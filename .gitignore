@@ -1,0 +1,10 @@
+target/
+build/
+demo/counter.js
+demo/counter.js.map
+bench/krausest/
+bench/results-raw/
+bench/**/node_modules/
+bench/melange/out/
+bench/vanilla/dist/
+bench/vanilla/dist-krausest/

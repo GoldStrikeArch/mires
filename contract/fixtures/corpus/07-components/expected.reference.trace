@@ -1,0 +1,46 @@
+{"$record":"header","$generatedBy":"contract/harness/gen-corpus.mjs","$doNotEditByHand":"Re-run the extractor instead. A diff here after a version bump IS the drift report.","$extractedFrom":{"dom-expressions":"0.40.8","solid-js":"1.9.14","babel-plugin-jsx-dom-expressions":"0.40.7","gitSha":"56bd4054237b031c0cca8c1ec69da162c52ed4a6"},"$extractionDate":"2026-07-29","$what":"Normalized runtime-call trace of a reference-compiled CORPUS fixture executed against harness/trace.mjs. Node identities are renamed in first-appearance order; functions become fn#N; templates become tmpl#N.","fixture":"corpus/07-components","label":"corpus/07-components","freeBindingsHealed":[],"status":"completed","error":null,"recordCount":45}
+{"op":"template","tmpl":"tmpl#0","html":"<span class=badge>"}
+{"op":"template","tmpl":"tmpl#1","html":"<section class=card><h2>"}
+{"op":"template","tmpl":"tmpl#2","html":"<p class=count>count "}
+{"op":"template","tmpl":"tmpl#3","html":"<p class=readout>"}
+{"op":"template","tmpl":"tmpl#4","html":"<div id=main>"}
+{"op":"template","tmpl":"tmpl#5","html":"<p>Account details"}
+{"op":"template","tmpl":"tmpl#6","html":"<div class=panel><button>+1"}
+{"op":"template","tmpl":"tmpl#7","html":"<div class=panel>"}
+{"op":"template","tmpl":"tmpl#8","html":"<div class=row>"}
+{"op":"template.clone","tmpl":"tmpl#4","result":"tmpl#4:root"}
+{"op":"createComponent","comp":"fn#0","props":{"label":"Active"}}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"insert","parent":"tmpl#0:root","accessor":"Active","marker":"undefined","initial":"undefined"}
+{"op":"insert","parent":"tmpl#4:root","accessor":"tmpl#0:root","marker":"undefined","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#4","result":"tmpl#4:root"}
+{"op":"createComponent","comp":"fn#0","props":{"label":"Active"}}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"insert","parent":"tmpl#0:root","accessor":"Active","marker":"undefined","initial":"undefined"}
+{"op":"insert","parent":"tmpl#4:root","accessor":"tmpl#0:root","marker":"undefined","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#5","result":"tmpl#5:root"}
+{"op":"createComponent","comp":"fn#1","props":{"children":"tmpl#5:root","title":"Profile"}}
+{"op":"template.clone","tmpl":"tmpl#5","result":"tmpl#5:root"}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"insert","parent":"tmpl#1:root.firstChild","accessor":"Profile","marker":"undefined","initial":"undefined"}
+{"op":"insert","parent":"tmpl#1:root","accessor":"tmpl#5:root","marker":null,"initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#6","result":"tmpl#6:root"}
+{"op":"createComponent","comp":"fn#2","props":{"count":"fn#3"}}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"insert","parent":"tmpl#2:root","accessor":"fn#3","marker":null,"initial":"undefined"}
+{"op":"insert","parent":"tmpl#6:root","accessor":"tmpl#2:root","marker":"tmpl#6:root.firstChild","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#7","result":"tmpl#7:root"}
+{"op":"createComponent","comp":"fn#4","props":{"read":"fn#5"}}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"insert","parent":"tmpl#3:root","accessor":"fn#5","marker":"undefined","initial":"undefined"}
+{"op":"insert","parent":"tmpl#7:root","accessor":"tmpl#3:root","marker":"undefined","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#8","result":"tmpl#8:root"}
+{"op":"createComponent","comp":"fn#0","props":{"label":"One"}}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"insert","parent":"tmpl#0:root","accessor":"One","marker":"undefined","initial":"undefined"}
+{"op":"insert","parent":"tmpl#8:root","accessor":"tmpl#0:root","marker":null,"initial":"undefined"}
+{"op":"createComponent","comp":"fn#0","props":{"label":"Two"}}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"insert","parent":"tmpl#0:root","accessor":"Two","marker":"undefined","initial":"undefined"}
+{"op":"insert","parent":"tmpl#8:root","accessor":"tmpl#0:root","marker":null,"initial":"undefined"}
+{"op":"delegateEvents","events":["click"],"document":"undefined"}

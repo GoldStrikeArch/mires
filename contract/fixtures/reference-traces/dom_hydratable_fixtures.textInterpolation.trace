@@ -1,0 +1,71 @@
+{"$record":"header","$generatedBy":"contract/harness/run-trace.mjs","$doNotEditByHand":"Re-run the extractor instead. A diff here after a version bump IS the drift report.","$extractedFrom":{"dom-expressions":"0.40.8","solid-js":"1.9.14","babel-plugin-jsx-dom-expressions":"0.40.7","gitSha":"56bd4054237b031c0cca8c1ec69da162c52ed4a6"},"$extractionDate":"2026-07-29","$what":"Normalized runtime-call trace of a reference-compiled fixture executed against harness/trace.mjs. Node identities are renamed in first-appearance order; functions become fn#N; templates become tmpl#N.","fixture":"__dom_hydratable_fixtures__/textInterpolation","label":"__dom_hydratable_fixtures__/textInterpolation","freeBindingsHealed":[],"status":"completed","error":null,"recordCount":70}
+{"op":"template","tmpl":"tmpl#0","html":"<span>Hello "}
+{"op":"template","tmpl":"tmpl#1","html":"<span> John"}
+{"op":"template","tmpl":"tmpl#2","html":"<span>Hello John"}
+{"op":"template","tmpl":"tmpl#3","html":"<span>Hello <!$><!/>"}
+{"op":"template","tmpl":"tmpl#4","html":"<span><!$><!/> John"}
+{"op":"template","tmpl":"tmpl#5","html":"<span><!$><!/> <!$><!/>"}
+{"op":"template","tmpl":"tmpl#6","html":"<span> <!$><!/> <!$><!/> "}
+{"op":"template","tmpl":"tmpl#7","html":"<span> <!$><!/><!$><!/> "}
+{"op":"template","tmpl":"tmpl#8","html":"<span>Hello"}
+{"op":"template","tmpl":"tmpl#9","html":"<span>&nbsp;&lt;Hi&gt;&nbsp;"}
+{"op":"template","tmpl":"tmpl#10","html":"<span>Hi&lt;script>alert();&lt;/script>"}
+{"op":"template","tmpl":"tmpl#11","html":"<span>Hello World!"}
+{"op":"template","tmpl":"tmpl#12","html":"<span>4 + 5 = 9"}
+{"op":"template","tmpl":"tmpl#13","html":"<div><!$><!/>\nd"}
+{"op":"template","tmpl":"tmpl#14","html":"<div>"}
+{"op":"template","tmpl":"tmpl#15","html":"<span> <!$><!/>"}
+{"op":"template","tmpl":"tmpl#16","html":"<span><!$><!/> "}
+{"op":"template","tmpl":"tmpl#17","html":"<div normal=Search… title=Search&amp;hellip;>"}
+{"op":"template","tmpl":"tmpl#18","html":"<div><div></div><!$><!/>"}
+{"op":"getNextElement","tmpl":"tmpl#0","result":"hk#5"}
+{"op":"getNextElement","tmpl":"tmpl#1","result":"hk#6"}
+{"op":"getNextElement","tmpl":"tmpl#2","result":"hk#7"}
+{"op":"getNextElement","tmpl":"tmpl#3","result":"hk#8"}
+{"op":"getNextMarker","start":"hk#8.firstChild.nextSibling.nextSibling","end":"marker#9"}
+{"op":"insert","parent":"hk#8","marker":"marker#9","initial":[]}
+{"op":"getNextElement","tmpl":"tmpl#4","result":"hk#10"}
+{"op":"getNextMarker","start":"hk#10.firstChild.nextSibling","end":"marker#11"}
+{"op":"insert","parent":"hk#10","marker":"marker#11","initial":[]}
+{"op":"getNextElement","tmpl":"tmpl#5","result":"hk#12"}
+{"op":"getNextMarker","start":"hk#12.firstChild.nextSibling","end":"marker#13"}
+{"op":"getNextMarker","start":"marker#13.nextSibling.nextSibling.nextSibling","end":"marker#14"}
+{"op":"insert","parent":"hk#12","marker":"marker#13","initial":[]}
+{"op":"insert","parent":"hk#12","marker":"marker#14","initial":[]}
+{"op":"getNextElement","tmpl":"tmpl#6","result":"hk#15"}
+{"op":"getNextMarker","start":"hk#15.firstChild.nextSibling.nextSibling","end":"marker#16"}
+{"op":"getNextMarker","start":"marker#16.nextSibling.nextSibling.nextSibling","end":"marker#17"}
+{"op":"insert","parent":"hk#15","marker":"marker#16","initial":[]}
+{"op":"insert","parent":"hk#15","marker":"marker#17","initial":[]}
+{"op":"getNextElement","tmpl":"tmpl#7","result":"hk#18"}
+{"op":"getNextMarker","start":"hk#18.firstChild.nextSibling.nextSibling","end":"marker#19"}
+{"op":"getNextMarker","start":"marker#19.nextSibling.nextSibling","end":"marker#20"}
+{"op":"insert","parent":"hk#18","marker":"marker#19","initial":[]}
+{"op":"insert","parent":"hk#18","marker":"marker#20","initial":[]}
+{"op":"getNextElement","tmpl":"tmpl#8","result":"hk#21"}
+{"op":"getNextElement","tmpl":"tmpl#2","result":"hk#22"}
+{"op":"getNextElement","tmpl":"tmpl#2","result":"hk#23"}
+{"op":"getNextElement","tmpl":"tmpl#9","result":"hk#24"}
+{"op":"createComponent","props":{"children":" <Hi> "}}
+{"op":"getNextElement","tmpl":"tmpl#10","result":"hk#25"}
+{"op":"getNextElement","tmpl":"tmpl#11","result":"hk#26"}
+{"op":"getNextElement","tmpl":"tmpl#12","result":"hk#27"}
+{"op":"getNextElement","tmpl":"tmpl#13","result":"hk#28"}
+{"op":"getNextMarker","start":"hk#28.firstChild.nextSibling","end":"marker#29"}
+{"op":"insert","parent":"hk#28","marker":"marker#29","initial":[]}
+{"op":"getNextElement","tmpl":"tmpl#14","result":"hk#30"}
+{"op":"insert","parent":"hk#30","marker":"undefined","initial":"undefined"}
+{"op":"createComponent","props":{}}
+{"op":"getNextElement","tmpl":"tmpl#15","result":"hk#31"}
+{"op":"getNextMarker","start":"hk#31.firstChild.nextSibling.nextSibling","end":"marker#32"}
+{"op":"insert","parent":"hk#31","marker":"marker#32","initial":[]}
+{"op":"createComponent","props":{"children":[" ",null]}}
+{"op":"getNextElement","tmpl":"tmpl#16","result":"hk#33"}
+{"op":"getNextMarker","start":"hk#33.firstChild.nextSibling","end":"marker#34"}
+{"op":"insert","parent":"hk#33","marker":"marker#34","initial":[]}
+{"op":"createComponent","props":{"children":[null," "]}}
+{"op":"getNextElement","tmpl":"tmpl#17","result":"hk#35"}
+{"op":"createComponent","props":{"normal":"Search…","title":"Search&hellip;"}}
+{"op":"getNextElement","tmpl":"tmpl#18","result":"hk#36"}
+{"op":"getNextMarker","start":"hk#36.firstChild.nextSibling.nextSibling","end":"marker#37"}
+{"op":"insert","parent":"hk#36","marker":"marker#37","initial":[]}

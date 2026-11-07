@@ -1,0 +1,453 @@
+{
+  "$generatedBy": "contract/harness/extract-escaping.mjs",
+  "$doNotEditByHand": "Re-run the extractor instead. A diff here after a version bump IS the drift report.",
+  "$extractedFrom": {
+    "dom-expressions": "0.40.8",
+    "solid-js": "1.9.14",
+    "babel-plugin-jsx-dom-expressions": "0.40.7",
+    "gitSha": "56bd4054237b031c0cca8c1ec69da162c52ed4a6"
+  },
+  "$extractionDate": "2026-07-29",
+  "$source": "solid-js/web/dist/server.js:544 escape(s, attr)",
+  "$rules": {
+    "text": {
+      "<": "&lt;",
+      "&": "&amp;"
+    },
+    "attr": {
+      "\"": "&quot;",
+      "&": "&amp;"
+    },
+    "notEscapedAnywhere": [
+      ">",
+      "'"
+    ],
+    "idempotent": false
+  },
+  "$topcoatDelta": {
+    "$comparedAgainst": "crates/topcoat-view/src/escape.rs",
+    "text": "DIVERGES. Topcoat's HtmlContext::Text escapes & < > (TEXT_ESCAPES). solid's text mode escapes only & and <. Topcoat additionally emits &gt; for >. This is a superset -- strictly safer, never unsafe -- but it means Topcoat's SSR text output is NOT byte-identical to solid's for any input containing '>'. If the JS emitter reuses solid's runtime for client-side text updates while Rust renders the SSR pass, a '>' in dynamic text produces '&gt;' on the server and '>' on the client: a hydration text mismatch.",
+    "attr": "MATCHES. Topcoat's AttributeValue escapes & and \" (ATTRIBUTE_VALUE_ESCAPES); solid's attr mode escapes & and \". Identical.",
+    "comment": "NO SOLID EQUIVALENT. Topcoat has HtmlContext::Comment (escapes & > \") for machine-readable comment payloads. solid never escapes into comments.",
+    "identContexts": "NO SOLID EQUIVALENT. Topcoat's AttributeKey/ElementName validate-and-panic rather than escape. solid does not guard these positions at all.",
+    "nonStringCoercion": "NO TOPCOAT EQUIVALENT. solid's escape() doubles as a coercion point for functions/arrays/booleans (see nonStringPassthrough). Topcoat escapes only &str through fmt::Write."
+  },
+  "caseCount": 47,
+  "invariants": [
+    {
+      "name": "text escapes <",
+      "actual": "&lt;",
+      "expected": "&lt;",
+      "ok": true
+    },
+    {
+      "name": "text escapes &",
+      "actual": "&amp;",
+      "expected": "&amp;",
+      "ok": true
+    },
+    {
+      "name": "text does NOT escape >",
+      "actual": ">",
+      "expected": ">",
+      "ok": true
+    },
+    {
+      "name": "text does NOT escape '",
+      "actual": "'",
+      "expected": "'",
+      "ok": true
+    },
+    {
+      "name": "text does NOT escape \"",
+      "actual": "\"",
+      "expected": "\"",
+      "ok": true
+    },
+    {
+      "name": "attr escapes \"",
+      "actual": "&quot;",
+      "expected": "&quot;",
+      "ok": true
+    },
+    {
+      "name": "attr escapes &",
+      "actual": "&amp;",
+      "expected": "&amp;",
+      "ok": true
+    },
+    {
+      "name": "attr does NOT escape <",
+      "actual": "<",
+      "expected": "<",
+      "ok": true
+    },
+    {
+      "name": "attr does NOT escape >",
+      "actual": ">",
+      "expected": ">",
+      "ok": true
+    },
+    {
+      "name": "attr does NOT escape '",
+      "actual": "'",
+      "expected": "'",
+      "ok": true
+    },
+    {
+      "name": "escape is NOT idempotent (text)",
+      "actual": "&amp;amp;",
+      "expected": "&amp;amp;",
+      "ok": true
+    },
+    {
+      "name": "unicode passes through",
+      "actual": "😍é日",
+      "expected": "😍é日",
+      "ok": true
+    }
+  ],
+  "cases": [
+    {
+      "input": "<",
+      "expectedText": "&lt;",
+      "expectedAttr": "<"
+    },
+    {
+      "input": "&",
+      "expectedText": "&amp;",
+      "expectedAttr": "&amp;"
+    },
+    {
+      "input": "\"",
+      "expectedText": "\"",
+      "expectedAttr": "&quot;"
+    },
+    {
+      "input": "<&>",
+      "expectedText": "&lt;&amp;>",
+      "expectedAttr": "<&amp;>"
+    },
+    {
+      "input": "<&\">",
+      "expectedText": "&lt;&amp;\">",
+      "expectedAttr": "<&amp;&quot;>"
+    },
+    {
+      "input": "a < b && c > d",
+      "expectedText": "a &lt; b &amp;&amp; c > d",
+      "expectedAttr": "a < b &amp;&amp; c > d"
+    },
+    {
+      "input": ">",
+      "expectedText": ">",
+      "expectedAttr": ">"
+    },
+    {
+      "input": "'",
+      "expectedText": "'",
+      "expectedAttr": "'"
+    },
+    {
+      "input": "a > b",
+      "expectedText": "a > b",
+      "expectedAttr": "a > b"
+    },
+    {
+      "input": "it's",
+      "expectedText": "it's",
+      "expectedAttr": "it's"
+    },
+    {
+      "input": "<a href='x'>",
+      "expectedText": "&lt;a href='x'>",
+      "expectedAttr": "<a href='x'>"
+    },
+    {
+      "input": "say \"hi\"",
+      "expectedText": "say \"hi\"",
+      "expectedAttr": "say &quot;hi&quot;"
+    },
+    {
+      "input": "<script>alert(1)</script>",
+      "expectedText": "&lt;script>alert(1)&lt;/script>",
+      "expectedAttr": "<script>alert(1)</script>"
+    },
+    {
+      "input": "</textarea><script>",
+      "expectedText": "&lt;/textarea>&lt;script>",
+      "expectedAttr": "</textarea><script>"
+    },
+    {
+      "input": "<img src=x onerror=\"alert(1)\">",
+      "expectedText": "&lt;img src=x onerror=\"alert(1)\">",
+      "expectedAttr": "<img src=x onerror=&quot;alert(1)&quot;>"
+    },
+    {
+      "input": "<!-- comment -->",
+      "expectedText": "&lt;!-- comment -->",
+      "expectedAttr": "<!-- comment -->"
+    },
+    {
+      "input": "<!$>",
+      "expectedText": "&lt;!$>",
+      "expectedAttr": "<!$>"
+    },
+    {
+      "input": "<!/>",
+      "expectedText": "&lt;!/>",
+      "expectedAttr": "<!/>"
+    },
+    {
+      "input": "&amp;",
+      "expectedText": "&amp;amp;",
+      "expectedAttr": "&amp;amp;"
+    },
+    {
+      "input": "&lt;",
+      "expectedText": "&amp;lt;",
+      "expectedAttr": "&amp;lt;"
+    },
+    {
+      "input": "&quot;",
+      "expectedText": "&amp;quot;",
+      "expectedAttr": "&amp;quot;"
+    },
+    {
+      "input": "&#39;",
+      "expectedText": "&amp;#39;",
+      "expectedAttr": "&amp;#39;"
+    },
+    {
+      "input": "&amp;amp;",
+      "expectedText": "&amp;amp;amp;",
+      "expectedAttr": "&amp;amp;amp;"
+    },
+    {
+      "input": "already &lt;escaped&gt;",
+      "expectedText": "already &amp;lt;escaped&amp;gt;",
+      "expectedAttr": "already &amp;lt;escaped&amp;gt;"
+    },
+    {
+      "input": "",
+      "expectedText": "",
+      "expectedAttr": ""
+    },
+    {
+      "input": "<<<",
+      "expectedText": "&lt;&lt;&lt;",
+      "expectedAttr": "<<<"
+    },
+    {
+      "input": "&&&",
+      "expectedText": "&amp;&amp;&amp;",
+      "expectedAttr": "&amp;&amp;&amp;"
+    },
+    {
+      "input": "\"\"\"",
+      "expectedText": "\"\"\"",
+      "expectedAttr": "&quot;&quot;&quot;"
+    },
+    {
+      "input": "<&<&<",
+      "expectedText": "&lt;&amp;&lt;&amp;&lt;",
+      "expectedAttr": "<&amp;<&amp;<"
+    },
+    {
+      "input": "abc",
+      "expectedText": "abc",
+      "expectedAttr": "abc"
+    },
+    {
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expectedText": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expectedAttr": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa<bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "expectedText": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&lt;bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "expectedAttr": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa<bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    {
+      "input": " ",
+      "expectedText": " ",
+      "expectedAttr": " "
+    },
+    {
+      "input": "\n",
+      "expectedText": "\n",
+      "expectedAttr": "\n"
+    },
+    {
+      "input": "\t",
+      "expectedText": "\t",
+      "expectedAttr": "\t"
+    },
+    {
+      "input": "a\u0000b",
+      "expectedText": "a\u0000b",
+      "expectedAttr": "a\u0000b"
+    },
+    {
+      "input": "café",
+      "expectedText": "café",
+      "expectedAttr": "café"
+    },
+    {
+      "input": "résumé < naïve",
+      "expectedText": "résumé &lt; naïve",
+      "expectedAttr": "résumé < naïve"
+    },
+    {
+      "input": "日本語",
+      "expectedText": "日本語",
+      "expectedAttr": "日本語"
+    },
+    {
+      "input": "😍",
+      "expectedText": "😍",
+      "expectedAttr": "😍"
+    },
+    {
+      "input": "emotion-😍 & more",
+      "expectedText": "emotion-😍 &amp; more",
+      "expectedAttr": "emotion-😍 &amp; more"
+    },
+    {
+      "input": "☼<…&‾>",
+      "expectedText": "☼&lt;…&amp;‾>",
+      "expectedAttr": "☼<…&amp;‾>"
+    },
+    {
+      "input": " ",
+      "expectedText": " ",
+      "expectedAttr": " "
+    },
+    {
+      "input": "﻿",
+      "expectedText": "﻿",
+      "expectedAttr": "﻿"
+    },
+    {
+      "input": "＜",
+      "expectedText": "＜",
+      "expectedAttr": "＜"
+    },
+    {
+      "input": "＆",
+      "expectedText": "＆",
+      "expectedAttr": "＆"
+    },
+    {
+      "input": "‹",
+      "expectedText": "‹",
+      "expectedAttr": "‹"
+    }
+  ],
+  "nonStringPassthrough": [
+    {
+      "label": "number 42",
+      "textMode": {
+        "ok": true,
+        "value": "42",
+        "type": "number"
+      },
+      "attrMode": {
+        "ok": true,
+        "value": "42",
+        "type": "number"
+      }
+    },
+    {
+      "label": "number 0",
+      "textMode": {
+        "ok": true,
+        "value": "0",
+        "type": "number"
+      },
+      "attrMode": {
+        "ok": true,
+        "value": "0",
+        "type": "number"
+      }
+    },
+    {
+      "label": "boolean true",
+      "textMode": {
+        "ok": true,
+        "value": "true",
+        "type": "boolean"
+      },
+      "attrMode": {
+        "ok": true,
+        "value": "true",
+        "type": "string"
+      }
+    },
+    {
+      "label": "boolean false",
+      "textMode": {
+        "ok": true,
+        "value": "false",
+        "type": "boolean"
+      },
+      "attrMode": {
+        "ok": true,
+        "value": "false",
+        "type": "string"
+      }
+    },
+    {
+      "label": "null",
+      "textMode": {
+        "ok": true,
+        "value": "null",
+        "type": "object"
+      },
+      "attrMode": {
+        "ok": true,
+        "value": "null",
+        "type": "object"
+      }
+    },
+    {
+      "label": "undefined",
+      "textMode": {
+        "ok": true,
+        "value": "undefined",
+        "type": "undefined"
+      },
+      "attrMode": {
+        "ok": true,
+        "value": "undefined",
+        "type": "undefined"
+      }
+    },
+    {
+      "label": "function returning '<b>'",
+      "textMode": {
+        "ok": true,
+        "value": "&lt;b>",
+        "type": "string"
+      },
+      "attrMode": {
+        "ok": true,
+        "value": "() => \"<b>\"",
+        "type": "function"
+      }
+    },
+    {
+      "label": "array ['<a>', '&']",
+      "textMode": {
+        "ok": true,
+        "value": "[\"&lt;a>\",\"&amp;\"]",
+        "type": "object"
+      },
+      "attrMode": {
+        "ok": true,
+        "value": "[\"<a>\",\"&\"]",
+        "type": "object"
+      }
+    }
+  ]
+}

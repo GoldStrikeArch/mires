@@ -1,0 +1,8 @@
+9106
+# gzipped byte size of dist/mires-dom.js.
+# Baseline established 2026-07-29 by runtime/dom/build.mjs.
+# Raised 2026-07-30 from 9097 (+9) for the createSignal re-export declared in
+# reactive-additions.mjs. The size of that delta is itself the evidence that
+# solid's reactive core is in the bundle once, not twice.
+# This is a measured value, not a budget target -- update it deliberately when
+# the artifact legitimately grows, so unexplained growth shows up in review.

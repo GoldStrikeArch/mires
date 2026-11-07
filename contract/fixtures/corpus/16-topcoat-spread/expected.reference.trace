@@ -1,0 +1,22 @@
+{"$record":"header","$generatedBy":"contract/harness/gen-corpus.mjs","$doNotEditByHand":"Re-run the extractor instead. A diff here after a version bump IS the drift report.","$extractedFrom":{"dom-expressions":"0.40.8","solid-js":"1.9.14","babel-plugin-jsx-dom-expressions":"0.40.7","gitSha":"56bd4054237b031c0cca8c1ec69da162c52ed4a6"},"$extractionDate":"2026-07-29","$what":"Normalized runtime-call trace of a reference-compiled CORPUS fixture executed against harness/trace.mjs. Node identities are renamed in first-appearance order; functions become fn#N; templates become tmpl#N.","fixture":"corpus/16-topcoat-spread","label":"corpus/16-topcoat-spread","freeBindingsHealed":["attrs","getProps","Child","props"],"status":"completed","error":null,"recordCount":21}
+{"op":"template","tmpl":"tmpl#0","html":"<div>"}
+{"op":"template","tmpl":"tmpl#1","html":"<div id=main>"}
+{"op":"template","tmpl":"tmpl#2","html":"<div class=base>"}
+{"op":"template","tmpl":"tmpl#3","html":"<div><span>Save"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"spread","node":"tmpl#0:root","isSVG":false,"skipChildren":false}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"mergeProps","sources":[null,{"id":"main"}]}
+{"op":"spread","node":"tmpl#0:root","props":{"id":"main"},"isSVG":false,"skipChildren":false}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"spread","node":"tmpl#1:root","isSVG":false,"skipChildren":false}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"mergeProps","sources":[null,{"id":"main"}]}
+{"op":"spread","node":"tmpl#2:root","props":{"id":"main"},"isSVG":false,"skipChildren":false}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"mergeProps","sources":["fn#0"]}
+{"op":"spread","node":"tmpl#0:root","props":{},"isSVG":false,"skipChildren":false}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"spread","node":"tmpl#3:root","isSVG":false,"skipChildren":true}
+{"op":"mergeProps","sources":[null,{"name":"John"}]}
+{"op":"createComponent","props":{"name":"John"}}

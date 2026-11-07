@@ -1,0 +1,6 @@
+{"$record":"header","$what":"Differs from base.trace only by Topcoat's text escaping: '>' rendered as '&gt;'. A real, permanent divergence (fixtures/escaping.json $topcoatDelta), which is why it belongs in a delta file rather than in a bug report.","fixture":"testdata/base","label":"testdata/accepted","freeBindingsHealed":[],"status":"completed","error":null,"recordCount":5}
+{"op":"template","tmpl":"tmpl#0","html":"<div><p>a &gt; b <!>"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"#0"}
+{"op":"insert","parent":"#0","accessor":"fn#0","marker":"#1","initial":"undefined"}
+{"op":"addEventListener","node":"#0","name":"click","handler":"fn#1","delegate":true}
+{"op":"delegateEvents","events":["click"],"document":"undefined"}

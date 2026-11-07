@@ -1,0 +1,57 @@
+{"$record":"header","$generatedBy":"contract/harness/run-trace.mjs","$doNotEditByHand":"Re-run the extractor instead. A diff here after a version bump IS the drift report.","$extractedFrom":{"dom-expressions":"0.40.8","solid-js":"1.9.14","babel-plugin-jsx-dom-expressions":"0.40.7","gitSha":"56bd4054237b031c0cca8c1ec69da162c52ed4a6"},"$extractionDate":"2026-07-29","$what":"Normalized runtime-call trace of a reference-compiled fixture executed against harness/trace.mjs. Node identities are renamed in first-appearance order; functions become fn#N; templates become tmpl#N.","fixture":"__dom_fixtures__/textInterpolation","label":"__dom_fixtures__/textInterpolation","freeBindingsHealed":["name","greeting","Comp","s","expr","Div"],"status":"completed","error":null,"recordCount":56}
+{"op":"template","tmpl":"tmpl#0","html":"<span>Hello "}
+{"op":"template","tmpl":"tmpl#1","html":"<span> John"}
+{"op":"template","tmpl":"tmpl#2","html":"<span>Hello John"}
+{"op":"template","tmpl":"tmpl#3","html":"<span> "}
+{"op":"template","tmpl":"tmpl#4","html":"<span> <!> <!> "}
+{"op":"template","tmpl":"tmpl#5","html":"<span> <!> "}
+{"op":"template","tmpl":"tmpl#6","html":"<span>Hello"}
+{"op":"template","tmpl":"tmpl#7","html":"<span>&nbsp;&lt;Hi&gt;&nbsp;"}
+{"op":"template","tmpl":"tmpl#8","html":"<span>Hi&lt;script>alert();&lt;/script>"}
+{"op":"template","tmpl":"tmpl#9","html":"<span>Hello World!"}
+{"op":"template","tmpl":"tmpl#10","html":"<span>4 + 5 = 9"}
+{"op":"template","tmpl":"tmpl#11","html":"<div>\nd"}
+{"op":"template","tmpl":"tmpl#12","html":"<div>"}
+{"op":"template","tmpl":"tmpl#13","html":"<div normal=Search… title=Search&amp;hellip;>"}
+{"op":"template","tmpl":"tmpl#14","html":"<div><div>"}
+{"op":"template","tmpl":"tmpl#15","html":"<p>${blah}"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"insert","parent":"tmpl#0:root","marker":null,"initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"insert","parent":"tmpl#1:root","marker":"tmpl#1:root.firstChild","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"insert","parent":"tmpl#3:root","marker":"tmpl#3:root.firstChild","initial":"undefined"}
+{"op":"insert","parent":"tmpl#3:root","marker":null,"initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#4","result":"tmpl#4:root"}
+{"op":"insert","parent":"tmpl#4:root","marker":"tmpl#4:root.firstChild.nextSibling","initial":"undefined"}
+{"op":"insert","parent":"tmpl#4:root","marker":"tmpl#4:root.firstChild.nextSibling.nextSibling.nextSibling","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#5","result":"tmpl#5:root"}
+{"op":"insert","parent":"tmpl#5:root","marker":"tmpl#5:root.firstChild.nextSibling","initial":"undefined"}
+{"op":"insert","parent":"tmpl#5:root","marker":"tmpl#5:root.firstChild.nextSibling","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#6","result":"tmpl#6:root"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"template.clone","tmpl":"tmpl#7","result":"tmpl#7:root"}
+{"op":"createComponent","props":{"children":" <Hi> "}}
+{"op":"template.clone","tmpl":"tmpl#8","result":"tmpl#8:root"}
+{"op":"template.clone","tmpl":"tmpl#9","result":"tmpl#9:root"}
+{"op":"template.clone","tmpl":"tmpl#10","result":"tmpl#10:root"}
+{"op":"template.clone","tmpl":"tmpl#11","result":"tmpl#11:root"}
+{"op":"insert","parent":"tmpl#11:root","marker":"tmpl#11:root.firstChild","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#12","result":"tmpl#12:root"}
+{"op":"insert","parent":"tmpl#12:root","marker":"undefined","initial":"undefined"}
+{"op":"createComponent","props":{}}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"insert","parent":"tmpl#3:root","marker":null,"initial":"undefined"}
+{"op":"createComponent","props":{"children":[" ",null]}}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"insert","parent":"tmpl#3:root","marker":"tmpl#3:root.firstChild","initial":"undefined"}
+{"op":"createComponent","props":{"children":[null," "]}}
+{"op":"template.clone","tmpl":"tmpl#13","result":"tmpl#13:root"}
+{"op":"createComponent","props":{"normal":"Search…","title":"Search&hellip;"}}
+{"op":"template.clone","tmpl":"tmpl#14","result":"tmpl#14:root"}
+{"op":"insert","parent":"tmpl#14:root","marker":null,"initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#15","result":"tmpl#15:root"}

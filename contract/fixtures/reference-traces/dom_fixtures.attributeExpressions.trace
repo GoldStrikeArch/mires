@@ -1,0 +1,89 @@
+{"$record":"header","$generatedBy":"contract/harness/run-trace.mjs","$doNotEditByHand":"Re-run the extractor instead. A diff here after a version bump IS the drift report.","$extractedFrom":{"dom-expressions":"0.40.8","solid-js":"1.9.14","babel-plugin-jsx-dom-expressions":"0.40.7","gitSha":"56bd4054237b031c0cca8c1ec69da162c52ed4a6"},"$extractionDate":"2026-07-29","$what":"Normalized runtime-call trace of a reference-compiled fixture executed against harness/trace.mjs. Node identities are renamed in first-appearance order; functions become fn#N; templates become tmpl#N.","fixture":"__dom_fixtures__/attributeExpressions","label":"__dom_fixtures__/attributeExpressions","freeBindingsHealed":["results","unknown","color","dynamic","welcoming","getProps","rowId","state"],"status":"stopped-early","error":"_el$13.classList.toggle is not a function","recordCount":88}
+{"op":"template","tmpl":"tmpl#0","html":"<div id=main><h1 class=base id=my-h1><a href=/>Welcome"}
+{"op":"template","tmpl":"tmpl#1","html":"<div><div></div><div> </div><div>"}
+{"op":"template","tmpl":"tmpl#2","html":"<div foo>"}
+{"op":"template","tmpl":"tmpl#3","html":"<div>"}
+{"op":"template","tmpl":"tmpl#4","html":"<div class=\"a b\">"}
+{"op":"template","tmpl":"tmpl#5","html":"<div style=margin-right:40px>"}
+{"op":"template","tmpl":"tmpl#6","html":"<div onclick=\"console.log('hi')\">"}
+{"op":"template","tmpl":"tmpl#7","html":"<input type=checkbox>"}
+{"op":"template","tmpl":"tmpl#8","html":"<div class=\"`a\">`$`"}
+{"op":"template","tmpl":"tmpl#9","html":"<button class=\"static hi\"type=button>Write"}
+{"op":"template","tmpl":"tmpl#10","html":"<button class=\"a b c\">Hi"}
+{"op":"template","tmpl":"tmpl#11","html":"<div class=\"bg-red-500 flex flex-col\">"}
+{"op":"template","tmpl":"tmpl#12","html":"<div><input readonly><input>"}
+{"op":"template","tmpl":"tmpl#13","html":"<div style=b:static>"}
+{"op":"template","tmpl":"tmpl#14","html":"<div data=\"&quot;hi&quot;\"data2=\"&quot;\">"}
+{"op":"template","tmpl":"tmpl#15","html":"<a>"}
+{"op":"template","tmpl":"tmpl#16","html":"<div><a>"}
+{"op":"template","tmpl":"tmpl#17","html":"<div start=Hi>Hi"}
+{"op":"template","tmpl":"tmpl#18","html":"<label><span>Input is </span><input><div>"}
+{"op":"template","tmpl":"tmpl#19","html":"<div class=\"class1 class2 class3 class4 class5 class6\"random=\"random1 random2\n    random3 random4\"style=\"color:red;background-color:blue !important;border:1px solid black;font-size:12px\">"}
+{"op":"template","tmpl":"tmpl#20","html":"<button>"}
+{"op":"template","tmpl":"tmpl#21","html":"<input value=10>"}
+{"op":"template","tmpl":"tmpl#22","html":"<select><option>Red</option><option>Blue"}
+{"op":"template","tmpl":"tmpl#23","html":"<div>empty string"}
+{"op":"template","tmpl":"tmpl#24","html":"<div>js empty"}
+{"op":"template","tmpl":"tmpl#25","html":"<div quack>hola"}
+{"op":"template","tmpl":"tmpl#26","html":"<div quack>\"hola js\""}
+{"op":"template","tmpl":"tmpl#27","html":"<div quack>true"}
+{"op":"template","tmpl":"tmpl#28","html":"<div>false"}
+{"op":"template","tmpl":"tmpl#29","html":"<div quack>1"}
+{"op":"template","tmpl":"tmpl#30","html":"<div>0"}
+{"op":"template","tmpl":"tmpl#31","html":"<div quack>\"1\""}
+{"op":"template","tmpl":"tmpl#32","html":"<div>\"0\""}
+{"op":"template","tmpl":"tmpl#33","html":"<div>undefined"}
+{"op":"template","tmpl":"tmpl#34","html":"<div>null"}
+{"op":"template","tmpl":"tmpl#35","html":"<div>boolTest()"}
+{"op":"template","tmpl":"tmpl#36","html":"<div>boolTest"}
+{"op":"template","tmpl":"tmpl#37","html":"<div>boolTestBinding"}
+{"op":"template","tmpl":"tmpl#38","html":"<div>boolTestObjBinding.value"}
+{"op":"template","tmpl":"tmpl#39","html":"<div>fn"}
+{"op":"template","tmpl":"tmpl#40","html":"<div before quack>should have space before"}
+{"op":"template","tmpl":"tmpl#41","html":"<div before quack after>should have space before/after"}
+{"op":"template","tmpl":"tmpl#42","html":"<div quack after>should have space before/after"}
+{"op":"template","tmpl":"tmpl#43","html":"<img src>"}
+{"op":"template","tmpl":"tmpl#44","html":"<div><img src>"}
+{"op":"template","tmpl":"tmpl#45","html":"<img src loading=lazy>","isImportNode":true,"isSVG":false,"isMathML":false}
+{"op":"template","tmpl":"tmpl#46","html":"<div><img src loading=lazy>","isImportNode":true,"isSVG":false,"isMathML":false}
+{"op":"template","tmpl":"tmpl#47","html":"<iframe src>"}
+{"op":"template","tmpl":"tmpl#48","html":"<div><iframe src>"}
+{"op":"template","tmpl":"tmpl#49","html":"<iframe src loading=lazy>","isImportNode":true,"isSVG":false,"isMathML":false}
+{"op":"template","tmpl":"tmpl#50","html":"<div><iframe src loading=lazy>","isImportNode":true,"isSVG":false,"isMathML":false}
+{"op":"template","tmpl":"tmpl#51","html":"<div title=\"<u>data</u>\">"}
+{"op":"template","tmpl":"tmpl#52","html":"<div truestr=true truestrjs=true>"}
+{"op":"template","tmpl":"tmpl#53","html":"<div falsestr=false falsestrjs=false>"}
+{"op":"template","tmpl":"tmpl#54","html":"<math display=block><mrow>","isImportNode":false,"isSVG":false,"isMathML":true}
+{"op":"template","tmpl":"tmpl#55","html":"<mrow><mi>x</mi><mo>=","isImportNode":false,"isSVG":false,"isMathML":true}
+{"op":"template","tmpl":"tmpl#56","html":"<div style=background:red>"}
+{"op":"template","tmpl":"tmpl#57","html":"<div style=background:red;color:green;margin:3;padding:0.4>"}
+{"op":"template","tmpl":"tmpl#58","html":"<div style=background:red;color:green>"}
+{"op":"template","tmpl":"tmpl#59","html":"<div style=\"padding-left:clamp(2px, 2px, 2px)\">"}
+{"op":"template","tmpl":"tmpl#60","html":"<div style=\"a:clamp(2px, 2px, 2px)\">"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"mergeProps","sources":[null,{"classList":{},"style":{}}]}
+{"op":"spread","node":"tmpl#0:root","props":{"classList":{},"style":{}},"isSVG":false,"skipChildren":true}
+{"op":"mergeProps","sources":[null,{"classList":{"dynamic":"undefined","selected":true},"disabled":true,"foo":"","style":{"background-color":"undefined","margin-right":"40px"},"title":"undefined"}]}
+{"op":"spread","node":"tmpl#0:root.firstChild","props":{"classList":{"dynamic":"undefined","selected":true},"disabled":true,"foo":"","style":{"background-color":"undefined","margin-right":"40px"},"title":"undefined"},"isSVG":false,"skipChildren":true}
+{"op":"classList","node":"tmpl#0:root.firstChild.firstChild","value":{"ccc ddd":true},"prev":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"mergeProps","sources":["fn#0"]}
+{"op":"spread","node":"tmpl#1:root","props":{},"isSVG":false,"skipChildren":true}
+{"op":"effect","fn":"fn#1","init":"undefined","options":"undefined"}
+{"op":"effect.threw","fn":"fn#1","error":"row is not defined"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"setAttribute","node":"tmpl#2:root","name":"id"}
+{"op":"setStyleProperty","node":"tmpl#2:root","name":"background-color"}
+{"op":"effect","fn":"fn#2","init":"undefined","options":"undefined"}
+{"op":"setAttribute","node":"tmpl#2:root","name":"name","value":"state"}
+{"op":"effect.ran","fn":"fn#2","returned":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"classList","node":"tmpl#3:root","value":{"ccc:ddd":true},"prev":"undefined"}
+{"op":"effect","fn":"fn#3","init":"undefined","options":"undefined"}
+{"op":"className","node":"tmpl#3:root","value":"hi <free:state.class>"}
+{"op":"effect.ran","fn":"fn#3","returned":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#4","result":"tmpl#4:root"}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"effect","fn":"fn#4","init":"undefined","options":"undefined"}
+{"op":"effect.threw","fn":"fn#4","error":"someStyle is not defined"}
+{"op":"template.clone","tmpl":"tmpl#5","result":"tmpl#5:root"}

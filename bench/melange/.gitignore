@@ -1,0 +1,8 @@
+node_modules
+
+# The build products of extract.mjs / compare.mjs, except the two that ARE the
+# result: the extracted Melange output and the report. Both are small and both
+# are what makes the comparison reviewable without a Chrome and a playground.
+out/*
+!out/store.melange.js
+!out/melange-report.md

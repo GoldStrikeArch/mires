@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rustc-codegen-js counter demo</title>
+
+    <!--
+      counter.js is produced from counter.rs by the JS codegen backend:
+
+          scripts/build.sh
+          scripts/compile.sh demo/counter.rs demo/counter.js
+
+      Both scripts below are plain scripts (no modules), so this page works
+      straight off the filesystem: just open demo/index.html over file://.
+
+      The counter's state lives here in JavaScript; the compiled Rust supplies
+      the pure functions counter_clicked / counter_label_kind / counter_log.
+
+      Stepping through the Rust in DevTools
+      -------------------------------------
+
+      Recompile with source maps on, which writes demo/counter.js.map beside
+      the JavaScript and a sourceMappingURL comment at the end of it:
+
+          JS_EXTRA_ARGS='js-source-map=on' \
+              scripts/compile.sh demo/counter.rs demo/counter.js
+
+      Then, with this page open:
+
+        1. open DevTools (Cmd-Opt-I / F12) and go to Sources;
+        2. counter.rs appears in the file tree next to counter.js — the map
+           carries the Rust text itself, so this works over file:// with no
+           server and no path juggling;
+        3. put a breakpoint on the `n + 1` inside counter_clicked and press
+           the +1 button. Execution stops on the Rust line, and the call stack
+           names the Rust functions (`counter_clicked`, `Counter::increment`)
+           rather than their mangled JavaScript spellings;
+        4. Step (F11) walks Rust statement by Rust statement. The runtime shim
+           and the compiler's own glue are in the map's ignoreList, so stepping
+           runs through them instead of into them.
+
+      Nothing about the emitted JavaScript changes: with the option off the
+      output is byte for byte what it was, minus the sourceMappingURL line.
+    -->
+    <script src="../runtime/shim.js"></script>
+    <script src="./counter.js"></script>
+
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+      }
+      main {
+        display: grid;
+        justify-items: center;
+        gap: 1rem;
+        padding: 2rem;
+      }
+      h1 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 600;
+        opacity: 0.6;
+      }
+      #count {
+        font-size: 4rem;
+        font-variant-numeric: tabular-nums;
+        line-height: 1;
+      }
+      #label {
+        min-height: 1.2em;
+        opacity: 0.6;
+        font-size: 0.875rem;
+      }
+      button {
+        font: inherit;
+        padding: 0.5rem 1.25rem;
+        border: 1px solid currentColor;
+        border-radius: 0.5rem;
+        background: transparent;
+        color: inherit;
+        cursor: pointer;
+      }
+      button:hover {
+        opacity: 0.75;
+      }
+    </style>
+  </head>
+
+  <body>
+    <main>
+      <h1>counter_clicked(n) compiled from Rust</h1>
+      <span id="count">0</span>
+      <span id="label"></span>
+      <button id="increment" type="button">Increment</button>
+    </main>
+
+    <script>
+      var LABELS = ["click to start counting", "counting", "next click wraps to 0"];
+
+      var countEl = document.getElementById("count");
+      var labelEl = document.getElementById("label");
+      var buttonEl = document.getElementById("increment");
+
+      var count = 0;
+
+      function render() {
+        countEl.textContent = String(count);
+        labelEl.textContent = LABELS[counter_label_kind(count)];
+      }
+
+      buttonEl.addEventListener("click", function () {
+        count = counter_clicked(count);
+        counter_log(count); // goes through __rt.js_log_i32 -> console.log
+        render();
+      });
+
+      render();
+    </script>
+  </body>
+</html>

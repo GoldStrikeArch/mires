@@ -1,0 +1,128 @@
+# Upstream babel-plugin fixtures (verbatim copy)
+
+These directories are copied **byte for byte** from the pinned dom-expressions
+monorepo. Nothing here is authored by us and nothing here should ever be edited
+by hand.
+
+## Origin
+
+| | |
+|---|---|
+| repo | `ryansolid/dom-expressions` |
+| commit | `56bd4054237b031c0cca8c1ec69da162c52ed4a6` |
+| path | `packages/babel-plugin-jsx-dom-expressions/test/` |
+| plugin version at that commit | `0.40.7` |
+| extracted | 2026-07-29 |
+| copied by | `contract/harness/import-upstream-fixtures.mjs` |
+
+Families copied: `__dom_fixtures__`, `__dom_hydratable_fixtures__`, `__ssr_hydratable_fixtures__`.
+
+## What they are
+
+Each case directory holds:
+
+- `code.js`, the JSX input (named `.js` despite being JSX; the plugin pulls
+  in `@babel/plugin-syntax-jsx` itself, and babel-plugin-tester does not infer
+  a parser from the extension).
+- `output.js`, the expected compiled output, as produced by
+  babel-plugin-tester and **formatted with prettier** before being written.
+
+## Why they are committed
+
+They are the ground truth for G0 proof 3. `contract/harness/verify-reference.mjs`
+compiles every `code.js` with our pinned toolchain and compares against
+`output.js`. A byte match proves our pin, babel version, plugin version,
+plugin options, and formatter, is faithful to the tree that produced them.
+
+Reproducing them exactly requires more than the plugin version:
+
+- `@babel/core@7.20.12` with `@babel/traverse@7.23.2`
+  forced. `Scope.generateUid` numbering changed in later 7.x, which renames every
+  `_tmpl$`/`_el$` identifier.
+- `prettier@2.8.2` plus the upstream repo's `.prettierrc`.
+
+See `contract/CONTRACT-DOM.md` for the full option sets.
+
+## Known wrinkle
+
+Three `output.js` files lack a trailing newline where the other 40 have one
+(`__dom_fixtures__/SVG`, `__dom_hydratable_fixtures__/SVG`,
+`__ssr_fixtures__/attributeExpressions`). That is an inconsistency in the
+upstream repo, not a formatting difference, our output is prettier's, which
+always ends with a newline. `verify-reference.mjs` reports those three as
+`trailing-whitespace` rather than `exact`.
+
+## Integrity
+
+68 files. sha256 of each, so an accidental edit is detectable:
+
+```
+170d33b76a345918f266b7cce487b5704489daa6aa8216e6cde4104efab213dd  __dom_fixtures__/SVG/code.js
+558ce58770c68cba1ded90b685672d82f763aa686dd79ded8e9a1dfef42777c2  __dom_fixtures__/SVG/output.js
+43b48600d744f4967480c3d4fd6f250d8a07be221bd2e5ceb27896d5cdb96c30  __dom_fixtures__/attributeExpressions/code.js
+92974aeb2bbf781a3580754ee3a90fe3fa1ef8c047e3a290d026e0c6c056bb12  __dom_fixtures__/attributeExpressions/output.js
+233cee019382fee1263fd16615d8784cabf18d8b30d1749be6200b0c80ef6a82  __dom_fixtures__/components/code.js
+6c67ca959c8f3d8e425edd213f227a9ba9d65db87c95df413f77cecff38fb2bb  __dom_fixtures__/components/output.js
+f7c11596bb46c9774d42a9b76518c215b6c5d5c60656b680b5a1f9b12278c5cd  __dom_fixtures__/conditionalExpressions/code.js
+39ec92f579f582fde77b548e38fd10e8196a0bcf417e4294e3de958e4449bec4  __dom_fixtures__/conditionalExpressions/output.js
+b9ac643ae138019cc4ce3142344892302b90aad4904254af298951fe24e18023  __dom_fixtures__/customElements/code.js
+34ebee91d41e413f6684139ba95a5fdaf5cad4409b36dc6b70fe00e84dd05462  __dom_fixtures__/customElements/output.js
+0023bd7cf75450bd947850af32696b4eeeef9f5f409bbe6043e29f1317f56ed0  __dom_fixtures__/eventExpressions/code.js
+b44b154e3b589cee57b4ac4a547c062348b2c3ccfd7583754bb30a77981a22b6  __dom_fixtures__/eventExpressions/output.js
+197d46b674befdb2375295a01559aad91e536f28d1e56c6053ae53a0149eef57  __dom_fixtures__/fragments/code.js
+74f4c1f83cf9c5faf8be0c18e667032534f7a6a64efd9ab483b921642e130f53  __dom_fixtures__/fragments/output.js
+bf3ed1259943a60bcfa090aa38284b9e908832f62efde46ac5b3c689add5a5a9  __dom_fixtures__/insertChildren/code.js
+e05179b70e3b79a18eeedd173ae901b98670466b3bf669e901e3400dcdf655d5  __dom_fixtures__/insertChildren/output.js
+67a4e3d0b5640b02a510018719a0eeada4455372565088450dcaa64ea95ee656  __dom_fixtures__/namespaceElements/code.js
+e699d2a4bff5e257c581d27a2211360c28b0625fdbffbc930a645454c35ba6d2  __dom_fixtures__/namespaceElements/output.js
+e0dd505ad89e24bb6dd587f96819c9af5b2e457464ed953692e46dc6b62469eb  __dom_fixtures__/simpleElements/code.js
+b01570ca2ff3bd37d6e1cd3a6816523d3552dccc102bf581e9a05029d45cf10d  __dom_fixtures__/simpleElements/output.js
+62ce2de9556302c1c4cb8d4e026a9ba0b3d20de54e38d9a905e82ad1192dc2e1  __dom_fixtures__/textInterpolation/code.js
+4e00906e5dc7705a9efbc595c53ea0e5990f037d16ee37613e7d129fadf62aba  __dom_fixtures__/textInterpolation/output.js
+170d33b76a345918f266b7cce487b5704489daa6aa8216e6cde4104efab213dd  __dom_hydratable_fixtures__/SVG/code.js
+e51ed2490b58ed2ac20db66cbced48aee2e3a6d8e13e8c3c3239effc911248f1  __dom_hydratable_fixtures__/SVG/output.js
+4df56763e7ca8590ff7a499d21f7fa10f5a3a30df5d70551d9480b40545b1160  __dom_hydratable_fixtures__/attributeExpressions/code.js
+e6213470b0fddff3f4598e1f506909f174bef47d3ded1e8e523b95ef59bf5ed0  __dom_hydratable_fixtures__/attributeExpressions/output.js
+4cef02ed09b2c69f5a4479521e1fd9fbd91bf5717a3c420a1b031c6309bb19b2  __dom_hydratable_fixtures__/components/code.js
+a1f6add654a3e487ba4497b918c84252b5af0e1f7d61101b543d0136de6e9c48  __dom_hydratable_fixtures__/components/output.js
+798fee7d1b054ca5e4ecf13f35309dffc417d9b563f60363b93b39ac5fa71b50  __dom_hydratable_fixtures__/conditionalExpressions/code.js
+d2e63c42f35b4f3aa9998cf8189ce826d1ad89a2eea7be875b90446b659a266d  __dom_hydratable_fixtures__/conditionalExpressions/output.js
+61592b8d5d74d55870a6170af65db60a4454b182ffc53a0fd3f3d28ca25d3eb4  __dom_hydratable_fixtures__/customElements/code.js
+747ab9c11b360c6e543af677ce7081d2d6951fe38469fe41dde5d174df5189bb  __dom_hydratable_fixtures__/customElements/output.js
+41cdaccb264e18597f1f7e89034dd4cca7efcc0b774f40ac6096416d24396839  __dom_hydratable_fixtures__/document/code.js
+636c0f3c54640ff81a59e4dcbb0ed8e7b92ec01add471db9048f3b01e2c9a132  __dom_hydratable_fixtures__/document/output.js
+4d2938535c658d57e2e6e5fa4f07509abcc68088208a5af50c9c3f7cc1e4573b  __dom_hydratable_fixtures__/eventExpressions/code.js
+990612365d1a281cbaec7315a712a9a2cb811956fbb3460bc05928f20f2ec685  __dom_hydratable_fixtures__/eventExpressions/output.js
+dbc19e27a1d8c5c3278e990994e3fa6f482c2aba49271e3c948803fa36f5e255  __dom_hydratable_fixtures__/flags/code.js
+a0f76a3f056855e833884bc34a5afca8435e29ecb7215cf14fa38ec70c6ec870  __dom_hydratable_fixtures__/flags/output.js
+197d46b674befdb2375295a01559aad91e536f28d1e56c6053ae53a0149eef57  __dom_hydratable_fixtures__/fragments/code.js
+58cb9f6577fe8278e31c14bd59de77ee6ede16fdfb82a0f8826eb8dcfd1aaf6e  __dom_hydratable_fixtures__/fragments/output.js
+f66197ba34e45c26ef157107492c89e1fea5684209f5e937a0555c2de66b9ac4  __dom_hydratable_fixtures__/insertChildren/code.js
+955bbf99b39c1ce1938100b23d1403bfeef437341815e74c552858807a827957  __dom_hydratable_fixtures__/insertChildren/output.js
+e0dd505ad89e24bb6dd587f96819c9af5b2e457464ed953692e46dc6b62469eb  __dom_hydratable_fixtures__/simpleElements/code.js
+6690738dbed7299ff4546be27cbe7e77363ea4ce4e037e5548c1f8fc8b33db81  __dom_hydratable_fixtures__/simpleElements/output.js
+fd07c53564481259a70af1e116844384bde2b1e9c0acd9d1c56f27fc4088f52f  __dom_hydratable_fixtures__/textInterpolation/code.js
+8842313653bfd91ae51782c802d776474cb2852a1b13a004b8d98ffb95e5a88f  __dom_hydratable_fixtures__/textInterpolation/output.js
+170d33b76a345918f266b7cce487b5704489daa6aa8216e6cde4104efab213dd  __ssr_hydratable_fixtures__/SVG/code.js
+986faeec8601b7ce293b914f4c0303be5c83b10b621eb6195a8eb3bb78aea6f0  __ssr_hydratable_fixtures__/SVG/output.js
+8d4fe466215d572538da6aba4eb619399910518ed89e3ba4248bfb0d394f5fe7  __ssr_hydratable_fixtures__/attributeExpressions/code.js
+d2d8d50cec66ee3ac528a4b00320f85a2c8032c6fee093e5a00904bb0b0c948b  __ssr_hydratable_fixtures__/attributeExpressions/output.js
+4cef02ed09b2c69f5a4479521e1fd9fbd91bf5717a3c420a1b031c6309bb19b2  __ssr_hydratable_fixtures__/components/code.js
+703288615bacc29149ffccf2798785da6a9be5998e08438ab3f3f63a31358c73  __ssr_hydratable_fixtures__/components/output.js
+0cf918734b177d855c502d1e5e3e46ab8294f1d8edf27a32034451292f038269  __ssr_hydratable_fixtures__/conditionalExpressions/code.js
+4e1d9d63e5527b4a10926dd0d87b2531792784aa8e14659db1e9829024fce936  __ssr_hydratable_fixtures__/conditionalExpressions/output.js
+61592b8d5d74d55870a6170af65db60a4454b182ffc53a0fd3f3d28ca25d3eb4  __ssr_hydratable_fixtures__/customElements/code.js
+85972fad15169b7183435be2d3b31c55db288262a2255aaf305a8fab638b4d5b  __ssr_hydratable_fixtures__/customElements/output.js
+f71750b6ea1feb94d01caafd2c7ff34e3d158f3d0b2c93c2a069d0869953ea55  __ssr_hydratable_fixtures__/document/code.js
+34e82be0e1843fac6fd9fb7de6014376e400974daa4310d41950930913943151  __ssr_hydratable_fixtures__/document/output.js
+b5f26e3825ec07ee09329c5230ea4ade89189dd711f76a18df3558c6c8593f54  __ssr_hydratable_fixtures__/flags/code.js
+43ce86c31d7ae0f114a7eec749df99f8bfd2de5ee4ac5edbffc112e96907724f  __ssr_hydratable_fixtures__/flags/output.js
+197d46b674befdb2375295a01559aad91e536f28d1e56c6053ae53a0149eef57  __ssr_hydratable_fixtures__/fragments/code.js
+b0ebbbe2b8209350e6805c1049faf2de8c0dfebdf2b6d47ba52a234462592e8b  __ssr_hydratable_fixtures__/fragments/output.js
+ccf6040f6ea6970391d36103ea04b409c08da09ebd2258b3bf52b0c7f1a46e1c  __ssr_hydratable_fixtures__/insertChildren/code.js
+e9ce0403af7231139e48c21cb10f82243207ec0e23ee92e22bcf32e5d054012b  __ssr_hydratable_fixtures__/insertChildren/output.js
+e0dd505ad89e24bb6dd587f96819c9af5b2e457464ed953692e46dc6b62469eb  __ssr_hydratable_fixtures__/simpleElements/code.js
+ed5fb3b563657819c0ba2a46115ce371e8269028afe83caf5b697bde17b3d2ec  __ssr_hydratable_fixtures__/simpleElements/output.js
+fd07c53564481259a70af1e116844384bde2b1e9c0acd9d1c56f27fc4088f52f  __ssr_hydratable_fixtures__/textInterpolation/code.js
+1eb6dd175d813568d9a92095e5ee50f87402f9399f86d6759edc549dafa26c00  __ssr_hydratable_fixtures__/textInterpolation/output.js
+```

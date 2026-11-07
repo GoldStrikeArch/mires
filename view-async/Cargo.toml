@@ -1,0 +1,8 @@
+[package]
+name = "view-async"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+view-abi = { path = "../view-abi" }

@@ -1,0 +1,10 @@
+function rust_entry() {
+  x11_unit_fn$shout$hb23f80473e1b8316(41);
+  x11_unit_fn$nothing$hde0fca8cc91be5e7();
+  x11_unit_fn$mini_core$print_i32$h5f986493799b2aae(0);
+}
+function x11_unit_fn$nothing$hde0fca8cc91be5e7() {}
+function x11_unit_fn$shout$hb23f80473e1b8316(x) {
+  x11_unit_fn$mini_core$print_i32$h5f986493799b2aae(x);
+  x11_unit_fn$mini_core$print_i32$h5f986493799b2aae(x + 1 | 0);
+}

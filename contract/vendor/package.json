@@ -1,0 +1,51 @@
+{
+  "name": "@topcoat-spike/dom-contract-vendor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pinned upstream toolchain the dom-expressions contract extractors run against. Every version is exact -- zero ranges -- so a re-run either reproduces the committed fixtures or reports drift.",
+  "scripts": {
+    "fetch": "./fetch.sh",
+    "verify-pins": "node ../harness/verify-pins.mjs"
+  },
+  "dependencies": {
+    "@babel/core": "7.20.12",
+    "babel-plugin-jsx-dom-expressions": "0.40.7",
+    "babel-plugin-tester": "10.1.0",
+    "dom-expressions": "0.40.8",
+    "parse5": "7.3.0",
+    "prettier": "2.8.2",
+    "solid-js": "1.9.14"
+  },
+  "resolutions": {
+    "@babel/traverse": "7.23.2",
+    "@babel/generator": "7.20.7"
+  },
+  "$note-babel-internals": [
+    "@babel/traverse and @babel/generator are FORCED to the versions in upstream's",
+    "pnpm-lock at 56bd405. They are transitive deps of @babel/core, and yarn would",
+    "otherwise hoist newer ones that satisfy core's caret ranges.",
+    "This is load-bearing for byte-matching: Scope.generateUid lives in traverse,",
+    "and its numbering changed after 7.23 -- a newer traverse emits _tmpl$0/_el$0",
+    "where the committed fixtures have _tmpl$10/_el$10. Same identifiers, different",
+    "names, so every downstream reference differs too."
+  ],
+  "$note-prettier": [
+    "prettier is pinned to 2.8.2 and babel-plugin-tester to 10.1.0 -- the exact",
+    "versions in the upstream repo's pnpm-lock at 56bd405. This is NOT optional",
+    "trivia: babel-plugin-tester formats every fixture output.js through prettier",
+    "before writing it, so the committed expected outputs are prettier-2.8.2",
+    "artifacts. Reproducing them byte-for-byte (G0 proof 3) requires the same",
+    "prettier major AND the repo's .prettierrc. See CONTRACT-DOM.md point 1."
+  ],
+  "$note-jsdom": [
+    "jsdom is deliberately NOT a dependency. It was in the original spec, but:",
+    "(a) nothing here needs a live DOM -- the tree oracle is parse5-only and",
+    "    trace.mjs is a synthetic recorder that must NOT touch a real DOM;",
+    "(b) jsdom >=30 requires node ^24.15.0 (this env is 24.5.0); and",
+    "(c) jsdom >=30 depends on parse5 ^8, which would put a SECOND parse5 major",
+    "    in the tree. The oracle must use the same parse5 the reference plugin",
+    "    uses (^7.1.2) or the two can disagree on HTML tree construction.",
+    "If a live DOM is ever needed, add jsdom@26 (parse5 7) rather than 30."
+  ]
+}

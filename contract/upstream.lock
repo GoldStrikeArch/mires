@@ -1,0 +1,54 @@
+{
+  "$comment": [
+    "Machine-readable pin of every upstream source the dom-expressions contract",
+    "is extracted from. vendor/fetch.sh reads this file and verifies each",
+    "download against it. Bumping a version here and re-running the harness",
+    "extractors produces a diff that IS the drift report."
+  ],
+  "extractionDate": "2026-07-29",
+  "npm": {
+    "dom-expressions": {
+      "version": "0.40.8",
+      "integrity": "sha512-BCa4LfBBqJ7mCRPPJ5ccRRBz3+Ws/dkmEfkGx0GxVtRhJdI0HDrJCCd6DlA7JFNPomt3cQY2xPnDukyp/4DSFw==",
+      "gitHead": "56bd4054237b031c0cca8c1ec69da162c52ed4a6",
+      "role": "the runtime ABI + constants tables (client.js, constants.js)"
+    },
+    "solid-js": {
+      "version": "1.9.14",
+      "integrity": "sha512-sAEXC0Kk0S1EDg+8ysEWJDbYhA3RRoEjwuySUGlKIemeo0I5YZfOyumNjNs9Sv3y2nmhD+0rW66ag2HsMuQiGQ==",
+      "gitHead": null,
+      "role": "escape(), getContextId(), generateHydrationScript(); also the concrete rxcore impl the vendored runtime artifact bundles"
+    },
+    "babel-plugin-jsx-dom-expressions": {
+      "version": "0.40.7",
+      "integrity": "sha512-/O6JWUmjv03OI9lL2ry9bUjpD5S3PclM55RRJEyCdcFZ5W2SEA/59d+l2hNsk3gI6kiWRdRPdOtqZmsQzFN1pQ==",
+      "gitHead": "3c01eb2ac61b193d4164319befe3f1b2634549cb",
+      "role": "the reference compiler; compile-reference.mjs drives it",
+      "$note": "gitHead differs from dom-expressions@0.40.8 -- see contract/CONTRACT-DOM.md point 0 and vendor/PLUGIN-PARITY.md"
+    },
+    "@babel/core": {
+      "version": "7.20.12",
+      "integrity": "sha512-XsMfHovsUYHFMdrIHkZphTN/2Hzzi78R08NuHfDBehym2VsPDL6Zn/JAD/JQdnRvbSsbQc4mVaU1m6JgtTEElg==",
+      "role": "drives the plugin. Pinned to the EXACT version in upstream's pnpm-lock at 56bd405. Not merely 7.x: babel's generateUid numbering changed after 7.20, so a newer 7.x emits _tmpl$0 where the committed fixtures have _tmpl$10. Byte-matching upstream's outputs requires this exact version. @babel/core 8 is incompatible outright (peerDependency is ^7.20.12)."
+    },
+    "parse5": {
+      "version": "7.3.0",
+      "integrity": "sha512-IInvU7fabl34qmi9gY8XOVxhYyMyuH2xUNpb2q8/Y+7552KlejkRvqvD19nMoUW/uQGGbqNpA6Tufu5FL5BZgw==",
+      "role": "tree-construction oracle. Pinned to the SAME major the plugin itself depends on (^7.1.2) so the oracle and the reference compiler agree on HTML parsing."
+    },
+    "typescript": {
+      "version": "5.9.3",
+      "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
+      "role": "type-checks the backend's emitted .d.ts, and a consuming .ts fixture per island, with `tsc --noEmit`. Nothing else here uses it and nothing resolves through it: it is invoked as a program from upstream/typescript/bin/tsc, never imported.",
+      "$note-why-5-and-not-7": "typescript 7.x is the native port and ships its compiler as ~20 platform-specific optional dependencies (@typescript/typescript-darwin-arm64 and friends), so the pin would resolve to a different artifact per machine and a single sha512 could not cover it. 5.9.3 is the last line that is pure JavaScript with ZERO dependencies, which is what makes it trivially pinnable the way every other entry here is: one tarball, one hash, no tree. Its engines field is node >=14.17, so this environment's 24.5 is fine.",
+      "$note-not-in-vendor-package-json": "Deliberately NOT added to vendor/package.json. Doing so would rewrite yarn.lock, and that lockfile is load-bearing for byte-matching: it forces @babel/traverse and @babel/generator to upstream's exact versions. A tool that is only ever spawned as a subprocess does not need to be in the module graph, so it is fetched and hash-verified like every other upstream artifact and left out of the install."
+    }
+  },
+  "git": {
+    "repo": "ryansolid/dom-expressions",
+    "sha": "56bd4054237b031c0cca8c1ec69da162c52ed4a6",
+    "integrity": "sha512-IFbnBOquwBF/JiOvPhmwi9sh/f6W4KVU/2vTg76eDgkmU6MfYjQ7Kd7t1qmnhj8byKvwLbLD8mR7lxBRh9mSFA==",
+    "role": "the babel-plugin test fixture dirs only (__dom_fixtures__, __dom_hydratable_fixtures__, __ssr_hydratable_fixtures__) + file:line sources for CONTRACT-DOM.md",
+    "$note": "github codeload tarballs are not contractually byte-stable; the commit sha is the authoritative pin and the integrity above is advisory (fetch.sh warns rather than fails on mismatch)."
+  }
+}

@@ -1,0 +1,26 @@
+n=42 i=-7 u=5
+0 255 -2147483648 4294967295
+-9223372036854775808 18446744073709551615
+ff FF 101 100
+0xff 0xFF 0b101 0o100
+ffffffff 11111110
+[      42][42      ][   42   ]
+[0007][-007][+7][-7]
+[    hi][hi    ][  hi  ]
+[****hi][hi----][..hi..]
+[   Z][Z   ][ Z  ]
+[123456][abcdef]
+[abc][abc     ]
+s=text c=Z c=é
+a b a 3
+9 v
+[   5][  6]
+true false -40C
+{1} literal
+0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz|1
+a literal with no arguments
+false
+true
+direct! 2
+6
+122333

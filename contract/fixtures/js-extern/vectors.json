@@ -1,0 +1,678 @@
+{
+  "$generatedBy": "contract/harness/check-js-extern.mjs",
+  "$doNotEditByHand": "Re-run the driver instead. Edit fixtures/js-extern/drivers.mjs, then re-record.",
+  "$whatThisIs": "The expected JS-level call trace for each `#[js_extern]` call shape, produced by executing the reference emission in `js` against fixtures/js-extern/chart-lib.mjs.",
+  "$notDerivedFromUpstream": "Unlike every other fixture here, nothing on this page comes from a pinned upstream package. The descriptor design is ours; the fake library is ours. What keeps it honest is the assertions in drivers.mjs, which run on every check.",
+  "$howTheBackendUsesThis": [
+    "Compile a module whose `#[js_extern]` declarations describe chart-lib.mjs.",
+    "Resolve its import specifier for the library to fixtures/js-extern/chart-lib.mjs (the way run-trace.mjs resolves `r-dom` to the recording stub).",
+    "Drive it so it performs the operation named by a vector's `id`.",
+    "Compare `__trace()` with that vector's `trace` using compareTrace() from check-js-extern.mjs.",
+    "The emitted JS need not match `js`. It must be indistinguishable at the trace."
+  ],
+  "$shapes": {
+    "new": "construct: `new B(...)`. Negative arm included -- a plain call throws.",
+    "send": "a method on an instance: `x.m(...)`. Argument count is observable.",
+    "get": "a property read, rooted at an instance or at the module binding, one or more scope steps.",
+    "set": "a property assignment. Not required this wave.",
+    "index": "an element read out of an indexed collection, by a runtime index.",
+    "call": "a function reached through a scope path: `B.m(...)`. Not required this wave."
+  },
+  "$env": {
+    "canvas": {
+      "nodeName": "CANVAS",
+      "id": "revenue"
+    },
+    "config": {
+      "type": "line",
+      "title": "Revenue",
+      "data": {
+        "labels": [
+          "Q1",
+          "Q2"
+        ],
+        "datasets": [
+          {
+            "label": "Revenue",
+            "values": [
+              10,
+              20
+            ]
+          },
+          {
+            "label": "Cost",
+            "values": [
+              4,
+              6
+            ]
+          }
+        ],
+        "points": [
+          {
+            "x": 0,
+            "y": 10
+          },
+          {
+            "x": 1,
+            "y": 20
+          }
+        ]
+      }
+    },
+    "nextData": {
+      "labels": [
+        "Q3"
+      ],
+      "datasets": [
+        {
+          "label": "Revenue",
+          "values": [
+            30
+          ]
+        }
+      ],
+      "points": [
+        {
+          "x": 2,
+          "y": 30
+        }
+      ]
+    },
+    "plugin": {
+      "id": "tooltip"
+    }
+  },
+  "vectors": [
+    {
+      "id": "new-named",
+      "shape": "new",
+      "required": true,
+      "why": "Construction through the NAMED export, the ordinary case: two arguments, a fresh instance returned.",
+      "js": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "trace": [
+        {
+          "op": "new",
+          "ctor": "Chart",
+          "via": "named",
+          "argc": 2,
+          "args": [
+            "node(canvas)",
+            {
+              "data": {
+                "datasets": [
+                  {
+                    "label": "Revenue",
+                    "values": [
+                      10,
+                      20
+                    ]
+                  },
+                  {
+                    "label": "Cost",
+                    "values": [
+                      4,
+                      6
+                    ]
+                  }
+                ],
+                "labels": [
+                  "Q1",
+                  "Q2"
+                ],
+                "points": [
+                  {
+                    "x": 0,
+                    "y": 10
+                  },
+                  {
+                    "x": 1,
+                    "y": 20
+                  }
+                ]
+              },
+              "title": "Revenue",
+              "type": "line"
+            }
+          ],
+          "result": "chart#0"
+        }
+      ],
+      "returned": "chart#0",
+      "threw": null
+    },
+    {
+      "id": "new-default",
+      "shape": "new",
+      "required": true,
+      "why": "The same construction through the DEFAULT export. The library offers both bindings; a descriptor has to name one, and the trace records which was taken.",
+      "js": [
+        "(m) => new m.default(env.canvas, env.config)"
+      ],
+      "trace": [
+        {
+          "op": "new",
+          "ctor": "Chart",
+          "via": "default",
+          "argc": 2,
+          "args": [
+            "node(canvas)",
+            {
+              "data": {
+                "datasets": [
+                  {
+                    "label": "Revenue",
+                    "values": [
+                      10,
+                      20
+                    ]
+                  },
+                  {
+                    "label": "Cost",
+                    "values": [
+                      4,
+                      6
+                    ]
+                  }
+                ],
+                "labels": [
+                  "Q1",
+                  "Q2"
+                ],
+                "points": [
+                  {
+                    "x": 0,
+                    "y": 10
+                  },
+                  {
+                    "x": 1,
+                    "y": 20
+                  }
+                ]
+              },
+              "title": "Revenue",
+              "type": "line"
+            }
+          ],
+          "result": "chart#0"
+        }
+      ],
+      "returned": "chart#0",
+      "threw": null
+    },
+    {
+      "id": "new-without-new",
+      "shape": "new",
+      "required": true,
+      "why": "The negative for the `new` shape. A lowering that emits a plain call where the descriptor said `new` does not silently produce a wrong-looking chart -- it throws, the way a real class does. Recorded so the failure mode is pinned rather than assumed.",
+      "js": [
+        "(m) => m.Chart(env.canvas, env.config)"
+      ],
+      "trace": [
+        {
+          "op": "new.withoutNew",
+          "ctor": "Chart",
+          "via": "named",
+          "argc": 2,
+          "args": [
+            "node(canvas)",
+            {
+              "data": {
+                "datasets": [
+                  {
+                    "label": "Revenue",
+                    "values": [
+                      10,
+                      20
+                    ]
+                  },
+                  {
+                    "label": "Cost",
+                    "values": [
+                      4,
+                      6
+                    ]
+                  }
+                ],
+                "labels": [
+                  "Q1",
+                  "Q2"
+                ],
+                "points": [
+                  {
+                    "x": 0,
+                    "y": 10
+                  },
+                  {
+                    "x": 1,
+                    "y": 20
+                  }
+                ]
+              },
+              "title": "Revenue",
+              "type": "line"
+            }
+          ]
+        }
+      ],
+      "returned": "undefined",
+      "threw": "TypeError: Chart is a constructor and cannot be invoked without 'new'"
+    },
+    {
+      "id": "send-one-arg",
+      "shape": "send",
+      "required": true,
+      "why": "A method on an instance, one argument, no useful return value. The commonest shape in the dashboard: push new data at an existing chart.",
+      "setup": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "js": [
+        "(m, instance) => instance.update(env.nextData)"
+      ],
+      "trace": [
+        {
+          "op": "send",
+          "target": "chart#0",
+          "method": "update",
+          "argc": 1,
+          "args": [
+            {
+              "datasets": [
+                {
+                  "label": "Revenue",
+                  "values": [
+                    30
+                  ]
+                }
+              ],
+              "labels": [
+                "Q3"
+              ],
+              "points": [
+                {
+                  "x": 2,
+                  "y": 30
+                }
+              ]
+            }
+          ],
+          "returned": "undefined"
+        }
+      ],
+      "returned": "undefined",
+      "threw": null
+    },
+    {
+      "id": "send-zero-args",
+      "shape": "send",
+      "required": true,
+      "why": "A zero-argument method. The empty argument list has to be empty, not a list containing one `undefined` -- the same asymmetry PROCEDURES.md records for the procedure wire, in a different place.",
+      "setup": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "js": [
+        "(m, instance) => instance.destroy()"
+      ],
+      "trace": [
+        {
+          "op": "send",
+          "target": "chart#0",
+          "method": "destroy",
+          "argc": 0,
+          "args": [],
+          "returned": "undefined"
+        }
+      ],
+      "returned": "undefined",
+      "threw": null
+    },
+    {
+      "id": "send-trailing-omitted",
+      "shape": "send",
+      "required": true,
+      "why": "An optional trailing argument the caller did not supply. This is Melange's trailing-`undefined` stripping made observable: the library branches on `arguments.length`, so the two spellings are NOT equivalent, and the descriptor has to pick one.",
+      "setup": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "js": [
+        "(m, instance) => instance.resize(800)"
+      ],
+      "trace": [
+        {
+          "op": "send",
+          "target": "chart#0",
+          "method": "resize",
+          "argc": 1,
+          "args": [
+            800
+          ],
+          "returned": "undefined"
+        }
+      ],
+      "returned": "undefined",
+      "threw": null
+    },
+    {
+      "id": "send-trailing-undefined",
+      "shape": "send",
+      "required": true,
+      "why": "The same call written with the trailing argument spelled `undefined`. Its trace differs from `send-trailing-omitted` in `argc`, which is the whole point: if a lowering pads optional arguments, this is where it shows.",
+      "setup": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "js": [
+        "(m, instance) => instance.resize(800, undefined)"
+      ],
+      "trace": [
+        {
+          "op": "send",
+          "target": "chart#0",
+          "method": "resize",
+          "argc": 2,
+          "args": [
+            800,
+            "undefined"
+          ],
+          "returned": "undefined"
+        }
+      ],
+      "returned": "undefined",
+      "threw": null
+    },
+    {
+      "id": "nullable-some",
+      "shape": "send",
+      "required": true,
+      "returnWrapper": "nullToOption",
+      "why": "The in-range read of a fallible accessor. Half of the `null_to_opt` return wrapper: this arm has to arrive as a present value.",
+      "setup": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "js": [
+        "(m, instance) => instance.getPoint(0)"
+      ],
+      "trace": [
+        {
+          "op": "send",
+          "target": "chart#0",
+          "method": "getPoint",
+          "argc": 1,
+          "args": [
+            0
+          ],
+          "returned": {
+            "x": 0,
+            "y": 10
+          }
+        }
+      ],
+      "returned": {
+        "x": 0,
+        "y": 10
+      },
+      "threw": null
+    },
+    {
+      "id": "nullable-none",
+      "shape": "send",
+      "required": true,
+      "returnWrapper": "nullToOption",
+      "why": "The out-of-range read. The library answers `null` -- JSON's null, not `undefined`. A wrapper that only tests `=== undefined` passes every other vector on this page and fails here.",
+      "setup": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "js": [
+        "(m, instance) => instance.getPoint(99)"
+      ],
+      "trace": [
+        {
+          "op": "send",
+          "target": "chart#0",
+          "method": "getPoint",
+          "argc": 1,
+          "args": [
+            99
+          ],
+          "returned": null
+        }
+      ],
+      "returned": null,
+      "threw": null
+    },
+    {
+      "id": "get-property",
+      "shape": "get",
+      "required": true,
+      "why": "Reading a property off an instance. Distinct from `send`: no call, no arguments, and a lowering that emitted `chart.data()` would find a non-function.",
+      "setup": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "js": [
+        "(m, instance) => instance.data"
+      ],
+      "trace": [
+        {
+          "op": "get",
+          "target": "chart#0",
+          "prop": "data",
+          "value": "chart#0.data"
+        }
+      ],
+      "returned": "chart#0.data",
+      "threw": null
+    },
+    {
+      "id": "get-scoped",
+      "shape": "get",
+      "required": true,
+      "why": "A two-step read, `chart.data.datasets`. The descriptor's scope axis is what makes this one declaration rather than two, and the trace shows both steps -- a lowering cannot collapse them, because each step is a real property read.",
+      "setup": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "js": [
+        "(m, instance) => instance.data.datasets"
+      ],
+      "trace": [
+        {
+          "op": "get",
+          "target": "chart#0",
+          "prop": "data",
+          "value": "chart#0.data"
+        },
+        {
+          "op": "get",
+          "target": "chart#0.data",
+          "prop": "datasets",
+          "value": "chart#0.data.datasets"
+        }
+      ],
+      "returned": "chart#0.data.datasets",
+      "threw": null
+    },
+    {
+      "id": "get-static",
+      "shape": "get",
+      "required": true,
+      "why": "A property on the module binding rather than on an instance. Same shape, different scope root.",
+      "js": [
+        "(m) => m.Chart.version"
+      ],
+      "trace": [
+        {
+          "op": "get",
+          "target": "Chart",
+          "via": "named",
+          "prop": "version",
+          "value": "0.0.0-fake"
+        }
+      ],
+      "returned": "0.0.0-fake",
+      "threw": null
+    },
+    {
+      "id": "set-property",
+      "shape": "set",
+      "required": false,
+      "why": "Assignment to a property. Listed as not-required for this wave -- the dashboard's four shapes are new/send/get/index -- but it shares the getter's scope machinery and costs nothing to pin now.",
+      "setup": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "js": [
+        "(m, instance) => {",
+        "  instance.title = \"Revenue, restated\";",
+        "}"
+      ],
+      "trace": [
+        {
+          "op": "set",
+          "target": "chart#0",
+          "prop": "title",
+          "value": "Revenue, restated"
+        }
+      ],
+      "returned": "undefined",
+      "threw": null
+    },
+    {
+      "id": "index-in-range",
+      "shape": "index",
+      "required": true,
+      "why": "An element read out of an indexed collection. The index is a runtime value, which is why this is its own shape rather than another `get` with a constant path.",
+      "setup": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "js": [
+        "(m, instance) => instance.data.datasets[0]"
+      ],
+      "trace": [
+        {
+          "op": "get",
+          "target": "chart#0",
+          "prop": "data",
+          "value": "chart#0.data"
+        },
+        {
+          "op": "get",
+          "target": "chart#0.data",
+          "prop": "datasets",
+          "value": "chart#0.data.datasets"
+        },
+        {
+          "op": "index",
+          "target": "chart#0.data.datasets",
+          "index": 0,
+          "value": {
+            "label": "Revenue",
+            "values": [
+              10,
+              20
+            ]
+          }
+        }
+      ],
+      "returned": {
+        "label": "Revenue",
+        "values": [
+          10,
+          20
+        ]
+      },
+      "threw": null
+    },
+    {
+      "id": "index-length",
+      "shape": "index",
+      "required": true,
+      "why": "The collection's length. Anything iterating the collection from Rust needs it, and it is a `get` on the collection rather than an `index` -- so a descriptor that models a collection as opaque cannot express the loop.",
+      "setup": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "js": [
+        "(m, instance) => instance.data.datasets.length"
+      ],
+      "trace": [
+        {
+          "op": "get",
+          "target": "chart#0",
+          "prop": "data",
+          "value": "chart#0.data"
+        },
+        {
+          "op": "get",
+          "target": "chart#0.data",
+          "prop": "datasets",
+          "value": "chart#0.data.datasets"
+        },
+        {
+          "op": "get",
+          "target": "chart#0.data.datasets",
+          "prop": "length",
+          "value": 2
+        }
+      ],
+      "returned": 2,
+      "threw": null
+    },
+    {
+      "id": "index-out-of-range",
+      "shape": "index",
+      "required": true,
+      "why": "The out-of-range index. The collection answers `undefined`, where `getPoint` answers `null` for the same class of mistake. Both are real library behaviour and a descriptor's return wrapper has to say which one it accepts -- assuming they are interchangeable is the bug this vector exists to catch.",
+      "setup": [
+        "(m) => new m.Chart(env.canvas, env.config)"
+      ],
+      "js": [
+        "(m, instance) => instance.data.datasets[9]"
+      ],
+      "trace": [
+        {
+          "op": "get",
+          "target": "chart#0",
+          "prop": "data",
+          "value": "chart#0.data"
+        },
+        {
+          "op": "get",
+          "target": "chart#0.data",
+          "prop": "datasets",
+          "value": "chart#0.data.datasets"
+        },
+        {
+          "op": "index",
+          "target": "chart#0.data.datasets",
+          "index": 9,
+          "value": "undefined"
+        }
+      ],
+      "returned": "undefined",
+      "threw": null
+    },
+    {
+      "id": "call-static",
+      "shape": "call",
+      "required": false,
+      "why": "A static method on the binding: `Chart.register(plugin)`. Not one of this wave's four, but it is how the real library is initialised, so the dashboard will need it and the vector is here to be met rather than discovered.",
+      "js": [
+        "(m) => m.Chart.register(env.plugin)"
+      ],
+      "trace": [
+        {
+          "op": "call",
+          "target": "Chart",
+          "via": "named",
+          "method": "register",
+          "argc": 1,
+          "args": [
+            {
+              "id": "tooltip"
+            }
+          ],
+          "returned": "undefined"
+        }
+      ],
+      "returned": "undefined",
+      "threw": null
+    }
+  ]
+}

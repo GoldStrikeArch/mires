@@ -1,0 +1,10 @@
+function rust_entry() {
+  x01_arith$mini_core$print_i32$h53421f2d7a47d2af(x01_arith$mix$h4d921c80fc2bc59d(7, 11));
+  x01_arith$mini_core$print_i32$h53421f2d7a47d2af(x01_arith$bytes$h40187762191fc19d(200, 100) | 0);
+}
+function x01_arith$bytes$h40187762191fc19d(x, y) {
+  return (x + y & 255) << (3 & 7) & 255;
+}
+function x01_arith$mix$h4d921c80fc2bc59d(a, b) {
+  return ((Math.imul(a + b | 0, 3) | 0) << 2 | 0) ^ a | 0;
+}

@@ -1,0 +1,7 @@
+{
+  "$comment": "Marks contract/ as an ES module scope so harness/*.mjs and the generated fixtures/*.js load without node's typeless-package warning. Deliberately has no dependencies -- the pinned toolchain lives in vendor/ and is reached through harness/loader.mjs.",
+  "name": "@mires/dom-contract",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module"
+}

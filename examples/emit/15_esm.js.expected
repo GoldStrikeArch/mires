@@ -1,0 +1,9 @@
+import * as __rt from "./shim.js";
+function rust_entry() {
+  x15_esm$mini_core$print_i32$h3304015e2aca8f46(x15_esm$double$h88865d0ab974941b(21));
+  x15_esm$mini_core$print_str$h3df0c9e4a9cb2296("module");
+}
+function x15_esm$double$h88865d0ab974941b(x) {
+  return x + x | 0;
+}
+export { rust_entry };

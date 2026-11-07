@@ -1,0 +1,26 @@
+rustc_codegen_mires: let `alloc` supply the default allocator.
+
+`#![default_lib_allocator]` is how a crate tells rustc "the `__rust_alloc`
+family is provided for you". `std` is the crate that normally carries it, and
+without one rustc rejects every program that allocates and has no
+`#[global_allocator]` of its own.
+
+There is no `std` here. The `__rust_*` symbols are supplied by the backend
+instead (`backend/src/alloc_support.rs`), with bodies over the runtime shim's
+heap, and that is exactly what `AllocatorKind::Default` means. Marking `alloc`
+as the crate providing it is what makes an ordinary `#![no_std]` crate with
+`extern crate alloc;` compile with no allocator boilerplate at all.
+
+--- a/library/alloc/src/lib.rs
++++ b/library/alloc/src/lib.rs
+@@ -73,6 +73,10 @@
+ #![feature(rustdoc_internals)]
+ #![no_std]
+ #![needs_allocator]
++// rustc_codegen_mires: the `__rust_alloc` family is synthesized by the backend over the runtime
++// shim's heap, which is what `AllocatorKind::Default` asks for. Saying so here is what lets a
++// `#![no_std]` crate use `alloc` without a `#[global_allocator]` of its own.
++#![default_lib_allocator]
+ // Lints:
+ #![deny(unsafe_op_in_unsafe_fn)]
+ #![deny(implicit_provenance_casts)]

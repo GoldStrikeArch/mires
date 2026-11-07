@@ -1,0 +1,14 @@
+{"$record":"header","$generatedBy":"contract/harness/gen-corpus.mjs","$doNotEditByHand":"Re-run the extractor instead. A diff here after a version bump IS the drift report.","$extractedFrom":{"dom-expressions":"0.40.8","solid-js":"1.9.14","babel-plugin-jsx-dom-expressions":"0.40.7","gitSha":"56bd4054237b031c0cca8c1ec69da162c52ed4a6"},"$extractionDate":"2026-07-29","$what":"Normalized runtime-call trace of a reference-compiled CORPUS fixture executed against harness/trace.mjs. Node identities are renamed in first-appearance order; functions become fn#N; templates become tmpl#N.","fixture":"corpus/04-event-expressions","label":"corpus/04-event-expressions","freeBindingsHealed":["handler"],"status":"completed","error":null,"recordCount":13}
+{"op":"template","tmpl":"tmpl#0","html":"<button>Click"}
+{"op":"template","tmpl":"tmpl#1","html":"<button>Change"}
+{"op":"template","tmpl":"tmpl#2","html":"<button>Custom"}
+{"op":"template","tmpl":"tmpl#3","html":"<div id=main><button>+1</button><input>"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"addEventListener","node":"tmpl#0:root","name":"click","delegate":true}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"node.addEventListener","node":"tmpl#1:root","name":"change","handler":"fn#0","options":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"addEventListener","node":"tmpl#2:root","name":"custom-event","handler":"fn#1","delegate":false}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"delegateEvents","events":["click","input"],"document":"undefined"}

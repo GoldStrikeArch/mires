@@ -1,0 +1,6 @@
+{"$record":"header","$what":"Structurally identical to base.trace with every id renumbered: tmpl#0->tmpl#4, #0->#7, #1->#9, fn#0->fn#2, fn#1->fn#5. A comparator that compares text rather than structure fails on this.","fixture":"testdata/base","label":"testdata/equal-renumbered","freeBindingsHealed":[],"status":"completed","error":null,"recordCount":5}
+{"op":"template","tmpl":"tmpl#4","html":"<div><p>a > b <!>"}
+{"op":"template.clone","tmpl":"tmpl#4","result":"#7"}
+{"op":"insert","parent":"#7","accessor":"fn#2","marker":"#9","initial":"undefined"}
+{"op":"addEventListener","node":"#7","name":"click","handler":"fn#5","delegate":true}
+{"op":"delegateEvents","events":["click"],"document":"undefined"}

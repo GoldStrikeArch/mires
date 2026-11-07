@@ -1,0 +1,76 @@
+{
+  "$what": "The corpus-wide DESIGN RECORD for accepted trace deltas: what a rule may be, what a rule may not be, and which divergences no rule can express. It is NOT the file any suite loads -- see $notLoaded.",
+  "$notLoaded": {
+    "state": "This file is loaded by no code path. scripts/dom-test.sh points `--delta` at examples/dom-tests/deltas.json, which took over in wave 4 and says so at its own :5.",
+    "liveFile": "examples/dom-tests/deltas.json -- the measured rules, per family, plus $measuredAndRetired (deltas that turned out not to occur, and why) and $whatIsDeliberatelyNotHere (the named causes every DIFFERS row cites).",
+    "liveStatus": "contract/fixtures/l2-status.json -- the per-family verdict, enforced by contract/harness/check-l2-status.mjs. Read that, not the prose here, for what any family's L2 state IS.",
+    "whyItIsStillHere": "Two reasons, both about citation. (1) The live file cites four rules BY ID as an 'ATTRIBUTED COPY of the rule of the same id in contract/fixtures/corpus/deltas.json', and CONTRACT.md:1557 cites its prediction for family 07; deleting the file would break both. (2) $ruleKinds, $rejectedRules and $notExpressibleAsRules are written nowhere else, and they are the reasoning that keeps the live file's rules honest -- particularly the rejected blanket-rewrite spelling of the escaping delta, which was caught by running it.",
+    "howToUseTheRulesBelow": "As the seed they were: each was PREDICTED from a documented fact before any comparison ran. Every one has since been confirmed or retired against a real trace, and the outcome is recorded in the live file, not here. Do not add a rule here; add it there."
+  },
+  "$doNotEditByHand": false,
+  "$howItWorks": [
+    "Keys under `fixtures` are the `fixture` field in a trace header -- gen-corpus.mjs writes `corpus/<family>`.",
+    "Every rule needs a `why`. loadDeltas refuses a rule without one: an accepted delta whose justification nobody wrote down is indistinguishable from a bug someone silenced.",
+    "A rule that matches nothing is reported as STALE, so a delta that stops occurring gets deleted rather than quietly protecting a future regression.",
+    "The same rules may also be declared in a family's NOTES.md front matter, next to the prose that explains them. 02-text-interpolation does exactly that; the copy here is the corpus-wide one."
+  ],
+  "$ruleKinds": {
+    "ignore-op": "{kind, op, why} -- drop every record with this op from BOTH sides",
+    "ignore-field": "{kind, op, field, why} -- blank one field on both sides before comparing",
+    "rewrite": "{kind, side, op, field, from, to, regex?, why} -- string-replace a field on ONE side (side: 'a' | 'b')",
+    "accept-diff": "{kind, op, field, a, b, why} -- demote one exact value pair to 'accepted'"
+  },
+  "$rejectedRules": {
+    "text-gt-escaping as a blanket rewrite": "The obvious spelling of the escaping delta is `{kind: 'rewrite', side: 'b', op: 'template', field: 'html', from: '&gt;', to: '>'}`. It is wrong, and it was caught by running it. The SAME fixture's `escape` case has the REFERENCE emitting `<span>&nbsp;&lt;Hi&gt;&nbsp;` -- the plugin copies JSX text through verbatim without decoding entities, so a source `&gt;` stays `&gt;` and is not an escape at all. A blanket rewrite mangles that template on one side only, and would then mask any genuine divergence in it. Escaping deltas must be pinned to exact value pairs with accept-diff, never pattern-rewritten.",
+    "generally": "Prefer accept-diff. `rewrite` exists for mechanical, total transformations (an identifier scheme, a path separator); reach for it only when the transformation is provably total over the field."
+  },
+  "$notExpressibleAsRules": {
+    "the getter-children double clone (family 07, case withChildren)": "The reference trace holds TWO `template.clone` records for the children template, one either side of the `createComponent` record; real solid produces one and Topcoat will produce one. The cause is harness/trace.mjs's `value()` normalizer (:186-190) reading every key of the props object to record it, which forces `get children()` before the component body runs, after which the destructure inside `Card` forces it again -- a getter is not memoised. So this is a HARNESS artifact, not a divergence between the two compilers. No rule kind can express it: ignore-op/ignore-field/rewrite/accept-diff all preserve record counts, and accept-diff only demotes ALIGNED pairs, while this shows up as one `missing-in-b`. Two ways out, neither taken here: (1) teach `value()` to record a getter-valued property as a marker instead of forcing it, which would fix the artifact at the cost of rebaselining every committed trace that carries a props object, including fixtures/reference-traces/ recorded from upstream; (2) add a `drop-record` rule kind for an accepted extra record on one side, which needs a predicate tight enough that it cannot swallow a real divergence. Until then family 07's `withChildren` is expected to report exactly one `missing-in-b` and it is written up in that family's NOTES.md."
+  },
+  "$status": "SUPERSEDED. This said 'Seeded, not measured. The Rust emitter does not compile these fixtures yet' -- true when it was written, false since wave 4 for thirteen families and false for fifteen now. The seeded rules WERE measured on first contact: `text-gt-escaping` did not occur and was retired with a written reason, and `component-props-object` / `component-fn-identity` were confirmed with their preconditions checked. All of that is recorded in examples/dom-tests/deltas.json, and the resulting per-family verdict is contract/fixtures/l2-status.json. Convention, unchanged and still the one every rule here and there uses: side 'a' is the reference trace, side 'b' is the Topcoat one.",
+  "fixtures": {
+    "corpus/02-text-interpolation": [
+      {
+        "id": "text-gt-escaping",
+        "kind": "accept-diff",
+        "op": "template",
+        "field": "html",
+        "a": "<span>Hi&lt;script>alert();&lt;/script>",
+        "b": "<span>Hi&lt;script&gt;alert();&lt;/script&gt;",
+        "why": "Topcoat's HtmlContext::Text escapes & < AND > (TEXT_ESCAPES in crates/topcoat-view/src/escape.rs); solid's text mode escapes only & and <. This is the `injection` case, where a JS string literal child is folded into the template through solid's escape(). Recorded in fixtures/escaping.json $topcoatDelta. ACCEPTED FOR THE DOM TEMPLATE STRING ONLY -- if Rust renders SSR with '&gt;' and solid's runtime re-renders the same text with '>', hydration sees a text mismatch. See 02-text-interpolation/NOTES.md."
+      }
+    ],
+    "corpus/07-components": [
+      {
+        "id": "component-props-object",
+        "kind": "ignore-field",
+        "op": "createComponent",
+        "field": "props",
+        "why": "No props object crosses the boundary on the Topcoat side. A client component is a plain Rust fn taking one props STRUCT, which the emitted call builds inside the thunk it hands over -- `move || badge(BadgeProps { label: (\"Active\"), })` (view-dom/src/lower/component.rs:62-64) -- so `_$createComponent` is passed no props (the field records as the string \"undefined\"), while the reference passes an object literal. The struct is a Rust value, never a JS object. The information is not lost from the comparison: the callee's own template records follow immediately and identify which component ran. PRECONDITION: this assumes the emitter wraps the call as `_$createComponent(thunk)` to get the hydration-context nesting (CONTRACT-DOM.md 9.5). If it instead synthesises a props object and an adapter, delete this rule -- compare-trace reports an unmatched rule as STALE, which is the signal."
+      },
+      {
+        "id": "component-fn-identity",
+        "kind": "ignore-field",
+        "op": "createComponent",
+        "field": "comp",
+        "why": "The reference passes the component FUNCTION to createComponent, so several calls to one component all record the same fn id and compare-trace preserves that aliasing deliberately. A thunk-per-call-site emission produces a distinct function per call site, so the aliasing differs even though the same component runs: in 07-components the three Badge calls are one fn on the reference side and three on the Topcoat side. Blanking the field keeps the comparison on the call SEQUENCE, which is what this family is measuring. Same PRECONDITION as component-props-object: if the emitter passes the component directly, this rule goes STALE and should be deleted rather than kept."
+      }
+    ],
+    "corpus/07b-nested-components": [
+      {
+        "id": "component-props-object",
+        "kind": "ignore-field",
+        "op": "createComponent",
+        "field": "props",
+        "why": "Same as corpus/07-components' rule of the same id: Topcoat's eager props mean there is no props object to compare. Declared per fixture because deltas are looked up by the trace header's `fixture` field."
+      },
+      {
+        "id": "component-fn-identity",
+        "kind": "ignore-field",
+        "op": "createComponent",
+        "field": "comp",
+        "why": "Same as corpus/07-components' rule of the same id. This family makes the aliasing difference sharpest: Badge is called three times from three different component bodies, which is one fn id on the reference side and three thunks on the Topcoat side."
+      }
+    ]
+  }
+}

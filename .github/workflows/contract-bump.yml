@@ -1,0 +1,160 @@
+name: Contract Bump
+
+# `contract/` pins every upstream source the dom-expressions contract is
+# extracted from, and the fixtures under `contract/fixtures` are what those pins
+# produce. Re-running the extractors either reproduces them byte for byte or the
+# difference is the drift report.
+#
+# This is that re-run, once a month. Green means the pins still reproduce the
+# committed fixtures. Drift opens an issue, with the regenerated tree attached as
+# a patch, and never a pull request: a fixture that moved is a claim about the
+# reference implementation, and accepting one is a reading job rather than a
+# merge.
+#
+# Nothing here builds Rust. The extractors are node scripts over vendored npm
+# tarballs.
+
+on:
+  schedule:
+    # The first of the month, after the nightly bump's usual slot.
+    - cron: "0 7 1 * *"
+  workflow_dispatch:
+
+concurrency:
+  group: mires-contract-bump
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  drift:
+    name: drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: contract
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: yarn
+          cache-dependency-path: contract/vendor/yarn.lock
+
+      # `fetch.sh` verifies every download against `contract/upstream.lock`, so a
+      # tampered or moved tarball fails here rather than quietly changing what
+      # the extractors read.
+      - name: fetch the pinned upstream sources
+        working-directory: contract/vendor
+        run: ./fetch.sh
+
+      - name: install the pinned toolchain
+        working-directory: contract/vendor
+        run: yarn install --frozen-lockfile
+
+      # Regenerates every fixture and reports the ones whose committed bytes
+      # differ. Allowed to fail, because its failing is the finding.
+      - name: run the extractors against the pins
+        id: check
+        run: |
+          set -uo pipefail
+          if node --import ./harness/register-loader.mjs harness/run-all.mjs --check \
+            2>&1 | tee "$RUNNER_TEMP/check.log"; then
+            echo "drift=no" >>"$GITHUB_OUTPUT"
+            echo "::notice::the pins still reproduce every committed fixture"
+          else
+            echo "drift=yes" >>"$GITHUB_OUTPUT"
+          fi
+
+      # What moved, named the way a reader wants it: how many files, then the
+      # first few, then the whole tree as a patch.
+      - name: summarize the drift
+        id: drift
+        if: steps.check.outputs.drift == 'yes'
+        working-directory: .
+        run: |
+          set -euo pipefail
+          git add --intent-to-add -- contract/fixtures
+          git --no-pager diff --stat -- contract/fixtures >"$RUNNER_TEMP/stat.txt"
+          git --no-pager diff -- contract/fixtures >"$RUNNER_TEMP/fixtures.patch"
+
+          files=$(git diff --name-only -- contract/fixtures)
+          count=$(printf '%s\n' "$files" | grep -c . || true)
+          named=$(printf '%s\n' "$files" | head -3 \
+            | awk -F/ '{ printf "%s%s", sep, $NF; sep = ", " }')
+          if [ "$count" -gt 3 ]; then
+            named="$named, and $((count - 3)) more"
+          fi
+
+          # `run-all.mjs` also exits non-zero when an extractor itself failed, in
+          # which case nothing was regenerated and there is no drift to name.
+          if [ "$count" -eq 0 ]; then
+            title="dom-expressions contract: the extractors failed against the pins"
+          else
+            title="dom-expressions contract drift: $count fixture(s) changed ($named)"
+          fi
+
+          echo "count=$count" >>"$GITHUB_OUTPUT"
+          echo "title=$title" >>"$GITHUB_OUTPUT"
+
+      - name: upload the regenerated fixtures
+        if: steps.drift.outputs.count != '' && steps.drift.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-fixtures-patch
+          path: ${{ runner.temp }}/fixtures.patch
+          if-no-files-found: error
+
+      # One open issue at a time: a monthly re-run of the same unaccepted drift
+      # comments on the report rather than filing a second one.
+      - name: report the drift
+        if: steps.check.outputs.drift == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: ${{ steps.drift.outputs.title }}
+        run: |
+          set -euo pipefail
+          {
+            echo "\`contract/harness/run-all.mjs --check\` regenerated the fixtures from the pinned upstream sources and they no longer match what is committed."
+            echo
+            echo "The pins are in \`contract/upstream.lock\`. Drift with those pins unchanged means an extractor, the harness, or the environment moved, not upstream, and that is the first thing to establish."
+            echo
+            echo "Where a fixture moved, the regenerated tree is attached to this run as the \`contract-fixtures-patch\` artifact. Apply it from the repository root with \`git apply\` to see the new fixtures in place."
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/stat.txt"
+            echo '```'
+            echo
+            echo "<details><summary>The extractor run</summary>"
+            echo
+            echo '```text'
+            tail -c 40000 "$RUNNER_TEMP/check.log"
+            echo '```'
+            echo
+            echo "</details>"
+            echo
+            echo "Reported by \`.github/workflows/contract-bump.yml\`."
+          } >"$RUNNER_TEMP/body.md"
+
+          existing=$(gh issue list --state open --limit 1 \
+            --search 'in:title "dom-expressions contract"' \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file "$RUNNER_TEMP/body.md"
+            echo "::notice::commented on the open drift report #$existing"
+          else
+            gh issue create --title "$TITLE" --body-file "$RUNNER_TEMP/body.md"
+          fi
+
+      # The issue carries the detail; this carries the alarm. A cron whose only
+      # output is an issue nobody is watching reports nothing.
+      - name: fail on drift
+        if: steps.check.outputs.drift == 'yes'
+        run: |
+          echo "::error::the pinned upstream sources no longer reproduce the committed fixtures" >&2
+          exit 1

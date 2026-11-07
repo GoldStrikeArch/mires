@@ -1,0 +1,66 @@
+--- a/library/core/src/panic.rs	2026-07-29 06:36:18
++++ b/library/core/src/panic.rs	2026-07-29 06:38:56
+@@ -163,13 +163,17 @@
+         #[rustc_allow_const_fn_unstable(const_eval_select)]
+         #[inline(always)] // inline the wrapper
+         #[track_caller]
++        // rustc_codegen_mires: both branches now use `$const_msg`, so the captured values are unused.
++        #[allow(unused_variables)]
+         const fn do_panic($($arg: $ty),*) -> ! {
+             $crate::intrinsics::const_eval_select!(
+                 @capture { $($arg: $ty = $arg),* } -> !:
+                 if const #[track_caller] {
+                     $crate::panic!($const_msg)
+                 } else #[track_caller] {
+-                    $crate::panic!($runtime_msg)
++                    // rustc_codegen_mires: the runtime message is the formatted one, and formatting
++                    // is out of scope for this backend. Both branches now use the plain message.
++                    $crate::panic!($const_msg)
+                 }
+             )
+         }
+--- a/library/core/src/panicking.rs	2026-07-29 06:36:18
++++ b/library/core/src/panicking.rs	2026-07-29 06:38:18
+@@ -256,7 +256,12 @@
+ #[rustc_do_not_const_check] // hooked by const-eval
+ #[rustc_const_stable_indirect] // must follow stable const rules since it is exposed to stable
+ pub const fn panic_display<T: fmt::Display>(x: &T) -> ! {
+-    panic_fmt(format_args!("{}", *x));
++    // rustc_codegen_mires: `format_args!("{}", x)` builds a `&dyn Display` argument, and the vtable
++    // that goes with it keeps every `Display` impl in the program alive — which is how the whole
++    // of `core::fmt`, and with it raw pointer arithmetic, becomes reachable from an
++    // `Option::expect`. The message becomes a fixed string; the panic itself is unchanged.
++    let _ = x;
++    panic("panicked with a message that rustc_codegen_mires cannot format");
+ }
+ 
+ #[cfg_attr(not(panic = "immediate-abort"), inline(never), cold, optimize(size))]
+@@ -268,7 +273,11 @@
+         super::intrinsics::abort()
+     }
+ 
+-    panic!("index out of bounds: the len is {len} but the index is {index}")
++    // rustc_codegen_mires: the formatted message would pull `Display for usize` — and with it the
++    // whole `core::fmt` machinery, which needs raw pointer arithmetic — into every program that
++    // indexes a slice. The numbers are dropped; the abort is not.
++    let _ = (index, len);
++    panic!("index out of bounds")
+ }
+ 
+ #[cfg_attr(not(panic = "immediate-abort"), inline(never), cold, optimize(size))]
+@@ -404,7 +413,14 @@
+     T: fmt::Debug + ?Sized,
+     U: fmt::Debug + ?Sized,
+ {
+-    assert_failed_inner(kind, &left, &right, args)
++    // rustc_codegen_mires: see `panic_display`. Dropping the two `&dyn Debug` coercions is what keeps
++    // `Debug` impls — and the formatting machinery behind them — out of the program.
++    let _ = (left, right, args);
++    match kind {
++        AssertKind::Eq => panic("assertion `left == right` failed"),
++        AssertKind::Ne => panic("assertion `left != right` failed"),
++        AssertKind::Match => panic("assertion `left matches right` failed"),
++    }
+ }
+ 
+ /// Internal function for `assert_match!`

@@ -1,0 +1,27 @@
+function rust_entry() {
+  x06_match_4$mini_core$print_i32$h3aa696e6bac11940(x06_match_4$small$h4327deb0c5f38b91(0));
+  x06_match_4$mini_core$print_i32$h3aa696e6bac11940(x06_match_4$small$h4327deb0c5f38b91(2));
+  x06_match_4$mini_core$print_i32$h3aa696e6bac11940(x06_match_4$small$h4327deb0c5f38b91(4));
+  x06_match_4$mini_core$print_i32$h3aa696e6bac11940(x06_match_4$small$h4327deb0c5f38b91(9));
+}
+function x06_match_4$small$h4327deb0c5f38b91(n) {
+  let _0;
+  switch (n) {
+    case 0:
+      _0 = 100;
+      break;
+    case 1:
+    case 2:
+      _0 = 200;
+      break;
+    default:
+      if (3 <= n) {
+        if (n <= 5) {
+          _0 = 300;
+          break;
+        }
+      }
+      _0 = 400;
+  }
+  return _0;
+}

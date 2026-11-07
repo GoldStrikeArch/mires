@@ -1,0 +1,82 @@
+function rust_entry() {
+  let s;
+  x18_enum_shapes$mini_core$print_i32$hbdc1641ec0ec043e(x18_enum_shapes$sign_value$he7a5b60ff8f9e7db("Pos"));
+  x18_enum_shapes$mini_core$print_bool$hb5302bc953b02d7d(x18_enum_shapes$is_not_zero$hc5cb992077c48069("Zero"));
+  x18_enum_shapes$mini_core$print_i32$hbdc1641ec0ec043e(x18_enum_shapes$letter_value$h4098d3ce4c240e65(66));
+  x18_enum_shapes$mini_core$print_i32$hbdc1641ec0ec043e(x18_enum_shapes$area$hd61f6936047b1915({ TAG: "Nothing" }));
+  x18_enum_shapes$mini_core$print_i32$hbdc1641ec0ec043e(x18_enum_shapes$area$hd61f6936047b1915({ TAG: "Num", _0: 7 }));
+  x18_enum_shapes$mini_core$print_i32$hbdc1641ec0ec043e(x18_enum_shapes$area$hd61f6936047b1915({ TAG: "Pair", _0: 3, _1: 4 }));
+  x18_enum_shapes$mini_core$print_i32$hbdc1641ec0ec043e(x18_enum_shapes$area$hd61f6936047b1915({ TAG: "Named", w: 5, h: 6 }));
+  s = { TAG: "Nothing" };
+  x18_enum_shapes$overwrite$hd6b9f98c954bfdc1(s);
+  x18_enum_shapes$mini_core$print_i32$hbdc1641ec0ec043e(x18_enum_shapes$area$hd61f6936047b1915(s));
+}
+function x18_enum_shapes$area$hd61f6936047b1915(s) {
+  let _0;
+  switch (s.TAG) {
+    case "Nothing":
+      _0 = 0;
+      break;
+    case "Num":
+      _0 = s._0;
+      break;
+    case "Pair":
+      _0 = s._0 + s._1 | 0;
+      break;
+    case "Named":
+      _0 = Math.imul(s.w, s.h) | 0;
+      break;
+    default:
+      throw new Error("rustc_codegen_mires: entered unreachable code");
+  }
+  return _0;
+}
+function x18_enum_shapes$is_not_zero$hc5cb992077c48069(s) {
+  let _0;
+  switch (s) {
+    case "Zero":
+      _0 = false;
+      break;
+    case "Neg":
+    case "Pos":
+      _0 = true;
+      break;
+    default:
+      throw new Error("rustc_codegen_mires: entered unreachable code");
+  }
+  return _0;
+}
+function x18_enum_shapes$letter_value$h4098d3ce4c240e65(l) {
+  let _0;
+  switch (l) {
+    case 65:
+      _0 = 1;
+      break;
+    case 66:
+      _0 = 2;
+      break;
+    default:
+      throw new Error("rustc_codegen_mires: entered unreachable code");
+  }
+  return _0;
+}
+function x18_enum_shapes$overwrite$hd6b9f98c954bfdc1(s) {
+  __rt.overwrite(s, { TAG: "Pair", _0: 8, _1: 9 });
+}
+function x18_enum_shapes$sign_value$he7a5b60ff8f9e7db(s) {
+  let _0;
+  switch (s) {
+    case "Neg":
+      _0 = -1;
+      break;
+    case "Zero":
+      _0 = 0;
+      break;
+    case "Pos":
+      _0 = 1;
+      break;
+    default:
+      throw new Error("rustc_codegen_mires: entered unreachable code");
+  }
+  return _0;
+}

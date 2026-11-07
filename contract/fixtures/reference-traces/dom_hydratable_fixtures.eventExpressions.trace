@@ -1,0 +1,16 @@
+{"$record":"header","$generatedBy":"contract/harness/run-trace.mjs","$doNotEditByHand":"Re-run the extractor instead. A diff here after a version bump IS the drift report.","$extractedFrom":{"dom-expressions":"0.40.8","solid-js":"1.9.14","babel-plugin-jsx-dom-expressions":"0.40.7","gitSha":"56bd4054237b031c0cca8c1ec69da162c52ed4a6"},"$extractionDate":"2026-07-29","$what":"Normalized runtime-call trace of a reference-compiled fixture executed against harness/trace.mjs. Node identities are renamed in first-appearance order; functions become fn#N; templates become tmpl#N.","fixture":"__dom_hydratable_fixtures__/eventExpressions","label":"__dom_hydratable_fixtures__/eventExpressions","freeBindingsHealed":["hoistedCustomEvent2"],"status":"completed","error":null,"recordCount":15}
+{"op":"template","tmpl":"tmpl#0","html":"<div id=main><button>Change Bound</button><button>Change Bound</button><button>Click Delegated</button><button>Click Delegated</button><button>Click Listener</button><button>Click Capture"}
+{"op":"getNextElement","tmpl":"tmpl#0","result":"hk#58"}
+{"op":"node.addEventListener","node":"hk#58.firstChild","name":"change","handler":"fn#0","options":"undefined"}
+{"op":"node.addEventListener","node":"hk#58.firstChild.nextSibling","name":"change","handler":"fn#1","options":"undefined"}
+{"op":"addEventListener","node":"hk#58.firstChild.nextSibling.nextSibling.nextSibling.nextSibling","name":"inlined-to-hoisted2","handler":{"handleEvent":"fn#2"},"delegate":false}
+{"op":"addEventListener","node":"hk#58.firstChild.nextSibling.nextSibling.nextSibling.nextSibling","name":"inlined-to-hoisted1","handler":{"handleEvent":"fn#3"},"delegate":false}
+{"op":"addEventListener","node":"hk#58.firstChild.nextSibling.nextSibling.nextSibling.nextSibling","name":"inlined-with-options","handler":{"handleEvent":"fn#4","once":false},"delegate":false}
+{"op":"addEventListener","node":"hk#58.firstChild.nextSibling.nextSibling.nextSibling.nextSibling","name":"inlined","handler":"fn#5","delegate":false}
+{"op":"addEventListener","node":"hk#58.firstChild.nextSibling.nextSibling.nextSibling.nextSibling","name":"hoisted-custom-event2","delegate":false}
+{"op":"addEventListener","node":"hk#58.firstChild.nextSibling.nextSibling.nextSibling.nextSibling","name":"hoisted-custom-event1","handler":"fn#3","delegate":false}
+{"op":"addEventListener","node":"hk#58.firstChild.nextSibling.nextSibling.nextSibling.nextSibling","name":"CAPS-ev2","handler":"fn#6","delegate":false}
+{"op":"addEventListener","node":"hk#58.firstChild.nextSibling.nextSibling.nextSibling.nextSibling","name":"click","handler":"fn#7","delegate":false}
+{"op":"node.addEventListener","node":"hk#58.firstChild.nextSibling.nextSibling.nextSibling.nextSibling.nextSibling","name":"camelClick","handler":"fn#8","options":true}
+{"op":"runHydrationEvents"}
+{"op":"delegateEvents","events":["click"],"document":"undefined"}

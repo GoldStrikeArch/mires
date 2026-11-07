@@ -1,0 +1,18 @@
+function rust_entry() {
+  let base = [];
+  base[0] = 10;
+  x12_closure$mini_core$print_i32$h750c5b65caf1dcae(x12_closure$apply$h1ce532ef4d120f4b([[{ buf: base, off: 0 }][0]], 5));
+  x12_closure$mini_core$print_i32$h750c5b65caf1dcae(x12_closure$apply$hac3a31abddbff673(undefined, 6));
+}
+function x12_closure$apply$h1ce532ef4d120f4b(f, x) {
+  return x12_closure$rust_entry$closure_0$h45906eaef90ef3a1(f, [x][0]);
+}
+function x12_closure$apply$hac3a31abddbff673(f, x) {
+  return x12_closure$rust_entry$closure_1$h7bec90746824113a(f, [x][0]);
+}
+function x12_closure$rust_entry$closure_0$h45906eaef90ef3a1(_1, x) {
+  return x + _1[0].buf[_1[0].off] | 0;
+}
+function x12_closure$rust_entry$closure_1$h7bec90746824113a(_1, x) {
+  return Math.imul(x, x) | 0;
+}

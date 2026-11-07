@@ -1,0 +1,100 @@
+// rustc_codegen_mires — program
+// ./chart-lib.mjs
+import { Chart as ext$Chart$ha63ef9d821d58172 } from "./chart-lib.mjs";
+// ./chart-lib.mjs
+import { default as ext$default$h12f6cccdfb836843 } from "./chart-lib.mjs";
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// core::option::Option::<T>::is_none
+function core$option$impl_0_is_none$h9343231ed45e47dd(self) {
+  return !((self.TAG === "None" ? 0 : 1) === 1);
+}
+// rust_entry
+function rust_entry() {}
+// v_call_static
+function v_call_static(plugin) {
+  ext$Chart$ha63ef9d821d58172.register(plugin);
+}
+// v_get_property
+function v_get_property(chart) {
+  return chart.data;
+}
+// v_get_scoped
+function v_get_scoped(chart) {
+  return chart.data.datasets;
+}
+// v_get_static
+function v_get_static() {
+  return ext$Chart$ha63ef9d821d58172.version;
+}
+// v_index_in_range
+function v_index_in_range(chart) {
+  return chart.data.datasets[0];
+}
+// v_index_length
+function v_index_length(chart) {
+  return chart.data.datasets.length;
+}
+// v_index_out_of_range
+function v_index_out_of_range(chart) {
+  return chart.data.datasets[9];
+}
+// v_new_default
+function v_new_default(target, config) {
+  return new ext$default$h12f6cccdfb836843(target, config);
+}
+// v_new_named
+function v_new_named(target, config) {
+  return new ext$Chart$ha63ef9d821d58172(target, config);
+}
+// v_new_without_new
+function v_new_without_new(target, config) {
+  return ext$Chart$ha63ef9d821d58172(target, config);
+}
+// v_nullable_none
+function v_nullable_none(chart) {
+  let _3, $t0;
+  $t0 = chart.getPoint(99);
+  _3 = $t0 == null ? { TAG: "None" } : { TAG: "Some", _0: $t0 };
+  return core$option$impl_0_is_none$h9343231ed45e47dd(_3);
+}
+// v_nullable_some
+function v_nullable_some(chart) {
+  let _0, _2, $t0;
+  $t0 = chart.getPoint(0);
+  _2 = $t0 == null ? { TAG: "None" } : { TAG: "Some", _0: $t0 };
+  switch (_2.TAG) {
+    case "None":
+      _0 = -1;
+      break;
+    case "Some":
+      _0 = _2._0.x;
+      break;
+    default:
+      throw new Error("rustc_codegen_mires: entered unreachable code");
+  }
+  return _0;
+}
+// v_send_one_arg
+function v_send_one_arg(chart, data) {
+  chart.update(data);
+}
+// v_send_trailing_omitted
+function v_send_trailing_omitted(chart) {
+  chart.resize(800);
+}
+// v_send_trailing_undefined
+function v_send_trailing_undefined(chart, height) {
+  chart.resize(800, height);
+}
+// v_send_zero_args
+function v_send_zero_args(chart) {
+  chart.destroy();
+}
+// v_set_property
+function v_set_property(chart, title) {
+  chart.title = title;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry, v_call_static, v_get_property, v_get_scoped, v_get_static, v_index_in_range, v_index_length, v_index_out_of_range, v_new_default, v_new_named, v_new_without_new, v_nullable_none, v_nullable_some, v_send_one_arg, v_send_trailing_omitted, v_send_trailing_undefined, v_send_zero_args, v_set_property };

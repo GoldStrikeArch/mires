@@ -1,0 +1,8 @@
+[package]
+name = "mires-build"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The `Display` impls for `BuildError`, which carry the fix-it commands.
+thiserror = "2.0.19"

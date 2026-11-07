@@ -1,0 +1,47 @@
+// rustc_codegen_mires — program
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// core::option::Option::<T>::is_none
+function core$option$impl_0_is_none$hda0d80922275f86e(self) {
+  return !((self.TAG === "None" ? 0 : 1) === 1);
+}
+// v_call_global
+function v_call_global(message) {
+  let _0;
+  _0 = dashLog(message);
+}
+// v_call_global_path
+function v_call_global_path(a, b) {
+  return Math.max(a, b);
+}
+// v_get_global
+function v_get_global() {
+  return dash.status;
+}
+// v_index_global
+function v_index_global(index) {
+  return dash.ticks[index];
+}
+// v_new_global
+function v_new_global(url) {
+  return new EventSource(url);
+}
+// v_new_then_close
+function v_new_then_close(url) {
+  new EventSource(url).close();
+}
+// v_nullable_global
+function v_nullable_global() {
+  let _2, $t0;
+  $t0 = dash.missing;
+  _2 = $t0 == null ? { TAG: "None" } : { TAG: "Some", _0: $t0 };
+  return core$option$impl_0_is_none$hda0d80922275f86e(_2);
+}
+// v_set_global
+function v_set_global(value) {
+  let _0;
+  _0 = dash.status = value;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, v_call_global, v_call_global_path, v_get_global, v_index_global, v_new_global, v_new_then_close, v_nullable_global, v_set_global };

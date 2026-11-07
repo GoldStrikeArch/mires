@@ -1,0 +1,45 @@
+{"$record":"header","$generatedBy":"contract/harness/run-trace.mjs","$doNotEditByHand":"Re-run the extractor instead. A diff here after a version bump IS the drift report.","$extractedFrom":{"dom-expressions":"0.40.8","solid-js":"1.9.14","babel-plugin-jsx-dom-expressions":"0.40.7","gitSha":"56bd4054237b031c0cca8c1ec69da162c52ed4a6"},"$extractionDate":"2026-07-29","$what":"Normalized runtime-call trace of a reference-compiled fixture executed against harness/trace.mjs. Node identities are renamed in first-appearance order; functions become fn#N; templates become tmpl#N.","fixture":"__dom_hydratable_fixtures__/insertChildren","label":"__dom_hydratable_fixtures__/insertChildren","freeBindingsHealed":["Module","Hello"],"status":"stopped-early","error":"children is not a function","recordCount":44}
+{"op":"template","tmpl":"tmpl#0","html":"<div>"}
+{"op":"template","tmpl":"tmpl#1","html":"<module>"}
+{"op":"template","tmpl":"tmpl#2","html":"<module>Hello"}
+{"op":"template","tmpl":"tmpl#3","html":"<module>Hi <!$><!/>"}
+{"op":"template","tmpl":"tmpl#4","html":"<module>Hi<!$><!/>"}
+{"op":"template","tmpl":"tmpl#5","html":"<div>Test 1"}
+{"op":"getNextElement","tmpl":"tmpl#0","result":"hk#43"}
+{"op":"createComponent","props":{"children":"hk#43"}}
+{"op":"getNextElement","tmpl":"tmpl#1","result":"hk#44"}
+{"op":"insert","parent":"hk#44","accessor":"hk#43","marker":"undefined","initial":"undefined"}
+{"op":"getNextElement","tmpl":"tmpl#2","result":"hk#45"}
+{"op":"getNextElement","tmpl":"tmpl#1","result":"hk#46"}
+{"op":"createComponent","props":{}}
+{"op":"insert","parent":"hk#46","accessor":"undefined","marker":"undefined","initial":"undefined"}
+{"op":"getNextElement","tmpl":"tmpl#1","result":"hk#47"}
+{"op":"insert","parent":"hk#47","accessor":"fn#0","marker":"undefined","initial":"undefined"}
+{"op":"createComponent","props":{"children":"hk#43"}}
+{"op":"getNextElement","tmpl":"tmpl#1","result":"hk#48"}
+{"op":"spread","node":"hk#48","props":{"children":"hk#43"},"isSVG":false,"skipChildren":false}
+{"op":"runHydrationEvents"}
+{"op":"getNextElement","tmpl":"tmpl#2","result":"hk#49"}
+{"op":"spread","node":"hk#49","props":{"children":"hk#43"},"isSVG":false,"skipChildren":true}
+{"op":"runHydrationEvents"}
+{"op":"getNextElement","tmpl":"tmpl#1","result":"hk#50"}
+{"op":"spread","node":"hk#50","props":{"children":"hk#43"},"isSVG":false,"skipChildren":true}
+{"op":"insert","parent":"hk#50","accessor":"fn#1","marker":"undefined","initial":"undefined"}
+{"op":"runHydrationEvents"}
+{"op":"mergeProps","sources":[{"children":"hk#43"},{"children":"Hello"}]}
+{"op":"createComponent","props":{"children":"Hello"}}
+{"op":"getNextElement","tmpl":"tmpl#1","result":"hk#51"}
+{"op":"insert","parent":"hk#51","marker":"undefined","initial":"undefined"}
+{"op":"createComponent","props":{}}
+{"op":"getNextElement","tmpl":"tmpl#1","result":"hk#52"}
+{"op":"insert","parent":"hk#52","accessor":"hk#43","marker":"undefined","initial":"undefined"}
+{"op":"createComponent","props":{"children":"hk#43"}}
+{"op":"getNextElement","tmpl":"tmpl#1","result":"hk#53"}
+{"op":"insert","parent":"hk#53","accessor":"fn#2","marker":"undefined","initial":"undefined"}
+{"op":"createComponent","props":{"children":"hk#43"}}
+{"op":"getNextElement","tmpl":"tmpl#3","result":"hk#54"}
+{"op":"getNextMarker","start":"hk#54.firstChild.nextSibling","end":"marker#55"}
+{"op":"insert","parent":"hk#54","accessor":"hk#43","marker":"marker#55","initial":[]}
+{"op":"createComponent","props":{"children":["Hi ","hk#43"]}}
+{"op":"getNextElement","tmpl":"tmpl#1","result":"hk#56"}
+{"op":"insert","parent":"hk#56","accessor":"hk#43","marker":"undefined","initial":"undefined"}

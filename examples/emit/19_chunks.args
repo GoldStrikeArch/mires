@@ -1,0 +1,4 @@
+js-modules=esm
+js-chunk=a:__island_a
+js-chunk=b:__island_b
+js-chunk-shared=shared

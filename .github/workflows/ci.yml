@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: mires-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The suites reuse the backend dylib built once below rather than rebuilding
+  # it per suite.
+  SKIP_BUILD: "1"
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      # The pinned nightly, with the components the backend needs, read from
+      # `rust-toolchain.toml` by rustup itself.
+      - name: install the pinned toolchain
+        run: rustc --version --verbose
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The sysroot is `core` and `alloc` compiled by the backend. It only
+      # changes when the backend, the patches, or the toolchain do.
+      - name: cache the sysroot
+        uses: actions/cache@v4
+        with:
+          path: build/sysroot
+          key: sysroot-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'patches/**', 'backend/**', 'structurizer/**', 'scripts/build_sysroot.sh') }}
+
+      - name: cargo tests
+        run: cargo test --workspace
+
+      - name: build the backend
+        run: bash scripts/build.sh
+
+      - name: build the sysroot
+        env:
+          JS_EXTRA_ARGS: ""
+        run: bash scripts/build_sysroot.sh
+
+      - name: core and mini-core suites
+        run: bash scripts/test.sh
+
+      - name: emit suite
+        run: bash scripts/emit-test.sh
+
+      - name: module suite
+        run: bash scripts/module-test.sh
+
+      - name: extern suite
+        run: bash scripts/extern-test.sh
+
+      - name: async suite
+        run: bash scripts/async-test.sh
+
+      - name: dts suite
+        run: bash scripts/dts-test.sh

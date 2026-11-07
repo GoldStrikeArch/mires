@@ -1,0 +1,12 @@
+{
+  "$what": "Deliberately invalid: the rule carries no `why`. loadDeltas must refuse it. An accepted delta whose justification nobody wrote down is indistinguishable from a bug someone silenced.",
+  "fixtures": {
+    "testdata/base": [
+      {
+        "id": "unjustified",
+        "kind": "ignore-op",
+        "op": "template"
+      }
+    ]
+  }
+}

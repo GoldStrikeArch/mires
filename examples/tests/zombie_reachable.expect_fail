@@ -1,0 +1,5 @@
+examples/tests/zombie_reachable.rs:
+ptr_mask
+cannot cast a pointer to `Pair` into a pointer to `Triple`
+in `repack`
+required by `rust_entry`

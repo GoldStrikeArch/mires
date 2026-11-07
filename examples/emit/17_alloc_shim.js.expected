@@ -1,0 +1,30 @@
+function _RNvCs1lVxXr9ZvqQ_7___rustc12___rust_alloc(layout$size, layout$align) {
+  return __rt.alloc(layout$size, layout$align);
+}
+function _RNvCs1lVxXr9ZvqQ_7___rustc14___rust_dealloc(ptr, layout$size, layout$align) {
+  __rt.dealloc(ptr, layout$size, layout$align);
+}
+function _RNvCs1lVxXr9ZvqQ_7___rustc19___rust_alloc_zeroed(layout$size, layout$align) {
+  return __rt.alloc_zeroed(layout$size, layout$align);
+}
+function _RNvCs1lVxXr9ZvqQ_7___rustc26___rust_alloc_error_handler(layout$size, layout$align) {
+  __rt.alloc_error(layout$size, layout$align);
+}
+function _RNvCs1lVxXr9ZvqQ_7___rustc35___rust_no_alloc_shim_is_unstable_v2() {}
+function rust_entry() {
+  let boxed = [];
+  boxed[0] = alloc$boxed$impl_0_new$h3034cc737def7e04(41);
+  x17_alloc_shim$prelude$print_i32$h993aa2e4c78a8d46(boxed[0].buf[boxed[0].off] + 1 | 0);
+  core$ptr$drop_glue$hb63dc3eb78685891({ buf: boxed, off: 0 });
+}
+function core$alloc$layout$impl_0_from_size_alignment_unchecked$precondition_check$hab48e74dd9055d51() {
+  throw new Error("rustc_codegen_mires: `core$alloc$layout$impl_0_from_size_alignment_unchecked$precondition_check$hab48e74dd9055d51` was never codegenned; the monomorphization collector proved every call to it unreachable");
+}
+
+function core$mem$alignment$impl_0_new_unchecked$precondition_check$h0e52ffe916149fef() {
+  throw new Error("rustc_codegen_mires: `core$mem$alignment$impl_0_new_unchecked$precondition_check$h0e52ffe916149fef` was never codegenned; the monomorphization collector proved every call to it unreachable");
+}
+
+function core$ptr$non_null$impl_3_new_unchecked$precondition_check$hd790945cfeefe665() {
+  throw new Error("rustc_codegen_mires: `core$ptr$non_null$impl_3_new_unchecked$precondition_check$hd790945cfeefe665` was never codegenned; the monomorphization collector proved every call to it unreachable");
+}

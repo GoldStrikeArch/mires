@@ -1,0 +1,2 @@
+the trait bound `Point: MapKey` is not satisfied
+the trait `MapKey` is not implemented for `Point`

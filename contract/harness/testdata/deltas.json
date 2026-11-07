@@ -1,0 +1,23 @@
+{
+  "$what": "Accepted-delta rules for the comparator's own unit test. The escaping rule is the real one, copied in shape from fixtures/escaping.json's $topcoatDelta; the stale rule is deliberately unmatchable, to prove a rule that fires on nothing is reported.",
+  "fixtures": {
+    "testdata/base": [
+      {
+        "id": "text-gt-escaping",
+        "kind": "rewrite",
+        "side": "b",
+        "op": "template",
+        "field": "html",
+        "from": "&gt;",
+        "to": ">",
+        "why": "Topcoat's HtmlContext::Text escapes & < AND >, solid's text mode escapes only & and <. A '>' in template text therefore renders as '&gt;' from Topcoat and '>' from the reference. Strictly safer, never unsafe, and permanent -- see fixtures/escaping.json $topcoatDelta."
+      },
+      {
+        "id": "stale-rule-on-purpose",
+        "kind": "ignore-op",
+        "op": "voidFn:useAssets",
+        "why": "Nothing in these traces ever emits this op. Present so the test can assert that a rule matching nothing is reported as STALE rather than passing unnoticed."
+      }
+    ]
+  }
+}

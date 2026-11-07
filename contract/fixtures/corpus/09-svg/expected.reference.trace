@@ -1,0 +1,11 @@
+{"$record":"header","$generatedBy":"contract/harness/gen-corpus.mjs","$doNotEditByHand":"Re-run the extractor instead. A diff here after a version bump IS the drift report.","$extractedFrom":{"dom-expressions":"0.40.8","solid-js":"1.9.14","babel-plugin-jsx-dom-expressions":"0.40.7","gitSha":"56bd4054237b031c0cca8c1ec69da162c52ed4a6"},"$extractionDate":"2026-07-29","$what":"Normalized runtime-call trace of a reference-compiled CORPUS fixture executed against harness/trace.mjs. Node identities are renamed in first-appearance order; functions become fn#N; templates become tmpl#N.","fixture":"corpus/09-svg","label":"corpus/09-svg","freeBindingsHealed":[],"status":"completed","error":null,"recordCount":10}
+{"op":"template","tmpl":"tmpl#0","html":"<svg width=400 height=180><rect stroke-width=2 x=50 y=20 width=150 height=150>"}
+{"op":"template","tmpl":"tmpl#1","html":"<svg width=400 height=180><rect width=150 height=150>"}
+{"op":"template","tmpl":"tmpl#2","html":"<svg><linearGradient gradientTransform=rotate(25)><stop offset=0%>"}
+{"op":"template","tmpl":"tmpl#3","html":"<svg><rect x=50 y=20 width=150 height=150></svg>","isImportNode":false,"isSVG":true,"isMathML":false}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"effect","fn":"fn#0","init":{"a":"undefined","e":"undefined","t":"undefined"},"options":"undefined"}
+{"op":"effect.threw","fn":"fn#0","error":"state is not defined"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}

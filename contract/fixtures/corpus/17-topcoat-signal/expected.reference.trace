@@ -1,0 +1,14 @@
+{"$record":"header","$generatedBy":"contract/harness/gen-corpus.mjs","$doNotEditByHand":"Re-run the extractor instead. A diff here after a version bump IS the drift report.","$extractedFrom":{"dom-expressions":"0.40.8","solid-js":"1.9.14","babel-plugin-jsx-dom-expressions":"0.40.7","gitSha":"56bd4054237b031c0cca8c1ec69da162c52ed4a6"},"$extractionDate":"2026-07-29","$what":"Normalized runtime-call trace of a reference-compiled CORPUS fixture executed against harness/trace.mjs. Node identities are renamed in first-appearance order; functions become fn#N; templates become tmpl#N.","fixture":"corpus/17-topcoat-signal","label":"corpus/17-topcoat-signal","freeBindingsHealed":["createSignal","createSignal (iterable)"],"status":"completed","error":null,"recordCount":13}
+{"op":"template","tmpl":"tmpl#0","html":"<div><button>+1</button><p>Count: "}
+{"op":"template","tmpl":"tmpl#1","html":"<div><input><p>Hello, <!>!"}
+{"op":"template","tmpl":"tmpl#2","html":"<div><button>What is Topcoat?</button><p>A fullstack Rust framework."}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"insert","parent":"tmpl#0:root.firstChild.nextSibling","marker":null,"initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"insert","parent":"tmpl#1:root.firstChild.nextSibling","marker":"tmpl#1:root.firstChild.nextSibling.firstChild.nextSibling","initial":"undefined"}
+{"op":"effect","fn":"fn#0","init":"undefined","options":"undefined"}
+{"op":"effect.ran","fn":"fn#0","returned":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"effect","fn":"fn#1","init":"undefined","options":"undefined"}
+{"op":"effect.ran","fn":"fn#1","returned":true}
+{"op":"delegateEvents","events":["click","input"],"document":"undefined"}

@@ -1,0 +1,29 @@
+{
+  "name": "@mires/melange-compare",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The Melange core-logic comparison: the krausest non-keyed store written twice, once in OCaml compiled by the Melange playground and once in Rust compiled by this backend, measured for size, node micro-performance and readability.",
+  "scripts": {
+    "extract": "node extract.mjs",
+    "compare": "node compare.mjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "25.4.0"
+  },
+  "$note-why-a-separate-package": [
+    "contract/parity/package.json is the precedent: a harness that needs one npm",
+    "dependency gets its own package with its own node_modules and its own",
+    "lockfile, rather than putting that dependency where every other harness in",
+    "the spike would inherit it. Nothing else in the spike has a node dependency",
+    "at all -- the contract harness vendors what it compares against -- and this",
+    "one needs a browser driver for exactly one reason: the Melange playground is",
+    "the only Melange compiler available here (no opam), and it is a client side",
+    "WebAssembly bundle, so the only way to run it is to load the page.",
+    "",
+    "puppeteer-CORE, not puppeteer: -core downloads no browser. The Chrome this",
+    "drives is the one already installed at /Applications/Google Chrome.app,",
+    "named by executablePath, which is also the browser the krausest harness in",
+    "the sibling tracks uses. One browser, one version, recorded in the report."
+  ]
+}

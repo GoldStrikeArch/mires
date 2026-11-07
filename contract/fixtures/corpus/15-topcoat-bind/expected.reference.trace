@@ -1,0 +1,30 @@
+{"$record":"header","$generatedBy":"contract/harness/gen-corpus.mjs","$doNotEditByHand":"Re-run the extractor instead. A diff here after a version bump IS the drift report.","$extractedFrom":{"dom-expressions":"0.40.8","solid-js":"1.9.14","babel-plugin-jsx-dom-expressions":"0.40.7","gitSha":"56bd4054237b031c0cca8c1ec69da162c52ed4a6"},"$extractionDate":"2026-07-29","$what":"Normalized runtime-call trace of a reference-compiled CORPUS fixture executed against harness/trace.mjs. Node identities are renamed in first-appearance order; functions become fn#N; templates become tmpl#N.","fixture":"corpus/15-topcoat-bind","label":"corpus/15-topcoat-bind","freeBindingsHealed":["name"],"status":"completed","error":null,"recordCount":29}
+{"op":"template","tmpl":"tmpl#0","html":"<p>A fullstack Rust framework."}
+{"op":"template","tmpl":"tmpl#1","html":"<input>"}
+{"op":"template","tmpl":"tmpl#2","html":"<input type=checkbox>"}
+{"op":"template","tmpl":"tmpl#3","html":"<div>"}
+{"op":"template","tmpl":"tmpl#4","html":"<button>Save"}
+{"op":"template","tmpl":"tmpl#5","html":"<div><input><p>Hello, <!>!"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"effect","fn":"fn#0","init":"undefined","options":"undefined"}
+{"op":"effect.threw","fn":"fn#0","error":"open is not defined"}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"effect","fn":"fn#1","init":"undefined","options":"undefined"}
+{"op":"effect.ran","fn":"fn#1","returned":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"effect","fn":"fn#2","init":"undefined","options":"undefined"}
+{"op":"effect.threw","fn":"fn#2","error":"done is not defined"}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"effect","fn":"fn#3","init":"undefined","options":"undefined"}
+{"op":"effect.threw","fn":"fn#3","error":"cls is not defined"}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"effect","fn":"fn#4","init":"undefined","options":"undefined"}
+{"op":"effect.threw","fn":"fn#4","error":"style is not defined"}
+{"op":"template.clone","tmpl":"tmpl#4","result":"tmpl#4:root"}
+{"op":"effect","fn":"fn#5","init":"undefined","options":"undefined"}
+{"op":"effect.threw","fn":"fn#5","error":"busy is not defined"}
+{"op":"template.clone","tmpl":"tmpl#5","result":"tmpl#5:root"}
+{"op":"insert","parent":"tmpl#5:root.firstChild.nextSibling","marker":"tmpl#5:root.firstChild.nextSibling.firstChild.nextSibling","initial":"undefined"}
+{"op":"effect","fn":"fn#6","init":"undefined","options":"undefined"}
+{"op":"effect.ran","fn":"fn#6","returned":"undefined"}
+{"op":"delegateEvents","events":["input"],"document":"undefined"}

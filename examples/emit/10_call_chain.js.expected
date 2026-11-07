@@ -1,0 +1,15 @@
+function rust_entry() {
+  x10_call_chain$mini_core$print_i32$hc3d64a61b9dc0642(x10_call_chain$pipeline$h917c3f6ebdab6210(3));
+}
+function x10_call_chain$double$h61c6a60b1ed3f8ba(x) {
+  return Math.imul(x, 2) | 0;
+}
+function x10_call_chain$inc$h2373371252e779db(x) {
+  return x + 1 | 0;
+}
+function x10_call_chain$pipeline$h917c3f6ebdab6210(x) {
+  return x10_call_chain$square$hcffe3c9995eeef6b(x10_call_chain$inc$h2373371252e779db(x10_call_chain$double$h61c6a60b1ed3f8ba(x10_call_chain$inc$h2373371252e779db(x))));
+}
+function x10_call_chain$square$hcffe3c9995eeef6b(x) {
+  return Math.imul(x, x) | 0;
+}

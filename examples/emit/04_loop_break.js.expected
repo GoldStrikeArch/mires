@@ -1,0 +1,21 @@
+function rust_entry() {
+  x04_loop_break$mini_core$print_i32$hd4c92be1cea39c41(x04_loop_break$first_multiple$h65e32bc8d902dc96(7, 10));
+}
+function x04_loop_break$first_multiple$h65e32bc8d902dc96(of, above) {
+  let candidate, _7, _10;
+  candidate = above;
+  for (;;) {
+    candidate = candidate + 1 | 0;
+    _7 = candidate;
+    if (of === 0) {
+      x04_loop_break$mini_core$panic_const$panic_const_rem_by_zero$hf7943d50aa38ba0d({ file: "examples/emit/04_loop_break.rs", line: 17, column: 12 });
+    }
+    _10 = _7 === -2147483648;
+    if (of === -1 && _10) {
+      x04_loop_break$mini_core$panic_const$panic_const_rem_overflow$h52f45d64fb57e35f({ file: "examples/emit/04_loop_break.rs", line: 17, column: 12 });
+    }
+    if (!((_7 % of | 0) !== 0)) {
+      return candidate;
+    }
+  }
+}

@@ -1,0 +1,13 @@
+function rust_entry() {
+  let o;
+  o = { left: { a: 1, b: 2 }, right: { a: 3, b: 4 } };
+  x09_struct_fields$mini_core$print_i32$he81f28a70dc9741c(x09_struct_fields$total$h7074c7afcaf9aeba(o));
+  x09_struct_fields$bump$h83d4eb9f91d8e070(o, 10);
+  x09_struct_fields$mini_core$print_i32$he81f28a70dc9741c(x09_struct_fields$total$h7074c7afcaf9aeba(o));
+}
+function x09_struct_fields$bump$h83d4eb9f91d8e070(o, by) {
+  o.right.b = o.right.b + by | 0;
+}
+function x09_struct_fields$total$h7074c7afcaf9aeba(o) {
+  return ((o.left.a + o.left.b | 0) + o.right.a | 0) + o.right.b | 0;
+}

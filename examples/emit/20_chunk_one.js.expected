@@ -1,0 +1,9 @@
+import * as __rt from "./shim.js";
+function rust_entry() {
+  x20_chunk_one$mini_core$print_str$h0c8feb0c08a5cfa8("one");
+  x20_chunk_one$mini_core$print_i32$h2d18f581ae5c21c3(x20_chunk_one$triple$h591a17cd36580097(14));
+}
+function x20_chunk_one$triple$h591a17cd36580097(x) {
+  return (x + x | 0) + x | 0;
+}
+export { rust_entry };

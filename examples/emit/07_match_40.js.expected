@@ -1,0 +1,135 @@
+function rust_entry() {
+  x07_match_40$mini_core$print_i32$h96a7d40487905f59(x07_match_40$pick$h2ae25105a971dca6(0));
+  x07_match_40$mini_core$print_i32$h96a7d40487905f59(x07_match_40$pick$h2ae25105a971dca6(1));
+  x07_match_40$mini_core$print_i32$h96a7d40487905f59(x07_match_40$pick$h2ae25105a971dca6(17));
+  x07_match_40$mini_core$print_i32$h96a7d40487905f59(x07_match_40$pick$h2ae25105a971dca6(39));
+  x07_match_40$mini_core$print_i32$h96a7d40487905f59(x07_match_40$pick$h2ae25105a971dca6(40));
+}
+function x07_match_40$pick$h2ae25105a971dca6(n) {
+  let _0;
+  switch (n) {
+    case 0:
+      _0 = 1;
+      break;
+    case 1:
+      _0 = 8;
+      break;
+    case 2:
+      _0 = 15;
+      break;
+    case 3:
+      _0 = 22;
+      break;
+    case 4:
+      _0 = 29;
+      break;
+    case 5:
+      _0 = 36;
+      break;
+    case 6:
+      _0 = 43;
+      break;
+    case 7:
+      _0 = 50;
+      break;
+    case 8:
+      _0 = 57;
+      break;
+    case 9:
+      _0 = 64;
+      break;
+    case 10:
+      _0 = 71;
+      break;
+    case 11:
+      _0 = 78;
+      break;
+    case 12:
+      _0 = 85;
+      break;
+    case 13:
+      _0 = 92;
+      break;
+    case 14:
+      _0 = 99;
+      break;
+    case 15:
+      _0 = 106;
+      break;
+    case 16:
+      _0 = 113;
+      break;
+    case 17:
+      _0 = 120;
+      break;
+    case 18:
+      _0 = 127;
+      break;
+    case 19:
+      _0 = 134;
+      break;
+    case 20:
+      _0 = 141;
+      break;
+    case 21:
+      _0 = 148;
+      break;
+    case 22:
+      _0 = 155;
+      break;
+    case 23:
+      _0 = 162;
+      break;
+    case 24:
+      _0 = 169;
+      break;
+    case 25:
+      _0 = 176;
+      break;
+    case 26:
+      _0 = 183;
+      break;
+    case 27:
+      _0 = 190;
+      break;
+    case 28:
+      _0 = 197;
+      break;
+    case 29:
+      _0 = 204;
+      break;
+    case 30:
+      _0 = 211;
+      break;
+    case 31:
+      _0 = 218;
+      break;
+    case 32:
+      _0 = 225;
+      break;
+    case 33:
+      _0 = 232;
+      break;
+    case 34:
+      _0 = 239;
+      break;
+    case 35:
+      _0 = 246;
+      break;
+    case 36:
+      _0 = 253;
+      break;
+    case 37:
+      _0 = 260;
+      break;
+    case 38:
+      _0 = 267;
+      break;
+    case 39:
+      _0 = 274;
+      break;
+    default:
+      _0 = -1;
+  }
+  return _0;
+}

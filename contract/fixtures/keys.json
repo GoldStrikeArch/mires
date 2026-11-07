@@ -1,0 +1,1693 @@
+{
+  "$generatedBy": "contract/harness/extract-keys.mjs",
+  "$doNotEditByHand": "Re-run the extractor instead. A diff here after a version bump IS the drift report.",
+  "$extractedFrom": {
+    "dom-expressions": "0.40.8",
+    "solid-js": "1.9.14",
+    "babel-plugin-jsx-dom-expressions": "0.40.7",
+    "gitSha": "56bd4054237b031c0cca8c1ec69da162c52ed4a6"
+  },
+  "$extractionDate": "2026-07-29",
+  "$source": "solid-js/dist/solid.js:121-149 (sharedConfig, getContextId, nextHydrateContext)",
+  "$algorithm": [
+    "key = context.id + letter(digits(count) - 1) + String(count)",
+    "letter(0) = ''  letter(n>0) = String.fromCharCode(96 + n)  // 1->'a', 2->'b', ...",
+    "getNextContextId() returns the key for the CURRENT count, then post-increments count.",
+    "getContextId() returns the key for the current count WITHOUT incrementing.",
+    "A child context is { ...parent, id: parent.getNextContextId(), count: 0 }."
+  ],
+  "$prefixFree": "The letter encodes the digit-length of the numeric suffix, so concatenated segments are unambiguously separable -- that is the whole point of the letter.",
+  "tripleCount": 264,
+  "boundaryChecks": [
+    {
+      "name": "1-digit count gets no letter",
+      "actual": "x7",
+      "expected": "x7",
+      "ok": true
+    },
+    {
+      "name": "2-digit count gets 'a'",
+      "actual": "xa42",
+      "expected": "xa42",
+      "ok": true
+    },
+    {
+      "name": "3-digit count gets 'b'",
+      "actual": "xb100",
+      "expected": "xb100",
+      "ok": true
+    },
+    {
+      "name": "4-digit count gets 'c'",
+      "actual": "xc1000",
+      "expected": "xc1000",
+      "ok": true
+    },
+    {
+      "name": "boundary 9 -> no letter",
+      "actual": "x9",
+      "expected": "x9",
+      "ok": true
+    },
+    {
+      "name": "boundary 10 -> 'a'",
+      "actual": "xa10",
+      "expected": "xa10",
+      "ok": true
+    },
+    {
+      "name": "boundary 99 -> 'a'",
+      "actual": "xa99",
+      "expected": "xa99",
+      "ok": true
+    },
+    {
+      "name": "boundary 100 -> 'b'",
+      "actual": "xb100",
+      "expected": "xb100",
+      "ok": true
+    },
+    {
+      "name": "empty context id",
+      "actual": "5",
+      "expected": "5",
+      "ok": true
+    }
+  ],
+  "nesting": [
+    {
+      "depth": 0,
+      "parentId": "",
+      "parentCountBefore": 0,
+      "childId": "0",
+      "parentCountAfter": 1
+    },
+    {
+      "depth": 1,
+      "parentId": "0",
+      "parentCountBefore": 1,
+      "childId": "00",
+      "parentCountAfter": 1
+    },
+    {
+      "depth": 2,
+      "parentId": "00",
+      "parentCountBefore": 1,
+      "childId": "000",
+      "parentCountAfter": 1
+    },
+    {
+      "depth": 3,
+      "parentId": "000",
+      "parentCountBefore": 1,
+      "childId": "0000",
+      "parentCountAfter": 1
+    }
+  ],
+  "triples": [
+    {
+      "contextId": "",
+      "count": 0,
+      "key": "0",
+      "countAfter": 1
+    },
+    {
+      "contextId": "",
+      "count": 1,
+      "key": "1",
+      "countAfter": 2
+    },
+    {
+      "contextId": "",
+      "count": 2,
+      "key": "2",
+      "countAfter": 3
+    },
+    {
+      "contextId": "",
+      "count": 3,
+      "key": "3",
+      "countAfter": 4
+    },
+    {
+      "contextId": "",
+      "count": 4,
+      "key": "4",
+      "countAfter": 5
+    },
+    {
+      "contextId": "",
+      "count": 5,
+      "key": "5",
+      "countAfter": 6
+    },
+    {
+      "contextId": "",
+      "count": 6,
+      "key": "6",
+      "countAfter": 7
+    },
+    {
+      "contextId": "",
+      "count": 7,
+      "key": "7",
+      "countAfter": 8
+    },
+    {
+      "contextId": "",
+      "count": 8,
+      "key": "8",
+      "countAfter": 9
+    },
+    {
+      "contextId": "",
+      "count": 9,
+      "key": "9",
+      "countAfter": 10
+    },
+    {
+      "contextId": "",
+      "count": 10,
+      "key": "a10",
+      "countAfter": 11
+    },
+    {
+      "contextId": "",
+      "count": 11,
+      "key": "a11",
+      "countAfter": 12
+    },
+    {
+      "contextId": "",
+      "count": 12,
+      "key": "a12",
+      "countAfter": 13
+    },
+    {
+      "contextId": "",
+      "count": 19,
+      "key": "a19",
+      "countAfter": 20
+    },
+    {
+      "contextId": "",
+      "count": 20,
+      "key": "a20",
+      "countAfter": 21
+    },
+    {
+      "contextId": "",
+      "count": 42,
+      "key": "a42",
+      "countAfter": 43
+    },
+    {
+      "contextId": "",
+      "count": 50,
+      "key": "a50",
+      "countAfter": 51
+    },
+    {
+      "contextId": "",
+      "count": 98,
+      "key": "a98",
+      "countAfter": 99
+    },
+    {
+      "contextId": "",
+      "count": 99,
+      "key": "a99",
+      "countAfter": 100
+    },
+    {
+      "contextId": "",
+      "count": 100,
+      "key": "b100",
+      "countAfter": 101
+    },
+    {
+      "contextId": "",
+      "count": 101,
+      "key": "b101",
+      "countAfter": 102
+    },
+    {
+      "contextId": "",
+      "count": 123,
+      "key": "b123",
+      "countAfter": 124
+    },
+    {
+      "contextId": "",
+      "count": 200,
+      "key": "b200",
+      "countAfter": 201
+    },
+    {
+      "contextId": "",
+      "count": 500,
+      "key": "b500",
+      "countAfter": 501
+    },
+    {
+      "contextId": "",
+      "count": 998,
+      "key": "b998",
+      "countAfter": 999
+    },
+    {
+      "contextId": "",
+      "count": 999,
+      "key": "b999",
+      "countAfter": 1000
+    },
+    {
+      "contextId": "",
+      "count": 1000,
+      "key": "c1000",
+      "countAfter": 1001
+    },
+    {
+      "contextId": "",
+      "count": 1001,
+      "key": "c1001",
+      "countAfter": 1002
+    },
+    {
+      "contextId": "",
+      "count": 4096,
+      "key": "c4096",
+      "countAfter": 4097
+    },
+    {
+      "contextId": "",
+      "count": 9999,
+      "key": "c9999",
+      "countAfter": 10000
+    },
+    {
+      "contextId": "",
+      "count": 10000,
+      "key": "d10000",
+      "countAfter": 10001
+    },
+    {
+      "contextId": "",
+      "count": 99999,
+      "key": "d99999",
+      "countAfter": 100000
+    },
+    {
+      "contextId": "",
+      "count": 100000,
+      "key": "e100000",
+      "countAfter": 100001
+    },
+    {
+      "contextId": "0",
+      "count": 0,
+      "key": "00",
+      "countAfter": 1
+    },
+    {
+      "contextId": "0",
+      "count": 1,
+      "key": "01",
+      "countAfter": 2
+    },
+    {
+      "contextId": "0",
+      "count": 2,
+      "key": "02",
+      "countAfter": 3
+    },
+    {
+      "contextId": "0",
+      "count": 3,
+      "key": "03",
+      "countAfter": 4
+    },
+    {
+      "contextId": "0",
+      "count": 4,
+      "key": "04",
+      "countAfter": 5
+    },
+    {
+      "contextId": "0",
+      "count": 5,
+      "key": "05",
+      "countAfter": 6
+    },
+    {
+      "contextId": "0",
+      "count": 6,
+      "key": "06",
+      "countAfter": 7
+    },
+    {
+      "contextId": "0",
+      "count": 7,
+      "key": "07",
+      "countAfter": 8
+    },
+    {
+      "contextId": "0",
+      "count": 8,
+      "key": "08",
+      "countAfter": 9
+    },
+    {
+      "contextId": "0",
+      "count": 9,
+      "key": "09",
+      "countAfter": 10
+    },
+    {
+      "contextId": "0",
+      "count": 10,
+      "key": "0a10",
+      "countAfter": 11
+    },
+    {
+      "contextId": "0",
+      "count": 11,
+      "key": "0a11",
+      "countAfter": 12
+    },
+    {
+      "contextId": "0",
+      "count": 12,
+      "key": "0a12",
+      "countAfter": 13
+    },
+    {
+      "contextId": "0",
+      "count": 19,
+      "key": "0a19",
+      "countAfter": 20
+    },
+    {
+      "contextId": "0",
+      "count": 20,
+      "key": "0a20",
+      "countAfter": 21
+    },
+    {
+      "contextId": "0",
+      "count": 42,
+      "key": "0a42",
+      "countAfter": 43
+    },
+    {
+      "contextId": "0",
+      "count": 50,
+      "key": "0a50",
+      "countAfter": 51
+    },
+    {
+      "contextId": "0",
+      "count": 98,
+      "key": "0a98",
+      "countAfter": 99
+    },
+    {
+      "contextId": "0",
+      "count": 99,
+      "key": "0a99",
+      "countAfter": 100
+    },
+    {
+      "contextId": "0",
+      "count": 100,
+      "key": "0b100",
+      "countAfter": 101
+    },
+    {
+      "contextId": "0",
+      "count": 101,
+      "key": "0b101",
+      "countAfter": 102
+    },
+    {
+      "contextId": "0",
+      "count": 123,
+      "key": "0b123",
+      "countAfter": 124
+    },
+    {
+      "contextId": "0",
+      "count": 200,
+      "key": "0b200",
+      "countAfter": 201
+    },
+    {
+      "contextId": "0",
+      "count": 500,
+      "key": "0b500",
+      "countAfter": 501
+    },
+    {
+      "contextId": "0",
+      "count": 998,
+      "key": "0b998",
+      "countAfter": 999
+    },
+    {
+      "contextId": "0",
+      "count": 999,
+      "key": "0b999",
+      "countAfter": 1000
+    },
+    {
+      "contextId": "0",
+      "count": 1000,
+      "key": "0c1000",
+      "countAfter": 1001
+    },
+    {
+      "contextId": "0",
+      "count": 1001,
+      "key": "0c1001",
+      "countAfter": 1002
+    },
+    {
+      "contextId": "0",
+      "count": 4096,
+      "key": "0c4096",
+      "countAfter": 4097
+    },
+    {
+      "contextId": "0",
+      "count": 9999,
+      "key": "0c9999",
+      "countAfter": 10000
+    },
+    {
+      "contextId": "0",
+      "count": 10000,
+      "key": "0d10000",
+      "countAfter": 10001
+    },
+    {
+      "contextId": "0",
+      "count": 99999,
+      "key": "0d99999",
+      "countAfter": 100000
+    },
+    {
+      "contextId": "0",
+      "count": 100000,
+      "key": "0e100000",
+      "countAfter": 100001
+    },
+    {
+      "contextId": "1",
+      "count": 0,
+      "key": "10",
+      "countAfter": 1
+    },
+    {
+      "contextId": "1",
+      "count": 1,
+      "key": "11",
+      "countAfter": 2
+    },
+    {
+      "contextId": "1",
+      "count": 2,
+      "key": "12",
+      "countAfter": 3
+    },
+    {
+      "contextId": "1",
+      "count": 3,
+      "key": "13",
+      "countAfter": 4
+    },
+    {
+      "contextId": "1",
+      "count": 4,
+      "key": "14",
+      "countAfter": 5
+    },
+    {
+      "contextId": "1",
+      "count": 5,
+      "key": "15",
+      "countAfter": 6
+    },
+    {
+      "contextId": "1",
+      "count": 6,
+      "key": "16",
+      "countAfter": 7
+    },
+    {
+      "contextId": "1",
+      "count": 7,
+      "key": "17",
+      "countAfter": 8
+    },
+    {
+      "contextId": "1",
+      "count": 8,
+      "key": "18",
+      "countAfter": 9
+    },
+    {
+      "contextId": "1",
+      "count": 9,
+      "key": "19",
+      "countAfter": 10
+    },
+    {
+      "contextId": "1",
+      "count": 10,
+      "key": "1a10",
+      "countAfter": 11
+    },
+    {
+      "contextId": "1",
+      "count": 11,
+      "key": "1a11",
+      "countAfter": 12
+    },
+    {
+      "contextId": "1",
+      "count": 12,
+      "key": "1a12",
+      "countAfter": 13
+    },
+    {
+      "contextId": "1",
+      "count": 19,
+      "key": "1a19",
+      "countAfter": 20
+    },
+    {
+      "contextId": "1",
+      "count": 20,
+      "key": "1a20",
+      "countAfter": 21
+    },
+    {
+      "contextId": "1",
+      "count": 42,
+      "key": "1a42",
+      "countAfter": 43
+    },
+    {
+      "contextId": "1",
+      "count": 50,
+      "key": "1a50",
+      "countAfter": 51
+    },
+    {
+      "contextId": "1",
+      "count": 98,
+      "key": "1a98",
+      "countAfter": 99
+    },
+    {
+      "contextId": "1",
+      "count": 99,
+      "key": "1a99",
+      "countAfter": 100
+    },
+    {
+      "contextId": "1",
+      "count": 100,
+      "key": "1b100",
+      "countAfter": 101
+    },
+    {
+      "contextId": "1",
+      "count": 101,
+      "key": "1b101",
+      "countAfter": 102
+    },
+    {
+      "contextId": "1",
+      "count": 123,
+      "key": "1b123",
+      "countAfter": 124
+    },
+    {
+      "contextId": "1",
+      "count": 200,
+      "key": "1b200",
+      "countAfter": 201
+    },
+    {
+      "contextId": "1",
+      "count": 500,
+      "key": "1b500",
+      "countAfter": 501
+    },
+    {
+      "contextId": "1",
+      "count": 998,
+      "key": "1b998",
+      "countAfter": 999
+    },
+    {
+      "contextId": "1",
+      "count": 999,
+      "key": "1b999",
+      "countAfter": 1000
+    },
+    {
+      "contextId": "1",
+      "count": 1000,
+      "key": "1c1000",
+      "countAfter": 1001
+    },
+    {
+      "contextId": "1",
+      "count": 1001,
+      "key": "1c1001",
+      "countAfter": 1002
+    },
+    {
+      "contextId": "1",
+      "count": 4096,
+      "key": "1c4096",
+      "countAfter": 4097
+    },
+    {
+      "contextId": "1",
+      "count": 9999,
+      "key": "1c9999",
+      "countAfter": 10000
+    },
+    {
+      "contextId": "1",
+      "count": 10000,
+      "key": "1d10000",
+      "countAfter": 10001
+    },
+    {
+      "contextId": "1",
+      "count": 99999,
+      "key": "1d99999",
+      "countAfter": 100000
+    },
+    {
+      "contextId": "1",
+      "count": 100000,
+      "key": "1e100000",
+      "countAfter": 100001
+    },
+    {
+      "contextId": "9",
+      "count": 0,
+      "key": "90",
+      "countAfter": 1
+    },
+    {
+      "contextId": "9",
+      "count": 1,
+      "key": "91",
+      "countAfter": 2
+    },
+    {
+      "contextId": "9",
+      "count": 2,
+      "key": "92",
+      "countAfter": 3
+    },
+    {
+      "contextId": "9",
+      "count": 3,
+      "key": "93",
+      "countAfter": 4
+    },
+    {
+      "contextId": "9",
+      "count": 4,
+      "key": "94",
+      "countAfter": 5
+    },
+    {
+      "contextId": "9",
+      "count": 5,
+      "key": "95",
+      "countAfter": 6
+    },
+    {
+      "contextId": "9",
+      "count": 6,
+      "key": "96",
+      "countAfter": 7
+    },
+    {
+      "contextId": "9",
+      "count": 7,
+      "key": "97",
+      "countAfter": 8
+    },
+    {
+      "contextId": "9",
+      "count": 8,
+      "key": "98",
+      "countAfter": 9
+    },
+    {
+      "contextId": "9",
+      "count": 9,
+      "key": "99",
+      "countAfter": 10
+    },
+    {
+      "contextId": "9",
+      "count": 10,
+      "key": "9a10",
+      "countAfter": 11
+    },
+    {
+      "contextId": "9",
+      "count": 11,
+      "key": "9a11",
+      "countAfter": 12
+    },
+    {
+      "contextId": "9",
+      "count": 12,
+      "key": "9a12",
+      "countAfter": 13
+    },
+    {
+      "contextId": "9",
+      "count": 19,
+      "key": "9a19",
+      "countAfter": 20
+    },
+    {
+      "contextId": "9",
+      "count": 20,
+      "key": "9a20",
+      "countAfter": 21
+    },
+    {
+      "contextId": "9",
+      "count": 42,
+      "key": "9a42",
+      "countAfter": 43
+    },
+    {
+      "contextId": "9",
+      "count": 50,
+      "key": "9a50",
+      "countAfter": 51
+    },
+    {
+      "contextId": "9",
+      "count": 98,
+      "key": "9a98",
+      "countAfter": 99
+    },
+    {
+      "contextId": "9",
+      "count": 99,
+      "key": "9a99",
+      "countAfter": 100
+    },
+    {
+      "contextId": "9",
+      "count": 100,
+      "key": "9b100",
+      "countAfter": 101
+    },
+    {
+      "contextId": "9",
+      "count": 101,
+      "key": "9b101",
+      "countAfter": 102
+    },
+    {
+      "contextId": "9",
+      "count": 123,
+      "key": "9b123",
+      "countAfter": 124
+    },
+    {
+      "contextId": "9",
+      "count": 200,
+      "key": "9b200",
+      "countAfter": 201
+    },
+    {
+      "contextId": "9",
+      "count": 500,
+      "key": "9b500",
+      "countAfter": 501
+    },
+    {
+      "contextId": "9",
+      "count": 998,
+      "key": "9b998",
+      "countAfter": 999
+    },
+    {
+      "contextId": "9",
+      "count": 999,
+      "key": "9b999",
+      "countAfter": 1000
+    },
+    {
+      "contextId": "9",
+      "count": 1000,
+      "key": "9c1000",
+      "countAfter": 1001
+    },
+    {
+      "contextId": "9",
+      "count": 1001,
+      "key": "9c1001",
+      "countAfter": 1002
+    },
+    {
+      "contextId": "9",
+      "count": 4096,
+      "key": "9c4096",
+      "countAfter": 4097
+    },
+    {
+      "contextId": "9",
+      "count": 9999,
+      "key": "9c9999",
+      "countAfter": 10000
+    },
+    {
+      "contextId": "9",
+      "count": 10000,
+      "key": "9d10000",
+      "countAfter": 10001
+    },
+    {
+      "contextId": "9",
+      "count": 99999,
+      "key": "9d99999",
+      "countAfter": 100000
+    },
+    {
+      "contextId": "9",
+      "count": 100000,
+      "key": "9e100000",
+      "countAfter": 100001
+    },
+    {
+      "contextId": "a0",
+      "count": 0,
+      "key": "a00",
+      "countAfter": 1
+    },
+    {
+      "contextId": "a0",
+      "count": 1,
+      "key": "a01",
+      "countAfter": 2
+    },
+    {
+      "contextId": "a0",
+      "count": 2,
+      "key": "a02",
+      "countAfter": 3
+    },
+    {
+      "contextId": "a0",
+      "count": 3,
+      "key": "a03",
+      "countAfter": 4
+    },
+    {
+      "contextId": "a0",
+      "count": 4,
+      "key": "a04",
+      "countAfter": 5
+    },
+    {
+      "contextId": "a0",
+      "count": 5,
+      "key": "a05",
+      "countAfter": 6
+    },
+    {
+      "contextId": "a0",
+      "count": 6,
+      "key": "a06",
+      "countAfter": 7
+    },
+    {
+      "contextId": "a0",
+      "count": 7,
+      "key": "a07",
+      "countAfter": 8
+    },
+    {
+      "contextId": "a0",
+      "count": 8,
+      "key": "a08",
+      "countAfter": 9
+    },
+    {
+      "contextId": "a0",
+      "count": 9,
+      "key": "a09",
+      "countAfter": 10
+    },
+    {
+      "contextId": "a0",
+      "count": 10,
+      "key": "a0a10",
+      "countAfter": 11
+    },
+    {
+      "contextId": "a0",
+      "count": 11,
+      "key": "a0a11",
+      "countAfter": 12
+    },
+    {
+      "contextId": "a0",
+      "count": 12,
+      "key": "a0a12",
+      "countAfter": 13
+    },
+    {
+      "contextId": "a0",
+      "count": 19,
+      "key": "a0a19",
+      "countAfter": 20
+    },
+    {
+      "contextId": "a0",
+      "count": 20,
+      "key": "a0a20",
+      "countAfter": 21
+    },
+    {
+      "contextId": "a0",
+      "count": 42,
+      "key": "a0a42",
+      "countAfter": 43
+    },
+    {
+      "contextId": "a0",
+      "count": 50,
+      "key": "a0a50",
+      "countAfter": 51
+    },
+    {
+      "contextId": "a0",
+      "count": 98,
+      "key": "a0a98",
+      "countAfter": 99
+    },
+    {
+      "contextId": "a0",
+      "count": 99,
+      "key": "a0a99",
+      "countAfter": 100
+    },
+    {
+      "contextId": "a0",
+      "count": 100,
+      "key": "a0b100",
+      "countAfter": 101
+    },
+    {
+      "contextId": "a0",
+      "count": 101,
+      "key": "a0b101",
+      "countAfter": 102
+    },
+    {
+      "contextId": "a0",
+      "count": 123,
+      "key": "a0b123",
+      "countAfter": 124
+    },
+    {
+      "contextId": "a0",
+      "count": 200,
+      "key": "a0b200",
+      "countAfter": 201
+    },
+    {
+      "contextId": "a0",
+      "count": 500,
+      "key": "a0b500",
+      "countAfter": 501
+    },
+    {
+      "contextId": "a0",
+      "count": 998,
+      "key": "a0b998",
+      "countAfter": 999
+    },
+    {
+      "contextId": "a0",
+      "count": 999,
+      "key": "a0b999",
+      "countAfter": 1000
+    },
+    {
+      "contextId": "a0",
+      "count": 1000,
+      "key": "a0c1000",
+      "countAfter": 1001
+    },
+    {
+      "contextId": "a0",
+      "count": 1001,
+      "key": "a0c1001",
+      "countAfter": 1002
+    },
+    {
+      "contextId": "a0",
+      "count": 4096,
+      "key": "a0c4096",
+      "countAfter": 4097
+    },
+    {
+      "contextId": "a0",
+      "count": 9999,
+      "key": "a0c9999",
+      "countAfter": 10000
+    },
+    {
+      "contextId": "a0",
+      "count": 10000,
+      "key": "a0d10000",
+      "countAfter": 10001
+    },
+    {
+      "contextId": "a0",
+      "count": 99999,
+      "key": "a0d99999",
+      "countAfter": 100000
+    },
+    {
+      "contextId": "a0",
+      "count": 100000,
+      "key": "a0e100000",
+      "countAfter": 100001
+    },
+    {
+      "contextId": "0a10",
+      "count": 0,
+      "key": "0a100",
+      "countAfter": 1
+    },
+    {
+      "contextId": "0a10",
+      "count": 1,
+      "key": "0a101",
+      "countAfter": 2
+    },
+    {
+      "contextId": "0a10",
+      "count": 2,
+      "key": "0a102",
+      "countAfter": 3
+    },
+    {
+      "contextId": "0a10",
+      "count": 3,
+      "key": "0a103",
+      "countAfter": 4
+    },
+    {
+      "contextId": "0a10",
+      "count": 4,
+      "key": "0a104",
+      "countAfter": 5
+    },
+    {
+      "contextId": "0a10",
+      "count": 5,
+      "key": "0a105",
+      "countAfter": 6
+    },
+    {
+      "contextId": "0a10",
+      "count": 6,
+      "key": "0a106",
+      "countAfter": 7
+    },
+    {
+      "contextId": "0a10",
+      "count": 7,
+      "key": "0a107",
+      "countAfter": 8
+    },
+    {
+      "contextId": "0a10",
+      "count": 8,
+      "key": "0a108",
+      "countAfter": 9
+    },
+    {
+      "contextId": "0a10",
+      "count": 9,
+      "key": "0a109",
+      "countAfter": 10
+    },
+    {
+      "contextId": "0a10",
+      "count": 10,
+      "key": "0a10a10",
+      "countAfter": 11
+    },
+    {
+      "contextId": "0a10",
+      "count": 11,
+      "key": "0a10a11",
+      "countAfter": 12
+    },
+    {
+      "contextId": "0a10",
+      "count": 12,
+      "key": "0a10a12",
+      "countAfter": 13
+    },
+    {
+      "contextId": "0a10",
+      "count": 19,
+      "key": "0a10a19",
+      "countAfter": 20
+    },
+    {
+      "contextId": "0a10",
+      "count": 20,
+      "key": "0a10a20",
+      "countAfter": 21
+    },
+    {
+      "contextId": "0a10",
+      "count": 42,
+      "key": "0a10a42",
+      "countAfter": 43
+    },
+    {
+      "contextId": "0a10",
+      "count": 50,
+      "key": "0a10a50",
+      "countAfter": 51
+    },
+    {
+      "contextId": "0a10",
+      "count": 98,
+      "key": "0a10a98",
+      "countAfter": 99
+    },
+    {
+      "contextId": "0a10",
+      "count": 99,
+      "key": "0a10a99",
+      "countAfter": 100
+    },
+    {
+      "contextId": "0a10",
+      "count": 100,
+      "key": "0a10b100",
+      "countAfter": 101
+    },
+    {
+      "contextId": "0a10",
+      "count": 101,
+      "key": "0a10b101",
+      "countAfter": 102
+    },
+    {
+      "contextId": "0a10",
+      "count": 123,
+      "key": "0a10b123",
+      "countAfter": 124
+    },
+    {
+      "contextId": "0a10",
+      "count": 200,
+      "key": "0a10b200",
+      "countAfter": 201
+    },
+    {
+      "contextId": "0a10",
+      "count": 500,
+      "key": "0a10b500",
+      "countAfter": 501
+    },
+    {
+      "contextId": "0a10",
+      "count": 998,
+      "key": "0a10b998",
+      "countAfter": 999
+    },
+    {
+      "contextId": "0a10",
+      "count": 999,
+      "key": "0a10b999",
+      "countAfter": 1000
+    },
+    {
+      "contextId": "0a10",
+      "count": 1000,
+      "key": "0a10c1000",
+      "countAfter": 1001
+    },
+    {
+      "contextId": "0a10",
+      "count": 1001,
+      "key": "0a10c1001",
+      "countAfter": 1002
+    },
+    {
+      "contextId": "0a10",
+      "count": 4096,
+      "key": "0a10c4096",
+      "countAfter": 4097
+    },
+    {
+      "contextId": "0a10",
+      "count": 9999,
+      "key": "0a10c9999",
+      "countAfter": 10000
+    },
+    {
+      "contextId": "0a10",
+      "count": 10000,
+      "key": "0a10d10000",
+      "countAfter": 10001
+    },
+    {
+      "contextId": "0a10",
+      "count": 99999,
+      "key": "0a10d99999",
+      "countAfter": 100000
+    },
+    {
+      "contextId": "0a10",
+      "count": 100000,
+      "key": "0a10e100000",
+      "countAfter": 100001
+    },
+    {
+      "contextId": "b100",
+      "count": 0,
+      "key": "b1000",
+      "countAfter": 1
+    },
+    {
+      "contextId": "b100",
+      "count": 1,
+      "key": "b1001",
+      "countAfter": 2
+    },
+    {
+      "contextId": "b100",
+      "count": 2,
+      "key": "b1002",
+      "countAfter": 3
+    },
+    {
+      "contextId": "b100",
+      "count": 3,
+      "key": "b1003",
+      "countAfter": 4
+    },
+    {
+      "contextId": "b100",
+      "count": 4,
+      "key": "b1004",
+      "countAfter": 5
+    },
+    {
+      "contextId": "b100",
+      "count": 5,
+      "key": "b1005",
+      "countAfter": 6
+    },
+    {
+      "contextId": "b100",
+      "count": 6,
+      "key": "b1006",
+      "countAfter": 7
+    },
+    {
+      "contextId": "b100",
+      "count": 7,
+      "key": "b1007",
+      "countAfter": 8
+    },
+    {
+      "contextId": "b100",
+      "count": 8,
+      "key": "b1008",
+      "countAfter": 9
+    },
+    {
+      "contextId": "b100",
+      "count": 9,
+      "key": "b1009",
+      "countAfter": 10
+    },
+    {
+      "contextId": "b100",
+      "count": 10,
+      "key": "b100a10",
+      "countAfter": 11
+    },
+    {
+      "contextId": "b100",
+      "count": 11,
+      "key": "b100a11",
+      "countAfter": 12
+    },
+    {
+      "contextId": "b100",
+      "count": 12,
+      "key": "b100a12",
+      "countAfter": 13
+    },
+    {
+      "contextId": "b100",
+      "count": 19,
+      "key": "b100a19",
+      "countAfter": 20
+    },
+    {
+      "contextId": "b100",
+      "count": 20,
+      "key": "b100a20",
+      "countAfter": 21
+    },
+    {
+      "contextId": "b100",
+      "count": 42,
+      "key": "b100a42",
+      "countAfter": 43
+    },
+    {
+      "contextId": "b100",
+      "count": 50,
+      "key": "b100a50",
+      "countAfter": 51
+    },
+    {
+      "contextId": "b100",
+      "count": 98,
+      "key": "b100a98",
+      "countAfter": 99
+    },
+    {
+      "contextId": "b100",
+      "count": 99,
+      "key": "b100a99",
+      "countAfter": 100
+    },
+    {
+      "contextId": "b100",
+      "count": 100,
+      "key": "b100b100",
+      "countAfter": 101
+    },
+    {
+      "contextId": "b100",
+      "count": 101,
+      "key": "b100b101",
+      "countAfter": 102
+    },
+    {
+      "contextId": "b100",
+      "count": 123,
+      "key": "b100b123",
+      "countAfter": 124
+    },
+    {
+      "contextId": "b100",
+      "count": 200,
+      "key": "b100b200",
+      "countAfter": 201
+    },
+    {
+      "contextId": "b100",
+      "count": 500,
+      "key": "b100b500",
+      "countAfter": 501
+    },
+    {
+      "contextId": "b100",
+      "count": 998,
+      "key": "b100b998",
+      "countAfter": 999
+    },
+    {
+      "contextId": "b100",
+      "count": 999,
+      "key": "b100b999",
+      "countAfter": 1000
+    },
+    {
+      "contextId": "b100",
+      "count": 1000,
+      "key": "b100c1000",
+      "countAfter": 1001
+    },
+    {
+      "contextId": "b100",
+      "count": 1001,
+      "key": "b100c1001",
+      "countAfter": 1002
+    },
+    {
+      "contextId": "b100",
+      "count": 4096,
+      "key": "b100c4096",
+      "countAfter": 4097
+    },
+    {
+      "contextId": "b100",
+      "count": 9999,
+      "key": "b100c9999",
+      "countAfter": 10000
+    },
+    {
+      "contextId": "b100",
+      "count": 10000,
+      "key": "b100d10000",
+      "countAfter": 10001
+    },
+    {
+      "contextId": "b100",
+      "count": 99999,
+      "key": "b100d99999",
+      "countAfter": 100000
+    },
+    {
+      "contextId": "b100",
+      "count": 100000,
+      "key": "b100e100000",
+      "countAfter": 100001
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 0,
+      "key": "0a10b1000",
+      "countAfter": 1
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 1,
+      "key": "0a10b1001",
+      "countAfter": 2
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 2,
+      "key": "0a10b1002",
+      "countAfter": 3
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 3,
+      "key": "0a10b1003",
+      "countAfter": 4
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 4,
+      "key": "0a10b1004",
+      "countAfter": 5
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 5,
+      "key": "0a10b1005",
+      "countAfter": 6
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 6,
+      "key": "0a10b1006",
+      "countAfter": 7
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 7,
+      "key": "0a10b1007",
+      "countAfter": 8
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 8,
+      "key": "0a10b1008",
+      "countAfter": 9
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 9,
+      "key": "0a10b1009",
+      "countAfter": 10
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 10,
+      "key": "0a10b100a10",
+      "countAfter": 11
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 11,
+      "key": "0a10b100a11",
+      "countAfter": 12
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 12,
+      "key": "0a10b100a12",
+      "countAfter": 13
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 19,
+      "key": "0a10b100a19",
+      "countAfter": 20
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 20,
+      "key": "0a10b100a20",
+      "countAfter": 21
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 42,
+      "key": "0a10b100a42",
+      "countAfter": 43
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 50,
+      "key": "0a10b100a50",
+      "countAfter": 51
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 98,
+      "key": "0a10b100a98",
+      "countAfter": 99
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 99,
+      "key": "0a10b100a99",
+      "countAfter": 100
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 100,
+      "key": "0a10b100b100",
+      "countAfter": 101
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 101,
+      "key": "0a10b100b101",
+      "countAfter": 102
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 123,
+      "key": "0a10b100b123",
+      "countAfter": 124
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 200,
+      "key": "0a10b100b200",
+      "countAfter": 201
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 500,
+      "key": "0a10b100b500",
+      "countAfter": 501
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 998,
+      "key": "0a10b100b998",
+      "countAfter": 999
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 999,
+      "key": "0a10b100b999",
+      "countAfter": 1000
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 1000,
+      "key": "0a10b100c1000",
+      "countAfter": 1001
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 1001,
+      "key": "0a10b100c1001",
+      "countAfter": 1002
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 4096,
+      "key": "0a10b100c4096",
+      "countAfter": 4097
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 9999,
+      "key": "0a10b100c9999",
+      "countAfter": 10000
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 10000,
+      "key": "0a10b100d10000",
+      "countAfter": 10001
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 99999,
+      "key": "0a10b100d99999",
+      "countAfter": 100000
+    },
+    {
+      "contextId": "0a10b100",
+      "count": 100000,
+      "key": "0a10b100e100000",
+      "countAfter": 100001
+    }
+  ]
+}

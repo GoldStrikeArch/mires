@@ -1,0 +1,33 @@
+function rust_entry() {
+  let value = [], base, _10;
+  value[0] = 1;
+  x14_pointers$bump$h2b40639afb54a27c({ buf: value, off: 0 }, 41);
+  x14_pointers$mini_core$print_i32$hf678a2c85ecff833(value[0]);
+  _10 = 0;
+  if (!(_10 < 4)) {
+    x14_pointers$mini_core$panic_bounds_check$h25e30b2ab8a7433d(_10, 4, { file: "examples/emit/14_pointers.rs", line: 68, column: 17 });
+  }
+  base = { buf: [10, 20, 30, 40], off: _10 };
+  x14_pointers$mini_core$print_i32$hf678a2c85ecff833(x14_pointers$nth$h3d0f6f892101f55e(base, 2));
+  x14_pointers$mini_core$print_i32$hf678a2c85ecff833(x14_pointers$sum$h845cb2de3c4ecf9e(base, { buf: base.buf, off: base.off + 4 }));
+}
+function x14_pointers$bump$h2b40639afb54a27c(target, by) {
+  target.buf[target.off] = target.buf[target.off] + by | 0;
+}
+function x14_pointers$nth$h3d0f6f892101f55e(base, index) {
+  return base.buf[base.off + index];
+}
+function x14_pointers$sum$h845cb2de3c4ecf9e(start, end) {
+  let at, total, _11;
+  at = start;
+  total = 0;
+  for (;;) {
+    if (end.off - at.off > 0) {
+      total = total + at.buf[at.off] | 0;
+      _11 = at;
+      at = { buf: _11.buf, off: _11.off + 1 };
+    } else {
+      return total;
+    }
+  }
+}

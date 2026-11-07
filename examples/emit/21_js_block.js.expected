@@ -1,0 +1,14 @@
+function rust_entry() {
+  let a, b, kind, body;
+  x21_js_block$prelude$print_i32$h95f4868d6175203e((1+1));
+  a = 6;
+  b = 7;
+  x21_js_block$prelude$print_i32$h95f4868d6175203e(((_$js0, _$js1) => (_$js0*_$js1))(a, b));
+  kind = "application/topcoat+json";
+  body = "[\"world\"]";
+  x21_js_block$prelude$print_str$h1fda1bd3008a8178(((_$js0, _$js1) => (({method:"POST",headers:{"content-type":_$js0},body: _$js1}).headers["content-type"]))(kind, body));
+  x21_js_block$prelude$print_str$h1fda1bd3008a8178(((_$js0, _$js1) => (({method:"POST",headers:{"content-type":_$js0},body: _$js1}).body))(kind, body));
+  x21_js_block$prelude$print_i32$h95f4868d6175203e(((_$js0) => (_$js0+_$js0))(a));
+  x21_js_block$prelude$print_str$h1fda1bd3008a8178(((_$js0) => (((s)=>s.slice(0,11))(_$js0)))(kind));
+  x21_js_block$prelude$print_str$h1fda1bd3008a8178(((_$js0, _$js1) => (`${_$js0} of ${_$js1}`))(a, b));
+}

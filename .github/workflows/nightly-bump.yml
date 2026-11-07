@@ -1,0 +1,222 @@
+name: Nightly Bump
+
+# The codegen backend is a rustc plugin, so it only loads into the exact nightly
+# it was built against. That pin has to move, and it can only move on evidence:
+# this walks it forward once a week, rebuilds the backend and the `core` it
+# compiles, runs the suites, and opens a pull request only if all of them pass.
+
+on:
+  schedule:
+    # Mondays, early UTC: a nightly published over the weekend has settled, and a
+    # green pull request is waiting at the start of the week.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "The nightly to pin, e.g. nightly-2026-07-27. Defaults to the latest."
+        required: false
+        type: string
+
+# One bump at a time: two runs would race on the same branch. Never cancelled,
+# because a run that is most of the way through a sysroot build is worth more
+# than the one that would replace it.
+concurrency:
+  group: mires-nightly-bump
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # The suites reuse the backend dylib built by the first step rather than
+  # rebuilding it several more times. `scripts/build.sh` does not read this.
+  SKIP_BUILD: "1"
+
+jobs:
+  bump:
+    name: bump
+    runs-on: ubuntu-latest
+    # The sysroot is `core` compiled by a freshly built backend, and the suites
+    # run on top of it. There is no cache to help: every run is a toolchain this
+    # machine has never seen, so `Swatinem/rust-cache` could not hit.
+    timeout-minutes: 150
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Every suite runs its compiled JavaScript under node. No lockfile is
+          # involved, so there is nothing to cache.
+          node-version: 24
+
+      # The pin the checkout carries, and the one it should carry. Equal means
+      # there is nothing to do, and every step below is skipped rather than the
+      # run failing.
+      - name: resolve the nightly
+        id: nightly
+        env:
+          REQUESTED: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          toolchain=rust-toolchain.toml
+          current=$(grep -m1 -E '^[[:space:]]*channel[[:space:]]*=' "$toolchain" | cut -d'"' -f2)
+          if [ -z "$current" ]; then
+            echo "::error::no channel in $toolchain" >&2
+            exit 1
+          fi
+
+          if [ -n "$REQUESTED" ]; then
+            wanted=$REQUESTED
+          else
+            # The release channel manifest names the date the latest nightly is
+            # pinnable by, which is what `nightly-<date>` has to be built from.
+            date=$(curl -sSf https://static.rust-lang.org/dist/channel-rust-nightly.toml \
+              | grep -m1 -E '^date = ' | cut -d'"' -f2)
+            if [ -z "$date" ]; then
+              echo "::error::could not read the latest nightly's date from the channel manifest" >&2
+              exit 1
+            fi
+            wanted="nightly-$date"
+          fi
+
+          echo "current=$current" >>"$GITHUB_OUTPUT"
+          echo "wanted=$wanted" >>"$GITHUB_OUTPUT"
+          if [ "$current" = "$wanted" ]; then
+            echo "bump=no" >>"$GITHUB_OUTPUT"
+            echo "::notice::the pin is already $current"
+          else
+            echo "bump=yes" >>"$GITHUB_OUTPUT"
+            echo "::notice::bumping the pin from $current to $wanted"
+          fi
+
+      # The pin moves before anything is built, so what the suites run against is
+      # what the pull request would land.
+      - name: bump the pin
+        if: steps.nightly.outputs.bump == 'yes'
+        env:
+          WANTED: ${{ steps.nightly.outputs.wanted }}
+        run: |
+          set -euo pipefail
+          toolchain=rust-toolchain.toml
+          sed -i -E "s|^([[:space:]]*channel[[:space:]]*=[[:space:]]*).*|\1\"${WANTED}\"|" "$toolchain"
+          grep -q "\"${WANTED}\"" "$toolchain"
+          git --no-pager diff -- "$toolchain"
+
+      # The components come out of the toolchain file rather than being repeated
+      # here, so the pin stays the one place that says what the backend needs. A
+      # nightly missing one of them cannot host the backend at all, and this step
+      # failing is that report.
+      - name: install the nightly
+        if: steps.nightly.outputs.bump == 'yes'
+        env:
+          WANTED: ${{ steps.nightly.outputs.wanted }}
+        run: |
+          set -euo pipefail
+          toolchain=rust-toolchain.toml
+          components=$(grep -m1 -E '^[[:space:]]*components[[:space:]]*=' "$toolchain" \
+            | cut -d= -f2- | tr -d '[]",')
+          args=()
+          for component in $components; do
+            args+=(--component "$component")
+          done
+          rustup toolchain install "$WANTED" --profile minimal "${args[@]}"
+          rustc "+$WANTED" --version --verbose
+
+      - name: build the backend
+        if: steps.nightly.outputs.bump == 'yes'
+        run: bash scripts/build.sh
+
+      - name: build the sysroot
+        if: steps.nightly.outputs.bump == 'yes'
+        env:
+          JS_EXTRA_ARGS: ""
+        run: bash scripts/build_sysroot.sh
+
+      - name: cargo tests
+        if: steps.nightly.outputs.bump == 'yes'
+        run: cargo test --workspace
+
+      - name: core and mini-core suites
+        if: steps.nightly.outputs.bump == 'yes'
+        run: bash scripts/test.sh
+
+      - name: emit suite
+        if: steps.nightly.outputs.bump == 'yes'
+        run: bash scripts/emit-test.sh
+
+      - name: module suite
+        if: steps.nightly.outputs.bump == 'yes'
+        run: bash scripts/module-test.sh
+
+      - name: extern suite
+        if: steps.nightly.outputs.bump == 'yes'
+        run: bash scripts/extern-test.sh
+
+      - name: async suite
+        if: steps.nightly.outputs.bump == 'yes'
+        run: bash scripts/async-test.sh
+
+      - name: dts suite
+        if: steps.nightly.outputs.bump == 'yes'
+        run: bash scripts/dts-test.sh
+
+      # Only reachable with every suite above green, because a failing step fails
+      # the job. A golden that moved under the new nightly stops the run here,
+      # which is the intended outcome: a rebaseline is a judgement call and not
+      # something a cron should make.
+      - name: open the pull request
+        if: steps.nightly.outputs.bump == 'yes'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT: ${{ steps.nightly.outputs.current }}
+          WANTED: ${{ steps.nightly.outputs.wanted }}
+        run: |
+          set -euo pipefail
+          branch="chore/nightly-${WANTED}"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add rust-toolchain.toml Cargo.lock
+          git commit -m "chore: bump the codegen backend nightly to ${WANTED}"
+          # Forced, so a branch left behind by a run that failed later is
+          # replaced rather than blocking this one.
+          git push --force origin "HEAD:refs/heads/${branch}"
+
+          open=$(gh pr list --head "$branch" --state open --json number --jq 'length')
+          if [ "$open" != "0" ]; then
+            echo "::notice::the pull request for $branch is already open, and now carries this build"
+            exit 0
+          fi
+
+          cat >"$RUNNER_TEMP/body.md" <<BODY
+          Moves the toolchain pin from \`${CURRENT}\` to \`${WANTED}\`.
+
+          The backend is a rustc plugin and only loads into the nightly it was built against, so \`rust-toolchain.toml\` is what decides which nightly a client compile runs on.
+
+          Green on the new nightly, in this order:
+
+          - \`scripts/build.sh\`, the backend, release
+          - \`scripts/build_sysroot.sh\`, \`core\` and \`alloc\` compiled by it
+          - \`cargo test --workspace\`
+          - \`scripts/test.sh\`
+          - \`scripts/emit-test.sh\`
+          - \`scripts/module-test.sh\`
+          - \`scripts/extern-test.sh\`
+          - \`scripts/async-test.sh\`
+          - \`scripts/dts-test.sh\`
+
+          A bump whose goldens moved never reaches this point: the suite fails and no pull request is opened, because rebaselining is a judgement call.
+
+          Opened by \`.github/workflows/nightly-bump.yml\`. A pull request made with \`GITHUB_TOKEN\` does not start CI, so push to this branch, or close and reopen it, to get a run.
+          BODY
+
+          gh pr create \
+            --base "${GITHUB_REF_NAME}" \
+            --head "$branch" \
+            --title "chore: bump the codegen backend nightly to ${WANTED}" \
+            --body-file "$RUNNER_TEMP/body.md"

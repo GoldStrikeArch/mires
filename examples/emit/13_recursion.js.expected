@@ -1,0 +1,32 @@
+function rust_entry() {
+  x13_recursion$mini_core$print_i32$hbd40e94f15751aff(x13_recursion$factorial$he2afc22b797412b2(6));
+  x13_recursion$mini_core$print_bool$h442f5791ea58da34(x13_recursion$is_even$h612baeabea858e38(10));
+  x13_recursion$mini_core$print_bool$h442f5791ea58da34(x13_recursion$is_odd$ha21eec9a4716c16a(10));
+}
+function x13_recursion$factorial$he2afc22b797412b2(n) {
+  let _0;
+  if (n <= 1) {
+    _0 = 1;
+  } else {
+    _0 = Math.imul(n, x13_recursion$factorial$he2afc22b797412b2(n - 1 | 0)) | 0;
+  }
+  return _0;
+}
+function x13_recursion$is_even$h612baeabea858e38(n) {
+  let _0;
+  if (n === 0) {
+    _0 = true;
+  } else {
+    _0 = x13_recursion$is_odd$ha21eec9a4716c16a(n - 1 | 0);
+  }
+  return _0;
+}
+function x13_recursion$is_odd$ha21eec9a4716c16a(n) {
+  let _0;
+  if (n === 0) {
+    _0 = false;
+  } else {
+    _0 = x13_recursion$is_even$h612baeabea858e38(n - 1 | 0);
+  }
+  return _0;
+}

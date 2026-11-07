@@ -1,0 +1,27 @@
+{
+  "name": "@mires/dom-runtime",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "The vendored client runtime for the Rust->JS emitter: solid-js/web's DOM runtime, bundled to a single self-contained ESM file exporting exactly the dom-expressions client ABI.",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node check-exports.mjs",
+    "size": "node build.mjs --size"
+  },
+  "dependencies": {
+    "solid-js": "1.9.14"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1"
+  },
+  "$note-bundler": [
+    "esbuild rather than tsup. crates/topcoat-runtime/browser uses tsup, and this",
+    "build mirrors its settings exactly (esm / noExternal / platform browser /",
+    "target es2022 / minify / sourcemap). But tsup is a wrapper whose value is",
+    "TypeScript entry handling and dts emission, and this package has neither: a",
+    "single hand-written .js re-export file. esbuild is what tsup would call",
+    "anyway, with one less layer between the pin and the artifact.",
+    "See README.md."
+  ]
+}

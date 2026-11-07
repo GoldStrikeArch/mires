@@ -1,0 +1,17 @@
+function rust_entry() {
+  x03_while$mini_core$print_i32$h363f430c0365f96d(x03_while$triangle$h303270904bc67f68(5));
+  x03_while$mini_core$print_i32$h363f430c0365f96d(x03_while$triangle$h303270904bc67f68(0));
+}
+function x03_while$triangle$h303270904bc67f68(n) {
+  let i, acc;
+  i = 0;
+  acc = 0;
+  for (;;) {
+    if (i < n) {
+      acc = acc + i | 0;
+      i = i + 1 | 0;
+    } else {
+      return acc;
+    }
+  }
+}

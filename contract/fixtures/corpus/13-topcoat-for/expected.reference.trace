@@ -1,0 +1,20 @@
+{"$record":"header","$generatedBy":"contract/harness/gen-corpus.mjs","$doNotEditByHand":"Re-run the extractor instead. A diff here after a version bump IS the drift report.","$extractedFrom":{"dom-expressions":"0.40.8","solid-js":"1.9.14","babel-plugin-jsx-dom-expressions":"0.40.7","gitSha":"56bd4054237b031c0cca8c1ec69da162c52ed4a6"},"$extractionDate":"2026-07-29","$what":"Normalized runtime-call trace of a reference-compiled CORPUS fixture executed against harness/trace.mjs. Node identities are renamed in first-appearance order; functions become fn#N; templates become tmpl#N.","fixture":"corpus/13-topcoat-for","label":"corpus/13-topcoat-for","freeBindingsHealed":["posts","attrs"],"status":"completed","error":null,"recordCount":19}
+{"op":"template","tmpl":"tmpl#0","html":"<ul>"}
+{"op":"template","tmpl":"tmpl#1","html":"<li><a>"}
+{"op":"template","tmpl":"tmpl#2","html":"<li>None"}
+{"op":"template","tmpl":"tmpl#3","html":"<li>"}
+{"op":"template","tmpl":"tmpl#4","html":"<div>"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"insert","parent":"tmpl#0:root","accessor":"fn#0","marker":"undefined","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"createComponent","comp":"fn#1","props":{"children":"fn#1"}}
+{"op":"For","props":{"children":"fn#1"}}
+{"op":"insert","parent":"tmpl#0:root","accessor":"undefined","marker":"undefined","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"createComponent","comp":"fn#1","props":{"children":"fn#2","fallback":"tmpl#2:root"}}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"For","props":{"children":"fn#2","fallback":"tmpl#2:root"}}
+{"op":"insert","parent":"tmpl#0:root","accessor":"undefined","marker":"undefined","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#4","result":"tmpl#4:root"}
+{"op":"spread","node":"tmpl#4:root","isSVG":false,"skipChildren":false}

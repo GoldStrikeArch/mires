@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "backend",
+    "mires-build",
+    "structurizer",
+    "mires-js",
+    "view-abi",
+    "view-async",
+    "js-extern-macro",
+    "js-macro",
+]

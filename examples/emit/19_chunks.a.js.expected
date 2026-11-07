@@ -1,0 +1,9 @@
+import { x19_chunks$mini_core$print_i32$h03a0ab5afd07a6ca, x19_chunks$mini_core$print_str$ha7091700cec2948f, x19_chunks$shared_add$hc9865bfa68abd03f } from "./shared.js";
+function __island_a() {
+  x19_chunks$mini_core$print_str$ha7091700cec2948f("a");
+  x19_chunks$mini_core$print_i32$h03a0ab5afd07a6ca(x19_chunks$only_a$he540914af2283378(20));
+}
+function x19_chunks$only_a$he540914af2283378(x) {
+  return x19_chunks$shared_add$hc9865bfa68abd03f(x) + 1 | 0;
+}
+export { __island_a };

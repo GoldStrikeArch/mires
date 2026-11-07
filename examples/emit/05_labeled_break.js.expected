@@ -1,0 +1,28 @@
+function rust_entry() {
+  x05_labeled_break$mini_core$print_i32$h5f620b8465c61963(x05_labeled_break$find$h8ffc377e306a6653(6, 12));
+  x05_labeled_break$mini_core$print_i32$h5f620b8465c61963(x05_labeled_break$find$h8ffc377e306a6653(3, 99));
+}
+function x05_labeled_break$find$h8ffc377e306a6653(limit, target) {
+  let i, found, j;
+  i = 0;
+  found = -1;
+  L0: for (;;) {
+    if (i < limit) {
+      j = 0;
+      for (;;) {
+        if (j < limit) {
+          if ((Math.imul(i, j) | 0) === target) {
+            found = (Math.imul(i, 10) | 0) + j | 0;
+            break;
+          } else {
+            j = j + 1 | 0;
+          }
+        } else {
+          i = i + 1 | 0;
+          continue L0;
+        }
+      }
+    }
+    return found;
+  }
+}

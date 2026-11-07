@@ -1,0 +1,413 @@
+{
+  "$generatedBy": "contract/harness/extract-abi.mjs",
+  "$doNotEditByHand": "Re-run the extractor instead. A diff here after a version bump IS the drift report.",
+  "$extractedFrom": {
+    "dom-expressions": "0.40.8",
+    "solid-js": "1.9.14",
+    "babel-plugin-jsx-dom-expressions": "0.40.7",
+    "gitSha": "56bd4054237b031c0cca8c1ec69da162c52ed4a6"
+  },
+  "$extractionDate": "2026-07-29",
+  "$source": "dom-expressions/src/client.js, imported with rxcore bound to solid-js",
+  "$arityNote": "arity is Function.length, which stops at the first parameter with a default or a rest parameter. e.g. template(html, isImportNode, isSVG, isMathML) reports 4, but delegateEvents(eventNames, document = window.document) reports 1. Treat arity as a lower bound on the declared parameter count, not a call-signature contract.",
+  "exportCount": 48,
+  "exports": [
+    {
+      "name": "Aliases",
+      "kind": "object",
+      "origin": "constants",
+      "inSolidWeb": true
+    },
+    {
+      "name": "Assets",
+      "kind": "function",
+      "arity": 0,
+      "origin": "voidFn (server-only, inert on client)",
+      "inSolidWeb": true
+    },
+    {
+      "name": "ChildProperties",
+      "kind": "set",
+      "origin": "constants",
+      "inSolidWeb": true
+    },
+    {
+      "name": "DOMElements",
+      "kind": "set",
+      "origin": "constants",
+      "inSolidWeb": true
+    },
+    {
+      "name": "DelegatedEvents",
+      "kind": "set",
+      "origin": "constants",
+      "inSolidWeb": true
+    },
+    {
+      "name": "Hydration",
+      "kind": "function",
+      "arity": 1,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "HydrationScript",
+      "kind": "function",
+      "arity": 0,
+      "origin": "voidFn (server-only, inert on client)",
+      "inSolidWeb": true
+    },
+    {
+      "name": "NoHydration",
+      "kind": "function",
+      "arity": 1,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "Properties",
+      "kind": "set",
+      "origin": "constants",
+      "inSolidWeb": true
+    },
+    {
+      "name": "RequestContext",
+      "kind": "symbol",
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "SVGElements",
+      "kind": "set",
+      "origin": "constants",
+      "inSolidWeb": true
+    },
+    {
+      "name": "SVGNamespace",
+      "kind": "object",
+      "origin": "constants",
+      "inSolidWeb": true
+    },
+    {
+      "name": "addEventListener",
+      "kind": "function",
+      "arity": 4,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "assign",
+      "kind": "function",
+      "arity": 4,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "classList",
+      "kind": "function",
+      "arity": 2,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "className",
+      "kind": "function",
+      "arity": 2,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "clearDelegatedEvents",
+      "kind": "function",
+      "arity": 0,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "createComponent",
+      "kind": "function",
+      "arity": 2,
+      "origin": "rxcore",
+      "inSolidWeb": true
+    },
+    {
+      "name": "delegateEvents",
+      "kind": "function",
+      "arity": 1,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "dynamicProperty",
+      "kind": "function",
+      "arity": 2,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "effect",
+      "kind": "function",
+      "arity": 3,
+      "origin": "rxcore",
+      "inSolidWeb": true
+    },
+    {
+      "name": "generateHydrationScript",
+      "kind": "function",
+      "arity": 0,
+      "origin": "voidFn (server-only, inert on client)",
+      "inSolidWeb": true
+    },
+    {
+      "name": "getAssets",
+      "kind": "function",
+      "arity": 0,
+      "origin": "voidFn (server-only, inert on client)",
+      "inSolidWeb": true
+    },
+    {
+      "name": "getHydrationKey",
+      "kind": "function",
+      "arity": 0,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "getNextElement",
+      "kind": "function",
+      "arity": 1,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "getNextMarker",
+      "kind": "function",
+      "arity": 1,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "getNextMatch",
+      "kind": "function",
+      "arity": 2,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "getOwner",
+      "kind": "function",
+      "arity": 0,
+      "origin": "rxcore",
+      "inSolidWeb": true
+    },
+    {
+      "name": "getPropAlias",
+      "kind": "function",
+      "arity": 2,
+      "origin": "constants",
+      "inSolidWeb": true
+    },
+    {
+      "name": "getRequestEvent",
+      "kind": "function",
+      "arity": 0,
+      "origin": "voidFn (server-only, inert on client)",
+      "inSolidWeb": true
+    },
+    {
+      "name": "hydrate",
+      "kind": "function",
+      "arity": 2,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "innerHTML",
+      "kind": "function",
+      "arity": 2,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "insert",
+      "kind": "function",
+      "arity": 4,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "memo",
+      "kind": "function",
+      "arity": 3,
+      "origin": "rxcore",
+      "inSolidWeb": true
+    },
+    {
+      "name": "mergeProps",
+      "kind": "function",
+      "arity": 0,
+      "origin": "rxcore",
+      "inSolidWeb": true
+    },
+    {
+      "name": "render",
+      "kind": "function",
+      "arity": 3,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "runHydrationEvents",
+      "kind": "function",
+      "arity": 0,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "setAttribute",
+      "kind": "function",
+      "arity": 3,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "setAttributeNS",
+      "kind": "function",
+      "arity": 4,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "setBoolAttribute",
+      "kind": "function",
+      "arity": 3,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "setProperty",
+      "kind": "function",
+      "arity": 3,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "setStyleProperty",
+      "kind": "function",
+      "arity": 3,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "spread",
+      "kind": "function",
+      "arity": 1,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "style",
+      "kind": "function",
+      "arity": 3,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "template",
+      "kind": "function",
+      "arity": 4,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "untrack",
+      "kind": "function",
+      "arity": 1,
+      "origin": "rxcore",
+      "inSolidWeb": true
+    },
+    {
+      "name": "use",
+      "kind": "function",
+      "arity": 3,
+      "origin": "client.js",
+      "inSolidWeb": true
+    },
+    {
+      "name": "useAssets",
+      "kind": "function",
+      "arity": 0,
+      "origin": "voidFn (server-only, inert on client)",
+      "inSolidWeb": true
+    }
+  ],
+  "rxcore": {
+    "$note": "The reactivity seam. client.js imports these from the bare specifier \"rxcore\", which is a build-time alias, not a package. solid-js points it at solid's core; that is what the vendored runtime artifact bundles.",
+    "reExported": [
+      "effect",
+      "memo",
+      "untrack",
+      "getOwner",
+      "createComponent",
+      "mergeProps"
+    ],
+    "internalOnly": [
+      "root",
+      "sharedConfig"
+    ]
+  },
+  "constantsReExports": [
+    "Properties",
+    "ChildProperties",
+    "getPropAlias",
+    "Aliases",
+    "DOMElements",
+    "SVGElements",
+    "SVGNamespace",
+    "DelegatedEvents"
+  ],
+  "voidOnClient": [
+    "useAssets",
+    "getAssets",
+    "Assets",
+    "generateHydrationScript",
+    "HydrationScript",
+    "getRequestEvent"
+  ],
+  "solidWebParity": {
+    "$note": "Measured against solid-js/web/dist/web.js (the BROWSER build). runtime/dom re-exports from solid-js/web, so a name absent here cannot simply be re-exported.",
+    "solidWebExportCount": 73,
+    "missingFromSolidWeb": []
+  },
+  "emitterRequired": {
+    "$note": "The subset the Rust emitter is specified to call. These must exist in the vendored artifact or the emitter cannot link.",
+    "names": [
+      "template",
+      "insert",
+      "effect",
+      "setAttribute",
+      "setBoolAttribute",
+      "className",
+      "classList",
+      "style",
+      "spread",
+      "assign",
+      "use",
+      "delegateEvents",
+      "addEventListener",
+      "createComponent",
+      "memo",
+      "dynamicProperty",
+      "getNextElement",
+      "getNextMatch",
+      "getNextMarker",
+      "runHydrationEvents",
+      "getHydrationKey",
+      "hydrate",
+      "render",
+      "NoHydration"
+    ],
+    "missingFromClient": [],
+    "missingFromSolidWeb": []
+  }
+}

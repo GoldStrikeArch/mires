@@ -1,0 +1,632 @@
+function rust_entry() {
+  x08_match_200$mini_core$print_i32$h890fb54ca57cca56(x08_match_200$pick$ha84a8ddf9f43bcd8(0));
+  x08_match_200$mini_core$print_i32$h890fb54ca57cca56(x08_match_200$pick$ha84a8ddf9f43bcd8(1));
+  x08_match_200$mini_core$print_i32$h890fb54ca57cca56(x08_match_200$pick$ha84a8ddf9f43bcd8(99));
+  x08_match_200$mini_core$print_i32$h890fb54ca57cca56(x08_match_200$pick$ha84a8ddf9f43bcd8(199));
+  x08_match_200$mini_core$print_i32$h890fb54ca57cca56(x08_match_200$pick$ha84a8ddf9f43bcd8(200));
+}
+function x08_match_200$pick$ha84a8ddf9f43bcd8(n) {
+  let _0, $s0;
+  L0: {
+    $s0 = n;
+    if ($s0 >= 100) {
+      if ($s0 >= 150) {
+        switch ($s0) {
+          case 150:
+            _0 = 452;
+            break L0;
+          case 151:
+            _0 = 455;
+            break L0;
+          case 152:
+            _0 = 458;
+            break L0;
+          case 153:
+            _0 = 461;
+            break L0;
+          case 154:
+            _0 = 464;
+            break L0;
+          case 155:
+            _0 = 467;
+            break L0;
+          case 156:
+            _0 = 470;
+            break L0;
+          case 157:
+            _0 = 473;
+            break L0;
+          case 158:
+            _0 = 476;
+            break L0;
+          case 159:
+            _0 = 479;
+            break L0;
+          case 160:
+            _0 = 482;
+            break L0;
+          case 161:
+            _0 = 485;
+            break L0;
+          case 162:
+            _0 = 488;
+            break L0;
+          case 163:
+            _0 = 491;
+            break L0;
+          case 164:
+            _0 = 494;
+            break L0;
+          case 165:
+            _0 = 497;
+            break L0;
+          case 166:
+            _0 = 500;
+            break L0;
+          case 167:
+            _0 = 503;
+            break L0;
+          case 168:
+            _0 = 506;
+            break L0;
+          case 169:
+            _0 = 509;
+            break L0;
+          case 170:
+            _0 = 512;
+            break L0;
+          case 171:
+            _0 = 515;
+            break L0;
+          case 172:
+            _0 = 518;
+            break L0;
+          case 173:
+            _0 = 521;
+            break L0;
+          case 174:
+            _0 = 524;
+            break L0;
+          case 175:
+            _0 = 527;
+            break L0;
+          case 176:
+            _0 = 530;
+            break L0;
+          case 177:
+            _0 = 533;
+            break L0;
+          case 178:
+            _0 = 536;
+            break L0;
+          case 179:
+            _0 = 539;
+            break L0;
+          case 180:
+            _0 = 542;
+            break L0;
+          case 181:
+            _0 = 545;
+            break L0;
+          case 182:
+            _0 = 548;
+            break L0;
+          case 183:
+            _0 = 551;
+            break L0;
+          case 184:
+            _0 = 554;
+            break L0;
+          case 185:
+            _0 = 557;
+            break L0;
+          case 186:
+            _0 = 560;
+            break L0;
+          case 187:
+            _0 = 563;
+            break L0;
+          case 188:
+            _0 = 566;
+            break L0;
+          case 189:
+            _0 = 569;
+            break L0;
+          case 190:
+            _0 = 572;
+            break L0;
+          case 191:
+            _0 = 575;
+            break L0;
+          case 192:
+            _0 = 578;
+            break L0;
+          case 193:
+            _0 = 581;
+            break L0;
+          case 194:
+            _0 = 584;
+            break L0;
+          case 195:
+            _0 = 587;
+            break L0;
+          case 196:
+            _0 = 590;
+            break L0;
+          case 197:
+            _0 = 593;
+            break L0;
+          case 198:
+            _0 = 596;
+            break L0;
+          case 199:
+            _0 = 599;
+            break L0;
+          default:
+        }
+      } else {
+        switch ($s0) {
+          case 100:
+            _0 = 302;
+            break L0;
+          case 101:
+            _0 = 305;
+            break L0;
+          case 102:
+            _0 = 308;
+            break L0;
+          case 103:
+            _0 = 311;
+            break L0;
+          case 104:
+            _0 = 314;
+            break L0;
+          case 105:
+            _0 = 317;
+            break L0;
+          case 106:
+            _0 = 320;
+            break L0;
+          case 107:
+            _0 = 323;
+            break L0;
+          case 108:
+            _0 = 326;
+            break L0;
+          case 109:
+            _0 = 329;
+            break L0;
+          case 110:
+            _0 = 332;
+            break L0;
+          case 111:
+            _0 = 335;
+            break L0;
+          case 112:
+            _0 = 338;
+            break L0;
+          case 113:
+            _0 = 341;
+            break L0;
+          case 114:
+            _0 = 344;
+            break L0;
+          case 115:
+            _0 = 347;
+            break L0;
+          case 116:
+            _0 = 350;
+            break L0;
+          case 117:
+            _0 = 353;
+            break L0;
+          case 118:
+            _0 = 356;
+            break L0;
+          case 119:
+            _0 = 359;
+            break L0;
+          case 120:
+            _0 = 362;
+            break L0;
+          case 121:
+            _0 = 365;
+            break L0;
+          case 122:
+            _0 = 368;
+            break L0;
+          case 123:
+            _0 = 371;
+            break L0;
+          case 124:
+            _0 = 374;
+            break L0;
+          case 125:
+            _0 = 377;
+            break L0;
+          case 126:
+            _0 = 380;
+            break L0;
+          case 127:
+            _0 = 383;
+            break L0;
+          case 128:
+            _0 = 386;
+            break L0;
+          case 129:
+            _0 = 389;
+            break L0;
+          case 130:
+            _0 = 392;
+            break L0;
+          case 131:
+            _0 = 395;
+            break L0;
+          case 132:
+            _0 = 398;
+            break L0;
+          case 133:
+            _0 = 401;
+            break L0;
+          case 134:
+            _0 = 404;
+            break L0;
+          case 135:
+            _0 = 407;
+            break L0;
+          case 136:
+            _0 = 410;
+            break L0;
+          case 137:
+            _0 = 413;
+            break L0;
+          case 138:
+            _0 = 416;
+            break L0;
+          case 139:
+            _0 = 419;
+            break L0;
+          case 140:
+            _0 = 422;
+            break L0;
+          case 141:
+            _0 = 425;
+            break L0;
+          case 142:
+            _0 = 428;
+            break L0;
+          case 143:
+            _0 = 431;
+            break L0;
+          case 144:
+            _0 = 434;
+            break L0;
+          case 145:
+            _0 = 437;
+            break L0;
+          case 146:
+            _0 = 440;
+            break L0;
+          case 147:
+            _0 = 443;
+            break L0;
+          case 148:
+            _0 = 446;
+            break L0;
+          default:
+            _0 = 449;
+            break L0;
+        }
+      }
+    } else if ($s0 >= 50) {
+      switch ($s0) {
+        case 50:
+          _0 = 152;
+          break L0;
+        case 51:
+          _0 = 155;
+          break L0;
+        case 52:
+          _0 = 158;
+          break L0;
+        case 53:
+          _0 = 161;
+          break L0;
+        case 54:
+          _0 = 164;
+          break L0;
+        case 55:
+          _0 = 167;
+          break L0;
+        case 56:
+          _0 = 170;
+          break L0;
+        case 57:
+          _0 = 173;
+          break L0;
+        case 58:
+          _0 = 176;
+          break L0;
+        case 59:
+          _0 = 179;
+          break L0;
+        case 60:
+          _0 = 182;
+          break L0;
+        case 61:
+          _0 = 185;
+          break L0;
+        case 62:
+          _0 = 188;
+          break L0;
+        case 63:
+          _0 = 191;
+          break L0;
+        case 64:
+          _0 = 194;
+          break L0;
+        case 65:
+          _0 = 197;
+          break L0;
+        case 66:
+          _0 = 200;
+          break L0;
+        case 67:
+          _0 = 203;
+          break L0;
+        case 68:
+          _0 = 206;
+          break L0;
+        case 69:
+          _0 = 209;
+          break L0;
+        case 70:
+          _0 = 212;
+          break L0;
+        case 71:
+          _0 = 215;
+          break L0;
+        case 72:
+          _0 = 218;
+          break L0;
+        case 73:
+          _0 = 221;
+          break L0;
+        case 74:
+          _0 = 224;
+          break L0;
+        case 75:
+          _0 = 227;
+          break L0;
+        case 76:
+          _0 = 230;
+          break L0;
+        case 77:
+          _0 = 233;
+          break L0;
+        case 78:
+          _0 = 236;
+          break L0;
+        case 79:
+          _0 = 239;
+          break L0;
+        case 80:
+          _0 = 242;
+          break L0;
+        case 81:
+          _0 = 245;
+          break L0;
+        case 82:
+          _0 = 248;
+          break L0;
+        case 83:
+          _0 = 251;
+          break L0;
+        case 84:
+          _0 = 254;
+          break L0;
+        case 85:
+          _0 = 257;
+          break L0;
+        case 86:
+          _0 = 260;
+          break L0;
+        case 87:
+          _0 = 263;
+          break L0;
+        case 88:
+          _0 = 266;
+          break L0;
+        case 89:
+          _0 = 269;
+          break L0;
+        case 90:
+          _0 = 272;
+          break L0;
+        case 91:
+          _0 = 275;
+          break L0;
+        case 92:
+          _0 = 278;
+          break L0;
+        case 93:
+          _0 = 281;
+          break L0;
+        case 94:
+          _0 = 284;
+          break L0;
+        case 95:
+          _0 = 287;
+          break L0;
+        case 96:
+          _0 = 290;
+          break L0;
+        case 97:
+          _0 = 293;
+          break L0;
+        case 98:
+          _0 = 296;
+          break L0;
+        default:
+          _0 = 299;
+          break L0;
+      }
+    } else {
+      switch ($s0) {
+        case 0:
+          _0 = 2;
+          break L0;
+        case 1:
+          _0 = 5;
+          break L0;
+        case 2:
+          _0 = 8;
+          break L0;
+        case 3:
+          _0 = 11;
+          break L0;
+        case 4:
+          _0 = 14;
+          break L0;
+        case 5:
+          _0 = 17;
+          break L0;
+        case 6:
+          _0 = 20;
+          break L0;
+        case 7:
+          _0 = 23;
+          break L0;
+        case 8:
+          _0 = 26;
+          break L0;
+        case 9:
+          _0 = 29;
+          break L0;
+        case 10:
+          _0 = 32;
+          break L0;
+        case 11:
+          _0 = 35;
+          break L0;
+        case 12:
+          _0 = 38;
+          break L0;
+        case 13:
+          _0 = 41;
+          break L0;
+        case 14:
+          _0 = 44;
+          break L0;
+        case 15:
+          _0 = 47;
+          break L0;
+        case 16:
+          _0 = 50;
+          break L0;
+        case 17:
+          _0 = 53;
+          break L0;
+        case 18:
+          _0 = 56;
+          break L0;
+        case 19:
+          _0 = 59;
+          break L0;
+        case 20:
+          _0 = 62;
+          break L0;
+        case 21:
+          _0 = 65;
+          break L0;
+        case 22:
+          _0 = 68;
+          break L0;
+        case 23:
+          _0 = 71;
+          break L0;
+        case 24:
+          _0 = 74;
+          break L0;
+        case 25:
+          _0 = 77;
+          break L0;
+        case 26:
+          _0 = 80;
+          break L0;
+        case 27:
+          _0 = 83;
+          break L0;
+        case 28:
+          _0 = 86;
+          break L0;
+        case 29:
+          _0 = 89;
+          break L0;
+        case 30:
+          _0 = 92;
+          break L0;
+        case 31:
+          _0 = 95;
+          break L0;
+        case 32:
+          _0 = 98;
+          break L0;
+        case 33:
+          _0 = 101;
+          break L0;
+        case 34:
+          _0 = 104;
+          break L0;
+        case 35:
+          _0 = 107;
+          break L0;
+        case 36:
+          _0 = 110;
+          break L0;
+        case 37:
+          _0 = 113;
+          break L0;
+        case 38:
+          _0 = 116;
+          break L0;
+        case 39:
+          _0 = 119;
+          break L0;
+        case 40:
+          _0 = 122;
+          break L0;
+        case 41:
+          _0 = 125;
+          break L0;
+        case 42:
+          _0 = 128;
+          break L0;
+        case 43:
+          _0 = 131;
+          break L0;
+        case 44:
+          _0 = 134;
+          break L0;
+        case 45:
+          _0 = 137;
+          break L0;
+        case 46:
+          _0 = 140;
+          break L0;
+        case 47:
+          _0 = 143;
+          break L0;
+        case 48:
+          _0 = 146;
+          break L0;
+        case 49:
+          _0 = 149;
+          break L0;
+        default:
+      }
+    }
+    _0 = -1;
+  }
+  return _0;
+}

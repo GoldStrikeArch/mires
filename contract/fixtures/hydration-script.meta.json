@@ -1,0 +1,49 @@
+{
+  "$generatedBy": "contract/harness/extract-bootstrap.mjs",
+  "$doNotEditByHand": "Re-run the extractor instead. A diff here after a version bump IS the drift report.",
+  "$extractedFrom": {
+    "dom-expressions": "0.40.8",
+    "solid-js": "1.9.14",
+    "babel-plugin-jsx-dom-expressions": "0.40.7",
+    "gitSha": "56bd4054237b031c0cca8c1ec69da162c52ed4a6"
+  },
+  "$extractionDate": "2026-07-29",
+  "$source": "solid-js/web/dist/server.js:621 generateHydrationScript",
+  "solidDefaultEventNames": [
+    "click",
+    "input"
+  ],
+  "delegatedEventCount": 22,
+  "$defaultIsNotDelegatedSet": "solid's generateHydrationScript defaults to 2 events (click, input); the dom-expressions DelegatedEvents set has 22. These are different mechanisms: the bootstrap captures pre-hydration events, delegation dispatches post-hydration.",
+  "hyShape": {
+    "events": "array of [element, event] captured before hydration",
+    "completed": "WeakSet of already-hydrated elements (excluded from capture)",
+    "r": "resource registry -- inert {} in the non-streaming build, key must exist",
+    "fe": "flush-events hook -- no-op stub, must exist as a callable",
+    "$noDoneField": "the initial shape has NO 'done' field; the client assigns it later"
+  },
+  "trailingMarker": "<!--xs-->",
+  "ownerLookup": "walks up from composedPath()[0] (falling back to event.target) to the nearest ancestor with a data-hk attribute, hopping shadow roots via .host",
+  "roundTrips": [
+    {
+      "label": "solid default",
+      "eventCount": 2,
+      "byteIdentical": true
+    },
+    {
+      "label": "single",
+      "eventCount": 1,
+      "byteIdentical": true
+    },
+    {
+      "label": "empty",
+      "eventCount": 0,
+      "byteIdentical": true
+    },
+    {
+      "label": "all 22 delegated",
+      "eventCount": 22,
+      "byteIdentical": true
+    }
+  ]
+}

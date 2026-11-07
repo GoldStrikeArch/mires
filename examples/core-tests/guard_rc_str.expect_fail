@@ -1,0 +1,2 @@
+a struct with a `str` tail is not supported by rustc_codegen_mires
+cannot cast a pointer to `str` into a pointer to `alloc::rc::RcInner<str>`

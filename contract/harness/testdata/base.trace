@@ -1,0 +1,6 @@
+{"$record":"header","$what":"Hand-written trace, input to harness/test-compare-trace.mjs. Not generated: it exists to exercise the comparator, so it must not move when upstream does.","fixture":"testdata/base","label":"testdata/base","freeBindingsHealed":[],"status":"completed","error":null,"recordCount":5}
+{"op":"template","tmpl":"tmpl#0","html":"<div><p>a > b <!>"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"#0"}
+{"op":"insert","parent":"#0","accessor":"fn#0","marker":"#1","initial":"undefined"}
+{"op":"addEventListener","node":"#0","name":"click","handler":"fn#1","delegate":true}
+{"op":"delegateEvents","events":["click"],"document":"undefined"}

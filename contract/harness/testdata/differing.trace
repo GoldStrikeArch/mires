@@ -1,0 +1,7 @@
+{"$record":"header","$what":"Three real divergences from base.trace: a different template string, an extra setAttribute, and a delegated handler attached as a plain listener.","fixture":"testdata/base","label":"testdata/differing","freeBindingsHealed":[],"status":"completed","error":null,"recordCount":6}
+{"op":"template","tmpl":"tmpl#0","html":"<div><p>a > b <!><span>"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"#0"}
+{"op":"setAttribute","node":"#0","name":"id","value":"main"}
+{"op":"insert","parent":"#0","accessor":"fn#0","marker":"#1","initial":"undefined"}
+{"op":"addEventListener","node":"#0","name":"click","handler":"fn#1","delegate":false}
+{"op":"delegateEvents","events":["click"],"document":"undefined"}

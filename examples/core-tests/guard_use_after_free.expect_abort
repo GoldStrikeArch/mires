@@ -1,0 +1,1 @@
+the program must abort: a pointer into a freed heap block cannot be cast

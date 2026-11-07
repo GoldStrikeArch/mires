@@ -1,0 +1,1 @@
+the program must abort: as_chunks cannot rebuild a slice at chunk granularity
