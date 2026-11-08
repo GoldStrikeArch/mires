@@ -74,3 +74,58 @@ Append-only log written by `measure.mjs`. Each block is one run; receipts live i
 
 - compact kernels: 58/58
 - pro: ok, wall 205.5 s, peak RSS 3082 MiB
+
+## S5a-strings — 2026-11-08T14:50:59.437Z
+
+- HEAD `231da39d14fc39bd5669460eb3c23a74e60736e8`, 0 dirty path(s); compiler source digest `e03c53e7139f` (differs from docs/v2-source-identity.json)
+- jsc-link `46c2715e8052`, codegen dylib `36bc17521916`, node v26.8.1, built: yes
+- receipts: `build/v2-restoration/S5a-strings/`
+
+| target | file | raw | min | gzip | brotli | status |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| compact | fp.esm.min.js | 685062 | 518334 | 111445 | 81348 | ok |
+| compact | fp.min.js | 690178 | 518309 | 111299 | 81307 | ok |
+| compact | fp.umd.min.js | 690449 | 518504 | 111379 | 81239 | ok |
+| compact | raw/program.js | 668350 | — | 108760 | 83993 | ok |
+| corpus | minisearch/index.min.js | 347723 | 255629 | 58819 | 46340 | ok |
+| corpus | minisearch/raw/program.js | 321314 | — | 58135 | 46640 | ok |
+| corpus | marked/index.min.js | 140272 | 103639 | 26736 | 21890 | ok |
+| corpus | marked/raw/program.js | 119402 | — | 24441 | 20049 | ok |
+| corpus | fflate/index.min.js | 84361 | 59980 | 14989 | 12982 | ok |
+| corpus | fflate/raw/program.js | 63911 | — | 12113 | 10438 | ok |
+| corpus | idb/index.min.js | 124553 | 89591 | 22387 | 18814 | ok |
+| corpus | idb/raw/program.js | 100484 | — | 19589 | 16412 | ok |
+| corpus | idb_lines/index.min.js | 133845 | 97538 | 24446 | 20392 | ok |
+| corpus | idb_lines/raw/program.js | 109959 | — | 21890 | 18204 | ok |
+| corpus | ky/index.min.js | 231804 | 172319 | 42521 | 34317 | ok |
+| corpus | ky/raw/program.js | 202023 | — | 40365 | 32735 | ok |
+| corpus | uplot/index.min.js | 14179 | 10054 | 3406 | 2729 | ok |
+| corpus | uplot/raw/program.js | 13634 | — | 3417 | 2762 | ok |
+| corpus | explorer/index.min.js | 479542 | 357684 | 83760 | 64918 | ok |
+| corpus | explorer/raw/program.js | 453283 | — | 84055 | 66821 | ok |
+| corpus | workbox/index.min.js | 100104 | 71666 | 18386 | 15552 | ok |
+| corpus | workbox/raw/program.js | 78416 | — | 15728 | 12966 | ok |
+| corpus | workbox_direct/index.min.js | 17986 | 13279 | 4009 | 3483 | ok |
+| corpus | workbox_direct/raw/program.js | 12885 | — | 2863 | 2442 | ok |
+
+| target | wall s | peak RSS MiB | status |
+| --- | ---: | ---: | --- |
+| compact | 49.5 | 3475 | ok |
+| corpus | 79.3 | 3076 | ok |
+
+| workload | p50 ms | p95 ms | calls/sample | samples | rust/js ratio | A/A ratio |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| marked | 16.57 | 16.92 | 5 | 9 | 7.30 | 0.997 |
+| minisearch | 4.38 | 5.48 | 4 | 9 | 41.85 | 1.020 |
+| fflate | 17.54 | 21.43 | 3 | 9 | 31.49 | 0.882 |
+
+| environment | workload | rust ms/call p50 | js ms/call p50 | rust/js ratio | A/A ratio | status |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| chrome 157.0.8103.39 | marked | 3.159 | 0.383 | 8.25 | 1.010 | ok/ok |
+| chrome 157.0.8103.39 | minisearch | 0.692 | 0.020 | 35.36 | 0.981 | ok/ok |
+| chrome 157.0.8103.39 | fflate | 5.353 | 0.188 | 28.44 | 0.983 | ok/ok |
+| firefox 159.0.1 | marked | 4.816 | 0.400 | 12.03 | 1.014 | ok/ok |
+| firefox 159.0.1 | minisearch | 0.969 | 0.027 | 35.62 | 1.017 | ok/ok |
+| firefox 159.0.1 | fflate | 10.500 | 3.827 | 2.74 | 1.021 | ok/ok |
+
+- corpus run (browsers: chrome,firefox): passed; paired timing passed vs fflate 0.8.3, marked 18.1.1, minisearch 7.2.0; load avg (1/5/15 min) 4.2/6.4/6.0 at start, 5.5/6.4/6.1 at end; compact kernels: 58/58; corpus artifacts vs build.json: identical
