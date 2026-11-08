@@ -144,29 +144,16 @@ pub fn evaluate_groups(
 ) -> (AbiPlan, Evaluation) {
     let profile = release_profile(opts);
     let mut cache = Cache::default();
+    // `table`, `funcs`, the profile and the options are borrowed unchanged for the whole
+    // evaluation: every measurement below differs from the others only in its ABI plan.
+    let program = program_key(table, funcs, profile, opts);
     let baseline = AbiPlan::default();
-    let before = measure_cached(
-        &mut cache,
-        table,
-        funcs,
-        &baseline,
-        profile,
-        opts,
-        &mut measure,
-    );
-    let full_after = measure_cached(
-        &mut cache,
-        table,
-        funcs,
-        candidate,
-        profile,
-        opts,
-        &mut measure,
-    );
+    let before = measure_cached(&mut cache, program, &baseline, &mut measure);
+    let full_after = measure_cached(&mut cache, program, candidate, &mut measure);
     let mut trials = Vec::new();
     for items in candidate.economic_groups() {
         let plan = candidate.subset(&items);
-        let after = measure_cached(&mut cache, table, funcs, &plan, profile, opts, &mut measure);
+        let after = measure_cached(&mut cache, program, &plan, &mut measure);
         let (accepted, reason, hotness_source, budget_consumed_bps) =
             decide(profile, before, after);
         trials.push(Trial {
@@ -197,17 +184,8 @@ pub fn evaluate_groups(
         .flat_map(|trial| trial.items.iter().copied())
         .collect();
     let combined = candidate.subset(&individually_selected);
-    let combined_metrics = (!individually_selected.is_empty()).then(|| {
-        measure_cached(
-            &mut cache,
-            table,
-            funcs,
-            &combined,
-            profile,
-            opts,
-            &mut measure,
-        )
-    });
+    let combined_metrics = (!individually_selected.is_empty())
+        .then(|| measure_cached(&mut cache, program, &combined, &mut measure));
     let combined_accepted = combined_metrics
         .flatten()
         .is_some_and(|after| decide(profile, before, Some(after)).0);
@@ -237,15 +215,7 @@ pub fn evaluate_groups(
                 let mut proposed = selected.clone();
                 proposed.extend(&trial.items);
                 let proposed_plan = candidate.subset(&proposed);
-                let next = measure_cached(
-                    &mut cache,
-                    table,
-                    funcs,
-                    &proposed_plan,
-                    profile,
-                    opts,
-                    &mut measure,
-                );
+                let next = measure_cached(&mut cache, program, &proposed_plan, &mut measure);
                 let (accepted, reason, hotness_source, budget_consumed_bps) =
                     decide_incremental(profile, before, current, next);
                 (accepted, reason, hotness_source, budget_consumed_bps, next)
@@ -280,15 +250,7 @@ pub fn evaluate_groups(
     // Replay the selected key through the cache. Besides guarding key completeness in every real
     // link, this makes the receipt prove that a hit returns the decision's exact final metrics.
     let replay_plan = candidate.subset(&selected);
-    let replay = measure_cached(
-        &mut cache,
-        table,
-        funcs,
-        &replay_plan,
-        profile,
-        opts,
-        &mut measure,
-    );
+    let replay = measure_cached(&mut cache, program, &replay_plan, &mut measure);
     debug_assert_eq!(replay, current);
     current = replay;
     let selected_plan = candidate.with_economic_selection(&selected, &reasons);
@@ -355,14 +317,11 @@ fn record_trial(
 
 fn measure_cached(
     cache: &mut Cache,
-    table: &BTreeMap<JsName, LinkItem>,
-    funcs: &BTreeMap<JsName, Result<Func, crate::jir::decline::Decline>>,
+    program: Hash128,
     plan: &AbiPlan,
-    profile: Profile,
-    opts: &Opts,
     measure: &mut impl FnMut(&AbiPlan) -> Option<ProgramMetrics>,
 ) -> Option<ProgramMetrics> {
-    let key = cache_key(table, funcs, plan, profile, opts);
+    let key = cache_key(program, plan);
     cache.measure(key, || measure(plan))
 }
 
@@ -561,15 +520,16 @@ fn growth_bps(after: u64, before: u64) -> u64 {
         .div_ceil(before)
 }
 
-fn cache_key(
+/// The digest of every key input that one [`evaluate_groups`] holds fixed: the release profile,
+/// the naming and minifier settings, every item, and every function body. Only the ABI plan
+/// varies between its measurements, so this is computed once and [`cache_key`] adds the plan.
+fn program_key(
     table: &BTreeMap<JsName, LinkItem>,
     funcs: &BTreeMap<JsName, Result<Func, crate::jir::decline::Decline>>,
-    abi: &AbiPlan,
     profile: Profile,
     opts: &Opts,
 ) -> Hash128 {
-    crate::profile::bump(crate::profile::Counter::CacheKeyCalls);
-    let _scope = crate::profile::scope("physical_cache.key");
+    let _scope = crate::profile::scope("physical_cache.program_key");
     let mut bytes = Vec::new();
     bytes.extend_from_slice(profile.as_str().as_bytes());
     bytes.extend_from_slice(
@@ -593,6 +553,18 @@ fn cache_key(
         bytes.extend_from_slice(name.as_str().as_bytes());
         bytes.extend_from_slice(format!("{func:?}").as_bytes());
     }
+    crate::profile::add(crate::profile::Counter::CacheKeyBytes, bytes.len());
+    Hash128::of(&bytes)
+}
+
+/// The cache key of one measurement: the evaluation's fixed [`program_key`] and the ABI plan.
+///
+/// Within one evaluation `program` is constant, so two keys are equal exactly when the plans'
+/// cost keys are, as when the fixed inputs were spelled out in front of every plan.
+fn cache_key(program: Hash128, abi: &AbiPlan) -> Hash128 {
+    crate::profile::bump(crate::profile::Counter::CacheKeyCalls);
+    let _scope = crate::profile::scope("physical_cache.key");
+    let mut bytes = program.to_bytes().to_vec();
     abi.extend_cost_key(&mut bytes);
     crate::profile::add(crate::profile::Counter::CacheKeyBytes, bytes.len());
     Hash128::of(&bytes)

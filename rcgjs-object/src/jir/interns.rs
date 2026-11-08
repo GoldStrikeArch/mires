@@ -163,6 +163,21 @@ impl Interns {
         self.strings.get(id.0 as usize).map(String::as_str)
     }
 
+    /// Whether `value` is one of [`Self::strings`].
+    ///
+    /// A table built through [`Self::intern_str`] or read back through [`Self::rebuild_indices`]
+    /// indexes every string exactly once, so the index answers. A table whose `strings` were
+    /// filled by hand (tests push to the public field) is not indexed in full, and is searched.
+    pub fn contains_str(&self, value: &str) -> bool {
+        if self.string_index.len() == self.strings.len() {
+            self.string_index
+                .get(value)
+                .is_some_and(|id| self.str(*id) == Some(value))
+        } else {
+            self.strings.iter().any(|string| string == value)
+        }
+    }
+
     pub fn bytes(&self, id: BytesId) -> Option<&[u8]> {
         self.bytes.get(id.0 as usize).map(Vec::as_slice)
     }
@@ -177,5 +192,42 @@ impl Interns {
 
     pub fn ty(&self, id: TypeId) -> Option<&TypeDescriptor> {
         self.types.get(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Interns;
+
+    #[test]
+    fn string_membership_holds_for_indexed_and_hand_filled_tables() {
+        let strings = ["$invoke0", "foo", "$caught"];
+        let mut interned = Interns::new();
+        for string in strings {
+            interned.intern_str(string);
+        }
+        let hand_filled = Interns {
+            strings: strings.map(str::to_owned).to_vec(),
+            ..Interns::default()
+        };
+        let mut decoded = hand_filled.clone();
+        decoded.rebuild_indices();
+        let mut duplicated = Interns {
+            strings: ["foo", "foo", "$caught"].map(str::to_owned).to_vec(),
+            ..Interns::default()
+        };
+        duplicated.rebuild_indices();
+        let mut appended = interned.clone();
+        appended.strings.push("$exception".to_owned());
+        for table in [&interned, &decoded, &hand_filled, &duplicated, &appended] {
+            for probe in ["$invoke0", "foo", "$caught", "$exception", "", "$invoke0$1"] {
+                assert_eq!(
+                    table.contains_str(probe),
+                    table.strings.iter().any(|string| string == probe),
+                    "{probe:?} in {:?}",
+                    table.strings
+                );
+            }
+        }
     }
 }

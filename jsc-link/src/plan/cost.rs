@@ -27,6 +27,7 @@
 //! vector.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 
 use crate::analysis::js_alloc::JsAllocSites;
 use crate::jir::decline::Decline;
@@ -257,16 +258,17 @@ pub fn measure_expr(expr: &jsast::Expr) -> u64 {
 /// Parsed from the bundled `runtime/shim.js` exactly as `scripts/minimal-shim.mjs` slices
 /// members, so the byte a helper is priced at is the byte `minimal-shim` ships.
 pub fn helper_bytes() -> BTreeMap<String, u64> {
-    shim_members(SHIM)
-        .into_iter()
-        .map(|(name, source)| (name, source.len() as u64))
+    shim()
+        .members
+        .iter()
+        .map(|(name, source)| (name.clone(), source.len() as u64))
         .collect()
 }
 
 /// The transitive runtime members reached by `direct`, using the same member statements and
 /// reference closure as `scripts/minimal-shim.mjs`.
 pub fn helper_closure(direct: &BTreeSet<String>) -> BTreeSet<String> {
-    shim_helper_closure(SHIM, direct)
+    shim().closure(direct)
 }
 
 /// Every runtime helper directly mentioned by a compact program.
@@ -276,16 +278,95 @@ pub fn runtime_members(program: &str) -> BTreeSet<String> {
 
 /// Deterministic source for the transitive runtime-helper closure of `direct`.
 pub fn helper_program(direct: &BTreeSet<String>) -> String {
-    let members = shim_members(SHIM);
-    let closure = shim_helper_closure(SHIM, direct);
+    let shim = shim();
     let mut program = String::new();
-    for member in closure {
-        if let Some(source) = members.get(&member) {
+    for member in shim.closure(direct) {
+        if let Some(source) = shim.members.get(&member) {
             program.push_str(source);
             program.push('\n');
         }
     }
     program
+}
+
+/// The bundled `runtime/shim.js`, parsed once per process.
+fn shim() -> &'static ShimIndex {
+    static SHIM_INDEX: OnceLock<ShimIndex> = OnceLock::new();
+    SHIM_INDEX.get_or_init(|| ShimIndex::of(SHIM))
+}
+
+/// One shim source's member statements, and each member's direct dependencies under
+/// `minimal-shim.mjs`'s closure rule. Neither depends on which members a program reaches, so a
+/// closure is a walk over this index rather than a re-parse.
+struct ShimIndex {
+    /// Every member's statement, by name ([`shim_members`]).
+    members: BTreeMap<String, String>,
+    /// The members each member's statement reaches directly: the runtime members it references,
+    /// and the owner of every lexical helper binding it mentions.
+    dependencies: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl ShimIndex {
+    fn of(source: &str) -> ShimIndex {
+        let members = shim_members(source);
+        // Match minimal-shim's source groups: lexical helper declarations travel
+        // with the runtime member preceding them, even when another member calls them.
+        let mut bindings = BTreeMap::new();
+        for (name, source) in &members {
+            for line in source.lines() {
+                let Some(declaration) = ["const ", "let ", "var ", "function "]
+                    .into_iter()
+                    .find_map(|prefix| line.strip_prefix(prefix))
+                else {
+                    continue;
+                };
+                let binding = declaration
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                    .next()
+                    .and_then(ident);
+                if let Some(binding) = binding {
+                    bindings.insert(binding.to_owned(), name.clone());
+                }
+            }
+        }
+        let dependencies = members
+            .iter()
+            .map(|(name, statement)| {
+                let mut dependencies = referenced_members(statement);
+                for token in
+                    statement.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                {
+                    if let Some(owner) = bindings.get(token) {
+                        dependencies.insert(owner.clone());
+                    }
+                }
+                (name.clone(), dependencies)
+            })
+            .collect();
+        ShimIndex {
+            members,
+            dependencies,
+        }
+    }
+
+    /// `direct` and every member it transitively depends on. A name that is not a member is
+    /// kept and has no dependencies.
+    fn closure(&self, direct: &BTreeSet<String>) -> BTreeSet<String> {
+        crate::profile::bump(crate::profile::Counter::ShimClosure);
+        let mut needed = direct.clone();
+        let mut queue: Vec<&str> = direct.iter().map(String::as_str).collect();
+        while let Some(name) = queue.pop() {
+            let Some(dependencies) = self.dependencies.get(name) else {
+                continue;
+            };
+            for dependency in dependencies {
+                if needed.insert(dependency.clone()) {
+                    queue.push(dependency);
+                }
+            }
+        }
+        needed
+    }
 }
 
 /// Every member statement in any shim source. Split out so the parser and closure are testable.
@@ -352,49 +433,11 @@ fn shim_members(source: &str) -> BTreeMap<String, String> {
     members
 }
 
+/// The closure of `direct` over any shim source, parsed here. The bundled shim's closure is
+/// [`helper_closure`], served from its parsed-once index.
+#[cfg(test)]
 fn shim_helper_closure(source: &str, direct: &BTreeSet<String>) -> BTreeSet<String> {
-    crate::profile::bump(crate::profile::Counter::ShimClosure);
-    let members = shim_members(source);
-    // Match minimal-shim's source groups: lexical helper declarations travel
-    // with the runtime member preceding them, even when another member calls them.
-    let mut bindings = BTreeMap::new();
-    for (name, source) in &members {
-        for line in source.lines() {
-            let Some(declaration) = ["const ", "let ", "var ", "function "]
-                .into_iter()
-                .find_map(|prefix| line.strip_prefix(prefix))
-            else {
-                continue;
-            };
-            let binding = declaration
-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
-                .next()
-                .and_then(ident);
-            if let Some(binding) = binding {
-                bindings.insert(binding.to_owned(), name.clone());
-            }
-        }
-    }
-    let mut needed = direct.clone();
-    let mut queue: Vec<String> = direct.iter().cloned().collect();
-    while let Some(name) = queue.pop() {
-        let Some(statement) = members.get(&name) else {
-            continue;
-        };
-        let mut dependencies = referenced_members(statement);
-        for token in statement.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
-        {
-            if let Some(owner) = bindings.get(token) {
-                dependencies.insert(owner.clone());
-            }
-        }
-        for dependency in dependencies {
-            if needed.insert(dependency.clone()) {
-                queue.push(dependency);
-            }
-        }
-    }
-    needed
+    ShimIndex::of(source).closure(direct)
 }
 
 /// Every runtime member reference in one statement. The boundary check mirrors
@@ -677,6 +720,116 @@ globalThis.__rt.root = () => globalThis.__rt.middle();
         assert_eq!(
             referenced_members("x__rt.nope(); obj.__rt.nope(); __rt.yes();"),
             BTreeSet::from(["yes".to_owned()])
+        );
+    }
+
+    /// The closure as it was computed before the shim was indexed: a fresh parse, and the
+    /// dependencies of each member re-derived as the walk reaches it.
+    fn uncached_closure(source: &str, direct: &BTreeSet<String>) -> BTreeSet<String> {
+        let members = shim_members(source);
+        let mut bindings = BTreeMap::new();
+        for (name, source) in &members {
+            for line in source.lines() {
+                let Some(declaration) = ["const ", "let ", "var ", "function "]
+                    .into_iter()
+                    .find_map(|prefix| line.strip_prefix(prefix))
+                else {
+                    continue;
+                };
+                let binding = declaration
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+                    .next()
+                    .and_then(ident);
+                if let Some(binding) = binding {
+                    bindings.insert(binding.to_owned(), name.clone());
+                }
+            }
+        }
+        let mut needed = direct.clone();
+        let mut queue: Vec<String> = direct.iter().cloned().collect();
+        while let Some(name) = queue.pop() {
+            let Some(statement) = members.get(&name) else {
+                continue;
+            };
+            let mut dependencies = referenced_members(statement);
+            for token in
+                statement.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            {
+                if let Some(owner) = bindings.get(token) {
+                    dependencies.insert(owner.clone());
+                }
+            }
+            for dependency in dependencies {
+                if needed.insert(dependency.clone()) {
+                    queue.push(dependency);
+                }
+            }
+        }
+        needed
+    }
+
+    /// `helper_program` before the shim was indexed.
+    fn uncached_helper_program(direct: &BTreeSet<String>) -> String {
+        let members = shim_members(SHIM);
+        let closure = uncached_closure(SHIM, direct);
+        let mut program = String::new();
+        for member in closure {
+            if let Some(source) = members.get(&member) {
+                program.push_str(source);
+                program.push('\n');
+            }
+        }
+        program
+    }
+
+    /// The parsed-once shim answers exactly what a fresh parse per call did: for no member,
+    /// every member alone, members `minimal-shim.mjs` would be handed by real programs, names
+    /// the shim does not define, and every member at once.
+    #[test]
+    fn the_indexed_shim_matches_a_fresh_parse() {
+        let members = shim_members(SHIM);
+        let declares = |line: &str| {
+            ["const ", "let ", "function "]
+                .iter()
+                .any(|p| line.starts_with(p))
+        };
+        assert!(
+            members
+                .values()
+                .flat_map(|statement| statement.lines())
+                .any(declares),
+            "the shim declares lexical helpers, so the binding rule is exercised"
+        );
+        let set = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        let mut directs = vec![
+            BTreeSet::new(),
+            set(&["js_log_i32", "js_abort"]),
+            set(&["str_bytes", "bytes_str", "native_f64_to_string"]),
+            set(&["not_a_member", "bytes_str"]),
+            set(&["not_a_member"]),
+            members.keys().cloned().collect(),
+        ];
+        directs.extend(members.keys().map(|name| set(&[name.as_str()])));
+        let mut reaches_further = false;
+        for direct in &directs {
+            let closure = helper_closure(direct);
+            assert_eq!(closure, uncached_closure(SHIM, direct), "{direct:?}");
+            assert_eq!(
+                helper_program(direct),
+                uncached_helper_program(direct),
+                "{direct:?}"
+            );
+            reaches_further |= closure.len() > direct.len();
+        }
+        assert!(reaches_further, "some member depends on another");
+        assert_eq!(
+            helper_bytes(),
+            members
+                .iter()
+                .map(|(name, source)| (name.clone(), source.len() as u64))
+                .collect::<BTreeMap<_, _>>()
         );
     }
 }

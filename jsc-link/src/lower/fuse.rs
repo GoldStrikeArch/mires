@@ -166,25 +166,7 @@ pub fn plan(
     planner.pin_host_environments();
     planner.name();
     planner.copies();
-    if func.has_invoke() {
-        crate::profile::bump(crate::profile::Counter::CatchReserveCalls);
-        crate::profile::add(
-            crate::profile::Counter::CatchReserveStrings,
-            interns.strings.len(),
-        );
-        // A catch binding also shadows free names in its handler.
-        planner.taken.extend(interns.strings.iter().cloned());
-    }
-    for block in &func.blocks {
-        if matches!(block.term, RTerm::Invoke { .. }) {
-            let name = planner.unique(format!("$invoke{}", block.id.0));
-            planner.plan.invoke_names.insert(block.id, name);
-        }
-    }
-    if !planner.plan.invoke_names.is_empty() {
-        planner.plan.exception_name = Some(planner.unique("$exception".to_owned()));
-        planner.plan.catch_name = Some(planner.unique("$caught".to_owned()));
-    }
+    planner.name_invokes();
     planner.scrutinees();
     planner.finish()
 }
@@ -204,6 +186,8 @@ struct Planner<'a> {
     plan: Plan,
     /// The names taken so far.
     taken: BTreeSet<String>,
+    /// Whether every interned string counts as taken too (set by [`Planner::name_invokes`]).
+    reserve_interns: bool,
     /// The `_N` spellings reserved for the first value of each MIR local.
     reserved_numbers: BTreeSet<String>,
 }
@@ -241,6 +225,7 @@ impl<'a> Planner<'a> {
             purity: BTreeMap::new(),
             plan: Plan::default(),
             taken: BTreeSet::new(),
+            reserve_interns: false,
             reserved_numbers: BTreeSet::new(),
         }
     }
@@ -1058,16 +1043,54 @@ impl<'a> Planner<'a> {
     }
 
     fn unique(&mut self, base: String) -> String {
-        if self.taken.insert(base.clone()) {
+        if self.claim(&base) {
             return base;
         }
         for n in 1u32.. {
             let candidate = format!("{base}${n}");
-            if self.taken.insert(candidate.clone()) {
+            if self.claim(&candidate) {
                 return candidate;
             }
         }
         base
+    }
+
+    /// Takes `name` unless an earlier name holds it or, once [`Self::reserve_interns`] is set, it
+    /// is an interned string.
+    fn claim(&mut self, name: &str) -> bool {
+        if self.taken.contains(name) {
+            return false;
+        }
+        if self.reserve_interns {
+            crate::profile::bump(crate::profile::Counter::CatchReserveStrings);
+            if self.interns.contains_str(name) {
+                return false;
+            }
+        }
+        self.taken.insert(name.to_owned())
+    }
+
+    /// Names each `Invoke`'s outcome flag, then the handler's exception and catch bindings.
+    ///
+    /// A catch binding also shadows free names in its handler, so these names avoid every
+    /// interned string besides the names taken so far. The table is crate-sized and only a few
+    /// `$`-prefixed candidates are asked about, so [`Self::claim`] looks each one up in it rather
+    /// than copying the table into `taken`.
+    fn name_invokes(&mut self) {
+        if !self.func.has_invoke() {
+            return;
+        }
+        crate::profile::bump(crate::profile::Counter::CatchReserveCalls);
+        self.reserve_interns = true;
+        let func = self.func;
+        for block in &func.blocks {
+            if matches!(block.term, RTerm::Invoke { .. }) {
+                let name = self.unique(format!("$invoke{}", block.id.0));
+                self.plan.invoke_names.insert(block.id, name);
+            }
+        }
+        self.plan.exception_name = Some(self.unique("$exception".to_owned()));
+        self.plan.catch_name = Some(self.unique("$caught".to_owned()));
     }
 
     /// Whether the value needs a name: an entry parameter, a block parameter, or an op result
@@ -1605,6 +1628,153 @@ mod tests {
         assert_eq!(rescue("class").as_deref(), Some("_class"));
         assert_eq!(rescue("$weird").as_deref(), Some("x$weird"));
         assert_eq!(rescue("_unused").as_deref(), Some("_unused"));
+    }
+
+    /// Two `Invoke`s (blocks 0 and 1) whose unwind edges share one handler.
+    fn invoking() -> Func {
+        use crate::jir::repr::FuncBuilder;
+        use crate::jir::semantic::{AbiSignature, DefinitionId, ItemId, Signature};
+        let item = ItemId {
+            definition: DefinitionId {
+                crate_id: 1,
+                local_hash: 1,
+            },
+            instantiation: 1,
+        };
+        let sig = Signature {
+            abi: AbiSignature {
+                parameters: 0,
+                spread: None,
+                caller_location: false,
+            },
+            arguments: Vec::new(),
+            result: TypeId(0),
+        };
+        let mut b = FuncBuilder::new(item, sig);
+        let entry = FuncBuilder::ENTRY;
+        let second = b.block();
+        let done = b.block();
+        let handler = b.block();
+        b.terminate(
+            entry,
+            RTerm::Invoke {
+                normal: (second, Vec::new()),
+                unwind: (handler, Vec::new()),
+            },
+        );
+        b.terminate(
+            second,
+            RTerm::Invoke {
+                normal: (done, Vec::new()),
+                unwind: (handler, Vec::new()),
+            },
+        );
+        b.terminate(done, RTerm::Return(None));
+        b.terminate(handler, RTerm::Throw(None));
+        b.finish()
+    }
+
+    type CatchNames = (BTreeMap<RBlockId, String>, Option<String>, Option<String>);
+
+    fn catch_names(plan: &Plan) -> CatchNames {
+        (
+            plan.invoke_names.clone(),
+            plan.exception_name.clone(),
+            plan.catch_name.clone(),
+        )
+    }
+
+    /// The catch-name reservation as it was before the interned strings were consulted lazily:
+    /// every one of them copied into `taken`, then named through the plain `unique`.
+    fn eager_catch_names(planner: &mut Planner<'_>) -> CatchNames {
+        planner
+            .taken
+            .extend(planner.interns.strings.iter().cloned());
+        let func = planner.func;
+        for block in &func.blocks {
+            if matches!(block.term, RTerm::Invoke { .. }) {
+                let name = planner.unique(format!("$invoke{}", block.id.0));
+                planner.plan.invoke_names.insert(block.id, name);
+            }
+        }
+        if !planner.plan.invoke_names.is_empty() {
+            planner.plan.exception_name = Some(planner.unique("$exception".to_owned()));
+            planner.plan.catch_name = Some(planner.unique("$caught".to_owned()));
+        }
+        catch_names(&planner.plan)
+    }
+
+    /// Names taken before the reservation, as `name` and `copies` would leave them.
+    fn seed(planner: &mut Planner<'_>, earlier: &[&str]) {
+        planner.taken.insert(CALLER_LOCATION_NAME.to_owned());
+        planner
+            .taken
+            .extend(earlier.iter().map(|name| (*name).to_owned()));
+    }
+
+    #[test]
+    fn catch_names_avoid_interned_strings_exactly_as_the_eager_copy_did() {
+        let func = invoking();
+        let table = TypeTable::default();
+        let opts = Opts::default();
+        let strings = [
+            "$invoke0",
+            "$invoke0$1",
+            "$exception",
+            "$caught",
+            "foo",
+            "$caught$1",
+        ];
+        let mut indexed = Interns::new();
+        for string in strings {
+            indexed.intern_str(string);
+        }
+        // Filled by hand: the string index is empty and membership falls back to a search.
+        let mut hand_filled = Interns::new();
+        hand_filled.strings = strings.map(str::to_owned).to_vec();
+        let mut appended = indexed.clone();
+        appended.strings.push("$invoke1".to_owned());
+        let empty = Interns::new();
+        let earlier: [&[&str]; 3] = [&[], &["$invoke1", "$exception$1"], &["$caught$2"]];
+        for interns in [&indexed, &hand_filled, &appended, &empty] {
+            for taken in earlier {
+                let mut eager = Planner::new(&func, None, &table, interns, &opts);
+                seed(&mut eager, taken);
+                let expected = eager_catch_names(&mut eager);
+                let mut lazy = Planner::new(&func, None, &table, interns, &opts);
+                seed(&mut lazy, taken);
+                lazy.name_invokes();
+                assert_eq!(
+                    catch_names(&lazy.plan),
+                    expected,
+                    "strings {:?}, taken {taken:?}",
+                    interns.strings
+                );
+                for name in expected.0.values().chain(&expected.1).chain(&expected.2) {
+                    assert!(!interns.strings.contains(name));
+                    assert!(!taken.contains(&name.as_str()));
+                }
+            }
+        }
+        // Through the public entry point.
+        assert_eq!(
+            catch_names(&plan(&func, None, &table, &indexed, &opts)),
+            (
+                BTreeMap::from([
+                    (RBlockId(0), "$invoke0$2".to_owned()),
+                    (RBlockId(1), "$invoke1".to_owned()),
+                ]),
+                Some("$exception$1".to_owned()),
+                Some("$caught$2".to_owned()),
+            )
+        );
+        let mut straight = func.clone();
+        straight.blocks.truncate(1);
+        straight.blocks[0].term = RTerm::Return(None);
+        assert_eq!(
+            catch_names(&plan(&straight, None, &table, &indexed, &opts)),
+            (BTreeMap::new(), None, None)
+        );
     }
 
     #[test]
