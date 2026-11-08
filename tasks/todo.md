@@ -22,7 +22,7 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 - [ ] Pro optimized cleanup-on link completes; R1.1 row
 
 ## Stage 3 — remove provably unnecessary cleanup edges (P07)
-- [ ] 3a RemoveNoopLandingPads after ElaborateDrops
+- [ ] 3a RemoveNoopLandingPads after ElaborateDrops — finding: under panic=abort the vendored pass never ran; 91% of cleanup bodies had only bare `resume` pads. Guarded run: compact gzip 110.6→106.1 KB. Full fix (body selection keyed on pre-removal state) measured 60.7 KB gzip / 610 tries; being delivered with backend/coroutine_source.rs + driver.rs changes.
 - [ ] 3b plan/cleanup.rs: EmptyChain + NoThrow (may_throw summary), witnesses, report
 - [ ] 3c no empty try for dead protected op
 - [ ] cleanup-edges tests + CONTRACT.md note; R2a row
