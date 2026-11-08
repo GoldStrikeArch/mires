@@ -36,3 +36,6 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 
 ## Stage 5 — next wave (chosen after Stage 4 attribution)
 - [ ] P10 strings / P12 formatter / P13–P16 bounded passes / browser timing matrix
+
+## Known gaps discovered (not blocking the current stage)
+- `Rc<[Z]>` built via `Rc::from(vec![Z;n])` fails on the JIR lane with `__rt.retype_rc: this pointer does not name a live heap block` (passes on the default lane). Pre-existing; found by the 1a verifier (fixture scratchpad/verify1a/fx/rc_vec.rs).
