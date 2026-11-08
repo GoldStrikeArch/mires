@@ -9,8 +9,10 @@
 //! path from a lowering method up to the unit would mean rewriting all of them. Interior
 //! mutability is confined to the two sinks below.
 
-use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::cell::{Ref, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
+
+use rcgjs_object::jir::Interns;
 
 use rustc_middle::ty::TyCtxt;
 
@@ -27,10 +29,14 @@ pub(crate) struct CguCx<'tcx> {
     pub(crate) opts: &'static Opts,
     /// Items discovered while lowering, appended to the unit after the mono item walk.
     extra: RefCell<Vec<JsItem>>,
+    required: RefCell<BTreeMap<JsName, rustc_middle::mono::MonoItem<'tcx>>>,
     /// The names already emitted into this unit, so an interned item is built exactly once.
     emitted: RefCell<BTreeSet<JsName>>,
     /// How many keyed loops have been numbered in this unit. See [`CguCx::next_keyed_site`].
     keyed_sites: RefCell<u32>,
+    /// The crate-scope JIR-S tables (strings, bytes, signatures, source facts, the type table)
+    /// every body of this unit refers into. See [`CguCx::interns`].
+    interns: RefCell<Interns>,
 }
 
 impl<'tcx> CguCx<'tcx> {
@@ -40,9 +46,71 @@ impl<'tcx> CguCx<'tcx> {
             namer: Namer::new(tcx, opts.names),
             opts,
             extra: RefCell::new(Vec::new()),
+            required: RefCell::new(BTreeMap::new()),
             emitted: RefCell::new(BTreeSet::new()),
             keyed_sites: RefCell::new(0),
+            interns: RefCell::new(Interns::new()),
         }
+    }
+
+    /// Records a resolved semantic dependency before the JIR encoder releases its intern borrow.
+    pub(crate) fn require_function(&self, instance: rustc_middle::ty::Instance<'tcx>) {
+        use rustc_middle::ty::{InstanceKind, ShimKind};
+        if !crate::coroutine_source::cleanup_probe()
+            || matches!(
+                instance.def,
+                InstanceKind::Virtual(..)
+                    | InstanceKind::Intrinsic(_)
+                    | InstanceKind::LlvmIntrinsic(_)
+                    | InstanceKind::Shim(ShimKind::ThreadLocal(..))
+            )
+            || !self.tcx.should_codegen_locally(instance)
+        {
+            return;
+        }
+        let name = self.namer.fn_name(instance);
+        self.required
+            .borrow_mut()
+            .insert(name, rustc_middle::mono::MonoItem::Fn(instance));
+    }
+
+    pub(crate) fn require_static(&self, definition: rustc_hir::def_id::DefId) {
+        if crate::coroutine_source::cleanup_probe() && definition.is_local() {
+            let name = self.namer.static_name(definition);
+            self.required
+                .borrow_mut()
+                .insert(name, rustc_middle::mono::MonoItem::Static(definition));
+        }
+    }
+
+    pub(crate) fn take_required(&self) -> Vec<(JsName, rustc_middle::mono::MonoItem<'tcx>)> {
+        std::mem::take(&mut *self.required.borrow_mut())
+            .into_iter()
+            .filter(|(name, _)| !self.emitted.borrow().contains(name))
+            .collect()
+    }
+
+    /// The JIR-S interns of this unit, accumulated across every item encoded into it.
+    ///
+    /// Ids are per unit: two units intern the same string under different ids, and the object
+    /// writer stores the unit's tables beside its bodies so the linker can re-intern. Within one
+    /// unit the ids are deterministic, because items are encoded in
+    /// `items_in_deterministic_order`. The encoder takes the `RefCell` mutably while it encodes
+    /// one item; nothing else may hold this borrow across an encode.
+    #[allow(dead_code)]
+    pub(crate) fn interns(&self) -> Ref<'_, Interns> {
+        self.interns.borrow()
+    }
+
+    /// Mutable access for the encoder. Never held across a call back into lowering.
+    pub(crate) fn interns_mut(&self) -> std::cell::RefMut<'_, Interns> {
+        self.interns.borrow_mut()
+    }
+
+    /// Takes the unit's interns, leaving empty tables behind.
+    #[allow(dead_code)]
+    pub(crate) fn take_interns(&self) -> Interns {
+        std::mem::take(&mut self.interns.borrow_mut())
     }
 
     /// The next keyed loop's site, which is what separates one keyed loop's row cache from
@@ -56,7 +124,10 @@ impl<'tcx> CguCx<'tcx> {
         let mut sites = self.keyed_sites.borrow_mut();
         let site = *sites;
         *sites += 1;
-        format!("{}#{site}", self.tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE))
+        format!(
+            "{}#{site}",
+            self.tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE)
+        )
     }
 
     /// Records that `name` has an item in this unit. Returns `false` if it already had one.
@@ -102,7 +173,10 @@ impl<'tcx> CguCx<'tcx> {
     pub(crate) fn intern(&self, name: JsName, build: impl FnOnce() -> JsItem) {
         if self.claim(&name) {
             let item = build();
-            debug_assert_eq!(item.name, name, "`intern` built an item under a different name");
+            debug_assert_eq!(
+                item.name, name,
+                "`intern` built an item under a different name"
+            );
             self.extra.borrow_mut().push(item);
         }
     }

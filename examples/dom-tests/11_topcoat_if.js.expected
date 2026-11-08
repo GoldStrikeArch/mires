@@ -1,0 +1,107 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { memo as _$memo } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h70ecbd4edf573156 = _$template("<div></div>");
+const tmpl$hd2c7e32f58f4177d = _$template("<a href=\"/account\">Account</a>");
+const tmpl$h2c2ce68aac83f164 = _$template("<a href=\"/login\">Sign in</a>");
+const tmpl$hc07193c9c2b2e14b = _$template("<span>a</span>");
+const tmpl$h0bc516437fd749f0 = _$template("<span>b</span>");
+const tmpl$h5a2a35b0734e854a = _$template("<span>fallback</span>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x11_topcoat_if$if_else$h2b10cd5e34548454(true);
+  x11_topcoat_if$if_only$hc714e3a43be25568(false);
+  x11_topcoat_if$if_else_if$h52eacc28f5c7ba43(false, true);
+}
+// if_else::{closure#0}
+function x11_topcoat_if$if_else$closure_0$h2c0079e6074ea02f(_1) {
+  return _1[0].buf[_1[0].off];
+}
+// if_else::{closure#1}
+function x11_topcoat_if$if_else$closure_1$h9481ada5199fd4e5(_1) {
+  return tmpl$hd2c7e32f58f4177d();
+}
+// if_else::{closure#2}
+function x11_topcoat_if$if_else$closure_2$hff359ffea68bf31b(_1) {
+  return tmpl$h2c2ce68aac83f164();
+}
+// if_else
+function x11_topcoat_if$if_else$h2b10cd5e34548454(signed_in) {
+  let _0, _6, $t0;
+  signed_in = [signed_in];
+  _0 = tmpl$h70ecbd4edf573156();
+  _6 = [{ buf: signed_in, off: 0 }];
+  $t0 = _$memo(() => x11_topcoat_if$if_else$closure_0$h2c0079e6074ea02f(_6));
+  _$insert(_0, () => $t0() ? x11_topcoat_if$if_else$closure_1$h9481ada5199fd4e5(undefined) : x11_topcoat_if$if_else$closure_2$hff359ffea68bf31b(undefined));
+  return _0;
+}
+// if_else_if::{closure#0}
+function x11_topcoat_if$if_else_if$closure_0$h0e0c9a096b8a2c4a(_1) {
+  return _1[0].buf[_1[0].off];
+}
+// if_else_if::{closure#1}
+function x11_topcoat_if$if_else_if$closure_1$he2bd00d179ea17d5(_1) {
+  return tmpl$hc07193c9c2b2e14b();
+}
+// if_else_if::{closure#2}
+function x11_topcoat_if$if_else_if$closure_2$h63c76ec52d4a26d2(_1) {
+  let _2, $t0;
+  _2 = [_1[0]];
+  $t0 = _$memo(() => x11_topcoat_if$if_else_if$closure_2_closure_0$ha34ab756935d0f04(_2));
+  return () => $t0() ? x11_topcoat_if$if_else_if$closure_2_closure_1$hf251a976858ae4fe(undefined) : x11_topcoat_if$if_else_if$closure_2_closure_2$h949569bdc7d8d152(undefined);
+}
+// if_else_if::{closure#2}::{closure#0}
+function x11_topcoat_if$if_else_if$closure_2_closure_0$ha34ab756935d0f04(_1) {
+  return _1[0].buf[_1[0].off];
+}
+// if_else_if::{closure#2}::{closure#1}
+function x11_topcoat_if$if_else_if$closure_2_closure_1$hf251a976858ae4fe(_1) {
+  return tmpl$h0bc516437fd749f0();
+}
+// if_else_if::{closure#2}::{closure#2}
+function x11_topcoat_if$if_else_if$closure_2_closure_2$h949569bdc7d8d152(_1) {
+  return tmpl$h5a2a35b0734e854a();
+}
+// if_else_if
+function x11_topcoat_if$if_else_if$h52eacc28f5c7ba43(a, b) {
+  let _0, _7, _9, $t0;
+  a = [a];
+  b = [b];
+  _0 = tmpl$h70ecbd4edf573156();
+  _7 = [{ buf: a, off: 0 }];
+  _9 = [{ buf: b, off: 0 }];
+  $t0 = _$memo(() => x11_topcoat_if$if_else_if$closure_0$h0e0c9a096b8a2c4a(_7));
+  _$insert(_0, () => $t0() ? x11_topcoat_if$if_else_if$closure_1$he2bd00d179ea17d5(undefined) : x11_topcoat_if$if_else_if$closure_2$h63c76ec52d4a26d2(_9));
+  return _0;
+}
+// if_only::{closure#0}
+function x11_topcoat_if$if_only$closure_0$h37d81f9f832022dc(_1) {
+  return _1[0].buf[_1[0].off];
+}
+// if_only::{closure#1}
+function x11_topcoat_if$if_only$closure_1$hff56d94ef5b3fd75(_1) {
+  return tmpl$hd2c7e32f58f4177d();
+}
+// if_only::{closure#2}
+function x11_topcoat_if$if_only$closure_2$h95ebb5998749797a(_1) {
+  return null;
+}
+// if_only
+function x11_topcoat_if$if_only$hc714e3a43be25568(signed_in) {
+  let _0, _6, $t0;
+  signed_in = [signed_in];
+  _0 = tmpl$h70ecbd4edf573156();
+  _6 = [{ buf: signed_in, off: 0 }];
+  $t0 = _$memo(() => x11_topcoat_if$if_only$closure_0$h37d81f9f832022dc(_6));
+  _$insert(_0, () => $t0() ? x11_topcoat_if$if_only$closure_1$hff56d94ef5b3fd75(undefined) : x11_topcoat_if$if_only$closure_2$h95ebb5998749797a(undefined));
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

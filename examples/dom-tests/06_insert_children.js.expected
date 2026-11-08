@@ -1,0 +1,66 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h70ecbd4edf573156 = _$template("<div></div>");
+const tmpl$hb03c131395aa8345 = _$template("<div>Hello <!></div>");
+const tmpl$h96ec1cc863bf07a0 = _$template("<div><!><span></span></div>");
+const tmpl$h1e8598c9b1e4830f = _$template("<div><span></span><!><span></span></div>");
+const tmpl$hee50edfc53c620e0 = _$template("<div><!><!></div>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x06_insert_children$only$h7971082864e45b53("a");
+  x06_insert_children$after_text$h94bac23d6401c352("b");
+  x06_insert_children$before_element$hc1d134ff07a5ee36("c");
+  x06_insert_children$between$h8de4c03966ce17d0("d");
+  x06_insert_children$adjacent$h761f163769c6d1a4("e", "f");
+}
+// adjacent
+function x06_insert_children$adjacent$h761f163769c6d1a4(first, second) {
+  let _0, $t0, $t1;
+  _0 = tmpl$hee50edfc53c620e0();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  _$insert(_0, first, $t0);
+  _$insert(_0, second, $t1);
+  return _0;
+}
+// after_text
+function x06_insert_children$after_text$h94bac23d6401c352(children) {
+  let _0, $t0, $t1;
+  _0 = tmpl$hb03c131395aa8345();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  _$insert(_0, children, $t1);
+  return _0;
+}
+// before_element
+function x06_insert_children$before_element$hc1d134ff07a5ee36(children) {
+  let _0, $t0;
+  _0 = tmpl$h96ec1cc863bf07a0();
+  $t0 = _0.firstChild;
+  _$insert(_0, children, $t0);
+  return _0;
+}
+// between
+function x06_insert_children$between$h8de4c03966ce17d0(children) {
+  let _0, $t0, $t1;
+  _0 = tmpl$h1e8598c9b1e4830f();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  _$insert(_0, children, $t1);
+  return _0;
+}
+// only
+function x06_insert_children$only$h7971082864e45b53(children) {
+  let _0;
+  _0 = tmpl$h70ecbd4edf573156();
+  _$insert(_0, children);
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

@@ -1,0 +1,212 @@
+{
+  "$comment": [
+    "Chunk-size budgets for what the island page delivers to a browser (A6).",
+    "",
+    "Every number here was MEASURED, never chosen. A baseline is the first green",
+    "measurement of a subject, recorded with the date it was taken; `node budgets.mjs`",
+    "judges the current delivery against it and `node budgets.mjs --update` re-records.",
+    "A subject that moves is a result to read and then re-record, in either direction --",
+    "see lib/budget.mjs's header for why a shrink is a finding and not a win.",
+    "",
+    "The budgets run as part of the parity suite (run.mjs adds a check per fixture) so",
+    "that a size regression fails the same run a hydration regression fails. They are",
+    "also runnable alone, which is the form to use when re-baselining."
+  ],
+  "policy": {
+    "tolerance": 0.05,
+    "floorBytes": 128,
+    "$tolerance": "Proportional slack on the gzip baseline. Tight, because these builds are deterministic: the same sources produce the same bytes, so the band is absorbing INTENTIONAL small changes, not measurement noise. There is no noise to absorb.",
+    "$floorBytes": "An absolute floor under the proportional slack, because 5% of the 307-byte loader is 15 bytes and one reworded comment in dom.rs would break it. The floor carries the small subjects; the proportion carries the large ones."
+  },
+  "gzip": {
+    "level": 9,
+    "$level": "Pinned, and pinned at the extreme rather than at a realistic 6, so that a change in a number means a change in CONTENT and not a change in how hard the compressor tried. Measured here: topcoat-dom.js is 9105 at level 6 and 9106 at level 9 -- deflate is not monotone in effort, which is the whole reason this has to be written down.",
+    "measuredOn": {
+      "node": "v24.5.0",
+      "zlib": "1.3.1-470d3a2",
+      "$why": "Recorded because gzip output size is a property of the zlib build, not of the standard. If a runner reports every subject as moved by a handful of bytes at once, compare these first: that is a zlib change, not a regression."
+    }
+  },
+  "chunking": {
+    "landed": true,
+    "$landed": [
+      "Per-island chunking HAS landed. dom.rs serves four chunks as siblings under",
+      "/demo/chunks/ from one parameterized route, and the page resolves each by the bare",
+      "specifier `topcoat-island/<name>` through an import map the BUILD writes.",
+      "",
+      "What that changed here, and it is the thing the pre-chunking note predicted: the",
+      "island subjects are INDEPENDENT now. Before, all three named the same islands.js,",
+      "so they were one number wearing three names and adding any island moved all of",
+      "them. Each now measures its own chunk plus the shared chunk it imports, and",
+      "`containsIslands` finally reads as exactly one island per island subject. That",
+      "independence is the concrete thing C1 bought, and it is visible here as a diff.",
+      "",
+      "A subject is still a SUM over separately gzipped artifacts, which is why an island",
+      "subject is its own chunk PLUS shared: the browser fetches two files and pays for",
+      "both. See lib/budget.mjs `measure` for why they are not concatenated first."
+    ],
+    "islandArtifact": "/demo/islands.js",
+    "$islandArtifact": "The single module the islands were served from before chunking. Consulted only while `landed` is false, and kept so that flag still means something if it is ever flipped back."
+  },
+  "subjects": {
+    "island:counter": {
+      "artifacts": [
+        "/demo/chunks/counter.js",
+        "/demo/chunks/shared.js"
+      ],
+      "containsIslands": [
+        "counter"
+      ],
+      "$note": "The counter island's own chunk plus the shared chunk it imports, which is what a browser fetches to run it. Post-chunking this is finally about ONE island: `containsIslands` should read [\"counter\"] and a second name appearing in it is a chunking regression, not a size one.",
+      "gzip": 3075,
+      "raw": 12273,
+      "measured": "2026-07-31",
+      "$rebaselined": "was 1072 gzip / 3159 raw, 2026-07-30"
+    },
+    "island:nested": {
+      "artifacts": [
+        "/demo/chunks/nested.js",
+        "/demo/chunks/shared.js"
+      ],
+      "containsIslands": [
+        "nested"
+      ],
+      "$note": "The nested island's own chunk plus the shared chunk it imports, which is what a browser fetches to run it. Post-chunking this is finally about ONE island: `containsIslands` should read [\"nested\"] and a second name appearing in it is a chunking regression, not a size one.",
+      "gzip": 3292,
+      "raw": 12996,
+      "measured": "2026-07-31",
+      "$rebaselined": "was 1289 gzip / 3882 raw, 2026-07-30"
+    },
+    "island:life": {
+      "artifacts": [
+        "/demo/chunks/life.js",
+        "/demo/chunks/shared.js"
+      ],
+      "containsIslands": [
+        "life"
+      ],
+      "$note": "The life island's own chunk plus the shared chunk it imports, added when the showcase wave landed three more islands; same shape as the other island subjects.",
+      "gzip": 7499,
+      "raw": 34452,
+      "measured": "2026-07-31",
+      "$rebaselined": "first measurement, 2026-07-31"
+    },
+    "island:sand": {
+      "artifacts": [
+        "/demo/chunks/sand.js",
+        "/demo/chunks/shared.js"
+      ],
+      "containsIslands": [
+        "sand"
+      ],
+      "$note": "The sand island's own chunk plus the shared chunk it imports, added when the showcase wave landed three more islands; same shape as the other island subjects.",
+      "gzip": 7579,
+      "raw": 35220,
+      "measured": "2026-07-31",
+      "$rebaselined": "first measurement, 2026-07-31"
+    },
+    "island:mines": {
+      "artifacts": [
+        "/demo/chunks/mines.js",
+        "/demo/chunks/shared.js"
+      ],
+      "containsIslands": [
+        "mines"
+      ],
+      "$note": "The mines island's own chunk plus the shared chunk it imports, added when the showcase wave landed three more islands; same shape as the other island subjects.",
+      "gzip": 8127,
+      "raw": 42384,
+      "measured": "2026-07-31",
+      "$rebaselined": "first measurement, 2026-07-31"
+    },
+    "island:bench": {
+      "artifacts": [
+        "/demo/chunks/bench.js",
+        "/demo/chunks/shared.js"
+      ],
+      "containsIslands": [
+        "bench"
+      ],
+      "$note": "The bench island's own chunk plus the shared chunk it imports; same shape as the other island subjects. The js-framework-benchmark harness weighs its own copy of this delivery separately (bench-pack.mjs); this subject is about what dom.rs serves.",
+      "gzip": 5219,
+      "raw": 21352,
+      "measured": "2026-08-01",
+      "$rebaselined": "was 0 gzip / 0 raw, 2026-07-31"
+    },
+    "chunk:shared": {
+      "artifacts": [
+        "/demo/chunks/shared.js"
+      ],
+      "containsIslands": [],
+      "$note": "What more than one island reaches, on its own. Inside all three island subjects by construction, and watched separately because it is the one chunk whose growth is paid for by every island page at once. It should contain NO island entry point, which `containsIslands` asserts by staying empty.",
+      "gzip": 2230,
+      "raw": 9452,
+      "measured": "2026-07-31",
+      "$rebaselined": "was 227 gzip / 338 raw, 2026-07-30"
+    },
+    "runtime": {
+      "artifacts": [
+        "/demo/topcoat-dom.js"
+      ],
+      "gzip": 9106,
+      "raw": 23971,
+      "measured": "2026-07-30",
+      "$note": "The pinned solid/dom-expressions bundle every island page loads. It is not emitted by the backend, so this budget is not watching the emitter -- it is watching the one number that is the same on every page and the largest single thing a first-time visitor downloads. It should move only when the pin moves."
+    },
+    "loader": {
+      "artifacts": [
+        "/demo/island-loader.js"
+      ],
+      "gzip": 1483,
+      "raw": 3320,
+      "measured": "2026-07-30",
+      "$note": "Hand-written in dom.rs, not generated. Budgeted anyway because it ships on every island page, and a budget that covers three of the four modules the page delivers is a budget with a hole in it.",
+      "$rebaselined": "was 307 gzip / 477 raw, 2026-07-30"
+    },
+    "island-rt": {
+      "artifacts": [
+        "/demo/island-rt.js"
+      ],
+      "$note": "The host functions the islands borrow from the page: the boards, the clock, the pointer sink and the benchmark's row store. Hand-written rather than emitted, like the loader, and budgeted for the same reason -- it ships on every island page and nothing else would notice it growing.",
+      "gzip": 6129,
+      "raw": 15665,
+      "measured": "2026-08-01",
+      "$rebaselined": "was 6838 gzip / 17294 raw, 2026-07-31"
+    },
+    "page:island": {
+      "artifacts": [
+        "/demo/topcoat-dom.js",
+        "/demo/island-loader.js",
+        "/demo/chunks/counter.js",
+        "/demo/chunks/shared.js"
+      ],
+      "containsIslands": [
+        "counter"
+      ],
+      "$note": "What a browser actually pulls down for the counter island page. The subject a person would quote, and the one that stays comparable across a change that redistributes bytes between the chunks.",
+      "gzip": 13698,
+      "raw": 39673,
+      "measured": "2026-07-31",
+      "$rebaselined": "was 11661 gzip / 30450 raw, 2026-07-30"
+    }
+  },
+  "$notBudgeted": {
+    "/demo/chunks/counter.js.map": "A source map. Served, but no browser fetches it unless devtools are open.",
+    "/demo/chunks/nested.js.map": "As above.",
+    "/demo/chunks/shared.js.map": "As above.",
+    "/demo/chunks.importmap.json": "The page's import map, served on its own so a harness can resolve a chunk specifier the way the page does. The page itself INLINES the map in a <script type=\"importmap\">, so a browser never fetches this route and it costs a visitor nothing.",
+    "/demo/chunks/life.js.map": "As above.",
+    "/demo/chunks/sand.js.map": "As above.",
+    "/demo/chunks/mines.js.map": "As above.",
+    "/demo/chunks/bench.js.map": "As above."
+  },
+  "$whyTheseMoved": [
+    "2026-07-31: twelve subjects re-baselined at once, and the cause is one event, not twelve.",
+    "The previous baselines were stamped 2026-07-30, before the showcase wave landed the life,",
+    "sand and mines islands. Those islands grew the shared chunk (Range::contains and friends,",
+    "instantiated by life and mines) and island-rt (seven new __rt exports), and every island",
+    "subject moved by exactly the shared-chunk delta it imports. The stale captures hid this",
+    "until the import-map reorder (the Firefox bare-specifier fix) forced a recapture. The",
+    "three island:life/sand/mines subjects are first measurements, not movements."
+  ]
+}

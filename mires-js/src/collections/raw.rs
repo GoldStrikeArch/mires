@@ -62,7 +62,7 @@ unsafe extern "C" {
 #[inline(never)]
 pub(crate) fn map_has<Q: ?Sized>(map: RawMap, key: &Q) -> bool {
     let _ = (map, key);
-    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_mires")
+    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }
 
 /// `map.set(key, value)`.
@@ -70,7 +70,7 @@ pub(crate) fn map_has<Q: ?Sized>(map: RawMap, key: &Q) -> bool {
 #[inline(never)]
 pub(crate) fn map_set<Q: ?Sized, V>(map: RawMap, key: &Q, value: V) {
     let _ = (map, key, value);
-    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_mires")
+    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }
 
 /// `map.delete(key)`.
@@ -78,7 +78,7 @@ pub(crate) fn map_set<Q: ?Sized, V>(map: RawMap, key: &Q, value: V) {
 #[inline(never)]
 pub(crate) fn map_del<Q: ?Sized>(map: RawMap, key: &Q) {
     let _ = (map, key);
-    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_mires")
+    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }
 
 /// `map.get(key)`, as a shared reference to the stored value.
@@ -93,7 +93,7 @@ pub(crate) fn map_del<Q: ?Sized>(map: RawMap, key: &Q) {
 #[inline(never)]
 pub(crate) unsafe fn map_get<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> &'a V {
     let _ = (map, key);
-    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_mires")
+    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }
 
 /// `map.get(key)`, as a mutable reference to the stored value.
@@ -109,7 +109,7 @@ pub(crate) unsafe fn map_get<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> &'a V {
 #[inline(never)]
 pub(crate) unsafe fn map_get_mut<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> &'a mut V {
     let _ = (map, key);
-    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_mires")
+    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }
 
 /// `[...map.keys()]`, the keys as they are right now.
@@ -122,5 +122,5 @@ pub(crate) unsafe fn map_get_mut<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> &'a 
 #[inline(never)]
 pub(crate) fn map_keys<'a, S>(map: RawMap) -> &'a [S] {
     let _ = map;
-    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_mires")
+    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }

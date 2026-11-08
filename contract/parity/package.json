@@ -1,0 +1,38 @@
+{
+  "name": "@topcoat-spike/dom-parity",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "The SSR-to-client hydration parity harness. Runs the real server HTML, the real bootstrap, the real pinned runtime and the real compiled island together under a live DOM, and measures what hydration does to the document.",
+  "scripts": {
+    "parity": "node run.mjs",
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "jsdom": "29.1.1"
+  },
+  "$note-why-a-separate-package": [
+    "contract/README.md records that the contract harness has NO jsdom, for two",
+    "reasons: jsdom 30 requires node ^24.15 (this environment is 24.5), and it",
+    "depends on parse5 8, which would put a second parse5 major next to the 7.3.0",
+    "the reference babel plugin parses templates with. The tree oracle must agree",
+    "with the plugin about HTML parsing, so a second parse5 in that tree is not",
+    "acceptable.",
+    "",
+    "Both objections are about ONE dependency tree, not about jsdom. So this is a",
+    "separate package with its own node_modules and its own lockfile. Nothing in",
+    "contract/vendor changes, contract/vendor's parse5 stays the only parse5 the",
+    "oracle ever sees, and the parity harness -- which needs a live DOM and a real",
+    "MutationObserver, the whole point of it -- gets one.",
+    "",
+    "jsdom is pinned to 29.1.1, the last line whose engines field admits node 24.5",
+    "(`^20.19.0 || ^22.13.0 || >=24.0.0`). 30.x demands `^24.15.0` and will not",
+    "install here. Verified: MutationObserver delivers characterData, childList and",
+    "attribute records on node 24.5.0."
+  ],
+  "$note-no-upstream-pin-of-its-own": [
+    "The runtime under test is NOT taken from this package. It is read out of",
+    "contract/vendor/upstream/solid-js, the same hash-verified files demo-app's own",
+    "routes serve with include_str!. jsdom supplies the DOM and nothing else."
+  ]
+}

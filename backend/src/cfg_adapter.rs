@@ -27,10 +27,10 @@
 //! literal `emit.rs` prints). Ordering, contiguity and every range test are then exactly the
 //! ordering, contiguity and ranges of the Rust values, and the literals still print signed.
 
-use rustc_middle::mir::START_BLOCK;
 use rustc_middle::mir::BasicBlock;
+use rustc_middle::mir::START_BLOCK;
 use rustc_middle::ty::{Ty, TyCtxt};
-use structurizer::{Block, BlockId, Cfg, Payload};
+use structurizer::{Block, BlockId, Cfg};
 
 use crate::base::FnCx;
 use crate::jsast::{Expr, Stmt};
@@ -60,18 +60,6 @@ pub(crate) struct Scrutinee<'tcx> {
 
 /// The graph of one function body.
 pub(crate) type BodyCfg<'tcx> = Cfg<Vec<Stmt>, Scrutinee<'tcx>>;
-
-/// One unit per statement: a block's cost is how many statements duplicating it would duplicate.
-///
-/// Block payloads are straight line at this point — the only nested statement a lowering produces
-/// here is the `if` guarding an `Assert`'s panic, which is two or three statements' worth — so
-/// counting the top level is close enough for the one decision this feeds, whether a loop
-/// continuation is small enough to be duplicated into the loop.
-impl Payload for Stmt {
-    fn cost(&self) -> i32 {
-        1
-    }
-}
 
 /// The non-cleanup blocks of a body, renumbered densely.
 pub(crate) struct Blocks {
@@ -104,13 +92,28 @@ pub(crate) fn build<'tcx>(fx: &FnCx<'_, 'tcx>) -> Option<BodyCfg<'tcx>> {
     let blocks = Blocks { ids };
     let entry = blocks.id(START_BLOCK)?;
 
-    let mut out = Vec::with_capacity(order.len());
-    for bb in order {
+    let mut out: Vec<_> = order.iter().map(|_| None).collect();
+    // A template must be registered before its dominated holes are lowered. MIR block
+    // numbers do not imply execution order, especially after inlining. Keep graph ids
+    // stable, and retain unreachable blocks after lowering the reachable graph.
+    for &bb in mir.basic_blocks.reverse_postorder().iter().chain(&order) {
+        let Some(id) = blocks.id(bb) else { continue };
+        let slot = &mut out[id.0 as usize];
+        if slot.is_some() {
+            continue;
+        }
         let (stmts, term) = fx.codegen_block(bb, &mir.basic_blocks[bb], &blocks);
         // Unwind edges are not edges of this graph; they are what the try/catch pass will read.
-        out.push(Block { stmts, term, unwind: None });
+        *slot = Some(Block {
+            stmts,
+            term,
+            unwind: None,
+        });
     }
-    Some(Cfg { blocks: out, entry })
+    Some(Cfg {
+        blocks: out.into_iter().collect::<Option<_>>()?,
+        entry,
+    })
 }
 
 /// The bias that maps the values of `ty` onto the unsigned order: the sign bit, or nothing at all

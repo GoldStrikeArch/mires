@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Builds a `wasm32-unknown-unknown` sysroot whose `core` was compiled by
-# rustc_codegen_mires, so that ordinary `#![no_std]` crates can be compiled to
+# rustc_codegen_js, so that ordinary `#![no_std]` crates can be compiled to
 # JavaScript against the real standard library core.
 #
 #   scripts/build_sysroot.sh            # incremental (cargo decides)
@@ -21,14 +21,14 @@
 # ------------
 #
 #   1. copies `library/` out of the pinned toolchain's `rust-src` component into
-#      build/stdlib/ — the toolchain's own copy is never touched, so a patch that
-#      goes wrong cannot corrupt the installed sources;
+#      the keyed cache under build/sysroot-cache/; the toolchain's own copy is
+#      never touched, so a patch cannot corrupt the installed sources;
 #   2. applies every patches/*.patch, in name order, with `patch -p1` rooted at
 #      build/stdlib (so a patch's paths start with `library/`);
 #   3. builds `library/core`, `library/compiler-builtins` and `library/alloc`
 #      with cargo, with `-Zcodegen-backend` pointed at our dylib;
-#   4. installs the three rlibs into build/sysroot/, laid out the way `--sysroot`
-#      expects.
+#   4. installs the three rlibs into build/sysroots/<key>/, laid out the way
+#      `--sysroot` expects.
 #
 # Why `compiler_builtins` too
 # ---------------------------
@@ -55,6 +55,10 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd -- "$script_dir/.." && pwd)
+# shellcheck source=integration-lock.sh
+source "$script_dir/integration-lock.sh"
+# shellcheck source=sysroot-cache.sh
+source "$script_dir/sysroot-cache.sh"
 
 clean=0
 for arg in "$@"; do
@@ -68,9 +72,6 @@ for arg in "$@"; do
 done
 
 target=wasm32-unknown-unknown
-stdlib="$root/build/stdlib"
-sysroot="$root/build/sysroot"
-libdir="$sysroot/lib/rustlib/$target/lib"
 
 channel=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' \
 	"$root/rust-toolchain.toml" | head -n 1)
@@ -96,6 +97,95 @@ if [ ! -f "$dylib" ]; then
 	exit 1
 fi
 
+case "${JSC_RUST_OPT_LEVEL:-}" in
+"" | 0 | 1 | 2 | 3 | s | z) ;;
+*)
+	echo "build_sysroot.sh: invalid JSC_RUST_OPT_LEVEL: $JSC_RUST_OPT_LEVEL" >&2
+	exit 2
+	;;
+esac
+
+# Equivalent option sets share a cache entry and are also passed to rustc in
+# this canonical order. This avoids a key that claims two differently ordered
+# invocations are identical while compiling them differently.
+JS_EXTRA_ARGS=$(jsc_sysroot_args)
+export JS_EXTRA_ARGS
+key=$(jsc_sysroot_key "$root" "$target" "$dylib")
+case "$key" in
+*[!0-9a-f]* | "")
+	echo "build_sysroot.sh: invalid sysroot cache key: $key" >&2
+	exit 1
+	;;
+esac
+
+cache="$root/build/sysroot-cache/$key"
+stdlib="$cache/stdlib"
+sysroot="$root/build/sysroots/$key"
+libdir="$sysroot/lib/rustlib/$target/lib"
+
+# One writer per immutable key. Different settings build in separate trees;
+# the same settings either reuse the completed entry or fail clearly instead
+# of racing cargo and the final install.
+lock_parent="$root/build/sysroot-cache/.locks"
+lock="$lock_parent/$key"
+legacy_lock=""
+mkdir -p "$lock_parent"
+if ! mkdir "$lock" 2>/dev/null; then
+	owner=""
+	[ -f "$lock/pid" ] && owner=$(cat "$lock/pid")
+	if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+		rm -rf "$lock"
+		mkdir "$lock"
+	else
+		echo "build_sysroot.sh: sysroot $key is already being built${owner:+ by pid $owner}" >&2
+		exit 75
+	fi
+fi
+printf '%s' "$$" >"$lock/pid"
+cleanup() {
+	[ -z "${install:-}" ] || rm -rf "$install"
+	[ -z "$legacy_lock" ] || rm -rf "$legacy_lock"
+	rm -rf "$lock"
+}
+trap cleanup EXIT INT TERM
+
+if [ "$clean" = 1 ]; then
+	rm -rf "$cache" "$sysroot"
+fi
+
+activate_legacy_default() {
+	[ -z "$JS_EXTRA_ARGS" ] || return 0
+	[ -z "${JSC_RUST_OPT_LEVEL:-}" ] || return 0
+	local legacy="$root/build/sysroot"
+	local link="$root/build/.sysroot-link.$$"
+	legacy_lock="$lock_parent/legacy-default"
+	if ! mkdir "$legacy_lock" 2>/dev/null; then
+		echo "build_sysroot.sh: the default sysroot link is already being updated" >&2
+		exit 75
+	fi
+	mkdir -p "$root/build/sysroots"
+	if [ -e "$legacy" ] && [ ! -L "$legacy" ]; then
+		mv "$legacy" "$root/build/sysroots/legacy-unkeyed-$$"
+	fi
+	ln -s "sysroots/$key" "$link"
+	# BSD `mv -f link existing-directory-symlink` follows the destination and moves `link`
+	# inside the old sysroot. Unlink it under the cross-key activation lock, then install the new
+	# link, so a successful default build can never leave the compatibility path stale.
+	jsc_replace_symlink "$link" "$legacy"
+	rmdir "$legacy_lock"
+	legacy_lock=""
+}
+
+if [ -d "$libdir" ] && [ -f "$sysroot/.cache-key" ] && \
+	[ "$(cat "$sysroot/.cache-key")" = "$key" ] && \
+	[ "$(cat "$sysroot/.js-args" 2>/dev/null || true)" = "$JS_EXTRA_ARGS" ] && \
+	[ "$(cat "$sysroot/.rust-opt-level" 2>/dev/null || true)" = "${JSC_RUST_OPT_LEVEL:-}" ] && \
+	[ "$(cat "$sysroot/.target" 2>/dev/null || true)" = "$target" ]; then
+	activate_legacy_default
+	echo "==> reusing sysroot: $sysroot"
+	exit 0
+fi
+
 # ---------------------------------------------------------------------------
 # 1. a private copy of the standard library sources
 # ---------------------------------------------------------------------------
@@ -105,10 +195,6 @@ if [ ! -d "$src_root/library/core" ]; then
 	echo "build_sysroot.sh: no rust-src for $channel at $src_root" >&2
 	echo "build_sysroot.sh: run  rustup component add rust-src --toolchain $channel" >&2
 	exit 1
-fi
-
-if [ "$clean" = 1 ]; then
-	rm -rf "$stdlib" "$sysroot"
 fi
 
 echo "==> copying $src_root/library"
@@ -157,11 +243,16 @@ fi
 
 # One `-Cllvm-args=` per option: rustflags are split on whitespace, so a single
 # occurrence carrying two options would arrive as one unknown flag.
-backend_args=""
+backend_args=" -Cllvm-args=js-producer=$(jsc_sha256_file "$dylib")"
 if [ -n "${JS_EXTRA_ARGS:-}" ]; then
 	for arg in $JS_EXTRA_ARGS; do
 		backend_args="$backend_args -Cllvm-args=$arg"
 	done
+fi
+
+rust_opt_arg=""
+if [ -n "${JSC_RUST_OPT_LEVEL:-}" ]; then
+	rust_opt_arg=" -Copt-level=$JSC_RUST_OPT_LEVEL"
 fi
 
 export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="\
@@ -172,7 +263,7 @@ export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="\
 -Ccodegen-units=1 \
 -Coverflow-checks=off \
 -Cdebug-assertions=off \
--Cdebuginfo=0$backend_args"
+-Cdebuginfo=0$backend_args$rust_opt_arg"
 
 # Almost every dependency is a path dependency inside the copied tree, but not
 # quite all: compiler-builtins pulls cfg-if from crates.io. A machine that has
@@ -198,8 +289,7 @@ export CARGO_NET_OFFLINE=true
 # hashes, and two `libcore-*.rlib` in one sysroot is an error at every later use
 # of it. Throwing the build directory away is what keeps exactly one.
 stamp="$stdlib/.backend-stamp"
-digest=$(printf '%s\n%s' "$(shasum -a 256 "$dylib" | cut -d' ' -f1)" "$backend_args" |
-	shasum -a 256 | cut -d' ' -f1)
+digest=$key
 if [ ! -f "$stamp" ] || [ "$(cat "$stamp")" != "$digest" ]; then
 	echo "==> backend or options changed, discarding the previous sysroot build"
 	rm -rf "$stdlib/library/target"
@@ -228,9 +318,11 @@ printf '%s' "$digest" >"$stamp"
 # ---------------------------------------------------------------------------
 
 deps="$stdlib/library/target/$target/release/deps"
+install="$root/build/sysroots/.install-$key-$$"
+install_lib="$install/lib/rustlib/$target/lib"
 
-rm -rf "$libdir"
-mkdir -p "$libdir"
+rm -rf "$install"
+mkdir -p "$install_lib"
 
 # The newest of each, never every match: a stale rlib from an earlier set of flags
 # would make `--sysroot` ambiguous, which rustc rejects outright.
@@ -239,7 +331,7 @@ for pattern in 'libcore-*.rlib' 'libcompiler_builtins-*.rlib' 'liballoc-*.rlib';
 	newest=$(find "$deps" -maxdepth 1 -name "$pattern" -type f 2>/dev/null |
 		tr '\n' '\0' | xargs -0 ls -t 2>/dev/null | head -n 1)
 	[ -n "$newest" ] || continue
-	cp "$newest" "$libdir/"
+	cp "$newest" "$install_lib/"
 	found=$((found + 1))
 done
 
@@ -255,7 +347,14 @@ fi
 # in a program: a generic instantiation codegenned both here and in the crate
 # linking against it must come out spelled identically, or link.rs reports the two
 # spellings as two different definitions of one item.
-printf '%s' "${JS_EXTRA_ARGS:-}" >"$sysroot/.js-args"
+printf '%s' "${JS_EXTRA_ARGS:-}" >"$install/.js-args"
+printf '%s' "${JSC_RUST_OPT_LEVEL:-}" >"$install/.rust-opt-level"
+printf '%s' "$key" >"$install/.cache-key"
+printf '%s' "$target" >"$install/.target"
+mkdir -p "$root/build/sysroots"
+rm -rf "$sysroot"
+mv "$install" "$sysroot"
+activate_legacy_default
 
 echo
 echo "==> sysroot: $sysroot"

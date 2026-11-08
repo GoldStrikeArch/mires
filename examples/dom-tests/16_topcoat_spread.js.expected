@@ -1,0 +1,40 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { spread as _$spread } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h70ecbd4edf573156 = _$template("<div></div>");
+const tmpl$h22595ebb6e3adb73 = _$template("<div id=\"main\"></div>");
+const tmpl$h3d49f9f4fa0d9606 = _$template("<div><span>Save</span></div>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x16_topcoat_spread$spread_only$hd626eb1063e36b7a({ id: "a" });
+  x16_topcoat_spread$spread_after$h1a49b6f184b2d064({ id: "b" });
+  x16_topcoat_spread$spread_with_children$h98c8c077933580a5({ id: "c" });
+}
+// spread_after
+function x16_topcoat_spread$spread_after$h1a49b6f184b2d064(attrs) {
+  let _0;
+  _0 = tmpl$h22595ebb6e3adb73();
+  _$spread(_0, { id: attrs.id }, false, false);
+  return _0;
+}
+// spread_only
+function x16_topcoat_spread$spread_only$hd626eb1063e36b7a(attrs) {
+  let _0;
+  _0 = tmpl$h70ecbd4edf573156();
+  _$spread(_0, { id: attrs.id }, false, false);
+  return _0;
+}
+// spread_with_children
+function x16_topcoat_spread$spread_with_children$h98c8c077933580a5(attrs) {
+  let _0;
+  _0 = tmpl$h3d49f9f4fa0d9606();
+  _$spread(_0, { id: attrs.id }, false, false);
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

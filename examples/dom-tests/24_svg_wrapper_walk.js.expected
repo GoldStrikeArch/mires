@@ -1,0 +1,32 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h3d845ffef8e12f3e = _$template("<svg><g><!><text x=\"0\" y=\"0\">px</text></g></svg>", false, true, false);
+const tmpl$h42eead4b171e7aba = _$template("<svg><text x=\"0\" y=\"0\"></text></svg>", false, true, false);
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x24_svg_wrapper_walk$root_group$h6ec397c17d48010d("40");
+  x24_svg_wrapper_walk$root_text$haaf154ad0d0bd20b("41");
+}
+// root_group
+function x24_svg_wrapper_walk$root_group$h6ec397c17d48010d(label) {
+  let _0, $t0;
+  _0 = tmpl$h3d845ffef8e12f3e();
+  $t0 = _0.firstChild;
+  _$insert(_0, label, $t0);
+  return _0;
+}
+// root_text
+function x24_svg_wrapper_walk$root_text$haaf154ad0d0bd20b(label) {
+  let _0;
+  _0 = tmpl$h42eead4b171e7aba();
+  _$insert(_0, label);
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

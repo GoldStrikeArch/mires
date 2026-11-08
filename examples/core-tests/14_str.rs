@@ -22,8 +22,8 @@
 mod prelude;
 use prelude::*;
 
-/// Words counted over the byte view, which is the substitute for `split(' ')` on a haystack long
-/// enough to reach `memchr`'s word-at-a-time path (see the note at `split` below).
+/// Words counted over the byte view, exercising direct UTF-8 storage independently of the
+/// standard `split` iterator covered below.
 fn count_words(text: &str) -> usize {
     let bytes = text.as_bytes();
     let mut count = 0;
@@ -212,8 +212,8 @@ pub fn rust_entry() {
     }
     // `rfind` is out and does not say so at compile time: `memrchr` reads the haystack a `usize` at
     // a time through `align_to`, and a byte view of a buffer cannot be cast back to one of eight
-    // byte elements, so `__rt.unscale` throws at the moment it is reached. `find`'s forward
-    // `memchr` takes its short haystack path instead and never asks.
+    // byte elements, so `__rt.unscale` throws at the moment it is reached. Forward `memchr` is
+    // scalar in this backend's custom sysroot and therefore works at every haystack length.
 
     // ------------------------------------------------------------------------- find(&str)
     // The same `StrSearcher` `contains` runs, asked for the offset rather than for a yes or no.
@@ -250,11 +250,10 @@ pub fn rust_entry() {
     print_bool(ascii.find("zz").is_none());
 
     // -------------------------------------------------------------------------------- slicing
-    // `&s[a..b]`, the indexing form, whose failure path is `str::slice_error_fail`: it formats the
-    // offending `char` with `Debug`, which escapes it through a buffer of `AsciiChar` and casts
-    // that to a `str`. That cast is the one this section used to be unable to reach, so every
-    // slice here went through `get` instead. Both forms are exercised now, and `get` stays because
-    // the `None` cases below have no panicking spelling.
+    // `&s[a..b]`, the indexing form, whose failure path is `str::slice_error_fail`. The sysroot
+    // stub panics with a constant message instead of formatting the offending `char`. Successful
+    // slices still run the char-boundary checks. `get` stays because the `None` cases below have
+    // no panicking spelling.
     print_str(&ascii[1..3]);
     print_str(&ascii[..2]);
     print_str(&ascii[3..]);
@@ -291,10 +290,8 @@ pub fn rust_entry() {
     print_usize(count_words(""));
     print_usize(count_words("  spaced  out  "));
 
-    // `split(char)` itself works, and is subject to the same `memchr` boundary `find` is: the
-    // searcher reads the haystack a `usize` at a time once it is at least two `usize`s long, and
-    // that read goes through `align_to`, which `__rt.unscale` refuses. Below that — every string
-    // here — it walks bytes and answers.
+    // `split(char)` uses the same safe scalar forward `memchr` as `find(char)`. The long case pins
+    // that there is no native-memory-size threshold in the JavaScript sysroot.
     let mut first_word = "";
     for word in "a bc".split(' ') {
         first_word = word;
@@ -303,6 +300,7 @@ pub fn rust_entry() {
     print_str(first_word);
     print_usize("a b c".split(' ').count());
     print_str("a,b".split(',').nth(1).unwrap());
+    print_usize("one two three four".split(' ').count());
 
     print_str("  padded  ".trim());
     print_usize("  padded  ".trim().len());

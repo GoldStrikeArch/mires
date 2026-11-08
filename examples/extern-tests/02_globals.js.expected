@@ -1,4 +1,4 @@
-// rustc_codegen_mires — program
+// rustc_codegen_js — program
 // panic
 function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
   for (;;) {}
@@ -9,39 +9,60 @@ function core$option$impl_0_is_none$hda0d80922275f86e(self) {
 }
 // v_call_global
 function v_call_global(message) {
-  let _0;
-  _0 = dashLog(message);
+  let _0, $t0, $t1;
+  $t0 = message;
+  $t1 = dashLog($t0);
+  _0 = $t1;
 }
 // v_call_global_path
 function v_call_global_path(a, b) {
-  return Math.max(a, b);
+  let $t0, $t1, $t2;
+  $t0 = a;
+  $t1 = b;
+  $t2 = Math.max($t0, $t1);
+  return $t2;
 }
 // v_get_global
 function v_get_global() {
-  return dash.status;
+  let $t0;
+  $t0 = dash.status;
+  return $t0;
 }
 // v_index_global
 function v_index_global(index) {
-  return dash.ticks[index];
+  let $t0, $t1;
+  $t0 = index;
+  $t1 = dash.ticks[$t0];
+  return $t1;
 }
 // v_new_global
 function v_new_global(url) {
-  return new EventSource(url);
+  let $t0, $t1;
+  $t0 = url;
+  $t1 = new EventSource($t0);
+  return $t1;
 }
 // v_new_then_close
 function v_new_then_close(url) {
-  new EventSource(url).close();
+  let $t0, $t1, $t2, $t3;
+  $t0 = url;
+  $t1 = new EventSource($t0);
+  $t2 = $t1;
+  $t3 = $t2.close();
 }
 // v_nullable_global
 function v_nullable_global() {
-  let _2, $t0;
+  let _2, $t0, $t1;
   $t0 = dash.missing;
-  _2 = $t0 == null ? { TAG: "None" } : { TAG: "Some", _0: $t0 };
+  $t1 = $t0 == null ? { TAG: "None" } : { TAG: "Some", _0: $t0 };
+  _2 = $t1;
   return core$option$impl_0_is_none$hda0d80922275f86e(_2);
 }
 // v_set_global
 function v_set_global(value) {
-  let _0;
-  _0 = dash.status = value;
+  let _0, $t0, $t1;
+  $t0 = value;
+  $t1 = dash.status = $t0;
+  _0 = $t1;
 }
 export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, v_call_global, v_call_global_path, v_get_global, v_index_global, v_new_global, v_new_then_close, v_nullable_global, v_set_global };

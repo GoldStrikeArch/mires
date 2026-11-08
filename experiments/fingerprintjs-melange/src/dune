@@ -1,0 +1,7 @@
+(melange.emit
+ (target fp)
+ (alias default)
+ (module_systems es6)
+ (emit_stdlib false)
+ (preprocess
+  (pps melange.ppx)))

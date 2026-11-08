@@ -56,7 +56,7 @@ use crate::base::FnCx;
 use crate::jsast::{self, BinOp as JsBinOp, Expr, Stmt};
 use crate::naming::Namer;
 use crate::ptr;
-use crate::value::{self, IntRepr, int_info, int_repr, is_zst, mask, typing_env};
+use crate::value::{self, int_info, int_repr, is_zst, mask, typing_env, IntRepr};
 
 /// The hidden parameter a `#[track_caller]` function takes its caller's location in.
 ///
@@ -130,12 +130,12 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         // front rather than misread by a later group's suffix matching.
         if name.starts_with("simd_") {
             return Some(self.unsupported(format!(
-                "the SIMD intrinsic `{name}` is not supported by rustc_codegen_mires"
+                "the SIMD intrinsic `{name}` is not supported by rustc_codegen_js"
             )));
         }
         if name.ends_with("f16") || name.ends_with("f128") {
             return Some(self.unsupported(format!(
-                "`{name}` is not supported by rustc_codegen_mires: JavaScript has no `f16` or `f128`"
+                "`{name}` is not supported by rustc_codegen_js: JavaScript has no `f16` or `f128`"
             )));
         }
 
@@ -159,13 +159,20 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
                 let Ok(layout) = tcx.layout_of(typing_env().as_query_input(ty)) else {
                     return Some(self.unsupported(format!("`{ty}` has no layout")));
                 };
-                let bytes =
-                    if name == "size_of" { layout.size.bytes() } else { layout.align.bytes() };
+                let bytes = if name == "size_of" {
+                    layout.size.bytes()
+                } else {
+                    layout.align.bytes()
+                };
                 Outcome::Value(self.usize_literal(bytes))
             }
             "size_of_val" | "align_of_val" => self.size_of_val(name == "size_of_val"),
             "vtable_size" | "vtable_align" => {
-                let slot = if name == "vtable_size" { VTABLE_SIZE_SLOT } else { VTABLE_ALIGN_SLOT };
+                let slot = if name == "vtable_size" {
+                    VTABLE_SIZE_SLOT
+                } else {
+                    VTABLE_ALIGN_SLOT
+                };
                 Outcome::Value(jsast::index(self.arg(0), jsast::num(slot)))
             }
             "variant_count" => {
@@ -176,9 +183,9 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
                 };
                 Outcome::Value(self.usize_literal(count as u64))
             }
-            "needs_drop" => {
-                Outcome::Value(jsast::boolean(self.type_at(0).needs_drop(tcx, typing_env())))
-            }
+            "needs_drop" => Outcome::Value(jsast::boolean(
+                self.type_at(0).needs_drop(tcx, typing_env()),
+            )),
             // Returns a `&'static str`, which is a JavaScript string.
             "type_name" => {
                 let ty = self.type_at(0);
@@ -194,7 +201,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             }
             // Byte offsets do not exist in a model where a struct is a JavaScript object.
             "offset_of" | "field_offset" => self.unsupported(format!(
-                "`{name}` is not supported by rustc_codegen_mires: a struct is a JavaScript object, \
+                "`{name}` is not supported by rustc_codegen_js: a struct is a JavaScript object, \
                  which has no byte offsets"
             )),
             // Normally rewritten to `Rvalue::Discriminant` by `LowerIntrinsics`.
@@ -226,7 +233,11 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             let Ok(layout) = tcx.layout_of(typing_env().as_query_input(ty)) else {
                 return self.unsupported(format!("`{ty}` has no layout"));
             };
-            let bytes = if size { layout.size.bytes() } else { layout.align.bytes() };
+            let bytes = if size {
+                layout.size.bytes()
+            } else {
+                layout.align.bytes()
+            };
             return Outcome::Value(self.usize_literal(bytes));
         }
 
@@ -255,14 +266,21 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             }),
             // `{ ptr, meta }`, where `meta` is the vtable array.
             ty::Dynamic(..) => {
-                let slot = if size { VTABLE_SIZE_SLOT } else { VTABLE_ALIGN_SLOT };
-                Outcome::Value(jsast::index(jsast::member(self.arg(0), "meta"), jsast::num(slot)))
+                let slot = if size {
+                    VTABLE_SIZE_SLOT
+                } else {
+                    VTABLE_ALIGN_SLOT
+                };
+                Outcome::Value(jsast::index(
+                    jsast::member(self.arg(0), "meta"),
+                    jsast::num(slot),
+                ))
             }
             _ => match crate::value::unsized_tail(tcx, ty) {
                 Some(tail) => self.size_of_tail(ty, tail, size),
-                None => {
-                    self.unsupported(format!("the size of `{ty}` is not known to rustc_codegen_mires"))
-                }
+                None => self.unsupported(format!(
+                    "the size of `{ty}` is not known to rustc_codegen_js"
+                )),
             },
         }
     }
@@ -283,7 +301,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         }
         let ty::Slice(element) = tail.kind() else {
             return self.unsupported(format!(
-                "the size of a struct with a `{tail}` tail is not known to rustc_codegen_mires: only \
+                "the size of a struct with a `{tail}` tail is not known to rustc_codegen_js: only \
                  a slice tail has a run of elements to measure"
             ));
         };
@@ -310,19 +328,21 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         Some(match name {
             "abort" => Outcome::Done(vec![jsast::expr_stmt(jsast::rt_call(
                 "js_abort",
-                vec![jsast::string("rustc_codegen_mires: `abort` intrinsic")],
+                vec![jsast::string("rustc_codegen_js: `abort` intrinsic")],
             ))]),
             // Normally rewritten to `TerminatorKind::Unreachable` by `LowerIntrinsics`.
-            "unreachable" => {
-                Outcome::Done(vec![jsast::throw_error("rustc_codegen_mires: entered unreachable code")])
-            }
+            "unreachable" => Outcome::Done(vec![jsast::throw_abort(
+                "rustc_codegen_js: entered unreachable code",
+            )]),
             // A `debugger` statement would stop every run under attached devtools, which is not
             // what a stray `breakpoint()` inside a library should do.
             "breakpoint" => Outcome::Done(vec![jsast::comment("`breakpoint` intrinsic")]),
-            "cold_path" | "assume" | "prefetch_read_data" | "prefetch_write_data"
-            | "prefetch_read_instruction" | "prefetch_write_instruction" => {
-                Outcome::Done(Vec::new())
-            }
+            "cold_path"
+            | "assume"
+            | "prefetch_read_data"
+            | "prefetch_write_data"
+            | "prefetch_read_instruction"
+            | "prefetch_write_instruction" => Outcome::Done(Vec::new()),
             "likely" | "unlikely" | "black_box" | "rustc_peek" => Outcome::Value(self.arg(0)),
             "select_unpredictable" => {
                 Outcome::Value(jsast::cond(self.arg(0), self.arg(1), self.arg(2)))
@@ -342,7 +362,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             "const_eval_select" => self.const_eval_select(),
             "catch_unwind" => self.catch_unwind(),
             "return_address" => self.unsupported(
-                "`return_address` is not supported by rustc_codegen_mires: a JavaScript call stack \
+                "`return_address` is not supported by rustc_codegen_js: a JavaScript call stack \
                  has no addresses"
                     .to_string(),
             ),
@@ -426,7 +446,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
     fn catch_unwind(&self) -> Outcome {
         if self.fx.tcx.sess.panic_strategy() != PanicStrategy::Abort {
             return self.unsupported(
-                "`catch_unwind` is not supported by rustc_codegen_mires: unwinding does not exist in \
+                "`catch_unwind` is not supported by rustc_codegen_js: unwinding does not exist in \
                  the JavaScript lowering (build with `-Cpanic=abort`)"
                     .to_string(),
             );
@@ -491,16 +511,28 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         // ordinary `||`: the operands are promised to share no bit, and with one bit each that
         // means at most one of them is `true`. `Option`'s niche helpers reach it.
         if name == "disjoint_bitor" && matches!(operand_ty.kind(), ty::Bool) {
-            return Some(Outcome::Value(jsast::binary(JsBinOp::Or, self.arg(0), self.arg(1))));
+            return Some(Outcome::Value(jsast::binary(
+                JsBinOp::Or,
+                self.arg(0),
+                self.arg(1),
+            )));
         }
         let Some((signed, bits)) = int_info(self.fx.tcx, operand_ty) else {
             return Some(self.unsupported(format!(
-                "`{name}` on `{operand_ty}` is not supported by rustc_codegen_mires"
+                "`{name}` on `{operand_ty}` is not supported by rustc_codegen_js"
             )));
         };
-        let int = Int { repr: int_repr(operand_ty), signed, bits };
+        let int = Int {
+            repr: int_repr(operand_ty),
+            signed,
+            bits,
+        };
 
-        Some(if bit_op { self.bit_op(name, int) } else { self.arithmetic(name, int) })
+        Some(if bit_op {
+            self.bit_op(name, int)
+        } else {
+            self.arithmetic(name, int)
+        })
     }
 
     /// `wrapping_*`, `unchecked_*`, `saturating_*`, `*_with_overflow`, `rotate_*`.
@@ -538,7 +570,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
                 self.with_overflow(name, int)
             }
             "rotate_left" | "rotate_right" => self.rotate(name == "rotate_left", int),
-            _ => self.unsupported(format!("`{name}` is not supported by rustc_codegen_mires")),
+            _ => self.unsupported(format!("`{name}` is not supported by rustc_codegen_js")),
         }
     }
 
@@ -553,7 +585,11 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         Outcome::Value(jsast::cond(
             jsast::binary(JsBinOp::Gt, sum.clone(), max.clone()),
             max,
-            jsast::cond(jsast::binary(JsBinOp::Lt, sum.clone(), min.clone()), min, sum),
+            jsast::cond(
+                jsast::binary(JsBinOp::Lt, sum.clone(), min.clone()),
+                min,
+                sum,
+            ),
         ))
     }
 
@@ -582,8 +618,11 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
     fn rotate(&self, left: bool, int: Int) -> Outcome {
         let value = self.temp(int.zero_extend(self.arg(0)));
         // The rotate amount is a `u32` and the width is a power of two, so masking is the modulo.
-        let amount =
-            self.temp(jsast::binary(JsBinOp::BitAnd, self.arg(1), jsast::num((int.bits - 1) as f64)));
+        let amount = self.temp(jsast::binary(
+            JsBinOp::BitAnd,
+            self.arg(1),
+            jsast::num((int.bits - 1) as f64),
+        ));
         let amount = match int.repr {
             IntRepr::BigInt => jsast::to_bigint(amount),
             IntRepr::Number => amount,
@@ -639,7 +678,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             && !matches!(operand_ty.kind(), ty::Bool | ty::Char)
         {
             return self.unsupported(format!(
-                "`three_way_compare` on `{operand_ty}` is not supported by rustc_codegen_mires"
+                "`three_way_compare` on `{operand_ty}` is not supported by rustc_codegen_js"
             ));
         }
         Outcome::Value(jsast::cond(
@@ -713,7 +752,10 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
                     )),
                 ]);
                 // The four byte sums, summed into the top byte by one multiply.
-                Outcome::Value(ushr(jsast::imul(slot, jsast::num(0x0101_0101u32 as f64)), 24))
+                Outcome::Value(ushr(
+                    jsast::imul(slot, jsast::num(0x0101_0101u32 as f64)),
+                    24,
+                ))
             }
             "bswap" => match int.bits {
                 8 => Outcome::Value(self.arg(0)),
@@ -724,7 +766,10 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
                 _ => {
                     let value = self.temp(value);
                     Outcome::Value(truncate(or(
-                        or(ushr(value.clone(), 24), and(ushr(value.clone(), 8), 0x0000_ff00)),
+                        or(
+                            ushr(value.clone(), 24),
+                            and(ushr(value.clone(), 8), 0x0000_ff00),
+                        ),
                         or(and(shl(value.clone(), 8), 0x00ff_0000), shl(value, 24)),
                     )))
                 }
@@ -733,7 +778,10 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
                 let slot = self.temp(value);
                 let set = |expr: Expr| jsast::assign_stmt(slot.clone(), expr);
                 let swap = |width: u32, pattern: u32| {
-                    or(and(ushr(slot.clone(), width), pattern), shl(and(slot.clone(), pattern), width))
+                    or(
+                        and(ushr(slot.clone(), width), pattern),
+                        shl(and(slot.clone(), pattern), width),
+                    )
                 };
                 self.prelude.borrow_mut().extend([
                     set(swap(1, 0x5555_5555)),
@@ -750,7 +798,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
                     ushr(slot, 32 - int.bits)
                 }))
             }
-            _ => self.unsupported(format!("`{name}` is not supported by rustc_codegen_mires")),
+            _ => self.unsupported(format!("`{name}` is not supported by rustc_codegen_js")),
         }
     }
 
@@ -810,7 +858,10 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
                 let count = self.temp(jsast::num(0));
                 self.prelude.borrow_mut().push(jsast::if_else(
                     jsast::binary(JsBinOp::StrictEq, value.clone(), zero.clone()),
-                    vec![jsast::assign_stmt(count.clone(), jsast::num(int.bits as f64))],
+                    vec![jsast::assign_stmt(
+                        count.clone(),
+                        jsast::num(int.bits as f64),
+                    )],
                     vec![jsast::while_(
                         jsast::binary(
                             JsBinOp::StrictEq,
@@ -849,7 +900,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
                 ));
                 Outcome::Value(mask(int.repr, int.signed, int.bits, out))
             }
-            _ => self.unsupported(format!("`{name}` is not supported by rustc_codegen_mires")),
+            _ => self.unsupported(format!("`{name}` is not supported by rustc_codegen_js")),
         }
     }
 
@@ -876,7 +927,10 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             return Some(self.float_to_int());
         }
 
-        let base = name.strip_suffix("f32").or_else(|| name.strip_suffix("f64")).unwrap_or(name);
+        let base = name
+            .strip_suffix("f32")
+            .or_else(|| name.strip_suffix("f64"))
+            .unwrap_or(name);
         let math = |method: &str, arity: usize| {
             let args = (0..arity).map(|i| self.arg(i)).collect();
             jsast::call(jsast::member(jsast::id("Math"), method), args)
@@ -908,7 +962,8 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             // `minimumNumber`: the operand that is not NaN. Spelled the way `core`'s own fallback
             // body spells it, so the `-0`/`+0` tie breaks the same way.
             "minimum_number_nsz_" | "maximum_number_nsz_" => {
-                let (x, y) = (self.arg(0), self.arg(1));
+                let x = self.temp(self.arg(0));
+                let y = self.temp(self.arg(1));
                 let take_y = if base.starts_with("minimum") {
                     jsast::binary(JsBinOp::Le, y.clone(), x.clone())
                 } else {
@@ -920,8 +975,9 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             // Rust rounds a tie away from zero; `Math.round` rounds it toward positive infinity.
             "round" => {
                 let x = self.temp(self.arg(0));
-                let round =
-                    |value: Expr| jsast::call(jsast::member(jsast::id("Math"), "round"), vec![value]);
+                let round = |value: Expr| {
+                    jsast::call(jsast::member(jsast::id("Math"), "round"), vec![value])
+                };
                 jsast::cond(
                     jsast::binary(JsBinOp::Lt, x.clone(), jsast::num(0)),
                     jsast::neg(round(jsast::neg(x.clone()))),
@@ -930,7 +986,8 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             }
             "round_ties_even_" => return Some(self.round_ties_even()),
             "copysign" => {
-                let (x, y) = (self.arg(0), self.arg(1));
+                let x = self.temp(self.arg(0));
+                let y = self.temp(self.arg(1));
                 let magnitude = jsast::call(jsast::member(jsast::id("Math"), "abs"), vec![x]);
                 // `Object.is(y, -0)` is the only way to tell `-0` from `+0` in JavaScript.
                 let negative = jsast::binary(
@@ -975,7 +1032,11 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
                 | "minimum_number_nsz_"
                 | "maximum_number_nsz_"
         );
-        Some(Outcome::Value(if exact { value } else { self.round_to_f32(value) }))
+        Some(Outcome::Value(if exact {
+            value
+        } else {
+            self.round_to_f32(value)
+        }))
     }
 
     /// `float_to_int_unchecked`: the truncation toward zero, at the destination's width.
@@ -983,7 +1044,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         let to_ty = self.ret_ty();
         let Some((signed, bits)) = int_info(self.fx.tcx, to_ty) else {
             return self.unsupported(format!(
-                "`float_to_int_unchecked` to `{to_ty}` is not supported by rustc_codegen_mires"
+                "`float_to_int_unchecked` to `{to_ty}` is not supported by rustc_codegen_js"
             ));
         };
         let truncated = jsast::call(jsast::member(jsast::id("Math"), "trunc"), vec![self.arg(0)]);
@@ -998,8 +1059,10 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
     /// `round_ties_even`, the rounding a hardware `rint` does in the default mode.
     fn round_ties_even(&self) -> Outcome {
         let x = self.temp(self.arg(0));
-        let floor =
-            self.temp(jsast::call(jsast::member(jsast::id("Math"), "floor"), vec![x.clone()]));
+        let floor = self.temp(jsast::call(
+            jsast::member(jsast::id("Math"), "floor"),
+            vec![x.clone()],
+        ));
         let fraction = jsast::binary(JsBinOp::Sub, x, floor.clone());
         let up = jsast::binary(JsBinOp::Add, floor.clone(), jsast::num(1));
         // A tie goes to whichever neighbour is even. `f % 2` is zero exactly when `f` is even, and
@@ -1017,7 +1080,11 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         let value = jsast::cond(
             jsast::binary(JsBinOp::Lt, fraction.clone(), jsast::num(0.5)),
             floor,
-            jsast::cond(jsast::binary(JsBinOp::Gt, fraction, jsast::num(0.5)), up, tie),
+            jsast::cond(
+                jsast::binary(JsBinOp::Gt, fraction, jsast::num(0.5)),
+                up,
+                tie,
+            ),
         );
         Outcome::Value(self.round_to_f32(value))
     }
@@ -1040,10 +1107,15 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             "read_via_copy" | "volatile_load" | "unaligned_volatile_load" => {
                 Outcome::Value(self.read_via_copy())
             }
-            "write_via_move" | "volatile_store" | "unaligned_volatile_store"
-            | "nontemporal_store" => {
-                Outcome::Done(ptr::deref_write(self.fx, self.type_at(0), self.arg(0), self.arg(1)))
-            }
+            "write_via_move"
+            | "volatile_store"
+            | "unaligned_volatile_store"
+            | "nontemporal_store" => Outcome::Done(ptr::deref_write(
+                self.fx,
+                self.type_at(0),
+                self.arg(0),
+                self.arg(1),
+            )),
             "typed_swap_nonoverlapping" => self.typed_swap(),
             "aggregate_raw_ptr" => self.aggregate_raw_ptr(),
             "slice_get_unchecked" => self.slice_get_unchecked(),
@@ -1097,7 +1169,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             // The one pointer operation with no answer here: a mask over an address says something
             // about the bits of a pointer, and a slot has no bits.
             "ptr_mask" => self.unsupported(
-                "`ptr_mask` is not supported by rustc_codegen_mires: masking the bits of a pointer \
+                "`ptr_mask` is not supported by rustc_codegen_js: masking the bits of a pointer \
                  has no meaning in a model where a pointer is a buffer and a key rather than an \
                  address"
                     .to_string(),
@@ -1147,8 +1219,12 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             read
         };
         let saved = self.temp(copy);
-        let mut statements =
-            ptr::deref_write(self.fx, pointee, x, ptr::deref_read(self.fx, pointee, y.clone()));
+        let mut statements = ptr::deref_write(
+            self.fx,
+            pointee,
+            x,
+            ptr::deref_read(self.fx, pointee, y.clone()),
+        );
         statements.extend(ptr::deref_write(self.fx, pointee, y, saved));
         Outcome::Done(statements)
     }
@@ -1166,7 +1242,14 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         // The destination is evaluated first, which is the order the helper takes them in. Both
         // are operand reads of a pointer, so the swap is not observable.
         let (dst, src) = (self.arg(target), self.arg(source));
-        Outcome::Done(ptr::copy(self.fx, pointee, dst, src, self.arg(2), overlapping))
+        Outcome::Done(ptr::copy(
+            self.fx,
+            pointee,
+            dst,
+            src,
+            self.arg(2),
+            overlapping,
+        ))
     }
 
     /// `raw_eq(a, b)`: whether the two pointees have the same bytes.
@@ -1210,7 +1293,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         }
         if !compares_by_value(pointee) {
             return self.unsupported(format!(
-                "`raw_eq` on `{pointee}` is not supported by rustc_codegen_mires: the bytes of a \
+                "`raw_eq` on `{pointee}` is not supported by rustc_codegen_js: the bytes of a \
                  value are not observable in a model where a value is a JavaScript object"
             ));
         }
@@ -1245,7 +1328,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         };
         let ty::Slice(element_ty) = pointee.kind() else {
             return self.unsupported(format!(
-                "`slice_get_unchecked` on `{pointee}` is not supported by rustc_codegen_mires"
+                "`slice_get_unchecked` on `{pointee}` is not supported by rustc_codegen_js"
             ));
         };
         // `{ buf, off, len }`: the element lives at `buf[off + i]`, so the pointer to it is the
@@ -1279,10 +1362,10 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
     fn atomic(&self, name: &str) -> Option<Outcome> {
         let mut name = name.strip_prefix("atomic_")?;
         // `atomic_cxchg_seqcst_seqcst` carries two orderings, so strip until nothing is left.
-        while let Some(stripped) = ORDERINGS
-            .iter()
-            .find_map(|ordering| name.strip_suffix(ordering).and_then(|s| s.strip_suffix('_')))
-        {
+        while let Some(stripped) = ORDERINGS.iter().find_map(|ordering| {
+            name.strip_suffix(ordering)
+                .and_then(|s| s.strip_suffix('_'))
+        }) {
             name = stripped;
         }
 
@@ -1323,33 +1406,33 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
             }
             // Returns `(old, succeeded)`, which is a two element JS array.
             _ => {
-                if !compares_by_value(pointee) {
+                let old = self.temp(read());
+                let matched = if pointee.is_raw_ptr() {
+                    ptr::eq(self.fx, pointee, old.clone(), self.arg(1))
+                } else if compares_by_value(pointee) {
+                    jsast::binary(JsBinOp::StrictEq, old.clone(), self.arg(1))
+                } else {
                     return Some(self.unsupported(format!(
                         "an atomic compare and exchange on `{pointee}` is not supported by \
-                         rustc_codegen_mires: values of that type have no `===` equality"
+                         rustc_codegen_js: values of that type have no atomic equality"
                     )));
-                }
-                let old = self.temp(read());
-                let matched =
-                    self.temp(jsast::binary(JsBinOp::StrictEq, old.clone(), self.arg(1)));
-                self.prelude.borrow_mut().push(jsast::if_(matched.clone(), write(self.arg(2))));
+                };
+                let matched = self.temp(matched);
+                self.prelude
+                    .borrow_mut()
+                    .push(jsast::if_(matched.clone(), write(self.arg(2))));
                 Outcome::Value(jsast::array(vec![old, matched]))
             }
         })
     }
 
     /// The new value a read-modify-write atomic stores, given the old one.
-    fn atomic_update(
-        &self,
-        name: &str,
-        pointee: Ty<'tcx>,
-        old: Expr,
-    ) -> Result<Expr, Outcome> {
+    fn atomic_update(&self, name: &str, pointee: Ty<'tcx>, old: Expr) -> Result<Expr, Outcome> {
         let operand = self.arg(1);
         if matches!(name, "max" | "min" | "umax" | "umin") {
             if !compares_by_value(pointee) {
                 return Err(self.unsupported(format!(
-                    "an atomic `{name}` on `{pointee}` is not supported by rustc_codegen_mires"
+                    "an atomic `{name}` on `{pointee}` is not supported by rustc_codegen_js"
                 )));
             }
             // An unsigned value is already non-negative in both representations — a number is
@@ -1365,7 +1448,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
 
         let Some((signed, bits)) = int_info(self.fx.tcx, pointee) else {
             return Err(self.unsupported(format!(
-                "an atomic `{name}` on `{pointee}` is not supported by rustc_codegen_mires"
+                "an atomic `{name}` on `{pointee}` is not supported by rustc_codegen_js"
             )));
         };
         let repr = int_repr(pointee);
@@ -1430,7 +1513,11 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
 
     /// The type the result is written at.
     fn ret_ty(&self) -> Ty<'tcx> {
-        self.fx.monomorphize(self.destination.ty(&self.fx.mir.local_decls, self.fx.tcx).ty)
+        self.fx.monomorphize(
+            self.destination
+                .ty(&self.fx.mir.local_decls, self.fx.tcx)
+                .ty,
+        )
     }
 
     /// A `usize` literal, in whichever representation `usize` has on this target.
@@ -1464,7 +1551,10 @@ struct Int {
 impl Int {
     /// The same width, read as unsigned.
     fn unsigned(self) -> Int {
-        Int { signed: false, ..self }
+        Int {
+            signed: false,
+            ..self
+        }
     }
 
     /// A literal in this representation.
@@ -1570,7 +1660,11 @@ pub(crate) fn caller_location_argument<'tcx>(fx: &FnCx<'_, 'tcx>, span: Span) ->
 /// writes them by index, so the order is a guarantee rather than a guess.
 pub(crate) fn caller_location_value<'tcx>(fx: &FnCx<'_, 'tcx>, span: Span) -> Expr {
     let tcx = fx.tcx;
-    if tcx.lang_items().get(rustc_hir::LangItem::PanicLocation).is_none() {
+    if tcx
+        .lang_items()
+        .get(rustc_hir::LangItem::PanicLocation)
+        .is_none()
+    {
         return fx.zombie(
             "a caller location is needed, but this crate defines no `panic_location` lang item"
                 .to_string(),
@@ -1578,14 +1672,20 @@ pub(crate) fn caller_location_value<'tcx>(fx: &FnCx<'_, 'tcx>, span: Span) -> Ex
     }
     let pointer_ty = tcx.caller_location_ty();
     let Some(location_ty) = pointer_ty.builtin_deref(true) else {
-        return fx.zombie(format!("the caller location type `{pointer_ty}` is not a reference"));
+        return fx.zombie(format!(
+            "the caller location type `{pointer_ty}` is not a reference"
+        ));
     };
     let ty::Adt(def, args) = location_ty.kind() else {
-        return fx.zombie(format!("the caller location type `{location_ty}` is not a struct"));
+        return fx.zombie(format!(
+            "the caller location type `{location_ty}` is not a struct"
+        ));
     };
     let variant = def.non_enum_variant();
     if variant.fields.len() < 3 {
-        return fx.zombie(format!("the caller location type `{location_ty}` has no file field"));
+        return fx.zombie(format!(
+            "the caller location type `{location_ty}` has no file field"
+        ));
     }
 
     // The file name field is a *pointer to* `str`, but not always a plain `&'static str`: real
@@ -1602,14 +1702,18 @@ pub(crate) fn caller_location_value<'tcx>(fx: &FnCx<'_, 'tcx>, span: Span) -> Ex
     if !points_at_str {
         return fx.zombie(format!(
             "the caller location type `{location_ty}` stores its file name as `{file_ty}`, which \
-             is not supported by rustc_codegen_mires"
+             is not supported by rustc_codegen_js"
         ));
     }
 
     // The outermost macro expansion, which is the location a user recognises.
     let topmost = span.ctxt().outer_expn().expansion_cause().unwrap_or(span);
     let caller = tcx.sess.source_map().lookup_char_pos(topmost.lo());
-    let file = caller.file.name.prefer_remapped_unconditionally().to_string();
+    let file = caller
+        .file
+        .name
+        .prefer_remapped_unconditionally()
+        .to_string();
     let line = caller.line as u32;
     let column = caller.col_display as u32 + 1;
 
@@ -1629,9 +1733,18 @@ pub(crate) fn caller_location_value<'tcx>(fx: &FnCx<'_, 'tcx>, span: Span) -> Ex
         format!("caller location {file}:{line}:{column}"),
         || {
             jsast::object(vec![
-                (Namer::field_name(variant, FieldIdx::ZERO), wrap_file(jsast::string(file.clone()))),
-                (Namer::field_name(variant, FieldIdx::from_u32(1)), jsast::num(line as f64)),
-                (Namer::field_name(variant, FieldIdx::from_u32(2)), jsast::num(column as f64)),
+                (
+                    Namer::field_name(variant, FieldIdx::ZERO),
+                    wrap_file(jsast::string(file.clone())),
+                ),
+                (
+                    Namer::field_name(variant, FieldIdx::from_u32(1)),
+                    jsast::num(line as f64),
+                ),
+                (
+                    Namer::field_name(variant, FieldIdx::from_u32(2)),
+                    jsast::num(column as f64),
+                ),
             ])
         },
     )
@@ -1679,7 +1792,14 @@ pub(crate) fn codegen_transmute<'tcx>(
     // over `u32` needs no case of its own.
     let (inner_from, inner_value) = unwrap_wrappers(fx, from_ty, value);
     let (inner_to, rebuild) = target_wrappers(fx, to_ty);
-    rebuild(transmute_scalar(fx, inner_from, inner_to, inner_value, from_ty, to_ty))
+    rebuild(transmute_scalar(
+        fx,
+        inner_from,
+        inner_to,
+        inner_value,
+        from_ty,
+        to_ty,
+    ))
 }
 
 /// The scalar half of a transmute, once both sides have had their wrappers removed. `from_ty` and
@@ -1726,9 +1846,12 @@ fn transmute_scalar<'tcx>(
         (ReprClass::Int(from), ReprClass::Int(to)) if from.bits == to.bits => {
             mask(to.repr, to.signed, to.bits, value)
         }
-        (ReprClass::Bool, ReprClass::Int(to)) => {
-            mask(to.repr, to.signed, to.bits, jsast::cond(value, jsast::num(1), jsast::num(0)))
-        }
+        (ReprClass::Bool, ReprClass::Int(to)) => mask(
+            to.repr,
+            to.signed,
+            to.bits,
+            jsast::cond(value, jsast::num(1), jsast::num(0)),
+        ),
         (ReprClass::Int(_), ReprClass::Bool) => {
             jsast::binary(JsBinOp::StrictNe, value, jsast::num(0))
         }
@@ -1825,7 +1948,7 @@ fn transmute_scalar<'tcx>(
         _ => match niche_from_scalar(fx, inner_from, inner_to, value) {
             Some(decoded) => decoded,
             None => fx.zombie(format!(
-                "`transmute` from `{from_ty}` to `{to_ty}` is not supported by rustc_codegen_mires"
+                "`transmute` from `{from_ty}` to `{to_ty}` is not supported by rustc_codegen_js"
             )),
         },
     }
@@ -1839,7 +1962,9 @@ const BYTES_PARAM: &str = "$b";
 /// A transparent union element counts: `[MaybeUninit<u8>; N]` holds the same JavaScript numbers
 /// `[u8; N]` does (`value.rs`).
 fn byte_array_len<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<u64> {
-    let ty::Array(element, count) = value::peel_pattern(ty).kind() else { return None };
+    let ty::Array(element, count) = value::peel_pattern(ty).kind() else {
+        return None;
+    };
     let element = value::peel_pattern(value::peel_transparent(tcx, *element));
     matches!(element.kind(), ty::Uint(ty::UintTy::U8)).then(|| count.try_to_target_usize(tcx))?
 }
@@ -1859,16 +1984,29 @@ fn bytes_to_int(int: Int, value: Expr) -> Expr {
     let big = int.repr == crate::value::IntRepr::BigInt;
     let byte = |index: u32| {
         let read = jsast::index(bytes.clone(), jsast::num(index));
-        if big { jsast::call(jsast::id("BigInt"), vec![read]) } else { read }
+        if big {
+            jsast::call(jsast::id("BigInt"), vec![read])
+        } else {
+            read
+        }
     };
-    let shift = |amount: u32| if big { jsast::bigint(amount) } else { jsast::num(amount) };
+    let shift = |amount: u32| {
+        if big {
+            jsast::bigint(amount)
+        } else {
+            jsast::num(amount)
+        }
+    };
     let mut combined = byte(0);
     for index in 1..int.bits / 8 {
         let shifted = jsast::binary(JsBinOp::Shl, byte(index), shift(index * 8));
         combined = jsast::binary(JsBinOp::BitOr, combined, shifted);
     }
     let combined = mask(int.repr, int.signed, int.bits, combined);
-    jsast::call(jsast::arrow(vec![BYTES_PARAM.to_string()], combined), vec![value])
+    jsast::call(
+        jsast::arrow(vec![BYTES_PARAM.to_string()], combined),
+        vec![value],
+    )
 }
 
 /// The other direction: the `N` bytes of an integer, least significant first.
@@ -1892,12 +2030,23 @@ fn int_to_bytes(int: Int, value: Expr) -> Expr {
             } else {
                 jsast::binary(JsBinOp::UShr, bound.clone(), jsast::num(index * 8))
             };
-            let mask = if big { jsast::bigint(255u32) } else { jsast::num(255) };
+            let mask = if big {
+                jsast::bigint(255u32)
+            } else {
+                jsast::num(255)
+            };
             let byte = jsast::binary(JsBinOp::BitAnd, shifted, mask);
-            if big { jsast::call(jsast::id("Number"), vec![byte]) } else { byte }
+            if big {
+                jsast::call(jsast::id("Number"), vec![byte])
+            } else {
+                byte
+            }
         })
         .collect();
-    jsast::call(jsast::arrow(vec![BYTES_PARAM.to_string()], jsast::array(bytes)), vec![value])
+    jsast::call(
+        jsast::arrow(vec![BYTES_PARAM.to_string()], jsast::array(bytes)),
+        vec![value],
+    )
 }
 
 /// The parameter the niche decode binds the incoming scalar to.
@@ -1932,16 +2081,27 @@ fn niche_from_scalar<'tcx>(
 
     let tcx = fx.tcx;
     let (signed, bits) = int_info(tcx, from_ty)?;
-    let int = Int { repr: int_repr(from_ty), signed, bits };
+    let int = Int {
+        repr: int_repr(from_ty),
+        signed,
+        bits,
+    };
 
-    let ty::Adt(def, args) = to_ty.kind() else { return None };
+    let ty::Adt(def, args) = to_ty.kind() else {
+        return None;
+    };
     if !def.is_enum() {
         return None;
     }
     let layout = tcx.layout_of(typing_env().as_query_input(to_ty)).ok()?;
     let Variants::Multiple {
         tag,
-        tag_encoding: TagEncoding::Niche { untagged_variant, niche_variants, niche_start },
+        tag_encoding:
+            TagEncoding::Niche {
+                untagged_variant,
+                niche_variants,
+                niche_start,
+            },
         ..
     } = &layout.variants
     else {
@@ -1960,8 +2120,10 @@ fn niche_from_scalar<'tcx>(
     }
 
     let payload = def.variant(*untagged_variant);
-    let mut fields =
-        payload.fields.iter_enumerated().filter(|(_, field)| live(field.ty(tcx, args)));
+    let mut fields = payload
+        .fields
+        .iter_enumerated()
+        .filter(|(_, field)| live(field.ty(tcx, args)));
     let (field_index, field) = fields.next()?;
     if fields.next().is_some() {
         return None;
@@ -1983,9 +2145,15 @@ fn niche_from_scalar<'tcx>(
             codegen_transmute(fx, from_ty, field_ty, bound.clone()),
         )],
     )?;
-    let decoded =
-        jsast::cond(jsast::binary(JsBinOp::StrictEq, bound, niche), empty_value, filled);
-    Some(jsast::call(jsast::arrow(vec![NICHE_PARAM.to_string()], decoded), vec![value]))
+    let decoded = jsast::cond(
+        jsast::binary(JsBinOp::StrictEq, bound, niche),
+        empty_value,
+        filled,
+    );
+    Some(jsast::call(
+        jsast::arrow(vec![NICHE_PARAM.to_string()], decoded),
+        vec![value],
+    ))
 }
 
 /// How a value is represented, at the granularity a transmute cares about.
@@ -2016,7 +2184,11 @@ impl ReprClass {
             ty::Float(ty::FloatTy::F32) => ReprClass::Float(32),
             ty::Float(ty::FloatTy::F64) => ReprClass::Float(64),
             ty::Int(_) | ty::Uint(_) => match int_info(tcx, ty) {
-                Some((signed, bits)) => ReprClass::Int(Int { repr: int_repr(ty), signed, bits }),
+                Some((signed, bits)) => ReprClass::Int(Int {
+                    repr: int_repr(ty),
+                    signed,
+                    bits,
+                }),
                 None => ReprClass::Other,
             },
             ty::FnPtr(..) => ReprClass::Pointer(true),
@@ -2031,7 +2203,11 @@ impl ReprClass {
 
 /// The typed array constructor holding a float of this width.
 fn float_array(bits: u32) -> &'static str {
-    if bits == 32 { "Float32Array" } else { "Float64Array" }
+    if bits == 32 {
+        "Float32Array"
+    } else {
+        "Float64Array"
+    }
 }
 
 /// The typed array constructor holding an integer of this width and signedness.
@@ -2065,7 +2241,9 @@ fn unwrap_wrappers<'tcx>(
     // A wrapper chain is as deep as the type nests, which is finite; the bound is belt and braces
     // against a shape this loop has not been taught about.
     for _ in 0..16 {
-        let Some((inner_ty, key)) = sole_field(fx, ty) else { break };
+        let Some((inner_ty, key)) = sole_field(fx, ty) else {
+            break;
+        };
         value = value::field_expr(value, key);
         ty = inner_ty;
     }
@@ -2080,7 +2258,9 @@ fn target_wrappers<'tcx>(
 ) -> (Ty<'tcx>, impl Fn(Expr) -> Expr) {
     let mut wrappers = Vec::new();
     for _ in 0..16 {
-        let Some((inner_ty, key)) = sole_field(fx, ty) else { break };
+        let Some((inner_ty, key)) = sole_field(fx, ty) else {
+            break;
+        };
         wrappers.push(key);
         ty = inner_ty;
     }
@@ -2124,18 +2304,26 @@ pub(crate) fn sole_field<'tcx>(
         ty::Adt(def, args) if def.is_struct() || def.is_union() => {
             let variant = def.non_enum_variant();
             let mut live = variant.fields.iter_enumerated().filter(|(_, field)| {
-                !is_zst(tcx, tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args)))
+                !is_zst(
+                    tcx,
+                    tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args)),
+                )
             });
             let (index, field) = live.next()?;
             if live.next().is_some() {
                 return None;
             }
             let field_ty = tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args));
-            Some((field_ty, value::FieldKey::Name(Namer::field_name(variant, index))))
+            Some((
+                field_ty,
+                value::FieldKey::Name(Namer::field_name(variant, index)),
+            ))
         }
         ty::Tuple(element_tys) => {
-            let mut live =
-                element_tys.iter().enumerate().filter(|(_, element)| !is_zst(tcx, *element));
+            let mut live = element_tys
+                .iter()
+                .enumerate()
+                .filter(|(_, element)| !is_zst(tcx, *element));
             let (index, element_ty) = live.next()?;
             if live.next().is_some() {
                 return None;
@@ -2143,7 +2331,7 @@ pub(crate) fn sole_field<'tcx>(
             Some((element_ty, value::FieldKey::Index(index)))
         }
         ty::Array(element_ty, count) => (count.try_to_target_usize(tcx) == Some(1))
-            .then(|| (*element_ty, value::FieldKey::Index(0))),
+            .then_some((*element_ty, value::FieldKey::Index(0))),
         _ => None,
     }
 }

@@ -16,7 +16,10 @@ pub(crate) enum DTree {
     /// `then_` takes the values the test accepts, `else_` the rest.
     If(Test, Box<DTree>, Box<DTree>),
     /// A jump table. `default` takes every value no arm lists.
-    Switch { arms: Vec<(Vec<u128>, BlockId)>, default: BlockId },
+    Switch {
+        arms: Vec<(Vec<u128>, BlockId)>,
+        default: BlockId,
+    },
 }
 
 impl DTree {
@@ -101,11 +104,7 @@ impl Group {
 ///
 /// `cases` may be in any order and may repeat a value; the first target listed
 /// for a value wins.
-pub(crate) fn build_switch(
-    cases: &[(u128, BlockId)],
-    default: BlockId,
-    opts: &Options,
-) -> DTree {
+pub(crate) fn build_switch(cases: &[(u128, BlockId)], default: BlockId, opts: &Options) -> DTree {
     let mut sorted: Vec<(u128, BlockId)> = cases.to_vec();
     sorted.sort_by_key(|(v, _)| *v);
     sorted.dedup_by_key(|(v, _)| *v);
@@ -115,7 +114,11 @@ pub(crate) fn build_switch(
     for (v, t) in sorted {
         match runs.last_mut() {
             Some(r) if r.target == t && r.hi + 1 == v => r.hi = v,
-            _ => runs.push(Run { lo: v, hi: v, target: t }),
+            _ => runs.push(Run {
+                lo: v,
+                hi: v,
+                target: t,
+            }),
         }
     }
     if runs.is_empty() {
@@ -195,7 +198,10 @@ fn build(
         + 1;
     if nbcases <= opts.switch_max_case as u128 || runs.len() < 2 {
         return DTree::Switch {
-            arms: groups[..last].iter().map(|g| (g.values(), g.target)).collect(),
+            arms: groups[..last]
+                .iter()
+                .map(|g| (g.values(), g.target))
+                .collect(),
             default: groups[last].target,
         };
     }
@@ -232,7 +238,11 @@ fn normalize(runs: &[Run], default: BlockId, lo: Option<u128>, hi: Option<u128>)
     if !interval_covered(listed, lo, hi) {
         match groups.iter_mut().find(|g| g.target == default) {
             Some(g) => g.count = None,
-            None => groups.push(Group { ranges: Vec::new(), target: default, count: None }),
+            None => groups.push(Group {
+                ranges: Vec::new(),
+                target: default,
+                count: None,
+            }),
         }
     }
     groups.sort_by(|a, b| match (a.count, b.count) {
@@ -255,7 +265,8 @@ fn covers(groups: &[Group], lo: Option<u128>, hi: Option<u128>) -> bool {
 
 fn interval_covered(listed: u128, lo: Option<u128>, hi: Option<u128>) -> bool {
     match (lo, hi) {
-        (Some(lo), Some(hi)) if hi >= lo => match hi.checked_sub(lo).and_then(|d| d.checked_add(1)) {
+        (Some(lo), Some(hi)) if hi >= lo => match hi.checked_sub(lo).and_then(|d| d.checked_add(1))
+        {
             Some(width) => listed >= width,
             None => false,
         },
@@ -276,6 +287,9 @@ fn single_test(g: &Group) -> Option<Test> {
     if lo == hi {
         Some(Test::Eq(lo))
     } else {
-        Some(Test::InRange { lo, len: hi - lo + 1 })
+        Some(Test::InRange {
+            lo,
+            len: hi - lo + 1,
+        })
     }
 }

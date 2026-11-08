@@ -56,97 +56,15 @@
 // each operation.
 #![allow(dead_code)]
 
-
+use rustc_abi::Size;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 
 use crate::base::FnCx;
 use crate::jsast::{self, BinOp as JsBinOp, Expr, Stmt};
+use crate::naming::Namer;
 use crate::value::{is_indirect, is_zst, peel_pattern, peel_transparent, typing_env};
 
-/// The buffer half of a slot.
-pub(crate) const BUF: &str = "buf";
-/// The offset half of a slot, counted in units of the pointee type.
-pub(crate) const OFF: &str = "off";
-/// The element size a scaled slot's byte offset is measured against.
-pub(crate) const SCALE: &str = "sc";
-/// The element count a window slot spans.
-pub(crate) const WINDOW: &str = "w";
-/// The length of a fat slice pointer.
-pub(crate) const LEN: &str = "len";
-/// The data half of a fat trait object pointer.
-pub(crate) const PTR: &str = "ptr";
-/// The vtable half of a fat trait object pointer.
-pub(crate) const META: &str = "meta";
-
-// ---------------------------------------------------------------------------------------------
-// Building and taking apart the records
-// ---------------------------------------------------------------------------------------------
-
-/// `{ buf, off }`: a pointer to `buf[off]`.
-pub(crate) fn slot(buf: Expr, off: Expr) -> Expr {
-    jsast::object_of(vec![(BUF, buf), (OFF, off)])
-}
-
-/// `{ buf, off, sc }`: a byte offset view of a buffer whose elements are `scale` bytes wide.
-///
-/// This is what `p as *const u8` produces for a pointee larger than a byte. `off` is a *byte*
-/// offset, so the element it names is `buf[off / sc]` and only an offset that is a multiple of
-/// `sc` names one at all. A scaled slot is not dereferenceable: it is meant to be offset and then
-/// cast back, which is what the `__rt.unscale` helper does.
-pub(crate) fn scaled_slot(buf: Expr, off: Expr, scale: u64) -> Expr {
-    jsast::object_of(vec![(BUF, buf), (OFF, off), (SCALE, jsast::num(scale as f64))])
-}
-
-/// `{ buf, off, w }`: a pointer to the `width` elements starting at `buf[off]`.
-///
-/// This is what `p as *const [E; N]` produces. The window is how a pointer to an array of
-/// elements stays inside the buffer those elements live in, rather than copying them out.
-pub(crate) fn window_slot(buf: Expr, off: Expr, width: u64) -> Expr {
-    jsast::object_of(vec![(BUF, buf), (OFF, off), (WINDOW, jsast::num(width as f64))])
-}
-
-/// `{ buf, off, len }`: a fat pointer to `len` elements starting at `buf[off]`.
-pub(crate) fn fat_slice(buf: Expr, off: Expr, len: Expr) -> Expr {
-    jsast::object_of(vec![(BUF, buf), (OFF, off), (LEN, len)])
-}
-
-/// `{ ptr, meta }`: a fat pointer to a trait object.
-pub(crate) fn fat_dyn(data: Expr, meta: Expr) -> Expr {
-    jsast::object_of(vec![(PTR, data), (META, meta)])
-}
-
-/// `p.buf`.
-pub(crate) fn slot_buf(pointer: Expr) -> Expr {
-    jsast::member(pointer, BUF)
-}
-
-/// `p.off`.
-pub(crate) fn slot_off(pointer: Expr) -> Expr {
-    jsast::member(pointer, OFF)
-}
-
-/// `p.sc`, the element size a scaled slot's offset is measured against.
-pub(crate) fn slot_scale(pointer: Expr) -> Expr {
-    jsast::member(pointer, SCALE)
-}
-
-/// `p.w`, the element count a window slot spans.
-pub(crate) fn slot_window(pointer: Expr) -> Expr {
-    jsast::member(pointer, WINDOW)
-}
-
-/// `p.len`, the length of a fat slice pointer.
-pub(crate) fn slot_len(pointer: Expr) -> Expr {
-    jsast::member(pointer, LEN)
-}
-
-/// `p.buf[p.off]`: the place a slot points at, as an assignable JavaScript expression.
-///
-/// `pointer` is evaluated twice, so a caller holding anything but a local or a field hoists it
-/// into a temporary first ([`FnCx::temp`]).
-pub(crate) fn slot_element(pointer: Expr) -> Expr {
-    jsast::index(slot_buf(pointer.clone()), slot_off(pointer))
-}
+pub(crate) use rcgjs_object::ptr::*;
 
 // ---------------------------------------------------------------------------------------------
 // Reading and writing through a pointer
@@ -177,7 +95,11 @@ pub(crate) fn deref_read<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, pointer: 
             return jsast::rt_call("read_array", vec![pointer, jsast::num(width as f64)]);
         }
     }
-    if is_slot_pointee(fx.tcx, pointee) { slot_element(pointer) } else { pointer }
+    if is_slot_pointee(fx.tcx, pointee) {
+        slot_element(pointer)
+    } else {
+        pointer
+    }
 }
 
 /// The statements that store `value` through `pointer`, a **raw** pointer to `pointee`.
@@ -187,8 +109,8 @@ pub(crate) fn deref_read<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, pointer: 
 /// 1. a zero sized pointee stores nothing, but `value` may still be a call worth making;
 /// 2. `&mut str` has no mutable JavaScript form, so a write through one is a zombie;
 /// 3. an aggregate pointee is overwritten in place by `__rt.overwrite` *at the slot it names*, so
-///    that every alias of the aggregate sees the new contents; assigning the slot would rebind
-///    only the one container the pointer came from;
+///    that every alias of the aggregate sees the new contents; assigning the slot would rebind only
+///    the one container the pointer came from;
 /// 4. anything else is an assignment to [`slot_element`].
 pub(crate) fn deref_write<'tcx>(
     fx: &FnCx<'_, 'tcx>,
@@ -205,8 +127,14 @@ pub(crate) fn deref_write<'tcx>(
         return write_indirect(fx, pointee, pointer, value);
     }
     // The write half of the array question above.
-    if matches!(peel_pattern(peel_transparent(fx.tcx, pointee)).kind(), ty::Array(..)) {
-        return vec![jsast::expr_stmt(jsast::rt_call("write_array", vec![pointer, value]))];
+    if matches!(
+        peel_pattern(peel_transparent(fx.tcx, pointee)).kind(),
+        ty::Array(..)
+    ) {
+        return vec![jsast::expr_stmt(jsast::rt_call(
+            "write_array",
+            vec![pointer, value],
+        ))];
     }
     let element = slot_element(pointer);
     if is_indirect(fx.tcx, pointee) {
@@ -231,9 +159,9 @@ pub(crate) fn write_indirect<'tcx>(
     }
     // A `&str` is a JavaScript string, which has no mutable form to write through.
     if matches!(peel_pattern(pointee).kind(), ty::Str) {
-        return vec![jsast::expr_stmt(
-            fx.zombie("mutating a `&mut str` is not supported by rustc_codegen_mires".to_string()),
-        )];
+        return vec![jsast::expr_stmt(fx.zombie(
+            "mutating a `&mut str` is not supported by rustc_codegen_js".to_string(),
+        ))];
     }
     // Overwrite the aggregate in place so every alias sees the new contents. Not
     // `Object.assign`: writing a smaller enum variant over a larger one has to drop the keys
@@ -246,9 +174,7 @@ pub(crate) fn write_indirect<'tcx>(
     // wherever there *is* an object, so the aliasing rule is unchanged.
     let call = match target {
         Expr::Index(base, key) => jsast::rt_call("_put", vec![*base, *key, value]),
-        Expr::Member(base, name) => {
-            jsast::rt_call("_put", vec![*base, jsast::string(name), value])
-        }
+        Expr::Member(base, name) => jsast::rt_call("_put", vec![*base, jsast::string(name), value]),
         target => jsast::rt_call("overwrite", vec![target, value]),
     };
     vec![jsast::expr_stmt(call)]
@@ -376,30 +302,23 @@ pub(crate) fn offset_from<'tcx>(
 
 /// `lhs == rhs` on two pointers of type `pointer_ty`.
 ///
-/// `__rt.ptr_eq(a, b)` is `===` first (so two references to one object, and two numbers, answer
-/// immediately), `false` when either side is not an object, and a comparison of `buf`, `off` and
-/// `sc` otherwise. `len` is deliberately ignored, which makes comparing a fat pointer with a thin
-/// one free.
-///
-/// Every `==` on a pointer routes here, including the `compares_by_value` checks in `rvalue.rs`
-/// and `intrinsics.rs`.
-pub(crate) fn eq<'tcx>(
-    fx: &FnCx<'_, 'tcx>,
-    pointer_ty: Ty<'tcx>,
-    lhs: Expr,
-    rhs: Expr,
-) -> Expr {
-    let _ = (fx, pointer_ty);
-    jsast::rt_call("ptr_eq", vec![lhs, rhs])
+/// Wide pointers compare both their data pointer and metadata.
+pub(crate) fn eq<'tcx>(fx: &FnCx<'_, 'tcx>, pointer_ty: Ty<'tcx>, lhs: Expr, rhs: Expr) -> Expr {
+    let helper = match pointer_ty.builtin_deref(true) {
+        Some(pointee) if matches!(pointee.kind(), ty::Slice(_)) => "slice_ptr_eq",
+        Some(pointee)
+            if matches!(pointee.kind(), ty::Dynamic(..))
+                || crate::value::unsized_tail(fx.tcx, pointee).is_some() =>
+        {
+            "fat_ptr_eq"
+        }
+        _ => "ptr_eq",
+    };
+    jsast::rt_call(helper, vec![lhs, rhs])
 }
 
 /// `lhs != rhs` on two pointers of type `pointer_ty`: the negation of [`eq`].
-pub(crate) fn ne<'tcx>(
-    fx: &FnCx<'_, 'tcx>,
-    pointer_ty: Ty<'tcx>,
-    lhs: Expr,
-    rhs: Expr,
-) -> Expr {
+pub(crate) fn ne<'tcx>(fx: &FnCx<'_, 'tcx>, pointer_ty: Ty<'tcx>, lhs: Expr, rhs: Expr) -> Expr {
     jsast::not(eq(fx, pointer_ty, lhs, rhs))
 }
 
@@ -480,7 +399,11 @@ pub(crate) fn copy<'tcx>(
     if is_zst(tcx, pointee) {
         return Vec::new();
     }
-    let name = if overlapping { "copy" } else { "copy_nonoverlapping" };
+    let name = if overlapping {
+        "copy"
+    } else {
+        "copy_nonoverlapping"
+    };
     let mut args = vec![dst, src, count];
     if crate::value::needs_clone(tcx, pointee) {
         args.push(jsast::arrow(
@@ -539,7 +462,7 @@ pub(crate) fn write_bytes<'tcx>(
     } else {
         let Some(zero) = zero_value(tcx, pointee) else {
             return vec![jsast::expr_stmt(fx.zombie(format!(
-                "`write_bytes` on `{pointee}` is not supported by rustc_codegen_mires: a byte \
+                "`write_bytes` on `{pointee}` is not supported by rustc_codegen_js: a byte \
                  pattern names a value only for a one byte pointee, and zero for a scalar one"
             )))];
         };
@@ -596,7 +519,8 @@ pub(crate) fn compare_bytes(lhs: Expr, rhs: Expr, count: Expr) -> Expr {
 /// | array of elements to anything | `__rt.unwindow`, then the element's answer |
 /// | aggregate to its single non zero sized field | reproject: `{ buf: p.buf[p.off], off: "<field>" }` |
 /// | size N to size 1 | a [`scaled_slot`] over the same buffer |
-/// | size 1 to size N | `__rt.unscale`: a fresh heap block is retyped to that element size, a scaled slot is re-keyed, anything else throws |
+/// | size 1 to scalar size N | `__rt.unscale`: a fresh heap block is retyped, a scaled slot is re-keyed, or byte storage gets an aliasing scalar view |
+/// | size 1 to aggregate size N | `__rt.unscale`: only a fresh heap block or matching scaled slot is legal |
 /// | anything else | a zombie naming both types, recorded at the cast |
 ///
 /// A `str` on either side is decided before any of that, by [`cast_str`]: it is a JavaScript string
@@ -651,7 +575,7 @@ fn cast_pointer_at<'tcx>(
     let tcx = fx.tcx;
     let unsupported = || {
         fx.zombie(format!(
-            "rustc_codegen_mires cannot cast a pointer to `{from_pointee}` into a pointer to \
+            "rustc_codegen_js cannot cast a pointer to `{from_pointee}` into a pointer to \
              `{to_pointee}`"
         ))
     };
@@ -684,6 +608,13 @@ fn cast_pointer_at<'tcx>(
     // it expects its `self`, and every field read would answer `undefined`.
     if is_zst(tcx, to) {
         let reference = raw_to_ref(fx, from, value);
+        let reference = if crate::value::unsized_tail(tcx, from).is_some()
+            || matches!(from.kind(), ty::Dynamic(..))
+        {
+            jsast::member(reference, PTR)
+        } else {
+            reference
+        };
         // What the erasure loses is the element size, and one caller needs it back:
         // `<*const T>::addr` is `transmute(self.cast::<()>())`, so by the time the address is
         // taken the pointee is `()` and the offset is still counted in `T`s. `__rt.erase` records
@@ -695,7 +626,11 @@ fn cast_pointer_at<'tcx>(
             _ => reference,
         }
     } else if is_zst(tcx, from) {
-        ref_to_raw(fx, to, value)
+        // An erased pointer can still be a scaled byte view. Restore the target units.
+        match size_of(tcx, to) {
+            Some(size) => jsast::rt_call("thin", vec![value, jsast::num(size as f64)]),
+            None => ref_to_raw(fx, to, value),
+        }
     } else {
         cast_pointer_sized(fx, from_pointee, to_pointee, from, to, value, depth)
     }
@@ -715,7 +650,7 @@ fn cast_pointer_sized<'tcx>(
     let tcx = fx.tcx;
     let unsupported = || {
         fx.zombie(format!(
-            "rustc_codegen_mires cannot cast a pointer to `{from_pointee}` into a pointer to \
+            "rustc_codegen_js cannot cast a pointer to `{from_pointee}` into a pointer to \
              `{to_pointee}`"
         ))
     };
@@ -774,7 +709,8 @@ fn cast_pointer_sized<'tcx>(
     // `NonNull<rt::Argument>` for every single-argument `write!` in a program, so that identity is
     // the difference between `args.buf` and `undefined`.
     if let ty::Array(element, count) = to.kind() {
-        let element = peel_pattern(peel_transparent(tcx, *element));
+        let to_element = *element;
+        let element = peel_pattern(peel_transparent(tcx, to_element));
         let width = count.try_to_target_usize(tcx).unwrap_or(0);
         // The window is over elements of `to`, so a byte view has to be keyed to the element
         // first. `Box::new([1, 2, 3])` is that cast: `alloc` hands back a byte granular block and
@@ -785,14 +721,20 @@ fn cast_pointer_sized<'tcx>(
         let keyed = if element == from {
             Some(value.clone())
         } else if from_size == 1 && !is_indirect(tcx, from) && element_size.is_some() {
-            Some(jsast::rt_call(
-                "unscale",
-                vec![
-                    value.clone(),
-                    jsast::num(element_size.unwrap_or(1) as f64),
-                    crate::alloc_support::zero_factory(fx.cgu, element),
-                ],
-            ))
+            let mut arguments = vec![
+                value.clone(),
+                jsast::num(element_size.unwrap_or(1) as f64),
+                crate::alloc_support::zero_factory(fx.cgu, element),
+            ];
+            let member = if crate::value::crosses_transparent_union(tcx, from_pointee) {
+                "unscale_uninit"
+            } else if let Some(kind) = scalar_view_kind(tcx, element) {
+                arguments.push(kind);
+                "unscale_scalar"
+            } else {
+                "unscale"
+            };
+            Some(jsast::rt_call(member, arguments))
         } else {
             None
         };
@@ -829,11 +771,22 @@ fn cast_pointer_sized<'tcx>(
     }
 
     // A wrapper to what it wraps: `*const NonNull<T>` to `*const *const T`. The slot moves from
-    // the wrapper to the field inside it, which is a place of the target type — as opposed to the
-    // other direction, from a scalar to a wrapper around it, which has no place to name and stays
-    // on the unsupported list.
+    // the wrapper to the field inside it, which is a place of the target type.
     if let Some(reprojected) = reproject_to_field(fx, from, to, &value, depth) {
         return reprojected;
+    }
+    // A layout prefix with more fields after it. `InternalNode<K, V>` starts with its
+    // `LeafNode<K, V>` data, so the pointer names that zero-offset field while retaining the
+    // containing object in the slot record. The reverse cast is accepted only for that exact
+    // record shape; a standalone leaf cannot become an internal node.
+    if let Some(key) = zero_offset_field(fx, from, to) {
+        return jsast::rt_call(
+            "prefix",
+            vec![value, field_key_expr(key), jsast::num(from_size as f64)],
+        );
+    }
+    if let Some(key) = zero_offset_field(fx, to, from) {
+        return jsast::rt_call("unproject", vec![value, field_key_expr(key)]);
     }
 
     // `p as *const u8`: a byte offset view of a buffer of `from_size` byte elements. Not
@@ -847,25 +800,52 @@ fn cast_pointer_sized<'tcx>(
         return jsast::rt_call("scale", vec![value, jsast::num(from_size as f64)]);
     }
     // The way back. `__rt.unscale` answers for a scaled slot of exactly this element size whose
-    // byte offset lands on an element, and for a **fresh heap block**, which it retypes to this
-    // element size (`CONTRACT.md`, "Allocation"). Anything else throws — which is what makes an
-    // aligned `byte_add` honest, and byte punning of a buffer that really is bytes a run time error
-    // at the mistake rather than a wrong value.
+    // byte offset lands on an element, for a **fresh heap block**, which it retypes to this element
+    // size (`CONTRACT.md`, "Allocation"), and for an integer or float scalar over actual byte
+    // storage, which gets an aliasing accessor view. Aggregate byte punning still throws: no
+    // JavaScript object occupies those bytes, so there is no aggregate value to hand back.
     //
     // The third argument is how a *zeroed* block is filled once it is retyped: only the compiler
     // knows what a zero `to_pointee` looks like, so the cast carries a factory for one.
     if from_size == 1 && !is_indirect(tcx, from) {
-        return jsast::rt_call(
-            "unscale",
-            vec![
-                value,
-                jsast::num(to_size as f64),
-                crate::alloc_support::zero_factory(fx.cgu, to_pointee),
-            ],
-        );
+        let mut arguments = vec![
+            value,
+            jsast::num(to_size as f64),
+            crate::alloc_support::zero_factory(fx.cgu, to_pointee),
+        ];
+        let member = if crate::value::crosses_transparent_union(tcx, from_pointee) {
+            "unscale_uninit"
+        } else if let Some(kind) = scalar_view_kind(tcx, to_pointee) {
+            arguments.push(kind);
+            "unscale_scalar"
+        } else {
+            "unscale"
+        };
+        return jsast::rt_call(member, arguments);
     }
 
     unsupported()
+}
+
+/// The exact scalar representation an aliasing byte-storage view may decode.
+///
+/// `null` deliberately keeps aggregates, pointers, enums, and other semantic values on the
+/// refusing arm of `__rt.unscale`: a width alone is not enough to reconstruct those values.
+fn scalar_view_kind<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Expr> {
+    let ty = peel_pattern(peel_transparent(tcx, ty));
+    let kind = match ty.kind() {
+        ty::Int(_) | ty::Uint(_) => crate::value::int_info(tcx, ty)
+            .filter(|(_, bits)| *bits > 8)
+            .map(|(signed, bits)| format!("{}{bits}", if signed { 'i' } else { 'u' })),
+        ty::Float(float) => Some(match float {
+            ty::FloatTy::F32 => "f32".to_owned(),
+            ty::FloatTy::F64 => "f64".to_owned(),
+            _ => return None,
+        }),
+        ty::Char => Some("u32".to_owned()),
+        _ => None,
+    };
+    kind.map(jsast::string)
 }
 
 /// The row of [`cast_pointer`] that reshapes a heap block into a **header plus an unsized tail**.
@@ -887,7 +867,7 @@ fn reshape_to_tail<'tcx>(
     let tail = crate::value::unsized_tail(fx.tcx, to).expect("the caller matched on the tail");
     let ty::Slice(element) = tail.kind() else {
         return fx.zombie(format!(
-            "rustc_codegen_mires cannot build a pointer to `{to_pointee}`: only a slice tail is \
+            "rustc_codegen_js cannot build a pointer to `{to_pointee}`: only a slice tail is \
              supported, and a `{tail}` tail is not"
         ));
     };
@@ -896,7 +876,7 @@ fn reshape_to_tail<'tcx>(
     };
     if !matches!(from.kind(), ty::Slice(_)) {
         return fx.zombie(format!(
-            "rustc_codegen_mires cannot cast a pointer to `{from}` into a pointer to `{to_pointee}`: \
+            "rustc_codegen_js cannot cast a pointer to `{from}` into a pointer to `{to_pointee}`: \
              the length of the tail is not carried by the source pointer"
         ));
     }
@@ -940,20 +920,68 @@ fn reproject_to_field<'tcx>(
         }
         let mut pointer = value.clone();
         for key in chain {
-            pointer = match key {
-                crate::value::FieldKey::Name(name) => {
-                    slot(slot_element(pointer), jsast::string(name))
-                }
-                crate::value::FieldKey::Index(index) => {
-                    slot(slot_element(pointer), jsast::num(index as f64))
-                }
-                // A transparent union is its field already: the slot does not move.
-                crate::value::FieldKey::Transparent => pointer,
-            };
+            pointer = project_field(pointer, key);
         }
         return Some(pointer);
     }
     None
+}
+
+/// The non-zero-sized field of a larger `aggregate` whose actual layout offset is zero and whose
+/// peeled type is `target`. Requiring a larger container keeps a one-field newtype out of the
+/// inverse-prefix path: a standalone scalar allocation has no retained aggregate provenance.
+fn zero_offset_field<'tcx>(
+    fx: &FnCx<'_, 'tcx>,
+    aggregate: Ty<'tcx>,
+    target: Ty<'tcx>,
+) -> Option<crate::value::FieldKey> {
+    let tcx = fx.tcx;
+    let aggregate = peel_pattern(peel_transparent(tcx, aggregate));
+    let target = peel_pattern(peel_transparent(tcx, target));
+    let layout = tcx.layout_of(typing_env().as_query_input(aggregate)).ok()?;
+    let target_layout = tcx.layout_of(typing_env().as_query_input(target)).ok()?;
+    if layout.size <= target_layout.size {
+        return None;
+    }
+    match aggregate.kind() {
+        ty::Adt(definition, arguments) if definition.is_struct() => {
+            let variant = definition.non_enum_variant();
+            variant.fields.iter_enumerated().find_map(|(index, field)| {
+                let field_ty =
+                    tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, arguments));
+                (layout.fields.offset(index.as_usize()) == Size::ZERO
+                    && !is_zst(tcx, field_ty)
+                    && peel_pattern(peel_transparent(tcx, field_ty)) == target)
+                    .then(|| crate::value::FieldKey::Name(Namer::field_name(variant, index)))
+            })
+        }
+        ty::Tuple(fields) => fields.iter().enumerate().find_map(|(index, field_ty)| {
+            (layout.fields.offset(index) == Size::ZERO
+                && !is_zst(tcx, field_ty)
+                && peel_pattern(peel_transparent(tcx, field_ty)) == target)
+                .then_some(crate::value::FieldKey::Index(index))
+        }),
+        _ => None,
+    }
+}
+
+fn project_field(pointer: Expr, key: crate::value::FieldKey) -> Expr {
+    match key {
+        crate::value::FieldKey::Name(name) => slot(slot_element(pointer), jsast::string(name)),
+        crate::value::FieldKey::Index(index) => {
+            slot(slot_element(pointer), jsast::num(index as f64))
+        }
+        // A transparent union is its field already: the slot does not move.
+        crate::value::FieldKey::Transparent => pointer,
+    }
+}
+
+fn field_key_expr(key: crate::value::FieldKey) -> Expr {
+    match key {
+        crate::value::FieldKey::Name(name) => jsast::string(name),
+        crate::value::FieldKey::Index(index) => jsast::num(index as f64),
+        crate::value::FieldKey::Transparent => jsast::undefined(),
+    }
 }
 
 /// `value`, preceded by the assignment [`reread`] asked for, if it asked for one.
@@ -971,8 +999,8 @@ fn sequenced(setup: Option<Expr>, value: Expr) -> Expr {
 /// pointers taken from one object are the same record and `ptr::eq` on them is true, and its
 /// `buf[0]` *is* the object, so a write through the pointer reaches every alias.
 ///
-/// A reference to something that has no slot form at all — a `&str`, an unsized pointee, a zero
-/// sized one — is handed back unchanged.
+/// Unsized struct pointers convert their data half and preserve metadata. Other pointees
+/// without a slot form, including slices, `str` and zero-sized types, remain unchanged.
 ///
 /// The box is the *last* resort. When the reference is a read out of a container —
 /// `points[i]`, `pair.first` — the slot naming that place is `{ buf: points, off: i }`, and
@@ -981,6 +1009,9 @@ fn sequenced(setup: Option<Expr>, value: Expr) -> Expr {
 /// offsetting away from it names nothing. Two raw pointers taken this way from one element are
 /// still equal, because `__rt.ptr_eq` compares the buffer and the key rather than the record.
 pub(crate) fn ref_to_raw<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, reference: Expr) -> Expr {
+    if crate::value::unsized_tail(fx.tcx, pointee).is_some() {
+        return jsast::rt_call("tail_raw", vec![reference]);
+    }
     if !is_slot_pointee(fx.tcx, pointee) {
         return reference;
     }
@@ -999,10 +1030,17 @@ pub(crate) fn ref_to_raw<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, reference
 /// The inverse of [`ref_to_raw`]. A reference to an aggregate is the object the slot names,
 /// [`slot_element`]; a reference to anything else is the slot itself.
 pub(crate) fn raw_to_ref<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, raw: Expr) -> Expr {
+    if crate::value::unsized_tail(fx.tcx, pointee).is_some() {
+        return jsast::rt_call("tail_ref", vec![raw]);
+    }
     if !is_slot_pointee(fx.tcx, pointee) {
         return raw;
     }
-    if is_indirect(fx.tcx, pointee) { slot_element(raw) } else { raw }
+    if is_indirect(fx.tcx, pointee) {
+        slot_element(raw)
+    } else {
+        raw
+    }
 }
 
 /// A fat pointer built from its two halves: `aggregate_raw_ptr(data, meta)`, and the tail of an
@@ -1010,9 +1048,8 @@ pub(crate) fn raw_to_ref<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, raw: Expr
 ///
 /// `pointee` is the unsized pointee: `[T]` or `dyn Trait`.
 ///
-/// A slice pointer keeps the buffer and offset of the data pointer and takes the length from the
-/// metadata, `{ buf: d.buf, off: d.off, len: m }`, which is what makes `from_raw_parts` on a slot
-/// work.
+/// A slice pointer keeps the data slot and the metadata length. `slice_from_parts` normalizes
+/// dangling addresses without changing allocation layout.
 ///
 /// A **chunk granularity** rebuild — the element type of the result is itself an array, which is
 /// what `as_chunks` asks for — is a question the type cannot answer, so it is asked at run time by
@@ -1045,13 +1082,15 @@ pub(crate) fn build_fat<'tcx>(
             };
             jsast::rt_call("chunk_slice", vec![data, meta, jsast::num(width as f64)])
         }
-        ty::Slice(_) => fat_slice(slot_buf(data.clone()), slot_off(data), meta),
+        ty::Slice(_) => jsast::rt_call("slice_from_parts", vec![data, meta]),
         // `str::from_raw_parts(p, n)`: the `n` bytes at `p`, decoded back into the JavaScript
         // string a `&str` is.
         ty::Str => {
             let (setup, data) = reread(fx, data, &[BUF, OFF]);
-            let decoded =
-                jsast::rt_call("bytes_str", vec![slot_buf(data.clone()), slot_off(data), meta]);
+            let decoded = jsast::rt_call(
+                "bytes_str",
+                vec![slot_buf(data.clone()), slot_off(data), meta],
+            );
             sequenced(setup, decoded)
         }
         // A **sized** pointee has `()` for its metadata, so nothing is being rebuilt: a thin
@@ -1072,8 +1111,8 @@ pub(crate) fn build_fat<'tcx>(
         // the metadata of the value being copied into it -- and the reshape is the same one the
         // pointer cast performs, from the other arrival state (`runtime/shim.js`).
         _ => {
-            let element = crate::value::unsized_tail(fx.tcx, pointee)
-                .and_then(|tail| match tail.kind() {
+            let element =
+                crate::value::unsized_tail(fx.tcx, pointee).and_then(|tail| match tail.kind() {
                     ty::Slice(element) => size_of(fx.tcx, *element),
                     _ => None,
                 });
@@ -1089,7 +1128,7 @@ pub(crate) fn build_fat<'tcx>(
                 ),
                 None => fx.zombie(format!(
                     "a pointer to `{pointee}` cannot be rebuilt from a thin data pointer by \
-                     rustc_codegen_mires"
+                     rustc_codegen_js"
                 )),
             }
         }
@@ -1134,7 +1173,11 @@ pub(crate) fn bytes_to_str<'tcx>(fx: &FnCx<'_, 'tcx>, form: ByteElement, bytes: 
     let (setup, bytes) = reread(fx, bytes, &[BUF, OFF, LEN]);
     let decoded = jsast::rt_call(
         form.decoder(),
-        vec![slot_buf(bytes.clone()), slot_off(bytes.clone()), slot_len(bytes)],
+        vec![
+            slot_buf(bytes.clone()),
+            slot_off(bytes.clone()),
+            slot_len(bytes),
+        ],
     );
     sequenced(setup, decoded)
 }
@@ -1160,8 +1203,8 @@ pub(crate) fn str_len(string: Expr) -> Expr {
 ///
 /// The element of the slice being decoded is any [one byte element](ByteElement) rather than a
 /// `u8`, and `core` needs it to be: `char`'s `Debug` escapes through a buffer of `AsciiChar`, whose
-/// `as_str` is this cast. Every panic that names a `char` is downstream of that, which is `&s[a..b]`
-/// on a `str`, `contains`, `find` with a `&str` pattern, and the float formatter.
+/// `as_str` is this cast. Every panic that names a `char` is downstream of that, which is
+/// `&s[a..b]` on a `str`, `contains`, `find` with a `&str` pattern, and the float formatter.
 pub(crate) fn cast_str<'tcx>(
     fx: &FnCx<'_, 'tcx>,
     from_pointee: Ty<'tcx>,
@@ -1176,7 +1219,7 @@ pub(crate) fn cast_str<'tcx>(
     }
     let unsupported = || {
         fx.zombie(format!(
-            "rustc_codegen_mires cannot cast a pointer to `{from_pointee}` into a pointer to \
+            "rustc_codegen_js cannot cast a pointer to `{from_pointee}` into a pointer to \
              `{to_pointee}`: a `str` is a JavaScript string, whose only byte view is the UTF-8 \
              one `as_bytes` produces"
         ))
@@ -1284,9 +1327,9 @@ fn duplicable(value: &Expr, reads: &[&str]) -> bool {
             duplicable(object, reads)
                 && matches!(&**index, Expr::Num(_) | Expr::Str(_) | Expr::Ident(_))
         }
-        Expr::Object(entries) => {
-            reads.iter().all(|name| jsast::folds_property(entries, name))
-        }
+        Expr::Object(entries) => reads
+            .iter()
+            .all(|name| jsast::folds_property(entries, name)),
         _ => false,
     }
 }

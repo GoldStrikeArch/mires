@@ -7,3 +7,4 @@ function x19_chunks$only_b$hc3fee5938e27bab7(x) {
   return x19_chunks$shared_add$hc9865bfa68abd03f(x) - 1 | 0;
 }
 export { __island_b };
+(globalThis.__rcgjsChunks || (globalThis.__rcgjsChunks = new Map())).set("b", __island_b);

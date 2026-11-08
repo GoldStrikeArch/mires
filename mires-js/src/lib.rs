@@ -1,6 +1,6 @@
 //! The host's own data structures, as Rust types.
 //!
-//! A program compiled by `rustc_codegen_mires` runs on a JavaScript engine, and that engine already
+//! A program compiled by `rustc_codegen_js` runs on a JavaScript engine, and that engine already
 //! ships hash tables: `Map` and the string interning behind every object key. This crate hands
 //! those to Rust as [`collections::HashMap`] and [`collections::HashSet`].
 //!
@@ -22,7 +22,24 @@
 //! "Host collections".
 
 #![no_std]
+#![feature(local_waker)]
 
 extern crate alloc;
 
+// Host `Map`-backed collections: the one FFI seam allowed unsafe.
+#[allow(unsafe_code)]
 pub mod collections;
+
+pub use js_extern_macro::{js_bindings, js_export};
+
+mod executor;
+mod host;
+mod host_value;
+mod promise;
+mod web;
+
+pub use executor::*;
+pub use host::*;
+pub use host_value::*;
+pub use promise::*;
+pub use web::*;

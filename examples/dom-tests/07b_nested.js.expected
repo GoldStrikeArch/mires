@@ -1,0 +1,115 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { createComponent as _$createComponent } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h20207ec50a9647a8 = _$template("<span class=\"badge\"></span>");
+const tmpl$hcd112568d1318e17 = _$template("<section class=\"card\"><h2></h2><!></section>");
+const tmpl$hb78025fc51858132 = _$template("<section class=\"card\"><h2></h2><!><!></section>");
+const tmpl$h55984f88f725e0c4 = _$template("<section class=\"outer\"><h2></h2><!></section>");
+const tmpl$h22595ebb6e3adb73 = _$template("<div id=\"main\"></div>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x07b_nested$nested_in_element$h31f66679f0286b12();
+  x07b_nested$depth_three$h513c38bfc382fd5e();
+  x07b_nested$siblings_in_body$h04952836c5d328d1();
+}
+// badge
+function x07b_nested$badge$hd8aadabe121d096d(props) {
+  let _0, label;
+  label = props.label;
+  _0 = tmpl$h20207ec50a9647a8();
+  _$insert(_0, label);
+  return _0;
+}
+// depth_three::{closure#0}
+function x07b_nested$depth_three$closure_0$h09077ff5f541619e(_1) {
+  return x07b_nested$outer_card$h9b9463343f815cf7({ title: "Profile" });
+}
+// depth_three
+function x07b_nested$depth_three$h513c38bfc382fd5e() {
+  let _0;
+  _0 = tmpl$h22595ebb6e3adb73();
+  _$insert(_0, _$createComponent(() => x07b_nested$depth_three$closure_0$h09077ff5f541619e(undefined)));
+  return _0;
+}
+// double_card::{closure#0}
+function x07b_nested$double_card$closure_0$hbb46a6f6dc78ce1b(_1) {
+  return x07b_nested$badge$hd8aadabe121d096d({ label: "One" });
+}
+// double_card::{closure#1}
+function x07b_nested$double_card$closure_1$hacf08c18ce29af5f(_1) {
+  return x07b_nested$badge$hd8aadabe121d096d({ label: "Two" });
+}
+// double_card
+function x07b_nested$double_card$h4b9405de9e836bd0(props) {
+  let _0, title, $t0, $t1, $t2;
+  title = props.title;
+  _0 = tmpl$hb78025fc51858132();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  $t2 = $t1.nextSibling;
+  _$insert($t0, title);
+  _$insert(_0, _$createComponent(() => x07b_nested$double_card$closure_0$hbb46a6f6dc78ce1b(undefined)), $t1);
+  _$insert(_0, _$createComponent(() => x07b_nested$double_card$closure_1$hacf08c18ce29af5f(undefined)), $t2);
+  return _0;
+}
+// labelled_card::{closure#0}
+function x07b_nested$labelled_card$closure_0$hb6b4afdca343b777(_1) {
+  return x07b_nested$badge$hd8aadabe121d096d({ label: "Active" });
+}
+// labelled_card
+function x07b_nested$labelled_card$h2214e767f49f7294(props) {
+  let _0, title, $t0, $t1;
+  title = props.title;
+  _0 = tmpl$hcd112568d1318e17();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  _$insert($t0, title);
+  _$insert(_0, _$createComponent(() => x07b_nested$labelled_card$closure_0$hb6b4afdca343b777(undefined)), $t1);
+  return _0;
+}
+// nested_in_element::{closure#0}
+function x07b_nested$nested_in_element$closure_0$he897e461def7b9ef(_1) {
+  return x07b_nested$labelled_card$h2214e767f49f7294({ title: "Profile" });
+}
+// nested_in_element
+function x07b_nested$nested_in_element$h31f66679f0286b12() {
+  let _0;
+  _0 = tmpl$h22595ebb6e3adb73();
+  _$insert(_0, _$createComponent(() => x07b_nested$nested_in_element$closure_0$he897e461def7b9ef(undefined)));
+  return _0;
+}
+// outer_card::{closure#0}
+function x07b_nested$outer_card$closure_0$h954f7e69028c450f(_1) {
+  return x07b_nested$labelled_card$h2214e767f49f7294({ title: "Inner" });
+}
+// outer_card
+function x07b_nested$outer_card$h9b9463343f815cf7(props) {
+  let _0, title, $t0, $t1;
+  title = props.title;
+  _0 = tmpl$h55984f88f725e0c4();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  _$insert($t0, title);
+  _$insert(_0, _$createComponent(() => x07b_nested$outer_card$closure_0$h954f7e69028c450f(undefined)), $t1);
+  return _0;
+}
+// siblings_in_body::{closure#0}
+function x07b_nested$siblings_in_body$closure_0$hd8b5c450dac9f876(_1) {
+  return x07b_nested$double_card$h4b9405de9e836bd0({ title: "Profile" });
+}
+// siblings_in_body
+function x07b_nested$siblings_in_body$h04952836c5d328d1() {
+  let _0;
+  _0 = tmpl$h22595ebb6e3adb73();
+  _$insert(_0, _$createComponent(() => x07b_nested$siblings_in_body$closure_0$hd8b5c450dac9f876(undefined)));
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

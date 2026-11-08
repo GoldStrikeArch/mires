@@ -1,0 +1,60 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h475e425ccface200 = _$template("<div>First</div>");
+const tmpl$h84fa8657d2b1aa66 = _$template("<div>Last</div>");
+const tmpl$h70ecbd4edf573156 = _$template("<div></div>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x08_fragments$multi_static$h753e2a8bad4a1e86();
+  x08_fragments$multi_expression$h91653ccec526ee8b("middle");
+  x08_fragments$first_dynamic$h00a20705b6c03c58(undefined);
+  x08_fragments$last_static$h1c616326e3172c5d("tail");
+}
+// first_dynamic::{closure#0}
+function x08_fragments$first_dynamic$closure_0$h46e7c40b7a1e683f(_1) {
+  return x08_fragments$rust_entry$closure_0$h20d0affdaa6cf815(_1);
+}
+// first_dynamic
+function x08_fragments$first_dynamic$h00a20705b6c03c58(inserted) {
+  let __tc_root_0, _6, __tc_root_1;
+  __tc_root_0 = tmpl$h70ecbd4edf573156();
+  _6 = undefined;
+  _$insert(__tc_root_0, () => x08_fragments$first_dynamic$closure_0$h46e7c40b7a1e683f(_6));
+  __tc_root_1 = tmpl$h70ecbd4edf573156();
+  return [__tc_root_0, __tc_root_1];
+}
+// last_static
+function x08_fragments$last_static$h1c616326e3172c5d(inserted) {
+  let __tc_root_0, __tc_root_1;
+  __tc_root_0 = tmpl$h70ecbd4edf573156();
+  __tc_root_1 = tmpl$h70ecbd4edf573156();
+  _$insert(__tc_root_1, inserted);
+  return [__tc_root_0, __tc_root_1];
+}
+// multi_expression
+function x08_fragments$multi_expression$h91653ccec526ee8b(inserted) {
+  let __tc_root_0, __tc_root_1, __tc_root_2;
+  __tc_root_0 = tmpl$h475e425ccface200();
+  __tc_root_1 = tmpl$h70ecbd4edf573156();
+  _$insert(__tc_root_1, inserted);
+  __tc_root_2 = tmpl$h84fa8657d2b1aa66();
+  return [__tc_root_0, __tc_root_1, __tc_root_2];
+}
+// multi_static
+function x08_fragments$multi_static$h753e2a8bad4a1e86() {
+  let __tc_root_0;
+  __tc_root_0 = tmpl$h475e425ccface200();
+  return [__tc_root_0, tmpl$h84fa8657d2b1aa66()];
+}
+// rust_entry::{closure#0}
+function x08_fragments$rust_entry$closure_0$h20d0affdaa6cf815(_1) {
+  return "dynamic";
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

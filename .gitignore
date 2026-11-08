@@ -8,3 +8,38 @@ bench/**/node_modules/
 bench/melange/out/
 bench/vanilla/dist/
 bench/vanilla/dist-krausest/
+
+# Recovery inputs and private retained references
+/recovery/
+/experiments-2026-09-05/
+/experiments-pro/fp-pro/
+**/node_modules/
+/experiments/**/dist/
+/experiments/**/_build/
+/experiments/**/target/
+/experiments-pro/**/dist/
+/experiments-pro/**/target/
+/experiments-pro/**/_build/
+/build/
+.DS_Store
+
+# Original Pro material is private until its publication rights are resolved.
+/experiments-pro/
+/experiments/**/bench/results/
+/experiments/**/results/
+
+# Comparator compiler caches and generated language outputs
+/.toolchains/
+**/.scala-build/
+**/.bsp/
+**/.dart_tool/
+**/elm-stuff/
+/experiments/fingerprintjs-*/build/
+/experiments/fingerprintjs-kotlin/gradle-production/.gradle/
+/experiments/fingerprintjs-kotlin/gradle-production/build/
+/experiments/fingerprintjs-rescript/lib/
+
+# Comparator incremental state
+**/.gradle/
+**/.kotlin/
+**/__pycache__/

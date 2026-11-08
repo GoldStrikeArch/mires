@@ -1,0 +1,39 @@
+# Items the JIR lane never lowers.
+#
+# One emitted JavaScript item name per line; `#` starts a comment and blank lines are ignored.
+# The file is compiled into `jsc-link` (`link/lane.rs` reads it with `include_str!`), so it is a
+# property of the compiler rather than of a build script: every build, every script and every gate
+# sees the same list without having to pass it an option.
+#
+# WHAT BELONGS HERE
+# -----------------
+# An item whose JavaScript must stay v1's printed text for a reason that is not a missing lowering
+# rule — a hand-written shape another tool matches on, an ABI a golden outside this repository
+# pins. It is NOT the place to park an item the lowerer gets wrong: that is a `Decline` from
+# `lower_item`, which the lane report counts and a promotion round drives to zero. The exit gate
+# reads "fallback_count == 0 except the allow-list", so a name added here is a number the gate
+# stops watching, and it needs a comment saying who is watching it instead.
+#
+# WHAT DOES NOT BELONG HERE, AND WHY IT NEVER WILL
+# ------------------------------------------------
+# The synthesized items — the allocator shim, `global_asm`, the link step's own missing-item stubs,
+# hoisted constants, the ESM shim import, cross-chunk imports — have no MIR body, so the encoder
+# records `Unavailable(Encode(Synthesized))` and no JIR-S body travels in the object at all. The
+# lane driver only offers the lowerer an item whose body it decoded, so those items never reach it
+# and never need to be named here. That is also why the fixture coverage runs report 409 declines
+# that are all `encode.synthesized` and why that number is not a lane failure.
+#
+# THE STATE OF THE LIST
+# ---------------------
+# It is EMPTY, and that is the exit gate's number: over the four fixture suites, 7,070 offered
+# items lower and none falls back. The only items without a JIR body are the synthesized ones
+# described above (`encode.synthesized`), which never reach the lowerer.
+#
+# One near miss is worth recording, because it is the shape a future entry would have. Until W10
+# part (b), `fmt::builders::DebugTuple::{field,finish}` carried no body: their `Result::and_then`
+# call passes a `rust-call` pack of type `((),)`, which is zero-sized, so rustc hands the encoder
+# `ConstValue::ZeroSized` rather than an allocation, and there was no tree to take the argument
+# out of (`encode.spread-not-tuple`). That was an encoder gap and not a lowering limit, so it was
+# fixed where it belonged (`backend/src/jir/encode.rs::call_arguments`) rather than parked here.
+# The rule that produced the right answer: an entry here has to be something no lowering could
+# ever do, not something no lowering does yet.

@@ -12,12 +12,12 @@
 //! ```
 //!
 //! `url`, `kind` and `body` are Rust bindings in scope at the call, and they are CAPTURED: the
-//! expansion passes them by value to a marker function whose [`link_section`] carries the
+//! expansion passes them by value to a marker function whose `link_section` carries the
 //! JavaScript, and the backend fills the block's holes with them. Nothing else in that block is a
 //! capture: `fetch` is reached through `globalThis`, `method` and `headers` are keys, `r` is bound
 //! by the arrow, and `text` is a property.
 //!
-//! Which is which is decided by a JavaScript lexer, [`lexer`], not a parser. An identifier it
+//! Which is which is decided by a JavaScript lexer, `lexer`, not a parser. An identifier it
 //! cannot classify is reported as FREE, so it becomes a real Rust identifier in the expansion and
 //! an unintended one is a spanned "cannot find value" from rustc rather than a capture that quietly
 //! went missing.
@@ -25,7 +25,7 @@
 //! # What is a capture
 //!
 //! Everything identifier shaped except a reserved word, one of the four host names
-//! ([`lexer::HOST_NAMES`]), a property after `.` or `?.`, an object literal key, and a name the
+//! (`lexer::HOST_NAMES`), a property after `.` or `?.`, an object literal key, and a name the
 //! block itself binds. The object literal shorthand `{ body }` IS a reference and so is a capture;
 //! it is written out as `{ body: <slot> }` so the key keeps its name.
 //!
@@ -96,7 +96,10 @@ impl Js {
     pub(crate) fn parse(input: TokenStream) -> syn::Result<Self> {
         let span = input.span();
         if input.is_empty() {
-            return Err(syn::Error::new(span, "`js!{}` takes one JavaScript expression"));
+            return Err(syn::Error::new(
+                span,
+                "`js!{}` takes one JavaScript expression",
+            ));
         }
 
         // A raw string literal is the verbatim form. A plain one is an ordinary JavaScript string
@@ -104,13 +107,21 @@ impl Js {
         // unambiguous.
         if let Some(literal) = raw_string(&input) {
             let text: syn::LitStr = syn::parse2(literal.clone())?;
-            return Ok(Self { source: text.value(), span: text.span(), spans: BTreeMap::new() });
+            return Ok(Self {
+                source: text.value(),
+                span: text.span(),
+                spans: BTreeMap::new(),
+            });
         }
 
         let mut source = String::new();
         let mut spans = BTreeMap::new();
         write_tokens(&mut source, &mut spans, input, &mut false);
-        Ok(Self { source, span, spans })
+        Ok(Self {
+            source,
+            span,
+            spans,
+        })
     }
 
     /// The `link_section` the block travels as, and the Rust bindings that fill its slots.
@@ -123,9 +134,15 @@ impl Js {
     pub(crate) fn section(&self) -> syn::Result<(String, Vec<syn::Ident>)> {
         let analysis =
             lexer::analyze(&self.source).map_err(|why| syn::Error::new(self.span, why))?;
-        let captures: Vec<syn::Ident> =
-            analysis.free.iter().map(|name| self.capture(name)).collect::<syn::Result<_>>()?;
-        let block = block::Block { slots: captures.len(), text: analysis.text };
+        let captures: Vec<syn::Ident> = analysis
+            .free
+            .iter()
+            .map(|name| self.capture(name))
+            .collect::<syn::Result<_>>()?;
+        let block = block::Block {
+            slots: captures.len(),
+            text: analysis.text,
+        };
         Ok((block.encode(), captures))
     }
 
@@ -136,13 +153,15 @@ impl Js {
     /// Returns why the block is not one this macro takes. See [`Js::section`].
     pub(crate) fn expand(&self) -> syn::Result<TokenStream> {
         let (section, captures) = self.section()?;
-        let types: Vec<syn::Ident> =
-            (0..captures.len()).map(|index| format_ident!("__JsCapture{index}")).collect();
-        let parameters: Vec<syn::Ident> =
-            (0..captures.len()).map(|index| format_ident!("__js_capture{index}")).collect();
+        let types: Vec<syn::Ident> = (0..captures.len())
+            .map(|index| format_ident!("__JsCapture{index}"))
+            .collect();
+        let parameters: Vec<syn::Ident> = (0..captures.len())
+            .map(|index| format_ident!("__js_capture{index}"))
+            .collect();
 
         // No braces in the message: `unreachable!` reads it as a format string.
-        let unreachable = "a `js!` block is only something rustc_codegen_mires can lower";
+        let unreachable = "a `js!` block is only something rustc_codegen_js can lower";
 
         Ok(quote! {{
             #[cfg_attr(target_arch = "wasm32", link_section = #section)]
@@ -181,7 +200,9 @@ impl Js {
 /// The single raw string literal a verbatim block is written as, if that is what the input is.
 fn raw_string(input: &TokenStream) -> Option<TokenStream> {
     let mut tokens = input.clone().into_iter();
-    let TokenTree::Literal(literal) = tokens.next()? else { return None };
+    let TokenTree::Literal(literal) = tokens.next()? else {
+        return None;
+    };
     if tokens.next().is_some() {
         return None;
     }
@@ -276,7 +297,11 @@ mod tests {
 
     /// The `link_section` a block travels as, which is what the backend reads.
     fn section(block: &str) -> String {
-        Js::parse(tokens(block)).expect("it parses").section().expect("it expands").0
+        Js::parse(tokens(block))
+            .expect("it parses")
+            .section()
+            .expect("it expands")
+            .0
     }
 
     fn error(block: &str) -> String {
@@ -312,10 +337,20 @@ mod tests {
         assert_eq!(source(r#""a + b""#), "\"a + b\"");
         assert_eq!(section(r#""a + b""#), "rcgjs.js.1.0.\"a + b\"");
         // A comment survives the verbatim form and cannot survive the token one.
-        assert_eq!(source(r##"r#"a // why
-b"#"##), "a // why\nb");
-        assert_eq!(section(r##"r#"a // why
-b"#"##), "rcgjs.js.1.2._$js0 // why\\n_$js1");
+        assert_eq!(
+            source(
+                r##"r#"a // why
+b"#"##
+            ),
+            "a // why\nb"
+        );
+        assert_eq!(
+            section(
+                r##"r#"a // why
+b"#"##
+            ),
+            "rcgjs.js.1.2._$js0 // why\\n_$js1"
+        );
     }
 
     #[test]
@@ -334,7 +369,11 @@ b"#"##), "rcgjs.js.1.2._$js0 // why\\n_$js1");
 
     #[test]
     fn a_capture_is_emitted_as_the_identifier_it_names() {
-        let text = Js::parse(tokens("f(a, b, a)")).unwrap().expand().unwrap().to_string();
+        let text = Js::parse(tokens("f(a, b, a)"))
+            .unwrap()
+            .expand()
+            .unwrap()
+            .to_string();
         assert!(text.contains("__mires_js_block (f , a , b)"), "{text}");
         assert!(text.contains("__JsCapture0"), "{text}");
         assert!(text.contains("__JsCapture2"), "{text}");
@@ -345,7 +384,11 @@ b"#"##), "rcgjs.js.1.2._$js0 // why\\n_$js1");
 
     #[test]
     fn a_block_with_no_captures_takes_no_arguments() {
-        let text = Js::parse(tokens("1 + 1")).unwrap().expand().unwrap().to_string();
+        let text = Js::parse(tokens("1 + 1"))
+            .unwrap()
+            .expand()
+            .unwrap()
+            .to_string();
         assert!(text.contains("__mires_js_block ()"), "{text}");
         assert!(!text.contains("__JsCapture0"), "{text}");
     }

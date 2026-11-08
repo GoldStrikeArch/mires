@@ -1,0 +1,63 @@
+{
+  "source": "Earlier complete file reads and dev12 audit in this conversation",
+  "originalOctoberSnapshotRecovered": false,
+  "fixtures": [
+    195,
+    201
+  ],
+  "auditProbes": [
+    "audit_named_reference",
+    "audit_zst_closure_drop",
+    "audit_zst_vec_drop",
+    "audit_aggregate_place"
+  ],
+  "files": [
+    {
+      "path": "195_zst_array_drops.rs",
+      "sha256": "f9050aa87757f059d263748755688919516c4e1311c80b3ab93d42317b30c76e",
+      "kind": "conversation-derived reconstruction, new formatting; not original bytes",
+      "originalHashAvailable": false
+    },
+    {
+      "path": "201_reference_field_pointers.rs",
+      "sha256": "49042d6d2ad53f2f64beb3194ee3903864ba4528cd1abfbc639f18b0512459e4",
+      "kind": "conversation-derived reconstruction, new formatting; not original bytes",
+      "originalHashAvailable": false
+    },
+    {
+      "path": "audit_aggregate_place.rs",
+      "sha256": "b27f1d3b958157b51f0f191a2a39581d012c2e62cc8796cae65474b91665908e",
+      "kind": "conversation-derived reconstruction, new formatting; not original bytes",
+      "originalHashAvailable": false
+    },
+    {
+      "path": "audit_named_reference.rs",
+      "sha256": "498a7a52ef9ddac5b5ff9d8b8cd5e29b1b61150ba3b63e5fa696fd4295cf5457",
+      "kind": "conversation-derived reconstruction, new formatting; not original bytes",
+      "originalHashAvailable": false
+    },
+    {
+      "path": "audit_zst_closure_drop.rs",
+      "sha256": "be580b818c74ed172519b2461363d5503d3a8011e014b1380a96ad043e519e1a",
+      "kind": "conversation-derived reconstruction, new formatting; not original bytes",
+      "originalHashAvailable": false
+    },
+    {
+      "path": "audit_zst_vec_drop.rs",
+      "sha256": "6b3f120cf107432e62ddd7a326ac1dec544963744d02655f9191b617b6f363bf",
+      "kind": "conversation-derived reconstruction, new formatting; not original bytes",
+      "originalHashAvailable": false
+    },
+    {
+      "path": "prelude.rs",
+      "sha256": "97c0f7cfbec0e381830ecc9bfd53c3b34db0f2bab3968d54abd95ce330575410",
+      "kind": "original earlier snapshot support file",
+      "originalHashAvailable": true
+    }
+  ],
+  "limitations": [
+    "These files are not installed into any recovered compiler snapshot.",
+    "Native expectations will be regenerated; no old size budget is invented.",
+    "Dev13 may already repair some dev12 audit failures; the old failure classification is historical."
+  ]
+}

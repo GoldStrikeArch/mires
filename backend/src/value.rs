@@ -6,8 +6,8 @@
 //! * `i8..=i32`, `u8..=u32`, `isize`/`usize`, `char`, `f32`/`f64` are JS numbers, `bool` is a JS
 //!   boolean, `&str` is a JS string.
 //! * `i64`/`u64`/`i128`/`u128` are JS **BigInt**s — see [`IntRepr`].
-//! * A struct is an object keyed by field name; a field whose name is a number (a tuple struct)
-//!   is keyed `_0`, `_1`, ... so the key stays a plain identifier.
+//! * A struct is an object keyed by field name; a field whose name is a number (a tuple struct) is
+//!   keyed `_0`, `_1`, ... so the key stays a plain identifier.
 //! * Tuples, arrays and closure environments are JS arrays.
 //! * An enum is one of three things, and which one follows from its declaration: see [`EnumRepr`].
 //! * `()` and zero sized values are `undefined`.
@@ -21,8 +21,8 @@
 //!   that same JS value**. `Deref` of it is a no-op, and mutation through it works because JS
 //!   objects have reference semantics.
 //! * A reference to a place whose type is *direct* (a number, a boolean, a pointer — everything
-//!   whose JS value carries no identity) is a `{ buf, off }` **slot** naming the place, and
-//!   `Deref` of it is the assignable expression `p.buf[p.off]`. `ptr.rs` owns that model, and
+//!   whose JS value carries no identity) is a `{ buf, off }` **slot** naming the place, and `Deref`
+//!   of it is the assignable expression `p.buf[p.off]`. `ptr.rs` owns that model, and
 //!   `CONTRACT.md`'s "Pointers" section is its specification.
 //!
 //! A local whose address is taken and whose type is direct has no place for a slot to name, so it
@@ -30,7 +30,7 @@
 //! the accessor objects (`{ get, set }`) earlier stages emitted, and with them the last of the
 //! contract's cells.
 
-use rustc_abi::{FIRST_VARIANT, FieldIdx, Size, TagEncoding, VariantIdx, Variants};
+use rustc_abi::{FieldIdx, Size, TagEncoding, VariantIdx, Variants, FIRST_VARIANT};
 use rustc_middle::ty::{self, AdtDef, ScalarInt, Ty, TyCtxt};
 
 use crate::jsast::{self, Expr};
@@ -77,8 +77,8 @@ pub(crate) fn is_zst<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
 ///   is a number.
 /// * A **`Box<T, A>`** whose allocator is zero sized, which is every `Box` in a program with one
 ///   global allocator. A box *is* the pointer it owns: `Box::new` allocates, casts and writes, and
-///   a `Box<[T]>` or a `Box<dyn Trait>` is exactly the fat pointer that names the allocation.
-///   Rust does not call a box `repr(transparent)`, because a box is a language item rather than a
+///   a `Box<[T]>` or a `Box<dyn Trait>` is exactly the fat pointer that names the allocation. Rust
+///   does not call a box `repr(transparent)`, because a box is a language item rather than a
 ///   library type, but it holds nothing else.
 ///
 /// The struct half is what makes a buffer of them a buffer of what they wrap: `core::fmt` builds
@@ -95,14 +95,20 @@ pub(crate) fn transparent_field_indexed<'tcx>(
     ty: Ty<'tcx>,
 ) -> Option<(FieldIdx, Ty<'tcx>)> {
     let peeled = peel_pattern(ty);
-    let ty::Adt(def, args) = peeled.kind() else { return None };
+    let ty::Adt(def, args) = peeled.kind() else {
+        return None;
+    };
     if !def.is_union() && !def.is_struct() {
         return None;
     }
-    let mut live = def.non_enum_variant().fields.iter_enumerated().filter_map(|(index, field)| {
-        let field_ty = tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, *args));
-        (!is_zst(tcx, field_ty)).then_some((index, field_ty))
-    });
+    let mut live = def
+        .non_enum_variant()
+        .fields
+        .iter_enumerated()
+        .filter_map(|(index, field)| {
+            let field_ty = tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args));
+            (!is_zst(tcx, field_ty)).then_some((index, field_ty))
+        });
     let field = live.next()?;
     if live.next().is_some() {
         return None;
@@ -180,7 +186,9 @@ pub(crate) fn unsized_tail_indexed<'tcx>(
     ty: Ty<'tcx>,
 ) -> Option<(FieldIdx, Ty<'tcx>)> {
     let ty = peel_pattern(peel_transparent(tcx, ty));
-    let ty::Adt(def, args) = ty.kind() else { return None };
+    let ty::Adt(def, args) = ty.kind() else {
+        return None;
+    };
     if !def.is_struct() {
         return None;
     }
@@ -233,8 +241,8 @@ pub(crate) enum EnumRepr {
     },
     /// **The state's index, as a plain JavaScript number under [`TAG`].** A coroutine after
     /// `StateTransform` is an enum in everything but [`ty::TyKind`]: its layout is
-    /// [`Variants::Multiple`], its states are variants and its saved locals are per-variant fields.
-    /// What it does not have is variant *names*, so its tag is the state's index.
+    /// [`Variants::Multiple`], its states are variants and its saved locals are per-variant
+    /// fields. What it does not have is variant *names*, so its tag is the state's index.
     ///
     /// Always an object, never the bare number: a coroutine holds its upvars beside the tag from
     /// the moment it is built, and it is only ever reached through a `&mut` (`Future::poll` takes
@@ -255,19 +263,30 @@ pub(crate) enum EnumRepr {
 /// enum answers the way the enum does. `core::mem::Alignment` is exactly that wrapper.
 pub(crate) fn direct_tag<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<(u64, bool)> {
     let ty = peel_pattern(peel_transparent(tcx, ty));
-    let ty::Adt(def, _) = ty.kind() else { return None };
-    if !def.is_enum() || def.variants().iter().any(|variant| !variant.fields.is_empty()) {
+    let ty::Adt(def, _) = ty.kind() else {
+        return None;
+    };
+    if !def.is_enum()
+        || def
+            .variants()
+            .iter()
+            .any(|variant| !variant.fields.is_empty())
+    {
         return None;
     }
     // Without an integer `repr` the discriminants are the compiler's own numbering, and a variant
     // is spelled by name instead.
-    if def.repr().int.is_none() {
-        return None;
-    }
+    def.repr().int?;
     let layout = tcx.layout_of(typing_env().as_query_input(ty)).ok()?;
     match layout.variants {
-        Variants::Multiple { tag, tag_encoding: TagEncoding::Direct, .. } => {
-            let rustc_abi::Primitive::Int(integer, signed) = tag.primitive() else { return None };
+        Variants::Multiple {
+            tag,
+            tag_encoding: TagEncoding::Direct,
+            ..
+        } => {
+            let rustc_abi::Primitive::Int(integer, signed) = tag.primitive() else {
+                return None;
+            };
             Some((integer.size().bits(), signed))
         }
         _ => None,
@@ -284,14 +303,19 @@ pub(crate) fn enum_repr<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<EnumRep
     if let ty::Coroutine(..) = peeled.kind() {
         return Some(EnumRepr::State);
     }
-    let ty::Adt(def, _) = peeled.kind() else { return None };
+    let ty::Adt(def, _) = peeled.kind() else {
+        return None;
+    };
     if !def.is_enum() {
         return None;
     }
     if direct_tag(tcx, peeled).is_some() {
         return Some(EnumRepr::Number);
     }
-    let fieldless = def.variants().iter().all(|variant| variant.fields.is_empty());
+    let fieldless = def
+        .variants()
+        .iter()
+        .all(|variant| variant.fields.is_empty());
     Some(EnumRepr::Tag { fieldless })
 }
 
@@ -301,8 +325,10 @@ pub(crate) fn enum_repr<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<EnumRep
 /// Zero sized enums are excluded: their value is `undefined`, which every part of this model
 /// already treats as an aggregate with nothing in it.
 pub(crate) fn is_primitive_enum<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
-    matches!(enum_repr(tcx, ty), Some(EnumRepr::Number | EnumRepr::Tag { fieldless: true }))
-        && !is_zst(tcx, ty)
+    matches!(
+        enum_repr(tcx, ty),
+        Some(EnumRepr::Number | EnumRepr::Tag { fieldless: true })
+    ) && !is_zst(tcx, ty)
 }
 
 /// The JavaScript string standing for one variant of a [tagged](EnumRepr::Tag) enum.
@@ -320,8 +346,9 @@ pub(crate) fn discriminant_literal<'tcx>(
     index: VariantIdx,
 ) -> Expr {
     match ty.discriminant_for_variant(tcx, index) {
-        Some(discr) => int_literal(tcx, discr.ty, discr.val)
-            .unwrap_or_else(|| jsast::num(discr.val as f64)),
+        Some(discr) => {
+            int_literal(tcx, discr.ty, discr.val).unwrap_or_else(|| jsast::num(discr.val as f64))
+        }
         None => jsast::num(0),
     }
 }
@@ -354,14 +381,20 @@ pub(crate) fn enum_value<'tcx>(
 /// A name for a [tagged](EnumRepr::Tag) enum and the discriminant number for a
 /// [numeric](EnumRepr::Number) one. This is what [`tag_expr`] reads back, so a `SwitchInt` case and
 /// a `SetDiscriminant` both spell a variant with it. `None` when `ty` is not an enum.
-pub(crate) fn variant_tag<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, index: VariantIdx) -> Option<Expr> {
+pub(crate) fn variant_tag<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+    index: VariantIdx,
+) -> Option<Expr> {
     let peeled = peel_pattern(peel_transparent(tcx, ty));
     // A coroutine's states have no names, so the index is the tag. It is also the discriminant
     // `SwitchInt` compares against, which is what makes the numeric decision tree work unchanged.
     if let ty::Coroutine(..) = peeled.kind() {
         return Some(jsast::num(index.as_u32() as f64));
     }
-    let ty::Adt(def, _) = peeled.kind() else { return None };
+    let ty::Adt(def, _) = peeled.kind() else {
+        return None;
+    };
     Some(match enum_repr(tcx, peeled)? {
         EnumRepr::Number => discriminant_literal(tcx, peeled, index),
         EnumRepr::Tag { .. } | EnumRepr::State => tag_literal(def.variant(index)),
@@ -401,7 +434,9 @@ pub(crate) fn discriminant_number<'tcx>(
     if repr == EnumRepr::State {
         return Some(tag_expr(repr, value));
     }
-    let ty::Adt(def, _) = peeled.kind() else { return None };
+    let ty::Adt(def, _) = peeled.kind() else {
+        return None;
+    };
     let tag = tag_expr(repr, value);
     let mut indices = def.variants().indices();
     let last = indices.next_back()?;
@@ -430,7 +465,9 @@ pub(crate) fn variant_with_discriminant<'tcx>(
     discriminant: u128,
 ) -> Option<&'tcx ty::VariantDef> {
     let peeled = peel_pattern(peel_transparent(tcx, ty));
-    let ty::Adt(def, _) = peeled.kind() else { return None };
+    let ty::Adt(def, _) = peeled.kind() else {
+        return None;
+    };
     def.variants()
         .iter_enumerated()
         .find(|(index, _)| {
@@ -586,7 +623,11 @@ pub(crate) fn clone_expr<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, value: Expr) -> 
     }
     // `x` if `x` is copied as is, `clone_expr(x)` if it needs one of its own.
     let clone_field = |field_ty: Ty<'tcx>, read: Expr| {
-        if needs_clone(tcx, field_ty) { clone_expr(tcx, field_ty, read) } else { read }
+        if needs_clone(tcx, field_ty) {
+            clone_expr(tcx, field_ty, read)
+        } else {
+            read
+        }
     };
 
     match ty.kind() {
@@ -641,7 +682,10 @@ pub(crate) fn clone_expr<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, value: Expr) -> 
 
 /// `Object.assign({}, value)`, a one level copy for a shape this module cannot take apart.
 fn shallow_clone(value: Expr) -> Expr {
-    jsast::call(jsast::member(jsast::id("Object"), "assign"), vec![jsast::object(vec![]), value])
+    jsast::call(
+        jsast::member(jsast::id("Object"), "assign"),
+        vec![jsast::object(vec![]), value],
+    )
 }
 
 /// A copy of an enum value: `TAG === "A" ? { TAG: "A", _0: ... } : ...`.
@@ -661,7 +705,10 @@ fn clone_enum<'tcx>(
 ) -> Expr {
     let payload_needs_clone = def.variants().iter().any(|variant| {
         variant.fields.iter().any(|field| {
-            needs_clone(tcx, tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args)))
+            needs_clone(
+                tcx,
+                tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args)),
+            )
         })
     });
 
@@ -690,7 +737,9 @@ fn clone_enum<'tcx>(
 
     // The last variant is the fallback of the chain, so it needs no test of its own.
     let mut indices = def.variants().indices();
-    let Some(last) = indices.next_back() else { return shallow_clone(value) };
+    let Some(last) = indices.next_back() else {
+        return shallow_clone(value);
+    };
     let mut copy = variant_copy(last).1;
     for index in indices.rev() {
         let (tag, variant) = variant_copy(index);
@@ -727,7 +776,11 @@ pub(crate) fn variant_def<'tcx>(
     def: ty::AdtDef<'tcx>,
     variant: Option<VariantIdx>,
 ) -> &'tcx ty::VariantDef {
-    if def.is_enum() { def.variant(variant.unwrap_or(FIRST_VARIANT)) } else { def.non_enum_variant() }
+    if def.is_enum() {
+        def.variant(variant.unwrap_or(FIRST_VARIANT))
+    } else {
+        def.non_enum_variant()
+    }
 }
 
 /// Where to find field `field` of a place of type `base_ty` (already downcast to `variant`).
@@ -737,6 +790,12 @@ pub(crate) fn field_key<'tcx>(
     variant: Option<VariantIdx>,
     field: FieldIdx,
 ) -> Option<FieldKey> {
+    // Every zero-sized value is the one JavaScript value `undefined`, including an all-ZST
+    // aggregate after rustc has inlined or constant-folded its constructor. A field projection
+    // must preserve that representation instead of inventing an object-shaped `.field` read.
+    if is_zst(tcx, base_ty) {
+        return Some(FieldKey::Transparent);
+    }
     // A transparent wrapper is its field, whichever field is named: a union's payload arm is the
     // value itself, and its zero sized arm is the `undefined` an uninitialized value is. A
     // `repr(transparent)` struct has one field that is not a 1-ZST, and reading a 1-ZST field
@@ -745,7 +804,10 @@ pub(crate) fn field_key<'tcx>(
         return Some(FieldKey::Transparent);
     }
     match base_ty.kind() {
-        ty::Adt(def, _) => Some(FieldKey::Name(Namer::field_name(variant_def(*def, variant), field))),
+        ty::Adt(def, _) => Some(FieldKey::Name(Namer::field_name(
+            variant_def(*def, variant),
+            field,
+        ))),
         ty::Tuple(_) | ty::Closure(..) => Some(FieldKey::Index(field.as_usize())),
         ty::Coroutine(def_id, args) => coroutine_field_key(tcx, *def_id, args, variant, field),
         _ => None,
@@ -808,13 +870,12 @@ pub(crate) enum IntRepr {
     BigInt,
 }
 
-/// How values of `ty` are represented, for any integer type. Non-integers report [`IntRepr::Number`],
-/// which is what `bool`, `char` and the floats all are.
+/// How values of `ty` are represented, for any integer type. Non-integers report
+/// [`IntRepr::Number`], which is what `bool`, `char` and the floats all are.
 pub(crate) fn int_repr<'tcx>(ty: Ty<'tcx>) -> IntRepr {
     match ty.kind() {
-        ty::Int(ty::IntTy::I64 | ty::IntTy::I128) | ty::Uint(ty::UintTy::U64 | ty::UintTy::U128) => {
-            IntRepr::BigInt
-        }
+        ty::Int(ty::IntTy::I64 | ty::IntTy::I128)
+        | ty::Uint(ty::UintTy::U64 | ty::UintTy::U128) => IntRepr::BigInt,
         _ => IntRepr::Number,
     }
 }
@@ -876,7 +937,11 @@ pub(crate) fn resign(signed: bool, bits: u32, raw: u128) -> i128 {
 
 /// A `BigInt` literal for a raw bit pattern of the given width and signedness.
 pub(crate) fn wide_int_literal(signed: bool, bits: u32, raw: u128) -> Expr {
-    if signed { jsast::bigint(resign(true, bits, raw)) } else { jsast::bigint(raw) }
+    if signed {
+        jsast::bigint(resign(true, bits, raw))
+    } else {
+        jsast::bigint(raw)
+    }
 }
 
 /// A literal for a raw integer bit pattern of type `ty`, in whichever representation `ty` uses.

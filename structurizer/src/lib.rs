@@ -11,8 +11,16 @@
 //! let cfg = Cfg {
 //!     entry: BlockId(0),
 //!     blocks: vec![
-//!         Block { stmts: "x = 1;", term: Term::Goto(BlockId(1)), unwind: None },
-//!         Block { stmts: "y = 2;", term: Term::Return, unwind: None },
+//!         Block {
+//!             stmts: "x = 1;",
+//!             term: Term::Goto(BlockId(1)),
+//!             unwind: None,
+//!         },
+//!         Block {
+//!             stmts: "y = 2;",
+//!             term: Term::Return,
+//!             unwind: None,
+//!         },
 //!     ],
 //! };
 //! let out = structure::<&str, &str>(cfg, &Options::default()).unwrap();
@@ -59,11 +67,14 @@
 //! range block id, or an empty body. Malformed input never panics.
 //!
 //! Control flow this crate cannot express as loops and labeled blocks is not
-//! an error. An irreducible graph, or one that nests deeper than a few hundred
+//! an error. A loop with more than one entry has its entries compiled as the
+//! cases of a [`Region::Dispatch`] nested inside otherwise structured flow,
+//! and a body that defeats even that, or that nests deeper than a few hundred
 //! levels, comes back as a single [`Region::Dispatch`] over all its blocks,
 //! which expresses any graph at the cost of readability.
-//! [`StructureStats::dispatch_fallbacks`] counts those, so a backend can
-//! measure how often it happens.
+//! [`StructureStats::dispatch_fallbacks`] counts the dispatches and
+//! [`StructureStats::whole_body_dispatch`] flags the flat form, so a backend
+//! can measure how often each happens.
 
 mod cfg;
 mod dom;
@@ -113,6 +124,9 @@ pub struct StructureStats {
     pub irreducible: bool,
     /// How many [`Region::Dispatch`] regions the output holds.
     pub dispatch_fallbacks: u32,
+    /// The whole body is one flat [`Region::Dispatch`], because
+    /// [`Options::force_dispatch`] asked for it or the nested form failed.
+    pub whole_body_dispatch: bool,
 }
 
 /// The result of [`structure`].
@@ -130,7 +144,10 @@ pub enum StructureError {
     /// The body has no blocks, or the entry is not one of them.
     EmptyCfg,
     /// A terminator names a block that does not exist.
-    BlockOutOfRange { from: Option<BlockId>, target: BlockId },
+    BlockOutOfRange {
+        from: Option<BlockId>,
+        target: BlockId,
+    },
     /// A block that is not reachable from the entry was asked about.
     UnreachableBlock(BlockId),
     /// A block was placed in two different scopes.
@@ -210,18 +227,26 @@ pub fn structure<S: Payload, C>(
 ) -> Result<Structured<S, C>, StructureError> {
     let mut order = order::Order::build(&cfg)?;
     let dom = dom::Dom::build(&order)?;
-    let mut stats = StructureStats::default();
-    stats.irreducible = !loops::is_reducible(&order, &dom);
+    let stats = StructureStats {
+        irreducible: !loops::is_reducible(&order, &dom),
+        ..StructureStats::default()
+    };
 
-    let (skeleton, stats) = if stats.irreducible || opts.force_dispatch {
+    let (skeleton, stats) = if opts.force_dispatch {
         let mut emitter = emit::Emitter::new(&cfg, &order, &dom, opts, stats);
         let skeleton = emitter.run_dispatch()?;
         (skeleton, emitter.stats())
     } else {
         // Hoisting a loop continuation out changes which blocks dominate it,
-        // so the tree has to be built again afterwards.
-        loops::shrink_loops(&cfg, &mut order, opts)?;
-        let dom = dom::Dom::build(&order)?;
+        // so the tree has to be built again afterwards. A graph with a multi
+        // entry loop skips the hoist: it is calibrated for loops with one
+        // entry, and the cycles it would move resolve through dispatches.
+        let dom = if stats.irreducible {
+            dom
+        } else {
+            loops::shrink_loops(&cfg, &mut order, opts)?;
+            dom::Dom::build(&order)?
+        };
         let mut emitter = emit::Emitter::new(&cfg, &order, &dom, opts, stats);
         match emitter.run() {
             Ok(skeleton) => (skeleton, emitter.stats()),
@@ -270,14 +295,27 @@ fn fill_region<S, C>(
             label,
             body: Box::new(fill_region(*body, stmts, conds)?),
         },
-        Region::LetTmp { tmp, value } => Region::LetTmp { tmp, value: take_cond(conds, value)? },
-        Region::If { scrut, test, then_, else_ } => Region::If {
+        Region::LetTmp { tmp, value } => Region::LetTmp {
+            tmp,
+            value: take_cond(conds, value)?,
+        },
+        Region::If {
+            scrut,
+            test,
+            then_,
+            else_,
+        } => Region::If {
             scrut: fill_scrut(conds, scrut)?,
             test,
             then_: Box::new(fill_region(*then_, stmts, conds)?),
             else_: Box::new(fill_region(*else_, stmts, conds)?),
         },
-        Region::Switch { scrut, arms, default, label } => Region::Switch {
+        Region::Switch {
+            scrut,
+            arms,
+            default,
+            label,
+        } => Region::Switch {
             scrut: fill_scrut(conds, scrut)?,
             arms: arms
                 .into_iter()
@@ -286,7 +324,12 @@ fn fill_region<S, C>(
             default: Box::new(fill_region(*default, stmts, conds)?),
             label,
         },
-        Region::Dispatch { sel, label, cases, trailing_break } => Region::Dispatch {
+        Region::Dispatch {
+            sel,
+            label,
+            cases,
+            trailing_break,
+        } => Region::Dispatch {
             sel,
             label,
             cases: cases
@@ -318,10 +361,7 @@ fn take_cond<C>(conds: &mut [Option<C>], b: BlockId) -> Result<C, StructureError
         .ok_or(StructureError::Internal("scrutinee read more than once"))
 }
 
-fn fill_scrut<C>(
-    conds: &mut [Option<C>],
-    s: Scrut<BlockId>,
-) -> Result<Scrut<C>, StructureError> {
+fn fill_scrut<C>(conds: &mut [Option<C>], s: Scrut<BlockId>) -> Result<Scrut<C>, StructureError> {
     match s {
         Scrut::Payload(b) => take_cond(conds, b).map(Scrut::Payload),
         Scrut::Tmp(t) => Ok(Scrut::Tmp(t)),

@@ -1,0 +1,273 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>keyed DOM runtime test</title>
+<body>
+<script type="module">
+import "../runtime/shim.js";
+
+const checks = [];
+const check = (condition, name) => {
+  if (!condition) throw new Error(`failed: ${name}`);
+  checks.push(name);
+};
+const names = parent => [...parent.childNodes].map(node => node.dataset?.name || "end");
+const rt = globalThis.__rt;
+
+try {
+  const parent = document.createElement("div");
+  Object.defineProperty(parent, "moveBefore", { configurable: true, value: undefined });
+  document.body.append(parent);
+  const state = rt.keyed_dom_state(parent);
+  const disposed = [];
+  let factories = 0;
+  const factory = (owner, item) => {
+    factories += 1;
+    owner.onCleanup(() => disposed.push(item.id));
+    const label = document.createElement("span");
+    label.dataset.name = `label:${item.id}`;
+    const input = document.createElement("input");
+    input.dataset.name = `input:${item.id}`;
+    input.value = item.label;
+    return [label, input];
+  };
+
+  rt.keyed_dom_reconcile(
+    state,
+    [{ id: 1, label: "one" }, { id: 2, label: "two" }, { id: 3, label: "three" }],
+    item => item.id,
+    factory,
+  );
+  const row1 = state.rows.get(1);
+  const row2 = state.rows.get(2);
+  const row3 = state.rows.get(3);
+  const active = row2.nodes[1];
+  active.focus();
+  active.setSelectionRange(1, 2);
+  const blur = [];
+  active.addEventListener("blur", () => blur.push("blur"));
+
+  rt.keyed_dom_reconcile(
+    state,
+    [{ id: 3, label: "three+" }, { id: 1, label: "one+" }, { id: 2, label: "two+" }],
+    item => item.id,
+    factory,
+  );
+  check(state.rows.get(1) === row1 && state.rows.get(2) === row2 && state.rows.get(3) === row3,
+    "retained row identity");
+  check(document.activeElement === active && active.selectionStart === 1 && active.selectionEnd === 2,
+    "focus and selection survive common reorder");
+  check(blur.length === 0, "common reorder emits no blur");
+  check(row2.item.value.label === "two+" && row2.index.value === 2, "live row slots update");
+  check(names(parent).join(",") === "label:3,input:3,label:1,input:1,label:2,input:2,end",
+    "multi-node target order");
+  check(factories === 3, "retained rows are not rebuilt");
+
+  const beforeFailure = names(parent);
+  const beforeItems = [row3.item.value, row1.item.value, row2.item.value];
+  const insertBefore = parent.insertBefore.bind(parent);
+  let failAfter = 1;
+  parent.insertBefore = (node, reference) => {
+    if (failAfter === 0) {
+      failAfter = null;
+      throw new Error("injected browser DOM failure");
+    }
+    if (failAfter !== null) failAfter -= 1;
+    return insertBefore(node, reference);
+  };
+  let failed = false;
+  try {
+    rt.keyed_dom_reconcile(
+      state,
+      [{ id: 1, label: "bad-1" }, { id: 2, label: "bad-2" }, { id: 3, label: "bad-3" }],
+      item => item.id,
+      factory,
+    );
+  } catch (error) {
+    failed = error.message === "injected browser DOM failure";
+  }
+  check(failed, "injected commit failure is reported");
+  check(names(parent).join(",") === beforeFailure.join(","), "browser DOM rollback");
+  check(state.rows.get(3) === row3 && state.rows.get(1) === row1 && state.rows.get(2) === row2,
+    "row map rollback");
+  check(row3.item.value === beforeItems[0] && row1.item.value === beforeItems[1]
+    && row2.item.value === beforeItems[2], "slot rollback");
+  check(document.activeElement === active && blur.length === 0, "rollback preserves focus");
+
+  let duplicateFactories = 0;
+  try {
+    rt.keyed_dom_reconcile(
+      state,
+      [{ id: 2 }, { id: 2 }],
+      item => item.id,
+      () => {
+        duplicateFactories += 1;
+        return document.createElement("div");
+      },
+    );
+  } catch (error) {
+    check(error.message.includes("duplicate keyed-list key"), "duplicate key diagnostic");
+  }
+  check(duplicateFactories === 0, "duplicates fail before row creation");
+
+  rt.keyed_dom_reconcile(
+    state,
+    [{ id: 3, label: "three" }, { id: 4, label: "four" }],
+    item => item.id,
+    factory,
+  );
+  check(row1.nodes.every(node => node.parentNode === null)
+    && row2.nodes.every(node => node.parentNode === null), "removed ranges detach");
+  check(disposed.join(",") === "1,2", "removed owners dispose exactly once");
+  check(factories === 4, "only a new key builds a row");
+
+  const atomicParent = document.createElement("div");
+  document.body.append(atomicParent);
+  const atomicSupported = typeof atomicParent.moveBefore === "function";
+  let atomicLifecycle = null;
+  if (atomicSupported) {
+    let connected = 0;
+    let disconnected = 0;
+    let moved = 0;
+    if (!customElements.get("keyed-runtime-probe")) {
+      customElements.define("keyed-runtime-probe", class extends HTMLElement {
+        connectedCallback() { connected += 1; }
+        disconnectedCallback() { disconnected += 1; }
+        connectedMoveCallback() { moved += 1; }
+      });
+    }
+    const atomicState = rt.keyed_dom_state(atomicParent);
+    rt.keyed_dom_reconcile(
+      atomicState,
+      [{ id: 1 }, { id: 2 }, { id: 3 }],
+      item => item.id,
+      (_owner, item) => {
+        const node = document.createElement("keyed-runtime-probe");
+        node.dataset.name = `atomic:${item.id}`;
+        return node;
+      },
+    );
+    rt.keyed_dom_reconcile(
+      atomicState,
+      [{ id: 3 }, { id: 1 }, { id: 2 }],
+      item => item.id,
+      () => { throw new Error("retained atomic row rebuilt"); },
+    );
+    atomicLifecycle = { connected, disconnected, moved };
+    check(disconnected === 0 && connected === 3 && moved > 0,
+      "moveBefore preserves custom-element lifecycle");
+    rt.keyed_dom_dispose(atomicState);
+  }
+
+  for (const nestedSource of [false, true]) {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const list = rt.keyed_dom_state(container);
+    const created = [], removed = [];
+    const factory = (owner, item) => {
+      created.push(item);
+      owner.onCleanup(() => removed.push(item));
+      const node = document.createElement("span");
+      node.textContent = String(item);
+      return node;
+    };
+    const queued = [3];
+    rt.keyed_dom_reconcile(list, {
+      *[Symbol.iterator]() {
+        rt.keyed_dom_reconcile(list, nestedSource ? {
+          *[Symbol.iterator]() {
+            rt.keyed_dom_reconcile(list, queued, key => key, factory);
+            queued[0] = 4;
+            yield 2;
+          },
+        } : [2], key => key, factory);
+        check(created.length === 0 && container.childNodes.length === 1,
+          "source iteration cannot create or commit a nested DOM row");
+        yield 1;
+      },
+    }, key => key, factory);
+    const latest = nestedSource ? 3 : 2;
+    check(container.textContent === String(latest), "newest source snapshot owns the final DOM");
+    check(created.join(",") === `1,${latest}` && removed.join(",") === "1",
+      "superseded queued source creates no owner and committed rows clean up once");
+    rt.keyed_dom_dispose(list);
+    check(container.childNodes.length === 0 && removed.join(",") === `1,${latest}`,
+      "reentrant source list disposal removes every row and boundary");
+    container.remove();
+  }
+
+  // A carrier can fail after its row has acquired resources but before the
+  // transaction receives the record. Clean up that row and earlier new rows.
+  for (const phase of ["lookup", "call", "element"]) {
+    for (const cleanupThrows of [false, true]) {
+      const container = document.createElement("div");
+      document.body.append(container);
+      const target = new EventTarget();
+      const heard = [], removed = [];
+      let roots = 0;
+      const list = rt.keyed_dom_state(container, undefined, {
+        root: build => {
+          roots += 1;
+          return build(() => { roots -= 1; });
+        },
+      });
+      const failure = Object.freeze(new Error("carrier copy"));
+      const factory = (owner, item) => {
+        const listener = () => heard.push(item);
+        target.addEventListener("ping", listener);
+        owner.onCleanup(() => {
+          target.removeEventListener("ping", listener);
+          removed.push(item);
+          if (item === 3 && cleanupThrows) throw new Error("cleanup");
+        });
+        const node = document.createElement("span");
+        node.textContent = String(item);
+        if (item !== 3) return node;
+        const carrier = [node];
+        if (phase === "lookup") {
+          Object.defineProperty(carrier, "slice", { get() { throw failure; } });
+        } else if (phase === "call") {
+          carrier.slice = () => { throw failure; };
+        } else {
+          Object.defineProperty(carrier, 0, { get() { throw failure; } });
+        }
+        return carrier;
+      };
+      rt.keyed_dom_reconcile(list, [1], key => key, factory);
+      const original = list.rows.get(1);
+      let caught = false;
+      try {
+        rt.keyed_dom_reconcile(list, [2, 3, 1], key => key, factory);
+      } catch (error) {
+        caught = error === failure;
+      }
+      check(caught, "carrier failure identity survives cleanup errors");
+      check(roots === 1, "failed carrier and prior new row dispose their roots");
+      check(removed.join(",") === "3,2", "every failed transaction row cleans up once");
+      target.dispatchEvent(new Event("ping"));
+      check(heard.join(",") === "1", "failed carrier leaves no live event listener");
+      check(list.rows.size === 1 && list.rows.get(1) === original
+        && container.firstChild === original.nodes[0] && container.childNodes.length === 2,
+      "carrier failure preserves the committed row and DOM");
+      rt.keyed_dom_reconcile(list, [1, 4], key => key, factory);
+      check(container.textContent === "14" && roots === 2, "carrier failure permits recovery");
+      rt.keyed_dom_dispose(list);
+      heard.length = 0;
+      target.dispatchEvent(new Event("ping"));
+      check(roots === 0 && heard.length === 0 && container.childNodes.length === 0,
+        "recovered list disposal releases roots, listeners, and DOM");
+      check(removed.join(",") === "3,2,1,4", "recovery cleanup is exactly once");
+      container.remove();
+    }
+  }
+
+  rt.keyed_dom_dispose(state);
+  check(parent.childNodes.length === 0, "island disposal removes rows and boundary");
+  check(disposed.join(",") === "1,2,3,4", "island disposal is exact");
+  window.__keyedDomResult = { atomicLifecycle, atomicSupported, checks, status: "pass" };
+  document.body.dataset.status = "pass";
+} catch (error) {
+  window.__keyedDomResult = { error: error.stack || String(error), message: String(error.message || error), checks, status: "fail" };
+  document.body.dataset.status = "fail";
+}
+</script>
+</body>

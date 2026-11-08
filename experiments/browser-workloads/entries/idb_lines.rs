@@ -1,0 +1,17 @@
+#![no_std]
+#![no_main]
+#![deny(unsafe_code)]
+
+extern crate browser_workloads;
+
+use mires_js::{JsValue, js_export};
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    loop {}
+}
+
+#[js_export]
+pub fn workload_run(options: JsValue) -> JsValue {
+    browser_workloads::idb_lines::roundtrip(options)
+}

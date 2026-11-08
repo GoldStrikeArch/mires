@@ -152,7 +152,10 @@ fn a_covered_range_splits_by_comparison() {
     // splitting until it reaches a range it fully covers and can compare
     // against directly.
     let cases: Vec<(u128, u32)> = (0..16).map(|v| (v as u128, v / 2 + 1)).collect();
-    let opts = Options { switch_max_case: 4, ..Options::default() };
+    let opts = Options {
+        switch_max_case: 4,
+        ..Options::default()
+    };
     let out = run_opts(cfg(switch_cfg(&cases, 9, 9)), &opts);
     expect![[r#"
         b0;
@@ -209,7 +212,10 @@ fn a_scrutinee_read_twice_is_bound_once() {
     // A tree of comparisons over the same value: it is evaluated into a
     // temporary first, so it is read once however many tests there are.
     let cases = [(0, 1), (5, 2), (9, 3)];
-    let opts = Options { switch_max_case: 2, ..Options::default() };
+    let opts = Options {
+        switch_max_case: 2,
+        ..Options::default()
+    };
     let out = run_opts(cfg(switch_cfg(&cases, 4, 4)), &opts);
     expect![[r#"
         b0;

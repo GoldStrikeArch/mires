@@ -42,9 +42,16 @@ pub(crate) fn emit<'tcx>(
     fx: &FnCx<'_, 'tcx>,
     region: Region<Vec<Stmt>, Scrutinee<'tcx>>,
 ) -> (Vec<Stmt>, Vec<String>) {
-    let mut emitter = Emitter { fx, tmps: BTreeMap::new() };
+    let mut emitter = Emitter {
+        fx,
+        tmps: BTreeMap::new(),
+    };
     let body = emitter.region(region);
-    let tmps = emitter.tmps.keys().map(|tmp| tmp_name(TmpId(*tmp))).collect();
+    let tmps = emitter
+        .tmps
+        .keys()
+        .map(|tmp| tmp_name(TmpId(*tmp)))
+        .collect();
     (body, tmps)
 }
 
@@ -64,6 +71,8 @@ struct Emitter<'a, 'b, 'tcx> {
     tmps: BTreeMap<u32, Option<ScrutTy<'tcx>>>,
 }
 
+type SwitchArm<'tcx> = (Vec<u128>, Region<Vec<Stmt>, Scrutinee<'tcx>>);
+
 impl<'tcx> Emitter<'_, '_, 'tcx> {
     fn region(&mut self, region: Region<Vec<Stmt>, Scrutinee<'tcx>>) -> Vec<Stmt> {
         match region {
@@ -73,21 +82,37 @@ impl<'tcx> Emitter<'_, '_, 'tcx> {
                 let body = self.region(*body);
                 vec![jsast::labeled(label_name(label), Stmt::Block(body))]
             }
-            Region::Loop { label, body } => vec![self.loop_(label, *body)],
+            Region::Loop { label, body } => self.loop_(label, *body),
             Region::LetTmp { tmp, value } => {
                 self.tmps.insert(tmp.0, Some(value.ty));
                 vec![jsast::assign_stmt(jsast::id(tmp_name(tmp)), value.value)]
             }
-            Region::If { scrut, test, then_, else_ } => self.if_(scrut, test, *then_, *else_),
-            Region::Switch { scrut, arms, default, label } => {
-                self.switch(scrut, arms, *default, label)
-            }
-            Region::Dispatch { sel, label, cases, trailing_break } => {
+            Region::If {
+                scrut,
+                test,
+                then_,
+                else_,
+            } => self.if_(scrut, test, *then_, *else_),
+            Region::Switch {
+                scrut,
+                arms,
+                default,
+                label,
+            } => self.switch(scrut, arms, *default, label),
+            Region::Dispatch {
+                sel,
+                label,
+                cases,
+                trailing_break,
+            } => {
                 vec![self.dispatch(sel, label, cases, trailing_break)]
             }
             Region::SetSel(tmp, value) => {
                 self.tmps.entry(tmp.0).or_insert(None);
-                vec![jsast::assign_stmt(jsast::id(tmp_name(tmp)), jsast::num(value))]
+                vec![jsast::assign_stmt(
+                    jsast::id(tmp_name(tmp)),
+                    jsast::num(value),
+                )]
             }
             Region::Break(label) => vec![Stmt::Break(label.map(label_name))],
             Region::Continue(label) => vec![Stmt::Continue(label.map(label_name))],
@@ -95,26 +120,39 @@ impl<'tcx> Emitter<'_, '_, 'tcx> {
             // local, in which case what it holds is `_0[0]`.
             Region::Return => vec![jsast::ret(self.fx.local_expr(RETURN_PLACE))],
             Region::Unreachable => {
-                vec![jsast::throw_error("rustc_codegen_mires: entered unreachable code")]
+                vec![jsast::throw_abort(
+                    "rustc_codegen_js: entered unreachable code",
+                )]
             }
             Region::Throw => {
-                vec![jsast::throw_error("rustc_codegen_mires: unwinding is not supported")]
+                vec![jsast::throw_abort(
+                    "rustc_codegen_js: unwinding is not supported",
+                )]
             }
         }
     }
 
-    fn loop_(&mut self, label: Option<Label>, body: Region<Vec<Stmt>, Scrutinee<'tcx>>) -> Stmt {
+    fn loop_(
+        &mut self,
+        label: Option<Label>,
+        body: Region<Vec<Stmt>, Scrutinee<'tcx>>,
+    ) -> Vec<Stmt> {
         let mut body = self.region(body);
+        // A marker-only body belongs to the executable empty loop itself.
+        if body.iter().all(|stmt| matches!(stmt, Stmt::Loc(_))) {
+            body.push(Stmt::LoopForever(label.map(label_name), Vec::new()));
+            return body;
+        }
         // `for (;;) { if (c) { .. } else break; }` is the `while` the source had. Both forms run
         // the body while `c` holds, and both capture the same `break`s and `continue`s, so the
         // rewrite is local to this statement.
-        match as_while(&mut body) {
+        vec![match as_while(&mut body) {
             Some((test, inner)) => match label {
                 Some(label) => jsast::labeled(label_name(label), jsast::while_(test, inner)),
                 None => jsast::while_(test, inner),
             },
             None => Stmt::LoopForever(label.map(label_name), body),
-        }
+        }]
     }
 
     fn if_(
@@ -135,7 +173,11 @@ impl<'tcx> Emitter<'_, '_, 'tcx> {
             // or a boolean, never a float, so nothing here can be NaN.
             (true, false) => vec![jsast::if_(self.test(value, scrut_ty, test, true), else_)],
             (false, false) => {
-                vec![jsast::if_else(self.test(value, scrut_ty, test, false), then_, else_)]
+                vec![jsast::if_else(
+                    self.test(value, scrut_ty, test, false),
+                    then_,
+                    else_,
+                )]
             }
             // Nothing left to choose between. An inline scrutinee still has to be evaluated for
             // whatever effects it has; one already bound to a temporary has been.
@@ -147,7 +189,7 @@ impl<'tcx> Emitter<'_, '_, 'tcx> {
     fn switch(
         &mut self,
         scrut: Scrut<Scrutinee<'tcx>>,
-        arms: Vec<(Vec<u128>, Region<Vec<Stmt>, Scrutinee<'tcx>>)>,
+        arms: Vec<SwitchArm<'tcx>>,
         default: Region<Vec<Stmt>, Scrutinee<'tcx>>,
         label: Option<Label>,
     ) -> Vec<Stmt> {
@@ -161,7 +203,10 @@ impl<'tcx> Emitter<'_, '_, 'tcx> {
             .into_iter()
             .map(|(values, body)| {
                 let body = self.region(body);
-                let tests = values.into_iter().map(|v| self.case_literal(scrut_ty, v)).collect();
+                let tests = values
+                    .into_iter()
+                    .map(|v| self.case_literal(scrut_ty, v))
+                    .collect();
                 jsast::case(tests, body)
             })
             .collect();
@@ -198,7 +243,7 @@ impl<'tcx> Emitter<'_, '_, 'tcx> {
             jsast::id("Error"),
             vec![jsast::binary(
                 BinOp::Add,
-                jsast::string("rustc_codegen_mires: bad block "),
+                jsast::string("rustc_codegen_js: bad block "),
                 selector.clone(),
             )],
         ))]));
@@ -222,11 +267,10 @@ impl<'tcx> Emitter<'_, '_, 'tcx> {
     ///
     /// A `Region::LetTmp` always precedes the tests that read its temporary, so the type is there.
     fn tmp_ty(&self, tmp: TmpId) -> ScrutTy<'tcx> {
-        self.tmps
-            .get(&tmp.0)
-            .copied()
-            .flatten()
-            .unwrap_or(ScrutTy { ty: self.fx.tcx.types.usize, tag_enum: None })
+        self.tmps.get(&tmp.0).copied().flatten().unwrap_or(ScrutTy {
+            ty: self.fx.tcx.types.usize,
+            tag_enum: None,
+        })
     }
 
     /// A case value as a JavaScript literal, unbiased back into the scrutinee's own type.
@@ -238,18 +282,16 @@ impl<'tcx> Emitter<'_, '_, 'tcx> {
     fn case_literal(&self, scrut: ScrutTy<'tcx>, encoded: u128) -> Expr {
         let raw = cfg_adapter::decode(self.fx.tcx, scrut.ty, encoded);
         match scrut.tag_enum {
-            Some(enum_ty) => {
-                match value::variant_with_discriminant(self.fx.tcx, enum_ty, raw) {
-                    Some(variant) => value::tag_literal(variant),
-                    None => jsast::string(format!("$no-variant-{raw}")),
-                }
-            }
+            Some(enum_ty) => match value::variant_with_discriminant(self.fx.tcx, enum_ty, raw) {
+                Some(variant) => value::tag_literal(variant),
+                None => jsast::string(format!("$no-variant-{raw}")),
+            },
             None => self.fx.switch_case_value(scrut.ty, raw),
         }
     }
 
-    /// The variants of a tag scrutinee's enum whose discriminant `keep` accepts, as an `||` chain of
-    /// equalities (or, negated, an `&&` chain of inequalities).
+    /// The variants of a tag scrutinee's enum whose discriminant `keep` accepts, as an `||` chain
+    /// of equalities (or, negated, an `&&` chain of inequalities).
     ///
     /// The structurizer reports an ordering test -- "below 3", "one of 2 values from 0" -- whenever
     /// the values it is partitioning happen to be contiguous. Names have no order, so the test is
@@ -270,18 +312,28 @@ impl<'tcx> Emitter<'_, '_, 'tcx> {
             (BinOp::StrictEq, BinOp::Or)
         };
         let peeled = value::peel_pattern(value::peel_transparent(tcx, enum_ty));
-        let ty::Adt(def, _) = peeled.kind() else { return jsast::boolean(negated) };
+        let ty::Adt(def, _) = peeled.kind() else {
+            return jsast::boolean(negated);
+        };
         let (signed, bits) = value::int_info(tcx, scrut_ty).unwrap_or((false, 128));
         let mut tests: Vec<Expr> = Vec::new();
         for (index, variant) in def.variants().iter_enumerated() {
-            let Some(discr) = peeled.discriminant_for_variant(tcx, index) else { continue };
+            let Some(discr) = peeled.discriminant_for_variant(tcx, index) else {
+                continue;
+            };
             if !keep(value::resign(signed, bits, discr.val)) {
                 continue;
             }
-            tests.push(jsast::binary(op, value.clone(), value::tag_literal(variant)));
+            tests.push(jsast::binary(
+                op,
+                value.clone(),
+                value::tag_literal(variant),
+            ));
         }
         let mut tests = tests.into_iter();
-        let Some(first) = tests.next() else { return jsast::boolean(negated) };
+        let Some(first) = tests.next() else {
+            return jsast::boolean(negated);
+        };
         tests.fold(first, |acc, test| jsast::binary(join, acc, test))
     }
 
@@ -312,8 +364,7 @@ impl<'tcx> Emitter<'_, '_, 'tcx> {
                 }
                 Test::InRange { lo, len } => {
                     let (low, high) = (bound(lo), bound(lo + len - 1));
-                    return self
-                        .tag_chain(value, enum_ty, ty, |d| d >= low && d <= high, negated);
+                    return self.tag_chain(value, enum_ty, ty, |d| d >= low && d <= high, negated);
                 }
             }
         }
@@ -326,7 +377,11 @@ impl<'tcx> Emitter<'_, '_, 'tcx> {
                 }
             }
             Test::Eq(v) => {
-                let op = if negated { BinOp::StrictNe } else { BinOp::StrictEq };
+                let op = if negated {
+                    BinOp::StrictNe
+                } else {
+                    BinOp::StrictEq
+                };
                 jsast::binary(op, value, self.case_literal(scrut, v))
             }
             Test::Lt(v) => {
@@ -370,7 +425,12 @@ impl<'tcx> Emitter<'_, '_, 'tcx> {
 fn as_while(body: &mut Vec<Stmt>) -> Option<(Expr, Vec<Stmt>)> {
     // Source map markers print nothing, so a loop that is one `if` behind a marker is still one
     // `if`. The markers go with the test they precede, which is where the `while` puts it anyway.
-    if body.iter().filter(|stmt| !matches!(stmt, Stmt::Loc(_))).count() != 1 {
+    if body
+        .iter()
+        .filter(|stmt| !matches!(stmt, Stmt::Loc(_)))
+        .count()
+        != 1
+    {
         return None;
     }
     match body.pop()? {

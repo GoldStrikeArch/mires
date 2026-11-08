@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::{BuildError, Result};
+use crate::{BuildError, EntryRole, Result};
 
 /// The `-Cllvm-args` option naming one chunk, `js-chunk=<name>:<entry>`.
 ///
@@ -9,6 +9,8 @@ use crate::{BuildError, Result};
 pub const CHUNK_ARG: &str = "js-chunk";
 /// The `-Cllvm-args` option naming the shared chunk, `js-chunk-shared=<name>`.
 pub const SHARED_CHUNK_ARG: &str = "js-chunk-shared";
+/// Option that registers each named chunk's entry in `globalThis.__rcgjsChunks`.
+pub const CHUNK_REGISTRY_ARG: &str = "js-chunk-registry=on";
 /// The prefix an island's exported entry point is named with.
 pub const ISLAND_ENTRY_PREFIX: &str = "__island_";
 /// Default [`dir`](Chunking::dir): the directory inside `OUT_DIR` the chunks
@@ -17,7 +19,7 @@ pub const DEFAULT_CHUNK_DIR: &str = "chunks";
 /// Default [`shared`](Chunking::shared) chunk name.
 pub const DEFAULT_SHARED_NAME: &str = "shared";
 /// Default [`specifier`](Chunking::specifier) prefix.
-pub const DEFAULT_SPECIFIER_PREFIX: &str = "mires-island/";
+pub const DEFAULT_SPECIFIER_PREFIX: &str = "topcoat-island/";
 
 /// One emitted JavaScript file, named by the chunk it holds.
 ///
@@ -58,15 +60,14 @@ impl Chunk {
 ///
 /// BuildConfig::new("client-island/island.rs")
 ///     .output_name("islands.js")
-///     .js_extern(true)
-///     .view_abi(true)
+///     .views(true)
 ///     .crate_arg("js-modules=esm")
 ///     .chunks(
 ///         Chunking::new()
 ///             .island("counter")
 ///             .island("search")
 ///             .url_base("/demo/chunks/")
-///             .import("mires-dom", "/demo/mires-dom.js"),
+///             .import("topcoat-dom", "/demo/topcoat-dom.js"),
 ///     )
 ///     .render()
 ///     .unwrap();
@@ -80,20 +81,20 @@ impl Chunk {
 /// chunk, plus the shared file when there is anything to share. These are link
 /// step options, like `js-modules`, so they cost no sysroot rebuild.
 ///
-/// A backend that emits one file for the whole crate leaves those files
-/// absent, and every requested chunk then names that one file: the served URLs
-/// collapse onto it, the import map still resolves, and the page still asks
-/// for an island by name. That is what makes the request safe to write before
-/// the backend can split, and it is why a chunk name is not a file name until
-/// the compile has run.
+/// The linker records the entry roles, programs, shared edges, and checksums in its artifact
+/// manifest. Publishing verifies that graph and copies only its reachable resources. A backend
+/// that omits a requested entry fails the build; an unsplit application cannot stand in for a
+/// lazily loaded island.
 #[derive(Debug, Clone)]
 pub struct Chunking {
     entries: Vec<(String, String)>,
+    roles: Vec<(String, EntryRole)>,
     shared: String,
     dir: String,
     specifier: String,
     url_base: Option<String>,
     imports: Vec<(String, String)>,
+    register_entries: bool,
 }
 
 impl Chunking {
@@ -102,11 +103,13 @@ impl Chunking {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            roles: Vec::new(),
             shared: DEFAULT_SHARED_NAME.to_owned(),
             dir: DEFAULT_CHUNK_DIR.to_owned(),
             specifier: DEFAULT_SPECIFIER_PREFIX.to_owned(),
             url_base: None,
             imports: Vec::new(),
+            register_entries: false,
         }
     }
 
@@ -118,7 +121,7 @@ impl Chunking {
     pub fn island(self, name: impl Into<String>) -> Self {
         let name = name.into();
         let entry = format!("{ISLAND_ENTRY_PREFIX}{name}");
-        self.entry(name, entry)
+        self.entry_with_role(name, entry, EntryRole::Island)
     }
 
     /// Ask for a chunk called `name` holding everything the export `entry`
@@ -127,8 +130,21 @@ impl Chunking {
     /// Calls accumulate, in order. [`island`](Self::island) is this with the
     /// export name spelled for you.
     #[must_use]
-    pub fn entry(mut self, name: impl Into<String>, entry: impl Into<String>) -> Self {
-        self.entries.push((name.into(), entry.into()));
+    pub fn entry(self, name: impl Into<String>, entry: impl Into<String>) -> Self {
+        self.entry_with_role(name, entry, EntryRole::Main)
+    }
+
+    /// Declare the deployment role of a chunk's stable exported root.
+    #[must_use]
+    pub fn entry_with_role(
+        mut self,
+        name: impl Into<String>,
+        entry: impl Into<String>,
+        role: EntryRole,
+    ) -> Self {
+        let name = name.into();
+        self.roles.push((name.clone(), role));
+        self.entries.push((name, entry.into()));
         self
     }
 
@@ -186,6 +202,17 @@ impl Chunking {
         self
     }
 
+    /// Register each named chunk's entry for a loader that uses module script elements.
+    ///
+    /// The registry maps chunk names to their entry functions in
+    /// `globalThis.__rcgjsChunks`. This keeps a lazy loader within ES2018 syntax without using
+    /// dynamic `import()`. It is off by default, so ordinary ESM chunks keep no global state.
+    #[must_use]
+    pub fn register_entries(mut self, on: bool) -> Self {
+        self.register_entries = on;
+        self
+    }
+
     /// Whether no chunk was asked for, in which case the program is emitted as
     /// one file.
     #[must_use]
@@ -226,6 +253,14 @@ impl Chunking {
             .map(|(name, entry)| format!("{CHUNK_ARG}={name}:{entry}"))
             .collect();
         args.push(format!("{SHARED_CHUNK_ARG}={}", self.shared));
+        args.extend(
+            self.roles
+                .iter()
+                .map(|(name, role)| format!("js-chunk-role={name}:{}", role.as_str())),
+        );
+        if self.register_entries {
+            args.push(CHUNK_REGISTRY_ARG.to_owned());
+        }
         args
     }
 
@@ -364,6 +399,8 @@ mod tests {
                 "js-chunk=counter:__island_counter",
                 "js-chunk=search:__island_search",
                 "js-chunk-shared=shared",
+                "js-chunk-role=counter:island",
+                "js-chunk-role=search:island",
             ]
         );
     }
@@ -374,9 +411,22 @@ mod tests {
 
         assert_eq!(
             chunking.args(),
-            ["js-chunk=boot:start", "js-chunk-shared=common"]
+            [
+                "js-chunk=boot:start",
+                "js-chunk-shared=common",
+                "js-chunk-role=boot:main"
+            ]
         );
         assert_eq!(chunking.shared_name(), "common");
+    }
+
+    #[test]
+    fn entry_registration_is_an_explicit_link_option() {
+        let ordinary = Chunking::new().island("counter");
+        assert!(!ordinary.args().iter().any(|arg| arg == CHUNK_REGISTRY_ARG));
+
+        let registered = ordinary.register_entries(true);
+        assert_eq!(registered.args().last().unwrap(), CHUNK_REGISTRY_ARG);
     }
 
     #[test]
@@ -404,7 +454,7 @@ mod tests {
 
         assert_eq!(chunking.directory(), "chunks");
         assert_eq!(chunking.shared_name(), "shared");
-        assert_eq!(chunking.specifier_for("counter"), "mires-island/counter");
+        assert_eq!(chunking.specifier_for("counter"), "topcoat-island/counter");
     }
 
     #[test]
@@ -440,9 +490,9 @@ mod tests {
         assert_eq!(
             map,
             concat!(
-                r#"{"imports":{"mires-island/counter":"/demo/chunks/counter.js","#,
-                r#""mires-island/search":"/demo/chunks/search.js","#,
-                r#""mires-island/shared":"/demo/chunks/shared.js"}}"#,
+                r#"{"imports":{"topcoat-island/counter":"/demo/chunks/counter.js","#,
+                r#""topcoat-island/search":"/demo/chunks/search.js","#,
+                r#""topcoat-island/shared":"/demo/chunks/shared.js"}}"#,
             )
         );
     }
@@ -452,7 +502,7 @@ mod tests {
         let chunking = Chunking::new()
             .island("counter")
             .url_base("/demo/chunks/")
-            .import("mires-dom", "/demo/mires-dom.js");
+            .import("topcoat-dom", "/demo/topcoat-dom.js");
 
         let map = chunking
             .import_map(&[chunk("counter", "counter.js")])
@@ -461,8 +511,8 @@ mod tests {
         assert_eq!(
             map,
             concat!(
-                r#"{"imports":{"mires-dom":"/demo/mires-dom.js","#,
-                r#""mires-island/counter":"/demo/chunks/counter.js"}}"#,
+                r#"{"imports":{"topcoat-dom":"/demo/topcoat-dom.js","#,
+                r#""topcoat-island/counter":"/demo/chunks/counter.js"}}"#,
             )
         );
     }
@@ -484,8 +534,8 @@ mod tests {
         assert_eq!(
             map,
             concat!(
-                r#"{"imports":{"mires-island/counter":"/demo/chunks/islands.js","#,
-                r#""mires-island/search":"/demo/chunks/islands.js"}}"#,
+                r#"{"imports":{"topcoat-island/counter":"/demo/chunks/islands.js","#,
+                r#""topcoat-island/search":"/demo/chunks/islands.js"}}"#,
             )
         );
     }

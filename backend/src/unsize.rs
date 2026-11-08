@@ -53,7 +53,7 @@ pub(crate) fn coerce_unsized<'tcx>(
             // it. Its lockstep tails are the tail *field's* two types, which say how long the tail
             // is and nothing about where the record lives, so they are read for the metadata only.
             if unsized_tail(tcx, *target).is_some() {
-                return fatten_tail(fx, value, *source, *target, raw);
+                return fatten_tail(fx, value, *source, *target);
             }
             let (source, target) =
                 tcx.struct_lockstep_tails_for_codegen(*source, *target, typing_env());
@@ -79,8 +79,7 @@ pub(crate) fn coerce_unsized<'tcx>(
             for (idx, field) in variant.fields.iter_enumerated() {
                 let key = Namer::field_name(variant, idx);
                 let read = jsast::member(value.clone(), key.clone());
-                let field_from =
-                    tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args_a));
+                let field_from = tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args_a));
                 let field_to = tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args_b));
 
                 // Everything but the pointer field is carried across unchanged.
@@ -91,7 +90,7 @@ pub(crate) fn coerce_unsized<'tcx>(
                 if coerced {
                     return fx.zombie(format!(
                         "`{from_ty}` has more than one field to unsize, which \
-                         rustc_codegen_mires does not support"
+                         rustc_codegen_js does not support"
                     ));
                 }
                 coerced = true;
@@ -107,7 +106,7 @@ pub(crate) fn coerce_unsized<'tcx>(
             }
         }
         _ => fx.zombie(format!(
-            "unsizing coercions are not supported by rustc_codegen_mires (`{from_ty}` to `{to_ty}`)"
+            "unsizing coercions are not supported by rustc_codegen_js (`{from_ty}` to `{to_ty}`)"
         )),
     }
 }
@@ -121,16 +120,8 @@ pub(crate) fn coerce_unsized<'tcx>(
 /// fat slice over the whole record, and the dereference on the other side reads the record as the
 /// struct it is.
 ///
-/// The data half is the **reference** form of the record, even when the pointer being coerced is a
-/// raw one, for the same reason a trait object's is: everything past the coercion projects fields
-/// out of a record rather than reading a slot.
-fn fatten_tail<'tcx>(
-    fx: &FnCx<'_, 'tcx>,
-    value: Expr,
-    source: Ty<'tcx>,
-    target: Ty<'tcx>,
-    raw: bool,
-) -> Expr {
+/// The data half preserves the input form: an object for a reference, a slot for a raw pointer.
+fn fatten_tail<'tcx>(fx: &FnCx<'_, 'tcx>, value: Expr, source: Ty<'tcx>, target: Ty<'tcx>) -> Expr {
     let tcx = fx.tcx;
     let (source_tail, target_tail) =
         tcx.struct_lockstep_tails_for_codegen(source, target, typing_env());
@@ -138,19 +129,20 @@ fn fatten_tail<'tcx>(
         (ty::Array(_, len), ty::Slice(_)) => match len.try_to_target_usize(tcx) {
             Some(len) => jsast::num(len as f64),
             None => {
-                return fx
-                    .zombie(format!("the length of `{source_tail}` is not known at compile time"));
+                return fx.zombie(format!(
+                    "the length of `{source_tail}` is not known at compile time"
+                ));
             }
         },
         _ => {
             return fx.zombie(format!(
                 "cannot unsize `{source}` to `{target}`: a struct tail going from \
-                 `{source_tail}` to `{target_tail}` is not supported by rustc_codegen_mires"
+                 `{source_tail}` to `{target_tail}` is not supported by rustc_codegen_js"
             ));
         }
     };
-    let record = if raw { crate::ptr::raw_to_ref(fx, source, value) } else { value };
-    crate::ptr::fat_dyn(record, meta)
+
+    crate::ptr::fat_dyn(value, meta)
 }
 
 /// Builds the fat pointer for a pointer whose pointee goes from `source` to `target`.
@@ -172,7 +164,9 @@ fn fatten<'tcx>(
             let len = match len.try_to_target_usize(tcx) {
                 Some(len) => len,
                 None => {
-                    fx.zombie(format!("the length of `{source}` is not known at compile time"));
+                    fx.zombie(format!(
+                        "the length of `{source}` is not known at compile time"
+                    ));
                     0
                 }
             };
@@ -217,7 +211,11 @@ fn fatten<'tcx>(
                 .principal()
                 .map(|principal| tcx.instantiate_bound_regions_with_erased(principal));
             let meta = crate::vtable::vtable_expr(fx.cgu, source, principal);
-            let value = if raw { crate::ptr::raw_to_ref(fx, source, value) } else { value };
+            let value = if raw {
+                crate::ptr::raw_to_ref(fx, source, value)
+            } else {
+                value
+            };
             crate::ptr::fat_dyn(value, meta)
         }
         _ => fx.zombie(format!("cannot unsize `{source}` to `{target}`")),

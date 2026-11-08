@@ -1,0 +1,27 @@
+{
+  "function": "x64hash128",
+  "seedDefault": 0,
+  "vectors": [
+    {
+      "input": "Hello, world, hi",
+      "hash": "9a66b4567d520770dc8eaf9a508ecf1b"
+    },
+    {
+      "input": "hello",
+      "hash": "cbd8a7b341bd9b025b1e906a48ae1d19"
+    },
+    {
+      "input": "Hello, world, h",
+      "hash": "4552c6409e0a7bd3b0f9eb318bb35f05"
+    },
+    {
+      "input": "Hello, world, hi!",
+      "hash": "dce3e02d43da4d2374e84e484c566492"
+    },
+    {
+      "input": "Hello, world, hi, Hello, world, hi",
+      "hash": "d49c261c833b671870b471c42df4dbf0"
+    }
+  ],
+  "notes": "Non-ASCII and long-text vectors live in experiments/fingerprintjs/src/utils/hashing.test.ts. Ports must match those too."
+}

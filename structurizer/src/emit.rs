@@ -112,42 +112,99 @@ impl<'a, S, C> Emitter<'a, S, C> {
         let skel = Region::seq(code);
         for &b in &self.order.rpo {
             if !self.visited[b.index()] {
-                return Err(StructureError::Internal("a reachable block was not emitted"));
+                return Err(StructureError::Internal(
+                    "a reachable block was not emitted",
+                ));
             }
         }
         Ok(self.drop_unused_labels(skel))
     }
 
-    /// The whole body as one flat dispatch loop, one case per block.
+    /// The whole body as one flat dispatch loop.
     ///
-    /// This is what irreducible control flow falls back to: no block is placed
-    /// relative to any other, so nothing has to nest.
+    /// This is what [`Options::force_dispatch`] asks for and what a body the
+    /// nested form fails on falls back to: no block is placed relative to any
+    /// other, so nothing has to nest.
+    ///
+    /// Blocks and cases are not one to one. A block whose one predecessor
+    /// hands control over unconditionally is concatenated into that
+    /// predecessor's case, and a jump to the case emitted next falls through
+    /// instead of assigning the selector, so only the blocks control can reach
+    /// from several places pay for a case of their own.
     pub(crate) fn run_dispatch(&mut self) -> Result<Skeleton, StructureError> {
         self.stats.dispatch_fallbacks += 1;
+        self.stats.whole_body_dispatch = true;
         let sel = self.fresh_tmp();
         let label = self.fresh_label();
+
+        // The entry is never absorbed: case 0 is where the dispatch starts.
+        let mut absorbed = vec![false; self.cfg.blocks.len()];
+        for &b in self.order.rpo.iter().skip(1) {
+            let [p] = self.order.preds[b.index()][..] else {
+                continue;
+            };
+            let handover = matches!(
+                self.cfg.blocks.get(p.index()).map(|block| &block.term),
+                Some(Term::Goto(t)) if *t == b
+            );
+            if p != b && handover {
+                absorbed[b.index()] = true;
+            }
+        }
+        let heads: Vec<BlockId> = self
+            .order
+            .rpo
+            .iter()
+            .copied()
+            .filter(|b| !absorbed[b.index()])
+            .collect();
+
         let mut stack: Vec<Scope> = Vec::new();
-        for (i, &b) in self.order.rpo.iter().enumerate() {
+        for (i, &b) in heads.iter().enumerate() {
             stack.push(Scope {
                 target: b,
                 label,
-                kind: SKind::Dispatch { sel, case: i as u32 },
+                kind: SKind::Dispatch {
+                    sel,
+                    case: i as u32,
+                },
             });
         }
-        let mut cases = Vec::with_capacity(self.order.rpo.len());
-        let mut falls_through = false;
-        for (i, &b) in self.order.rpo.iter().enumerate() {
-            let (stmts, branch) = self.take_block(b)?;
-            let (never, mut code) = self.compile_branch_or_test(branch, &mut stack, Ft::Return)?;
-            let mut body = vec![Region::Block(stmts)];
-            body.append(&mut code);
-            if !never {
-                // Every block ends in a terminator, so this is unreachable; it
-                // is here so a case can never run the one after it.
-                body.push(Region::Break(None));
-                falls_through = true;
+        let mut cases = Vec::with_capacity(heads.len());
+        let mut last_never = true;
+        for (i, &head) in heads.iter().enumerate() {
+            // Falling off a case runs the one emitted after it, which is what
+            // a jump to that case's block means.
+            let ft = match heads.get(i + 1) {
+                Some(&next) => Ft::Block(next),
+                None => Ft::Return,
+            };
+            let mut body = Vec::new();
+            let mut pc = head;
+            let never = loop {
+                let (stmts, branch) = self.take_block(pc)?;
+                body.push(Region::Block(stmts));
+                if let Branching::Goto(next) = branch {
+                    if absorbed[next.index()] {
+                        pc = next;
+                        continue;
+                    }
+                }
+                let (never, mut code) = self.compile_branch_or_test(branch, &mut stack, ft)?;
+                body.append(&mut code);
+                break never;
+            };
+            if i + 1 == heads.len() {
+                last_never = never;
             }
             cases.push((i as u32, Region::seq(body)));
+        }
+        for &b in &self.order.rpo {
+            if !self.visited[b.index()] {
+                return Err(StructureError::Internal(
+                    "a reachable block was not emitted",
+                ));
+            }
         }
         let skel = Region::Seq(vec![
             Region::SetSel(sel, 0),
@@ -155,7 +212,7 @@ impl<'a, S, C> Emitter<'a, S, C> {
                 sel,
                 label: Some(label),
                 cases,
-                trailing_break: falls_through,
+                trailing_break: !last_never,
             },
         ]);
         Ok(self.drop_unused_labels(skel))
@@ -189,7 +246,10 @@ impl<'a, S, C> Emitter<'a, S, C> {
             .cfg
             .blocks
             .get(pc.index())
-            .ok_or(StructureError::BlockOutOfRange { from: None, target: pc })?;
+            .ok_or(StructureError::BlockOutOfRange {
+                from: None,
+                target: pc,
+            })?;
         if self.visited[pc.index()] {
             return Err(StructureError::BlockCompiledTwice(pc));
         }
@@ -207,6 +267,20 @@ impl<'a, S, C> Emitter<'a, S, C> {
         Ok((pc, branch))
     }
 
+    /// Whether the block heads a loop the nested form can express: some back
+    /// edge lands on it from a block it dominates.
+    ///
+    /// A retreating edge whose source the block does not dominate is a second
+    /// entry into a loop headed elsewhere. A loop wrapped around the block
+    /// could never capture that jump, which instead resolves through the
+    /// dispatch an enclosing [`Emitter::compile_block_no_loop`] routed the
+    /// cycle through.
+    fn heads_a_loop(&self, pc: BlockId) -> bool {
+        self.order.preds[pc.index()]
+            .iter()
+            .any(|&p| self.order.is_backward(p, pc) && self.dom.dominates(self.order, pc, p))
+    }
+
     /// Emits a block, wrapping it in a loop when it heads one.
     fn compile_block(
         &mut self,
@@ -214,16 +288,24 @@ impl<'a, S, C> Emitter<'a, S, C> {
         stack: &mut Vec<Scope>,
         ft: Ft,
     ) -> Result<(bool, Vec<Skeleton>), StructureError> {
-        if !self.order.is_loop_header(pc) {
+        if !self.heads_a_loop(pc) {
             return self.compile_block_no_loop(pc, stack, ft);
         }
         self.enter()?;
         let label = self.fresh_label();
         let exit = self.fresh_exit();
         let depth = stack.len();
-        stack.push(Scope { target: pc, label, kind: SKind::Loop });
+        stack.push(Scope {
+            target: pc,
+            label,
+            kind: SKind::Loop,
+        });
         if let Ft::Block(join) = ft {
-            stack.push(Scope { target: join, label, kind: SKind::ExitLoop(exit) });
+            stack.push(Scope {
+                target: join,
+                label,
+                kind: SKind::ExitLoop(exit),
+            });
         }
         let (never_body, body) = self.compile_block_no_loop(pc, stack, Ft::Block(pc))?;
         stack.truncate(depth);
@@ -255,13 +337,28 @@ impl<'a, S, C> Emitter<'a, S, C> {
             .copied()
             .filter(|&c| branch.nbbranch(c) >= 2 || self.order.is_merge_node(c))
             .collect();
+        // A cycle among sibling subtrees is a loop with more than one entry,
+        // which no arrangement of labeled blocks can jump backward into. The
+        // siblings on such a cycle all become cases of one dispatch instead,
+        // whose selector a jump from any of them can set. Only a graph with a
+        // multi entry loop somewhere pays for the search.
+        let mut cyclic = Vec::new();
+        if self.stats.irreducible {
+            cyclic = crate::loops::cyclic_children(self.order, self.dom, pc);
+            for &member in &cyclic {
+                if !new_scopes.contains(&member) {
+                    new_scopes.push(member);
+                }
+            }
+        }
         self.order.sort_in_post_order(&mut new_scopes);
 
-        let (never, mut after) = if new_scopes.len() > self.opts.merge_node_max {
-            self.compile_dispatch(branch, &new_scopes, stack, ft)?
-        } else {
-            self.compile_scopes(branch, &new_scopes, stack, ft)?
-        };
+        let (never, mut after) =
+            if !cyclic.is_empty() || new_scopes.len() > self.opts.merge_node_max {
+                self.compile_dispatch(branch, &new_scopes, stack, ft)?
+            } else {
+                self.compile_scopes(branch, &new_scopes, stack, ft)?
+            };
         let mut code = vec![Region::Block(stmts)];
         code.append(&mut after);
         Ok((never, code))
@@ -282,12 +379,19 @@ impl<'a, S, C> Emitter<'a, S, C> {
         self.enter()?;
         let label = self.fresh_label();
         let depth = stack.len();
-        stack.push(Scope { target: x, label, kind: SKind::Forward });
+        stack.push(Scope {
+            target: x,
+            label,
+            kind: SKind::Forward,
+        });
         let (_, inner) = self.compile_scopes(branch, rest, stack, Ft::Block(x))?;
         let (never, mut code) = self.compile_block(x, stack, ft)?;
         stack.truncate(depth);
         self.leave();
-        let mut out = vec![Region::Labeled { label, body: Box::new(Region::seq(inner)) }];
+        let mut out = vec![Region::Labeled {
+            label,
+            body: Box::new(Region::seq(inner)),
+        }];
         out.append(&mut code);
         Ok((never, out))
     }
@@ -316,11 +420,18 @@ impl<'a, S, C> Emitter<'a, S, C> {
             stack.push(Scope {
                 target: x,
                 label,
-                kind: SKind::Dispatch { sel, case: i as u32 + 1 },
+                kind: SKind::Dispatch {
+                    sel,
+                    case: i as u32 + 1,
+                },
             });
         }
         if let Ft::Block(join) = ft {
-            stack.push(Scope { target: join, label, kind: SKind::ExitLoop(exit) });
+            stack.push(Scope {
+                target: join,
+                label,
+                kind: SKind::ExitLoop(exit),
+            });
         }
 
         // Emitted in reverse so each case falls through to the one before it,
@@ -509,11 +620,16 @@ impl<'a, S, C> Emitter<'a, S, C> {
                 let exit = self.fresh_exit();
                 let depth = stack.len();
                 if let Ft::Block(join) = ft {
-                    stack.push(Scope { target: join, label, kind: SKind::ExitSwitch(exit) });
+                    stack.push(Scope {
+                        target: join,
+                        label,
+                        kind: SKind::ExitSwitch(exit),
+                    });
                 }
                 // The default is emitted last, so it is compiled first.
-                let (mut all_never, default) =
-                    self.compile_branch(*default, stack, ft).map(|(n, c)| (n, Region::seq(c)))?;
+                let (mut all_never, default) = self
+                    .compile_branch(*default, stack, ft)
+                    .map(|(n, c)| (n, Region::seq(c)))?;
                 let mut cases: Vec<(Vec<u128>, Skeleton)> = Vec::with_capacity(arms.len());
                 for (values, target) in arms.iter().rev() {
                     let (never, mut code) = self.compile_branch(*target, stack, ft)?;
@@ -581,7 +697,10 @@ impl<'a, S, C> Emitter<'a, S, C> {
             Region::Labeled { label, body } => {
                 let body = self.drop_unused_labels(*body);
                 if self.used(label).is_some() {
-                    Region::Labeled { label, body: Box::new(body) }
+                    Region::Labeled {
+                        label,
+                        body: Box::new(body),
+                    }
                 } else {
                     body
                 }
@@ -590,13 +709,23 @@ impl<'a, S, C> Emitter<'a, S, C> {
                 label: keep(label),
                 body: Box::new(self.drop_unused_labels(*body)),
             },
-            Region::If { scrut, test, then_, else_ } => Region::If {
+            Region::If {
+                scrut,
+                test,
+                then_,
+                else_,
+            } => Region::If {
                 scrut,
                 test,
                 then_: Box::new(self.drop_unused_labels(*then_)),
                 else_: Box::new(self.drop_unused_labels(*else_)),
             },
-            Region::Switch { scrut, arms, default, label } => Region::Switch {
+            Region::Switch {
+                scrut,
+                arms,
+                default,
+                label,
+            } => Region::Switch {
                 scrut,
                 arms: arms
                     .into_iter()
@@ -605,7 +734,12 @@ impl<'a, S, C> Emitter<'a, S, C> {
                 default: Box::new(self.drop_unused_labels(*default)),
                 label: keep(label),
             },
-            Region::Dispatch { sel, label, cases, trailing_break } => Region::Dispatch {
+            Region::Dispatch {
+                sel,
+                label,
+                cases,
+                trailing_break,
+            } => Region::Dispatch {
                 sel,
                 label: keep(label),
                 cases: cases

@@ -93,7 +93,7 @@ async function traceModule(code, label) {
 
     // A fresh filename each attempt: node caches modules by URL, so a retry
     // would otherwise re-serve the failed instance without re-executing it.
-    const file = path.join(tmpdir(), `mires-trace-${randomUUID()}.mjs`);
+    const file = path.join(tmpdir(), `topcoat-trace-${randomUUID()}.mjs`);
     writeFileSync(file, code);
 
     try {

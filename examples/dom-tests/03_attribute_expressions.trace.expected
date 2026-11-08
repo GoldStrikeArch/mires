@@ -1,0 +1,18 @@
+{"$record":"header","$generatedBy":"scripts/dom-trace.mjs","$what":"Normalized runtime-call trace of a rustc_codegen_js-compiled client module executed against contract/harness/trace.mjs.","fixture":"domtest/03_attribute_expressions","label":"domtest/03_attribute_expressions","freeBindingsHealed":[],"status":"completed","error":null,"recordCount":17}
+{"op":"template","tmpl":"tmpl#0","html":"<div id=\"main\" class=\"base\"></div>"}
+{"op":"template","tmpl":"tmpl#1","html":"<h1>Welcome</h1>"}
+{"op":"template","tmpl":"tmpl#2","html":"<a></a>"}
+{"op":"template","tmpl":"tmpl#3","html":"<input type=\"text\" disabled=\"\">"}
+{"op":"template","tmpl":"tmpl#4","html":"<div id=\"main\"><a href=\"/\">Welcome</a></div>"}
+{"op":"template","tmpl":"tmpl#5","html":"<input>"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"setAttribute","node":"tmpl#1:root","name":"id","value":"my-h1"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"setAttribute","node":"tmpl#2:root","name":"href","value":"/hello"}
+{"op":"setAttribute","node":"tmpl#2:root","name":"title","value":"Hello"}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"template.clone","tmpl":"tmpl#4","result":"tmpl#4:root"}
+{"op":"setAttribute","node":"tmpl#4:root.firstChild","name":"data-slug","value":"hello"}
+{"op":"template.clone","tmpl":"tmpl#5","result":"tmpl#5:root"}
+{"op":"setAttribute","node":"tmpl#5:root","name":"value","value":"10"}

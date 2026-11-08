@@ -1,0 +1,456 @@
+{
+ "$what": "Accepted differences between a corpus reference trace and the trace of the same family compiled by rustc_codegen_js. Consumed by contract/harness/compare-trace.mjs --delta, from scripts/dom-test.sh. Side 'a' is the reference, side 'b' is ours.",
+ "$doNotEditByHand": false,
+ "$relationToTheCorpusDeltas": [
+  "contract/fixtures/corpus/deltas.json is the corpus-wide file and is READ ONLY from here. Its one rule is repeated below, attributed, because compare-trace.mjs takes a single --delta file and a rule that lives in two places going stale in one of them is worse than a copy that names its source.",
+  "Everything else here is a divergence this suite measured on first contact, which is what that file's $status asked for."
+ ],
+ "$whatARuleIsFor": [
+  "A rule is for a difference that is TOTAL and MECHANICAL: one convention, applied everywhere, that a regex or a dropped field expresses exactly. Two emitters spelling the same template differently is one; a healed free binding on the reference side is another.",
+  "A difference in WHAT IS EMITTED is never a rule. Those are listed in $whatIsDeliberatelyNotHere, per family, so that every line a comparison still reports has a written cause and the report can say which."
+ ],
+ "$measuredAndRetired": {
+  "text-gt-escaping": "The corpus predicted that our `injection` template would read `<span>Hi&lt;script&gt;alert();&lt;/script&gt;` where the reference reads `<span>Hi&lt;script>alert();&lt;/script>`, because Topcoat's text escaping covers `>` and solid's does not. Measured on first contact, the delta does not occur, and for a reason worth recording: the reference plugin constant-folds a JS string literal child INTO the template and escapes it on the way in, while view-dom treats `(expr)` as a dynamic hole whatever the expression is. Our template is `<span>Hi<!></span>` and the text never enters the HTML at all, so no escaping happens to differ over. The rule was removed rather than left standing, per the corpus README.",
+  "template-declaration-order": "The reference declares one `_$template` per distinct string in first-use order, and this backend used to declare them in name order, which permuted every `tmpl#N`. Fixed rather than accepted, in two steps: a cloner carries the source position of the `view!` that built it, and where several views build the same template the EARLIEST of their positions wins, because codegen order is a symbol-hash order and has nothing to do with the source. Two templates of one view tie-break on the index the emitter numbered the payload with. CONTRACT.md, 'Templates'. The pins are 01-simple-elements going from seven differences to none and 11-topcoat-if from 38 lines to 11.",
+  "node-is-zero-sized": "`view_abi::Node` used to be zero sized, so a template root passed as a value became `undefined` before the backend saw it and every branch of a markup-bodied `if`/`match` contributed nothing. Fixed in the ABI (version 3): `Node` is a `repr(transparent)` one-word handle, so a root survives being returned and being passed through `content`. Both properties are load bearing and the type's own documentation says why. The pin is families 11 and 12 emitting an `insert` per branch, and the island entry point returning its root.",
+  "memo-hoisting-for-a-conditional": "The reference wraps a conditional's test in `_$memo` so an unchanged test does not rebuild the branch (CONTRACT-DOM 6.4). This backend now does too: `view_abi::cond` hands the test over as a closure of its own, and the backend emits `_$memo(() => test())` plus an accessor that dispatches on it. Both spellings of a conditional go through it -- markup-bodied `if`/`else if` and a Rust `if` inside `$(...)`. The pins are 05-conditional losing three `memo`-only lines and 11-topcoat-if losing all of its."
+ },
+ "$whatIsDeliberatelyNotHere": {
+  "anchor-placement": "Outside hydratable mode the reference emits a `<!>` only for an expression sandwiched between two text nodes and lets adjacent expressions share one; view-dom anchors every dynamic child of a multi-child element (view-dom/src/lib.rs, 'Where this differs from upstream'). That changes the template string, the walk, and the marker argument of `_$insert` together, so it is one divergence showing up as many records. It is view-dom's, not the backend's, and it is reported. Families: 02, 06, 15.",
+  "write-once-vs-always-reactive": "JSX has one syntax for a dynamic attribute and the plugin wraps every non-static one in an effect. Topcoat has two: `name=(expr)` is written once and `:name=$(expr)` is reactive. So the reference trace carries an `effect` record where ours carries a bare `setAttribute`, for the same source. This is a language difference, not an emitter defect. Families: 03, 14.",
+  "different-reference-program": "The reference modules for families 11 and 12 are written with solid's `<Show>` component, so their traces carry `createComponent` and `Show` records that no Topcoat program can produce: Topcoat's `if` is a Rust conditional, not a component. The two are not the same program and the comparison is reported for what it is. Families: 11, 12.",
+  "delegate-events-placement": "The reference emits one `delegateEvents` call at the end of the module carrying the union over every template; this backend emits one per instantiated template that needs one. Both register the same listeners (CONTRACT.md, 'Templates'). Families: 04, 15.",
+  "fixture-coverage": "Some cases of a corpus family have no counterpart here, because the macro still refuses them (`if`/`let` in an attribute list, a multi-node `match` arm), because the spike has no type to write them with (`impl Fn` handlers, `topcoat::view::Attributes`), or because Topcoat has no syntax for the distinction they turn on (`prop:` and `attr:` on a custom element). Each fixture's own module docs say which. A case only the reference has is reported as ONLY IN A.",
+  "memo-hoisting-for-a-match": "A `match`, and an `if` whose test binds (`if let`), still reach the backend as one closure and get no memo. Their arms select on a pattern rather than on a boolean, and an arm's body reads what the pattern bound, so there is no test to hand over separately: splitting one would mean matching once to choose the arm and again inside it to bind, which is a different program from the one that was written. `view_abi::cond` documents this. A `memo` record present only on the reference side is this. Family: 12.",
+  "keyed-list-vs-a-rust-loop": "The recorded reference for family 13 is JSX's `<For each={..}>`, a keyed reconciling component, so its trace carries `createComponent` and `For` records. Topcoat's `for` is a Rust loop over a Rust iterator: it runs once where it is written, appends each row to a list, and hands the list to one `_$insert`. The family's own NOTES.md says which of the two JSX forms is the structural match -- `.map()`, which 'builds an array eagerly and hands it to insert, which is what a Rust for loop over an iterator does' -- and records `<For>` as idiomatic Solid rather than as the target. The `fallback` prop has no Topcoat form either; that is an `if` around the loop. Family: 13.",
+  "eager-child-content-and-the-cases-it-makes-unwritable": "Child content of a client component is an eager `view_abi::Node` field of the props struct, so it is built BEFORE the component boundary and takes slots in the caller's key context; the reference builds it inside the callee from a `get children()` getter. The divergence is permanent and is quantified by contract/fixtures/keys-nested.json's `07b-children-component-eager` vs `-getter` rows. Today it is not merely a different ordering: view-dom rejects child nodes of a component outright (view-dom/src/lower/component.rs), because the server writes a hydration key where a part RENDERS and an eager child renders inside the callee, so the two halves would disagree on the order the caller's slots are spent. So corpus 07's `with_children` and 07b's `children_component` have no counterpart here at all and their records report as ONLY IN A. Not expressible as a rule: every rule kind preserves record counts. Families: 07, 07b.",
+  "the-getter-children-double-clone": "Corpus family 07's `withChildren` case carries TWO `template.clone` records for the children template in the reference trace where real solid produces one, because harness/trace.mjs's `value()` normaliser reads every key of the props object to record it and so forces `get children()` before the component runs. It is a harness artifact, written up in that family's NOTES.md and in the corpus deltas' `$notExpressibleAsRules`. Subsumed here by the entry above, since the case is unwritable anyway. Families: 07.",
+  "fragment-roots-must-be-elements": "A view body with several top-level nodes IS a fragment in Topcoat, and `DomWriter::close_scope` returns one template per root as a Rust tuple. What it will not take is a top-level node that is not an element: `DomWriter::template` refuses bare text and a bare `(expr)` outside an element. So upstream's bare `{inserted}` fragment member is written `<div>(inserted)</div>` here, which adds a real element, a real template and a real `_$insert` that the reference does not have. `corpus/08-fragments/NOTES.md:18-25` records this as an undecided language question -- \"can a view body start with text?\" -- rather than a missing feature. Family: 08.",
+  "memo-for-a-fragment-member": "A dynamic member of a JSX fragment is an ARRAY ELEMENT, so the plugin wraps it in `_$memo` -- there is no parent element to insert into and nothing else would subscribe. Ours is a child of the `<div>` that wraps it, so `_$insert` takes the accessor and subscribes to it itself, which is the same reactivity with one fewer allocation. A `memo` record present only on the reference side is this. Family: 08.",
+  "one-effect-per-hole-not-a-shared-record": "The reference groups every reactive attribute of ONE element into a single `_$effect` carrying a previous-value record, so three dynamic attributes on a `<rect>` are one `effect` record whose `init` is `{e, t, a}` -- three keys from the base-53 frequency-ordered alphabet, CONTRACT-DOM 6.2 and 6.3. view-dom hands the backend one `::view_abi::effect` per hole and records the shared group as `Hole::effect_group` for the backend to honour later, so a reactive Topcoat element with three attributes would be three effects and three records rather than one. Not built: the payload already carries the grouping, and collapsing it is an emitter change with its own goldens, so it is measured here rather than rushed alongside the namespace work. The single `effect` record on the reference side of family 09 has exactly this shape. Families: 09.",
+  "custom-element-owner-write": "The reference plugin's `contextToCustomElements` option writes `_el$._$owner = _$getOwner()` on every custom-element ROOT, so corpus family 10 carries six `getOwner` records that no Topcoat program produces. The property is solid's own back-channel for giving a custom element its reactive owner, read by solid's `customElement` helper; Topcoat has no equivalent and nothing on the Topcoat side would read it. The flag half of the same option IS implemented (`is_import_node`, so the three templates agree on all four `_$template` arguments); the owner write is the half with no Topcoat meaning. Every `getOwner` record ONLY IN A is this. Family: 10.",
+  "custom-element-attribute-is-a-property-write": "On a custom element the reference compiles an unknown attribute to a plain JavaScript PROPERTY write -- `_el$.someAttr = name` for `some-attr={name}`, `_el$2.notprop = data` for `notProp={data}` -- which is an assignment and so leaves NO runtime call and no trace record at all. Topcoat lowers every `name=(expr)` to `HoleKind::Attribute` and emits `_$setAttribute`, which does record. So ours carries two `setAttribute` records the reference does not, and the reference's one `setAttribute` belongs to its `attr:my-attr` case, which has no Topcoat spelling. `prop:` and `attr:` are the syntax that would let an author decide, and there is none today: writing `someProp=(data)` would compile to an attribute write where the JSX compiles to a property write, which is a silently wrong pairing rather than a documented one (`contract/fixtures/corpus/10-custom-elements/NOTES.md`). Family: 10."
+ },
+ "fixtures": {
+  "corpus/01-simple-elements": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "template-attribute-quotes",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "=\"([^\"\\s>]*)\"",
+    "to": "=$1",
+    "regex": true,
+    "why": "The other half of the same convention: the reference leaves an attribute value unquoted when it needs no quotes, view-dom always quotes. Only values with no space and no `>` are unquoted here, which is exactly the set the reference leaves bare, so a value that really needs quotes is untouched and still compared."
+   }
+  ],
+  "corpus/02-text-interpolation": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "insert-accessor-is-a-real-value",
+    "kind": "ignore-field",
+    "op": "insert",
+    "field": "accessor",
+    "why": "The reference fixture's interpolated values are free bindings its source never declared, so run-trace.mjs heals each one to a Proxy; a Proxy has a truthy `__tmpl`, trace.mjs's value() returns the Proxy itself, and JSON.stringify drops the key. The field is therefore absent from every reference `insert` record and carries a real Rust value in ours. This is an artifact of how the reference fixture is executed, not a difference between the two emitters, and it is total over the field."
+   }
+  ],
+  "corpus/03-attribute-expressions": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "template-attribute-quotes",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "=\"([^\"\\s>]*)\"",
+    "to": "=$1",
+    "regex": true,
+    "why": "The other half of the same convention: the reference leaves an attribute value unquoted when it needs no quotes, view-dom always quotes. Only values with no space and no `>` are unquoted here, which is exactly the set the reference leaves bare, so a value that really needs quotes is untouched and still compared."
+   },
+   {
+    "id": "set-attribute-value-is-a-real-value",
+    "kind": "ignore-field",
+    "op": "setAttribute",
+    "field": "value",
+    "why": "The same execution artifact as `insert-accessor-is-a-real-value`, one op along: the reference's attribute values come from free bindings that run-trace.mjs healed to Proxies, so the field is absent there and carries a real Rust value here. Total over the field."
+   },
+   {
+    "id": "reference-effects-throw-on-healed-bindings",
+    "kind": "ignore-op",
+    "op": "effect.threw",
+    "why": "A reference effect reading a member of a healed free binding throws (`post is not defined`), so the reference trace records `effect.threw` where nothing went wrong with the emitter. Dropped from both sides; an effect of OURS that threw would still fail this fixture's own NN.trace.expected golden, which is checked first."
+   }
+  ],
+  "corpus/04-event-expressions": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   }
+  ],
+  "corpus/05-conditional": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "insert-accessor-is-a-real-value",
+    "kind": "ignore-field",
+    "op": "insert",
+    "field": "accessor",
+    "why": "The reference wraps every conditional child in `_$memo` and inserts the memo, so its `accessor` is a runtime function; ours is the value or the closure thunk directly. The memo itself is reported as a `memo` record and is listed under $whatIsDeliberatelyNotHere; this rule only stops the same fact being counted twice, once as a missing memo and once as a changed accessor."
+   }
+  ],
+  "corpus/06-insert-children": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "insert-accessor-is-a-real-value",
+    "kind": "ignore-field",
+    "op": "insert",
+    "field": "accessor",
+    "why": "The same execution artifact as in 02-text-interpolation: `children`, `first`, `second` and `tiles` are healed free bindings on the reference side and real Rust values on ours, so the field is absent there and present here. Total over the field."
+   }
+  ],
+  "corpus/11-topcoat-if": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "template-attribute-quotes",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "=\"([^\"\\s>]*)\"",
+    "to": "=$1",
+    "regex": true,
+    "why": "The other half of the same convention: the reference leaves an attribute value unquoted when it needs no quotes, view-dom always quotes. Only values with no space and no `>` are unquoted here, which is exactly the set the reference leaves bare, so a value that really needs quotes is untouched and still compared."
+   }
+  ],
+  "corpus/12-topcoat-match": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "template-attribute-quotes",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "=\"([^\"\\s>]*)\"",
+    "to": "=$1",
+    "regex": true,
+    "why": "The other half of the same convention: the reference leaves an attribute value unquoted when it needs no quotes, view-dom always quotes. Only values with no space and no `>` are unquoted here, which is exactly the set the reference leaves bare, so a value that really needs quotes is untouched and still compared."
+   }
+  ],
+  "corpus/13-topcoat-for": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   }
+  ],
+  "corpus/14-topcoat-local": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "set-attribute-value-is-a-real-value",
+    "kind": "ignore-field",
+    "op": "setAttribute",
+    "field": "value",
+    "why": "The same execution artifact as `insert-accessor-is-a-real-value`, one op along: the reference's attribute values come from free bindings that run-trace.mjs healed to Proxies, so the field is absent there and carries a real Rust value here. Total over the field."
+   },
+   {
+    "id": "insert-accessor-is-a-real-value",
+    "kind": "ignore-field",
+    "op": "insert",
+    "field": "accessor",
+    "why": "The same execution artifact as in 02-text-interpolation: `post.title` and `title` are healed free bindings on the reference side and real Rust values on ours."
+   }
+  ],
+  "corpus/15-topcoat-bind": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "template-attribute-quotes",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "=\"([^\"\\s>]*)\"",
+    "to": "=$1",
+    "regex": true,
+    "why": "The other half of the same convention: the reference leaves an attribute value unquoted when it needs no quotes, view-dom always quotes. Only values with no space and no `>` are unquoted here, which is exactly the set the reference leaves bare, so a value that really needs quotes is untouched and still compared."
+   },
+   {
+    "id": "reference-effects-throw-on-healed-bindings",
+    "kind": "ignore-op",
+    "op": "effect.threw",
+    "why": "A reference effect reading a member of a healed free binding throws (`post is not defined`), so the reference trace records `effect.threw` where nothing went wrong with the emitter. Dropped from both sides; an effect of OURS that threw would still fail this fixture's own NN.trace.expected golden, which is checked first."
+   }
+  ],
+  "corpus/07-components": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "template-attribute-quotes",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "=\"([^\"\\s>]*)\"",
+    "to": "=$1",
+    "regex": true,
+    "why": "The other half of the same convention: the reference leaves an attribute value unquoted when it needs no quotes, view-dom always quotes. Only values with no space and no `>` are unquoted here, which is exactly the set the reference leaves bare, so a value that really needs quotes is untouched and still compared."
+   },
+   {
+    "id": "insert-accessor-is-a-real-value",
+    "kind": "ignore-field",
+    "op": "insert",
+    "field": "accessor",
+    "why": "The same execution artifact as in 02-text-interpolation: `children`, `first`, `second` and `tiles` are healed free bindings on the reference side and real Rust values on ours, so the field is absent there and present here. Total over the field."
+   },
+   {
+    "id": "component-props-object",
+    "kind": "ignore-field",
+    "op": "createComponent",
+    "field": "props",
+    "why": "No props object crosses the boundary on the Topcoat side. A client component is a plain Rust fn taking one props STRUCT, which the emitted call builds inside the thunk it hands over -- `move || badge(BadgeProps { label: (\"Active\"), })` (view-dom/src/lower/component.rs:62-64) -- so `_$createComponent` is passed no props (the field records as the string \"undefined\"), while the reference passes an object literal. The struct is a Rust value, never a JS object. The information is not lost from the comparison: the callee's own template records follow immediately and identify which component ran. PRECONDITION: this assumes the emitter wraps the call as `_$createComponent(thunk)` to get the hydration-context nesting (CONTRACT-DOM.md 9.5). If it instead synthesises a props object and an adapter, delete this rule -- compare-trace reports an unmatched rule as STALE, which is the signal. ATTRIBUTED COPY of the rule of the same id in contract/fixtures/corpus/deltas.json, which is read only from here; compare-trace.mjs takes a single --delta file. MEASURED on first contact in wave 2 and CONFIRMED: the precondition that rule states holds exactly, the emitter wraps a component call as `_$createComponent(thunk)`."
+   },
+   {
+    "id": "component-fn-identity",
+    "kind": "ignore-field",
+    "op": "createComponent",
+    "field": "comp",
+    "why": "The reference passes the component FUNCTION to createComponent, so several calls to one component all record the same fn id and compare-trace preserves that aliasing deliberately. A thunk-per-call-site emission produces a distinct function per call site, so the aliasing differs even though the same component runs: in 07-components the three Badge calls are one fn on the reference side and three on the Topcoat side. Blanking the field keeps the comparison on the call SEQUENCE, which is what this family is measuring. Same PRECONDITION as component-props-object: if the emitter passes the component directly, this rule goes STALE and should be deleted rather than kept. ATTRIBUTED COPY of the rule of the same id in contract/fixtures/corpus/deltas.json, which is read only from here; compare-trace.mjs takes a single --delta file. MEASURED on first contact in wave 2 and CONFIRMED: the precondition that rule states holds exactly, the emitter wraps a component call as `_$createComponent(thunk)`."
+   }
+  ],
+  "corpus/07b-nested-components": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "template-attribute-quotes",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "=\"([^\"\\s>]*)\"",
+    "to": "=$1",
+    "regex": true,
+    "why": "The other half of the same convention: the reference leaves an attribute value unquoted when it needs no quotes, view-dom always quotes. Only values with no space and no `>` are unquoted here, which is exactly the set the reference leaves bare, so a value that really needs quotes is untouched and still compared."
+   },
+   {
+    "id": "insert-accessor-is-a-real-value",
+    "kind": "ignore-field",
+    "op": "insert",
+    "field": "accessor",
+    "why": "The same execution artifact as in 02-text-interpolation: `children`, `first`, `second` and `tiles` are healed free bindings on the reference side and real Rust values on ours, so the field is absent there and present here. Total over the field."
+   },
+   {
+    "id": "component-props-object",
+    "kind": "ignore-field",
+    "op": "createComponent",
+    "field": "props",
+    "why": "Same as corpus/07-components' rule of the same id: Topcoat's eager props mean there is no props object to compare. Declared per fixture because deltas are looked up by the trace header's `fixture` field. ATTRIBUTED COPY of the rule of the same id in contract/fixtures/corpus/deltas.json, which is read only from here; compare-trace.mjs takes a single --delta file. MEASURED on first contact in wave 2 and CONFIRMED: the precondition that rule states holds exactly, the emitter wraps a component call as `_$createComponent(thunk)`."
+   },
+   {
+    "id": "component-fn-identity",
+    "kind": "ignore-field",
+    "op": "createComponent",
+    "field": "comp",
+    "why": "Same as corpus/07-components' rule of the same id. This family makes the aliasing difference sharpest: Badge is called three times from three different component bodies, which is one fn id on the reference side and three thunks on the Topcoat side. ATTRIBUTED COPY of the rule of the same id in contract/fixtures/corpus/deltas.json, which is read only from here; compare-trace.mjs takes a single --delta file. MEASURED on first contact in wave 2 and CONFIRMED: the precondition that rule states holds exactly, the emitter wraps a component call as `_$createComponent(thunk)`."
+   }
+  ],
+  "corpus/08-fragments": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   }
+  ],
+  "corpus/09-svg": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "svg-wrapper-closing-tag",
+    "kind": "rewrite",
+    "side": "a",
+    "op": "template",
+    "field": "html",
+    "from": "</svg>$",
+    "to": "",
+    "regex": true,
+    "why": "THE FAMILY-09 EXCEPTION to template-closing-tags, and the reason that rule needs one. `rootRect` is the only template in the corpus the reference does NOT minify all the way: it writes the synthetic wrapper's `</svg>` out, because the extra unwrap depth `isSVG` asks for counts on the wrapper being closed (contract/fixtures/corpus/09-svg/NOTES.md, fact 3). Side b's rule strips OUR trailing closing tags including that same `</svg>`, so without this the two sides could never agree on this one template however correct the emitter was. Stripping it from side a puts both in the same normalised form. It is the same one spelling convention, applied to the one template the reference exempts from it, and it fires exactly once: the family's other three templates are rooted at `<svg>`, need no wrapper, and carry no trailing tag for it to match."
+   },
+   {
+    "id": "template-attribute-quotes",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "=\"([^\"\\s>]*)\"",
+    "to": "=$1",
+    "regex": true,
+    "why": "The other half of the same convention: the reference leaves an attribute value unquoted when it needs no quotes, view-dom always quotes. Only values with no space and no `>` are unquoted here, which is exactly the set the reference leaves bare, so a value that really needs quotes is untouched and still compared."
+   },
+   {
+    "id": "reference-effects-throw-on-healed-bindings",
+    "kind": "ignore-op",
+    "op": "effect.threw",
+    "why": "The reference's dynamic SVG attributes read members of `state`, a free binding its source never declares, so run-trace.mjs heals it and the effect throws (`state is not defined`) before reaching its three `setAttribute` calls. That is an artifact of how the reference fixture is executed, not a difference between the two emitters. Dropped from both sides; an effect of OURS that threw would still fail this fixture's own NN.trace.expected golden, which is checked first."
+   }
+  ],
+  "corpus/10-custom-elements": [
+   {
+    "id": "template-closing-tags",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "(?:</[A-Za-z][A-Za-z0-9-]*>)+$",
+    "to": "",
+    "regex": true,
+    "why": "The reference minifies a template by dropping the closing tags an HTML parser infers, which is the trailing run of them; view-dom closes every element it opens. CONTRACT-DOM 2.5 says both are correct, and the two strings parse to the same tree. This is a total, mechanical normalisation of ONE spelling convention rather than a per-template exception, so a real change to a template string still shows as a difference."
+   },
+   {
+    "id": "template-attribute-quotes",
+    "kind": "rewrite",
+    "side": "b",
+    "op": "template",
+    "field": "html",
+    "from": "=\"([^\"\\s>]*)\"",
+    "to": "=$1",
+    "regex": true,
+    "why": "The other half of the same convention: the reference leaves an attribute value unquoted when it needs no quotes, view-dom always quotes. Only values with no space and no `>` are unquoted here, which is exactly the set the reference leaves bare, so a value that really needs quotes is untouched and still compared."
+   }
+  ]
+ }
+}

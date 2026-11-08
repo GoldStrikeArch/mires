@@ -1,0 +1,413 @@
+//! Places: the JavaScript that reads and writes the storage a [`Root`] and a [`Proj`] path name
+//! (v1 `backend/src/place.rs`, over JIR-R roots instead of MIR locals).
+//!
+//! The walk is v1's exactly — `Deref` picks the pointer form from the type table, `Field` asks
+//! `TypeTable::field`, `Index`/`ConstantIndex`/`Subslice` spell element and window reads,
+//! `Downcast` is a no-op — and so are the three shapes it produces (`JsPlace`), the reference and
+//! raw pointer built by running it backwards (`borrow_view`/`raw_view`), and the write-through
+//! rules.
+
+use rcgjs_object::jir::decline::OpClass;
+use rcgjs_object::jir::repr::{Proj, Root};
+use rcgjs_object::jir::types::{FieldKey, TypeId, TypeKind};
+use rcgjs_object::jsast::{self, BinOp, Expr, Stmt};
+use rcgjs_object::ptr::{self, BUF, META, OFF, PTR};
+
+use super::value::{self, field_expr, is_slot, is_slot_pointee};
+use super::{decline, JsCx, Res};
+
+/// A place, lowered to the JavaScript that reads and writes it (`place.rs::JsPlace`).
+#[derive(Clone, Debug)]
+pub enum JsPlace {
+    /// A JS assignment target: a local, a property, an element, or the `p.buf[p.off]` a pointer
+    /// names.
+    Var(Expr),
+    /// The pointee of a reference to an aggregate: reading is the value itself, writing overwrites
+    /// in place.
+    Deref(Expr),
+    /// The `N` elements a pointer to `[E; N]` names, reached through `__rt.read_array` and
+    /// `__rt.write_array`. The expression is the pointer.
+    Array(Expr, u64),
+}
+
+/// The result of walking a place.
+pub struct Walk {
+    pub place: JsPlace,
+    pub ty: TypeId,
+    /// The pointer a `&`-of-this-place is, when the place is the pointee of a fat pointer.
+    pub identity: Option<Expr>,
+}
+
+impl<'a> JsCx<'a> {
+    /// The place a root names, before any projection: an SSA value's storage or a cell.
+    pub fn root_place(&self, root: &Root) -> Res<(JsPlace, TypeId)> {
+        match root {
+            Root::Value(v) => Ok((JsPlace::Var(self.expr_of(*v)?), self.ty_of(*v)?)),
+            Root::Cell(cell) => Ok((JsPlace::Var(self.cell_expr(*cell)?), self.cell_ty(*cell)?)),
+        }
+    }
+
+    /// The place walk (`place.rs::walk_place`).
+    pub fn walk_place(&self, root: &Root, path: &[Proj]) -> Res<Walk> {
+        let table = self.table;
+        let (mut current, mut ty) = self.root_place(root)?;
+        let mut variant: Option<u32> = None;
+        let mut identity = None;
+        let mut tail: Option<Expr> = None;
+
+        for (step, proj) in path.iter().enumerate() {
+            let settles = path[step + 1..]
+                .iter()
+                .all(|proj| matches!(proj, Proj::Field { .. } | Proj::Downcast { .. }));
+            identity = None;
+            let carried_tail = tail.take();
+
+            match proj {
+                Proj::Deref => {
+                    let Some(pointee) = value::pointee_of(table, ty) else {
+                        return Err(decline(
+                            OpClass::Place,
+                            format!(
+                                "deref of non-pointer {ty:?} at projection {step} from {root:?}"
+                            ),
+                        ));
+                    };
+                    let value = self.read_place(&current);
+                    let shape = table.peeled(pointee);
+                    current = match value::kind(table, shape) {
+                        Some(TypeKind::Dynamic { .. }) => {
+                            identity = Some(value.clone());
+                            JsPlace::Deref(jsast::member(value, PTR))
+                        }
+                        Some(TypeKind::Slice(_)) => {
+                            identity = Some(value.clone());
+                            JsPlace::Deref(value)
+                        }
+                        _ if table.unsized_tail(shape).is_some() => {
+                            let value = if value::is_raw(table, ty) {
+                                self.raw_to_ref(pointee, value)
+                            } else {
+                                value
+                            };
+                            identity = Some(value.clone());
+                            tail = Some(jsast::member(value.clone(), META));
+                            JsPlace::Deref(jsast::member(value, PTR))
+                        }
+                        Some(TypeKind::Array { length, .. }) if settles && is_slot(table, ty) => {
+                            JsPlace::Array(value, *length)
+                        }
+                        _ if is_slot(table, ty) && table.is_indirect(pointee) => {
+                            JsPlace::Deref(ptr::slot_element(value))
+                        }
+                        _ if is_slot(table, ty) => JsPlace::Var(ptr::slot_element(value)),
+                        _ => JsPlace::Deref(value),
+                    };
+                    ty = pointee;
+                    variant = None;
+                }
+                Proj::Field {
+                    field,
+                    ty: field_ty,
+                } => {
+                    let key = match table.field(ty, variant, *field) {
+                        Some(descriptor) => descriptor.key,
+                        None => {
+                            return Err(decline(
+                                OpClass::Place,
+                                format!("field {field} of a type with no such field"),
+                            ))
+                        }
+                    };
+                    let field_ty = *field_ty;
+                    if matches!(key, FieldKey::Transparent) {
+                        tail = carried_tail;
+                    } else if !table.get(field_ty).is_some_and(|d| d.layout.sized) {
+                        let base = self.read_place(&current);
+                        current = self.tail_place(base, key, field_ty, carried_tail)?;
+                    } else {
+                        let base = self.read_place(&current);
+                        current = JsPlace::Var(field_expr(self.interns, base, key));
+                    }
+                    ty = field_ty;
+                    variant = None;
+                }
+                Proj::Index(index) => {
+                    let base = self.read_place(&current);
+                    let index = self.expr_of(*index)?;
+                    current = JsPlace::Var(self.element_expr(ty, base, index));
+                    ty = self.element_ty(ty)?;
+                    variant = None;
+                }
+                Proj::ConstantIndex {
+                    offset, from_end, ..
+                } => {
+                    let base = self.read_place(&current);
+                    let index = self.constant_index(ty, base.clone(), *offset, *from_end);
+                    current = JsPlace::Var(self.element_expr(ty, base, index));
+                    ty = self.element_ty(ty)?;
+                    variant = None;
+                }
+                Proj::Subslice { from, to, from_end } => {
+                    let base = self.read_place(&current);
+                    let (value, subslice_ty) = self.subslice(ty, base, *from, *to, *from_end)?;
+                    current = JsPlace::Deref(value);
+                    ty = subslice_ty;
+                    variant = None;
+                }
+                Proj::Downcast { variant: index } => {
+                    variant = Some(*index);
+                    tail = carried_tail;
+                }
+            }
+        }
+        Ok(Walk {
+            place: current,
+            ty,
+            identity,
+        })
+    }
+
+    /// The place a struct's unsized tail is (`place.rs::tail_place`).
+    fn tail_place(
+        &self,
+        record: Expr,
+        key: FieldKey,
+        tail_ty: TypeId,
+        tail: Option<Expr>,
+    ) -> Res<JsPlace> {
+        let Some(tail) = tail else {
+            return Err(decline(
+                OpClass::Place,
+                "the unsized tail of a struct projected out of a place that is not behind a { ptr, meta } pointer",
+            ));
+        };
+        if !matches!(value::kind(self.table, tail_ty), Some(TypeKind::Slice(_))) {
+            return Err(decline(
+                OpClass::Place,
+                "a struct with a non-slice unsized tail",
+            ));
+        }
+        Ok(JsPlace::Deref(jsast::rt_call(
+            "tail_slice",
+            vec![
+                record,
+                jsast::string(value::key_name(self.interns, key).expect("tail field key")),
+                tail,
+            ],
+        )))
+    }
+
+    /// One element of an array or a slice: `base[i]` or `base.buf[base.off + i]`.
+    pub fn element_expr(&self, base_ty: TypeId, base: Expr, index: Expr) -> Expr {
+        match value::kind(self.table, base_ty) {
+            Some(TypeKind::Slice(_)) => jsast::index(
+                ptr::slot_buf(base.clone()),
+                offset(ptr::slot_off(base), index),
+            ),
+            _ => jsast::index(base, index),
+        }
+    }
+
+    /// The index a `ConstantIndex` projection reads.
+    fn constant_index(&self, base_ty: TypeId, base: Expr, offset: u64, from_end: bool) -> Expr {
+        if !from_end {
+            return jsast::num(offset as f64);
+        }
+        let length = match value::kind(self.table, base_ty) {
+            Some(TypeKind::Slice(_)) => ptr::slot_len(base),
+            _ => jsast::member(base, "length"),
+        };
+        jsast::binary(BinOp::Sub, length, jsast::num(offset as f64))
+    }
+
+    /// A `Subslice` projection (`place.rs::subslice`).
+    fn subslice(
+        &self,
+        base_ty: TypeId,
+        base: Expr,
+        from: u64,
+        to: u64,
+        from_end: bool,
+    ) -> Res<(Expr, TypeId)> {
+        match value::kind(self.table, base_ty) {
+            Some(TypeKind::Slice(_)) => {
+                let len = ptr::slot_len(base.clone());
+                let len = if from_end {
+                    let trimmed = from + to;
+                    if trimmed == 0 {
+                        len
+                    } else {
+                        jsast::binary(BinOp::Sub, len, jsast::num(trimmed as f64))
+                    }
+                } else {
+                    jsast::num(to.saturating_sub(from) as f64)
+                };
+                let value = ptr::fat_slice(
+                    ptr::slot_buf(base.clone()),
+                    offset(ptr::slot_off(base), jsast::num(from as f64)),
+                    len,
+                );
+                Ok((value, base_ty))
+            }
+            Some(TypeKind::Array { length, .. }) => {
+                let size = *length;
+                let end = if from_end {
+                    size.saturating_sub(to)
+                } else {
+                    to
+                };
+                let value = jsast::method_call(
+                    base,
+                    "slice",
+                    vec![jsast::num(from as f64), jsast::num(end as f64)],
+                );
+                // The subslice of a fixed size array is another fixed size array; its type is not
+                // in the table unless the body mentions it, and nothing after a `Subslice` asks
+                // for it but a further projection, which reads the same element type.
+                Ok((value, base_ty))
+            }
+            _ => Err(decline(OpClass::Place, "subslice of a non-array place")),
+        }
+    }
+
+    /// The element type of an array or slice.
+    pub fn element_ty(&self, ty: TypeId) -> Res<TypeId> {
+        match value::kind(self.table, ty) {
+            Some(TypeKind::Array { element, .. } | TypeKind::Slice(element)) => Ok(*element),
+            _ => Err(decline(OpClass::Place, "index of a non-array place")),
+        }
+    }
+
+    /// The expression that reads a place.
+    pub fn read_place(&self, place: &JsPlace) -> Expr {
+        match place {
+            JsPlace::Var(expr) | JsPlace::Deref(expr) => expr.clone(),
+            JsPlace::Array(pointer, width) => jsast::rt_call(
+                "read_array",
+                vec![pointer.clone(), jsast::num(*width as f64)],
+            ),
+        }
+    }
+
+    /// The statements that write `value` to a place of type `ty` (`place.rs::write_place`).
+    pub fn write_place(&self, place: JsPlace, ty: TypeId, value: Expr) -> Res<Vec<Stmt>> {
+        match place {
+            JsPlace::Var(target) => {
+                if !is_lvalue(&target) {
+                    return Err(decline(
+                        OpClass::Place,
+                        "a write to a place whose expression is not assignable (an inlined value used as storage)",
+                    ));
+                }
+                Ok(vec![jsast::assign_stmt(target, value)])
+            }
+            JsPlace::Deref(target) => self.write_indirect(ty, target, value),
+            JsPlace::Array(pointer, _) => Ok(vec![jsast::expr_stmt(jsast::rt_call(
+                "write_array",
+                vec![pointer, value],
+            ))]),
+        }
+    }
+
+    /// `&place` (`place.rs::codegen_ref`).
+    pub fn borrow_view(&self, root: &Root, path: &[Proj]) -> Res<Expr> {
+        let walk = self.walk_place(root, path)?;
+        if let Some(identity) = walk.identity {
+            if let Some(TypeKind::Slice(element)) = value::kind(self.table, walk.ty) {
+                if matches!(
+                    value::kind(self.table, *element),
+                    Some(TypeKind::Integer { bits: 8, .. })
+                ) {
+                    return Ok(jsast::rt_call("byte_slice_ref", vec![identity]));
+                }
+            }
+            return Ok(identity);
+        }
+        if let JsPlace::Array(pointer, width) = &walk.place {
+            return Ok(jsast::rt_call(
+                "array_ref",
+                vec![pointer.clone(), jsast::num(*width as f64)],
+            ));
+        }
+        if self.table.is_indirect(walk.ty) {
+            return Ok(self.read_place(&walk.place));
+        }
+        self.slot_of(walk.place, walk.ty)
+    }
+
+    /// `&raw const place` (`place.rs::codegen_raw_ptr`).
+    pub fn raw_view(&self, root: &Root, path: &[Proj]) -> Res<Expr> {
+        let walk = self.walk_place(root, path)?;
+        if let Some(identity) = walk.identity {
+            return Ok(self.ref_to_raw(walk.ty, identity));
+        }
+        if !is_slot_pointee(self.table, walk.ty) {
+            return Ok(self.read_place(&walk.place));
+        }
+        self.slot_of(walk.place, walk.ty)
+    }
+
+    /// The slot naming a place: the place walk, run backwards (`place.rs::slot_of`).
+    fn slot_of(&self, place: JsPlace, ty: TypeId) -> Res<Expr> {
+        match place {
+            JsPlace::Var(Expr::Index(base, key)) if reborrowed(&base, &key).is_some() => {
+                Ok(reborrowed(&base, &key)
+                    .cloned()
+                    .unwrap_or_else(jsast::undefined))
+            }
+            JsPlace::Var(Expr::Index(base, key)) => Ok(ptr::slot(*base, *key)),
+            JsPlace::Var(Expr::Member(base, name)) => Ok(ptr::slot(*base, jsast::string(name))),
+            JsPlace::Array(pointer, _) => Ok(pointer),
+            JsPlace::Deref(value) | JsPlace::Var(value) => {
+                if self.table.is_indirect(ty) {
+                    Ok(self.ref_to_raw(ty, value))
+                } else {
+                    Err(decline(
+                        OpClass::Place,
+                        "the address of a direct value that is not in a cell (the place has no container to be the buf of)",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// The metadata half of a fat pointer (`place.rs::ptr_metadata`).
+    pub fn ptr_metadata(&self, pointer_ty: TypeId, value: Expr) -> Res<Expr> {
+        let table = self.table;
+        let Some(pointee) = value::pointee_of(table, pointer_ty) else {
+            return Err(decline(OpClass::Rvalue, "PtrMetadata of a non-pointer"));
+        };
+        match value::kind(table, pointee) {
+            Some(TypeKind::Slice(_)) => Ok(ptr::slot_len(value)),
+            Some(TypeKind::Dynamic { .. }) => Ok(jsast::member(value, META)),
+            Some(TypeKind::Str) => Ok(self.str_len(value)),
+            _ if table.get(pointee).is_some_and(|d| d.layout.sized) => Ok(jsast::undefined()),
+            _ if table.unsized_tail(pointee).is_some() => Ok(jsast::member(value, META)),
+            _ => Err(decline(
+                OpClass::Rvalue,
+                "PtrMetadata of a pointee whose metadata has no JavaScript form",
+            )),
+        }
+    }
+}
+
+/// The pointer `p` of a `p.buf[p.off]` place.
+fn reborrowed<'e>(base: &'e Expr, key: &'e Expr) -> Option<&'e Expr> {
+    let (Expr::Member(buffer, buf), Expr::Member(offset, off)) = (base, key) else {
+        return None;
+    };
+    (buf == BUF && off == OFF && buffer == offset).then_some(&**buffer)
+}
+
+/// `base + index`, with the `+ 0` of an unshifted slice folded away.
+pub fn offset(base: Expr, index: Expr) -> Expr {
+    if index == jsast::num(0) {
+        return base;
+    }
+    jsast::binary(BinOp::Add, base, index)
+}
+
+/// Whether an expression can stand on the left of `=`.
+pub fn is_lvalue(expr: &Expr) -> bool {
+    matches!(expr, Expr::Ident(_) | Expr::Member(..) | Expr::Index(..))
+}

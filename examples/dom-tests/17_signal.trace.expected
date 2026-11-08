@@ -1,0 +1,7 @@
+{"$record":"header","$generatedBy":"scripts/dom-trace.mjs","$what":"Normalized runtime-call trace of a rustc_codegen_js-compiled client module executed against contract/harness/trace.mjs.","fixture":"domtest/17_signal","label":"domtest/17_signal","freeBindingsHealed":[],"status":"completed","error":null,"recordCount":6}
+{"op":"template","tmpl":"tmpl#0","html":"<div><button>+1</button><button>-1</button><p>Count: <!></p></div>"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"delegateEvents","events":["click"],"document":"undefined"}
+{"op":"effect","fn":"fn#0","init":"undefined","options":"undefined"}
+{"op":"effect.ran","fn":"fn#0","returned":true}
+{"op":"insert","parent":"tmpl#0:root.firstChild.nextSibling.nextSibling","accessor":"fn#1","marker":"tmpl#0:root.firstChild.nextSibling.nextSibling.firstChild.nextSibling","initial":"undefined"}

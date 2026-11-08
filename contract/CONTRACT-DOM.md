@@ -1017,8 +1017,8 @@ guarded by `if (Owner)`, so a resource created outside an owner has none at all.
 
 - Topcoat delta: dropping a Rust future is expected to cancel its work, and the
   pinned runtime offers no counterpart. An executor that maps drop onto anything has
-  to build it, and the `fetch` a framework's procedure call issues is the first thing
-  that will want it.
+  to build it, and the `fetch` a procedure call issues (point 3 of PROCEDURES.md) is
+  the first thing that will want it.
 
 ## Open questions
 

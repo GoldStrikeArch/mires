@@ -1,0 +1,13 @@
+{
+  "name": "fingerprintjs-dart-experiment",
+  "version": "5.2.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Unpublished Dart2js port of FingerprintJS 5.2.0",
+  "module": "dist/fp.esm.js",
+  "types": "dist/fp.d.ts",
+  "scripts": {
+    "build": "node tools/build.mjs"
+  }
+}

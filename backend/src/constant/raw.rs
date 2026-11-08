@@ -10,7 +10,7 @@
 
 use rustc_abi::{Size, TagEncoding, VariantIdx, Variants};
 use rustc_middle::mir::interpret::{
-    AllocId, Allocation, CtfeProvenance, read_target_uint, write_target_uint,
+    read_target_uint, write_target_uint, AllocId, Allocation, CtfeProvenance,
 };
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, ScalarInt, Ty, TyCtxt};
@@ -48,7 +48,12 @@ pub(crate) fn scratch_alloc<'tcx>(
     let size = layout.size.max(int.size());
     let mut bytes = vec![0u8; size.bytes_usize()];
     let width = int.size().bytes_usize();
-    write_target_uint(tcx.data_layout.endian, &mut bytes[..width], int.to_uint(int.size())).ok()?;
+    write_target_uint(
+        tcx.data_layout.endian,
+        &mut bytes[..width],
+        int.to_uint(int.size()),
+    )
+    .ok()?;
     Some(Allocation::from_bytes_byte_aligned_immutable(bytes, ()))
 }
 
@@ -77,7 +82,12 @@ pub(crate) fn variant_index<'tcx>(
     match &layout.variants {
         Variants::Empty => Err(TagError::Uninhabited),
         Variants::Single { index } => Ok(*index),
-        Variants::Multiple { tag, tag_encoding, tag_field, .. } => {
+        Variants::Multiple {
+            tag,
+            tag_encoding,
+            tag_field,
+            ..
+        } => {
             let tag_size = tag.size(&tcx);
             let tag_offset = offset + layout.fields.offset(tag_field.as_usize());
             let bits = read_scalar(tcx, alloc, tag_offset, tag_size)
@@ -93,7 +103,11 @@ pub(crate) fn variant_index<'tcx>(
                 // `i = tag.wrapping_sub(niche_start) + niche_variants.start`, and anything landing
                 // outside `niche_variants` was the untagged variant. The arithmetic is done at the
                 // tag's width, which is what `wrapping` means here.
-                TagEncoding::Niche { untagged_variant, niche_variants, niche_start } => {
+                TagEncoding::Niche {
+                    untagged_variant,
+                    niche_variants,
+                    niche_start,
+                } => {
                     let relative = tag_size.truncate(bits.wrapping_sub(*niche_start));
                     let count =
                         niche_variants.last.index() as u128 - niche_variants.start.index() as u128;
@@ -153,7 +167,9 @@ pub(crate) fn read_pointer(
     };
     Pointer {
         provenance: alloc.provenance().ptrs().get(&offset).copied(),
-        offset: bits.map_or(Size::ZERO, |int| Size::from_bytes(int.to_uint(pointer_size) as u64)),
+        offset: bits.map_or(Size::ZERO, |int| {
+            Size::from_bytes(int.to_uint(pointer_size) as u64)
+        }),
         meta,
         readable: bits.is_some(),
     }
@@ -168,11 +184,7 @@ pub(crate) enum StrError {
 }
 
 /// The `str` whose `length` bytes start at `offset` in `alloc`.
-pub(crate) fn read_str(
-    alloc: &Allocation,
-    offset: Size,
-    length: u64,
-) -> Result<&str, StrError> {
+pub(crate) fn read_str(alloc: &Allocation, offset: Size, length: u64) -> Result<&str, StrError> {
     let start = offset.bytes_usize();
     let end = start.saturating_add(usize::try_from(length).unwrap_or(usize::MAX));
     if end > alloc.len() {
@@ -187,6 +199,8 @@ pub(crate) fn read_str(
 /// An element of a zero sized type has no bytes to read, so the check is vacuous for one; the
 /// slice still has the length it claims, because that is what `len()` answers.
 pub(crate) fn slice_fits(alloc: &Allocation, offset: Size, stride: u64, length: usize) -> bool {
-    let end = offset.bytes().saturating_add(stride.saturating_mul(length as u64));
+    let end = offset
+        .bytes()
+        .saturating_add(stride.saturating_mul(length as u64));
     end <= alloc.len() as u64
 }

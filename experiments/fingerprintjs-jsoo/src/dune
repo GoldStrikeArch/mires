@@ -1,0 +1,14 @@
+(executable
+ (name fingerprintjs)
+ (modes js)
+ (libraries js_of_ocaml lwt)
+ (preprocess
+  (pps js_of_ocaml-ppx))
+ (js_of_ocaml
+  (compilation_mode whole_program)
+  (sourcemap no)
+  (flags
+   --effects=disabled
+   --target-env=browser
+   --no-extern-fs
+   --opt=3)))

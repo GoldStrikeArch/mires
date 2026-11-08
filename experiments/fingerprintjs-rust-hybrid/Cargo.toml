@@ -1,0 +1,24 @@
+[package]
+name = "fingerprintjs-rust-hybrid-experiment"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "A safe Rust+JS hybrid parity experiment for FingerprintJS 5.2.0"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+mires-js = { path = "../../mires-js" }
+js-macro = { path = "../../spike/rustc-codegen-js/js-macro" }
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fingerprint_fiber)"] }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+too_many_lines = "allow"

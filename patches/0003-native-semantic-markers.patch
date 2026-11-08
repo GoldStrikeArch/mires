@@ -1,0 +1,44 @@
+rustc_codegen_js: mark exact native semantic adapters.
+
+The backend recognizes native standard-library operations from rustc semantic
+identities, never from source paths or generated symbol names. `Extend` is not
+a lang item or diagnostic item in the pinned standard library, so give its
+required method a private compiler-owned marker in the sysroot sources. The
+formatting adapter markers identify the exact default `Write::write_fmt` method
+and its sized specialization without interpreting diagnostic paths.
+The string marker identifies the exact generic `Display`-based fallback used
+by `ToString` so a monomorphic numeric implementation can be recognized.
+
+--- a/library/core/src/iter/traits/collect.rs
++++ b/library/core/src/iter/traits/collect.rs
+@@ -415,2 +415,3 @@ pub trait Extend<A> {
+     #[stable(feature = "rust1", since = "1.0.0")]
++    #[rustc_diagnostic_item = "rcgjs_extend"]
+     fn extend<T: IntoIterator<Item = A>>(&mut self, iter: T);
+--- a/library/core/src/fmt/mod.rs
++++ b/library/core/src/fmt/mod.rs
+@@ -209,5 +209,6 @@ pub trait Write {
+     /// ```
+     #[stable(feature = "rust1", since = "1.0.0")]
++    #[rustc_diagnostic_item = "rcgjs_fmt_write_fmt"]
+     fn write_fmt(&mut self, args: Arguments<'_>) -> Result {
+         // We use a specialization for `Sized` types to avoid an indirection
+         // through `&mut self`
+@@ -229,6 +230,7 @@ pub trait Write {
+ 
+         impl<W: Write> SpecWriteFmt for &mut W {
+             #[inline]
++            #[rustc_diagnostic_item = "rcgjs_fmt_spec_write_fmt"]
+             fn spec_write_fmt(self, args: Arguments<'_>) -> Result {
+                 if let Some(s) = args.as_statically_known_str() {
+                     self.write_str(s)
+--- a/library/alloc/src/string.rs
++++ b/library/alloc/src/string.rs
+@@ -2920,6 +2920,7 @@ impl<T: fmt::Display + ?Sized> SpecToString for T {
+     // See <https://github.com/rust-lang/rust/pull/74852>, the last attempt
+     // to try to remove it.
+     #[inline]
++    #[rustc_diagnostic_item = "rcgjs_spec_to_string"]
+     default fn spec_to_string(&self) -> String {
+         let mut buf = String::new();
+         let mut formatter =

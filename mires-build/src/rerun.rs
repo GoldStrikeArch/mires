@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{ProcMacro, Toolchain, ROOT_ENV};
+use crate::{Result, RustOptLevel, Toolchain, SPIKE_ROOT_ENV};
 
 /// The inputs a compiled client program depends on, printed as
 /// `cargo:rerun-if-changed` directives.
@@ -29,61 +29,103 @@ impl Rerun {
         let mut paths = vec![client_dir.to_path_buf()];
         collect_inputs(client_dir, &mut paths);
         collect_path_modules(&mut paths);
+        let patch_dir = toolchain.root().join("patches");
+        let mut patches: Vec<_> = fs::read_dir(&patch_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "patch")
+            })
+            .collect();
+        patches.sort();
         paths.extend([
             toolchain.dylib().to_path_buf(),
+            toolchain.linker().to_path_buf(),
             toolchain.shim(),
             toolchain.script("compile_core.sh"),
+            toolchain.script("minimal-shim.mjs"),
+            toolchain.script("artifact-manifest.mjs"),
+            toolchain.script("sysroot-cache.sh"),
+            toolchain.root().join("rust-toolchain.toml"),
             toolchain.sysroot_args(),
+            patch_dir,
         ]);
+        paths.extend(patches);
         Self { paths }
     }
 
-    /// Also watch the `#[js_extern]` macro a crate expands through: the dylib
-    /// and the sources it is built from.
-    #[must_use]
-    pub fn extern_macro(self, toolchain: &Toolchain) -> Self {
-        self.macro_inputs(&toolchain.js_extern_macro(), &toolchain.extern_macro_sources())
+    /// Watch only the immutable sysroot selected for this build.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when the checkout cannot derive the settings' cache key.
+    pub fn selected_sysroot(
+        toolchain: &Toolchain,
+        emit_args: &str,
+        opt_level: Option<RustOptLevel>,
+    ) -> Result<Self> {
+        let sysroot = toolchain.sysroot_for(emit_args, opt_level)?;
+        Ok(Self {
+            paths: vec![
+                sysroot.join(".cache-key"),
+                sysroot.join(".js-args"),
+                sysroot.join(".rust-opt-level"),
+            ],
+        })
     }
 
-    /// Also watch a proc macro the caller named: its dylib and the sources it
-    /// is built from.
+    /// Also watch what a crate using the view macros compiles against: the
+    /// macros themselves and the sources they are built from.
     ///
     /// The sources matter as much as the dylib. Watching only the built macro
-    /// means an edit to it reruns nothing until someone happens to rebuild it,
-    /// so the expansion keeps coming out of the macro that was current when
-    /// the dylib was written.
+    /// means an edit to the lowering reruns nothing until someone happens to
+    /// rebuild it, so the expansion keeps coming out of the macro that was
+    /// current when the dylib was written.
     #[must_use]
-    pub fn proc_macro(self, proc_macro: &ProcMacro) -> Self {
-        self.macro_inputs(proc_macro.dylib(), proc_macro.sources())
+    pub fn views(self, toolchain: &Toolchain) -> Self {
+        self.views_with_keyed(toolchain, false)
     }
 
-    /// Also watch a crate the backend compiles to an rlib for the client: its
-    /// root file and the directory holding it.
+    /// Also watch the isolated proc-macro artifacts selected by `keyed`.
     #[must_use]
-    pub fn rlib(mut self, src: &Path) -> Self {
-        let dir = src.parent().unwrap_or(Path::new("."));
-        self.paths.push(dir.to_path_buf());
-        collect_inputs(dir, &mut self.paths);
-        self
-    }
-
-    fn macro_inputs(mut self, dylib: &Path, sources: &[PathBuf]) -> Self {
-        self.paths.push(dylib.to_path_buf());
-        for dir in sources {
+    pub(crate) fn views_with_keyed(mut self, toolchain: &Toolchain, keyed: bool) -> Self {
+        self.paths.push(toolchain.view_macros_with_keyed(keyed));
+        self.paths.push(toolchain.js_extern_macro_with_keyed(keyed));
+        for dir in toolchain.view_sources() {
             // The directory itself covers a source file being added or
             // removed, which no per-file directive can.
             self.paths.push(dir.clone());
-            collect_inputs(dir, &mut self.paths);
+            collect_inputs(&dir, &mut self.paths);
+        }
+        self
+    }
+
+    /// Also watch the framework procedure macro and its client runtime seam.
+    #[must_use]
+    pub fn procedures(mut self, toolchain: &Toolchain) -> Self {
+        self.paths.push(toolchain.procedure_macro());
+        self.paths.push(toolchain.js_macro());
+        for dir in toolchain.procedure_sources() {
+            self.paths.push(dir.clone());
+            collect_inputs(&dir, &mut self.paths);
         }
         self
     }
 
     /// Print the directives.
     pub fn emit(&self) {
+        self.emit_paths();
+        println!("cargo:rerun-if-env-changed={SPIKE_ROOT_ENV}");
+        println!("cargo:rerun-if-env-changed=JSC_SPIKE_ROOT");
+    }
+
+    pub(crate) fn emit_paths(&self) {
         for path in &self.paths {
             println!("cargo:rerun-if-changed={}", path.display());
         }
-        println!("cargo:rerun-if-env-changed={ROOT_ENV}");
     }
 
     /// The watched paths, in the order they are printed.
@@ -220,34 +262,94 @@ mod tests {
 
         assert_eq!(paths.first().unwrap(), Path::new("/app/client"));
         assert!(paths.contains(&toolchain.dylib().to_path_buf()));
+        assert!(paths.contains(&toolchain.linker().to_path_buf()));
         assert!(paths.contains(&toolchain.shim()));
         assert!(paths.contains(&toolchain.script("compile_core.sh")));
+        assert!(paths.contains(&toolchain.script("sysroot-cache.sh")));
+        assert!(paths.contains(&toolchain.root().join("rust-toolchain.toml")));
         assert!(paths.contains(&toolchain.sysroot_args()));
     }
 
     #[test]
-    fn watching_a_macro_covers_the_sources_and_not_only_the_dylib() {
-        let checkout = TempDir::new("rerun-macros");
-        fs::create_dir_all(checkout.path().join("js-extern-macro/src")).unwrap();
-        fs::write(checkout.path().join("js-extern-macro/src/lib.rs"), "").unwrap();
-        fs::create_dir_all(checkout.path().join("my-macro/src")).unwrap();
-        fs::write(checkout.path().join("my-macro/src/lib.rs"), "").unwrap();
-        let proc_macro = ProcMacro::new("my_macro", checkout.path().join("libmy_macro.so"))
-            .source_dir(checkout.path().join("my-macro"));
+    fn watches_every_sysroot_patch_in_stable_order() {
+        let spike = TempDir::new("rerun-sysroot-patches");
+        fs::create_dir_all(spike.path().join("patches")).unwrap();
+        fs::write(spike.path().join("patches/b.patch"), "").unwrap();
+        fs::write(spike.path().join("patches/a.patch"), "").unwrap();
+        fs::write(spike.path().join("patches/notes.txt"), "").unwrap();
+        let toolchain = Toolchain::new(spike.path()).unwrap();
 
-        let toolchain = Toolchain::new(checkout.path()).unwrap();
-        let rerun = Rerun::new(Path::new("/app/client/app.rs"), &toolchain)
-            .extern_macro(&toolchain)
-            .proc_macro(&proc_macro)
-            .rlib(&toolchain.view_abi());
+        let rerun = Rerun::new(Path::new("/app/client/app.rs"), &toolchain);
+        let patches: Vec<_> = rerun
+            .paths()
+            .iter()
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "patch")
+            })
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            patches,
+            [
+                spike.path().join("patches/a.patch"),
+                spike.path().join("patches/b.patch"),
+            ],
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn watches_the_selected_keyed_sysroot() {
+        let spike = TempDir::new("rerun-keyed-sysroot");
+        fs::create_dir_all(spike.path().join("scripts")).unwrap();
+        fs::write(
+            spike.path().join("scripts/sysroot-cache.sh"),
+            format!(
+                "printf '%s/build/sysroots/selected\\n' '{}'\n",
+                spike.path().display(),
+            ),
+        )
+        .unwrap();
+        let toolchain = Toolchain::new(spike.path()).unwrap();
+
+        let rerun =
+            Rerun::selected_sysroot(&toolchain, "js-opt=on", Some(RustOptLevel::SizeMin)).unwrap();
+        let selected = spike.path().join("build/sysroots/selected");
+
+        assert!(rerun.paths().contains(&selected.join(".cache-key")));
+        assert!(rerun.paths().contains(&selected.join(".js-args")));
+        assert!(rerun.paths().contains(&selected.join(".rust-opt-level")));
+    }
+
+    #[test]
+    fn watching_the_views_covers_the_sources_and_not_only_the_dylib() {
+        let spike = TempDir::new("rerun-views");
+        fs::create_dir_all(spike.path().join("view-dom/src")).unwrap();
+        fs::write(spike.path().join("view-dom/src/lower.rs"), "").unwrap();
+
+        let toolchain = Toolchain::new(spike.path()).unwrap();
+        let rerun = Rerun::new(Path::new("/app/client/app.rs"), &toolchain).views(&toolchain);
         let paths = rerun.paths();
 
-        assert!(paths.contains(&toolchain.js_extern_macro()));
-        assert!(paths.contains(&checkout.path().join("js-extern-macro")));
-        assert!(paths.contains(&checkout.path().join("js-extern-macro/src/lib.rs")));
-        assert!(paths.contains(&checkout.path().join("libmy_macro.so")));
-        assert!(paths.contains(&checkout.path().join("my-macro/src/lib.rs")));
-        assert!(paths.contains(&checkout.path().join("view-abi/src")));
+        assert!(paths.contains(&toolchain.view_macros()));
+        assert!(paths.contains(&spike.path().join("view-dom")));
+        assert!(paths.contains(&spike.path().join("view-dom/src/lower.rs")));
+    }
+
+    #[test]
+    fn watching_keyed_views_selects_the_isolated_macro_artifact() {
+        let spike = TempDir::new("rerun-keyed-views");
+        let toolchain = Toolchain::new(spike.path()).unwrap();
+
+        let rerun = Rerun::new(Path::new("/app/client/app.rs"), &toolchain)
+            .views_with_keyed(&toolchain, true);
+
+        assert!(rerun
+            .paths()
+            .contains(&toolchain.view_macros_with_keyed(true)));
+        assert!(!rerun.paths().contains(&toolchain.view_macros()));
     }
 
     #[test]

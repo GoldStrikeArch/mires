@@ -1,0 +1,38 @@
+rustc_codegen_js: avoid redundant char-pattern panic edges.
+
+CharSearcher records a UTF-8 needle length in 1..=4 and stores its bytes in a
+four-byte array. Compare the candidate slice with a non-panicking view of that
+array. Likewise, implement char suffix removal with checked byte views after an
+explicit length guard. Safe callers observe the same results, while the custom
+JavaScript sysroot does not retain slice-index panic machinery for bounds and a
+character boundary already established by the pattern.
+
+--- a/library/core/src/str/pattern.rs
++++ b/library/core/src/str/pattern.rs
+@@ -467,6 +467,6 @@ unsafe impl<'a> Searcher<'a> for CharSearcher<'a> {
+                     let found_char = self.finger - self.utf8_size();
+                     if let Some(slice) = self.haystack.as_bytes().get(found_char..self.finger) {
+-                        if slice == &self.utf8_encoded[0..self.utf8_size()] {
++                        if self.utf8_encoded.get(..self.utf8_size()) == Some(slice) {
+                             return Some((found_char, self.finger));
+                     }
+                 }
+@@ -611,7 +611,17 @@ impl Pattern for char {
+     where
+         Self::Searcher<'a>: ReverseSearcher<'a>,
+     {
+-        self.encode_utf8(&mut [0u8; 4]).strip_suffix_of(haystack)
++        let mut buffer = [0u8; 4];
++        let encoded = self.encode_utf8(&mut buffer).as_bytes();
++        if encoded.len() > haystack.len() {
++            return None;
++        }
++        let start = haystack.len() - encoded.len();
++        if haystack.as_bytes().get(start..) == Some(encoded) {
++            haystack.get(..start)
++        } else {
++            None
++        }
+     }
+ 
+     #[inline]

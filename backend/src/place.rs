@@ -17,9 +17,8 @@
 //!   `meta` comes back to build the fat slice the tail's type is.
 //!
 //! `Deref` of the first two keeps the whole object: it is the place walk's *later* projections that
-//! read `buf`/`off`/`len` or `ptr`. `&*p` where `*p` is unsized is therefore the identity, which is
-//! exactly what MIR's `&raw const (fake) (*_1)` (`RawPtrKind::FakeForPtrMetadata`, the shape a
-//! bounds check is built out of) needs it to be.
+//! read `buf`/`off`/`len` or `ptr`. Reborrows preserve metadata. Unsized struct borrows convert
+//! the raw data slot to its record, and raw reborrows recover the same slot.
 //!
 //! # Slots
 //!
@@ -44,7 +43,7 @@ use rustc_middle::ty::{self, Ty};
 use crate::base::FnCx;
 use crate::jsast::{self, BinOp as JsBinOp, Expr, Stmt};
 use crate::ptr;
-use crate::value::{FieldKey, clone_expr, field_expr, field_key, is_indirect, needs_clone};
+use crate::value::{clone_expr, field_expr, field_key, is_indirect, needs_clone, FieldKey};
 
 /// A place, lowered to the JavaScript that reads and writes it.
 pub(crate) enum JsPlace {
@@ -62,32 +61,11 @@ pub(crate) enum JsPlace {
     Array(Expr, u64),
 }
 
-/// Where the unsized tail of a struct lives, carried from the `Deref` that named the struct to the
-/// projection that reads the tail.
-///
-/// The two forms are the same reference/raw split every other aggregate pointee has, and they are
-/// the two halves of the representation:
-///
-/// * a **reference** to such a struct is `{ ptr: <the record>, meta }`, and the tail is an
-///   ordinary field of that record holding the elements. `core`'s `array::IntoIter` unsizes a
-///   `PolymorphicIter<[T; N]>` this way;
-/// * a **raw pointer** to one is `{ ptr: <a slot>, meta }` over a heap block laid out as the
-///   header record at element 0 and the tail after it, which is what `Rc<[T]>` allocates
-///   (`runtime/shim.js`, `retype_rc`). The record is `p.ptr.buf[p.ptr.off]` and the tail is the
-///   run of elements that follows it, so the tail is a slice over the block itself.
-enum Tail {
-    /// The tail is a field of the record, holding the elements.
-    Field { meta: Expr },
-    /// The tail is the run of elements after the header in a heap block.
-    Block { block: Expr, meta: Expr },
-}
-
 /// The result of walking a place: where it is and what type it has.
 struct Walk<'tcx> {
     place: JsPlace,
     ty: Ty<'tcx>,
-    /// The pointer a `&`-of-this-place is, when the place is the pointee of a fat pointer. `&*p`
-    /// on an unsized pointee is `p` itself, metadata included.
+    /// The reference to an unsized pointee, including its metadata.
     identity: Option<Expr>,
 }
 
@@ -108,7 +86,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
         // the projection that reads that tail needs it, and the steps that may sit in between -- a
         // transparent field, a downcast, a cast that changes nothing -- leave the place alone and
         // carry it along; every other projection drops it.
-        let mut tail: Option<Tail> = None;
+        let mut tail: Option<Expr> = None;
 
         let projection = place.projection;
         for (step, elem) in projection.iter().enumerate() {
@@ -144,9 +122,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     // below are asked of what the pointee's JavaScript value actually is.
                     // `MaybeUninit<[E; N]>` is how `Box::new([1, 2, 3])` spells the place it
                     // writes into, and it has to reach the array row rather than the scalar one.
-                    let shape = crate::value::peel_pattern(
-                        crate::value::peel_transparent(self.tcx, pointee),
-                    );
+                    let shape = crate::value::peel_pattern(crate::value::peel_transparent(
+                        self.tcx, pointee,
+                    ));
                     current = match shape.kind() {
                         // A trait object: the concrete value lives behind `.ptr`, and the whole
                         // fat pointer is what a reference to the pointee is.
@@ -162,23 +140,16 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         }
                         // A struct with an unsized tail: the record lives behind `.ptr`, exactly
                         // as a trait object's concrete value does, and `.meta` measures the tail.
-                        // Where the tail itself is depends on which of the two the `.ptr` half is,
-                        // and that is the same reference/raw split every other aggregate pointee
-                        // has -- see [`Tail`].
+                        // Normalize raw slots before projecting fields or borrowing the record.
                         _ if crate::value::unsized_tail(self.tcx, shape).is_some() => {
+                            let value = if ptr::is_raw(self.tcx, ty) {
+                                ptr::raw_to_ref(self, pointee, value)
+                            } else {
+                                value
+                            };
                             identity = Some(value.clone());
-                            let meta = jsast::member(value.clone(), ptr::META);
-                            let record = jsast::member(value, ptr::PTR);
-                            match ptr::is_raw(self.tcx, ty) {
-                                true => {
-                                    tail = Some(Tail::Block { block: record.clone(), meta });
-                                    JsPlace::Deref(ptr::slot_element(record))
-                                }
-                                false => {
-                                    tail = Some(Tail::Field { meta });
-                                    JsPlace::Deref(record)
-                                }
-                            }
+                            tail = Some(jsast::member(value.clone(), ptr::META));
+                            JsPlace::Deref(jsast::member(value, ptr::PTR))
                         }
                         // A pointer to an array, dereferenced as a whole: the elements it names
                         // are `p.buf[p.off]` for a plain slot and `buf[off .. off + w]` for the
@@ -204,9 +175,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         // A slot to a primitive: `p.buf[p.off]` is the place, and it is assignable,
                         // so the projections that follow and a write both work without a special
                         // case.
-                        _ if ptr::is_slot(self.tcx, ty) => {
-                            JsPlace::Var(ptr::slot_element(value))
-                        }
+                        _ if ptr::is_slot(self.tcx, ty) => JsPlace::Var(ptr::slot_element(value)),
                         // A reference to an aggregate, which is the aggregate's own object.
                         _ => JsPlace::Deref(value),
                     };
@@ -247,7 +216,11 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     ty = self.element_ty(ty);
                     variant = None;
                 }
-                PlaceElem::ConstantIndex { offset, min_length: _, from_end } => {
+                PlaceElem::ConstantIndex {
+                    offset,
+                    min_length: _,
+                    from_end,
+                } => {
                     let base = self.read(&current);
                     let index = self.constant_index(ty, base.clone(), offset, from_end);
                     // Constant either way, so nothing to hoist: `len` cannot change under a
@@ -276,7 +249,11 @@ impl<'tcx> FnCx<'_, 'tcx> {
             }
         }
 
-        Walk { place: current, ty, identity }
+        Walk {
+            place: current,
+            ty,
+            identity,
+        }
     }
 
     /// The place a struct's **unsized tail** is, given the record it was projected out of, the key
@@ -292,7 +269,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
         record: Expr,
         key: FieldKey,
         tail_ty: Ty<'tcx>,
-        tail: Option<Tail>,
+        tail: Option<Expr>,
     ) -> JsPlace {
         let Some(tail) = tail else {
             return JsPlace::Var(self.zombie(format!(
@@ -302,31 +279,33 @@ impl<'tcx> FnCx<'_, 'tcx> {
         };
         if !matches!(tail_ty.kind(), ty::Slice(_)) {
             return JsPlace::Var(self.zombie(format!(
-                "a struct with a `{tail_ty}` tail is not supported by rustc_codegen_mires; only a \
+                "a struct with a `{tail_ty}` tail is not supported by rustc_codegen_js; only a \
                  slice tail is, because only a run of elements can be laid out after the header \
                  (`examples/core-tests/guard_rc_str.rs`)"
             )));
         }
-        match tail {
-            // The field holds the elements, so the slice over them starts at zero.
-            Tail::Field { meta } => {
-                JsPlace::Deref(ptr::fat_slice(field_expr(record, key), jsast::num(0), meta))
-            }
-            // The block holds the header at the slot's own offset and the tail after it, so the
-            // slice starts one element on. Every `{ buf, off }` the model builds then works over
-            // the tail unchanged: it is an ordinary slice into the block.
-            Tail::Block { block, meta } => JsPlace::Deref(ptr::fat_slice(
-                ptr::slot_buf(block.clone()),
-                jsast::binary(JsBinOp::Add, ptr::slot_off(block), jsast::num(1)),
-                meta,
-            )),
-        }
+        JsPlace::Deref(jsast::rt_call(
+            "tail_slice",
+            vec![
+                record,
+                match key {
+                    FieldKey::Name(name) => jsast::string(name),
+                    FieldKey::Index(index) => jsast::num(index as f64),
+                    FieldKey::Transparent => unreachable!("transparent tail field"),
+                },
+                tail,
+            ],
+        ))
     }
 
     /// How a local is read: `x`, or `x[0]` when it is boxed (see `uses.rs`).
     pub(crate) fn local_expr(&self, local: rustc_middle::mir::Local) -> Expr {
         let name = jsast::id(self.local_name(local));
-        if self.is_boxed(local) { jsast::index(name, jsast::num(0)) } else { name }
+        if self.is_boxed(local) {
+            jsast::index(name, jsast::num(0))
+        } else {
+            name
+        }
     }
 
     /// One element of an array or a slice: `base[i]` or `base.buf[base.off + i]`.
@@ -390,7 +369,11 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 // Subslicing a fixed size array yields another fixed size array, so the value is
                 // a plain JS array rather than a fat pointer.
                 let size = size.try_to_target_usize(tcx).unwrap_or(0);
-                let end = if from_end { size.saturating_sub(to) } else { to };
+                let end = if from_end {
+                    size.saturating_sub(to)
+                } else {
+                    to
+                };
                 let element = self.element_ty(base_ty);
                 let value = jsast::method_call(
                     base,
@@ -419,9 +402,10 @@ impl<'tcx> FnCx<'_, 'tcx> {
             JsPlace::Var(expr) | JsPlace::Deref(expr) => expr.clone(),
             // A copy of the elements: a plain slot hands back the array it holds, a window slot
             // the `n` elements it spans.
-            JsPlace::Array(pointer, width) => {
-                jsast::rt_call("read_array", vec![pointer.clone(), jsast::num(*width as f64)])
-            }
+            JsPlace::Array(pointer, width) => jsast::rt_call(
+                "read_array",
+                vec![pointer.clone(), jsast::num(*width as f64)],
+            ),
         }
     }
 
@@ -438,7 +422,10 @@ impl<'tcx> FnCx<'_, 'tcx> {
             // Element by element for a window, an in place overwrite for a plain slot: never a
             // rebind, because the elements live in a buffer other pointers share.
             JsPlace::Array(pointer, _) => {
-                vec![jsast::expr_stmt(jsast::rt_call("write_array", vec![pointer, value]))]
+                vec![jsast::expr_stmt(jsast::rt_call(
+                    "write_array",
+                    vec![pointer, value],
+                ))]
             }
         }
     }
@@ -453,6 +440,14 @@ impl<'tcx> FnCx<'_, 'tcx> {
         // `&*p` where `*p` is unsized is `p`: the metadata belongs to the reference, not to the
         // pointee, so there is nothing to rebuild.
         if let Some(identity) = walk.identity {
+            if let ty::Slice(element) = walk.ty.kind() {
+                if matches!(
+                    element.kind(),
+                    ty::Int(ty::IntTy::I8) | ty::Uint(ty::UintTy::U8)
+                ) {
+                    return jsast::rt_call("byte_slice_ref", vec![identity]);
+                }
+            }
             return identity;
         }
         // `&*p` where the pointee is an array: a reference to an aggregate is the aggregate's own
@@ -464,7 +459,10 @@ impl<'tcx> FnCx<'_, 'tcx> {
         // `<&mut [T] as TryInto<&mut [T; N]>>` and every `as *mut [E; N]` cast at a non zero
         // offset need and what silently read one element instead.
         if let JsPlace::Array(pointer, width) = &walk.place {
-            return jsast::rt_call("array_ref", vec![pointer.clone(), jsast::num(*width as f64)]);
+            return jsast::rt_call(
+                "array_ref",
+                vec![pointer.clone(), jsast::num(*width as f64)],
+            );
         }
         if is_indirect(self.tcx, walk.ty) {
             return self.read(&walk.place);
@@ -481,7 +479,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
     pub(crate) fn codegen_raw_ptr(&self, place: Place<'tcx>) -> Expr {
         let walk = self.walk_place(place);
         if let Some(identity) = walk.identity {
-            return identity;
+            return ptr::ref_to_raw(self, walk.ty, identity);
         }
         // `str`, a zero sized pointee: no slot form to build.
         if !ptr::is_slot_pointee(self.tcx, walk.ty) {
@@ -503,7 +501,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
             // itself. Rebuilding `{ buf: p.buf, off: p.off }` would answer the same for a
             // dereference and lose whatever else the record carried — a scale, a window.
             JsPlace::Var(Expr::Index(base, key)) if reborrowed(&base, &key).is_some() => {
-                reborrowed(&base, &key).cloned().unwrap_or_else(jsast::undefined)
+                reborrowed(&base, &key)
+                    .cloned()
+                    .unwrap_or_else(jsast::undefined)
             }
             JsPlace::Var(Expr::Index(base, key)) => ptr::slot(*base, *key),
             JsPlace::Var(Expr::Member(base, name)) => ptr::slot(*base, jsast::string(name)),
@@ -515,7 +515,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     ptr::ref_to_raw(self, ty, value)
                 } else {
                     self.zombie(format!(
-                        "rustc_codegen_mires cannot take the address of this `{ty}`: it is a \
+                        "rustc_codegen_js cannot take the address of this `{ty}`: it is a \
                          JavaScript value rather than a place, and the pass that boxes the \
                          locals whose address is taken did not see this one"
                     ))
@@ -530,7 +530,11 @@ impl<'tcx> FnCx<'_, 'tcx> {
             Operand::Copy(place) => {
                 let (source, ty) = self.codegen_place(*place);
                 let value = self.read(&source);
-                if needs_clone(self.tcx, ty) { clone_expr(self.tcx, ty, value) } else { value }
+                if needs_clone(self.tcx, ty) {
+                    clone_expr(self.tcx, ty, value)
+                } else {
+                    value
+                }
             }
             Operand::Move(place) => {
                 let (source, _) = self.codegen_place(*place);
@@ -542,6 +546,27 @@ impl<'tcx> FnCx<'_, 'tcx> {
             // `-Cdebug-assertions=off -Coverflow-checks=off`: every runtime check is disabled.
             Operand::RuntimeChecks(check) => jsast::boolean(check.value(self.tcx.sess)),
         }
+    }
+
+    /// The receiver of a virtual call.
+    ///
+    /// rustc spells an owned trait-object call such as `Box<dyn FnOnce()>::call_once` with an
+    /// unsized `dyn FnOnce` place (`move *box`). The value carried by the ABI is nevertheless the
+    /// whole fat pointer: its data half is the method's first argument and its metadata selects
+    /// the vtable slot. An ordinary place read deliberately returns only the concrete value behind
+    /// `.ptr`, so recover the identity that [`FnCx::walk_place`] kept for this one ABI boundary.
+    pub(crate) fn codegen_virtual_receiver(&self, operand: &Operand<'tcx>) -> (Expr, bool) {
+        if let Operand::Copy(place) | Operand::Move(place) = operand {
+            let walk = self.walk_place(*place);
+            let shape =
+                crate::value::peel_pattern(crate::value::peel_transparent(self.tcx, walk.ty));
+            if matches!(shape.kind(), ty::Dynamic(..)) {
+                if let Some(identity) = walk.identity {
+                    return (identity, true);
+                }
+            }
+        }
+        (self.codegen_operand(operand), false)
     }
 
     /// An operand read without cloning, for callers that immediately project out of it.
@@ -582,7 +607,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 jsast::member(value, ptr::META)
             }
             _ => self.zombie(format!(
-                "the pointer metadata of `{pointee}` is not supported by rustc_codegen_mires"
+                "the pointer metadata of `{pointee}` is not supported by rustc_codegen_js"
             )),
         }
     }
@@ -590,7 +615,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
 
 /// The pointer `p` of a `p.buf[p.off]` place, which is the place a slot already names.
 fn reborrowed<'a>(base: &'a Expr, key: &'a Expr) -> Option<&'a Expr> {
-    let (Expr::Member(buffer, buf), Expr::Member(offset, off)) = (base, key) else { return None };
+    let (Expr::Member(buffer, buf), Expr::Member(offset, off)) = (base, key) else {
+        return None;
+    };
     (buf == ptr::BUF && off == ptr::OFF && buffer == offset).then_some(&**buffer)
 }
 

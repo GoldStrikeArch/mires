@@ -1,0 +1,1 @@
+`#[js(fallible)]` returns a `Result<T, mires_js::JsValue>`

@@ -1,0 +1,89 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h86af18169ab23db0 = _$template("<span>Hello </span>");
+const tmpl$h89aa8e233bbb0041 = _$template("<span> John</span>");
+const tmpl$he2700acb08c66893 = _$template("<span>Hello <!></span>");
+const tmpl$h9e007c19cc89e950 = _$template("<span><!> John</span>");
+const tmpl$h68823ec9416ca20e = _$template("<span><!> <!></span>");
+const tmpl$h540d8bb6d200d16e = _$template("<span> <!><!> </span>");
+const tmpl$h8659cb8a76567c90 = _$template("<span> &lt;Hi> </span>");
+const tmpl$h1dba953017bef668 = _$template("<span>Hi<!></span>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x02_text_interpolation$trailing$h40f51c00e16de9f7();
+  x02_text_interpolation$leading$h02df63edcab6e6ff();
+  x02_text_interpolation$trailing_expr$ha5099acb664ce18a("world");
+  x02_text_interpolation$leading_expr$h255b9ea2e214c4b6("Hello");
+  x02_text_interpolation$multi_expr$h6fa710d7bcf6f58f("Hello", "John");
+  x02_text_interpolation$multi_expr_together$hb10be51f02f60ada("Hello", "John");
+  x02_text_interpolation$escape$ha40151223c61e2b8();
+  x02_text_interpolation$injection$h647601b307dab331();
+}
+// escape
+function x02_text_interpolation$escape$ha40151223c61e2b8() {
+  return tmpl$h8659cb8a76567c90();
+}
+// injection
+function x02_text_interpolation$injection$h647601b307dab331() {
+  let _0, $t0, $t1;
+  _0 = tmpl$h1dba953017bef668();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  _$insert(_0, "<script>alert();</script>", $t1);
+  return _0;
+}
+// leading
+function x02_text_interpolation$leading$h02df63edcab6e6ff() {
+  return tmpl$h89aa8e233bbb0041();
+}
+// leading_expr
+function x02_text_interpolation$leading_expr$h255b9ea2e214c4b6(greeting) {
+  let _0, $t0;
+  _0 = tmpl$h9e007c19cc89e950();
+  $t0 = _0.firstChild;
+  _$insert(_0, greeting, $t0);
+  return _0;
+}
+// multi_expr
+function x02_text_interpolation$multi_expr$h6fa710d7bcf6f58f(greeting, name) {
+  let _0, $t0, $t1, $t2;
+  _0 = tmpl$h68823ec9416ca20e();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  $t2 = $t1.nextSibling;
+  _$insert(_0, greeting, $t0);
+  _$insert(_0, name, $t2);
+  return _0;
+}
+// multi_expr_together
+function x02_text_interpolation$multi_expr_together$hb10be51f02f60ada(greeting, name) {
+  let _0, $t0, $t1, $t2;
+  _0 = tmpl$h540d8bb6d200d16e();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  $t2 = $t1.nextSibling;
+  _$insert(_0, greeting, $t1);
+  _$insert(_0, name, $t2);
+  return _0;
+}
+// trailing
+function x02_text_interpolation$trailing$h40f51c00e16de9f7() {
+  return tmpl$h86af18169ab23db0();
+}
+// trailing_expr
+function x02_text_interpolation$trailing_expr$ha5099acb664ce18a(name) {
+  let _0, $t0, $t1;
+  _0 = tmpl$he2700acb08c66893();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  _$insert(_0, name, $t1);
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

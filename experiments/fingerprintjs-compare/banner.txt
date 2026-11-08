@@ -1,0 +1,6 @@
+/*
+ * FingerprintJS 5.2.0 (https://github.com/fingerprintjs/fingerprintjs)
+ *   MIT License, Copyright (c) 2025 FingerprintJS, Inc
+ *
+ * Unpublished compiler-comparison experiment. Not a FingerprintJS product.
+ */

@@ -1,0 +1,23 @@
+{
+  "name": "fingerprintjs-compare",
+  "version": "0.0.0-experiment",
+  "private": true,
+  "description": "Shared contract and measurement harness for the FingerprintJS compiler comparison",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "measure": "node tools/measure-matrix.mjs --output matrix.json",
+    "differential": "node tools/run-differential.mjs",
+    "bench": "node tools/run-bench.mjs",
+    "summarize": "node tools/summarize.mjs --input matrix.json --output matrix.md",
+    "measure:production": "node tools/measure-matrix.mjs --profile production --output matrix.production.json",
+    "bench:production": "node tools/run-runtime-matrix.mjs",
+    "bench:production:smoke": "node tools/run-runtime-matrix.mjs --smoke true",
+    "runtime:summary": "node tools/summarize-runtime.mjs --matrix matrix.json --output runtime-matrix.json --markdown runtime-matrix.md",
+    "kernel:production": "node tools/run-kernel-matrix.mjs",
+    "parity:feature:static": "node tools/check-feature-parity-static.mjs --output feature-parity-static.json",
+    "parity:feature:browser": "node tools/run-feature-parity.mjs",
+    "parity:feature:summary": "node tools/summarize-feature-parity.mjs",
+    "parity:feature": "npm run parity:feature:static && npm run parity:feature:browser && npm run parity:feature:summary"
+  }
+}

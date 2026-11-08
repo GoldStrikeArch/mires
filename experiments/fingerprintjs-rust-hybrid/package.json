@@ -1,0 +1,31 @@
+{
+  "name": "fingerprintjs-rust-hybrid-experiment",
+  "version": "0.0.0-experiment",
+  "private": true,
+  "description": "Unpublished Rust+JS hybrid parity experiment for FingerprintJS 5.2.0",
+  "license": "MIT",
+  "scripts": {
+    "build": "node tools/build.mjs --optimizer on --scheduler boundary",
+    "build:boundary": "node tools/build.mjs --optimizer on --scheduler boundary",
+    "build:off": "node tools/build.mjs --optimizer off --scheduler boundary",
+    "build:optimizer-report": "node tools/build.mjs --optimizer report --scheduler boundary",
+    "build:optimizer-on": "node tools/build.mjs --optimizer on --scheduler boundary",
+    "check:kernels": "node tools/check-kernels.mjs",
+    "check:package": "node tools/check-package.mjs --allow-size-failure",
+    "check:ssr": "node tools/check-ssr.mjs",
+    "check:types": "node tools/check-types.mjs",
+    "test:differential": "node tests/differential.mjs",
+    "bench": "node bench/run.mjs",
+    "bench:minified": "node bench/run.mjs --minified",
+    "bench:summarize": "node bench/summarize.mjs",
+    "measure:bundles": "node tools/measure-bundles.mjs",
+    "measure:esm": "node tools/measure-esm.mjs"
+  },
+  "main": "dist/fp.cjs.js",
+  "module": "dist/fp.esm.js",
+  "types": "dist/fp.d.ts",
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ]
+}

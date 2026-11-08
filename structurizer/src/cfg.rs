@@ -34,9 +34,17 @@ pub enum Term<C> {
     /// Unconditional branch.
     Goto(BlockId),
     /// Branch on a truth value.
-    Cond { on: C, then_: BlockId, else_: BlockId },
+    Cond {
+        on: C,
+        then_: BlockId,
+        else_: BlockId,
+    },
     /// Branch on an integer value, `default` taking every unlisted value.
-    Switch { on: C, cases: Vec<(u128, BlockId)>, default: BlockId },
+    Switch {
+        on: C,
+        cases: Vec<(u128, BlockId)>,
+        default: BlockId,
+    },
     /// Leave the function normally.
     Return,
     /// Control never gets here.

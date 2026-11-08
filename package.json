@@ -1,0 +1,36 @@
+{
+  "name": "mires-v2-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "test:runtime": "node --test scripts/native-values.test.mjs scripts/host-future-driver.test.mjs scripts/minimal-shim.test.mjs scripts/runtime-*.test.mjs",
+    "build": "bash scripts/build.sh --locked",
+    "compile": "node scripts/mires.mjs",
+    "test:standalone": "node scripts/standalone-check.mjs",
+    "test:cleanup": "bash scripts/cleanup-smoke.sh",
+    "check": "bash scripts/check.sh",
+    "build:oss-reference": "cd experiments/fingerprintjs && ../../node_modules/.bin/rollup -c rollup.config.ts --configPlugin '@rollup/plugin-typescript={tsconfig:\"tsconfig.rollupConfig.json\"}'",
+    "build:corpus": "node experiments/browser-workloads/tools/build.mjs",
+    "test:corpus": "node experiments/browser-workloads/tools/run.mjs --pure",
+    "setup:comparators:ocaml": "bash experiments/tools/setup-ocaml-comparators.sh",
+    "build:comparators": "python3 experiments/tools/run-comparator-builds.py",
+    "check:comparators": "python3 experiments/tools/check-comparators.py"
+  },
+  "devDependencies": {
+    "@rollup/plugin-json": "5.0.1",
+    "@rollup/plugin-node-resolve": "15.0.1",
+    "@rollup/plugin-terser": "0.2.1",
+    "@rollup/plugin-typescript": "10.0.1",
+    "acorn": "8.15.0",
+    "elm": "0.19.2-0",
+    "rescript": "12.3.0",
+    "rimraf": "3.0.2",
+    "rollup": "3.30.0",
+    "rollup-plugin-dts": "5.3.1",
+    "rollup-plugin-license": "3.0.1",
+    "selenium-webdriver": "4.41.0",
+    "terser": "5.31.6",
+    "tslib": "2.8.1",
+    "typescript": "5.1.6"
+  }
+}

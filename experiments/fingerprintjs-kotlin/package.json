@@ -1,0 +1,11 @@
+{
+  "name": "fingerprintjs-kotlin-experiment",
+  "version": "5.2.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Unpublished Kotlin/JS compiler-comparison experiment. Not a FingerprintJS product.",
+  "scripts": {
+    "build": "node tools/build.mjs"
+  }
+}

@@ -1,0 +1,12 @@
+{"$record":"header","$generatedBy":"scripts/dom-trace.mjs","$what":"Normalized runtime-call trace of a rustc_codegen_js-compiled client module executed against contract/harness/trace.mjs.","fixture":"domtest/09_svg","label":"domtest/09_svg","freeBindingsHealed":[],"status":"completed","error":null,"recordCount":11}
+{"op":"template","tmpl":"tmpl#0","html":"<svg width=\"400\" height=\"180\"><rect stroke-width=\"2\" x=\"50\" y=\"20\" width=\"150\" height=\"150\"></rect></svg>"}
+{"op":"template","tmpl":"tmpl#1","html":"<svg width=\"400\" height=\"180\"><rect width=\"150\" height=\"150\"></rect></svg>"}
+{"op":"template","tmpl":"tmpl#2","html":"<svg><linearGradient gradientTransform=\"rotate(25)\"><stop offset=\"0%\"></stop></linearGradient></svg>"}
+{"op":"template","tmpl":"tmpl#3","html":"<svg><rect x=\"50\" y=\"20\" width=\"150\" height=\"150\"></rect></svg>","isImportNode":false,"isSVG":true,"isMathML":false}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"setAttribute","node":"tmpl#1:root.firstChild","name":"stroke-width","value":"2"}
+{"op":"setAttribute","node":"tmpl#1:root.firstChild","name":"x","value":"50"}
+{"op":"setAttribute","node":"tmpl#1:root.firstChild","name":"y","value":"20"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}

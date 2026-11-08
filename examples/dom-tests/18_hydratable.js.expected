@@ -1,0 +1,74 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { getNextElement as _$getNextElement } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { getNextMarker as _$getNextMarker } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$hd963b9ea286762bd = _$template("<span>Hello <!$><!/></span>");
+const tmpl$h966d2718a07f8f9a = _$template("<span><!$><!/> John</span>");
+const tmpl$h0b538df4a443176c = _$template("<span><!$><!/> and <!$><!/> both</span>");
+const tmpl$hecb5cf78b0b97bb3 = _$template("<div><span>Hello <!$><!/></span><p>after</p></div>");
+const tmpl$he2dd28b7448109fb = _$template("<span>Hello John</span>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x18_hydratable$trailing_hole$h743d434ed4f16827("John");
+  x18_hydratable$hole_then_text$he80a290fa36ba84c("Hello");
+  x18_hydratable$after_two_holes$h1c696e1bc69f54e7("Hello", "John");
+  x18_hydratable$nested_then_element$h778178a6c627fe0f("John");
+  x18_hydratable$no_holes$hf5787e2e272b5cec();
+}
+// after_two_holes
+function x18_hydratable$after_two_holes$h1c696e1bc69f54e7(greeting, name) {
+  let _0, $t0, $t1, $t2, $t3, $t4;
+  _0 = _$getNextElement(tmpl$h0b538df4a443176c);
+  $t0 = _0.firstChild;
+  $t1 = _$getNextMarker($t0.nextSibling);
+  $t2 = $t1[0].nextSibling;
+  $t3 = $t2.nextSibling;
+  $t4 = _$getNextMarker($t3.nextSibling);
+  _$insert(_0, greeting, $t1[0], $t1[1]);
+  _$insert(_0, name, $t4[0], $t4[1]);
+  return _0;
+}
+// hole_then_text
+function x18_hydratable$hole_then_text$he80a290fa36ba84c(greeting) {
+  let _0, $t0, $t1;
+  _0 = _$getNextElement(tmpl$h966d2718a07f8f9a);
+  $t0 = _0.firstChild;
+  $t1 = _$getNextMarker($t0.nextSibling);
+  _$insert(_0, greeting, $t1[0], $t1[1]);
+  return _0;
+}
+// nested_then_element
+function x18_hydratable$nested_then_element$h778178a6c627fe0f(name) {
+  let _0, $t0, $t1, $t2, $t3;
+  _0 = _$getNextElement(tmpl$hecb5cf78b0b97bb3);
+  $t0 = _0.firstChild;
+  $t1 = $t0.firstChild;
+  $t2 = $t1.nextSibling;
+  $t3 = _$getNextMarker($t2.nextSibling);
+  _$insert($t0, name, $t3[0], $t3[1]);
+  return _0;
+}
+// no_holes
+function x18_hydratable$no_holes$hf5787e2e272b5cec() {
+  return _$getNextElement(tmpl$he2dd28b7448109fb);
+}
+// trailing_hole
+function x18_hydratable$trailing_hole$h743d434ed4f16827(name) {
+  let _0, $t0, $t1, $t2;
+  _0 = _$getNextElement(tmpl$hd963b9ea286762bd);
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  $t2 = _$getNextMarker($t1.nextSibling);
+  _$insert(_0, name, $t2[0], $t2[1]);
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

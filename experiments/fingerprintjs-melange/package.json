@@ -1,0 +1,11 @@
+{
+  "name": "fingerprintjs-melange-experiment",
+  "version": "5.2.0",
+  "private": true,
+  "description": "Unpublished Melange 7.0.1 port of FingerprintJS 5.2.0",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "node tools/build.mjs"
+  }
+}

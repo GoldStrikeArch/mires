@@ -1,0 +1,708 @@
+// rustc_codegen_js — program
+import * as __rt from "./shim.js";
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { setAttribute as _$setAttribute } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$hf6cbd6a9cadd62de = _$template("<ul></ul>");
+const tmpl$h3c5fd2ade9f27c85 = _$template("<li><a></a></li>");
+const tmpl$he15647176a3d34ce = _$template("<li></li>");
+const tmpl$h209c904ab65ab271 = _$template("<table><tbody></tbody></table>");
+const tmpl$h5170ecff268b7f0c = _$template("<tr></tr>");
+const tmpl$h28af99a106592544 = _$template("<td></td>");
+// `alloc` allocator shim
+function _RNvCs1lVxXr9ZvqQ_7___rustc12___rust_alloc(layout$size, layout$align) {
+  return __rt.alloc(layout$size, layout$align);
+}
+// `dealloc` allocator shim
+function _RNvCs1lVxXr9ZvqQ_7___rustc14___rust_dealloc(ptr, layout$size, layout$align) {
+  __rt.dealloc(ptr, layout$size, layout$align);
+}
+// `realloc` allocator shim
+function _RNvCs1lVxXr9ZvqQ_7___rustc14___rust_realloc(ptr, layout$size, layout$align, new_size) {
+  return __rt.realloc(ptr, layout$size, layout$align, new_size);
+}
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// `alloc_zeroed` allocator shim
+function _RNvCs1lVxXr9ZvqQ_7___rustc19___rust_alloc_zeroed(layout$size, layout$align) {
+  return __rt.alloc_zeroed(layout$size, layout$align);
+}
+// `alloc_error_handler` allocator shim
+function _RNvCs1lVxXr9ZvqQ_7___rustc26___rust_alloc_error_handler(layout$size, layout$align) {
+  __rt.alloc_error(layout$size, layout$align);
+}
+// `__rust_no_alloc_shim_is_unstable_v2` allocator shim
+function _RNvCs1lVxXr9ZvqQ_7___rustc35___rust_no_alloc_shim_is_unstable_v2() {}
+// alloc::handle_alloc_error
+function alloc$alloc$handle_alloc_error$h69221b1ecbce9a86(layout) {
+  _RNvCs1lVxXr9ZvqQ_7___rustc26___rust_alloc_error_handler(layout.size, layout.align);
+  throw new Error("rustc_codegen_js: diverging call returned");
+  throw new Error("rustc_codegen_js: entered unreachable code");
+}
+// alloc::alloc::Global::alloc_impl_runtime
+function alloc$alloc$impl_0_alloc_impl_runtime$h4a47ccc633324138(layout, zeroed) {
+  let _0, size, raw_ptr, ptr, _12, _13, _25, _30, _31, _32;
+  size = layout.size;
+  L0: {
+    if (size === 0) {
+      _12 = layout.align;
+      _13 = __rt.slice_from_parts(_12, 0);
+      if (false) {
+        core$ptr$non_null$impl_3_new_unchecked$precondition_check$hd790945cfeefe665(_12, { filename: "core/src/ptr/non_null.rs", line: 238, col: 13 });
+      }
+      _0 = { TAG: "Ok", _0: _13 };
+    } else {
+      if (zeroed) {
+        _31 = layout.align;
+        _RNvCs1lVxXr9ZvqQ_7___rustc35___rust_no_alloc_shim_is_unstable_v2();
+        raw_ptr = _RNvCs1lVxXr9ZvqQ_7___rustc19___rust_alloc_zeroed(size, _31);
+      } else {
+        _32 = layout.align;
+        _RNvCs1lVxXr9ZvqQ_7___rustc35___rust_no_alloc_shim_is_unstable_v2();
+        raw_ptr = _RNvCs1lVxXr9ZvqQ_7___rustc12___rust_alloc(size, _32);
+      }
+      if (__rt.addr(raw_ptr, 1) >>> 0 === 0) {
+        _30 = 1 === 1;
+        _0 = { TAG: "Err", _0: {} };
+        break L0;
+      } else {
+        if (false) {
+          core$ptr$non_null$impl_3_new_unchecked$precondition_check$hd790945cfeefe665(raw_ptr, { filename: "core/src/ptr/non_null.rs", line: 238, col: 13 });
+        }
+        ptr = raw_ptr;
+        _25 = __rt.slice_from_parts(ptr, size);
+        if (false) {
+          core$ptr$non_null$impl_3_new_unchecked$precondition_check$hd790945cfeefe665(ptr, { filename: "core/src/ptr/non_null.rs", line: 238, col: 13 });
+        }
+        _0 = { TAG: "Ok", _0: _25 };
+      }
+    }
+  }
+  return _0;
+}
+// alloc::alloc::Global::grow_impl_runtime
+function alloc$alloc$impl_0_grow_impl_runtime$hcf472bfce49ce19c(self, ptr, old_layout, new_layout, zeroed) {
+  let _0, old_size, new_size, _12, raw_ptr, ptr$1, _20, _21, _24, new_ptr, _27, _28, _30, _40, _44, _51, _52;
+  old_size = old_layout.size;
+  L0: {
+    L1: {
+      if (old_size === 0) {
+        _0 = alloc$alloc$impl_0_alloc_impl_runtime$h4a47ccc633324138(new_layout, zeroed);
+      } else {
+        _30 = old_layout.align;
+        if (_30 === new_layout.align) {
+          new_size = new_layout.size;
+          _12 = new_size >= old_size;
+          if (false) {
+            core$hint$assert_unchecked$precondition_check$hdce51c1a1d470deb(_12, { filename: "core/src/hint.rs", line: 205, col: 9 });
+          }
+          raw_ptr = _RNvCs1lVxXr9ZvqQ_7___rustc14___rust_realloc(ptr, old_size, _30, new_size);
+          if (__rt.addr(raw_ptr, 1) >>> 0 === 0) {
+            _40 = 1 === 1;
+            _0 = { TAG: "Err", _0: {} };
+          } else {
+            if (false) {
+              core$ptr$non_null$impl_3_new_unchecked$precondition_check$hd790945cfeefe665(raw_ptr, { filename: "core/src/ptr/non_null.rs", line: 238, col: 13 });
+            }
+            ptr$1 = raw_ptr;
+            if (zeroed) {
+              _20 = { buf: raw_ptr.buf, off: raw_ptr.off + old_size, sc: raw_ptr.sc };
+              _21 = new_size - old_size >>> 0;
+              if (false) {
+                core$ptr$write_bytes$precondition_check$h1e33aa62ebbd5352(_20, 1, _21 === 0, { filename: "core/src/ptr/mod.rs", line: 707, col: 9 });
+              }
+              __rt.write_bytes(_20, 0, _21);
+            }
+            _44 = __rt.slice_from_parts(ptr$1, new_size);
+            if (false) {
+              core$ptr$non_null$impl_3_new_unchecked$precondition_check$hd790945cfeefe665(ptr$1, { filename: "core/src/ptr/non_null.rs", line: 238, col: 13 });
+            }
+            _0 = { TAG: "Ok", _0: _44 };
+            break L1;
+          }
+        } else {
+          _24 = alloc$alloc$impl_0_alloc_impl_runtime$h4a47ccc633324138(new_layout, zeroed);
+          switch (_24.TAG) {
+            case "Ok":
+              new_ptr = _24._0;
+              _52 = new_ptr;
+              _27 = ptr;
+              _28 = _52;
+              if (false) {
+                core$ptr$copy_nonoverlapping$precondition_check$h25cfb1cf714f1d8e(ptr, _52, 1, 1, old_size, { filename: "core/src/ptr/mod.rs", line: 534, col: 5 });
+              }
+              __rt.copy_nonoverlapping(_28, _27, old_size);
+              _RNvCs1lVxXr9ZvqQ_7___rustc14___rust_dealloc(ptr, old_size, _30);
+              _0 = { TAG: "Ok", _0: new_ptr };
+              break L1;
+            case "Err":
+              _51 = 1 === 1;
+              _0 = { TAG: "Err", _0: {} };
+              break;
+            default:
+              throw new Error("rustc_codegen_js: entered unreachable code");
+          }
+        }
+        break L0;
+      }
+    }
+  }
+  return _0;
+}
+// <alloc::alloc::Global as core::alloc::Allocator>::allocate
+function alloc$alloc$impl_1_allocate$hf68d238b9987ff29(self, layout) {
+  return alloc$alloc$impl_0_alloc_impl_runtime$h4a47ccc633324138(layout, false);
+}
+// <alloc::alloc::Global as core::alloc::Allocator>::deallocate
+function alloc$alloc$impl_1_deallocate$h09d9659e02676691(self, ptr, layout) {
+  let _0, _4, _5;
+  _4 = layout.size;
+  _5 = layout.align;
+  if (_4 !== 0) {
+    _0 = _RNvCs1lVxXr9ZvqQ_7___rustc14___rust_dealloc(ptr, _4, _5);
+  }
+}
+// <alloc::alloc::Global as core::alloc::Allocator>::grow
+function alloc$alloc$impl_1_grow$hf2c9b1bee1374324(self, ptr, old_layout, new_layout) {
+  return alloc$alloc$impl_0_grow_impl_runtime$hcf472bfce49ce19c(self, ptr, old_layout, new_layout, false);
+}
+// raw_vec::capacity_overflow
+function alloc$raw_vec$capacity_overflow$ha63c18a59d7a8e58() {
+  core$panicking$panic_fmt$hdaf85415329cda6a({ template: { buf: __rt.str_bytes("capacity overflow").buf, off: 0 }, args: (__rt.str_bytes("capacity overflow").len << 1 >>> 0 | 1) >>> 0 }, { filename: "alloc/src/raw_vec/mod.rs", line: 28, col: 5 });
+  throw new Error("rustc_codegen_js: diverging call returned");
+  throw new Error("rustc_codegen_js: entered unreachable code");
+}
+// raw_vec::handle_error
+function alloc$raw_vec$handle_error$ha6b2a2e8076ea335(e) {
+  let _2;
+  switch (e.kind.TAG) {
+    case "CapacityOverflow":
+      alloc$raw_vec$capacity_overflow$ha63c18a59d7a8e58();
+      throw new Error("rustc_codegen_js: diverging call returned");
+      throw new Error("rustc_codegen_js: entered unreachable code");
+    case "AllocError":
+      _2 = { TAG: "AllocError", layout: { size: e.kind.layout.size, align: e.kind.layout.align }, non_exhaustive: undefined };
+      alloc$alloc$handle_alloc_error$h69221b1ecbce9a86({ size: _2.layout.size, align: _2.layout.align });
+      throw new Error("rustc_codegen_js: diverging call returned");
+      throw new Error("rustc_codegen_js: entered unreachable code");
+    default:
+      throw new Error("rustc_codegen_js: entered unreachable code");
+  }
+}
+// <alloc::raw_vec::RawVec<T, A> as core::ops::Drop>::drop
+function alloc$raw_vec$impl_3_drop$h2215fec645886c12(self) {
+  let _0;
+  _0 = alloc$raw_vec$impl_5_deallocate$h12ad165cfdb06f4c(self.inner, { size: 8, align: 4 });
+}
+// alloc::raw_vec::RawVecInner::<A>::deallocate
+function alloc$raw_vec$impl_5_deallocate$h12ad165cfdb06f4c(self, elem_layout) {
+  let _3, _10, _11, _13, _14, _19, _20;
+  _19 = elem_layout.size;
+  _20 = elem_layout.align;
+  L0: {
+    if (_19 !== 0) {
+      if (self.cap >>> 0 !== 0) {
+        _11 = self.cap >>> 0;
+        if (false) {
+          core$num$impl_11_unchecked_mul$precondition_check$he9b4e9f8dc33cc65(_19, _11, { filename: "core/src/num/mod.rs", line: 1417, col: 5 });
+        }
+        _10 = Math.imul(_19, _11) >>> 0;
+        _14 = _20;
+        if (false) {
+          core$alloc$layout$impl_0_from_size_align_unchecked$precondition_check$h05bbdc381a6f4bb6(_10, _14, { filename: "core/src/alloc/layout.rs", line: 133, col: 9 });
+        }
+        _13 = { size: _10, align: _20 };
+        _3 = { TAG: "Some", _0: [self.ptr, { size: _13.size, align: _13.align }] };
+        alloc$alloc$impl_1_deallocate$h09d9659e02676691(self.alloc, _3._0[0], { size: _3._0[1].size, align: _3._0[1].align });
+        break L0;
+      }
+    }
+  }
+}
+// alloc::raw_vec::RawVec::<T, A>::grow_one
+function alloc$raw_vec$impl_6_grow_one$h326f592e84be5c87(self) {
+  let _2, _3;
+  _2 = self.inner;
+  _3 = alloc$raw_vec$impl_7_grow_amortized$h3d170a9f5529fa2a(_2, _2.cap >>> 0, 1, { size: 8, align: 4 });
+  switch (_3.TAG) {
+    case "Ok":
+      return;
+    case "Err":
+      alloc$raw_vec$handle_error$ha6b2a2e8076ea335(_3._0);
+      throw new Error("rustc_codegen_js: diverging call returned");
+      throw new Error("rustc_codegen_js: entered unreachable code");
+    default:
+      throw new Error("rustc_codegen_js: entered unreachable code");
+  }
+}
+// alloc::raw_vec::RawVecInner::<A>::finish_grow
+function alloc$raw_vec$impl_7_finish_grow$hdb14ff37d9b62e90(self, cap, elem_layout) {
+  let _0, _4, _5, residual, new_layout, memory, _9, ptr, old_layout, _12, _20, _22, _23, _26, _29, _32, _33, _37, _38, _40, _41, _47, _48, _52, _53;
+  _52 = elem_layout.size;
+  _53 = elem_layout.align;
+  _23 = (($w) => [$w >>> 0, $w >>> 0 !== $w])((_52 >>> 0) * (cap >>> 0));
+  _26 = _23[0] >>> 0;
+  _22 = _23[1];
+  L0: {
+    if (!_22) {
+      if (_26 <= 2147483648 - _53 >>> 0) {
+        _29 = { size: _26, align: _53 };
+        _5 = { TAG: "Ok", _0: { size: _29.size, align: _29.align } };
+        _32 = _5._0;
+        _4 = { TAG: "Continue", _0: { size: _32.size, align: _32.align } };
+        new_layout = { size: _4._0.size, align: _4._0.align };
+        L2: {
+          if (_52 !== 0) {
+            if (self.cap >>> 0 !== 0) {
+              _38 = self.cap >>> 0;
+              if (false) {
+                core$num$impl_11_unchecked_mul$precondition_check$he9b4e9f8dc33cc65(_52, _38, { filename: "core/src/num/mod.rs", line: 1417, col: 5 });
+              }
+              _37 = Math.imul(_52, _38) >>> 0;
+              _41 = _53;
+              if (false) {
+                core$alloc$layout$impl_0_from_size_align_unchecked$precondition_check$h05bbdc381a6f4bb6(_37, _41, { filename: "core/src/alloc/layout.rs", line: 133, col: 9 });
+              }
+              _40 = { size: _37, align: _53 };
+              _9 = { TAG: "Some", _0: [self.ptr, { size: _40.size, align: _40.align }] };
+              old_layout = { size: _9._0[1].size, align: _9._0[1].align };
+              _12 = old_layout.align === new_layout.align;
+              ptr = _9._0[0];
+              if (false) {
+                core$hint$assert_unchecked$precondition_check$hdce51c1a1d470deb(_12, { filename: "core/src/hint.rs", line: 205, col: 9 });
+              }
+              memory = alloc$alloc$impl_1_grow$hf2c9b1bee1374324(self.alloc, ptr, old_layout, { size: new_layout.size, align: new_layout.align });
+              break L2;
+            }
+          }
+          memory = alloc$alloc$impl_1_allocate$hf68d238b9987ff29(self.alloc, { size: new_layout.size, align: new_layout.align });
+        }
+        switch (memory.TAG) {
+          case "Ok":
+            _0 = { TAG: "Ok", _0: memory._0 };
+            break;
+          case "Err":
+            _20 = { TAG: "AllocError", layout: { size: new_layout.size, align: new_layout.align }, non_exhaustive: undefined };
+            _0 = { TAG: "Err", _0: { kind: _20.TAG === "CapacityOverflow" ? { TAG: "CapacityOverflow" } : { TAG: "AllocError", layout: { size: _20.layout.size, align: _20.layout.align }, non_exhaustive: _20.non_exhaustive } } };
+            break;
+          default:
+            throw new Error("rustc_codegen_js: entered unreachable code");
+        }
+        break L0;
+      }
+    }
+    _5 = { TAG: "Err", _0: { kind: { TAG: "CapacityOverflow" } } };
+    _33 = _5._0;
+    _4 = { TAG: "Break", _0: { TAG: "Err", _0: { kind: _33.kind.TAG === "CapacityOverflow" ? { TAG: "CapacityOverflow" } : { TAG: "AllocError", layout: { size: _33.kind.layout.size, align: _33.kind.layout.align }, non_exhaustive: _33.kind.non_exhaustive } } } };
+    residual = _4._0;
+    _48 = 1 === 1;
+    _47 = { kind: residual._0.kind.TAG === "CapacityOverflow" ? { TAG: "CapacityOverflow" } : { TAG: "AllocError", layout: { size: residual._0.kind.layout.size, align: residual._0.kind.layout.align }, non_exhaustive: residual._0.kind.non_exhaustive } };
+    _0 = { TAG: "Err", _0: { kind: _47.kind.TAG === "CapacityOverflow" ? { TAG: "CapacityOverflow" } : { TAG: "AllocError", layout: { size: _47.kind.layout.size, align: _47.kind.layout.align }, non_exhaustive: _47.kind.non_exhaustive } } };
+  }
+  return _0;
+}
+// alloc::raw_vec::RawVecInner::<A>::grow_amortized
+function alloc$raw_vec$impl_7_grow_amortized$h3d170a9f5529fa2a(self, len, additional, elem_layout) {
+  let _0, _5, _6, _7, residual, required_cap, cap, cap$1, _15, _16, residual$1, _27, _30, _32, _39, _47, _48;
+  _5 = elem_layout.size;
+  L0: {
+    if (_5 === 0) {
+      _0 = { TAG: "Err", _0: { kind: { TAG: "CapacityOverflow" } } };
+    } else if ((($w) => [$w >>> 0, $w >>> 0 !== $w])(len + additional)[1]) {
+      _7 = { TAG: "Err", _0: { TAG: "CapacityOverflow" } };
+      _27 = _7._0;
+      _6 = { TAG: "Break", _0: { TAG: "Err", _0: _27.TAG === "CapacityOverflow" ? { TAG: "CapacityOverflow" } : { TAG: "AllocError", layout: { size: _27.layout.size, align: _27.layout.align }, non_exhaustive: _27.non_exhaustive } } };
+      residual = _6._0;
+      _32 = 1 === 1;
+      _30 = residual._0.TAG === "CapacityOverflow" ? { TAG: "CapacityOverflow" } : { TAG: "AllocError", layout: { size: residual._0.layout.size, align: residual._0.layout.align }, non_exhaustive: residual._0.non_exhaustive };
+      _0 = { TAG: "Err", _0: { kind: _30.TAG === "CapacityOverflow" ? { TAG: "CapacityOverflow" } : { TAG: "AllocError", layout: { size: _30.layout.size, align: _30.layout.align }, non_exhaustive: _30.non_exhaustive } } };
+    } else {
+      _7 = { TAG: "Ok", _0: len + additional >>> 0 };
+      _6 = { TAG: "Continue", _0: _7._0 };
+      required_cap = _6._0;
+      cap = Math.imul(self.cap >>> 0, 2) >>> 0;
+      if (!(required_cap < cap)) {
+        cap = required_cap;
+      }
+      if (_5 === 1) {
+        cap$1 = 8;
+      } else if (_5 <= 1024) {
+        cap$1 = 4;
+      } else {
+        cap$1 = 1;
+      }
+      if (!(cap < cap$1)) {
+        cap$1 = cap;
+      }
+      _16 = alloc$raw_vec$impl_7_finish_grow$hdb14ff37d9b62e90(self, cap$1, elem_layout);
+      switch (_16.TAG) {
+        case "Ok":
+          _15 = { TAG: "Continue", _0: _16._0 };
+          self.ptr = _15._0;
+          self.cap = cap$1 >>> 0;
+          _0 = { TAG: "Ok", _0: undefined };
+          break L0;
+        case "Err":
+          _39 = _16._0;
+          _15 = { TAG: "Break", _0: { TAG: "Err", _0: { kind: _39.kind.TAG === "CapacityOverflow" ? { TAG: "CapacityOverflow" } : { TAG: "AllocError", layout: { size: _39.kind.layout.size, align: _39.kind.layout.align }, non_exhaustive: _39.kind.non_exhaustive } } } };
+          residual$1 = _15._0;
+          _48 = 1 === 1;
+          _47 = { kind: residual$1._0.kind.TAG === "CapacityOverflow" ? { TAG: "CapacityOverflow" } : { TAG: "AllocError", layout: { size: residual$1._0.kind.layout.size, align: residual$1._0.kind.layout.align }, non_exhaustive: residual$1._0.kind.non_exhaustive } };
+          _0 = { TAG: "Err", _0: { kind: _47.kind.TAG === "CapacityOverflow" ? { TAG: "CapacityOverflow" } : { TAG: "AllocError", layout: { size: _47.kind.layout.size, align: _47.kind.layout.align }, non_exhaustive: _47.kind.non_exhaustive } } };
+          break;
+        default:
+          throw new Error("rustc_codegen_js: entered unreachable code");
+      }
+    }
+  }
+  return _0;
+}
+// alloc::vec::Vec::<T>::new
+function alloc$vec$impl_0_new$h81d33ae2cdb73770() {
+  return { buf: { inner: { ptr: 4, cap: 0, alloc: undefined }, _marker: undefined }, len: 0 };
+}
+// <&'a alloc::vec::Vec<T, A> as core::iter::IntoIterator>::into_iter
+function alloc$vec$impl_19_into_iter$hdf03562f8acde3fa(self) {
+  let _4, _6, _8, _10;
+  _4 = self.len;
+  _6 = __rt.slice_from_parts(__rt.unscale(self.buf.inner.ptr, 8, null), _4);
+  if (false) {
+    _8 = _4;
+  } else {
+    _10 = _6;
+    _8 = { buf: _10.buf, off: _10.off + _4 };
+  }
+  return { ptr: _6, end_or_len: _8, _marker: undefined };
+}
+// <alloc::vec::Vec<T, A> as core::ops::Drop>::drop
+function alloc$vec$impl_27_drop$h5780d48a5157e01a(self) {
+  let _4, _6, _7, _8;
+  _4 = self.len;
+  _6 = __rt.slice_from_parts(__rt.unscale(self.buf.inner.ptr, 8, null), _4);
+  _7 = 0;
+  for (;;) {
+    if (_7 === _4) {
+      return;
+    } else {
+      _8 = { buf: _6.buf, off: _6.off + _7 };
+      _7 = _7 + 1 >>> 0;
+    }
+  }
+}
+// alloc::vec::Vec::<T, A>::push
+function alloc$vec$impl_44_push$h31ea3e044bfa91ff(self, value) {
+  alloc$vec$impl_44_push_mut$hf58fe0fee5d11db4(self, value);
+}
+// alloc::vec::Vec::<T, A>::push_mut
+function alloc$vec$impl_44_push_mut$hf58fe0fee5d11db4(self, value) {
+  let len, _5, end, _9;
+  len = self.len;
+  if (8 === 0) {
+    _5 = 4294967295;
+  } else {
+    _5 = self.buf.inner.cap >>> 0;
+  }
+  if (len === _5) {
+    alloc$raw_vec$impl_6_grow_one$h326f592e84be5c87(self.buf);
+  }
+  _9 = __rt.unscale(self.buf.inner.ptr, 8, null);
+  end = { buf: _9.buf, off: _9.off + len };
+  end.buf[end.off] = value;
+  self.len = len + 1 >>> 0;
+  return end;
+}
+// panicking::panic_fmt
+function core$panicking$panic_fmt$hdaf85415329cda6a(fmt, $loc) {
+  let pi;
+  pi = { message: fmt, location: $loc, can_unwind: true, force_no_backtrace: false };
+  _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(pi);
+  throw new Error("rustc_codegen_js: diverging call returned");
+  throw new Error("rustc_codegen_js: entered unreachable code");
+}
+// core::ptr::drop_glue
+function core$ptr$drop_glue$h4644b52adc7cbd73(_1) {
+  alloc$vec$impl_27_drop$h5780d48a5157e01a(_1);
+  core$ptr$drop_glue$hfeb27fa89ce367ec(_1.buf);
+}
+// core::ptr::drop_glue
+function core$ptr$drop_glue$hfeb27fa89ce367ec(_1) {
+  alloc$raw_vec$impl_3_drop$h2215fec645886c12(_1);
+}
+// <core::slice::Iter<'a, T> as core::iter::Iterator>::next
+function core$slice$iter$impl_171_next$h36a1b82023bceb2a(self) {
+  let _0, ptr, end_or_len, len, _11;
+  ptr = self.ptr;
+  end_or_len = self.end_or_len;
+  L0: {
+    L1: {
+      if (false) {
+        len = __rt.addr(end_or_len, 16) >>> 0;
+        if (len === 0) {
+          _0 = { TAG: "None" };
+          break L1;
+        } else {
+          if (false) {
+            core$num$impl_11_unchecked_sub$precondition_check$h4c33ce104fc15265(len, 1, { filename: "core/src/num/mod.rs", line: 1417, col: 5 });
+          }
+          self.end_or_len = len - 1 >>> 0;
+        }
+      } else {
+        _11 = ptr;
+        if (__rt.ptr_eq(_11, end_or_len)) {
+          _0 = { TAG: "None" };
+          break L1;
+        } else {
+          self.ptr = { buf: _11.buf, off: _11.off + 1 };
+        }
+      }
+      _0 = { TAG: "Some", _0: ptr.buf[ptr.off] };
+      break L0;
+    }
+  }
+  return _0;
+}
+// <core::slice::Iter<'a, T> as core::iter::Iterator>::next
+function core$slice$iter$impl_171_next$h87a5c87323c7dbbc(self) {
+  let _0, ptr, end_or_len, len, _11;
+  ptr = self.ptr;
+  end_or_len = self.end_or_len;
+  L0: {
+    L1: {
+      if (false) {
+        len = __rt.addr(end_or_len, 8) >>> 0;
+        if (len === 0) {
+          _0 = { TAG: "None" };
+          break L1;
+        } else {
+          if (false) {
+            core$num$impl_11_unchecked_sub$precondition_check$h4c33ce104fc15265(len, 1, { filename: "core/src/num/mod.rs", line: 1417, col: 5 });
+          }
+          self.end_or_len = len - 1 >>> 0;
+        }
+      } else {
+        _11 = ptr;
+        if (__rt.ptr_eq(_11, end_or_len)) {
+          _0 = { TAG: "None" };
+          break L1;
+        } else {
+          self.ptr = { buf: _11.buf, off: _11.off + 1 };
+        }
+      }
+      _0 = { TAG: "Some", _0: ptr };
+      break L0;
+    }
+  }
+  return _0;
+}
+// <core::slice::Iter<'a, T> as core::iter::Iterator>::next
+function core$slice$iter$impl_171_next$hc726822981337141(self) {
+  let _0, ptr, end_or_len, len, _11;
+  ptr = self.ptr;
+  end_or_len = self.end_or_len;
+  L0: {
+    L1: {
+      if (false) {
+        len = __rt.addr(end_or_len, 8) >>> 0;
+        if (len === 0) {
+          _0 = { TAG: "None" };
+          break L1;
+        } else {
+          if (false) {
+            core$num$impl_11_unchecked_sub$precondition_check$h4c33ce104fc15265(len, 1, { filename: "core/src/num/mod.rs", line: 1417, col: 5 });
+          }
+          self.end_or_len = len - 1 >>> 0;
+        }
+      } else {
+        _11 = ptr;
+        if (__rt.ptr_eq(_11, end_or_len)) {
+          _0 = { TAG: "None" };
+          break L1;
+        } else {
+          self.ptr = { buf: _11.buf, off: _11.off + 1 };
+        }
+      }
+      _0 = { TAG: "Some", _0: ptr };
+      break L0;
+    }
+  }
+  return _0;
+}
+// core::slice::iter::<impl core::iter::IntoIterator for &'a [T]>::into_iter
+function core$slice$iter$impl_1_into_iter$h0e31e67d248b37d9(self) {
+  let _2, _3, _5, _7;
+  _2 = self.len;
+  _3 = self;
+  if (false) {
+    _5 = _2;
+  } else {
+    _7 = _3;
+    _5 = { buf: _7.buf, off: _7.off + _2 };
+  }
+  return { ptr: _3, end_or_len: _5, _marker: undefined };
+}
+// core::slice::iter::<impl core::iter::IntoIterator for &'a [T]>::into_iter
+function core$slice$iter$impl_1_into_iter$h472e3393252986ae(self) {
+  let _2, _3, _5, _7;
+  _2 = self.len;
+  _3 = self;
+  if (false) {
+    _5 = _2;
+  } else {
+    _7 = _3;
+    _5 = { buf: _7.buf, off: _7.off + _2 };
+  }
+  return { ptr: _3, end_or_len: _5, _marker: undefined };
+}
+// core::slice::iter::<impl core::iter::IntoIterator for &'a [T]>::into_iter
+function core$slice$iter$impl_1_into_iter$ha113b861de0f2670(self) {
+  let _2, _3, _5, _7;
+  _2 = self.len;
+  _3 = self;
+  if (false) {
+    _5 = _2;
+  } else {
+    _7 = _3;
+    _5 = { buf: _7.buf, off: _7.off + _2 };
+  }
+  return { ptr: _3, end_or_len: _5, _marker: undefined };
+}
+// rust_entry
+function rust_entry() {
+  let posts, titles, rows;
+  posts = [{ url: "/a", title: "A" }, { url: "/b", title: "B" }];
+  x13_topcoat_for$slice_rows$h6a8e7c6854e9c554({ buf: posts, off: 0, len: 2 });
+  titles = alloc$vec$impl_0_new$h81d33ae2cdb73770();
+  alloc$vec$impl_44_push$h31ea3e044bfa91ff(titles, "A");
+  alloc$vec$impl_44_push$h31ea3e044bfa91ff(titles, "B");
+  x13_topcoat_for$vec_rows$he5dcbe65cf52e580(titles);
+  rows = [{ buf: ["a", "b"], off: 0, len: 2 }, { buf: ["c"], off: 0, len: 1 }];
+  x13_topcoat_for$nested_rows$h4eef44a3f1a48a30({ buf: rows, off: 0, len: 2 });
+  core$ptr$drop_glue$h4644b52adc7cbd73(titles);
+}
+// nested_rows
+function x13_topcoat_for$nested_rows$h4eef44a3f1a48a30(rows) {
+  let _0, __tc_rows, iter, _8, row, _14, __tc_root_1, __tc_rows$1, iter$1, _23, cell, _29, __tc_root_2, $t0;
+  _0 = tmpl$h209c904ab65ab271();
+  $t0 = _0.firstChild;
+  __tc_rows = [];
+  iter = core$slice$iter$impl_1_into_iter$ha113b861de0f2670(rows);
+  L0: for (;;) {
+    _8 = core$slice$iter$impl_171_next$h87a5c87323c7dbbc(iter);
+    switch (_8.TAG) {
+      case "None":
+        _$insert($t0, __tc_rows);
+        return _0;
+      case "Some":
+        row = _8._0;
+        __tc_root_1 = tmpl$h5170ecff268b7f0c();
+        __tc_rows$1 = [];
+        iter$1 = core$slice$iter$impl_1_into_iter$h0e31e67d248b37d9(row.buf[row.off]);
+        L3: for (;;) {
+          _23 = core$slice$iter$impl_171_next$hc726822981337141(iter$1);
+          switch (_23.TAG) {
+            case "None":
+              _$insert(__tc_root_1, __tc_rows$1);
+              _14 = __tc_root_1;
+              __tc_rows.push(_14);
+              continue L0;
+            case "Some":
+              cell = _23._0;
+              __tc_root_2 = tmpl$h28af99a106592544();
+              _$insert(__tc_root_2, cell.buf[cell.off]);
+              _29 = __tc_root_2;
+              __tc_rows$1.push(_29);
+              break;
+            default:
+              break L3;
+          }
+        }
+        break;
+      default:
+    }
+    throw new Error("rustc_codegen_js: entered unreachable code");
+  }
+}
+// slice_rows
+function x13_topcoat_for$slice_rows$h6a8e7c6854e9c554(posts) {
+  let _0, __tc_rows, iter, _8, post, _14, __tc_root_1, $t0;
+  _0 = tmpl$hf6cbd6a9cadd62de();
+  __tc_rows = [];
+  iter = core$slice$iter$impl_1_into_iter$h472e3393252986ae(posts);
+  for (;;) {
+    _8 = core$slice$iter$impl_171_next$h36a1b82023bceb2a(iter);
+    switch (_8.TAG) {
+      case "None":
+        _$insert(_0, __tc_rows);
+        return _0;
+      case "Some":
+        post = _8._0;
+        __tc_root_1 = tmpl$h3c5fd2ade9f27c85();
+        $t0 = __tc_root_1.firstChild;
+        _$setAttribute($t0, "href", post.url);
+        _$insert($t0, post.title);
+        _14 = __tc_root_1;
+        __tc_rows.push(_14);
+        break;
+      default:
+        throw new Error("rustc_codegen_js: entered unreachable code");
+    }
+  }
+}
+// vec_rows
+function x13_topcoat_for$vec_rows$he5dcbe65cf52e580(titles) {
+  let _0, __tc_rows, iter, _8, title, _14, __tc_root_1;
+  _0 = tmpl$hf6cbd6a9cadd62de();
+  __tc_rows = [];
+  iter = alloc$vec$impl_19_into_iter$hdf03562f8acde3fa(titles);
+  for (;;) {
+    _8 = core$slice$iter$impl_171_next$hc726822981337141(iter);
+    switch (_8.TAG) {
+      case "None":
+        _$insert(_0, __tc_rows);
+        return _0;
+      case "Some":
+        title = _8._0;
+        __tc_root_1 = tmpl$he15647176a3d34ce();
+        _$insert(__tc_root_1, title.buf[title.off]);
+        _14 = __tc_root_1;
+        __tc_rows.push(_14);
+        break;
+      default:
+        throw new Error("rustc_codegen_js: entered unreachable code");
+    }
+  }
+}
+
+function core$alloc$layout$impl_0_from_size_align_unchecked$precondition_check$h05bbdc381a6f4bb6() {
+  throw new Error("rustc_codegen_js: `core$alloc$layout$impl_0_from_size_align_unchecked$precondition_check$h05bbdc381a6f4bb6` was never codegenned; the monomorphization collector proved every call to it unreachable");
+}
+
+function core$hint$assert_unchecked$precondition_check$hdce51c1a1d470deb() {
+  throw new Error("rustc_codegen_js: `core$hint$assert_unchecked$precondition_check$hdce51c1a1d470deb` was never codegenned; the monomorphization collector proved every call to it unreachable");
+}
+
+function core$num$impl_11_unchecked_mul$precondition_check$he9b4e9f8dc33cc65() {
+  throw new Error("rustc_codegen_js: `core$num$impl_11_unchecked_mul$precondition_check$he9b4e9f8dc33cc65` was never codegenned; the monomorphization collector proved every call to it unreachable");
+}
+
+function core$num$impl_11_unchecked_sub$precondition_check$h4c33ce104fc15265() {
+  throw new Error("rustc_codegen_js: `core$num$impl_11_unchecked_sub$precondition_check$h4c33ce104fc15265` was never codegenned; the monomorphization collector proved every call to it unreachable");
+}
+
+function core$ptr$copy_nonoverlapping$precondition_check$h25cfb1cf714f1d8e() {
+  throw new Error("rustc_codegen_js: `core$ptr$copy_nonoverlapping$precondition_check$h25cfb1cf714f1d8e` was never codegenned; the monomorphization collector proved every call to it unreachable");
+}
+
+function core$ptr$non_null$impl_3_new_unchecked$precondition_check$hd790945cfeefe665() {
+  throw new Error("rustc_codegen_js: `core$ptr$non_null$impl_3_new_unchecked$precondition_check$hd790945cfeefe665` was never codegenned; the monomorphization collector proved every call to it unreachable");
+}
+
+function core$ptr$write_bytes$precondition_check$h1e33aa62ebbd5352() {
+  throw new Error("rustc_codegen_js: `core$ptr$write_bytes$precondition_check$h1e33aa62ebbd5352` was never codegenned; the monomorphization collector proved every call to it unreachable");
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

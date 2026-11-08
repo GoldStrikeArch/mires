@@ -1,0 +1,23 @@
+{
+  "name": "fingerprintjs-rust-compact-experiment",
+  "version": "0.0.0-experiment",
+  "private": true,
+  "description": "Unpublished compact Rust port of FingerprintJS 5.2.0. Algorithm version remains 5.2.0.",
+  "license": "MIT",
+  "scripts": {
+    "build": "node tools/build.mjs --optimizer on --rust-opt-level z --mir-inline on --scheduler boundary",
+    "check:package": "node tools/check-package.mjs",
+    "check:ssr": "node tools/check-ssr.mjs",
+    "check:types": "node tools/check-types.mjs",
+    "test:differential": "node tests/differential.mjs",
+    "measure:bundles": "node tools/measure-bundles.mjs",
+    "measure:esm": "node tools/measure-esm.mjs"
+  },
+  "main": "dist/fp.cjs.js",
+  "module": "dist/fp.esm.js",
+  "types": "dist/fp.d.ts",
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ]
+}

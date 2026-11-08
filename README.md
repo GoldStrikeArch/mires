@@ -1,92 +1,95 @@
-# mires
+# mires — standalone Rust-to-JavaScript compiler
 
-A Rust-to-JavaScript compiler: an out-of-tree rustc codegen backend that lowers
-monomorphized MIR to JavaScript, with the pieces a compiled program needs around
-it. The name is MIR + ES.
+`mires` compiles monomorphized Rust MIR, including real `core` and `alloc`, into JavaScript. This workspace now contains the recovered **v2 producer / semantic-object / independent-linker architecture**, rather than the earlier text-first backend.
 
-It compiles real `core` and `alloc`. A `#![no_std]` crate becomes a readable,
-minifiable ES module or script with source maps, whole-program dead-code
-elimination, `#[js_extern]` bindings to JavaScript libraries, and an executor for
-Rust futures. The template ABI in `view-abi` is what a UI framework's view macro
-can lower to so that a server-rendered page hydrates in the browser; that
-lowering lives with the framework, not here.
+This is a working development reconstruction based on the coherent September 7 v2 snapshot, with selected later safety and packaging requirements restored. **It is not a byte-exact October dev13 recovery or a production-qualified release.** The remaining optimization and semantic gaps are listed in [the restoration record](docs/V2-RESTORATION.md) and [current verification results](VERDICT.md). Historical archived verdicts are kept separately.
 
-## Layout
+## Compile and run Rust
 
-| path | what |
-|---|---|
-| `backend/` | the codegen backend, `rustc_codegen_mires`, loaded with `-Zcodegen-backend` |
-| `structurizer/` | CFG to structured control flow (a relooper), no rustc dependency |
-| `mires-build/` | compiles a client crate to JavaScript from a Cargo `build.rs` |
-| `js-macro/` | `js!{}`, an inline JavaScript expression with captured Rust values |
-| `js-extern-macro/` | `#[js_extern]` on `extern "C"` blocks: typed bindings to a JavaScript library |
-| `view-abi/` | the template ABI between a view lowering and the backend |
-| `view-async/` | the executor that polls Rust futures inside a compiled program |
-| `mires-js/` | host `Map`/`Set` exposed to Rust as `HashMap`/`HashSet` |
-| `runtime/` | `shim.js`, the `__rt` object every compiled program calls, and the vendored DOM runtime bundle |
-| `patches/` | the two patches applied to the toolchain's `rust-src` before the sysroot is built |
-| `scripts/` | build and test drivers (see below) |
-| `examples/` | the fixture suites |
-| `contract/` | the dom-expressions contract: what the template emission and the DOM runtime must reproduce, extracted from pinned upstream sources |
-| `bench/` | the krausest js-framework-benchmark harness and a Melange comparison |
-| `demo/` | a `#![no_core]` counter for the browser |
-| `CONTRACT.md` | the interface spec: compilation command, options, value model, zombies, modules, chunks |
-| `VERDICT.md` | the gate record: what is proven, what is out |
-
-## Setup
-
-The backend is a rustc plugin and loads only into the nightly `rust-toolchain.toml`
-pins. rustup installs it on first use in this directory, with the `rust-src`,
-`rustc-dev`, and `llvm-tools` components. macOS and Linux only.
+macOS/Linux, Rustup and Node.js 24+ are required. `rust-toolchain.toml` pins the backend's nightly and rustc development components. Application build scripts can remain on stable Rust.
 
 ```sh
-scripts/build.sh                            # the backend, release
-JS_EXTRA_ARGS='' scripts/build_sysroot.sh   # core, compiler-builtins and alloc compiled by it, into build/sysroot
+npm ci --ignore-scripts
+bash scripts/build.sh --locked
+node scripts/mires.mjs build examples/standalone/hello.rs --out build/hello.mjs
+node --input-type=module -e 'import {sum_squares, greeting} from "./build/hello.mjs"; console.log(greeting(), sum_squares(5))'
 ```
 
-Both take minutes. Everything that compiles a crate asks for the pinned nightly
-by name, so `rustup default` is never touched.
+The example uses `Vec`, iterator adapters, and exported Rust functions. It prints `Hello from Rust 30`. No Topcoat framework, view macro, server or DOM runtime is needed.
 
-## Tests
+The compiler command writes an ES module, its reached-only runtime module, an authored source map, a linker-owned artifact manifest, and a build receipt with source/binary/artifact hashes. `node scripts/mires.mjs --help` describes profile and dependency options.
+
+Input is currently a `#![no_std]` library with `core`/`alloc`, exported functions and a panic handler, not an arbitrary `std` desktop executable. JavaScript/browser integration is explicit through `mires-js`, `#[js_extern]` and `js!`.
+
+### Stable Cargo build-script integration
 
 ```sh
-cargo test --workspace      # the crates' own tests
-scripts/test.sh             # examples/tests (no_core) and examples/core-tests (real core), run under node
-scripts/emit-test.sh        # goldens of the emitted JavaScript; UPDATE_EXPECT=1 rebaselines
-scripts/module-test.sh      # script and ESM output agree item for item
-scripts/extern-test.sh      # #[js_extern]
-scripts/async-test.sh       # the executor
-scripts/dts-test.sh         # the .d.ts output
-scripts/matrix.sh           # test.sh under every emit-option mode
+cargo +stable run --manifest-path examples/standalone-consumer/Cargo.toml
 ```
 
-Node 24 or later is needed. The contract harness has its own setup, in
-[`contract/README.md`](contract/README.md).
+The example's stable `build.rs` uses `mires_build::BuildConfig` to compile a separate Rust client using the pinned backend. `MIRES_ROOT` selects another checkout; `JSC_SPIKE_ROOT` remains accepted for old experiment drivers. Both compiler binaries are watched for incremental invalidation.
 
-## Compiling a crate
+## Source layout
 
-`scripts/compile_core.sh <src.rs> <out.js>` compiles one `#![no_std]` root file
-against the sysroot. From a Cargo build script, `mires-build` does the same with
-rerun tracking, chunking, and setup checks:
+| Directory | Role |
+| --- | --- |
+| `backend/` | `rustc_codegen_mires`: rustc-facing semantic producer |
+| `rustc-cleanup/` | Hash-verified adaptations of the pinned rustc drop/coroutine passes |
+| `rcgjs-object/` | Rustc-independent object format, semantic IR, identities, origins, contracts |
+| `jsc-link/` | Independent linker, SSA, analyses, optimizer, representation/ABI planner, JavaScript emission |
+| `structurizer/` | Control-flow graph to structured JavaScript |
+| `mires-build/` | Stable build-script bridge |
+| `mires-js/` | General host values, JavaScript bindings, collections and future interoperation |
+| `js-extern-macro/`, `js-macro/` | Typed external bindings and explicit JavaScript expressions |
+| `runtime/` | Canonical runtime, extracted per artifact |
+| `view-abi/`, `view-async/` | Retained small compatibility ABI/executor crates; no Topcoat framework dependency |
+| `scripts/`, `examples/` | Build drivers, compiler fixtures and standalone examples |
+| `experiments/` | Recovered OSS reference, Rust ports and reduced workload corpus |
+| `experiments-pro/` | Private recovered Pro reference, Rust ports and historical tools; ignored by Git |
+| `recovery/v2/` | Unmodified snapshots, content-addressed variants, evidence and recovery manifests |
 
-```toml
-[build-dependencies]
-mires-build = { path = "../mires/mires-build" }
+Legacy template-marker lowering remains internally for compatibility with recovered code; the Topcoat UI implementation and framework crates are not workspace members or dependencies. Removing all legacy marker support is separate from restoring a verified generic compiler.
+
+## Profiles and cleanup
+
+`release-size`, `release-balanced`, and `release-speed` select the JIR lane and optimizer, an ES2018 syntax ceiling, and **host-exception cleanup on**. `js-cleanup=off` is an explicit opt-out and changes recoverable-exception semantics. ES2018 is a syntax ceiling, not a promise that every reached host capability exists in an ES2018 engine.
+
+The primitive build drivers remain available:
+
+```sh
+SKIP_BUILD=1 JS_EXTRA_ARGS='js-profile=release-balanced' bash scripts/build_sysroot.sh
+JS_EXTRA_ARGS='js-profile=release-balanced' bash scripts/compile_core.sh source.rs build/program.js
 ```
 
-```rust
-mires_build::BuildConfig::new("client/app.rs").render().unwrap();
+These lower-level commands emit compiler artifacts; use `scripts/mires.mjs` for a module with a verified runtime package. An unsupported operation must be diagnosed, not silently replaced. Reachable functions whose semantic body is unavailable cannot fall back to text that drops required cleanup.
+
+## Verify the compiler
+
+```sh
+SKIP_BUILD=1 JS_EXTRA_ARGS='js-lane=jir js-opt=on' bash scripts/build_sysroot.sh
+SKIP_BUILD=1 JS_EXTRA_ARGS='js-lane=jir js-opt=on' bash scripts/test.sh --require-core
+bash scripts/check.sh
+npm run test:standalone
+SKIP_BUILD=1 npm run test:cleanup
+bash scripts/cleanup-admission-test.sh
 ```
 
-A crate that uses a proc macro is expanded by plain rustc first, because the
-backend cannot run one: `.js_extern(true)` for `#[js_extern]`, `.proc_macro(..)`
-for a macro built elsewhere, `.view_abi(true)` or `.rlib(..)` for a crate the
-backend compiles to an rlib first. `MIRES_ROOT` points a build at a checkout
-other than the one `mires-build` was compiled from.
+`check.sh` requires a nonempty real compiler corpus, then checks formatting, Clippy, Rust tests, runtime tests and cache identities. The cleanup tests exercise ordinary/active host throws, drop order and thrown-value identity; the admission test requires a reachable unencodable cleanup dependency to be rejected and an unreachable one to remain harmless.
 
-## Options
+## Experiments
 
-Backend options travel through `-Cllvm-args`, for example `js-minify=on` or
-`js-modules=esm`. An option that changes how an item is spelled has to match
-between the sysroot and the crate, which is why `build/sysroot/.js-args` records
-the set the sysroot was built with. `CONTRACT.md` lists every option.
+See [experiments/README.md](experiments/README.md). The OSS reference can be rebuilt from its original TypeScript source. Rust ports build through the active standalone compiler and use manifest-bound packaging.
+
+```sh
+npm run build:oss-reference
+npm run build:corpus
+npm run test:corpus
+```
+
+Fingerprint Pro's exact self-contained 4.1.4 reference module and declarations are present locally, but its original source checkout is incomplete. Its Rust ports can be rebuilt independently. Do not mistake an API/import check for full browser parity, and do not publish private recovered material.
+
+The later October cleanup/formatter optimizations, union-string work, constant pooling, trailing arguments and remaining memory-model repairs are not all reimplemented. Restored historical measurements are targets and evidence about their original inputs—not performance claims for this compiler. Other-language comparison ports have not been restored.
+
+## Other-language compiler comparisons
+
+The restored ReScript, Melange, js_of_ocaml, Scala.js, Dart2JS, Kotlin/JS, and Elm implementations are available for both OSS and private Pro experiments. See [the comparator guide](docs/COMPARATORS.md) for installation, build/check commands, verified scope, and production-variant selection.

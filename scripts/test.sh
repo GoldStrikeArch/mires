@@ -3,8 +3,10 @@
 # Builds the backend, compiles every test to JavaScript, runs it under node and
 # diffs stdout against the matching .expected file.
 #
-#   scripts/test.sh              # run every test
-#   scripts/test.sh 03_structs   # run one test (name, file name or path)
+#   scripts/test.sh                  # run every test
+#   scripts/test.sh --require-core   # explicitly require core (the default)
+#   REQUIRE_CORE=0 scripts/test.sh   # explicitly allow missing core prerequisites
+#   scripts/test.sh 03_structs       # run one test (name, file name or path)
 #
 # Two suites run, in this order:
 #
@@ -13,10 +15,9 @@
 #                         `--emit=obj`).
 #   examples/core-tests/  `#![no_std]` crates against the REAL `core`, compiled
 #                         with scripts/compile_core.sh against the sysroot that
-#                         scripts/build_sysroot.sh builds. Skipped with a notice
-#                         if that sysroot is absent, so this script still works
-#                         on a fresh checkout — run ./scripts/build_sysroot.sh
-#                         once to enable them.
+#                         scripts/build_sysroot.sh builds for the selected options.
+#                         Missing prerequisites fail unless REQUIRE_CORE=0 explicitly
+#                         allows a partial suite. A named core test always requires core.
 #
 # A core test may also name `mires_js`, the host collections crate, which this
 # script builds through the backend into an rlib and offers to every one of them
@@ -27,6 +28,11 @@
 # Per test companion files, all optional except the first:
 #
 #   NN.expected     exact expected stdout (required for a normal test)
+#   NN.jir.maxbytes a byte budget that replaces NN.maxbytes when $JS_EXTRA_ARGS
+#                   asks for `js-lane=jir`, for a fixture whose size the JIR
+#                   lowering moves. Absent for nearly every fixture, and that is
+#                   the interesting case: the lane is held to the baseline's
+#                   budget unless somebody wrote down why it may not be.
 #   NN.maxbytes     a byte budget for the emitted .js; catches size regressions
 #                   from a lost dead-code elimination. Defaults to
 #                   $DEFAULT_MAXBYTES below. NOT enforced when $JS_EXTRA_ARGS
@@ -58,10 +64,31 @@ set -uo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd -- "$script_dir/.." && pwd)
+# shellcheck source=integration-lock.sh
+source "$script_dir/integration-lock.sh"
+# shellcheck source=sysroot-cache.sh
+source "$script_dir/sysroot-cache.sh"
+
+require_core=${REQUIRE_CORE:-1}
+if [ "${1:-}" = --require-core ]; then
+	require_core=1
+	shift
+fi
+case "$require_core" in
+0 | 1) ;;
+*)
+	echo "test.sh: REQUIRE_CORE must be 0 or 1" >&2
+	exit 2
+	;;
+esac
+
+# The integration suite exercises the release linker, where debug assertions do not enable proof
+# replay. CI must check the optimizer's witnesses there too.
+: "${RCGJS_WITNESS_CHECK:=1}"
+export RCGJS_WITNESS_CHECK
 
 tests_dir="$root/examples/tests"
 core_dir="$root/examples/core-tests"
-sysroot="$root/build/sysroot"
 build_dir="$root/build"
 # Logs and captured output live beside, not inside, the directory rustc emits
 # into, so nothing here can be mistaken for a compiler artifact.
@@ -72,30 +99,29 @@ entry="$script_dir/entry.js"
 # Nothing is pending: every test in both suites is expected to pass.
 PENDING=""
 
+# The lane the caller asked for, which decides one thing here: which byte budget applies. The JIR
+# lane prints an item from its JIR-S body rather than from v1's text, so a fixture whose size moves
+# may carry `NN.jir.maxbytes` beside `NN.maxbytes`; without one the baseline budget is enforced, so
+# a lane that quietly grew a fixture is still a failure.
+lane_suffix=""
+case " ${JS_EXTRA_ARGS:-} " in
+*" js-lane=jir "*) lane_suffix=".jir" ;;
+esac
+
+# budget_file <directory> <name>: the budget a fixture is held to on this lane.
+budget_file() {
+	if [ -n "$lane_suffix" ] && [ -f "$1/$2$lane_suffix.maxbytes" ]; then
+		printf '%s' "$1/$2$lane_suffix.maxbytes"
+	else
+		printf '%s' "$1/$2.maxbytes"
+	fi
+}
+
 # How a compiled program is run, which is the one thing `js-modules` decides here.
 case " ${JS_EXTRA_ARGS:-} " in
 *js-modules=esm*) esm=1 ;;
 *) esm=0 ;;
 esac
-
-# emit_args <args>: the emit-affecting subset of a $JS_EXTRA_ARGS string.
-#
-# An option is emit-affecting when it can change the text of an item two crates
-# might both codegen, which is the whole of what a sysroot and the crate on top of
-# it have to agree on. The module options are not: everything they add is
-# synthesized by the link step (scripts/module-test.sh holds that), so switching
-# modes must not cost a sysroot rebuild.
-emit_args() {
-	local out=""
-	local arg
-	for arg in $1; do
-		case "$arg" in
-		js-modules=* | js-shim-module=* | js-dom-module=*) continue ;;
-		esac
-		out="$out${out:+ }$arg"
-	done
-	printf '%s' "$out"
-}
 
 # run_program <program.js> <name> <stdout> <stderr>: runs a compiled program.
 run_program() {
@@ -158,6 +184,7 @@ if [ -n "$selected" ]; then
 		sources=$tests_dir/$name.rs
 	elif [ -f "$core_dir/$name.rs" ] && [ "$name" != prelude ]; then
 		core_sources=$core_dir/$name.rs
+		require_core=1
 	else
 		echo "test.sh: no such test: $name" >&2
 		echo "test.sh: available:" >&2
@@ -171,6 +198,10 @@ else
 	core_sources=$(all_core_sources)
 	if [ -z "$sources" ]; then
 		echo "test.sh: no tests found in $tests_dir" >&2
+		exit 1
+	fi
+	if [ "$require_core" = 1 ] && [ -z "$core_sources" ]; then
+		echo "test.sh: no core tests found in $core_dir" >&2
 		exit 1
 	fi
 fi
@@ -198,7 +229,7 @@ for src in $sources; do
 	out="$build_dir/$name.js"
 	expected="$tests_dir/$name.expected"
 	expect_fail="$tests_dir/$name.expect_fail"
-	maxbytes_file="$tests_dir/$name.maxbytes"
+	maxbytes_file=$(budget_file "$tests_dir" "$name")
 	absent="$tests_dir/$name.absent"
 	actual="$log_dir/$name.actual"
 	compile_log="$log_dir/$name.compile.log"
@@ -304,43 +335,40 @@ done
 # The core suite: the same crates, but against the real `core`.
 # -------------------------------------------------------------------------
 
+if [ -n "$core_sources" ]; then
+	case "$(uname -s)" in
+	Darwin) dylib="$root/target/release/librustc_codegen_mires.dylib" ;;
+	*) dylib="$root/target/release/librustc_codegen_mires.so" ;;
+	esac
+	sysroot=$(jsc_resolve_sysroot "$root" wasm32-unknown-unknown "$dylib") || exit 1
+	# Preserve automatic option switching for checkouts with a default sysroot.
+	if [ ! -d "$sysroot/lib/rustlib/wasm32-unknown-unknown/lib" ] && \
+		[ -d "$root/build/sysroot/lib/rustlib/wasm32-unknown-unknown/lib" ]; then
+		echo "==> building matching keyed sysroot: $sysroot"
+		if ! JS_EXTRA_ARGS="$(jsc_sysroot_args)" SKIP_BUILD=1 "$script_dir/build_sysroot.sh" \
+			>"$log_dir/build_sysroot.log" 2>&1; then
+			echo "    sysroot build failed, see $log_dir/build_sysroot.log"
+		fi
+		sysroot=$(jsc_resolve_sysroot "$root" wasm32-unknown-unknown "$dylib") || exit 1
+	fi
+fi
+
 if [ -n "$core_sources" ] && [ ! -d "$sysroot/lib/rustlib/wasm32-unknown-unknown/lib" ]; then
 	echo
 	echo "==> core suite skipped: no sysroot at $sysroot"
 	echo "    build one with ./scripts/build_sysroot.sh (about a minute), then re-run"
-	core_sources=""
-fi
-
-# The sysroot has to have been built with the same emit-affecting $JS_EXTRA_ARGS
-# as the crates linking against it. An option that changes the JavaScript an item
-# prints — js-minify, js-structure, js-queue — makes a generic instantiation that
-# both `core` and the test crate codegen come out spelled two ways, and link.rs
-# reports that (correctly) as two different definitions of one item. Rebuilding
-# is the fix; build_sysroot.sh is idempotent and notices the change itself.
-if [ -n "$core_sources" ]; then
-	sysroot_args=""
-	[ -f "$sysroot/.js-args" ] && sysroot_args=$(cat "$sysroot/.js-args")
-	want_args=$(emit_args "${JS_EXTRA_ARGS:-}")
-	if [ "$(emit_args "$sysroot_args")" != "$want_args" ]; then
-		echo
-		echo "==> the sysroot was built with JS_EXTRA_ARGS='$sysroot_args', this run wants"
-		echo "    '$want_args' — rebuilding it (about a minute)"
-		if JS_EXTRA_ARGS="$want_args" SKIP_BUILD=1 "$script_dir/build_sysroot.sh" \
-			>"$log_dir/build_sysroot.log" 2>&1; then
-			echo "    ok"
-		else
-			echo "    sysroot rebuild failed, see $log_dir/build_sysroot.log"
-			echo "==> core suite skipped"
-			core_sources=""
-		fi
+	if [ "$require_core" = 1 ]; then
+		echo "test.sh: the real-core suite is required" >&2
+		exit 1
 	fi
+	core_sources=""
 fi
 
 core_build_dir="$build_dir/core"
 mkdir -p "$core_build_dir"
 
 # `mires-js` is compiled by THIS backend into an rlib and offered to every core test, exactly as
-# scripts/async-test.sh does with `view-abi`. A test that never names it links nothing: `--extern`
+# scripts/dom-test.sh does with `view-abi`. A test that never names it links nothing: `--extern`
 # only puts the crate on the search path, so the budgets of the other tests do not move.
 #
 # It is built with the emit-affecting options the sysroot was built with, for the reason the
@@ -348,21 +376,49 @@ mkdir -p "$core_build_dir"
 # generic instantiation that both crates codegen come out spelled two ways, and link.rs reports
 # that as two definitions of one item.
 mires_js_rlib="$core_build_dir/libmires_js.rlib"
+proc_macro_dir="$core_build_dir/proc-macro"
 if [ -n "$core_sources" ]; then
 	echo
-	echo "==> building mires-js through the backend"
-	if JS_EXTRA_ARGS="$(emit_args "${JS_EXTRA_ARGS:-}")" "$script_dir/compile_core.sh" \
-		"$root/mires-js/src/lib.rs" "$mires_js_rlib" \
-		--crate-type rlib --crate-name mires_js >"$log_dir/mires-js.log" 2>&1; then
+	echo "==> building js-extern-macro for mires-js"
+	if (cd "$root" && cargo build -p js-extern-macro) >"$log_dir/js-extern-macro.log" 2>&1; then
+		mkdir -p "$proc_macro_dir"
+		case "$(uname -s)" in
+		Darwin) proc_macro="$root/target/debug/libjs_extern_macro.dylib" ;;
+		*) proc_macro="$root/target/debug/libjs_extern_macro.so" ;;
+		esac
+		ln -sf "$proc_macro" "$proc_macro_dir/$(basename -- "$proc_macro")"
 		echo "    ok"
 	else
-		echo "    failed, see $log_dir/mires-js.log"
-		sed 's/^/    /' "$log_dir/mires-js.log"
+		echo "    failed, see $log_dir/js-extern-macro.log"
+		sed 's/^/    /' "$log_dir/js-extern-macro.log"
+		if [ "$require_core" = 1 ]; then
+			echo "test.sh: the real-core suite is required" >&2
+			exit 1
+		fi
 		echo "==> core suite skipped"
 		core_sources=""
 	fi
 fi
-core_externs=(--extern "mires_js=$mires_js_rlib")
+if [ -n "$core_sources" ]; then
+	echo
+	echo "==> building mires-js through the backend"
+	if JS_EXTRA_ARGS="$(jsc_normalize_emit_args "${JS_EXTRA_ARGS:-}")" "$script_dir/compile_core.sh" \
+		"$root/mires-js/src/lib.rs" "$mires_js_rlib" \
+		--crate-type rlib --crate-name mires_js \
+		--extern js_extern_macro="$proc_macro" >"$log_dir/mires-js.log" 2>&1; then
+		echo "    ok"
+	else
+		echo "    failed, see $log_dir/mires-js.log"
+		sed 's/^/    /' "$log_dir/mires-js.log"
+		if [ "$require_core" = 1 ]; then
+			echo "test.sh: the real-core suite is required" >&2
+			exit 1
+		fi
+		echo "==> core suite skipped"
+		core_sources=""
+	fi
+fi
+core_externs=(--extern "mires_js=$mires_js_rlib" --search "$proc_macro_dir")
 
 for src in $core_sources; do
 	name=$(basename -- "${src%.rs}")
@@ -370,7 +426,7 @@ for src in $core_sources; do
 	expected="$core_dir/$name.expected"
 	expect_fail="$core_dir/$name.expect_fail"
 	expect_abort="$core_dir/$name.expect_abort"
-	maxbytes_file="$core_dir/$name.maxbytes"
+	maxbytes_file=$(budget_file "$core_dir" "$name")
 	absent="$core_dir/$name.absent"
 	actual="$log_dir/$name.actual"
 	compile_log="$log_dir/$name.compile.log"

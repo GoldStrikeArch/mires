@@ -1,4 +1,4 @@
-//! Declares a JavaScript interface to `rustc_codegen_mires`, so a program can call one without
+//! Declares a JavaScript interface to `rustc_codegen_js`, so a program can call one without
 //! anybody hand writing the encoding that carries it.
 //!
 //! ```ignore
@@ -20,23 +20,24 @@
 //! ```
 //!
 //! Each declaration becomes a marker function: an ordinary Rust `fn` whose body never runs and
-//! whose [`link_section`] the backend matches on, exactly as `view-abi`'s markers work. The
+//! whose `link_section` the backend matches on, exactly as `view-abi`'s markers work. The
 //! declaration is written as a foreign block because that is the shape a reader expects and the
 //! shape the signatures suit; nothing foreign survives the expansion, and it must not, because
 //! rustc has announced that `link_section` on a foreign function will become a hard error.
 //!
-//! See [`descriptor`] for the encoding and for the shapes.
+//! See `descriptor` for the encoding and for the shapes.
 
 mod descriptor;
 
-use descriptor::{Descriptor, Shape};
+use descriptor::{Descriptor, Fact, Shape, Slot, SlotFacts};
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
     parse::{Parse, ParseStream},
     punctuated::Punctuated,
     spanned::Spanned,
-    ForeignItem, Ident, ItemForeignMod, LitStr, Token,
+    AngleBracketedGenericArguments, Attribute, FnArg, ForeignItem, GenericArgument, Ident, ItemFn,
+    ItemForeignMod, LitStr, PathArguments, ReturnType, Signature, Token, Type, Visibility,
 };
 
 /// Declares the JavaScript interface a foreign block describes. See the crate docs.
@@ -56,6 +57,105 @@ pub fn js_extern(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Declares JavaScript bindings without an unsafe foreign block.
+///
+/// The optional `module = "..";` header applies to every declaration. Without it, declarations
+/// are rooted at browser globals or at their first argument, following the same rules as
+/// [`js_extern`].
+#[proc_macro]
+pub fn js_bindings(input: TokenStream) -> TokenStream {
+    let bindings = syn::parse_macro_input!(input as Bindings);
+    match expand_bindings(&bindings) {
+        Ok(tokens) => tokens.into(),
+        Err(error) => error.to_compile_error().into(),
+    }
+}
+
+/// Exports a Rust function under its Rust name without an unsafe source-level attribute.
+#[proc_macro_attribute]
+pub fn js_export(attr: TokenStream, item: TokenStream) -> TokenStream {
+    if !attr.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "`js_export` takes no arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+    let function = syn::parse_macro_input!(item as ItemFn);
+    quote! {
+        #[unsafe(no_mangle)]
+        #function
+    }
+    .into()
+}
+
+/// A safe JavaScript bindings block.
+struct Bindings {
+    module: String,
+    functions: Vec<BindingFn>,
+}
+
+impl Parse for Bindings {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let module = if input.peek(Ident) && input.peek2(Token![=]) {
+            let key: Ident = input.parse()?;
+            if key != "module" {
+                return Err(syn::Error::new(
+                    key.span(),
+                    "the bindings header is `module = \"..\";`",
+                ));
+            }
+            input.parse::<Token![=]>()?;
+            let value = input.parse::<LitStr>()?.value();
+            input.parse::<Token![;]>()?;
+            value
+        } else {
+            String::new()
+        };
+        let mut functions = Vec::new();
+        while !input.is_empty() {
+            functions.push(input.parse()?);
+        }
+        Ok(Self { module, functions })
+    }
+}
+
+/// One function in a safe bindings block.
+struct BindingFn {
+    attrs: Vec<Attribute>,
+    visibility: Visibility,
+    signature: Signature,
+    semicolon: Token![;],
+}
+
+impl Parse for BindingFn {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        Ok(Self {
+            attrs: input.call(Attribute::parse_outer)?,
+            visibility: input.parse()?,
+            signature: input.parse()?,
+            semicolon: input.parse()?,
+        })
+    }
+}
+
+/// Expands a safe bindings block through the same marker path as [`js_extern`].
+fn expand_bindings(bindings: &Bindings) -> syn::Result<proc_macro2::TokenStream> {
+    let mut out = proc_macro2::TokenStream::new();
+    for function in &bindings.functions {
+        let attrs = &function.attrs;
+        let visibility = &function.visibility;
+        let signature = &function.signature;
+        let semicolon = &function.semicolon;
+        let foreign: syn::ForeignItemFn = syn::parse2(quote! {
+            #(#attrs)* #visibility #signature #semicolon
+        })?;
+        out.extend(marker(&bindings.module, &foreign)?);
+    }
+    Ok(out)
+}
+
 /// The attribute's own argument: `module = "chart.js"`, or nothing for a global.
 struct ModuleArg {
     module: String,
@@ -64,7 +164,9 @@ struct ModuleArg {
 impl Parse for ModuleArg {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         if input.is_empty() {
-            return Ok(Self { module: String::new() });
+            return Ok(Self {
+                module: String::new(),
+            });
         }
         let key: Ident = input.parse()?;
         if key != "module" {
@@ -78,7 +180,9 @@ impl Parse for ModuleArg {
         if !input.is_empty() {
             return Err(input.error("`js_extern` takes one argument"));
         }
-        Ok(Self { module: value.value() })
+        Ok(Self {
+            module: value.value(),
+        })
     }
 }
 
@@ -87,6 +191,7 @@ struct JsAttr {
     shape: Shape,
     name: Option<String>,
     nullable: bool,
+    fallible: bool,
     global: bool,
     module: Option<String>,
 }
@@ -96,6 +201,7 @@ impl Parse for JsAttr {
         let mut shape = None;
         let mut name = None;
         let mut nullable = false;
+        let mut fallible = false;
         let mut global = None;
         let mut module = None;
 
@@ -109,6 +215,7 @@ impl Parse for JsAttr {
                     name = value;
                 }
                 JsEntry::Nullable => nullable = true,
+                JsEntry::Fallible => fallible = true,
                 JsEntry::Global(span) => global = Some(span),
                 JsEntry::Module(span, value) => module = Some((span, value)),
             }
@@ -116,8 +223,8 @@ impl Parse for JsAttr {
 
         let shape = shape.ok_or_else(|| {
             input.error(
-                "`#[js(..)]` needs a shape: `call`, `new`, `method`, `get`, `set`, `index` or \
-                 `index_set`",
+                "`#[js(..)]` needs a shape: `call`, `new`, `method`, `computed_method`, `get`, \
+                 `set`, `index`, `index_set` or `has`",
             )
         })?;
         // The two name a root each, so a declaration carrying both says two things and means one.
@@ -134,6 +241,7 @@ impl Parse for JsAttr {
             shape,
             name,
             nullable,
+            fallible,
             global: global.is_some(),
             module: module.map(|(_, value)| value),
         })
@@ -145,6 +253,7 @@ enum JsEntry {
     /// A shape, with the JavaScript name it was given.
     Shape(proc_macro2::Span, Shape, Option<String>),
     Nullable,
+    Fallible,
     Global(proc_macro2::Span),
     Module(proc_macro2::Span, String),
 }
@@ -168,11 +277,19 @@ impl Parse for JsEntry {
             "set" => Shape::Set,
             "index" => Shape::Index,
             "index_set" => Shape::IndexSet,
+            "has" => Shape::Has,
+            "computed_method" => Shape::ComputedMethod,
             "nullable" => {
                 if value.is_some() {
                     return Err(syn::Error::new(key.span(), "`nullable` takes no value"));
                 }
                 return Ok(JsEntry::Nullable);
+            }
+            "fallible" => {
+                if value.is_some() {
+                    return Err(syn::Error::new(key.span(), "`fallible` takes no value"));
+                }
+                return Ok(JsEntry::Fallible);
             }
             "global" => {
                 if value.is_some() {
@@ -197,6 +314,111 @@ impl Parse for JsEntry {
     }
 }
 
+/// One parameter's `#[js(..)]`: what the host does with that argument.
+///
+/// ```ignore
+/// js_bindings! {
+///     #[js(method = "write")]
+///     fn write(sink: &Sink, #[js(reads, accepts(host_string))] text: &str);
+/// }
+/// ```
+///
+/// `accepts(..)` names the carriers the host takes the value in unchanged; every other entry is a
+/// bare word naming how the host observes it. A parameter with no attribute says nothing, which is
+/// what every declaration written before this existed says, and the consumer classifies it from
+/// its Rust type instead.
+struct SlotAttr(SlotFacts);
+
+impl Parse for SlotAttr {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let mut facts = SlotFacts::default();
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            if key == "accepts" {
+                let carriers;
+                syn::parenthesized!(carriers in input);
+                for name in Punctuated::<Ident, Token![,]>::parse_terminated(&carriers)? {
+                    let fact = Fact::from_word(&name.to_string())
+                        .filter(|fact| fact.is_carrier())
+                        .ok_or_else(|| {
+                            syn::Error::new(
+                                name.span(),
+                                format!("`{name}` is not a carrier: {}", words(Fact::carriers())),
+                            )
+                        })?;
+                    facts = facts.with(fact);
+                }
+            } else {
+                let fact = Fact::from_word(&key.to_string())
+                    .filter(|fact| !fact.is_carrier())
+                    .ok_or_else(|| {
+                        syn::Error::new(
+                            key.span(),
+                            format!(
+                                "`{key}` is not a parameter fact: `accepts(..)`, {}",
+                                words(Fact::observations())
+                            ),
+                        )
+                    })?;
+                facts = facts.with(fact);
+            }
+            if input.is_empty() {
+                break;
+            }
+            input.parse::<Token![,]>()?;
+        }
+        if facts.is_empty() {
+            return Err(input.error("a parameter's `#[js(..)]` says at least one thing"));
+        }
+        Ok(Self(facts))
+    }
+}
+
+/// The words `facts` can be spelled with, for an error message.
+fn words(facts: impl Iterator<Item = Fact>) -> String {
+    facts
+        .map(|fact| format!("`{}`", fact.word()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Takes every parameter's `#[js(..)]` off `signature`, as the slot facts they declare.
+///
+/// The attributes are removed rather than copied through, because what the macro writes is an
+/// ordinary Rust function and `#[js(..)]` is not an attribute rustc knows.
+fn take_slots(signature: &mut Signature) -> syn::Result<Vec<(Slot, SlotFacts)>> {
+    let mut slots = Vec::new();
+    let inputs = signature.inputs.span();
+    for (index, argument) in signature.inputs.iter_mut().enumerate() {
+        let attrs = match argument {
+            FnArg::Receiver(receiver) => &mut receiver.attrs,
+            FnArg::Typed(typed) => &mut typed.attrs,
+        };
+        let mut facts = None;
+        let mut kept = Vec::new();
+        for attr in attrs.drain(..) {
+            if !attr.path().is_ident("js") {
+                kept.push(attr);
+                continue;
+            }
+            if facts.is_some() {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "a parameter has one `#[js(..)]`",
+                ));
+            }
+            facts = Some(attr.parse_args::<SlotAttr>()?.0);
+        }
+        *attrs = kept;
+        if let Some(facts) = facts {
+            let index = u32::try_from(index)
+                .map_err(|_| syn::Error::new(inputs, "too many parameters to declare"))?;
+            slots.push((Slot::Parameter(index), facts));
+        }
+    }
+    Ok(slots)
+}
+
 /// The marker functions a block expands to.
 fn expand(module: &str, block: &ItemForeignMod) -> syn::Result<proc_macro2::TokenStream> {
     let mut out = proc_macro2::TokenStream::new();
@@ -219,7 +441,10 @@ fn marker(module: &str, function: &syn::ForeignItemFn) -> syn::Result<proc_macro
     for attr in &function.attrs {
         if attr.path().is_ident("js") {
             if js.is_some() {
-                return Err(syn::Error::new(attr.span(), "a declaration has one `#[js(..)]`"));
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "a declaration has one `#[js(..)]`",
+                ));
             }
             js = Some(attr.parse_args::<JsAttr>()?);
         } else {
@@ -233,12 +458,17 @@ fn marker(module: &str, function: &syn::ForeignItemFn) -> syn::Result<proc_macro
         )
     })?;
 
-    let signature = &function.sig;
+    let mut signature = function.sig.clone();
+    let slots = take_slots(&mut signature)?;
+    let signature = &signature;
     let visibility = &function.vis;
     let ident = &signature.ident;
 
     if let Some(variadic) = &signature.variadic {
-        return Err(syn::Error::new(variadic.span(), "a declaration is not variadic"));
+        return Err(syn::Error::new(
+            variadic.span(),
+            "a declaration is not variadic",
+        ));
     }
 
     if js.nullable && !js.shape.returns_a_value() {
@@ -247,11 +477,36 @@ fn marker(module: &str, function: &syn::ForeignItemFn) -> syn::Result<proc_macro
             "`nullable` describes a returned value, and this shape returns none",
         ));
     }
+    if js.fallible
+        && !matches!(
+            js.shape,
+            Shape::Call | Shape::New | Shape::Method | Shape::ComputedMethod | Shape::Get
+        )
+    {
+        return Err(syn::Error::new(
+            signature.ident.span(),
+            "`fallible` applies to a call, construction, method or property read",
+        ));
+    }
+    if js.fallible && js.nullable {
+        return Err(syn::Error::new(
+            signature.ident.span(),
+            "`fallible` and `nullable` cannot describe the same declaration",
+        ));
+    }
+    if js.fallible && !returns_result_js_value(signature) {
+        return Err(syn::Error::new(
+            signature.output.span(),
+            "a `fallible` declaration returns `Result<T, JsValue>`",
+        ));
+    }
 
     // An index off the receiver itself needs no path; everything else defaults to the Rust name,
     // which is what makes the common declaration a one liner.
     let name = match (js.shape, &js.name) {
-        (Shape::Index | Shape::IndexSet, None) => String::new(),
+        (Shape::Index | Shape::IndexSet | Shape::Has | Shape::ComputedMethod, None) => {
+            String::new()
+        }
         (_, Some(name)) => name.clone(),
         (_, None) => ident.to_string(),
     };
@@ -271,9 +526,11 @@ fn marker(module: &str, function: &syn::ForeignItemFn) -> syn::Result<proc_macro
     let descriptor = Descriptor {
         shape: js.shape,
         nullable: js.nullable,
+        fallible: js.fallible,
         global: js.global,
         module,
         name,
+        slots,
     };
 
     if !descriptor.acts_on_argument() && descriptor.name.is_empty() {
@@ -291,8 +548,10 @@ fn marker(module: &str, function: &syn::ForeignItemFn) -> syn::Result<proc_macro
         let takes = match (descriptor.acts_on_argument(), js.shape) {
             (true, Shape::Index) => "the value it indexes and the key",
             (true, Shape::IndexSet) => "the value it indexes, the key and the value to write",
+            (true, Shape::Has | Shape::ComputedMethod) => "the receiver and the key",
             (true, Shape::Set) => "the receiver and the value to write",
             (true, _) => "the receiver",
+            (false, Shape::Has | Shape::ComputedMethod) => "the key",
             (false, _) => "the value to write",
         };
         return Err(syn::Error::new(
@@ -303,12 +562,24 @@ fn marker(module: &str, function: &syn::ForeignItemFn) -> syn::Result<proc_macro
             ),
         ));
     }
+    let passed = arguments - required;
+    if js.shape == Shape::Has && passed != 0 {
+        return Err(syn::Error::new(
+            signature.inputs.span(),
+            "a `has` declaration takes only its receiver and key",
+        ));
+    }
+    if js.shape == Shape::ComputedMethod && passed > 2 {
+        return Err(syn::Error::new(
+            signature.inputs.span(),
+            "a `computed_method` declaration takes at most two method arguments",
+        ));
+    }
 
     let section = descriptor.encode();
 
-    let unreachable = format!(
-        "`{ident}` is a `#[js_extern]` declaration, which only rustc_codegen_mires can lower"
-    );
+    let unreachable =
+        format!("`{ident}` is a `#[js_extern]` declaration, which only rustc_codegen_js can lower");
     Ok(quote! {
         #(#kept)*
         #[cfg_attr(target_arch = "wasm32", link_section = #section)]
@@ -324,6 +595,40 @@ fn marker(module: &str, function: &syn::ForeignItemFn) -> syn::Result<proc_macro
     })
 }
 
+/// Whether a signature spells the boundary type a fallible declaration promises.
+fn returns_result_js_value(signature: &Signature) -> bool {
+    let ReturnType::Type(_, ty) = &signature.output else {
+        return false;
+    };
+    let Type::Path(result) = ty.as_ref() else {
+        return false;
+    };
+    let Some(segment) = result.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Result" {
+        return false;
+    }
+    let PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }) =
+        &segment.arguments
+    else {
+        return false;
+    };
+    let mut types = args.iter().filter_map(|argument| match argument {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    });
+    let (Some(_), Some(Type::Path(error)), None) = (types.next(), types.next(), types.next())
+    else {
+        return false;
+    };
+    error
+        .path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "JsValue")
+}
+
 /// Whether `name` can be written as a JavaScript identifier, or as a dotted path of them.
 ///
 /// A path is what a walk needs. `instance.data.datasets` is one property read written twice, and
@@ -336,8 +641,7 @@ fn is_js_name(name: &str) -> bool {
             characters
                 .next()
                 .is_some_and(|first| first.is_ascii_alphabetic() || first == '_' || first == '$')
-                && characters
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+                && characters.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
         })
 }
 
@@ -368,54 +672,147 @@ mod tests {
             ("new", 'n'),
             ("index", 'i'),
             ("index_set", 'j'),
+            ("has", 'h'),
+            ("computed_method", 'm'),
         ] {
-            let source = format!(
-                r#"unsafe extern "C" {{ #[js({attr})] fn f(a: u32, b: u32, c: u32) -> u32; }}"#
-            );
+            let parameters = if attr == "has" {
+                "a: u32, b: u32"
+            } else {
+                "a: u32, b: u32, c: u32"
+            };
+            let source =
+                format!(r#"unsafe extern "C" {{ #[js({attr})] fn f({parameters}) -> u32; }}"#);
             let encoded = descriptor("m.js", &source).expect("it expands");
-            assert!(encoded.starts_with(&format!("rcgjs.ext.2.{letter}")), "{encoded}");
+            assert!(
+                encoded.starts_with(&format!("rcgjs.ext.3.{letter}")),
+                "{encoded}"
+            );
         }
         // The member shapes take a receiver, so they are declared with one.
         for (attr, letter) in [("method", 's'), ("get", 'g'), ("set", 't')] {
             let source =
                 format!(r#"unsafe extern "C" {{ #[js({attr})] fn f(a: u32, b: u32) -> u32; }}"#);
             let encoded = descriptor("", &source).expect("it expands");
-            assert!(encoded.starts_with(&format!("rcgjs.ext.2.{letter}")), "{encoded}");
+            assert!(
+                encoded.starts_with(&format!("rcgjs.ext.3.{letter}")),
+                "{encoded}"
+            );
         }
     }
 
     #[test]
     fn the_rust_name_is_the_default_javascript_name() {
         assert_eq!(
-            descriptor("chart.js", r#"unsafe extern "C" { #[js(new)] fn Chart(); }"#).unwrap(),
-            "rcgjs.ext.2.n-.8,5.chart.jsChart",
+            descriptor(
+                "chart.js",
+                r#"unsafe extern "C" { #[js(new)] fn Chart(); }"#
+            )
+            .unwrap(),
+            "rcgjs.ext.3.n-.-.8,5.chart.jsChart",
         );
         assert_eq!(
-            descriptor("chart.js", r#"unsafe extern "C" { #[js(new = "Chart")] fn make(); }"#)
-                .unwrap(),
-            "rcgjs.ext.2.n-.8,5.chart.jsChart",
+            descriptor(
+                "chart.js",
+                r#"unsafe extern "C" { #[js(new = "Chart")] fn make(); }"#
+            )
+            .unwrap(),
+            "rcgjs.ext.3.n-.-.8,5.chart.jsChart",
         );
     }
 
     #[test]
     fn nullable_sets_the_flag_and_only_where_a_value_comes_back() {
         assert_eq!(
-            descriptor("", r#"unsafe extern "C" { #[js(get = "w", nullable)] fn w(a: u32) -> u32; }"#)
-                .unwrap(),
-            "rcgjs.ext.2.gn.0,1.w",
+            descriptor(
+                "",
+                r#"unsafe extern "C" { #[js(get = "w", nullable)] fn w(a: u32) -> u32; }"#
+            )
+            .unwrap(),
+            "rcgjs.ext.3.gn.-.0,1.w",
         );
-        let error =
-            descriptor("", r#"unsafe extern "C" { #[js(set = "w", nullable)] fn w(a: u32, b: u32); }"#)
-                .unwrap_err();
+        let error = descriptor(
+            "",
+            r#"unsafe extern "C" { #[js(set = "w", nullable)] fn w(a: u32, b: u32); }"#,
+        )
+        .unwrap_err();
         assert!(error.contains("returns none"), "{error}");
+    }
+
+    #[test]
+    fn fallible_sets_the_flag_and_requires_the_host_result() {
+        assert_eq!(
+            descriptor(
+                "",
+                r#"unsafe extern "C" {
+                    #[js(call = "JSON.parse", fallible)]
+                    fn parse(value: &str) -> Result<u32, JsValue>;
+                }"#,
+            )
+            .unwrap(),
+            "rcgjs.ext.3.cf.-.0,10.JSON.parse",
+        );
+        for result in ["u32", "Result<u32, u32>"] {
+            let source = format!(
+                r#"unsafe extern "C" {{
+                    #[js(call = "JSON.parse", fallible)] fn parse() -> {result};
+                }}"#,
+            );
+            let error = descriptor("", &source).unwrap_err();
+            assert!(error.contains("Result<T, JsValue>"), "{error}");
+        }
+        let error = descriptor(
+            "",
+            r#"unsafe extern "C" {
+                #[js(index, fallible)] fn at(a: u32, b: u32) -> Result<u32, JsValue>;
+            }"#,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("call, construction, method or property"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn computed_shapes_take_a_key_and_methods_are_fixed_arity() {
+        assert_eq!(
+            descriptor(
+                "",
+                r#"unsafe extern "C" { #[js(has)] fn has(a: u32, key: &str) -> bool; }"#,
+            )
+            .unwrap(),
+            "rcgjs.ext.3.h-.-.0,0.",
+        );
+        for arity in 0..=2 {
+            let args = (0..arity)
+                .map(|n| format!(", a{n}: u32"))
+                .collect::<String>();
+            let source = format!(
+                r#"unsafe extern "C" {{
+                    #[js(computed_method)] fn call(receiver: u32, key: &str{args}) -> u32;
+                }}"#,
+            );
+            assert!(descriptor("", &source).is_ok(), "{source}");
+        }
+        let error = descriptor(
+            "",
+            r#"unsafe extern "C" {
+                #[js(computed_method)]
+                fn call(receiver: u32, key: &str, a: u32, b: u32, c: u32) -> u32;
+            }"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("at most two"), "{error}");
     }
 
     #[test]
     fn a_shape_that_needs_a_receiver_says_so_on_the_declaration() {
         for (attr, arity) in [("method", 0), ("get", 0), ("set", 1), ("index_set", 2)] {
             let params: Vec<String> = (0..arity).map(|n| format!("a{n}: u32")).collect();
-            let source =
-                format!(r#"unsafe extern "C" {{ #[js({attr})] fn f({}); }}"#, params.join(", "));
+            let source = format!(
+                r#"unsafe extern "C" {{ #[js({attr})] fn f({}); }}"#,
+                params.join(", ")
+            );
             let error = descriptor("", &source).unwrap_err();
             assert!(error.contains("at least"), "`{attr}` reported `{error}`");
         }
@@ -430,12 +827,14 @@ mod tests {
                 r#"unsafe extern "C" { #[js(get = "Chart.version")] fn v() -> u32; }"#,
             )
             .unwrap(),
-            "rcgjs.ext.2.g-.8,13.chart.jsChart.version",
+            "rcgjs.ext.3.g-.-.8,13.chart.jsChart.version",
         );
         // The same shape with no module needs the receiver it acts on.
-        let error =
-            descriptor("", r#"unsafe extern "C" { #[js(get = "data")] fn f() -> u32; }"#)
-                .unwrap_err();
+        let error = descriptor(
+            "",
+            r#"unsafe extern "C" { #[js(get = "data")] fn f() -> u32; }"#,
+        )
+        .unwrap_err();
         assert!(error.contains("at least 1"), "{error}");
     }
 
@@ -443,9 +842,12 @@ mod tests {
     fn an_index_takes_a_path_and_may_take_none() {
         // Straight off the receiver.
         assert_eq!(
-            descriptor("", r#"unsafe extern "C" { #[js(index)] fn at(a: u32, k: u32) -> u32; }"#)
-                .unwrap(),
-            "rcgjs.ext.2.i-.0,0.",
+            descriptor(
+                "",
+                r#"unsafe extern "C" { #[js(index)] fn at(a: u32, k: u32) -> u32; }"#
+            )
+            .unwrap(),
+            "rcgjs.ext.3.i-.-.0,0.",
         );
         // Or after a walk: `a.data.datasets[k]`, which is one declaration and three operations.
         assert_eq!(
@@ -454,7 +856,7 @@ mod tests {
                 r#"unsafe extern "C" { #[js(index = "data.datasets")] fn at(a: u32, k: u32) -> u32; }"#,
             )
             .unwrap(),
-            "rcgjs.ext.2.i-.0,13.data.datasets",
+            "rcgjs.ext.3.i-.-.0,13.data.datasets",
         );
     }
 
@@ -473,7 +875,9 @@ mod tests {
     fn a_declaration_without_a_shape_is_rejected() {
         let block: ItemForeignMod =
             syn::parse_str(r#"unsafe extern "C" { fn f(); }"#).expect("it parses");
-        let ForeignItem::Fn(function) = &block.items[0] else { panic!() };
+        let ForeignItem::Fn(function) = &block.items[0] else {
+            panic!()
+        };
         let error = marker("m.js", function).unwrap_err().to_string();
         assert!(error.contains("needs a `#[js(..)]`"), "{error}");
     }
@@ -486,7 +890,7 @@ mod tests {
                 r#"unsafe extern "C" { #[js(new, module = "")] fn EventSource(u: u32); }"#,
             )
             .unwrap(),
-            "rcgjs.ext.2.n-.0,11.EventSource",
+            "rcgjs.ext.3.n-.-.0,11.EventSource",
         );
     }
 
@@ -500,7 +904,7 @@ mod tests {
                 r#"unsafe extern "C" { #[js(global, get = "location.href")] fn href() -> u32; }"#,
             )
             .unwrap(),
-            "rcgjs.ext.2.gg.0,13.location.href",
+            "rcgjs.ext.3.gg.-.0,13.location.href",
         );
         // The same declaration without it needs the receiver it would have acted on.
         let error = descriptor(
@@ -520,7 +924,7 @@ mod tests {
                 r#"unsafe extern "C" { #[js(global, new = "EventSource")] fn source(u: &str) -> u32; }"#,
             )
             .unwrap(),
-            "rcgjs.ext.2.ng.0,11.EventSource",
+            "rcgjs.ext.3.ng.-.0,11.EventSource",
         );
         let error = descriptor(
             "",
@@ -534,14 +938,20 @@ mod tests {
     fn a_call_and_a_new_are_global_without_the_flag_because_they_have_no_receiver() {
         // Unchanged by the flag's arrival: these two never acted on an argument.
         assert_eq!(
-            descriptor("", r#"unsafe extern "C" { #[js(new)] fn EventSource(u: &str) -> u32; }"#)
-                .unwrap(),
-            "rcgjs.ext.2.n-.0,11.EventSource",
+            descriptor(
+                "",
+                r#"unsafe extern "C" { #[js(new)] fn EventSource(u: &str) -> u32; }"#
+            )
+            .unwrap(),
+            "rcgjs.ext.3.n-.-.0,11.EventSource",
         );
         assert_eq!(
-            descriptor("", r#"unsafe extern "C" { #[js(call = "Math.max")] fn max(a: u32) -> u32; }"#)
-                .unwrap(),
-            "rcgjs.ext.2.c-.0,8.Math.max",
+            descriptor(
+                "",
+                r#"unsafe extern "C" { #[js(call = "Math.max")] fn max(a: u32) -> u32; }"#
+            )
+            .unwrap(),
+            "rcgjs.ext.3.c-.-.0,8.Math.max",
         );
     }
 
@@ -564,11 +974,90 @@ mod tests {
                 #[js(new)] pub fn Chart(canvas: &str) -> u32; }"#,
         )
         .expect("it parses");
-        let ForeignItem::Fn(function) = &block.items[0] else { panic!() };
+        let ForeignItem::Fn(function) = &block.items[0] else {
+            panic!()
+        };
         let text = marker("chart.js", function).unwrap().to_string();
-        assert!(text.contains("pub fn Chart (canvas : & str) -> u32"), "{text}");
+        assert!(
+            text.contains("pub fn Chart (canvas : & str) -> u32"),
+            "{text}"
+        );
         assert!(text.contains("doc"), "{text}");
         assert!(text.contains("inline (never)"), "{text}");
         assert!(text.contains("target_arch = \"wasm32\""), "{text}");
+    }
+
+    #[test]
+    fn safe_bindings_reuse_the_foreign_descriptor_path() {
+        let bindings: Bindings = syn::parse_str(
+            r#"
+                #[js(call = "Math.max")]
+                pub fn max(a: f64, b: f64) -> f64;
+            "#,
+        )
+        .unwrap();
+        let text = expand_bindings(&bindings).unwrap().to_string();
+        assert!(
+            text.contains("pub fn max (a : f64 , b : f64) -> f64"),
+            "{text}"
+        );
+        assert!(text.contains("rcgjs.ext.3.c-.-.0,8.Math.max"), "{text}");
+    }
+
+    #[test]
+    fn safe_bindings_accept_a_module_header() {
+        let bindings: Bindings = syn::parse_str(
+            r#"
+                module = "chart.js";
+                #[js(new = "Chart")]
+                fn chart(canvas: JsValue) -> JsValue;
+            "#,
+        )
+        .unwrap();
+        let text = expand_bindings(&bindings).unwrap().to_string();
+        assert!(
+            text.contains("rcgjs.ext.3.n-.-.8,5.chart.jsChart"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_parameter_declares_what_the_host_does_with_it() {
+        let bindings: Bindings = syn::parse_str(
+            r#"
+                #[js(method = "write")]
+                fn write(
+                    sink: JsValue,
+                    #[js(reads, accepts(host_string, scalar))] text: &str,
+                    #[js(retains, mutates)] buffer: &mut [u8],
+                );
+            "#,
+        )
+        .unwrap();
+        let text = expand_bindings(&bindings).unwrap().to_string();
+        // Parameter 1 reads and takes a host string or a scalar; parameter 2 keeps what it writes
+        // through. Parameter 0 said nothing, so it is not written at all.
+        assert!(text.contains("rcgjs.ext.3.s-.1hcr,2mt.0,5.write"), "{text}");
+        // `#[js(..)]` is not an attribute rustc knows, so nothing of it survives the expansion.
+        assert!(!text.contains("# [js"), "{text}");
+        assert!(text.contains("text : & str"), "{text}");
+    }
+
+    #[test]
+    fn a_parameter_fact_that_names_nothing_is_refused() {
+        for (attr, why) in [
+            ("#[js(reeds)]", "not a parameter fact"),
+            ("#[js(host_string)]", "not a parameter fact"),
+            ("#[js(accepts(reads))]", "not a carrier"),
+            ("#[js(accepts(host_strings))]", "not a carrier"),
+            ("#[js()]", "says at least one thing"),
+            ("#[js(reads)] #[js(owns)]", "one `#[js(..)]`"),
+        ] {
+            let source = format!(
+                r#"unsafe extern "C" {{ #[js(method = "m")] fn f(a: u32, {attr} b: u32); }}"#
+            );
+            let error = descriptor("", &source).expect_err("it is refused");
+            assert!(error.contains(why), "`{attr}` reported `{error}`");
+        }
     }
 }

@@ -1,7 +1,5 @@
 # G2 checklist: the audited gate state
 
-> **Scope.** This gate record predates the compiler's extraction into its own repository. The `view!` lowering (`view-dom`), `dom-tests`, the demo app, the parity harness and the procedure wire it audits are the Topcoat integration and are not in this repository.
-
 > **This is the wave-5 AUDIT, dated 2026-07-30, and it is kept as written.** It is
 > not the current state and must not be read as one — its whole value is being a
 > snapshot someone can check a later claim against. The current state is

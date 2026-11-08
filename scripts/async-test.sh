@@ -22,22 +22,43 @@
 # HOW A FIXTURE IS COMPILED
 # -------------------------
 # `view-abi` and `view-async` are compiled by THIS backend into rlibs first, in that order, since
-# the second links the first. `js-extern-macro` is a proc macro and is built by plain cargo for
-# the host. The DOM module is written below: the executor imports `getOwner` and `runWithOwner` from
-# it, and `runWithOwner` is the one name a client DOM module owes beyond the client ABI's 48 plus
-# `createSignal` (it is exported by `solid-js` and not re-exported by `solid-js/web`).
+# the second links the first. `js-macro` is a proc macro and is built by plain cargo for the
+# host. The suite uses the vendored DOM runtime so owner cleanup and
+# re-entry execute in the same reactive graph as deployed applications.
 
 set -uo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd -- "$script_dir/.." && pwd)
+# shellcheck source=integration-lock.sh
+source "$script_dir/integration-lock.sh"
 
 fixture_dir="$root/examples/async-tests"
 build_dir="$root/build/asynctest"
 log_dir="$root/build/logs"
 
-DOM_MODULE="./mires-dom.js"
+DOM_MODULE="./topcoat-dom.js"
 ASYNC_ARGS="js-names=readable js-comments=on js-modules=esm js-dom-module=$DOM_MODULE"
+ASYNC_OPT_MODE=${ASYNC_OPT_MODE:-off}
+case "$ASYNC_OPT_MODE" in
+off) ;;
+report | on) ASYNC_ARGS="$ASYNC_ARGS js-opt=$ASYNC_OPT_MODE" ;;
+*)
+	echo "async-test.sh: ASYNC_OPT_MODE must be off, report, or on" >&2
+	exit 2
+	;;
+esac
+export ASYNC_OPT_MODE
+
+# The lane the caller asked for. `js-lane` is a link step decision and not emit-affecting, so
+# nothing here needs a sysroot of its own; only `jir` is honoured, since `shadow` writes two
+# programs and scripts/async-check.mjs drives one directory of them.
+case " ${JS_EXTRA_ARGS:-} " in
+*" js-lane=jir "*)
+	ASYNC_ARGS="$ASYNC_ARGS js-lane=jir"
+	echo "note: fixtures are compiled with js-lane=jir"
+	;;
+esac
 
 mkdir -p "$build_dir" "$log_dir"
 
@@ -51,9 +72,9 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
 	fi
 fi
 
-echo "==> building the proc macro for the host"
-if ! (cd "$root" && cargo build -p js-extern-macro) >"$log_dir/async-macro.log" 2>&1; then
-	echo "async-test.sh: could not build the proc macro" >&2
+echo "==> building the proc macros for the host"
+if ! (cd "$root" && cargo build -p js-macro -p js-extern-macro) >"$log_dir/async-macro.log" 2>&1; then
+	echo "async-test.sh: could not build the proc macros" >&2
 	cat "$log_dir/async-macro.log" >&2
 	exit 1
 fi
@@ -61,7 +82,17 @@ case "$(uname -s)" in
 Darwin) suffix=dylib ;;
 *) suffix=so ;;
 esac
+js_macro="$root/target/debug/libjs_macro.$suffix"
 extern_macro="$root/target/debug/libjs_extern_macro.$suffix"
+
+# A directory holding nothing but proc macros. `topcoat-dom` uses `js!{}`, so rustc has to
+# find that macro while loading `topcoat-dom`'s metadata, and it finds a transitive dependency by
+# filename on the search path rather than through `--extern`. The directory must hold no rlibs:
+# `target/debug` has HOST builds of `view-abi` in it, and rustc offers those for the target and
+# then reports the wrong triple.
+macro_dir="$build_dir/macros"
+mkdir -p "$macro_dir"
+cp "$js_macro" "$extern_macro" "$macro_dir/"
 
 # The DOM module specifier is emit affecting and the executor's own crate emits imports of it, so
 # the rlibs are built with the same arguments the fixtures are. `view-abi` has none of its own --
@@ -76,6 +107,34 @@ if ! JS_EXTRA_ARGS="$ASYNC_ARGS" "$script_dir/compile_core.sh" "$root/view-abi/s
 	exit 1
 fi
 
+echo "==> building topcoat-runtime-macro for the host"
+# The FRAMEWORK's own proc macro, out of the root workspace: fixture 06 drives the real
+# `#[procedure(serde)]` expansion rather than a copy of it.
+#
+# Built with the SPIKE's pinned nightly and into a target directory of its own. rustc loads a
+# proc-macro dylib into its own process, so one built by another compiler is refused with "extern
+# location is of an unknown type"; the root workspace is on stable, which is exactly that case.
+channel=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' \
+	"$root/rust-toolchain.toml" | head -n 1)
+: "${channel:=nightly}"
+#
+# `--features discover` is NOT optional here, and the reason is a defect rather than a preference:
+# with the feature off, the grammar's `registration` is `None`, `quote!` interpolates nothing for
+# it, and the `#[cfg(not(topcoat_client))]` written above it falls through onto the NEXT item --
+# which is the client half. The client function then carries both halves of the cfg and is stripped
+# whatever the flag says. See build/logs/wave5-backend-report.md; the fix is one line in
+# crates/topcoat-runtime/grammar/src/procedure.rs and is the framework's to make.
+if ! (cd "$root/../.." && cargo "+$channel" build -p topcoat-runtime-macro --features discover \
+	--target-dir "$root/build/hostmacro-discover") >"$log_dir/async-procedure-macro.log" 2>&1; then
+	echo "async-test.sh: could not build topcoat-runtime-macro" >&2
+	cat "$log_dir/async-procedure-macro.log" >&2
+	exit 1
+fi
+case "$(uname -s)" in
+Darwin) procedure_macro="$root/build/hostmacro-discover/debug/libtopcoat_runtime_macro.dylib" ;;
+*) procedure_macro="$root/build/hostmacro-discover/debug/libtopcoat_runtime_macro.so" ;;
+esac
+
 echo "==> building view-async through the backend"
 async_rlib="$build_dir/libview_async.rlib"
 if ! JS_EXTRA_ARGS="$ASYNC_ARGS" "$script_dir/compile_core.sh" "$root/view-async/src/lib.rs" "$async_rlib" \
@@ -86,6 +145,18 @@ if ! JS_EXTRA_ARGS="$ASYNC_ARGS" "$script_dir/compile_core.sh" "$root/view-async
 	exit 1
 fi
 
+echo "==> building topcoat-dom through the backend"
+dom_rlib="$build_dir/libtopcoat_dom.rlib"
+if ! JS_EXTRA_ARGS="$ASYNC_ARGS" "$script_dir/compile_core.sh" "$root/topcoat-dom/src/lib.rs" \
+	"$dom_rlib" --crate-type rlib --crate-name topcoat_dom \
+	--search "$build_dir" --search "$macro_dir" \
+	--extern view_abi="$abi_rlib" --extern view_async="$async_rlib" \
+	--extern js_macro="$js_macro" >"$log_dir/async-dom.log" 2>&1; then
+	echo "async-test.sh: could not build topcoat-dom as an rlib" >&2
+	cat "$log_dir/async-dom.log" >&2
+	exit 1
+fi
+
 # The run directory: a module package, the ES module shim, and the DOM module the executor's owner
 # markers import from.
 printf '{ "type": "module" }\n' >"$build_dir/package.json"
@@ -93,49 +164,7 @@ if ! node "$script_dir/make-esm-shim.mjs" "$build_dir/shim.js"; then
 	echo "async-test.sh: could not derive the ES module shim" >&2
 	exit 1
 fi
-cat >"$build_dir/mires-dom.js" <<'EOF'
-// The DOM runtime the executor's owner markers import from, for this suite's purposes.
-//
-// `getOwner` and `runWithOwner` are the whole surface an executor needs, and this is the smallest
-// implementation of the contract they are held to: the current owner is a module-level variable,
-// `runWithOwner` installs one for the duration of a synchronous call and restores whatever was
-// there in a `finally`. That is what solid's own does, minus the `Listener` it restores alongside,
-// which nothing here reads.
-//
-// The point of implementing rather than recording them is that the assertions are about the
-// executor: the fixtures ask whether a continuation ran under the owner the spawn captured, and a
-// stub that only recorded the calls could not answer.
-//
-// Written by scripts/async-test.sh.
-let current = null;
-
-export function getOwner() {
-  return current;
-}
-
-export function runWithOwner(owner, run) {
-  const previous = current;
-  current = owner;
-  try {
-    return run();
-  } finally {
-    current = previous;
-  }
-}
-
-// A signal is the `[read, write]` pair the value model keeps in a `Sig<T>` handle, so a fixture
-// that writes one from a continuation hands the driver something it can read.
-export function createSignal(initial) {
-  let value = initial;
-  return [
-    () => value,
-    (next) => {
-      value = typeof next === "function" ? next(value) : next;
-      return value;
-    }
-  ];
-}
-EOF
+cp "$root/runtime/dom/dist/topcoat-dom.js" "$build_dir/topcoat-dom.js"
 
 # ------------------------------------------------------------------- selection
 
@@ -167,10 +196,15 @@ for src in $sources; do
 
 	echo "==> $name"
 
-	if ! JS_EXTRA_ARGS="$ASYNC_ARGS" "$script_dir/compile_core.sh" "$src" "$out" \
-		--search "$build_dir" \
+	# Direct rustc fixtures have no Cargo package environment. Give the procedure
+	# macro a stable synthetic package identity without changing facade resolution.
+	if ! TOPCOAT_PROCEDURE_MANIFEST_DIR="$root" TOPCOAT_PROCEDURE_PKG_NAME="async-$name" \
+		JS_EXTRA_ARGS="$ASYNC_ARGS" "$script_dir/compile_core.sh" "$src" "$out" \
+		--cfg topcoat_client --search "$build_dir" --search "$macro_dir" \
 		--extern view_abi="$abi_rlib" --extern view_async="$async_rlib" \
+		--extern topcoat_dom="$dom_rlib" --extern js_macro="$js_macro" \
 		--extern js_extern_macro="$extern_macro" \
+		--extern topcoat_runtime_macro="$procedure_macro" \
 		>"$log_dir/async-$name.compile.log" 2>&1; then
 		echo "    compile failed:"
 		sed 's/^/    /' "$log_dir/async-$name.compile.log"

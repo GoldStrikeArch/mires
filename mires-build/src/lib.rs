@@ -1,6 +1,6 @@
 //! Compiles a client crate to JavaScript from a Cargo build script.
 //!
-//! This is a wrapper around the `rustc_codegen_mires` backend and the
+//! This is a wrapper around the `rustc_codegen_js` backend and the
 //! `scripts/compile_core.sh` script that drives it. A build script points it
 //! at one `.rs` file and gets a program, a source map, and the runtime shim in
 //! `$OUT_DIR`:
@@ -31,7 +31,8 @@
 //!
 //! [`Toolchain::preconditions`] is that list of steps, and
 //! [`Toolchain::apply`] performs one, so a tool outside a build script can set
-//! the checkout up without a second opinion about when it is ready.
+//! the checkout up without a second opinion about when it is ready. That is
+//! what `topcoat client setup` does.
 //!
 //! The `JS_EXTRA_ARGS` the sysroot was built with are recorded next to it. Any
 //! backend option that changes how items are spelled has to be the same on
@@ -55,18 +56,6 @@
 //!   `__rt.<name>(...)`. The page has to define `__rt`, which is what the published `shim.js` does
 //!   for the names it knows.
 //!
-//! # Macros
-//!
-//! The backend cannot run a proc macro, so a crate that uses one is compiled in
-//! two passes: plain rustc expands the macros and resolves the `--cfg` flags,
-//! and the backend compiles the expansion. [`BuildConfig::js_extern`] asks for
-//! the `#[js_extern]` macro this checkout owns, and [`BuildConfig::proc_macro`]
-//! names any other macro, built for the host by whoever owns it. A `no_std`
-//! crate the client links against, such as the template ABI, is compiled to an
-//! rlib by the same backend first with [`BuildConfig::rlib`] (or
-//! [`BuildConfig::view_abi`] for that one), so the expansion and the program
-//! agree about it.
-//!
 //! # Chunks
 //!
 //! A page with several islands does not have to load all of them out of one
@@ -76,17 +65,16 @@
 //! ```rust,no_run
 //! use mires_build::{BuildConfig, Chunking};
 //!
-//! let artifacts = BuildConfig::new("client/islands.rs")
+//! let artifacts = BuildConfig::new("client-island/island.rs")
 //!     .output_name("islands.js")
-//!     .js_extern(true)
-//!     .view_abi(true)
+//!     .views(true)
 //!     .crate_arg("js-modules=esm")
 //!     .chunks(
 //!         Chunking::new()
 //!             .island("counter")
 //!             .island("search")
 //!             .url_base("/demo/chunks/")
-//!             .import("mires-dom", "/demo/mires-dom.js"),
+//!             .import("topcoat-dom", "/demo/topcoat-dom.js"),
 //!     )
 //!     .render()
 //!     .unwrap();
@@ -136,7 +124,6 @@ mod config;
 mod error;
 mod pinned;
 mod preconditions;
-mod proc_macro;
 mod rerun;
 mod shimcheck;
 mod toolchain;
@@ -146,7 +133,7 @@ pub use config::*;
 pub use error::*;
 pub use pinned::*;
 pub use preconditions::*;
-pub use proc_macro::*;
+pub use rcgjs_object::artifact::EntryRole;
 pub use rerun::*;
 pub use shimcheck::*;
 pub use toolchain::*;

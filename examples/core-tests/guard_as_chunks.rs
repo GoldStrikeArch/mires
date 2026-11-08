@@ -11,8 +11,8 @@
 //! printed first appears, the chunking then aborts the program, and `guard_as_chunks.expect_abort`
 //! requires the non-zero exit. The neighbouring guards — dereferencing a byte view, `__rt.unscale`
 //! on a misaligned offset, a `copy` between two pointers whose scales disagree — are the same
-//! shape and are listed in `CONTRACT.md`; `align_to`, which is how `memchr` reads a haystack a
-//! `usize` at a time, is the one a program is most likely to reach by accident.
+//! shape and are listed in `CONTRACT.md`; `align_to`, which is how reverse `memrchr` reads a
+//! haystack a `usize` at a time, is the one a program is most likely to reach by accident.
 //!
 //! If a later round makes `as_chunks` work, this test starts failing by *succeeding*. Replace it
 //! with the ordinary expectation then.

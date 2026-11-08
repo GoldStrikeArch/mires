@@ -43,7 +43,10 @@ pub(crate) enum ConstVal {
     /// A struct: its fields in declaration order, under the names the Rust source gives them.
     Struct(Vec<(String, ConstVal)>),
     /// One variant of an enum, by name, with its fields.
-    Enum { variant: String, fields: Vec<(String, ConstVal)> },
+    Enum {
+        variant: String,
+        fields: Vec<(String, ConstVal)>,
+    },
     /// The unit value, and the value of any other zero sized type.
     Unit,
 }
@@ -77,9 +80,15 @@ impl ConstVal {
         let value = match self {
             ConstVal::Uint(value) => *value,
             ConstVal::Int(value) if *value >= 0 => *value as u128,
-            other => return Err(format!("`{what}` is {}, not an unsigned integer", other.kind())),
+            other => {
+                return Err(format!(
+                    "`{what}` is {}, not an unsigned integer",
+                    other.kind()
+                ));
+            }
         };
-        u32::try_from(value).map_err(|_| format!("`{what}` is `{value}`, which does not fit a `u32`"))
+        u32::try_from(value)
+            .map_err(|_| format!("`{what}` is `{value}`, which does not fit a `u32`"))
     }
 
     /// This value as a string.
@@ -104,7 +113,10 @@ impl ConstVal {
             ConstVal::Struct(fields) => fields,
             ConstVal::Enum { fields, .. } => fields,
             other => {
-                return Err(format!("`{name}` was looked up in {}, which has no fields", other.kind()));
+                return Err(format!(
+                    "`{name}` was looked up in {}, which has no fields",
+                    other.kind()
+                ));
             }
         };
         fields
@@ -130,7 +142,8 @@ impl ConstVal {
 /// Returns a message naming what could not be read: an initializer that does not const evaluate,
 /// or a value whose type this reader does not decode.
 pub(crate) fn read_static<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Result<ConstVal, String> {
-    let ty = tcx.normalize_erasing_regions(typing_env(), tcx.type_of(def_id).instantiate_identity());
+    let ty =
+        tcx.normalize_erasing_regions(typing_env(), tcx.type_of(def_id).instantiate_identity());
     let alloc = tcx
         .eval_static_initializer(def_id)
         .map_err(|_| "its initializer does not const evaluate".to_string())?;
@@ -161,21 +174,23 @@ fn read_alloc<'tcx>(
     };
 
     match ty.kind() {
-        ty::Bool => Ok(ConstVal::Bool(scalar(layout.size)?.to_uint(layout.size) != 0)),
+        ty::Bool => Ok(ConstVal::Bool(
+            scalar(layout.size)?.to_uint(layout.size) != 0,
+        )),
         ty::Char => Ok(ConstVal::Uint(scalar(layout.size)?.to_uint(layout.size))),
         ty::Uint(_) => Ok(ConstVal::Uint(scalar(layout.size)?.to_uint(layout.size))),
         ty::Int(_) => Ok(ConstVal::Int(scalar(layout.size)?.to_int(layout.size))),
-        ty::Float(ty::FloatTy::F32) => {
-            Ok(ConstVal::Float(f32::from_bits(scalar(layout.size)?.to_uint(layout.size) as u32).into()))
-        }
-        ty::Float(ty::FloatTy::F64) => {
-            Ok(ConstVal::Float(f64::from_bits(scalar(layout.size)?.to_uint(layout.size) as u64)))
-        }
+        ty::Float(ty::FloatTy::F32) => Ok(ConstVal::Float(
+            f32::from_bits(scalar(layout.size)?.to_uint(layout.size) as u32).into(),
+        )),
+        ty::Float(ty::FloatTy::F64) => Ok(ConstVal::Float(f64::from_bits(
+            scalar(layout.size)?.to_uint(layout.size) as u64,
+        ))),
         // A pattern only restricts which values inhabit the type; the bytes are the base type's.
         ty::Pat(base, _) => read_alloc(tcx, alloc, offset, *base),
         ty::Adt(def, args) if def.is_enum() => {
-            let index = raw::variant_index(tcx, alloc, offset, layout, *def).map_err(|err| {
-                match err {
+            let index =
+                raw::variant_index(tcx, alloc, offset, layout, *def).map_err(|err| match err {
                     raw::TagError::Uninhabited => format!("`{ty}` is uninhabited"),
                     raw::TagError::Unreadable => {
                         format!("the discriminant of `{ty}` could not be read")
@@ -183,8 +198,7 @@ fn read_alloc<'tcx>(
                     raw::TagError::NoSuchVariant(bits) => {
                         format!("`{ty}` has the discriminant `{bits}`, which names no variant")
                     }
-                }
-            })?;
+                })?;
             let variant = value::variant_def(*def, Some(index));
             let variant_layout = layout.for_variant(
                 &rustc_middle::ty::layout::LayoutCx::new(tcx, typing_env()),
@@ -199,7 +213,10 @@ fn read_alloc<'tcx>(
                     read_alloc(tcx, alloc, at, field_ty)?,
                 ));
             }
-            Ok(ConstVal::Enum { variant: variant.name.to_string(), fields })
+            Ok(ConstVal::Enum {
+                variant: variant.name.to_string(),
+                fields,
+            })
         }
         ty::Adt(def, args) if def.is_struct() => {
             let variant = def.non_enum_variant();
@@ -233,7 +250,9 @@ fn read_alloc<'tcx>(
             Ok(ConstVal::Seq(elements))
         }
         ty::Ref(..) => read_reference(tcx, alloc, offset, ty),
-        _ => Err(format!("a value of type `{ty}` cannot be read out of a constant")),
+        _ => Err(format!(
+            "a value of type `{ty}` cannot be read out of a constant"
+        )),
     }
 }
 
@@ -308,7 +327,10 @@ mod tests {
             ("path".to_owned(), ConstVal::Str("cn".to_owned())),
             (
                 "kind".to_owned(),
-                ConstVal::Enum { variant: "Attribute".to_owned(), fields: Vec::new() },
+                ConstVal::Enum {
+                    variant: "Attribute".to_owned(),
+                    fields: Vec::new(),
+                },
             ),
             ("name".to_owned(), ConstVal::Str("href".to_owned())),
             ("reactive".to_owned(), ConstVal::Bool(true)),
@@ -322,8 +344,17 @@ mod tests {
         assert_eq!(hole.field("path").unwrap().as_str("path").unwrap(), "cn");
         assert_eq!(hole.field("name").unwrap().as_str("name").unwrap(), "href");
         assert!(hole.field("reactive").unwrap().as_bool("reactive").unwrap());
-        assert_eq!(hole.field("effect_group").unwrap().as_u32("effect_group").unwrap(), 3);
-        assert_eq!(hole.field("kind").unwrap().variant("kind").unwrap(), "Attribute");
+        assert_eq!(
+            hole.field("effect_group")
+                .unwrap()
+                .as_u32("effect_group")
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            hole.field("kind").unwrap().variant("kind").unwrap(),
+            "Attribute"
+        );
     }
 
     #[test]
@@ -334,10 +365,16 @@ mod tests {
             "`path` is a string, not an unsigned integer"
         );
         assert_eq!(
-            hole.field("reactive").unwrap().as_str("reactive").unwrap_err(),
+            hole.field("reactive")
+                .unwrap()
+                .as_str("reactive")
+                .unwrap_err(),
             "`reactive` is a `bool`, not a string"
         );
-        assert_eq!(hole.field("missing").unwrap_err(), "there is no field `missing`");
+        assert_eq!(
+            hole.field("missing").unwrap_err(),
+            "there is no field `missing`"
+        );
         assert_eq!(
             ConstVal::Unit.field("path").unwrap_err(),
             "`path` was looked up in the unit value, which has no fields"
@@ -352,7 +389,10 @@ mod tests {
             "`effect_group` is `4294967296`, which does not fit a `u32`"
         );
         // `u32::MAX` itself is `NO_EFFECT_GROUP`, and must read back rather than being rejected.
-        assert_eq!(ConstVal::Uint(u128::from(u32::MAX)).as_u32("g").unwrap(), u32::MAX);
+        assert_eq!(
+            ConstVal::Uint(u128::from(u32::MAX)).as_u32("g").unwrap(),
+            u32::MAX
+        );
         // A signed literal that happens to be non-negative is still a `u32`; a negative one is not.
         assert_eq!(ConstVal::Int(7).as_u32("g").unwrap(), 7);
         assert!(ConstVal::Int(-1).as_u32("g").is_err());

@@ -1,0 +1,39 @@
+rustc_codegen_js: compare char candidates by scalar prefix bytes.
+
+CharSearcher has already found the final UTF-8 byte of its encoded needle and
+the candidate view is at most four bytes long. Match that checked view by its
+exact one-to-four-byte shape and compare only the preceding bytes. This keeps
+the implementation safe while avoiding a generic slice-equality operation for
+the fixed-size character needle.
+
+--- a/library/core/src/str/pattern.rs
++++ b/library/core/src/str/pattern.rs
+@@ -466,9 +466,24 @@ unsafe impl<'a> Searcher<'a> for CharSearcher<'a> {
+                 self.finger += index + 1;
+                 if self.finger >= self.utf8_size() {
+                     let found_char = self.finger - self.utf8_size();
+-                    if let Some(slice) = self.haystack.as_bytes().get(found_char..self.finger) {
+-                        if self.utf8_encoded.get(..self.utf8_size()) == Some(slice) {
+-                            return Some((found_char, self.finger));
+-                        }
++                    let matched = match self
++                        .haystack
++                        .as_bytes()
++                        .get(found_char..self.finger)
++                    {
++                        Some([_]) => true,
++                        Some([a, _]) => *a == self.utf8_encoded[0],
++                        Some([a, b, _]) => {
++                            *a == self.utf8_encoded[0] && *b == self.utf8_encoded[1]
++                        }
++                        Some([a, b, c, _]) => {
++                            *a == self.utf8_encoded[0]
++                                && *b == self.utf8_encoded[1]
++                                && *c == self.utf8_encoded[2]
++                        }
++                        _ => false,
++                    };
++                    if matched {
++                        return Some((found_char, self.finger));
+                     }
+                 }

@@ -5,8 +5,8 @@
 //! reachability pass in `link.rs` depends on a handful of invariants that only hold if names are
 //! produced in exactly one place:
 //!
-//! * an item name never starts with `$` — that namespace belongs to compiler temporaries
-//!   (`$v`, `$t0`, `$sel`), so a temporary can never be mistaken for a reference to an item;
+//! * an item name never starts with `$` — that namespace belongs to compiler temporaries (`$v`,
+//!   `$t0`, `$sel`), so a temporary can never be mistaken for a reference to an item;
 //! * an item name never matches `^_[0-9]` — that is the shape of a MIR local (`_0`, `_1`);
 //! * an item name is never `bb` — the trampoline's block variable;
 //! * an item name is always a plain JavaScript identifier, never a reserved word.
@@ -17,10 +17,11 @@
 //! # Readable names
 //!
 //! The default ([`NameStyle::Readable`]) is a sanitized `def_path_str` plus `$h` and 16 hex digits
-//! of a hash of the item's crate-independent identity ([`Namer::hash_key`]). The hash is not a collision *repair* — it is
-//! unconditional, so a name depends on nothing but the item itself. A per-codegen-unit
-//! disambiguation table would make the same item come out differently depending on what else
-//! landed in its unit, which would break reproducible builds and cross-crate linking alike.
+//! of a hash of the item's crate-independent identity ([`Namer::hash_key`]). The hash is not a
+//! collision *repair* — it is unconditional, so a name depends on nothing but the item itself. A
+//! per-codegen-unit disambiguation table would make the same item come out differently depending on
+//! what else landed in its unit, which would break reproducible builds and cross-crate linking
+//! alike.
 //!
 //! `#[no_mangle]` and `#[export_name]` items keep their exact name: `scripts/entry.js` calls
 //! `rust_entry()`, and the demo's button calls `counter_clicked(n)`. So do
@@ -68,7 +69,9 @@ pub(crate) const STRING_PREFIX: &str = "s";
 /// segment before the hash, so its readable half can never be just `loc` or `s`. That is what lets
 /// `queue.rs` treat a read of one as a constant on the strength of its spelling alone.
 pub(crate) fn is_hoisted_const(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix(LOCATION_PREFIX).or_else(|| name.strip_prefix(STRING_PREFIX))
+    let Some(rest) = name
+        .strip_prefix(LOCATION_PREFIX)
+        .or_else(|| name.strip_prefix(STRING_PREFIX))
     else {
         return false;
     };
@@ -97,7 +100,10 @@ impl<'tcx> Namer<'tcx> {
         }
         match self.style {
             NameStyle::Mangled => {
-                debug_assert!(jsast::is_plain_ident(symbol), "`{symbol}` is not a JS identifier");
+                debug_assert!(
+                    jsast::is_plain_ident(symbol),
+                    "`{symbol}` is not a JS identifier"
+                );
                 JsName::new(symbol.to_owned())
             }
             NameStyle::Readable => {
@@ -157,7 +163,10 @@ impl<'tcx> Namer<'tcx> {
         let (path, key) = match trait_ref {
             Some(trait_ref) => {
                 let trait_ = self.stable_trait(trait_ref);
-                (format!("vtable::{ty}::{trait_}"), format!("vtable\u{1}{ty}\u{1}{trait_}"))
+                (
+                    format!("vtable::{ty}::{trait_}"),
+                    format!("vtable\u{1}{ty}\u{1}{trait_}"),
+                )
             }
             None => (format!("vtable::{ty}"), format!("vtable\u{1}{ty}")),
         };
@@ -186,7 +195,11 @@ impl<'tcx> Namer<'tcx> {
                 .filter_map(|arg| arg.as_type())
                 .map(|arg| self.stable_ty(arg))
                 .collect();
-            if tys.is_empty() { String::new() } else { format!("<{}>", tys.join(",")) }
+            if tys.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", tys.join(","))
+            }
         };
         match ty.kind() {
             ty::Adt(def, generics) => format!("{}{}", self.stem(def.did()), args(generics)),
@@ -213,8 +226,10 @@ impl<'tcx> Namer<'tcx> {
             ty::Array(element, _) => format!("[{};N]", self.stable_ty(*element)),
             ty::Pat(base, _) => self.stable_ty(*base),
             ty::Tuple(elements) => {
-                let parts: Vec<String> =
-                    elements.iter().map(|element| self.stable_ty(element)).collect();
+                let parts: Vec<String> = elements
+                    .iter()
+                    .map(|element| self.stable_ty(element))
+                    .collect();
                 format!("({})", parts.join(","))
             }
             ty::Dynamic(predicates, ..) => match predicates.principal() {
@@ -235,7 +250,11 @@ impl<'tcx> Namer<'tcx> {
             .map(|arg| self.stable_ty(arg))
             .collect();
         let stem = self.stem(trait_ref.def_id);
-        if generics.is_empty() { stem } else { format!("{stem}<{}>", generics.join(",")) }
+        if generics.is_empty() {
+            stem
+        } else {
+            format!("{stem}<{}>", generics.join(","))
+        }
     }
 
     /// The name of a synthetic item that has no `DefId` and no type to describe it.
@@ -313,8 +332,10 @@ impl<'tcx> Namer<'tcx> {
 
     /// Whether the item carries `#[rustc_std_internal_symbol]`.
     fn is_std_internal_symbol(&self, def_id: DefId) -> bool {
-        if !matches!(self.tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn | DefKind::Static { .. })
-        {
+        if !matches!(
+            self.tcx.def_kind(def_id),
+            DefKind::Fn | DefKind::AssocFn | DefKind::Static { .. }
+        ) {
             return false;
         }
         self.tcx
@@ -351,7 +372,7 @@ impl<'tcx> Namer<'tcx> {
                 self.tcx.def_span(def_id),
                 format!(
                     "`{symbol}` is not a valid JavaScript identifier, so it cannot be used as an \
-                     exported name by rustc_codegen_mires"
+                     exported name by rustc_codegen_js"
                 ),
             );
             return Some(JsName::new(jsast::sanitize_ident(symbol)));
@@ -364,7 +385,10 @@ impl<'tcx> Namer<'tcx> {
         match self.style {
             NameStyle::Mangled => {
                 // v0 and legacy symbols are already plain identifiers, and already unique.
-                debug_assert!(jsast::is_plain_ident(symbol), "`{symbol}` is not a JS identifier");
+                debug_assert!(
+                    jsast::is_plain_ident(symbol),
+                    "`{symbol}` is not a JS identifier"
+                );
                 JsName::new(symbol.to_owned())
             }
             NameStyle::Readable => JsName::new(readable(&self.stem(def_id), symbol)),
@@ -425,9 +449,18 @@ fn readable(path: &str, key: &str) -> String {
     out.push_str(HASH_SEP);
     out.push_str(&format!("{:0width$x}", hash64(key), width = HASH_DIGITS));
 
-    debug_assert!(jsast::is_plain_ident(&out), "`{out}` is not a JavaScript identifier");
-    debug_assert!(!out.starts_with(PATH_SEP), "`{out}` invades the temporary namespace");
-    debug_assert!(out != "bb", "`{out}` collides with the trampoline block variable");
+    debug_assert!(
+        jsast::is_plain_ident(&out),
+        "`{out}` is not a JavaScript identifier"
+    );
+    debug_assert!(
+        !out.starts_with(PATH_SEP),
+        "`{out}` invades the temporary namespace"
+    );
+    debug_assert!(
+        out != "bb",
+        "`{out}` collides with the trampoline block variable"
+    );
     debug_assert!(
         !(out.starts_with('_') && out[1..].starts_with(|c: char| c.is_ascii_digit())),
         "`{out}` looks like a MIR local"
@@ -490,13 +523,18 @@ mod tests {
             assert!(jsast::is_plain_ident(&name), "{path} -> {name}");
             assert!(!name.starts_with('$'), "{path} -> {name}");
             assert_ne!(name, "bb");
-            assert!(!(name.starts_with('_') && name[1..].starts_with(|c: char| c.is_ascii_digit())));
+            assert!(
+                !(name.starts_with('_') && name[1..].starts_with(|c: char| c.is_ascii_digit()))
+            );
         }
     }
 
     #[test]
     fn hoisted_constants_are_told_apart_from_derived_names() {
-        assert!(is_hoisted_const(&readable(LOCATION_PREFIX, "loc\u{1}a.rs\u{1}1\u{1}2")));
+        assert!(is_hoisted_const(&readable(
+            LOCATION_PREFIX,
+            "loc\u{1}a.rs\u{1}1\u{1}2"
+        )));
         assert!(is_hoisted_const(&readable(STRING_PREFIX, "some string")));
         // A derived name always carries a path segment after the crate name, so neither the
         // shortest plausible collision nor a truncated hash passes.

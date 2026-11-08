@@ -80,7 +80,12 @@ impl Order {
             p.dedup();
         }
 
-        Ok(Order { succs, preds, rpo, order })
+        Ok(Order {
+            succs,
+            preds,
+            rpo,
+            order,
+        })
     }
 
     /// Position in reverse post order.
@@ -109,7 +114,9 @@ impl Order {
 
     /// The block is entered by a back edge, so it heads a loop.
     pub(crate) fn is_loop_header(&self, b: BlockId) -> bool {
-        self.preds[b.index()].iter().any(|&p| self.is_backward(p, b))
+        self.preds[b.index()]
+            .iter()
+            .any(|&p| self.is_backward(p, b))
     }
 
     /// At least two forward edges move into the block, so control joins here.

@@ -24,6 +24,8 @@
 //! the argument types it needs to emit.
 
 #![no_std]
+// The string-sink `extern "C"` block below is the crate's one FFI seam.
+#![allow(unsafe_code)]
 
 /// The version the backend checks before trusting the rest of the payload.
 ///
@@ -34,8 +36,12 @@
 /// 5 added the four executor markers ([`microtask`], [`on_settled`], [`owner`] and
 /// [`with_owner`]) and the [`JsValue`] and [`Owner`] handles. Version 6 added
 /// [`TemplateData::is_import_node`] and [`TemplateData::is_svg`], the two
-/// template-construction flags `_$template` takes after the HTML.
-pub const ABI_VERSION: u32 = 6;
+/// template-construction flags `_$template` takes after the HTML. Version 7 adds
+/// the versioned [`keyed_list_v1`] semantic boundary. Version 8 adds [`Selector`]
+/// and the [`selector`] keyed fan-out marker. The transitional `keyed-v2` macro
+/// feature emits [`keyed_list_v1`]; default macro output remains compatible with
+/// the legacy [`push_keyed`] lane.
+pub const ABI_VERSION: u32 = 8;
 
 /// The [`Hole::effect_group`] of a hole that no shared effect drives.
 pub const NO_EFFECT_GROUP: u32 = u32::MAX;
@@ -130,16 +136,14 @@ pub enum HoleKind {
 /// Two properties of the declaration are load bearing, and both are about what a
 /// value of it survives as on the way through MIR.
 ///
-/// * **One machine word rather than zero-sized**, exactly as on [`Sig`]. MIR folds a
-///   zero-sized return to a constant, so every function returning a template root
-///   would return `undefined` and every branch of a conditional would contribute
-///   nothing.
-/// * **`repr(transparent)`**, so the handle *is* the field. An ordinary one-field
-///   struct is an object keyed by field name in the backend's value model, and a
-///   value copied out of one is rebuilt field by field: a template root passed
-///   through a `Node` would come back as `{ handle: undefined }`. Transparent makes
-///   both the field read and the rebuild the identity, which is what lets the
-///   backend keep the DOM node itself in the handle.
+/// * **One machine word rather than zero-sized**, exactly as on [`Sig`]. MIR folds a zero-sized
+///   return to a constant, so every function returning a template root would return `undefined` and
+///   every branch of a conditional would contribute nothing.
+/// * **`repr(transparent)`**, so the handle *is* the field. An ordinary one-field struct is an
+///   object keyed by field name in the backend's value model, and a value copied out of one is
+///   rebuilt field by field: a template root passed through a `Node` would come back as `{ handle:
+///   undefined }`. Transparent makes both the field read and the rebuild the identity, which is
+///   what lets the backend keep the DOM node itself in the handle.
 #[repr(transparent)]
 pub struct Node {
     /// Never read by Rust code; see the type docs.
@@ -193,7 +197,7 @@ impl Event {
 #[inline(never)]
 pub fn event_target_value(event: &Event) -> &'static str {
     let _ = event;
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Backs [`Event::prevent_default`]. Takes the event by reference, as
@@ -202,7 +206,7 @@ pub fn event_target_value(event: &Event) -> &'static str {
 #[inline(never)]
 pub fn event_prevent_default(event: &Event) {
     let _ = event;
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// A signal declared by `signal name = init;` in a view body.
@@ -211,15 +215,14 @@ pub fn event_prevent_default(event: &Event) {
 /// Only the backend gives it meaning. Both properties of the declaration are load
 /// bearing, for the same reasons they are on [`Node`].
 ///
-/// * **One machine word rather than zero-sized**: a zero-sized value has no
-///   JavaScript representation, so the `[get, set]` pair the backend stores in it
-///   would be dropped on the floor.
-/// * **`repr(transparent)`**, so the handle *is* the field. In the backend's value
-///   model an ordinary struct is an object keyed by field name, and a value copied
-///   out of one is rebuilt field by field: a signal passed by value -- into a
-///   component's props struct, or captured by a `move` closure -- would come back as
-///   `{ handle: undefined, marker: undefined }`, and reading it would call
-///   `undefined`. Transparent makes both the field read and the rebuild the identity,
+/// * **One machine word rather than zero-sized**: a zero-sized value has no JavaScript
+///   representation, so the `[get, set]` pair the backend stores in it would be dropped on the
+///   floor.
+/// * **`repr(transparent)`**, so the handle *is* the field. In the backend's value model an
+///   ordinary struct is an object keyed by field name, and a value copied out of one is rebuilt
+///   field by field: a signal passed by value -- into a component's props struct, or captured by a
+///   `move` closure -- would come back as `{ handle: undefined, marker: undefined }`, and reading
+///   it would call `undefined`. Transparent makes both the field read and the rebuild the identity,
 ///   which is what lets the backend keep the `[get, set]` pair in the handle.
 #[repr(transparent)]
 pub struct Sig<T> {
@@ -257,6 +260,38 @@ impl<T> Clone for Sig<T> {
 
 impl<T> Copy for Sig<T> {}
 
+/// A keyed predicate derived from a [`Sig`].
+///
+/// Calling [`Selector::is`] inside a reactive row subscribes that row only to the
+/// queried key. Changing the source signal therefore wakes the previously selected
+/// key and the newly selected key, rather than every row that shares the signal.
+///
+/// Like [`Sig`], this is a transparent one-word handle whose value exists only in
+/// compiler output.
+#[repr(transparent)]
+pub struct Selector<T> {
+    /// Never read by Rust code; the backend stores the host selector here.
+    #[allow(dead_code)]
+    handle: u32,
+    marker: core::marker::PhantomData<T>,
+}
+
+impl<T> Selector<T> {
+    /// Whether `value` is the source signal's current key.
+    #[must_use]
+    pub fn is(self, value: T) -> bool {
+        selector_is(self, value)
+    }
+}
+
+impl<T> Clone for Selector<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Selector<T> {}
+
 /// Instantiates a template: clone, walk, return the root.
 ///
 /// Never runs. The backend intercepts the call by its `link_section` and replaces it
@@ -266,7 +301,7 @@ impl<T> Copy for Sig<T> {}
 #[inline(never)]
 pub fn template(data: &'static TemplateData) -> Node {
     let _ = data;
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Fills hole `index` of an instantiated template with a value, once.
@@ -274,7 +309,7 @@ pub fn template(data: &'static TemplateData) -> Node {
 #[inline(never)]
 pub fn hole<V>(root: &Node, index: u32, value: V) {
     let _ = (root, index, value);
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Fills hole `index` with an event handler: the backend emits a delegated property
@@ -297,7 +332,7 @@ where
     // one. Nothing ever runs: the backend intercepts every call to this marker.
     let _ = (root, index);
     let _ = f(&Event(()));
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Fills hole `index` reactively: the backend wraps the closure in `_$effect`.
@@ -316,7 +351,7 @@ where
     // it. The backend intercepts every call to this marker, so nothing ever runs.
     let _ = (root, index);
     let _ = f();
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Fills hole `index` with a client component call: the backend emits
@@ -343,7 +378,7 @@ where
     // Called for the mono collector's sake, as on `effect`. Nothing ever runs.
     let _ = (root, index);
     let _ = f();
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// The text a hole's value renders as.
@@ -352,12 +387,11 @@ where
 /// rather than whatever the value's JavaScript representation happens to be. The
 /// backend sees the monomorphized `T` and lowers this one of two ways.
 ///
-/// * A **known primitive** `T` is converted in place, and a `T` that is already a
-///   JavaScript string is the identity. This is what retires writing `(*title)` in a
-///   view to get at a `&&str`: the deref is the conversion, and the emitter does it.
-/// * **Anything else** goes through `T`'s own [`Display`], written into the host
-///   string builder by [`display_to_str`], whose instance this body names so the
-///   collector walks into it.
+/// * A **known primitive** `T` is converted in place, and a `T` that is already a JavaScript string
+///   is the identity. This is what retires writing `(*title)` in a view to get at a `&&str`: the
+///   deref is the conversion, and the emitter does it.
+/// * **Anything else** goes through `T`'s own [`Display`], written into the host string builder by
+///   [`display_to_str`], whose instance this body names so the collector walks into it.
 ///
 /// [`Display`]: core::fmt::Display
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.tc.text")]
@@ -367,7 +401,7 @@ pub fn text<T: core::fmt::Display>(v: T) -> Node {
     // its closure's call. The backend intercepts every call to this marker, so nothing
     // ever runs.
     let _ = display_to_str(v);
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 // The host string builder the backend's shim keeps, described in `CONTRACT.md` under
@@ -432,7 +466,7 @@ pub fn display_to_str<T: core::fmt::Display>(v: T) -> &'static str {
 #[inline(never)]
 pub fn content<V>(value: V) -> Node {
     let _ = value;
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// A conditional in a node position, with its test handed over separately.
@@ -460,7 +494,7 @@ where
 {
     // Called for the mono collector's sake, as on `effect`. Nothing ever runs.
     let _ = (test(), then(), els());
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Starts the list of rows a `for` in a node position renders into.
@@ -478,7 +512,42 @@ where
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.tc.list")]
 #[inline(never)]
 pub fn list() -> Node {
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
+}
+
+/// Declares one transactional keyed list to the v2 compiler.
+///
+/// Unlike [`push_keyed`], this boundary hands the collection producer, typed key
+/// extractor, and row factory to the compiler together. That gives the linker a
+/// place to validate key purity and representation, create an instance-scoped row
+/// owner, and avoid calling `row` for retained keys.
+///
+/// This is the version-one typing shell, not a stable application API. The
+/// transitional `keyed-v2` macro feature emits it. The initial JIR lane accepts
+/// copyable items from native arrays, shared arrays or slices, and canonical
+/// global-allocator `Vec` values. Bounded and host-backed iterators can use the
+/// same lane after ordinary Rust materialization into `Vec`; the baseline lane
+/// still declines the marker.
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.tc.keyedlist.v1")]
+#[inline(never)]
+pub fn keyed_list_v1<C, I, K, Collection, Key, Row>(
+    collection: Collection,
+    key: Key,
+    row: Row,
+) -> Node
+where
+    C: IntoIterator<Item = I>,
+    I: Copy,
+    Collection: Fn() -> C,
+    Key: Fn(I) -> K,
+    Row: Fn(I, usize) -> Node,
+{
+    // Calls are present for the monomorphization collector. The backend
+    // intercepts the marker, so the body never executes.
+    if let Some(item) = collection().into_iter().next() {
+        let _ = (key(item), row(item, 0));
+    }
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Appends one row to a [`list`].
@@ -486,7 +555,7 @@ pub fn list() -> Node {
 #[inline(never)]
 pub fn push(list: &Node, row: Node) {
     let _ = (list, row);
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Appends one row to a [`list`], matched to the row of the same key from the previous
@@ -512,7 +581,7 @@ pub fn push_keyed<K: core::fmt::Display>(list: &Node, key: K, row: Node) {
     // `display_to_str` is named for the collector's sake, exactly as in `text`: a key
     // the backend has no conversion for is formatted by this at run time.
     let _ = (list, display_to_str(key), row);
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Declares the signal numbered `ordinal` within its view, seeded with `init`.
@@ -523,7 +592,26 @@ pub fn push_keyed<K: core::fmt::Display>(list: &Node, key: K, row: Node) {
 #[inline(never)]
 pub fn signal<T>(ordinal: u32, init: T) -> Sig<T> {
     let _ = (ordinal, init);
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
+}
+
+/// Derives a keyed predicate from `source`.
+///
+/// The v2 lowering maps this marker to the reactive runtime's selector primitive.
+/// The selected type must use the same exact scalar domain as a keyed-list key.
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.tc.selector")]
+#[inline(never)]
+pub fn selector<T>(source: Sig<T>) -> Selector<T> {
+    let _ = source;
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
+}
+
+/// Backs [`Selector::is`].
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.tc.selis")]
+#[inline(never)]
+pub fn selector_is<T>(selector: Selector<T>, value: T) -> bool {
+    let _ = (selector, value);
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Backs [`Sig::get`]. A free function because a `link_section` belongs to an item,
@@ -539,7 +627,7 @@ pub fn signal<T>(ordinal: u32, init: T) -> Sig<T> {
 #[inline(never)]
 pub fn sig_get<T>(sig: Sig<T>) -> T {
     let _ = sig;
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Backs [`Sig::set`]. Takes the handle by value, for the reason [`sig_get`] gives.
@@ -547,7 +635,7 @@ pub fn sig_get<T>(sig: Sig<T>) -> T {
 #[inline(never)]
 pub fn sig_set<T>(sig: Sig<T>, value: T) {
     let _ = (sig, value);
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 // -------------------------------------------------------------------------------
@@ -616,7 +704,21 @@ where
     // Called for the collector's sake. The backend intercepts every call to this
     // marker, so nothing ever runs.
     f();
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
+}
+
+/// Calls `f` when the current reactive owner is cleaned up.
+///
+/// With no current owner, no cleanup is registered. The callback may run during
+/// a computation's refresh as well as during root disposal.
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.tc.cleanup")]
+#[inline(never)]
+pub fn on_cleanup<F>(f: F)
+where
+    F: Fn(),
+{
+    f();
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Calls `f` when `value` settles, with what it settled to and whether it succeeded.
@@ -646,7 +748,29 @@ where
     // named through `host_value` because this body has no `V` of its own to call
     // with; nothing ever runs, so nothing is ever cast.
     f(host_value(value), true);
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
+}
+
+/// Runs a host operation, returning a synchronous JavaScript exception as `Err`.
+///
+/// `V` is the caller's claim about the thrown host value, as on [`on_settled`]. This catches
+/// the exception at this call boundary; it does not provide Rust unwinding inside `f`.
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.try")]
+#[inline(never)]
+pub fn try_host<V, F>(f: F) -> Result<(), V>
+where
+    F: Fn(),
+{
+    f();
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
+}
+
+/// Throws a synchronous host exception with the original value identity.
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.throw")]
+#[inline(never)]
+pub fn throw_host(value: JsValue) -> ! {
+    let _ = value;
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// A host value read as a `V`.
@@ -662,7 +786,7 @@ where
 #[inline(never)]
 fn host_value<V>(value: JsValue) -> V {
     let _ = value;
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// The owner the calling code is running under.
@@ -673,7 +797,7 @@ fn host_value<V>(value: JsValue) -> V {
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.tc.owner")]
 #[inline(never)]
 pub fn owner() -> Owner {
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }
 
 /// Runs `f` under `owner`, restoring whatever was current afterwards.
@@ -694,5 +818,5 @@ where
     // Called for the collector's sake, as on [`microtask`].
     let _ = owner;
     f();
-    unreachable!("view-abi markers are only meaningful to rustc_codegen_mires")
+    unreachable!("view-abi markers are only meaningful to rustc_codegen_js")
 }

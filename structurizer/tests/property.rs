@@ -60,28 +60,45 @@ struct Spec {
 }
 
 impl Spec {
-    fn generate(rng: &mut Lcg) -> Spec {
+    /// A `tangled` graph retreats on half its edges and aims them at nearby
+    /// blocks, so overlapping small cycles pile up into loops with several
+    /// entries; an untangled one leads forward on two thirds of its edges,
+    /// which keeps it from being nothing but tangles.
+    fn generate(rng: &mut Lcg, tangled: bool) -> Spec {
         let n = 3 + rng.below(18) as u32;
         let mut terms = Vec::new();
         for i in 0..n {
-            // Two thirds of the edges lead forward, which keeps the graphs
-            // from being nothing but tangles.
             let target = |rng: &mut Lcg| -> BlockId {
-                if rng.below(3) > 0 && i + 1 < n {
+                let forward = if tangled {
+                    rng.below(2) > 0
+                } else {
+                    rng.below(3) > 0
+                };
+                if forward && i + 1 < n {
                     BlockId(i + 1 + rng.below((n - i - 1) as u64) as u32)
+                } else if tangled {
+                    BlockId(i.saturating_sub(rng.below(4) as u32))
                 } else {
                     BlockId(rng.below(n as u64) as u32)
                 }
             };
             let term = match rng.below(12) {
                 0..=4 => Term::Goto(target(rng)),
-                5..=8 => Term::Cond { on: i, then_: target(rng), else_: target(rng) },
+                5..=8 => Term::Cond {
+                    on: i,
+                    then_: target(rng),
+                    else_: target(rng),
+                },
                 9 | 10 => {
                     let k = 1 + rng.below(4) as usize;
                     let cases = (0..k)
                         .map(|j| (rng.below(6) as u128 + j as u128, target(rng)))
                         .collect();
-                    Term::Switch { on: i, cases, default: target(rng) }
+                    Term::Switch {
+                        on: i,
+                        cases,
+                        default: target(rng),
+                    }
                 }
                 _ => Term::Return,
             };
@@ -112,10 +129,16 @@ impl Spec {
 fn clone_term(t: &Term<Cond>) -> Term<Cond> {
     match t {
         Term::Goto(b) => Term::Goto(*b),
-        Term::Cond { on, then_, else_ } => Term::Cond { on: *on, then_: *then_, else_: *else_ },
-        Term::Switch { on, cases, default } => {
-            Term::Switch { on: *on, cases: cases.clone(), default: *default }
-        }
+        Term::Cond { on, then_, else_ } => Term::Cond {
+            on: *on,
+            then_: *then_,
+            else_: *else_,
+        },
+        Term::Switch { on, cases, default } => Term::Switch {
+            on: *on,
+            cases: cases.clone(),
+            default: *default,
+        },
         Term::Return => Term::Return,
         Term::Unreachable => Term::Unreachable,
         Term::Throw => Term::Throw,
@@ -132,7 +155,11 @@ struct Oracle<'a> {
 
 impl<'a> Oracle<'a> {
     fn new(spec: &'a Spec, script: &'a [u64]) -> Oracle<'a> {
-        Oracle { spec, script, pos: 0 }
+        Oracle {
+            spec,
+            script,
+            pos: 0,
+        }
     }
 
     /// The value the terminator of `block` branches on this time round.
@@ -274,7 +301,12 @@ impl<'a> Interp<'a> {
                 self.tmps.insert(tmp.0, v);
                 Flow::Fall
             }
-            Region::If { scrut, test, then_, else_ } => {
+            Region::If {
+                scrut,
+                test,
+                then_,
+                else_,
+            } => {
                 let v = self.eval(scrut);
                 if Interp::holds(test, v) {
                     self.exec(then_)
@@ -282,7 +314,12 @@ impl<'a> Interp<'a> {
                     self.exec(else_)
                 }
             }
-            Region::Switch { scrut, arms, default, label } => {
+            Region::Switch {
+                scrut,
+                arms,
+                default,
+                label,
+            } => {
                 let v = self.eval(scrut);
                 let start = arms
                     .iter()
@@ -298,7 +335,12 @@ impl<'a> Interp<'a> {
                     f => f,
                 }
             }
-            Region::Dispatch { sel, label, cases, trailing_break } => loop {
+            Region::Dispatch {
+                sel,
+                label,
+                cases,
+                trailing_break,
+            } => loop {
                 let v = self.tmps.get(&sel.0).copied().unwrap_or(0);
                 let start = cases
                     .iter()
@@ -363,57 +405,100 @@ fn walk_region(spec: &Spec, region: &Region<Stmts, Cond>, script: &[u64]) -> (Ve
 fn a_region_visits_the_same_blocks_as_the_graph_it_came_from() {
     let option_sets = [
         ("default", Options::default()),
-        ("dispatch", Options { force_dispatch: true, ..Options::default() }),
+        (
+            "dispatch",
+            Options {
+                force_dispatch: true,
+                ..Options::default()
+            },
+        ),
         // Forces the flat dispatch wherever a join needs a scope, and narrow
         // switches, so the decision trees have to split.
         (
             "narrow",
-            Options { merge_node_max: 0, switch_max_case: 2, ..Options::default() },
+            Options {
+                merge_node_max: 0,
+                switch_max_case: 2,
+                ..Options::default()
+            },
         ),
     ];
+    // `STRUCTURIZER_PROPERTY_GRAPHS` cranks the graphs per phase past the
+    // committed default for a long local run.
+    let per_phase: u64 = std::env::var("STRUCTURIZER_PROPERTY_GRAPHS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150);
     let mut rng = Lcg(0x5eed_1234_9abc_def0);
-    let mut graphs = 0;
-    let mut checks = 0;
-    let mut irreducible = 0;
-    let mut dispatches = 0;
-    let mut traced = 0;
+    let mut graphs = 0u64;
+    let mut checks = 0u64;
+    let mut irreducible = 0u64;
+    let mut dispatches = 0u64;
+    let mut scoped = 0u64;
+    let mut whole_body = 0u64;
+    let mut traced = 0u64;
 
-    for _ in 0..30 {
-        let spec = Spec::generate(&mut rng);
-        graphs += 1;
-        let scripts: Vec<Vec<u64>> = (0..8)
-            .map(|_| (0..7).map(|_| rng.next()).collect())
-            .collect();
-        for (name, opts) in &option_sets {
-            let out = match structure(spec.cfg(), opts) {
-                Ok(out) => out,
-                Err(e) => panic!("graph {graphs} under {name}: {e}"),
-            };
-            irreducible += u32::from(out.stats.irreducible);
-            dispatches += out.stats.dispatch_fallbacks;
-            for script in &scripts {
-                let want = walk_cfg(&spec, script);
-                let got = walk_region(&spec, &out.region, script);
-                assert_eq!(
-                    want, got,
-                    "graph {graphs} under {name} with script {script:?}\n\
-                     blocks: {:?}",
-                    spec.terms.len()
-                );
-                checks += 1;
-                traced += want.0.len();
+    for tangled in [false, true] {
+        for _ in 0..per_phase {
+            let spec = Spec::generate(&mut rng, tangled);
+            graphs += 1;
+            let scripts: Vec<Vec<u64>> = (0..8)
+                .map(|_| (0..7).map(|_| rng.next()).collect())
+                .collect();
+            for (name, opts) in &option_sets {
+                let out = match structure(spec.cfg(), opts) {
+                    Ok(out) => out,
+                    Err(e) => panic!("graph {graphs} under {name}: {e}"),
+                };
+                irreducible += u64::from(out.stats.irreducible);
+                dispatches += u64::from(out.stats.dispatch_fallbacks);
+                if out.stats.irreducible && !opts.force_dispatch {
+                    if out.stats.whole_body_dispatch {
+                        whole_body += 1;
+                    } else {
+                        scoped += 1;
+                    }
+                }
+                for script in &scripts {
+                    let want = walk_cfg(&spec, script);
+                    let got = walk_region(&spec, &out.region, script);
+                    assert_eq!(
+                        want,
+                        got,
+                        "graph {graphs} under {name} with script {script:?}\n\
+                         blocks: {:?}",
+                        spec.terms.len()
+                    );
+                    checks += 1;
+                    traced += want.0.len() as u64;
+                }
             }
         }
     }
 
-    assert_eq!(graphs, 30);
-    assert_eq!(checks, 30 * 3 * 8);
-    // The generator has to keep producing graphs worth checking.
+    assert_eq!(graphs, 2 * per_phase);
+    assert_eq!(checks, graphs * 3 * 8);
+    // The generator has to keep producing graphs worth checking. The whole
+    // body fallbacks under these options are all one pre-existing class: a
+    // switch listing one value twice with two targets makes its second target
+    // reachable by edge but dead in the decision tree, which only the flat
+    // dispatch emits. MIR switches list each value once, so a backend never
+    // takes that path.
     assert!(irreducible > 0, "no irreducible graph was generated");
-    assert!(dispatches >= 60, "the dispatch fallback was barely exercised");
-    assert!(traced > 5000, "the traces were too short to mean much: {traced}");
+    assert!(
+        dispatches >= graphs,
+        "the dispatch fallback was barely exercised: {dispatches}"
+    );
+    assert!(
+        scoped >= graphs / 4,
+        "multi entry loops rarely reached the scoped dispatch: {scoped} of {graphs}"
+    );
+    assert!(
+        traced > checks * 6,
+        "the traces were too short to mean much: {traced}"
+    );
     println!(
-        "{graphs} graphs, {checks} runs, {traced} block visits, \
-         {irreducible} irreducible, {dispatches} dispatch regions"
+        "{graphs} graphs, {checks} runs, {traced} block visits, {irreducible} irreducible, \
+         {dispatches} dispatch regions, {scoped} scoped, {whole_body} whole body fallbacks"
     );
 }

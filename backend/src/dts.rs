@@ -1,4 +1,8 @@
-//! `.d.ts` synthesis: what an emitted module looks like to TypeScript.
+//! `.d.ts` synthesis, tcx side: the TypeScript a Rust signature comes out as.
+//!
+//! The [`Dts`] value this produces and the writer that turns a module's worth of them into the
+//! finished `.d.ts` text live in [`rcgjs_object::dts`]; the link step has no `TyCtxt` to compute a
+//! signature with, and this half has nothing to print.
 //!
 //! A compiled island is an ES module with exported entry points and imports of its own, and nothing
 //! about it says what those entries take or answer. This writes that down, beside the `.js`, from
@@ -33,28 +37,14 @@
 use std::collections::BTreeMap;
 
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
-use serde::{Deserialize, Serialize};
 
 use crate::value::{enum_repr, EnumRepr, TAG};
+
+pub(crate) use rcgjs_object::dts::Dts;
 
 /// How deep a type is followed before it is called opaque. A type that nests further than this is
 /// not one an island entry point takes.
 const MAX_DEPTH: u32 = 8;
-
-/// One exported entry point's TypeScript signature.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct Dts {
-    /// `(parameter name, TypeScript type)`, in the order the function takes them.
-    pub(crate) params: Vec<(String, String)>,
-    /// The TypeScript type the function answers.
-    pub(crate) ret: String,
-    /// Named types this signature refers to, as `(name, body)`. Named rather than inlined so a
-    /// type used by two entries is written once and reads as one type.
-    pub(crate) types: Vec<(String, String)>,
-    /// The Rust signature, for the doc comment. What the TypeScript came from, so a surprising
-    /// type can be traced back without recompiling.
-    pub(crate) rust: String,
-}
 
 /// The signature of `instance`, whose emitted parameters are `params`.
 ///
@@ -110,9 +100,8 @@ fn ts_type<'tcx>(
         ty::Char => "number".to_owned(),
         // Wider than 53 bits, so these are `BigInt`s and not numbers. Getting this wrong is the
         // one primitive mistake that survives testing: a small `u64` reads fine as a number.
-        ty::Int(ty::IntTy::I64 | ty::IntTy::I128) | ty::Uint(ty::UintTy::U64 | ty::UintTy::U128) => {
-            "bigint".to_owned()
-        }
+        ty::Int(ty::IntTy::I64 | ty::IntTy::I128)
+        | ty::Uint(ty::UintTy::U64 | ty::UintTy::U128) => "bigint".to_owned(),
         ty::Int(_) | ty::Uint(_) | ty::Float(_) => "number".to_owned(),
         ty::Str => "string".to_owned(),
         ty::Never => "never".to_owned(),
@@ -124,13 +113,18 @@ fn ts_type<'tcx>(
         },
         ty::Tuple(fields) if fields.is_empty() => "undefined".to_owned(),
         ty::Tuple(fields) => {
-            let members: Vec<String> =
-                fields.iter().map(|field| ts_type(tcx, field, types, depth + 1)).collect();
+            let members: Vec<String> = fields
+                .iter()
+                .map(|field| ts_type(tcx, field, types, depth + 1))
+                .collect();
             format!("[{}]", members.join(", "))
         }
         ty::Adt(def, args) => {
             if let Some(opaque) = opaque_handle(tcx, def.did()) {
-                types.insert(opaque.to_owned(), format!("{{ readonly __{opaque}: unique symbol }}"));
+                types.insert(
+                    opaque.to_owned(),
+                    format!("{{ readonly __{opaque}: unique symbol }}"),
+                );
                 return opaque.to_owned();
             }
             match def.is_enum() {
@@ -170,7 +164,12 @@ fn ts_struct<'tcx>(
     // A `repr(transparent)` struct IS its field in the value model, so it is that field's type.
     if def.repr().transparent() && variant.fields.len() == 1 {
         let field = variant.fields.iter().next().expect("one field");
-        return ts_type(tcx, tcx.normalize_erasing_regions(crate::value::typing_env(), field.ty(tcx, args)), types, depth + 1);
+        return ts_type(
+            tcx,
+            tcx.normalize_erasing_regions(crate::value::typing_env(), field.ty(tcx, args)),
+            types,
+            depth + 1,
+        );
     }
     let name = ts_name(tcx, ty);
     if types.contains_key(&name) {
@@ -182,7 +181,12 @@ fn ts_struct<'tcx>(
         .fields
         .iter()
         .map(|field| {
-            let field_ty = ts_type(tcx, tcx.normalize_erasing_regions(crate::value::typing_env(), field.ty(tcx, args)), types, depth + 1);
+            let field_ty = ts_type(
+                tcx,
+                tcx.normalize_erasing_regions(crate::value::typing_env(), field.ty(tcx, args)),
+                types,
+                depth + 1,
+            );
             format!("{}: {field_ty}", field.name)
         })
         .collect();
@@ -207,7 +211,9 @@ fn ts_enum<'tcx>(
     types: &mut BTreeMap<String, String>,
     depth: u32,
 ) -> String {
-    let Some(repr) = enum_repr(tcx, ty) else { return "unknown".to_owned() };
+    let Some(repr) = enum_repr(tcx, ty) else {
+        return "unknown".to_owned();
+    };
     match repr {
         // A `repr(int)` fieldless enum IS its discriminant, which is what makes a transmute to
         // that integer a move with no shape change. There is no narrower type for it.
@@ -239,7 +245,12 @@ fn ts_enum<'tcx>(
             }
             let mut members = vec![format!("{TAG}: \"{}\"", variant.name)];
             members.extend(variant.fields.iter().map(|field| {
-                let field_ty = ts_type(tcx, tcx.normalize_erasing_regions(crate::value::typing_env(), field.ty(tcx, args)), types, depth + 1);
+                let field_ty = ts_type(
+                    tcx,
+                    tcx.normalize_erasing_regions(crate::value::typing_env(), field.ty(tcx, args)),
+                    types,
+                    depth + 1,
+                );
                 format!("{}: {field_ty}", field.name)
             }));
             object(&members)
@@ -275,119 +286,3 @@ fn ts_name<'tcx>(_tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> String {
 
 // -------------------------------------------------------------------------------------------
 // The file
-// -------------------------------------------------------------------------------------------
-
-/// The `.d.ts` for one emitted module.
-///
-/// Three sections, in the order a reader wants them: the named types, the modules the program
-/// imports from, and the entry points. Nothing is emitted for an item that carries no signature,
-/// which is every internal item and every entry whose Rust signature the emitter could not match
-/// to its parameter list.
-pub(crate) fn module_dts(label: &str, items: &[&crate::item::LinkItem]) -> String {
-    use crate::item::ItemKind;
-
-    let mut out = format!(
-        "// rustc_codegen_mires -- {label}\n\
-         // Generated by `-Cllvm-args=js-dts=on`. Do not edit: it is rewritten on every build.\n"
-    );
-
-    // One definition per name, from whichever item mentioned it first. Two items describing one
-    // Rust type describe it the same way, because both came from the same walk over that type.
-    let mut types: BTreeMap<&str, &str> = BTreeMap::new();
-    for item in items {
-        let Some(dts) = &item.dts else { continue };
-        for (name, body) in &dts.types {
-            types.entry(name).or_insert(body);
-        }
-    }
-    if !types.is_empty() {
-        out.push('\n');
-        for (name, body) in &types {
-            out.push_str(&format!("type {name} = {body};\n"));
-        }
-    }
-
-    // What the module reaches out to. A consumer needs this to build an import map, and it is the
-    // declared-interface surface: every `#[js_extern]` that named a module is one of these.
-    let mut modules: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for item in items {
-        if item.kind != ItemKind::Import {
-            continue;
-        }
-        modules.entry(item.debug_path.as_str()).or_default().extend(imported_names(&item.js));
-    }
-    if !modules.is_empty() {
-        out.push('\n');
-        for (source, names) in &modules {
-            let mut names = names.clone();
-            names.sort();
-            names.dedup();
-            out.push_str(&format!("declare module \"{source}\" {{\n"));
-            for name in names {
-                out.push_str(&format!("  export const {name}: unknown;\n"));
-            }
-            out.push_str("}\n");
-        }
-    }
-
-    out.push('\n');
-    for item in items {
-        let Some(dts) = &item.dts else { continue };
-        if !item.linkage.exported {
-            continue;
-        }
-        let name = item.linkage.fixed_name.as_deref().unwrap_or_else(|| item.name.as_str());
-        let params: Vec<String> = dts
-            .params
-            .iter()
-            .map(|(param, ty)| format!("{}: {ty}", crate::jsast::sanitize_ident(param)))
-            .collect();
-        out.push_str(&format!("/** `{}` */\n", dts.rust));
-        out.push_str(&format!(
-            "export declare function {name}({}): {};\n",
-            params.join(", "),
-            dts.ret
-        ));
-    }
-    out
-}
-
-/// The names an `import { A as B, C } from "..."` statement binds.
-///
-/// The text is the backend's own, printed by `jsast`, so this reads exactly the one shape it
-/// prints. The LOCAL name is what is reported, because that is the binding the emitted program
-/// uses and the one a reader is matching against the code.
-fn imported_names(js: &str) -> Vec<String> {
-    let Some(open) = js.find('{') else { return Vec::new() };
-    let Some(close) = js[open..].find('}') else { return Vec::new() };
-    js[open + 1..open + close]
-        .split(',')
-        .filter_map(|entry| entry.split_whitespace().next_back().map(str::to_owned))
-        .filter(|name| !name.is_empty())
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_local_binding_is_what_an_import_reports() {
-        assert_eq!(
-            imported_names("import { getOwner as _$getOwner } from \"./mires-dom.js\";\n"),
-            ["_$getOwner"]
-        );
-        assert_eq!(
-            imported_names("import { a as b, c } from \"m\";\n"),
-            ["b", "c"]
-        );
-        assert!(imported_names("import * as __rt from \"./shim.js\";\n").is_empty());
-    }
-
-    #[test]
-    fn a_named_type_is_a_typescript_identifier() {
-        // The Rust path is squashed rather than escaped, so `Option<&str>` and `core::fmt::Error`
-        // both come out as something TypeScript will take as a name.
-        assert!(!"OptionStr".contains(|c: char| !c.is_ascii_alphanumeric()));
-    }
-}

@@ -112,8 +112,9 @@ impl Block {
             )));
         }
 
-        let slots: usize =
-            slots.parse().map_err(|_| bad(&format!("`{slots}` is not a slot count")))?;
+        let slots: usize = slots
+            .parse()
+            .map_err(|_| bad(&format!("`{slots}` is not a slot count")))?;
         let text = unescape(text).map_err(|why| bad(&why))?;
 
         Ok(Block { slots, text })
@@ -177,10 +178,21 @@ mod tests {
     #[test]
     fn the_encoding_is_the_documented_one() {
         assert_eq!(
-            Block { slots: 2, text: "fetch(_$js0,{body:_$js1})".to_owned() }.encode(),
+            Block {
+                slots: 2,
+                text: "fetch(_$js0,{body:_$js1})".to_owned()
+            }
+            .encode(),
             "rcgjs.js.1.2.fetch(_$js0,{body:_$js1})",
         );
-        assert_eq!(Block { slots: 0, text: "1 + 1".to_owned() }.encode(), "rcgjs.js.1.0.1 + 1");
+        assert_eq!(
+            Block {
+                slots: 0,
+                text: "1 + 1".to_owned()
+            }
+            .encode(),
+            "rcgjs.js.1.0.1 + 1"
+        );
     }
 
     #[test]
@@ -194,13 +206,19 @@ mod tests {
             "/* . */ 1",
             "",
         ] {
-            round_trip(&Block { slots: 1, text: text.to_owned() });
+            round_trip(&Block {
+                slots: 1,
+                text: text.to_owned(),
+            });
         }
     }
 
     #[test]
     fn a_newline_travels_as_one_line_and_comes_back_as_a_newline() {
-        let block = Block { slots: 0, text: "a &&\n// why\nb".to_owned() };
+        let block = Block {
+            slots: 0,
+            text: "a &&\n// why\nb".to_owned(),
+        };
         let encoded = block.encode();
         assert!(!encoded.contains('\n'), "{encoded}");
         round_trip(&block);
@@ -210,7 +228,10 @@ mod tests {
     fn a_backslash_survives_a_newline_beside_it() {
         // The case a naive escape gets wrong: a literal backslash-n in the JavaScript is not a
         // newline, and must not come back as one.
-        round_trip(&Block { slots: 0, text: "\"a\\nb\"".to_owned() });
+        round_trip(&Block {
+            slots: 0,
+            text: "\"a\\nb\"".to_owned(),
+        });
         assert_eq!(escape("\\n"), "\\\\n");
         assert_eq!(unescape("\\\\n").as_deref(), Ok("\\n"));
     }

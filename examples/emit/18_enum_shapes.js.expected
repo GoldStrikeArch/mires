@@ -27,7 +27,7 @@ function x18_enum_shapes$area$hd61f6936047b1915(s) {
       _0 = Math.imul(s.w, s.h) | 0;
       break;
     default:
-      throw new Error("rustc_codegen_mires: entered unreachable code");
+      throw new Error("rustc_codegen_js: entered unreachable code");
   }
   return _0;
 }
@@ -42,7 +42,7 @@ function x18_enum_shapes$is_not_zero$hc5cb992077c48069(s) {
       _0 = true;
       break;
     default:
-      throw new Error("rustc_codegen_mires: entered unreachable code");
+      throw new Error("rustc_codegen_js: entered unreachable code");
   }
   return _0;
 }
@@ -56,7 +56,7 @@ function x18_enum_shapes$letter_value$h4098d3ce4c240e65(l) {
       _0 = 2;
       break;
     default:
-      throw new Error("rustc_codegen_mires: entered unreachable code");
+      throw new Error("rustc_codegen_js: entered unreachable code");
   }
   return _0;
 }
@@ -76,7 +76,7 @@ function x18_enum_shapes$sign_value$he7a5b60ff8f9e7db(s) {
       _0 = 1;
       break;
     default:
-      throw new Error("rustc_codegen_mires: entered unreachable code");
+      throw new Error("rustc_codegen_js: entered unreachable code");
   }
   return _0;
 }

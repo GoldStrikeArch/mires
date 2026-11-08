@@ -67,9 +67,12 @@ pub(crate) fn codegen_constant<'tcx>(
     let ty = konst.ty();
     match konst.eval(tcx, typing_env(), constant.span) {
         Ok(value) => codegen_const_value(cgu, log, value, ty, constant.span),
-        Err(_) => {
-            zombie(cgu, log, constant.span, format!("could not evaluate constant of type `{ty}`"))
-        }
+        Err(_) => zombie(
+            cgu,
+            log,
+            constant.span,
+            format!("could not evaluate constant of type `{ty}`"),
+        ),
     }
 }
 
@@ -85,8 +88,8 @@ pub(crate) fn codegen_static_initializer<'tcx>(
     span: Span,
 ) -> Expr {
     let tcx = cgu.tcx;
-    let ty = tcx
-        .normalize_erasing_regions(typing_env(), tcx.type_of(def_id).instantiate_identity());
+    let ty =
+        tcx.normalize_erasing_regions(typing_env(), tcx.type_of(def_id).instantiate_identity());
     match tcx.eval_static_initializer(def_id) {
         Ok(alloc) => read_alloc(cgu, log, alloc.inner(), Size::ZERO, ty, span),
         // An `extern` static, or one whose initializer failed to evaluate (already reported).
@@ -130,7 +133,15 @@ pub(crate) fn codegen_const_value<'tcx>(
             if pointee.is_str() {
                 return str_expr(cgu, log, alloc.inner(), Size::ZERO, Some(meta), span);
             }
-            slice_expr(cgu, log, alloc.inner(), Size::ZERO, pointee, Some(meta), span)
+            slice_expr(
+                cgu,
+                log,
+                alloc.inner(),
+                Size::ZERO,
+                pointee,
+                Some(meta),
+                span,
+            )
         }
         // A constant whose value lives in an allocation rather than in a register: an aggregate
         // passed by value, `const C: Option<i32> = None` used directly. Decoded the same way a
@@ -177,7 +188,7 @@ fn scalar_to_expr<'tcx>(
                 cgu,
                 log,
                 span,
-                format!("constants of type `{ty}` are not supported by rustc_codegen_mires"),
+                format!("constants of type `{ty}` are not supported by rustc_codegen_js"),
             ),
         },
     }
@@ -199,11 +210,23 @@ fn read_alloc<'tcx>(
 ) -> Expr {
     let tcx = cgu.tcx;
     let Ok(layout) = tcx.layout_of(typing_env().as_query_input(ty)) else {
-        return zombie(cgu, log, span, format!("no layout for `{ty}` in a constant"));
+        return zombie(
+            cgu,
+            log,
+            span,
+            format!("no layout for `{ty}` in a constant"),
+        );
     };
 
     let field = |index: usize, field_ty: Ty<'tcx>| {
-        read_alloc(cgu, log, alloc, offset + layout.fields.offset(index), field_ty, span)
+        read_alloc(
+            cgu,
+            log,
+            alloc,
+            offset + layout.fields.offset(index),
+            field_ty,
+            span,
+        )
     };
 
     // A transparent wrapper *is* its one non-1-ZST field (`value.rs`), so its bytes are that
@@ -218,16 +241,17 @@ fn read_alloc<'tcx>(
         ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) => {
             match raw::read_scalar(tcx, alloc, offset, layout.size) {
                 Some(int) => scalar_to_expr(cgu, log, int, ty, span),
-                None => {
-                    zombie(cgu, log, span, format!("could not read a `{ty}` out of a constant"))
-                }
+                None => zombie(
+                    cgu,
+                    log,
+                    span,
+                    format!("could not read a `{ty}` out of a constant"),
+                ),
             }
         }
         // A pattern only restricts which values inhabit the type; the bytes are the base type's.
         ty::Pat(base, _) => read_alloc(cgu, log, alloc, offset, *base, span),
-        ty::Adt(def, _) if def.is_enum() => {
-            read_enum(cgu, log, alloc, offset, ty, layout, span)
-        }
+        ty::Adt(def, _) if def.is_enum() => read_enum(cgu, log, alloc, offset, ty, layout, span),
         ty::Adt(def, args) if def.is_struct() => {
             let variant = def.non_enum_variant();
             let entries = variant
@@ -236,7 +260,10 @@ fn read_alloc<'tcx>(
                 .map(|(index, field_def)| {
                     let field_ty =
                         tcx.normalize_erasing_regions(typing_env(), field_def.ty(tcx, args));
-                    (Namer::field_name(variant, index), field(index.as_usize(), field_ty))
+                    (
+                        Namer::field_name(variant, index),
+                        field(index.as_usize(), field_ty),
+                    )
                 })
                 .collect();
             jsast::object(entries)
@@ -245,13 +272,31 @@ fn read_alloc<'tcx>(
             if element_tys.is_empty() {
                 jsast::undefined()
             } else {
-                jsast::array(element_tys.iter().enumerate().map(|(i, el)| field(i, el)).collect())
+                jsast::array(
+                    element_tys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, el)| field(i, el))
+                        .collect(),
+                )
             }
         }
         ty::Array(element_ty, count) => {
             let count = count.try_to_target_usize(tcx).unwrap_or_default() as usize;
             jsast::array((0..count).map(|i| field(i, *element_ty)).collect())
         }
+        // MIR represents a closure environment as its captures in field order. Ordinary
+        // `Rvalue::Aggregate` construction emits that environment as a JavaScript array; const
+        // propagation can instead leave the same environment in an allocation, so decode it to
+        // the identical shape here.
+        ty::Closure(_, args) => jsast::array(
+            args.as_closure()
+                .upvar_tys()
+                .iter()
+                .enumerate()
+                .map(|(index, upvar_ty)| field(index, upvar_ty))
+                .collect(),
+        ),
         // A pointer stored *inside* an allocation: `static S: &str`, `static P: &Point`.
         ty::Ref(..) | ty::RawPtr(..) | ty::FnPtr(..) => {
             read_pointer(cgu, log, alloc, offset, ty, span)
@@ -363,7 +408,7 @@ fn read_pointer<'tcx>(
                 span,
                 format!(
                     "a `{ty}` in a constant is an address with no provenance, and a wide pointer \
-                     to nothing cannot be named by rustc_codegen_mires"
+                     to nothing cannot be named by rustc_codegen_js"
                 ),
             );
         }
@@ -373,7 +418,9 @@ fn read_pointer<'tcx>(
                 cgu,
                 log,
                 span,
-                format!("a `{ty}` in a constant is uninitialized, which rustc_codegen_mires cannot read"),
+                format!(
+                    "a `{ty}` in a constant is uninitialized, which rustc_codegen_js cannot read"
+                ),
             ),
         };
     };
@@ -397,7 +444,12 @@ fn pointer_expr<'tcx>(
     let tcx = cgu.tcx;
     let pointee = || {
         ty.builtin_deref(true).ok_or_else(|| {
-            zombie(cgu, log, span, format!("the pointer constant `{ty}` is not a reference"))
+            zombie(
+                cgu,
+                log,
+                span,
+                format!("the pointer constant `{ty}` is not a reference"),
+            )
         })
     };
 
@@ -423,7 +475,7 @@ fn pointer_expr<'tcx>(
                     span,
                     format!(
                         "a pointer into the middle of a `static` is not supported by \
-                         rustc_codegen_mires (type `{ty}`)"
+                         rustc_codegen_js (type `{ty}`)"
                     ),
                 );
             }
@@ -463,7 +515,7 @@ fn pointer_expr<'tcx>(
             cgu,
             log,
             span,
-            format!("pointer constants are not supported by rustc_codegen_mires (type `{ty}`)"),
+            format!("pointer constants are not supported by rustc_codegen_js (type `{ty}`)"),
         ),
     }
 }
@@ -473,12 +525,7 @@ fn pointer_expr<'tcx>(
 /// A *reference* to an aggregate is the aggregate's own object; a *raw* pointer to one is a slot,
 /// so that it can be offset and compared like any other raw pointer. `__rt.box` is what turns the
 /// object into the one slot that stands for it — see `ptr::ref_to_raw`, whose rule this is.
-fn boxed_if_raw<'tcx>(
-    cgu: &CguCx<'tcx>,
-    ty: Ty<'tcx>,
-    pointee: Ty<'tcx>,
-    value: Expr,
-) -> Expr {
+fn boxed_if_raw<'tcx>(cgu: &CguCx<'tcx>, ty: Ty<'tcx>, pointee: Ty<'tcx>, value: Expr) -> Expr {
     let raw = matches!(value::peel_pattern(ty).kind(), ty::RawPtr(..));
     if raw && crate::ptr::is_slot_pointee(cgu.tcx, pointee) {
         return jsast::rt_call("box", vec![value]);
@@ -508,12 +555,22 @@ fn slice_expr<'tcx>(
 ) -> Expr {
     let tcx = cgu.tcx;
     let (Some(length), ty::Slice(element_ty)) = (meta, pointee.kind()) else {
-        return zombie(cgu, log, span, format!("a `&{pointee}` constant with no length"));
+        return zombie(
+            cgu,
+            log,
+            span,
+            format!("a `&{pointee}` constant with no length"),
+        );
     };
     // The slice type reached codegen monomorphized, so its element type is normalized already.
     let element_ty = *element_ty;
     let Ok(element) = tcx.layout_of(typing_env().as_query_input(element_ty)) else {
-        return zombie(cgu, log, span, format!("no layout for `{element_ty}` in a slice constant"));
+        return zombie(
+            cgu,
+            log,
+            span,
+            format!("no layout for `{element_ty}` in a slice constant"),
+        );
     };
     let stride = element.size.bytes();
     let length = usize::try_from(length).unwrap_or(usize::MAX);
@@ -531,7 +588,11 @@ fn slice_expr<'tcx>(
             read_alloc(cgu, log, alloc, at, element_ty, span)
         })
         .collect();
-    crate::ptr::fat_slice(jsast::array(elements), jsast::num(0), jsast::num(length as f64))
+    crate::ptr::fat_slice(
+        jsast::array(elements),
+        jsast::num(0),
+        jsast::num(length as f64),
+    )
 }
 
 /// The `&str` whose bytes start at `offset` in `alloc` and run for `meta` bytes.
@@ -544,7 +605,12 @@ fn str_expr<'tcx>(
     span: Span,
 ) -> Expr {
     let Some(length) = meta else {
-        return zombie(cgu, log, span, "a `&str` constant with no length".to_string());
+        return zombie(
+            cgu,
+            log,
+            span,
+            "a `&str` constant with no length".to_string(),
+        );
     };
     match raw::read_str(alloc, offset, length) {
         Ok(text) if text.len() >= HOIST_STRING_BYTES => {
@@ -565,9 +631,12 @@ fn str_expr<'tcx>(
             span,
             "a `&str` constant runs past the end of its allocation".to_string(),
         ),
-        Err(raw::StrError::NotUtf8) => {
-            zombie(cgu, log, span, "string constant is not valid UTF-8".to_string())
-        }
+        Err(raw::StrError::NotUtf8) => zombie(
+            cgu,
+            log,
+            span,
+            "string constant is not valid UTF-8".to_string(),
+        ),
     }
 }
 

@@ -51,14 +51,14 @@ const EMPTY_MODULE = pathToFileURL(path.join(here, "empty-module.mjs")).href;
 
 // Temp modules written by run-trace.mjs. Used to scope the "stub anything that
 // cannot resolve" behaviour to tracing only.
-const TRACE_MODULE_RE = /mires-trace-[0-9a-f-]+\.mjs$/;
+const TRACE_MODULE_RE = /topcoat-trace-[0-9a-f-]+\.mjs$/;
 
 // Synthetic stub modules are served under this scheme. The specifier carries
 // the export names the importer asked for, so a NAMED import from an
 // unresolvable package still links -- a default-only stub cannot satisfy
 // `import { binding } from "somewhere"`, because ESM checks named exports at
 // link time, before any code runs.
-const STUB_SCHEME = "mires-stub:";
+const STUB_SCHEME = "topcoat-stub:";
 
 /**
  * Find the names an importer binds from a given specifier, so the synthesized

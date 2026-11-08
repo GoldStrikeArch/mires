@@ -6,7 +6,7 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll};
 
-use view_abi::{on_settled, JsValue};
+use view_abi::{on_settled, try_host, JsValue};
 
 /// How far along a [`Settling`] is.
 enum State<V> {
@@ -43,8 +43,15 @@ pub struct Settling<V> {
 /// that it arrives INSIDE the poll: the pinned runtime's error handling is entirely synchronous,
 /// so a rejection left as a rejection reaches no boundary and becomes a host-level unhandled
 /// rejection (`CONTRACT-DOM` 14.4).
+///
+/// A synchronous exception while subscribing is returned as `Err` by the first poll, even
+/// if a thenable calls a settlement callback before throwing. Successful subscription keeps
+/// the normal later-poll scheduling. The awaiting body can clean up through its Rust error path.
 pub fn await_promise<V>(promise: JsValue) -> Settling<V> {
-    Settling { promise, state: Rc::new(RefCell::new(State::Fresh)) }
+    Settling {
+        promise,
+        state: Rc::new(RefCell::new(State::Fresh)),
+    }
 }
 
 impl<V> Future for Settling<V> {
@@ -56,12 +63,17 @@ impl<V> Future for Settling<V> {
         let taken = core::mem::replace(&mut *me.state.borrow_mut(), State::Waiting);
         match taken {
             State::Fresh => {
-                let state = Rc::clone(&me.state);
-                let waker = context.waker().clone();
-                on_settled(me.promise, move |value: V, ok: bool| {
-                    *state.borrow_mut() = State::Settled(value, ok);
-                    waker.wake_by_ref();
+                let subscribed = try_host(|| {
+                    let state = Rc::clone(&me.state);
+                    let waker = context.waker().clone();
+                    on_settled(me.promise, move |value: V, ok: bool| {
+                        *state.borrow_mut() = State::Settled(value, ok);
+                        waker.wake_by_ref();
+                    });
                 });
+                if let Err(error) = subscribed {
+                    return Poll::Ready(Err(error));
+                }
                 Poll::Pending
             }
             State::Waiting => Poll::Pending,

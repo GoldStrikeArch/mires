@@ -18,13 +18,13 @@ function rust_entry() {
   core$ptr$drop_glue$hb63dc3eb78685891({ buf: boxed, off: 0 });
 }
 function core$alloc$layout$impl_0_from_size_alignment_unchecked$precondition_check$hab48e74dd9055d51() {
-  throw new Error("rustc_codegen_mires: `core$alloc$layout$impl_0_from_size_alignment_unchecked$precondition_check$hab48e74dd9055d51` was never codegenned; the monomorphization collector proved every call to it unreachable");
+  throw new Error("rustc_codegen_js: `core$alloc$layout$impl_0_from_size_alignment_unchecked$precondition_check$hab48e74dd9055d51` was never codegenned; the monomorphization collector proved every call to it unreachable");
 }
 
 function core$mem$alignment$impl_0_new_unchecked$precondition_check$h0e52ffe916149fef() {
-  throw new Error("rustc_codegen_mires: `core$mem$alignment$impl_0_new_unchecked$precondition_check$h0e52ffe916149fef` was never codegenned; the monomorphization collector proved every call to it unreachable");
+  throw new Error("rustc_codegen_js: `core$mem$alignment$impl_0_new_unchecked$precondition_check$h0e52ffe916149fef` was never codegenned; the monomorphization collector proved every call to it unreachable");
 }
 
 function core$ptr$non_null$impl_3_new_unchecked$precondition_check$hd790945cfeefe665() {
-  throw new Error("rustc_codegen_mires: `core$ptr$non_null$impl_3_new_unchecked$precondition_check$hd790945cfeefe665` was never codegenned; the monomorphization collector proved every call to it unreachable");
+  throw new Error("rustc_codegen_js: `core$ptr$non_null$impl_3_new_unchecked$precondition_check$hd790945cfeefe665` was never codegenned; the monomorphization collector proved every call to it unreachable");
 }

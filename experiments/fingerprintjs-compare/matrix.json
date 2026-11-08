@@ -1,0 +1,1232 @@
+{
+  "generatedAt": "2026-08-15T08:50:26.474Z",
+  "implementations": [
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 31484,
+          "bytes": 129311,
+          "gzip9": 37548,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs/dist/fp.esm.js",
+          "sha256": "1199e961c36958e92e486a94cc6fbc5b1687b483d635019d4130cc722ecab206"
+        },
+        "iifeMin": {
+          "brotli11": 14239,
+          "bytes": 36746,
+          "gzip9": 16178,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs/dist/fp.min.js",
+          "sha256": "9341c632ea5657977d103ca06aa0632338dc298d4ca5338e51277c63831a2ef5"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs/dist/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": null,
+        "jsKernels": null,
+        "program": 129311,
+        "runtime": 0,
+        "source": "oracle-esm"
+      },
+      "complete": false,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs/dist",
+      "family": "oracle",
+      "frozen": true,
+      "id": "oracle",
+      "kind": "oracle",
+      "label": "TypeScript oracle",
+      "present": {
+        "attribution": false,
+        "esm": true,
+        "esmMin": false,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": false,
+        "rawShim": false,
+        "types": true,
+        "variant": false
+      },
+      "profile": "production",
+      "runtimeDefault": true,
+      "sizeDefault": true,
+      "variant": null
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 120158,
+          "bytes": 1087270,
+          "gzip9": 176244,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust/dist/boundary/fp.esm.js",
+          "sha256": "c87dc7b91c611205a2bed4ffd578f0cce685ab513dfe4a9d973ad3fc38f2e602"
+        },
+        "esmMin": {
+          "brotli11": 59355,
+          "bytes": 332381,
+          "gzip9": 73939,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust/dist/boundary/fp.esm.min.js",
+          "sha256": "417bb3da93a0df5dadba1fcae71177a290eb55c37f47cc8d64610c77053296f9"
+        },
+        "iifeMin": {
+          "brotli11": 59297,
+          "bytes": 332361,
+          "gzip9": 73917,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust/dist/boundary/fp.min.js",
+          "sha256": "2aa73db1bd1c56dd2934b4114fdb9798552115e0910f976a5d604dc1ff50ed02"
+        },
+        "rawFacade": {
+          "brotli11": 662,
+          "bytes": 2687,
+          "gzip9": 754,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust/dist/boundary/raw/facade.js",
+          "sha256": "9ce7f2369e504cc7cd933249c84358c1f377e86a38aac454bc697b0cf6abebda"
+        },
+        "rawProgram": {
+          "brotli11": 123928,
+          "bytes": 1229197,
+          "gzip9": 185824,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust/dist/boundary/raw/program.js",
+          "sha256": "c80115a78e78ea5c66e8508564a6de6eda2afe8c2d8f364e9fc621652893d547"
+        },
+        "rawShim": {
+          "brotli11": 5113,
+          "bytes": 21173,
+          "gzip9": 5765,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust/dist/boundary/raw/shim.js",
+          "sha256": "4c21b19bd4935303756616db1b7f306f670b9435bf3368b2481f0d400ec919bd"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust/dist/boundary/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": 2687,
+        "jsKernels": null,
+        "program": 1229197,
+        "runtime": 21173,
+        "source": "inferred"
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust/dist/boundary",
+      "family": "rust",
+      "frozen": true,
+      "id": "rust-idiomatic",
+      "kind": "rust-idiomatic",
+      "label": "Idiomatic Rust",
+      "present": {
+        "attribution": false,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": true,
+        "rawProgram": true,
+        "rawShim": true,
+        "types": true,
+        "variant": false
+      },
+      "profile": "baseline",
+      "runtimeDefault": false,
+      "sizeDefault": false,
+      "variant": null
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 21106,
+          "bytes": 96158,
+          "gzip9": 24461,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rescript/dist/fp.esm.js",
+          "sha256": "15e80aa31385c7dd9359dbbc6d63a37598b6725574bcb0f6cc23e7366ee15ba8"
+        },
+        "esmMin": {
+          "brotli11": 15445,
+          "bytes": 42198,
+          "gzip9": 17465,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rescript/dist/fp.esm.min.js",
+          "sha256": "e4a450acd8bbbb4c51411e7996f20cdb1149bd08da860c800bec29ec372093b2"
+        },
+        "iifeMin": {
+          "brotli11": 15422,
+          "bytes": 42283,
+          "gzip9": 17453,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rescript/dist/fp.min.js",
+          "sha256": "c369862b45aef1cf2c87159a298fce2c254f1a11641aee338b8e0f27fa66ed37"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rescript/dist/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": null,
+        "jsKernels": null,
+        "program": null,
+        "runtime": null,
+        "source": "inferred"
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rescript",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rescript/dist",
+      "family": "rescript",
+      "frozen": false,
+      "id": "rescript",
+      "kind": "rescript",
+      "label": "ReScript",
+      "present": {
+        "attribution": false,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": false,
+        "rawShim": false,
+        "types": true,
+        "variant": false
+      },
+      "profile": "production",
+      "runtimeDefault": true,
+      "sizeDefault": true,
+      "variant": null
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 23027,
+          "bytes": 107682,
+          "gzip9": 26596,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-melange/dist/fp.esm.js",
+          "sha256": "52d31229c53d8958dfea928e50febbd36b60a007169011b1c7a9d5920aea8012"
+        },
+        "esmMin": {
+          "brotli11": 16678,
+          "bytes": 49769,
+          "gzip9": 18870,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-melange/dist/fp.esm.min.js",
+          "sha256": "d44c5cfd7cad86a92e7d7f013437e6681a4ae4767e580322cd83fc6dff6cde6d"
+        },
+        "iifeMin": {
+          "brotli11": 16655,
+          "bytes": 49856,
+          "gzip9": 18840,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-melange/dist/fp.min.js",
+          "sha256": "1657e7a8b0d3b8f4569706720ab28c801772cd830f339f8538e73dcfb644cd0a"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-melange/dist/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": null,
+        "jsKernels": null,
+        "program": null,
+        "runtime": null,
+        "source": "inferred"
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-melange",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-melange/dist",
+      "family": "melange",
+      "frozen": false,
+      "id": "melange",
+      "kind": "melange",
+      "label": "Melange 7.0.1",
+      "present": {
+        "attribution": false,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": false,
+        "rawShim": false,
+        "types": true,
+        "variant": false
+      },
+      "profile": "production",
+      "runtimeDefault": true,
+      "sizeDefault": true,
+      "variant": null
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 63327,
+          "bytes": 358357,
+          "gzip9": 76752,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-jsoo/dist/fp.esm.js",
+          "sha256": "224b5922350d390297baba4f7de10376d9cf60d1590ade15987e93449762617d"
+        },
+        "esmMin": {
+          "brotli11": 41815,
+          "bytes": 136383,
+          "gzip9": 47979,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-jsoo/dist/fp.esm.min.js",
+          "sha256": "ad7ba4268d5479ace0242561a9dd1a3cef6639d5665251a7776f3166230949c1"
+        },
+        "iifeMin": {
+          "brotli11": 41870,
+          "bytes": 136140,
+          "gzip9": 47988,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-jsoo/dist/fp.min.js",
+          "sha256": "aa871a7f74adbd9efb44e01ea586b641b7a5e4446233cbc9d209085f1a864084"
+        },
+        "rawProgram": {
+          "brotli11": 41852,
+          "bytes": 138894,
+          "gzip9": 47774,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-jsoo/dist/raw/program.js",
+          "sha256": "5482a0452529f9f12eb18144d83e94c0d0db48e88e746c2c3804053efab94796"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-jsoo/dist/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": null,
+        "jsKernels": null,
+        "program": 138894,
+        "runtime": null,
+        "source": "inferred"
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-jsoo",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-jsoo/dist",
+      "family": "jsoo",
+      "frozen": false,
+      "id": "jsoo",
+      "kind": "jsoo",
+      "label": "js_of_ocaml",
+      "present": {
+        "attribution": false,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": true,
+        "rawShim": false,
+        "types": true,
+        "variant": false
+      },
+      "profile": "production",
+      "runtimeDefault": true,
+      "sizeDefault": true,
+      "variant": null
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 63645,
+          "bytes": 520272,
+          "gzip9": 89931,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-compact/dist/fp.esm.js",
+          "sha256": "530a8166b584fcc732ee597a529a515ccd48ca1ac86e73f489ce572b11fb73f6"
+        },
+        "esmMin": {
+          "brotli11": 33636,
+          "bytes": 159764,
+          "gzip9": 43948,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-compact/dist/fp.esm.min.js",
+          "sha256": "7351489ddb6ec0994ea3b66a8dfccb15b499a308d425668ef82648d5363908d3"
+        },
+        "iifeMin": {
+          "brotli11": 33627,
+          "bytes": 159745,
+          "gzip9": 43910,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-compact/dist/fp.min.js",
+          "sha256": "41108892b2978d99cc870c56da1e61a038296eadda05291734ecc80ed91b86f0"
+        },
+        "rawFacade": {
+          "brotli11": 662,
+          "bytes": 2687,
+          "gzip9": 754,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-compact/dist/raw/facade.js",
+          "sha256": "9ce7f2369e504cc7cd933249c84358c1f377e86a38aac454bc697b0cf6abebda"
+        },
+        "rawProgram": {
+          "brotli11": 60373,
+          "bytes": 521642,
+          "gzip9": 87467,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-compact/dist/raw/program.js",
+          "sha256": "650c9ac590a3b48490b891c110931672440db48d98b87a3c7b5bc915b8b747f1"
+        },
+        "rawShim": {
+          "brotli11": 4257,
+          "bytes": 17092,
+          "gzip9": 4818,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-compact/dist/raw/shim.js",
+          "sha256": "cb411540071e094e2fd467ab1e43dcd58982f30889821884fd01907ef51d0f05"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-compact/dist/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": 2687,
+        "jsKernels": null,
+        "program": 521642,
+        "runtime": 17092,
+        "source": "inferred"
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-compact",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-compact/dist",
+      "family": "rust",
+      "frozen": false,
+      "id": "rust-compact",
+      "kind": "rust-compact",
+      "label": "Compact Rust",
+      "present": {
+        "attribution": false,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": true,
+        "rawProgram": true,
+        "rawShim": true,
+        "types": true,
+        "variant": false
+      },
+      "profile": "production",
+      "runtimeDefault": true,
+      "sizeDefault": true,
+      "variant": null
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 108234,
+          "bytes": 882461,
+          "gzip9": 154602,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-hybrid/dist/fp.esm.js",
+          "sha256": "1e9063026f6b854f140e253494b0483e0904884ab33c78b8bbd4e5d2516e0767"
+        },
+        "esmMin": {
+          "brotli11": 56226,
+          "bytes": 269652,
+          "gzip9": 68682,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-hybrid/dist/fp.esm.min.js",
+          "sha256": "c86d0fe10b0a0e7ff3093defc80adf1d7162ef62425c9b03fbb756050989dddc"
+        },
+        "iifeMin": {
+          "brotli11": 56222,
+          "bytes": 269643,
+          "gzip9": 68646,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-hybrid/dist/fp.min.js",
+          "sha256": "376b3e19d51a1298515c00064ea08292af56bdfaf5663c5273d0b63b450b8d02"
+        },
+        "rawFacade": {
+          "brotli11": 662,
+          "bytes": 2687,
+          "gzip9": 754,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-hybrid/dist/raw/facade.js",
+          "sha256": "9ce7f2369e504cc7cd933249c84358c1f377e86a38aac454bc697b0cf6abebda"
+        },
+        "rawProgram": {
+          "brotli11": 105388,
+          "bytes": 907634,
+          "gzip9": 153149,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-hybrid/dist/raw/program.js",
+          "sha256": "b3ada9549c2fc6a6f120f3f1b91dda2ce240adc1e14eb226c23636d096e60d83"
+        },
+        "rawShim": {
+          "brotli11": 5437,
+          "bytes": 22492,
+          "gzip9": 6148,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-hybrid/dist/raw/shim.js",
+          "sha256": "8a7035b2a6f97dbb9c231efdd891f591dc76f81d50a86bc7f2560caea4dc076b"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-hybrid/dist/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": 2687,
+        "iifeMin": 269643,
+        "jsBlocks": 18,
+        "jsFiles": 10002,
+        "jsKernels": 10020,
+        "mostlyJs": false,
+        "rustProgram": 907634,
+        "rustShim": 22492
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-hybrid",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-rust-hybrid/dist",
+      "family": "rust",
+      "frozen": false,
+      "id": "rust-hybrid",
+      "kind": "rust-hybrid",
+      "label": "Hybrid Rust",
+      "present": {
+        "attribution": true,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": true,
+        "rawProgram": true,
+        "rawShim": true,
+        "types": true,
+        "variant": false
+      },
+      "profile": "experimental",
+      "runtimeDefault": false,
+      "sizeDefault": false,
+      "variant": null
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 67802,
+          "bytes": 435032,
+          "gzip9": 83985,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart/dist/o1/fp.esm.js",
+          "sha256": "d402680fcb137aab1d35230aa193bf1806161c0df569df9faa047f79f76162ed"
+        },
+        "esmMin": {
+          "brotli11": 53642,
+          "bytes": 252175,
+          "gzip9": 64818,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart/dist/o1/fp.esm.min.js",
+          "sha256": "b9ce0a904c5904c189683e2b7fdfbffece14213968bacf541ee5cbce435b4032"
+        },
+        "iifeMin": {
+          "brotli11": 53633,
+          "bytes": 251899,
+          "gzip9": 64816,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart/dist/o1/fp.min.js",
+          "sha256": "405ca428c6c24fd55953453ef8b879bff1b985916660430c7d36b8034cb7ebdc"
+        },
+        "rawProgram": {
+          "brotli11": 67478,
+          "bytes": 433186,
+          "gzip9": 83505,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart/dist/o1/raw/program.js",
+          "sha256": "d4b123a8865d88035af9c357904589f4e9d5d8120fc978c6744f0483b227bc4c"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart/dist/o1/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": null,
+        "program": 433186,
+        "runtime": null,
+        "runtimeSeparable": false,
+        "source": "dart2js whole-program output"
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart/dist/o1",
+      "family": "dart",
+      "frozen": false,
+      "id": "dart",
+      "kind": "dart",
+      "label": "Dart2js -O1 (readable-first)",
+      "present": {
+        "attribution": true,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": true,
+        "rawShim": false,
+        "types": true,
+        "variant": true
+      },
+      "profile": "readable",
+      "runtimeDefault": false,
+      "sizeDefault": false,
+      "variant": {
+        "compiler": "dart2js",
+        "compilerFlags": [
+          "-O1",
+          "--no-source-maps"
+        ],
+        "family": "dart",
+        "id": "o1",
+        "packaging": "named-export facade plus common Terser pass",
+        "profile": "readable",
+        "runtimeSeparable": false,
+        "schema": 1,
+        "semanticSafety": "default readable-first optimizations"
+      }
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 46383,
+          "bytes": 166823,
+          "gzip9": 54366,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart/dist/o2/fp.esm.js",
+          "sha256": "1f7bce25cae8f86ebf328cc5a8f529390660ffe752a5bac88641278523b6accd"
+        },
+        "esmMin": {
+          "brotli11": 44857,
+          "bytes": 151444,
+          "gzip9": 52165,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart/dist/o2/fp.esm.min.js",
+          "sha256": "ad4c96b191bd98771e258e6b197924735e281de8b537a82d4db861ff6ec7b245"
+        },
+        "iifeMin": {
+          "brotli11": 44842,
+          "bytes": 151168,
+          "gzip9": 52147,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart/dist/o2/fp.min.js",
+          "sha256": "9b5f7287579703ffec1f46188ca6bafb54dab08acf58de18ab538947fb641bee"
+        },
+        "rawProgram": {
+          "brotli11": 46061,
+          "bytes": 164977,
+          "gzip9": 53847,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart/dist/o2/raw/program.js",
+          "sha256": "46027fda3037bac9c8e533d212c24baf01c7ded736c032883abf73ef466b7526"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart/dist/o2/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": null,
+        "program": 164977,
+        "runtime": null,
+        "runtimeSeparable": false,
+        "source": "dart2js whole-program output"
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-dart/dist/o2",
+      "family": "dart",
+      "frozen": false,
+      "id": "dart-o2",
+      "kind": "dart",
+      "label": "Dart2js -O2 (production)",
+      "present": {
+        "attribution": true,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": true,
+        "rawShim": false,
+        "types": true,
+        "variant": true
+      },
+      "profile": "production",
+      "runtimeDefault": true,
+      "sizeDefault": true,
+      "variant": {
+        "compiler": "dart2js",
+        "compilerFlags": [
+          "-O2",
+          "--no-source-maps"
+        ],
+        "family": "dart",
+        "id": "o2",
+        "packaging": "named-export facade plus common Terser pass",
+        "profile": "production",
+        "runtimeSeparable": false,
+        "schema": 1,
+        "semanticSafety": "safe production optimizations"
+      }
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 104700,
+          "bytes": 995265,
+          "gzip9": 141822,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs/dist/fast/fp.esm.js",
+          "sha256": "be26f7af5a2587817cec5bc7099cae3e50d4d51e470d032509f92442829655ab"
+        },
+        "esmMin": {
+          "brotli11": 73469,
+          "bytes": 485633,
+          "gzip9": 91078,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs/dist/fast/fp.esm.min.js",
+          "sha256": "ba41508e16be6030632679e8d503036295191a3a83a53ca8c9f7cf831b3fcf80"
+        },
+        "iifeMin": {
+          "brotli11": 73517,
+          "bytes": 485126,
+          "gzip9": 91364,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs/dist/fast/fp.min.js",
+          "sha256": "3e12f1370a0b65cbfa7a71f538f27546863f1c2265c233aaf5bdcfdbd1e427e1"
+        },
+        "rawProgram": {
+          "brotli11": 104083,
+          "bytes": 993996,
+          "gzip9": 141057,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs/dist/fast/raw/program.js",
+          "sha256": "0b30540102c427c9d30e932df0a2c5921ab2de59551dd509c4858763f4232703"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs/dist/fast/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": 0,
+        "program": 993996,
+        "runtime": null,
+        "runtimeSeparable": false,
+        "source": "Scala.js linked whole-program output"
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs/dist/fast",
+      "family": "scalajs",
+      "frozen": false,
+      "id": "scalajs",
+      "kind": "scalajs",
+      "label": "Scala.js fastLink (readable-first)",
+      "present": {
+        "attribution": true,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": true,
+        "rawShim": false,
+        "types": true,
+        "variant": true
+      },
+      "profile": "readable",
+      "runtimeDefault": false,
+      "sizeDefault": false,
+      "variant": {
+        "compiler": "Scala.js 1.22.0",
+        "compilerMode": "fastLinkJS",
+        "family": "scalajs",
+        "id": "fast",
+        "packaging": "native ESM exports plus common Terser pass",
+        "profile": "readable",
+        "runtimeSeparable": false,
+        "schema": 1
+      }
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 83215,
+          "bytes": 609808,
+          "gzip9": 106473,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs/dist/full/fp.esm.js",
+          "sha256": "ffe387701632bbf2d818e3c5ca828ad5b72c66e5a3add5461f1b7cc4a93a097e"
+        },
+        "esmMin": {
+          "brotli11": 56853,
+          "bytes": 229011,
+          "gzip9": 67564,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs/dist/full/fp.esm.min.js",
+          "sha256": "41291564424eea45c104b048cefca04c7d64c7dc2fd796883778e78e5df7b58a"
+        },
+        "iifeMin": {
+          "brotli11": 56734,
+          "bytes": 228513,
+          "gzip9": 67338,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs/dist/full/fp.min.js",
+          "sha256": "4bd29a27e546c687902816075e03b61f21ff832a0615c162b0bf65a2a8e981bf"
+        },
+        "rawProgram": {
+          "brotli11": 82708,
+          "bytes": 608539,
+          "gzip9": 105748,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs/dist/full/raw/program.js",
+          "sha256": "f1a2db56cd9dfefd26547ac8e3ad1eca5f8905410f8b4dcb4d338ccf3bbd3997"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs/dist/full/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": 0,
+        "program": 608539,
+        "runtime": null,
+        "runtimeSeparable": false,
+        "source": "Scala.js linked whole-program output"
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-scalajs/dist/full",
+      "family": "scalajs",
+      "frozen": false,
+      "id": "scalajs-full",
+      "kind": "scalajs",
+      "label": "Scala.js fullLink (production)",
+      "present": {
+        "attribution": true,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": true,
+        "rawShim": false,
+        "types": true,
+        "variant": true
+      },
+      "profile": "production",
+      "runtimeDefault": true,
+      "sizeDefault": true,
+      "variant": {
+        "compiler": "Scala.js 1.22.0",
+        "compilerMode": "fullLinkJS/release",
+        "family": "scalajs",
+        "id": "full",
+        "packaging": "native ESM exports plus common Terser pass",
+        "profile": "production",
+        "runtimeSeparable": false,
+        "schema": 1
+      }
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 32022,
+          "bytes": 143839,
+          "gzip9": 36549,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm/dist/standard/fp.esm.js",
+          "sha256": "8ad3caf178d8c397b2bacb33ec7b00d971390f53fcc9e540afe5a84c1c2a7b95"
+        },
+        "esmMin": {
+          "brotli11": 20457,
+          "bytes": 57914,
+          "gzip9": 22958,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm/dist/standard/fp.esm.min.js",
+          "sha256": "1f45108a320c8a546cfc5fa3ff8475f892a0d589ab774547795f15a1a7785118"
+        },
+        "iifeMin": {
+          "brotli11": 20488,
+          "bytes": 57980,
+          "gzip9": 22992,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm/dist/standard/fp.min.js",
+          "sha256": "77f0351bddfcd7382b46914c46d2d52bc5b48993a70937ec4e980f2a923f1a17"
+        },
+        "rawProgram": {
+          "brotli11": 19061,
+          "bytes": 99038,
+          "gzip9": 21859,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm/dist/standard/raw/program.js",
+          "sha256": "2dbb3be3937f3f7606e608729b04f9d54bf3a18bf5ae8dfd7ed20e0739a6c83c"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm/dist/standard/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "compilerAwareMinifier": false,
+        "elmProgram": 38033,
+        "elmRuntime": 60935,
+        "facade": 1370,
+        "iifeMin": 57980,
+        "jsHost": 63352,
+        "mostlyJs": true
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm/dist/standard",
+      "family": "elm",
+      "frozen": false,
+      "id": "elm",
+      "kind": "elm",
+      "label": "Elm standard minifier",
+      "present": {
+        "attribution": true,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": true,
+        "rawShim": false,
+        "types": true,
+        "variant": true
+      },
+      "profile": "readable",
+      "runtimeDefault": false,
+      "sizeDefault": false,
+      "variant": {
+        "compiler": "Elm 0.19.2 --optimize",
+        "compilerAwareMinifier": false,
+        "compilerAwareScope": null,
+        "family": "elm",
+        "id": "standard",
+        "packaging": "Rollup plus common Terser pass",
+        "profile": "readable",
+        "schema": 1
+      }
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 23574,
+          "bytes": 82723,
+          "gzip9": 26690,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm/dist/production/fp.esm.js",
+          "sha256": "a4f30dc5212f9e766443aeeebed17c03469a097bc664f2c45011a2fd4554f86e"
+        },
+        "esmMin": {
+          "brotli11": 19634,
+          "bytes": 53884,
+          "gzip9": 21928,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm/dist/production/fp.esm.min.js",
+          "sha256": "d74b13c3d56fa575f30401a9f9ee5ae10e830b2c7d855f87278beba39e1e11fb"
+        },
+        "iifeMin": {
+          "brotli11": 19616,
+          "bytes": 53949,
+          "gzip9": 21964,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm/dist/production/fp.min.js",
+          "sha256": "78c8400e73c24b43e2dcfb30bcbbb7d21b432163bd2127d74c7ae7d142ee5d59"
+        },
+        "rawProgram": {
+          "brotli11": 7270,
+          "bytes": 22056,
+          "gzip9": 8176,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm/dist/production/raw/program.js",
+          "sha256": "c3c8b103f1b16276f94af42837a71f3518a51b8be8a36de4f70239f72179cc98"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm/dist/production/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "compilerAwareMinifier": true,
+        "elmProgram": 38033,
+        "elmRuntime": 60935,
+        "facade": 1370,
+        "iifeMin": 53949,
+        "jsHost": 63352,
+        "mostlyJs": true
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-elm/dist/production",
+      "family": "elm",
+      "frozen": false,
+      "id": "elm-production",
+      "kind": "elm",
+      "label": "Elm compiler-aware minifier",
+      "present": {
+        "attribution": true,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": true,
+        "rawShim": false,
+        "types": true,
+        "variant": true
+      },
+      "profile": "production",
+      "runtimeDefault": true,
+      "sizeDefault": true,
+      "variant": {
+        "compiler": "Elm 0.19.2 --optimize",
+        "compilerAwareMinifier": true,
+        "compilerAwareScope": "generated Elm module only; JS host uses ordinary Terser",
+        "family": "elm",
+        "id": "production",
+        "packaging": "Rollup plus common Terser pass",
+        "profile": "production",
+        "schema": 1
+      }
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 35976,
+          "bytes": 213782,
+          "gzip9": 42567,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/readable/fp.esm.js",
+          "sha256": "f3720d50bb273a714b4eb1cebc5f64e58c703a1217dd8a570c276af5671dbd4e"
+        },
+        "esmMin": {
+          "brotli11": 24309,
+          "bytes": 74896,
+          "gzip9": 27512,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/readable/fp.esm.min.js",
+          "sha256": "869b2b3b628f687c35a786a12d096f909ec8992d9ee7de0ac75fb1d15a79b24d"
+        },
+        "iifeMin": {
+          "brotli11": 24225,
+          "bytes": 74653,
+          "gzip9": 27409,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/readable/fp.min.js",
+          "sha256": "87a3592b86bb2ccd960232533e2467f203e1f806444c2dbe8703477cd786647a"
+        },
+        "rawProgram": {
+          "brotli11": 35659,
+          "bytes": 212076,
+          "gzip9": 42190,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/readable/raw/program.js",
+          "sha256": "b341fba92a4404e64f17067e9285bcf733c706f228a27401298071475bb811cd"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/readable/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": null,
+        "program": 212076,
+        "runtime": 108234,
+        "runtimeSeparable": true,
+        "source": "Kotlin js/app linker modules plus Rollup",
+        "sourceProgramModules": 162059
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/readable",
+      "family": "kotlin",
+      "frozen": false,
+      "id": "kotlin",
+      "kind": "kotlin",
+      "label": "Kotlin/JS readable packaging",
+      "present": {
+        "attribution": true,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": true,
+        "rawShim": false,
+        "types": true,
+        "variant": true
+      },
+      "profile": "readable",
+      "runtimeDefault": false,
+      "sizeDefault": false,
+      "variant": {
+        "compiler": "Kotlin Toolchain 0.11.1 js/app",
+        "compilerReleaseEffective": false,
+        "family": "kotlin",
+        "id": "readable",
+        "profile": "readable",
+        "releaseDiagnostic": "The js/app platform reports that build variants are unsupported.",
+        "releaseRequested": true,
+        "rollupTreeshake": false,
+        "schema": 1,
+        "terserPasses": 1
+      }
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 35664,
+          "bytes": 210806,
+          "gzip9": 42086,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/proxy-production/fp.esm.js",
+          "sha256": "d51bc6c60ff7552e17d9308a35d774b7f877ba7bdcfb95e83a98b263a9df851c"
+        },
+        "esmMin": {
+          "brotli11": 24034,
+          "bytes": 74246,
+          "gzip9": 27258,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/proxy-production/fp.esm.min.js",
+          "sha256": "2db43988fe07d79411eb6328d0a0c05353ce4b9b048cb3a37ed2b1d1a2b5025b"
+        },
+        "iifeMin": {
+          "brotli11": 23989,
+          "bytes": 74002,
+          "gzip9": 27176,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/proxy-production/fp.min.js",
+          "sha256": "fd8f944b35d33343abc2cef2b100860efe4add03ba5f197416703c5d0ef00f6b"
+        },
+        "rawProgram": {
+          "brotli11": 35321,
+          "bytes": 209100,
+          "gzip9": 41708,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/proxy-production/raw/program.js",
+          "sha256": "1e4371ed0c056852c9f6da0b9296d1c544d71fc70b1cf306dae4287a8ae7ee05"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/proxy-production/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": null,
+        "program": 209100,
+        "runtime": 108234,
+        "runtimeSeparable": true,
+        "source": "Kotlin js/app linker modules plus production packaging proxy",
+        "sourceProgramModules": 162059
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/proxy-production",
+      "family": "kotlin",
+      "frozen": false,
+      "id": "kotlin-proxy",
+      "kind": "kotlin",
+      "label": "Kotlin/JS js/app packaging proxy",
+      "present": {
+        "attribution": true,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": true,
+        "rawShim": false,
+        "types": true,
+        "variant": true
+      },
+      "profile": "proxy",
+      "runtimeDefault": false,
+      "sizeDefault": false,
+      "variant": {
+        "compiler": "Kotlin Toolchain 0.11.1 js/app",
+        "compilerReleaseEffective": false,
+        "family": "kotlin",
+        "id": "proxy-production",
+        "profile": "proxy",
+        "releaseDiagnostic": "Packaging proxy only: js/app ignores release; Rollup tree-shaking and two Terser passes are applied.",
+        "releaseRequested": true,
+        "rollupTreeshake": true,
+        "schema": 1,
+        "terserPasses": 2
+      }
+    },
+    {
+      "artifacts": {
+        "esm": {
+          "brotli11": 39079,
+          "bytes": 221362,
+          "gzip9": 46178,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/production/fp.esm.js",
+          "sha256": "b3bbeab6bc4447ddd151aa59f97aede81147f3434cfd1e6ba4d9a2fe6debd11f"
+        },
+        "esmMin": {
+          "brotli11": 25522,
+          "bytes": 77274,
+          "gzip9": 28830,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/production/fp.esm.min.js",
+          "sha256": "aeab731fdac627bbe8722e0caf47270278d427a2c3838206ca9ae28032f314cd"
+        },
+        "iifeMin": {
+          "brotli11": 25514,
+          "bytes": 77057,
+          "gzip9": 28817,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/production/fp.min.js",
+          "sha256": "4095671457c944abc0dd4f5da48afd38ec3151bed81e87b40f0ddba9aa37a747"
+        },
+        "rawProgram": {
+          "brotli11": 38753,
+          "bytes": 219656,
+          "gzip9": 45719,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/production/raw/program.js",
+          "sha256": "ceef5bbb97597e9d391ec37247b2801f28280f86e6ac975fbac3da02923d44b2"
+        },
+        "types": {
+          "brotli11": 6742,
+          "bytes": 27932,
+          "gzip9": 8255,
+          "path": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/production/fp.d.ts",
+          "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+        }
+      },
+      "attribution": {
+        "facade": null,
+        "program": 219656,
+        "runtime": null,
+        "runtimeSeparable": false,
+        "source": "Kotlin/JS Gradle production whole-program output"
+      },
+      "complete": true,
+      "dir": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin",
+      "dist": "/Users/mpl4/Desktop/workspace/OSS/topcoat/experiments/fingerprintjs-kotlin/dist/production",
+      "family": "kotlin",
+      "frozen": false,
+      "id": "kotlin-production",
+      "kind": "kotlin",
+      "label": "Kotlin/JS Gradle production",
+      "present": {
+        "attribution": true,
+        "esm": true,
+        "esmMin": true,
+        "iifeMin": true,
+        "rawFacade": false,
+        "rawProgram": true,
+        "rawShim": false,
+        "types": true,
+        "variant": true
+      },
+      "profile": "production",
+      "runtimeDefault": true,
+      "sizeDefault": true,
+      "variant": {
+        "compiler": "Kotlin/JS Gradle plugin 2.4.10",
+        "compilerReleaseEffective": true,
+        "dce": true,
+        "family": "kotlin",
+        "gradle": "9.4.1",
+        "id": "production",
+        "minimizedMemberNames": true,
+        "moduleKind": "es",
+        "outputGranularity": "whole-program",
+        "profile": "production",
+        "schema": 1,
+        "target": "es2015",
+        "task": "compileProductionExecutableKotlinJs",
+        "terserPasses": 2
+      }
+    }
+  ],
+  "schema": 2
+}

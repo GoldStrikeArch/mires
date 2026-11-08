@@ -39,9 +39,9 @@ use crate::jsast::{self, Expr, Stmt};
 /// interface may be doing deliberately: `chart.data.datasets` reads `data` and then `datasets`,
 /// and a library whose `data` getter has an effect would notice the difference.
 fn walk(root: Expr, steps: &[&str]) -> Expr {
-    steps
-        .iter()
-        .fold(root, |object, step| jsast::member(object, (*step).to_owned()))
+    steps.iter().fold(root, |object, step| {
+        jsast::member(object, (*step).to_owned())
+    })
 }
 
 /// The descriptor `def_id` carries, or `None` for anything that is not a declaration.
@@ -50,7 +50,72 @@ pub(crate) fn extern_section(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) 
     section.as_str().strip_prefix(PREFIX).map(str::to_owned)
 }
 
+/// Declared globals read by this body must remain outside its local namespace.
+pub(crate) fn global_names<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+    body: &mir::Body<'tcx>,
+) -> std::collections::HashSet<String> {
+    use rustc_middle::mir::visit::Visitor;
+
+    struct Globals<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        body: &'a mir::Body<'tcx>,
+        names: std::collections::HashSet<String>,
+    }
+    impl Globals<'_, '_> {
+        fn add(&mut self, definition: rustc_hir::def_id::DefId) {
+            let Some(section) = extern_section(self.tcx, definition) else {
+                return;
+            };
+            let Ok(descriptor) = Descriptor::decode(&section) else {
+                return;
+            };
+            if descriptor.root() != Root::Module && !descriptor.acts_on_argument() {
+                if let Some(head) = descriptor.segments().first() {
+                    self.names.insert((*head).to_owned());
+                }
+            }
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for Globals<'_, 'tcx> {
+        fn visit_operand(&mut self, operand: &mir::Operand<'tcx>, _: mir::Location) {
+            if let ty::FnDef(definition, _) = operand.ty(&self.body.local_decls, self.tcx).kind() {
+                self.add(*definition);
+            }
+        }
+    }
+    let mut globals = Globals {
+        tcx,
+        body,
+        names: Default::default(),
+    };
+    globals.add(instance.def_id());
+    globals.visit_body(body);
+    globals.names
+}
+
 impl<'tcx> FnCx<'_, 'tcx> {
+    /// Emits the host operation as this marker function's body.
+    ///
+    /// Call sites still inline the same operation. Native regions that pass sink arguments call
+    /// this compiled body instead of the `unreachable!` placeholder the macro writes.
+    pub(crate) fn codegen_js_extern_fn(&self, body: &str) -> Vec<Stmt> {
+        let args: Vec<Spanned<mir::Operand<'tcx>>> = self
+            .mir
+            .args_iter()
+            .map(|local| Spanned {
+                node: mir::Operand::Copy(local.into()),
+                span: self.mir.span,
+            })
+            .collect();
+        let destination: mir::Place<'tcx> = mir::RETURN_PLACE.into();
+        let mut stmts = self.codegen_js_extern(body, &args, destination);
+        let (target, _) = self.codegen_place(destination);
+        stmts.push(jsast::ret(self.read(&target)));
+        stmts
+    }
+
     /// Lowers a call to a `#[js_extern]` declaration.
     pub(crate) fn codegen_js_extern(
         &self,
@@ -73,9 +138,17 @@ impl<'tcx> FnCx<'_, 'tcx> {
             )))];
         }
 
+        // Rust arguments are evaluated before the host binding looks up its callee or
+        // property. Compiler temporaries cannot be fused back across that lookup.
+        let mut setup = Vec::new();
         let lowered: Vec<Expr> = args
             .iter()
-            .map(|arg| self.at(arg.span, || self.codegen_operand(&arg.node)))
+            .map(|arg| {
+                let value = self.at(arg.span, || self.codegen_operand(&arg.node));
+                let (hold, value) = self.temp(value);
+                setup.push(hold);
+                value
+            })
             .collect();
         let (acted_on, passed) = lowered.split_at(required);
 
@@ -100,11 +173,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
             // path is rooted, which `root` has already answered. The last step is called as a
             // MEMBER rather than as a plain call, so `Chart.register(x)` keeps its receiver.
             Shape::Call | Shape::Method => match steps.split_last() {
-                Some((last, before)) => jsast::method_call(
-                    walk(root, before),
-                    (*last).to_owned(),
-                    passed.to_vec(),
-                ),
+                Some((last, before)) => {
+                    jsast::method_call(walk(root, before), (*last).to_owned(), passed.to_vec())
+                }
                 None => jsast::call(root, passed.to_vec()),
             },
             Shape::New => jsast::new(walk(root, steps), passed.to_vec()),
@@ -129,19 +200,89 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 let written = operands.next().cloned().unwrap_or_else(jsast::undefined);
                 jsast::assign(jsast::index(walk(root, steps), key), written)
             }
+            Shape::Has => jsast::method_call(
+                jsast::id("Reflect"),
+                "has",
+                vec![
+                    walk(root, steps),
+                    operands.next().cloned().unwrap_or_else(jsast::undefined),
+                ],
+            ),
+            Shape::ComputedMethod => jsast::call(
+                jsast::index(
+                    walk(root, steps),
+                    operands.next().cloned().unwrap_or_else(jsast::undefined),
+                ),
+                passed.to_vec(),
+            ),
         };
 
-        if !descriptor.nullable {
-            return self.write_place(destination, value);
-        }
-        match self.nullable(destination, value) {
-            Ok((hold, wrapped)) => {
-                let mut stmts = vec![hold];
-                stmts.extend(self.write_place(destination, wrapped));
-                stmts
+        let value = if descriptor.fallible {
+            if descriptor.nullable {
+                return vec![jsast::expr_stmt(self.zombie(format!(
+                    "`{PREFIX}{body}` cannot be both fallible and nullable"
+                )))];
             }
-            Err(why) => vec![jsast::expr_stmt(self.zombie(why))],
+            if let Err(why) = self.fallible_result(destination) {
+                return vec![jsast::expr_stmt(self.zombie(why))];
+            }
+            let ok_ty = self.result_value_ty(destination).unwrap_or_else(|| {
+                self.monomorphize(destination.ty(&self.mir.local_decls, self.tcx).ty)
+            });
+            let value = self.host_boundary_value(ok_ty, value);
+            jsast::rt_call("host_try", vec![jsast::arrow(Vec::new(), value)])
+        } else if !descriptor.nullable {
+            let ty = self.monomorphize(destination.ty(&self.mir.local_decls, self.tcx).ty);
+            self.host_boundary_value(ty, value)
+        } else {
+            match self.nullable(destination, value) {
+                Ok((hold, wrapped)) => {
+                    setup.push(hold);
+                    wrapped
+                }
+                Err(why) => return vec![jsast::expr_stmt(self.zombie(why))],
+            }
+        };
+        // Host getters and global bindings can throw or mutate state even when their
+        // results are unused. Keep their evaluation out of the ordinary Rust-read queue.
+        let (hold, value) = self.temp(value);
+        setup.push(hold);
+        setup.extend(self.write_place(destination, value));
+        setup
+    }
+
+    /// Checks the destination promised by a `#[js(fallible)]` declaration.
+    fn fallible_result(&self, destination: mir::Place<'tcx>) -> Result<(), String> {
+        let tcx = self.tcx;
+        let ty = self.monomorphize(destination.ty(&self.mir.local_decls, tcx).ty);
+        let ty::Adt(def, args) = ty.kind() else {
+            return Err(format!(
+                "`#[js(fallible)]` returns a `Result<T, JsValue>`, and this returns `{ty}`"
+            ));
+        };
+        if !def.is_enum() || !tcx.is_diagnostic_item(rustc_span::sym::Result, def.did()) {
+            return Err(format!(
+                "`#[js(fallible)]` returns a `Result<T, JsValue>`, and this returns `{ty}`"
+            ));
         }
+        let error = args.type_at(1);
+        let ty::Adt(error_def, _) = error.kind() else {
+            return Err(format!(
+                "`#[js(fallible)]` returns a `Result<T, mires_js::JsValue>`, and this returns \
+                 `{ty}`"
+            ));
+        };
+        // A structural path identifies the same type inside its defining crate and through
+        // downstream re-exports. Diagnostic paths depend on where they are printed.
+        let is_host_value = tcx.crate_name(error_def.did().krate).as_str() == "mires_js"
+            && tcx.def_path(error_def.did()).to_string_no_crate_verbose() == "::host::JsValue";
+        if !is_host_value {
+            return Err(format!(
+                "`#[js(fallible)]` returns a `Result<T, mires_js::JsValue>`, and this returns \
+                 `{ty}`"
+            ));
+        }
+        Ok(())
     }
 
     /// What the path is rooted at when it is not rooted at an argument: the module's imported
@@ -151,7 +292,12 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// reaches `register` through it, because `import { Chart.register }` is not a thing anyone
     /// can write.
     fn js_binding(&self, descriptor: &Descriptor) -> Expr {
-        let head = descriptor.segments().first().copied().unwrap_or_default().to_owned();
+        let head = descriptor
+            .segments()
+            .first()
+            .copied()
+            .unwrap_or_default()
+            .to_owned();
         // The descriptor's own answer rather than a second reading of its module, so a global and
         // an import cannot be told apart two ways that disagree.
         if descriptor.root() != Root::Module {
@@ -167,7 +313,11 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 ItemKind::Import,
                 jsast::import_named(vec![(head.clone(), local.clone())], source.clone()),
                 Vec::new(),
-                Linkage { fixed_name: Some(local.clone()), root: false, exported: false },
+                Linkage {
+                    fixed_name: Some(local.clone()),
+                    root: false,
+                    exported: false,
+                },
                 source.clone(),
             )
         });
@@ -189,18 +339,18 @@ impl<'tcx> FnCx<'_, 'tcx> {
     ///
     /// Returns why the destination is not an `Option`, so a declaration whose return type does not
     /// match its flag is a named zombie rather than a wrong value.
-    fn nullable(
-        &self,
-        destination: mir::Place<'tcx>,
-        value: Expr,
-    ) -> Result<(Stmt, Expr), String> {
+    fn nullable(&self, destination: mir::Place<'tcx>, value: Expr) -> Result<(Stmt, Expr), String> {
         let tcx = self.tcx;
         let ty = self.monomorphize(destination.ty(&self.mir.local_decls, tcx).ty);
-        let ty::Adt(def, _) = ty.kind() else {
-            return Err(format!("`#[js(nullable)]` returns an `Option`, and this returns `{ty}`"));
+        let ty::Adt(def, args) = ty.kind() else {
+            return Err(format!(
+                "`#[js(nullable)]` returns an `Option`, and this returns `{ty}`"
+            ));
         };
         if !def.is_enum() || !tcx.is_diagnostic_item(rustc_span::sym::Option, def.did()) {
-            return Err(format!("`#[js(nullable)]` returns an `Option`, and this returns `{ty}`"));
+            return Err(format!(
+                "`#[js(nullable)]` returns an `Option`, and this returns `{ty}`"
+            ));
         }
 
         let variant = |name: &str| {
@@ -210,12 +360,16 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 .map(|(index, _)| index)
                 .ok_or_else(|| format!("`{ty}` has no `{name}` variant"))
         };
+        let value_ty = self.monomorphize(args.type_at(0));
         let (hold, held) = self.temp(value);
         let some = crate::value::enum_value(
             tcx,
             ty,
             variant("Some")?,
-            vec![("_0".to_owned(), held.clone())],
+            vec![(
+                "_0".to_owned(),
+                self.host_boundary_value(value_ty, held.clone()),
+            )],
         )
         .ok_or_else(|| format!("`{ty}` has no enum representation"))?;
         let none = crate::value::enum_value(tcx, ty, variant("None")?, Vec::new())
@@ -229,5 +383,28 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 some,
             ),
         ))
+    }
+
+    /// Applies representation rules a typed JavaScript result must satisfy before Rust sees it.
+    fn host_boundary_value(&self, ty: rustc_middle::ty::Ty<'tcx>, value: Expr) -> Expr {
+        match ty.kind() {
+            rustc_middle::ty::Float(rustc_middle::ty::FloatTy::F32) => jsast::fround(value),
+            _ => value,
+        }
+    }
+
+    /// The success value declared by a `Result<T, E>` destination.
+    fn result_value_ty(&self, destination: mir::Place<'tcx>) -> Option<rustc_middle::ty::Ty<'tcx>> {
+        let ty = self.monomorphize(destination.ty(&self.mir.local_decls, self.tcx).ty);
+        let rustc_middle::ty::Adt(def, args) = ty.kind() else {
+            return None;
+        };
+        if !self
+            .tcx
+            .is_diagnostic_item(rustc_span::sym::Result, def.did())
+        {
+            return None;
+        }
+        Some(self.monomorphize(args.type_at(0)))
     }
 }

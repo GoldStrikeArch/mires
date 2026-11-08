@@ -6,3 +6,6 @@ publish = false
 
 [dependencies]
 view-abi = { path = "../view-abi" }
+
+[lints]
+workspace = true

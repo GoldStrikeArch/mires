@@ -1,0 +1,158 @@
+{
+  "schema": 1,
+  "capturedAt": "2026-11-08T03:48:07.351003+00:00",
+  "observed": {
+    "node": {
+      "command": [
+        "node",
+        "--version"
+      ],
+      "exitCode": 0,
+      "output": "v26.8.1"
+    },
+    "npm": {
+      "command": [
+        "npm",
+        "--version"
+      ],
+      "exitCode": 0,
+      "output": "12.0.2"
+    },
+    "rescript": {
+      "command": [
+        "node_modules/.bin/rescript",
+        "--version"
+      ],
+      "exitCode": 0,
+      "output": "rescript 12.3.0"
+    },
+    "elm": {
+      "command": [
+        "node_modules/.bin/elm",
+        "--version"
+      ],
+      "exitCode": 0,
+      "output": "0.19.2"
+    },
+    "dart": {
+      "command": [
+        "dart",
+        "--version"
+      ],
+      "exitCode": 0,
+      "output": "Dart SDK version: 3.13.7 (stable) (Thu Oct 22 14:28:57 2026 -0700) on \"macos_arm64\""
+    },
+    "scalaCli": {
+      "command": [
+        "scala-cli",
+        "version"
+      ],
+      "exitCode": 0,
+      "output": "Scala CLI version: 1.18.0\nScala version (default): 3.9.0"
+    },
+    "kotlinToolchain": {
+      "command": [
+        "experiments/tools/kotlin",
+        "--version"
+      ],
+      "exitCode": 0,
+      "output": "Kotlin Toolchain version 0.12.0 (2039c53, 2026-08-25)"
+    },
+    "java": {
+      "command": [
+        "java",
+        "-version"
+      ],
+      "exitCode": 0,
+      "output": "openjdk version \"21.0.13.0.3\" 2026-10-24\nOpenJDK Runtime Environment Homebrew (build 21.0.13.0.3)\nOpenJDK 64-Bit Server VM Homebrew (build 21.0.13.0.3, mixed mode, sharing)"
+    },
+    "opam": {
+      "command": [
+        "opam",
+        "--version"
+      ],
+      "exitCode": 0,
+      "output": "2.6.1"
+    },
+    "ocaml": {
+      "command": [
+        "opam",
+        "exec",
+        "--root",
+        "/Users/mikhail.pertsev/Desktop/OSS/mires/.toolchains/opam",
+        "--switch",
+        "mires-comparators",
+        "--",
+        "ocamlc",
+        "-version"
+      ],
+      "exitCode": 0,
+      "output": "5.3.0"
+    },
+    "dune": {
+      "command": [
+        "opam",
+        "exec",
+        "--root",
+        "/Users/mikhail.pertsev/Desktop/OSS/mires/.toolchains/opam",
+        "--switch",
+        "mires-comparators",
+        "--",
+        "dune",
+        "--version"
+      ],
+      "exitCode": 0,
+      "output": "3.24.2"
+    },
+    "melange": {
+      "command": [
+        "opam",
+        "exec",
+        "--root",
+        "/Users/mikhail.pertsev/Desktop/OSS/mires/.toolchains/opam",
+        "--switch",
+        "mires-comparators",
+        "--",
+        "melc",
+        "-version"
+      ],
+      "exitCode": 0,
+      "output": "Melange 7.0.1-53 (Using OCaml:5.3.0+Melange)"
+    },
+    "jsOfOcaml": {
+      "command": [
+        "opam",
+        "exec",
+        "--root",
+        "/Users/mikhail.pertsev/Desktop/OSS/mires/.toolchains/opam",
+        "--switch",
+        "mires-comparators",
+        "--",
+        "js_of_ocaml",
+        "--version"
+      ],
+      "exitCode": 0,
+      "output": "6.4.1+6.4.1"
+    }
+  },
+  "projectPins": {
+    "scala": "3.8.4",
+    "scalaJs": "1.22.0",
+    "scalaJsDom": "2.8.1",
+    "gradle": "9.4.1",
+    "kotlinGradlePlugin": "2.4.10",
+    "melange": "7.0.1-53",
+    "ocaml": "5.3.0",
+    "dune": "3.24.2",
+    "jsOfOcaml": "6.4.1",
+    "lwt": "6.1.2"
+  },
+  "npmLockSha256": "77e0631552241d2cce198bb9e533be53e9242320c0778ed8168a9efab7729b9a",
+  "ocamlSwitchExportSha256": "e7abe1d350bf001038b9778e38e04d597cd3fbdec616464cca5cb359b3b5b5c1",
+  "kotlinWrapperSha256": "b9a4ebe4e5f846057609203f82a19730414d69ca692178d094e2a6f99f5526c7",
+  "historicalDifferences": [
+    "Installed Kotlin Toolchain 0.12.0 replaces the archived 0.11.1 js/app runner; actual metadata is emitted.",
+    "Installed Dart 3.13.7 satisfies archived SDK ^3.13.0; this is a fresh build, not a historical binary reconstruction.",
+    "Scala CLI is 1.18.0; Scala and Scala.js source versions remain pinned."
+  ]
+}

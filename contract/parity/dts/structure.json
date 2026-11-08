@@ -1,0 +1,445 @@
+{
+  "$generatedBy": "contract/parity/dts.mjs",
+  "$doNotEditByHand": "Re-run the step. A diff here IS the API change.",
+  "files": {
+    "01_shapes.d.ts": {
+      "parser": "typescript",
+      "exports": [
+        {
+          "kind": "function",
+          "name": "_RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "_1",
+              "optional": false,
+              "type": "CorePanicPanicInfo"
+            }
+          ],
+          "returns": "never",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "bump",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "count",
+              "optional": false,
+              "type": "Sig"
+            }
+          ],
+          "returns": "Sig",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "chart",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "target",
+              "optional": false,
+              "type": "JsValue"
+            }
+          ],
+          "returns": "JsValue",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "describe",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "reply",
+              "optional": false,
+              "type": "Reply"
+            }
+          ],
+          "returns": "Reply",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "greet",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "name",
+              "optional": false,
+              "type": "string"
+            }
+          ],
+          "returns": "string",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "maybe",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "value",
+              "optional": false,
+              "type": "number"
+            },
+            {
+              "name": "present",
+              "optional": false,
+              "type": "boolean"
+            }
+          ],
+          "returns": "CoreOptionOptionF64",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "primitives",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "count",
+              "optional": false,
+              "type": "number"
+            },
+            {
+              "name": "big",
+              "optional": false,
+              "type": "bigint"
+            },
+            {
+              "name": "ratio",
+              "optional": false,
+              "type": "number"
+            },
+            {
+              "name": "flag",
+              "optional": false,
+              "type": "boolean"
+            },
+            {
+              "name": "letter",
+              "optional": false,
+              "type": "number"
+            }
+          ],
+          "returns": "bigint",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "raise",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "level",
+              "optional": false,
+              "type": "number"
+            }
+          ],
+          "returns": "number",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "shift",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "point",
+              "optional": false,
+              "type": "Point"
+            },
+            {
+              "name": "by",
+              "optional": false,
+              "type": "number"
+            }
+          ],
+          "returns": "Point",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "split",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "value",
+              "optional": false,
+              "type": "number"
+            }
+          ],
+          "returns": "[number, number]",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "turn",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "direction",
+              "optional": false,
+              "type": "Direction"
+            }
+          ],
+          "returns": "Direction",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "wrap",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "value",
+              "optional": false,
+              "type": "number"
+            }
+          ],
+          "returns": "Node",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "module",
+          "name": "\"chart.js\""
+        },
+        {
+          "kind": "type",
+          "name": "CoreFmtArguments",
+          "typeParameters": [],
+          "aliases": "{ template: unknown; args: unknown }",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "CoreMarkerPhantomDataStr",
+          "typeParameters": [],
+          "aliases": "{}",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "CoreOptionOptionF64",
+          "typeParameters": [],
+          "aliases": "{ TAG: \"None\" } | { TAG: \"Some\"; 0: number }",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "CorePanicLocation",
+          "typeParameters": [],
+          "aliases": "{ filename: unknown; line: number; col: number; _filename: CoreMarkerPhantomDataStr }",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "CorePanicPanicInfo",
+          "typeParameters": [],
+          "aliases": "{ message: CoreFmtArguments; location: CorePanicLocation; can_unwind: boolean; force_no_backtrace: boolean }",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "Direction",
+          "typeParameters": [],
+          "aliases": "\"North\" | \"South\"",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "JsValue",
+          "typeParameters": [],
+          "aliases": "{ readonly __JsValue: unique symbol }",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "Node",
+          "typeParameters": [],
+          "aliases": "{ readonly __Node: unique symbol }",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "Point",
+          "typeParameters": [],
+          "aliases": "{ x: number; y: number }",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "Reply",
+          "typeParameters": [],
+          "aliases": "{ TAG: \"Empty\" } | { TAG: \"Text\"; 0: number } | { TAG: \"Point\"; x: number; y: number }",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "Sig",
+          "typeParameters": [],
+          "aliases": "{ readonly __Sig: unique symbol }",
+          "modifiers": []
+        },
+        {
+          "kind": "variable",
+          "name": "ext$Chart$h63682570ca348144",
+          "type": "unknown",
+          "modifiers": [
+            "export"
+          ],
+          "module": "\"chart.js\""
+        }
+      ]
+    },
+    "17_signal.d.ts": {
+      "parser": "typescript",
+      "exports": [
+        {
+          "kind": "function",
+          "name": "_RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind",
+          "typeParameters": [],
+          "parameters": [
+            {
+              "name": "_1",
+              "optional": false,
+              "type": "CorePanicPanicInfo"
+            }
+          ],
+          "returns": "never",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "rust_entry",
+          "typeParameters": [],
+          "parameters": [],
+          "returns": "void",
+          "modifiers": [
+            "declare",
+            "export"
+          ]
+        },
+        {
+          "kind": "module",
+          "name": "\"./topcoat-dom.js\""
+        },
+        {
+          "kind": "type",
+          "name": "CoreFmtArguments",
+          "typeParameters": [],
+          "aliases": "{ template: unknown; args: unknown }",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "CoreMarkerPhantomDataStr",
+          "typeParameters": [],
+          "aliases": "{  }",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "CorePanicLocation",
+          "typeParameters": [],
+          "aliases": "{ filename: unknown; line: number; col: number; _filename: CoreMarkerPhantomDataStr }",
+          "modifiers": []
+        },
+        {
+          "kind": "type",
+          "name": "CorePanicPanicInfo",
+          "typeParameters": [],
+          "aliases": "{ message: CoreFmtArguments; location: CorePanicLocation; can_unwind: boolean; force_no_backtrace: boolean }",
+          "modifiers": []
+        },
+        {
+          "kind": "variable",
+          "name": "_$createSignal",
+          "type": "unknown",
+          "modifiers": [
+            "export"
+          ],
+          "module": "\"./topcoat-dom.js\""
+        },
+        {
+          "kind": "variable",
+          "name": "_$delegateEvents",
+          "type": "unknown",
+          "modifiers": [
+            "export"
+          ],
+          "module": "\"./topcoat-dom.js\""
+        },
+        {
+          "kind": "variable",
+          "name": "_$effect",
+          "type": "unknown",
+          "modifiers": [
+            "export"
+          ],
+          "module": "\"./topcoat-dom.js\""
+        },
+        {
+          "kind": "variable",
+          "name": "_$insert",
+          "type": "unknown",
+          "modifiers": [
+            "export"
+          ],
+          "module": "\"./topcoat-dom.js\""
+        },
+        {
+          "kind": "variable",
+          "name": "_$template",
+          "type": "unknown",
+          "modifiers": [
+            "export"
+          ],
+          "module": "\"./topcoat-dom.js\""
+        }
+      ]
+    }
+  }
+}

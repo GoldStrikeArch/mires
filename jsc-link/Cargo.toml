@@ -1,0 +1,34 @@
+[package]
+name = "jsc-link"
+version = "0.1.0"
+edition = "2021"
+description = "The rustc-free consumer: objects in, finished JavaScript program out"
+
+[lib]
+name = "jsc_link"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "jsc-link"
+path = "src/main.rs"
+
+[dependencies]
+# The shared contract: the object format, the JIR-S schema, the printer stack, the options.
+rcgjs-object = { path = "../rcgjs-object" }
+# Decoding the manifest the backend hands over.
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+# Reading the `ar` archives rustc packs rlibs into.
+object = { version = "0.39.1", default-features = false, features = ["read", "std", "archive"] }
+# Turning the JIR-R control flow graph into loops and branches (`lower/structure.rs`).
+structurizer = { path = "../structurizer" }
+# Exact wire-size economics for physical ABI candidates. Both run in-process so link decisions
+# are deterministic and do not depend on whichever `gzip`/`brotli` binaries are installed.
+flate2 = { version = "1.1.8", default-features = false, features = ["rust_backend"] }
+brotli = "8.0.4"
+serde_json.workspace = true
+
+[dev-dependencies]
+sha2.workspace = true
+
+[lints]
+workspace = true

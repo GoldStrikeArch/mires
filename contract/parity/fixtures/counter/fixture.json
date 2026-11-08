@@ -1,0 +1,29 @@
+{
+  "$comment": "Fixture #1: the counter island. `expected` carries the numbers so that a backend fix flips a value here and nothing else. See README.md.",
+  "name": "counter",
+  "route": "/island",
+  "mount": "topcoat-island[data-ti=\"counter\"]",
+  "island": "counter",
+  "events": [
+    "click"
+  ],
+  "expected": {
+    "seeds": [
+      5
+    ],
+    "keys": [
+      "0"
+    ],
+    "$keys": "The hydration keys in allocation order, relative to the render id. The counter has no components, so its one template root takes root slot 0 and there is nothing to nest. Declared anyway: it is what makes the scheme check non-vacuous here, and it is the value the `nested` fixture's list is the interesting version of.",
+    "components": 0,
+    "$components": "Component boundaries in the source. Zero, so every slot the keys imply must be spent by an element that carries it.",
+    "hydrateMutations": 0,
+    "$hydrateMutations": "How many MutationRecords the hydrate bracket produces. 0 is the target and the value hydration is supposed to have: solid's insertExpression returns early for a string or number hole while hydrating, so a correctly claimed text hole is a no-op.",
+    "htmlAfterHydrate": null,
+    "$htmlAfterHydrate": "null means the mount must serialize identically before and after hydration. A string means it must equal that string exactly -- use that form only to record a known, reviewed defect.",
+    "clickMutations": 1,
+    "$clickMutations": "MutationRecords from one click on +1. 1 is the target and the current value: upstream claims only the value between the markers, so an update writes .data on the server's text node. (The getNextMarker defect used to cost 3; fixed in wave 5.)",
+    "clickHtml": "<p class=\"island-count\">count <!--$-->6<!--/--></p>",
+    "$clickHtml": "The count element after one click, with both marker comments preserved."
+  }
+}

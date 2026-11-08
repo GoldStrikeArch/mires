@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Compiles one no_core Rust source file to JavaScript with the rustc_codegen_mires
+# Compiles one no_core Rust source file to JavaScript with the rustc_codegen_js
 # backend.
 #
 #   scripts/compile.sh <src.rs> <out.js>
@@ -23,14 +23,21 @@
 # expected output does not depend on where the checkout lives. It is spelled the
 # same way in scripts/compile_core.sh, which is what keeps a location recorded in
 # one crate and the same location recorded in another spelled identically, and so
-# shareable (see `js-hoist-consts` in backend/src/opts.rs).
+# shareable (see `js-hoist-consts` in rcgjs-object/src/opts.rs).
 #
 # $JS_EXTRA_ARGS is passed on to the backend as `-Cllvm-args`, the one channel a
-# hot-plugged codegen backend gets (see backend/src/opts.rs). It is empty by
+# hot-plugged codegen backend gets (see rcgjs-object/src/opts.rs). It is empty by
 # default, so the compiler is invoked exactly as it was without it. Several
 # options separate with spaces:
 #
 #   JS_EXTRA_ARGS='js-structure=trampoline' scripts/test.sh
+#
+# $JSC_RUST_MIR_INLINE=on adds `-Zinline-mir`, which runs rustc's MIR inliner on
+# this crate. The sysroot is always built with it (scripts/build_sysroot.sh), so
+# this only ever adds the app-crate half; it changes what rustc hands the backend
+# and so changes the emitted JavaScript in every optimizer mode. It is off by
+# default, which is what keeps the goldens and the off/report byte identity
+# untouched.
 #
 # With `js-source-map=on` the backend also writes <out.js>.map beside the output
 # and ends the JavaScript with a sourceMappingURL comment naming it. The map is
@@ -42,6 +49,10 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd -- "$script_dir/.." && pwd)
+# shellcheck source=integration-lock.sh
+source "$script_dir/integration-lock.sh"
+# shellcheck source=sysroot-cache.sh
+source "$script_dir/sysroot-cache.sh"
 
 if [ "$#" -ne 2 ]; then
 	echo "usage: compile.sh <src.rs> <out.js>" >&2
@@ -77,6 +88,18 @@ if [ ! -f "$dylib" ]; then
 	exit 1
 fi
 
+# The consumer half of the compiler. The dylib finds it as its own sibling, which
+# is where scripts/build.sh puts it; exporting the path says so outright, so a
+# stale or relocated build tree fails here with a name rather than inside rustc.
+: "${JSC_LINK_BIN:=$root/target/release/jsc-link}"
+export JSC_LINK_BIN
+
+if [ ! -f "$JSC_LINK_BIN" ]; then
+	echo "compile.sh: linker not built: $JSC_LINK_BIN" >&2
+	echo "compile.sh: run scripts/build.sh first" >&2
+	exit 1
+fi
+
 # rustc derives the crate name from the file stem, with `-` mapped to `_`.
 crate=$(basename -- "$src" .rs | tr '-' '_')
 
@@ -94,13 +117,32 @@ trap 'rm -f "$stamp"' EXIT
 
 stderr_file="$out_dir/.compile-stderr.$$"
 
-# An empty array expands to nothing at all, which is what keeps the default
-# command line unchanged. (The `${a[@]+...}` guard is for bash 3.2, where an
-# empty array under `set -u` is an unbound variable.)
-backend_args=()
+# Rustc tracks the path but not the backend file's contents.
+backend_args=(-Cllvm-args="js-producer=$(jsc_sha256_file "$dylib")")
 if [ -n "${JS_EXTRA_ARGS:-}" ]; then
-	backend_args=(-Cllvm-args="$JS_EXTRA_ARGS")
+	backend_args+=(-Cllvm-args="$JS_EXTRA_ARGS")
 fi
+
+rust_opt_args=()
+if [ -n "${JSC_RUST_OPT_LEVEL:-}" ]; then
+	case "$JSC_RUST_OPT_LEVEL" in
+	0 | 1 | 2 | 3 | s | z) rust_opt_args=(-Copt-level="$JSC_RUST_OPT_LEVEL") ;;
+	*)
+		echo "compile.sh: invalid JSC_RUST_OPT_LEVEL: $JSC_RUST_OPT_LEVEL" >&2
+		exit 2
+		;;
+	esac
+fi
+
+mir_inline_args=()
+case "${JSC_RUST_MIR_INLINE:-off}" in
+off) ;;
+on) mir_inline_args=(-Zinline-mir) ;;
+*)
+	echo "compile.sh: invalid JSC_RUST_MIR_INLINE: $JSC_RUST_MIR_INLINE" >&2
+	exit 2
+	;;
+esac
 
 set +e
 (
@@ -110,6 +152,8 @@ set +e
 			--edition 2021 --crate-type lib --emit=obj \
 			--target wasm32-unknown-unknown \
 			-Ccodegen-units=1 -Cpanic=abort -Coverflow-checks=off -Cdebug-assertions=off -Cdebuginfo=0 \
+			${rust_opt_args[@]+"${rust_opt_args[@]}"} \
+			${mir_inline_args[@]+"${mir_inline_args[@]}"} \
 			--remap-path-prefix "$root/=" \
 			${backend_args[@]+"${backend_args[@]}"} \
 			-o "$out" "$src"

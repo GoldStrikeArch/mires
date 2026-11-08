@@ -26,11 +26,11 @@ use rustc_abi::Variants;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_middle::mir::visit::{PlaceContext, Visitor};
 use rustc_middle::mir::{
-    Body, Local, Location, Operand, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind,
+    Body, Local, Location, Operand, Rvalue, StatementKind, TerminatorKind, RETURN_PLACE,
 };
 use rustc_middle::ty::{Instance, Ty, TyCtxt};
 
-use crate::value::{self, EnumRepr, typing_env};
+use crate::value::{self, typing_env, EnumRepr};
 
 /// The tag-reading locals of one body, with the enum each one's tag belongs to.
 #[derive(Default)]
@@ -57,7 +57,9 @@ impl<'tcx> TagDiscrs<'tcx> {
 
         for (block, data) in mir.basic_blocks.iter_enumerated() {
             for (index, statement) in data.statements.iter().enumerate() {
-                let StatementKind::Assign(assignment) = &statement.kind else { continue };
+                let StatementKind::Assign(assignment) = &statement.kind else {
+                    continue;
+                };
                 let (Some(local), Rvalue::Discriminant(source)) =
                     (assignment.0.as_local(), &assignment.1)
                 else {
@@ -85,7 +87,10 @@ impl<'tcx> TagDiscrs<'tcx> {
                     continue;
                 }
                 // A second definition of the same local means its value is not this one read.
-                let at = Location { block, statement_index: index };
+                let at = Location {
+                    block,
+                    statement_index: index,
+                };
                 if candidates.insert(local, (source_ty, at)).is_some() {
                     rejected.insert(local);
                 }
@@ -100,13 +105,29 @@ impl<'tcx> TagDiscrs<'tcx> {
         // can serve.
         let mut switched = FxHashSet::default();
         for (block, data) in mir.basic_blocks.iter_enumerated() {
-            let Some(terminator) = &data.terminator else { continue };
-            let TerminatorKind::SwitchInt { discr, .. } = &terminator.kind else { continue };
-            let Some(local) = discr.place().and_then(|place| place.as_local()) else { continue };
-            switched.insert((local, Location { block, statement_index: data.statements.len() }));
+            let Some(terminator) = &data.terminator else {
+                continue;
+            };
+            let TerminatorKind::SwitchInt { discr, .. } = &terminator.kind else {
+                continue;
+            };
+            let Some(local) = discr.place().and_then(|place| place.as_local()) else {
+                continue;
+            };
+            switched.insert((
+                local,
+                Location {
+                    block,
+                    statement_index: data.statements.len(),
+                },
+            ));
         }
 
-        let mut collector = Collector { candidates: &candidates, switched, rejected };
+        let mut collector = Collector {
+            candidates: &candidates,
+            switched,
+            rejected,
+        };
         collector.visit_body(mir);
         let rejected = collector.rejected;
 
@@ -140,7 +161,9 @@ struct Collector<'a, 'tcx> {
 
 impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
     fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
-        let Some((_, definition)) = self.candidates.get(&local) else { return };
+        let Some((_, definition)) = self.candidates.get(&local) else {
+            return;
+        };
         // `StorageLive`, `StorageDead` and the other non-uses do not read the value.
         if matches!(context, PlaceContext::NonUse(_)) {
             return;

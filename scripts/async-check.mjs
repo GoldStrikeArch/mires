@@ -89,11 +89,19 @@ const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href)
 
 {
   const emitted = text("02_owner");
-  check(
-    "shape: the scheduler is a microtask through the shim",
-    /__rt\.microtask\(\(\) =>/.test(emitted),
-    emitted.match(/.*__rt\.microtask.*/)?.[0]?.trim()
-  );
+  const optimized = process.env.ASYNC_OPT_MODE === "on";
+  if (optimized) {
+    check(
+      "shape: the compiler emitted the shared host future driver",
+      /__rt\.host_spawn\(/.test(emitted),
+      emitted.match(/.*__rt\.host_spawn.*/)?.[0]?.trim()
+    );
+  } else {
+    check(
+      "shape: off/report uses the safe Rust microtask executor",
+      /__rt\.microtask\(/.test(emitted) && /__rt\.host_local_waker\(/.test(emitted)
+    );
+  }
   check(
     "shape: the promise bridge is the shim's `settled`",
     /__rt\.settled\(/.test(emitted),
@@ -101,20 +109,19 @@ const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href)
   );
   check(
     "shape: the owner is captured through the DOM module",
-    /import \{ getOwner as _\$getOwner \} from "\.\/mires-dom\.js";/.test(emitted)
+    /import \{ getOwner as _\$getOwner \} from "\.\/topcoat-dom\.js";/.test(emitted)
   );
   check(
     "shape: and re-entered through it",
-    /import \{ runWithOwner as _\$runWithOwner \} from "\.\/mires-dom\.js";/.test(emitted) &&
-      /_\$runWithOwner\(/.test(emitted),
-    emitted.match(/.*_\$runWithOwner\(.*/)?.[0]?.trim()
+    /import \{ runWithOwner as _\$runWithOwner \} from "\.\/topcoat-dom\.js";/.test(emitted) &&
+      (optimized
+        ? /__rt\.host_spawn\([^;]*_\$runWithOwner/.test(emitted)
+        : /_\$runWithOwner\(/.test(emitted)),
+    emitted.match(/.*_\$runWithOwner.*/)?.[0]?.trim()
   );
-  // The waker's data is a task id and never an address: a `RawWaker` built from a heap pointer is
-  // the one shape this value model has a miscompile history with.
   check(
-    "shape: the waker vtable is a plain record of four functions",
-    /VTABLE\$?\w* = \{ clone: /.test(emitted),
-    emitted.match(/.*VTABLE.* = \{ clone.*/)?.[0]?.trim()?.slice(0, 120)
+    "shape: no Rust task table or RawWaker is linked",
+    !/view_async::task::(?:install|lookup|waker_for)|RawWakerVTable|static mut TASKS/.test(emitted)
   );
 }
 
@@ -147,10 +154,10 @@ const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href)
 
 {
   reset();
-  const dom = await import(pathToFileURL(path.join(from, "mires-dom.js")).href);
+  const dom = await import(pathToFileURL(path.join(from, "topcoat-dom.js")).href);
   const js = await load("02_owner");
   // The island's own owner. `run` is called under it, the way an island's setup is.
-  const island = { name: "island" };
+  const island = { name: "island", cleanups: null };
   const signal = dom.runWithOwner(island, () => js.run());
 
   check("02: the signal starts at its initial value", signal[0]() === 0, String(signal[0]()));
@@ -172,6 +179,42 @@ const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href)
   );
   check("02: the write landed on the signal", signal[0]() === 1, String(signal[0]()));
   check("02: and the owner is restored again afterwards", dom.getOwner() === null);
+}
+
+// The same compiled owner-aware future also accepts a getter-backed thenable. The
+// bridge must call the retrieved method, preserving its receiver, after one lookup.
+{
+  reset();
+  const dom = await import(pathToFileURL(path.join(from, "topcoat-dom.js")).href);
+  const js = await load("02_owner");
+  const original = globalThis.resolved;
+  const trace = [];
+  globalThis.resolved = (value) => {
+    const thenable = Object.create({
+      get then() {
+        trace.push("get");
+        return new Proxy(function () {}, {
+          get() { throw new Error("unexpected callable property read"); },
+          apply(target, receiver, args) {
+            trace.push(receiver === thenable ? "receiver" : "wrong receiver");
+            args[0](value);
+          },
+        });
+      },
+    });
+    return thenable;
+  };
+  try {
+    const owner = { name: "thenable", cleanups: null };
+    const signal = dom.runWithOwner(owner, () => js.run());
+    check("02 thenable: the task is still deferred", trace.length === 0 && signal[0]() === 0);
+    await settleAll();
+    check("02 thenable: one lookup and the original receiver", JSON.stringify(trace) === JSON.stringify(["get", "receiver"]), JSON.stringify(trace));
+    check("02 thenable: the compiled future resumes once", JSON.stringify(steps) === JSON.stringify(["reply"]) && signal[0]() === 1);
+    check("02 thenable: owner reentry and restoration", owners.get("resume") === owner && dom.getOwner() === null);
+  } finally {
+    globalThis.resolved = original;
+  }
 }
 
 // --------------------------------------------- 03: a rejection is a value, not a rejection
@@ -261,6 +304,117 @@ const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href)
     JSON.stringify(steps)
   );
 }
+
+// ------------------------------------- 06: a procedure, through the framework's own expansion
+
+{
+  // Every request the compiled program made: the url, the media type and the body. The client
+  // half builds the whole `fetch` init itself with a `js!{}` block, so what is recorded here is
+  // the real thing rather than the arguments of a host function that stood in for it: the method,
+  // the header the block writes under a name Rust cannot spell, and the body.
+  let requests = [];
+  let answer = null;
+  globalThis.fetch = (url, init) => {
+    requests.push({
+      url,
+      method: init?.method,
+      contentType: init?.headers?.["content-type"],
+      body: init?.body,
+    });
+    // A `Response` as far as the block reads one: a status it checks and a body it reads.
+    return Promise.resolve(answer).then((text) => ({ ok: true, status: 200, text: () => text }));
+  };
+
+  reset();
+  const js = await load("06_procedure");
+  const emitted = text("06_procedure");
+
+  // The route and the media type are the wire's, and they are in the compiled text because the
+  // client half builds them: a client that agreed with the server by accident would not be.
+  check(
+    "06: the route prefix is the wire's",
+    emitted.includes('"/_topcoat/procedures/"'),
+    emitted.match(/"\/_topcoat\/procedures\/"/)?.[0]
+  );
+  check(
+    "06: on the serde media type, not application/json",
+    emitted.includes('"application/topcoat+json"') && !emitted.includes('"application/json"')
+  );
+  // The `js!{}` block, which is what replaced the one host function this client used to need. The
+  // header name is in the compiled text because the client builds the init object itself, and it
+  // is the thing a `#[repr(C)]` struct could never have spelled.
+  check(
+    "06: the fetch init is built by the client, header name and all",
+    emitted.includes('"content-type"') && emitted.includes("globalThis.fetch"),
+    emitted.match(/globalThis\.fetch[^\n]*/)?.[0]
+  );
+  check(
+    "06: and no host function stands in for it",
+    !emitted.includes("topcoatFetch")
+  );
+
+  const reply = js.make_signal();
+  answer = Promise.resolve('"world"');
+  js.on_click("world", reply);
+  check("06: nothing was requested inline", requests.length === 0, String(requests.length));
+
+  await settleAll();
+  check("06: exactly one request went out", requests.length === 1, JSON.stringify(requests));
+  check(
+    "06: to the procedure's own id under the route",
+    /^\/_topcoat\/procedures\/[0-9a-f-]{36}$/.test(requests[0]?.url ?? ""),
+    requests[0]?.url
+  );
+  check(
+    "06: with the serde media type",
+    requests[0]?.contentType === "application/topcoat+json",
+    requests[0]?.contentType
+  );
+  check("06: as a POST", requests[0]?.method === "POST", requests[0]?.method);
+  // One argument is still an ARRAY. A client that sent the bare value would be understood by
+  // nothing, and it is the mistake a hand-written one makes.
+  check(
+    "06: the argument crossed as a JSON array of one",
+    requests[0]?.body === '["world"]',
+    requests[0]?.body
+  );
+  check("06: the call succeeded", JSON.stringify(steps) === JSON.stringify(["ok"]), JSON.stringify(steps));
+  check("06: and the reply was written into the signal", reply[0]() === "world", String(reply[0]()));
+
+  // The zero-argument spelling is `[]` and not `null`, which PROCEDURES.md calls a deliberate and
+  // unshared asymmetry: `()` serializes to `null`, and the server decodes an array.
+  requests = [];
+  answer = Promise.resolve('"5"');
+  const version = js.make_signal();
+  js.on_version(version);
+  await settleAll();
+  check("06: a zero-argument call sends `[]`, not `null`", requests[0]?.body === "[]", requests[0]?.body);
+  check("06: and its reply lands too", version[0]() === "5", String(version[0]()));
+
+  // A failed request comes back as an `Err` the caller can render, not as a host rejection.
+  reset();
+  requests = [];
+  answer = Promise.reject("offline");
+  const failed = js.make_signal();
+  js.on_click("world", failed);
+  await settleAll();
+  check("06: a rejected request is an Err", JSON.stringify(steps) === JSON.stringify(["err"]), JSON.stringify(steps));
+  check("06: carrying the reason", failed[0]() === "offline", String(failed[0]()));
+  check("06: and still nothing reached the host unhandled", unhandled.length === 0, JSON.stringify(unhandled.map(String)));
+}
+
+const { checkOwnerCancellation } = await import("./async-cancellation-check.mjs");
+const cancellation = await checkOwnerCancellation(
+  await load("07_cancellation"),
+  await import(pathToFileURL(path.join(from, "topcoat-dom.js")).href),
+);
+
+console.log(`ok    07: owner cancellation (${cancellation.checks} assertions)`);
+
+// Subscription exceptions return through typed Rust error paths under the captured owner.
+const { checkOwnerSubscription } = await import('./async-subscription-check.mjs');
+await checkOwnerSubscription(await load('08_subscription'), await import(pathToFileURL(path.join(from, 'topcoat-dom.js')).href));
+console.log('owner subscription: 40 cases passed');
 
 console.log(`${failures === 0 ? "PASS" : "FAIL"}: ${failures} failed`);
 process.exit(failures === 0 ? 0 : 1);

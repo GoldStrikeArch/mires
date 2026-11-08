@@ -5,3 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+js-extern-macro = { path = "../js-extern-macro" }
+
+[lints]
+workspace = true

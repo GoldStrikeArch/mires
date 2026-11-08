@@ -3,9 +3,9 @@
 //   node build.mjs           build dist/ and record the size baseline
 //   node build.mjs --size    build and print sizes without touching the baseline
 //
-// Settings mirror crates/topcoat-runtime/browser/tsup.config.ts:
-//   format esm / noExternal (bundle everything) / platform browser /
-//   target es2022 / minify / sourcemap.
+// Settings match crates/topcoat-runtime/browser/tsup.config.ts for format,
+// bundling, platform, minification, and source maps. The syntax target is
+// deliberately ES2018 to match this compiler package rather than ES2022.
 
 import { build } from "esbuild";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dist = path.join(here, "dist");
-const outfile = path.join(dist, "mires-dom.js");
+const outfile = path.join(dist, "topcoat-dom.js");
 const maxbytesFile = `${outfile}.maxbytes`;
 const sizeOnly = process.argv.includes("--size");
 
@@ -31,7 +31,10 @@ const result = await build({
   external: [],
   format: "esm",
   platform: "browser",
-  target: "es2022",
+  // This artifact ships with the compiler's default ES2018 package. Keep the
+  // compatibility contract executable at the bundler boundary instead of
+  // relying on the current dependency source happening to parse as ES2018.
+  target: "es2018",
   minify: true,
   sourcemap: true,
   legalComments: "none",
@@ -60,7 +63,7 @@ if (leakedImport) {
   process.exit(1);
 }
 
-console.log(`dist/mires-dom.js      ${raw} bytes raw`);
+console.log(`dist/topcoat-dom.js      ${raw} bytes raw`);
 console.log(`                         ${gzip} bytes gzip`);
 
 if (!sizeOnly) {
@@ -77,7 +80,7 @@ if (!sizeOnly) {
     // First measurement establishes the baseline.
     writeFileSync(
       maxbytesFile,
-      `${gzip}\n# gzipped byte size of dist/mires-dom.js.\n# Baseline established ${new Date().toISOString().slice(0, 10)} by runtime/dom/build.mjs.\n# This is a measured value, not a budget target -- update it deliberately when\n# the artifact legitimately grows, so unexplained growth shows up in review.\n`
+      `${gzip}\n# gzipped byte size of dist/topcoat-dom.js.\n# Baseline established ${new Date().toISOString().slice(0, 10)} by runtime/dom/build.mjs.\n# This is a measured value, not a budget target -- update it deliberately when\n# the artifact legitimately grows, so unexplained growth shows up in review.\n`
     );
     console.log(`baseline                 established at ${gzip} bytes gzip`);
   }

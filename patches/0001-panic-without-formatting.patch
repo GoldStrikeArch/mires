@@ -4,7 +4,7 @@
          #[rustc_allow_const_fn_unstable(const_eval_select)]
          #[inline(always)] // inline the wrapper
          #[track_caller]
-+        // rustc_codegen_mires: both branches now use `$const_msg`, so the captured values are unused.
++        // rustc_codegen_js: both branches now use `$const_msg`, so the captured values are unused.
 +        #[allow(unused_variables)]
          const fn do_panic($($arg: $ty),*) -> ! {
              $crate::intrinsics::const_eval_select!(
@@ -13,7 +13,7 @@
                      $crate::panic!($const_msg)
                  } else #[track_caller] {
 -                    $crate::panic!($runtime_msg)
-+                    // rustc_codegen_mires: the runtime message is the formatted one, and formatting
++                    // rustc_codegen_js: the runtime message is the formatted one, and formatting
 +                    // is out of scope for this backend. Both branches now use the plain message.
 +                    $crate::panic!($const_msg)
                  }
@@ -26,12 +26,12 @@
  #[rustc_const_stable_indirect] // must follow stable const rules since it is exposed to stable
  pub const fn panic_display<T: fmt::Display>(x: &T) -> ! {
 -    panic_fmt(format_args!("{}", *x));
-+    // rustc_codegen_mires: `format_args!("{}", x)` builds a `&dyn Display` argument, and the vtable
++    // rustc_codegen_js: `format_args!("{}", x)` builds a `&dyn Display` argument, and the vtable
 +    // that goes with it keeps every `Display` impl in the program alive — which is how the whole
 +    // of `core::fmt`, and with it raw pointer arithmetic, becomes reachable from an
 +    // `Option::expect`. The message becomes a fixed string; the panic itself is unchanged.
 +    let _ = x;
-+    panic("panicked with a message that rustc_codegen_mires cannot format");
++    panic("panicked with a message that rustc_codegen_js cannot format");
  }
  
  #[cfg_attr(not(panic = "immediate-abort"), inline(never), cold, optimize(size))]
@@ -40,7 +40,7 @@
      }
  
 -    panic!("index out of bounds: the len is {len} but the index is {index}")
-+    // rustc_codegen_mires: the formatted message would pull `Display for usize` — and with it the
++    // rustc_codegen_js: the formatted message would pull `Display for usize` — and with it the
 +    // whole `core::fmt` machinery, which needs raw pointer arithmetic — into every program that
 +    // indexes a slice. The numbers are dropped; the abort is not.
 +    let _ = (index, len);
@@ -53,7 +53,7 @@
      U: fmt::Debug + ?Sized,
  {
 -    assert_failed_inner(kind, &left, &right, args)
-+    // rustc_codegen_mires: see `panic_display`. Dropping the two `&dyn Debug` coercions is what keeps
++    // rustc_codegen_js: see `panic_display`. Dropping the two `&dyn Debug` coercions is what keeps
 +    // `Debug` impls — and the formatting machinery behind them — out of the program.
 +    let _ = (left, right, args);
 +    match kind {
@@ -64,3 +64,62 @@
  }
  
  /// Internal function for `assert_match!`
+--- a/library/core/src/str/mod.rs
+--- a/library/core/src/str/mod.rs
++++ b/library/core/src/str/mod.rs
+@@ -82,50 +82,11 @@
+ 
+ #[track_caller]
+ fn slice_error_fail_rt(s: &str, begin: usize, end: usize) -> ! {
+-    let len = s.len();
+-
+-    // 1. begin is OOB.
+-    if begin > len {
+-        panic!("start byte index {begin} is out of bounds for string of length {len}");
+-    }
+-
+-    // 2. end is OOB.
+-    if end > len {
+-        panic!("end byte index {end} is out of bounds for string of length {len}");
+-    }
+-
+-    // 3. range is backwards.
+-    if begin > end {
+-        panic!("byte range starts at {begin} but ends at {end}");
+-    }
+-
+-    // 4. begin is inside a character.
+-    if !s.is_char_boundary(begin) {
+-        let floor = s.floor_char_boundary(begin);
+-        let ceil = s.ceil_char_boundary(begin);
+-        let range = floor..ceil;
+-        let ch = s[floor..ceil].chars().next().unwrap();
+-        panic!(
+-            "start byte index {begin} is not a char boundary; it is inside {ch:?} (bytes {range:?} of string)"
+-        )
+-    }
+-
+-    // 5. end is inside a character.
+-    if !s.is_char_boundary(end) {
+-        let floor = s.floor_char_boundary(end);
+-        let ceil = s.ceil_char_boundary(end);
+-        let range = floor..ceil;
+-        let ch = s[floor..ceil].chars().next().unwrap();
+-        panic!(
+-            "end byte index {end} is not a char boundary; it is inside {ch:?} (bytes {range:?} of string)"
+-        )
+-    }
+-
+-    // 6. end is OOB and range is inclusive (end == len).
+-    // This test cannot be combined with 2. above because for cases like
+-    // `"abcαβγ"[4..9]` the error is that 4 is inside 'α', not that 9 is OOB.
+-    debug_assert_eq!(end, len);
+-    panic!("end byte index {end} is out of bounds for string of length {len}");
++    // rustc_codegen_js: the formatted messages name the offending `char` with `Debug`,
++    // which keeps `fmt`, escape iterators, and Unicode tables reachable from every
++    // `&s[a..b]`. The abort is unchanged; the message matches `slice_error_fail_ct`.
++    let _ = (s, begin, end);
++    panic!("failed to slice string");
+ }
+ 
+ impl str {

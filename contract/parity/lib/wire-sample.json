@@ -1,0 +1,42 @@
+{
+	"$what": "The wire block the deleted search fixture carried, kept as the harness unit tests' sample input: test.mjs proves the procedure-wire checks against it. It is a sample of the typed procedure wire, not a fixture; run.mjs does not read it.",
+	"wire": {
+		"$what": "The procedure wire the island's client half speaks. Every value here is CHECKED against contract/fixtures/procedure-wire.json by lib/wire.mjs, on every run including while this fixture is pending. So this block cannot drift from the spec, and the stub interact.mjs builds from it cannot be a convenient approximation.",
+		"wire": "serde",
+		"$wireWhy": "The serde wire, not the surrogate one: a procedure returning Vec<String> to a Rust-compiled client is exactly what that wire exists for. procedure-wire.json `wires.serde.$exclusive` records that a serde procedure cannot be named from expr! at all, so this island cannot use the surrogate path even by accident.",
+		"routePrefix": "/_topcoat/procedures",
+		"method": "POST",
+		"requestContentType": "application/topcoat+json",
+		"responseContentType": "application/json",
+		"zeroArguments": "[]",
+		"$zeroArguments": "Recorded even though this island always sends one argument, because it is the asymmetry most likely to be got wrong: the SURROGATE wire spells zero arguments `null` and each wire rejects the other's spelling. interact.mjs asserts the island never sends `null`.",
+		"errorStatus": 400,
+		"errorContentType": "text/plain",
+		"errorBodyStartsWith": "bad request: invalid JSON value:",
+		"errorBodyEndsWith": "(at `[0]`)",
+		"$errorBody": "The middle of this message is serde_json's own wording and MUST NOT be asserted -- a patch release would break the test. Prefix and suffix only. The suffix is DERIVED from the spec's $pathRule at `errorArgumentIndex`, not copied: the rule is that segments join with `.` and a sequence index is written `[n]`, and the argument array is a sequence.",
+		"idIsNotKnowable": true,
+		"$idIsNotKnowable": "A procedure's id is a v4 uuid minted at MACRO-EXPANSION time, so it is not stable across rebuilds and cannot be written down here. The fixture asserts the route SHAPE -- the prefix plus exactly one non-empty segment -- which is everything about the URL that is knowable from the client side.",
+		"vectors": {
+			"oneArgument": "serde-one-arg",
+			"zeroArguments": "serde-zero-args",
+			"zeroArgumentsRejectsNull": "serde-zero-args-rejects-null",
+			"mediaTypeRejected": "serde-rejects-json-media-type",
+			"response": "response-struct",
+			"error": "serde-wrong-argument-type"
+		},
+		"$vectors": "The vectors this fixture honours, by id. lib/wire.mjs asserts each one exists and that the values above are the ones it carries. Naming them rather than copying them is the whole mechanism: when a vector was corrected in wave 2, a fixture that had copied the value would have kept sending the stale one into a stub that accepted it happily.",
+		"$ifTheIslandDivergesFromThis": "The framework agent's host-call design may hit a demo-app route rather than the procedure route (their finding: a procedure id is minted per expansion, so one #[procedure] in a file shared by the server and client crates gets TWO different uuids and cannot address itself). If so: move `routePrefix` to what the island calls and record the divergence, but KEEP the body encoding, the media type and the error vectors -- those are what this fixture is for, and they are the part their design preserves.",
+		"callTarget": {
+			"kind": "exactPath",
+			"path": "/demo/search",
+			"$why": "NOT the procedure route, and this is a finding rather than a shortcut. A procedure's id is a v4 uuid minted at MACRO-EXPANSION time, and an island's file is expanded TWICE -- once by the server crate, once by the client crate -- so the two expansions mint DIFFERENT ids and a procedure declared in a file shared by both halves cannot address itself from the client. demo-app's answer (framework agent, wave-3 item 3) is a written-down `#[route(POST \"/demo/search\")]` decoding through `topcoat::runtime::serde_args`, so the SAME wire is served at a URL that does not depend on an expansion. The `#[procedure(serde)] fn search` exists beside it as the surface an app uses.",
+			"$whatThisFixtureStillProves": "Everything it was for. The route changed; the wire did not. Media type, argument array encoding, zero-argument asymmetry, response encoding and the error shape are all unchanged, and those are what the vectors below pin. This is exactly the move `$ifTheIslandDivergesFromThis` prescribed before the divergence happened."
+		},
+		"$routePrefixNote": "Kept and still cross-checked against procedure-wire.json, because the procedure route DOES exist for `#[procedure(serde)] fn search` -- it is just not what a compiled island can call. `fetchStub` reports both `isProcedureRoute` and `onTarget` so a fixture can tell which it got.",
+		"errorArgumentIndex": 0,
+		"$errorArgumentIndex": "THIS procedure takes ONE argument, so a bad argument is index 0 and the server answers ``(at `[0]`)``. MEASURED live by the framework agent with curl against `POST /demo/search`. The vector below pins a TWO-argument signature, hence its `[1]`: same rule, different index. lib/wire.mjs therefore validates the spec's $pathRule against the vector's own recorded suffix FIRST and only then applies it here, so copying a literal that the real server never sends is not possible.",
+		"errorVectorArgumentIndex": 1,
+		"$errorVectorArgumentIndex": "The index the VECTOR's own bad argument sits at. Present so the rule check is a closed loop with no free parameter: if rule(1) stops rendering the vector's recorded suffix, either the rule or the vector moved, and the fixture must not be edited to paper over it."
+	}
+}

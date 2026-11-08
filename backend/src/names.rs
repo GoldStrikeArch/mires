@@ -40,8 +40,8 @@
 //! * a local name never starts with `$`. That namespace belongs to the compiler's own temporaries
 //!   (`$t0` from `place.rs`, `$s0` from `emit.rs`, `$loc` from `intrinsics.rs`), which are declared
 //!   in the same scope.
-//! * a local name is never `bb`, never a JavaScript reserved word, and never one of the globals
-//!   the emitted code reads ([`RESERVED`]) — `__rt` above all, which every shim call goes through.
+//! * a local name is never `bb`, never a JavaScript reserved word, and never one of the globals the
+//!   emitted code reads ([`RESERVED`]) — `__rt` above all, which every shim call goes through.
 //! * two locals never get the same name: collisions are resolved with a `$1`, `$2`, ... suffix,
 //!   numbered per function so that a body's names do not depend on anything outside it.
 //!
@@ -54,7 +54,7 @@
 
 use std::collections::HashSet;
 
-use rustc_middle::mir::{Body, Local, RETURN_PLACE, VarDebugInfoContents};
+use rustc_middle::mir::{Body, Local, VarDebugInfoContents, RETURN_PLACE};
 use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
 
@@ -72,7 +72,9 @@ const RESERVED: &[&str] = &[
     "ArrayBuffer",
     "BigInt",
     "Boolean",
+    "CompressionStream",
     "DataView",
+    "DecompressionStream",
     "Error",
     "Infinity",
     "Math",
@@ -81,6 +83,7 @@ const RESERVED: &[&str] = &[
     "Object",
     "String",
     "Symbol",
+    "Uint8Array",
     "arguments",
     "bb",
     "console",
@@ -96,21 +99,28 @@ pub(crate) struct LocalNames {
     /// the source map's `names` table, which is how a debugger shows `self` where the output says
     /// `self$1`. A local that kept its Rust spelling exactly is not listed: nothing to say.
     originals: Vec<(String, String)>,
+    globals: HashSet<String>,
 }
 
 impl LocalNames {
     /// The fallback naming: `_0`, `_1`, ... for every local, as the spike emitted them.
-    pub(crate) fn numbered(mir: &Body<'_>) -> LocalNames {
+    pub(crate) fn numbered(mir: &Body<'_>, globals: HashSet<String>) -> LocalNames {
+        let mut taken = globals.clone();
         LocalNames {
-            names: mir.local_decls.indices().map(|local| fallback(local)).collect(),
+            names: mir
+                .local_decls
+                .indices()
+                .map(|local| unique(fallback(local), &mut taken))
+                .collect(),
             originals: Vec::new(),
+            globals,
         }
     }
 
     /// The readable naming: `var_debug_info` where it says something, `_N` everywhere else.
-    pub(crate) fn new(mir: &Body<'_>, style: NameStyle) -> LocalNames {
+    pub(crate) fn new(mir: &Body<'_>, style: NameStyle, globals: HashSet<String>) -> LocalNames {
         if style == NameStyle::Mangled {
-            return LocalNames::numbered(mir);
+            return LocalNames::numbered(mir, globals);
         }
 
         // First wins. A local that two debug entries name — which inlining produces — reads as the
@@ -119,7 +129,9 @@ impl LocalNames {
         // told the first stands for.
         let mut wanted: Vec<Option<(String, String)>> = vec![None; mir.local_decls.len()];
         for info in &mir.var_debug_info {
-            let VarDebugInfoContents::Place(place) = info.value else { continue };
+            let VarDebugInfoContents::Place(place) = info.value else {
+                continue;
+            };
             // A projection means the name is not this local but a piece of it — a closure capture,
             // a field of a scattered aggregate. Naming the whole local after the piece would lie.
             if !place.projection.is_empty() {
@@ -139,10 +151,11 @@ impl LocalNames {
         // Every local that keeps its number holds that number's spelling, so a debug name that
         // happens to read `_7` cannot take it. (`rescue` already refuses that shape; this also
         // covers the collision suffixes.)
-        let mut taken: HashSet<String> = HashSet::with_capacity(mir.local_decls.len());
+        let mut taken = globals.clone();
+        let mut numbered = vec![String::new(); mir.local_decls.len()];
         for local in mir.local_decls.indices() {
             if wanted[local.as_usize()].is_none() {
-                taken.insert(fallback(local));
+                numbered[local.as_usize()] = unique(fallback(local), &mut taken);
             }
         }
         taken.insert(fallback(RETURN_PLACE));
@@ -158,11 +171,21 @@ impl LocalNames {
                     }
                     name
                 }
-                None => fallback(local),
+                None => numbered[local.as_usize()].clone(),
             };
             names.push(name);
         }
-        LocalNames { names, originals }
+        LocalNames {
+            names,
+            originals,
+            globals,
+        }
+    }
+
+    /// Keeps a compiler-generated name outside the declared host globals as well.
+    pub(crate) fn generated(&self, base: String) -> String {
+        let mut taken = self.globals.clone();
+        unique(base, &mut taken)
     }
 
     /// The JavaScript name to Rust name pairs worth putting in a source map's `names` table.
@@ -214,7 +237,10 @@ fn rescue(raw: &str) -> Option<String> {
         name.push('_');
     }
 
-    debug_assert!(jsast::is_plain_ident(&name), "`{name}` is not a JavaScript identifier");
+    debug_assert!(
+        jsast::is_plain_ident(&name),
+        "`{name}` is not a JavaScript identifier"
+    );
     Some(name)
 }
 
@@ -251,7 +277,10 @@ pub(crate) struct LineComments<'tcx> {
 impl<'tcx> LineComments<'tcx> {
     pub(crate) fn new(tcx: TyCtxt<'tcx>) -> LineComments<'tcx> {
         let on = crate::opts::get().line_comments;
-        LineComments { tcx: on.then_some(tcx), last: None }
+        LineComments {
+            tcx: on.then_some(tcx),
+            last: None,
+        }
     }
 
     /// Appends the comment for `span`, unless it would repeat the last one or the option is off.
@@ -261,7 +290,11 @@ impl<'tcx> LineComments<'tcx> {
             return;
         }
         let location = tcx.sess.source_map().lookup_char_pos(span.lo());
-        let file = location.file.name.prefer_remapped_unconditionally().to_string();
+        let file = location
+            .file
+            .name
+            .prefer_remapped_unconditionally()
+            .to_string();
         let text = format!("{file}:{}", location.line);
         if self.last.as_deref() == Some(text.as_str()) {
             return;
@@ -291,13 +324,18 @@ pub(crate) struct Locs<'tcx> {
 impl<'tcx> Locs<'tcx> {
     pub(crate) fn new(tcx: TyCtxt<'tcx>) -> Locs<'tcx> {
         let on = crate::opts::get().source_map;
-        Locs { tcx: on.then_some(tcx), last: None }
+        Locs {
+            tcx: on.then_some(tcx),
+            last: None,
+        }
     }
 
     /// Appends the marker for `span`, unless it would repeat the last one or the option is off.
     pub(crate) fn at(&mut self, out: &mut Vec<Stmt>, span: Span) {
         let Some(tcx) = self.tcx else { return };
-        let Some(loc) = location_of(tcx, span) else { return };
+        let Some(loc) = location_of(tcx, span) else {
+            return;
+        };
         if self.last.as_ref() == Some(&loc) {
             return;
         }
@@ -315,11 +353,19 @@ pub(crate) fn location_of(tcx: TyCtxt<'_>, span: Span) -> Option<Loc> {
         return None;
     }
     let position = tcx.sess.source_map().lookup_char_pos(span.lo());
-    let file = position.file.name.prefer_remapped_unconditionally().to_string();
+    let file = position
+        .file
+        .name
+        .prefer_remapped_unconditionally()
+        .to_string();
     if file.is_empty() {
         return None;
     }
-    Some(Loc { file, line: position.line as u32, col: position.col.0 as u32 })
+    Some(Loc {
+        file,
+        line: position.line as u32,
+        col: position.col.0 as u32,
+    })
 }
 
 #[cfg(test)]

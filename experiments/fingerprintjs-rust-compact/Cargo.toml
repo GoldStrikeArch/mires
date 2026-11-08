@@ -1,0 +1,22 @@
+[package]
+name = "fingerprintjs-rust-compact-experiment"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "A compact safe Rust port of FingerprintJS 5.2.0"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+mires-js = { path = "../../mires-js" }
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+too_many_lines = "allow"

@@ -1,0 +1,11 @@
+{
+  "name": "rustc-codegen-js-browser-workloads",
+  "version": "0.0.0-experiment",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "test": "node tools/run.mjs",
+    "all": "npm run build && npm test"
+  }
+}

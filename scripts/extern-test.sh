@@ -12,6 +12,12 @@
 # golden:
 #
 #   NN.js.expected     the emitted JavaScript, byte for byte
+#   NN.jir.js.expected the same under `JS_EXTRA_ARGS='js-lane=jir'`, for a fixture whose text the
+#                      JIR lowering changes. Absent where the two lanes print the same bytes.
+#
+# EXTERN_OPT_MODE=off|report|on (default off) compiles every fixture with the optimizer in that
+# mode. `on` rewrites the printed text, so the goldens are skipped under it and the two contract
+# drivers below carry the check.
 #
 # and the meaning of that emission is checked separately by two drivers. scripts/extern-check.mjs
 # runs the compiled module against contract/fixtures/js-extern/chart-lib.mjs and compares the
@@ -38,6 +44,44 @@ log_dir="$root/build/logs"
 
 EXTERN_ARGS="js-names=readable js-comments=on js-modules=esm"
 
+# The lane the caller asked for, passed through to every compilation here. `js-lane` is a link
+# step decision and not emit-affecting, so it needs no sysroot of its own; only `jir` is honoured,
+# since `shadow` writes two programs and this suite drives one. What the suite asserts is what the
+# program DOES, which is exactly what must not depend on the lane.
+lane=""
+lane_note=""
+case " ${JS_EXTRA_ARGS:-} " in
+*" js-lane=jir "*)
+	lane=jir
+	EXTERN_ARGS="$EXTERN_ARGS js-lane=jir"
+	lane_note="js-lane=jir"
+	;;
+esac
+
+# The optimizer mode, its own control rather than something read out of $JS_EXTRA_ARGS: the flags
+# here are pinned, so an option arriving through the environment would silently be dropped. Unlike
+# `js-lane`, `js-opt` IS emit-affecting, so `on` and `report` link against their own keyed sysroot,
+# built below. Under `on` the passes rewrite the printed text, so the JS goldens are not compared
+# — the two contract drivers are, and they are what says the emission still MEANS the same thing.
+EXTERN_OPT_MODE=${EXTERN_OPT_MODE:-off}
+case "$EXTERN_OPT_MODE" in
+off) ;;
+report | on) EXTERN_ARGS="$EXTERN_ARGS js-opt=$EXTERN_OPT_MODE" ;;
+*)
+	echo "extern-test.sh: EXTERN_OPT_MODE must be off, report, or on" >&2
+	exit 2
+	;;
+esac
+if [ "${UPDATE_EXPECT:-0}" = 1 ] && [ "$EXTERN_OPT_MODE" != off ]; then
+	echo "extern-test.sh: expectations may only be updated in off mode" >&2
+	exit 2
+fi
+echo "note: compiled with ${lane_note:-js-lane=baseline} js-opt=$EXTERN_OPT_MODE${lane:+; NN.jir.js.expected wins where it exists}"
+if [ "$EXTERN_OPT_MODE" = on ]; then
+	echo "note: EXTERN_OPT_MODE=on rewrites the printed text, so the JS goldens are not compared;"
+	echo "      the extern-check and globals-check vectors still are"
+fi
+
 mkdir -p "$build_dir" "$log_dir"
 
 # ---------------------------------------------------------------- prerequisites
@@ -49,6 +93,10 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
 		exit 1
 	fi
 fi
+
+# The keyed sysroot these fixtures link against: `js-names=readable`, and `js-opt` in the two
+# non-off modes, are emit-affecting and so key it.
+JS_EXTRA_ARGS="$EXTERN_ARGS" SKIP_BUILD=1 "$script_dir/build_sysroot.sh" >/dev/null
 
 echo "==> building js-extern-macro for the host"
 if ! (cd "$root" && cargo build -p js-extern-macro) >"$log_dir/extern-macro.log" 2>&1; then
@@ -97,6 +145,14 @@ for src in $sources; do
 	name=$(basename -- "${src%.rs}")
 	out="$build_dir/$name.js"
 	expected_js="$fixture_dir/$name.js.expected"
+	# The lane's own golden, where the fixture has one. A lane golden exists only where the lane's
+	# text differs from the baseline's; without one the baseline golden is what both are held to,
+	# which is how an item the lane prints identically stays a single expectation. Under
+	# UPDATE_EXPECT the lane golden is the one written, so a lane run cannot rebaseline the
+	# baseline.
+	if [ -n "$lane" ] && { [ "${UPDATE_EXPECT:-0}" = "1" ] || [ -f "$fixture_dir/$name.$lane.js.expected" ]; }; then
+		expected_js="$fixture_dir/$name.$lane.js.expected"
+	fi
 	total=$((total + 1))
 
 	echo "==> $name"
@@ -110,7 +166,10 @@ for src in $sources; do
 		continue
 	fi
 
-	if [ "${UPDATE_EXPECT:-0}" = "1" ]; then
+	if [ "$EXTERN_OPT_MODE" = on ]; then
+		echo "    ok (compiled; golden compare skipped under EXTERN_OPT_MODE=on)"
+		results="$results$name PASS compiled"$'\n'
+	elif [ "${UPDATE_EXPECT:-0}" = "1" ]; then
 		if ! cmp -s "$out" "$expected_js" 2>/dev/null; then
 			cp "$out" "$expected_js"
 			echo "    updated (js)"

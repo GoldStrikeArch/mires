@@ -26,7 +26,7 @@
 
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, ExistentialTraitRef, Instance, Ty, TyCtxt, VtblEntry};
-use rustc_span::{DUMMY_SP, Span};
+use rustc_span::{Span, DUMMY_SP};
 
 use crate::cgu::CguCx;
 use crate::item::{ItemKind, JsItem, JsName, Linkage, ZombieKind, ZombieLog};
@@ -101,6 +101,7 @@ fn build<'tcx>(
         Linkage::internal(),
         debug_path,
     )
+    .with_late_ir(crate::late_ir::vtable(cgu, ty, trait_ref))
 }
 
 /// Slot 0: the drop glue of the concrete type, or `null` when it has none.

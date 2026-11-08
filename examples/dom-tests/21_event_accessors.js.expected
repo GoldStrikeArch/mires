@@ -1,0 +1,81 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { createSignal as _$createSignal } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { delegateEvents as _$delegateEvents } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$hef6d6e397432ce04 = _$template("<div><input></input><p></p></div>");
+const tmpl$hc99f887f8f5c7c69 = _$template("<form><button>Go</button></form>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// cancel
+function cancel(event) {
+  lib$impl_0_prevent_default$h89891f6baccf05e7(event);
+}
+// Event::prevent_default
+function lib$impl_0_prevent_default$h89891f6baccf05e7(self) {
+  self.preventDefault();
+}
+// Event::target_value
+function lib$impl_0_target_value$hb940ae051483159d(self) {
+  return self.target.value || "";
+}
+// lib::Sig::<T>::get
+function lib$impl_1_get$hcd9f475050de987d(self) {
+  return self[0]();
+}
+// lib::Sig::<T>::set
+function lib$impl_1_set$h0a2e433321bf6a09(self, value) {
+  self[1](value);
+}
+// read_target_value
+function read_target_value(event) {
+  return lib$impl_0_target_value$hb940ae051483159d(event);
+}
+// rust_entry
+function rust_entry() {
+  x21_event_accessors$search_box$h3a84730dc176ff37();
+  x21_event_accessors$form$h7040c240e7021431();
+}
+// form::{closure#0}
+function x21_event_accessors$form$closure_0$h3d6903f2e7afdf37(_1, e) {
+  let _0;
+  _0 = lib$impl_0_prevent_default$h89891f6baccf05e7(e);
+}
+// form
+function x21_event_accessors$form$h7040c240e7021431() {
+  let _0;
+  _0 = tmpl$hc99f887f8f5c7c69();
+  _0.addEventListener("submit", ($a0) => x21_event_accessors$form$closure_0$h3d6903f2e7afdf37(undefined, $a0));
+  return _0;
+}
+// search_box::{closure#0}
+function x21_event_accessors$search_box$closure_0$h55695fefc4b33ba5(_1, e) {
+  let _0, _3;
+  _3 = _1[0];
+  _0 = lib$impl_1_set$h0a2e433321bf6a09(_3, lib$impl_0_target_value$hb940ae051483159d(e));
+}
+// search_box::{closure#1}
+function x21_event_accessors$search_box$closure_1$hc1f1aa79be9c1551(_1) {
+  return lib$impl_1_get$hcd9f475050de987d(_1[0]);
+}
+// search_box
+function x21_event_accessors$search_box$h3a84730dc176ff37() {
+  let _0, query, _5, _8, $t0, $t1;
+  query = _$createSignal("");
+  _0 = tmpl$hef6d6e397432ce04();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  _$delegateEvents(["input"]);
+  _5 = [query];
+  $t0.$$input = ($a0) => x21_event_accessors$search_box$closure_0$h55695fefc4b33ba5(_5, $a0);
+  _8 = [query];
+  _$insert($t1, () => x21_event_accessors$search_box$closure_1$hc1f1aa79be9c1551(_8));
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, cancel, read_target_value, rust_entry };

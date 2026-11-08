@@ -9,3 +9,6 @@ crate-type = ["rlib"]
 [dev-dependencies]
 # Inline snapshot assertions for the golden CFG matrix (`UPDATE_EXPECT=1` rebaselines).
 expect-test = "1.5.1"
+
+[lints]
+workspace = true

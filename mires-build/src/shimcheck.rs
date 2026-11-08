@@ -130,9 +130,16 @@ fn exports(source: &str, module: &Path) -> Result<BTreeSet<String>> {
             continue;
         }
 
-        let after = ["async function ", "function ", "const ", "let ", "var ", "class "]
-            .iter()
-            .find_map(|keyword| rest.strip_prefix(keyword));
+        let after = [
+            "async function ",
+            "function ",
+            "const ",
+            "let ",
+            "var ",
+            "class ",
+        ]
+        .iter()
+        .find_map(|keyword| rest.strip_prefix(keyword));
         if let Some(after) = after {
             if let Some(name) = identifier(after) {
                 out.insert(name);
@@ -273,9 +280,7 @@ mod tests {
         );
         assert_eq!(
             names(source),
-            [
-                "Widget", "alpha", "f2i", "gamma", "later", "memo", "mutable", "older",
-            ]
+            ["Widget", "alpha", "f2i", "gamma", "later", "memo", "mutable", "older",]
         );
     }
 
@@ -283,7 +288,8 @@ mod tests {
     fn the_generated_shim_clause_is_read_across_its_lines() {
         // `scripts/make-esm-shim.mjs` writes exactly this shape, one name per
         // line, and it is the whole export surface of the shim's module form.
-        let source = "export const {\n  alloc,\n  str_bytes,\n  write_bytes,\n} = globalThis.__rt;\n";
+        let source =
+            "export const {\n  alloc,\n  str_bytes,\n  write_bytes,\n} = globalThis.__rt;\n";
         assert_eq!(names(source), ["alloc", "str_bytes", "write_bytes"]);
     }
 
@@ -301,11 +307,13 @@ mod tests {
         // Not through the literal `__rt`: a minified or renamed binding is the
         // case a hard-coded name would miss silently.
         let text = concat!(
-            "import * as q from \"mires-island-rt\";\n",
+            "import * as q from \"topcoat-island-rt\";\n",
             "function go() { return q.str_bytes(\"x\").len + q.f2i(1, 0, 9); }\n",
         );
         assert_eq!(
-            members(text, "mires-island-rt").into_iter().collect::<Vec<_>>(),
+            members(text, "topcoat-island-rt")
+                .into_iter()
+                .collect::<Vec<_>>(),
             ["f2i", "str_bytes"]
         );
     }
@@ -313,12 +321,14 @@ mod tests {
     #[test]
     fn a_read_through_a_different_module_is_not_counted() {
         let text = concat!(
-            "import * as dom from \"mires-dom\";\n",
-            "import * as rt from \"mires-island-rt\";\n",
+            "import * as dom from \"topcoat-dom\";\n",
+            "import * as rt from \"topcoat-island-rt\";\n",
             "const a = dom.insert(x); const b = rt.f2i(1, 0, 9);\n",
         );
         assert_eq!(
-            members(text, "mires-island-rt").into_iter().collect::<Vec<_>>(),
+            members(text, "topcoat-island-rt")
+                .into_iter()
+                .collect::<Vec<_>>(),
             ["f2i"]
         );
     }
@@ -329,9 +339,6 @@ mod tests {
             "import * as rt from \"m\";\n",
             "const chart = { art: 1 }; const v = chart.art + rt.real;\n",
         );
-        assert_eq!(
-            members(text, "m").into_iter().collect::<Vec<_>>(),
-            ["real"]
-        );
+        assert_eq!(members(text, "m").into_iter().collect::<Vec<_>>(), ["real"]);
     }
 }

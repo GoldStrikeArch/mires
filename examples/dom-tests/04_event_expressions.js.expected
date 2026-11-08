@@ -1,0 +1,56 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { delegateEvents as _$delegateEvents } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h74604e505899397e = _$template("<button>Click</button>");
+const tmpl$hcd8b81b5130d4ae8 = _$template("<button>Change</button>");
+const tmpl$h0ec0bbc5767a9a8d = _$template("<button>Custom</button>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x04_event_expressions$delegated$hd9f266b034446292(1);
+  x04_event_expressions$non_delegated$h4f5fba49f789baad(2);
+  x04_event_expressions$custom_event$h153c0e26c73a4327(3);
+}
+// custom_event::{closure#0}
+function x04_event_expressions$custom_event$closure_0$h3ef7d05d9b13e20b(_1, _e) {
+  return _1[0];
+}
+// custom_event
+function x04_event_expressions$custom_event$h153c0e26c73a4327(value) {
+  let _0, _5;
+  _0 = tmpl$h0ec0bbc5767a9a8d();
+  _5 = [value];
+  _0.addEventListener("custom-event", ($a0) => x04_event_expressions$custom_event$closure_0$h3ef7d05d9b13e20b(_5, $a0));
+  return _0;
+}
+// delegated::{closure#0}
+function x04_event_expressions$delegated$closure_0$hc5103402f9996697(_1, _e) {
+  return _1[0] + 1 >>> 0;
+}
+// delegated
+function x04_event_expressions$delegated$hd9f266b034446292(count) {
+  let _0, _5;
+  _0 = tmpl$h74604e505899397e();
+  _$delegateEvents(["click"]);
+  _5 = [count];
+  _0.$$click = ($a0) => x04_event_expressions$delegated$closure_0$hc5103402f9996697(_5, $a0);
+  return _0;
+}
+// non_delegated::{closure#0}
+function x04_event_expressions$non_delegated$closure_0$h006d5ee870fb3d6f(_1, _e) {
+  return _1[0];
+}
+// non_delegated
+function x04_event_expressions$non_delegated$h4f5fba49f789baad(value) {
+  let _0, _5;
+  _0 = tmpl$hcd8b81b5130d4ae8();
+  _5 = [value];
+  _0.addEventListener("change", ($a0) => x04_event_expressions$non_delegated$closure_0$h006d5ee870fb3d6f(_5, $a0));
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

@@ -1,0 +1,43 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { setAttribute as _$setAttribute } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$hc0d519e2347888ba = _$template("<svg width=\"400\" height=\"180\"><rect stroke-width=\"2\" x=\"50\" y=\"20\" width=\"150\" height=\"150\"></rect></svg>");
+const tmpl$h38af7f491f8a7f72 = _$template("<svg width=\"400\" height=\"180\"><rect width=\"150\" height=\"150\"></rect></svg>");
+const tmpl$hdd54d9a668f8d7ff = _$template("<svg><linearGradient gradientTransform=\"rotate(25)\"><stop offset=\"0%\"></stop></linearGradient></svg>");
+const tmpl$h110c29d48a127398 = _$template("<svg><rect x=\"50\" y=\"20\" width=\"150\" height=\"150\"></rect></svg>", false, true, false);
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x09_svg$static_svg$h62c07596307fb683();
+  x09_svg$dynamic_svg$h5a32972d3c53d7c0("2", "50", "20");
+  x09_svg$camel_cased$h8cb952ebaab03e8d();
+  x09_svg$root_rect$h18e8f5c399c6d2ef();
+}
+// camel_cased
+function x09_svg$camel_cased$h8cb952ebaab03e8d() {
+  return tmpl$hdd54d9a668f8d7ff();
+}
+// dynamic_svg
+function x09_svg$dynamic_svg$h5a32972d3c53d7c0(width, x, y) {
+  let _0, $t0;
+  _0 = tmpl$h38af7f491f8a7f72();
+  $t0 = _0.firstChild;
+  _$setAttribute($t0, "stroke-width", width);
+  _$setAttribute($t0, "x", x);
+  _$setAttribute($t0, "y", y);
+  return _0;
+}
+// root_rect
+function x09_svg$root_rect$h18e8f5c399c6d2ef() {
+  return tmpl$h110c29d48a127398();
+}
+// static_svg
+function x09_svg$static_svg$h62c07596307fb683() {
+  return tmpl$hc0d519e2347888ba();
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

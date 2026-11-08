@@ -1,4 +1,4 @@
-//! `rustc_codegen_mires` — an out-of-tree rustc codegen backend that lowers monomorphized MIR to
+//! `rustc_codegen_js` — an out-of-tree rustc codegen backend that lowers monomorphized MIR to
 //! JavaScript.
 //!
 //! Plug-in mechanics are modeled on `rustc_codegen_cranelift` (`src/lib.rs`): the crate is a
@@ -17,10 +17,13 @@ extern crate rustc_hashes;
 extern crate rustc_hir;
 extern crate rustc_metadata;
 extern crate rustc_middle;
+extern crate rustc_mir_dataflow;
+extern crate rustc_serialize;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_symbol_mangling;
 extern crate rustc_target;
+extern crate rustc_type_ir;
 
 // Linking against rustc_driver prevents duplicating functions and statics that are already part of
 // the host rustc process (cg_clif src/lib.rs:29-31).
@@ -34,26 +37,28 @@ use rustc_codegen_ssa::{CompiledModules, CrateInfo, TargetConfig};
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::WorkProductMap;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::Session;
 use rustc_session::config::OutputFilenames;
-use rustc_span::{Symbol, sym};
+use rustc_session::Session;
+use rustc_span::{sym, Symbol};
 use rustc_target::spec::{Arch, Os};
 
 mod abi;
 mod alloc_support;
+mod async_analysis;
 mod base;
+pub(crate) use rcgjs_object::baseline_shadow;
 /// The `js!{}` block format.
 ///
 /// Included from `js-macro` for the same reason [`descriptor`] is included from
 /// `js-extern-macro`: the macro encodes, this backend decodes, and one file is what keeps the two
 /// from drifting. See its own docs for the encoding.
 #[path = "../../js-macro/src/block.rs"]
-#[allow(dead_code)]
 mod block;
 mod cfg_adapter;
 mod cgu;
 mod constant;
 mod constread;
+mod coroutine_source;
 /// The `#[js_extern]` descriptor format.
 ///
 /// The file itself lives in `js-extern-macro`, which is where it is written, and is included here
@@ -65,27 +70,32 @@ mod constread;
 /// for. Its unit tests come along and run under `cargo test -p rustc_codegen_mires` as well, so the
 /// two sides are checked against one format rather than against each other.
 #[path = "../../js-extern-macro/src/descriptor.rs"]
-#[allow(dead_code)]
 mod descriptor;
 mod driver;
 mod dts;
 mod emit;
+mod host;
+mod identity;
 mod intrinsics;
 mod item;
+mod jir;
 mod js_block;
 mod js_extern;
-mod jsast;
+mod source_mir;
+pub(crate) use rcgjs_object::jsast;
+mod late_ir;
 mod link;
 mod map;
-mod minify;
+pub(crate) use rcgjs_object::minify;
 mod names;
 mod naming;
+mod opportunity;
 mod opts;
 mod place;
 mod ptr;
 mod queue;
+mod representation;
 mod rvalue;
-mod sourcemap;
 mod tag;
 mod template;
 mod unsize;
@@ -104,13 +114,19 @@ impl CodegenBackend for JsCodegenBackend {
         use rustc_session::config::Lto;
 
         opts::init(sess);
+        identity::init(sess);
+        coroutine_source::init();
 
         match sess.lto() {
             Lto::No | Lto::ThinLocal => {}
             Lto::Thin | Lto::Fat => {
-                sess.dcx().fatal("LTO is not supported by rustc_codegen_mires");
+                sess.dcx().fatal("LTO is not supported by rustc_codegen_js");
             }
         }
+    }
+
+    fn provide(&self, providers: &mut rustc_middle::util::Providers) {
+        coroutine_source::provide(providers);
     }
 
     fn thin_lto_supported(&self) -> bool {
@@ -157,19 +173,23 @@ impl CodegenBackend for JsCodegenBackend {
     }
 
     fn print_version(&self) {
-        println!("rustc_codegen_mires version {}", env!("CARGO_PKG_VERSION"));
+        println!("rustc_codegen_js version {}", env!("CARGO_PKG_VERSION"));
     }
 
     fn codegen_crate(&self, tcx: TyCtxt<'_>) -> Box<dyn Any> {
+        coroutine_source::prepare(tcx);
         if tcx.sess.codegen_units().as_usize() > 1 {
             // More than one CGU still codegens fine, but rustc refuses to copy several object
             // files onto a single `-o` path, so the .js output would go missing.
             tcx.dcx().warn(
-                "rustc_codegen_mires expects `-Ccodegen-units=1`; with more than one codegen unit \
+                "rustc_codegen_js expects `-Ccodegen-units=1`; with more than one codegen unit \
                  rustc will not copy the emitted JavaScript to the `-o` path",
             );
         }
-        Box::new(rustc_codegen_ssa::base::codegen_crate(driver::JsDriver, tcx))
+        Box::new(rustc_codegen_ssa::base::codegen_crate(
+            driver::JsDriver,
+            tcx,
+        ))
     }
 
     fn join_codegen(
@@ -207,6 +227,8 @@ impl CodegenBackend for JsCodegenBackend {
 }
 
 /// Entry point for the hot-plugged backend (`-Zcodegen-backend=<this dylib>`).
+// The single exported symbol rustc loads; the attribute is the only unsafe in the crate.
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     Box::new(JsCodegenBackend)

@@ -1,0 +1,157 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { createComponent as _$createComponent } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { createSignal as _$createSignal } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { delegateEvents as _$delegateEvents } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h20207ec50a9647a8 = _$template("<span class=\"badge\"></span>");
+const tmpl$h07a70f6f8ea9cf54 = _$template("<p class=\"count\">count <!></p>");
+const tmpl$h77d9cd20252b8c99 = _$template("<p class=\"readout\"></p>");
+const tmpl$h22595ebb6e3adb73 = _$template("<div id=\"main\"></div>");
+const tmpl$h03ebdd9ea59a793d = _$template("<div class=\"panel\"><!><button>+1</button></div>");
+const tmpl$h2a202c626e514767 = _$template("<div class=\"panel\"></div>");
+const tmpl$h9d8116e62daa913b = _$template("<div class=\"row\"><!><!></div>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// lib::Sig::<T>::get
+function lib$impl_1_get$h22b2c6516c245f14(self) {
+  return self[0]();
+}
+// lib::Sig::<T>::set
+function lib$impl_1_set$h75b71d3dba9df7c0(self, value) {
+  self[1](value);
+}
+// rust_entry
+function rust_entry() {
+  x07_components$static_props$h03923becab21d97c();
+  x07_components$dynamic_prop$h58345bd88f89b268("Active");
+  x07_components$reactive_prop$h0b085c1226a14815();
+  x07_components$closure_prop$h316e9ecbb080144d();
+  x07_components$sibling_components$hc0a4afad91abccb4();
+}
+// badge
+function x07_components$badge$h7eb3e4096820bed5(props) {
+  let _0, label;
+  label = props.label;
+  _0 = tmpl$h20207ec50a9647a8();
+  _$insert(_0, label);
+  return _0;
+}
+// closure_prop::{closure#0}
+function x07_components$closure_prop$closure_0$h73f1c5950ef5fab2(_1) {
+  return x07_components$readout$h71bfca5e1f7ddca4({ read: [_1[0]] });
+}
+// closure_prop::{closure#0}::{closure#0}
+function x07_components$closure_prop$closure_0_closure_0$h2a1344230f93dadd(_1) {
+  return lib$impl_1_get$h22b2c6516c245f14(_1[0]) * 2;
+}
+// closure_prop
+function x07_components$closure_prop$h316e9ecbb080144d() {
+  let _0, count, _5;
+  count = _$createSignal(0);
+  _0 = tmpl$h2a202c626e514767();
+  _5 = [count];
+  _$insert(_0, _$createComponent(() => x07_components$closure_prop$closure_0$h73f1c5950ef5fab2(_5)));
+  return _0;
+}
+// dynamic_prop::{closure#0}
+function x07_components$dynamic_prop$closure_0$he7fc82aa749306d1(_1) {
+  return x07_components$badge$h7eb3e4096820bed5({ label: _1[0] });
+}
+// dynamic_prop
+function x07_components$dynamic_prop$h58345bd88f89b268(label) {
+  let _0, _5;
+  _0 = tmpl$h22595ebb6e3adb73();
+  _5 = [label];
+  _$insert(_0, _$createComponent(() => x07_components$dynamic_prop$closure_0$he7fc82aa749306d1(_5)));
+  return _0;
+}
+// live_count::{closure#0}
+function x07_components$live_count$closure_0$h82d4b2bfb6326391(_1) {
+  return lib$impl_1_get$h22b2c6516c245f14(_1[0]);
+}
+// live_count
+function x07_components$live_count$ha86cc1c4fa207721(props) {
+  let _0, count, _6, $t0, $t1;
+  count = props.count;
+  _0 = tmpl$h07a70f6f8ea9cf54();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  _6 = [count];
+  _$insert(_0, () => x07_components$live_count$closure_0$h82d4b2bfb6326391(_6), $t1);
+  return _0;
+}
+// reactive_prop::{closure#0}
+function x07_components$reactive_prop$closure_0$hb199926e627c07d0(_1) {
+  return x07_components$live_count$ha86cc1c4fa207721({ count: _1[0] });
+}
+// reactive_prop::{closure#1}
+function x07_components$reactive_prop$closure_1$hc717e99920c8dfb2(_1, _e) {
+  let _0, _3;
+  _3 = _1[0];
+  _0 = lib$impl_1_set$h75b71d3dba9df7c0(_3, lib$impl_1_get$h22b2c6516c245f14(_1[0]) + 1);
+}
+// reactive_prop
+function x07_components$reactive_prop$h0b085c1226a14815() {
+  let _0, count, _5, _8, $t0, $t1;
+  count = _$createSignal(0);
+  _0 = tmpl$h03ebdd9ea59a793d();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  _$delegateEvents(["click"]);
+  _5 = [count];
+  _$insert(_0, _$createComponent(() => x07_components$reactive_prop$closure_0$hb199926e627c07d0(_5)), $t0);
+  _8 = [count];
+  $t1.$$click = ($a0) => x07_components$reactive_prop$closure_1$hc717e99920c8dfb2(_8, $a0);
+  return _0;
+}
+// readout::{closure#0}
+function x07_components$readout$closure_0$hab1e7e6f2649bd2b(_1) {
+  return x07_components$closure_prop$closure_0_closure_0$h2a1344230f93dadd(_1[0]);
+}
+// readout
+function x07_components$readout$h71bfca5e1f7ddca4(props) {
+  let _0, read, _6;
+  read = props.read;
+  _0 = tmpl$h77d9cd20252b8c99();
+  _6 = [read];
+  _$insert(_0, () => x07_components$readout$closure_0$hab1e7e6f2649bd2b(_6));
+  return _0;
+}
+// sibling_components::{closure#0}
+function x07_components$sibling_components$closure_0$h3f9317bd2850cd79(_1) {
+  return x07_components$badge$h7eb3e4096820bed5({ label: "One" });
+}
+// sibling_components::{closure#1}
+function x07_components$sibling_components$closure_1$h15456278debccf8b(_1) {
+  return x07_components$badge$h7eb3e4096820bed5({ label: "Two" });
+}
+// sibling_components
+function x07_components$sibling_components$hc0a4afad91abccb4() {
+  let _0, $t0, $t1;
+  _0 = tmpl$h9d8116e62daa913b();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  _$insert(_0, _$createComponent(() => x07_components$sibling_components$closure_0$h3f9317bd2850cd79(undefined)), $t0);
+  _$insert(_0, _$createComponent(() => x07_components$sibling_components$closure_1$h15456278debccf8b(undefined)), $t1);
+  return _0;
+}
+// static_props::{closure#0}
+function x07_components$static_props$closure_0$h8634bca5ed463bb5(_1) {
+  return x07_components$badge$h7eb3e4096820bed5({ label: "Active" });
+}
+// static_props
+function x07_components$static_props$h03923becab21d97c() {
+  let _0;
+  _0 = tmpl$h22595ebb6e3adb73();
+  _$insert(_0, _$createComponent(() => x07_components$static_props$closure_0$h8634bca5ed463bb5(undefined)));
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

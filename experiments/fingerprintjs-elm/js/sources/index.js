@@ -1,0 +1,90 @@
+import { getUserAgentData } from './simple.js'
+import { getFonts } from './fonts.js'
+import { getDomBlockers } from './dom_blockers.js'
+import { getFontPreferences } from './font_preferences.js'
+import { getAudioFingerprint } from './audio.js'
+import { getScreenFrame } from './screen_frame.js'
+import { getCanvasFingerprint } from './canvas.js'
+import {
+  getOsCpu,
+  getLanguages,
+  getColorDepth,
+  getDeviceMemory,
+  getScreenResolution,
+  getHardwareConcurrency,
+  getTimezone,
+  getSessionStorage,
+  getLocalStorage,
+  getIndexedDB,
+  getOpenDatabase,
+  getCpuClass,
+  getPlatform,
+  getPlugins,
+  getTouchSupport,
+  getVendor,
+  getVendorFlavors,
+  areCookiesEnabled,
+  isPdfViewerEnabled,
+  getArchitecture,
+  getApplePayState,
+  getPrivateClickMeasurement,
+  getDateTimeLocale,
+} from './simple.js'
+import {
+  getColorGamut,
+  areColorsInverted,
+  areColorsForced,
+  getMonochromeDepth,
+  getContrastPreference,
+  isMotionReduced,
+  isTransparencyReduced,
+  isHDR,
+} from './media.js'
+import { getMathFingerprint } from './math.js'
+import { getAudioContextBaseLatency } from './audio.js'
+import { getWebGlBasics, getWebGlExtensions } from './webgl.js'
+
+export const sources = {
+  userAgentData: getUserAgentData,
+  fonts: getFonts,
+  domBlockers: getDomBlockers,
+  fontPreferences: getFontPreferences,
+  audio: getAudioFingerprint,
+  screenFrame: getScreenFrame,
+  canvas: getCanvasFingerprint,
+  osCpu: getOsCpu,
+  languages: getLanguages,
+  colorDepth: getColorDepth,
+  deviceMemory: getDeviceMemory,
+  screenResolution: getScreenResolution,
+  hardwareConcurrency: getHardwareConcurrency,
+  timezone: getTimezone,
+  sessionStorage: getSessionStorage,
+  localStorage: getLocalStorage,
+  indexedDB: getIndexedDB,
+  openDatabase: getOpenDatabase,
+  cpuClass: getCpuClass,
+  platform: getPlatform,
+  plugins: getPlugins,
+  touchSupport: getTouchSupport,
+  vendor: getVendor,
+  vendorFlavors: getVendorFlavors,
+  cookiesEnabled: areCookiesEnabled,
+  colorGamut: getColorGamut,
+  invertedColors: areColorsInverted,
+  forcedColors: areColorsForced,
+  monochrome: getMonochromeDepth,
+  contrast: getContrastPreference,
+  reducedMotion: isMotionReduced,
+  reducedTransparency: isTransparencyReduced,
+  hdr: isHDR,
+  math: getMathFingerprint,
+  pdfViewerEnabled: isPdfViewerEnabled,
+  architecture: getArchitecture,
+  applePay: getApplePayState,
+  privateClickMeasurement: getPrivateClickMeasurement,
+  audioBaseLatency: getAudioContextBaseLatency,
+  dateTimeLocale: getDateTimeLocale,
+  webGlBasics: getWebGlBasics,
+  webGlExtensions: getWebGlExtensions,
+}

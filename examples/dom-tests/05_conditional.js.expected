@@ -1,0 +1,121 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { memo as _$memo } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h70ecbd4edf573156 = _$template("<div></div>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x05_conditional$static_test$he575b98cb95d2858(true, "good", "bad");
+  x05_conditional$dynamic_test$h5e2cb0dbd31a630b(false, "good", "bad");
+  x05_conditional$logical_and$hf93301dcc59a2b54(true, "good");
+  x05_conditional$chain$hf22c77608d8338fe(false, true);
+}
+// chain::{closure#0}
+function x05_conditional$chain$closure_0$he9ab5a251d29967b(_1) {
+  return _1[0].buf[_1[0].off];
+}
+// chain::{closure#1}
+function x05_conditional$chain$closure_1$h882900ad4025ceb3(_1) {
+  return "a";
+}
+// chain::{closure#2}
+function x05_conditional$chain$closure_2$h34588f95917a80a3(_1) {
+  let _2, $t0;
+  _2 = [_1[0]];
+  $t0 = _$memo(() => x05_conditional$chain$closure_2_closure_0$h222a00d51c11d942(_2));
+  return () => $t0() ? x05_conditional$chain$closure_2_closure_1$h39d1c58b979f6140(undefined) : x05_conditional$chain$closure_2_closure_2$h4997ece5ab221838(undefined);
+}
+// chain::{closure#2}::{closure#0}
+function x05_conditional$chain$closure_2_closure_0$h222a00d51c11d942(_1) {
+  return _1[0].buf[_1[0].off];
+}
+// chain::{closure#2}::{closure#1}
+function x05_conditional$chain$closure_2_closure_1$h39d1c58b979f6140(_1) {
+  return "b";
+}
+// chain::{closure#2}::{closure#2}
+function x05_conditional$chain$closure_2_closure_2$h4997ece5ab221838(_1) {
+  return "fallback";
+}
+// chain
+function x05_conditional$chain$hf22c77608d8338fe(a, b) {
+  let _0, _7, _9, $t0;
+  a = [a];
+  b = [b];
+  _0 = tmpl$h70ecbd4edf573156();
+  _7 = [{ buf: a, off: 0 }];
+  _9 = [{ buf: b, off: 0 }];
+  $t0 = _$memo(() => x05_conditional$chain$closure_0$he9ab5a251d29967b(_7));
+  _$insert(_0, () => $t0() ? x05_conditional$chain$closure_1$h882900ad4025ceb3(undefined) : x05_conditional$chain$closure_2$h34588f95917a80a3(_9));
+  return _0;
+}
+// dynamic_test::{closure#0}
+function x05_conditional$dynamic_test$closure_0$h62cdbc3e0ee2974a(_1) {
+  return _1[0].buf[_1[0].off];
+}
+// dynamic_test::{closure#1}
+function x05_conditional$dynamic_test$closure_1$h2eb16bf95a57c4c4(_1) {
+  return _1[0].buf[_1[0].off];
+}
+// dynamic_test::{closure#2}
+function x05_conditional$dynamic_test$closure_2$hacceedaafdc1c3ff(_1) {
+  return _1[0].buf[_1[0].off];
+}
+// dynamic_test
+function x05_conditional$dynamic_test$h5e2cb0dbd31a630b(dynamic, good, bad) {
+  let _0, _8, _10, _12, $t0;
+  dynamic = [dynamic];
+  good = [good];
+  bad = [bad];
+  _0 = tmpl$h70ecbd4edf573156();
+  _8 = [{ buf: dynamic, off: 0 }];
+  _10 = [{ buf: good, off: 0 }];
+  _12 = [{ buf: bad, off: 0 }];
+  $t0 = _$memo(() => x05_conditional$dynamic_test$closure_0$h62cdbc3e0ee2974a(_8));
+  _$insert(_0, () => $t0() ? x05_conditional$dynamic_test$closure_1$h2eb16bf95a57c4c4(_10) : x05_conditional$dynamic_test$closure_2$hacceedaafdc1c3ff(_12));
+  return _0;
+}
+// logical_and::{closure#0}
+function x05_conditional$logical_and$closure_0$h4483f7b1001b98bc(_1) {
+  return _1[0].buf[_1[0].off];
+}
+// logical_and::{closure#1}
+function x05_conditional$logical_and$closure_1$hf6b9e1ff83ea417b(_1) {
+  return _1[0].buf[_1[0].off];
+}
+// logical_and::{closure#2}
+function x05_conditional$logical_and$closure_2$h6a049481f7e32443(_1) {
+  return "";
+}
+// logical_and
+function x05_conditional$logical_and$hf93301dcc59a2b54(dynamic, good) {
+  let _0, _7, _9, $t0;
+  dynamic = [dynamic];
+  good = [good];
+  _0 = tmpl$h70ecbd4edf573156();
+  _7 = [{ buf: dynamic, off: 0 }];
+  _9 = [{ buf: good, off: 0 }];
+  $t0 = _$memo(() => x05_conditional$logical_and$closure_0$h4483f7b1001b98bc(_7));
+  _$insert(_0, () => $t0() ? x05_conditional$logical_and$closure_1$hf6b9e1ff83ea417b(_9) : x05_conditional$logical_and$closure_2$h6a049481f7e32443(undefined));
+  return _0;
+}
+// static_test
+function x05_conditional$static_test$he575b98cb95d2858(simple, good, bad) {
+  let _0, _7;
+  _0 = tmpl$h70ecbd4edf573156();
+  if (simple) {
+    _7 = good;
+  } else {
+    _7 = bad;
+  }
+  _$insert(_0, _7);
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

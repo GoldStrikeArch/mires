@@ -34,13 +34,31 @@ const STEPS = [
   ["verify-reference.mjs", ["--all"]],
   ["run-trace.mjs", ["--record"]],
   ["test-compare-trace.mjs", []],
+  // Not an extractor and not a proof about upstream: procedure-wire.json is
+  // hand-written, because the procedure wire is Topcoat's own and there is no
+  // upstream to derive it from. This step re-reads the framework source lines the
+  // file cites and fails if a cited value moved, so the hand-written spec is
+  // gated the same way a generated fixture is.
+  ["check-procedure-wire.mjs", []],
   // Also not an extractor. `#[js_extern]`'s descriptor design is ours and has no
   // upstream, so its vectors are RECORDED by driving a checked-in fake library
   // through reference emissions, the way run-trace.mjs records the reference
   // compiler's runtime calls. The circularity that would otherwise create --
   // a driver cannot disagree with its own recording -- is closed by the
   // assertions in fixtures/js-extern/drivers.mjs, which run on every invocation.
-  ["check-js-extern.mjs", ["--record"]]
+  ["check-js-extern.mjs", ["--record"]],
+  // The L2 gate, and the third step here that is neither an extractor nor a proof
+  // about upstream. It recomputes every corpus family's trace-parity verdict and
+  // fails if it differs from the committed fixtures/l2-status.json IN EITHER
+  // DIRECTION. It runs in --check mode rather than --record so the failure carries
+  // its own directional message instead of surfacing only as a drift hash.
+  //
+  // It reads two things: the reference traces in fixtures/corpus/, which the steps
+  // above regenerate from pinned upstream, and examples/dom-tests/NN.trace.expected,
+  // which is ours. So it is also the one step that fails when an upstream bump moves
+  // a reference trace underneath a recorded verdict -- which is exactly the drift
+  // question this script exists to ask, one level up from bytes.
+  ["check-l2-status.mjs", ["--check"]]
 ];
 
 /** sha256 of every file under a directory, keyed by relative path. */

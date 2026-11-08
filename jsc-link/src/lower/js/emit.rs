@@ -1,0 +1,1627 @@
+//! The region tree as JavaScript statements, and the ops of one block as the statements and
+//! expressions they become (v1 `backend/src/emit.rs` plus the statement half of `base.rs`).
+//!
+//! # Ops
+//!
+//! A block's payload is its ops in order. An op whose result the plan inlined becomes an
+//! expression cached on the context and consumed at its use site (`JsCx::expr_of`); every other
+//! value-producing op is an assignment to its `let` name (declared once in the prelude, as v1
+//! declares every local); an effect is a statement. Every op is preceded by the `Stmt::Loc` marker
+//! of its origin under `js-source-map=on`, deduplicated per block exactly as v1 `names.rs::Locs`.
+//!
+//! # Regions
+//!
+//! Labels are `L0..`, structurizer temporaries `$s0..`; tests are spelled by [`Emitter::test`]
+//! with the sign-bias decode over `TypeTable::int_info`; a switch on a tag enum spells its cases
+//! as variant names.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use rcgjs_object::item::JsName;
+use rcgjs_object::jir::decline::OpClass;
+use rcgjs_object::jir::repr::{Op, OpKind, RAssertMessage, RBlockId, RTerm, Root, ValueId};
+use rcgjs_object::jir::semantic::{
+    BinaryOp, CoroutineDesugaring, CoroutineKind, HostPayload, TypeId,
+};
+use rcgjs_object::jir::types::{EnumRepr, IntRepr, PointerForm, TypeKind};
+use rcgjs_object::jsast::{self, BinOp, Expr, Loc, Stmt};
+use rcgjs_object::ptr;
+use structurizer::{Label, Region, Scrut, Test, TmpId};
+
+use super::super::plan::{self, BlockPayload, CopyOperand, OpRef, RScrut};
+use super::call::Lowered;
+use super::place::JsPlace;
+use super::value::{self, resign};
+use super::{decline, JsCx, Res, CALLER_LOCATION_PARAM};
+
+/// The name of a structurizer label.
+pub fn label_name(label: Label) -> String {
+    format!("L{}", label.0)
+}
+
+/// The name of a structurizer temporary (`emit.rs::tmp_name`).
+pub fn tmp_name(tmp: TmpId) -> String {
+    format!("$s{}", tmp.0)
+}
+
+/// The name spill register `index` would prefer, one-based: `$r1`, `$r2`, ...
+///
+/// Each register is a module-scope `let` the link step synthesizes as an item of its own
+/// (`jsc_link::plan::abi_flat::AbiPlan::spill_items`), so both the reader and the writer name it
+/// the same way and the reachability walk follows it like any other reference. Preferred rather
+/// than fixed because the program may already call something `$r1`, in which case the plan
+/// allocates the register a name around it and hands the printer the list ([`spill_name_of`]).
+pub fn spill_name(index: u32) -> String {
+    format!("$r{index}")
+}
+
+/// The name the plan allocated spill register `index`, falling back to the preferred spelling
+/// when there is no plan (a lowering run outside the lane driver).
+pub(super) fn spill_name_of(names: &[JsName], index: u32) -> String {
+    match names.get(index as usize - 1) {
+        Some(name) => name.as_str().to_owned(),
+        None => spill_name(index),
+    }
+}
+
+/// The scrutinee type a test reads its value through.
+#[derive(Clone, Copy)]
+pub struct ScrutTy {
+    pub ty: TypeId,
+    pub tag_enum: Option<TypeId>,
+}
+
+/// The body of one function, and the names of the temporaries its prelude has to declare.
+pub fn emit(cx: &JsCx<'_>, region: Region<BlockPayload, RScrut>) -> Res<(Vec<Stmt>, Vec<String>)> {
+    let mut emitter = Emitter {
+        cx,
+        tmps: BTreeMap::new(),
+    };
+    let body = emitter.region(region)?;
+    let tmps = emitter
+        .tmps
+        .keys()
+        .map(|tmp| tmp_name(TmpId(*tmp)))
+        .collect();
+    Ok((body, tmps))
+}
+
+struct Emitter<'a, 'b> {
+    cx: &'a JsCx<'b>,
+    /// Every temporary the tree names, with the scrutinee type of the ones a test reads back.
+    tmps: BTreeMap<u32, Option<ScrutTy>>,
+}
+
+type SwitchArm = (Vec<u128>, Region<BlockPayload, RScrut>);
+
+impl Emitter<'_, '_> {
+    fn region(&mut self, region: Region<BlockPayload, RScrut>) -> Res<Vec<Stmt>> {
+        Ok(match region {
+            Region::Seq(regions) => {
+                let mut out = Vec::new();
+                for region in regions {
+                    out.extend(self.region(region)?);
+                }
+                out
+            }
+            Region::Block(payload) => self.cx.payload(&payload)?,
+            Region::Labeled { label, body } => {
+                let body = self.region(*body)?;
+                vec![jsast::labeled(label_name(label), Stmt::Block(body))]
+            }
+            Region::Loop { label, body } => self.loop_(label, *body)?,
+            Region::LetTmp { tmp, value } => {
+                let loc = self.scrutinee_loc(&Scrut::Payload(value));
+                let (expr, ty) = self.cx.scrutinee(&value)?;
+                self.tmps.insert(tmp.0, Some(ty));
+                with_loc(
+                    loc,
+                    vec![jsast::assign_stmt(jsast::id(tmp_name(tmp)), expr)],
+                )
+            }
+            Region::If {
+                scrut,
+                test,
+                then_,
+                else_,
+            } => self.if_(scrut, test, *then_, *else_)?,
+            Region::Switch {
+                scrut,
+                arms,
+                default,
+                label,
+            } => self.switch(scrut, arms, *default, label)?,
+            Region::Dispatch {
+                sel,
+                label,
+                cases,
+                trailing_break,
+            } => vec![self.dispatch(sel, label, cases, trailing_break)?],
+            Region::SetSel(tmp, value) => {
+                self.tmps.entry(tmp.0).or_insert(None);
+                vec![jsast::assign_stmt(
+                    jsast::id(tmp_name(tmp)),
+                    jsast::num(value),
+                )]
+            }
+            Region::Break(label) => vec![Stmt::Break(label.map(label_name))],
+            Region::Continue(label) => vec![Stmt::Continue(label.map(label_name))],
+            Region::Return => vec![self.cx.return_stmt()?],
+            Region::Unreachable => vec![jsast::throw_abort(
+                "rustc_codegen_js: entered unreachable code",
+            )],
+            Region::Throw if self.cx.func.has_invoke() => Vec::new(),
+            Region::Throw => vec![jsast::throw_abort(
+                "rustc_codegen_js: unwinding is not supported",
+            )],
+        })
+    }
+
+    fn loop_(
+        &mut self,
+        label: Option<Label>,
+        body: Region<BlockPayload, RScrut>,
+    ) -> Res<Vec<Stmt>> {
+        let mut body = self.region(body)?;
+        // A marker-only body belongs to the executable empty loop itself.
+        if body.iter().all(|stmt| matches!(stmt, Stmt::Loc(_))) {
+            body.push(Stmt::LoopForever(label.map(label_name), Vec::new()));
+            return Ok(body);
+        }
+        Ok(match as_while(&mut body) {
+            Some((test, inner)) => {
+                // `as_while` leaves the condition's leading source markers in `body`.
+                let statement = match label {
+                    Some(label) => jsast::labeled(label_name(label), jsast::while_(test, inner)),
+                    None => jsast::while_(test, inner),
+                };
+                body.push(statement);
+                body
+            }
+            None => vec![Stmt::LoopForever(label.map(label_name), body)],
+        })
+    }
+
+    fn if_(
+        &mut self,
+        scrut: Scrut<RScrut>,
+        test: Test,
+        then_: Region<BlockPayload, RScrut>,
+        else_: Region<BlockPayload, RScrut>,
+    ) -> Res<Vec<Stmt>> {
+        let loc = self.scrutinee_loc(&scrut);
+        let then_ = self.region(then_)?;
+        let else_ = self.region(else_)?;
+        let inline = matches!(scrut, Scrut::Payload(_));
+        let (value, scrut_ty) = self.scrutinee(scrut)?;
+        Ok(with_loc(
+            loc,
+            match (then_.is_empty(), else_.is_empty()) {
+                (false, true) => vec![jsast::if_(self.test(value, scrut_ty, test, false), then_)],
+                (true, false) => vec![jsast::if_(self.test(value, scrut_ty, test, true), else_)],
+                (false, false) => vec![jsast::if_else(
+                    self.test(value, scrut_ty, test, false),
+                    then_,
+                    else_,
+                )],
+                (true, true) if inline => vec![jsast::expr_stmt(value)],
+                (true, true) => Vec::new(),
+            },
+        ))
+    }
+
+    fn switch(
+        &mut self,
+        scrut: Scrut<RScrut>,
+        arms: Vec<SwitchArm>,
+        default: Region<BlockPayload, RScrut>,
+        label: Option<Label>,
+    ) -> Res<Vec<Stmt>> {
+        let loc = self.scrutinee_loc(&scrut);
+        let scrut_ty = match &scrut {
+            Scrut::Payload(scrutinee) => self.cx.scrut_ty(scrutinee),
+            Scrut::Tmp(tmp) => self.tmp_ty(*tmp),
+        };
+        let mut cases = Vec::with_capacity(arms.len() + 1);
+        for (values, body) in arms {
+            let body = self.region(body)?;
+            let tests = values
+                .into_iter()
+                .map(|v| self.case_literal(scrut_ty, v))
+                .collect();
+            cases.push(jsast::case(tests, body));
+        }
+        let default = self.region(default)?;
+        cases.push(jsast::default_case(default));
+        let (value, _) = self.scrutinee(scrut)?;
+        let switch = jsast::switch(value, cases);
+        Ok(with_loc(
+            loc,
+            match label {
+                Some(label) => vec![jsast::labeled(label_name(label), switch)],
+                None => vec![switch],
+            },
+        ))
+    }
+
+    /// A fused condition has no statement at its definition. Attribute the
+    /// emitted test (or its saved temporary) to that expression's origin.
+    fn scrutinee_loc(&self, scrut: &Scrut<RScrut>) -> Option<Loc> {
+        let Scrut::Payload(scrut) = scrut else {
+            return None;
+        };
+        let RScrut::Value { value, .. } = scrut else {
+            return None;
+        };
+        if !self.cx.is_inline(*value) {
+            return None;
+        }
+        self.cx.def_of(*value).and_then(|op| self.cx.op_loc(op))
+    }
+
+    fn dispatch(
+        &mut self,
+        sel: TmpId,
+        label: Option<Label>,
+        cases: Vec<(u32, Region<BlockPayload, RScrut>)>,
+        trailing_break: bool,
+    ) -> Res<Stmt> {
+        self.tmps.entry(sel.0).or_insert(None);
+        let selector = jsast::id(tmp_name(sel));
+        let mut out = Vec::with_capacity(cases.len() + 1);
+        for (value, body) in cases {
+            let body = self.region(body)?;
+            out.push(jsast::case(vec![jsast::num(value)], body));
+        }
+        out.push(jsast::default_case(vec![jsast::throw(jsast::new(
+            jsast::id("Error"),
+            vec![jsast::binary(
+                BinOp::Add,
+                jsast::string("rustc_codegen_js: bad block "),
+                selector.clone(),
+            )],
+        ))]));
+        let mut body = vec![jsast::switch(selector, out)];
+        if trailing_break {
+            body.push(Stmt::Break(None));
+        }
+        Ok(Stmt::LoopForever(label.map(label_name), body))
+    }
+
+    /// The expression a branch tests, and the type that says how to read it.
+    fn scrutinee(&mut self, scrut: Scrut<RScrut>) -> Res<(Expr, ScrutTy)> {
+        match scrut {
+            Scrut::Payload(scrutinee) => self.cx.scrutinee(&scrutinee),
+            Scrut::Tmp(tmp) => Ok((jsast::id(tmp_name(tmp)), self.tmp_ty(tmp))),
+        }
+    }
+
+    /// The type recorded for a temporary when it was bound.
+    fn tmp_ty(&self, tmp: TmpId) -> ScrutTy {
+        self.tmps.get(&tmp.0).copied().flatten().unwrap_or(ScrutTy {
+            ty: self.cx.usize_ty(),
+            tag_enum: None,
+        })
+    }
+
+    /// A case value as a JavaScript literal, unbiased back into the scrutinee's own type.
+    ///
+    /// A tag scrutinee is matched by *name*, so the discriminant the case carries is looked back
+    /// up as the variant it belongs to (re-signed through the scrutinee's width, so `255` at `i8`
+    /// finds the `-1` variant). A case value naming no variant gets a string no tag can equal.
+    fn case_literal(&self, scrut: ScrutTy, encoded: u128) -> Expr {
+        let raw = self.cx.decode(scrut.ty, encoded);
+        match scrut.tag_enum {
+            Some(enum_ty) => {
+                let signed = self.cx.case_value(scrut.ty, encoded);
+                match value::variant_with_logical_discr(self.cx.table, enum_ty, signed) {
+                    Some(variant) => {
+                        value::variant_tag(self.cx.table, self.cx.interns, enum_ty, variant)
+                            .unwrap_or_else(|| jsast::string(format!("$no-variant-{raw}")))
+                    }
+                    None => jsast::string(format!("$no-variant-{raw}")),
+                }
+            }
+            None => value::int_literal(self.cx.table, scrut.ty, raw)
+                .unwrap_or_else(|| jsast::num(raw as f64)),
+        }
+    }
+
+    /// The variants of a tag scrutinee's enum whose discriminant `keep` accepts, as an `||`
+    /// chain of equalities (or, negated, an `&&` chain of inequalities).
+    fn tag_chain(
+        &self,
+        value: Expr,
+        enum_ty: TypeId,
+        scrut_ty: TypeId,
+        keep: impl Fn(i128) -> bool,
+        negated: bool,
+    ) -> Expr {
+        let (op, join) = if negated {
+            (BinOp::StrictNe, BinOp::And)
+        } else {
+            (BinOp::StrictEq, BinOp::Or)
+        };
+        let variants = value::enum_variants(self.cx.table, enum_ty);
+        let (signed, bits) = self.cx.table.int_info(scrut_ty).unwrap_or((false, 128));
+        let mut tests: Vec<Expr> = Vec::new();
+        for (index, variant) in variants.iter().enumerate() {
+            let discr = resign(signed, bits, variant.logical_discr as u128);
+            if !keep(discr) {
+                continue;
+            }
+            let Some(tag) =
+                value::variant_tag(self.cx.table, self.cx.interns, enum_ty, index as u32)
+            else {
+                continue;
+            };
+            tests.push(jsast::binary(op, value.clone(), tag));
+        }
+        let mut tests = tests.into_iter();
+        let Some(first) = tests.next() else {
+            return jsast::boolean(negated);
+        };
+        tests.fold(first, |acc, test| jsast::binary(join, acc, test))
+    }
+
+    /// How a test on a scrutinee reads in JavaScript, or its exact negation (`emit.rs::test`).
+    fn test(&self, value: Expr, scrut: ScrutTy, test: Test, negated: bool) -> Expr {
+        let ty = scrut.ty;
+        if let Some(enum_ty) = scrut.tag_enum {
+            let bound = |v: u128| self.cx.case_value(ty, v);
+            match test {
+                Test::Eq(_) | Test::IsTrue => {}
+                Test::Lt(v) => {
+                    let bound = bound(v);
+                    return self.tag_chain(value, enum_ty, ty, |d| d > bound, negated);
+                }
+                Test::Le(v) => {
+                    let bound = bound(v);
+                    return self.tag_chain(value, enum_ty, ty, |d| d >= bound, negated);
+                }
+                Test::InRange { lo, len } => {
+                    let (low, high) = (bound(lo), bound(lo + len - 1));
+                    return self.tag_chain(value, enum_ty, ty, |d| d >= low && d <= high, negated);
+                }
+            }
+        }
+        match test {
+            Test::IsTrue => {
+                if negated {
+                    jsast::not(value)
+                } else {
+                    value
+                }
+            }
+            Test::Eq(v) => {
+                let op = if negated {
+                    BinOp::StrictNe
+                } else {
+                    BinOp::StrictEq
+                };
+                jsast::binary(op, value, self.case_literal(scrut, v))
+            }
+            Test::Lt(v) => {
+                let op = if negated { BinOp::Le } else { BinOp::Gt };
+                jsast::binary(op, value, self.case_literal(scrut, v))
+            }
+            Test::Le(v) => {
+                let op = if negated { BinOp::Lt } else { BinOp::Ge };
+                jsast::binary(op, value, self.case_literal(scrut, v))
+            }
+            Test::InRange { lo, len } => match self.cx.table.int_repr(ty) {
+                IntRepr::Number => {
+                    let offset = if self.cx.case_value(ty, lo) == 0 {
+                        value
+                    } else {
+                        jsast::binary(BinOp::Sub, value, self.case_literal(scrut, lo))
+                    };
+                    let op = if negated { BinOp::Ge } else { BinOp::Lt };
+                    jsast::binary(op, jsast::u32_wrap(offset), jsast::num(len as f64))
+                }
+                IntRepr::BigInt => {
+                    let (low, high, join) = if negated {
+                        (BinOp::Lt, BinOp::Gt, BinOp::Or)
+                    } else {
+                        (BinOp::Ge, BinOp::Le, BinOp::And)
+                    };
+                    let above = jsast::binary(low, value.clone(), self.case_literal(scrut, lo));
+                    let below = jsast::binary(high, value, self.case_literal(scrut, lo + len - 1));
+                    jsast::binary(join, above, below)
+                }
+            },
+        }
+    }
+}
+
+fn with_loc(loc: Option<Loc>, mut statements: Vec<Stmt>) -> Vec<Stmt> {
+    if !statements.is_empty() {
+        if let Some(loc) = loc {
+            statements.insert(0, Stmt::Loc(loc));
+        }
+    }
+    statements
+}
+
+/// The test and body of a `for (;;)` that is really a `while` (`emit.rs::as_while`).
+fn as_while(body: &mut Vec<Stmt>) -> Option<(Expr, Vec<Stmt>)> {
+    if body
+        .iter()
+        .filter(|stmt| !matches!(stmt, Stmt::Loc(_)))
+        .count()
+        != 1
+    {
+        return None;
+    }
+    match body.pop()? {
+        Stmt::If(test, then, Some(els))
+            if matches!(els.as_slice(), [Stmt::Break(None)]) && !then.is_empty() =>
+        {
+            Some((test, then))
+        }
+        other => {
+            body.push(other);
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Sign bias (v1 `cfg_adapter.rs`)
+// ---------------------------------------------------------------------------------------------
+
+impl<'a> JsCx<'a> {
+    /// The MIR bit pattern an encoded case value stands for (`plan::decode`).
+    pub fn decode(&self, ty: TypeId, encoded: u128) -> u128 {
+        plan::decode(self.table, ty, encoded)
+    }
+
+    /// The Rust value an encoded case value stands for, sign included (`plan::case_value`).
+    pub fn case_value(&self, ty: TypeId, encoded: u128) -> i128 {
+        plan::case_value(self.table, ty, encoded)
+    }
+
+    /// A `usize`-shaped type for a temporary bound with no recorded type: the first 32-bit
+    /// unsigned integer in the table, or the scrutinee's own type is used instead.
+    fn usize_ty(&self) -> TypeId {
+        self.table
+            .descriptors()
+            .iter()
+            .find(|d| {
+                matches!(
+                    d.kind,
+                    TypeKind::Integer {
+                        signed: false,
+                        bits: 32
+                    }
+                )
+            })
+            .map(|d| d.id)
+            .unwrap_or(TypeId(0))
+    }
+
+    /// The scrutinee type of an `RScrut`.
+    pub fn scrut_ty(&self, scrutinee: &RScrut) -> ScrutTy {
+        match *scrutinee {
+            RScrut::Value { ty, tag_enum, .. } => ScrutTy { ty, tag_enum },
+            RScrut::Invoke(_) => ScrutTy {
+                ty: self.usize_ty(),
+                tag_enum: None,
+            },
+        }
+    }
+
+    /// The expression a scrutinee tests and its type.
+    pub fn scrutinee(&self, scrutinee: &RScrut) -> Res<(Expr, ScrutTy)> {
+        let expr = match *scrutinee {
+            RScrut::Value { value, .. } => self.expr_of(value)?,
+            RScrut::Invoke(block) => jsast::id(
+                self.plan
+                    .invoke_names
+                    .get(&block)
+                    .ok_or_else(|| decline(OpClass::Terminator, "invoke control name missing"))?,
+            ),
+        };
+        Ok((expr, self.scrut_ty(scrutinee)))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ops
+// ---------------------------------------------------------------------------------------------
+
+impl<'a> JsCx<'a> {
+    /// The statements of one block payload: its ops in order, each behind its source marker,
+    /// then the edge copies of the edge it carries.
+    pub fn payload(&self, payload: &BlockPayload) -> Res<Vec<Stmt>> {
+        let mut out = Vec::new();
+        let mut last: Option<Loc> = None;
+        for op_ref in &payload.ops {
+            let op = self.op(*op_ref)?;
+            self.at(op.origin);
+            let mut stmts = self.op_stmts(op)?;
+            let block = &self.func.blocks[op_ref.block.0 as usize];
+            if matches!(block.term, RTerm::Invoke { .. })
+                && op_ref.index as usize + 1 == block.ops.len()
+            {
+                let success =
+                    self.plan.invoke_names.get(&block.id).ok_or_else(|| {
+                        decline(OpClass::Terminator, "invoke control name missing")
+                    })?;
+                let exception =
+                    self.plan.exception_name.as_ref().ok_or_else(|| {
+                        decline(OpClass::Terminator, "invoke exception name missing")
+                    })?;
+                let binding = self
+                    .plan
+                    .catch_name
+                    .as_ref()
+                    .ok_or_else(|| decline(OpClass::Terminator, "invoke catch name missing"))?;
+                let mut body = Vec::new();
+                self.mark(&mut body, &mut None, self.op_loc(op));
+                body.append(&mut stmts);
+                body.push(jsast::assign_stmt(jsast::id(success), jsast::num(1.0)));
+                stmts.push(Stmt::TryCatch {
+                    body,
+                    binding: binding.clone(),
+                    handler: vec![
+                        jsast::if_(
+                            jsast::rt_call("is_abort", vec![jsast::id(binding)]),
+                            vec![jsast::throw(jsast::id(binding))],
+                        ),
+                        jsast::assign_stmt(jsast::id(exception), jsast::id(binding)),
+                        jsast::assign_stmt(jsast::id(success), jsast::num(0.0)),
+                    ],
+                });
+            }
+            if stmts.is_empty() {
+                continue;
+            }
+            self.mark(&mut out, &mut last, self.op_loc(op));
+            out.extend(stmts);
+        }
+        // What the block's terminator runs before it transfers control: a thrown value, and the
+        // returned value parked for the `Region::Return` that follows.
+        if let Some(block) = payload.block {
+            let stmts = self.term_stmts(block)?;
+            if !stmts.is_empty() {
+                self.mark(&mut out, &mut last, self.term_loc(block));
+                out.extend(stmts);
+            }
+        }
+        if let Some(edge) = payload.edge {
+            if let Some(copies) = self.plan.copies.get(&edge) {
+                for copy in copies {
+                    // An expression fused into an edge assignment has no standalone op marker.
+                    // Keep its definition's source, including an imported provider's origin.
+                    if let CopyOperand::Value(value) = copy.src {
+                        if self.is_inline(value) {
+                            let loc = self.def_of(value).and_then(|op| self.op_loc(op));
+                            self.mark(&mut out, &mut last, loc);
+                        }
+                    }
+                    if let CopyOperand::Value(value) = copy.dst {
+                        if self.plan.physical_slices.contains(&value) {
+                            let src = match copy.src {
+                                CopyOperand::Value(v) => self.expr_of(v)?,
+                                CopyOperand::Temp(_) => {
+                                    jsast::id(self.copy_operand_name(copy.src)?)
+                                }
+                            };
+                            out.extend(self.assign_physical_slice(value, src)?);
+                            continue;
+                        }
+                        if self.plan.physical_slots.contains(&value) {
+                            let src = match copy.src {
+                                CopyOperand::Value(v) => self.expr_of(v)?,
+                                CopyOperand::Temp(_) => {
+                                    jsast::id(self.copy_operand_name(copy.src)?)
+                                }
+                            };
+                            out.extend(self.assign_physical_slot(value, src)?);
+                            continue;
+                        }
+                    }
+                    let dst = self.copy_operand_name(copy.dst)?;
+                    let src = match copy.src {
+                        CopyOperand::Value(v) => self.expr_of(v)?,
+                        CopyOperand::Temp(_) => jsast::id(self.copy_operand_name(copy.src)?),
+                    };
+                    out.push(jsast::assign_stmt(jsast::id(dst), src));
+                }
+            }
+        }
+        while matches!(out.last(), Some(Stmt::Loc(_))) {
+            out.pop();
+        }
+        // An empty self-loop still executes its backedge. Its marker belongs
+        // on the recovered loop header rather than an absent body statement.
+        if out.is_empty() {
+            if let Some(block) = payload.block {
+                if matches!(self.func.blocks[block.0 as usize].term, RTerm::Goto(target, _) if target == block)
+                {
+                    self.mark(&mut out, &mut last, self.term_loc(block));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The name a copy operand is assigned through.
+    fn copy_operand_name(&self, operand: CopyOperand) -> Res<String> {
+        match operand {
+            CopyOperand::Value(v) => self.name_of(v).map(str::to_owned).ok_or_else(|| {
+                decline(
+                    OpClass::Terminator,
+                    format!("copy of unnamed value {}", v.0),
+                )
+            }),
+            CopyOperand::Temp(index) => self
+                .plan
+                .copy_temps
+                .get(index as usize)
+                .cloned()
+                .ok_or_else(|| {
+                    decline(
+                        OpClass::Terminator,
+                        format!("copy temporary {index} is not in the plan"),
+                    )
+                }),
+        }
+    }
+
+    /// Appends the marker for `loc`, unless it would repeat the last one (`names.rs::Locs`).
+    fn mark(&self, out: &mut Vec<Stmt>, last: &mut Option<Loc>, loc: Option<Loc>) {
+        let Some(loc) = loc else { return };
+        if last.as_ref() == Some(&loc) {
+            return;
+        }
+        out.push(Stmt::Loc(loc.clone()));
+        *last = Some(loc);
+    }
+
+    /// The keyed marker owns a source fact for its whole synthesized runtime
+    /// call. Prefer that over the enclosing macro expansion's MIR origin so an
+    /// exact debugger position lands on the written `for ... key (...)` site.
+    fn op_loc(&self, op: &Op) -> Option<Loc> {
+        if let Some(loc) = self.keyed_op_loc(op) {
+            return Some(loc);
+        }
+        let args = match &op.kind {
+            OpKind::Call { args, .. } | OpKind::Host { args, .. } => args.as_slice(),
+            _ => &[],
+        };
+        let mut seen = BTreeSet::new();
+        if let Some(loc) = args
+            .iter()
+            .find_map(|value| self.inlined_keyed_loc(*value, &mut seen))
+        {
+            return Some(loc);
+        }
+        self.loc_of(op.origin)
+    }
+
+    /// Finds a keyed expression that this operation prints at its use site.
+    fn inlined_keyed_loc(&self, value: ValueId, seen: &mut BTreeSet<ValueId>) -> Option<Loc> {
+        if !self.is_inline(value) || !seen.insert(value) {
+            return None;
+        }
+        let op = self.def_of(value)?;
+        if let Some(loc) = self.keyed_op_loc(op) {
+            return Some(loc);
+        }
+        let args = match &op.kind {
+            OpKind::Call { args, .. } | OpKind::Host { args, .. } => args.as_slice(),
+            OpKind::Copy(value) | OpKind::Move(value) => {
+                return self.inlined_keyed_loc(*value, seen)
+            }
+            _ => &[],
+        };
+        args.iter()
+            .find_map(|value| self.inlined_keyed_loc(*value, seen))
+    }
+
+    fn keyed_op_loc(&self, op: &Op) -> Option<Loc> {
+        let OpKind::Call {
+            host: Some(HostPayload::KeyedList(payload)),
+            ..
+        } = &op.kind
+        else {
+            return None;
+        };
+        payload.site.and_then(|site| self.loc_of_fact(site))
+    }
+
+    /// The op an `OpRef` names.
+    fn op(&self, op_ref: OpRef) -> Res<&'a Op> {
+        self.func
+            .blocks
+            .get(op_ref.block.0 as usize)
+            .and_then(|block| block.ops.get(op_ref.index as usize))
+            .ok_or_else(|| {
+                decline(
+                    OpClass::Other,
+                    format!(
+                        "op {} of block {} is out of range",
+                        op_ref.index, op_ref.block.0
+                    ),
+                )
+            })
+    }
+
+    /// The `Loc` of a block's terminator, through the origin table's terminator row.
+    fn term_loc(&self, block: RBlockId) -> Option<Loc> {
+        if !self.opts.source_map {
+            return None;
+        }
+        let origins = self.origins?;
+        let origin = origins.terminators.get(block.0 as usize)?;
+        self.loc_of(*origin)
+    }
+
+    /// What a terminator runs before it transfers control: a `Throw` throws its value; a
+    /// `Return` parks its value for the `Region::Return` that follows (the region carries none).
+    fn term_stmts(&self, block: RBlockId) -> Res<Vec<Stmt>> {
+        let Some(term) = self.func.blocks.get(block.0 as usize).map(|b| &b.term) else {
+            return Err(decline(
+                OpClass::Terminator,
+                format!("block {} is out of range", block.0),
+            ));
+        };
+        match term {
+            RTerm::Return(Some(v)) => {
+                // A `()` (or other zero-sized) result is a bare `return`, as v1's unit function.
+                let value = if self.table.is_zst(self.ty_of(*v)?) {
+                    None
+                } else {
+                    Some(self.expr_of(*v)?)
+                };
+                self.pending_return.replace(value);
+                Ok(Vec::new())
+            }
+            RTerm::Return(None) => {
+                self.pending_return.replace(None);
+                Ok(Vec::new())
+            }
+            RTerm::Throw(Some(v)) => Ok(vec![jsast::throw(self.expr_of(*v)?)]),
+            RTerm::Throw(None) if self.plan.exception_name.is_some() => Ok(vec![jsast::throw(
+                jsast::id(self.plan.exception_name.as_ref().unwrap()),
+            )]),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// `Region::Return`: `return <value>` with the value the returning block parked, or a bare
+    /// `return` for a `()` function.
+    fn return_stmt(&self) -> Res<Stmt> {
+        match self.pending_return.take() {
+            Some(value) => {
+                let tagged = self
+                    .target_abi
+                    .and_then(|sig| sig.result.as_ref())
+                    .and_then(|result| result.tagged.as_ref());
+                let recursive = self
+                    .target_abi
+                    .and_then(|sig| sig.result.as_ref())
+                    .and_then(|result| result.recursive.as_ref());
+                if tagged.is_none() && recursive.is_none() {
+                    return Ok(jsast::ret(value));
+                }
+                let keys = match (tagged, recursive) {
+                    (Some(tagged), None) => {
+                        value::tagged_product_keys(self.table, self.interns, tagged)
+                    }
+                    (None, Some(recursive)) => {
+                        value::recursive_product_keys(self.table, self.interns, recursive)
+                    }
+                    _ => None,
+                };
+                let Some(keys) = keys else {
+                    return Err(decline(
+                        OpClass::Terminator,
+                        "physical return has an unprintable product shape",
+                    ));
+                };
+                let reads = keys.iter().map(String::as_str).collect::<Vec<_>>();
+                let (setup, value) = self.reread(value, &reads);
+                let lanes = match (tagged, recursive) {
+                    (Some(tagged), None) => {
+                        value::tagged_product_lanes(self.table, self.interns, tagged, value)
+                    }
+                    (None, Some(recursive)) => {
+                        value::recursive_product_lanes(self.table, self.interns, recursive, value)
+                    }
+                    _ => None,
+                };
+                let Some(mut lanes) = lanes else {
+                    return Err(decline(
+                        OpClass::Terminator,
+                        "physical return lanes do not agree with its type",
+                    ));
+                };
+                let tag = lanes.remove(0);
+                let mut sequence = Vec::with_capacity(lanes.len() + 2);
+                sequence.extend(setup);
+                sequence.extend(lanes.into_iter().enumerate().map(|(index, payload)| {
+                    jsast::assign(
+                        jsast::id(spill_name_of(self.spills, index as u32 + 1)),
+                        payload,
+                    )
+                }));
+                sequence.push(tag);
+                Ok(jsast::ret(jsast::seq(sequence)))
+            }
+            None if self.table.is_zst(self.func.sig.result) => Ok(jsast::ret_void()),
+            None => Err(decline(
+                OpClass::Terminator,
+                "a `Region::Return` with no returning block payload before it",
+            )),
+        }
+    }
+
+    /// The statements one op becomes: nothing for an inlined value (its expression is cached), an
+    /// assignment for a named one, the effect's statements otherwise.
+    pub fn op_stmts(&self, op: &Op) -> Res<Vec<Stmt>> {
+        // A tagged result is a virtual canonical object backed by captured scalar locals. Its
+        // admission proof permits only field/discriminant reads and Move/Copy aliases leading to
+        // those reads or another prepared direct call, so cloning the description would add an
+        // `Object.assign` with no observable copy semantics. Propagate the virtual description
+        // instead; a true escape was refused by the ABI planner and never reaches this path.
+        if let (Some(result), OpKind::Move(source) | OpKind::Copy(source)) = (op.result, &op.kind) {
+            if let Some(value) = self.tagged_expr(*source) {
+                self.bind_tagged_expr(result, value);
+                return Ok(Vec::new());
+            }
+        }
+        if let Some(result) = op
+            .result
+            .filter(|result| self.plan.physical_slices.contains(result))
+        {
+            let value = match &op.kind {
+                // A fat slice is a Copy value. Cloning its temporary JavaScript record would
+                // reintroduce precisely the allocation the lanes remove.
+                OpKind::Copy(source) | OpKind::Move(source) => self.expr_of(*source)?,
+                _ => self.op_expr(op, result)?,
+            };
+            self.record_allocation_origin(result, &value);
+            return self.assign_physical_slice(result, value);
+        }
+        if let Some(result) = op
+            .result
+            .filter(|result| self.plan.physical_slots.contains(result))
+        {
+            let value = match &op.kind {
+                OpKind::Copy(source) | OpKind::Move(source) => self.expr_of(*source)?,
+                _ => self.op_expr(op, result)?,
+            };
+            self.record_allocation_origin(result, &value);
+            return self.assign_physical_slot(result, value);
+        }
+        // A call, an intrinsic, a host operation and a drop are lowered as statements plus a
+        // value (`call.rs`): whatever the lowering has to run before the result is bound.
+        if matches!(
+            op.kind,
+            OpKind::Call { .. }
+                | OpKind::Intrinsic { .. }
+                | OpKind::Host { .. }
+                | OpKind::Drop { .. }
+        ) {
+            if let Some(result) = op.result.filter(|result| self.is_inline(*result)) {
+                // Spelled at its one use site (`JsCx::expr_of`) — but the statements its lowering
+                // needs have no position there, so they are emitted here, at the definition, and
+                // the value is cached for the use to read back. The plan promises the use is in
+                // the same block after the definition with only commuting ops in between, so
+                // that is evaluating in order.
+                let (prelude, value, virtual_tagged) = match self.lower_call_like(op)? {
+                    Lowered::Value(prelude, value) => (prelude, value, false),
+                    Lowered::Virtual(prelude, value) => (prelude, value, true),
+                    Lowered::Done(_) => {
+                        return Err(decline(
+                            OpClass::Call,
+                            "an inlined call whose lowering produces no value",
+                        ))
+                    }
+                };
+                if virtual_tagged {
+                    self.bind_tagged_expr(result, value);
+                    return Ok(prelude);
+                }
+                let repeated = self.reads_pointer_twice(result)?;
+                if prelude.is_empty() && !repeated {
+                    return Ok(Vec::new());
+                }
+                let mut out = prelude;
+                let value = if repeated {
+                    let (bind, name) = self.temp(value);
+                    out.push(bind);
+                    name
+                } else {
+                    value
+                };
+                self.cache_expr(result, value);
+                return Ok(out);
+            }
+            return self.call_stmts(op);
+        }
+        match op.result {
+            Some(result) => {
+                // An inline value is spelled at its use site (`JsCx::expr_of`).
+                if self.is_inline(result) {
+                    return Ok(Vec::new());
+                }
+                let expr = self.op_expr(op, result)?;
+                self.record_allocation_origin(result, &expr);
+                // A zero-sized value reads as `undefined` everywhere (`expr_of`), so its
+                // assignment has nothing to say; a call's effects still run.
+                if self.table.is_zst(self.ty_of(result)?)
+                    && !matches!(
+                        op.kind,
+                        OpKind::Call { .. } | OpKind::Intrinsic { .. } | OpKind::Host { .. }
+                    )
+                {
+                    return Ok(Vec::new());
+                }
+                let Some(name) = self.name_of(result) else {
+                    // A value nobody reads and the plan did not name: evaluated for its effects,
+                    // which for the ops of this module there are none of, but a call has.
+                    return Ok(match &op.kind {
+                        OpKind::Call { .. } | OpKind::Intrinsic { .. } | OpKind::Host { .. } => {
+                            vec![jsast::expr_stmt(expr)]
+                        }
+                        _ => Vec::new(),
+                    });
+                };
+                Ok(vec![jsast::assign_stmt(jsast::id(name), expr)])
+            }
+            None => self.effect_stmts(op),
+        }
+    }
+
+    /// Assigns the `buf`/`off`/`len` locals that physically carry one logical fat slice.
+    fn assign_physical_slice(&self, result: ValueId, value: Expr) -> Res<Vec<Stmt>> {
+        let Some(name) = self.name_of(result) else {
+            return Err(decline(
+                OpClass::Rvalue,
+                format!("physical slice {} has no name", result.0),
+            ));
+        };
+        let (setup, value) = self.reread(value, &[ptr::BUF, ptr::OFF, ptr::LEN]);
+        let mut out = Vec::with_capacity(4);
+        if let Some(setup) = setup {
+            out.push(jsast::expr_stmt(setup));
+        }
+        for (suffix, lane) in [
+            ("$buf", ptr::slot_buf(value.clone())),
+            ("$off", ptr::slot_off(value.clone())),
+            ("$len", ptr::slot_len(value)),
+        ] {
+            out.push(jsast::assign_stmt(
+                jsast::id(format!("{name}{suffix}")),
+                lane,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Assigns the `buf`/`off` locals that physically carry one logical thin pointer.
+    fn assign_physical_slot(&self, result: ValueId, value: Expr) -> Res<Vec<Stmt>> {
+        let Some(name) = self.name_of(result) else {
+            return Err(decline(
+                OpClass::Rvalue,
+                format!("physical slot {} has no name", result.0),
+            ));
+        };
+        let (setup, value) = self.reread(value, &[ptr::BUF, ptr::OFF]);
+        let mut out = Vec::with_capacity(3);
+        if let Some(setup) = setup {
+            out.push(jsast::expr_stmt(setup));
+        }
+        for (suffix, lane) in [
+            ("$buf", ptr::slot_buf(value.clone())),
+            ("$off", ptr::slot_off(value)),
+        ] {
+            out.push(jsast::assign_stmt(
+                jsast::id(format!("{name}{suffix}")),
+                lane,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// The expression of a value-producing op (v1 `codegen_rvalue`/`codegen_operand`).
+    pub(super) fn op_expr(&self, op: &Op, result: ValueId) -> Res<Expr> {
+        let table = self.table;
+        let result_ty = self.ty_of(result)?;
+        // Every zero-sized value is `undefined` (`rvalue.rs:35-37`), whatever op produced it —
+        // except a call, whose effects run either way, and a view, which describes a place even
+        // when the SSA builder uses its zero-sized pointee type as a placeholder.
+        let zst = table.is_zst(result_ty)
+            && !matches!(
+                op.kind,
+                OpKind::Call { .. }
+                    | OpKind::Intrinsic { .. }
+                    | OpKind::Host { .. }
+                    | OpKind::BorrowView { .. }
+                    | OpKind::RawView { .. }
+                    | OpKind::SliceView { .. }
+            );
+        if zst {
+            // The operands are values, so reading them has no effect to preserve.
+            if let OpKind::Call { .. } | OpKind::Intrinsic { .. } | OpKind::Host { .. } = op.kind {
+            } else {
+                return Ok(jsast::undefined());
+            }
+        }
+        match &op.kind {
+            OpKind::Const(tree) => self.const_expr(tree, result_ty),
+            OpKind::Copy(v) => {
+                let value = self.expr_of(*v)?;
+                let ty = self.ty_of(*v)?;
+                // A committed carrier is cloned at its own shape: the baseline field-wise clone
+                // reads a structure the value no longer has (Phase 4).
+                match self.func.values[v.0 as usize].carrier {
+                    rcgjs_object::jir::repr::Carrier::HostString => Ok(value),
+                    rcgjs_object::jir::repr::Carrier::StringBuilder => {
+                        Ok(record_clone(value, &["text", "cap"], &[]))
+                    }
+                    rcgjs_object::jir::repr::Carrier::NativeVec => {
+                        Ok(record_clone(value, &["len", "cap"], &["buf"]))
+                    }
+                    rcgjs_object::jir::repr::Carrier::SliceView => {
+                        Ok(record_clone(value, &["buf", "off", "len"], &[]))
+                    }
+                    _ => Ok(if table.needs_clone(ty) {
+                        value::clone_expr(table, self.interns, ty, value)
+                    } else {
+                        value
+                    }),
+                }
+            }
+            OpKind::Move(v) => self.expr_of(*v),
+            OpKind::Aggregate {
+                ty,
+                variant,
+                active_field,
+                fields,
+            } => {
+                let values = fields
+                    .iter()
+                    .map(|field| self.expr_of(*field))
+                    .collect::<Res<Vec<_>>>()?;
+                self.aggregate(*ty, *variant, *active_field, values)
+            }
+            OpKind::Repeat { v, count } => {
+                let element_ty = self.ty_of(*v)?;
+                let is_constant = self.is_inline(*v)
+                    && self
+                        .def_of(*v)
+                        .is_some_and(|def| matches!(def.kind, OpKind::Const(_)));
+                Ok(self.repeat(element_ty, self.expr_of(*v)?, *count, is_constant))
+            }
+            OpKind::Field {
+                base,
+                variant,
+                field,
+            } => {
+                let base_ty = self.ty_of(*base)?;
+                let Some(descriptor) = table.field(base_ty, *variant, *field) else {
+                    return Err(decline(
+                        OpClass::Place,
+                        format!("field {field} of a type with no such field"),
+                    ));
+                };
+                Ok(value::field_expr(
+                    self.interns,
+                    self.expr_of(*base)?,
+                    descriptor.key,
+                ))
+            }
+            OpKind::Discriminant(base) => {
+                let base_ty = self.ty_of(*base)?;
+                let as_tag = self.plan.tag_values.contains(&result);
+                self.discriminant(base_ty, self.expr_of(*base)?, result_ty, as_tag)
+            }
+            OpKind::CellLoad(cell) => self.cell_expr(*cell),
+            OpKind::BorrowView { root, path, .. } => self.borrow_view(root, path),
+            OpKind::RawView { root, path, .. } => self.raw_view(root, path),
+            OpKind::SliceView { ptr: pointer, len } => {
+                let pointer_ty = self.ty_of(*pointer)?;
+                let data = self.expr_of(*pointer)?;
+                let len = self.expr_of(*len)?;
+                let Some(pointee) = value::pointee_of(table, result_ty) else {
+                    return Err(decline(OpClass::Rvalue, "SliceView at a non-pointer type"));
+                };
+                match table.pointer_form(pointer_ty) {
+                    // A reference to an array: the array object is the buffer.
+                    Some(rcgjs_object::jir::types::PointerForm::Thin) => {
+                        Ok(ptr::fat_slice(data, jsast::num(0), len))
+                    }
+                    _ => self.build_fat(pointee, data, len),
+                }
+            }
+            OpKind::Deref(pointer) => {
+                let walk = self.pointee_place(*pointer)?;
+                Ok(self.read_place(&walk.place))
+            }
+            OpKind::Binary { op: bin, l, r, ty } => {
+                let rhs_ty = self.ty_of(*r)?;
+                self.binary(
+                    *bin,
+                    *ty,
+                    rhs_ty,
+                    result_ty,
+                    self.expr_of(*l)?,
+                    self.expr_of(*r)?,
+                )
+            }
+            OpKind::Unary { op: un, v, ty } => self.unary(*un, *ty, self.expr_of(*v)?),
+            OpKind::Cast { kind, v, from, to } => self.cast(*kind, *from, *to, self.expr_of(*v)?),
+            OpKind::Call { .. } | OpKind::Intrinsic { .. } | OpKind::Host { .. } => {
+                self.call_expr(op)
+            }
+            // A spill register: a module-scope `let` the flat direct-call ABI writes on the way
+            // out of a callee and the caller reads back (`jsc_link::plan::abi_flat`).
+            OpKind::SpillRead(index) => Ok(jsast::id(spill_name_of(self.spills, *index))),
+            OpKind::Materialize(_) => Err(decline(
+                OpClass::Rvalue,
+                "Materialize is a Phase 3 op with no baseline lowering",
+            )),
+            // A carrier conversion: the registry-owned adapter expression over the value
+            // (`adapters.rs`). The value's Rust type is unchanged — `result_ty` is it.
+            OpKind::Convert { v, from, to } => super::adapters::convert(
+                self.table,
+                self.interns,
+                self.expr_of(*v)?,
+                result_ty,
+                *from,
+                *to,
+            ),
+            OpKind::SetField { .. }
+            | OpKind::SetDiscriminant { .. }
+            | OpKind::CellAlloc(_)
+            | OpKind::CellStore { .. }
+            | OpKind::StoreThrough { .. }
+            | OpKind::Drop { .. }
+            | OpKind::Assert { .. }
+            | OpKind::Zombie(_)
+            | OpKind::SpillWrite { .. } => {
+                Err(decline(OpClass::Statement, "an effect op carries a result"))
+            }
+        }
+    }
+
+    /// The statements of an op with no result.
+    fn effect_stmts(&self, op: &Op) -> Res<Vec<Stmt>> {
+        let table = self.table;
+        match &op.kind {
+            OpKind::SetField {
+                base,
+                variant,
+                field,
+                v,
+            } => {
+                let base_ty = self.ty_of(*base)?;
+                let Some(descriptor) = table.field(base_ty, *variant, *field) else {
+                    return Err(decline(
+                        OpClass::Place,
+                        format!("field {field} of a type with no such field"),
+                    ));
+                };
+                let value = self.expr_of(*v)?;
+                if table.is_zst(descriptor.ty) {
+                    // Nothing to store; the value is a JS value with no effect to keep.
+                    return Ok(Vec::new());
+                }
+                let target = value::field_expr(self.interns, self.expr_of(*base)?, descriptor.key);
+                self.write_place(JsPlace::Var(target), descriptor.ty, value)
+            }
+            OpKind::SetDiscriminant { base, variant } => {
+                let base_ty = self.ty_of(*base)?;
+                let target = self.expr_of(*base)?;
+                self.set_discriminant(JsPlace::Var(target), base_ty, *variant)
+            }
+            // The prelude declares the cell (`let x = []` when boxed); bringing it into existence
+            // is nothing at the alloc site, exactly as v1 declared every local once.
+            OpKind::CellAlloc(_) => Ok(Vec::new()),
+            OpKind::CellStore { cell, v } => {
+                let value = self.expr_of(*v)?;
+                // A boxed parameter cell: v1 builds the box in the prelude, `x = [x];`, so the
+                // parameter's own binding becomes the box. That is what a store of the parameter
+                // value into a cell named like the parameter is.
+                if self.plan.param_cells.contains_key(cell) {
+                    if !self.cell_boxed(*cell) {
+                        return Ok(Vec::new());
+                    }
+                    let name = jsast::id(self.cell_name(*cell)?);
+                    return Ok(vec![jsast::assign_stmt(name, jsast::array(vec![value]))]);
+                }
+                Ok(vec![jsast::assign_stmt(self.cell_expr(*cell)?, value)])
+            }
+            OpKind::StoreThrough { ptr: pointer, v } => {
+                // The store-back idiom an in-place mutation leaves behind
+                // (`ssa.rs::set_discriminant`: `Deref` the view, mutate, store it back). Storing
+                // a value back where it was just read from is a no-op — for an object pointee
+                // the mutation already happened where the object lives, and for a scalar one the
+                // value is unchanged — and `__rt.overwrite` implements a whole-aggregate write by
+                // clearing the target first, so spelling it would *erase* the object.
+                if self.stores_back(*pointer, *v) {
+                    return Ok(Vec::new());
+                }
+                let walk = self.pointee_place(*pointer)?;
+                let value = self.expr_of(*v)?;
+                self.write_place(walk.place, walk.ty, value)
+            }
+            OpKind::Assert {
+                cond,
+                expected,
+                msg,
+            } => self.assert_stmts(*cond, *expected, msg),
+            OpKind::Zombie(message) => {
+                let message = self.interns.str(*message).unwrap_or("").to_owned();
+                Ok(vec![jsast::expr_stmt(self.zombie(message))])
+            }
+            OpKind::SpillWrite { index, v } => Ok(vec![jsast::assign_stmt(
+                jsast::id(spill_name_of(self.spills, *index)),
+                self.expr_of(*v)?,
+            )]),
+            // A call, an intrinsic, a host operation and a drop never reach here: `op_stmts`
+            // routes them through `call.rs` before it looks at the result.
+            _ => Err(decline(OpClass::Statement, "a value op carries no result")),
+        }
+    }
+
+    /// The expression of a call-shaped op at a use site the plan inlined it into.
+    ///
+    /// An inlined value has no statement position, so a lowering that needs one is folded into a
+    /// comma expression where every statement is an assignment, and declined otherwise.
+    fn call_expr(&self, op: &Op) -> Res<Expr> {
+        let lowered = self.lower_call_like(op)?;
+        lowered.into_expr().ok_or_else(|| {
+            decline(
+                OpClass::Call,
+                "an inlined call whose lowering needs a statement position",
+            )
+        })
+    }
+
+    /// The statements of a call-shaped op: what its lowering has to run, then the binding of its
+    /// result (`base.rs`'s `write_place` after a call).
+    fn call_stmts(&self, op: &Op) -> Res<Vec<Stmt>> {
+        let (mut out, value) = match self.lower_call_like(op)? {
+            Lowered::Done(stmts) => return Ok(stmts),
+            Lowered::Value(prelude, value) => (prelude, value),
+            Lowered::Virtual(prelude, value) => {
+                let Some(result) = op.result else {
+                    return Err(decline(
+                        OpClass::Call,
+                        "a virtual tagged call result has no JIR value",
+                    ));
+                };
+                self.bind_tagged_expr(result, value);
+                return Ok(prelude);
+            }
+        };
+        // A `Callee::Nop` call is nothing at all, and a zero-sized result is `undefined`
+        // everywhere (`expr_of`), so neither is worth a statement of its own.
+        if matches!(value, Expr::Undefined) {
+            return Ok(out);
+        }
+        let mut named = None;
+        if let Some(result) = op.result {
+            if !self.table.is_zst(self.ty_of(result)?) {
+                named = self.name_of(result);
+            }
+        }
+        match named {
+            Some(name) => out.push(jsast::assign_stmt(jsast::id(name), value)),
+            // Evaluated for its effects, which a call has and nothing else reaching here does.
+            None => out.push(jsast::expr_stmt(value)),
+        }
+        Ok(out)
+    }
+
+    /// Whether the one use of an inlined pointer value reads the pointer record more than once.
+    ///
+    /// A `{ buf, off }` slot is dereferenced as `p.buf[p.off]` and a `{ ptr, meta }` fat pointer
+    /// as `p.ptr`/`p.meta`, so a *call* spelled there would run once per field. Such a value is
+    /// bound to a temporary at its definition instead, which is what v1's `ptr.rs::reread` does
+    /// for every pointer expression it repeats. Everything else — an argument, a field read, an
+    /// operand of an operator — spells its operand once and keeps the call inline.
+    fn reads_pointer_twice(&self, v: ValueId) -> Res<bool> {
+        let repeatable = matches!(
+            self.table.pointer_form(self.ty_of(v)?),
+            Some(
+                PointerForm::Slot
+                    | PointerForm::FatSlice
+                    | PointerForm::FatDyn
+                    | PointerForm::FatTail
+            )
+        );
+        if !repeatable {
+            return Ok(false);
+        }
+        for block in &self.func.blocks {
+            for op in &block.ops {
+                if !op.kind.uses().contains(&v) {
+                    continue;
+                }
+                return Ok(match &op.kind {
+                    OpKind::Deref(pointer) | OpKind::StoreThrough { ptr: pointer, .. } => {
+                        *pointer == v
+                    }
+                    OpKind::BorrowView {
+                        root: Root::Value(root),
+                        ..
+                    }
+                    | OpKind::RawView {
+                        root: Root::Value(root),
+                        ..
+                    }
+                    | OpKind::Drop {
+                        root: Root::Value(root),
+                        ..
+                    } => *root == v,
+                    OpKind::SliceView { ptr: pointer, .. } => *pointer == v,
+                    _ => false,
+                });
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `v` is the value `Deref` of `pointer` produced, carried by renames and by copies
+    /// that alias rather than clone.
+    ///
+    /// A `Move`, and a `Copy` of a type that does not `needs_clone`, are the same JavaScript
+    /// value; a `Copy` that clones is a different object and a store of it is a real write.
+    fn stores_back(&self, pointer: ValueId, v: ValueId) -> bool {
+        let mut value = v;
+        for _ in 0..8 {
+            let Some(def) = self.def_of(value) else {
+                return false;
+            };
+            match def.kind {
+                OpKind::Deref(source) => return source == pointer,
+                OpKind::Move(inner) => value = inner,
+                OpKind::Copy(inner) => {
+                    let Ok(ty) = self.ty_of(inner) else {
+                        return false;
+                    };
+                    if self.table.needs_clone(ty) {
+                        return false;
+                    }
+                    value = inner;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// The place a pointer value points at: the walked place itself for an inline synthetic view
+    /// (`plan.rs`, "Synthetic views": a `BorrowView` consumed by exactly one `Deref`/`StoreThrough`
+    /// is spelled as v1's read/write of the place, never as a pointer record), and the `Deref`
+    /// of the pointer expression otherwise.
+    pub(crate) fn pointee_place(&self, pointer: ValueId) -> Res<super::place::Walk> {
+        if self.is_inline(pointer) {
+            if let Some(Op {
+                kind: OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. },
+                ..
+            }) = self.def_of(pointer)
+            {
+                return self.walk_place(root, path);
+            }
+        }
+        self.walk_place(
+            &Root::Value(pointer),
+            &[rcgjs_object::jir::repr::Proj::Deref],
+        )
+    }
+
+    /// An `Assert` (`base.rs:707-723`, `857-901`): `if (!cond) { <panic> }`.
+    fn assert_stmts(&self, cond: ValueId, expected: bool, msg: &RAssertMessage) -> Res<Vec<Stmt>> {
+        // `is_optional_overflow_check`: the arithmetic overflow checks rustc emits regardless of
+        // `-Coverflow-checks`, which v1 drops when the session has them off. The link step does
+        // not know the session flag; the suite compiles with them off.
+        if matches!(
+            msg,
+            RAssertMessage::Overflow {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Shl | BinaryOp::Shr,
+                ..
+            }
+        ) {
+            return Ok(Vec::new());
+        }
+        let condition = self.expr_of(cond)?;
+        let failed = if expected {
+            jsast::not(condition)
+        } else {
+            condition
+        };
+        Ok(vec![jsast::if_(failed, self.assert_failure(msg)?)])
+    }
+
+    /// The body of the `if` an `Assert` guards (`base.rs::codegen_assert_failure`).
+    fn assert_failure(&self, msg: &RAssertMessage) -> Res<Vec<Stmt>> {
+        let (lang_fn, args): (&str, Vec<ValueId>) = match msg {
+            RAssertMessage::BoundsCheck { length, index } => {
+                ("panic_bounds_check", vec![*index, *length])
+            }
+            RAssertMessage::MisalignedPointer { required, found } => (
+                "panic_misaligned_pointer_dereference",
+                vec![*required, *found],
+            ),
+            RAssertMessage::InvalidEnum(source) => {
+                ("panic_invalid_enum_construction", vec![*source])
+            }
+            other => (panic_function(other), Vec::new()),
+        };
+        // The panic lang item is a `Direct` call the encoder did not record: it is found among
+        // the item's baseline references by its path's last segment.
+        let candidates: Vec<&String> = self
+            .summary
+            .deps
+            .iter()
+            .filter(|dep| names_lang_fn(dep, lang_fn))
+            .collect();
+        match candidates.as_slice() {
+            [name] => {
+                let mut arguments = args
+                    .iter()
+                    .map(|arg| self.expr_of(*arg))
+                    .collect::<Res<Vec<_>>>()?;
+                // The panic lang items are `#[track_caller]`: the location of the expression that
+                // failed, or the enclosing `$loc` in a `#[track_caller]` body.
+                if self.func.sig.abi.caller_location {
+                    arguments.push(jsast::id(CALLER_LOCATION_PARAM));
+                } else {
+                    let origin = self.origin.get();
+                    let Some(fact) = origin.and_then(|origin| self.fact_of(origin)) else {
+                        return Err(decline(
+                            OpClass::Terminator,
+                            "an assert whose panic takes a caller location has no source fact",
+                        ));
+                    };
+                    arguments.push(self.caller_location_value(fact)?);
+                }
+                Ok(vec![jsast::expr_stmt(jsast::call(
+                    jsast::id((*name).clone()),
+                    arguments,
+                ))])
+            }
+            [] => Ok(vec![jsast::expr_stmt(jsast::rt_call(
+                "js_abort",
+                vec![jsast::string(assert_message(msg))],
+            ))]),
+            _ => Err(decline(
+                OpClass::Terminator,
+                format!("the `{lang_fn}` panic function is ambiguous among the item's references"),
+            )),
+        }
+    }
+}
+
+/// Whether an emitted item name is `<path>$<lang_fn>$h<hash>`.
+fn names_lang_fn(name: &str, lang_fn: &str) -> bool {
+    let Some((stem, hash)) = name.rsplit_once("$h") else {
+        return false;
+    };
+    if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    stem == lang_fn || stem.ends_with(&format!("${lang_fn}"))
+}
+
+/// The lang item function name of an `AssertKind` (`AssertKind::panic_function`).
+fn panic_function(msg: &RAssertMessage) -> &'static str {
+    match msg {
+        RAssertMessage::Overflow { op, .. } => match op {
+            BinaryOp::Add => "panic_const_add_overflow",
+            BinaryOp::Sub => "panic_const_sub_overflow",
+            BinaryOp::Mul => "panic_const_mul_overflow",
+            BinaryOp::Div => "panic_const_div_overflow",
+            BinaryOp::Rem => "panic_const_rem_overflow",
+            BinaryOp::Shr => "panic_const_shr_overflow",
+            BinaryOp::Shl => "panic_const_shl_overflow",
+            _ => "panic_const_generic_overflow",
+        },
+        RAssertMessage::OverflowNeg(_) => "panic_const_neg_overflow",
+        RAssertMessage::DivisionByZero(_) => "panic_const_div_by_zero",
+        RAssertMessage::RemainderByZero(_) => "panic_const_rem_by_zero",
+        RAssertMessage::ResumedAfterReturn(kind) => match kind {
+            CoroutineKind::Desugared {
+                kind: CoroutineDesugaring::Async,
+                ..
+            } => "panic_const_async_fn_resumed",
+            CoroutineKind::Desugared {
+                kind: CoroutineDesugaring::AsyncGen,
+                ..
+            } => "panic_const_async_gen_fn_resumed",
+            CoroutineKind::Desugared {
+                kind: CoroutineDesugaring::Gen,
+                ..
+            } => "panic_const_gen_fn_none",
+            CoroutineKind::Coroutine { .. } => "panic_const_coroutine_resumed",
+        },
+        RAssertMessage::ResumedAfterPanic(kind) => match kind {
+            CoroutineKind::Desugared {
+                kind: CoroutineDesugaring::Async,
+                ..
+            } => "panic_const_async_fn_resumed_panic",
+            CoroutineKind::Desugared {
+                kind: CoroutineDesugaring::AsyncGen,
+                ..
+            } => "panic_const_async_gen_fn_resumed_panic",
+            CoroutineKind::Desugared {
+                kind: CoroutineDesugaring::Gen,
+                ..
+            } => "panic_const_gen_fn_none_panic",
+            CoroutineKind::Coroutine { .. } => "panic_const_coroutine_resumed_panic",
+        },
+        RAssertMessage::ResumedAfterDrop(kind) => match kind {
+            CoroutineKind::Desugared {
+                kind: CoroutineDesugaring::Async,
+                ..
+            } => "panic_const_async_fn_resumed_drop",
+            CoroutineKind::Desugared {
+                kind: CoroutineDesugaring::AsyncGen,
+                ..
+            } => "panic_const_async_gen_fn_resumed_drop",
+            CoroutineKind::Desugared {
+                kind: CoroutineDesugaring::Gen,
+                ..
+            } => "panic_const_gen_fn_none_drop",
+            CoroutineKind::Coroutine { .. } => "panic_const_coroutine_resumed_drop",
+        },
+        RAssertMessage::NullPointer => "panic_null_pointer_dereference",
+        RAssertMessage::NullReference => "panic_null_reference_construction",
+        RAssertMessage::BoundsCheck { .. } => "panic_bounds_check",
+        RAssertMessage::MisalignedPointer { .. } => "panic_misaligned_pointer_dereference",
+        RAssertMessage::InvalidEnum(_) => "panic_invalid_enum_construction",
+    }
+}
+
+/// What a failed assertion says when the program defines no panic lang item (`base.rs:1022`).
+fn assert_message(msg: &RAssertMessage) -> &'static str {
+    match msg {
+        RAssertMessage::BoundsCheck { .. } => "index out of bounds",
+        RAssertMessage::DivisionByZero(..) => "attempt to divide by zero",
+        RAssertMessage::RemainderByZero(..) => {
+            "attempt to calculate the remainder with a divisor of zero"
+        }
+        RAssertMessage::OverflowNeg(..) => "attempt to negate with overflow",
+        RAssertMessage::Overflow { .. } => "attempt to compute with overflow",
+        _ => "assertion failed",
+    }
+}
+
+/// Keeps `EnumRepr` in scope for the documentation of the tag rules above.
+#[allow(dead_code)]
+fn _repr(_: EnumRepr) {}
+
+/// A fresh record over a carrier value: `fields` copied as they are, `sliced` copied with
+/// `.slice()` (the one owned buffer a native Vec clone must not share). Evaluates `value` once.
+fn record_clone(value: Expr, fields: &[&str], sliced: &[&str]) -> Expr {
+    let (value, wrap): (Expr, Box<dyn FnOnce(Expr) -> Expr>) = if matches!(&value, Expr::Ident(_)) {
+        (value, Box::new(|body| body))
+    } else {
+        (
+            jsast::id("$cp"),
+            Box::new(move |body| {
+                jsast::call(jsast::arrow(vec!["$cp".to_owned()], body), vec![value])
+            }),
+        )
+    };
+    let mut entries = Vec::new();
+    for field in sliced {
+        entries.push((
+            (*field).to_owned(),
+            jsast::method_call(jsast::member(value.clone(), *field), "slice", Vec::new()),
+        ));
+    }
+    for field in fields {
+        entries.push(((*field).to_owned(), jsast::member(value.clone(), *field)));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    wrap(jsast::object(entries))
+}

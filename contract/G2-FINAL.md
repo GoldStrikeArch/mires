@@ -1,7 +1,5 @@
 # G2 final: the completed gate
 
-> **Scope.** This gate record predates the compiler's extraction into its own repository. The `view!` lowering (`view-dom`), `dom-tests`, the demo app, the parity harness and the procedure wire it audits are the Topcoat integration and are not in this repository.
-
 The single input to `VERDICT.md`'s G2 section. It carries every row of
 [`G2-CHECKLIST.md`](G2-CHECKLIST.md) — the wave-5 audit — through to its final
 disposition, and it adds the numbers, the size table, the standing OUT list and
@@ -424,7 +422,7 @@ Raw and gzip, gzip pinned at level 9. Every number measured 2026-07-30, from
 | subject | raw | gzip |
 |---|---|---|
 | `chunk:shared` | 338 | 227 |
-| `runtime` (`mires-dom.js`, solid-js/web + core, one reactive graph) | 23,971 | 9,106 |
+| `runtime` (`topcoat-dom.js`, solid-js/web + core, one reactive graph) | 23,971 | 9,106 |
 | `loader` (`island-loader.js`) | 3,320 | 1,483 |
 | `island-rt` (`island-rt.js`) | 8,345 | 3,570 |
 

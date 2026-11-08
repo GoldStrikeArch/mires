@@ -68,7 +68,7 @@ Call a method on an instance. Vectors `send-one-arg`, `send-zero-args`, `send-tr
 
 Argument count is observable and is recorded as `argc` separately from the argument list, because the two spellings of an omitted optional argument are not equivalent to a library that branches on `arguments.length`. `send-trailing-omitted` and `send-trailing-undefined` are the same call written both ways and their traces differ. This is Melange's trailing `undefined` stripping made into a measurement: the descriptor has to pick a rule, and this is where a lowering that pads optional arguments shows up.
 
-The zero argument case is its own vector because an empty argument list has to be empty, not a list containing one `undefined`.
+The zero argument case is its own vector for the same reason the procedure wire has one. An empty argument list has to be empty, not a list containing one `undefined`. See [`PROCEDURES.md`](PROCEDURES.md) for the same asymmetry in a different place.
 
 ### get
 
@@ -109,25 +109,28 @@ The encoding's source of truth is `js-extern-macro/src/descriptor.rs`. That file
 A declaration travels as a `link_section` on the marker function the macro writes, which is how `codegen_fn_attrs` carries it across a crate boundary without new machinery.
 
 ```text
-rcgjs.ext.<version>.<shape><flags>.<module-len>,<name-len>.<module><name>
+rcgjs.ext.<version>.<shape><flags>.<slots>.<module-len>,<name-len>.<module><name>
 ```
 
-`rcgjs.ext.2.n-.8,5.chart.jsChart` is the worked example, and it is `new Chart(..)` on the `Chart` export of `chart.js`.
+`rcgjs.ext.3.n-.-.8,5.chart.jsChart` is the worked example, and it is `new Chart(..)` on the `Chart` export of `chart.js`.
 
 | field | what it is |
 |---|---|
 | `rcgjs.ext.` | the prefix the backend matches on. `#[js_extern]` sections live outside the `rcgjs.tc.` namespace the view ABI's markers use, so the two never collide. |
-| `<version>` | currently `2`, and the first thing decoded. A descriptor written by another version is named as such rather than mis-read. |
+| `<version>` | currently `3`, and the first thing decoded, because it is what says how many fields follow. Version 2 is still read, and is the same grammar without `<slots>`. A descriptor written by any other version is named as such rather than mis-read. |
 | `<shape>` | one letter: `c` call, `n` new, `s` method (this page's "send"), `g` get, `t` set, `i` index, `j` index-set. |
 | `<flags>` | a run of letters, or `-` for none. `n` is a nullable return, `g` is rooted at the global scope. `encode` writes them in that order and `decode` accepts them in any. |
+| `<slots>` | the per-slot host contract, `-` where the declaration annotated no slot. Otherwise a `,` separated run of `<key><letters>` entries written in slot order, the key a decimal parameter index or `*` for the result. The letters name the carriers the host accepts there — `b` baseline, `h` host string, `v` native vec, `s` slice view, `c` scalar — and how it observes the value: `r` reads, `d` identity, `y` bytes, `m` mutates, `t` retains, `o` owns, `x` throws, `p` suspends. |
 | `<module-len>,<name-len>` | byte counts, decimal. |
 | `<module><name>` | the module specifier and the JavaScript name, concatenated, split by the first length. |
 
-`rcgjs.ext.2.gn.0,5.width` is the other end of the range: a nullable get of `width`, rooted at an argument because the module is empty and the `g` flag is absent. Note that the `g` there is the SHAPE letter for a get, in the first position; the flags are `n` alone. The two `g`s are in different fields and mean different things.
+`rcgjs.ext.3.gn.-.0,5.width` is the other end of the range: a nullable get of `width`, rooted at an argument because the module is empty and the `g` flag is absent. Note that the `g` there is the SHAPE letter for a get, in the first position; the flags are `n` alone. The two `g`s are in different fields and mean different things.
 
 An empty name carries meaning by being empty: it is an index straight off its receiver, with no path walked first.
 
-The version is 2 rather than 1 because wave 5 added the `g` flag. The grammar did not move, since the flags field was already a run of letters, but the vocabulary did, and the module doc's rule is that a change to the grammar bumps the version. Bumping was the better call anyway: a version-1 decoder meeting a `g` refuses it as "not a flag", which is safe, but the version check refuses it by naming the version, which is the more useful message. Nothing persists a descriptor across a build, so nothing had to migrate.
+`rcgjs.ext.3.s-.1hcr,2mt.0,5.write` is a declaration that says something about its slots: parameter 1 is read and taken as a host string or a scalar, and parameter 2 is written through and kept. Parameter 0 said nothing, so it is not written at all, and the consumer classifies it from its Rust type — which is what every slot of a version 2 descriptor does, and why one keeps its exact meaning.
+
+The version is 3 rather than 2 because Phase 4 added the `<slots>` FIELD; a new letter in an existing run is backward compatible and a new field is not, which is the rule the module doc states. The version was 2 rather than 1 because wave 5 added the `g` flag. The grammar did not move, since the flags field was already a run of letters, but the vocabulary did, and the module doc's rule is that a change to the grammar bumps the version. Bumping was the better call anyway: a version-1 decoder meeting a `g` refuses it as "not a flag", which is safe, but the version check refuses it by naming the version, which is the more useful message. Nothing persists a descriptor across a build, so nothing had to migrate.
 
 ### The three roots
 

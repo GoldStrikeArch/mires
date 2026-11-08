@@ -1,0 +1,29 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h003004a6e22666b1 = _$template("<div id=\"main\"><h1>Welcome</h1><label for=\"entry\">Edit:</label><input id=\"entry\" type=\"text\"></div>");
+const tmpl$h2f3d7b196e24db89 = _$template("<div><span><a></a></span><span></span></div>");
+const tmpl$h0a22374833f3a251 = _$template("<div><style>div { color: red; }</style></div>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x01_simple_elements$nested$h2bcda759968f4000();
+  x01_simple_elements$siblings$h87b385fe4287eb4f();
+  x01_simple_elements$raw_text$h066075f042467f1d();
+}
+// nested
+function x01_simple_elements$nested$h2bcda759968f4000() {
+  return tmpl$h003004a6e22666b1();
+}
+// raw_text
+function x01_simple_elements$raw_text$h066075f042467f1d() {
+  return tmpl$h0a22374833f3a251();
+}
+// siblings
+function x01_simple_elements$siblings$h87b385fe4287eb4f() {
+  return tmpl$h2f3d7b196e24db89();
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

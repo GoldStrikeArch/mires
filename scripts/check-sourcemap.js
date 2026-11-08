@@ -2,7 +2,7 @@
 //
 // Checks a source map the backend wrote, without a browser.
 //
-//   node scripts/check-sourcemap.js <out.js> [expected-source-substring]
+//   node scripts/check-sourcemap.js <out.js> [expected-source-substring] [generated-text] [original-line]
 //
 // Stepping through Rust in DevTools cannot be automated here, so this asserts
 // everything a debugger would need before it could work:
@@ -57,11 +57,20 @@ function decodeLine(text, where) {
 
 const jsPath = process.argv[2];
 const wanted = process.argv[3];
+const generatedText = process.argv[4];
+const originalLine = process.argv[5] === undefined ? null : Number(process.argv[5]);
+if (originalLine !== null && (!Number.isInteger(originalLine) || originalLine < 1)) {
+	fail('original-line must be a positive integer');
+}
 if (!jsPath) fail('usage: check-sourcemap.js <out.js> [expected-source-substring]');
 
 const js = fs.readFileSync(jsPath, 'utf8');
 const jsLines = js.split('\n');
 if (js.endsWith('\n')) jsLines.pop();
+const targetLine = generatedText ? jsLines.findIndex(line => line.includes(generatedText)) : -1;
+if (generatedText && targetLine < 0) fail(`generated text ${JSON.stringify(generatedText)} is absent`);
+const targetColumn = targetLine >= 0 ? jsLines[targetLine].indexOf(generatedText) : -1;
+let targetMapping = null;
 
 const urlMatch = js.match(/\/\/# sourceMappingURL=(.*)\s*$/);
 if (!urlMatch) fail(`${jsPath} has no sourceMappingURL comment`);
@@ -113,10 +122,16 @@ lines.forEach((line, genLine) => {
 		if (genCol > jsLines[genLine].length) {
 			fail(`${mapPath}:${genLine + 1}: column ${genCol} is past the end of a ${jsLines[genLine].length} character line`);
 		}
-		if (fields.length === 1) continue;
+		if (fields.length === 1) {
+			if (genLine === targetLine && genCol <= targetColumn) targetMapping = null;
+			continue;
+		}
 		source += fields[1];
 		srcLine += fields[2];
 		srcCol += fields[3];
+		if (genLine === targetLine && genCol <= targetColumn) {
+			targetMapping = { source, line: srcLine };
+		}
 		if (source < 0 || source >= map.sources.length) {
 			fail(`${mapPath}:${genLine + 1}: source index ${source} is out of range`);
 		}
@@ -141,6 +156,17 @@ lines.forEach((line, genLine) => {
 
 if (unmapped.length > 0) {
 	fail(`${mapPath}: ${unmapped.length} generated lines have no mapping (first: ${unmapped[0]})`);
+}
+
+if (generatedText) {
+	if (!targetMapping) fail(`generated text ${JSON.stringify(generatedText)} is unmapped`);
+	const { source, line } = targetMapping;
+	if (wanted && !map.sources[source].includes(wanted)) {
+		fail(`generated text maps to ${map.sources[source]}:${line + 1}, expected ${wanted}`);
+	}
+	if (originalLine !== null && line + 1 !== originalLine) {
+		fail(`generated text maps to line ${line + 1}, expected ${originalLine}`);
+	}
 }
 
 for (const index of map.ignoreList || []) {

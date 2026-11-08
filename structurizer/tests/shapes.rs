@@ -70,10 +70,16 @@ fn matrix(blocks: Vec<Term<S>>, hot: usize, ways: Ways) -> String {
 fn clone_term(t: &Term<S>) -> Term<S> {
     match t {
         Term::Goto(b) => Term::Goto(*b),
-        Term::Cond { on, then_, else_ } => Term::Cond { on, then_: *then_, else_: *else_ },
-        Term::Switch { on, cases, default } => {
-            Term::Switch { on, cases: cases.clone(), default: *default }
-        }
+        Term::Cond { on, then_, else_ } => Term::Cond {
+            on,
+            then_: *then_,
+            else_: *else_,
+        },
+        Term::Switch { on, cases, default } => Term::Switch {
+            on,
+            cases: cases.clone(),
+            default: *default,
+        },
         Term::Return => Term::Return,
         Term::Unreachable => Term::Unreachable,
         Term::Throw => Term::Throw,
@@ -84,7 +90,10 @@ fn clone_term(t: &Term<S>) -> Term<S> {
 fn if_shape() {
     // 0: if (c0) { 1 } ; 2
     let blocks = vec![cond("c0", 1, 2), goto(2), ret()];
-    let ways = Ways { next: 2, ..Ways::default() };
+    let ways = Ways {
+        next: 2,
+        ..Ways::default()
+    };
     expect![[r#"
         == break inner ==
         n/a
@@ -118,7 +127,10 @@ fn if_shape() {
 fn if_else_shape() {
     // 0: if (c0) { 1 } else { 2 } ; 3
     let blocks = vec![cond("c0", 1, 2), goto(3), goto(3), ret()];
-    let ways = Ways { next: 3, ..Ways::default() };
+    let ways = Ways {
+        next: 3,
+        ..Ways::default()
+    };
     expect![[r#"
         == break inner ==
         n/a
@@ -155,7 +167,12 @@ fn if_else_shape() {
 fn while_shape() {
     // 1: while (c1) { 2; 3 } ; 4
     let blocks = vec![goto(1), cond("c1", 2, 4), goto(3), goto(1), ret()];
-    let ways = Ways { inner_head: Some(1), inner_exit: Some(4), next: 3, ..Ways::default() };
+    let ways = Ways {
+        inner_head: Some(1),
+        inner_exit: Some(4),
+        next: 3,
+        ..Ways::default()
+    };
     expect![[r#"
         == break inner ==
         b0;
@@ -210,7 +227,12 @@ fn while_shape() {
 fn loop_shape() {
     // 1: loop { 1; if (c2) continue; else break } ; 3
     let blocks = vec![goto(1), goto(2), cond("c2", 1, 3), ret()];
-    let ways = Ways { inner_head: Some(1), inner_exit: Some(3), next: 2, ..Ways::default() };
+    let ways = Ways {
+        inner_head: Some(1),
+        inner_exit: Some(3),
+        next: 2,
+        ..Ways::default()
+    };
     expect![[r#"
         == break inner ==
         b0;
@@ -249,7 +271,10 @@ fn loop_shape() {
 fn if_in_if_shape() {
     // 0: if (c0) { if (c1) { 2 } else { 3 } } ; 4
     let blocks = vec![cond("c0", 1, 4), cond("c1", 2, 3), goto(4), goto(4), ret()];
-    let ways = Ways { next: 4, ..Ways::default() };
+    let ways = Ways {
+        next: 4,
+        ..Ways::default()
+    };
     expect![[r#"
         == break inner ==
         n/a
@@ -434,7 +459,12 @@ fn loop_in_if_shape() {
         ret(),
         goto(2),
     ];
-    let ways = Ways { inner_head: Some(2), inner_exit: Some(4), next: 6, ..Ways::default() };
+    let ways = Ways {
+        inner_head: Some(2),
+        inner_exit: Some(4),
+        next: 6,
+        ..Ways::default()
+    };
     expect![[r#"
         == break inner ==
         b0;
@@ -515,7 +545,12 @@ fn if_in_loop_shape() {
         goto(1),
         ret(),
     ];
-    let ways = Ways { inner_head: Some(1), inner_exit: Some(6), next: 5, ..Ways::default() };
+    let ways = Ways {
+        inner_head: Some(1),
+        inner_exit: Some(6),
+        next: 5,
+        ..Ways::default()
+    };
     expect![[r#"
         == break inner ==
         b0;

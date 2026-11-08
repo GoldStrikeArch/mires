@@ -1,4 +1,4 @@
-// Minimal `core` replacement for the rustc_codegen_mires spike.
+// Minimal `core` replacement for the rustc_codegen_js spike.
 //
 // Adapted from rustc_codegen_cranelift's `example/mini_core.rs`. ITEMS ONLY -- the
 // crate-level attributes live in every test's fixed header (see CONTRACT.md).

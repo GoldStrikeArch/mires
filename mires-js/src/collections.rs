@@ -2,7 +2,7 @@
 //!
 //! [`HashMap`] and [`HashSet`] are the two, and both are one host `Map` and nothing else.
 //!
-//! A doctest cannot run here: these operations only exist once `rustc_codegen_mires` has replaced
+//! A doctest cannot run here: these operations only exist once `rustc_codegen_js` has replaced
 //! them, so the block below is prose rather than a test.
 //!
 //! ```text

@@ -1,0 +1,10 @@
+[package]
+name = "mires-standalone-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[build-dependencies]
+mires-build = { path = "../../mires-build" }
+
+[workspace]

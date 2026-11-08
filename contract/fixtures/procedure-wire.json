@@ -1,0 +1,346 @@
+{
+  "$what": "The procedure call wire: what a client POSTs to a #[procedure] route and what comes back. THE SINGLE SOURCE for the framework crate's HTTP tests and for wave 3's client fixtures, so that the two cannot disagree about the wire while both passing.",
+  "$handWritten": true,
+  "$notGenerated": "No extractor produces this file. Every claim in it is cited to Topcoat's own source below, not extracted from upstream, because the wire is Topcoat's and not solid's. `harness/check-procedure-wire.mjs` re-reads those sources on every run and fails if a cited value moved, so this file cannot drift from the code silently even though nothing regenerates it.",
+  "$corrections": [
+    {
+      "vector": "serde-wrong-argument-type",
+      "claimed": "expect.bodyEndsWith = \"(at `1`)\"",
+      "observed": "expect.bodyEndsWith = \"(at `[1]`)\"",
+      "foldedIn": true,
+      "why": "serde_path_to_error brackets a sequence index, and the argument array is a sequence, so the second argument's path is `[1]` and not `1`. The claim this vector exists to make -- that the message names WHICH argument was wrong -- was right; only the spelling was predicted wrong.",
+      "reportedBy": "the framework agent's landed HTTP tests, via crates/topcoat-runtime/macro/tests/fixtures/procedure_wire.json's own $corrections block",
+      "$lesson": "This is what `derived: true` is for and it fired on a vector that was NOT marked derived: the vector cited a real unit test, but that test asserts only that the error is a BadRequestError, not what the rendered path says. A citation is only as strong as what the cited test actually asserts."
+    }
+  ],
+  "$howToUse": [
+    "Framework/server tests: for each vector with `direction: \"request\"`, build a POST to `route.prefix + '/' + id` with `contentType` and `body` verbatim, and assert `expect`.",
+    "Client fixtures (wave 3): for each vector, assert the client PRODUCES exactly `contentType` and `body` for the named `args`. Same rows, read the other way round.",
+    "A vector whose `derived` is true was NOT observed in an existing test; it follows from the cited code and is a prediction to confirm on first contact. Everything else cites the test that already pins it."
+  ],
+  "$citations": {
+    "routePrefix": "crates/topcoat-runtime/src/procedure.rs:13 (PROCEDURE_ROUTE_PREFIX)",
+    "routeShape": "crates/topcoat-runtime/src/procedure.rs:169-196 (ProcedureRoute::new builds `{prefix}/{id}`; Route::methods is Methods::Only(&[Method::POST]))",
+    "procedureId": "crates/topcoat-runtime/grammar/src/procedure.rs:123 (`uuid::Uuid::new_v4()` at macro-expansion time, so the id is baked into both halves of the build and is stable for a given binary, NOT across rebuilds)",
+    "serdeContentType": "crates/topcoat-runtime/src/procedure.rs:23 (SERDE_CONTENT_TYPE)",
+    "serdeArgsDecode": "crates/topcoat-runtime/src/procedure.rs:36-52 (serde_args: guard the media type, then decode through the router's own Json extractor)",
+    "serdeMediaTypeMatching": "crates/topcoat-runtime/src/procedure.rs:56-66 (is_serde_content_type: split on ';', trim, eq_ignore_ascii_case)",
+    "serdeZeroArgs": "crates/topcoat-runtime/src/procedure.rs:26-30 and :302-323 (`[]` decodes into `[(); 0]`; `()` is not an empty array to serde, it is null)",
+    "surrogateWire": "crates/topcoat-runtime/browser/src/surrogate/procedure.ts:11-25 (POST, Content-Type: application/json, body `args.length === 0 ? null : args.map(a => a.dehydrate())`)",
+    "surrogateHandler": "crates/topcoat-runtime/grammar/src/procedure.rs:125-141 (decodes Json<Surrogate>, responds Json(into_surrogate(ret)))",
+    "jsonExtractor": "crates/topcoat-router/src/content/json.rs:80-97 (content-type guard -> 400), :125-136 (serde_path_to_error decode), :154-170 (json_content_type accepts application/json and any application/*+json)",
+    "jsonResponse": "crates/topcoat-router/src/content/json.rs:138-149 (IntoResponse for Json sets a static application/json)",
+    "decodeErrorShape": "crates/topcoat-router/src/content/json.rs:173-187 (json_deserialization_error: Data -> 'invalid JSON value: ..', Syntax/Eof -> 'invalid JSON syntax: ..', then bad_request_at(path, description))",
+    "badRequestShape": "crates/topcoat-router/src/error/bad_request.rs:70-84 (Display is 'bad request: {description}' or 'bad request: {description} (at `{path}`)'; IntoResponse is (400, String))",
+    "internalErrorShape": "crates/topcoat-router/src/error/internal_server.rs:55-67 (body is the literal 'internal server error'; the inner error is NOT exposed)",
+    "errorStatusMapping": "crates/topcoat-router/src/error.rs:34-53 (error_into_response downcasts Forbidden, BadRequest, InternalServer, NotFound, MethodNotAllowed, Redirect, Unauthorized in that order; anything else becomes a 500)",
+    "textPlain": "crates/topcoat-router/src/response.rs:17,127 (a String body is served as `text/plain; charset=utf-8`)",
+    "clientFutureLaziness": "crates/topcoat-runtime/browser/src/surrogate/future.ts:1-23 (a Rust Future is modelled as a LAZY PromiseLike: the async thunk runs on the first `then`, and the promise is memoised)",
+    "wireDesignDecision": "spike/rustc-codegen-js/build/logs/wave2-framework-report.md:88-137 (wave-2 framework agent's decision: per-procedure opt-in, exclusive wires, and deviations D1/D2)"
+  },
+  "route": {
+    "prefix": "/_topcoat/procedures",
+    "path": "/_topcoat/procedures/{id}",
+    "method": "POST",
+    "idIsUrlEncodedByTheClient": true,
+    "$otherMethods": "A ProcedureRoute answers Methods::Only(&[Method::POST]), so any other method is the router's 405, not the procedure's business.",
+    "$unknownId": "No route is registered for an id that was never mounted, so an unknown procedure is the router's 404. There is no per-procedure 'no such procedure' error."
+  },
+  "wires": {
+    "surrogate": {
+      "selectedBy": "#[procedure] with no arguments -- today's only wire",
+      "requestContentType": "application/json",
+      "argumentEncoding": "a JSON array, one element per argument, each element the argument's `dehydrate()` form",
+      "zeroArguments": "null",
+      "$zeroArgumentsWhy": "The argument tuple for zero arguments is `()`, whose Surrogate is `()`, and serde only accepts the literal `null` for a unit. So `[]` is a 400 on this wire.",
+      "responseContentType": "application/json",
+      "responseEncoding": "the return value's surrogate, which the client passes to `cx.hydrate()`"
+    },
+    "serde": {
+      "selectedBy": "#[procedure(serde)] -- the wire the Rust-to-JS client needs, because an arbitrary #[derive(Deserialize)] type has no Surrogated impl",
+      "requestContentType": "application/topcoat+json",
+      "argumentEncoding": "a JSON array, one element per argument, each encoded by its own Serialize impl",
+      "zeroArguments": "[]",
+      "$zeroArgumentsWhy": "The zero-argument codegen decodes `[(); 0]`, which accepts exactly a zero-length array and rejects `null`. This asymmetry with the surrogate wire is deliberate and is NOT shared between the two.",
+      "responseContentType": "application/json",
+      "responseEncoding": "the return value by its own Serialize impl",
+      "$whyADistinctMediaType": "The surrogate wire already occupies application/json, so it cannot be the discriminator. See deviation D1 in the wave-2 framework report.",
+      "$exclusive": "A procedure serves ONE wire. A surrogate-wire caller hitting a serde procedure is rejected by the content-type guard, and a serde-only procedure cannot be named from expr! at all, because ProcedureSurrogate::call requires A: Surrogated."
+    }
+  },
+  "mediaTypeMatching": {
+    "$rule": "Take everything before the first ';', trim ASCII whitespace, compare case-insensitively. Both wires do this; only the value they compare against differs.",
+    "serdeAccepts": [
+      "application/topcoat+json",
+      "application/topcoat+json; charset=utf-8",
+      "Application/Topcoat+JSON",
+      " application/topcoat+json "
+    ],
+    "serdeRejects": [
+      "application/json",
+      "text/plain",
+      "application/topcoat",
+      null
+    ],
+    "$jsonExtractorIsWider": "The router's Json extractor accepts application/json AND any application/*+json, so it accepts application/topcoat+json too. That is what lets the serde handler guard on the exact media type and then reuse Json for the body read, the size limit and the serde_path_to_error diagnostics."
+  },
+  "errors": {
+    "$bodyIsPlainText": "Every error below is `text/plain; charset=utf-8` carrying the error's Display string. There is no JSON error envelope, and inventing one for procedures alone would make them the only endpoint in the framework with one.",
+    "wrongMediaType": {
+      "status": 400,
+      "bodyExactly": "bad request: expected request with `Content-Type: application/topcoat+json`",
+      "$why": "serde_args' own guard. 400 rather than 415 matches what the Json extractor already returns for a content-type mismatch; see deviation D2. No 415 constructor exists in the repo."
+    },
+    "malformedJson": {
+      "status": 400,
+      "bodyStartsWith": "bad request: invalid JSON syntax:",
+      "$why": "serde_json classified the failure as Syntax or Eof."
+    },
+    "wrongArgumentType": {
+      "status": 400,
+      "bodyStartsWith": "bad request: invalid JSON value:",
+      "bodyEndsWith": "(at `[1]`)",
+      "$why": "Data category, with the serde_path_to_error path to the argument that failed. The path is the zero-based index in the argument array, BRACKETED, because serde_path_to_error renders a sequence index as `[n]` and the argument array is a sequence. So `(at `[1]`)` means the second argument.",
+      "$pathRule": "Segments are joined with `.` and a sequence index is written `[n]`. A bad field inside a struct argument should therefore read `[0].name`. The top-level form is observed; the nested form follows from the same rule and is NOT confirmed -- do not assert it without checking, since the top-level spelling was predicted wrong once already.",
+      "$whyNotAnExactBody": "The middle of the message is serde_json's own wording ('invalid type: integer `7`, expected a string at line 1 column 7'), which is not Topcoat's string to pin. Assert the prefix and the path, not the whole line, or a serde_json patch release breaks the test for no reason."
+    },
+    "wrongArity": {
+      "status": 400,
+      "bodyStartsWith": "bad request: invalid JSON value:",
+      "$why": "A tuple of the wrong length is a Data error from serde ('invalid length N, expected a tuple of size M').",
+      "derived": true
+    },
+    "handlerError": {
+      "status": "the status of the error the procedure returned",
+      "$mapping": "bad_request -> 400, forbidden -> 403, not_found -> 404, unauthorized -> 401, method_not_allowed -> 405, redirect -> its own, internal_server_error -> 500, and any other error -> 500 with the body 'internal server error' and nothing about the cause.",
+      "$why": "The procedure handler returns Result<Response>, so the router's ordinary error_into_response applies. Procedures add no error handling of their own."
+    }
+  },
+  "vectors": [
+    {
+      "id": "serde-two-args",
+      "wire": "serde",
+      "direction": "request",
+      "signature": "async fn f(a: f64, b: String) -> Result<..>",
+      "args": "(2.5, \"x\")",
+      "contentType": "application/topcoat+json",
+      "body": "[2.5,\"x\"]",
+      "decodesTo": "(f64, String) == (2.5, \"x\".to_owned())",
+      "expect": { "status": 200 },
+      "pinnedBy": "crates/topcoat-runtime/src/procedure.rs:292-300"
+    },
+    {
+      "id": "serde-one-arg",
+      "wire": "serde",
+      "direction": "request",
+      "signature": "async fn f(a: f64) -> Result<..>",
+      "args": "(2.5,)",
+      "contentType": "application/topcoat+json",
+      "body": "[2.5]",
+      "decodesTo": "(f64,) == (2.5,)",
+      "expect": { "status": 200 },
+      "$note": "One argument is still an ARRAY, not a bare value. The tuple is (T,).",
+      "derived": true
+    },
+    {
+      "id": "serde-zero-args",
+      "wire": "serde",
+      "direction": "request",
+      "signature": "async fn f() -> Result<..>",
+      "args": "()",
+      "contentType": "application/topcoat+json",
+      "body": "[]",
+      "decodesTo": "[(); 0]",
+      "expect": { "status": 200 },
+      "pinnedBy": "crates/topcoat-runtime/src/procedure.rs:302-310"
+    },
+    {
+      "id": "serde-struct-arg",
+      "wire": "serde",
+      "direction": "request",
+      "signature": "async fn f(input: Input) -> Result<..> where Input { name: String, count: u32 }",
+      "args": "(Input { name: \"x\".into(), count: 3 },)",
+      "contentType": "application/topcoat+json",
+      "body": "[{\"count\":3,\"name\":\"x\"}]",
+      "decodesTo": "(Input { name: \"x\", count: 3 },)",
+      "expect": { "status": 200 },
+      "$note": "The whole reason the serde wire exists: Input has no Surrogated impl and never needs one. Field order in the body is the client's business -- serde does not require declaration order.",
+      "derived": true
+    },
+    {
+      "id": "serde-zero-args-rejects-null",
+      "wire": "serde",
+      "direction": "request",
+      "signature": "async fn f() -> Result<..>",
+      "contentType": "application/topcoat+json",
+      "body": "null",
+      "expect": { "status": 400, "bodyStartsWith": "bad request: invalid JSON value:" },
+      "$why": "`null` is the SURROGATE wire's zero-argument body. Each wire rejects the other's spelling, which is what makes the asymmetry safe.",
+      "pinnedBy": "crates/topcoat-runtime/src/procedure.rs:312-323"
+    },
+    {
+      "id": "serde-rejects-json-media-type",
+      "wire": "serde",
+      "direction": "request",
+      "signature": "async fn f(a: f64) -> Result<..>",
+      "contentType": "application/json",
+      "body": "[1.0]",
+      "expect": {
+        "status": 400,
+        "bodyExactly": "bad request: expected request with `Content-Type: application/topcoat+json`"
+      },
+      "$why": "A well-formed serde body sent under the other wire's media type. The message names the media type it wanted.",
+      "pinnedBy": "crates/topcoat-runtime/src/procedure.rs:325-339"
+    },
+    {
+      "id": "serde-rejects-missing-media-type",
+      "wire": "serde",
+      "direction": "request",
+      "signature": "async fn f(a: f64) -> Result<..>",
+      "contentType": null,
+      "body": "[1.0]",
+      "expect": {
+        "status": 400,
+        "bodyExactly": "bad request: expected request with `Content-Type: application/topcoat+json`"
+      },
+      "pinnedBy": "crates/topcoat-runtime/src/procedure.rs:325-339"
+    },
+    {
+      "id": "serde-media-type-with-parameters",
+      "wire": "serde",
+      "direction": "request",
+      "signature": "async fn f(a: f64) -> Result<..>",
+      "contentType": "application/topcoat+json; charset=utf-8",
+      "body": "[1.0]",
+      "expect": { "status": 200 },
+      "$why": "Parameters after the media type are ignored, so a client that sends a charset is not punished for it.",
+      "pinnedBy": "crates/topcoat-runtime/src/procedure.rs:272-280"
+    },
+    {
+      "id": "serde-wrong-argument-type",
+      "wire": "serde",
+      "direction": "request",
+      "signature": "async fn f(a: f64, b: String) -> Result<..>",
+      "contentType": "application/topcoat+json",
+      "body": "[2.5,7]",
+      "expect": {
+        "status": 400,
+        "bodyStartsWith": "bad request: invalid JSON value:",
+        "bodyEndsWith": "(at `[1]`)"
+      },
+      "$why": "The path names WHICH argument was wrong. `[1]` is the second argument: serde_path_to_error brackets a sequence index, and the argument array is a sequence.",
+      "$corrected": true,
+      "pinnedBy": "crates/topcoat-runtime/src/procedure.rs:341-349 (the decode); crates/topcoat-runtime/macro/tests/fixtures/procedure_wire.json (the rendered path, observed by the framework agent's landed HTTP tests)"
+    },
+    {
+      "id": "serde-wrong-arity",
+      "wire": "serde",
+      "direction": "request",
+      "signature": "async fn f(a: f64, b: String) -> Result<..>",
+      "contentType": "application/topcoat+json",
+      "body": "[1.0]",
+      "expect": { "status": 400, "bodyStartsWith": "bad request: invalid JSON value:" },
+      "derived": true
+    },
+    {
+      "id": "serde-malformed-body",
+      "wire": "serde",
+      "direction": "request",
+      "signature": "async fn f(a: f64) -> Result<..>",
+      "contentType": "application/topcoat+json",
+      "body": "[1.0",
+      "expect": { "status": 400, "bodyStartsWith": "bad request: invalid JSON syntax:" },
+      "bodyIsValidJson": false,
+      "derived": true
+    },
+    {
+      "id": "surrogate-zero-args",
+      "wire": "surrogate",
+      "direction": "request",
+      "signature": "async fn f() -> Result<..>",
+      "args": "()",
+      "contentType": "application/json",
+      "body": "null",
+      "expect": { "status": 200 },
+      "$why": "The literal `null`, not `[]`. This is the branch `args.length === 0 ? null : ...` in the browser client.",
+      "pinnedBy": "crates/topcoat-runtime/browser/src/surrogate/procedure.ts:17-24"
+    },
+    {
+      "id": "surrogate-two-args",
+      "wire": "surrogate",
+      "direction": "request",
+      "signature": "async fn f(a: f64, b: String) -> Result<..>",
+      "args": "(2.5, \"x\")",
+      "contentType": "application/json",
+      "body": "[2.5,\"x\"]",
+      "expect": { "status": 200 },
+      "$note": "For a scalar the dehydrated surrogate IS the plain JSON value, so this vector's body is identical to serde-two-args'. The two wires differ in the media type, in the zero-argument spelling, and in what a NON-scalar dehydrates to -- not in this row.",
+      "derived": true
+    },
+    {
+      "id": "response-scalar",
+      "wire": "both",
+      "direction": "response",
+      "returns": "Result<f64>",
+      "value": "6.0",
+      "status": 200,
+      "contentType": "application/json",
+      "body": "6.0",
+      "pinnedBy": "crates/topcoat-router/src/content/json.rs:138-149"
+    },
+    {
+      "id": "response-string",
+      "wire": "both",
+      "direction": "response",
+      "returns": "Result<String>",
+      "value": "\"ok\"",
+      "status": 200,
+      "contentType": "application/json",
+      "body": "\"ok\"",
+      "$note": "A JSON string, quotes included -- not text/plain. The response is Json(R) whatever R is.",
+      "derived": true
+    },
+    {
+      "id": "response-unit",
+      "wire": "both",
+      "direction": "response",
+      "returns": "Result<()>",
+      "value": "()",
+      "status": 200,
+      "contentType": "application/json",
+      "body": "null",
+      "$note": "A procedure that returns nothing still answers with a JSON body. There is no 204 path.",
+      "derived": true
+    },
+    {
+      "id": "response-struct",
+      "wire": "serde",
+      "direction": "response",
+      "returns": "Result<Output> where Output { ok: bool }",
+      "value": "Output { ok: true }",
+      "status": 200,
+      "contentType": "application/json",
+      "body": "{\"ok\":true}",
+      "derived": true
+    },
+    {
+      "id": "method-not-post",
+      "wire": "both",
+      "direction": "request",
+      "method": "GET",
+      "expect": { "status": 405 },
+      "$why": "ProcedureRoute answers Methods::Only(&[Method::POST]).",
+      "pinnedBy": "crates/topcoat-runtime/src/procedure.rs:184-187",
+      "derived": true
+    },
+    {
+      "id": "unknown-procedure-id",
+      "wire": "both",
+      "direction": "request",
+      "path": "/_topcoat/procedures/not-a-real-id",
+      "expect": { "status": 404 },
+      "$why": "Nothing is mounted at that path, so it is an ordinary router miss.",
+      "derived": true
+    }
+  ]
+}

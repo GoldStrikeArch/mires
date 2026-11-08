@@ -1,0 +1,156 @@
+// rustc_codegen_js — program
+import * as __rt from "./shim.js";
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$hf6cbd6a9cadd62de = _$template("<ul></ul>");
+const tmpl$he15647176a3d34ce = _$template("<li></li>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// <core::slice::Iter<'a, T> as core::iter::Iterator>::next
+function core$slice$iter$impl_171_next$ha0266bf9022044b0(self) {
+  let ptr, end_or_len, len, _11, _0, _0$1;
+  ptr = self.ptr;
+  end_or_len = self.end_or_len;
+  L0: {
+    L1: {
+      if (false) {
+        len = __rt.addr(end_or_len, 12) >>> 0;
+        if (len === 0) {
+          _0$1 = { TAG: "None" };
+          break L1;
+        } else {
+          if (false) {
+            core$num$impl_11_unchecked_sub$precondition_check$h4c33ce104fc15265(len, 1, { filename: "core/src/num/mod.rs", line: 1417, col: 5 });
+          }
+          self.end_or_len = len - 1 >>> 0;
+        }
+      } else {
+        _11 = ptr;
+        if (__rt.ptr_eq(_11, end_or_len)) {
+          _0$1 = { TAG: "None" };
+          break L1;
+        } else {
+          self.ptr = { buf: _11.buf, off: _11.off + 1 };
+        }
+      }
+      _0 = { TAG: "Some", _0: ptr.buf[ptr.off] };
+      break L0;
+    }
+    _0 = _0$1;
+  }
+  return _0;
+}
+// core::slice::iter::<impl core::iter::IntoIterator for &'a [T]>::into_iter
+function core$slice$iter$impl_1_into_iter$hdf4b48e564c580a1(self) {
+  let _2, _3, _5;
+  _2 = self.len;
+  _3 = self;
+  if (false) {
+    _5 = _2;
+  } else {
+    _5 = { buf: _3.buf, off: _3.off + _2 };
+  }
+  return { ptr: _3, end_or_len: _5, _marker: undefined };
+}
+// rust_entry
+function rust_entry() {
+  let first;
+  first = [{ id: 1, title: "A" }, { id: 2, title: "B" }, { id: 3, title: "C" }];
+  x20_keyed_for$keyed$h2abef2e6b64a0219({ buf: first, off: 0, len: 3 });
+  x20_keyed_for$keyed$h2abef2e6b64a0219({ buf: [{ id: 3, title: "C" }, { id: 1, title: "A" }, { id: 2, title: "B" }], off: 0, len: 3 });
+  x20_keyed_for$keyed$h2abef2e6b64a0219({ buf: [{ id: 2, title: "B" }, { id: 4, title: "D" }, { id: 1, title: "A" }], off: 0, len: 3 });
+  x20_keyed_for$unkeyed$hcceb8a87d238b2c8({ buf: first, off: 0, len: 3 });
+  x20_keyed_for$keyed_by_str$h07b94b8e91e8f222({ buf: first, off: 0, len: 3 });
+}
+// keyed
+function x20_keyed_for$keyed$h2abef2e6b64a0219(posts) {
+  let _0, __tc_rows, iter, _6, post, _14, __tc_root_1, _20, $v16, _2, $v20, $t0, $t1;
+  _0 = ($t0 = tmpl$hf6cbd6a9cadd62de(), $t0);
+  __tc_rows = [];
+  iter = core$slice$iter$impl_1_into_iter$hdf4b48e564c580a1(posts);
+  for (;;) {
+    _6 = core$slice$iter$impl_171_next$ha0266bf9022044b0(iter);
+    switch (_6.TAG) {
+      case "None":
+        $v20 = 0;
+        _$insert($t0, __tc_rows);
+        return _0;
+      case "Some":
+        post = _6._0;
+        _14 = post.id;
+        __tc_root_1 = ($t1 = tmpl$he15647176a3d34ce(), $t1);
+        _20 = post.title;
+        $v16 = 0;
+        _$insert($t1, _20);
+        _2 = __tc_root_1;
+        __tc_rows.push(__rt.keyed_row("x20_keyed_for$keyed$h2abef2e6b64a0219#13", String(_14), _2));
+        break;
+      default:
+        throw new Error("rustc_codegen_js: entered unreachable code");
+    }
+  }
+}
+// keyed_by_str
+function x20_keyed_for$keyed_by_str$h07b94b8e91e8f222(posts) {
+  let _0, __tc_rows, iter, _6, post, _14, __tc_root_1, _20, $v16, _2, $v20, $t0, $t1;
+  _0 = ($t0 = tmpl$hf6cbd6a9cadd62de(), $t0);
+  __tc_rows = [];
+  iter = core$slice$iter$impl_1_into_iter$hdf4b48e564c580a1(posts);
+  for (;;) {
+    _6 = core$slice$iter$impl_171_next$ha0266bf9022044b0(iter);
+    switch (_6.TAG) {
+      case "None":
+        $v20 = 0;
+        _$insert($t0, __tc_rows);
+        return _0;
+      case "Some":
+        post = _6._0;
+        _14 = post.title;
+        __tc_root_1 = ($t1 = tmpl$he15647176a3d34ce(), $t1);
+        _20 = post.id;
+        $v16 = 0;
+        _$insert($t1, _20);
+        _2 = __tc_root_1;
+        __tc_rows.push(__rt.keyed_row("x20_keyed_for$keyed_by_str$h07b94b8e91e8f222#13", _14, _2));
+        break;
+      default:
+        throw new Error("rustc_codegen_js: entered unreachable code");
+    }
+  }
+}
+// unkeyed
+function x20_keyed_for$unkeyed$hcceb8a87d238b2c8(posts) {
+  let _0, __tc_rows, iter, _6, post, __tc_root_1, _19, $v14, _2, $v18, $t0, $t1;
+  _0 = ($t0 = tmpl$hf6cbd6a9cadd62de(), $t0);
+  __tc_rows = [];
+  iter = core$slice$iter$impl_1_into_iter$hdf4b48e564c580a1(posts);
+  for (;;) {
+    _6 = core$slice$iter$impl_171_next$ha0266bf9022044b0(iter);
+    switch (_6.TAG) {
+      case "None":
+        $v18 = 0;
+        _$insert($t0, __tc_rows);
+        return _0;
+      case "Some":
+        post = _6._0;
+        __tc_root_1 = ($t1 = tmpl$he15647176a3d34ce(), $t1);
+        _19 = post.title;
+        $v14 = 0;
+        _$insert($t1, _19);
+        _2 = __tc_root_1;
+        __tc_rows.push(_2);
+        break;
+      default:
+        throw new Error("rustc_codegen_js: entered unreachable code");
+    }
+  }
+}
+
+function core$num$impl_11_unchecked_sub$precondition_check$h4c33ce104fc15265() {
+  throw new Error("rustc_codegen_js: `core$num$impl_11_unchecked_sub$precondition_check$h4c33ce104fc15265` was never codegenned; the monomorphization collector proved every call to it unreachable");
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

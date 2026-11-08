@@ -1,0 +1,70 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { createSignal as _$createSignal } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { delegateEvents as _$delegateEvents } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { effect as _$effect } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h8cc1e8cdb15d3d03 = _$template("<div><button>+1</button><button>-1</button><p>Count: <!></p></div>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// lib::Sig::<T>::get
+function lib$impl_1_get$h04611f6253cd488a(self) {
+  return self[0]();
+}
+// lib::Sig::<T>::set
+function lib$impl_1_set$hbf5e226192239f53(self, value) {
+  self[1](value);
+}
+// rust_entry
+function rust_entry() {
+  x17_signal$counter$h2c044ec1e19d9964();
+}
+// counter::{closure#0}
+function x17_signal$counter$closure_0$he149e5bb9f79fd72(_1, _e) {
+  let _0, _3;
+  _3 = _1[0];
+  _0 = lib$impl_1_set$hbf5e226192239f53(_3, lib$impl_1_get$h04611f6253cd488a(_1[0]) + 1 >>> 0);
+}
+// counter::{closure#1}
+function x17_signal$counter$closure_1$h8a6093fd49e2cfc0(_1) {
+  return lib$impl_1_get$h04611f6253cd488a(_1[0]) === 0;
+}
+// counter::{closure#2}
+function x17_signal$counter$closure_2$ha1855ed723cefe9a(_1, _e) {
+  let _0, _3;
+  _3 = _1[0];
+  _0 = lib$impl_1_set$hbf5e226192239f53(_3, lib$impl_1_get$h04611f6253cd488a(_1[0]) - 1 >>> 0);
+}
+// counter::{closure#3}
+function x17_signal$counter$closure_3$h80f6f65ba637b4e0(_1) {
+  return lib$impl_1_get$h04611f6253cd488a(_1[0]);
+}
+// counter
+function x17_signal$counter$h2c044ec1e19d9964() {
+  let _0, count, _5, _8, _11, _14, $t0, $t1, $t2, $t3, $t4;
+  count = _$createSignal(0);
+  _0 = tmpl$h8cc1e8cdb15d3d03();
+  $t0 = _0.firstChild;
+  $t1 = $t0.nextSibling;
+  $t2 = $t1.nextSibling;
+  $t3 = $t2.firstChild;
+  $t4 = $t3.nextSibling;
+  _$delegateEvents(["click"]);
+  _5 = [count];
+  $t0.$$click = ($a0) => x17_signal$counter$closure_0$he149e5bb9f79fd72(_5, $a0);
+  _8 = [count];
+  _$effect(() => $t1.disabled = x17_signal$counter$closure_1$h8a6093fd49e2cfc0(_8));
+  _11 = [count];
+  $t1.$$click = ($a0) => x17_signal$counter$closure_2$ha1855ed723cefe9a(_11, $a0);
+  _14 = [count];
+  _$insert($t2, () => x17_signal$counter$closure_3$h80f6f65ba637b4e0(_14), $t4);
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

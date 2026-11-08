@@ -45,12 +45,8 @@
 
 use std::collections::HashSet;
 
-use rustc_middle::mir::visit::{
-    MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor,
-};
-use rustc_middle::mir::{
-    Body, Local, Location, Place, PlaceElem, RETURN_PLACE, StatementKind,
-};
+use rustc_middle::mir::visit::{MutatingUseContext, NonMutatingUseContext, PlaceContext, Visitor};
+use rustc_middle::mir::{Body, Local, Location, Place, PlaceElem, StatementKind, RETURN_PLACE};
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt, TypeFoldable};
 
 use crate::value::{transparent_field, typing_env};
@@ -103,11 +99,17 @@ impl Uses {
             dropped: dropped_locations(mir, dropped),
         };
         collector.visit_body(mir);
-        Uses { locals: collector.locals, arg_count: mir.arg_count }
+        Uses {
+            locals: collector.locals,
+            arg_count: mir.arg_count,
+        }
     }
 
     fn get(&self, local: Local) -> LocalUse {
-        self.locals.get(local.as_usize()).copied().unwrap_or_default()
+        self.locals
+            .get(local.as_usize())
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Whether the local is a parameter, which is bound by the function signature and so is
@@ -240,14 +242,12 @@ impl<'tcx> Collector<'tcx> {
 
     /// The monomorphized type a local reaches through a run of projections, or `None` if this pass
     /// cannot work it out.
-    fn projected_ty(
-        &self,
-        local: Local,
-        projection: &[PlaceElem<'tcx>],
-    ) -> Option<Ty<'tcx>> {
+    fn projected_ty(&self, local: Local, projection: &[PlaceElem<'tcx>]) -> Option<Ty<'tcx>> {
         let &local_ty = self.local_decls.get(local.as_usize())?;
         let ty = projection.iter().fold(local_ty, |ty, elem| {
-            rustc_middle::mir::PlaceTy::from_ty(ty).projection_ty(self.tcx, *elem).ty
+            rustc_middle::mir::PlaceTy::from_ty(ty)
+                .projection_ty(self.tcx, *elem)
+                .ty
         });
         Some(self.monomorphize(ty))
     }
@@ -294,7 +294,9 @@ impl<'tcx> Visitor<'tcx> for Collector<'tcx> {
     }
 
     fn visit_local(&mut self, local: Local, context: PlaceContext, _location: Location) {
-        let Some(slot) = self.locals.get_mut(local.as_usize()) else { return };
+        let Some(slot) = self.locals.get_mut(local.as_usize()) else {
+            return;
+        };
         match context {
             // Storage markers and debug info do not read or write anything.
             PlaceContext::NonUse(_) => {}
@@ -349,10 +351,17 @@ fn dropped_locations<'tcx>(mir: &Body<'tcx>, dropped: &[bool]) -> HashSet<Locati
     }
     for (block, data) in mir.basic_blocks.iter_enumerated() {
         for (statement_index, statement) in data.statements.iter().enumerate() {
-            let StatementKind::Assign(assignment) = &statement.kind else { continue };
-            let Some(local) = assignment.0.as_local() else { continue };
+            let StatementKind::Assign(assignment) = &statement.kind else {
+                continue;
+            };
+            let Some(local) = assignment.0.as_local() else {
+                continue;
+            };
             if dropped.get(local.as_usize()).copied().unwrap_or(false) {
-                locations.insert(Location { block, statement_index });
+                locations.insert(Location {
+                    block,
+                    statement_index,
+                });
             }
         }
     }
@@ -373,4 +382,3 @@ fn is_borrow(context: PlaceContext) -> bool {
             )
     )
 }
-

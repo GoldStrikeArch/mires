@@ -30,6 +30,8 @@
 #   * `--remap-path-prefix` makes the `#[track_caller]` locations `core` builds —
 #     which a `#[panic_handler]` can print — repository relative, so a test's
 #     expected output does not depend on where the checkout lives.
+#   * `JSC_REMAP_ROOT`, when set, gives an additional source tree stable relative
+#     paths. Package builders use it for sources outside this compiler checkout.
 #
 # Everything reachable from a `#[no_mangle]` item in this crate is emitted;
 # everything else — which is nearly all of `core` — is dropped.
@@ -41,11 +43,24 @@
 # output (`js-comments`, `js-line-comments`, `js-source-map`) are safe to pass
 # here alone — they are per item, and an item is emitted by whichever crate
 # codegenned it.
+#
+# $JSC_RUST_MIR_INLINE=on adds `-Zinline-mir` to this crate. The sysroot is
+# always built with it, so this only adds the app-crate half: a `core` body
+# small enough for rustc's cost model lands inside the caller instead of behind
+# a call, which is what lets the backend's own passes see one body. It does not
+# take part in the sysroot cache key, because it changes nothing the sysroot
+# build does. It is off by default; turning it on changes the emitted JavaScript
+# in every optimizer mode, so it is a build setting rather than an optimizer
+# pass.
 
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd -- "$script_dir/.." && pwd)
+# shellcheck source=integration-lock.sh
+source "$script_dir/integration-lock.sh"
+# shellcheck source=sysroot-cache.sh
+source "$script_dir/sysroot-cache.sh"
 
 if [ "$#" -lt 2 ]; then
 	echo "usage: compile_core.sh <src.rs> <out.js> [--extern NAME=PATH]... [--crate-type KIND] [--crate-name NAME] [--cfg NAME]... [--search DIR]..." >&2
@@ -133,10 +148,39 @@ if [ ! -f "$dylib" ]; then
 	exit 1
 fi
 
-sysroot="$root/build/sysroot"
+# The consumer half of the compiler. The dylib finds it as its own sibling, which
+# is where scripts/build.sh puts it; exporting the path says so outright, so a
+# stale or relocated build tree fails here with a name rather than inside rustc.
+: "${JSC_LINK_BIN:=$root/target/release/jsc-link}"
+export JSC_LINK_BIN
+
+if [ ! -f "$JSC_LINK_BIN" ]; then
+	echo "compile_core.sh: linker not built: $JSC_LINK_BIN" >&2
+	echo "compile_core.sh: run scripts/build.sh first" >&2
+	exit 1
+fi
+
+case "${JSC_RUST_OPT_LEVEL:-}" in
+"" | 0 | 1 | 2 | 3 | s | z) ;;
+*)
+	echo "compile_core.sh: invalid JSC_RUST_OPT_LEVEL: $JSC_RUST_OPT_LEVEL" >&2
+	exit 2
+	;;
+esac
+
+case "${JSC_RUST_MIR_INLINE:-off}" in
+off | on) ;;
+*)
+	echo "compile_core.sh: invalid JSC_RUST_MIR_INLINE: $JSC_RUST_MIR_INLINE" >&2
+	exit 2
+	;;
+esac
+
+sysroot=$(jsc_resolve_sysroot \
+	"$root" wasm32-unknown-unknown "$dylib")
 if [ ! -d "$sysroot/lib/rustlib/wasm32-unknown-unknown/lib" ]; then
 	echo "compile_core.sh: no sysroot at $sysroot" >&2
-	echo "compile_core.sh: run scripts/build_sysroot.sh first" >&2
+	echo "compile_core.sh: build matching settings with scripts/build_sysroot.sh" >&2
 	exit 1
 fi
 
@@ -149,17 +193,35 @@ rm -f "$out"
 stderr_file="$out_dir/.compile-core-stderr.$$"
 trap 'rm -f "$stderr_file"' EXIT
 
-# An empty array expands to nothing at all, which is what keeps the default
-# command line unchanged. (The `${a[@]+...}` guard is for bash 3.2, where an
-# empty array under `set -u` is an unbound variable.)
-backend_args=()
+# Rustc tracks the path but not the backend file's contents.
+backend_args=(-Cllvm-args="js-producer=$(jsc_sha256_file "$dylib")")
 if [ -n "${JS_EXTRA_ARGS:-}" ]; then
-	backend_args=(-Cllvm-args="$JS_EXTRA_ARGS")
+	backend_args+=(-Cllvm-args="$JS_EXTRA_ARGS")
+fi
+
+rust_opt_args=()
+if [ -n "${JSC_RUST_OPT_LEVEL:-}" ]; then
+	rust_opt_args=(-Copt-level="$JSC_RUST_OPT_LEVEL")
+fi
+
+mir_inline_args=()
+if [ "${JSC_RUST_MIR_INLINE:-off}" = on ]; then
+	mir_inline_args=(-Zinline-mir)
 fi
 
 name_args=()
 if [ -n "$crate_name" ]; then
 	name_args=(--crate-name "$crate_name")
+fi
+
+remap_args=(--remap-path-prefix "$root/=")
+if [ -n "${JSC_REMAP_ROOT:-}" ]; then
+	if [ ! -d "$JSC_REMAP_ROOT" ]; then
+		echo "compile_core.sh: no such JSC_REMAP_ROOT: $JSC_REMAP_ROOT" >&2
+		exit 2
+	fi
+	remap_root=$(cd -- "$JSC_REMAP_ROOT" && pwd)
+	remap_args+=(--remap-path-prefix "$remap_root/=")
 fi
 
 set +e
@@ -173,7 +235,9 @@ set +e
 			--crate-type "$crate_type" \
 			${name_args[@]+"${name_args[@]}"} \
 			-Ccodegen-units=1 -Cpanic=abort -Coverflow-checks=off -Cdebug-assertions=off -Cdebuginfo=0 \
-			--remap-path-prefix "$root/=" \
+			${rust_opt_args[@]+"${rust_opt_args[@]}"} \
+			${mir_inline_args[@]+"${mir_inline_args[@]}"} \
+			${remap_args[@]+"${remap_args[@]}"} \
 			${externs[@]+"${externs[@]}"} \
 			${cfgs[@]+"${cfgs[@]}"} \
 			${searches[@]+"${searches[@]}"} \
@@ -184,6 +248,9 @@ status=$?
 set -e
 
 if [ "$status" -ne 0 ]; then
+	# rustc may have copied a provisional object onto -o before the custom link failed.
+	# Never leave it looking like a successfully linked JavaScript artifact.
+	rm -f -- "$out"
 	echo "compile_core.sh: rustc failed (exit $status) compiling $src" >&2
 	cat "$stderr_file" >&2
 	exit "$status"

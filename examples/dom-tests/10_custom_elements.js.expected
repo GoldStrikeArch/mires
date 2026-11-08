@@ -1,0 +1,42 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { setAttribute as _$setAttribute } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h400bf06718247388 = _$template("<my-element></my-element>", true, false, false);
+const tmpl$h90bc2673225af6ee = _$template("<my-element><header slot=\"head\">Title</header></my-element>", true, false, false);
+const tmpl$h73438f0b3a3e11fb = _$template("<my-widget data-widget-id=\"profile\"></my-widget>", true, false, false);
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x10_custom_elements$dashed_attr$hfe77cf6a337031dd("profile");
+  x10_custom_elements$camel_attr$hf3894f2bb3e8f0fb("value");
+  x10_custom_elements$with_children$hb05e8ccfd54ad379();
+  x10_custom_elements$static_only$hefd9be65d1b89f16();
+}
+// camel_attr
+function x10_custom_elements$camel_attr$hf3894f2bb3e8f0fb(data) {
+  let _0;
+  _0 = tmpl$h400bf06718247388();
+  _$setAttribute(_0, "notProp", data);
+  return _0;
+}
+// dashed_attr
+function x10_custom_elements$dashed_attr$hfe77cf6a337031dd(name) {
+  let _0;
+  _0 = tmpl$h400bf06718247388();
+  _$setAttribute(_0, "some-attr", name);
+  return _0;
+}
+// static_only
+function x10_custom_elements$static_only$hefd9be65d1b89f16() {
+  return tmpl$h73438f0b3a3e11fb();
+}
+// with_children
+function x10_custom_elements$with_children$hb05e8ccfd54ad379() {
+  return tmpl$h90bc2673225af6ee();
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

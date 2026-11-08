@@ -1,0 +1,33 @@
+rustc_codegen_js: let Lines drive its forward split directly.
+
+Keep Lines' Map-based representation so its layout, Clone implementation,
+Debug output, and reverse iterator stay unchanged. Its forward path can drive
+the contained SplitInclusive state directly and trim the fixed ASCII sequence
+CR? LF through safe byte and str views. The guards establish that each
+wrapping subtraction is an ordinary one-byte reduction, and checked views keep
+a safe fallback without retaining generic Map, Fn, or char-pattern code in the
+JavaScript output.
+
+--- a/library/core/src/str/iter.rs
++++ b/library/core/src/str/iter.rs
+@@ -1174,7 +1174,19 @@ impl<'a> Iterator for Lines<'a> {
+ 
+     #[inline]
+     fn next(&mut self) -> Option<&'a str> {
+-        self.0.next()
++        match self.0.iter.0.next_inclusive() {
++            Some(line) => {
++                let Some(&b'\n') = line.as_bytes().last() else {
++                    return Some(line);
++                };
++                let line = line.get(..line.len().wrapping_sub(1)).unwrap_or(line);
++                Some(match line.as_bytes().last() {
++                    Some(&b'\r') => line.get(..line.len().wrapping_sub(1)).unwrap_or(line),
++                    _ => line,
++                })
++            }
++            None => None,
++        }
+     }
+ 
+     #[inline]

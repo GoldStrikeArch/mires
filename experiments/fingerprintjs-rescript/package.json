@@ -1,0 +1,22 @@
+{
+  "name": "fingerprintjs-rescript-experiment",
+  "description": "Unpublished ReScript 12 port of FingerprintJS 5.2.0 for a compiler-comparison experiment",
+  "version": "5.2.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/fp.esm.js",
+  "module": "dist/fp.esm.js",
+  "types": "dist/fp.d.ts",
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "rescript": "npx --yes rescript@12.3.0"
+  },
+  "devDependencies": {
+    "rescript": "12.3.0"
+  }
+}

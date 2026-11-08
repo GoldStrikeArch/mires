@@ -1,0 +1,17 @@
+{
+  "name": "fingerprintjs-rescript-experiment",
+  "sources": [
+    {
+      "dir": "src",
+      "subdirs": true
+    }
+  ],
+  "package-specs": {
+    "module": "esmodule",
+    "in-source": false
+  },
+  "suffix": ".res.mjs",
+  "warnings": {
+    "number": "-3"
+  }
+}

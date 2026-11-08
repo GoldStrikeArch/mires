@@ -32,8 +32,7 @@
 //!
 //! * **Const** — literals, arithmetic over them, and reads of locals `uses.rs` calls immutable.
 //!   Depends on nothing that can change and changes nothing, so it may move anywhere.
-//! * **Read** — a field or element read, an accessor's `get()`, a clone. May not move past a
-//!   write.
+//! * **Read** — a field or element read, an accessor's `get()`, a clone. May not move past a write.
 //! * **Effect** — a call, an assignment, anything opaque. May not move past a read or another
 //!   effect.
 //!
@@ -43,8 +42,8 @@
 //! * before emitting a statement, every queued entry that does not commute with it is flushed, in
 //!   the order the entries were queued;
 //! * an entry is substituted into an expression only if it commutes with everything already
-//!   evaluated in that expression — substituting into the second operand of `a.x + _5` moves
-//!   `a.x` in front of whatever `_5` was;
+//!   evaluated in that expression — substituting into the second operand of `a.x + _5` moves `a.x`
+//!   in front of whatever `_5` was;
 //! * an entry whose name still appears in the statement after substitution is flushed, which is
 //!   what makes a declined substitution safe rather than a dangling read;
 //! * an entry is flushed if the statement assigns to a variable the entry mentions;
@@ -105,7 +104,16 @@ fn commutes(a: Purity, b: Purity) -> bool {
 ///
 /// A Rust item can never be named one of these: every name the backend invents for an item
 /// carries a `$`-separated path and a hash suffix (`naming.rs`).
-const PURE_GLOBALS: &[&str] = &["Math", "BigInt", "Number", "Object", "Array", "String", "__rt"];
+const PURE_GLOBALS: &[&str] = &[
+    "Math",
+    "BigInt",
+    "Number",
+    "Object",
+    "Array",
+    "String",
+    "Uint8Array",
+    "__rt",
+];
 
 /// An assignment held back from the output, waiting for the expression that reads it.
 struct Entry {
@@ -132,7 +140,10 @@ pub(crate) fn run<'tcx>(
 /// twice. Counting the emitted tree closes that gap, and closes it for every lowering rather than
 /// for the ones anybody thought of — an expression is only moved to "the place that reads it" when
 /// the tree really does read it in exactly one place.
-fn count_reads<'tcx>(region: &Region<Vec<Stmt>, Scrutinee<'tcx>>, reads: &mut HashMap<String, usize>) {
+fn count_reads<'tcx>(
+    region: &Region<Vec<Stmt>, Scrutinee<'tcx>>,
+    reads: &mut HashMap<String, usize>,
+) {
     let mut bump = |name: &str| {
         *reads.entry(name.to_string()).or_insert(0) += 1;
     };
@@ -148,12 +159,22 @@ fn count_reads<'tcx>(region: &Region<Vec<Stmt>, Scrutinee<'tcx>>, reads: &mut Ha
             }
         }
         Region::LetTmp { value, .. } => each_ident(&value.value, &mut bump),
-        Region::If { scrut, then_, else_, .. } => {
+        Region::If {
+            scrut,
+            then_,
+            else_,
+            ..
+        } => {
             count_scrut(scrut, reads);
             count_reads(then_, reads);
             count_reads(else_, reads);
         }
-        Region::Switch { scrut, arms, default, .. } => {
+        Region::Switch {
+            scrut,
+            arms,
+            default,
+            ..
+        } => {
             count_scrut(scrut, reads);
             for (_, body) in arms {
                 count_reads(body, reads);
@@ -205,11 +226,7 @@ struct Queuer<'a> {
 }
 
 impl<'a> Queuer<'a> {
-    fn new<'tcx>(
-        fx: &FnCx<'_, 'tcx>,
-        uses: &'a Uses,
-        reads: HashMap<String, usize>,
-    ) -> Queuer<'a> {
+    fn new<'tcx>(fx: &FnCx<'_, 'tcx>, uses: &'a Uses, reads: HashMap<String, usize>) -> Queuer<'a> {
         let mut locals = HashMap::new();
         let mut immutable = HashSet::new();
         for local in fx.mir.local_decls.indices() {
@@ -273,9 +290,10 @@ impl Queuer<'_> {
                 true => Purity::Const,
                 false => self.purity(object).max(Purity::Read),
             },
-            Expr::Index(object, index) => {
-                self.purity(object).max(self.purity(index)).max(Purity::Read)
-            }
+            Expr::Index(object, index) => self
+                .purity(object)
+                .max(self.purity(index))
+                .max(Purity::Read),
             Expr::Call(callee, args) => {
                 let mut purity = self.callee_purity(callee);
                 for arg in args {
@@ -298,15 +316,16 @@ impl Queuer<'_> {
             Expr::Unary(_, operand) => self.purity(operand),
             Expr::Binary(_, lhs, rhs) => self.purity(lhs).max(self.purity(rhs)),
             Expr::Assign(..) | Expr::CompoundAssign(..) => Purity::Effect,
-            Expr::Cond(test, consequent, alternate) => {
-                self.purity(test).max(self.purity(consequent)).max(self.purity(alternate))
-            }
-            Expr::Object(entries) => {
-                entries.iter().fold(Purity::Const, |acc, (_, value)| acc.max(self.purity(value)))
-            }
-            Expr::Array(items) | Expr::Seq(items) => {
-                items.iter().fold(Purity::Const, |acc, item| acc.max(self.purity(item)))
-            }
+            Expr::Cond(test, consequent, alternate) => self
+                .purity(test)
+                .max(self.purity(consequent))
+                .max(self.purity(alternate)),
+            Expr::Object(entries) => entries
+                .iter()
+                .fold(Purity::Const, |acc, (_, value)| acc.max(self.purity(value))),
+            Expr::Array(items) | Expr::Seq(items) => items
+                .iter()
+                .fold(Purity::Const, |acc, item| acc.max(self.purity(item))),
             // Verbatim text the pass cannot read.
             Expr::Raw(_) => Purity::Effect,
         }
@@ -349,9 +368,7 @@ impl Queuer<'_> {
                 // is documented as not guaranteed, so nothing may depend on where the call lands.
                 // `Read` rather than `Const` because the byte buffer it hands back is a place
                 // another statement may write through.
-                (Expr::Ident(name), "str_bytes" | "str_len" | "bytes_str")
-                    if name == "__rt" =>
-                {
+                (Expr::Ident(name), "str_bytes" | "str_len" | "bytes_str") if name == "__rt" => {
                     Purity::Read
                 }
                 // The pointer helpers that only *read*. Each is a function of the places its
@@ -363,7 +380,8 @@ impl Queuer<'_> {
                 // * `ptr_eq`, `ptr_cmp` and `compare_bytes` read memory and report on it, and
                 //   `compare_bytes` is a read of two runs of elements even though its siblings in
                 //   the same family write;
-                // * `offset`, `unscale`, `unwindow` and `thin` build a new record out of an old one;
+                // * `offset`, `unscale`, `unwindow` and `thin` build a new record out of an old
+                //   one;
                 // * `read_array` copies elements out, and `array_ref` names them without copying,
                 //   memoizing the view it hands back the way `box` memoizes a slot.
                 //
@@ -371,8 +389,8 @@ impl Queuer<'_> {
                 // statement may write, so they may not be carried across a write.
                 (
                     Expr::Ident(name),
-                    "box" | "addr" | "ptr_eq" | "ptr_cmp" | "compare_bytes" | "offset"
-                    | "unscale" | "unwindow" | "thin" | "read_array" | "array_ref",
+                    "box" | "addr" | "ptr_eq" | "ptr_cmp" | "compare_bytes" | "offset" | "unscale"
+                    | "unwindow" | "thin" | "read_array" | "array_ref",
                 ) if name == "__rt" => Purity::Read,
                 // Everything else in the shim writes: `copy`, `copy_nonoverlapping`,
                 // `write_bytes`, `write_array` and `overwrite` all store through a pointer, and a
@@ -489,6 +507,10 @@ fn each_ident_stmt(stmt: &Stmt, f: &mut dyn FnMut(&str)) {
                 list(&case.body, f);
             }
         }
+        Stmt::TryCatch { body, handler, .. } => {
+            list(body, f);
+            list(handler, f);
+        }
         Stmt::Labeled(_, inner) => each_ident_stmt(inner, f),
         Stmt::LoopForever(_, body) | Stmt::Block(body) | Stmt::FunctionDecl { body, .. } => {
             list(body, f)
@@ -535,9 +557,7 @@ fn each_ident(expr: &Expr, f: &mut dyn FnMut(&str)) {
             }
         }
         Expr::Unary(_, operand) => each_ident(operand, f),
-        Expr::Binary(_, lhs, rhs)
-        | Expr::Assign(lhs, rhs)
-        | Expr::CompoundAssign(_, lhs, rhs) => {
+        Expr::Binary(_, lhs, rhs) | Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
             each_ident(lhs, f);
             each_ident(rhs, f);
         }
@@ -632,6 +652,16 @@ fn assigned_roots(stmt: &Stmt, out: &mut Vec<String>) {
         Stmt::Switch(disc, cases) => {
             collect_assigned(disc, out);
             for stmt in cases.iter().flat_map(|case| &case.body) {
+                assigned_roots(stmt, out);
+            }
+        }
+        Stmt::TryCatch {
+            body,
+            binding,
+            handler,
+        } => {
+            out.push(binding.clone());
+            for stmt in body.iter().chain(handler) {
                 assigned_roots(stmt, out);
             }
         }
@@ -737,7 +767,9 @@ impl Subst<'_, '_> {
             // together or neither is, because the counting rule in [`each_ident`] treats them as
             // a single mention and a half substituted pair would leave a dangling name behind.
             Expr::Index(object, index) if slot_deref_name(object, index).is_some() => {
-                let name = slot_deref_name(object, index).unwrap_or_default().to_string();
+                let name = slot_deref_name(object, index)
+                    .unwrap_or_default()
+                    .to_string();
                 self.saw(Purity::Read);
                 if !self.foldable(&name) {
                     self.saw(self.queuer.ident_purity(&name));
@@ -759,9 +791,13 @@ impl Subst<'_, '_> {
             }
             Expr::Call(callee, args) => {
                 let purity = self.queuer.callee_purity(callee);
-                // The callee is a name or a member of one; only its object can hold a read.
+                // A host member lookup can invoke a getter before the arguments. Values
+                // evaluated before the Rust call must not move across that lookup.
                 match &mut **callee {
-                    Expr::Member(object, _) if !pure_global(object) => self.expr(object),
+                    Expr::Member(object, _) if !pure_global(object) => {
+                        self.expr(object);
+                        self.saw(Purity::Effect);
+                    }
                     Expr::Ident(_) | Expr::Member(..) => {}
                     other => self.opaque(other),
                 }
@@ -777,6 +813,10 @@ impl Subst<'_, '_> {
                     Expr::Ident(name) if name == "Array" => Purity::Read,
                     _ => Purity::Effect,
                 };
+                if !matches!(&**callee, Expr::Ident(_)) {
+                    self.opaque(callee);
+                    self.saw(Purity::Effect);
+                }
                 for arg in args {
                     self.expr(arg);
                 }
@@ -913,7 +953,12 @@ impl Queuer<'_> {
                     close(&mut out, &mut stmts);
                     out.push(Region::SetSel(tmp, value));
                 }
-                Region::If { scrut, test, then_, else_ } => {
+                Region::If {
+                    scrut,
+                    test,
+                    then_,
+                    else_,
+                } => {
                     let scrut = self.scrutinee(scrut, &mut queue);
                     flush_all(&mut queue, &mut stmts);
                     close(&mut out, &mut stmts);
@@ -924,7 +969,12 @@ impl Queuer<'_> {
                         else_: Box::new(self.region(*else_, false)),
                     });
                 }
-                Region::Switch { scrut, arms, default, label } => {
+                Region::Switch {
+                    scrut,
+                    arms,
+                    default,
+                    label,
+                } => {
                     let scrut = self.scrutinee(scrut, &mut queue);
                     flush_all(&mut queue, &mut stmts);
                     close(&mut out, &mut stmts);
@@ -947,23 +997,35 @@ impl Queuer<'_> {
                     } else if self.ret_boxed {
                         Some(self.ret_read.clone())
                     } else {
-                        Some(take_assignment(&mut stmts, &self.ret).unwrap_or_else(|| {
-                            jsast::id(self.ret.clone())
-                        }))
+                        Some(
+                            take_assignment(&mut stmts, &self.ret)
+                                .unwrap_or_else(|| jsast::id(self.ret.clone())),
+                        )
                     };
                     stmts.push(Stmt::Return(value));
                 }
                 Region::Labeled { label, body } => {
                     flush_all(&mut queue, &mut stmts);
                     close(&mut out, &mut stmts);
-                    out.push(Region::Labeled { label, body: Box::new(self.region(*body, false)) });
+                    out.push(Region::Labeled {
+                        label,
+                        body: Box::new(self.region(*body, false)),
+                    });
                 }
                 Region::Loop { label, body } => {
                     flush_all(&mut queue, &mut stmts);
                     close(&mut out, &mut stmts);
-                    out.push(Region::Loop { label, body: Box::new(self.region(*body, false)) });
+                    out.push(Region::Loop {
+                        label,
+                        body: Box::new(self.region(*body, false)),
+                    });
                 }
-                Region::Dispatch { sel, label, cases, trailing_break } => {
+                Region::Dispatch {
+                    sel,
+                    label,
+                    cases,
+                    trailing_break,
+                } => {
                     flush_all(&mut queue, &mut stmts);
                     close(&mut out, &mut stmts);
                     out.push(Region::Dispatch {
@@ -989,7 +1051,11 @@ impl Queuer<'_> {
 
         flush_all(&mut queue, &mut stmts);
         close(&mut out, &mut stmts);
-        if out.len() == 1 { out.pop().unwrap_or(Region::Seq(Vec::new())) } else { Region::Seq(out) }
+        if out.len() == 1 {
+            out.pop().unwrap_or(Region::Seq(Vec::new()))
+        } else {
+            Region::Seq(out)
+        }
     }
 
     /// One statement of a block payload.
@@ -1068,7 +1134,11 @@ impl Queuer<'_> {
     ) {
         if let Some(local) = self.local(&name) {
             if self.uses.inlinable(local) && self.reads(&name) == 1 {
-                queue.push(Entry { name, value, purity });
+                queue.push(Entry {
+                    name,
+                    value,
+                    purity,
+                });
                 return;
             }
             // Nothing reads the target, so only what the right hand side *does* is left.
@@ -1111,18 +1181,24 @@ impl Queuer<'_> {
         }
     }
 
-    fn substitute(&self, expr: &mut Expr, queue: &mut Vec<Entry>, once: &HashSet<String>) -> Purity {
-        let mut subst = Subst { queuer: self, queue, once, seen: Purity::Const };
+    fn substitute(
+        &self,
+        expr: &mut Expr,
+        queue: &mut Vec<Entry>,
+        once: &HashSet<String>,
+    ) -> Purity {
+        let mut subst = Subst {
+            queuer: self,
+            queue,
+            once,
+            seen: Purity::Const,
+        };
         subst.expr(expr);
         subst.seen
     }
 
     /// The queued names that occur exactly once, and so may move to where they are read.
-    fn substitutable(
-        &self,
-        queue: &[Entry],
-        count: impl Fn(&str) -> usize,
-    ) -> HashSet<String> {
+    fn substitutable(&self, queue: &[Entry], count: impl Fn(&str) -> usize) -> HashSet<String> {
         queue
             .iter()
             .filter(|entry| count(&entry.name) == 1)
@@ -1132,7 +1208,11 @@ impl Queuer<'_> {
 
     /// The queued names a predicate still finds.
     fn mentioned(&self, queue: &[Entry], keep: impl Fn(&str) -> bool) -> Vec<String> {
-        queue.iter().filter(|entry| keep(&entry.name)).map(|entry| entry.name.clone()).collect()
+        queue
+            .iter()
+            .filter(|entry| keep(&entry.name))
+            .map(|entry| entry.name.clone())
+            .collect()
     }
 
     /// Emits every queued entry that cannot stay behind, in the order the entries were queued.
@@ -1150,8 +1230,10 @@ impl Queuer<'_> {
         let mut kept = Vec::with_capacity(queue.len());
         for entry in queue.drain(..) {
             let stays = commutes(purity, entry.purity)
-                && !still.iter().any(|name| *name == entry.name)
-                && !writes.iter().any(|name| count_in_expr(&entry.value, name) > 0);
+                && !still.contains(&entry.name)
+                && !writes
+                    .iter()
+                    .any(|name| count_in_expr(&entry.value, name) > 0);
             if stays {
                 kept.push(entry);
             } else {
@@ -1194,7 +1276,9 @@ fn close<'tcx>(out: &mut Vec<Tree<'tcx>>, stmts: &mut Vec<Stmt>) {
 /// less trailing: looking through it is what keeps `js-source-map=on` from silently turning
 /// destination passing off and emitting different JavaScript.
 fn take_assignment(stmts: &mut Vec<Stmt>, name: &str) -> Option<Expr> {
-    let last = stmts.iter().rposition(|stmt| !matches!(stmt, Stmt::Loc(_)))?;
+    let last = stmts
+        .iter()
+        .rposition(|stmt| !matches!(stmt, Stmt::Loc(_)))?;
     let matches = match &stmts[last] {
         Stmt::ExprStmt(Expr::Assign(target, _)) => {
             matches!(&**target, Expr::Ident(ident) if ident == name)

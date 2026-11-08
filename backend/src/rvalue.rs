@@ -18,7 +18,7 @@ use rustc_middle::ty::{self, CoroutineArgsExt, Instance, Ty, TyCtxt};
 
 use crate::base::FnCx;
 use crate::jsast::{self, BinOp as JsBinOp, Expr};
-use crate::value::{self, IntRepr, int_info, int_repr, mask, mask_ty, typing_env};
+use crate::value::{self, int_info, int_repr, mask, mask_ty, typing_env, IntRepr};
 
 /// The parameter the checked-arithmetic arrow binds its exact result to. `$`-leading, so it can
 /// never collide with a Rust identifier or with a local (`naming.rs` reserves the namespace).
@@ -31,6 +31,10 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// otherwise. Only [`FnCx::codegen_discriminant`] reads it: whether a tag may stand for a
     /// discriminant is a question about what the *destination* is later used for (`tag.rs`).
     pub(crate) fn codegen_rvalue(&self, rvalue: &Rvalue<'tcx>, dest: Option<Local>) -> Expr {
+        let ty = self.monomorphize(rvalue.ty(&self.mir.local_decls, self.tcx));
+        if value::is_zst(self.tcx, ty) {
+            return jsast::undefined();
+        }
         match rvalue {
             Rvalue::Use(operand, _) => self.codegen_operand(operand),
             Rvalue::CopyForDeref(place) => {
@@ -64,7 +68,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     }
                     MirBinOp::AddWithOverflow
                     | MirBinOp::SubWithOverflow
-                    | MirBinOp::MulWithOverflow => self.codegen_with_overflow(*op, lhs_ty, lhs, rhs),
+                    | MirBinOp::MulWithOverflow => {
+                        self.codegen_with_overflow(*op, lhs_ty, lhs, rhs)
+                    }
                     _ => self.codegen_binop(*op, lhs_ty, rhs_ty, lhs, rhs),
                 }
             }
@@ -83,7 +89,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     // discriminant is the state the resume switches on. Answering zero here, which
                     // is what the arm below used to do for it, made every resume re-enter the
                     // unresumed state.
-                    ty::Adt(_, _) | ty::Coroutine(..) if value::enum_repr(self.tcx, ty).is_some() => {
+                    ty::Adt(_, _) | ty::Coroutine(..)
+                        if value::enum_repr(self.tcx, ty).is_some() =>
+                    {
                         self.codegen_discriminant(ty, source, dest)
                     }
                     // Everything else has exactly one variant, whose discriminant is zero.
@@ -92,13 +100,18 @@ impl<'tcx> FnCx<'_, 'tcx> {
             }
             Rvalue::Aggregate(kind, operands) => {
                 let ty = self.monomorphize(rvalue.ty(&self.mir.local_decls, self.tcx));
-                let values = operands.iter().map(|op| self.codegen_operand(op)).collect::<Vec<_>>();
-                self.codegen_aggregate(&**kind, ty, values)
+                let values = operands
+                    .iter()
+                    .map(|op| self.codegen_operand(op))
+                    .collect::<Vec<_>>();
+                self.codegen_aggregate(kind, ty, values)
             }
             Rvalue::Repeat(operand, count) => {
                 let element_ty = self.operand_ty(operand);
-                let count =
-                    self.monomorphize(*count).try_to_target_usize(self.tcx).unwrap_or_default();
+                let count = self
+                    .monomorphize(*count)
+                    .try_to_target_usize(self.tcx)
+                    .unwrap_or_default();
 
                 // `fill` puts the *same* JS object in every slot, so a write through one element
                 // would be visible through all the others. An element that is an object therefore
@@ -134,7 +147,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
             }
             Rvalue::WrapUnsafeBinder(operand, _) => self.codegen_operand(operand),
             Rvalue::ThreadLocalRef(_) => {
-                self.zombie("thread locals are not supported by rustc_codegen_mires".to_string())
+                self.zombie("thread locals are not supported by rustc_codegen_js".to_string())
             }
         }
     }
@@ -150,8 +163,8 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// The layout is consulted first, because a type with one possible variant has no tag to read.
     /// `Option<Infallible>` is the case that matters: it has one inhabited variant, so it is zero
     /// sized and its JavaScript value is `undefined`. That type is not exotic, it is what `?` on an
-    /// `Option` produces as its residual, so every `?` in the program depends on this. When there is
-    /// only one variant its discriminant is known at compile time anyway.
+    /// `Option` produces as its residual, so every `?` in the program depends on this. When there
+    /// is only one variant its discriminant is known at compile time anyway.
     fn codegen_discriminant(
         &self,
         ty: Ty<'tcx>,
@@ -205,7 +218,11 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     .unwrap_or_else(|| self.zombie(format!("`{ty}` is not a coroutine")))
             }
             AggregateKind::Tuple => {
-                if values.is_empty() { jsast::undefined() } else { jsast::array(values) }
+                if values.is_empty() {
+                    jsast::undefined()
+                } else {
+                    jsast::array(values)
+                }
             }
             AggregateKind::Adt(def_id, variant_index, _, _, active_field) => {
                 let def = self.tcx.adt_def(*def_id);
@@ -240,7 +257,8 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     // A union write names the one field it initializes.
                     Some(field) => {
                         if let Some(value) = values.into_iter().next() {
-                            entries.push((crate::naming::Namer::field_name(variant, *field), value));
+                            entries
+                                .push((crate::naming::Namer::field_name(variant, *field), value));
                         }
                     }
                     None => {
@@ -270,7 +288,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 };
                 crate::ptr::build_fat(self, pointee, data, meta)
             }
-            _ => self.zombie(format!("`{kind:?}` aggregates are not supported by rustc_codegen_mires")),
+            _ => self.zombie(format!(
+                "`{kind:?}` aggregates are not supported by rustc_codegen_js"
+            )),
         }
     }
 
@@ -280,8 +300,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// `Ordering::Less` exactly the way [`FnCx::codegen_aggregate`] does. `Ordering` is a fieldless
     /// `#[repr(i8)]` enum, so each of the three is the plain number its discriminant is.
     ///
-    /// Both operands are read twice. They are `Operand`s, so a read is a local, a field or a
-    /// constant, and reading one twice has no more effect than reading it once.
+    /// The shared emitter captures expressions before testing the inputs twice.
     fn codegen_three_way(
         &self,
         operand_ty: Ty<'tcx>,
@@ -290,14 +309,16 @@ impl<'tcx> FnCx<'_, 'tcx> {
         rhs: Expr,
     ) -> Expr {
         let ty::Adt(def, _) = ordering_ty.kind() else {
-            return self
-                .zombie(format!("`Cmp` returned `{ordering_ty}`, which is not an `Ordering`"));
+            return self.zombie(format!(
+                "`Cmp` returned `{ordering_ty}`, which is not an `Ordering`"
+            ));
         };
         if int_info(self.tcx, operand_ty).is_none()
             && !matches!(operand_ty.kind(), ty::Bool | ty::Char)
         {
-            return self
-                .zombie(format!("`Cmp` on `{operand_ty}` is not supported by rustc_codegen_mires"));
+            return self.zombie(format!(
+                "`Cmp` on `{operand_ty}` is not supported by rustc_codegen_js"
+            ));
         }
         let variant = |wanted: &str| -> Option<Expr> {
             let index = def
@@ -309,17 +330,15 @@ impl<'tcx> FnCx<'_, 'tcx> {
         let (Some(less), Some(equal), Some(greater)) =
             (variant("Less"), variant("Equal"), variant("Greater"))
         else {
-            return self
-                .zombie(format!("`Cmp` returned `{ordering_ty}`, which is not an `Ordering`"));
+            return self.zombie(format!(
+                "`Cmp` returned `{ordering_ty}`, which is not an `Ordering`"
+            ));
         };
-        jsast::cond(
-            jsast::binary(JsBinOp::Lt, lhs.clone(), rhs.clone()),
-            less,
-            jsast::cond(jsast::binary(JsBinOp::StrictEq, lhs, rhs), equal, greater),
-        )
+        rcgjs_object::evaluation::three_way(lhs, rhs, less, equal, greater)
     }
 
-    /// `BinOp::AddWithOverflow` and its siblings: the wrapped result paired with whether it wrapped.
+    /// `BinOp::AddWithOverflow` and its siblings: the wrapped result paired with whether it
+    /// wrapped.
     ///
     /// The destination is a `(T, bool)` tuple, which is a two element JS array. The exact result is
     /// computed once and bound by an immediately applied arrow function: a `let` would need a
@@ -328,16 +347,11 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// A 32 bit product is not exact in a double, and does not have to be — it is only compared for
     /// *equality* with the wrapped result, and a rounded product that overflowed is never equal to
     /// it.
-    fn codegen_with_overflow(
-        &self,
-        op: MirBinOp,
-        ty: Ty<'tcx>,
-        lhs: Expr,
-        rhs: Expr,
-    ) -> Expr {
+    fn codegen_with_overflow(&self, op: MirBinOp, ty: Ty<'tcx>, lhs: Expr, rhs: Expr) -> Expr {
         let Some((signed, bits)) = int_info(self.tcx, ty) else {
-            return self
-                .zombie(format!("`{op:?}` on `{ty}` is not supported by rustc_codegen_mires"));
+            return self.zombie(format!(
+                "`{op:?}` on `{ty}` is not supported by rustc_codegen_js"
+            ));
         };
         let repr = int_repr(ty);
         let js_op = match op {
@@ -374,9 +388,8 @@ impl<'tcx> FnCx<'_, 'tcx> {
         // identity of two records that name the same place. `ptr.rs` owns what the comparison
         // means; every pointer relation goes through it.
         if is_pointer(ty) {
-            let ptr_op = |js_op: JsBinOp| {
-                crate::ptr::cmp(self, ty, js_op, lhs.clone(), rhs.clone())
-            };
+            let ptr_op =
+                |js_op: JsBinOp| crate::ptr::cmp(self, ty, js_op, lhs.clone(), rhs.clone());
             match op {
                 MirBinOp::Offset => return crate::ptr::add(self, pointee_of(ty), lhs, rhs),
                 MirBinOp::Eq => return crate::ptr::eq(self, ty, lhs, rhs),
@@ -387,7 +400,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 MirBinOp::Ge => return ptr_op(JsBinOp::Ge),
                 _ => {
                     return self.zombie(format!(
-                        "`{op:?}` on `{ty}` is not supported by rustc_codegen_mires"
+                        "`{op:?}` on `{ty}` is not supported by rustc_codegen_js"
                     ));
                 }
             }
@@ -400,7 +413,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
             // function, by an identity that is stable per item).
             MirBinOp::Eq | MirBinOp::Ne if !compares_by_value(self.tcx, ty) => {
                 return self.zombie(format!(
-                    "`{op:?}` on `{ty}` is not supported by rustc_codegen_mires"
+                    "`{op:?}` on `{ty}` is not supported by rustc_codegen_js"
                 ));
             }
             MirBinOp::Eq => return compare(JsBinOp::StrictEq),
@@ -414,8 +427,12 @@ impl<'tcx> FnCx<'_, 'tcx> {
 
         if matches!(ty.kind(), ty::Bool) {
             return match op {
-                MirBinOp::BitAnd => jsast::binary(JsBinOp::And, lhs, rhs),
-                MirBinOp::BitOr => jsast::binary(JsBinOp::Or, lhs, rhs),
+                MirBinOp::BitAnd => {
+                    rcgjs_object::evaluation::eager_boolean(JsBinOp::BitAnd, lhs, rhs)
+                }
+                MirBinOp::BitOr => {
+                    rcgjs_object::evaluation::eager_boolean(JsBinOp::BitOr, lhs, rhs)
+                }
                 MirBinOp::BitXor => jsast::binary(JsBinOp::StrictNe, lhs, rhs),
                 _ => self.zombie(format!("`{op:?}` is not defined on `bool`")),
             };
@@ -457,9 +474,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 _ => rhs,
             };
             match repr {
-                IntRepr::BigInt => {
-                    jsast::binary(JsBinOp::BitAnd, amount, jsast::bigint(bits - 1))
-                }
+                IntRepr::BigInt => jsast::binary(JsBinOp::BitAnd, amount, jsast::bigint(bits - 1)),
                 // JavaScript's own shift operators already mask the amount to five bits.
                 IntRepr::Number if bits == 32 => amount,
                 IntRepr::Number => {
@@ -503,7 +518,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 };
                 mask(jsast::binary(js_op, lhs, shift_amount(rhs)))
             }
-            _ => self.zombie(format!("`{op:?}` is not supported by rustc_codegen_mires (on `{ty}`)")),
+            _ => self.zombie(format!(
+                "`{op:?}` is not supported by rustc_codegen_js (on `{ty}`)"
+            )),
         }
     }
 
@@ -594,8 +611,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
                                 Some(instance) => {
                                     jsast::id(self.cgu.namer.fn_name(instance).into_string())
                                 }
-                                None => self
-                                    .zombie(format!("cannot take a pointer to `{from_ty}`")),
+                                None => {
+                                    self.zombie(format!("cannot take a pointer to `{from_ty}`"))
+                                }
                             }
                         }
                         _ => self.zombie(format!("cannot reify `{from_ty}`")),
@@ -608,23 +626,22 @@ impl<'tcx> FnCx<'_, 'tcx> {
                                 generic_args,
                                 ty::ClosureKind::FnOnce,
                             );
-                            let target =
-                                jsast::id(self.cgu.namer.fn_name(instance).into_string());
+                            let target = jsast::id(self.cgu.namer.fn_name(instance).into_string());
                             // The shim that instance names is `FnOnce::call_once`, whose first
                             // parameter is the closure's environment; a `fn` pointer is called
                             // without one. Only a non-capturing closure coerces, so the
                             // environment is zero sized and `undefined` is the whole of it — but
                             // it still occupies a parameter slot, so the coercion is a wrapper
                             // that puts it back.
-                            let arity =
-                                self.tcx.instantiate_bound_regions_with_erased(to_ty.fn_sig(self.tcx))
-                                    .inputs()
-                                    .len();
+                            let arity = self
+                                .tcx
+                                .instantiate_bound_regions_with_erased(to_ty.fn_sig(self.tcx))
+                                .inputs()
+                                .len();
                             let params: Vec<String> =
                                 (0..arity).map(|i| format!("$a{i}")).collect();
                             let mut arguments = vec![jsast::undefined()];
-                            arguments
-                                .extend(params.iter().map(|name| jsast::id(name.clone())));
+                            arguments.extend(params.iter().map(|name| jsast::id(name.clone())));
                             jsast::arrow(params, jsast::call(target, arguments))
                         }
                         _ => self.zombie(format!("cannot coerce `{from_ty}` to a fn pointer")),
@@ -641,7 +658,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         crate::unsize::coerce_unsized(self, value, from_ty, to_ty)
                     }
                     _ => self.zombie(format!(
-                        "`{coercion:?}` coercions are not supported by rustc_codegen_mires \
+                        "`{coercion:?}` coercions are not supported by rustc_codegen_js \
                          (`{from_ty}` to `{to_ty}`)"
                     )),
                 }
@@ -710,12 +727,16 @@ impl<'tcx> FnCx<'_, 'tcx> {
             return self.zombie(format!("`{to_ty}` is not an integer"));
         };
         match int_repr(to_ty) {
-            IntRepr::BigInt => {
-                jsast::rt_call("f2i_big", vec![value, jsast::num(bits), jsast::boolean(signed)])
-            }
+            IntRepr::BigInt => jsast::rt_call(
+                "f2i_big",
+                vec![value, jsast::num(bits), jsast::boolean(signed)],
+            ),
             IntRepr::Number => {
                 let (min, max) = if signed {
-                    (-(2f64.powi(bits as i32 - 1)), 2f64.powi(bits as i32 - 1) - 1.0)
+                    (
+                        -(2f64.powi(bits as i32 - 1)),
+                        2f64.powi(bits as i32 - 1) - 1.0,
+                    )
                 } else {
                     (0.0, 2f64.powi(bits as i32) - 1.0)
                 };
@@ -756,7 +777,13 @@ fn compares_by_value<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
     }
     matches!(
         ty.kind(),
-        ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Bool | ty::Char | ty::FnPtr(..) | ty::FnDef(..)
+        ty::Int(_)
+            | ty::Uint(_)
+            | ty::Float(_)
+            | ty::Bool
+            | ty::Char
+            | ty::FnPtr(..)
+            | ty::FnDef(..)
     )
 }
 

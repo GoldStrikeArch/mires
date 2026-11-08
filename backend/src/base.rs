@@ -36,11 +36,11 @@
 
 use std::cell::{Cell, RefCell};
 
-use rustc_hir::LangItem;
 use rustc_hir::def_id::DefId;
+use rustc_hir::LangItem;
 use rustc_middle::mir::{
-    self, AssertKind, BasicBlock, BasicBlockData, Body, Local, START_BLOCK, Statement,
-    StatementKind, SwitchTargets, Terminator, TerminatorKind,
+    self, AssertKind, BasicBlock, BasicBlockData, Body, Local, Statement, StatementKind,
+    SwitchTargets, Terminator, TerminatorKind, START_BLOCK,
 };
 use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, Instance, TyCtxt, TypeFoldable};
@@ -49,7 +49,7 @@ use structurizer::{Options as StructureOptions, Term};
 
 use crate::cfg_adapter::{self, Blocks, Scrutinee};
 use crate::cgu::CguCx;
-use crate::item::{ItemKind, JsItem, ZombieKind, ZombieLog};
+use crate::item::{ItemKind, JsItem, OptimizationInfo, OptimizationMiss, ZombieKind, ZombieLog};
 use crate::jsast::{self, Expr, Stmt};
 use crate::names::{LineComments, LocalNames, Locs};
 use crate::opts::Structure;
@@ -78,7 +78,7 @@ pub(crate) fn codegen_fn<'tcx>(cgu: &CguCx<'tcx>, instance: Instance<'tcx>) -> J
     let mut names = vec![(name.as_str().to_owned(), debug_path.clone())];
     names.extend(fx.names.originals().iter().cloned());
 
-    JsItem::new(
+    let mut item = JsItem::new(
         name,
         ItemKind::Fn,
         decl,
@@ -87,7 +87,11 @@ pub(crate) fn codegen_fn<'tcx>(cgu: &CguCx<'tcx>, instance: Instance<'tcx>) -> J
         debug_path,
     )
     .with_source(crate::names::location_of(tcx, mir.span), names)
-    .with_dts(dts)
+    .with_dts(dts);
+    let optimization = fx.optimization.take();
+    item.optimization.selections.extend(optimization.selections);
+    item.optimization.misses.extend(optimization.misses);
+    item
 }
 
 /// Lower a `static` item.
@@ -107,9 +111,13 @@ pub(crate) fn codegen_static<'tcx>(cgu: &CguCx<'tcx>, def_id: DefId) -> JsItem {
     let zombies = ZombieLog::default();
     let value =
         crate::constant::codegen_static_initializer(cgu, &zombies, def_id, tcx.def_span(def_id));
-    let ty = tcx.normalize_erasing_regions(typing_env(), tcx.type_of(def_id).instantiate_identity());
-    let value =
-        if crate::value::is_indirect(tcx, ty) { value } else { jsast::array(vec![value]) };
+    let ty =
+        tcx.normalize_erasing_regions(typing_env(), tcx.type_of(def_id).instantiate_identity());
+    let value = if crate::value::is_indirect(tcx, ty) {
+        value
+    } else {
+        jsast::array(vec![value])
+    };
     let debug_path = with_no_trimmed_paths!(tcx.def_path_str(def_id));
 
     let names = vec![(name.as_str().to_owned(), debug_path.clone())];
@@ -132,6 +140,8 @@ pub(crate) struct FnCx<'a, 'tcx> {
     pub(crate) instance: Instance<'tcx>,
     pub(crate) mir: &'tcx Body<'tcx>,
     pub(crate) zombies: ZombieLog,
+    /// Optimizer decisions made while lowering this function.
+    pub(crate) optimization: RefCell<OptimizationInfo>,
     /// What each MIR local is called in the emitted JavaScript. See `names.rs`.
     pub(crate) names: LocalNames,
     /// The span lowering is currently at. See the module docs.
@@ -173,7 +183,12 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             instance,
             mir,
             zombies: ZombieLog::default(),
-            names: LocalNames::new(mir, crate::opts::get().names),
+            optimization: RefCell::new(OptimizationInfo::default()),
+            names: LocalNames::new(
+                mir,
+                crate::opts::get().names,
+                crate::js_extern::global_names(cgu.tcx, instance, mir),
+            ),
             span: Cell::new(mir.span),
             block: Cell::new(START_BLOCK),
             cyclic: cyclic_blocks(mir),
@@ -203,6 +218,8 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 fx.uses.bare_borrowed(local) && !crate::value::is_indirect(fx.tcx, ty)
             })
             .collect();
+        crate::representation::analyze(&fx);
+        crate::opportunity::analyze(&fx);
         fx
     }
 
@@ -217,7 +234,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     /// Whether this local only carries an argument to a `view-abi` marker that read it instead of
     /// lowering it, so that the assignment filling it has nothing left to feed.
     fn is_consumed(&self, local: Local) -> bool {
-        self.consumed.get(local.as_usize()).copied().unwrap_or(false)
+        self.consumed
+            .get(local.as_usize())
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Substitutes the instance's generic arguments into a type read off the MIR body.
@@ -230,6 +250,38 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             typing_env(),
             ty::EarlyBinder::bind(self.tcx, value),
         )
+    }
+
+    /// Records a proven representation or lowering choice for this function.
+    pub(crate) fn record_optimization_selection(
+        &self,
+        pass: impl Into<String>,
+        selected: impl Into<String>,
+        reason: impl Into<String>,
+    ) {
+        self.optimization
+            .borrow_mut()
+            .select(pass, selected, reason);
+    }
+
+    /// Records a rejected candidate for this function.
+    pub(crate) fn record_optimization_miss(&self, miss: OptimizationMiss) {
+        self.optimization.borrow_mut().misses.push(miss);
+    }
+
+    /// Records a rejected candidate at a source span, classifying workspace warnings once.
+    pub(crate) fn record_optimization_miss_at(
+        &self,
+        pass: impl Into<String>,
+        reason: impl Into<String>,
+        span: Span,
+    ) {
+        let mut miss = OptimizationMiss::new(pass, reason);
+        if let Some(loc) = crate::names::location_of(self.tcx, span) {
+            let location = format!("{}:{}:{}", loc.file, loc.line, loc.col + 1);
+            miss = miss.at_source(loc.file, location);
+        }
+        self.record_optimization_miss(miss);
     }
 
     /// The span lowering is currently at.
@@ -248,7 +300,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     /// iteration -- a closure over the environment of a `view!` handler -- therefore has to
     /// snapshot the value instead; see `abi.rs::closure_thunk`.
     pub(crate) fn in_cycle(&self) -> bool {
-        self.cyclic.get(self.block.get().as_usize()).copied().unwrap_or(false)
+        self.cyclic
+            .get(self.block.get().as_usize())
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Runs `f` with the current span narrowed to `span`.
@@ -266,7 +321,8 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     /// is dropped and the zombie with it. That is what lets a crate define `impl Add for i64`
     /// without every program that links it failing to compile.
     pub(crate) fn zombie(&self, message: String) -> Expr {
-        self.zombies.record(self.tcx, self.span.get(), ZombieKind::Unsupported, message)
+        self.zombies
+            .record(self.tcx, self.span.get(), ZombieKind::Unsupported, message)
     }
 
     /// Allocates a hoisted temporary holding `value`.
@@ -280,11 +336,14 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     pub(crate) fn temp(&self, value: Expr) -> (Stmt, Expr) {
         let name = {
             let mut temps = self.temps.borrow_mut();
-            let name = format!("$t{}", temps.len());
+            let name = self.names.generated(format!("$t{}", temps.len()));
             temps.push(name.clone());
             name
         };
-        (jsast::assign_stmt(jsast::id(name.clone()), value), jsast::id(name))
+        (
+            jsast::assign_stmt(jsast::id(name.clone()), value),
+            jsast::id(name),
+        )
     }
 
     /// What a MIR local is called in the emitted JavaScript.
@@ -301,7 +360,8 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     /// closure whose argument tuple is called `args` takes `args$e0`, `args$e1`, ..., while a
     /// second local also called `args` would become `args$1`.
     fn spread_param(&self, local: Local, i: usize) -> String {
-        format!("{}$e{i}", self.local_name(local))
+        self.names
+            .generated(format!("{}$e{i}", self.local_name(local)))
     }
 
     /// The function's JavaScript parameter list.
@@ -368,17 +428,15 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             match (is_param, self.spread_arity(local)) {
                 // Rebuild the splatted `"rust-call"` tuple from the individual parameters.
                 (true, Some(arity)) => {
-                    let elements =
-                        (0..arity).map(|i| jsast::id(self.spread_param(local, i))).collect();
+                    let elements = (0..arity)
+                        .map(|i| jsast::id(self.spread_param(local, i)))
+                        .collect();
                     declarations.push((self.local_name(local), Some(jsast::array(elements))));
                 }
                 (true, None) => {
                     if boxed {
                         let name = jsast::id(self.local_name(local));
-                        prelude.push(jsast::assign_stmt(
-                            name.clone(),
-                            jsast::array(vec![name]),
-                        ));
+                        prelude.push(jsast::assign_stmt(name.clone(), jsast::array(vec![name])));
                     }
                 }
                 (false, _) => {
@@ -422,6 +480,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     /// hoisted temporaries declared and its zombies recorded, which costs a few unused `let`s and
     /// a duplicated diagnostic on a path that is not supposed to be reachable at all.
     fn codegen_control_flow(&self) -> (Vec<Stmt>, Vec<String>) {
+        if let Some(section) = crate::js_extern::extern_section(self.tcx, self.instance.def_id()) {
+            return (self.codegen_js_extern_fn(&section), Vec::new());
+        }
         if !matches!(crate::opts::get().structure, Structure::Trampoline) {
             if let Some(body) = self.structure_body(false) {
                 return body;
@@ -432,8 +493,11 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         }
 
         self.span.set(self.mir.span);
-        let message = "this function's control flow cannot be lowered by rustc_codegen_mires";
-        (vec![jsast::expr_stmt(self.zombie(message.to_string()))], Vec::new())
+        let message = "this function's control flow cannot be lowered by rustc_codegen_js";
+        (
+            vec![jsast::expr_stmt(self.zombie(message.to_string()))],
+            Vec::new(),
+        )
     }
 
     /// One attempt at rebuilding the body, as regions or as one flat dispatch loop.
@@ -442,8 +506,33 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     /// that is the one representation in which the statements of a straight-line run are adjacent
     /// and the boundaries the queue has to stop at are explicit. See `queue.rs`.
     fn structure_body(&self, force_dispatch: bool) -> Option<(Vec<Stmt>, Vec<String>)> {
-        let options = StructureOptions { force_dispatch, ..StructureOptions::default() };
+        let options = StructureOptions {
+            force_dispatch,
+            ..StructureOptions::default()
+        };
         let structured = structurizer::structure(cfg_adapter::build(self)?, &options).ok()?;
+        // Report-only: how far from fully structured this body came out, so a
+        // report can find the bodies still paying for dispatch loops.
+        let stats = structured.stats;
+        if stats.dispatch_fallbacks > 0 {
+            self.record_optimization_selection(
+                "structure",
+                if stats.whole_body_dispatch {
+                    "whole-body-dispatch"
+                } else {
+                    "scoped-dispatch"
+                },
+                format!(
+                    "{} dispatch region(s); the graph {}",
+                    stats.dispatch_fallbacks,
+                    if stats.irreducible {
+                        "has a loop with more than one entry"
+                    } else {
+                        "is reducible"
+                    },
+                ),
+            );
+        }
 
         let region = if crate::opts::get().queue {
             crate::queue::run(self, &self.uses, structured.region)
@@ -483,18 +572,34 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         let mut locs = Locs::new(self.tcx);
         for statement in &data.statements {
             lines.at(&mut stmts, statement.source_info.span);
-            locs.at(&mut stmts, statement.source_info.span);
+            locs.at(
+                &mut stmts,
+                rustc_span::hygiene::walk_chain_collapsed(
+                    statement.source_info.span,
+                    self.mir.span,
+                ),
+            );
             stmts.extend(self.codegen_statement(statement));
         }
         // The two halves run in this order and neither lowers what the other does: a terminator's
         // statements and the value its edge branches on are disjoint parts of it.
         lines.at(&mut stmts, data.terminator().source_info.span);
-        locs.at(&mut stmts, data.terminator().source_info.span);
+        locs.at(
+            &mut stmts,
+            rustc_span::hygiene::walk_chain_collapsed(
+                data.terminator().source_info.span,
+                self.mir.span,
+            ),
+        );
         stmts.extend(self.terminator_stmts(data.terminator()));
-        // A marker with nothing after it says nothing, and would only get in the way of the
-        // peepholes that look at what a block ends with.
-        while matches!(stmts.last(), Some(Stmt::Loc(_))) {
-            stmts.pop();
+        // An empty self-loop still executes its backedge. Keep that origin for
+        // the loop header; other trailing markers only obstruct block peepholes.
+        let empty_loop = matches!(data.terminator().kind, TerminatorKind::Goto { target } if target == bb)
+            && stmts.iter().all(|stmt| matches!(stmt, Stmt::Loc(_)));
+        if !empty_loop {
+            while matches!(stmts.last(), Some(Stmt::Loc(_))) {
+                stmts.pop();
+            }
         }
         (stmts, self.terminator_term(data.terminator(), blocks))
     }
@@ -543,15 +648,20 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 // An argument on its way to a marker that reads it at codegen time. Emitting it
                 // would be a dead store, and a dead store naming a `static` is what keeps that
                 // `static` in the program.
-                if assignment.0.as_local().is_some_and(|local| self.is_consumed(local)) {
+                if assignment
+                    .0
+                    .as_local()
+                    .is_some_and(|local| self.is_consumed(local))
+                {
                     return Vec::new();
                 }
                 let value = self.codegen_rvalue(&assignment.1, assignment.0.as_local());
                 self.write_place(assignment.0, value)
             }
-            StatementKind::SetDiscriminant { place, variant_index } => {
-                self.codegen_set_discriminant(**place, *variant_index)
-            }
+            StatementKind::SetDiscriminant {
+                place,
+                variant_index,
+            } => self.codegen_set_discriminant(**place, *variant_index),
             StatementKind::Intrinsic(intrinsic) => match &**intrinsic {
                 // `assume` only guides optimizations.
                 rustc_middle::mir::NonDivergingIntrinsic::Assume(_) => Vec::new(),
@@ -583,7 +693,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             // Everything above is a statement with nothing to emit. Anything else is a statement
             // the backend does not know, and skipping it silently would miscompile the body.
             other => vec![jsast::expr_stmt(self.zombie(format!(
-                "`{}` statements are not supported by rustc_codegen_mires",
+                "`{}` statements are not supported by rustc_codegen_js",
                 other.name()
             )))],
         }
@@ -605,20 +715,36 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             | TerminatorKind::FalseUnwind { .. }
             | TerminatorKind::UnwindResume
             | TerminatorKind::UnwindTerminate(_) => Vec::new(),
-            TerminatorKind::Call { func, args, destination, target, fn_span, .. } => {
-                self.at(*fn_span, || self.codegen_call(func, args, *destination, target.is_none()))
-            }
-            TerminatorKind::Assert { cond, expected, msg, .. } => {
+            TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                target,
+                fn_span,
+                ..
+            } => self.at(*fn_span, || {
+                self.codegen_call(func, args, *destination, target.is_none())
+            }),
+            TerminatorKind::Assert {
+                cond,
+                expected,
+                msg,
+                ..
+            } => {
                 if !self.tcx.sess.overflow_checks() && msg.is_optional_overflow_check() {
                     return Vec::new();
                 }
                 let condition = self.codegen_operand(cond);
-                let failed = if *expected { jsast::not(condition) } else { condition };
+                let failed = if *expected {
+                    jsast::not(condition)
+                } else {
+                    condition
+                };
                 vec![jsast::if_(failed, self.codegen_assert_failure(msg))]
             }
             TerminatorKind::Drop { place, .. } => self.codegen_drop(*place),
             other => vec![jsast::expr_stmt(self.zombie(format!(
-                "`{}` terminators are not supported by rustc_codegen_mires",
+                "`{}` terminators are not supported by rustc_codegen_js",
                 other.name()
             )))],
         }
@@ -647,12 +773,15 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             | TerminatorKind::FalseUnwind { real_target, .. } => goto(*real_target),
             // A call that does not come back ends the block. Control reaching the code after it
             // means the callee returned when its type says it cannot.
-            TerminatorKind::Call { target, .. } => match target {
-                Some(target) => goto(*target),
-                None => Term::Unreachable,
-            },
+            TerminatorKind::Call {
+                target: Some(target),
+                ..
+            } => goto(*target),
+            TerminatorKind::Call { target: None, .. } => Term::Unreachable,
             TerminatorKind::Return => Term::Return,
-            TerminatorKind::SwitchInt { discr, targets } => self.switch_term(discr, targets, blocks),
+            TerminatorKind::SwitchInt { discr, targets } => {
+                self.switch_term(discr, targets, blocks)
+            }
             TerminatorKind::UnwindResume | TerminatorKind::UnwindTerminate(_) => Term::Throw,
             // `Unreachable`, and every terminator the backend does not know: the statements above
             // have already aborted, so nothing can follow.
@@ -693,7 +822,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
 
         let mut cases = Vec::with_capacity(targets.iter().len());
         for (value, target) in targets.iter() {
-            let Some(id) = blocks.id(target) else { return Term::Throw };
+            let Some(id) = blocks.id(target) else {
+                return Term::Throw;
+            };
             cases.push((cfg_adapter::encode(self.tcx, ty, value), id));
         }
         match blocks.id(targets.otherwise()) {
@@ -729,7 +860,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
 
         let argument = self.codegen_ref(place);
         let glue_name = self.cgu.namer.fn_name(glue).into_string();
-        vec![jsast::expr_stmt(jsast::call(jsast::id(glue_name), vec![argument]))]
+        vec![jsast::expr_stmt(jsast::call(
+            jsast::id(glue_name),
+            vec![argument],
+        ))]
     }
 
     /// The body of the `if` an `Assert` terminator guards: the panic it fails with.
@@ -743,10 +877,13 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     /// A program that declared no such lang item aborts through the shim with a static message.
     fn codegen_assert_failure(&self, msg: &mir::AssertKind<mir::Operand<'tcx>>) -> Vec<Stmt> {
         let (lang_item, args) = match msg {
-            AssertKind::BoundsCheck { len, index } => (LangItem::PanicBoundsCheck, vec![index, len]),
-            AssertKind::MisalignedPointerDereference { required, found } => {
-                (LangItem::PanicMisalignedPointerDereference, vec![required, found])
+            AssertKind::BoundsCheck { len, index } => {
+                (LangItem::PanicBoundsCheck, vec![index, len])
             }
+            AssertKind::MisalignedPointerDereference { required, found } => (
+                LangItem::PanicMisalignedPointerDereference,
+                vec![required, found],
+            ),
             AssertKind::InvalidEnumConstruction(source) => {
                 (LangItem::PanicInvalidEnumConstruction, vec![source])
             }
@@ -770,7 +907,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 // The panic lang items are `#[track_caller]`, so they take the location of the
                 // expression that failed as a hidden trailing argument.
                 if panic.def.requires_caller_location(self.tcx) {
-                    arguments.push(crate::intrinsics::caller_location_argument(self, self.span()));
+                    arguments.push(crate::intrinsics::caller_location_argument(
+                        self,
+                        self.span(),
+                    ));
                 }
                 vec![jsast::expr_stmt(jsast::call(jsast::id(name), arguments))]
             }
@@ -780,7 +920,6 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             ))],
         }
     }
-
 }
 
 /// The names a finished body declares for itself, at the level the prelude would declare them.

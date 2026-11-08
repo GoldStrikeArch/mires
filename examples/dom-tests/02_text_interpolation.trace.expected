@@ -1,0 +1,24 @@
+{"$record":"header","$generatedBy":"scripts/dom-trace.mjs","$what":"Normalized runtime-call trace of a rustc_codegen_js-compiled client module executed against contract/harness/trace.mjs.","fixture":"domtest/02_text_interpolation","label":"domtest/02_text_interpolation","freeBindingsHealed":[],"status":"completed","error":null,"recordCount":23}
+{"op":"template","tmpl":"tmpl#0","html":"<span>Hello </span>"}
+{"op":"template","tmpl":"tmpl#1","html":"<span> John</span>"}
+{"op":"template","tmpl":"tmpl#2","html":"<span>Hello <!></span>"}
+{"op":"template","tmpl":"tmpl#3","html":"<span><!> John</span>"}
+{"op":"template","tmpl":"tmpl#4","html":"<span><!> <!></span>"}
+{"op":"template","tmpl":"tmpl#5","html":"<span> <!><!> </span>"}
+{"op":"template","tmpl":"tmpl#6","html":"<span> &lt;Hi> </span>"}
+{"op":"template","tmpl":"tmpl#7","html":"<span>Hi<!></span>"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"insert","parent":"tmpl#2:root","accessor":"world","marker":"tmpl#2:root.firstChild.nextSibling","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"insert","parent":"tmpl#3:root","accessor":"Hello","marker":"tmpl#3:root.firstChild","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#4","result":"tmpl#4:root"}
+{"op":"insert","parent":"tmpl#4:root","accessor":"Hello","marker":"tmpl#4:root.firstChild","initial":"undefined"}
+{"op":"insert","parent":"tmpl#4:root","accessor":"John","marker":"tmpl#4:root.firstChild.nextSibling.nextSibling","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#5","result":"tmpl#5:root"}
+{"op":"insert","parent":"tmpl#5:root","accessor":"Hello","marker":"tmpl#5:root.firstChild.nextSibling","initial":"undefined"}
+{"op":"insert","parent":"tmpl#5:root","accessor":"John","marker":"tmpl#5:root.firstChild.nextSibling.nextSibling","initial":"undefined"}
+{"op":"template.clone","tmpl":"tmpl#6","result":"tmpl#6:root"}
+{"op":"template.clone","tmpl":"tmpl#7","result":"tmpl#7:root"}
+{"op":"insert","parent":"tmpl#7:root","accessor":"<script>alert();</script>","marker":"tmpl#7:root.firstChild.nextSibling","initial":"undefined"}

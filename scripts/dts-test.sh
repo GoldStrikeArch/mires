@@ -14,6 +14,10 @@
 #
 # and scripts/dts-check.mjs then asserts the properties a carelessly rewritten golden would break.
 #
+# DTS_OPT_MODE=off|report|on (default off) compiles every fixture with the optimizer in that mode.
+# A declaration file is a fact about a signature, so it must not move: the golden is compared in
+# every mode.
+#
 # WHY THERE IS NO `tsc` HERE
 # --------------------------
 # There is no TypeScript compiler anywhere in this tree: contract/vendor/node_modules holds babel,
@@ -33,6 +37,39 @@ log_dir="$root/build/logs"
 
 DTS_ARGS="js-names=readable js-comments=on js-modules=esm js-dts=on"
 
+# The lane the caller asked for, passed through to every compilation here. `js-lane` is a link
+# step decision and not emit-affecting, so it needs no sysroot of its own; only `jir` is honoured,
+# since `shadow` writes two programs and this suite drives one. What the suite asserts is what the
+# program DOES, which is exactly what must not depend on the lane.
+lane_note=""
+case " ${JS_EXTRA_ARGS:-} " in
+*" js-lane=jir "*)
+	DTS_ARGS="$DTS_ARGS js-lane=jir"
+	lane_note="js-lane=jir"
+	;;
+esac
+
+# The optimizer mode, its own control rather than something read out of $JS_EXTRA_ARGS: the flags
+# here are pinned, so an option arriving through the environment would silently be dropped. Unlike
+# `js-lane`, `js-opt` IS emit-affecting, so `on` and `report` link against their own keyed sysroot,
+# built below. The golden here is the `.d.ts`, which is a type walk over the item's SIGNATURE: no
+# pass may move it, and a mode that did would be the finding. So every mode compares it, and there
+# is no `on` exemption of the kind scripts/dom-test.sh needs for its JavaScript.
+DTS_OPT_MODE=${DTS_OPT_MODE:-off}
+case "$DTS_OPT_MODE" in
+off) ;;
+report | on) DTS_ARGS="$DTS_ARGS js-opt=$DTS_OPT_MODE" ;;
+*)
+	echo "dts-test.sh: DTS_OPT_MODE must be off, report, or on" >&2
+	exit 2
+	;;
+esac
+if [ "${UPDATE_EXPECT:-0}" = 1 ] && [ "$DTS_OPT_MODE" != off ]; then
+	echo "dts-test.sh: expectations may only be updated in off mode" >&2
+	exit 2
+fi
+echo "note: compiled with ${lane_note:-js-lane=baseline} js-opt=$DTS_OPT_MODE"
+
 mkdir -p "$build_dir" "$log_dir"
 
 # ---------------------------------------------------------------- prerequisites
@@ -44,6 +81,10 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
 		exit 1
 	fi
 fi
+
+# The keyed sysroot these fixtures link against: `js-names=readable`, and `js-opt` in the two
+# non-off modes, are emit-affecting and so key it.
+JS_EXTRA_ARGS="$DTS_ARGS" SKIP_BUILD=1 "$script_dir/build_sysroot.sh" >/dev/null
 
 echo "==> building js-extern-macro for the host"
 if ! (cd "$root" && cargo build -p js-extern-macro) >"$log_dir/dts-macro.log" 2>&1; then

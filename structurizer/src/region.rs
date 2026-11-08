@@ -54,9 +54,15 @@ pub enum Region<S, C> {
     /// The statements of one input block.
     Block(S),
     /// A labeled block. `Break(Some(label))` from inside jumps past it.
-    Labeled { label: Label, body: Box<Region<S, C>> },
+    Labeled {
+        label: Label,
+        body: Box<Region<S, C>>,
+    },
     /// An endless loop, left by a break or a jump out of the function.
-    Loop { label: Option<Label>, body: Box<Region<S, C>> },
+    Loop {
+        label: Option<Label>,
+        body: Box<Region<S, C>>,
+    },
     /// Binds a condition payload to a temporary.
     ///
     /// A temporary that no later region reads still evaluates its payload; the
@@ -81,7 +87,7 @@ pub enum Region<S, C> {
         label: Option<Label>,
     },
     /// A selector driven loop, standing in for a tower of labeled blocks that
-    /// would nest too deep.
+    /// would nest too deep or for a loop with more than one entry.
     ///
     /// Renders as `for (;;) { switch (sel) { case k: ... } [break;] }`. Cases
     /// fall through into each other, `trailing_break` says whether the break

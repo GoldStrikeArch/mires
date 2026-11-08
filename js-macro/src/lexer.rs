@@ -51,16 +51,54 @@ pub const HOST_NAMES: [&str; 4] = ["globalThis", "undefined", "NaN", "Infinity"]
 
 /// The reserved words, which are never identifiers.
 const RESERVED: [&str; 42] = [
-    "async", "await", "break", "case", "catch", "class", "const", "continue", "debugger",
-    "default", "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for",
-    "function", "get", "if", "implements", "import", "in", "instanceof", "interface", "let", "new",
-    "null", "of", "package", "private", "protected", "public", "return", "set", "static", "super",
-    "switch", "this", "throw",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "get",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "instanceof",
+    "interface",
+    "let",
+    "new",
+    "null",
+    "of",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "set",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
 ];
 
 /// The rest of the reserved words. Split only to keep each array a readable width.
-const RESERVED_REST: [&str; 8] =
-    ["true", "try", "typeof", "var", "void", "while", "with", "yield"];
+const RESERVED_REST: [&str; 8] = [
+    "true", "try", "typeof", "var", "void", "while", "with", "yield",
+];
 
 /// Reserved words that END a value, which is what decides a `/` written after one.
 const VALUE_WORDS: [&str; 6] = ["this", "super", "true", "false", "null", "yield"];
@@ -231,7 +269,11 @@ impl<'a> Scan<'a> {
             at: 0,
             templates: Vec::new(),
             frames: vec![Frame::root()],
-            scopes: vec![Scope { names: BTreeSet::new(), depth: 0, expression: false }],
+            scopes: vec![Scope {
+                names: BTreeSet::new(),
+                depth: 0,
+                expression: false,
+            }],
             occurrences: Vec::new(),
             prev: Prev::Start,
             pending: None,
@@ -252,7 +294,9 @@ impl<'a> Scan<'a> {
     }
 
     fn frame_mut(&mut self) -> &mut Frame {
-        self.frames.last_mut().expect("the root frame is never popped")
+        self.frames
+            .last_mut()
+            .expect("the root frame is never popped")
     }
 
     /// How many brackets are open, which is what a scope's extent is measured in.
@@ -331,7 +375,10 @@ impl<'a> Scan<'a> {
 
     /// Binds `name` in the innermost scope.
     fn bind(&mut self, name: &str) {
-        self.scopes.last_mut().expect("the root scope is never dropped").insert_name(name);
+        self.scopes
+            .last_mut()
+            .expect("the root scope is never dropped")
+            .insert_name(name);
     }
 
     /// Drops every scope whose region the scan has left.
@@ -367,7 +414,11 @@ impl<'a> Scan<'a> {
                 names.insert(occurrence.name.clone());
             }
         }
-        self.scopes.push(Scope { names, depth: PENDING, expression: false });
+        self.scopes.push(Scope {
+            names,
+            depth: PENDING,
+            expression: false,
+        });
         self.pending = Some(self.scopes.len() - 1);
     }
 
@@ -605,14 +656,18 @@ fn identifier(scan: &mut Scan<'_>) -> Result<(), String> {
     let word: String = scan.chars[start..end].iter().collect();
 
     if block::is_slot_name(&word) {
-        return Err(format!("`{word}` is what a capture is emitted as, so a block cannot spell it"));
+        return Err(format!(
+            "`{word}` is what a capture is emitted as, so a block cannot spell it"
+        ));
     }
 
     let after_dot = matches!(&scan.prev, Prev::Op(op) if op == "." || op == "?.");
     let next = scan.significant(end).map(|(_, character)| character);
 
     if STATEMENT_WORDS.contains(&word.as_str()) && scan.depth() == 0 && !after_dot {
-        return Err(format!("`{word}` opens a statement and a `js!{{}}` block is one expression"));
+        return Err(format!(
+            "`{word}` opens a statement and a `js!{{}}` block is one expression"
+        ));
     }
 
     let mut free = false;
@@ -638,7 +693,14 @@ fn identifier(scan: &mut Scan<'_>) -> Result<(), String> {
     }
 
     let default = scan.frame().default;
-    scan.occurrences.push(Occurrence { start, end, name: word.clone(), free, default, shorthand });
+    scan.occurrences.push(Occurrence {
+        start,
+        end,
+        name: word.clone(),
+        free,
+        default,
+        shorthand,
+    });
     scan.prev = Prev::Word(word);
     Ok(())
 }
@@ -721,7 +783,13 @@ fn open(scan: &mut Scan<'_>, character: char) -> Result<(), String> {
     scan.expect_params = false;
     scan.expect_name = false;
     let occurrences = scan.occurrences.len();
-    scan.frames.push(Frame { open: character, object, occurrences, params, ..Frame::root() });
+    scan.frames.push(Frame {
+        open: character,
+        object,
+        occurrences,
+        params,
+        ..Frame::root()
+    });
     // A scope waiting on its body gets it here: a `{` after a parameter list is that body.
     if character == '{' && !object {
         if let Some(index) = scan.pending.take() {
@@ -737,7 +805,9 @@ fn open(scan: &mut Scan<'_>, character: char) -> Result<(), String> {
 /// A closing bracket, and everything that closing one settles.
 fn close(scan: &mut Scan<'_>, character: char) -> Result<(), String> {
     if scan.frames.len() == 1 {
-        return Err(format!("`{character}` closes a bracket that was never opened"));
+        return Err(format!(
+            "`{character}` closes a bracket that was never opened"
+        ));
     }
     let frame = scan.frames.pop().expect("the length was checked");
     let expected = match frame.open {
@@ -983,7 +1053,10 @@ mod tests {
         assert_eq!(free("a ? b : c"), ["a", "b", "c"]);
         assert_eq!(free("f(a ? b : c)"), ["f", "a", "b", "c"]);
         // Inside a block, `case x:` is a statement and `x` is a reference.
-        assert_eq!(free("(() => { switch (a) { case b: return c; } })"), ["a", "b", "c"]);
+        assert_eq!(
+            free("(() => { switch (a) { case b: return c; } })"),
+            ["a", "b", "c"]
+        );
     }
 
     #[test]
@@ -1027,19 +1100,34 @@ mod tests {
     fn a_declaration_binds_its_names_and_references_its_initializer() {
         assert_eq!(free("(() => { const a = b; return a; })"), ["b"]);
         assert_eq!(free("(() => { let a = 1, c = d; return a + c; })"), ["d"]);
-        assert_eq!(free("(() => { const { a, b: c } = d; return a + c; })"), ["d"]);
+        assert_eq!(
+            free("(() => { const { a, b: c } = d; return a + c; })"),
+            ["d"]
+        );
         assert_eq!(free("(() => { const [a, b] = c; return a + b; })"), ["c"]);
         // A destructuring default is a reference.
-        assert_eq!(free("(() => { const { a = z } = d; return a; })"), ["z", "d"]);
+        assert_eq!(
+            free("(() => { const { a = z } = d; return a; })"),
+            ["z", "d"]
+        );
     }
 
     #[test]
     fn a_for_head_and_a_catch_bind_what_they_declare() {
-        assert_eq!(free("(() => { for (const x of xs) { f(x); } })"), ["xs", "f"]);
+        assert_eq!(
+            free("(() => { for (const x of xs) { f(x); } })"),
+            ["xs", "f"]
+        );
         assert_eq!(free("(() => { for (const k in o) { f(k); } })"), ["o", "f"]);
-        assert_eq!(free("(() => { try { f(); } catch (e) { g(e); } })"), ["f", "g"]);
+        assert_eq!(
+            free("(() => { try { f(); } catch (e) { g(e); } })"),
+            ["f", "g"]
+        );
         // The declaration ends with its head, so what follows reads as references again.
-        assert_eq!(free("(() => { for (let i = 0; i < n; i++) { f(i); } })"), ["n", "f"]);
+        assert_eq!(
+            free("(() => { for (let i = 0; i < n; i++) { f(i); } })"),
+            ["n", "f"]
+        );
     }
 
     #[test]
@@ -1080,9 +1168,19 @@ mod tests {
 
     #[test]
     fn a_body_that_is_statements_rather_than_an_expression_is_refused() {
-        for source in ["const a = 1", "return a", "if (a) b", "for (;;) {}", "let a", "a; b"] {
+        for source in [
+            "const a = 1",
+            "return a",
+            "if (a) b",
+            "for (;;) {}",
+            "let a",
+            "a; b",
+        ] {
             let message = error(source);
-            assert!(message.contains("one expression"), "`{source}` reported `{message}`");
+            assert!(
+                message.contains("one expression"),
+                "`{source}` reported `{message}`"
+            );
         }
         // Inside a function body they are ordinary statements.
         assert_eq!(free("(() => { const a = 1; return a; })"), none());
@@ -1107,7 +1205,13 @@ mod tests {
 
     #[test]
     fn a_block_with_no_captures_is_left_exactly_as_written() {
-        for source in ["r => r.text()", "(a, b) => a + b", "1 + 1", "\"x\"", "`a${1}b`"] {
+        for source in [
+            "r => r.text()",
+            "(a, b) => a + b",
+            "1 + 1",
+            "\"x\"",
+            "`a${1}b`",
+        ] {
             assert_eq!(text(source), source);
             assert_eq!(free(source), none());
         }

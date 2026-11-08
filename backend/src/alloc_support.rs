@@ -24,17 +24,17 @@
 //! A heap block is born byte granular and retyped at the first `*mut u8` to `*mut T` cast (see
 //! `CONTRACT.md`). A block from `alloc_zeroed` has to come out of that retype holding `T`s worth
 //! of zero rather than bytes of zero, and only the compiler knows what a zero `T` looks like:
-//! `{ TAG: "None" }` for a niched `None`, `{ x: 0, y: 0 }` for a struct, `false` for a `bool`. So the
-//! cast carries a **zero element factory** to `__rt.unscale`, and [`zero_factory`] is what builds
-//! it.
+//! `{ TAG: "None" }` for a niched `None`, `{ x: 0, y: 0 }` for a struct, `false` for a `bool`. So
+//! the cast carries a **zero element factory** to `__rt.unscale`, and [`zero_factory`] is what
+//! builds it.
 
 use rustc_abi::Size;
 use rustc_ast::expand::allocator::{
-    ALLOC_ERROR_HANDLER, AllocatorMethod, AllocatorMethodInput, AllocatorTy,
-    NO_ALLOC_SHIM_IS_UNSTABLE, SpecialAllocatorMethod, default_fn_name, global_fn_name,
+    default_fn_name, global_fn_name, AllocatorKind, AllocatorMethod, AllocatorMethodInput,
+    AllocatorTy, SpecialAllocatorMethod, ALLOC_ERROR_HANDLER, NO_ALLOC_SHIM_IS_UNSTABLE,
 };
-use rustc_middle::mir::ConstValue;
 use rustc_middle::mir::interpret::Allocation;
+use rustc_middle::mir::ConstValue;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::DUMMY_SP;
 use rustc_symbol_mangling::mangle_internal_symbol;
@@ -42,6 +42,7 @@ use rustc_symbol_mangling::mangle_internal_symbol;
 use crate::cgu::CguCx;
 use crate::item::{ItemKind, JsItem, JsName, Linkage, ZombieLog};
 use crate::jsast::{self, Expr, Stmt};
+use crate::late_ir::{AllocatorProvider, LateIrAnalysisSummary};
 use crate::value;
 
 /// The `__rt` member each of the four known methods is answered with.
@@ -64,7 +65,10 @@ fn rt_member(special: SpecialAllocatorMethod) -> &'static str {
 fn input_params(input: &AllocatorMethodInput) -> Vec<String> {
     match input.ty {
         AllocatorTy::Layout => {
-            vec![format!("{}$size", input.name), format!("{}$align", input.name)]
+            vec![
+                format!("{}$size", input.name),
+                format!("{}$align", input.name),
+            ]
         }
         _ => vec![input.name.to_string()],
     }
@@ -165,20 +169,37 @@ pub(crate) fn shim_items(tcx: TyCtxt<'_>, methods: &[AllocatorMethod]) -> Vec<Js
             None if method.name == ALLOC_ERROR_HANDLER => alloc_error_body(method),
             None => forwarding_body(tcx, method, &params),
         };
-        items.push(shim_item(name, params, body, format!("`{}` allocator shim", method.name)));
+        items.push(shim_item(
+            name,
+            params,
+            body,
+            format!("`{}` allocator shim", method.name),
+        ));
     }
 
     // The marker `alloc::alloc::alloc` calls to make sure a program that allocates was linked with
     // a shim at all. It is a symbol whose existence is the whole of its meaning, so the body is
     // empty; cg_clif emits it unconditionally and so does this.
-    items.push(shim_item(
-        mangle_internal_symbol(tcx, NO_ALLOC_SHIM_IS_UNSTABLE),
-        Vec::new(),
-        Vec::new(),
-        format!("`{NO_ALLOC_SHIM_IS_UNSTABLE}` allocator shim"),
-    ));
+    let provider = allocator_provider(tcx.allocator_kind(()));
+    items.push(
+        shim_item(
+            mangle_internal_symbol(tcx, NO_ALLOC_SHIM_IS_UNSTABLE),
+            Vec::new(),
+            Vec::new(),
+            format!("`{NO_ALLOC_SHIM_IS_UNSTABLE}` allocator shim"),
+        )
+        .with_late_ir(LateIrAnalysisSummary::allocator_provider(provider)),
+    );
 
     items
+}
+
+fn allocator_provider(kind: Option<AllocatorKind>) -> AllocatorProvider {
+    match kind {
+        Some(AllocatorKind::Default) => AllocatorProvider::Default,
+        Some(AllocatorKind::Global) => AllocatorProvider::Custom,
+        None => AllocatorProvider::Unknown,
+    }
 }
 
 /// The third argument `__rt.unscale` takes: how to spell a zero element of the type being cast to.
@@ -211,9 +232,13 @@ pub(crate) fn zero_factory<'tcx>(cgu: &CguCx<'tcx>, ty: Ty<'tcx>) -> Expr {
 /// names the type; an arrow rather than a value for the same reason [`zero_factory`] is one.
 pub(crate) fn header_factory<'tcx>(cgu: &CguCx<'tcx>, ty: Ty<'tcx>) -> Expr {
     let tcx = cgu.tcx;
-    let Some((tail, _)) = value::unsized_tail_indexed(tcx, ty) else { return jsast::null() };
+    let Some((tail, _)) = value::unsized_tail_indexed(tcx, ty) else {
+        return jsast::null();
+    };
     let ty = value::peel_pattern(value::peel_transparent(tcx, ty));
-    let ty::Adt(def, args) = ty.kind() else { return jsast::null() };
+    let ty::Adt(def, args) = ty.kind() else {
+        return jsast::null();
+    };
     let variant = def.non_enum_variant();
 
     let mut entries = Vec::with_capacity(variant.fields.len());
@@ -225,7 +250,9 @@ pub(crate) fn header_factory<'tcx>(cgu: &CguCx<'tcx>, ty: Ty<'tcx>) -> Expr {
         if value::is_zst(tcx, field_ty) {
             continue;
         }
-        let Some(zero) = zero_value(cgu, field_ty) else { return jsast::null() };
+        let Some(zero) = zero_value(cgu, field_ty) else {
+            return jsast::null();
+        };
         entries.push((crate::naming::Namer::field_name(variant, index), zero));
     }
     jsast::arrow(Vec::new(), jsast::object(entries))
@@ -249,7 +276,6 @@ pub(crate) fn non_byte_zero_factory<'tcx>(cgu: &CguCx<'tcx>, ty: Ty<'tcx>) -> Op
 /// arrays — is answered by construction rather than by a second table that could disagree with the
 /// first. A type the reader cannot decode records a zombie; that is a question, not an answer, so
 /// the probe log is thrown away and the caller is told `None`.
-///
 // TODO(stage3): unify with constant::raw — this is the same decode the constant reader does, and
 // the two should share the entry point once `constant.rs` is free to change.
 fn zero_value<'tcx>(cgu: &CguCx<'tcx>, ty: Ty<'tcx>) -> Option<Expr> {
@@ -258,18 +284,37 @@ fn zero_value<'tcx>(cgu: &CguCx<'tcx>, ty: Ty<'tcx>) -> Option<Expr> {
     if !layout.is_sized() {
         return None;
     }
-    let alloc = Allocation::from_bytes_byte_aligned_immutable(
-        vec![0u8; layout.size.bytes_usize()],
-        (),
-    );
+    let alloc =
+        Allocation::from_bytes_byte_aligned_immutable(vec![0u8; layout.size.bytes_usize()], ());
     let alloc_id = tcx.reserve_and_set_memory_alloc(tcx.mk_const_alloc(alloc));
     let probe = ZombieLog::default();
     let value = crate::constant::codegen_const_value(
         cgu,
         &probe,
-        ConstValue::Indirect { alloc_id, offset: Size::ZERO },
+        ConstValue::Indirect {
+            alloc_id,
+            offset: Size::ZERO,
+        },
         ty,
         DUMMY_SP,
     );
     probe.take().is_empty().then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rustc_allocator_kinds_map_to_conservative_artifact_facts() {
+        assert_eq!(
+            allocator_provider(Some(AllocatorKind::Default)),
+            AllocatorProvider::Default
+        );
+        assert_eq!(
+            allocator_provider(Some(AllocatorKind::Global)),
+            AllocatorProvider::Custom
+        );
+        assert_eq!(allocator_provider(None), AllocatorProvider::Unknown);
+    }
 }

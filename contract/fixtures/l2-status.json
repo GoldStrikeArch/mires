@@ -1,0 +1,415 @@
+{
+  "$what": "The committed L2 verdict: one row per corpus family, recording how the trace of the family compiled by rustc_codegen_js compares against the reference trace in contract/fixtures/corpus/<family>/expected.reference.trace, with the accepted deltas in examples/dom-tests/deltas.json applied. Recomputed and enforced by contract/harness/check-l2-status.mjs.",
+  "$howToRegenerate": [
+    "cd contract/harness",
+    "node --import ./register-loader.mjs check-l2-status.mjs           # check, exit 1 on any change",
+    "node --import ./register-loader.mjs check-l2-status.mjs --record  # rewrite after reading the diff",
+    "It reads only committed bytes -- the reference traces here and examples/dom-tests/NN.trace.expected -- so it needs no build. That is sound because scripts/dom-test.sh already fails if a freshly emitted trace differs from NN.trace.expected, so on a green dom run the committed trace IS the emitted trace."
+  ],
+  "$states": {
+    "MATCH": "compared, and the traces agree once the accepted deltas are applied.",
+    "DIFFERS": "compared, and they do not. `differences` is the count and `attribution` names the written cause(s). This is what the G2 checklist calls ATTRIBUTED.",
+    "EXCLUDED": "deliberately not compared. `why` says so. No examples/dom-tests/NN.family names it.",
+    "GAP": "neither compared nor excluded. `why` records the blocker. The only state that is a gate item."
+  },
+  "$fields": {
+    "measured": "state, fixture, differences, accepted, staleRules, causes, records -- rewritten by --record and compared by a check. `causes` is the mechanically derived signature of the disagreement: the distinct kind:op pairs, sorted.",
+    "declared": "attribution, why, note -- written by hand, carried forward by --record untouched, and REQUIRED: a DIFFERS row with no attribution fails, and so does one citing a cause that is not a key of $whatIsDeliberatelyNotHere in examples/dom-tests/deltas.json."
+  },
+  "$summary": {
+    "MATCH": 1,
+    "DIFFERS": 15,
+    "EXCLUDED": 2
+  },
+  "families": {
+    "01-simple-elements": {
+      "state": "MATCH",
+      "fixture": "examples/dom-tests/01_simple_elements.trace.expected",
+      "differences": 0,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [],
+      "records": {
+        "reference": 6,
+        "ours": 6
+      },
+      "note": "The only true trace MATCH in the corpus, and the reason this file exists: nothing else defends it. It reaches MATCH through two `rewrite` rules that normalise ONE spelling convention each (template-closing-tags, template-attribute-quotes), not through per-record exceptions."
+    },
+    "02-text-interpolation": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/02_text_interpolation.trace.expected",
+      "differences": 25,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "changed:insert",
+        "extra-in-b:insert",
+        "extra-in-b:template",
+        "extra-in-b:template.clone",
+        "missing-in-b:insert",
+        "missing-in-b:template",
+        "missing-in-b:template.clone"
+      ],
+      "records": {
+        "reference": 20,
+        "ours": 23
+      },
+      "attribution": [
+        "anchor-placement",
+        "fixture-coverage"
+      ]
+    },
+    "03-attribute-expressions": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/03_attribute_expressions.trace.expected",
+      "differences": 9,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "changed:setAttribute",
+        "changed:template",
+        "extra-in-b:setAttribute",
+        "missing-in-b:effect"
+      ],
+      "records": {
+        "reference": 19,
+        "ours": 17
+      },
+      "attribution": [
+        "write-once-vs-always-reactive"
+      ],
+      "note": "One difference is an artifact of the template-attribute-quotes rule rather than of either emitter: the reference writes the boolean attribute bare as `disabled`, view-dom writes `disabled=\"\"`, and the rule rewrites that to `disabled=`. A rule clause for the empty value would close it. Recorded rather than silently absorbed."
+    },
+    "04-event-expressions": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/04_event_expressions.trace.expected",
+      "differences": 8,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "extra-in-b:delegateEvents",
+        "extra-in-b:node.addEventListener",
+        "missing-in-b:addEventListener",
+        "missing-in-b:delegateEvents",
+        "missing-in-b:template",
+        "missing-in-b:template.clone"
+      ],
+      "records": {
+        "reference": 13,
+        "ours": 9
+      },
+      "attribution": [
+        "delegate-events-placement",
+        "fixture-coverage"
+      ]
+    },
+    "05-conditional": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/05_conditional.trace.expected",
+      "differences": 6,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "changed:insert",
+        "missing-in-b:insert",
+        "missing-in-b:memo",
+        "missing-in-b:template",
+        "missing-in-b:template.clone"
+      ],
+      "records": {
+        "reference": 17,
+        "ours": 12
+      },
+      "attribution": [
+        "fixture-coverage"
+      ],
+      "note": "The memo record ONLY IN A is not the retired `memo-hoisting-for-a-conditional` delta -- that one is measured and fixed (examples/dom-tests/deltas.json $measuredAndRetired). It belongs to the reference-only `withMarkup` case, which has no view.rs counterpart (G2-CHECKLIST.md structural finding 5)."
+    },
+    "06-insert-children": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/06_insert_children.trace.expected",
+      "differences": 20,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "changed:insert",
+        "changed:template",
+        "extra-in-b:insert",
+        "extra-in-b:template",
+        "extra-in-b:template.clone",
+        "missing-in-b:insert",
+        "missing-in-b:template",
+        "missing-in-b:template.clone"
+      ],
+      "records": {
+        "reference": 19,
+        "ours": 16
+      },
+      "attribution": [
+        "anchor-placement",
+        "fixture-coverage"
+      ]
+    },
+    "07-components": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/07_components.trace.expected",
+      "differences": 47,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "changed:insert",
+        "extra-in-b:delegateEvents",
+        "extra-in-b:insert",
+        "extra-in-b:template",
+        "extra-in-b:template.clone",
+        "missing-in-b:createComponent",
+        "missing-in-b:delegateEvents",
+        "missing-in-b:insert",
+        "missing-in-b:template",
+        "missing-in-b:template.clone"
+      ],
+      "records": {
+        "reference": 45,
+        "ours": 37
+      },
+      "attribution": [
+        "eager-child-content-and-the-cases-it-makes-unwritable",
+        "the-getter-children-double-clone",
+        "fixture-coverage"
+      ]
+    },
+    "07b-nested-components": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/07b_nested.trace.expected",
+      "differences": 42,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "changed:insert",
+        "changed:template",
+        "extra-in-b:insert",
+        "extra-in-b:template",
+        "extra-in-b:template.clone",
+        "missing-in-b:createComponent",
+        "missing-in-b:insert",
+        "missing-in-b:template",
+        "missing-in-b:template.clone"
+      ],
+      "records": {
+        "reference": 49,
+        "ours": 40
+      },
+      "attribution": [
+        "eager-child-content-and-the-cases-it-makes-unwritable",
+        "fixture-coverage"
+      ]
+    },
+    "08-fragments": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/08_fragments.trace.expected",
+      "differences": 7,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "extra-in-b:insert",
+        "extra-in-b:template.clone",
+        "missing-in-b:memo"
+      ],
+      "records": {
+        "reference": 10,
+        "ours": 15
+      },
+      "attribution": [
+        "fragment-roots-must-be-elements",
+        "memo-for-a-fragment-member"
+      ],
+      "note": "Closed in wave 6, GAP -> DIFFERS, and it needed no emitter change at all: a view body with several top-level nodes IS a fragment, because DomWriter::close_scope already returns one template per root as a Rust tuple. It was a GAP only because nobody had compiled it. L2 went 18 lines to 7, and all three templates now MATCH byte for byte once the standard template-closing-tags normalisation is applied. THIS ROW IS THE GATE'S FIRST REAL CATCH: the backend's wave-6 sweep tripped check-l2-status.mjs with 'IMPROVED 08-fragments: committed GAP, measured DIFFERS' before this row existed."
+    },
+    "09-svg": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/09_svg.trace.expected",
+      "differences": 4,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "extra-in-b:setAttribute",
+        "missing-in-b:effect"
+      ],
+      "records": {
+        "reference": 10,
+        "ours": 11
+      },
+      "attribution": [
+        "write-once-vs-always-reactive",
+        "one-effect-per-hole-not-a-shared-record"
+      ],
+      "note": "GAP -> DIFFERS. Namespace detection is built: TemplateData carries is_import_node and is_svg (ABI 6), Template::finish sets is_svg from an SVG-only root and prefixes the literal <svg> wrapper, and Template::tree roots the walk at the wrapper's first child to match the runtime's extra unwrap (CONTRACT-DOM 2.2). ALL FOUR TEMPLATES MATCH BYTE FOR BYTE, flags included, once the standard closing-tag and attribute-quote normalisations are applied plus this family's exception: rootRect is the only corpus template the reference does not minify all the way, so `svg-wrapper-closing-tag` strips the trailing </svg> from side a as well. The four remaining lines are one divergence seen from two sides: the reference wraps its three dynamic <rect> attributes in ONE effect with a {e, t, a} previous-value record, and Topcoat's `name=(expr)` is written once, so ours is three bare setAttribute calls and no effect. Even a reactive Topcoat spelling would be three effects rather than one, which is the second cause. setAttributeNS for xlink: names is still absent and no case in this family needs it."
+    },
+    "10-custom-elements": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/10_custom_elements.trace.expected",
+      "differences": 11,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "extra-in-b:setAttribute",
+        "missing-in-b:getOwner",
+        "missing-in-b:setAttribute",
+        "missing-in-b:template.clone"
+      ],
+      "records": {
+        "reference": 16,
+        "ours": 9
+      },
+      "attribution": [
+        "custom-element-owner-write",
+        "custom-element-attribute-is-a-property-write",
+        "fixture-coverage"
+      ],
+      "note": "GAP -> DIFFERS, and this family cannot reach MATCH. is_import_node is built, so all three templates MATCH byte for byte on all four _$template arguments. The eleven remaining lines are three written causes and nothing else: six getOwner records the reference writes onto every custom-element root and no Topcoat program produces; three setAttribute records, two of ours where the reference does a property write that leaves no record at all and one of the reference's belonging to its attr: case; and two clones of the two cases (attr:, prop:) Topcoat has no syntax to spell."
+    },
+    "11-topcoat-if": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/11_topcoat_if.trace.expected",
+      "differences": 11,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "missing-in-b:Show",
+        "missing-in-b:createComponent",
+        "missing-in-b:insert",
+        "missing-in-b:setAttribute",
+        "missing-in-b:template",
+        "missing-in-b:template.clone"
+      ],
+      "records": {
+        "reference": 26,
+        "ours": 15
+      },
+      "attribution": [
+        "different-reference-program"
+      ]
+    },
+    "12-topcoat-match": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/12_topcoat_match.trace.expected",
+      "differences": 14,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "changed:insert",
+        "extra-in-b:insert",
+        "extra-in-b:template.clone",
+        "missing-in-b:className",
+        "missing-in-b:insert",
+        "missing-in-b:template",
+        "missing-in-b:template.clone"
+      ],
+      "records": {
+        "reference": 17,
+        "ours": 10
+      },
+      "attribution": [
+        "different-reference-program",
+        "memo-hoisting-for-a-match",
+        "fixture-coverage"
+      ]
+    },
+    "13-topcoat-for": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/13_topcoat_for.trace.expected",
+      "differences": 36,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "changed:insert",
+        "extra-in-b:insert",
+        "extra-in-b:setAttribute",
+        "extra-in-b:template",
+        "extra-in-b:template.clone",
+        "missing-in-b:For",
+        "missing-in-b:createComponent",
+        "missing-in-b:insert",
+        "missing-in-b:spread",
+        "missing-in-b:template",
+        "missing-in-b:template.clone"
+      ],
+      "records": {
+        "reference": 19,
+        "ours": 32
+      },
+      "attribution": [
+        "keyed-list-vs-a-rust-loop"
+      ],
+      "note": "The family the keyed-list decision turns on, and it is DECIDED as of wave 6: `push_keyed` stays identity-only and this family stays DIFFERS. Reason (backend wave-6 report, item 1, finding K3): the reference is solid's `<For>`, which clones a row's template once per row EVER, while Topcoat's `for` is an eager Rust loop that clones once per row PER RENDER, before push_keyed is reached. The divergence is the loop, not the reconcile, so no version of push_keyed moves this row to MATCH. The dashboard parity fixture asserts the rows are REBUILT for the same reason (contract/parity/fixtures/dashboard/fixture.json expected.$notKeyed). See also contract/fixtures/corpus/13-topcoat-for/NOTES.md and G2-CHECKLIST.md, 'The unkeyed list'."
+    },
+    "14-topcoat-local": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/14_topcoat_local.trace.expected",
+      "differences": 16,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "extra-in-b:setAttribute",
+        "missing-in-b:effect",
+        "missing-in-b:effect.ran",
+        "missing-in-b:insert",
+        "missing-in-b:setAttribute",
+        "missing-in-b:template",
+        "missing-in-b:template.clone"
+      ],
+      "records": {
+        "reference": 18,
+        "ours": 4
+      },
+      "attribution": [
+        "write-once-vs-always-reactive",
+        "fixture-coverage"
+      ],
+      "note": "The widest record gap in the corpus: 18 reference records against 4 of ours, because most of the family's cases are `name=(expr)` attributes written once where the reference wraps each in an effect."
+    },
+    "15-topcoat-bind": {
+      "state": "DIFFERS",
+      "fixture": "examples/dom-tests/15_bind_attributes.trace.expected",
+      "differences": 26,
+      "accepted": 0,
+      "staleRules": [],
+      "causes": [
+        "changed:effect.ran",
+        "changed:template",
+        "extra-in-b:classList",
+        "extra-in-b:effect",
+        "extra-in-b:effect.ran",
+        "extra-in-b:setAttribute",
+        "extra-in-b:style",
+        "extra-in-b:template",
+        "extra-in-b:template.clone",
+        "missing-in-b:delegateEvents",
+        "missing-in-b:effect",
+        "missing-in-b:effect.ran",
+        "missing-in-b:insert",
+        "missing-in-b:template",
+        "missing-in-b:template.clone"
+      ],
+      "records": {
+        "reference": 29,
+        "ours": 22
+      },
+      "attribution": [
+        "anchor-placement",
+        "delegate-events-placement",
+        "fixture-coverage"
+      ]
+    },
+    "16-topcoat-spread": {
+      "state": "EXCLUDED",
+      "fixture": null,
+      "why": "Deliberately uncompared. examples/dom-tests/16_topcoat_spread.rs:3-7: the corpus writes `topcoat::view::Attributes`, which the spike does not build, so the fixture pins the emitted shape and not runtime behaviour. It carries no .family for that reason. The fixture still runs under L1 (NN.js.expected + NN.trace.expected)."
+    },
+    "17-topcoat-signal": {
+      "state": "EXCLUDED",
+      "fixture": null,
+      "why": "Deliberately uncompared. examples/dom-tests/17_signal.rs:9-10: the reference module for corpus family 17 is a different program, so a trace comparison against it would not be measuring anything. The fixture still runs under L1."
+    }
+  }
+}

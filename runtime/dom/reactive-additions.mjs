@@ -7,14 +7,22 @@
 // additions the emitter needs are declared here, and both gen-index.mjs and
 // check-exports.mjs read this one list.
 //
-// WHY createSignal
-// ----------------
+// WHY batch, createRoot, createSelector, createSignal, and onCleanup
+// ------------------------------------------------------------------
 // The emitter emits `import { createSignal } from "<js-dom-module>"` for a
 // signal declared in an island. client.js has no such export: it re-exports six
 // names from the rxcore seam (effect, memo, untrack, getOwner, createComponent,
 // mergeProps) and creating state is not one of them. A signal taken from any
 // other copy of solid would sit in a different reactive graph and never notify
 // the effects in this one, so it has to come out of this same artifact.
+//
+// A keyed row uses that same graph for its live item/index signals. `batch`
+// publishes every retained-row update before dependent effects flush, and
+// `createRoot` gives the row one exact disposal boundary. Importing either from
+// another copy would split ownership or scheduling from the effects they govern.
+// `onCleanup` attaches the list's final disposal to the surrounding island owner.
+// `createSelector` gives compiler-known selection key-specific fan-out: changing
+// selection wakes only the old and new keyed rows.
 //
 // WHY runWithOwner
 // ----------------
@@ -33,6 +41,10 @@
 // twice is a build error.
 
 export const reactiveAdditions = {
+  batch: "batch",
+  createRoot: "createRoot",
+  createSelector: "createSelector",
   createSignal: "createSignal",
+  onCleanup: "onCleanup",
   runWithOwner: "runWithOwner"
 };

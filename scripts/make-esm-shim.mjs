@@ -4,7 +4,8 @@
 //
 // runtime/shim.js is a plain script: it assigns `globalThis.__rt`, it is
 // concatenated ahead of a compiled program, and pages load it with a bare
-// `<script src>` and extend the object afterwards (demo/index.html does). A program compiled with
+// `<script src>` and extend the object afterwards (demo/index.html and
+// demo-app/src/glue.js both do). A program compiled with
 // `-Cllvm-args=js-modules=esm` needs the same members as an ES module instead,
 // so that `import * as __rt from "./shim.js"` binds them.
 //

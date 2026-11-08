@@ -1,0 +1,24 @@
+--- a/library/core/src/str/pattern.rs
++++ b/library/core/src/str/pattern.rs
+@@ -39,6 +39,5 @@
+ 
+ use crate::cmp::Ordering;
+-use crate::convert::TryInto as _;
+ use crate::slice::memchr;
+ use crate::{cmp, fmt};
+ 
+@@ -566,10 +565,9 @@
+     fn into_searcher<'a>(self, haystack: &'a str) -> Self::Searcher<'a> {
+         let mut utf8_encoded = [0; char::MAX_LEN_UTF8];
+-        let utf8_size = self
+-            .encode_utf8(&mut utf8_encoded)
+-            .len()
+-            .try_into()
+-            .expect("char len should be less than 255");
++        // rustc_codegen_js: `encode_utf8` returns a slice of this four-byte array, so its
++        // length always fits in the searcher's `u8` field. Avoid the impossible conversion
++        // error path, which otherwise retains integer-error formatting in small string users.
++        let utf8_size = self.encode_utf8(&mut utf8_encoded).len() as u8;
+ 
+         CharSearcher {
+             haystack,

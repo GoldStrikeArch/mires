@@ -54,6 +54,9 @@ on `wasm32-unknown-unknown` and 64 and 8 on a 64 bit host).
 | `28_array_into_iter` | `for x in arr` by value: `array::IntoIter` through `PolymorphicIter`'s unsized tail, so a pointer to a struct with a trailing slice is `{ ptr, meta }`, from both alive ends and with a `Drop` element |
 | `29_rc` | `Rc` and `Arc`, both halves. Sized: the strong and weak counts, `get_mut` gated on uniqueness, `ptr_eq` on one block and on two, a `Weak` that does not keep its value alive, the payload glue that runs when the LAST owner goes, `Rc<RefCell<T>>` written through a clone. Unsized: `Rc<[u8]>`, `Rc<[u32]>`, `Rc<[String]>` through the `from_iter` path, an element with a `Drop`, `Arc<[T]>` and an empty tail |
 | `30_hashmap` | `mires_js::collections::{HashMap, HashSet}`: every key class including the BigInt widths and the `str` class, `insert` returning the old value, a struct value written through `get_mut`, `remove`, snapshot iteration, and set dedup |
+| `102_str_lines` | `str::Lines`, `split_once`, CRLF handling, and one-, two-, three-, and four-byte `char` search and suffix matching through safe scalar byte views, without the impossible conversion, slice-index, aligned-word, or forward `Map` graphs |
+| `104_exact_typed_vec` | exact/reserved `Vec<u32>` planning: width-aware cast capacity, straight-line push length proofs, capacity-observation and retained-view declines, explicit `Uint32Array` selection, logical capacity, and scalar slice consumers |
+| `105_slice_iterator_cursor` | checked cursor lowering for exact `Enumerate<Take<SliceIter<u8>>>` and `Enumerate<Skip<SliceIter<u8>>>` loops across empty, short, exact, overlong, dynamic, and early-break cases; signed/wider elements, reversed adapter order, and observed iterator state decline |
 | `guard_as_chunks` | a gap that is a run time guard rather than a zombie: `as_chunks` aborts the program instead of answering |
 | `guard_heap_retype` | reading one heap block at two element sizes once something has been written at the first: `__rt.unscale` throws rather than hand back a wrong number |
 | `guard_map_key` | a gap that is a **type** error: an aggregate cannot be a host `Map` key, and the sealed `MapKey` trait says so at the call site |
@@ -95,11 +98,10 @@ somebody else's buffer. So the question is asked when the program runs, and `__r
 `__rt.unscale` throws:
 
 * `as_chunks`, `array_chunks`, `chunks_exact`, `align_to`. `guard_as_chunks` pins the abort.
-* through `align_to`, `memchr`'s word-at-a-time path: `str::find(char)` and `split(char)` answer
-  while the haystack is shorter than two `usize`s and throw past that, and `rfind` (`memrchr`)
-  never answers. An index loop over `as_bytes()` is the substitute, and `14_str` uses one.
-  `find(&str)` and `contains` are *not* subject to this: they run the two way `StrSearcher`, which
-  compares slices rather than reading words, and `14_str` covers them at every length.
+* through `align_to`, `memrchr`'s word-at-a-time path: `rfind(char)` still cannot answer. Forward
+  `memchr` is scalar in the custom sysroot, so `str::find(char)` and `split(char)` work at every
+  haystack length. `find(&str)` and `contains` are not subject to the word path either: they run the
+  two-way `StrSearcher`, which compares slices. `14_str` covers the forward forms.
 * a pointer cast between two pointees that are neither the same size nor a byte. This one *is* a
   zombie, reported at the cast with both types named; `examples/tests/zombie_reachable.rs` pins it.
 
@@ -135,6 +137,19 @@ there too, because the `None` cases have no panicking spelling.
 the runtime arm of `core`'s `const_panic!`, `panic_bounds_check`, `panic_display` and
 `assert_failed` panic with a fixed string rather than a formatted one, so bounds-checked indexing,
 `clamp`, `Option::expect`, `assert!` and `unreachable!` all work with a less specific message.
+`str::slice_error_fail_rt` is the same kind of stub: `&s[a..b]` still panics off a char
+boundary, but it does not format the offending `char`. `54_str_index_no_fmt` is the receipt
+that `fmt` and Unicode tables stay unreachable from indexing and `contains` alone.
+
+`patches/0004-char-searcher-byte-length.patch` is narrower: `CharSearcher` stores the length returned by `char::encode_utf8` in a `u8`. Because the caller supplies a four-byte array, that length is always in `1..=4`; the patch uses the exact cast directly instead of retaining an impossible `TryInto::try_into().expect(...)` error path. `102_str_lines` covers every UTF-8 width and its `.absent` file rejects the conversion error, its message, and `core::fmt::write` in the output.
+
+`patches/0005-scalar-memchr.patch` keeps forward byte search on the existing safe scalar implementation. Native Rust profits from aligned word loads, but a byte slice here is a JavaScript array and the same path expands into pointer retyping, alignment, bounds, and panic machinery before returning to a scalar scan. `102_str_lines` exercises a haystack past the old threshold and rejects `memchr_aligned` in the emitted program. Reverse `memrchr` remains unchanged.
+
+`patches/0006-char-searcher-nonpanicking-needle.patch` compares a `CharSearcher` candidate with checked views of its four-byte encoded needle and implements `char` suffix matching with an explicit length guard plus checked string views. Both ranges are established by the searcher before the comparison, so retaining `slice_index_fail` only adds an unreachable panic graph. The no-inline suffix helper in `102_str_lines` exercises every UTF-8 width plus mismatch and too-short cases at run time, and its `.absent` file rejects that graph.
+
+`patches/0007-lines-direct-split.patch` keeps `Lines`' public `Map`-based representation, clone/debug behavior, and reverse iterator intact. Only `Lines::next` drives its contained `SplitInclusive` state directly and trims the fixed ASCII `CR? LF` ending with safe byte checks and checked string views. The fixture's long LF/CRLF input pins the behavior and rejects the otherwise retained forward `Map::next` adapter.
+
+`patches/0012-char-searcher-scalar-prefix.patch` uses the final UTF-8 byte already found by forward `CharSearcher` and compares only the preceding zero to three bytes. Exact one- through four-byte slice patterns keep every access checked while removing generic slice equality from the single-character search graph. `102_str_lines` includes same-final-byte false candidates at every multibyte width, the repeated-byte U+A041 case that can produce an interior false hit, and negative matches.
 
 ### 3. Unfinished, rather than decided
 
@@ -182,7 +197,7 @@ still emitted, with a `__rt.js_abort(...)` in place of that expression, and the 
 only if the whole-program walk finds it reachable — with the chain that made it reachable:
 
 ```
-error: core/src/ascii/ascii_char.rs:1186:23: rustc_codegen_mires cannot cast a pointer to
+error: core/src/ascii/ascii_char.rs:1186:23: rustc_codegen_js cannot cast a pointer to
        `[ascii::ascii_char::AsciiChar]` into a pointer to `str`
   = note: in `<escape::EscapeIterInner<N, escape::MaybeEscaped> as fmt::Display>::fmt`
   = note: required by `<char as fmt::Debug>::fmt`

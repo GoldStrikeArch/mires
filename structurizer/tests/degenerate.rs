@@ -103,8 +103,16 @@ fn an_unwind_edge_is_not_an_edge() {
     let cfg = Cfg {
         entry: BlockId(0),
         blocks: vec![
-            Block { stmts: "b0", term: Term::Return, unwind: Some(BlockId(1)) },
-            Block { stmts: "b1", term: Term::Throw, unwind: None },
+            Block {
+                stmts: "b0",
+                term: Term::Return,
+                unwind: Some(BlockId(1)),
+            },
+            Block {
+                stmts: "b1",
+                term: Term::Throw,
+                unwind: None,
+            },
         ],
     };
     let out = run_cfg(cfg);
@@ -121,14 +129,20 @@ fn a_branch_to_nowhere_is_an_error() {
     let err = structure(cfg, &Options::default()).unwrap_err();
     assert_eq!(
         err,
-        StructureError::BlockOutOfRange { from: Some(BlockId(0)), target: BlockId(7) }
+        StructureError::BlockOutOfRange {
+            from: Some(BlockId(0)),
+            target: BlockId(7)
+        }
     );
     assert_eq!(err.to_string(), "block 0 branches to unknown block 7");
 }
 
 #[test]
 fn an_empty_body_is_an_error() {
-    let cfg: Cfg<S, S> = Cfg { entry: BlockId(0), blocks: Vec::new() };
+    let cfg: Cfg<S, S> = Cfg {
+        entry: BlockId(0),
+        blocks: Vec::new(),
+    };
     assert_eq!(
         structure(cfg, &Options::default()).unwrap_err(),
         StructureError::EmptyCfg
@@ -159,11 +173,26 @@ fn diamond_chain(n: u32) -> Cfg<S, S> {
             },
             unwind: None,
         });
-        blocks.push(Block { stmts: "s", term: Term::Goto(BlockId(base + 3)), unwind: None });
-        blocks.push(Block { stmts: "s", term: Term::Goto(BlockId(base + 3)), unwind: None });
+        blocks.push(Block {
+            stmts: "s",
+            term: Term::Goto(BlockId(base + 3)),
+            unwind: None,
+        });
+        blocks.push(Block {
+            stmts: "s",
+            term: Term::Goto(BlockId(base + 3)),
+            unwind: None,
+        });
     }
-    blocks.push(Block { stmts: "s", term: Term::Return, unwind: None });
-    Cfg { entry: BlockId(0), blocks }
+    blocks.push(Block {
+        stmts: "s",
+        term: Term::Return,
+        unwind: None,
+    });
+    Cfg {
+        entry: BlockId(0),
+        blocks,
+    }
 }
 
 #[test]

@@ -29,7 +29,7 @@ const fixtures = path.join(root, "contract/fixtures/js-extern");
 
 // The compiled program imports the library by the specifier its declarations named. The run
 // directory satisfies that specifier with a re-export of the contract's file, which is the same
-// trick scripts/async-test.sh uses for the DOM module: one module instance, so `__trace()` read
+// trick scripts/dom-test.sh uses for the DOM runtime: one module instance, so `__trace()` read
 // from here sees what the compiled program did.
 //
 // `default` is re-exported by name because `export *` does not carry it, and the library exports

@@ -1,0 +1,53 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { insert as _$insert } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h70ecbd4edf573156 = _$template("<div></div>");
+const tmpl$h7a0e5658a0cb4983 = _$template("<span>Draft</span>");
+const tmpl$h3db8d7738b512de2 = _$template("<a href=\"/posts\"></a>");
+const tmpl$hb4aa2250c30c16e6 = _$template("<span>Archived</span>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  x12_topcoat_match$simple_match$h64ae2e0ac47f8ee2({ TAG: "Draft" }, true);
+  x12_topcoat_match$simple_match$h64ae2e0ac47f8ee2({ TAG: "Published", title: "Hello" }, false);
+  x12_topcoat_match$simple_match$h64ae2e0ac47f8ee2({ TAG: "Archived" }, true);
+}
+// simple_match::{closure#0}
+function x12_topcoat_match$simple_match$closure_0$hc5164c7950833169(_1) {
+  let _0, title, __tc_root_2;
+  switch (_1[0].TAG) {
+    case "Draft":
+      _0 = tmpl$h7a0e5658a0cb4983();
+      break;
+    case "Published":
+      title = _1[0].title;
+      __tc_root_2 = tmpl$h3db8d7738b512de2();
+      _$insert(__tc_root_2, title);
+      _0 = __tc_root_2;
+      break;
+    case "Archived":
+      if (_1[1]) {
+        _0 = tmpl$hb4aa2250c30c16e6();
+      } else {
+        _0 = null;
+      }
+      break;
+    default:
+      throw new Error("rustc_codegen_js: entered unreachable code");
+  }
+  return _0;
+}
+// simple_match
+function x12_topcoat_match$simple_match$h64ae2e0ac47f8ee2(status, show_archived) {
+  let _0, _6;
+  _0 = tmpl$h70ecbd4edf573156();
+  _6 = [status, show_archived];
+  _$insert(_0, () => x12_topcoat_match$simple_match$closure_0$hc5164c7950833169(_6));
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

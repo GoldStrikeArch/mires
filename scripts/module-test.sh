@@ -29,7 +29,9 @@
 #   4. run both -- the script by concatenation, the module through
 #      scripts/run-esm.sh -- and diff the two outputs against each other.
 #
-# Set SKIP_BUILD=1 to reuse an already-built backend dylib.
+# Set SKIP_BUILD=1 to reuse an already-built backend dylib. MODULE_OPT_MODE=off|report|on (default
+# off) runs the whole comparison with the optimizer in that mode: the property under test — that
+# the module half and the script half are one program — has to hold with the passes on as well.
 
 set -uo pipefail
 
@@ -45,6 +47,34 @@ entry="$script_dir/entry.js"
 # The same baseline the emit goldens use, minus the module option each half sets.
 BASE_ARGS="js-names=readable js-comments=on"
 
+# The lane the caller asked for, passed through to every compilation here. `js-lane` is a link
+# step decision and not emit-affecting, so it needs no sysroot of its own; only `jir` is honoured,
+# since `shadow` writes two programs and this suite drives one. What the suite asserts is what the
+# program DOES, which is exactly what must not depend on the lane.
+lane_note=""
+case " ${JS_EXTRA_ARGS:-} " in
+*" js-lane=jir "*)
+	BASE_ARGS="$BASE_ARGS js-lane=jir"
+	lane_note="js-lane=jir"
+	;;
+esac
+
+# The optimizer mode, its own control rather than something read out of $JS_EXTRA_ARGS: the flags
+# here are pinned, so an option arriving through the environment would silently be dropped. Unlike
+# `js-lane`, `js-opt` IS emit-affecting, so `on` and `report` link against their own keyed sysroot,
+# built below. This suite has no text golden of its own — it compares the two halves of one
+# compilation against each other — so every mode runs every check.
+MODULE_OPT_MODE=${MODULE_OPT_MODE:-off}
+case "$MODULE_OPT_MODE" in
+off) ;;
+report | on) BASE_ARGS="$BASE_ARGS js-opt=$MODULE_OPT_MODE" ;;
+*)
+	echo "module-test.sh: MODULE_OPT_MODE must be off, report, or on" >&2
+	exit 2
+	;;
+esac
+echo "note: compiled with ${lane_note:-js-lane=baseline} js-opt=$MODULE_OPT_MODE"
+
 mkdir -p "$build_dir" "$log_dir"
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
@@ -54,6 +84,10 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
 		exit 1
 	fi
 fi
+
+# The keyed sysroot the NN.core fixtures link against: `js-names=readable`, and `js-opt` in the
+# two non-off modes, are emit-affecting and so key it.
+JS_EXTRA_ARGS="$BASE_ARGS" SKIP_BUILD=1 "$script_dir/build_sysroot.sh" >/dev/null
 
 selected=${1:-}
 if [ -n "$selected" ]; then

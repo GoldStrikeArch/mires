@@ -71,6 +71,24 @@ impl<'tcx> FnCx<'_, 'tcx> {
         // `Location` as a hidden trailing argument, and `base.rs`'s `params` binds it.
         let mut tracks_caller = false;
 
+        // Async markers keep ordinary safe Rust bodies in off/report mode. Report records the
+        // candidate but deliberately takes the same call path as off, so their JavaScript agrees.
+        if let ty::FnDef(def_id, _) = *func_ty.kind() {
+            if let Some(marker) = crate::host::host_section(tcx, def_id) {
+                if crate::host::is_async_marker(&marker)
+                    && crate::opts::get().analyzes(crate::opts::OptimizerPass::FuturePoller)
+                    && !crate::opts::get().applies(crate::opts::OptimizerPass::FuturePoller)
+                {
+                    if let Some(future) = args.first() {
+                        self.record_async_lane(
+                            self.operand_ty(&future.node),
+                            matches!(marker.as_str(), "spawnowner" | "spawnowner.v2"),
+                        );
+                    }
+                }
+            }
+        }
+
         let callee = match *func_ty.kind() {
             // A `view-abi` marker is recognized before anything else asks what the callee is: it
             // has a body, it resolves, and calling it would compile — it would just abort at run
@@ -86,13 +104,22 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 let marker = crate::map::map_section(tcx, def_id).expect("just matched");
                 return self.codegen_map_marker(&marker, args, destination);
             }
+            // The reusable dynamic host ABI is another marker family. It lives apart from the
+            // view ABI so a non-DOM program links none of that owner policy.
+            ty::FnDef(def_id, _)
+                if crate::host::host_section(tcx, def_id).is_some_and(|marker| {
+                    !crate::host::is_async_marker(&marker)
+                        || crate::opts::get().applies(crate::opts::OptimizerPass::FuturePoller)
+                }) =>
+            {
+                let marker = crate::host::host_section(tcx, def_id).expect("just matched");
+                return self.codegen_host_marker(&marker, def_id, args, destination);
+            }
             // A `#[js_extern]` declaration is recognized here for the same reason, and it has to be
             // here rather than later: its marker is an ordinary Rust function, so without this it
             // would resolve and emit a call to a body whose only statement is `unreachable!`.
             // See `crate::js_extern`.
-            ty::FnDef(def_id, _)
-                if crate::js_extern::extern_section(tcx, def_id).is_some() =>
-            {
+            ty::FnDef(def_id, _) if crate::js_extern::extern_section(tcx, def_id).is_some() => {
                 let body = crate::js_extern::extern_section(tcx, def_id).expect("just matched");
                 return self.codegen_js_extern(&body, args, destination);
             }
@@ -129,19 +156,15 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     };
                     // Not `expect_resolve`: an unresolvable callee is a diagnostic on this call,
                     // not an ICE in the backend.
-                    let instance = match Instance::try_resolve(
-                        tcx,
-                        typing_env(),
-                        def_id,
-                        bound_free_args,
-                    ) {
-                        Ok(Some(instance)) => instance,
-                        Ok(None) | Err(_) => {
-                            return vec![jsast::expr_stmt(
-                                self.zombie(format!("cannot resolve a call to `{func_ty}`")),
-                            )];
-                        }
-                    };
+                    let instance =
+                        match Instance::try_resolve(tcx, typing_env(), def_id, bound_free_args) {
+                            Ok(Some(instance)) => instance,
+                            Ok(None) | Err(_) => {
+                                return vec![jsast::expr_stmt(
+                                    self.zombie(format!("cannot resolve a call to `{func_ty}`")),
+                                )];
+                            }
+                        };
                     tracks_caller = instance.def.requires_caller_location(tcx);
                     match instance.def {
                         ty::InstanceKind::Intrinsic(def_id) => {
@@ -172,7 +195,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                                 Callee::Direct(self.cgu.namer.fn_name(fallback).into_string())
                             } else {
                                 return vec![jsast::expr_stmt(self.zombie(format!(
-                                    "intrinsic `{}` is not supported by rustc_codegen_mires",
+                                    "intrinsic `{}` is not supported by rustc_codegen_js",
                                     tcx.item_name(def_id)
                                 )))];
                             }
@@ -198,14 +221,33 @@ impl<'tcx> FnCx<'_, 'tcx> {
             return Vec::new();
         }
 
+        let virtual_call = matches!(&callee, Callee::Virtual(_));
+        let owned_virtual_receiver = virtual_call
+            && args
+                .first()
+                .is_some_and(|arg| self.codegen_virtual_receiver(&arg.node).1);
         let mut arguments = if is_rust_call {
-            self.splat_rust_call_args(args)
+            self.splat_rust_call_args(args, virtual_call)
         } else {
             // Each argument reports against its own span rather than the callee's.
-            args.iter().map(|arg| self.at(arg.span, || self.codegen_operand(&arg.node))).collect()
+            args.iter()
+                .enumerate()
+                .map(|(index, arg)| {
+                    self.at(arg.span, || {
+                        if virtual_call && index == 0 {
+                            self.codegen_virtual_receiver(&arg.node).0
+                        } else {
+                            self.codegen_operand(&arg.node)
+                        }
+                    })
+                })
+                .collect()
         };
         if tracks_caller {
-            arguments.push(crate::intrinsics::caller_location_argument(self, self.span()));
+            arguments.push(crate::intrinsics::caller_location_argument(
+                self,
+                self.span(),
+            ));
         }
 
         // A virtual call reads its receiver three times (twice for the vtable, once for the
@@ -223,7 +265,16 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 };
                 let (bind, receiver) = self.temp(receiver.clone());
                 out.push(bind);
-                let mut call_args = vec![jsast::member(receiver.clone(), "ptr")];
+                let data = jsast::member(receiver.clone(), "ptr");
+                // An unsized by-value receiver (`move *Box<dyn Trait>`) is the one virtual ABI
+                // that consumes the concrete allocation through its raw pointer. Every borrowed
+                // receiver keeps the reference-form data half stored in the fat pointer.
+                let data = if owned_virtual_receiver {
+                    jsast::rt_call("unref", vec![data])
+                } else {
+                    data
+                };
+                let mut call_args = vec![data];
                 call_args.extend(rest.iter().cloned());
                 jsast::call(vtable_slot(receiver, idx as f64), call_args)
             }
@@ -233,7 +284,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
         if diverges {
             // A call that never returns: the shim's `js_abort` throws, so nothing follows it.
             out.push(jsast::expr_stmt(call));
-            out.push(jsast::throw_error("rustc_codegen_mires: diverging call returned"));
+            out.push(jsast::throw_abort(
+                "rustc_codegen_js: diverging call returned",
+            ));
         } else {
             out.extend(self.write_place(destination, call));
         }
@@ -261,19 +314,30 @@ impl<'tcx> FnCx<'_, 'tcx> {
     }
 
     /// Splats the argument tuple of a `"rust-call"` callee into one argument per element.
-    fn splat_rust_call_args(&self, args: &[Spanned<mir::Operand<'tcx>>]) -> Vec<Expr> {
+    fn splat_rust_call_args(
+        &self,
+        args: &[Spanned<mir::Operand<'tcx>>],
+        virtual_call: bool,
+    ) -> Vec<Expr> {
         let (self_arg, pack) = match args {
             [pack] => (None, pack),
             [self_arg, pack] => (Some(self_arg), pack),
             _ => {
-                return vec![
-                    self.zombie("a `\"rust-call\"` function takes one or two arguments".to_string()),
-                ];
+                return vec![self
+                    .zombie("a `\"rust-call\"` function takes one or two arguments".to_string())];
             }
         };
 
         let mut out = Vec::new();
-        out.extend(self_arg.map(|arg| self.at(arg.span, || self.codegen_operand(&arg.node))));
+        out.extend(self_arg.map(|arg| {
+            self.at(arg.span, || {
+                if virtual_call {
+                    self.codegen_virtual_receiver(&arg.node).0
+                } else {
+                    self.codegen_operand(&arg.node)
+                }
+            })
+        }));
 
         self.at(pack.span, || {
             let pack = &pack.node;
@@ -289,6 +353,16 @@ impl<'tcx> FnCx<'_, 'tcx> {
             // element is copied exactly as `Operand::Copy` of that field would be.
             let pack_value = self.codegen_operand_aliased(pack);
             for (i, element_ty) in element_tys.iter().enumerate() {
+                if crate::value::is_zst(self.tcx, pack_ty) {
+                    // The erased tuple has no fields to index. Evaluate its operand once before
+                    // passing the separate zero-sized parameters.
+                    out.push(if i == 0 {
+                        jsast::seq(vec![pack_value.clone(), jsast::undefined()])
+                    } else {
+                        jsast::undefined()
+                    });
+                    continue;
+                }
                 let element = jsast::index(pack_value.clone(), jsast::num(i as f64));
                 out.push(if crate::value::needs_clone(self.tcx, element_ty) {
                     crate::value::clone_expr(self.tcx, element_ty, element)
@@ -340,7 +414,10 @@ const MARKER_PREFIX: &str = "rcgjs.tc.";
 /// The marker `def_id` is, by the `link_section` it carries.
 fn marker_section(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
     let section = tcx.codegen_fn_attrs(def_id).link_section?;
-    section.as_str().strip_prefix(MARKER_PREFIX).map(str::to_owned)
+    section
+        .as_str()
+        .strip_prefix(MARKER_PREFIX)
+        .map(str::to_owned)
 }
 
 /// How a `view_abi::text` value of type `ty` becomes a JavaScript string, or `None` for a type that
@@ -373,9 +450,10 @@ fn text_conversion<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, value: Expr) -> Option
         }
         // A `char` is a code point NUMBER in the value model, so `String(x)` would print the
         // number: `'J'` would render as `74`. Rust's `Display` for a `char` is the character.
-        ty::Char => {
-            Some(jsast::call(jsast::id("String.fromCodePoint".to_owned()), vec![value]))
-        }
+        ty::Char => Some(jsast::call(
+            jsast::id("String.fromCodePoint".to_owned()),
+            vec![value],
+        )),
         // `String(x)` is Rust's `Display` for every one of these.
         ty::Bool | ty::Int(_) | ty::Uint(_) | ty::Float(_) => {
             Some(jsast::call(jsast::id("String".to_owned()), vec![value]))
@@ -427,14 +505,22 @@ pub(crate) fn consumed_locals<'tcx>(
         let mir::TerminatorKind::Call { func, args, .. } = &block.terminator().kind else {
             continue;
         };
-        let ty::FnDef(def_id, _) = *func.ty(&mir.local_decls, tcx).kind() else { continue };
-        let Some(marker) = marker_section(tcx, def_id) else { continue };
+        let ty::FnDef(def_id, _) = *func.ty(&mir.local_decls, tcx).kind() else {
+            continue;
+        };
+        let Some(marker) = marker_section(tcx, def_id) else {
+            continue;
+        };
 
         for &index in consumed_arguments(&marker) {
-            let Some(argument) = args.get(index) else { continue };
+            let Some(argument) = args.get(index) else {
+                continue;
+            };
             let mut place = argument.node.place();
             for _ in 0..MAX_STEPS {
-                let Some(local) = place.and_then(|place| place.as_local()) else { break };
+                let Some(local) = place.and_then(|place| place.as_local()) else {
+                    break;
+                };
                 if !uses.inlinable(local) {
                     break;
                 }
@@ -453,7 +539,9 @@ pub(crate) fn consumed_locals<'tcx>(
 fn assigned_place<'tcx>(mir: &mir::Body<'tcx>, local: mir::Local) -> Option<mir::Place<'tcx>> {
     for block in mir.basic_blocks.iter() {
         for statement in &block.statements {
-            let mir::StatementKind::Assign(assignment) = &statement.kind else { continue };
+            let mir::StatementKind::Assign(assignment) = &statement.kind else {
+                continue;
+            };
             let (place, rvalue) = &**assignment;
             if place.as_local() != Some(local) {
                 continue;
@@ -469,18 +557,19 @@ fn assigned_place<'tcx>(mir: &mir::Body<'tcx>, local: mir::Local) -> Option<mir:
 }
 
 /// The operand `local`'s one assignment reads, when that assignment is a plain move or copy.
-fn assigned_operand<'tcx>(
-    mir: &mir::Body<'tcx>,
-    local: mir::Local,
-) -> Option<mir::Operand<'tcx>> {
+fn assigned_operand<'tcx>(mir: &mir::Body<'tcx>, local: mir::Local) -> Option<mir::Operand<'tcx>> {
     for block in mir.basic_blocks.iter() {
         for statement in &block.statements {
-            let mir::StatementKind::Assign(assignment) = &statement.kind else { continue };
+            let mir::StatementKind::Assign(assignment) = &statement.kind else {
+                continue;
+            };
             let (place, rvalue) = &**assignment;
             if place.as_local() != Some(local) {
                 continue;
             }
-            let mir::Rvalue::Use(operand, _) = rvalue else { return None };
+            let mir::Rvalue::Use(operand, _) = rvalue else {
+                return None;
+            };
             return Some(operand.clone());
         }
     }
@@ -523,7 +612,10 @@ impl Instantiation {
     /// Asked once the body has been lowered: a group that never completed is one whose writes were
     /// buffered and never emitted, which is a miscompilation rather than a missing optimization.
     pub(crate) fn incomplete_group(&self) -> Option<u32> {
-        self.awaited.iter().find(|(_, holes)| !holes.is_empty()).map(|(group, _)| *group)
+        self.awaited
+            .iter()
+            .find(|(_, holes)| !holes.is_empty())
+            .map(|(group, _)| *group)
     }
 }
 
@@ -555,7 +647,10 @@ impl Fill {
     /// the other: the sink calls what it is given.
     fn accessor(&self) -> Expr {
         match self {
-            Fill::Once(value) | Fill::Tracked { accessor: value, .. } => value.clone(),
+            Fill::Once(value)
+            | Fill::Tracked {
+                accessor: value, ..
+            } => value.clone(),
         }
     }
 
@@ -613,6 +708,8 @@ impl<'tcx> FnCx<'_, 'tcx> {
             "hole" | "handler" | "component" => self.codegen_fill(args, false),
             "effect" => self.codegen_fill(args, true),
             "signal" => self.codegen_signal(args, destination),
+            "selector" => self.codegen_selector(args, destination),
+            "selis" => self.codegen_selector_read(args, destination),
             "sget" => self.codegen_signal_read(args, destination),
             "sset" => self.codegen_signal_write(args),
             "etv" => self.codegen_event_target_value(args, destination),
@@ -623,7 +720,38 @@ impl<'tcx> FnCx<'_, 'tcx> {
             "list" => self.codegen_list(destination),
             "push" => self.codegen_push(args),
             "pushkeyed" => self.codegen_push_keyed(def_id, args),
+            "keyedlist.v1" => {
+                // The baseline remains an explicit poison, but it must intern every import the
+                // JIR lane may select. Link-time lowering cannot add module items after the
+                // reachability table has been built.
+                let mut prepared = [
+                    "batch",
+                    "createRoot",
+                    "createSignal",
+                    "effect",
+                    "onCleanup",
+                    "untrack",
+                ]
+                .into_iter()
+                .map(|name| crate::template::dom_import(self.cgu, name))
+                .collect::<Vec<_>>();
+                for argument in args {
+                    let Ok((callable, _)) = self.closure_thunk(&argument.node) else {
+                        return poison(
+                            "keyed.callable-unavailable: a keyed-list callable cannot be emitted"
+                                .to_string(),
+                        );
+                    };
+                    prepared.push(callable);
+                }
+                prepared.push(self.zombie(
+                    "keyed.runtime-lane-not-ready: the version-one keyed-list marker is v2-only and not executable yet"
+                        .to_string(),
+                ));
+                vec![jsast::expr_stmt(jsast::seq(prepared))]
+            }
             "micro" => self.codegen_microtask(args),
+            "cleanup" => self.codegen_cleanup(args),
             "settled" => self.codegen_settled(args),
             "owner" => self.codegen_owner(destination),
             "withowner" => self.codegen_with_owner(args),
@@ -640,7 +768,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
         args: &[Spanned<mir::Operand<'tcx>>],
         destination: mir::Place<'tcx>,
     ) -> Vec<Stmt> {
-        use crate::template::{NodeKind, Step, Template, Walk, dom_import};
+        use crate::template::{dom_import, NodeKind, Step, Template, Walk};
 
         // The imports below are ES module items. In script output they would be a syntax error in
         // the file rather than a wrong value, so the whole instantiation is refused instead.
@@ -653,10 +781,12 @@ impl<'tcx> FnCx<'_, 'tcx> {
         }
 
         let Some(def_id) = self.static_argument(args.first()) else {
-            return vec![jsast::expr_stmt(self.zombie(
-                "the first argument of `view_abi::template` is not a reference to a `static`"
-                    .to_string(),
-            ))];
+            return vec![jsast::expr_stmt(
+                self.zombie(
+                    "the first argument of `view_abi::template` is not a reference to a `static`"
+                        .to_string(),
+                ),
+            )];
         };
         let template = match Template::read(self.tcx, def_id) {
             Ok(template) => template,
@@ -690,8 +820,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
             .holes
             .iter()
             .filter(|hole| {
-                hole.kind.inserts_a_node()
-                    && tree.kind_at(&hole.path) == Some(NodeKind::MarkerOpen)
+                hole.kind.inserts_a_node() && tree.kind_at(&hole.path) == Some(NodeKind::MarkerOpen)
             })
             .map(|hole| {
                 let mut path = hole.path.clone();
@@ -751,18 +880,24 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 // reaching anything else is the sole child of the element it reached.
                 let anchored = hole.kind.inserts_a_node() && kind.is_comment();
                 let parent = match anchored {
-                    true => Some(hole.anchor_parent().and_then(|path| walk.at(path)).ok_or_else(
-                        || {
-                            format!(
-                                "the anchor its walk `{rendered}` reaches is not inside an \
+                    true => Some(
+                        hole.anchor_parent()
+                            .and_then(|path| walk.at(path))
+                            .ok_or_else(|| {
+                                format!(
+                                    "the anchor its walk `{rendered}` reaches is not inside an \
                                  element of the template `{}`",
-                                template.html
-                            )
-                        },
-                    )?),
+                                    template.html
+                                )
+                            })?,
+                    ),
                     false => None,
                 };
-                Ok(HoleTarget { node, parent, pair: walk.marker_pair(&hole.path) })
+                Ok(HoleTarget {
+                    node,
+                    parent,
+                    pair: walk.marker_pair(&hole.path),
+                })
             })
             .collect();
 
@@ -794,7 +929,12 @@ impl<'tcx> FnCx<'_, 'tcx> {
         if let Some(local) = destination.as_local() {
             self.templates.borrow_mut().insert(
                 local,
-                Instantiation { template, targets, awaited, arrived: Default::default() },
+                Instantiation {
+                    template,
+                    targets,
+                    awaited,
+                    arrived: Default::default(),
+                },
             );
         }
         out
@@ -805,29 +945,33 @@ impl<'tcx> FnCx<'_, 'tcx> {
         use crate::template::HoleKind;
 
         let [root, index, value] = args else {
-            return vec![jsast::expr_stmt(
-                self.zombie("a `view-abi` hole marker takes three arguments".to_string()),
-            )];
+            return vec![jsast::expr_stmt(self.zombie(
+                "a `view-abi` hole marker takes three arguments".to_string(),
+            ))];
         };
 
         let Some(local) = self.node_local(&root.node) else {
-            return vec![jsast::expr_stmt(self.zombie(
-                "the `root` of a `view-abi` hole marker does not name an instantiated template"
-                    .to_string(),
-            ))];
+            return vec![jsast::expr_stmt(
+                self.zombie(
+                    "the `root` of a `view-abi` hole marker does not name an instantiated template"
+                        .to_string(),
+                ),
+            )];
         };
         let Some(index) = self.constant_u32(&index.node) else {
-            return vec![jsast::expr_stmt(
-                self.zombie("the index of a `view-abi` hole marker is not a constant".to_string()),
-            )];
+            return vec![jsast::expr_stmt(self.zombie(
+                "the index of a `view-abi` hole marker is not a constant".to_string(),
+            ))];
         };
 
         let templates = self.templates.borrow();
         let Some(instantiation) = templates.get(&local) else {
-            return vec![jsast::expr_stmt(self.zombie(
-                "the `root` of a `view-abi` hole marker does not name an instantiated template"
-                    .to_string(),
-            ))];
+            return vec![jsast::expr_stmt(
+                self.zombie(
+                    "the `root` of a `view-abi` hole marker does not name an instantiated template"
+                        .to_string(),
+                ),
+            )];
         };
         let Some(hole) = instantiation.template.holes.get(index as usize) else {
             return vec![jsast::expr_stmt(self.zombie(format!(
@@ -844,7 +988,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
             }
         };
         let hole = hole.clone();
-        let shared = hole.effect_group.filter(|group| instantiation.awaited.contains_key(group));
+        let shared = hole
+            .effect_group
+            .filter(|group| instantiation.awaited.contains_key(group));
         drop(templates);
 
         // What the sink is decides how the value is lowered, not just whether the hole is
@@ -875,9 +1021,19 @@ impl<'tcx> FnCx<'_, 'tcx> {
             return self.write_hole(&hole, &target, fill);
         };
         let mut templates = self.templates.borrow_mut();
-        let Some(instantiation) = templates.get_mut(&local) else { return Vec::new() };
-        instantiation.awaited.entry(group).or_default().retain(|waiting| *waiting != index as usize);
-        instantiation.arrived.entry(group).or_default().push(Write { hole, target, fill });
+        let Some(instantiation) = templates.get_mut(&local) else {
+            return Vec::new();
+        };
+        instantiation
+            .awaited
+            .entry(group)
+            .or_default()
+            .retain(|waiting| *waiting != index as usize);
+        instantiation
+            .arrived
+            .entry(group)
+            .or_default()
+            .push(Write { hole, target, fill });
         if !instantiation.awaited[&group].is_empty() {
             return Vec::new();
         }
@@ -894,7 +1050,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// same section names: they take the previous value and their result *is* what is recorded, so
     /// they are called unconditionally.
     fn write_group(&self, writes: Vec<Write>) -> Vec<Stmt> {
-        use crate::template::{HoleKind, dom_import};
+        use crate::template::{dom_import, HoleKind};
 
         /// The record parameter, and the name of the local holding hole `index`'s value. Both are
         /// upstream's spelling, so that a diff against the reference output is about the code.
@@ -957,13 +1113,21 @@ impl<'tcx> FnCx<'_, 'tcx> {
             .collect();
         vec![jsast::expr_stmt(jsast::call(
             dom_import(self.cgu, "effect"),
-            vec![jsast::arrow_block(vec![RECORD.to_owned()], body), jsast::object(seed)],
+            vec![
+                jsast::arrow_block(vec![RECORD.to_owned()], body),
+                jsast::object(seed),
+            ],
         ))]
     }
 
     /// The statements that fill one located hole.
-    fn write_hole(&self, hole: &crate::template::Hole, target: &HoleTarget, fill: Fill) -> Vec<Stmt> {
-        use crate::template::{HoleKind, dom_import};
+    fn write_hole(
+        &self,
+        hole: &crate::template::Hole,
+        target: &HoleTarget,
+        fill: Fill,
+    ) -> Vec<Stmt> {
+        use crate::template::{dom_import, HoleKind};
 
         let node = target.node.clone();
         let name = || jsast::string(hole.name.clone());
@@ -1047,7 +1211,10 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 vec![node.clone(), name(), fill.value()],
             ))],
             HoleKind::Property => {
-                vec![wrap(jsast::assign(jsast::index(node.clone(), name()), fill.value()))]
+                vec![wrap(jsast::assign(
+                    jsast::index(node.clone(), name()),
+                    fill.value(),
+                ))]
             }
             // A delegated handler is a property the runtime's one document listener reads, never
             // a listener of its own (CONTRACT-DOM 7.2).
@@ -1064,7 +1231,12 @@ impl<'tcx> FnCx<'_, 'tcx> {
             HoleKind::Style => vec![wrap_diffing("style")],
             HoleKind::Spread => vec![jsast::expr_stmt(jsast::call(
                 dom_import(self.cgu, "spread"),
-                vec![node, fill.accessor(), jsast::boolean(false), jsast::boolean(false)],
+                vec![
+                    node,
+                    fill.accessor(),
+                    jsast::boolean(false),
+                    jsast::boolean(false),
+                ],
             ))],
         }
     }
@@ -1084,8 +1256,46 @@ impl<'tcx> FnCx<'_, 'tcx> {
             )];
         };
         let init = self.at(init.span, || self.codegen_operand(&init.node));
-        let call = jsast::call(crate::template::dom_import(self.cgu, "createSignal"), vec![init]);
+        let call = jsast::call(
+            crate::template::dom_import(self.cgu, "createSignal"),
+            vec![init],
+        );
         self.write_place(destination, call)
+    }
+
+    /// `selector(sig)`: a key-specific predicate backed by the signal's read half.
+    fn codegen_selector(
+        &self,
+        args: &[Spanned<mir::Operand<'tcx>>],
+        destination: mir::Place<'tcx>,
+    ) -> Vec<Stmt> {
+        let [signal] = args else {
+            return vec![jsast::expr_stmt(
+                self.zombie("`view_abi::selector` takes one signal".to_string()),
+            )];
+        };
+        let signal = self.at(signal.span, || self.codegen_operand(&signal.node));
+        let call = jsast::call(
+            crate::template::dom_import(self.cgu, "createSelector"),
+            vec![jsast::index(signal, jsast::num(0))],
+        );
+        self.write_place(destination, call)
+    }
+
+    /// `selector_is(selector, value)`: subscribe to one key of a selector.
+    fn codegen_selector_read(
+        &self,
+        args: &[Spanned<mir::Operand<'tcx>>],
+        destination: mir::Place<'tcx>,
+    ) -> Vec<Stmt> {
+        let [selector, value] = args else {
+            return vec![jsast::expr_stmt(self.zombie(
+                "`view_abi::selector_is` takes a selector and a value".to_string(),
+            ))];
+        };
+        let selector = self.at(selector.span, || self.codegen_operand(&selector.node));
+        let value = self.at(value.span, || self.codegen_operand(&value.node));
+        self.write_place(destination, jsast::call(selector, vec![value]))
     }
 
     /// `sig_get(&sig)`: the read half of the pair, called.
@@ -1121,12 +1331,15 @@ impl<'tcx> FnCx<'_, 'tcx> {
         destination: mir::Place<'tcx>,
     ) -> Vec<Stmt> {
         let [event] = args else {
-            return vec![jsast::expr_stmt(
-                self.zombie("`view_abi::event_target_value` takes one argument".to_string()),
-            )];
+            return vec![jsast::expr_stmt(self.zombie(
+                "`view_abi::event_target_value` takes one argument".to_string(),
+            ))];
         };
         let event = self.at(event.span, || self.codegen_operand(&event.node));
-        let value = jsast::member(jsast::member(event, "target".to_owned()), "value".to_owned());
+        let value = jsast::member(
+            jsast::member(event, "target".to_owned()),
+            "value".to_owned(),
+        );
         let text = jsast::binary(jsast::BinOp::Or, value, jsast::string(""));
         self.write_place(destination, text)
     }
@@ -1134,12 +1347,15 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// `event_prevent_default(event)`: `event.preventDefault()`.
     fn codegen_event_prevent_default(&self, args: &[Spanned<mir::Operand<'tcx>>]) -> Vec<Stmt> {
         let [event] = args else {
-            return vec![jsast::expr_stmt(
-                self.zombie("`view_abi::event_prevent_default` takes one argument".to_string()),
-            )];
+            return vec![jsast::expr_stmt(self.zombie(
+                "`view_abi::event_prevent_default` takes one argument".to_string(),
+            ))];
         };
         let event = self.at(event.span, || self.codegen_operand(&event.node));
-        let call = jsast::call(jsast::member(event, "preventDefault".to_owned()), Vec::new());
+        let call = jsast::call(
+            jsast::member(event, "preventDefault".to_owned()),
+            Vec::new(),
+        );
         vec![jsast::expr_stmt(call)]
     }
 
@@ -1152,7 +1368,10 @@ impl<'tcx> FnCx<'_, 'tcx> {
         };
         let sig = self.at(sig.span, || self.codegen_operand(&sig.node));
         let value = self.at(value.span, || self.codegen_operand(&value.node));
-        vec![jsast::expr_stmt(jsast::call(jsast::index(sig, jsast::num(1)), vec![value]))]
+        vec![jsast::expr_stmt(jsast::call(
+            jsast::index(sig, jsast::num(1)),
+            vec![value],
+        ))]
     }
 
     /// `content(value)`: the value a branch or a row contributes, erased to one type.
@@ -1337,15 +1556,11 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// the text it renders as, and `__rt.keyed_row` holds one cache per loop. The site number is
     /// what separates two loops' caches; it is per call site, and a `for` has exactly one
     /// `push_keyed` in it, so per call site IS per loop.
-    fn codegen_push_keyed(
-        &self,
-        def_id: DefId,
-        args: &[Spanned<mir::Operand<'tcx>>],
-    ) -> Vec<Stmt> {
+    fn codegen_push_keyed(&self, def_id: DefId, args: &[Spanned<mir::Operand<'tcx>>]) -> Vec<Stmt> {
         let [list, key, row] = args else {
-            return vec![jsast::expr_stmt(
-                self.zombie("`view_abi::push_keyed` takes a list, a key and a row".to_string()),
-            )];
+            return vec![jsast::expr_stmt(self.zombie(
+                "`view_abi::push_keyed` takes a list, a key and a row".to_string(),
+            ))];
         };
         let Some(local) = self.node_local(&list.node) else {
             return vec![jsast::expr_stmt(self.zombie(
@@ -1384,8 +1599,27 @@ impl<'tcx> FnCx<'_, 'tcx> {
         };
         match self.at(f.span, || self.closure_thunk(&f.node)) {
             Ok((arrow, _)) => {
-                vec![jsast::expr_stmt(jsast::rt_call("microtask".to_owned(), vec![arrow]))]
+                vec![jsast::expr_stmt(jsast::rt_call(
+                    "microtask".to_owned(),
+                    vec![arrow],
+                ))]
             }
+            Err(err) => vec![jsast::expr_stmt(self.zombie(err))],
+        }
+    }
+
+    /// `on_cleanup(f)`: `_$onCleanup(() => f())`.
+    fn codegen_cleanup(&self, args: &[Spanned<mir::Operand<'tcx>>]) -> Vec<Stmt> {
+        let [f] = args else {
+            return vec![jsast::expr_stmt(
+                self.zombie("`view_abi::on_cleanup` takes one closure".to_string()),
+            )];
+        };
+        match self.at(f.span, || self.closure_thunk(&f.node)) {
+            Ok((arrow, _)) => vec![jsast::expr_stmt(jsast::call(
+                crate::template::dom_import(self.cgu, "onCleanup"),
+                vec![arrow],
+            ))],
             Err(err) => vec![jsast::expr_stmt(self.zombie(err))],
         }
     }
@@ -1397,14 +1631,17 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// settling means; see `runtime/shim.js`.
     fn codegen_settled(&self, args: &[Spanned<mir::Operand<'tcx>>]) -> Vec<Stmt> {
         let [value, f] = args else {
-            return vec![jsast::expr_stmt(
-                self.zombie("`view_abi::on_settled` takes a value and a closure".to_string()),
-            )];
+            return vec![jsast::expr_stmt(self.zombie(
+                "`view_abi::on_settled` takes a value and a closure".to_string(),
+            ))];
         };
         let value = self.at(value.span, || self.codegen_operand(&value.node));
         match self.at(f.span, || self.closure_thunk(&f.node)) {
             Ok((arrow, _)) => {
-                vec![jsast::expr_stmt(jsast::rt_call("settled".to_owned(), vec![value, arrow]))]
+                vec![jsast::expr_stmt(jsast::rt_call(
+                    "settled".to_owned(),
+                    vec![value, arrow],
+                ))]
             }
             Err(err) => vec![jsast::expr_stmt(self.zombie(err))],
         }
@@ -1412,8 +1649,10 @@ impl<'tcx> FnCx<'_, 'tcx> {
 
     /// `owner()`: `_$getOwner()`, the reactive owner the caller is running under.
     fn codegen_owner(&self, destination: mir::Place<'tcx>) -> Vec<Stmt> {
-        let call =
-            jsast::call(crate::template::dom_import(self.cgu, "getOwner"), Vec::new());
+        let call = jsast::call(
+            crate::template::dom_import(self.cgu, "getOwner"),
+            Vec::new(),
+        );
         self.write_place(destination, call)
     }
 
@@ -1424,9 +1663,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// module that forwards only the web build has to add it.
     fn codegen_with_owner(&self, args: &[Spanned<mir::Operand<'tcx>>]) -> Vec<Stmt> {
         let [owner, f] = args else {
-            return vec![jsast::expr_stmt(
-                self.zombie("`view_abi::with_owner` takes an owner and a closure".to_string()),
-            )];
+            return vec![jsast::expr_stmt(self.zombie(
+                "`view_abi::with_owner` takes an owner and a closure".to_string(),
+            ))];
         };
         let owner = self.at(owner.span, || self.codegen_operand(&owner.node));
         match self.at(f.span, || self.closure_thunk(&f.node)) {
@@ -1478,7 +1717,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
     fn source_order(&self, def_id: DefId) -> Option<crate::item::SourceOrder> {
         let loc = crate::names::location_of(self.tcx, self.tcx.def_span(def_id).source_callsite())?;
         let name = self.tcx.item_name(def_id);
-        let digits = name.as_str().trim_start_matches(|c: char| !c.is_ascii_digit());
+        let digits = name
+            .as_str()
+            .trim_start_matches(|c: char| !c.is_ascii_digit());
         Some(crate::item::SourceOrder {
             file: loc.file,
             line: loc.line,
@@ -1519,7 +1760,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
             if self.templates.borrow().contains_key(&local) {
                 return Some(local);
             }
-            let Some(next) = self.assigned_from(local) else { return Some(local) };
+            let Some(next) = self.assigned_from(local) else {
+                return Some(local);
+            };
             local = next;
         }
         Some(local)
@@ -1529,7 +1772,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
     fn assigned_from(&self, local: mir::Local) -> Option<mir::Local> {
         for block in self.mir.basic_blocks.iter() {
             for statement in &block.statements {
-                let mir::StatementKind::Assign(assignment) = &statement.kind else { continue };
+                let mir::StatementKind::Assign(assignment) = &statement.kind else {
+                    continue;
+                };
                 let (place, rvalue) = &**assignment;
                 if place.as_local() != Some(local) {
                     continue;
@@ -1538,7 +1783,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     mir::Rvalue::Ref(_, _, source) | mir::Rvalue::CopyForDeref(source) => {
                         source.as_local()
                     }
-                    mir::Rvalue::Use(operand, _) => operand.place().and_then(|place| place.as_local()),
+                    mir::Rvalue::Use(operand, _) => {
+                        operand.place().and_then(|place| place.as_local())
+                    }
                     _ => None,
                 };
             }
@@ -1576,7 +1823,6 @@ impl<'tcx> FnCx<'_, 'tcx> {
         None
     }
 
-
     /// The two forms of the closure a marker was handed: `(...args) => body(env, ...args)` and the
     /// call `body(env)` alone.
     ///
@@ -1601,7 +1847,10 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// # Errors
     ///
     /// Returns a message naming the type that was passed where a closure was expected.
-    fn closure_thunk(&self, operand: &mir::Operand<'tcx>) -> Result<(Expr, Expr), String> {
+    pub(crate) fn closure_thunk(
+        &self,
+        operand: &mir::Operand<'tcx>,
+    ) -> Result<(Expr, Expr), String> {
         let ty = self.operand_ty(operand);
         let (instance, has_environment) = match *ty.kind() {
             ty::Closure(def_id, generic_args) => (Instance::new_raw(def_id, generic_args), true),
@@ -1625,13 +1874,20 @@ impl<'tcx> FnCx<'_, 'tcx> {
             }
         };
 
-        if !self.tcx.is_mir_available(instance.def_id()) {
-            return Err(format!("`{ty}` has no MIR, so its body cannot be emitted"));
-        }
-        // The body's arguments are its environment (for a closure) and then the ones a caller
-        // splats out of the `"rust-call"` tuple.
-        let mir = self.tcx.instance_mir(instance.def);
-        let arity = mir.arg_count.saturating_sub(usize::from(has_environment));
+        let arity = if has_environment {
+            if !self.tcx.is_mir_available(instance.def_id()) {
+                return Err(format!("`{ty}` has no MIR, so its body cannot be emitted"));
+            }
+            // Closure MIR splats the rust-call tuple after its environment argument.
+            self.tcx
+                .instance_mir(instance.def)
+                .arg_count
+                .saturating_sub(1)
+        } else {
+            // An external non-generic function is already compiled in its rlib. Its signature
+            // remains available even when its body was not exported as MIR.
+            ty.fn_sig(self.tcx).skip_binder().inputs().len()
+        };
 
         // Every marker that is handed a closure calls it (`cond`, `effect`, `handler`), so the
         // monomorphization collector has already walked into the body and everything it calls, and
@@ -1662,7 +1918,6 @@ impl<'tcx> FnCx<'_, 'tcx> {
         };
         Ok((arrow, call))
     }
-
 }
 
 #[cfg(test)]
@@ -1685,7 +1940,11 @@ mod tests {
     #[test]
     fn record_keys_are_distinct() {
         let keys: std::collections::BTreeSet<String> = (0..200).map(record_key).collect();
-        assert_eq!(keys.len(), 200, "a key is what tells one write of a group from another");
+        assert_eq!(
+            keys.len(),
+            200,
+            "a key is what tells one write of a group from another"
+        );
     }
 
     #[test]

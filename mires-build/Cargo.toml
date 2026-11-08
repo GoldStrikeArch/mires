@@ -6,3 +6,7 @@ edition = "2021"
 [dependencies]
 # The `Display` impls for `BuildError`, which carry the fix-it commands.
 thiserror = "2.0.19"
+rcgjs-object = { path = "../rcgjs-object" }
+
+[lints]
+workspace = true

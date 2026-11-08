@@ -12,8 +12,8 @@ pub enum Step {
     Backend,
     /// The sysroot holding the `core` the backend compiled.
     Sysroot,
-    /// The `#[js_extern]` proc macro, built for the host that runs it.
-    ExternMacro,
+    /// The view macros, built for the host that runs them.
+    ViewMacros,
 }
 
 impl Step {
@@ -23,7 +23,7 @@ impl Step {
         Self::Toolchain,
         Self::Backend,
         Self::Sysroot,
-        Self::ExternMacro,
+        Self::ViewMacros,
     ];
 
     /// A short name for the step, for progress output.
@@ -33,7 +33,7 @@ impl Step {
             Self::Toolchain => "toolchain",
             Self::Backend => "backend",
             Self::Sysroot => "sysroot",
-            Self::ExternMacro => "js-extern macro",
+            Self::ViewMacros => "view macros",
         }
     }
 }
@@ -132,6 +132,18 @@ impl Fix {
         self
     }
 
+    /// Set an environment variable when `value` is present.
+    pub(crate) fn maybe_env(
+        self,
+        key: impl Into<String>,
+        value: Option<impl Into<String>>,
+    ) -> Self {
+        match value {
+            Some(value) => self.env(key, value),
+            None => self,
+        }
+    }
+
     /// Run the command in `dir`.
     pub(crate) fn dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.dir = Some(dir.into());
@@ -216,13 +228,13 @@ mod tests {
 
     #[test]
     fn a_command_with_a_directory_prints_the_cd_that_reaches_it() {
-        let fix = Fix::new(Step::ExternMacro, "cargo")
-            .args(["build", "--release", "-p", "js-extern-macro"])
+        let fix = Fix::new(Step::ViewMacros, "cargo")
+            .args(["build", "--release", "-p", "view-dom-macro"])
             .dir("/spike");
 
         assert_eq!(
             fix.to_string(),
-            "cd /spike && cargo build --release -p js-extern-macro"
+            "cd /spike && cargo build --release -p view-dom-macro"
         );
         assert_eq!(fix.directory(), Some(Path::new("/spike")));
     }
@@ -278,6 +290,6 @@ mod tests {
         assert_eq!(Step::Toolchain.label(), "toolchain");
         assert_eq!(Step::Backend.label(), "backend");
         assert_eq!(Step::Sysroot.label(), "sysroot");
-        assert_eq!(Step::ExternMacro.label(), "js-extern macro");
+        assert_eq!(Step::ViewMacros.label(), "view macros");
     }
 }

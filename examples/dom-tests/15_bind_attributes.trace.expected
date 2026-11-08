@@ -1,0 +1,23 @@
+{"$record":"header","$generatedBy":"scripts/dom-trace.mjs","$what":"Normalized runtime-call trace of a rustc_codegen_js-compiled client module executed against contract/harness/trace.mjs.","fixture":"domtest/15_bind_attributes","label":"domtest/15_bind_attributes","freeBindingsHealed":[],"status":"completed","error":null,"recordCount":22}
+{"op":"template","tmpl":"tmpl#0","html":"<p>A fullstack Rust framework.</p>"}
+{"op":"template","tmpl":"tmpl#1","html":"<input type=\"checkbox\">"}
+{"op":"template","tmpl":"tmpl#2","html":"<div></div>"}
+{"op":"template","tmpl":"tmpl#3","html":"<button>Save</button>"}
+{"op":"template.clone","tmpl":"tmpl#0","result":"tmpl#0:root"}
+{"op":"effect","fn":"fn#0","init":"undefined","options":"undefined"}
+{"op":"effect.ran","fn":"fn#0","returned":true}
+{"op":"template.clone","tmpl":"tmpl#1","result":"tmpl#1:root"}
+{"op":"effect","fn":"fn#1","init":"undefined","options":"undefined"}
+{"op":"effect.ran","fn":"fn#1","returned":false}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"effect","fn":"fn#2","init":"undefined","options":"undefined"}
+{"op":"classList","node":"tmpl#2:root","value":"off","prev":"undefined"}
+{"op":"effect.ran","fn":"fn#2","returned":"off"}
+{"op":"template.clone","tmpl":"tmpl#2","result":"tmpl#2:root"}
+{"op":"effect","fn":"fn#3","init":"undefined","options":"undefined"}
+{"op":"style","node":"tmpl#2:root","value":0,"prev":"undefined"}
+{"op":"effect.ran","fn":"fn#3","returned":0}
+{"op":"template.clone","tmpl":"tmpl#3","result":"tmpl#3:root"}
+{"op":"effect","fn":"fn#4","init":{"e":"undefined","t":"undefined"},"options":"undefined"}
+{"op":"setAttribute","node":"tmpl#3:root","name":"title","value":false}
+{"op":"effect.ran","fn":"fn#4","returned":{"e":false,"t":false}}

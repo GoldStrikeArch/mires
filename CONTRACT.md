@@ -1,17 +1,17 @@
-# Interface contract
+> Recovery baseline: this document was imported from the September 7 v2 snapshot.
+> It describes historical mechanisms and limits, not completed October recovery or production qualification.
+> See `docs/V2-RESTORATION.md` and the current `VERDICT.md`.
 
-Every component (backend, mini_core, tests, shim, scripts, demo) was built by a different
+# Spike interface contract
+
+Every component (backend, mini_core, tests, shim, scripts, demo) is built by a different
 agent in parallel. This file is the single source of truth for the interfaces between them.
-Do not deviate from it; if something proves impossible, note it instead of silently changing
-the contract.
+Do not deviate from it; if something proves impossible, note it in your report instead of
+silently changing the contract.
 
-> **Scope.** This repository holds the compiler. The sections below that describe the
-> `view!` lowering (`view-dom`, `view-dom-macro`), the `dom-tests` suite, the demo app,
-> the hydration parity harness, and the procedure wire describe the Topcoat integration,
-> which lives with Topcoat and not here. They are kept because the template ABI, the
-> hydration keys and the chunking they rely on are this compiler's, and the record of how
-> they were arrived at is still the best explanation of why those are shaped as they are.
-> The reference for the backend's design is `rustc_codegen_cranelift`.
+Full plan: /Users/mpl4/.claude/plans/buzzing-wondering-pillow.md
+Reference cg_clif clone (read-only):
+/private/tmp/claude-501/-Users-mpl4-Desktop-workspace-OSS-topcoat/61e61eec-1ccc-45c3-838d-971b5be2d33f/scratchpad/compilers/rustc_codegen_cranelift
 
 ## Toolchain
 
@@ -23,7 +23,7 @@ llvm-tools). Being installed at spike start; may still be downloading — poll
 
 ```
 rustc +nightly-2026-07-27 \
-  -Zcodegen-backend=<abs path to target/release/librustc_codegen_mires.dylib> \
+  -Zcodegen-backend=<abs path to target/release/librustc_codegen_js.dylib> \
   --edition 2021 --crate-type lib --emit=obj \
   -Ccodegen-units=1 -Cpanic=abort -Coverflow-checks=off -Cdebuginfo=0 \
   -o <out>.js <test>.rs
@@ -136,6 +136,9 @@ must match node's default console.log formatting (booleans print as `true`/`fals
   boxed — see "Pointers (stage 1.5)" below, which supersedes this line. Cells (`{ v: value }`)
   and accessors (`{ get, set }`) were the stage 0 and stage 1 spellings and no longer exist.
 - Copy of an aggregate = shallow clone; Move = alias.
+- A closure environment is an array of its captures in MIR field order. Const propagation may
+  leave that environment in immutable allocation bytes; all three compiler lanes decode those
+  bytes capture by capture to the same array rather than rejecting the closure type.
 - `Box<T>` is **the pointer it owns**, and nothing else: a slot for a sized `T`, a fat slice for
   `Box<[T]>`, a fat dyn for `Box<dyn Trait>`. See "Allocation".
 - `String` has no representation of its own: it is a `Vec<u8>`, a heap block of one byte elements,
@@ -174,7 +177,8 @@ formatting anywhere -- print numbers and literal strs only.
 
 ## Scripts
 
-- scripts/build.sh    — cargo build --release (the backend dylib) from the spike root
+- scripts/build.sh    — cargo build --release from the spike root: the backend dylib and the
+                        `jsc-link` binary it execs at the link step, printing both paths
 - scripts/compile.sh  — $1=src $2=out.js; runs the rustc command above
 - scripts/entry.js    — exactly `rust_entry();`
 - scripts/test.sh     — build backend, then for each examples/tests/*.rs: compile,
@@ -222,6 +226,12 @@ Tests against the real `core` use a second command (`scripts/compile_core.sh`):
 builds. `cdylib` is the point — it makes rustc run `CodegenBackend::link`, which is where
 whole-program dead code elimination and zombie reporting happen.
 
+Incremental rustc invocations require `-Cllvm-args=js-producer=<sha256>`, where the digest covers the selected backend library. The compile and sysroot scripts supply it automatically. The producer verifies it before queries run. A missing incremental identity, stale digest, or duplicate identity is an error. Rustc tracks the argument, so replacing a backend at the same path invalidates its query and codegen caches while an unchanged backend permits reuse. The digest is independent of linker policy and is excluded from normalized emit options. Executable cleanup MIR archives carry and verify this producer identity separately.
+
+`js-cleanup=on` is an experimental producer option, off by default. It retains executable ordinary and coroutine cleanup for the existing host-exception contract. It requires a matching cleanup-enabled sysroot and dependencies, and JIR lowering for reachable cleanup bodies. Baseline fallback is an error when it would discard those bodies' cleanup paths. Rust panic/abort behavior remains unchanged. The pinned MIR bridge preserves the shared coroutine layout and applies rustc's abort policy to the body used by rustc.
+
+Cleanup-enabled libraries carry a versioned, checksummed executable MIR member with stable definition, source and hygiene identities. Import validates the producer digest, rustc version, emit options, target layout and crate identity. Generic consumers can reconstruct that MIR without the original source files. `scripts/cleanup-transport-test.py` checks cold/warm/edited builds, fresh consumers of warm libraries, incompatible producers and source absence. The ordinary source-fact capture described below remains the default when executable cleanup is disabled.
+
 Backend options ride in on `-Cllvm-args`, space separated (`scripts/compile.sh` forwards
 `$JS_EXTRA_ARGS`):
 
@@ -237,15 +247,19 @@ js-source-map=on|off         write a `.map` beside the program (default off; see
 js-emit-skip=PREFIX          hide items under a def path prefix (see "Emit goldens")
 js-scoped-lets               declare locals at their region LCA
 js-minify=on|locals|off      short names and compact printing (default off; see "Minify mode")
+js-ecma-target=2018|latest   emitted JavaScript syntax ceiling (default latest)
 js-hoist-consts=on|off       share repeated constants (default on; see "Hoisted constants")
 js-modules=esm|script        ES module or plain script (default script; see "Modules")
 js-shim-module=SPEC          where `__rt` is imported from (default `./shim.js`)
-js-dom-module=SPEC           where the DOM runtime is imported from (default `mires-dom`)
+js-dom-module=SPEC           where the DOM runtime is imported from (default `topcoat-dom`)
+js-profile=NAME              dev, report, release-size, release-balanced, or release-speed
 ```
 
 `$JS_EXTRA_ARGS` is forwarded by **all three** compile paths: `scripts/compile.sh`,
 `scripts/compile_core.sh` and `scripts/build_sysroot.sh` (which turns each space separated option
 into its own `-Cllvm-args=`, since rustflags are split on whitespace).
+
+`js-profile` is an alias layer: profiles expand before explicit options, so a spelled-out option always wins regardless of command-line order. The three release profiles select `js-ecma-target=2018`, the JIR lane, and optimizer emission; release-size and release-balanced use full minification, while release-speed keeps item names. Dev and report retain the `latest` syntax target.
 
 **An option is emit-affecting when it can change the text of an item two crates might both
 codegen.** That is the whole of the rule, and everything below follows from it: an option that
@@ -265,7 +279,7 @@ JS_EXTRA_ARGS='js-names=mangled' ./scripts/build_sysroot.sh   # then the same fo
 ```
 
 Emit-affecting, so the sysroot has to be rebuilt to match: `js-names`, `js-structure`,
-`js-queue`, `js-switch`, `js-scoped-lets`, `js-minify`, `js-hoist-consts` and
+`js-queue`, `js-switch`, `js-scoped-lets`, `js-minify`, `js-ecma-target`, `js-hoist-consts` and
 **`js-line-comments`** — the last one is
 the surprise, because only the *leading* header comment run is stripped before two definitions are
 compared (`LinkItem::code`), and its comments are interleaved through the body.
@@ -282,6 +296,8 @@ time; see "Modules") and **`js-source-map`** (its markers print nothing; the Jav
 required to come out byte for byte identical). A map can therefore be asked for without rebuilding
 the sysroot — a `core` built without one simply contributes items with no mappings, which then
 read as generated glue and are stepped over.
+
+`js-ecma-target=2018` is a syntax ceiling, not an ES2018-runtime claim. It prints BigInt constants through `BigInt("...")`, lowers logical and nullish assignment with exact one-evaluation semantics, and leaves runtime requirements such as `BigInt`, `globalThis`, `queueMicrotask`, `MessageChannel`, and `TextEncoder` in the separate final-artifact inventory. A pinned Acorn 8.15.0 parse of every public artifact is the compliance authority; Terser's `ecma` setting is policy metadata, and opaque `js!` input is accepted only when that final parse succeeds.
 
 ### Value representation
 
@@ -329,10 +345,23 @@ pointer arithmetic, which has no meaning where a value is a JavaScript object ra
 an address. `patches/0001-panic-without-formatting.patch` applies the same rule inside `core`
 itself, replacing the formatted runtime panic messages with their constant equivalents; without it
 `panic_display` builds a `&dyn Display` whose vtable keeps every `Display` impl in the program
-alive.
+alive. The same patch stubs `str::slice_error_fail_rt`: that function used to format the
+offending `char` with `Debug`, which kept `fmt`, escape iterators, and Unicode tables reachable
+from every `&s[a..b]`. The abort is unchanged; the message is the constant
+`failed to slice string`.
 
 The rule is about the *handler*, not about formatting: `write!` into a `fmt::Write` sink runs, and
 `examples/core-tests/11_fmt.rs` is the golden that pins it.
+
+`patches/0004-char-searcher-byte-length.patch` removes a different statically impossible formatting root. `char::encode_utf8` returns a slice of the four-byte array supplied by `CharSearcher`, so that slice's length is in `1..=4` and stores exactly in the searcher's `u8` field. The patched source uses the direct cast instead of `TryInto::try_into().expect(...)`; this preserves every searcher state while keeping `TryFromIntError`, its `Debug` implementation, and the resulting `core::fmt` graph out of small `str::Lines` and `split_once` programs. `examples/core-tests/102_str_lines.rs` covers all four UTF-8 widths, and its `.absent` companion pins the deleted reachability.
+
+`patches/0005-scalar-memchr.patch` selects `core`'s existing safe scalar implementation for forward `memchr`. The native aligned-word implementation has identical answers, but over this backend's JavaScript-array byte slices it adds pointer retyping, alignment, bounds, and panic machinery before falling back to scalar comparisons. The patch removes that target-inappropriate graph without changing reverse `memrchr`; `examples/core-tests/102_str_lines.rs` crosses the old length threshold and its `.absent` companion rejects `memchr_aligned`.
+
+`patches/0006-char-searcher-nonpanicking-needle.patch` uses checked views for the encoded `CharSearcher` candidate and for `char` suffix removal after an explicit length guard. Those ranges are already established by the pattern state, so the safe checked form preserves the result without retaining `slice_index_fail`. `examples/core-tests/102_str_lines.rs` runs all four encoded widths, a mismatch, and a too-short suffix through a no-inline helper; its `.absent` companion pins the missing panic edge.
+
+`patches/0007-lines-direct-split.patch` specializes only forward `Lines::next`: it drives the already-contained `SplitInclusive` state and removes the fixed ASCII `CR? LF` ending with safe byte checks and checked `str` views. The public `Map` representation, cloning, debug formatting, `size_hint`, and reverse iteration do not change. The same fixture covers LF, CRLF, empty, and unterminated lines and rejects the unused forward `Map::next` adapter.
+
+`patches/0012-char-searcher-scalar-prefix.patch` specializes the fixed-width comparison inside forward `CharSearcher::next_match`. `memchr` has already matched the encoded character's final byte, so exact one- through four-byte checked slice patterns compare only the preceding bytes and avoid generic slice equality. The search state, reverse path, and mismatch behavior are unchanged. `examples/core-tests/102_str_lines.rs` covers every width, same-final-byte false candidates, an interior false hit in U+A041, and negative cases.
 
 ### Not supported (each is a zombie, reported only if reachable)
 
@@ -402,15 +431,18 @@ rather than through the JavaScript.
 - Granularity is one mapping per **run of statements from one Rust position** — the same seam and
   the same de-duplication as `js-line-comments`.
 - `sources` are file names as rustc spells them in a diagnostic (`--remap-path-prefix` applies).
-  `sourcesContent` carries the text of every source this compilation still holds, which makes
-  stepping work over `file://` with no server; a file that came from a dependency's rlib is `null`
-  and the browser resolves it against the map's URL.
+  `sourcesContent` combines the current session with source text retained in dependency objects.
+  Object section S7 stores compressed text independently of JIR bodies, including generic-only
+  crates, so dependency source trees need not be present at link time. Archive packaging refreshes
+  a separate source member on every build, independently of codegen-unit reuse. The linker decodes it only
+  for source-map output and rejects conflicting text under one remapped name. Sources unavailable
+  from legacy objects remain `null`.
 - `names` maps an emitted name to the Rust one: a function's def path, and every local whose
   spelling had to change (`self$1`). A fresh mapping is opened immediately after each such
   identifier, because a debugger reads the name off whatever mapping covers it.
 - Every generated line is mapped. A line with nothing of its own repeats the mapping in effect —
   Firefox stops a mapping at the end of its line — and a line at the start of an item, or before
-  any location at all, maps to the synthetic source `<rustc_codegen_mires generated>`, which is the
+  any location at all, maps to the synthetic source `<rustc_codegen_js generated>`, which is the
   only entry in `ignoreList`. That is the blackboxing rule: the prologue, the dispatch scaffolding
   and the missing-item stubs are code no Rust programmer wrote, and a debugger told so steps over
   them.
@@ -432,14 +464,14 @@ goldens.
 
 Three things happen, in two places:
 
-- **Local names** (`backend/src/minify.rs`, at codegen time, per item): a function's parameters,
+- **Local names** (`rcgjs-object/src/minify.rs`, at codegen time, per item): a function's parameters,
   `let`s, `$`-temporaries and labels become `a`, `b`, `c`, ... Parameters take the alphabet
   positionally first, then the remaining names are taken in order of falling occurrence count,
   each given the shortest name still free — js_of_ocaml's strategy, measured there within 0.06% of
   a mixed-integer-programming optimum, with no interference graph. Ties break on the name, which
   makes the output a function of the input alone. The alphabet is jsoo's: 54 characters may start
   an identifier and 64 may continue one, encoded little-endian.
-- **Item names** (`backend/src/minify.rs`, at link time, once): every reachable item that is not
+- **Item names** (`rcgjs-object/src/minify.rs`, at link time, once): every reachable item that is not
   exported becomes `$a`, `$b`, `$c`, ... by the same frequency rule. This *has* to be
   whole-program — an item is codegenned by whichever crate instantiated it and called from any
   other — and by then an item is text, so the pass is a scan rather than a parse. It is sound
@@ -469,9 +501,9 @@ local renamer cannot see; this is the same hazard `names.rs` documents for reada
 
 - `js-minify` is **emit-affecting**, so the sysroot's `core` has to be built with it too — see
   "Compilation". `scripts/test.sh` now keeps the two in step by itself.
-- `js-minify` turns `js-comments` **off** (a header comment is the larger half of a small item) and
-  **refuses `js-source-map`**, with a warning: the map's `names` table would name variables the
-  minified program no longer has. Renaming through the map is the designed fix and is not built.
+- `js-minify` turns `js-comments` **off** (a header comment is the larger half of a small item).
+  It composes with `js-source-map`: local renaming moves the map's emitted-name keys with the AST,
+  and whole-program item renaming rebases generated columns before the final map is encoded.
 - `js-minify=locals` is the bisecting step: compact printing and short local names, item names left
   alone. A minified program is then still greppable for a def path, and it is how the two halves of
   the win were measured apart.
@@ -549,8 +581,9 @@ so a write through a pointer is an ordinary assignment and every alias sees it. 
 that produces a pointer either names a real slot or degrades to a provenance free number, and
 nothing in between.
 
-`backend/src/ptr.rs` is the one place that builds and consumes these records; every other module
-goes through it. It is also where the model is being landed: an operation that does not implement
+`rcgjs-object/src/ptr.rs` (the record shape) and `backend/src/ptr.rs` (every reader and writer
+that consults a layout) are the one place that builds and consumes these records; every other
+module goes through them. It is also where the model is being landed: an operation that does not implement
 the specification below says so in its doc comment, and the shim helper behind it throws instead of
 answering.
 
@@ -560,6 +593,7 @@ answering.
 |---|---|---|
 | slot | `{ buf, off }` | a pointer to one place, dereferenceable |
 | scaled slot | `{ buf, off, sc }` | a byte offset view of a buffer of `sc`-byte elements, from an `as *const u8` cast; **not** dereferenceable |
+| prefix slot | `{ buf, off, pr, ps }` | a pointer to a non-zero-sized field at layout offset zero; `pr` retains the containing slot and `ps` its pointee size |
 | window slot | `{ buf, off, w }` | a pointer to `w` consecutive elements, from an `as *const [E; N]` cast |
 | fat slice | `{ buf, off, len }` | `&[T]`, `*const [T]`, unchanged from stage 1 |
 | fat dyn | `{ ptr, meta }` | `&dyn Trait`, unchanged from stage 1 |
@@ -627,9 +661,8 @@ carries the record rather than the tail:
 ```
 
 The same two keys a `&dyn Trait` uses, for the same reason: what the pointer names is one value
-and the metadata beside it is what says how much of it there is. `ptr` is always the **reference**
-form of the record, even when the pointer being coerced is a raw one, because everything past the
-coercion projects fields out of a record.
+and the metadata beside it is what says how much of it there is. A reference carries the record;
+a raw pointer carries its slot. Unsizing preserves that distinction.
 
 `core`'s `array::IntoIter` is why this exists, and it is what `for x in [a, b, c]` compiles to. It
 holds a `PolymorphicIter<[MaybeUninit<T>; N]>` -- `struct PolymorphicIter<DATA: ?Sized> { alive:
@@ -670,8 +703,10 @@ slice `{ buf: p.ptr.buf, off: p.ptr.off + 1, len: p.meta }`. Every `{ buf, off }
 builds works over that tail unchanged, which is the point of putting the header first: an offset is
 a new record, a write is an assignment, a subslice moves `off` and `len`.
 
-So the `.ptr` half is the record for a **reference** and a slot for a **raw pointer**, which is the
-ref/raw split every other aggregate pointee already has ("References and raw pointers").
+So the `.ptr` half is the record for a **reference** and a slot for a **raw pointer**.
+`tail_ref` and `tail_raw` preserve metadata and the exact containing slot across that boundary.
+`tail_slice` uses that slot to recover an allocated tail from the original block; a coerced sized
+record keeps its original tail field. Both paths share storage without copying elements.
 
 The reshape is `__rt.retype_rc(p, header_mk, tail_es, len)`, and it accepts the two states `alloc`
 actually arrives in: `allocate_for_slice` casts the fresh block to the element type first, so the
@@ -702,8 +737,12 @@ One function owns the matrix, `ptr::cast_pointer`, and every pointer to pointer 
 | zero sized pointee on the target side | the **reference form** of the source pointee: `&T`, which is the object for an aggregate and the slot for a primitive |
 | zero sized pointee on the source side | the way back, the raw pointer that reference form denotes |
 | aggregate to its single non zero sized field | reproject: `{ buf: p.buf[p.off], off: "<field>" }` |
+| larger aggregate to a matching non zero sized field at layout offset zero | `__rt.prefix`, which retains the containing slot and therefore the shared address |
+| that zero-offset field back to its containing aggregate | `__rt.unproject`, which accepts only the prefix slot made by the forward cast |
 | size N to size 1 | `__rt.scale`: a scaled slot over the same buffer, and an address unchanged |
-| size 1 to size N | `__rt.unscale`, which throws on a misaligned offset |
+| size 1 to an integer, float or `char` of size N | `__rt.unscale_scalar`: allocation retyping for a fresh heap block, scale recovery for a scaled slot, or an aliasing little-endian scalar view over byte storage |
+| size 1 through a transparent union to size N | `__rt.unscale_uninit`: `unscale` plus one-time retyping of array-backed uninitialized stack storage |
+| any other size 1 to size N | `__rt.unscale`, which retypes a fresh heap block or throws |
 | element to array of elements | a window slot |
 | array of elements to anything | `__rt.unwindow`, then the element's answer |
 | anything else | a zombie at the cast, naming both types |
@@ -713,10 +752,36 @@ pointer to `[E; N]` is either a plain slot whose one element is the whole array 
 an earlier cast produced over `N` consecutive elements of somebody else's buffer, and nothing in
 the type says which.
 
-`[u8; N]` and `uN` convert little endian **as values**, in the transmute lowering, not here: a slot
-names a place, and no place in a byte buffer holds the integer those bytes spell. That is the form
-`u32::from_le_bytes` and `fmt`'s `cast_array().read()` actually reach; a *pointer* cast between the
-two lands on the last row.
+A zero-offset prefix cast is not the single-field transparent case. An aggregate may have other
+fields after the prefix, as `alloc::collections::btree::node::InternalNode<K, V>` does after its
+`LeafNode<K, V>`. The projected JavaScript place is the prefix field, but both Rust pointers have
+the same address. The prefix slot therefore retains the original slot. Addressing, equality,
+ordering and a zero byte round trip use that retained provenance. Pointer arithmetic may not leave
+the prefix field, and the reverse cast checks both the retained slot and field key, so a standalone
+value with the prefix type cannot be promoted into a larger containing aggregate. A same-size,
+one-field newtype is not a prefix and continues through the ordinary transparent or allocation
+cast rows.
+`examples/core-tests/101_btree_map_nodes.rs` pins both directions through the standard library's
+B-tree node types.
+
+An integer, `f32`, `f64` or `char` read through a suitably aligned byte pointer gets a cached view
+whose indexed properties decode and encode the source bytes in little-endian order. The view is an
+ordinary slot to the compiler, so a write through it is immediately visible through the byte
+pointer and a repeated cast preserves pointer identity. Its synthetic address and a cast back to
+bytes continue to use the original buffer. Width alone is not enough to reconstruct a pointer,
+enum or aggregate, so those types keep the refusing `unscale` path.
+Building a raw slice through `slice_from_parts` normalizes a dangling data address. Creating a
+`u8` or `i8` slice reference through `byte_slice_ref` seals initialized heap storage as bytes. A later scalar view aliases that storage
+without changing its byte capacity, including a partial word at the end. Cached views acquire new
+word slots after heap growth. Raw slices and `MaybeUninit<u8>` slices leave allocation retyping
+available. Fixture 110 covers empty
+vectors, slice offsets, UTF-8 word reads, invalid sequences, and growth against native Rust.
+The custom sysroot deliberately keeps forward `memchr` scalar rather than routing JavaScript-array bytes through these word-sized views. `examples/core-tests/102_str_lines.rs` pins that absence; direct scalar alias reads and writes remain part of the pointer contract above.
+
+`[u8; N]` and `uN` still convert little endian **as values** in the transmute lowering rather than
+through a pointer view. That is the form `u32::from_le_bytes` and `fmt`'s
+`cast_array().read()` actually reach. A *pointer* cast to the scalar uses the aliasing accessor
+above; a pointer cast to an array at another element width remains unsupported.
 
 A union with a single non zero sized field (`MaybeUninit<T>`) is **transparent**: it is represented
 as that field, and `uninit()` is `undefined`. So is a **`repr(transparent)` struct**, which the
@@ -818,10 +883,15 @@ turns back into a dereferenceable pointer.
   through a single `raw_eq` of the whole array, so without that arm no `[T; N] == [T; N]` would
   work. An array of scalars has no padding, so element by element asks what the bytes would.
 
-Equality and ordering are `__rt.ptr_eq` and `__rt.ptr_cmp`. `ptr_eq` is `===` first, `false` for a
-non object, and a comparison of `buf`, `off` and `sc` otherwise; `len` is deliberately ignored, so
-a fat pointer equals the thin pointer to its start. `ptr_cmp` compares `off` when both sides share
-a buffer and the addresses otherwise, and returns -1, 0 or 1.
+`__rt.ptr_eq` compares data pointers through object identity or their `buf`, `off` and `sc`.
+Equality of wide pointers also compares metadata: `slice_ptr_eq` checks `len`, and `fat_ptr_eq`
+checks the data half and `meta`. Casting to a thin pointer discards metadata. `ptr_cmp` compares
+`off` when both sides share a buffer and the addresses otherwise, and returns -1, 0 or 1.
+
+Zero-length copies, byte writes and byte comparisons access no storage. Their operands are still
+evaluated, and Rust's alignment and non-null preconditions still apply. An uninitialized allocation
+can be cast to its complete-element prefix without losing its full byte size; trailing bytes do
+not become initialized values.
 
 ### `str` is a hybrid
 
@@ -867,6 +937,8 @@ output (`u8` to `AsciiChar`) and how `core::mem::Alignment` is read as a `usize`
 
 ```js
 __rt.box(value)              // the slot a raw pointer to a bare aggregate names
+__rt.prefix(p, key, size)    // project a zero-offset aggregate field and retain its provenance
+__rt.unproject(p, key)       // recover the exact containing slot from that prefix pointer
 __rt.addr(p, size)           // the synthetic address of a pointer
 __rt.ptr_eq(a, b)            // whether two pointers name the same place
 __rt.ptr_cmp(a, b, size)     // -1, 0 or 1
@@ -877,7 +949,9 @@ __rt.write_bytes(dst, byte, count, zero?)      // repeat a byte pattern
 __rt.compare_bytes(a, b, count)        // lexicographic byte comparison
 __rt.read_array(p, n)        // the `n` elements at `p`, as a JS array
 __rt.write_array(p, values)  // the write half of read_array
-__rt.unscale(p, size)        // a scaled slot back to a slot, throws if misaligned
+__rt.unscale(p, size, mk)    // a scaled slot back to a slot, throws if misaligned
+__rt.unscale_scalar(p, size, mk, kind) // an aliasing integer/float/char view over byte storage
+__rt.unscale_uninit(p, size, mk)       // one-time retype of uninitialized array storage
 __rt.chunk_slice(p, n, w)    // a slice re-read at chunk granularity, throws if it is not one
 __rt.unwindow(p)             // a pointer to `[E; N]`, as a pointer to its first element
 __rt.thin(p, size)           // `from_raw_parts` with `()` metadata: the data pointer, un-erased
@@ -898,7 +972,8 @@ asks. `ptr_metadata` of a thin pointer is `undefined`.
 ### Still not supported
 
 Each is a zombie, reported only if reachable: `ptr_mask` ·
-byte punning between two pointees that are neither the same size nor a byte · `raw_eq` on an
+byte punning into an aggregate or a semantic scalar other than the supported integer, float and
+`char` byte views · `raw_eq` on an
 aggregate other than an array of scalars, and `write_bytes` on any aggregate · writing through a
 `&mut str` · reprojecting a pointer from a scalar to a wrapper around it, unless the wrapper is a
 [layout-identical newtype](#casts) · reinterpreting an array at another element width (`[u16; 8]`
@@ -962,8 +1037,7 @@ program is only wrong if it reaches them: rebuilding a slice at another element 
 not have, and which has to be a run time refusal rather than a zombie because `align_to` is on the
 static call graph of `Display for str` through `do_count_chars`, so rejecting it would reject
 `write!` itself (`examples/core-tests/guard_as_chunks.rs` pins the abort, and the same guard is
-what `str::find`/`split(char)` reach through `memchr` once a haystack is at least two `usize`s
-long); dereferencing a scaled slot or an address; `__rt.unscale`
+what reverse `str::rfind(char)` reaches through `memrchr`); dereferencing a scaled slot or an address; `__rt.unscale`
 on an offset that is not a multiple of the element size; a `copy` or a `compare_bytes` between two
 pointers whose scales disagree, or a byte count that is not a whole number of elements; a run that
 reaches past the end of its buffer, which is undefined behaviour in Rust and here is the shape a
@@ -1093,7 +1167,7 @@ replaced:
 | measure-size table, `js-minify=locals` | +1.9% | **+1.5%** |
 | measure-size table, `js-minify=on` | +3.9% | **+2.3%** |
 | the counter island (all modes) | 0.0% | **0.0%** |
-| the 14 dom fixtures + the shim + `mires-dom` | -0.5% | **-0.5%** |
+| the 14 dom fixtures + the shim + `topcoat-dom` | -0.5% | **-0.5%** |
 
 A variant name costs more than a small integer, and it lands entirely on enum-dense code: the
 worst case is `04_enums`, a fixture that is nothing but enums, at +7.5% minified-gzip on a 630 byte
@@ -1201,6 +1275,20 @@ Asking for the size the block **already has** is free and is the common case, no
 `RawVecInner` stores its buffer as a `*mut u8` and casts it back on every single access, so a `Vec`
 runs through the cast once per element read.
 
+### Uninitialized stack storage
+
+The standard library also uses aligned stack arrays of `MaybeUninit<u8>` as scratch storage and
+casts them to `MaybeUninit<T>`. Stable sorting is the representative path. The transparent union at
+the source says that no byte value is observed through the old element shape, so an array-backed
+stack buffer may acquire an element size exactly once without becoming a heap allocation.
+
+`__rt.unscale_uninit` keeps the same `bytes`, `es` and `fresh` facts in a separate weak side table
+and applies the ordinary retype rules. Repeating the same element size is free; changing it after
+the first retype, using a misaligned offset, or presenting non-array storage is a run time refusal.
+The separate table is important: stores into sort scratch space must not acquire allocator
+ownership or deallocation behavior. `examples/core-tests/100_uninit_stack_retype.rs` pins this
+path.
+
 ### The zero element factory
 
 A block from `alloc_zeroed` holds zero *bytes*, and a zero element is not always the number `0`: it
@@ -1238,11 +1326,11 @@ Each of these is an exception naming the mistake, not a zombie and not a wrong n
 reason `align_to` is (see "Not supported"): whether a given pointer is a fresh block is a fact about
 the value, not about the type, so it cannot be answered when the item is lowered.
 
-- **retyping a block that is no longer fresh** at a different element size — the bytes have been
-  written at one size and reading them at another is a reinterpretation this model cannot express
-  (`examples/core-tests/guard_heap_retype.rs`);
-- **a byte capacity that is not a whole number of elements**, and a byte offset that does not land
-  on one;
+- **retyping a block that is no longer fresh** at a different element size
+  (`examples/core-tests/guard_heap_retype.rs`). Scalar views over a sealed byte block alias its
+  bytes instead of retyping it;
+- **a zeroed byte capacity that is not a whole number of elements**, and a byte offset that does
+  not land on an element;
 - **a zeroed block whose element zero cannot be spelled**
   (`examples/core-tests/guard_zeroed_retype.rs`);
 - **a cast through a pointer into a freed block**
@@ -1267,7 +1355,24 @@ Two consequences the rest of the backend reads:
 - a `Box<dyn Trait>`'s data half is the *reference* form of the concrete value, which for an
   aggregate is the object and no longer names the allocation. `__rt._put` therefore records where an
   aggregate stored into a heap block lives, so `__rt.box` hands that place back and the box can be
-  freed.
+  freed;
+- an owned unsized virtual receiver keeps the whole fat-pointer identity until dispatch. Rustc
+  spells `Box<dyn FnOnce(Args)>::call_once` as `move *box`, but the virtual ABI still needs
+  `meta[slot]` to choose the method and the raw allocation slot as its first argument. The dispatch
+  path therefore selects the vtable entry from the fat pointer and passes `__rt.unref(ptr)` for an
+  owned receiver. Borrowed virtual receivers continue to pass the reference-form data half.
+
+`examples/core-tests/103_boxed_fn_once.rs` pins owned `FnOnce` receivers with zero, one and two
+arguments.
+
+On the JIR optimizer lane, this remains the baseline Box carrier. A private region may instead
+select `NativeBox` only when allocation is compiler-owned, pointer/address identity is
+unobserved, and exact pointee drop glue is available. Default drop and structural field drop are
+semantic operations; a user-defined destructor on the boxed pointee, custom or unknown
+allocators, raw pointers, and missing structural glue pin the region to the baseline carrier.
+Exact drop glue for fields of a structurally dropped pointee remains legal. Exported Box slots
+also remain baseline until the linker has a verified canonical wrapper. Fixtures 89 and 90
+protect the native drop cases.
 
 ### `String` is `Vec<u8>`
 
@@ -1306,8 +1411,8 @@ is a JavaScript array of one element type and is retyped exactly once, so both a
 rather than slow paths (see "Retyping" and "Run time refusals" above). No amount of work on the
 allocation model changes that: it is the same reinterpretation `guard_heap_retype.rs` pins.
 
-The host already has a hash table. `mires-js` is the crate that hands it to Rust as
-`mires_js::collections::{HashMap, HashSet}`, and `examples/core-tests/30_hashmap.rs` is the
+The host already has a hash table. `topcoat-js` is the crate that hands it to Rust as
+`topcoat_js::collections::{HashMap, HashSet}`, and `examples/core-tests/30_hashmap.rs` is the
 golden.
 
 **A `HashMap<K, V>` IS a host `Map`.** `repr(transparent)` over a one word handle, exactly as
@@ -1333,7 +1438,7 @@ Floats are excluded, for the reason `core` gives them no `Eq`. Everything else i
 the entry would be filed under the object that carried the key and never found again by an equal one
 built later, which is a silent wrong answer with nothing reported anywhere.
 
-**The refusal is a type error, twice over.** `mires_js::collections::MapKey` is sealed, so an
+**The refusal is a type error, twice over.** `topcoat_js::collections::MapKey` is sealed, so an
 aggregate key is rejected at the call site with the key type named, before any code is generated;
 `examples/core-tests/guard_map_key.rs` pins that message. `backend/src/map.rs` carries the same rule
 again as a post-monomorphization check on the marker's key argument, which is unreachable through
@@ -1408,7 +1513,7 @@ __rt.map_keys(m)          // { buf: [...m.keys()], off: 0, len }: a snapshot, as
 ```
 
 `scripts/make-esm-shim.mjs` needs no list to keep in step: it evaluates the shim and exports the keys
-of the `__rt` it built, so these are in the ES module form by construction, and `mires-build`'s
+of the `__rt` it built, so these are in the ES module form by construction, and `jsc-build`'s
 `shimcheck` reads that module's own exports.
 
 #### Not supported
@@ -1420,7 +1525,7 @@ of the `__rt` it built, so these are in the ES module form by construction, and 
   struct or enum. Sealed trait, plus the backend check.
 - **`&mut` aliasing across a lookup.** Two `get_mut` calls for one key hand out two references to
   one place, and only the borrow checker stops that: the markers return a reference at a lifetime
-  the caller picks, so `mires-js` narrows it to a borrow of the map at every call site and the
+  the caller picks, so `topcoat-js` narrows it to a borrow of the map at every call site and the
   markers are `unsafe fn` to say so.
 
 ### The allocator shim
@@ -1505,7 +1610,7 @@ dependency order; then everything else. That is one new tier on top of the order
 rewrites text, and renaming the binding inside an `import` would import a name the module does not
 export. `_$` is reserved for the DOM runtime's bindings (`_$insert`, `_$template`), and no
 generated local ever starts with it, so an imported binding cannot be shadowed either.
-`js-dom-module` decides where those come from and defaults to `mires-dom`.
+`js-dom-module` decides where those come from and defaults to `topcoat-dom`.
 
 **The export clause** names the `#[no_mangle]`/`#[export_name]` items of the crate being linked, in
 sorted order, in one trailing statement. One clause rather than an `export` keyword on each
@@ -1549,14 +1654,140 @@ whatever else the crate declares.
 
 ### Object file format version
 
-An object file's `//# rcgjs:` item table now starts with a `u16` format version. postcard is not
-self describing, so a table written in an older shape does not fail to parse — it parses into
-something else, and the program that comes out is wrong rather than rejected. A mismatch is an
-error naming the fix (`scripts/build_sysroot.sh --clean`). Bump `FORMAT_VERSION` in
-`backend/src/item.rs` whenever the table's shape changes -- and also when the **JavaScript inside
-it** changes incompatibly, which is the same failure one level up: an object holding the old enum
-encoding would link cleanly against new objects and produce a program that is wrong rather than
-rejected. Version 4 is the string-tag enum encoding.
+An object file carries a `u16` format version. postcard is not self describing, so a table written
+in an older shape does not fail to parse — it parses into something else, and the program that
+comes out is wrong rather than rejected. A mismatch is an error naming the fix
+(`scripts/build_sysroot.sh --clean`). Bump `FORMAT_VERSION` in `rcgjs-object/src/object.rs`
+whenever the shape changes -- and also when the **JavaScript inside it** changes incompatibly,
+which is the same failure one level up: an object holding the old enum encoding would link cleanly
+against new objects and produce a program that is wrong rather than rejected.
+
+Format 20 (Phase 1 W2) replaced the trailing `//# rcgjs:` text footer with a binary member: the
+printed baseline JavaScript still comes first as a plain UTF-8 text section, then a `RCGJS\0`
+member holding a header and six checksummed sections (interns, the eagerly read summary index,
+content-addressed deflated JIR-S bodies, the per-item baseline records, origins, and the frozen v1
+optimizer's metadata), then a fixed 16-byte trailer so a reader finds the member without scanning
+the text. The header pins the JIR schema, the rustc that produced the object, its data layout and
+the emit-affecting options. `rcgjs-object/src/object.rs` is the specification.
+
+Format 27 and JIR schema 15 carry source coroutine control-flow and suspension facts in the intern section. The pinned rustc backend wraps `mir_drops_elaborated_and_const_checked`, borrows `mir_promoted` before delegating to rustc, and stores owned yield locations, bare resume locals, and the complete source block graph. Each block records its terminator class and ordered normal, unwind, resume, cancellation, or imaginary successors. Bare drop locals and direct source callee identities are retained before MIR inlining; projected drop places and dynamic callees remain unavailable. The producer checks the complete ordered target sequence against rustc's successor iterator. The reader validates edge targets and terminator arity, requires exactly one matching yield record per yield block, and checks its resume/cancellation edges. These indices belong to the generic analysis body, including unreachable blocks. They are not indices into the transformed JIR body or proof of dynamic suspension counts. Local coroutine queries are requested before codegen units serialize their metadata, including generic-only libraries. The object reader retains those facts independently of emitted items and rejects invalid indices. The linker merges them by stable definition identity, resolves object-local source positions, and reports conflicting captures explicitly.
+
+The compiler session retains each captured coroutine's promoted MIR as owned tokens through rustc's encoder and reconstructs it through rustc's decoder when codegen requests source facts. This preserves instruction operands, types, source scopes and cleanup edges after the original provider consumes the body, without retaining borrowed MIR or modifying rustc's passes. Session-local span, definition and allocation IDs make these snapshots unsuitable for object files or reuse in another compiler session. Only the existing source-fact tables cross that boundary. Self-check mode round-trips ordinary bodies after provider delegation too, compares the full body with only recomputable CFG caches cleared, and re-encodes the result. The suspension-facts harness requires these checks. Retaining source MIR does not elaborate its drops, emit exceptional cleanup or provide executable generic bodies to downstream crates.
+
+The producer also follows existing debug-place records through the pinned analysis-to-runtime passes, which preserve their order. It retains each record's original bare local identity before delegation, checks record count, name and source scope afterward, then resolves the transformed whole-field projection through rustc's runtime coroutine layout. A generated Pin alias must have one direct assignment from the coroutine argument. This does not add or alter MIR debug records. The optional `runtime_frame` table records saved-field indices, state membership and proven source-local correspondences. Empty source lists remain explicit for unnamed, projected or transformed-away records, including compiler-generated cleanup state. A changed record identity makes the table unavailable. The linker separately checks its shape against the monomorphic coroutine type. This maps whole source locals to runtime fields; it does not map source yield blocks to runtime states, reconstruct initialized cleanup or select continuations.
+
+The schema-8 `async` report keeps source yield sites separate from the estimated post-transform suspension states. An unavailable capture stays unavailable, including when an incremental query bypasses the producer hook. The backend keeps no MIR references in its session cache and supports one compiler session per process, as its global options do. Each codegen unit records the source queries as dependencies so edits to a generic-only library invalidate its saved metadata. The report derives normal-flow segments from block zero and every resume destination, stopping at yields. Segments may overlap and contain loops; imaginary borrow-check edges are excluded and unwind exits are reported separately. A resume destination from an unreachable yield still has a segment, so segment existence does not prove entry reachability. Potential async-drop cancellation edges are preserved on `Drop` terminators. A source yield count of zero does not prove that driving the future cannot suspend. The graph does not contain executable instruction operands, complete call effects, or a runtime drop plan. These facts alone never authorize native continuation lowering. Await relationships, wake sources, source-to-state mapping, live storage, initialized cleanup, and driver/cancellation legality require separate proofs. `scripts/suspension-facts-test.sh` checks local and generic-library captures, source lines, zero fallback, runtime results, off/report JavaScript identity, and cold/warm/edited incremental builds. Its independent `source-cfg-mir.py` check compares every block and edge with the pinned rustc analysis MIR dumps in cold and edited builds. The same checker independently reads runtime saved-field layouts and debug places, and rejects swapped source mappings and missing state fields.
+
+Each yield can also carry `liveness` with sorted source-local indices for retained values, retained locals previously borrowed, and live storage. The producer reuses the pinned `rustc_mir_dataflow` analyses and validates the retained union, field types, source identities, per-yield field order and source positions against `mir_coroutine_witnesses`. No source-position matching is used to infer local identity. Missing witnesses remain unavailable. The object reader rejects duplicate, out-of-range, self-retention and inconsistent borrowed-local records. These are promoted-MIR facts, not indices into the optimized runtime frame, initialized drop flags, or an executable continuation plan.
+
+The liveness fixture distinguishes a retained borrow, a consumed guard, a held guard and values live at different yields. Independent MIR checks resolve the authored local names and reject omitted live/borrowed records. Cold/warm/edited builds also replace a borrow with a value copy while keeping the yield count unchanged, verifying that incremental metadata tracks the changed retained state. Runtime-frame correspondence, executable source operands and state-specific cleanup remain separate requirements.
+
+The optional `initialization` table records conservative promoted-MIR move-path state before and after each terminator's primary effect. The producer reuses rustc's default maybe-initialized and maybe-uninitialized analyses over all tracked types. A path present in both sets is conditional; an aggregate's children must be considered separately after partial moves. Paths preserve their source local, parent and projection indices. Type-changing projections without generic type identity remain unavailable. Unreachable points carry no state. The object reader checks path ancestry, local and path indices, sorted unique sets and block coverage. These facts precede rustc's later drop-elaboration refinements and are not runtime drop flags. After a call's primary effect, moved arguments have left the caller but the return destination is not yet initialized: that happens only on the normal-return edge.
+
+The initialization fixture observes uninitialized and initialized locals, a partially moved tuple, conditional initialization across a real suspension, and call argument/destination state. Independent textual MIR probes locate the authored locals and calls. A conditional-to-definite initialization edit preserves the yield count while changing the serialized state, and four deliberately corrupted reports must fail the probe checks. Executable operands, runtime state correspondence and cleanup emission remain open.
+
+### Experimental ready Promise boundaries
+
+`js-jir-ready-futures=on` is a link-only opt-in for ordinary `future_to_promise` boundaries under the JIR `future-poller` pass. It is off by default and in every release profile. The linker requires a compiler-generated coroutine with no source yields or saved suspension state, plain captures without references or destructors, no source-local cleanup, an unused poll context, and only proven typed extern calls. Source callee identities also reject ordinary helpers hidden by MIR inlining. The positional producer/linker manifest is version 4. Custom pollers, awaits, retained borrows, and unsupported cleanup use the established executor.
+
+The selected `host_future_ready` driver preserves the existing poll and drop callbacks and passes a valid no-op waker. It creates a fresh Promise, drives synchronously, reads the ready result before dropping the future, and clears its retained frame before Promise adoption. Poll and drop exceptions retain their identity, with a drop exception taking priority. This removes scheduler flags, queued wake handling, and scheduling closures; it does not remove the Rust poll state machine, Context construction, or callback glue. It adds no Promise job boundary before first progress. Ordinary future construction stays inert until driven.
+
+Selection requires all analyzed ordinary Promise boundaries to be eligible, so a mixed program does not intentionally add a second driver facility. Any final lowering refusal while the ready plan is selected retries the whole program with that plan disabled. Report mode records `would_select` while retaining off-identical JavaScript. Async report schema 8 exposes `ready_boundaries` separately from the unselected suspension graphs. Rows explicitly leave `package_profitability_proven` false: the override is experimental, and complete-package economics and protected runtime remain external admission requirements.
+
+`scripts/promise-ready-test.sh` verifies compiled transition traces, inert construction, thenable adoption, rejection identity, reentrant driving, decline controls, source-call checks after MIR inlining, and injected whole-plan rollback. `scripts/runtime-ready.test.mjs` pins callback/drop exception priority and result access order in both full and extracted runtimes. `scripts/promise-ready-package.mjs <build-directory>` compares the complete minified runtime closure against the same fixture with the option off. `scripts/promise-ready-browser.mjs <build-directory> <output-directory>` runs the compiled fixtures, decline controls, rollback and complete packages in Chrome, Firefox and Safari. These checks do not qualify general suspending continuations, initialized-state cleanup, owner cancellation, or automatic release-policy selection.
+
+### The link step is a separate program, and the lane is its decision (v2)
+
+The dylib no longer links anything itself. It writes object files and execs its sibling binary
+`jsc-link` with a manifest; the graph walk, deduplication, chunking, the source map, the `.d.ts`,
+the report and the optimizer passes all live there. `scripts/build.sh` builds both and prints
+both paths, and `JSC_LINK_BIN` overrides where the dylib looks. `jsc-link/README.md` is the
+specification of the manifest and of the lanes.
+
+Because an object file carries both v1's printed JavaScript and the item's JIR-S body,
+`-Cllvm-args=js-lane=baseline|jir|shadow` chooses which spelling each item is printed from **at
+link time**: it is not emit-affecting, it does not enter the sysroot cache key, and one set of
+objects serves every lane. `baseline` is the default and is byte-identical to v1;
+`jir` prints the JIR lowering wherever it succeeded and v1's text for the rest, beside a
+`<out>.lane.json` sidecar; `shadow` prints both programs from one link so they can be diffed.
+`js-lane=jir` composes with `js-opt=on`: the pair was refused through Phase 2, because v1's text
+optimizer rewrote baseline JavaScript the lane does not print, and Phase 3 lifted the refusal by
+re-landing the rewrites as JIR passes (`jsc-link/src/opt/`). Phase 5 (W5h) then deleted the v1
+text optimizer outright: on the baseline lane `js-opt=on` now means the producer-baked passes plus
+link-dedup, with no link-time text rewriting, and `on` output is byte-identical to `off` plus
+dedup. `-Cllvm-args=js-jir-flat-abi=on|off` (default
+on, link-only) turns the lane's flat direct-call ABI off for bisecting.
+`-Cllvm-args=js-jir-typed-storage=on|off` (default off, also link-only) enables the experimental
+exact/reserved numeric storage path. It has no effect unless the lane is `jir` and the optimizer is
+`on`, and it does not require a distinct sysroot.
+
+The flat ABI covers eligible private direct-call parameters and narrow field-only product
+results. Result lane 0 is returned normally; additional lanes use program-wide collision-safe
+`$rN` spill bindings and must be consumed immediately by the direct caller. Caller and callee
+rewrite transactionally, and any unsupported export, indirect use, suspension, or lowering retry
+restores the canonical materialized ABI. Fixture 91 protects the result path. Interprocedural
+projection forwarding may reuse call arguments only for an immediately adjacent same-block copy;
+fixture 92 protects the mutation boundary.
+
+The typed-storage override does not change the semantic `NativeVec` carrier. For an eligible
+private `Vec<T>::with_capacity`, it allocates the buffer as one `Uint8Array`, `Int8Array`,
+`Uint16Array`, `Int16Array`, `Uint32Array`, `Int32Array`, `Float32Array`, or `Float64Array` at the
+greater of a constant initial capacity and a proven maximum logical length. The 32-bit target's
+`usize` and `isize` use the corresponding 32-bit arrays. The vector still carries independent
+`len` and logical `cap` fields; TypedArray length is never exposed as Rust capacity.
+
+The proof follows only a unique acyclic `Goto` path and applies integer-capacity casts with exact
+source/target widths and signedness. It permits private push, clear, length, emptiness,
+indexing/mutation, POD drop, and an immutable slice consumed only by a selected scalar
+`buf, off, len` direct-call ABI. A branch or unknown mutation loses the length proof. Dropful,
+zero-sized, unsized, or unsupported elements; custom or unknown allocators; capacity/layout,
+identity, address, or raw-parts observation; retained or mutable views; owned copies;
+remove/extend emission; and unadapted call, host, indirect, vtable, export, store, or return
+boundaries decline the complete value-local choice.
+
+Current schema-15 lane reports publish `constant_initial_capacity`, `proven_maximum_length`,
+`proven_exact_final_length`, `selected`, and an exact terminal reason for every candidate.
+`storage_mode` records whether the executable override was active, while selected rows record what
+actually changed. With the option absent, reporting remains observational and emission is
+unchanged. Fixture 104 and `scripts/storage-plan-test.sh` are the executable contract.
+
+Finished-AST SROA on a JIR-lowered declaration may forward a direct compiler-local alias only when
+the JIR SSA definition dominates it and the source slot is never replaced: an unassigned parameter
+or a local with exactly one whole write. The alias must itself have one source. A field alias keeps
+the narrower rule: its root is a fresh object literal and its final field is never assigned. The
+rewrite redirects reads to the already-evaluated source slot rather than moving the source
+expression, so object identity and mutation remain visible; reassigned sources, replaced-field
+snapshots, shadowed names, and verbatim JavaScript decline.
+
+JIR schema 9 appends one exact standard-iterator identity to `TypeMeta`. `SliceIter` and
+`Enumerate` use existing rustc diagnostic items; `patches/0013-iterator-diagnostic-items.patch`
+marks `Take` and `Skip`. The producer records only those compiler identities. A path, source span,
+debug name, or emitted JavaScript name is never semantic evidence for iterator lowering.
+
+The finished-JIR `slice-iter` pass covers exactly
+`Enumerate<Take<SliceIter<u8>>>` and `Enumerate<Skip<SliceIter<u8>>>`. The complete construction,
+source/end pointer relation, slice metadata length, direct or fresh mutable-borrow driver, loop SCC,
+backedges, and common exit must match. Adapter values may not escape. Blocks between a loop exit
+and its one parameter-free common exit may only read, project, borrow, cast, or discardably update
+the dead adapter state. Calls, arithmetic, unrelated stores, observed remaining length, other
+element types, and other adapter orders decline the rewrite.
+
+The replacement carries one checked `usize` cursor. `Take` tests both source length and limit;
+`Skip` begins at the limit and subtracts it for the enumerate index. The indexed byte borrow and
+cursor increment remain explicit JIR operations. Existing DCE removes the unreachable adapter
+graph. Before later slice forwarding, a `SliceIteratorCursor` witness independently checks the
+exact adapter, source, length, limit, cursor, guards, enumerate index, borrow, preheader, backedges,
+body, and exit for every selected loop. Complete rewrite SCCs and their preheaders must be pairwise
+disjoint. Failure preserves the original item with `proof.witness`. Lane-report schema 15 publishes
+global and per-item `slice_iter.would_lower` and `slice_iter.final_emitted`; report mode and witness
+fallback always report zero final cursors. Fixture 105 and `scripts/slice-iterator-test.sh` define
+the positive, explicit decline, early-break, and targeted-witness-fault contract.
+
+Lowering may inline a synthetic slot view only while its root is pure. An effectful expression that
+returns a slot is materialized before dereference, store-through, or the first borrow/raw view; this
+preserves Rust's one-evaluation rule. Pure field views stay visible to the alias planner instead of
+being hidden behind a temporary, so later stores still invalidate their reads. The JIR lowering
+tests pin both sides of that rule.
 
 ## Chunks (stage 4)
 
@@ -1657,14 +1888,9 @@ statements and says nothing about the old ones.
 
 ### The executor
 
-A future is driven by the `view-async` crate, and the division of labour is the point: **the poll
-loop is Rust and only the scheduler is JavaScript.** A loop on the JavaScript side would have to
-call `Future::poll`, which is monomorphized per future type and takes a `Pin<&mut Self>`, and this
-value model hands out neither a monomorphized method as a callable nor a `&mut F` as its receiver.
-Putting the loop in Rust shrinks the boundary to five markers, none of them generic over a future,
-and puts the policy where it can be tested.
+The `view-async` crate drives Rust futures under a captured reactive owner. With optimization disabled, a safe Rust `Rc<Task>` holds the pinned future and a callback-backed waker. Optimized builds pass the concrete Rust poll and drop functions to `__rt.host_spawn`, which holds the scheduling state in JavaScript. Both paths defer the first poll to a microtask, coalesce wakes, and preserve Rust's future state and drop glue.
 
-The shim's whole half is two members. `__rt.microtask(f)` is `queueMicrotask`. `__rt.settled(v, f)`
+The Promise bridge uses two primitives. `__rt.microtask(f)` is `queueMicrotask`. `__rt.settled(v, f)`
 calls `f(x, true)` when `v` resolves and `f(e, false)` when it rejects, and queues `f(v, true)` for
 a value that is not a thenable at all. Two decisions there: the thenable test is
 `typeof v.then === "function"` and not upstream's `"then" in v` property test (CONTRACT-DOM 14.9),
@@ -1672,17 +1898,19 @@ because this one refuses to call what is not callable; and a rejection is delive
 `ok === false` rather than left as a rejection, because the pinned runtime's error handling is
 entirely synchronous and a rejection reaches none of it (CONTRACT-DOM 14.4).
 
-On the Rust side, a module-level table holds one `Rc<Task>` per spawned future. **A waker's data is
-a task ID, never a pointer**: `RawWaker` takes a `*const ()`, and handing out `Box::into_raw` would
-ask this value model for a stable heap address, which is the part of it with the miscompile history.
-A `usize` is a number here. One `scheduled` flag per task makes any number of wakes between two
-polls cost one poll.
+The bridge reads `then` once and invokes that retrieved callable with the original value as its receiver. Getter, call, and synchronous callback exceptions propagate unchanged. Reading a callable's own `call` property is unnecessary and may itself invoke a getter or proxy trap. Non-callable values retain the deferred successful callback.
 
-The owner is captured at `spawn`, before the first poll, and every resume runs inside
-`_$runWithOwner`. That is not tidiness: the runtime's `Owner` is a module-level global restored in a
-synchronous `finally`, so for a suspended computation it is gone by the time a continuation runs,
-and a continuation without it reads signals without subscribing, registers cleanups that do nothing,
-and creates effects nobody disposes (CONTRACT-DOM 14.3). Every one of those is silent.
+Both `topcoat_js::await_promise` and `view_async::await_promise` catch an exception from that subscription call and return `Poll::Ready(Err(error))` in the first poll. The awaiting Rust body can then follow its normal error path and drop initialized locals. A synchronous settlement callback followed by a throw still returns the thrown error; queued or later callbacks cannot resume a completed driver. Successful subscription keeps the existing later-poll scheduling. This boundary does not catch exceptions from unrelated Rust or host calls or provide Rust unwinding.
+
+`view_abi::try_host` exposes the existing `rcgjs.host.try` operation for a closure returning unit and a typed error. As with `on_settled`, the error type is the caller's claim about the host value. `view_async` uses this boundary without leaving its captured owner. The subscription suite covers host values, strings, numbers, and unit, including deferred first polling, exact microtask order, initialized-local cleanup, rejection identity, and late callbacks after a throw.
+
+Both safe Rust task drivers catch host exceptions around polling while keeping the outer future-slot borrow outside the catch boundary. Terminal state is marked and the future is taken out of its slot before drop. Polling, completion, cancellation and throwing drop cannot leave the frame available to a queued wake. A drop exception takes precedence over a poll exception, matching the optimized host driver. Owner tasks run both polling and drop under the captured owner and propagate through the existing DOM error policy, which preserves Error instances and normalizes other thrown values. Plain tasks propagate the original host value. This is driver cleanup, not general Rust unwinding or reconstruction of locals initialized inside an active poll. The panic policy is unchanged. `scripts/task-cleanup-test.sh` and `scripts/task-cleanup-browser.mjs` compare the compiled drivers, owner cancellation, cleanup order and exception identity; the control mode runs preserved original libraries against the same checks.
+
+`scripts/active-poll-cleanup-test.sh` checks the separate, incomplete active-call cleanup contract. Its safe Rust fixture covers first-poll locals, locals created after resumption, partial aggregate construction, an owned argument moved into an ordinary callee, and replacement whose right-hand side throws. Both Promise drivers run each case normally and with an injected host exception across baseline/JIR and off/report/on. The script retains every result and exits nonzero when required drops are missing. Passing driver cleanup does not satisfy this gate: a suspended future's drop shim cannot recover a local that exists only inside an active Rust invocation.
+
+The owner is captured at `spawn`, before the first poll, and every resume runs inside `_$runWithOwner`. Owner cleanup cancels the task, drops its initialized future state under that same owner, and prevents later wakes from polling it. If cleanup occurs during an active poll, dropping the pinned frame waits until the poll returns. Already-issued native Promise or fetch work continues independently. Completion and repeated cleanup drop the future at most once.
+
+The `rcgjs.host.spawnowner.v2` marker admits this cleanup policy in both compiler lanes. Its optimized driver receives `onCleanup` as a seventh argument. The older `rcgjs.host.spawnowner` marker retains its six-argument driver contract, so linking an older object does not silently change its lifetime policy. `rcgjs.tc.cleanup` registers a closure with the current owner's `onCleanup`; without an owner, it registers nothing.
 
 An island's setup must stay synchronous whatever this does (CONTRACT-DOM 14.6), so the executor is
 only ever reached from an event handler or an effect. That is a constraint the emitter does not
@@ -1724,6 +1952,7 @@ abort at run time.
 | `rcgjs.tc.pushkeyed` | `list.push(__rt.keyed_row(site, key, row))` |
 | `rcgjs.tc.etv` | `event.target.value || ""`, the text of the element an event came from |
 | `rcgjs.tc.epd` | `event.preventDefault()` |
+| `rcgjs.tc.cleanup` | `_$onCleanup(() => body(env))` |
 | `rcgjs.tc.micro` | `__rt.microtask(() => body(env))` |
 | `rcgjs.tc.settled` | `__rt.settled(value, (x, ok) => body(env, x, ok))` |
 | `rcgjs.tc.owner` | `_$getOwner()` |
@@ -1749,11 +1978,7 @@ and `core`, `alloc` and `compiler_builtins` contain none: no rlib in the sysroot
 conservative than that and rebuilds on any change to the backend dylib, which is a build script
 decision rather than an ABI requirement.
 
-`rcgjs.tc.withowner` is the one lowering that needs a name the client ABI does not declare.
-`getOwner` is one of its 48 exports and **`runWithOwner` is not**: it exists inside
-`solid-js/web/dist/web.js` and is absent from that file's export clause, while `solid-js` proper
-does export it. So a client DOM module owes `runWithOwner` beyond the 48, exactly as it already owes
-`createSignal`, and both are re-exports of real `solid-js` exports rather than inventions.
+The executor imports `getOwner`, `runWithOwner`, and `onCleanup` from the configured DOM module. The vendored runtime exports these from one reactive graph, together with `createSignal` and the other reactive additions. A custom DOM module must provide the same owner and cleanup contract.
 
 The two event markers take the event **by reference**, unlike the signal markers, which take their
 handle by value (see "The handles are transparent, and taken by value"). The reason the two differ:
@@ -2021,7 +2246,7 @@ reference output. Two more rules make that order the source's rather than an acc
 Adding the field and then the tie-breaker bumped the object file's `FORMAT_VERSION` to 3.
 
 Runtime names are `ItemKind::Import` items from the `js-dom-module` specifier (default
-`mires-dom`), one item per name, bound as `_$template`, `_$insert`, `_$effect` and so on: the
+`topcoat-dom`), one item per name, bound as `_$template`, `_$insert`, `_$effect` and so on: the
 `_$` convention upstream's output uses, so a diff against the reference is about code rather than
 spelling. They deduplicate, order and survive dead code elimination through the machinery
 "Modules" already describes.
@@ -2046,6 +2271,13 @@ marker is collected exactly when the marker's body calls it. Every marker that t
 `cond` calls all three of its closures, `effect` calls its own, and `handler` builds an `Event` and
 calls the handler with it. `Event` is constructible only inside `view-abi`, which is what lets that
 body exist at all.
+
+Function items passed to these markers or to `topcoat-js` callbacks use their signature metadata
+for argument counts. A non-generic function in another crate can have compiled code in its rlib
+without exporting MIR to the caller. That absence does not prevent calling the function. Closure
+environments still use their MIR argument layout. `scripts/function-item-callbacks-test.sh` checks
+external zero-, one-, and two-argument functions, exception identity, generic functions and closures
+in both lanes and all three optimizer modes.
 
 So there is no walk of the backend's own here, and there was one: while a handler reached the
 backend through the fully generic `hole<V>`, which cannot call a `V`, the backend re-walked the
@@ -2271,11 +2503,14 @@ from anything and dead code elimination removes it, along with the `core::fmt` c
 ### The descriptor
 
 ```text
-rcgjs.ext.<version>.<shape><flags>.<module-len>,<name-len>.<module><name>
+rcgjs.ext.<version>.<shape><flags>.<slots>.<module-len>,<name-len>.<module><name>
 ```
 
-for example `rcgjs.ext.2.n-.8,5.chart.jsChart`. `<flags>` is a run of letters or `-` for none:
-`n` is a nullable return and `g` is a path rooted at the global scope. The fields are length prefixed rather than
+for example `rcgjs.ext.3.n-.-.8,5.chart.jsChart`. `<flags>` is a run of letters or `-` for none:
+`n` is a nullable return and `g` is a path rooted at the global scope. `<slots>` is the per-slot
+host contract, `-` where the declaration annotated none: a `,` separated run of `<key><letters>`
+entries in slot order, naming the carriers the host accepts at that slot and how it observes the
+value. Version 2, the same grammar without `<slots>`, is still decoded and annotates nothing. The fields are length prefixed rather than
 delimited because a module specifier holds `.`, `/`, `-`, `@` and `:` and a JavaScript name holds
 `$` and `_`: no character is safely excluded from both, a delimiter would need escaping, and an
 escaping bug is silent. Decoding is total, and the version is the first field read, so a descriptor
@@ -2396,7 +2631,7 @@ that already exists and is worth naming; a block is for the value that has no na
 that produced it is above. `fetch(url, init)` takes an options object holding
 `{ method, headers: { "content-type": .. }, body }`, and the value model makes a `#[repr(C)]` struct
 an object keyed by FIELD NAME. `content-type` is not a Rust field name, and no `#[js(rename)]` fixes
-it, because the object is a VALUE rather than a declaration. Before this, `mires-dom` declared one
+it, because the object is a VALUE rather than a declaration. Before this, `topcoat-dom` declared one
 host function whose whole job was to hold that object.
 
 ### The block is one expression, and it is not validated
@@ -2511,11 +2746,11 @@ The macro writes a marker function inside the expression, carrying the descripto
 {
     #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.js.1.2....")]
     #[inline(never)]
-    fn __mires_js_block<__JsBlock, __JsCapture0, __JsCapture1>(
+    fn __topcoat_js_block<__JsBlock, __JsCapture0, __JsCapture1>(
         __js_capture0: __JsCapture0,
         __js_capture1: __JsCapture1,
     ) -> __JsBlock { ::core::unreachable!(..) }
-    __mires_js_block(url, body)
+    __topcoat_js_block(url, body)
 }
 ```
 
@@ -2569,3 +2804,11 @@ a template literal through the verbatim form. It is compiled against the real `c
 `examples/async-tests/06_procedure.rs` is the motivating case running: `scripts/async-check.mjs`
 installs `globalThis.fetch`, records the init object the compiled program built, and asserts the
 method, the media type under the header name Rust cannot spell, and the argument array.
+
+## Effect-summary interpretation
+
+The effects corpus evaluates available JIR-R callees using their actual bodies and the caller's heap. A single operation budget covers the whole call tree. An explicit frame stack preserves caller values and cells across calls and bounds nesting at 128 frames without using host recursion. Return values, aliasing, writes and failures are observed independently of the summaries being checked. The per-object corpus uses one shared type and intern table; missing callees and operations outside the interpreter's declared subset produce explicit skipped runs. Type-shaped call stubs remain available for SSA transformation comparisons, but they are not execution evidence for effect-summary validation.
+
+Interpreter outcomes retain the result or trap, ordered call/drop trace and final mutable pointees on both success and failure. A failing call records its trap before propagation. SSA lowering and the DCE, range and partial-escape corpora share the complete-outcome comparison policy. Matching modeled failures agree only when their traces and pointees also agree. Unsupported operations, unavailable hooks, exhausted budgets and undefined original executions are explicitly skipped; malformed executions are mismatches. JIR-R transformation samples follow the lowered parameter list, including spread and caller-location parameters. These observations do not model all host exception identities, cleanup paths or writes restored before exit.
+
+Negative write claims in the effect-summary corpus use monotonic heap write history. Mutable slot access and storage reconstruction mark the containing heap object; allocation, reads and borrowing existing storage do not. A same-value store or a write later restored still contradicts a no-write claim on an argument's tracked pointee. Writes completed before an unsupported operation, unavailable hook or exhausted budget can also disprove the claim. These runs remain skipped, and a prefix without a write does not establish agreement about the unexecuted suffix. Prefix checks and contradictions are reported separately. This history is separate from differential outcomes: it validates conservative summaries without requiring an optimizer to preserve every unobserved intermediate store. Complete transitive alias graphs remain outside this check.

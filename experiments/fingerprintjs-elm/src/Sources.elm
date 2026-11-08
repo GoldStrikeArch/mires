@@ -1,0 +1,51 @@
+module Sources exposing (order)
+
+{-| Built-in entropy source keys in FingerprintJS 5.2.0 collection order.
+-}
+
+
+order : List String
+order =
+    [ "userAgentData"
+    , "fonts"
+    , "domBlockers"
+    , "fontPreferences"
+    , "audio"
+    , "screenFrame"
+    , "canvas"
+    , "osCpu"
+    , "languages"
+    , "colorDepth"
+    , "deviceMemory"
+    , "screenResolution"
+    , "hardwareConcurrency"
+    , "timezone"
+    , "sessionStorage"
+    , "localStorage"
+    , "indexedDB"
+    , "openDatabase"
+    , "cpuClass"
+    , "platform"
+    , "plugins"
+    , "touchSupport"
+    , "vendor"
+    , "vendorFlavors"
+    , "cookiesEnabled"
+    , "colorGamut"
+    , "invertedColors"
+    , "forcedColors"
+    , "monochrome"
+    , "contrast"
+    , "reducedMotion"
+    , "reducedTransparency"
+    , "hdr"
+    , "math"
+    , "pdfViewerEnabled"
+    , "architecture"
+    , "applePay"
+    , "privateClickMeasurement"
+    , "audioBaseLatency"
+    , "dateTimeLocale"
+    , "webGlBasics"
+    , "webGlExtensions"
+    ]

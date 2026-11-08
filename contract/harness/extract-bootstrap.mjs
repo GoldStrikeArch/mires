@@ -6,7 +6,7 @@
 // Writes fixtures/hydration-script.js.
 //
 // The extraction is driven rather than copied: we call the real function with
-// eventNames ["__MIRES_EVENTS__"], locate that sentinel in the output, and
+// eventNames ["__TOPCOAT_EVENTS__"], locate that sentinel in the output, and
 // replace it with a ${EVENTS} placeholder. Then we prove the round trip -- that
 // substituting a real event list into our template reproduces what solid emits
 // for that same list, byte for byte -- for several event lists including the
@@ -20,7 +20,7 @@ import { pathToFileURL } from "node:url";
 const server = await import(pathToFileURL(path.join(SOLID, "web", "dist", "server.js")).href);
 const { generateHydrationScript } = server;
 
-const SENTINEL = "__MIRES_EVENTS__";
+const SENTINEL = "__TOPCOAT_EVENTS__";
 
 // Drive with one sentinel event and lift the sentinel out from BETWEEN the
 // quotes solid supplies. solid's source is:

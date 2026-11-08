@@ -2,9 +2,7 @@
 
 #![allow(dead_code)]
 
-use structurizer::{
-    structure, Block, BlockId, Cfg, Options, Region, Scrut, Term, Test,
-};
+use structurizer::{structure, Block, BlockId, Cfg, Options, Region, Scrut, Term, Test};
 
 pub type S = &'static str;
 pub type R = Region<S, S>;
@@ -18,7 +16,11 @@ pub fn goto(t: u32) -> Term<S> {
 }
 
 pub fn cond(on: S, then_: u32, else_: u32) -> Term<S> {
-    Term::Cond { on, then_: b(then_), else_: b(else_) }
+    Term::Cond {
+        on,
+        then_: b(then_),
+        else_: b(else_),
+    }
 }
 
 pub fn switch(on: S, cases: &[(u128, u32)], default: u32) -> Term<S> {
@@ -53,7 +55,11 @@ pub fn cfg(blocks: Vec<Term<S>>) -> Cfg<S, S> {
         blocks: blocks
             .into_iter()
             .enumerate()
-            .map(|(i, term)| Block { stmts: names[i], term, unwind: None })
+            .map(|(i, term)| Block {
+                stmts: names[i],
+                term,
+                unwind: None,
+            })
             .collect(),
     }
 }
@@ -64,7 +70,11 @@ pub fn cfg_with(blocks: Vec<(S, Term<S>)>) -> Cfg<S, S> {
         entry: b(0),
         blocks: blocks
             .into_iter()
-            .map(|(stmts, term)| Block { stmts, term, unwind: None })
+            .map(|(stmts, term)| Block {
+                stmts,
+                term,
+                unwind: None,
+            })
             .collect(),
     }
 }
@@ -104,7 +114,15 @@ pub fn run_opts(c: Cfg<S, S>, opts: &Options) -> String {
                 s.push_str("// irreducible\n");
             }
             if out.stats.dispatch_fallbacks > 0 {
-                s.push_str(&format!("// dispatch x{}\n", out.stats.dispatch_fallbacks));
+                s.push_str(&format!(
+                    "// dispatch x{}{}\n",
+                    out.stats.dispatch_fallbacks,
+                    if out.stats.whole_body_dispatch {
+                        " (whole body)"
+                    } else {
+                        ""
+                    }
+                ));
             }
             let used = labels(&out.region);
             if !used.is_empty() {
@@ -149,7 +167,12 @@ fn walk(r: &R, s: &mut Summary) {
         Region::Seq(v) => v.iter().for_each(|r| walk(r, s)),
         Region::Block(_) => s.blocks += 1,
         Region::Labeled { body, .. } | Region::Loop { body, .. } => walk(body, s),
-        Region::If { test: t, then_, else_, .. } => {
+        Region::If {
+            test: t,
+            then_,
+            else_,
+            ..
+        } => {
             s.tests.push(
                 match t {
                     Test::IsTrue => "IsTrue",
@@ -197,7 +220,12 @@ fn collect_labels(r: &R, out: &mut Vec<u32>) {
             collect_labels(then_, out);
             collect_labels(else_, out);
         }
-        Region::Switch { arms, default, label, .. } => {
+        Region::Switch {
+            arms,
+            default,
+            label,
+            ..
+        } => {
             out.extend(label.map(|l| l.0));
             arms.iter().for_each(|(_, r)| collect_labels(r, out));
             collect_labels(default, out);
@@ -280,7 +308,12 @@ fn write_region(out: &mut String, r: &R, d: usize) {
             pad(out, d);
             out.push_str(&format!("let $t{} = {};\n", tmp.0, value));
         }
-        Region::If { scrut: s, test: t, then_, else_ } => {
+        Region::If {
+            scrut: s,
+            test: t,
+            then_,
+            else_,
+        } => {
             pad(out, d);
             out.push_str(&format!("if ({}) {{\n", test(s, t)));
             write_region(out, then_, d + 1);
@@ -294,7 +327,12 @@ fn write_region(out: &mut String, r: &R, d: usize) {
                 out.push_str("}\n");
             }
         }
-        Region::Switch { scrut: s, arms, default, label } => {
+        Region::Switch {
+            scrut: s,
+            arms,
+            default,
+            label,
+        } => {
             pad(out, d);
             if let Some(l) = label {
                 out.push_str(&format!("L{}: ", l.0));
@@ -312,7 +350,12 @@ fn write_region(out: &mut String, r: &R, d: usize) {
             pad(out, d);
             out.push_str("}\n");
         }
-        Region::Dispatch { sel, label, cases, trailing_break } => {
+        Region::Dispatch {
+            sel,
+            label,
+            cases,
+            trailing_break,
+        } => {
             pad(out, d);
             if let Some(l) = label {
                 out.push_str(&format!("L{}: ", l.0));

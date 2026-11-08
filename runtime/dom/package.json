@@ -1,5 +1,5 @@
 {
-  "name": "@mires/dom-runtime",
+  "name": "@topcoat-spike/dom-runtime",
   "version": "0.0.1",
   "private": true,
   "type": "module",
@@ -17,8 +17,8 @@
   },
   "$note-bundler": [
     "esbuild rather than tsup. crates/topcoat-runtime/browser uses tsup, and this",
-    "build mirrors its settings exactly (esm / noExternal / platform browser /",
-    "target es2022 / minify / sourcemap). But tsup is a wrapper whose value is",
+    "build matches its packaging settings (esm / noExternal / platform browser /",
+    "minify / sourcemap) but deliberately targets es2018 rather than es2022. tsup's value is",
     "TypeScript entry handling and dts emission, and this package has neither: a",
     "single hand-written .js re-export file. esbuild is what tsup would call",
     "anyway, with one less layer between the pin and the artifact.",

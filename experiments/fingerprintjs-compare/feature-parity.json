@@ -1,0 +1,5516 @@
+{
+  "schema": 2,
+  "generatedAt": "2026-08-15T18:23:11.641Z",
+  "oracleCommit": "e196578ba35362fdf15647e013d66ac28b3c9fb5",
+  "expected": {
+    "exportCount": 25,
+    "sourceCount": 42,
+    "exports": [
+      "componentsToDebugString",
+      "default",
+      "getFullscreenElement",
+      "getUnstableAudioFingerprint",
+      "getUnstableCanvasFingerprint",
+      "getUnstableHardwareConcurrency",
+      "getUnstableScreenFrame",
+      "getUnstableScreenResolution",
+      "getWebGLContext",
+      "hashComponents",
+      "isAndroid",
+      "isChromium",
+      "isDesktopWebKit",
+      "isEdgeHTML",
+      "isGecko",
+      "isSamsungInternet",
+      "isTrident",
+      "isWebKit",
+      "load",
+      "loadSources",
+      "murmurX64Hash128",
+      "prepareForSources",
+      "sources",
+      "transformSource",
+      "withIframe"
+    ],
+    "defaultExports": [
+      "load",
+      "hashComponents",
+      "componentsToDebugString"
+    ],
+    "sources": [
+      "userAgentData",
+      "fonts",
+      "domBlockers",
+      "fontPreferences",
+      "audio",
+      "screenFrame",
+      "canvas",
+      "osCpu",
+      "languages",
+      "colorDepth",
+      "deviceMemory",
+      "screenResolution",
+      "hardwareConcurrency",
+      "timezone",
+      "sessionStorage",
+      "localStorage",
+      "indexedDB",
+      "openDatabase",
+      "cpuClass",
+      "platform",
+      "plugins",
+      "touchSupport",
+      "vendor",
+      "vendorFlavors",
+      "cookiesEnabled",
+      "colorGamut",
+      "invertedColors",
+      "forcedColors",
+      "monochrome",
+      "contrast",
+      "reducedMotion",
+      "reducedTransparency",
+      "hdr",
+      "math",
+      "pdfViewerEnabled",
+      "architecture",
+      "applePay",
+      "privateClickMeasurement",
+      "audioBaseLatency",
+      "dateTimeLocale",
+      "webGlBasics",
+      "webGlExtensions"
+    ],
+    "declarationsSha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+  },
+  "definitions": {
+    "coreFingerprintParity": "Exact 42-source registry and source function metadata, plus zero normalized differences in the agent, component, custom-source, hash, confidence, and lazy visitor-id differential across Chrome, Firefox, and Safari.",
+    "upstreamSideEffectParity": "Direct utilities, monitoring, debug logging, iframe rejection/cleanup, preparation, and unstable helper behavior match the unmodified FingerprintJS oracle.",
+    "observableFunctionMetadata": "Public Function.name and Function.length, plus audited returned-function metadata, match the oracle.",
+    "oracleFormatCoverage": "Every JavaScript/declaration artifact present in the oracle dist directory is present; extra formats are allowed."
+  },
+  "rows": [
+    {
+      "id": "rust-idiomatic",
+      "label": "Idiomatic Rust",
+      "family": "rust",
+      "coreFingerprintParity": true,
+      "upstreamSideEffectParity": true,
+      "observableFunctionMetadata": false,
+      "apiKeysAndTypes": true,
+      "iifeApiShape": true,
+      "oracleFormatCoverage": true,
+      "strictEsmParity": false,
+      "artifactPackageParity": false,
+      "baselineBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "extendedBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "baselineDifferenceCount": 0,
+      "behavioralIssues": [],
+      "metadataIssues": [
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        }
+      ],
+      "metadataSummary": {
+        "exportedFunctions": [],
+        "returnedFunctions": [
+          "agent.get"
+        ]
+      },
+      "behavioralDifferences": [],
+      "metadataDifferences": [
+        {
+          "browser": "chrome",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        }
+      ],
+      "missingRequiredArtifacts": []
+    },
+    {
+      "id": "rescript",
+      "label": "ReScript",
+      "family": "rescript",
+      "coreFingerprintParity": true,
+      "upstreamSideEffectParity": true,
+      "observableFunctionMetadata": false,
+      "apiKeysAndTypes": true,
+      "iifeApiShape": true,
+      "oracleFormatCoverage": false,
+      "strictEsmParity": false,
+      "artifactPackageParity": false,
+      "baselineBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "extendedBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "baselineDifferenceCount": 0,
+      "behavioralIssues": [],
+      "metadataIssues": [
+        {
+          "path": "exports.componentsToDebugString",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "componentsToDebugString",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "componentsToDebugString$1",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.getFullscreenElement",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getFullscreenElement",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "getFullscreenElement$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getUnstableAudioFingerprint",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableAudioFingerprint",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "getUnstableAudioFingerprint$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getUnstableCanvasFingerprint",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableCanvasFingerprint",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "getUnstableCanvasFingerprint$1",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.getUnstableHardwareConcurrency",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableHardwareConcurrency",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "getUnstableHardwareConcurrency$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getUnstableScreenFrame",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableScreenFrame",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "getUnstableScreenFrame$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getUnstableScreenResolution",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableScreenResolution",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "getUnstableScreenResolution$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getWebGLContext",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getWebGLContext",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "getWebGLContext$1",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.hashComponents",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "hashComponents",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "hashComponents$1",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.isAndroid",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isAndroid",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "isAndroid$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isChromium",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isChromium",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "isChromium$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isDesktopWebKit",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isDesktopWebKit",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "isDesktopWebKit$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isEdgeHTML",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isEdgeHTML",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "isEdgeHTML$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isGecko",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isGecko",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "isGecko$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isSamsungInternet",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isSamsungInternet",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "isSamsungInternet$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isTrident",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isTrident",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "isTrident$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isWebKit",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isWebKit",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "isWebKit$1",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.load",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "load",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "load$1",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.loadSources",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "loadSources",
+            "length": 4
+          },
+          "candidate": {
+            "type": "function",
+            "name": "loadSources$1",
+            "length": 4
+          }
+        },
+        {
+          "path": "exports.prepareForSources",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "prepareForSources",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "prepareForSources$1",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.transformSource",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "transformSource",
+            "length": 2
+          },
+          "candidate": {
+            "type": "function",
+            "name": "transformSource$1",
+            "length": 2
+          }
+        },
+        {
+          "path": "exports.withIframe",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "withIframe",
+            "length": 2
+          },
+          "candidate": {
+            "type": "function",
+            "name": "withIframe$1",
+            "length": 3
+          }
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "componentsToDebugString",
+          "candidate": "componentsToDebugString$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getFullscreenElement",
+          "candidate": "getFullscreenElement$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": "getUnstableAudioFingerprint$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": "getUnstableCanvasFingerprint$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": "getUnstableHardwareConcurrency$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableScreenFrame",
+          "candidate": "getUnstableScreenFrame$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableScreenResolution",
+          "candidate": "getUnstableScreenResolution$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getWebGLContext",
+          "candidate": "getWebGLContext$1"
+        },
+        {
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "hashComponents",
+          "candidate": "hashComponents$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isAndroid",
+          "candidate": "isAndroid$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isChromium.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isChromium",
+          "candidate": "isChromium$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isDesktopWebKit",
+          "candidate": "isDesktopWebKit$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isEdgeHTML",
+          "candidate": "isEdgeHTML$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isGecko.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isGecko",
+          "candidate": "isGecko$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isSamsungInternet",
+          "candidate": "isSamsungInternet$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isTrident.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isTrident",
+          "candidate": "isTrident$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isWebKit",
+          "candidate": "isWebKit$1"
+        },
+        {
+          "path": "$[0].exportFunctions.load.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.load.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "load",
+          "candidate": "load$1"
+        },
+        {
+          "path": "$[0].exportFunctions.loadSources.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "loadSources",
+          "candidate": "loadSources$1"
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "prepareForSources",
+          "candidate": "prepareForSources$1"
+        },
+        {
+          "path": "$[0].exportFunctions.transformSource.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "transformSource",
+          "candidate": "transformSource$1"
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "withIframe",
+          "candidate": "withIframe$1"
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "componentsToDebugString",
+          "candidate": "componentsToDebugString$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getFullscreenElement",
+          "candidate": "getFullscreenElement$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": "getUnstableAudioFingerprint$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": "getUnstableCanvasFingerprint$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": "getUnstableHardwareConcurrency$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableScreenFrame",
+          "candidate": "getUnstableScreenFrame$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableScreenResolution",
+          "candidate": "getUnstableScreenResolution$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getWebGLContext",
+          "candidate": "getWebGLContext$1"
+        },
+        {
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "hashComponents",
+          "candidate": "hashComponents$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isAndroid",
+          "candidate": "isAndroid$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isChromium.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isChromium",
+          "candidate": "isChromium$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isDesktopWebKit",
+          "candidate": "isDesktopWebKit$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isEdgeHTML",
+          "candidate": "isEdgeHTML$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isGecko.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isGecko",
+          "candidate": "isGecko$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isSamsungInternet",
+          "candidate": "isSamsungInternet$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isTrident.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isTrident",
+          "candidate": "isTrident$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isWebKit",
+          "candidate": "isWebKit$1"
+        },
+        {
+          "path": "$[0].exportFunctions.load.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.load.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "load",
+          "candidate": "load$1"
+        },
+        {
+          "path": "$[0].exportFunctions.loadSources.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "loadSources",
+          "candidate": "loadSources$1"
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "prepareForSources",
+          "candidate": "prepareForSources$1"
+        },
+        {
+          "path": "$[0].exportFunctions.transformSource.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "transformSource",
+          "candidate": "transformSource$1"
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "withIframe",
+          "candidate": "withIframe$1"
+        },
+        {
+          "path": "$[0].exportFunctions.transformSource.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "transformSource",
+          "candidate": "transformSource$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isWebKit",
+          "candidate": "isWebKit$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isAndroid",
+          "candidate": "isAndroid$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getWebGLContext",
+          "candidate": "getWebGLContext$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isGecko.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isGecko",
+          "candidate": "isGecko$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isTrident.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isTrident",
+          "candidate": "isTrident$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": "getUnstableCanvasFingerprint$1"
+        },
+        {
+          "path": "$[0].exportFunctions.loadSources.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "loadSources",
+          "candidate": "loadSources$1"
+        },
+        {
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "componentsToDebugString",
+          "candidate": "componentsToDebugString$1"
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "prepareForSources",
+          "candidate": "prepareForSources$1"
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": "getUnstableHardwareConcurrency$1"
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "withIframe",
+          "candidate": "withIframe$1"
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableScreenFrame",
+          "candidate": "getUnstableScreenFrame$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": "getUnstableAudioFingerprint$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getFullscreenElement",
+          "candidate": "getFullscreenElement$1"
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableScreenResolution",
+          "candidate": "getUnstableScreenResolution$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isChromium.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isChromium",
+          "candidate": "isChromium$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isEdgeHTML",
+          "candidate": "isEdgeHTML$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isDesktopWebKit",
+          "candidate": "isDesktopWebKit$1"
+        },
+        {
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isSamsungInternet",
+          "candidate": "isSamsungInternet$1"
+        },
+        {
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "hashComponents",
+          "candidate": "hashComponents$1"
+        },
+        {
+          "path": "$[0].exportFunctions.load.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "load",
+          "candidate": "load$1"
+        },
+        {
+          "path": "$[0].exportFunctions.load.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        }
+      ],
+      "metadataSummary": {
+        "exportedFunctions": [
+          "componentsToDebugString",
+          "getFullscreenElement",
+          "getUnstableAudioFingerprint",
+          "getUnstableCanvasFingerprint",
+          "getUnstableHardwareConcurrency",
+          "getUnstableScreenFrame",
+          "getUnstableScreenResolution",
+          "getWebGLContext",
+          "hashComponents",
+          "isAndroid",
+          "isChromium",
+          "isDesktopWebKit",
+          "isEdgeHTML",
+          "isGecko",
+          "isSamsungInternet",
+          "isTrident",
+          "isWebKit",
+          "load",
+          "loadSources",
+          "prepareForSources",
+          "transformSource",
+          "withIframe"
+        ],
+        "returnedFunctions": [
+          "agent.get"
+        ]
+      },
+      "behavioralDifferences": [],
+      "metadataDifferences": [
+        {
+          "browser": "chrome",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "upstream": "componentsToDebugString",
+          "candidate": "componentsToDebugString$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "upstream": "getFullscreenElement",
+          "candidate": "getFullscreenElement$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": "getUnstableAudioFingerprint$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": "getUnstableCanvasFingerprint$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": "getUnstableHardwareConcurrency$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "upstream": "getUnstableScreenFrame",
+          "candidate": "getUnstableScreenFrame$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "upstream": "getUnstableScreenResolution",
+          "candidate": "getUnstableScreenResolution$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "upstream": "getWebGLContext",
+          "candidate": "getWebGLContext$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "upstream": "hashComponents",
+          "candidate": "hashComponents$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "upstream": "isAndroid",
+          "candidate": "isAndroid$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isChromium.name",
+          "upstream": "isChromium",
+          "candidate": "isChromium$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "upstream": "isDesktopWebKit",
+          "candidate": "isDesktopWebKit$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "upstream": "isEdgeHTML",
+          "candidate": "isEdgeHTML$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isGecko.name",
+          "upstream": "isGecko",
+          "candidate": "isGecko$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "upstream": "isSamsungInternet",
+          "candidate": "isSamsungInternet$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isTrident.name",
+          "upstream": "isTrident",
+          "candidate": "isTrident$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "upstream": "isWebKit",
+          "candidate": "isWebKit$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.load.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.load.name",
+          "upstream": "load",
+          "candidate": "load$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.loadSources.name",
+          "upstream": "loadSources",
+          "candidate": "loadSources$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "upstream": "prepareForSources",
+          "candidate": "prepareForSources$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.transformSource.name",
+          "upstream": "transformSource",
+          "candidate": "transformSource$1"
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.withIframe.length",
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.withIframe.name",
+          "upstream": "withIframe",
+          "candidate": "withIframe$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "upstream": "componentsToDebugString",
+          "candidate": "componentsToDebugString$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "upstream": "getFullscreenElement",
+          "candidate": "getFullscreenElement$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": "getUnstableAudioFingerprint$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": "getUnstableCanvasFingerprint$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": "getUnstableHardwareConcurrency$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "upstream": "getUnstableScreenFrame",
+          "candidate": "getUnstableScreenFrame$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "upstream": "getUnstableScreenResolution",
+          "candidate": "getUnstableScreenResolution$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "upstream": "getWebGLContext",
+          "candidate": "getWebGLContext$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "upstream": "hashComponents",
+          "candidate": "hashComponents$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "upstream": "isAndroid",
+          "candidate": "isAndroid$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isChromium.name",
+          "upstream": "isChromium",
+          "candidate": "isChromium$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "upstream": "isDesktopWebKit",
+          "candidate": "isDesktopWebKit$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "upstream": "isEdgeHTML",
+          "candidate": "isEdgeHTML$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isGecko.name",
+          "upstream": "isGecko",
+          "candidate": "isGecko$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "upstream": "isSamsungInternet",
+          "candidate": "isSamsungInternet$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isTrident.name",
+          "upstream": "isTrident",
+          "candidate": "isTrident$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "upstream": "isWebKit",
+          "candidate": "isWebKit$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.load.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.load.name",
+          "upstream": "load",
+          "candidate": "load$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.loadSources.name",
+          "upstream": "loadSources",
+          "candidate": "loadSources$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "upstream": "prepareForSources",
+          "candidate": "prepareForSources$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.transformSource.name",
+          "upstream": "transformSource",
+          "candidate": "transformSource$1"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.withIframe.length",
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.withIframe.name",
+          "upstream": "withIframe",
+          "candidate": "withIframe$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.transformSource.name",
+          "upstream": "transformSource",
+          "candidate": "transformSource$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "upstream": "isWebKit",
+          "candidate": "isWebKit$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "upstream": "isAndroid",
+          "candidate": "isAndroid$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "upstream": "getWebGLContext",
+          "candidate": "getWebGLContext$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isGecko.name",
+          "upstream": "isGecko",
+          "candidate": "isGecko$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isTrident.name",
+          "upstream": "isTrident",
+          "candidate": "isTrident$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": "getUnstableCanvasFingerprint$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.loadSources.name",
+          "upstream": "loadSources",
+          "candidate": "loadSources$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "upstream": "componentsToDebugString",
+          "candidate": "componentsToDebugString$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "upstream": "prepareForSources",
+          "candidate": "prepareForSources$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": "getUnstableHardwareConcurrency$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.withIframe.name",
+          "upstream": "withIframe",
+          "candidate": "withIframe$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.withIframe.length",
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "upstream": "getUnstableScreenFrame",
+          "candidate": "getUnstableScreenFrame$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": "getUnstableAudioFingerprint$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "upstream": "getFullscreenElement",
+          "candidate": "getFullscreenElement$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "upstream": "getUnstableScreenResolution",
+          "candidate": "getUnstableScreenResolution$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isChromium.name",
+          "upstream": "isChromium",
+          "candidate": "isChromium$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "upstream": "isEdgeHTML",
+          "candidate": "isEdgeHTML$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "upstream": "isDesktopWebKit",
+          "candidate": "isDesktopWebKit$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "upstream": "isSamsungInternet",
+          "candidate": "isSamsungInternet$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "upstream": "hashComponents",
+          "candidate": "hashComponents$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.load.name",
+          "upstream": "load",
+          "candidate": "load$1"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.load.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        }
+      ],
+      "missingRequiredArtifacts": [
+        "fp.cjs.js",
+        "fp.js",
+        "fp.umd.js",
+        "fp.umd.min.js"
+      ]
+    },
+    {
+      "id": "melange",
+      "label": "Melange 7.0.1",
+      "family": "melange",
+      "coreFingerprintParity": true,
+      "upstreamSideEffectParity": true,
+      "observableFunctionMetadata": true,
+      "apiKeysAndTypes": true,
+      "iifeApiShape": true,
+      "oracleFormatCoverage": false,
+      "strictEsmParity": true,
+      "artifactPackageParity": false,
+      "baselineBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "extendedBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "baselineDifferenceCount": 0,
+      "behavioralIssues": [],
+      "metadataIssues": [],
+      "metadataSummary": {
+        "exportedFunctions": [],
+        "returnedFunctions": []
+      },
+      "behavioralDifferences": [],
+      "metadataDifferences": [],
+      "missingRequiredArtifacts": [
+        "fp.cjs.js",
+        "fp.js",
+        "fp.umd.js",
+        "fp.umd.min.js"
+      ]
+    },
+    {
+      "id": "jsoo",
+      "label": "js_of_ocaml",
+      "family": "jsoo",
+      "coreFingerprintParity": true,
+      "upstreamSideEffectParity": true,
+      "observableFunctionMetadata": true,
+      "apiKeysAndTypes": true,
+      "iifeApiShape": false,
+      "oracleFormatCoverage": false,
+      "strictEsmParity": true,
+      "artifactPackageParity": false,
+      "baselineBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "extendedBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "baselineDifferenceCount": 0,
+      "behavioralIssues": [],
+      "metadataIssues": [],
+      "metadataSummary": {
+        "exportedFunctions": [],
+        "returnedFunctions": []
+      },
+      "behavioralDifferences": [],
+      "metadataDifferences": [],
+      "missingRequiredArtifacts": [
+        "fp.cjs.js",
+        "fp.js",
+        "fp.umd.js",
+        "fp.umd.min.js"
+      ]
+    },
+    {
+      "id": "rust-compact",
+      "label": "Compact Rust",
+      "family": "rust",
+      "coreFingerprintParity": true,
+      "upstreamSideEffectParity": true,
+      "observableFunctionMetadata": false,
+      "apiKeysAndTypes": true,
+      "iifeApiShape": true,
+      "oracleFormatCoverage": true,
+      "strictEsmParity": false,
+      "artifactPackageParity": false,
+      "baselineBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "extendedBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "baselineDifferenceCount": 0,
+      "behavioralIssues": [],
+      "metadataIssues": [
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].unstable.audio.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "",
+          "candidate": "_0"
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].unstable.audio.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "",
+          "candidate": "_0"
+        },
+        {
+          "path": "$[0].unstable.audio.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "",
+          "candidate": "_0"
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        }
+      ],
+      "metadataSummary": {
+        "exportedFunctions": [],
+        "returnedFunctions": [
+          "agent.get",
+          "audio cleanup function"
+        ]
+      },
+      "behavioralDifferences": [],
+      "metadataDifferences": [
+        {
+          "browser": "chrome",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].unstable.audio.name",
+          "upstream": "",
+          "candidate": "_0"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].unstable.audio.name",
+          "upstream": "",
+          "candidate": "_0"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].unstable.audio.name",
+          "upstream": "",
+          "candidate": "_0"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        }
+      ],
+      "missingRequiredArtifacts": []
+    },
+    {
+      "id": "rust-hybrid",
+      "label": "Hybrid Rust",
+      "family": "rust",
+      "coreFingerprintParity": true,
+      "upstreamSideEffectParity": true,
+      "observableFunctionMetadata": false,
+      "apiKeysAndTypes": true,
+      "iifeApiShape": true,
+      "oracleFormatCoverage": true,
+      "strictEsmParity": false,
+      "artifactPackageParity": false,
+      "baselineBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "extendedBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "baselineDifferenceCount": 0,
+      "behavioralIssues": [],
+      "metadataIssues": [
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        }
+      ],
+      "metadataSummary": {
+        "exportedFunctions": [],
+        "returnedFunctions": [
+          "agent.get"
+        ]
+      },
+      "behavioralDifferences": [],
+      "metadataDifferences": [
+        {
+          "browser": "chrome",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        }
+      ],
+      "missingRequiredArtifacts": []
+    },
+    {
+      "id": "dart-o2",
+      "label": "Dart2js -O2 (production)",
+      "family": "dart",
+      "coreFingerprintParity": true,
+      "upstreamSideEffectParity": true,
+      "observableFunctionMetadata": false,
+      "apiKeysAndTypes": true,
+      "iifeApiShape": false,
+      "oracleFormatCoverage": false,
+      "strictEsmParity": false,
+      "artifactPackageParity": false,
+      "baselineBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "extendedBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "baselineDifferenceCount": 0,
+      "behavioralIssues": [],
+      "metadataIssues": [
+        {
+          "path": "exports.getUnstableCanvasFingerprint",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableCanvasFingerprint",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "getUnstableCanvasFingerprint",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.loadSources",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "loadSources",
+            "length": 4
+          },
+          "candidate": {
+            "type": "function",
+            "name": "loadSources",
+            "length": 3
+          }
+        },
+        {
+          "path": "exports.murmurX64Hash128",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "x64hash128",
+            "length": 2
+          },
+          "candidate": {
+            "type": "function",
+            "name": "x64hash128",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.withIframe",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "withIframe",
+            "length": 2
+          },
+          "candidate": {
+            "type": "function",
+            "name": "withIframe",
+            "length": 1
+          }
+        },
+        {
+          "path": "$[0].agent.get.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 1,
+          "candidate": 0
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 1,
+          "candidate": 0
+        },
+        {
+          "path": "$[0].exportFunctions.loadSources.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 4,
+          "candidate": 3
+        },
+        {
+          "path": "$[0].exportFunctions.murmurX64Hash128.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 2,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 2,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].agent.get.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 1,
+          "candidate": 0
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 1,
+          "candidate": 0
+        },
+        {
+          "path": "$[0].exportFunctions.loadSources.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 4,
+          "candidate": 3
+        },
+        {
+          "path": "$[0].exportFunctions.murmurX64Hash128.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 2,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 2,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 1,
+          "candidate": 0
+        },
+        {
+          "path": "$[0].exportFunctions.loadSources.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 4,
+          "candidate": 3
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 2,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.murmurX64Hash128.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 2,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].agent.get.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 1,
+          "candidate": 0
+        }
+      ],
+      "metadataSummary": {
+        "exportedFunctions": [
+          "getUnstableCanvasFingerprint",
+          "loadSources",
+          "murmurX64Hash128",
+          "withIframe"
+        ],
+        "returnedFunctions": [
+          "agent.get"
+        ]
+      },
+      "behavioralDifferences": [],
+      "metadataDifferences": [
+        {
+          "browser": "chrome",
+          "path": "$[0].agent.get.length",
+          "upstream": 1,
+          "candidate": 0
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.length",
+          "upstream": 1,
+          "candidate": 0
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.loadSources.length",
+          "upstream": 4,
+          "candidate": 3
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.murmurX64Hash128.length",
+          "upstream": 2,
+          "candidate": 1
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.withIframe.length",
+          "upstream": 2,
+          "candidate": 1
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].agent.get.length",
+          "upstream": 1,
+          "candidate": 0
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.length",
+          "upstream": 1,
+          "candidate": 0
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.loadSources.length",
+          "upstream": 4,
+          "candidate": 3
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.murmurX64Hash128.length",
+          "upstream": 2,
+          "candidate": 1
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.withIframe.length",
+          "upstream": 2,
+          "candidate": 1
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.length",
+          "upstream": 1,
+          "candidate": 0
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.loadSources.length",
+          "upstream": 4,
+          "candidate": 3
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.withIframe.length",
+          "upstream": 2,
+          "candidate": 1
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.murmurX64Hash128.length",
+          "upstream": 2,
+          "candidate": 1
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].agent.get.length",
+          "upstream": 1,
+          "candidate": 0
+        }
+      ],
+      "missingRequiredArtifacts": [
+        "fp.cjs.js",
+        "fp.js",
+        "fp.umd.js",
+        "fp.umd.min.js"
+      ]
+    },
+    {
+      "id": "scalajs-full",
+      "label": "Scala.js fullLink (production)",
+      "family": "scalajs",
+      "coreFingerprintParity": true,
+      "upstreamSideEffectParity": true,
+      "observableFunctionMetadata": false,
+      "apiKeysAndTypes": true,
+      "iifeApiShape": true,
+      "oracleFormatCoverage": false,
+      "strictEsmParity": false,
+      "artifactPackageParity": false,
+      "baselineBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "extendedBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "baselineDifferenceCount": 0,
+      "behavioralIssues": [],
+      "metadataIssues": [
+        {
+          "path": "exports.componentsToDebugString",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "componentsToDebugString",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.getFullscreenElement",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getFullscreenElement",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getUnstableAudioFingerprint",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableAudioFingerprint",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getUnstableCanvasFingerprint",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableCanvasFingerprint",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.getUnstableHardwareConcurrency",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableHardwareConcurrency",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getUnstableScreenFrame",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableScreenFrame",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getUnstableScreenResolution",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableScreenResolution",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getWebGLContext",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getWebGLContext",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.hashComponents",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "hashComponents",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.isAndroid",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isAndroid",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isChromium",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isChromium",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isDesktopWebKit",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isDesktopWebKit",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isEdgeHTML",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isEdgeHTML",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isGecko",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isGecko",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isSamsungInternet",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isSamsungInternet",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isTrident",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isTrident",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isWebKit",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isWebKit",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.load",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "load",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.loadSources",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "loadSources",
+            "length": 4
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 4
+          }
+        },
+        {
+          "path": "exports.murmurX64Hash128",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "x64hash128",
+            "length": 2
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 2
+          }
+        },
+        {
+          "path": "exports.prepareForSources",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "prepareForSources",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.transformSource",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "transformSource",
+            "length": 2
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 2
+          }
+        },
+        {
+          "path": "exports.withIframe",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "withIframe",
+            "length": 2
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 3
+          }
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "componentsToDebugString",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getFullscreenElement",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableScreenFrame",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableScreenResolution",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getWebGLContext",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "hashComponents",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isAndroid",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isChromium.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isChromium",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isDesktopWebKit",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isEdgeHTML",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isGecko.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isGecko",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isSamsungInternet",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isTrident.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isTrident",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isWebKit",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.load.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.load.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "load",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.loadSources.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "loadSources",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "x64hash128",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "prepareForSources",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.transformSource.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "transformSource",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "withIframe",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "componentsToDebugString",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getFullscreenElement",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableScreenFrame",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableScreenResolution",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getWebGLContext",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "hashComponents",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isAndroid",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isChromium.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isChromium",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isDesktopWebKit",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isEdgeHTML",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isGecko.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isGecko",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isSamsungInternet",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isTrident.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isTrident",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isWebKit",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.load.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.load.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "load",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.loadSources.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "loadSources",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "x64hash128",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "prepareForSources",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.transformSource.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "transformSource",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "withIframe",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.transformSource.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "transformSource",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isWebKit",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isAndroid",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getWebGLContext",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isGecko.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isGecko",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isTrident.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isTrident",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.loadSources.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "loadSources",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "componentsToDebugString",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "prepareForSources",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "withIframe",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableScreenFrame",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getFullscreenElement",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableScreenResolution",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "x64hash128",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isChromium.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isChromium",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isEdgeHTML",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isDesktopWebKit",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isSamsungInternet",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "hashComponents",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.load.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "load",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.load.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        }
+      ],
+      "metadataSummary": {
+        "exportedFunctions": [
+          "componentsToDebugString",
+          "getFullscreenElement",
+          "getUnstableAudioFingerprint",
+          "getUnstableCanvasFingerprint",
+          "getUnstableHardwareConcurrency",
+          "getUnstableScreenFrame",
+          "getUnstableScreenResolution",
+          "getWebGLContext",
+          "hashComponents",
+          "isAndroid",
+          "isChromium",
+          "isDesktopWebKit",
+          "isEdgeHTML",
+          "isGecko",
+          "isSamsungInternet",
+          "isTrident",
+          "isWebKit",
+          "load",
+          "loadSources",
+          "murmurX64Hash128",
+          "prepareForSources",
+          "transformSource",
+          "withIframe"
+        ],
+        "returnedFunctions": [
+          "agent.get"
+        ]
+      },
+      "behavioralDifferences": [],
+      "metadataDifferences": [
+        {
+          "browser": "chrome",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "upstream": "componentsToDebugString",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "upstream": "getFullscreenElement",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "upstream": "getUnstableScreenFrame",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "upstream": "getUnstableScreenResolution",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "upstream": "getWebGLContext",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "upstream": "hashComponents",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "upstream": "isAndroid",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isChromium.name",
+          "upstream": "isChromium",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "upstream": "isDesktopWebKit",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "upstream": "isEdgeHTML",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isGecko.name",
+          "upstream": "isGecko",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "upstream": "isSamsungInternet",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isTrident.name",
+          "upstream": "isTrident",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "upstream": "isWebKit",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.load.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.load.name",
+          "upstream": "load",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.loadSources.name",
+          "upstream": "loadSources",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "upstream": "x64hash128",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "upstream": "prepareForSources",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.transformSource.name",
+          "upstream": "transformSource",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.withIframe.length",
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.withIframe.name",
+          "upstream": "withIframe",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "upstream": "componentsToDebugString",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "upstream": "getFullscreenElement",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "upstream": "getUnstableScreenFrame",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "upstream": "getUnstableScreenResolution",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "upstream": "getWebGLContext",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "upstream": "hashComponents",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "upstream": "isAndroid",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isChromium.name",
+          "upstream": "isChromium",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "upstream": "isDesktopWebKit",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "upstream": "isEdgeHTML",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isGecko.name",
+          "upstream": "isGecko",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "upstream": "isSamsungInternet",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isTrident.name",
+          "upstream": "isTrident",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "upstream": "isWebKit",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.load.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.load.name",
+          "upstream": "load",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.loadSources.name",
+          "upstream": "loadSources",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "upstream": "x64hash128",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "upstream": "prepareForSources",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.transformSource.name",
+          "upstream": "transformSource",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.withIframe.length",
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.withIframe.name",
+          "upstream": "withIframe",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.transformSource.name",
+          "upstream": "transformSource",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "upstream": "isWebKit",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "upstream": "isAndroid",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "upstream": "getWebGLContext",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isGecko.name",
+          "upstream": "isGecko",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isTrident.name",
+          "upstream": "isTrident",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.loadSources.name",
+          "upstream": "loadSources",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "upstream": "componentsToDebugString",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "upstream": "prepareForSources",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.withIframe.name",
+          "upstream": "withIframe",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.withIframe.length",
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "upstream": "getUnstableScreenFrame",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "upstream": "getFullscreenElement",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "upstream": "getUnstableScreenResolution",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "upstream": "x64hash128",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isChromium.name",
+          "upstream": "isChromium",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "upstream": "isEdgeHTML",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "upstream": "isDesktopWebKit",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "upstream": "isSamsungInternet",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "upstream": "hashComponents",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.load.name",
+          "upstream": "load",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.load.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        }
+      ],
+      "missingRequiredArtifacts": [
+        "fp.cjs.js",
+        "fp.js",
+        "fp.umd.js",
+        "fp.umd.min.js"
+      ]
+    },
+    {
+      "id": "elm-production",
+      "label": "Elm compiler-aware minifier",
+      "family": "elm",
+      "coreFingerprintParity": true,
+      "upstreamSideEffectParity": true,
+      "observableFunctionMetadata": false,
+      "apiKeysAndTypes": true,
+      "iifeApiShape": true,
+      "oracleFormatCoverage": false,
+      "strictEsmParity": false,
+      "artifactPackageParity": false,
+      "baselineBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "extendedBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "baselineDifferenceCount": 0,
+      "behavioralIssues": [],
+      "metadataIssues": [
+        {
+          "path": "exports.murmurX64Hash128",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "x64hash128",
+            "length": 2
+          },
+          "candidate": {
+            "type": "function",
+            "name": "murmurX64Hash128",
+            "length": 2
+          }
+        },
+        {
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "x64hash128",
+          "candidate": "murmurX64Hash128"
+        },
+        {
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "x64hash128",
+          "candidate": "murmurX64Hash128"
+        },
+        {
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "x64hash128",
+          "candidate": "murmurX64Hash128"
+        }
+      ],
+      "metadataSummary": {
+        "exportedFunctions": [
+          "murmurX64Hash128"
+        ],
+        "returnedFunctions": []
+      },
+      "behavioralDifferences": [],
+      "metadataDifferences": [
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "upstream": "x64hash128",
+          "candidate": "murmurX64Hash128"
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "upstream": "x64hash128",
+          "candidate": "murmurX64Hash128"
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "upstream": "x64hash128",
+          "candidate": "murmurX64Hash128"
+        }
+      ],
+      "missingRequiredArtifacts": [
+        "fp.cjs.js",
+        "fp.js",
+        "fp.umd.js",
+        "fp.umd.min.js"
+      ]
+    },
+    {
+      "id": "kotlin-production",
+      "label": "Kotlin/JS Gradle production",
+      "family": "kotlin",
+      "coreFingerprintParity": true,
+      "upstreamSideEffectParity": true,
+      "observableFunctionMetadata": false,
+      "apiKeysAndTypes": true,
+      "iifeApiShape": false,
+      "oracleFormatCoverage": false,
+      "strictEsmParity": false,
+      "artifactPackageParity": false,
+      "baselineBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "extendedBrowsers": [
+        "chrome",
+        "firefox",
+        "Safari"
+      ],
+      "baselineDifferenceCount": 0,
+      "behavioralIssues": [],
+      "metadataIssues": [
+        {
+          "path": "exports.componentsToDebugString",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "componentsToDebugString",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.getFullscreenElement",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getFullscreenElement",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getUnstableAudioFingerprint",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableAudioFingerprint",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getUnstableCanvasFingerprint",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableCanvasFingerprint",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.getUnstableHardwareConcurrency",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableHardwareConcurrency",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getUnstableScreenFrame",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableScreenFrame",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getUnstableScreenResolution",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getUnstableScreenResolution",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.getWebGLContext",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "getWebGLContext",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.hashComponents",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "hashComponents",
+            "length": 1
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.isAndroid",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isAndroid",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isChromium",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isChromium",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isDesktopWebKit",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isDesktopWebKit",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isEdgeHTML",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isEdgeHTML",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isGecko",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isGecko",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isSamsungInternet",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isSamsungInternet",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isTrident",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isTrident",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.isWebKit",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "isWebKit",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 0
+          }
+        },
+        {
+          "path": "exports.load",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "load",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.loadSources",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "loadSources",
+            "length": 4
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 4
+          }
+        },
+        {
+          "path": "exports.murmurX64Hash128",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "x64hash128",
+            "length": 2
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 2
+          }
+        },
+        {
+          "path": "exports.prepareForSources",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "prepareForSources",
+            "length": 0
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 1
+          }
+        },
+        {
+          "path": "exports.transformSource",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "transformSource",
+            "length": 2
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 2
+          }
+        },
+        {
+          "path": "exports.withIframe",
+          "browsers": [
+            "static ESM"
+          ],
+          "upstream": {
+            "type": "function",
+            "name": "withIframe",
+            "length": 2
+          },
+          "candidate": {
+            "type": "function",
+            "name": "",
+            "length": 3
+          }
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "componentsToDebugString",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getFullscreenElement",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableScreenFrame",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getUnstableScreenResolution",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "getWebGLContext",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "hashComponents",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isAndroid",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isChromium.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isChromium",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isDesktopWebKit",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isEdgeHTML",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isGecko.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isGecko",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isSamsungInternet",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isTrident.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isTrident",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "isWebKit",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.load.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.load.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "load",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.loadSources.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "loadSources",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "x64hash128",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "prepareForSources",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.transformSource.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "transformSource",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.length",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.name",
+          "browsers": [
+            "chrome"
+          ],
+          "upstream": "withIframe",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "componentsToDebugString",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getFullscreenElement",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableScreenFrame",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getUnstableScreenResolution",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "getWebGLContext",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "hashComponents",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isAndroid",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isChromium.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isChromium",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isDesktopWebKit",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isEdgeHTML",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isGecko.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isGecko",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isSamsungInternet",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isTrident.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isTrident",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "isWebKit",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.load.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.load.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "load",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.loadSources.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "loadSources",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "x64hash128",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "prepareForSources",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.transformSource.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "transformSource",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.length",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.name",
+          "browsers": [
+            "firefox"
+          ],
+          "upstream": "withIframe",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.transformSource.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "transformSource",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isWebKit",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isAndroid",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getWebGLContext",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isGecko.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isGecko",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isTrident.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isTrident",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.loadSources.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "loadSources",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "componentsToDebugString",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "prepareForSources",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "withIframe",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.withIframe.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableScreenFrame",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getFullscreenElement",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "getUnstableScreenResolution",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "x64hash128",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isChromium.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isChromium",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isEdgeHTML",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isDesktopWebKit",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "isSamsungInternet",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "hashComponents",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.load.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "load",
+          "candidate": ""
+        },
+        {
+          "path": "$[0].exportFunctions.load.length",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "path": "$[0].agent.get.name",
+          "browsers": [
+            "Safari"
+          ],
+          "upstream": "get",
+          "candidate": ""
+        }
+      ],
+      "metadataSummary": {
+        "exportedFunctions": [
+          "componentsToDebugString",
+          "getFullscreenElement",
+          "getUnstableAudioFingerprint",
+          "getUnstableCanvasFingerprint",
+          "getUnstableHardwareConcurrency",
+          "getUnstableScreenFrame",
+          "getUnstableScreenResolution",
+          "getWebGLContext",
+          "hashComponents",
+          "isAndroid",
+          "isChromium",
+          "isDesktopWebKit",
+          "isEdgeHTML",
+          "isGecko",
+          "isSamsungInternet",
+          "isTrident",
+          "isWebKit",
+          "load",
+          "loadSources",
+          "murmurX64Hash128",
+          "prepareForSources",
+          "transformSource",
+          "withIframe"
+        ],
+        "returnedFunctions": [
+          "agent.get"
+        ]
+      },
+      "behavioralDifferences": [],
+      "metadataDifferences": [
+        {
+          "browser": "chrome",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "upstream": "componentsToDebugString",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "upstream": "getFullscreenElement",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "upstream": "getUnstableScreenFrame",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "upstream": "getUnstableScreenResolution",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "upstream": "getWebGLContext",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "upstream": "hashComponents",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "upstream": "isAndroid",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isChromium.name",
+          "upstream": "isChromium",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "upstream": "isDesktopWebKit",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "upstream": "isEdgeHTML",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isGecko.name",
+          "upstream": "isGecko",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "upstream": "isSamsungInternet",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isTrident.name",
+          "upstream": "isTrident",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "upstream": "isWebKit",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.load.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.load.name",
+          "upstream": "load",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.loadSources.name",
+          "upstream": "loadSources",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "upstream": "x64hash128",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "upstream": "prepareForSources",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.transformSource.name",
+          "upstream": "transformSource",
+          "candidate": ""
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.withIframe.length",
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "browser": "chrome",
+          "path": "$[0].exportFunctions.withIframe.name",
+          "upstream": "withIframe",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "upstream": "componentsToDebugString",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "upstream": "getFullscreenElement",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "upstream": "getUnstableScreenFrame",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "upstream": "getUnstableScreenResolution",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "upstream": "getWebGLContext",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "upstream": "hashComponents",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "upstream": "isAndroid",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isChromium.name",
+          "upstream": "isChromium",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "upstream": "isDesktopWebKit",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "upstream": "isEdgeHTML",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isGecko.name",
+          "upstream": "isGecko",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "upstream": "isSamsungInternet",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isTrident.name",
+          "upstream": "isTrident",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "upstream": "isWebKit",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.load.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.load.name",
+          "upstream": "load",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.loadSources.name",
+          "upstream": "loadSources",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "upstream": "x64hash128",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "upstream": "prepareForSources",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.transformSource.name",
+          "upstream": "transformSource",
+          "candidate": ""
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.withIframe.length",
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "browser": "firefox",
+          "path": "$[0].exportFunctions.withIframe.name",
+          "upstream": "withIframe",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.transformSource.name",
+          "upstream": "transformSource",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isWebKit.name",
+          "upstream": "isWebKit",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isAndroid.name",
+          "upstream": "isAndroid",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getWebGLContext.name",
+          "upstream": "getWebGLContext",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isGecko.name",
+          "upstream": "isGecko",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isTrident.name",
+          "upstream": "isTrident",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableCanvasFingerprint.name",
+          "upstream": "getUnstableCanvasFingerprint",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.loadSources.name",
+          "upstream": "loadSources",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.componentsToDebugString.name",
+          "upstream": "componentsToDebugString",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.prepareForSources.name",
+          "upstream": "prepareForSources",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.prepareForSources.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableHardwareConcurrency.name",
+          "upstream": "getUnstableHardwareConcurrency",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.withIframe.name",
+          "upstream": "withIframe",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.withIframe.length",
+          "upstream": 2,
+          "candidate": 3
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableScreenFrame.name",
+          "upstream": "getUnstableScreenFrame",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableAudioFingerprint.name",
+          "upstream": "getUnstableAudioFingerprint",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getFullscreenElement.name",
+          "upstream": "getFullscreenElement",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.getUnstableScreenResolution.name",
+          "upstream": "getUnstableScreenResolution",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.murmurX64Hash128.name",
+          "upstream": "x64hash128",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isChromium.name",
+          "upstream": "isChromium",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isEdgeHTML.name",
+          "upstream": "isEdgeHTML",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isDesktopWebKit.name",
+          "upstream": "isDesktopWebKit",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.isSamsungInternet.name",
+          "upstream": "isSamsungInternet",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.hashComponents.name",
+          "upstream": "hashComponents",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.load.name",
+          "upstream": "load",
+          "candidate": ""
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].exportFunctions.load.length",
+          "upstream": 0,
+          "candidate": 1
+        },
+        {
+          "browser": "Safari",
+          "path": "$[0].agent.get.name",
+          "upstream": "get",
+          "candidate": ""
+        }
+      ],
+      "missingRequiredArtifacts": [
+        "fp.cjs.js",
+        "fp.js",
+        "fp.umd.js",
+        "fp.umd.min.js"
+      ]
+    }
+  ]
+}

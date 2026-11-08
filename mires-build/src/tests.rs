@@ -16,8 +16,10 @@ impl TempDir {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
 
-        let path =
-            env::temp_dir().join(format!("mires-build-{}-{unique}-{label}", std::process::id()));
+        let path = env::temp_dir().join(format!(
+            "mires-build-{}-{unique}-{label}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         Self { path }

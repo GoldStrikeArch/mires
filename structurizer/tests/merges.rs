@@ -254,7 +254,10 @@ fn twelve_siblings_dispatch() {
 
 #[test]
 fn sibling_threshold_moves_with_the_option() {
-    let opts = Options { merge_node_max: 3, ..Options::default() };
+    let opts = Options {
+        merge_node_max: 3,
+        ..Options::default()
+    };
     let out = run_opts(cfg(siblings(5)), &opts);
     expect![[r#"
         // dispatch x1

@@ -1,0 +1,65 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { setAttribute as _$setAttribute } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h8483caa7e63a1d11 = _$template("<div id=\"main\" class=\"base\"></div>");
+const tmpl$hcb13335841375f7a = _$template("<h1>Welcome</h1>");
+const tmpl$h91a8f4a4f4d014ca = _$template("<a></a>");
+const tmpl$h87c6178af1bba39e = _$template("<input type=\"text\" disabled=\"\">");
+const tmpl$hbb07f2e6dd83cf07 = _$template("<div id=\"main\"><a href=\"/\">Welcome</a></div>");
+const tmpl$h00760edda2023e75 = _$template("<input>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// rust_entry
+function rust_entry() {
+  let post;
+  post = { url: "/hello", title: "Hello", slug: "hello" };
+  x03_attribute_expressions$static_attrs$h1ffde2337783bae2();
+  x03_attribute_expressions$dynamic_value$hb5086c0bec303222("my-h1");
+  x03_attribute_expressions$dynamic_member$h73d462da907c40b3(post);
+  x03_attribute_expressions$boolean_attr$hbb7f9c81f25873a1();
+  x03_attribute_expressions$mixed$he5913f8561b3d798(post);
+  x03_attribute_expressions$property$h04c2e2c85642e610("10");
+}
+// boolean_attr
+function x03_attribute_expressions$boolean_attr$hbb7f9c81f25873a1() {
+  return tmpl$h87c6178af1bba39e();
+}
+// dynamic_member
+function x03_attribute_expressions$dynamic_member$h73d462da907c40b3(post) {
+  let _0;
+  _0 = tmpl$h91a8f4a4f4d014ca();
+  _$setAttribute(_0, "href", post.url);
+  _$setAttribute(_0, "title", post.title);
+  return _0;
+}
+// dynamic_value
+function x03_attribute_expressions$dynamic_value$hb5086c0bec303222(id) {
+  let _0;
+  _0 = tmpl$hcb13335841375f7a();
+  _$setAttribute(_0, "id", id);
+  return _0;
+}
+// mixed
+function x03_attribute_expressions$mixed$he5913f8561b3d798(post) {
+  let _0, $t0;
+  _0 = tmpl$hbb07f2e6dd83cf07();
+  $t0 = _0.firstChild;
+  _$setAttribute($t0, "data-slug", post.slug);
+  return _0;
+}
+// property
+function x03_attribute_expressions$property$h04c2e2c85642e610(value) {
+  let _0;
+  _0 = tmpl$h00760edda2023e75();
+  _$setAttribute(_0, "value", value);
+  return _0;
+}
+// static_attrs
+function x03_attribute_expressions$static_attrs$h1ffde2337783bae2() {
+  return tmpl$h8483caa7e63a1d11();
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

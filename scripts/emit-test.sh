@@ -80,6 +80,33 @@
 # It runs through scripts/run-chunks.sh, which imports each chunk's entry point
 # from its own file: that is what proves the cross-chunk imports resolve and that
 # the names the chunks import are the names the other chunks export.
+#
+# THE JIR LANE
+# ------------
+# The compile flags are pinned, with one exception: `js-lane=jir` in $JS_EXTRA_ARGS
+# is passed through, because which lane a program is printed from is a link step
+# decision and the point of the suite is to hold both lanes to a golden. Under it a
+# fixture compares against
+#
+#   NN.jir.js.expected   the emitted JavaScript on the JIR lane
+#
+# and falls back to NN.js.expected when there is none, which is what makes a lane
+# whose lowerings are all fallbacks — every one of them today — pass the suite
+# against the baseline goldens unchanged. `UPDATE_EXPECT=1` under the lane writes
+# the lane golden and never the baseline one. A chunked fixture has no lane golden
+# per chunk; compare those unsplit.
+#
+# THE OPTIMIZER
+# -------------
+#   EMIT_OPT_MODE=off|report|on   default off
+#
+# `js-opt` is NOT read out of $JS_EXTRA_ARGS, for the same reason the rest of the
+# flags are not: this is a golden suite. `report` prints the same bytes as `off`
+# and is the metamorphic check on the diagnostics half; `on` rewrites the printed
+# text, so under it the JS goldens are NOT compared — stdout, the chunk split, the
+# degenerate-chunk identity and the byte budgets are, which is what makes it a
+# check on meaning rather than a second set of goldens to maintain. That is the
+# same rule scripts/dom-test.sh applies under DOM_OPT_MODE=on.
 
 set -uo pipefail
 
@@ -98,6 +125,41 @@ EMIT_SKIP="mini_core"
 # The compilation every fixture is baselined under.
 EMIT_ARGS="js-names=readable js-comments=on js-emit-skip=$EMIT_SKIP"
 
+# The lane the caller asked for. Only `js-lane=jir` is honoured: `shadow` writes two
+# programs and is what scripts/lane-shadow-test.sh runs, not a golden mode.
+LANE_ARGS=""
+lane=""
+case " ${JS_EXTRA_ARGS:-} " in
+*" js-lane=jir "*)
+	lane=jir
+	LANE_ARGS="js-lane=jir"
+	;;
+esac
+
+# The optimizer mode, its own control rather than something read out of $JS_EXTRA_ARGS: the
+# compile flags are pinned here so that a golden does not depend on the caller's environment, and
+# an option arriving through the environment would silently be dropped (which is exactly what it
+# used to be). `js-opt` IS emit-affecting, so `on` and `report` link against their own keyed
+# sysroot, built below.
+EMIT_OPT_MODE=${EMIT_OPT_MODE:-off}
+case "$EMIT_OPT_MODE" in
+off) ;;
+report | on) LANE_ARGS="${LANE_ARGS:+$LANE_ARGS }js-opt=$EMIT_OPT_MODE" ;;
+*)
+	echo "emit-test.sh: EMIT_OPT_MODE must be off, report, or on" >&2
+	exit 2
+	;;
+esac
+if [ "${UPDATE_EXPECT:-0}" = 1 ] && [ "$EMIT_OPT_MODE" != off ]; then
+	echo "emit-test.sh: expectations may only be updated in off mode" >&2
+	exit 2
+fi
+echo "note: compiled with js-lane=${lane:-baseline} js-opt=$EMIT_OPT_MODE${lane:+; NN.jir.js.expected wins where it exists}"
+if [ "$EMIT_OPT_MODE" = on ]; then
+	echo "note: EMIT_OPT_MODE=on rewrites the printed text, so the JS goldens are not compared;"
+	echo "      stdout, the chunk split and the byte budgets still are"
+fi
+
 mkdir -p "$build_dir" "$log_dir"
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
@@ -107,6 +169,12 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
 		exit 1
 	fi
 fi
+
+# The keyed sysroot the NN.core fixtures link against. Every emit-affecting option this suite
+# pins takes part in the key -- `js-names=readable` always, `js-opt` in the two non-off modes --
+# so the suite builds its own rather than needing one to have been left behind by another run.
+JS_EXTRA_ARGS="$EMIT_ARGS${LANE_ARGS:+ $LANE_ARGS}" SKIP_BUILD=1 \
+	"$script_dir/build_sysroot.sh" >/dev/null
 
 selected=${1:-}
 if [ -n "$selected" ]; then
@@ -189,6 +257,13 @@ for src in $sources; do
 	args="js-names=readable js-comments=on js-emit-skip=$skip"
 	if [ -f "$emit_dir/$name.args" ]; then
 		args="$args $(tr '\n' ' ' <"$emit_dir/$name.args")"
+	fi
+	args="$args${LANE_ARGS:+ $LANE_ARGS}"
+
+	# The lane's own golden, where the fixture has one. Under UPDATE_EXPECT the lane
+	# golden is the one written, so a lane run can never rebaseline the baseline.
+	if [ -n "$lane" ] && { [ "${UPDATE_EXPECT:-0}" = "1" ] || [ -f "$emit_dir/$name.$lane.js.expected" ]; }; then
+		expected_js="$emit_dir/$name.$lane.js.expected"
 	fi
 
 	# A fixture marked NN.core is compiled against the real sysroot.
@@ -340,11 +415,13 @@ for src in $sources; do
 	if [ ! -f "$expected_out" ]; then
 		absent="stdout"
 	fi
-	for index in "${!expectations[@]}"; do
-		if [ ! -f "${expectations[$index]}" ]; then
-			absent="${absent:+$absent+}${labels[$index]}"
-		fi
-	done
+	if [ "$EMIT_OPT_MODE" != on ]; then
+		for index in "${!expectations[@]}"; do
+			if [ ! -f "${expectations[$index]}" ]; then
+				absent="${absent:+$absent+}${labels[$index]}"
+			fi
+		done
+	fi
 	if [ -n "$absent" ]; then
 		echo "    missing expectation ($absent); run UPDATE_EXPECT=1 scripts/emit-test.sh $name"
 		results="$results$name FAIL no-expectation"$'\n'
@@ -362,6 +439,9 @@ for src in $sources; do
 
 	mismatch=""
 	for index in "${!actuals[@]}"; do
+		if [ "$EMIT_OPT_MODE" = on ]; then
+			break
+		fi
 		label=${labels[$index]}
 		diff_log="$log_dir/emit-$name.$label.diff"
 		if [ "$label" = "js" ]; then

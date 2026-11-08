@@ -43,8 +43,14 @@ unsafe extern "C" {
     fn event_source(url: &str) -> JsValue;
 
     /// `dashLog(message)`: a bare global function.
+    ///
+    /// The one declaration here that says what the host does with its argument: it reads the text
+    /// and takes it as a JavaScript string, which is the version 3 descriptor's per-slot contract
+    /// (`descriptor::SlotFacts`). Nothing about the emission changes — the facts are read by the
+    /// representation planner and by nothing else — so this fixture's golden is the proof that a
+    /// descriptor carrying slot facts travels exactly as one without them.
     #[js(call = "dashLog")]
-    fn log(message: &str);
+    fn log(#[js(reads, accepts(host_string))] message: &str);
 
     /// `Math.max(a, b)`: a global reached through a path, whose last step keeps its receiver.
     #[js(call = "Math.max")]

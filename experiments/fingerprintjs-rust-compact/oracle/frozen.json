@@ -1,0 +1,151 @@
+{
+  "defaultExports": [
+    "load",
+    "hashComponents",
+    "componentsToDebugString"
+  ],
+  "exports": [
+    "componentsToDebugString",
+    "default",
+    "getFullscreenElement",
+    "getUnstableAudioFingerprint",
+    "getUnstableCanvasFingerprint",
+    "getUnstableHardwareConcurrency",
+    "getUnstableScreenFrame",
+    "getUnstableScreenResolution",
+    "getWebGLContext",
+    "hashComponents",
+    "isAndroid",
+    "isChromium",
+    "isDesktopWebKit",
+    "isEdgeHTML",
+    "isGecko",
+    "isSamsungInternet",
+    "isTrident",
+    "isWebKit",
+    "load",
+    "loadSources",
+    "murmurX64Hash128",
+    "prepareForSources",
+    "sources",
+    "transformSource",
+    "withIframe"
+  ],
+  "files": {
+    "fp.cjs.js": {
+      "brotli11": 31596,
+      "bytes": 130021,
+      "gzip9": 37693,
+      "sha256": "6b45497c67d51eef1381663f240bbc2248f0a5d5226b9f46ec7b624f89f49b48"
+    },
+    "fp.d.ts": {
+      "brotli11": 6742,
+      "bytes": 27932,
+      "gzip9": 8255,
+      "sha256": "d20e2e6b3f60afb7679c1f87dd62800b7a7ce7155e86efbf6206190a1c185731"
+    },
+    "fp.esm.js": {
+      "brotli11": 31484,
+      "bytes": 129311,
+      "gzip9": 37548,
+      "sha256": "1199e961c36958e92e486a94cc6fbc5b1687b483d635019d4130cc722ecab206"
+    },
+    "fp.js": {
+      "brotli11": 31790,
+      "bytes": 136471,
+      "gzip9": 38038,
+      "sha256": "870adc4a650fb58063973f0752cbcd9dcc2798e50bd472cbae5bc21bbf732a0f"
+    },
+    "fp.min.js": {
+      "brotli11": 14239,
+      "bytes": 36746,
+      "gzip9": 16178,
+      "sha256": "9341c632ea5657977d103ca06aa0632338dc298d4ca5338e51277c63831a2ef5"
+    },
+    "fp.umd.js": {
+      "brotli11": 31893,
+      "bytes": 136742,
+      "gzip9": 38130,
+      "sha256": "d6303624fa3cae6c28fa1031fd115535d24f5b53ea2403cdefadf729ba9087c2"
+    },
+    "fp.umd.min.js": {
+      "brotli11": 14371,
+      "bytes": 36937,
+      "gzip9": 16253,
+      "sha256": "a8de5ead580c42d2e2b01a5752aa08da510852230971aa18554d67cd5de5775b"
+    }
+  },
+  "gates": {
+    "iife": {
+      "brotli11": 14239,
+      "bytes": 36746,
+      "file": "fp.min.js",
+      "gzip9": 16178
+    },
+    "umd": {
+      "brotli11": 14371,
+      "bytes": 36937,
+      "file": "fp.umd.min.js",
+      "gzip9": 16253
+    }
+  },
+  "oracle": {
+    "checkoutCommit": "feab7913fbb536466bab72b1795d27ec68423003",
+    "commit": "e196578ba35362fdf15647e013d66ac28b3c9fb5",
+    "package": "@fingerprintjs/fingerprintjs",
+    "tag": "v5.2.0",
+    "version": "5.2.0"
+  },
+  "schema": 1,
+  "sourceChecksums": {
+    "packageJson": "fc40bd08418cfcf115cca2c6b7197bddb92db990a3fbbb320d3688eaa87a0d97",
+    "publicIndex": "1b9c3d94130c12137c79832ee9e02c60639a2d2ffe02a90909bcb6e0eb2c00a4",
+    "sourceIndex": "607ebb47bf054eb078e07d08011ae9ad79481a24e55dcb1e076aeacb8481f4df",
+    "sourceTreeListing": "f6d0d088efb26272f05fa5703294f42d40b959b8fab148213c41b1249388c296"
+  },
+  "sources": [
+    "userAgentData",
+    "fonts",
+    "domBlockers",
+    "fontPreferences",
+    "audio",
+    "screenFrame",
+    "canvas",
+    "osCpu",
+    "languages",
+    "colorDepth",
+    "deviceMemory",
+    "screenResolution",
+    "hardwareConcurrency",
+    "timezone",
+    "sessionStorage",
+    "localStorage",
+    "indexedDB",
+    "openDatabase",
+    "cpuClass",
+    "platform",
+    "plugins",
+    "touchSupport",
+    "vendor",
+    "vendorFlavors",
+    "cookiesEnabled",
+    "colorGamut",
+    "invertedColors",
+    "forcedColors",
+    "monochrome",
+    "contrast",
+    "reducedMotion",
+    "reducedTransparency",
+    "hdr",
+    "math",
+    "pdfViewerEnabled",
+    "architecture",
+    "applePay",
+    "privateClickMeasurement",
+    "audioBaseLatency",
+    "dateTimeLocale",
+    "webGlBasics",
+    "webGlExtensions"
+  ]
+}
+

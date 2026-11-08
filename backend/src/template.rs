@@ -38,7 +38,7 @@ use crate::jsast::{self, Expr};
 
 /// The `view_abi::ABI_VERSION` this backend decodes. A payload announcing anything else is refused
 /// by name rather than read as if it had this shape.
-pub(crate) const ABI_VERSION: u32 = 6;
+pub(crate) const ABI_VERSION: u32 = 8;
 
 /// `view_abi::NO_EFFECT_GROUP`: the group of a hole no shared effect drives.
 const NO_EFFECT_GROUP: u32 = u32::MAX;
@@ -123,8 +123,8 @@ pub(crate) struct Template {
     pub(crate) html: String,
     /// Whether the template claims server-rendered nodes rather than cloning.
     pub(crate) hydratable: bool,
-    /// Whether the cloner imports the prototype node rather than cloning it, which is what upgrades
-    /// a custom element on insertion. The second argument of `_$template`.
+    /// Whether the cloner imports the prototype node rather than cloning it, which is what
+    /// upgrades a custom element on insertion. The second argument of `_$template`.
     pub(crate) is_import_node: bool,
     /// Whether the template's root is an SVG-only element. The third argument of `_$template`.
     ///
@@ -170,7 +170,14 @@ impl Template {
             events.push(event.as_str(&format!("events[{index}]"))?.to_owned());
         }
 
-        Ok(Template { html, hydratable, is_import_node, is_svg, holes, events })
+        Ok(Template {
+            html,
+            hydratable,
+            is_import_node,
+            is_svg,
+            holes,
+            events,
+        })
     }
 
     /// The node tree the template's HTML describes, rooted where a hole's walk starts.
@@ -228,8 +235,8 @@ impl Template {
     pub(crate) fn cloner(&self, cgu: &CguCx<'_>, order: Option<SourceOrder>) -> Expr {
         let name = cgu.namer.synthetic_name("tmpl", &self.cloner_key());
         // Every use offers its position and the earliest wins, so a template several views build is
-        // declared where the first of them is written rather than where codegen happened to reach it
-        // first.
+        // declared where the first of them is written rather than where codegen happened to reach
+        // it first.
         if let Some(order) = order.clone() {
             cgu.order_at_most(&name, order);
         }
@@ -269,7 +276,13 @@ impl Hole {
         let reactive = value.field("reactive")?.as_bool("reactive")?;
         let group = value.field("effect_group")?.as_u32("effect_group")?;
         let effect_group = (group != NO_EFFECT_GROUP).then_some(group);
-        Ok(Hole { path, kind, name, reactive, effect_group })
+        Ok(Hole {
+            path,
+            kind,
+            name,
+            reactive,
+            effect_group,
+        })
     }
 
     /// The walk to the element a [`HoleKind::Child`] hole inserts into, given that its own walk
@@ -278,7 +291,10 @@ impl Hole {
     /// An anchor is a child position of its element, so its walk is the element's walk followed by
     /// one `firstChild` and a run of `nextSibling`s. Dropping that tail is the element's walk.
     pub(crate) fn anchor_parent(&self) -> Option<&[Step]> {
-        let last = self.path.iter().rposition(|step| *step == Step::FirstChild)?;
+        let last = self
+            .path
+            .iter()
+            .rposition(|step| *step == Step::FirstChild)?;
         Some(&self.path[..last])
     }
 }
@@ -326,7 +342,11 @@ pub(crate) fn dom_import(cgu: &CguCx<'_>, name: &str) -> Expr {
             ItemKind::Import,
             jsast::import_named(vec![(name.to_owned(), local.clone())], source.clone()),
             Vec::new(),
-            Linkage { fixed_name: Some(local.clone()), root: false, exported: false },
+            Linkage {
+                fixed_name: Some(local.clone()),
+                root: false,
+                exported: false,
+            },
             source.clone(),
         )
     });
@@ -354,7 +374,10 @@ impl NodeKind {
     /// Whether the node is a comment of any of the three forms, which is what makes a child hole
     /// *anchored*: the value goes before the comment rather than into the node the walk reached.
     pub(crate) fn is_comment(self) -> bool {
-        matches!(self, NodeKind::Comment | NodeKind::MarkerOpen | NodeKind::MarkerClose)
+        matches!(
+            self,
+            NodeKind::Comment | NodeKind::MarkerOpen | NodeKind::MarkerClose
+        )
     }
 }
 
@@ -396,7 +419,13 @@ impl Tree {
                     Some(offset) => at + offset,
                     None => bytes.len(),
                 };
-                push(&mut stack, Node { kind: NodeKind::Text, children: Vec::new() });
+                push(
+                    &mut stack,
+                    Node {
+                        kind: NodeKind::Text,
+                        children: Vec::new(),
+                    },
+                );
                 at = end;
                 continue;
             }
@@ -414,7 +443,13 @@ impl Tree {
                     "<!/>" => NodeKind::MarkerClose,
                     _ => NodeKind::Comment,
                 };
-                push(&mut stack, Node { kind, children: Vec::new() });
+                push(
+                    &mut stack,
+                    Node {
+                        kind,
+                        children: Vec::new(),
+                    },
+                );
                 at = end.unwrap_or(bytes.len());
                 continue;
             }
@@ -435,9 +470,18 @@ impl Tree {
             // An opening tag. Attribute values may hold `>`, so the scan honours quoting.
             let name = tag_name(&html[at + 1..]);
             let end = tag_end(html, at);
-            let self_closing = html[at..end].trim_end_matches('>').trim_end().ends_with('/');
+            let self_closing = html[at..end]
+                .trim_end_matches('>')
+                .trim_end()
+                .ends_with('/');
             if VOID_ELEMENTS.contains(&name.as_str()) || self_closing {
-                push(&mut stack, Node { kind: NodeKind::Element, children: Vec::new() });
+                push(
+                    &mut stack,
+                    Node {
+                        kind: NodeKind::Element,
+                        children: Vec::new(),
+                    },
+                );
             } else {
                 stack.push((name, Vec::new()));
             }
@@ -447,7 +491,9 @@ impl Tree {
         while stack.len() > 1 {
             close(&mut stack);
         }
-        Tree { roots: stack.pop().map(|(_, roots)| roots).unwrap_or_default() }
+        Tree {
+            roots: stack.pop().map(|(_, roots)| roots).unwrap_or_default(),
+        }
     }
 
     /// The same tree with the synthetic `<svg>` wrapper stripped: the wrapper's children become the
@@ -459,7 +505,9 @@ impl Tree {
     /// high, which turns a sole-child insert into an anchored one and back, with no diagnostic.
     fn inside_svg_wrapper(self) -> Tree {
         match self.roots.into_iter().next() {
-            Some(wrapper) => Tree { roots: wrapper.children },
+            Some(wrapper) => Tree {
+                roots: wrapper.children,
+            },
             None => Tree { roots: Vec::new() },
         }
     }
@@ -504,8 +552,16 @@ fn push(stack: &mut [(String, Vec<Node>)], node: Node) {
 
 /// Closes the innermost open element, appending it to its parent.
 fn close(stack: &mut Vec<(String, Vec<Node>)>) {
-    let Some((_, children)) = stack.pop() else { return };
-    push(stack, Node { kind: NodeKind::Element, children });
+    let Some((_, children)) = stack.pop() else {
+        return;
+    };
+    push(
+        stack,
+        Node {
+            kind: NodeKind::Element,
+            children,
+        },
+    );
 }
 
 /// The tag name at the start of `rest`, lowercased.
@@ -705,7 +761,10 @@ mod tests {
     fn a_path_is_a_run_of_walk_steps() {
         assert_eq!(path(""), []);
         assert_eq!(path("c"), [Step::FirstChild]);
-        assert_eq!(path("cnn"), [Step::FirstChild, Step::NextSibling, Step::NextSibling]);
+        assert_eq!(
+            path("cnn"),
+            [Step::FirstChild, Step::NextSibling, Step::NextSibling]
+        );
         assert_eq!(
             parse_path("cx").unwrap_err(),
             "`x` is not a walk step (`c` or `n`)"
@@ -832,7 +891,10 @@ mod tests {
         // The root, plus the three named steps.
         assert_eq!(walk.len(), 4);
         assert_eq!(jsast::expr_to_string(&walk.at(&path("")).unwrap()), "root");
-        assert_eq!(jsast::expr_to_string(&walk.at(&path("cnn")).unwrap()), "$t2");
+        assert_eq!(
+            jsast::expr_to_string(&walk.at(&path("cnn")).unwrap()),
+            "$t2"
+        );
     }
 
     #[test]
@@ -862,8 +924,14 @@ mod tests {
             ]
         );
         // The pair belongs to the opening marker, and the closing one is its first element.
-        assert_eq!(jsast::expr_to_string(&walk.marker_pair(&path("cn")).unwrap()), "$t2");
-        assert_eq!(jsast::expr_to_string(&walk.at(&path("cnn")).unwrap()), "$t2[0]");
+        assert_eq!(
+            jsast::expr_to_string(&walk.marker_pair(&path("cn")).unwrap()),
+            "$t2"
+        );
+        assert_eq!(
+            jsast::expr_to_string(&walk.at(&path("cnn")).unwrap()),
+            "$t2[0]"
+        );
         assert!(walk.marker_pair(&path("c")).is_none());
     }
 
@@ -881,14 +949,19 @@ mod tests {
                 "$t2 = $t1[0].nextSibling",
             ]
         );
-        assert_eq!(jsast::expr_to_string(&walk.at(&path("cnn")).unwrap()), "$t2");
+        assert_eq!(
+            jsast::expr_to_string(&walk.at(&path("cnn")).unwrap()),
+            "$t2"
+        );
 
         // Two pairs in one child list: the second `<!$>` is reached from the first `<!/>`, and its
         // own pair from there again. This is the case a raw walk gets wrong twice over.
         // Both pairs are asked for, exactly as `abi.rs` asks for the `<!/>` of every hydratable
         // child hole.
-        let (walk, bound) =
-            plan_over("<span><!$><!/> <!$><!/></span>", &["cn", "cnn", "cnnn", "cnnnn"]);
+        let (walk, bound) = plan_over(
+            "<span><!$><!/> <!$><!/></span>",
+            &["cn", "cnn", "cnnn", "cnnnn"],
+        );
         assert_eq!(
             bound,
             [
@@ -899,7 +972,10 @@ mod tests {
                 "$t4 = getNextMarker($t3.nextSibling)",
             ]
         );
-        assert_eq!(jsast::expr_to_string(&walk.marker_pair(&path("cnnn")).unwrap()), "$t4");
+        assert_eq!(
+            jsast::expr_to_string(&walk.marker_pair(&path("cnnn")).unwrap()),
+            "$t4"
+        );
     }
 
     #[test]
@@ -917,7 +993,10 @@ mod tests {
     fn delegated_events_are_unioned_deduplicated_and_sorted() {
         let first = template("<button>", vec![], &["click"]);
         let second = template("<input>", vec![], &["input", "click"]);
-        assert_eq!(delegated_events([&first, &second].into_iter()), ["click", "input"]);
+        assert_eq!(
+            delegated_events([&first, &second].into_iter()),
+            ["click", "input"]
+        );
         // A payload that repeats a name registers one listener, not two.
         let repeated = template("<button>", vec![], &["click", "click"]);
         assert_eq!(delegated_events([&repeated].into_iter()), ["click"]);
@@ -927,17 +1006,29 @@ mod tests {
     #[test]
     fn a_cloner_is_keyed_by_its_html_and_its_construction_flags() {
         let plain = template("<div>Hello ", vec![], &[]);
-        let same_html_hydratable = Template { hydratable: true, ..plain.clone() };
+        let same_html_hydratable = Template {
+            hydratable: true,
+            ..plain.clone()
+        };
         assert_eq!(plain.cloner_key(), same_html_hydratable.cloner_key());
-        assert_ne!(plain.cloner_key(), template("<div>Hi ", vec![], &[]).cloner_key());
+        assert_ne!(
+            plain.cloner_key(),
+            template("<div>Hi ", vec![], &[]).cloner_key()
+        );
         // The key describes the value, so it never mentions where the template came from, and an
         // unflagged template keys on its HTML alone.
         assert_eq!(plain.cloner_key(), "tmpl\u{1}<div>Hello ");
 
         // The flags are part of the cloner, not of the text: two templates with one HTML and
         // different flags are two construction routines and must not intern together.
-        let imported = Template { is_import_node: true, ..plain.clone() };
-        let svg = Template { is_svg: true, ..plain.clone() };
+        let imported = Template {
+            is_import_node: true,
+            ..plain.clone()
+        };
+        let svg = Template {
+            is_svg: true,
+            ..plain.clone()
+        };
         assert_ne!(plain.cloner_key(), imported.cloner_key());
         assert_ne!(plain.cloner_key(), svg.cloner_key());
         assert_ne!(imported.cloner_key(), svg.cloner_key());
@@ -959,8 +1050,14 @@ mod tests {
 
         // Without the flag the same text is read as the wrapper being the root, which is what the
         // pair exists to keep from happening by halves.
-        let unwrapped = Template { is_svg: false, ..wrapped.clone() };
-        assert_eq!(unwrapped.tree().kind_at(&path("c")), Some(NodeKind::Element));
+        let unwrapped = Template {
+            is_svg: false,
+            ..wrapped.clone()
+        };
+        assert_eq!(
+            unwrapped.tree().kind_at(&path("c")),
+            Some(NodeKind::Element)
+        );
     }
 
     #[test]

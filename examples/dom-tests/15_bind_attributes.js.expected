@@ -1,0 +1,119 @@
+// rustc_codegen_js — program
+// ./topcoat-dom.js
+import { classList as _$classList } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { createSignal as _$createSignal } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { effect as _$effect } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { setAttribute as _$setAttribute } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { style as _$style } from "./topcoat-dom.js";
+// ./topcoat-dom.js
+import { template as _$template } from "./topcoat-dom.js";
+const tmpl$h1277565933427a84 = _$template("<p>A fullstack Rust framework.</p>");
+const tmpl$h1dbea6b589fe76fd = _$template("<input type=\"checkbox\">");
+const tmpl$h70ecbd4edf573156 = _$template("<div></div>");
+const tmpl$hfcec774f35ed0903 = _$template("<button>Save</button>");
+// panic
+function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
+  for (;;) {}
+}
+// lib::Sig::<T>::get
+function lib$impl_1_get$h04611f6253cd488a(self) {
+  return self[0]();
+}
+// lib::Sig::<T>::get
+function lib$impl_1_get$h61012c8ca4be03c7(self) {
+  return self[0]();
+}
+// rust_entry
+function rust_entry() {
+  x15_bind_attributes$bind_hidden$h2d624d8fff27b4c7();
+  x15_bind_attributes$bind_checked$h8bb6ec59d788d465();
+  x15_bind_attributes$bind_class$h94193ba23c1e25c9();
+  x15_bind_attributes$bind_style$h5465b85457fd0352();
+  x15_bind_attributes$grouped$h53e46b1c0424339f();
+}
+// bind_checked::{closure#0}
+function x15_bind_attributes$bind_checked$closure_0$ha26b5e7b38e1d2da(_1) {
+  return lib$impl_1_get$h61012c8ca4be03c7(_1[0]);
+}
+// bind_checked
+function x15_bind_attributes$bind_checked$h8bb6ec59d788d465() {
+  let _0, done, _5;
+  done = _$createSignal(false);
+  _0 = tmpl$h1dbea6b589fe76fd();
+  _5 = [done];
+  _$effect(() => _0.checked = x15_bind_attributes$bind_checked$closure_0$ha26b5e7b38e1d2da(_5));
+  return _0;
+}
+// bind_class::{closure#0}
+function x15_bind_attributes$bind_class$closure_0$h4817abde15bcf66c(_1) {
+  let _0;
+  if (lib$impl_1_get$h61012c8ca4be03c7(_1[0])) {
+    _0 = "on";
+  } else {
+    _0 = "off";
+  }
+  return _0;
+}
+// bind_class
+function x15_bind_attributes$bind_class$h94193ba23c1e25c9() {
+  let _0, active, _5;
+  active = _$createSignal(false);
+  _0 = tmpl$h70ecbd4edf573156();
+  _5 = [active];
+  _$effect((_$p) => _$classList(_0, x15_bind_attributes$bind_class$closure_0$h4817abde15bcf66c(_5), _$p));
+  return _0;
+}
+// bind_hidden::{closure#0}
+function x15_bind_attributes$bind_hidden$closure_0$h361c103790684148(_1) {
+  return !lib$impl_1_get$h61012c8ca4be03c7(_1[0]);
+}
+// bind_hidden
+function x15_bind_attributes$bind_hidden$h2d624d8fff27b4c7() {
+  let _0, open, _5;
+  open = _$createSignal(false);
+  _0 = tmpl$h1277565933427a84();
+  _5 = [open];
+  _$effect(() => _0.hidden = x15_bind_attributes$bind_hidden$closure_0$h361c103790684148(_5));
+  return _0;
+}
+// bind_style::{closure#0}
+function x15_bind_attributes$bind_style$closure_0$hbcd24d68ee1c37fb(_1) {
+  return lib$impl_1_get$h04611f6253cd488a(_1[0]);
+}
+// bind_style
+function x15_bind_attributes$bind_style$h5465b85457fd0352() {
+  let _0, color, _5;
+  color = _$createSignal(0);
+  _0 = tmpl$h70ecbd4edf573156();
+  _5 = [color];
+  _$effect((_$p) => _$style(_0, x15_bind_attributes$bind_style$closure_0$hbcd24d68ee1c37fb(_5), _$p));
+  return _0;
+}
+// grouped::{closure#0}
+function x15_bind_attributes$grouped$closure_0$hc88c56d7b5cd40a6(_1) {
+  return lib$impl_1_get$h61012c8ca4be03c7(_1[0]);
+}
+// grouped::{closure#1}
+function x15_bind_attributes$grouped$closure_1$h8db427d5bf9eeb55(_1) {
+  return lib$impl_1_get$h61012c8ca4be03c7(_1[0]);
+}
+// grouped
+function x15_bind_attributes$grouped$h53e46b1c0424339f() {
+  let _0, busy, _5, _8;
+  busy = _$createSignal(false);
+  _0 = tmpl$hfcec774f35ed0903();
+  _5 = [busy];
+  _8 = [busy];
+  _$effect((_p$) => {
+    let _v$ = x15_bind_attributes$grouped$closure_0$hc88c56d7b5cd40a6(_5), _v$2 = x15_bind_attributes$grouped$closure_1$h8db427d5bf9eeb55(_8);
+    _v$ !== _p$.e && (_0.disabled = _p$.e = _v$);
+    _v$2 !== _p$.t && _$setAttribute(_0, "title", _p$.t = _v$2);
+    return _p$;
+  }, { e: undefined, t: undefined });
+  return _0;
+}
+export { _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind, rust_entry };

@@ -3,41 +3,55 @@
 A single self-contained ESM file that provides the **dom-expressions client
 ABI** to code produced by the Rust to JS emitter.
 
-`dist/mires-dom.js` is committed. It is a build artifact, but it is checked in
+`dist/topcoat-dom.js` is committed. It is a build artifact, but it is checked in
 deliberately: the emitter's output is meaningless without it, and a reviewer
 should be able to see the exact bytes the generated code will run against
 without needing a JS toolchain.
 
 ## What it is
 
-`src/index.js` re-exports, from `solid-js/web`, exactly the 48 names in
+`src/index.js` exposes, from `solid-js/web`, exactly the 48 names in
 [`contract/fixtures/abi.json`](../../contract/fixtures/abi.json), the complete
-export surface of `dom-expressions/src/client.js`, plus the two reactive names
-in [`reactive-additions.mjs`](reactive-additions.mjs), `createSignal` and
-`runWithOwner`, from `solid-js`. That is 50 exports. `build.mjs` bundles the entry point, with solid inlined, into one file
-with no remaining imports.
+export surface of `dom-expressions/src/client.js`, plus the six reactive names
+in [`reactive-additions.mjs`](reactive-additions.mjs), `batch`, `createRoot`,
+`createSelector`, `createSignal`, `onCleanup`, and `runWithOwner`, from
+`solid-js`. That is 54 exports. `build.mjs` bundles the entry point, with solid
+inlined, into one file with no remaining imports.
+
+Forty-six ABI names are direct re-exports. `hydrate` and `insert` are transparent
+wrappers around the other two. While `hydrate` is on the stack, the `insert`
+wrapper gives a tagged keyed result the exact parent, closing marker, and server
+nodes that dom-expressions already computed. This is the information needed to
+adopt an empty or sole-child list and to scope a mismatch fallback; ordinary
+inserts take the unchanged upstream path.
 
 ### Why anything is added to the ABI
 
 `abi.json` is extracted by importing upstream's `client.js` and reflecting over
-it, so it can only ever describe what upstream exports. The emitter needs two
-names upstream does not have: `createSignal`, for a signal declared in an island,
-and `runWithOwner`, which the async executor uses to re-enter a captured owner
-after an await. `client.js` re-exports six names from the rxcore seam (`effect`,
-`memo`, `untrack`, `getOwner`, `createComponent`, `mergeProps`); creating state
-is not one of them, and neither is `getOwner`'s counterpart.
+it, so it can only ever describe what upstream exports. The emitter needs six
+names upstream does not have: `batch`, `createRoot`, `createSelector`,
+`createSignal`, and `onCleanup` for transactional keyed rows, plus
+`runWithOwner`, which the async executor uses to re-enter a captured owner after
+an await. `client.js` re-exports six names from the rxcore seam (`effect`, `memo`,
+`untrack`, `getOwner`, `createComponent`, `mergeProps`); creating keyed state is
+not one of them, and neither is `getOwner`'s counterpart.
 
-Neither can come from a second copy of solid loaded next to this one: a signal
+None can come from a second copy of solid loaded next to this one: a signal
 created in another reactive graph never notifies the effects in this one, so
 hydrated state would silently never update. They have to be exported by this
 artifact, from the same inlined copy of solid's core. `reactive-additions.mjs` is
 where such a name is pinned, `gen-index.mjs` writes it into the entry point, and
 `check-exports.mjs` expects the union of the two lists. `check-exports.mjs` also
-runs the signal and effect against each other, so "one graph" is asserted, not
+verifies signal notification, two-key selector fan-out, batched publication,
+and root disposal against the ABI's effect, so "one graph" is asserted, not
 assumed.
 
-Adding `createSignal` cost 9 gzipped bytes, which is the other half of the same
-evidence: nothing new was pulled in, only a name exported.
+Adding `batch`, `createRoot`, and `onCleanup` to the existing additions cost 58
+gzipped bytes. Nothing new was pulled in; the artifact exports three more names from its existing core.
+Adding `createSelector` costs another 161 gzipped bytes and supplies the K3
+old/new-row selection invalidation primitive.
+The K4 hydration-range bridge around the two existing ABI exports costs 76
+gzipped bytes. It adds no export and no dependency.
 
 ### Why solid-js/web and not dom-expressions
 
@@ -79,9 +93,9 @@ that looks correct, right export names, right count, but throws on use.
 | `gen-index.mjs` | regenerates `src/index.js` from the ABI fixture and the additions |
 | `build.mjs` | the bundler invocation, plus size measurement |
 | `check-exports.mjs` | asserts the built bundle's exports equal that surface exactly |
-| `dist/mires-dom.js` | the artifact |
-| `dist/mires-dom.js.map` | source map |
-| `dist/mires-dom.js.maxbytes` | measured gzipped size baseline |
+| `dist/topcoat-dom.js` | the artifact |
+| `dist/topcoat-dom.js.map` | source map |
+| `dist/topcoat-dom.js.maxbytes` | measured gzipped size baseline |
 
 ## Rebuilding
 
@@ -98,10 +112,10 @@ node check-exports.mjs
 
 | | bytes |
 |---|---|
-| raw | 23,971 |
-| gzip | 9,106 |
+| raw | 24,759 |
+| gzip | 9,409 |
 
-`dist/mires-dom.js.maxbytes` holds the gzipped number. It is a **measured
+`dist/topcoat-dom.js.maxbytes` holds the gzipped number. It is a **measured
 baseline, not a budget**: `build.mjs` prints the delta against it on every
 rebuild so unexplained growth is visible in review. Update it deliberately when
 the artifact legitimately grows.
@@ -109,7 +123,7 @@ the artifact legitimately grows.
 ## Reproducibility expectation
 
 The build is deterministic. Two runs from the same lockfile produce a
-byte-identical `dist/mires-dom.js`; this was verified by rebuilding and
+byte-identical `dist/topcoat-dom.js`; this was verified by rebuilding and
 comparing sha256. Anything that changes those bytes should be one of:
 
 1. a change to `src/index.js`, which can only come from a change to
@@ -128,9 +142,12 @@ extraction, so the runtime and the contract describe the same code.
 ## Bundler choice
 
 `esbuild`, not `tsup`. The precedent in this repo,
-`crates/topcoat-runtime/browser`, uses tsup, and every setting here mirrors its
-`tsup.config.ts` exactly: `format: esm`, bundle everything, `platform: browser`,
-`target: es2022`, `minify`, `sourcemap`.
+`crates/topcoat-runtime/browser`, uses tsup. This build matches its packaging
+settings—`format: esm`, bundle everything, `platform: browser`, `minify`, and
+`sourcemap`—but deliberately uses `target: es2018`. The surrounding v2 compiler
+package defaults to ES2018, so this vendored artifact enforces the same syntax
+boundary even though the Topcoat runtime it was derived from currently targets
+ES2022.
 
 tsup's value is TypeScript entry handling and `.d.ts` emission. This package has
 a single hand-written `.js` entry and no types to emit, so tsup would contribute
