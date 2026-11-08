@@ -3508,4 +3508,245 @@ fn a_zero_sized_element_is_a_place_with_no_storage() {
     }
 }
 
+/// `Holder { n: i32, r: &Point }` and `[Point; 2]`, for the tests of a reference read out of a
+/// place: the table [`world`] holds, plus a field and an element whose type is or holds a `Point`.
+fn reference_holders(interns: &mut Interns) -> (TypeId, TypeId) {
+    const HOLDER: TypeId = TypeId(50);
+    const POINTS: TypeId = TypeId(51);
+    let name = interns.intern_str("Holder");
+    let n = interns.intern_str("n");
+    let r = interns.intern_str("r");
+    let fields = vec![
+        field(FieldKey::Name(n), I32),
+        field(FieldKey::Name(r), REF_POINT),
+    ];
+    let mut holder = descriptor(
+        HOLDER,
+        TypeKind::Adt {
+            def: def(40),
+            args: Vec::new(),
+            form: NominalForm::Struct,
+            variants: vec![variant(name, fields.clone(), 0, None)],
+            niche: None,
+        },
+        8,
+    );
+    holder.js.is_indirect = true;
+    holder.js.needs_clone = true;
+    holder.js.fields = fields;
+    interns.intern_type(holder);
+    let mut points = descriptor(
+        POINTS,
+        TypeKind::Array {
+            element: POINT,
+            length: 2,
+        },
+        16,
+    );
+    points.js.is_indirect = true;
+    points.js.needs_clone = true;
+    points.js.fields = vec![field(FieldKey::Index(0), POINT)];
+    interns.intern_type(points);
+    (HOLDER, POINTS)
+}
+
+/// A direct call of `callee` with `args`, for its effect.
+fn call_op(callee: StrId, args: Vec<ValueId>) -> OpKind {
+    OpKind::Call {
+        callee: Callee::Direct {
+            item: item(2),
+            link_name: callee,
+        },
+        function: None,
+        args,
+        track_caller: None,
+        semantic: CallSemantic::Ordinary,
+        host: None,
+    }
+}
+
+/// A reference to an aggregate is the object, and the raw pointer made from it is the object's
+/// box, however the reference was read: from a field (`a.r`), as an inline borrow of an element
+/// (`xs[1]`), or from a boxed cell (`c[0]`). The slot of that expression would be the address of
+/// the storage holding the reference, which `ptr::eq` tells apart from the box of the same object
+/// (`examples/known-gaps/201_reference_field_pointers`, `audit_named_reference`). The address of
+/// the field itself, and the pointee of a raw pointer, are still the slots they name.
+#[test]
+fn a_reference_read_out_of_a_place_is_a_raw_pointer_to_its_pointee() {
+    let mut interns = world();
+    let (holder, points) = reference_holders(&mut interns);
+    let same = interns.intern_str("same");
+    let ref_to_ref_point = TypeId(52);
+    interns.intern_type(pointer(
+        ref_to_ref_point,
+        REF_POINT,
+        PointerForm::Slot,
+        true,
+    ));
+
+    let mut b = FuncBuilder::new(
+        item(1),
+        signature(vec![holder, POINT, points, RAW_POINT], UNIT),
+    );
+    let e = FuncBuilder::ENTRY;
+    let a = b.param(holder, NO_ORIGIN);
+    let h = b.param(POINT, NO_ORIGIN);
+    let xs = b.param(points, NO_ORIGIN);
+    let p = b.param(RAW_POINT, NO_ORIGIN);
+    let raw_of = |b: &mut FuncBuilder, root: Root| {
+        b.op(
+            e,
+            OpKind::RawView {
+                root,
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            RAW_POINT,
+            NO_ORIGIN,
+        )
+    };
+    let borrow = |b: &mut FuncBuilder, root: ValueId, path: Vec<Proj>| {
+        b.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Value(root),
+                path,
+                mutable: false,
+            },
+            REF_POINT,
+            NO_ORIGIN,
+        )
+    };
+
+    // `same(a.r, &h)`: the pointer stored in the field, beside a fresh borrow.
+    let loaded = b.op(
+        e,
+        OpKind::Field {
+            base: a,
+            variant: None,
+            field: 1,
+        },
+        REF_POINT,
+        NO_ORIGIN,
+    );
+    let from_field = raw_of(&mut b, Root::Value(loaded));
+    let h_ref = borrow(&mut b, h, Vec::new());
+    let from_local = raw_of(&mut b, Root::Value(h_ref));
+    b.effect(e, call_op(same, vec![from_field, from_local]), NO_ORIGIN);
+
+    // `same(&xs[1], &a.r as *const &Point)`: an element borrow, and the field's own address.
+    let one = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+        USIZE,
+        NO_ORIGIN,
+    );
+    let element = borrow(&mut b, xs, vec![Proj::Index(one)]);
+    let from_element = raw_of(&mut b, Root::Value(element));
+    let field_address = b.op(
+        e,
+        OpKind::RawView {
+            root: Root::Value(a),
+            path: vec![Proj::Field {
+                field: 1,
+                ty: REF_POINT,
+            }],
+            mutable: false,
+        },
+        ref_to_ref_point,
+        NO_ORIGIN,
+    );
+    b.effect(
+        e,
+        call_op(same, vec![from_element, field_address]),
+        NO_ORIGIN,
+    );
+
+    // `let c = &h; same(c, p)`, with `c` a boxed cell: a cell read, and a raw pointer's pointee.
+    let cell = b.cell(REF_POINT, true, NO_ORIGIN);
+    b.effect(e, OpKind::CellAlloc(cell), NO_ORIGIN);
+    let h_ref = borrow(&mut b, h, Vec::new());
+    b.effect(e, OpKind::CellStore { cell, v: h_ref }, NO_ORIGIN);
+    let from_cell = raw_of(&mut b, Root::Cell(cell));
+    let through_raw = raw_of(&mut b, Root::Value(p));
+    b.effect(e, call_op(same, vec![from_cell, through_raw]), NO_ORIGIN);
+    b.terminate(e, RTerm::Return(None));
+
+    let func = b.finish();
+    func.verify(&interns.types).unwrap();
+    let plan = super::super::fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
+    // The fix is in the conversion, not a loss of fusion: the loaded reference stays inline.
+    assert!(plan.inline.contains(&loaded));
+    assert!(plan.inline.contains(&element));
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(
+        &interns,
+        "f",
+        &["same"],
+        &body,
+        &func,
+        &plan,
+        straight(&func),
+    );
+    assert_eq!(
+        js,
+        "function f($v0, $v1, $v2, $v3) {\n  let $cell = [];\n  same(__rt.box($v0.r), __rt.box($v1));\n  same(__rt.box($v2[1]), { buf: $v0, off: \"r\" });\n  $cell[0] = $v1;\n  same(__rt.box($cell[0]), { buf: $v3.buf, off: $v3.off });\n}\n"
+    );
+}
+
+/// A reference-to-raw cast builds its pointer from the operand's spelling (`ptr.rs::ref_to_raw`),
+/// so the planner keeps a reference loaded from a field out of it: inline, the cast would answer
+/// the field's own slot.
+#[test]
+fn a_reference_to_raw_cast_reads_a_loaded_reference_through_a_name() {
+    let mut interns = world();
+    let (holder, _) = reference_holders(&mut interns);
+    let same = interns.intern_str("same");
+    let mut b = FuncBuilder::new(item(1), signature(vec![holder], UNIT));
+    let e = FuncBuilder::ENTRY;
+    let a = b.param(holder, NO_ORIGIN);
+    let loaded = b.op(
+        e,
+        OpKind::Field {
+            base: a,
+            variant: None,
+            field: 1,
+        },
+        REF_POINT,
+        NO_ORIGIN,
+    );
+    let raw = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PtrToPtr,
+            v: loaded,
+            from: REF_POINT,
+            to: RAW_POINT,
+        },
+        RAW_POINT,
+        NO_ORIGIN,
+    );
+    b.effect(e, call_op(same, vec![raw]), NO_ORIGIN);
+    b.terminate(e, RTerm::Return(None));
+    let func = b.finish();
+    func.verify(&interns.types).unwrap();
+    let plan = super::super::fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
+    assert!(!plan.inline.contains(&loaded));
+    assert!(plan.inline.contains(&raw));
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(
+        &interns,
+        "f",
+        &["same"],
+        &body,
+        &func,
+        &plan,
+        straight(&func),
+    );
+    assert_eq!(
+        js,
+        "function f($v0) {\n  let $v1;\n  $v1 = $v0.r;\n  same(__rt.box($v1));\n}\n"
+    );
+}
+
 mod invoke;

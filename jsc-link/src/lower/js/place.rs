@@ -41,6 +41,14 @@ pub struct Walk {
     pub ty: TypeId,
     /// The pointer a `&`-of-this-place is, when the place is the pointee of a fat pointer.
     pub identity: Option<Expr>,
+    /// Whether the walk holds this place as an aggregate *value* rather than as storage: the
+    /// pointee of a reference to an aggregate, or an SSA value root of one, before any step
+    /// reaches into storage. A reference to an aggregate is the object itself, so the place's
+    /// expression is the reference value, spelled as wherever it was read from: `a.r`, `refs[i]`,
+    /// a boxed cell's `c[0]`, or an inline value's whole definition. Its raw pointer is the
+    /// object's `__rt.box` ([`JsCx::raw_view`]), never the slot of that expression, which would
+    /// be the address of the storage *holding* the reference.
+    pub object: bool,
 }
 
 impl<'a> JsCx<'a> {
@@ -59,6 +67,8 @@ impl<'a> JsCx<'a> {
         let mut variant: Option<u32> = None;
         let mut identity = None;
         let mut tail: Option<Expr> = None;
+        // An SSA value has no storage of its own: an aggregate one is held as the object.
+        let mut object = matches!(root, Root::Value(_)) && is_object(table, ty);
 
         for (step, proj) in path.iter().enumerate() {
             let settles = path[step + 1..]
@@ -66,6 +76,8 @@ impl<'a> JsCx<'a> {
                 .all(|proj| matches!(proj, Proj::Field { .. } | Proj::Downcast { .. }));
             identity = None;
             let carried_tail = tail.take();
+            // A downcast and a transparent field are the same place; every other step leaves it.
+            object &= matches!(proj, Proj::Downcast { .. } | Proj::Field { .. });
 
             match proj {
                 Proj::Deref => {
@@ -113,7 +125,11 @@ impl<'a> JsCx<'a> {
                             JsPlace::Deref(ptr::slot_element(value))
                         }
                         _ if is_slot(table, ty) => JsPlace::Var(ptr::slot_element(value)),
-                        _ => JsPlace::Deref(value),
+                        // A reference to an aggregate: the pointee is the reference value.
+                        _ => {
+                            object = is_object(table, pointee);
+                            JsPlace::Deref(value)
+                        }
                     };
                     ty = pointee;
                     variant = None;
@@ -131,6 +147,7 @@ impl<'a> JsCx<'a> {
                             ))
                         }
                     };
+                    object &= matches!(key, FieldKey::Transparent);
                     let field_ty = *field_ty;
                     if matches!(current, JsPlace::Unit(_)) {
                         // Still no storage, and still the same address.
@@ -202,6 +219,7 @@ impl<'a> JsCx<'a> {
             place: current,
             ty,
             identity,
+            object,
         })
     }
 
@@ -413,6 +431,10 @@ impl<'a> JsCx<'a> {
         if !is_slot_pointee(self.table, walk.ty) {
             return Ok(self.read_place(&walk.place));
         }
+        // An aggregate held as a value: its box, whatever expression the value was read with.
+        if walk.object {
+            return Ok(jsast::rt_call("box", vec![self.read_place(&walk.place)]));
+        }
         self.slot_of(walk.place, walk.ty)
     }
 
@@ -460,6 +482,12 @@ impl<'a> JsCx<'a> {
             )),
         }
     }
+}
+
+/// Whether a raw pointer to a place of type `ty` held as a value is the object's `__rt.box`
+/// (`ptr.rs::ref_to_raw`): a sized, non-zero-sized aggregate whose reference is the object itself.
+fn is_object(table: &TypeTable, ty: TypeId) -> bool {
+    table.is_indirect(ty) && is_slot_pointee(table, ty) && table.unsized_tail(ty).is_none()
 }
 
 /// Whether an element of an array or slice of type `base_ty` has no storage to name

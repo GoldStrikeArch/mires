@@ -803,6 +803,9 @@ impl<'a> Planner<'a> {
                 return true;
             }
         }
+        if self.cast_reads_reference_spelling(value, op) {
+            return true;
+        }
         if let OpKind::Intrinsic { name, .. } = &op.kind {
             return OperandEvaluation::intrinsic(self.interns.str(*name).unwrap_or(""))
                 == OperandEvaluation::Materialize;
@@ -925,6 +928,40 @@ impl<'a> Planner<'a> {
             }
         });
         mentions > 1
+    }
+
+    /// Whether `op` is a reference-to-raw cast of `value` to a pointer to an aggregate, which
+    /// `js::ptr::ref_to_raw` builds from the operand's *spelling* rather than its value.
+    ///
+    /// A reference to an aggregate is the object itself, and the raw pointer made from it is the
+    /// object's one `__rt.box` slot. `ref_to_raw` reads the reference's expression, though: `x.f`
+    /// becomes `{ buf: x, off: "f" }` and `x[i]` becomes `{ buf: x, off: i }`, the slot of the
+    /// place that expression names. Spelled inline, a reference loaded from a field or an element
+    /// is exactly such an expression, and the cast would answer the address of the field that
+    /// *holds* the reference (`&a.r`, a `*const &P`) instead of the pointer stored in it. The
+    /// operand is captured, so the cast sees a name. A raw view of a reference's pointee
+    /// (`&raw const *r`, which is how rustc spells `r as *const P`) does not depend on the spelling
+    /// (`js::place::Walk::object`), so only the cast is left to guard here.
+    fn cast_reads_reference_spelling(&self, value: ValueId, op: &crate::jir::repr::Op) -> bool {
+        use super::js::value::{is_raw, is_slot_pointee, pointee_of};
+        let OpKind::Cast {
+            kind: CastKind::PtrToPtr | CastKind::FnPtrToPtr,
+            v,
+            from,
+            to,
+        } = &op.kind
+        else {
+            return false;
+        };
+        let table = self.table;
+        *v == value
+            && !is_raw(table, *from)
+            && is_raw(table, *to)
+            && pointee_of(table, *from).is_some_and(|pointee| {
+                is_slot_pointee(table, pointee)
+                    && table.is_indirect(pointee)
+                    && table.unsized_tail(pointee).is_none()
+            })
     }
 
     /// The encoder has consumed this static address into every template call's payload.
