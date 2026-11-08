@@ -1,9 +1,13 @@
 // Drives the compiled executor fixtures and asserts what they did.
 //
-//   node scripts/async-check.mjs
+//   node scripts/async-check.mjs [<dir>] [<fixture>...]
 //
-// The fixtures are examples/async-tests/*.rs and build/asynctest/*.js is what scripts/async-test.sh
-// leaves behind, so run that first.
+// The fixtures are examples/async-tests/*.rs and <dir>/<fixture>.js is what scripts/async-test.sh
+// leaves behind, so run that first. <dir> defaults to build/asynctest/$ASYNC_OPT_MODE (`off` when
+// unset), and ASYNC_OPT_MODE says which executor path the shape checks expect. With no fixture
+// named, every fixture this repository can build is checked; 06_procedure needs the Topcoat
+// framework's crates (see scripts/async-test.sh) and is checked only when named. Each fixture's
+// verdict is printed as a `summary <fixture> <ok> <failed>` line once its checks are done.
 //
 // Two kinds of check. The SHAPE checks read the emitted text: that the scheduler is a microtask,
 // that the owner is captured through the DOM module rather than invented, that the promise bridge
@@ -21,14 +25,61 @@ import path from "node:path";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
-const from = path.join(root, "build/asynctest");
+const [dirArgument, ...named] = process.argv.slice(2);
+const from = path.resolve(
+  dirArgument ?? path.join(root, "build/asynctest", process.env.ASYNC_OPT_MODE ?? "off")
+);
+const BUILDABLE = [
+  "01_microtask",
+  "02_owner",
+  "03_rejected",
+  "04_coalesced",
+  "05_concurrent",
+  "07_cancellation",
+  "08_subscription",
+];
+const selected = named.length > 0 ? named : BUILDABLE;
 
 let failures = 0;
-const check = (label, ok, detail) => {
+/** The fixture the checks below are about, and every fixture's `[ok, failed]` tally. */
+let current = null;
+const tally = new Map();
+/** `count` is how many assertions one line stands for: the shared checks report theirs. */
+const check = (label, ok, detail, count = 1) => {
   console.log(`${ok ? "ok  " : "FAIL"}  ${label}${detail === undefined ? "" : `: ${detail}`}`);
+  const counts = tally.get(current) ?? [0, 0];
+  counts[ok ? 0 : 1] += ok ? count : 1;
+  tally.set(current, counts);
   if (!ok) {
     failures += 1;
   }
+};
+/**
+ * Prints the finished fixture's verdict as soon as the next one starts, so a check that throws out
+ * of a host callback and ends the process still leaves the verdicts that were reached.
+ */
+const reported = new Set();
+const summarize = () => {
+  if (current !== null && !reported.has(current)) {
+    const [ok, failed] = tally.get(current) ?? [0, 0];
+    console.log(`summary ${current} ${ok} ${failed}`);
+    reported.add(current);
+  }
+};
+/** Whether `name` was asked for and its program exists; a missing program is a failure. */
+const want = (name) => {
+  if (!selected.includes(name)) {
+    return false;
+  }
+  if (name !== current) {
+    summarize();
+  }
+  current = name;
+  const present = fs.existsSync(path.join(from, `${name}.js`));
+  if (!present) {
+    check(`${name}: compiled program present`, false, path.join(from, `${name}.js`));
+  }
+  return present;
 };
 
 /** Everything a fixture recorded, in order. */
@@ -85,49 +136,9 @@ process.on("unhandledRejection", (reason) => {
 const text = (name) => fs.readFileSync(path.join(from, `${name}.js`), "utf8");
 const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href);
 
-// ---------------------------------------------------------------- the shape
-
-{
-  const emitted = text("02_owner");
-  const optimized = process.env.ASYNC_OPT_MODE === "on";
-  if (optimized) {
-    check(
-      "shape: the compiler emitted the shared host future driver",
-      /__rt\.host_spawn\(/.test(emitted),
-      emitted.match(/.*__rt\.host_spawn.*/)?.[0]?.trim()
-    );
-  } else {
-    check(
-      "shape: off/report uses the safe Rust microtask executor",
-      /__rt\.microtask\(/.test(emitted) && /__rt\.host_local_waker\(/.test(emitted)
-    );
-  }
-  check(
-    "shape: the promise bridge is the shim's `settled`",
-    /__rt\.settled\(/.test(emitted),
-    emitted.match(/.*__rt\.settled.*/)?.[0]?.trim()
-  );
-  check(
-    "shape: the owner is captured through the DOM module",
-    /import \{ getOwner as _\$getOwner \} from "\.\/topcoat-dom\.js";/.test(emitted)
-  );
-  check(
-    "shape: and re-entered through it",
-    /import \{ runWithOwner as _\$runWithOwner \} from "\.\/topcoat-dom\.js";/.test(emitted) &&
-      (optimized
-        ? /__rt\.host_spawn\([^;]*_\$runWithOwner/.test(emitted)
-        : /_\$runWithOwner\(/.test(emitted)),
-    emitted.match(/.*_\$runWithOwner.*/)?.[0]?.trim()
-  );
-  check(
-    "shape: no Rust task table or RawWaker is linked",
-    !/view_async::task::(?:install|lookup|waker_for)|RawWakerVTable|static mut TASKS/.test(emitted)
-  );
-}
-
 // ------------------------------------------------------- 01: once, and deferred
 
-{
+if (want("01_microtask")) {
   reset();
   const js = await load("01_microtask");
   js.run();
@@ -150,9 +161,61 @@ const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href)
   );
 }
 
+// ---------------------------------------------------------------- the shape
+//
+// Release builds are minified, so the patterns allow for the compact spelling. Minification also
+// renames the items, so whether the old Rust task table is linked is answered from the item names
+// the link step's lane report (`<program>.lane.json`) records, as well as from the text.
+
+if (want("02_owner")) {
+  const emitted = text("02_owner");
+  let linkedItems = "";
+  try {
+    const report = JSON.parse(fs.readFileSync(path.join(from, "02_owner.js.lane.json"), "utf8"));
+    linkedItems = report.items.map((item) => item.name).join("\n");
+  } catch {
+    // No lane report: the emitted text is all there is to read.
+  }
+  const optimized = process.env.ASYNC_OPT_MODE === "on";
+  if (optimized) {
+    check(
+      "shape: the compiler emitted the shared host future driver",
+      /__rt\.host_spawn\(/.test(emitted),
+      emitted.match(/.*__rt\.host_spawn.*/)?.[0]?.trim()
+    );
+  } else {
+    check(
+      "shape: off/report uses the safe Rust microtask executor",
+      /__rt\.microtask\(/.test(emitted) && /__rt\.host_local_waker\(/.test(emitted)
+    );
+  }
+  check(
+    "shape: the promise bridge is the shim's `settled`",
+    /__rt\.settled\(/.test(emitted),
+    emitted.match(/.*__rt\.settled.*/)?.[0]?.trim()
+  );
+  check(
+    "shape: the owner is captured through the DOM module",
+    /import ?\{ ?getOwner as _\$getOwner ?\} ?from ?"\.\/topcoat-dom\.js";/.test(emitted)
+  );
+  check(
+    "shape: and re-entered through it",
+    /import ?\{ ?runWithOwner as _\$runWithOwner ?\} ?from ?"\.\/topcoat-dom\.js";/.test(emitted) &&
+      (optimized
+        ? /__rt\.host_spawn\([^;]*_\$runWithOwner/.test(emitted)
+        : /_\$runWithOwner\(/.test(emitted)),
+    emitted.match(/.*_\$runWithOwner.*/)?.[0]?.trim()
+  );
+  const taskTable = /view_async(?:::|\$)task(?:::|\$)(?:install|lookup|waker_for)|RawWakerVTable|static mut TASKS/;
+  check(
+    "shape: no Rust task table or RawWaker is linked",
+    !taskTable.test(emitted) && !taskTable.test(linkedItems)
+  );
+}
+
 // ------------------------------------------------- 02: the owner, and the write
 
-{
+if (want("02_owner")) {
   reset();
   const dom = await import(pathToFileURL(path.join(from, "topcoat-dom.js")).href);
   const js = await load("02_owner");
@@ -183,7 +246,7 @@ const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href)
 
 // The same compiled owner-aware future also accepts a getter-backed thenable. The
 // bridge must call the retrieved method, preserving its receiver, after one lookup.
-{
+if (want("02_owner")) {
   reset();
   const dom = await import(pathToFileURL(path.join(from, "topcoat-dom.js")).href);
   const js = await load("02_owner");
@@ -219,7 +282,7 @@ const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href)
 
 // --------------------------------------------- 03: a rejection is a value, not a rejection
 
-{
+if (want("03_rejected")) {
   reset();
   const js = await load("03_rejected");
   js.run_rejected();
@@ -244,7 +307,7 @@ const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href)
 
 // ------------------------------------------------------- 04: wakes are coalesced
 
-{
+if (want("04_coalesced")) {
   reset();
   const js = await load("04_coalesced");
   js.run();
@@ -263,7 +326,7 @@ const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href)
 
 // -------------------------------------------------------- 05: two tasks at once
 
-{
+if (want("05_concurrent")) {
   reset();
   const js = await load("05_concurrent");
   js.run();
@@ -306,8 +369,11 @@ const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href)
 }
 
 // ------------------------------------- 06: a procedure, through the framework's own expansion
+//
+// Not built by scripts/async-test.sh: it needs the framework's `topcoat_runtime_macro` and
+// `topcoat_dom`, which this repository does not have. It runs when named and present.
 
-{
+if (want("06_procedure")) {
   // Every request the compiled program made: the url, the media type and the body. The client
   // half builds the whole `fetch` init itself with a `js!{}` block, so what is recorded here is
   // the real thing rather than the arguments of a host function that stood in for it: the method,
@@ -403,18 +469,43 @@ const load = (name) => import(pathToFileURL(path.join(from, `${name}.js`)).href)
   check("06: and still nothing reached the host unhandled", unhandled.length === 0, JSON.stringify(unhandled.map(String)));
 }
 
-const { checkOwnerCancellation } = await import("./async-cancellation-check.mjs");
-const cancellation = await checkOwnerCancellation(
-  await load("07_cancellation"),
-  await import(pathToFileURL(path.join(from, "topcoat-dom.js")).href),
-);
+// The two shared checks throw at their first wrong step, with the trace in the message. A throw from
+// inside a host callback the program calls ends the process instead; the verdicts printed stand.
 
-console.log(`ok    07: owner cancellation (${cancellation.checks} assertions)`);
+if (want("07_cancellation")) {
+  const { checkOwnerCancellation } = await import("./async-cancellation-check.mjs");
+  try {
+    const cancellation = await checkOwnerCancellation(
+      await load("07_cancellation"),
+      await import(pathToFileURL(path.join(from, "topcoat-dom.js")).href),
+    );
+    check(`07: owner cancellation (${cancellation.checks} assertions)`, true, undefined, cancellation.checks);
+  } catch (error) {
+    check("07: owner cancellation", false, error?.message ?? String(error));
+  }
+}
 
 // Subscription exceptions return through typed Rust error paths under the captured owner.
-const { checkOwnerSubscription } = await import('./async-subscription-check.mjs');
-await checkOwnerSubscription(await load('08_subscription'), await import(pathToFileURL(path.join(from, 'topcoat-dom.js')).href));
-console.log('owner subscription: 40 cases passed');
+if (want("08_subscription")) {
+  const { checkOwnerSubscription } = await import("./async-subscription-check.mjs");
+  try {
+    const subscription = await checkOwnerSubscription(
+      await load("08_subscription"),
+      await import(pathToFileURL(path.join(from, "topcoat-dom.js")).href),
+    );
+    check(`08: owner subscription (${subscription.rows.length} cases)`, true, undefined, subscription.rows.length);
+  } catch (error) {
+    check("08: owner subscription", false, error?.message ?? String(error));
+  }
+}
 
+summarize();
+for (const name of selected) {
+  if (!reported.has(name)) {
+    current = name;
+    check(`${name}: checked`, false, "scripts/async-check.mjs has no checks for it");
+    summarize();
+  }
+}
 console.log(`${failures === 0 ? "PASS" : "FAIL"}: ${failures} failed`);
 process.exit(failures === 0 ? 0 : 1);
