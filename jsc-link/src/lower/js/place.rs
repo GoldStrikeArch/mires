@@ -3,13 +3,13 @@
 //!
 //! The walk is v1's exactly — `Deref` picks the pointer form from the type table, `Field` asks
 //! `TypeTable::field`, `Index`/`ConstantIndex`/`Subslice` spell element and window reads,
-//! `Downcast` is a no-op — and so are the three shapes it produces (`JsPlace`), the reference and
+//! `Downcast` is a no-op — and so are the four shapes it produces (`JsPlace`), the reference and
 //! raw pointer built by running it backwards (`borrow_view`/`raw_view`), and the write-through
 //! rules.
 
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::repr::{Proj, Root};
-use rcgjs_object::jir::types::{FieldKey, TypeId, TypeKind};
+use rcgjs_object::jir::types::{FieldKey, TypeId, TypeKind, TypeTable};
 use rcgjs_object::jsast::{self, BinOp, Expr, Stmt};
 use rcgjs_object::ptr::{self, BUF, META, OFF, PTR};
 
@@ -28,6 +28,11 @@ pub enum JsPlace {
     /// The `N` elements a pointer to `[E; N]` names, reached through `__rt.read_array` and
     /// `__rt.write_array`. The expression is the pointer.
     Array(Expr, u64),
+    /// A place with no storage (`place.rs::JsPlace::Unit`): a zero-sized element of an array or
+    /// slice, or anything projected out of a zero-sized array. Reading it is `undefined` and a
+    /// write to it stores nothing. The expression is the pointer every reference or raw pointer to
+    /// it is: the data pointer of the slice (its `buf`), or the reference form of the array.
+    Unit(Expr),
 }
 
 /// The result of walking a place.
@@ -72,6 +77,14 @@ impl<'a> JsCx<'a> {
                             ),
                         ));
                     };
+                    // Nothing inside a place with no storage has storage either, and a pointer
+                    // read out of no storage is `undefined`.
+                    if matches!(current, JsPlace::Unit(_)) {
+                        current = JsPlace::Unit(jsast::undefined());
+                        ty = pointee;
+                        variant = None;
+                        continue;
+                    }
                     let value = self.read_place(&current);
                     let shape = table.peeled(pointee);
                     current = match value::kind(table, shape) {
@@ -119,7 +132,9 @@ impl<'a> JsCx<'a> {
                         }
                     };
                     let field_ty = *field_ty;
-                    if matches!(key, FieldKey::Transparent) {
+                    if matches!(current, JsPlace::Unit(_)) {
+                        // Still no storage, and still the same address.
+                    } else if matches!(key, FieldKey::Transparent) {
                         tail = carried_tail;
                     } else if !table.get(field_ty).is_some_and(|d| d.layout.sized) {
                         let base = self.read_place(&current);
@@ -132,19 +147,42 @@ impl<'a> JsCx<'a> {
                     variant = None;
                 }
                 Proj::Index(index) => {
-                    let base = self.read_place(&current);
-                    let index = self.expr_of(*index)?;
-                    current = JsPlace::Var(self.element_expr(ty, base, index));
-                    ty = self.element_ty(ty)?;
+                    let element = self.element_ty(ty)?;
+                    if let Some(address) = self.unit_element(&current, ty, element) {
+                        // The index is not spelled, so `fuse` never makes it an inline value
+                        // ([`reaches_unit`]): it was evaluated where it was defined.
+                        current = JsPlace::Unit(address);
+                    } else {
+                        let base = self.read_place(&current);
+                        let index = self.expr_of(*index)?;
+                        current = JsPlace::Var(self.element_expr(ty, base, index));
+                    }
+                    ty = element;
                     variant = None;
                 }
                 Proj::ConstantIndex {
                     offset, from_end, ..
                 } => {
-                    let base = self.read_place(&current);
-                    let index = self.constant_index(ty, base.clone(), *offset, *from_end);
-                    current = JsPlace::Var(self.element_expr(ty, base, index));
-                    ty = self.element_ty(ty)?;
+                    let element = self.element_ty(ty)?;
+                    if let Some(address) = self.unit_element(&current, ty, element) {
+                        current = JsPlace::Unit(address);
+                    } else {
+                        let base = self.read_place(&current);
+                        let index = self.constant_index(ty, base.clone(), *offset, *from_end);
+                        current = JsPlace::Var(self.element_expr(ty, base, index));
+                    }
+                    ty = element;
+                    variant = None;
+                }
+                // A run of a zero-sized array is a zero-sized array at the same address. A run of
+                // a slice stays a fat slice whatever its element is, because its `len` is the
+                // element count.
+                Proj::Subslice { .. }
+                    if matches!(current, JsPlace::Unit(_)) || table.is_zst(ty) =>
+                {
+                    if !matches!(current, JsPlace::Unit(_)) {
+                        current = JsPlace::Unit(self.read_place(&current));
+                    }
                     variant = None;
                 }
                 Proj::Subslice { from, to, from_end } => {
@@ -195,6 +233,25 @@ impl<'a> JsCx<'a> {
                 tail,
             ],
         )))
+    }
+
+    /// The address of an element of `base` (of type `base_ty`) when the element has no storage
+    /// ([`element_is_unit`]), and `None` when it has. Every element of such a run is at one
+    /// address: the one the base already had, the data pointer of a slice (its `buf`, which is
+    /// what `as_ptr` answers), or the reference form of a zero-sized array. None of the three
+    /// reads an element.
+    fn unit_element(&self, base: &JsPlace, base_ty: TypeId, element: TypeId) -> Option<Expr> {
+        if let JsPlace::Unit(address) = base {
+            return Some(address.clone());
+        }
+        if !element_is_unit(self.table, base_ty, element) {
+            return None;
+        }
+        let base = self.read_place(base);
+        Some(match value::kind(self.table, base_ty) {
+            Some(TypeKind::Slice(_)) => ptr::slot_buf(base),
+            _ => base,
+        })
     }
 
     /// One element of an array or a slice: `base[i]` or `base.buf[base.off + i]`.
@@ -286,6 +343,7 @@ impl<'a> JsCx<'a> {
                 "read_array",
                 vec![pointer.clone(), jsast::num(*width as f64)],
             ),
+            JsPlace::Unit(_) => jsast::undefined(),
         }
     }
 
@@ -306,6 +364,11 @@ impl<'a> JsCx<'a> {
                 "write_array",
                 vec![pointer, value],
             ))]),
+            // Nothing to store. A value with effects of its own is still evaluated.
+            JsPlace::Unit(_) => Ok(match value {
+                Expr::Undefined => Vec::new(),
+                value => vec![jsast::expr_stmt(value)],
+            }),
         }
     }
 
@@ -329,6 +392,9 @@ impl<'a> JsCx<'a> {
                 vec![pointer.clone(), jsast::num(*width as f64)],
             ));
         }
+        if let JsPlace::Unit(address) = walk.place {
+            return Ok(address);
+        }
         if self.table.is_indirect(walk.ty) {
             return Ok(self.read_place(&walk.place));
         }
@@ -340,6 +406,9 @@ impl<'a> JsCx<'a> {
         let walk = self.walk_place(root, path)?;
         if let Some(identity) = walk.identity {
             return Ok(self.ref_to_raw(walk.ty, identity));
+        }
+        if let JsPlace::Unit(address) = walk.place {
+            return Ok(address);
         }
         if !is_slot_pointee(self.table, walk.ty) {
             return Ok(self.read_place(&walk.place));
@@ -358,6 +427,8 @@ impl<'a> JsCx<'a> {
             JsPlace::Var(Expr::Index(base, key)) => Ok(ptr::slot(*base, *key)),
             JsPlace::Var(Expr::Member(base, name)) => Ok(ptr::slot(*base, jsast::string(name))),
             JsPlace::Array(pointer, _) => Ok(pointer),
+            // No storage, so no slot either: the pointer is the address the run shares.
+            JsPlace::Unit(address) => Ok(address),
             JsPlace::Deref(value) | JsPlace::Var(value) => {
                 if self.table.is_indirect(ty) {
                     Ok(self.ref_to_raw(ty, value))
@@ -389,6 +460,48 @@ impl<'a> JsCx<'a> {
             )),
         }
     }
+}
+
+/// Whether an element of an array or slice of type `base_ty` has no storage to name
+/// ([`JsPlace::Unit`], `place.rs::element_is_unit`): the base is a zero-sized array, which is
+/// `undefined` like every zero-sized value, or the element is zero-sized, which a slice holds
+/// nowhere at all: its `buf` is only the data pointer it was built from (`undefined` when it was
+/// unsized from such an array, a dangling address under a collection that never allocated).
+pub fn element_is_unit(table: &TypeTable, base_ty: TypeId, element: TypeId) -> bool {
+    table.is_zst(base_ty) || table.is_zst(element)
+}
+
+/// Whether the walk of `path` from a root of type `root_ty` reaches a place with no storage. Such
+/// a place does not spell the index that selected it, and is not spelled at all where it is only
+/// read or written, so the plan keeps every operand of the view (its root value and its indices)
+/// out of the inline set: an inline value is evaluated where it is spelled or not at all. A step
+/// whose type the table cannot answer counts as reaching one, which costs a name, never an
+/// evaluation.
+pub fn reaches_unit(table: &TypeTable, root_ty: TypeId, path: &[Proj]) -> bool {
+    let mut ty = Some(root_ty);
+    for proj in path {
+        match proj {
+            Proj::Deref => ty = ty.and_then(|ty| value::pointee_of(table, ty)),
+            Proj::Field { ty: field, .. } => ty = Some(*field),
+            Proj::Index(_) | Proj::ConstantIndex { .. } => {
+                let element = ty.and_then(|ty| match value::kind(table, ty) {
+                    Some(TypeKind::Array { element, .. } | TypeKind::Slice(element)) => {
+                        Some(*element)
+                    }
+                    _ => None,
+                });
+                match (ty, element) {
+                    (Some(base), Some(element)) if !element_is_unit(table, base, element) => {
+                        ty = Some(element);
+                    }
+                    _ => return true,
+                }
+            }
+            Proj::Subslice { .. } if ty.is_none_or(|ty| table.is_zst(ty)) => return true,
+            Proj::Subslice { .. } | Proj::Downcast { .. } => {}
+        }
+    }
+    false
 }
 
 /// The pointer `p` of a `p.buf[p.off]` place.

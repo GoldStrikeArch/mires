@@ -264,11 +264,20 @@ globalThis.__rt.byte_slice_ref = (p) => {
 // size, so alignment predicates answer correctly; and the low bits are
 // therefore determined by the element size, which is what `fmt::Arguments`
 // tests when it looks at `bits & 1`.
+//
+// `undefined` as a pointer is the reference form of a zero-sized value: every
+// pointer to a zero-sized local, to an element of a zero-sized array, and into a
+// slice unsized from one (CONTRACT.md, "Pointers"). Rust promises such a pointer
+// is non-null and aligned and nothing more, so all of them share one address,
+// `_zst_addr`: 2^29, the largest alignment a type can ask for. No base is ever
+// given that address, so it is never mistaken for an element of a real buffer.
 globalThis.__rt._addrs = new WeakMap();
 globalThis.__rt._addrNext = 0;
+globalThis.__rt._zst_addr = 536870912;
 globalThis.__rt.addr = (p, size) => {
   if (typeof p === "number") return p;
-  if (p === null || p === undefined) return 0;
+  if (p === null) return 0;
+  if (p === undefined) return globalThis.__rt._zst_addr;
   if (p.pr !== undefined) return globalThis.__rt.addr(p.pr, p.ps);
   globalThis.__rt._named(p, "addr");
   const scalar = globalThis.__rt._scalar_view_of.get(p.buf);
@@ -288,6 +297,7 @@ globalThis.__rt.addr = (p, size) => {
   let base = globalThis.__rt._addrs.get(key);
   if (base === undefined) {
     base = 4096 * ++globalThis.__rt._addrNext;
+    if (base === globalThis.__rt._zst_addr) base = 4096 * ++globalThis.__rt._addrNext;
     globalThis.__rt._addrs.set(key, base);
   }
   // A slot keyed by a property name (a field of an aggregate) has no address of
@@ -389,6 +399,12 @@ globalThis.__rt.ptr_cmp = (a, b, size) => {
 // record literal is what lets `p.buf[p.off + 1]` fold out of it.
 globalThis.__rt.offset = (p, count, size) => {
   if (typeof p === "number") return p + count * size;
+  // The reference form of a zero-sized value is the address `_zst_addr` (see
+  // `addr`): a zero-sized step leaves it as it is, any other one is arithmetic on
+  // that address.
+  if (p === undefined) {
+    return count === 0 || size === 0 ? p : globalThis.__rt._zst_addr + count * size;
+  }
   if (p.pr !== undefined) {
     if (count === 0) return p;
     throw __rt.abort_error(new Error(

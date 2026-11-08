@@ -3360,4 +3360,152 @@ fn a_transmute_between_two_integers_of_one_width_remasks_the_value() {
     assert_eq!(js, "function f(x) {\n  return x | 0;\n}\n");
 }
 
+/// `fn f(s: &mut [()]) { sink(&raw mut (*s)[index()]); sink(s as *mut ()); drop((*s)[0]) }`, and
+/// the same over a zero-sized `[(); 4]` behind a reference: a zero-sized element has no storage,
+/// so instead of a read of `s.buf[s.off + i]` (a `TypeError` for a slice unsized from an
+/// `undefined` array) its raw pointer, the cast of the container to an element pointer
+/// (`as_ptr`), and the reference its glue receives are all one address: the slice's data pointer
+/// `s.buf`, or the array's own pointer `s`. The index is not spelled in the place, so the plan
+/// keeps it at its definition, where its call still runs once; an `i32` element spells the same
+/// index inline.
+#[test]
+fn a_zero_sized_element_is_a_place_with_no_storage() {
+    const UNIT_SLICE: TypeId = TypeId(40);
+    const REF_UNIT_SLICE: TypeId = TypeId(41);
+    const RAW_UNIT: TypeId = TypeId(42);
+    const UNIT_ARRAY: TypeId = TypeId(43);
+    const REF_UNIT_ARRAY: TypeId = TypeId(44);
+    let mut interns = world();
+    let mut unit_slice = descriptor(UNIT_SLICE, TypeKind::Slice(UNIT), 0);
+    unit_slice.layout.sized = false;
+    unit_slice.layout.size = None;
+    unit_slice.layout.zst = false;
+    unit_slice.js.is_indirect = true;
+    interns.intern_type(unit_slice);
+    interns.intern_type(pointer(
+        REF_UNIT_SLICE,
+        UNIT_SLICE,
+        PointerForm::FatSlice,
+        false,
+    ));
+    interns.intern_type(pointer(RAW_UNIT, UNIT, PointerForm::Thin, true));
+    interns.intern_type(descriptor(
+        UNIT_ARRAY,
+        TypeKind::Array {
+            element: UNIT,
+            length: 4,
+        },
+        0,
+    ));
+    interns.intern_type(pointer(
+        REF_UNIT_ARRAY,
+        UNIT_ARRAY,
+        PointerForm::Thin,
+        false,
+    ));
+    let sink = interns.intern_str("sink");
+    let index_name = interns.intern_str("index");
+    let glue = interns.intern_str("drop_unit");
+
+    for (base_ty, element_ptr) in [
+        (REF_UNIT_SLICE, RAW_UNIT),
+        (REF_UNIT_ARRAY, RAW_UNIT),
+        (REF_SLICE, RAW_I32),
+    ] {
+        let zero_sized = element_ptr == RAW_UNIT;
+        let mut b = FuncBuilder::new(item(1), signature(vec![base_ty], UNIT));
+        let s = b.param(base_ty, NO_ORIGIN);
+        let e = FuncBuilder::ENTRY;
+        let call = |callee, args| OpKind::Call {
+            callee: Callee::Direct {
+                item: item(2),
+                link_name: callee,
+            },
+            function: None,
+            args,
+            track_caller: None,
+            semantic: CallSemantic::Ordinary,
+            host: None,
+        };
+        let index = b.op(e, call(index_name, Vec::new()), USIZE, NO_ORIGIN);
+        let element = b.op(
+            e,
+            OpKind::RawView {
+                root: Root::Value(s),
+                path: vec![Proj::Deref, Proj::Index(index)],
+                mutable: true,
+            },
+            element_ptr,
+            NO_ORIGIN,
+        );
+        b.effect(e, call(sink, vec![element]), NO_ORIGIN);
+        if zero_sized {
+            let as_ptr = b.op(
+                e,
+                OpKind::Cast {
+                    kind: CastKind::PtrToPtr,
+                    v: s,
+                    from: base_ty,
+                    to: RAW_UNIT,
+                },
+                RAW_UNIT,
+                NO_ORIGIN,
+            );
+            b.effect(e, call(sink, vec![as_ptr]), NO_ORIGIN);
+            b.effect(
+                e,
+                OpKind::Drop {
+                    root: Root::Value(s),
+                    path: vec![
+                        Proj::Deref,
+                        Proj::ConstantIndex {
+                            offset: 0,
+                            min_length: 1,
+                            from_end: false,
+                        },
+                    ],
+                    glue: DropGlue::Direct {
+                        item: item(3),
+                        link_name: glue,
+                    },
+                },
+                NO_ORIGIN,
+            );
+        }
+        b.terminate(e, RTerm::Return(None));
+        let func = b.finish();
+        func.verify(&interns.types).unwrap();
+        let plan =
+            super::super::fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
+        assert_eq!(
+            plan.inline.contains(&index),
+            !zero_sized,
+            "an index the place does not spell must not be inline"
+        );
+        let body = body_of(BodyKind::Function, func.sig.clone());
+        let js = lower(
+            &interns,
+            "f",
+            &["sink", "index", "drop_unit"],
+            &body,
+            &func,
+            &plan,
+            straight(&func),
+        );
+        assert_eq!(js.matches("index()").count(), 1, "{js}");
+        if zero_sized {
+            let address = if base_ty == REF_UNIT_SLICE {
+                "$v0.buf"
+            } else {
+                "$v0"
+            };
+            assert_eq!(js.matches(&format!("sink({address});")).count(), 2, "{js}");
+            assert!(js.contains(&format!("drop_unit({address});")), "{js}");
+            assert!(!js.contains("["), "{js}");
+        } else {
+            assert!(js.contains(".off + index()"), "{js}");
+        }
+    }
+}
+
 mod invoke;

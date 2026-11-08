@@ -650,6 +650,36 @@ Two rules about boxing that are easy to get wrong, and both are miscompilations 
 `&*p` where `*p` is unsized stays the identity: the fat pointer already carries everything a place
 of that type is.
 
+An element of an array or slice whose element type is zero-sized, and anything projected out of a
+zero-sized array, is a place with **no storage**: a zero-sized array is `undefined` like every
+zero-sized value, so there is no buffer to index. Reading such a place is `undefined` and writing
+it stores nothing. The element count is unaffected: it is the array type's `N` or the slice's
+`len`, so bounds checks, `len`, and compiler drop glue's loop over `&raw mut (*s)[i]` run exactly as
+many times as natively.
+
+Every pointer to such an element is **one address, the one its container provides**:
+
+* an element of a zero-sized array `a` is at `a`'s own pointer: `&a`, which is `undefined` for a
+  local or a field (the reference form of a zero-sized value), or the raw pointer `a` was reached
+  through;
+* an element of a slice of zero-sized elements is at the slice's data pointer, which the record
+  keeps unnormalized as its `buf`: `{ buf: undefined, off, len }` when it was unsized from such an
+  array, `{ buf: d, off: 0, len }` when `from_raw_parts(d, len)` built it (a `Vec<Z>` passes its
+  dangling address `d`). `off` is not part of the address.
+
+The conversions answer the same address: `as_ptr`, `as_mut_ptr` and every cast of a `*const [Z]` to
+a zero-sized pointee is `buf`; `add`, `offset` and `wrapping_add` on a zero-sized pointee do not
+move it; `from_raw_parts(p, n)` is `{ buf: p, off: 0, len: n }`, so it round trips. `ptr::eq`,
+`ptr::addr_eq` and `as usize` therefore agree for `&a[i]`, `a.as_ptr()`, `s.as_ptr()`,
+`s.first()`, an iterator's item, and a `Vec<Z>`'s `as_ptr()` against its elements. `undefined` as a
+pointer has the address `2^29` (`__rt._zst_addr`, never given to a buffer), so `is_null()` is false
+for every one of them and every alignment predicate holds. Rust leaves it unspecified whether two
+different zero-sized arrays share an address; here they do when both are `undefined`. Not
+supported: `==` or ordering of two fat `*const [Z]` (`__rt.slice_ptr_eq` compares `off`, and refuses
+a `buf` of `undefined`), and `offset_from` on a zero-sized pointee, which panics in Rust.
+`examples/core-tests/114_zst_aggregate_drops.rs` and `115_zst_element_pointers.rs` are the
+fixtures.
+
 ### A struct with an unsized tail
 
 A struct whose **last field is unsized** is unsized itself, and it is neither a slice nor a trait

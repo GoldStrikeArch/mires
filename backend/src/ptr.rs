@@ -607,6 +607,14 @@ fn cast_pointer_at<'tcx>(
     // to it, because a raw pointer can be offset — would hand `<T as Display>::fmt` a slot where
     // it expects its `self`, and every field read would answer `undefined`.
     if is_zst(tcx, to) {
+        // A slice of zero-sized elements holds them nowhere: its `buf` is the data pointer it was
+        // built from, which is the one address every element has (`place.rs`, `JsPlace::Unit`).
+        // `as_ptr`, `cast::<()>` and `addr_eq` all answer it.
+        if let ty::Slice(element) = from.kind() {
+            if is_zst(tcx, *element) {
+                return slot_buf(value);
+            }
+        }
         let reference = raw_to_ref(fx, from, value);
         let reference = if crate::value::unsized_tail(tcx, from).is_some()
             || matches!(from.kind(), ty::Dynamic(..))
@@ -1061,6 +1069,12 @@ pub(crate) fn raw_to_ref<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, raw: Expr
 /// every `Display for str`, so a zombie there would reject `write!` itself. The cast that feeds it
 /// (`*const u8` to `*const usize`) throws first, so nothing silently reads bytes as words.
 ///
+/// A **zero-sized element** (`Vec<Z>`'s, `Vec<[Z; N]>`'s, `Vec<[T; 0]>`'s) asks neither question:
+/// nothing is stored at any granularity, and its elements are places with no storage (`place.rs`,
+/// `JsPlace::Unit`). The record keeps the data pointer itself as its `buf`, unnormalized, because
+/// that is the one address every element has: `as_ptr` answers it and `from_raw_parts` round
+/// trips through it. The JIR lane's `SliceView` over a thin pointer is the same record.
+///
 /// A `str` is a JavaScript string rather than a buffer, so rebuilding one from a byte pointer is
 /// `__rt.bytes_str` over the data slot and the length — a decode rather than a re-wrapping, which
 /// is the price of the hybrid.
@@ -1075,6 +1089,7 @@ pub(crate) fn build_fat<'tcx>(
 ) -> Expr {
     match pointee.kind() {
         ty::Dynamic(..) => fat_dyn(data, meta),
+        ty::Slice(element) if is_zst(fx.tcx, *element) => fat_slice(data, jsast::num(0), meta),
         ty::Slice(element) if matches!(element.kind(), ty::Array(..)) => {
             let width = match element.kind() {
                 ty::Array(_, count) => count.try_to_target_usize(fx.tcx).unwrap_or(0),

@@ -423,8 +423,11 @@ impl<'a> SemanticInterpreter<'a> {
                 }
                 Terminator::Return => {
                     let ret = self.heap.read(&Location::root(self.local(LocalId(0))?))?;
+                    // A zero-sized result carries no bits, so it is the type's one value however
+                    // much of the return place was written -- a `MaybeUninit<Z>::uninit()` leaves
+                    // the union's other arm `Undef` -- exactly as JIR-R returns it.
                     let ret = match ret {
-                        Value::Undef if self.table.is_zst(self.body.signature.result) => {
+                        _ if self.table.is_zst(self.body.signature.result) => {
                             eval::zero_sized(self.body.signature.result, self.table)?
                         }
                         Value::Undef => return Err(Trap::Ub("return of uninitialized storage")),

@@ -258,15 +258,17 @@ impl<'a> JsCx<'a> {
         let table = self.table;
         match value::kind(table, pointee) {
             Some(TypeKind::Dynamic { .. }) => Ok(ptr::fat_dyn(data, meta)),
-            Some(TypeKind::Slice(element)) => {
-                if let Some(TypeKind::Array { length, .. }) = value::kind(table, *element) {
-                    return Ok(jsast::rt_call(
-                        "chunk_slice",
-                        vec![data, meta, jsast::num(*length as f64)],
-                    ));
-                }
-                Ok(jsast::rt_call("slice_from_parts", vec![data, meta]))
-            }
+            Some(TypeKind::Slice(element)) => match value::kind(table, *element) {
+                // Zero-sized elements are stored nowhere, so the record keeps the data pointer
+                // itself as its `buf`: what `as_ptr` and every element pointer answer, exactly as
+                // a `SliceView` over a thin pointer spells it. Nothing is normalized or asked.
+                _ if table.is_zst(*element) => Ok(ptr::fat_slice(data, jsast::num(0), meta)),
+                Some(TypeKind::Array { length, .. }) => Ok(jsast::rt_call(
+                    "chunk_slice",
+                    vec![data, meta, jsast::num(*length as f64)],
+                )),
+                _ => Ok(jsast::rt_call("slice_from_parts", vec![data, meta])),
+            },
             Some(TypeKind::Str) => {
                 let (setup, data) = self.reread(data, &[BUF, OFF]);
                 let decoded = jsast::rt_call(
@@ -416,6 +418,14 @@ impl<'a> JsCx<'a> {
             return Ok(value);
         }
         if table.is_zst(to) {
+            // A slice of zero-sized elements holds them nowhere: its `buf` is the data pointer it
+            // was built from, which is the one address every element has (`place.rs`,
+            // `JsPlace::Unit`). `as_ptr`, `cast::<()>` and `addr_eq` all answer it.
+            if let Some(TypeKind::Slice(element)) = value::kind(table, from) {
+                if table.is_zst(*element) {
+                    return Ok(ptr::slot_buf(value));
+                }
+            }
             let reference = self.raw_to_ref(from, value);
             let reference = if table.unsized_tail(from).is_some()
                 || matches!(value::kind(table, from), Some(TypeKind::Dynamic { .. }))

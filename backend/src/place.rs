@@ -38,7 +38,7 @@
 
 use rustc_abi::VariantIdx;
 use rustc_middle::mir::{Operand, Place, PlaceElem};
-use rustc_middle::ty::{self, Ty};
+use rustc_middle::ty::{self, Ty, TyCtxt};
 
 use crate::base::FnCx;
 use crate::jsast::{self, BinOp as JsBinOp, Expr, Stmt};
@@ -59,6 +59,21 @@ pub(crate) enum JsPlace {
     /// `p.buf[p.off]`, and the window slot a `as *const [E; N]` cast produces spans `w`
     /// consecutive elements of somebody else's buffer (`ptr.rs`, "Forms").
     Array(Expr, u64),
+    /// A place with no storage: a zero-sized element of an array or slice, or anything projected
+    /// out of a zero-sized array ([`element_is_unit`]).
+    ///
+    /// A zero-sized array is `undefined`, like every zero-sized value, so it has no buffer to
+    /// index; a slice of zero-sized elements has none either: its `buf` is only the data pointer
+    /// it was built from (`undefined` when it was unsized from such an array, a dangling address
+    /// under a collection that never allocated). The elements are still there logically -- the
+    /// array type and the slice's `len` count them -- so a bounds check, `len` and the drop glue's
+    /// loop over `&raw mut (*slice)[i]` keep working; only the storage is absent.
+    ///
+    /// Reading such a place is `undefined` and a write to it stores nothing. The expression is the
+    /// one address every element of the run has, and so what every reference or raw pointer to
+    /// one is: the slice's data pointer (what `as_ptr` answers), or the reference form of the
+    /// zero-sized array, which is the array's own pointer cast to its element.
+    Unit(Expr),
 }
 
 /// The result of walking a place: where it is and what type it has.
@@ -117,6 +132,14 @@ impl<'tcx> FnCx<'_, 'tcx> {
                             identity: None,
                         };
                     };
+                    // Nothing inside a place with no storage has storage either, and a pointer
+                    // read out of no storage is `undefined`.
+                    if matches!(current, JsPlace::Unit(_)) {
+                        current = JsPlace::Unit(jsast::undefined());
+                        ty = pointee;
+                        variant = None;
+                        continue;
+                    }
                     let value = self.read(&current);
                     // A transparent wrapper *is* its field (`value.rs`), so the shape questions
                     // below are asked of what the pointee's JavaScript value actually is.
@@ -194,7 +217,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     // way is a copy of the elements rather than the place they live in.
                     // `MaybeUninit::write` is the case -- `(*p).value = v` on a `Box<[E; N]>` has
                     // to reach the same store `*p = v` does.
-                    if matches!(key, FieldKey::Transparent) {
+                    if matches!(current, JsPlace::Unit(_)) {
+                        // Still no storage, and still the same address.
+                    } else if matches!(key, FieldKey::Transparent) {
                         tail = carried_tail;
                     } else if !field_ty.is_sized(self.tcx, crate::value::typing_env()) {
                         // The unsized tail of the record a `Deref` of a `{ ptr, meta }` named.
@@ -210,10 +235,15 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     variant = None;
                 }
                 PlaceElem::Index(index) => {
-                    let base = self.read(&current);
-                    let index = self.local_expr(index);
-                    current = JsPlace::Var(self.element_expr(ty, base, index));
-                    ty = self.element_ty(ty);
+                    let element = self.element_ty(ty);
+                    if let Some(address) = self.unit_element(&current, ty, element) {
+                        current = JsPlace::Unit(address);
+                    } else {
+                        let base = self.read(&current);
+                        let index = self.local_expr(index);
+                        current = JsPlace::Var(self.element_expr(ty, base, index));
+                    }
+                    ty = element;
                     variant = None;
                 }
                 PlaceElem::ConstantIndex {
@@ -221,12 +251,33 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     min_length: _,
                     from_end,
                 } => {
-                    let base = self.read(&current);
-                    let index = self.constant_index(ty, base.clone(), offset, from_end);
-                    // Constant either way, so nothing to hoist: `len` cannot change under a
-                    // reference that borrows the slice it was read from.
-                    current = JsPlace::Var(self.element_expr(ty, base, index));
-                    ty = self.element_ty(ty);
+                    let element = self.element_ty(ty);
+                    if let Some(address) = self.unit_element(&current, ty, element) {
+                        current = JsPlace::Unit(address);
+                    } else {
+                        let base = self.read(&current);
+                        let index = self.constant_index(ty, base.clone(), offset, from_end);
+                        // Constant either way, so nothing to hoist: `len` cannot change under a
+                        // reference that borrows the slice it was read from.
+                        current = JsPlace::Var(self.element_expr(ty, base, index));
+                    }
+                    ty = element;
+                    variant = None;
+                }
+                // A run of a zero-sized array is a zero-sized array at the same address. A run of
+                // a slice stays a fat slice whatever its element is, because its `len` is the
+                // element count.
+                PlaceElem::Subslice { from, to, from_end }
+                    if matches!(current, JsPlace::Unit(_))
+                        || crate::value::is_zst(self.tcx, ty) =>
+                {
+                    // Only the type of the run is wanted; its JavaScript would index nothing.
+                    let (_, subslice_ty) =
+                        self.subslice(ty, jsast::undefined(), from, to, from_end);
+                    if !matches!(current, JsPlace::Unit(_)) {
+                        current = JsPlace::Unit(self.read(&current));
+                    }
+                    ty = subslice_ty;
                     variant = None;
                 }
                 PlaceElem::Subslice { from, to, from_end } => {
@@ -306,6 +357,25 @@ impl<'tcx> FnCx<'_, 'tcx> {
         } else {
             name
         }
+    }
+
+    /// The address of an element of `base` (of type `base_ty`) when the element has no storage
+    /// ([`element_is_unit`]), and `None` when it has. Every element of such a run is at one
+    /// address: the one the base already had, the data pointer of a slice (its `buf`, which is
+    /// what `as_ptr` answers), or the reference form of a zero-sized array. None of the three
+    /// reads an element.
+    fn unit_element(&self, base: &JsPlace, base_ty: Ty<'tcx>, element: Ty<'tcx>) -> Option<Expr> {
+        if let JsPlace::Unit(address) = base {
+            return Some(address.clone());
+        }
+        if !element_is_unit(self.tcx, base_ty, element) {
+            return None;
+        }
+        let base = self.read(base);
+        Some(match base_ty.kind() {
+            ty::Slice(_) => ptr::slot_buf(base),
+            _ => base,
+        })
     }
 
     /// One element of an array or a slice: `base[i]` or `base.buf[base.off + i]`.
@@ -406,6 +476,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 "read_array",
                 vec![pointer.clone(), jsast::num(*width as f64)],
             ),
+            JsPlace::Unit(_) => jsast::undefined(),
         }
     }
 
@@ -427,6 +498,11 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     vec![pointer, value],
                 ))]
             }
+            // Nothing to store. A value with effects of its own is still evaluated.
+            JsPlace::Unit(_) => match value {
+                Expr::Undefined => Vec::new(),
+                value => vec![jsast::expr_stmt(value)],
+            },
         }
     }
 
@@ -464,6 +540,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 vec![pointer.clone(), jsast::num(*width as f64)],
             );
         }
+        if let JsPlace::Unit(address) = walk.place {
+            return address;
+        }
         if is_indirect(self.tcx, walk.ty) {
             return self.read(&walk.place);
         }
@@ -480,6 +559,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
         let walk = self.walk_place(place);
         if let Some(identity) = walk.identity {
             return ptr::ref_to_raw(self, walk.ty, identity);
+        }
+        if let JsPlace::Unit(address) = walk.place {
+            return address;
         }
         // `str`, a zero sized pointee: no slot form to build.
         if !ptr::is_slot_pointee(self.tcx, walk.ty) {
@@ -510,6 +592,8 @@ impl<'tcx> FnCx<'_, 'tcx> {
             // The pointer a `__rt.read_array` place came from already names it: `&raw (*p)` is
             // `p`, window and all.
             JsPlace::Array(pointer, _) => pointer,
+            // No storage, so no slot either: the pointer is the address the run shares.
+            JsPlace::Unit(address) => address,
             JsPlace::Deref(value) | JsPlace::Var(value) => {
                 if is_indirect(self.tcx, ty) {
                     ptr::ref_to_raw(self, ty, value)
@@ -611,6 +695,12 @@ impl<'tcx> FnCx<'_, 'tcx> {
             )),
         }
     }
+}
+
+/// Whether an element of an array or slice of type `base_ty` has no storage to name
+/// ([`JsPlace::Unit`]): the base is a zero-sized array, or the element is zero-sized.
+fn element_is_unit<'tcx>(tcx: TyCtxt<'tcx>, base_ty: Ty<'tcx>, element: Ty<'tcx>) -> bool {
+    crate::value::is_zst(tcx, base_ty) || crate::value::is_zst(tcx, element)
 }
 
 /// The pointer `p` of a `p.buf[p.off]` place, which is the place a slot already names.

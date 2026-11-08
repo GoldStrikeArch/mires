@@ -787,6 +787,22 @@ impl<'a> Planner<'a> {
         {
             return true;
         }
+        // So does a place walk that reaches an element with no storage: the index that selected
+        // it is not spelled, and a read or write of it spells nothing (`js::place::reaches_unit`).
+        if let OpKind::BorrowView { root, path, .. }
+        | OpKind::RawView { root, path, .. }
+        | OpKind::Drop { root, path, .. } = &op.kind
+        {
+            let root_ty = match root {
+                Root::Value(base) => self.func.values[base.0 as usize].ty,
+                Root::Cell(cell) => self.func.cells[cell.0 as usize].ty,
+            };
+            let operand = matches!(root, Root::Value(base) if *base == value)
+                || path_uses(path).contains(&value);
+            if operand && super::js::place::reaches_unit(self.table, root_ty, path) {
+                return true;
+            }
+        }
         if let OpKind::Intrinsic { name, .. } = &op.kind {
             return OperandEvaluation::intrinsic(self.interns.str(*name).unwrap_or(""))
                 == OperandEvaluation::Materialize;
