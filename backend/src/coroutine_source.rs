@@ -118,6 +118,9 @@ pub(crate) fn cleanup_probe() -> bool {
     crate::opts::get().cleanup
 }
 
+/// The executable cleanup body, or `None` when the body has no unwinding call and rustc's
+/// optimized MIR is equivalent. Selection uses [`rustc_cleanup::Prepared::had_cleanup`], observed
+/// before no-op landing pads are removed, so a body whose pads were all no-ops is still selected.
 pub(crate) fn cleanup_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: rustc_middle::ty::Instance<'tcx>,
@@ -136,8 +139,9 @@ pub(crate) fn cleanup_body<'tcx>(
         let captured = CAPTURED.lock().expect("coroutine source cache poisoned");
         captured.get(&identity)?.mir.body(tcx)
     };
-    if tcx.is_coroutine(def) {
-        rustc_cleanup::coroutine(tcx, &mut body).expect("cleanup coroutine transformation");
+    let prepared = if tcx.is_coroutine(def) {
+        let prepared =
+            rustc_cleanup::coroutine(tcx, &mut body).expect("cleanup coroutine transformation");
         let original = tcx.instance_mir(instance.def);
         let original_layout = original
             .coroutine
@@ -153,16 +157,17 @@ pub(crate) fn cleanup_body<'tcx>(
             "cleanup coroutine layout differs"
         );
         eprintln!("cleanup-coroutine-layout-match: {instance:?}");
+        prepared
     } else {
         rustc_cleanup::ordinary(tcx, &mut body)
-            .expect("cleanup execution probe requires elaboration");
+            .expect("cleanup execution probe requires elaboration")
+    };
+    if !prepared.had_cleanup {
+        return None;
     }
     body = rustc_cleanup::select_runtime(tcx, body);
     if std::env::var_os("JSC_MIR_TRANSPORT_SELFCHECK").is_some() {
         body = crate::source_mir::PortableMir::roundtrip(tcx, &body);
-    }
-    if !body.basic_blocks.iter().any(|block| block.is_cleanup) {
-        return None;
     }
     eprintln!(
         "cleanup-execution {:?}: {} blocks",

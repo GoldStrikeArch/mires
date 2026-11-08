@@ -134,9 +134,7 @@ fn codegen_cgu_inner(tcx: TyCtxt<'_>, cgu_name: Symbol) -> JsModule {
                     let mut item = item;
                     if cx.opts.cleanup
                         && item.jir.is_none()
-                        && crate::coroutine_source::cleanup_body(tcx, instance).is_some_and(
-                            |body| body.basic_blocks.iter().any(|block| block.is_cleanup),
-                        )
+                        && crate::coroutine_source::cleanup_body(tcx, instance).is_some()
                     {
                         item.zombies.push(rcgjs_object::item::Zombie {
                             loc: tcx.sess.source_map().span_to_diagnostic_string(tcx.def_span(instance.def_id())),

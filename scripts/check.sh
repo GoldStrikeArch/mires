@@ -37,3 +37,5 @@ cargo test --workspace
 node --test scripts/native-values.test.mjs scripts/host-future-driver.test.mjs \
     scripts/minimal-shim.test.mjs scripts/runtime-*.test.mjs
 bash scripts/sysroot-cache.test.sh
+# Removing no-op landing pads must not change which bodies keep executable cleanup.
+bash scripts/noop-landing-pads-test.sh

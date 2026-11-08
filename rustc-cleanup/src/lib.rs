@@ -96,9 +96,18 @@ pub fn elaborate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> Result<(), &
     Ok(())
 }
 
+/// What the runtime passes observed before removing no-op landing pads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prepared {
+    /// The body had a cleanup block or an unwind edge that continues or enters cleanup. Such a
+    /// body needs this MIR even when every pad was a no-op: its optimized MIR may inline a callee
+    /// without the callee's cleanup. A body without either has no unwinding call to inline.
+    pub had_cleanup: bool,
+}
+
 /// Reconstructs a private coroutine state machine while retaining host-exception cleanup.
 /// The caller must retain this layout in the coroutine query. Rust panic policy is unchanged.
-pub fn coroutine<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> Result<(), &'static str> {
+pub fn coroutine<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> Result<Prepared, &'static str> {
     if body.coroutine.is_none() {
         return Err("expected source coroutine");
     }
@@ -112,12 +121,11 @@ pub fn coroutine<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> Result<(), &
     for pass in passes {
         pass.run_pass(tcx, body);
     }
-    finish_runtime(tcx, body);
-    Ok(())
+    Ok(finish_runtime(tcx, body))
 }
 
 /// Prepares a private ordinary body for runtime execution while preserving its unwind edges.
-pub fn ordinary<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> Result<(), &'static str> {
+pub fn ordinary<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> Result<Prepared, &'static str> {
     elaborate(tcx, body)?;
     for pass in [
         &add_moves_for_packed_drops::AddMovesForPackedDrops as &dyn MirPass<'tcx>,
@@ -126,11 +134,10 @@ pub fn ordinary<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> Result<(), &'
     ] {
         pass.run_pass(tcx, body);
     }
-    finish_runtime(tcx, body);
-    Ok(())
+    Ok(finish_runtime(tcx, body))
 }
 
-fn finish_runtime<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+fn finish_runtime<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) -> Prepared {
     body.phase = rustc_middle::mir::MirPhase::Runtime(rustc_middle::mir::RuntimePhase::Initial);
     for pass in [
         &lower_intrinsics::LowerIntrinsics as &dyn MirPass<'tcx>,
@@ -145,6 +152,33 @@ fn finish_runtime<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
     for decl in &mut body.local_decls {
         decl.local_info = rustc_middle::mir::ClearCrossCrate::Clear;
     }
+    use rustc_middle::mir::UnwindAction;
+    let prepared = Prepared {
+        had_cleanup: body.basic_blocks.iter().any(|block| {
+            block.is_cleanup
+                || matches!(
+                    block.terminator().unwind(),
+                    Some(UnwindAction::Continue | UnwindAction::Cleanup(_))
+                )
+        }),
+    };
+    remove_noop_pads(tcx, body);
+    prepared
+}
+
+/// Repeats rustc's post-elaboration `RemoveNoopLandingPads` and `SimplifyCfg::Final` from
+/// `run_optimization_passes`. rustc gates that pair by MIR opt level only, so it applies under
+/// `-Cpanic=abort`, which disables the analysis-phase run in `elaborate`. A no-op pad holds only
+/// markers, writes to bare locals and jumps to no-op pads before resuming, never a drop or call.
+/// Unwind edges into one become `Continue`, which propagates the same exception.
+fn remove_noop_pads<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+    if tcx.sess.mir_opt_level() == 0
+        || remove_noop_landing_pads::find_noop_landing_pads(body, None).is_empty()
+    {
+        return;
+    }
+    remove_noop_landing_pads::RemoveNoopLandingPads.run_pass(tcx, body);
+    simplify::SimplifyCfg::Final.run_pass(tcx, body);
 }
 
 /// Selects the runtime half of const-evaluation branches with the pinned rustc transform.
