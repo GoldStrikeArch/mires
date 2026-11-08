@@ -34,7 +34,14 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 - [ ] 4d inlining at unprotected sites
 - [ ] R2 row; re-plan from attribution
 
-## Stage 5 — next wave (chosen after Stage 4 attribution)
+## Stage 5 — next wave (chosen from runtime attribution, perf-diag 2026-11-08)
+Attribution (Node, per call): marked 79.8 ms = 92% `str_bytes` re-encoding the whole document per `&str` slice (4-entry memo always evicted; 4.39 MB encoded per 8 KB input; quadratic). minisearch 1.0 ms = 30% UTF-8 round-trips (`String::as_str`→`bytes_str`, `str==str`→re-encode) + 33% WeakMap/WeakSet heap registry (`_heap_block` on every `&[u8]` reborrow, `addr` minting in `NonNull::new`, `_put`, `dealloc`). fflate 5.5 ms = 31% bit-by-bit CRC (port) with compiler-added try/catch + `with_overflow` IIFE closures + `Range::next` Option objects, 32% per-byte `Reflect.set` export (binding), rest iterator pointer-record churn.
+- [ ] 5a P10 runtime strings: ASCII fast path in `str_bytes` (no `Array.prototype.slice` on typed arrays), owner/operation-lifetime byte-view reuse instead of the ring, `str::len` without full encode; measured A/B: marked 79.8→~3 ms, minisearch −24–31%
+- [ ] 5a' BUG: `__rt.addr` mints `4096*++_addrNext` and never reuses; wraps to 0 after 2^20 mints → `NonNull::new` reports null → "memory allocation failed" (minisearch dies after 3,705 calls). Fix with the string work.
+- [ ] 5b P16 runtime heap registry off hot paths (`_heap_block`, `addr` in fresh-block NonNull, `_put` box set, `dealloc` freed set) — after 1b lands (same shim functions); minisearch −24%, marked residual −20%
+- [ ] 5c structural: keep byte-derived `&str` as `{buf,off,len}` views, convert only at the host boundary (removes the quadratic structurally) — after 5a measured
+- [ ] 5d lowering: `*_with_overflow` without IIFE closure+array (`lower/js/intrinsics.rs:619-633`); `Range::next`/`Option` result objects (SROA/inlining after 3b); hoist track_caller Location literals (P13) — fflate CRC −50% of compiler-added cost
+- [ ] 5e binding: bulk `Vec<u8>`→`Uint8Array` export path (fflate −39%)
 - [ ] P10 strings / P12 formatter / P13–P16 bounded passes / browser timing matrix
 - [ ] 2e (policy arm, not equivalence): cheaper trial compression (e.g. gzip-only or brotli q5 for trial ranking, brotli-11 only for the final candidate) — must be qualified as a decision-policy change with before/after decision diffs
 
