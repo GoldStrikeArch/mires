@@ -19,7 +19,7 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 - [x] 2b shim parsed once in cost.rs (9a940b3)
 - [x] 2c physical_cost cache key hoisted (9a940b3)
 - [x] 2d dependency-aware lowering reuse + RCGJS_COST_REUSE_VERIFY (compact physical lowerings 93,917 → 2,941; verified byte-identical)
-- [ ] Pro optimized cleanup-on link completes; R1.1 row
+- [x] Pro optimized cleanup-on link completes: 632 s → 146 s lane time (205 s wall, load ~20), compact 70 s → 32 s; outputs byte-identical (label S2-compile-cost). Remaining B2 cost is brotli-11 in trials (Pro 104 of 138 s) — a separate policy arm, see Stage 5.
 
 ## Stage 3 — remove provably unnecessary cleanup edges (P07)
 - [ ] 3a RemoveNoopLandingPads after ElaborateDrops — finding: under panic=abort the vendored pass never ran; 91% of cleanup bodies had only bare `resume` pads. Guarded run: compact gzip 110.6→106.1 KB. Full fix (body selection keyed on pre-removal state) measured 60.7 KB gzip / 610 tries; being delivered with backend/coroutine_source.rs + driver.rs changes.
@@ -36,6 +36,7 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 
 ## Stage 5 — next wave (chosen after Stage 4 attribution)
 - [ ] P10 strings / P12 formatter / P13–P16 bounded passes / browser timing matrix
+- [ ] 2e (policy arm, not equivalence): cheaper trial compression (e.g. gzip-only or brotli q5 for trial ranking, brotli-11 only for the final candidate) — must be qualified as a decision-policy change with before/after decision diffs
 
 ## Known gaps discovered (not blocking the current stage)
 - `Rc<[Z]>` built via `Rc::from(vec![Z;n])` fails on the JIR lane with `__rt.retype_rc: this pointer does not name a live heap block` (passes on the default lane). Pre-existing; found by the 1a verifier (fixture scratchpad/verify1a/fx/rc_vec.rs).

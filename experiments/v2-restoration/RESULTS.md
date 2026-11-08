@@ -54,3 +54,23 @@ Append-only log written by `measure.mjs`. Each block is one run; receipts live i
 
 - corpus pure run: passed; compact kernels: 58/58; idiomatic kernels: 58/58; corpus artifacts vs build.json: identical
 - pro: ok, wall 654.1 s, peak RSS 2856 MiB
+
+## S2-compile-cost — 2026-11-08T11:23:00.159Z
+
+- HEAD `410e1543fc3fa238b1c9a671ce8f28ed0914ace3`, 0 dirty path(s); compiler source digest `ef97ab4b7c15` (differs from docs/v2-source-identity.json)
+- jsc-link `a307003bff23`, codegen dylib `2667f2f5bec3`, node v26.8.1, built: yes
+- receipts: `build/v2-restoration/S2-compile-cost/`
+
+| target | file | raw | min | gzip | brotli | status |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| compact | fp.esm.min.js | 680202 | 515481 | 110636 | 80491 | ok |
+| compact | fp.min.js | 685034 | 515459 | 110398 | 80412 | ok |
+| compact | fp.umd.min.js | 685305 | 515654 | 110483 | 80529 | ok |
+| compact | raw/program.js | 668404 | — | 108757 | 83969 | ok |
+
+| target | wall s | peak RSS MiB | status |
+| --- | ---: | ---: | --- |
+| compact | 86.1 | 2888 | ok |
+
+- compact kernels: 58/58
+- pro: ok, wall 205.5 s, peak RSS 3082 MiB
