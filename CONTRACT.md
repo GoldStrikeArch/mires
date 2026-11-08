@@ -675,8 +675,9 @@ move it; `from_raw_parts(p, n)` is `{ buf: p, off: 0, len: n }`, so it round tri
 pointer has the address `2^29` (`__rt._zst_addr`, never given to a buffer), so `is_null()` is false
 for every one of them and every alignment predicate holds. Rust leaves it unspecified whether two
 different zero-sized arrays share an address; here they do when both are `undefined`. Not
-supported: `==` or ordering of two fat `*const [Z]` (`__rt.slice_ptr_eq` compares `off`, and refuses
-a `buf` of `undefined`), and `offset_from` on a zero-sized pointee, which panics in Rust.
+supported: `==`, `ptr::eq` or ordering of two fat `*const [Z]` / `&[Z]` (the comparison reaches
+`__rt.ptr_eq`, which refuses a `buf` of `undefined`; `ptr::addr_eq` on the same slices works), and
+`offset_from` on a zero-sized pointee, which panics in Rust.
 `examples/core-tests/114_zst_aggregate_drops.rs` and `115_zst_element_pointers.rs` are the
 fixtures.
 

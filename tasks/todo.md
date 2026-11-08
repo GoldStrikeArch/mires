@@ -10,8 +10,8 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 - [x] R0 row recorded (compact 110.6 KB gz, idiomatic 186.5 KB gz, Pro optimized link completes in 654 s)
 
 ## Stage 1 — correctness (P02/P03)
-- [ ] 1a ZST aggregate storage/drop: 195_zst_array_drops, audit_zst_closure_drop, audit_zst_vec_drop
-- [ ] 1b audit_aggregate_place identity
+- [x] 1a ZST aggregate storage/drop: 195_zst_array_drops, audit_zst_closure_drop, audit_zst_vec_drop (merged; fixtures 114, 115)
+- [ ] 1b audit_aggregate_place identity — first verification FAILED on runtime regression (struct field store 5.7–8.4×, ptr_eq 2.9×, ptr_cmp 6.3×, fflate 1.26×) and a v1-lane borrowed-local bug; sent back for rework
 - [ ] check-known-gaps 6/6; suites green; R1 row
 
 ## Stage 2 — compile cost (P04), equivalent output
