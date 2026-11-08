@@ -32,11 +32,13 @@
 #                than required to be zero
 #   dom-tests    examples/dom-tests as ES modules, run through scripts/dom-trace.mjs against the
 #                contract's recording stub; the trace is the output that is diffed
-#   async-tests  the executor fixtures, whose runner is scripts/async-check.mjs over the whole
-#                build directory rather than a command per program. So this suite is compared by
-#                running scripts/async-test.sh twice — once plain, once with `js-lane=jir` — and
-#                diffing the behaviour log the driver wrote. Same question, one verdict for the
-#                suite instead of one per fixture
+#
+# There is no async suite. The executor fixtures are built only in the release configuration,
+# `js-profile=release-balanced` and so `js-cleanup=on`, and there the baseline lane refuses every
+# one of them ("requires semantic cleanup lowering"): there is no baseline program to compare the
+# JIR one against. scripts/async-test.sh is their gate. It builds them on the JIR lane, fails any
+# fixture with an item that fell back to the baseline, and asserts the executor's step sequence
+# directly instead of against a second lane.
 #
 # `js-lane` is not emit-affecting (`rcgjs-object/src/opts.rs`), so every suite links against the
 # ordinary default sysroot and none of this costs a rebuild.
@@ -61,7 +63,7 @@ log_dir="$root/build/logs"
 shim="$root/runtime/shim.js"
 entry="$script_dir/entry.js"
 
-ALL_SUITES="tests core-tests dom-tests async-tests"
+ALL_SUITES="tests core-tests dom-tests"
 suites=${*:-$ALL_SUITES}
 for suite in $suites; do
 	case " $ALL_SUITES " in
@@ -220,8 +222,8 @@ esac
 # The sysroot is keyed on the backend dylib and on the emit-affecting options only, exactly as
 # scripts/compile_core.sh resolves it. `js-lane` is not one of them — an object carries both lanes
 # — so a shadow run links against the sysroot an ordinary run already built. What DOES key one is
-# a suite spelling out an emit-affecting default, which is why the async suite (whose script
-# passes `js-names=readable`) asks for its own and the DOM suite here does not spell it.
+# a suite spelling out an emit-affecting default, which is why the DOM suite here does not spell
+# the `js-names=readable` its own script passes.
 sysroot_checked=""
 
 ensure_sysroot() {
@@ -433,81 +435,11 @@ EOF
 	done
 }
 
-# ------------------------------------------------------------------ examples/async-tests
-
-# normalize_behaviour <in> <out>: the executor's check log with the two values that move between
-# two compilations replaced.
-#
-# Fixture 06 drives the framework's real `#[procedure]` expansion, which mints a fresh UUID per
-# expansion and routes the request to it. Two compilations therefore disagree about it whatever
-# lane they were printed from, so comparing the raw log would report a difference that is not one.
-# Everything else in the log — the order of the steps, which task resumed when — is the subject.
-#
-# The `shape:` checks (async-check.mjs) quote the emitted line they matched as their detail, and
-# an emitted line names lane-dependent locals, so two lanes disagree about the quotation while
-# agreeing about the shape. The detail tail after the label is stripped — the `ok`/`FAIL` verdict
-# and the label are the columns compared (Phase 5, D10e). Only `shape:` lines are touched: a
-# behaviour check's detail is a step sequence, and those must still agree verbatim.
-normalize_behaviour() {
-	sed -E -e 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<uuid>/g' \
-		-e 's/^((ok  |FAIL)  shape: [^:]*):.*/\1/' "$1" >"$2"
-}
-
-run_async_tests_suite() {
-	echo "==> examples/async-tests (the whole suite twice; see the header)"
-	# scripts/async-test.sh spells out `js-names=readable`, which keys a sysroot of its own.
-	if ! ensure_sysroot "js-names=readable${OPT_ARGS:+ $OPT_ARGS}"; then
-		echo "    skipped: no sysroot"
-		record async-tests SKIP no-sysroot
-		return
-	fi
-	local behaviour="$log_dir/async-behaviour.log"
-	if ! SKIP_BUILD=1 JS_EXTRA_ARGS="$OPT_ARGS" ASYNC_OPT_MODE="$SHADOW_OPT_MODE" "$script_dir/async-test.sh" \
-		>"$log_dir/laneshadow-async-baseline.log" 2>&1; then
-		echo "    skipped: the suite does not pass on the baseline lane"
-		record async-tests SKIP baseline-failed
-		return
-	fi
-	normalize_behaviour "$behaviour" "$log_dir/laneshadow-async-baseline.behaviour"
-	if ! SKIP_BUILD=1 JS_EXTRA_ARGS="${OPT_ARGS:+$OPT_ARGS }js-lane=jir" ASYNC_OPT_MODE="$SHADOW_OPT_MODE" "$script_dir/async-test.sh" \
-		>"$log_dir/laneshadow-async-jir.log" 2>&1; then
-		echo "    the suite fails on the JIR lane, see $log_dir/laneshadow-async-jir.log"
-		record async-tests DIFF suite-failed
-		return
-	fi
-	normalize_behaviour "$behaviour" "$log_dir/laneshadow-async-jir.behaviour"
-	# The sidecars the JIR run left behind, so the histogram counts this suite too.
-	mkdir -p "$build_dir/async-tests"
-	cp "$root"/build/asynctest/*.lane.json "$build_dir/async-tests/" 2>/dev/null
-
-	if ! diff -u "$log_dir/laneshadow-async-baseline.behaviour" \
-		"$log_dir/laneshadow-async-jir.behaviour" >"$log_dir/laneshadow-async.diff"; then
-		echo "    the executor behaved differently (- baseline, + jir):"
-		sed 's/^/    /' "$log_dir/laneshadow-async.diff" | head -n 40
-		record async-tests DIFF behaviour
-		return
-	fi
-	local lowered=0 fallbacks=0 sidecar
-	for sidecar in "$build_dir"/async-tests/*.lane.json; do
-		[ -f "$sidecar" ] || continue
-		lowered=$((lowered + $(lane_count "$sidecar" jir)))
-		fallbacks=$((fallbacks + $(lane_count "$sidecar" fallback)))
-	done
-	if [ "$lowered" -eq 0 ]; then
-		echo "    ok (no item lowered, behaviour identical)"
-		record async-tests FALLBACK-ONLY "$fallbacks fallbacks"
-	else
-		echo "    ok ($lowered items lowered, behaviour identical)"
-		record async-tests PASS "$lowered lowered, $fallbacks fallbacks"
-	fi
-}
-
 for suite in $suites; do
 	case "$suite" in
 	tests) run_tests_suite ;;
 	core-tests) run_core_tests_suite ;;
 	dom-tests) run_dom_tests_suite ;;
-	async-tests) run_async_tests_suite ;;
 	esac
 done
 

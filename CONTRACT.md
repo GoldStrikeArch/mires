@@ -2832,9 +2832,12 @@ unspellable key, a capture named twice, the shorthand, an arrow parameter that i
 a template literal through the verbatim form. It is compiled against the real `core` (`.core`) with
 `js-macro` built for the host, which is what `emit-test.sh`'s `NN.macro` companion is for.
 
-`examples/async-tests/06_procedure.rs` is the motivating case running: `scripts/async-check.mjs`
-installs `globalThis.fetch`, records the init object the compiled program built, and asserts the
-method, the media type under the header name Rust cannot spell, and the argument array.
+`examples/async-tests/06_procedure.rs` is the motivating case, and it is not run here: it needs the
+Topcoat framework's `topcoat_runtime_macro` and `topcoat_dom`, which are not part of this
+repository, so `scripts/async-test.sh` reports it as SKIP. Its checks stay in
+`scripts/async-check.mjs` and run when the fixture is named and built: they install
+`globalThis.fetch`, record the init object the compiled program built, and assert the method, the
+media type under the header name Rust cannot spell, and the argument array.
 
 ## Effect-summary interpretation
 

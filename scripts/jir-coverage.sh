@@ -312,6 +312,9 @@ measure_dom_tests() {
 
 measure_async_tests() {
 	echo "==> examples/async-tests"
+	# The module options scripts/async-test.sh compiles its fixtures with. That gate builds them
+	# under `js-profile=release-balanced` on the JIR lane; here they get this script's options, like
+	# every other suite, so the numbers are comparable.
 	suite_args="js-comments=on js-modules=esm js-dom-module=./topcoat-dom.js"
 	if ! ensure_sysroot "$base_args $suite_args"; then
 		echo "    skipped: $sysroot_reason"
@@ -319,70 +322,52 @@ measure_async_tests() {
 		return
 	fi
 
-	# The scaffolding scripts/async-test.sh builds, in the same order: three host proc macros (one
-	# of them out of the framework workspace, with the spike's pinned nightly) and three rlibs
-	# compiled by this backend. Any of them failing skips the suite with the reason rather than
-	# reporting a coverage number the fixtures did not contribute to.
-	local channel
-	channel=$(jsc_pinned_channel "$root")
-	if ! (cd "$root" && cargo build -p js-macro -p js-extern-macro) \
-		>"$log_dir/jir-coverage-async-macros.log" 2>&1; then
-		echo "    skipped: the proc macros did not build, see $log_dir/jir-coverage-async-macros.log"
+	# The scaffolding the gate builds: `js-extern-macro` for the host, then `view-abi` and
+	# `view-async` compiled by this backend into rlibs. The rlibs get a directory of their own: the
+	# fixtures search it for `view-async`'s dependency on `view-abi`, and the dom suite's `view_abi`
+	# in $build_dir would be a second candidate for it. Any of them failing skips the suite with the
+	# reason rather than reporting a coverage number the fixtures did not contribute to.
+	if ! (cd "$root" && cargo build -p js-extern-macro) >"$log_dir/jir-coverage-async-macro.log" 2>&1; then
+		echo "    skipped: js-extern-macro did not build, see $log_dir/jir-coverage-async-macro.log"
 		record async-tests '(suite)' skipped-no-macro "" ""
 		return
 	fi
-	if ! (cd "$root/../.." && cargo "+$channel" build -p topcoat-runtime-macro --features discover \
-		--target-dir "$root/build/hostmacro-discover") \
-		>"$log_dir/jir-coverage-async-procedure.log" 2>&1; then
-		echo "    skipped: topcoat-runtime-macro did not build, see $log_dir/jir-coverage-async-procedure.log"
-		record async-tests '(suite)' skipped-no-macro "" ""
-		return
-	fi
-	local js_macro="$root/target/debug/libjs_macro.$macro_suffix"
 	local extern_macro="$root/target/debug/libjs_extern_macro.$macro_suffix"
-	local procedure_macro="$root/build/hostmacro-discover/debug/libtopcoat_runtime_macro.$macro_suffix"
-	# A directory of proc macros and nothing else: rustc finds a transitive dependency by file
-	# name on the search path, and an rlib built for the host beside them reports the wrong triple.
-	local macro_dir="$build_dir/async-macros"
-	mkdir -p "$macro_dir"
-	cp "$js_macro" "$extern_macro" "$macro_dir/"
+	local deps="$build_dir/async-deps"
+	local abi="$deps/libview_abi.rlib"
+	local async_rlib="$deps/libview_async.rlib"
+	mkdir -p "$deps"
+	if ! JS_EXTRA_ARGS="$base_args $suite_args" "$script_dir/compile_core.sh" \
+		"$root/view-abi/src/lib.rs" "$abi" --crate-type rlib --crate-name view_abi \
+		>"$log_dir/jir-coverage-async-view_abi.log" 2>&1; then
+		echo "    skipped: view-abi did not build, see $log_dir/jir-coverage-async-view_abi.log"
+		record async-tests '(suite)' skipped-no-rlib "" ""
+		return
+	fi
+	if ! JS_EXTRA_ARGS="$base_args $suite_args" "$script_dir/compile_core.sh" \
+		"$root/view-async/src/lib.rs" "$async_rlib" --crate-type rlib --crate-name view_async \
+		--extern "view_abi=$abi" >"$log_dir/jir-coverage-async-view_async.log" 2>&1; then
+		echo "    skipped: view-async did not build, see $log_dir/jir-coverage-async-view_async.log"
+		record async-tests '(suite)' skipped-no-rlib "" ""
+		return
+	fi
 
-	local abi="$build_dir/libview_abi_async.rlib"
-	local async_rlib="$build_dir/libview_async.rlib"
-	local dom_rlib="$build_dir/libtopcoat_dom.rlib"
-	local step
-	for step in \
-		"view_abi|$root/view-abi/src/lib.rs|$abi" \
-		"view_async|$root/view-async/src/lib.rs|$async_rlib" \
-		"topcoat_dom|$root/topcoat-dom/src/lib.rs|$dom_rlib"; do
-		local crate=${step%%|*}
-		local rest=${step#*|}
-		local source=${rest%%|*}
-		local target=${rest#*|}
-		if ! JS_EXTRA_ARGS="$base_args $suite_args" "$script_dir/compile_core.sh" \
-			"$source" "$target" --crate-type rlib --crate-name "$crate" \
-			--search "$build_dir" --search "$macro_dir" \
-			--extern "view_abi=$abi" --extern "view_async=$async_rlib" \
-			--extern "js_macro=$js_macro" \
-			>"$log_dir/jir-coverage-async-$crate.log" 2>&1; then
-			echo "    skipped: $crate did not build, see $log_dir/jir-coverage-async-$crate.log"
-			record async-tests '(suite)' skipped-no-rlib "" ""
-			return
-		fi
-	done
-
-	local src
+	local src name
 	for src in "$root"/examples/async-tests/*.rs; do
 		[ -f "$src" ] || continue
-		case "$(basename -- "$src")" in
-		prelude.rs) continue ;;
+		name=$(basename -- "${src%.rs}")
+		case "$name" in
+		prelude) continue ;;
+		06_procedure)
+			# The framework's own expansion, which needs crates this repository does not have; the
+			# gate skips it too (scripts/async-test.sh, WHAT IS NOT BUILT).
+			record async-tests "$name" skipped-needs-framework "" ""
+			continue
+			;;
 		esac
-		compile_fixture async-tests compile_core.sh "$src" \
-			--cfg topcoat_client --search "$build_dir" --search "$macro_dir" \
+		compile_fixture async-tests compile_core.sh "$src" --search "$deps" \
 			--extern "view_abi=$abi" --extern "view_async=$async_rlib" \
-			--extern "topcoat_dom=$dom_rlib" --extern "js_macro=$js_macro" \
-			--extern "js_extern_macro=$extern_macro" \
-			--extern "topcoat_runtime_macro=$procedure_macro"
+			--extern "js_extern_macro=$extern_macro"
 	done
 }
 

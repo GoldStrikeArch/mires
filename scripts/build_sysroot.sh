@@ -142,12 +142,18 @@ if ! mkdir "$lock" 2>/dev/null; then
 	fi
 fi
 printf '%s' "$$" >"$lock/pid"
+# This trap replaces the one integration-lock.sh installed, so it releases the lock itself. A nested
+# invocation runs under its caller's lock, defines no release function, and leaves the lock alone.
+# EXIT alone: integration-lock.sh's INT and TERM traps exit through it, and bash runs it on a
+# signal with no trap of its own; a cleanup trapped on the signal itself would resume the build
+# with both locks released.
 cleanup() {
 	[ -z "${install:-}" ] || rm -rf "$install"
 	[ -z "$legacy_lock" ] || rm -rf "$legacy_lock"
 	rm -rf "$lock"
+	if declare -F release_integration_lock >/dev/null; then release_integration_lock; fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
 
 if [ "$clean" = 1 ]; then
 	rm -rf "$cache" "$sysroot"
