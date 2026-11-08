@@ -317,6 +317,13 @@ impl<'a> JsCx<'a> {
         ptr::slot(ptr::slot_buf(self.str_to_bytes(string)), jsast::num(0))
     }
 
+    /// `s.as_bytes_mut()` (`ptr.rs::str_to_bytes_mut`): a fresh byte view no other `as_bytes`
+    /// shares, so a write through it — lost, since a `&mut str` has no mutable JavaScript form —
+    /// cannot surface in the memoized view of an equal string.
+    pub fn str_to_bytes_mut(&self, string: Expr) -> Expr {
+        jsast::rt_call("str_bytes_mut", vec![string])
+    }
+
     /// `str::from_utf8_unchecked(v)` (`ptr.rs::bytes_to_str`).
     pub fn bytes_to_str(&self, bytes: Expr) -> Expr {
         let (setup, bytes) = self.reread(bytes, &[BUF, OFF, LEN]);
@@ -336,6 +343,16 @@ impl<'a> JsCx<'a> {
         jsast::rt_call("str_len", vec![string])
     }
 
+    /// The length of a fat slice (`ptr.rs::slice_len`): `slice.len`, except over a `&str`'s byte
+    /// view, where `__rt.str_bytes(s).len` is `__rt.str_len(s)`. `str::len` is
+    /// `self.as_bytes().len()`, and a length needs no bytes.
+    pub fn slice_len(&self, slice: Expr) -> Expr {
+        match str_bytes_operand(slice) {
+            Ok(string) => self.str_len(string),
+            Err(slice) => ptr::slot_len(slice),
+        }
+    }
+
     /// The `str` arms of the pointer cast matrix over two pointee types (`ptr.rs::cast_str`);
     /// `None` when neither side is a `str`.
     pub fn cast_str(
@@ -343,6 +360,18 @@ impl<'a> JsCx<'a> {
         from_pointee: TypeId,
         to_pointee: TypeId,
         value: Expr,
+    ) -> Option<Res<Expr>> {
+        self.cast_str_as(from_pointee, to_pointee, value, false)
+    }
+
+    /// [`Self::cast_str`], told whether the target pointer is mutable: a `str` cast to a mutable
+    /// byte pointer gets its own byte view (`ptr.rs::cast_str`).
+    fn cast_str_as(
+        &self,
+        from_pointee: TypeId,
+        to_pointee: TypeId,
+        value: Expr,
+        mutable: bool,
     ) -> Option<Res<Expr>> {
         let table = self.table;
         let (from_str, to_str) = (
@@ -361,10 +390,16 @@ impl<'a> JsCx<'a> {
         Some(match (from_str, to_str) {
             (true, true) => Ok(value),
             (true, false) => match value::kind(table, to_pointee) {
-                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => {
-                    Ok(self.str_to_bytes(value))
-                }
-                _ if value::is_u8(table, to_pointee) => Ok(self.str_to_byte_ptr(value)),
+                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => Ok(if mutable {
+                    self.str_to_bytes_mut(value)
+                } else {
+                    self.str_to_bytes(value)
+                }),
+                _ if value::is_u8(table, to_pointee) => Ok(if mutable {
+                    ptr::slot(ptr::slot_buf(self.str_to_bytes_mut(value)), jsast::num(0))
+                } else {
+                    self.str_to_byte_ptr(value)
+                }),
                 _ => unsupported(),
             },
             (false, true) => match value::kind(table, from_pointee) {
@@ -381,7 +416,14 @@ impl<'a> JsCx<'a> {
     pub fn cast_str_ptr(&self, from_ty: TypeId, to_ty: TypeId, value: Expr) -> Option<Res<Expr>> {
         let from_pointee = value::pointee_of(self.table, from_ty)?;
         let to_pointee = value::pointee_of(self.table, to_ty)?;
-        self.cast_str(from_pointee, to_pointee, value)
+        let mutable = matches!(
+            value::kind(self.table, to_ty),
+            Some(
+                TypeKind::Reference { mutable: true, .. }
+                    | TypeKind::RawPointer { mutable: true, .. }
+            )
+        );
+        self.cast_str_as(from_pointee, to_pointee, value, mutable)
     }
 
     /// `value as *const to_pointee` (`ptr.rs::cast_pointer`).
@@ -787,4 +829,20 @@ fn duplicable(value: &Expr, reads: &[&str]) -> bool {
 /// `p.meta`, the metadata half of a fat pointer.
 pub fn meta(pointer: Expr) -> Expr {
     jsast::member(pointer, META)
+}
+
+/// The string a `__rt.str_bytes(s)` call encodes, or the expression back when it is anything else
+/// (`ptr.rs::str_bytes_operand`). `str_bytes` has no effect a program can observe, so a consumer
+/// that needs only what the string itself answers may drop the call.
+fn str_bytes_operand(expr: Expr) -> Result<Expr, Expr> {
+    match expr {
+        Expr::Call(callee, mut args)
+            if args.len() == 1
+                && matches!(&*callee, Expr::Member(object, name)
+                    if name == "str_bytes" && matches!(&**object, Expr::Ident(rt) if rt == "__rt")) =>
+        {
+            Ok(args.pop().expect("one argument"))
+        }
+        other => Err(other),
+    }
 }

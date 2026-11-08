@@ -177,42 +177,17 @@ function rustApi(module) {
 	};
 }
 
-// ------------------------------------------------- the synthetic address space
+// This benchmark used to reset `__rt._addrs` and `__rt._addrNext` between
+// batches: `__rt.addr` handed each block `4096 * ++_addrNext` and never reused
+// one, so block number 1048576 got the address 2^32, which `>>> 0` made null,
+// and a good allocation was reported as failed. The runtime now gives a freed
+// block's address back (`__rt._addr_release`) and carves addresses by size, so
+// no reset is needed -- and resetting the bump pointer under live free lists
+// would hand one address out twice.
 
-// A LIMIT OF THE MODEL THIS BENCHMARK RAN INTO, and the workaround for it.
-//
-// Every allocation is null-checked by the emitted code as
-// `__rt.addr(raw_ptr, 1) >>> 0 === 0`, and `__rt.addr` hands each new block the
-// synthetic address `4096 * ++__rt._addrNext`. At block number 1048576 that
-// product is exactly 2^32, `>>> 0` makes it zero, and a perfectly good
-// allocation is reported to `alloc::handle_alloc_error` as a failure:
-//
-//     Error: rustc_codegen_mires: memory allocation of 17 bytes failed
-//
-// One iteration of this benchmark allocates about two thousand blocks (a
-// `String` each for two thousand labels, plus the `Vec`s), so the ceiling is
-// around five hundred iterations per process -- which a warmup pass plus three
-// rounds across two Rust builds walks straight through. It is a real defect and
-// it is written up in the report rather than papered over.
-//
-// The workaround is sound because of WHEN it is applied. Between batches
-// nothing is live: every iteration builds its own store and drops it, so no
-// pointer whose address has been handed out survives to be asked again. The
-// addresses are a lazily assigned side table keyed by the buffer, so emptying it
-// and restarting the counter cannot renumber anything that still exists.
-function resetAddressSpace() {
-	const rt = globalThis.__rt;
-	if (rt === undefined) return;
-	rt._addrs = new WeakMap();
-	rt._addrNext = 0;
-}
-
-/** Untimed iterations, with the address space reset often enough to stay under the ceiling. */
+/** Untimed iterations. */
 function warm(api, count) {
-	for (let i = 0; i < count; i++) {
-		if (i % 100 === 0) resetAddressSpace();
-		iteration(api);
-	}
+	for (let i = 0; i < count; i++) iteration(api);
 }
 
 // ------------------------------------------------------------------ the sizes
@@ -374,7 +349,6 @@ function stats(samples) {
  * garbage collection pause that lands in one of them and a batch mean is not.
  */
 function timeSide(api) {
-	resetAddressSpace();
 	globalThis.gc();
 	for (let i = 0; i < WARMUP; i++) iteration(api);
 	const samples = [];
@@ -455,7 +429,6 @@ function gitHead() {
 // ------------------------------------------------------------------------ run
 
 console.log("==> equivalence");
-resetAddressSpace();
 checkEquivalence();
 console.log(`    all ${SIDES.length} sides compute the same state, operation by operation`);
 

@@ -678,7 +678,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
             return self.zombie(format!("`{pointer_ty}` has no pointer metadata"));
         };
         match pointee.kind() {
-            ty::Slice(_) => ptr::slot_len(value),
+            ty::Slice(_) => ptr::slice_len(value),
             ty::Dynamic(..) => jsast::member(value, ptr::META),
             // A `&str` is a JavaScript string, whose metadata is the length of the bytes it would
             // encode to rather than a field of a record.

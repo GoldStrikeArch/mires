@@ -579,6 +579,13 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 } else {
                     value
                 };
+                // A `str` row asks whether the target is mutable (`as_bytes_mut`), which only the
+                // pointer types say.
+                if let Some(converted) =
+                    crate::ptr::cast_str_ptr(self, from_ty, to_ty, value.clone())
+                {
+                    return converted;
+                }
                 crate::ptr::cast_pointer(self, from_pointee, to_pointee, value)
             }
             // Exposing an address is the pointer to integer direction: a real pointer's synthetic

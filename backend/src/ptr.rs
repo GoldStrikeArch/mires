@@ -1176,6 +1176,13 @@ pub(crate) fn str_to_byte_ptr(string: Expr) -> Expr {
     slot(slot_buf(str_to_bytes(string)), jsast::num(0))
 }
 
+/// `s.as_bytes_mut()`: a fresh byte view no other `as_bytes` shares, so a write through it — lost,
+/// since a `&mut str` has no mutable JavaScript form — cannot surface in the memoized view of an
+/// equal string.
+pub(crate) fn str_to_bytes_mut(string: Expr) -> Expr {
+    jsast::rt_call("str_bytes_mut", vec![string])
+}
+
 /// `str::from_utf8_unchecked(v)`: the JavaScript string `v`'s bytes spell.
 ///
 /// `bytes` is a fat slice of one byte elements, so the three halves of it are what the decoder
@@ -1202,6 +1209,32 @@ pub(crate) fn str_len(string: Expr) -> Expr {
     jsast::rt_call("str_len", vec![string])
 }
 
+/// The length of a fat slice: `slice.len`, except over a `&str`'s byte view, where
+/// `__rt.str_bytes(s).len` is `__rt.str_len(s)`. `str::len` is `self.as_bytes().len()`, and a
+/// length needs no bytes.
+pub(crate) fn slice_len(slice: Expr) -> Expr {
+    match str_bytes_operand(slice) {
+        Ok(string) => str_len(string),
+        Err(slice) => slot_len(slice),
+    }
+}
+
+/// The string a `__rt.str_bytes(s)` call encodes, or the expression back when it is anything
+/// else. `str_bytes` has no effect a program can observe, so a consumer that needs only what the
+/// string itself answers may drop the call.
+fn str_bytes_operand(expr: Expr) -> Result<Expr, Expr> {
+    match expr {
+        Expr::Call(callee, mut args)
+            if args.len() == 1
+                && matches!(&*callee, Expr::Member(object, name)
+                    if name == "str_bytes" && matches!(&**object, Expr::Ident(rt) if rt == "__rt")) =>
+        {
+            Ok(args.pop().expect("one argument"))
+        }
+        other => Err(other),
+    }
+}
+
 /// The `str` arms of the pointer cast matrix, over the two **pointee** types.
 ///
 /// `None` when neither side is a `str`, which is the answer that lets [`cast_pointer`] go on to the
@@ -1211,8 +1244,8 @@ pub(crate) fn str_len(string: Expr) -> Expr {
 /// | from -> to | result |
 /// |---|---|
 /// | `str` -> `str` | identity, which covers `*const str` to `*mut str` |
-/// | `str` -> `[u8]` | [`str_to_bytes`] |
-/// | `str` -> `u8` | [`str_to_byte_ptr`] |
+/// | `str` -> `[u8]` | [`str_to_bytes`]; [`str_to_bytes_mut`] for a mutable target |
+/// | `str` -> `u8` | [`str_to_byte_ptr`]; over [`str_to_bytes_mut`] for a mutable target |
 /// | `[E]` -> `str`, `E` one byte | [`bytes_to_str`] |
 /// | anything else with a `str` on one side | a zombie naming both types |
 ///
@@ -1225,6 +1258,18 @@ pub(crate) fn cast_str<'tcx>(
     from_pointee: Ty<'tcx>,
     to_pointee: Ty<'tcx>,
     value: Expr,
+) -> Option<Expr> {
+    cast_str_as(fx, from_pointee, to_pointee, value, false)
+}
+
+/// [`cast_str`], told whether the target pointer is mutable: a `str` cast to a mutable byte
+/// pointer gets its own byte view ([`str_to_bytes_mut`]).
+fn cast_str_as<'tcx>(
+    fx: &FnCx<'_, 'tcx>,
+    from_pointee: Ty<'tcx>,
+    to_pointee: Ty<'tcx>,
+    value: Expr,
+    mutable: bool,
 ) -> Option<Expr> {
     let from = peel_pattern(from_pointee);
     let to = peel_pattern(to_pointee);
@@ -1242,7 +1287,9 @@ pub(crate) fn cast_str<'tcx>(
     Some(match (from_str, to_str) {
         (true, true) => value,
         (true, false) => match to.kind() {
+            ty::Slice(element) if is_u8(*element) && mutable => str_to_bytes_mut(value),
             ty::Slice(element) if is_u8(*element) => str_to_bytes(value),
+            _ if is_u8(to) && mutable => slot(slot_buf(str_to_bytes_mut(value)), jsast::num(0)),
             _ if is_u8(to) => str_to_byte_ptr(value),
             _ => unsupported(),
         },
@@ -1270,7 +1317,8 @@ pub(crate) fn cast_str_ptr<'tcx>(
 ) -> Option<Expr> {
     let from_pointee = peel_pattern(from_ty).builtin_deref(true)?;
     let to_pointee = peel_pattern(to_ty).builtin_deref(true)?;
-    cast_str(fx, from_pointee, to_pointee, value)
+    let mutable = peel_pattern(to_ty).is_mutable_ptr();
+    cast_str_as(fx, from_pointee, to_pointee, value, mutable)
 }
 
 /// Whether `ty` is `u8`, the element of every byte view.

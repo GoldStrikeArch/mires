@@ -449,7 +449,7 @@ impl<'a> JsCx<'a> {
             return Err(decline(OpClass::Rvalue, "PtrMetadata of a non-pointer"));
         };
         match value::kind(table, pointee) {
-            Some(TypeKind::Slice(_)) => Ok(ptr::slot_len(value)),
+            Some(TypeKind::Slice(_)) => Ok(self.slice_len(value)),
             Some(TypeKind::Dynamic { .. }) => Ok(jsast::member(value, META)),
             Some(TypeKind::Str) => Ok(self.str_len(value)),
             _ if table.get(pointee).is_some_and(|d| d.layout.sized) => Ok(jsast::undefined()),

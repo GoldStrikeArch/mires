@@ -251,8 +251,8 @@ globalThis.__rt.byte_slice_ref = (p) => {
 };
 
 // `p as usize`: the synthetic address of a pointer, where `size` is the size of
-// the pointee in bytes. Every buffer is given a base of `4096 * n` the first
-// time it is asked about, kept in a WeakMap so that it never moves, and an
+// the pointee in bytes. Every buffer is given a base the first time it is asked
+// about (`_addr_mint`, below), kept in a WeakMap so that it never moves, and an
 // element at offset `off` sits at `base + off * size`. A scaled slot's offset
 // is already in bytes and is added as it is; a number is an address already and
 // comes back unchanged.
@@ -260,10 +260,11 @@ globalThis.__rt.byte_slice_ref = (p) => {
 // The four properties this scheme exists for: a base is never zero, so
 // `is_null()` is false for every real pointer and true only for `null()`; a
 // base is at least 4096, so `NonNull::dangling()` (an alignment, always
-// smaller) never collides with one; an address is a multiple of the element
-// size, so alignment predicates answer correctly; and the low bits are
-// therefore determined by the element size, which is what `fmt::Arguments`
-// tests when it looks at `bits & 1`.
+// smaller) never collides with one; a base is aligned to the buffer's byte size
+// rounded up to a power of two (at least 16, at most 4096), so an address is a
+// multiple of the element alignment and alignment predicates answer correctly;
+// and the low bits are therefore determined by the element size, which is what
+// `fmt::Arguments` tests when it looks at `bits & 1`.
 //
 // `undefined` as a pointer is the reference form of a zero-sized value: every
 // pointer to a zero-sized local, to an element of a zero-sized array, and into a
@@ -272,7 +273,7 @@ globalThis.__rt.byte_slice_ref = (p) => {
 // `_zst_addr`: 2^29, the largest alignment a type can ask for. No base is ever
 // given that address, so it is never mistaken for an element of a real buffer.
 globalThis.__rt._addrs = new WeakMap();
-globalThis.__rt._addrNext = 0;
+globalThis.__rt._addrNext = 4096;
 globalThis.__rt._zst_addr = 536870912;
 globalThis.__rt.addr = (p, size) => {
   if (typeof p === "number") return p;
@@ -296,9 +297,8 @@ globalThis.__rt.addr = (p, size) => {
   }
   let base = globalThis.__rt._addrs.get(key);
   if (base === undefined) {
-    base = 4096 * ++globalThis.__rt._addrNext;
-    if (base === globalThis.__rt._zst_addr) base = 4096 * ++globalThis.__rt._addrNext;
-    globalThis.__rt._addrs.set(key, base);
+    base = globalThis.__rt._addr_mint(key, scalar !== undefined ? 1
+      : p.sc !== undefined ? p.sc : p.es === undefined ? size : p.es);
   }
   // A slot keyed by a property name (a field of an aggregate) has no address of
   // its own, and reports the address of the object it is a field of.
@@ -309,6 +309,88 @@ globalThis.__rt.addr = (p, size) => {
   // that reaches here for an erased pointer knows only that the pointee is zero
   // sized, and the offset is still counted in the elements it was erased from.
   return base + off * (p.es === undefined ? size : p.es);
+};
+
+// The synthetic address space. A usize is 32 bits, so every base has to fit in
+// 2^32 -- and a base that was never given back would exhaust it: one per
+// `NonNull::new` on a fresh allocation is a million allocations, which a
+// long-running page reaches. So bases are carved like a buddy allocator.
+//
+// A buffer of `n` bytes takes a granule of `2^k` bytes, the smallest power of
+// two that holds it, at least 16 and at most 4096, and its base is a multiple of
+// the granule: every type's alignment divides its size, so a buffer is aligned
+// for anything it can hold (a buffer larger than 4096 bytes is aligned to 4096,
+// as before). Granules come from a per-size free list first and from a bump
+// pointer otherwise; the alignment gap the bump leaves is split into smaller
+// free granules rather than lost. A base is handed back:
+//
+//   * by `dealloc`, for a heap block (`_addr_release`). The freed buffer keeps
+//     its entry, so a dangling pointer still answers the address it had, and a
+//     later allocation may reuse it -- exactly as a native allocator does;
+//   * by a FinalizationRegistry, for any other buffer (a stack array, a box, a
+//     string's byte view) once the engine has collected it, which is the moment
+//     nothing can ask for that address again.
+//
+// A base is therefore unique among the buffers that are alive, and stable for a
+// buffer's whole lifetime. Only when the bump pointer reaches 2^32 with no free
+// granule of the size asked is there no base to give, and that is a refusal that
+// says so rather than an address that wraps to null.
+globalThis.__rt._addrFree = Array.from({ length: 13 }, () => []);
+globalThis.__rt._addrHeap = new WeakMap();
+globalThis.__rt._addrGone = typeof FinalizationRegistry === "function"
+  ? new FinalizationRegistry((held) => {
+    // `held` is the base plus its granule's exponent, which is below 16.
+    globalThis.__rt._addrFree[held & 15].push(held - (held & 15));
+  })
+  : undefined;
+
+// _addr_mint(key, es): a base for `key`, whose elements are `es` bytes each:
+// a free granule of its size, or a fresh one from the bump pointer. The top is
+// reached only when about 2^32 bytes of granules have been live at once (a
+// million live 4 KiB buffers), which no engine's heap holds, so free granules
+// of other sizes are not split -- the top is a refusal.
+globalThis.__rt._addr_mint = (key, es) => {
+  const free = globalThis.__rt._addrFree;
+  const block = globalThis.__rt._blocks.get(key);
+  const bytes = block !== undefined ? block.bytes
+    : (typeof key.length === "number" ? key.length : 1) * (es > 0 ? es : 1);
+  let k = 4;
+  while (k < 12 && 2 ** k < bytes) k++;
+  let base = free[k].pop();
+  if (base === undefined) {
+    const size = 2 ** k;
+    base = globalThis.__rt._addrNext;
+    while (base % size !== 0) {
+      let j = 4;
+      while (j + 1 < k && base % 2 ** (j + 1) === 0) j++;
+      free[j].push(base);
+      base += 2 ** j;
+    }
+    // Never hand out the shared zero-sized address (see `addr`).
+    if (base === globalThis.__rt._zst_addr) base += 4096;
+    if (base + size > 4294967296) {
+      throw __rt.abort_error(new Error("rustc_codegen_js: the 32-bit synthetic address space is exhausted"));
+    }
+    globalThis.__rt._addrNext = base + size;
+  }
+  globalThis.__rt._addrs.set(key, base);
+  if (block !== undefined) globalThis.__rt._addrHeap.set(key, k);
+  else if (globalThis.__rt._addrGone !== undefined) globalThis.__rt._addrGone.register(key, base + k);
+  return base;
+};
+
+// _addr_release(buf, bytes): gives a heap block's granule back. `dealloc` calls
+// it without `bytes`; `realloc` calls it with the new size, and it acts only if
+// the block grew past its granule (below 4096): the block then takes a base at
+// its new size the next time it is asked, because otherwise its addresses would
+// run into its neighbours'. Rust lets a reallocation move, so the old address
+// ending with it is no change of meaning.
+globalThis.__rt._addr_release = (buf, bytes) => {
+  const k = globalThis.__rt._addrHeap.get(buf);
+  if (k === undefined || (bytes !== undefined && (k === 12 || bytes <= 2 ** k))) return;
+  globalThis.__rt._addrHeap.delete(buf);
+  globalThis.__rt._addrFree[k].push(globalThis.__rt._addrs.get(buf));
+  if (bytes !== undefined) globalThis.__rt._addrs.delete(buf);
 };
 
 // offset_from(a, b): how many elements `a` is past `b`, for an *aggregate*
@@ -1030,12 +1112,22 @@ globalThis.__rt.unwindow = (p) => {
 };
 
 // The `str` hybrid. A `&str` is a JavaScript string, and its byte view is
-// produced on demand by the three helpers below. The wrappers construct their
-// native codec on first use, so importing a package never needs browser codecs.
+// produced on demand by the helpers below. The wrappers construct their native
+// codec on first use, so importing a package never needs browser codecs.
 globalThis.__rt._encoder = {
   value: null,
   encode(value) {
     return (this.value || (this.value = new TextEncoder())).encode(value);
+  },
+  // encodeInto: the bytes written into `target`, which the caller sized to hold
+  // all of them (three bytes per UTF-16 code unit is always enough). An engine
+  // whose encoder predates `encodeInto` encodes and copies.
+  into(value, target) {
+    const encoder = this.value || (this.value = new TextEncoder());
+    if (typeof encoder.encodeInto === "function") return encoder.encodeInto(value, target).written;
+    const bytes = encoder.encode(value);
+    target.set(bytes);
+    return bytes.length;
   },
 };
 globalThis.__rt._decoder = {
@@ -1043,6 +1135,79 @@ globalThis.__rt._decoder = {
   decode(value) {
     return (this.value || (this.value = new TextDecoder("utf-8", { ignoreBOM: true }))).decode(value);
   },
+};
+
+// _utf8(s): the UTF-8 bytes of a JavaScript string as a fresh plain array,
+// exactly the bytes `TextEncoder` produces -- a lone surrogate is U+FFFD.
+//
+// A short ASCII string is built straight from its code units: a call into the
+// native encoder costs more than the whole loop. Anything else is encoded
+// natively and copied element by element into an array allocated at its final
+// length, which is an order of magnitude cheaper than handing the typed array to
+// `Array.prototype.slice` or `Array.from`. Strings of up to 4096 code units are
+// encoded into one reused 12 KiB scratch buffer, so they allocate only the
+// result; a longer one allocates a transient `Uint8Array`.
+globalThis.__rt._utf8_scratch = null;
+globalThis.__rt._utf8 = (s) => {
+  const n = s.length;
+  if (n <= 16) {
+    const bytes = new Array(n);
+    let i = 0;
+    for (; i < n; i++) {
+      const c = s.charCodeAt(i);
+      if (c > 0x7f) break;
+      bytes[i] = c;
+    }
+    if (i === n) return bytes;
+  }
+  let source;
+  let len;
+  if (n <= 4096) {
+    source = globalThis.__rt._utf8_scratch ||
+      (globalThis.__rt._utf8_scratch = new Uint8Array(3 * 4096));
+    len = globalThis.__rt._encoder.into(s, source);
+  } else {
+    source = globalThis.__rt._encoder.encode(s);
+    len = source.length;
+  }
+  const bytes = new Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = source[i];
+  return bytes;
+};
+
+// The byte-view memo: string -> the `{ buf, off: 0, len }` record `str_bytes`
+// returned for it.
+//
+// A `&str` sliced out of a longer one is encoded again on every slice, because
+// `&s[a..b]` is `s.as_bytes()` plus a decode: a parser walking a document asks
+// for the document's bytes once per token. The memo makes that one encode per
+// operation instead of one per token, which is the difference between linear
+// and quadratic. Its lifetime is the operation and its size is bounded:
+//
+//   * it is emptied when the JavaScript stack unwinds -- the first insertion
+//     queues a microtask that clears it, so no entry outlives the synchronous
+//     run of Rust code (an export, a callback, one poll of a future) that made
+//     it. Without `queueMicrotask` only the bound below applies;
+//   * it holds at most `budget` (4 MiB) of encoded bytes; the insertion that
+//     would exceed it empties it first;
+//   * a string longer than `budget / 4` is held apart from that budget, and at
+//     most the two most recent such strings are, so one large document that
+//     every slice re-reads is not evicted by its own slices.
+//
+// Strings are immutable, so an entry can never be stale: a `String` that is
+// mutated derefs to a different JavaScript string. Two equal strings share one
+// record, which is as good as two everywhere but pointer identity -- and
+// CONTRACT.md documents identity across independent calls as not guaranteed.
+// The record and its buffer are never handed to an owner that mutates them:
+// the converters that build an owned `String` from a host string copy.
+globalThis.__rt._str_memo = { map: new Map(), bytes: 0, huge: [], armed: false, budget: 4194304 };
+
+globalThis.__rt._str_memo_clear = () => {
+  const memo = globalThis.__rt._str_memo;
+  memo.map.clear();
+  memo.bytes = 0;
+  memo.huge.length = 0;
+  memo.armed = false;
 };
 
 // str_bytes(s): the UTF-8 bytes of a JavaScript string as `{ buf, off, len }`,
@@ -1054,39 +1219,76 @@ globalThis.__rt._decoder = {
 // same kind of thing for `__rt.copy`, `__rt.overwrite` and a bare `p.buf[p.off]`
 // write to work on both.
 //
-// A four entry memo ring keyed by the string returns the *same* record for a
-// repeated call, so `s.as_bytes().as_ptr() == s.as_bytes().as_ptr()` holds in
-// the shapes a program actually writes and a byte slice compared with itself
-// takes the fast path. Correctness never depends on it: the ring is four
-// entries, so a fifth distinct string evicts the first, and two records over
-// equal bytes are as good as one everywhere but pointer identity — which
-// CONTRACT.md documents as not guaranteed across independent calls.
-globalThis.__rt._strBytes = [];
-globalThis.__rt._strBytesNext = 0;
+// A repeated call within one operation returns the *same* record (see the memo
+// above), so `s.as_bytes().as_ptr() == s.as_bytes().as_ptr()` holds in the
+// shapes a program actually writes and a byte slice compared with itself takes
+// the fast path. Correctness never depends on it.
 globalThis.__rt.str_bytes = (s) => {
-  const memo = globalThis.__rt._strBytes;
-  for (let i = 0; i < memo.length; i++) {
-    if (memo[i].s === s) return memo[i].r;
+  const memo = globalThis.__rt._str_memo;
+  let record = memo.map.get(s);
+  if (record !== undefined) return record;
+  const bytes = globalThis.__rt._utf8(s);
+  record = { buf: bytes, off: 0, len: bytes.length };
+  if (!memo.armed) {
+    memo.armed = true;
+    if (typeof queueMicrotask === "function") queueMicrotask(globalThis.__rt._str_memo_clear);
   }
-  const bytes = Array.prototype.slice.call(globalThis.__rt._encoder.encode(s));
-  const record = { buf: bytes, off: 0, len: bytes.length };
-  memo[globalThis.__rt._strBytesNext] = { s: s, r: record };
-  globalThis.__rt._strBytesNext = (globalThis.__rt._strBytesNext + 1) % 4;
+  if (bytes.length > memo.budget / 4) {
+    if (memo.huge.length === 2) memo.map.delete(memo.huge.shift());
+    memo.huge.push(s);
+  } else {
+    if (memo.bytes + bytes.length > memo.budget) {
+      const huge = memo.huge.map((key) => memo.map.get(key));
+      memo.map.clear();
+      memo.huge.forEach((key, i) => memo.map.set(key, huge[i]));
+      memo.bytes = 0;
+    }
+    memo.bytes += bytes.length;
+  }
+  memo.map.set(s, record);
   return record;
 };
 
+// str_bytes_mut(s): `str::as_bytes_mut` and `as_mut_ptr` -- the same bytes as
+// `str_bytes`, in a fresh record that is never memoized. A `&mut str` has no
+// mutable JavaScript form (a write through it is lost; CONTRACT.md), and the
+// `&mut str` a `String` derefs to is a decoded copy, so the one thing this owes
+// is containment: the write must not land in the view an equal string shares.
+globalThis.__rt.str_bytes_mut = (s) => {
+  const bytes = globalThis.__rt._utf8(s);
+  return { buf: bytes, off: 0, len: bytes.length };
+};
+
 // str_len(s): the UTF-8 byte length of a JavaScript string, which is the
-// metadata of a `&str`.
+// metadata of a `&str` and `str::len`.
 //
-// The fast path is the common one: a string whose every code unit is below 0x80
-// is one byte per unit, so its length is the answer and nothing is encoded. A
-// scan is still O(n), but it allocates nothing, and it is exact for the
-// surrogate pairs an astral character arrives as.
+// Nothing is encoded: a code unit below 0x80 is one byte, below 0x800 two, a
+// surrogate pair four, and any other unit three -- including a lone surrogate,
+// which the encoder replaces with the three-byte U+FFFD. A string long enough
+// for the scan to cost more than a lookup is answered from the byte-view memo
+// when an earlier `str_bytes` already has it, which keeps a length asked once
+// per token of a long document from costing a scan each time.
 globalThis.__rt.str_len = (s) => {
-  for (let i = 0; i < s.length; i++) {
-    if (s.charCodeAt(i) > 0x7f) return globalThis.__rt._encoder.encode(s).length;
+  const n = s.length;
+  const map = globalThis.__rt._str_memo.map;
+  if (n > 64 && map.size !== 0) {
+    const record = map.get(s);
+    if (record !== undefined) return record.len;
   }
-  return s.length;
+  let len = n;
+  for (let i = 0; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x80) continue;
+    if (c < 0x800) {
+      len += 1;
+    } else if ((c & 0xfc00) === 0xd800 && i + 1 < n && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+      len += 2;
+      i++;
+    } else {
+      len += 2;
+    }
+  }
+  return len;
 };
 
 // bytes_str(buf, off, len): decodes the `len` UTF-8 bytes at `buf[off]` back
@@ -1095,37 +1297,39 @@ globalThis.__rt.str_len = (s) => {
 //
 // The bytes are a plain array (see str_bytes), which the decoder does not take,
 // so they are copied into a `Uint8Array` first; a typed array that arrived from
-// somewhere else is sliced directly.
+// somewhere else is viewed directly. The copy is also what reads an `i8`
+// element as its byte: a store into a `Uint8Array` wraps a negative number.
 //
 // The ASCII fast path is what a `String` built out of `alloc` actually hits:
 // every byte below 0x80 is its own code point, so the string is assembled
 // directly and neither the copy nor the decoder runs. `String.fromCharCode`
 // takes a bounded run of arguments, so the loop chunks; above the chunk size,
-// or at the first byte that is not ASCII, the decoder takes over.
+// or at the first byte that is not ASCII (a negative `i8` included), the
+// decoder takes over.
 globalThis.__rt._ASCII_CHUNK = 4096;
 globalThis.__rt.bytes_str = (buf, off, len) => {
   // A zero length `str` reads nothing, and the buffer it names may not exist at
   // all: `let none: [u8; 0] = []` is a zero sized place, whose JavaScript value
   // is `undefined`.
   if (len === 0) return "";
+  const typed = buf instanceof Uint8Array;
   if (len <= globalThis.__rt._ASCII_CHUNK) {
-    let ascii = true;
-    for (let i = 0; i < len; i++) {
-      if (buf[off + i] > 0x7f) {
-        ascii = false;
-        break;
-      }
-    }
-    if (ascii) {
+    let i = 0;
+    while (i < len && (buf[off + i] & 0x80) === 0) i++;
+    if (i === len) {
       return String.fromCharCode.apply(
         null,
-        Array.prototype.slice.call(buf, off, off + len),
+        typed ? buf.subarray(off, off + len) : Array.prototype.slice.call(buf, off, off + len),
       );
     }
   }
-  const bytes = buf instanceof Uint8Array
-    ? buf.subarray(off, off + len)
-    : Uint8Array.from(Array.prototype.slice.call(buf, off, off + len));
+  let bytes;
+  if (typed) {
+    bytes = buf.subarray(off, off + len);
+  } else {
+    bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = buf[off + i];
+  }
   return globalThis.__rt._decoder.decode(bytes);
 };
 
@@ -1616,7 +1820,8 @@ globalThis.__rt.alloc_zeroed = (size, align) =>
 // dealloc(ptr, size, align): `__rust_dealloc`. The block is unregistered and
 // poisoned: emptying the array makes every stale pointer into it read
 // `undefined` rather than the value it used to hold, and the `_freed` set turns
-// a later cast through that pointer into a refusal that says so.
+// a later cast through that pointer into a refusal that says so. Its synthetic
+// address, if it was ever asked for, goes back to the free list (`addr`).
 globalThis.__rt.dealloc = (p, size, align) => {
   const buf = p === null || typeof p !== "object" ? null : p.buf;
   if (buf === null || !globalThis.__rt._blocks.has(buf)) {
@@ -1627,6 +1832,7 @@ globalThis.__rt.dealloc = (p, size, align) => {
   }
   globalThis.__rt._blocks.delete(buf);
   globalThis.__rt._freed.add(buf);
+  globalThis.__rt._addr_release(buf);
   buf.length = 0;
 };
 
@@ -1654,6 +1860,7 @@ globalThis.__rt.realloc = (p, size, align, new_size) => {
   }
   block.bytes = new_size;
   buf.length = new_size / block.es;
+  globalThis.__rt._addr_release(buf, new_size);
   return { buf, off: p.off };
 };
 

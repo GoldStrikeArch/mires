@@ -283,6 +283,11 @@ impl<'a> JsCx<'a> {
                 } else {
                     value
                 };
+                // A `str` arm asks whether the target is mutable (`as_bytes_mut`), which only the
+                // pointer types say.
+                if let Some(converted) = self.cast_str_ptr(from_ty, to_ty, value.clone()) {
+                    return converted;
+                }
                 self.cast_pointer(from_pointee, to_pointee, value)
             }
             CastKind::PointerExposeProvenance => {

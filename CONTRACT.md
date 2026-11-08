@@ -862,10 +862,31 @@ its digits in held objects where bytes belonged.
 
 ### Addresses
 
-`p as usize` is `__rt.addr(p, size_of::<pointee>())`. Every buffer is given a synthetic base of
-`4096 * n` the first time it is asked about, kept in a `WeakMap` so that it never moves, and the
-address of an element is `base + off * size`; a scaled slot's offset is already in bytes and is
-added as it is, and a number is an address already.
+`p as usize` is `__rt.addr(p, size_of::<pointee>())`. Every buffer is given a synthetic base the
+first time it is asked about, kept in a `WeakMap` so that it never moves, and the address of an
+element is `base + off * size`; a scaled slot's offset is already in bytes and is added as it is,
+and a number is an address already.
+
+A `usize` is 32 bits, so the space of bases is finite and is managed like a buddy allocator. A
+buffer of `n` bytes takes a granule of the smallest power of two that holds it, at least 16 and at
+most 4096, and its base is a multiple of that granule — aligned for every type the buffer can
+hold, since a type's alignment divides its size. A heap block's size is its `Layout` size; another
+buffer's is its length times the element size of the first `addr` asked of it. An alignment the
+size does not imply — a hand-built `Layout` whose alignment exceeds its size, or an over-aligned
+element first addressed through a byte pointer — is honoured only up to 16. Granules come from a
+per-size free list first, then from a bump pointer starting at 4096 (whose alignment gaps are
+split into smaller free granules). `dealloc` gives a heap
+block's granule back — the freed buffer keeps its entry, so a dangling pointer still answers the
+address it had, and a later allocation may reuse it, as a native allocator would — and a
+`FinalizationRegistry` gives back the granule of any other buffer once the engine has collected
+it. A `realloc` that grows a block past its granule (below 4096) gives the granule back too, and
+the block takes a base at its new size when next asked: a reallocation may move in Rust, and
+otherwise the grown block's addresses would run into its neighbours'. A base is therefore unique
+among live buffers and stable for a buffer's lifetime. The space runs out only when the bump
+pointer reaches 2^32 with no free granule of the size asked — about 2^32 bytes of granules live at
+once, a million live 4 KiB buffers — and that is a refusal that says so. (Bases used to be `4096 * n`
+and were never reused: the 2^20th buffer was given the address 2^32, which `>>> 0` made null, and
+`NonNull::new` reported a good allocation as failed.)
 
 The size does not always survive to the call. `<*const T>::addr` is written
 `transmute(self.cast::<()>())`, so the pointee is `()` by the time the address is taken while the
@@ -878,7 +899,9 @@ The scheme is chosen for four guarantees, not for convenience:
 
 - `is_null()` is false for every real pointer and true only for `null()`, because no base is zero;
 - `NonNull::dangling()` is an alignment, always below 4096, so it never collides with a base;
-- an address is a multiple of the element size, so alignment predicates answer correctly;
+- an address is a multiple of the element alignment (a type's alignment divides its size, and a
+  buffer's base is aligned to its size rounded up to a power of two), so alignment predicates answer
+  correctly;
 - `fmt::Arguments::as_str` tests `bits & 1` on an 8 byte element, so the answer is deterministic.
 
 Addresses are **not** ordered across buffers in any way a program may rely on, and an address never
@@ -931,15 +954,37 @@ not become initialized values.
 `&str` stays a JS string, and the byte view is produced on demand:
 
 - `as_bytes` is `__rt.str_bytes(s)`, which encodes the string to UTF-8 and returns
-  `{ buf, off: 0, len }` over a **plain array**, the same kind of buffer every other `[u8]` is.
-  `as_ptr` is the same call reduced to the slot `{ buf: __rt.str_bytes(s).buf, off: 0 }`, because a
-  thin pointer carries no length. A four entry memo ring keyed by the string returns the same record
-  for a repeated call, so pointer identity holds in practice; identity across independent calls is
-  **not** guaranteed, and nothing may depend on it.
+  `{ buf, off: 0, len }` over a **plain array**, the same kind of buffer every other `[u8]` is —
+  exactly the bytes `TextEncoder` writes, so a lone surrogate is U+FFFD. `as_ptr` is the same call
+  reduced to the slot `{ buf: __rt.str_bytes(s).buf, off: 0 }`, because a thin pointer carries no
+  length.
+- The records are **memoized for the operation**, keyed by the string. `&s[a..b]` is
+  `s.as_bytes()` plus a decode, so a parser walking a document asks for the whole document's bytes
+  once per token; the memo makes that one encode per operation instead of one per token (linear
+  rather than quadratic). Its bound: the memo is emptied when the JavaScript stack unwinds (the
+  first insertion queues one microtask that clears it, so no entry outlives the synchronous run of
+  Rust code that made it — an export, a callback, one poll of a future); it holds at most 4 MiB of
+  encoded bytes, and the insertion that would exceed that empties it first; a string of more than
+  1 MiB is held apart from that budget, at most the two most recent such strings, so a large
+  document is not evicted by its own slices. Without `queueMicrotask` only the byte bound applies.
+  Strings are immutable, so an entry is never stale — a mutated `String` derefs to a different
+  JavaScript string — and an owned `String` built from a host string copies, never aliasing a
+  memoized buffer. A repeated call within the operation returns the same record, so pointer
+  identity holds in practice; identity across independent calls is **not** guaranteed, and nothing
+  may depend on it.
 - `from_utf8_unchecked`, and a raw pointer whose pointee is `str` (`str::from_raw_parts`), are
-  `__rt.bytes_str(buf, off, len)`.
-- The metadata of a `&str` is `__rt.str_len(s)`, the UTF-8 byte length, with an ASCII fast path.
-- Writing through a `&mut str` stays a zombie.
+  `__rt.bytes_str(buf, off, len)`. An `i8` element is read as its byte.
+- The metadata of a `&str` is `__rt.str_len(s)`, the UTF-8 byte length, computed from the UTF-16
+  code units without encoding (a surrogate pair is four bytes, a lone surrogate the three of
+  U+FFFD); a string of more than 64 code units is answered from the memo when its bytes are
+  already there. `str::len` lowers to the same call: `__rt.str_bytes(s).len` folds to
+  `__rt.str_len(s)`.
+- Writing through a `&mut str` stays a zombie: the `&mut str` a `String` derefs to is a decoded
+  JavaScript string, so a write through `as_bytes_mut` (`make_ascii_uppercase`,
+  `to_ascii_lowercase`) does not reach the `String`'s storage and is lost. It is contained: a cast
+  from `str` to a **mutable** byte pointer is `__rt.str_bytes_mut(s)`, a fresh record that is never
+  memoized, so the lost write never surfaces in the view another `as_bytes` of an equal string
+  reads.
 
 `ptr::cast_str` owns the whole matrix — `str` to `[u8]`, `str` to `u8`, a slice of one byte elements
 to `str`, `str` to `str`, and a zombie for anything else with a `str` on one side — and every
@@ -988,7 +1033,8 @@ __rt.unscale_uninit(p, size, mk)       // one-time retype of uninitialized array
 __rt.chunk_slice(p, n, w)    // a slice re-read at chunk granularity, throws if it is not one
 __rt.unwindow(p)             // a pointer to `[E; N]`, as a pointer to its first element
 __rt.thin(p, size)           // `from_raw_parts` with `()` metadata: the data pointer, un-erased
-__rt.str_bytes(s)            // UTF-8 bytes of a JS string as `{ buf, off, len }`
+__rt.str_bytes(s)            // UTF-8 bytes of a JS string as `{ buf, off, len }`, memoized
+__rt.str_bytes_mut(s)        // the same bytes in a fresh, unmemoized record (`as_bytes_mut`)
 __rt.str_len(s)              // UTF-8 byte length
 __rt.bytes_str(buf, off, len) // UTF-8 bytes back to a JS string, `""` at length zero
 ```
