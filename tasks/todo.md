@@ -23,7 +23,7 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 
 ## Stage 3 — remove provably unnecessary cleanup edges (P07)
 - [ ] 3a RemoveNoopLandingPads after ElaborateDrops — full fix committed on branch worktree-agent-afeda83ff9fd9aa67 (9920693): selected-body set identical, compact gzip 110.6→60.7 KB, try 4,182→610, core suite 138/138. BLOCKED on 1b: with no-op pads gone, 201_reference_field_pointers and audit_named_reference fail (latent aggregate-place identity bug previously masked by all-box lowering). Merge after 1b passes 6/6 with 3a applied.
-- [ ] 3b plan/cleanup.rs: EmptyChain + NoThrow (may_throw summary), witnesses, report — implemented (pre-3a baseline): compact gzip 110.6→54.9 KB, try 4,182→196, core suite 138/138; under verification
+- [ ] 3b plan/cleanup.rs: EmptyChain + NoThrow (may_throw summary), witnesses, report — verified sound (whitelist, fixpoint, 10 protected-op classes, mutations) but BLOCKED like 3a on the fuse.rs place-view miscompile that opening fusion exposes (201, audit_named_reference). Agent a12941501626bbe56 fixing fuse.rs.
 - [ ] 3c no empty try for dead protected op — covered by 3b (92→0) via no-throw proofs for markers/cold_path/nop calls
 - [ ] cleanup-edges tests + CONTRACT.md note; R2a row
 
@@ -50,3 +50,6 @@ Attribution (Node, per call): marked 79.8 ms = 92% `str_bytes` re-encoding the w
 - `Rc<[Z]>` built via `Rc::from(vec![Z;n])` fails on the JIR lane with `__rt.retype_rc: this pointer does not name a live heap block` (passes on the default lane). Pre-existing; found by the 1a verifier (fixture scratchpad/verify1a/fx/rc_vec.rs).
 - [x] `scripts/active-poll-cleanup-test.sh` was stale (never requested js-cleanup=on); now a real gate (60/60 + baseline refusal). Open: same trap bug in scripts/compile.sh:116; wire the gate into check.sh/CI after 3a's check.sh edit lands.
 - Runtime: on the current build, compiled Rust is 43–146x slower per call than the JS originals (marked 146x, minisearch 68x, fflate 43x; harness commit 75d30a2). Diagnosis running; this, not scaffolding, is the runtime problem.
+- `scripts/matrix.sh:268` pass list lacks `cleanup` and `host-args` → no leave-one-out coverage for the new pass.
+- `scripts/async-test.sh:127` cds to `$root/../..` and builds `topcoat-runtime-macro` (monorepo-era); cannot run standalone. Stale script.
+- Baseline fusion miscompile (pre-existing, reachable with js-cleanup=off): `fuse.rs` fuses a reference-field load into a place view (`{buf:a,off:"r"}` instead of the loaded pointer). Being fixed.
