@@ -4,10 +4,10 @@ Plan: ~/.claude/plans/alright-look-at-the-breezy-hejlsberg.md (approved 2026-11-
 Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.1, high) per stage.
 
 ## Stage 0 — baseline commit + measurement loop
-- [ ] Baseline commit of the reconstruction on main
-- [ ] `experiments/v2-restoration/measure.mjs` + `RESULTS.md`
-- [ ] `RCGJS_COST_PROFILE=1` compile-cost counters in jsc-link
-- [ ] R0 row recorded
+- [x] Baseline commit of the reconstruction on main (93c0785)
+- [x] `experiments/v2-restoration/measure.mjs` + `RESULTS.md` (f7e0e10)
+- [x] `RCGJS_COST_PROFILE=1` compile-cost counters in jsc-link (0111435)
+- [x] R0 row recorded (compact 110.6 KB gz, idiomatic 186.5 KB gz, Pro optimized link completes in 654 s)
 
 ## Stage 1 — correctness (P02/P03)
 - [ ] 1a ZST aggregate storage/drop: 195_zst_array_drops, audit_zst_closure_drop, audit_zst_vec_drop
