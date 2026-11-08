@@ -65,8 +65,10 @@ const SHIM_NAMESPACE: &str = "__rt";
 /// The whole of `jsc-link` hangs off this: the manifest names the objects, the rlibs, the output
 /// and the options, and nothing else about the compilation is visible from here.
 pub fn run(manifest: &Manifest) -> u32 {
+    let total_scope = crate::profile::scope("link.total");
     let dcx = Sink::new();
     crate::opts::set(manifest.opts.clone());
+    let read_scope = crate::profile::scope("link.read");
 
     let mut items = Read {
         source_map: manifest.opts.source_map,
@@ -91,6 +93,7 @@ pub fn run(manifest: &Manifest) -> u32 {
         }
     }
     items.note_mixed_formats(&dcx);
+    drop(read_scope);
     let sources = std::mem::take(&mut items.sources);
 
     match &manifest.mode {
@@ -127,6 +130,8 @@ pub fn run(manifest: &Manifest) -> u32 {
             }
         }
     }
+    drop(total_scope);
+    crate::profile::dump();
     dcx.errors()
 }
 
@@ -460,12 +465,14 @@ fn resolve(
         let (live, _) = reach(dcx, &table);
         reject_cleanup_fallbacks(dcx, &table, &live, lane_run.as_ref());
     }
-    let mut dedup = crate::link_dedup::merge_duplicates(
-        &mut table,
-        &reachable,
-        &BTreeSet::new(),
-        &mut conflicts,
-    );
+    let mut dedup = crate::profile::time("link.dedup", || {
+        crate::link_dedup::merge_duplicates(
+            &mut table,
+            &reachable,
+            &BTreeSet::new(),
+            &mut conflicts,
+        )
+    });
     let references_changed = baseline_count != reachable.len() || dedup.references_changed()
         // The flat-call ABI adds the spill registers to the table, and an item nothing has walked
         // to yet is an item `order` will not place and `print_units` will not print. A lowering
@@ -506,7 +513,9 @@ fn resolve(
         exports: BTreeSet::new(),
         entry: None,
     };
-    let mut printed = print_units(dcx, sources, std::slice::from_ref(&unit));
+    let mut printed = crate::profile::time("link.print", || {
+        print_units(dcx, sources, std::slice::from_ref(&unit))
+    });
     let mut deployment = ArtifactManifest {
         schema: ARTIFACT_SCHEMA,
         object_format: FORMAT_VERSION,

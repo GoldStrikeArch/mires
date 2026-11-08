@@ -167,6 +167,11 @@ pub fn plan(
     planner.name();
     planner.copies();
     if func.has_invoke() {
+        crate::profile::bump(crate::profile::Counter::CatchReserveCalls);
+        crate::profile::add(
+            crate::profile::Counter::CatchReserveStrings,
+            interns.strings.len(),
+        );
         // A catch binding also shadows free names in its handler.
         planner.taken.extend(interns.strings.iter().cloned());
     }

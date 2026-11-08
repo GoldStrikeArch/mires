@@ -25,6 +25,7 @@ mod link_dedup;
 mod lower;
 mod opt;
 mod plan;
+mod profile;
 mod report;
 
 /// The shared crate's modules, under the names the moved code already spells them by.

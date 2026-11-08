@@ -1541,6 +1541,7 @@ impl Planner<'_> {
     /// naming, unique runtime helpers, and the allocation term. A decline anywhere in a rewritten
     /// function makes the vector unmeasurable and therefore unprofitable.
     fn program_cost(&self, commit: &Commit) -> Option<ProgramCost> {
+        crate::profile::bump(crate::profile::Counter::TrialReprProgram);
         let mut opts = self.cx.opts.clone();
         opts.optimizer = crate::opts::OptimizerMode::On;
         if !matches!(
@@ -1624,6 +1625,7 @@ impl Planner<'_> {
                 .get(name)
                 .unwrap_or(crate::lower::EMPTY_CALL_RETARGETS);
             let input = self.lower_input_with(name, item, &opts, abi.spill_names(), retargets)?;
+            crate::profile::bump(crate::profile::Counter::LowerReprProgram);
             let measured = match cost::lower_item(&input, func) {
                 Ok(measured) => measured,
                 Err(decline) => {

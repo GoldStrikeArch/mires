@@ -527,7 +527,14 @@ impl LaneRun {
 /// Writes the sidecar beside the program.
 pub(crate) fn write_sidecar(dcx: &Sink, path: &Path, run: &LaneRun, lane: Lane) {
     let path = sidecar_path(path);
-    if let Err(err) = std::fs::write(&path, run.render(lane)) {
+    let mut text = run.render(lane);
+    // `RCGJS_COST_PROFILE=1` only: the compile-cost figures so far, as the object's last member.
+    if crate::profile::enabled() {
+        if let Some(body) = text.strip_suffix("}\n") {
+            text = format!("{body},\"cost_profile\":{}}}\n", crate::profile::json());
+        }
+    }
+    if let Err(err) = std::fs::write(&path, text) {
         dcx.err(format!("error writing `{}`: {err}", path.display()));
     }
 }
@@ -573,6 +580,7 @@ pub(crate) fn run(
     reachable: &[JsName],
     coroutine_sources: &crate::plan::async_graph::SourceCaptures,
 ) -> LaneRun {
+    let _lane_scope = crate::profile::scope("lane.total");
     let opts = crate::opts::get();
     // The names the reachability walk can follow, taken before any item is replaced. Cloned
     // rather than borrowed because the loop below holds `&mut` on one item of the same table.
@@ -590,6 +598,7 @@ pub(crate) fn run(
     // Phase A, once: the plan is made over the same Funcs the first pass rewrites, and a retry
     // rebuilds them because the rewrite consumed them.
     let pristine_funcs = {
+        let _scope = crate::profile::scope("lane.A.build_funcs");
         let ctx = Ctx {
             opts,
             items: &items,
@@ -623,7 +632,7 @@ pub(crate) fn run(
         }
     };
     let mut planned_funcs = pristine_funcs.clone();
-    let mut o_stats = run_o(table, &mut planned_funcs, &live);
+    let mut o_stats = crate::profile::time("lane.O", || run_o(table, &mut planned_funcs, &live));
 
     // Phase B1: solve and commit on the planned map in both `report` and `on`. Report mode keeps
     // only the accounting; on mode prints the committed map. D9 can therefore measure the exact
@@ -636,13 +645,15 @@ pub(crate) fn run(
             drop_glue: &drop_glue,
             vtables: &vtables,
         };
-        crate::plan::representation::plan_and_commit(
-            table,
-            &mut planned_funcs,
-            &live,
-            &repr_cx,
-            true,
-        )
+        crate::profile::time("lane.B1.representation", || {
+            crate::plan::representation::plan_and_commit(
+                table,
+                &mut planned_funcs,
+                &live,
+                &repr_cx,
+                true,
+            )
+        })
     } else {
         crate::plan::representation::ReprOutcome::default()
     };
@@ -700,11 +711,13 @@ pub(crate) fn run(
                 .map(|func| func.item)
         })
         .collect();
-    let mut plan =
-        crate::plan::abi_flat::plan_excluding(&planning_table, &abi_funcs, opts, &clone_sources);
+    let mut plan = crate::profile::time("lane.B2.abi_flat", || {
+        crate::plan::abi_flat::plan_excluding(&planning_table, &abi_funcs, opts, &clone_sources)
+    });
     let abi_applied = opts.applies(OptimizerPass::Sroa);
     let mut economics = None;
     if !plan.is_empty() {
+        let _scope = crate::profile::scope("lane.B2.physical");
         let (selected, evaluation) = crate::plan::physical_cost::evaluate_groups(
             &planning_table,
             &planned_funcs,
@@ -757,6 +770,7 @@ pub(crate) fn run(
     let mut ready_allowed = true;
     let mut physical = planned_physical;
     let (lowered, async_plan) = loop {
+        let rewrite_scope = crate::profile::scope("lane.rewrite");
         if abi_applied {
             physical = crate::plan::physical::PhysicalPlan::of(
                 &work_table,
@@ -776,21 +790,25 @@ pub(crate) fn run(
             .clone_from(&async_plan.ready.selected);
         // Phase B2.
         plan.rewrite(&mut funcs, &work_table);
+        drop(rewrite_scope);
         // Phase C.
-        let (lowered, retry) = lower_all(
-            &work_table,
-            &names,
-            &ctx,
-            funcs,
-            &plan,
-            &repr,
-            &physical,
-            &defined,
-            &live,
-        );
+        let (lowered, retry) = crate::profile::time("lane.C.lower_all", || {
+            lower_all(
+                &work_table,
+                &names,
+                &ctx,
+                funcs,
+                &plan,
+                &repr,
+                &physical,
+                &defined,
+                &live,
+            )
+        });
         if retry
             && (!plan.is_empty() || !repr.touched.is_empty() || !physical.ready_futures.is_empty())
         {
+            let _scope = crate::profile::scope("lane.retry");
             ready_allowed = false;
             // BOTH plans are emptied (D1): the retried run rebuilds pristine Funcs and rewrites
             // nothing, so nothing it touched can decline. Each keeps its refusal accounting, so
@@ -1074,6 +1092,7 @@ fn physical_program_metrics(
     abi: &AbiPlan,
     ctx: &Ctx<'_>,
 ) -> Option<crate::plan::physical_cost::ProgramMetrics> {
+    crate::profile::bump(crate::profile::Counter::TrialPhysical);
     let mut opts = ctx.opts.clone();
     opts.optimizer = crate::opts::OptimizerMode::On;
     opts.minify = true;
@@ -1113,6 +1132,7 @@ fn physical_program_metrics(
         // ABI, just as the final phase-C pass does, or those candidates price as byte-identical
         // to the baseline and can never be selected.
         input.abi = Some(abi);
+        crate::profile::bump(crate::profile::Counter::LowerPhysical);
         match crate::plan::cost::lower_item(&input, func) {
             Ok(measured) => {
                 let sites = crate::analysis::js_alloc::JsAllocSites::of(&measured.lowered.decl);
@@ -1549,6 +1569,7 @@ fn lower_all(
         };
         input.abi = Some(plan);
         input.physical = Some(physical);
+        crate::profile::bump(crate::profile::Counter::LowerFinal);
         let mut stats = OptStats::default();
         let mut alloc = None;
         let mut result = match repr.bodies.get(name) {

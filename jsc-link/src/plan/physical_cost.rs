@@ -118,8 +118,10 @@ impl Cache {
     ) -> Option<ProgramMetrics> {
         if let Some(metrics) = self.entries.get(&key) {
             self.hits += 1;
+            crate::profile::bump(crate::profile::Counter::CacheHits);
             return *metrics;
         }
+        crate::profile::bump(crate::profile::Counter::CacheMisses);
         let metrics = measure();
         self.entries.insert(key, metrics);
         metrics
@@ -437,18 +439,24 @@ pub fn program_metrics(
     loop_allocations: u64,
     alloc_term: u64,
 ) -> ProgramMetrics {
+    crate::profile::bump(crate::profile::Counter::ProgramMetrics);
+    crate::profile::add(crate::profile::Counter::CompressInputBytes, program.len());
+    let gzip_scope = crate::profile::scope("compress.gzip");
     let mut gzip = GzBuilder::new()
         .mtime(0)
         .write(Vec::new(), Compression::best());
     gzip.write_all(program.as_bytes())
         .expect("writing to a Vec cannot fail");
     let gzip = gzip.finish().expect("writing to a Vec cannot fail").len() as u64;
+    drop(gzip_scope);
 
+    let brotli_scope = crate::profile::scope("compress.brotli");
     let mut brotli = brotli::CompressorWriter::new(Vec::new(), 4096, 11, 22);
     brotli
         .write_all(program.as_bytes())
         .expect("writing to a Vec cannot fail");
     let brotli = brotli.into_inner().len() as u64;
+    drop(brotli_scope);
 
     ProgramMetrics {
         min: program.len() as u64,
@@ -560,6 +568,8 @@ fn cache_key(
     profile: Profile,
     opts: &Opts,
 ) -> Hash128 {
+    crate::profile::bump(crate::profile::Counter::CacheKeyCalls);
+    let _scope = crate::profile::scope("physical_cache.key");
     let mut bytes = Vec::new();
     bytes.extend_from_slice(profile.as_str().as_bytes());
     bytes.extend_from_slice(
@@ -584,6 +594,7 @@ fn cache_key(
         bytes.extend_from_slice(format!("{func:?}").as_bytes());
     }
     abi.extend_cost_key(&mut bytes);
+    crate::profile::add(crate::profile::Counter::CacheKeyBytes, bytes.len());
     Hash128::of(&bytes)
 }
 

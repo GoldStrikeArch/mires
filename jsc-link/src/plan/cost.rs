@@ -181,6 +181,7 @@ impl Cost {
 /// unoptimized print would make `report`'s solve disagree with `on`'s — `report` must say what
 /// `on` would do.
 pub fn measure_item(input: &LowerInput<'_>, func: &Func) -> Option<u64> {
+    crate::profile::bump(crate::profile::Counter::LowerReprProbe);
     let measured = lower_item(input, func).ok()?;
     Some(measure_decl(&measured.lowered.decl))
 }
@@ -189,6 +190,7 @@ pub fn measure_item(input: &LowerInput<'_>, func: &Func) -> Option<u64> {
 /// allocation term of the final JIR-R body. This is shared by per-item probes and the final
 /// post-commit whole-program measurement.
 pub fn lower_item(input: &LowerInput<'_>, func: &Func) -> Result<MeasuredItem, Decline> {
+    crate::profile::bump(crate::profile::Counter::LowerItem);
     let mut func = func.clone();
     let mut opts = input.opts.clone();
     opts.optimizer = OptimizerMode::On;
@@ -219,6 +221,7 @@ pub fn measure_inline_item(
     func: &Func,
     renames: &BTreeMap<String, String>,
 ) -> Option<(u64, BTreeSet<crate::item::JsName>)> {
+    crate::profile::bump(crate::profile::Counter::LowerInline);
     let measured = lower_item(input, func).ok()?;
     let compact = compact_decl(&measured.lowered.decl);
     Some((
@@ -292,6 +295,7 @@ pub fn helper_program(direct: &BTreeSet<String>) -> String {
 /// `globalThis.__rt.name = …` assignment per member, each ending immediately before the next
 /// member's leading comments.
 fn shim_members(source: &str) -> BTreeMap<String, String> {
+    crate::profile::bump(crate::profile::Counter::ShimMembers);
     let lines: Vec<&str> = source.lines().collect();
     let mut members = BTreeMap::new();
 
@@ -349,6 +353,7 @@ fn shim_members(source: &str) -> BTreeMap<String, String> {
 }
 
 fn shim_helper_closure(source: &str, direct: &BTreeSet<String>) -> BTreeSet<String> {
+    crate::profile::bump(crate::profile::Counter::ShimClosure);
     let members = shim_members(source);
     // Match minimal-shim's source groups: lexical helper declarations travel
     // with the runtime member preceding them, even when another member calls them.
