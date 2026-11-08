@@ -43,3 +43,6 @@ bench/vanilla/dist-krausest/
 **/.gradle/
 **/.kotlin/
 **/__pycache__/
+
+# Subagent worktree metadata
+/.claude/worktrees/
