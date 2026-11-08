@@ -24,24 +24,23 @@
 // status, which is the `NN.maxbytes` precedent from `scripts/emit-test.sh`: a
 // budget you beat is a budget you re-baseline, not one you leave loose.
 //
-// WHAT IT COMPARES, AND WHY IT NEEDS NO BUILD
-// -------------------------------------------
+// WHAT IT COMPARES, AND WHAT THAT DOES NOT PROVE HERE
+// ---------------------------------------------------
 // Not the freshly compiled trace -- the COMMITTED one,
-// `examples/dom-tests/NN.trace.expected`. That is sound, and it is the load-bearing
-// design decision here:
+// `examples/dom-tests/NN.trace.expected` -- so it needs no rustc, no cargo and no
+// backend build, and runs in about a second.
 //
-//   dom-test.sh already diffs the freshly produced trace against NN.trace.expected
-//   and FAILS the suite on any difference (its step 2, "trace changed"). So on a
-//   green dom run the committed trace and the emitted trace are byte identical.
-//   Comparing the committed one against the reference therefore yields exactly the
-//   L2 verdict dom-test.sh would print -- and yields it from committed bytes alone,
-//   with no rustc, no cargo, no backend build, in about a second.
+// NOTE: the traces are frozen data. This design was sound while dom-test.sh
+// re-emitted every trace and failed on any difference from NN.trace.expected.
+// In this repository it does not: the fixtures need the framework's
+// `view_dom_macro`, which is not here, so scripts/dom-test.sh SKIPs (exit 3) and
+// no gate re-emits or re-verifies these traces. The committed `*.trace.expected`
+// files are the September 7 base's bytes as imported in 93c0785, not what this
+// compiler emits today. A MATCH or DIFFERS row here is a verdict about those
+// frozen traces against the reference corpus, and nothing more.
 //
-// The consequence worth stating plainly: this gate cannot catch an emitter change
-// on its own, because an emitter change that is not also committed to
-// NN.trace.expected is caught by dom-test.sh first. It catches the thing
-// dom-test.sh cannot -- a re-baselined trace that silently moved a family's L2
-// verdict, and a reference trace or delta rule that moved underneath one.
+// What it still catches: a reference trace, a delta rule or a re-baselined
+// NN.trace.expected that moves a family's recorded verdict.
 //
 // THE THREE NON-MEASURED STATES
 // -----------------------------
@@ -89,7 +88,7 @@ const SEED = {
     "cd contract/harness",
     "node --import ./register-loader.mjs check-l2-status.mjs           # check, exit 1 on any change",
     "node --import ./register-loader.mjs check-l2-status.mjs --record  # rewrite after reading the diff",
-    "It reads only committed bytes -- the reference traces here and examples/dom-tests/NN.trace.expected -- so it needs no build. That is sound because scripts/dom-test.sh already fails if a freshly emitted trace differs from NN.trace.expected, so on a green dom run the committed trace IS the emitted trace."
+    "It reads only committed bytes -- the reference traces here and examples/dom-tests/NN.trace.expected -- so it needs no build. Those traces are frozen September 7 data: scripts/dom-test.sh skips without the framework's view_dom_macro, so no gate here re-verifies that they are what the compiler emits."
   ],
   $states: {
     MATCH: "compared, and the traces agree once the accepted deltas are applied.",

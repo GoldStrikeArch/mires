@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # Shared DOM traces, handler captures, zero JIR fallback, and exact off/report output.
+#
+# Framework-specific: scripts/dom-test.sh, which this drives twelve times, needs `view_dom_macro`,
+# which this repository does not carry. Without it this prints SKIP and exits 3 (see dom-test.sh).
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd -- "$script_dir/.." && pwd)
+if [ ! -f "$root/view-dom-macro/Cargo.toml" ]; then
+	echo "SKIP: framework-specific suite (needs view_dom_macro; see CONTRACT.md)"
+	exit 3
+fi
 source "$script_dir/integration-lock.sh"
 cd "$root"
 if [ "${SKIP_BUILD:-0}" != 1 ]; then

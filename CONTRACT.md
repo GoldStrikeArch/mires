@@ -201,7 +201,9 @@ formatting anywhere -- print numbers and literal strs only.
                         "Source maps"); `node scripts/check-sourcemap.js build/03_structs.js`
 - scripts/dom-test.sh — the `view!` suite: expands each examples/dom-tests fixture, compiles it as
                         an ES module, runs it against the contract's recording stub and diffs both
-                        the JavaScript and the trace (see "Templates"); UPDATE_EXPECT=1 rebaselines
+                        the JavaScript and the trace (see "Templates"); UPDATE_EXPECT=1 rebaselines.
+                        Framework-specific: without a `view-dom-macro/` checkout it prints SKIP and
+                        exits 3 (see "The suite")
 - scripts/dom-trace.mjs — runs one compiled client module against contract/harness/trace.mjs and
                         prints the trace as JSON Lines
 
@@ -2455,6 +2457,44 @@ by field -- which turned a root passed through a `Node` into `{ handle: undefine
 **3. `each` is `list`/`push`,** so a `for` lowers. See "The markers".
 
 ### The suite
+
+**In this repository the suite is framework-specific, and skipped.** Every fixture in
+`examples/dom-tests/`, and every one in `examples/keyed-tests/`, is written with `view_dom_macro`, a
+Topcoat framework crate this repository deliberately does not carry (docs/V2-RESTORATION.md).
+Without a `view-dom-macro/` checkout, `scripts/dom-test.sh` and `scripts/dom-matrix-test.sh` print
+`SKIP: framework-specific suite (needs view_dom_macro; see CONTRACT.md)` and exit 3 before building
+anything. `scripts/lane-shadow-test.sh` leaves `dom-tests` out of its default suites; named, it is
+one `SKIP framework` row, which its `N/M agree, K skipped` summary never counts as an agreement.
+`scripts/jir-coverage.sh` records the suite as `skipped-needs-framework`. `scripts/matrix.sh`'s
+`checks` row reports `for-handler-test`, `keyed-compiled-test`, `island-sourcemap-test` and
+`artifact-manifest-test`, which need `view-dom-macro` or `demo-app`, as `SKIP framework` lines,
+neither passed nor failed. The committed `NN.js.expected` and `NN.trace.expected` are frozen
+September 7 data that no gate here re-emits, so `contract/harness/check-l2-status.mjs` measures
+those frozen traces and not this compiler's output. The rest of this section describes the suite
+as it runs with a framework checkout.
+
+**The generic subset.** Two compiler behaviours were pinned only by DOM fixtures. Each now has a
+macro-free fixture, run in `scripts/matrix.sh`'s `checks` row:
+
+- `examples/host_loop_callbacks.rs` (`scripts/host-loop-callbacks-test.sh`) is what
+  `23_for_row_handlers` pinned. Closures created directly in `for` loop bodies, handed to the host
+  and called after the loop, must answer their own turn's captures: by value, through a reference
+  to a `Copy` value, from a nested loop, together with an outer counter they mutate, and a running
+  local the loop reassigns (see "A thunk built inside a loop snapshots its environment"). The
+  release build (`js-profile=release-balanced`, so `js-cleanup=on`, on the JIR lane) keeps
+  `callback0` out of line, so each thunk is created in a call frame of its own. The inlined build
+  (`JSC_RUST_MIR_INLINE=on`, both lanes) puts the marker on the loop itself, and there the check
+  requires the immediately invoked `(($c) => ($a0) => body($c, $a0))(env)` wrapper at every site.
+  On the parsed program, both builds require that no function created on a loop escapes over a
+  binding of the enclosing function. Optimizer off, report and on; off and report byte identical.
+- `examples/host_event_access.rs` (`scripts/host-event-access-test.sh`) is what
+  `21_event_accessors` pinned, together with the listener around it. A `#[js_extern]`
+  `addEventListener` receives a closure that reads `event.target.value` (the empty string when there
+  is no string value) and calls `preventDefault()` once, on the event it was handed. A second
+  listener holds a `Drop` guard across `preventDefault`, which the check makes throw an Error, an
+  object, a symbol, `undefined` and `null`. The guard must drop exactly once, nothing after the call
+  may run, and the caller must receive the thrown value itself. JIR lane under
+  `js-profile=release-balanced`, optimizer off, report and on; off and report byte identical.
 
 `examples/dom-tests/` holds one fixture per corpus family it mirrors, written against
 `dom_view_client_only!` because the reference traces were recorded from the non-hydratable preset.

@@ -78,6 +78,9 @@
 # and this compares two lanes of one compilation against each other.
 # `lane-shadow-opt` runs the same differential with the JIR optimizer on. It is a separate row so
 # the default shadow configuration cannot hide an optimizer-only wrong-code regression.
+# Both rows read the script's `N/M agree, K skipped` line and PASS only when every row that ran
+# agreed, at least one ran, and K is zero: a skipped suite is not an agreement. The framework suite
+# (dom-tests) is not one of the script's defaults for that reason; see its header.
 #
 # `passes` is the metamorphic check on the JIR pass pipeline (Phase 5, D5):
 # `RCGJS_JIR_PASSES` is the link-time env that selects which optimizer passes
@@ -91,7 +94,10 @@
 # wish): each one asserts a fallback or decline path a golden suite cannot --
 # the flat-ABI retry, the representation commit rollback, the custom-allocator
 # decline and mixed-call-site versioning -- and reports PASS/FAIL by exit code, summed into one
-# row.
+# row. A script that needs the Topcoat framework this repository does not carry (`view-dom-macro`,
+# `demo-app`; CONTRACT.md, "The suite" under "Templates") is a `SKIP framework` line while what it
+# needs is absent: not run, and counted neither as a pass nor as a failure. The row's count reads
+# `N/M passed, K skipped (framework)`, M counting only the scripts that ran.
 
 set -uo pipefail
 
@@ -291,15 +297,36 @@ passes_loo() {
 }
 
 # The pass/fail receipt scripts, one PASS each by exit code.
+check_list=(abi-retry-test repr-rollback-test allocator-guard-test repr-sourcemap-test macro-sourcemap-test island-sourcemap-test native-clone-test mixed-version-test native-box-test carrier-pea-test flat-result-test slice-lane-test slice-iterator-test projection-mutation-test sroa-test for-handler-test cross-crate-physical-test storage-plan-test async-graph-test async-action-test es2018-test operand-effects-test artifact-manifest-test keyed-compiled-test host-operations-test cross-object-inline-test operation-census-test host-loop-callbacks-test host-event-access-test)
+
+# framework_needs <script>: the paths under the root a receipt script needs from the Topcoat
+# framework checkout this repository does not carry, one per line; nothing for every other script.
+framework_needs() {
+	case "$1" in
+	for-handler-test | keyed-compiled-test) printf '%s\n' view-dom-macro/Cargo.toml ;;
+	island-sourcemap-test) printf '%s\n' view-dom-macro/Cargo.toml demo-app ;;
+	artifact-manifest-test) printf '%s\n' demo-app ;;
+	esac
+}
+
 check_scripts() {
-	local passed=0 total=0 status=0 script
+	local passed=0 total=0 skipped=0 status=0 script need missing
 	printf '\n==> building the backend used by bespoke checks\n'
 	if ! "$script_dir/build.sh" >"$root/build/logs/matrix-check-build.log" 2>&1; then
 		cat "$root/build/logs/matrix-check-build.log"
-		printf '\n0/22 passed\n'
+		printf '\n0/%d passed\n' "${#check_list[@]}"
 		return 1
 	fi
-	for script in abi-retry-test repr-rollback-test allocator-guard-test repr-sourcemap-test macro-sourcemap-test island-sourcemap-test native-clone-test mixed-version-test native-box-test carrier-pea-test flat-result-test slice-lane-test slice-iterator-test projection-mutation-test sroa-test for-handler-test cross-crate-physical-test storage-plan-test async-graph-test async-action-test es2018-test operand-effects-test artifact-manifest-test keyed-compiled-test host-operations-test cross-object-inline-test operation-census-test; do
+	for script in "${check_list[@]}"; do
+		missing=""
+		for need in $(framework_needs "$script"); do
+			[ -e "$root/$need" ] || missing="$missing${missing:+ }$need"
+		done
+		if [ -n "$missing" ]; then
+			skipped=$((skipped + 1))
+			printf '\n==> %s.sh\nSKIP framework (missing %s)\n' "$script" "$missing"
+			continue
+		fi
 		total=$((total + 1))
 		printf '\n==> %s.sh\n' "$script"
 		if SKIP_BUILD=1 "$script_dir/$script.sh" \
@@ -310,7 +337,7 @@ check_scripts() {
 		fi
 		cat "$root/build/logs/matrix-check-$script.log"
 	done
-	printf '\n%d/%d passed\n' "$passed" "$total"
+	printf '\n%d/%d passed, %d skipped (framework)\n' "$passed" "$total" "$skipped"
 	return "$status"
 }
 
@@ -357,15 +384,20 @@ for entry in "${modes[@]}"; do
 	fi
 	status=$?
 
+	shadow=0
 	if [ "$flags" = "@shadow" ] || [ "$flags" = "@shadow-opt" ]; then
-		line=$(grep -Eo '[0-9]+/[0-9]+ agree' "$log" | tail -1)
+		shadow=1
+		line=$(grep -Eo '[0-9]+/[0-9]+ agree, [0-9]+ skipped' "$log" | tail -1)
 	elif [ "$flags" = "@suites-opt" ]; then
 		line=$(grep -Eo '[0-9]+/[0-9]+ passed' "$log" | tail -1)
+	elif [ "$flags" = "@checks" ]; then
+		line=$(grep -Eo '[0-9]+/[0-9]+ passed(, [0-9]+ skipped \(framework\))?' "$log" | tail -1)
 	else
 		line=$(grep -Eo '[0-9]+/[0-9]+ passed' "$log" | tail -1)
 	fi
 	passed=${line%%/*}
-	total=$(printf '%s' "$line" | sed 's|.*/||; s| passed||; s| agree||')
+	total=$(printf '%s' "$line" | sed 's|^[0-9]*/||; s|[^0-9].*||')
+	skipped=$(printf '%s' "$line" | sed -n 's|.*, \([0-9]*\) skipped.*|\1|p')
 
 	verdict="PASS"
 	if [ "$name" = "names-mangled" ]; then
@@ -377,6 +409,10 @@ for entry in "${modes[@]}"; do
 			verdict="PINNED"
 		fi
 	elif [ "$status" -ne 0 ] || [ "$passed" != "$total" ]; then
+		verdict="FAIL"
+		failures=$((failures + 1))
+	elif [ "$shadow" -eq 1 ] && { [ -z "$line" ] || [ "$total" -eq 0 ] || [ "$skipped" != 0 ]; }; then
+		# A shadow row agrees only over suites that ran: no count, nothing run, or any skip fails it.
 		verdict="FAIL"
 		failures=$((failures + 1))
 	fi

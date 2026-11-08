@@ -3,8 +3,9 @@
 # The shadow lane: compile every fixture twice from one set of objects and prove the two
 # programs behave identically.
 #
-#   scripts/lane-shadow-test.sh                    # every suite
+#   scripts/lane-shadow-test.sh                    # the default suites: tests, core-tests
 #   scripts/lane-shadow-test.sh tests core-tests   # some of them
+#   scripts/lane-shadow-test.sh dom-tests          # the framework suite, by name only
 #
 # `-Cllvm-args=js-lane=shadow` makes the link step print the program twice: the baseline (v1's
 # text, item for item) to the output path, and the JIR lane's — every item the lowerer took,
@@ -24,6 +25,11 @@
 # is the point of the stub: total fallback is a working compiler, and the number that has to move
 # is the fallback count and nothing else.
 #
+# A suite that cannot be run at all (its scaffolding is missing) is one SKIP row. A SKIP is not an
+# agreement: the summary is `N/M agree, K skipped`, where M counts only the rows that ran, and
+# scripts/matrix.sh fails its shadow rows on any K above zero. The run exits 0 when every row that
+# ran agrees, 1 on any DIFF or ERROR, and 3 when nothing ran at all.
+#
 # THE SUITES, AND HOW EACH ONE RUNS A PROGRAM
 # -------------------------------------------
 #   tests        examples/tests, scripts/compile.sh, run as `shim + program + entry` under node
@@ -31,7 +37,12 @@
 #                fixtures exit non-zero on purpose, which is why the exit code is compared rather
 #                than required to be zero
 #   dom-tests    examples/dom-tests as ES modules, run through scripts/dom-trace.mjs against the
-#                contract's recording stub; the trace is the output that is diffed
+#                contract's recording stub; the trace is the output that is diffed. NOT a default
+#                suite: every fixture needs the framework's `view_dom_macro`, which this repository
+#                does not carry (CONTRACT.md, "The suite" under "Templates"), so a default run
+#                would always carry a SKIP row and a skip-free default could never be demanded.
+#                Named explicitly, it runs when a `view-dom-macro/` checkout is present and is
+#                one `SKIP framework` row when it is not
 #
 # There is no async suite. The executor fixtures are built only in the release configuration,
 # `js-profile=release-balanced` and so `js-cleanup=on`, and there the baseline lane refuses every
@@ -64,7 +75,8 @@ shim="$root/runtime/shim.js"
 entry="$script_dir/entry.js"
 
 ALL_SUITES="tests core-tests dom-tests"
-suites=${*:-$ALL_SUITES}
+DEFAULT_SUITES="tests core-tests"
+suites=${*:-$DEFAULT_SUITES}
 for suite in $suites; do
 	case " $ALL_SUITES " in
 	*" $suite "*) ;;
@@ -101,10 +113,17 @@ fi
 results=""
 failures=0
 total=0
+skipped=0
 
 # record <name> <verdict> <detail>
+#
+# `total` counts the rows that RAN; a SKIP is counted apart and never as an agreement.
 record() {
 	results="$results$1 $2 $3"$'\n'
+	if [ "$2" = SKIP ]; then
+		skipped=$((skipped + 1))
+		return
+	fi
 	total=$((total + 1))
 	if [ "$2" = DIFF ] || [ "$2" = ERROR ]; then
 		failures=$((failures + 1))
@@ -351,6 +370,11 @@ run_core_tests_suite() {
 
 run_dom_tests_suite() {
 	echo "==> examples/dom-tests"
+	if [ ! -f "$root/view-dom-macro/Cargo.toml" ]; then
+		echo "    SKIP: framework-specific suite (needs view_dom_macro; see CONTRACT.md)"
+		record dom-tests SKIP framework
+		return
+	fi
 	if ! ensure_sysroot "$OPT_ARGS"; then
 		echo "    skipped: no sysroot"
 		record dom-tests SKIP no-sysroot
@@ -453,7 +477,7 @@ printf '%s' "$results" | while read -r name result detail; do
 	printf '%-28s %-15s %s\n' "$name" "$result" "$detail"
 done
 echo "----------------------------------------------------------------"
-printf '%d/%d agree\n' "$((total - failures))" "$total"
+printf '%d/%d agree, %d skipped\n' "$((total - failures))" "$total" "$skipped"
 echo "================================================================"
 
 # The worklist: which declines and which classes the fallbacks came from, over every sidecar.
@@ -521,4 +545,8 @@ HISTOGRAM
 
 if [ "$failures" -ne 0 ]; then
 	exit 1
+fi
+if [ "$total" -eq 0 ]; then
+	echo "lane-shadow-test.sh: nothing ran ($skipped skipped)"
+	exit 3
 fi

@@ -54,6 +54,7 @@ usage() {
 usage: jir-coverage.sh [--fixtures] [--fingerprintjs] [--sysroot-args '<backend options>']
 
   --fixtures        measure examples/{tests,core-tests,dom-tests,async-tests,native-tests}
+                    (dom-tests is skipped without a view-dom-macro/ framework checkout)
   --fingerprintjs   measure the FingerprintJS idiomatic and compact ports
   --sysroot-args    extra backend options for every compilation (and so for the sysroot)
 
@@ -277,6 +278,14 @@ measure_native_tests() {
 
 measure_dom_tests() {
 	echo "==> examples/dom-tests"
+	# Framework-specific: every fixture needs `view_dom_macro`, which this repository does not
+	# carry (CONTRACT.md, "The suite" under "Templates"). Excluded by name rather than by a failed
+	# cargo build, so the summary says why the suite is missing from the total.
+	if [ ! -f "$root/view-dom-macro/Cargo.toml" ]; then
+		echo "    skipped: framework-specific suite (needs view_dom_macro; see CONTRACT.md)"
+		record dom-tests '(suite)' skipped-needs-framework "" ""
+		return
+	fi
 	# The options scripts/dom-test.sh compiles its fixtures with, less the `js-names=readable`
 	# it spells out: readable names are the default, and naming a default costs a sysroot of its
 	# own here for output that is identical either way.

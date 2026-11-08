@@ -2,6 +2,14 @@
 #
 # The DOM suite: `view!` fixtures compiled to ES modules and run against the contract's stub.
 #
+# FRAMEWORK-SPECIFIC, AND SKIPPED HERE. Every fixture in examples/dom-tests needs `view_dom_macro`,
+# a Topcoat framework crate this repository deliberately does not carry (CONTRACT.md, "The suite"
+# under "Templates"). Without a `view-dom-macro/` checkout the script prints a SKIP line and exits
+# 3 before building anything: a skip is neither a pass nor a failure, and the exit code says so.
+# The rest of the script is kept intact for a framework checkout. The generic compiler behaviour
+# these fixtures used to pin is covered by scripts/host-loop-callbacks-test.sh and
+# scripts/host-event-access-test.sh.
+#
 #   scripts/dom-test.sh                  # check every fixture
 #   scripts/dom-test.sh 01_simple_elements
 #   UPDATE_EXPECT=1 scripts/dom-test.sh  # rewrite the goldens from the output
@@ -52,6 +60,12 @@ set -uo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd -- "$script_dir/.." && pwd)
+
+# Exit code 3 is SKIP, distinct from 0 (passed), 1 (failed) and 2 (usage).
+if [ ! -f "$root/view-dom-macro/Cargo.toml" ]; then
+	echo "SKIP: framework-specific suite (needs view_dom_macro; see CONTRACT.md)"
+	exit 3
+fi
 
 fixture_dir="$root/examples/dom-tests"
 build_dir="$root/build/domtest"
