@@ -11,6 +11,7 @@ pub mod async_graph;
 pub(crate) mod async_ready;
 pub mod cost;
 pub mod graph;
+pub(crate) mod lowering_reuse;
 pub mod mincut;
 pub mod physical;
 pub mod physical_cost;

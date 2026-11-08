@@ -43,6 +43,11 @@ counters! {
     LowerReprProgram => "lower_item.repr_program",
     LowerPhysical => "lower_item.physical",
     LowerInline => "lower_item.inline",
+    // Whole-program trials that reused an item's neutral lowering instead (`plan::lowering_reuse`),
+    // and the fresh lowerings `RCGJS_COST_REUSE_VERIFY=1` compared those reuses against.
+    LowerPhysicalReused => "lower_item.physical_reused",
+    LowerReprReused => "lower_item.repr_reused",
+    LowerReuseVerified => "lower_item.reuse_verified",
     // Phase C's own lowerings (`lane::lower_all`), which do not go through `cost::lower_item`.
     LowerFinal => "lower.final",
     // Whole-program trials: representation `program_cost`, physical `physical_program_metrics`.

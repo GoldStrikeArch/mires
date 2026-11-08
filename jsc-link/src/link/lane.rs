@@ -718,13 +718,22 @@ pub(crate) fn run(
     let mut economics = None;
     if !plan.is_empty() {
         let _scope = crate::profile::scope("lane.B2.physical");
+        let mut reuse = crate::plan::lowering_reuse::Reuse::physical();
         let (selected, evaluation) = crate::plan::physical_cost::evaluate_groups(
             &planning_table,
             &planned_funcs,
             &plan,
             opts,
             abi_applied,
-            |candidate| physical_program_metrics(&planning_table, &planned_funcs, candidate, &ctx),
+            |candidate| {
+                physical_program_metrics(
+                    &planning_table,
+                    &planned_funcs,
+                    candidate,
+                    &ctx,
+                    &mut reuse,
+                )
+            },
         );
         plan = selected;
         economics = Some(evaluation);
@@ -1086,13 +1095,19 @@ fn lower_input_with_retargets<'a>(
 }
 
 /// Builds the exact compact program for one physical ABI label vector.
+///
+/// `reuse` hands back the lowering of every function the trial provably leaves at its neutral
+/// input (`plan::lowering_reuse`); everything after the per-item lowering runs over the whole
+/// program.
 fn physical_program_metrics(
     source_table: &BTreeMap<JsName, LinkItem>,
     source_funcs: &BTreeMap<JsName, Result<Func, Decline>>,
     abi: &AbiPlan,
     ctx: &Ctx<'_>,
+    reuse: &mut crate::plan::lowering_reuse::Reuse,
 ) -> Option<crate::plan::physical_cost::ProgramMetrics> {
     crate::profile::bump(crate::profile::Counter::TrialPhysical);
+    reuse.begin_trial(source_table, source_funcs, ctx.opts);
     let mut opts = ctx.opts.clone();
     opts.optimizer = crate::opts::OptimizerMode::On;
     opts.minify = true;
@@ -1132,47 +1147,22 @@ fn physical_program_metrics(
         // ABI, just as the final phase-C pass does, or those candidates price as byte-identical
         // to the baseline and can never be selected.
         input.abi = Some(abi);
-        crate::profile::bump(crate::profile::Counter::LowerPhysical);
-        match crate::plan::cost::lower_item(&input, func) {
-            Ok(measured) => {
-                let sites = crate::analysis::js_alloc::JsAllocSites::of(&measured.lowered.decl);
-                allocation_terms.insert(
-                    name.clone(),
-                    (sites.total(), sites.in_loop(), measured.alloc_term),
-                );
-                direct_calls.insert(
-                    name.clone(),
-                    sites
-                        .direct_calls()
-                        .iter()
-                        .map(|callee| JsName::new(callee.clone()))
-                        .collect(),
-                );
-                loop_calls.insert(
-                    name.clone(),
-                    sites
-                        .loop_calls()
-                        .iter()
-                        .map(|callee| JsName::new(callee.clone()))
-                        .collect(),
-                );
-                lowered.push((name.clone(), measured.lowered));
+        match reuse.lower_physical(abi, name, &input, func) {
+            Ok(lowering) => {
+                allocation_terms.insert(name.clone(), lowering.alloc);
+                direct_calls.insert(name.clone(), lowering.direct_calls);
+                loop_calls.insert(name.clone(), lowering.loop_calls);
+                lowered.push((name.clone(), lowering.js, lowering.refs));
             }
             Err(_) if abi.touches(name) => return None,
             Err(_) => {}
         }
     }
 
-    for (name, lowered) in lowered {
+    for (name, js, refs) in lowered {
         let item = table.get_mut(&name)?;
-        let mut decl = lowered.decl;
-        crate::minify::shorten_locals_for_measurement(&mut decl);
-        item.js = jsast::program_to_string_styled_for_target(
-            std::slice::from_ref(&decl),
-            jsast::Style::Compact,
-            crate::opts::get().ecma_target,
-        );
-        item.refs = lowered.refs;
+        item.js = js;
+        item.refs = refs;
     }
     for spill in abi.spill_items() {
         table.insert(spill.name.clone(), spill);

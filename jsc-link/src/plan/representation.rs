@@ -64,6 +64,7 @@ use crate::lower::semantic_ops::{
 use crate::lower::LowerInput;
 use crate::plan::cost::{self, INF};
 use crate::plan::graph::{Cap, Problem, ProblemKey};
+use crate::plan::lowering_reuse::{Lowering, Reuse};
 use crate::plan::{mincut, versions};
 
 /// What one lane pass hands B1: the option set and the program-wide indexes the cost model's
@@ -296,18 +297,6 @@ pub(crate) fn clone_link_item(mut source: LinkItem, name: &JsName) -> LinkItem {
     source.dts = None;
     source.debug_path = format!("{} [native version]", source.debug_path);
     source
-}
-
-/// The compact declaration used only by D9's hypothetical program table.
-fn install_compact(item: &mut LinkItem, lowered: crate::lower::LoweredItem) {
-    let mut decl = lowered.decl;
-    crate::minify::shorten_locals_for_measurement(&mut decl);
-    item.js = jsast::program_to_string_styled_for_target(
-        std::slice::from_ref(&decl),
-        jsast::Style::Compact,
-        crate::opts::get().ecma_target,
-    );
-    item.refs = lowered.refs;
 }
 
 /// A registry replacement as the ordinary lowering record D9 installs in its cloned table.
@@ -627,7 +616,8 @@ impl Planner<'_> {
                 }
             }
         }
-        let measured_baseline = self.program_cost(&Commit::default());
+        let mut reuse = Reuse::representation();
+        let measured_baseline = self.program_cost(&Commit::default(), &mut reuse);
         let exact_available = measured_baseline.is_some();
         let baseline = measured_baseline.unwrap_or_else(|| self.fallback_program_cost());
         let economics = CarrierEconomics::from_opts(self.cx.opts);
@@ -635,12 +625,12 @@ impl Planner<'_> {
         let baseline_labels = vec![None; count];
         let mut measured: BTreeMap<Vec<Option<Carrier>>, Option<ProgramCost>> =
             BTreeMap::from([(baseline_labels, Some(baseline))]);
-        let measure_vector = |labels: &[Option<Carrier>]| {
+        let mut measure_vector = |labels: &[Option<Carrier>]| {
             if !exact_available {
                 return None;
             }
             match self.build_commit(problem, labels, &ops, false) {
-                Ok(commit) => self.program_cost(&commit),
+                Ok(commit) => self.program_cost(&commit, &mut reuse),
                 Err((_, reason)) => {
                     if std::env::var("RCGJS_REPR_DEBUG_COST").is_ok() {
                         eprintln!("repr-cost: commit declined: {reason}");
@@ -1540,8 +1530,13 @@ impl Planner<'_> {
     /// adapters, the flat ABI, final reachability, link deduplication, profile-selected item
     /// naming, unique runtime helpers, and the allocation term. A decline anywhere in a rewritten
     /// function makes the vector unmeasurable and therefore unprofitable.
-    fn program_cost(&self, commit: &Commit) -> Option<ProgramCost> {
+    ///
+    /// `reuse` hands back the lowering of every function the commit and its ABI plan provably
+    /// leave at its neutral input (`plan::lowering_reuse`); everything after the per-item lowering
+    /// runs over the whole program.
+    fn program_cost(&self, commit: &Commit, reuse: &mut Reuse) -> Option<ProgramCost> {
         crate::profile::bump(crate::profile::Counter::TrialReprProgram);
+        reuse.begin_trial(self.table, self.funcs, self.cx.opts);
         let mut opts = self.cx.opts.clone();
         opts.optimizer = crate::opts::OptimizerMode::On;
         if !matches!(
@@ -1583,93 +1578,70 @@ impl Planner<'_> {
         let mut direct_calls: BTreeMap<JsName, BTreeSet<JsName>> = BTreeMap::new();
         let mut loop_calls: BTreeMap<JsName, BTreeSet<JsName>> = BTreeMap::new();
         for (name, entry) in &funcs {
-            if let Some(body) = commit.bodies.get(name) {
-                let native = native_lowered(name, body);
-                let sites = crate::analysis::js_alloc::JsAllocSites::of(&native.decl);
-                allocation_terms.insert(
-                    name.clone(),
-                    (
-                        sites.total(),
-                        sites.in_loop(),
-                        cost::Cost::new(&opts).alloc_term(&sites),
-                    ),
-                );
-                direct_calls.insert(
-                    name.clone(),
-                    sites
-                        .direct_calls()
-                        .iter()
-                        .map(|callee| JsName::new(callee.clone()))
-                        .collect(),
-                );
-                loop_calls.insert(
-                    name.clone(),
-                    sites
-                        .loop_calls()
-                        .iter()
-                        .map(|callee| JsName::new(callee.clone()))
-                        .collect(),
-                );
-                lowered.push((name.clone(), native));
-                continue;
-            }
-            let Ok(func) = entry else {
-                if commit.funcs.contains_key(name) || abi.touches(name) {
-                    return None;
-                }
-                continue;
-            };
-            let item = table.get(name)?;
-            let retargets = commit
-                .call_retargets
-                .get(name)
-                .unwrap_or(crate::lower::EMPTY_CALL_RETARGETS);
-            let input = self.lower_input_with(name, item, &opts, abi.spill_names(), retargets)?;
-            crate::profile::bump(crate::profile::Counter::LowerReprProgram);
-            let measured = match cost::lower_item(&input, func) {
-                Ok(measured) => measured,
-                Err(decline) => {
-                    if std::env::var("RCGJS_REPR_DEBUG_COST").is_ok() {
-                        eprintln!(
-                            "repr-cost: decline {} (carrier={}, abi={}): {decline}",
-                            name.as_str(),
-                            commit.funcs.contains_key(name),
-                            abi.touches(name),
-                        );
-                    }
+            let lowering = if let Some(body) = commit.bodies.get(name) {
+                Lowering::new(native_lowered(name, body), |sites| {
+                    cost::Cost::new(&opts).alloc_term(sites)
+                })
+            } else {
+                let Ok(func) = entry else {
                     if commit.funcs.contains_key(name) || abi.touches(name) {
                         return None;
                     }
                     continue;
+                };
+                let item = table.get(name)?;
+                let retargets = commit
+                    .call_retargets
+                    .get(name)
+                    .unwrap_or(crate::lower::EMPTY_CALL_RETARGETS);
+                let input =
+                    self.lower_input_with(name, item, &opts, abi.spill_names(), retargets)?;
+                let committed = commit.funcs.contains_key(name)
+                    || commit.clones.contains_key(name)
+                    || !retargets.is_empty();
+                let describe = || {
+                    let names = |names: Vec<&JsName>| {
+                        names
+                            .into_iter()
+                            .map(JsName::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    format!(
+                        "funcs [{}], bodies [{}], clones [{}]",
+                        names(commit.funcs.keys().collect()),
+                        names(commit.bodies.keys().collect()),
+                        names(commit.clones.keys().collect()),
+                    )
+                };
+                match reuse.lower_representation(&abi, committed, name, &input, func, describe) {
+                    Ok(lowering) => lowering,
+                    Err(decline) => {
+                        if std::env::var("RCGJS_REPR_DEBUG_COST").is_ok() {
+                            eprintln!(
+                                "repr-cost: decline {} (carrier={}, abi={}): {decline}",
+                                name.as_str(),
+                                commit.funcs.contains_key(name),
+                                abi.touches(name),
+                            );
+                        }
+                        if commit.funcs.contains_key(name) || abi.touches(name) {
+                            return None;
+                        }
+                        continue;
+                    }
                 }
             };
-            let sites = crate::analysis::js_alloc::JsAllocSites::of(&measured.lowered.decl);
-            allocation_terms.insert(
-                name.clone(),
-                (sites.total(), sites.in_loop(), measured.alloc_term),
-            );
-            direct_calls.insert(
-                name.clone(),
-                sites
-                    .direct_calls()
-                    .iter()
-                    .map(|callee| JsName::new(callee.clone()))
-                    .collect(),
-            );
-            loop_calls.insert(
-                name.clone(),
-                sites
-                    .loop_calls()
-                    .iter()
-                    .map(|callee| JsName::new(callee.clone()))
-                    .collect(),
-            );
-            lowered.push((name.clone(), measured.lowered));
+            allocation_terms.insert(name.clone(), lowering.alloc);
+            direct_calls.insert(name.clone(), lowering.direct_calls);
+            loop_calls.insert(name.clone(), lowering.loop_calls);
+            lowered.push((name.clone(), lowering.js, lowering.refs));
         }
 
-        for (name, lowered) in lowered {
+        for (name, js, refs) in lowered {
             let item = table.get_mut(&name)?;
-            install_compact(item, lowered);
+            item.js = js;
+            item.refs = refs;
         }
         for spill in abi.spill_items() {
             table.insert(spill.name.clone(), spill);
