@@ -40,4 +40,5 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 
 ## Known gaps discovered (not blocking the current stage)
 - `Rc<[Z]>` built via `Rc::from(vec![Z;n])` fails on the JIR lane with `__rt.retype_rc: this pointer does not name a live heap block` (passes on the default lane). Pre-existing; found by the 1a verifier (fixture scratchpad/verify1a/fx/rc_vec.rs).
-- `scripts/active-poll-cleanup-test.sh` exits 1 in all 6 modes at baseline (runs without js-cleanup=on). Investigate whether the script or its expectations are stale before relying on it as a gate.
+- [x] `scripts/active-poll-cleanup-test.sh` was stale (never requested js-cleanup=on); now a real gate (60/60 + baseline refusal). Open: same trap bug in scripts/compile.sh:116; wire the gate into check.sh/CI after 3a's check.sh edit lands.
+- Runtime: on the current build, compiled Rust is 43–146x slower per call than the JS originals (marked 146x, minisearch 68x, fflate 43x; harness commit 75d30a2). Diagnosis running; this, not scaffolding, is the runtime problem.
