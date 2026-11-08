@@ -10,6 +10,7 @@
 //   node experiments/v2-restoration/measure.mjs --label R0
 //     [--targets compact,idiomatic,pro,corpus] [--no-build] [--force]
 //     [--pro-timeout-min 15] [--pro-optimizer on|off] [--samples 9] [--warmups 2]
+//     [--browsers chrome,firefox,safari]
 
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
@@ -30,6 +31,8 @@ const TARGETS = ['compact', 'idiomatic', 'pro', 'corpus']
 // `run.mjs --pure` benchmarks.
 const CORPUS_WORKLOADS = ['minisearch', 'marked', 'fflate', 'idb', 'idb_lines', 'ky', 'uplot', 'explorer', 'workbox', 'workbox_direct']
 const CORPUS_TIMED = ['marked', 'minisearch', 'fflate']
+// Browsers the corpus runner can time in (run.mjs --browsers); none means `run.mjs --pure`.
+const CORPUS_BROWSERS = ['chrome', 'firefox', 'safari']
 const COST_PROFILE_PREFIX = 'rcgjs-cost-profile:'
 const SCHEMA = 1
 
@@ -487,7 +490,9 @@ function collectInputs({ label, options, specs, argv }) {
       brotli: 'node:zlib brotliCompressSync quality 11, lgwin 22',
       fetchedTotal: 'each fetched resource counted once: a package entry bundle plus any worker bundle it loads; shims are inside the bundles',
       linkCost: '/usr/bin/time -l around the whole package build tool: wall seconds, and max RSS of the largest single process in the tree',
-      runtime: `experiments/browser-workloads/tools/run.mjs --pure, ${options.samples} samples after ${options.warmups} warmups; ms per sample of N calls`,
+      runtime: `experiments/browser-workloads/tools/run.mjs ${corpusRunMode(options.browsers).join(' ')}, ${options.samples} samples after ${options.warmups} warmups; `
+        + 'pureBenchmarks: ms per sample of N calls in Node; paired timing (tools/timing-protocol.mjs): ms per call of the Rust build against the pinned JS reference '
+        + 'and against a second Rust instance (A/A), per environment, rust/js ratio = Rust p50 / JS p50',
     },
     targets: Object.fromEntries(options.targets.map((name) => [name, {
       command: ['node', specs[name].tool, ...specs[name].args],
@@ -653,37 +658,89 @@ function runKernels(name, spec, labelDir) {
   }
 }
 
-function runCorpusTiming(options, labelDir) {
-  const receipt = resolve(labelDir, 'receipts', 'corpus-runtime.json')
-  const logPath = resolve(labelDir, 'logs', 'corpus-runtime.log')
-  const args = ['experiments/browser-workloads/tools/run.mjs', '--pure',
-    '--samples', String(options.samples), '--warmups', String(options.warmups), '--output', receipt]
-  const result = spawnSync(process.execPath, args, { cwd: repoRoot, encoding: 'utf8' })
-  writeFileSync(logPath, `${result.stdout ?? ''}${result.stderr ?? ''}`)
-  const record = readJsonOrNull(receipt)
+// `--pure` (Node only) without browsers; otherwise the runner's browser path, which also runs its
+// browser checks and, with Chrome, the service-worker lifecycle.
+export function corpusRunMode(browsers) {
+  return browsers.length === 0 ? ['--pure'] : ['--browsers', browsers.join(',')]
+}
+
+// The numbers measure.mjs keeps from a corpus run.mjs receipt. Per workload: the Node
+// pureBenchmarks fields (unchanged), plus the Node paired-timing ratios. `timing` carries the paired
+// protocol's per-arm rows and per-cell comparisons for every environment, the reference library
+// versions and the machine load average at the start and end of the run.
+export function corpusRuntimeFromReceipt(record) {
+  const comparisons = record?.timing?.comparisons ?? []
+  const rows = record?.timing?.rows ?? []
+  const comparison = (environmentKey, workload, kind) => comparisons.find((entry) =>
+    entry.environmentKey === environmentKey && entry.workload === workload && entry.comparison === kind)
+  const row = (environmentKey, workload, arm) => rows.find((entry) =>
+    entry.environmentKey === environmentKey && entry.workload === workload && entry.pair === 'rust-vs-js' && entry.arm === arm)
   const workloads = {}
   for (const name of CORPUS_TIMED) {
     const bench = record?.pureBenchmarks?.[name]
-    workloads[name] = bench?.milliseconds ? {
-      p50: bench.milliseconds.p50,
-      p95: bench.milliseconds.p95,
-      min: bench.milliseconds.min,
-      max: bench.milliseconds.max,
-      samples: bench.milliseconds.count,
-      callsPerSample: bench.iterations,
-      checksum: bench.checksum,
-    } : { error: bench?.error ?? 'no benchmark record' }
+    const main = comparison('node', name, 'rust/js')
+    const control = comparison('node', name, 'A/A')
+    workloads[name] = {
+      ...(bench?.milliseconds ? {
+        p50: bench.milliseconds.p50,
+        p95: bench.milliseconds.p95,
+        min: bench.milliseconds.min,
+        max: bench.milliseconds.max,
+        samples: bench.milliseconds.count,
+        callsPerSample: bench.iterations,
+        checksum: bench.checksum,
+      } : { error: bench?.error ?? 'no benchmark record' }),
+      rustP50PerCall: row('node', name, 'rust')?.p50 ?? null,
+      jsP50PerCall: row('node', name, 'js')?.p50 ?? null,
+      rustJsRatio: main?.status === 'ok' ? main.ratio : null,
+      rustJsPairedRatio: main?.status === 'ok' ? main.pairedRatio : null,
+      aaRatio: control?.status === 'ok' ? control.ratio : null,
+      timingStatus: main ? `${main.status}/${control?.status ?? 'missing'}` : 'missing',
+    }
   }
+  const timing = record?.timing
+  return {
+    workloads,
+    timing: timing ? {
+      protocolVersion: timing.protocol?.version ?? null,
+      loadAverage: timing.loadAverage ?? null,
+      references: Object.fromEntries(Object.entries(timing.references ?? {})
+        .map(([name, reference]) => [name, { package: reference.package, version: reference.version ?? null, pinned: reference.pinned ?? null }])),
+      environments: Object.fromEntries(Object.entries(timing.environments ?? {}).map(([key, environment]) => [key, {
+        status: environment.status,
+        label: environment.environment?.label ?? key,
+        ...(environment.environment?.driver ? { driver: environment.environment.driver } : {}),
+        ...(environment.reason ? { reason: environment.reason } : {}),
+      }])),
+      rows,
+      comparisons,
+    } : null,
+  }
+}
+
+function runCorpusTiming(options, labelDir) {
+  const receipt = resolve(labelDir, 'receipts', 'corpus-runtime.json')
+  const logPath = resolve(labelDir, 'logs', 'corpus-runtime.log')
+  const args = ['experiments/browser-workloads/tools/run.mjs', ...corpusRunMode(options.browsers),
+    '--samples', String(options.samples), '--warmups', String(options.warmups), '--output', receipt]
+  const result = spawnSync(process.execPath, args, { cwd: repoRoot, encoding: 'utf8', maxBuffer: 64 << 20 })
+  writeFileSync(logPath, `${result.stdout ?? ''}${result.stderr ?? ''}`)
+  const record = readJsonOrNull(receipt)
+  const { workloads, timing } = corpusRuntimeFromReceipt(record)
   return {
     status: record ? (record.status?.passed ? 'passed' : 'failed') : 'failed',
     exitCode: result.status,
     command: ['node', ...args.map((arg) => (arg === receipt ? rel(receipt) : arg))],
-    unit: 'milliseconds per sample; one sample runs callsPerSample calls',
+    browsers: options.browsers,
+    unit: 'p50/p95/min/max: milliseconds per sample of callsPerSample calls (pureBenchmarks); *PerCall and timing rows: milliseconds per call',
     purePassed: record?.status?.purePassed ?? null,
+    timingPassed: record?.status?.timingPassed ?? null,
+    browserPassed: options.browsers.length === 0 ? null : record?.status?.browserPassed ?? null,
     buildReceiptMatched: record?.status?.buildReceiptMatched ?? null,
     receipt: rel(receipt),
     log: rel(logPath),
     workloads,
+    timing,
   }
 }
 
@@ -695,6 +752,36 @@ const dash = '—'
 const fmt = (value, digits = 0) => (value === null || value === undefined ? dash : Number(value).toFixed(digits))
 
 const displayName = (name, specs) => (name === 'pro' && specs.pro.optimizer === 'off' ? 'pro (opt-off)' : name)
+
+// The RESULTS.md runtime tables for a corpus runtime record. The first table keeps the original
+// Node pureBenchmarks columns and appends the Node paired-timing ratios; browser environments, when
+// timed, get a second table, and an unavailable browser is a status row with no numbers.
+export function corpusRuntimeLines(corpus) {
+  const lines = ['', '| workload | p50 ms | p95 ms | calls/sample | samples | rust/js ratio | A/A ratio |',
+    '| --- | ---: | ---: | ---: | ---: | ---: | ---: |']
+  for (const [name, bench] of Object.entries(corpus.workloads)) {
+    lines.push(`| ${name} | ${fmt(bench.p50, 2)} | ${fmt(bench.p95, 2)} | ${fmt(bench.callsPerSample)} | ${fmt(bench.samples)} | ${fmt(bench.rustJsRatio, 2)} | ${fmt(bench.aaRatio, 3)} |`)
+  }
+  const environments = Object.entries(corpus.timing?.environments ?? {}).filter(([key]) => key !== 'node')
+  if (environments.length === 0) return lines
+  lines.push('', '| environment | workload | rust ms/call p50 | js ms/call p50 | rust/js ratio | A/A ratio | status |',
+    '| --- | --- | ---: | ---: | ---: | ---: | --- |')
+  const { rows, comparisons } = corpus.timing
+  for (const [key, environment] of environments) {
+    const cells = comparisons.filter((entry) => entry.environmentKey === key && entry.workload)
+    if (cells.length === 0) {
+      lines.push(`| ${environment.label} | ${dash} | ${dash} | ${dash} | ${dash} | ${dash} | ${environment.status}${environment.reason ? `: ${String(environment.reason).split('\n')[0].replaceAll('|', '/').slice(0, 160)}` : ''} |`)
+      continue
+    }
+    for (const workload of CORPUS_TIMED) {
+      const main = cells.find((entry) => entry.workload === workload && entry.comparison === 'rust/js')
+      const control = cells.find((entry) => entry.workload === workload && entry.comparison === 'A/A')
+      const p50 = (arm) => rows.find((entry) => entry.environmentKey === key && entry.workload === workload && entry.pair === 'rust-vs-js' && entry.arm === arm)?.p50
+      lines.push(`| ${environment.label} | ${workload} | ${fmt(p50('rust'), 3)} | ${fmt(p50('js'), 3)} | ${fmt(main?.status === 'ok' ? main.ratio : null, 2)} | ${fmt(control?.status === 'ok' ? control.ratio : null, 3)} | ${main?.status ?? 'missing'}/${control?.status ?? 'missing'} |`)
+    }
+  }
+  return lines
+}
 
 // The only Pro information allowed into public receipts: status, and wall time and peak RSS when
 // the build completed.
@@ -748,14 +835,18 @@ function resultsBlock({ inputs, specs, sizes, cost, runtime, receiptsDir, extraL
       lines.push(`| ${displayName(name, specs)} | ${fmt(build.wallSeconds, 1)} | ${fmt(build.peakRssMiB)} | ${status} |`)
     }
   }
+  if (runtime.corpus) lines.push(...corpusRuntimeLines(runtime.corpus))
+  const notes = []
   if (runtime.corpus) {
-    lines.push('', '| workload | p50 ms | p95 ms | calls/sample | samples |', '| --- | ---: | ---: | ---: | ---: |')
-    for (const [name, bench] of Object.entries(runtime.corpus.workloads)) {
-      lines.push(`| ${name} | ${fmt(bench.p50, 2)} | ${fmt(bench.p95, 2)} | ${fmt(bench.callsPerSample)} | ${fmt(bench.samples)} |`)
+    const browsers = runtime.corpus.browsers ?? []
+    notes.push(`corpus ${browsers.length === 0 ? 'pure run' : `run (browsers: ${browsers.join(',')})`}: ${runtime.corpus.status}`)
+    const timing = runtime.corpus.timing
+    if (timing) {
+      const references = Object.values(timing.references).map((reference) => `${reference.package} ${reference.version ?? 'missing'}`).join(', ')
+      const load = (values) => (values ? values.map((value) => fmt(value, 1)).join('/') : dash)
+      notes.push(`paired timing ${runtime.corpus.timingPassed ? 'passed' : 'failed'} vs ${references}; load avg (1/5/15 min) ${load(timing.loadAverage?.start)} at start, ${load(timing.loadAverage?.end)} at end`)
     }
   }
-  const notes = []
-  if (runtime.corpus) notes.push(`corpus pure run: ${runtime.corpus.status}`)
   for (const [name, kernels] of Object.entries(runtime.kernels)) {
     notes.push(`${name} kernels: ${kernels.total === null || kernels.total === undefined ? kernels.status : `${kernels.passed}/${kernels.total}`}`)
   }
@@ -781,9 +872,10 @@ function appendResults(path, header, block) {
 
 const USAGE = `usage: node experiments/v2-restoration/measure.mjs --label <name>
   [--targets ${TARGETS.join(',')}] [--no-build] [--force]
-  [--pro-timeout-min 15] [--pro-optimizer on|off] [--samples 9] [--warmups 2]`
+  [--pro-timeout-min 15] [--pro-optimizer on|off] [--samples 9] [--warmups 2]
+  [--browsers ${CORPUS_BROWSERS.join(',')}]`
 
-function parseOptions(argv) {
+export function parseOptions(argv) {
   const { values } = parseArgs({
     args: argv,
     strict: true,
@@ -796,6 +888,7 @@ function parseOptions(argv) {
       'pro-optimizer': { type: 'string', default: 'on' },
       samples: { type: 'string', default: '9' },
       warmups: { type: 'string', default: '2' },
+      browsers: { type: 'string', default: '' },
       help: { type: 'boolean', short: 'h', default: false },
     },
   })
@@ -817,6 +910,8 @@ function parseOptions(argv) {
   const warmups = Number(values.warmups)
   if (!Number.isInteger(samples) || samples < 1) fail('--samples must be a positive integer')
   if (!Number.isInteger(warmups) || warmups < 0) fail('--warmups must be a non-negative integer')
+  const browsers = [...new Set(values.browsers.split(',').map((name) => name.trim()).filter(Boolean))]
+  for (const name of browsers) if (!CORPUS_BROWSERS.includes(name)) fail(`unknown browser: ${name} (expected ${CORPUS_BROWSERS.join(', ')})`)
   return {
     label: values.label,
     force: values.force,
@@ -827,6 +922,7 @@ function parseOptions(argv) {
       proOptimizer: values['pro-optimizer'],
       samples,
       warmups,
+      browsers,
     },
   }
 }
@@ -935,7 +1031,7 @@ async function main() {
 
   const runtime = { schema: SCHEMA, label, corpus: null, kernels: {} }
   if (options.targets.includes('corpus')) {
-    process.stdout.write(`measure: timing corpus workloads (${options.samples} samples, ${options.warmups} warmups)\n`)
+    process.stdout.write(`measure: timing corpus workloads (${options.samples} samples, ${options.warmups} warmups${options.browsers.length ? `, browsers ${options.browsers.join(',')}` : ''})\n`)
     runtime.corpus = runCorpusTiming(options, labelDir)
   }
   for (const name of options.targets.filter((target) => specs[target].kernels)) {
@@ -1030,7 +1126,19 @@ function summarize({ inputs, sizes, cost, decisions, runtime }) {
     runtime: runtime.corpus ? {
       status: runtime.corpus.status,
       workloads: Object.fromEntries(Object.entries(runtime.corpus.workloads)
-        .map(([name, bench]) => [name, { p50: bench.p50 ?? null, p95: bench.p95 ?? null, callsPerSample: bench.callsPerSample ?? null }])),
+        .map(([name, bench]) => [name, {
+          p50: bench.p50 ?? null, p95: bench.p95 ?? null, callsPerSample: bench.callsPerSample ?? null,
+          rustJsRatio: bench.rustJsRatio ?? null, aaRatio: bench.aaRatio ?? null,
+        }])),
+      browsers: runtime.corpus.browsers ?? [],
+      timing: runtime.corpus.timing ? {
+        environments: runtime.corpus.timing.environments,
+        loadAverage: runtime.corpus.timing.loadAverage,
+        comparisons: runtime.corpus.timing.comparisons.map((entry) => ({
+          environment: entry.environment, workload: entry.workload ?? null, comparison: entry.comparison ?? null,
+          status: entry.status, ratio: entry.ratio ?? null,
+        })),
+      } : null,
     } : null,
     kernels: Object.fromEntries(Object.entries(runtime.kernels)
       .map(([name, kernels]) => [name, { status: kernels.status, passed: kernels.passed ?? null, total: kernels.total ?? null }])),

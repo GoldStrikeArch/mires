@@ -5,7 +5,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 
-import { parseCostProfile, parseTimeOutput, privateStatusLine, runTimed, targetSpecs } from './measure.mjs'
+import {
+  corpusRunMode, corpusRuntimeFromReceipt, corpusRuntimeLines, parseCostProfile, parseOptions, parseTimeOutput,
+  privateStatusLine, runTimed, targetSpecs,
+} from './measure.mjs'
 
 function isAlive(pid) {
   try {
@@ -114,4 +117,82 @@ test('the public line for a private target carries only status, wall time and pe
   assert.equal(privateStatusLine('pro', { status: 'timed-out', wallSeconds: null, peakRssMiB: null, timeoutMinutes: 15 }, on), 'pro: timed-out')
   assert.equal(privateStatusLine('pro', { status: 'failed', wallSeconds: 12.3, peakRssMiB: 900 }, on), 'pro: failed')
   assert.equal(privateStatusLine('pro', { status: 'not-built', wallSeconds: null, peakRssMiB: null }, off), 'pro (opt-off): skipped')
+})
+
+test('--browsers defaults to none (pure only), validates names and passes through to the corpus runner', () => {
+  assert.deepEqual(parseOptions(['--label', 'x']).options.browsers, [])
+  assert.deepEqual(corpusRunMode([]), ['--pure'])
+  const { options } = parseOptions(['--label', 'x', '--browsers', 'chrome, firefox,chrome,,safari'])
+  assert.deepEqual(options.browsers, ['chrome', 'firefox', 'safari'])
+  assert.deepEqual(corpusRunMode(options.browsers), ['--browsers', 'chrome,firefox,safari'])
+  assert.throws(() => parseOptions(['--label', 'x', '--browsers', 'chrome,opera']), /unknown browser: opera/)
+})
+
+// A minimal run.mjs receipt: Node pureBenchmarks plus the paired-timing rows and comparisons for
+// Node and Chrome, and an unavailable Safari.
+function corpusReceipt() {
+  const bench = (p50, iterations) => ({ checksum: 1, iterations, milliseconds: { count: 5, min: p50 - 1, p50, p95: p50 + 1, max: p50 + 2 } })
+  const row = (environmentKey, workload, arm, p50) => ({ environmentKey, workload, pair: 'rust-vs-js', arm, p50 })
+  const comparison = (environmentKey, workload, kind, ratio, status = 'ok') =>
+    ({ environmentKey, environment: environmentKey, workload, comparison: kind, status, ratio, pairedRatio: ratio })
+  const rows = []
+  const comparisons = []
+  for (const [workload, rust, js] of [['marked', 100, 0.5], ['minisearch', 1.5, 0.025], ['fflate', 6, 0.2]]) {
+    for (const key of ['node', 'chrome']) {
+      rows.push(row(key, workload, 'rust', rust), row(key, workload, 'js', js))
+      comparisons.push(comparison(key, workload, 'rust/js', rust / js), comparison(key, workload, 'A/A', 1.01))
+    }
+  }
+  comparisons.find((entry) => entry.environmentKey === 'chrome' && entry.workload === 'fflate' && entry.comparison === 'rust/js').status = 'checksum-mismatch'
+  comparisons.push({ environmentKey: 'safari', environment: 'safari', status: 'unavailable', reason: 'Remote automation is off | enable it' })
+  return {
+    status: { passed: false, purePassed: true, timingPassed: false },
+    pureBenchmarks: { marked: bench(400, 5), minisearch: bench(5, 4), fflate: bench(20, 3) },
+    timing: {
+      protocol: { version: 1 },
+      loadAverage: { start: [12, 10, 9], end: [14, 11, 9] },
+      references: { marked: { package: 'marked', version: '18.1.1', pinned: '18.1.1', entry: {} } },
+      environments: {
+        node: { status: 'ok', environment: { label: 'node v26.8.1' }, cells: [] },
+        chrome: { status: 'failed', environment: { label: 'chrome 157.0', driver: '157.0 (x)' }, cells: [] },
+        safari: { status: 'unavailable', reason: 'Remote automation is off | enable it', cells: [] },
+      },
+      rows,
+      comparisons,
+    },
+  }
+}
+
+test('corpus runtime keeps the pureBenchmarks fields and adds the Node rust/js and A/A ratios', () => {
+  const { workloads, timing } = corpusRuntimeFromReceipt(corpusReceipt())
+  assert.deepEqual(Object.keys(workloads), ['marked', 'minisearch', 'fflate'])
+  assert.equal(workloads.marked.p50, 400)
+  assert.equal(workloads.marked.callsPerSample, 5)
+  assert.equal(workloads.marked.samples, 5)
+  assert.equal(workloads.marked.rustJsRatio, 200)
+  assert.equal(workloads.marked.aaRatio, 1.01)
+  assert.equal(workloads.marked.rustP50PerCall, 100)
+  assert.equal(workloads.marked.jsP50PerCall, 0.5)
+  assert.equal(workloads.marked.timingStatus, 'ok/ok')
+  assert.deepEqual(timing.references.marked, { package: 'marked', version: '18.1.1', pinned: '18.1.1' })
+  assert.deepEqual(timing.environments.safari, { status: 'unavailable', label: 'safari', reason: 'Remote automation is off | enable it' })
+  assert.deepEqual(timing.loadAverage, { start: [12, 10, 9], end: [14, 11, 9] })
+  // A receipt from before paired timing still yields the original fields and null ratios.
+  const legacy = corpusRuntimeFromReceipt({ pureBenchmarks: corpusReceipt().pureBenchmarks })
+  assert.equal(legacy.workloads.fflate.p50, 20)
+  assert.equal(legacy.workloads.fflate.rustJsRatio, null)
+  assert.equal(legacy.timing, null)
+})
+
+test('the RESULTS.md runtime table appends ratio columns; browsers get their own rows, never numbers when unavailable', () => {
+  const lines = corpusRuntimeLines(corpusRuntimeFromReceipt(corpusReceipt()))
+  assert.equal(lines[1], '| workload | p50 ms | p95 ms | calls/sample | samples | rust/js ratio | A/A ratio |')
+  assert.equal(lines[3], '| marked | 400.00 | 401.00 | 5 | 5 | 200.00 | 1.010 |')
+  assert.ok(lines.includes('| chrome 157.0 | marked | 100.000 | 0.500 | 200.00 | 1.010 | ok/ok |'))
+  assert.ok(lines.includes('| chrome 157.0 | fflate | 6.000 | 0.200 | — | 1.010 | checksum-mismatch/ok |'))
+  assert.ok(lines.includes('| safari | — | — | — | — | — | unavailable: Remote automation is off / enable it |'))
+  assert.ok(!lines.some((line) => line.startsWith('| node')), 'Node ratios live in the first table only')
+  const pureOnly = corpusRuntimeLines(corpusRuntimeFromReceipt({ ...corpusReceipt(), timing: { ...corpusReceipt().timing,
+    environments: { node: corpusReceipt().timing.environments.node } } }))
+  assert.equal(pureOnly.length, 6, 'no browser table without browser environments')
 })

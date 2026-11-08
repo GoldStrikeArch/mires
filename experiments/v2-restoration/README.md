@@ -10,9 +10,10 @@ node experiments/v2-restoration/measure.mjs --label R0
   [--no-build]                               # measure existing artifacts only (built: false)
   [--pro-timeout-min 15]                     # wall-clock limit for the Pro build
   [--pro-optimizer on|off]                   # off = the optimizer-off control build
-  [--samples 9 --warmups 2]                  # corpus Node timing
+  [--samples 9 --warmups 2]                  # corpus timing samples and warmups
+  [--browsers chrome,firefox,safari]         # corpus timing in browsers too (default: none, Node only)
   [--force]                                  # replace an existing build/v2-restoration/<label>/
-node --test experiments/v2-restoration/measure.test.mjs   # timeout / process-tree kill / parsers
+node --test experiments/v2-restoration/measure.test.mjs   # timeout / process-tree kill / parsers / runtime table
 ```
 
 Each run writes `build/v2-restoration/<label>/` and appends one block to [RESULTS.md](RESULTS.md).
@@ -75,7 +76,7 @@ Files are relative to `build/v2-restoration/<label>/`. For Pro they are relative
 | `sizes.json` | per artifact: bytes, sha256, gzip, brotli, mtime, status, and the unminified counterpart's bytes; fetched totals; corpus cross-check against `results/build.json` |
 | `compile-cost.json` | per build: status, exit code, wall/user/sys seconds, max RSS, command, log path, the `cargo` crates compiled during the build, whether the sysroot was rebuilt, cost-profile blocks (`costProfile.links[]` with `order`, `output`, `attributedBy`, `counters`), and the kill report after a timeout |
 | `decisions.json` | per link (Pro: main and worker; corpus: per workload): applied and would-apply counts (sroa, ast_dce, inline, devirt), range, inline declines by reason (including `inline.exceptional-control-flow`), fallback count, ABI/physical/repr decisions, item lanes, optimizer-report totals, and emitted-code counts from `raw/program.js`: bytes, `^function ` items, `try{`, `if(__rt.is_abort(`, `__rt.` helper references by name. Each source report's path, sha256 and status are included. |
-| `runtime.json` | corpus `run.mjs --pure` p50/p95/min/max per timed workload (marked, minisearch, fflate) and the offline kernel checks (`experiments/tools/check-oss-kernels.mjs`) for compact and idiomatic |
+| `runtime.json` | corpus `run.mjs` per timed workload (marked, minisearch, fflate): the Node `pureBenchmarks` p50/p95/min/max per sample, plus the paired timing: Node per-call p50 of Rust and of the JS reference, `rustJsRatio`, `rustJsPairedRatio` and `aaRatio`. `corpus.timing` holds the reference versions, the load average at start and end, every environment's status and identity (browser version and driver; `unavailable` with the reason when a browser could not start), and every per-arm row and per-cell comparison from the corpus receipt. Also the offline kernel checks (`experiments/tools/check-oss-kernels.mjs`) for compact and idiomatic. |
 | `summary.json` | the headline numbers from all of the above |
 | `logs/` | `<target>-build.log` (stdout+stderr), `<target>-build.time.txt` (`/usr/bin/time -l`), runtime and kernel logs |
 | `receipts/` | the sub-tools' own receipts: corpus build and runtime receipts, kernel receipts |
@@ -116,10 +117,22 @@ Build statuses are `ok`, `failed` (non-zero exit), `timed-out` and `not-built`.
   descendant that left the group. Anything still alive after 5 s gets SIGKILL. The build is recorded
   as `status: "timed-out"` with `timeoutMinutes` and a kill report (`survivors` must be empty), and
   never with a duration. Ctrl-C on `measure.mjs` stops the active build the same way.
-- **Runtime.** `experiments/browser-workloads/tools/run.mjs --pure --samples N --warmups M` in Node.
-  One sample is the time for `callsPerSample` calls, in milliseconds. p50 and p95 are order
-  statistics over the samples. The run also checks the corpus outputs and that `dist/` matches
-  `results/build.json`.
+- **Runtime.** `experiments/browser-workloads/tools/run.mjs --pure --samples N --warmups M`, or,
+  with `--browsers <list>`, `run.mjs --browsers <list> --samples N --warmups M`. The browser form
+  also runs the corpus browser checks and, with Chrome, the service-worker lifecycle. The run checks
+  the corpus outputs and that `dist/` matches `results/build.json`. It records two kinds of timing:
+  - `pureBenchmarks` (Node only, unchanged). One sample is the time for `callsPerSample` calls, in
+    milliseconds. p50 and p95 are order statistics over the samples. These are the first table's
+    original columns.
+  - Paired timing ([protocol](../browser-workloads/README.md#runtime-timing-against-javascript-references)).
+    In each environment (Node, plus each browser), every timed workload runs one cell against the
+    pinned JS reference library and one A/A cell against a second Rust instance. Each cell runs in a
+    fresh process or page, measures cold import separately, and passes a checksum gate before any
+    timing. Arm order is randomized per round. The `rust/js ratio` column is Rust per-call p50 / JS
+    per-call p50 in Node. The `A/A ratio` column is the same statistic for Rust against itself, so it
+    shows how noisy the run was. Browser environments get a second table. A browser that could not
+    start is a status row with its reason and no numbers. The block's notes line gives the reference
+    versions and the load average (`os.loadavg()`, 1/5/15 min) at the start and end of the corpus run.
 - **Compiler identity.** `sourceIdentity` reuses the method of
   [docs/v2-source-identity.json](../../docs/v2-source-identity.json). Its input is every git-visible
   (tracked or untracked, non-ignored) file under the recorded top-level directories plus the
