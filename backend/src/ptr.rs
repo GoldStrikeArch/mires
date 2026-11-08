@@ -349,15 +349,17 @@ pub(crate) fn cmp<'tcx>(
 ///
 /// Not implemented yet: the pointer value is handed back as it is, which is exact for an address
 /// and meaningless for a record. The specification: `__rt.addr(p, size_of::<pointee>())`, which
-/// assigns every buffer a synthetic base address of `4096 * n` on first sight (a `WeakMap`, so the
-/// same buffer keeps its base) and returns `base + off * size`, or `base + off` for a scaled slot,
+/// assigns every buffer a synthetic base address on first sight (a power-of-two granule of at least
+/// 16 bytes from a free list or a bump pointer starting at 4096; a `WeakMap`, so the same buffer
+/// keeps its base) and returns `base + off * size`, or `base + off` for a scaled slot,
 /// or the number itself for an address.
 ///
 /// The scheme is chosen for four guarantees rather than convenience:
 ///
 /// * `is_null()` is false for every real pointer and true only for `null()`, because a base is
 ///   never zero;
-/// * `NonNull::dangling()` is an alignment, which is below 4096, so it never collides with a base;
+/// * `NonNull::dangling()` is an alignment, which is below the first bump address 4096 and is never
+///   handed out as a granule, so it never collides with a base;
 /// * an address is a multiple of the element size, so alignment predicates answer correctly;
 /// * `fmt::Arguments::as_str` tests `bits & 1`, and its element is 8 bytes wide, so the answer is
 ///   deterministic.

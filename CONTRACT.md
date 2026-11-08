@@ -873,7 +873,8 @@ most 4096, and its base is a multiple of that granule — aligned for every type
 hold, since a type's alignment divides its size. A heap block's size is its `Layout` size; another
 buffer's is its length times the element size of the first `addr` asked of it. An alignment the
 size does not imply — a hand-built `Layout` whose alignment exceeds its size, or an over-aligned
-element first addressed through a byte pointer — is honoured only up to 16. Granules come from a
+element first addressed through a byte pointer — is honoured only up to the buffer's granule
+(at least 16). Granules come from a
 per-size free list first, then from a bump pointer starting at 4096 (whose alignment gaps are
 split into smaller free granules). `dealloc` gives a heap
 block's granule back — the freed buffer keeps its entry, so a dangling pointer still answers the

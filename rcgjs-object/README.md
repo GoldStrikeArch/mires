@@ -276,7 +276,7 @@ mean in JavaScript.
   `__rt.offset(p, count, size)` (`shim.js:315-320`); `offset_from` is `a.off - b.off`,
   `__rt.offset_from(a, b)` for indirect pointees, `l - r` for ZST pointees (`ptr.rs:370-390`).
   Comparison `__rt.ptr_eq(a, b)` (`shim.js:281-291`, ignores `len`), `__rt.ptr_cmp(a, b, size) op 0`;
-  address `__rt.addr(p, size)` (`shim.js:209-236`, a synthetic `4096 * n` base per buffer).
+  address `__rt.addr(p, size)` (`shim.js:209-236`, a synthetic power-of-two granule base per buffer, reused after free).
 - Casts (`ptr.rs:634-878`) go through the shim: `__rt.box(v)` (`shim.js:113-121`, `{ buf: [v],
   off: 0 }` memoized per object), `__rt.erase`, `__rt.scale`/`unscale`, `__rt.retype`,
   `__rt.unwindow`/`unwindow_slice`, `__rt.unref`, `__rt.thin`, `__rt.chunk_slice`,
