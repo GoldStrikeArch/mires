@@ -23,8 +23,8 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 
 ## Stage 3 — remove provably unnecessary cleanup edges (P07)
 - [ ] 3a RemoveNoopLandingPads after ElaborateDrops — finding: under panic=abort the vendored pass never ran; 91% of cleanup bodies had only bare `resume` pads. Guarded run: compact gzip 110.6→106.1 KB. Full fix (body selection keyed on pre-removal state) measured 60.7 KB gzip / 610 tries; being delivered with backend/coroutine_source.rs + driver.rs changes.
-- [ ] 3b plan/cleanup.rs: EmptyChain + NoThrow (may_throw summary), witnesses, report
-- [ ] 3c no empty try for dead protected op
+- [ ] 3b plan/cleanup.rs: EmptyChain + NoThrow (may_throw summary), witnesses, report — implemented (pre-3a baseline): compact gzip 110.6→54.9 KB, try 4,182→196, core suite 138/138; under verification
+- [ ] 3c no empty try for dead protected op — covered by 3b (92→0) via no-throw proofs for markers/cold_path/nop calls
 - [ ] cleanup-edges tests + CONTRACT.md note; R2a row
 
 ## Stage 4 — optimize cleanup-bearing bodies (P08/P09-lite)
@@ -40,3 +40,4 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 
 ## Known gaps discovered (not blocking the current stage)
 - `Rc<[Z]>` built via `Rc::from(vec![Z;n])` fails on the JIR lane with `__rt.retype_rc: this pointer does not name a live heap block` (passes on the default lane). Pre-existing; found by the 1a verifier (fixture scratchpad/verify1a/fx/rc_vec.rs).
+- `scripts/active-poll-cleanup-test.sh` exits 1 in all 6 modes at baseline (runs without js-cleanup=on). Investigate whether the script or its expectations are stale before relying on it as a gate.
