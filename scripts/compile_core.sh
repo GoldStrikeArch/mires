@@ -191,7 +191,13 @@ channel=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p
 rm -f "$out"
 
 stderr_file="$out_dir/.compile-core-stderr.$$"
-trap 'rm -f "$stderr_file"' EXIT
+# This trap replaces the one integration-lock.sh installed, so it releases the lock itself. A nested
+# invocation runs under its caller's lock, defines no release function, and leaves the lock alone.
+cleanup() {
+	rm -f "$stderr_file"
+	if declare -F release_integration_lock >/dev/null; then release_integration_lock; fi
+}
+trap cleanup EXIT
 
 # Rustc tracks the path but not the backend file's contents.
 backend_args=(-Cllvm-args="js-producer=$(jsc_sha256_file "$dylib")")
