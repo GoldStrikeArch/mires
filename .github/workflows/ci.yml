@@ -23,5 +23,6 @@ jobs:
       - run: node scripts/standalone-check.mjs
       - run: SKIP_BUILD=1 bash scripts/cleanup-smoke.sh
       - run: SKIP_BUILD=1 bash scripts/noop-landing-pads-test.sh
+      - run: python3 scripts/cleanup-transport-test.py
       - run: bash scripts/cleanup-admission-test.sh
       - run: cargo +stable run --manifest-path examples/standalone-consumer/Cargo.toml

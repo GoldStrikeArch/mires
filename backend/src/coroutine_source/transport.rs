@@ -7,12 +7,13 @@ use rustc_middle::ty::{GenericArgs, Instance};
 use rustc_session::config::CrateType;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 const MAGIC: &[u8] = b"RCGJS-MIR-3\0";
 const MAX_BYTES: usize = 512 * 1024 * 1024;
 static OUTPUT: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-static INPUT: Mutex<BTreeMap<CrateNum, Option<Arc<CrateMir>>>> = Mutex::new(BTreeMap::new());
+static INPUT: Mutex<BTreeMap<CrateNum, Arc<CrateMir>>> = Mutex::new(BTreeMap::new());
 
 #[derive(Serialize, Deserialize)]
 struct CrateMir {
@@ -99,7 +100,7 @@ pub(super) fn body<'tcx>(tcx: TyCtxt<'tcx>, def: DefId) -> Option<Body<'tcx>> {
             INPUT.lock().unwrap().insert(def.krate, value.clone());
             value
         }
-    }?;
+    };
     let identity = crate::jir::types::definition_id(tcx, def);
     let index = input.definitions.iter().position(|id| *id == identity)?;
     let body = input.mir.body_at(tcx, index);
@@ -129,11 +130,43 @@ pub(super) fn body<'tcx>(tcx: TyCtxt<'tcx>, def: DefId) -> Option<Body<'tcx>> {
     Some(body)
 }
 
-fn read(tcx: TyCtxt<'_>, krate: CrateNum) -> Result<Option<Arc<CrateMir>>, String> {
-    let Some(path) = &tcx.used_crate_source(krate).rlib else {
-        return Ok(None);
+/// The rlib that carries `krate`'s cleanup MIR archive.
+///
+/// A direct `--extern` or `--sysroot` hands rustc the rlib itself. Cargo hands a dependent rlib
+/// only the dependency's `.rmeta` (pipelining, which current cargo cannot turn off): that is how
+/// the sysroot's `alloc` sees `core`. Cargo writes the archive beside it under the same stem,
+/// `deps/lib<name>-<hash>.{rmeta,rlib}`; [`read`] proves it is the same compilation through the
+/// crate hash and producer identity rather than assuming it. Without the archive the generics of
+/// `krate` would be lowered from the optimized MIR in its metadata, whose cleanup paths
+/// `-Cpanic=abort` removed, so a missing archive is an error and never a silent fallback.
+fn archive_path(tcx: TyCtxt<'_>, krate: CrateNum) -> Result<PathBuf, String> {
+    let source = tcx.used_crate_source(krate);
+    if let Some(rlib) = &source.rlib {
+        return Ok(rlib.clone());
+    }
+    let name = tcx.crate_name(krate);
+    let Some(rmeta) = &source.rmeta else {
+        return Err(format!(
+            "cleanup MIR of `{name}` is unavailable: rustc was given no rlib for it"
+        ));
     };
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read cleanup MIR library: {e}"))?;
+    let rlib = rmeta.with_extension("rlib");
+    if rlib.is_file() {
+        return Ok(rlib);
+    }
+    Err(format!(
+        "cleanup MIR of `{name}` is unavailable: rustc was given only its metadata `{}`, and \
+         no rlib exists beside it; build `{name}` completely before its dependents",
+        rmeta.display()
+    ))
+}
+
+/// `krate`'s cleanup MIR archive. Every rlib this backend writes with cleanup enabled carries
+/// one, even when it holds no body, so an rlib without one was not built with these options.
+fn read(tcx: TyCtxt<'_>, krate: CrateNum) -> Result<Arc<CrateMir>, String> {
+    let path = archive_path(tcx, krate)?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| format!("cannot read cleanup MIR library `{}`: {e}", path.display()))?;
     let archive = object::read::archive::ArchiveFile::parse(&*bytes).map_err(|e| e.to_string())?;
     let mut result = None;
     for member in archive.members() {
@@ -186,5 +219,10 @@ fn read(tcx: TyCtxt<'_>, krate: CrateNum) -> Result<Option<Arc<CrateMir>>, Strin
         }
         result = Some(Arc::new(value));
     }
-    Ok(result)
+    result.ok_or_else(|| {
+        format!(
+            "`{}` carries no cleanup MIR archive; rebuild it with `js-cleanup=on`",
+            path.display()
+        )
+    })
 }

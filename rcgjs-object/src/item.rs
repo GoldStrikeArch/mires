@@ -124,6 +124,13 @@ impl ZombieKind {
     }
 }
 
+/// How the zombie of an item that owes cleanup but carries no JIR body begins: its baseline text
+/// cannot run its cleanup paths. The producer records it and the linker keeps it through
+/// duplicate resolution, so a reachable copy that owes cleanup fails the link rather than losing
+/// its destructors to a copy lowered from MIR without cleanup.
+pub const CLEANUP_LOWERING_REQUIRED: &str =
+    "requires semantic cleanup lowering; baseline fallback would discard its cleanup paths";
+
 /// Something the backend could not lower, standing in the emitted JavaScript as a runtime abort.
 ///
 /// Nothing is reported when a zombie is recorded. `link.rs` reports the ones the program can

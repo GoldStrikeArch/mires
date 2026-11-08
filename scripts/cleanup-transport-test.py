@@ -1,7 +1,16 @@
 """Verify generic cleanup transport, incremental edits, and producer identity.
 
-Usage: cleanup-transport-test.py WORK SYSROOT off|report|on
-The sysroot must have matching cleanup-enabled, minified ES2018 emit options.
+Usage: cleanup-transport-test.py [WORK SYSROOT off|report|on]
+The sysroot must have matching cleanup-enabled, minified ES2018 emit options. Without arguments the
+test runs `on` in build/cleanup-transport against the `js-profile=release-balanced` sysroot, which
+it builds when missing (the backend itself must already be built).
+
+The metadata cases compile a crate against its dependency's `.rmeta` alone, the way cargo compiles
+the sysroot's `alloc` against `core`: its copy of the dependency's generic must still come from the
+cleanup MIR in the rlib beside that `.rmeta`, and without that rlib the compilation must fail.
+`guarded::<fn() -> u32>` is instantiated in two crates, so two objects carry a copy and the kept
+copy must have cleanup edges. The sysroot's own `alloc` copy of `core::iter::adapters::try_process`
+must have them too.
 """
 
 import hashlib
@@ -15,8 +24,20 @@ import subprocess
 import sys
 
 root = Path(__file__).resolve().parent.parent
-work, sysroot = (Path(value).resolve() for value in sys.argv[1:3])
-mode = sys.argv[3]
+if len(sys.argv) == 1:
+    work = root / "build/cleanup-transport"
+    shutil.rmtree(work, ignore_errors=True)
+    subprocess.run(["cargo", "build", "-p", "js-extern-macro", "--locked"], cwd=root, check=True,
+                   capture_output=True)
+    built = subprocess.run(["bash", "scripts/build_sysroot.sh"], cwd=root, check=True,
+                           capture_output=True, text=True,
+                           env=dict(os.environ, SKIP_BUILD="1",
+                                    JS_EXTRA_ARGS="js-profile=release-balanced"))
+    sysroot = Path(re.findall(r"^==> (?:reusing )?sysroot: (.+)$", built.stdout, re.MULTILINE)[-1])
+    mode = "on"
+else:
+    work, sysroot = (Path(value).resolve() for value in sys.argv[1:3])
+    mode = sys.argv[3]
 assert mode in ["off", "report", "on"]
 work.mkdir()
 suffix = ".dylib" if platform.system() == "Darwin" else ".so"
@@ -160,9 +181,90 @@ run("runtime-only-execute", ["node", "--input-type=module", "-e",
     "import {calc} from " + json.dumps(program.as_uri()) +
     "; if (calc() !== 42) throw Error('wrong result'); console.log(42);"])
 assert json.loads(program.with_suffix(".mjs.lane.json").read_text())["fallback_count"] == 0
+
+metadata = work / "metadata"
+metadata.mkdir()
+fixtures = root / "examples/cross-crate-tests"
+# Each crate instantiates the generics it uses, as at the optimization levels the packages build
+# with, so `guarded::<fn() -> u32>` has a copy in both the middle crate and the client.
+separate = base + ["-Zshare-generics=no", "-Cllvm-args=" + flags]
+run("metadata-provider", separate + [
+    "--crate-type=rlib", "--crate-name=cleanup_metadata_provider", "--emit=metadata,link",
+    "--out-dir", str(metadata), str(fixtures / "cleanup_metadata_provider.rs")])
+
+
+def middle(name, provider, error=None):
+    return run(name, separate + [
+        "--crate-type=rlib", "--crate-name=cleanup_metadata_middle",
+        "--extern", "cleanup_metadata_provider=" + str(provider / "libcleanup_metadata_provider.rmeta"),
+        "-Ldependency=" + str(provider), "-o", str(provider / "libcleanup_metadata_middle.rlib"),
+        str(fixtures / "cleanup_metadata_middle.rs")], error)
+
+
+middle("metadata-middle", metadata)
+assert "cleanup-mir-import: " in (work / "metadata-middle.log").read_text()
+metadata_program = metadata / "program.js"
+lane_report = metadata / "lane.json"
+run("metadata-client", separate + [
+    "--crate-type=cdylib", "--crate-name=cleanup_metadata_client",
+    "--extern", "cleanup_metadata_middle=" + str(metadata / "libcleanup_metadata_middle.rlib"),
+    "--extern", "cleanup_metadata_provider=" + str(metadata / "libcleanup_metadata_provider.rlib"),
+    "-Ldependency=" + str(metadata), "-Cllvm-args=js-lane=jir js-lane-report=" + str(lane_report),
+    "-o", str(metadata_program), str(fixtures / "cleanup_metadata_client.rs")])
+run("metadata-execute", ["node", "-e", r"""
+const fs = require('node:fs')
+const vm = require('node:vm')
+const [program, shim] = process.argv.slice(1)
+const context = vm.createContext({ TextDecoder, TextEncoder })
+vm.runInContext(fs.readFileSync(shim, 'utf8'), context)
+const drops = []
+context.__rt.js_log_f64 = (value) => drops.push(Number(value))
+const marker = new Error('host marker')
+context.__rt.host_throw = () => { throw marker }
+vm.runInContext(fs.readFileSync(program, 'utf8'), context)
+const cases = [
+  ['single copy', 7, 12, (throwing) => context.metadata_host_throw(throwing)],
+  ['middle copy call', 9, 14, (throwing) => context.shared_host_throw(throwing, false)],
+  ['client copy call', 11, 16, (throwing) => context.shared_host_throw(throwing, true)],
+]
+for (const [name, guard, value, call] of cases) {
+  drops.length = 0
+  const result = call(false)
+  if (result !== value || JSON.stringify(drops) !== JSON.stringify([guard])) {
+    throw new Error(`${name}: returned ${result}, dropped ${JSON.stringify(drops)}`)
+  }
+  drops.length = 0
+  let caught
+  try { call(true) } catch (error) { caught = error }
+  if (caught !== marker || JSON.stringify(drops) !== JSON.stringify([guard])) {
+    throw new Error(`${name} host throw: caught ${caught === marker ? 'the marker' : String(caught)}, dropped ${JSON.stringify(drops)}`)
+  }
+}
+console.log('metadata transport: destructors run on host throws')
+""", str(metadata_program), str(root / "runtime/shim.js")])
+rows_by_prefix = {}
+for row in json.loads(lane_report.read_text())["items"]:
+    for prefix in ["cleanup_metadata_provider$guarded$", "core$iter$adapters$try_process$"]:
+        if row["name"].startswith(prefix):
+            rows_by_prefix.setdefault(prefix, []).append(row)
+assert len(rows_by_prefix.get("cleanup_metadata_provider$guarded$", [])) == 2, rows_by_prefix
+assert rows_by_prefix.get("core$iter$adapters$try_process$"), rows_by_prefix
+for rows in rows_by_prefix.values():
+    for row in rows:
+        assert "unwind" in row["class"], row
+print("metadata-lane-report PASS", flush=True)
+metadata_only = work / "metadata-only"
+metadata_only.mkdir()
+shutil.copyfile(metadata / "libcleanup_metadata_provider.rmeta",
+                metadata_only / "libcleanup_metadata_provider.rmeta")
+middle("metadata-rlib-absent", metadata_only,
+       "cleanup MIR of `cleanup_metadata_provider` is unavailable")
+
 (work / "result.json").write_text(json.dumps(dict(
     passed=True, mode=mode, runtimeCases=141, producerIdentityChecked=True,
     coldWarmCguReuse=True, changedWarmCguReuse=True, removedSourceMapPreserved=True,
-    runtimeNamespacePrepared=True,
+    runtimeNamespacePrepared=True, metadataOnlyDependencyImported=True,
+    metadataOnlyDependencyWithoutRlibRefused=True, duplicateCopiesKeepCleanup=True,
+    allocCoreGenericCarriesCleanup=True,
     backendSha256=hashlib.sha256(backend.read_bytes()).hexdigest(),
 ), indent=2) + "\n")

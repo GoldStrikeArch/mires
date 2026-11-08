@@ -137,9 +137,13 @@ fn codegen_cgu_inner(tcx: TyCtxt<'_>, cgu_name: Symbol) -> JsModule {
                         && crate::coroutine_source::cleanup_body(tcx, instance).is_some()
                     {
                         item.zombies.push(rcgjs_object::item::Zombie {
-                            loc: tcx.sess.source_map().span_to_diagnostic_string(tcx.def_span(instance.def_id())),
+                            loc: tcx
+                                .sess
+                                .source_map()
+                                .span_to_diagnostic_string(tcx.def_span(instance.def_id())),
                             message: format!(
-                                "requires semantic cleanup lowering; baseline fallback would discard its cleanup paths (encoding: {:?})",
+                                "{} (encoding: {:?})",
+                                rcgjs_object::item::CLEANUP_LOWERING_REQUIRED,
                                 item.jir_decline
                             ),
                             span: None,

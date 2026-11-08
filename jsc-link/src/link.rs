@@ -44,7 +44,7 @@ use rcgjs_object::artifact::{
 use crate::diag::Sink;
 use crate::item::{
     prologue, read_object, write_program, ItemKind, ItemMap, JsName, LinkItem, Linkage,
-    FORMAT_VERSION,
+    CLEANUP_LOWERING_REQUIRED, FORMAT_VERSION,
 };
 use crate::jir::conflict::{self, ConflictRecord};
 use crate::jir::summary::{MergeDecision, Side};
@@ -1212,8 +1212,7 @@ fn reject_cleanup_fallbacks(
             continue;
         }
         let mut diagnostic = dcx.struct_err(format!(
-            "rustc_codegen_js: `{name}` requires semantic cleanup lowering; \
-             baseline fallback would discard its cleanup paths"
+            "rustc_codegen_js: `{name}` {CLEANUP_LOWERING_REQUIRED}"
         ));
         if let Some(decline) = outcome.and_then(|outcome| outcome.decline.as_ref()) {
             diagnostic.note(format!("JIR lowering declined: {decline}"));
@@ -1297,7 +1296,8 @@ fn write_lane_report(
 /// * different Rust items under one JavaScript name — still a hard error, and now the only one;
 /// * equal normalized bodies — merge, keeping either;
 /// * a body on one side only — keep the side that has one;
-/// * different normalized bodies — keep the smaller hash and record the choice for the autopsy.
+/// * different normalized bodies — keep the one with cleanup edges when only one has them, else
+///   the smaller hash, and record the choice for the autopsy.
 ///
 /// Format 19 objects and link-synthesized items carry no summary; those fall back to v1's text
 /// comparison, which is all there is to go on. That path disappears with format 19.
@@ -1326,7 +1326,34 @@ fn dedup(
     table
 }
 
+/// Whether a copy's producer recorded that it owes cleanup it could not lower: it has no JIR body,
+/// and its baseline text carries the [`CLEANUP_LOWERING_REQUIRED`] zombie instead.
+fn declined_cleanup(item: &LinkItem) -> bool {
+    !item.jir.has_body()
+        && item
+            .zombies
+            .iter()
+            .any(|zombie| zombie.message.starts_with(CLEANUP_LOWERING_REQUIRED))
+}
+
+/// Whether a copy's JIR body has cleanup edges, by its summary.
+fn cleanup_body(item: &LinkItem) -> bool {
+    item.jir.summary.as_ref().is_some_and(|summary| {
+        summary
+            .class
+            .contains(crate::jir::summary::ItemClass::UNWIND)
+    })
+}
+
 /// Acts on one [`MergeDecision`], folding the loser's metadata into the winner either way.
+///
+/// A cleanup obligation survives deduplication. Between two bodies,
+/// [`crate::jir::summary::merge_duplicates`] already keeps the one with cleanup edges. A copy that
+/// owes cleanup but declined encoding ([`declined_cleanup`]) is kept, zombie and all, over a copy
+/// whose body has no cleanup edges: the two were lowered from one Rust body, so the second came
+/// from MIR that had lost its cleanup paths. If that copy is reachable its zombie fails the link,
+/// which is the fail-closed outcome; nothing of the losing body is folded in, because
+/// [`LinkItem::merge_duplicate_metadata`] would hand it the cleanup-free body.
 fn apply_duplicate(
     dcx: &Sink,
     existing: &mut LinkItem,
@@ -1334,6 +1361,16 @@ fn apply_duplicate(
     decision: MergeDecision,
     conflicts: &mut Vec<ConflictRecord>,
 ) {
+    if !matches!(decision, MergeDecision::Error(_)) {
+        let owes = |item: &LinkItem| declined_cleanup(item) || cleanup_body(item);
+        if declined_cleanup(&item) && !owes(existing) {
+            adopt_body(existing, item);
+            return;
+        }
+        if declined_cleanup(existing) && !owes(&item) {
+            return;
+        }
+    }
     match decision {
         MergeDecision::Merge => {
             existing.merge_physical_summary(&item);
@@ -2304,6 +2341,135 @@ mod tests {
             &mut conflicts,
         );
         assert_eq!(dcx.errors(), 1);
+    }
+
+    /// A copy of `name` with a body (`hash`), with or without cleanup edges in its summary.
+    fn body_copy(name: &str, hash: u64, cleanup: bool) -> LinkItem {
+        let mut copy = duplicate(
+            name,
+            &format!("function {name}(){{/*{hash}*/}}"),
+            Some(1),
+            Some(hash),
+        );
+        let summary = copy.jir.summary.as_mut().expect("a summary");
+        summary.body = Some(Default::default());
+        if cleanup {
+            summary.class.insert(crate::jir::summary::ItemClass::UNWIND);
+        }
+        copy
+    }
+
+    /// A copy of `name` that owes cleanup but declined encoding, as the producer writes it.
+    fn declined_cleanup_copy(name: &str) -> LinkItem {
+        let mut copy = duplicate(
+            name,
+            &format!("function {name}(){{/*declined*/}}"),
+            Some(1),
+            None,
+        );
+        copy.zombies.push(crate::item::FlatZombie {
+            loc: "src/lib.rs:1:1".to_owned(),
+            message: format!("{CLEANUP_LOWERING_REQUIRED} (encoding: None)"),
+            kind: crate::item::ZombieKind::Unsupported,
+        });
+        copy
+    }
+
+    fn kept(table: &BTreeMap<JsName, LinkItem>, name: &str) -> LinkItem {
+        table[&JsName::new(name.to_owned())].clone()
+    }
+
+    /// The copy lowered from MIR that kept its cleanup paths survives even when the copy lowered
+    /// from MIR that lost them (rustc's optimized MIR under `-Cpanic=abort`) has the smaller hash,
+    /// whichever order the objects were read in. With cleanup on both sides the smaller hash wins.
+    #[test]
+    fn a_copy_with_cleanup_edges_beats_a_smaller_hash_without_them() {
+        for (cleanup_low, cleanup_high, expected) in [
+            (false, true, 9u64),
+            (true, false, 4),
+            (true, true, 4),
+            (false, false, 4),
+        ] {
+            for reversed in [false, true] {
+                let dcx = Sink::new();
+                let mut conflicts = Vec::new();
+                let mut items = vec![
+                    body_copy("f", 4, cleanup_low),
+                    body_copy("f", 9, cleanup_high),
+                ];
+                if reversed {
+                    items.reverse();
+                }
+                let table = dedup(&dcx, items, &mut conflicts);
+                assert_eq!(dcx.errors(), 0);
+                assert_eq!(conflicts.len(), 1);
+                let summary = kept(&table, "f").jir.summary.expect("a summary");
+                assert_eq!(
+                    summary.semantic_hash,
+                    Some(Hash128 {
+                        lo: expected,
+                        hi: 0
+                    })
+                );
+            }
+        }
+    }
+
+    /// A copy that owes cleanup but has no body is kept, zombie and all, over a body without
+    /// cleanup edges, so a reachable use fails the link instead of losing its destructors. A body
+    /// with cleanup edges is the faithful copy and is kept over both.
+    #[test]
+    fn a_declined_cleanup_copy_is_not_replaced_by_a_body_without_cleanup() {
+        let orders = |items: Vec<LinkItem>| {
+            let mut reversed = items.clone();
+            reversed.reverse();
+            [items, reversed]
+        };
+        for items in orders(vec![declined_cleanup_copy("f"), body_copy("f", 3, false)])
+            .into_iter()
+            .chain(orders(vec![
+                declined_cleanup_copy("f"),
+                duplicate("f", "function f(){}", Some(1), None),
+            ]))
+        {
+            let dcx = Sink::new();
+            let table = dedup(&dcx, items, &mut Vec::new());
+            let f = kept(&table, "f");
+            assert!(
+                !f.jir.has_body(),
+                "the cleanup-free body must not be adopted"
+            );
+            assert!(f.zombies[0].message.starts_with(CLEANUP_LOWERING_REQUIRED));
+            let (reachable, parents) = reach_from(&table, std::slice::from_ref(&f.name));
+            report_zombies(
+                &dcx,
+                &table,
+                &reachable,
+                &parents,
+                None,
+                &mut BTreeSet::new(),
+            );
+            assert_eq!(
+                dcx.errors(),
+                1,
+                "a reachable copy that owes cleanup fails the link"
+            );
+        }
+        for items in orders(vec![
+            declined_cleanup_copy("f"),
+            body_copy("f", 3, true),
+            body_copy("f", 2, false),
+        ]) {
+            let dcx = Sink::new();
+            let table = dedup(&dcx, items, &mut Vec::new());
+            let f = kept(&table, "f");
+            assert_eq!(dcx.errors(), 0);
+            assert!(f.zombies.is_empty());
+            assert_eq!(
+                f.jir.summary.and_then(|summary| summary.semantic_hash),
+                Some(Hash128 { lo: 3, hi: 0 })
+            );
+        }
     }
 
     /// An item encoded in one crate and declined in another keeps the body that exists, with no

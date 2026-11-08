@@ -1687,7 +1687,8 @@ pub enum Side {
 /// | different [`SemanticKey`], same `link_name` | [`MergeDecision::Error`] |
 /// | same key, equal normalized hash | [`MergeDecision::Merge`] — keep either body, union the origins |
 /// | same key, one body only | [`MergeDecision::Available`] — keep the side that has one |
-/// | same key, different normalized hashes | [`MergeDecision::Choose`] — keep the smaller hash |
+/// | same key, different normalized hashes, cleanup edges on one side only | [`MergeDecision::Choose`] — keep the side with cleanup edges |
+/// | same key, different normalized hashes, otherwise | [`MergeDecision::Choose`] — keep the smaller hash |
 ///
 /// A body difference is never unavailability. v1's `DUPLICATE_CONFLICT` degrade
 /// ([`super::decline::MergeDecline::Conflict`]) has no case left here.
@@ -1700,8 +1701,8 @@ pub enum MergeDecision {
     Available(Side),
     /// Both sides carry a body and the normal forms differ. Keep `keep`'s body, whose hash is
     /// `chosen`, and drop the other, whose hash is `rejected`; record `decline` against the item.
-    /// `chosen` is always the smaller hash, so the outcome does not depend on the order objects
-    /// were read in.
+    /// See [`choose_body`]: the choice depends only on the two summaries, so the outcome does not
+    /// depend on the order objects were read in.
     Choose {
         keep: Side,
         chosen: Hash128,
@@ -1764,28 +1765,7 @@ pub fn merge_duplicates(a: &ItemSummary, b: &ItemSummary) -> MergeDecision {
             right: b.key.item,
         });
     }
-    match (a.semantic_hash, b.semantic_hash) {
-        (None, None) => MergeDecision::Merge,
-        (Some(_), None) => MergeDecision::Available(Side::Left),
-        (None, Some(_)) => MergeDecision::Available(Side::Right),
-        (Some(left), Some(right)) if left == right => MergeDecision::Merge,
-        (Some(left), Some(right)) => {
-            let (keep, chosen, rejected) = if left < right {
-                (Side::Left, left, right)
-            } else {
-                (Side::Right, right, left)
-            };
-            MergeDecision::Choose {
-                keep,
-                chosen,
-                rejected,
-                decline: Decline::Merge(MergeDecline::BodyChoice {
-                    chosen: hash_key(chosen),
-                    rejected: hash_key(rejected),
-                }),
-            }
-        }
-    }
+    choose_body(a, b)
 }
 
 /// What the linker does with two items the **text** dedup pass proved interchangeable.
@@ -1799,17 +1779,38 @@ pub fn merge_duplicates(a: &ItemSummary, b: &ItemSummary) -> MergeDecision {
 /// item.
 ///
 /// So this is [`merge_duplicates`] without the identity check: never an error, never a loss of
-/// availability, and a deterministic min-hash pick recorded as
+/// availability, and the deterministic [`choose_body`] pick recorded as
 /// [`MergeDecline::BodyChoice`] when the bodies differ. v1 instead declined the winner's late-IR
 /// availability outright, which is where all 74 of its `DUPLICATE_CONFLICT`s came from.
 pub fn merge_aliases(a: &ItemSummary, b: &ItemSummary) -> MergeDecision {
+    choose_body(a, b)
+}
+
+/// Which of two bodies for one item survives: the shared tail of [`merge_duplicates`] and
+/// [`merge_aliases`].
+///
+/// A copy with cleanup edges ([`ItemClass::UNWIND`]) beats a copy without them. Two duplicates
+/// were lowered from one Rust body, so the copy without cleanup edges came from MIR that had
+/// already lost them (rustc's optimized MIR under `-Cpanic=abort`), and keeping it would silently
+/// skip the destructors a host exception owes. (Aliases are already proved interchangeable by
+/// their printed text; the same rule only keeps the body that describes more.) Otherwise the
+/// smaller normalized hash wins. The decision reads only the two summaries, so it does not depend
+/// on the order objects were read in, and folding it over several copies keeps the same one
+/// whatever the order.
+fn choose_body(a: &ItemSummary, b: &ItemSummary) -> MergeDecision {
     match (a.semantic_hash, b.semantic_hash) {
         (None, None) => MergeDecision::Merge,
         (Some(_), None) => MergeDecision::Available(Side::Left),
         (None, Some(_)) => MergeDecision::Available(Side::Right),
         (Some(left), Some(right)) if left == right => MergeDecision::Merge,
         (Some(left), Some(right)) => {
-            let (keep, chosen, rejected) = if left < right {
+            let cleanup = |summary: &ItemSummary| summary.class.contains(ItemClass::UNWIND);
+            let keep_left = match (cleanup(a), cleanup(b)) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => left < right,
+            };
+            let (keep, chosen, rejected) = if keep_left {
                 (Side::Left, left, right)
             } else {
                 (Side::Right, right, left)
@@ -2265,6 +2266,61 @@ mod identity_tests {
                 assert_eq!(decline, back_decline);
             }
             other => panic!("expected a deterministic choice, got {other:?}"),
+        }
+    }
+
+    /// A copy with cleanup edges is kept over a copy without them whatever their hashes, for
+    /// duplicates and aliases alike, and either way round. Otherwise the smaller hash wins.
+    #[test]
+    fn a_copy_with_cleanup_edges_beats_a_smaller_hash_without_them() {
+        let low = Hash128 { lo: 1, hi: 0 };
+        let high = Hash128 { lo: 2, hi: 0 };
+        let copy = |hash, cleanup| {
+            let mut copy = summary("f", Some(item(1)), Some(hash));
+            if cleanup {
+                copy.class.insert(ItemClass::UNWIND);
+            }
+            copy
+        };
+        for merge in [merge_duplicates, merge_aliases] {
+            for (low_cleanup, high_cleanup, expected) in [
+                (false, true, high),
+                (true, false, low),
+                (true, true, low),
+                (false, false, low),
+            ] {
+                let (left, right) = (copy(low, low_cleanup), copy(high, high_cleanup));
+                for (a, b, keep) in [
+                    (
+                        &left,
+                        &right,
+                        if expected == low {
+                            Side::Left
+                        } else {
+                            Side::Right
+                        },
+                    ),
+                    (
+                        &right,
+                        &left,
+                        if expected == low {
+                            Side::Right
+                        } else {
+                            Side::Left
+                        },
+                    ),
+                ] {
+                    match merge(a, b) {
+                        MergeDecision::Choose {
+                            keep: kept, chosen, ..
+                        } => {
+                            assert_eq!(kept, keep);
+                            assert_eq!(chosen, expected);
+                        }
+                        other => panic!("expected a choice, got {other:?}"),
+                    }
+                }
+            }
         }
     }
 
