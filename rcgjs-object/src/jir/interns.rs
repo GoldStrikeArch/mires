@@ -168,6 +168,8 @@ impl Interns {
     /// A table built through [`Self::intern_str`] or read back through [`Self::rebuild_indices`]
     /// indexes every string exactly once, so the index answers. A table whose `strings` were
     /// filled by hand (tests push to the public field) is not indexed in full, and is searched.
+    /// The length comparison is exact only while `strings` is append-only: editing an entry in
+    /// place or truncating and re-pushing to the same length would leave a stale index.
     pub fn contains_str(&self, value: &str) -> bool {
         if self.string_index.len() == self.strings.len() {
             self.string_index

@@ -15,9 +15,9 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 - [ ] check-known-gaps 6/6; suites green; R1 row
 
 ## Stage 2 — compile cost (P04), equivalent output
-- [ ] 2a fuse.rs catch-name reservation O(1)
-- [ ] 2b shim parsed once in cost.rs
-- [ ] 2c physical_cost cache key hoisted
+- [x] 2a fuse.rs catch-name reservation O(1) (9a940b3)
+- [x] 2b shim parsed once in cost.rs (9a940b3)
+- [x] 2c physical_cost cache key hoisted (9a940b3)
 - [ ] 2d dependency-aware lowering reuse + RCGJS_COST_REUSE_VERIFY
 - [ ] Pro optimized cleanup-on link completes; R1.1 row
 
