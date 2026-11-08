@@ -18,7 +18,7 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 - [x] 2a fuse.rs catch-name reservation O(1) (9a940b3)
 - [x] 2b shim parsed once in cost.rs (9a940b3)
 - [x] 2c physical_cost cache key hoisted (9a940b3)
-- [ ] 2d dependency-aware lowering reuse + RCGJS_COST_REUSE_VERIFY
+- [x] 2d dependency-aware lowering reuse + RCGJS_COST_REUSE_VERIFY (compact physical lowerings 93,917 → 2,941; verified byte-identical)
 - [ ] Pro optimized cleanup-on link completes; R1.1 row
 
 ## Stage 3 — remove provably unnecessary cleanup edges (P07)
