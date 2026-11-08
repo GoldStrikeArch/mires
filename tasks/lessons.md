@@ -1,3 +1,5 @@
 # Lessons
 
 - 2026-11-08: The user requires delegated execution: implementation work runs in subagents on Opus 5.5 at xhigh effort, and every stage is checked by a separate verifier subagent on Fable 5.1 at high effort. Do not present a plan without an explicit execution model; do not implement stages inline in the main session.
+- 2026-11-08: `scripts/test.sh` byte budgets (`.maxbytes`) are baselined against the default cleanup-off mode and are only waived when JS_EXTRA_ARGS contains js-minify / js-source-map / etc. Under `js-lane=jir js-opt=on js-cleanup=on` 89/138 fixtures fail on budget alone at HEAD. Use `JS_EXTRA_ARGS="js-profile=release-balanced"` (budgets waived) as the behavioural gate, and treat the explicit jir+opt run as behaviour-only (compare "over budget" rows against the baseline binary). Do not specify a gate command in a brief without having seen it pass at baseline.
+- 2026-11-08: subagent worktrees are created from the current HEAD at spawn time; always state the expected HEAD in the brief and have the agent verify `git rev-parse HEAD` first.
