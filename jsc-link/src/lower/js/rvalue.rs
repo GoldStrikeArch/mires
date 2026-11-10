@@ -1,7 +1,7 @@
 //! Operators, casts, aggregates and discriminants (v1 `backend/src/rvalue.rs` and the coercion
 //! rows of `unsize.rs` that need no vtable name).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rcgjs_object::evaluation::OperandEvaluation;
 use rcgjs_object::jir::decline::OpClass;
@@ -32,8 +32,9 @@ fn overflow_operator(op: BinaryOp) -> Option<JsBinOp> {
 ///
 /// Every sum and difference can: two integers of at most 32 bits add exactly in a double, and a
 /// `BigInt` result is exact by construction. So can a product of at most 16 bits (below 2^32) or
-/// in `BigInt`. A 32 bit product cannot — the double rounds away the low bits a wrap keeps — and
-/// keeps the array form of [`JsCx::binary`].
+/// in `BigInt`. A 32 bit product cannot — the double rounds away the low bits a wrap keeps — so
+/// it is carried only when one half is read ([`PairCarrier::Wrapped`], [`PairCarrier::Overflowed`])
+/// and keeps the array form of [`JsCx::binary`] otherwise.
 fn exact_overflow(table: &TypeTable, op: BinaryOp, ty: TypeId) -> bool {
     let Some((_, bits)) = table.int_info(ty) else {
         return false;
@@ -46,51 +47,120 @@ fn exact_overflow(table: &TypeTable, op: BinaryOp, ty: TypeId) -> bool {
     overflow_operator(op).is_some() && (table.int_repr(ty) == IntRepr::BigInt || bits <= limit)
 }
 
-/// The overflow pairs of `func` that are never built: results of `AddWithOverflow` and its
-/// siblings that [`exact_overflow`] admits and that every use takes apart with a `Field`
-/// projection, the `let (r, o) = a.overflowing_add(b)` and `checked_*` shape.
+/// Whether `op` at `ty` is the one overflow operator [`exact_overflow`] refuses: a product of 32
+/// bit numbers.
+fn product_32(table: &TypeTable, op: BinaryOp, ty: TypeId) -> bool {
+    op == BinaryOp::MulWithOverflow
+        && table.int_repr(ty) == IntRepr::Number
+        && table.int_info(ty).is_some_and(|(_, bits)| bits == 32)
+}
+
+/// How an overflow pair that is never built is spelled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PairCarrier {
+    /// The exact `l op r` ([`exact_overflow`]): `.0` reads `mask(x)` and `.1` `mask(x) !== x`.
+    Exact,
+    /// A 32 bit product only `.0` of which is read: the wrapped `mask(Math.imul(l, r))` itself.
+    Wrapped,
+    /// A 32 bit product only `.1` of which is read: the flag `mask(Math.imul(l, r)) !== l * r`
+    /// itself.
+    Overflowed,
+}
+
+/// A value of a pair family that is never built: the result of the overflow op `root`, or a
+/// `Move`/`Copy` of a member, all spelled by the same `carrier`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CarriedPair {
+    pub root: ValueId,
+    pub carrier: PairCarrier,
+}
+
+/// The overflow pairs of `func` that are never built, by every value of their family.
 ///
-/// Such a value is carried as its exact result (`JsCx::op_expr` spells only `l op r`), and each
-/// projection reads its half off that ([`JsCx::overflow_field`]). Any other use — a block
-/// argument, a copy, a store, a call argument, a return — needs the real pair and keeps the
-/// array. Unsigned sums usually never get here: `opt::dce` already splits a projected one into a
+/// A family is a result of `AddWithOverflow` or a sibling, plus every `Move`/`Copy` of a member
+/// (a copy of a value nobody mutates is the same value). It is carried when every use of every
+/// member is a `Field` projection of `.0` or `.1` or such a `Move`/`Copy` — the
+/// `let (r, o) = a.overflowing_add(b)` and `checked_*` shape. Any other use — a block argument,
+/// a return, a call argument, an aggregate field, a store, a borrow — needs the real pair and
+/// keeps the array. A 32 bit product is carried only when one of its halves is never read.
+/// Unsigned sums usually never get here: `opt::dce` already splits a projected one into a
 /// wrapped add and a comparison.
-pub(super) fn exact_overflow_pairs(func: &Func, table: &TypeTable) -> BTreeSet<ValueId> {
-    let mut pairs: BTreeSet<ValueId> = func
-        .blocks
-        .iter()
-        .flat_map(|block| &block.ops)
+pub(super) fn carried_overflow_pairs(
+    func: &Func,
+    table: &TypeTable,
+) -> BTreeMap<ValueId, CarriedPair> {
+    let ops = || func.blocks.iter().flat_map(|block| &block.ops);
+    let roots: BTreeMap<ValueId, (BinaryOp, TypeId)> = ops()
         .filter_map(|op| match (op.result, &op.kind) {
-            (Some(result), OpKind::Binary { op, ty, .. }) if exact_overflow(table, *op, *ty) => {
-                Some(result)
+            (Some(result), OpKind::Binary { op, ty, .. })
+                if exact_overflow(table, *op, *ty) || product_32(table, *op, *ty) =>
+            {
+                Some((result, (*op, *ty)))
             }
             _ => None,
         })
         .collect();
-    if pairs.is_empty() {
-        return pairs;
+    if roots.is_empty() {
+        return BTreeMap::new();
     }
-    for block in &func.blocks {
-        for op in &block.ops {
-            let projection = matches!(
-                op.kind,
-                OpKind::Field {
-                    variant: None,
-                    field: 0 | 1,
-                    ..
-                }
-            );
-            if !projection {
-                for used in op.kind.uses() {
-                    pairs.remove(&used);
+    let mut root_of: BTreeMap<ValueId, ValueId> = roots.keys().map(|&root| (root, root)).collect();
+    // Blocks are not in dominance order, so a copy of a copy may be seen before its source is.
+    loop {
+        let mut grew = false;
+        for op in ops() {
+            if let (Some(result), OpKind::Move(source) | OpKind::Copy(source)) =
+                (op.result, &op.kind)
+            {
+                if let Some(&root) = root_of.get(source) {
+                    grew |= root_of.insert(result, root).is_none();
                 }
             }
         }
-        for used in block.term.uses() {
-            pairs.remove(&used);
+        if !grew {
+            break;
         }
     }
-    pairs
+    let mut read: BTreeMap<ValueId, [bool; 2]> = BTreeMap::new();
+    let mut escaped: BTreeSet<ValueId> = BTreeSet::new();
+    for block in &func.blocks {
+        for op in &block.ops {
+            match &op.kind {
+                OpKind::Field {
+                    base,
+                    variant: None,
+                    field: field @ (0 | 1),
+                } if root_of.contains_key(base) => {
+                    read.entry(root_of[base]).or_default()[*field as usize] = true;
+                }
+                OpKind::Move(source) | OpKind::Copy(source) if root_of.contains_key(source) => {}
+                kind => escaped.extend(kind.uses().iter().filter_map(|v| root_of.get(v))),
+            }
+        }
+        escaped.extend(block.term.uses().iter().filter_map(|v| root_of.get(v)));
+    }
+    let carriers: BTreeMap<ValueId, PairCarrier> = roots
+        .into_iter()
+        .filter(|(root, _)| !escaped.contains(root))
+        .filter_map(|(root, (op, ty))| {
+            let carrier = if exact_overflow(table, op, ty) {
+                PairCarrier::Exact
+            } else {
+                match read.get(&root).copied().unwrap_or_default() {
+                    [true, true] => return None,
+                    [false, true] => PairCarrier::Overflowed,
+                    _ => PairCarrier::Wrapped,
+                }
+            };
+            Some((root, carrier))
+        })
+        .collect();
+    root_of
+        .into_iter()
+        .filter_map(|(value, root)| {
+            let carrier = *carriers.get(&root)?;
+            Some((value, CarriedPair { root, carrier }))
+        })
+        .collect()
 }
 
 impl<'a> JsCx<'a> {
@@ -167,21 +237,15 @@ impl<'a> JsCx<'a> {
             ));
         };
         let repr = self.table.int_repr(ty);
-        let (wrapped, exact) =
-            if op == BinaryOp::MulWithOverflow && repr == IntRepr::Number && bits == 32 {
-                let (lhs, lhs_again) = self.read_twice(lhs);
-                let (rhs, rhs_again) = self.read_twice(rhs);
-                (
-                    jsast::imul(lhs, rhs),
-                    jsast::binary(JsBinOp::Mul, lhs_again, rhs_again),
-                )
-            } else {
-                let exact = self.temp_name();
-                (
-                    jsast::assign(exact.clone(), jsast::binary(js_op, lhs, rhs)),
-                    exact,
-                )
-            };
+        let (wrapped, exact) = if product_32(self.table, op, ty) {
+            self.product_32_halves(lhs, rhs)
+        } else {
+            let exact = self.temp_name();
+            (
+                jsast::assign(exact.clone(), jsast::binary(js_op, lhs, rhs)),
+                exact,
+            )
+        };
         let bound = self.temp_name();
         Ok(jsast::array(vec![
             jsast::assign(bound.clone(), mask(repr, signed, bits, wrapped)),
@@ -189,27 +253,76 @@ impl<'a> JsCx<'a> {
         ]))
     }
 
-    /// The value of an overflow pair [`exact_overflow_pairs`] admitted: the exact `l op r`, with
-    /// no wrap and no pair around it.
-    pub(super) fn overflow_exact(&self, op: BinaryOp, lhs: Expr, rhs: Expr) -> Res<Expr> {
-        let Some(js_op) = overflow_operator(op) else {
-            return Err(decline(
-                OpClass::Rvalue,
-                format!("`{op:?}` carried as an exact overflow result"),
-            ));
-        };
-        Ok(jsast::binary(js_op, lhs, rhs))
+    /// A 32 bit product over operands evaluated once each: `Math.imul(l, r)`, the product modulo
+    /// 2^32 that the wrapped half masks, and the rounded `l * r` only the flag compares against.
+    fn product_32_halves(&self, lhs: Expr, rhs: Expr) -> (Expr, Expr) {
+        let (lhs, lhs_again) = self.read_twice(lhs);
+        let (rhs, rhs_again) = self.read_twice(rhs);
+        (
+            jsast::imul(lhs, rhs),
+            jsast::binary(JsBinOp::Mul, lhs_again, rhs_again),
+        )
     }
 
-    /// Field `field` of an overflow pair [`exact_overflow_pairs`] admitted, read off its exact
-    /// result `x`: the wrapped `mask(x)`, or the flag `mask(x) !== x`.
-    pub(super) fn overflow_field(&self, pair: ValueId, field: u32) -> Res<Expr> {
-        let ty = match self.def_of(pair).map(|def| &def.kind) {
+    /// The value of the overflow op at the root of a carried pair family
+    /// ([`carried_overflow_pairs`]): the exact `l op r`, with no wrap and no pair around it, or
+    /// the one half of a 32 bit product that is read.
+    pub(super) fn carried_pair_value(
+        &self,
+        carrier: PairCarrier,
+        op: BinaryOp,
+        ty: TypeId,
+        lhs: Expr,
+        rhs: Expr,
+    ) -> Res<Expr> {
+        let (Some((signed, bits)), Some(js_op)) = (self.table.int_info(ty), overflow_operator(op))
+        else {
+            return Err(decline(
+                OpClass::Rvalue,
+                "overflowing arithmetic on a non-integer",
+            ));
+        };
+        let repr = self.table.int_repr(ty);
+        Ok(match carrier {
+            PairCarrier::Exact => jsast::binary(js_op, lhs, rhs),
+            PairCarrier::Wrapped => mask(repr, signed, bits, jsast::imul(lhs, rhs)),
+            PairCarrier::Overflowed => {
+                let (wrapped, rounded) = self.product_32_halves(lhs, rhs);
+                jsast::binary(
+                    JsBinOp::StrictNe,
+                    mask(repr, signed, bits, wrapped),
+                    rounded,
+                )
+            }
+        })
+    }
+
+    /// Field `field` of the carried pair `base` ([`carried_overflow_pairs`]): read off the exact
+    /// result `x` — the wrapped `mask(x)` or the flag `mask(x) !== x` — or, for a 32 bit product,
+    /// the half the value already is.
+    pub(super) fn carried_pair_field(
+        &self,
+        pair: CarriedPair,
+        base: ValueId,
+        field: u32,
+    ) -> Res<Expr> {
+        let value = self.expr_of(base)?;
+        match (pair.carrier, field) {
+            (PairCarrier::Wrapped, 0) | (PairCarrier::Overflowed, 1) => return Ok(value),
+            (PairCarrier::Exact, 0 | 1) => {}
+            _ => {
+                return Err(decline(
+                    OpClass::Rvalue,
+                    "a carried overflow pair read through a half it does not carry",
+                ))
+            }
+        }
+        let ty = match self.def_of(pair.root).map(|def| &def.kind) {
             Some(OpKind::Binary { ty, .. }) => *ty,
             _ => {
                 return Err(decline(
                     OpClass::Rvalue,
-                    "an exact overflow pair that no `Binary` op defines",
+                    "a carried overflow pair that no `Binary` op defines",
                 ))
             }
         };
@@ -220,11 +333,10 @@ impl<'a> JsCx<'a> {
             ));
         };
         let repr = self.table.int_repr(ty);
-        let exact = self.expr_of(pair)?;
         Ok(match field {
-            0 => mask(repr, signed, bits, exact),
+            0 => mask(repr, signed, bits, value),
             _ => {
-                let (exact, again) = self.read_twice(exact);
+                let (exact, again) = self.read_twice(value);
                 jsast::binary(JsBinOp::StrictNe, mask(repr, signed, bits, exact), again)
             }
         })

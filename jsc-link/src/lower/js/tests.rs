@@ -746,9 +746,30 @@ fn projected_overflow(op: BinaryOp, ty: TypeId, pair: TypeId) -> Func {
     b.finish()
 }
 
-/// The test world plus the integer widths and `(T, bool)` pairs the overflow tests sweep:
-/// `(element, pair, signed, bits)`.
-fn overflow_world() -> (Interns, Vec<(TypeId, TypeId, bool, u32)>) {
+/// One integer width the overflow tests sweep, with the types its pairs need.
+#[derive(Clone, Copy)]
+struct Width {
+    element: TypeId,
+    /// `(T, bool)`.
+    pair: TypeId,
+    /// `((T, bool),)`, a product holding a pair in a field.
+    nest: TypeId,
+    /// `&(T, bool)` and `*mut (T, bool)`.
+    reference: TypeId,
+    raw: TypeId,
+    signed: bool,
+    bits: u32,
+}
+
+impl Width {
+    fn label(self) -> String {
+        format!("{}{}", if self.signed { 'i' } else { 'u' }, self.bits)
+    }
+}
+
+/// The test world plus every integer width the overflow tests sweep: `u32`, `i8`, `u8`, `u16`,
+/// `i32`, `i64`, `u64`, in that order.
+fn overflow_world() -> (Interns, Vec<Width>) {
     const I8: TypeId = TypeId(60);
     const U16: TypeId = TypeId(61);
     const U64: TypeId = TypeId(62);
@@ -756,8 +777,9 @@ fn overflow_world() -> (Interns, Vec<(TypeId, TypeId, bool, u32)>) {
     interns.intern_type(int(I8, true, 8));
     interns.intern_type(int(U16, false, 16));
     interns.intern_type(int(U64, false, 64));
-    let mut widths = vec![(U32, OVERFLOW, false, 32)];
+    let mut widths = Vec::new();
     for (index, (element, signed, bits)) in [
+        (U32, false, 32),
         (I8, true, 8),
         (U8, false, 8),
         (U16, false, 16),
@@ -768,19 +790,162 @@ fn overflow_world() -> (Interns, Vec<(TypeId, TypeId, bool, u32)>) {
     .into_iter()
     .enumerate()
     {
-        let pair = TypeId(70 + index as u128);
-        let mut descriptor = descriptor(pair, TypeKind::Tuple(vec![element, BOOL]), 16);
-        descriptor.js.is_indirect = true;
-        descriptor.js.needs_clone = true;
-        descriptor.js.fields = vec![
-            field(FieldKey::Index(0), element),
-            field(FieldKey::Index(1), BOOL),
-        ];
-        interns.intern_type(descriptor);
-        widths.push((element, pair, signed, bits));
+        let id = |slot: u128| TypeId(100 + 10 * index as u128 + slot);
+        let pair = if element == U32 { OVERFLOW } else { id(0) };
+        if element != U32 {
+            let mut descriptor = descriptor(pair, TypeKind::Tuple(vec![element, BOOL]), 16);
+            descriptor.js.is_indirect = true;
+            descriptor.js.needs_clone = true;
+            descriptor.js.fields = vec![
+                field(FieldKey::Index(0), element),
+                field(FieldKey::Index(1), BOOL),
+            ];
+            interns.intern_type(descriptor);
+        }
+        let mut nest = descriptor(id(1), TypeKind::Tuple(vec![pair]), 16);
+        nest.js.is_indirect = true;
+        nest.js.needs_clone = true;
+        nest.js.fields = vec![field(FieldKey::Index(0), pair)];
+        interns.intern_type(nest);
+        interns.intern_type(pointer(id(2), pair, PointerForm::Thin, false));
+        interns.intern_type(pointer(id(3), pair, PointerForm::Thin, true));
+        widths.push(Width {
+            element,
+            pair,
+            nest: id(1),
+            reference: id(2),
+            raw: id(3),
+            signed,
+            bits,
+        });
     }
     (interns, widths)
 }
+
+/// A Node program that runs lowered `(a, b) -> (T, bool)` functions over every pair of a width's
+/// boundary values and compares each answer with Rust's own `overflowing_*`.
+struct OverflowHarness {
+    source: String,
+}
+
+impl OverflowHarness {
+    fn new() -> Self {
+        Self {
+            source: String::from(
+                "'use strict';\nconst assert = require('node:assert/strict');\nconst cases = [];\n\
+                 function keep(p) {\n  assert.ok(Array.isArray(p) && p.length === 2, \
+                 `keep got ${p}`);\n  return p;\n}\n",
+            ),
+        }
+    }
+
+    /// Adds the function `js` (declaring `name`) and its cases for `op` at `width`.
+    fn add(&mut self, name: &str, js: &str, op: BinaryOp, width: Width) {
+        let Width { signed, bits, .. } = width;
+        let (min, max): (i128, i128) = if signed {
+            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        } else {
+            (0, (1i128 << bits) - 1)
+        };
+        let half = 1i128 << (bits / 2);
+        let edges = [min, min + 1, max - 1, max, -half, half - 1, half];
+        let mut values: Vec<i128> = edges.into_iter().chain(-2..=2).collect();
+        values.retain(|value| (min..=max).contains(value));
+        let wrap = |value: i128| {
+            let modulus = 1i128 << bits;
+            let low = value.rem_euclid(modulus);
+            if signed && low > max {
+                low - modulus
+            } else {
+                low
+            }
+        };
+        let literal = |value: i128| {
+            if bits > 32 {
+                format!("{value}n")
+            } else {
+                value.to_string()
+            }
+        };
+        self.source.push_str(js);
+        for &a in &values {
+            for &b in &values {
+                // A 64 bit product can leave `i128` too; it has overflowed either way, and
+                // wrapping modulo 2^128 keeps the low bits.
+                let (wrapped, overflowed) = match op {
+                    BinaryOp::AddWithOverflow => (wrap(a + b), wrap(a + b) != a + b),
+                    BinaryOp::SubWithOverflow => (wrap(a - b), wrap(a - b) != a - b),
+                    _ => match a.checked_mul(b) {
+                        Some(exact) => (wrap(exact), wrap(exact) != exact),
+                        None => (wrap(a.wrapping_mul(b)), true),
+                    },
+                };
+                self.source.push_str(&format!(
+                    "cases.push(['{name}', {name}, {}, {}, {}, {overflowed}]);\n",
+                    literal(a),
+                    literal(b),
+                    literal(wrapped),
+                ));
+            }
+        }
+    }
+
+    /// Lowers `func` as `name` with `names` for its values and adds it.
+    fn lower(
+        &mut self,
+        interns: &Interns,
+        name: &str,
+        func: &Func,
+        names: &[(u32, &str)],
+        op: BinaryOp,
+        width: Width,
+    ) -> String {
+        let mut plan = plan_of(func, names);
+        for (index, _) in func.cells.iter().enumerate() {
+            plan.cell_names.insert(
+                rcgjs_object::jir::repr::CellId(index as u32),
+                format!("c{index}"),
+            );
+        }
+        let body = body_of(BodyKind::Function, func.sig.clone());
+        let js = lower(interns, name, &["keep"], &body, func, &plan, straight(func));
+        self.add(name, &js, op, width);
+        js
+    }
+
+    fn run(mut self) {
+        self.source.push_str(
+            "for (const [name, f, a, b, wrapped, overflowed] of cases) {\n  const [r, o] = f(a, b);\n  \
+             assert.ok(r === wrapped && o === overflowed, `${name}(${a}, ${b}) = [${r}, ${o}], \
+             want [${wrapped}, ${overflowed}]`);\n}\nconsole.log(cases.length);\n",
+        );
+        // The program is too long for an argument; it goes in on stdin.
+        let mut node = std::process::Command::new("node")
+            .arg("-")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("Node is required by the compiler semantic tests");
+        std::io::Write::write_all(
+            &mut node.stdin.take().expect("piped stdin"),
+            self.source.as_bytes(),
+        )
+        .expect("write the program to Node");
+        let output = node.wait_with_output().expect("Node runs to completion");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+const OVERFLOW_OPS: [(BinaryOp, &str); 3] = [
+    (BinaryOp::AddWithOverflow, "add"),
+    (BinaryOp::SubWithOverflow, "sub"),
+    (BinaryOp::MulWithOverflow, "mul"),
+];
 
 #[test]
 fn an_escaping_overflow_pair_is_an_array_without_a_closure() {
@@ -811,8 +976,7 @@ fn an_escaping_32_bit_product_wraps_through_imul() {
 #[test]
 fn a_projected_overflow_pair_is_its_exact_result() {
     let (interns, widths) = overflow_world();
-    let (_, i32_pair, ..) = widths[4];
-    let func = projected_overflow(BinaryOp::AddWithOverflow, I32, i32_pair);
+    let func = projected_overflow(BinaryOp::AddWithOverflow, I32, widths[4].pair);
     let plan = plan_of(&func, &[(0, "a"), (1, "b"), (2, "p"), (3, "r"), (4, "o")]);
     let body = body_of(BodyKind::Function, func.sig.clone());
     let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
@@ -825,34 +989,7 @@ fn a_projected_overflow_pair_is_its_exact_result() {
 #[test]
 fn an_inline_projected_overflow_pair_binds_one_temporary() {
     let (interns, widths) = overflow_world();
-    let (_, i64_pair, ..) = widths[5];
-    let mut b = FuncBuilder::new(item(1), signature(vec![I64, I64], BOOL));
-    let x = b.param(I64, NO_ORIGIN);
-    let y = b.param(I64, NO_ORIGIN);
-    let e = FuncBuilder::ENTRY;
-    let p = b.op(
-        e,
-        OpKind::Binary {
-            op: BinaryOp::SubWithOverflow,
-            l: x,
-            r: y,
-            ty: I64,
-        },
-        i64_pair,
-        NO_ORIGIN,
-    );
-    let overflowed = b.op(
-        e,
-        OpKind::Field {
-            base: p,
-            variant: None,
-            field: 1,
-        },
-        BOOL,
-        NO_ORIGIN,
-    );
-    b.terminate(e, RTerm::Return(Some(overflowed)));
-    let func = b.finish();
+    let func = one_half_overflow(BinaryOp::SubWithOverflow, widths[5], 1);
     let plan = plan_of(&func, &[(0, "a"), (1, "b")]);
     let body = body_of(BodyKind::Function, func.sig.clone());
     let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
@@ -863,7 +1000,7 @@ fn an_inline_projected_overflow_pair_binds_one_temporary() {
 }
 
 #[test]
-fn a_32_bit_product_pair_is_built_even_when_projected() {
+fn a_32_bit_product_pair_is_built_when_both_halves_are_read() {
     let interns = world();
     let func = projected_overflow(BinaryOp::MulWithOverflow, U32, OVERFLOW);
     let plan = plan_of(&func, &[(0, "a"), (1, "b"), (2, "p"), (3, "r"), (4, "o")]);
@@ -877,100 +1014,513 @@ fn a_32_bit_product_pair_is_built_even_when_projected() {
     );
 }
 
-/// Every pair shape — projected (carried as the exact result) and escaping (an array) — of every
-/// overflow operator at every representation, run under Node at the boundary values and compared
-/// with Rust's own `overflowing_*`.
+/// `a.op(b).<field>` alone, returned as a `bool` (`.1`) or `T` (`.0`).
+fn one_half_overflow(op: BinaryOp, width: Width, half: u32) -> Func {
+    let ty = width.element;
+    let result = if half == 0 { ty } else { BOOL };
+    let mut b = FuncBuilder::new(item(1), signature(vec![ty, ty], result));
+    let x = b.param(ty, NO_ORIGIN);
+    let y = b.param(ty, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let p = b.op(
+        e,
+        OpKind::Binary { op, l: x, r: y, ty },
+        width.pair,
+        NO_ORIGIN,
+    );
+    let read = b.op(
+        e,
+        OpKind::Field {
+            base: p,
+            variant: None,
+            field: half,
+        },
+        result,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(read)));
+    b.finish()
+}
+
+#[test]
+fn a_32_bit_product_read_through_one_half_is_that_half_alone() {
+    let (interns, widths) = overflow_world();
+    let spell = |half, named: &[(u32, &str)]| {
+        let func = one_half_overflow(BinaryOp::MulWithOverflow, widths[4], half);
+        let plan = plan_of(&func, named);
+        let body = body_of(BodyKind::Function, func.sig.clone());
+        lower(&interns, "f", &[], &body, &func, &plan, straight(&func))
+    };
+    assert_eq!(
+        spell(0, &[(0, "a"), (1, "b")]),
+        "function f(a, b) {\n  return Math.imul(a, b) | 0;\n}\n"
+    );
+    assert_eq!(
+        spell(1, &[(0, "a"), (1, "b")]),
+        "function f(a, b) {\n  return (Math.imul(a, b) | 0) !== a * b;\n}\n"
+    );
+    assert_eq!(
+        spell(1, &[(0, "a"), (1, "b"), (2, "p")]),
+        "function f(a, b) {\n  let p;\n  p = (Math.imul(a, b) | 0) !== a * b;\n  return p;\n}\n"
+    );
+}
+
+/// `let p = a.op(b); let q = p (Move or Copy); (q.0, p.1)`: a pair renamed or copied and then
+/// only projected. Values: `a b p o q r out`.
+fn aliased_overflow(op: BinaryOp, width: Width, copy: bool) -> Func {
+    let Width {
+        element: ty, pair, ..
+    } = width;
+    let mut b = FuncBuilder::new(item(1), signature(vec![ty, ty], pair));
+    let x = b.param(ty, NO_ORIGIN);
+    let y = b.param(ty, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let p = b.op(e, OpKind::Binary { op, l: x, r: y, ty }, pair, NO_ORIGIN);
+    let projection = |b: &mut FuncBuilder, base, field, ty| {
+        b.op(
+            e,
+            OpKind::Field {
+                base,
+                variant: None,
+                field,
+            },
+            ty,
+            NO_ORIGIN,
+        )
+    };
+    let overflowed = projection(&mut b, p, 1, BOOL);
+    let alias = if copy {
+        OpKind::Copy(p)
+    } else {
+        OpKind::Move(p)
+    };
+    let q = b.op(e, alias, pair, NO_ORIGIN);
+    let wrapped = projection(&mut b, q, 0, ty);
+    let out = b.op(
+        e,
+        OpKind::Aggregate {
+            ty: pair,
+            variant: 0,
+            active_field: None,
+            fields: vec![wrapped, overflowed],
+        },
+        pair,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    b.finish()
+}
+
+#[test]
+fn a_moved_or_copied_projected_pair_is_still_its_exact_result() {
+    let (interns, widths) = overflow_world();
+    for copy in [false, true] {
+        let func = aliased_overflow(BinaryOp::AddWithOverflow, widths[4], copy);
+        let plan = plan_of(
+            &func,
+            &[(0, "a"), (1, "b"), (2, "p"), (3, "o"), (4, "q"), (5, "r")],
+        );
+        let body = body_of(BodyKind::Function, func.sig.clone());
+        let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+        assert_eq!(
+            js,
+            "function f(a, b) {\n  let p, o, q, r;\n  p = a + b;\n  o = (p | 0) !== p;\n  q = p;\n  \
+             r = q | 0;\n  return [r, o];\n}\n",
+            "copy: {copy}"
+        );
+    }
+}
+
+/// Every carried and built pair shape of every overflow operator at every width, under Node at
+/// the boundary values against Rust's own `overflowing_*`: projected (both halves, carried as the
+/// exact result or, for a 32 bit product, built), one half only, moved or copied, and escaping
+/// whole.
 #[test]
 fn overflow_pairs_agree_with_rust_at_every_width() {
     let (interns, widths) = overflow_world();
-    let mut source = String::from(
-        "'use strict';\nconst assert = require('node:assert/strict');\nconst cases = [];\n",
-    );
-    let ops = [
-        (BinaryOp::AddWithOverflow, "add"),
-        (BinaryOp::SubWithOverflow, "sub"),
-        (BinaryOp::MulWithOverflow, "mul"),
-    ];
-    for (element, pair, signed, bits) in widths {
-        let (min, max): (i128, i128) = if signed {
-            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
-        } else {
-            (0, (1i128 << bits) - 1)
-        };
-        let half = 1i128 << (bits / 2);
-        let edges = [min, min + 1, max - 1, max, -half, half - 1, half];
-        let mut values: Vec<i128> = edges.into_iter().chain(-2..=2).collect();
-        values.retain(|value| (min..=max).contains(value));
-        let wrap = |value: i128| {
-            let modulus = 1i128 << bits;
-            let low = value.rem_euclid(modulus);
-            if signed && low > max {
-                low - modulus
-            } else {
-                low
-            }
-        };
-        let literal = |value: i128| {
-            if bits > 32 {
-                format!("{value}n")
-            } else {
-                value.to_string()
-            }
-        };
-        for (op, spelled) in ops {
-            for (shape, func) in [
-                ("projected", projected_overflow(op, element, pair)),
-                ("escaping", escaping_overflow(op, element, pair)),
+    let mut harness = OverflowHarness::new();
+    let projected: &[(u32, &str)] = &[(0, "a"), (1, "b"), (2, "p"), (3, "r"), (4, "o")];
+    let aliased: &[(u32, &str)] = &[(0, "a"), (1, "b"), (2, "p"), (3, "o"), (4, "q"), (5, "r")];
+    for width in widths {
+        for (op, spelled) in OVERFLOW_OPS {
+            let label = format!("{spelled}_{}", width.label());
+            for (shape, func, names) in [
+                (
+                    "projected",
+                    projected_overflow(op, width.element, width.pair),
+                    projected,
+                ),
+                (
+                    "escaping",
+                    escaping_overflow(op, width.element, width.pair),
+                    projected,
+                ),
+                ("moved", aliased_overflow(op, width, false), aliased),
+                ("copied", aliased_overflow(op, width, true), aliased),
             ] {
-                let name = format!("{spelled}_{}{bits}_{shape}", if signed { 'i' } else { 'u' });
-                let plan = plan_of(&func, &[(0, "a"), (1, "b"), (2, "p"), (3, "r"), (4, "o")]);
-                let body = body_of(BodyKind::Function, func.sig.clone());
-                source.push_str(&lower(
+                harness.lower(
                     &interns,
-                    &name,
-                    &[],
-                    &body,
+                    &format!("{label}_{shape}"),
                     &func,
-                    &plan,
-                    straight(&func),
-                ));
-                for &a in &values {
-                    for &b in &values {
-                        // A 64 bit product can leave `i128` too; it has overflowed either way,
-                        // and wrapping modulo 2^128 keeps the low bits.
-                        let (wrapped, overflowed) = match op {
-                            BinaryOp::AddWithOverflow => (wrap(a + b), wrap(a + b) != a + b),
-                            BinaryOp::SubWithOverflow => (wrap(a - b), wrap(a - b) != a - b),
-                            _ => match a.checked_mul(b) {
-                                Some(exact) => (wrap(exact), wrap(exact) != exact),
-                                None => (wrap(a.wrapping_mul(b)), true),
-                            },
-                        };
-                        source.push_str(&format!(
-                            "cases.push(['{name}', {name}, {}, {}, {}, {overflowed}]);\n",
-                            literal(a),
-                            literal(b),
-                            literal(wrapped),
-                        ));
-                    }
-                }
+                    names,
+                    op,
+                    width,
+                );
+            }
+            // One half alone, wrapped back into a pair beside the half the reference computes.
+            for half in [0, 1] {
+                let func = one_half_overflow(op, width, half);
+                let name = format!("{label}_half{half}");
+                let plan = plan_of(&func, &[(0, "a"), (1, "b")]);
+                let body = body_of(BodyKind::Function, func.sig.clone());
+                let js = lower(&interns, &name, &[], &body, &func, &plan, straight(&func));
+                let reference = format!("{label}_projected");
+                let wrapper = if half == 0 {
+                    format!("function {name}$w(a, b) {{ return [{name}(a, b), {reference}(a, b)[1]]; }}\n")
+                } else {
+                    format!("function {name}$w(a, b) {{ return [{reference}(a, b)[0], {name}(a, b)]; }}\n")
+                };
+                harness.add(&format!("{name}$w"), &format!("{js}{wrapper}"), op, width);
             }
         }
     }
-    source.push_str(
-        "for (const [name, f, a, b, wrapped, overflowed] of cases) {\n  const [r, o] = f(a, b);\n  \
-         assert.ok(r === wrapped && o === overflowed, `${name}(${a}, ${b}) = [${r}, ${o}], \
-         want [${wrapped}, ${overflowed}]`);\n}\nconsole.log(cases.length);\n",
+    harness.run();
+}
+
+/// A chain of aliases whose blocks are not in dominance order: the block that comes last in
+/// control flow is stored first and holds `r = move q; s = copy r` and both projections, while
+/// the block stored after it holds the overflow op and `q = move p`. One pass over the blocks sees
+/// `r` and `s` before `q` joins the family, so the family must be found by a fixpoint; a carrier
+/// committed for only part of the chain would be projected as if it were a pair.
+#[test]
+fn an_alias_chain_is_one_family_whatever_the_block_order() {
+    let (interns, widths) = overflow_world();
+    let mut harness = OverflowHarness::new();
+    for width in widths {
+        for (op, spelled) in OVERFLOW_OPS {
+            let Width {
+                element: ty, pair, ..
+            } = width;
+            let mut b = FuncBuilder::new(item(1), signature(vec![ty, ty], pair));
+            let x = b.param(ty, NO_ORIGIN);
+            let y = b.param(ty, NO_ORIGIN);
+            let e = FuncBuilder::ENTRY;
+            let last = b.block();
+            let middle = b.block();
+            b.terminate(e, RTerm::Goto(middle, vec![]));
+            let p = b.op(
+                middle,
+                OpKind::Binary { op, l: x, r: y, ty },
+                pair,
+                NO_ORIGIN,
+            );
+            let q = b.op(middle, OpKind::Move(p), pair, NO_ORIGIN);
+            b.terminate(middle, RTerm::Goto(last, vec![]));
+            let r = b.op(last, OpKind::Move(q), pair, NO_ORIGIN);
+            let s = b.op(last, OpKind::Copy(r), pair, NO_ORIGIN);
+            let wrapped = b.op(
+                last,
+                OpKind::Field {
+                    base: s,
+                    variant: None,
+                    field: 0,
+                },
+                ty,
+                NO_ORIGIN,
+            );
+            let overflowed = b.op(
+                last,
+                OpKind::Field {
+                    base: r,
+                    variant: None,
+                    field: 1,
+                },
+                BOOL,
+                NO_ORIGIN,
+            );
+            let out = b.op(
+                last,
+                OpKind::Aggregate {
+                    ty: pair,
+                    variant: 0,
+                    active_field: None,
+                    fields: vec![wrapped, overflowed],
+                },
+                pair,
+                NO_ORIGIN,
+            );
+            b.terminate(last, RTerm::Return(Some(out)));
+            let func = b.finish();
+            let plan = plan_of(
+                &func,
+                &[
+                    (0, "a"),
+                    (1, "b"),
+                    (2, "p"),
+                    (3, "q"),
+                    (4, "r"),
+                    (5, "s"),
+                    (6, "w"),
+                    (7, "o"),
+                ],
+            );
+            let region = Region::Seq(vec![
+                Region::Block(payload(&func, 0, None)),
+                Region::Block(payload(&func, middle.0, None)),
+                Region::Block(payload(&func, last.0, None)),
+                Region::Return,
+            ]);
+            let name = format!("{spelled}_{}_out_of_order", width.label());
+            let body = body_of(BodyKind::Function, func.sig.clone());
+            let js = lower(&interns, &name, &[], &body, &func, &plan, region);
+            harness.add(&name, &js, op, width);
+        }
+    }
+    harness.run();
+}
+
+/// How a pair escapes in [`escaping_use`]: each is a use `carried_overflow_pairs` must refuse.
+#[derive(Clone, Copy, Debug)]
+enum Escape {
+    /// `q = keep(p)`, a call argument.
+    Call,
+    /// `w = (p,)` and `q = w.0`, an aggregate field.
+    Aggregate,
+    /// `c = p; q = c`, a store to a cell.
+    CellStore,
+    /// `w = (seed,); w.0 = p; q = w.0`, a field store.
+    SetField,
+    /// `c = seed; *&mut c = p; q = c`, a store through a pointer.
+    StoreThrough,
+    /// `q = *&p`, a reference view.
+    Borrow,
+    /// `q = *(&raw const p)`, a raw view.
+    Raw,
+    /// `q = copy p; keep(q)`, a copy whose own use escapes.
+    CopyThenCall,
+}
+
+impl Escape {
+    const ALL: [Escape; 8] = [
+        Escape::Call,
+        Escape::Aggregate,
+        Escape::CellStore,
+        Escape::SetField,
+        Escape::StoreThrough,
+        Escape::Borrow,
+        Escape::Raw,
+        Escape::CopyThenCall,
+    ];
+}
+
+/// `let p = a.op(b); let o = p.1; let q = <p through escape>; (q.0, o)`, with the plan's names.
+/// The projection `o` makes `p` a pair that would be carried if the escape were not seen.
+fn escaping_use(
+    op: BinaryOp,
+    width: Width,
+    escape: Escape,
+    keep: StrId,
+) -> (Func, Vec<(u32, String)>) {
+    let Width {
+        element: ty,
+        pair,
+        nest,
+        reference,
+        raw,
+        ..
+    } = width;
+    let mut b = FuncBuilder::new(item(1), signature(vec![ty, ty], pair));
+    let x = b.param(ty, NO_ORIGIN);
+    let y = b.param(ty, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let p = b.op(e, OpKind::Binary { op, l: x, r: y, ty }, pair, NO_ORIGIN);
+    let field = |b: &mut FuncBuilder, base, field, ty| {
+        b.op(
+            e,
+            OpKind::Field {
+                base,
+                variant: None,
+                field,
+            },
+            ty,
+            NO_ORIGIN,
+        )
+    };
+    let call = |b: &mut FuncBuilder, arg| {
+        b.op(
+            e,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(9),
+                    link_name: keep,
+                },
+                function: None,
+                args: vec![arg],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            pair,
+            NO_ORIGIN,
+        )
+    };
+    let overflowed = field(&mut b, p, 1, BOOL);
+    // A pair value distinct from `p`, for the stores to overwrite.
+    let seed = |b: &mut FuncBuilder| {
+        b.op(
+            e,
+            OpKind::Aggregate {
+                ty: pair,
+                variant: 0,
+                active_field: None,
+                fields: vec![x, overflowed],
+            },
+            pair,
+            NO_ORIGIN,
+        )
+    };
+    let nested = |b: &mut FuncBuilder, inner| {
+        b.op(
+            e,
+            OpKind::Aggregate {
+                ty: nest,
+                variant: 0,
+                active_field: None,
+                fields: vec![inner],
+            },
+            nest,
+            NO_ORIGIN,
+        )
+    };
+    let q = match escape {
+        Escape::Call => call(&mut b, p),
+        Escape::Aggregate => {
+            let w = nested(&mut b, p);
+            field(&mut b, w, 0, pair)
+        }
+        Escape::CellStore => {
+            let cell = b.cell(pair, false, NO_ORIGIN);
+            b.effect(e, OpKind::CellAlloc(cell), NO_ORIGIN);
+            b.effect(e, OpKind::CellStore { cell, v: p }, NO_ORIGIN);
+            b.op(e, OpKind::CellLoad(cell), pair, NO_ORIGIN)
+        }
+        Escape::SetField => {
+            let start = seed(&mut b);
+            let w = nested(&mut b, start);
+            b.effect(
+                e,
+                OpKind::SetField {
+                    base: w,
+                    variant: None,
+                    field: 0,
+                    v: p,
+                },
+                NO_ORIGIN,
+            );
+            field(&mut b, w, 0, pair)
+        }
+        Escape::StoreThrough => {
+            let start = seed(&mut b);
+            let cell = b.cell(pair, true, NO_ORIGIN);
+            b.effect(e, OpKind::CellAlloc(cell), NO_ORIGIN);
+            b.effect(e, OpKind::CellStore { cell, v: start }, NO_ORIGIN);
+            let slot = b.op(
+                e,
+                OpKind::BorrowView {
+                    root: Root::Cell(cell),
+                    path: vec![],
+                    mutable: true,
+                },
+                reference,
+                NO_ORIGIN,
+            );
+            b.effect(e, OpKind::StoreThrough { ptr: slot, v: p }, NO_ORIGIN);
+            b.op(e, OpKind::CellLoad(cell), pair, NO_ORIGIN)
+        }
+        Escape::Borrow | Escape::Raw => {
+            let (kind, ty) = match escape {
+                Escape::Borrow => (
+                    OpKind::BorrowView {
+                        root: Root::Value(p),
+                        path: vec![],
+                        mutable: false,
+                    },
+                    reference,
+                ),
+                _ => (
+                    OpKind::RawView {
+                        root: Root::Value(p),
+                        path: vec![],
+                        mutable: false,
+                    },
+                    raw,
+                ),
+            };
+            let view = b.op(e, kind, ty, NO_ORIGIN);
+            b.op(e, OpKind::Deref(view), pair, NO_ORIGIN)
+        }
+        Escape::CopyThenCall => {
+            let copy = b.op(e, OpKind::Copy(p), pair, NO_ORIGIN);
+            call(&mut b, copy)
+        }
+    };
+    let wrapped = field(&mut b, q, 0, ty);
+    let out = b.op(
+        e,
+        OpKind::Aggregate {
+            ty: pair,
+            variant: 0,
+            active_field: None,
+            fields: vec![wrapped, overflowed],
+        },
+        pair,
+        NO_ORIGIN,
     );
-    let output = std::process::Command::new("node")
-        .args(["-e", &source])
-        .output()
-        .expect("Node is required by the compiler semantic tests");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let func = b.finish();
+    // Every value but a view is named, so a value used twice is never spelled twice.
+    let special = [(p, "p"), (overflowed, "o"), (q, "q"), (wrapped, "r")];
+    let names = func.blocks[0]
+        .ops
+        .iter()
+        .filter(|op| !matches!(op.kind, OpKind::BorrowView { .. } | OpKind::RawView { .. }))
+        .filter_map(|op| op.result)
+        .map(|v| {
+            let name = special
+                .iter()
+                .find(|(value, _)| *value == v)
+                .map_or_else(|| format!("v{}", v.0), |(_, name)| (*name).to_owned());
+            (v.0, name)
+        })
+        .chain([(x.0, "a".to_owned()), (y.0, "b".to_owned())])
+        .collect();
+    (func, names)
+}
+
+/// A pair that escapes through a call argument, an aggregate field, a store (to a cell, a field,
+/// through a pointer), a view (reference or raw) or a copy that escapes in turn is built as a
+/// real array — even though it is also projected — and still agrees with Rust under Node.
+#[test]
+fn an_overflow_pair_that_escapes_through_any_use_is_built() {
+    let (mut interns, widths) = overflow_world();
+    let keep = interns.intern_str("keep");
+    let mut harness = OverflowHarness::new();
+    for width in widths {
+        for (op, spelled) in OVERFLOW_OPS {
+            for escape in Escape::ALL {
+                let (func, names) = escaping_use(op, width, escape, keep);
+                let names: Vec<(u32, &str)> =
+                    names.iter().map(|(v, name)| (*v, name.as_str())).collect();
+                let name = format!("{spelled}_{}_{escape:?}", width.label());
+                let js = harness.lower(&interns, &name, &func, &names, op, width);
+                assert!(
+                    js.contains("p = [$t"),
+                    "{name}: the escaping pair must be built\n{js}"
+                );
+            }
+        }
+    }
+    harness.run();
 }
 
 #[test]

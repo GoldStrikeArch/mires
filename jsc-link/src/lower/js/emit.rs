@@ -1056,6 +1056,11 @@ impl<'a> JsCx<'a> {
             OpKind::Const(tree) => self.const_expr(tree, result_ty),
             OpKind::Copy(v) => {
                 let value = self.expr_of(*v)?;
+                // A carried overflow pair is a scalar (`rvalue::carried_overflow_pairs`), and
+                // nothing mutates one: its copy is the same value.
+                if self.carried_pairs.contains_key(&result) {
+                    return Ok(value);
+                }
                 let ty = self.ty_of(*v)?;
                 // A committed carrier is cloned at its own shape: the baseline field-wise clone
                 // reads a structure the value no longer has (Phase 4).
@@ -1103,8 +1108,8 @@ impl<'a> JsCx<'a> {
                 variant,
                 field,
             } => {
-                if self.exact_pairs.contains(base) {
-                    return self.overflow_field(*base, *field);
+                if let Some(&pair) = self.carried_pairs.get(base) {
+                    return self.carried_pair_field(pair, *base, *field);
                 }
                 let base_ty = self.ty_of(*base)?;
                 let Some(descriptor) = table.field(base_ty, *variant, *field) else {
@@ -1147,8 +1152,9 @@ impl<'a> JsCx<'a> {
                 Ok(self.read_place(&walk.place))
             }
             OpKind::Binary { op: bin, l, r, ty } => {
-                if self.exact_pairs.contains(&result) {
-                    return self.overflow_exact(*bin, self.expr_of(*l)?, self.expr_of(*r)?);
+                if let Some(pair) = self.carried_pairs.get(&result) {
+                    let (lhs, rhs) = (self.expr_of(*l)?, self.expr_of(*r)?);
+                    return self.carried_pair_value(pair.carrier, *bin, *ty, lhs, rhs);
                 }
                 let rhs_ty = self.ty_of(*r)?;
                 self.binary(

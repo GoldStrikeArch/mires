@@ -13,18 +13,31 @@
 //! Each sweep folds every result into a 32 bit FNV-1a hash and prints it, so a single wrong bit
 //! anywhere changes a printed line, and prints the `overflowing_*` results of a few boundary pairs
 //! outright. The sweeps run several rounds so that the arithmetic is optimized code, not only the
-//! interpreter's first pass. The expectations were validated by transplanting this file onto `std`
-//! with `isize`/`usize` spelled `i32`/`u32` (the target's pointer width) and running it at `-O` and
-//! `-O0` with `-C overflow-checks=off`, which agree.
+//! interpreter's first pass.
+//!
+//! `escapes` then lets a pair leave its op every way a program can — a call argument, a return
+//! value, an array element, a struct field, a closure capture, an `Option` payload, `black_box`,
+//! a `&` and a `&mut` borrow, two pairs into one call, a projected pair that also escapes, a pair
+//! read after a recursive call and one carried across a loop back edge — and hashes each shape on
+//! its own. It spells the operators as the `*_with_overflow` intrinsics, which rustc lowers to the
+//! MIR operators in this crate's own bodies, so every shape reaches the lowering's escape analysis
+//! even without MIR inlining.
+//!
+//! The expectations were validated by transplanting this file onto `std` with `isize`/`usize`
+//! spelled `i32`/`u32` (the target's pointer width) and running it at `-O` and `-O0` with
+//! `-C overflow-checks=off`, which agree.
 
 #![no_std]
 #![no_main]
+#![feature(core_intrinsics)]
+#![allow(internal_features)]
 
 #[path = "prelude.rs"]
 mod prelude;
 use prelude::*;
 
 use core::hint::black_box;
+use core::intrinsics::{add_with_overflow, mul_with_overflow, sub_with_overflow};
 
 /// How many times each sweep runs over its value table.
 const ROUNDS: u32 = 6;
@@ -33,6 +46,7 @@ const ROUNDS: u32 = 6;
 const NONE: u32 = 0x9e37_79b9;
 
 /// A 32 bit FNV-1a accumulator over 32 bit words.
+#[derive(Clone, Copy)]
 struct Hash(u32);
 
 impl Hash {
@@ -112,6 +126,141 @@ escaping!(esc_i8: i8, esc_i16: i16, esc_i32: i32, esc_i64: i64, esc_i128: i128,
     esc_isize: isize, esc_u8: u8, esc_u16: u16, esc_u32: u32, esc_u64: u64, esc_u128: u128,
     esc_usize: usize);
 
+/// Folds both halves of a pair.
+fn fold_pair<T: Value>(hash: &mut Hash, pair: (T, bool)) {
+    pair.0.fold(hash);
+    hash.flag(pair.1);
+}
+
+/// A pair in a struct field.
+#[derive(Clone, Copy)]
+struct Holder<T> {
+    pair: (T, bool),
+    tag: u32,
+}
+
+#[inline(never)]
+fn sink<T>(pair: (T, bool)) -> (T, bool) {
+    pair
+}
+
+#[inline(never)]
+fn sink2<T: Value>(hash: &mut Hash, p: (T, bool), q: (T, bool)) -> bool {
+    p.0.fold(hash);
+    q.0.fold(hash);
+    p.1 ^ q.1
+}
+
+#[inline(never)]
+fn by_ref<T: Copy>(pair: &(T, bool)) -> (T, bool) {
+    *pair
+}
+
+#[inline(never)]
+fn by_mut<T: Copy>(pair: &mut (T, bool)) {
+    pair.1 = !pair.1;
+}
+
+#[inline(never)]
+fn call_it<T, F: Fn() -> (T, bool)>(f: F) -> (T, bool) {
+    f()
+}
+
+/// Defines `escapes(values: &[$t])`: every way a pair can leave the op that made it, each shape
+/// hashed on its own, for every pair of `values`. A macro rather than a generic function, because
+/// the `*_with_overflow` intrinsics are only defined at a concrete integer type.
+macro_rules! escapes {
+    ($t:ty) => {
+        /// A pair returned whole.
+        #[inline(never)]
+        fn made(a: $t, b: $t) -> ($t, bool) {
+            add_with_overflow(a, b)
+        }
+
+        #[inline(never)]
+        fn made_product(a: $t, b: $t) -> ($t, bool) {
+            mul_with_overflow(a, b)
+        }
+
+        /// `p` and `s` are computed before the recursive call; both halves of `p` are read after
+        /// it.
+        #[inline(never)]
+        fn deep(depth: u32, a: $t, b: $t) -> ($t, bool) {
+            let p = mul_with_overflow(a, b);
+            let s = add_with_overflow(a, b);
+            if depth == 0 {
+                return (s.0, s.1 ^ p.1);
+            }
+            let q = deep(depth - 1, b, s.0);
+            let r = add_with_overflow(p.0, q.0);
+            (r.0, r.1 ^ p.1 ^ q.1)
+        }
+
+        #[inline(never)]
+        fn escapes(values: &[$t]) {
+            let mut h = [Hash::new(); 13];
+            for (i, &a) in values.iter().enumerate() {
+                for (j, &b) in values.iter().enumerate() {
+                    let k = i ^ j;
+                    fold_pair(&mut h[0], sink(add_with_overflow(a, b)));
+                    fold_pair(&mut h[0], sink(mul_with_overflow(a, b)));
+                    fold_pair(&mut h[1], made(a, b));
+                    fold_pair(&mut h[1], made_product(a, b));
+                    let mut slots = [(a, false), (b, true)];
+                    slots[k & 1] = add_with_overflow(a, b);
+                    slots[(k >> 1) & 1] = mul_with_overflow(b, a);
+                    fold_pair(&mut h[2], slots[black_box(k) & 1]);
+                    fold_pair(&mut h[2], slots[black_box(k + 1) & 1]);
+                    let held = black_box(Holder {
+                        pair: mul_with_overflow(a, b),
+                        tag: 7,
+                    });
+                    fold_pair(&mut h[3], held.pair);
+                    h[3].flag(held.tag == 7);
+                    let captured = sub_with_overflow(a, b);
+                    fold_pair(&mut h[4], call_it(move || captured));
+                    let wrapped = Some(add_with_overflow(a, b));
+                    let unwrapped = match black_box(wrapped) {
+                        Some(pair) => pair,
+                        None => (a, false),
+                    };
+                    fold_pair(&mut h[5], unwrapped);
+                    fold_pair(&mut h[6], black_box(add_with_overflow(a, b)));
+                    fold_pair(&mut h[6], black_box(mul_with_overflow(a, b)));
+                    let borrowed = add_with_overflow(a, b);
+                    fold_pair(&mut h[7], by_ref(&borrowed));
+                    let mut mutated = mul_with_overflow(a, b);
+                    by_mut(&mut mutated);
+                    fold_pair(&mut h[8], mutated);
+                    let both = sink2(&mut h[9], add_with_overflow(a, b), sub_with_overflow(b, a));
+                    h[9].flag(both);
+                    let p = add_with_overflow(a, b);
+                    let q = sink(p);
+                    fold_pair(&mut h[10], (p.0, p.1 ^ q.1));
+                    q.0.fold(&mut h[10]);
+                    fold_pair(&mut h[11], deep(3, a, b));
+                }
+            }
+            let mut acc = values[0];
+            let mut prev = (values[1], false);
+            for &x in values {
+                let cur = add_with_overflow(acc, x);
+                fold_pair(&mut h[12], prev);
+                prev = cur;
+                let m = mul_with_overflow(cur.0, x);
+                acc = m.0;
+                h[12].flag(m.1);
+            }
+            fold_pair(&mut h[12], prev);
+            acc.fold(&mut h[12]);
+            print_str("escapes");
+            for hash in h {
+                print_u32(hash.0);
+            }
+        }
+    };
+}
+
 /// Sweeps every pair of `values` through every operation, prints the hashes, then prints the
 /// `overflowing_*` results of `edges` outright.
 macro_rules! sweep {
@@ -188,6 +337,8 @@ macro_rules! sweep {
                 flags |= (o as u32) << (3 * i + 2);
             }
             print_u32(flags);
+            escapes!($t);
+            escapes(values);
         }
     };
 }

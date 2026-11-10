@@ -150,11 +150,13 @@ mean in JavaScript.
   to right, so no closure is needed. A 32-bit product is not exact in a double, so its wrapped
   half is `Math.imul(l, r)` and only the flag compares against the rounded `l * r`:
   `[$t0 = Math.imul(a, b) >>> 0, $t0 !== a * b]` (an operand that is not a name or a literal is
-  bound to a temporary by its first read). On the JIR lane a pair every use of which is a
-  `Field` projection is never built (`jsc-link` `rvalue.rs::exact_overflow_pairs`): it is carried
-  as the exact `l op r`, `.0` reads `mask(x)` and `.1` `mask(x) !== x`, except for a 32-bit
-  product, which keeps the array. (The DOM goldens under `examples/dom-tests` predate this and
-  still show the old arrow form, `(($w) => [mask($w), mask($w) !== $w])(l op r)`.)
+  bound to a temporary by its first read). On the JIR lane a pair every use of which — through
+  any `Move`/`Copy` of it — is a `Field` projection is never built (`jsc-link`
+  `rvalue.rs::carried_overflow_pairs`): it is carried as the exact `l op r`, `.0` reads `mask(x)`
+  and `.1` `mask(x) !== x`. A 32-bit product read through one half only is that half alone,
+  `mask(Math.imul(l, r))` or `mask(Math.imul(l, r)) !== l * r`; read through both, it keeps the
+  array. (The DOM goldens under `examples/dom-tests` predate this and still show the old arrow
+  form, `(($w) => [mask($w), mask($w) !== $w])(l op r)`.)
 - `Assert` (`backend/src/base.rs:707-723`, `857-901`): `if (!cond) { <panic> }` where the panic
   is the lang item call (`panic_bounds_check(index, len, <loc>)`,
   `panic_misaligned_pointer_dereference(required, found, <loc>)`,
