@@ -698,32 +698,278 @@ fn u8_arith_masks_and_shift_amounts_match_the_golden() {
     );
 }
 
-#[test]
-fn overflowing_add_is_the_arrow_form() {
-    let interns = world();
-    let mut b = FuncBuilder::new(item(1), signature(vec![U32, U32], OVERFLOW));
-    let a = b.param(U32, NO_ORIGIN);
-    let c = b.param(U32, NO_ORIGIN);
+/// `(r, o) = a.op(b)` returned whole: `p = op(a, b)` is the pair itself.
+fn escaping_overflow(op: BinaryOp, ty: TypeId, pair: TypeId) -> Func {
+    let mut b = FuncBuilder::new(item(1), signature(vec![ty, ty], pair));
+    let x = b.param(ty, NO_ORIGIN);
+    let y = b.param(ty, NO_ORIGIN);
     let e = FuncBuilder::ENTRY;
-    let r = b.op(
+    let p = b.op(e, OpKind::Binary { op, l: x, r: y, ty }, pair, NO_ORIGIN);
+    b.terminate(e, RTerm::Return(Some(p)));
+    b.finish()
+}
+
+/// `let (r, o) = a.op(b); (r, o)`: the pair `p` is only ever projected, and a fresh tuple of its
+/// two fields is what leaves. Values: `a b p r o out`.
+fn projected_overflow(op: BinaryOp, ty: TypeId, pair: TypeId) -> Func {
+    let mut b = FuncBuilder::new(item(1), signature(vec![ty, ty], pair));
+    let x = b.param(ty, NO_ORIGIN);
+    let y = b.param(ty, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let p = b.op(e, OpKind::Binary { op, l: x, r: y, ty }, pair, NO_ORIGIN);
+    let field = |b: &mut FuncBuilder, field, ty| {
+        b.op(
+            e,
+            OpKind::Field {
+                base: p,
+                variant: None,
+                field,
+            },
+            ty,
+            NO_ORIGIN,
+        )
+    };
+    let wrapped = field(&mut b, 0, ty);
+    let overflowed = field(&mut b, 1, BOOL);
+    let out = b.op(
         e,
-        OpKind::Binary {
-            op: BinaryOp::AddWithOverflow,
-            l: a,
-            r: c,
-            ty: U32,
+        OpKind::Aggregate {
+            ty: pair,
+            variant: 0,
+            active_field: None,
+            fields: vec![wrapped, overflowed],
         },
-        OVERFLOW,
+        pair,
         NO_ORIGIN,
     );
-    b.terminate(e, RTerm::Return(Some(r)));
+    b.terminate(e, RTerm::Return(Some(out)));
+    b.finish()
+}
+
+/// The test world plus the integer widths and `(T, bool)` pairs the overflow tests sweep:
+/// `(element, pair, signed, bits)`.
+fn overflow_world() -> (Interns, Vec<(TypeId, TypeId, bool, u32)>) {
+    const I8: TypeId = TypeId(60);
+    const U16: TypeId = TypeId(61);
+    const U64: TypeId = TypeId(62);
+    let mut interns = world();
+    interns.intern_type(int(I8, true, 8));
+    interns.intern_type(int(U16, false, 16));
+    interns.intern_type(int(U64, false, 64));
+    let mut widths = vec![(U32, OVERFLOW, false, 32)];
+    for (index, (element, signed, bits)) in [
+        (I8, true, 8),
+        (U8, false, 8),
+        (U16, false, 16),
+        (I32, true, 32),
+        (I64, true, 64),
+        (U64, false, 64),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let pair = TypeId(70 + index as u128);
+        let mut descriptor = descriptor(pair, TypeKind::Tuple(vec![element, BOOL]), 16);
+        descriptor.js.is_indirect = true;
+        descriptor.js.needs_clone = true;
+        descriptor.js.fields = vec![
+            field(FieldKey::Index(0), element),
+            field(FieldKey::Index(1), BOOL),
+        ];
+        interns.intern_type(descriptor);
+        widths.push((element, pair, signed, bits));
+    }
+    (interns, widths)
+}
+
+#[test]
+fn an_escaping_overflow_pair_is_an_array_without_a_closure() {
+    let interns = world();
+    let func = escaping_overflow(BinaryOp::AddWithOverflow, U32, OVERFLOW);
+    let plan = plan_of(&func, &[(0, "a"), (1, "b")]);
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+    assert_eq!(
+        js,
+        "function f(a, b) {\n  let $t0, $t1;\n  return [$t1 = ($t0 = a + b) >>> 0, $t1 !== $t0];\n}\n"
+    );
+}
+
+#[test]
+fn an_escaping_32_bit_product_wraps_through_imul() {
+    let interns = world();
+    let func = escaping_overflow(BinaryOp::MulWithOverflow, U32, OVERFLOW);
+    let plan = plan_of(&func, &[(0, "a"), (1, "b")]);
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+    assert_eq!(
+        js,
+        "function f(a, b) {\n  let $t0;\n  return [$t0 = Math.imul(a, b) >>> 0, $t0 !== a * b];\n}\n"
+    );
+}
+
+#[test]
+fn a_projected_overflow_pair_is_its_exact_result() {
+    let (interns, widths) = overflow_world();
+    let (_, i32_pair, ..) = widths[4];
+    let func = projected_overflow(BinaryOp::AddWithOverflow, I32, i32_pair);
+    let plan = plan_of(&func, &[(0, "a"), (1, "b"), (2, "p"), (3, "r"), (4, "o")]);
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+    assert_eq!(
+        js,
+        "function f(a, b) {\n  let p, r, o;\n  p = a + b;\n  r = p | 0;\n  o = (p | 0) !== p;\n  return [r, o];\n}\n"
+    );
+}
+
+#[test]
+fn an_inline_projected_overflow_pair_binds_one_temporary() {
+    let (interns, widths) = overflow_world();
+    let (_, i64_pair, ..) = widths[5];
+    let mut b = FuncBuilder::new(item(1), signature(vec![I64, I64], BOOL));
+    let x = b.param(I64, NO_ORIGIN);
+    let y = b.param(I64, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let p = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::SubWithOverflow,
+            l: x,
+            r: y,
+            ty: I64,
+        },
+        i64_pair,
+        NO_ORIGIN,
+    );
+    let overflowed = b.op(
+        e,
+        OpKind::Field {
+            base: p,
+            variant: None,
+            field: 1,
+        },
+        BOOL,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(overflowed)));
     let func = b.finish();
     let plan = plan_of(&func, &[(0, "a"), (1, "b")]);
     let body = body_of(BodyKind::Function, func.sig.clone());
     let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
     assert_eq!(
         js,
-        "function f(a, b) {\n  return (($w) => [$w >>> 0, $w >>> 0 !== $w])(a + b);\n}\n"
+        "function f(a, b) {\n  let $t0;\n  return BigInt.asIntN(64, $t0 = a - b) !== $t0;\n}\n"
+    );
+}
+
+#[test]
+fn a_32_bit_product_pair_is_built_even_when_projected() {
+    let interns = world();
+    let func = projected_overflow(BinaryOp::MulWithOverflow, U32, OVERFLOW);
+    let plan = plan_of(&func, &[(0, "a"), (1, "b"), (2, "p"), (3, "r"), (4, "o")]);
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+    assert!(
+        js.contains("p = [$t0 = Math.imul(a, b) >>> 0, $t0 !== a * b];")
+            && js.contains("r = p[0];")
+            && js.contains("o = p[1];"),
+        "{js}"
+    );
+}
+
+/// Every pair shape — projected (carried as the exact result) and escaping (an array) — of every
+/// overflow operator at every representation, run under Node at the boundary values and compared
+/// with Rust's own `overflowing_*`.
+#[test]
+fn overflow_pairs_agree_with_rust_at_every_width() {
+    let (interns, widths) = overflow_world();
+    let mut source = String::from(
+        "'use strict';\nconst assert = require('node:assert/strict');\nconst cases = [];\n",
+    );
+    let ops = [
+        (BinaryOp::AddWithOverflow, "add"),
+        (BinaryOp::SubWithOverflow, "sub"),
+        (BinaryOp::MulWithOverflow, "mul"),
+    ];
+    for (element, pair, signed, bits) in widths {
+        let (min, max): (i128, i128) = if signed {
+            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        } else {
+            (0, (1i128 << bits) - 1)
+        };
+        let half = 1i128 << (bits / 2);
+        let edges = [min, min + 1, max - 1, max, -half, half - 1, half];
+        let mut values: Vec<i128> = edges.into_iter().chain(-2..=2).collect();
+        values.retain(|value| (min..=max).contains(value));
+        let wrap = |value: i128| {
+            let modulus = 1i128 << bits;
+            let low = value.rem_euclid(modulus);
+            if signed && low > max {
+                low - modulus
+            } else {
+                low
+            }
+        };
+        let literal = |value: i128| {
+            if bits > 32 {
+                format!("{value}n")
+            } else {
+                value.to_string()
+            }
+        };
+        for (op, spelled) in ops {
+            for (shape, func) in [
+                ("projected", projected_overflow(op, element, pair)),
+                ("escaping", escaping_overflow(op, element, pair)),
+            ] {
+                let name = format!("{spelled}_{}{bits}_{shape}", if signed { 'i' } else { 'u' });
+                let plan = plan_of(&func, &[(0, "a"), (1, "b"), (2, "p"), (3, "r"), (4, "o")]);
+                let body = body_of(BodyKind::Function, func.sig.clone());
+                source.push_str(&lower(
+                    &interns,
+                    &name,
+                    &[],
+                    &body,
+                    &func,
+                    &plan,
+                    straight(&func),
+                ));
+                for &a in &values {
+                    for &b in &values {
+                        // A 64 bit product can leave `i128` too; it has overflowed either way,
+                        // and wrapping modulo 2^128 keeps the low bits.
+                        let (wrapped, overflowed) = match op {
+                            BinaryOp::AddWithOverflow => (wrap(a + b), wrap(a + b) != a + b),
+                            BinaryOp::SubWithOverflow => (wrap(a - b), wrap(a - b) != a - b),
+                            _ => match a.checked_mul(b) {
+                                Some(exact) => (wrap(exact), wrap(exact) != exact),
+                                None => (wrap(a.wrapping_mul(b)), true),
+                            },
+                        };
+                        source.push_str(&format!(
+                            "cases.push(['{name}', {name}, {}, {}, {}, {overflowed}]);\n",
+                            literal(a),
+                            literal(b),
+                            literal(wrapped),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    source.push_str(
+        "for (const [name, f, a, b, wrapped, overflowed] of cases) {\n  const [r, o] = f(a, b);\n  \
+         assert.ok(r === wrapped && o === overflowed, `${name}(${a}, ${b}) = [${r}, ${o}], \
+         want [${wrapped}, ${overflowed}]`);\n}\nconsole.log(cases.length);\n",
+    );
+    let output = std::process::Command::new("node")
+        .args(["-e", &source])
+        .output()
+        .expect("Node is required by the compiler semantic tests");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -3298,6 +3544,39 @@ fn an_intrinsic_with_a_prelude_emits_its_statements_before_the_binding() {
         concat!(
             "function f(x, y) {\n  let s, $t0;\n  $t0 = x + y;\n",
             "  s = $t0 > 255 ? 255 : $t0 < 0 ? 0 : $t0;\n  return s;\n}\n"
+        )
+    );
+}
+
+#[test]
+fn the_mul_with_overflow_intrinsic_wraps_a_32_bit_product_through_imul() {
+    let mut interns = world();
+    let name = interns.intern_str("mul_with_overflow");
+    let e = FuncBuilder::ENTRY;
+    let mut b = FuncBuilder::new(item(1), signature(vec![U32, U32], OVERFLOW));
+    let x = b.param(U32, NO_ORIGIN);
+    let y = b.param(U32, NO_ORIGIN);
+    let pair = b.op(
+        e,
+        OpKind::Intrinsic {
+            name,
+            types: vec![U32],
+            fallback: None,
+            args: vec![x, y],
+        },
+        OVERFLOW,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(pair)));
+    let func = b.finish();
+    let plan = plan_of(&func, &[(0, "x"), (1, "y"), (pair.0, "p")]);
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+    assert_eq!(
+        js,
+        concat!(
+            "function f(x, y) {\n  let p, $t0, $t1;\n  $t0 = x * y;\n",
+            "  $t1 = Math.imul(x, y) >>> 0;\n  p = [$t1, $t1 !== $t0];\n  return p;\n}\n"
         )
     );
 }

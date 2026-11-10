@@ -1,11 +1,15 @@
 //! Operators, casts, aggregates and discriminants (v1 `backend/src/rvalue.rs` and the coercion
 //! rows of `unsize.rs` that need no vtable name).
 
+use std::collections::BTreeSet;
+
 use rcgjs_object::evaluation::OperandEvaluation;
 use rcgjs_object::jir::decline::OpClass;
-use rcgjs_object::jir::repr::ValueId;
+use rcgjs_object::jir::repr::{Func, OpKind, ValueId};
 use rcgjs_object::jir::semantic::{BinaryOp, CastKind, UnaryOp};
-use rcgjs_object::jir::types::{EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind};
+use rcgjs_object::jir::types::{
+    EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind, TypeTable,
+};
 use rcgjs_object::jsast::{self, BinOp as JsBinOp, Expr};
 use rcgjs_object::ptr;
 
@@ -13,8 +17,81 @@ use super::call::Lowered;
 use super::value::{self, mask, mask_ty, TAG};
 use super::{decline, JsCx, Res};
 
-/// The parameter the checked-arithmetic arrow binds its exact result to (`rvalue.rs:24`).
-const OVERFLOW_PARAM: &str = "$w";
+/// The JavaScript operator of an overflow-reporting operator, applied at full precision.
+fn overflow_operator(op: BinaryOp) -> Option<JsBinOp> {
+    match op {
+        BinaryOp::AddWithOverflow => Some(JsBinOp::Add),
+        BinaryOp::SubWithOverflow => Some(JsBinOp::Sub),
+        BinaryOp::MulWithOverflow => Some(JsBinOp::Mul),
+        _ => None,
+    }
+}
+
+/// Whether `op` at `ty` can carry its `(T, bool)` pair as the exact JavaScript result `x` alone:
+/// the wrapped half is then `mask(x)` and the flag `mask(x) !== x`.
+///
+/// Every sum and difference can: two integers of at most 32 bits add exactly in a double, and a
+/// `BigInt` result is exact by construction. So can a product of at most 16 bits (below 2^32) or
+/// in `BigInt`. A 32 bit product cannot — the double rounds away the low bits a wrap keeps — and
+/// keeps the array form of [`JsCx::binary`].
+fn exact_overflow(table: &TypeTable, op: BinaryOp, ty: TypeId) -> bool {
+    let Some((_, bits)) = table.int_info(ty) else {
+        return false;
+    };
+    let limit = if op == BinaryOp::MulWithOverflow {
+        16
+    } else {
+        32
+    };
+    overflow_operator(op).is_some() && (table.int_repr(ty) == IntRepr::BigInt || bits <= limit)
+}
+
+/// The overflow pairs of `func` that are never built: results of `AddWithOverflow` and its
+/// siblings that [`exact_overflow`] admits and that every use takes apart with a `Field`
+/// projection, the `let (r, o) = a.overflowing_add(b)` and `checked_*` shape.
+///
+/// Such a value is carried as its exact result (`JsCx::op_expr` spells only `l op r`), and each
+/// projection reads its half off that ([`JsCx::overflow_field`]). Any other use — a block
+/// argument, a copy, a store, a call argument, a return — needs the real pair and keeps the
+/// array. Unsigned sums usually never get here: `opt::dce` already splits a projected one into a
+/// wrapped add and a comparison.
+pub(super) fn exact_overflow_pairs(func: &Func, table: &TypeTable) -> BTreeSet<ValueId> {
+    let mut pairs: BTreeSet<ValueId> = func
+        .blocks
+        .iter()
+        .flat_map(|block| &block.ops)
+        .filter_map(|op| match (op.result, &op.kind) {
+            (Some(result), OpKind::Binary { op, ty, .. }) if exact_overflow(table, *op, *ty) => {
+                Some(result)
+            }
+            _ => None,
+        })
+        .collect();
+    if pairs.is_empty() {
+        return pairs;
+    }
+    for block in &func.blocks {
+        for op in &block.ops {
+            let projection = matches!(
+                op.kind,
+                OpKind::Field {
+                    variant: None,
+                    field: 0 | 1,
+                    ..
+                }
+            );
+            if !projection {
+                for used in op.kind.uses() {
+                    pairs.remove(&used);
+                }
+            }
+        }
+        for used in block.term.uses() {
+            pairs.remove(&used);
+        }
+    }
+    pairs
+}
 
 impl<'a> JsCx<'a> {
     /// `l op r` at operand type `ty` (`rvalue.rs::codegen_rvalue`, `BinaryOp` arm).
@@ -71,8 +148,71 @@ impl<'a> JsCx<'a> {
         ))
     }
 
-    /// `AddWithOverflow` and its siblings (`rvalue.rs::codegen_with_overflow`).
+    /// `AddWithOverflow` and its siblings as a real pair (`rvalue.rs::codegen_with_overflow`): the
+    /// array `[$u = mask($t = l op r), $u !== $t]`.
+    ///
+    /// An rvalue has no statement position, so the exact result is bound by an assignment to a
+    /// hoisted temporary inside the first element (`ptr.rs::reread`'s idiom) and read back by the
+    /// second; array elements evaluate left to right, and that is all the sequencing it needs —
+    /// no closure. A 32 bit product is not exact in a double, so its wrapped half is
+    /// `Math.imul` over the operands, and only the flag compares against the rounded product: a
+    /// product outside the type's range rounds to a double outside it too, never to a value
+    /// inside.
     fn with_overflow(&self, op: BinaryOp, ty: TypeId, lhs: Expr, rhs: Expr) -> Res<Expr> {
+        let (Some((signed, bits)), Some(js_op)) = (self.table.int_info(ty), overflow_operator(op))
+        else {
+            return Err(decline(
+                OpClass::Rvalue,
+                "overflowing arithmetic on a non-integer",
+            ));
+        };
+        let repr = self.table.int_repr(ty);
+        let (wrapped, exact) =
+            if op == BinaryOp::MulWithOverflow && repr == IntRepr::Number && bits == 32 {
+                let (lhs, lhs_again) = self.read_twice(lhs);
+                let (rhs, rhs_again) = self.read_twice(rhs);
+                (
+                    jsast::imul(lhs, rhs),
+                    jsast::binary(JsBinOp::Mul, lhs_again, rhs_again),
+                )
+            } else {
+                let exact = self.temp_name();
+                (
+                    jsast::assign(exact.clone(), jsast::binary(js_op, lhs, rhs)),
+                    exact,
+                )
+            };
+        let bound = self.temp_name();
+        Ok(jsast::array(vec![
+            jsast::assign(bound.clone(), mask(repr, signed, bits, wrapped)),
+            jsast::binary(JsBinOp::StrictNe, bound, exact),
+        ]))
+    }
+
+    /// The value of an overflow pair [`exact_overflow_pairs`] admitted: the exact `l op r`, with
+    /// no wrap and no pair around it.
+    pub(super) fn overflow_exact(&self, op: BinaryOp, lhs: Expr, rhs: Expr) -> Res<Expr> {
+        let Some(js_op) = overflow_operator(op) else {
+            return Err(decline(
+                OpClass::Rvalue,
+                format!("`{op:?}` carried as an exact overflow result"),
+            ));
+        };
+        Ok(jsast::binary(js_op, lhs, rhs))
+    }
+
+    /// Field `field` of an overflow pair [`exact_overflow_pairs`] admitted, read off its exact
+    /// result `x`: the wrapped `mask(x)`, or the flag `mask(x) !== x`.
+    pub(super) fn overflow_field(&self, pair: ValueId, field: u32) -> Res<Expr> {
+        let ty = match self.def_of(pair).map(|def| &def.kind) {
+            Some(OpKind::Binary { ty, .. }) => *ty,
+            _ => {
+                return Err(decline(
+                    OpClass::Rvalue,
+                    "an exact overflow pair that no `Binary` op defines",
+                ))
+            }
+        };
         let Some((signed, bits)) = self.table.int_info(ty) else {
             return Err(decline(
                 OpClass::Rvalue,
@@ -80,24 +220,32 @@ impl<'a> JsCx<'a> {
             ));
         };
         let repr = self.table.int_repr(ty);
-        let js_op = match op {
-            BinaryOp::AddWithOverflow => JsBinOp::Add,
-            BinaryOp::SubWithOverflow => JsBinOp::Sub,
-            _ => JsBinOp::Mul,
-        };
-        let exact = jsast::binary(js_op, lhs, rhs);
-        let bound = jsast::id(OVERFLOW_PARAM);
-        let wrapped = mask(repr, signed, bits, bound.clone());
-        Ok(jsast::call(
-            jsast::arrow(
-                vec![OVERFLOW_PARAM.to_string()],
-                jsast::array(vec![
-                    wrapped.clone(),
-                    jsast::binary(JsBinOp::StrictNe, wrapped, bound),
-                ]),
-            ),
-            vec![exact],
-        ))
+        let exact = self.expr_of(pair)?;
+        Ok(match field {
+            0 => mask(repr, signed, bits, exact),
+            _ => {
+                let (exact, again) = self.read_twice(exact);
+                jsast::binary(JsBinOp::StrictNe, mask(repr, signed, bits, exact), again)
+            }
+        })
+    }
+
+    /// `value` read twice, evaluated once: itself when it is a name or a literal, otherwise an
+    /// assignment to a hoisted temporary for the first read and the temporary for the second.
+    fn read_twice(&self, value: Expr) -> (Expr, Expr) {
+        if matches!(
+            value,
+            Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_) | Expr::BigInt(_)
+        ) {
+            return (value.clone(), value);
+        }
+        let name = self.temp_name();
+        (jsast::assign(name.clone(), value), name)
+    }
+
+    /// A fresh hoisted temporary, for an assignment spelled inside an expression.
+    fn temp_name(&self) -> Expr {
+        self.temp(jsast::undefined()).1
     }
 
     /// Every other binary operator (`rvalue.rs::codegen_binop`).

@@ -1103,6 +1103,9 @@ impl<'a> JsCx<'a> {
                 variant,
                 field,
             } => {
+                if self.exact_pairs.contains(base) {
+                    return self.overflow_field(*base, *field);
+                }
                 let base_ty = self.ty_of(*base)?;
                 let Some(descriptor) = table.field(base_ty, *variant, *field) else {
                     return Err(decline(
@@ -1144,6 +1147,9 @@ impl<'a> JsCx<'a> {
                 Ok(self.read_place(&walk.place))
             }
             OpKind::Binary { op: bin, l, r, ty } => {
+                if self.exact_pairs.contains(&result) {
+                    return self.overflow_exact(*bin, self.expr_of(*l)?, self.expr_of(*r)?);
+                }
                 let rhs_ty = self.ty_of(*r)?;
                 self.binary(
                     *bin,

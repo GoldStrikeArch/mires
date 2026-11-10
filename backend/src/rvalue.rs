@@ -20,10 +20,6 @@ use crate::base::FnCx;
 use crate::jsast::{self, BinOp as JsBinOp, Expr};
 use crate::value::{self, int_info, int_repr, mask, mask_ty, typing_env, IntRepr};
 
-/// The parameter the checked-arithmetic arrow binds its exact result to. `$`-leading, so it can
-/// never collide with a Rust identifier or with a local (`naming.rs` reserves the namespace).
-const OVERFLOW_PARAM: &str = "$w";
-
 impl<'tcx> FnCx<'_, 'tcx> {
     /// Lowers one rvalue.
     ///
@@ -340,13 +336,16 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// `BinOp::AddWithOverflow` and its siblings: the wrapped result paired with whether it
     /// wrapped.
     ///
-    /// The destination is a `(T, bool)` tuple, which is a two element JS array. The exact result is
-    /// computed once and bound by an immediately applied arrow function: a `let` would need a
-    /// statement, and an rvalue is lowered in expression position.
+    /// The destination is a `(T, bool)` tuple, which is a two element JS array:
+    /// `[$u = mask($t = l op r), $u !== $t]`. An rvalue is lowered in expression position, so the
+    /// exact result is bound by an assignment to a hoisted temporary inside the first element and
+    /// read back by the second; array elements evaluate left to right, so it is computed once
+    /// without a closure.
     ///
-    /// A 32 bit product is not exact in a double, and does not have to be — it is only compared for
-    /// *equality* with the wrapped result, and a rounded product that overflowed is never equal to
-    /// it.
+    /// A 32 bit product is not exact in a double. The flag does not need it to be — it only
+    /// compares the product for *equality* with the wrapped result, and a rounded product that
+    /// overflowed is never equal to it — but the wrapped result does, so it is `Math.imul` over
+    /// the operands rather than `mask(exact)`.
     fn codegen_with_overflow(&self, op: MirBinOp, ty: Ty<'tcx>, lhs: Expr, rhs: Expr) -> Expr {
         let Some((signed, bits)) = int_info(self.tcx, ty) else {
             return self.zombie(format!(
@@ -359,19 +358,33 @@ impl<'tcx> FnCx<'_, 'tcx> {
             MirBinOp::SubWithOverflow => JsBinOp::Sub,
             _ => JsBinOp::Mul,
         };
-        let exact = jsast::binary(js_op, lhs, rhs);
-        let bound = jsast::id(OVERFLOW_PARAM);
-        let wrapped = mask(repr, signed, bits, bound.clone());
-        jsast::call(
-            jsast::arrow(
-                vec![OVERFLOW_PARAM.to_string()],
-                jsast::array(vec![
-                    wrapped.clone(),
-                    jsast::binary(JsBinOp::StrictNe, wrapped, bound),
-                ]),
-            ),
-            vec![exact],
-        )
+        let temp = || self.temp(jsast::undefined()).1;
+        let (wrapped, exact) = if js_op == JsBinOp::Mul && repr == IntRepr::Number && bits == 32 {
+            let read_twice = |value: Expr| match value {
+                Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_) => (value.clone(), value),
+                value => {
+                    let name = temp();
+                    (jsast::assign(name.clone(), value), name)
+                }
+            };
+            let (lhs, lhs_again) = read_twice(lhs);
+            let (rhs, rhs_again) = read_twice(rhs);
+            (
+                jsast::imul(lhs, rhs),
+                jsast::binary(JsBinOp::Mul, lhs_again, rhs_again),
+            )
+        } else {
+            let exact = temp();
+            (
+                jsast::assign(exact.clone(), jsast::binary(js_op, lhs, rhs)),
+                exact,
+            )
+        };
+        let bound = temp();
+        jsast::array(vec![
+            jsast::assign(bound.clone(), mask(repr, signed, bits, wrapped)),
+            jsast::binary(JsBinOp::StrictNe, bound, exact),
+        ])
     }
 
     fn codegen_binop(

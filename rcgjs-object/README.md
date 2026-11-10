@@ -144,11 +144,17 @@ mean in JavaScript.
 - `Cmp` (`rvalue.rs:305-343`): `l < r ? Less : (l === r ? Equal : Greater)` with the three
   `Ordering` values spelled by `enum_value`, which for the real `core::cmp::Ordering`
   (`#[repr(i8)]`, fieldless) is `-1`, `0`, `1` (*code only*).
-- `AddWithOverflow`/`SubWithOverflow`/`MulWithOverflow` (`rvalue.rs:355-380`): a two-element
-  array from an immediately applied arrow, `(($w) => [mask($w), mask($w) !== $w])(l op r)`,
-  with the plain JS operator inside (never `Math.imul`, so an overflowed product is caught).
-  Golden `examples/dom-tests/13_topcoat_for.js.expected:251`:
-  `(($w) => [$w >>> 0, $w >>> 0 !== $w])((_52 >>> 0) * (cap >>> 0))`.
+- `AddWithOverflow`/`SubWithOverflow`/`MulWithOverflow` (`rvalue.rs::codegen_with_overflow`): a
+  two-element array whose first element binds the exact result to a hoisted temporary and whose
+  second reads it back, `[$t1 = mask($t0 = l op r), $t1 !== $t0]` — array elements evaluate left
+  to right, so no closure is needed. A 32-bit product is not exact in a double, so its wrapped
+  half is `Math.imul(l, r)` and only the flag compares against the rounded `l * r`:
+  `[$t0 = Math.imul(a, b) >>> 0, $t0 !== a * b]` (an operand that is not a name or a literal is
+  bound to a temporary by its first read). On the JIR lane a pair every use of which is a
+  `Field` projection is never built (`jsc-link` `rvalue.rs::exact_overflow_pairs`): it is carried
+  as the exact `l op r`, `.0` reads `mask(x)` and `.1` `mask(x) !== x`, except for a 32-bit
+  product, which keeps the array. (The DOM goldens under `examples/dom-tests` predate this and
+  still show the old arrow form, `(($w) => [mask($w), mask($w) !== $w])(l op r)`.)
 - `Assert` (`backend/src/base.rs:707-723`, `857-901`): `if (!cond) { <panic> }` where the panic
   is the lang item call (`panic_bounds_check(index, len, <loc>)`,
   `panic_misaligned_pointer_dereference(required, found, <loc>)`,
@@ -356,7 +362,7 @@ mean in JavaScript.
   reference to the place (`base.rs:826-846`).
 - Locals are declared once at the top of the function in one `let` list (`base.rs:414-459`).
   Reserved names: `$tN` hoisted temporaries, `$sN` structurizer scrutinee temporaries, `$aN`
-  thunk parameters, `$w` overflow binder, `$e` clone parameter, `$c` captured environment,
+  thunk parameters, `$w` waker parameter, `$e` clone parameter, `$c` captured environment,
   `$loc`, `<name>$eN` spread parameters.
 
 ### Panics, aborts, unwinding

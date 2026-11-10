@@ -598,16 +598,23 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
     fn with_overflow(&self, name: &str, int: Int) -> Outcome {
         let lhs = self.arg(0);
         let rhs = self.arg(1);
+        let product = name == "mul_with_overflow";
         let exact = match name {
             "add_with_overflow" => jsast::binary(JsBinOp::Add, lhs, rhs),
             "sub_with_overflow" => jsast::binary(JsBinOp::Sub, lhs, rhs),
             // A 32 bit product overflows a double's 53 bit mantissa, so this is not always the
-            // exact product. It does not have to be: it is only compared for *equality* with the
-            // wrapped result, and a rounded product that overflowed is never equal to it.
+            // exact product. The flag does not need it to be: it only compares the product for
+            // *equality* with the wrapped result, and a rounded product that overflowed is never
+            // equal to it. The wrapped result does, so it is `Math.imul`, never `mask(exact)`.
             _ => jsast::binary(JsBinOp::Mul, lhs, rhs),
         };
         let exact = self.temp(exact);
-        let wrapped = self.temp(mask(int.repr, int.signed, int.bits, exact.clone()));
+        let wrapping = if product && int.repr == IntRepr::Number && int.bits == 32 {
+            int.multiply(self.arg(0), self.arg(1))
+        } else {
+            exact.clone()
+        };
+        let wrapped = self.temp(mask(int.repr, int.signed, int.bits, wrapping));
         Outcome::Value(jsast::array(vec![
             wrapped.clone(),
             jsast::binary(JsBinOp::StrictNe, wrapped, exact),

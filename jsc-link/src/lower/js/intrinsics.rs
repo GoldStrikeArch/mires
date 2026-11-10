@@ -617,16 +617,26 @@ impl Intrinsic<'_, '_> {
     }
 
     /// `add_with_overflow` and its siblings: the wrapped result paired with whether it wrapped.
+    ///
+    /// A 32 bit product is not exact in a double, so its wrapped half is `Math.imul` over the
+    /// (captured) operands; the flag still compares against the rounded product, which lands
+    /// outside the type's range exactly when the true product does.
     fn with_overflow(&self, name: &str, int: Int) -> Res<Outcome> {
         let lhs = self.arg(0)?;
         let rhs = self.arg(1)?;
-        let exact = match name {
-            "add_with_overflow" => jsast::binary(BinOp::Add, lhs, rhs),
-            "sub_with_overflow" => jsast::binary(BinOp::Sub, lhs, rhs),
-            _ => jsast::binary(BinOp::Mul, lhs, rhs),
+        let product = name == "mul_with_overflow";
+        let op = match name {
+            "add_with_overflow" => BinOp::Add,
+            "sub_with_overflow" => BinOp::Sub,
+            _ => BinOp::Mul,
         };
-        let exact = self.temp(exact);
-        let wrapped = self.temp(value::mask(int.repr, int.signed, int.bits, exact.clone()));
+        let exact = self.temp(jsast::binary(op, lhs.clone(), rhs.clone()));
+        let wrapping = if product && int.repr == IntRepr::Number && int.bits == 32 {
+            int.multiply(lhs, rhs)
+        } else {
+            exact.clone()
+        };
+        let wrapped = self.temp(value::mask(int.repr, int.signed, int.bits, wrapping));
         Ok(Outcome::Value(jsast::array(vec![
             wrapped.clone(),
             jsast::binary(BinOp::StrictNe, wrapped, exact),

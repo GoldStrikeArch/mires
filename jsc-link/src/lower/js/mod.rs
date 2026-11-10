@@ -36,7 +36,7 @@ pub mod value;
 mod tests;
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rcgjs_object::item::{FlatZombie, JsName, ZombieKind};
 use rcgjs_object::jir::decline::{Decline, LowerDecline, OpClass};
@@ -121,6 +121,8 @@ pub struct JsCx<'a> {
     pending_return: RefCell<Option<Expr>>,
     /// The defining op of every value an op defines: `(block, index)`.
     defs: BTreeMap<ValueId, (u32, u32)>,
+    /// Overflow pairs carried as their exact result (`rvalue::exact_overflow_pairs`).
+    exact_pairs: BTreeSet<ValueId>,
 }
 
 impl<'a> JsCx<'a> {
@@ -166,6 +168,7 @@ impl<'a> JsCx<'a> {
             origin: Cell::new(None),
             pending_return: RefCell::new(None),
             defs,
+            exact_pairs: rvalue::exact_overflow_pairs(func, table),
         }
     }
 
