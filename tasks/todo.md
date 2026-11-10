@@ -11,7 +11,7 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 
 ## Stage 1 — correctness (P02/P03)
 - [x] 1a ZST aggregate storage/drop: 195_zst_array_drops, audit_zst_closure_drop, audit_zst_vec_drop (merged; fixtures 114, 115)
-- [ ] 1b audit_aggregate_place identity — first verification FAILED on runtime regression (struct field store 5.7–8.4×, ptr_eq 2.9×, ptr_cmp 6.3×, fflate 1.26×) and a v1-lane borrowed-local bug; sent back for rework
+- [ ] 1b audit_aggregate_place identity — round 3 delivered (uncommitted in worktree agent-a1ab8f94…, on main+3a+fusion): known-gaps 6/6; field-wise inline stores; pointer-valued places rebind; v1 borrowed-field fix; perf ratios vs base ≤1.03 on p50 (minisearch min-of-samples 1.07–1.10 unresolved); compact +2.0% gzip. Under Fable 5.2 xhigh verification.
 - [ ] check-known-gaps 6/6; suites green; R1 row
 
 ## Stage 2 — compile cost (P04), equivalent output
@@ -40,8 +40,9 @@ Attribution (Node, per call): marked 79.8 ms = 92% `str_bytes` re-encoding the w
 - [x] 5a' BUG (fixed with 5a: granule free-list allocator; 1.1M allocs tested): `__rt.addr` mints `4096*++_addrNext` and never reuses; wraps to 0 after 2^20 mints → `NonNull::new` reports null → "memory allocation failed" (minisearch dies after 3,705 calls). Fix with the string work.
 - [ ] 5b P16 runtime heap registry off hot paths (`_heap_block`, `addr` in fresh-block NonNull, `_put` box set, `dealloc` freed set) — after 1b lands (same shim functions); minisearch −24%, marked residual −20%
 - [ ] 5c structural: keep byte-derived `&str` as `{buf,off,len}` views, convert only at the host boundary (removes the quadratic structurally) — after 5a measured
-- [ ] 5d lowering: `*_with_overflow` without IIFE closure+array (`lower/js/intrinsics.rs:619-633`); `Range::next`/`Option` result objects (SROA/inlining after 3b); hoist track_caller Location literals (P13) — fflate CRC −50% of compiler-added cost
-- [ ] 5e binding: bulk `Vec<u8>`→`Uint8Array` export path (fflate −39%)
+- [ ] 5d1 delivered (uncommitted, worktree agent-a91cccad…, under verification): overflow pairs without IIFE; projected-only pairs never built; FOUND+FIXED exactness bug: 32-bit `overflowing_mul` wrapped value used a rounded double (`u32::MAX.overflowing_mul(u32::MAX)` gave 0, native 1) → `Math.imul`. fflate closures/call 490K→4; time neutral in steady state.
+- [ ] 5d (remaining) lowering: `*_with_overflow` without IIFE closure+array (`lower/js/intrinsics.rs:619-633`); `Range::next`/`Option` result objects (SROA/inlining after 3b); hoist track_caller Location literals (P13) — fflate CRC −50% of compiler-added cost
+- [ ] 5e delivered (uncommitted, worktree agent-a9d7348c…, under verification): one host op per byte-buffer crossing (`JsUint8Array::from_slice`/`copy_to_slice`/`to_vec`); fflate 33–36× → 17.5–19.6× vs JS in Node. Note: `01_chart.js.expected` extern golden was stale on main (rebaselined there).
 - [ ] P10 strings / P12 formatter / P13–P16 bounded passes / browser timing matrix
 - [ ] 2e (policy arm, not equivalence): cheaper trial compression (e.g. gzip-only or brotli q5 for trial ranking, brotli-11 only for the final candidate) — must be qualified as a decision-policy change with before/after decision diffs
 
@@ -64,3 +65,6 @@ Attribution (Node, per call): marked 79.8 ms = 92% `str_bytes` re-encoding the w
 - Found by 5a: native `String` builders (`{text,cap}`) call `str_len(text)` on every push → quadratic string building; needs a byte-length field on the StringBuilder carrier (P10 item 2). `&mut str` writes through `as_bytes_mut`/`make_ascii_uppercase` are lost (documented zombie), now contained by `str_bytes_mut`.
 - DOM-skip verifier limits: the plain-mode loop-callback shape rule exempts an IIFE's inner thunk from the free-variable scan (`--snapshot` covers it in the inlined build); non-shadow matrix rows still PASS on exit 0 with no count line (pre-existing); `contract/fixtures/l2-status.json` `$howToRegenerate` text is stale until a `--record` run.
 - Address model limit (pre-existing, confirmed by the 5a verifier): a heap block larger than 4096 bytes gets a 4096 granule, so synthetic addresses of its elements beyond byte 4096 alias the next live block's base. Only relations are observable, but `ptr_cmp` across such blocks can be wrong. Fix: size the granule to the block (or cap element addressing) — CONTRACT.md should state it until then.
+- 5a2 delivered (uncommitted, worktree agent-a8bb8d77…, under verification): native String builder `{text,cap,len}` → linear building (64 KB of 1-byte pushes 5,589 → 18.8 ms). No real workload commits a builder today (marked's String stays baseline because of `is_empty`/`reserve`), so corpus/compact are byte-identical: value depends on widening builder commitment later.
+- Granule address fix (blocks >4096 bytes) in progress (worktree agent-acd9d634…; implementer resumed after a network error).
+- USER ACTION: `git stash list` shows `stash@{0}` "s1b-a1ab8f94-r4-premerge-fusion" left by the 1b implementer (its `git stash drop` was denied by the permission classifier). Already applied in its worktree; safe to drop, but that is the user's call.
