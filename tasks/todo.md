@@ -27,7 +27,18 @@ Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.
 - [ ] 3c no empty try for dead protected op — covered by 3b (92→0) via no-throw proofs for markers/cold_path/nop calls
 - [ ] cleanup-edges tests + CONTRACT.md note; R2a row
 
-## Stage 4 — optimize cleanup-bearing bodies (P08/P09-lite)
+## Stage 4' — re-planned from the byte attribution of the integrated build (2026-11-10, scratchpad/attrib2)
+Integrated compact: 208,988 min / 55,876 gzip / 43,548 brotli. App code 62.5% of min bytes, core+alloc 24.6%, shim 7.5%. Measured levers (re-minified with the build's terser settings):
+- [ ] 4'a no-throw extensions in effects.rs (implementer running): (i) resolve `Callee::Foreign` to the in-program definition (panic handler `rust_begin_unwind` is `for(;;){}` yet counted as throwing), (ii) audited pure intrinsics (`caller_location`, `assert_inhabited`, `ctpop`, `size_of_val`, `align_of_val`, `compare_bytes`…), (iv) closure-creation markers `callback0/1/2` and `try`. (i)+(ii) −4.9K min / −1.09K gzip; with (iv) ≈ −8K; (iii) trusting declared non-fallible host contracts is a further −7.6K min but changes destructor semantics on a throwing host getter → stays opt-in (USER DECISION). All 210 tries = −19.6K min / −4.8K gzip upper bound. Also rebaselines the cleanup-edges expected JSON and adds `cleanup`/`host-args` to matrix.sh.
+- [ ] 4'b inline budget bug (implementer running): budget max(program/2000, 384) with a 24 B floor charge per site = exactly 16 inlined sites per program; `inline.rs:146` comment promises shrinking sites refund, `:263` never does. 643 one-statement functions / 2,169 call sites raw; hashing `#[inline(always)]` helpers stay out of line (3,879 B vs 1,766 hand-written).
+- [ ] 4'c hoist large immutable const aggregates once (P13): `BLOCKER_FILTERS` is emitted 4× (7 KB each), `FONT_PREFERENCES` 2×: −20.9K min / −4.04K gzip (brotli −0.1K).
+- [ ] 4'd shared unreachable-abort helper (155 identical `throw __rt.abort_error(new Error("…unreachable code"))`): −8.3K min / −0.32K gzip; printer-only (emit.rs — after 1b/5d1/5a2 merge, same file).
+- [ ] 4'e module-scoped shim (no `globalThis.__rt.` properties): −5.5K min / −0.89K gzip; runtime structure change.
+- [ ] 4'f numeric enum tags (−2.4K / −0.17K); dead trailing arguments (−2.1K / −0.25K, `analysis/param_use.rs` exists).
+- Not worth doing (measured): Location literal hoisting (gzip gets worse), numeric spellings (0 after terser), `ub_checks` folding (0 after terser; raw only).
+- Shape gaps vs hand-written JS on three functions: 53–64% (un-inlined helpers, `byte_slice_ref` re-evaluated per access, bounds checks with Location literals the loop guard already proves, iterator `{TAG,_0:[i,item]}` objects, temporaries).
+
+## Stage 4 (original plan; superseded where 4' overlaps) — optimize cleanup-bearing bodies (P08/P09-lite)
 - [ ] 4a shared try per protected region
 - [ ] 4b fusion with fences
 - [ ] 4c PEA in Invoke bodies
