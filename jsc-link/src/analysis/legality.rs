@@ -657,7 +657,7 @@ mod tests {
 
     /// The accepts-set is load bearing: a mutable string can only be a builder, which no
     /// declaration can accept, so a `reads, accepts(host_string)` slot receiving a mutated
-    /// `String` pins it — `{ text, cap }` must never reach a host that declared a JS string.
+    /// `String` pins it — `{ text, cap, len }` must never reach a host that declared a JS string.
     #[test]
     fn legality_a_mutated_string_into_an_accepts_host_string_slot_pins() {
         let mut prog = Prog::new();

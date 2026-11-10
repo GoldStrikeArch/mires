@@ -980,6 +980,26 @@ not become initialized values.
   U+FFFD); a string of more than 64 code units is answered from the memo when its bytes are
   already there. `str::len` lowers to the same call: `__rt.str_bytes(s).len` folds to
   `__rt.str_len(s)`.
+- A `String` the optimizer keeps native (a host string, or the builder `{ text, cap, len }`, see
+  OPTIMIZER.md) holds exactly the text the baseline `Vec<u8>` `String` would decode, because
+  every piece that joins it is well formed on its own. A piece that may come from a host — a
+  `push_str`/`write_str` argument, each `&str` argument of a `write!`/`format!` site, a host
+  string converted into a builder — first goes through `__rt.native_str_wf`, which turns each
+  lone surrogate (only a host can hand Rust one) into U+FFFD, the three bytes `str_bytes` stores
+  for it. Every other piece is well formed by construction: a pushed `char`, a format template's
+  literal text, the ASCII text of an integer, `bool` or `f64`, a `to_string` result, a baseline
+  string converted into a native carrier, and a native `String` argument's text, itself only
+  ever built from such pieces. (A `char` that a host function returns is not checked to be a
+  scalar value; a surrogate forged that way is outside this guarantee, in the baseline
+  representation as well.) Two adjacent pieces therefore never pair into a scalar the baseline
+  never held — two appended halves of a surrogate pair stay two U+FFFD, in one site or across
+  appends — and the host is handed the same string either way.
+- The builder never asks `str_len` about the text it has accumulated: `len` is that text's exact
+  UTF-8 byte length, kept by every operation (an append adds only the appended piece's length),
+  so `String::len` is a field read and building a string is linear in the bytes appended. `cap`
+  is the Rust-visible capacity in the same bytes, never below `len`: it starts at the requested
+  capacity (zero, or the exact length for a builder made from text) and grows exact-fit, to the
+  new length, when an append exceeds it — not by `RawVec`'s amortized doubling.
 - Writing through a `&mut str` stays a zombie: the `&mut str` a `String` derefs to is a decoded
   JavaScript string, so a write through `as_bytes_mut` (`make_ascii_uppercase`,
   `to_ascii_lowercase`) does not reach the `String`'s storage and is lost. It is contained: a cast

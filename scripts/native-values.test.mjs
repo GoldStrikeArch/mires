@@ -115,30 +115,34 @@ test("native string indices use UTF-8 bytes and UTF-16 boundaries", () => {
   }
 });
 
-test("native string mutation preserves byte capacity", () => {
-  const value = { text: "", cap: 32 };
+test("native string mutation preserves byte capacity and the exact byte length", () => {
+  const value = { text: "", cap: 32, len: 0 };
 
   rt.native_str_push(value, 0x61);
   rt.native_str_push(value, 0x1f600);
   rt.native_str_push(value, 0x20ac);
-  assert.deepEqual(value, { text: "a\u{1f600}\u20ac", cap: 32 });
+  assert.deepEqual(value, { text: "a\u{1f600}\u20ac", cap: 32, len: 8 });
 
   assert.equal(rt.native_str_pop(value), 0x20ac);
+  assert.equal(value.len, 5);
   assert.equal(rt.native_str_pop(value), 0x1f600);
+  assert.equal(value.len, 1);
   assert.equal(rt.native_str_pop(value), 0x61);
   assert.equal(rt.native_str_pop(value), -1);
-  assert.equal(value.cap, 32);
+  assert.deepEqual(value, { text: "", cap: 32, len: 0 });
 
   value.text = "a\u00e9\u20ac\u{1f600}z";
+  value.len = 11;
   rt.native_str_truncate(value, 10);
-  assert.equal(value.text, "a\u00e9\u20ac\u{1f600}");
+  assert.deepEqual(value, { text: "a\u00e9\u20ac\u{1f600}", cap: 32, len: 10 });
   rt.native_str_truncate(value, 6);
-  assert.equal(value.text, "a\u00e9\u20ac");
+  assert.deepEqual(value, { text: "a\u00e9\u20ac", cap: 32, len: 6 });
   rt.native_str_truncate(value, 100);
-  assert.equal(value.text, "a\u00e9\u20ac");
+  rt.native_str_truncate(value, 6);
+  assert.deepEqual(value, { text: "a\u00e9\u20ac", cap: 32, len: 6 });
   assert.throws(() => rt.native_str_truncate(value, 2), RangeError);
-  assert.equal(value.text, "a\u00e9\u20ac");
-  assert.equal(value.cap, 32);
+  assert.throws(() => rt.native_str_truncate(value, -1), RangeError);
+  assert.deepEqual(value, { text: "a\u00e9\u20ac", cap: 32, len: 6 });
 });
 
 test("native f64 strings match Rust default Display", () => {
@@ -160,7 +164,7 @@ test("native f64 strings match Rust default Display", () => {
 
   for (const [value, expected] of cases) {
     const actual = rt.native_f64_to_string(value);
-    assert.deepEqual(actual, { text: expected, cap: expected.length });
+    assert.deepEqual(actual, { text: expected, cap: expected.length, len: expected.length });
   }
 });
 

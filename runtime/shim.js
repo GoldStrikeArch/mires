@@ -1350,6 +1350,30 @@ globalThis.__rt._utf8_width = (point) => {
   return 4;
 };
 
+// native_str_wf(s): the text a `&str` is once Rust holds it as bytes. A lone
+// surrogate (only a host can hand Rust one) is the U+FFFD that `str_bytes`
+// encodes for it, so this is exactly what a baseline `Vec<u8>` String decodes
+// back after the same append. A native String's text is only ever built from
+// such text: it stays well formed, its UTF-8 length is the sum of its pieces'
+// (`str_len`), and two appended halves can never pair into one scalar the
+// baseline never saw. A well-formed string -- every string Rust itself makes --
+// is returned as is, without allocating.
+globalThis.__rt.native_str_wf = (s) => {
+  let out = null;
+  let from = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if ((c & 0xf800) !== 0xd800) continue;
+    if (c < 0xdc00 && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+      i++;
+      continue;
+    }
+    out = (out === null ? "" : out) + s.slice(from, i) + String.fromCharCode(0xfffd);
+    from = i + 1;
+  }
+  return out === null ? s : out + s.slice(from);
+};
+
 // Maps a UTF-8 byte boundary to the corresponding JavaScript UTF-16 index.
 // A byte inside a code point, a negative/non-integral index, or an index past
 // the end has no equivalent and returns -1.
@@ -1462,18 +1486,26 @@ globalThis.__rt.native_f64_to_string = (value) => {
     else text = digits.slice(0, decimalAt) + "." + digits.slice(decimalAt);
     if (negative) text = "-" + text;
   }
-  return { text: text, cap: text.length };
+  // Every character of the rendering is ASCII: its UTF-16 length is its UTF-8
+  // length, and an owned `String` built from it is exact-fit.
+  return { text: text, cap: text.length, len: text.length };
 };
 
-// A mutable native String is `{ text, cap }`, where `cap` is measured in UTF-8
-// bytes. Its reserve path has already established enough capacity, so pushing
-// a Rust `char` changes only the text.
+// A mutable native String is `{ text, cap, len }`: well-formed text (see
+// native_str_wf), its Rust-visible capacity and its exact UTF-8 byte length,
+// both in bytes. Every operation keeps `len` in step with the text, so nothing
+// rescans the text to learn its length -- which is what would make building a
+// string quadratic. The compiled reserve path has already established enough
+// capacity, so pushing a Rust `char` appends it and advances the length by its
+// width.
 globalThis.__rt.native_str_push = (value, point) => {
   value.text += String.fromCodePoint(point);
+  value.len += globalThis.__rt._utf8_width(point);
 };
 
 // Returns -1 for `None`; every Rust `char` is otherwise a non-negative Unicode
-// scalar value. Capacity is retained, as it is by `String::pop`.
+// scalar value. Capacity is retained, as it is by `String::pop`; the length
+// drops by the popped scalar's width.
 globalThis.__rt.native_str_pop = (value) => {
   const text = value.text;
   if (text.length === 0) return -1;
@@ -1485,20 +1517,40 @@ globalThis.__rt.native_str_pop = (value) => {
   }
   const point = text.codePointAt(at);
   value.text = text.slice(0, at);
+  value.len -= globalThis.__rt._utf8_width(point);
   return point;
 };
 
 // Rust makes an index at or past the current byte length a no-op and rejects an
-// in-range index that is not a char boundary. Capacity is retained.
+// in-range index that is not a char boundary. Capacity is retained; the length
+// becomes the index.
 globalThis.__rt.native_str_truncate = (value, byteIndex) => {
+  if (byteIndex >= value.len) return;
   const text = value.text;
   const utf16 = globalThis.__rt.native_str_utf16_index(text, byteIndex);
-  if (utf16 >= 0) {
-    if (utf16 < text.length) value.text = text.slice(0, utf16);
-    return;
+  if (utf16 < 0) {
+    throw __rt.abort_error(new RangeError("native String truncate index is not a UTF-8 boundary"));
   }
-  if (byteIndex > globalThis.__rt.str_len(text)) return;
-  throw __rt.abort_error(new RangeError("native String truncate index is not a UTF-8 boundary"));
+  value.text = text.slice(0, utf16);
+  value.len = byteIndex;
+};
+
+// _sb_check(value): the `RCGJS_SB_VERIFY=1` drift check the compiler emits after
+// every mutation of a native String and around every read of its length. The
+// text must be well formed (a lone surrogate would decode differently from the
+// baseline's bytes), the cached `len` must be its UTF-8 byte length and `cap`
+// at least that; anything else is a compiler bug, reported before the length is
+// used. Returns the value, so a checked length read is
+// `__rt._sb_check(value).len`.
+globalThis.__rt._sb_check = (value) => {
+  const measured = globalThis.__rt.str_len(value.text);
+  const wellFormed = globalThis.__rt.native_str_wf(value.text) === value.text;
+  if (value.len !== measured || !(value.cap >= measured) || !wellFormed) {
+    const detail = "len " + value.len + ", cap " + value.cap + ", text measures " + measured +
+      (wellFormed ? "" : ", text has a lone surrogate");
+    throw __rt.abort_error(new RangeError("native String length drift: " + detail));
+  }
+  return value;
 };
 
 globalThis.__rt.native_vec_new = (capacity) => ({
@@ -3382,12 +3434,15 @@ globalThis.__rt.host_task = (f) => {
 };
 
 // convert_host_sb(s): a host string entering the mutable native String carrier
-// `{ text, cap }` (Phase 4 Convert adapter). An immutable host string's capacity
-// is its UTF-8 byte length, which the carrier records exactly.
-globalThis.__rt.convert_host_sb = (s) => ({
-  text: s,
-  cap: globalThis.__rt.str_len(s),
-});
+// `{ text, cap, len }` (Phase 4 Convert adapter). The text is taken as Rust
+// holds it (native_str_wf), and an immutable host string's capacity is its
+// UTF-8 byte length, measured once: the builder's length and its exact-fit
+// capacity both.
+globalThis.__rt.convert_host_sb = (s) => {
+  const text = globalThis.__rt.native_str_wf(s);
+  const len = globalThis.__rt.str_len(text);
+  return { text: text, cap: len, len: len };
+};
 
 // convert_str_block(s): the UTF-8 bytes of a host string as a fresh `{ buf, off,
 // len }` block the caller owns (Phase 4 Convert adapter, host string back to the
@@ -3406,11 +3461,12 @@ globalThis.__rt.convert_str_block = (s) => {
   return { buf: p.buf, off: 0, len: shared.len, cap: shared.len };
 };
 
-// convert_sb_block(sb): a mutable native `{ text, cap }` String's bytes as a
-// fresh registered `{ buf, off, len, cap }` block (Phase 4 Convert adapter,
+// convert_sb_block(sb): a mutable native `{ text, cap, len }` String's bytes as
+// a fresh registered `{ buf, off, len, cap }` block (Phase 4 Convert adapter,
 // builder back to the baseline `Vec<u8>` String). The backing array is capacity
 // length with `[0, len)` initialized, and the builder's Rust-visible capacity
 // rides along for the baseline cap leaf — a moved String keeps its capacity.
+// The bytes have to be encoded here anyway, so the block's length is theirs.
 globalThis.__rt.convert_sb_block = (sb) => {
   const shared = globalThis.__rt.str_bytes(sb.text);
   const cap = Math.max(sb.cap, shared.len);

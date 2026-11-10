@@ -1,6 +1,6 @@
 //! The mutable native `String` carrier's contract, exercised end to end (Phase 4, D5).
 //!
-//! Everything the `{ text, cap }` StringBuilder carrier must preserve when the representation
+//! Everything the `{ text, cap, len }` StringBuilder carrier must keep when the representation
 //! planner commits it: construction with and without an explicit capacity, UTF-8 byte length
 //! (ASCII and multi-byte), capacity growth on `push`/`push_str`, `clear` keeping the capacity,
 //! `as_str` borrowing, and the `fmt::Write` sinks. The expected stdout is mode-independent: the

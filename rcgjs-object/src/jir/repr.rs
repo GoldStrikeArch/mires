@@ -130,7 +130,8 @@ pub enum Carrier {
     Flat,
     /// A `String` carried as a host string.
     HostString,
-    /// A `String` under construction, `{ text, cap }`.
+    /// A `String` under construction, `{ text, cap, len }`: the text, and its capacity and exact
+    /// length in UTF-8 bytes.
     StringBuilder,
     /// A `Vec<T>` as `{ buf, len, cap }` over a native array.
     NativeVec,

@@ -363,26 +363,28 @@ mod ops {
     op!(STRING_WITH_CAPACITY, StringWithCapacity, 1, RESULT_BUILDER, BUILDER_ONLY, THROWS,
         string::legality_with_capacity, string::string_with_capacity, &[], 90, FIXTURE_71);
     op!(STRING_LEN, StringLen, 1, RECEIVER_STRING, HOST_OR_BUILDER, PURE,
-        string::legality_unsigned_return, string::string_len, &["str_len"], 34, FIXTURE_71);
+        string::legality_unsigned_return, string::string_len, &["_sb_check", "str_len"], 34,
+        FIXTURE_71);
     op!(STRING_CAPACITY, StringCapacity, 1, RECEIVER_BUILDER, BUILDER_ONLY, PURE,
         string::legality_unsigned_return, string::string_capacity, &[], 24, FIXTURE_71);
     op!(STRING_PUSH, StringPush, 2, MUT_RECEIVER_BUILDER, BUILDER_ONLY, THROWS_AND_MUTATES,
         string::legality_push, string::string_push,
-        &["_utf8_width", "native_str_push", "str_len"], 200, FIXTURE_71);
+        &["_sb_check", "_utf8_width", "native_str_push"], 200, FIXTURE_71);
     op!(STRING_PUSH_STR, StringPushStr, 2, MUT_RECEIVER_BUILDER, BUILDER_ONLY, THROWS_AND_MUTATES,
-        string::legality_push_str, string::string_push_str, &["str_len"], 170, FIXTURE_71);
+        string::legality_push_str, string::string_push_str,
+        &["_sb_check", "native_str_wf", "str_len"], 170, FIXTURE_71);
     op!(STRING_CLEAR, StringClear, 1, MUT_RECEIVER_BUILDER, BUILDER_ONLY, MUTATES,
-        string::legality_unit_return, string::string_clear, &[], 26, FIXTURE_71);
+        string::legality_unit_return, string::string_clear, &["_sb_check"], 26, FIXTURE_71);
     op!(STRING_AS_STR, StringAsStr, 1, RECEIVER_STRING, HOST_OR_BUILDER, PURE,
         string::legality_as_str, string::string_as_str, &[], 22, FIXTURE_71);
     op!(STRING_DROP, StringDrop, 1, MUT_RECEIVER_BUILDER, BUILDER_ONLY, MUTATES,
         string::legality_unit_return, string::string_drop, &[], 40, FIXTURE_71);
     op!(FMT_WRITE_STR, StringFmtWriteStr, 2, MUT_RECEIVER_BUILDER, BUILDER_ONLY,
         THROWS_AND_MUTATES, fmt::legality_fmt_write_str, string::string_push_str,
-        &["str_len"], 190, FIXTURE_72);
+        &["_sb_check", "native_str_wf", "str_len"], 190, FIXTURE_72);
     op!(FMT_WRITE_CHAR, StringFmtWriteChar, 2, MUT_RECEIVER_BUILDER, BUILDER_ONLY,
         THROWS_AND_MUTATES, fmt::legality_fmt_write_char, string::string_push,
-        &["_utf8_width", "native_str_push", "str_len"], 220, FIXTURE_72);
+        &["_sb_check", "_utf8_width", "native_str_push"], 220, FIXTURE_72);
     op!(F64_SPEC_TO_STRING, F64SpecToString, 1, RESULT_BUILDER, BUILDER_ONLY, PURE,
         fmt::legality_f64_to_string, fmt::f64_spec_to_string,
         &["native_f64_to_string"], 60, FIXTURE_72);
@@ -394,7 +396,7 @@ mod ops {
         fmt::legality_char_to_string, fmt::primitive_to_string, &["str_len"], 80, FIXTURE_72);
     op!(FORMAT_ARGUMENT_NEW_DISPLAY, FormatArgumentNewDisplay, 1, NO_SLOTS, HOST_OR_BUILDER, PURE,
         fmt::legality_argument_new_display, fmt::format_argument_new_display,
-        &["native_f64_to_string"], 70, FIXTURE_72);
+        &["native_f64_to_string", "native_str_wf"], 70, FIXTURE_72);
     op!(FORMAT_ARGS_NEW, FormatArgsNew, 2, NO_SLOTS, HOST_OR_BUILDER, PURE,
         fmt::legality_format_args_new, fmt::format_args_new, &[], 16, FIXTURE_72);
     op!(FORMAT_ARGS_TO_STRING, FormatArgsToString, 1, RESULT_STRING, HOST_OR_BUILDER, PURE,

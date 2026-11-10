@@ -557,7 +557,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::StringNew,
         BUILDER,
         r#"function f() {
-  return { text: "", cap: 0 };
+  return { text: "", cap: 0, len: 0 };
 }"#,
     ),
     (
@@ -567,7 +567,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
   if ($native0 > 2147483647) {
     throw new RangeError("rustc_codegen_js: native String capacity overflow");
   }
-  return { text: "", cap: $native0 };
+  return { text: "", cap: $native0, len: 0 };
 }"#,
     ),
     (
@@ -581,7 +581,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::StringLen,
         BUILDER,
         r#"function f($native0) {
-  return __rt.str_len($native0.text);
+  return $native0.len;
 }"#,
     ),
     (
@@ -595,7 +595,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::StringPush,
         BUILDER,
         r#"function f($native0, $native1) {
-  const $nativeRequired = __rt.str_len($native0.text) + __rt._utf8_width($native1);
+  const $nativeRequired = $native0.len + __rt._utf8_width($native1);
   if ($nativeRequired > 2147483647) {
     throw new RangeError("rustc_codegen_js: native String capacity overflow");
   }
@@ -610,14 +610,16 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::StringPushStr,
         BUILDER,
         r#"function f($native0, $native1) {
-  const $nativeRequired = __rt.str_len($native0.text) + __rt.str_len($native1);
+  const $nativePiece = __rt.native_str_wf($native1);
+  const $nativeRequired = $native0.len + __rt.str_len($nativePiece);
   if ($nativeRequired > 2147483647) {
     throw new RangeError("rustc_codegen_js: native String capacity overflow");
   }
   if ($native0.cap < $nativeRequired) {
     $native0.cap = $nativeRequired;
   }
-  $native0.text += $native1;
+  $native0.text += $nativePiece;
+  $native0.len = $nativeRequired;
   return;
 }"#,
     ),
@@ -626,6 +628,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         BUILDER,
         r#"function f($native0) {
   $native0.text = "";
+  $native0.len = 0;
   return;
 }"#,
     ),
@@ -649,6 +652,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         r#"function f($native0) {
   $native0.text = "";
   $native0.cap = 0;
+  $native0.len = 0;
   return;
 }"#,
     ),
@@ -656,14 +660,16 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::StringFmtWriteStr,
         BUILDER,
         r#"function f($native0, $native1) {
-  const $nativeRequired = __rt.str_len($native0.text) + __rt.str_len($native1);
+  const $nativePiece = __rt.native_str_wf($native1);
+  const $nativeRequired = $native0.len + __rt.str_len($nativePiece);
   if ($nativeRequired > 2147483647) {
     throw new RangeError("rustc_codegen_js: native String capacity overflow");
   }
   if ($native0.cap < $nativeRequired) {
     $native0.cap = $nativeRequired;
   }
-  $native0.text += $native1;
+  $native0.text += $nativePiece;
+  $native0.len = $nativeRequired;
   return { TAG: "Ok", _0: undefined };
 }"#,
     ),
@@ -671,7 +677,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::StringFmtWriteChar,
         BUILDER,
         r#"function f($native0, $native1) {
-  const $nativeRequired = __rt.str_len($native0.text) + __rt._utf8_width($native1);
+  const $nativeRequired = $native0.len + __rt._utf8_width($native1);
   if ($nativeRequired > 2147483647) {
     throw new RangeError("rustc_codegen_js: native String capacity overflow");
   }
@@ -701,7 +707,8 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         BUILDER,
         r#"function f($native0) {
   const $nativeText = String($native0.buf[$native0.off]);
-  return { text: $nativeText, cap: $nativeText.length };
+  const $nativeLen = $nativeText.length;
+  return { text: $nativeText, cap: $nativeLen, len: $nativeLen };
 }"#,
     ),
     (
@@ -716,7 +723,8 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         BUILDER,
         r#"function f($native0) {
   const $nativeText = $native0.buf[$native0.off] ? "true" : "false";
-  return { text: $nativeText, cap: $nativeText.length };
+  const $nativeLen = $nativeText.length;
+  return { text: $nativeText, cap: $nativeLen, len: $nativeLen };
 }"#,
     ),
     (
@@ -731,7 +739,8 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         BUILDER,
         r#"function f($native0) {
   const $nativeText = String.fromCodePoint($native0.buf[$native0.off]);
-  return { text: $nativeText, cap: __rt.str_len($nativeText) };
+  const $nativeLen = __rt.str_len($nativeText);
+  return { text: $nativeText, cap: $nativeLen, len: $nativeLen };
 }"#,
     ),
     (
@@ -760,7 +769,8 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         BUILDER,
         r#"function f($native0) {
   const $nativeText = $native0;
-  return { text: $nativeText, cap: __rt.str_len($nativeText) };
+  const $nativeLen = __rt.str_len($nativeText);
+  return { text: $nativeText, cap: $nativeLen, len: $nativeLen };
 }"#,
     ),
     (
@@ -1476,11 +1486,22 @@ mod adapters {
     }
 
     #[test]
-    fn baseline_to_builder_carries_the_cap_leaf() {
+    fn baseline_to_builder_carries_the_cap_and_len_leaves() {
         assert_eq!(
             converted(jsast::id("s"), Carrier::Baseline, Carrier::StringBuilder),
             "{ text: __rt.bytes_str(s.vec.buf.inner.ptr.buf, s.vec.buf.inner.ptr.off, \
-             s.vec.len), cap: s.vec.buf.inner.cap }"
+             s.vec.len), cap: s.vec.buf.inner.cap, len: s.vec.len }"
+        );
+    }
+
+    #[test]
+    fn baseline_to_builder_evaluates_a_compound_value_once() {
+        let value = jsast::call(jsast::id("g"), vec![]);
+        assert_eq!(
+            converted(value, Carrier::Baseline, Carrier::StringBuilder),
+            "(($cv) => ({ text: __rt.bytes_str($cv.vec.buf.inner.ptr.buf, \
+             $cv.vec.buf.inner.ptr.off, $cv.vec.len), cap: $cv.vec.buf.inner.cap, \
+             len: $cv.vec.len }))(g())"
         );
     }
 
@@ -2108,7 +2129,7 @@ for (const f of [before, after]) {
       const buffer = [10, 20, 30, 40];
       const view = { buf: buffer, off: 1, len: 2 };
       const capacity = (ownedKind === 'builder' ? __rt.str_len(text) : 2) + reserve;
-      const owned = ownedKind === 'builder' ? { text, cap: capacity } : ownedKind === 'vec' ? { buf: [1, 2], len: 2, cap: capacity } : undefined;
+      const owned = ownedKind === 'builder' ? { text, cap: capacity, len: __rt.str_len(text) } : ownedKind === 'vec' ? { buf: [1, 2], len: 2, cap: capacity } : undefined;
       if (ownedKind === 'vec') owned.buf.length = capacity;
       throwAtObserve = shouldThrow;
       if (shouldThrow) assert.throws(() => f(text, caller, rounds, view, owned), error => error === thrown);
@@ -2140,6 +2161,7 @@ for (const f of [before, after]) {
         if (ownedKind === 'builder') {
           assert.equal(__rt.bytes_str(ptr.buf, ptr.off, vec.len), text + '\ud83d\ude00\ud83d\ude00');
           assert.equal(owned.text, dropped ? '' : mutated ? text + '\ud83d\ude00\ud83d\ude00' : text);
+          assert.equal(owned.len, __rt.str_len(owned.text));
         } else {
           assert.deepEqual(ptr.buf.slice(ptr.off, ptr.off + vec.len), [1, 2, 77, 77]);
           assert.equal(owned.len, dropped ? 0 : mutated ? 4 : 2);
@@ -2174,5 +2196,559 @@ for (const f of [before, after]) {
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// -- The call-site format kernel, driven directly ----------------------------------------------
+//
+// The planner does not commit a format site yet (its `Move` renames stay baseline), so these build
+// the committed shape by hand — the constructor calls' results marked exactly as `commit_func`
+// marks them — lower it through the real `lower_func` path the kernel intercepts in, and run the
+// emitted JavaScript against the baseline representation's answer: the UTF-8 bytes of every
+// piece appended in order, decoded back.
+
+/// One display argument of a hand-built format site.
+#[derive(Clone, Copy)]
+enum SiteArg {
+    /// A host `&str`, displayed through `&&str`.
+    Str,
+    /// An `i32`, displayed through `&i32`.
+    Int,
+}
+
+/// The consumer of a hand-built format site.
+#[derive(Clone, Copy)]
+enum SiteConsumer {
+    /// `alloc::fmt::format` into a `String` at this carrier.
+    Format(Carrier),
+    /// `String::write_fmt` into a `{ text, cap, len }` builder parameter.
+    WriteFmt,
+}
+
+/// The JavaScript function `name` lowered from one committed-shape format site: parameters
+/// `[builder,] args...`, an `Argument::new_display` over a borrow of each argument, the default
+/// template `template`, and `consumer`.
+fn format_site_js(
+    name: &str,
+    template: &[u8],
+    site_args: &[SiteArg],
+    consumer: SiteConsumer,
+) -> String {
+    use crate::jir::origin::OriginId;
+    use crate::jir::repr::{FuncBuilder, OpKind, RTerm, Root, ValueId};
+    use crate::jir::semantic::{Body, BodyKind, CallSemantic, Callee, ConstTree, ItemId};
+    use crate::jir::summary::{Availability, ItemClass, ItemSummary, SemanticKey};
+    use crate::lower::js::host::{ItemEntry, ItemIndex};
+    use crate::lower::{lower_func, LowerInput};
+    use crate::opts::Opts;
+    use rcgjs_object::object::{BlobRef, ItemKind, Linkage};
+
+    const ORIGIN: OriginId = OriginId(0);
+    const ARG_LIST: TypeId = TypeId(60);
+    const ARG_LIST_REF: TypeId = TypeId(61);
+    const TEMPLATE: TypeId = TypeId(62);
+    let (mut table, mut interns) = table();
+    let mut list = descriptor(
+        ARG_LIST,
+        TypeKind::Array {
+            element: ARGUMENT,
+            length: site_args.len() as u64,
+        },
+        8 * site_args.len() as u64,
+    );
+    list.js.is_indirect = true;
+    table.insert(list);
+    table.insert(reference(ARG_LIST_REF, ARG_LIST, false));
+    let mut bytes = descriptor(
+        TEMPLATE,
+        TypeKind::Array {
+            element: U8,
+            length: template.len() as u64,
+        },
+        template.len() as u64,
+    );
+    bytes.js.is_indirect = true;
+    table.insert(bytes);
+
+    // The machinery items, by the exact identity the kernel resolves a callee through.
+    let mut items = ItemIndex::new();
+    let mut machinery = |n: u64, link: &str, params: usize, standard: StandardOperation| {
+        let item = ItemId {
+            definition: def_id(n),
+            instantiation: 0,
+        };
+        items.insert(
+            item,
+            ItemEntry {
+                name: link.to_owned(),
+                params,
+                abi_known: true,
+                result: None,
+                caller_location: false,
+                used_params: BTreeSet::new(),
+                standard: Some(standard),
+                keyed_purity: None,
+                keyed_read_params: None,
+                keyed_may_unwind: None,
+                keyed_row_capture: None,
+                keyed_proxy_safe_params: None,
+            },
+        );
+        Callee::Direct {
+            item,
+            link_name: interns.intern_str(link),
+        }
+    };
+    let display = machinery(
+        201,
+        "new_display",
+        1,
+        StandardOperation::FormatArgumentNewDisplay,
+    );
+    let new = machinery(202, "arguments_new", 2, StandardOperation::FormatArgsNew);
+    let format = machinery(203, "format", 1, StandardOperation::FormatArgsToString);
+    let write_fmt = machinery(204, "write_fmt", 2, StandardOperation::StringFmtWriteFmt);
+    let call = |callee: &Callee, args: Vec<ValueId>, semantic: CallSemantic| OpKind::Call {
+        callee: callee.clone(),
+        function: None,
+        args,
+        track_caller: None,
+        semantic,
+        host: None,
+    };
+
+    let writes = matches!(consumer, SiteConsumer::WriteFmt);
+    let mut parameters: Vec<TypeId> = writes.then_some(STRING).into_iter().collect();
+    parameters.extend(site_args.iter().map(|arg| match arg {
+        SiteArg::Str => STR_REF,
+        SiteArg::Int => I32,
+    }));
+    let result_ty = if writes { FMT_RESULT } else { STRING };
+    let item = ItemId {
+        definition: def_id(300),
+        instantiation: 0,
+    };
+    let mut b = FuncBuilder::new(item, sig(parameters, result_ty));
+    let entry = FuncBuilder::ENTRY;
+    let builder = writes.then(|| b.param(STRING, ORIGIN));
+    let values: Vec<(SiteArg, ValueId)> = site_args
+        .iter()
+        .map(|arg| {
+            let ty = match arg {
+                SiteArg::Str => STR_REF,
+                SiteArg::Int => I32,
+            };
+            (*arg, b.param(ty, ORIGIN))
+        })
+        .collect();
+    let mut displays = Vec::new();
+    for (arg, value) in values {
+        let reference_ty = match arg {
+            SiteArg::Str => PIECES_REF,
+            SiteArg::Int => I32_REF,
+        };
+        let reference = b.op(
+            entry,
+            OpKind::BorrowView {
+                root: Root::Value(value),
+                path: vec![],
+                mutable: false,
+            },
+            reference_ty,
+            ORIGIN,
+        );
+        displays.push(b.op(
+            entry,
+            call(&display, vec![reference], CallSemantic::Ordinary),
+            ARGUMENT,
+            ORIGIN,
+        ));
+    }
+    let list = b.op(
+        entry,
+        OpKind::Aggregate {
+            ty: ARG_LIST,
+            variant: 0,
+            active_field: None,
+            fields: displays.clone(),
+        },
+        ARG_LIST,
+        ORIGIN,
+    );
+    let list_ref = b.op(
+        entry,
+        OpKind::BorrowView {
+            root: Root::Value(list),
+            path: vec![],
+            mutable: false,
+        },
+        ARG_LIST_REF,
+        ORIGIN,
+    );
+    let template_value = b.op(
+        entry,
+        OpKind::Const(ConstTree::Aggregate(
+            template
+                .iter()
+                .map(|byte| ConstTree::Scalar {
+                    bits: u128::from(*byte),
+                    bytes: 1,
+                })
+                .collect(),
+        )),
+        TEMPLATE,
+        ORIGIN,
+    );
+    let arguments = b.op(
+        entry,
+        call(&new, vec![template_value, list_ref], CallSemantic::Ordinary),
+        ARGUMENTS,
+        ORIGIN,
+    );
+    let result = match builder {
+        None => b.op(
+            entry,
+            call(&format, vec![arguments], CallSemantic::Ordinary),
+            STRING,
+            ORIGIN,
+        ),
+        Some(builder) => {
+            let receiver = b.op(
+                entry,
+                OpKind::BorrowView {
+                    root: Root::Value(builder),
+                    path: vec![],
+                    mutable: true,
+                },
+                STRING_MUT,
+                ORIGIN,
+            );
+            b.op(
+                entry,
+                call(
+                    &write_fmt,
+                    vec![receiver, arguments],
+                    CallSemantic::Standard(StandardOperation::StringFmtWriteFmt),
+                ),
+                FMT_RESULT,
+                ORIGIN,
+            )
+        }
+    };
+    b.terminate(entry, RTerm::Return(Some(result)));
+    let mut func = b.finish();
+    // The committed marks (`plan::representation::commit_func`): each constructor result carries
+    // its native text, the destination its native carrier.
+    for value in displays.iter().chain([&arguments]) {
+        func.values[value.0 as usize].carrier = Carrier::HostString;
+    }
+    match consumer {
+        SiteConsumer::Format(carrier) => func.values[result.0 as usize].carrier = carrier,
+        SiteConsumer::WriteFmt => {
+            func.values[builder.unwrap().0 as usize].carrier = Carrier::StringBuilder;
+        }
+    }
+
+    let body = Body {
+        item,
+        kind: BodyKind::Function,
+        semantic: BodySemantic::Ordinary,
+        signature: func.sig.clone(),
+        locals: vec![],
+        blocks: vec![],
+    };
+    let summary = ItemSummary {
+        key: SemanticKey {
+            link_name: name.to_owned(),
+            item: Some(item),
+        },
+        body_hash: None,
+        semantic_hash: None,
+        availability: Availability::Available,
+        deps: Vec::new(),
+        abi: None,
+        physical: None,
+        kind: ItemKind::Fn,
+        linkage: Linkage::internal(),
+        order: None,
+        dts: false,
+        fallback: BlobRef {
+            offset: 0,
+            clen: 0,
+            ulen: 0,
+        },
+        body: None,
+        origin: None,
+        estimated_bytes: 0,
+        class: ItemClass::default(),
+    };
+    let opts = Opts::default();
+    let js_name = JsName::new(name.to_owned());
+    let input = LowerInput {
+        name: &js_name,
+        summary: &summary,
+        body: &body,
+        origins: None,
+        interns: &interns,
+        table: &table,
+        opts: &opts,
+        items: &items,
+        drop_glue: crate::lower::js::host::EMPTY_DROP_GLUE,
+        vtables: &crate::lower::js::unsize::EMPTY_VTABLES,
+        spills: &[],
+        abi: None,
+        physical: None,
+        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+    };
+    let lowered = lower_func(&input, &func)
+        .unwrap_or_else(|decline| panic!("the format kernel declined `{name}`: {decline}"));
+    let js = jsast::stmt_to_string(&lowered.decl);
+    // Nothing of the elided machinery survives: the site is inline host text.
+    for machinery in ["new_display", "arguments_new", "format(", "write_fmt"] {
+        assert!(
+            !js.contains(machinery),
+            "`{name}` still calls {machinery}:\n{js}"
+        );
+    }
+    js
+}
+
+/// Runs `harness` in Node after the shim and `functions`, failing the test on any throw.
+fn run_in_node(functions: &[String], harness: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut program = include_str!("../../../../runtime/shim.js").to_owned();
+    for function in functions {
+        program.push_str(function);
+        program.push('\n');
+    }
+    program.push_str(harness);
+    let mut child = Command::new("node")
+        .arg("--input-type=commonjs")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Node is required for emitted format-kernel verification");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(program.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        program
+            .lines()
+            .rev()
+            .take(200)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// The templates the kernel tests drive, by the shape of the argument run they hold: adjacent
+/// host strings first and last, beside literals, three in a row, and around a non-string.
+const KERNEL_SITES: &[(&str, &[u8], &[SiteArg])] = &[
+    ("pair", b"\xc0\xc0\0", &[SiteArg::Str, SiteArg::Str]),
+    (
+        "bracketed",
+        b"\x01<\xc0\xc0\x01>\0",
+        &[SiteArg::Str, SiteArg::Str],
+    ),
+    (
+        "triple",
+        b"\xc0\xc0\xc0\0",
+        &[SiteArg::Str, SiteArg::Str, SiteArg::Str],
+    ),
+    (
+        "around_int",
+        b"\xc0\xc0\xc0\0",
+        &[SiteArg::Str, SiteArg::Int, SiteArg::Str],
+    ),
+    ("dashed", b"\xc0\x01-\xc0\0", &[SiteArg::Str, SiteArg::Str]),
+];
+
+/// The JavaScript every kernel harness shares: the host pieces (lone halves of a surrogate pair
+/// in every arrangement, the pair itself, well-formed text), the baseline model, and one row of
+/// arguments per combination of pieces for a site's argument kinds.
+const KERNEL_HARNESS_PRELUDE: &str = r#"
+const assert = require('node:assert/strict');
+const HI = String.fromCharCode(0xd83d), LO = String.fromCharCode(0xde00);
+const PIECES = [HI, LO, HI + LO, LO + HI, 'a' + HI, LO + 'b', '', 'plain', String.fromCharCode(0xe9), HI + HI];
+const INTS = [-7, 0, 42];
+const encoder = new TextEncoder();
+const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
+// The baseline `Vec<u8>` String after appending `pieces` in order: their bytes, decoded back.
+function baseline(pieces) {
+  const parts = pieces.map((piece) => encoder.encode(piece));
+  const all = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
+  let at = 0;
+  for (const part of parts) { all.set(part, at); at += part.length; }
+  return { text: decoder.decode(all), len: all.length };
+}
+function rows(kinds) {
+  let out = [[]];
+  for (const kind of kinds) {
+    const choices = kind === 'Str' ? PIECES : INTS;
+    out = out.flatMap((row) => choices.map((choice) => row.concat([choice])));
+  }
+  return out;
+}
+// The pieces the site appends, in order: template literal, argument, literal, ... literal.
+function sitePieces(literals, row) {
+  const out = [literals[0]];
+  row.forEach((arg, i) => out.push(String(arg), literals[i + 1]));
+  return out;
+}
+"#;
+
+/// `const <variable> = [{ name, kinds, literals }...]`: the [`KERNEL_SITES`] as the harness sees
+/// them, each function named `<prefix>_<site>`.
+fn kernel_site_table(variable: &str, prefix: &str) -> String {
+    let mut sites = format!("const {variable} = [\n");
+    for (name, template, args) in KERNEL_SITES {
+        let literals = crate::lower::semantic_ops::fmt_kernel::decode_template(template).unwrap();
+        let kinds: Vec<&str> = args
+            .iter()
+            .map(|arg| match arg {
+                SiteArg::Str => "'Str'",
+                SiteArg::Int => "'Int'",
+            })
+            .collect();
+        let literals: Vec<String> = literals.iter().map(|piece| format!("{piece:?}")).collect();
+        sites.push_str(&format!(
+            "  {{ name: '{prefix}_{name}', fn: {prefix}_{name}, kinds: [{}], literals: [{}] }},\n",
+            kinds.join(", "),
+            literals.join(", ")
+        ));
+    }
+    sites.push_str("];\n");
+    sites
+}
+
+/// `format!` of adjacent host `&str` arguments: as a host string and as a builder, the text and
+/// the length are the baseline's in every position — two lone halves stay two U+FFFD, never one
+/// scalar the baseline never held.
+#[test]
+fn the_format_kernel_appends_adjacent_host_strings_as_the_baseline_bytes() {
+    let mut functions = Vec::new();
+    for (carrier, prefix) in [
+        (Carrier::HostString, "host"),
+        (Carrier::StringBuilder, "builder"),
+    ] {
+        for (name, template, args) in KERNEL_SITES {
+            functions.push(format_site_js(
+                &format!("{prefix}_{name}"),
+                template,
+                args,
+                SiteConsumer::Format(carrier),
+            ));
+        }
+    }
+    let host_sites = kernel_site_table("HOST_SITES", "host");
+    let builder_sites = kernel_site_table("BUILDER_SITES", "builder");
+    let harness = format!(
+        r#"{KERNEL_HARNESS_PRELUDE}
+{host_sites}
+{builder_sites}
+for (const site of HOST_SITES) {{
+  for (const row of rows(site.kinds)) {{
+    const expected = baseline(sitePieces(site.literals, row));
+    assert.equal(site.fn(...row), expected.text, site.name + ' ' + JSON.stringify(row));
+  }}
+}}
+for (const site of BUILDER_SITES) {{
+  for (const row of rows(site.kinds)) {{
+    const expected = baseline(sitePieces(site.literals, row));
+    const value = site.fn(...row);
+    const label = site.name + ' ' + JSON.stringify(row);
+    assert.equal(value.text, expected.text, label);
+    assert.equal(value.len, expected.len, label);
+    assert.equal(value.cap, value.len, label);
+    assert.equal(__rt._sb_check(value), value, label);
+  }}
+}}
+"#
+    );
+    run_in_node(&functions, &harness);
+}
+
+/// Inline `write!` into a builder: every append adds exactly the baseline's bytes for its pieces
+/// (adjacent host halves included), the cached length advances with the text, and the capacity
+/// covers it — across two appends to the same builder.
+#[test]
+fn the_write_kernel_appends_adjacent_host_strings_and_advances_the_length() {
+    let mut functions = Vec::new();
+    for (name, template, args) in KERNEL_SITES {
+        functions.push(format_site_js(
+            &format!("write_{name}"),
+            template,
+            args,
+            SiteConsumer::WriteFmt,
+        ));
+    }
+    let sites = kernel_site_table("WRITE_SITES", "write");
+    let harness = format!(
+        r#"{KERNEL_HARNESS_PRELUDE}
+{sites}
+for (const site of WRITE_SITES) {{
+  for (const row of rows(site.kinds)) {{
+    const label = site.name + ' ' + JSON.stringify(row);
+    const builder = {{ text: 'x', cap: 1, len: 1 }};
+    const once = ['x'].concat(sitePieces(site.literals, row));
+    assert.deepEqual(site.fn(builder, ...row), {{ TAG: 'Ok', _0: undefined }}, label);
+    assert.equal(builder.text, baseline(once).text, label);
+    assert.equal(builder.len, baseline(once).len, label);
+    assert.ok(builder.cap >= builder.len, label + ': cap ' + builder.cap + ' < len ' + builder.len);
+    site.fn(builder, ...row);
+    const twice = once.concat(sitePieces(site.literals, row));
+    assert.equal(builder.text, baseline(twice).text, label);
+    assert.equal(builder.len, baseline(twice).len, label);
+    assert.ok(builder.cap >= builder.len, label + ': cap ' + builder.cap + ' < len ' + builder.len);
+    assert.equal(__rt._sb_check(builder), builder, label);
+  }}
+}}
+"#
+    );
+    run_in_node(&functions, &harness);
+}
+
+/// The `Argument::new_display` semantic body for a host `&str` takes it as Rust holds it: a lone
+/// surrogate is U+FFFD, so the native `Arguments` text it joins is well formed piece by piece.
+#[test]
+fn the_new_display_body_takes_a_host_str_as_rust_holds_it() {
+    let (table, interns) = table();
+    let signature = sig(vec![STR_REF], ARGUMENT);
+    let cx = lower_cx(
+        StandardOperation::FormatArgumentNewDisplay,
+        &signature,
+        &table,
+        &interns,
+    );
+    let rewrite = rewrite(&cx, &[]).expect("a host &str display argument lowers");
+    assert!(rewrite.runtime_helpers.contains("native_str_wf"));
+    let function = jsast::stmt_to_string(&jsast::function(
+        "display_str",
+        rewrite.parameters,
+        rewrite.statements,
+    ));
+    run_in_node(
+        &[function],
+        r#"
+const assert = require('node:assert/strict');
+const HI = String.fromCharCode(0xd83d), LO = String.fromCharCode(0xde00);
+const FFFD = String.fromCharCode(0xfffd);
+assert.equal(display_str(HI) + display_str(LO), FFFD + FFFD);
+assert.equal(display_str(HI + LO), HI + LO);
+assert.equal(display_str('plain'), 'plain');
+"#,
     );
 }

@@ -16,7 +16,7 @@ use crate::jsast::{self, BinOp, Expr, Stmt};
 use super::string::receiver;
 use super::{slot_type, type_get, LowerCx, SemanticDecline, SignatureSlot};
 
-/// `f64::to_string`: the exact Rust-compatible shortest decimal, already `{ text, cap }`.
+/// `f64::to_string`: the exact Rust-compatible shortest decimal, already `{ text, cap, len }`.
 pub(super) fn f64_spec_to_string(
     _cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
@@ -56,8 +56,9 @@ pub(super) fn primitive_to_string(
         Some(Carrier::HostString) => Ok(vec![jsast::ret(text)]),
         Some(Carrier::StringBuilder) => {
             // A decimal integer and both boolean words are ASCII, so their UTF-16 length is their
-            // UTF-8 byte capacity. A `char` needs the exact encoded width.
-            let capacity = if operation == StandardOperation::CharToString {
+            // UTF-8 byte length, which is both the builder's length and its exact-fit capacity.
+            // A `char` needs the exact encoded width.
+            let length = if operation == StandardOperation::CharToString {
                 helpers.insert("str_len");
                 jsast::rt_call("str_len", vec![jsast::id("$nativeText")])
             } else {
@@ -65,10 +66,11 @@ pub(super) fn primitive_to_string(
             };
             Ok(vec![
                 jsast::const_("$nativeText", text),
-                jsast::ret(jsast::object_of(vec![
-                    ("text", jsast::id("$nativeText")),
-                    ("cap", capacity),
-                ])),
+                jsast::const_("$nativeLen", length),
+                jsast::ret(super::string::exact_builder(
+                    jsast::id("$nativeText"),
+                    jsast::id("$nativeLen"),
+                )),
             ])
         }
         _ => Err(SemanticDecline::WrongCarrier(SignatureSlot::Result)),
@@ -107,7 +109,10 @@ pub(super) fn format_args_to_string(
 }
 
 /// The native `String::new`/`with_capacity` layout the format sinks share: an immutable result is
-/// the host string, a mutable one is `{ text, cap }` with the capacity in UTF-8 bytes.
+/// the host string, a mutable one is the exact-fit `{ text, cap, len }`, its capacity and length
+/// the text's one UTF-8 measurement. The native `Arguments` text is already the text the
+/// baseline `String` holds: each of its pieces is well formed on its own (a host `&str` argument
+/// is taken as Rust holds it where it is displayed, `format_display_text`).
 pub(super) fn owned_native_string(
     text: Expr,
     carrier: Option<Carrier>,
@@ -119,13 +124,14 @@ pub(super) fn owned_native_string(
             helpers.insert("str_len");
             Ok(vec![
                 jsast::const_("$nativeText", text),
-                jsast::ret(jsast::object_of(vec![
-                    ("text", jsast::id("$nativeText")),
-                    (
-                        "cap",
-                        jsast::rt_call("str_len", vec![jsast::id("$nativeText")]),
-                    ),
-                ])),
+                jsast::const_(
+                    "$nativeLen",
+                    jsast::rt_call("str_len", vec![jsast::id("$nativeText")]),
+                ),
+                jsast::ret(super::string::exact_builder(
+                    jsast::id("$nativeText"),
+                    jsast::id("$nativeLen"),
+                )),
             ])
         }
         _ => Err(SemanticDecline::WrongCarrier(SignatureSlot::Result)),
@@ -195,7 +201,9 @@ fn format_display_text(
         FormatDisplayKind::Char => {
             jsast::method_call(jsast::id("String"), "fromCodePoint", vec![loaded])
         }
-        FormatDisplayKind::Str => receiver(),
+        // The one display text a host may have made: taken as Rust holds it (lone surrogate to
+        // U+FFFD), so the concatenated `Arguments` text is well formed piece by piece.
+        FormatDisplayKind::Str => super::string::well_formed(receiver(), helpers),
         // A committed `String` argument may arrive as either string carrier; the typeof test
         // reads whichever it is without a plan-time distinction (v1's exact ternary).
         FormatDisplayKind::String => jsast::cond(

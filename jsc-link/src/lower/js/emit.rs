@@ -1067,7 +1067,7 @@ impl<'a> JsCx<'a> {
                 match self.func.values[v.0 as usize].carrier {
                     rcgjs_object::jir::repr::Carrier::HostString => Ok(value),
                     rcgjs_object::jir::repr::Carrier::StringBuilder => {
-                        Ok(record_clone(value, &["text", "cap"], &[]))
+                        Ok(record_clone(value, &["text", "cap", "len"], &[]))
                     }
                     rcgjs_object::jir::repr::Carrier::NativeVec => {
                         Ok(record_clone(value, &["len", "cap"], &["buf"]))

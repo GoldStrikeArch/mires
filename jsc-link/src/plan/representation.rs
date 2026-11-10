@@ -2709,6 +2709,10 @@ impl Planner<'_> {
                 {
                     members.insert("str_len".to_owned());
                 }
+                // A host `&str` argument is displayed as Rust holds it (`fmt_kernel::display_text`).
+                if site.args.iter().any(|arg| arg.kind == DisplayKind::Str) {
+                    members.insert("native_str_wf".to_owned());
+                }
                 fmt_elide.insert(site.consumer);
                 fmt_elide.insert(site.new_call);
                 fmt_elide.extend(site.display_calls.iter().copied());

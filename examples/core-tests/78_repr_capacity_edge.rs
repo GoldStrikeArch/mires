@@ -1,7 +1,7 @@
 //! Capacity across a native->baseline string cut edge (Phase 4, D6).
 //!
 //! `rust_entry`'s builder is committed native (`with_capacity` + `push_str` force the
-//! `{ text, cap }` carrier), while `sink` is pinned baseline by raw provenance
+//! `{ text, cap, len }` carrier), while `sink` is pinned baseline by raw provenance
 //! (`as_mut_vec`). The move into `sink` is therefore a cut edge whose Convert adapter
 //! must carry the builder's Rust-visible capacity into the baseline cap leaf: a moved
 //! `String` keeps its capacity, so both sides print 64, in every mode.

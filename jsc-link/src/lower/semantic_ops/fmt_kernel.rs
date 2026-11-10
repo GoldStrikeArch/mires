@@ -763,17 +763,19 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
             let result = op
                 .result
                 .ok_or_else(|| kernel_decline("marked format! has no destination"))?;
+            // Already the text the baseline `String` holds: every piece of it is well formed on
+            // its own (see `display_text`), so the concatenation is too.
             let text = cx.expr_of(*arguments)?;
             match cx.func.values[result.0 as usize].carrier {
                 Carrier::HostString => Ok(Some(Lowered::value(text))),
                 Carrier::StringBuilder => {
+                    // The exact-fit builder: the text measured once, for its length and its
+                    // capacity both.
                     let (bind, name) = cx.temp(text);
+                    let (bind_len, length) = cx.temp(jsast::rt_call("str_len", vec![name.clone()]));
                     Ok(Some(Lowered::Value(
-                        vec![bind],
-                        jsast::object_of(vec![
-                            ("text", name.clone()),
-                            ("cap", jsast::rt_call("str_len", vec![name])),
-                        ]),
+                        vec![bind, bind_len],
+                        super::string::exact_builder(name, length),
                     )))
                 }
                 _ => Err(kernel_decline("marked format! destination is not native")),
@@ -786,12 +788,23 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
             if !marked(view.chase_copies(*arguments)) {
                 return Ok(None);
             }
-            // The receiver is a committed StringBuilder behind `&mut` (the plan's gate).
+            // The receiver is a committed StringBuilder behind `&mut` (the plan's gate). The
+            // append is `String::push_str`'s: the formatted text (well formed piece by piece, see
+            // `display_text`), the required length is the cached length plus that text's (the
+            // only text measured), the capacity grows to cover it, and the cached length advances
+            // with the text.
             let walk = cx.pointee_place(*receiver)?;
             let recv = cx.read_place(&walk.place);
+            // A format site's runtime members are the planner's to account (`representation`),
+            // so the set is only a sink here.
+            let mut helpers = BTreeSet::new();
             let (bind_text, text) = cx.temp(cx.expr_of(*arguments)?);
-            let (bind_required, required) = cx.temp(jsast::rt_call("str_len", vec![text.clone()]));
-            let stmts = vec![
+            let (bind_required, required) = cx.temp(jsast::binary(
+                BinOp::Add,
+                super::string::builder_len(recv.clone(), &mut helpers),
+                jsast::rt_call("str_len", vec![text.clone()]),
+            ));
+            let mut stmts = vec![
                 bind_text,
                 bind_required,
                 jsast::if_(
@@ -802,15 +815,17 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
                     ),
                     vec![jsast::assign_stmt(
                         jsast::member(recv.clone(), "cap"),
-                        required,
+                        required.clone(),
                     )],
                 ),
                 jsast::expr_stmt(jsast::compound_assign(
                     BinOp::Add,
-                    jsast::member(recv, "text"),
+                    jsast::member(recv.clone(), "text"),
                     text,
                 )),
+                jsast::assign_stmt(jsast::member(recv.clone(), "len"), required),
             ];
+            stmts.extend(super::string::builder_checked(recv, &mut helpers));
             match op.result {
                 None => Ok(Some(Lowered::Done(stmts))),
                 Some(result) => {
@@ -833,6 +848,14 @@ fn kernel_decline(detail: &str) -> crate::jir::decline::Decline {
 /// The host text of one display argument (v1 `display_text_from_ref`): the place read, wrapped
 /// by its proven kind. `mark` is the committed carrier of the `new_display` result, which for a
 /// `String` source records the source's own carrier.
+///
+/// Every piece a site concatenates is well formed on its own, so the concatenation is exactly
+/// the text the baseline `String` decodes from its bytes, and two adjacent pieces can never pair
+/// into a scalar the baseline never held. A host `&str` is the one piece that may hold a lone
+/// surrogate, so it is taken as Rust holds it (`__rt.native_str_wf`: U+FFFD) where it is read.
+/// Everything else is well formed by construction: the template's literal pieces are decoded
+/// UTF-8 (`decode_template`), the integer, `bool` and `f64` texts are ASCII, a `char` is one
+/// scalar, and a native `String` source's text is itself only ever built from such pieces.
 fn display_text(
     cx: &JsCx<'_>,
     root: Root,
@@ -846,7 +869,8 @@ fn display_text(
         DisplayKind::Integer => jsast::call(jsast::id("String"), vec![loaded]),
         DisplayKind::Bool => jsast::cond(loaded, jsast::string("true"), jsast::string("false")),
         DisplayKind::Char => jsast::method_call(jsast::id("String"), "fromCodePoint", vec![loaded]),
-        DisplayKind::Str => loaded,
+        // The planner accounts the members a site reaches (`representation`): the set is a sink.
+        DisplayKind::Str => super::string::well_formed(loaded, &mut BTreeSet::new()),
         DisplayKind::F64 => {
             jsast::member(jsast::rt_call("native_f64_to_string", vec![loaded]), "text")
         }

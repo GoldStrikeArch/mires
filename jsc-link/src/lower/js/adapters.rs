@@ -3,7 +3,8 @@
 //! An adapter is a small expression over the value being converted — never a statement, never a
 //! change to the value's Rust type. The string family: `Baseline` (the `Vec<u8>` alloc-block
 //! `String` struct), [`Carrier::HostString`] (an immutable JavaScript string) and
-//! [`Carrier::StringBuilder`] (`{ text, cap }`, capacity in UTF-8 bytes). The vec/slice family:
+//! [`Carrier::StringBuilder`] (`{ text, cap, len }`, capacity and length in UTF-8 bytes). The
+//! vec/slice family:
 //! [`Carrier::NativeVec`] (`{ buf, len, cap }`, `buf` a capacity-length array initialized in
 //! `[0, len)`) and [`Carrier::SliceView`] (`{ buf, off, len }` sharing a native buffer — the
 //! same record a baseline fat slice is, so that direction is a plain re-record).
@@ -124,14 +125,16 @@ fn host_text(layout: &StringLayout, value: Expr) -> Expr {
     )
 }
 
-/// `{ text, cap }` straight off the baseline leaves: the decoded text, and the cap leaf carried
-/// into the builder's Rust-visible capacity (a moved `String` keeps its capacity).
+/// `{ text, cap, len }` straight off the baseline leaves: the decoded text, the cap leaf carried
+/// into the builder's Rust-visible capacity (a moved `String` keeps its capacity), and the len
+/// leaf — the decoded bytes' count, exactly the text's UTF-8 length — as its cached length.
 fn baseline_to_builder(table: &TypeTable, interns: &Interns, value: Expr, ty: TypeId) -> Res<Expr> {
     let layout = StringLayout::of(table, interns, ty)?;
     let (value, wrap) = once(value);
     Ok(wrap(jsast::object_of(vec![
         ("text", host_text(&layout, value.clone())),
-        ("cap", layout.member(value, &layout.cap)),
+        ("cap", layout.member(value.clone(), &layout.cap)),
+        ("len", layout.member(value, &layout.len)),
     ])))
 }
 

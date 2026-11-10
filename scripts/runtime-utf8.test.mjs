@@ -190,7 +190,7 @@ test('an owned String converted from a host string never aliases the memoized vi
     owned.buf[0] = 0x21
     owned.buf.push(0x21)
     assert.deepEqual(view(rt.str_bytes(text)), before)
-    const builder = rt.convert_sb_block({ text, cap: before.length + 8 })
+    const builder = rt.convert_sb_block({ text, cap: before.length + 8, len: before.length })
     assert.notEqual(builder.buf, shared.buf)
     builder.buf[1] = 0x21
     assert.deepEqual(view(rt.str_bytes(text)), before)
