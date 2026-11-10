@@ -354,10 +354,12 @@ function alloc$raw_vec$impl_6_grow_one$h017bcea116474a49(self) {
 }
 // alloc::raw_vec::RawVecInner::<A>::finish_grow
 function alloc$raw_vec$impl_7_finish_grow$hdb14ff37d9b62e90(self, cap, elem_layout) {
-  let _0, _4, _5, residual, new_layout, memory, _9, ptr, old_layout, _12, _20, _22, _23, _26, _29, _32, _33, _37, _38, _40, _41, _47, _48, _52, _53;
+  let _0, _4, _5, residual, new_layout, memory, _9, ptr, old_layout, _12, _20, _22, _23, _24, _25, _26, _29, _32, _33, _37, _38, _40, _41, _47, _48, _52, _53, $t0;
   _52 = elem_layout.size;
   _53 = elem_layout.align;
-  _23 = (($w) => [$w >>> 0, $w >>> 0 !== $w])((_52 >>> 0) * (cap >>> 0));
+  _24 = _52 >>> 0;
+  _25 = cap >>> 0;
+  _23 = [$t0 = Math.imul(_24, _25) >>> 0, $t0 !== _24 * _25];
   _26 = _23[0] >>> 0;
   _22 = _23[1];
   L0: {
@@ -420,12 +422,12 @@ function alloc$raw_vec$impl_7_finish_grow$hdb14ff37d9b62e90(self, cap, elem_layo
 }
 // alloc::raw_vec::RawVecInner::<A>::grow_amortized
 function alloc$raw_vec$impl_7_grow_amortized$h3d170a9f5529fa2a(self, len, additional, elem_layout) {
-  let _0, _5, _6, _7, residual, required_cap, cap, cap$1, _15, _16, residual$1, _27, _30, _32, _39, _47, _48;
+  let _0, _5, _6, _7, residual, required_cap, cap, cap$1, _15, _16, residual$1, _27, _30, _32, _39, _47, _48, $t0, $t1;
   _5 = elem_layout.size;
   L0: {
     if (_5 === 0) {
       _0 = { TAG: "Err", _0: { kind: { TAG: "CapacityOverflow" } } };
-    } else if ((($w) => [$w >>> 0, $w >>> 0 !== $w])(len + additional)[1]) {
+    } else if ([$t1 = ($t0 = len + additional) >>> 0, $t1 !== $t0][1]) {
       _7 = { TAG: "Err", _0: { TAG: "CapacityOverflow" } };
       _27 = _7._0;
       _6 = { TAG: "Break", _0: { TAG: "Err", _0: _27.TAG === "CapacityOverflow" ? { TAG: "CapacityOverflow" } : { TAG: "AllocError", layout: { size: _27.layout.size, align: _27.layout.align }, non_exhaustive: _27.non_exhaustive } } };
@@ -476,9 +478,11 @@ function alloc$raw_vec$impl_7_grow_amortized$h3d170a9f5529fa2a(self, len, additi
 }
 // alloc::raw_vec::RawVecInner::<A>::try_allocate_in
 function alloc$raw_vec$impl_7_try_allocate_in$h938b13dc8d6947cd(capacity, init, alloc, elem_layout) {
-  let _0, _5, layout, result, _11, _17, _24, _25, _28, _31, _39;
+  let _0, _5, layout, result, _11, _17, _24, _25, _26, _27, _28, _31, _39, $t0;
   _39 = elem_layout.align;
-  _25 = (($w) => [$w >>> 0, $w >>> 0 !== $w])((elem_layout.size >>> 0) * (capacity >>> 0));
+  _26 = elem_layout.size >>> 0;
+  _27 = capacity >>> 0;
+  _25 = [$t0 = Math.imul(_26, _27) >>> 0, $t0 !== _26 * _27];
   _28 = _25[0] >>> 0;
   _24 = _25[1];
   L0: {
@@ -1195,11 +1199,11 @@ function core$iter$range$impl_15_next$ha8b29c9714bc7cc6(self) {
 }
 // <u8 as core::iter::Step>::forward_overflowing
 function core$iter$range$impl_41_forward_overflowing$h094e3585005ba544(start, n) {
-  let _0;
+  let _0, $t0, $t1;
   if (n > 255) {
     _0 = [start + (n & 255) & 255, true];
   } else {
-    _0 = (($w) => [$w & 255, ($w & 255) !== $w])(start + (n & 255));
+    _0 = [$t1 = ($t0 = start + (n & 255)) & 255, $t1 !== $t0];
   }
   return _0;
 }
