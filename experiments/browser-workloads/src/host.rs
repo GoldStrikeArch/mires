@@ -24,9 +24,6 @@ js_bindings! {
     #[js(call = "parseFloat")]
     fn parse_float_raw(value: JsValue) -> f64;
 
-    #[js(new = "Uint8Array")]
-    fn uint8_array_new(length: f64) -> JsValue;
-
     #[js(global, get = "globalThis")]
     pub fn global_this() -> JsValue;
 
@@ -67,17 +64,9 @@ pub fn set(target: JsValue, key: &str, value: JsValue) {
     let _ = reflect_set(target, JsValue::erase(key), value);
 }
 
-pub fn set_key(target: JsValue, key: JsValue, value: JsValue) {
-    let _ = reflect_set(target, key, value);
-}
-
 #[must_use]
 pub fn index(target: JsValue, at: usize) -> JsValue {
     get_key(target, JsValue::erase(at))
-}
-
-pub fn set_index(target: JsValue, at: usize, value: JsValue) {
-    set_key(target, JsValue::erase(at), value);
 }
 
 #[must_use]
@@ -101,11 +90,6 @@ pub fn call(receiver: JsValue, method: &str, arguments: &[JsValue]) -> JsValue {
 
 pub fn push(target: JsValue, value: JsValue) {
     let _ = call(target, "push", &[value]);
-}
-
-#[must_use]
-pub fn uint8_array(length: usize) -> JsValue {
-    uint8_array_new(length as f64)
 }
 
 #[must_use]

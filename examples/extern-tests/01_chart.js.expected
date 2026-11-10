@@ -3,6 +3,7 @@
 import { Chart as ext$Chart$ha63ef9d821d58172 } from "./chart-lib.mjs";
 // ./chart-lib.mjs
 import { default as ext$default$h12f6cccdfb836843 } from "./chart-lib.mjs";
+import * as __rt from "./shim.js";
 // panic
 function _RNvCs1lVxXr9ZvqQ_7___rustc17rust_begin_unwind(_1) {
   for (;;) {}
@@ -114,7 +115,7 @@ function v_nullable_some(chart) {
       _0 = $t5;
       break;
     default:
-      throw new Error("rustc_codegen_js: entered unreachable code");
+      throw __rt.abort_error(new Error("rustc_codegen_js: entered unreachable code"));
   }
   return _0;
 }

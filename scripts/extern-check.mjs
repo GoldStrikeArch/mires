@@ -15,7 +15,8 @@
 // and a `Chart(el, cfg)` factory both produce a chart, and only a recorder tells them apart.
 //
 // The fixture is examples/extern-tests/01_chart.rs; build/externtest/01_chart.js is what
-// scripts/extern-test.sh leaves behind, so run that first.
+// scripts/extern-test.sh leaves behind, so run that first. The last section drives
+// examples/extern-tests/03_bytes_bulk.rs, the bulk byte crossings of `mires_js::JsUint8Array`.
 
 import { fileURLToPath, pathToFileURL } from "node:url";
 import fs from "node:fs";
@@ -212,6 +213,221 @@ run("call-static", () => {
   js.v_call_static(env.plugin);
   return undefined;
 });
+
+// ------------------------------------------------------------------------- byte buffers
+// examples/extern-tests/03_bytes_bulk.rs: `mires_js::JsUint8Array` copies a whole byte range across
+// the boundary with one host operation each way. Exact values and lengths, a slice that does not
+// start at its buffer's first element, `i8` storage, and copy semantics in both directions.
+const bytes = await import(pathToFileURL(path.join(from, "03_bytes_bulk.js")).href);
+const rt = await import(pathToFileURL(path.join(from, "shim.js")).href);
+const pattern = (length) => Uint8Array.from({ length }, (_, index) => (index * 7 + 3) & 255);
+const same = (actual, expected) => actual instanceof Uint8Array
+  && actual.length === expected.length
+  && actual.every((byte, index) => byte === expected[index]);
+const shown = (value) => value instanceof Uint8Array
+  ? `Uint8Array(${value.length}) [${Array.from(value.subarray(0, 12)).join(", ")}${value.length > 12 ? ", ..." : ""}]`
+  : String(value);
+const exact = (label, run, expected) => {
+  let actual;
+  try {
+    actual = run();
+  } catch (error) {
+    check(label, false, `threw ${String(error)}`);
+    return;
+  }
+  check(label, same(actual, expected), same(actual, expected) ? undefined : shown(actual));
+};
+
+exact("bytes: an empty Vec crosses as an empty Uint8Array", () => bytes.bytes_pattern(0), []);
+exact("bytes: one byte", () => bytes.bytes_pattern(1), [3]);
+exact("bytes: 65,536 bytes, every value 0..=255", () => bytes.bytes_pattern(65536), pattern(65536));
+exact("bytes: 0 and 255 and their neighbours", () => bytes.bytes_extremes(), [0, 255, 1, 254, 127, 128]);
+exact("bytes: an empty literal", () => bytes.bytes_empty_literal(), []);
+exact("bytes: a Vec that never allocated", () => bytes.bytes_empty_vec(), []);
+exact("bytes: a slice at offset 100 of a larger buffer", () => bytes.bytes_middle(100, 164), pattern(300).subarray(100, 164));
+exact("bytes: a slice ending at its buffer's last element", () => bytes.bytes_middle(299, 300), pattern(300).subarray(299));
+exact("bytes: an empty slice inside a buffer", () => bytes.bytes_middle(150, 150), []);
+exact("bytes: a Vec after push past capacity and truncate", () => bytes.bytes_push_truncate(), [25, 50, 75, 100, 125, 255]);
+exact("bytes: i8 storage crosses as its bytes", () => bytes.bytes_signed(), [128, 255, 0, 1, 127]);
+exact("bytes: a static byte string", () => bytes.bytes_static_and_str(0), [0, 255, ...new TextEncoder().encode("static")]);
+exact("bytes: a &str's UTF-8 bytes", () => bytes.bytes_static_and_str(1), new TextEncoder().encode("héllo \u{1f600}"));
+{
+  const first = bytes.bytes_pattern(8);
+  const second = bytes.bytes_pattern(8);
+  check("bytes: every export is a fresh Uint8Array over its own buffer",
+    first !== second && first.buffer !== second.buffer && first.byteOffset === 0
+      && first.buffer.byteLength === 8);
+}
+for (const length of [0, 1, 7, 65536]) {
+  let answer;
+  try {
+    answer = bytes.bytes_round_trip(length);
+  } catch (error) {
+    answer = `threw ${String(error)}`;
+  }
+  check(`bytes: Rust -> JS -> Rust round trip of ${length} bytes is equal`, answer === true, String(answer));
+}
+{
+  const input = Uint8Array.from([0, 1, 128, 254, 255, 42]);
+  const output = bytes.bytes_echo(input);
+  check("bytes: JS -> Rust -> JS round trip is equal", same(output, input), shown(output));
+  check("bytes: the round trip does not alias its input", output !== input && output.buffer !== input.buffer);
+  const big = pattern(65536).reverse();
+  exact("bytes: JS -> Rust -> JS round trip of 65,536 bytes", () => bytes.bytes_echo(big), big);
+  exact("bytes: an empty Uint8Array imports as an empty Vec", () => bytes.bytes_echo(new Uint8Array(0)), []);
+  const window = pattern(64).subarray(10, 20);
+  exact("bytes: a subarray view imports only its own range", () => bytes.bytes_echo(window), window);
+}
+{
+  const input = Uint8Array.from([9, 8, 7, 0, 255]);
+  exact("bytes: copy_to_slice into the middle of a larger buffer",
+    () => bytes.bytes_copy_into_middle(input, 3),
+    [0xee, 0xee, 0xee, 9, 8, 7, 0, 255, 0xee, 0xee, 0xee]);
+  let threw = null;
+  try {
+    bytes.bytes_copy_mismatch(Uint8Array.from([1, 2]));
+  } catch (error) {
+    threw = error;
+  }
+  check("bytes: copy_to_slice into a slice of another length panics", threw === "rust panic", String(threw));
+  let accepted = null;
+  try {
+    bytes.bytes_echo([1, 2, 3]);
+    accepted = "a plain array was accepted";
+  } catch (error) {
+    accepted = error instanceof TypeError ? null : String(error);
+  }
+  check("bytes: only a Uint8Array is accepted as one", accepted === null, accepted ?? undefined);
+}
+{
+  let calls = 0;
+  const failures = bytes.bytes_copy_isolation((view) => {
+    calls += 1;
+    for (let index = 0; index < view.length; index += 1) view[index] = (calls === 1 ? 200 : 144) + index;
+  });
+  check("bytes: writes after a crossing are never visible on the other side",
+    failures === 0 && calls === 2, `failure bits ${failures}, ${calls} host call(s)`);
+}
+// The runtime helper on the carriers a compiled program can hand it, directly: typed backing
+// storage (a typed `NativeVec` buffer), `i8` values in a plain array, an absent or frozen buffer
+// behind a zero length, and an offset into a typed buffer.
+{
+  exact("bytes: runtime copy of a plain array at an offset",
+    () => rt.u8array_from_bytes({ buf: [5, 6, 7, 8, 9], off: 1, len: 3 }), [6, 7, 8]);
+  exact("bytes: runtime copy of i8 values",
+    () => rt.u8array_from_bytes({ buf: [-128, -1, 0, 127], off: 0, len: 4 }), [128, 255, 0, 127]);
+  exact("bytes: runtime copy of Uint8Array storage at an offset",
+    () => rt.u8array_from_bytes({ buf: Uint8Array.from([1, 2, 3, 4]), off: 2, len: 2 }), [3, 4]);
+  exact("bytes: runtime copy of Int8Array storage",
+    () => rt.u8array_from_bytes({ buf: Int8Array.from([-1, -128, 5]), off: 0, len: 3 }), [255, 128, 5]);
+  exact("bytes: runtime copy of an absent zero-length buffer",
+    () => rt.u8array_from_bytes({ buf: undefined, off: undefined, len: 0 }), []);
+  exact("bytes: runtime copy of the frozen dangling buffer",
+    () => rt.u8array_from_bytes(rt.slice_from_parts(1, 0)), []);
+  const storage = Uint8Array.from([1, 2, 3]);
+  const copied = rt.u8array_from_bytes({ buf: storage, off: 0, len: 3 });
+  copied[0] = 99;
+  check("bytes: runtime copy of typed storage does not alias it", storage[0] === 1 && copied.buffer !== storage.buffer);
+  const destination = { buf: [0, 0, 0, 0, 0], off: 1, len: 3 };
+  rt.u8array_into_bytes(Uint8Array.from([255, 0, 128]), destination);
+  check("bytes: runtime import writes exactly dst.len bytes at dst.off",
+    JSON.stringify(destination.buf) === JSON.stringify([0, 255, 0, 128, 0]), JSON.stringify(destination.buf));
+}
+// The export and the length read are classified as unable to throw (`HostOperation::may_throw`),
+// so whatever they are handed, the only exception allowed out is a registered compiler abort.
+const aborts = (label, run) => {
+  let threw = null;
+  let answer;
+  try {
+    answer = run();
+  } catch (error) {
+    threw = { error };
+  }
+  const ok = threw !== null && rt.is_abort(threw.error);
+  check(label, ok, ok ? undefined : threw === null
+    ? `returned ${shown(answer)}`
+    : `threw an ordinary ${threw.error instanceof Error ? threw.error.constructor.name : typeof threw.error}`);
+};
+{
+  const hostile = new Proxy({}, { get() { throw new Error("host getter ran"); } });
+  aborts("bytes: a host record with a negative length aborts", () => bytes.bytes_from_host_record({ len: -1 }));
+  aborts("bytes: a host record with a fractional length aborts", () => bytes.bytes_from_host_record({ buf: [1, 2], off: 0, len: 1.5 }));
+  aborts("bytes: a host record whose getter throws aborts", () => bytes.bytes_from_host_record(hostile));
+  aborts("bytes: a host record whose range overruns its buffer aborts", () => bytes.bytes_from_host_record({ buf: [1, 2], off: 1, len: 2 }));
+  aborts("bytes: a host record with a field-key offset aborts", () => bytes.bytes_from_host_record({ buf: { b: 1 }, off: "b", len: 1 }));
+  aborts("bytes: a host record over a DataView aborts", () => bytes.bytes_from_host_record({ buf: new DataView(new ArrayBuffer(4)), off: 0, len: 2 }));
+  aborts("bytes: a host record over BigInt storage aborts", () => bytes.bytes_from_host_record({ buf: [1n, 2n], off: 0, len: 2 }));
+  aborts("bytes: a host record over a BigInt64Array aborts", () => bytes.bytes_from_host_record({ buf: new BigInt64Array(2), off: 0, len: 2 }));
+  aborts("bytes: a length no Uint8Array can have aborts", () => bytes.bytes_from_host_record({ buf: [], off: 0, len: 2 ** 53 }));
+  exact("bytes: a well-formed host record is copied", () => bytes.bytes_from_host_record({ buf: [1, 2, 3], off: 1, len: 2 }), [2, 3]);
+  aborts("bytes: u64 storage viewed as bytes aborts", () => bytes.bytes_from_words());
+  aborts("bytes: host values viewed as bytes abort when valueOf throws",
+    () => bytes.bytes_from_values({ valueOf() { throw new Error("host valueOf ran"); } }));
+  aborts("bytes: runtime export of undefined aborts", () => rt.u8array_from_bytes(undefined));
+  const target = { buf: [7, 7, 7], off: 0, len: 3 };
+  aborts("bytes: runtime import into a destination of another length aborts", () => rt.u8array_into_bytes(Uint8Array.from([1, 2]), target));
+  check("bytes: the aborted import wrote nothing", target.buf.every((byte) => byte === 7), JSON.stringify(target.buf));
+}
+// The length read is classified as able to throw: a view that is not a `Uint8Array` is refused with
+// the ordinary `TypeError` a mismatched host read raises, so cleanup runs, and no host code runs.
+{
+  const refuses = (label, value, run) => {
+    let traps = 0;
+    const counted = new Proxy(value, { get(object, key) { traps += 1; return Reflect.get(object, key); } });
+    let threw = null;
+    try {
+      run(counted);
+    } catch (error) {
+      threw = { error };
+    }
+    const ok = threw !== null && threw.error instanceof TypeError && !rt.is_abort(threw.error) && traps === 0;
+    check(label, ok, ok ? undefined : threw === null ? "it did not throw"
+      : `${rt.is_abort(threw.error) ? "abort" : String(threw.error)}, ${traps} trap(s)`);
+  };
+  refuses("bytes: runtime length of a Proxy over a Uint8Array is a TypeError, no trap run",
+    Uint8Array.from([1, 2, 3]), (value) => rt.u8array_length(value));
+  refuses("bytes: runtime length of an array-like is a TypeError, no trap run",
+    { length: 3 }, (value) => rt.u8array_length(value));
+  refuses("bytes: runtime length of an Int8Array is a TypeError",
+    new Int8Array(3), (value) => rt.u8array_length(new Int8Array(3)));
+  refuses("bytes: to_vec of a mistyped Proxy is a TypeError, no trap run",
+    Uint8Array.from([1, 2, 3]), (value) => bytes.bytes_unchecked_to_vec(value));
+  exact("bytes: to_vec of a genuine Uint8Array through the unchecked declaration",
+    () => bytes.bytes_unchecked_to_vec(Uint8Array.from([5, 6])), [5, 6]);
+}
+// An own `length` property on a genuine Uint8Array is never consulted: sizes come from the
+// internal slots, and the copy checks them again.
+{
+  const shadowed = (real, fake) => {
+    const view = Uint8Array.from(real);
+    Object.defineProperty(view, "length", { get() { return fake; }, configurable: true });
+    return view;
+  };
+  exact("bytes: an own length longer than the view does not lengthen the import", () => bytes.bytes_echo(shadowed([1, 2, 3], 5)), [1, 2, 3]);
+  exact("bytes: an own length shorter than the view does not truncate the import", () => bytes.bytes_echo(shadowed([1, 2, 3], 1)), [1, 2, 3]);
+  exact("bytes: copy_to_slice sizes from the view, not its own length",
+    () => bytes.bytes_copy_into_middle(shadowed([4, 5, 6], 9), 1), [0xee, 4, 5, 6, 0xee]);
+  let threw = null;
+  try {
+    bytes.bytes_copy_mismatch(shadowed([1, 2], 3));
+  } catch (error) {
+    threw = error;
+  }
+  check("bytes: an own length equal to the destination does not let a short view through", threw === "rust panic", String(threw));
+  check("bytes: runtime length reads the internal slot", rt.u8array_length(shadowed([1, 2, 3], 5)) === 3);
+}
+// Detach: a view whose buffer is transferred after the conversion has length zero.
+{
+  let answer;
+  try {
+    answer = bytes.bytes_after_detach(Uint8Array.from([1, 2, 3]), (view) => {
+      structuredClone(view.buffer, { transfer: [view.buffer] });
+    });
+  } catch (error) {
+    answer = `threw ${String(error)}`;
+  }
+  check("bytes: a detached view has length zero and imports as an empty Vec", answer === 3000, String(answer));
+}
 
 console.log(failures === 0 ? "\nall checks passed" : `\n${failures} check(s) failed`);
 process.exit(failures === 0 ? 0 : 1);

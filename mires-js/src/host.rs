@@ -378,6 +378,27 @@ pub(crate) fn host_base64_url_native(value: crate::JsUint8Array) -> crate::JsStr
 pub(crate) fn host_base64_url_supported() -> bool {
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 }
+
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.u8arrayfrombytes")]
+#[inline(never)]
+pub(crate) fn host_u8array_from_bytes(bytes: &[u8]) -> crate::JsUint8Array {
+    let _ = bytes;
+    unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
+}
+
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.u8arraylength")]
+#[inline(never)]
+pub(crate) fn host_u8array_length(value: crate::JsUint8Array) -> usize {
+    let _ = value;
+    unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
+}
+
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.u8arrayintobytes")]
+#[inline(never)]
+pub(crate) fn host_u8array_into_bytes(source: crate::JsUint8Array, destination: &mut [u8]) {
+    let _ = (source, destination);
+    unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
+}
 marker!(
     host_is_undefined(value: JsValue) -> bool,
     "rcgjs.host.isundefined",

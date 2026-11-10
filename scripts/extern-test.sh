@@ -21,7 +21,8 @@
 #
 # and the meaning of that emission is checked separately by two drivers. scripts/extern-check.mjs
 # runs the compiled module against contract/fixtures/js-extern/chart-lib.mjs and compares the
-# recorded call trace with contract/fixtures/js-extern/vectors.json; scripts/globals-check.mjs does
+# recorded call trace with contract/fixtures/js-extern/vectors.json, then drives 03_bytes_bulk's
+# bulk byte crossings (`mires_js::JsUint8Array`) against exact expected bytes; scripts/globals-check.mjs does
 # the same for declarations rooted at the global scope, against a recorder it installs as those
 # globals. A golden pins WHAT was emitted; a driver pins that it does what the reference emission
 # does, which is the thing a descriptor is about.
@@ -109,6 +110,23 @@ Darwin) proc_macro="$root/target/debug/libjs_extern_macro.dylib" ;;
 *) proc_macro="$root/target/debug/libjs_extern_macro.so" ;;
 esac
 
+# `mires-js`, built by this backend into an rlib with the fixtures' own flags, for a fixture that
+# crosses the boundary through the library's typed host values (03_bytes_bulk). It depends on the
+# proc macro by name, so the macro also sits alone in a search directory: a directory of host rlibs
+# beside it would offer those for the target too.
+echo "==> building mires-js"
+proc_macro_dir="$build_dir/proc-macro"
+mkdir -p "$proc_macro_dir"
+ln -sf "$proc_macro" "$proc_macro_dir/$(basename -- "$proc_macro")"
+mires_js="$build_dir/libmires_js.rlib"
+if ! JS_EXTRA_ARGS="$EXTERN_ARGS" "$script_dir/compile_core.sh" "$root/mires-js/src/lib.rs" "$mires_js" \
+	--crate-type rlib --crate-name mires_js --extern js_extern_macro="$proc_macro" \
+	>"$log_dir/extern-mires-js.log" 2>&1; then
+	echo "extern-test.sh: could not build mires-js" >&2
+	cat "$log_dir/extern-mires-js.log" >&2
+	exit 1
+fi
+
 # The run directory: a module package and the ES module shim. The chart library itself is written
 # by scripts/extern-check.mjs, which is what resolves the declared specifier.
 printf '{ "type": "module" }\n' >"$build_dir/package.json"
@@ -158,7 +176,8 @@ for src in $sources; do
 	echo "==> $name"
 
 	if ! JS_EXTRA_ARGS="$EXTERN_ARGS" "$script_dir/compile_core.sh" "$src" "$out" \
-		--extern js_extern_macro="$proc_macro" >"$log_dir/extern-$name.compile.log" 2>&1; then
+		--extern js_extern_macro="$proc_macro" --extern mires_js="$mires_js" \
+		--search "$proc_macro_dir" >"$log_dir/extern-$name.compile.log" 2>&1; then
 		echo "    compile failed:"
 		sed 's/^/    /' "$log_dir/extern-$name.compile.log"
 		results="$results$name FAIL compile-error"$'\n'

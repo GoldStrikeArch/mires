@@ -192,6 +192,21 @@ The vectors on this page drive the chart library, which is a module, so none of 
 
 The proposed vector ids, for when a global recorder joins the chart library in `fixtures/js-extern/`, are `new-global`, `call-global`, `call-global-path`, `get-global`, `set-global`, `index-global`, `nullable-global`, and the negative `new-global-without-new`. `globals-check.mjs` already drives all eight and becomes their driver unchanged. Until then the global root is proven, but it is proven next door rather than here, and this page should not be read as having pinned it.
 
+## Byte buffers
+
+Arguments pass through unmarshalled, and for bytes that is a trap rather than a convenience: a
+`&[u8]` handed to a declaration arrives as the compiler's `{ buf, off, len }` slice record, not as a
+`Uint8Array`. Bytes cross through `mires_js::JsUint8Array` instead, by copy and in bulk:
+`from_slice` (Rust to a fresh `Uint8Array`) is one host operation, and `copy_to_slice` and `to_vec`
+(a `Uint8Array` back into Rust bytes) are two, a length read from the view's internal slots and one
+copy. The two sides never share storage afterwards.
+CONTRACT.md, "Byte buffers cross by copy", states the full contract, and
+`examples/extern-tests/03_bytes_bulk.rs` with `scripts/extern-check.mjs` checks it.
+
+A slot's `bytes` observation fact (`y` in the descriptor) is a different thing: it tells the
+representation planner that the host observes a value's bytes, which pins that edge to the baseline
+representation. It converts nothing.
+
 ## Running it
 
 ```sh

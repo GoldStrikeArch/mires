@@ -21,6 +21,15 @@ pub enum HostOperation {
     Erase,
     Invoke,
     Construct,
+    /// `JsUint8Array::from_slice`: a Rust byte slice copied into a fresh, exact-length
+    /// `Uint8Array` by one runtime call (`__rt.u8array_from_bytes`).
+    Uint8ArrayFromBytes,
+    /// `JsUint8Array::len`: a `Uint8Array`'s length read from its internal slots
+    /// (`__rt.u8array_length`), which an own `length` property cannot shadow.
+    Uint8ArrayLength,
+    /// `JsUint8Array::copy_to_slice`: a `Uint8Array`'s bytes copied into a Rust byte slice of
+    /// the same length by one runtime call (`__rt.u8array_into_bytes`).
+    Uint8ArrayIntoBytes,
 }
 
 impl HostOperation {
@@ -44,6 +53,9 @@ impl HostOperation {
             "erase" => Self::Erase,
             "invoke" => Self::Invoke,
             "construct" => Self::Construct,
+            "u8arrayfrombytes" => Self::Uint8ArrayFromBytes,
+            "u8arraylength" => Self::Uint8ArrayLength,
+            "u8arrayintobytes" => Self::Uint8ArrayIntoBytes,
             _ => return None,
         })
     }
@@ -51,7 +63,7 @@ impl HostOperation {
     pub fn arity(self) -> usize {
         match self {
             Self::Undefined | Self::Null => 0,
-            Self::StrictEq | Self::Add | Self::Construct => 2,
+            Self::StrictEq | Self::Add | Self::Construct | Self::Uint8ArrayIntoBytes => 2,
             Self::BigIntRange | Self::Invoke => 3,
             _ => 1,
         }
@@ -71,6 +83,36 @@ impl HostOperation {
             // host function before consuming operands. Source arguments run first.
             _ => OperandEvaluation::Materialize,
         }
+    }
+
+    /// Whether the emitted operation can raise a JavaScript exception other than a registered
+    /// compiler abort, given operands that are already evaluated. Exhausting the stack on entering
+    /// a runtime helper is the engine's failure, as it is for any call, and is not counted.
+    ///
+    /// `false` is unconditional, because a cleanup analysis removes unwind edges on it: it holds
+    /// for every operand a program can hand the operation, a lying declaration's included. The
+    /// operation is a literal, a strict comparison, `typeof`, `!!`, `Number.isInteger`, the
+    /// operand itself, or the byte export `u8array_from_bytes`, which checks its record and turns
+    /// every failure into a registered abort. `add` and `bigintrange` reach `valueOf` on host
+    /// values; `invoke` and `construct` run host code. The import's length read runs no host code
+    /// but refuses a value that is not a `Uint8Array` with a `TypeError`, so that cleanup runs as it
+    /// does for any host exception, and its copy also writes through a destination record it does
+    /// not validate: both answer `true`.
+    pub fn may_throw(self) -> bool {
+        !matches!(
+            self,
+            Self::Undefined
+                | Self::Null
+                | Self::IsUndefined
+                | Self::IsNull
+                | Self::Truthy
+                | Self::StrictEq
+                | Self::TypeIs(_)
+                | Self::IsObject
+                | Self::IsInteger
+                | Self::Erase
+                | Self::Uint8ArrayFromBytes
+        )
     }
 
     pub fn lower(self, arguments: Vec<Expr>) -> Result<Expr, String> {
@@ -139,6 +181,9 @@ impl HostOperation {
                 jsast::binary(BinOp::Le, one(), values[2].clone()),
             ),
             Self::Erase => one(),
+            Self::Uint8ArrayFromBytes => jsast::rt_call("u8array_from_bytes", vec![one()]),
+            Self::Uint8ArrayLength => jsast::rt_call("u8array_length", vec![one()]),
+            Self::Uint8ArrayIntoBytes => jsast::rt_call("u8array_into_bytes", values.to_vec()),
             Self::Invoke | Self::Construct => {
                 let arguments = values.last().unwrap();
                 let array = if array {
@@ -295,6 +340,9 @@ assert.deepEqual(trace, [0, 1, 'construct']);
             "erase",
             "invoke",
             "construct",
+            "u8arrayfrombytes",
+            "u8arraylength",
+            "u8arrayintobytes",
         ] {
             let operation = HostOperation::from_marker(marker).unwrap();
             assert!(operation
@@ -305,5 +353,45 @@ assert.deepEqual(trace, [0, 1, 'construct']);
                 .is_err());
         }
         assert_eq!(HostOperation::from_marker("unknown"), None);
+    }
+
+    #[test]
+    fn byte_crossings_are_one_runtime_call_each_and_only_the_export_raises_nothing() {
+        let spelled = |operation: HostOperation| {
+            let arguments = (0..operation.arity())
+                .map(|index| jsast::id(format!("a{index}")))
+                .collect();
+            jsast::expr_to_string(&operation.lower(arguments).unwrap())
+        };
+        assert_eq!(
+            spelled(HostOperation::Uint8ArrayFromBytes),
+            "__rt.u8array_from_bytes(a0)"
+        );
+        assert_eq!(
+            spelled(HostOperation::Uint8ArrayLength),
+            "__rt.u8array_length(a0)"
+        );
+        assert_eq!(
+            spelled(HostOperation::Uint8ArrayIntoBytes),
+            "__rt.u8array_into_bytes(a0, a1)"
+        );
+        // The export aborts on anything else; the import refuses a non-`Uint8Array` with a
+        // `TypeError`.
+        assert!(!HostOperation::Uint8ArrayFromBytes.may_throw());
+        assert!(HostOperation::Uint8ArrayLength.may_throw());
+        assert!(HostOperation::Uint8ArrayIntoBytes.may_throw());
+        for marker in ["add", "bigintrange", "invoke", "construct"] {
+            assert!(HostOperation::from_marker(marker).unwrap().may_throw());
+        }
+        for marker in [
+            "undefined",
+            "isnull",
+            "truthy",
+            "stricteq",
+            "isstring",
+            "erase",
+        ] {
+            assert!(!HostOperation::from_marker(marker).unwrap().may_throw());
+        }
     }
 }

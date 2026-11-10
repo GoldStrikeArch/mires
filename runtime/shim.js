@@ -3454,3 +3454,92 @@ globalThis.__rt.convert_sv_nv = (s) => ({
   len: s.len,
   cap: s.len,
 });
+
+// The `%TypedArray%.prototype` accessors, captured when the runtime loads. They
+// read a typed array's internal slots, so an own `length` or `subarray`
+// property a host defines on one instance is never consulted, and the tag is
+// `undefined` (never an exception, never a trap) for anything that is not a
+// typed array, a Proxy included.
+globalThis.__rt._typed_array = ((prototype) => ({
+  length: Object.getOwnPropertyDescriptor(prototype, "length").get,
+  tag: Object.getOwnPropertyDescriptor(prototype, Symbol.toStringTag).get,
+  subarray: prototype.subarray,
+}))(Object.getPrototypeOf(Uint8Array.prototype));
+
+// u8array_from_bytes(s): a Rust byte slice `{ buf, off, len }` copied into a
+// fresh exact-length `Uint8Array` (mires-js `JsUint8Array::from_slice`). One
+// host operation per conversion: the loop is here, not one boundary call per
+// byte in the program. The result never aliases Rust storage. A store into a
+// `Uint8Array` wraps, so an `i8` element is read as its byte, and typed
+// backing storage is copied with one `set`. A zero length slice reads nothing;
+// its buffer may be a frozen dangling array or absent.
+//
+// The operation raises nothing but a registered abort, which is what lets the
+// compiler classify it as non-throwing (`HostOperation::may_throw`). The record
+// is checked before anything is read through it -- an integer length and
+// offset, a plain array or typed array buffer that holds the range -- and
+// whatever else goes wrong (an allocation the engine refuses, storage that is
+// not bytes) becomes the same abort.
+globalThis.__rt.u8array_from_bytes = (s) => {
+  try {
+    const len = s.len;
+    if (Number.isInteger(len) && len >= 0) {
+      const out = new Uint8Array(len);
+      if (len === 0) return out;
+      const buf = s.buf;
+      const off = s.off;
+      if (Number.isInteger(off) && off >= 0) {
+        if (Array.isArray(buf)) {
+          if (off + len <= buf.length) {
+            for (let i = 0; i < len; i += 1) out[i] = buf[off + i];
+            return out;
+          }
+        } else if (ArrayBuffer.isView(buf)) {
+          const typed = globalThis.__rt._typed_array;
+          if (off + len <= Reflect.apply(typed.length, buf, [])) {
+            out.set(Reflect.apply(typed.subarray, buf, [off, off + len]));
+            return out;
+          }
+        }
+      }
+    }
+  } catch (error) {
+    // Reported below, without reading the value that was thrown.
+  }
+  throw __rt.abort_error(new Error(
+    "rustc_codegen_js: this value is not a Rust byte slice, so it cannot be copied into a Uint8Array",
+  ));
+};
+
+// u8array_length(view): the length of a `Uint8Array` from its internal slots
+// (mires-js `JsUint8Array::len`), so an own `length` property cannot shadow
+// it. A detached view has length zero. No host code runs: anything that is not
+// a `Uint8Array` -- a Proxy, another typed array, a host value a declaration
+// mistyped -- is refused with the same `TypeError` a mismatched host read
+// raises (`rcgjs.host.badread`), so cleanup still runs on the way out.
+globalThis.__rt.u8array_length = (view) => {
+  const typed = globalThis.__rt._typed_array;
+  if (Reflect.apply(typed.tag, view, []) !== "Uint8Array") {
+    throw new TypeError("host value does not match its Rust representation");
+  }
+  return Reflect.apply(typed.length, view, []);
+};
+
+// u8array_into_bytes(src, dst): a `Uint8Array`'s bytes written into the Rust
+// byte slice `dst` (mires-js `JsUint8Array::copy_to_slice` and `to_vec`, which
+// size `dst` from `u8array_length`). The lengths are checked again here, from
+// the internal slots, so the helper is fail-closed on its own: a mismatch
+// aborts before anything is written. The writes are the element stores Rust
+// itself would make, so the storage keeps its element type, and nothing
+// aliases `src` afterwards.
+globalThis.__rt.u8array_into_bytes = (src, dst) => {
+  const len = dst.len;
+  if (globalThis.__rt.u8array_length(src) !== len) {
+    throw __rt.abort_error(new Error(
+      "rustc_codegen_js: a Uint8Array does not hold as many bytes as its Rust destination",
+    ));
+  }
+  const buf = dst.buf;
+  const off = dst.off;
+  for (let i = 0; i < len; i += 1) buf[off + i] = src[i];
+};

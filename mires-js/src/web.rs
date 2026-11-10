@@ -1,5 +1,7 @@
 //! Typed byte and compression operations provided by the JavaScript host.
 
+use alloc::vec::Vec;
+
 use crate::{js_bindings, HostValue, JsString, JsValue};
 
 /// A native JavaScript `Uint8Array`.
@@ -7,8 +9,27 @@ use crate::{js_bindings, HostValue, JsString, JsValue};
 /// Conversion from an opaque value checks its public constructor against the current realm's
 /// `Uint8Array` and verifies the intrinsic element kind. Detached storage raises the host's
 /// `TypeError`. These checks apply at conversion time; another alias can later detach the buffer.
-/// Construction from Rust bytes copies once into host-owned contiguous storage. Copies between
-/// two values use the host's overlap-safe `TypedArray.prototype.set` operation.
+/// Copies between two values use the host's overlap-safe `TypedArray.prototype.set` operation.
+///
+/// # Bulk byte crossings
+///
+/// Bytes cross between Rust and the host only by copy, in bulk whatever the length.
+/// [`from_slice`](Self::from_slice) (also `From<&[u8]>`) is one host operation that hands the host a
+/// fresh `Uint8Array`. [`to_vec`](Self::to_vec) (also `From<JsUint8Array> for Vec<u8>`) and
+/// [`copy_to_slice`](Self::copy_to_slice) are two: the length read that sizes the destination, then
+/// one copy. The two sides never share storage: a later write to the Rust buffer is not visible
+/// through the `Uint8Array`, and a later write to the `Uint8Array` is not visible to Rust.
+///
+/// A length is read from the view's internal slots, never from its `length` property, so an own
+/// `length` a host defines on the instance changes nothing here. A view whose buffer was detached
+/// after the conversion has length zero: [`len`](Self::len) answers 0, `to_vec` returns an empty
+/// `Vec`, and `copy_to_slice` panics unless its destination is empty.
+///
+/// The export raises nothing but a compiler abort: a value that is not a Rust byte slice and an
+/// allocation the engine refuses both abort. The length read runs no host code, and refuses a
+/// `JsUint8Array` that does not hold a `Uint8Array` with a `TypeError`, as a mismatched
+/// [`JsValue::read`] does. The import's copy checks its source the same way and aborts before it
+/// writes if the lengths disagree.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct JsUint8Array {
@@ -44,20 +65,44 @@ impl JsUint8Array {
         uint8_array_new(length)
     }
 
-    /// Copies a Rust byte slice into exact-length host storage.
+    /// Copies a Rust byte slice into a fresh `Uint8Array` of exactly `bytes.len()` bytes.
+    ///
+    /// The whole range is copied by one host operation, which raises nothing but a compiler abort.
+    /// The result shares no storage with `bytes`.
     #[must_use]
     pub fn from_slice(bytes: &[u8]) -> Self {
-        let mut output = Self::new(bytes.len());
-        for (index, byte) in bytes.iter().copied().enumerate() {
-            output.set(index, byte);
-        }
-        output
+        crate::host::host_u8array_from_bytes(bytes)
     }
 
-    /// Returns the number of bytes in this view.
+    /// Copies every byte of this view into `destination`: a length read, then one copy.
+    ///
+    /// # Panics
+    ///
+    /// When `destination.len()` is not this view's [`len`](Self::len), as
+    /// `<[u8]>::copy_from_slice` does, before anything is written. A detached view has length
+    /// zero.
+    pub fn copy_to_slice(&self, destination: &mut [u8]) {
+        assert!(
+            self.len() == destination.len(),
+            "JsUint8Array::copy_to_slice: destination length differs from the view's"
+        );
+        crate::host::host_u8array_into_bytes(*self, destination);
+    }
+
+    /// Copies this view's bytes into a new `Vec<u8>` of exactly [`len`](Self::len) bytes: a length
+    /// read, then one copy. A detached view gives an empty `Vec`.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut bytes = alloc::vec![0; self.len()];
+        crate::host::host_u8array_into_bytes(*self, &mut bytes);
+        bytes
+    }
+
+    /// Returns the number of bytes in this view, from its internal slots: an own `length`
+    /// property does not shadow it, and a detached view has length zero.
     #[must_use]
     pub fn len(&self) -> usize {
-        uint8_array_len(*self)
+        crate::host::host_u8array_length(*self)
     }
 
     /// Whether this view contains no bytes.
@@ -110,6 +155,20 @@ impl JsUint8Array {
 impl From<JsUint8Array> for JsValue {
     fn from(value: JsUint8Array) -> Self {
         value.as_value()
+    }
+}
+
+/// [`JsUint8Array::from_slice`].
+impl From<&[u8]> for JsUint8Array {
+    fn from(bytes: &[u8]) -> Self {
+        Self::from_slice(bytes)
+    }
+}
+
+/// [`JsUint8Array::to_vec`].
+impl From<JsUint8Array> for Vec<u8> {
+    fn from(value: JsUint8Array) -> Self {
+        value.to_vec()
     }
 }
 
@@ -340,9 +399,6 @@ js_bindings! {
 
     #[js(call = "Uint8Array.prototype.indexOf.call")]
     fn uint8_array_index_of(value: JsValue, search: u8, start: f64) -> isize;
-
-    #[js(get = "length")]
-    fn uint8_array_len(value: JsUint8Array) -> usize;
 
     #[js(index)]
     fn uint8_array_get(value: JsUint8Array, index: usize) -> u8;

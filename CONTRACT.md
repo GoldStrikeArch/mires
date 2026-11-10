@@ -2694,6 +2694,69 @@ one machine word, for the two reasons `view_abi::Node` gives: a zero sized value
 MIR, and an ordinary one field struct is rebuilt field by field, so a JavaScript object passed
 through one would come back as `{ handle: undefined }`.
 
+### Byte buffers cross by copy
+
+Passing through holds for a byte slice too, which is why it is the wrong way to hand bytes to the
+host: a `&[u8]` is the `{ buf, off, len }` record over a JavaScript array of numbers (or over a
+typed backing store), not a `Uint8Array`, and an interface declared to take one receives the
+record. `mires_js::JsUint8Array` is the binding for bytes, and it crosses in bulk:
+
+| Rust | markers | runtime |
+|---|---|---|
+| `JsUint8Array::from_slice(&[u8])`, `From<&[u8]>` | `rcgjs.host.u8arrayfrombytes` | `__rt.u8array_from_bytes(s)` |
+| `JsUint8Array::len(&self)` | `rcgjs.host.u8arraylength` | `__rt.u8array_length(view)` |
+| `JsUint8Array::copy_to_slice(&self, &mut [u8])` | `u8arraylength`, then `rcgjs.host.u8arrayintobytes` | `__rt.u8array_into_bytes(src, dst)` |
+| `JsUint8Array::to_vec(&self)`, `From<JsUint8Array> for Vec<u8>` | the same two, into a fresh zeroed `Vec` | |
+
+The markers are `rcgjs_object::host::HostOperation`s, so the two lanes lower them from one table.
+
+- **Bulk, whatever the length.** The export is one host operation; the import is two, the length
+  read that sizes the destination and one copy. The loops are in the runtime helpers, so a 61 KB
+  buffer costs one or two calls rather than one boundary call per byte.
+- **Copy, never alias.** The export returns a fresh `Uint8Array` over its own `ArrayBuffer`; the
+  import writes Rust storage with the element stores Rust itself would make. A write on either side
+  after a crossing is never visible on the other.
+- **Exact values and length.** The export reads `[off, off + len)` and nothing past it, so a `Vec`'s
+  capacity never crosses. A store into a `Uint8Array` wraps, so `i8` storage crosses as its byte,
+  as `__rt.bytes_str` reads it; typed backing storage is copied with one `TypedArray.prototype.set`.
+  A zero length slice reads nothing, and its buffer may be absent or the frozen dangling array.
+- **Lengths come from internal slots.** `len`, and so the import's sizing, read the
+  `%TypedArray%.prototype` length and tag accessors the runtime captured when it loaded, never the
+  view's `length` property: an own `length` a host defines on the instance changes nothing.
+  `copy_to_slice` panics when the lengths differ, before it writes, as `<[u8]>::copy_from_slice`
+  does, and `u8array_into_bytes` checks them again and aborts on a mismatch, so the helper is
+  fail-closed on its own.
+- **Detached views have length zero.** A view whose buffer was transferred after the conversion
+  (conversion itself refuses a detached one) answers `len() == 0`: `to_vec` returns an empty `Vec`
+  and `copy_to_slice` panics unless its destination is empty.
+- **What may throw.** The export raises nothing but a registered compiler abort, which a cleanup
+  handler rethrows before it runs any destructor; `try_host`, which catches everything, still
+  answers one as `Err`. It checks its record before reading through it (integer length and offset,
+  a plain array or typed array buffer that holds the range) and turns anything else that goes wrong
+  into the same abort: a host object retyped as a byte slice by a declaration that lies, storage
+  that is not bytes viewed as bytes through `unsafe`, an allocation the engine refuses. Such a
+  misuse can still run host code first (a getter on the retyped object, a `valueOf` on a viewed
+  element), but the operation itself cannot raise an ordinary exception, so
+  `HostOperation::may_throw` answers `false` and a cleanup pass may remove the unwind edge around
+  it. That is a statement about this operation only: the compiled path to it first reborrows the
+  slice (`__rt.byte_slice_ref`, which reads the record's `buf`), and on a retyped host object that
+  read can raise an ordinary exception before the operation runs — the same trust in Rust-valid
+  operands that every `&[u8]` reborrow, load and length read already rests on. The length read runs no host code at
+  all; a `JsUint8Array` that does not hold a `Uint8Array` (a declaration that mistyped a host value)
+  is refused with the `TypeError` a mismatched `JsValue::read` raises, so destructors run as for any
+  host exception. It, and the copy, which writes through a destination record it does not
+  validate, answer `true`.
+
+`examples/extern-tests/03_bytes_bulk.rs`, driven by `scripts/extern-check.mjs`, checks each of
+these: empty, one and 65,536 bytes, 0 and 255, a slice at a non-zero offset, a `Vec` after `push`
+and `truncate`, `i8` storage, round trips both ways, a length mismatch, copy semantics in both
+directions, a shadowed `length`, a detached view, an abort for the malformed records and non-byte
+views it lists, and a `TypeError` with no host code run for a mistyped view, plus the runtime
+helpers directly on typed, dangling and hostile values. One silent case remains and predates this
+operation: non-byte storage viewed as bytes through `unsafe` copies element-wise when the byte
+length fits the element count and the elements are numbers (`u32` words `[0x01020304, 5]` viewed
+as two bytes export `[4, 5]`).
+
 ### `#[js(nullable)]`
 
 A declaration whose return type is `Option<T>` may say that the interface answers `null` for an
