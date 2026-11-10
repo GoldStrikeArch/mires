@@ -941,7 +941,13 @@ impl<'a> Planner<'a> {
     /// *holds* the reference (`&a.r`, a `*const &P`) instead of the pointer stored in it. The
     /// operand is captured, so the cast sees a name. A raw view of a reference's pointee
     /// (`&raw const *r`, which is how rustc spells `r as *const P`) does not depend on the spelling
-    /// (`js::place::Walk::object`), so only the cast is left to guard here.
+    /// (`js::place::Walk::object`), so only this cast (`js::rvalue::cast`) is left to guard here.
+    ///
+    /// No lowered program reaches it today: MIR's `PtrToPtr` is raw to raw, so a reference-typed
+    /// operand only arrives from a JIR pass or a hand-built body. It is kept because the cast's
+    /// lowering accepts one and would answer the field's slot silently;
+    /// `js::tests::a_reference_to_raw_cast_reads_a_loaded_reference_through_a_name` builds the
+    /// shape and is what exercises this rule.
     fn cast_reads_reference_spelling(&self, value: ValueId, op: &crate::jir::repr::Op) -> bool {
         use super::js::value::{is_raw, is_slot_pointee, pointee_of};
         let OpKind::Cast {

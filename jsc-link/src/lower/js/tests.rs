@@ -4028,4 +4028,216 @@ fn a_reference_to_raw_cast_reads_a_loaded_reference_through_a_name() {
     );
 }
 
+/// The walk keeps a place "held as a value" ([`super::place::Walk::object`], so its raw pointer
+/// is the object's box) only while the place is still the object the reference names: through a
+/// downcast and through every level of `#[repr(transparent)]` wrapping, and for an aggregate value
+/// with no projection at all. A step into storage ends it, and the raw pointer is then the slot of
+/// that storage: a real field (even one of an aggregate type), an element, and a scalar payload of
+/// an enum variant. Every root is a reference read from a field and spelled inline (`$v0.w`), the
+/// spelling the slot shortcut would otherwise have read as the place.
+#[test]
+fn a_raw_view_boxes_a_held_object_until_a_step_reaches_storage() {
+    const W: TypeId = TypeId(53);
+    const W2: TypeId = TypeId(54);
+    const REF_W2: TypeId = TypeId(55);
+    const REF_SHAPE: TypeId = TypeId(56);
+    const RAW_SHAPE: TypeId = TypeId(57);
+    const HOLDS: TypeId = TypeId(58);
+    const REF_HOLDS: TypeId = TypeId(59);
+    const REF_POINTS: TypeId = TypeId(60);
+    const REFS: TypeId = TypeId(61);
+    let mut interns = world();
+    let (_, points) = reference_holders(&mut interns);
+    let same = interns.intern_str("same");
+    let mut name = |text: &str| interns.intern_str(text);
+    let (wrapper, holds_name, refs_name) = (name("W"), name("Holds"), name("Refs"));
+    let (p, n, w, s, h, xs, pt) = (
+        name("p"),
+        name("n"),
+        name("w"),
+        name("s"),
+        name("h"),
+        name("xs"),
+        name("pt"),
+    );
+    // `#[repr(transparent)] struct W(Point); #[repr(transparent)] struct W2(W);`
+    for (id, inner, def_n) in [(W, POINT, 41), (W2, W, 42)] {
+        let fields = vec![field(FieldKey::Index(0), inner)];
+        let mut ty = descriptor(
+            id,
+            TypeKind::Adt {
+                def: def(def_n),
+                args: Vec::new(),
+                form: NominalForm::Struct,
+                variants: vec![variant(wrapper, fields.clone(), 0, None)],
+                niche: None,
+            },
+            8,
+        );
+        ty.js.is_indirect = true;
+        ty.js.needs_clone = true;
+        ty.js.transparent = Some(rcgjs_object::jir::types::TransparentField {
+            field: 0,
+            ty: inner,
+        });
+        ty.js.peeled = POINT;
+        ty.js.fields = fields;
+        interns.intern_type(ty);
+    }
+    let mut record = |id: TypeId, def_n: u64, name: StrId, fields: Vec<FieldDescriptor>| {
+        let mut ty = descriptor(
+            id,
+            TypeKind::Adt {
+                def: def(def_n),
+                args: Vec::new(),
+                form: NominalForm::Struct,
+                variants: vec![variant(name, fields.clone(), 0, None)],
+                niche: None,
+            },
+            12,
+        );
+        ty.js.is_indirect = true;
+        ty.js.needs_clone = true;
+        ty.js.fields = fields;
+        interns.intern_type(ty);
+    };
+    // `struct Holds { p: Point, n: i32 }`: a field of an aggregate type is still storage.
+    record(
+        HOLDS,
+        43,
+        holds_name,
+        vec![
+            field(FieldKey::Name(p), POINT),
+            field(FieldKey::Name(n), I32),
+        ],
+    );
+    // `struct Refs<'a> { w: &W2, s: &Shape, h: &Holds, xs: &[Point; 2], pt: Point }`.
+    record(
+        REFS,
+        44,
+        refs_name,
+        vec![
+            field(FieldKey::Name(w), REF_W2),
+            field(FieldKey::Name(s), REF_SHAPE),
+            field(FieldKey::Name(h), REF_HOLDS),
+            field(FieldKey::Name(xs), REF_POINTS),
+            field(FieldKey::Name(pt), POINT),
+        ],
+    );
+    interns.intern_type(pointer(REF_W2, W2, PointerForm::Thin, false));
+    interns.intern_type(pointer(REF_SHAPE, SHAPE, PointerForm::Thin, false));
+    interns.intern_type(pointer(RAW_SHAPE, SHAPE, PointerForm::Slot, true));
+    interns.intern_type(pointer(REF_HOLDS, HOLDS, PointerForm::Thin, false));
+    interns.intern_type(pointer(REF_POINTS, points, PointerForm::Thin, false));
+
+    let mut b = FuncBuilder::new(item(1), signature(vec![REFS, USIZE], UNIT));
+    let e = FuncBuilder::ENTRY;
+    let refs = b.param(REFS, NO_ORIGIN);
+    let index = b.param(USIZE, NO_ORIGIN);
+    // `&raw const <path>` of `refs.<field>`, the field read right before it so it is inline.
+    let raw = |b: &mut FuncBuilder, field: u32, field_ty: TypeId, path: Vec<Proj>, ty: TypeId| {
+        let loaded = b.op(
+            e,
+            OpKind::Field {
+                base: refs,
+                variant: None,
+                field,
+            },
+            field_ty,
+            NO_ORIGIN,
+        );
+        b.op(
+            e,
+            OpKind::RawView {
+                root: Root::Value(loaded),
+                path,
+                mutable: false,
+            },
+            ty,
+            NO_ORIGIN,
+        )
+    };
+    let wrapped = vec![
+        Proj::Deref,
+        Proj::Field { field: 0, ty: W },
+        Proj::Field {
+            field: 0,
+            ty: POINT,
+        },
+    ];
+    let pairs = [
+        // `&raw const (*refs.w).0.0` and `&raw const *(refs.s as Named)`: still the object.
+        [
+            (0, REF_W2, wrapped, RAW_POINT),
+            (
+                1,
+                REF_SHAPE,
+                vec![Proj::Deref, Proj::Downcast { variant: 3 }],
+                RAW_SHAPE,
+            ),
+        ],
+        // `&raw const (*refs.h).p` and `&raw const (*refs.xs)[index]`: storage.
+        [
+            (
+                2,
+                REF_HOLDS,
+                vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: 0,
+                        ty: POINT,
+                    },
+                ],
+                RAW_POINT,
+            ),
+            (
+                3,
+                REF_POINTS,
+                vec![Proj::Deref, Proj::Index(index)],
+                RAW_POINT,
+            ),
+        ],
+        // `&raw const (*refs.s as Num).0` is storage; `&raw const refs.pt` read as a value is not.
+        [
+            (
+                1,
+                REF_SHAPE,
+                vec![
+                    Proj::Deref,
+                    Proj::Downcast { variant: 1 },
+                    Proj::Field { field: 0, ty: I32 },
+                ],
+                RAW_I32,
+            ),
+            (4, POINT, Vec::new(), RAW_POINT),
+        ],
+    ];
+    for pair in pairs {
+        let args = pair
+            .into_iter()
+            .map(|(field, field_ty, path, ty)| raw(&mut b, field, field_ty, path, ty))
+            .collect();
+        b.effect(e, call_op(same, args), NO_ORIGIN);
+    }
+    b.terminate(e, RTerm::Return(None));
+
+    let func = b.finish();
+    func.verify(&interns.types).unwrap();
+    let plan = super::super::fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(
+        &interns,
+        "f",
+        &["same"],
+        &body,
+        &func,
+        &plan,
+        straight(&func),
+    );
+    assert_eq!(
+        js,
+        "function f($v0, $v1) {\n  same(__rt.box($v0.w), __rt.box($v0.s));\n  same({ buf: $v0.h, off: \"p\" }, { buf: $v0.xs, off: $v1 });\n  same({ buf: $v0.s, off: \"_0\" }, __rt.box($v0.pt));\n}\n"
+    );
+}
+
 mod invoke;
