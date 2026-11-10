@@ -324,6 +324,16 @@ for (const length of [0, 1, 7, 65536]) {
     () => rt.u8array_from_bytes({ buf: undefined, off: undefined, len: 0 }), []);
   exact("bytes: runtime copy of the frozen dangling buffer",
     () => rt.u8array_from_bytes(rt.slice_from_parts(1, 0)), []);
+  // Typed storage is sliced with the captured `subarray`, never the instance's own property.
+  const ownSubarray = (answer) => {
+    const view = Uint8Array.from([1, 2, 3, 4]);
+    Object.defineProperty(view, "subarray", { value: answer });
+    return view;
+  };
+  exact("bytes: runtime copy ignores a typed buffer's own subarray that answers other bytes",
+    () => rt.u8array_from_bytes({ buf: ownSubarray(() => Uint8Array.from([9, 9, 9])), off: 1, len: 3 }), [2, 3, 4]);
+  exact("bytes: runtime copy ignores a typed buffer's own subarray that throws",
+    () => rt.u8array_from_bytes({ buf: ownSubarray(() => { throw new Error("own subarray ran"); }), off: 0, len: 2 }), [1, 2]);
   const storage = Uint8Array.from([1, 2, 3]);
   const copied = rt.u8array_from_bytes({ buf: storage, off: 0, len: 3 });
   copied[0] = 99;
@@ -355,6 +365,13 @@ const aborts = (label, run) => {
   aborts("bytes: a host record whose getter throws aborts", () => bytes.bytes_from_host_record(hostile));
   aborts("bytes: a host record whose range overruns its buffer aborts", () => bytes.bytes_from_host_record({ buf: [1, 2], off: 1, len: 2 }));
   aborts("bytes: a host record with a field-key offset aborts", () => bytes.bytes_from_host_record({ buf: { b: 1 }, off: "b", len: 1 }));
+  // The offset is checked for itself, over an array buffer whose range check alone would pass.
+  aborts("bytes: an array record with a fractional offset aborts", () => bytes.bytes_from_host_record({ buf: [1, 2, 3], off: 0.5, len: 2 }));
+  aborts("bytes: an array record with a negative offset aborts", () => bytes.bytes_from_host_record({ buf: [1, 2, 3], off: -1, len: 2 }));
+  aborts("bytes: an array record with a string offset aborts", () => bytes.bytes_from_host_record({ buf: [5, 6, 7], off: "0", len: 1 }));
+  // Typed storage is range-checked by its built-in length: `subarray` would clamp silently.
+  aborts("bytes: a typed record whose range passes the end of its buffer aborts",
+    () => bytes.bytes_from_host_record({ buf: Uint8Array.from([1, 2, 3]), off: 2, len: 4 }));
   aborts("bytes: a host record over a DataView aborts", () => bytes.bytes_from_host_record({ buf: new DataView(new ArrayBuffer(4)), off: 0, len: 2 }));
   aborts("bytes: a host record over BigInt storage aborts", () => bytes.bytes_from_host_record({ buf: [1n, 2n], off: 0, len: 2 }));
   aborts("bytes: a host record over a BigInt64Array aborts", () => bytes.bytes_from_host_record({ buf: new BigInt64Array(2), off: 0, len: 2 }));
@@ -373,7 +390,11 @@ const aborts = (label, run) => {
 {
   const refuses = (label, value, run) => {
     let traps = 0;
-    const counted = new Proxy(value, { get(object, key) { traps += 1; return Reflect.get(object, key); } });
+    // Every trap kind is counted (`get`, `getPrototypeOf`, `has`, ...): reading the tag through
+    // the captured accessor reaches none of them, where `instanceof` would walk the prototype.
+    const counted = new Proxy(value, new Proxy({}, {
+      get: (_, trap) => (...args) => { traps += 1; return Reflect[trap](...args); },
+    }));
     let threw = null;
     try {
       run(counted);
@@ -392,6 +413,19 @@ const aborts = (label, run) => {
     new Int8Array(3), (value) => rt.u8array_length(new Int8Array(3)));
   refuses("bytes: to_vec of a mistyped Proxy is a TypeError, no trap run",
     Uint8Array.from([1, 2, 3]), (value) => bytes.bytes_unchecked_to_vec(value));
+  let walked = 0;
+  const prototypeWalk = new Proxy(Uint8Array.from([1, 2, 3]), {
+    getPrototypeOf() { walked += 1; throw new Error("getPrototypeOf trap ran"); },
+  });
+  let refused = null;
+  try {
+    rt.u8array_length(prototypeWalk);
+  } catch (error) {
+    refused = error;
+  }
+  check("bytes: runtime length never walks a Proxy's prototype (its getPrototypeOf trap throws)",
+    refused instanceof TypeError && !rt.is_abort(refused) && walked === 0,
+    `${String(refused)}, getPrototypeOf ran ${walked} time(s)`);
   exact("bytes: to_vec of a genuine Uint8Array through the unchecked declaration",
     () => bytes.bytes_unchecked_to_vec(Uint8Array.from([5, 6])), [5, 6]);
 }
