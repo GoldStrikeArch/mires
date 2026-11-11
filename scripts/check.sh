@@ -3,7 +3,9 @@
 # The cheap pre-landing check every workstream runs before it reports done:
 # formatting, clippy with warnings denied, and the workspace unit tests. The
 # fixture suites (test.sh, emit-test.sh, ...) are separate because they need
-# sysroots; this one needs only cargo.
+# sysroots. This one needs cargo and the one `js-lane=jir js-opt=on` sysroot
+# it builds itself for the property-test corpus, which is also what the small
+# chunk suite at the end (scripts/chunk-test.sh) links against.
 #
 #   scripts/check.sh
 
@@ -39,3 +41,8 @@ node --test scripts/native-values.test.mjs scripts/host-future-driver.test.mjs \
 bash scripts/sysroot-cache.test.sh
 # Removing no-op landing pads must not change which bodies keep executable cleanup.
 bash scripts/noop-landing-pads-test.sh
+# The core fixtures that carry a `.chunks` file, built split and run (or refused), in the one mode
+# the corpus above uses. What a split can get wrong -- a chunk declaring a name it also imports, a
+# cycle of statics printed as plain `let`s, a split that has to be refused -- shows only when the
+# program is split, and no other suite here splits one. About a minute.
+JS_EXTRA_ARGS='js-lane=jir js-opt=on' bash scripts/chunk-test.sh

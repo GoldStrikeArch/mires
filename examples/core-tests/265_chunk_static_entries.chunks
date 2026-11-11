@@ -1,0 +1,3 @@
+run: a:chunk_a b:chunk_b
+u:ENTRY_UP d:ENTRY_DOWN a:chunk_a b:chunk_b
+a:chunk_a d:ENTRY_DOWN b:chunk_b u:ENTRY_UP

@@ -1,0 +1,5 @@
+a:chunk_a b:chunk_b
+b:chunk_b a:chunk_a
+refuse: s:ENTRY_S a:chunk_a b:chunk_b -- the chunks `s`, `shared` import each other, and module level initializers read bindings around that cycle
+refuse: a:chunk_a b:chunk_b s:ENTRY_S -- the chunks `s`, `shared` import each other, and module level initializers read bindings around that cycle
+refuse: c:ENTRY_C a:chunk_a b:chunk_b -- refer to each other but would be split across the chunks `c`, `shared`

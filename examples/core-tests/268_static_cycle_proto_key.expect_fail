@@ -1,0 +1,2 @@
+refer to each other, and `CY1` has a field named `__proto__`
+so the cycle cannot be initialized in two steps

@@ -16,6 +16,15 @@
 # other lines ask for the same chunks in another order, which moves every chunk's index and so
 # every ownership decision's iteration order without changing what the program does.
 #
+# Two more line forms:
+#
+#   run: <chunk:entry>...                 the entries every build imports and calls, in order,
+#                                         instead of the first build line's. For a fixture that
+#                                         names a `static` as a chunk entry: a static is exported,
+#                                         not called.
+#   refuse: <chunk:entry>... -- <text>    a split the link step must refuse: the build has to
+#                                         fail, and its output has to contain <text> (no `#`).
+#
 # What a pass proves is that the chunk files load (no name both imported and declared, no binding
 # read before its module initialized it), that the imports resolve to the names the other chunks
 # export, and that the split program prints what the native one does.
@@ -78,32 +87,74 @@ fi
 pass=0
 fail=0
 failed=""
+# compile <out dir> <pairs...>: builds the fixture `$src` split as asked, logging to compile.log.
+compile() {
+	local out=$1
+	shift
+	local chunk_args="" pair
+	for pair in "$@"; do
+		chunk_args="$chunk_args js-chunk=$pair"
+	done
+	rm -rf "$out"
+	mkdir -p "$out"
+	JS_EXTRA_ARGS="${JS_EXTRA_ARGS:-} js-modules=esm$chunk_args" \
+		"$script_dir/compile_core.sh" "$src" "$out/program.js" >"$out/compile.log" 2>&1
+}
+
+note_fail() {
+	fail=$((fail + 1))
+	failed="$failed $name"
+}
+
 for name in $fixtures; do
 	src="$core_dir/$name.rs"
 	expected="$core_dir/$name.expected"
-	calls=""
+	chunks="$core_dir/$name.chunks"
+	# `run:` names the entries every build calls; the first build line does by default.
+	calls=$(sed -n 's/#.*//; s/^run:[[:space:]]*//p' "$chunks" | head -n 1)
+	if [ -z "$calls" ]; then
+		calls=$(sed 's/#.*//' "$chunks" | grep -Ev '^[[:space:]]*$|^[[:space:]]*(run|refuse):' | head -n 1)
+	fi
 	build=0
 	while IFS= read -r line || [ -n "$line" ]; do
 		line=${line%%#*}
+		case "$line" in
+		run:*) continue ;;
+		refuse:*)
+			# `refuse: <pairs> -- <text>`: the split must be refused at link time, and the
+			# compiler output must say <text>.
+			rest=${line#refuse:}
+			want=${rest#* -- }
+			pairs=${rest%% -- *}
+			# shellcheck disable=SC2086
+			set -- $pairs
+			build=$((build + 1))
+			label="$name[$build: refuse $*]"
+			out="$build_dir/$name/$build"
+			if compile "$out" "$@"; then
+				echo "FAIL  $label: compiled, but must be refused"
+				note_fail
+			elif grep -qF -- "$want" "$out/compile.log"; then
+				echo "PASS  $label"
+				pass=$((pass + 1))
+			else
+				echo "FAIL  $label: refused without saying \"$want\", see $out/compile.log"
+				sed -n '1,4s/^/    /p' "$out/compile.log"
+				note_fail
+			fi
+			continue
+			;;
+		esac
 		# shellcheck disable=SC2086
 		set -- $line
 		[ "$#" -eq 0 ] && continue
 		build=$((build + 1))
-		[ -z "$calls" ] && calls="$*"
 		label="$name[$build: $*]"
 		out="$build_dir/$name/$build"
-		rm -rf "$out"
-		mkdir -p "$out"
-		chunk_args=""
-		for pair in "$@"; do
-			chunk_args="$chunk_args js-chunk=$pair"
-		done
-		if ! JS_EXTRA_ARGS="${JS_EXTRA_ARGS:-} js-modules=esm$chunk_args" \
-			"$script_dir/compile_core.sh" "$src" "$out/program.js" >"$out/compile.log" 2>&1; then
+		if ! compile "$out" "$@"; then
 			echo "FAIL  $label: does not compile, see $out/compile.log"
 			sed -n '1,6s/^/    /p' "$out/compile.log"
-			fail=$((fail + 1))
-			failed="$failed $name"
+			note_fail
 			continue
 		fi
 		# shellcheck disable=SC2086
@@ -117,14 +168,12 @@ for name in $fixtures; do
 			echo "FAIL  $label: exit $status, see $out"
 			diff "$expected" "$out/stdout" | sed -n '1,6s/^/    /p'
 			sed -n '1,4s/^/    /p' "$out/stderr"
-			fail=$((fail + 1))
-			failed="$failed $name"
+			note_fail
 		fi
-	done <"$core_dir/$name.chunks"
+	done <"$chunks"
 	if [ "$build" -eq 0 ]; then
 		echo "FAIL  $name: $name.chunks asks for no build"
-		fail=$((fail + 1))
-		failed="$failed $name"
+		note_fail
 	fi
 done
 

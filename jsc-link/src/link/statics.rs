@@ -36,8 +36,12 @@
 //! evaluated, now that the names it holds are bound, and copied onto it. The binding keeps the
 //! identity it was declared with, which is the identity every other initializer and every function
 //! captured, so `ptr::eq` of the two ways to reach a member is still true. `Object.assign` copies
-//! the literal's own properties in their own order onto an object with the literal's prototype,
-//! so the result cannot be told apart from the literal itself. Where in the literal a reference
+//! the literal's own enumerable properties, in their own order, onto an empty object or array
+//! with the literal's prototype, and for every literal this printer emits that gives the same
+//! object, with one exception: a `__proto__` key, which an object literal takes as the object's
+//! prototype instead of a property, so there is no own property to copy. A Rust field named
+//! `__proto__` prints as that key, and a cycle member holding one is refused (below). Where in
+//! the literal a reference
 //! sits does not matter — a field, an enum payload (`{ TAG: "Some", _0: B }`, a decoded
 //! `Option<&'static T>`), an array element, a slice's buffer — because the whole literal is
 //! evaluated only once every member exists.
@@ -54,16 +58,26 @@
 //!
 //! The two-step form needs the shape this module documents above: a `static` item whose text is
 //! one `let NAME = <literal>;` (after its `//` header comments), where the literal is one object or
-//! array literal. A cycle with any other member, or through a binding of another kind, is a link
-//! error naming the statics, never a program that throws at load or silently holds `undefined`.
-//! No producer emits such a cycle today; the refusal is what keeps a future one from being
-//! printed in the order that cannot work.
+//! array literal with no `__proto__` key. A cycle with any other member, or through a binding of
+//! another kind, is a link error naming the statics, never a program that throws at load or
+//! silently holds `undefined` or a wrong prototype. Apart from a field named `__proto__`, no
+//! producer emits such a cycle today; the refusal is what keeps a future one from being printed
+//! in an order that cannot work.
 //!
 //! # Chunks
 //!
 //! A cycle cannot span two chunks: whichever chunk reaches one member reaches them all, so they
 //! share one owner (see `write_chunks`). The one way to split one, a `static` named as a chunk's
 //! entry point, is refused by [`split_cycles`].
+//!
+//! Across files the same hazard has a second shape. Inside a cycle of chunk imports, which file
+//! evaluates first depends on which one the host loads first, so a module level initializer that
+//! reads a binding imported from a file that imports it back reads it uninitialized under some
+//! load order. A function is safe to import around such a cycle: function declarations exist
+//! before any module evaluates. [`evaluation_cycles`] refuses every other import read by an
+//! initializer around a cycle. Only a `static` named as an entry point creates one, because a
+//! chunk another file imports from owns nothing but its entry: everything that entry reaches is
+//! reached by two chunks, so it is shared.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -380,6 +394,12 @@ impl<'a> Declaration<'a> {
         if literal_len(literal) != Some(literal.len()) {
             return Err("is not initialized with exactly one object or array literal");
         }
+        if has_proto_key(literal) {
+            return Err(
+                "has a field named `__proto__`, which an object literal takes as its \
+                        prototype rather than as a property and `Object.assign` would not copy",
+            );
+        }
         Ok(Declaration {
             lead,
             head,
@@ -442,6 +462,70 @@ impl<'a> Declaration<'a> {
     fn lead_lines(&self) -> u32 {
         self.lead.matches('\n').count() as u32
     }
+}
+
+/// Whether `text`, a literal [`literal_len`] accepted, has a `__proto__` key anywhere: the bare
+/// name or the string `"__proto__"` directly after `{` or `,` and directly before `:`.
+///
+/// In an object literal that one key sets the object's prototype instead of creating a property,
+/// so `Object.assign` (which copies own properties) would drop it. A Rust field named `__proto__`
+/// prints as exactly that key. The scan is the printer's token shape: double quoted strings are
+/// skipped as tokens (the only quotes [`literal_len`] lets through), and a name after `.` is a
+/// property read, not a key.
+fn has_proto_key(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let next_significant = |mut at: usize| {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        bytes.get(at).copied()
+    };
+    let is_key = |previous: u8, after: usize| {
+        matches!(previous, b'{' | b',') && next_significant(after) == Some(b':')
+    };
+    let mut previous = 0u8;
+    let mut at = 0;
+    while at < bytes.len() {
+        let start = at;
+        match bytes[at] {
+            b'"' => {
+                at += 1;
+                while at < bytes.len() {
+                    match bytes[at] {
+                        b'\\' => at += 2,
+                        b'"' => {
+                            at += 1;
+                            break;
+                        }
+                        _ => at += 1,
+                    }
+                }
+                let at = at.min(bytes.len());
+                if &text[start..at] == "\"__proto__\"" && is_key(previous, at) {
+                    return true;
+                }
+                previous = b'"';
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' => {
+                while at < bytes.len()
+                    && (bytes[at].is_ascii_alphanumeric() || matches!(bytes[at], b'_' | b'$'))
+                {
+                    at += 1;
+                }
+                let read = start > 0 && bytes[start - 1] == b'.';
+                if &text[start..at] == "__proto__" && !read && is_key(previous, at) {
+                    return true;
+                }
+                previous = bytes[at - 1];
+            }
+            byte if byte.is_ascii_whitespace() => at += 1,
+            byte => {
+                previous = byte;
+                at += 1;
+            }
+        }
+    }
+    false
 }
 
 /// The byte length of the object or array literal `text` starts with, or `None` if it is not
@@ -513,6 +597,102 @@ pub(crate) fn split_cycles(
                 chunks.join("`, `"),
             ));
         }
+    }
+}
+
+/// Reports every module level initializer that reads, around a cycle of chunk imports, a binding
+/// another file declares.
+///
+/// `holds[at]` is what unit `at` prints (the names it owns and the imports it replicates),
+/// `owner` who owns each name, and `imported[at]` the names unit `at` imports, by the unit that
+/// exports them. The rule: if unit `at` imports a binding from unit `from` and `from` imports
+/// (directly or through other units) from `at`, no binding of `at` may name that binding. When a
+/// host's import path enters that cycle at `from`, `from` first evaluates what it imports, `at`
+/// among them; `at` finds `from` already in progress and evaluates first, so the read finds the
+/// binding in its temporal dead zone. Reads from function bodies do not count: they run after
+/// every file has been evaluated, and an imported function exists before any file evaluates.
+///
+/// Reported once per cycle of files, naming each read. Runs after [`split_cycles`], which
+/// reports the narrower case of a cycle of statics split by an entry point in its own words.
+pub(crate) fn evaluation_cycles(
+    dcx: &Sink,
+    table: &BTreeMap<JsName, LinkItem>,
+    holds: &[Vec<JsName>],
+    owner: &BTreeMap<&JsName, usize>,
+    imported: &[BTreeMap<usize, BTreeSet<&str>>],
+    label: impl Fn(usize) -> String,
+) {
+    // Which units each unit reaches through its imports (the graph has a handful of nodes).
+    let reaches: Vec<BTreeSet<usize>> = (0..imported.len())
+        .map(|start| {
+            let mut seen = BTreeSet::new();
+            let mut work = vec![start];
+            while let Some(at) = work.pop() {
+                for &from in imported[at].keys() {
+                    if seen.insert(from) {
+                        work.push(from);
+                    }
+                }
+            }
+            seen
+        })
+        .collect();
+
+    // The reads, grouped by the cycle of files they run around (its members, sorted).
+    let mut cycles: BTreeMap<BTreeSet<usize>, Vec<String>> = BTreeMap::new();
+    for (at, held) in holds.iter().enumerate() {
+        for name in held {
+            let Some(item) = table.get(name) else {
+                continue;
+            };
+            if owner.get(name) != Some(&at) {
+                continue;
+            }
+            // Only a module level binding's initializer runs while its file is evaluated.
+            let read_at_load = item.kind.is_binding();
+            if !read_at_load {
+                continue;
+            }
+            for referenced in &item.refs {
+                let Some(&from) = owner.get(referenced) else {
+                    continue;
+                };
+                if from == at || !reaches[from].contains(&at) {
+                    continue;
+                }
+                let Some(target) = table
+                    .get(referenced)
+                    .filter(|target| target.kind.is_binding())
+                else {
+                    continue;
+                };
+                let members: BTreeSet<usize> = (0..imported.len())
+                    .filter(|&unit| {
+                        unit == at || (reaches[at].contains(&unit) && reaches[unit].contains(&at))
+                    })
+                    .collect();
+                cycles.entry(members).or_default().push(format!(
+                    "`{}` in `{}` reads `{}` from `{}`",
+                    item.debug_path,
+                    label(at),
+                    target.debug_path,
+                    label(from),
+                ));
+            }
+        }
+    }
+
+    for (members, reads) in cycles {
+        let files: Vec<String> = members.into_iter().map(&label).collect();
+        dcx.err(format!(
+            "the chunks `{}` import each other, and module level initializers read bindings \
+             around that cycle ({}); depending on which file a host loads first, one of these \
+             reads would find its binding uninitialized. Only functions may be imported around \
+             a cycle of chunks, and a `static` named as a chunk's entry point is what makes one: \
+             name a function as the entry point instead",
+            files.join("`, `"),
+            reads.join("; "),
+        ));
     }
 }
 
@@ -772,6 +952,133 @@ mod tests {
                 (2, 0, 1, 3, 0, 0),
                 (3, 0, 0, 8, 0, -1)
             ]
+        );
+    }
+
+    /// A `__proto__` key, bare or quoted, at any depth, is found; a read, a string value or an
+    /// element spelling it is not a key.
+    #[test]
+    fn a_proto_key_is_found_where_a_literal_would_take_it_as_the_prototype() {
+        for text in [
+            "{__proto__:a}",
+            "{ id: 1, __proto__: b }",
+            "{\"__proto__\": b}",
+            "{ a: [{ x: 1 }, { __proto__ : 2 }] }",
+        ] {
+            assert!(has_proto_key(text), "{text}");
+        }
+        for text in [
+            "{ a: x.__proto__ }",
+            "{ a: \"__proto__\" }",
+            "[__proto__, 1]",
+            "{ a: \"{__proto__:1}\" }",
+            "{ __proto: 1, proto__: 2 }",
+        ] {
+            assert!(!has_proto_key(text), "{text}");
+        }
+    }
+
+    /// A cycle member holding a `__proto__` key is refused, since `Object.assign` would not copy
+    /// what that key sets.
+    #[test]
+    fn a_cycle_member_with_a_proto_key_is_refused() {
+        let table = table(vec![
+            binding("a", "let a = { id: 1, __proto__: b };\n", &["b"]),
+            binding("b", "let b = { id: 2, __proto__: a };\n", &["a"]),
+        ]);
+        let (text, errors) = printed(&table);
+        assert_eq!(errors, 1);
+        assert!(text.contains("let a = { id: 1, __proto__: b };\n"));
+    }
+
+    /// Units 0 (a chunk whose entry point is the static `entry`) and 1 (shared).
+    fn two_units(
+        entry_refs: &[&str],
+        shared_refs: &[&str],
+    ) -> (BTreeMap<JsName, LinkItem>, Vec<Vec<JsName>>) {
+        let mut function = binding("f", "function f() {}\n", &[]);
+        function.kind = ItemKind::Fn;
+        let mut reader = binding("g", "function g() { return entry; }\n", &["entry"]);
+        reader.kind = ItemKind::Fn;
+        let table = table(vec![
+            binding("entry", "let entry = {};\n", entry_refs),
+            binding("leaf", "let leaf = {};\n", &[]),
+            binding("hold", "let hold = {};\n", shared_refs),
+            function,
+            reader,
+        ]);
+        let holds = vec![
+            vec![JsName::new("entry".to_owned())],
+            ["leaf", "hold", "f", "g"]
+                .map(|name| JsName::new(name.to_owned()))
+                .to_vec(),
+        ];
+        (table, holds)
+    }
+
+    /// How many errors `evaluation_cycles` reports for `two_units`, given what each unit imports.
+    fn evaluation_errors(
+        entry_refs: &[&str],
+        shared_refs: &[&str],
+        imported: &[BTreeMap<usize, BTreeSet<&str>>],
+    ) -> u32 {
+        let (table, holds) = two_units(entry_refs, shared_refs);
+        let owner: BTreeMap<&JsName, usize> = holds
+            .iter()
+            .enumerate()
+            .flat_map(|(at, held)| held.iter().map(move |name| (name, at)))
+            .collect();
+        let dcx = Sink::new();
+        evaluation_cycles(&dcx, &table, &holds, &owner, imported, |at| {
+            format!("unit{at}")
+        });
+        dcx.errors()
+    }
+
+    /// A binding read around a cycle of imports is refused whichever side reads it and however
+    /// the other side uses its import; a function import, a read from a function body and a
+    /// one-way import are fine.
+    #[test]
+    fn a_binding_read_around_a_cycle_of_chunk_imports_is_refused() {
+        let imports = |up: &[&'static str], down: &[&'static str]| {
+            let mut imported = vec![BTreeMap::new(), BTreeMap::new()];
+            if !up.is_empty() {
+                imported[0].insert(1, up.iter().copied().collect());
+            }
+            if !down.is_empty() {
+                imported[1].insert(0, down.iter().copied().collect());
+            }
+            imported
+        };
+        // The entry reads the shared `leaf`; the shared `hold` reads the entry.
+        assert_eq!(
+            evaluation_errors(&["leaf"], &["entry"], &imports(&["leaf"], &["entry"])),
+            1
+        );
+        // The entry reads `leaf`; shared imports the entry back only for the function `g`.
+        assert_eq!(
+            evaluation_errors(&["leaf"], &[], &imports(&["leaf"], &["entry"])),
+            1
+        );
+        // The entry imports only the function `f`; the shared `hold` reads the entry.
+        assert_eq!(
+            evaluation_errors(&["f"], &["entry"], &imports(&["f"], &["entry"])),
+            1
+        );
+        // Around the cycle only a function is read, and the entry is named from a function body.
+        assert_eq!(
+            evaluation_errors(&["f"], &[], &imports(&["f"], &["entry"])),
+            0
+        );
+        // One way only: the entry reads `leaf`, nothing imports the entry.
+        assert_eq!(
+            evaluation_errors(&["leaf"], &[], &imports(&["leaf"], &[])),
+            0
+        );
+        // One way only: the shared `hold` reads the entry, which imports nothing.
+        assert_eq!(
+            evaluation_errors(&[], &["entry"], &imports(&[], &["entry"])),
+            0
         );
     }
 

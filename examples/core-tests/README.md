@@ -94,12 +94,19 @@ It was the only silent miscompile the spike ever had, and `14_str` pins it.
 | `262_chunk_owned_statics` | split three ways: statics a chunk owns that name a shared static (from two chunks), a chunk-owned static naming another chunk's entry point, an interior-mutable shared static written from two chunks |
 | `263_chunk_three_owners` | split three ways, in both declaration orders: chains of chunk-owned statics into shared ones, a static only one chunk reads that names one only another reads, a shared static naming a chunk's entry point, hoisted strings in chunk-owned statics |
 | `264_chunk_static_cycles` | split two ways: a cycle the shared chunk owns written from one chunk and read from the other, a cycle and a self reference one chunk owns, a cycle whose members name the other chunk's entry point |
+| `265_chunk_static_entries` | split four ways with two `static`s as entry points whose imports run one way: one names a shared binding, the shared chunk names the other |
+| `266_chunk_static_entry_refusals` | splits the link step refuses: a `static` entry point that names a shared binding while a shared binding names it (the two files would import each other), and one that would split a cycle of statics; split by its functions only, it runs |
+| `267_static_cycle_arrays` | array statics in cycles are real arrays: copied by value (`.slice()`), passed by value, a copy of an array of structs, a subslice at a run time offset, a reversed walk, `map`; a 40-element table, a grid, a static slice, zero-sized statics |
+| `268_static_cycle_proto_key` | `.expect_fail`: a cycle of statics with a field named `__proto__` is refused at link time, because the two-step initialization would lose it |
 
 A test with a `.chunks` file is also built split by `scripts/chunk-test.sh`: each line is one build,
 the `chunk:entry` pairs handed to the compiler as `js-chunk=` options in that order, and every build
 runs the entries in the order of the first line, which is the order `rust_entry` calls them. So one
-`.expected` holds for the unsplit program and for every split of it. `CONTRACT.md`, "Statics that
-refer to each other" and "Who owns what", has the rules these pin.
+`.expected` holds for the unsplit program and for every split of it. A `run:` line names the
+entries to call instead (a `static` entry is exported, not called), and a
+`refuse: <pairs> -- <text>` line is a split that must fail to link with `<text>` in the output.
+`scripts/check.sh` runs the suite. `CONTRACT.md`, "Statics that refer to each other", "Who owns
+what" and "Around a cycle of imports, only functions", has the rules these pin.
 
 ## What is out, and why
 

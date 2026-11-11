@@ -1690,7 +1690,16 @@ fn write_chunks(
         true => opts.shared_chunk.as_str(),
         false => plans[at].name,
     };
+    // No module level initializer may read a binding around a cycle of chunk imports, which only
+    // a `static` named as an entry point can create (`link/statics.rs`). A cycle of statics split
+    // that way is reported first, in its own words.
+    let errors = dcx.errors();
     statics::split_cycles(dcx, table, &owner, |at| label(at).to_owned());
+    if dcx.errors() == errors {
+        statics::evaluation_cycles(dcx, table, &names, &owner, &imported, |at| {
+            label(at).to_owned()
+        });
+    }
 
     // Each unit's bindings in initialization order, over the names it owns and only those: a
     // binding another unit owns arrives through the `import` above it, and placing it here as well

@@ -435,8 +435,13 @@ cycle. A program without a cycle prints byte for byte as before.
 
 A cycle whose member is not one `let` of one object or array literal, or that runs through a
 binding of another kind, is a link error naming the statics, never a reordering that throws at
-load. No producer emits one today. See `jsc-link/src/link/statics.rs`; `260_static_cycles` and
-`261_static_cycle_cells` pin it.
+load. So is a member whose literal has a `__proto__` key: that is what a Rust field named
+`__proto__` prints as, an object literal takes it as the prototype rather than a property, and
+`Object.assign` copies properties only, so the filled object would lose the field. (Outside a
+cycle the same key is a printer gap of its own: a scalar `__proto__` field reads wrong.) See
+`jsc-link/src/link/statics.rs`; `260_static_cycles`, `261_static_cycle_cells`,
+`267_static_cycle_arrays` (array members are real arrays: copied by value they are `.slice()`d)
+and `268_static_cycle_proto_key` pin it.
 
 ### Source maps (`js-source-map=on`)
 
@@ -1957,8 +1962,19 @@ reach is also reached by both -- so it never imports from a chunk and the module
 Rule 1 is applied last, so an entry point another chunk also reaches stays in its own chunk and the
 other chunk imports it: island-to-island falls out of the same mechanism as island-to-shared instead
 of being a broken edge case. (The shared chunk may then import an entry point back, but a chunk
-whose entry another file names owns nothing else: everything that entry reaches is reached twice.
-An entry point is a hoisted function, so that import never orders an initializer.)
+whose entry another file names owns nothing else: everything that entry reaches is reached twice.)
+
+**Around a cycle of imports, only functions.** When files import each other, which one is
+evaluated first depends on which file the host loads first, so a module level initializer that
+reads a binding imported around that cycle reads it uninitialized under some load order. Function
+declarations exist before any module is evaluated, so importing a function around a cycle is
+always safe. The link step therefore refuses a split in which a module level binding of one file
+names a binding of another file that imports it back, directly or through other files. With
+functions as entry points this never happens: a file another file imports from holds nothing but
+its entry. A `static` may be an entry point (it is exported, not called) as long as its imports run
+one way, as in `265_chunk_static_entries`: it may name shared bindings when no shared binding names
+it, or be named by shared bindings when it names none of theirs. `266_chunk_static_entry_refusals`
+pins the refusal.
 
 **A unit declares what it owns, and only that.** Each file's module level bindings are ordered over
 the names that file owns: a binding it owns that names a binding another file owns comes after the
@@ -1966,9 +1982,10 @@ the names that file owns: a binding it owns that names a binding another file ow
 whole-program order does, declared it twice, a `SyntaxError` before the module ran.) A cycle of
 statics is reached as a whole by every chunk that reaches one member, so it has one owner and is
 initialized there in two steps (see "Statics that refer to each other"). The one way to split a
-cycle, naming one of its statics as a chunk's entry point, is a link error.
+cycle, naming one of its statics as a chunk's entry point, is a link error with its own message.
 `scripts/chunk-test.sh` runs the core fixtures that carry a `.chunks` file split
-(`262_chunk_owned_statics`, `263_chunk_three_owners`, `264_chunk_static_cycles`).
+(`262_chunk_owned_statics` to `266_chunk_static_entry_refusals`), including the splits that have to
+be refused, and `scripts/check.sh` runs it.
 
 ### The cross-chunk specifier is relative
 
