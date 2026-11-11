@@ -4,6 +4,10 @@
 
 This is a working development reconstruction based on the coherent September 7 v2 snapshot, with selected later safety and packaging requirements restored. **It is not a byte-exact October dev13 recovery or a production-qualified release.** The remaining optimization and semantic gaps are listed in [the restoration record](docs/V2-RESTORATION.md) and [current verification results](VERDICT.md). Historical archived verdicts are kept separately.
 
+## Current optimization-restoration checkpoint
+
+Selected round-1 wins are integrated locally; cleanup remains enabled. See [the comprehensive promotion and remaining-work report](round_1_integration_report.md) and [verification receipt](docs/round1-promotion-verification.json). The audited cleanup-edge-removal pass and failed/unverified size candidates are intentionally held back. Known correctness failures remain visible; this is not production admission.
+
 ## Compile and run Rust
 
 macOS/Linux, Rustup and Node.js 24+ are required. `rust-toolchain.toml` pins the backend's nightly and rustc development components. Application build scripts can remain on stable Rust.

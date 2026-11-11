@@ -1,5 +1,7 @@
 # Standalone v2 restoration
 
+> Historical assembly record. The current main-promotion scope and open work are in [round_1_integration_report.md](../round_1_integration_report.md); comparator restoration is recorded in [COMPARATORS.md](COMPARATORS.md).
+
 The implementation base is the coherent September 7 producer-integration snapshot, not a per-file merge of experimental branches. The source archives remain untouched under `recovery/v2/`. Original checkpoint identities do not identify this renamed and repaired compiler.
 
 ## Installed structure

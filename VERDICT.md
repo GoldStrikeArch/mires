@@ -1,57 +1,52 @@
-# Current verdict — standalone mires v2 reconstruction
+# Current verdict — selected round-1 main promotion
 
-Date: November 8, 2026. **Working development compiler assembled; not production-qualified and not the complete October dev13 implementation.**
+Date: 2026-11-11. **Working standalone development compiler; not production-qualified, not exact October dev13, and not R1.**
 
-The active workspace is now the recovered producer / semantic-object / independent-linker v2 architecture. It compiles real Rust `core` and `alloc`, produces runnable JavaScript and source maps, and is usable through both the standalone command and a stable Cargo build script. No Topcoat framework crate is required. The coherent implementation base is September 7; later release cleanup defaults, a fail-closed cleanup guard, linker invalidation, and recovered manifest packaging corrections are layered on it. See [the restoration record](docs/V2-RESTORATION.md).
+The current source combines the restored v2 architecture with selected round-1 wins and two freshly checked narrow correctness repairs. The full integration branch was deliberately not merged: its 3b cleanup-edge pass and pending no-throw extensions remain out until their proof gate and representation assumptions are repaired. Release cleanup stays on.
 
-## Fresh verification
+See [the comprehensive integration report](round_1_integration_report.md), [the exact verification receipt](docs/round1-promotion-verification.json), and [the historical round report](round_1_report.md). Original main was `a386c41d122f1f9e086119495b1d01285c18bc3f`; the tested implementation checkpoint is `045860d6bbcf689c0c05c9c9c06f623b47ea9922`. Documentation commits do not change that implementation.
 
-| Check | Result |
-| --- | --- |
-| Formatting / Clippy with warnings denied | Passed |
-| Rust workspace tests | 1021 passed, 0 failed, 7 ignored |
-| Recovered JIR+optimizer fixture suite | 138/138; explicit non-release cleanup-off mode |
-| Generic runtime suite | 40/40 |
-| Active host-call cleanup | 40/40; cleanup on with optimizer on/off |
-| Missing semantic cleanup body | Reachable case rejected; unreachable dependency harmless; failed link leaves no misleading final output |
-| Sysroot profile/cache normalization | Passed, including release cleanup default and explicit opt-out |
-| Standalone ESM example | Values, minimal runtime manifest and authored source map passed |
-| Stable Cargo consumer | Built through `mires-build`; generated JavaScript executed successfully |
-| Entire `scripts/check.sh` | Passed |
-| Browser-workload corpus | 10/10 builds, stable input hashes, ES2018 syntax checks and zero ordinary fallback |
-| Node-runnable corpus | Markdown, search, gzip and canvas-recording cases passed; search stress through 240 documents |
-| Negative evidence control | A deliberately failed build receipt is rejected by the runtime harness |
-| OSS reference | Rebuilt from original TypeScript |
-| Rust compact OSS package | Cleanup-on optimized build and API/import/package checks pass; 58/58 offline reference kernel comparisons |
-| Rust idiomatic Pro main + worker | Cleanup-on optimizer-off build and API/import/package checks pass |
+## Fresh selected-candidate evidence
 
-The optimized Pro link was stopped after approximately 9 minutes 38 seconds without completion. A live sample is retained in `build/assembly/pro-link-sample.txt`: it showed repeated physical-cost lowering and catch-name reservation work. This is compile-time evidence, not a measured runtime regression or a claim about a completed optimized build. The optimizer-off control did **not** disable cleanup.
+| Fresh check on selected staging source | Result |
+|---|---|
+| Format / Clippy warnings denied / Rust tests | Pass; **1055 passed, 0 failed, 7 ignored** |
+| Generic and pointer runtime tests | **75/75 pass** |
+| Release-balanced behavior/structural fixture suite | **146/146 pass**; default-mode byte budgets not applied |
+| Pointer fixture native controls | 82 output lines agree at native O0/O3 |
+| Pointer additional compiler settings | Default, JIR opt-off, release-balanced and compact-package MIR-inline pass |
+| Alias-store native fixtures | Fixtures 130/131 agree at native O0/O3 |
+| Alias-store generated extent | 22 programs / 132 functions × two settings; all 44 executions match fresh native output |
+| No-op landing-pad controls | Optimization on/off × MIR inlining on/off pass |
+| Active host cleanup | 40 smoke cases plus ZST controls pass; separate active-poll matrix **60/60**; baseline refuses as required |
+| Cleanup transport and admission | Pass, including negative producer/checksum/version/metadata cases |
+| Extern suite | **5/5**, including 118 byte-boundary and 17 globals assertions |
+| Standalone module | Values, cleanup default, maps and manifest pass |
+| Cleanup holdback control | 4/4 valid/mistyped host arithmetic cases preserve the destructor |
+| October-derived known gaps | **5/6**; aggregate-place identity remains open |
+| Round-1 adversarial inventory | **1/5**; alias-store repaired, four other failures remain |
+| OSS standard kernel comparisons | **58/58 each** on compact and idiomatic packages |
+| Expanded OSS seed API comparisons | **360/477 each**; failures identical to old main |
+| Corpus | **10/10 build**, Node pure/reference checks pass; no browser matrix |
+| Optimized cleanup-on Pro | Main/worker build and offline API/import/invalid-configuration checks pass |
 
-The package checkers were invoked with their explicit size-failure allowance to separate API/import checks from economic gates. Their full reports retain **6 compact-OSS and 6 Pro historical size failures**; those gates are not waived or called passed. New compiler/profile/toolchain identities differ from the old measurements.
 
-## Open later-regression cases
+The packages were built on the selected staging source. Main's rebuild/smoke result is recorded separately after promotion; staging tests are not relabeled as a second main run. Current sizes and exact artifacts are in the comprehensive report. Package API checks use the explicit size-failure allowance; six historical size failures per Rust package remain failures.
 
-The separate `examples/known-gaps` corpus uses fresh native expectations from conversation-reconstructed October tests. Its strict runner reports **2/6 passing** under cleanup-on `release-balanced`. The remaining failures are:
+## What remains
 
-- `195_zst_array_drops`
-- `audit_aggregate_place`
-- `audit_zst_closure_drop`
-- `audit_zst_vec_drop`
+Aggregate-place identity and four preserved round-1 cases (copy aliasing, flattened rows, pointer field-name confusion and niche constants) remain open. Broader heap-array, track-caller, address-lifetime, mutable-string and host-boundary work is pending. The alias-store regression is repaired conservatively; wider inlining is not thereby qualified.
 
-Three fail during zero-sized-array destruction; aggregate-place identity differs. `201_reference_field_pointers` and the named-reference audit probe pass on this reconstruction in the tested configuration. Do not infer their behavior in untested modes. None of the wrong answers was written into a golden as acceptable behavior.
+Next come correctness prerequisites, cleanup-proof enforcement and explicit host-boundary contracts, then formatter/String commitments and proven output improvements. The public holdout remains unimplemented. No new browser matrix, quiet-machine runtime comparison, clean external distribution or signing was performed. Other-language ports remain restored but were not rebuilt in this task.
+
+## Reproduce the open inventory
 
 ```sh
+bash scripts/build.sh --locked
 python3 scripts/check-known-gaps.py
+python3 scripts/check-round1-open.py
 ```
 
-That diagnostic intentionally exits nonzero while any case remains open. The recovered September suite passing does not supersede these failures.
+The strict diagnostic runners intentionally exit nonzero while defects remain. Native expectations are not replaced with incorrect compiler output. [The original recovery record](docs/V2-RESTORATION.md) is historical; its older counts are not the current candidate's counts.
 
-## Identity and evidence
-
-Compiler source digest: `eed71e26087504afedae82418024875b11a0b19fff20b2707053817adfc27505`. Exact current source inventory, binary/artifact hashes, scope and commands are in [v2-source-identity.json](docs/v2-source-identity.json) and [v2-assembly-verification.json](docs/v2-assembly-verification.json). Raw logs and package receipts are in `build/assembly/`; the first corpus attempt's detected source mutation is retained separately from the clean rerun. All 8,544 recovered files and 3,755 recovery content objects were reverified unchanged.
-
-The root checkout remains uncommitted. The pre-assembly source is preserved outside the repository under `/Users/mikhail.pertsev/mires-recovery-backups/assembly-20261108T025023`. Backups are local to this Mac, not off-device.
-
-## Still not claimed
-
-No complete October optimization restoration, three-browser parity matrix, release timing, signed prebuilt, clean Linux CI run, or production admission. The original Pro source checkout remains incomplete. Legacy template markers / small compatibility ABI crates remain internally; the Topcoat framework, UI macros, server and island implementation are not active workspace dependencies. Other-language ports were not restored.
+No push was authorized or performed. Private Pro material, recovery inputs, binaries and raw build output stay out of Git. Local backup locations and preservation limits are recorded in the integration report.

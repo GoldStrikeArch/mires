@@ -1,5 +1,7 @@
 # mires v2: smaller and faster output, cleanup on
 
+> Current local-main promotion: [integration report](../round_1_integration_report.md) and the dated addendum at the end. Earlier entries remain the round-1 investigation history.
+
 Plan: ~/.claude/plans/alright-look-at-the-breezy-hejlsberg.md (approved 2026-11-08).
 Execution: implementer subagents (Opus 5.5, xhigh) + verifier subagent (Fable 5.1, high) per stage.
 
@@ -163,3 +165,22 @@ Rule: a limit that needs an unsupported `unsafe` construct, or that predates the
   - waiting on a user decision: 4'a (host values that do not match their declared type), 4'c (how to make host isolation unable to leak).
   - queued, not started: 1e (addr reads user field names), 1f (heap arrays / Box<[T;N]>), 1h (track_caller chains), 1i (niche Some in constants reads None), 3b-gate, retype-guard, typed boundary checks, String::as_ptr, Box address leak, 4'd–4'f, inline hints, ES2020 target, runtime work (5b, 5c, P12), CONTRACT consolidation, integration → main merge + R1.
   - merge-time housekeeping: fixture numbers 121–126 collide across 4'b, 4'c, granule-min, 1c, 1d, 1b-min; three branches bump schema versions (4'c: JIR 16, manifest 6, sidecar 18).
+
+
+## Current promotion addendum — 2026-11-11 (supersedes older merge-status notes)
+
+- [x] Preserve refs, pending patches, untracked fixtures and decisive verifier evidence before integration.
+- [x] Select verified fusion, no-op landing-pad, cross-crate cleanup transport, overflow, bulk-byte and builder work; do not merge integration wholesale.
+- [x] Review and execute the delivered minimal pointer-move fix; use fixture 202; original worktree unchanged.
+- [x] Compare adversarial probes against freshly rebuilt old main. Treat the newly exposed lost write as an integration regression, not a waived base bug.
+- [x] Review and execute the delivered 1g alias-store fix, native fixtures and bounded generated extent. Wider inlining remains unpromoted.
+- [x] Run selected-candidate workspace/runtime/release fixtures, cleanup/transport/extern/standalone checks, and fresh OSS/corpus/optimized-Pro builds. Retain failures and negative controls.
+- [x] Preserve five public round-1 reproducers and native expectations with a strict runner.
+- [x] Write round_1_integration_report.md and docs/round1-promotion-verification.json.
+- [ ] Repair the four remaining round-1 cases and aggregate-place identity; validate adjacent heap-array/track-caller/address cases.
+- [ ] Repair 3b proof enforcement and representation/boundary prerequisites before promoting cleanup-edge removal or 4′a.
+- [ ] Rebase and verify pending 1c, 1d, granule-min, wider inlining and pooling individually; preserve original branches and resolve fixture/schema collisions.
+- [ ] Implement and freeze the public holdout; complete the original R1 gates rather than calling this scoped promotion R1.
+- [ ] Complete browser parity, controlled runtime measurements and later distribution qualification.
+
+The root integration report is the current status. Earlier under-verification/on-integration-only entries remain historical records. The user authorized local commits to main and prohibited pushing. This promotion does not claim a new broad implementation round or a new independent agent-verifier run.
