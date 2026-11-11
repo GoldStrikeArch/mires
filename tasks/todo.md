@@ -206,8 +206,8 @@ User decisions (2026-11-11):
 Fixture ranges: A1 210–219, A2 220–229, A3 230–239, A4 240–249, A5 250–259, A6 260–269, B 270–289, D 300+.
 
 ### Stage 0
-- [ ] Baseline gate run on main `b1bcca4` (tables kept for every brief)
-- [ ] v1 targets recorded in `experiments/v2-restoration/RESULTS.md`
+- [x] Baseline gate run on main `b1bcca4` (2026-11-11, load 5–11): build, check.sh, release fixtures 146/146, active-poll 60/60 with baseline refusals, cleanup transport and admission, extern 5/5, standalone all pass; known gaps 5/6 (aggregate place open); round1-open 1/5 in both modes (lost_write passes). Logs: session scratchpad `baseline/main-b1bcca4/`.
+- [x] v1 targets recorded in `experiments/v2-restoration/RESULTS.md` (ea5604f)
 
 ### Wave A — open miscompiles
 - [ ] A1 copy aliasing (1c) round 2 — from worktree agent-aa0340f7; `lower/{fuse,ssa}.rs`
