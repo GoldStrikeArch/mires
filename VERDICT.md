@@ -31,7 +31,7 @@ See [the comprehensive integration report](round_1_integration_report.md), [the 
 | Optimized cleanup-on Pro | Main/worker build and offline API/import/invalid-configuration checks pass |
 
 
-The packages were built on the selected staging source. Main's rebuild/smoke result is recorded separately after promotion; staging tests are not relabeled as a second main run. Current sizes and exact artifacts are in the comprehensive report. Package API checks use the explicit size-failure allowance; six historical size failures per Rust package remain failures.
+The packages were built on the selected staging source. Both binaries were subsequently rebuilt in main; the standalone check, open-case inventories and compact package/kernel checks were replayed there. Main's compact artifact is byte-identical to staging, and all 431 source-inventory entries match. Full staging suites are not relabeled as a second main run. Current sizes and exact artifacts are in the comprehensive report. Package API checks use the explicit size-failure allowance; six historical size failures per Rust package remain failures.
 
 ## What remains
 

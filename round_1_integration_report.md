@@ -107,6 +107,12 @@ The new pointer test's 82 output lines were independently checked using the pinn
 
 These checks do not constitute another independent Fable verifier run. They are integration review and fresh execution of the previously delivered work, with scope and unresolved cases recorded explicitly.
 
+### Main-checkout replay after promotion
+
+After the fast-forward to `cfae69e841e2c1286910734dd78c06e57c3267af`, both compiler binaries were rebuilt in the actual main checkout. The standalone values/cleanup/maps/manifest check passed there. The six October-derived probes again report 5/6, and the five round-1 probes again report 1/5 with the alias-store case repaired. These open failures remain explicit.
+
+The compact OSS package was also freshly rebuilt in main and passes 58/58 kernel comparisons. Its minified ESM SHA-256 is `a0ceb34e7f2f429e605a5a9f5124f6e844fc72633c1e9210d0d1663d453a93ed`, byte-identical to the tested staging artifact. All 431 compiler/source inventory entries match the staging snapshot. The full Rust/core/runtime suites and the other package targets were tested in that source-identical staging worktree, not claimed as rerun a second time in main. This follow-up commit updates evidence only; no compiler source changed after the replay.
+
 ## 5. Package results and the cost of the conservative selection
 
 | Target / metric | R0 historical | Full integration, not promoted wholesale | Selected candidate, fresh |

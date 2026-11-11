@@ -184,3 +184,5 @@ Rule: a limit that needs an unsupported `unsafe` construct, or that predates the
 - [ ] Complete browser parity, controlled runtime measurements and later distribution qualification.
 
 The root integration report is the current status. Earlier under-verification/on-integration-only entries remain historical records. The user authorized local commits to main and prohibited pushing. This promotion does not claim a new broad implementation round or a new independent agent-verifier run.
+
+- [x] Fast-forward main to the selected, documented candidate; rebuild both compiler binaries in main; replay standalone/open inventories and compact package kernels. Compact bytes match staging exactly. Evidence-only follow-up; no push.
