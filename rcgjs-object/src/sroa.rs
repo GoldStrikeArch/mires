@@ -1157,6 +1157,11 @@ struct LocalUse {
     self_update: bool,
     /// The field names read or written through the local.
     fields: BTreeSet<String>,
+    /// Whether a field of the local is assigned in place: `local.field = ...` or
+    /// `local.field op= ...`. Splitting turns a whole-local copy into one copy per lane, which
+    /// means the same as the JavaScript assignment only while the shared object is never
+    /// changed in place.
+    stores_field: bool,
     /// Whether the local is used in any way that is not one whole-value assignment or one field.
     opaque: bool,
 }
@@ -1227,10 +1232,26 @@ fn split_locals(decl: Stmt, allow_extended: bool) -> Stmt {
 /// is eligible only when all of its locals are otherwise field-only and at least one assignment
 /// constructs an object literal. Variant objects may omit payload fields: a missing property and
 /// an `undefined` lane are observationally equal under the field-only proof.
+///
+/// A whole-local assignment `x = y` does not copy anything: it makes `x` a second name for the
+/// object `y` holds, and that is how the lowering spells a reference (`&mut S` is the object
+/// itself), so an in-place store through one name is visible through the other. The split
+/// turns that assignment into one copy per lane, which is the same thing only while the shared
+/// object is never changed in place. A component in which a local on either side of a copy also
+/// stores a field is therefore kept whole.
 fn split_shapes(
     uses: &BTreeMap<String, LocalUse>,
     allow_extended: bool,
 ) -> BTreeMap<String, Vec<String>> {
+    let aliased: BTreeSet<&String> = uses
+        .iter()
+        .flat_map(|(name, use_)| {
+            use_.copies
+                .iter()
+                .filter(|source| uses.contains_key(*source))
+                .flat_map(move |source| [name, source])
+        })
+        .collect();
     let mut graph: BTreeMap<String, BTreeSet<String>> = uses
         .keys()
         .map(|name| (name.clone(), BTreeSet::new()))
@@ -1263,6 +1284,9 @@ fn split_shapes(
         }
         if component.iter().any(|name| uses[name].opaque)
             || !component.iter().any(|name| !uses[name].written.is_empty())
+            || component
+                .iter()
+                .any(|name| uses[name].stores_field && aliased.contains(name))
         {
             continue;
         }
@@ -1375,14 +1399,8 @@ fn identifiers(body: &[Stmt]) -> BTreeSet<String> {
 
 fn collect_stmt(stmt: &Stmt, uses: &mut BTreeMap<String, LocalUse>) {
     match stmt {
-        // The one shape a split rewrites: a whole-value assignment standing on its own.
-        Stmt::ExprStmt(Expr::Assign(target, value)) => {
-            if collect_whole_assignment(target, value, uses) {
-                return;
-            }
-            collect_expr(target, uses);
-            collect_expr(value, uses);
-        }
+        // A whole-value assignment standing on its own is the one shape a split rewrites;
+        // `collect_expr` recognizes it, nested or not.
         Stmt::ExprStmt(expr) | Stmt::Throw(expr) => collect_expr(expr, uses),
         Stmt::Let(_, init) => {
             if let Some(init) = init {
@@ -1497,10 +1515,16 @@ fn collect_expr(expr: &Expr, uses: &mut BTreeMap<String, LocalUse>) {
             if collect_whole_assignment(target, value, uses) {
                 return;
             }
+            note_field_store(target, uses);
             collect_expr(target, uses);
             collect_expr(value, uses);
         }
-        Expr::Binary(_, lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
+        Expr::CompoundAssign(_, target, value) => {
+            note_field_store(target, uses);
+            collect_expr(target, uses);
+            collect_expr(value, uses);
+        }
+        Expr::Binary(_, lhs, rhs) => {
             collect_expr(lhs, uses);
             collect_expr(rhs, uses);
         }
@@ -1543,6 +1567,19 @@ fn collect_expr(expr: &Expr, uses: &mut BTreeMap<String, LocalUse>) {
         | Expr::Bool(_)
         | Expr::Undefined
         | Expr::Null => {}
+    }
+}
+
+/// Records that `target`, the left-hand side of an assignment, changes one field of a local in
+/// place. A store into a field's own object (`local.field.inner = ...`) is not one: every lane
+/// copy of `local.field` still names that object.
+fn note_field_store(target: &Expr, uses: &mut BTreeMap<String, LocalUse>) {
+    if let Expr::Member(object, _) = target {
+        if let Expr::Ident(name) = object.as_ref() {
+            if let Some(use_) = uses.get_mut(name) {
+                use_.stores_field = true;
+            }
+        }
     }
 }
 
@@ -2637,6 +2674,107 @@ mod tests {
         );
         assert!(printed.contains("v$high$ = a"), "{printed}");
         assert!(printed.contains("return v$high$;"), "{printed}");
+    }
+
+    /// `function f(c, x, y, v)` that builds `a` on two paths, names its object twice more, stores
+    /// one field through the last name with `store`, and returns `a.f`.
+    ///
+    /// This is what an inlined `fn set(s: &mut S, v: u8) { s.f = v }` leaves behind: the
+    /// callee's `&mut S` parameter is bound to the caller's object through `t = a; s = t`. The
+    /// two paths keep `a` from being a once-written root whose aliases could be forwarded.
+    fn store_through_alias(store: Expr) -> Stmt {
+        let single = |value: &str| {
+            jsast::assign_stmt(
+                jsast::id("a"),
+                jsast::object(vec![("f".to_owned(), jsast::id(value))]),
+            )
+        };
+        Stmt::FunctionDecl {
+            name: "f".to_owned(),
+            params: ["c", "x", "y", "v"].map(str::to_owned).to_vec(),
+            body: vec![
+                Stmt::Lets(["a", "t", "s"].map(|name| (name.to_owned(), None)).to_vec()),
+                Stmt::If(jsast::id("c"), vec![single("x")], Some(vec![single("y")])),
+                jsast::assign_stmt(jsast::id("t"), jsast::id("a")),
+                jsast::assign_stmt(jsast::id("s"), jsast::id("t")),
+                Stmt::ExprStmt(store),
+                Stmt::Return(Some(jsast::member(jsast::id("a"), "f"))),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_store_through_a_second_name_reaches_the_object() {
+        let field = || jsast::member(jsast::id("s"), "f");
+        for (store, spelled) in [
+            (jsast::assign(field(), jsast::id("v")), "s.f = v;"),
+            (
+                Expr::CompoundAssign(BinOp::Add, Box::new(field()), Box::new(jsast::id("v"))),
+                "s.f += v;",
+            ),
+        ] {
+            let decl = store_through_alias(store);
+            let printed = split_locals(forward_stable_aliases(decl.clone()), true).to_string();
+            assert!(printed.contains(spelled), "{printed}");
+            assert!(printed.contains("return a.f;"), "{printed}");
+            assert!(!printed.contains("a$f"), "{printed}");
+            // The bounded JIR rounds pick among split candidates by size; none may lose the store.
+            let printed = analyze_jir(decl, OptimizerMode::On).decl.to_string();
+            assert!(printed.contains(spelled), "{printed}");
+            assert!(printed.contains("return a.f;"), "{printed}");
+        }
+    }
+
+    #[test]
+    fn copies_without_a_store_are_still_split() {
+        let read = jsast::assign(jsast::id("v"), jsast::member(jsast::id("s"), "f"));
+        let printed =
+            split_locals(forward_stable_aliases(store_through_alias(read)), true).to_string();
+        assert!(printed.contains("t$f = a$f"), "{printed}");
+        assert!(printed.contains("s$f = t$f"), "{printed}");
+        assert!(printed.contains("return a$f;"), "{printed}");
+    }
+
+    #[test]
+    fn a_store_into_a_fields_own_object_does_not_block_the_split() {
+        // `s.f.g = v` changes the object both lanes `a$f` and `s$f` name, not a lane.
+        let store = jsast::assign(
+            jsast::member(jsast::member(jsast::id("s"), "f"), "g"),
+            jsast::id("v"),
+        );
+        let printed =
+            split_locals(forward_stable_aliases(store_through_alias(store)), true).to_string();
+        assert!(printed.contains("s$f.g = v;"), "{printed}");
+        assert!(printed.contains("return a$f;"), "{printed}");
+    }
+
+    #[test]
+    fn a_store_without_a_second_name_is_split() {
+        // Pointer equality connects two records without naming one object twice.
+        let ptr = |name: &str, off: f64| {
+            jsast::assign_stmt(
+                jsast::id(name),
+                jsast::object(vec![
+                    ("buf".to_owned(), jsast::id("bytes")),
+                    ("off".to_owned(), jsast::num(off)),
+                ]),
+            )
+        };
+        let printed = split(
+            &["cursor", "end"],
+            &[],
+            vec![
+                ptr("cursor", 0.0),
+                ptr("end", 4.0),
+                jsast::assign_stmt(jsast::member(jsast::id("cursor"), "off"), jsast::num(4.0)),
+                Stmt::Return(Some(jsast::rt_call(
+                    "ptr_eq",
+                    vec![jsast::id("cursor"), jsast::id("end")],
+                ))),
+            ],
+        );
+        assert!(!printed.contains("{ buf:"), "{printed}");
+        assert!(printed.contains("cursor$off = 4;"), "{printed}");
     }
 
     #[test]
