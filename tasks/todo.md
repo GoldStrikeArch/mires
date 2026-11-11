@@ -186,3 +186,54 @@ Rule: a limit that needs an unsupported `unsafe` construct, or that predates the
 The root integration report is the current status. Earlier under-verification/on-integration-only entries remain historical records. The user authorized local commits to main and prohibited pushing. This promotion does not claim a new broad implementation round or a new independent agent-verifier run.
 
 - [x] Fast-forward main to the selected, documented candidate; rebuild both compiler binaries in main; replay standalone/open inventories and compact package kernels. Compact bytes match staging exactly. Evidence-only follow-up; no push.
+
+## Round 2 plan — 2026-11-11 (approved; supersedes the "suggested order" notes above)
+
+Plan: ~/.claude/plans/look-at-this-recursive-firefly.md. Base: main `b1bcca4`.
+Goal: v2 with cleanup on beats the frozen v1 figures on minified, gzip and brotli for both ports, and improves the workload Rust/JS ratios, with no semantics lost.
+Execution: implementers Opus 5.5 xhigh in their own worktree; a fresh Fable verifier at high effort per stage; commit to main only on pass / pass-with-limits; one commit per stage; no push.
+
+Targets (`fp.esm.min.js`; v1 = baseline lane with the frozen v1 optimizer, `recovery/v2/snapshots/2026-09-07/compiler/checkpoints/phase-3.md:166-198`, Node zlib 9 / brotli 11, cleanup off):
+- Compact: v1 160,615 / 44,283 / 33,890; main today 241,745 / 61,301 / 47,412.
+- Idiomatic: v1 259,527 / 64,908 / 53,064; main today 443,971 / 111,722 / 86,772.
+
+User decisions (2026-11-11):
+- v1 target = the frozen figures above (no v1 checkout exists on this machine).
+- Host values are checked at typed boundaries; 3b returns only after that and after the proof gate is fixed. A trusted binding stays an explicit opt-in.
+- Pooling: a rule that cannot leak by construction; the multi-chunk load fix lands separately first.
+- `as_flattened`: full support; then make the helper pay-per-use if possible.
+
+Fixture ranges: A1 210–219, A2 220–229, A3 230–239, A4 240–249, A5 250–259, A6 260–269, B 270–289, D 300+.
+
+### Stage 0
+- [ ] Baseline gate run on main `b1bcca4` (tables kept for every brief)
+- [ ] v1 targets recorded in `experiments/v2-restoration/RESULTS.md`
+
+### Wave A — open miscompiles
+- [ ] A1 copy aliasing (1c) round 2 — from worktree agent-aa0340f7; `lower/{fuse,ssa}.rs`
+- [ ] A2 flattening + heap arrays (1d + 1f) — from worktree agent-aeaee6e0; `runtime/shim.js`, `backend/src/ptr.rs`
+- [ ] A3 pointer records recognised by field name (1e) — after A2 (same files)
+- [ ] A4 niche-optimised constants (1i) — `backend/src/constant.rs`, `lower/js/constant.rs`
+- [ ] A5 `#[track_caller]` chains (1h) — after A1
+- [ ] A6 multi-chunk ownership fix extracted from pooling — `jsc-link/src/link.rs`
+- [ ] check-round1-open 5/5 in both modes
+
+### Wave B — cleanup-edge removal
+- [ ] B1 typed host-boundary checks
+- [ ] B2 3b proof gate (validate before mutating; refuse on disagreement in release)
+- [ ] B3 promote 3b (needs A2, B1, B2)
+- [ ] B4 no-throw extensions (4′a) without `compare_bytes`
+
+### Stage C — checkpoint
+- [ ] One-tree measurement of compact, idiomatic, corpus, Pro on a quiet machine; row in RESULTS.md against the v1 targets; fresh byte and runtime attribution
+
+### Wave D — ordered by the Stage C attribution
+- [ ] Wider inlining (4′b) on A1 + 1g
+- [ ] Emission wins: shared abort helper, module-scoped runtime, numeric enum tags, dead trailing arguments
+- [ ] Pooling with the type-proven rule
+- [ ] Formatter / String commitments
+- [ ] Runtime: heap registry, string views, iterator/Option result objects, overflow IIFEs
+- [ ] Cleanup-bearing body optimisation
+- [ ] Verify granule-min address release
+
+Deferred: aggregate-place identity (design review first), buddy allocator, seed-API adapter mismatch, public holdout, browser matrix.

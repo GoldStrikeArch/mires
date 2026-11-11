@@ -129,3 +129,22 @@ Append-only log written by `measure.mjs`. Each block is one run; receipts live i
 | firefox 159.0.1 | fflate | 10.500 | 3.827 | 2.74 | 1.021 | ok/ok |
 
 - corpus run (browsers: chrome,firefox): passed; paired timing passed vs fflate 0.8.3, marked 18.1.1, minisearch 7.2.0; load avg (1/5/15 min) 4.2/6.4/6.0 at start, 5.5/6.4/6.1 at end; compact kernels: 58/58; corpus artifacts vs build.json: identical
+
+## v1 reference targets — recorded 2026-11-11 (not a measure.mjs run)
+
+- Historical, not remeasured: there is no v1 checkout on this machine. Source:
+  `recovery/v2/snapshots/2026-09-07/compiler/checkpoints/phase-3.md:166-198`, column "baseline `on`"
+  (the baseline lane with the frozen v1 optimizer, built in that session). Node zlib level 9,
+  brotli quality 11. **Cleanup was off**; every v2 row in this file is cleanup on.
+- Round-2 size gate: v2 `fp.esm.min.js` below these on all three metrics for both ports.
+
+| target | file | min | gzip | brotli | status |
+| --- | --- | ---: | ---: | ---: | --- |
+| compact (v1) | fp.esm.min.js | 160,615 | 44,283 | 33,890 | historical |
+| idiomatic (v1) | fp.esm.min.js | 259,527 | 64,908 | 53,064 | historical |
+| compact (main `b1bcca4`) | fp.esm.min.js | 241,745 | 61,301 | 47,412 | from docs/round1-promotion-verification.json |
+| idiomatic (main `b1bcca4`) | fp.esm.min.js | 443,971 | 111,722 | 86,772 | from docs/round1-promotion-verification.json |
+
+- Gap to close: compact −81,130 / −17,018 / −13,522; idiomatic −184,444 / −46,814 / −33,708.
+- v1 was never timed on marked, minisearch or fflate. The runtime gate is the Rust/JS ratio on
+  those workloads against the latest v2 checkpoint row above.
