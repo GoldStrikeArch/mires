@@ -210,12 +210,12 @@ Fixture ranges: A1 210–219, A2 220–229, A3 230–239, A4 240–249, A5 250�
 - [x] v1 targets recorded in `experiments/v2-restoration/RESULTS.md` (ea5604f)
 
 ### Wave A — open miscompiles
-- [ ] A1 copy aliasing (1c) round 2 — from worktree agent-aa0340f7; `lower/{fuse,ssa}.rs`
+- [ ] A1 copy aliasing (1c) round 2 — DELIVERED 2026-11-11 on branch worktree-agent-a4c08c1551e54383a (35472d3), UNDER VERIFICATION (scratch verify-a1). Implementer: copy_alias passes both modes; extent 661/667 (6 heap-array cases = A2); cost compact +527 min / +298 gzip, idiomatic +596 / +378, all from declaring shared borrows of single-use values (a producer Freeze fact would recover it). Pre-existing bug reported: baseline lane under -Oz + MIR inline writes the operand through a shared/`&raw const` view of a fresh aggregate (scratch a1/prebug).
 - [ ] A2 flattening + heap arrays (1d + 1f) — from worktree agent-aeaee6e0; `runtime/shim.js`, `backend/src/ptr.rs`
 - [ ] A3 pointer records recognised by field name (1e) — after A2 (same files)
-- [ ] A4 niche-optimised constants (1i) — `backend/src/constant.rs`, `lower/js/constant.rs`
+- [ ] A4 niche-optimised constants (1i) — round 1 (branch worktree-agent-a0a61a0aaa5ae144a, 0efa74d) FAILED verification 2026-11-11 (scratch verify-a4); round 2 with the implementer. Claims reproduced (fixtures 240–244, packages byte-identical). Fail reasons: (1) `niche_width` (`lower/js/value.rs:929`) takes `variants.first()` through a single-present-variant enum → `Some(Parsed::Char(..))`, `Some(Err(..))` over `Result<!, _>` and wrapping-niche variants read as the wrong variant on the JIR lane (same on main); (2) cycles through `Option<&'static T>` that never observe the link ran on main and now die at load (ReferenceError) — resolved by sequencing: A4 lands only on top of A6's static-cycle fix, cycle programs c1–c10 re-run on the combination. Also for round 2: two unpinned mutants (deep uninhabited walk), `static SL: Option<&[u32]>`/`&[u32]` to a static loses its length (base bug, newly reached). `Option<&dyn Trait>` `Some` constants are now a clean refusal (documented limit, same as plain `&dyn`). Base bug found: run-time `match` on `Result<(Infallible, ()), char>` throws "unreachable" (`opt/dce.rs:615`, `lower/js/rvalue.rs:1109`).
 - [ ] A5 `#[track_caller]` chains (1h) — after A1
-- [ ] A6 multi-chunk ownership fix extracted from pooling — `jsc-link/src/link.rs`
+- [ ] A6 multi-chunk ownership fix extracted from pooling + statics that refer to each other (cycles fail at load on main) — `jsc-link/src/link.rs`; implementer running. Must land before A4.
 - [ ] check-round1-open 5/5 in both modes
 
 ### Wave B — cleanup-edge removal
