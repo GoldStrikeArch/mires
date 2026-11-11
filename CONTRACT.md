@@ -929,6 +929,13 @@ turns back into a dereferenceable pointer.
   element count for a slot, and a byte count over a scaled slot, which is divided by `sc`. An
   aggregate element is cloned on the way across, because a byte for byte copy is an independent
   value and assigning a JavaScript object would be an alias;
+- an element move **writes through** (into the object already in the place, `__rt._put`) only
+  where the element is an aggregate held by value: the move carries a `clone`, or the destination
+  is a `__rt.box` buffer (the one place standing for a local), or it is a byte copy over a scaled
+  slot, whose `u8` pointee says nothing about the elements. Every other element **rebinds** the
+  place. A reference to an aggregate is that aggregate's object and a raw pointer or a `Box` is a
+  slot record, so writing one into the object in the place would overwrite its *pointee*:
+  `[&h, &h2].swap(0, 1)` would copy `h2` over `h`;
 - `write_bytes` names a value for two pointees only: a one byte one, where the pattern *is* the
   value, and a zero pattern on any other scalar. An aggregate is a zombie, and a non-zero pattern on
   a wider pointee throws;

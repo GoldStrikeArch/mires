@@ -559,13 +559,14 @@ globalThis.__rt._scales = (a, b, op) => {
 
 // copy(dst, src, count): moves `count` elements, correct when the two ranges
 // overlap, which is `ptr::copy` and `slice::copy_within`. `clone` is present
-// when an element is an aggregate: a byte for byte copy produces an independent
-// value, and assigning a JavaScript object would produce an alias.
+// when an element is an aggregate held by value: a byte for byte copy produces
+// an independent value, and assigning a JavaScript object would produce an
+// alias.
 //
 // Inside one buffer with nothing to clone, `copyWithin` is the whole operation
 // and handles the overlap itself. Otherwise the loop runs away from the
 // overlap: upwards when the destination is below the source, downwards when it
-// is above.
+// is above. Which store each element gets is `_rebinds`.
 globalThis.__rt.copy = (dst, src, count, clone) => {
   if (count === 0) return;
   globalThis.__rt._scales(dst, src, "copy");
@@ -575,17 +576,53 @@ globalThis.__rt.copy = (dst, src, count, clone) => {
     d.buf.copyWithin(d.off, s.off, s.off + s.n);
     return;
   }
+  const down = d.buf === s.buf && d.off > s.off;
+  if (clone === undefined && globalThis.__rt._rebinds(dst, d.buf, s)) {
+    if (down) {
+      for (let i = s.n - 1; i >= 0; i--) d.buf[d.off + i] = s.buf[s.off + i];
+    } else {
+      for (let i = 0; i < s.n; i++) d.buf[d.off + i] = s.buf[s.off + i];
+    }
+    return;
+  }
   const each = clone === undefined ? (v) => v : clone;
   const put = globalThis.__rt._put;
-  if (d.buf === s.buf && d.off > s.off) {
+  if (down) {
     for (let i = s.n - 1; i >= 0; i--) put(d.buf, d.off + i, each(s.buf[s.off + i]));
   } else {
     for (let i = 0; i < s.n; i++) put(d.buf, d.off + i, each(s.buf[s.off + i]));
   }
 };
 
-// The one element store the copies share, and the one place where storing is
-// not an assignment.
+// Whether an element move with no `clone` into `buf` (the buffer of the
+// destination `dst`, the source run being `s`) rebinds each place, an
+// assignment, rather than writing into the object already there (`_put`).
+//
+// Only an aggregate held BY VALUE is written into its place, and the compiler
+// says when the element is one: it hands over `clone`. Every other element is a
+// value that names something else -- a reference to an aggregate is that
+// aggregate's own object, a raw pointer or a `Box` is a slot record, a `&[T]`
+// or a `&dyn Trait` is a fat one -- and writing it into the object in the place
+// would overwrite the *pointee*: `[&P; 2].swap(0, 1)` would copy one `P` over
+// the other instead of exchanging the two references. Two destinations keep
+// `_put` whatever the element is:
+//
+//   * a `__rt.box` buffer is not a buffer but the one place standing for a
+//     local, which still names the object in it (what makes
+//     `ptr::copy(.., &mut local, 1)` reach the local). It holds one element, so
+//     only a move of one object can be written into it;
+//   * a byte view (`sc`) counts bytes of elements that the pointee type -- a
+//     `u8` -- does not describe, so the absence of `clone` says nothing about
+//     them.
+globalThis.__rt._rebinds = (dst, buf, s) => {
+  if (dst.sc !== undefined) return false;
+  const first = s.buf[s.off];
+  return s.n !== 1 || first === null || typeof first !== "object" ||
+    !globalThis.__rt._boxed.has(buf);
+};
+
+// The one element store the copies share for an aggregate held by value (see
+// `_rebinds`), and the one place where storing is not an assignment.
 //
 // A `__rt.box` buffer is not a buffer: it is the single place that stands for a
 // local whose address was taken, and the local still names the *object* that was
@@ -629,6 +666,10 @@ globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone) => {
   globalThis.__rt._scales(dst, src, "copy_nonoverlapping");
   const d = globalThis.__rt._run(dst, count, "copy_nonoverlapping");
   const s = globalThis.__rt._run(src, count, "copy_nonoverlapping");
+  if (clone === undefined && globalThis.__rt._rebinds(dst, d.buf, s)) {
+    for (let i = 0; i < s.n; i++) d.buf[d.off + i] = s.buf[s.off + i];
+    return;
+  }
   const each = clone === undefined ? (v) => v : clone;
   for (let i = 0; i < s.n; i++) globalThis.__rt._put(d.buf, d.off + i, each(s.buf[s.off + i]));
 };
