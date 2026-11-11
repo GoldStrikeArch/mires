@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "scope": "Public, small reproductions preserved from the round-1 audit; not private product code. Expected outputs are not changed to match compiler behavior.",
+  "cases": [
+    {
+      "name": "address_fields",
+      "sourceSha256": "38e8de37dadd0cf27d4c8a1840c450df15c72e41859c81c8cc82ccb2ed69066f",
+      "expectedOrigin": "Native pinned nightly execution in the November 11 round-1 audit, opt-level 0",
+      "auditedIntegration": "2f36c3fec03eac4f11a399a6eda3ebf746650d0c",
+      "observedThen": "false\ntrue\n1\nfalse\n",
+      "passedThen": false,
+      "classification": "adversarial case; current status must be rerun"
+    },
+    {
+      "name": "copy_alias",
+      "sourceSha256": "13477bd5492cdb874318191c5a866ffce2b0c247c52ce1804a862f581a071de2",
+      "expectedOrigin": "Native pinned nightly execution in the November 11 round-1 audit, opt-level 0",
+      "auditedIntegration": "2f36c3fec03eac4f11a399a6eda3ebf746650d0c",
+      "observedThen": "static\n99\nlocal array\n99\nblack-boxed local array\n99\nparameter slice\n99\nmutable parameter slice\n77\n77\nstatic slice\n1\n",
+      "passedThen": false,
+      "classification": "adversarial case; current status must be rerun"
+    },
+    {
+      "name": "flattened_safe",
+      "sourceSha256": "43a0c5a8503f5b6073ae8c5fb8fc63bb9464fd4187d497d1010a804b76e3e418",
+      "expectedOrigin": "Native pinned nightly execution in the November 11 round-1 audit, opt-level 0",
+      "auditedIntegration": "2f36c3fec03eac4f11a399a6eda3ebf746650d0c",
+      "observedThen": "1\n2\nundefined\nundefined\n",
+      "passedThen": false,
+      "classification": "adversarial case; current status must be rerun"
+    },
+    {
+      "name": "lost_write",
+      "sourceSha256": "7862920420b70a178bcdf33604388c1a0798486ed83425b03f7e44842e682b34",
+      "expectedOrigin": "Native pinned nightly execution in the November 11 round-1 audit, opt-level 0",
+      "auditedIntegration": "2f36c3fec03eac4f11a399a6eda3ebf746650d0c",
+      "observedThen": "7\n",
+      "passedThen": false,
+      "classification": "adversarial case; current status must be rerun"
+    },
+    {
+      "name": "niche_constant",
+      "sourceSha256": "6f01573945765ea810b73d0161d091e5d94de2baa61feeff620fc8e6a184d152",
+      "expectedOrigin": "Native pinned nightly execution in the November 11 round-1 audit, opt-level 0",
+      "auditedIntegration": "2f36c3fec03eac4f11a399a6eda3ebf746650d0c",
+      "observedThen": "0\n0\n100\n0\ntrue\n11\n",
+      "passedThen": false,
+      "classification": "adversarial case; current status must be rerun"
+    }
+  ]
+}
