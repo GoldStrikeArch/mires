@@ -56,6 +56,10 @@ use crate::opts::{Lane, Modules};
 // `pub(crate)`: the representation planner (`plan/representation.rs`, W4b) fills the sidecar's
 // `ReprBlock`, which is defined beside the sidecar it is rendered into.
 pub(crate) mod lane;
+/// The initialization order of module level bindings, and the two-step form of a cycle of statics.
+mod statics;
+
+use statics::Placed;
 
 /// The name the runtime shim is bound to. Emitted calls are `__rt.<symbol>(...)`, in either mode.
 const SHIM_NAMESPACE: &str = "__rt";
@@ -504,7 +508,9 @@ fn resolve(
     }
 
     let stubs = stub_missing(&table, &reachable);
-    let mut ordered = order(&table, &reachable);
+    let placed = layout(&table, &reachable);
+    let cycles = statics::initialize_cycles(dcx, &placed);
+    let mut ordered = statics::print_order(&placed, &cycles);
     ordered.extend(stubs.iter());
     let unit = Unit {
         label: label.to_owned(),
@@ -1684,6 +1690,17 @@ fn write_chunks(
         true => opts.shared_chunk.as_str(),
         false => plans[at].name,
     };
+    statics::split_cycles(dcx, table, &owner, |at| label(at).to_owned());
+
+    // Each unit's bindings in initialization order, over the names it owns and only those: a
+    // binding another unit owns arrives through the `import` above it, and placing it here as well
+    // would declare one name twice, a `SyntaxError` before the module runs. A cycle of statics is
+    // always owned by one unit, and is initialized in two steps there (`link/statics.rs`).
+    let placed: Vec<Vec<Placed<'_>>> = names.iter().map(|owned| layout(table, owned)).collect();
+    let cycles: Vec<Vec<Vec<LinkItem>>> = placed
+        .iter()
+        .map(|placed| statics::initialize_cycles(dcx, placed))
+        .collect();
 
     // The synthesized imports and the stubs are owned here, because a unit borrows its items.
     let crossings: Vec<Vec<LinkItem>> = imported
@@ -1706,7 +1723,7 @@ fn write_chunks(
         if at == shared && owned.is_empty() {
             continue;
         }
-        let mut items = order(table, owned);
+        let mut items = statics::print_order(&placed[at], &cycles[at]);
         items.splice(0..0, crossings[at].iter());
         items.extend(stubs[at].iter());
         units.push(Unit {
@@ -1896,9 +1913,16 @@ fn report_zombies(
 /// `debug_path` is the module it imports from — which depends on nothing but the items themselves.
 ///
 /// Function declarations hoist, so their order never matters. A `let` does not: a binding that
-/// reads another binding has to come after it. The dependency order among bindings is a
-/// depth-first post-order over `refs`; a cycle (which Rust's `static` rules make impossible) would
-/// simply keep the discovery order.
+/// names another binding has to come after it. The dependency order among bindings is a
+/// depth-first post-order over `refs`. Rust allows statics that name each other, and no order of
+/// plain `let`s initializes those; [`layout`] keeps such a cycle together, and the printed program
+/// initializes it in two steps (`link/statics.rs`). Here, for the measurements that only count
+/// bytes, a cycle is listed member by member.
+///
+/// Only the items of `reachable` are placed. The walk that orders a binding after the bindings it
+/// names follows `refs`, and in a chunk (see [`write_chunks`]) some of those belong to another file
+/// and arrive through its `import` clause: following them into this file as well would declare one
+/// name twice, which is a `SyntaxError` before the module runs.
 ///
 /// A binding carrying a [`SourceOrder`] is placed before the rest and among its own kind in that
 /// order. `view!` template cloners are what need it: a trace numbers them in declaration order, so
@@ -1909,6 +1933,19 @@ pub(crate) fn order<'a>(
     table: &'a BTreeMap<JsName, LinkItem>,
     reachable: &'a [JsName],
 ) -> Vec<&'a LinkItem> {
+    let mut out = Vec::with_capacity(reachable.len());
+    for step in layout(table, reachable) {
+        match step {
+            Placed::Item(item) => out.push(item),
+            Placed::Cycle(members) => out.extend(members),
+        }
+    }
+    out
+}
+
+/// [`order`], with each cycle among the bindings kept together as one [`Placed::Cycle`].
+fn layout<'a>(table: &'a BTreeMap<JsName, LinkItem>, reachable: &'a [JsName]) -> Vec<Placed<'a>> {
+    let members: std::collections::HashSet<&JsName> = reachable.iter().collect();
     let mut names: Vec<&JsName> = reachable.iter().collect();
     names.sort();
     // The ordered bindings first, in their own order; the rest keep the name order above. The sort
@@ -1918,8 +1955,7 @@ pub(crate) fn order<'a>(
         (order.is_none(), order)
     });
 
-    let mut out: Vec<&LinkItem> = Vec::with_capacity(names.len());
-    let mut placed: std::collections::HashSet<&JsName> = std::collections::HashSet::new();
+    let mut out: Vec<Placed<'a>> = Vec::with_capacity(names.len());
 
     let mut imports: Vec<&LinkItem> = names
         .iter()
@@ -1927,38 +1963,13 @@ pub(crate) fn order<'a>(
         .filter(|item| item.kind == ItemKind::Import)
         .collect();
     imports.sort_by(|a, b| (&a.debug_path, &a.name).cmp(&(&b.debug_path, &b.name)));
-    out.extend(imports);
+    out.extend(imports.into_iter().map(Placed::Item));
 
-    fn visit<'a>(
-        name: &'a JsName,
-        table: &'a BTreeMap<JsName, LinkItem>,
-        placed: &mut std::collections::HashSet<&'a JsName>,
-        out: &mut Vec<&'a LinkItem>,
-    ) {
-        let Some((key, item)) = table.get_key_value(name) else {
-            return;
-        };
-        if !item.kind.is_binding() || !placed.insert(key) {
-            return;
-        }
-        for referenced in &item.refs {
-            if table
-                .get(referenced)
-                .is_some_and(|item| item.kind.is_binding())
-            {
-                visit(referenced, table, placed, out);
-            }
-        }
-        out.push(item);
-    }
-
-    for name in &names {
-        visit(name, table, &mut placed, &mut out);
-    }
+    out.extend(statics::layout(table, &members, &names));
     for name in &names {
         if let Some(item) = table.get(*name) {
             if !item.kind.is_binding() && item.kind != ItemKind::Import {
-                out.push(item);
+                out.push(Placed::Item(item));
             }
         }
     }
@@ -2497,5 +2508,40 @@ mod tests {
                 Some(Hash128 { lo: 3, hi: 0 })
             );
         }
+    }
+
+    /// A chunk's `order` places what the chunk owns and nothing it imports: a binding that names a
+    /// binding another chunk owns comes after its `import`, and the import is not declared again.
+    #[test]
+    fn order_places_only_the_items_it_is_given() {
+        let binding = |name: &str, refs: &[&str]| {
+            let mut item = duplicate(name, &format!("let {name};\n"), None, None);
+            item.kind = ItemKind::Static;
+            item.refs = refs.iter().map(|r| JsName::new((*r).to_owned())).collect();
+            item
+        };
+        let table: BTreeMap<JsName, LinkItem> = [
+            binding("shared_table", &[]),
+            binding("own_index", &["shared_table"]),
+            binding("own_other", &["own_index"]),
+        ]
+        .into_iter()
+        .map(|item| (item.name.clone(), item))
+        .collect();
+        let whole: Vec<JsName> = table.keys().cloned().collect();
+        let placed: Vec<&str> = order(&table, &whole)
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        assert_eq!(placed, ["shared_table", "own_index", "own_other"]);
+        let chunk = [
+            JsName::new("own_other".to_owned()),
+            JsName::new("own_index".to_owned()),
+        ];
+        let placed: Vec<&str> = order(&table, &chunk)
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        assert_eq!(placed, ["own_index", "own_other"]);
     }
 }

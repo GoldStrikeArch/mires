@@ -85,7 +85,9 @@ done
 # Anything the chunks import that is not itself an entry point: the shared chunk,
 # and any further file a chunk names relatively. Copied by following the
 # specifiers rather than by guessing the shared chunk's name, so a chunk that
-# imports something else fails loudly here instead of at run time.
+# imports something else fails loudly here instead of at run time. Both printer
+# styles are followed: `import { a } from "./shared.js";` and, minified,
+# `import{a}from"./shared.js";`.
 for pass in 1 2 3; do
 	missing=0
 	for file in "$dir"/*.js; do
@@ -99,7 +101,7 @@ for pass in 1 2 3; do
 				cp "$from/$spec" "$dir/$spec"
 				missing=1
 			fi
-		done < <(sed -n 's/^import .*from "\(\.\/[^"]*\)";$/\1/p' "$file")
+		done < <(sed -n 's/^import.*from *"\(\.\/[^"]*\)";$/\1/p' "$file")
 	done
 	[ "$missing" -eq 0 ] && break
 done

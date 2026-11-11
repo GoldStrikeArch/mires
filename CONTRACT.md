@@ -414,6 +414,30 @@ nothing else in the backend builds an identifier.
   Rust line — the cheap, readable-in-a-golden-file cousin of a source map. The path is spelled as
   rustc would spell it in a diagnostic, so `--remap-path-prefix` applies.
 
+### Statics that refer to each other
+
+A `static` is one module level `let NAME = <literal>;`. Its value was const-evaluated, so the
+literal only *names* the bindings it points at (a reference to a static is the binding, or
+`{ buf: NAME, off: 0 }`, or `__rt.box(NAME)`), and never reads what they hold. The link step
+declares a binding after the bindings it names, a depth-first post-order.
+
+Rust allows statics that name each other: two nodes, a ring, a static that names itself, through
+fields, enum payloads, arrays and slices of references. No order of plain `let`s initializes those
+(the first declaration reads a binding still in its temporal dead zone, a `ReferenceError` before
+any Rust code runs), so **a cycle is initialized in two steps**: every member is declared as an
+empty object (an empty array for an array literal), then each member's literal is evaluated and
+copied onto it with `Object.assign`. The binding keeps the identity it was declared with, which is
+the one every other initializer and function captured, so `ptr::eq` of the two ways to reach a
+member is true, and a write through one is seen through the other. The cycle sits where the
+post-order puts it as a whole: after what its members name outside it, before every binding that
+names a member. Module evaluation runs initializers only, so no Rust code sees a half-filled
+cycle. A program without a cycle prints byte for byte as before.
+
+A cycle whose member is not one `let` of one object or array literal, or that runs through a
+binding of another kind, is a link error naming the statics, never a reordering that throws at
+load. No producer emits one today. See `jsc-link/src/link/statics.rs`; `260_static_cycles` and
+`261_static_cycle_cells` pin it.
+
 ### Source maps (`js-source-map=on`)
 
 A **source map v3** is written beside the finished program, so a browser steps through the Rust
@@ -1932,7 +1956,19 @@ it. The shared chunk is closed under references -- everything an item two chunks
 reach is also reached by both -- so it never imports from a chunk and the module graph has no cycles.
 Rule 1 is applied last, so an entry point another chunk also reaches stays in its own chunk and the
 other chunk imports it: island-to-island falls out of the same mechanism as island-to-shared instead
-of being a broken edge case.
+of being a broken edge case. (The shared chunk may then import an entry point back, but a chunk
+whose entry another file names owns nothing else: everything that entry reaches is reached twice.
+An entry point is a hoisted function, so that import never orders an initializer.)
+
+**A unit declares what it owns, and only that.** Each file's module level bindings are ordered over
+the names that file owns: a binding it owns that names a binding another file owns comes after the
+`import` of that name and does not declare it again. (Following the name into the file, as the
+whole-program order does, declared it twice, a `SyntaxError` before the module ran.) A cycle of
+statics is reached as a whole by every chunk that reaches one member, so it has one owner and is
+initialized there in two steps (see "Statics that refer to each other"). The one way to split a
+cycle, naming one of its statics as a chunk's entry point, is a link error.
+`scripts/chunk-test.sh` runs the core fixtures that carry a `.chunks` file split
+(`262_chunk_owned_statics`, `263_chunk_three_owners`, `264_chunk_static_cycles`).
 
 ### The cross-chunk specifier is relative
 

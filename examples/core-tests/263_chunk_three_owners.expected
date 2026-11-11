@@ -1,0 +1,27 @@
+chunk a
+15
+a-name-that-is-long-enough-to-be-hoisted-into-a-shared-constant
+1
+chunk a
+15
+a-name-that-is-long-enough-to-be-hoisted-into-a-shared-constant
+2
+chunk b
+1021
+a-name-that-is-long-enough-to-be-hoisted-into-a-shared-constant
+2
+15
+true
+chunk a
+15
+a-name-that-is-long-enough-to-be-hoisted-into-a-shared-constant
+4
+chunk c
+1156
+1006
+true
+4
+chunk a
+15
+a-name-that-is-long-enough-to-be-hoisted-into-a-shared-constant
+5

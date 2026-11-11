@@ -85,6 +85,22 @@ The regression that section exists for is `s.as_bytes().len()`. It used to retur
 `*const u8` taken from a string was the string itself, and the slice built from it had no length.
 It was the only silent miscompile the spike ever had, and `14_str` pins it.
 
+### Statics that refer to each other, and chunks
+
+| test | covers |
+|---|---|
+| `260_static_cycles` | statics that name each other initialize and keep their identity: two nodes, a ring of three, a self reference, statics outside a cycle pointing into it, members holding a leaf static and hoisted long strings, cycles through a static slice of references, an array of references and a reference-only (boxed) static, and a `const` table naming cycle members |
+| `261_static_cycle_cells` | the same with interior mutability: an `AtomicU32` in each member, `Cell`s in two `static mut`s that point at each other through raw pointers, and a `static mut` pointing at itself; writes through one path read back through the other |
+| `262_chunk_owned_statics` | split three ways: statics a chunk owns that name a shared static (from two chunks), a chunk-owned static naming another chunk's entry point, an interior-mutable shared static written from two chunks |
+| `263_chunk_three_owners` | split three ways, in both declaration orders: chains of chunk-owned statics into shared ones, a static only one chunk reads that names one only another reads, a shared static naming a chunk's entry point, hoisted strings in chunk-owned statics |
+| `264_chunk_static_cycles` | split two ways: a cycle the shared chunk owns written from one chunk and read from the other, a cycle and a self reference one chunk owns, a cycle whose members name the other chunk's entry point |
+
+A test with a `.chunks` file is also built split by `scripts/chunk-test.sh`: each line is one build,
+the `chunk:entry` pairs handed to the compiler as `js-chunk=` options in that order, and every build
+runs the entries in the order of the first line, which is the order `rust_entry` calls them. So one
+`.expected` holds for the unsplit program and for every split of it. `CONTRACT.md`, "Statics that
+refer to each other" and "Who owns what", has the rules these pin.
+
 ## What is out, and why
 
 Everything below has one cause or the other. They are not arbitrary gaps; each is a consequence of
