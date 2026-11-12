@@ -254,3 +254,11 @@ Fixture ranges: A1 210–219, A2 220–229, A3 230–239, A4 240–249, A5 250�
 - [ ] Verify granule-min address release
 
 Deferred: aggregate-place identity (design review first), buddy allocator, seed-API adapter mismatch, public holdout, browser matrix.
+
+### PAUSE — user, 2026-11-12: "let's pause all new work after finishing this one"
+Read as: the four verifiers already running finish; nothing new is spawned or resumed, no send-backs, no merges, no gate runs until the user says so. The user also declined the integration gate run on main.
+- On main (verified, unpushed): A6 (cf80163), A6b (7979702), A1 (1362e12). Main's compiler binaries are stale (built at b1bcca4).
+- OWED before anything else lands: one integration gate run on main at 1362e12 (the three changes were each verified alone, never together). Script: session scratchpad `baseline/run-gates.sh <repo> <out>`; expected `copy_alias` + `lost_write` passing in round1-open, known gaps 5/6.
+- Verifiers still running at the pause: A4 round 3 (branch worktree-agent-a0a61a0aaa5ae144a, e2245df), A2 round 2 (worktree-agent-afbe5ab2cda06b284, 96b89e3), A5 round 2 (worktree-agent-af471d6991ec28a6b, a420032). Their verdicts get recorded here; a pass is NOT merged during the pause.
+- Not started: A1b (recover A1's +527/+596 B; brief not yet written, base would be 1362e12 with `briefs/COMMON-v2.md`), A1c, A2b (link-time lean runtime variants), A3 (after A2), A5b, A6c, A7 (after A4), A8, then Wave B.
+- Briefs and evidence live in the session scratchpad (`briefs/`, `a*/`, `verify-*/`), a temporary location that is not backed up.
