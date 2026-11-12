@@ -1,0 +1,29 @@
+{
+  "scope": "verifier sources preserved byte-for-byte; native expectations regenerated independently",
+  "cases": [
+    {
+      "name": "large_enum_copy",
+      "original": "verify-a1/prebug/big_enum_copy.rs",
+      "sha256": "73544cc3d71489442c7ff8e612b0fd29690ef50dcedb51452d7be9806a3acf07",
+      "classification": "open safe-Rust regression; not an expected wrong-answer test"
+    },
+    {
+      "name": "array_rest_write",
+      "original": "verify-a1/prebug/array_rest_pattern.rs",
+      "sha256": "21ab84143593628089ed646eb9bbc430c561e19f08c8cbf51f09c755bd29a577",
+      "classification": "open safe-Rust regression; not an expected wrong-answer test"
+    },
+    {
+      "name": "static_projection_cycle",
+      "original": "verify-a6/src/in_first.rs",
+      "sha256": "349d8e5289997be8897a6a32bd038d39c50e162b0a55c132a142b4a67094ba25",
+      "classification": "open safe-Rust regression; not an expected wrong-answer test"
+    },
+    {
+      "name": "static_proto_field",
+      "original": "verify-a6/src/pre_proto_nc.rs",
+      "sha256": "4494e61d82e363632ac5a5567dce307044310a6a10f53aec74ee6c38771ecafc",
+      "classification": "open safe-Rust regression; not an expected wrong-answer test"
+    }
+  ]
+}
