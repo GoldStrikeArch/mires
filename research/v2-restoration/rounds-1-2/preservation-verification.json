@@ -38,5 +38,11 @@
     "Caches, native executables, object files and sysroot products are excluded and must be rebuilt.",
     "The SQLite store and project transcripts contain private material; keep them out of public Git.",
     "Same-device duplicate is not disaster recovery."
-  ]
+  ],
+  "opaqueBinarySupplement": {
+    "files": 16735,
+    "archiveBytes": 17962236,
+    "sha256": "dfc366cee67fcddcdb12b7b8d44b088577535b396defbe44207ce1f7c7bd1c10",
+    "allMembersVerified": true
+  }
 }

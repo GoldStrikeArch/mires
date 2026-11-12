@@ -1,5 +1,10 @@
 # Current verdict — selected round-1 main promotion
 
+## Current consolidation — 2026-11-12
+
+The combined Round 2 main compiler has now been rebuilt and checked: 1,077 Rust tests, 160/160 release fixtures, 75/75 runtime checks and 13/13 chunk cases pass. Cleanup transport/admission and 60/60 active-poll cases pass. Known gaps remain 5/6, Round 1 open cases 2/5, and the preserved Round 2 counterexamples remain incorrect. No unfinished compiler branch was promoted. See [the cleanup handoff](WORKTREE-CLEANUP-HANDOFF.md) and [the fresh verification receipt](docs/round2-consolidation-verification.json). Earlier sections below are historical scoped promotion evidence, not a declaration that every later regression passes.
+
+
 Date: 2026-11-11. **Working standalone development compiler; not production-qualified, not exact October dev13, and not R1.**
 
 The current source combines the restored v2 architecture with selected round-1 wins and two freshly checked narrow correctness repairs. The full integration branch was deliberately not merged: its 3b cleanup-edge pass and pending no-throw extensions remain out until their proof gate and representation assumptions are repaired. Release cleanup stays on.

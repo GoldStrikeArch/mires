@@ -262,3 +262,16 @@ Read as: the four verifiers already running finish; nothing new is spawned or re
 - Verifiers still running at the pause: A4 round 3 (branch worktree-agent-a0a61a0aaa5ae144a, e2245df), A2 round 2 (worktree-agent-afbe5ab2cda06b284, 96b89e3), A5 round 2 (worktree-agent-af471d6991ec28a6b, a420032). Their verdicts get recorded here; a pass is NOT merged during the pause.
 - Not started: A1b (recover A1's +527/+596 B; brief not yet written, base would be 1362e12 with `briefs/COMMON-v2.md`), A1c, A2b (link-time lean runtime variants), A3 (after A2), A5b, A6c, A7 (after A4), A8, then Wave B.
 - Briefs and evidence live in the session scratchpad (`briefs/`, `a*/`, `verify-*/`), a temporary location that is not backed up.
+
+
+## Preservation and consolidation — 2026-11-12 (current user request)
+
+- [x] Inventory all worktree heads, dirty changes, untracked sources and scratch evidence.
+- [x] Preserve committed and unfinished work independently of `.claude/worktrees`, with hashes and restoration instructions; keep private/raw evidence out of public Git.
+- [x] Bring public reports, representative regressions, generators and reproducible verification entry points into the main tree.
+- [x] Run the combined-main verification; commit verified preservation/test/documentation changes, not unverified compiler branches.
+- [x] Verify restoration from preserved data, commit locally, and leave all worktrees/stash intact. No push.
+
+Verification: combined source at 1b582b8 rebuilt on main; 1,077 Rust tests, 75 runtime tests, 160/160 release fixtures, 13/13 chunks, 60/60 active-poll cleanup, transport/admission, extern and standalone passed. A1 package-mode subset 5/5. Strict open inventories remain known-gaps 5/6, round1-open 2/5 in both modes, round2-open 0/4 in each mode. No failing expected output was replaced.
+
+Preservation: 43 source trees and all reconstruction patches verified; nine uncommitted source snapshots retained on archive refs; 812,662 raw file records and 146,007 unique contents checked, plus project sessions and opaque binary-fixture supplement. See WORKTREE-CLEANUP-HANDOFF.md. A2/A4/A5 and withheld optimization candidates are preserved, NOT promoted. No worktree/stash deletion and no push.

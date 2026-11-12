@@ -8,6 +8,10 @@ This is a working development reconstruction based on the coherent September 7 v
 
 Selected round-1 wins are integrated locally; cleanup remains enabled. See [the comprehensive promotion and remaining-work report](round_1_integration_report.md) and [verification receipt](docs/round1-promotion-verification.json). The audited cleanup-edge-removal pass and failed/unverified size candidates are intentionally held back. Known correctness failures remain visible; this is not production admission.
 
+## Preserved restoration work
+
+The source, pending patches and verifier programs from both restoration rounds are preserved in [the research archive](research/v2-restoration/rounds-1-2/README.md). Read [WORKTREE-CLEANUP-HANDOFF.md](WORKTREE-CLEANUP-HANDOFF.md) before removing old worktrees. It distinguishes public reconstruction patches from private raw evidence and records the fresh combined-main checks.
+
 ## Compile and run Rust
 
 macOS/Linux, Rustup and Node.js 24+ are required. `rust-toolchain.toml` pins the backend's nightly and rustc development components. Application build scripts can remain on stable Rust.
