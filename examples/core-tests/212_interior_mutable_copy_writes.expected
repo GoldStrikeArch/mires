@@ -1,0 +1,44 @@
+parameters
+5007
+slice element
+21
+21
+static element
+11
+11
+local
+6
+tuple field
+40
+40
+replace
+5005007
+loop
+505152
+whole struct
+35701
+35701
+refcell
+5007
+atomic
+5007
+unsafecell get
+5007
+unsafecell raw_get
+31
+31
+as_ptr
+5007
+drop
+35701003
+35701003
+read back
+99005007
+only read
+4033
+from_mut
+357
+357
+sources
+357
+357

@@ -2398,6 +2398,347 @@ fn struct_aggregates_fields_and_copies() {
     );
 }
 
+/// Lowers `func` with the real fusion plan, returning the plan and the printed function. `deps`
+/// are the callees it may name.
+fn planned(interns: &Interns, func: &Func, deps: &[&str]) -> (Plan, String) {
+    let plan = super::super::fuse::plan(func, None, &interns.types, interns, &Opts::default());
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(interns, "f", deps, &body, func, &plan, straight(func));
+    (plan, js)
+}
+
+#[test]
+fn a_copy_written_and_never_read_again_keeps_the_write() {
+    let interns = world();
+    // `fn f(p: &Point) -> i32 { let mut q = *p; q.x = 5; p.x }`: the copy's one use is the write.
+    // Spelled inline, its clone `{ x: $v1.x, y: $v1.y }` folded under the field write to
+    // `$v1.x = 5`, which is the caller's point.
+    let mut b = FuncBuilder::new(item(1), signature(vec![REF_POINT], I32));
+    let p = b.param(REF_POINT, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let deref = b.op(e, OpKind::Deref(p), POINT, NO_ORIGIN);
+    let q = b.op(e, OpKind::Copy(deref), POINT, NO_ORIGIN);
+    let five = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 5, bytes: 4 }),
+        I32,
+        NO_ORIGIN,
+    );
+    b.effect(
+        e,
+        OpKind::SetField {
+            base: q,
+            variant: None,
+            field: 0,
+            v: five,
+        },
+        NO_ORIGIN,
+    );
+    let again = b.op(e, OpKind::Deref(p), POINT, NO_ORIGIN);
+    let x = b.op(
+        e,
+        OpKind::Field {
+            base: again,
+            variant: None,
+            field: 0,
+        },
+        I32,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(x)));
+    let func = b.finish();
+    let (plan, js) = planned(&interns, &func, &[]);
+    assert!(!plan.inline.contains(&q));
+    assert_eq!(
+        js,
+        "function f($v0) {\n  let $v1, $v2;\n  $v1 = $v0;\n  $v2 = { x: $v1.x, y: $v1.y };\n  $v2.x = 5;\n  return $v0.x;\n}\n"
+    );
+}
+
+#[test]
+fn an_aggregate_written_and_never_read_again_keeps_its_operands() {
+    let interns = world();
+    // `fn f(a: i32, c: i32) -> i32 { let mut q = Point { x: a, y: c }; q.x = 5; a }`: inline, the
+    // literal's field folded under the write to its operand, and the write became `a = 5`.
+    let mut b = FuncBuilder::new(item(1), signature(vec![I32, I32], I32));
+    let a = b.param(I32, NO_ORIGIN);
+    let c = b.param(I32, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let q = b.op(
+        e,
+        OpKind::Aggregate {
+            ty: POINT,
+            variant: 0,
+            active_field: None,
+            fields: vec![a, c],
+        },
+        POINT,
+        NO_ORIGIN,
+    );
+    let five = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 5, bytes: 4 }),
+        I32,
+        NO_ORIGIN,
+    );
+    b.effect(
+        e,
+        OpKind::SetField {
+            base: q,
+            variant: None,
+            field: 0,
+            v: five,
+        },
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(a)));
+    let func = b.finish();
+    let (plan, js) = planned(&interns, &func, &[]);
+    assert!(!plan.inline.contains(&q));
+    assert_eq!(
+        js,
+        "function f($v0, $v1) {\n  let $v2;\n  $v2 = { x: $v0, y: $v1 };\n  $v2.x = 5;\n  return $v0;\n}\n"
+    );
+}
+
+#[test]
+fn a_view_into_a_copy_is_rooted_at_the_copy() {
+    let interns = world();
+    // `fn f(p: &Point) -> i32 { let mut q = *p; *(&mut q.x) = 5; p.x }`: the view designates the
+    // copy's storage, so the copy is declared and the store lands in it.
+    let mut b = FuncBuilder::new(item(1), signature(vec![REF_POINT], I32));
+    let p = b.param(REF_POINT, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let deref = b.op(e, OpKind::Deref(p), POINT, NO_ORIGIN);
+    let q = b.op(e, OpKind::Copy(deref), POINT, NO_ORIGIN);
+    let view = b.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(q),
+            path: vec![Proj::Field { field: 0, ty: I32 }],
+            mutable: true,
+        },
+        REF_I32,
+        NO_ORIGIN,
+    );
+    let five = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 5, bytes: 4 }),
+        I32,
+        NO_ORIGIN,
+    );
+    b.effect(e, OpKind::StoreThrough { ptr: view, v: five }, NO_ORIGIN);
+    let again = b.op(e, OpKind::Deref(p), POINT, NO_ORIGIN);
+    let x = b.op(
+        e,
+        OpKind::Field {
+            base: again,
+            variant: None,
+            field: 0,
+        },
+        I32,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(x)));
+    let func = b.finish();
+    let (plan, js) = planned(&interns, &func, &[]);
+    assert!(!plan.inline.contains(&q));
+    assert_eq!(
+        js,
+        "function f($v0) {\n  let $v1, $v2;\n  $v1 = $v0;\n  $v2 = { x: $v1.x, y: $v1.y };\n  $v2.x = 5;\n  return $v0.x;\n}\n"
+    );
+}
+
+/// `f(a, c)`'s literal `Point { x: a, y: c }` and the constant `5`, the value and the store the
+/// tests below write into it.
+fn point_and_five(b: &mut FuncBuilder, a: ValueId, c: ValueId) -> (ValueId, ValueId) {
+    let e = FuncBuilder::ENTRY;
+    let q = b.op(
+        e,
+        OpKind::Aggregate {
+            ty: POINT,
+            variant: 0,
+            active_field: None,
+            fields: vec![a, c],
+        },
+        POINT,
+        NO_ORIGIN,
+    );
+    let five = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 5, bytes: 4 }),
+        I32,
+        NO_ORIGIN,
+    );
+    (q, five)
+}
+
+#[test]
+fn a_shared_view_into_an_aggregate_is_rooted_at_the_aggregate() {
+    let mut interns = world();
+    let put = interns.intern_str("put");
+    // `fn f(a: i32, c: i32) -> i32 { let q = C { x: Cell::new(a), y: c }; q.x.set(5); a }` with
+    // the `Cell` peeled to its `i32`: `put` (`Cell::set`) writes through the SHARED reference it
+    // is handed, so the reference designates storage like a mutable one. Spelled inline, it was a
+    // slot into the literal with no container of its own, and the lowering declined the item.
+    let mut b = FuncBuilder::new(item(1), signature(vec![I32, I32], I32));
+    let a = b.param(I32, NO_ORIGIN);
+    let c = b.param(I32, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let (q, five) = point_and_five(&mut b, a, c);
+    let view = b.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(q),
+            path: vec![Proj::Field { field: 0, ty: I32 }],
+            mutable: false,
+        },
+        REF_I32,
+        NO_ORIGIN,
+    );
+    b.effect(e, call_op(put, vec![view, five]), NO_ORIGIN);
+    b.terminate(e, RTerm::Return(Some(a)));
+    let func = b.finish();
+    let (plan, js) = planned(&interns, &func, &["put"]);
+    assert!(!plan.inline.contains(&q));
+    assert_eq!(
+        js,
+        "function f($v0, $v1) {\n  let $v2;\n  $v2 = { x: $v0, y: $v1 };\n  put({ buf: $v2, off: \"x\" }, 5);\n  return $v0;\n}\n"
+    );
+}
+
+#[test]
+fn a_raw_view_into_an_aggregate_is_rooted_at_the_aggregate() {
+    let interns = world();
+    // `fn f(a: i32, c: i32) -> i32 { let q = U { x: UnsafeCell::new(a), y: c };
+    // *UnsafeCell::raw_get(&raw const q.x) = 5; a }` once `raw_get` is inlined: a `*const` view
+    // of the field, stored through. Spelled inline, the store's place folded through the literal
+    // to the literal's operand and wrote the parameter, `$v0 = 5`.
+    let mut b = FuncBuilder::new(item(1), signature(vec![I32, I32], I32));
+    let a = b.param(I32, NO_ORIGIN);
+    let c = b.param(I32, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let (q, five) = point_and_five(&mut b, a, c);
+    let raw = b.op(
+        e,
+        OpKind::RawView {
+            root: Root::Value(q),
+            path: vec![Proj::Field { field: 0, ty: I32 }],
+            mutable: false,
+        },
+        RAW_I32,
+        NO_ORIGIN,
+    );
+    b.effect(e, OpKind::StoreThrough { ptr: raw, v: five }, NO_ORIGIN);
+    b.terminate(e, RTerm::Return(Some(a)));
+    let func = b.finish();
+    let (plan, js) = planned(&interns, &func, &[]);
+    assert!(!plan.inline.contains(&q));
+    assert_eq!(
+        js,
+        "function f($v0, $v1) {\n  let $v2;\n  $v2 = { x: $v0, y: $v1 };\n  $v2.x = 5;\n  return $v0;\n}\n"
+    );
+}
+
+#[test]
+fn a_variant_set_on_an_aggregate_is_set_on_the_aggregate() {
+    let interns = world();
+    // `fn f(a: i32, c: i32) -> i32 { let mut q = Shape::Pair(a, c); <q's variant := Num>; a }`:
+    // the `SetDiscriminant` is the literal's one use. Spelled inline, the tag write folded
+    // through the literal to its `TAG` entry and assigned to a string.
+    let mut b = FuncBuilder::new(item(1), signature(vec![I32, I32], I32));
+    let a = b.param(I32, NO_ORIGIN);
+    let c = b.param(I32, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let q = b.op(
+        e,
+        OpKind::Aggregate {
+            ty: SHAPE,
+            variant: 2,
+            active_field: None,
+            fields: vec![a, c],
+        },
+        SHAPE,
+        NO_ORIGIN,
+    );
+    b.effect(
+        e,
+        OpKind::SetDiscriminant {
+            base: q,
+            variant: 1,
+        },
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(a)));
+    let func = b.finish();
+    let (plan, js) = planned(&interns, &func, &[]);
+    assert!(!plan.inline.contains(&q));
+    assert_eq!(
+        js,
+        "function f($v0, $v1) {\n  let $v2;\n  $v2 = { TAG: \"Pair\", _0: $v0, _1: $v1 };\n  $v2.TAG = \"Num\";\n  return $v0;\n}\n"
+    );
+}
+
+/// The positive controls: what is only read, or only reached through a pointer it holds, is still
+/// spelled inline.
+#[test]
+fn a_copy_read_or_dereferenced_is_still_spelled_inline() {
+    let interns = world();
+    // `fn f(p: &Point) -> i32 { let q = *p; q.x }`: the copy is read, so its clone is spelled at
+    // the read and the field read folds through it.
+    let mut b = FuncBuilder::new(item(1), signature(vec![REF_POINT], I32));
+    let p = b.param(REF_POINT, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let deref = b.op(e, OpKind::Deref(p), POINT, NO_ORIGIN);
+    let q = b.op(e, OpKind::Copy(deref), POINT, NO_ORIGIN);
+    let x = b.op(
+        e,
+        OpKind::Field {
+            base: q,
+            variant: None,
+            field: 0,
+        },
+        I32,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(x)));
+    let func = b.finish();
+    let (plan, js) = planned(&interns, &func, &[]);
+    assert!(plan.inline.contains(&q));
+    assert_eq!(
+        js,
+        "function f($v0) {\n  let $v1;\n  $v1 = $v0;\n  return $v1.x;\n}\n"
+    );
+
+    // `fn f(p: &mut Point) { let r = p; (*r).x = 5 }`: the view dereferences the copied
+    // reference before it reaches storage, so it designates the pointee, not the copy.
+    let mut b = FuncBuilder::new(item(1), signature(vec![REF_POINT], UNIT));
+    let p = b.param(REF_POINT, NO_ORIGIN);
+    let r = b.op(e, OpKind::Copy(p), REF_POINT, NO_ORIGIN);
+    let view = b.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(r),
+            path: vec![Proj::Deref, Proj::Field { field: 0, ty: I32 }],
+            mutable: true,
+        },
+        REF_I32,
+        NO_ORIGIN,
+    );
+    let five = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 5, bytes: 4 }),
+        I32,
+        NO_ORIGIN,
+    );
+    b.effect(e, OpKind::StoreThrough { ptr: view, v: five }, NO_ORIGIN);
+    b.terminate(e, RTerm::Return(None));
+    let func = b.finish();
+    let (plan, js) = planned(&interns, &func, &[]);
+    assert!(plan.inline.contains(&r));
+    assert_eq!(js, "function f($v0) {\n  $v0.x = 5;\n}\n");
+}
+
 #[test]
 fn set_field_and_write_through_a_reference() {
     let interns = world();
@@ -4786,7 +5127,7 @@ fn a_raw_view_boxes_a_held_object_until_a_step_reaches_storage() {
     );
     assert_eq!(
         js,
-        "function f($v0, $v1) {\n  same(__rt.box($v0.w), __rt.box($v0.s));\n  same({ buf: $v0.h, off: \"p\" }, { buf: $v0.xs, off: $v1 });\n  same({ buf: $v0.s, off: \"_0\" }, __rt.box($v0.pt));\n}\n"
+        "function f($v0, $v1) {\n  let $v12;\n  same(__rt.box($v0.w), __rt.box($v0.s));\n  same({ buf: $v0.h, off: \"p\" }, { buf: $v0.xs, off: $v1 });\n  $v12 = $v0.pt;\n  same({ buf: $v0.s, off: \"_0\" }, __rt.box($v12));\n}\n"
     );
 }
 

@@ -1,0 +1,58 @@
+moved copy
+303
+303
+to a callee
+3
+3
+shared to a callee
+28
+21
+raw pointer
+3
+3
+ptr::write
+3
+3
+swap
+3003
+3003
+copy_from_slice
+4
+4
+iter_mut
+10
+10
+fill
+5
+5
+subslice
+5
+5
+closure
+3
+3
+moving closure
+102
+struct update
+3004
+3004
+reborrow
+4
+4
+transparent aggregate
+9
+9
+transparent scalar
+12099
+12099
+transparent drop
+5095
+6098
+niche option
+100777
+10
+totals
+357
+357
+15
+21

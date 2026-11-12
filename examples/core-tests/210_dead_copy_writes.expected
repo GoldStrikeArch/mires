@@ -1,0 +1,31 @@
+static
+276
+4
+276
+local array
+3
+slice parameter
+10
+10
+40
+40
+constant slice
+3
+9
+nested field
+11
+7
+reference field
+10
+tuple struct
+14
+struct field
+22
+option payload
+19
+reference taken later
+3
+loop
+9
+aggregate
+12

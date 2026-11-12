@@ -1,0 +1,67 @@
+constant
+11099
+constant slice
+48
+promoted
+41
+41
+promoted array
+45
+45
+local array
+56
+box
+61
+box by reference
+67
+67
+box field
+64
+vec
+73
+nested field
+11
+11
+nested whole
+1112
+1112
+nested copied out
+1111
+array in tuple struct
+907
+907
+array of structs
+306
+306
+new variant
+20231077
+new variant, dead
+2023
+2023
+new variant through a reference
+20233089
+payload
+30453095
+30453095
+payload in a tuple
+3045
+3045
+option take
+31033
+31033
+option replace
+31
+31
+option insert
+5100
+option get_or_insert
+5007
+option as_mut
+31
+31
+sources
+357
+357
+5068
+1109
+31

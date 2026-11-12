@@ -775,6 +775,9 @@ impl<'a> Planner<'a> {
         let Some(op) = block.ops.get(use_.position) else {
             return false;
         };
+        if uses_as_storage(&op.kind, value) {
+            return true;
+        }
         // Zero-sized expressions erase their operands from the final spelling. Keep those
         // operands at their definitions, where calls and other effects still execute.
         if op
@@ -1592,6 +1595,41 @@ fn cells_touched(kind: &OpKind) -> Vec<CellId> {
             ..
         } => vec![*cell],
         _ => Vec::new(),
+    }
+}
+
+/// Whether `kind` uses `value` as storage rather than only reading it: it writes a field or the
+/// variant of `value` in place (`SetField`/`SetDiscriminant` with `value` as `base`), or it takes
+/// a view of a place inside `value` itself (a `BorrowView`/`RawView` rooted at `value` whose path
+/// never dereferences), through which a later store, or a callee handed the view, may write.
+///
+/// Such a use needs `value` declared. Inlining substitutes a value's defining expression for its
+/// name, which is sound for a read: the expression evaluates to the value. A write lands in
+/// whatever the spelled expression designates instead, and an inline value has no storage of its
+/// own to designate. The expression of a `Copy` that clones is a fresh `{ x: s.x, y: s.y }`, which
+/// `jsast::member`'s read-only fold turns into the source's own field (`s.x = 99`); a `Copy` that
+/// does not clone, or an `Aggregate`, spells the very names and places it was built from, so the
+/// write overwrites one of them (`n = 99`, `table[i] = 99`).
+///
+/// A view counts whatever its mutability. A shared reference writes through interior mutability
+/// (`Cell::set`, `RefCell::borrow_mut`, an atomic store, `UnsafeCell::get`), and a raw pointer is
+/// written once it is cast to `*mut` (`UnsafeCell::raw_get`). Whether the place holds an
+/// `UnsafeCell` is not a fact the type table records, and after MIR inlining the write is a store
+/// in this very body (`let q = C { a: Cell::new(n), b: m }; q.a.set(99)` wrote `n = 99`).
+fn uses_as_storage(kind: &OpKind, value: ValueId) -> bool {
+    match kind {
+        OpKind::SetField { base, .. } | OpKind::SetDiscriminant { base, .. } => *base == value,
+        OpKind::BorrowView {
+            root: Root::Value(root),
+            path,
+            ..
+        }
+        | OpKind::RawView {
+            root: Root::Value(root),
+            path,
+            ..
+        } => *root == value && !path.iter().any(|proj| matches!(proj, Proj::Deref)),
+        _ => false,
     }
 }
 

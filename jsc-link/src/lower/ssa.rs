@@ -1393,6 +1393,23 @@ impl<'a> Builder<'a> {
         }
         // A single field write on a value: `SetField` on the reaching value's storage.
         let value_root = matches!(self.kinds[place.local.0 as usize], LocalKind::Value);
+        // That storage is the local's own only when its copies are values of their own. A copy of
+        // a type that does not `needs_clone` is the source value itself (`operand`), so after
+        // `let mut b = a` both locals reach one value, and writing `b`'s transparent field in
+        // place would rebind `a` too. Such a local is given a value of its own first; a write
+        // through a `Deref` lands in the pointee, not here.
+        let local_ty = self.local_ty(place.local);
+        if value_root
+            && !self.table.needs_clone(local_ty)
+            && !place
+                .projection
+                .iter()
+                .any(|projection| matches!(projection, Projection::Deref))
+        {
+            let shared = self.read_local(place.local);
+            let own = self.op(OpKind::Copy(shared), local_ty);
+            self.write_bare_local(place.local, own);
+        }
         let (downcast, field) = single_field(&place.projection);
         if let (true, Some(field)) = (value_root, field) {
             let base = self.read_local(place.local);
@@ -3078,6 +3095,7 @@ mod tests {
     const REF_POINT: TypeId = TypeId(11);
     const REF_I32: TypeId = TypeId(12);
     const REF_SLICE: TypeId = TypeId(13);
+    const WRAP: TypeId = TypeId(14);
 
     fn descriptor(id: TypeId, kind: TypeKind, size: u64) -> TypeDescriptor {
         TypeDescriptor {
@@ -3154,7 +3172,8 @@ mod tests {
     }
 
     /// `()`, `bool`, `i32`, `usize`, `Option<i32>`, `Point { x, y }`, `[i32; 4]`, `[i32]`,
-    /// `&mut Point`, `&mut i32`, `&mut [i32]`. `with_refs` leaves the reference types out.
+    /// `Wrap(i32)` (`repr(transparent)`), `&mut Point`, `&mut i32`, `&mut [i32]`. `with_refs`
+    /// leaves the reference types out.
     fn world(with_refs: bool) -> Interns {
         let mut interns = Interns::new();
         let def = |n: u64| crate::jir::semantic::DefinitionId {
@@ -3240,6 +3259,25 @@ mod tests {
         slice.layout.zst = false;
         slice.js.is_indirect = true;
         interns.intern_type(slice);
+        let wrap = interns.intern_str("Wrap");
+        let mut wrap_ty = descriptor(
+            WRAP,
+            TypeKind::Adt {
+                def: def(12),
+                args: Vec::new(),
+                form: NominalForm::Struct,
+                variants: vec![{
+                    let mut v = variant(wrap, vec![(FieldKey::Transparent, I32)], 0);
+                    v.physical_tag = None;
+                    v
+                }],
+                niche: None,
+            },
+            4,
+        );
+        wrap_ty.js.transparent = Some(TransparentField { field: 0, ty: I32 });
+        wrap_ty.js.peeled = I32;
+        interns.intern_type(wrap_ty);
         if with_refs {
             interns.intern_type(reference(REF_POINT, POINT, PointerForm::Thin));
             interns.intern_type(reference(REF_I32, I32, PointerForm::Slot));
@@ -3724,6 +3762,47 @@ mod tests {
             .iter()
             .any(|op| matches!(op.kind, OpKind::SetField { .. })));
         assert!(func.cells.is_empty());
+    }
+
+    /// `fn f(a: Wrap) -> i32 { let mut b = a; b.0 = 99; a.0 }`, `Wrap` a transparent `i32`.
+    fn transparent_write_body() -> Body {
+        let inner = Projection::Field { field: 0, ty: I32 };
+        let locals = vec![
+            local(0, LocalRole::Return, I32),
+            local(1, LocalRole::Argument, WRAP),
+            local(2, LocalRole::Temporary, WRAP),
+        ];
+        let entry = block(
+            vec![
+                assign(place(2, vec![], WRAP), Rvalue::Use(copy(1, WRAP))),
+                assign(place(2, vec![inner], I32), Rvalue::Use(i32_const(99))),
+                assign(
+                    place(0, vec![], I32),
+                    Rvalue::Use(copy_place(place(1, vec![inner], I32))),
+                ),
+            ],
+            Terminator::Return,
+        );
+        body(signature(vec![WRAP], I32), locals, vec![entry])
+    }
+
+    #[test]
+    fn a_write_into_a_copy_that_shares_its_source_value_writes_a_value_of_its_own() {
+        // A copy of a type that does not `needs_clone` is the source value itself, so `b` and
+        // `a` reach one value; the write into `b.0` must not land in it, or `a.0` reads 99.
+        let interns = world(true);
+        let (func, _) = check(&interns, &transparent_write_body());
+        let a = func.params[0];
+        let written: Vec<ValueId> = func.blocks[0]
+            .ops
+            .iter()
+            .filter_map(|op| match op.kind {
+                OpKind::SetField { base, .. } => Some(base),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(written.len(), 1);
+        assert_ne!(written[0], a);
     }
 
     /// `fn f(s: &[i32], i: usize) -> i32 { s[i] }` with the bounds check.
