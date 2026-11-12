@@ -1,0 +1,21 @@
+--- a/backend/src/uses.rs
++++ b/backend/src/uses.rs
+@@ -287,6 +287,18 @@ impl<'tcx> Visitor<'tcx> for Collector<'tcx> {
+                 slot.bare_borrowed = true;
+             }
+         }
++        // A borrow *into* the local -- `&_5.x` -- borrows it too, which is what
++        // [`LocalUse::borrowed`] says. rustc's `super_place` hands `visit_local` a `Projection`
++        // context for that place, so the borrow is recorded here, where its context still is one.
++        // Through a `Deref` the place is somewhere else and the local is only read.
++        if is_borrow(context)
++            && !matches!(place.projection.first(), Some(PlaceElem::Deref))
++            && !self.dropped.contains(&location)
++        {
++            if let Some(slot) = self.locals.get_mut(place.local.as_usize()) {
++                slot.borrowed = true;
++            }
++        }
+         let outer = self.through_deref;
+         self.through_deref = matches!(place.projection.first(), Some(PlaceElem::Deref));
+         self.super_place(place, context, location);

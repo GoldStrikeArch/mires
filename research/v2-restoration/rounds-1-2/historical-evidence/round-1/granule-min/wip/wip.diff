@@ -1,0 +1,388 @@
+diff --git a/CONTRACT.md b/CONTRACT.md
+index 94772eb..f276019 100644
+--- a/CONTRACT.md
++++ b/CONTRACT.md
+@@ -891,6 +891,15 @@ once, a million live 4 KiB buffers — and that is a refusal that says so. (Base
+ and were never reused: the 2^20th buffer was given the address 2^32, which `>>> 0` made null, and
+ `NonNull::new` reported a good allocation as failed.)
+ 
++A buffer larger than 4096 bytes is a known limit of this scheme: it still takes a 4096-byte
++granule, so only its first 4096 bytes of address space are its own. Its base is unique among live
++buffers and stable, like every base, but the synthetic address of an element more than 4096 bytes
++into it lies past its granule, where it can coincide with an address in another live buffer's
++range or in a granule handed out later. Only comparisons between such addresses are affected —
++an equality, an ordering or a difference of the integers, and so the ordering of two raw pointers
++into different buffers, which compares their addresses — never `ptr::eq`, which compares buffer
++and offset, nor a dereference. The limit is not fixed yet.
++
+ The size does not always survive to the call. `<*const T>::addr` is written
+ `transmute(self.cast::<()>())`, so the pointee is `()` by the time the address is taken while the
+ offset is still counted in `T`s — which is why the erasing cast (`__rt.erase`) records the element
+diff --git a/jsc-link/src/lower/js/adapters.rs b/jsc-link/src/lower/js/adapters.rs
+index 1a7c463..c1e2da3 100644
+--- a/jsc-link/src/lower/js/adapters.rs
++++ b/jsc-link/src/lower/js/adapters.rs
+@@ -12,8 +12,9 @@
+ //! The baseline block is reached through the type table, never through guessed field names: the
+ //! resolver walks the recorded `String` → `Vec<u8>` → raw-parts structure to the `{ buf, off }`
+ //! pointer leaf, the length, and the capacity, and declines any shape it does not recognize. The
+-//! byte-level marshalling itself is the existing shim's: `__rt.bytes_str` decodes a block's UTF-8
+-//! bytes, and `__rt.convert_str_block` / `__rt.convert_sb_block` encode a fresh, unshared block —
++//! byte-level marshalling itself is the existing shim's: `__rt.convert_block_str` decodes a block's
++//! UTF-8 bytes (`__rt.bytes_str`'s decode) and consumes the block, as `__rt.convert_block_nv` does
++//! for a `Vec`, and `__rt.convert_str_block` / `__rt.convert_sb_block` encode a fresh, unshared block —
+ //! fresh because `str_bytes` memoizes records that other `as_bytes` calls may alias, and an owned
+ //! baseline `String` must not share its allocation. Capacity is Rust-visible and survives every
+ //! string conversion that can carry it: a builder's `.cap` rides into the baseline cap leaf
+@@ -105,18 +106,26 @@ pub fn convert(
+     }
+ }
+ 
+-/// `__rt.bytes_str(<ptr>.buf, <ptr>.off, <len>)` over the baseline block.
++/// `__rt.convert_block_str(<ptr>.buf, <ptr>.off, <len>)` over the baseline block.
+ fn baseline_to_host(table: &TypeTable, interns: &Interns, value: Expr, ty: TypeId) -> Res<Expr> {
+     let layout = StringLayout::of(table, interns, ty)?;
+     let (value, wrap) = once(value);
+     Ok(wrap(host_text(&layout, value)))
+ }
+ 
+-/// The decoded text of a baseline `String` value.
++/// The decoded text of a baseline `String` value, which consumes the value's block.
++///
++/// Both conversions that spell it (to the host string and to the builder) leave the baseline
++/// direction, which the planner commits only for a dead, unaliased source or a value being
++/// dropped (D2's dead-source rule; `analysis/valueflow.rs` `dead_unaliased`). The block is
++/// therefore never read again, and no `dealloc` will come for it: the native carrier is dropped by
++/// the engine. So the decode goes through `__rt.convert_block_str`, which gives the block's
++/// synthetic address granule back exactly as `dealloc` would. A decode of bytes the program still
++/// owns (`str::from_utf8_unchecked`, a `&str` from raw parts) stays `__rt.bytes_str`.
+ fn host_text(layout: &StringLayout, value: Expr) -> Expr {
+     let pointer = layout.member(value.clone(), &layout.ptr);
+     jsast::rt_call(
+-        "bytes_str",
++        "convert_block_str",
+         vec![
+             jsast::member(pointer.clone(), "buf"),
+             jsast::member(pointer, "off"),
+diff --git a/jsc-link/src/lower/semantic_ops/tests.rs b/jsc-link/src/lower/semantic_ops/tests.rs
+index b37a095..486a852 100644
+--- a/jsc-link/src/lower/semantic_ops/tests.rs
++++ b/jsc-link/src/lower/semantic_ops/tests.rs
+@@ -1451,7 +1451,7 @@ mod adapters {
+     fn baseline_to_host_decodes_the_block() {
+         assert_eq!(
+             converted(jsast::id("s"), Carrier::Baseline, Carrier::HostString),
+-            "__rt.bytes_str(s.vec.buf.inner.ptr.buf, s.vec.buf.inner.ptr.off, s.vec.len)"
++            "__rt.convert_block_str(s.vec.buf.inner.ptr.buf, s.vec.buf.inner.ptr.off, s.vec.len)"
+         );
+     }
+ 
+@@ -1460,8 +1460,8 @@ mod adapters {
+         let value = jsast::call(jsast::id("g"), vec![]);
+         assert_eq!(
+             converted(value, Carrier::Baseline, Carrier::HostString),
+-            "(($cv) => __rt.bytes_str($cv.vec.buf.inner.ptr.buf, $cv.vec.buf.inner.ptr.off, \
+-             $cv.vec.len))(g())"
++            "(($cv) => __rt.convert_block_str($cv.vec.buf.inner.ptr.buf, \
++             $cv.vec.buf.inner.ptr.off, $cv.vec.len))(g())"
+         );
+     }
+ 
+@@ -1489,7 +1489,7 @@ mod adapters {
+     fn baseline_to_builder_carries_the_cap_and_len_leaves() {
+         assert_eq!(
+             converted(jsast::id("s"), Carrier::Baseline, Carrier::StringBuilder),
+-            "{ text: __rt.bytes_str(s.vec.buf.inner.ptr.buf, s.vec.buf.inner.ptr.off, \
++            "{ text: __rt.convert_block_str(s.vec.buf.inner.ptr.buf, s.vec.buf.inner.ptr.off, \
+              s.vec.len), cap: s.vec.buf.inner.cap, len: s.vec.len }"
+         );
+     }
+@@ -1499,7 +1499,7 @@ mod adapters {
+         let value = jsast::call(jsast::id("g"), vec![]);
+         assert_eq!(
+             converted(value, Carrier::Baseline, Carrier::StringBuilder),
+-            "(($cv) => ({ text: __rt.bytes_str($cv.vec.buf.inner.ptr.buf, \
++            "(($cv) => ({ text: __rt.convert_block_str($cv.vec.buf.inner.ptr.buf, \
+              $cv.vec.buf.inner.ptr.off, $cv.vec.len), cap: $cv.vec.buf.inner.cap, \
+              len: $cv.vec.len }))(g())"
+         );
+@@ -1618,6 +1618,65 @@ mod adapters {
+                 .unwrap_or_else(|decline| panic!("{from:?} -> {to:?}: {decline:?}")),
+         )
+     }
++
++    /// Which conversions consume the baseline heap block they read, and so give its synthetic
++    /// address granule back (`__rt.convert_block_nv`, `__rt.convert_block_str`), and which leave
++    /// it to its owner. Leaving the baseline for a native carrier consumes the block: the planner
++    /// commits that direction only for a dead, unaliased source or a value being dropped, and the
++    /// native carrier's drop is the engine's, so no `dealloc` ever releases the block. Every
++    /// other spelling either builds a fresh block (into the baseline), touches no heap block (the
++    /// native-to-native ones), or borrows a block that stays live and owned elsewhere (a slice
++    /// view, a boxed pointer kept as it is): those must never release.
++    #[test]
++    fn exactly_the_conversions_that_consume_a_block_release_it() {
++        const CARRIERS: [Carrier; 6] = [
++            Carrier::Baseline,
++            Carrier::HostString,
++            Carrier::StringBuilder,
++            Carrier::NativeVec,
++            Carrier::SliceView,
++            Carrier::NativeBox,
++        ];
++        const RELEASING: [&str; 2] = ["__rt.convert_block_nv(", "__rt.convert_block_str("];
++        let (table, interns) = table();
++        let mut consuming = Vec::new();
++        let mut checked = 0;
++        for ty in [STRING, VEC_U32, SLICE_REF] {
++            for from in CARRIERS {
++                for to in CARRIERS {
++                    if from == to {
++                        continue;
++                    }
++                    let Ok(expr) = convert(&table, &interns, jsast::id("v"), ty, from, to) else {
++                        continue;
++                    };
++                    let text = jsast::expr_to_string(&expr);
++                    let releases = RELEASING.iter().any(|helper| text.contains(helper));
++                    let consumes = from == Carrier::Baseline
++                        && matches!(
++                            to,
++                            Carrier::HostString | Carrier::StringBuilder | Carrier::NativeVec
++                        );
++                    assert_eq!(releases, consumes, "{from:?} -> {to:?}: {text}");
++                    // A consuming decode is never the plain read-only `bytes_str`.
++                    assert!(!(consumes && text.contains("__rt.bytes_str(")), "{text}");
++                    if consumes {
++                        consuming.push((from, to));
++                    }
++                    checked += 1;
++                }
++            }
++        }
++        assert_eq!(
++            consuming,
++            [
++                (Carrier::Baseline, Carrier::HostString),
++                (Carrier::Baseline, Carrier::StringBuilder),
++                (Carrier::Baseline, Carrier::NativeVec),
++            ]
++        );
++        assert!(checked >= 12, "only {checked} spellings were checked");
++    }
+ }
+ 
+ #[test]
+diff --git a/scripts/runtime-addr.test.mjs b/scripts/runtime-addr.test.mjs
+index a9312e3..a619d4e 100644
+--- a/scripts/runtime-addr.test.mjs
++++ b/scripts/runtime-addr.test.mjs
+@@ -8,7 +8,7 @@ import vm from 'node:vm'
+ 
+ const source = await readFile(new URL('../runtime/shim.js', import.meta.url), 'utf8')
+ function runtime(code = source) {
+-  const context = vm.createContext({})
++  const context = vm.createContext({ TextEncoder, TextDecoder, Uint8Array })
+   vm.runInContext(code, context)
+   return context.__rt
+ }
+@@ -152,3 +152,200 @@ test('the top of the space is used to its last granule, then refused; freed gran
+   rt.dealloc(a, 16, 1)
+   assert.equal(nonNull(rt, rt.alloc(16, 1)), 2 ** 32 - 32, 'a freed granule is reused even at the top')
+ })
++
++// The allocator's own state, for comparing before and after.
++const freeLists = (rt) => JSON.stringify(rt._addrFree)
++
++test('a refused bump leaves the free lists as it found them, so a retry hands out no address twice', () => {
++  const rt = runtime()
++  // A 16-byte block has just taken the first granule of the last page.
++  rt._addrNext = 2 ** 32 - 4096 + 16
++  const before = freeLists(rt)
++  for (let attempt = 0; attempt < 3; attempt++) {
++    assert.throws(() => nonNull(rt, rt.alloc(4096, 1)), /address space is exhausted/)
++    assert.equal(freeLists(rt), before, `refusal ${attempt} changed the free lists`)
++    assert.equal(rt._addrNext, 2 ** 32 - 4096 + 16, `refusal ${attempt} moved the bump pointer`)
++  }
++  // The rest of the last page is 255 granules of 16 bytes, each handed out exactly once.
++  const seen = new Set()
++  for (let i = 0; i < 255; i++) {
++    const address = nonNull(rt, rt.alloc(16, 1))
++    assert.ok(!seen.has(address), `address ${address} handed to two live blocks`)
++    assert.ok(address >= 2 ** 32 - 4096 + 16 && address < 2 ** 32, `address ${address} outside the page`)
++    seen.add(address)
++  }
++  assert.throws(() => nonNull(rt, rt.alloc(16, 1)), /address space is exhausted/)
++})
++
++test('the refused-bump retry, reached through alloc and addr alone: no live duplicate', () => {
++  const rt = runtime()
++  const live = []
++  const owner = new Set()
++  const take = (bytes) => {
++    const p = rt.alloc(bytes, 1)
++    const address = nonNull(rt, p)
++    assert.ok(!owner.has(address), `address ${address} handed to two live blocks`)
++    owner.add(address)
++    live.push(p)
++    return address
++  }
++  // Every page below the last one, kept alive. A 4096-byte block is a register call, not an
++  // array of 4096 holes: only its Layout size reaches the address space.
++  for (;;) {
++    const p = rt._register([], 4096, false)
++    const address = nonNull(rt, p)
++    live.push(p)
++    owner.add(address)
++    if (address === 2 ** 32 - 8192) break
++  }
++  take(16)
++  assert.throws(() => take(4096), /address space is exhausted/)
++  for (let i = 0; i < 255; i++) take(16)
++  assert.throws(() => take(16), /address space is exhausted/)
++  assert.ok(live.length > 2 ** 20 - 2)
++})
++
++// A baseline String's bytes as the String adapters hand them to `convert_block_str`: a registered
++// byte block of `cap` bytes, the text's UTF-8 bytes at the front.
++function stringBlock(rt, text, cap = 64) {
++  const bytes = new TextEncoder().encode(text)
++  const p = rt.alloc(Math.max(cap, bytes.length), 1)
++  bytes.forEach((byte, i) => { p.buf[i] = byte })
++  return { p, len: bytes.length }
++}
++
++test('a Vec conversion that consumes its block gives the granule back, as dealloc does', () => {
++  const rt = runtime()
++  const v = rt.alloc(100, 1)
++  v.buf[0] = 7
++  const address = nonNull(rt, v)
++  const element = rt.addr({ buf: v.buf, off: 9 }, 1)
++  const native = rt.convert_block_nv(v.buf, 0, 1, 100)
++  assert.deepEqual([native.len, native.cap, native.buf.length, native.buf[0]], [1, 100, 100, 7])
++  assert.equal(rt.addr(v, 1), address, 'a dangling pointer answers the address it had')
++  assert.equal(rt.addr({ buf: v.buf, off: 9 }, 1), element)
++  assert.equal(nonNull(rt, rt.alloc(100, 1)), address, 'the granule serves the next block of its size')
++  assert.equal(rt.addr(v, 1), address, 'and the dangling pointer still answers the same address')
++  assert.notEqual(nonNull(rt, rt.alloc(100, 1)), address, 'the granule is handed out once')
++})
++
++test('a String conversion that consumes its block decodes it and gives the granule back', () => {
++  const rt = runtime()
++  for (const text of ['', 'ascii only', 'Grüße, 世界 🦀', 'x'.repeat(5000)]) {
++    const { p, len } = stringBlock(rt, text)
++    const address = nonNull(rt, p)
++    assert.equal(rt.convert_block_str(p.buf, p.off, len), text)
++    assert.equal(rt.addr(p, 1), address, 'a dangling pointer answers the address it had')
++    const next = stringBlock(rt, 'next', Math.max(64, len))
++    assert.equal(nonNull(rt, next.p), address, `the granule of ${JSON.stringify(text.slice(0, 12))} is free again`)
++    assert.equal(rt.addr(p, 1), address)
++  }
++  // A String that never allocated: its data pointer is `NonNull::dangling()`, a bare number.
++  const dangling = 1
++  assert.equal(rt.convert_block_str(dangling.buf, dangling.off, 0), '')
++})
++
++test('a converted block whose address was never asked costs nothing: no mint, no entry', () => {
++  const rt = runtime()
++  nonNull(rt, rt.alloc(24, 1)) // something minted already, so the free lists are not empty
++  const v = rt.alloc(100, 1)
++  const s = stringBlock(rt, 'never asked')
++  const lists = freeLists(rt)
++  const next = rt._addrNext
++  rt.convert_block_nv(v.buf, 0, 0, 100)
++  rt.convert_block_str(s.p.buf, 0, s.len)
++  assert.equal(freeLists(rt), lists)
++  assert.equal(rt._addrNext, next)
++  assert.equal(rt._addrs.has(v.buf) || rt._addrs.has(s.p.buf), false)
++  assert.equal(rt._addrHeap.has(v.buf) || rt._addrHeap.has(s.p.buf), false)
++})
++
++test('a consumed block gives its granule back once, whatever releases it again', () => {
++  const rt = runtime()
++  const v = rt.alloc(48, 1)
++  const address = nonNull(rt, v)
++  rt.convert_block_nv(v.buf, 0, 0, 48)
++  rt.convert_block_nv(v.buf, 0, 0, 48)
++  rt.dealloc(v, 48, 1)
++  const a = nonNull(rt, rt.alloc(48, 1))
++  const b = nonNull(rt, rt.alloc(48, 1))
++  assert.equal(a, address)
++  assert.notEqual(b, address)
++})
++
++test('a conversion that only reads a live block keeps its granule', () => {
++  const rt = runtime()
++  // `bytes_str` decodes bytes a live String still owns (`as_str`, `from_utf8_unchecked`).
++  const s = stringBlock(rt, 'still alive')
++  const sAddress = nonNull(rt, s.p)
++  assert.equal(rt.bytes_str(s.p.buf, s.p.off, s.len), 'still alive')
++  // `convert_sv_nv` copies a slice view's window; the block behind it belongs to the Vec it
++  // borrows from.
++  const v = rt.alloc(64, 1)
++  v.buf.fill(3, 0, 8)
++  const vAddress = nonNull(rt, v)
++  const copy = rt.convert_sv_nv({ buf: v.buf, off: 2, len: 4 })
++  assert.deepEqual([copy.len, Array.from(copy.buf)], [4, [3, 3, 3, 3]])
++  for (let i = 0; i < 8; i++) {
++    const other = nonNull(rt, rt.alloc(64, 1))
++    assert.ok(other !== sAddress && other !== vAddress, `a live block's address ${other} was handed out again`)
++  }
++  assert.equal(rt.addr(s.p, 1), sAddress)
++  assert.equal(rt.addr(v, 1), vAddress)
++})
++
++test('three million rounds of allocate, ask the address, convert: no exhaustion, no live duplicate', () => {
++  const rt = runtime()
++  const window = 64
++  const live = []
++  const owner = new Set()
++  const text = new TextEncoder().encode('round')
++  for (let i = 0; i < 3_000_000; i++) {
++    // A page-sized block takes the largest granule, so a leak would exhaust the space after
++    // about 2^20 rounds; the backing array is short because only its Layout size matters here.
++    const p = rt._register(Array.from(text), 4096, false)
++    const address = nonNull(rt, p)
++    if (address === 0 || owner.has(address)) throw new Error(`round ${i}: address ${address} is null or live`)
++    owner.add(address)
++    live.push([p, address])
++    if (live.length > window) {
++      const [q, a] = live.shift()
++      owner.delete(a)
++      if (i % 2 === 0) rt.convert_block_nv(q.buf, 0, text.length, text.length)
++      else if (rt.convert_block_str(q.buf, 0, text.length) !== 'round') throw new Error(`round ${i}: decode`)
++      if (rt.addr(q, 1) !== a) throw new Error(`round ${i}: a dangling pointer changed its address`)
++    }
++  }
++  assert.ok(rt._addrNext < 2 ** 24, `the bump pointer reached ${rt._addrNext}`)
++})
++
++test('the conversions read and write nothing on user objects, whatever their field names', () => {
++  const rt = runtime()
++  // Every name the allocator and the conversions use, as the fields of a user struct.
++  const names = ['buf', 'off', 'len', 'cap', 'text', 'copy', 'k', 'base', 'gap', 'size', 'bytes',
++    'es', 'sc', 'fresh', 'zeroed', 'length', '_addrs', '_addrHeap', '_addrFree', '_addrNext']
++  const touched = []
++  const trap = (kind) => (target, key, ...rest) => {
++    touched.push(`${kind} ${String(key)}`)
++    return Reflect[kind](target, key, ...rest)
++  }
++  const user = () => new Proxy(Object.fromEntries(names.map((name, i) => [name, i + 1])), {
++    get: trap('get'), set: trap('set'), has: trap('has'), defineProperty: trap('defineProperty'),
++    deleteProperty: trap('deleteProperty'), getOwnPropertyDescriptor: trap('getOwnPropertyDescriptor'),
++    ownKeys: (target) => { touched.push('ownKeys'); return Reflect.ownKeys(target) },
++    getPrototypeOf: (target) => { touched.push('getPrototypeOf'); return Reflect.getPrototypeOf(target) },
++  })
++  // A `Vec` of four 48-byte structs, already element-typed: its elements are the objects.
++  const elements = [user(), user(), user(), user()]
++  const v = rt._register(elements.slice(), 4 * 48, false)
++  const address = nonNull(rt, v)
++  const native = rt.convert_block_nv(v.buf, 0, 4, 4)
++  // A user object handed to the release itself is only ever a key.
++  const lists = freeLists(rt)
++  rt._addr_release(user())
++  assert.equal(freeLists(rt), lists)
++  assert.deepEqual(touched, [], 'a user object was read or written')
++  assert.ok(native.buf.length === 4 && native.buf.every((element, i) => element === elements[i]))
++  assert.equal(rt.addr(v, 48), address)
++  assert.equal(nonNull(rt, rt.alloc(4 * 48, 1)), address)
++})

@@ -1,0 +1,4737 @@
+diff --git a/CONTRACT.md b/CONTRACT.md
+index 8e26a1a3d19b3f60c5ca8dd5acb13ed98c2895c9..79a11270e03fcc30355aa21fde8646030d653a9b 100644
+--- a/CONTRACT.md
++++ b/CONTRACT.md
+@@ -1089,7 +1089,9 @@ whose value is a variant name and so carries no discriminant to observe (see "En
+ a struct with a **`str` or `dyn` tail** (`Rc<str>`, `Arc<dyn Trait>`), where a slice tail is
+ [supported](#the-heap-half) because only a run of elements can be laid out after the header ·
+ `Rc::into_raw` and `Rc::from_raw`, whose `byte_sub(data_offset)` steps backwards across that
+-header · `TypeId` equality · SIMD · `f16`/`f128` · threads.
++header · a `&dyn Trait` in constant data, plain or as an `Option<&dyn Trait>` holding `Some`
++(`None` compiles; see "One decoder, two readers") · `TypeId` equality · SIMD · `f16`/`f128` ·
++threads.
+ 
+ What is **no longer** on that list, and was: `&s[a..b]` on a `str`, `contains`, `find` with a `&str`
+ pattern, `Display` and `LowerExp` for `f32`/`f64`, `{:?}` on a `char`, `escape_ascii` and
+@@ -2214,7 +2216,95 @@ mentions. The one thing that kept it mentioned was the dead store, and the dead
+   `static` the backend consumes at codegen time needs.
+ 
+ A second, independent decoder is the failure mode this arrangement exists to prevent: it would
+-agree with the first on every case anyone tested and disagree on the one nobody did.
++agree with the first on every case anyone tested and disagree on the one nobody did. The JIR
++encoder (`jir/encode.rs`, which writes every item's JIR body in every mode) and the v1 late-IR
++analysis encoder (`late_ir.rs`, run when `js-opt` is not `off`) decode constant memory into a
++`ConstTree` through the same primitives.
++
++**A tag that is a pointer.** The niche of `Option<&T>`, `Option<&str>`, `Option<&[T]>`,
++`Option<fn()>`, `Option<NonNull<T>>`, `Option<Box<T>>` and `Result<(), &str>` is the pointer the
++untagged variant holds. In a constant allocation the bytes of a pointer are only its offset into the
++allocation its provenance names, so `Some(&7)` — `7` at the start of its own allocation — has the
++bytes of `None`. `raw::variant_index` therefore never reads such a tag by its bytes: when the tag's
++bytes carry provenance it applies rustc's own rule (`InterpCx::read_discriminant`): the variant is
++the untagged one if the niche is the single value `0` and the pointer cannot be null (in bounds of
++its allocation, one past the end included, or misaligned for it), and the constant is refused at
++compile time otherwise. rustc's validator rejects a maybe-null pointer in a niche field, so the
++refusal is not reachable from a constant rustc accepts.
++
++**A pointer at a type that only holds one.** A register-sized constant (`ConstValue::Scalar`) whose
++scalar is a pointer need not have a pointer type: `Some(&x)` at `Option<&T>`, `Some(f)` at
++`Option<fn()>`, a `NonNull<T>`, a one-field struct. Such a constant is written back into a scratch
++allocation together with its provenance (`raw::scratch_alloc`) and read at its type, exactly like a
++register-sized integer at a non-primitive type, in the baseline lane and in both encoders. Only
++a constant whose type is itself a reference, raw pointer or function pointer is lowered as a
++pointer directly.
++
++**The link-time scalar decoder.** A register-sized integer constant at an enum type reaches the
++JIR lowering as bits (`Constant::Scalar`), and `jsc-link`'s `constant.rs::scalar_expr` and
++`dce.rs::scalar_variant` decode it from the type table, and so does the JIR interpreter
++(`interp/eval.rs::scalar`), through the one decoder `rcgjs-object` `jir/niche.rs` (the interpreter
++evaluates a fieldless variant and reports a variant whose payload the bits are as unsupported). The
++table records `niche_start` and the untagged variant but not `niche_variants`, which
++`niche_variant` rebuilds by rustc's rule: every variant but the untagged one takes a niche value unless rustc leaves it out as
++*absent* (uninhabited and every field a 1-ZST), so `Dead([u32; 0], Infallible)` keeps its slot;
++uninhabitedness is rustc's layout fact at any depth (`Wrap<Void>`, `(Void,)`, `[Void; 2]`, an enum
++whose variants are all dead). The subtraction wraps at the width of the niche scalar, which
++`niche_width` finds by walking the producer's niche path (`jir/types.rs::niche_facts`, a walk of
++rustc's layout) through the table without peeling anything: a struct's or union's field, a
++tuple's element, an array's element at any index, a pattern type's base (rustc's field 0), and
++for an enum the variant rustc lays out when its layout is one variant — `single_layout_variant`,
++the first variant that is not absent, which in `enum Parsed { Never((), Infallible), Char(char) }`
++is `Char`, not variant 0. When the walk cannot be followed the constant is declined (the baseline
++lane prints it) rather than decoded at a guessed width. A register-sized constant of an enum whose
++layout is one variant (`const P: Parsed = Parsed::Char('w')`) is that variant's payload. The
++payload is decoded through transparent wrappers and pattern types (`Some(NonZero(77))`).
++
++**A wide pointer into a `static`.** `static SL: &[u32] = &ARR`, `Some(&ARR)`, a struct field
++holding either: a slice is `{ buf, off, len }` over the static's own storage, so it aliases the
++static as the same slice built at run time does: an array static's buffer is its elements' array;
++a static of the element type is one element, the boxed `[value]` of a primitive static, or for an
++aggregate static its one slot's buffer, `__rt.box(S).buf`, which is what the run-time
++`slice::from_ref(&S)` and a raw pointer constant to `S` name, so `ptr::eq(SL.as_ptr(), &S)` holds
++and a whole-element store through a `&mut [T]` reaches `S` and back. The offset names the first
++element at the element's stride. A `&str` into a static (what `str::from_utf8(&BYTES)` makes) is
++the text of those bytes, read from the static's initializer, and is refused when the static can be
++written (`static mut`, interior mutability); like the `&str` the same call builds at run time it is
++a JavaScript string with no place, so `ptr::eq(TEXT.as_ptr(), BYTES.as_ptr())` is false for both
++(true natively). Emitting the pointer names the binding and reads it only for an aggregate
++static's slot (`__rt.box(S)`, as a raw pointer constant to `S` already does), so the slice depends
++on initialisation order only as a reference to `S` does. A global reference in JIR carries
++no length, so the encoder declines a wide pointer to a static and the item takes the baseline
++lane; in a body that needs semantic cleanup lowering (the release profiles) that decline is a
++compile-time refusal, which is how a `const C: &[T] = &STATIC` used in such a body fails.
++
++**A closure as a `fn` pointer** in constant data (`const F: fn(u32) -> u32 = |x| x + 7`, the same
++inside `Option`, a table or a struct, and the vtable `core::task::Waker::noop()` builds). Const
++evaluation stores it as the closure's `FnOnce` instance (its body, or the `call_once` shim of a `Fn`
++or `FnMut` closure), which takes the environment first, and a `fn` pointer is called without one;
++printed as the bare function, a call handed its first argument to the environment slot (main read
++`0` for `F(1)`, and `Some(|x| x + 7)` did not match `Some`). The constant is the wrapper the
++run-time `ClosureFnPointer` coercion builds, `($a0, ..) => shim(undefined, $a0, ..)` with one
++parameter per input of the `fn` type, in both lanes: the baseline recognizes the instance
++(`constant.rs::reified_closure_type`); the JIR encoder describes the closure's type, whose
++`fn_pointer_shim` in the type table is that same item, and the link-time lowering prints the wrapper
++for a function global it finds there. The same instance reified through the trait method
++(`<F as Fn<(u32,)>>::call`, `FnOnce::call_once`) is an `extern "rust-call"` pointer that takes the
++environment explicitly, and stays the function itself. A closure at a type that is not a `fn`
++pointer is refused. A named function in constant data is the function itself, as before.
++
++**Not decoded, refused at compile time.** A `&dyn Trait` in constant data — plain, or as an
++`Option<&dyn Trait>` that holds `Some`, whether its data pointer names a promoted value or a
++`static` — is refused ("a `&dyn ..` in a constant is a trait object, whose vtable rustc_codegen_js
++does not decode out of constant data"); an `Option<&dyn Trait>` holding `None` compiles and reads
++back as `None`.
++So are a pointer one past the end of its allocation, which names no element, and a thin pointer
++into the middle of a `static`.
++
++`examples/core-tests/240`–`249` pin every place a niche constant can live, every niche carrier,
++the absent-variant and single-variant layouts (and the run-time discriminant of the latter, 248),
++wide pointers into statics, and the trait-object refusal; `290`–`292` pin niche constants over a
++zeroed heap, one-element slices of a static, and closures as `fn` pointer constants.
+ 
+ ### The walk
+ 
+diff --git a/backend/src/constant.rs b/backend/src/constant.rs
+index 61b836a07e70e1026cee46b946c230ff45f4ce22..d9f5aace9b00333222a69caf372a215f52290b03 100644
+--- a/backend/src/constant.rs
++++ b/backend/src/constant.rs
+@@ -24,7 +24,7 @@ pub(crate) mod raw;
+ use rustc_abi::Size;
+ use rustc_hir::def_id::DefId;
+ use rustc_middle::mir::interpret::{AllocId, Allocation, GlobalAlloc, Scalar};
+-use rustc_middle::mir::{ConstOperand, ConstValue};
++use rustc_middle::mir::{ConstOperand, ConstValue, Mutability};
+ use rustc_middle::ty::layout::{LayoutCx, TyAndLayout};
+ use rustc_middle::ty::{self, Instance, ScalarInt, Ty};
+ use rustc_span::Span;
+@@ -114,6 +114,13 @@ pub(crate) fn codegen_const_value<'tcx>(
+     match value {
+         ConstValue::ZeroSized => jsast::undefined(),
+         ConstValue::Scalar(Scalar::Int(int)) => scalar_to_expr(cgu, log, int, ty, span),
++        // A pointer at a type that is not itself a pointer: `Some(&x)` at `Option<&T>`, `Some(f)`
++        // at `Option<fn()>`, a `NonNull<T>`. The pointer is only the payload; which variant it is
++        // and where it sits are the type's layout facts, so it is decoded like every other
++        // register-sized constant of a non-primitive type.
++        ConstValue::Scalar(scalar @ Scalar::Ptr(..)) if !is_builtin_pointer(ty) => {
++            scalar_in_memory(cgu, log, scalar, ty, span)
++        }
+         ConstValue::Scalar(Scalar::Ptr(pointer, _)) => {
+             // A reference to a `static`, to a function, or to a promoted value like
+             // `&Point { x: 1, y: 2 }`. A thin pointer, so there is no metadata to carry.
+@@ -179,18 +186,36 @@ fn scalar_to_expr<'tcx>(
+         ty::Float(ty::FloatTy::F32) => jsast::num(f32::from_bits(int.to_uint(size) as u32) as f64),
+         ty::Float(ty::FloatTy::F64) => jsast::num(f64::from_bits(int.to_uint(size) as u64)),
+         // Not a primitive, but small enough that const evaluation kept it in a register rather
+-        // than an allocation: `None::<&mut i32>`, a one-field newtype, a fieldless enum. The bits
+-        // are laid out exactly as they would be in memory, so they are decoded by putting them
+-        // back into a scratch allocation and reading that.
+-        _ => match raw::scratch_alloc(cgu.tcx, int, ty) {
+-            Some(alloc) => read_alloc(cgu, log, &alloc, Size::ZERO, ty, span),
+-            None => zombie(
+-                cgu,
+-                log,
+-                span,
+-                format!("constants of type `{ty}` are not supported by rustc_codegen_js"),
+-            ),
+-        },
++        // than an allocation: `None::<&mut i32>`, a one-field newtype, a fieldless enum.
++        _ => scalar_in_memory(cgu, log, Scalar::Int(int), ty, span),
++    }
++}
++
++/// Whether `ty` is a pointer in its own right, rather than a type that merely holds one.
++pub(crate) fn is_builtin_pointer(ty: Ty<'_>) -> bool {
++    matches!(ty.kind(), ty::Ref(..) | ty::RawPtr(..) | ty::FnPtr(..))
++}
++
++/// A register-sized constant of a type that is not a primitive.
++///
++/// The bits are laid out exactly as they would be in memory, so they are decoded by putting them
++/// back into a scratch allocation — a pointer with its provenance — and reading that at `ty`, by
++/// the one reader that follows the type's layout.
++fn scalar_in_memory<'tcx>(
++    cgu: &CguCx<'tcx>,
++    log: &ZombieLog,
++    scalar: Scalar,
++    ty: Ty<'tcx>,
++    span: Span,
++) -> Expr {
++    match raw::scratch_alloc(cgu.tcx, scalar, ty) {
++        Some(alloc) => read_alloc(cgu, log, &alloc, Size::ZERO, ty, span),
++        None => zombie(
++            cgu,
++            log,
++            span,
++            format!("constants of type `{ty}` are not supported by rustc_codegen_js"),
++        ),
+     }
+ }
+ 
+@@ -198,8 +223,9 @@ fn scalar_to_expr<'tcx>(
+ ///
+ /// Promoted constants (`&Point { x: 1, y: 2 }`) reach codegen as bytes plus a type; since the
+ /// JavaScript side models values, not memory, the bytes are decoded field by field back into the
+-/// value they encode. Only the shapes the spike needs are decoded: scalars, structs, tuples and
+-/// arrays. Anything else — an enum, a nested reference — becomes a zombie.
++/// value they encode: scalars, structs, tuples, arrays, closure environments, enums (by
++/// [`read_enum`], whose variant comes from the layout's tag encoding and, for a pointer niche, from
++/// the pointer's provenance) and the pointers stored inside. Anything else becomes a zombie.
+ fn read_alloc<'tcx>(
+     cgu: &CguCx<'tcx>,
+     log: &ZombieLog,
+@@ -453,7 +479,58 @@ fn pointer_expr<'tcx>(
+         })
+     };
+ 
++    // A trait object is `{ ptr, meta }`, and its `meta` is a vtable this reader does not decode
++    // out of a constant, whichever allocation the data half points into.
++    if ty
++        .builtin_deref(true)
++        .is_some_and(|pointee| matches!(pointee.kind(), ty::Dynamic(..)))
++    {
++        return zombie(
++            cgu,
++            log,
++            span,
++            format!(
++                "a `{ty}` in a constant is a trait object, whose vtable rustc_codegen_js does not \
++                 decode out of constant data"
++            ),
++        );
++    }
++
+     match tcx.global_alloc(alloc_id) {
++        // A non-capturing closure reified as a `fn` pointer: const evaluation stores what
++        // `Instance::resolve_closure(.., FnOnce)` names, the closure's own body or its `call_once`
++        // shim, and either takes the closure's environment as its first parameter, which a `fn`
++        // pointer is called without. The environment is zero sized, so the pointer is the wrapper
++        // that passes `undefined` for it, exactly as the run-time `ClosureFnPointer` coercion
++        // builds it (`rvalue.rs`). Printed bare, a call would hand its first argument to the
++        // environment slot. The same instance reified through the trait method
++        // (`<F as Fn<(u32,)>>::call`) is an `extern "rust-call"` pointer that takes the
++        // environment explicitly, and is the function itself.
++        GlobalAlloc::Function { instance, .. } if reified_closure_type(tcx, instance).is_some() => {
++            let target = jsast::id(cgu.namer.fn_name(instance).into_string());
++            match ty.kind() {
++                ty::FnPtr(..) if ty.fn_sig(tcx).abi() == rustc_abi::ExternAbi::RustCall => target,
++                ty::FnPtr(..) => {
++                    let arity = tcx
++                        .instantiate_bound_regions_with_erased(ty.fn_sig(tcx))
++                        .inputs()
++                        .len();
++                    let params: Vec<String> = (0..arity).map(|i| format!("$a{i}")).collect();
++                    let mut arguments = vec![jsast::undefined()];
++                    arguments.extend(params.iter().map(|name| jsast::id(name.clone())));
++                    jsast::arrow(params, jsast::call(target, arguments))
++                }
++                _ => zombie(
++                    cgu,
++                    log,
++                    span,
++                    format!(
++                        "a closure stored as a `{ty}`, which is not a `fn` pointer, in constant \
++                         data is not supported by rustc_codegen_js"
++                    ),
++                ),
++            }
++        }
+         // A function pointer is the emitted function itself.
+         GlobalAlloc::Function { instance, .. } => {
+             jsast::id(cgu.namer.fn_name(instance).into_string())
+@@ -468,6 +545,9 @@ fn pointer_expr<'tcx>(
+                 Ok(pointee) => pointee,
+                 Err(poison) => return poison,
+             };
++            if raw::is_wide_pointee(pointee) {
++                return static_wide_pointer(cgu, log, def_id, offset, ty, pointee, meta, span);
++            }
+             if offset != Size::ZERO {
+                 return zombie(
+                     cgu,
+@@ -520,6 +600,29 @@ fn pointer_expr<'tcx>(
+     }
+ }
+ 
++/// The closure type whose reification as a `fn` pointer `instance` is, when it is a closure's
++/// `FnOnce` instance (`Instance::resolve_closure(.., FnOnce)`): the closure's own body, or the
++/// `call_once` shim of a `Fn`/`FnMut` closure, whose first type argument is the closure. Both take
++/// the environment first. That closure type's `fn_pointer_shim` in the JIR type table names this
++/// same instance, which is how the link-time lowering recognizes the target.
++pub(crate) fn reified_closure_type<'tcx>(
++    tcx: rustc_middle::ty::TyCtxt<'tcx>,
++    instance: Instance<'tcx>,
++) -> Option<Ty<'tcx>> {
++    match instance.def {
++        ty::InstanceKind::Shim(ty::ShimKind::ClosureOnce { .. }) => {
++            Some(instance.args.type_at(0)).filter(|ty| matches!(ty.kind(), ty::Closure(..)))
++        }
++        ty::InstanceKind::Item(def_id)
++            if tcx.def_kind(def_id) == rustc_hir::def::DefKind::Closure
++                && matches!(tcx.type_of(def_id).skip_binder().kind(), ty::Closure(..)) =>
++        {
++            Some(Ty::new_closure(tcx, def_id, instance.args))
++        }
++        _ => None,
++    }
++}
++
+ /// A pointer constant to an aggregate, as the pointer type it has.
+ ///
+ /// A *reference* to an aggregate is the aggregate's own object; a *raw* pointer to one is a slot,
+@@ -533,6 +636,99 @@ fn boxed_if_raw<'tcx>(cgu: &CguCx<'tcx>, ty: Ty<'tcx>, pointee: Ty<'tcx>, value:
+     value
+ }
+ 
++/// A wide pointer into a `static`: `static SL: &[u32] = &ARR`, `Some(&ARR)`, a struct field
++/// holding either, and the `&str` that `str::from_utf8(&BYTES)` makes of a static's bytes.
++///
++/// A slice is `{ buf, off, len }` over the static's own storage, so that it aliases the static as
++/// the pointer does. An array static is emitted as the JavaScript array of its elements, which is
++/// the buffer; a static of the element type itself is one element: a primitive one is emitted
++/// boxed, `[value]`, which is that buffer already, and an aggregate one's buffer is its one slot,
++/// `__rt.box(S).buf`, the same buffer the run-time `slice::from_ref(&S)` builds, which makes
++/// `ptr::eq` and whole-element stores through the slice agree with it. `offset` names the first
++/// element, at the element's stride.
++///
++/// A `str` is a JavaScript string, a value with no place of its own, so it is the text of the
++/// bytes the pointer names, read from the static's initializer. That is the static's value only
++/// while nothing can write it, so a `static mut` or a static with interior mutability is refused.
++///
++/// The binding is only named — except for an aggregate static's one slot, which `__rt.box` makes
++/// when the slice is initialised, as a raw pointer constant to that static already does — so the
++/// pointer depends on the order of initialisation only as a reference to the static does.
++#[allow(clippy::too_many_arguments)]
++fn static_wide_pointer<'tcx>(
++    cgu: &CguCx<'tcx>,
++    log: &ZombieLog,
++    def_id: DefId,
++    offset: Size,
++    ty: Ty<'tcx>,
++    pointee: Ty<'tcx>,
++    meta: Option<u64>,
++    span: Span,
++) -> Expr {
++    let tcx = cgu.tcx;
++    let refuse = |what: &str| {
++        zombie(
++            cgu,
++            log,
++            span,
++            format!("a `{ty}` into a `static` {what}, which rustc_codegen_js cannot name"),
++        )
++    };
++    let Some(length) = meta else {
++        return refuse("with no length");
++    };
++    let static_ty =
++        tcx.normalize_erasing_regions(typing_env(), tcx.type_of(def_id).instantiate_identity());
++    let binding = jsast::id(cgu.namer.static_name(def_id).into_string());
++    match pointee.kind() {
++        ty::Slice(element) => {
++            let element = *element;
++            let Ok(layout) = tcx.layout_of(typing_env().as_query_input(element)) else {
++                return refuse("whose element has no layout");
++            };
++            let (buf, count) = match static_ty.kind() {
++                ty::Array(array_element, count) if *array_element == element => {
++                    (binding, count.try_to_target_usize(tcx))
++                }
++                // An aggregate static's one slot, `__rt.box(S)`: the buffer the run-time
++                // `slice::from_ref(&S)` and a raw pointer constant to `S` use, so that identity
++                // and whole-element stores agree with them.
++                _ if static_ty == element && is_indirect(tcx, element) => (
++                    crate::ptr::slot_buf(jsast::rt_call("box", vec![binding])),
++                    Some(1),
++                ),
++                _ if static_ty == element => (binding, Some(1)),
++                _ => return refuse(&format!("of type `{static_ty}`")),
++            };
++            let stride = layout.size.bytes();
++            let start = match stride {
++                0 if offset == Size::ZERO => 0,
++                0 => return refuse("past a zero-sized element"),
++                _ if !offset.bytes().is_multiple_of(stride) => {
++                    return refuse("between two elements")
++                }
++                _ => offset.bytes() / stride,
++            };
++            match count {
++                Some(count) if start.saturating_add(length) <= count => {
++                    crate::ptr::fat_slice(buf, jsast::num(start as f64), jsast::num(length as f64))
++                }
++                _ => refuse("running past the end of it"),
++            }
++        }
++        ty::Str => {
++            if GlobalAlloc::Static(def_id).mutability(tcx, typing_env()) != Mutability::Not {
++                return refuse("that can be written");
++            }
++            match tcx.eval_static_initializer(def_id) {
++                Ok(alloc) => str_expr(cgu, log, alloc.inner(), offset, Some(length), span),
++                Err(_) => refuse("whose initializer could not be evaluated"),
++            }
++        }
++        _ => refuse("of this kind"),
++    }
++}
++
+ /// The `&[T]` whose `meta` elements start at `offset` in `alloc`.
+ ///
+ /// A slice constant is a fat pointer, and the JavaScript side has no memory for it to point into,
+diff --git a/backend/src/constant/raw.rs b/backend/src/constant/raw.rs
+index abf003a34c5458201f31d5041c68ac4fba72a1fd..ee68970cf302cda52653bb9389e33071f120a384 100644
+--- a/backend/src/constant/raw.rs
++++ b/backend/src/constant/raw.rs
+@@ -8,10 +8,11 @@
+ //! Nothing here reports anything. A function returns what it found or an error describing what it
+ //! could not read, and the caller turns that into whichever kind of diagnostic it deals in.
+ 
+-use rustc_abi::{Size, TagEncoding, VariantIdx, Variants};
++use rustc_abi::{Align, Size, TagEncoding, VariantIdx, Variants};
+ use rustc_middle::mir::interpret::{
+-    read_target_uint, write_target_uint, AllocId, Allocation, CtfeProvenance,
++    alloc_range, read_target_uint, AllocId, Allocation, CtfeProvenance, GlobalAlloc, Scalar,
+ };
++use rustc_middle::mir::Mutability;
+ use rustc_middle::ty::layout::TyAndLayout;
+ use rustc_middle::ty::{self, ScalarInt, Ty, TyCtxt};
+ 
+@@ -36,25 +37,37 @@ pub(crate) fn read_scalar(
+ 
+ /// An allocation holding the bytes of one scalar, laid out for `ty`.
+ ///
+-/// The scalar is written at offset zero and the rest is left zero: a value whose layout is a
+-/// single scalar occupies its low bytes, and the padding a larger layout adds is never read back,
+-/// because a reader only visits the fields the type declares.
++/// This is how a constant that const evaluation kept in a register (`ConstValue::Scalar`) is
++/// decoded at a type that is not itself a primitive: `Option<&T>`, `Option<NonZero<u32>>`, a
++/// fieldless enum, a newtype. The bits are laid out exactly as they would be in memory, so they are
++/// put back into memory and read by the same reader as every other constant, which knows the
++/// type's layout.
++///
++/// The scalar is written at offset zero, which is where a layout whose `BackendRepr` is one scalar
++/// keeps it, and the rest is left zero: the padding a larger layout adds is never read back,
++/// because a reader only visits the fields the type declares. A pointer is written with its
++/// provenance, as const evaluation would have written it, because the bytes of a pointer are only
++/// its offset into the allocation it names: without the provenance beside them, `Some(&x)` would
++/// read as the null niche.
+ pub(crate) fn scratch_alloc<'tcx>(
+     tcx: TyCtxt<'tcx>,
+-    int: ScalarInt,
++    scalar: Scalar,
+     ty: Ty<'tcx>,
+ ) -> Option<Allocation> {
+     let layout = tcx.layout_of(typing_env().as_query_input(ty)).ok()?;
+-    let size = layout.size.max(int.size());
+-    let mut bytes = vec![0u8; size.bytes_usize()];
+-    let width = int.size().bytes_usize();
+-    write_target_uint(
+-        tcx.data_layout.endian,
+-        &mut bytes[..width],
+-        int.to_uint(int.size()),
+-    )
+-    .ok()?;
+-    Some(Allocation::from_bytes_byte_aligned_immutable(bytes, ()))
++    let width = scalar.size();
++    let size = layout.size.max(width);
++    let mut alloc = Allocation::from_bytes(
++        vec![0u8; size.bytes_usize()],
++        Align::ONE,
++        Mutability::Mut,
++        (),
++    );
++    alloc
++        .write_scalar(&tcx, alloc_range(Size::ZERO, width), scalar)
++        .ok()?;
++    alloc.mutability = Mutability::Not;
++    Some(alloc)
+ }
+ 
+ /// Why the variant of an enum could not be worked out from its bytes.
+@@ -72,6 +85,12 @@ pub(crate) enum TagError {
+ /// The bytes hold a *tag*, and which variant that tag names depends on how the layout chose to
+ /// encode it. A direct tag is the discriminant itself; a niche tag is an otherwise-invalid value
+ /// of some field, which is how `Option<&T>` fits in one pointer.
++///
++/// A tag can also be a pointer into another allocation: the niche of `Option<&T>`, `Option<&str>`,
++/// `Option<fn()>` or `Option<NonNull<T>>` is the pointer the untagged variant holds. Such a tag has
++/// no numeric value at all — its bytes are only its offset within the allocation its provenance
++/// names, so `Some(&x)` with `x` at the start of its allocation has the same bytes as `None` — and
++/// it is decided by [`pointer_tag`], never by those bytes.
+ pub(crate) fn variant_index<'tcx>(
+     tcx: TyCtxt<'tcx>,
+     alloc: &Allocation,
+@@ -93,6 +112,12 @@ pub(crate) fn variant_index<'tcx>(
+             let bits = read_scalar(tcx, alloc, tag_offset, tag_size)
+                 .map(|int| int.to_uint(tag_size))
+                 .ok_or(TagError::Unreadable)?;
++            if !alloc
++                .provenance()
++                .range_empty(alloc_range(tag_offset, tag_size), &tcx)
++            {
++                return pointer_tag(tcx, alloc, tag_offset, tag_size, bits, tag_encoding);
++            }
+             match tag_encoding {
+                 // The tag *is* the discriminant, truncated to the tag's width.
+                 TagEncoding::Direct => def
+@@ -122,6 +147,66 @@ pub(crate) fn variant_index<'tcx>(
+     }
+ }
+ 
++/// The variant a tag that holds a pointer into an allocation names.
++///
++/// This is rustc's own rule (`InterpCx::read_discriminant`): a pointer with provenance can only be
++/// told apart from the niche values when the niche is the single value zero and the pointer cannot
++/// be null, and then it is the untagged variant, whose payload the pointer is. That covers every
++/// pointer niche rustc lays out — a reference, `NonNull`, `Box` and a function pointer each have
++/// exactly the one invalid value `0` — and anything else is refused rather than guessed: a direct
++/// tag, several niche variants, a niche that does not start at zero, a tag holding only part of a
++/// pointer, or a pointer that may be null.
++///
++/// `bits` are the tag's bytes, which for a pointer are its offset into the allocation it names.
++fn pointer_tag(
++    tcx: TyCtxt<'_>,
++    alloc: &Allocation,
++    tag_offset: Size,
++    tag_size: Size,
++    bits: u128,
++    tag_encoding: &TagEncoding<VariantIdx>,
++) -> Result<VariantIdx, TagError> {
++    let TagEncoding::Niche {
++        untagged_variant,
++        niche_variants,
++        niche_start,
++    } = tag_encoding
++    else {
++        return Err(TagError::Unreadable);
++    };
++    if *niche_start != 0
++        || niche_variants.start != niche_variants.last
++        || tag_size != tcx.data_layout.pointer_size()
++    {
++        return Err(TagError::Unreadable);
++    }
++    let Some(provenance) = alloc.provenance().get_ptr(tag_offset) else {
++        return Err(TagError::Unreadable);
++    };
++    let Ok(offset) = u64::try_from(bits) else {
++        return Err(TagError::Unreadable);
++    };
++    match may_be_null(tcx, provenance.alloc_id(), Size::from_bytes(offset)) {
++        false => Ok(*untagged_variant),
++        true => Err(TagError::Unreadable),
++    }
++}
++
++/// Whether the pointer `offset` bytes into `alloc_id` may be null (`InterpCx::scalar_may_be_null`).
++///
++/// An allocation's base address is not known, but it is never null and no in-bounds pointer (one
++/// past the end included) wraps around to null; a pointer that is not a multiple of the
++/// allocation's alignment cannot be null either. A type id is a fake allocation whose offset *is*
++/// the value, and is treated as possibly null, as rustc treats it.
++fn may_be_null(tcx: TyCtxt<'_>, alloc_id: AllocId, offset: Size) -> bool {
++    let global = tcx.global_alloc(alloc_id);
++    if matches!(global, GlobalAlloc::TypeId { .. }) {
++        return true;
++    }
++    let (size, align) = global.size_and_align(tcx, typing_env());
++    offset > size && offset.bytes().is_multiple_of(align.bytes())
++}
++
+ /// Whether a pointer to this type carries metadata, and so occupies two pointer sized slots.
+ pub(crate) fn is_wide_pointee(pointee: Ty<'_>) -> bool {
+     matches!(pointee.kind(), ty::Str | ty::Slice(_))
+diff --git a/backend/src/jir/encode.rs b/backend/src/jir/encode.rs
+index 5545d4b8b1b72bf11f7d014112bdaeb4cd459704..b679e7e10bc1aa0618dbbe809620fe5a49401d52 100644
+--- a/backend/src/jir/encode.rs
++++ b/backend/src/jir/encode.rs
+@@ -1335,6 +1335,22 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
+                 bits: value.to_uint(value.size()),
+                 bytes: value.size().bytes() as u8,
+             }),
++            // A pointer at a type that only holds one (`Some(&x)` at `Option<&T>`, `Some(f)` at
++            // `Option<fn()>`, a `NonNull<T>`): its variant and place are the type's layout facts,
++            // so it is decoded out of memory like the baseline lane decodes it
++            // (`constant.rs::scalar_in_memory`).
++            mir::ConstValue::Scalar(scalar @ Scalar::Ptr(..))
++                if !crate::constant::is_builtin_pointer(ty) =>
++            {
++                let scratch = crate::constant::raw::scratch_alloc(tcx, scalar, ty)
++                    .ok_or_else(|| EncodeDecline::ConstantNoLayout { ty: type_name(ty) })?;
++                Ok(Constant::Memory(self.const_tree(
++                    &scratch,
++                    Size::ZERO,
++                    ty,
++                    0,
++                )?))
++            }
+             mir::ConstValue::Scalar(Scalar::Ptr(pointer, _)) => {
+                 let (provenance, offset) = pointer.prov_and_relative_offset();
+                 if let GlobalAlloc::Memory(allocation) = tcx.global_alloc(provenance.alloc_id()) {
+@@ -1739,6 +1755,13 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
+         let tcx = self.tcx();
+         Ok(match tcx.global_alloc(allocation) {
+             GlobalAlloc::Function { instance } => {
++                // A closure reified as a `fn` pointer names its `FnOnce` instance, which takes the
++                // environment first. Describing the closure's type puts its `fn_pointer_shim` (this
++                // same instance) in the table, which is how the lowering recognizes the target and
++                // prints the run-time coercion's wrapper (`lower/js/constant.rs::global_expr`).
++                if let Some(closure) = crate::constant::reified_closure_type(tcx, instance) {
++                    self.type_id(closure)?;
++                }
+                 let item = self.direct_item(instance);
+                 GlobalReference::Function {
+                     item: item.item,
+diff --git a/backend/src/late_ir.rs b/backend/src/late_ir.rs
+index 8b2b141750b13e1b2a5be4e6175b0271cabb0b71..bfb5e4cb621539d8fec4543b53d853cee4baa8bd 100644
+--- a/backend/src/late_ir.rs
++++ b/backend/src/late_ir.rs
+@@ -1148,6 +1148,22 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
+                 bits: value.to_uint(value.size()),
+                 bytes: value.size().bytes() as u8,
+             }),
++            // A pointer at a type that only holds one (`Some(&x)` at `Option<&T>`, `Some(f)` at
++            // `Option<fn()>`, a `NonNull<T>`): its variant and place are the type's layout facts,
++            // so it is decoded out of memory like the baseline lane decodes it
++            // (`constant.rs::scalar_in_memory`).
++            mir::ConstValue::Scalar(scalar @ Scalar::Ptr(..))
++                if !crate::constant::is_builtin_pointer(ty) =>
++            {
++                let scratch = crate::constant::raw::scratch_alloc(tcx, scalar, ty)
++                    .ok_or_else(|| format!("no layout for `{ty}` in a constant"))?;
++                Ok(Constant::Memory(self.const_tree(
++                    &scratch,
++                    Size::ZERO,
++                    ty,
++                    0,
++                )?))
++            }
+             mir::ConstValue::Scalar(Scalar::Ptr(pointer, _)) => {
+                 let (provenance, offset) = pointer.prov_and_relative_offset();
+                 if let GlobalAlloc::Memory(allocation) = tcx.global_alloc(provenance.alloc_id()) {
+diff --git a/examples/core-tests/240_niche_pointer_constants.expected b/examples/core-tests/240_niche_pointer_constants.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..71173bce5331bc48cf7a4c8e531b52515d3210e7
+--- /dev/null
++++ b/examples/core-tests/240_niche_pointer_constants.expected
+@@ -0,0 +1,51 @@
++const
++5
++none
++5
++none
++true
++static
++6
++none
++6
++none
++70
++70
++true
++true
++static mut
++7
++none
++8
++promoted
++9
++9
++none
++associated and generic
++10
++none
++10
++11
++none
++tables
++1
++none
++3
++none
++22
++23
++1
++31
++2
++none
++3
++33
++4
++none
++5
++35
++run time
++41
++none
++41
++none
+diff --git a/examples/core-tests/240_niche_pointer_constants.rs b/examples/core-tests/240_niche_pointer_constants.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..c401767c6d423cb84507c72d9d2e8f96d1924f31
+--- /dev/null
++++ b/examples/core-tests/240_niche_pointer_constants.rs
+@@ -0,0 +1,149 @@
++//! A pointer niche in constant data reads back as the variant it holds, wherever the data lives.
++//!
++//! `Option<&T>` is one pointer: `None` is the null pointer and `Some(r)` is `r`. In a constant
++//! allocation the bytes of a pointer are only its offset into the allocation it names — the
++//! allocation itself is the provenance recorded beside them — so `Some(&7)`, whose `7` sits at the
++//! start of its own allocation, has exactly the bytes of `None`. Its variant comes from the
++//! provenance, never from those bytes (rustc's own rule, `InterpCx::read_discriminant`), and the
++//! decoder used to read the bytes and answer `None`.
++//!
++//! Every place constant data can live is exercised, with both variants: a `const` used directly
++//! and through `black_box` (a register-sized `ConstValue::Scalar` holding the pointer), a
++//! `static`, a `static mut` read back and rewritten, a promoted `&Some(..)`, an associated
++//! constant, a trait constant read in a generic function, `static` and `const` tables of options
++//! and of structs holding them, and, as the control, the same values built at run time.
++
++#![no_std]
++#![no_main]
++
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++
++use core::hint::black_box;
++
++#[inline(never)]
++fn idx(i: usize) -> usize {
++    black_box(i)
++}
++
++#[inline(never)]
++fn show(o: Option<&u32>) {
++    match o {
++        Some(v) => print_u32(*v),
++        None => print_str("none"),
++    }
++}
++
++const C_SOME: Option<&u32> = Some(&5);
++const C_NONE: Option<&u32> = None;
++static S_SOME: Option<&u32> = Some(&6);
++static S_NONE: Option<&u32> = None;
++static mut SM: Option<&u32> = Some(&7);
++static TARGET: u32 = 70;
++static S_TO_STATIC: Option<&u32> = Some(&TARGET);
++const C_TO_STATIC: Option<&u32> = Some(&TARGET);
++
++struct Holder;
++impl Holder {
++    const A: Option<&'static u32> = Some(&10);
++    const N: Option<&'static u32> = None;
++}
++
++trait Scale {
++    const V: Option<&'static u32>;
++}
++struct KA;
++struct KB;
++impl Scale for KA {
++    const V: Option<&'static u32> = Some(&11);
++}
++impl Scale for KB {
++    const V: Option<&'static u32> = None;
++}
++#[inline(never)]
++fn get<T: Scale>() -> Option<&'static u32> {
++    T::V
++}
++
++const TABLE: [Option<&u32>; 3] = [Some(&1), None, Some(&3)];
++static STABLE: [Option<&u32>; 3] = [None, Some(&22), Some(&23)];
++
++struct Row {
++    id: u32,
++    v: Option<&'static u32>,
++}
++const ROWS: &[Row] = &[
++    Row { id: 1, v: Some(&31) },
++    Row { id: 2, v: None },
++    Row { id: 3, v: Some(&33) },
++];
++static SROWS: [Row; 2] = [Row { id: 4, v: None }, Row { id: 5, v: Some(&35) }];
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    print_str("const");
++    show(C_SOME);
++    show(C_NONE);
++    show(black_box(C_SOME));
++    show(black_box(C_NONE));
++    print_bool(C_SOME.is_some());
++
++    print_str("static");
++    show(S_SOME);
++    show(S_NONE);
++    show(*black_box(&S_SOME));
++    show(*black_box(&S_NONE));
++    show(S_TO_STATIC);
++    show(C_TO_STATIC);
++    print_bool(core::ptr::eq(S_TO_STATIC.unwrap(), &TARGET));
++    print_bool(core::ptr::eq(C_TO_STATIC.unwrap(), &TARGET));
++
++    print_str("static mut");
++    unsafe {
++        show(*black_box(&raw const SM));
++        SM = None;
++        show(*black_box(&raw const SM));
++        SM = Some(&8);
++        show(*black_box(&raw const SM));
++    }
++
++    print_str("promoted");
++    let p: &'static Option<&'static u32> = &Some(&9);
++    show(*p);
++    show(*black_box(p));
++    let q: &'static Option<&'static u32> = &None;
++    show(*black_box(q));
++
++    print_str("associated and generic");
++    show(Holder::A);
++    show(Holder::N);
++    show(black_box(Holder::A));
++    show(get::<KA>());
++    show(get::<KB>());
++
++    print_str("tables");
++    for i in 0..3 {
++        show(TABLE[idx(i)]);
++    }
++    for i in 0..3 {
++        show(STABLE[idx(i)]);
++    }
++    for i in 0..3 {
++        let r = &ROWS[idx(i)];
++        print_u32(r.id);
++        show(r.v);
++    }
++    for r in SROWS.iter() {
++        print_u32(r.id);
++        show(r.v);
++    }
++
++    print_str("run time");
++    let x = 41u32;
++    show(black_box(Some(&x)));
++    show(black_box(None));
++    let lt = [Some(&x), None];
++    show(black_box(lt)[idx(0)]);
++    show(black_box(lt)[idx(1)]);
++}
+diff --git a/examples/core-tests/241_niche_wide_pointer_constants.expected b/examples/core-tests/241_niche_wide_pointer_constants.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..b2fe198a4886ace74508d56b55afee30c0b4252e
+--- /dev/null
++++ b/examples/core-tests/241_niche_wide_pointer_constants.expected
+@@ -0,0 +1,78 @@
++str
++alpha
++<none>
++alpha
++beta
++<none>
++
++gamma
++slice
++3
++6
++0
++0
++<none>
++2
++30
++fn
++7
++<none>
++7
++true
++8
++<none>
++7
++nonnull
++55
++55
++<none>
++56
++true
++true
++box
++<none>
++63
++nested
++61
++some-none
++none
++62
++err
++ok
++bad input
++
++direct
++direct
++true
++cow
++true
++
++payload offset
++1
++2
++3
++<none>
++4
++5
++6
++7
++8
++9
++10
++11
++w
++<none>
++dyn
++true
++9
++true
++8
++run time
++65
++66
++64
++<none>
++delta
++<none>
++<none>
++8
+diff --git a/examples/core-tests/241_niche_wide_pointer_constants.maxbytes b/examples/core-tests/241_niche_wide_pointer_constants.maxbytes
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f1a0826ce25df764dda6999b8e30a9b327e9977
+--- /dev/null
++++ b/examples/core-tests/241_niche_wide_pointer_constants.maxbytes
+@@ -0,0 +1 @@
++49152
+diff --git a/examples/core-tests/241_niche_wide_pointer_constants.rs b/examples/core-tests/241_niche_wide_pointer_constants.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..6a192ff0f52f32ef8270eac0b11d614f30778e8d
+--- /dev/null
++++ b/examples/core-tests/241_niche_wide_pointer_constants.rs
+@@ -0,0 +1,267 @@
++//! Every pointer that carries a niche, in constant data: fat pointers, function pointers,
++//! `NonNull`, `Box`, and a pointer niche nested inside another enum or at a non-zero offset inside
++//! a struct payload.
++//!
++//! `Option<&str>` and `Option<&[T]>` keep their niche in the data pointer of a two-word value,
++//! `Option<fn()>` in a pointer into a *function* allocation, `Option<NonNull<T>>` in a pointer
++//! behind a transparent wrapper and a pattern type, and `Result<(), &str>` spells the variant that
++//! carries data as the pointer and the unit one as null. Each of these used to read back as the
++//! null variant whenever its pointer named the start of an allocation, and `Option<fn()>` used
++//! directly was the bare function, which the `Option` it stood for could not match. `Cow` keeps its
++//! niche in an integer field while the borrowed pointer sits elsewhere, and
++//! `NonNull::dangling()` is an address with no provenance at all: the two controls for the case
++//! where the bytes alone do decide. `Option<&dyn Trait>` holding `None` compiles and reads back as
++//! `None`; holding `Some` it is refused (fixture 249).
++
++#![no_std]
++#![no_main]
++
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++
++extern crate alloc;
++use alloc::borrow::Cow;
++use alloc::boxed::Box;
++use core::hint::black_box;
++use core::ptr::NonNull;
++
++#[inline(never)]
++fn idx(i: usize) -> usize {
++    black_box(i)
++}
++#[inline(never)]
++fn show_str(o: Option<&str>) {
++    match o {
++        Some(s) => print_str(s),
++        None => print_str("<none>"),
++    }
++}
++#[inline(never)]
++fn show_slice(o: Option<&[u16]>) {
++    match o {
++        Some(s) => {
++            print_usize(s.len());
++            print_u32(s.iter().map(|v| *v as u32).sum());
++        }
++        None => print_str("<none>"),
++    }
++}
++fn seven() -> u32 {
++    7
++}
++fn eight() -> u32 {
++    8
++}
++#[inline(never)]
++fn show_fn(o: Option<fn() -> u32>) {
++    match o {
++        Some(f) => print_u32(f()),
++        None => print_str("<none>"),
++    }
++}
++#[inline(never)]
++fn show_nn(o: Option<NonNull<u32>>) {
++    match o {
++        Some(p) => print_u32(unsafe { *p.as_ptr() }),
++        None => print_str("<none>"),
++    }
++}
++#[inline(never)]
++fn show_box(o: &Option<Box<u32>>) {
++    match o {
++        Some(b) => print_u32(**b),
++        None => print_str("<none>"),
++    }
++}
++#[inline(never)]
++fn show_oo(o: Option<Option<&u32>>) {
++    match o {
++        Some(Some(v)) => print_u32(*v),
++        Some(None) => print_str("some-none"),
++        None => print_str("none"),
++    }
++}
++#[inline(never)]
++fn show_res(o: Result<&u32, ()>) {
++    match o {
++        Ok(v) => print_u32(*v),
++        Err(()) => print_str("err"),
++    }
++}
++#[inline(never)]
++fn show_check(o: Result<(), &str>) {
++    match o {
++        Ok(()) => print_str("ok"),
++        Err(e) => print_str(e),
++    }
++}
++
++const STR_S: Option<&str> = Some("alpha");
++const STR_N: Option<&str> = None;
++static SSTR: [Option<&str>; 3] = [Some("beta"), None, Some("")];
++const SL_S: Option<&[u16]> = Some(&[1, 2, 3]);
++const SL_E: Option<&[u16]> = Some(&[]);
++static SSL: [Option<&[u16]>; 2] = [None, Some(&[10, 20])];
++const F_S: Option<fn() -> u32> = Some(seven);
++const F_N: Option<fn() -> u32> = None;
++static FS: [Option<fn() -> u32>; 3] = [Some(eight), None, Some(seven)];
++static NN_TARGET: u32 = 55;
++const NN_S: Option<NonNull<u32>> = Some(NonNull::from_ref(&NN_TARGET));
++struct SyncNonNull([Option<NonNull<u32>>; 2]);
++unsafe impl Sync for SyncNonNull {}
++static NNS: SyncNonNull = SyncNonNull([None, Some(NonNull::from_ref(&56))]);
++const NN_D: Option<NonNull<u32>> = Some(NonNull::dangling());
++static BOX_N: Option<Box<u32>> = None;
++const OO: [Option<Option<&u32>>; 3] = [Some(Some(&61)), Some(None), None];
++static ROO: [Result<&u32, ()>; 2] = [Ok(&62), Err(())];
++const CHECKS: [Result<(), &str>; 3] = [Ok(()), Err("bad input"), Err("")];
++const C_CHECK: Result<(), &str> = Err("direct");
++static COWS: [Cow<'static, str>; 2] = [Cow::Borrowed("cow"), Cow::Borrowed("")];
++
++trait Speak {
++    fn n(&self) -> u32;
++}
++impl Speak for u32 {
++    fn n(&self) -> u32 {
++        *self
++    }
++}
++/// `None` of a trait-object option has no pointer to decode; `Some` is refused (fixture 249).
++static DYN_N: Option<&(dyn Speak + Sync)> = None;
++const CDYN_N: Option<&(dyn Speak + Sync)> = None;
++
++#[derive(Clone, Copy)]
++struct Pair {
++    n: u32,
++    tag: u8,
++    r: &'static u32,
++}
++#[derive(Clone, Copy)]
++struct Wrap {
++    a: u16,
++    inner: (u8, Pair),
++    name: &'static str,
++}
++const PAIRS: &[Option<Pair>] = &[
++    Some(Pair { n: 1, tag: 2, r: &3 }),
++    None,
++    Some(Pair { n: 4, tag: 5, r: &6 }),
++];
++static WRAPS: [Option<Wrap>; 2] = [
++    Some(Wrap { a: 7, inner: (8, Pair { n: 9, tag: 10, r: &11 }), name: "w" }),
++    None,
++];
++#[inline(never)]
++fn show_pair(o: Option<Pair>) {
++    match o {
++        Some(p) => {
++            print_u32(p.n);
++            print_u32(p.tag as u32);
++            print_u32(*p.r);
++        }
++        None => print_str("<none>"),
++    }
++}
++
++/// `Option<fn()>` constants used directly, alone in their item: the only pointers here name a
++/// function, so nothing else in the body forces it out of the JIR lane.
++#[inline(never)]
++fn direct_fn_constants() {
++    show_fn(F_S);
++    show_fn(F_N);
++    show_fn(black_box(F_S));
++    print_bool(F_S.is_some());
++}
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    print_str("str");
++    show_str(STR_S);
++    show_str(STR_N);
++    show_str(black_box(STR_S));
++    for i in 0..3 {
++        show_str(SSTR[idx(i)]);
++    }
++    let promoted: &'static Option<&'static str> = &Some("gamma");
++    show_str(*black_box(promoted));
++
++    print_str("slice");
++    show_slice(SL_S);
++    show_slice(SL_E);
++    for i in 0..2 {
++        show_slice(SSL[idx(i)]);
++    }
++
++    print_str("fn");
++    direct_fn_constants();
++    for i in 0..3 {
++        show_fn(FS[idx(i)]);
++    }
++
++    print_str("nonnull");
++    show_nn(NN_S);
++    show_nn(black_box(NN_S));
++    for i in 0..2 {
++        show_nn(NNS.0[idx(i)]);
++    }
++    print_bool(black_box(NN_D).is_some());
++    print_bool(NN_D == Some(NonNull::dangling()));
++
++    print_str("box");
++    show_box(&BOX_N);
++    let b = Some(Box::new(63u32));
++    show_box(black_box(&b));
++
++    print_str("nested");
++    for i in 0..3 {
++        show_oo(OO[idx(i)]);
++    }
++    for i in 0..2 {
++        show_res(ROO[idx(i)]);
++    }
++    for i in 0..3 {
++        show_check(CHECKS[idx(i)]);
++    }
++    show_check(C_CHECK);
++    show_check(black_box(C_CHECK));
++    for i in 0..2 {
++        let c = &COWS[idx(i)];
++        print_bool(matches!(c, Cow::Borrowed(_)));
++        print_str(c);
++    }
++
++    print_str("payload offset");
++    for i in 0..3 {
++        show_pair(PAIRS[idx(i)]);
++    }
++    for i in 0..2 {
++        match WRAPS[idx(i)] {
++            Some(w) => {
++                print_u32(w.a as u32);
++                print_u32(w.inner.0 as u32);
++                show_pair(Some(w.inner.1));
++                print_str(w.name);
++            }
++            None => print_str("<none>"),
++        }
++    }
++
++    print_str("dyn");
++    print_bool(black_box(&DYN_N).is_none());
++    print_u32(DYN_N.map_or(9, |d| d.n()));
++    print_bool(CDYN_N.is_none());
++    print_u32(black_box(CDYN_N).map_or(8, |d| d.n()));
++
++    print_str("run time");
++    let x: &'static u32 = Box::leak(Box::new(64u32));
++    let lp = [Some(Pair { n: 65, tag: 66, r: x }), None];
++    show_pair(black_box(lp)[idx(0)]);
++    show_pair(black_box(lp)[idx(1)]);
++    let ls: [Option<&str>; 2] = [Some("delta"), None];
++    show_str(black_box(ls)[idx(0)]);
++    show_str(black_box(ls)[idx(1)]);
++    let lf: [Option<fn() -> u32>; 2] = [None, Some(eight)];
++    show_fn(black_box(lf)[idx(0)]);
++    show_fn(black_box(lf)[idx(1)]);
++}
+diff --git a/examples/core-tests/242_niche_integer_constants.expected b/examples/core-tests/242_niche_integer_constants.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..624d2b884ca40e98458f319f72fdd5c24543f4dd
+--- /dev/null
++++ b/examples/core-tests/242_niche_integer_constants.expected
+@@ -0,0 +1,83 @@
++200
++1000
++1099511627776
++1000
++70000
++1000
++77
++77
++122
++1
++1000
++0
++1114111
++9
++113
++1
++-1
++1
++1
++-1
++2
++0
++0
++2
++0
++3
++1
++8
++3
++1
++9
++9
++9
++4
++9
++1
++1
++41
++0
++2
++1
++7
++3
++2
++8
++4
++3
++9
++9
++50
++107
++1
++2
++2
++2
++4
++8
++2
++4
++1
++109
++1
++97
++3
++2
++1000
++61
++3
++9
++7
++7
++120
++true
++7
++121
++2
++3
++4
++7
++8
++9
++7
++122
+diff --git a/examples/core-tests/242_niche_integer_constants.maxbytes b/examples/core-tests/242_niche_integer_constants.maxbytes
+new file mode 100644
+index 0000000000000000000000000000000000000000..188d1cb884451801fa6cabb5b7da2d62e55ccea8
+--- /dev/null
++++ b/examples/core-tests/242_niche_integer_constants.maxbytes
+@@ -0,0 +1 @@
++40960
+diff --git a/examples/core-tests/242_niche_integer_constants.rs b/examples/core-tests/242_niche_integer_constants.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf63564208521aa70f8a25d2d8a145c31769459e
+--- /dev/null
++++ b/examples/core-tests/242_niche_integer_constants.rs
+@@ -0,0 +1,293 @@
++//! Integer niches in constant data: `NonZero`, `char`, `bool`, fieldless enums, nested `Option`s,
++//! enums with one data-carrying variant and several niche-encoded unit variants, niches at a
++//! non-zero offset inside a payload, niche ranges that wrap, and a niche range with an uninhabited
++//! variant inside it.
++//!
++//! The bytes decide these, so they were already right in memory; what this pins is the other two
++//! ways the same values arrive. A register-sized constant used directly (`ConstValue::Scalar`) is
++//! decoded by the link-time lowering from the type table, which used to stop at a transparent
++//! wrapper inside the payload (`Some(NonZero(77))` printed `Some({})`), and which rebuilds rustc's
++//! `niche_variants` from the variants: `Gap::Dead([u32; 0], Infallible)` is uninhabited but not a
++//! 1-ZST, so rustc still gives it a niche value and `Gap::After` takes the next one; the lowering
++//! used to skip it and read `After` as `Live('\u{110001}')`. `Wr`'s two unit variants take the
++//! niche values 255 and 0 (the range wraps past the top of a `u8`), and `Sg`'s and `Ordering`'s
++//! valid range itself wraps (`-1..=1`).
++
++#![no_std]
++#![no_main]
++
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++
++use core::cmp::Ordering;
++use core::convert::Infallible;
++use core::hint::black_box;
++use core::num::{NonZeroU32, NonZeroU64, NonZeroU8};
++
++#[inline(never)]
++fn idx(i: usize) -> usize {
++    black_box(i)
++}
++
++#[derive(Clone, Copy)]
++enum Color {
++    Red,
++    Green,
++    Blue,
++}
++/// Valid range 200..=254: `Wr`'s two unit variants take the niche values 255 and 0, wrapping.
++#[derive(Clone, Copy)]
++#[repr(u8)]
++enum Hi {
++    A = 200,
++    B = 254,
++}
++#[derive(Clone, Copy)]
++enum Wr {
++    V(Hi),
++    N1,
++    N2,
++}
++/// Valid range -1..=1, i.e. 255..=1 as bits: the valid range itself wraps.
++#[derive(Clone, Copy)]
++#[repr(i8)]
++enum Sg {
++    M = -1,
++    Z = 0,
++    P = 1,
++}
++#[derive(Clone, Copy)]
++enum Multi {
++    Data { a: u32, flag: bool },
++    X,
++    Y,
++    Z,
++}
++#[derive(Clone, Copy)]
++enum Dir {
++    Go(char),
++    Up,
++    Down,
++}
++
++/// Uninhabited without being a 1-ZST, so rustc numbers it: `After` is the second niche value.
++#[derive(Clone, Copy)]
++#[allow(dead_code)]
++enum Gap {
++    Live(char),
++    Dead([u32; 0], Infallible),
++    After,
++}
++#[inline(never)]
++fn c_gap(g: Gap) -> u32 {
++    match g {
++        Gap::Live(c) => c as u32,
++        Gap::After => 7,
++        Gap::Dead(..) => 99,
++    }
++}
++const GAP_AFTER: Gap = Gap::After;
++const GAP_LIVE: Gap = Gap::Live('x');
++static GAPS: [Gap; 2] = [Gap::After, Gap::Live('y')];
++
++#[inline(never)]
++fn c_nz8(o: Option<NonZeroU8>) -> u32 {
++    o.map_or(1000, |v| v.get() as u32)
++}
++#[inline(never)]
++fn c_nz32(o: Option<NonZeroU32>) -> u32 {
++    o.map_or(1000, |v| v.get())
++}
++#[inline(never)]
++fn c_nz64(o: Option<NonZeroU64>) -> u64 {
++    o.map_or(1000, |v| v.get())
++}
++#[inline(never)]
++fn c_char(o: Option<char>) -> u32 {
++    o.map_or(1000, |v| v as u32)
++}
++#[inline(never)]
++fn c_bool(o: Option<bool>) -> u32 {
++    match o {
++        Some(true) => 1,
++        Some(false) => 0,
++        None => 9,
++    }
++}
++#[inline(never)]
++fn c_color(o: Option<Color>) -> u32 {
++    match o {
++        Some(Color::Red) => 1,
++        Some(Color::Green) => 2,
++        Some(Color::Blue) => 3,
++        None => 9,
++    }
++}
++#[inline(never)]
++fn c_ord(o: Option<Ordering>) -> i32 {
++    match o {
++        Some(v) => v as i32,
++        None => 9,
++    }
++}
++#[inline(never)]
++fn c_oob(o: Option<Option<bool>>) -> u32 {
++    match o {
++        Some(Some(true)) => 1,
++        Some(Some(false)) => 0,
++        Some(None) => 8,
++        None => 9,
++    }
++}
++#[inline(never)]
++fn c_ooob(o: Option<Option<Option<bool>>>) -> u32 {
++    match o {
++        Some(Some(Some(true))) => 1,
++        Some(Some(Some(false))) => 0,
++        Some(Some(None)) => 7,
++        Some(None) => 8,
++        None => 9,
++    }
++}
++#[inline(never)]
++fn c_wr(o: Wr) -> u32 {
++    match o {
++        Wr::V(Hi::A) => 1,
++        Wr::V(Hi::B) => 2,
++        Wr::N1 => 3,
++        Wr::N2 => 4,
++    }
++}
++#[inline(never)]
++fn c_owr(o: Option<Wr>) -> u32 {
++    o.map_or(9, c_wr)
++}
++#[inline(never)]
++fn c_sg(o: Option<Sg>) -> i32 {
++    match o {
++        Some(v) => v as i32,
++        None => 9,
++    }
++}
++#[inline(never)]
++fn c_multi(o: Multi) -> u32 {
++    match o {
++        Multi::Data { a, flag } => a * 10 + flag as u32,
++        Multi::X => 1,
++        Multi::Y => 2,
++        Multi::Z => 3,
++    }
++}
++#[inline(never)]
++fn c_dir(o: Dir) -> u32 {
++    match o {
++        Dir::Go(c) => c as u32,
++        Dir::Up => 1,
++        Dir::Down => 2,
++    }
++}
++
++const NZ8: [Option<NonZeroU8>; 2] = [NonZeroU8::new(200), None];
++static NZ32: [Option<NonZeroU32>; 2] = [None, NonZeroU32::new(70000)];
++const NZ64: [Option<NonZeroU64>; 2] = [NonZeroU64::new(1 << 40), None];
++const NZ32_C: Option<NonZeroU32> = NonZeroU32::new(77);
++const CHARS: [Option<char>; 3] = [Some('z'), None, Some('\u{10FFFF}')];
++static CHAR_S: Option<char> = Some('q');
++const BOOLS: [Option<bool>; 3] = [Some(true), Some(false), None];
++static COLORS: [Option<Color>; 4] = [Some(Color::Red), Some(Color::Green), Some(Color::Blue), None];
++const ORDS: [Option<Ordering>; 4] = [Some(Ordering::Less), Some(Ordering::Equal), Some(Ordering::Greater), None];
++const OOB: [Option<Option<bool>>; 4] = [Some(Some(true)), Some(Some(false)), Some(None), None];
++static OOOB: [Option<Option<Option<bool>>>; 5] =
++    [Some(Some(Some(true))), Some(Some(Some(false))), Some(Some(None)), Some(None), None];
++const WRS: [Wr; 4] = [Wr::V(Hi::A), Wr::V(Hi::B), Wr::N1, Wr::N2];
++static OWRS: [Option<Wr>; 5] = [Some(Wr::V(Hi::A)), Some(Wr::V(Hi::B)), Some(Wr::N1), Some(Wr::N2), None];
++const SGS: [Option<Sg>; 4] = [Some(Sg::M), Some(Sg::Z), Some(Sg::P), None];
++static MULTIS: [Multi; 5] = [Multi::Data { a: 4, flag: true }, Multi::X, Multi::Y, Multi::Z, Multi::Data { a: 5, flag: false }];
++const DIRS: [Dir; 3] = [Dir::Go('k'), Dir::Up, Dir::Down];
++const C_MULTI: Multi = Multi::Y;
++const C_DIR: Dir = Dir::Down;
++const C_WR: Wr = Wr::N2;
++const C_OOB: Option<Option<bool>> = Some(None);
++static mut SM_DIR: Dir = Dir::Up;
++
++struct Rec {
++    id: u8,
++    c: Option<char>,
++    m: Multi,
++}
++const RECS: &[Rec] = &[
++    Rec { id: 1, c: Some('a'), m: Multi::Z },
++    Rec { id: 2, c: None, m: Multi::Data { a: 6, flag: true } },
++];
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    for i in 0..2 {
++        print_u32(c_nz8(NZ8[idx(i)]));
++        print_u32(c_nz32(NZ32[idx(i)]));
++        print_u64(c_nz64(NZ64[idx(i)]));
++    }
++    print_u32(c_nz32(NZ32_C));
++    print_u32(c_nz32(black_box(NZ32_C)));
++    for i in 0..3 {
++        print_u32(c_char(CHARS[idx(i)]));
++        print_u32(c_bool(BOOLS[idx(i)]));
++    }
++    print_u32(c_char(CHAR_S));
++    for i in 0..4 {
++        print_u32(c_color(COLORS[idx(i)]));
++        print_i32(c_ord(ORDS[idx(i)]));
++        print_u32(c_oob(OOB[idx(i)]));
++        print_u32(c_wr(WRS[idx(i)]));
++        print_i32(c_sg(SGS[idx(i)]));
++    }
++    for i in 0..5 {
++        print_u32(c_ooob(OOOB[idx(i)]));
++        print_u32(c_owr(OWRS[idx(i)]));
++        print_u32(c_multi(MULTIS[idx(i)]));
++    }
++    for i in 0..3 {
++        print_u32(c_dir(DIRS[idx(i)]));
++    }
++    print_u32(c_multi(C_MULTI));
++    print_u32(c_dir(C_DIR));
++    print_u32(c_wr(C_WR));
++    print_u32(c_oob(C_OOB));
++    print_u32(c_multi(black_box(C_MULTI)));
++    print_u32(c_wr(black_box(C_WR)));
++    unsafe {
++        print_u32(c_dir(*black_box(&raw const SM_DIR)));
++        SM_DIR = Dir::Go('m');
++        print_u32(c_dir(*black_box(&raw const SM_DIR)));
++    }
++    for i in 0..2 {
++        let r = &RECS[idx(i)];
++        print_u32(r.id as u32);
++        print_u32(c_char(r.c));
++        print_u32(c_multi(r.m));
++    }
++    let promoted: &'static [Option<Wr>; 2] = &[Some(Wr::N1), None];
++    print_u32(c_owr(black_box(promoted)[idx(0)]));
++    print_u32(c_owr(black_box(promoted)[idx(1)]));
++    print_u32(c_gap(GAP_AFTER));
++    print_u32(c_gap(black_box(GAP_AFTER)));
++    print_u32(c_gap(GAP_LIVE));
++    print_bool(matches!(GAP_AFTER, Gap::After));
++    for i in 0..2 {
++        print_u32(c_gap(GAPS[idx(i)]));
++    }
++    // Run-time controls.
++    let lw = [Wr::V(Hi::B), Wr::N1, Wr::N2];
++    for i in 0..3 {
++        print_u32(c_wr(black_box(lw)[idx(i)]));
++    }
++    let lo: [Option<Option<Option<bool>>>; 3] = [Some(Some(None)), Some(None), None];
++    for i in 0..3 {
++        print_u32(c_ooob(black_box(lo)[idx(i)]));
++    }
++    let lg = [Gap::After, Gap::Live('z')];
++    for i in 0..2 {
++        print_u32(c_gap(black_box(lg)[idx(i)]));
++    }
++}
+diff --git a/examples/core-tests/243_niche_static_references.expected b/examples/core-tests/243_niche_static_references.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..f638b52af317613a46fba6345d8c4bfb59c18c9d
+--- /dev/null
++++ b/examples/core-tests/243_niche_static_references.expected
+@@ -0,0 +1,21 @@
++123
++123
++23
++23
++3
++0
++123
++true
++true
++true
++true
++true
++true
++23
++true
++0
++123
++40
++true
++named
++true
+diff --git a/examples/core-tests/243_niche_static_references.rs b/examples/core-tests/243_niche_static_references.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..096481f3935857082215f0f341b801cf1c531824
+--- /dev/null
++++ b/examples/core-tests/243_niche_static_references.rs
+@@ -0,0 +1,76 @@
++//! Statics that name other statics through a pointer niche keep the identity and the order of
++//! initialisation a plain reference has.
++//!
++//! `static HEAD: Node = Node { next: Some(&MID), .. }` holds a pointer whose provenance is the
++//! static `MID`, at offset zero, so its bytes are those of `None`: the list used to stop at its
++//! first node. Decoded by provenance, `Some(&MID)` is the binding `MID` itself — the same object
++//! `&MID` names anywhere else, so `ptr::eq` holds — and naming it is what orders `MID` before
++//! `HEAD`, exactly as a field of type `&'static Node` already did. The chain is declared consumer
++//! first, a `static mut` cursor is read, rewritten to `None` and to another static, and a
++//! primitive static is reached through its boxed slot.
++
++#![no_std]
++#![no_main]
++
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++
++use core::hint::black_box;
++use core::ptr;
++
++struct Node {
++    id: u32,
++    next: Option<&'static Node>,
++}
++// A chain declared tail-last, so a consumer is declared before what it names.
++static HEAD: Node = Node { id: 1, next: Some(&MID) };
++static MID: Node = Node { id: 2, next: Some(&TAIL) };
++static TAIL: Node = Node { id: 3, next: None };
++static ALIAS: Option<&Node> = Some(&HEAD);
++const CALIAS: Option<&Node> = Some(&MID);
++static TABLE: [Option<&Node>; 3] = [Some(&TAIL), None, Some(&HEAD)];
++static mut CURSOR: Option<&'static Node> = Some(&MID);
++static COUNTER: u32 = 40;
++static PCOUNT: Option<&u32> = Some(&COUNTER);
++static PSTR: Option<&&str> = Some(&NAME);
++static NAME: &str = "named";
++
++#[inline(never)]
++fn walk(mut n: Option<&'static Node>) -> u32 {
++    let mut t = 0;
++    while let Some(node) = n {
++        t = t * 10 + node.id;
++        n = node.next;
++    }
++    t
++}
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    print_u32(walk(Some(&HEAD)));
++    print_u32(walk(ALIAS));
++    print_u32(walk(CALIAS));
++    print_u32(walk(black_box(CALIAS)));
++    for i in 0..3 {
++        print_u32(walk(TABLE[black_box(i)]));
++    }
++    print_bool(ptr::eq(ALIAS.unwrap(), &HEAD));
++    print_bool(ptr::eq(CALIAS.unwrap(), &MID));
++    print_bool(ptr::eq(HEAD.next.unwrap(), &MID));
++    print_bool(ptr::eq(MID.next.unwrap(), &TAIL));
++    print_bool(ptr::eq(TABLE[black_box(2)].unwrap(), &HEAD));
++    print_bool(ptr::eq(TABLE[black_box(0)].unwrap(), MID.next.unwrap()));
++    unsafe {
++        print_u32(walk(*black_box(&raw const CURSOR)));
++        print_bool(ptr::eq((*black_box(&raw const CURSOR)).unwrap(), &MID));
++        CURSOR = TAIL.next;
++        print_u32(walk(*black_box(&raw const CURSOR)));
++        CURSOR = Some(&HEAD);
++        print_u32(walk(*black_box(&raw const CURSOR)));
++    }
++    print_u32(*PCOUNT.unwrap());
++    print_bool(ptr::eq(PCOUNT.unwrap(), &COUNTER));
++    print_str(*PSTR.unwrap());
++    print_bool(ptr::eq(PSTR.unwrap(), &NAME));
++}
+diff --git a/examples/core-tests/244_niche_pointer_wrappers.expected b/examples/core-tests/244_niche_pointer_wrappers.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..1cdcd26a08a8a614e39614b957b866e59d20b2a6
+--- /dev/null
++++ b/examples/core-tests/244_niche_pointer_wrappers.expected
+@@ -0,0 +1,33 @@
++true
++true
++true
++0
++200
++200
++300
++100
++200
++a-name
++12
++true
++12
++12
++13
++<anon>
++0
++false
++1
++2
++13
++200
++0
++77
++77
++true
++78
++78
++79
++79
++80
++80
++true
+diff --git a/examples/core-tests/244_niche_pointer_wrappers.maxbytes b/examples/core-tests/244_niche_pointer_wrappers.maxbytes
+new file mode 100644
+index 0000000000000000000000000000000000000000..eaf70f4e77deb257f3dbe4f7599714892362086e
+--- /dev/null
++++ b/examples/core-tests/244_niche_pointer_wrappers.maxbytes
+@@ -0,0 +1 @@
++28672
+diff --git a/examples/core-tests/244_niche_pointer_wrappers.rs b/examples/core-tests/244_niche_pointer_wrappers.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b126fdbed4b33c59c0b653991285a1ddaefa089a
+--- /dev/null
++++ b/examples/core-tests/244_niche_pointer_wrappers.rs
+@@ -0,0 +1,118 @@
++//! Pointer constants at types that hold a pointer without being one, and the edges of the pointer
++//! niche: zero-sized pointees, pointers into the middle of a promoted array, generic-position
++//! constants, and a const-generic choice between `Some` and `None`.
++//!
++//! A register-sized constant is a `ConstValue::Scalar`, and when the scalar is a pointer the type
++//! need not be a pointer type: `Option<&T>`, `NonNull<T>` (a transparent wrapper over a pattern
++//! type over `*const T`), a one-field struct, a one-element tuple. Each used to be treated as a
++//! pointer of its own type and refused (or, at a function, printed as the bare function); it is
++//! now put back into memory with its provenance and read at its type, by the same layout-driven
++//! reader as every other constant. `Some(&())` and `Some(&[])` point at zero-sized allocations,
++//! which are in bounds at offset zero and so not null.
++
++#![no_std]
++#![no_main]
++
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++
++use core::hint::black_box;
++use core::ptr::NonNull;
++
++#[inline(never)]
++fn idx(i: usize) -> usize {
++    black_box(i)
++}
++
++// Zero-sized pointees and interior pointers.
++const ZU: Option<&()> = Some(&());
++const ZA: Option<&[u8; 0]> = Some(&[]);
++const ARR: [u32; 3] = [100, 200, 300];
++const MID: Option<&u32> = Some(&ARR[1]);
++static SMID: [Option<&u32>; 2] = [Some(&ARR[2]), Some(&ARR[0])];
++struct SyncEnd(Option<NonNull<u32>>);
++unsafe impl Sync for SyncEnd {}
++/// A `NonNull` one element into a promoted array: offset 4 of its allocation.
++static ENDS: SyncEnd = SyncEnd(Some(unsafe {
++    NonNull::new_unchecked((&ARR as *const [u32; 3]).cast::<u32>().cast_mut().wrapping_add(1))
++}));
++
++// Generic-position constants.
++trait Named {
++    const NAME: Option<&'static str>;
++    const SCALE: Option<&'static u32>;
++}
++struct A;
++struct B;
++impl Named for A {
++    const NAME: Option<&'static str> = Some("a-name");
++    const SCALE: Option<&'static u32> = Some(&12);
++}
++impl Named for B {
++    const NAME: Option<&'static str> = None;
++    const SCALE: Option<&'static u32> = None;
++}
++struct Pick<T>(T);
++impl<T: Named> Pick<T> {
++    const BOTH: (Option<&'static str>, Option<&'static u32>) = (T::NAME, T::SCALE);
++    const TABLE: [Option<&'static u32>; 2] = [T::SCALE, Some(&13)];
++}
++#[inline(never)]
++fn report<T: Named>() {
++    match T::NAME {
++        Some(s) => print_str(s),
++        None => print_str("<anon>"),
++    }
++    print_u32(T::SCALE.map_or(0, |s| *s));
++    let both = Pick::<T>::BOTH;
++    print_bool(both.0.is_some());
++    print_u32(both.1.map_or(1, |s| *s));
++    print_u32(Pick::<T>::TABLE[idx(0)].map_or(2, |s| *s));
++    print_u32(Pick::<T>::TABLE[idx(1)].map_or(3, |s| *s));
++}
++#[inline(never)]
++fn nth<const N: usize>() -> Option<&'static u32> {
++    if N < 3 { Some(&ARR[N]) } else { None }
++}
++
++// Pointer constants at types that hold a pointer but are not enums.
++static NN_T: u32 = 77;
++const NN: NonNull<u32> = NonNull::from_ref(&NN_T);
++#[derive(Clone, Copy)]
++struct Plain(&'static u32);
++#[derive(Clone, Copy)]
++#[repr(transparent)]
++struct Clear(&'static u32);
++const PLAIN: Plain = Plain(&78);
++const CLEAR: Clear = Clear(&79);
++const TUP: (&'static u32,) = (&80,);
++const FNW: Plain = Plain(&NN_T);
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    print_bool(ZU.is_some());
++    print_bool(black_box(ZU).is_some());
++    print_bool(ZA.is_some());
++    print_usize(ZA.map_or(9, |a| a.len()));
++    print_u32(*MID.unwrap());
++    print_u32(*black_box(MID).unwrap());
++    for i in 0..2 {
++        print_u32(SMID[idx(i)].map_or(0, |v| *v));
++    }
++    print_u32(unsafe { *black_box(&ENDS).0.unwrap().as_ptr() });
++    report::<A>();
++    report::<B>();
++    print_u32(nth::<1>().map_or(0, |v| *v));
++    print_u32(nth::<5>().map_or(0, |v| *v));
++    print_u32(unsafe { *NN.as_ptr() });
++    print_u32(unsafe { *black_box(NN).as_ptr() });
++    print_bool(core::ptr::eq(NN.as_ptr(), &NN_T));
++    print_u32(*PLAIN.0);
++    print_u32(*black_box(PLAIN).0);
++    print_u32(*CLEAR.0);
++    print_u32(*black_box(CLEAR).0);
++    print_u32(*TUP.0);
++    print_u32(*black_box(TUP).0);
++    print_bool(core::ptr::eq(FNW.0, &NN_T));
++}
+diff --git a/examples/core-tests/245_niche_absent_variants.expected b/examples/core-tests/245_niche_absent_variants.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a9d45edca93548fdb260d5d7739956a10ed6af6
+--- /dev/null
++++ b/examples/core-tests/245_niche_absent_variants.expected
+@@ -0,0 +1,436 @@
++97
++97
++97
++7
++7
++7
++97
++7
++98
++98
++98
++7
++7
++7
++8
++8
++8
++98
++7
++8
++99
++99
++99
++7
++7
++7
++99
++7
++100
++100
++100
++7
++7
++7
++8
++8
++8
++100
++7
++8
++101
++101
++101
++7
++7
++7
++101
++7
++102
++102
++102
++7
++7
++7
++102
++7
++103
++103
++103
++6
++6
++6
++7
++7
++7
++103
++6
++7
++104
++104
++104
++5
++5
++5
++7
++7
++7
++104
++5
++7
++105
++105
++105
++5
++5
++5
++7
++7
++7
++105
++5
++7
++106
++106
++106
++7
++7
++7
++106
++7
++1
++1
++1
++2
++2
++2
++107
++107
++107
++3
++3
++3
++4
++4
++4
++1
++2
++107
++3
++4
++1
++1
++1
++11
++11
++11
++10
++10
++10
++2
++2
++2
++3
++3
++3
++1
++11
++10
++2
++3
++109
++109
++109
++1
++1
++1
++2
++2
++2
++109
++1
++2
++110
++110
++110
++7
++7
++7
++110
++7
++111
++111
++111
++7
++7
++7
++111
++7
++112
++112
++112
++5
++5
++5
++7
++7
++7
++112
++5
++7
++113
++113
++113
++5
++5
++5
++7
++7
++7
++113
++5
++7
++114
++114
++114
++7
++7
++7
++114
++7
++115
++115
++115
++7
++7
++7
++115
++7
++116
++116
++116
++7
++7
++7
++116
++7
++117
++117
++117
++7
++7
++7
++117
++7
++10
++10
++10
++11
++11
++11
++1
++1
++1
++2
++2
++2
++3
++3
++3
++10
++11
++1
++2
++3
++200
++200
++200
++1000
++1000
++1000
++200
++1000
++201
++201
++201
++1000
++1000
++1000
++201
++1000
++118
++118
++118
++7
++7
++7
++0
++0
++0
++118
++7
++0
++119
++119
++119
++7
++7
++7
++1
++1
++1
++0
++0
++0
++119
++7
++1
++0
++1
++1
++1
++11
++11
++11
++2
++2
++2
++3
++3
++3
++0
++0
++0
++1
++11
++2
++3
++0
++11
++11
++11
++10
++10
++10
++11
++10
++11
++11
++11
++10
++10
++10
++0
++0
++0
++11
++10
++0
++11
++11
++11
++10
++10
++10
++0
++0
++0
++11
++10
++0
++120
++120
++120
++0
++0
++0
++120
++0
++9
++9
++9
++0
++0
++0
++9
++0
++11
++11
++11
++0
++0
++0
++11
++0
++2
++2
++2
++254
++254
++254
++1000
++1000
++1000
++1001
++1001
++1001
++2
++254
++1000
++1001
++2
++2
++2
++254
++254
++254
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++2
++254
++1000
++1001
++1002
++5
++5
++5
++77
++77
++77
++1
++1
++1
++5
++77
++1
++6
++6
++6
++77
++77
++77
++1
++1
++1
++6
++77
++1
++8
++8
++8
++77
++77
++77
++1
++1
++1
++8
++77
++1
+diff --git a/examples/core-tests/245_niche_absent_variants.maxbytes b/examples/core-tests/245_niche_absent_variants.maxbytes
+new file mode 100644
+index 0000000000000000000000000000000000000000..cf8a2a14aae36cd4d3575703244b6292d63797cf
+--- /dev/null
++++ b/examples/core-tests/245_niche_absent_variants.maxbytes
+@@ -0,0 +1 @@
++163840
+diff --git a/examples/core-tests/245_niche_absent_variants.rs b/examples/core-tests/245_niche_absent_variants.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..281baf206c318250303c2b25f463f214a1be837e
+--- /dev/null
++++ b/examples/core-tests/245_niche_absent_variants.rs
+@@ -0,0 +1,189 @@
++//! Niche enums with variants rustc leaves out of the layout, and variants it keeps although they
++//! are uninhabited, read back from constants: inline, as an argument, through `black_box`, and from
++//! a `static` table.
++//!
++//! rustc numbers the niche values from the first to the last variant that is neither the untagged
++//! one nor *absent*, and a variant is absent only when it is uninhabited AND every field is a
++//! 1-ZST. A register-sized constant reaches the link-time decoder as bits, and that decoder
++//! rebuilds the numbering from the type table, so it has to see uninhabitedness at any depth
++//! (`Wrap<Void>`, `(Void,)`, `[Void; 2]`, an enum all of whose variants are dead) and keep a dead
++//! variant that holds a non-1-ZST field (`[u32; 0]` or `u8` beside `Void`, a 4-aligned
++//! uninhabited struct). Dead variants sit at the start, in the middle and at the end, the untagged
++//! variant sits in the middle, and `[Void; 0]` and `PhantomData<Void>` are the inhabited controls.
++//! Derived from the A4 round-1 verifier's probe `v1_absent.rs`.
++
++#![no_std]
++#![no_main]
++
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++
++use core::convert::Infallible;
++use core::hint::black_box;
++use core::marker::PhantomData;
++use core::num::NonZeroU8;
++
++trait HasOut {
++    type Out;
++}
++impl<T> HasOut for fn() -> T {
++    type Out = T;
++}
++type Never = <fn() -> ! as HasOut>::Out;
++
++#[derive(Clone, Copy)]
++enum Void {}
++#[derive(Clone, Copy)]
++struct Wrap<T>(T);
++#[derive(Clone, Copy)]
++#[repr(align(4))]
++struct Aligned(Void);
++#[derive(Clone, Copy)]
++enum AllDead {
++    A(Void),
++    B(Never),
++}
++
++macro_rules! suite {
++    ($f:ident, $T:ty, [$($k:expr),* $(,)?], |$e:ident| $body:expr) => {
++        #[inline(never)]
++        fn $f() {
++            #[inline(never)]
++            fn cls($e: $T) -> u32 { $body }
++            static TABLE: &[$T] = &[$($k),*];
++            $(
++                {
++                    const K: $T = $k;
++                    { let $e = K; print_u32($body); }
++                    print_u32(cls(K));
++                    print_u32(cls(black_box(K)));
++                }
++            )*
++            let mut i = 0;
++            while i < TABLE.len() {
++                print_u32(cls(TABLE[black_box(i)]));
++                i += 1;
++            }
++        }
++    };
++}
++
++#[derive(Clone, Copy)]
++enum E1 { Live(char), Dead(Never), After }
++suite!(s1, E1, [E1::Live('a'), E1::After], |e| match e { E1::Live(c) => c as u32, E1::After => 7, E1::Dead(_) => 99 });
++
++#[derive(Clone, Copy)]
++enum E2 { Dead(Void), Live(char), After, Last }
++suite!(s2, E2, [E2::Live('b'), E2::After, E2::Last], |e| match e { E2::Live(c) => c as u32, E2::After => 7, E2::Last => 8, E2::Dead(_) => 99 });
++
++#[derive(Clone, Copy)]
++enum E3 { Live(char), Dead([u32; 0], Void), After }
++suite!(s3, E3, [E3::Live('c'), E3::After], |e| match e { E3::Live(c) => c as u32, E3::After => 7, E3::Dead(..) => 99 });
++
++#[derive(Clone, Copy)]
++enum E4 { Live(char), Dead(Void, [u64; 0]), After, Dead2(Infallible), Last }
++suite!(s4, E4, [E4::Live('d'), E4::After, E4::Last], |e| match e { E4::Live(c) => c as u32, E4::After => 7, E4::Last => 8, E4::Dead(..) => 99, E4::Dead2(_) => 98 });
++
++#[derive(Clone, Copy)]
++enum E5 { Live(char), Dead(Aligned), After }
++suite!(s5, E5, [E5::Live('e'), E5::After], |e| match e { E5::Live(c) => c as u32, E5::After => 7, E5::Dead(_) => 99 });
++
++#[derive(Clone, Copy)]
++enum E6 { Live(char), Dead(Wrap<Void>), After }
++suite!(s6, E6, [E6::Live('f'), E6::After], |e| match e { E6::Live(c) => c as u32, E6::After => 7, E6::Dead(_) => 99 });
++
++#[derive(Clone, Copy)]
++enum E7 { Live(char), Dead((Void,)), Mid, Dead2([Void; 2]), After }
++suite!(s7, E7, [E7::Live('g'), E7::Mid, E7::After], |e| match e { E7::Live(c) => c as u32, E7::Mid => 6, E7::After => 7, E7::Dead(_) => 99, E7::Dead2(_) => 98 });
++
++#[derive(Clone, Copy)]
++enum E8 { Live(char), Empty([Void; 0]), After }
++suite!(s8, E8, [E8::Live('h'), E8::Empty([]), E8::After], |e| match e { E8::Live(c) => c as u32, E8::After => 7, E8::Empty(_) => 5 });
++
++#[derive(Clone, Copy)]
++enum E9 { Live(char), Ph(PhantomData<Void>), After }
++suite!(s9, E9, [E9::Live('i'), E9::Ph(PhantomData), E9::After], |e| match e { E9::Live(c) => c as u32, E9::After => 7, E9::Ph(_) => 5 });
++
++#[derive(Clone, Copy)]
++enum E10 { Live(char), Dead(AllDead), After }
++suite!(s10, E10, [E10::Live('j'), E10::After], |e| match e { E10::Live(c) => c as u32, E10::After => 7, E10::Dead(_) => 99 });
++
++#[derive(Clone, Copy)]
++enum E11 { A, B, Live(char), C, D }
++suite!(s11, E11, [E11::A, E11::B, E11::Live('k'), E11::C, E11::D], |e| match e { E11::A => 1, E11::B => 2, E11::Live(c) => c as u32, E11::C => 3, E11::D => 4 });
++
++#[derive(Clone, Copy)]
++enum E12 { Dead(Void), A, Live(bool), Dead2(Never), B, Dead3(Void), C }
++suite!(s12, E12, [E12::A, E12::Live(true), E12::Live(false), E12::B, E12::C], |e| match e { E12::A => 1, E12::Live(b) => 10 + b as u32, E12::B => 2, E12::C => 3, E12::Dead(_) => 99, E12::Dead2(_) => 98, E12::Dead3(_) => 97 });
++
++#[derive(Clone, Copy)]
++enum E13 { Live(char), A, B, Dead(Void) }
++suite!(s13, E13, [E13::Live('m'), E13::A, E13::B], |e| match e { E13::Live(c) => c as u32, E13::A => 1, E13::B => 2, E13::Dead(_) => 99 });
++
++#[derive(Clone, Copy)]
++enum E14 { Dead(u8, Void), Live(char), After }
++suite!(s14, E14, [E14::Live('n'), E14::After], |e| match e { E14::Live(c) => c as u32, E14::After => 7, E14::Dead(..) => 99 });
++
++#[derive(Clone, Copy)]
++enum G<T> { Live(char), Mid(T), After }
++suite!(s16a, G<Void>, [G::Live('o'), G::After], |e| match e { G::Live(c) => c as u32, G::After => 7, G::Mid(_) => 99 });
++suite!(s16b, G<()>, [G::Live('p'), G::Mid(()), G::After], |e| match e { G::Live(c) => c as u32, G::After => 7, G::Mid(_) => 5 });
++suite!(s16c, G<[u32; 0]>, [G::Live('q'), G::Mid([]), G::After], |e| match e { G::Live(c) => c as u32, G::After => 7, G::Mid(_) => 5 });
++suite!(s16d, G<Never>, [G::Live('r'), G::After], |e| match e { G::Live(c) => c as u32, G::After => 7, G::Mid(_) => 99 });
++suite!(s16e, G<([u16; 0], Void)>, [G::Live('s'), G::After], |e| match e { G::Live(c) => c as u32, G::After => 7, G::Mid(_) => 99 });
++suite!(s16f, G<(u32, Void)>, [G::Live('t'), G::After], |e| match e { G::Live(c) => c as u32, G::After => 7, G::Mid(_) => 99 });
++suite!(s16g, G<Wrap<Wrap<(Void, ())>>>, [G::Live('u'), G::After], |e| match e { G::Live(c) => c as u32, G::After => 7, G::Mid(_) => 99 });
++
++#[derive(Clone, Copy)]
++enum E17 { Live(bool), Dead(Void), A, B, C }
++suite!(s17, E17, [E17::Live(false), E17::Live(true), E17::A, E17::B, E17::C], |e| match e { E17::Live(b) => 10 + b as u32, E17::A => 1, E17::B => 2, E17::C => 3, E17::Dead(_) => 99 });
++
++#[derive(Clone, Copy)]
++enum E18 { Live(NonZeroU8), Dead(Never), A }
++suite!(s18, E18, [E18::Live(NonZeroU8::new(200).unwrap()), E18::A], |e| match e { E18::Live(n) => n.get() as u32, E18::A => 1000, E18::Dead(_) => 99 });
++
++#[derive(Clone, Copy)]
++enum E18b { Live(NonZeroU8), Dead([u8; 0], Void), A }
++suite!(s18b, E18b, [E18b::Live(NonZeroU8::new(201).unwrap()), E18b::A], |e| match e { E18b::Live(n) => n.get() as u32, E18b::A => 1000, E18b::Dead(..) => 99 });
++
++suite!(s19a, Option<E1>, [Some(E1::Live('v')), Some(E1::After), None], |e| match e { Some(E1::Live(c)) => c as u32, Some(E1::After) => 7, Some(E1::Dead(_)) => 99, None => 0 });
++suite!(s19b, Option<Option<E3>>, [Some(Some(E3::Live('w'))), Some(Some(E3::After)), Some(None), None], |e| match e { Some(Some(E3::Live(c))) => c as u32, Some(Some(E3::After)) => 7, Some(Some(E3::Dead(..))) => 99, Some(None) => 1, None => 0 });
++suite!(s19c, Option<E12>, [Some(E12::A), Some(E12::Live(true)), Some(E12::B), Some(E12::C), None], |e| match e { Some(E12::A) => 1, Some(E12::Live(b)) => 10 + b as u32, Some(E12::B) => 2, Some(E12::C) => 3, Some(_) => 99, None => 0 });
++
++suite!(s20a, Result<bool, Void>, [Ok(true), Ok(false)], |e| match e { Ok(b) => 10 + b as u32, Err(_) => 99 });
++suite!(s20b, Option<Result<bool, Void>>, [Some(Ok(true)), Some(Ok(false)), None], |e| match e { Some(Ok(b)) => 10 + b as u32, Some(Err(_)) => 99, None => 0 });
++suite!(s20c, Option<Result<Void, bool>>, [Some(Err(true)), Some(Err(false)), None], |e| match e { Some(Err(b)) => 10 + b as u32, Some(Ok(_)) => 99, None => 0 });
++suite!(s20d, Option<Result<Never, char>>, [Some(Err('x')), None], |e| match e { Some(Err(c)) => c as u32, Some(Ok(_)) => 99, None => 0 });
++suite!(s20e, Option<Result<Infallible, NonZeroU8>>, [Some(Err(NonZeroU8::new(9).unwrap())), None], |e| match e { Some(Err(n)) => n.get() as u32, Some(Ok(_)) => 99, None => 0 });
++suite!(s20f, Result<Option<bool>, Infallible>, [Ok(Some(true)), Ok(None)], |e| match e { Ok(Some(b)) => 10 + b as u32, Ok(None) => 0, Err(_) => 99 });
++
++#[derive(Clone, Copy)]
++#[repr(u8)]
++enum Small { X = 2, Y = 0xFE }
++#[derive(Clone, Copy)]
++enum E21 { P(Small), Q, Dead(Void), R }
++suite!(s21, E21, [E21::P(Small::X), E21::P(Small::Y), E21::Q, E21::R], |e| match e { E21::P(s) => s as u32, E21::Q => 1000, E21::R => 1001, E21::Dead(_) => 99 });
++#[derive(Clone, Copy)]
++enum E21b { P(Small), Q, R, S }
++suite!(s21b, E21b, [E21b::P(Small::X), E21b::P(Small::Y), E21b::Q, E21b::R, E21b::S], |e| match e { E21b::P(s) => s as u32, E21b::Q => 1000, E21b::R => 1001, E21b::S => 1002 });
++
++static SEVEN: u32 = 77;
++#[derive(Clone, Copy)]
++enum R1 { Live(&'static u32), Dead(Void), Nil }
++suite!(s22a, R1, [R1::Live(&5), R1::Live(&SEVEN), R1::Nil], |e| match e { R1::Live(r) => *r, R1::Nil => 1, R1::Dead(_) => 99 });
++#[derive(Clone, Copy)]
++enum R2 { Nil, Dead(Void), Live(&'static u32) }
++suite!(s22b, R2, [R2::Live(&6), R2::Live(&SEVEN), R2::Nil], |e| match e { R2::Live(r) => *r, R2::Nil => 1, R2::Dead(_) => 99 });
++#[derive(Clone, Copy)]
++enum R3 { Live(&'static u32), Nil, Dead([u8; 0], Void) }
++suite!(s22c, R3, [R3::Live(&8), R3::Live(&SEVEN), R3::Nil], |e| match e { R3::Live(r) => *r, R3::Nil => 1, R3::Dead(..) => 99 });
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    s1(); s2(); s3(); s4(); s5(); s6(); s7(); s8(); s9(); s10(); s11(); s12(); s13(); s14();
++    s16a(); s16b(); s16c(); s16d(); s16e(); s16f(); s16g();
++    s17(); s18(); s18b(); s19a(); s19b(); s19c();
++    s20a(); s20b(); s20c(); s20d(); s20e(); s20f();
++    s21(); s21b(); s22a(); s22b(); s22c();
++}
+diff --git a/examples/core-tests/246_niche_single_variant_payloads.expected b/examples/core-tests/246_niche_single_variant_payloads.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..e8ba3268298b38c3fd553226952b982d18ca91ff
+--- /dev/null
++++ b/examples/core-tests/246_niche_single_variant_payloads.expected
+@@ -0,0 +1,248 @@
++119
++119
++119
++0
++0
++0
++119
++0
++118
++118
++118
++118
++120
++120
++120
++0
++0
++0
++120
++0
++121
++121
++121
++0
++0
++0
++121
++0
++11
++11
++11
++10
++10
++10
++0
++0
++0
++11
++10
++0
++2
++2
++2
++254
++254
++254
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++2
++254
++1000
++1001
++1002
++2
++2
++2
++254
++254
++254
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++2
++254
++1000
++1001
++1002
++200
++200
++200
++253
++253
++253
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++200
++253
++1000
++1001
++1002
++253
++253
++253
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++253
++1000
++1001
++1002
++253
++253
++253
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++253
++1000
++1001
++1002
++253
++253
++253
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++253
++1000
++1001
++1002
++253
++253
++253
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++253
++1000
++1001
++1002
++253
++253
++253
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++253
++1000
++1001
++1002
++253
++253
++253
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++253
++1000
++1001
++1002
++253
++253
++253
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++253
++1000
++1001
++1002
++253
++253
++253
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++253
++1000
++1001
++1002
++253
++253
++253
++1000
++1000
++1000
++1001
++1001
++1001
++1002
++1002
++1002
++253
++1000
++1001
++1002
++117
++117
++116
++116
+diff --git a/examples/core-tests/246_niche_single_variant_payloads.maxbytes b/examples/core-tests/246_niche_single_variant_payloads.maxbytes
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff783194a1e8f3b20f8f626e05adec150db45159
+--- /dev/null
++++ b/examples/core-tests/246_niche_single_variant_payloads.maxbytes
+@@ -0,0 +1 @@
++98304
+diff --git a/examples/core-tests/246_niche_single_variant_payloads.rs b/examples/core-tests/246_niche_single_variant_payloads.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..72fffa862c52119b49cffe8527379187eed515c3
+--- /dev/null
++++ b/examples/core-tests/246_niche_single_variant_payloads.rs
+@@ -0,0 +1,209 @@
++//! A niche that lives inside an enum rustc lays out as a single variant other than variant 0, and
++//! constants of such enums themselves.
++//!
++//! `enum Parsed { Never((), Infallible), Char(char) }` has one present variant, `Char`, so its
++//! layout is that variant alone and `Option<Parsed>` keeps its `None` in the `char`. The niche is
++//! recorded as a path of field indices through the layout, and the link-time decoder used to
++//! follow it through the enum's *first* variant: it landed on the `()` of `Never`, read the niche
++//! as zero bits wide, and decoded every bit pattern as the first niche variant (`Some('w')` read
++//! as `None`; `W::P(..)`, `W::R` and `W::S` all read as `W::Q`). `WW` puts the same single-variant
++//! payload under niche values that wrap past `u8::MAX` (254, 255, 0), so a decoder that lost the
++//! scalar's width and subtracted at another width would read `WW::S` as `WW::P`. The same walk
++//! passes through transparent wrappers, `ManuallyDrop`, tuples, plain one-field structs and named
++//! structs, which the `fam!` rows pin over that wrapping range. A constant of such an enum used
++//! directly (`const P: Parsed = Parsed::Char('w')`) is decoded by the same layout rule.
++
++#![no_std]
++#![no_main]
++
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++
++use core::convert::Infallible;
++use core::hint::black_box;
++use core::mem::ManuallyDrop;
++
++trait HasOut {
++    type Out;
++}
++impl<T> HasOut for fn() -> T {
++    type Out = T;
++}
++type Never = <fn() -> ! as HasOut>::Out;
++
++macro_rules! suite {
++    ($f:ident, $T:ty, [$($k:expr),* $(,)?], |$e:ident| $body:expr) => {
++        #[inline(never)]
++        fn $f() {
++            #[inline(never)]
++            fn cls($e: $T) -> u32 { $body }
++            static TABLE: &[$T] = &[$($k),*];
++            $(
++                {
++                    const K: $T = $k;
++                    { let $e = K; print_u32($body); }
++                    print_u32(cls(K));
++                    print_u32(cls(black_box(K)));
++                }
++            )*
++            let mut i = 0;
++            while i < TABLE.len() {
++                print_u32(cls(TABLE[black_box(i)]));
++                i += 1;
++            }
++        }
++    };
++}
++
++#[derive(Clone, Copy)]
++enum Parsed {
++    Never((), Infallible),
++    Char(char),
++}
++suite!(parsed, Option<Parsed>, [Some(Parsed::Char('w')), None],
++    |e| match e { Some(Parsed::Char(c)) => c as u32, Some(Parsed::Never(..)) => 99, None => 0 });
++suite!(bare, Parsed, [Parsed::Char('v')], |e| match e { Parsed::Char(c) => c as u32, Parsed::Never(..) => 99 });
++suite!(never_ok, Option<Result<Never, char>>, [Some(Err('x')), None],
++    |e| match e { Some(Err(c)) => c as u32, Some(Ok(_)) => 99, None => 0 });
++suite!(infallible_ok, Option<Result<Infallible, char>>, [Some(Err('y')), None],
++    |e| match e { Some(Err(c)) => c as u32, Some(Ok(_)) => 99, None => 0 });
++
++#[derive(Clone, Copy)]
++enum Third {
++    A(Infallible),
++    B((), Infallible),
++    C(bool),
++}
++suite!(third, Option<Third>, [Some(Third::C(true)), Some(Third::C(false)), None],
++    |e| match e { Some(Third::C(b)) => 10 + b as u32, Some(_) => 99, None => 0 });
++
++/// Discriminants 2 and 254: rustc takes the valid range 254..=2, which wraps, and the three niche
++/// values after it are 3, 4 and 5.
++#[derive(Clone, Copy)]
++#[repr(u8)]
++enum Small {
++    X = 2,
++    Y = 0xFE,
++}
++#[derive(Clone, Copy)]
++enum Inner {
++    Dead((), Infallible),
++    Live(Small),
++}
++#[derive(Clone, Copy)]
++enum W {
++    P(Inner),
++    Q,
++    R,
++    S,
++}
++suite!(wrapping, W, [W::P(Inner::Live(Small::X)), W::P(Inner::Live(Small::Y)), W::Q, W::R, W::S],
++    |e| match e { W::P(Inner::Live(s)) => s as u32, W::P(_) => 99, W::Q => 1000, W::R => 1001, W::S => 1002 });
++#[derive(Clone, Copy)]
++enum W2 {
++    P(Result<Never, Small>),
++    Q,
++    R,
++    S,
++}
++suite!(wrapping_result, W2, [W2::P(Err(Small::X)), W2::P(Err(Small::Y)), W2::Q, W2::R, W2::S],
++    |e| match e { W2::P(Err(s)) => s as u32, W2::P(Ok(_)) => 99, W2::Q => 1000, W2::R => 1001, W2::S => 1002 });
++
++/// Valid range 200..=253: three niche values are 254, 255 and 0, wrapping past `u8::MAX`.
++#[derive(Clone, Copy)]
++#[repr(u8)]
++enum Hi {
++    A = 200,
++    B = 253,
++}
++#[derive(Clone, Copy)]
++enum InnerHi {
++    Dead((), Infallible),
++    Live(Hi),
++}
++#[derive(Clone, Copy)]
++enum WW {
++    P(InnerHi),
++    Q,
++    R,
++    S,
++}
++suite!(wrapping_hi, WW, [WW::P(InnerHi::Live(Hi::A)), WW::P(InnerHi::Live(Hi::B)), WW::Q, WW::R, WW::S],
++    |e| match e { WW::P(InnerHi::Live(h)) => h as u32, WW::P(_) => 99, WW::Q => 1000, WW::R => 1001, WW::S => 1002 });
++#[derive(Clone, Copy)]
++enum WW2 {
++    P(Result<Never, Hi>),
++    Q,
++    R,
++    S,
++}
++suite!(wrapping_hi_result, WW2, [WW2::P(Err(Hi::B)), WW2::Q, WW2::R, WW2::S],
++    |e| match e { WW2::P(Err(h)) => h as u32, WW2::P(Ok(_)) => 99, WW2::Q => 1000, WW2::R => 1001, WW2::S => 1002 });
++
++#[derive(Clone, Copy)]
++#[repr(transparent)]
++struct Tr<T>(T);
++#[derive(Clone, Copy)]
++struct Wrap<T>(T);
++#[derive(Clone, Copy)]
++struct Named {
++    z: (),
++    s: Hi,
++}
++
++macro_rules! fam {
++    ($f:ident, $W:ident, $P:ty, $mk:expr, |$p:ident| $get:expr) => {
++        #[derive(Clone, Copy)]
++        enum $W {
++            P($P),
++            Q,
++            R,
++            S,
++        }
++        suite!($f, $W, [$W::P($mk), $W::Q, $W::R, $W::S],
++            |e| match e { $W::P($p) => $get as u32, $W::Q => 1000, $W::R => 1001, $W::S => 1002 });
++    };
++}
++fam!(direct, W0, Hi, Hi::B, |p| p);
++fam!(transparent, W1, Tr<Hi>, Tr(Hi::B), |p| p.0);
++fam!(manually, W2m, ManuallyDrop<Hi>, ManuallyDrop::new(Hi::B), |p| *p);
++fam!(tuple, W3, (Hi,), (Hi::B,), |p| p.0);
++fam!(wrap, W4, Wrap<Hi>, Wrap(Hi::B), |p| p.0);
++fam!(named, W5, Named, Named { z: (), s: Hi::B }, |p| p.s);
++fam!(nested, W6, Wrap<Tr<(Hi,)>>, Wrap(Tr((Hi::B,))), |p| ((p.0).0).0);
++fam!(through_enum, W7, Wrap<InnerHi>, Wrap(InnerHi::Live(Hi::B)),
++    |p| (match p.0 { InnerHi::Live(h) => h as u32, InnerHi::Dead(..) => 99 }));
++
++#[inline(never)]
++fn direct_single_layout() {
++    // Register-sized constants of a single-variant layout, used directly.
++    const P: Parsed = Parsed::Char('u');
++    const R: Result<Never, char> = Err('t');
++    print_u32(match P { Parsed::Char(c) => c as u32, Parsed::Never(..) => 99 });
++    print_u32(match black_box(P) { Parsed::Char(c) => c as u32, Parsed::Never(..) => 99 });
++    print_u32(match R { Err(c) => c as u32, Ok(_) => 99 });
++    print_u32(match black_box(R) { Err(c) => c as u32, Ok(_) => 99 });
++}
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    parsed();
++    bare();
++    never_ok();
++    infallible_ok();
++    third();
++    wrapping();
++    wrapping_result();
++    wrapping_hi();
++    wrapping_hi_result();
++    direct();
++    transparent();
++    manually();
++    tuple();
++    wrap();
++    named();
++    nested();
++    through_enum();
++    direct_single_layout();
++}
+diff --git a/examples/core-tests/247_static_wide_pointers.expected b/examples/core-tests/247_static_wide_pointers.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f1f52b198bcb30dd89f4db8f3a50107f9b6a40c
+--- /dev/null
++++ b/examples/core-tests/247_static_wide_pointers.expected
+@@ -0,0 +1,30 @@
++3
++200
++600
++true
++2
++200
++true
++3
++600
++3
++600
++none
++h
++600
++2
++500
++hello
++5
++hello
++1
++7
++true
++1
++3
++true
++3
++600
++none
++2
++500
+diff --git a/examples/core-tests/247_static_wide_pointers.rs b/examples/core-tests/247_static_wide_pointers.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..45fe9feb8b0ef4923d01bda805a09fcb0a9175fb
+--- /dev/null
++++ b/examples/core-tests/247_static_wide_pointers.rs
+@@ -0,0 +1,102 @@
++//! Wide pointers into statics: `&[T]` and `&str`, plain, inside `Option`, inside a struct and in
++//! a table.
++//!
++//! A slice is `{ buf, off, len }`, and a pointer into a static used to become the static's binding
++//! alone: `static SL: &[u32] = &ARR` had no length (`SL.len()` was `undefined`), and once
++//! `Some(&ARR)` decoded as `Some` the same slice made indexing panic. The buffer is the static's
++//! own array, so `ptr::eq` with the static holds, `ARR.split_at(1).1` starts one element in, and
++//! `slice::from_ref` of a primitive or an aggregate static is one element of it. A `&str` built
++//! from a static's bytes by `str::from_utf8` is the text of those bytes. (A `const` that names a
++//! static, `const C: &[u32] = &ARR`, is a wide pointer constant inside the body that uses it; the
++//! JIR lane cannot carry its length, so it is left out here: see CONTRACT.md.)
++
++#![no_std]
++#![no_main]
++
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++
++use core::hint::black_box;
++
++static ARR: [u32; 3] = [100, 200, 300];
++static SL: &[u32] = &ARR;
++static TAIL: &[u32] = ARR.split_at(1).1;
++static OPT: Option<&[u32]> = Some(&ARR);
++static NONE: Option<&[u32]> = None;
++struct Holder {
++    name: &'static str,
++    data: &'static [u32],
++    more: Option<&'static [u32]>,
++}
++static H: Holder = Holder { name: "h", data: &ARR, more: Some(TAIL) };
++static BYTES: [u8; 5] = *b"hello";
++static TEXT: &str = match core::str::from_utf8(&BYTES) {
++    Ok(s) => s,
++    Err(_) => "bad",
++};
++static OTEXT: Option<&str> = match core::str::from_utf8(&BYTES) {
++    Ok(s) => Some(s),
++    Err(_) => None,
++};
++static ONE: u32 = 7;
++static ONE_SL: &[u32] = core::slice::from_ref(&ONE);
++#[derive(Clone, Copy)]
++struct Pt {
++    x: u32,
++    y: u32,
++}
++static PT: Pt = Pt { x: 1, y: 2 };
++static PT_SL: &[Pt] = core::slice::from_ref(&PT);
++static TABLE: [Option<&[u32]>; 3] = [Some(&ARR), None, Some(TAIL)];
++
++#[inline(never)]
++fn sum(s: &[u32]) -> u32 {
++    let mut t = 0;
++    for v in s {
++        t += *v;
++    }
++    t
++}
++#[inline(never)]
++fn show(o: Option<&[u32]>) {
++    match o {
++        Some(s) => {
++            print_usize(s.len());
++            print_u32(sum(s));
++        }
++        None => print_str("none"),
++    }
++}
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    print_usize(SL.len());
++    print_u32(black_box(SL)[1]);
++    print_u32(sum(SL));
++    print_bool(core::ptr::eq(SL.as_ptr(), ARR.as_ptr()));
++    print_usize(TAIL.len());
++    print_u32(TAIL[0]);
++    print_bool(core::ptr::eq(TAIL.as_ptr(), &ARR[1]));
++    show(OPT);
++    show(black_box(OPT));
++    show(NONE);
++    print_str(H.name);
++    print_u32(sum(black_box(&H).data));
++    show(H.more);
++    print_str(TEXT);
++    print_usize(TEXT.len());
++    match OTEXT {
++        Some(s) => print_str(s),
++        None => print_str("<none>"),
++    }
++    print_usize(ONE_SL.len());
++    print_u32(ONE_SL[0]);
++    print_bool(core::ptr::eq(&ONE_SL[0], &ONE));
++    print_usize(PT_SL.len());
++    print_u32(PT_SL[0].x + PT_SL[0].y);
++    print_bool(core::ptr::eq(&PT_SL[0], &PT));
++    for i in 0..3 {
++        show(TABLE[black_box(i)]);
++    }
++}
+diff --git a/examples/core-tests/248_single_variant_discriminant.expected b/examples/core-tests/248_single_variant_discriminant.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..d678f4fd71b45d5b6f69763385cf7460df05e072
+--- /dev/null
++++ b/examples/core-tests/248_single_variant_discriminant.expected
+@@ -0,0 +1,11 @@
++122
++121
++5
++6
++7
++8
++120
++9
++119
++true
++true
+diff --git a/examples/core-tests/248_single_variant_discriminant.rs b/examples/core-tests/248_single_variant_discriminant.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..ef61f0d495cc15067e982dc555da34a1bc9937f6
+--- /dev/null
++++ b/examples/core-tests/248_single_variant_discriminant.rs
+@@ -0,0 +1,87 @@
++//! The run-time discriminant of an enum rustc lays out as a single variant other than the first.
++//!
++//! Such a layout stores no tag, so the discriminant is a constant: the variant rustc lays out,
++//! which is the first one that is not *absent* (uninhabited with only 1-ZST fields). The lowering
++//! and dead-code elimination used to take the first variant a shallow uninhabitedness test leaves
++//! standing, and `(Infallible, ())`, `Wrap<Infallible>` or `[Void; 1]` hide their `Infallible` from
++//! that test: `match r { Ok(_) => .., Err(c) => .. }` on `Result<(Infallible, ()), char>` took the
++//! `Ok` arm, which is unreachable, and threw. The controls are variants whose `Infallible` the
++//! shallow test does see, and a `Result` with two live variants.
++
++#![no_std]
++#![no_main]
++
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++
++use core::convert::Infallible;
++use core::hint::black_box;
++
++#[derive(Clone, Copy)]
++struct Wrap<T>(T);
++#[derive(Clone, Copy)]
++enum Void {}
++
++#[inline(never)]
++fn tuple(r: Result<(Infallible, ()), char>) -> u32 {
++    match r {
++        Ok(_) => 99,
++        Err(c) => c as u32,
++    }
++}
++#[derive(Clone, Copy)]
++enum Second {
++    Dead(Wrap<Infallible>),
++    Live(u32),
++}
++#[inline(never)]
++fn second(s: Second) -> u32 {
++    match s {
++        Second::Dead(_) => 99,
++        Second::Live(n) => n,
++    }
++}
++#[derive(Clone, Copy)]
++enum Third {
++    A([Void; 1]),
++    B((), Wrap<(Void,)>),
++    C(u16),
++}
++#[inline(never)]
++fn third(t: Third) -> u32 {
++    match t {
++        Third::C(n) => n as u32,
++        _ => 99,
++    }
++}
++#[inline(never)]
++fn plain(r: Result<Infallible, char>) -> u32 {
++    match r {
++        Ok(_) => 99,
++        Err(c) => c as u32,
++    }
++}
++#[inline(never)]
++fn both(r: Result<u8, char>) -> u32 {
++    match r {
++        Ok(n) => n as u32,
++        Err(c) => c as u32,
++    }
++}
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    print_u32(tuple(black_box(Err('z'))));
++    print_u32(tuple(Err('y')));
++    print_u32(second(Second::Live(black_box(5))));
++    print_u32(second(black_box(Second::Live(6))));
++    print_u32(third(Third::C(black_box(7))));
++    print_u32(third(black_box(Third::C(8))));
++    print_u32(plain(black_box(Err('x'))));
++    print_u32(both(black_box(Ok(9))));
++    print_u32(both(black_box(Err('w'))));
++    let local: Result<(Infallible, ()), char> = Err(black_box('v'));
++    print_bool(local.is_err());
++    print_bool(matches!(black_box(local), Err('v')));
++}
+diff --git a/examples/core-tests/249_dyn_constant_refused.expect_fail b/examples/core-tests/249_dyn_constant_refused.expect_fail
+new file mode 100644
+index 0000000000000000000000000000000000000000..78caa2f9a01c83dde17294c87d93e88e12576a30
+--- /dev/null
++++ b/examples/core-tests/249_dyn_constant_refused.expect_fail
+@@ -0,0 +1,4 @@
++a `&dyn Speak + core::marker::Sync` in a constant is a trait object
++a `&dyn Named` in a constant is a trait object
++a `&dyn Labeled` in a constant is a trait object
++whose vtable rustc_codegen_js does not decode out of constant data
+diff --git a/examples/core-tests/249_dyn_constant_refused.rs b/examples/core-tests/249_dyn_constant_refused.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a19780272fe740a01e68231f2b2f48b0baeb7364
+--- /dev/null
++++ b/examples/core-tests/249_dyn_constant_refused.rs
+@@ -0,0 +1,62 @@
++//! A trait object in constant data is refused at compile time, plain or inside `Option`, whether
++//! its data pointer names a promoted value or a `static`.
++//!
++//! A `&dyn Trait` is `{ ptr, meta }`, and a constant one would need its vtable decoded out of
++//! constant memory, which the constant readers do not do. `Option<&dyn Trait>` holding `Some` used
++//! to slip past the refusal — its niche decoded as `None`, so the program compiled and read
++//! `None` — and a `&dyn Trait` whose data pointer named a `static` was printed as the static's
++//! object without its vtable, so a call through it threw a `TypeError` at run time. All three are
++//! now refused with one diagnostic; each uses its own trait so that each refusal shows in the
++//! output. `None` of that type has no pointer to decode and compiles (fixture 241).
++
++#![no_std]
++#![no_main]
++
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++
++use core::hint::black_box;
++
++trait Speak {
++    fn n(&self) -> u32;
++}
++impl Speak for u32 {
++    fn n(&self) -> u32 {
++        *self
++    }
++}
++trait Named: Sync {
++    fn id(&self) -> u32;
++}
++trait Labeled: Sync {
++    fn label(&self) -> u32;
++}
++struct N {
++    id: u32,
++}
++impl Named for N {
++    fn id(&self) -> u32 {
++        self.id
++    }
++}
++impl Labeled for N {
++    fn label(&self) -> u32 {
++        self.id * 10
++    }
++}
++static B: N = N { id: 2 };
++
++/// A promoted target.
++static DYN: Option<&(dyn Speak + Sync)> = Some(&5u32);
++/// A `static` target, inside `Option`.
++static OD: Option<&dyn Named> = Some(&B);
++/// A `static` target, plain.
++static PD: &dyn Labeled = &B;
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    print_u32(black_box(&DYN).map_or(0, |d| d.n()));
++    print_u32(black_box(&OD).map_or(0, |d| d.id()));
++    print_u32(black_box(&PD).label());
++}
+diff --git a/examples/core-tests/290_niche_zeroed_heap.expected b/examples/core-tests/290_niche_zeroed_heap.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..3a6e3ad5c19d3ca8f1a9c68e646c5318283fbc9a
+--- /dev/null
++++ b/examples/core-tests/290_niche_zeroed_heap.expected
+@@ -0,0 +1,14 @@
++3
++3
++2
++2
++7
++true
++2
++2
++100
++2
++2
++2
++true
++2
+diff --git a/examples/core-tests/290_niche_zeroed_heap.maxbytes b/examples/core-tests/290_niche_zeroed_heap.maxbytes
+new file mode 100644
+index 0000000000000000000000000000000000000000..964b8c4f787d0cf268770a0a2e2579b0eaba7715
+--- /dev/null
++++ b/examples/core-tests/290_niche_zeroed_heap.maxbytes
+@@ -0,0 +1 @@
++139264
+diff --git a/examples/core-tests/290_niche_zeroed_heap.rs b/examples/core-tests/290_niche_zeroed_heap.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1914d6afb1aebc8920fc3ba0d09bbb34418398e
+--- /dev/null
++++ b/examples/core-tests/290_niche_zeroed_heap.rs
+@@ -0,0 +1,65 @@
++//! Zeroed values of niche enums: the variant the all-zero bit pattern names, through the niche
++//! walk's array and tuple steps and a single-variant layout.
++//!
++//! A zeroed allocation (`vec![None; n]` of an all-zero element, `Box::new_zeroed`) is decoded by
++//! the link-time `zero_variant`, which names the variant of bits `0` with the same niche decoder as
++//! register-sized constants. `O2`, `OArr` and `OTupS` put `Hi2 { A = 200, B = 254 }`'s niche
++//! (values 255 and 0, wrapping) behind a plain field, an array element and a tuple element of a
++//! single-variant layout; all-zero bytes are `R`. Derived from the A4 round-2 verifier's probe
++//! `z6_zeroed_heap.rs`.
++
++#![no_std]
++#![no_main]
++#![allow(unused, unreachable_patterns, dead_code, invalid_value)]
++extern crate alloc;
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++use alloc::boxed::Box;
++use alloc::vec;
++use alloc::vec::Vec;
++use core::convert::Infallible;
++use core::hint::black_box;
++use core::num::{NonZeroU8, NonZeroU32, NonZeroU64};
++
++#[derive(Clone, Copy)] enum SL<T> { Never((), Infallible), Live(T) }
++#[derive(Clone, Copy)] #[repr(u8)] enum Hi2 { A = 200, B = 254 }
++// niche values 255, 0: all-zero bytes are R
++#[derive(Clone, Copy)] enum O2 { P(Hi2), Q, R }
++#[derive(Clone, Copy)] enum OArr { P([Hi2; 2]), Q, R }
++#[derive(Clone, Copy)] enum OTupS { P((SL<Hi2>, ())), Q, R }
++
++static SEVEN: u32 = 7;
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    // safe: `vec![elem; n]` of an all-zero element allocates zeroed
++    let a: Vec<Option<&'static u32>> = vec![None; black_box(3)];
++    print_usize(a.iter().filter(|o| o.is_none()).count());
++    let b: Vec<Option<NonZeroU8>> = vec![None; black_box(3)];
++    print_usize(b.iter().filter(|o| o.is_none()).count());
++    let c: Vec<Option<NonZeroU64>> = vec![None; black_box(2)];
++    print_usize(c.iter().filter(|o| o.is_none()).count());
++    let e: Vec<(Option<&'static u32>, u8)> = vec![(None, 0); black_box(2)];
++    print_usize(e.iter().filter(|o| o.0.is_none() && o.1 == 0).count());
++    let mut g: Vec<Option<&'static u32>> = vec![None; black_box(2)];
++    g[1] = Some(&SEVEN);
++    print_u32(g[1].map_or(0, |v| *v)); print_bool(g[0].is_none());
++    let h: Vec<Option<char>> = vec![None; black_box(2)];
++    print_usize(h.iter().filter(|o| o.is_none()).count());
++    let i: Vec<Option<SL<NonZeroU8>>> = vec![None; black_box(2)];
++    print_usize(i.iter().filter(|o| o.is_none()).count());
++    // unsafe, every value in its normal representation: zeroed heap slices
++    let z2: Box<[Option<[bool; 2]>]> = unsafe { Box::<[Option<[bool; 2]>]>::new_zeroed_slice(black_box(2)).assume_init() };
++    print_u32(match z2[1] { Some(b) => 100 + b[0] as u32 + b[1] as u32, None => 1 });
++    let z3: Box<[O2]> = unsafe { Box::<[O2]>::new_zeroed_slice(black_box(2)).assume_init() };
++    print_u32(match z3[1] { O2::P(h) => h as u32, O2::Q => 1, O2::R => 2 });
++    let z4: Box<[OArr]> = unsafe { Box::<[OArr]>::new_zeroed_slice(black_box(2)).assume_init() };
++    print_u32(match z4[1] { OArr::P(a) => a[0] as u32, OArr::Q => 1, OArr::R => 2 });
++    let z5: Box<[OTupS]> = unsafe { Box::<[OTupS]>::new_zeroed_slice(black_box(2)).assume_init() };
++    print_u32(match z5[1] { OTupS::P(_) => 99, OTupS::Q => 1, OTupS::R => 2 });
++    let z6: Box<Option<NonZeroU32>> = unsafe { Box::<Option<NonZeroU32>>::new_zeroed().assume_init() };
++    print_bool(z6.is_none());
++    let z7: Box<O2> = unsafe { Box::<O2>::new_zeroed().assume_init() };
++    print_u32(match *z7 { O2::P(h) => h as u32, O2::Q => 1, O2::R => 2 });
++}
+diff --git a/examples/core-tests/291_static_one_element_slices.expected b/examples/core-tests/291_static_one_element_slices.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..871c584fa201c17b98e244a959a827bbbe861308
+--- /dev/null
++++ b/examples/core-tests/291_static_one_element_slices.expected
+@@ -0,0 +1,22 @@
++1
++2
++true
++true
++1
++7
++true
++true
++true
++true
++15
++20
++15
++42
++true
++9
++55
++66
++77
++88
++99
++90
+diff --git a/examples/core-tests/291_static_one_element_slices.maxbytes b/examples/core-tests/291_static_one_element_slices.maxbytes
+new file mode 100644
+index 0000000000000000000000000000000000000000..dce60d44b8c83e8e2982bb8bb369a54ac6f433fd
+--- /dev/null
++++ b/examples/core-tests/291_static_one_element_slices.maxbytes
+@@ -0,0 +1 @@
++32768
+diff --git a/examples/core-tests/291_static_one_element_slices.rs b/examples/core-tests/291_static_one_element_slices.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..5f6c935d782750a25986ec2e2d1c0c4a20d8b4c6
+--- /dev/null
++++ b/examples/core-tests/291_static_one_element_slices.rs
+@@ -0,0 +1,125 @@
++//! A slice constant of one element over an aggregate `static` aliases the static as the same
++//! slice built at run time does.
++//!
++//! `slice::from_ref(&S)` and `slice::from_mut(&mut S)` in a static initializer make a one-element
++//! slice whose buffer must be the static's own one slot, `__rt.box(S).buf`, which is what the
++//! run-time `from_ref` and a raw pointer constant to `S` name. It used to be a fresh array holding
++//! the static's object: `ptr::eq(ONE.as_ptr(), &S)` was false, a whole-element store through the
++//! slice never reached `S`, and a later store to `S` was not seen through the slice. The modules are
++//! the A4 round-2 verifier's probes: `from_ref` of an aggregate and of a primitive static (with the
++//! run-time slices as controls), a `static mut` slice written whole in both directions, and its
++//! neighbours (a raw `*mut [T]`, `Option<&mut [(u32, u8)]>`, a slice of `Option<u64>`, `fill`,
++//! `copy_from_slice`, `iter_mut`, and the array static as the control).
++
++#![no_std]
++#![no_main]
++#![allow(static_mut_refs)]
++
++#[path = "prelude.rs"]
++mod prelude;
++
++mod from_ref {
++    use super::prelude::*;
++    use core::hint::black_box;
++    struct N { id: u32 }
++    static B: N = N { id: 2 };
++    static ONE: &[N] = core::slice::from_ref(&B);
++    static P: u32 = 7;
++    static ONEP: &[u32] = core::slice::from_ref(&P);
++    pub fn run() {
++        print_u32(ONE.len() as u32);
++        print_u32(ONE[0].id);
++        print_bool(core::ptr::eq(&ONE[0], &B));
++        print_bool(core::ptr::eq(ONE.as_ptr(), &B));
++        print_u32(ONEP.len() as u32);
++        print_u32(ONEP[0]);
++        print_bool(core::ptr::eq(&ONEP[0], &P));
++        print_bool(core::ptr::eq(ONEP.as_ptr(), &P));
++        // The same slices built at run time.
++        let s = core::slice::from_ref(black_box(&B));
++        print_bool(core::ptr::eq(s.as_ptr(), &B));
++        let t = core::slice::from_ref(black_box(&P));
++        print_bool(core::ptr::eq(t.as_ptr(), &P));
++    }
++}
++
++mod static_mut {
++    use super::prelude::*;
++    // A constant `&mut [T]` over ONE aggregate `static mut` (what `slice::from_mut` makes of it).
++    // The round-2 emission is `{ buf: [ONE], off: 0, len: 1 }`: a fresh JavaScript array holding the
++    // static's object, so storing a whole element through the slice replaces the array's slot and
++    // never reaches the static. Native: 15 20. Round 2: 3 7 (silently). Main: aborts at run time
++    // (the slice had no length, so the bounds check panics).
++    #[derive(Clone, Copy)]
++    struct Pt { x: u32, y: u32 }
++    static mut ONE: Pt = Pt { x: 1, y: 2 };
++    static mut ONE_SL: &mut [Pt] = unsafe { core::slice::from_mut(&mut *(&raw mut ONE)) };
++
++    pub fn run() {
++        unsafe {
++            (*(&raw mut ONE_SL))[0] = Pt { x: 7, y: 8 };
++            print_u32(ONE.x + ONE.y);
++            ONE = Pt { x: 20, y: 30 };
++            print_u32((*(&raw const ONE_SL))[0].x);
++        }
++    }
++}
++
++mod variants {
++    use super::prelude::*;
++    use core::hint::black_box;
++
++    // Neighbours of fail_r2_1: the same one-element constant slice over an aggregate `static mut`,
++    // through a raw wide pointer, inside Option, a tuple element type, an enum element type, with
++    // `swap`/`copy_from_slice`/`fill`/`iter_mut`, and the array control (which is right).
++    #[derive(Clone, Copy)]
++    struct Pt { x: u32, y: u32 }
++    static mut A: Pt = Pt { x: 1, y: 2 };
++    struct Raw(*mut [Pt]);
++    unsafe impl Sync for Raw {}
++    static A_RAW: Raw = Raw(unsafe { core::slice::from_mut(&mut *(&raw mut A)) } as *mut [Pt]);
++
++    static mut B: (u32, u8) = (1, 2);
++    static mut B_SL: Option<&mut [(u32, u8)]> = Some(unsafe { core::slice::from_mut(&mut *(&raw mut B)) });
++
++    static mut C: Option<u64> = Some(5);
++    static mut C_SL: &mut [Option<u64>] = unsafe { core::slice::from_mut(&mut *(&raw mut C)) };
++
++    static mut D: Pt = Pt { x: 1, y: 2 };
++    static mut D_SL: &mut [Pt] = unsafe { core::slice::from_mut(&mut *(&raw mut D)) };
++
++    static mut ARR: [Pt; 2] = [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }];
++    static mut ARR_SL: &mut [Pt] = unsafe { &mut *(&raw mut ARR) };
++
++    pub fn run() {
++        unsafe {
++            (*A_RAW.0)[0] = Pt { x: 7, y: 8 };
++            print_u32(A.x + A.y);
++            if let Some(s) = &mut *(&raw mut B_SL) { s[black_box(0)] = (40, 2); }
++            print_u32(B.0 + B.1 as u32);
++            (*(&raw mut C_SL))[0] = None;
++            print_bool(C.is_none());
++            C = Some(9);
++            print_u64((*(&raw const C_SL))[0].unwrap_or(0));
++            (*(&raw mut D_SL)).fill(Pt { x: 50, y: 5 });
++            print_u32(D.x + D.y);
++            (*(&raw mut D_SL)).copy_from_slice(&[Pt { x: 60, y: 6 }]);
++            print_u32(D.x + D.y);
++            for p in (*(&raw mut D_SL)).iter_mut() { *p = Pt { x: 70, y: 7 }; }
++            print_u32(D.x + D.y);
++            (*(&raw mut ARR_SL))[1] = Pt { x: 80, y: 8 };
++            print_u32(ARR[1].x + ARR[1].y);
++            ARR = [Pt { x: 9, y: 9 }, Pt { x: 90, y: 9 }];
++            print_u32((*(&raw const ARR_SL))[1].x + (*(&raw const ARR_SL))[1].y);
++            (*(&raw mut ARR_SL)).swap(0, 1);
++            print_u32(ARR[0].x);
++        }
++    }
++}
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    from_ref::run();
++    static_mut::run();
++    variants::run();
++}
+diff --git a/examples/core-tests/292_closure_fn_constants.expected b/examples/core-tests/292_closure_fn_constants.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..07c9a58f7e9f1c23359a4a62eb18ffc6fb07b1bb
+--- /dev/null
++++ b/examples/core-tests/292_closure_fn_constants.expected
+@@ -0,0 +1,33 @@
++5
++8
++9
++34
++30201
++true
++yes
++no
++1001
++14
++false
++6
++9
++10
++99
++12
++15
++42
++7
++8
++18
++77
++36
++18
++add
++7
++mul
++12
++2
++12
++13
++15
++18
+diff --git a/examples/core-tests/292_closure_fn_constants.rs b/examples/core-tests/292_closure_fn_constants.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c31083de04d269159f75a614a3d55d089cc8919
+--- /dev/null
++++ b/examples/core-tests/292_closure_fn_constants.rs
+@@ -0,0 +1,106 @@
++//! A closure stored as a `fn` pointer in constant data calls the closure.
++//!
++//! Const evaluation stores a non-capturing closure reified as a `fn` pointer as the closure's
++//! `FnOnce` instance (its body, or the `call_once` shim of a `Fn`/`FnMut` closure), which takes the
++//! closure's environment first; a `fn` pointer is called without one. Printed as the bare
++//! function, as it used to be, `C1(1)` handed `1` to the environment slot (main read `0`), and
++//! `Some(|x| x + 7)` did not match `Some`. The constant is now the wrapper the run-time
++//! coercion builds, `($a0, ..) => shim(undefined, $a0, ..)`, in both lanes: plain, in `Option`, in
++//! tables and struct fields, at arities 0 to 3 with integer, `u64`, `bool`, `&str`, unit and tuple
++//! results. Named functions in the same positions are the controls, and stay the function itself,
++//! and so does the same closure instance reified through the trait method
++//! (`<F as Fn<(u32,)>>::call`, `FnOnce::call_once`), an `extern "rust-call"` pointer that takes the
++//! environment explicitly (main was right there; a wrapper would shift its arguments).
++//! `core::task::Waker::noop()` builds its vtable the same way, which is what `26_async` reaches.
++
++#![no_std]
++#![no_main]
++#![feature(unboxed_closures, fn_traits)]
++
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++
++use core::hint::black_box;
++
++fn named(x: u32) -> u32 {
++    x * 3
++}
++fn named0() -> u32 {
++    42
++}
++
++const C0: fn() -> u32 = || 5;
++const C1: fn(u32) -> u32 = |x| x + 7;
++const C2: fn(u32, u32) -> u32 = |a, b| a * 10 + b;
++const C3: fn(u8, u16, u32) -> u64 = |a, b, c| a as u64 + b as u64 * 100 + c as u64 * 10000;
++const CB: fn(u32) -> bool = |x| x > 3;
++const CS: fn(bool) -> &'static str = |b| if b { "yes" } else { "no" };
++const CU: fn(u32) = |x| print_u32(x + 1000);
++const CT: fn(u32) -> (u32, bool) = |x| (x * 2, x % 2 == 0);
++const OC0: Option<fn() -> u32> = Some(|| 6);
++const OC1: Option<fn(u32) -> u32> = Some(|x| x + 8);
++const ON: Option<fn(u32) -> u32> = None;
++const ONAMED: Option<fn(u32) -> u32> = Some(named);
++const NAMED: fn(u32) -> u32 = named;
++static TABLE: [fn(u32) -> u32; 3] = [|x| x + 1, named, |x| x * x];
++static OTABLE: [Option<fn(u32) -> u32>; 3] = [Some(|x| x + 2), None, Some(named)];
++struct Op {
++    name: &'static str,
++    run: fn(u32, u32) -> u32,
++}
++static OPS: [Op; 2] = [Op { name: "add", run: |a, b| a + b }, Op { name: "mul", run: |a, b| a * b }];
++static NAMED0: fn() -> u32 = named0;
++
++struct Method<F>(F);
++impl<F: Fn(u32) -> u32> Method<F> {
++    const CALL: extern "rust-call" fn(&F, (u32,)) -> u32 = <F as Fn<(u32,)>>::call;
++    const ONCE: extern "rust-call" fn(F, (u32,)) -> u32 = <F as FnOnce<(u32,)>>::call_once;
++}
++
++#[inline(never)]
++fn methods<F: Fn(u32) -> u32 + Copy>(f: F) {
++    print_u32(Method::<F>::CALL(&f, (5,)));
++    print_u32(black_box(Method::<F>::ONCE)(f, (6,)));
++}
++
++#[inline(never)]
++fn idx(i: usize) -> usize {
++    black_box(i)
++}
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    print_u32(C0());
++    print_u32(C1(1));
++    print_u32(black_box(C1)(2));
++    print_u32(C2(3, 4));
++    print_u64(C3(1, 2, 3));
++    print_bool(CB(5));
++    print_str(CS(true));
++    print_str(black_box(CS)(false));
++    CU(1);
++    let (a, b) = CT(7);
++    print_u32(a);
++    print_bool(b);
++    print_u32(OC0.map_or(0, |f| f()));
++    print_u32(OC1.map_or(0, |f| f(1)));
++    print_u32(black_box(OC1).map_or(0, |f| f(2)));
++    print_u32(ON.map_or(99, |f| f(1)));
++    print_u32(ONAMED.map_or(0, |f| f(4)));
++    print_u32(NAMED(5));
++    print_u32(NAMED0());
++    for i in 0..3 {
++        print_u32(TABLE[idx(i)](6));
++        print_u32(OTABLE[idx(i)].map_or(77, |f| f(6)));
++    }
++    for i in 0..2 {
++        let op = &OPS[idx(i)];
++        print_str(op.name);
++        print_u32((op.run)(3, 4));
++    }
++    let rt: fn(u32) -> u32 = |x| x + 1;
++    print_u32(black_box(rt)(1));
++    methods(|x| x + 7);
++    methods(|x| x * 3);
++}
+diff --git a/examples/core-tests/README.md b/examples/core-tests/README.md
+index 066d5769702514fae8a8e2731cf7b7f1dda243f0..51d0743ba62d1e708f9081fa30b31c1accf93f0e 100644
+--- a/examples/core-tests/README.md
++++ b/examples/core-tests/README.md
+@@ -59,6 +59,19 @@ on `wasm32-unknown-unknown` and 64 and 8 on a 64 bit host).
+ | `105_slice_iterator_cursor` | checked cursor lowering for exact `Enumerate<Take<SliceIter<u8>>>` and `Enumerate<Skip<SliceIter<u8>>>` loops across empty, short, exact, overlong, dynamic, and early-break cases; signed/wider elements, reversed adapter order, and observed iterator state decline |
+ | `114_zst_aggregate_drops` | arrays and slices of zero-sized elements keep their `undefined` storage while every element is dropped exactly once: locals, returns, by-value and by-reference parameters, `&mut [Z]`, `move` closures, `Vec<[Z; N]>`, `[[u8; 0]; N]`, zero-length arrays, partial moves, replacement, and a `[Z; 2000]` that `.absent` keeps from being materialized; `scripts/cleanup-smoke.sh` drives its host-throw path |
+ | `115_zst_element_pointers` | every pointer to a zero-sized element is its container's one address: `&a[i]`, `a.as_ptr()`, `s.as_ptr()`, `s.first()`, an iterator's item, `add`/`wrapping_add`, a `from_raw_parts` round trip and a `Vec<Z>`'s dangling pointer agree under `ptr::eq`, `addr_eq` and `as usize`; none is null and a 64-byte-aligned zero-sized element is aligned |
++| `240_niche_pointer_constants` | `Option<&T>` in constant data reads back as the variant it holds: a `const` used directly and through `black_box`, a `static`, a `static mut` read back and rewritten, a promoted `&Some(..)`, associated and trait constants in a generic function, `const` and `static` tables of options and of structs holding them, and the same values built at run time |
++| `241_niche_wide_pointer_constants` | every pointer niche carrier in constant data: `Option<&str>`, `Option<&[T]>`, `Option<fn()>` (used directly too), `Option<NonNull<T>>` incl. `dangling()`, `Option<Box<T>>`, `Option<Option<&T>>`, `Result<&T, ()>`, `Result<(), &str>`, `Cow::Borrowed`, and a pointer niche at a non-zero offset inside a struct payload |
++| `242_niche_integer_constants` | integer niches in constant data and in register-sized constants: `NonZero` at three widths, `char`, `bool`, fieldless enums, `Ordering`, `Option<Option<..>>` three deep, an enum with several niche-encoded unit variants, a niche range that wraps past `u8::MAX`, a valid range that wraps, and an uninhabited non-1-ZST variant that still takes a niche value |
++| `243_niche_static_references` | statics naming statics through `Option<&'static T>`: a list declared consumer first, `ptr::eq` identity with the named static, a `static mut` cursor rewritten, and a boxed primitive static reached through its slot |
++| `244_niche_pointer_wrappers` | pointer constants at types that hold a pointer without being one (`NonNull<T>`, a one-field struct, a transparent struct, a one-tuple), pointers to zero-sized and into the middle of promoted allocations, generic-position and const-generic constants |
++| `245_niche_absent_variants` | niche enums with variants rustc leaves out of the layout (uninhabited with only 1-ZST fields, at any depth: `Wrap<Void>`, `(Void,)`, `[Void; 2]`, an all-dead enum) and dead variants it keeps (`[u32; 0]` or `u8` beside `Void`, an aligned uninhabited struct), at the start, middle and end, with the untagged variant in the middle; register-sized constants inline, as arguments, through `black_box`, and from a `static` table |
++| `246_niche_single_variant_payloads` | a niche inside an enum laid out as a single variant other than variant 0 (`Option<Parsed>`, `Option<Result<!, char>>`), wrapping niche ranges reached through it and through transparent, `ManuallyDrop`, tuple, plain and named wrappers, and register-sized constants of such enums used directly |
++| `247_static_wide_pointers` | `&[T]` and `&str` into statics: plain, in `Option`, in a struct and a table, an interior `split_at` tail, `slice::from_ref` of a primitive and of an aggregate static, with `len`, indexing and `ptr::eq` identity |
++| `248_single_variant_discriminant` | the run-time discriminant of an enum laid out as one variant other than the first, whose dead variants hide their `Infallible` in a tuple, a wrapper or an array (`Result<(Infallible, ()), char>`), with the controls whose `Infallible` is direct |
++| `249_dyn_constant_refused` | a `&dyn Trait` in constant data is a compile-time refusal (`.expect_fail`): `Option<&dyn Trait>` holding `Some` with a promoted and with a `static` target, and a plain `&dyn Trait` naming a `static`; `None` of that type compiles (241) |
++| `290_niche_zeroed_heap` | zeroed heap values of niche enums (`vec![None; n]`, `Box::new_zeroed`): the variant of the all-zero pattern through the niche walk's field, array and tuple steps and a single-variant layout, over a niche that wraps |
++| `291_static_one_element_slices` | one-element slices over aggregate statics (`slice::from_ref`, `slice::from_mut` of a `static mut`, a raw `*mut [T]`, `Option<&mut [T]>`): `ptr::eq` with the static and whole-element stores in both directions agree with the run-time slice |
++| `292_closure_fn_constants` | a closure stored as a `fn` pointer in constant data calls the closure: plain, in `Option`, in tables and struct fields, arities 0 to 3 and several result types, with named functions and the `extern "rust-call"` trait method (`<F as Fn<_>>::call`) as the controls |
+ | `guard_as_chunks` | a gap that is a run time guard rather than a zombie: `as_chunks` aborts the program instead of answering |
+ | `guard_heap_retype` | reading one heap block at two element sizes once something has been written at the first: `__rt.unscale` throws rather than hand back a wrong number |
+ | `guard_map_key` | a gap that is a **type** error: an aggregate cannot be a host `Map` key, and the sealed `MapKey` trait says so at the call site |
+diff --git a/jsc-link/src/lower/js/constant.rs b/jsc-link/src/lower/js/constant.rs
+index 34f2de12855f3815cb6aa1b120cfdcf763cd11fb..36298e26b0c38984650aa21966659dbe3de437cc 100644
+--- a/jsc-link/src/lower/js/constant.rs
++++ b/jsc-link/src/lower/js/constant.rs
+@@ -5,7 +5,9 @@
+ use rcgjs_object::jir::decline::OpClass;
+ use rcgjs_object::jir::origin::SourceFact;
+ use rcgjs_object::jir::semantic::{ConstTree, GlobalReference};
+-use rcgjs_object::jir::types::{EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind};
++use rcgjs_object::jir::types::{
++    EnumRepr, FieldKey, IntRepr, NominalForm, SigAbi, TypeId, TypeKind,
++};
+ use rcgjs_object::jsast::{self, Expr};
+ use rcgjs_object::ptr;
+ 
+@@ -155,6 +157,15 @@ impl<'a> JsCx<'a> {
+                 "scalar constant at an unknown type",
+             ));
+         };
++        // A transparent wrapper *is* its field and a pattern type its base, as in
++        // `const_expr_at`. The payload of a niche enum is reached by recursion rather than through
++        // `const_expr_at`, so it is peeled here too: `Some(NonZero(77))` is `{ _0: 77 }`.
++        if let Some(inner) = descriptor.js.transparent {
++            return self.scalar_expr(bits, inner.ty);
++        }
++        if let TypeKind::Pattern(base) = descriptor.kind {
++            return self.scalar_expr(bits, base);
++        }
+         match &descriptor.kind {
+             TypeKind::Bool => Ok(jsast::boolean(bits != 0)),
+             TypeKind::Char => Ok(jsast::num(bits as f64)),
+@@ -212,15 +223,36 @@ impl<'a> JsCx<'a> {
+                     return value::enum_value(table, self.interns, ty, index as u32, Vec::new())
+                         .ok_or_else(|| decline(OpClass::Constant, "scalar enum constant"));
+                 }
+-                // A niche: the bit pattern names a niche variant or the untagged one, whose one
+-                // non-zero-sized field holds the bits.
+-                let Some(niche) = niche else {
+-                    return Err(decline(
+-                        OpClass::Constant,
+-                        "scalar constant of an enum with neither a direct tag nor a niche",
+-                    ));
++                // Under a niche the bit pattern names a niche variant, which is fieldless, or the
++                // untagged one, whose one non-zero-sized field holds the bits. Under a layout of a
++                // single variant (`Variants::Single`) the bits are the payload of the variant
++                // rustc lays out, which need not be variant 0.
++                let (index, payload) = match niche {
++                    Some(niche) => {
++                        let Some(index) = value::niche_variant(table, variants, niche, bits) else {
++                            return Err(decline(
++                                OpClass::Constant,
++                                "the width of a niche scalar cannot be read from the type table",
++                            ));
++                        };
++                        (index, index == niche.untagged_variant)
++                    }
++                    None if value::is_single_layout_enum(table, ty) => {
++                        let Some(index) = value::single_layout_variant(table, variants) else {
++                            return Err(decline(
++                                OpClass::Constant,
++                                "scalar constant of an uninhabited enum",
++                            ));
++                        };
++                        (index as u32, true)
++                    }
++                    None => {
++                        return Err(decline(
++                            OpClass::Constant,
++                            "scalar constant of an enum with neither a direct tag nor a niche",
++                        ));
++                    }
+                 };
+-                let index = value::niche_variant(table, variants, niche, bits);
+                 let Some(variant) = variants.get(index as usize) else {
+                     return Err(decline(OpClass::Constant, "niche names a missing variant"));
+                 };
+@@ -230,7 +262,7 @@ impl<'a> JsCx<'a> {
+                     let key = self.field_key_name(field.key)?;
+                     if table.is_zst(field.ty) {
+                         entries.push((key, jsast::undefined()));
+-                    } else if index != niche.untagged_variant {
++                    } else if !payload {
+                         return Err(decline(
+                             OpClass::Constant,
+                             "scalar constant of a niche variant with a payload",
+@@ -441,9 +473,57 @@ impl<'a> JsCx<'a> {
+     /// A pointer to a global (`constant.rs::pointer_expr`, `Function`/`Static`).
+     fn global_expr(&self, target: &GlobalReference, offset: u64, ty: TypeId) -> Res<Expr> {
+         match target {
+-            GlobalReference::Function { link_name, .. } => Ok(jsast::id(
+-                self.interns.str(*link_name).unwrap_or("").to_owned(),
+-            )),
++            // The function itself, at a pointer type only: at `Option<fn()>` the function is the
++            // payload of a variant, and the encoder decodes such a constant into a variant tree.
++            // A closure reified as a `fn` pointer names its `FnOnce` instance, which takes the
++            // environment first; the encoder describes the closure's type, whose `fn_pointer_shim`
++            // is this item, and the pointer is the wrapper the run-time `ClosureFnPointer`
++            // coercion builds (`rvalue.rs`), passing `undefined` for the zero-sized environment.
++            // The same item reified through the trait method (`<F as Fn<(u32,)>>::call`) is an
++            // `extern "rust-call"` pointer that takes the environment explicitly: the function.
++            GlobalReference::Function { item, link_name } => {
++                let target = jsast::id(self.interns.str(*link_name).unwrap_or("").to_owned());
++                let closure = self.table.descriptors().iter().any(|descriptor| {
++                    matches!(
++                        &descriptor.kind,
++                        TypeKind::Closure {
++                            fn_pointer_shim: Some(shim),
++                            ..
++                        } if shim.item == *item
++                    )
++                });
++                let kind = value::kind(self.table, ty);
++                let signature = match kind {
++                    Some(TypeKind::FnPtr { sig }) => self.interns.sig(*sig),
++                    _ => None,
++                };
++                match (kind, signature) {
++                    (Some(TypeKind::FnPtr { .. }), Some(signature))
++                        if closure && signature.abi != SigAbi::RustCall =>
++                    {
++                        let params: Vec<String> = (0..signature.inputs.len())
++                            .map(|index| format!("$a{index}"))
++                            .collect();
++                        let mut arguments = vec![jsast::undefined()];
++                        arguments.extend(params.iter().cloned().map(jsast::id));
++                        Ok(jsast::arrow(params, jsast::call(target, arguments)))
++                    }
++                    (Some(TypeKind::FnPtr { .. }), Some(_)) if closure => Ok(target),
++                    (
++                        Some(
++                            TypeKind::FnPtr { .. }
++                            | TypeKind::RawPointer { .. }
++                            | TypeKind::Reference { .. },
++                        ),
++                        _,
++                    ) if !closure => Ok(target),
++                    _ => Err(decline(
++                        OpClass::Constant,
++                        "a pointer to a function at a type that is not a pointer, or to a closure \
++                         at a type that is not a `fn` pointer with a known signature",
++                    )),
++                }
++            }
+             // A reference to a `static` is the module level binding it was emitted as. For an
+             // indirect type the binding's own value *is* the reference; a primitive has no
+             // identity to point at, so such a `static` is emitted **boxed** (`let S = [value]`,
+@@ -463,6 +543,29 @@ impl<'a> JsCx<'a> {
+                         "a reference to a `static` at a type that is not a pointer",
+                     ));
+                 };
++                // A wide pointer needs its length, which a global reference does not carry; the
++                // encoder declines these and the baseline lane builds `{ buf, off, len }`.
++                if matches!(
++                    value::kind(self.table, pointee),
++                    Some(TypeKind::Slice(_) | TypeKind::Str)
++                ) {
++                    return Err(decline(
++                        OpClass::Constant,
++                        "a wide pointer to a `static` has no length in a global reference",
++                    ));
++                }
++                // A trait object needs its vtable, which a global reference does not carry either;
++                // the baseline lane refuses it (`constant.rs::pointer_expr`).
++                if matches!(
++                    value::kind(self.table, pointee),
++                    Some(TypeKind::Dynamic { .. })
++                ) {
++                    return Err(decline(
++                        OpClass::Constant,
++                        "a trait object pointing into a `static` has no vtable in a global \
++                         reference",
++                    ));
++                }
+                 if !self.table.is_indirect(pointee) {
+                     return Ok(ptr::slot(binding, jsast::num(0)));
+                 }
+diff --git a/jsc-link/src/lower/js/rvalue.rs b/jsc-link/src/lower/js/rvalue.rs
+index eab7a40dc623fd2c80561cc51ec23771ed4b30ec..8423b05510316e2e5c2767a1281e73230f352291 100644
+--- a/jsc-link/src/lower/js/rvalue.rs
++++ b/jsc-link/src/lower/js/rvalue.rs
+@@ -1146,7 +1146,13 @@ impl<'a> JsCx<'a> {
+             _ => false,
+         };
+         if inhabited.len() <= 1 || untagged {
+-            let index = inhabited.first().copied().unwrap_or(0);
++            // A single-variant layout holds the variant rustc lays out, which is not necessarily
++            // the first one the shallow test above leaves standing: `Result<(Infallible, ()), char>`
++            // is always `Err`.
++            let index = match untagged {
++                true => value::single_layout_variant(table, variants).unwrap_or(0),
++                false => inhabited.first().copied().unwrap_or(0),
++            };
+             return Ok(value::discriminant_literal(
+                 table,
+                 peeled,
+diff --git a/jsc-link/src/lower/js/value.rs b/jsc-link/src/lower/js/value.rs
+index 00efa513319520867961528e9708b50a8cc1fd2a..4632b8f279850d494c69f893c0ba409184d2f630 100644
+--- a/jsc-link/src/lower/js/value.rs
++++ b/jsc-link/src/lower/js/value.rs
+@@ -796,7 +796,7 @@ fn zero_variant(
+     niche: Option<&rcgjs_object::jir::types::Niche>,
+ ) -> Option<u32> {
+     if let Some(niche) = niche {
+-        return Some(niche_variant(table, variants, niche, 0));
++        return niche_variant(table, variants, niche, 0);
+     }
+     if variants
+         .iter()
+@@ -811,100 +811,8 @@ fn zero_variant(
+     (variants.len() == 1).then_some(0)
+ }
+ 
+-/// Whether a type is uninhabited (`!`, or an enum with no variants), shallowly.
+-fn is_uninhabited(table: &TypeTable, ty: TypeId) -> bool {
+-    match kind(table, ty) {
+-        Some(TypeKind::Never) => true,
+-        Some(TypeKind::Adt {
+-            form: NominalForm::Enum,
+-            variants,
+-            ..
+-        }) => variants.is_empty(),
+-        _ => false,
+-    }
+-}
+-
+-/// The variant a niche-encoded enum holds when its niche scalar reads `bits`
+-/// (`rustc_abi::TagEncoding::Niche`): the variant `niche_variants.start + (bits - niche_start)`
+-/// when that lands on a niche variant, the untagged variant otherwise.
+-///
+-/// The table records the untagged variant and `niche_start`; `niche_variants.start` is the first
+-/// present variant that is not the untagged one (rustc numbers the niche values from it, the
+-/// untagged variant's own slot in that numbering unused).
+-pub fn niche_variant(
+-    table: &TypeTable,
+-    variants: &[VariantDescriptor],
+-    niche: &rcgjs_object::jir::types::Niche,
+-    bits: u128,
+-) -> u32 {
+-    let present = |index: usize| {
+-        !variants[index]
+-            .fields
+-            .iter()
+-            .any(|field| is_uninhabited(table, field.ty))
+-    };
+-    let Some(start) = (0..variants.len())
+-        .find(|index| *index as u32 != niche.untagged_variant && present(*index))
+-    else {
+-        return niche.untagged_variant;
+-    };
+-    let Some(end) = (0..variants.len())
+-        .rev()
+-        .find(|index| *index as u32 != niche.untagged_variant && present(*index))
+-    else {
+-        return niche.untagged_variant;
+-    };
+-    // The width of the niche scalar decides how the subtraction wraps: the niche field's own
+-    // width when the path reaches an integer, the pointer width otherwise.
+-    let width = niche_width(table, variants, niche).unwrap_or(128);
+-    let mask = if width >= 128 {
+-        u128::MAX
+-    } else {
+-        (1u128 << width) - 1
+-    };
+-    let relative = bits.wrapping_sub(niche.niche_start) & mask;
+-    let count = (end - start + 1) as u128;
+-    if relative < count {
+-        let variant = start as u128 + relative;
+-        if variant as u32 != niche.untagged_variant {
+-            return variant as u32;
+-        }
+-    }
+-    niche.untagged_variant
+-}
+-
+-/// The width in bits of the scalar a niche lives in, following the niche field path down the
+-/// untagged variant.
+-pub fn niche_width(
+-    table: &TypeTable,
+-    variants: &[VariantDescriptor],
+-    niche: &rcgjs_object::jir::types::Niche,
+-) -> Option<u32> {
+-    let mut fields: &[rcgjs_object::jir::types::FieldDescriptor] =
+-        &variants.get(niche.untagged_variant as usize)?.fields;
+-    let mut ty = None;
+-    for step in &niche.niche_field {
+-        let field = fields.get(*step as usize)?;
+-        ty = Some(field.ty);
+-        let descriptor = table.get(table.peeled(field.ty))?;
+-        fields = match &descriptor.kind {
+-            TypeKind::Adt { variants, .. } => &variants.first()?.fields,
+-            _ => &descriptor.js.fields,
+-        };
+-    }
+-    let ty = ty?;
+-    if let Some((_, bits)) = table.int_info(ty) {
+-        return Some(bits);
+-    }
+-    match kind(table, ty) {
+-        Some(TypeKind::Bool) => Some(8),
+-        Some(TypeKind::Char) => Some(32),
+-        Some(TypeKind::Reference { .. } | TypeKind::RawPointer { .. } | TypeKind::FnPtr { .. }) => {
+-            Some(32)
+-        }
+-        _ => size_of(table, ty).map(|bytes| (bytes * 8) as u32),
+-    }
+-}
++// The layout decoder of register-sized enum constants is shared with the JIR interpreter.
++pub use rcgjs_object::jir::niche::{is_single_layout_enum, niche_variant, single_layout_variant};
+ 
+ /// The variant of a `Number` enum whose logical discriminant is `discr`.
+ pub fn variant_with_logical_discr(table: &TypeTable, ty: TypeId, discr: i128) -> Option<u32> {
+diff --git a/jsc-link/src/opt/dce.rs b/jsc-link/src/opt/dce.rs
+index 9fd0cfe47cd30f786cf06da42745e599a5f8b7f8..5934eb1681452f448c0500d5c6e3c27996cdce7a 100644
+--- a/jsc-link/src/opt/dce.rs
++++ b/jsc-link/src/opt/dce.rs
+@@ -505,9 +505,7 @@ fn scalar_variant(table: &TypeTable, ty: TypeId, bits: u128) -> Option<u32> {
+         return None;
+     };
+     if let Some(niche) = niche {
+-        return Some(crate::lower::js::value::niche_variant(
+-            table, variants, niche, bits,
+-        ));
++        return crate::lower::js::value::niche_variant(table, variants, niche, bits);
+     }
+     if variants
+         .iter()
+@@ -642,7 +640,12 @@ fn static_discriminant(table: &TypeTable, ty: TypeId) -> Option<i128> {
+     if inhabited.len() > 1 && !untagged {
+         return None;
+     }
+-    let index = inhabited.first().copied().unwrap_or(0);
++    // A single-variant layout holds the variant rustc lays out, which is not necessarily the first
++    // one the shallow test above leaves standing (`Result<(Infallible, ()), char>` is `Err`).
++    let index = match untagged {
++        true => crate::lower::js::value::single_layout_variant(table, variants).unwrap_or(0),
++        false => inhabited.first().copied().unwrap_or(0),
++    };
+     Some(
+         variants
+             .get(index)
+diff --git a/rcgjs-object/src/jir/interp/eval.rs b/rcgjs-object/src/jir/interp/eval.rs
+index dd42ab0f91bf057ff86f8302459187bac108b5f3..e3d6bceca2899f395849adf560c3536dd19fec5d 100644
+--- a/rcgjs-object/src/jir/interp/eval.rs
++++ b/rcgjs-object/src/jir/interp/eval.rs
+@@ -1,8 +1,9 @@
+ //! Operator, cast, and constant evaluation shared by the two interpreters.
+ 
+ use crate::jir::interns::Interns;
++use crate::jir::niche;
+ use crate::jir::semantic::{BinaryOp, CastKind, ConstTree, GlobalReference, TypeId, UnaryOp};
+-use crate::jir::types::{EnumRepr, TypeKind, TypeTable};
++use crate::jir::types::{EnumRepr, NominalForm, TypeKind, TypeTable};
+ 
+ use super::heap::{field_count, pointee_type, Heap};
+ use super::value::{int_range, normalize_int, truncate_bits, Value};
+@@ -38,7 +39,12 @@ pub fn scalar(bits: u128, ty: TypeId, table: &TypeTable) -> Result<Value, Trap>
+         }
+         TypeKind::Float { bits: 64 } => Ok(Value::float(f64::from_bits(bits as u64), 64)),
+         TypeKind::Float { .. } => Err(Trap::Unsupported("f16/f128 constant")),
+-        TypeKind::Adt { variants, .. } => {
++        TypeKind::Adt {
++            variants,
++            form,
++            niche,
++            ..
++        } => {
+             if let Some(inner) = descriptor.js.transparent {
+                 let field = scalar(bits, inner.ty, table)?;
+                 let count = variants.first().map_or(1, |variant| variant.fields.len());
+@@ -50,6 +56,48 @@ pub fn scalar(bits: u128, ty: TypeId, table: &TypeTable) -> Result<Value, Trap>
+                     fields,
+                 });
+             }
++            // The bits of a register-sized enum constant are its discriminant only under a direct
++            // tag or a `Number` repr. Under a niche, or a layout of one variant, they name the
++            // variant by the layout's rules, which `niche` reads exactly as the link-time printer
++            // and dead-code elimination read them. A variant whose payload the bits are is not
++            // modelled here (its fields would have to be decoded out of the same bits), so such a
++            // constant is unsupported rather than evaluated as a variant without its payload.
++            let direct = variants
++                .iter()
++                .all(|variant| variant.physical_tag.is_some())
++                || matches!(descriptor.js.enum_repr, Some(EnumRepr::Number { .. }));
++            if matches!(form, NominalForm::Enum) && !direct {
++                let (variant, payload) = if let Some(niche) = niche {
++                    let Some(index) = niche::niche_variant(table, variants, niche, bits) else {
++                        return Err(Trap::Unsupported(
++                            "a niche constant whose scalar width the type table does not give",
++                        ));
++                    };
++                    (index, index == niche.untagged_variant)
++                } else if niche::is_single_layout_enum(table, ty) {
++                    let Some(index) = niche::single_layout_variant(table, variants) else {
++                        return Err(Trap::Ub("a constant of an uninhabited enum"));
++                    };
++                    (index as u32, true)
++                } else {
++                    return Err(Trap::Unsupported(
++                        "a register-sized constant of an enum with neither a tag nor a niche",
++                    ));
++                };
++                let carries = variants.get(variant as usize).is_some_and(|variant| {
++                    variant.fields.iter().any(|field| !table.is_zst(field.ty))
++                });
++                if payload && carries {
++                    return Err(Trap::Unsupported(
++                        "a register-sized enum constant whose bits are a variant's payload",
++                    ));
++                }
++                return Ok(Value::Aggregate {
++                    ty,
++                    variant,
++                    fields: Vec::new(),
++                });
++            }
+             let variant = table
+                 .variant_with_discriminant(ty, bits)
+                 .ok_or(Trap::Ub("scalar constant names no variant of the enum"))?;
+diff --git a/rcgjs-object/src/jir/interp/tests.rs b/rcgjs-object/src/jir/interp/tests.rs
+index babef256268cb190d53f271459248f586490588d..1c28d8d71a2576893deeccf9e8a4d34a6a8a97fb 100644
+--- a/rcgjs-object/src/jir/interp/tests.rs
++++ b/rcgjs-object/src/jir/interp/tests.rs
+@@ -2210,3 +2210,76 @@ fn repr_direct_calls_resume_loop_parameters_and_void_calls() {
+         );
+     }
+ }
++
++/// A register-sized enum constant names its variant by the layout's rules (`jir::niche`), the same
++/// rules the link-time printer and dead-code elimination use: under a niche, `bits - niche_start`
++/// counts from the first niche variant, not from discriminant 0, so the bit pattern 2 below is `A`
++/// although `B`'s discriminant is 2. A fieldless variant is evaluated; a variant whose payload the
++/// bits are is not modelled and is unsupported rather than a variant without its payload, and so is
++/// every constant of a single-variant layout, whose bits are always the laid-out variant's payload.
++#[test]
++fn scalar_constants_name_variants_by_the_layout_rules() {
++    let mut interns = world();
++    let live = interns.intern_str("Live");
++    let dead = interns.intern_str("Dead");
++    let a = interns.intern_str("A");
++    let b = interns.intern_str("B");
++    let field_0 = interns.intern_str("_0");
++    const NICHED: TypeId = TypeId(900);
++    const SINGLE: TypeId = TypeId(901);
++    const NEVER: TypeId = TypeId(902);
++    let def = |n| DefinitionId {
++        crate_id: 1,
++        local_hash: n,
++    };
++    interns.intern_type(descriptor(NEVER, TypeKind::Never, 0));
++    interns.intern_type(descriptor(
++        NICHED,
++        TypeKind::Adt {
++            def: def(900),
++            args: Vec::new(),
++            form: NominalForm::Enum,
++            variants: vec![
++                variant(live, vec![(FieldKey::Name(field_0), BOOL)], 0),
++                variant(a, Vec::new(), 1),
++                variant(b, Vec::new(), 2),
++            ],
++            niche: Some(Niche {
++                untagged_variant: 0,
++                niche_field: vec![0],
++                niche_start: 2,
++                valid_range: (0, 1),
++            }),
++        },
++        1,
++    ));
++    interns.intern_type(descriptor(
++        SINGLE,
++        TypeKind::Adt {
++            def: def(901),
++            args: Vec::new(),
++            form: NominalForm::Enum,
++            variants: vec![
++                variant(dead, vec![(FieldKey::Index(0), NEVER)], 0),
++                variant(live, vec![(FieldKey::Name(field_0), BOOL)], 1),
++            ],
++            niche: None,
++        },
++        1,
++    ));
++    let variant_of = |bits, ty| match eval::scalar(bits, ty, &interns.types) {
++        Ok(Value::Aggregate { variant, .. }) => Ok(variant),
++        Ok(other) => panic!("{other:?}"),
++        Err(trap) => Err(trap),
++    };
++    assert_eq!(variant_of(2, NICHED), Ok(1), "the first niche value is `A`");
++    assert_eq!(variant_of(3, NICHED), Ok(2), "the second is `B`");
++    for (bits, ty) in [(1, NICHED), (0, NICHED), (1, SINGLE), (0, SINGLE)] {
++        assert!(
++            matches!(variant_of(bits, ty), Err(Trap::Unsupported(_))),
++            "{bits} at {ty:?} is a payload"
++        );
++    }
++    // The control: a `Number` enum is still its discriminant.
++    assert!(eval::scalar(1, ORDERING, &interns.types).is_ok());
++}
+diff --git a/rcgjs-object/src/jir/mod.rs b/rcgjs-object/src/jir/mod.rs
+index 45dc5f61b8864a584c10daf841441719674721df..4b00e0b1d4fe7ad63a933176860f6dd8a767b598 100644
+--- a/rcgjs-object/src/jir/mod.rs
++++ b/rcgjs-object/src/jir/mod.rs
+@@ -8,6 +8,7 @@ mod dependencies;
+ pub mod hash;
+ pub mod interns;
+ pub mod interp;
++pub mod niche;
+ pub mod origin;
+ pub mod repr;
+ pub mod semantic;
+diff --git a/rcgjs-object/src/jir/niche.rs b/rcgjs-object/src/jir/niche.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9419cd036c5d659392c1ae7156e1a86dc24764c
+--- /dev/null
++++ b/rcgjs-object/src/jir/niche.rs
+@@ -0,0 +1,449 @@
++//! Reading a register-sized enum constant out of the type table by rustc's layout rules.
++//!
++//! A register-sized constant at an enum type reaches the JIR as bits (`Constant::Scalar`), and the
++//! type table carries the layout facts needed to name its variant: the niche (untagged variant,
++//! `niche_start`, and the path of field indices the producer walked down rustc's layout to the
++//! niche scalar), each variant's fields with their 1-ZST and layout facts, and the physical tags.
++//! The link-time printer (`jsc-link` `lower/js/constant.rs`), dead-code elimination's switch folding
++//! and the JIR interpreter all read such constants, and all of them read them here, so they cannot
++//! disagree about which variant a bit pattern names.
++
++use super::types::{EnumRepr, NominalForm, TypeId, TypeKind, TypeTable, VariantDescriptor};
++
++/// The variant a niche-encoded enum holds when its niche scalar reads `bits`
++/// (`rustc_abi::TagEncoding::Niche`): the variant `niche_variants.start + (bits - niche_start)`
++/// when that lands on a niche variant, the untagged variant otherwise.
++///
++/// The table records the untagged variant and `niche_start`; `niche_variants` is rebuilt by
++/// rustc's own rule (`rustc_abi::layout`, `needs_disc`): it runs from the first to the last variant
++/// that is neither the untagged one nor [`absent_variant`] (rustc numbers the niche values from its
++/// start, the untagged variant's own slot in that numbering unused). A variant that is uninhabited
++/// but has a field that is not a 1-ZST — `Dead([u32; 0], Infallible)` — still takes a niche value.
++///
++/// The subtraction wraps at the width of the niche scalar ([`niche_width`]); `None` when that width
++/// cannot be worked out, so that a caller refuses instead of decoding at the wrong width.
++pub fn niche_variant(
++    table: &TypeTable,
++    variants: &[VariantDescriptor],
++    niche: &super::types::Niche,
++    bits: u128,
++) -> Option<u32> {
++    let present = |index: usize| !absent_variant(table, &variants[index]);
++    let Some(start) = (0..variants.len())
++        .find(|index| *index as u32 != niche.untagged_variant && present(*index))
++    else {
++        return Some(niche.untagged_variant);
++    };
++    let Some(end) = (0..variants.len())
++        .rev()
++        .find(|index| *index as u32 != niche.untagged_variant && present(*index))
++    else {
++        return Some(niche.untagged_variant);
++    };
++    let width = niche_width(table, variants, niche)?;
++    let mask = match width {
++        0 => return None,
++        128.. => u128::MAX,
++        _ => (1u128 << width) - 1,
++    };
++    let relative = bits.wrapping_sub(niche.niche_start) & mask;
++    let count = (end - start + 1) as u128;
++    if relative < count {
++        let variant = start as u128 + relative;
++        if variant as u32 != niche.untagged_variant {
++            return Some(variant as u32);
++        }
++    }
++    Some(niche.untagged_variant)
++}
++
++/// Whether rustc leaves a variant out of an enum's layout (`rustc_abi::layout::absent`): it is
++/// uninhabited and every field is a 1-ZST, so it has no values and takes no niche value.
++pub fn absent_variant(table: &TypeTable, variant: &VariantDescriptor) -> bool {
++    let one_zst = |ty: TypeId| table.get(ty).is_some_and(|d| d.layout.one_zst);
++    variant
++        .fields
++        .iter()
++        .any(|field| uninhabited_layout(table, field.ty, 0))
++        && variant.fields.iter().all(|field| one_zst(field.ty))
++}
++
++/// Whether rustc's layout of `ty` is uninhabited (`LayoutData::is_uninhabited`): `!`, a struct,
++/// tuple or closure with an uninhabited field, a non-empty array of an uninhabited element, and an
++/// enum every variant of which is uninhabited (one with no variants included). A union, a pointer
++/// and a primitive never are; a type the table does not describe is taken to be inhabited, which
++/// keeps its variant in the niche numbering as rustc does for every variant with a sized field.
++fn uninhabited_layout(table: &TypeTable, ty: TypeId, depth: u32) -> bool {
++    if depth > 64 {
++        return false;
++    }
++    let any_field = |variant: &VariantDescriptor| {
++        variant
++            .fields
++            .iter()
++            .any(|field| uninhabited_layout(table, field.ty, depth + 1))
++    };
++    match table.get(ty).map(|d| &d.kind) {
++        Some(TypeKind::Never) => true,
++        Some(TypeKind::Adt {
++            form: NominalForm::Struct,
++            variants,
++            ..
++        }) => variants.first().is_some_and(any_field),
++        Some(TypeKind::Adt {
++            form: NominalForm::Enum,
++            variants,
++            ..
++        }) => variants.iter().all(any_field),
++        Some(
++            TypeKind::Tuple(elements)
++            | TypeKind::Closure {
++                upvars: elements, ..
++            },
++        ) => elements
++            .iter()
++            .any(|element| uninhabited_layout(table, *element, depth + 1)),
++        Some(TypeKind::Array { element, length }) => {
++            *length != 0 && uninhabited_layout(table, *element, depth + 1)
++        }
++        Some(TypeKind::Pattern(base)) => uninhabited_layout(table, *base, depth + 1),
++        _ => false,
++    }
++}
++
++/// The variant rustc lays an enum out as when its layout is a single variant (`Variants::Single`,
++/// which the table spells as no niche and no physical tag on any variant): the first variant that
++/// is not [`absent_variant`] (`rustc_abi::layout::layout_of_enum`, `present_first`). Not
++/// necessarily variant 0: in `enum Parsed { Never((), Infallible), Char(char) }` it is `Char`.
++/// `None` when every variant is absent, which is the uninhabited layout.
++pub fn single_layout_variant(table: &TypeTable, variants: &[VariantDescriptor]) -> Option<usize> {
++    variants
++        .iter()
++        .position(|variant| !absent_variant(table, variant))
++}
++
++/// Whether the table describes `ty` as an enum whose layout is a single variant: no niche, no
++/// physical tag, and not a `Number` enum (which keeps its discriminant as its value).
++pub fn is_single_layout_enum(table: &TypeTable, ty: TypeId) -> bool {
++    let Some(descriptor) = table.get(ty) else {
++        return false;
++    };
++    let TypeKind::Adt {
++        form: NominalForm::Enum,
++        variants,
++        niche: None,
++        ..
++    } = &descriptor.kind
++    else {
++        return false;
++    };
++    variants
++        .iter()
++        .all(|variant| variant.physical_tag.is_none())
++        && !matches!(descriptor.js.enum_repr, Some(EnumRepr::Number { .. }))
++}
++
++/// The width in bits of the scalar a niche lives in, or `None` when the table cannot follow the
++/// niche to it (the caller then refuses rather than guess a width).
++///
++/// The producer records the niche as a path of field indices down the untagged variant, taken by
++/// walking rustc's layout (`jir/types.rs::niche_facts`), and this walks the same path through the
++/// table: a step into a struct or union takes the field at that index, into a tuple or closure
++/// the element, into an array the element at any index, into a pattern type its base (rustc's
++/// field 0 of one, as in `NonNull`'s `*const T is !null`), and into an enum a field of the
++/// variant rustc lays out ([`single_layout_variant`]; the producer's walk stops at a multi-variant
++/// enum, so only single-variant layouts are passed through). The walk ends at the niche's scalar, at a
++/// nested multi-variant enum whose tag the niche is, or at a pointer (a wide pointer's niche is its
++/// data pointer, and the path's last step into it names no field the table describes).
++pub fn niche_width(
++    table: &TypeTable,
++    variants: &[VariantDescriptor],
++    niche: &super::types::Niche,
++) -> Option<u32> {
++    let untagged = variants.get(niche.untagged_variant as usize)?;
++    let mut ty: Option<TypeId> = None;
++    for step in &niche.niche_field {
++        let index = *step as usize;
++        let next = match ty {
++            None => untagged.fields.get(index)?.ty,
++            Some(current) => match &table.get(current)?.kind {
++                TypeKind::Reference { .. }
++                | TypeKind::RawPointer { .. }
++                | TypeKind::FnPtr { .. } => break,
++                kind => layout_field(table, current, kind, index)?,
++            },
++        };
++        ty = Some(next);
++    }
++    scalar_bits(table, ty?, 0)
++}
++
++/// The type of field `index` of `ty`'s layout, for [`niche_width`]'s walk.
++fn layout_field(table: &TypeTable, ty: TypeId, kind: &TypeKind, index: usize) -> Option<TypeId> {
++    match kind {
++        TypeKind::Adt {
++            form: NominalForm::Struct | NominalForm::Union,
++            variants,
++            ..
++        } => Some(variants.first()?.fields.get(index)?.ty),
++        TypeKind::Adt {
++            form: NominalForm::Enum,
++            variants,
++            ..
++        } if is_single_layout_enum(table, ty) => Some(
++            variants
++                .get(single_layout_variant(table, variants)?)?
++                .fields
++                .get(index)?
++                .ty,
++        ),
++        TypeKind::Tuple(elements)
++        | TypeKind::Closure {
++            upvars: elements, ..
++        } => elements.get(index).copied(),
++        TypeKind::Array { element, length } => ((index as u64) < *length).then_some(*element),
++        // A pattern type's layout is its base's, which rustc's walk steps into as field 0.
++        TypeKind::Pattern(base) if index == 0 => Some(*base),
++        _ => None,
++    }
++}
++
++/// The width in bits of the scalar a niche walk ended at: an integer, `bool`, `char` or pointer;
++/// a pattern type's or transparent wrapper's base; and for an enum, its own niche scalar or its
++/// direct tag.
++fn scalar_bits(table: &TypeTable, ty: TypeId, depth: u32) -> Option<u32> {
++    if depth > 64 {
++        return None;
++    }
++    if let Some((_, bits)) = table.int_info(ty) {
++        return Some(bits);
++    }
++    let descriptor = table.get(ty)?;
++    if let Some(inner) = descriptor.js.transparent {
++        return scalar_bits(table, inner.ty, depth + 1);
++    }
++    match &descriptor.kind {
++        TypeKind::Bool => Some(8),
++        TypeKind::Char => Some(32),
++        // `isize`/`usize` and pointers are 32 bits on `wasm32-unknown-unknown`.
++        TypeKind::Reference { .. } | TypeKind::RawPointer { .. } | TypeKind::FnPtr { .. } => {
++            Some(32)
++        }
++        TypeKind::Pattern(base) => scalar_bits(table, *base, depth + 1),
++        TypeKind::Adt {
++            form: NominalForm::Enum,
++            variants,
++            niche: Some(niche),
++            ..
++        } => niche_width(table, variants, niche),
++        TypeKind::Adt {
++            form: NominalForm::Enum,
++            variants,
++            niche: None,
++            ..
++        } => variants
++            .iter()
++            .find_map(|variant| variant.physical_tag)
++            .map(|tag| u32::from(tag.bytes) * 8),
++        _ => None,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    //! The walk to the niche scalar, step by step, over hand-built tables shaped like the ones the
++    //! producer writes (`backend/src/jir/types.rs`), and the refusal when the walk cannot be
++    //! followed. End-to-end fixtures cover most steps; these pin the ones a program can reach only
++    //! through a zeroed heap value or a path the producer does not describe.
++
++    use super::*;
++    use crate::jir::interns::StrId;
++    use crate::jir::semantic::DefinitionId;
++    use crate::jir::types::{
++        FieldDescriptor, FieldKey, JsFacts, LayoutFacts, Niche, NominalDiscriminant,
++        TypeDescriptor, TypeMeta,
++    };
++
++    const HI: TypeId = TypeId(1);
++    const ARRAY1: TypeId = TypeId(2);
++    const TUPLE1: TypeId = TypeId(3);
++    const BY_ARRAY: TypeId = TypeId(4);
++    const BY_TUPLE: TypeId = TypeId(5);
++    const LOST: TypeId = TypeId(6);
++    const MISSING: TypeId = TypeId(99);
++
++    fn descriptor(id: TypeId, kind: TypeKind, size: u64) -> TypeDescriptor {
++        TypeDescriptor {
++            id,
++            name: None,
++            kind,
++            layout: LayoutFacts {
++                size: Some(size),
++                unsized_prefix: None,
++                align: Some(1),
++                sized: true,
++                zst: size == 0,
++                one_zst: size == 0,
++                needs_drop: false,
++                has_own_drop: false,
++            },
++            meta: TypeMeta::default(),
++            js: JsFacts {
++                int: None,
++                is_indirect: true,
++                needs_clone: false,
++                crosses_transparent_union: false,
++                transparent: None,
++                peeled: id,
++                unsized_tail: None,
++                enum_repr: None,
++                is_primitive_enum: false,
++                pointer_form: None,
++                byte_element: false,
++                fields: Vec::new(),
++            },
++        }
++    }
++
++    fn variant(fields: Vec<TypeId>, discr: i128, tag: Option<u128>) -> VariantDescriptor {
++        VariantDescriptor {
++            name: StrId(0),
++            fields: fields
++                .into_iter()
++                .enumerate()
++                .map(|(index, ty)| FieldDescriptor {
++                    key: FieldKey::Index(index as u32),
++                    ty,
++                    offset: 0,
++                })
++                .collect(),
++            logical_discr: discr,
++            physical_tag: tag.map(|bits| NominalDiscriminant { bits, bytes: 1 }),
++            result_ok: false,
++            saved_local_keys: Vec::new(),
++        }
++    }
++
++    fn adt(
++        id: TypeId,
++        form: NominalForm,
++        variants: Vec<VariantDescriptor>,
++        niche: Option<Niche>,
++    ) -> TypeDescriptor {
++        descriptor(
++            id,
++            TypeKind::Adt {
++                def: DefinitionId {
++                    crate_id: 1,
++                    local_hash: id.0 as u64,
++                },
++                args: Vec::new(),
++                form,
++                variants,
++                niche,
++            },
++            1,
++        )
++    }
++
++    /// `enum W { P(<payload>), Q, R }` over `Hi { A = 200, B = 254 }`: niche values 255 and 0.
++    fn wrapping(id: TypeId, payload: TypeId, path: Vec<u32>) -> TypeDescriptor {
++        adt(
++            id,
++            NominalForm::Enum,
++            vec![
++                variant(vec![payload], 0, None),
++                variant(Vec::new(), 1, None),
++                variant(Vec::new(), 2, None),
++            ],
++            Some(Niche {
++                untagged_variant: 0,
++                niche_field: path,
++                niche_start: 255,
++                valid_range: (200, 254),
++            }),
++        )
++    }
++
++    fn table() -> TypeTable {
++        let mut table = TypeTable::new();
++        // `Hi` is a fieldless enum with a one-byte direct tag.
++        table.insert(adt(
++            HI,
++            NominalForm::Enum,
++            vec![
++                variant(Vec::new(), 200, Some(200)),
++                variant(Vec::new(), 254, Some(254)),
++            ],
++            None,
++        ));
++        table.insert(descriptor(
++            ARRAY1,
++            TypeKind::Array {
++                element: HI,
++                length: 1,
++            },
++            1,
++        ));
++        table.insert(descriptor(TUPLE1, TypeKind::Tuple(vec![HI]), 1));
++        // The producer's paths: the payload field, then its element 0, which is `Hi`.
++        table.insert(wrapping(BY_ARRAY, ARRAY1, vec![0, 0]));
++        table.insert(wrapping(BY_TUPLE, TUPLE1, vec![0, 0]));
++        // A path into a type the table does not describe.
++        table.insert(wrapping(LOST, MISSING, vec![0, 0]));
++        table
++    }
++
++    fn decode(table: &TypeTable, ty: TypeId, bits: u128) -> Option<u32> {
++        let Some(TypeKind::Adt {
++            variants,
++            niche: Some(niche),
++            ..
++        }) = table.get(ty).map(|descriptor| &descriptor.kind)
++        else {
++            panic!("not a niche enum");
++        };
++        niche_variant(table, variants, niche, bits)
++    }
++
++    #[test]
++    fn the_walk_steps_through_an_array_element() {
++        let table = table();
++        assert_eq!(
++            niche_width(&table, table.variants(BY_ARRAY), niche_of(&table, BY_ARRAY)),
++            Some(8)
++        );
++        assert_eq!(decode(&table, BY_ARRAY, 255), Some(1), "Q");
++        assert_eq!(decode(&table, BY_ARRAY, 0), Some(2), "R wraps past u8::MAX");
++        assert_eq!(decode(&table, BY_ARRAY, 200), Some(0), "P");
++    }
++
++    #[test]
++    fn the_walk_steps_through_a_tuple_element() {
++        let table = table();
++        assert_eq!(decode(&table, BY_TUPLE, 255), Some(1), "Q");
++        assert_eq!(decode(&table, BY_TUPLE, 0), Some(2), "R wraps past u8::MAX");
++        assert_eq!(decode(&table, BY_TUPLE, 254), Some(0), "P");
++    }
++
++    #[test]
++    fn a_walk_that_cannot_be_followed_is_refused_not_guessed() {
++        let table = table();
++        assert_eq!(
++            niche_width(&table, table.variants(LOST), niche_of(&table, LOST)),
++            None
++        );
++        // A guess at any width would name a variant for these bits; the decoder names none.
++        assert_eq!(decode(&table, LOST, 0), None);
++        assert_eq!(decode(&table, LOST, 255), None);
++    }
++
++    fn niche_of(table: &TypeTable, ty: TypeId) -> &Niche {
++        match table.get(ty).map(|descriptor| &descriptor.kind) {
++            Some(TypeKind::Adt {
++                niche: Some(niche), ..
++            }) => niche,
++            _ => panic!("not a niche enum"),
++        }
++    }
++}

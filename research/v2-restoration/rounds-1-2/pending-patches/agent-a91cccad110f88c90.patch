@@ -1,0 +1,3617 @@
+diff --git a/CONTRACT.md b/CONTRACT.md
+index d08f72e75f8c34cf7e8594eeedac6dfd4fa2640e..3336d56e6fe11edd0c09312a98f626f004ce9f6f 100644
+--- a/CONTRACT.md
++++ b/CONTRACT.md
+@@ -860,10 +860,31 @@ its digits in held objects where bytes belonged.
+ 
+ ### Addresses
+ 
+-`p as usize` is `__rt.addr(p, size_of::<pointee>())`. Every buffer is given a synthetic base of
+-`4096 * n` the first time it is asked about, kept in a `WeakMap` so that it never moves, and the
+-address of an element is `base + off * size`; a scaled slot's offset is already in bytes and is
+-added as it is, and a number is an address already.
++`p as usize` is `__rt.addr(p, size_of::<pointee>())`. Every buffer is given a synthetic base the
++first time it is asked about, kept in a `WeakMap` so that it never moves, and the address of an
++element is `base + off * size`; a scaled slot's offset is already in bytes and is added as it is,
++and a number is an address already.
++
++A `usize` is 32 bits, so the space of bases is finite and is managed like a buddy allocator. A
++buffer of `n` bytes takes a granule of the smallest power of two that holds it, at least 16 and at
++most 4096, and its base is a multiple of that granule — aligned for every type the buffer can
++hold, since a type's alignment divides its size. A heap block's size is its `Layout` size; another
++buffer's is its length times the element size of the first `addr` asked of it. An alignment the
++size does not imply — a hand-built `Layout` whose alignment exceeds its size, or an over-aligned
++element first addressed through a byte pointer — is honoured only up to 16. Granules come from a
++per-size free list first, then from a bump pointer starting at 4096 (whose alignment gaps are
++split into smaller free granules). `dealloc` gives a heap
++block's granule back — the freed buffer keeps its entry, so a dangling pointer still answers the
++address it had, and a later allocation may reuse it, as a native allocator would — and a
++`FinalizationRegistry` gives back the granule of any other buffer once the engine has collected
++it. A `realloc` that grows a block past its granule (below 4096) gives the granule back too, and
++the block takes a base at its new size when next asked: a reallocation may move in Rust, and
++otherwise the grown block's addresses would run into its neighbours'. A base is therefore unique
++among live buffers and stable for a buffer's lifetime. The space runs out only when the bump
++pointer reaches 2^32 with no free granule of the size asked — about 2^32 bytes of granules live at
++once, a million live 4 KiB buffers — and that is a refusal that says so. (Bases used to be `4096 * n`
++and were never reused: the 2^20th buffer was given the address 2^32, which `>>> 0` made null, and
++`NonNull::new` reported a good allocation as failed.)
+ 
+ The size does not always survive to the call. `<*const T>::addr` is written
+ `transmute(self.cast::<()>())`, so the pointee is `()` by the time the address is taken while the
+@@ -876,7 +897,9 @@ The scheme is chosen for four guarantees, not for convenience:
+ 
+ - `is_null()` is false for every real pointer and true only for `null()`, because no base is zero;
+ - `NonNull::dangling()` is an alignment, always below 4096, so it never collides with a base;
+-- an address is a multiple of the element size, so alignment predicates answer correctly;
++- an address is a multiple of the element alignment (a type's alignment divides its size, and a
++  buffer's base is aligned to its size rounded up to a power of two), so alignment predicates answer
++  correctly;
+ - `fmt::Arguments::as_str` tests `bits & 1` on an 8 byte element, so the answer is deterministic.
+ 
+ Addresses are **not** ordered across buffers in any way a program may rely on, and an address never
+@@ -929,15 +952,37 @@ not become initialized values.
+ `&str` stays a JS string, and the byte view is produced on demand:
+ 
+ - `as_bytes` is `__rt.str_bytes(s)`, which encodes the string to UTF-8 and returns
+-  `{ buf, off: 0, len }` over a **plain array**, the same kind of buffer every other `[u8]` is.
+-  `as_ptr` is the same call reduced to the slot `{ buf: __rt.str_bytes(s).buf, off: 0 }`, because a
+-  thin pointer carries no length. A four entry memo ring keyed by the string returns the same record
+-  for a repeated call, so pointer identity holds in practice; identity across independent calls is
+-  **not** guaranteed, and nothing may depend on it.
++  `{ buf, off: 0, len }` over a **plain array**, the same kind of buffer every other `[u8]` is —
++  exactly the bytes `TextEncoder` writes, so a lone surrogate is U+FFFD. `as_ptr` is the same call
++  reduced to the slot `{ buf: __rt.str_bytes(s).buf, off: 0 }`, because a thin pointer carries no
++  length.
++- The records are **memoized for the operation**, keyed by the string. `&s[a..b]` is
++  `s.as_bytes()` plus a decode, so a parser walking a document asks for the whole document's bytes
++  once per token; the memo makes that one encode per operation instead of one per token (linear
++  rather than quadratic). Its bound: the memo is emptied when the JavaScript stack unwinds (the
++  first insertion queues one microtask that clears it, so no entry outlives the synchronous run of
++  Rust code that made it — an export, a callback, one poll of a future); it holds at most 4 MiB of
++  encoded bytes, and the insertion that would exceed that empties it first; a string of more than
++  1 MiB is held apart from that budget, at most the two most recent such strings, so a large
++  document is not evicted by its own slices. Without `queueMicrotask` only the byte bound applies.
++  Strings are immutable, so an entry is never stale — a mutated `String` derefs to a different
++  JavaScript string — and an owned `String` built from a host string copies, never aliasing a
++  memoized buffer. A repeated call within the operation returns the same record, so pointer
++  identity holds in practice; identity across independent calls is **not** guaranteed, and nothing
++  may depend on it.
+ - `from_utf8_unchecked`, and a raw pointer whose pointee is `str` (`str::from_raw_parts`), are
+-  `__rt.bytes_str(buf, off, len)`.
+-- The metadata of a `&str` is `__rt.str_len(s)`, the UTF-8 byte length, with an ASCII fast path.
+-- Writing through a `&mut str` stays a zombie.
++  `__rt.bytes_str(buf, off, len)`. An `i8` element is read as its byte.
++- The metadata of a `&str` is `__rt.str_len(s)`, the UTF-8 byte length, computed from the UTF-16
++  code units without encoding (a surrogate pair is four bytes, a lone surrogate the three of
++  U+FFFD); a string of more than 64 code units is answered from the memo when its bytes are
++  already there. `str::len` lowers to the same call: `__rt.str_bytes(s).len` folds to
++  `__rt.str_len(s)`.
++- Writing through a `&mut str` stays a zombie: the `&mut str` a `String` derefs to is a decoded
++  JavaScript string, so a write through `as_bytes_mut` (`make_ascii_uppercase`,
++  `to_ascii_lowercase`) does not reach the `String`'s storage and is lost. It is contained: a cast
++  from `str` to a **mutable** byte pointer is `__rt.str_bytes_mut(s)`, a fresh record that is never
++  memoized, so the lost write never surfaces in the view another `as_bytes` of an equal string
++  reads.
+ 
+ `ptr::cast_str` owns the whole matrix — `str` to `[u8]`, `str` to `u8`, a slice of one byte elements
+ to `str`, `str` to `str`, and a zombie for anything else with a `str` on one side — and every
+@@ -986,7 +1031,8 @@ __rt.unscale_uninit(p, size, mk)       // one-time retype of uninitialized array
+ __rt.chunk_slice(p, n, w)    // a slice re-read at chunk granularity, throws if it is not one
+ __rt.unwindow(p)             // a pointer to `[E; N]`, as a pointer to its first element
+ __rt.thin(p, size)           // `from_raw_parts` with `()` metadata: the data pointer, un-erased
+-__rt.str_bytes(s)            // UTF-8 bytes of a JS string as `{ buf, off, len }`
++__rt.str_bytes(s)            // UTF-8 bytes of a JS string as `{ buf, off, len }`, memoized
++__rt.str_bytes_mut(s)        // the same bytes in a fresh, unmemoized record (`as_bytes_mut`)
+ __rt.str_len(s)              // UTF-8 byte length
+ __rt.bytes_str(buf, off, len) // UTF-8 bytes back to a JS string, `""` at length zero
+ ```
+diff --git a/backend/src/intrinsics.rs b/backend/src/intrinsics.rs
+index 074a358a134ee52bc7fc08052af9129be11d797d..4cbeeb10bed18919da0dd7ca83458aef71ee79b0 100644
+--- a/backend/src/intrinsics.rs
++++ b/backend/src/intrinsics.rs
+@@ -598,16 +598,23 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
+     fn with_overflow(&self, name: &str, int: Int) -> Outcome {
+         let lhs = self.arg(0);
+         let rhs = self.arg(1);
++        let product = name == "mul_with_overflow";
+         let exact = match name {
+             "add_with_overflow" => jsast::binary(JsBinOp::Add, lhs, rhs),
+             "sub_with_overflow" => jsast::binary(JsBinOp::Sub, lhs, rhs),
+             // A 32 bit product overflows a double's 53 bit mantissa, so this is not always the
+-            // exact product. It does not have to be: it is only compared for *equality* with the
+-            // wrapped result, and a rounded product that overflowed is never equal to it.
++            // exact product. The flag does not need it to be: it only compares the product for
++            // *equality* with the wrapped result, and a rounded product that overflowed is never
++            // equal to it. The wrapped result does, so it is `Math.imul`, never `mask(exact)`.
+             _ => jsast::binary(JsBinOp::Mul, lhs, rhs),
+         };
+         let exact = self.temp(exact);
+-        let wrapped = self.temp(mask(int.repr, int.signed, int.bits, exact.clone()));
++        let wrapping = if product && int.repr == IntRepr::Number && int.bits == 32 {
++            int.multiply(self.arg(0), self.arg(1))
++        } else {
++            exact.clone()
++        };
++        let wrapped = self.temp(mask(int.repr, int.signed, int.bits, wrapping));
+         Outcome::Value(jsast::array(vec![
+             wrapped.clone(),
+             jsast::binary(JsBinOp::StrictNe, wrapped, exact),
+diff --git a/backend/src/place.rs b/backend/src/place.rs
+index f97c6ea22309685e7af342e36cc609d4b2472e77..7b26f39e7143ddfb4cd1641337997f04470a2dad 100644
+--- a/backend/src/place.rs
++++ b/backend/src/place.rs
+@@ -678,7 +678,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
+             return self.zombie(format!("`{pointer_ty}` has no pointer metadata"));
+         };
+         match pointee.kind() {
+-            ty::Slice(_) => ptr::slot_len(value),
++            ty::Slice(_) => ptr::slice_len(value),
+             ty::Dynamic(..) => jsast::member(value, ptr::META),
+             // A `&str` is a JavaScript string, whose metadata is the length of the bytes it would
+             // encode to rather than a field of a record.
+diff --git a/backend/src/ptr.rs b/backend/src/ptr.rs
+index bef41b911279c7175ce6cd6905f71794c6c93f10..c20bd2bcc64d28e99afa32e306a1df7775a09f62 100644
+--- a/backend/src/ptr.rs
++++ b/backend/src/ptr.rs
+@@ -1176,6 +1176,13 @@ pub(crate) fn str_to_byte_ptr(string: Expr) -> Expr {
+     slot(slot_buf(str_to_bytes(string)), jsast::num(0))
+ }
+ 
++/// `s.as_bytes_mut()`: a fresh byte view no other `as_bytes` shares, so a write through it — lost,
++/// since a `&mut str` has no mutable JavaScript form — cannot surface in the memoized view of an
++/// equal string.
++pub(crate) fn str_to_bytes_mut(string: Expr) -> Expr {
++    jsast::rt_call("str_bytes_mut", vec![string])
++}
++
+ /// `str::from_utf8_unchecked(v)`: the JavaScript string `v`'s bytes spell.
+ ///
+ /// `bytes` is a fat slice of one byte elements, so the three halves of it are what the decoder
+@@ -1202,6 +1209,32 @@ pub(crate) fn str_len(string: Expr) -> Expr {
+     jsast::rt_call("str_len", vec![string])
+ }
+ 
++/// The length of a fat slice: `slice.len`, except over a `&str`'s byte view, where
++/// `__rt.str_bytes(s).len` is `__rt.str_len(s)`. `str::len` is `self.as_bytes().len()`, and a
++/// length needs no bytes.
++pub(crate) fn slice_len(slice: Expr) -> Expr {
++    match str_bytes_operand(slice) {
++        Ok(string) => str_len(string),
++        Err(slice) => slot_len(slice),
++    }
++}
++
++/// The string a `__rt.str_bytes(s)` call encodes, or the expression back when it is anything
++/// else. `str_bytes` has no effect a program can observe, so a consumer that needs only what the
++/// string itself answers may drop the call.
++fn str_bytes_operand(expr: Expr) -> Result<Expr, Expr> {
++    match expr {
++        Expr::Call(callee, mut args)
++            if args.len() == 1
++                && matches!(&*callee, Expr::Member(object, name)
++                    if name == "str_bytes" && matches!(&**object, Expr::Ident(rt) if rt == "__rt")) =>
++        {
++            Ok(args.pop().expect("one argument"))
++        }
++        other => Err(other),
++    }
++}
++
+ /// The `str` arms of the pointer cast matrix, over the two **pointee** types.
+ ///
+ /// `None` when neither side is a `str`, which is the answer that lets [`cast_pointer`] go on to the
+@@ -1211,8 +1244,8 @@ pub(crate) fn str_len(string: Expr) -> Expr {
+ /// | from -> to | result |
+ /// |---|---|
+ /// | `str` -> `str` | identity, which covers `*const str` to `*mut str` |
+-/// | `str` -> `[u8]` | [`str_to_bytes`] |
+-/// | `str` -> `u8` | [`str_to_byte_ptr`] |
++/// | `str` -> `[u8]` | [`str_to_bytes`]; [`str_to_bytes_mut`] for a mutable target |
++/// | `str` -> `u8` | [`str_to_byte_ptr`]; over [`str_to_bytes_mut`] for a mutable target |
+ /// | `[E]` -> `str`, `E` one byte | [`bytes_to_str`] |
+ /// | anything else with a `str` on one side | a zombie naming both types |
+ ///
+@@ -1225,6 +1258,18 @@ pub(crate) fn cast_str<'tcx>(
+     from_pointee: Ty<'tcx>,
+     to_pointee: Ty<'tcx>,
+     value: Expr,
++) -> Option<Expr> {
++    cast_str_as(fx, from_pointee, to_pointee, value, false)
++}
++
++/// [`cast_str`], told whether the target pointer is mutable: a `str` cast to a mutable byte
++/// pointer gets its own byte view ([`str_to_bytes_mut`]).
++fn cast_str_as<'tcx>(
++    fx: &FnCx<'_, 'tcx>,
++    from_pointee: Ty<'tcx>,
++    to_pointee: Ty<'tcx>,
++    value: Expr,
++    mutable: bool,
+ ) -> Option<Expr> {
+     let from = peel_pattern(from_pointee);
+     let to = peel_pattern(to_pointee);
+@@ -1242,7 +1287,9 @@ pub(crate) fn cast_str<'tcx>(
+     Some(match (from_str, to_str) {
+         (true, true) => value,
+         (true, false) => match to.kind() {
++            ty::Slice(element) if is_u8(*element) && mutable => str_to_bytes_mut(value),
+             ty::Slice(element) if is_u8(*element) => str_to_bytes(value),
++            _ if is_u8(to) && mutable => slot(slot_buf(str_to_bytes_mut(value)), jsast::num(0)),
+             _ if is_u8(to) => str_to_byte_ptr(value),
+             _ => unsupported(),
+         },
+@@ -1270,7 +1317,8 @@ pub(crate) fn cast_str_ptr<'tcx>(
+ ) -> Option<Expr> {
+     let from_pointee = peel_pattern(from_ty).builtin_deref(true)?;
+     let to_pointee = peel_pattern(to_ty).builtin_deref(true)?;
+-    cast_str(fx, from_pointee, to_pointee, value)
++    let mutable = peel_pattern(to_ty).is_mutable_ptr();
++    cast_str_as(fx, from_pointee, to_pointee, value, mutable)
+ }
+ 
+ /// Whether `ty` is `u8`, the element of every byte view.
+diff --git a/backend/src/rvalue.rs b/backend/src/rvalue.rs
+index f84c0972186b1d6174d82f6c5d6f12e11f03ff97..993b00d9eb3951fac0f1c8727b7efb301da3c172 100644
+--- a/backend/src/rvalue.rs
++++ b/backend/src/rvalue.rs
+@@ -20,10 +20,6 @@ use crate::base::FnCx;
+ use crate::jsast::{self, BinOp as JsBinOp, Expr};
+ use crate::value::{self, int_info, int_repr, mask, mask_ty, typing_env, IntRepr};
+ 
+-/// The parameter the checked-arithmetic arrow binds its exact result to. `$`-leading, so it can
+-/// never collide with a Rust identifier or with a local (`naming.rs` reserves the namespace).
+-const OVERFLOW_PARAM: &str = "$w";
+-
+ impl<'tcx> FnCx<'_, 'tcx> {
+     /// Lowers one rvalue.
+     ///
+@@ -340,13 +336,16 @@ impl<'tcx> FnCx<'_, 'tcx> {
+     /// `BinOp::AddWithOverflow` and its siblings: the wrapped result paired with whether it
+     /// wrapped.
+     ///
+-    /// The destination is a `(T, bool)` tuple, which is a two element JS array. The exact result is
+-    /// computed once and bound by an immediately applied arrow function: a `let` would need a
+-    /// statement, and an rvalue is lowered in expression position.
++    /// The destination is a `(T, bool)` tuple, which is a two element JS array:
++    /// `[$u = mask($t = l op r), $u !== $t]`. An rvalue is lowered in expression position, so the
++    /// exact result is bound by an assignment to a hoisted temporary inside the first element and
++    /// read back by the second; array elements evaluate left to right, so it is computed once
++    /// without a closure.
+     ///
+-    /// A 32 bit product is not exact in a double, and does not have to be — it is only compared for
+-    /// *equality* with the wrapped result, and a rounded product that overflowed is never equal to
+-    /// it.
++    /// A 32 bit product is not exact in a double. The flag does not need it to be — it only
++    /// compares the product for *equality* with the wrapped result, and a rounded product that
++    /// overflowed is never equal to it — but the wrapped result does, so it is `Math.imul` over
++    /// the operands rather than `mask(exact)`.
+     fn codegen_with_overflow(&self, op: MirBinOp, ty: Ty<'tcx>, lhs: Expr, rhs: Expr) -> Expr {
+         let Some((signed, bits)) = int_info(self.tcx, ty) else {
+             return self.zombie(format!(
+@@ -359,19 +358,33 @@ impl<'tcx> FnCx<'_, 'tcx> {
+             MirBinOp::SubWithOverflow => JsBinOp::Sub,
+             _ => JsBinOp::Mul,
+         };
+-        let exact = jsast::binary(js_op, lhs, rhs);
+-        let bound = jsast::id(OVERFLOW_PARAM);
+-        let wrapped = mask(repr, signed, bits, bound.clone());
+-        jsast::call(
+-            jsast::arrow(
+-                vec![OVERFLOW_PARAM.to_string()],
+-                jsast::array(vec![
+-                    wrapped.clone(),
+-                    jsast::binary(JsBinOp::StrictNe, wrapped, bound),
+-                ]),
+-            ),
+-            vec![exact],
+-        )
++        let temp = || self.temp(jsast::undefined()).1;
++        let (wrapped, exact) = if js_op == JsBinOp::Mul && repr == IntRepr::Number && bits == 32 {
++            let read_twice = |value: Expr| match value {
++                Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_) => (value.clone(), value),
++                value => {
++                    let name = temp();
++                    (jsast::assign(name.clone(), value), name)
++                }
++            };
++            let (lhs, lhs_again) = read_twice(lhs);
++            let (rhs, rhs_again) = read_twice(rhs);
++            (
++                jsast::imul(lhs, rhs),
++                jsast::binary(JsBinOp::Mul, lhs_again, rhs_again),
++            )
++        } else {
++            let exact = temp();
++            (
++                jsast::assign(exact.clone(), jsast::binary(js_op, lhs, rhs)),
++                exact,
++            )
++        };
++        let bound = temp();
++        jsast::array(vec![
++            jsast::assign(bound.clone(), mask(repr, signed, bits, wrapped)),
++            jsast::binary(JsBinOp::StrictNe, bound, exact),
++        ])
+     }
+ 
+     fn codegen_binop(
+@@ -579,6 +592,13 @@ impl<'tcx> FnCx<'_, 'tcx> {
+                 } else {
+                     value
+                 };
++                // A `str` row asks whether the target is mutable (`as_bytes_mut`), which only the
++                // pointer types say.
++                if let Some(converted) =
++                    crate::ptr::cast_str_ptr(self, from_ty, to_ty, value.clone())
++                {
++                    return converted;
++                }
+                 crate::ptr::cast_pointer(self, from_pointee, to_pointee, value)
+             }
+             // Exposing an address is the pointer to integer direction: a real pointer's synthetic
+diff --git a/bench/melange/compare.mjs b/bench/melange/compare.mjs
+index bb74f9309ca478e1059ac9436da819f5fb2a0d91..b213b2ba276fba8735692112569ba3ac90510116 100644
+--- a/bench/melange/compare.mjs
++++ b/bench/melange/compare.mjs
+@@ -177,42 +177,17 @@ function rustApi(module) {
+ 	};
+ }
+ 
+-// ------------------------------------------------- the synthetic address space
+-
+-// A LIMIT OF THE MODEL THIS BENCHMARK RAN INTO, and the workaround for it.
+-//
+-// Every allocation is null-checked by the emitted code as
+-// `__rt.addr(raw_ptr, 1) >>> 0 === 0`, and `__rt.addr` hands each new block the
+-// synthetic address `4096 * ++__rt._addrNext`. At block number 1048576 that
+-// product is exactly 2^32, `>>> 0` makes it zero, and a perfectly good
+-// allocation is reported to `alloc::handle_alloc_error` as a failure:
+-//
+-//     Error: rustc_codegen_mires: memory allocation of 17 bytes failed
+-//
+-// One iteration of this benchmark allocates about two thousand blocks (a
+-// `String` each for two thousand labels, plus the `Vec`s), so the ceiling is
+-// around five hundred iterations per process -- which a warmup pass plus three
+-// rounds across two Rust builds walks straight through. It is a real defect and
+-// it is written up in the report rather than papered over.
+-//
+-// The workaround is sound because of WHEN it is applied. Between batches
+-// nothing is live: every iteration builds its own store and drops it, so no
+-// pointer whose address has been handed out survives to be asked again. The
+-// addresses are a lazily assigned side table keyed by the buffer, so emptying it
+-// and restarting the counter cannot renumber anything that still exists.
+-function resetAddressSpace() {
+-	const rt = globalThis.__rt;
+-	if (rt === undefined) return;
+-	rt._addrs = new WeakMap();
+-	rt._addrNext = 0;
+-}
+-
+-/** Untimed iterations, with the address space reset often enough to stay under the ceiling. */
++// This benchmark used to reset `__rt._addrs` and `__rt._addrNext` between
++// batches: `__rt.addr` handed each block `4096 * ++_addrNext` and never reused
++// one, so block number 1048576 got the address 2^32, which `>>> 0` made null,
++// and a good allocation was reported as failed. The runtime now gives a freed
++// block's address back (`__rt._addr_release`) and carves addresses by size, so
++// no reset is needed -- and resetting the bump pointer under live free lists
++// would hand one address out twice.
++
++/** Untimed iterations. */
+ function warm(api, count) {
+-	for (let i = 0; i < count; i++) {
+-		if (i % 100 === 0) resetAddressSpace();
+-		iteration(api);
+-	}
++	for (let i = 0; i < count; i++) iteration(api);
+ }
+ 
+ // ------------------------------------------------------------------ the sizes
+@@ -374,7 +349,6 @@ function stats(samples) {
+  * garbage collection pause that lands in one of them and a batch mean is not.
+  */
+ function timeSide(api) {
+-	resetAddressSpace();
+ 	globalThis.gc();
+ 	for (let i = 0; i < WARMUP; i++) iteration(api);
+ 	const samples = [];
+@@ -455,7 +429,6 @@ function gitHead() {
+ // ------------------------------------------------------------------------ run
+ 
+ console.log("==> equivalence");
+-resetAddressSpace();
+ checkEquivalence();
+ console.log(`    all ${SIDES.length} sides compute the same state, operation by operation`);
+ 
+diff --git a/examples/core-tests/117_overflow_arith.expected b/examples/core-tests/117_overflow_arith.expected
+new file mode 100644
+index 0000000000000000000000000000000000000000..dcd5c20edb2e094361e9175fb0e40f8c4963a85c
+--- /dev/null
++++ b/examples/core-tests/117_overflow_arith.expected
+@@ -0,0 +1,422 @@
++i8
++2575732613
++2576987709
++1416886611
++1174581893
++3032935853
++-128
++126
++127
++127
++-127
++-128
++0
++0
++0
++23
++1
++-124
++2409
++escapes
++2789892168
++2789892168
++2618581937
++3565972438
++2194582736
++3814726594
++2789892168
++3814726594
++1420506273
++3275155820
++801974912
++3972788929
++946965187
++i16
++2895721413
++2169256373
++3951723139
++2868078917
++2926067389
++-32768
++32766
++32767
++32767
++-32767
++-32768
++0
++0
++0
++363
++1
++-32594
++2409
++escapes
++2297609388
++2297609388
++3148177495
++2208308314
++4052133228
++1748505450
++2297609388
++1748505450
++432337301
++2536505584
++2411514880
++73719483
++1692875899
++i32
++3683151733
++2685478999
++58874671
++4010435843
++2942851141
++-2147483648
++2147483646
++2147483647
++2147483647
++-2147483647
++-2147483648
++0
++0
++0
++92681
++1
++2147441940
++361
++escapes
++4139627964
++4139627964
++3439532018
++179456582
++2009260740
++3979614110
++4139627964
++3979614110
++1973858841
++1622893464
++2818617072
++1413086263
++2466843383
++isize
++3683151733
++2685478999
++58874671
++4010435843
++2942851141
++-2147483648
++2147483646
++2147483647
++2147483647
++-2147483647
++-2147483648
++0
++0
++0
++92681
++1
++2147441940
++361
++escapes
++4139627964
++4139627964
++3439532018
++179456582
++2009260740
++3979614110
++4139627964
++3979614110
++1973858841
++1622893464
++2818617072
++1413086263
++2466843383
++i64
++2644971099
++1865072421
++3873618381
++3662165649
++869897957
++-9223372036854775808
++9223372036854775806
++9223372036854775807
++9223372036854775807
++-9223372036854775807
++-9223372036854775808
++0
++0
++0
++6074000999
++1
++9223372033963249500
++361
++escapes
++794279758
++794279758
++521954279
++1752678096
++2912638073
++3752524064
++794279758
++3752524064
++3584860739
++1784131223
++3295070182
++213726836
++168527403
++i128
++473041779
++1786700199
++502569953
++1943789061
++270736505
++-9223372036854775808
++0
++9223372036854775807
++-2
++9223372036854775807
++-1
++9223372036854775807
++-1
++-9223372036854775808
++1
++-9223372036854775808
++0
++0
++0
++0
++0
++0
++0
++1
++7640891576956012809
++0
++1
++-9223372036854775808
++3924315910072289428
++2409
++escapes
++3909349847
++3909349847
++697129725
++397717320
++3735135080
++485365883
++3909349847
++485365883
++1668997127
++416552969
++151038600
++371674483
++2120433879
++u8
++12343517
++1043256791
++3486327413
++759533733
++1117655581
++0
++254
++255
++1
++255
++0
++254
++0
++1
++32
++0
++0
++2385
++escapes
++685144847
++685144847
++1048058496
++843368187
++4210702902
++2564211338
++685144847
++2564211338
++816105778
++2832048498
++3600126436
++889881470
++2366966703
++u16
++3217989661
++2975150711
++4255482133
++611833029
++1585659645
++0
++65534
++65535
++1
++65535
++0
++65534
++0
++1
++512
++0
++0
++2385
++escapes
++190443183
++190443183
++3833676400
++1608765595
++495736534
++35095402
++190443183
++35095402
++3645277202
++1911066994
++898719236
++893224190
++3376355999
++u32
++4093742109
++3064275575
++1466177301
++2016807109
++3879633661
++0
++4294967294
++4294967295
++1
++4294967295
++0
++4294967294
++0
++1
++131072
++0
++0
++2385
++escapes
++178639535
++178639535
++138203504
++3974705819
++2518891734
++1659046250
++178639535
++1659046250
++3421655570
++2423462770
++161952772
++138394366
++235351711
++usize
++4093742109
++3064275575
++1466177301
++2016807109
++3879633661
++0
++4294967294
++4294967295
++1
++4294967295
++0
++4294967294
++0
++1
++131072
++0
++0
++2385
++escapes
++178639535
++178639535
++138203504
++3974705819
++2518891734
++1659046250
++178639535
++1659046250
++3421655570
++2423462770
++161952772
++138394366
++235351711
++u64
++213665971
++1630997165
++3649052181
++2559854837
++1288598525
++0
++-2
++-1
++1
++-1
++0
++-2
++0
++1
++8589934592
++0
++0
++2385
++escapes
++3406012755
++3406012755
++421190147
++2839812005
++2507990900
++4042302718
++3406012755
++4042302718
++3073472648
++1435665248
++1160058998
++2072861862
++1904327050
++u128
++3659722685
++3036935173
++4269263141
++1845119769
++1648040013
++0
++0
++-1
++-2
++-1
++-1
++0
++1
++-1
++-1
++0
++0
++-1
++-2
++0
++0
++0
++1
++2
++0
++0
++0
++0
++0
++2385
++escapes
++3685642025
++3685642025
++278474211
++2456152508
++3705352215
++3211620225
++3685642025
++3211620225
++149372023
++2693358912
++1945351808
++1248630115
++4082226419
++ranges
++2926852709
+diff --git a/examples/core-tests/117_overflow_arith.maxbytes b/examples/core-tests/117_overflow_arith.maxbytes
+new file mode 100644
+index 0000000000000000000000000000000000000000..8843600c66cabe49f7b1d0f2cfea4489bab51214
+--- /dev/null
++++ b/examples/core-tests/117_overflow_arith.maxbytes
+@@ -0,0 +1 @@
++593920
+diff --git a/examples/core-tests/117_overflow_arith.rs b/examples/core-tests/117_overflow_arith.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f3659cfe1e0b4d71ecee9669fc8d80fe71a5736
+--- /dev/null
++++ b/examples/core-tests/117_overflow_arith.rs
+@@ -0,0 +1,438 @@
++//! Overflow-reporting integer arithmetic at every width, checked against a native oracle.
++//!
++//! `overflowing_*`, `checked_*`, `saturating_*` and the `Step` behind a `Range` all reach the MIR
++//! operators `AddWithOverflow`, `SubWithOverflow` and `MulWithOverflow`, whose result is a
++//! `(T, bool)` pair. Most uses take that pair apart at once, so the lowering carries it as the
++//! exact JavaScript result and reads the two fields off it; a pair that escapes whole (here through
++//! `black_box`, or as a non-inlined function's return value) is still a two-element array. Both
++//! shapes are swept here over every width — `i8` to `i128`, `u8` to `u128`, and the 32 bit `isize`
++//! and `usize` of this target — at the edges where an answer flips: `MIN`, `MAX`, `±1`, `0`, the
++//! half-width carry of a product and the largest square that still fits. A 32 bit product is not
++//! exact in a double, which is why the wrapped half must come from `Math.imul`.
++//!
++//! Each sweep folds every result into a 32 bit FNV-1a hash and prints it, so a single wrong bit
++//! anywhere changes a printed line, and prints the `overflowing_*` results of a few boundary pairs
++//! outright. The sweeps run several rounds so that the arithmetic is optimized code, not only the
++//! interpreter's first pass.
++//!
++//! `escapes` then lets a pair leave its op every way a program can — a call argument, a return
++//! value, an array element, a struct field, a closure capture, an `Option` payload, `black_box`,
++//! a `&` and a `&mut` borrow, two pairs into one call, a projected pair that also escapes, a pair
++//! read after a recursive call and one carried across a loop back edge — and hashes each shape on
++//! its own. It spells the operators as the `*_with_overflow` intrinsics, which rustc lowers to the
++//! MIR operators in this crate's own bodies, so every shape reaches the lowering's escape analysis
++//! even without MIR inlining.
++//!
++//! The expectations were validated by transplanting this file onto `std` with `isize`/`usize`
++//! spelled `i32`/`u32` (the target's pointer width) and running it at `-O` and `-O0` with
++//! `-C overflow-checks=off`, which agree.
++
++#![no_std]
++#![no_main]
++#![feature(core_intrinsics)]
++#![allow(internal_features)]
++
++#[path = "prelude.rs"]
++mod prelude;
++use prelude::*;
++
++use core::hint::black_box;
++use core::intrinsics::{add_with_overflow, mul_with_overflow, sub_with_overflow};
++
++/// How many times each sweep runs over its value table.
++const ROUNDS: u32 = 6;
++
++/// The word a `checked_*` that answered `None` folds as.
++const NONE: u32 = 0x9e37_79b9;
++
++/// A 32 bit FNV-1a accumulator over 32 bit words.
++#[derive(Clone, Copy)]
++struct Hash(u32);
++
++impl Hash {
++    fn new() -> Hash {
++        Hash(0x811c_9dc5)
++    }
++
++    fn word(&mut self, word: u32) {
++        self.0 = (self.0 ^ word).wrapping_mul(0x0100_0193);
++    }
++
++    fn flag(&mut self, flag: bool) {
++        self.word(if flag { 0x5bd1_e995 } else { 0x1b87_3593 });
++    }
++}
++
++/// A value that folds into a [`Hash`] and prints itself.
++trait Value: Copy {
++    fn fold(self, hash: &mut Hash);
++    fn print(self);
++}
++
++macro_rules! narrow {
++    ($($t:ty => $print:ident as $via:ty),*) => {$(
++        impl Value for $t {
++            fn fold(self, hash: &mut Hash) {
++                hash.word(self as u32);
++            }
++            fn print(self) {
++                $print(self as $via);
++            }
++        }
++    )*};
++}
++
++narrow!(i8 => print_i32 as i32, i16 => print_i32 as i32, i32 => print_i32 as i32,
++    isize => print_i32 as i32, u8 => print_u32 as u32, u16 => print_u32 as u32,
++    u32 => print_u32 as u32, usize => print_u32 as u32);
++
++macro_rules! wide {
++    ($($t:ty),*) => {$(
++        impl Value for $t {
++            fn fold(self, hash: &mut Hash) {
++                let mut rest = self as u128;
++                for _ in 0..(<$t>::BITS / 32) {
++                    hash.word(rest as u32);
++                    rest >>= 32;
++                }
++            }
++            fn print(self) {
++                if <$t>::BITS > 64 {
++                    print_i64(((self as u128) >> 64) as i64);
++                }
++                print_i64(self as i64);
++            }
++        }
++    )*};
++}
++
++wide!(i64, u64, i128, u128);
++
++/// An overflowing operation whose pair leaves this function whole.
++macro_rules! escaping {
++    ($($name:ident: $t:ty),*) => {$(
++        #[inline(never)]
++        fn $name(op: u32, a: $t, b: $t) -> ($t, bool) {
++            match op {
++                0 => a.overflowing_add(b),
++                1 => a.overflowing_sub(b),
++                _ => a.overflowing_mul(b),
++            }
++        }
++    )*};
++}
++
++escaping!(esc_i8: i8, esc_i16: i16, esc_i32: i32, esc_i64: i64, esc_i128: i128,
++    esc_isize: isize, esc_u8: u8, esc_u16: u16, esc_u32: u32, esc_u64: u64, esc_u128: u128,
++    esc_usize: usize);
++
++/// Folds both halves of a pair.
++fn fold_pair<T: Value>(hash: &mut Hash, pair: (T, bool)) {
++    pair.0.fold(hash);
++    hash.flag(pair.1);
++}
++
++/// A pair in a struct field.
++#[derive(Clone, Copy)]
++struct Holder<T> {
++    pair: (T, bool),
++    tag: u32,
++}
++
++#[inline(never)]
++fn sink<T>(pair: (T, bool)) -> (T, bool) {
++    pair
++}
++
++#[inline(never)]
++fn sink2<T: Value>(hash: &mut Hash, p: (T, bool), q: (T, bool)) -> bool {
++    p.0.fold(hash);
++    q.0.fold(hash);
++    p.1 ^ q.1
++}
++
++#[inline(never)]
++fn by_ref<T: Copy>(pair: &(T, bool)) -> (T, bool) {
++    *pair
++}
++
++#[inline(never)]
++fn by_mut<T: Copy>(pair: &mut (T, bool)) {
++    pair.1 = !pair.1;
++}
++
++#[inline(never)]
++fn call_it<T, F: Fn() -> (T, bool)>(f: F) -> (T, bool) {
++    f()
++}
++
++/// Defines `escapes(values: &[$t])`: every way a pair can leave the op that made it, each shape
++/// hashed on its own, for every pair of `values`. A macro rather than a generic function, because
++/// the `*_with_overflow` intrinsics are only defined at a concrete integer type.
++macro_rules! escapes {
++    ($t:ty) => {
++        /// A pair returned whole.
++        #[inline(never)]
++        fn made(a: $t, b: $t) -> ($t, bool) {
++            add_with_overflow(a, b)
++        }
++
++        #[inline(never)]
++        fn made_product(a: $t, b: $t) -> ($t, bool) {
++            mul_with_overflow(a, b)
++        }
++
++        /// `p` and `s` are computed before the recursive call; both halves of `p` are read after
++        /// it.
++        #[inline(never)]
++        fn deep(depth: u32, a: $t, b: $t) -> ($t, bool) {
++            let p = mul_with_overflow(a, b);
++            let s = add_with_overflow(a, b);
++            if depth == 0 {
++                return (s.0, s.1 ^ p.1);
++            }
++            let q = deep(depth - 1, b, s.0);
++            let r = add_with_overflow(p.0, q.0);
++            (r.0, r.1 ^ p.1 ^ q.1)
++        }
++
++        #[inline(never)]
++        fn escapes(values: &[$t]) {
++            let mut h = [Hash::new(); 13];
++            for (i, &a) in values.iter().enumerate() {
++                for (j, &b) in values.iter().enumerate() {
++                    let k = i ^ j;
++                    fold_pair(&mut h[0], sink(add_with_overflow(a, b)));
++                    fold_pair(&mut h[0], sink(mul_with_overflow(a, b)));
++                    fold_pair(&mut h[1], made(a, b));
++                    fold_pair(&mut h[1], made_product(a, b));
++                    let mut slots = [(a, false), (b, true)];
++                    slots[k & 1] = add_with_overflow(a, b);
++                    slots[(k >> 1) & 1] = mul_with_overflow(b, a);
++                    fold_pair(&mut h[2], slots[black_box(k) & 1]);
++                    fold_pair(&mut h[2], slots[black_box(k + 1) & 1]);
++                    let held = black_box(Holder {
++                        pair: mul_with_overflow(a, b),
++                        tag: 7,
++                    });
++                    fold_pair(&mut h[3], held.pair);
++                    h[3].flag(held.tag == 7);
++                    let captured = sub_with_overflow(a, b);
++                    fold_pair(&mut h[4], call_it(move || captured));
++                    let wrapped = Some(add_with_overflow(a, b));
++                    let unwrapped = match black_box(wrapped) {
++                        Some(pair) => pair,
++                        None => (a, false),
++                    };
++                    fold_pair(&mut h[5], unwrapped);
++                    fold_pair(&mut h[6], black_box(add_with_overflow(a, b)));
++                    fold_pair(&mut h[6], black_box(mul_with_overflow(a, b)));
++                    let borrowed = add_with_overflow(a, b);
++                    fold_pair(&mut h[7], by_ref(&borrowed));
++                    let mut mutated = mul_with_overflow(a, b);
++                    by_mut(&mut mutated);
++                    fold_pair(&mut h[8], mutated);
++                    let both = sink2(&mut h[9], add_with_overflow(a, b), sub_with_overflow(b, a));
++                    h[9].flag(both);
++                    let p = add_with_overflow(a, b);
++                    let q = sink(p);
++                    fold_pair(&mut h[10], (p.0, p.1 ^ q.1));
++                    q.0.fold(&mut h[10]);
++                    fold_pair(&mut h[11], deep(3, a, b));
++                }
++            }
++            let mut acc = values[0];
++            let mut prev = (values[1], false);
++            for &x in values {
++                let cur = add_with_overflow(acc, x);
++                fold_pair(&mut h[12], prev);
++                prev = cur;
++                let m = mul_with_overflow(cur.0, x);
++                acc = m.0;
++                h[12].flag(m.1);
++            }
++            fold_pair(&mut h[12], prev);
++            acc.fold(&mut h[12]);
++            print_str("escapes");
++            for hash in h {
++                print_u32(hash.0);
++            }
++        }
++    };
++}
++
++/// Sweeps every pair of `values` through every operation, prints the hashes, then prints the
++/// `overflowing_*` results of `edges` outright.
++macro_rules! sweep {
++    ($name:ident, $label:expr, $t:ty, $escape:ident, $values:expr, $edges:expr) => {
++        #[inline(never)]
++        fn $name() {
++            let values: &[$t] = black_box(&$values);
++            let mut overflowing = Hash::new();
++            let mut checked = Hash::new();
++            let mut wrapping = Hash::new();
++            let mut saturating = Hash::new();
++            let mut escaped = Hash::new();
++            let mut round = 0;
++            while round < black_box(ROUNDS) {
++                for &a in values {
++                    for &b in values {
++                        let (r, o) = a.overflowing_add(b);
++                        r.fold(&mut overflowing);
++                        overflowing.flag(o);
++                        let (r, o) = a.overflowing_sub(b);
++                        r.fold(&mut overflowing);
++                        overflowing.flag(o);
++                        let (r, o) = a.overflowing_mul(b);
++                        r.fold(&mut overflowing);
++                        overflowing.flag(o);
++
++                        for result in [a.checked_add(b), a.checked_sub(b), a.checked_mul(b)] {
++                            match result {
++                                Some(r) => r.fold(&mut checked),
++                                None => checked.word(NONE),
++                            }
++                        }
++                        checked.flag(a.checked_add(b).is_none());
++                        checked.flag(a.checked_mul(b).is_some());
++
++                        a.wrapping_add(b).fold(&mut wrapping);
++                        a.wrapping_sub(b).fold(&mut wrapping);
++                        a.wrapping_mul(b).fold(&mut wrapping);
++
++                        a.saturating_add(b).fold(&mut saturating);
++                        a.saturating_sub(b).fold(&mut saturating);
++                        a.saturating_mul(b).fold(&mut saturating);
++
++                        for op in 0..3 {
++                            let pair = black_box($escape(op, a, b));
++                            pair.0.fold(&mut escaped);
++                            escaped.flag(pair.1);
++                        }
++                        let pair = black_box(a.overflowing_mul(b));
++                        pair.0.fold(&mut escaped);
++                        escaped.flag(pair.1);
++                    }
++                }
++                round += 1;
++            }
++            print_str($label);
++            print_u32(overflowing.0);
++            print_u32(checked.0);
++            print_u32(wrapping.0);
++            print_u32(saturating.0);
++            print_u32(escaped.0);
++            let mut flags = 0u32;
++            for (i, &(a, b)) in black_box(&$edges).iter().enumerate() {
++                let a: $t = a;
++                let b: $t = b;
++                let (r, o) = a.overflowing_add(b);
++                r.print();
++                flags |= (o as u32) << (3 * i);
++                let (r, o) = a.overflowing_sub(b);
++                r.print();
++                flags |= (o as u32) << (3 * i + 1);
++                let (r, o) = a.overflowing_mul(b);
++                r.print();
++                flags |= (o as u32) << (3 * i + 2);
++            }
++            print_u32(flags);
++            escapes!($t);
++            escapes(values);
++        }
++    };
++}
++
++sweep!(sweep_i8, "i8", i8, esc_i8,
++    [i8::MIN, i8::MIN + 1, -16, -2, -1, 0, 1, 2, 11, 12, 16, i8::MAX - 1, i8::MAX],
++    [(i8::MAX, 1), (i8::MIN, -1), (i8::MIN, i8::MIN), (12, 11)]);
++sweep!(sweep_i16, "i16", i16, esc_i16,
++    [i16::MIN, i16::MIN + 1, -256, -2, -1, 0, 1, 2, 181, 182, 256, i16::MAX - 1, i16::MAX],
++    [(i16::MAX, 1), (i16::MIN, -1), (i16::MIN, i16::MIN), (182, 181)]);
++sweep!(sweep_i32, "i32", i32, esc_i32,
++    [i32::MIN, i32::MIN + 1, -65536, -2, -1, 0, 1, 2, 46340, 46341, 65536, i32::MAX - 1,
++        i32::MAX],
++    [(i32::MAX, 1), (i32::MIN, -1), (i32::MIN, i32::MIN), (46341, 46340)]);
++sweep!(sweep_isize, "isize", isize, esc_isize,
++    [isize::MIN, isize::MIN + 1, -65536, -2, -1, 0, 1, 2, 46340, 46341, 65536, isize::MAX - 1,
++        isize::MAX],
++    [(isize::MAX, 1), (isize::MIN, -1), (isize::MIN, isize::MIN), (46341, 46340)]);
++sweep!(sweep_i64, "i64", i64, esc_i64,
++    [i64::MIN, i64::MIN + 1, -(1 << 32), -2, -1, 0, 1, 2, 3_037_000_499, 3_037_000_500, 1 << 32,
++        i64::MAX - 1, i64::MAX],
++    [(i64::MAX, 1), (i64::MIN, -1), (i64::MIN, i64::MIN), (3_037_000_500, 3_037_000_499)]);
++sweep!(sweep_i128, "i128", i128, esc_i128,
++    [i128::MIN, i128::MIN + 1, -(1 << 64), -2, -1, 0, 1, 2, 13_043_817_825_332_782_212,
++        13_043_817_825_332_782_213, 1 << 64, i128::MAX - 1, i128::MAX],
++    [(i128::MAX, 1), (i128::MIN, -1), (i128::MIN, i128::MIN),
++        (13_043_817_825_332_782_213, 13_043_817_825_332_782_212)]);
++sweep!(sweep_u8, "u8", u8, esc_u8,
++    [0, 1, 2, 3, 15, 16, 17, 127, 128, u8::MAX - 1, u8::MAX],
++    [(u8::MAX, 1), (0, 1), (u8::MAX, u8::MAX), (16, 16)]);
++sweep!(sweep_u16, "u16", u16, esc_u16,
++    [0, 1, 2, 3, 255, 256, 257, 32767, 32768, u16::MAX - 1, u16::MAX],
++    [(u16::MAX, 1), (0, 1), (u16::MAX, u16::MAX), (256, 256)]);
++sweep!(sweep_u32, "u32", u32, esc_u32,
++    [0, 1, 2, 3, 65535, 65536, 65537, 0x7fff_ffff, 0x8000_0000, u32::MAX - 1, u32::MAX],
++    [(u32::MAX, 1), (0, 1), (u32::MAX, u32::MAX), (65536, 65536)]);
++sweep!(sweep_usize, "usize", usize, esc_usize,
++    [0, 1, 2, 3, 65535, 65536, 65537, 0x7fff_ffff, 0x8000_0000, usize::MAX - 1, usize::MAX],
++    [(usize::MAX, 1), (0, 1), (usize::MAX, usize::MAX), (65536, 65536)]);
++sweep!(sweep_u64, "u64", u64, esc_u64,
++    [0, 1, 2, 3, u32::MAX as u64, 1 << 32, (1 << 32) + 1, i64::MAX as u64, 1 << 63, u64::MAX - 1,
++        u64::MAX],
++    [(u64::MAX, 1), (0, 1), (u64::MAX, u64::MAX), (1 << 32, 1 << 32)]);
++sweep!(sweep_u128, "u128", u128, esc_u128,
++    [0, 1, 2, 3, u64::MAX as u128, 1 << 64, (1 << 64) + 1, i128::MAX as u128, 1 << 127,
++        u128::MAX - 1, u128::MAX],
++    [(u128::MAX, 1), (0, 1), (u128::MAX, u128::MAX), (1 << 64, 1 << 64)]);
++
++/// `Range::next` steps with `Step::forward_unchecked`, the overflowing add `fflate`'s byte loop
++/// spends its time in; the ranges end at the top of their type and start at the bottom.
++#[inline(never)]
++fn ranges() {
++    let mut hash = Hash::new();
++    let mut round = 0;
++    while round < black_box(ROUNDS) {
++        for i in black_box(i32::MAX - 300)..black_box(i32::MAX) {
++            i.fold(&mut hash);
++        }
++        for i in black_box(i32::MIN)..black_box(i32::MIN + 300) {
++            i.fold(&mut hash);
++        }
++        for i in black_box(u8::MAX - 40)..=black_box(u8::MAX) {
++            i.fold(&mut hash);
++        }
++        for i in black_box(i64::MAX - 40)..black_box(i64::MAX) {
++            i.fold(&mut hash);
++        }
++        for i in (black_box(usize::MAX - 90)..black_box(usize::MAX)).rev() {
++            i.fold(&mut hash);
++        }
++        let mut sum = 0i16;
++        for i in black_box(-300i16)..black_box(300) {
++            sum = sum.wrapping_add(i.checked_add_unsigned(black_box(7)).unwrap_or(0));
++        }
++        sum.fold(&mut hash);
++        round += 1;
++    }
++    print_str("ranges");
++    print_u32(hash.0);
++}
++
++#[unsafe(no_mangle)]
++pub fn rust_entry() {
++    sweep_i8();
++    sweep_i16();
++    sweep_i32();
++    sweep_isize();
++    sweep_i64();
++    sweep_i128();
++    sweep_u8();
++    sweep_u16();
++    sweep_u32();
++    sweep_usize();
++    sweep_u64();
++    sweep_u128();
++    ranges();
++}
+diff --git a/jsc-link/src/lower/js/emit.rs b/jsc-link/src/lower/js/emit.rs
+index 94a7e4961ada5b7469687a0874811128b140db79..a7aed7b0d0b145cb438dcaa4e636ebc75515824b 100644
+--- a/jsc-link/src/lower/js/emit.rs
++++ b/jsc-link/src/lower/js/emit.rs
+@@ -1056,6 +1056,11 @@ impl<'a> JsCx<'a> {
+             OpKind::Const(tree) => self.const_expr(tree, result_ty),
+             OpKind::Copy(v) => {
+                 let value = self.expr_of(*v)?;
++                // A carried overflow pair is a scalar (`rvalue::carried_overflow_pairs`), and
++                // nothing mutates one: its copy is the same value.
++                if self.carried_pairs.contains_key(&result) {
++                    return Ok(value);
++                }
+                 let ty = self.ty_of(*v)?;
+                 // A committed carrier is cloned at its own shape: the baseline field-wise clone
+                 // reads a structure the value no longer has (Phase 4).
+@@ -1103,6 +1108,9 @@ impl<'a> JsCx<'a> {
+                 variant,
+                 field,
+             } => {
++                if let Some(&pair) = self.carried_pairs.get(base) {
++                    return self.carried_pair_field(pair, *base, *field);
++                }
+                 let base_ty = self.ty_of(*base)?;
+                 let Some(descriptor) = table.field(base_ty, *variant, *field) else {
+                     return Err(decline(
+@@ -1144,6 +1152,10 @@ impl<'a> JsCx<'a> {
+                 Ok(self.read_place(&walk.place))
+             }
+             OpKind::Binary { op: bin, l, r, ty } => {
++                if let Some(pair) = self.carried_pairs.get(&result) {
++                    let (lhs, rhs) = (self.expr_of(*l)?, self.expr_of(*r)?);
++                    return self.carried_pair_value(pair.carrier, *bin, *ty, lhs, rhs);
++                }
+                 let rhs_ty = self.ty_of(*r)?;
+                 self.binary(
+                     *bin,
+diff --git a/jsc-link/src/lower/js/intrinsics.rs b/jsc-link/src/lower/js/intrinsics.rs
+index 8132008d083fc1d7f134df3fceb0c6a16a84e128..de71f12f4c0dae26437505e65d1420d1e20ddaaf 100644
+--- a/jsc-link/src/lower/js/intrinsics.rs
++++ b/jsc-link/src/lower/js/intrinsics.rs
+@@ -617,16 +617,26 @@ impl Intrinsic<'_, '_> {
+     }
+ 
+     /// `add_with_overflow` and its siblings: the wrapped result paired with whether it wrapped.
++    ///
++    /// A 32 bit product is not exact in a double, so its wrapped half is `Math.imul` over the
++    /// (captured) operands; the flag still compares against the rounded product, which lands
++    /// outside the type's range exactly when the true product does.
+     fn with_overflow(&self, name: &str, int: Int) -> Res<Outcome> {
+         let lhs = self.arg(0)?;
+         let rhs = self.arg(1)?;
+-        let exact = match name {
+-            "add_with_overflow" => jsast::binary(BinOp::Add, lhs, rhs),
+-            "sub_with_overflow" => jsast::binary(BinOp::Sub, lhs, rhs),
+-            _ => jsast::binary(BinOp::Mul, lhs, rhs),
++        let product = name == "mul_with_overflow";
++        let op = match name {
++            "add_with_overflow" => BinOp::Add,
++            "sub_with_overflow" => BinOp::Sub,
++            _ => BinOp::Mul,
+         };
+-        let exact = self.temp(exact);
+-        let wrapped = self.temp(value::mask(int.repr, int.signed, int.bits, exact.clone()));
++        let exact = self.temp(jsast::binary(op, lhs.clone(), rhs.clone()));
++        let wrapping = if product && int.repr == IntRepr::Number && int.bits == 32 {
++            int.multiply(lhs, rhs)
++        } else {
++            exact.clone()
++        };
++        let wrapped = self.temp(value::mask(int.repr, int.signed, int.bits, wrapping));
+         Ok(Outcome::Value(jsast::array(vec![
+             wrapped.clone(),
+             jsast::binary(BinOp::StrictNe, wrapped, exact),
+diff --git a/jsc-link/src/lower/js/mod.rs b/jsc-link/src/lower/js/mod.rs
+index 8b29c5987bffde45cf456750fd594457c146f7ed..2301dc3685a7e7124f3117577700911e8fdb91dc 100644
+--- a/jsc-link/src/lower/js/mod.rs
++++ b/jsc-link/src/lower/js/mod.rs
+@@ -121,6 +121,9 @@ pub struct JsCx<'a> {
+     pending_return: RefCell<Option<Expr>>,
+     /// The defining op of every value an op defines: `(block, index)`.
+     defs: BTreeMap<ValueId, (u32, u32)>,
++    /// Overflow pairs that are never built, and how each is spelled
++    /// (`rvalue::carried_overflow_pairs`).
++    carried_pairs: BTreeMap<ValueId, rvalue::CarriedPair>,
+ }
+ 
+ impl<'a> JsCx<'a> {
+@@ -166,6 +169,7 @@ impl<'a> JsCx<'a> {
+             origin: Cell::new(None),
+             pending_return: RefCell::new(None),
+             defs,
++            carried_pairs: rvalue::carried_overflow_pairs(func, table),
+         }
+     }
+ 
+diff --git a/jsc-link/src/lower/js/place.rs b/jsc-link/src/lower/js/place.rs
+index 83de3f5931d6a79e0d04517da77ebce67d10b4ac..9adcb03fd052d1826c6ffc70f7fb79a0a033e5bc 100644
+--- a/jsc-link/src/lower/js/place.rs
++++ b/jsc-link/src/lower/js/place.rs
+@@ -449,7 +449,7 @@ impl<'a> JsCx<'a> {
+             return Err(decline(OpClass::Rvalue, "PtrMetadata of a non-pointer"));
+         };
+         match value::kind(table, pointee) {
+-            Some(TypeKind::Slice(_)) => Ok(ptr::slot_len(value)),
++            Some(TypeKind::Slice(_)) => Ok(self.slice_len(value)),
+             Some(TypeKind::Dynamic { .. }) => Ok(jsast::member(value, META)),
+             Some(TypeKind::Str) => Ok(self.str_len(value)),
+             _ if table.get(pointee).is_some_and(|d| d.layout.sized) => Ok(jsast::undefined()),
+diff --git a/jsc-link/src/lower/js/ptr.rs b/jsc-link/src/lower/js/ptr.rs
+index 24ee373e20c4f10bc974d725161bb9c4cab25549..0ae1e0d35d24cb455e5c78619b0867c1de1fead6 100644
+--- a/jsc-link/src/lower/js/ptr.rs
++++ b/jsc-link/src/lower/js/ptr.rs
+@@ -317,6 +317,13 @@ impl<'a> JsCx<'a> {
+         ptr::slot(ptr::slot_buf(self.str_to_bytes(string)), jsast::num(0))
+     }
+ 
++    /// `s.as_bytes_mut()` (`ptr.rs::str_to_bytes_mut`): a fresh byte view no other `as_bytes`
++    /// shares, so a write through it — lost, since a `&mut str` has no mutable JavaScript form —
++    /// cannot surface in the memoized view of an equal string.
++    pub fn str_to_bytes_mut(&self, string: Expr) -> Expr {
++        jsast::rt_call("str_bytes_mut", vec![string])
++    }
++
+     /// `str::from_utf8_unchecked(v)` (`ptr.rs::bytes_to_str`).
+     pub fn bytes_to_str(&self, bytes: Expr) -> Expr {
+         let (setup, bytes) = self.reread(bytes, &[BUF, OFF, LEN]);
+@@ -336,6 +343,16 @@ impl<'a> JsCx<'a> {
+         jsast::rt_call("str_len", vec![string])
+     }
+ 
++    /// The length of a fat slice (`ptr.rs::slice_len`): `slice.len`, except over a `&str`'s byte
++    /// view, where `__rt.str_bytes(s).len` is `__rt.str_len(s)`. `str::len` is
++    /// `self.as_bytes().len()`, and a length needs no bytes.
++    pub fn slice_len(&self, slice: Expr) -> Expr {
++        match str_bytes_operand(slice) {
++            Ok(string) => self.str_len(string),
++            Err(slice) => ptr::slot_len(slice),
++        }
++    }
++
+     /// The `str` arms of the pointer cast matrix over two pointee types (`ptr.rs::cast_str`);
+     /// `None` when neither side is a `str`.
+     pub fn cast_str(
+@@ -343,6 +360,18 @@ impl<'a> JsCx<'a> {
+         from_pointee: TypeId,
+         to_pointee: TypeId,
+         value: Expr,
++    ) -> Option<Res<Expr>> {
++        self.cast_str_as(from_pointee, to_pointee, value, false)
++    }
++
++    /// [`Self::cast_str`], told whether the target pointer is mutable: a `str` cast to a mutable
++    /// byte pointer gets its own byte view (`ptr.rs::cast_str`).
++    fn cast_str_as(
++        &self,
++        from_pointee: TypeId,
++        to_pointee: TypeId,
++        value: Expr,
++        mutable: bool,
+     ) -> Option<Res<Expr>> {
+         let table = self.table;
+         let (from_str, to_str) = (
+@@ -361,10 +390,16 @@ impl<'a> JsCx<'a> {
+         Some(match (from_str, to_str) {
+             (true, true) => Ok(value),
+             (true, false) => match value::kind(table, to_pointee) {
+-                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => {
+-                    Ok(self.str_to_bytes(value))
+-                }
+-                _ if value::is_u8(table, to_pointee) => Ok(self.str_to_byte_ptr(value)),
++                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => Ok(if mutable {
++                    self.str_to_bytes_mut(value)
++                } else {
++                    self.str_to_bytes(value)
++                }),
++                _ if value::is_u8(table, to_pointee) => Ok(if mutable {
++                    ptr::slot(ptr::slot_buf(self.str_to_bytes_mut(value)), jsast::num(0))
++                } else {
++                    self.str_to_byte_ptr(value)
++                }),
+                 _ => unsupported(),
+             },
+             (false, true) => match value::kind(table, from_pointee) {
+@@ -381,7 +416,14 @@ impl<'a> JsCx<'a> {
+     pub fn cast_str_ptr(&self, from_ty: TypeId, to_ty: TypeId, value: Expr) -> Option<Res<Expr>> {
+         let from_pointee = value::pointee_of(self.table, from_ty)?;
+         let to_pointee = value::pointee_of(self.table, to_ty)?;
+-        self.cast_str(from_pointee, to_pointee, value)
++        let mutable = matches!(
++            value::kind(self.table, to_ty),
++            Some(
++                TypeKind::Reference { mutable: true, .. }
++                    | TypeKind::RawPointer { mutable: true, .. }
++            )
++        );
++        self.cast_str_as(from_pointee, to_pointee, value, mutable)
+     }
+ 
+     /// `value as *const to_pointee` (`ptr.rs::cast_pointer`).
+@@ -788,3 +830,19 @@ fn duplicable(value: &Expr, reads: &[&str]) -> bool {
+ pub fn meta(pointer: Expr) -> Expr {
+     jsast::member(pointer, META)
+ }
++
++/// The string a `__rt.str_bytes(s)` call encodes, or the expression back when it is anything else
++/// (`ptr.rs::str_bytes_operand`). `str_bytes` has no effect a program can observe, so a consumer
++/// that needs only what the string itself answers may drop the call.
++fn str_bytes_operand(expr: Expr) -> Result<Expr, Expr> {
++    match expr {
++        Expr::Call(callee, mut args)
++            if args.len() == 1
++                && matches!(&*callee, Expr::Member(object, name)
++                    if name == "str_bytes" && matches!(&**object, Expr::Ident(rt) if rt == "__rt")) =>
++        {
++            Ok(args.pop().expect("one argument"))
++        }
++        other => Err(other),
++    }
++}
+diff --git a/jsc-link/src/lower/js/rvalue.rs b/jsc-link/src/lower/js/rvalue.rs
+index 71a1cfe545cb1a9f6fa8e483120d1dd2370314c5..eab7a40dc623fd2c80561cc51ec23771ed4b30ec 100644
+--- a/jsc-link/src/lower/js/rvalue.rs
++++ b/jsc-link/src/lower/js/rvalue.rs
+@@ -1,11 +1,15 @@
+ //! Operators, casts, aggregates and discriminants (v1 `backend/src/rvalue.rs` and the coercion
+ //! rows of `unsize.rs` that need no vtable name).
+ 
++use std::collections::{BTreeMap, BTreeSet};
++
+ use rcgjs_object::evaluation::OperandEvaluation;
+ use rcgjs_object::jir::decline::OpClass;
+-use rcgjs_object::jir::repr::ValueId;
++use rcgjs_object::jir::repr::{Func, OpKind, ValueId};
+ use rcgjs_object::jir::semantic::{BinaryOp, CastKind, UnaryOp};
+-use rcgjs_object::jir::types::{EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind};
++use rcgjs_object::jir::types::{
++    EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind, TypeTable,
++};
+ use rcgjs_object::jsast::{self, BinOp as JsBinOp, Expr};
+ use rcgjs_object::ptr;
+ 
+@@ -13,8 +17,151 @@ use super::call::Lowered;
+ use super::value::{self, mask, mask_ty, TAG};
+ use super::{decline, JsCx, Res};
+ 
+-/// The parameter the checked-arithmetic arrow binds its exact result to (`rvalue.rs:24`).
+-const OVERFLOW_PARAM: &str = "$w";
++/// The JavaScript operator of an overflow-reporting operator, applied at full precision.
++fn overflow_operator(op: BinaryOp) -> Option<JsBinOp> {
++    match op {
++        BinaryOp::AddWithOverflow => Some(JsBinOp::Add),
++        BinaryOp::SubWithOverflow => Some(JsBinOp::Sub),
++        BinaryOp::MulWithOverflow => Some(JsBinOp::Mul),
++        _ => None,
++    }
++}
++
++/// Whether `op` at `ty` can carry its `(T, bool)` pair as the exact JavaScript result `x` alone:
++/// the wrapped half is then `mask(x)` and the flag `mask(x) !== x`.
++///
++/// Every sum and difference can: two integers of at most 32 bits add exactly in a double, and a
++/// `BigInt` result is exact by construction. So can a product of at most 16 bits (below 2^32) or
++/// in `BigInt`. A 32 bit product cannot — the double rounds away the low bits a wrap keeps — so
++/// it is carried only when one half is read ([`PairCarrier::Wrapped`], [`PairCarrier::Overflowed`])
++/// and keeps the array form of [`JsCx::binary`] otherwise.
++fn exact_overflow(table: &TypeTable, op: BinaryOp, ty: TypeId) -> bool {
++    let Some((_, bits)) = table.int_info(ty) else {
++        return false;
++    };
++    let limit = if op == BinaryOp::MulWithOverflow {
++        16
++    } else {
++        32
++    };
++    overflow_operator(op).is_some() && (table.int_repr(ty) == IntRepr::BigInt || bits <= limit)
++}
++
++/// Whether `op` at `ty` is the one overflow operator [`exact_overflow`] refuses: a product of 32
++/// bit numbers.
++fn product_32(table: &TypeTable, op: BinaryOp, ty: TypeId) -> bool {
++    op == BinaryOp::MulWithOverflow
++        && table.int_repr(ty) == IntRepr::Number
++        && table.int_info(ty).is_some_and(|(_, bits)| bits == 32)
++}
++
++/// How an overflow pair that is never built is spelled.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) enum PairCarrier {
++    /// The exact `l op r` ([`exact_overflow`]): `.0` reads `mask(x)` and `.1` `mask(x) !== x`.
++    Exact,
++    /// A 32 bit product only `.0` of which is read: the wrapped `mask(Math.imul(l, r))` itself.
++    Wrapped,
++    /// A 32 bit product only `.1` of which is read: the flag `mask(Math.imul(l, r)) !== l * r`
++    /// itself.
++    Overflowed,
++}
++
++/// A value of a pair family that is never built: the result of the overflow op `root`, or a
++/// `Move`/`Copy` of a member, all spelled by the same `carrier`.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(super) struct CarriedPair {
++    pub root: ValueId,
++    pub carrier: PairCarrier,
++}
++
++/// The overflow pairs of `func` that are never built, by every value of their family.
++///
++/// A family is a result of `AddWithOverflow` or a sibling, plus every `Move`/`Copy` of a member
++/// (a copy of a value nobody mutates is the same value). It is carried when every use of every
++/// member is a `Field` projection of `.0` or `.1` or such a `Move`/`Copy` — the
++/// `let (r, o) = a.overflowing_add(b)` and `checked_*` shape. Any other use — a block argument,
++/// a return, a call argument, an aggregate field, a store, a borrow — needs the real pair and
++/// keeps the array. A 32 bit product is carried only when one of its halves is never read.
++/// Unsigned sums usually never get here: `opt::dce` already splits a projected one into a
++/// wrapped add and a comparison.
++pub(super) fn carried_overflow_pairs(
++    func: &Func,
++    table: &TypeTable,
++) -> BTreeMap<ValueId, CarriedPair> {
++    let ops = || func.blocks.iter().flat_map(|block| &block.ops);
++    let roots: BTreeMap<ValueId, (BinaryOp, TypeId)> = ops()
++        .filter_map(|op| match (op.result, &op.kind) {
++            (Some(result), OpKind::Binary { op, ty, .. })
++                if exact_overflow(table, *op, *ty) || product_32(table, *op, *ty) =>
++            {
++                Some((result, (*op, *ty)))
++            }
++            _ => None,
++        })
++        .collect();
++    if roots.is_empty() {
++        return BTreeMap::new();
++    }
++    let mut root_of: BTreeMap<ValueId, ValueId> = roots.keys().map(|&root| (root, root)).collect();
++    // Blocks are not in dominance order, so a copy of a copy may be seen before its source is.
++    loop {
++        let mut grew = false;
++        for op in ops() {
++            if let (Some(result), OpKind::Move(source) | OpKind::Copy(source)) =
++                (op.result, &op.kind)
++            {
++                if let Some(&root) = root_of.get(source) {
++                    grew |= root_of.insert(result, root).is_none();
++                }
++            }
++        }
++        if !grew {
++            break;
++        }
++    }
++    let mut read: BTreeMap<ValueId, [bool; 2]> = BTreeMap::new();
++    let mut escaped: BTreeSet<ValueId> = BTreeSet::new();
++    for block in &func.blocks {
++        for op in &block.ops {
++            match &op.kind {
++                OpKind::Field {
++                    base,
++                    variant: None,
++                    field: field @ (0 | 1),
++                } if root_of.contains_key(base) => {
++                    read.entry(root_of[base]).or_default()[*field as usize] = true;
++                }
++                OpKind::Move(source) | OpKind::Copy(source) if root_of.contains_key(source) => {}
++                kind => escaped.extend(kind.uses().iter().filter_map(|v| root_of.get(v))),
++            }
++        }
++        escaped.extend(block.term.uses().iter().filter_map(|v| root_of.get(v)));
++    }
++    let carriers: BTreeMap<ValueId, PairCarrier> = roots
++        .into_iter()
++        .filter(|(root, _)| !escaped.contains(root))
++        .filter_map(|(root, (op, ty))| {
++            let carrier = if exact_overflow(table, op, ty) {
++                PairCarrier::Exact
++            } else {
++                match read.get(&root).copied().unwrap_or_default() {
++                    [true, true] => return None,
++                    [false, true] => PairCarrier::Overflowed,
++                    _ => PairCarrier::Wrapped,
++                }
++            };
++            Some((root, carrier))
++        })
++        .collect();
++    root_of
++        .into_iter()
++        .filter_map(|(value, root)| {
++            let carrier = *carriers.get(&root)?;
++            Some((value, CarriedPair { root, carrier }))
++        })
++        .collect()
++}
+ 
+ impl<'a> JsCx<'a> {
+     /// `l op r` at operand type `ty` (`rvalue.rs::codegen_rvalue`, `BinaryOp` arm).
+@@ -71,33 +218,146 @@ impl<'a> JsCx<'a> {
+         ))
+     }
+ 
+-    /// `AddWithOverflow` and its siblings (`rvalue.rs::codegen_with_overflow`).
++    /// `AddWithOverflow` and its siblings as a real pair (`rvalue.rs::codegen_with_overflow`): the
++    /// array `[$u = mask($t = l op r), $u !== $t]`.
++    ///
++    /// An rvalue has no statement position, so the exact result is bound by an assignment to a
++    /// hoisted temporary inside the first element (`ptr.rs::reread`'s idiom) and read back by the
++    /// second; array elements evaluate left to right, and that is all the sequencing it needs —
++    /// no closure. A 32 bit product is not exact in a double, so its wrapped half is
++    /// `Math.imul` over the operands, and only the flag compares against the rounded product: a
++    /// product outside the type's range rounds to a double outside it too, never to a value
++    /// inside.
+     fn with_overflow(&self, op: BinaryOp, ty: TypeId, lhs: Expr, rhs: Expr) -> Res<Expr> {
+-        let Some((signed, bits)) = self.table.int_info(ty) else {
++        let (Some((signed, bits)), Some(js_op)) = (self.table.int_info(ty), overflow_operator(op))
++        else {
+             return Err(decline(
+                 OpClass::Rvalue,
+                 "overflowing arithmetic on a non-integer",
+             ));
+         };
+         let repr = self.table.int_repr(ty);
+-        let js_op = match op {
+-            BinaryOp::AddWithOverflow => JsBinOp::Add,
+-            BinaryOp::SubWithOverflow => JsBinOp::Sub,
+-            _ => JsBinOp::Mul,
++        let (wrapped, exact) = if product_32(self.table, op, ty) {
++            self.product_32_halves(lhs, rhs)
++        } else {
++            let exact = self.temp_name();
++            (
++                jsast::assign(exact.clone(), jsast::binary(js_op, lhs, rhs)),
++                exact,
++            )
+         };
+-        let exact = jsast::binary(js_op, lhs, rhs);
+-        let bound = jsast::id(OVERFLOW_PARAM);
+-        let wrapped = mask(repr, signed, bits, bound.clone());
+-        Ok(jsast::call(
+-            jsast::arrow(
+-                vec![OVERFLOW_PARAM.to_string()],
+-                jsast::array(vec![
+-                    wrapped.clone(),
+-                    jsast::binary(JsBinOp::StrictNe, wrapped, bound),
+-                ]),
+-            ),
+-            vec![exact],
+-        ))
++        let bound = self.temp_name();
++        Ok(jsast::array(vec![
++            jsast::assign(bound.clone(), mask(repr, signed, bits, wrapped)),
++            jsast::binary(JsBinOp::StrictNe, bound, exact),
++        ]))
++    }
++
++    /// A 32 bit product over operands evaluated once each: `Math.imul(l, r)`, the product modulo
++    /// 2^32 that the wrapped half masks, and the rounded `l * r` only the flag compares against.
++    fn product_32_halves(&self, lhs: Expr, rhs: Expr) -> (Expr, Expr) {
++        let (lhs, lhs_again) = self.read_twice(lhs);
++        let (rhs, rhs_again) = self.read_twice(rhs);
++        (
++            jsast::imul(lhs, rhs),
++            jsast::binary(JsBinOp::Mul, lhs_again, rhs_again),
++        )
++    }
++
++    /// The value of the overflow op at the root of a carried pair family
++    /// ([`carried_overflow_pairs`]): the exact `l op r`, with no wrap and no pair around it, or
++    /// the one half of a 32 bit product that is read.
++    pub(super) fn carried_pair_value(
++        &self,
++        carrier: PairCarrier,
++        op: BinaryOp,
++        ty: TypeId,
++        lhs: Expr,
++        rhs: Expr,
++    ) -> Res<Expr> {
++        let (Some((signed, bits)), Some(js_op)) = (self.table.int_info(ty), overflow_operator(op))
++        else {
++            return Err(decline(
++                OpClass::Rvalue,
++                "overflowing arithmetic on a non-integer",
++            ));
++        };
++        let repr = self.table.int_repr(ty);
++        Ok(match carrier {
++            PairCarrier::Exact => jsast::binary(js_op, lhs, rhs),
++            PairCarrier::Wrapped => mask(repr, signed, bits, jsast::imul(lhs, rhs)),
++            PairCarrier::Overflowed => {
++                let (wrapped, rounded) = self.product_32_halves(lhs, rhs);
++                jsast::binary(
++                    JsBinOp::StrictNe,
++                    mask(repr, signed, bits, wrapped),
++                    rounded,
++                )
++            }
++        })
++    }
++
++    /// Field `field` of the carried pair `base` ([`carried_overflow_pairs`]): read off the exact
++    /// result `x` — the wrapped `mask(x)` or the flag `mask(x) !== x` — or, for a 32 bit product,
++    /// the half the value already is.
++    pub(super) fn carried_pair_field(
++        &self,
++        pair: CarriedPair,
++        base: ValueId,
++        field: u32,
++    ) -> Res<Expr> {
++        let value = self.expr_of(base)?;
++        match (pair.carrier, field) {
++            (PairCarrier::Wrapped, 0) | (PairCarrier::Overflowed, 1) => return Ok(value),
++            (PairCarrier::Exact, 0 | 1) => {}
++            _ => {
++                return Err(decline(
++                    OpClass::Rvalue,
++                    "a carried overflow pair read through a half it does not carry",
++                ))
++            }
++        }
++        let ty = match self.def_of(pair.root).map(|def| &def.kind) {
++            Some(OpKind::Binary { ty, .. }) => *ty,
++            _ => {
++                return Err(decline(
++                    OpClass::Rvalue,
++                    "a carried overflow pair that no `Binary` op defines",
++                ))
++            }
++        };
++        let Some((signed, bits)) = self.table.int_info(ty) else {
++            return Err(decline(
++                OpClass::Rvalue,
++                "overflowing arithmetic on a non-integer",
++            ));
++        };
++        let repr = self.table.int_repr(ty);
++        Ok(match field {
++            0 => mask(repr, signed, bits, value),
++            _ => {
++                let (exact, again) = self.read_twice(value);
++                jsast::binary(JsBinOp::StrictNe, mask(repr, signed, bits, exact), again)
++            }
++        })
++    }
++
++    /// `value` read twice, evaluated once: itself when it is a name or a literal, otherwise an
++    /// assignment to a hoisted temporary for the first read and the temporary for the second.
++    fn read_twice(&self, value: Expr) -> (Expr, Expr) {
++        if matches!(
++            value,
++            Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_) | Expr::BigInt(_)
++        ) {
++            return (value.clone(), value);
++        }
++        let name = self.temp_name();
++        (jsast::assign(name.clone(), value), name)
++    }
++
++    /// A fresh hoisted temporary, for an assignment spelled inside an expression.
++    fn temp_name(&self) -> Expr {
++        self.temp(jsast::undefined()).1
+     }
+ 
+     /// Every other binary operator (`rvalue.rs::codegen_binop`).
+@@ -283,6 +543,11 @@ impl<'a> JsCx<'a> {
+                 } else {
+                     value
+                 };
++                // A `str` arm asks whether the target is mutable (`as_bytes_mut`), which only the
++                // pointer types say.
++                if let Some(converted) = self.cast_str_ptr(from_ty, to_ty, value.clone()) {
++                    return converted;
++                }
+                 self.cast_pointer(from_pointee, to_pointee, value)
+             }
+             CastKind::PointerExposeProvenance => {
+diff --git a/jsc-link/src/lower/js/tests.rs b/jsc-link/src/lower/js/tests.rs
+index 23c958152b8f09cfd90dc5f9fe4a3fbbf4ebe759..88a5d33f5b5a323d14d1a0466578851d1a3e7505 100644
+--- a/jsc-link/src/lower/js/tests.rs
++++ b/jsc-link/src/lower/js/tests.rs
+@@ -698,33 +698,829 @@ fn u8_arith_masks_and_shift_amounts_match_the_golden() {
+     );
+ }
+ 
+-#[test]
+-fn overflowing_add_is_the_arrow_form() {
+-    let interns = world();
+-    let mut b = FuncBuilder::new(item(1), signature(vec![U32, U32], OVERFLOW));
+-    let a = b.param(U32, NO_ORIGIN);
+-    let c = b.param(U32, NO_ORIGIN);
++/// `(r, o) = a.op(b)` returned whole: `p = op(a, b)` is the pair itself.
++fn escaping_overflow(op: BinaryOp, ty: TypeId, pair: TypeId) -> Func {
++    let mut b = FuncBuilder::new(item(1), signature(vec![ty, ty], pair));
++    let x = b.param(ty, NO_ORIGIN);
++    let y = b.param(ty, NO_ORIGIN);
++    let e = FuncBuilder::ENTRY;
++    let p = b.op(e, OpKind::Binary { op, l: x, r: y, ty }, pair, NO_ORIGIN);
++    b.terminate(e, RTerm::Return(Some(p)));
++    b.finish()
++}
++
++/// `let (r, o) = a.op(b); (r, o)`: the pair `p` is only ever projected, and a fresh tuple of its
++/// two fields is what leaves. Values: `a b p r o out`.
++fn projected_overflow(op: BinaryOp, ty: TypeId, pair: TypeId) -> Func {
++    let mut b = FuncBuilder::new(item(1), signature(vec![ty, ty], pair));
++    let x = b.param(ty, NO_ORIGIN);
++    let y = b.param(ty, NO_ORIGIN);
+     let e = FuncBuilder::ENTRY;
+-    let r = b.op(
++    let p = b.op(e, OpKind::Binary { op, l: x, r: y, ty }, pair, NO_ORIGIN);
++    let field = |b: &mut FuncBuilder, field, ty| {
++        b.op(
++            e,
++            OpKind::Field {
++                base: p,
++                variant: None,
++                field,
++            },
++            ty,
++            NO_ORIGIN,
++        )
++    };
++    let wrapped = field(&mut b, 0, ty);
++    let overflowed = field(&mut b, 1, BOOL);
++    let out = b.op(
+         e,
+-        OpKind::Binary {
+-            op: BinaryOp::AddWithOverflow,
+-            l: a,
+-            r: c,
+-            ty: U32,
++        OpKind::Aggregate {
++            ty: pair,
++            variant: 0,
++            active_field: None,
++            fields: vec![wrapped, overflowed],
+         },
+-        OVERFLOW,
++        pair,
+         NO_ORIGIN,
+     );
+-    b.terminate(e, RTerm::Return(Some(r)));
+-    let func = b.finish();
++    b.terminate(e, RTerm::Return(Some(out)));
++    b.finish()
++}
++
++/// One integer width the overflow tests sweep, with the types its pairs need.
++#[derive(Clone, Copy)]
++struct Width {
++    element: TypeId,
++    /// `(T, bool)`.
++    pair: TypeId,
++    /// `((T, bool),)`, a product holding a pair in a field.
++    nest: TypeId,
++    /// `&(T, bool)` and `*mut (T, bool)`.
++    reference: TypeId,
++    raw: TypeId,
++    signed: bool,
++    bits: u32,
++}
++
++impl Width {
++    fn label(self) -> String {
++        format!("{}{}", if self.signed { 'i' } else { 'u' }, self.bits)
++    }
++}
++
++/// The test world plus every integer width the overflow tests sweep: `u32`, `i8`, `u8`, `u16`,
++/// `i32`, `i64`, `u64`, in that order.
++fn overflow_world() -> (Interns, Vec<Width>) {
++    const I8: TypeId = TypeId(60);
++    const U16: TypeId = TypeId(61);
++    const U64: TypeId = TypeId(62);
++    let mut interns = world();
++    interns.intern_type(int(I8, true, 8));
++    interns.intern_type(int(U16, false, 16));
++    interns.intern_type(int(U64, false, 64));
++    let mut widths = Vec::new();
++    for (index, (element, signed, bits)) in [
++        (U32, false, 32),
++        (I8, true, 8),
++        (U8, false, 8),
++        (U16, false, 16),
++        (I32, true, 32),
++        (I64, true, 64),
++        (U64, false, 64),
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let id = |slot: u128| TypeId(100 + 10 * index as u128 + slot);
++        let pair = if element == U32 { OVERFLOW } else { id(0) };
++        if element != U32 {
++            let mut descriptor = descriptor(pair, TypeKind::Tuple(vec![element, BOOL]), 16);
++            descriptor.js.is_indirect = true;
++            descriptor.js.needs_clone = true;
++            descriptor.js.fields = vec![
++                field(FieldKey::Index(0), element),
++                field(FieldKey::Index(1), BOOL),
++            ];
++            interns.intern_type(descriptor);
++        }
++        let mut nest = descriptor(id(1), TypeKind::Tuple(vec![pair]), 16);
++        nest.js.is_indirect = true;
++        nest.js.needs_clone = true;
++        nest.js.fields = vec![field(FieldKey::Index(0), pair)];
++        interns.intern_type(nest);
++        interns.intern_type(pointer(id(2), pair, PointerForm::Thin, false));
++        interns.intern_type(pointer(id(3), pair, PointerForm::Thin, true));
++        widths.push(Width {
++            element,
++            pair,
++            nest: id(1),
++            reference: id(2),
++            raw: id(3),
++            signed,
++            bits,
++        });
++    }
++    (interns, widths)
++}
++
++/// A Node program that runs lowered `(a, b) -> (T, bool)` functions over every pair of a width's
++/// boundary values and compares each answer with Rust's own `overflowing_*`.
++struct OverflowHarness {
++    source: String,
++}
++
++impl OverflowHarness {
++    fn new() -> Self {
++        Self {
++            source: String::from(
++                "'use strict';\nconst assert = require('node:assert/strict');\nconst cases = [];\n\
++                 function keep(p) {\n  assert.ok(Array.isArray(p) && p.length === 2, \
++                 `keep got ${p}`);\n  return p;\n}\n",
++            ),
++        }
++    }
++
++    /// Adds the function `js` (declaring `name`) and its cases for `op` at `width`.
++    fn add(&mut self, name: &str, js: &str, op: BinaryOp, width: Width) {
++        let Width { signed, bits, .. } = width;
++        let (min, max): (i128, i128) = if signed {
++            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
++        } else {
++            (0, (1i128 << bits) - 1)
++        };
++        let half = 1i128 << (bits / 2);
++        let edges = [min, min + 1, max - 1, max, -half, half - 1, half];
++        let mut values: Vec<i128> = edges.into_iter().chain(-2..=2).collect();
++        values.retain(|value| (min..=max).contains(value));
++        let wrap = |value: i128| {
++            let modulus = 1i128 << bits;
++            let low = value.rem_euclid(modulus);
++            if signed && low > max {
++                low - modulus
++            } else {
++                low
++            }
++        };
++        let literal = |value: i128| {
++            if bits > 32 {
++                format!("{value}n")
++            } else {
++                value.to_string()
++            }
++        };
++        self.source.push_str(js);
++        for &a in &values {
++            for &b in &values {
++                // A 64 bit product can leave `i128` too; it has overflowed either way, and
++                // wrapping modulo 2^128 keeps the low bits.
++                let (wrapped, overflowed) = match op {
++                    BinaryOp::AddWithOverflow => (wrap(a + b), wrap(a + b) != a + b),
++                    BinaryOp::SubWithOverflow => (wrap(a - b), wrap(a - b) != a - b),
++                    _ => match a.checked_mul(b) {
++                        Some(exact) => (wrap(exact), wrap(exact) != exact),
++                        None => (wrap(a.wrapping_mul(b)), true),
++                    },
++                };
++                self.source.push_str(&format!(
++                    "cases.push(['{name}', {name}, {}, {}, {}, {overflowed}]);\n",
++                    literal(a),
++                    literal(b),
++                    literal(wrapped),
++                ));
++            }
++        }
++    }
++
++    /// Lowers `func` as `name` with `names` for its values and adds it.
++    fn lower(
++        &mut self,
++        interns: &Interns,
++        name: &str,
++        func: &Func,
++        names: &[(u32, &str)],
++        op: BinaryOp,
++        width: Width,
++    ) -> String {
++        let mut plan = plan_of(func, names);
++        for (index, _) in func.cells.iter().enumerate() {
++            plan.cell_names.insert(
++                rcgjs_object::jir::repr::CellId(index as u32),
++                format!("c{index}"),
++            );
++        }
++        let body = body_of(BodyKind::Function, func.sig.clone());
++        let js = lower(interns, name, &["keep"], &body, func, &plan, straight(func));
++        self.add(name, &js, op, width);
++        js
++    }
++
++    fn run(mut self) {
++        self.source.push_str(
++            "for (const [name, f, a, b, wrapped, overflowed] of cases) {\n  const [r, o] = f(a, b);\n  \
++             assert.ok(r === wrapped && o === overflowed, `${name}(${a}, ${b}) = [${r}, ${o}], \
++             want [${wrapped}, ${overflowed}]`);\n}\nconsole.log(cases.length);\n",
++        );
++        // The program is too long for an argument; it goes in on stdin.
++        let mut node = std::process::Command::new("node")
++            .arg("-")
++            .stdin(std::process::Stdio::piped())
++            .stdout(std::process::Stdio::piped())
++            .stderr(std::process::Stdio::piped())
++            .spawn()
++            .expect("Node is required by the compiler semantic tests");
++        std::io::Write::write_all(
++            &mut node.stdin.take().expect("piped stdin"),
++            self.source.as_bytes(),
++        )
++        .expect("write the program to Node");
++        let output = node.wait_with_output().expect("Node runs to completion");
++        assert!(
++            output.status.success(),
++            "{}",
++            String::from_utf8_lossy(&output.stderr)
++        );
++    }
++}
++
++const OVERFLOW_OPS: [(BinaryOp, &str); 3] = [
++    (BinaryOp::AddWithOverflow, "add"),
++    (BinaryOp::SubWithOverflow, "sub"),
++    (BinaryOp::MulWithOverflow, "mul"),
++];
++
++#[test]
++fn an_escaping_overflow_pair_is_an_array_without_a_closure() {
++    let interns = world();
++    let func = escaping_overflow(BinaryOp::AddWithOverflow, U32, OVERFLOW);
++    let plan = plan_of(&func, &[(0, "a"), (1, "b")]);
++    let body = body_of(BodyKind::Function, func.sig.clone());
++    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
++    assert_eq!(
++        js,
++        "function f(a, b) {\n  let $t0, $t1;\n  return [$t1 = ($t0 = a + b) >>> 0, $t1 !== $t0];\n}\n"
++    );
++}
++
++#[test]
++fn an_escaping_32_bit_product_wraps_through_imul() {
++    let interns = world();
++    let func = escaping_overflow(BinaryOp::MulWithOverflow, U32, OVERFLOW);
+     let plan = plan_of(&func, &[(0, "a"), (1, "b")]);
+     let body = body_of(BodyKind::Function, func.sig.clone());
+     let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+     assert_eq!(
+         js,
+-        "function f(a, b) {\n  return (($w) => [$w >>> 0, $w >>> 0 !== $w])(a + b);\n}\n"
++        "function f(a, b) {\n  let $t0;\n  return [$t0 = Math.imul(a, b) >>> 0, $t0 !== a * b];\n}\n"
++    );
++}
++
++#[test]
++fn a_projected_overflow_pair_is_its_exact_result() {
++    let (interns, widths) = overflow_world();
++    let func = projected_overflow(BinaryOp::AddWithOverflow, I32, widths[4].pair);
++    let plan = plan_of(&func, &[(0, "a"), (1, "b"), (2, "p"), (3, "r"), (4, "o")]);
++    let body = body_of(BodyKind::Function, func.sig.clone());
++    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
++    assert_eq!(
++        js,
++        "function f(a, b) {\n  let p, r, o;\n  p = a + b;\n  r = p | 0;\n  o = (p | 0) !== p;\n  return [r, o];\n}\n"
++    );
++}
++
++#[test]
++fn an_inline_projected_overflow_pair_binds_one_temporary() {
++    let (interns, widths) = overflow_world();
++    let func = one_half_overflow(BinaryOp::SubWithOverflow, widths[5], 1);
++    let plan = plan_of(&func, &[(0, "a"), (1, "b")]);
++    let body = body_of(BodyKind::Function, func.sig.clone());
++    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
++    assert_eq!(
++        js,
++        "function f(a, b) {\n  let $t0;\n  return BigInt.asIntN(64, $t0 = a - b) !== $t0;\n}\n"
++    );
++}
++
++#[test]
++fn a_32_bit_product_pair_is_built_when_both_halves_are_read() {
++    let interns = world();
++    let func = projected_overflow(BinaryOp::MulWithOverflow, U32, OVERFLOW);
++    let plan = plan_of(&func, &[(0, "a"), (1, "b"), (2, "p"), (3, "r"), (4, "o")]);
++    let body = body_of(BodyKind::Function, func.sig.clone());
++    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
++    assert!(
++        js.contains("p = [$t0 = Math.imul(a, b) >>> 0, $t0 !== a * b];")
++            && js.contains("r = p[0];")
++            && js.contains("o = p[1];"),
++        "{js}"
++    );
++}
++
++/// `a.op(b).<field>` alone, returned as a `bool` (`.1`) or `T` (`.0`).
++fn one_half_overflow(op: BinaryOp, width: Width, half: u32) -> Func {
++    let ty = width.element;
++    let result = if half == 0 { ty } else { BOOL };
++    let mut b = FuncBuilder::new(item(1), signature(vec![ty, ty], result));
++    let x = b.param(ty, NO_ORIGIN);
++    let y = b.param(ty, NO_ORIGIN);
++    let e = FuncBuilder::ENTRY;
++    let p = b.op(
++        e,
++        OpKind::Binary { op, l: x, r: y, ty },
++        width.pair,
++        NO_ORIGIN,
++    );
++    let read = b.op(
++        e,
++        OpKind::Field {
++            base: p,
++            variant: None,
++            field: half,
++        },
++        result,
++        NO_ORIGIN,
++    );
++    b.terminate(e, RTerm::Return(Some(read)));
++    b.finish()
++}
++
++#[test]
++fn a_32_bit_product_read_through_one_half_is_that_half_alone() {
++    let (interns, widths) = overflow_world();
++    let spell = |half, named: &[(u32, &str)]| {
++        let func = one_half_overflow(BinaryOp::MulWithOverflow, widths[4], half);
++        let plan = plan_of(&func, named);
++        let body = body_of(BodyKind::Function, func.sig.clone());
++        lower(&interns, "f", &[], &body, &func, &plan, straight(&func))
++    };
++    assert_eq!(
++        spell(0, &[(0, "a"), (1, "b")]),
++        "function f(a, b) {\n  return Math.imul(a, b) | 0;\n}\n"
++    );
++    assert_eq!(
++        spell(1, &[(0, "a"), (1, "b")]),
++        "function f(a, b) {\n  return (Math.imul(a, b) | 0) !== a * b;\n}\n"
++    );
++    assert_eq!(
++        spell(1, &[(0, "a"), (1, "b"), (2, "p")]),
++        "function f(a, b) {\n  let p;\n  p = (Math.imul(a, b) | 0) !== a * b;\n  return p;\n}\n"
++    );
++}
++
++/// `let p = a.op(b); let q = p (Move or Copy); (q.0, p.1)`: a pair renamed or copied and then
++/// only projected. Values: `a b p o q r out`.
++fn aliased_overflow(op: BinaryOp, width: Width, copy: bool) -> Func {
++    let Width {
++        element: ty, pair, ..
++    } = width;
++    let mut b = FuncBuilder::new(item(1), signature(vec![ty, ty], pair));
++    let x = b.param(ty, NO_ORIGIN);
++    let y = b.param(ty, NO_ORIGIN);
++    let e = FuncBuilder::ENTRY;
++    let p = b.op(e, OpKind::Binary { op, l: x, r: y, ty }, pair, NO_ORIGIN);
++    let projection = |b: &mut FuncBuilder, base, field, ty| {
++        b.op(
++            e,
++            OpKind::Field {
++                base,
++                variant: None,
++                field,
++            },
++            ty,
++            NO_ORIGIN,
++        )
++    };
++    let overflowed = projection(&mut b, p, 1, BOOL);
++    let alias = if copy {
++        OpKind::Copy(p)
++    } else {
++        OpKind::Move(p)
++    };
++    let q = b.op(e, alias, pair, NO_ORIGIN);
++    let wrapped = projection(&mut b, q, 0, ty);
++    let out = b.op(
++        e,
++        OpKind::Aggregate {
++            ty: pair,
++            variant: 0,
++            active_field: None,
++            fields: vec![wrapped, overflowed],
++        },
++        pair,
++        NO_ORIGIN,
+     );
++    b.terminate(e, RTerm::Return(Some(out)));
++    b.finish()
++}
++
++#[test]
++fn a_moved_or_copied_projected_pair_is_still_its_exact_result() {
++    let (interns, widths) = overflow_world();
++    for copy in [false, true] {
++        let func = aliased_overflow(BinaryOp::AddWithOverflow, widths[4], copy);
++        let plan = plan_of(
++            &func,
++            &[(0, "a"), (1, "b"), (2, "p"), (3, "o"), (4, "q"), (5, "r")],
++        );
++        let body = body_of(BodyKind::Function, func.sig.clone());
++        let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
++        assert_eq!(
++            js,
++            "function f(a, b) {\n  let p, o, q, r;\n  p = a + b;\n  o = (p | 0) !== p;\n  q = p;\n  \
++             r = q | 0;\n  return [r, o];\n}\n",
++            "copy: {copy}"
++        );
++    }
++}
++
++/// Every carried and built pair shape of every overflow operator at every width, under Node at
++/// the boundary values against Rust's own `overflowing_*`: projected (both halves, carried as the
++/// exact result or, for a 32 bit product, built), one half only, moved or copied, and escaping
++/// whole.
++#[test]
++fn overflow_pairs_agree_with_rust_at_every_width() {
++    let (interns, widths) = overflow_world();
++    let mut harness = OverflowHarness::new();
++    let projected: &[(u32, &str)] = &[(0, "a"), (1, "b"), (2, "p"), (3, "r"), (4, "o")];
++    let aliased: &[(u32, &str)] = &[(0, "a"), (1, "b"), (2, "p"), (3, "o"), (4, "q"), (5, "r")];
++    for width in widths {
++        for (op, spelled) in OVERFLOW_OPS {
++            let label = format!("{spelled}_{}", width.label());
++            for (shape, func, names) in [
++                (
++                    "projected",
++                    projected_overflow(op, width.element, width.pair),
++                    projected,
++                ),
++                (
++                    "escaping",
++                    escaping_overflow(op, width.element, width.pair),
++                    projected,
++                ),
++                ("moved", aliased_overflow(op, width, false), aliased),
++                ("copied", aliased_overflow(op, width, true), aliased),
++            ] {
++                harness.lower(
++                    &interns,
++                    &format!("{label}_{shape}"),
++                    &func,
++                    names,
++                    op,
++                    width,
++                );
++            }
++            // One half alone, wrapped back into a pair beside the half the reference computes.
++            for half in [0, 1] {
++                let func = one_half_overflow(op, width, half);
++                let name = format!("{label}_half{half}");
++                let plan = plan_of(&func, &[(0, "a"), (1, "b")]);
++                let body = body_of(BodyKind::Function, func.sig.clone());
++                let js = lower(&interns, &name, &[], &body, &func, &plan, straight(&func));
++                let reference = format!("{label}_projected");
++                let wrapper = if half == 0 {
++                    format!("function {name}$w(a, b) {{ return [{name}(a, b), {reference}(a, b)[1]]; }}\n")
++                } else {
++                    format!("function {name}$w(a, b) {{ return [{reference}(a, b)[0], {name}(a, b)]; }}\n")
++                };
++                harness.add(&format!("{name}$w"), &format!("{js}{wrapper}"), op, width);
++            }
++        }
++    }
++    harness.run();
++}
++
++/// A chain of aliases whose blocks are not in dominance order: the block that comes last in
++/// control flow is stored first and holds `r = move q; s = copy r` and both projections, while
++/// the block stored after it holds the overflow op and `q = move p`. One pass over the blocks sees
++/// `r` and `s` before `q` joins the family, so the family must be found by a fixpoint; a carrier
++/// committed for only part of the chain would be projected as if it were a pair.
++#[test]
++fn an_alias_chain_is_one_family_whatever_the_block_order() {
++    let (interns, widths) = overflow_world();
++    let mut harness = OverflowHarness::new();
++    for width in widths {
++        for (op, spelled) in OVERFLOW_OPS {
++            let Width {
++                element: ty, pair, ..
++            } = width;
++            let mut b = FuncBuilder::new(item(1), signature(vec![ty, ty], pair));
++            let x = b.param(ty, NO_ORIGIN);
++            let y = b.param(ty, NO_ORIGIN);
++            let e = FuncBuilder::ENTRY;
++            let last = b.block();
++            let middle = b.block();
++            b.terminate(e, RTerm::Goto(middle, vec![]));
++            let p = b.op(
++                middle,
++                OpKind::Binary { op, l: x, r: y, ty },
++                pair,
++                NO_ORIGIN,
++            );
++            let q = b.op(middle, OpKind::Move(p), pair, NO_ORIGIN);
++            b.terminate(middle, RTerm::Goto(last, vec![]));
++            let r = b.op(last, OpKind::Move(q), pair, NO_ORIGIN);
++            let s = b.op(last, OpKind::Copy(r), pair, NO_ORIGIN);
++            let wrapped = b.op(
++                last,
++                OpKind::Field {
++                    base: s,
++                    variant: None,
++                    field: 0,
++                },
++                ty,
++                NO_ORIGIN,
++            );
++            let overflowed = b.op(
++                last,
++                OpKind::Field {
++                    base: r,
++                    variant: None,
++                    field: 1,
++                },
++                BOOL,
++                NO_ORIGIN,
++            );
++            let out = b.op(
++                last,
++                OpKind::Aggregate {
++                    ty: pair,
++                    variant: 0,
++                    active_field: None,
++                    fields: vec![wrapped, overflowed],
++                },
++                pair,
++                NO_ORIGIN,
++            );
++            b.terminate(last, RTerm::Return(Some(out)));
++            let func = b.finish();
++            let plan = plan_of(
++                &func,
++                &[
++                    (0, "a"),
++                    (1, "b"),
++                    (2, "p"),
++                    (3, "q"),
++                    (4, "r"),
++                    (5, "s"),
++                    (6, "w"),
++                    (7, "o"),
++                ],
++            );
++            let region = Region::Seq(vec![
++                Region::Block(payload(&func, 0, None)),
++                Region::Block(payload(&func, middle.0, None)),
++                Region::Block(payload(&func, last.0, None)),
++                Region::Return,
++            ]);
++            let name = format!("{spelled}_{}_out_of_order", width.label());
++            let body = body_of(BodyKind::Function, func.sig.clone());
++            let js = lower(&interns, &name, &[], &body, &func, &plan, region);
++            harness.add(&name, &js, op, width);
++        }
++    }
++    harness.run();
++}
++
++/// How a pair escapes in [`escaping_use`]: each is a use `carried_overflow_pairs` must refuse.
++#[derive(Clone, Copy, Debug)]
++enum Escape {
++    /// `q = keep(p)`, a call argument.
++    Call,
++    /// `w = (p,)` and `q = w.0`, an aggregate field.
++    Aggregate,
++    /// `c = p; q = c`, a store to a cell.
++    CellStore,
++    /// `w = (seed,); w.0 = p; q = w.0`, a field store.
++    SetField,
++    /// `c = seed; *&mut c = p; q = c`, a store through a pointer.
++    StoreThrough,
++    /// `q = *&p`, a reference view.
++    Borrow,
++    /// `q = *(&raw const p)`, a raw view.
++    Raw,
++    /// `q = copy p; keep(q)`, a copy whose own use escapes.
++    CopyThenCall,
++}
++
++impl Escape {
++    const ALL: [Escape; 8] = [
++        Escape::Call,
++        Escape::Aggregate,
++        Escape::CellStore,
++        Escape::SetField,
++        Escape::StoreThrough,
++        Escape::Borrow,
++        Escape::Raw,
++        Escape::CopyThenCall,
++    ];
++}
++
++/// `let p = a.op(b); let o = p.1; let q = <p through escape>; (q.0, o)`, with the plan's names.
++/// The projection `o` makes `p` a pair that would be carried if the escape were not seen.
++fn escaping_use(
++    op: BinaryOp,
++    width: Width,
++    escape: Escape,
++    keep: StrId,
++) -> (Func, Vec<(u32, String)>) {
++    let Width {
++        element: ty,
++        pair,
++        nest,
++        reference,
++        raw,
++        ..
++    } = width;
++    let mut b = FuncBuilder::new(item(1), signature(vec![ty, ty], pair));
++    let x = b.param(ty, NO_ORIGIN);
++    let y = b.param(ty, NO_ORIGIN);
++    let e = FuncBuilder::ENTRY;
++    let p = b.op(e, OpKind::Binary { op, l: x, r: y, ty }, pair, NO_ORIGIN);
++    let field = |b: &mut FuncBuilder, base, field, ty| {
++        b.op(
++            e,
++            OpKind::Field {
++                base,
++                variant: None,
++                field,
++            },
++            ty,
++            NO_ORIGIN,
++        )
++    };
++    let call = |b: &mut FuncBuilder, arg| {
++        b.op(
++            e,
++            OpKind::Call {
++                callee: Callee::Direct {
++                    item: item(9),
++                    link_name: keep,
++                },
++                function: None,
++                args: vec![arg],
++                track_caller: None,
++                semantic: CallSemantic::Ordinary,
++                host: None,
++            },
++            pair,
++            NO_ORIGIN,
++        )
++    };
++    let overflowed = field(&mut b, p, 1, BOOL);
++    // A pair value distinct from `p`, for the stores to overwrite.
++    let seed = |b: &mut FuncBuilder| {
++        b.op(
++            e,
++            OpKind::Aggregate {
++                ty: pair,
++                variant: 0,
++                active_field: None,
++                fields: vec![x, overflowed],
++            },
++            pair,
++            NO_ORIGIN,
++        )
++    };
++    let nested = |b: &mut FuncBuilder, inner| {
++        b.op(
++            e,
++            OpKind::Aggregate {
++                ty: nest,
++                variant: 0,
++                active_field: None,
++                fields: vec![inner],
++            },
++            nest,
++            NO_ORIGIN,
++        )
++    };
++    let q = match escape {
++        Escape::Call => call(&mut b, p),
++        Escape::Aggregate => {
++            let w = nested(&mut b, p);
++            field(&mut b, w, 0, pair)
++        }
++        Escape::CellStore => {
++            let cell = b.cell(pair, false, NO_ORIGIN);
++            b.effect(e, OpKind::CellAlloc(cell), NO_ORIGIN);
++            b.effect(e, OpKind::CellStore { cell, v: p }, NO_ORIGIN);
++            b.op(e, OpKind::CellLoad(cell), pair, NO_ORIGIN)
++        }
++        Escape::SetField => {
++            let start = seed(&mut b);
++            let w = nested(&mut b, start);
++            b.effect(
++                e,
++                OpKind::SetField {
++                    base: w,
++                    variant: None,
++                    field: 0,
++                    v: p,
++                },
++                NO_ORIGIN,
++            );
++            field(&mut b, w, 0, pair)
++        }
++        Escape::StoreThrough => {
++            let start = seed(&mut b);
++            let cell = b.cell(pair, true, NO_ORIGIN);
++            b.effect(e, OpKind::CellAlloc(cell), NO_ORIGIN);
++            b.effect(e, OpKind::CellStore { cell, v: start }, NO_ORIGIN);
++            let slot = b.op(
++                e,
++                OpKind::BorrowView {
++                    root: Root::Cell(cell),
++                    path: vec![],
++                    mutable: true,
++                },
++                reference,
++                NO_ORIGIN,
++            );
++            b.effect(e, OpKind::StoreThrough { ptr: slot, v: p }, NO_ORIGIN);
++            b.op(e, OpKind::CellLoad(cell), pair, NO_ORIGIN)
++        }
++        Escape::Borrow | Escape::Raw => {
++            let (kind, ty) = match escape {
++                Escape::Borrow => (
++                    OpKind::BorrowView {
++                        root: Root::Value(p),
++                        path: vec![],
++                        mutable: false,
++                    },
++                    reference,
++                ),
++                _ => (
++                    OpKind::RawView {
++                        root: Root::Value(p),
++                        path: vec![],
++                        mutable: false,
++                    },
++                    raw,
++                ),
++            };
++            let view = b.op(e, kind, ty, NO_ORIGIN);
++            b.op(e, OpKind::Deref(view), pair, NO_ORIGIN)
++        }
++        Escape::CopyThenCall => {
++            let copy = b.op(e, OpKind::Copy(p), pair, NO_ORIGIN);
++            call(&mut b, copy)
++        }
++    };
++    let wrapped = field(&mut b, q, 0, ty);
++    let out = b.op(
++        e,
++        OpKind::Aggregate {
++            ty: pair,
++            variant: 0,
++            active_field: None,
++            fields: vec![wrapped, overflowed],
++        },
++        pair,
++        NO_ORIGIN,
++    );
++    b.terminate(e, RTerm::Return(Some(out)));
++    let func = b.finish();
++    // Every value but a view is named, so a value used twice is never spelled twice.
++    let special = [(p, "p"), (overflowed, "o"), (q, "q"), (wrapped, "r")];
++    let names = func.blocks[0]
++        .ops
++        .iter()
++        .filter(|op| !matches!(op.kind, OpKind::BorrowView { .. } | OpKind::RawView { .. }))
++        .filter_map(|op| op.result)
++        .map(|v| {
++            let name = special
++                .iter()
++                .find(|(value, _)| *value == v)
++                .map_or_else(|| format!("v{}", v.0), |(_, name)| (*name).to_owned());
++            (v.0, name)
++        })
++        .chain([(x.0, "a".to_owned()), (y.0, "b".to_owned())])
++        .collect();
++    (func, names)
++}
++
++/// A pair that escapes through a call argument, an aggregate field, a store (to a cell, a field,
++/// through a pointer), a view (reference or raw) or a copy that escapes in turn is built as a
++/// real array — even though it is also projected — and still agrees with Rust under Node.
++#[test]
++fn an_overflow_pair_that_escapes_through_any_use_is_built() {
++    let (mut interns, widths) = overflow_world();
++    let keep = interns.intern_str("keep");
++    let mut harness = OverflowHarness::new();
++    for width in widths {
++        for (op, spelled) in OVERFLOW_OPS {
++            for escape in Escape::ALL {
++                let (func, names) = escaping_use(op, width, escape, keep);
++                let names: Vec<(u32, &str)> =
++                    names.iter().map(|(v, name)| (*v, name.as_str())).collect();
++                let name = format!("{spelled}_{}_{escape:?}", width.label());
++                let js = harness.lower(&interns, &name, &func, &names, op, width);
++                assert!(
++                    js.contains("p = [$t"),
++                    "{name}: the escaping pair must be built\n{js}"
++                );
++            }
++        }
++    }
++    harness.run();
+ }
+ 
+ #[test]
+@@ -3302,6 +4098,39 @@ fn an_intrinsic_with_a_prelude_emits_its_statements_before_the_binding() {
+     );
+ }
+ 
++#[test]
++fn the_mul_with_overflow_intrinsic_wraps_a_32_bit_product_through_imul() {
++    let mut interns = world();
++    let name = interns.intern_str("mul_with_overflow");
++    let e = FuncBuilder::ENTRY;
++    let mut b = FuncBuilder::new(item(1), signature(vec![U32, U32], OVERFLOW));
++    let x = b.param(U32, NO_ORIGIN);
++    let y = b.param(U32, NO_ORIGIN);
++    let pair = b.op(
++        e,
++        OpKind::Intrinsic {
++            name,
++            types: vec![U32],
++            fallback: None,
++            args: vec![x, y],
++        },
++        OVERFLOW,
++        NO_ORIGIN,
++    );
++    b.terminate(e, RTerm::Return(Some(pair)));
++    let func = b.finish();
++    let plan = plan_of(&func, &[(0, "x"), (1, "y"), (pair.0, "p")]);
++    let body = body_of(BodyKind::Function, func.sig.clone());
++    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
++    assert_eq!(
++        js,
++        concat!(
++            "function f(x, y) {\n  let p, $t0, $t1;\n  $t0 = x * y;\n",
++            "  $t1 = Math.imul(x, y) >>> 0;\n  p = [$t1, $t1 !== $t0];\n  return p;\n}\n"
++        )
++    );
++}
++
+ #[test]
+ fn an_unknown_intrinsic_falls_back_to_the_body_the_collector_emitted() {
+     let mut interns = world();
+diff --git a/rcgjs-object/README.md b/rcgjs-object/README.md
+index 9c070176a584f62d9a22fa1ae4cc86ce9b6b1f76..f1941f2be6e1929b6e50ad2cb52b5e0c52618895 100644
+--- a/rcgjs-object/README.md
++++ b/rcgjs-object/README.md
+@@ -144,11 +144,19 @@ mean in JavaScript.
+ - `Cmp` (`rvalue.rs:305-343`): `l < r ? Less : (l === r ? Equal : Greater)` with the three
+   `Ordering` values spelled by `enum_value`, which for the real `core::cmp::Ordering`
+   (`#[repr(i8)]`, fieldless) is `-1`, `0`, `1` (*code only*).
+-- `AddWithOverflow`/`SubWithOverflow`/`MulWithOverflow` (`rvalue.rs:355-380`): a two-element
+-  array from an immediately applied arrow, `(($w) => [mask($w), mask($w) !== $w])(l op r)`,
+-  with the plain JS operator inside (never `Math.imul`, so an overflowed product is caught).
+-  Golden `examples/dom-tests/13_topcoat_for.js.expected:251`:
+-  `(($w) => [$w >>> 0, $w >>> 0 !== $w])((_52 >>> 0) * (cap >>> 0))`.
++- `AddWithOverflow`/`SubWithOverflow`/`MulWithOverflow` (`rvalue.rs::codegen_with_overflow`): a
++  two-element array whose first element binds the exact result to a hoisted temporary and whose
++  second reads it back, `[$t1 = mask($t0 = l op r), $t1 !== $t0]` — array elements evaluate left
++  to right, so no closure is needed. A 32-bit product is not exact in a double, so its wrapped
++  half is `Math.imul(l, r)` and only the flag compares against the rounded `l * r`:
++  `[$t0 = Math.imul(a, b) >>> 0, $t0 !== a * b]` (an operand that is not a name or a literal is
++  bound to a temporary by its first read). On the JIR lane a pair every use of which — through
++  any `Move`/`Copy` of it — is a `Field` projection is never built (`jsc-link`
++  `rvalue.rs::carried_overflow_pairs`): it is carried as the exact `l op r`, `.0` reads `mask(x)`
++  and `.1` `mask(x) !== x`. A 32-bit product read through one half only is that half alone,
++  `mask(Math.imul(l, r))` or `mask(Math.imul(l, r)) !== l * r`; read through both, it keeps the
++  array. (The DOM goldens under `examples/dom-tests` predate this and still show the old arrow
++  form, `(($w) => [mask($w), mask($w) !== $w])(l op r)`.)
+ - `Assert` (`backend/src/base.rs:707-723`, `857-901`): `if (!cond) { <panic> }` where the panic
+   is the lang item call (`panic_bounds_check(index, len, <loc>)`,
+   `panic_misaligned_pointer_dereference(required, found, <loc>)`,
+@@ -356,7 +364,7 @@ mean in JavaScript.
+   reference to the place (`base.rs:826-846`).
+ - Locals are declared once at the top of the function in one `let` list (`base.rs:414-459`).
+   Reserved names: `$tN` hoisted temporaries, `$sN` structurizer scrutinee temporaries, `$aN`
+-  thunk parameters, `$w` overflow binder, `$e` clone parameter, `$c` captured environment,
++  thunk parameters, `$w` waker parameter, `$e` clone parameter, `$c` captured environment,
+   `$loc`, `<name>$eN` spread parameters.
+ 
+ ### Panics, aborts, unwinding
+diff --git a/runtime/shim.js b/runtime/shim.js
+index 72ab6b298fef80e0502870f435a079245e3a38d6..5c3e111ad9f5f446770f4f1bdddaa101a5ec3318 100644
+--- a/runtime/shim.js
++++ b/runtime/shim.js
+@@ -251,8 +251,8 @@ globalThis.__rt.byte_slice_ref = (p) => {
+ };
+ 
+ // `p as usize`: the synthetic address of a pointer, where `size` is the size of
+-// the pointee in bytes. Every buffer is given a base of `4096 * n` the first
+-// time it is asked about, kept in a WeakMap so that it never moves, and an
++// the pointee in bytes. Every buffer is given a base the first time it is asked
++// about (`_addr_mint`, below), kept in a WeakMap so that it never moves, and an
+ // element at offset `off` sits at `base + off * size`. A scaled slot's offset
+ // is already in bytes and is added as it is; a number is an address already and
+ // comes back unchanged.
+@@ -260,10 +260,11 @@ globalThis.__rt.byte_slice_ref = (p) => {
+ // The four properties this scheme exists for: a base is never zero, so
+ // `is_null()` is false for every real pointer and true only for `null()`; a
+ // base is at least 4096, so `NonNull::dangling()` (an alignment, always
+-// smaller) never collides with one; an address is a multiple of the element
+-// size, so alignment predicates answer correctly; and the low bits are
+-// therefore determined by the element size, which is what `fmt::Arguments`
+-// tests when it looks at `bits & 1`.
++// smaller) never collides with one; a base is aligned to the buffer's byte size
++// rounded up to a power of two (at least 16, at most 4096), so an address is a
++// multiple of the element alignment and alignment predicates answer correctly;
++// and the low bits are therefore determined by the element size, which is what
++// `fmt::Arguments` tests when it looks at `bits & 1`.
+ //
+ // `undefined` as a pointer is the reference form of a zero-sized value: every
+ // pointer to a zero-sized local, to an element of a zero-sized array, and into a
+@@ -272,7 +273,7 @@ globalThis.__rt.byte_slice_ref = (p) => {
+ // `_zst_addr`: 2^29, the largest alignment a type can ask for. No base is ever
+ // given that address, so it is never mistaken for an element of a real buffer.
+ globalThis.__rt._addrs = new WeakMap();
+-globalThis.__rt._addrNext = 0;
++globalThis.__rt._addrNext = 4096;
+ globalThis.__rt._zst_addr = 536870912;
+ globalThis.__rt.addr = (p, size) => {
+   if (typeof p === "number") return p;
+@@ -296,9 +297,8 @@ globalThis.__rt.addr = (p, size) => {
+   }
+   let base = globalThis.__rt._addrs.get(key);
+   if (base === undefined) {
+-    base = 4096 * ++globalThis.__rt._addrNext;
+-    if (base === globalThis.__rt._zst_addr) base = 4096 * ++globalThis.__rt._addrNext;
+-    globalThis.__rt._addrs.set(key, base);
++    base = globalThis.__rt._addr_mint(key, scalar !== undefined ? 1
++      : p.sc !== undefined ? p.sc : p.es === undefined ? size : p.es);
+   }
+   // A slot keyed by a property name (a field of an aggregate) has no address of
+   // its own, and reports the address of the object it is a field of.
+@@ -311,6 +311,88 @@ globalThis.__rt.addr = (p, size) => {
+   return base + off * (p.es === undefined ? size : p.es);
+ };
+ 
++// The synthetic address space. A usize is 32 bits, so every base has to fit in
++// 2^32 -- and a base that was never given back would exhaust it: one per
++// `NonNull::new` on a fresh allocation is a million allocations, which a
++// long-running page reaches. So bases are carved like a buddy allocator.
++//
++// A buffer of `n` bytes takes a granule of `2^k` bytes, the smallest power of
++// two that holds it, at least 16 and at most 4096, and its base is a multiple of
++// the granule: every type's alignment divides its size, so a buffer is aligned
++// for anything it can hold (a buffer larger than 4096 bytes is aligned to 4096,
++// as before). Granules come from a per-size free list first and from a bump
++// pointer otherwise; the alignment gap the bump leaves is split into smaller
++// free granules rather than lost. A base is handed back:
++//
++//   * by `dealloc`, for a heap block (`_addr_release`). The freed buffer keeps
++//     its entry, so a dangling pointer still answers the address it had, and a
++//     later allocation may reuse it -- exactly as a native allocator does;
++//   * by a FinalizationRegistry, for any other buffer (a stack array, a box, a
++//     string's byte view) once the engine has collected it, which is the moment
++//     nothing can ask for that address again.
++//
++// A base is therefore unique among the buffers that are alive, and stable for a
++// buffer's whole lifetime. Only when the bump pointer reaches 2^32 with no free
++// granule of the size asked is there no base to give, and that is a refusal that
++// says so rather than an address that wraps to null.
++globalThis.__rt._addrFree = Array.from({ length: 13 }, () => []);
++globalThis.__rt._addrHeap = new WeakMap();
++globalThis.__rt._addrGone = typeof FinalizationRegistry === "function"
++  ? new FinalizationRegistry((held) => {
++    // `held` is the base plus its granule's exponent, which is below 16.
++    globalThis.__rt._addrFree[held & 15].push(held - (held & 15));
++  })
++  : undefined;
++
++// _addr_mint(key, es): a base for `key`, whose elements are `es` bytes each:
++// a free granule of its size, or a fresh one from the bump pointer. The top is
++// reached only when about 2^32 bytes of granules have been live at once (a
++// million live 4 KiB buffers), which no engine's heap holds, so free granules
++// of other sizes are not split -- the top is a refusal.
++globalThis.__rt._addr_mint = (key, es) => {
++  const free = globalThis.__rt._addrFree;
++  const block = globalThis.__rt._blocks.get(key);
++  const bytes = block !== undefined ? block.bytes
++    : (typeof key.length === "number" ? key.length : 1) * (es > 0 ? es : 1);
++  let k = 4;
++  while (k < 12 && 2 ** k < bytes) k++;
++  let base = free[k].pop();
++  if (base === undefined) {
++    const size = 2 ** k;
++    base = globalThis.__rt._addrNext;
++    while (base % size !== 0) {
++      let j = 4;
++      while (j + 1 < k && base % 2 ** (j + 1) === 0) j++;
++      free[j].push(base);
++      base += 2 ** j;
++    }
++    // Never hand out the shared zero-sized address (see `addr`).
++    if (base === globalThis.__rt._zst_addr) base += 4096;
++    if (base + size > 4294967296) {
++      throw __rt.abort_error(new Error("rustc_codegen_js: the 32-bit synthetic address space is exhausted"));
++    }
++    globalThis.__rt._addrNext = base + size;
++  }
++  globalThis.__rt._addrs.set(key, base);
++  if (block !== undefined) globalThis.__rt._addrHeap.set(key, k);
++  else if (globalThis.__rt._addrGone !== undefined) globalThis.__rt._addrGone.register(key, base + k);
++  return base;
++};
++
++// _addr_release(buf, bytes): gives a heap block's granule back. `dealloc` calls
++// it without `bytes`; `realloc` calls it with the new size, and it acts only if
++// the block grew past its granule (below 4096): the block then takes a base at
++// its new size the next time it is asked, because otherwise its addresses would
++// run into its neighbours'. Rust lets a reallocation move, so the old address
++// ending with it is no change of meaning.
++globalThis.__rt._addr_release = (buf, bytes) => {
++  const k = globalThis.__rt._addrHeap.get(buf);
++  if (k === undefined || (bytes !== undefined && (k === 12 || bytes <= 2 ** k))) return;
++  globalThis.__rt._addrHeap.delete(buf);
++  globalThis.__rt._addrFree[k].push(globalThis.__rt._addrs.get(buf));
++  if (bytes !== undefined) globalThis.__rt._addrs.delete(buf);
++};
++
+ // offset_from(a, b): how many elements `a` is past `b`, for an *aggregate*
+ // pointee. The thin case is `a.off - b.off` and the backend emits it inline;
+ // this exists for the one shape that subtraction cannot answer.
+@@ -1030,13 +1112,23 @@ globalThis.__rt.unwindow = (p) => {
+ };
+ 
+ // The `str` hybrid. A `&str` is a JavaScript string, and its byte view is
+-// produced on demand by the three helpers below. The wrappers construct their
+-// native codec on first use, so importing a package never needs browser codecs.
++// produced on demand by the helpers below. The wrappers construct their native
++// codec on first use, so importing a package never needs browser codecs.
+ globalThis.__rt._encoder = {
+   value: null,
+   encode(value) {
+     return (this.value || (this.value = new TextEncoder())).encode(value);
+   },
++  // encodeInto: the bytes written into `target`, which the caller sized to hold
++  // all of them (three bytes per UTF-16 code unit is always enough). An engine
++  // whose encoder predates `encodeInto` encodes and copies.
++  into(value, target) {
++    const encoder = this.value || (this.value = new TextEncoder());
++    if (typeof encoder.encodeInto === "function") return encoder.encodeInto(value, target).written;
++    const bytes = encoder.encode(value);
++    target.set(bytes);
++    return bytes.length;
++  },
+ };
+ globalThis.__rt._decoder = {
+   value: null,
+@@ -1045,6 +1137,79 @@ globalThis.__rt._decoder = {
+   },
+ };
+ 
++// _utf8(s): the UTF-8 bytes of a JavaScript string as a fresh plain array,
++// exactly the bytes `TextEncoder` produces -- a lone surrogate is U+FFFD.
++//
++// A short ASCII string is built straight from its code units: a call into the
++// native encoder costs more than the whole loop. Anything else is encoded
++// natively and copied element by element into an array allocated at its final
++// length, which is an order of magnitude cheaper than handing the typed array to
++// `Array.prototype.slice` or `Array.from`. Strings of up to 4096 code units are
++// encoded into one reused 12 KiB scratch buffer, so they allocate only the
++// result; a longer one allocates a transient `Uint8Array`.
++globalThis.__rt._utf8_scratch = null;
++globalThis.__rt._utf8 = (s) => {
++  const n = s.length;
++  if (n <= 16) {
++    const bytes = new Array(n);
++    let i = 0;
++    for (; i < n; i++) {
++      const c = s.charCodeAt(i);
++      if (c > 0x7f) break;
++      bytes[i] = c;
++    }
++    if (i === n) return bytes;
++  }
++  let source;
++  let len;
++  if (n <= 4096) {
++    source = globalThis.__rt._utf8_scratch ||
++      (globalThis.__rt._utf8_scratch = new Uint8Array(3 * 4096));
++    len = globalThis.__rt._encoder.into(s, source);
++  } else {
++    source = globalThis.__rt._encoder.encode(s);
++    len = source.length;
++  }
++  const bytes = new Array(len);
++  for (let i = 0; i < len; i++) bytes[i] = source[i];
++  return bytes;
++};
++
++// The byte-view memo: string -> the `{ buf, off: 0, len }` record `str_bytes`
++// returned for it.
++//
++// A `&str` sliced out of a longer one is encoded again on every slice, because
++// `&s[a..b]` is `s.as_bytes()` plus a decode: a parser walking a document asks
++// for the document's bytes once per token. The memo makes that one encode per
++// operation instead of one per token, which is the difference between linear
++// and quadratic. Its lifetime is the operation and its size is bounded:
++//
++//   * it is emptied when the JavaScript stack unwinds -- the first insertion
++//     queues a microtask that clears it, so no entry outlives the synchronous
++//     run of Rust code (an export, a callback, one poll of a future) that made
++//     it. Without `queueMicrotask` only the bound below applies;
++//   * it holds at most `budget` (4 MiB) of encoded bytes; the insertion that
++//     would exceed it empties it first;
++//   * a string longer than `budget / 4` is held apart from that budget, and at
++//     most the two most recent such strings are, so one large document that
++//     every slice re-reads is not evicted by its own slices.
++//
++// Strings are immutable, so an entry can never be stale: a `String` that is
++// mutated derefs to a different JavaScript string. Two equal strings share one
++// record, which is as good as two everywhere but pointer identity -- and
++// CONTRACT.md documents identity across independent calls as not guaranteed.
++// The record and its buffer are never handed to an owner that mutates them:
++// the converters that build an owned `String` from a host string copy.
++globalThis.__rt._str_memo = { map: new Map(), bytes: 0, huge: [], armed: false, budget: 4194304 };
++
++globalThis.__rt._str_memo_clear = () => {
++  const memo = globalThis.__rt._str_memo;
++  memo.map.clear();
++  memo.bytes = 0;
++  memo.huge.length = 0;
++  memo.armed = false;
++};
++
+ // str_bytes(s): the UTF-8 bytes of a JavaScript string as `{ buf, off, len }`,
+ // which is `str::as_bytes` and `str::as_ptr`.
+ //
+@@ -1054,39 +1219,76 @@ globalThis.__rt._decoder = {
+ // same kind of thing for `__rt.copy`, `__rt.overwrite` and a bare `p.buf[p.off]`
+ // write to work on both.
+ //
+-// A four entry memo ring keyed by the string returns the *same* record for a
+-// repeated call, so `s.as_bytes().as_ptr() == s.as_bytes().as_ptr()` holds in
+-// the shapes a program actually writes and a byte slice compared with itself
+-// takes the fast path. Correctness never depends on it: the ring is four
+-// entries, so a fifth distinct string evicts the first, and two records over
+-// equal bytes are as good as one everywhere but pointer identity — which
+-// CONTRACT.md documents as not guaranteed across independent calls.
+-globalThis.__rt._strBytes = [];
+-globalThis.__rt._strBytesNext = 0;
++// A repeated call within one operation returns the *same* record (see the memo
++// above), so `s.as_bytes().as_ptr() == s.as_bytes().as_ptr()` holds in the
++// shapes a program actually writes and a byte slice compared with itself takes
++// the fast path. Correctness never depends on it.
+ globalThis.__rt.str_bytes = (s) => {
+-  const memo = globalThis.__rt._strBytes;
+-  for (let i = 0; i < memo.length; i++) {
+-    if (memo[i].s === s) return memo[i].r;
+-  }
+-  const bytes = Array.prototype.slice.call(globalThis.__rt._encoder.encode(s));
+-  const record = { buf: bytes, off: 0, len: bytes.length };
+-  memo[globalThis.__rt._strBytesNext] = { s: s, r: record };
+-  globalThis.__rt._strBytesNext = (globalThis.__rt._strBytesNext + 1) % 4;
++  const memo = globalThis.__rt._str_memo;
++  let record = memo.map.get(s);
++  if (record !== undefined) return record;
++  const bytes = globalThis.__rt._utf8(s);
++  record = { buf: bytes, off: 0, len: bytes.length };
++  if (!memo.armed) {
++    memo.armed = true;
++    if (typeof queueMicrotask === "function") queueMicrotask(globalThis.__rt._str_memo_clear);
++  }
++  if (bytes.length > memo.budget / 4) {
++    if (memo.huge.length === 2) memo.map.delete(memo.huge.shift());
++    memo.huge.push(s);
++  } else {
++    if (memo.bytes + bytes.length > memo.budget) {
++      const huge = memo.huge.map((key) => memo.map.get(key));
++      memo.map.clear();
++      memo.huge.forEach((key, i) => memo.map.set(key, huge[i]));
++      memo.bytes = 0;
++    }
++    memo.bytes += bytes.length;
++  }
++  memo.map.set(s, record);
+   return record;
+ };
+ 
++// str_bytes_mut(s): `str::as_bytes_mut` and `as_mut_ptr` -- the same bytes as
++// `str_bytes`, in a fresh record that is never memoized. A `&mut str` has no
++// mutable JavaScript form (a write through it is lost; CONTRACT.md), and the
++// `&mut str` a `String` derefs to is a decoded copy, so the one thing this owes
++// is containment: the write must not land in the view an equal string shares.
++globalThis.__rt.str_bytes_mut = (s) => {
++  const bytes = globalThis.__rt._utf8(s);
++  return { buf: bytes, off: 0, len: bytes.length };
++};
++
+ // str_len(s): the UTF-8 byte length of a JavaScript string, which is the
+-// metadata of a `&str`.
+-//
+-// The fast path is the common one: a string whose every code unit is below 0x80
+-// is one byte per unit, so its length is the answer and nothing is encoded. A
+-// scan is still O(n), but it allocates nothing, and it is exact for the
+-// surrogate pairs an astral character arrives as.
++// metadata of a `&str` and `str::len`.
++//
++// Nothing is encoded: a code unit below 0x80 is one byte, below 0x800 two, a
++// surrogate pair four, and any other unit three -- including a lone surrogate,
++// which the encoder replaces with the three-byte U+FFFD. A string long enough
++// for the scan to cost more than a lookup is answered from the byte-view memo
++// when an earlier `str_bytes` already has it, which keeps a length asked once
++// per token of a long document from costing a scan each time.
+ globalThis.__rt.str_len = (s) => {
+-  for (let i = 0; i < s.length; i++) {
+-    if (s.charCodeAt(i) > 0x7f) return globalThis.__rt._encoder.encode(s).length;
++  const n = s.length;
++  const map = globalThis.__rt._str_memo.map;
++  if (n > 64 && map.size !== 0) {
++    const record = map.get(s);
++    if (record !== undefined) return record.len;
+   }
+-  return s.length;
++  let len = n;
++  for (let i = 0; i < n; i++) {
++    const c = s.charCodeAt(i);
++    if (c < 0x80) continue;
++    if (c < 0x800) {
++      len += 1;
++    } else if ((c & 0xfc00) === 0xd800 && i + 1 < n && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
++      len += 2;
++      i++;
++    } else {
++      len += 2;
++    }
++  }
++  return len;
+ };
+ 
+ // bytes_str(buf, off, len): decodes the `len` UTF-8 bytes at `buf[off]` back
+@@ -1095,37 +1297,39 @@ globalThis.__rt.str_len = (s) => {
+ //
+ // The bytes are a plain array (see str_bytes), which the decoder does not take,
+ // so they are copied into a `Uint8Array` first; a typed array that arrived from
+-// somewhere else is sliced directly.
++// somewhere else is viewed directly. The copy is also what reads an `i8`
++// element as its byte: a store into a `Uint8Array` wraps a negative number.
+ //
+ // The ASCII fast path is what a `String` built out of `alloc` actually hits:
+ // every byte below 0x80 is its own code point, so the string is assembled
+ // directly and neither the copy nor the decoder runs. `String.fromCharCode`
+ // takes a bounded run of arguments, so the loop chunks; above the chunk size,
+-// or at the first byte that is not ASCII, the decoder takes over.
++// or at the first byte that is not ASCII (a negative `i8` included), the
++// decoder takes over.
+ globalThis.__rt._ASCII_CHUNK = 4096;
+ globalThis.__rt.bytes_str = (buf, off, len) => {
+   // A zero length `str` reads nothing, and the buffer it names may not exist at
+   // all: `let none: [u8; 0] = []` is a zero sized place, whose JavaScript value
+   // is `undefined`.
+   if (len === 0) return "";
++  const typed = buf instanceof Uint8Array;
+   if (len <= globalThis.__rt._ASCII_CHUNK) {
+-    let ascii = true;
+-    for (let i = 0; i < len; i++) {
+-      if (buf[off + i] > 0x7f) {
+-        ascii = false;
+-        break;
+-      }
+-    }
+-    if (ascii) {
++    let i = 0;
++    while (i < len && (buf[off + i] & 0x80) === 0) i++;
++    if (i === len) {
+       return String.fromCharCode.apply(
+         null,
+-        Array.prototype.slice.call(buf, off, off + len),
++        typed ? buf.subarray(off, off + len) : Array.prototype.slice.call(buf, off, off + len),
+       );
+     }
+   }
+-  const bytes = buf instanceof Uint8Array
+-    ? buf.subarray(off, off + len)
+-    : Uint8Array.from(Array.prototype.slice.call(buf, off, off + len));
++  let bytes;
++  if (typed) {
++    bytes = buf.subarray(off, off + len);
++  } else {
++    bytes = new Uint8Array(len);
++    for (let i = 0; i < len; i++) bytes[i] = buf[off + i];
++  }
+   return globalThis.__rt._decoder.decode(bytes);
+ };
+ 
+@@ -1616,7 +1820,8 @@ globalThis.__rt.alloc_zeroed = (size, align) =>
+ // dealloc(ptr, size, align): `__rust_dealloc`. The block is unregistered and
+ // poisoned: emptying the array makes every stale pointer into it read
+ // `undefined` rather than the value it used to hold, and the `_freed` set turns
+-// a later cast through that pointer into a refusal that says so.
++// a later cast through that pointer into a refusal that says so. Its synthetic
++// address, if it was ever asked for, goes back to the free list (`addr`).
+ globalThis.__rt.dealloc = (p, size, align) => {
+   const buf = p === null || typeof p !== "object" ? null : p.buf;
+   if (buf === null || !globalThis.__rt._blocks.has(buf)) {
+@@ -1627,6 +1832,7 @@ globalThis.__rt.dealloc = (p, size, align) => {
+   }
+   globalThis.__rt._blocks.delete(buf);
+   globalThis.__rt._freed.add(buf);
++  globalThis.__rt._addr_release(buf);
+   buf.length = 0;
+ };
+ 
+@@ -1654,6 +1860,7 @@ globalThis.__rt.realloc = (p, size, align, new_size) => {
+   }
+   block.bytes = new_size;
+   buf.length = new_size / block.es;
++  globalThis.__rt._addr_release(buf, new_size);
+   return { buf, off: p.off };
+ };
+ 
+diff --git a/scripts/runtime-addr.test.mjs b/scripts/runtime-addr.test.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9312e38dacc5e53e67959be4a8dbc81a80374af
+--- /dev/null
++++ b/scripts/runtime-addr.test.mjs
+@@ -0,0 +1,154 @@
++// The synthetic address space (`__rt.addr`, `_addr_mint`): a usize is 32 bits, so bases must be
++// given back and carved by size, or a long-running program's millionth allocation is reported as
++// a failed one (`addr(p, 1) >>> 0 === 0` in `NonNull::new`).
++import assert from 'node:assert/strict'
++import { readFile } from 'node:fs/promises'
++import test from 'node:test'
++import vm from 'node:vm'
++
++const source = await readFile(new URL('../runtime/shim.js', import.meta.url), 'utf8')
++function runtime(code = source) {
++  const context = vm.createContext({})
++  vm.runInContext(code, context)
++  return context.__rt
++}
++// `NonNull::new` on a fresh allocation, exactly as the emitted code spells it.
++const nonNull = (rt, p) => rt.addr(p, 1) >>> 0
++
++// Mints well over 2^20 small blocks with interleaved frees, holding a sliding window of live
++// blocks, and checks every invariant the pointer model promises for each one.
++function churn(rt, total, window, sizes) {
++  const live = []
++  const owner = new Map()
++  let maxAddress = 0
++  for (let i = 0; i < total; i++) {
++    const size = sizes[i % sizes.length]
++    const p = rt.alloc(size, 1)
++    const address = nonNull(rt, p)
++    if (address === 0) throw new Error(`allocation ${i} of ${size} bytes got the null address`)
++    if (address !== rt.addr(p, 1)) throw new Error(`allocation ${i} wrapped past 2^32: ${rt.addr(p, 1)}`)
++    if (address < 4096) throw new Error(`allocation ${i} collides with the dangling range: ${address}`)
++    if (address === rt._zst_addr) throw new Error(`allocation ${i} was given the zero-sized address`)
++    const granule = Math.min(4096, Math.max(16, 2 ** Math.ceil(Math.log2(size))))
++    if (address % granule !== 0) throw new Error(`allocation ${i} of ${size} bytes at ${address} is not ${granule}-aligned`)
++    if (owner.has(address)) throw new Error(`allocation ${i} duplicates a live block's address ${address}`)
++    owner.set(address, p)
++    live.push([p, address])
++    maxAddress = Math.max(maxAddress, address)
++    // Interleaved frees: usually the oldest, sometimes a random live block.
++    while (live.length > window) {
++      const at = i % 7 === 0 ? (i * 2654435761 >>> 0) % live.length : 0
++      const [q, a] = live[at]
++      live[at] = live[live.length - 1]
++      live.pop()
++      if (rt.addr(q, 1) !== a) throw new Error('a live block\'s address moved')
++      owner.delete(a)
++      rt.dealloc(q, 0, 1)
++    }
++  }
++  for (const [p, a] of live) assert.equal(rt.addr(p, 1), a, 'stable for the block\'s lifetime')
++  return { maxAddress, live: live.length }
++}
++
++test('more than 2^20 small allocations with interleaved frees: no wrap, no null, no live duplicate', () => {
++  const rt = runtime()
++  const { maxAddress } = churn(rt, (1 << 20) + 50000, 300, [17, 24, 8, 64, 100, 1, 4096, 33])
++  // Reuse keeps the space compact: the window is 300 blocks, so the top stays tiny.
++  assert.ok(maxAddress < 64 * 1024 * 1024, `top of the address space reached ${maxAddress}`)
++})
++
++test('a large live set of small blocks fits: granules are sized, not 4096 bytes each', () => {
++  const rt = runtime()
++  // 1.1 million simultaneously live 16-byte blocks would need 4.5 GB of address space at a
++  // 4096-byte granule; at 16 bytes they take 18 MB.
++  const { maxAddress, live } = churn(rt, 1_100_000, 1_100_000, [16, 12, 8])
++  assert.equal(live, 1_100_000)
++  assert.ok(maxAddress < 2 ** 26, `top reached ${maxAddress}`)
++})
++
++test('the minting this replaced wraps to null after 2^20 blocks', () => {
++  const old = source.replace(
++    /base = globalThis\.__rt\._addr_mint\(key, [^;]*;/,
++    'base = 4096 * (globalThis.__rt._addrOld = (globalThis.__rt._addrOld || 0) + 1);' +
++      ' if (base === globalThis.__rt._zst_addr) base = 4096 * ++globalThis.__rt._addrOld;' +
++      ' globalThis.__rt._addrs.set(key, base);',
++  )
++  assert.notEqual(old, source)
++  assert.throws(() => churn(runtime(old), (1 << 20) + 10, 300, [17]), /null address|wrapped/)
++})
++
++test('a freed block keeps its address for dangling pointers, and the address is reused', () => {
++  const rt = runtime()
++  const a = rt.alloc(24, 8)
++  const address = nonNull(rt, a)
++  const element = rt.addr({ buf: a.buf, off: 3 }, 1)
++  assert.equal(element, address + 3)
++  rt.dealloc(a, 24, 8)
++  assert.equal(rt.addr(a, 1), address, 'a dangling pointer answers the address it had')
++  const b = rt.alloc(20, 4)
++  assert.equal(nonNull(rt, b), address, 'the freed granule is reused, as a native allocator would')
++  const c = rt.alloc(20, 4)
++  assert.notEqual(nonNull(rt, c), address)
++})
++
++test('a block realloc grows past its granule re-mints instead of overlapping its neighbours', () => {
++  const rt = runtime()
++  const v = rt.alloc(8, 1)
++  const before = nonNull(rt, v)
++  const neighbour = rt.alloc(16, 1)
++  const next = nonNull(rt, neighbour)
++  assert.equal(next, before + 16)
++  // Growing within the granule keeps the address.
++  const same = rt.realloc(v, 8, 1, 16)
++  assert.equal(rt.addr(same, 1), before)
++  // Growing past it moves the address (a reallocation may move) to a granule of the new size.
++  const grown = rt.realloc(same, 16, 1, 100)
++  const after = nonNull(rt, grown)
++  assert.notEqual(after, before)
++  assert.equal(after % 128, 0)
++  assert.ok(after + 100 <= next || after >= next + 16, 'no overlap with the live neighbour')
++  assert.equal(rt.addr({ buf: grown.buf, off: 99 }, 1), after + 99)
++  // The old granule is free again.
++  assert.equal(nonNull(rt, rt.alloc(16, 1)), before)
++})
++
++test('alignment follows the block size; elements stay multiples of their size', () => {
++  const rt = runtime()
++  for (const [bytes, align] of [[1, 16], [16, 16], [17, 32], [64, 64], [100, 128], [4096, 4096], [10000, 4096]]) {
++    const p = rt.alloc(bytes, 1)
++    assert.equal(nonNull(rt, p) % align, 0, `${bytes} bytes`)
++  }
++  // A non-heap buffer (a stack array) is sized by its length and the element size asked.
++  const words = [1, 2, 3, 4, 5, 6, 7, 8]
++  const at = rt.addr({ buf: words, off: 2 }, 8)
++  assert.equal((at - 16) % 64, 0)
++  assert.equal(at % 8, 0)
++})
++
++test('the bump never hands out the zero-sized address', () => {
++  const rt = runtime()
++  rt._addrNext = rt._zst_addr - 16
++  assert.equal(nonNull(rt, rt.alloc(16, 1)), rt._zst_addr - 16)
++  assert.equal(nonNull(rt, rt.alloc(16, 1)), rt._zst_addr + 4096)
++})
++
++test('the alignment gap the bump leaves is reused, not lost', () => {
++  const rt = runtime()
++  const small = nonNull(rt, rt.alloc(16, 1))
++  assert.equal(small, 4096)
++  const page = nonNull(rt, rt.alloc(4096, 1))
++  assert.equal(page, 8192)
++  // [4112, 8192) was carved into 16, 32, ..., 2048-byte free granules.
++  assert.equal(nonNull(rt, rt.alloc(2048, 1)), 4096 + 2048)
++  assert.equal(nonNull(rt, rt.alloc(16, 1)), 4112)
++})
++
++test('the top of the space is used to its last granule, then refused; freed granules still serve', () => {
++  const rt = runtime()
++  rt._addrNext = 2 ** 32 - 32
++  const a = rt.alloc(16, 1)
++  assert.deepEqual([nonNull(rt, a), nonNull(rt, rt.alloc(16, 1))], [2 ** 32 - 32, 2 ** 32 - 16])
++  assert.throws(() => nonNull(rt, rt.alloc(16, 1)), /address space is exhausted/)
++  rt.dealloc(a, 16, 1)
++  assert.equal(nonNull(rt, rt.alloc(16, 1)), 2 ** 32 - 32, 'a freed granule is reused even at the top')
++})
+diff --git a/scripts/runtime-utf8.test.mjs b/scripts/runtime-utf8.test.mjs
+index 8e9474d5f5056815839aeaf8af4d9fc1b94d6554..74d52a55c224244e93708afb09e755745f843685 100644
+--- a/scripts/runtime-utf8.test.mjs
++++ b/scripts/runtime-utf8.test.mjs
+@@ -33,3 +33,217 @@ for (const compiler of ['mires-v2']) {
+     assert.throws(() => verify(runtime(faulty)), assert.AssertionError)
+   })
+ }
++
++// ---------------------------------------------------------------------------------------------
++// The byte view, its length, and the memo that bounds re-encoding (CONTRACT.md, "`str` is a
++// hybrid"). Every expected byte sequence comes from the host's own TextEncoder.
++
++const source = await readFile(new URL('../runtime/shim.js', import.meta.url), 'utf8')
++const encoder = new TextEncoder()
++const decoder = new TextDecoder('utf-8', { ignoreBOM: true })
++const utf8 = (text) => Array.from(encoder.encode(text))
++const view = (record) => Array.from(record.buf).slice(record.off, record.off + record.len)
++const label = (text) => JSON.stringify(text.slice(0, 12))
++// A runtime whose microtasks are collected rather than run, so a test decides when the stack
++// "unwinds".
++function scheduled() {
++  const jobs = []
++  const context = vm.createContext({ TextEncoder, TextDecoder, Uint8Array, queueMicrotask: (job) => jobs.push(job) })
++  vm.runInContext(source, context)
++  return { rt: context.__rt, jobs, unwind: () => { while (jobs.length) jobs.shift()() } }
++}
++
++const astral = '😀'
++const encodings = [
++  '', 'a', 'ascii only, sixteen', 'exactly 16 chars', 'seventeen chars!!', '\0\x7f',
++  '\x80', '߿', 'é', 'Grüße', 'ࠀ', '￿', '世界', astral, 'a' + astral + 'b',
++  '﻿', '﻿BOM', 'x﻿',
++  // Lone and misordered surrogates: the encoder writes U+FFFD (three bytes) for each.
++  '\ud800', '\udc00', 'a\ud800', '\ud800b', '\udc00\ud800', '\ud800𐀀', astral + '\ud83d',
++  'é'.repeat(4096), '世'.repeat(5000), astral.repeat(3000) + '\ud800',
++  'a'.repeat(4096), 'a'.repeat(4097), 'a'.repeat(1 << 20), ('Grüße 世界 ' + astral).repeat(80000),
++]
++
++test('str_bytes and str_len agree with TextEncoder on every width, BOMs, lone surrogates and 1 MB', () => {
++  const { rt } = scheduled()
++  for (const text of encodings) {
++    const want = utf8(text)
++    const record = rt.str_bytes(text)
++    assert.equal(record.off, 0)
++    assert.equal(record.len, want.length, `len of ${label(text)}`)
++    assert.ok(Array.isArray(record.buf), 'the byte view is a plain array, the kind every [u8] is')
++    assert.deepEqual(view(record), want, `bytes of ${label(text)}`)
++    assert.equal(rt.str_len(text), want.length, `str_len of ${label(text)}`)
++    assert.equal(rt.bytes_str(record.buf, record.off, record.len), decoder.decode(encoder.encode(text)))
++  }
++  // str_len never needs the memo: a fresh runtime answers before any str_bytes.
++  const fresh = scheduled().rt
++  for (const text of encodings) assert.equal(fresh.str_len(text), utf8(text).length, `fresh str_len of ${label(text)}`)
++  assert.equal(fresh._str_memo.map.size, 0, 'str_len does not populate the memo')
++})
++
++test('str_len and str_bytes match TextEncoder on random UTF-16, including unpaired surrogates', () => {
++  const { rt } = scheduled()
++  let seed = 12345
++  const next = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0)
++  const units = [0x41, 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xfeff, 0xffff]
++  for (let i = 0; i < 4000; i++) {
++    const n = next() % 90
++    let text = ''
++    for (let j = 0; j < n; j++) text += String.fromCharCode(next() % 3 ? units[next() % units.length] : next() & 0xffff)
++    assert.equal(rt.str_len(text), encoder.encode(text).length, JSON.stringify(text))
++    assert.deepEqual(view(rt.str_bytes(text)), utf8(text), JSON.stringify(text))
++  }
++})
++
++test('an encoder without encodeInto still produces the same bytes', () => {
++  class OldEncoder { encode(text) { return encoder.encode(text) } }
++  const context = vm.createContext({ TextEncoder: OldEncoder, TextDecoder, Uint8Array })
++  vm.runInContext(source, context)
++  for (const text of ['Grüße', '世界' + astral, '\ud800x', 'é'.repeat(5000), 'ascii']) {
++    assert.deepEqual(view(context.__rt.str_bytes(text)), utf8(text), label(text))
++  }
++})
++
++test('bytes_str reads i8 elements and typed arrays as bytes', () => {
++  const { rt } = scheduled()
++  // `é` is C3 A9; as i8 elements those are -61 and -87. A negative byte is not ASCII.
++  assert.equal(rt.bytes_str([0x61, -61, -87, 0x62], 0, 4), 'aéb')
++  assert.equal(rt.bytes_str([-16, -97, -104, -128], 0, 4), astral)
++  const typed = encoder.encode('xx' + 'Grüße' + 'yy')
++  assert.equal(rt.bytes_str(typed, 2, typed.length - 4), 'Grüße')
++  assert.equal(rt.bytes_str(encoder.encode('plain ascii'), 0, 11), 'plain ascii')
++  const long = 'é'.repeat(3000)
++  assert.equal(rt.bytes_str(utf8(long), 0, utf8(long).length), long)
++})
++
++test('within one operation a string has one byte view, and the memo empties when the stack unwinds', () => {
++  const { rt, jobs, unwind } = scheduled()
++  const doc = 'line one\nline two\n'.repeat(500)
++  const first = rt.str_bytes(doc)
++  assert.equal(jobs.length, 1, 'the first insertion queues exactly one clearing microtask')
++  // Many other strings pass through between two reads of the document -- the shape that evicted
++  // the old four-entry ring on every source line.
++  for (let i = 0; i < 1000; i++) rt.str_bytes(`token ${i}`)
++  assert.equal(rt.str_bytes(doc), first, 'same record within the operation')
++  assert.equal(rt.str_bytes(doc.split('').join('')), first, 'equal content is the same key')
++  assert.equal(jobs.length, 1, 'no further microtasks while armed')
++  assert.equal(rt.str_len(doc), utf8(doc).length)
++  unwind()
++  assert.equal(rt._str_memo.map.size, 0)
++  assert.equal(rt._str_memo.bytes, 0)
++  const second = rt.str_bytes(doc)
++  assert.notEqual(second, first, 'a new operation encodes again')
++  assert.deepEqual(view(second), view(first))
++  assert.equal(jobs.length, 1, 'the next operation re-arms the clear')
++})
++
++test('the memo is bounded by bytes beyond its capacity, and a huge string survives its slices', () => {
++  const { rt } = scheduled()
++  const memo = rt._str_memo
++  const budget = memo.budget
++  assert.equal(budget, 4 * 1024 * 1024)
++  // Well past capacity with distinct medium strings: always correct, never above the budget.
++  const chunk = 'm'.repeat(64 * 1024 - 8)
++  for (let i = 0; i < 200; i++) {
++    const text = chunk + String(i).padStart(8, '0')
++    const record = rt.str_bytes(text)
++    assert.equal(record.len, text.length)
++    assert.equal(record.buf[record.len - 1], text.charCodeAt(text.length - 1))
++    assert.ok(memo.bytes <= budget, `held ${memo.bytes} bytes`)
++    let total = 0
++    for (const [key, value] of memo.map) if (!memo.huge.includes(key)) total += value.len
++    assert.equal(total, memo.bytes, 'the byte count is exact')
++  }
++  // A document larger than budget / 4 is held apart: churning more than the whole budget through
++  // the memo does not evict it, so slicing it stays linear.
++  const doc = ('# heading\n\n' + 'text '.repeat(40) + '\n').repeat(6000)
++  assert.ok(doc.length > budget / 4)
++  const record = rt.str_bytes(doc)
++  for (let i = 0; i < 400; i++) {
++    rt.str_bytes(chunk + 'x' + i)
++    assert.equal(rt.str_bytes(doc), record, `document evicted after ${i} slices`)
++  }
++  // At most two huge strings are held; a third evicts the oldest.
++  const second = doc + 'b', third = doc + 'c'
++  const r2 = rt.str_bytes(second)
++  rt.str_bytes(third)
++  assert.equal(memo.huge.length, 2)
++  assert.equal(rt.str_bytes(second), r2)
++  assert.notEqual(rt.str_bytes(doc), record, 'the oldest huge string was evicted')
++})
++
++test('without queueMicrotask the byte bound alone applies', () => {
++  const rt = runtime(source)
++  for (let i = 0; i < 100; i++) rt.str_bytes('n'.repeat(100 * 1024) + i)
++  assert.ok(rt._str_memo.bytes <= rt._str_memo.budget)
++  assert.equal(rt._str_memo.armed, true)
++})
++
++test('an owned String converted from a host string never aliases the memoized view', () => {
++  const { rt } = scheduled()
++  for (const text of ['owned', 'Grüße ' + astral, 'a'.repeat(5000)]) {
++    const shared = rt.str_bytes(text)
++    const before = view(shared)
++    const owned = rt.convert_str_block(text)
++    assert.notEqual(owned.buf, shared.buf)
++    owned.buf[0] = 0x21
++    owned.buf.push(0x21)
++    assert.deepEqual(view(rt.str_bytes(text)), before)
++    const builder = rt.convert_sb_block({ text, cap: before.length + 8 })
++    assert.notEqual(builder.buf, shared.buf)
++    builder.buf[1] = 0x21
++    assert.deepEqual(view(rt.str_bytes(text)), before)
++    // A mutated String derefs to a different JavaScript string: never a stale view.
++    const mutated = rt.bytes_str(owned.buf, 0, before.length)
++    assert.notEqual(mutated, text)
++    assert.deepEqual(view(rt.str_bytes(mutated)), utf8(mutated))
++  }
++})
++
++test('a mutable byte view (as_bytes_mut) is fresh, so a write through it never reaches the memo', () => {
++  const { rt } = scheduled()
++  const text = 'Hello World'
++  const shared = rt.str_bytes(text)
++  const mutable = rt.str_bytes_mut(text)
++  assert.notEqual(mutable, shared)
++  assert.notEqual(mutable.buf, shared.buf)
++  assert.deepEqual(view(mutable), utf8(text))
++  for (let i = 0; i < mutable.len; i++) mutable.buf[i] |= 0x20
++  assert.deepEqual(view(rt.str_bytes(text)), utf8(text), 'the shared view is untouched')
++  assert.equal(rt.str_len(text), 11)
++  assert.notEqual(rt.str_bytes_mut(text), mutable, 'never memoized')
++})
++
++// Timing, printed and never asserted: the old conversion (`Array.prototype.slice` over the
++// encoder's typed array) against `_utf8`, on fresh strings (a miss every time), and a memo hit.
++test('str_bytes timing (printed, not asserted)', () => {
++  const { rt, unwind } = scheduled()
++  const ascii = ('## Section 12\n\n- **browser** compiler\n- [report](https://example.test/12)\n\n').repeat(120).slice(0, 8192)
++  const mixed = ('Grüße, 世界! emoji ' + astral + ' and ascii, ').repeat(300).slice(0, 8192)
++  const old = (s) => Array.prototype.slice.call(encoder.encode(s))
++  const time = (f, iterations) => {
++    for (let i = 0; i < 20; i++) f(i)
++    const samples = []
++    for (let r = 0; r < 7; r++) {
++      const start = process.hrtime.bigint()
++      for (let i = 0; i < iterations; i++) f(i)
++      samples.push(Number(process.hrtime.bigint() - start) / iterations / 1000)
++    }
++    return samples.sort((a, b) => a - b)[3].toFixed(2)
++  }
++  const rows = []
++  for (const [name, text] of [['8 KB ASCII', ascii], ['8 KB mixed', mixed]]) {
++    // A distinct string object per call, so no memo applies to the miss columns.
++    const fresh = Array.from({ length: 64 }, () => JSON.parse(JSON.stringify(text)))
++    rows.push({
++      input: name,
++      'before: slice.call(encode) µs': time((i) => old(fresh[i & 63]), 200),
++      'after: miss µs': time((i) => { unwind(); return rt.str_bytes(fresh[i & 63]) }, 200),
++      'after: memo hit µs': time(() => rt.str_bytes(text), 2000),
++      'str_len, no memo µs': time((i) => { unwind(); return rt.str_len(fresh[i & 63]) }, 200),
++    })
++  }
++  console.log('# str_bytes timing (median of 7)')
++  console.table(rows)
++})

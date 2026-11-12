@@ -1,0 +1,784 @@
+diff --git a/jsc-link/src/lower/fuse.rs b/jsc-link/src/lower/fuse.rs
+index b315c5c94cc73d64db71c37c97948f4545be260a..6780f3e03e0f96c8b82fe2f4bf0902a101b99e7c 100644
+--- a/jsc-link/src/lower/fuse.rs
++++ b/jsc-link/src/lower/fuse.rs
+@@ -166,25 +166,7 @@ pub fn plan(
+     planner.pin_host_environments();
+     planner.name();
+     planner.copies();
+-    if func.has_invoke() {
+-        crate::profile::bump(crate::profile::Counter::CatchReserveCalls);
+-        crate::profile::add(
+-            crate::profile::Counter::CatchReserveStrings,
+-            interns.strings.len(),
+-        );
+-        // A catch binding also shadows free names in its handler.
+-        planner.taken.extend(interns.strings.iter().cloned());
+-    }
+-    for block in &func.blocks {
+-        if matches!(block.term, RTerm::Invoke { .. }) {
+-            let name = planner.unique(format!("$invoke{}", block.id.0));
+-            planner.plan.invoke_names.insert(block.id, name);
+-        }
+-    }
+-    if !planner.plan.invoke_names.is_empty() {
+-        planner.plan.exception_name = Some(planner.unique("$exception".to_owned()));
+-        planner.plan.catch_name = Some(planner.unique("$caught".to_owned()));
+-    }
++    planner.name_invokes();
+     planner.scrutinees();
+     planner.finish()
+ }
+@@ -204,6 +186,8 @@ struct Planner<'a> {
+     plan: Plan,
+     /// The names taken so far.
+     taken: BTreeSet<String>,
++    /// Whether every interned string counts as taken too (set by [`Planner::name_invokes`]).
++    reserve_interns: bool,
+     /// The `_N` spellings reserved for the first value of each MIR local.
+     reserved_numbers: BTreeSet<String>,
+ }
+@@ -241,6 +225,7 @@ impl<'a> Planner<'a> {
+             purity: BTreeMap::new(),
+             plan: Plan::default(),
+             taken: BTreeSet::new(),
++            reserve_interns: false,
+             reserved_numbers: BTreeSet::new(),
+         }
+     }
+@@ -1058,18 +1043,56 @@ impl<'a> Planner<'a> {
+     }
+ 
+     fn unique(&mut self, base: String) -> String {
+-        if self.taken.insert(base.clone()) {
++        if self.claim(&base) {
+             return base;
+         }
+         for n in 1u32.. {
+             let candidate = format!("{base}${n}");
+-            if self.taken.insert(candidate.clone()) {
++            if self.claim(&candidate) {
+                 return candidate;
+             }
+         }
+         base
+     }
+ 
++    /// Takes `name` unless an earlier name holds it or, once [`Self::reserve_interns`] is set, it
++    /// is an interned string.
++    fn claim(&mut self, name: &str) -> bool {
++        if self.taken.contains(name) {
++            return false;
++        }
++        if self.reserve_interns {
++            crate::profile::bump(crate::profile::Counter::CatchReserveStrings);
++            if self.interns.contains_str(name) {
++                return false;
++            }
++        }
++        self.taken.insert(name.to_owned())
++    }
++
++    /// Names each `Invoke`'s outcome flag, then the handler's exception and catch bindings.
++    ///
++    /// A catch binding also shadows free names in its handler, so these names avoid every
++    /// interned string besides the names taken so far. The table is crate-sized and only a few
++    /// `$`-prefixed candidates are asked about, so [`Self::claim`] looks each one up in it rather
++    /// than copying the table into `taken`.
++    fn name_invokes(&mut self) {
++        if !self.func.has_invoke() {
++            return;
++        }
++        crate::profile::bump(crate::profile::Counter::CatchReserveCalls);
++        self.reserve_interns = true;
++        let func = self.func;
++        for block in &func.blocks {
++            if matches!(block.term, RTerm::Invoke { .. }) {
++                let name = self.unique(format!("$invoke{}", block.id.0));
++                self.plan.invoke_names.insert(block.id, name);
++            }
++        }
++        self.plan.exception_name = Some(self.unique("$exception".to_owned()));
++        self.plan.catch_name = Some(self.unique("$caught".to_owned()));
++    }
++
+     /// Whether the value needs a name: an entry parameter, a block parameter, or an op result
+     /// that is used and not inline.
+     fn needs_name(&self, v: ValueId) -> bool {
+@@ -1607,6 +1630,153 @@ mod tests {
+         assert_eq!(rescue("_unused").as_deref(), Some("_unused"));
+     }
+ 
++    /// Two `Invoke`s (blocks 0 and 1) whose unwind edges share one handler.
++    fn invoking() -> Func {
++        use crate::jir::repr::FuncBuilder;
++        use crate::jir::semantic::{AbiSignature, DefinitionId, ItemId, Signature};
++        let item = ItemId {
++            definition: DefinitionId {
++                crate_id: 1,
++                local_hash: 1,
++            },
++            instantiation: 1,
++        };
++        let sig = Signature {
++            abi: AbiSignature {
++                parameters: 0,
++                spread: None,
++                caller_location: false,
++            },
++            arguments: Vec::new(),
++            result: TypeId(0),
++        };
++        let mut b = FuncBuilder::new(item, sig);
++        let entry = FuncBuilder::ENTRY;
++        let second = b.block();
++        let done = b.block();
++        let handler = b.block();
++        b.terminate(
++            entry,
++            RTerm::Invoke {
++                normal: (second, Vec::new()),
++                unwind: (handler, Vec::new()),
++            },
++        );
++        b.terminate(
++            second,
++            RTerm::Invoke {
++                normal: (done, Vec::new()),
++                unwind: (handler, Vec::new()),
++            },
++        );
++        b.terminate(done, RTerm::Return(None));
++        b.terminate(handler, RTerm::Throw(None));
++        b.finish()
++    }
++
++    type CatchNames = (BTreeMap<RBlockId, String>, Option<String>, Option<String>);
++
++    fn catch_names(plan: &Plan) -> CatchNames {
++        (
++            plan.invoke_names.clone(),
++            plan.exception_name.clone(),
++            plan.catch_name.clone(),
++        )
++    }
++
++    /// The catch-name reservation as it was before the interned strings were consulted lazily:
++    /// every one of them copied into `taken`, then named through the plain `unique`.
++    fn eager_catch_names(planner: &mut Planner<'_>) -> CatchNames {
++        planner
++            .taken
++            .extend(planner.interns.strings.iter().cloned());
++        let func = planner.func;
++        for block in &func.blocks {
++            if matches!(block.term, RTerm::Invoke { .. }) {
++                let name = planner.unique(format!("$invoke{}", block.id.0));
++                planner.plan.invoke_names.insert(block.id, name);
++            }
++        }
++        if !planner.plan.invoke_names.is_empty() {
++            planner.plan.exception_name = Some(planner.unique("$exception".to_owned()));
++            planner.plan.catch_name = Some(planner.unique("$caught".to_owned()));
++        }
++        catch_names(&planner.plan)
++    }
++
++    /// Names taken before the reservation, as `name` and `copies` would leave them.
++    fn seed(planner: &mut Planner<'_>, earlier: &[&str]) {
++        planner.taken.insert(CALLER_LOCATION_NAME.to_owned());
++        planner
++            .taken
++            .extend(earlier.iter().map(|name| (*name).to_owned()));
++    }
++
++    #[test]
++    fn catch_names_avoid_interned_strings_exactly_as_the_eager_copy_did() {
++        let func = invoking();
++        let table = TypeTable::default();
++        let opts = Opts::default();
++        let strings = [
++            "$invoke0",
++            "$invoke0$1",
++            "$exception",
++            "$caught",
++            "foo",
++            "$caught$1",
++        ];
++        let mut indexed = Interns::new();
++        for string in strings {
++            indexed.intern_str(string);
++        }
++        // Filled by hand: the string index is empty and membership falls back to a search.
++        let mut hand_filled = Interns::new();
++        hand_filled.strings = strings.map(str::to_owned).to_vec();
++        let mut appended = indexed.clone();
++        appended.strings.push("$invoke1".to_owned());
++        let empty = Interns::new();
++        let earlier: [&[&str]; 3] = [&[], &["$invoke1", "$exception$1"], &["$caught$2"]];
++        for interns in [&indexed, &hand_filled, &appended, &empty] {
++            for taken in earlier {
++                let mut eager = Planner::new(&func, None, &table, interns, &opts);
++                seed(&mut eager, taken);
++                let expected = eager_catch_names(&mut eager);
++                let mut lazy = Planner::new(&func, None, &table, interns, &opts);
++                seed(&mut lazy, taken);
++                lazy.name_invokes();
++                assert_eq!(
++                    catch_names(&lazy.plan),
++                    expected,
++                    "strings {:?}, taken {taken:?}",
++                    interns.strings
++                );
++                for name in expected.0.values().chain(&expected.1).chain(&expected.2) {
++                    assert!(!interns.strings.contains(name));
++                    assert!(!taken.contains(&name.as_str()));
++                }
++            }
++        }
++        // Through the public entry point.
++        assert_eq!(
++            catch_names(&plan(&func, None, &table, &indexed, &opts)),
++            (
++                BTreeMap::from([
++                    (RBlockId(0), "$invoke0$2".to_owned()),
++                    (RBlockId(1), "$invoke1".to_owned()),
++                ]),
++                Some("$exception$1".to_owned()),
++                Some("$caught$2".to_owned()),
++            )
++        );
++        let mut straight = func.clone();
++        straight.blocks.truncate(1);
++        straight.blocks[0].term = RTerm::Return(None);
++        assert_eq!(
++            catch_names(&plan(&straight, None, &table, &indexed, &opts)),
++            (BTreeMap::new(), None, None)
++        );
++    }
++
+     #[test]
+     fn the_ladder_commutes_like_v1() {
+         assert!(commutes(Purity::Const, Purity::Effect));
+diff --git a/jsc-link/src/plan/cost.rs b/jsc-link/src/plan/cost.rs
+index 8038bae52674e98e77886a96f8db1ce7855bccfa..86bb26cc14ab1e8927058ddbb6aa3c14bfefa88c 100644
+--- a/jsc-link/src/plan/cost.rs
++++ b/jsc-link/src/plan/cost.rs
+@@ -27,6 +27,7 @@
+ //! vector.
+ 
+ use std::collections::{BTreeMap, BTreeSet};
++use std::sync::OnceLock;
+ 
+ use crate::analysis::js_alloc::JsAllocSites;
+ use crate::jir::decline::Decline;
+@@ -257,16 +258,17 @@ pub fn measure_expr(expr: &jsast::Expr) -> u64 {
+ /// Parsed from the bundled `runtime/shim.js` exactly as `scripts/minimal-shim.mjs` slices
+ /// members, so the byte a helper is priced at is the byte `minimal-shim` ships.
+ pub fn helper_bytes() -> BTreeMap<String, u64> {
+-    shim_members(SHIM)
+-        .into_iter()
+-        .map(|(name, source)| (name, source.len() as u64))
++    shim()
++        .members
++        .iter()
++        .map(|(name, source)| (name.clone(), source.len() as u64))
+         .collect()
+ }
+ 
+ /// The transitive runtime members reached by `direct`, using the same member statements and
+ /// reference closure as `scripts/minimal-shim.mjs`.
+ pub fn helper_closure(direct: &BTreeSet<String>) -> BTreeSet<String> {
+-    shim_helper_closure(SHIM, direct)
++    shim().closure(direct)
+ }
+ 
+ /// Every runtime helper directly mentioned by a compact program.
+@@ -276,11 +278,10 @@ pub fn runtime_members(program: &str) -> BTreeSet<String> {
+ 
+ /// Deterministic source for the transitive runtime-helper closure of `direct`.
+ pub fn helper_program(direct: &BTreeSet<String>) -> String {
+-    let members = shim_members(SHIM);
+-    let closure = shim_helper_closure(SHIM, direct);
++    let shim = shim();
+     let mut program = String::new();
+-    for member in closure {
+-        if let Some(source) = members.get(&member) {
++    for member in shim.closure(direct) {
++        if let Some(source) = shim.members.get(&member) {
+             program.push_str(source);
+             program.push('\n');
+         }
+@@ -288,6 +289,86 @@ pub fn helper_program(direct: &BTreeSet<String>) -> String {
+     program
+ }
+ 
++/// The bundled `runtime/shim.js`, parsed once per process.
++fn shim() -> &'static ShimIndex {
++    static SHIM_INDEX: OnceLock<ShimIndex> = OnceLock::new();
++    SHIM_INDEX.get_or_init(|| ShimIndex::of(SHIM))
++}
++
++/// One shim source's member statements, and each member's direct dependencies under
++/// `minimal-shim.mjs`'s closure rule. Neither depends on which members a program reaches, so a
++/// closure is a walk over this index rather than a re-parse.
++struct ShimIndex {
++    /// Every member's statement, by name ([`shim_members`]).
++    members: BTreeMap<String, String>,
++    /// The members each member's statement reaches directly: the runtime members it references,
++    /// and the owner of every lexical helper binding it mentions.
++    dependencies: BTreeMap<String, BTreeSet<String>>,
++}
++
++impl ShimIndex {
++    fn of(source: &str) -> ShimIndex {
++        let members = shim_members(source);
++        // Match minimal-shim's source groups: lexical helper declarations travel
++        // with the runtime member preceding them, even when another member calls them.
++        let mut bindings = BTreeMap::new();
++        for (name, source) in &members {
++            for line in source.lines() {
++                let Some(declaration) = ["const ", "let ", "var ", "function "]
++                    .into_iter()
++                    .find_map(|prefix| line.strip_prefix(prefix))
++                else {
++                    continue;
++                };
++                let binding = declaration
++                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
++                    .next()
++                    .and_then(ident);
++                if let Some(binding) = binding {
++                    bindings.insert(binding.to_owned(), name.clone());
++                }
++            }
++        }
++        let dependencies = members
++            .iter()
++            .map(|(name, statement)| {
++                let mut dependencies = referenced_members(statement);
++                for token in
++                    statement.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
++                {
++                    if let Some(owner) = bindings.get(token) {
++                        dependencies.insert(owner.clone());
++                    }
++                }
++                (name.clone(), dependencies)
++            })
++            .collect();
++        ShimIndex {
++            members,
++            dependencies,
++        }
++    }
++
++    /// `direct` and every member it transitively depends on. A name that is not a member is
++    /// kept and has no dependencies.
++    fn closure(&self, direct: &BTreeSet<String>) -> BTreeSet<String> {
++        crate::profile::bump(crate::profile::Counter::ShimClosure);
++        let mut needed = direct.clone();
++        let mut queue: Vec<&str> = direct.iter().map(String::as_str).collect();
++        while let Some(name) = queue.pop() {
++            let Some(dependencies) = self.dependencies.get(name) else {
++                continue;
++            };
++            for dependency in dependencies {
++                if needed.insert(dependency.clone()) {
++                    queue.push(dependency);
++                }
++            }
++        }
++        needed
++    }
++}
++
+ /// Every member statement in any shim source. Split out so the parser and closure are testable.
+ ///
+ /// The shim's rigid shape (its own documented contract, relied on by `minimal-shim.mjs`): one
+@@ -352,49 +433,11 @@ fn shim_members(source: &str) -> BTreeMap<String, String> {
+     members
+ }
+ 
++/// The closure of `direct` over any shim source, parsed here. The bundled shim's closure is
++/// [`helper_closure`], served from its parsed-once index.
++#[cfg(test)]
+ fn shim_helper_closure(source: &str, direct: &BTreeSet<String>) -> BTreeSet<String> {
+-    crate::profile::bump(crate::profile::Counter::ShimClosure);
+-    let members = shim_members(source);
+-    // Match minimal-shim's source groups: lexical helper declarations travel
+-    // with the runtime member preceding them, even when another member calls them.
+-    let mut bindings = BTreeMap::new();
+-    for (name, source) in &members {
+-        for line in source.lines() {
+-            let Some(declaration) = ["const ", "let ", "var ", "function "]
+-                .into_iter()
+-                .find_map(|prefix| line.strip_prefix(prefix))
+-            else {
+-                continue;
+-            };
+-            let binding = declaration
+-                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+-                .next()
+-                .and_then(ident);
+-            if let Some(binding) = binding {
+-                bindings.insert(binding.to_owned(), name.clone());
+-            }
+-        }
+-    }
+-    let mut needed = direct.clone();
+-    let mut queue: Vec<String> = direct.iter().cloned().collect();
+-    while let Some(name) = queue.pop() {
+-        let Some(statement) = members.get(&name) else {
+-            continue;
+-        };
+-        let mut dependencies = referenced_members(statement);
+-        for token in statement.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+-        {
+-            if let Some(owner) = bindings.get(token) {
+-                dependencies.insert(owner.clone());
+-            }
+-        }
+-        for dependency in dependencies {
+-            if needed.insert(dependency.clone()) {
+-                queue.push(dependency);
+-            }
+-        }
+-    }
+-    needed
++    ShimIndex::of(source).closure(direct)
+ }
+ 
+ /// Every runtime member reference in one statement. The boundary check mirrors
+@@ -679,4 +722,114 @@ globalThis.__rt.root = () => globalThis.__rt.middle();
+             BTreeSet::from(["yes".to_owned()])
+         );
+     }
++
++    /// The closure as it was computed before the shim was indexed: a fresh parse, and the
++    /// dependencies of each member re-derived as the walk reaches it.
++    fn uncached_closure(source: &str, direct: &BTreeSet<String>) -> BTreeSet<String> {
++        let members = shim_members(source);
++        let mut bindings = BTreeMap::new();
++        for (name, source) in &members {
++            for line in source.lines() {
++                let Some(declaration) = ["const ", "let ", "var ", "function "]
++                    .into_iter()
++                    .find_map(|prefix| line.strip_prefix(prefix))
++                else {
++                    continue;
++                };
++                let binding = declaration
++                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
++                    .next()
++                    .and_then(ident);
++                if let Some(binding) = binding {
++                    bindings.insert(binding.to_owned(), name.clone());
++                }
++            }
++        }
++        let mut needed = direct.clone();
++        let mut queue: Vec<String> = direct.iter().cloned().collect();
++        while let Some(name) = queue.pop() {
++            let Some(statement) = members.get(&name) else {
++                continue;
++            };
++            let mut dependencies = referenced_members(statement);
++            for token in
++                statement.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
++            {
++                if let Some(owner) = bindings.get(token) {
++                    dependencies.insert(owner.clone());
++                }
++            }
++            for dependency in dependencies {
++                if needed.insert(dependency.clone()) {
++                    queue.push(dependency);
++                }
++            }
++        }
++        needed
++    }
++
++    /// `helper_program` before the shim was indexed.
++    fn uncached_helper_program(direct: &BTreeSet<String>) -> String {
++        let members = shim_members(SHIM);
++        let closure = uncached_closure(SHIM, direct);
++        let mut program = String::new();
++        for member in closure {
++            if let Some(source) = members.get(&member) {
++                program.push_str(source);
++                program.push('\n');
++            }
++        }
++        program
++    }
++
++    /// The parsed-once shim answers exactly what a fresh parse per call did: for no member,
++    /// every member alone, members `minimal-shim.mjs` would be handed by real programs, names
++    /// the shim does not define, and every member at once.
++    #[test]
++    fn the_indexed_shim_matches_a_fresh_parse() {
++        let members = shim_members(SHIM);
++        let declares = |line: &str| {
++            ["const ", "let ", "function "]
++                .iter()
++                .any(|p| line.starts_with(p))
++        };
++        assert!(
++            members
++                .values()
++                .flat_map(|statement| statement.lines())
++                .any(declares),
++            "the shim declares lexical helpers, so the binding rule is exercised"
++        );
++        let set = |names: &[&str]| -> BTreeSet<String> {
++            names.iter().map(|name| (*name).to_owned()).collect()
++        };
++        let mut directs = vec![
++            BTreeSet::new(),
++            set(&["js_log_i32", "js_abort"]),
++            set(&["str_bytes", "bytes_str", "native_f64_to_string"]),
++            set(&["not_a_member", "bytes_str"]),
++            set(&["not_a_member"]),
++            members.keys().cloned().collect(),
++        ];
++        directs.extend(members.keys().map(|name| set(&[name.as_str()])));
++        let mut reaches_further = false;
++        for direct in &directs {
++            let closure = helper_closure(direct);
++            assert_eq!(closure, uncached_closure(SHIM, direct), "{direct:?}");
++            assert_eq!(
++                helper_program(direct),
++                uncached_helper_program(direct),
++                "{direct:?}"
++            );
++            reaches_further |= closure.len() > direct.len();
++        }
++        assert!(reaches_further, "some member depends on another");
++        assert_eq!(
++            helper_bytes(),
++            members
++                .iter()
++                .map(|(name, source)| (name.clone(), source.len() as u64))
++                .collect::<BTreeMap<_, _>>()
++        );
++    }
+ }
+diff --git a/jsc-link/src/plan/physical_cost.rs b/jsc-link/src/plan/physical_cost.rs
+index 4d9a96d6f588100abbb77cfc1bbb28044068420e..eb76365ffe86e8ba3616864e591b4a6c6928c329 100644
+--- a/jsc-link/src/plan/physical_cost.rs
++++ b/jsc-link/src/plan/physical_cost.rs
+@@ -144,29 +144,16 @@ pub fn evaluate_groups(
+ ) -> (AbiPlan, Evaluation) {
+     let profile = release_profile(opts);
+     let mut cache = Cache::default();
++    // `table`, `funcs`, the profile and the options are borrowed unchanged for the whole
++    // evaluation: every measurement below differs from the others only in its ABI plan.
++    let program = program_key(table, funcs, profile, opts);
+     let baseline = AbiPlan::default();
+-    let before = measure_cached(
+-        &mut cache,
+-        table,
+-        funcs,
+-        &baseline,
+-        profile,
+-        opts,
+-        &mut measure,
+-    );
+-    let full_after = measure_cached(
+-        &mut cache,
+-        table,
+-        funcs,
+-        candidate,
+-        profile,
+-        opts,
+-        &mut measure,
+-    );
++    let before = measure_cached(&mut cache, program, &baseline, &mut measure);
++    let full_after = measure_cached(&mut cache, program, candidate, &mut measure);
+     let mut trials = Vec::new();
+     for items in candidate.economic_groups() {
+         let plan = candidate.subset(&items);
+-        let after = measure_cached(&mut cache, table, funcs, &plan, profile, opts, &mut measure);
++        let after = measure_cached(&mut cache, program, &plan, &mut measure);
+         let (accepted, reason, hotness_source, budget_consumed_bps) =
+             decide(profile, before, after);
+         trials.push(Trial {
+@@ -197,17 +184,8 @@ pub fn evaluate_groups(
+         .flat_map(|trial| trial.items.iter().copied())
+         .collect();
+     let combined = candidate.subset(&individually_selected);
+-    let combined_metrics = (!individually_selected.is_empty()).then(|| {
+-        measure_cached(
+-            &mut cache,
+-            table,
+-            funcs,
+-            &combined,
+-            profile,
+-            opts,
+-            &mut measure,
+-        )
+-    });
++    let combined_metrics = (!individually_selected.is_empty())
++        .then(|| measure_cached(&mut cache, program, &combined, &mut measure));
+     let combined_accepted = combined_metrics
+         .flatten()
+         .is_some_and(|after| decide(profile, before, Some(after)).0);
+@@ -237,15 +215,7 @@ pub fn evaluate_groups(
+                 let mut proposed = selected.clone();
+                 proposed.extend(&trial.items);
+                 let proposed_plan = candidate.subset(&proposed);
+-                let next = measure_cached(
+-                    &mut cache,
+-                    table,
+-                    funcs,
+-                    &proposed_plan,
+-                    profile,
+-                    opts,
+-                    &mut measure,
+-                );
++                let next = measure_cached(&mut cache, program, &proposed_plan, &mut measure);
+                 let (accepted, reason, hotness_source, budget_consumed_bps) =
+                     decide_incremental(profile, before, current, next);
+                 (accepted, reason, hotness_source, budget_consumed_bps, next)
+@@ -280,15 +250,7 @@ pub fn evaluate_groups(
+     // Replay the selected key through the cache. Besides guarding key completeness in every real
+     // link, this makes the receipt prove that a hit returns the decision's exact final metrics.
+     let replay_plan = candidate.subset(&selected);
+-    let replay = measure_cached(
+-        &mut cache,
+-        table,
+-        funcs,
+-        &replay_plan,
+-        profile,
+-        opts,
+-        &mut measure,
+-    );
++    let replay = measure_cached(&mut cache, program, &replay_plan, &mut measure);
+     debug_assert_eq!(replay, current);
+     current = replay;
+     let selected_plan = candidate.with_economic_selection(&selected, &reasons);
+@@ -355,14 +317,11 @@ fn record_trial(
+ 
+ fn measure_cached(
+     cache: &mut Cache,
+-    table: &BTreeMap<JsName, LinkItem>,
+-    funcs: &BTreeMap<JsName, Result<Func, crate::jir::decline::Decline>>,
++    program: Hash128,
+     plan: &AbiPlan,
+-    profile: Profile,
+-    opts: &Opts,
+     measure: &mut impl FnMut(&AbiPlan) -> Option<ProgramMetrics>,
+ ) -> Option<ProgramMetrics> {
+-    let key = cache_key(table, funcs, plan, profile, opts);
++    let key = cache_key(program, plan);
+     cache.measure(key, || measure(plan))
+ }
+ 
+@@ -561,15 +520,16 @@ fn growth_bps(after: u64, before: u64) -> u64 {
+         .div_ceil(before)
+ }
+ 
+-fn cache_key(
++/// The digest of every key input that one [`evaluate_groups`] holds fixed: the release profile,
++/// the naming and minifier settings, every item, and every function body. Only the ABI plan
++/// varies between its measurements, so this is computed once and [`cache_key`] adds the plan.
++fn program_key(
+     table: &BTreeMap<JsName, LinkItem>,
+     funcs: &BTreeMap<JsName, Result<Func, crate::jir::decline::Decline>>,
+-    abi: &AbiPlan,
+     profile: Profile,
+     opts: &Opts,
+ ) -> Hash128 {
+-    crate::profile::bump(crate::profile::Counter::CacheKeyCalls);
+-    let _scope = crate::profile::scope("physical_cache.key");
++    let _scope = crate::profile::scope("physical_cache.program_key");
+     let mut bytes = Vec::new();
+     bytes.extend_from_slice(profile.as_str().as_bytes());
+     bytes.extend_from_slice(
+@@ -593,6 +553,18 @@ fn cache_key(
+         bytes.extend_from_slice(name.as_str().as_bytes());
+         bytes.extend_from_slice(format!("{func:?}").as_bytes());
+     }
++    crate::profile::add(crate::profile::Counter::CacheKeyBytes, bytes.len());
++    Hash128::of(&bytes)
++}
++
++/// The cache key of one measurement: the evaluation's fixed [`program_key`] and the ABI plan.
++///
++/// Within one evaluation `program` is constant, so two keys are equal exactly when the plans'
++/// cost keys are, as when the fixed inputs were spelled out in front of every plan.
++fn cache_key(program: Hash128, abi: &AbiPlan) -> Hash128 {
++    crate::profile::bump(crate::profile::Counter::CacheKeyCalls);
++    let _scope = crate::profile::scope("physical_cache.key");
++    let mut bytes = program.to_bytes().to_vec();
+     abi.extend_cost_key(&mut bytes);
+     crate::profile::add(crate::profile::Counter::CacheKeyBytes, bytes.len());
+     Hash128::of(&bytes)
+diff --git a/rcgjs-object/src/jir/interns.rs b/rcgjs-object/src/jir/interns.rs
+index 96a6f149a162eadf5d1a20a12084201f5ab7941e..3ce79447fb84afdecb26b61d4a8fb9907d59d91f 100644
+--- a/rcgjs-object/src/jir/interns.rs
++++ b/rcgjs-object/src/jir/interns.rs
+@@ -163,6 +163,21 @@ impl Interns {
+         self.strings.get(id.0 as usize).map(String::as_str)
+     }
+ 
++    /// Whether `value` is one of [`Self::strings`].
++    ///
++    /// A table built through [`Self::intern_str`] or read back through [`Self::rebuild_indices`]
++    /// indexes every string exactly once, so the index answers. A table whose `strings` were
++    /// filled by hand (tests push to the public field) is not indexed in full, and is searched.
++    pub fn contains_str(&self, value: &str) -> bool {
++        if self.string_index.len() == self.strings.len() {
++            self.string_index
++                .get(value)
++                .is_some_and(|id| self.str(*id) == Some(value))
++        } else {
++            self.strings.iter().any(|string| string == value)
++        }
++    }
++
+     pub fn bytes(&self, id: BytesId) -> Option<&[u8]> {
+         self.bytes.get(id.0 as usize).map(Vec::as_slice)
+     }
+@@ -179,3 +194,40 @@ impl Interns {
+         self.types.get(id)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::Interns;
++
++    #[test]
++    fn string_membership_holds_for_indexed_and_hand_filled_tables() {
++        let strings = ["$invoke0", "foo", "$caught"];
++        let mut interned = Interns::new();
++        for string in strings {
++            interned.intern_str(string);
++        }
++        let hand_filled = Interns {
++            strings: strings.map(str::to_owned).to_vec(),
++            ..Interns::default()
++        };
++        let mut decoded = hand_filled.clone();
++        decoded.rebuild_indices();
++        let mut duplicated = Interns {
++            strings: ["foo", "foo", "$caught"].map(str::to_owned).to_vec(),
++            ..Interns::default()
++        };
++        duplicated.rebuild_indices();
++        let mut appended = interned.clone();
++        appended.strings.push("$exception".to_owned());
++        for table in [&interned, &decoded, &hand_filled, &duplicated, &appended] {
++            for probe in ["$invoke0", "foo", "$caught", "$exception", "", "$invoke0$1"] {
++                assert_eq!(
++                    table.contains_str(probe),
++                    table.strings.iter().any(|string| string == probe),
++                    "{probe:?} in {:?}",
++                    table.strings
++                );
++            }
++        }
++    }
++}

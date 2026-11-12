@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "sourceHeadBefore": "1b582b84793842bd64698256d2811531f638e99b",
+  "preservedWorktrees": 43,
+  "uncommittedSourceSnapshots": 9,
+  "everySourceTreeRestored": true,
+  "everyPatchTreeChecked": true,
+  "publicHistoricalFiles": 2082,
+  "rawEvidence": {
+    "fileRecords": 812662,
+    "uniqueObjects": 146007,
+    "sourceBytes": 28341757940,
+    "allUniqueHashesVerified": true,
+    "databaseBytes": 2501865472,
+    "databaseSha256": "b3bd601bcbfc573dfb61b52e6a415db47bcbd42adcbf5d67f0d546bc9605df48",
+    "private": true
+  },
+  "gitBundle": {
+    "file": "all-refs-preserved.bundle",
+    "bytes": 5184855,
+    "sha256": "c3be7d5f75fe606f29f4169e3f62577b90f07fd13b0787adc569721f83ba7688",
+    "restoredSnapshots": 43,
+    "verifiedAgainstOriginalWorkingTrees": 42,
+    "includesAllRefsAndStash": true
+  },
+  "projectSessions": {
+    "files": 224,
+    "archiveBytes": 104012281,
+    "sha256": "3a2f9b743a848bc4f39f7ecd9c475eadc79c2dde2432adf42786afaae12087e0",
+    "private": true
+  },
+  "compilerBranchesPromoted": [],
+  "noWorktreeDeleted": true,
+  "noPush": true,
+  "offDeviceBackup": false,
+  "limits": [
+    "Preserved source/evidence is not a verifier pass.",
+    "Caches, native executables, object files and sysroot products are excluded and must be rebuilt.",
+    "The SQLite store and project transcripts contain private material; keep them out of public Git.",
+    "Same-device duplicate is not disaster recovery."
+  ]
+}

@@ -1,0 +1,47 @@
+diff --git a/backend/src/ptr.rs b/backend/src/ptr.rs
+index 05be034..56d4b9c 100644
+--- a/backend/src/ptr.rs
++++ b/backend/src/ptr.rs
+@@ -1012,12 +1012,13 @@ fn sequenced(setup: Option<Expr>, value: Expr) -> Expr {
+ /// Unsized struct pointers convert their data half and preserve metadata. Other pointees
+ /// without a slot form, including slices, `str` and zero-sized types, remain unchanged.
+ ///
+-/// The box is the *last* resort. When the reference is a read out of a container —
+-/// `points[i]`, `pair.first` — the slot naming that place is `{ buf: points, off: i }`, and
+-/// building it instead keeps the pointer inside the buffer its element lives in. That is what
+-/// makes `ptr::copy` of a run of aggregates work at all: a boxed element is a buffer of one, and
+-/// offsetting away from it names nothing. Two raw pointers taken this way from one element are
+-/// still equal, because `__rt.ptr_eq` compares the buffer and the key rather than the record.
++/// The reference is a *value*, so how its expression is spelled says nothing about where the
++/// aggregate lives. `refs[i]`, `a.r` and a boxed cell's `c[0]` are references *loaded* from a
++/// place, and the slot of that place — `{ buf: refs, off: i }` — is the address of the storage
++/// holding the reference (a `*const &P`), not of the `P`. A raw pointer to an element or a field
++/// that holds an aggregate by value is built from the place itself (`place.rs::slot_of`), never
++/// here. The one spelling that does name the pointee's place is `p.buf[p.off]`, the pointee of a
++/// slot `p`, and it keeps that slot.
+ pub(crate) fn ref_to_raw<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, reference: Expr) -> Expr {
+     if crate::value::unsized_tail(fx.tcx, pointee).is_some() {
+         return jsast::rt_call("tail_raw", vec![reference]);
+@@ -1029,12 +1030,20 @@ pub(crate) fn ref_to_raw<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, reference
+         return reference;
+     }
+     match reference {
+-        Expr::Index(base, key) => slot(*base, *key),
+-        Expr::Member(base, name) => slot(*base, jsast::string(name)),
++        Expr::Index(base, key) if is_slot_element(&base, &key) => slot(*base, *key),
+         reference => jsast::rt_call("box", vec![reference]),
+     }
+ }
+ 
++/// Whether `base[key]` is `p.buf[p.off]`, the place a slot `p` names ([`slot_element`]).
++fn is_slot_element(base: &Expr, key: &Expr) -> bool {
++    matches!(
++        (base, key),
++        (Expr::Member(buffer, buf), Expr::Member(offset, off))
++            if buf == BUF && off == OFF && buffer == offset
++    )
++}
++
+ /// `&*raw`: the reference a raw pointer to `pointee` becomes.
+ ///
+ /// The inverse of [`ref_to_raw`]. A reference to an aggregate is the object the slot names,

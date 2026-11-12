@@ -1,0 +1,3144 @@
+diff --git a/CONTRACT.md b/CONTRACT.md
+index d08f72e75f8c34cf7e8594eeedac6dfd4fa2640e..8051810bf8acc36c068d87b55acf9a4d1572418c 100644
+--- a/CONTRACT.md
++++ b/CONTRACT.md
+@@ -860,10 +860,31 @@ its digits in held objects where bytes belonged.
+ 
+ ### Addresses
+ 
+-`p as usize` is `__rt.addr(p, size_of::<pointee>())`. Every buffer is given a synthetic base of
+-`4096 * n` the first time it is asked about, kept in a `WeakMap` so that it never moves, and the
+-address of an element is `base + off * size`; a scaled slot's offset is already in bytes and is
+-added as it is, and a number is an address already.
++`p as usize` is `__rt.addr(p, size_of::<pointee>())`. Every buffer is given a synthetic base the
++first time it is asked about, kept in a `WeakMap` so that it never moves, and the address of an
++element is `base + off * size`; a scaled slot's offset is already in bytes and is added as it is,
++and a number is an address already.
++
++A `usize` is 32 bits, so the space of bases is finite and is managed like a buddy allocator. A
++buffer of `n` bytes takes a granule of the smallest power of two that holds it, at least 16 and at
++most 4096, and its base is a multiple of that granule — aligned for every type the buffer can
++hold, since a type's alignment divides its size. A heap block's size is its `Layout` size; another
++buffer's is its length times the element size of the first `addr` asked of it. An alignment the
++size does not imply — a hand-built `Layout` whose alignment exceeds its size, or an over-aligned
++element first addressed through a byte pointer — is honoured only up to 16. Granules come from a
++per-size free list first, then from a bump pointer starting at 4096 (whose alignment gaps are
++split into smaller free granules). `dealloc` gives a heap
++block's granule back — the freed buffer keeps its entry, so a dangling pointer still answers the
++address it had, and a later allocation may reuse it, as a native allocator would — and a
++`FinalizationRegistry` gives back the granule of any other buffer once the engine has collected
++it. A `realloc` that grows a block past its granule (below 4096) gives the granule back too, and
++the block takes a base at its new size when next asked: a reallocation may move in Rust, and
++otherwise the grown block's addresses would run into its neighbours'. A base is therefore unique
++among live buffers and stable for a buffer's lifetime. The space runs out only when the bump
++pointer reaches 2^32 with no free granule of the size asked — about 2^32 bytes of granules live at
++once, a million live 4 KiB buffers — and that is a refusal that says so. (Bases used to be `4096 * n`
++and were never reused: the 2^20th buffer was given the address 2^32, which `>>> 0` made null, and
++`NonNull::new` reported a good allocation as failed.)
+ 
+ The size does not always survive to the call. `<*const T>::addr` is written
+ `transmute(self.cast::<()>())`, so the pointee is `()` by the time the address is taken while the
+@@ -876,7 +897,9 @@ The scheme is chosen for four guarantees, not for convenience:
+ 
+ - `is_null()` is false for every real pointer and true only for `null()`, because no base is zero;
+ - `NonNull::dangling()` is an alignment, always below 4096, so it never collides with a base;
+-- an address is a multiple of the element size, so alignment predicates answer correctly;
++- an address is a multiple of the element alignment (a type's alignment divides its size, and a
++  buffer's base is aligned to its size rounded up to a power of two), so alignment predicates answer
++  correctly;
+ - `fmt::Arguments::as_str` tests `bits & 1` on an 8 byte element, so the answer is deterministic.
+ 
+ Addresses are **not** ordered across buffers in any way a program may rely on, and an address never
+@@ -929,15 +952,57 @@ not become initialized values.
+ `&str` stays a JS string, and the byte view is produced on demand:
+ 
+ - `as_bytes` is `__rt.str_bytes(s)`, which encodes the string to UTF-8 and returns
+-  `{ buf, off: 0, len }` over a **plain array**, the same kind of buffer every other `[u8]` is.
+-  `as_ptr` is the same call reduced to the slot `{ buf: __rt.str_bytes(s).buf, off: 0 }`, because a
+-  thin pointer carries no length. A four entry memo ring keyed by the string returns the same record
+-  for a repeated call, so pointer identity holds in practice; identity across independent calls is
+-  **not** guaranteed, and nothing may depend on it.
++  `{ buf, off: 0, len }` over a **plain array**, the same kind of buffer every other `[u8]` is —
++  exactly the bytes `TextEncoder` writes, so a lone surrogate is U+FFFD. `as_ptr` is the same call
++  reduced to the slot `{ buf: __rt.str_bytes(s).buf, off: 0 }`, because a thin pointer carries no
++  length.
++- The records are **memoized for the operation**, keyed by the string. `&s[a..b]` is
++  `s.as_bytes()` plus a decode, so a parser walking a document asks for the whole document's bytes
++  once per token; the memo makes that one encode per operation instead of one per token (linear
++  rather than quadratic). Its bound: the memo is emptied when the JavaScript stack unwinds (the
++  first insertion queues one microtask that clears it, so no entry outlives the synchronous run of
++  Rust code that made it — an export, a callback, one poll of a future); it holds at most 4 MiB of
++  encoded bytes, and the insertion that would exceed that empties it first; a string of more than
++  1 MiB is held apart from that budget, at most the two most recent such strings, so a large
++  document is not evicted by its own slices. Without `queueMicrotask` only the byte bound applies.
++  Strings are immutable, so an entry is never stale — a mutated `String` derefs to a different
++  JavaScript string — and an owned `String` built from a host string copies, never aliasing a
++  memoized buffer. A repeated call within the operation returns the same record, so pointer
++  identity holds in practice; identity across independent calls is **not** guaranteed, and nothing
++  may depend on it.
+ - `from_utf8_unchecked`, and a raw pointer whose pointee is `str` (`str::from_raw_parts`), are
+-  `__rt.bytes_str(buf, off, len)`.
+-- The metadata of a `&str` is `__rt.str_len(s)`, the UTF-8 byte length, with an ASCII fast path.
+-- Writing through a `&mut str` stays a zombie.
++  `__rt.bytes_str(buf, off, len)`. An `i8` element is read as its byte.
++- The metadata of a `&str` is `__rt.str_len(s)`, the UTF-8 byte length, computed from the UTF-16
++  code units without encoding (a surrogate pair is four bytes, a lone surrogate the three of
++  U+FFFD); a string of more than 64 code units is answered from the memo when its bytes are
++  already there. `str::len` lowers to the same call: `__rt.str_bytes(s).len` folds to
++  `__rt.str_len(s)`.
++- A `String` the optimizer keeps native (a host string, or the builder `{ text, cap, len }`, see
++  OPTIMIZER.md) holds exactly the text the baseline `Vec<u8>` `String` would decode, because
++  every piece that joins it is well formed on its own. A piece that may come from a host — a
++  `push_str`/`write_str` argument, each `&str` argument of a `write!`/`format!` site, a host
++  string converted into a builder — first goes through `__rt.native_str_wf`, which turns each
++  lone surrogate (only a host can hand Rust one) into U+FFFD, the three bytes `str_bytes` stores
++  for it. Every other piece is well formed by construction: a pushed `char`, a format template's
++  literal text, the ASCII text of an integer, `bool` or `f64`, a `to_string` result, a baseline
++  string converted into a native carrier, and a native `String` argument's text, itself only
++  ever built from such pieces. (A `char` that a host function returns is not checked to be a
++  scalar value; a surrogate forged that way is outside this guarantee, in the baseline
++  representation as well.) Two adjacent pieces therefore never pair into a scalar the baseline
++  never held — two appended halves of a surrogate pair stay two U+FFFD, in one site or across
++  appends — and the host is handed the same string either way.
++- The builder never asks `str_len` about the text it has accumulated: `len` is that text's exact
++  UTF-8 byte length, kept by every operation (an append adds only the appended piece's length),
++  so `String::len` is a field read and building a string is linear in the bytes appended. `cap`
++  is the Rust-visible capacity in the same bytes, never below `len`: it starts at the requested
++  capacity (zero, or the exact length for a builder made from text) and grows exact-fit, to the
++  new length, when an append exceeds it — not by `RawVec`'s amortized doubling.
++- Writing through a `&mut str` stays a zombie: the `&mut str` a `String` derefs to is a decoded
++  JavaScript string, so a write through `as_bytes_mut` (`make_ascii_uppercase`,
++  `to_ascii_lowercase`) does not reach the `String`'s storage and is lost. It is contained: a cast
++  from `str` to a **mutable** byte pointer is `__rt.str_bytes_mut(s)`, a fresh record that is never
++  memoized, so the lost write never surfaces in the view another `as_bytes` of an equal string
++  reads.
+ 
+ `ptr::cast_str` owns the whole matrix — `str` to `[u8]`, `str` to `u8`, a slice of one byte elements
+ to `str`, `str` to `str`, and a zombie for anything else with a `str` on one side — and every
+@@ -986,7 +1051,8 @@ __rt.unscale_uninit(p, size, mk)       // one-time retype of uninitialized array
+ __rt.chunk_slice(p, n, w)    // a slice re-read at chunk granularity, throws if it is not one
+ __rt.unwindow(p)             // a pointer to `[E; N]`, as a pointer to its first element
+ __rt.thin(p, size)           // `from_raw_parts` with `()` metadata: the data pointer, un-erased
+-__rt.str_bytes(s)            // UTF-8 bytes of a JS string as `{ buf, off, len }`
++__rt.str_bytes(s)            // UTF-8 bytes of a JS string as `{ buf, off, len }`, memoized
++__rt.str_bytes_mut(s)        // the same bytes in a fresh, unmemoized record (`as_bytes_mut`)
+ __rt.str_len(s)              // UTF-8 byte length
+ __rt.bytes_str(buf, off, len) // UTF-8 bytes back to a JS string, `""` at length zero
+ ```
+diff --git a/OPTIMIZER.md b/OPTIMIZER.md
+index 17d90dc092ce89d36eab52741e213dcbc45802cf..c2f87df5d0c931ed41d59c8ac56db0711d4d577f 100644
+--- a/OPTIMIZER.md
++++ b/OPTIMIZER.md
+@@ -203,7 +203,7 @@ The interprocedural projection pass may replace a copy of a freshly returned fie
+ 
+ `topcoat-js` provides opaque `JsValue`, `JsString`, and `JsArray<JsValue>` boundary values. `JsString` deliberately uses JavaScript UTF-16 indexing and is not a Rust `String`; `JsArray` is not a Rust `Vec`. `JsValue::erase` and `read` accept only sealed, copyable host representations and validate the JavaScript type and Rust value range before reading. Owning Rust values cannot bypass their representation or `Drop` contract through this API.
+ 
+-A `js_bindings!` parameter is a sink only when the declared type provably carries the same JavaScript value in the baseline and native lanes: the scalars, and `&str` behind shared references. Sink arguments do not mark their value-flow component `HostBoundary`, so a native immutable `String` borrowed as `&str` can commit and is passed as the host string; a mutable `{text, cap}` passes `text`. Everything else stays a pin: mutable references (the host can write back through the carrier), owned `String` and `Vec` values (their baseline host value is the struct carrier), slices and `JsArray` (a native `Vec` backing array is capacity-length, not len-length), opaque `JsValue`, view-ABI, `repr(C)`, and raw provenance. Host-call results unpin only for the same sink shapes. The binding item itself remains host. Mixed callers keep the original baseline item; prepared native callers may target one private `$n1` version. A transaction still commits only if every member is proven and the complete reachable program shrinks.
++A `js_bindings!` parameter is a sink only when the declared type provably carries the same JavaScript value in the baseline and native lanes: the scalars, and `&str` behind shared references. Sink arguments do not mark their value-flow component `HostBoundary`, so a native immutable `String` borrowed as `&str` can commit and is passed as the host string; a mutable `{text, cap, len}` passes `text`. Everything else stays a pin: mutable references (the host can write back through the carrier), owned `String` and `Vec` values (their baseline host value is the struct carrier), slices and `JsArray` (a native `Vec` backing array is capacity-length, not len-length), opaque `JsValue`, view-ABI, `repr(C)`, and raw provenance. Host-call results unpin only for the same sink shapes. The binding item itself remains host. Mixed callers keep the original baseline item; prepared native callers may target one private `$n1` version. A transaction still commits only if every member is proven and the complete reachable program shrinks.
+ 
+ Rust closures can become host callbacks at arities zero, one, and two. Their capture environment transfers to the JavaScript realm, so Rust destructors are not a callback-release mechanism; a resource that needs deterministic release needs an explicit host cleanup operation. Synchronous host throws can be caught as `Result<JsValue, JsValue>` through `try_host` or a fallible binding.
+ 
+@@ -255,7 +255,7 @@ When complete executable late IR is unavailable, a separate fail-soft MIR scan c
+ 
+ Eligible `Vec<T>` values use `{buf, len, cap}` with initialized elements in `[0, len)`. Native slice views share the same buffer. The standard-operation lane covers construction with and without capacity, length and capacity reads, push, clear, slice views, emptiness, indexing, removal, owned-`Vec` extension, drop, and slice swap. It preserves explicit capacity, clears released slots, checks bounds and capacity overflow before mutation, moves owned elements out of an extended source, and calls exact monomorphic element drop glue in order when required.
+ 
+-An eligible immutable `String` is a host string. A mutable one uses `{text, cap}`, with capacity measured in UTF-8 bytes. The current lane covers construction with and without capacity, UTF-8 byte length, capacity, `push`, `push_str`, `clear`, `as_str`, `fmt::Write::write_str`, `fmt::Write::write_char`, exact default `f64::to_string`, exact `ToString::to_string` for every fixed-width integer, `bool`, and `char`, default-Display `format!("{x}")` / `write_fmt` for those same types plus `&str`, `String`, and shortest `f64`, and drop. The compiler owns the same `String::new` / `with_capacity` constructor those sinks need, so a `format!`-only program does not have to keep `with_capacity` reachable. Exact compiler-marked `write_fmt` adapters and their String vtable keep baseline `fmt::Arguments`, `Option`, and `Result` carriers while accounting every native slot. The compiler-owned `as_str` adapter returns native text when it sees the exact disjoint native shape and otherwise calls a private copy of its baseline body. The compiler-owned String drop adapter returns for the exact mutable native shape and otherwise calls its exact baseline `Vec<u8>` drop target, which is pinned to the baseline body. Runtime helpers provide exact UTF-8 byte length, scalar append, character-boundary checks, UTF-8 byte to UTF-16 index conversion, and Rust-compatible default `f64` text.
++An eligible immutable `String` is a host string. A mutable one uses `{text, cap, len}`: `cap` is Rust's capacity and `len` the exact UTF-8 byte length of `text`, both in bytes. No operation rescans the text to learn its length: `push`/`write_char` advance `len` by the scalar's width, `push_str`/`write_str`/`write_fmt` by the appended text's own measured length, `clear` and drop reset it, and every constructor measures its text once or knows it (empty, ASCII decimal, the baseline `len` leaf). `len()` is therefore a field read and building a string costs the bytes appended rather than the bytes already there (it was quadratic while every append measured the whole text). `cap` grows only to the new length when an append exceeds it, so it never falls below `len`. The text of either native string is always well formed and equal to what the baseline `Vec<u8>` would decode, because every piece that joins it is well formed on its own: each piece a host may supply — a `push_str`/`write_str` argument, each `&str` argument of a `format!`/`write!` site (taken where it is displayed, not after concatenation), a host string converted into a builder — passes through `__rt.native_str_wf`, which turns a lone surrogate (only a host can supply one) into the U+FFFD the baseline's bytes hold, and every other piece (a `char`, template literal text, integer/`bool`/`f64` text, a native `String` argument's text) is well formed by construction. Two adjacent pieces, in one site or across appends, therefore never pair into a scalar the baseline never saw, and the host is handed the same text from either representation. `RCGJS_SB_VERIFY=1` at link time routes every length read and every mutation through `__rt._sb_check`, which re-measures the text and aborts on drift. The current lane covers construction with and without capacity, UTF-8 byte length, capacity, `push`, `push_str`, `clear`, `as_str`, `fmt::Write::write_str`, `fmt::Write::write_char`, exact default `f64::to_string`, exact `ToString::to_string` for every fixed-width integer, `bool`, and `char`, default-Display `format!("{x}")` / `write_fmt` for those same types plus `&str`, `String`, and shortest `f64`, and drop. The compiler owns the same `String::new` / `with_capacity` constructor those sinks need, so a `format!`-only program does not have to keep `with_capacity` reachable. Exact compiler-marked `write_fmt` adapters and their String vtable keep baseline `fmt::Arguments`, `Option`, and `Result` carriers while accounting every native slot. The compiler-owned `as_str` adapter returns native text when it sees the exact disjoint native shape and otherwise calls a private copy of its baseline body. The compiler-owned String drop adapter returns for the exact mutable native shape and otherwise calls its exact baseline `Vec<u8>` drop target, which is pinned to the baseline body. Runtime helpers provide exact UTF-8 byte length, scalar append, character-boundary checks, UTF-8 byte to UTF-16 index conversion, and Rust-compatible default `f64` text.
+ 
+ Zero-sized or unsized vector elements, custom or unknown allocators, unsupported pointer widths, address or provenance observation, unsupported operations, indirect or foreign calls, user-defined destructors, missing exact drop glue, and pinned values keep the connected region on baseline. Capacity overflow is checked for the supported 32-bit target before allocation or mutation; the JavaScript target does not simulate host out-of-memory failure. Native regions also retain printed JavaScript when source maps are requested because the executable lowerers do not yet reproduce source-map entries.
+ 
+@@ -283,7 +283,7 @@ Executable native regions are implemented, but several broader opportunities rem
+ | Wider native heap API | The listed `Vec`, `String`, slice, and structural-drop paths can emit. Every unsupported operation or connected caller keeps its complete region on baseline. | Differential semantics for each added operation, including capacity, panic, alias, move, and drop behavior. |
+ | Parameterized duplicate merge | Only bodies that are the same code merge. Bodies that agree except in which item they name keep one copy each. | A win worth the indirection. On the FingerprintJS program after the exact merge, 43 such groups covering 216 items are left, and passing the differing names as arguments would save 7,213 raw bytes at best, against a wrapper on every call into a group. |
+ 
+-The formatting analysis names the consumer of every eligible `Arguments` value, so `native-default-display-builder-format-bbN` and `native-default-display-builder-write-fmt-bbN` separate the two owning sinks. Proven default-Display templates now emit: static pieces plus already-lowered argument texts are concatenated into the same native `String` layout `String::new` / `with_capacity` already lower (a host string, or `{text, cap}`). The compiler owns that constructor, so a `format!`-only program does not need a reachable `String::with_capacity` item. User `Display`, Debug, and width/fill/precision beyond primitive `to_string` stay on baseline `core::fmt`, including `f32` and any `f64` site that is not default-shortest.
++The formatting analysis names the consumer of every eligible `Arguments` value, so `native-default-display-builder-format-bbN` and `native-default-display-builder-write-fmt-bbN` separate the two owning sinks. Proven default-Display templates now emit: static pieces plus already-lowered argument texts are concatenated into the same native `String` layout `String::new` / `with_capacity` already lower (a host string, or `{text, cap, len}`). The compiler owns that constructor, so a `format!`-only program does not need a reachable `String::with_capacity` item. User `Display`, Debug, and width/fill/precision beyond primitive `to_string` stay on baseline `core::fmt`, including `f32` and any `f64` site that is not default-shortest.
+ 
+ The kernel inlines a format site only on exact identity, never on shape. The consumer must be the linked `alloc::fmt::format` item or the exact `String::write_fmt` operation, and the elided constructors must be the linked `Arguments::new` / `Argument::new_display` items — the identities travel from the callee bodies' standard semantics, so a user function that takes one `fmt::Arguments` argument is never rewritten. The pipeline elides only the constructor apparatus: a producer call feeding a template (`value.to_string()`) keeps its emission, and a `String` display argument needs a planned native representation, not a runtime type test. A format-machinery call the pipeline cannot prove declines the whole item rather than emitting generically, because a staged native constructor and a baseline consumer disagree on the `Arguments` encoding. For the same reason every vtable-referenced item keeps its baseline representation: the dispatcher passes carriers no collected body shows. `examples/core-tests/57_native_format_sinks` pins all of these shapes differentially across the three modes.
+ 
+diff --git a/backend/src/place.rs b/backend/src/place.rs
+index f97c6ea22309685e7af342e36cc609d4b2472e77..7b26f39e7143ddfb4cd1641337997f04470a2dad 100644
+--- a/backend/src/place.rs
++++ b/backend/src/place.rs
+@@ -678,7 +678,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
+             return self.zombie(format!("`{pointer_ty}` has no pointer metadata"));
+         };
+         match pointee.kind() {
+-            ty::Slice(_) => ptr::slot_len(value),
++            ty::Slice(_) => ptr::slice_len(value),
+             ty::Dynamic(..) => jsast::member(value, ptr::META),
+             // A `&str` is a JavaScript string, whose metadata is the length of the bytes it would
+             // encode to rather than a field of a record.
+diff --git a/backend/src/ptr.rs b/backend/src/ptr.rs
+index bef41b911279c7175ce6cd6905f71794c6c93f10..c20bd2bcc64d28e99afa32e306a1df7775a09f62 100644
+--- a/backend/src/ptr.rs
++++ b/backend/src/ptr.rs
+@@ -1176,6 +1176,13 @@ pub(crate) fn str_to_byte_ptr(string: Expr) -> Expr {
+     slot(slot_buf(str_to_bytes(string)), jsast::num(0))
+ }
+ 
++/// `s.as_bytes_mut()`: a fresh byte view no other `as_bytes` shares, so a write through it — lost,
++/// since a `&mut str` has no mutable JavaScript form — cannot surface in the memoized view of an
++/// equal string.
++pub(crate) fn str_to_bytes_mut(string: Expr) -> Expr {
++    jsast::rt_call("str_bytes_mut", vec![string])
++}
++
+ /// `str::from_utf8_unchecked(v)`: the JavaScript string `v`'s bytes spell.
+ ///
+ /// `bytes` is a fat slice of one byte elements, so the three halves of it are what the decoder
+@@ -1202,6 +1209,32 @@ pub(crate) fn str_len(string: Expr) -> Expr {
+     jsast::rt_call("str_len", vec![string])
+ }
+ 
++/// The length of a fat slice: `slice.len`, except over a `&str`'s byte view, where
++/// `__rt.str_bytes(s).len` is `__rt.str_len(s)`. `str::len` is `self.as_bytes().len()`, and a
++/// length needs no bytes.
++pub(crate) fn slice_len(slice: Expr) -> Expr {
++    match str_bytes_operand(slice) {
++        Ok(string) => str_len(string),
++        Err(slice) => slot_len(slice),
++    }
++}
++
++/// The string a `__rt.str_bytes(s)` call encodes, or the expression back when it is anything
++/// else. `str_bytes` has no effect a program can observe, so a consumer that needs only what the
++/// string itself answers may drop the call.
++fn str_bytes_operand(expr: Expr) -> Result<Expr, Expr> {
++    match expr {
++        Expr::Call(callee, mut args)
++            if args.len() == 1
++                && matches!(&*callee, Expr::Member(object, name)
++                    if name == "str_bytes" && matches!(&**object, Expr::Ident(rt) if rt == "__rt")) =>
++        {
++            Ok(args.pop().expect("one argument"))
++        }
++        other => Err(other),
++    }
++}
++
+ /// The `str` arms of the pointer cast matrix, over the two **pointee** types.
+ ///
+ /// `None` when neither side is a `str`, which is the answer that lets [`cast_pointer`] go on to the
+@@ -1211,8 +1244,8 @@ pub(crate) fn str_len(string: Expr) -> Expr {
+ /// | from -> to | result |
+ /// |---|---|
+ /// | `str` -> `str` | identity, which covers `*const str` to `*mut str` |
+-/// | `str` -> `[u8]` | [`str_to_bytes`] |
+-/// | `str` -> `u8` | [`str_to_byte_ptr`] |
++/// | `str` -> `[u8]` | [`str_to_bytes`]; [`str_to_bytes_mut`] for a mutable target |
++/// | `str` -> `u8` | [`str_to_byte_ptr`]; over [`str_to_bytes_mut`] for a mutable target |
+ /// | `[E]` -> `str`, `E` one byte | [`bytes_to_str`] |
+ /// | anything else with a `str` on one side | a zombie naming both types |
+ ///
+@@ -1225,6 +1258,18 @@ pub(crate) fn cast_str<'tcx>(
+     from_pointee: Ty<'tcx>,
+     to_pointee: Ty<'tcx>,
+     value: Expr,
++) -> Option<Expr> {
++    cast_str_as(fx, from_pointee, to_pointee, value, false)
++}
++
++/// [`cast_str`], told whether the target pointer is mutable: a `str` cast to a mutable byte
++/// pointer gets its own byte view ([`str_to_bytes_mut`]).
++fn cast_str_as<'tcx>(
++    fx: &FnCx<'_, 'tcx>,
++    from_pointee: Ty<'tcx>,
++    to_pointee: Ty<'tcx>,
++    value: Expr,
++    mutable: bool,
+ ) -> Option<Expr> {
+     let from = peel_pattern(from_pointee);
+     let to = peel_pattern(to_pointee);
+@@ -1242,7 +1287,9 @@ pub(crate) fn cast_str<'tcx>(
+     Some(match (from_str, to_str) {
+         (true, true) => value,
+         (true, false) => match to.kind() {
++            ty::Slice(element) if is_u8(*element) && mutable => str_to_bytes_mut(value),
+             ty::Slice(element) if is_u8(*element) => str_to_bytes(value),
++            _ if is_u8(to) && mutable => slot(slot_buf(str_to_bytes_mut(value)), jsast::num(0)),
+             _ if is_u8(to) => str_to_byte_ptr(value),
+             _ => unsupported(),
+         },
+@@ -1270,7 +1317,8 @@ pub(crate) fn cast_str_ptr<'tcx>(
+ ) -> Option<Expr> {
+     let from_pointee = peel_pattern(from_ty).builtin_deref(true)?;
+     let to_pointee = peel_pattern(to_ty).builtin_deref(true)?;
+-    cast_str(fx, from_pointee, to_pointee, value)
++    let mutable = peel_pattern(to_ty).is_mutable_ptr();
++    cast_str_as(fx, from_pointee, to_pointee, value, mutable)
+ }
+ 
+ /// Whether `ty` is `u8`, the element of every byte view.
+diff --git a/backend/src/rvalue.rs b/backend/src/rvalue.rs
+index f84c0972186b1d6174d82f6c5d6f12e11f03ff97..ce63ef546af90d1114c8564c823d8a8b7b316127 100644
+--- a/backend/src/rvalue.rs
++++ b/backend/src/rvalue.rs
+@@ -579,6 +579,13 @@ impl<'tcx> FnCx<'_, 'tcx> {
+                 } else {
+                     value
+                 };
++                // A `str` row asks whether the target is mutable (`as_bytes_mut`), which only the
++                // pointer types say.
++                if let Some(converted) =
++                    crate::ptr::cast_str_ptr(self, from_ty, to_ty, value.clone())
++                {
++                    return converted;
++                }
+                 crate::ptr::cast_pointer(self, from_pointee, to_pointee, value)
+             }
+             // Exposing an address is the pointer to integer direction: a real pointer's synthetic
+diff --git a/bench/melange/compare.mjs b/bench/melange/compare.mjs
+index bb74f9309ca478e1059ac9436da819f5fb2a0d91..b213b2ba276fba8735692112569ba3ac90510116 100644
+--- a/bench/melange/compare.mjs
++++ b/bench/melange/compare.mjs
+@@ -177,42 +177,17 @@ function rustApi(module) {
+ 	};
+ }
+ 
+-// ------------------------------------------------- the synthetic address space
+-
+-// A LIMIT OF THE MODEL THIS BENCHMARK RAN INTO, and the workaround for it.
+-//
+-// Every allocation is null-checked by the emitted code as
+-// `__rt.addr(raw_ptr, 1) >>> 0 === 0`, and `__rt.addr` hands each new block the
+-// synthetic address `4096 * ++__rt._addrNext`. At block number 1048576 that
+-// product is exactly 2^32, `>>> 0` makes it zero, and a perfectly good
+-// allocation is reported to `alloc::handle_alloc_error` as a failure:
+-//
+-//     Error: rustc_codegen_mires: memory allocation of 17 bytes failed
+-//
+-// One iteration of this benchmark allocates about two thousand blocks (a
+-// `String` each for two thousand labels, plus the `Vec`s), so the ceiling is
+-// around five hundred iterations per process -- which a warmup pass plus three
+-// rounds across two Rust builds walks straight through. It is a real defect and
+-// it is written up in the report rather than papered over.
+-//
+-// The workaround is sound because of WHEN it is applied. Between batches
+-// nothing is live: every iteration builds its own store and drops it, so no
+-// pointer whose address has been handed out survives to be asked again. The
+-// addresses are a lazily assigned side table keyed by the buffer, so emptying it
+-// and restarting the counter cannot renumber anything that still exists.
+-function resetAddressSpace() {
+-	const rt = globalThis.__rt;
+-	if (rt === undefined) return;
+-	rt._addrs = new WeakMap();
+-	rt._addrNext = 0;
+-}
+-
+-/** Untimed iterations, with the address space reset often enough to stay under the ceiling. */
++// This benchmark used to reset `__rt._addrs` and `__rt._addrNext` between
++// batches: `__rt.addr` handed each block `4096 * ++_addrNext` and never reused
++// one, so block number 1048576 got the address 2^32, which `>>> 0` made null,
++// and a good allocation was reported as failed. The runtime now gives a freed
++// block's address back (`__rt._addr_release`) and carves addresses by size, so
++// no reset is needed -- and resetting the bump pointer under live free lists
++// would hand one address out twice.
++
++/** Untimed iterations. */
+ function warm(api, count) {
+-	for (let i = 0; i < count; i++) {
+-		if (i % 100 === 0) resetAddressSpace();
+-		iteration(api);
+-	}
++	for (let i = 0; i < count; i++) iteration(api);
+ }
+ 
+ // ------------------------------------------------------------------ the sizes
+@@ -374,7 +349,6 @@ function stats(samples) {
+  * garbage collection pause that lands in one of them and a batch mean is not.
+  */
+ function timeSide(api) {
+-	resetAddressSpace();
+ 	globalThis.gc();
+ 	for (let i = 0; i < WARMUP; i++) iteration(api);
+ 	const samples = [];
+@@ -455,7 +429,6 @@ function gitHead() {
+ // ------------------------------------------------------------------------ run
+ 
+ console.log("==> equivalence");
+-resetAddressSpace();
+ checkEquivalence();
+ console.log(`    all ${SIDES.length} sides compute the same state, operation by operation`);
+ 
+diff --git a/examples/core-tests/71_repr_string_builder.rs b/examples/core-tests/71_repr_string_builder.rs
+index e70461fb61a376236e5e441301c4e72c39ed502e..e827f9c7dac1d0d2f0a359810d64ce52db66151d 100644
+--- a/examples/core-tests/71_repr_string_builder.rs
++++ b/examples/core-tests/71_repr_string_builder.rs
+@@ -1,6 +1,6 @@
+ //! The mutable native `String` carrier's contract, exercised end to end (Phase 4, D5).
+ //!
+-//! Everything the `{ text, cap }` StringBuilder carrier must preserve when the representation
++//! Everything the `{ text, cap, len }` StringBuilder carrier must keep when the representation
+ //! planner commits it: construction with and without an explicit capacity, UTF-8 byte length
+ //! (ASCII and multi-byte), capacity growth on `push`/`push_str`, `clear` keeping the capacity,
+ //! `as_str` borrowing, and the `fmt::Write` sinks. The expected stdout is mode-independent: the
+diff --git a/examples/core-tests/78_repr_capacity_edge.rs b/examples/core-tests/78_repr_capacity_edge.rs
+index e56ebcfa876f4824059c20257de1d04d45860a0c..acd23b19fe3c8a4ffc887c4dbc414d79d77957c9 100644
+--- a/examples/core-tests/78_repr_capacity_edge.rs
++++ b/examples/core-tests/78_repr_capacity_edge.rs
+@@ -1,7 +1,7 @@
+ //! Capacity across a native->baseline string cut edge (Phase 4, D6).
+ //!
+ //! `rust_entry`'s builder is committed native (`with_capacity` + `push_str` force the
+-//! `{ text, cap }` carrier), while `sink` is pinned baseline by raw provenance
++//! `{ text, cap, len }` carrier), while `sink` is pinned baseline by raw provenance
+ //! (`as_mut_vec`). The move into `sink` is therefore a cut edge whose Convert adapter
+ //! must carry the builder's Rust-visible capacity into the baseline cap leaf: a moved
+ //! `String` keeps its capacity, so both sides print 64, in every mode.
+diff --git a/jsc-link/src/analysis/legality.rs b/jsc-link/src/analysis/legality.rs
+index 15a958827c6f3dccc8493931a979ea15f7849ef2..7e8a7672becfa86f1297fe1567fa8cfe67ff2975 100644
+--- a/jsc-link/src/analysis/legality.rs
++++ b/jsc-link/src/analysis/legality.rs
+@@ -657,7 +657,7 @@ mod tests {
+ 
+     /// The accepts-set is load bearing: a mutable string can only be a builder, which no
+     /// declaration can accept, so a `reads, accepts(host_string)` slot receiving a mutated
+-    /// `String` pins it — `{ text, cap }` must never reach a host that declared a JS string.
++    /// `String` pins it — `{ text, cap, len }` must never reach a host that declared a JS string.
+     #[test]
+     fn legality_a_mutated_string_into_an_accepts_host_string_slot_pins() {
+         let mut prog = Prog::new();
+diff --git a/jsc-link/src/lower/js/adapters.rs b/jsc-link/src/lower/js/adapters.rs
+index 89d2051d9c2235051798790712d7dec3de27ca80..1a7c463d1b6f91772045dd56b46394caeb368a00 100644
+--- a/jsc-link/src/lower/js/adapters.rs
++++ b/jsc-link/src/lower/js/adapters.rs
+@@ -3,7 +3,8 @@
+ //! An adapter is a small expression over the value being converted — never a statement, never a
+ //! change to the value's Rust type. The string family: `Baseline` (the `Vec<u8>` alloc-block
+ //! `String` struct), [`Carrier::HostString`] (an immutable JavaScript string) and
+-//! [`Carrier::StringBuilder`] (`{ text, cap }`, capacity in UTF-8 bytes). The vec/slice family:
++//! [`Carrier::StringBuilder`] (`{ text, cap, len }`, capacity and length in UTF-8 bytes). The
++//! vec/slice family:
+ //! [`Carrier::NativeVec`] (`{ buf, len, cap }`, `buf` a capacity-length array initialized in
+ //! `[0, len)`) and [`Carrier::SliceView`] (`{ buf, off, len }` sharing a native buffer — the
+ //! same record a baseline fat slice is, so that direction is a plain re-record).
+@@ -124,14 +125,16 @@ fn host_text(layout: &StringLayout, value: Expr) -> Expr {
+     )
+ }
+ 
+-/// `{ text, cap }` straight off the baseline leaves: the decoded text, and the cap leaf carried
+-/// into the builder's Rust-visible capacity (a moved `String` keeps its capacity).
++/// `{ text, cap, len }` straight off the baseline leaves: the decoded text, the cap leaf carried
++/// into the builder's Rust-visible capacity (a moved `String` keeps its capacity), and the len
++/// leaf — the decoded bytes' count, exactly the text's UTF-8 length — as its cached length.
+ fn baseline_to_builder(table: &TypeTable, interns: &Interns, value: Expr, ty: TypeId) -> Res<Expr> {
+     let layout = StringLayout::of(table, interns, ty)?;
+     let (value, wrap) = once(value);
+     Ok(wrap(jsast::object_of(vec![
+         ("text", host_text(&layout, value.clone())),
+-        ("cap", layout.member(value, &layout.cap)),
++        ("cap", layout.member(value.clone(), &layout.cap)),
++        ("len", layout.member(value, &layout.len)),
+     ])))
+ }
+ 
+diff --git a/jsc-link/src/lower/js/emit.rs b/jsc-link/src/lower/js/emit.rs
+index 94a7e4961ada5b7469687a0874811128b140db79..2bf594a9645153553e2d218b2df092a8d7a3fba9 100644
+--- a/jsc-link/src/lower/js/emit.rs
++++ b/jsc-link/src/lower/js/emit.rs
+@@ -1062,7 +1062,7 @@ impl<'a> JsCx<'a> {
+                 match self.func.values[v.0 as usize].carrier {
+                     rcgjs_object::jir::repr::Carrier::HostString => Ok(value),
+                     rcgjs_object::jir::repr::Carrier::StringBuilder => {
+-                        Ok(record_clone(value, &["text", "cap"], &[]))
++                        Ok(record_clone(value, &["text", "cap", "len"], &[]))
+                     }
+                     rcgjs_object::jir::repr::Carrier::NativeVec => {
+                         Ok(record_clone(value, &["len", "cap"], &["buf"]))
+diff --git a/jsc-link/src/lower/js/place.rs b/jsc-link/src/lower/js/place.rs
+index 83de3f5931d6a79e0d04517da77ebce67d10b4ac..9adcb03fd052d1826c6ffc70f7fb79a0a033e5bc 100644
+--- a/jsc-link/src/lower/js/place.rs
++++ b/jsc-link/src/lower/js/place.rs
+@@ -449,7 +449,7 @@ impl<'a> JsCx<'a> {
+             return Err(decline(OpClass::Rvalue, "PtrMetadata of a non-pointer"));
+         };
+         match value::kind(table, pointee) {
+-            Some(TypeKind::Slice(_)) => Ok(ptr::slot_len(value)),
++            Some(TypeKind::Slice(_)) => Ok(self.slice_len(value)),
+             Some(TypeKind::Dynamic { .. }) => Ok(jsast::member(value, META)),
+             Some(TypeKind::Str) => Ok(self.str_len(value)),
+             _ if table.get(pointee).is_some_and(|d| d.layout.sized) => Ok(jsast::undefined()),
+diff --git a/jsc-link/src/lower/js/ptr.rs b/jsc-link/src/lower/js/ptr.rs
+index 24ee373e20c4f10bc974d725161bb9c4cab25549..0ae1e0d35d24cb455e5c78619b0867c1de1fead6 100644
+--- a/jsc-link/src/lower/js/ptr.rs
++++ b/jsc-link/src/lower/js/ptr.rs
+@@ -317,6 +317,13 @@ impl<'a> JsCx<'a> {
+         ptr::slot(ptr::slot_buf(self.str_to_bytes(string)), jsast::num(0))
+     }
+ 
++    /// `s.as_bytes_mut()` (`ptr.rs::str_to_bytes_mut`): a fresh byte view no other `as_bytes`
++    /// shares, so a write through it — lost, since a `&mut str` has no mutable JavaScript form —
++    /// cannot surface in the memoized view of an equal string.
++    pub fn str_to_bytes_mut(&self, string: Expr) -> Expr {
++        jsast::rt_call("str_bytes_mut", vec![string])
++    }
++
+     /// `str::from_utf8_unchecked(v)` (`ptr.rs::bytes_to_str`).
+     pub fn bytes_to_str(&self, bytes: Expr) -> Expr {
+         let (setup, bytes) = self.reread(bytes, &[BUF, OFF, LEN]);
+@@ -336,6 +343,16 @@ impl<'a> JsCx<'a> {
+         jsast::rt_call("str_len", vec![string])
+     }
+ 
++    /// The length of a fat slice (`ptr.rs::slice_len`): `slice.len`, except over a `&str`'s byte
++    /// view, where `__rt.str_bytes(s).len` is `__rt.str_len(s)`. `str::len` is
++    /// `self.as_bytes().len()`, and a length needs no bytes.
++    pub fn slice_len(&self, slice: Expr) -> Expr {
++        match str_bytes_operand(slice) {
++            Ok(string) => self.str_len(string),
++            Err(slice) => ptr::slot_len(slice),
++        }
++    }
++
+     /// The `str` arms of the pointer cast matrix over two pointee types (`ptr.rs::cast_str`);
+     /// `None` when neither side is a `str`.
+     pub fn cast_str(
+@@ -343,6 +360,18 @@ impl<'a> JsCx<'a> {
+         from_pointee: TypeId,
+         to_pointee: TypeId,
+         value: Expr,
++    ) -> Option<Res<Expr>> {
++        self.cast_str_as(from_pointee, to_pointee, value, false)
++    }
++
++    /// [`Self::cast_str`], told whether the target pointer is mutable: a `str` cast to a mutable
++    /// byte pointer gets its own byte view (`ptr.rs::cast_str`).
++    fn cast_str_as(
++        &self,
++        from_pointee: TypeId,
++        to_pointee: TypeId,
++        value: Expr,
++        mutable: bool,
+     ) -> Option<Res<Expr>> {
+         let table = self.table;
+         let (from_str, to_str) = (
+@@ -361,10 +390,16 @@ impl<'a> JsCx<'a> {
+         Some(match (from_str, to_str) {
+             (true, true) => Ok(value),
+             (true, false) => match value::kind(table, to_pointee) {
+-                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => {
+-                    Ok(self.str_to_bytes(value))
+-                }
+-                _ if value::is_u8(table, to_pointee) => Ok(self.str_to_byte_ptr(value)),
++                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => Ok(if mutable {
++                    self.str_to_bytes_mut(value)
++                } else {
++                    self.str_to_bytes(value)
++                }),
++                _ if value::is_u8(table, to_pointee) => Ok(if mutable {
++                    ptr::slot(ptr::slot_buf(self.str_to_bytes_mut(value)), jsast::num(0))
++                } else {
++                    self.str_to_byte_ptr(value)
++                }),
+                 _ => unsupported(),
+             },
+             (false, true) => match value::kind(table, from_pointee) {
+@@ -381,7 +416,14 @@ impl<'a> JsCx<'a> {
+     pub fn cast_str_ptr(&self, from_ty: TypeId, to_ty: TypeId, value: Expr) -> Option<Res<Expr>> {
+         let from_pointee = value::pointee_of(self.table, from_ty)?;
+         let to_pointee = value::pointee_of(self.table, to_ty)?;
+-        self.cast_str(from_pointee, to_pointee, value)
++        let mutable = matches!(
++            value::kind(self.table, to_ty),
++            Some(
++                TypeKind::Reference { mutable: true, .. }
++                    | TypeKind::RawPointer { mutable: true, .. }
++            )
++        );
++        self.cast_str_as(from_pointee, to_pointee, value, mutable)
+     }
+ 
+     /// `value as *const to_pointee` (`ptr.rs::cast_pointer`).
+@@ -788,3 +830,19 @@ fn duplicable(value: &Expr, reads: &[&str]) -> bool {
+ pub fn meta(pointer: Expr) -> Expr {
+     jsast::member(pointer, META)
+ }
++
++/// The string a `__rt.str_bytes(s)` call encodes, or the expression back when it is anything else
++/// (`ptr.rs::str_bytes_operand`). `str_bytes` has no effect a program can observe, so a consumer
++/// that needs only what the string itself answers may drop the call.
++fn str_bytes_operand(expr: Expr) -> Result<Expr, Expr> {
++    match expr {
++        Expr::Call(callee, mut args)
++            if args.len() == 1
++                && matches!(&*callee, Expr::Member(object, name)
++                    if name == "str_bytes" && matches!(&**object, Expr::Ident(rt) if rt == "__rt")) =>
++        {
++            Ok(args.pop().expect("one argument"))
++        }
++        other => Err(other),
++    }
++}
+diff --git a/jsc-link/src/lower/js/rvalue.rs b/jsc-link/src/lower/js/rvalue.rs
+index 71a1cfe545cb1a9f6fa8e483120d1dd2370314c5..47953c6065f03c00d5d0a776f4c246e2488250ea 100644
+--- a/jsc-link/src/lower/js/rvalue.rs
++++ b/jsc-link/src/lower/js/rvalue.rs
+@@ -283,6 +283,11 @@ impl<'a> JsCx<'a> {
+                 } else {
+                     value
+                 };
++                // A `str` arm asks whether the target is mutable (`as_bytes_mut`), which only the
++                // pointer types say.
++                if let Some(converted) = self.cast_str_ptr(from_ty, to_ty, value.clone()) {
++                    return converted;
++                }
+                 self.cast_pointer(from_pointee, to_pointee, value)
+             }
+             CastKind::PointerExposeProvenance => {
+diff --git a/jsc-link/src/lower/semantic_ops/fmt.rs b/jsc-link/src/lower/semantic_ops/fmt.rs
+index 7ac5540d3e04b5644be75cdf1e85c06c9300b2b5..0307e8a35af92ea7a0affe9d90f82349586e7707 100644
+--- a/jsc-link/src/lower/semantic_ops/fmt.rs
++++ b/jsc-link/src/lower/semantic_ops/fmt.rs
+@@ -16,7 +16,7 @@ use crate::jsast::{self, BinOp, Expr, Stmt};
+ use super::string::receiver;
+ use super::{slot_type, type_get, LowerCx, SemanticDecline, SignatureSlot};
+ 
+-/// `f64::to_string`: the exact Rust-compatible shortest decimal, already `{ text, cap }`.
++/// `f64::to_string`: the exact Rust-compatible shortest decimal, already `{ text, cap, len }`.
+ pub(super) fn f64_spec_to_string(
+     _cx: &LowerCx<'_>,
+     _carrier: Option<Carrier>,
+@@ -56,8 +56,9 @@ pub(super) fn primitive_to_string(
+         Some(Carrier::HostString) => Ok(vec![jsast::ret(text)]),
+         Some(Carrier::StringBuilder) => {
+             // A decimal integer and both boolean words are ASCII, so their UTF-16 length is their
+-            // UTF-8 byte capacity. A `char` needs the exact encoded width.
+-            let capacity = if operation == StandardOperation::CharToString {
++            // UTF-8 byte length, which is both the builder's length and its exact-fit capacity.
++            // A `char` needs the exact encoded width.
++            let length = if operation == StandardOperation::CharToString {
+                 helpers.insert("str_len");
+                 jsast::rt_call("str_len", vec![jsast::id("$nativeText")])
+             } else {
+@@ -65,10 +66,11 @@ pub(super) fn primitive_to_string(
+             };
+             Ok(vec![
+                 jsast::const_("$nativeText", text),
+-                jsast::ret(jsast::object_of(vec![
+-                    ("text", jsast::id("$nativeText")),
+-                    ("cap", capacity),
+-                ])),
++                jsast::const_("$nativeLen", length),
++                jsast::ret(super::string::exact_builder(
++                    jsast::id("$nativeText"),
++                    jsast::id("$nativeLen"),
++                )),
+             ])
+         }
+         _ => Err(SemanticDecline::WrongCarrier(SignatureSlot::Result)),
+@@ -107,7 +109,10 @@ pub(super) fn format_args_to_string(
+ }
+ 
+ /// The native `String::new`/`with_capacity` layout the format sinks share: an immutable result is
+-/// the host string, a mutable one is `{ text, cap }` with the capacity in UTF-8 bytes.
++/// the host string, a mutable one is the exact-fit `{ text, cap, len }`, its capacity and length
++/// the text's one UTF-8 measurement. The native `Arguments` text is already the text the
++/// baseline `String` holds: each of its pieces is well formed on its own (a host `&str` argument
++/// is taken as Rust holds it where it is displayed, `format_display_text`).
+ pub(super) fn owned_native_string(
+     text: Expr,
+     carrier: Option<Carrier>,
+@@ -119,13 +124,14 @@ pub(super) fn owned_native_string(
+             helpers.insert("str_len");
+             Ok(vec![
+                 jsast::const_("$nativeText", text),
+-                jsast::ret(jsast::object_of(vec![
+-                    ("text", jsast::id("$nativeText")),
+-                    (
+-                        "cap",
+-                        jsast::rt_call("str_len", vec![jsast::id("$nativeText")]),
+-                    ),
+-                ])),
++                jsast::const_(
++                    "$nativeLen",
++                    jsast::rt_call("str_len", vec![jsast::id("$nativeText")]),
++                ),
++                jsast::ret(super::string::exact_builder(
++                    jsast::id("$nativeText"),
++                    jsast::id("$nativeLen"),
++                )),
+             ])
+         }
+         _ => Err(SemanticDecline::WrongCarrier(SignatureSlot::Result)),
+@@ -195,7 +201,9 @@ fn format_display_text(
+         FormatDisplayKind::Char => {
+             jsast::method_call(jsast::id("String"), "fromCodePoint", vec![loaded])
+         }
+-        FormatDisplayKind::Str => receiver(),
++        // The one display text a host may have made: taken as Rust holds it (lone surrogate to
++        // U+FFFD), so the concatenated `Arguments` text is well formed piece by piece.
++        FormatDisplayKind::Str => super::string::well_formed(receiver(), helpers),
+         // A committed `String` argument may arrive as either string carrier; the typeof test
+         // reads whichever it is without a plan-time distinction (v1's exact ternary).
+         FormatDisplayKind::String => jsast::cond(
+diff --git a/jsc-link/src/lower/semantic_ops/fmt_kernel.rs b/jsc-link/src/lower/semantic_ops/fmt_kernel.rs
+index 4e1fc4fd5284d1a71749fb63f812efc2336ca0a4..a202131e938b3c08436b90c3f014a39ede23e9ba 100644
+--- a/jsc-link/src/lower/semantic_ops/fmt_kernel.rs
++++ b/jsc-link/src/lower/semantic_ops/fmt_kernel.rs
+@@ -763,17 +763,19 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
+             let result = op
+                 .result
+                 .ok_or_else(|| kernel_decline("marked format! has no destination"))?;
++            // Already the text the baseline `String` holds: every piece of it is well formed on
++            // its own (see `display_text`), so the concatenation is too.
+             let text = cx.expr_of(*arguments)?;
+             match cx.func.values[result.0 as usize].carrier {
+                 Carrier::HostString => Ok(Some(Lowered::value(text))),
+                 Carrier::StringBuilder => {
++                    // The exact-fit builder: the text measured once, for its length and its
++                    // capacity both.
+                     let (bind, name) = cx.temp(text);
++                    let (bind_len, length) = cx.temp(jsast::rt_call("str_len", vec![name.clone()]));
+                     Ok(Some(Lowered::Value(
+-                        vec![bind],
+-                        jsast::object_of(vec![
+-                            ("text", name.clone()),
+-                            ("cap", jsast::rt_call("str_len", vec![name])),
+-                        ]),
++                        vec![bind, bind_len],
++                        super::string::exact_builder(name, length),
+                     )))
+                 }
+                 _ => Err(kernel_decline("marked format! destination is not native")),
+@@ -786,12 +788,23 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
+             if !marked(view.chase_copies(*arguments)) {
+                 return Ok(None);
+             }
+-            // The receiver is a committed StringBuilder behind `&mut` (the plan's gate).
++            // The receiver is a committed StringBuilder behind `&mut` (the plan's gate). The
++            // append is `String::push_str`'s: the formatted text (well formed piece by piece, see
++            // `display_text`), the required length is the cached length plus that text's (the
++            // only text measured), the capacity grows to cover it, and the cached length advances
++            // with the text.
+             let walk = cx.pointee_place(*receiver)?;
+             let recv = cx.read_place(&walk.place);
++            // A format site's runtime members are the planner's to account (`representation`),
++            // so the set is only a sink here.
++            let mut helpers = BTreeSet::new();
+             let (bind_text, text) = cx.temp(cx.expr_of(*arguments)?);
+-            let (bind_required, required) = cx.temp(jsast::rt_call("str_len", vec![text.clone()]));
+-            let stmts = vec![
++            let (bind_required, required) = cx.temp(jsast::binary(
++                BinOp::Add,
++                super::string::builder_len(recv.clone(), &mut helpers),
++                jsast::rt_call("str_len", vec![text.clone()]),
++            ));
++            let mut stmts = vec![
+                 bind_text,
+                 bind_required,
+                 jsast::if_(
+@@ -802,15 +815,17 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
+                     ),
+                     vec![jsast::assign_stmt(
+                         jsast::member(recv.clone(), "cap"),
+-                        required,
++                        required.clone(),
+                     )],
+                 ),
+                 jsast::expr_stmt(jsast::compound_assign(
+                     BinOp::Add,
+-                    jsast::member(recv, "text"),
++                    jsast::member(recv.clone(), "text"),
+                     text,
+                 )),
++                jsast::assign_stmt(jsast::member(recv.clone(), "len"), required),
+             ];
++            stmts.extend(super::string::builder_checked(recv, &mut helpers));
+             match op.result {
+                 None => Ok(Some(Lowered::Done(stmts))),
+                 Some(result) => {
+@@ -833,6 +848,14 @@ fn kernel_decline(detail: &str) -> crate::jir::decline::Decline {
+ /// The host text of one display argument (v1 `display_text_from_ref`): the place read, wrapped
+ /// by its proven kind. `mark` is the committed carrier of the `new_display` result, which for a
+ /// `String` source records the source's own carrier.
++///
++/// Every piece a site concatenates is well formed on its own, so the concatenation is exactly
++/// the text the baseline `String` decodes from its bytes, and two adjacent pieces can never pair
++/// into a scalar the baseline never held. A host `&str` is the one piece that may hold a lone
++/// surrogate, so it is taken as Rust holds it (`__rt.native_str_wf`: U+FFFD) where it is read.
++/// Everything else is well formed by construction: the template's literal pieces are decoded
++/// UTF-8 (`decode_template`), the integer, `bool` and `f64` texts are ASCII, a `char` is one
++/// scalar, and a native `String` source's text is itself only ever built from such pieces.
+ fn display_text(
+     cx: &JsCx<'_>,
+     root: Root,
+@@ -846,7 +869,8 @@ fn display_text(
+         DisplayKind::Integer => jsast::call(jsast::id("String"), vec![loaded]),
+         DisplayKind::Bool => jsast::cond(loaded, jsast::string("true"), jsast::string("false")),
+         DisplayKind::Char => jsast::method_call(jsast::id("String"), "fromCodePoint", vec![loaded]),
+-        DisplayKind::Str => loaded,
++        // The planner accounts the members a site reaches (`representation`): the set is a sink.
++        DisplayKind::Str => super::string::well_formed(loaded, &mut BTreeSet::new()),
+         DisplayKind::F64 => {
+             jsast::member(jsast::rt_call("native_f64_to_string", vec![loaded]), "text")
+         }
+diff --git a/jsc-link/src/lower/semantic_ops/mod.rs b/jsc-link/src/lower/semantic_ops/mod.rs
+index cf9092c9b6a361da24e5bba24d71cde5233faf59..7280ba58669a68e369db40d30070fdbf0bfb7dda 100644
+--- a/jsc-link/src/lower/semantic_ops/mod.rs
++++ b/jsc-link/src/lower/semantic_ops/mod.rs
+@@ -363,26 +363,28 @@ mod ops {
+     op!(STRING_WITH_CAPACITY, StringWithCapacity, 1, RESULT_BUILDER, BUILDER_ONLY, THROWS,
+         string::legality_with_capacity, string::string_with_capacity, &[], 90, FIXTURE_71);
+     op!(STRING_LEN, StringLen, 1, RECEIVER_STRING, HOST_OR_BUILDER, PURE,
+-        string::legality_unsigned_return, string::string_len, &["str_len"], 34, FIXTURE_71);
++        string::legality_unsigned_return, string::string_len, &["_sb_check", "str_len"], 34,
++        FIXTURE_71);
+     op!(STRING_CAPACITY, StringCapacity, 1, RECEIVER_BUILDER, BUILDER_ONLY, PURE,
+         string::legality_unsigned_return, string::string_capacity, &[], 24, FIXTURE_71);
+     op!(STRING_PUSH, StringPush, 2, MUT_RECEIVER_BUILDER, BUILDER_ONLY, THROWS_AND_MUTATES,
+         string::legality_push, string::string_push,
+-        &["_utf8_width", "native_str_push", "str_len"], 200, FIXTURE_71);
++        &["_sb_check", "_utf8_width", "native_str_push"], 200, FIXTURE_71);
+     op!(STRING_PUSH_STR, StringPushStr, 2, MUT_RECEIVER_BUILDER, BUILDER_ONLY, THROWS_AND_MUTATES,
+-        string::legality_push_str, string::string_push_str, &["str_len"], 170, FIXTURE_71);
++        string::legality_push_str, string::string_push_str,
++        &["_sb_check", "native_str_wf", "str_len"], 170, FIXTURE_71);
+     op!(STRING_CLEAR, StringClear, 1, MUT_RECEIVER_BUILDER, BUILDER_ONLY, MUTATES,
+-        string::legality_unit_return, string::string_clear, &[], 26, FIXTURE_71);
++        string::legality_unit_return, string::string_clear, &["_sb_check"], 26, FIXTURE_71);
+     op!(STRING_AS_STR, StringAsStr, 1, RECEIVER_STRING, HOST_OR_BUILDER, PURE,
+         string::legality_as_str, string::string_as_str, &[], 22, FIXTURE_71);
+     op!(STRING_DROP, StringDrop, 1, MUT_RECEIVER_BUILDER, BUILDER_ONLY, MUTATES,
+         string::legality_unit_return, string::string_drop, &[], 40, FIXTURE_71);
+     op!(FMT_WRITE_STR, StringFmtWriteStr, 2, MUT_RECEIVER_BUILDER, BUILDER_ONLY,
+         THROWS_AND_MUTATES, fmt::legality_fmt_write_str, string::string_push_str,
+-        &["str_len"], 190, FIXTURE_72);
++        &["_sb_check", "native_str_wf", "str_len"], 190, FIXTURE_72);
+     op!(FMT_WRITE_CHAR, StringFmtWriteChar, 2, MUT_RECEIVER_BUILDER, BUILDER_ONLY,
+         THROWS_AND_MUTATES, fmt::legality_fmt_write_char, string::string_push,
+-        &["_utf8_width", "native_str_push", "str_len"], 220, FIXTURE_72);
++        &["_sb_check", "_utf8_width", "native_str_push"], 220, FIXTURE_72);
+     op!(F64_SPEC_TO_STRING, F64SpecToString, 1, RESULT_BUILDER, BUILDER_ONLY, PURE,
+         fmt::legality_f64_to_string, fmt::f64_spec_to_string,
+         &["native_f64_to_string"], 60, FIXTURE_72);
+@@ -394,7 +396,7 @@ mod ops {
+         fmt::legality_char_to_string, fmt::primitive_to_string, &["str_len"], 80, FIXTURE_72);
+     op!(FORMAT_ARGUMENT_NEW_DISPLAY, FormatArgumentNewDisplay, 1, NO_SLOTS, HOST_OR_BUILDER, PURE,
+         fmt::legality_argument_new_display, fmt::format_argument_new_display,
+-        &["native_f64_to_string"], 70, FIXTURE_72);
++        &["native_f64_to_string", "native_str_wf"], 70, FIXTURE_72);
+     op!(FORMAT_ARGS_NEW, FormatArgsNew, 2, NO_SLOTS, HOST_OR_BUILDER, PURE,
+         fmt::legality_format_args_new, fmt::format_args_new, &[], 16, FIXTURE_72);
+     op!(FORMAT_ARGS_TO_STRING, FormatArgsToString, 1, RESULT_STRING, HOST_OR_BUILDER, PURE,
+diff --git a/jsc-link/src/lower/semantic_ops/string.rs b/jsc-link/src/lower/semantic_ops/string.rs
+index 279e40bb80bfe620ffd05a63e88ec298bc856ebe..a6415eaaa36598c32f3a5532b8866de1703fe9a7 100644
+--- a/jsc-link/src/lower/semantic_ops/string.rs
++++ b/jsc-link/src/lower/semantic_ops/string.rs
+@@ -1,11 +1,31 @@
+ //! The `String` family emitters: construction, length, append, clear, borrow, drop.
+ //!
+-//! Ports of v1 `native_std_lower.rs`'s string arms, spelling for spelling. The carriers are D5's:
++//! Ports of v1 `native_std_lower.rs`'s string arms. The carriers are D5's:
+ //! [`Carrier::HostString`] is an immutable JavaScript string; [`Carrier::StringBuilder`] is
+-//! `{ text, cap }` with the capacity in UTF-8 bytes. Every capacity or bounds throw precedes
+-//! every mutation.
++//! `{ text, cap, len }` with the capacity and the length in UTF-8 bytes. Every capacity or bounds
++//! throw precedes every mutation.
++//!
++//! `len` is the exact UTF-8 byte length of `text`, kept beside it so that no operation rescans the
++//! accumulated text: an append costs the bytes it appends, not the bytes already there, and
++//! `String::len` is a field read. Every writer of a builder keeps the two in step — a constructor
++//! knows its text is empty, knows its width, or measures it once (`__rt.str_len`) rather than
++//! guess; an append adds the appended width; `clear` and drop reset it. The writers are this file,
++//! the format emitters (`fmt.rs`, `fmt_kernel.rs`), the `Convert` adapters
++//! (`lower/js/adapters.rs`, `__rt.convert_host_sb`), the carrier copy (`lower/js/emit.rs`) and the
++//! shim's `native_*` string helpers. `RCGJS_SB_VERIFY=1` routes every length read and every
++//! mutation through `__rt._sb_check`, which re-measures the text and throws on drift.
++//!
++//! The text is always well formed, piece by piece. Text a host handed over as a `&str` may hold a
++//! lone surrogate, which the baseline `Vec<u8>` `String` stores as the three bytes of U+FFFD;
++//! every such piece — a `push_str` argument here, a format site's `&str` argument where it is
++//! displayed (`fmt_kernel::display_text`, `fmt::format_display_text`) — therefore goes through
++//! `__rt.native_str_wf` (lone surrogate to U+FFFD) first, and every other piece is well formed by
++//! construction. So the builder hands back exactly the text the baseline decodes, its length is
++//! the sum of its pieces' lengths, and two adjacent halves never pair into a scalar the baseline
++//! never held.
+ 
+ use std::collections::BTreeSet;
++use std::sync::OnceLock;
+ 
+ use crate::item::JsName;
+ use crate::jir::repr::Carrier;
+@@ -26,9 +46,59 @@ pub(super) fn member(name: &str) -> Expr {
+     jsast::member(receiver(), name)
+ }
+ 
+-/// `{ text: "", cap: <capacity> }` — the mutable carrier's empty value.
++/// Whether `RCGJS_SB_VERIFY=1` is set: every builder length read and mutation is then checked by
++/// `__rt._sb_check` against a fresh measurement of the text. Read once per process; a debugging
++/// aid for tests, off by default.
++fn verify_builders() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var("RCGJS_SB_VERIFY").is_ok_and(|value| value == "1"))
++}
++
++/// The cached UTF-8 byte length of the builder `value`: `value.len`. `value` must be a pure place
++/// read, because it is evaluated once per use.
++pub(super) fn builder_len(value: Expr, helpers: &mut BTreeSet<&'static str>) -> Expr {
++    if verify_builders() {
++        helpers.insert("_sb_check");
++        jsast::member(jsast::rt_call("_sb_check", vec![value]), "len")
++    } else {
++        jsast::member(value, "len")
++    }
++}
++
++/// What closes a mutation of the builder `value`: nothing, or the drift check under
++/// `RCGJS_SB_VERIFY=1`.
++pub(super) fn builder_checked(value: Expr, helpers: &mut BTreeSet<&'static str>) -> Vec<Stmt> {
++    if verify_builders() {
++        helpers.insert("_sb_check");
++        vec![jsast::expr_stmt(jsast::rt_call("_sb_check", vec![value]))]
++    } else {
++        Vec::new()
++    }
++}
++
++/// `__rt.native_str_wf(text)`: `text` as Rust holds it once it is bytes, every lone surrogate a
++/// U+FFFD. What any text a host may have produced goes through before it joins a native `String`.
++pub(super) fn well_formed(text: Expr, helpers: &mut BTreeSet<&'static str>) -> Expr {
++    helpers.insert("native_str_wf");
++    jsast::rt_call("native_str_wf", vec![text])
++}
++
++/// `{ text, cap, len }`: the builder literal, in the property order every constructor uses (the
++/// carrier copy, `record_clone`, lists its fields sorted instead).
++fn builder_literal(text: Expr, capacity: Expr, length: Expr) -> Expr {
++    jsast::object_of(vec![("text", text), ("cap", capacity), ("len", length)])
++}
++
++/// An exact-fit builder over `text`, whose UTF-8 byte length is `length`: the capacity a `String`
++/// freshly built from that text reports. `length` is spelled twice, so it must be a name or a pure
++/// read.
++pub(super) fn exact_builder(text: Expr, length: Expr) -> Expr {
++    builder_literal(text, length.clone(), length)
++}
++
++/// `{ text: "", cap: <capacity>, len: 0 }`: the mutable carrier's empty value.
+ fn native_string(capacity: Expr) -> Expr {
+-    jsast::object_of(vec![("text", jsast::string("")), ("cap", capacity)])
++    builder_literal(jsast::string(""), capacity, jsast::num(0))
+ }
+ 
+ pub(super) fn string_new(
+@@ -59,19 +129,22 @@ pub(super) fn string_with_capacity(
+     ])
+ }
+ 
++/// `String::len`: a host string is measured, a builder answers from its cached length.
+ pub(super) fn string_len(
+     _cx: &LowerCx<'_>,
+     carrier: Option<Carrier>,
+     helpers: &mut BTreeSet<&'static str>,
+     _refs: &mut BTreeSet<JsName>,
+ ) -> Result<Vec<Stmt>, SemanticDecline> {
+-    helpers.insert("str_len");
+-    let text = match carrier {
+-        Some(Carrier::HostString) => receiver(),
+-        Some(Carrier::StringBuilder) => member("text"),
++    let length = match carrier {
++        Some(Carrier::HostString) => {
++            helpers.insert("str_len");
++            jsast::rt_call("str_len", vec![receiver()])
++        }
++        Some(Carrier::StringBuilder) => builder_len(receiver(), helpers),
+         _ => return Err(SemanticDecline::WrongCarrier(SignatureSlot::Argument(0))),
+     };
+-    Ok(vec![jsast::ret(jsast::rt_call("str_len", vec![text]))])
++    Ok(vec![jsast::ret(length)])
+ }
+ 
+ pub(super) fn string_capacity(
+@@ -83,26 +156,22 @@ pub(super) fn string_capacity(
+     Ok(vec![jsast::ret(member("cap"))])
+ }
+ 
+-/// `String::push` and `fmt::Write::write_char`: byte width of the scalar, capacity guard,
+-/// character-boundary-exact append through `__rt.native_str_push`.
+-pub(super) fn string_push(
++/// The append both `push` and `push_str` are: `setup`, then `$nativeRequired` (the cached length
++/// plus the appended `width`), the capacity guard, the capacity growth, and `mutation`, which
++/// appends the text and leaves the length at `$nativeRequired`.
++fn append(
+     cx: &LowerCx<'_>,
+-    _carrier: Option<Carrier>,
++    setup: Vec<Stmt>,
++    width: Expr,
++    mutation: Vec<Stmt>,
+     helpers: &mut BTreeSet<&'static str>,
+-    _refs: &mut BTreeSet<JsName>,
+ ) -> Result<Vec<Stmt>, SemanticDecline> {
+     let maximum = string_capacity_limit(cx)?;
+-    helpers.insert("_utf8_width");
+-    helpers.insert("native_str_push");
+-    helpers.insert("str_len");
+-    Ok(vec![
++    let mut statements = setup;
++    statements.extend([
+         jsast::const_(
+             "$nativeRequired",
+-            jsast::binary(
+-                BinOp::Add,
+-                jsast::rt_call("str_len", vec![member("text")]),
+-                jsast::rt_call("_utf8_width", vec![jsast::id("$native1")]),
+-            ),
++            jsast::binary(BinOp::Add, builder_len(receiver(), helpers), width),
+         ),
+         capacity_guard(jsast::id("$nativeRequired"), maximum, "String"),
+         jsast::if_(
+@@ -112,59 +181,76 @@ pub(super) fn string_push(
+                 jsast::id("$nativeRequired"),
+             )],
+         ),
+-        jsast::expr_stmt(jsast::rt_call(
++    ]);
++    statements.extend(mutation);
++    statements.extend(builder_checked(receiver(), helpers));
++    statements.push(append_return(cx)?);
++    Ok(statements)
++}
++
++/// `String::push` and `fmt::Write::write_char`: byte width of the scalar, capacity guard, and
++/// `__rt.native_str_push`, which appends the scalar exactly and advances the length by its width.
++pub(super) fn string_push(
++    cx: &LowerCx<'_>,
++    _carrier: Option<Carrier>,
++    helpers: &mut BTreeSet<&'static str>,
++    _refs: &mut BTreeSet<JsName>,
++) -> Result<Vec<Stmt>, SemanticDecline> {
++    helpers.insert("_utf8_width");
++    helpers.insert("native_str_push");
++    append(
++        cx,
++        Vec::new(),
++        jsast::rt_call("_utf8_width", vec![jsast::id("$native1")]),
++        vec![jsast::expr_stmt(jsast::rt_call(
+             "native_str_push",
+             vec![receiver(), jsast::id("$native1")],
+-        )),
+-        append_return(cx)?,
+-    ])
++        ))],
++        helpers,
++    )
+ }
+ 
+-/// `String::push_str` and `fmt::Write::write_str`: two UTF-8 lengths, capacity guard, `+=`.
++/// `String::push_str` and `fmt::Write::write_str`: the piece as Rust holds it (a host's lone
++/// surrogate is U+FFFD), its UTF-8 length (the only text measured), capacity guard, `+=`, and the
++/// new length.
+ pub(super) fn string_push_str(
+     cx: &LowerCx<'_>,
+     _carrier: Option<Carrier>,
+     helpers: &mut BTreeSet<&'static str>,
+     _refs: &mut BTreeSet<JsName>,
+ ) -> Result<Vec<Stmt>, SemanticDecline> {
+-    let maximum = string_capacity_limit(cx)?;
+     helpers.insert("str_len");
+-    Ok(vec![
+-        jsast::const_(
+-            "$nativeRequired",
+-            jsast::binary(
++    let piece = well_formed(jsast::id("$native1"), helpers);
++    append(
++        cx,
++        vec![jsast::const_("$nativePiece", piece)],
++        jsast::rt_call("str_len", vec![jsast::id("$nativePiece")]),
++        vec![
++            jsast::expr_stmt(jsast::compound_assign(
+                 BinOp::Add,
+-                jsast::rt_call("str_len", vec![member("text")]),
+-                jsast::rt_call("str_len", vec![jsast::id("$native1")]),
+-            ),
+-        ),
+-        capacity_guard(jsast::id("$nativeRequired"), maximum, "String"),
+-        jsast::if_(
+-            jsast::binary(BinOp::Lt, member("cap"), jsast::id("$nativeRequired")),
+-            vec![jsast::assign_stmt(
+-                member("cap"),
+-                jsast::id("$nativeRequired"),
+-            )],
+-        ),
+-        jsast::expr_stmt(jsast::compound_assign(
+-            BinOp::Add,
+-            member("text"),
+-            jsast::id("$native1"),
+-        )),
+-        append_return(cx)?,
+-    ])
++                member("text"),
++                jsast::id("$nativePiece"),
++            )),
++            jsast::assign_stmt(member("len"), jsast::id("$nativeRequired")),
++        ],
++        helpers,
++    )
+ }
+ 
++/// `String::clear`: the text and its length go, the capacity stays.
+ pub(super) fn string_clear(
+     _cx: &LowerCx<'_>,
+     _carrier: Option<Carrier>,
+-    _helpers: &mut BTreeSet<&'static str>,
++    helpers: &mut BTreeSet<&'static str>,
+     _refs: &mut BTreeSet<JsName>,
+ ) -> Result<Vec<Stmt>, SemanticDecline> {
+-    Ok(vec![
++    let mut statements = vec![
+         jsast::assign_stmt(member("text"), jsast::string("")),
+-        jsast::ret_void(),
+-    ])
++        jsast::assign_stmt(member("len"), jsast::num(0)),
++    ];
++    statements.extend(builder_checked(receiver(), helpers));
++    statements.push(jsast::ret_void());
++    Ok(statements)
+ }
+ 
+ pub(super) fn string_as_str(
+@@ -180,8 +266,8 @@ pub(super) fn string_as_str(
+     })])
+ }
+ 
+-/// The mutable carrier's drop: release the text, zero the capacity. A `HostString` never has a
+-/// drop body — an immutable string owns nothing.
++/// The mutable carrier's drop: release the text, zero the capacity and the length. A
++/// `HostString` never has a drop body — an immutable string owns nothing.
+ pub(super) fn string_drop(
+     _cx: &LowerCx<'_>,
+     _carrier: Option<Carrier>,
+@@ -191,6 +277,7 @@ pub(super) fn string_drop(
+     Ok(vec![
+         jsast::assign_stmt(member("text"), jsast::string("")),
+         jsast::assign_stmt(member("cap"), jsast::num(0)),
++        jsast::assign_stmt(member("len"), jsast::num(0)),
+         jsast::ret_void(),
+     ])
+ }
+diff --git a/jsc-link/src/lower/semantic_ops/tests.rs b/jsc-link/src/lower/semantic_ops/tests.rs
+index 7e4cdc87e9387d4c47a1979440d2bde14a9cc3bb..b37a09574ccdfbd9d43df788b691ed39c60fe9e5 100644
+--- a/jsc-link/src/lower/semantic_ops/tests.rs
++++ b/jsc-link/src/lower/semantic_ops/tests.rs
+@@ -557,7 +557,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+         StandardOperation::StringNew,
+         BUILDER,
+         r#"function f() {
+-  return { text: "", cap: 0 };
++  return { text: "", cap: 0, len: 0 };
+ }"#,
+     ),
+     (
+@@ -567,7 +567,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+   if ($native0 > 2147483647) {
+     throw new RangeError("rustc_codegen_js: native String capacity overflow");
+   }
+-  return { text: "", cap: $native0 };
++  return { text: "", cap: $native0, len: 0 };
+ }"#,
+     ),
+     (
+@@ -581,7 +581,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+         StandardOperation::StringLen,
+         BUILDER,
+         r#"function f($native0) {
+-  return __rt.str_len($native0.text);
++  return $native0.len;
+ }"#,
+     ),
+     (
+@@ -595,7 +595,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+         StandardOperation::StringPush,
+         BUILDER,
+         r#"function f($native0, $native1) {
+-  const $nativeRequired = __rt.str_len($native0.text) + __rt._utf8_width($native1);
++  const $nativeRequired = $native0.len + __rt._utf8_width($native1);
+   if ($nativeRequired > 2147483647) {
+     throw new RangeError("rustc_codegen_js: native String capacity overflow");
+   }
+@@ -610,14 +610,16 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+         StandardOperation::StringPushStr,
+         BUILDER,
+         r#"function f($native0, $native1) {
+-  const $nativeRequired = __rt.str_len($native0.text) + __rt.str_len($native1);
++  const $nativePiece = __rt.native_str_wf($native1);
++  const $nativeRequired = $native0.len + __rt.str_len($nativePiece);
+   if ($nativeRequired > 2147483647) {
+     throw new RangeError("rustc_codegen_js: native String capacity overflow");
+   }
+   if ($native0.cap < $nativeRequired) {
+     $native0.cap = $nativeRequired;
+   }
+-  $native0.text += $native1;
++  $native0.text += $nativePiece;
++  $native0.len = $nativeRequired;
+   return;
+ }"#,
+     ),
+@@ -626,6 +628,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+         BUILDER,
+         r#"function f($native0) {
+   $native0.text = "";
++  $native0.len = 0;
+   return;
+ }"#,
+     ),
+@@ -649,6 +652,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+         r#"function f($native0) {
+   $native0.text = "";
+   $native0.cap = 0;
++  $native0.len = 0;
+   return;
+ }"#,
+     ),
+@@ -656,14 +660,16 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+         StandardOperation::StringFmtWriteStr,
+         BUILDER,
+         r#"function f($native0, $native1) {
+-  const $nativeRequired = __rt.str_len($native0.text) + __rt.str_len($native1);
++  const $nativePiece = __rt.native_str_wf($native1);
++  const $nativeRequired = $native0.len + __rt.str_len($nativePiece);
+   if ($nativeRequired > 2147483647) {
+     throw new RangeError("rustc_codegen_js: native String capacity overflow");
+   }
+   if ($native0.cap < $nativeRequired) {
+     $native0.cap = $nativeRequired;
+   }
+-  $native0.text += $native1;
++  $native0.text += $nativePiece;
++  $native0.len = $nativeRequired;
+   return { TAG: "Ok", _0: undefined };
+ }"#,
+     ),
+@@ -671,7 +677,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+         StandardOperation::StringFmtWriteChar,
+         BUILDER,
+         r#"function f($native0, $native1) {
+-  const $nativeRequired = __rt.str_len($native0.text) + __rt._utf8_width($native1);
++  const $nativeRequired = $native0.len + __rt._utf8_width($native1);
+   if ($nativeRequired > 2147483647) {
+     throw new RangeError("rustc_codegen_js: native String capacity overflow");
+   }
+@@ -701,7 +707,8 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+         BUILDER,
+         r#"function f($native0) {
+   const $nativeText = String($native0.buf[$native0.off]);
+-  return { text: $nativeText, cap: $nativeText.length };
++  const $nativeLen = $nativeText.length;
++  return { text: $nativeText, cap: $nativeLen, len: $nativeLen };
+ }"#,
+     ),
+     (
+@@ -716,7 +723,8 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+         BUILDER,
+         r#"function f($native0) {
+   const $nativeText = $native0.buf[$native0.off] ? "true" : "false";
+-  return { text: $nativeText, cap: $nativeText.length };
++  const $nativeLen = $nativeText.length;
++  return { text: $nativeText, cap: $nativeLen, len: $nativeLen };
+ }"#,
+     ),
+     (
+@@ -731,7 +739,8 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+         BUILDER,
+         r#"function f($native0) {
+   const $nativeText = String.fromCodePoint($native0.buf[$native0.off]);
+-  return { text: $nativeText, cap: __rt.str_len($nativeText) };
++  const $nativeLen = __rt.str_len($nativeText);
++  return { text: $nativeText, cap: $nativeLen, len: $nativeLen };
+ }"#,
+     ),
+     (
+@@ -760,7 +769,8 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
+         BUILDER,
+         r#"function f($native0) {
+   const $nativeText = $native0;
+-  return { text: $nativeText, cap: __rt.str_len($nativeText) };
++  const $nativeLen = __rt.str_len($nativeText);
++  return { text: $nativeText, cap: $nativeLen, len: $nativeLen };
+ }"#,
+     ),
+     (
+@@ -1476,11 +1486,22 @@ mod adapters {
+     }
+ 
+     #[test]
+-    fn baseline_to_builder_carries_the_cap_leaf() {
++    fn baseline_to_builder_carries_the_cap_and_len_leaves() {
+         assert_eq!(
+             converted(jsast::id("s"), Carrier::Baseline, Carrier::StringBuilder),
+             "{ text: __rt.bytes_str(s.vec.buf.inner.ptr.buf, s.vec.buf.inner.ptr.off, \
+-             s.vec.len), cap: s.vec.buf.inner.cap }"
++             s.vec.len), cap: s.vec.buf.inner.cap, len: s.vec.len }"
++        );
++    }
++
++    #[test]
++    fn baseline_to_builder_evaluates_a_compound_value_once() {
++        let value = jsast::call(jsast::id("g"), vec![]);
++        assert_eq!(
++            converted(value, Carrier::Baseline, Carrier::StringBuilder),
++            "(($cv) => ({ text: __rt.bytes_str($cv.vec.buf.inner.ptr.buf, \
++             $cv.vec.buf.inner.ptr.off, $cv.vec.len), cap: $cv.vec.buf.inner.cap, \
++             len: $cv.vec.len }))(g())"
+         );
+     }
+ 
+@@ -2108,7 +2129,7 @@ for (const f of [before, after]) {
+       const buffer = [10, 20, 30, 40];
+       const view = { buf: buffer, off: 1, len: 2 };
+       const capacity = (ownedKind === 'builder' ? __rt.str_len(text) : 2) + reserve;
+-      const owned = ownedKind === 'builder' ? { text, cap: capacity } : ownedKind === 'vec' ? { buf: [1, 2], len: 2, cap: capacity } : undefined;
++      const owned = ownedKind === 'builder' ? { text, cap: capacity, len: __rt.str_len(text) } : ownedKind === 'vec' ? { buf: [1, 2], len: 2, cap: capacity } : undefined;
+       if (ownedKind === 'vec') owned.buf.length = capacity;
+       throwAtObserve = shouldThrow;
+       if (shouldThrow) assert.throws(() => f(text, caller, rounds, view, owned), error => error === thrown);
+@@ -2140,6 +2161,7 @@ for (const f of [before, after]) {
+         if (ownedKind === 'builder') {
+           assert.equal(__rt.bytes_str(ptr.buf, ptr.off, vec.len), text + '\ud83d\ude00\ud83d\ude00');
+           assert.equal(owned.text, dropped ? '' : mutated ? text + '\ud83d\ude00\ud83d\ude00' : text);
++          assert.equal(owned.len, __rt.str_len(owned.text));
+         } else {
+           assert.deepEqual(ptr.buf.slice(ptr.off, ptr.off + vec.len), [1, 2, 77, 77]);
+           assert.equal(owned.len, dropped ? 0 : mutated ? 4 : 2);
+@@ -2176,3 +2198,557 @@ for (const f of [before, after]) {
+         String::from_utf8_lossy(&output.stderr)
+     );
+ }
++
++// -- The call-site format kernel, driven directly ----------------------------------------------
++//
++// The planner does not commit a format site yet (its `Move` renames stay baseline), so these build
++// the committed shape by hand — the constructor calls' results marked exactly as `commit_func`
++// marks them — lower it through the real `lower_func` path the kernel intercepts in, and run the
++// emitted JavaScript against the baseline representation's answer: the UTF-8 bytes of every
++// piece appended in order, decoded back.
++
++/// One display argument of a hand-built format site.
++#[derive(Clone, Copy)]
++enum SiteArg {
++    /// A host `&str`, displayed through `&&str`.
++    Str,
++    /// An `i32`, displayed through `&i32`.
++    Int,
++}
++
++/// The consumer of a hand-built format site.
++#[derive(Clone, Copy)]
++enum SiteConsumer {
++    /// `alloc::fmt::format` into a `String` at this carrier.
++    Format(Carrier),
++    /// `String::write_fmt` into a `{ text, cap, len }` builder parameter.
++    WriteFmt,
++}
++
++/// The JavaScript function `name` lowered from one committed-shape format site: parameters
++/// `[builder,] args...`, an `Argument::new_display` over a borrow of each argument, the default
++/// template `template`, and `consumer`.
++fn format_site_js(
++    name: &str,
++    template: &[u8],
++    site_args: &[SiteArg],
++    consumer: SiteConsumer,
++) -> String {
++    use crate::jir::origin::OriginId;
++    use crate::jir::repr::{FuncBuilder, OpKind, RTerm, Root, ValueId};
++    use crate::jir::semantic::{Body, BodyKind, CallSemantic, Callee, ConstTree, ItemId};
++    use crate::jir::summary::{Availability, ItemClass, ItemSummary, SemanticKey};
++    use crate::lower::js::host::{ItemEntry, ItemIndex};
++    use crate::lower::{lower_func, LowerInput};
++    use crate::opts::Opts;
++    use rcgjs_object::object::{BlobRef, ItemKind, Linkage};
++
++    const ORIGIN: OriginId = OriginId(0);
++    const ARG_LIST: TypeId = TypeId(60);
++    const ARG_LIST_REF: TypeId = TypeId(61);
++    const TEMPLATE: TypeId = TypeId(62);
++    let (mut table, mut interns) = table();
++    let mut list = descriptor(
++        ARG_LIST,
++        TypeKind::Array {
++            element: ARGUMENT,
++            length: site_args.len() as u64,
++        },
++        8 * site_args.len() as u64,
++    );
++    list.js.is_indirect = true;
++    table.insert(list);
++    table.insert(reference(ARG_LIST_REF, ARG_LIST, false));
++    let mut bytes = descriptor(
++        TEMPLATE,
++        TypeKind::Array {
++            element: U8,
++            length: template.len() as u64,
++        },
++        template.len() as u64,
++    );
++    bytes.js.is_indirect = true;
++    table.insert(bytes);
++
++    // The machinery items, by the exact identity the kernel resolves a callee through.
++    let mut items = ItemIndex::new();
++    let mut machinery = |n: u64, link: &str, params: usize, standard: StandardOperation| {
++        let item = ItemId {
++            definition: def_id(n),
++            instantiation: 0,
++        };
++        items.insert(
++            item,
++            ItemEntry {
++                name: link.to_owned(),
++                params,
++                abi_known: true,
++                result: None,
++                caller_location: false,
++                used_params: BTreeSet::new(),
++                standard: Some(standard),
++                keyed_purity: None,
++                keyed_read_params: None,
++                keyed_may_unwind: None,
++                keyed_row_capture: None,
++                keyed_proxy_safe_params: None,
++            },
++        );
++        Callee::Direct {
++            item,
++            link_name: interns.intern_str(link),
++        }
++    };
++    let display = machinery(
++        201,
++        "new_display",
++        1,
++        StandardOperation::FormatArgumentNewDisplay,
++    );
++    let new = machinery(202, "arguments_new", 2, StandardOperation::FormatArgsNew);
++    let format = machinery(203, "format", 1, StandardOperation::FormatArgsToString);
++    let write_fmt = machinery(204, "write_fmt", 2, StandardOperation::StringFmtWriteFmt);
++    let call = |callee: &Callee, args: Vec<ValueId>, semantic: CallSemantic| OpKind::Call {
++        callee: callee.clone(),
++        function: None,
++        args,
++        track_caller: None,
++        semantic,
++        host: None,
++    };
++
++    let writes = matches!(consumer, SiteConsumer::WriteFmt);
++    let mut parameters: Vec<TypeId> = writes.then_some(STRING).into_iter().collect();
++    parameters.extend(site_args.iter().map(|arg| match arg {
++        SiteArg::Str => STR_REF,
++        SiteArg::Int => I32,
++    }));
++    let result_ty = if writes { FMT_RESULT } else { STRING };
++    let item = ItemId {
++        definition: def_id(300),
++        instantiation: 0,
++    };
++    let mut b = FuncBuilder::new(item, sig(parameters, result_ty));
++    let entry = FuncBuilder::ENTRY;
++    let builder = writes.then(|| b.param(STRING, ORIGIN));
++    let values: Vec<(SiteArg, ValueId)> = site_args
++        .iter()
++        .map(|arg| {
++            let ty = match arg {
++                SiteArg::Str => STR_REF,
++                SiteArg::Int => I32,
++            };
++            (*arg, b.param(ty, ORIGIN))
++        })
++        .collect();
++    let mut displays = Vec::new();
++    for (arg, value) in values {
++        let reference_ty = match arg {
++            SiteArg::Str => PIECES_REF,
++            SiteArg::Int => I32_REF,
++        };
++        let reference = b.op(
++            entry,
++            OpKind::BorrowView {
++                root: Root::Value(value),
++                path: vec![],
++                mutable: false,
++            },
++            reference_ty,
++            ORIGIN,
++        );
++        displays.push(b.op(
++            entry,
++            call(&display, vec![reference], CallSemantic::Ordinary),
++            ARGUMENT,
++            ORIGIN,
++        ));
++    }
++    let list = b.op(
++        entry,
++        OpKind::Aggregate {
++            ty: ARG_LIST,
++            variant: 0,
++            active_field: None,
++            fields: displays.clone(),
++        },
++        ARG_LIST,
++        ORIGIN,
++    );
++    let list_ref = b.op(
++        entry,
++        OpKind::BorrowView {
++            root: Root::Value(list),
++            path: vec![],
++            mutable: false,
++        },
++        ARG_LIST_REF,
++        ORIGIN,
++    );
++    let template_value = b.op(
++        entry,
++        OpKind::Const(ConstTree::Aggregate(
++            template
++                .iter()
++                .map(|byte| ConstTree::Scalar {
++                    bits: u128::from(*byte),
++                    bytes: 1,
++                })
++                .collect(),
++        )),
++        TEMPLATE,
++        ORIGIN,
++    );
++    let arguments = b.op(
++        entry,
++        call(&new, vec![template_value, list_ref], CallSemantic::Ordinary),
++        ARGUMENTS,
++        ORIGIN,
++    );
++    let result = match builder {
++        None => b.op(
++            entry,
++            call(&format, vec![arguments], CallSemantic::Ordinary),
++            STRING,
++            ORIGIN,
++        ),
++        Some(builder) => {
++            let receiver = b.op(
++                entry,
++                OpKind::BorrowView {
++                    root: Root::Value(builder),
++                    path: vec![],
++                    mutable: true,
++                },
++                STRING_MUT,
++                ORIGIN,
++            );
++            b.op(
++                entry,
++                call(
++                    &write_fmt,
++                    vec![receiver, arguments],
++                    CallSemantic::Standard(StandardOperation::StringFmtWriteFmt),
++                ),
++                FMT_RESULT,
++                ORIGIN,
++            )
++        }
++    };
++    b.terminate(entry, RTerm::Return(Some(result)));
++    let mut func = b.finish();
++    // The committed marks (`plan::representation::commit_func`): each constructor result carries
++    // its native text, the destination its native carrier.
++    for value in displays.iter().chain([&arguments]) {
++        func.values[value.0 as usize].carrier = Carrier::HostString;
++    }
++    match consumer {
++        SiteConsumer::Format(carrier) => func.values[result.0 as usize].carrier = carrier,
++        SiteConsumer::WriteFmt => {
++            func.values[builder.unwrap().0 as usize].carrier = Carrier::StringBuilder;
++        }
++    }
++
++    let body = Body {
++        item,
++        kind: BodyKind::Function,
++        semantic: BodySemantic::Ordinary,
++        signature: func.sig.clone(),
++        locals: vec![],
++        blocks: vec![],
++    };
++    let summary = ItemSummary {
++        key: SemanticKey {
++            link_name: name.to_owned(),
++            item: Some(item),
++        },
++        body_hash: None,
++        semantic_hash: None,
++        availability: Availability::Available,
++        deps: Vec::new(),
++        abi: None,
++        physical: None,
++        kind: ItemKind::Fn,
++        linkage: Linkage::internal(),
++        order: None,
++        dts: false,
++        fallback: BlobRef {
++            offset: 0,
++            clen: 0,
++            ulen: 0,
++        },
++        body: None,
++        origin: None,
++        estimated_bytes: 0,
++        class: ItemClass::default(),
++    };
++    let opts = Opts::default();
++    let js_name = JsName::new(name.to_owned());
++    let input = LowerInput {
++        name: &js_name,
++        summary: &summary,
++        body: &body,
++        origins: None,
++        interns: &interns,
++        table: &table,
++        opts: &opts,
++        items: &items,
++        drop_glue: crate::lower::js::host::EMPTY_DROP_GLUE,
++        vtables: &crate::lower::js::unsize::EMPTY_VTABLES,
++        spills: &[],
++        abi: None,
++        physical: None,
++        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
++    };
++    let lowered = lower_func(&input, &func)
++        .unwrap_or_else(|decline| panic!("the format kernel declined `{name}`: {decline}"));
++    let js = jsast::stmt_to_string(&lowered.decl);
++    // Nothing of the elided machinery survives: the site is inline host text.
++    for machinery in ["new_display", "arguments_new", "format(", "write_fmt"] {
++        assert!(
++            !js.contains(machinery),
++            "`{name}` still calls {machinery}:\n{js}"
++        );
++    }
++    js
++}
++
++/// Runs `harness` in Node after the shim and `functions`, failing the test on any throw.
++fn run_in_node(functions: &[String], harness: &str) {
++    use std::io::Write;
++    use std::process::{Command, Stdio};
++
++    let mut program = include_str!("../../../../runtime/shim.js").to_owned();
++    for function in functions {
++        program.push_str(function);
++        program.push('\n');
++    }
++    program.push_str(harness);
++    let mut child = Command::new("node")
++        .arg("--input-type=commonjs")
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::piped())
++        .spawn()
++        .expect("Node is required for emitted format-kernel verification");
++    child
++        .stdin
++        .take()
++        .unwrap()
++        .write_all(program.as_bytes())
++        .unwrap();
++    let output = child.wait_with_output().unwrap();
++    assert!(
++        output.status.success(),
++        "{}\n{}",
++        String::from_utf8_lossy(&output.stderr),
++        program
++            .lines()
++            .rev()
++            .take(200)
++            .collect::<Vec<_>>()
++            .into_iter()
++            .rev()
++            .collect::<Vec<_>>()
++            .join("\n")
++    );
++}
++
++/// The templates the kernel tests drive, by the shape of the argument run they hold: adjacent
++/// host strings first and last, beside literals, three in a row, and around a non-string.
++const KERNEL_SITES: &[(&str, &[u8], &[SiteArg])] = &[
++    ("pair", b"\xc0\xc0\0", &[SiteArg::Str, SiteArg::Str]),
++    (
++        "bracketed",
++        b"\x01<\xc0\xc0\x01>\0",
++        &[SiteArg::Str, SiteArg::Str],
++    ),
++    (
++        "triple",
++        b"\xc0\xc0\xc0\0",
++        &[SiteArg::Str, SiteArg::Str, SiteArg::Str],
++    ),
++    (
++        "around_int",
++        b"\xc0\xc0\xc0\0",
++        &[SiteArg::Str, SiteArg::Int, SiteArg::Str],
++    ),
++    ("dashed", b"\xc0\x01-\xc0\0", &[SiteArg::Str, SiteArg::Str]),
++];
++
++/// The JavaScript every kernel harness shares: the host pieces (lone halves of a surrogate pair
++/// in every arrangement, the pair itself, well-formed text), the baseline model, and one row of
++/// arguments per combination of pieces for a site's argument kinds.
++const KERNEL_HARNESS_PRELUDE: &str = r#"
++const assert = require('node:assert/strict');
++const HI = String.fromCharCode(0xd83d), LO = String.fromCharCode(0xde00);
++const PIECES = [HI, LO, HI + LO, LO + HI, 'a' + HI, LO + 'b', '', 'plain', String.fromCharCode(0xe9), HI + HI];
++const INTS = [-7, 0, 42];
++const encoder = new TextEncoder();
++const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
++// The baseline `Vec<u8>` String after appending `pieces` in order: their bytes, decoded back.
++function baseline(pieces) {
++  const parts = pieces.map((piece) => encoder.encode(piece));
++  const all = new Uint8Array(parts.reduce((total, part) => total + part.length, 0));
++  let at = 0;
++  for (const part of parts) { all.set(part, at); at += part.length; }
++  return { text: decoder.decode(all), len: all.length };
++}
++function rows(kinds) {
++  let out = [[]];
++  for (const kind of kinds) {
++    const choices = kind === 'Str' ? PIECES : INTS;
++    out = out.flatMap((row) => choices.map((choice) => row.concat([choice])));
++  }
++  return out;
++}
++// The pieces the site appends, in order: template literal, argument, literal, ... literal.
++function sitePieces(literals, row) {
++  const out = [literals[0]];
++  row.forEach((arg, i) => out.push(String(arg), literals[i + 1]));
++  return out;
++}
++"#;
++
++/// `const <variable> = [{ name, kinds, literals }...]`: the [`KERNEL_SITES`] as the harness sees
++/// them, each function named `<prefix>_<site>`.
++fn kernel_site_table(variable: &str, prefix: &str) -> String {
++    let mut sites = format!("const {variable} = [\n");
++    for (name, template, args) in KERNEL_SITES {
++        let literals = crate::lower::semantic_ops::fmt_kernel::decode_template(template).unwrap();
++        let kinds: Vec<&str> = args
++            .iter()
++            .map(|arg| match arg {
++                SiteArg::Str => "'Str'",
++                SiteArg::Int => "'Int'",
++            })
++            .collect();
++        let literals: Vec<String> = literals.iter().map(|piece| format!("{piece:?}")).collect();
++        sites.push_str(&format!(
++            "  {{ name: '{prefix}_{name}', fn: {prefix}_{name}, kinds: [{}], literals: [{}] }},\n",
++            kinds.join(", "),
++            literals.join(", ")
++        ));
++    }
++    sites.push_str("];\n");
++    sites
++}
++
++/// `format!` of adjacent host `&str` arguments: as a host string and as a builder, the text and
++/// the length are the baseline's in every position — two lone halves stay two U+FFFD, never one
++/// scalar the baseline never held.
++#[test]
++fn the_format_kernel_appends_adjacent_host_strings_as_the_baseline_bytes() {
++    let mut functions = Vec::new();
++    for (carrier, prefix) in [
++        (Carrier::HostString, "host"),
++        (Carrier::StringBuilder, "builder"),
++    ] {
++        for (name, template, args) in KERNEL_SITES {
++            functions.push(format_site_js(
++                &format!("{prefix}_{name}"),
++                template,
++                args,
++                SiteConsumer::Format(carrier),
++            ));
++        }
++    }
++    let host_sites = kernel_site_table("HOST_SITES", "host");
++    let builder_sites = kernel_site_table("BUILDER_SITES", "builder");
++    let harness = format!(
++        r#"{KERNEL_HARNESS_PRELUDE}
++{host_sites}
++{builder_sites}
++for (const site of HOST_SITES) {{
++  for (const row of rows(site.kinds)) {{
++    const expected = baseline(sitePieces(site.literals, row));
++    assert.equal(site.fn(...row), expected.text, site.name + ' ' + JSON.stringify(row));
++  }}
++}}
++for (const site of BUILDER_SITES) {{
++  for (const row of rows(site.kinds)) {{
++    const expected = baseline(sitePieces(site.literals, row));
++    const value = site.fn(...row);
++    const label = site.name + ' ' + JSON.stringify(row);
++    assert.equal(value.text, expected.text, label);
++    assert.equal(value.len, expected.len, label);
++    assert.equal(value.cap, value.len, label);
++    assert.equal(__rt._sb_check(value), value, label);
++  }}
++}}
++"#
++    );
++    run_in_node(&functions, &harness);
++}
++
++/// Inline `write!` into a builder: every append adds exactly the baseline's bytes for its pieces
++/// (adjacent host halves included), the cached length advances with the text, and the capacity
++/// covers it — across two appends to the same builder.
++#[test]
++fn the_write_kernel_appends_adjacent_host_strings_and_advances_the_length() {
++    let mut functions = Vec::new();
++    for (name, template, args) in KERNEL_SITES {
++        functions.push(format_site_js(
++            &format!("write_{name}"),
++            template,
++            args,
++            SiteConsumer::WriteFmt,
++        ));
++    }
++    let sites = kernel_site_table("WRITE_SITES", "write");
++    let harness = format!(
++        r#"{KERNEL_HARNESS_PRELUDE}
++{sites}
++for (const site of WRITE_SITES) {{
++  for (const row of rows(site.kinds)) {{
++    const label = site.name + ' ' + JSON.stringify(row);
++    const builder = {{ text: 'x', cap: 1, len: 1 }};
++    const once = ['x'].concat(sitePieces(site.literals, row));
++    assert.deepEqual(site.fn(builder, ...row), {{ TAG: 'Ok', _0: undefined }}, label);
++    assert.equal(builder.text, baseline(once).text, label);
++    assert.equal(builder.len, baseline(once).len, label);
++    assert.ok(builder.cap >= builder.len, label + ': cap ' + builder.cap + ' < len ' + builder.len);
++    site.fn(builder, ...row);
++    const twice = once.concat(sitePieces(site.literals, row));
++    assert.equal(builder.text, baseline(twice).text, label);
++    assert.equal(builder.len, baseline(twice).len, label);
++    assert.ok(builder.cap >= builder.len, label + ': cap ' + builder.cap + ' < len ' + builder.len);
++    assert.equal(__rt._sb_check(builder), builder, label);
++  }}
++}}
++"#
++    );
++    run_in_node(&functions, &harness);
++}
++
++/// The `Argument::new_display` semantic body for a host `&str` takes it as Rust holds it: a lone
++/// surrogate is U+FFFD, so the native `Arguments` text it joins is well formed piece by piece.
++#[test]
++fn the_new_display_body_takes_a_host_str_as_rust_holds_it() {
++    let (table, interns) = table();
++    let signature = sig(vec![STR_REF], ARGUMENT);
++    let cx = lower_cx(
++        StandardOperation::FormatArgumentNewDisplay,
++        &signature,
++        &table,
++        &interns,
++    );
++    let rewrite = rewrite(&cx, &[]).expect("a host &str display argument lowers");
++    assert!(rewrite.runtime_helpers.contains("native_str_wf"));
++    let function = jsast::stmt_to_string(&jsast::function(
++        "display_str",
++        rewrite.parameters,
++        rewrite.statements,
++    ));
++    run_in_node(
++        &[function],
++        r#"
++const assert = require('node:assert/strict');
++const HI = String.fromCharCode(0xd83d), LO = String.fromCharCode(0xde00);
++const FFFD = String.fromCharCode(0xfffd);
++assert.equal(display_str(HI) + display_str(LO), FFFD + FFFD);
++assert.equal(display_str(HI + LO), HI + LO);
++assert.equal(display_str('plain'), 'plain');
++"#,
++    );
++}
+diff --git a/jsc-link/src/plan/representation.rs b/jsc-link/src/plan/representation.rs
+index 04631cf4b15a742b4939dd365a2453af2dfc32f9..8cb06315ebc7f640beb4ed04d7a6a497b9ebfb37 100644
+--- a/jsc-link/src/plan/representation.rs
++++ b/jsc-link/src/plan/representation.rs
+@@ -2709,6 +2709,10 @@ impl Planner<'_> {
+                 {
+                     members.insert("str_len".to_owned());
+                 }
++                // A host `&str` argument is displayed as Rust holds it (`fmt_kernel::display_text`).
++                if site.args.iter().any(|arg| arg.kind == DisplayKind::Str) {
++                    members.insert("native_str_wf".to_owned());
++                }
+                 fmt_elide.insert(site.consumer);
+                 fmt_elide.insert(site.new_call);
+                 fmt_elide.extend(site.display_calls.iter().copied());
+diff --git a/rcgjs-object/src/jir/repr.rs b/rcgjs-object/src/jir/repr.rs
+index 7368ffb19ccfafc5ec1fe91e7427f7ad7d15f498..2c5eea5c422fadba681359c827f4576378db3bee 100644
+--- a/rcgjs-object/src/jir/repr.rs
++++ b/rcgjs-object/src/jir/repr.rs
+@@ -130,7 +130,8 @@ pub enum Carrier {
+     Flat,
+     /// A `String` carried as a host string.
+     HostString,
+-    /// A `String` under construction, `{ text, cap }`.
++    /// A `String` under construction, `{ text, cap, len }`: the text, and its capacity and exact
++    /// length in UTF-8 bytes.
+     StringBuilder,
+     /// A `Vec<T>` as `{ buf, len, cap }` over a native array.
+     NativeVec,
+diff --git a/runtime/shim.js b/runtime/shim.js
+index 72ab6b298fef80e0502870f435a079245e3a38d6..a602dc610998e539456a3db38ec4ab3cd64db178 100644
+--- a/runtime/shim.js
++++ b/runtime/shim.js
+@@ -251,8 +251,8 @@ globalThis.__rt.byte_slice_ref = (p) => {
+ };
+ 
+ // `p as usize`: the synthetic address of a pointer, where `size` is the size of
+-// the pointee in bytes. Every buffer is given a base of `4096 * n` the first
+-// time it is asked about, kept in a WeakMap so that it never moves, and an
++// the pointee in bytes. Every buffer is given a base the first time it is asked
++// about (`_addr_mint`, below), kept in a WeakMap so that it never moves, and an
+ // element at offset `off` sits at `base + off * size`. A scaled slot's offset
+ // is already in bytes and is added as it is; a number is an address already and
+ // comes back unchanged.
+@@ -260,10 +260,11 @@ globalThis.__rt.byte_slice_ref = (p) => {
+ // The four properties this scheme exists for: a base is never zero, so
+ // `is_null()` is false for every real pointer and true only for `null()`; a
+ // base is at least 4096, so `NonNull::dangling()` (an alignment, always
+-// smaller) never collides with one; an address is a multiple of the element
+-// size, so alignment predicates answer correctly; and the low bits are
+-// therefore determined by the element size, which is what `fmt::Arguments`
+-// tests when it looks at `bits & 1`.
++// smaller) never collides with one; a base is aligned to the buffer's byte size
++// rounded up to a power of two (at least 16, at most 4096), so an address is a
++// multiple of the element alignment and alignment predicates answer correctly;
++// and the low bits are therefore determined by the element size, which is what
++// `fmt::Arguments` tests when it looks at `bits & 1`.
+ //
+ // `undefined` as a pointer is the reference form of a zero-sized value: every
+ // pointer to a zero-sized local, to an element of a zero-sized array, and into a
+@@ -272,7 +273,7 @@ globalThis.__rt.byte_slice_ref = (p) => {
+ // `_zst_addr`: 2^29, the largest alignment a type can ask for. No base is ever
+ // given that address, so it is never mistaken for an element of a real buffer.
+ globalThis.__rt._addrs = new WeakMap();
+-globalThis.__rt._addrNext = 0;
++globalThis.__rt._addrNext = 4096;
+ globalThis.__rt._zst_addr = 536870912;
+ globalThis.__rt.addr = (p, size) => {
+   if (typeof p === "number") return p;
+@@ -296,9 +297,8 @@ globalThis.__rt.addr = (p, size) => {
+   }
+   let base = globalThis.__rt._addrs.get(key);
+   if (base === undefined) {
+-    base = 4096 * ++globalThis.__rt._addrNext;
+-    if (base === globalThis.__rt._zst_addr) base = 4096 * ++globalThis.__rt._addrNext;
+-    globalThis.__rt._addrs.set(key, base);
++    base = globalThis.__rt._addr_mint(key, scalar !== undefined ? 1
++      : p.sc !== undefined ? p.sc : p.es === undefined ? size : p.es);
+   }
+   // A slot keyed by a property name (a field of an aggregate) has no address of
+   // its own, and reports the address of the object it is a field of.
+@@ -311,6 +311,88 @@ globalThis.__rt.addr = (p, size) => {
+   return base + off * (p.es === undefined ? size : p.es);
+ };
+ 
++// The synthetic address space. A usize is 32 bits, so every base has to fit in
++// 2^32 -- and a base that was never given back would exhaust it: one per
++// `NonNull::new` on a fresh allocation is a million allocations, which a
++// long-running page reaches. So bases are carved like a buddy allocator.
++//
++// A buffer of `n` bytes takes a granule of `2^k` bytes, the smallest power of
++// two that holds it, at least 16 and at most 4096, and its base is a multiple of
++// the granule: every type's alignment divides its size, so a buffer is aligned
++// for anything it can hold (a buffer larger than 4096 bytes is aligned to 4096,
++// as before). Granules come from a per-size free list first and from a bump
++// pointer otherwise; the alignment gap the bump leaves is split into smaller
++// free granules rather than lost. A base is handed back:
++//
++//   * by `dealloc`, for a heap block (`_addr_release`). The freed buffer keeps
++//     its entry, so a dangling pointer still answers the address it had, and a
++//     later allocation may reuse it -- exactly as a native allocator does;
++//   * by a FinalizationRegistry, for any other buffer (a stack array, a box, a
++//     string's byte view) once the engine has collected it, which is the moment
++//     nothing can ask for that address again.
++//
++// A base is therefore unique among the buffers that are alive, and stable for a
++// buffer's whole lifetime. Only when the bump pointer reaches 2^32 with no free
++// granule of the size asked is there no base to give, and that is a refusal that
++// says so rather than an address that wraps to null.
++globalThis.__rt._addrFree = Array.from({ length: 13 }, () => []);
++globalThis.__rt._addrHeap = new WeakMap();
++globalThis.__rt._addrGone = typeof FinalizationRegistry === "function"
++  ? new FinalizationRegistry((held) => {
++    // `held` is the base plus its granule's exponent, which is below 16.
++    globalThis.__rt._addrFree[held & 15].push(held - (held & 15));
++  })
++  : undefined;
++
++// _addr_mint(key, es): a base for `key`, whose elements are `es` bytes each:
++// a free granule of its size, or a fresh one from the bump pointer. The top is
++// reached only when about 2^32 bytes of granules have been live at once (a
++// million live 4 KiB buffers), which no engine's heap holds, so free granules
++// of other sizes are not split -- the top is a refusal.
++globalThis.__rt._addr_mint = (key, es) => {
++  const free = globalThis.__rt._addrFree;
++  const block = globalThis.__rt._blocks.get(key);
++  const bytes = block !== undefined ? block.bytes
++    : (typeof key.length === "number" ? key.length : 1) * (es > 0 ? es : 1);
++  let k = 4;
++  while (k < 12 && 2 ** k < bytes) k++;
++  let base = free[k].pop();
++  if (base === undefined) {
++    const size = 2 ** k;
++    base = globalThis.__rt._addrNext;
++    while (base % size !== 0) {
++      let j = 4;
++      while (j + 1 < k && base % 2 ** (j + 1) === 0) j++;
++      free[j].push(base);
++      base += 2 ** j;
++    }
++    // Never hand out the shared zero-sized address (see `addr`).
++    if (base === globalThis.__rt._zst_addr) base += 4096;
++    if (base + size > 4294967296) {
++      throw __rt.abort_error(new Error("rustc_codegen_js: the 32-bit synthetic address space is exhausted"));
++    }
++    globalThis.__rt._addrNext = base + size;
++  }
++  globalThis.__rt._addrs.set(key, base);
++  if (block !== undefined) globalThis.__rt._addrHeap.set(key, k);
++  else if (globalThis.__rt._addrGone !== undefined) globalThis.__rt._addrGone.register(key, base + k);
++  return base;
++};
++
++// _addr_release(buf, bytes): gives a heap block's granule back. `dealloc` calls
++// it without `bytes`; `realloc` calls it with the new size, and it acts only if
++// the block grew past its granule (below 4096): the block then takes a base at
++// its new size the next time it is asked, because otherwise its addresses would
++// run into its neighbours'. Rust lets a reallocation move, so the old address
++// ending with it is no change of meaning.
++globalThis.__rt._addr_release = (buf, bytes) => {
++  const k = globalThis.__rt._addrHeap.get(buf);
++  if (k === undefined || (bytes !== undefined && (k === 12 || bytes <= 2 ** k))) return;
++  globalThis.__rt._addrHeap.delete(buf);
++  globalThis.__rt._addrFree[k].push(globalThis.__rt._addrs.get(buf));
++  if (bytes !== undefined) globalThis.__rt._addrs.delete(buf);
++};
++
+ // offset_from(a, b): how many elements `a` is past `b`, for an *aggregate*
+ // pointee. The thin case is `a.off - b.off` and the backend emits it inline;
+ // this exists for the one shape that subtraction cannot answer.
+@@ -1030,13 +1112,23 @@ globalThis.__rt.unwindow = (p) => {
+ };
+ 
+ // The `str` hybrid. A `&str` is a JavaScript string, and its byte view is
+-// produced on demand by the three helpers below. The wrappers construct their
+-// native codec on first use, so importing a package never needs browser codecs.
++// produced on demand by the helpers below. The wrappers construct their native
++// codec on first use, so importing a package never needs browser codecs.
+ globalThis.__rt._encoder = {
+   value: null,
+   encode(value) {
+     return (this.value || (this.value = new TextEncoder())).encode(value);
+   },
++  // encodeInto: the bytes written into `target`, which the caller sized to hold
++  // all of them (three bytes per UTF-16 code unit is always enough). An engine
++  // whose encoder predates `encodeInto` encodes and copies.
++  into(value, target) {
++    const encoder = this.value || (this.value = new TextEncoder());
++    if (typeof encoder.encodeInto === "function") return encoder.encodeInto(value, target).written;
++    const bytes = encoder.encode(value);
++    target.set(bytes);
++    return bytes.length;
++  },
+ };
+ globalThis.__rt._decoder = {
+   value: null,
+@@ -1045,6 +1137,79 @@ globalThis.__rt._decoder = {
+   },
+ };
+ 
++// _utf8(s): the UTF-8 bytes of a JavaScript string as a fresh plain array,
++// exactly the bytes `TextEncoder` produces -- a lone surrogate is U+FFFD.
++//
++// A short ASCII string is built straight from its code units: a call into the
++// native encoder costs more than the whole loop. Anything else is encoded
++// natively and copied element by element into an array allocated at its final
++// length, which is an order of magnitude cheaper than handing the typed array to
++// `Array.prototype.slice` or `Array.from`. Strings of up to 4096 code units are
++// encoded into one reused 12 KiB scratch buffer, so they allocate only the
++// result; a longer one allocates a transient `Uint8Array`.
++globalThis.__rt._utf8_scratch = null;
++globalThis.__rt._utf8 = (s) => {
++  const n = s.length;
++  if (n <= 16) {
++    const bytes = new Array(n);
++    let i = 0;
++    for (; i < n; i++) {
++      const c = s.charCodeAt(i);
++      if (c > 0x7f) break;
++      bytes[i] = c;
++    }
++    if (i === n) return bytes;
++  }
++  let source;
++  let len;
++  if (n <= 4096) {
++    source = globalThis.__rt._utf8_scratch ||
++      (globalThis.__rt._utf8_scratch = new Uint8Array(3 * 4096));
++    len = globalThis.__rt._encoder.into(s, source);
++  } else {
++    source = globalThis.__rt._encoder.encode(s);
++    len = source.length;
++  }
++  const bytes = new Array(len);
++  for (let i = 0; i < len; i++) bytes[i] = source[i];
++  return bytes;
++};
++
++// The byte-view memo: string -> the `{ buf, off: 0, len }` record `str_bytes`
++// returned for it.
++//
++// A `&str` sliced out of a longer one is encoded again on every slice, because
++// `&s[a..b]` is `s.as_bytes()` plus a decode: a parser walking a document asks
++// for the document's bytes once per token. The memo makes that one encode per
++// operation instead of one per token, which is the difference between linear
++// and quadratic. Its lifetime is the operation and its size is bounded:
++//
++//   * it is emptied when the JavaScript stack unwinds -- the first insertion
++//     queues a microtask that clears it, so no entry outlives the synchronous
++//     run of Rust code (an export, a callback, one poll of a future) that made
++//     it. Without `queueMicrotask` only the bound below applies;
++//   * it holds at most `budget` (4 MiB) of encoded bytes; the insertion that
++//     would exceed it empties it first;
++//   * a string longer than `budget / 4` is held apart from that budget, and at
++//     most the two most recent such strings are, so one large document that
++//     every slice re-reads is not evicted by its own slices.
++//
++// Strings are immutable, so an entry can never be stale: a `String` that is
++// mutated derefs to a different JavaScript string. Two equal strings share one
++// record, which is as good as two everywhere but pointer identity -- and
++// CONTRACT.md documents identity across independent calls as not guaranteed.
++// The record and its buffer are never handed to an owner that mutates them:
++// the converters that build an owned `String` from a host string copy.
++globalThis.__rt._str_memo = { map: new Map(), bytes: 0, huge: [], armed: false, budget: 4194304 };
++
++globalThis.__rt._str_memo_clear = () => {
++  const memo = globalThis.__rt._str_memo;
++  memo.map.clear();
++  memo.bytes = 0;
++  memo.huge.length = 0;
++  memo.armed = false;
++};
++
+ // str_bytes(s): the UTF-8 bytes of a JavaScript string as `{ buf, off, len }`,
+ // which is `str::as_bytes` and `str::as_ptr`.
+ //
+@@ -1054,39 +1219,76 @@ globalThis.__rt._decoder = {
+ // same kind of thing for `__rt.copy`, `__rt.overwrite` and a bare `p.buf[p.off]`
+ // write to work on both.
+ //
+-// A four entry memo ring keyed by the string returns the *same* record for a
+-// repeated call, so `s.as_bytes().as_ptr() == s.as_bytes().as_ptr()` holds in
+-// the shapes a program actually writes and a byte slice compared with itself
+-// takes the fast path. Correctness never depends on it: the ring is four
+-// entries, so a fifth distinct string evicts the first, and two records over
+-// equal bytes are as good as one everywhere but pointer identity — which
+-// CONTRACT.md documents as not guaranteed across independent calls.
+-globalThis.__rt._strBytes = [];
+-globalThis.__rt._strBytesNext = 0;
++// A repeated call within one operation returns the *same* record (see the memo
++// above), so `s.as_bytes().as_ptr() == s.as_bytes().as_ptr()` holds in the
++// shapes a program actually writes and a byte slice compared with itself takes
++// the fast path. Correctness never depends on it.
+ globalThis.__rt.str_bytes = (s) => {
+-  const memo = globalThis.__rt._strBytes;
+-  for (let i = 0; i < memo.length; i++) {
+-    if (memo[i].s === s) return memo[i].r;
+-  }
+-  const bytes = Array.prototype.slice.call(globalThis.__rt._encoder.encode(s));
+-  const record = { buf: bytes, off: 0, len: bytes.length };
+-  memo[globalThis.__rt._strBytesNext] = { s: s, r: record };
+-  globalThis.__rt._strBytesNext = (globalThis.__rt._strBytesNext + 1) % 4;
++  const memo = globalThis.__rt._str_memo;
++  let record = memo.map.get(s);
++  if (record !== undefined) return record;
++  const bytes = globalThis.__rt._utf8(s);
++  record = { buf: bytes, off: 0, len: bytes.length };
++  if (!memo.armed) {
++    memo.armed = true;
++    if (typeof queueMicrotask === "function") queueMicrotask(globalThis.__rt._str_memo_clear);
++  }
++  if (bytes.length > memo.budget / 4) {
++    if (memo.huge.length === 2) memo.map.delete(memo.huge.shift());
++    memo.huge.push(s);
++  } else {
++    if (memo.bytes + bytes.length > memo.budget) {
++      const huge = memo.huge.map((key) => memo.map.get(key));
++      memo.map.clear();
++      memo.huge.forEach((key, i) => memo.map.set(key, huge[i]));
++      memo.bytes = 0;
++    }
++    memo.bytes += bytes.length;
++  }
++  memo.map.set(s, record);
+   return record;
+ };
+ 
++// str_bytes_mut(s): `str::as_bytes_mut` and `as_mut_ptr` -- the same bytes as
++// `str_bytes`, in a fresh record that is never memoized. A `&mut str` has no
++// mutable JavaScript form (a write through it is lost; CONTRACT.md), and the
++// `&mut str` a `String` derefs to is a decoded copy, so the one thing this owes
++// is containment: the write must not land in the view an equal string shares.
++globalThis.__rt.str_bytes_mut = (s) => {
++  const bytes = globalThis.__rt._utf8(s);
++  return { buf: bytes, off: 0, len: bytes.length };
++};
++
+ // str_len(s): the UTF-8 byte length of a JavaScript string, which is the
+-// metadata of a `&str`.
+-//
+-// The fast path is the common one: a string whose every code unit is below 0x80
+-// is one byte per unit, so its length is the answer and nothing is encoded. A
+-// scan is still O(n), but it allocates nothing, and it is exact for the
+-// surrogate pairs an astral character arrives as.
++// metadata of a `&str` and `str::len`.
++//
++// Nothing is encoded: a code unit below 0x80 is one byte, below 0x800 two, a
++// surrogate pair four, and any other unit three -- including a lone surrogate,
++// which the encoder replaces with the three-byte U+FFFD. A string long enough
++// for the scan to cost more than a lookup is answered from the byte-view memo
++// when an earlier `str_bytes` already has it, which keeps a length asked once
++// per token of a long document from costing a scan each time.
+ globalThis.__rt.str_len = (s) => {
+-  for (let i = 0; i < s.length; i++) {
+-    if (s.charCodeAt(i) > 0x7f) return globalThis.__rt._encoder.encode(s).length;
++  const n = s.length;
++  const map = globalThis.__rt._str_memo.map;
++  if (n > 64 && map.size !== 0) {
++    const record = map.get(s);
++    if (record !== undefined) return record.len;
+   }
+-  return s.length;
++  let len = n;
++  for (let i = 0; i < n; i++) {
++    const c = s.charCodeAt(i);
++    if (c < 0x80) continue;
++    if (c < 0x800) {
++      len += 1;
++    } else if ((c & 0xfc00) === 0xd800 && i + 1 < n && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
++      len += 2;
++      i++;
++    } else {
++      len += 2;
++    }
++  }
++  return len;
+ };
+ 
+ // bytes_str(buf, off, len): decodes the `len` UTF-8 bytes at `buf[off]` back
+@@ -1095,37 +1297,39 @@ globalThis.__rt.str_len = (s) => {
+ //
+ // The bytes are a plain array (see str_bytes), which the decoder does not take,
+ // so they are copied into a `Uint8Array` first; a typed array that arrived from
+-// somewhere else is sliced directly.
++// somewhere else is viewed directly. The copy is also what reads an `i8`
++// element as its byte: a store into a `Uint8Array` wraps a negative number.
+ //
+ // The ASCII fast path is what a `String` built out of `alloc` actually hits:
+ // every byte below 0x80 is its own code point, so the string is assembled
+ // directly and neither the copy nor the decoder runs. `String.fromCharCode`
+ // takes a bounded run of arguments, so the loop chunks; above the chunk size,
+-// or at the first byte that is not ASCII, the decoder takes over.
++// or at the first byte that is not ASCII (a negative `i8` included), the
++// decoder takes over.
+ globalThis.__rt._ASCII_CHUNK = 4096;
+ globalThis.__rt.bytes_str = (buf, off, len) => {
+   // A zero length `str` reads nothing, and the buffer it names may not exist at
+   // all: `let none: [u8; 0] = []` is a zero sized place, whose JavaScript value
+   // is `undefined`.
+   if (len === 0) return "";
++  const typed = buf instanceof Uint8Array;
+   if (len <= globalThis.__rt._ASCII_CHUNK) {
+-    let ascii = true;
+-    for (let i = 0; i < len; i++) {
+-      if (buf[off + i] > 0x7f) {
+-        ascii = false;
+-        break;
+-      }
+-    }
+-    if (ascii) {
++    let i = 0;
++    while (i < len && (buf[off + i] & 0x80) === 0) i++;
++    if (i === len) {
+       return String.fromCharCode.apply(
+         null,
+-        Array.prototype.slice.call(buf, off, off + len),
++        typed ? buf.subarray(off, off + len) : Array.prototype.slice.call(buf, off, off + len),
+       );
+     }
+   }
+-  const bytes = buf instanceof Uint8Array
+-    ? buf.subarray(off, off + len)
+-    : Uint8Array.from(Array.prototype.slice.call(buf, off, off + len));
++  let bytes;
++  if (typed) {
++    bytes = buf.subarray(off, off + len);
++  } else {
++    bytes = new Uint8Array(len);
++    for (let i = 0; i < len; i++) bytes[i] = buf[off + i];
++  }
+   return globalThis.__rt._decoder.decode(bytes);
+ };
+ 
+@@ -1146,6 +1350,30 @@ globalThis.__rt._utf8_width = (point) => {
+   return 4;
+ };
+ 
++// native_str_wf(s): the text a `&str` is once Rust holds it as bytes. A lone
++// surrogate (only a host can hand Rust one) is the U+FFFD that `str_bytes`
++// encodes for it, so this is exactly what a baseline `Vec<u8>` String decodes
++// back after the same append. A native String's text is only ever built from
++// such text: it stays well formed, its UTF-8 length is the sum of its pieces'
++// (`str_len`), and two appended halves can never pair into one scalar the
++// baseline never saw. A well-formed string -- every string Rust itself makes --
++// is returned as is, without allocating.
++globalThis.__rt.native_str_wf = (s) => {
++  let out = null;
++  let from = 0;
++  for (let i = 0; i < s.length; i++) {
++    const c = s.charCodeAt(i);
++    if ((c & 0xf800) !== 0xd800) continue;
++    if (c < 0xdc00 && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
++      i++;
++      continue;
++    }
++    out = (out === null ? "" : out) + s.slice(from, i) + String.fromCharCode(0xfffd);
++    from = i + 1;
++  }
++  return out === null ? s : out + s.slice(from);
++};
++
+ // Maps a UTF-8 byte boundary to the corresponding JavaScript UTF-16 index.
+ // A byte inside a code point, a negative/non-integral index, or an index past
+ // the end has no equivalent and returns -1.
+@@ -1258,18 +1486,26 @@ globalThis.__rt.native_f64_to_string = (value) => {
+     else text = digits.slice(0, decimalAt) + "." + digits.slice(decimalAt);
+     if (negative) text = "-" + text;
+   }
+-  return { text: text, cap: text.length };
++  // Every character of the rendering is ASCII: its UTF-16 length is its UTF-8
++  // length, and an owned `String` built from it is exact-fit.
++  return { text: text, cap: text.length, len: text.length };
+ };
+ 
+-// A mutable native String is `{ text, cap }`, where `cap` is measured in UTF-8
+-// bytes. Its reserve path has already established enough capacity, so pushing
+-// a Rust `char` changes only the text.
++// A mutable native String is `{ text, cap, len }`: well-formed text (see
++// native_str_wf), its Rust-visible capacity and its exact UTF-8 byte length,
++// both in bytes. Every operation keeps `len` in step with the text, so nothing
++// rescans the text to learn its length -- which is what would make building a
++// string quadratic. The compiled reserve path has already established enough
++// capacity, so pushing a Rust `char` appends it and advances the length by its
++// width.
+ globalThis.__rt.native_str_push = (value, point) => {
+   value.text += String.fromCodePoint(point);
++  value.len += globalThis.__rt._utf8_width(point);
+ };
+ 
+ // Returns -1 for `None`; every Rust `char` is otherwise a non-negative Unicode
+-// scalar value. Capacity is retained, as it is by `String::pop`.
++// scalar value. Capacity is retained, as it is by `String::pop`; the length
++// drops by the popped scalar's width.
+ globalThis.__rt.native_str_pop = (value) => {
+   const text = value.text;
+   if (text.length === 0) return -1;
+@@ -1281,20 +1517,40 @@ globalThis.__rt.native_str_pop = (value) => {
+   }
+   const point = text.codePointAt(at);
+   value.text = text.slice(0, at);
++  value.len -= globalThis.__rt._utf8_width(point);
+   return point;
+ };
+ 
+ // Rust makes an index at or past the current byte length a no-op and rejects an
+-// in-range index that is not a char boundary. Capacity is retained.
++// in-range index that is not a char boundary. Capacity is retained; the length
++// becomes the index.
+ globalThis.__rt.native_str_truncate = (value, byteIndex) => {
++  if (byteIndex >= value.len) return;
+   const text = value.text;
+   const utf16 = globalThis.__rt.native_str_utf16_index(text, byteIndex);
+-  if (utf16 >= 0) {
+-    if (utf16 < text.length) value.text = text.slice(0, utf16);
+-    return;
++  if (utf16 < 0) {
++    throw __rt.abort_error(new RangeError("native String truncate index is not a UTF-8 boundary"));
++  }
++  value.text = text.slice(0, utf16);
++  value.len = byteIndex;
++};
++
++// _sb_check(value): the `RCGJS_SB_VERIFY=1` drift check the compiler emits after
++// every mutation of a native String and around every read of its length. The
++// text must be well formed (a lone surrogate would decode differently from the
++// baseline's bytes), the cached `len` must be its UTF-8 byte length and `cap`
++// at least that; anything else is a compiler bug, reported before the length is
++// used. Returns the value, so a checked length read is
++// `__rt._sb_check(value).len`.
++globalThis.__rt._sb_check = (value) => {
++  const measured = globalThis.__rt.str_len(value.text);
++  const wellFormed = globalThis.__rt.native_str_wf(value.text) === value.text;
++  if (value.len !== measured || !(value.cap >= measured) || !wellFormed) {
++    const detail = "len " + value.len + ", cap " + value.cap + ", text measures " + measured +
++      (wellFormed ? "" : ", text has a lone surrogate");
++    throw __rt.abort_error(new RangeError("native String length drift: " + detail));
+   }
+-  if (byteIndex > globalThis.__rt.str_len(text)) return;
+-  throw __rt.abort_error(new RangeError("native String truncate index is not a UTF-8 boundary"));
++  return value;
+ };
+ 
+ globalThis.__rt.native_vec_new = (capacity) => ({
+@@ -1616,7 +1872,8 @@ globalThis.__rt.alloc_zeroed = (size, align) =>
+ // dealloc(ptr, size, align): `__rust_dealloc`. The block is unregistered and
+ // poisoned: emptying the array makes every stale pointer into it read
+ // `undefined` rather than the value it used to hold, and the `_freed` set turns
+-// a later cast through that pointer into a refusal that says so.
++// a later cast through that pointer into a refusal that says so. Its synthetic
++// address, if it was ever asked for, goes back to the free list (`addr`).
+ globalThis.__rt.dealloc = (p, size, align) => {
+   const buf = p === null || typeof p !== "object" ? null : p.buf;
+   if (buf === null || !globalThis.__rt._blocks.has(buf)) {
+@@ -1627,6 +1884,7 @@ globalThis.__rt.dealloc = (p, size, align) => {
+   }
+   globalThis.__rt._blocks.delete(buf);
+   globalThis.__rt._freed.add(buf);
++  globalThis.__rt._addr_release(buf);
+   buf.length = 0;
+ };
+ 
+@@ -1654,6 +1912,7 @@ globalThis.__rt.realloc = (p, size, align, new_size) => {
+   }
+   block.bytes = new_size;
+   buf.length = new_size / block.es;
++  globalThis.__rt._addr_release(buf, new_size);
+   return { buf, off: p.off };
+ };
+ 
+@@ -3175,12 +3434,15 @@ globalThis.__rt.host_task = (f) => {
+ };
+ 
+ // convert_host_sb(s): a host string entering the mutable native String carrier
+-// `{ text, cap }` (Phase 4 Convert adapter). An immutable host string's capacity
+-// is its UTF-8 byte length, which the carrier records exactly.
+-globalThis.__rt.convert_host_sb = (s) => ({
+-  text: s,
+-  cap: globalThis.__rt.str_len(s),
+-});
++// `{ text, cap, len }` (Phase 4 Convert adapter). The text is taken as Rust
++// holds it (native_str_wf), and an immutable host string's capacity is its
++// UTF-8 byte length, measured once: the builder's length and its exact-fit
++// capacity both.
++globalThis.__rt.convert_host_sb = (s) => {
++  const text = globalThis.__rt.native_str_wf(s);
++  const len = globalThis.__rt.str_len(text);
++  return { text: text, cap: len, len: len };
++};
+ 
+ // convert_str_block(s): the UTF-8 bytes of a host string as a fresh `{ buf, off,
+ // len }` block the caller owns (Phase 4 Convert adapter, host string back to the
+@@ -3199,11 +3461,12 @@ globalThis.__rt.convert_str_block = (s) => {
+   return { buf: p.buf, off: 0, len: shared.len, cap: shared.len };
+ };
+ 
+-// convert_sb_block(sb): a mutable native `{ text, cap }` String's bytes as a
+-// fresh registered `{ buf, off, len, cap }` block (Phase 4 Convert adapter,
++// convert_sb_block(sb): a mutable native `{ text, cap, len }` String's bytes as
++// a fresh registered `{ buf, off, len, cap }` block (Phase 4 Convert adapter,
+ // builder back to the baseline `Vec<u8>` String). The backing array is capacity
+ // length with `[0, len)` initialized, and the builder's Rust-visible capacity
+ // rides along for the baseline cap leaf — a moved String keeps its capacity.
++// The bytes have to be encoded here anyway, so the block's length is theirs.
+ globalThis.__rt.convert_sb_block = (sb) => {
+   const shared = globalThis.__rt.str_bytes(sb.text);
+   const cap = Math.max(sb.cap, shared.len);
+diff --git a/scripts/native-values.test.mjs b/scripts/native-values.test.mjs
+index 8299409fa46add3ff23ed270ed754402a8668f6d..7ed0e2bbedc20dcc7c25dcd2f56ef72260053d12 100644
+--- a/scripts/native-values.test.mjs
++++ b/scripts/native-values.test.mjs
+@@ -115,30 +115,34 @@ test("native string indices use UTF-8 bytes and UTF-16 boundaries", () => {
+   }
+ });
+ 
+-test("native string mutation preserves byte capacity", () => {
+-  const value = { text: "", cap: 32 };
++test("native string mutation preserves byte capacity and the exact byte length", () => {
++  const value = { text: "", cap: 32, len: 0 };
+ 
+   rt.native_str_push(value, 0x61);
+   rt.native_str_push(value, 0x1f600);
+   rt.native_str_push(value, 0x20ac);
+-  assert.deepEqual(value, { text: "a\u{1f600}\u20ac", cap: 32 });
++  assert.deepEqual(value, { text: "a\u{1f600}\u20ac", cap: 32, len: 8 });
+ 
+   assert.equal(rt.native_str_pop(value), 0x20ac);
++  assert.equal(value.len, 5);
+   assert.equal(rt.native_str_pop(value), 0x1f600);
++  assert.equal(value.len, 1);
+   assert.equal(rt.native_str_pop(value), 0x61);
+   assert.equal(rt.native_str_pop(value), -1);
+-  assert.equal(value.cap, 32);
++  assert.deepEqual(value, { text: "", cap: 32, len: 0 });
+ 
+   value.text = "a\u00e9\u20ac\u{1f600}z";
++  value.len = 11;
+   rt.native_str_truncate(value, 10);
+-  assert.equal(value.text, "a\u00e9\u20ac\u{1f600}");
++  assert.deepEqual(value, { text: "a\u00e9\u20ac\u{1f600}", cap: 32, len: 10 });
+   rt.native_str_truncate(value, 6);
+-  assert.equal(value.text, "a\u00e9\u20ac");
++  assert.deepEqual(value, { text: "a\u00e9\u20ac", cap: 32, len: 6 });
+   rt.native_str_truncate(value, 100);
+-  assert.equal(value.text, "a\u00e9\u20ac");
++  rt.native_str_truncate(value, 6);
++  assert.deepEqual(value, { text: "a\u00e9\u20ac", cap: 32, len: 6 });
+   assert.throws(() => rt.native_str_truncate(value, 2), RangeError);
+-  assert.equal(value.text, "a\u00e9\u20ac");
+-  assert.equal(value.cap, 32);
++  assert.throws(() => rt.native_str_truncate(value, -1), RangeError);
++  assert.deepEqual(value, { text: "a\u00e9\u20ac", cap: 32, len: 6 });
+ });
+ 
+ test("native f64 strings match Rust default Display", () => {
+@@ -160,7 +164,7 @@ test("native f64 strings match Rust default Display", () => {
+ 
+   for (const [value, expected] of cases) {
+     const actual = rt.native_f64_to_string(value);
+-    assert.deepEqual(actual, { text: expected, cap: expected.length });
++    assert.deepEqual(actual, { text: expected, cap: expected.length, len: expected.length });
+   }
+ });
+ 
+diff --git a/scripts/runtime-addr.test.mjs b/scripts/runtime-addr.test.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9312e38dacc5e53e67959be4a8dbc81a80374af
+--- /dev/null
++++ b/scripts/runtime-addr.test.mjs
+@@ -0,0 +1,154 @@
++// The synthetic address space (`__rt.addr`, `_addr_mint`): a usize is 32 bits, so bases must be
++// given back and carved by size, or a long-running program's millionth allocation is reported as
++// a failed one (`addr(p, 1) >>> 0 === 0` in `NonNull::new`).
++import assert from 'node:assert/strict'
++import { readFile } from 'node:fs/promises'
++import test from 'node:test'
++import vm from 'node:vm'
++
++const source = await readFile(new URL('../runtime/shim.js', import.meta.url), 'utf8')
++function runtime(code = source) {
++  const context = vm.createContext({})
++  vm.runInContext(code, context)
++  return context.__rt
++}
++// `NonNull::new` on a fresh allocation, exactly as the emitted code spells it.
++const nonNull = (rt, p) => rt.addr(p, 1) >>> 0
++
++// Mints well over 2^20 small blocks with interleaved frees, holding a sliding window of live
++// blocks, and checks every invariant the pointer model promises for each one.
++function churn(rt, total, window, sizes) {
++  const live = []
++  const owner = new Map()
++  let maxAddress = 0
++  for (let i = 0; i < total; i++) {
++    const size = sizes[i % sizes.length]
++    const p = rt.alloc(size, 1)
++    const address = nonNull(rt, p)
++    if (address === 0) throw new Error(`allocation ${i} of ${size} bytes got the null address`)
++    if (address !== rt.addr(p, 1)) throw new Error(`allocation ${i} wrapped past 2^32: ${rt.addr(p, 1)}`)
++    if (address < 4096) throw new Error(`allocation ${i} collides with the dangling range: ${address}`)
++    if (address === rt._zst_addr) throw new Error(`allocation ${i} was given the zero-sized address`)
++    const granule = Math.min(4096, Math.max(16, 2 ** Math.ceil(Math.log2(size))))
++    if (address % granule !== 0) throw new Error(`allocation ${i} of ${size} bytes at ${address} is not ${granule}-aligned`)
++    if (owner.has(address)) throw new Error(`allocation ${i} duplicates a live block's address ${address}`)
++    owner.set(address, p)
++    live.push([p, address])
++    maxAddress = Math.max(maxAddress, address)
++    // Interleaved frees: usually the oldest, sometimes a random live block.
++    while (live.length > window) {
++      const at = i % 7 === 0 ? (i * 2654435761 >>> 0) % live.length : 0
++      const [q, a] = live[at]
++      live[at] = live[live.length - 1]
++      live.pop()
++      if (rt.addr(q, 1) !== a) throw new Error('a live block\'s address moved')
++      owner.delete(a)
++      rt.dealloc(q, 0, 1)
++    }
++  }
++  for (const [p, a] of live) assert.equal(rt.addr(p, 1), a, 'stable for the block\'s lifetime')
++  return { maxAddress, live: live.length }
++}
++
++test('more than 2^20 small allocations with interleaved frees: no wrap, no null, no live duplicate', () => {
++  const rt = runtime()
++  const { maxAddress } = churn(rt, (1 << 20) + 50000, 300, [17, 24, 8, 64, 100, 1, 4096, 33])
++  // Reuse keeps the space compact: the window is 300 blocks, so the top stays tiny.
++  assert.ok(maxAddress < 64 * 1024 * 1024, `top of the address space reached ${maxAddress}`)
++})
++
++test('a large live set of small blocks fits: granules are sized, not 4096 bytes each', () => {
++  const rt = runtime()
++  // 1.1 million simultaneously live 16-byte blocks would need 4.5 GB of address space at a
++  // 4096-byte granule; at 16 bytes they take 18 MB.
++  const { maxAddress, live } = churn(rt, 1_100_000, 1_100_000, [16, 12, 8])
++  assert.equal(live, 1_100_000)
++  assert.ok(maxAddress < 2 ** 26, `top reached ${maxAddress}`)
++})
++
++test('the minting this replaced wraps to null after 2^20 blocks', () => {
++  const old = source.replace(
++    /base = globalThis\.__rt\._addr_mint\(key, [^;]*;/,
++    'base = 4096 * (globalThis.__rt._addrOld = (globalThis.__rt._addrOld || 0) + 1);' +
++      ' if (base === globalThis.__rt._zst_addr) base = 4096 * ++globalThis.__rt._addrOld;' +
++      ' globalThis.__rt._addrs.set(key, base);',
++  )
++  assert.notEqual(old, source)
++  assert.throws(() => churn(runtime(old), (1 << 20) + 10, 300, [17]), /null address|wrapped/)
++})
++
++test('a freed block keeps its address for dangling pointers, and the address is reused', () => {
++  const rt = runtime()
++  const a = rt.alloc(24, 8)
++  const address = nonNull(rt, a)
++  const element = rt.addr({ buf: a.buf, off: 3 }, 1)
++  assert.equal(element, address + 3)
++  rt.dealloc(a, 24, 8)
++  assert.equal(rt.addr(a, 1), address, 'a dangling pointer answers the address it had')
++  const b = rt.alloc(20, 4)
++  assert.equal(nonNull(rt, b), address, 'the freed granule is reused, as a native allocator would')
++  const c = rt.alloc(20, 4)
++  assert.notEqual(nonNull(rt, c), address)
++})
++
++test('a block realloc grows past its granule re-mints instead of overlapping its neighbours', () => {
++  const rt = runtime()
++  const v = rt.alloc(8, 1)
++  const before = nonNull(rt, v)
++  const neighbour = rt.alloc(16, 1)
++  const next = nonNull(rt, neighbour)
++  assert.equal(next, before + 16)
++  // Growing within the granule keeps the address.
++  const same = rt.realloc(v, 8, 1, 16)
++  assert.equal(rt.addr(same, 1), before)
++  // Growing past it moves the address (a reallocation may move) to a granule of the new size.
++  const grown = rt.realloc(same, 16, 1, 100)
++  const after = nonNull(rt, grown)
++  assert.notEqual(after, before)
++  assert.equal(after % 128, 0)
++  assert.ok(after + 100 <= next || after >= next + 16, 'no overlap with the live neighbour')
++  assert.equal(rt.addr({ buf: grown.buf, off: 99 }, 1), after + 99)
++  // The old granule is free again.
++  assert.equal(nonNull(rt, rt.alloc(16, 1)), before)
++})
++
++test('alignment follows the block size; elements stay multiples of their size', () => {
++  const rt = runtime()
++  for (const [bytes, align] of [[1, 16], [16, 16], [17, 32], [64, 64], [100, 128], [4096, 4096], [10000, 4096]]) {
++    const p = rt.alloc(bytes, 1)
++    assert.equal(nonNull(rt, p) % align, 0, `${bytes} bytes`)
++  }
++  // A non-heap buffer (a stack array) is sized by its length and the element size asked.
++  const words = [1, 2, 3, 4, 5, 6, 7, 8]
++  const at = rt.addr({ buf: words, off: 2 }, 8)
++  assert.equal((at - 16) % 64, 0)
++  assert.equal(at % 8, 0)
++})
++
++test('the bump never hands out the zero-sized address', () => {
++  const rt = runtime()
++  rt._addrNext = rt._zst_addr - 16
++  assert.equal(nonNull(rt, rt.alloc(16, 1)), rt._zst_addr - 16)
++  assert.equal(nonNull(rt, rt.alloc(16, 1)), rt._zst_addr + 4096)
++})
++
++test('the alignment gap the bump leaves is reused, not lost', () => {
++  const rt = runtime()
++  const small = nonNull(rt, rt.alloc(16, 1))
++  assert.equal(small, 4096)
++  const page = nonNull(rt, rt.alloc(4096, 1))
++  assert.equal(page, 8192)
++  // [4112, 8192) was carved into 16, 32, ..., 2048-byte free granules.
++  assert.equal(nonNull(rt, rt.alloc(2048, 1)), 4096 + 2048)
++  assert.equal(nonNull(rt, rt.alloc(16, 1)), 4112)
++})
++
++test('the top of the space is used to its last granule, then refused; freed granules still serve', () => {
++  const rt = runtime()
++  rt._addrNext = 2 ** 32 - 32
++  const a = rt.alloc(16, 1)
++  assert.deepEqual([nonNull(rt, a), nonNull(rt, rt.alloc(16, 1))], [2 ** 32 - 32, 2 ** 32 - 16])
++  assert.throws(() => nonNull(rt, rt.alloc(16, 1)), /address space is exhausted/)
++  rt.dealloc(a, 16, 1)
++  assert.equal(nonNull(rt, rt.alloc(16, 1)), 2 ** 32 - 32, 'a freed granule is reused even at the top')
++})
+diff --git a/scripts/runtime-string-builder.test.mjs b/scripts/runtime-string-builder.test.mjs
+new file mode 100644
+index 0000000000000000000000000000000000000000..acf73c048c8faaf1f7f39a1360010dacb8afa334
+--- /dev/null
++++ b/scripts/runtime-string-builder.test.mjs
+@@ -0,0 +1,232 @@
++// The native mutable `String` carrier `{ text, cap, len }` (jsc-link `semantic_ops/string.rs`):
++// `len` is the exact UTF-8 byte length of `text`, kept beside it so that no operation rescans the
++// text, and the text is always well formed -- exactly the text the baseline `Vec<u8>` String
++// decodes after the same appends. These tests pin the runtime half of that rule: every shim helper
++// that builds or changes a builder leaves `len` exact and the text well formed, `native_str_wf`
++// takes a host's lone surrogates as the baseline's bytes do, and `__rt._sb_check` (what
++// `RCGJS_SB_VERIFY=1` emits) catches drift. The compiled half (the inline append, `clear`, drop,
++// the constructors) is pinned byte for byte by `jsc-link`'s
++// `every_lowering_matches_its_pinned_spelling`; `append` below is that pinned `push_str` spelling.
++import assert from 'node:assert/strict'
++import { readFile } from 'node:fs/promises'
++import test from 'node:test'
++import vm from 'node:vm'
++
++const source = await readFile(new URL('../runtime/shim.js', import.meta.url), 'utf8')
++function runtime() {
++  const context = vm.createContext({ TextEncoder, TextDecoder, Uint8Array })
++  vm.runInContext(source, context)
++  return context.__rt
++}
++const encoder = new TextEncoder()
++const decoder = new TextDecoder('utf-8', { ignoreBOM: true })
++const bytes = (text) => encoder.encode(text).length
++// What the baseline `String` holds after appending `pieces`: their UTF-8 bytes (a lone surrogate
++// encodes as U+FFFD), and the text those bytes decode back to.
++function baseline(pieces) {
++  const parts = pieces.map((piece) => encoder.encode(piece))
++  const all = new Uint8Array(parts.reduce((total, part) => total + part.length, 0))
++  let at = 0
++  for (const part of parts) {
++    all.set(part, at)
++    at += part.length
++  }
++  return { text: decoder.decode(all), len: all.length }
++}
++// Well-formed scalars of every UTF-8 width, as code points.
++const points = [0x61, 0x7f, 0xe9, 0x7ff, 0x800, 0x20ac, 0xfeff, 0xffff, 0x10000, 0x1f980, 0x10ffff]
++
++// A deterministic generator, so a failure reproduces.
++function generator(seed) {
++  let state = seed >>> 0
++  return (n) => {
++    state = (Math.imul(state, 1664525) + 1013904223) >>> 0
++    return state % n
++  }
++}
++
++function assertExact(rt, value, label) {
++  assert.equal(value.len, bytes(value.text), `${label}: len is the text's UTF-8 length`)
++  assert.equal(value.len, rt.str_len(value.text), `${label}: len agrees with str_len`)
++  assert.equal(value.len, rt.str_bytes(value.text).len, `${label}: len agrees with the byte view`)
++  assert.equal(value.text, value.text.toWellFormed(), `${label}: the text is well formed`)
++  assert.ok(value.cap >= value.len, `${label}: cap ${value.cap} covers len ${value.len}`)
++  assert.equal(rt._sb_check(value), value, `${label}: _sb_check accepts and returns the value`)
++}
++
++// The compiled `push_str`/`write_str` body (its capacity guard aside), as pinned in jsc-link.
++function append(rt, value, piece) {
++  const wellFormed = rt.native_str_wf(piece)
++  const required = value.len + rt.str_len(wellFormed)
++  if (value.cap < required) value.cap = required
++  value.text += wellFormed
++  value.len = required
++}
++
++test('native_str_wf takes a string exactly as UTF-8 bytes hold it', () => {
++  const rt = runtime()
++  const cases = ['', 'plain', '\u00e9\u20ac\u{1f980}', '\ud83d', '\ude00', '\ude00\ud83d', 'a\ud83db', 'a\ude00b',
++    '\ud83d\ud83d\ude00', '\ud83d\ude00\ude00', '\ufffd', '\ufeff\ud800', '\udbff\udfff', 'x'.repeat(5000) + '\udc00']
++  for (const text of cases) {
++    const wellFormed = rt.native_str_wf(text)
++    assert.equal(wellFormed, text.toWellFormed(), JSON.stringify(text))
++    assert.equal(wellFormed, decoder.decode(encoder.encode(text)), `${JSON.stringify(text)} round trips through bytes`)
++    assert.equal(rt.str_len(wellFormed), rt.str_len(text), 'sanitizing never changes the UTF-8 length')
++  }
++})
++
++test('appending lone and paired surrogates at every junction matches the baseline bytes', () => {
++  const rt = runtime()
++  const units = ['a', '\u00e9', '\u20ac', '\ud83d', '\ude00', '\ud83d\ude00', '\ufffd', '\ufeff', '\udbff', '\udc00']
++  // Every ordered pair of pieces, so each text-tail/piece-head kind meets every other once.
++  for (const left of units) {
++    for (const right of units) {
++      for (const tail of ['', 'x', '\ud83d']) {
++        const pieces = [left + tail, right, tail + left]
++        const value = { text: '', cap: 0, len: 0 }
++        for (const piece of pieces) append(rt, value, piece)
++        const expected = baseline(pieces)
++        assert.equal(value.text, expected.text, JSON.stringify(pieces))
++        assert.equal(value.len, expected.len, JSON.stringify(pieces))
++        assertExact(rt, value, JSON.stringify(pieces))
++      }
++    }
++  }
++  // Random pieces of up to five units drawn from the same alphabet, appended to random builders.
++  const next = generator(11)
++  for (let round = 0; round < 300; round++) {
++    const value = { text: '', cap: next(8), len: 0 }
++    const pieces = []
++    for (let k = next(12); k > 0; k--) {
++      let piece = ''
++      for (let n = next(6); n > 0; n--) piece += units[next(units.length)]
++      pieces.push(piece)
++      append(rt, value, piece)
++    }
++    const expected = baseline(pieces)
++    assert.equal(value.text, expected.text, JSON.stringify(pieces))
++    assert.equal(value.len, expected.len, JSON.stringify(pieces))
++    assertExact(rt, value, `round ${round}`)
++  }
++})
++
++test('push, pop and truncate keep the cached length exact over mixed widths', () => {
++  const rt = runtime()
++  const next = generator(7)
++  const value = { text: '', cap: 0, len: 0 }
++  for (let step = 0; step < 4000; step++) {
++    const choice = next(10)
++    if (choice < 7) {
++      const point = points[next(points.length)]
++      // The compiled append reserves first (cap only grows); the helper appends.
++      const required = value.len + rt._utf8_width(point)
++      if (value.cap < required) value.cap = required
++      rt.native_str_push(value, point)
++    } else if (choice < 9) {
++      const before = value.text
++      const popped = rt.native_str_pop(value)
++      if (before === '') assert.equal(popped, -1)
++      else assert.equal(value.text + String.fromCodePoint(popped), before, 'pop removes the last scalar')
++    } else {
++      // A char boundary somewhere in [0, len], or one past it (a no-op).
++      const boundaries = [0]
++      for (const scalar of value.text) boundaries.push(boundaries[boundaries.length - 1] + bytes(scalar))
++      const index = next(3) === 0 ? value.len + 1 + next(4) : boundaries[next(boundaries.length)]
++      const cap = value.cap
++      rt.native_str_truncate(value, index)
++      assert.equal(value.cap, cap, 'truncate keeps the capacity')
++    }
++    assertExact(rt, value, `step ${step}`)
++  }
++})
++
++test('truncate rejects a byte index inside a scalar and leaves the builder untouched', () => {
++  const rt = runtime()
++  const text = 'a\u00e9\u20ac\u{1f980}z'
++  const value = { text, cap: 40, len: bytes(text) }
++  for (const index of [2, 4, 5, 7, 8, 9, -1, 1.5, NaN]) {
++    // The runtime lives in its own realm: its RangeError is not this module's.
++    assert.throws(() => rt.native_str_truncate(value, index), (error) => error.name === 'RangeError' && rt.is_abort(error))
++    assert.deepEqual({ ...value }, { text, cap: 40, len: 11 })
++  }
++  for (const index of [11, 12, 1000]) {
++    rt.native_str_truncate(value, index)
++    assert.deepEqual({ ...value }, { text, cap: 40, len: 11 }, `${index} is at or past the end: a no-op`)
++  }
++})
++
++test('the runtime constructors take their text as Rust holds it, measured once, exact-fit', () => {
++  const rt = runtime()
++  const texts = ['', 'plain', 'Gr\u00fc\u00dfe', '\u20ac\u{1f980}\ufeff', 'a'.repeat(5000), 'a\u00e9'.repeat(3000), '\ud83d', 'x\udc00y', '\ude00\ud83d']
++  for (const text of texts) {
++    const value = rt.convert_host_sb(text)
++    assert.deepEqual(Object.keys(value), ['text', 'cap', 'len'], 'one property order for every builder')
++    // A lone surrogate is U+FFFD, three bytes, exactly as the baseline's bytes hold it.
++    assert.deepEqual({ ...value }, { text: baseline([text]).text, cap: baseline([text]).len, len: baseline([text]).len })
++    assertExact(rt, value, JSON.stringify(text))
++  }
++  for (const number of [0, -0, 1 / 3, 1e23, Number.MAX_VALUE, NaN, -Infinity]) {
++    const value = rt.native_f64_to_string(number)
++    assert.deepEqual(Object.keys(value), ['text', 'cap', 'len'])
++    assert.equal(value.len, bytes(value.text))
++    assert.equal(value.cap, value.len)
++  }
++})
++
++test('a builder converted to a baseline block carries its length and capacity', () => {
++  const rt = runtime()
++  for (const text of ['', 'abc', '\u00e9\u{1f980}', 'z'.repeat(5000), '\ud83d']) {
++    const value = rt.convert_host_sb(text)
++    value.cap += 9
++    const block = rt.convert_sb_block(value)
++    assert.equal(block.len, value.len)
++    assert.equal(block.cap, value.cap)
++    assert.equal(rt.bytes_str(block.buf, 0, block.len), value.text)
++  }
++})
++
++test('_sb_check reports drift as an abort, never as a wrong length', () => {
++  const rt = runtime()
++  const drifted = [
++    { text: 'abc', cap: 8, len: 2 },
++    { text: '\u00e9', cap: 8, len: 1 },
++    { text: '\u{1f980}', cap: 8, len: 2 },
++    { text: 'abc', cap: 2, len: 3 },
++    { text: 'abc', cap: 8 },
++    { text: 'abc', cap: undefined, len: 3 },
++    // The right length for a lone surrogate, but text the baseline could never hold.
++    { text: '\ud83d', cap: 3, len: 3 },
++    { text: '\ud83d\ude00', cap: 6, len: 6 },
++  ]
++  for (const value of drifted) {
++    assert.throws(
++      () => rt._sb_check(value),
++      (error) => error.name === 'RangeError' && rt.is_abort(error) && /native String length drift/.test(error.message),
++      JSON.stringify(value),
++    )
++  }
++})
++
++test('appending never measures the accumulated text', () => {
++  const rt = runtime()
++  const measure = rt.str_len
++  let measured = 0
++  rt.str_len = (text) => {
++    measured += text.length
++    return measure(text)
++  }
++  const value = rt.convert_host_sb('')
++  value.cap = 4 * 20000
++  measured = 0
++  for (let i = 0; i < 20000; i++) rt.native_str_push(value, points[i % points.length])
++  assert.equal(measured, 0, 'native_str_push advances the length by the scalar width alone')
++  let appended = 0
++  for (let i = 0; i < 2000; i++) {
++    const piece = i % 3 === 0 ? 'ab\u20ac' : i % 3 === 1 ? '\ud83d' : '\ude00x'
++    appended += piece.length
++    append(rt, value, piece)
++  }
++  assert.equal(measured, appended, 'push_str measures the piece alone')
++  rt.str_len = measure
++  assertExact(rt, value, 'after 20000 pushes and 2000 appends')
++})
+diff --git a/scripts/runtime-utf8.test.mjs b/scripts/runtime-utf8.test.mjs
+index 8e9474d5f5056815839aeaf8af4d9fc1b94d6554..c94d96b4b9444704bdfd51963bdf30267d95ffa0 100644
+--- a/scripts/runtime-utf8.test.mjs
++++ b/scripts/runtime-utf8.test.mjs
+@@ -33,3 +33,217 @@ for (const compiler of ['mires-v2']) {
+     assert.throws(() => verify(runtime(faulty)), assert.AssertionError)
+   })
+ }
++
++// ---------------------------------------------------------------------------------------------
++// The byte view, its length, and the memo that bounds re-encoding (CONTRACT.md, "`str` is a
++// hybrid"). Every expected byte sequence comes from the host's own TextEncoder.
++
++const source = await readFile(new URL('../runtime/shim.js', import.meta.url), 'utf8')
++const encoder = new TextEncoder()
++const decoder = new TextDecoder('utf-8', { ignoreBOM: true })
++const utf8 = (text) => Array.from(encoder.encode(text))
++const view = (record) => Array.from(record.buf).slice(record.off, record.off + record.len)
++const label = (text) => JSON.stringify(text.slice(0, 12))
++// A runtime whose microtasks are collected rather than run, so a test decides when the stack
++// "unwinds".
++function scheduled() {
++  const jobs = []
++  const context = vm.createContext({ TextEncoder, TextDecoder, Uint8Array, queueMicrotask: (job) => jobs.push(job) })
++  vm.runInContext(source, context)
++  return { rt: context.__rt, jobs, unwind: () => { while (jobs.length) jobs.shift()() } }
++}
++
++const astral = '😀'
++const encodings = [
++  '', 'a', 'ascii only, sixteen', 'exactly 16 chars', 'seventeen chars!!', '\0\x7f',
++  '\x80', '߿', 'é', 'Grüße', 'ࠀ', '￿', '世界', astral, 'a' + astral + 'b',
++  '﻿', '﻿BOM', 'x﻿',
++  // Lone and misordered surrogates: the encoder writes U+FFFD (three bytes) for each.
++  '\ud800', '\udc00', 'a\ud800', '\ud800b', '\udc00\ud800', '\ud800𐀀', astral + '\ud83d',
++  'é'.repeat(4096), '世'.repeat(5000), astral.repeat(3000) + '\ud800',
++  'a'.repeat(4096), 'a'.repeat(4097), 'a'.repeat(1 << 20), ('Grüße 世界 ' + astral).repeat(80000),
++]
++
++test('str_bytes and str_len agree with TextEncoder on every width, BOMs, lone surrogates and 1 MB', () => {
++  const { rt } = scheduled()
++  for (const text of encodings) {
++    const want = utf8(text)
++    const record = rt.str_bytes(text)
++    assert.equal(record.off, 0)
++    assert.equal(record.len, want.length, `len of ${label(text)}`)
++    assert.ok(Array.isArray(record.buf), 'the byte view is a plain array, the kind every [u8] is')
++    assert.deepEqual(view(record), want, `bytes of ${label(text)}`)
++    assert.equal(rt.str_len(text), want.length, `str_len of ${label(text)}`)
++    assert.equal(rt.bytes_str(record.buf, record.off, record.len), decoder.decode(encoder.encode(text)))
++  }
++  // str_len never needs the memo: a fresh runtime answers before any str_bytes.
++  const fresh = scheduled().rt
++  for (const text of encodings) assert.equal(fresh.str_len(text), utf8(text).length, `fresh str_len of ${label(text)}`)
++  assert.equal(fresh._str_memo.map.size, 0, 'str_len does not populate the memo')
++})
++
++test('str_len and str_bytes match TextEncoder on random UTF-16, including unpaired surrogates', () => {
++  const { rt } = scheduled()
++  let seed = 12345
++  const next = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0)
++  const units = [0x41, 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xfeff, 0xffff]
++  for (let i = 0; i < 4000; i++) {
++    const n = next() % 90
++    let text = ''
++    for (let j = 0; j < n; j++) text += String.fromCharCode(next() % 3 ? units[next() % units.length] : next() & 0xffff)
++    assert.equal(rt.str_len(text), encoder.encode(text).length, JSON.stringify(text))
++    assert.deepEqual(view(rt.str_bytes(text)), utf8(text), JSON.stringify(text))
++  }
++})
++
++test('an encoder without encodeInto still produces the same bytes', () => {
++  class OldEncoder { encode(text) { return encoder.encode(text) } }
++  const context = vm.createContext({ TextEncoder: OldEncoder, TextDecoder, Uint8Array })
++  vm.runInContext(source, context)
++  for (const text of ['Grüße', '世界' + astral, '\ud800x', 'é'.repeat(5000), 'ascii']) {
++    assert.deepEqual(view(context.__rt.str_bytes(text)), utf8(text), label(text))
++  }
++})
++
++test('bytes_str reads i8 elements and typed arrays as bytes', () => {
++  const { rt } = scheduled()
++  // `é` is C3 A9; as i8 elements those are -61 and -87. A negative byte is not ASCII.
++  assert.equal(rt.bytes_str([0x61, -61, -87, 0x62], 0, 4), 'aéb')
++  assert.equal(rt.bytes_str([-16, -97, -104, -128], 0, 4), astral)
++  const typed = encoder.encode('xx' + 'Grüße' + 'yy')
++  assert.equal(rt.bytes_str(typed, 2, typed.length - 4), 'Grüße')
++  assert.equal(rt.bytes_str(encoder.encode('plain ascii'), 0, 11), 'plain ascii')
++  const long = 'é'.repeat(3000)
++  assert.equal(rt.bytes_str(utf8(long), 0, utf8(long).length), long)
++})
++
++test('within one operation a string has one byte view, and the memo empties when the stack unwinds', () => {
++  const { rt, jobs, unwind } = scheduled()
++  const doc = 'line one\nline two\n'.repeat(500)
++  const first = rt.str_bytes(doc)
++  assert.equal(jobs.length, 1, 'the first insertion queues exactly one clearing microtask')
++  // Many other strings pass through between two reads of the document -- the shape that evicted
++  // the old four-entry ring on every source line.
++  for (let i = 0; i < 1000; i++) rt.str_bytes(`token ${i}`)
++  assert.equal(rt.str_bytes(doc), first, 'same record within the operation')
++  assert.equal(rt.str_bytes(doc.split('').join('')), first, 'equal content is the same key')
++  assert.equal(jobs.length, 1, 'no further microtasks while armed')
++  assert.equal(rt.str_len(doc), utf8(doc).length)
++  unwind()
++  assert.equal(rt._str_memo.map.size, 0)
++  assert.equal(rt._str_memo.bytes, 0)
++  const second = rt.str_bytes(doc)
++  assert.notEqual(second, first, 'a new operation encodes again')
++  assert.deepEqual(view(second), view(first))
++  assert.equal(jobs.length, 1, 'the next operation re-arms the clear')
++})
++
++test('the memo is bounded by bytes beyond its capacity, and a huge string survives its slices', () => {
++  const { rt } = scheduled()
++  const memo = rt._str_memo
++  const budget = memo.budget
++  assert.equal(budget, 4 * 1024 * 1024)
++  // Well past capacity with distinct medium strings: always correct, never above the budget.
++  const chunk = 'm'.repeat(64 * 1024 - 8)
++  for (let i = 0; i < 200; i++) {
++    const text = chunk + String(i).padStart(8, '0')
++    const record = rt.str_bytes(text)
++    assert.equal(record.len, text.length)
++    assert.equal(record.buf[record.len - 1], text.charCodeAt(text.length - 1))
++    assert.ok(memo.bytes <= budget, `held ${memo.bytes} bytes`)
++    let total = 0
++    for (const [key, value] of memo.map) if (!memo.huge.includes(key)) total += value.len
++    assert.equal(total, memo.bytes, 'the byte count is exact')
++  }
++  // A document larger than budget / 4 is held apart: churning more than the whole budget through
++  // the memo does not evict it, so slicing it stays linear.
++  const doc = ('# heading\n\n' + 'text '.repeat(40) + '\n').repeat(6000)
++  assert.ok(doc.length > budget / 4)
++  const record = rt.str_bytes(doc)
++  for (let i = 0; i < 400; i++) {
++    rt.str_bytes(chunk + 'x' + i)
++    assert.equal(rt.str_bytes(doc), record, `document evicted after ${i} slices`)
++  }
++  // At most two huge strings are held; a third evicts the oldest.
++  const second = doc + 'b', third = doc + 'c'
++  const r2 = rt.str_bytes(second)
++  rt.str_bytes(third)
++  assert.equal(memo.huge.length, 2)
++  assert.equal(rt.str_bytes(second), r2)
++  assert.notEqual(rt.str_bytes(doc), record, 'the oldest huge string was evicted')
++})
++
++test('without queueMicrotask the byte bound alone applies', () => {
++  const rt = runtime(source)
++  for (let i = 0; i < 100; i++) rt.str_bytes('n'.repeat(100 * 1024) + i)
++  assert.ok(rt._str_memo.bytes <= rt._str_memo.budget)
++  assert.equal(rt._str_memo.armed, true)
++})
++
++test('an owned String converted from a host string never aliases the memoized view', () => {
++  const { rt } = scheduled()
++  for (const text of ['owned', 'Grüße ' + astral, 'a'.repeat(5000)]) {
++    const shared = rt.str_bytes(text)
++    const before = view(shared)
++    const owned = rt.convert_str_block(text)
++    assert.notEqual(owned.buf, shared.buf)
++    owned.buf[0] = 0x21
++    owned.buf.push(0x21)
++    assert.deepEqual(view(rt.str_bytes(text)), before)
++    const builder = rt.convert_sb_block({ text, cap: before.length + 8, len: before.length })
++    assert.notEqual(builder.buf, shared.buf)
++    builder.buf[1] = 0x21
++    assert.deepEqual(view(rt.str_bytes(text)), before)
++    // A mutated String derefs to a different JavaScript string: never a stale view.
++    const mutated = rt.bytes_str(owned.buf, 0, before.length)
++    assert.notEqual(mutated, text)
++    assert.deepEqual(view(rt.str_bytes(mutated)), utf8(mutated))
++  }
++})
++
++test('a mutable byte view (as_bytes_mut) is fresh, so a write through it never reaches the memo', () => {
++  const { rt } = scheduled()
++  const text = 'Hello World'
++  const shared = rt.str_bytes(text)
++  const mutable = rt.str_bytes_mut(text)
++  assert.notEqual(mutable, shared)
++  assert.notEqual(mutable.buf, shared.buf)
++  assert.deepEqual(view(mutable), utf8(text))
++  for (let i = 0; i < mutable.len; i++) mutable.buf[i] |= 0x20
++  assert.deepEqual(view(rt.str_bytes(text)), utf8(text), 'the shared view is untouched')
++  assert.equal(rt.str_len(text), 11)
++  assert.notEqual(rt.str_bytes_mut(text), mutable, 'never memoized')
++})
++
++// Timing, printed and never asserted: the old conversion (`Array.prototype.slice` over the
++// encoder's typed array) against `_utf8`, on fresh strings (a miss every time), and a memo hit.
++test('str_bytes timing (printed, not asserted)', () => {
++  const { rt, unwind } = scheduled()
++  const ascii = ('## Section 12\n\n- **browser** compiler\n- [report](https://example.test/12)\n\n').repeat(120).slice(0, 8192)
++  const mixed = ('Grüße, 世界! emoji ' + astral + ' and ascii, ').repeat(300).slice(0, 8192)
++  const old = (s) => Array.prototype.slice.call(encoder.encode(s))
++  const time = (f, iterations) => {
++    for (let i = 0; i < 20; i++) f(i)
++    const samples = []
++    for (let r = 0; r < 7; r++) {
++      const start = process.hrtime.bigint()
++      for (let i = 0; i < iterations; i++) f(i)
++      samples.push(Number(process.hrtime.bigint() - start) / iterations / 1000)
++    }
++    return samples.sort((a, b) => a - b)[3].toFixed(2)
++  }
++  const rows = []
++  for (const [name, text] of [['8 KB ASCII', ascii], ['8 KB mixed', mixed]]) {
++    // A distinct string object per call, so no memo applies to the miss columns.
++    const fresh = Array.from({ length: 64 }, () => JSON.parse(JSON.stringify(text)))
++    rows.push({
++      input: name,
++      'before: slice.call(encode) µs': time((i) => old(fresh[i & 63]), 200),
++      'after: miss µs': time((i) => { unwind(); return rt.str_bytes(fresh[i & 63]) }, 200),
++      'after: memo hit µs': time(() => rt.str_bytes(text), 2000),
++      'str_len, no memo µs': time((i) => { unwind(); return rt.str_len(fresh[i & 63]) }, 200),
++    })
++  }
++  console.log('# str_bytes timing (median of 7)')
++  console.table(rows)
++})
