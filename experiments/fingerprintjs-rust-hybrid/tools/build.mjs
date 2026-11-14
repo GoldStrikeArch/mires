@@ -31,7 +31,7 @@ const rustOptLevel = options['rust-opt-level'] === undefined
 if (rustOptLevel && !['0', '1', '2', '3', 's', 'z'].includes(rustOptLevel)) {
   throw new Error('--rust-opt-level must be 0, 1, 2, 3, s, or z')
 }
-const mirInline = options['mir-inline'] === undefined ? 'off' : String(options['mir-inline'])
+const mirInline = String(options['mir-inline'] ?? (process.env.JSC_RUST_MIR_INLINE || 'off'))
 if (!['off', 'on'].includes(mirInline)) {
   throw new Error('--mir-inline must be off or on')
 }
@@ -365,7 +365,12 @@ function compile(arguments_, extraEnvironment = {}) {
 }
 
 async function ensureSysroot() {
-  const sysroot = command('bash', [resolve(compilerRoot, 'scripts/sysroot-cache.sh'), 'path'], {
+  const cacheScript = resolve(compilerRoot, 'scripts/sysroot-cache.sh')
+  const expectedArgs = command('bash', [cacheScript, 'args'], {
+    cwd: compilerRoot,
+    env: { ...process.env, ...compilerEnvironment },
+  }).trim()
+  const sysroot = command('bash', [cacheScript, 'path'], {
     cwd: compilerRoot,
     env: { ...process.env, ...compilerEnvironment },
   }).trim()
@@ -381,7 +386,7 @@ async function ensureSysroot() {
   } catch {
     // The sysroot builder below gives the useful prerequisite error.
   }
-  if (currentArgs?.trim() === optimizerEmitArgs && currentRustOpt?.trim() === rustOptLevel) return
+  if (currentArgs?.trim() === expectedArgs && currentRustOpt?.trim() === rustOptLevel) return
   command(resolve(compilerRoot, 'scripts/build_sysroot.sh'), [], {
     cwd: compilerRoot,
     env: { ...process.env, ...compilerEnvironment, SKIP_BUILD: '1' },

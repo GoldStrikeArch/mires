@@ -125,18 +125,17 @@ jsc_normalize_emit_args() {
 	jsc_normalize_args "$profile${profile:+ }$emit"
 }
 
-# The panic strategy `JSC_PANIC` selects: `abort` (unset, the default) or `unwind`.
+# The panic strategy `JSC_PANIC` selects: `unwind` (unset, the default) or `abort` (opt-in override).
 #
-# `abort` is the compiler as it always was: target wasm32-unknown-unknown, `-Cpanic=abort`, and
-# host-exception cleanup re-derived by the backend from unoptimized MIR (`js-cleanup=on`). `unwind`
-# compiles the sysroot and every crate for targets/mires32-unwind.json, whose panic strategy is
-# `unwind`, with `-Cpanic=unwind`: rustc's optimized MIR then keeps its unwind edges and the backend
-# lowers those instead, so `js-cleanup=off` follows the caller's backend options
-# (`jsc_mode_backend_args`). With `JSC_PANIC` unset nothing here changes a key, a flag or a path.
+# `unwind` compiles the sysroot and every crate for targets/mires32-unwind.json, whose panic
+# strategy is `unwind`, with `-Cpanic=unwind`: rustc's optimized MIR keeps its unwind edges and the
+# backend lowers those instead, so `js-cleanup=off` follows the caller's backend options
+# (`jsc_mode_backend_args`). `abort` is the legacy `-Cpanic=abort` mode on wasm32-unknown-unknown,
+# where host-exception cleanup is re-derived by the backend from unoptimized MIR (`js-cleanup=on`).
 jsc_panic() {
 	case "${JSC_PANIC:-}" in
-	"" | abort) printf 'abort' ;;
-	unwind) printf 'unwind' ;;
+	"" | unwind) printf 'unwind' ;;
+	abort) printf 'abort' ;;
 	*)
 		echo "sysroot-cache.sh: invalid JSC_PANIC: $JSC_PANIC (expected unset, abort or unwind)" >&2
 		return 1

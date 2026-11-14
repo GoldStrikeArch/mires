@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The unwind build mode's own fixtures (examples/unwind-tests/), in the mode JSC_PANIC selects:
-# run it once unset and once with JSC_PANIC=unwind. Each fixture compiles on the JIR lane under
+# run it once unset (`unwind` default) and once with `JSC_PANIC=abort`. Each fixture compiles on the JIR lane under
 # js-profile=release-balanced in optimizer modes off and on, in two settings (rustc's defaults, and
 # JSC_RUST_MIR_INLINE=on JSC_RUST_OPT_LEVEL=z), then runs normally and with the host throwing
 # (scripts/unwind-mode-check.mjs): the guard must drop and the thrown value must leave unchanged.

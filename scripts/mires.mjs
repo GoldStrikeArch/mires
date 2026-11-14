@@ -9,15 +9,16 @@ import { gzipSync, brotliCompressSync, constants } from 'node:zlib';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const help = `Usage: node scripts/mires.mjs build source.rs --out build/app.mjs
   --profile dev|report|release-size|release-balanced|release-speed
-  --cleanup on|off       Default: on. off omits recoverable host-exception cleanup.
-                         With JSC_PANIC=unwind the default is off and on is refused:
-                         that mode keeps cleanup through rustc's unwind edges.
+  --cleanup on|off       Default: off (in default unwind mode, where rustc's unwind
+                         edges keep cleanup and --cleanup on is refused). Under
+                         JSC_PANIC=abort, defaults to on (off omits cleanup).
   --extern name=path     Repeat for dependencies compiled with matching settings.
   --search directory    Repeat for transitive dependencies.
   --skip-build          Reuse the existing backend/linker; still resolve the sysroot.
 
-JSC_PANIC=unwind selects the unwind build mode (scripts/sysroot-cache.sh);
-unset, the build is the abort mode as before. The receipt records the mode.
+JSC_PANIC defaults to unwind (targets/mires32-unwind.json, scripts/sysroot-cache.sh);
+set JSC_PANIC=abort for -Cpanic=abort. JSC_RUST_MIR_INLINE defaults to off for client
+crates (set JSC_RUST_MIR_INLINE=on to enable). The receipt records the panic mode.
 
 Input is a no_std library with exported functions and a panic handler. Output is
 an ES module, a reached-only runtime module, source map and artifact manifest.
@@ -34,8 +35,10 @@ try {
   if (!args.length || args.includes('--help') || args[0]==='help') {console.log(help);process.exit(0);}
   if (args.shift() !== 'build') throw new Error('expected build; use --help');
   const src=args.shift(); if (!src || src.startsWith('-')) throw new Error('missing Rust source');
-  const panic=process.env.JSC_PANIC||'abort';
+  const panic=process.env.JSC_PANIC||'unwind';
   if(!['abort','unwind'].includes(panic))throw new Error('JSC_PANIC must be unset, abort or unwind');
+  const mirInline=process.env.JSC_RUST_MIR_INLINE||'off';
+  if(!['off','on'].includes(mirInline))throw new Error('JSC_RUST_MIR_INLINE must be unset, off or on');
   let output,profile='release-balanced',cleanup=panic==='unwind'?'off':'on',skip=false;const extra=[];
   while(args.length) {
     const k=args.shift();
@@ -55,8 +58,8 @@ try {
   mkdirSync(dirname(out),{recursive:true});
   const runtimeName=basename(out,'.mjs')+'.runtime.mjs';
   const emit=`js-profile=${profile} js-cleanup=${cleanup}`;
-  const env={...process.env,JS_EXTRA_ARGS:emit,JSC_SYSROOT_ARGS:emit,JSC_REMAP_ROOT:dirname(input),SKIP_BUILD:'1',...(panic==='unwind'?{JSC_PANIC:panic}:{})};
-  delete env.JSC_RUST_OPT_LEVEL;delete env.JSC_RUST_MIR_INLINE;
+  const env={...process.env,JS_EXTRA_ARGS:emit,JSC_SYSROOT_ARGS:emit,JSC_REMAP_ROOT:dirname(input),SKIP_BUILD:'1',JSC_PANIC:panic,JSC_RUST_MIR_INLINE:mirInline};
+  delete env.JSC_RUST_OPT_LEVEL;
   if(!skip)run('bash',['scripts/build.sh','--locked'],env);
   run('bash',['scripts/build_sysroot.sh'],env);
   run('bash',['scripts/compile_core.sh',input,out,...extra],{...env,JS_EXTRA_ARGS:`${emit} js-lane=jir js-modules=esm js-shim-module=./${runtimeName} js-source-map=on js-opt-warnings=off`});

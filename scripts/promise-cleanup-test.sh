@@ -33,7 +33,7 @@ for mode in off report on; do
       # JSC_PANIC=unwind: rustc's optimized MIR keeps cleanup blocks, which only the JIR lane lowers,
       # so the baseline lane refuses such a program (CONTRACT.md). That refusal is a skip, printed
       # and counted; any other failure fails the suite as before.
-      if [ "${JSC_PANIC:-}" = unwind ] && [ "$lane" = baseline ] && [ ! -e "$program" ] &&
+      if [ "${JSC_PANIC:-unwind}" = unwind ] && [ "$lane" = baseline ] && [ ! -e "$program" ] &&
         grep -q 'requires semantic cleanup lowering' "$program.compile.log"; then
         echo "$lane/$mode: SKIP (JSC_PANIC=unwind: the baseline lane cannot build a program with cleanup; refused with 'requires semantic cleanup lowering')"
         skipped=$((skipped + 1))

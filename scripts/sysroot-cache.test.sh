@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
-# The checks below describe the default build mode's keys; the unwind mode's are checked at the
-# end with JSC_PANIC set per command. An inherited selector must not move the default ones.
-unset JSC_PANIC
+# The checks below describe the abort mode's keys (selected explicitly with `JSC_PANIC=abort`); the
+# default unwind mode's keys (unset / `JSC_PANIC=unwind`) are checked at the end.
+export JSC_PANIC=abort
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=sysroot-cache.sh
@@ -225,31 +225,36 @@ cleanup_off=$(JS_EXTRA_ARGS="js-profile=release-balanced js-cleanup=off" key)
 [ "$cleanup_off" != "$profile_balanced" ]
 [ "$cleanup_off" = "$(JS_EXTRA_ARGS="js-cleanup=off js-profile=release-balanced" key)" ]
 
-# The unwind build mode (`JSC_PANIC=unwind`) is keyed apart from every default sysroot: its panic
-# strategy, its target and the target spec's content join the key, and `js-cleanup=off` follows the
-# caller's options, so a pinned `js-cleanup=on` or a release profile is overridden. `abort` is the
-# default spelled out, and anything else is refused rather than keyed.
+# The unwind build mode (unset or `JSC_PANIC=unwind`, the default) is keyed apart from every
+# abort sysroot (`JSC_PANIC=abort`): its panic strategy, its target and the target spec's content
+# join the key, and `js-cleanup=off` follows the caller's options, so a pinned `js-cleanup=on` or
+# a release profile is overridden. `abort` is the opt-in override, and anything else is refused.
+unset JSC_PANIC
 mkdir -p "$work/root/targets"
 printf 'spec-a' >"$work/root/targets/mires32-unwind.json"
-unwind_key() { JSC_PANIC=unwind JSC_TARGET=mires32-unwind key; }
+unwind_key() { JSC_TARGET=mires32-unwind key; }
 [ "$(JSC_PANIC=abort JS_EXTRA_ARGS='js-opt=report js-minify=on' key)" = "$first" ]
 unwind=$(JS_EXTRA_ARGS='js-opt=report js-minify=on' unwind_key)
+[ "$unwind" = "$(JSC_PANIC=unwind JS_EXTRA_ARGS='js-opt=report js-minify=on' unwind_key)" ]
 [ "$unwind" != "$first" ]
 [ "$unwind" != "$(JSC_PANIC=unwind JS_EXTRA_ARGS='js-opt=report js-minify=on' key)" ]
 [ "$unwind" = "$(JS_EXTRA_ARGS='js-opt=report js-minify=on js-cleanup=off' unwind_key)" ]
+[ "$(JS_EXTRA_ARGS='js-profile=release-balanced js-cleanup=on' jsc_sysroot_args)" = \
+	'js-cleanup=off js-ecma-target=2018 js-minify=on js-opt=on' ]
 [ "$(JSC_PANIC=unwind JS_EXTRA_ARGS='js-profile=release-balanced js-cleanup=on' jsc_sysroot_args)" = \
 	'js-cleanup=off js-ecma-target=2018 js-minify=on js-opt=on' ]
-[ "$(JSC_PANIC=unwind JSC_SYSROOT_ARGS='js-cleanup=on' JS_EXTRA_ARGS='js-opt=on' jsc_sysroot_args)" = 'js-cleanup=off' ]
-[ "$(JSC_PANIC=unwind JS_EXTRA_ARGS='' jsc_sysroot_args)" = 'js-cleanup=off' ]
-[ "$(JSC_PANIC=unwind jsc_mode_backend_args 'js-profile=release-balanced js-lane=jir')" = \
+[ "$(JSC_SYSROOT_ARGS='js-cleanup=on' JS_EXTRA_ARGS='js-opt=on' jsc_sysroot_args)" = 'js-cleanup=off' ]
+[ "$(JS_EXTRA_ARGS='' jsc_sysroot_args)" = 'js-cleanup=off' ]
+[ "$(jsc_mode_backend_args 'js-profile=release-balanced js-lane=jir')" = \
 	'js-profile=release-balanced js-lane=jir js-cleanup=off' ]
-[ "$(jsc_mode_backend_args '  js-opt=on ')" = '  js-opt=on ' ]
+[ "$(JSC_PANIC=abort jsc_mode_backend_args '  js-opt=on ')" = '  js-opt=on ' ]
 printf 'spec-b' >"$work/root/targets/mires32-unwind.json"
 [ "$(JS_EXTRA_ARGS='js-opt=report js-minify=on' unwind_key)" != "$unwind" ]
-[ "$(JS_EXTRA_ARGS='js-opt=report js-minify=on' key)" = "$first" ]
+[ "$(JSC_PANIC=abort JS_EXTRA_ARGS='js-opt=report js-minify=on' key)" = "$first" ]
 rm "$work/root/targets/mires32-unwind.json"
 refused() { if ("$@") >/dev/null 2>&1; then echo "not refused: $*" >&2; exit 1; fi; }
 refused unwind_key
+JSC_PANIC=unwind refused unwind_key
 refused env JSC_PANIC=Unwind bash -c "source '$script_dir/sysroot-cache.sh' && jsc_sysroot_args"
 JSC_PANIC=Unwind refused key
 printf 'unwind mode cache key checks passed\n'

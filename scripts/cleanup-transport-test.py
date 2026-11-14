@@ -31,7 +31,7 @@ import subprocess
 import sys
 
 root = Path(__file__).resolve().parent.parent
-panic_mode = os.environ.get("JSC_PANIC", "") or "abort"
+panic_mode = os.environ.get("JSC_PANIC", "") or "unwind"
 assert panic_mode in ["abort", "unwind"], "JSC_PANIC must be unset, abort or unwind"
 unwind = panic_mode == "unwind"
 skipped = []

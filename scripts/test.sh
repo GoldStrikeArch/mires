@@ -134,13 +134,17 @@ run_program() {
 	fi
 }
 
-# The byte budgets describe the default output. A mode that deliberately emits
-# more is exempt from them; see the .maxbytes note in the header.
+# The byte budgets describe the abort-mode default output. Modes that deliberately
+# emit more (including unwind-mode cleanup handlers) are exempt from them; see
+# the .maxbytes note in the header.
 enforce_budgets=1
 case " ${JS_EXTRA_ARGS:-} " in
 *js-line-comments* | *js-source-map* | *js-minify* | *js-structure=trampoline* | *js-queue=off*) enforce_budgets=0 ;;
 esac
-if [ "$enforce_budgets" -eq 0 ]; then
+if [ "$jsc_panic_mode" = unwind ]; then
+	enforce_budgets=0
+	echo "note: byte budgets are baselined against JSC_PANIC=abort; skipping budget checks under unwind"
+elif [ "$enforce_budgets" -eq 0 ]; then
 	echo "note: byte budgets are not enforced under JS_EXTRA_ARGS='${JS_EXTRA_ARGS:-}'"
 fi
 
@@ -211,6 +215,7 @@ fi
 results=""
 failures=0
 pending=0
+skipped=0
 total=0
 
 # record <name> <result> <detail>: appends a summary row and counts it. A
@@ -282,6 +287,14 @@ for src in $sources; do
 	fi
 
 	if ! "$script_dir/compile.sh" "$src" "$out" >"$compile_log" 2>&1; then
+		if [ "$jsc_panic_mode" = unwind ] && [ -z "$lane_suffix" ] &&
+			grep -q 'requires semantic cleanup lowering' "$compile_log"; then
+			echo "    SKIP (JSC_PANIC=unwind: the baseline lane cannot build a program with cleanup)"
+			record "$name" SKIP baseline-lane-refuses-cleanup
+			skipped=$((skipped + 1))
+			total=$((total - 1))
+			continue
+		fi
 		echo "    compile failed:"
 		sed 's/^/    /' "$compile_log"
 		record "$name" FAIL compile-error
@@ -481,6 +494,14 @@ for src in $core_sources; do
 
 	if ! "$script_dir/compile_core.sh" "$src" "$out" "${core_externs[@]}" \
 		>"$compile_log" 2>&1; then
+		if [ "$jsc_panic_mode" = unwind ] && [ -z "$lane_suffix" ] &&
+			grep -q 'requires semantic cleanup lowering' "$compile_log"; then
+			echo "    SKIP (JSC_PANIC=unwind: the baseline lane cannot build a program with cleanup)"
+			record "core/$name" SKIP baseline-lane-refuses-cleanup
+			skipped=$((skipped + 1))
+			total=$((total - 1))
+			continue
+		fi
 		echo "    compile failed:"
 		sed 's/^/    /' "$compile_log"
 		record "core/$name" FAIL compile-error
@@ -561,6 +582,9 @@ if [ "$pending" -ne 0 ]; then
 	printf ' (%d pending)' "$pending"
 fi
 printf '\n'
+if [ "$skipped" -ne 0 ]; then
+	printf '%d skipped (JSC_PANIC=unwind, baseline lane)\n' "$skipped"
+fi
 echo "================================================================"
 
 if [ "$failures" -ne 0 ]; then

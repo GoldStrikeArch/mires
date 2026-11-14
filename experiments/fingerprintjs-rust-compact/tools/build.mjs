@@ -33,11 +33,11 @@ const compilerProfile = options.profile === undefined ? '' : String(options.prof
 if (compilerProfile && !['dev', 'report', 'release-size', 'release-balanced', 'release-speed'].includes(compilerProfile)) {
   throw new Error('--profile must be dev, report, release-size, release-balanced, or release-speed')
 }
-// `JSC_PANIC` selects the build mode (scripts/sysroot-cache.sh); unset is `abort`, the compiler as
-// it always was. `unwind` builds for targets/mires32-unwind.json with -Cpanic=unwind: rustc's own
-// unwind edges then carry host-exception cleanup, the scripts turn the backend's re-derived cleanup
-// (`js-cleanup`) off, and `--cleanup on` would name a lowering the build does not use.
-const panic = process.env.JSC_PANIC || 'abort'
+// `JSC_PANIC` selects the build mode (scripts/sysroot-cache.sh); unset or `unwind` builds for
+// targets/mires32-unwind.json with -Cpanic=unwind: rustc's own unwind edges carry host-exception
+// cleanup, the scripts turn the backend's re-derived cleanup (`js-cleanup`) off, and `--cleanup on`
+// would name a lowering the build does not use. `abort` selects wasm32-unknown-unknown instead.
+const panic = process.env.JSC_PANIC || 'unwind'
 if (!['abort', 'unwind'].includes(panic)) throw new Error('JSC_PANIC must be unset, abort, or unwind')
 const cleanup = String(options.cleanup || (
   panic === 'unwind' ? 'off' : compilerProfile.startsWith('release-') ? 'on' : 'off'))
@@ -58,7 +58,7 @@ const rustOptLevel = options['rust-opt-level'] === undefined
 if (rustOptLevel && !['0', '1', '2', '3', 's', 'z'].includes(rustOptLevel)) {
   throw new Error('--rust-opt-level must be 0, 1, 2, 3, s, or z')
 }
-const mirInline = options['mir-inline'] === undefined ? 'on' : String(options['mir-inline'])
+const mirInline = String(options['mir-inline'] ?? (process.env.JSC_RUST_MIR_INLINE || 'off'))
 if (!['off', 'on'].includes(mirInline)) {
   throw new Error('--mir-inline must be off or on')
 }
@@ -108,7 +108,7 @@ const compilerEnvironment = {
   JSC_SYSROOT_ARGS: optimizerEmitArgs,
   JSC_RUST_OPT_LEVEL: rustOptLevel,
   JSC_RUST_MIR_INLINE: mirInline,
-  ...(panic === 'unwind' ? { JSC_PANIC: panic } : {}),
+  JSC_PANIC: panic,
 }
 const entry = resolve(sourceRoot, 'src/entry.rs')
 const exportManifest = parseExportManifest(await readFile(entry, 'utf8'))
