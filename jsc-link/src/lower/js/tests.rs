@@ -1691,15 +1691,20 @@ fn a_hoisting_lowering_names_its_bigint_constants_and_widens_constant_shift_amou
     let hoisted = lowered(Some(&names));
     assert_eq!(
         jsast::stmt_to_string(&hoisted.decl),
-        "function g(a) {\n  return BigInt.asIntN(64, a >> ($BI_33 & $BI_63));\n}\n"
+        "function g(a) {\n  return BigInt.asIntN(64, a >> (($BI_ok ? $BI_33 : $BI_no()) & $BI_63));\n}\n"
     );
     assert_eq!(
         hoisted.bigints,
         std::collections::BTreeSet::from(["33".to_owned(), "63".to_owned()])
     );
-    // The bindings are references like any other, which is what the lane driver prepares.
-    assert!(hoisted.refs.contains(&JsName::new("$BI_33".to_owned())));
-    assert!(hoisted.refs.contains(&JsName::new("$BI_63".to_owned())));
+    // The bindings, the `BigInt` test and the throwing function are references like any other,
+    // which is what the lane driver prepares.
+    for name in ["$BI_33", "$BI_63", "$BI_ok", "$BI_no"] {
+        assert!(
+            hoisted.refs.contains(&JsName::new(name.to_owned())),
+            "{name}"
+        );
+    }
 }
 
 #[test]

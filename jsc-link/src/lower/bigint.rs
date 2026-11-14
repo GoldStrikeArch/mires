@@ -4,8 +4,9 @@
 //! `BigInt("33")` (`jsast.rs`, `Printer::expr_bare`), and the engine parses that string again
 //! every time the expression runs. In a 64-bit arithmetic loop that parse is most of the cost. The
 //! JIR lane therefore spells each constant of a lowered function as an identifier ([`hoist`]),
-//! and the lane driver adds one module-level `const <name>=BigInt("<digits>")` per distinct value
-//! the printed items name ([`BigIntNames::item`]), exactly as it adds the flat-ABI spill
+//! and the lane driver adds one module-level `const <name>=<ok>&&BigInt("<digits>")` per distinct
+//! value the printed items name ([`BigIntNames::item`]), plus the two items those need
+//! ([`BigIntNames::support`]), exactly as it adds the flat-ABI spill
 //! registers: the names are prepared in the driver's `defined`/`live` sets before the lowerings
 //! are checked against them, and the items enter the table after phase C, so the reachability walk,
 //! `order`, chunking and the item rename treat them like any other binding.
@@ -21,6 +22,26 @@
 //! so their position among the bindings `order` lays out cannot matter. The baseline lane's printed
 //! text keeps `BigInt("…")` too: it is never re-parsed. `js-ecma-target=latest` prints `33n`,
 //! which needs no hoisting, and never reaches this module.
+//!
+//! # Engines without `BigInt`
+//!
+//! `BigInt` is a runtime requirement of 64-bit code, not of a program: a program whose 32-bit paths
+//! never compute with a 64-bit value loads and runs on an engine without it (Safari 12.1–13.1,
+//! Firefox 65–67), and a function that does reach a 64-bit constant there throws `ReferenceError:
+//! BigInt is not defined` where it evaluates `BigInt`. The hoist keeps both:
+//!
+//! * nothing calls `BigInt` while the program loads. `<ok>` is `typeof BigInt==="function"`, and a
+//!   binding is `<ok>&&BigInt("<digits>")`, so without `BigInt` every binding holds `false`;
+//! * no function reads a binding that holds `false`. The first constant an activation can evaluate
+//!   on each path is spelled `(<ok>?<name>:<no>())`, and `<no>` is `function(){return BigInt()}`,
+//!   which throws the same `ReferenceError` the inline `BigInt("…")` threw, at the same point in
+//!   the evaluation (anywhere else `BigInt()` throws a `TypeError`: it never returns). A constant
+//!   that every path reaches only after a guard was evaluated is spelled bare, because a guard that
+//!   did not throw means `<ok>` is true and every binding holds its value ([`hoist`] tracks this
+//!   in evaluation order, conservatively).
+//!
+//! In a loop the guard is the first constant of the body, once per iteration: the block loop of
+//! the `murmur3` kernel reads constants eight times per iteration and guards the first read.
 //!
 //! # Trial lowerings see inline constants
 //!
@@ -49,17 +70,18 @@
 //! key a `WeakMap` or carry properties, and the binding is `const`. What changes is when
 //! `BigInt("…")` runs: once, while the module initializes, instead of at each use. That is
 //! observable only by a program that replaces `globalThis.BigInt` after this module was evaluated
-//! (the hoisted value is the original `BigInt`'s), or one that calls a function using a constant
-//! while module initialization has not yet reached the constant's declaration (a temporal dead
-//! zone `ReferenceError`). Neither happens here: the program and the shim never assign `BigInt`,
-//! and module evaluation runs binding initializers only, which are literals that call no program
-//! function and name no constant; every function runs after the module (and, split, every module
-//! of its chunk graph) has evaluated.
+//! (the hoisted value is the original `BigInt`'s; one that defines `BigInt` only later finds every
+//! guard throwing), or one that calls a function using a constant while module initialization has
+//! not yet reached the constant's declaration (a temporal dead zone `ReferenceError`). Neither
+//! happens here: the program and the shim never assign `BigInt`, and module evaluation runs
+//! binding initializers only, which are literals that call no program function and name no
+//! constant; every function runs after the module (and, split, every module of its chunk graph)
+//! has evaluated.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::item::{item_map, ItemKind, JsItem, JsName, LinkItem, Linkage};
-use crate::jsast::{self, ArrowBody, Expr, Stmt};
+use crate::jsast::{self, ArrowBody, BinOp, Expr, Stmt, UnOp};
 
 /// The spelling every candidate prefix starts from.
 const BASE: &str = "$BI";
@@ -114,57 +136,132 @@ impl BigIntNames {
         })
     }
 
-    /// The module-level binding of `digits`: `const <name>=BigInt("<digits>")`, printed the way the
-    /// driver prints a lowered item (`JsItem::to_js_mapped`), so the build's style and target
-    /// apply. `None` for digits [`BigIntNames::name`] leaves inline.
+    /// The binding that says whether the engine has a `BigInt` function: `const <ok>=typeof
+    /// BigInt==="function"`. Every constant's initializer and every guarded use reads it.
+    pub fn ok(&self) -> String {
+        format!("{}ok", self.prefix)
+    }
+
+    /// The function a guarded use calls when [`BigIntNames::ok`] is false: `function <no>(){return
+    /// BigInt()}`, which always throws — the `ReferenceError` a `BigInt("…")` call throws on an
+    /// engine without `BigInt`, or the `TypeError` `BigInt()` throws anywhere else.
+    pub fn no(&self) -> String {
+        format!("{}no", self.prefix)
+    }
+
+    /// The module-level binding of `digits`: `const <name>=<ok>&&BigInt("<digits>")`, which calls
+    /// `BigInt` only on an engine that has it. `None` for digits [`BigIntNames::name`] leaves
+    /// inline.
     pub fn item(&self, digits: &str) -> Option<LinkItem> {
-        let name = JsName::new(self.name(digits)?);
-        let debug_path = format!("BigInt constant {digits}");
-        let printed = JsItem {
-            name: name.clone(),
-            kind: ItemKind::Const,
-            decl: jsast::const_(name.as_str(), Expr::BigInt(digits.to_owned())),
-            refs: BTreeSet::new(),
-            zombies: Vec::new(),
-            linkage: Linkage::internal(),
-            debug_path: debug_path.clone(),
-            order: None,
-            loc: None,
-            names: Vec::new(),
-            dts: None,
-            optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
-            jir: None,
-            jir_decline: None,
-            jir_item: None,
-        };
-        let (js, mappings) = printed.to_js_mapped(crate::opts::get().comments);
-        Some(LinkItem {
-            name,
-            kind: ItemKind::Const,
-            js,
-            refs: BTreeSet::new(),
-            zombies: Vec::new(),
-            linkage: Linkage::internal(),
-            debug_path,
-            crate_name: "generated".to_owned(),
-            order: None,
-            map: item_map(mappings),
-            dts: None,
-            optimization: Default::default(),
-            late_ir: Default::default(),
-            baseline_shadow: Default::default(),
-            jir: Default::default(),
-        })
+        let name = self.name(digits)?;
+        let init = jsast::binary(
+            BinOp::And,
+            jsast::id(self.ok()),
+            Expr::BigInt(digits.to_owned()),
+        );
+        Some(link_item(
+            &name,
+            ItemKind::Const,
+            jsast::const_(name.as_str(), init),
+            [self.ok()],
+            format!("BigInt constant {digits}"),
+        ))
+    }
+
+    /// The two items every program with a constant needs besides the constants: the
+    /// [`BigIntNames::ok`] binding and the [`BigIntNames::no`] function.
+    pub fn support(&self) -> [LinkItem; 2] {
+        let ok = self.ok();
+        let no = self.no();
+        let has_bigint = jsast::binary(
+            BinOp::StrictEq,
+            jsast::unary(UnOp::TypeOf, jsast::id("BigInt")),
+            jsast::string("function"),
+        );
+        let throws = vec![Stmt::Return(Some(jsast::call(
+            jsast::id("BigInt"),
+            Vec::new(),
+        )))];
+        [
+            link_item(
+                &ok,
+                ItemKind::Const,
+                jsast::const_(ok.as_str(), has_bigint),
+                [],
+                "whether the engine has BigInt".to_owned(),
+            ),
+            link_item(
+                &no,
+                ItemKind::Fn,
+                jsast::function(no.as_str(), Vec::new(), throws),
+                [],
+                "a BigInt constant on an engine without BigInt".to_owned(),
+            ),
+        ]
     }
 }
 
-/// Spells every BigInt constant of `decl` as its binding's name, and adds the digits of each one
-/// it names to `used`. A constant [`BigIntNames::name`] refuses keeps its inline spelling. Verbatim
-/// JavaScript (`Expr::Raw`, `Stmt::Raw`) is opaque and left alone.
+/// A link-generated item around `decl`, printed the way the driver prints a lowered item
+/// (`JsItem::to_js_mapped`), so the build's style and target apply.
+fn link_item<const N: usize>(
+    name: &str,
+    kind: ItemKind,
+    decl: Stmt,
+    refs: [String; N],
+    debug_path: String,
+) -> LinkItem {
+    let name = JsName::new(name.to_owned());
+    let refs: BTreeSet<JsName> = refs.into_iter().map(JsName::new).collect();
+    let printed = JsItem {
+        name: name.clone(),
+        kind,
+        decl,
+        refs: refs.clone(),
+        zombies: Vec::new(),
+        linkage: Linkage::internal(),
+        debug_path: debug_path.clone(),
+        order: None,
+        loc: None,
+        names: Vec::new(),
+        dts: None,
+        optimization: Default::default(),
+        late_ir: Default::default(),
+        baseline_shadow: Default::default(),
+        jir: None,
+        jir_decline: None,
+        jir_item: None,
+    };
+    let (js, mappings) = printed.to_js_mapped(crate::opts::get().comments);
+    LinkItem {
+        name,
+        kind,
+        js,
+        refs,
+        zombies: Vec::new(),
+        linkage: Linkage::internal(),
+        debug_path,
+        crate_name: "generated".to_owned(),
+        order: None,
+        map: item_map(mappings),
+        dts: None,
+        optimization: Default::default(),
+        late_ir: Default::default(),
+        baseline_shadow: Default::default(),
+        jir: Default::default(),
+    }
+}
+
+/// Spells every BigInt constant of the function `decl` as its binding's name, and adds the digits
+/// of each one it names to `used`. A constant [`BigIntNames::name`] refuses keeps its inline
+/// spelling. Verbatim JavaScript (`Expr::Raw`, `Stmt::Raw`) is opaque and left alone.
+///
+/// The first constant an activation of the function can evaluate on each path is guarded,
+/// `(<ok>?<name>:<no>())`, which throws exactly where the inline `BigInt("…")` would have thrown on
+/// an engine without `BigInt`. A constant that every path reaches only after a guard has been
+/// evaluated is spelled bare: once one guard has run without throwing, the engine has `BigInt` and
+/// every binding holds its value. See the module documentation, "Engines without `BigInt`".
 pub fn hoist(decl: &mut Stmt, names: &BigIntNames, used: &mut BTreeSet<String>) {
-    Hoist { names, used }.stmt(decl);
+    Hoist { names, used }.stmt(decl, false);
 }
 
 struct Hoist<'a> {
@@ -172,105 +269,159 @@ struct Hoist<'a> {
     used: &'a mut BTreeSet<String>,
 }
 
+/// The walk threads one fact through JavaScript's evaluation order: `guarded`, whether a guard has
+/// certainly been evaluated in this activation before the current point. Each method takes the
+/// fact on entry and returns it on exit. A construct that may skip part of itself (a branch, a
+/// case, a loop body, the right of `&&` and `||`, the arms of `?:`, a `try` body, a labeled
+/// statement a `break` may leave) passes the entry fact into that part and returns the fact it had
+/// before it; an arrow's body is another activation and starts unguarded.
 impl Hoist<'_> {
-    fn stmts(&mut self, stmts: &mut [Stmt]) {
+    fn stmts(&mut self, stmts: &mut [Stmt], mut guarded: bool) -> bool {
         for stmt in stmts {
-            self.stmt(stmt);
+            guarded = self.stmt(stmt, guarded);
         }
+        guarded
     }
 
-    fn stmt(&mut self, stmt: &mut Stmt) {
+    fn stmt(&mut self, stmt: &mut Stmt, guarded: bool) -> bool {
         match stmt {
-            Stmt::ExprStmt(expr) | Stmt::Throw(expr) | Stmt::Const(_, expr) => self.expr(expr),
-            Stmt::Let(_, init) | Stmt::Return(init) => {
-                if let Some(init) = init {
-                    self.expr(init);
-                }
+            Stmt::ExprStmt(expr) | Stmt::Throw(expr) | Stmt::Const(_, expr) => {
+                self.expr(expr, guarded)
             }
+            Stmt::Let(_, init) | Stmt::Return(init) => match init {
+                Some(init) => self.expr(init, guarded),
+                None => guarded,
+            },
             Stmt::Lets(declarations) => {
+                let mut guarded = guarded;
                 for (_, init) in declarations {
                     if let Some(init) = init {
-                        self.expr(init);
+                        guarded = self.expr(init, guarded);
                     }
                 }
+                guarded
             }
             Stmt::If(test, then, els) => {
-                self.expr(test);
-                self.stmts(then);
+                let guarded = self.expr(test, guarded);
+                self.stmts(then, guarded);
                 if let Some(els) = els {
-                    self.stmts(els);
+                    self.stmts(els, guarded);
                 }
+                guarded
             }
             Stmt::Switch(discriminant, cases) => {
-                self.expr(discriminant);
+                let guarded = self.expr(discriminant, guarded);
                 for case in cases {
                     for test in &mut case.tests {
-                        self.expr(test);
+                        self.expr(test, guarded);
                     }
-                    self.stmts(&mut case.body);
+                    self.stmts(&mut case.body, guarded);
                 }
+                guarded
             }
-            Stmt::Labeled(_, inner) => self.stmt(inner),
-            Stmt::LoopForever(_, body) | Stmt::Block(body) => self.stmts(body),
+            Stmt::Labeled(_, inner) => {
+                self.stmt(inner, guarded);
+                guarded
+            }
+            Stmt::Block(body) => self.stmts(body, guarded),
+            Stmt::LoopForever(_, body) => {
+                self.stmts(body, guarded);
+                guarded
+            }
+            // The test runs before the body, and before the loop is left, at least once.
             Stmt::While(test, body) => {
-                self.expr(test);
-                self.stmts(body);
+                let guarded = self.expr(test, guarded);
+                self.stmts(body, guarded);
+                guarded
             }
             Stmt::TryCatch { body, handler, .. } => {
-                self.stmts(body);
-                self.stmts(handler);
+                self.stmts(body, guarded);
+                self.stmts(handler, guarded);
+                guarded
             }
-            Stmt::FunctionDecl { body, .. } => self.stmts(body),
+            Stmt::FunctionDecl { body, .. } => {
+                self.stmts(body, false);
+                guarded
+            }
             Stmt::Continue(_)
             | Stmt::Break(_)
             | Stmt::Import { .. }
             | Stmt::Comment(_)
             | Stmt::Raw(_)
-            | Stmt::Loc(_) => {}
+            | Stmt::Loc(_) => guarded,
         }
     }
 
-    fn expr(&mut self, expr: &mut Expr) {
+    fn expr(&mut self, expr: &mut Expr, guarded: bool) -> bool {
         match expr {
             Expr::BigInt(digits) => {
-                if let Some(name) = self.names.name(digits) {
-                    self.used.insert(std::mem::take(digits));
-                    *expr = Expr::Ident(name);
-                }
+                let Some(name) = self.names.name(digits) else {
+                    return guarded;
+                };
+                self.used.insert(std::mem::take(digits));
+                *expr = if guarded {
+                    Expr::Ident(name)
+                } else {
+                    jsast::cond(
+                        jsast::id(self.names.ok()),
+                        Expr::Ident(name),
+                        jsast::call(jsast::id(self.names.no()), Vec::new()),
+                    )
+                };
+                true
             }
-            Expr::Member(object, _) | Expr::Unary(_, object) => self.expr(object),
+            Expr::Member(object, _) | Expr::Unary(_, object) => self.expr(object, guarded),
+            Expr::Binary(BinOp::And | BinOp::Or, left, right) => {
+                let guarded = self.expr(left, guarded);
+                self.expr(right, guarded);
+                guarded
+            }
+            // An assignment evaluates its target's object and key before its value.
             Expr::Index(left, right)
             | Expr::Binary(_, left, right)
             | Expr::Assign(left, right)
             | Expr::CompoundAssign(_, left, right) => {
-                self.expr(left);
-                self.expr(right);
+                let guarded = self.expr(left, guarded);
+                self.expr(right, guarded)
             }
             Expr::Call(callee, arguments) | Expr::New(callee, arguments) => {
-                self.expr(callee);
+                let mut guarded = self.expr(callee, guarded);
                 for argument in arguments {
-                    self.expr(argument);
+                    guarded = self.expr(argument, guarded);
                 }
+                guarded
             }
             Expr::Cond(test, consequent, alternate) => {
-                self.expr(test);
-                self.expr(consequent);
-                self.expr(alternate);
+                let guarded = self.expr(test, guarded);
+                self.expr(consequent, guarded);
+                self.expr(alternate, guarded);
+                guarded
             }
             Expr::Object(entries) => {
+                let mut guarded = guarded;
                 for (_, value) in entries {
-                    self.expr(value);
+                    guarded = self.expr(value, guarded);
                 }
+                guarded
             }
             Expr::Array(items) | Expr::Seq(items) => {
+                let mut guarded = guarded;
                 for item in items {
-                    self.expr(item);
+                    guarded = self.expr(item, guarded);
                 }
+                guarded
             }
-            Expr::Arrow(_, body) => match body {
-                ArrowBody::Expr(body) => self.expr(body),
-                ArrowBody::Block(body) => self.stmts(body),
-            },
+            Expr::Arrow(_, body) => {
+                match body {
+                    ArrowBody::Expr(body) => {
+                        self.expr(body, false);
+                    }
+                    ArrowBody::Block(body) => {
+                        self.stmts(body, false);
+                    }
+                }
+                guarded
+            }
             Expr::Num(_)
             | Expr::RawNum(_)
             | Expr::Str(_)
@@ -278,7 +429,7 @@ impl Hoist<'_> {
             | Expr::Undefined
             | Expr::Null
             | Expr::Ident(_)
-            | Expr::Raw(_) => {}
+            | Expr::Raw(_) => guarded,
         }
     }
 }
@@ -391,11 +542,156 @@ mod tests {
             jsast::Style::Compact,
             crate::opts::EcmaTarget::Es2018,
         );
+        // The first constant is guarded and everything after it is bare; the arrow is another
+        // activation, so its first constant is guarded again.
         assert_eq!(
             printed,
-            "function f(a){a=a>>($BI_33&$BI_63);return[b=>$BI_m1,$BI_33,BigInt(\"007\"),\
-             (BigInt(\"5\"))]}"
+            "function f(a){a=a>>(($BI_ok?$BI_33:$BI_no())&$BI_63);\
+             return[b=>$BI_ok?$BI_m1:$BI_no(),$BI_33,BigInt(\"007\"),(BigInt(\"5\"))]}"
         );
+    }
+
+    fn hoisted(body: Vec<Stmt>) -> String {
+        let mut decl = jsast::function("f", vec!["a".to_owned()], body);
+        hoist(&mut decl, &names(), &mut BTreeSet::new());
+        jsast::stmt_to_string_styled_for_target(
+            &decl,
+            jsast::Style::Compact,
+            crate::opts::EcmaTarget::Es2018,
+        )
+    }
+
+    fn uses(left: u32, right: u32) -> Expr {
+        jsast::binary(BinOp::Add, jsast::bigint(left), jsast::bigint(right))
+    }
+
+    /// A guard inside a part of a construct that may not run covers nothing after the construct;
+    /// one in a part that always runs first does.
+    #[test]
+    fn only_a_guard_that_has_certainly_run_covers_a_later_constant() {
+        let ret = |e: Expr| Stmt::Return(Some(e));
+        let expr = |e: Expr| Stmt::ExprStmt(e);
+        let guard = |n: u32| format!("$BI_ok?$BI_{n}:$BI_no()");
+
+        // A branch, a loop body, a labeled block, a `try` body: the constant after them is guarded.
+        for (construct, printed) in [
+            (
+                Stmt::If(jsast::id("a"), vec![expr(jsast::bigint(1u32))], None),
+                "if(a)",
+            ),
+            (
+                Stmt::LoopForever(None, vec![expr(jsast::bigint(1u32)), Stmt::Break(None)]),
+                "for(;;)",
+            ),
+            (
+                Stmt::Labeled(
+                    "l".to_owned(),
+                    Box::new(Stmt::Block(vec![expr(jsast::bigint(1u32))])),
+                ),
+                "l:",
+            ),
+            (
+                Stmt::TryCatch {
+                    body: vec![expr(jsast::bigint(1u32))],
+                    binding: "e".to_owned(),
+                    handler: Vec::new(),
+                },
+                "try",
+            ),
+        ] {
+            let js = hoisted(vec![construct, ret(jsast::bigint(2u32))]);
+            assert!(
+                js.contains(&guard(1)) && js.contains(&guard(2)),
+                "{printed}: {js}"
+            );
+        }
+
+        // The right of `&&`, the arms of `?:`: not certain. Their left, their test: certain.
+        let js = hoisted(vec![
+            expr(jsast::binary(
+                BinOp::And,
+                jsast::id("a"),
+                jsast::bigint(1u32),
+            )),
+            expr(jsast::cond(
+                jsast::id("a"),
+                jsast::bigint(1u32),
+                jsast::bigint(1u32),
+            )),
+            ret(jsast::bigint(2u32)),
+        ]);
+        assert_eq!(js.matches(&guard(1)).count(), 3, "{js}");
+        assert!(js.contains(&guard(2)), "{js}");
+        let js = hoisted(vec![
+            expr(jsast::binary(
+                BinOp::And,
+                jsast::bigint(1u32),
+                jsast::id("a"),
+            )),
+            ret(jsast::cond(
+                jsast::bigint(2u32),
+                jsast::bigint(3u32),
+                jsast::id("a"),
+            )),
+        ]);
+        assert_eq!(
+            js,
+            format!("function f(a){{({})&&a;return $BI_2?$BI_3:a}}", guard(1))
+        );
+
+        // Statements in order, a `while` test, a switch discriminant, a block: certain.
+        let js = hoisted(vec![
+            Stmt::While(uses(1, 2), vec![expr(jsast::bigint(3u32))]),
+            Stmt::Switch(
+                jsast::bigint(4u32),
+                vec![jsast::SwitchCase {
+                    tests: vec![jsast::bigint(5u32)],
+                    body: vec![expr(jsast::bigint(6u32))],
+                }],
+            ),
+            Stmt::Block(vec![expr(jsast::bigint(7u32))]),
+            ret(jsast::bigint(8u32)),
+        ]);
+        assert_eq!(js.matches("$BI_no()").count(), 1, "{js}");
+        assert!(
+            js.starts_with(&format!("function f(a){{while(({})+$BI_2)", guard(1))),
+            "{js}"
+        );
+
+        // An arrow's body is another activation; creating the arrow guards nothing.
+        let js = hoisted(vec![
+            expr(jsast::arrow(Vec::new(), jsast::bigint(1u32))),
+            ret(jsast::bigint(1u32)),
+        ]);
+        assert_eq!(js.matches(&guard(1)).count(), 2, "{js}");
+    }
+
+    /// The bindings call `BigInt` only on an engine that has it, and the guard's other arm always
+    /// throws.
+    #[test]
+    fn the_bindings_and_the_guard_never_call_bigint_on_an_engine_without_it() {
+        let names = names();
+        let item = names.item("33").expect("a canonical literal");
+        // The unit tests print for `js-ecma-target=latest`, where the literal is `33n`.
+        assert_eq!(item.js.trim(), "const $BI_33 = $BI_ok && 33n;");
+        assert_eq!(
+            item.refs,
+            BTreeSet::from([JsName::new("$BI_ok".to_owned())])
+        );
+        let [ok, no] = names.support();
+        assert_eq!(
+            ok.js.trim(),
+            "const $BI_ok = typeof BigInt === \"function\";"
+        );
+        assert_eq!(ok.kind, ItemKind::Const);
+        assert!(
+            no.js
+                .trim_end()
+                .ends_with("function $BI_no() {\n  return BigInt();\n}"),
+            "{}",
+            no.js
+        );
+        assert_eq!(no.kind, ItemKind::Fn);
     }
 
     #[test]

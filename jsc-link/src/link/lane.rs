@@ -877,20 +877,25 @@ pub(crate) fn run(
         }
     }
 
-    // One `const` per BigInt constant the lowerings name, the same way: prepared before `apply`
-    // checks a lowering against `defined` and `live`, and never over an item the program defines
-    // (the prefix was allocated around all of them). A binding no installed item ends up naming is
-    // unreachable and is not printed.
+    // One `const` per BigInt constant the lowerings name, plus the `BigInt` test and the throwing
+    // function the guarded uses name, the same way: prepared before `apply` checks a lowering
+    // against `defined` and `live`, and never over an item the program defines (the prefix was
+    // allocated around all of them). A binding no installed item ends up naming is unreachable and
+    // is not printed.
     let constants: BTreeSet<&String> = lowered
         .iter()
         .filter_map(|(_, result, _, _)| result.as_ref().ok())
         .flat_map(|lowering| &lowering.bigints)
         .collect();
     let mut added_bigints = false;
-    for digits in constants {
-        let Some(constant) = bigint_names.as_ref().and_then(|names| names.item(digits)) else {
-            continue;
-        };
+    let support = match &bigint_names {
+        Some(names) if !constants.is_empty() => names.support().to_vec(),
+        _ => Vec::new(),
+    };
+    let hoisted = constants
+        .into_iter()
+        .filter_map(|digits| bigint_names.as_ref().and_then(|names| names.item(digits)));
+    for constant in support.into_iter().chain(hoisted) {
         defined.insert(constant.name.clone());
         live.insert(constant.name.clone());
         match table.entry(constant.name.clone()) {

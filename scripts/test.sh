@@ -50,6 +50,11 @@
 #   NN.expect_abort marks a test that MUST compile, print its .expected and then
 #                   exit non-zero: a panic that reaches the `#[panic_handler]`.
 #                   A clean exit is a failure. (core suite only)
+#   NN.no_bigint    the program runs a second time on an engine without `BigInt`:
+#                   the global is deleted before anything loads. Its stdout must be
+#                   this file's lines up to an optional last line `-- throws <text>`;
+#                   with that line the run must exit non-zero with <text> in its
+#                   stderr, without it the run must exit 0. (core suite only)
 #
 # With `JS_EXTRA_ARGS='js-modules=esm'` every program is an ES module, so it runs
 # through scripts/run-esm.sh instead of the concatenation above: the shim is
@@ -129,6 +134,34 @@ run_program() {
 		"$script_dir/run-esm.sh" "$1" "$2" >"$3" 2>"$4"
 	else
 		cat "$shim" "$1" "$entry" | node - >"$3" 2>"$4"
+	fi
+}
+
+# check_without_bigint <program.js> <name> <NN.no_bigint> <log prefix>: runs a compiled program on
+# an engine without `BigInt` (the global deleted by a module node imports before anything else)
+# and holds it to NN.no_bigint, as the header describes. Prints what differs; fails if anything does.
+check_without_bigint() {
+	local expected=$3 log=$4 status want throws
+	NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--import=data:text/javascript,delete%20globalThis.BigInt" \
+		run_program "$1" "$2-no-bigint" "$log.actual" "$log.stderr"
+	status=$?
+	throws=$(sed -n '$s/^-- throws //p' "$expected")
+	grep -v '^-- throws ' "$expected" >"$log.expected"
+	if ! diff -u "$log.expected" "$log.actual" >"$log.diff"; then
+		echo "    without BigInt, output mismatch (- expected, + actual):"
+		sed 's/^/    /' "$log.diff"
+		return 1
+	fi
+	if [ -n "$throws" ]; then
+		if [ "$status" -eq 0 ] || ! grep -qF -- "$throws" "$log.stderr"; then
+			echo "    without BigInt, expected a failure saying \"$throws\" (exit $status):"
+			sed 's/^/    /' "$log.stderr"
+			return 1
+		fi
+	elif [ "$status" -ne 0 ]; then
+		echo "    without BigInt, runtime error:"
+		sed 's/^/    /' "$log.stderr"
+		return 1
 	fi
 }
 
@@ -535,6 +568,12 @@ for src in $core_sources; do
 			record "core/$name" FAIL not-eliminated
 			continue
 		fi
+	fi
+
+	if [ -f "$core_dir/$name.no_bigint" ] &&
+		! check_without_bigint "$out" "core-$name" "$core_dir/$name.no_bigint" "$log_dir/$name.no_bigint"; then
+		record "core/$name" FAIL without-bigint
+		continue
 	fi
 
 	if [ -f "$expect_abort" ]; then
