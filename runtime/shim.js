@@ -99,10 +99,13 @@ globalThis.__rt.f2i_big = (x, bits, signed) => {
 globalThis.__rt.overwrite = (target, value) => {
   if (Array.isArray(target)) {
     target.length = 0;
-  } else {
-    for (const key of Object.keys(target)) delete target[key];
+    return Object.assign(target, value);
   }
-  return Object.assign(target, value);
+  for (const key in target) {
+    if (!(key in value)) delete target[key];
+  }
+  for (const key in value) target[key] = value[key];
+  return target;
 };
 
 // ---------------------------------------------------------------------------
@@ -351,7 +354,7 @@ globalThis.__rt._addrGone = typeof FinalizationRegistry === "function"
 // of other sizes are not split -- the top is a refusal.
 globalThis.__rt._addr_mint = (key, es) => {
   const free = globalThis.__rt._addrFree;
-  const block = globalThis.__rt._blocks.get(key);
+  const block = globalThis.__rt._blk_get(key);
   const bytes = block !== undefined ? block.bytes
     : (typeof key.length === "number" ? key.length : 1) * (es > 0 ? es : 1);
   let k = 4;
@@ -587,10 +590,11 @@ globalThis.__rt.copy = (dst, src, count, clone) => {
   }
   const each = clone === undefined ? (v) => v : clone;
   const put = globalThis.__rt._put;
+  const dIsHeap = globalThis.__rt._blk_get(d.buf) !== undefined;
   if (down) {
-    for (let i = s.n - 1; i >= 0; i--) put(d.buf, d.off + i, each(s.buf[s.off + i]));
+    for (let i = s.n - 1; i >= 0; i--) put(d.buf, d.off + i, each(s.buf[s.off + i]), dIsHeap);
   } else {
-    for (let i = 0; i < s.n; i++) put(d.buf, d.off + i, each(s.buf[s.off + i]));
+    for (let i = 0; i < s.n; i++) put(d.buf, d.off + i, each(s.buf[s.off + i]), dIsHeap);
   }
 };
 
@@ -635,7 +639,7 @@ globalThis.__rt._rebinds = (dst, buf, s) => {
 // pointers name: a slot reads `buf[off]`, so it sees the new object, while an
 // aggregate *read* out of the buffer was copied on the way out (`read_via_copy`)
 // and is nobody's alias.
-globalThis.__rt._put = (buf, off, value) => {
+globalThis.__rt._put = (buf, off, value, heap) => {
   const old = buf[off];
   if (old !== null && typeof old === "object" && value !== null && typeof value === "object") {
     globalThis.__rt.overwrite(old, value);
@@ -653,7 +657,8 @@ globalThis.__rt._put = (buf, off, value) => {
   // the place the object happens to sit in.
   if (
     value !== null && typeof value === "object" &&
-    globalThis.__rt._blocks.has(buf) && !globalThis.__rt._boxes.has(value)
+    (heap !== undefined ? heap : globalThis.__rt._blk_get(buf) !== undefined) &&
+    !globalThis.__rt._boxes.has(value)
   ) {
     globalThis.__rt._boxes.set(value, { buf, off });
   }
@@ -671,7 +676,9 @@ globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone) => {
     return;
   }
   const each = clone === undefined ? (v) => v : clone;
-  for (let i = 0; i < s.n; i++) globalThis.__rt._put(d.buf, d.off + i, each(s.buf[s.off + i]));
+  const put = globalThis.__rt._put;
+  const dIsHeap = globalThis.__rt._blk_get(d.buf) !== undefined;
+  for (let i = 0; i < s.n; i++) put(d.buf, d.off + i, each(s.buf[s.off + i]), dIsHeap);
 };
 
 // write_bytes(dst, byte, count): sets `count` elements to the value that byte
@@ -1158,23 +1165,106 @@ globalThis.__rt.unwindow = (p) => {
 globalThis.__rt._encoder = {
   value: null,
   encode(value) {
-    return (this.value || (this.value = new TextEncoder())).encode(value);
+    if (typeof TextEncoder === "function") {
+      return (this.value || (this.value = new TextEncoder())).encode(value);
+    }
+    const buf = new Uint8Array(3 * value.length);
+    const len = this.into(value, buf);
+    return buf.subarray(0, len);
   },
   // encodeInto: the bytes written into `target`, which the caller sized to hold
   // all of them (three bytes per UTF-16 code unit is always enough). An engine
   // whose encoder predates `encodeInto` encodes and copies.
   into(value, target) {
-    const encoder = this.value || (this.value = new TextEncoder());
-    if (typeof encoder.encodeInto === "function") return encoder.encodeInto(value, target).written;
-    const bytes = encoder.encode(value);
-    target.set(bytes);
-    return bytes.length;
+    if (typeof TextEncoder === "function") {
+      const encoder = this.value || (this.value = new TextEncoder());
+      if (typeof encoder.encodeInto === "function") return encoder.encodeInto(value, target).written;
+      const bytes = encoder.encode(value);
+      target.set(bytes);
+      return bytes.length;
+    }
+    let out = 0;
+    const n = value.length;
+    for (let i = 0; i < n; i++) {
+      const c = value.charCodeAt(i);
+      if (c < 0x80) {
+        target[out++] = c;
+      } else if (c < 0x800) {
+        target[out++] = 0xc0 | (c >> 6);
+        target[out++] = 0x80 | (c & 0x3f);
+      } else if ((c & 0xfc00) === 0xd800 && i + 1 < n && (value.charCodeAt(i + 1) & 0xfc00) === 0xdc00) {
+        const cp = 0x10000 + (((c & 0x3ff) << 10) | (value.charCodeAt(++i) & 0x3ff));
+        target[out++] = 0xf0 | (cp >> 18);
+        target[out++] = 0x80 | ((cp >> 12) & 0x3f);
+        target[out++] = 0x80 | ((cp >> 6) & 0x3f);
+        target[out++] = 0x80 | (cp & 0x3f);
+      } else if ((c & 0xf800) === 0xd800) {
+        target[out++] = 0xef;
+        target[out++] = 0xbf;
+        target[out++] = 0xbd;
+      } else {
+        target[out++] = 0xe0 | (c >> 12);
+        target[out++] = 0x80 | ((c >> 6) & 0x3f);
+        target[out++] = 0x80 | (c & 0x3f);
+      }
+    }
+    return out;
   },
 };
 globalThis.__rt._decoder = {
   value: null,
   decode(value) {
-    return (this.value || (this.value = new TextDecoder("utf-8", { ignoreBOM: true }))).decode(value);
+    if (typeof TextDecoder === "function") {
+      return (this.value || (this.value = new TextDecoder("utf-8", { ignoreBOM: true }))).decode(value);
+    }
+    let out = "";
+    const codes = [];
+    for (let i = 0, n = value.length; i < n;) {
+      const b0 = value[i++];
+      if (b0 < 0x80) {
+        codes.push(b0);
+      } else {
+        let cp = 0xfffd;
+        const b1 = i < n ? value[i] : -1;
+        if (b0 >= 0xc2 && b0 <= 0xdf && (b1 & 0xc0) === 0x80) {
+          i++;
+          cp = ((b0 & 0x1f) << 6) | (b1 & 0x3f);
+        } else if (
+          b0 >= 0xe0 && b0 <= 0xef &&
+          b1 >= (b0 === 0xe0 ? 0xa0 : 0x80) && b1 <= (b0 === 0xed ? 0x9f : 0xbf)
+        ) {
+          i++;
+          const b2 = i < n ? value[i] : -1;
+          if ((b2 & 0xc0) === 0x80) {
+            i++;
+            cp = ((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f);
+          }
+        } else if (
+          b0 >= 0xf0 && b0 <= 0xf4 &&
+          b1 >= (b0 === 0xf0 ? 0x90 : 0x80) && b1 <= (b0 === 0xf4 ? 0x8f : 0xbf)
+        ) {
+          i++;
+          const b2 = i < n ? value[i] : -1;
+          if ((b2 & 0xc0) === 0x80) {
+            i++;
+            const b3 = i < n ? value[i] : -1;
+            if ((b3 & 0xc0) === 0x80) {
+              i++;
+              cp = (((b0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f)) - 0x10000;
+              codes.push(0xd800 | (cp >> 10));
+              cp = 0xdc00 | (cp & 0x3ff);
+            }
+          }
+        }
+        codes.push(cp);
+      }
+      if (codes.length >= 4096) {
+        out += String.fromCharCode.apply(null, codes);
+        codes.length = 0;
+      }
+    }
+    if (codes.length > 0) out += String.fromCharCode.apply(null, codes);
+    return out;
   },
 };
 
@@ -1191,7 +1281,7 @@ globalThis.__rt._decoder = {
 globalThis.__rt._utf8_scratch = null;
 globalThis.__rt._utf8 = (s) => {
   const n = s.length;
-  if (n <= 16) {
+  if (n <= 48) {
     const bytes = new Array(n);
     let i = 0;
     for (; i < n; i++) {
@@ -1360,7 +1450,9 @@ globalThis.__rt.bytes_str = (buf, off, len) => {
     if (i === len) {
       return String.fromCharCode.apply(
         null,
-        typed ? buf.subarray(off, off + len) : Array.prototype.slice.call(buf, off, off + len),
+        typed ? buf.subarray(off, off + len)
+          : (off === 0 && len === buf.length && Array.isArray(buf)
+            ? buf : Array.prototype.slice.call(buf, off, off + len)),
       );
     }
   }
@@ -1653,22 +1745,36 @@ globalThis.__rt.native_vec_set_len = (value, length) => {
 // that a use after free is a refusal naming itself rather than a read of an
 // emptied array.
 globalThis.__rt._blocks = new WeakMap();
+let _blkK = null;
+let _blkV;
 globalThis.__rt._freed = new WeakSet();
 // Stack arrays reached through `MaybeUninit<u8>` need the same one-time scale
 // bookkeeping without becoming heap blocks. In particular, `_put` must not
 // attach heap ownership metadata to values stored in sort scratch space.
 globalThis.__rt._uninit_blocks = new WeakMap();
 
+globalThis.__rt._blk_get = (buf) => {
+  if (buf === _blkK) return _blkV;
+  const meta = globalThis.__rt._blocks.get(buf);
+  if (meta !== undefined) {
+    _blkK = buf;
+    _blkV = meta;
+  }
+  return meta;
+};
+
 // _heap_block(buf): the block record for a buffer, or undefined if it is not
 // one. A freed block is a refusal rather than a miss: the mistake is worth
 // naming.
 globalThis.__rt._heap_block = (buf) => {
+  const block = globalThis.__rt._blk_get(buf);
+  if (block !== undefined) return block;
   if (globalThis.__rt._freed.has(buf)) {
     throw __rt.abort_error(new Error(
       "rustc_codegen_js: this pointer names a heap block that has been freed",
     ));
   }
-  return globalThis.__rt._blocks.get(buf);
+  return undefined;
 };
 
 // _retype(p, block, size, mk): the heap arm of `unscale`.
@@ -1890,7 +1996,10 @@ globalThis.__rt.tail_slice = (record, key, len) => {
 
 // _register(buf, bytes, zeroed): a new block, and the pointer to its start.
 globalThis.__rt._register = (buf, bytes, zeroed) => {
-  globalThis.__rt._blocks.set(buf, { bytes, es: 1, fresh: true, zeroed });
+  const meta = { bytes, es: 1, fresh: true, zeroed };
+  globalThis.__rt._blocks.set(buf, meta);
+  _blkK = buf;
+  _blkV = meta;
   return { buf, off: 0 };
 };
 
@@ -1917,13 +2026,17 @@ globalThis.__rt.alloc_zeroed = (size, align) =>
 // address, if it was ever asked for, goes back to the free list (`addr`).
 globalThis.__rt.dealloc = (p, size, align) => {
   const buf = p === null || typeof p !== "object" ? null : p.buf;
-  if (buf === null || !globalThis.__rt._blocks.has(buf)) {
+  if (buf === null || globalThis.__rt._blk_get(buf) === undefined) {
     throw __rt.abort_error(new Error(
       "rustc_codegen_js: this pointer does not name a live heap block, so it " +
         "cannot be deallocated",
     ));
   }
   globalThis.__rt._blocks.delete(buf);
+  if (_blkK === buf) {
+    _blkK = null;
+    _blkV = undefined;
+  }
   globalThis.__rt._freed.add(buf);
   globalThis.__rt._addr_release(buf);
   buf.length = 0;
@@ -3497,7 +3610,7 @@ globalThis.__rt.convert_str_block = (s) => {
   // `unscale`, which answers from the block registry, so the fresh copy is
   // registered exactly as `alloc` would have (already element-typed at 1 byte).
   const p = globalThis.__rt._register(copy, copy.length, false);
-  globalThis.__rt._blocks.get(copy).fresh = false;
+  globalThis.__rt._blk_get(copy).fresh = false;
   // A host string is immutable and exact-fit: its capacity is its byte length.
   return { buf: p.buf, off: 0, len: shared.len, cap: shared.len };
 };
@@ -3514,7 +3627,7 @@ globalThis.__rt.convert_sb_block = (sb) => {
   const copy = shared.buf.slice(0, shared.len);
   copy.length = cap;
   const p = globalThis.__rt._register(copy, cap, false);
-  globalThis.__rt._blocks.get(copy).fresh = false;
+  globalThis.__rt._blk_get(copy).fresh = false;
   return { buf: p.buf, off: 0, len: shared.len, cap };
 };
 
@@ -3527,7 +3640,7 @@ globalThis.__rt.convert_nv_block = (nv, size) => {
   const copy = nv.buf.slice(0, nv.len);
   copy.length = Math.max(nv.cap, nv.len);
   const p = globalThis.__rt._register(copy, copy.length * size, false);
-  const block = globalThis.__rt._blocks.get(copy);
+  const block = globalThis.__rt._blk_get(copy);
   block.es = size;
   block.fresh = false;
   return p;

@@ -247,3 +247,73 @@ test('str_bytes timing (printed, not asserted)', () => {
   console.log('# str_bytes timing (median of 7)')
   console.table(rows)
 })
+
+function runtimeNoCodec() {
+  const jobs = []
+  const context = vm.createContext({ Uint8Array, queueMicrotask: (job) => jobs.push(job) })
+  vm.runInContext(source, context)
+  return { rt: context.__rt, jobs, unwind: () => { while (jobs.length) jobs.shift()() } }
+}
+
+test('pure-JS UTF-8 fallback without TextEncoder/TextDecoder matches native codecs on all inputs', () => {
+  const { rt } = runtimeNoCodec()
+  assert.equal(rt._encoder.value, null)
+  assert.equal(rt._decoder.value, null)
+  for (const text of [...texts, ...encodings]) {
+    const want = utf8(text)
+    const rec = rt.str_bytes(text)
+    assert.equal(rec.off, 0)
+    assert.equal(rec.len, want.length, `no-codec len of ${label(text)}`)
+    assert.deepEqual(view(rec), want, `no-codec bytes of ${label(text)}`)
+    assert.equal(rt.str_len(text), want.length)
+    assert.equal(rt.bytes_str(rec.buf, rec.off, rec.len), decoder.decode(encoder.encode(text)))
+    const encoded = rt._encoder.encode(text)
+    assert.ok(encoded instanceof Uint8Array)
+    assert.deepEqual(Array.from(encoded), want)
+  }
+  // Subrange boundaries & i8 negative bytes without TextDecoder.
+  for (const text of texts) {
+    const bytes = encoder.encode(text), padded = new Uint8Array(bytes.length + 4)
+    padded.set([0xff, 0xff]); padded.set(bytes, 2); padded.set([0xff, 0xff], bytes.length + 2)
+    for (const input of [padded, Array.from(padded)]) {
+      assert.equal(rt.bytes_str(input, 2, bytes.length), text)
+    }
+  }
+  assert.equal(rt.bytes_str([0x61, -61, -87, 0x62], 0, 4), 'aéb')
+  assert.equal(rt.bytes_str([-16, -97, -104, -128], 0, 4), astral)
+})
+
+test('pure-JS UTF-8 decoder matches TextDecoder(ignoreBOM: true) on invalid and random byte sequences', () => {
+  const { rt } = runtimeNoCodec()
+  const edgeBytes = [
+    [], [0xef, 0xbb, 0xbf], [0xef, 0xbb, 0xbf, 0x41],
+    [0xc0, 0x80], [0xc1, 0xbf], [0xc2, 0x7f], [0xc2, 0x80], [0xdf, 0xbf],
+    [0xe0, 0x80, 0x80], [0xe0, 0x9f, 0xbf], [0xe0, 0xa0, 0x80], [0xe0, 0xa0],
+    [0xe1, 0x80, 0x41], [0xe1, 0x80], [0xed, 0x9f, 0xbf], [0xed, 0xa0, 0x80], [0xed, 0xbf, 0xbf],
+    [0xee, 0x80, 0x80], [0xef, 0xbf, 0xbf],
+    [0xf0, 0x80, 0x80, 0x80], [0xf0, 0x8f, 0xbf, 0xbf], [0xf0, 0x90, 0x80, 0x80],
+    [0xf0, 0x90, 0x80, 0x41], [0xf0, 0x90, 0x80], [0xf0, 0x90], [0xf0],
+    [0xf4, 0x8f, 0xbf, 0xbf], [0xf4, 0x90, 0x80, 0x80], [0xf5, 0x80, 0x80, 0x80],
+    [0x80], [0xbf], [0xff], [0xfe],
+  ]
+  for (const b of edgeBytes) {
+    const u8 = new Uint8Array(b)
+    assert.equal(rt.bytes_str(u8, 0, u8.length), decoder.decode(u8), JSON.stringify(b))
+  }
+  let seed = 987654321
+  const next = () => (seed = (Math.imul(seed, 1103515245) + 12345) >>> 0)
+  const interesting = [0x00, 0x41, 0x7f, 0x80, 0x8f, 0x90, 0x9f, 0xa0, 0xbf, 0xc0, 0xc1, 0xc2, 0xdf, 0xe0, 0xed, 0xee, 0xef, 0xf0, 0xf4, 0xf5, 0xff]
+  for (let i = 0; i < 4000; i++) {
+    const len = next() % 32
+    const u8 = new Uint8Array(len)
+    for (let j = 0; j < len; j++) u8[j] = (next() & 1) ? interesting[next() % interesting.length] : next() & 0xff
+    assert.equal(rt.bytes_str(u8, 0, u8.length), decoder.decode(u8))
+  }
+  const units = [0x41, 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff, 0xd800, 0xdbff, 0xdc00, 0xdfff, 0xe000, 0xfeff, 0xffff]
+  for (let i = 0; i < 2000; i++) {
+    const n = next() % 90
+    let text = ''
+    for (let j = 0; j < n; j++) text += String.fromCharCode(next() % 3 ? units[next() % units.length] : next() & 0xffff)
+    assert.deepEqual(view(rt.str_bytes(text)), utf8(text))
+  }
+})
