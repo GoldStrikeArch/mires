@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+# The checks below describe the default build mode's keys; the unwind mode's are checked at the
+# end with JSC_PANIC set per command. An inherited selector must not move the default ones.
+unset JSC_PANIC
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=sysroot-cache.sh
