@@ -57,7 +57,7 @@ const rustOptLevel = options['rust-opt-level'] === undefined
 if (rustOptLevel && !['0', '1', '2', '3', 's', 'z'].includes(rustOptLevel)) {
   throw new Error('--rust-opt-level must be 0, 1, 2, 3, s, or z')
 }
-const mirInline = options['mir-inline'] === undefined ? 'off' : String(options['mir-inline'])
+const mirInline = String(options['mir-inline'] ?? (process.env.JSC_RUST_MIR_INLINE || 'off'))
 if (!['off', 'on'].includes(mirInline)) {
   throw new Error('--mir-inline must be off or on')
 }
