@@ -147,6 +147,9 @@ fn codegen_cgu_inner(tcx: TyCtxt<'_>, cgu_name: Symbol) -> JsModule {
                             kind: ZombieKind::Unsupported,
                         });
                     }
+                    if tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind {
+                        reject_nounwind_foreign_calls(tcx, instance);
+                    }
                     if cx.claim(&item.name) {
                         module.items.push(item);
                     }
@@ -268,6 +271,59 @@ fn requires_cleanup_lowering<'tcx>(
             .basic_blocks
             .iter()
             .any(|block| block.is_cleanup)
+}
+
+/// Under `-Cpanic=unwind` (the unwind build mode), an error for each call this function makes to a
+/// foreign import whose ABI cannot unwind.
+///
+/// rustc removes the cleanup edge of such a call, so a JavaScript exception thrown by the host
+/// behind it would leave its callers without running their destructors. Declared
+/// `extern "C-unwind"` the call keeps its edge. The imports of the sysroot's own crates are the
+/// runtime's, which this compiler supplies, so only a program's own declarations are named. It is
+/// an error where the call is compiled rather than a zombie: the JIR lane replaces an item's
+/// zombies with its lowering's, and this is a property of the declaration, not of the lowering.
+fn reject_nounwind_foreign_calls<'tcx>(tcx: TyCtxt<'tcx>, instance: rustc_middle::ty::Instance<'tcx>) {
+    use rustc_abi::ExternAbi;
+    let body = tcx.instance_mir(instance.def);
+    for block in body.basic_blocks.iter() {
+        let terminator = block.terminator();
+        let rustc_middle::mir::TerminatorKind::Call { func, .. } = &terminator.kind else {
+            continue;
+        };
+        let rustc_middle::ty::FnDef(callee, _) = *func.ty(body, tcx).kind() else {
+            continue;
+        };
+        if !tcx.is_foreign_item(callee) {
+            continue;
+        }
+        let abi = tcx.fn_sig(callee).skip_binder().abi();
+        if !matches!(
+            abi,
+            ExternAbi::C { unwind: false } | ExternAbi::System { unwind: false }
+        ) {
+            continue;
+        }
+        if matches!(
+            tcx.crate_name(callee.krate).as_str(),
+            "core" | "alloc" | "compiler_builtins"
+        ) {
+            continue;
+        }
+        // rustc deduplicates an identical diagnostic, so each instance of a generic reports once.
+        tcx.dcx()
+            .struct_span_err(
+                terminator.source_info.span,
+                format!(
+                    "rustc_codegen_js: `{}` is a foreign import with the \"{}\" ABI, which cannot \
+                     unwind: under -Cpanic=unwind (JSC_PANIC=unwind) a host exception thrown \
+                     through it would skip its callers' cleanup. Declare it `extern \"C-unwind\"`.",
+                    tcx.def_path_str(callee),
+                    abi.as_str()
+                ),
+            )
+            .with_span_note(tcx.def_span(callee), "the import is declared here")
+            .emit();
+    }
 }
 
 /// Moves the JIR body out of a late-IR summary, so that the object stores it once (S3) and the
