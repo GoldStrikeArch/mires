@@ -234,6 +234,18 @@ Incremental rustc invocations require `-Cllvm-args=js-producer=<sha256>`, where 
 
 Cleanup-enabled libraries carry a versioned, checksummed executable MIR member with stable definition, source and hygiene identities. Import validates the producer digest, rustc version, emit options, target layout and crate identity. Generic consumers can reconstruct that MIR without the original source files. A consumer given only a dependency's `.rmeta` (cargo's pipelining, which is how the sysroot's `alloc` sees `core`) reads the member from the rlib written beside it under the same stem; the identity checks prove it is the same compilation. A dependency whose rlib or member cannot be found is an error, never a fallback to rustc's optimized MIR, whose cleanup paths `-Cpanic=abort` removed. When two objects carry copies of one item, the link keeps a copy with cleanup edges over one without them, whatever their hashes, and keeps a copy that owes cleanup but declined encoding (its zombie fails a reachable use) over a body without cleanup edges. `scripts/cleanup-transport-test.py` checks cold/warm/edited builds, fresh consumers of warm libraries, incompatible producers, source absence, metadata-only dependencies with and without their rlib, the kept copy of a duplicated instance, and the cleanup edges of the sysroot `alloc`'s instances of `core` generics. The ordinary source-fact capture described below remains the default when executable cleanup is disabled.
 
+`JSC_PANIC=unwind` selects the experimental unwind build mode; unset (or `abort`) is the default described above, and nothing makes the unwind mode a default. The sysroot and every crate are then compiled for `targets/mires32-unwind.json` (rustc's `wasm32-unknown-unknown` with `"panic-strategy": "unwind"`) with `-Cpanic=unwind`, and `js-cleanup=off` is appended after the caller's backend options, so a build that pins `js-cleanup=on` or a release profile runs in either mode. rustc's optimized MIR then keeps its unwind edges, and the backend lowers those: a JavaScript exception thrown by a host call runs the destructors of every live value on its way out and leaves the Rust frames as the same value, without the re-derived cleanup bodies of `js-cleanup=on`. The mode is keyed apart from every default sysroot (its panic strategy, the target spec's content and `patches/unwind/*.patch` join the cache key only in this mode); `patches/unwind/0001-core-eh-personality.patch` gives `core` the `eh_personality` lang item `-Cpanic=unwind` requires, so a crate needs nothing of its own (`examples/mini_core.rs` carries one for the `no_core` suite). `scripts/build_sysroot.sh`, `compile_core.sh`, `compile.sh`, `scripts/mires.mjs`, the experiment builders and `mires-build` read the switch; the receipts record it.
+
+In the unwind mode:
+
+* **A Rust panic is still an abort.** The `#[panic_handler]` runs, and every handler rethrows an abort without running cleanup (`__rt.is_abort`), exactly as under `-Cpanic=abort`; only a host exception unwinds. `catch_unwind` stays unsupported: the intrinsic is a zombie under any strategy but `abort`.
+* **Foreign imports must be `extern "C-unwind"`.** rustc removes the cleanup edge of a call whose ABI cannot unwind, so a host exception behind an `extern "C"` import would skip its callers' destructors. The backend rejects every call to such an import where it is compiled, with ``rustc_codegen_js: `name` is a foreign import with the "C" ABI, which cannot unwind: … Declare it `extern "C-unwind"`.`` and a note at the declaration (`examples/unwind-tests/290_extern_c_import_rejected.rs`); it is a compile-time error rather than a zombie because the JIR lane replaces an item's zombies with its lowering's. The imports of the sysroot's own crates (`core`, `alloc`, `compiler_builtins`) are the runtime's and exempt. `#[js_extern]` and `js_bindings!` expand to ordinary Rust functions, so their declarations are unaffected; `mires-js`, `view-abi` and the fixture preludes declare theirs `"C-unwind"`, which changes nothing under `-Cpanic=abort` (rustc gives the call `unwind unreachable` either way).
+* **An exported `extern "C" fn` rethrows.** Its cleanup path ends in `UnwindTerminate(Abi)`, which the JIR lowering emits as the same rethrow as `UnwindResume` once the drops have run (`UnwindTerminate(InCleanup)` still declines in a body with protected calls). The lowering is the same in both modes.
+* **The baseline lane cannot build programs with cleanup.** Every body that keeps a cleanup block needs the JIR lane: a reachable one that the baseline lane would print is refused with the `requires semantic cleanup lowering` refusal of `js-cleanup=on` above, and the backend's fail-closed guard gives an item whose JIR encoding declined (or `js-jir=off`) the same zombie. A suite row that asks the baseline lane to build such a program is skipped in this mode with its reason printed.
+* **Byte goldens are abort-mode text.** A golden recorded for the default mode is not compared in this mode; the behaviour checks beside it still run.
+
+`scripts/unwind-mode-test.sh` runs the mode's own fixtures (`examples/unwind-tests/`) in whichever mode `JSC_PANIC` selects.
+
 Backend options ride in on `-Cllvm-args`, space separated (`scripts/compile.sh` forwards
 `$JS_EXTRA_ARGS`):
 
@@ -337,6 +349,10 @@ at all — it is a Rust symbol some other crate in the program defines, and the 
 only because the definition cannot be named directly. Those lower to an ordinary direct call.
 `core`'s `panic_impl` (the `#[panic_handler]`) is the case that matters; the allocator shims have
 the same shape.
+
+In the unwind build mode (`JSC_PANIC=unwind`, see "Compilation") a program's foreign imports must be
+`extern "C-unwind"`: a call to an `extern "C"` import loses its cleanup edge there, so the backend
+rejects it at compile time and names that fix. The ABI's lowering is the same for both spellings.
 
 ### `#[panic_handler]` crates must not format
 
