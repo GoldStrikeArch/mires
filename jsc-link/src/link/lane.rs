@@ -775,6 +775,13 @@ pub(crate) fn run(
         defined.insert(register.clone());
         live.insert(register.clone());
     }
+    for helper in crate::lower::js::i64_pair::HELPER_NAMES {
+        let helper_name = JsName::new((*helper).to_owned());
+        if !table.contains_key(&helper_name) {
+            defined.insert(helper_name.clone());
+            live.insert(helper_name);
+        }
+    }
     let mut plan_retries = 0;
     let mut ready_allowed = true;
     let mut physical = planned_physical;
@@ -978,6 +985,19 @@ pub(crate) fn run(
             },
         }
         outcomes.push(outcome);
+    }
+
+    let referenced: BTreeSet<JsName> = table
+        .values()
+        .flat_map(|item| item.refs.iter().cloned())
+        .collect();
+    let existing: BTreeSet<JsName> = table.keys().cloned().collect();
+    let helper_items = crate::lower::js::i64_pair::needed_helper_items(&referenced, &existing);
+    let added_items = added_items || !helper_items.is_empty();
+    for helper in helper_items {
+        if let std::collections::btree_map::Entry::Vacant(slot) = table.entry(helper.name.clone()) {
+            slot.insert(helper);
+        }
     }
 
     LaneRun {

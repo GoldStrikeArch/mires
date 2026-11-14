@@ -830,13 +830,13 @@ struct OverflowHarness {
 
 impl OverflowHarness {
     fn new() -> Self {
-        Self {
-            source: String::from(
-                "'use strict';\nconst assert = require('node:assert/strict');\nconst cases = [];\n\
-                 function keep(p) {\n  assert.ok(Array.isArray(p) && p.length === 2, \
-                 `keep got ${p}`);\n  return p;\n}\n",
-            ),
-        }
+        let mut source = String::from(
+            "'use strict';\nconst assert = require('node:assert/strict');\nconst cases = [];\n\
+             function keep(p) {\n  assert.ok(Array.isArray(p) && p.length === 2, \
+             `keep got ${p}`);\n  return p;\n}\n",
+        );
+        source.push_str(&super::i64_pair::helper_preamble_js());
+        Self { source }
     }
 
     /// Adds the function `js` (declaring `name`) and its cases for `op` at `width`.
@@ -988,14 +988,54 @@ fn a_projected_overflow_pair_is_its_exact_result() {
 
 #[test]
 fn an_inline_projected_overflow_pair_binds_one_temporary() {
-    let (interns, widths) = overflow_world();
+    let (mut interns, widths) = overflow_world();
     let func = one_half_overflow(BinaryOp::SubWithOverflow, widths[5], 1);
     let plan = plan_of(&func, &[(0, "a"), (1, "b")]);
     let body = body_of(BodyKind::Function, func.sig.clone());
     let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
     assert_eq!(
         js,
-        "function f(a, b) {\n  let $t0;\n  return BigInt.asIntN(64, $t0 = a - b) !== $t0;\n}\n"
+        "function f(a, b) {\n  let a$lo, a$hi, b$lo, b$hi, $t0, $t1, $t2;\n  a$lo = Number(BigInt.asIntN(32, a)) | 0;\n  a$hi = Number(BigInt.asIntN(32, a >> 32n)) | 0;\n  b$lo = Number(BigInt.asIntN(32, b)) | 0;\n  b$hi = Number(BigInt.asIntN(32, b >> 32n)) | 0;\n  $t0 = a$lo - b$lo | 0;\n  $t1 = a$lo >>> 0 < b$lo >>> 0 ? 1 : 0;\n  $t2 = a$hi - b$hi - $t1 | 0;\n  return ((a$hi ^ b$hi) & (a$hi ^ $t2)) < 0;\n}\n"
+    );
+    // 128-bit integers remain BigInt-based and preserve the single-temporary v1 pattern.
+    const I128: TypeId = TypeId(63);
+    const I128_PAIR: TypeId = TypeId(64);
+    interns.intern_type(int(I128, true, 128));
+    let mut pair128 = descriptor(I128_PAIR, TypeKind::Tuple(vec![I128, BOOL]), 32);
+    pair128.js.is_indirect = true;
+    pair128.js.needs_clone = true;
+    pair128.js.fields = vec![
+        field(FieldKey::Index(0), I128),
+        field(FieldKey::Index(1), BOOL),
+    ];
+    interns.intern_type(pair128);
+    let func128 = one_half_overflow(
+        BinaryOp::SubWithOverflow,
+        Width {
+            element: I128,
+            pair: I128_PAIR,
+            nest: I128_PAIR,
+            reference: I128_PAIR,
+            raw: I128_PAIR,
+            signed: true,
+            bits: 128,
+        },
+        1,
+    );
+    let plan128 = plan_of(&func128, &[(0, "a"), (1, "b")]);
+    let body128 = body_of(BodyKind::Function, func128.sig.clone());
+    let js128 = lower(
+        &interns,
+        "f128",
+        &[],
+        &body128,
+        &func128,
+        &plan128,
+        straight(&func128),
+    );
+    assert_eq!(
+        js128,
+        "function f128(a, b) {\n  let $t0;\n  return BigInt.asIntN(128, $t0 = a - b) !== $t0;\n}\n"
     );
 }
 
@@ -1513,10 +1553,12 @@ fn an_overflow_pair_that_escapes_through_any_use_is_built() {
                     names.iter().map(|(v, name)| (*v, name.as_str())).collect();
                 let name = format!("{spelled}_{}_{escape:?}", width.label());
                 let js = harness.lower(&interns, &name, &func, &names, op, width);
-                assert!(
-                    js.contains("p = [$t"),
-                    "{name}: the escaping pair must be built\n{js}"
-                );
+                let built = if width.bits == 64 {
+                    js.contains("p = [BigInt(")
+                } else {
+                    js.contains("p = [$t")
+                };
+                assert!(built, "{name}: the escaping pair must be built\n{js}");
             }
         }
     }
@@ -1617,7 +1659,109 @@ fn bigint_and_float_and_casts_spell_as_v1() {
     let js = lower(&interns, "g", &[], &body, &func, &plan, straight(&func));
     assert_eq!(
         js,
-        "function g(a, n, f) {\n  return BigInt.asIntN(64, -BigInt.asIntN(64, BigInt.asIntN(64, BigInt.asIntN(64, a << (BigInt(n) & 63n)) + BigInt.asIntN(64, BigInt(n))) - __rt.f2i_big(Math.fround(f * f), 64, true)));\n}\n"
+        "function g(a, n, f) {\n  let a$lo, a$hi, $t0, $t1, $t2, $t3, $t4, $t5, $t6;\n  a$lo = Number(BigInt.asIntN(32, a)) | 0;\n  a$hi = Number(BigInt.asIntN(32, a >> 32n)) | 0;\n  $t0 = n & 63;\n  $t1 = n | 0;\n  $t2 = ($t0 & 32) !== 0 ? 0 : a$lo << $t0;\n  $t3 = $t2 + $t1 | 0;\n  $t4 = $__mires_i64_f2i(Math.fround(f * f), true);\n  $t5 = $__mires_i64_hi;\n  $t6 = -($t3 - $t4 | 0) | 0;\n  return BigInt(~(((($t0 & 32) !== 0 ? a$lo << $t0 : a$hi << $t0 | a$lo >>> 1 >>> 31 - $t0) + ($t1 >> 31) + ($t3 >>> 0 < $t2 >>> 0 ? 1 : 0) | 0) - $t5 - ($t3 >>> 0 < $t4 >>> 0 ? 1 : 0) | 0) + ($t6 === 0 ? 1 : 0) | 0) << 32n | BigInt($t6 >>> 0);\n}\n"
+    );
+    // 128-bit integers continue to lower to BigInt arithmetic like v1.
+    let mut interns128 = world();
+    const I128: TypeId = TypeId(63);
+    interns128.intern_type(int(I128, true, 128));
+    let mut b128 = FuncBuilder::new(item(1), signature(vec![I128, I32, F32], I128));
+    let a128 = b128.param(I128, NO_ORIGIN);
+    let n128 = b128.param(I32, NO_ORIGIN);
+    let f128 = b128.param(F32, NO_ORIGIN);
+    let e128 = FuncBuilder::ENTRY;
+    let shl128 = b128.op(
+        e128,
+        OpKind::Binary {
+            op: BinaryOp::Shl,
+            l: a128,
+            r: n128,
+            ty: I128,
+        },
+        I128,
+        NO_ORIGIN,
+    );
+    let widened128 = b128.op(
+        e128,
+        OpKind::Cast {
+            kind: CastKind::IntToInt,
+            v: n128,
+            from: I32,
+            to: I128,
+        },
+        I128,
+        NO_ORIGIN,
+    );
+    let sum128 = b128.op(
+        e128,
+        OpKind::Binary {
+            op: BinaryOp::Add,
+            l: shl128,
+            r: widened128,
+            ty: I128,
+        },
+        I128,
+        NO_ORIGIN,
+    );
+    let sq128 = b128.op(
+        e128,
+        OpKind::Binary {
+            op: BinaryOp::Mul,
+            l: f128,
+            r: f128,
+            ty: F32,
+        },
+        F32,
+        NO_ORIGIN,
+    );
+    let fi128 = b128.op(
+        e128,
+        OpKind::Cast {
+            kind: CastKind::FloatToInt,
+            v: sq128,
+            from: F32,
+            to: I128,
+        },
+        I128,
+        NO_ORIGIN,
+    );
+    let total128 = b128.op(
+        e128,
+        OpKind::Binary {
+            op: BinaryOp::Sub,
+            l: sum128,
+            r: fi128,
+            ty: I128,
+        },
+        I128,
+        NO_ORIGIN,
+    );
+    let neg128 = b128.op(
+        e128,
+        OpKind::Unary {
+            op: UnaryOp::Neg,
+            v: total128,
+            ty: I128,
+        },
+        I128,
+        NO_ORIGIN,
+    );
+    b128.terminate(e128, RTerm::Return(Some(neg128)));
+    let func128 = b128.finish();
+    let plan128 = plan_of(&func128, &[(0, "a"), (1, "n"), (2, "f")]);
+    let body128 = body_of(BodyKind::Function, func128.sig.clone());
+    let js128 = lower(
+        &interns128,
+        "g128",
+        &[],
+        &body128,
+        &func128,
+        &plan128,
+        straight(&func128),
+    );
+    assert_eq!(
+        js128,
+        "function g128(a, n, f) {\n  return BigInt.asIntN(128, -BigInt.asIntN(128, BigInt.asIntN(128, BigInt.asIntN(128, a << (BigInt(n) & 127n)) + BigInt.asIntN(128, BigInt(n))) - __rt.f2i_big(Math.fround(f * f), 128, true)));\n}\n"
     );
 }
 

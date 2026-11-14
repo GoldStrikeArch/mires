@@ -27,7 +27,7 @@ use rcgjs_object::evaluation::OperandEvaluation;
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::interns::StrId;
 use rcgjs_object::jir::repr::{Op, ValueId};
-use rcgjs_object::jir::semantic::DirectItemRef;
+use rcgjs_object::jir::semantic::{BinaryOp, DirectItemRef};
 use rcgjs_object::jir::types::{IntRepr, NominalForm, TypeId, TypeKind};
 use rcgjs_object::jsast::{self, BinOp, Expr, Stmt};
 use rcgjs_object::ptr;
@@ -50,6 +50,8 @@ const RAW_EQ_INDEX: &str = "$i";
 enum Outcome {
     /// The value to bind to the result.
     Value(Expr),
+    /// The 64-bit integer `(lo, hi)` pair to bind to the result.
+    Pair((Expr, Expr)),
     /// Statements that are the whole lowering; there is no value.
     Done(Vec<Stmt>),
 }
@@ -78,7 +80,9 @@ pub fn lower(
         captured: None,
         prelude: RefCell::new(Vec::new()),
     };
-    if OperandEvaluation::intrinsic(name) == OperandEvaluation::Materialize {
+    let has_i64 = result_ty.is_some_and(|ty| cx.is_i64_ty(ty))
+        || args.iter().any(|arg| cx.is_i64_value(*arg));
+    if OperandEvaluation::intrinsic(name) == OperandEvaluation::Materialize && !has_i64 {
         let arguments = args
             .iter()
             .map(|arg| cx.expr_of(*arg))
@@ -120,6 +124,7 @@ pub fn lower(
     let prelude = intrinsic.prelude.into_inner();
     Ok(match outcome {
         Outcome::Value(value) => Lowered::Value(prelude, value),
+        Outcome::Pair(pair) => Lowered::Pair(prelude, pair),
         Outcome::Done(stmts) => {
             let mut out = prelude;
             out.extend(stmts);
@@ -398,9 +403,37 @@ impl Intrinsic<'_, '_> {
             | "prefetch_write_data"
             | "prefetch_read_instruction"
             | "prefetch_write_instruction" => Outcome::Done(Vec::new()),
-            "likely" | "unlikely" | "black_box" | "rustc_peek" => Outcome::Value(self.arg(0)?),
+            "likely" | "unlikely" | "black_box" | "rustc_peek" => {
+                if self.result_ty.is_some_and(|ty| self.cx.is_i64_ty(ty)) {
+                    let arg = self.args.first().copied().ok_or_else(|| {
+                        decline(OpClass::Intrinsic, "intrinsic expected an argument")
+                    })?;
+                    Outcome::Pair(self.cx.pair_of(arg)?)
+                } else {
+                    Outcome::Value(self.arg(0)?)
+                }
+            }
             "select_unpredictable" => {
-                Outcome::Value(jsast::cond(self.arg(0)?, self.arg(1)?, self.arg(2)?))
+                if self.result_ty.is_some_and(|ty| self.cx.is_i64_ty(ty)) {
+                    let cond_id = *self.args.first().ok_or_else(|| {
+                        decline(OpClass::Intrinsic, "intrinsic expected cond argument")
+                    })?;
+                    let t_id = *self.args.get(1).ok_or_else(|| {
+                        decline(OpClass::Intrinsic, "intrinsic expected true argument")
+                    })?;
+                    let f_id = *self.args.get(2).ok_or_else(|| {
+                        decline(OpClass::Intrinsic, "intrinsic expected false argument")
+                    })?;
+                    let cond = self.temp(self.cx.expr_of(cond_id)?);
+                    let (tlo, thi) = self.cx.pair_of(t_id)?;
+                    let (flo, fhi) = self.cx.pair_of(f_id)?;
+                    Outcome::Pair((
+                        jsast::cond(cond.clone(), tlo, flo),
+                        jsast::cond(cond, thi, fhi),
+                    ))
+                } else {
+                    Outcome::Value(jsast::cond(self.arg(0)?, self.arg(1)?, self.arg(2)?))
+                }
             }
             "is_val_statically_known" | "ub_checks" | "contract_checks" => {
                 Outcome::Value(jsast::boolean(false))
@@ -540,6 +573,9 @@ impl Intrinsic<'_, '_> {
         }
         let table = self.cx.table;
         let operand_ty = self.arg_ty(0)?;
+        if super::i64_pair::is_i64(table, operand_ty) {
+            return self.integer_i64_pair(name, operand_ty).map(Some);
+        }
         if name == "three_way_compare" {
             return self.three_way_compare(operand_ty).map(Some);
         }
@@ -566,6 +602,164 @@ impl Intrinsic<'_, '_> {
         } else {
             self.arithmetic(name, int)?
         }))
+    }
+
+    fn pair_arg(&self, index: usize) -> Res<(Expr, Expr)> {
+        let arg = *self.args.get(index).ok_or_else(|| {
+            decline(
+                OpClass::Intrinsic,
+                format!("intrinsic expected argument {index}"),
+            )
+        })?;
+        self.cx.pair_of(arg)
+    }
+
+    fn shift_amount_i64_pair(&self, index: usize) -> Res<Expr> {
+        let arg = *self.args.get(index).ok_or_else(|| {
+            decline(
+                OpClass::Intrinsic,
+                format!("intrinsic expected argument {index}"),
+            )
+        })?;
+        let ty = self.cx.ty_of(arg)?;
+        if self.cx.is_i64_ty(ty) {
+            return Ok(self.cx.pair_of(arg)?.0);
+        }
+        let expr = self.arg(index)?;
+        if self.cx.table.int_repr(ty) == IntRepr::BigInt {
+            Ok(jsast::to_number(jsast::bigint_mask(false, 32, expr)))
+        } else {
+            Ok(expr)
+        }
+    }
+
+    fn integer_i64_pair(&self, name: &str, operand_ty: TypeId) -> Res<Outcome> {
+        let signed = super::i64_pair::i64_signedness(self.cx.table, operand_ty).unwrap_or(false);
+        let a = self.pair_arg(0)?;
+        let mut stmts = self.prelude.borrow_mut();
+        Ok(match name {
+            "ctpop" | "ctlz" | "ctlz_nonzero" | "cttz" | "cttz_nonzero" => Outcome::Value(
+                super::i64_pair::bit_count_intrinsic(self.cx, &mut stmts, name, a),
+            ),
+            "bswap" | "bitreverse" => Outcome::Pair(super::i64_pair::bit_permute_pair(
+                self.cx, &mut stmts, name, a,
+            )),
+            "three_way_compare" => {
+                let table = self.cx.table;
+                let ordering_ty = self.ret_ty()?;
+                let variants = value::enum_variants(table, ordering_ty);
+                let variant = |wanted: &str| -> Option<Expr> {
+                    let index = variants.iter().position(|variant| {
+                        value::variant_name(self.cx.interns, variant) == wanted
+                    })?;
+                    value::enum_value(
+                        table,
+                        self.cx.interns,
+                        ordering_ty,
+                        index as u32,
+                        Vec::new(),
+                    )
+                };
+                let (Some(less), Some(equal), Some(greater)) =
+                    (variant("Less"), variant("Equal"), variant("Greater"))
+                else {
+                    return Ok(self.unsupported(
+                        "`three_way_compare` did not return an `Ordering`".to_owned(),
+                    ));
+                };
+                let b = self.pair_arg(1)?;
+                Outcome::Value(super::i64_pair::three_way_ordering(
+                    self.cx,
+                    &mut stmts,
+                    signed,
+                    a,
+                    b,
+                    [less, equal, greater],
+                ))
+            }
+            "wrapping_add" | "unchecked_add" => {
+                let b = self.pair_arg(1)?;
+                Outcome::Pair(super::i64_pair::add_pair(self.cx, &mut stmts, a, b))
+            }
+            "wrapping_sub" | "unchecked_sub" => {
+                let b = self.pair_arg(1)?;
+                Outcome::Pair(super::i64_pair::sub_pair(self.cx, &mut stmts, a, b))
+            }
+            "wrapping_mul" | "unchecked_mul" => {
+                let b = self.pair_arg(1)?;
+                Outcome::Pair(super::i64_pair::mul_pair(self.cx, &mut stmts, a, b))
+            }
+            "unchecked_div" | "exact_div" => {
+                let b = self.pair_arg(1)?;
+                Outcome::Pair(super::i64_pair::div_rem_pair(
+                    self.cx, &mut stmts, signed, false, a, b,
+                ))
+            }
+            "unchecked_rem" => {
+                let b = self.pair_arg(1)?;
+                Outcome::Pair(super::i64_pair::div_rem_pair(
+                    self.cx, &mut stmts, signed, true, a, b,
+                ))
+            }
+            "disjoint_bitor" => {
+                let b = self.pair_arg(1)?;
+                Outcome::Pair(super::i64_pair::bitwise_pair(BinOp::BitOr, a, b))
+            }
+            "unchecked_shl" => {
+                drop(stmts);
+                let amt = self.shift_amount_i64_pair(1)?;
+                let mut stmts = self.prelude.borrow_mut();
+                Outcome::Pair(super::i64_pair::shl_pair(self.cx, &mut stmts, a, amt))
+            }
+            "unchecked_shr" => {
+                drop(stmts);
+                let amt = self.shift_amount_i64_pair(1)?;
+                let mut stmts = self.prelude.borrow_mut();
+                Outcome::Pair(super::i64_pair::shr_pair(
+                    self.cx, &mut stmts, signed, a, amt,
+                ))
+            }
+            "rotate_left" | "rotate_right" => {
+                drop(stmts);
+                let amt = self.shift_amount_i64_pair(1)?;
+                let mut stmts = self.prelude.borrow_mut();
+                Outcome::Pair(super::i64_pair::rotate_pair(
+                    self.cx,
+                    &mut stmts,
+                    name == "rotate_left",
+                    a,
+                    amt,
+                ))
+            }
+            "saturating_add" | "saturating_sub" => {
+                let b = self.pair_arg(1)?;
+                Outcome::Pair(super::i64_pair::saturating_pair(
+                    self.cx,
+                    &mut stmts,
+                    name == "saturating_add",
+                    signed,
+                    a,
+                    b,
+                ))
+            }
+            "add_with_overflow" | "sub_with_overflow" | "mul_with_overflow" => {
+                let b = self.pair_arg(1)?;
+                let bin_op = match name {
+                    "add_with_overflow" => BinaryOp::AddWithOverflow,
+                    "sub_with_overflow" => BinaryOp::SubWithOverflow,
+                    _ => BinaryOp::MulWithOverflow,
+                };
+                let (lo, hi, ovf) =
+                    super::i64_pair::with_overflow_pair(self.cx, &mut stmts, bin_op, signed, a, b);
+                let lo = super::i64_pair::materialize(self.cx, &mut stmts, lo);
+                let hi = super::i64_pair::materialize(self.cx, &mut stmts, hi);
+                Outcome::Value(jsast::array(vec![
+                    super::i64_pair::pack_bigint(signed, lo, hi),
+                    ovf,
+                ]))
+            }
+            _ => self.unsupported(format!("`{name}` is not supported by rustc_codegen_js")),
+        })
     }
 
     fn arithmetic(&self, name: &str, int: Int) -> Res<Outcome> {
@@ -1041,6 +1235,12 @@ impl Intrinsic<'_, '_> {
             jsast::member(jsast::id("Math"), "trunc"),
             vec![self.arg(0)?],
         );
+        if let Some(signed) = super::i64_pair::i64_signedness(table, to_ty) {
+            let mut stmts = self.prelude.borrow_mut();
+            return Ok(Outcome::Pair(super::i64_pair::float_to_i64_pair(
+                self.cx, &mut stmts, signed, truncated,
+            )));
+        }
         let repr = table.int_repr(to_ty);
         let value = match repr {
             IntRepr::BigInt => jsast::to_bigint(truncated),

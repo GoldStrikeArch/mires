@@ -1257,6 +1257,12 @@ fn type_table<'a>(table: &'a BTreeMap<JsName, LinkItem>, name: &JsName) -> Optio
 }
 
 fn param_shape(types: &TypeTable, param: &FlatParam) -> ValueShape {
+    if param.i64_pair {
+        return ValueShape::Product(vec![
+            LaneKind::Scalar(ScalarKind::Signed(32)),
+            LaneKind::Scalar(ScalarKind::Signed(32)),
+        ]);
+    }
     if param.slice {
         return ValueShape::Product(vec![
             LaneKind::Buffer,
@@ -1289,6 +1295,12 @@ fn param_shape(types: &TypeTable, param: &FlatParam) -> ValueShape {
 }
 
 fn result_shape(types: &TypeTable, result: &FlatResult) -> ValueShape {
+    if result.i64_pair {
+        return ValueShape::Product(vec![
+            LaneKind::Scalar(ScalarKind::Signed(32)),
+            LaneKind::Scalar(ScalarKind::Signed(32)),
+        ]);
+    }
     if let Some(tagged) = &result.tagged {
         return ValueShape::Product(
             std::iter::once(LaneKind::Tag)

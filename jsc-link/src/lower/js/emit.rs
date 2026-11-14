@@ -76,12 +76,21 @@ pub fn emit(cx: &JsCx<'_>, region: Region<BlockPayload, RScrut>) -> Res<(Vec<Stm
     let mut emitter = Emitter {
         cx,
         tmps: BTreeMap::new(),
+        next_switch_label: 0,
     };
     let body = emitter.region(region)?;
     let tmps = emitter
         .tmps
-        .keys()
-        .map(|tmp| tmp_name(TmpId(*tmp)))
+        .iter()
+        .flat_map(|(tmp, scrut)| {
+            let base = tmp_name(TmpId(*tmp));
+            if scrut.is_some_and(|s| cx.is_i64_ty(s.ty) && s.tag_enum.is_none()) {
+                let (lo, hi) = super::i64_pair::pair_names(&base);
+                vec![lo, hi]
+            } else {
+                vec![base]
+            }
+        })
         .collect();
     Ok((body, tmps))
 }
@@ -90,6 +99,7 @@ struct Emitter<'a, 'b> {
     cx: &'a JsCx<'b>,
     /// Every temporary the tree names, with the scrutinee type of the ones a test reads back.
     tmps: BTreeMap<u32, Option<ScrutTy>>,
+    next_switch_label: u32,
 }
 
 type SwitchArm = (Vec<u128>, Region<BlockPayload, RScrut>);
@@ -112,6 +122,21 @@ impl Emitter<'_, '_> {
             Region::Loop { label, body } => self.loop_(label, *body)?,
             Region::LetTmp { tmp, value } => {
                 let loc = self.scrutinee_loc(&Scrut::Payload(value));
+                let ty = self.cx.scrut_ty(&value);
+                if self.cx.is_i64_ty(ty.ty) && ty.tag_enum.is_none() {
+                    if let RScrut::Value { value: val_id, .. } = value {
+                        let (lo, hi) = self.cx.pair_of(val_id)?;
+                        self.tmps.insert(tmp.0, Some(ty));
+                        let (dst_lo, dst_hi) = super::i64_pair::pair_names(&tmp_name(tmp));
+                        return Ok(with_loc(
+                            loc,
+                            vec![
+                                jsast::assign_stmt(jsast::id(dst_lo), lo),
+                                jsast::assign_stmt(jsast::id(dst_hi), hi),
+                            ],
+                        ));
+                    }
+                }
                 let (expr, ty) = self.cx.scrutinee(&value)?;
                 self.tmps.insert(tmp.0, Some(ty));
                 with_loc(
@@ -182,6 +207,105 @@ impl Emitter<'_, '_> {
         })
     }
 
+    fn scrutinee_i64_pair(&self, scrut: &Scrut<RScrut>) -> Res<Option<((Expr, Expr), ScrutTy)>> {
+        let scrut_ty = match scrut {
+            Scrut::Payload(scrutinee) => self.cx.scrut_ty(scrutinee),
+            Scrut::Tmp(tmp) => self.tmp_ty(*tmp),
+        };
+        if !self.cx.is_i64_ty(scrut_ty.ty) || scrut_ty.tag_enum.is_some() {
+            return Ok(None);
+        }
+        let pair = match scrut {
+            Scrut::Payload(RScrut::Value { value, .. }) => self.cx.pair_of(*value)?,
+            Scrut::Tmp(tmp) => {
+                let (lo, hi) = super::i64_pair::pair_names(&tmp_name(*tmp));
+                (jsast::id(lo), jsast::id(hi))
+            }
+            Scrut::Payload(RScrut::Invoke(_)) => return Ok(None),
+        };
+        Ok(Some((pair, scrut_ty)))
+    }
+
+    fn test_i64_pair(
+        &self,
+        setup: &mut Vec<Stmt>,
+        pair: (Expr, Expr),
+        scrut: ScrutTy,
+        test: Test,
+        negated: bool,
+    ) -> Expr {
+        let signed = super::i64_pair::i64_signedness(self.cx.table, scrut.ty).unwrap_or(false);
+        let (al, ah) = super::i64_pair::materialize_pair(self.cx, setup, pair);
+        let lit = |encoded: u128| super::i64_pair::literal_pair(self.cx.decode(scrut.ty, encoded));
+        match test {
+            Test::IsTrue => {
+                let nz = jsast::binary(
+                    BinOp::StrictNe,
+                    jsast::binary(BinOp::BitOr, al, ah),
+                    jsast::num(0.0),
+                );
+                if negated {
+                    jsast::not(nz)
+                } else {
+                    nz
+                }
+            }
+            Test::Eq(v) => {
+                let op = if negated { BinaryOp::Ne } else { BinaryOp::Eq };
+                super::i64_pair::cmp_pair(self.cx, setup, op, signed, (al, ah), lit(v))
+            }
+            Test::Lt(v) => {
+                let op = if negated { BinaryOp::Le } else { BinaryOp::Gt };
+                super::i64_pair::cmp_pair(self.cx, setup, op, signed, (al, ah), lit(v))
+            }
+            Test::Le(v) => {
+                let op = if negated { BinaryOp::Lt } else { BinaryOp::Ge };
+                super::i64_pair::cmp_pair(self.cx, setup, op, signed, (al, ah), lit(v))
+            }
+            Test::InRange { lo, len } => {
+                let lo_pair = lit(lo);
+                let hi_pair = lit(lo + len - 1);
+                if negated {
+                    let below = super::i64_pair::cmp_pair(
+                        self.cx,
+                        setup,
+                        BinaryOp::Lt,
+                        signed,
+                        (al.clone(), ah.clone()),
+                        lo_pair,
+                    );
+                    let above = super::i64_pair::cmp_pair(
+                        self.cx,
+                        setup,
+                        BinaryOp::Gt,
+                        signed,
+                        (al, ah),
+                        hi_pair,
+                    );
+                    jsast::binary(BinOp::Or, below, above)
+                } else {
+                    let above = super::i64_pair::cmp_pair(
+                        self.cx,
+                        setup,
+                        BinaryOp::Ge,
+                        signed,
+                        (al.clone(), ah.clone()),
+                        lo_pair,
+                    );
+                    let below = super::i64_pair::cmp_pair(
+                        self.cx,
+                        setup,
+                        BinaryOp::Le,
+                        signed,
+                        (al, ah),
+                        hi_pair,
+                    );
+                    jsast::binary(BinOp::And, above, below)
+                }
+            }
+        }
+    }
+
     fn if_(
         &mut self,
         scrut: Scrut<RScrut>,
@@ -193,6 +317,38 @@ impl Emitter<'_, '_> {
         let then_ = self.region(then_)?;
         let else_ = self.region(else_)?;
         let inline = matches!(scrut, Scrut::Payload(_));
+        if let Some((pair, scrut_ty)) = self.scrutinee_i64_pair(&scrut)? {
+            let mut stmts = Vec::new();
+            let branch = match (then_.is_empty(), else_.is_empty()) {
+                (false, true) => vec![jsast::if_(
+                    self.test_i64_pair(&mut stmts, pair, scrut_ty, test, false),
+                    then_,
+                )],
+                (true, false) => vec![jsast::if_(
+                    self.test_i64_pair(&mut stmts, pair, scrut_ty, test, true),
+                    else_,
+                )],
+                (false, false) => vec![jsast::if_else(
+                    self.test_i64_pair(&mut stmts, pair, scrut_ty, test, false),
+                    then_,
+                    else_,
+                )],
+                (true, true) if inline => {
+                    let (lo, hi) = pair;
+                    let mut out = Vec::new();
+                    if !super::i64_pair::is_trivial(&lo) {
+                        out.push(jsast::expr_stmt(lo));
+                    }
+                    if !super::i64_pair::is_trivial(&hi) {
+                        out.push(jsast::expr_stmt(hi));
+                    }
+                    out
+                }
+                (true, true) => Vec::new(),
+            };
+            stmts.extend(branch);
+            return Ok(with_loc(loc, stmts));
+        }
         let (value, scrut_ty) = self.scrutinee(scrut)?;
         Ok(with_loc(
             loc,
@@ -218,6 +374,54 @@ impl Emitter<'_, '_> {
         label: Option<Label>,
     ) -> Res<Vec<Stmt>> {
         let loc = self.scrutinee_loc(&scrut);
+        if let Some((pair, scrut_ty)) = self.scrutinee_i64_pair(&scrut)? {
+            let mut setup = Vec::new();
+            let pair = super::i64_pair::materialize_pair(self.cx, &mut setup, pair);
+            let mut compiled_arms = Vec::with_capacity(arms.len());
+            for (values, body) in arms {
+                let body = self.region(body)?;
+                let mut conds = values.into_iter().map(|v| {
+                    let lit = super::i64_pair::literal_pair(self.cx.decode(scrut_ty.ty, v));
+                    super::i64_pair::cmp_pair(
+                        self.cx,
+                        &mut setup,
+                        BinaryOp::Eq,
+                        false,
+                        pair.clone(),
+                        lit,
+                    )
+                });
+                let cond = match conds.next() {
+                    Some(first) => conds.fold(first, |acc, c| jsast::binary(BinOp::Or, acc, c)),
+                    None => jsast::boolean(false),
+                };
+                compiled_arms.push((cond, body));
+            }
+            let default = self.region(default)?;
+            let mut chain = default;
+            for (cond, body) in compiled_arms.into_iter().rev() {
+                chain = if chain.is_empty() {
+                    vec![jsast::if_(cond, body)]
+                } else {
+                    vec![jsast::if_else(cond, body, chain)]
+                };
+            }
+            let (sw_label, needs_label) = match label {
+                Some(label) => (label_name(label), true),
+                None => {
+                    let id = self.next_switch_label;
+                    self.next_switch_label += 1;
+                    (format!("$sw{id}"), false)
+                }
+            };
+            let rewrote = rewrite_unlabeled_breaks(&mut chain, &sw_label);
+            if needs_label || rewrote {
+                setup.push(jsast::labeled(sw_label, Stmt::Block(chain)));
+            } else {
+                setup.extend(chain);
+            }
+            return Ok(with_loc(loc, setup));
+        }
         let scrut_ty = match &scrut {
             Scrut::Payload(scrutinee) => self.cx.scrut_ty(scrutinee),
             Scrut::Tmp(tmp) => self.tmp_ty(*tmp),
@@ -434,6 +638,40 @@ impl Emitter<'_, '_> {
     }
 }
 
+fn rewrite_unlabeled_breaks(stmts: &mut [Stmt], label: &str) -> bool {
+    let mut found = false;
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stmt::Break(None) => {
+                *stmt = Stmt::Break(Some(label.to_owned()));
+                found = true;
+            }
+            Stmt::If(_, then_, els) => {
+                found |= rewrite_unlabeled_breaks(then_, label);
+                if let Some(els) = els {
+                    found |= rewrite_unlabeled_breaks(els, label);
+                }
+            }
+            Stmt::Block(inner) => {
+                found |= rewrite_unlabeled_breaks(inner, label);
+            }
+            Stmt::Labeled(_, inner) => {
+                found |= rewrite_unlabeled_breaks(std::slice::from_mut(inner), label);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                found |= rewrite_unlabeled_breaks(body, label);
+                found |= rewrite_unlabeled_breaks(handler, label);
+            }
+            Stmt::Switch(_, _)
+            | Stmt::LoopForever(_, _)
+            | Stmt::While(_, _)
+            | Stmt::FunctionDecl { .. } => {}
+            _ => {}
+        }
+    }
+    found
+}
+
 fn with_loc(loc: Option<Loc>, mut statements: Vec<Stmt>) -> Vec<Stmt> {
     if !statements.is_empty() {
         if let Some(loc) = loc {
@@ -622,6 +860,36 @@ impl<'a> JsCx<'a> {
                             continue;
                         }
                     }
+                    let dst_is_i64 = match copy.dst {
+                        CopyOperand::Value(v) => self.is_i64_value(v),
+                        CopyOperand::Temp(_) => false,
+                    };
+                    let src_is_i64 = match copy.src {
+                        CopyOperand::Value(v) => self.is_i64_value(v),
+                        CopyOperand::Temp(_) => false,
+                    };
+                    if dst_is_i64 || src_is_i64 {
+                        let dst_base = self.copy_operand_name(copy.dst)?;
+                        let (dst_lo, dst_hi) = super::i64_pair::pair_names(&dst_base);
+                        let (src_lo, src_hi) = match copy.src {
+                            CopyOperand::Value(v) => self.pair_of(v)?,
+                            CopyOperand::Temp(_) => {
+                                let src_base = self.copy_operand_name(copy.src)?;
+                                let (slo, shi) = super::i64_pair::pair_names(&src_base);
+                                (jsast::id(slo), jsast::id(shi))
+                            }
+                        };
+                        let mut pair_stmts = Vec::new();
+                        super::i64_pair::emit_assign_pair(
+                            self,
+                            &mut pair_stmts,
+                            &dst_lo,
+                            &dst_hi,
+                            (src_lo, src_hi),
+                        );
+                        out.extend(pair_stmts);
+                        continue;
+                    }
                     let dst = self.copy_operand_name(copy.dst)?;
                     let src = match copy.src {
                         CopyOperand::Value(v) => self.expr_of(v)?,
@@ -770,6 +1038,17 @@ impl<'a> JsCx<'a> {
         };
         match term {
             RTerm::Return(Some(v)) => {
+                if self
+                    .target_abi
+                    .and_then(|sig| sig.result.as_ref())
+                    .is_some_and(|result| result.i64_pair)
+                {
+                    let pair = self.pair_of(*v)?;
+                    self.pending_return_pair.replace(Some(pair));
+                    self.pending_return.replace(None);
+                    return Ok(Vec::new());
+                }
+                self.pending_return_pair.replace(None);
                 // A `()` (or other zero-sized) result is a bare `return`, as v1's unit function.
                 let value = if self.table.is_zst(self.ty_of(*v)?) {
                     None
@@ -780,6 +1059,7 @@ impl<'a> JsCx<'a> {
                 Ok(Vec::new())
             }
             RTerm::Return(None) => {
+                self.pending_return_pair.replace(None);
                 self.pending_return.replace(None);
                 Ok(Vec::new())
             }
@@ -794,6 +1074,10 @@ impl<'a> JsCx<'a> {
     /// `Region::Return`: `return <value>` with the value the returning block parked, or a bare
     /// `return` for a `()` function.
     fn return_stmt(&self) -> Res<Stmt> {
+        if let Some((lo, hi)) = self.pending_return_pair.borrow_mut().take() {
+            let spill = jsast::id(spill_name_of(self.spills, 1));
+            return Ok(jsast::ret(jsast::seq(vec![jsast::assign(spill, hi), lo])));
+        }
         match self.pending_return.take() {
             Some(value) => {
                 let tagged = self
@@ -872,6 +1156,72 @@ impl<'a> JsCx<'a> {
                 self.bind_tagged_expr(result, value);
                 return Ok(Vec::new());
             }
+            let carried = self.carried_i64_overflow.borrow().get(source).cloned();
+            if let Some(carried) = carried {
+                self.carried_i64_overflow
+                    .borrow_mut()
+                    .insert(result, carried);
+                return Ok(Vec::new());
+            }
+        }
+        if let (
+            Some(result),
+            OpKind::Field {
+                base,
+                variant: None,
+                field,
+            },
+        ) = (op.result, &op.kind)
+        {
+            if let Some((lo, hi, ovf)) = self.carried_i64_overflow.borrow().get(base).cloned() {
+                return match field {
+                    0 => self.bind_i64_pair_result(result, Vec::new(), (lo, hi)),
+                    1 => self.bind_scalar_result(result, Vec::new(), ovf, false),
+                    _ => Err(decline(
+                        OpClass::Place,
+                        format!("field {field} of an i64 overflow pair"),
+                    )),
+                };
+            }
+        }
+        if let (Some(result), OpKind::Binary { op: bin, l, r, ty }) = (op.result, &op.kind) {
+            if self.is_i64_ty(*ty) {
+                let mut stmts = Vec::new();
+                if self.carried_pairs.contains_key(&result) {
+                    let signed = super::i64_pair::i64_signedness(self.table, *ty).unwrap_or(false);
+                    let a = self.pair_of(*l)?;
+                    let b = self.pair_of(*r)?;
+                    let (lo, hi, ovf) =
+                        super::i64_pair::with_overflow_pair(self, &mut stmts, *bin, signed, a, b);
+                    let lo = snapshot_scratch(self, &mut stmts, lo);
+                    let hi = snapshot_scratch(self, &mut stmts, hi);
+                    let ovf = snapshot_scratch(self, &mut stmts, ovf);
+                    self.carried_i64_overflow
+                        .borrow_mut()
+                        .insert(result, (lo, hi, ovf));
+                    return Ok(stmts);
+                }
+                let result_ty = self.ty_of(result)?;
+                if self.is_i64_ty(result_ty) {
+                    let pair = self.i64_binary_pair_stmts(&mut stmts, *bin, *ty, *l, *r)?;
+                    return self.bind_i64_pair_result(result, stmts, pair);
+                }
+                let expr = self.i64_binary_expr_stmts(&mut stmts, *bin, *ty, result_ty, *l, *r)?;
+                return self.bind_scalar_result(result, stmts, expr, false);
+            }
+        }
+        if let (Some(result), OpKind::Cast { kind, v, from, to }) = (op.result, &op.kind) {
+            let result_ty = self.ty_of(result)?;
+            if self.is_i64_ty(result_ty) {
+                let mut stmts = Vec::new();
+                let pair = self.i64_cast_pair_stmts(&mut stmts, *kind, *from, *to, *v)?;
+                return self.bind_i64_pair_result(result, stmts, pair);
+            }
+            if self.is_i64_ty(*from) {
+                let mut stmts = Vec::new();
+                let expr = self.i64_cast_expr_stmts(&mut stmts, *kind, *from, *to, *v)?;
+                return self.bind_scalar_result(result, stmts, expr, false);
+            }
         }
         if let Some(result) = op
             .result
@@ -915,6 +1265,9 @@ impl<'a> JsCx<'a> {
                 let (prelude, value, virtual_tagged) = match self.lower_call_like(op)? {
                     Lowered::Value(prelude, value) => (prelude, value, false),
                     Lowered::Virtual(prelude, value) => (prelude, value, true),
+                    Lowered::Pair(prelude, pair) => {
+                        return self.bind_i64_pair_result(result, prelude, pair);
+                    }
                     Lowered::Done(_) => {
                         return Err(decline(
                             OpClass::Call,
@@ -922,6 +1275,12 @@ impl<'a> JsCx<'a> {
                         ))
                     }
                 };
+                if self.is_i64_ty(self.ty_of(result)?) {
+                    let mut out = prelude;
+                    let value = super::i64_pair::materialize(self, &mut out, value);
+                    let pair = super::i64_pair::unpack_bigint_exprs(value);
+                    return self.bind_i64_pair_result(result, out, pair);
+                }
                 if virtual_tagged {
                     self.bind_tagged_expr(result, value);
                     return Ok(prelude);
@@ -945,6 +1304,62 @@ impl<'a> JsCx<'a> {
         }
         match op.result {
             Some(result) => {
+                let result_ty = self.ty_of(result)?;
+                if self.is_i64_ty(result_ty) {
+                    let mut stmts = Vec::new();
+                    let pair = match &op.kind {
+                        OpKind::Const(tree) => match self.const_i64_pair(tree, result_ty) {
+                            Some(pair) => pair,
+                            None => {
+                                let expr = super::i64_pair::materialize(
+                                    self,
+                                    &mut stmts,
+                                    self.op_expr(op, result)?,
+                                );
+                                super::i64_pair::unpack_bigint_exprs(expr)
+                            }
+                        },
+                        OpKind::Copy(v) | OpKind::Move(v) => self.pair_of(*v)?,
+                        OpKind::Unary { op: un, v, .. } => {
+                            self.i64_unary_pair_stmts(&mut stmts, *un, *v)?
+                        }
+                        OpKind::Aggregate {
+                            ty,
+                            active_field,
+                            fields,
+                            ..
+                        } if self.table.get(*ty).and_then(|d| d.js.transparent).is_some() => {
+                            let descriptor = self.table.get(*ty).expect("checked transparent");
+                            let inner = descriptor.js.transparent.expect("checked transparent");
+                            let is_union = matches!(
+                                descriptor.kind,
+                                TypeKind::Adt {
+                                    form: rcgjs_object::jir::types::NominalForm::Union,
+                                    ..
+                                }
+                            );
+                            if is_union && active_field.is_some_and(|active| active != inner.field)
+                            {
+                                (jsast::num(0.0), jsast::num(0.0))
+                            } else {
+                                let idx = if is_union { 0 } else { inner.field as usize };
+                                match fields.get(idx) {
+                                    Some(field) => self.pair_of(*field)?,
+                                    None => (jsast::num(0.0), jsast::num(0.0)),
+                                }
+                            }
+                        }
+                        _ => {
+                            let expr = super::i64_pair::materialize(
+                                self,
+                                &mut stmts,
+                                self.op_expr(op, result)?,
+                            );
+                            super::i64_pair::unpack_bigint_exprs(expr)
+                        }
+                    };
+                    return self.bind_i64_pair_result(result, stmts, pair);
+                }
                 // An inline value is spelled at its use site (`JsCx::expr_of`).
                 if self.is_inline(result) {
                     return Ok(Vec::new());
@@ -975,6 +1390,51 @@ impl<'a> JsCx<'a> {
             }
             None => self.effect_stmts(op),
         }
+    }
+
+    fn bind_i64_pair_result(
+        &self,
+        result: ValueId,
+        mut stmts: Vec<Stmt>,
+        (lo, hi): (Expr, Expr),
+    ) -> Res<Vec<Stmt>> {
+        if self.is_inline(result) {
+            let lo = snapshot_scratch(self, &mut stmts, lo);
+            let hi = snapshot_scratch(self, &mut stmts, hi);
+            self.bind_pair(result, lo, hi);
+            return Ok(stmts);
+        }
+        let Some(name) = self.name_of(result) else {
+            if !super::i64_pair::is_trivial(&lo) {
+                stmts.push(jsast::expr_stmt(lo));
+            }
+            if !super::i64_pair::is_trivial(&hi) {
+                stmts.push(jsast::expr_stmt(hi));
+            }
+            return Ok(stmts);
+        };
+        let (dst_lo, dst_hi) = super::i64_pair::pair_names(name);
+        super::i64_pair::emit_assign_pair(self, &mut stmts, &dst_lo, &dst_hi, (lo, hi));
+        Ok(stmts)
+    }
+
+    fn bind_scalar_result(
+        &self,
+        result: ValueId,
+        mut stmts: Vec<Stmt>,
+        expr: Expr,
+        has_effect: bool,
+    ) -> Res<Vec<Stmt>> {
+        if self.is_inline(result) {
+            self.cache_expr(result, expr);
+            return Ok(stmts);
+        }
+        if let Some(name) = self.name_of(result) {
+            stmts.push(jsast::assign_stmt(jsast::id(name), expr));
+        } else if has_effect || !super::i64_pair::is_trivial(&expr) {
+            stmts.push(jsast::expr_stmt(expr));
+        }
+        Ok(stmts)
     }
 
     /// Assigns the `buf`/`off`/`len` locals that physically carry one logical fat slice.
@@ -1302,6 +1762,16 @@ impl<'a> JsCx<'a> {
         let (mut out, value) = match self.lower_call_like(op)? {
             Lowered::Done(stmts) => return Ok(stmts),
             Lowered::Value(prelude, value) => (prelude, value),
+            Lowered::Pair(prelude, pair) => {
+                let Some(result) = op.result else {
+                    let mut out = prelude;
+                    if !super::i64_pair::is_trivial(&pair.0) {
+                        out.push(jsast::expr_stmt(pair.0));
+                    }
+                    return Ok(out);
+                };
+                return self.bind_i64_pair_result(result, prelude, pair);
+            }
             Lowered::Virtual(prelude, value) => {
                 let Some(result) = op.result else {
                     return Err(decline(
@@ -1313,6 +1783,13 @@ impl<'a> JsCx<'a> {
                 return Ok(prelude);
             }
         };
+        if let Some(result) = op.result {
+            if self.is_i64_ty(self.ty_of(result)?) {
+                let value = super::i64_pair::materialize(self, &mut out, value);
+                let pair = super::i64_pair::unpack_bigint_exprs(value);
+                return self.bind_i64_pair_result(result, out, pair);
+            }
+        }
         // A `Callee::Nop` call is nothing at all, and a zero-sized result is `undefined`
         // everywhere (`expr_of`), so neither is worth a statement of its own.
         if matches!(value, Expr::Undefined) {
@@ -1604,6 +2081,22 @@ fn assert_message(msg: &RAssertMessage) -> &'static str {
         RAssertMessage::OverflowNeg(..) => "attempt to negate with overflow",
         RAssertMessage::Overflow { .. } => "attempt to compute with overflow",
         _ => "assertion failed",
+    }
+}
+
+fn snapshot_scratch(cx: &JsCx<'_>, stmts: &mut Vec<Stmt>, expr: Expr) -> Expr {
+    let is_scratch = matches!(
+        &expr,
+        Expr::Ident(name)
+            if name.as_str() == super::i64_pair::HELPER_HI
+                || name.as_str() == super::i64_pair::HELPER_OVF
+    );
+    if is_scratch {
+        let (bind, ident) = cx.temp(expr);
+        stmts.push(bind);
+        ident
+    } else {
+        expr
     }
 }
 

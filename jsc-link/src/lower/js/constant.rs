@@ -56,6 +56,30 @@ impl<'a> JsCx<'a> {
         self.const_expr_at(tree, ty, 0)
     }
 
+    /// Lowers a 64-bit integer [`ConstTree`] directly to a signed-`Int32` `(lo, hi)` pair.
+    pub fn const_i64_pair(&self, tree: &ConstTree, ty: TypeId) -> Option<(Expr, Expr)> {
+        let mut cur_ty = ty;
+        for _ in 0..16 {
+            let descriptor = self.table.get(cur_ty)?;
+            if let Some(inner) = descriptor.js.transparent {
+                cur_ty = inner.ty;
+                continue;
+            }
+            if let TypeKind::Pattern(base) = descriptor.kind {
+                cur_ty = base;
+                continue;
+            }
+            break;
+        }
+        if !super::i64_pair::is_i64(self.table, cur_ty) {
+            return None;
+        }
+        match tree {
+            ConstTree::Scalar { bits, .. } => Some(super::i64_pair::literal_pair(*bits)),
+            _ => None,
+        }
+    }
+
     fn const_expr_at(&self, tree: &ConstTree, ty: TypeId, depth: u32) -> Res<Expr> {
         if depth > 64 {
             return Err(decline(
