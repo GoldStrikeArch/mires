@@ -14,10 +14,12 @@ pub const SPIKE_ROOT_ENV: &str = "MIRES_ROOT";
 pub const EXTRA_ARGS_ENV: &str = "JS_EXTRA_ARGS";
 /// Environment variable carrying an explicit rustc optimization level to the build scripts.
 pub const RUST_OPT_LEVEL_ENV: &str = "JSC_RUST_OPT_LEVEL";
+/// Environment variable controlling rustc MIR inlining (`off` by default, or `on`).
+pub const RUST_MIR_INLINE_ENV: &str = "JSC_RUST_MIR_INLINE";
 /// Environment variable selecting the emit-affecting options used to key the sysroot.
 pub const SYSROOT_ARGS_ENV: &str = "JSC_SYSROOT_ARGS";
-/// Environment variable selecting the build mode: unset (or `abort`) is the default
-/// `-Cpanic=abort` build, `unwind` the unwind build mode (`scripts/sysroot-cache.sh`, `jsc_panic`).
+/// Environment variable selecting the build mode: unset (or `unwind`) is the default
+/// `-Cpanic=unwind` build, `abort` the `-Cpanic=abort` override (`scripts/sysroot-cache.sh`, `jsc_panic`).
 pub const PANIC_ENV: &str = "JSC_PANIC";
 
 /// The build mode [`PANIC_ENV`] selects.
@@ -26,10 +28,10 @@ pub const PANIC_ENV: &str = "JSC_PANIC";
 /// runs, so a client crate, its sysroot and the scripts can never disagree about the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanicMode {
-    /// `-Cpanic=abort` on `wasm32-unknown-unknown`: the default.
+    /// `-Cpanic=abort` on `wasm32-unknown-unknown`: explicit opt-in override.
     Abort,
     /// `-Cpanic=unwind` on `targets/mires32-unwind.json`, with `js-cleanup=off` appended by the
-    /// scripts: rustc's unwind edges carry host-exception cleanup.
+    /// scripts: rustc's unwind edges carry host-exception cleanup (the default).
     Unwind,
 }
 
@@ -37,8 +39,8 @@ impl PanicMode {
     /// The mode a [`PANIC_ENV`] value names, or `None` for a value that names none.
     pub fn parse(value: Option<&str>) -> Option<Self> {
         match value {
-            None | Some("" | "abort") => Some(Self::Abort),
-            Some("unwind") => Some(Self::Unwind),
+            None | Some("" | "unwind") => Some(Self::Unwind),
+            Some("abort") => Some(Self::Abort),
             Some(_) => None,
         }
     }
@@ -66,8 +68,8 @@ impl PanicMode {
     /// What [`PANIC_ENV`] is set to for a child process; `None` removes an inherited value.
     fn env_value(self) -> Option<&'static str> {
         match self {
-            Self::Abort => None,
-            Self::Unwind => Some("unwind"),
+            Self::Unwind => None,
+            Self::Abort => Some("abort"),
         }
     }
 }
@@ -204,6 +206,9 @@ impl Toolchain {
             opt_level.map(RustOptLevel::as_str),
         );
         optional_env(&mut command, PANIC_ENV, self.panic.env_value());
+        if env::var_os(RUST_MIR_INLINE_ENV).is_none() {
+            command.env(RUST_MIR_INLINE_ENV, "off");
+        }
         scrub(&mut command);
 
         let output = command.output().map_err(|source| BuildError::Io {
@@ -531,13 +536,17 @@ impl Toolchain {
                 ));
             }
         };
+        let wanted_args = match self.panic {
+            PanicMode::Unwind => format!("{emit_args} js-cleanup=off"),
+            PanicMode::Abort => emit_args.to_owned(),
+        };
         let found = fs::read_to_string(sysroot.join(".js-args")).unwrap_or_default();
         let found_opt = fs::read_to_string(sysroot.join(".rust-opt-level")).unwrap_or_default();
         let found_key = fs::read_to_string(sysroot.join(".cache-key")).unwrap_or_default();
         let wanted_opt = opt_level.map(RustOptLevel::as_str).unwrap_or_default();
         let wanted_key = sysroot.file_name().and_then(|name| name.to_str());
         if self.sysroot_lib_for(&sysroot).is_dir()
-            && args_match(&found, emit_args)
+            && args_match(&found, &wanted_args)
             && found_opt.trim() == wanted_opt
             && wanted_key.is_some_and(|key| found_key.trim() == key)
         {
@@ -694,9 +703,13 @@ impl Toolchain {
             .args(fix.arguments())
             .env_remove(RUST_OPT_LEVEL_ENV)
             .env_remove(SYSROOT_ARGS_ENV)
+            .env_remove(PANIC_ENV)
             .env_remove("JSC_TARGET")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        if env::var_os(RUST_MIR_INLINE_ENV).is_none() {
+            command.env(RUST_MIR_INLINE_ENV, "off");
+        }
         for (key, value) in fix.environment() {
             command.env(key, value);
         }
@@ -940,6 +953,9 @@ impl Toolchain {
             opt_level.map(RustOptLevel::as_str),
         );
         optional_env(&mut command, PANIC_ENV, self.panic.env_value());
+        if env::var_os(RUST_MIR_INLINE_ENV).is_none() {
+            command.env(RUST_MIR_INLINE_ENV, "off");
+        }
         scrub(&mut command);
         procedure_identity_env(&mut command);
 
@@ -1499,7 +1515,7 @@ mod tests {
         assert_ne!(report, other);
 
         fs::create_dir_all(toolchain.sysroot_lib_for(&report)).unwrap();
-        fs::write(report.join(".js-args"), "js-opt=report").unwrap();
+        fs::write(report.join(".js-args"), "js-cleanup=off js-opt=report").unwrap();
         fs::write(report.join(".rust-opt-level"), "1").unwrap();
         fs::write(report.join(".cache-key"), "report-o1").unwrap();
         assert_eq!(
@@ -1509,6 +1525,17 @@ mod tests {
         assert!(toolchain
             .unmet_sysroot_with_opt_level("js-opt=off", None)
             .is_some());
+
+        let abort_toolchain = toolchain.with_panic_mode(PanicMode::Abort);
+        let abort_report = abort_toolchain
+            .sysroot_for("js-opt=report", Some(RustOptLevel::O1))
+            .unwrap();
+        fs::create_dir_all(abort_toolchain.sysroot_lib_for(&abort_report)).unwrap();
+        fs::write(abort_report.join(".js-args"), "js-opt=report").unwrap();
+        assert_eq!(
+            abort_toolchain.unmet_sysroot_with_opt_level("js-opt=report", Some(RustOptLevel::O1)),
+            None,
+        );
     }
 
     #[test]
@@ -1547,16 +1574,16 @@ mod tests {
 
     #[test]
     fn panic_mode_names_the_two_build_modes() {
-        assert_eq!(PanicMode::parse(None), Some(PanicMode::Abort));
-        assert_eq!(PanicMode::parse(Some("")), Some(PanicMode::Abort));
-        assert_eq!(PanicMode::parse(Some("abort")), Some(PanicMode::Abort));
+        assert_eq!(PanicMode::parse(None), Some(PanicMode::Unwind));
+        assert_eq!(PanicMode::parse(Some("")), Some(PanicMode::Unwind));
         assert_eq!(PanicMode::parse(Some("unwind")), Some(PanicMode::Unwind));
+        assert_eq!(PanicMode::parse(Some("abort")), Some(PanicMode::Abort));
         assert_eq!(PanicMode::parse(Some("Unwind")), None);
         assert_eq!(PanicMode::Abort.target_name(), "wasm32-unknown-unknown");
         assert_eq!(PanicMode::Unwind.target_name(), "mires32-unwind");
     }
 
-    /// The mode travels to the scripts explicitly, and an abort-mode toolchain masks an inherited
+    /// The mode travels to the scripts explicitly, and an unwind-mode toolchain masks an inherited
     /// selector, so a client crate is never compiled in a mode its toolchain does not describe.
     #[test]
     #[cfg(not(target_os = "windows"))]
@@ -1573,7 +1600,7 @@ mod tests {
         )
         .unwrap();
         let toolchain = Toolchain::new(dir.path()).unwrap();
-        for (mode, expected) in [(PanicMode::Unwind, "unwind"), (PanicMode::Abort, "unset")] {
+        for (mode, expected) in [(PanicMode::Unwind, "unset"), (PanicMode::Abort, "abort")] {
             let toolchain = toolchain.clone().with_panic_mode(mode);
             assert_eq!(toolchain.panic_mode(), mode);
             toolchain
@@ -1636,7 +1663,7 @@ mod tests {
         // The default build mode's commands, whatever JSC_PANIC the test process inherited.
         let toolchain = Toolchain::new("/spike")
             .unwrap()
-            .with_panic_mode(PanicMode::Abort);
+            .with_panic_mode(PanicMode::Unwind);
 
         let fixes: Vec<String> = checkout_steps(&toolchain, "js-minify=on", true)
             .iter()
@@ -1659,7 +1686,7 @@ mod tests {
         // The default build mode's command, whatever JSC_PANIC the test process inherited.
         let toolchain = Toolchain::new("/spike")
             .unwrap()
-            .with_panic_mode(PanicMode::Abort);
+            .with_panic_mode(PanicMode::Unwind);
         let fix =
             toolchain.fix_with_opt_level(Step::Sysroot, "js-opt=report", Some(RustOptLevel::O1));
 
@@ -1670,15 +1697,15 @@ mod tests {
                 "bash scripts/build_sysroot.sh",
             )
         );
-        // The unwind mode's sysroot is a different one, and its fix says so.
-        let unwind = toolchain.with_panic_mode(PanicMode::Unwind);
+        // The abort mode's sysroot is a different one, and its fix says so.
+        let abort = toolchain.with_panic_mode(PanicMode::Abort);
         assert_eq!(
-            unwind
+            abort
                 .fix_with_opt_level(Step::Sysroot, "js-opt=report", Some(RustOptLevel::O1))
                 .to_string(),
             concat!(
                 "cd /spike && JS_EXTRA_ARGS='js-opt=report' JSC_RUST_OPT_LEVEL='1' ",
-                "JSC_PANIC='unwind' bash scripts/build_sysroot.sh",
+                "JSC_PANIC='abort' bash scripts/build_sysroot.sh",
             )
         );
     }

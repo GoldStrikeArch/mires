@@ -16,7 +16,7 @@ pub enum BuildError {
     #[error("unsupported platform: {os}; the codegen backend is only built for unix")]
     UnsupportedPlatform { os: &'static str },
     #[error(
-        "JSC_PANIC={value:?} names no build mode; leave it unset (abort) or set it to `unwind`"
+        "JSC_PANIC={value:?} names no build mode; leave it unset (unwind) or set it to `abort`"
     )]
     PanicMode { value: String },
     #[error("no client crate root at {}", path.display())]

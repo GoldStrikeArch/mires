@@ -135,8 +135,8 @@ jsc_normalize_emit_args() {
 # (`jsc_mode_backend_args`). With `JSC_PANIC` unset nothing here changes a key, a flag or a path.
 jsc_panic() {
 	case "${JSC_PANIC:-}" in
-	"" | abort) printf 'abort' ;;
-	unwind) printf 'unwind' ;;
+	"" | unwind) printf 'unwind' ;;
+	abort) printf 'abort' ;;
 	*)
 		echo "sysroot-cache.sh: invalid JSC_PANIC: $JSC_PANIC (expected unset, abort or unwind)" >&2
 		return 1

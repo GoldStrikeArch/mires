@@ -81,7 +81,7 @@ fi
 # are not compared there and may not be written from it; the contract drivers still run. A fixture
 # the baseline lane must refuse (it keeps cleanup blocks only the JIR lane lowers) is a skip too.
 unwind=0
-[ "${JSC_PANIC:-}" = unwind ] && unwind=1
+[ "${JSC_PANIC:-unwind}" = unwind ] && unwind=1
 if [ "${UPDATE_EXPECT:-0}" = 1 ] && [ "$unwind" = 1 ]; then
 	echo "extern-test.sh: expectations may not be updated under JSC_PANIC=unwind" >&2
 	exit 2

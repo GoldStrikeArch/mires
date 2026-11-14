@@ -34,7 +34,7 @@ try {
   if (!args.length || args.includes('--help') || args[0]==='help') {console.log(help);process.exit(0);}
   if (args.shift() !== 'build') throw new Error('expected build; use --help');
   const src=args.shift(); if (!src || src.startsWith('-')) throw new Error('missing Rust source');
-  const panic=process.env.JSC_PANIC||'abort';
+  const panic=process.env.JSC_PANIC||'unwind';
   if(!['abort','unwind'].includes(panic))throw new Error('JSC_PANIC must be unset, abort or unwind');
   let output,profile='release-balanced',cleanup=panic==='unwind'?'off':'on',skip=false;const extra=[];
   while(args.length) {
@@ -55,7 +55,7 @@ try {
   mkdirSync(dirname(out),{recursive:true});
   const runtimeName=basename(out,'.mjs')+'.runtime.mjs';
   const emit=`js-profile=${profile} js-cleanup=${cleanup}`;
-  const env={...process.env,JS_EXTRA_ARGS:emit,JSC_SYSROOT_ARGS:emit,JSC_REMAP_ROOT:dirname(input),SKIP_BUILD:'1',...(panic==='unwind'?{JSC_PANIC:panic}:{})};
+  const env={...process.env,JS_EXTRA_ARGS:emit,JSC_SYSROOT_ARGS:emit,JSC_REMAP_ROOT:dirname(input),SKIP_BUILD:'1',JSC_PANIC:panic};
   delete env.JSC_RUST_OPT_LEVEL;delete env.JSC_RUST_MIR_INLINE;
   if(!skip)run('bash',['scripts/build.sh','--locked'],env);
   run('bash',['scripts/build_sysroot.sh'],env);

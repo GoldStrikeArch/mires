@@ -77,8 +77,8 @@ for arg in "$@"; do
 	esac
 done
 
-# `JSC_PANIC=unwind` builds for targets/mires32-unwind.json with `-Cpanic=unwind` instead (see
-# `jsc_panic` in sysroot-cache.sh); unset, the target is wasm32-unknown-unknown as it always was.
+# Unset or `JSC_PANIC=unwind` builds for targets/mires32-unwind.json with `-Cpanic=unwind` (see
+# `jsc_panic` in sysroot-cache.sh); `JSC_PANIC=abort` selects wasm32-unknown-unknown instead.
 # `$target` is the target's name, which keys the cache and names the sysroot's library directory.
 jsc_select_mode "$root" || exit 2
 target=$jsc_target_name
@@ -170,8 +170,8 @@ if [ "$clean" = 1 ]; then
 fi
 
 activate_legacy_default() {
-	[ "$jsc_panic_mode" = abort ] || return 0
-	[ -z "$JS_EXTRA_ARGS" ] || return 0
+	[ "$jsc_panic_mode" = unwind ] || return 0
+	[ "$JS_EXTRA_ARGS" = "js-cleanup=off" ] || return 0
 	[ -z "${JSC_RUST_OPT_LEVEL:-}" ] || return 0
 	local legacy="$root/build/sysroot"
 	local link="$root/build/.sysroot-link.$$"

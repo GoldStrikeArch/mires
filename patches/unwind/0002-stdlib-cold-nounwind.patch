@@ -1,0 +1,232 @@
+--- a/library/core/src/panicking.rs
++++ b/library/core/src/panicking.rs
+@@ -56,6 +56,7 @@
+ #[track_caller]
+ #[lang = "panic_fmt"] // needed for const-evaluated panics
+ #[rustc_do_not_const_check] // hooked by const-eval
++#[rustc_nounwind]
+ #[rustc_const_stable_indirect] // must follow stable const rules since it is exposed to stable
+ pub const fn panic_fmt(fmt: fmt::Arguments<'_>) -> ! {
+     if cfg!(panic = "immediate-abort") {
+@@ -65,6 +66,7 @@
+     // NOTE This function never crosses the FFI boundary; it's a Rust-to-Rust call
+     // that gets resolved to the `#[panic_handler]` function.
+     unsafe extern "Rust" {
++        #[rustc_nounwind]
+         #[lang = "panic_impl"]
+         fn panic_impl(pi: &PanicInfo<'_>) -> !;
+     }
+@@ -106,6 +108,7 @@
+             // NOTE This function never crosses the FFI boundary; it's a Rust-to-Rust call
+             // that gets resolved to the `#[panic_handler]` function.
+             unsafe extern "Rust" {
++                #[rustc_nounwind]
+                 #[lang = "panic_impl"]
+                 fn panic_impl(pi: &PanicInfo<'_>) -> !;
+             }
+@@ -134,6 +137,7 @@
+ #[cfg_attr(panic = "immediate-abort", inline)]
+ #[track_caller]
+ #[rustc_const_stable_indirect] // must follow stable const rules since it is exposed to stable
++#[rustc_nounwind]
+ #[lang = "panic"] // used by lints and miri for panics
+ pub const fn panic(expr: &'static str) -> ! {
+     // Use Arguments::from_str instead of format_args!("{expr}") to potentially
+@@ -169,6 +173,7 @@
+             #[cfg_attr(panic = "immediate-abort", inline)]
+             #[track_caller]
+             #[rustc_const_stable_indirect] // must follow stable const rules since it is exposed to stable
++            #[rustc_nounwind]
+             #[lang = stringify!($lang)]
+             pub const fn $lang() -> ! {
+                 // See the comment in `panic(&'static str)` for why we use `Arguments::from_str` here.
+@@ -235,6 +240,7 @@
+ 
+ #[inline]
+ #[track_caller]
++#[rustc_nounwind]
+ #[rustc_diagnostic_item = "unreachable_display"] // needed for `non-fmt-panics` lint
+ pub fn unreachable_display<T: fmt::Display>(x: &T) -> ! {
+     panic_fmt(format_args!("internal error: entered unreachable code: {}", *x));
+@@ -245,6 +251,7 @@
+ #[inline]
+ #[track_caller]
+ #[rustc_diagnostic_item = "panic_str_2015"]
++#[rustc_nounwind]
+ #[rustc_const_stable_indirect] // must follow stable const rules since it is exposed to stable
+ pub const fn panic_str_2015(expr: &str) -> ! {
+     panic_display(&expr);
+@@ -254,6 +261,7 @@
+ #[track_caller]
+ #[lang = "panic_display"] // needed for const-evaluated panics
+ #[rustc_do_not_const_check] // hooked by const-eval
++#[rustc_nounwind]
+ #[rustc_const_stable_indirect] // must follow stable const rules since it is exposed to stable
+ pub const fn panic_display<T: fmt::Display>(x: &T) -> ! {
+     // rustc_codegen_js: `format_args!("{}", x)` builds a `&dyn Display` argument, and the vtable
+@@ -267,6 +275,7 @@
+ #[cfg_attr(not(panic = "immediate-abort"), inline(never), cold, optimize(size))]
+ #[cfg_attr(panic = "immediate-abort", inline)]
+ #[track_caller]
++#[rustc_nounwind]
+ #[lang = "panic_bounds_check"] // needed by codegen for panic on OOB array/slice access
+ fn panic_bounds_check(index: usize, len: usize) -> ! {
+     if cfg!(panic = "immediate-abort") {
+@@ -377,6 +386,7 @@
+ 
+ /// This function is used instead of panic_fmt in const eval.
+ #[lang = "const_panic_fmt"] // needed by const-eval machine to replace calls to `panic_fmt` lang item
++#[rustc_nounwind]
+ #[rustc_const_stable_indirect] // must follow stable const rules since it is exposed to stable
+ pub const fn const_panic_fmt(fmt: fmt::Arguments<'_>) -> ! {
+     if let Some(msg) = fmt.as_str() {
+@@ -402,6 +412,7 @@
+ #[cfg_attr(not(panic = "immediate-abort"), inline(never), cold, optimize(size))]
+ #[cfg_attr(panic = "immediate-abort", inline)]
+ #[track_caller]
++#[rustc_nounwind]
+ #[doc(hidden)]
+ pub fn assert_failed<T, U>(
+     kind: AssertKind,
+@@ -427,6 +438,7 @@
+ #[cfg_attr(not(panic = "immediate-abort"), inline(never), cold, optimize(size))]
+ #[cfg_attr(panic = "immediate-abort", inline)]
+ #[track_caller]
++#[rustc_nounwind]
+ #[doc(hidden)]
+ pub fn assert_matches_failed<T: fmt::Debug + ?Sized>(
+     left: &T,
+@@ -446,6 +458,7 @@
+ /// Non-generic version of the above functions, to avoid code bloat.
+ #[cfg_attr(not(panic = "immediate-abort"), inline(never), cold, optimize(size))]
+ #[cfg_attr(panic = "immediate-abort", inline)]
++#[rustc_nounwind]
+ #[track_caller]
+ fn assert_failed_inner(
+     kind: AssertKind,
+--- a/library/core/src/slice/index.rs
++++ b/library/core/src/slice/index.rs
+@@ -35,6 +35,7 @@
+ 
+ #[cfg_attr(not(panic = "immediate-abort"), inline(never), cold)]
+ #[cfg_attr(panic = "immediate-abort", inline)]
++#[rustc_nounwind]
+ #[track_caller]
+ const fn slice_index_fail(start: usize, end: usize, len: usize) -> ! {
+     if start > len {
+--- a/library/core/src/str/mod.rs
++++ b/library/core/src/str/mod.rs
+@@ -65,21 +65,25 @@
+ #[cold]
+ #[track_caller]
+ #[rustc_allow_const_fn_unstable(const_eval_select)]
++#[rustc_nounwind]
+ #[cfg(not(panic = "immediate-abort"))]
+ const fn slice_error_fail(s: &str, begin: usize, end: usize) -> ! {
+     crate::intrinsics::const_eval_select((s, begin, end), slice_error_fail_ct, slice_error_fail_rt)
+ }
+ 
++#[rustc_nounwind]
+ #[cfg(panic = "immediate-abort")]
+ const fn slice_error_fail(s: &str, begin: usize, end: usize) -> ! {
+     slice_error_fail_ct(s, begin, end)
+ }
+ 
++#[rustc_nounwind]
+ #[track_caller]
+ const fn slice_error_fail_ct(_: &str, _: usize, _: usize) -> ! {
+     panic!("failed to slice string");
+ }
+ 
++#[rustc_nounwind]
+ #[track_caller]
+ fn slice_error_fail_rt(s: &str, begin: usize, end: usize) -> ! {
+     // rustc_codegen_js: the formatted messages name the offending `char` with `Debug`,
+--- a/library/core/src/option.rs
++++ b/library/core/src/option.rs
+@@ -2243,6 +2243,7 @@
+ #[cfg_attr(not(panic = "immediate-abort"), inline(never))]
+ #[cfg_attr(panic = "immediate-abort", inline)]
+ #[cold]
++#[rustc_nounwind]
+ #[track_caller]
+ const fn unwrap_failed() -> ! {
+     panic("called `Option::unwrap()` on a `None` value")
+@@ -2252,6 +2253,7 @@
+ #[cfg_attr(not(panic = "immediate-abort"), inline(never))]
+ #[cfg_attr(panic = "immediate-abort", inline)]
+ #[cold]
++#[rustc_nounwind]
+ #[track_caller]
+ const fn expect_failed(msg: &str) -> ! {
+     panic_display(&msg)
+--- a/library/core/src/result.rs
++++ b/library/core/src/result.rs
+@@ -1865,6 +1865,7 @@
+ #[cfg(not(panic = "immediate-abort"))]
+ #[inline(never)]
+ #[cold]
++#[rustc_nounwind]
+ #[track_caller]
+ fn unwrap_failed(msg: &str, error: &dyn fmt::Debug) -> ! {
+     panic!("{msg}: {error:?}");
+@@ -1877,6 +1878,7 @@
+ #[cfg(panic = "immediate-abort")]
+ #[inline]
+ #[cold]
++#[rustc_nounwind]
+ #[track_caller]
+ const fn unwrap_failed<T>(_msg: &str, _error: &T) -> ! {
+     panic!()
+--- a/library/alloc/src/raw_vec/mod.rs
++++ b/library/alloc/src/raw_vec/mod.rs
+@@ -23,6 +23,7 @@
+ // ensure that the code generation related to these panics is minimal as there's
+ // only one location which panics rather than a bunch throughout the module.
+ #[cfg(not(no_global_oom_handling))]
++#[rustc_nounwind]
+ #[cfg_attr(not(panic = "immediate-abort"), inline(never))]
+ const fn capacity_overflow() -> ! {
+     panic!("capacity overflow");
+@@ -887,6 +888,7 @@
+ #[cfg(not(no_global_oom_handling))]
+ #[cold]
+ #[optimize(size)]
++#[rustc_nounwind]
+ #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+ const fn handle_error(e: TryReserveError) -> ! {
+     match e.kind() {
+--- a/library/alloc/src/alloc.rs
++++ b/library/alloc/src/alloc.rs
+@@ -592,6 +592,7 @@
+     // This is the magic symbol to call the global alloc error handler. rustc generates
+     // it to call `__rg_oom` if there is a `#[alloc_error_handler]`, or to call the
+     // default implementations below (`__rdl_alloc_error_handler`) otherwise.
++    #[rustc_nounwind]
+     #[rustc_std_internal_symbol]
+     fn __rust_alloc_error_handler(size: usize, align: usize) -> !;
+ }
+@@ -625,12 +626,15 @@
+ #[rustc_const_unstable(feature = "const_alloc_error", issue = "92523")]
+ #[cfg(not(no_global_oom_handling))]
+ #[cold]
++#[rustc_nounwind]
+ #[optimize(size)]
+ pub const fn handle_alloc_error(layout: Layout) -> ! {
++    #[rustc_nounwind]
+     const fn ct_error(_: Layout) -> ! {
+         panic!("allocation failed");
+     }
+ 
++    #[rustc_nounwind]
+     #[inline]
+     fn rt_error(layout: Layout) -> ! {
+         unsafe {
+@@ -654,6 +658,7 @@
+ pub mod __alloc_error_handler {
+     // called via generated `__rust_alloc_error_handler` if there is no
+     // `#[alloc_error_handler]`.
++    #[rustc_nounwind]
+     #[rustc_std_internal_symbol]
+     pub unsafe fn __rdl_alloc_error_handler(size: usize, _align: usize) -> ! {
+         core::panicking::panic_nounwind_fmt(
