@@ -1641,9 +1641,6 @@ fn native_vec_carriers_compose_with_owned_copies_mutation_and_drop() {
 }
 
 fn assert_carrier_composition(with_slice_view: bool, owned_carrier: Option<Carrier>) {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
     use crate::jir::origin::OriginId;
     use crate::jir::repr::{FuncBuilder, OpKind, RTerm, Root};
     use crate::jir::semantic::{BinaryOp, Body, BodyKind, CallSemantic, Callee, ConstTree, ItemId};
@@ -2179,20 +2176,8 @@ for (const f of [before, after]) {
 }
 "#,
     );
-    let mut child = Command::new("node")
-        .arg("--input-type=commonjs")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let output = test_node::run(test_node::Node::StdinCommonJs(&program))
         .expect("Node is required for emitted carrier-composition verification");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(program.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -2636,29 +2621,14 @@ fn format_site_js_in(
 
 /// Runs `harness` in Node after the shim and `functions`, failing the test on any throw.
 fn run_in_node(functions: &[String], harness: &str) {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
     let mut program = include_str!("../../../../runtime/shim.js").to_owned();
     for function in functions {
         program.push_str(function);
         program.push('\n');
     }
     program.push_str(harness);
-    let mut child = Command::new("node")
-        .arg("--input-type=commonjs")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let output = test_node::run(test_node::Node::StdinCommonJs(&program))
         .expect("Node is required for emitted format-kernel verification");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(program.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
         "{}\n{}",

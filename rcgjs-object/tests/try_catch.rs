@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
-use std::process::{Command, Stdio};
+use test_node::Node;
 
 use rcgjs_object::jsast::{self as js, ArrowBody, Expr, Loc, Stmt, Style};
 use rcgjs_object::opts::{EcmaTarget, OptimizerMode};
@@ -178,20 +177,8 @@ console.log(checks);
                             .collect();
                         let text =
                             js::program_to_string_styled_for_target(&declarations, style, target);
-                        let mut child = Command::new("node")
-                            .arg("-")
-                            .stdin(Stdio::piped())
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .spawn()
+                        let output = test_node::run(Node::Stdin(&format!("{text}\n{harness}")))
                             .expect("Node is required for the exception regression");
-                        child
-                            .stdin
-                            .take()
-                            .unwrap()
-                            .write_all(format!("{text}\n{harness}").as_bytes())
-                            .unwrap();
-                        let output = child.wait_with_output().unwrap();
                         assert!(
                             output.status.success(),
                             "jir={jir} {:?} {rename} {style:?} {target:?}\n{}\n{text}",
