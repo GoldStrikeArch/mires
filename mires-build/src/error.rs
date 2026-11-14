@@ -15,6 +15,10 @@ pub enum BuildError {
     NoOutDir,
     #[error("unsupported platform: {os}; the codegen backend is only built for unix")]
     UnsupportedPlatform { os: &'static str },
+    #[error(
+        "JSC_PANIC={value:?} names no build mode; leave it unset (abort) or set it to `unwind`"
+    )]
+    PanicMode { value: String },
     #[error("no client crate root at {}", path.display())]
     ClientMissing { path: PathBuf },
     /// A setup step the checkout is missing, boxed because it carries the

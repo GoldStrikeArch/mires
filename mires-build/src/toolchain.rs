@@ -16,6 +16,61 @@ pub const EXTRA_ARGS_ENV: &str = "JS_EXTRA_ARGS";
 pub const RUST_OPT_LEVEL_ENV: &str = "JSC_RUST_OPT_LEVEL";
 /// Environment variable selecting the emit-affecting options used to key the sysroot.
 pub const SYSROOT_ARGS_ENV: &str = "JSC_SYSROOT_ARGS";
+/// Environment variable selecting the build mode: unset (or `abort`) is the default
+/// `-Cpanic=abort` build, `unwind` the unwind build mode (`scripts/sysroot-cache.sh`, `jsc_panic`).
+pub const PANIC_ENV: &str = "JSC_PANIC";
+
+/// The build mode [`PANIC_ENV`] selects.
+///
+/// The checkout's scripts read the same variable, and the toolchain passes it to every script it
+/// runs, so a client crate, its sysroot and the scripts can never disagree about the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanicMode {
+    /// `-Cpanic=abort` on `wasm32-unknown-unknown`: the default.
+    Abort,
+    /// `-Cpanic=unwind` on `targets/mires32-unwind.json`, with `js-cleanup=off` appended by the
+    /// scripts: rustc's unwind edges carry host-exception cleanup.
+    Unwind,
+}
+
+impl PanicMode {
+    /// The mode a [`PANIC_ENV`] value names, or `None` for a value that names none.
+    pub fn parse(value: Option<&str>) -> Option<Self> {
+        match value {
+            None | Some("" | "abort") => Some(Self::Abort),
+            Some("unwind") => Some(Self::Unwind),
+            Some(_) => None,
+        }
+    }
+
+    /// The mode in this process's environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` when [`PANIC_ENV`] is set to anything but `abort` or `unwind`.
+    pub fn from_env() -> Result<Self> {
+        let value = env::var(PANIC_ENV).ok();
+        Self::parse(value.as_deref()).ok_or_else(|| BuildError::PanicMode {
+            value: value.unwrap_or_default(),
+        })
+    }
+
+    /// The target's name: what the sysroot's `lib/rustlib/<name>/lib` is called.
+    pub fn target_name(self) -> &'static str {
+        match self {
+            Self::Abort => "wasm32-unknown-unknown",
+            Self::Unwind => "mires32-unwind",
+        }
+    }
+
+    /// What [`PANIC_ENV`] is set to for a child process; `None` removes an inherited value.
+    fn env_value(self) -> Option<&'static str> {
+        match self {
+            Self::Abort => None,
+            Self::Unwind => Some("unwind"),
+        }
+    }
+}
 
 /// Cargo target directory for the feature-gated keyed view macros.
 const KEYED_VIEW_MACRO_TARGET: &str = "keyed-view-macros";
@@ -28,6 +83,7 @@ pub struct Toolchain {
     root: PathBuf,
     dylib: PathBuf,
     linker: PathBuf,
+    panic: PanicMode,
 }
 
 impl Toolchain {
@@ -35,7 +91,8 @@ impl Toolchain {
     ///
     /// # Errors
     ///
-    /// Returns `Err` on a platform the backend is not built for.
+    /// Returns `Err` on a platform the backend is not built for, or when [`PANIC_ENV`] names no
+    /// build mode.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         let dylib = root.join("target").join("release").join(dylib_name()?);
@@ -44,7 +101,25 @@ impl Toolchain {
             root,
             dylib,
             linker,
+            panic: PanicMode::from_env()?,
         })
+    }
+
+    /// The same toolchain in another build mode.
+    #[must_use]
+    pub fn with_panic_mode(mut self, panic: PanicMode) -> Self {
+        self.panic = panic;
+        self
+    }
+
+    /// The build mode this toolchain compiles in.
+    pub fn panic_mode(&self) -> PanicMode {
+        self.panic
+    }
+
+    /// The unwind mode's target spec.
+    pub fn unwind_target_spec(&self) -> PathBuf {
+        self.root.join("targets").join("mires32-unwind.json")
     }
 
     /// The toolchain in the spike checkout named by [`SPIKE_ROOT_ENV`], else
@@ -128,6 +203,7 @@ impl Toolchain {
             RUST_OPT_LEVEL_ENV,
             opt_level.map(RustOptLevel::as_str),
         );
+        optional_env(&mut command, PANIC_ENV, self.panic.env_value());
         scrub(&mut command);
 
         let output = command.output().map_err(|source| BuildError::Io {
@@ -152,11 +228,11 @@ impl Toolchain {
         Ok(PathBuf::from(path))
     }
 
-    fn sysroot_lib_for(sysroot: &Path) -> PathBuf {
+    fn sysroot_lib_for(&self, sysroot: &Path) -> PathBuf {
         sysroot
             .join("lib")
             .join("rustlib")
-            .join("wasm32-unknown-unknown")
+            .join(self.panic.target_name())
             .join("lib")
     }
 
@@ -374,6 +450,7 @@ impl Toolchain {
                 .arg(path_arg(&self.script("build_sysroot.sh")))
                 .env(EXTRA_ARGS_ENV, emit_args.trim())
                 .maybe_env(RUST_OPT_LEVEL_ENV, opt_level.map(RustOptLevel::as_str))
+                .maybe_env(PANIC_ENV, self.panic.env_value())
                 .dir(&self.root),
             Step::ViewMacros => self.view_macro_fix(false),
         }
@@ -459,7 +536,7 @@ impl Toolchain {
         let found_key = fs::read_to_string(sysroot.join(".cache-key")).unwrap_or_default();
         let wanted_opt = opt_level.map(RustOptLevel::as_str).unwrap_or_default();
         let wanted_key = sysroot.file_name().and_then(|name| name.to_str());
-        if Self::sysroot_lib_for(&sysroot).is_dir()
+        if self.sysroot_lib_for(&sysroot).is_dir()
             && args_match(&found, emit_args)
             && found_opt.trim() == wanted_opt
             && wanted_key.is_some_and(|key| found_key.trim() == key)
@@ -714,8 +791,19 @@ impl Toolchain {
         let mut command = Command::new("rustc");
         command
             .arg(format!("+{}", self.pinned().channel()))
-            .args(["--edition", "2021"])
-            .args(["--target", "wasm32-unknown-unknown"])
+            .args(["--edition", "2021"]);
+        match self.panic {
+            PanicMode::Abort => {
+                command.args(["--target", "wasm32-unknown-unknown"]);
+            }
+            PanicMode::Unwind => {
+                command
+                    .arg("--target")
+                    .arg(self.unwind_target_spec())
+                    .args(["-Zunstable-options", "-Cpanic=unwind"]);
+            }
+        }
+        command
             .arg("--sysroot")
             .arg(sysroot)
             .args(["--crate-type", "cdylib"])
@@ -851,6 +939,7 @@ impl Toolchain {
             RUST_OPT_LEVEL_ENV,
             opt_level.map(RustOptLevel::as_str),
         );
+        optional_env(&mut command, PANIC_ENV, self.panic.env_value());
         scrub(&mut command);
         procedure_identity_env(&mut command);
 
@@ -1409,7 +1498,7 @@ mod tests {
         assert_eq!(other, dir.path().join("build/sysroots/other"));
         assert_ne!(report, other);
 
-        fs::create_dir_all(Toolchain::sysroot_lib_for(&report)).unwrap();
+        fs::create_dir_all(toolchain.sysroot_lib_for(&report)).unwrap();
         fs::write(report.join(".js-args"), "js-opt=report").unwrap();
         fs::write(report.join(".rust-opt-level"), "1").unwrap();
         fs::write(report.join(".cache-key"), "report-o1").unwrap();
@@ -1456,6 +1545,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn panic_mode_names_the_two_build_modes() {
+        assert_eq!(PanicMode::parse(None), Some(PanicMode::Abort));
+        assert_eq!(PanicMode::parse(Some("")), Some(PanicMode::Abort));
+        assert_eq!(PanicMode::parse(Some("abort")), Some(PanicMode::Abort));
+        assert_eq!(PanicMode::parse(Some("unwind")), Some(PanicMode::Unwind));
+        assert_eq!(PanicMode::parse(Some("Unwind")), None);
+        assert_eq!(PanicMode::Abort.target_name(), "wasm32-unknown-unknown");
+        assert_eq!(PanicMode::Unwind.target_name(), "mires32-unwind");
+    }
+
+    /// The mode travels to the scripts explicitly, and an abort-mode toolchain masks an inherited
+    /// selector, so a client crate is never compiled in a mode its toolchain does not describe.
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn compile_passes_the_build_mode_through() {
+        let dir = TempDir::new("compile-panic-mode");
+        fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        let recorded = dir.path().join("mode");
+        fs::write(
+            dir.path().join("scripts/compile_core.sh"),
+            format!(
+                "printf '%s' \"${{JSC_PANIC-unset}}\" >'{}'\n",
+                recorded.display()
+            ),
+        )
+        .unwrap();
+        let toolchain = Toolchain::new(dir.path()).unwrap();
+        for (mode, expected) in [(PanicMode::Unwind, "unwind"), (PanicMode::Abort, "unset")] {
+            let toolchain = toolchain.clone().with_panic_mode(mode);
+            assert_eq!(toolchain.panic_mode(), mode);
+            toolchain
+                .compile(Path::new("client.rs"), Path::new("out.js"), "", &[])
+                .unwrap();
+            assert_eq!(fs::read_to_string(&recorded).unwrap(), expected);
+        }
+        let unwind = toolchain.with_panic_mode(PanicMode::Unwind);
+        assert_eq!(
+            unwind.sysroot_lib_for(Path::new("/sysroot")),
+            Path::new("/sysroot/lib/rustlib/mires32-unwind/lib")
+        );
+        assert_eq!(
+            unwind.unwind_target_spec(),
+            dir.path().join("targets/mires32-unwind.json")
+        );
+    }
+
     /// The steps a checkout is missing, less the toolchain: whether the pinned
     /// nightly is installed is a property of the machine running the tests, not
     /// of the checkout they describe.
@@ -1497,7 +1633,10 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn every_fix_names_the_checkout_and_the_emit_options() {
-        let toolchain = Toolchain::new("/spike").unwrap();
+        // The default build mode's commands, whatever JSC_PANIC the test process inherited.
+        let toolchain = Toolchain::new("/spike")
+            .unwrap()
+            .with_panic_mode(PanicMode::Abort);
 
         let fixes: Vec<String> = checkout_steps(&toolchain, "js-minify=on", true)
             .iter()
@@ -1517,7 +1656,10 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn a_sysroot_fix_carries_an_explicit_rust_optimization_level() {
-        let toolchain = Toolchain::new("/spike").unwrap();
+        // The default build mode's command, whatever JSC_PANIC the test process inherited.
+        let toolchain = Toolchain::new("/spike")
+            .unwrap()
+            .with_panic_mode(PanicMode::Abort);
         let fix =
             toolchain.fix_with_opt_level(Step::Sysroot, "js-opt=report", Some(RustOptLevel::O1));
 
@@ -1526,6 +1668,17 @@ mod tests {
             concat!(
                 "cd /spike && JS_EXTRA_ARGS='js-opt=report' JSC_RUST_OPT_LEVEL='1' ",
                 "bash scripts/build_sysroot.sh",
+            )
+        );
+        // The unwind mode's sysroot is a different one, and its fix says so.
+        let unwind = toolchain.with_panic_mode(PanicMode::Unwind);
+        assert_eq!(
+            unwind
+                .fix_with_opt_level(Step::Sysroot, "js-opt=report", Some(RustOptLevel::O1))
+                .to_string(),
+            concat!(
+                "cd /spike && JS_EXTRA_ARGS='js-opt=report' JSC_RUST_OPT_LEVEL='1' ",
+                "JSC_PANIC='unwind' bash scripts/build_sysroot.sh",
             )
         );
     }

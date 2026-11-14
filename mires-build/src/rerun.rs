@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::{Result, RustOptLevel, Toolchain, SPIKE_ROOT_ENV};
+use crate::{PanicMode, Result, RustOptLevel, Toolchain, PANIC_ENV, SPIKE_ROOT_ENV};
 
 /// The inputs a compiled client program depends on, printed as
 /// `cargo:rerun-if-changed` directives.
@@ -54,6 +54,24 @@ impl Rerun {
             patch_dir,
         ]);
         paths.extend(patches);
+        // The unwind build mode's own inputs: its target spec, and the patches only it applies.
+        if toolchain.panic_mode() == PanicMode::Unwind {
+            let unwind_patches = toolchain.root().join("patches").join("unwind");
+            let mut patches: Vec<_> = fs::read_dir(&unwind_patches)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "patch")
+                })
+                .collect();
+            patches.sort();
+            paths.push(toolchain.unwind_target_spec());
+            paths.push(unwind_patches);
+            paths.extend(patches);
+        }
         Self { paths }
     }
 
@@ -120,6 +138,7 @@ impl Rerun {
         self.emit_paths();
         println!("cargo:rerun-if-env-changed={SPIKE_ROOT_ENV}");
         println!("cargo:rerun-if-env-changed=JSC_SPIKE_ROOT");
+        println!("cargo:rerun-if-env-changed={PANIC_ENV}");
     }
 
     pub(crate) fn emit_paths(&self) {
