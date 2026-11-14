@@ -63,7 +63,9 @@ pub(crate) use remap::Metadata;
 const PROGRAM_BUDGET_DENOMINATOR: u64 = 2000;
 
 /// A shared helper must fit within this compact declaration footprint before duplication.
-const SHARED_CALLEE_FOOTPRINT: u64 = 32;
+const SHARED_CALLEE_FOOTPRINT: u64 = 44;
+/// A `#[track_caller]` helper with an unused location parameter drops an argument at every site.
+const TRACK_CALLER_SHARED_FOOTPRINT: u64 = 84;
 
 /// The least program-ledger charge per accepted site bounds duplication even for local wins.
 /// Compression can lose sharing when a body replaces repeated calls.
@@ -118,6 +120,7 @@ struct Site {
     block: usize,
     op: usize,
     callee: JsName,
+    has_track_caller: bool,
 }
 
 type Measurement = (u64, BTreeSet<JsName>);
@@ -128,6 +131,7 @@ type Measurement = (u64, BTreeSet<JsName>);
 /// lane closure); `None` skips the caller. `sole_referrer(callee, caller)` answers the
 /// single-caller criterion from the live reference counts. `program_bytes` is the measured
 /// program total the +0.5% budget is taken of.
+#[allow(dead_code)] // Called by inline unit tests; `lane.rs` calls `run_with_mode`.
 #[allow(clippy::too_many_arguments)] // One call site (the lane driver); the arguments are the
                                      // pass's oracles.
 pub(crate) fn run(
@@ -139,6 +143,33 @@ pub(crate) fn run(
     zombie_free: &dyn Fn(&JsName) -> bool,
     program_bytes: u64,
     sizes: &BTreeMap<JsName, u64>,
+) -> InlineStats {
+    run_with_mode(
+        funcs,
+        metadata,
+        graph,
+        measure,
+        sole_referrer,
+        zombie_free,
+        program_bytes,
+        sizes,
+        false,
+    )
+}
+
+/// Runs the inliner, optionally admitting non-specialized `CallSemantic::Standard` calls after
+/// representation specialization (`allow_std_post_repr`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with_mode(
+    funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
+    metadata: &mut BTreeMap<JsName, Metadata<'_>>,
+    graph: &Callgraph,
+    measure: &dyn Fn(&JsName, &Func, &Metadata<'_>) -> Option<Measurement>,
+    sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
+    zombie_free: &dyn Fn(&JsName) -> bool,
+    program_bytes: u64,
+    sizes: &BTreeMap<JsName, u64>,
+    allow_std_post_repr: bool,
 ) -> InlineStats {
     let mut stats = InlineStats::default();
     let mut sizes = sizes.clone();
@@ -153,10 +184,6 @@ pub(crate) fn run(
         let Some(Ok(func)) = funcs.get(caller) else {
             continue;
         };
-        if func.has_invoke() {
-            stats.decline("inline.exceptional-control-flow");
-            continue;
-        }
         let sites = collect_sites(
             caller,
             func,
@@ -165,6 +192,7 @@ pub(crate) fn run(
             funcs,
             graph,
             zombie_free,
+            allow_std_post_repr,
             &mut stats,
         );
         if sites.is_empty() {
@@ -213,7 +241,11 @@ pub(crate) fn run(
                 continue;
             };
             let origin = current.blocks[site.block].ops[site.op].origin;
-            let (callee_func, imported) =
+            let site_args_len = match &current.blocks[site.block].ops[site.op].kind {
+                OpKind::Call { args, .. } => args.len(),
+                _ => continue,
+            };
+            let (mut callee_func, imported) =
                 match current_metadata.import(provider, callee_func, origin) {
                     Ok(value) => value,
                     Err(reason) => {
@@ -221,6 +253,10 @@ pub(crate) fn run(
                         continue;
                     }
                 };
+            if callee_func.sig.abi.caller_location && callee_func.params.len() == site_args_len + 1
+            {
+                strip_unused_last_param(&mut callee_func);
+            }
             let table = &imported.interns.types;
             let backup = current.clone();
             splice(&mut current, site.block, site.op, &callee_func);
@@ -233,10 +269,23 @@ pub(crate) fn run(
                 continue;
             }
             // Clean a clone so the remaining collected sites keep their block/op positions.
-            // Price and retain the same verified shape, including the merges the splice added.
+            // Price and retain the same verified shape, including the merges and DCE cleanup.
             let mut candidate = current.clone();
             collapse_forwarders(&mut candidate);
             fuse_straight_lines(&mut candidate);
+            let dce_opts = crate::opt::dce::Options {
+                no_constant_params: false,
+                no_deletions: false,
+                pure_call: None,
+            };
+            let mut candidate_dce = candidate.clone();
+            if crate::opt::dce::run_with(&mut candidate_dce, table, &dce_opts, &mut Vec::new())
+                && candidate_dce
+                    .verify_carriers(table, observed_carriers(&candidate_dce))
+                    .is_ok()
+            {
+                candidate = candidate_dce;
+            }
             if candidate
                 .verify_carriers(table, observed_carriers(&candidate))
                 .is_err()
@@ -260,7 +309,22 @@ pub(crate) fn run(
                 0
             };
             let net = delta.saturating_sub(removed.min(i64::MAX as u64) as i64);
-            let charge = net.max(MIN_SITE_CHARGE);
+            let tiny_accessor_slack = if matches!(criterion, Criterion::SmallCallee)
+                && callee_bytes <= 36
+                && net > 0
+                && net <= 2
+            {
+                net
+            } else {
+                0
+            };
+            let charge = if net <= 0 {
+                0
+            } else if tiny_accessor_slack > 0 {
+                tiny_accessor_slack
+            } else {
+                net.max(MIN_SITE_CHARGE)
+            };
             if std::env::var("RCGJS_O_DEBUG_FUNC")
                 .is_ok_and(|filter| caller.as_str().contains(&filter))
             {
@@ -269,9 +333,10 @@ pub(crate) fn run(
                     site.callee,
                 );
             }
-            // Only loop virtualization may spend net growth. Other sites must repay their
-            // caller growth through local cleanup or the proven removal of their sole callee.
-            let growth_allowed = matches!(criterion, Criterion::LoopVirtualizable);
+            // Only loop virtualization (or <=2B tiny accessors) may spend net growth. Other sites
+            // must repay their caller growth through local cleanup or sole-callee removal.
+            let growth_allowed =
+                matches!(criterion, Criterion::LoopVirtualizable) || tiny_accessor_slack > 0;
             // A small loop helper may expose enough scalar replacement to repay a modest
             // pre-cleanup growth in the later per-item pipeline. Bound both the duplicated body
             // and that temporary growth; this is the iterator-state case, not a general license
@@ -443,9 +508,14 @@ fn qualifies(
     // where accepting these sites cost ~500 brotli bytes while the minified count fell. So the
     // small-callee criterion only stands where the duplication is degenerate: a body at or
     // under the call's own post-minify footprint.
+    let footprint_limit = if site.has_track_caller {
+        TRACK_CALLER_SHARED_FOOTPRINT
+    } else {
+        SHARED_CALLEE_FOOTPRINT
+    };
     if sizes
         .get(callee)
-        .is_some_and(|bytes| *bytes <= SHARED_CALLEE_FOOTPRINT)
+        .is_some_and(|bytes| *bytes <= footprint_limit)
     {
         return Some(Criterion::SmallCallee);
     }
@@ -462,6 +532,7 @@ fn collect_sites(
     funcs: &BTreeMap<JsName, Result<Func, Decline>>,
     graph: &Callgraph,
     zombie_free: &dyn Fn(&JsName) -> bool,
+    allow_std_post_repr: bool,
     stats: &mut InlineStats,
 ) -> Vec<Site> {
     let mut sites = Vec::new();
@@ -478,11 +549,25 @@ fn collect_sites(
             else {
                 continue;
             };
-            if track_caller.is_some() {
-                stats.decline("inline.track-caller-unavailable");
+            if matches!(block.term, RTerm::Invoke { .. }) && op_index + 1 == block.ops.len() {
+                stats.decline("inline.exceptional-control-flow");
                 continue;
             }
-            if *semantic != CallSemantic::Ordinary || host.is_some() {
+            let semantic_ok = match semantic {
+                CallSemantic::Ordinary => true,
+                CallSemantic::Standard(std_op) if allow_std_post_repr => !matches!(
+                    std_op,
+                    crate::jir::semantic::StandardOperation::VecNew
+                        | crate::jir::semantic::StandardOperation::VecWithCapacity
+                        | crate::jir::semantic::StandardOperation::VecAsSlice
+                        | crate::jir::semantic::StandardOperation::VecPush
+                        | crate::jir::semantic::StandardOperation::FormatArgumentNewDisplay
+                        | crate::jir::semantic::StandardOperation::FormatArgsNew
+                        | crate::jir::semantic::StandardOperation::FormatArgsToString
+                ),
+                _ => false,
+            };
+            if !semantic_ok || host.is_some() {
                 stats.decline("inline.semantic-boundary");
                 continue;
             }
@@ -512,7 +597,12 @@ fn collect_sites(
                 stats.decline("inline.body-unavailable");
                 continue;
             };
-            if let Some(reason) = body_decline(callee_func, &callee_metadata.interns, args.len()) {
+            if let Some(reason) = body_decline(
+                callee_func,
+                &callee_metadata.interns,
+                args.len(),
+                track_caller.is_some(),
+            ) {
                 stats.decline(reason);
                 continue;
             }
@@ -535,22 +625,86 @@ fn collect_sites(
                 block: block_index,
                 op: op_index,
                 callee,
+                has_track_caller: track_caller.is_some()
+                    || (callee_func.sig.abi.caller_location && unused_caller_location(callee_func)),
             });
         }
     }
     sites
 }
 
+/// Whether `callee`'s implicit trailing `Location` parameter has zero uses in its body.
+fn unused_caller_location(callee: &Func) -> bool {
+    let Some(&last_param) = callee.params.last() else {
+        return false;
+    };
+    !callee.blocks.iter().any(|block| {
+        block
+            .ops
+            .iter()
+            .any(|op| op.kind.uses().contains(&last_param))
+            || block.term.uses().contains(&last_param)
+    })
+}
+
+/// Strips the dead trailing `Location` parameter from an imported `#[track_caller]` callee before splicing.
+fn strip_unused_last_param(callee: &mut Func) {
+    let Some(removed) = callee.params.pop() else {
+        return;
+    };
+    if let Some(entry) = callee.blocks.first_mut() {
+        entry.params.retain(|&p| p != removed);
+    }
+    callee.sig.abi.parameters = callee.sig.abi.parameters.saturating_sub(1);
+    callee.sig.abi.caller_location = false;
+    callee.values.remove(removed.0 as usize);
+    let remap_val = |v: ValueId| {
+        if v.0 > removed.0 {
+            ValueId(v.0 - 1)
+        } else {
+            v
+        }
+    };
+    for p in &mut callee.params {
+        *p = remap_val(*p);
+    }
+    for block in &mut callee.blocks {
+        for p in &mut block.params {
+            *p = remap_val(*p);
+        }
+        for op in &mut block.ops {
+            if let Some(res) = &mut op.result {
+                *res = remap_val(*res);
+            }
+            map_op(&mut op.kind, &remap_val, &|c| c);
+        }
+        block.term = map_term(&block.term, &remap_val, &|b| b);
+    }
+}
+
 /// The semantic boundary preventing a callee body from being spliced at this site.
-fn body_decline(callee: &Func, interns: &Interns, args: usize) -> Option<&'static str> {
+fn body_decline(
+    callee: &Func,
+    interns: &Interns,
+    args: usize,
+    site_has_track_caller: bool,
+) -> Option<&'static str> {
     if callee.has_invoke() {
         return Some("inline.exceptional-control-flow");
     }
-    if callee.sig.abi.caller_location {
+    let expected_params = if callee.sig.abi.caller_location {
+        if unused_caller_location(callee) && callee.params.len() == args + 1 {
+            args + 1
+        } else {
+            return Some("inline.track-caller-unavailable");
+        }
+    } else if site_has_track_caller {
         return Some("inline.track-caller-unavailable");
-    }
+    } else {
+        args
+    };
     if callee.sig.abi.spread.is_some()
-        || callee.params.len() != args
+        || callee.params.len() != expected_params
         || callee
             .blocks
             .first()
@@ -1641,5 +1795,360 @@ mod tests {
                 assert_eq!(origin.inline_stack, vec![O]);
             }
         }
+    }
+
+    #[test]
+    fn net_nonpositive_inlines_charge_zero_budget() {
+        // Two callers share a small callee soCriterion::SmallCallee applies (not SoleCaller).
+        // Previously each site paid at least MIN_SITE_CHARGE (24), exhausting BUDGET_FLOOR (384)
+        // after 16 calls even when each inline had net <= 0.
+        let mut prog = Prog::new();
+        let g = add_one(&mut prog);
+        prog.add("g", g);
+        for idx in 0..20 {
+            let caller = calls_g(&mut prog);
+            prog.add(&format!("f_{idx}"), caller);
+        }
+        let stats = prog.run(1, false);
+        assert_eq!(
+            stats.applied, 20,
+            "all 20 zero-net calls must fit in BUDGET_FLOOR"
+        );
+        assert_eq!(stats.declined_budget, 0);
+    }
+
+    #[test]
+    fn origin_invalid_uses_fallback_origin_on_import() {
+        use crate::jir::origin::{Origin, OriginKind, OriginTable};
+        use rcgjs_object::object::Header;
+        use std::borrow::Cow;
+
+        let mut provider = Interns::new();
+        provider.intern_type(TypeDescriptor {
+            id: I32,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: true,
+                bits: 32,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: Some(IntFacts {
+                    signed: true,
+                    bits: 32,
+                    repr: IntRepr::Number,
+                }),
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: I32,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+        let provider_origins = OriginTable {
+            origins: Vec::new(),
+            statements: Vec::new(),
+            terminators: Vec::new(),
+            locals: Vec::new(),
+            item_path: StrId(0),
+            root: None,
+        };
+        let provider_header = Header {
+            jir_schema: crate::jir::JIR_SCHEMA,
+            rustc_version_hash: 7,
+            data_layout: "wasm32".to_owned(),
+            emit_args: "faithful".to_owned(),
+            crate_name: "provider".to_owned(),
+            codec: crate::jir::codec::Codec::Deflate,
+            hash: crate::jir::hash::HashAlgorithm::SipHash13x128,
+        };
+
+        let mut caller_interns = provider.clone();
+        let g_str = caller_interns.intern_str("g");
+        let caller_origins = OriginTable {
+            origins: vec![Origin {
+                kind: OriginKind::Statement,
+                source: None,
+                local_name: None,
+                inline_stack: Vec::new(),
+            }],
+            statements: Vec::new(),
+            terminators: Vec::new(),
+            locals: vec![O],
+            item_path: g_str,
+            root: None,
+        };
+
+        let invalid_origin = OriginId(u32::MAX);
+        // Callee uses OriginId(u32::MAX) while provider has empty origin table.
+        let mut g_b = FuncBuilder::new(item(2), sig(1));
+        let x = g_b.param(I32, invalid_origin);
+        let one = g_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+            I32,
+            invalid_origin,
+        );
+        let sum = g_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: x,
+                r: one,
+                ty: I32,
+            },
+            I32,
+            invalid_origin,
+        );
+        g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(sum)));
+        let g = g_b.finish();
+
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let p = f_b.param(I32, O);
+        let call = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: g_str,
+                },
+                function: None,
+                args: vec![p],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+        let f = f_b.finish();
+
+        let f_name = JsName::new("f".to_owned());
+        let g_name = JsName::new("g".to_owned());
+        let mut funcs = BTreeMap::from([(f_name.clone(), Ok(f)), (g_name.clone(), Ok(g.clone()))]);
+        let mut metadata = BTreeMap::from([
+            (
+                f_name.clone(),
+                Metadata {
+                    universe: &caller_interns,
+                    interns: Cow::Borrowed(&caller_interns),
+                    origins: Some(Cow::Borrowed(&caller_origins)),
+                    header: Some(&provider_header),
+                },
+            ),
+            (
+                g_name.clone(),
+                Metadata {
+                    universe: &provider,
+                    interns: Cow::Borrowed(&provider),
+                    origins: Some(Cow::Borrowed(&provider_origins)),
+                    header: Some(&provider_header),
+                },
+            ),
+        ]);
+        let interns_map = BTreeMap::from([
+            (f_name.clone(), &caller_interns),
+            (g_name.clone(), &provider),
+        ]);
+        let graph = crate::analysis::callgraph::build(&funcs, &interns_map);
+        let sizes = BTreeMap::from([
+            (f_name.clone(), measured(funcs[&f_name].as_ref().unwrap())),
+            (g_name.clone(), measured(&g)),
+        ]);
+        let measure = |_: &JsName, func: &Func, meta: &Metadata<'_>| Some(measurement(func, meta));
+        let stats = run(
+            &mut funcs,
+            &mut metadata,
+            &graph,
+            &measure,
+            &|_, _| true,
+            &|_| true,
+            100_000,
+            &sizes,
+        );
+        assert_eq!(
+            stats.applied, 1,
+            "OriginId::INVALID should use fallback origin"
+        );
+        assert!(!stats.declined.contains_key("inline.origin-invalid"));
+    }
+
+    #[test]
+    fn unused_track_caller_param_is_stripped_and_inlined() {
+        let mut prog = Prog::new();
+        let file = prog.strid("caller.rs");
+        let fact = prog
+            .interns
+            .intern_source_fact(crate::jir::origin::SourceFact {
+                file,
+                line: 10,
+                col: 1,
+            });
+        // `fn g(x, _loc) { return x + 1; }` with caller_location = true
+        let mut g_sig = sig(2);
+        g_sig.abi.caller_location = true;
+        let mut g_b = FuncBuilder::new(item(2), g_sig);
+        let x = g_b.param(I32, O);
+        let _unused_loc = g_b.param(I32, O);
+        let one = g_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+            I32,
+            O,
+        );
+        let sum = g_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: x,
+                r: one,
+                ty: I32,
+            },
+            I32,
+            O,
+        );
+        g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(sum)));
+        let g = g_b.finish();
+
+        // Call `g(p)` with 1 explicit arg and `track_caller: Some(fact)`.
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let p = f_b.param(I32, O);
+        let g_str = prog.strid("g");
+        let call = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: g_str,
+                },
+                function: None,
+                args: vec![p],
+                track_caller: Some(fact),
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+        let f = f_b.finish();
+
+        prog.add("g", g);
+        prog.add("f", f);
+        let stats = prog.run(100_000, true);
+        assert_eq!(
+            stats.applied, 1,
+            "unused #[track_caller] callee should inline"
+        );
+        assert_eq!(prog.calls_in("f"), 0);
+    }
+
+    #[test]
+    fn dead_constant_branch_is_cleaned_before_pricing() {
+        let mut prog = Prog::new();
+        // `fn g(flag, x) { if flag == 0 { return x + 1; } else { return x + 1 + 2 + ...; } }`
+        // When called as `g(0, p)`, pre-pricing DCE eliminates the huge dead arm so `after <= limit`.
+        let mut g_b = FuncBuilder::new(item(2), sig(2));
+        let flag = g_b.param(I32, O);
+        let x = g_b.param(I32, O);
+        let b_dead = g_b.block();
+        let b_live = g_b.block();
+        g_b.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Switch {
+                scrut: flag,
+                scrut_ty: I32,
+                cases: vec![(0, b_live, Vec::new())],
+                default: (b_dead, Vec::new()),
+            },
+        );
+        let mut dead_acc = x;
+        for bits in 1..40 {
+            let c = g_b.op(
+                b_dead,
+                OpKind::Const(ConstTree::Scalar { bits, bytes: 4 }),
+                I32,
+                O,
+            );
+            dead_acc = g_b.op(
+                b_dead,
+                OpKind::Binary {
+                    op: BinaryOp::Add,
+                    l: dead_acc,
+                    r: c,
+                    ty: I32,
+                },
+                I32,
+                O,
+            );
+        }
+        g_b.terminate(b_dead, RTerm::Return(Some(dead_acc)));
+        let one = g_b.op(
+            b_live,
+            OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+            I32,
+            O,
+        );
+        let live_sum = g_b.op(
+            b_live,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: x,
+                r: one,
+                ty: I32,
+            },
+            I32,
+            O,
+        );
+        g_b.terminate(b_live, RTerm::Return(Some(live_sum)));
+        let g = g_b.finish();
+
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let p = f_b.param(I32, O);
+        let zero = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+            I32,
+            O,
+        );
+        let g_str = prog.strid("g");
+        let call = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: g_str,
+                },
+                function: None,
+                args: vec![zero, p],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+        let f = f_b.finish();
+
+        prog.add("g", g);
+        prog.add("f", f);
+        let stats = prog.run(100_000, true);
+        assert_eq!(
+            stats.applied, 1,
+            "DCE before pricing removes constant-folded dead arm"
+        );
+        assert_eq!(prog.calls_in("f"), 0);
     }
 }

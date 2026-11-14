@@ -244,16 +244,82 @@ fn check_emission(
                         .unwrap();
                     let func = &optimized;
                     let plan = crate::lower::fuse::plan(func, None, &interns.types, interns, &opts);
-                    assert!(plan
-                        .inline
-                        .iter()
-                        .all(|value| func.blocks.iter().any(|block| block.ops.iter().any(
-                            |op| op.result == Some(*value)
-                                && matches!(
-                                    op.kind,
-                                    OpKind::BorrowView { .. } | OpKind::RawView { .. }
-                                )
-                        ))));
+                    if mode != OptimizerMode::On {
+                        assert!(plan
+                            .inline
+                            .iter()
+                            .all(|value| func.blocks.iter().any(|block| {
+                                block.ops.iter().any(|op| {
+                                    op.result == Some(*value)
+                                        && matches!(
+                                            op.kind,
+                                            OpKind::BorrowView { .. } | OpKind::RawView { .. }
+                                        )
+                                })
+                            })));
+                    } else {
+                        for &value in &plan.inline {
+                            let (def_block, def_pos) = func
+                                .blocks
+                                .iter()
+                                .enumerate()
+                                .find_map(|(bi, block)| {
+                                    block
+                                        .ops
+                                        .iter()
+                                        .position(|op| op.result == Some(value))
+                                        .map(|oi| (bi, oi))
+                                })
+                                .expect("inlined value must be defined by an op in a single block");
+                            for (bi, block) in func.blocks.iter().enumerate() {
+                                if let crate::jir::repr::RTerm::Invoke { normal, unwind } =
+                                    &block.term
+                                {
+                                    assert!(
+                                        !normal.1.contains(&value) && !unwind.1.contains(&value),
+                                        "inlined value {value:?} must not be used on Invoke edge"
+                                    );
+                                }
+                                for (oi, op) in block.ops.iter().enumerate() {
+                                    if !op.kind.uses().contains(&value) {
+                                        continue;
+                                    }
+                                    assert_eq!(
+                                        bi, def_block,
+                                        "inlined value {value:?} in Invoke fn must stay block-local and not cross Invoke boundary"
+                                    );
+                                    if matches!(block.term, crate::jir::repr::RTerm::Invoke { .. })
+                                    {
+                                        let is_last = oi + 1 == block.ops.len();
+                                        let is_throwing = matches!(
+                                            op.kind,
+                                            OpKind::Call { .. }
+                                                | OpKind::Intrinsic { .. }
+                                                | OpKind::Host { .. }
+                                                | OpKind::Drop { .. }
+                                        );
+                                        assert!(
+                                            !(is_last && is_throwing),
+                                            "inlined value {value:?} must not be consumed by protected Invoke op"
+                                        );
+                                    }
+                                    for between in &block.ops[def_pos + 1..oi] {
+                                        assert!(
+                                            !matches!(
+                                                between.kind,
+                                                OpKind::Call { .. }
+                                                    | OpKind::Intrinsic { .. }
+                                                    | OpKind::Host { .. }
+                                                    | OpKind::Drop { .. }
+                                                    | OpKind::Assert { .. }
+                                            ),
+                                            "inlined value {value:?} must not cross a throwing op"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                     for name in plan
                         .invoke_names
                         .values()
@@ -1194,4 +1260,94 @@ for (thrown of [undefined, null, {}, Symbol('error'), new Error('error'), abort]
 console.log(checks);
 "#;
     check_emission(&interns, &body, &terminated, harness, 24, "terminate-abi");
+}
+
+#[test]
+fn goto_chain_in_invoke_function_never_fuses_across_blocks() {
+    use rcgjs_object::jir::semantic::BinaryOp;
+    let mut interns = world();
+    let mut b = FuncBuilder::new(item(1), signature(vec![I32], I32));
+    let x = b.param(I32, NO_ORIGIN);
+    let entry = FuncBuilder::ENTRY;
+    let mid = b.block();
+    let after = b.block();
+    let cleanup = b.block();
+
+    let one = b.op(
+        entry,
+        OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+        I32,
+        NO_ORIGIN,
+    );
+    let two = b.op(
+        mid,
+        OpKind::Const(ConstTree::Scalar { bits: 2, bytes: 4 }),
+        I32,
+        NO_ORIGIN,
+    );
+    // Defined in `entry`, used in `mid` across an unconditional `Goto`: scoped fusion in
+    // `Invoke` functions must NOT fuse `added` across blocks.
+    let added = b.op(
+        entry,
+        OpKind::Binary {
+            op: BinaryOp::Add,
+            l: x,
+            r: one,
+            ty: I32,
+        },
+        I32,
+        NO_ORIGIN,
+    );
+    b.terminate(entry, RTerm::Goto(mid, Vec::new()));
+
+    let arg = b.op(
+        mid,
+        OpKind::Binary {
+            op: BinaryOp::Add,
+            l: added,
+            r: two,
+            ty: I32,
+        },
+        I32,
+        NO_ORIGIN,
+    );
+    let call_res = b.op(mid, call(&mut interns, "step", vec![arg]), I32, NO_ORIGIN);
+    b.terminate(
+        mid,
+        RTerm::Invoke {
+            normal: (after, Vec::new()),
+            unwind: (cleanup, Vec::new()),
+        },
+    );
+    b.terminate(after, RTerm::Return(Some(call_res)));
+    b.effect(cleanup, call(&mut interns, "cleanup", vec![x]), NO_ORIGIN);
+    b.terminate(cleanup, RTerm::Throw(None));
+
+    let func = b.finish();
+    func.verify(&interns.types).unwrap();
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let harness = r#"
+const assert = require('node:assert/strict');
+let trace, shouldThrow, thrown;
+function step(v) { trace.push(['step', v]); if (shouldThrow) throw thrown; return v + 10; }
+function cleanup(v) { trace.push(['cleanup', v]); }
+let checks = 0;
+for (shouldThrow of [false, true]) {
+  thrown = new Error('boom');
+  trace = [];
+  let value, caught = false;
+  try { value = entry(5); } catch (e) { value = e; caught = true; }
+  assert.equal(caught, shouldThrow);
+  if (shouldThrow) {
+    assert.equal(value, thrown);
+    assert.deepEqual(trace, [['step', 8], ['cleanup', 5]]);
+  } else {
+    assert.equal(value, 18);
+    assert.deepEqual(trace, [['step', 8]]);
+  }
+  checks++;
+}
+console.log(checks);
+"#;
+    check_emission(&interns, &body, &func, harness, 2, "goto-chain");
 }

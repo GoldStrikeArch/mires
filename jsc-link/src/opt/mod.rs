@@ -27,6 +27,7 @@ pub mod inline;
 pub mod partial_escape;
 mod pipeline;
 pub mod projection;
+pub mod prune_invoke;
 pub mod range;
 pub mod slice_forward;
 pub mod slice_iter;
