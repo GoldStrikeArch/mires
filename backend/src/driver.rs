@@ -282,7 +282,10 @@ fn requires_cleanup_lowering<'tcx>(
 /// runtime's, which this compiler supplies, so only a program's own declarations are named. It is
 /// an error where the call is compiled rather than a zombie: the JIR lane replaces an item's
 /// zombies with its lowering's, and this is a property of the declaration, not of the lowering.
-fn reject_nounwind_foreign_calls<'tcx>(tcx: TyCtxt<'tcx>, instance: rustc_middle::ty::Instance<'tcx>) {
+fn reject_nounwind_foreign_calls<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: rustc_middle::ty::Instance<'tcx>,
+) {
     use rustc_abi::ExternAbi;
     let body = tcx.instance_mir(instance.def);
     for block in body.basic_blocks.iter() {
