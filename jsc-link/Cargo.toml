@@ -29,6 +29,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 sha2.workspace = true
+# The JavaScript the tests check runs in reused node workers (RCGJS_TEST_NODE=spawn: one node each).
+test-node = { path = "../test-node" }
 
 [lints]
 workspace = true

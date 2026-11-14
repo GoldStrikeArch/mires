@@ -920,19 +920,8 @@ impl OverflowHarness {
              want [${wrapped}, ${overflowed}]`);\n}\nconsole.log(cases.length);\n",
         );
         // The program is too long for an argument; it goes in on stdin.
-        let mut node = std::process::Command::new("node")
-            .arg("-")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+        let output = test_node::run(test_node::Node::Stdin(&self.source))
             .expect("Node is required by the compiler semantic tests");
-        std::io::Write::write_all(
-            &mut node.stdin.take().expect("piped stdin"),
-            self.source.as_bytes(),
-        )
-        .expect("write the program to Node");
-        let output = node.wait_with_output().expect("Node runs to completion");
         assert!(
             output.status.success(),
             "{}",

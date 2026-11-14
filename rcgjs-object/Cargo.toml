@@ -19,5 +19,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 
+[dev-dependencies]
+# tests/try_catch.rs runs its JavaScript in reused node workers (RCGJS_TEST_NODE=spawn: one node
+# each). The unit tests in src/ spawn node themselves; see test-node's crate documentation.
+test-node = { path = "../test-node" }
+
 [lints]
 workspace = true

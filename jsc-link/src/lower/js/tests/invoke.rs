@@ -1,6 +1,5 @@
 use super::*;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use test_node::Node;
 
 const RUNTIME: &str = include_str!("../../../../../runtime/shim.js");
 
@@ -296,19 +295,9 @@ fn check_emission(
                             dir.join(format!("{label}-{dispatch}-{mode:?}-{rename}-{style:?}.js"));
                         std::fs::write(path, format!("{RUNTIME}\n{source}\n{harness}")).unwrap();
                     }
-                    let mut child = Command::new("node")
-                        .arg("-")
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .expect("Node is required");
-                    write!(
-                        child.stdin.take().unwrap(),
-                        "{RUNTIME}\n{source}\n{harness}"
-                    )
-                    .unwrap();
-                    let output = child.wait_with_output().unwrap();
+                    let output =
+                        test_node::run(Node::Stdin(&format!("{RUNTIME}\n{source}\n{harness}")))
+                            .expect("Node is required");
                     assert!(output.status.success(), "dispatch={dispatch}, mode={mode:?}, rename={rename}, style={style:?}\n{source}\n{}", String::from_utf8_lossy(&output.stderr));
                     assert_eq!(
                         String::from_utf8_lossy(&output.stdout).trim(),
@@ -525,19 +514,8 @@ for (thrown of [undefined, Symbol('drop')]) for (failAt of [0, 1, 2, 3]) {
             &plan,
             structured.region,
         );
-        let mut child = Command::new("node")
-            .arg("-")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+        let output = test_node::run(Node::Stdin(&format!("{RUNTIME}\n{source}\n{harness}")))
             .expect("Node is required");
-        write!(
-            child.stdin.take().unwrap(),
-            "{RUNTIME}\n{source}\n{harness}"
-        )
-        .unwrap();
-        let output = child.wait_with_output().unwrap();
         assert!(
             output.status.success(),
             "{source}\n{}",
