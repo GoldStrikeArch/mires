@@ -1,0 +1,30 @@
+rustc_codegen_js: let `core` supply `eh_personality` in the unwind build mode.
+
+`-Cpanic=unwind` makes rustc require the `eh_personality` lang item in every
+crate graph that produces a final artifact, and `std` is the crate that
+normally carries it. There is no `std` here. `JSC_PANIC=unwind` applies this
+patch (patches/unwind/ is applied after patches/*.patch, and only in that
+mode), so an ordinary `#![no_std]` crate builds in the mode with nothing
+added. The item is an aborting stub, like `std`'s own one for wasm targets:
+the emitted JavaScript catches and rethrows an unwinding exception itself and
+never calls a personality routine. `#[cfg(panic = "unwind")]` keeps it out of
+an abort build even if the patch were applied there.
+
+--- a/library/core/src/lib.rs
++++ b/library/core/src/lib.rs
+@@ -404,3 +404,15 @@
+ // the rustdoc documentation for primitive types. Using `include!`
+ // because rustdoc only looks for these modules at the crate level.
+ include!("primitive_docs.rs");
++
++// rustc_codegen_js: under `-Cpanic=unwind` (the unwind build mode, `JSC_PANIC=unwind`) every final
++// crate needs the `eh_personality` lang item, which `std` normally supplies. There is no `std`
++// here, and an unwind is a JavaScript exception that the emitted code catches and rethrows: no
++// personality routine is ever called. So `core` carries the item, an aborting stub like `std`'s own
++// for wasm targets, and a crate built in that mode needs nothing of its own. Under `-Cpanic=abort`
++// the item does not exist.
++#[cfg(panic = "unwind")]
++#[lang = "eh_personality"]
++fn rust_eh_personality() {
++    crate::intrinsics::abort()
++}

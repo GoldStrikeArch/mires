@@ -648,3 +648,11 @@ fn panic_cannot_unwind() -> ! {
 fn panic_in_cleanup() -> ! {
     panic("panic in a destructor during cleanup");
 }
+
+// Under `-Cpanic=unwind` (the unwind build mode, `JSC_PANIC=unwind`) rustc requires this lang item,
+// which the sysroot's `core` supplies to every other suite (patches/unwind/). This suite links no
+// sysroot, so it carries its own. An unwind is a JavaScript exception the emitted code catches and
+// rethrows; no personality routine is ever called. Last in the file, so that no line above moves.
+#[cfg(panic = "unwind")]
+#[lang = "eh_personality"]
+fn rust_eh_personality() {}

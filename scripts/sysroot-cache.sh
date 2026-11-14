@@ -231,12 +231,15 @@ jsc_sha256_file() {
 	fi
 }
 
+# The digest of the `*.patch` files in `<root>/patches`, or in the directory given second
+# (`patches/unwind`, which only the unwind mode applies).
 jsc_patches_digest() {
 	local root=$1
+	local directory=${2:-$root/patches}
 	local found=0
 	local patch
 	{
-		for patch in "$root"/patches/*.patch; do
+		for patch in "$directory"/*.patch; do
 			[ -f "$patch" ] || continue
 			found=1
 			printf '%s %s\n' "$(basename -- "$patch")" "$(jsc_sha256_file "$patch")"
@@ -295,6 +298,7 @@ jsc_sysroot_key() {
 		if [ "$panic" = unwind ]; then
 			printf 'panic=unwind\n'
 			printf 'target-spec=%s\n' "$(jsc_sha256_file "$spec")"
+			printf 'unwind-patches=%s\n' "$(jsc_patches_digest "$root" "$root/patches/unwind")"
 		fi
 	} | jsc_sha256
 }

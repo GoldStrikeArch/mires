@@ -29,7 +29,8 @@
 #      the keyed cache under build/sysroot-cache/; the toolchain's own copy is
 #      never touched, so a patch cannot corrupt the installed sources;
 #   2. applies every patches/*.patch, in name order, with `patch -p1` rooted at
-#      build/stdlib (so a patch's paths start with `library/`);
+#      build/stdlib (so a patch's paths start with `library/`), and with
+#      JSC_PANIC=unwind every patches/unwind/*.patch after them;
 #   3. builds `library/core`, `library/compiler-builtins` and `library/alloc`
 #      with cargo, with `-Zcodegen-backend` pointed at our dylib;
 #   4. installs the three rlibs into build/sysroots/<key>/, laid out the way
@@ -226,6 +227,11 @@ rsync -a --delete \
 
 shopt -s nullglob
 patches=("$root"/patches/*.patch)
+# The unwind mode's own patches (patches/unwind/) go last, and only in that mode, which is also the
+# only mode whose cache key digests them.
+if [ "$jsc_panic_mode" = unwind ]; then
+	patches+=("$root"/patches/unwind/*.patch)
+fi
 shopt -u nullglob
 
 if [ ${#patches[@]} -eq 0 ]; then
