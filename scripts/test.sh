@@ -54,7 +54,10 @@
 #                   the global is deleted before anything loads. Its stdout must be
 #                   this file's lines up to an optional last line `-- throws <text>`;
 #                   with that line the run must exit non-zero with <text> in its
-#                   stderr, without it the run must exit 0. (core suite only)
+#                   stderr, without it the run must exit 0. Only for ES2018 output
+#                   (`js-ecma-target=2018`, what the release profiles select): an
+#                   engine without `BigInt` cannot parse the `123n` the default
+#                   target prints. (core suite only)
 #
 # With `JS_EXTRA_ARGS='js-modules=esm'` every program is an ES module, so it runs
 # through scripts/run-esm.sh instead of the concatenation above: the shim is
@@ -136,6 +139,21 @@ run_program() {
 		cat "$shim" "$1" "$entry" | node - >"$3" 2>"$4"
 	fi
 }
+
+# The ECMAScript target the programs are printed for, which decides whether NN.no_bigint applies:
+# a release profile selects 2018, and an explicit `js-ecma-target=` overrides a profile wherever it
+# is written (the backend expands a profile in front of the explicit options).
+ecma_target=latest
+for arg in ${JS_EXTRA_ARGS:-}; do
+	case $arg in
+	js-profile=release-*) ecma_target=2018 ;;
+	esac
+done
+for arg in ${JS_EXTRA_ARGS:-}; do
+	case $arg in
+	js-ecma-target=*) ecma_target=${arg#*=} ;;
+	esac
+done
 
 # check_without_bigint <program.js> <name> <NN.no_bigint> <log prefix>: runs a compiled program on
 # an engine without `BigInt` (the global deleted by a module node imports before anything else)
@@ -570,7 +588,7 @@ for src in $core_sources; do
 		fi
 	fi
 
-	if [ -f "$core_dir/$name.no_bigint" ] &&
+	if [ "$ecma_target" = 2018 ] && [ -f "$core_dir/$name.no_bigint" ] &&
 		! check_without_bigint "$out" "core-$name" "$core_dir/$name.no_bigint" "$log_dir/$name.no_bigint"; then
 		record "core/$name" FAIL without-bigint
 		continue
