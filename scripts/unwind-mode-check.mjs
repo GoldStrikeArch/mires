@@ -12,6 +12,7 @@ const [program, shim, name] = process.argv.slice(2)
 const fixtures = {
   '290_extern_c_import_rejected': { export: 'guarded_import', guard: 1, value: 3 },
   '291_extern_c_unwind_import_cleanup': { export: 'guarded_import', guard: 1, value: 3 },
+  '292_exported_extern_c_guard': { export: 'exported_guard', guard: 7, value: 5 },
 }
 const spec = fixtures[name]
 if (!spec) throw new Error(`unknown fixture ${name}`)

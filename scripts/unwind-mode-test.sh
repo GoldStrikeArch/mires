@@ -8,6 +8,8 @@
 #   290  a foreign import declared extern "C". Unwind mode: refused, and the message names
 #        `extern "C-unwind"`; nothing is linked. Abort mode: compiles, and js-cleanup keeps the drop.
 #   291  the same import declared extern "C-unwind": both modes keep the drop.
+#   292  an exported `extern "C" fn` holding a guard, whose cleanup path ends in
+#        UnwindTerminate(Abi) under -Cpanic=unwind: both modes keep the drop.
 #
 # Every result is retained. SKIP_BUILD=1 reuses the backend.
 set -euo pipefail
