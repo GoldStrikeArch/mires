@@ -669,6 +669,41 @@ pub(crate) fn run(
         );
     }
     let emitting_plans = opts.optimizer == crate::opts::OptimizerMode::On;
+    if emitting_plans
+        && repr_ran
+        && (planned_repr.block.committed > 0 || !planned_repr.touched.is_empty())
+        && opts.analyzes(OptimizerPass::AstDce)
+    {
+        let mut excluded: BTreeMap<JsName, Result<Func, Decline>> = BTreeMap::new();
+        for name in planned_repr
+            .touched
+            .iter()
+            .chain(planned_repr.bodies.keys())
+            .chain(planned_repr.call_retargets.keys())
+        {
+            if let Some(entry) = planned_funcs.remove(name) {
+                excluded.insert(name.clone(), entry);
+            }
+        }
+        let mut post_live = live.clone();
+        post_live.extend(planned_clones.keys().cloned());
+        let post_o = o_group_with_mode(
+            &mut planning_table,
+            &mut planned_funcs,
+            &ctx,
+            &post_live,
+            true,
+        );
+        planned_funcs.extend(excluded);
+        o_stats.inline.applied += post_o.inline.applied;
+        o_stats.inline.cross_object_applied += post_o.inline.cross_object_applied;
+        o_stats.inline.bytes_before += post_o.inline.bytes_before;
+        o_stats.inline.bytes_after += post_o.inline.bytes_after;
+        o_stats.inline.items.extend(post_o.inline.items);
+        o_stats.dce_items.extend(post_o.dce_items);
+        o_stats.witnesses_recorded += post_o.witnesses_recorded;
+        o_stats.witnesses_failed += post_o.witnesses_failed;
+    }
     let mut funcs = if emitting_plans {
         planned_funcs.clone()
     } else {
@@ -778,7 +813,7 @@ pub(crate) fn run(
     let mut plan_retries = 0;
     let mut ready_allowed = true;
     let mut physical = planned_physical;
-    let (lowered, async_plan) = loop {
+    let (mut lowered, async_plan) = loop {
         let rewrite_scope = crate::profile::scope("lane.rewrite");
         if abi_applied {
             physical = crate::plan::physical::PhysicalPlan::of(
@@ -851,7 +886,10 @@ pub(crate) fn run(
     // The spill registers the plan needs are items like any other, and they have to be in the
     // table and reachable before a lowering that names them is checked against either.
     let spills = plan.spill_items();
-    let added_items = !spills.is_empty() || !repr.clones.is_empty() || !abi_clones.is_empty();
+    let mut added_items = !spills.is_empty() || !repr.clones.is_empty() || !abi_clones.is_empty();
+    if opts.optimizer == crate::opts::OptimizerMode::On {
+        added_items |= super::hoist_consts::run(table, &mut lowered, &mut defined, &mut live);
+    }
     for spill in spills {
         // Never `insert`: a register's name was allocated around every name the program already
         // spells (`plan::abi_flat::allocate_spill_names`), and overwriting an item that the
@@ -1290,6 +1328,16 @@ fn o_group(
     ctx: &Ctx<'_>,
     live: &BTreeSet<JsName>,
 ) -> OGroup {
+    o_group_with_mode(table, funcs, ctx, live, false)
+}
+
+fn o_group_with_mode(
+    table: &mut BTreeMap<JsName, LinkItem>,
+    funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
+    ctx: &Ctx<'_>,
+    live: &BTreeSet<JsName>,
+    allow_std_post_repr: bool,
+) -> OGroup {
     use crate::analysis::{callgraph, effects, summary_check};
     let mut group = OGroup::default();
     let run_inline = crate::opt::o_pass_enabled("inline");
@@ -1297,6 +1345,9 @@ fn o_group(
     let run_dce = crate::opt::o_pass_enabled("dce");
     if !(run_inline || run_devirt || run_dce) {
         return group;
+    }
+    if run_dce && !allow_std_post_repr {
+        crate::opt::prune_invoke::run(table, funcs, live);
     }
     let interns_map: BTreeMap<JsName, &crate::jir::Interns> = table
         .iter()
@@ -1313,40 +1364,66 @@ fn o_group(
     let inline_renames = crate::minify::item_renames(&program, &items);
 
     // One item priced through the real phase-C pipeline on a clone, exactly the solver's rule.
-    let measure = |name: &JsName, func: &Func| -> Option<u64> {
+    let measure_full = |name: &JsName, func: &Func| -> Option<(u64, BTreeSet<JsName>)> {
         let item = table.get(name)?;
         let input = lower_input(name, item, ctx, &[])?;
         crate::plan::cost::measure_inline_item(&input, func, &inline_renames)
-            .map(|(bytes, _)| bytes)
     };
 
     if run_inline {
         // The measured program: the +0.5% budget's denominator and the per-item entry sizes. A
         // func the probe cannot price contributes its baseline text bytes to the total only.
         let mut sizes: BTreeMap<JsName, u64> = BTreeMap::new();
+        let mut measured_refs: BTreeMap<JsName, BTreeSet<JsName>> = BTreeMap::new();
         let mut program: u64 = 0;
         for (name, func) in funcs.iter() {
-            match func.as_ref().ok().and_then(|func| measure(name, func)) {
-                Some(bytes) => {
+            match func.as_ref().ok().and_then(|func| measure_full(name, func)) {
+                Some((bytes, refs)) => {
                     sizes.insert(name.clone(), bytes);
+                    measured_refs.insert(name.clone(), refs);
                     program += bytes;
                 }
                 None => program += table.get(name).map_or(0, |item| item.js.len() as u64),
             }
         }
+        // Recompute live reachability and reference counts from post-O measured refs so the
+        // sole-referrer oracle does not stay anchored to stale pre-opt `item.refs`.
+        let effective_live: BTreeSet<JsName> = {
+            let mut reach = BTreeSet::new();
+            let mut work: Vec<JsName> = table
+                .iter()
+                .filter_map(|(name, item)| {
+                    (live.contains(name)
+                        && (item.linkage.root || ctx.opts.roots.iter().any(|r| r == name.as_str())))
+                    .then(|| name.clone())
+                })
+                .collect();
+            while let Some(cur) = work.pop() {
+                if !live.contains(&cur) || !reach.insert(cur.clone()) {
+                    continue;
+                }
+                if let Some(refs) = measured_refs.get(&cur) {
+                    work.extend(refs.iter().cloned());
+                } else if let Some(item) = table.get(&cur) {
+                    work.extend(item.refs.iter().cloned());
+                }
+            }
+            reach
+        };
         // The live reference counts: the single-caller criterion's oracle.
-        let mut referrers: BTreeMap<&JsName, (u32, Option<&JsName>)> = BTreeMap::new();
+        let mut referrers: BTreeMap<JsName, (u32, Option<JsName>)> = BTreeMap::new();
         for (name, item) in table.iter() {
-            if !live.contains(name) {
+            if !effective_live.contains(name) {
                 continue;
             }
-            for target in &item.refs {
+            let refs_set = measured_refs.get(name).unwrap_or(&item.refs);
+            for target in refs_set {
                 if target == name {
                     continue;
                 }
-                let entry = referrers.entry(target).or_insert((0, None));
+                let entry = referrers.entry(target.clone()).or_insert((0, None));
                 entry.0 += 1;
-                entry.1 = Some(name);
+                entry.1 = Some(name.clone());
             }
         }
         let sole = |callee: &JsName, caller: &JsName| -> bool {
@@ -1354,7 +1431,7 @@ fn o_group(
                 && !ctx.opts.roots.iter().any(|root| root == callee.as_str())
                 && referrers
                     .get(callee)
-                    .is_some_and(|(count, who)| *count == 1 && *who == Some(caller))
+                    .is_some_and(|(count, who)| *count == 1 && who.as_ref() == Some(caller))
         };
         let zombie_free =
             |name: &JsName| table.get(name).is_some_and(|item| item.zombies.is_empty());
@@ -1382,7 +1459,7 @@ fn o_group(
                 input.origins = metadata.origins.as_deref();
                 crate::plan::cost::measure_inline_item(&input, func, &inline_renames)
             };
-        group.inline = crate::opt::inline::run(
+        group.inline = crate::opt::inline::run_with_mode(
             funcs,
             &mut metadata,
             &graph,
@@ -1391,6 +1468,7 @@ fn o_group(
             &zombie_free,
             program,
             &sizes,
+            allow_std_post_repr,
         );
         let updates: Vec<_> = metadata
             .into_iter()
@@ -2511,7 +2589,7 @@ fn linkable<'a>(refs: &'a BTreeSet<JsName>, defined: &BTreeSet<JsName>) -> BTree
 
 /// Every free identifier `decl` mentions, its own name excluded: `JsItem::new`'s rule, which is
 /// what the baseline's `refs` was built with.
-fn refs_of(decl: &jsast::Stmt, name: &JsName) -> BTreeSet<JsName> {
+pub(super) fn refs_of(decl: &jsast::Stmt, name: &JsName) -> BTreeSet<JsName> {
     let mut refs = BTreeSet::new();
     jsast::visit_free_idents(decl, &mut |ident| {
         if ident != name.as_str() {

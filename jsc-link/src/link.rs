@@ -55,6 +55,7 @@ use crate::opts::{Lane, Modules};
 
 // `pub(crate)`: the representation planner (`plan/representation.rs`, W4b) fills the sidecar's
 // `ReprBlock`, which is defined beside the sidecar it is rendered into.
+mod hoist_consts;
 pub(crate) mod lane;
 /// The initialization order of module level bindings, and the two-step form of a cycle of statics.
 mod statics;

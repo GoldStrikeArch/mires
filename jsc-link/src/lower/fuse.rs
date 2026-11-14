@@ -153,15 +153,15 @@ pub fn plan(
     planner.collect_uses();
     // Materialize operands before the protected operation. Fusion must not move
     // an earlier effect or property read inside a different exception boundary.
-    if !func
-        .blocks
-        .iter()
-        .any(|block| matches!(block.term, RTerm::Invoke { .. }))
-    {
+    let has_invoke = func.has_invoke();
+    if !has_invoke {
         planner.decide_inline();
         planner.physicalize_slices();
     } else {
         planner.inline_adjacent_place_views();
+        if opts.optimizer == rcgjs_object::opts::OptimizerMode::On {
+            planner.decide_inline();
+        }
     }
     planner.pin_host_environments();
     planner.name();
@@ -1009,6 +1009,13 @@ impl<'a> Planner<'a> {
         {
             return false;
         }
+        if matches!(
+            self.func.blocks[block.0 as usize].term,
+            RTerm::Invoke { .. }
+        ) && index + 1 >= self.func.blocks[block.0 as usize].ops.len()
+        {
+            return false;
+        }
         let uses = &self.uses[result.0 as usize];
         if self.is_template_data(result, uses) {
             return true;
@@ -1017,6 +1024,14 @@ impl<'a> Planner<'a> {
             return false;
         };
         if use_.conditional {
+            return false;
+        }
+        // Keep operands of the protected operation (and edge copies) materialized before `try`.
+        if matches!(
+            self.func.blocks[use_.block.0 as usize].term,
+            RTerm::Invoke { .. }
+        ) && use_.position + 1 >= self.func.blocks[use_.block.0 as usize].ops.len()
+        {
             return false;
         }
         if self.requires_captured_operand(result, use_, purity) {
@@ -1880,5 +1895,186 @@ mod tests {
         assert!(commutes(Purity::Read, Purity::Read));
         assert!(!commutes(Purity::Read, Purity::Effect));
         assert!(!commutes(Purity::Effect, Purity::Effect));
+    }
+
+    #[test]
+    fn scoped_fusion_fuses_inside_invoke_function_without_crossing_boundary() {
+        use crate::jir::origin::OriginId;
+        use crate::jir::repr::FuncBuilder;
+        use crate::jir::semantic::{
+            AbiSignature, CallSemantic, Callee, ConstTree, DefinitionId, ItemId, Signature, TypeId,
+        };
+        use crate::jir::types::{
+            IntFacts, IntRepr, JsFacts, LayoutFacts, TypeDescriptor, TypeKind, TypeMeta,
+        };
+
+        let mut table = TypeTable::default();
+        let u32_ty = TypeId(0);
+        table.insert(TypeDescriptor {
+            id: u32_ty,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: Some(IntFacts {
+                    signed: false,
+                    bits: 32,
+                    repr: IntRepr::Number,
+                }),
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: u32_ty,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+        let mut interns = Interns::new();
+        let target_str = interns.intern_str("helper_fn");
+        let sig = Signature {
+            arguments: Vec::new(),
+            result: u32_ty,
+            abi: AbiSignature::default(),
+        };
+        let item_1 = ItemId {
+            definition: DefinitionId {
+                crate_id: 0,
+                local_hash: 1,
+            },
+            instantiation: 0,
+        };
+        let item_2 = ItemId {
+            definition: DefinitionId {
+                crate_id: 0,
+                local_hash: 2,
+            },
+            instantiation: 0,
+        };
+        let o = OriginId(0);
+        let mut b = FuncBuilder::new(item_1, sig);
+        let b0 = FuncBuilder::ENTRY;
+        let b_norm = b.block();
+        let b_unw = b.block();
+
+        let v_before = b.op(
+            b0,
+            OpKind::Const(ConstTree::Scalar { bits: 7, bytes: 4 }),
+            u32_ty,
+            o,
+        );
+        let v_arg = b.op(
+            b0,
+            OpKind::Unary {
+                op: UnaryOp::Neg,
+                v: v_before,
+                ty: u32_ty,
+            },
+            u32_ty,
+            o,
+        );
+        let v_live_across = b.op(
+            b0,
+            OpKind::Const(ConstTree::Scalar { bits: 10, bytes: 4 }),
+            u32_ty,
+            o,
+        );
+        let v_call_res = b.op(
+            b0,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_2,
+                    link_name: target_str,
+                },
+                function: None,
+                args: vec![v_arg],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            u32_ty,
+            o,
+        );
+        b.terminate(
+            b0,
+            RTerm::Invoke {
+                normal: (b_norm, Vec::new()),
+                unwind: (b_unw, Vec::new()),
+            },
+        );
+        let v_after = b.op(
+            b_norm,
+            OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+            u32_ty,
+            o,
+        );
+        let v_tmp = b.op(
+            b_norm,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: v_call_res,
+                r: v_after,
+                ty: u32_ty,
+            },
+            u32_ty,
+            o,
+        );
+        let v_ret = b.op(
+            b_norm,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: v_tmp,
+                r: v_live_across,
+                ty: u32_ty,
+            },
+            u32_ty,
+            o,
+        );
+        b.terminate(b_norm, RTerm::Return(Some(v_ret)));
+        b.terminate(b_unw, RTerm::Throw(None));
+
+        let func = b.finish();
+        let off_plan = plan(&func, None, &table, &interns, &Opts::default());
+        assert!(
+            off_plan.inline.is_empty(),
+            "OptimizerMode::Off must leave Invoke functions un-fused (except adjacent place views)"
+        );
+
+        let on_opts = Opts {
+            optimizer: rcgjs_object::opts::OptimizerMode::On,
+            ..Opts::default()
+        };
+        let p = plan(&func, None, &table, &interns, &on_opts);
+        assert!(
+            p.inline.contains(&v_before),
+            "pure expression before protected op should fuse"
+        );
+        assert!(
+            !p.inline.contains(&v_arg),
+            "operand of protected Invoke call must stay materialized outside try"
+        );
+        assert!(
+            !p.inline.contains(&v_live_across),
+            "value live across Invoke must not fuse into normal continuation"
+        );
+        assert!(
+            !p.inline.contains(&v_call_res),
+            "protected Invoke call result must not be fused"
+        );
+        assert!(
+            p.inline.contains(&v_after),
+            "pure expression in non-Invoke block inside Invoke function should fuse"
+        );
     }
 }

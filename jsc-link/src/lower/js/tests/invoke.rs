@@ -244,16 +244,82 @@ fn check_emission(
                         .unwrap();
                     let func = &optimized;
                     let plan = crate::lower::fuse::plan(func, None, &interns.types, interns, &opts);
-                    assert!(plan
-                        .inline
-                        .iter()
-                        .all(|value| func.blocks.iter().any(|block| block.ops.iter().any(
-                            |op| op.result == Some(*value)
-                                && matches!(
-                                    op.kind,
-                                    OpKind::BorrowView { .. } | OpKind::RawView { .. }
-                                )
-                        ))));
+                    if mode != OptimizerMode::On {
+                        assert!(plan
+                            .inline
+                            .iter()
+                            .all(|value| func.blocks.iter().any(|block| {
+                                block.ops.iter().any(|op| {
+                                    op.result == Some(*value)
+                                        && matches!(
+                                            op.kind,
+                                            OpKind::BorrowView { .. } | OpKind::RawView { .. }
+                                        )
+                                })
+                            })));
+                    } else {
+                        for &value in &plan.inline {
+                            let (def_block, def_pos) = func
+                                .blocks
+                                .iter()
+                                .enumerate()
+                                .find_map(|(bi, block)| {
+                                    block
+                                        .ops
+                                        .iter()
+                                        .position(|op| op.result == Some(value))
+                                        .map(|oi| (bi, oi))
+                                })
+                                .expect("inlined value must be defined by an op in a single block");
+                            for (bi, block) in func.blocks.iter().enumerate() {
+                                if let crate::jir::repr::RTerm::Invoke { normal, unwind } =
+                                    &block.term
+                                {
+                                    assert!(
+                                        !normal.1.contains(&value) && !unwind.1.contains(&value),
+                                        "inlined value {value:?} must not be used on Invoke edge"
+                                    );
+                                }
+                                for (oi, op) in block.ops.iter().enumerate() {
+                                    if !op.kind.uses().contains(&value) {
+                                        continue;
+                                    }
+                                    assert_eq!(
+                                        bi, def_block,
+                                        "inlined value {value:?} in Invoke fn must stay block-local and not cross Invoke boundary"
+                                    );
+                                    if matches!(block.term, crate::jir::repr::RTerm::Invoke { .. })
+                                    {
+                                        let is_last = oi + 1 == block.ops.len();
+                                        let is_throwing = matches!(
+                                            op.kind,
+                                            OpKind::Call { .. }
+                                                | OpKind::Intrinsic { .. }
+                                                | OpKind::Host { .. }
+                                                | OpKind::Drop { .. }
+                                        );
+                                        assert!(
+                                            !(is_last && is_throwing),
+                                            "inlined value {value:?} must not be consumed by protected Invoke op"
+                                        );
+                                    }
+                                    for between in &block.ops[def_pos + 1..oi] {
+                                        assert!(
+                                            !matches!(
+                                                between.kind,
+                                                OpKind::Call { .. }
+                                                    | OpKind::Intrinsic { .. }
+                                                    | OpKind::Host { .. }
+                                                    | OpKind::Drop { .. }
+                                                    | OpKind::Assert { .. }
+                                            ),
+                                            "inlined value {value:?} must not cross a throwing op"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                     for name in plan
                         .invoke_names
                         .values()

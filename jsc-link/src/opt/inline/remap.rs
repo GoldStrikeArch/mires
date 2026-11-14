@@ -60,10 +60,19 @@ impl Metadata<'_> {
                 if caller.origins.len().saturating_add(callee.origins.len()) > 65536 {
                     return Err("inline.origin-budget");
                 }
+                let caller_orig_len = caller.origins.len();
                 let map = |id: OriginId| -> Res<OriginId> {
-                    ((id.0 as usize) < callee.origins.len())
-                        .then_some(OriginId(offset + id.0))
-                        .ok_or("inline.origin-invalid")
+                    if (id.0 as usize) < callee.origins.len() {
+                        Ok(OriginId(offset + id.0))
+                    } else if (call.0 as usize) < caller_orig_len {
+                        Ok(call)
+                    } else if caller_orig_len > 0 {
+                        Ok(OriginId(0))
+                    } else if id.0 == u32::MAX {
+                        Ok(id)
+                    } else {
+                        Err("inline.origin-invalid")
+                    }
                 };
                 for origin in &callee.origins {
                     let mut origin: Origin = origin.clone();
