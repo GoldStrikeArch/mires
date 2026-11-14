@@ -17,6 +17,12 @@
 //! the guards disabled prints `true` here). `hash64` is exported and holds the program's other
 //! 64-bit constants; with `BigInt` it runs last.
 //!
+//! `275_bigint_absent_engine.late_bigint` runs it once more: `BigInt` deleted before the program
+//! loads, then `globalThis.BigInt = Number` defined before `rust_entry` runs, a stand-in whose
+//! zero-argument call returns. A guarded read must still throw there rather than yield anything:
+//! the program stops at the same line. (The unmodified linker has no guards and computes with the
+//! stand-in, printing `false`; the guard that returned `BigInt()` printed `true`.)
+//!
 //! The expectations were validated by transplanting this file onto `std` and running it at `-O3`
 //! and `-C opt-level=0`, which agree.
 

@@ -33,12 +33,21 @@
 //! * nothing calls `BigInt` while the program loads. `<ok>` is `typeof BigInt==="function"`, and a
 //!   binding is `<ok>&&BigInt("<digits>")`, so without `BigInt` every binding holds `false`;
 //! * no function reads a binding that holds `false`. The first constant an activation can evaluate
-//!   on each path is spelled `(<ok>?<name>:<no>())`, and `<no>` is `function(){return BigInt()}`,
-//!   which throws the same `ReferenceError` the inline `BigInt("…")` threw, at the same point in
-//!   the evaluation (anywhere else `BigInt()` throws a `TypeError`: it never returns). A constant
+//!   on each path is spelled `(<ok>?<name>:<no>())`, and `<no>` is `function(){throw BigInt()}`,
+//!   which never returns. On an engine without `BigInt` it throws the `ReferenceError: BigInt is
+//!   not defined` the inline `BigInt("…")` threw, at the same point in the evaluation. A constant
 //!   that every path reaches only after a guard was evaluated is spelled bare, because a guard that
 //!   did not throw means `<ok>` is true and every binding holds its value ([`hoist`] tracks this
 //!   in evaluation order, conservatively).
+//!
+//! `<ok>` is read once, while the program loads, so what the host does to `BigInt` afterwards does
+//! not bring the constants back. A program that loaded without a `BigInt` function keeps every
+//! binding at `false`, and every guarded read keeps throwing: `BigInt()` is called each time, and
+//! it either throws (`ReferenceError` while `BigInt` is still missing, `TypeError` from a real
+//! `BigInt` or from a global that is not a function) or returns, and then `<no>` throws the value
+//! it returned (`globalThis.BigInt = Number` makes every guarded read throw `0`). No guarded read
+//! of such a program yields a value. A program that loaded with `BigInt` keeps the values it
+//! computed then, whatever `BigInt` becomes.
 //!
 //! In a loop the guard is the first constant of the body, once per iteration: the block loop of
 //! the `murmur3` kernel reads constants eight times per iteration and guards the first read.
@@ -71,12 +80,12 @@
 //! `BigInt("…")` runs: once, while the module initializes, instead of at each use. That is
 //! observable only by a program that replaces `globalThis.BigInt` after this module was evaluated
 //! (the hoisted value is the original `BigInt`'s; one that defines `BigInt` only later finds every
-//! guard throwing), or one that calls a function using a constant while module initialization has
-//! not yet reached the constant's declaration (a temporal dead zone `ReferenceError`). Neither
-//! happens here: the program and the shim never assign `BigInt`, and module evaluation runs
-//! binding initializers only, which are literals that call no program function and name no
-//! constant; every function runs after the module (and, split, every module of its chunk graph)
-//! has evaluated.
+//! guard throwing, see "Engines without `BigInt`"), or one that calls a function using a constant
+//! while module initialization has not yet reached the constant's declaration (a temporal dead
+//! zone `ReferenceError`). Neither happens here: the program and the shim never assign `BigInt`,
+//! and module evaluation runs binding initializers only, which are literals that call no program
+//! function and name no constant; every function runs after the module (and, split, every module
+//! of its chunk graph) has evaluated.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -142,9 +151,10 @@ impl BigIntNames {
         format!("{}ok", self.prefix)
     }
 
-    /// The function a guarded use calls when [`BigIntNames::ok`] is false: `function <no>(){return
-    /// BigInt()}`, which always throws — the `ReferenceError` a `BigInt("…")` call throws on an
-    /// engine without `BigInt`, or the `TypeError` `BigInt()` throws anywhere else.
+    /// The function a guarded use calls when [`BigIntNames::ok`] is false: `function <no>(){throw
+    /// BigInt()}`, which never returns: it throws the `ReferenceError` a `BigInt("…")` call throws
+    /// on an engine without `BigInt`, whatever `BigInt()` throws where a `BigInt` exists, and the
+    /// value `BigInt()` returned where a stand-in defined after load returns one.
     pub fn no(&self) -> String {
         format!("{}no", self.prefix)
     }
@@ -178,10 +188,7 @@ impl BigIntNames {
             jsast::unary(UnOp::TypeOf, jsast::id("BigInt")),
             jsast::string("function"),
         );
-        let throws = vec![Stmt::Return(Some(jsast::call(
-            jsast::id("BigInt"),
-            Vec::new(),
-        )))];
+        let throws = vec![Stmt::Throw(jsast::call(jsast::id("BigInt"), Vec::new()))];
         [
             link_item(
                 &ok,
@@ -687,7 +694,7 @@ mod tests {
         assert!(
             no.js
                 .trim_end()
-                .ends_with("function $BI_no() {\n  return BigInt();\n}"),
+                .ends_with("function $BI_no() {\n  throw BigInt();\n}"),
             "{}",
             no.js
         );

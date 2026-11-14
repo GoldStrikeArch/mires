@@ -52,12 +52,17 @@
 #                   A clean exit is a failure. (core suite only)
 #   NN.no_bigint    the program runs a second time on an engine without `BigInt`:
 #                   the global is deleted before anything loads. Its stdout must be
-#                   this file's lines up to an optional last line `-- throws <text>`;
-#                   with that line the run must exit non-zero with <text> in its
-#                   stderr, without it the run must exit 0. Only for ES2018 output
-#                   (`js-ecma-target=2018`, what the release profiles select): an
-#                   engine without `BigInt` cannot parse the `123n` the default
-#                   target prints. (core suite only)
+#                   this file's lines up to an optional last line `-- throws [<text>]`;
+#                   with that line the run must exit non-zero, with <text> in its
+#                   stderr when a text is given; without it the run must exit 0.
+#                   Only for ES2018 output (`js-ecma-target=2018`, what the release
+#                   profiles select): an engine without `BigInt` cannot parse the
+#                   `123n` the default target prints. (core suite only)
+#   NN.late_bigint  the same, except that after the program has loaded and before
+#                   its entry runs the host defines `globalThis.BigInt = Number`, a
+#                   stand-in whose zero-argument call returns instead of throwing.
+#                   Script mode only: an ES module program and its entry load as one
+#                   module graph, with no point in between. (core suite only)
 #
 # With `JS_EXTRA_ARGS='js-modules=esm'` every program is an ES module, so it runs
 # through scripts/run-esm.sh instead of the concatenation above: the shim is
@@ -155,29 +160,43 @@ for arg in ${JS_EXTRA_ARGS:-}; do
 	esac
 done
 
-# check_without_bigint <program.js> <name> <NN.no_bigint> <log prefix>: runs a compiled program on
-# an engine without `BigInt` (the global deleted by a module node imports before anything else)
-# and holds it to NN.no_bigint, as the header describes. Prints what differs; fails if anything does.
+# check_without_bigint <program.js> <name> <NN.no_bigint|NN.late_bigint> <log prefix> [late]:
+# runs a compiled program on an engine without `BigInt` (the global deleted by a module node
+# imports before anything else) and holds it to the file, as the header describes; with `late`,
+# `globalThis.BigInt = Number` is defined between the program and its entry. Prints what differs;
+# fails if anything does.
 check_without_bigint() {
-	local expected=$3 log=$4 status want throws
-	NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--import=data:text/javascript,delete%20globalThis.BigInt" \
-		run_program "$1" "$2-no-bigint" "$log.actual" "$log.stderr"
+	local expected=$3 log=$4 late=${5:-} status fails=0 throws="" what="without BigInt"
+	local options="${NODE_OPTIONS:+$NODE_OPTIONS }--import=data:text/javascript,delete%20globalThis.BigInt"
+	if [ -n "$late" ]; then
+		what="without BigInt at load, BigInt = Number after"
+		{
+			cat "$shim" "$1"
+			printf '\nglobalThis.BigInt = Number;\n'
+			cat "$entry"
+		} | NODE_OPTIONS="$options" node - >"$log.actual" 2>"$log.stderr"
+	else
+		NODE_OPTIONS="$options" run_program "$1" "$2-no-bigint" "$log.actual" "$log.stderr"
+	fi
 	status=$?
-	throws=$(sed -n '$s/^-- throws //p' "$expected")
-	grep -v '^-- throws ' "$expected" >"$log.expected"
+	if tail -n 1 "$expected" | grep -q '^-- throws'; then
+		fails=1
+		throws=$(tail -n 1 "$expected" | sed 's/^-- throws *//')
+	fi
+	grep -v '^-- throws' "$expected" >"$log.expected"
 	if ! diff -u "$log.expected" "$log.actual" >"$log.diff"; then
-		echo "    without BigInt, output mismatch (- expected, + actual):"
+		echo "    $what, output mismatch (- expected, + actual):"
 		sed 's/^/    /' "$log.diff"
 		return 1
 	fi
-	if [ -n "$throws" ]; then
-		if [ "$status" -eq 0 ] || ! grep -qF -- "$throws" "$log.stderr"; then
-			echo "    without BigInt, expected a failure saying \"$throws\" (exit $status):"
+	if [ "$fails" -eq 1 ]; then
+		if [ "$status" -eq 0 ] || { [ -n "$throws" ] && ! grep -qF -- "$throws" "$log.stderr"; }; then
+			echo "    $what, expected a failure${throws:+ saying \"$throws\"} (exit $status):"
 			sed 's/^/    /' "$log.stderr"
 			return 1
 		fi
 	elif [ "$status" -ne 0 ]; then
-		echo "    without BigInt, runtime error:"
+		echo "    $what, runtime error:"
 		sed 's/^/    /' "$log.stderr"
 		return 1
 	fi
@@ -591,6 +610,11 @@ for src in $core_sources; do
 	if [ "$ecma_target" = 2018 ] && [ -f "$core_dir/$name.no_bigint" ] &&
 		! check_without_bigint "$out" "core-$name" "$core_dir/$name.no_bigint" "$log_dir/$name.no_bigint"; then
 		record "core/$name" FAIL without-bigint
+		continue
+	fi
+	if [ "$ecma_target" = 2018 ] && [ "$esm" -eq 0 ] && [ -f "$core_dir/$name.late_bigint" ] &&
+		! check_without_bigint "$out" "core-$name" "$core_dir/$name.late_bigint" "$log_dir/$name.late_bigint" late; then
+		record "core/$name" FAIL late-bigint
 		continue
 	fi
 
