@@ -58,7 +58,7 @@ use crate::jir::repr::{
 use crate::jir::semantic::{
     AggregateKind, AssertMessage, BlockId, Body, BodyKind, BorrowKind, Call, Callee, CastKind,
     ConstTree, Constant, HostPayload, LocalId, LocalRole, Operand, OperandKind, Place, Projection,
-    Rvalue, StatementKind, Terminator, TypeId, Unwind,
+    Rvalue, StatementKind, TerminateReason, Terminator, TypeId, Unwind,
 };
 use crate::jir::types::{EnumRepr, NominalForm, TypeKind, TypeTable};
 
@@ -1915,13 +1915,22 @@ impl<'a> Builder<'a> {
             }
             Terminator::Unreachable => TermShape::Unreachable,
             Terminator::UnwindResume => TermShape::Throw,
-            Terminator::UnwindTerminate(_) if !self.normal_sources.is_empty() => {
+            // An unwind leaving a function that cannot unwind: under `-Cpanic=unwind` rustc ends
+            // the cleanup path of an `extern "C" fn` this way where a Rust one ends in
+            // `UnwindResume`. A Rust panic is already an abort that every handler rethrows without
+            // running cleanup (`__rt.is_abort`), so what reaches this block is a host exception,
+            // and the contract is that it leaves the function with its identity once the drops
+            // have run: the same rethrow of the caught exception as `UnwindResume`.
+            Terminator::UnwindTerminate(TerminateReason::Abi) => TermShape::Throw,
+            Terminator::UnwindTerminate(TerminateReason::InCleanup)
+                if !self.normal_sources.is_empty() =>
+            {
                 return Err(decline(
                     OpClass::Terminator,
                     "exception termination requires a separate abort boundary",
                 ));
             }
-            Terminator::UnwindTerminate(_) => TermShape::Throw,
+            Terminator::UnwindTerminate(TerminateReason::InCleanup) => TermShape::Throw,
             Terminator::Call(call) => self.call(call)?,
             Terminator::Drop {
                 place,

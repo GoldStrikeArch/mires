@@ -1118,7 +1118,7 @@ console.log(checks);
 }
 
 #[test]
-fn synthetic_success_writes_retain_the_call_origin_and_termination_declines() {
+fn synthetic_success_writes_retain_the_call_origin_and_in_cleanup_termination_declines() {
     use rcgjs_object::jir::origin::{Origin, OriginId, OriginKind, OriginTable};
     use rcgjs_object::jir::semantic::{TerminateReason, Terminator};
     let mut interns = world();
@@ -1151,6 +1151,8 @@ fn synthetic_success_writes_retain_the_call_origin_and_termination_declines() {
         .iter()
         .any(|op| matches!(op.kind, OpKind::CellStore { .. })));
     assert!(operations.iter().all(|op| op.origin == OriginId(2)));
+    let resumed = crate::lower::ssa::build(&body, None, &interns.types, &interns).unwrap();
+    // A terminate inside cleanup still declines: it needs an abort boundary of its own.
     body.blocks[7].terminator = Terminator::UnwindTerminate(TerminateReason::InCleanup);
     assert!(
         crate::lower::ssa::build(&body, None, &interns.types, &interns)
@@ -1158,4 +1160,38 @@ fn synthetic_success_writes_retain_the_call_origin_and_termination_declines() {
             .to_string()
             .contains("separate abort boundary")
     );
+    // The `Abi` reason ends the cleanup path of an `extern "C" fn` under `-Cpanic=unwind`. What
+    // reaches it is a host exception (a Rust panic is an abort every handler rethrows), and it
+    // leaves with its identity once the drops ran: the same lowering as `UnwindResume`.
+    body.blocks[7].terminator = Terminator::UnwindTerminate(TerminateReason::Abi);
+    body.verify(&interns.types, &interns).unwrap();
+    let terminated = crate::lower::ssa::build(&body, None, &interns.types, &interns).unwrap();
+    terminated.verify(&interns.types).unwrap();
+    assert_eq!(terminated, resumed);
+    let harness = r#"
+const assert = require('node:assert/strict');
+let abort; try { __rt.js_abort('abort'); } catch (error) { abort = error; }
+let trace, thrown, failAt;
+function step(index, value) {
+  trace.push(['step', index, value]); if (index === failAt) throw thrown; return value + index;
+}
+function cleanup(index, value) { trace.push(['cleanup', index, value]); }
+function outer() { trace.push('outer'); }
+let checks = 0;
+for (thrown of [undefined, null, {}, Symbol('error'), new Error('error'), abort]) for (failAt of [0, 1, 2, 3]) {
+  trace = []; let value, caught = false;
+  try { value = entry(false, {buf: [7], off: 0}); } catch (error) { value = error; caught = true; }
+  const fails = failAt !== 0;
+  assert.equal(caught, fails);
+  assert.ok(Object.is(value, fails ? thrown : 13));
+  const expected = []; let old = 7;
+  for (let n = 1; n <= (fails ? failAt : 3); n++) {
+    expected.push(['step', n, old]); if (!fails || n !== failAt) old += n;
+  }
+  if (fails && thrown !== abort) expected.push(['cleanup', failAt, old], 'outer');
+  assert.deepEqual(trace, expected); checks++;
+}
+console.log(checks);
+"#;
+    check_emission(&interns, &body, &terminated, harness, 24, "terminate-abi");
 }
