@@ -289,8 +289,11 @@ fn requires_cleanup_lowering<'tcx>(
 /// * such a callee inlined by rustc's MIR inliner, which leaves its `UnwindTerminate(Abi)` edges
 ///   inside this body, where the cleanup of this frame is gone the same way.
 ///
-/// Declared `extern "C-unwind"` the call keeps its edge, which is the fix every message names. A
-/// Rust callee whose body has no such edge cannot let anything out and is accepted.
+/// Either is refused only where this frame holds a value with drop glue across it
+/// ([`HeldDrops`]): with nothing to drop the exception passes this frame as it would with the
+/// edge, and the next frame up decides for itself. Declared `extern "C-unwind"` the call keeps its
+/// edge, which is the fix every message names. A Rust callee whose body has no such edge cannot
+/// let anything out and is accepted.
 ///
 /// The sysroot's own crates are not checked where the sysroot build compiles them
 /// ([`is_sysroot_build`]): they call no host function (the imports they declare are the runtime's,
@@ -309,17 +312,19 @@ fn reject_unwind_crossing_calls<'tcx>(
         return;
     }
     let body = tcx.instance_mir(instance.def);
+    let mut held = HeldDrops::new(tcx, instance, body);
     let fix = "Declare it `extern \"C-unwind\"`.";
     let consequence =
         "under -Cpanic=unwind (JSC_PANIC=unwind) rustc gives the call no cleanup, so \
                        a host exception thrown behind it would skip this function's destructors";
     // rustc deduplicates an identical diagnostic, so each instance of a generic reports once.
-    for block in body.basic_blocks.iter() {
-        let terminator = block.terminator();
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        let terminator = data.terminator();
         let span = terminator.source_info.span;
         if ends_in_abi_terminate(&terminator.kind) {
             if let Some((callee, call)) =
                 inlined_nounwind_frame(tcx, body, terminator.source_info.scope)
+                    .filter(|_| held.across(block))
             {
                 let abi = callee.ty(tcx, crate::value::typing_env()).fn_sig(tcx).abi();
                 tcx.dcx()
@@ -348,7 +353,7 @@ fn reject_unwind_crossing_calls<'tcx>(
             ty::EarlyBinder::bind(tcx, func.ty(body, tcx)),
         );
         let abi = callee_ty.fn_sig(tcx).abi();
-        if fn_can_unwind(tcx, None, abi) {
+        if fn_can_unwind(tcx, None, abi) || !held.across(block) {
             continue;
         }
         let abi = abi.as_str();
@@ -422,6 +427,109 @@ fn reject_unwind_crossing_calls<'tcx>(
             )
             .with_span_note(tcx.def_span(callee), "the function is defined here")
             .emit();
+    }
+}
+
+/// Which values a frame holds across a call, asked only where a refusal is in question.
+///
+/// A value is held across the call ending `block` when its type has drop glue and it is used after
+/// the call returns (dropped, moved or read: maybe-live at the call's return block), other than the
+/// call's own destination, which is not yet written while the call runs. A terminator with no
+/// block to return to (a call that does not return, or `UnwindTerminate` ending a cleanup path)
+/// gives no such answer, so there every local of such a type whose storage is live counts.
+struct HeldDrops<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    instance: rustc_middle::ty::Instance<'tcx>,
+    body: &'a rustc_middle::mir::Body<'tcx>,
+    /// Per local, whether its type has drop glue.
+    droppable: Option<Vec<bool>>,
+    live: Option<
+        rustc_mir_dataflow::ResultsCursor<'a, 'tcx, rustc_mir_dataflow::impls::MaybeLiveLocals>,
+    >,
+    storage: Option<
+        rustc_mir_dataflow::ResultsCursor<
+            'a,
+            'tcx,
+            rustc_mir_dataflow::impls::MaybeStorageLive<'a>,
+        >,
+    >,
+}
+
+impl<'a, 'tcx> HeldDrops<'a, 'tcx> {
+    fn new(
+        tcx: TyCtxt<'tcx>,
+        instance: rustc_middle::ty::Instance<'tcx>,
+        body: &'a rustc_middle::mir::Body<'tcx>,
+    ) -> Self {
+        Self {
+            tcx,
+            instance,
+            body,
+            droppable: None,
+            live: None,
+            storage: None,
+        }
+    }
+
+    fn across(&mut self, block: rustc_middle::mir::BasicBlock) -> bool {
+        use rustc_middle::mir::TerminatorKind;
+        use rustc_mir_dataflow::impls::{
+            always_storage_live_locals, MaybeLiveLocals, MaybeStorageLive,
+        };
+        use rustc_mir_dataflow::Analysis;
+        let (tcx, instance, body) = (self.tcx, self.instance, self.body);
+        let droppable = self.droppable.get_or_insert_with(|| {
+            body.local_decls
+                .iter()
+                .map(|decl| {
+                    instance
+                        .instantiate_mir_and_normalize_erasing_regions(
+                            tcx,
+                            crate::value::typing_env(),
+                            rustc_middle::ty::EarlyBinder::bind(tcx, decl.ty),
+                        )
+                        .needs_drop(tcx, crate::value::typing_env())
+                })
+                .collect()
+        });
+        if !droppable.contains(&true) {
+            return false;
+        }
+        let terminator = body.basic_blocks[block].terminator();
+        let returns_to = match &terminator.kind {
+            TerminatorKind::Call {
+                target: Some(target),
+                destination,
+                ..
+            } => Some((*target, Some(destination.local))),
+            TerminatorKind::Drop { target, .. } => Some((*target, None)),
+            _ => None,
+        };
+        match returns_to {
+            Some((target, destination)) => {
+                let live = self.live.get_or_insert_with(|| {
+                    MaybeLiveLocals
+                        .iterate_to_fixpoint(tcx, body, None)
+                        .into_results_cursor(body)
+                });
+                live.seek_to_block_start(target);
+                live.get()
+                    .iter()
+                    .any(|local| droppable[local.as_usize()] && Some(local) != destination)
+            }
+            None => {
+                let storage = self.storage.get_or_insert_with(|| {
+                    MaybeStorageLive::new(std::borrow::Cow::Owned(always_storage_live_locals(body)))
+                        .iterate_to_fixpoint(tcx, body, None)
+                        .into_results_cursor(body)
+                });
+                storage.seek_to_block_end(block);
+                storage
+                    .get()
+                    .iter()
+                    .any(|local| droppable[local.as_usize()])
+            }
+        }
     }
 }
 
