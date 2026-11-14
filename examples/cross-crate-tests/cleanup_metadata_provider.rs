@@ -11,7 +11,7 @@
 
 #![no_std]
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     fn js_log_f64(value: f64);
 }
 

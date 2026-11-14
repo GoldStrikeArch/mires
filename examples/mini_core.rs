@@ -551,7 +551,7 @@ pub trait Fn<Args: Tuple>: FnMut<Args> {
 // ---------------------------------------------------------------------------
 
 #[allow(improper_ctypes)]
-extern "C" {
+extern "C-unwind" {
     fn js_log_i32(x: i32);
     fn js_log_i64(x: i64);
     fn js_log_f64(x: f64);

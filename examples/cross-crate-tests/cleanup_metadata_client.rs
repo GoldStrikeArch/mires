@@ -7,7 +7,7 @@
 
 extern crate alloc;
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     fn host_throw();
 }
 

@@ -8,7 +8,7 @@
 mod prelude;
 use prelude::*;
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     fn host_throw();
 }
 

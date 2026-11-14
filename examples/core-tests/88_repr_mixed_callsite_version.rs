@@ -17,7 +17,7 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     fn js_log_f64(x: f64);
     fn js_log_str(s: &str);
     fn js_abort(msg: &str) -> !;

@@ -3,7 +3,7 @@
 
 #![no_std]
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     fn host_throw();
 }
 

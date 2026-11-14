@@ -11,7 +11,7 @@ use prelude::*;
 
 use alloc::boxed::Box;
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     fn host_throw();
 }
 

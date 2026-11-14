@@ -19,7 +19,7 @@
 
 #![allow(dead_code)]
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     pub fn js_log_i32(x: i32);
     pub fn js_log_i64(x: i64);
     pub fn js_log_f64(x: f64);
@@ -91,7 +91,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 // The handle is a `usize` index into a table the shim keeps, so the whole
 // surface is `extern "C"`-shaped. See `CONTRACT.md`, "Allocation".
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     pub fn sb_new() -> usize;
     pub fn sb_push(handle: usize, s: &str);
     pub fn sb_push_char(handle: usize, c: char);
