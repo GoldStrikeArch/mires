@@ -26,3 +26,28 @@ sha2 = "0.10.9"
 # entry point can `#[allow]` it at the smallest scope.
 [workspace.lints.rust]
 unsafe_code = "deny"
+
+# Dev builds optimise third-party code: the fixture-corpus tests spend a large share of their
+# time in it (miniz_oxide inflate, object, postcard, serde_json; brotli and flate2 in the
+# planner), and opt-level 2 runs them as fast as 3. Workspace members stay at opt-level 0,
+# and so do the proc macros and everything under them: a package's profile is part of the
+# identity of everything built on it, and the scripts hand rustc
+# `target/debug/libjs_extern_macro.dylib` and `libjs_macro.dylib`, which must not change.
+# `"*"` outranks `build-override`, hence the list: the registry packages that
+# `cargo tree -e normal,build -p <macro>` prints for js-extern-macro, js-macro, serde_derive
+# and thiserror-impl. Only `dev` is touched: the release backend dylib keys every sysroot.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.proc-macro2]
+opt-level = 0
+[profile.dev.package.quote]
+opt-level = 0
+[profile.dev.package.syn]
+opt-level = 0
+[profile.dev.package.unicode-ident]
+opt-level = 0
+[profile.dev.package.serde_derive]
+opt-level = 0
+[profile.dev.package.thiserror-impl]
+opt-level = 0
