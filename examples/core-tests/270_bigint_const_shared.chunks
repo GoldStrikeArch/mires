@@ -1,0 +1,3 @@
+# Each line is one split build; every build runs chunk_a then chunk_b.
+a:chunk_a b:chunk_b
+b:chunk_b a:chunk_a
