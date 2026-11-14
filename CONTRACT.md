@@ -239,12 +239,18 @@ Cleanup-enabled libraries carry a versioned, checksummed executable MIR member w
 In the unwind mode:
 
 * **A Rust panic is still an abort.** The `#[panic_handler]` runs, and every handler rethrows an abort without running cleanup (`__rt.is_abort`), exactly as under `-Cpanic=abort`; only a host exception unwinds. `catch_unwind` stays unsupported: the intrinsic is a zombie under any strategy but `abort`.
-* **Foreign imports must be `extern "C-unwind"`.** rustc removes the cleanup edge of a call whose ABI cannot unwind, so a host exception behind an `extern "C"` import would skip its callers' destructors. The backend rejects every call to such an import where it is compiled, with ``rustc_codegen_js: `name` is a foreign import with the "C" ABI, which cannot unwind: … Declare it `extern "C-unwind"`.`` and a note at the declaration (`examples/unwind-tests/290_extern_c_import_rejected.rs`); it is a compile-time error rather than a zombie because the JIR lane replaces an item's zombies with its lowering's. The imports of the sysroot's own crates (`core`, `alloc`, `compiler_builtins`) are the runtime's and exempt. `#[js_extern]` and `js_bindings!` expand to ordinary Rust functions, so their declarations are unaffected; `mires-js`, `view-abi` and the fixture preludes declare theirs `"C-unwind"`, which changes nothing under `-Cpanic=abort` (rustc gives the call `unwind unreachable` either way).
-* **An exported `extern "C" fn` rethrows.** Its cleanup path ends in `UnwindTerminate(Abi)`, which the JIR lowering emits as the same rethrow as `UnwindResume` once the drops have run (`UnwindTerminate(InCleanup)` still declines in a body with protected calls). The lowering is the same in both modes.
+* **Every call a host exception could cross keeps its cleanup, or the program is refused.** rustc removes the cleanup edge of any call whose callee's ABI cannot unwind (rustc's own `fn_can_unwind`: `"C"`, `"system"`, `"cdecl"`, `"unadjusted"` and every other ABI except the `-unwind` spellings and Rust's own), so the destructors a function holds across such a call are gone from its MIR. The backend refuses, where the call is compiled, each such call that may let a host exception through, and every message names the fix, `extern "C-unwind"`:
+  * a call to a foreign import, with ``rustc_codegen_js: `name` is a foreign import with the "C" ABI, which cannot unwind: … Declare it `extern "C-unwind"`.`` and a note at the declaration (`examples/unwind-tests/290_extern_c_import_rejected.rs`, `296_cdecl_import_rejected.rs`);
+  * a call through a function pointer of such an ABI, or of a `dyn` method declared with one (`295_extern_c_fn_pointer_and_dyn.rs`, `297_extern_c_import_through_pointer.rs`);
+  * a call to a Rust function with such an ABI whose body ends a cleanup path in `UnwindTerminate(Abi)` (it calls something that can unwind, and the lowering below rethrows there), or whose body is not available where the call is compiled, as a dependency's non-generic function's is not (`293_extern_c_fn_called_from_rust.rs`, `299_extern_c_fn_of_dependency.rs`);
+  * such a function inlined by rustc's MIR inliner, which leaves its `UnwindTerminate(Abi)` edges in the caller (`294_extern_c_fn_inlined.rs`).
+
+  A Rust callee whose body has no such edge cannot let an exception out and is accepted. The imports the sysroot's own crates declare are the runtime's and accepted; which crates those are is decided by where rustc loaded them from (the target's sysroot library directory), not by their names (`298_import_from_sysroot_named_crate.rs`). The sysroot build's own compilations (`-Zforce-unstable-if-unmarked`) are not checked: they call no host function, and `compiler_builtins`' intrinsics call one another through the C ABI; their generics are checked where a program instantiates them. It is a compile-time error rather than a zombie because the JIR lane replaces an item's zombies with its lowering's. `#[js_extern]` and `js_bindings!` expand to ordinary Rust functions, so their declarations are unaffected; `mires-js`, `view-abi` and the fixture preludes declare their imports `"C-unwind"`, which changes nothing under `-Cpanic=abort` (rustc gives the call `unwind unreachable` either way).
+* **An exported `extern "C" fn` rethrows when JavaScript calls it.** Its cleanup path ends in `UnwindTerminate(Abi)`, which the JIR lowering emits as the same rethrow as `UnwindResume` once the drops have run (`UnwindTerminate(InCleanup)` still declines in a body with protected calls); a call to it from Rust is refused as above. The lowering is the same in both modes.
 * **The baseline lane cannot build programs with cleanup.** Every body that keeps a cleanup block needs the JIR lane: a reachable one that the baseline lane would print is refused with the `requires semantic cleanup lowering` refusal of `js-cleanup=on` above, and the backend's fail-closed guard gives an item whose JIR encoding declined (or `js-jir=off`) the same zombie. A suite row that asks the baseline lane to build such a program is skipped in this mode with its reason printed.
 * **Byte goldens are abort-mode text.** A golden recorded for the default mode is not compared in this mode; the behaviour checks beside it still run.
 
-`scripts/unwind-mode-test.sh` runs the mode's own fixtures (`examples/unwind-tests/`) in whichever mode `JSC_PANIC` selects.
+`scripts/unwind-mode-test.sh` runs the mode's own fixtures (`examples/unwind-tests/`) in whichever mode `JSC_PANIC` selects, with rustc's defaults and with `JSC_RUST_MIR_INLINE=on JSC_RUST_OPT_LEVEL=z`.
 
 Backend options ride in on `-Cllvm-args`, space separated (`scripts/compile.sh` forwards
 `$JS_EXTRA_ARGS`):
@@ -351,8 +357,10 @@ only because the definition cannot be named directly. Those lower to an ordinary
 the same shape.
 
 In the unwind build mode (`JSC_PANIC=unwind`, see "Compilation") a program's foreign imports must be
-`extern "C-unwind"`: a call to an `extern "C"` import loses its cleanup edge there, so the backend
-rejects it at compile time and names that fix. The ABI's lowering is the same for both spellings.
+`extern "C-unwind"` (or have another ABI that can unwind): a call to an import whose ABI cannot
+unwind loses its cleanup edge there, whether the call names the import or goes through a function
+pointer, so the backend rejects it at compile time and names that fix. The ABI's lowering is the
+same for both spellings.
 
 ### `#[panic_handler]` crates must not format
 
