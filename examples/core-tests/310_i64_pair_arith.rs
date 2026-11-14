@@ -41,6 +41,19 @@ fn loop_phi_i64(mut acc: i64, n: u32) -> i64 {
     acc
 }
 
+#[inline(never)]
+fn bump_addr_taken(p: &mut u64, k: u64) {
+    *p = p.wrapping_mul(3).wrapping_add(k);
+}
+
+#[inline(never)]
+fn callee_addr_taken(mut x: u64, y: u64) -> u64 {
+    bump_addr_taken(&mut x, y);
+    bump_addr_taken(&mut x, y ^ 7);
+    bump_addr_taken(&mut x, y.rotate_left(5));
+    x.wrapping_add(y)
+}
+
 #[unsafe(no_mangle)]
 pub fn rust_entry() {
     // 1. Add / Sub / Mul across 32-bit boundary + carries / borrows
@@ -129,8 +142,10 @@ pub fn rust_entry() {
     print_u64(0x0123_4567_89ab_cdefu64.swap_bytes());
     print_u64(0x0123_4567_89ab_cdefu64.reverse_bits());
 
-    // 7. Direct internal ABI calls + loop phi switch
+    // 7. Direct internal ABI calls + loop phi switch + address-taken FlatAbi u64 parameter
     print_u64(direct_u64_mix(a, b, 19));
     print_i64(direct_i64_step(-987_654_321_098i64, 123_456i64, 33));
     print_i64(loop_phi_i64(0x1122_3344_5566_7788i64, 17));
+    let r1 = callee_addr_taken(a.wrapping_add(1), 5);
+    print_u64(callee_addr_taken(r1, 9));
 }

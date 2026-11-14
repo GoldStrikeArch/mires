@@ -1187,6 +1187,16 @@ fn physical_program_metrics(
     for spill in abi.spill_items() {
         table.insert(spill.name.clone(), spill);
     }
+    let referenced: BTreeSet<JsName> = table
+        .values()
+        .flat_map(|item| item.refs.iter().cloned())
+        .collect();
+    let existing: BTreeSet<JsName> = table.keys().cloned().collect();
+    for helper in crate::lower::js::i64_pair::needed_helper_items(&referenced, &existing) {
+        if let std::collections::btree_map::Entry::Vacant(slot) = table.entry(helper.name.clone()) {
+            slot.insert(helper);
+        }
+    }
 
     let mut reachable = crate::plan::representation::measurement_reach(&table, &opts.roots);
     if opts.analyzes(OptimizerPass::LinkDedup)

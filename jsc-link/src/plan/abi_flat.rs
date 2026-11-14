@@ -783,6 +783,14 @@ impl AbiPlan {
             .flatten()
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_target_test(item: ItemId, name: JsName, sig: FlatSig) -> Self {
+        let mut plan = Self::default();
+        plan.flat.insert(item, sig);
+        plan.names.insert(item, name);
+        plan
+    }
+
     /// Whether `name` is a private flat body behind a canonical wrapper.
     pub(crate) fn has_canonical_wrapper(&self, name: &JsName) -> bool {
         self.clones.contains_key(name)

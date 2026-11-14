@@ -37,7 +37,7 @@ pub mod value;
 mod tests;
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use rcgjs_object::item::{FlatZombie, JsName, ZombieKind};
 use rcgjs_object::jir::decline::{Decline, LowerDecline, OpClass};
@@ -107,6 +107,9 @@ pub struct JsCx<'a> {
     pair_exprs: RefCell<BTreeMap<ValueId, (Expr, Expr)>>,
     /// Carried 64-bit `*WithOverflow` results `(lo, hi, overflow_flag)` keyed by the pair value.
     pub(super) carried_i64_overflow: RefCell<BTreeMap<ValueId, (Expr, Expr, Expr)>>,
+    /// Exact JavaScript formal parameter names in the emitted `function` signature (excluding
+    /// expanded logical parameter names whose formal lanes are `<name>$lo`/`$buf`/etc.).
+    formal_param_names: RefCell<HashSet<String>>,
     /// Tagged direct-call results kept as virtual `tag, payload...` products.
     ///
     /// Their expressions are canonical object *descriptions*, but are never assigned as objects:
@@ -172,6 +175,7 @@ impl<'a> JsCx<'a> {
             exprs: RefCell::new(BTreeMap::new()),
             pair_exprs: RefCell::new(BTreeMap::new()),
             carried_i64_overflow: RefCell::new(BTreeMap::new()),
+            formal_param_names: RefCell::new(HashSet::new()),
             tagged_exprs: RefCell::new(BTreeMap::new()),
             allocation_origins: RefCell::new(Vec::new()),
             temps: RefCell::new(Vec::new()),
@@ -276,6 +280,16 @@ impl<'a> JsCx<'a> {
     /// Binds a 64-bit integer SSA value to its normalized signed-`Int32` `(lo, hi)` pair.
     pub(super) fn bind_pair(&self, value: ValueId, lo: Expr, hi: Expr) {
         self.pair_exprs.borrow_mut().insert(value, (lo, hi));
+    }
+
+    /// Records the exact JavaScript formal parameter names in the emitted signature.
+    pub(super) fn set_formal_param_names(&self, names: HashSet<String>) {
+        *self.formal_param_names.borrow_mut() = names;
+    }
+
+    /// Whether `name` is bound directly by a formal parameter in the emitted JS parameter list.
+    pub(super) fn is_formal_param_name(&self, name: &str) -> bool {
+        self.formal_param_names.borrow().contains(name)
     }
 
     /// Whether `ty` is a 64-bit integer lowered to signed-`Int32` `(lo, hi)` lanes.

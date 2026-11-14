@@ -1140,7 +1140,17 @@ pub fn float_to_i64_pair(
 /// Packs 8 byte (`u8`) expressions `[b0..b7]` (little endian) directly into signed `Int32` `(lo, hi)`.
 pub fn pack_8_bytes(bytes: [Expr; 8]) -> (Expr, Expr) {
     let [b0, b1, b2, b3, b4, b5, b6, b7] = bytes;
+    let mask_u8 = |e: Expr| -> Expr {
+        if let Some(c) = const_i32(&e) {
+            jsast::num(f64::from(c & 255))
+        } else {
+            jsast::binary(JsBinOp::BitAnd, e, jsast::num(255.0))
+        }
+    };
     let combine4 = |x0: Expr, x1: Expr, x2: Expr, x3: Expr| {
+        let x0 = mask_u8(x0);
+        let x1 = mask_u8(x1);
+        let x2 = mask_u8(x2);
         let s1 = jsast::binary(JsBinOp::Shl, x1, jsast::num(8.0));
         let s2 = jsast::binary(JsBinOp::Shl, x2, jsast::num(16.0));
         let s3 = jsast::binary(JsBinOp::Shl, x3, jsast::num(24.0));
@@ -1264,17 +1274,39 @@ pub fn needed_helper_items(
         jir: Default::default(),
     };
 
+    // Co-locate shared mutable static registers with every active writer function so ESM chunk
+    // splitting never separates a writer from its `let` binding (ESM imports are read-only).
+    let active_hi_writers: Vec<&'static str> = [
+        HELPER_MUL,
+        HELPER_MUL_OVF,
+        HELPER_DIV,
+        HELPER_F2I,
+        HELPER_F64_TO_BITS,
+    ]
+    .into_iter()
+    .filter(|w| need.contains(w) && !existing.contains(&JsName::new((*w).to_owned())))
+    .collect();
+    let active_ovf_writers: Vec<&'static str> = [HELPER_MUL_OVF]
+        .into_iter()
+        .filter(|w| need.contains(w) && !existing.contains(&JsName::new((*w).to_owned())))
+        .collect();
+
     let mut out = Vec::new();
     for &name in HELPER_NAMES {
         if !need.contains(name) || existing.contains(&JsName::new(name.to_owned())) {
             continue;
         }
         let item = match name {
-            HELPER_HI => make(name, ItemKind::Static, &[], format!("\nlet {HELPER_HI} = 0;\n")),
+            HELPER_HI => make(
+                name,
+                ItemKind::Static,
+                &active_hi_writers,
+                format!("\nlet {HELPER_HI} = 0;\n"),
+            ),
             HELPER_OVF => make(
                 name,
                 ItemKind::Static,
-                &[],
+                &active_ovf_writers,
                 format!("\nlet {HELPER_OVF} = false;\n"),
             ),
             HELPER_F64_VIEW => make(

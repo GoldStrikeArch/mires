@@ -5275,4 +5275,148 @@ fn a_raw_view_boxes_a_held_object_until_a_step_reaches_storage() {
     );
 }
 
+#[test]
+fn i64_pair_needed_helpers_co_locate_writers_with_shared_statics() {
+    let referenced: BTreeSet<JsName> = [
+        super::i64_pair::HELPER_MUL,
+        super::i64_pair::HELPER_MUL_OVF,
+        super::i64_pair::HELPER_DIV,
+    ]
+    .into_iter()
+    .map(|name| JsName::new(name.to_owned()))
+    .collect();
+    let items = super::i64_pair::needed_helper_items(&referenced, &BTreeSet::new());
+    let hi = items
+        .iter()
+        .find(|item| item.name.as_str() == super::i64_pair::HELPER_HI)
+        .expect("HELPER_HI present");
+    let hi_refs: BTreeSet<&str> = hi.refs.iter().map(|r| r.as_str()).collect();
+    assert!(hi_refs.contains(super::i64_pair::HELPER_MUL));
+    assert!(hi_refs.contains(super::i64_pair::HELPER_MUL_OVF));
+    assert!(hi_refs.contains(super::i64_pair::HELPER_DIV));
+    assert!(!hi_refs.contains(super::i64_pair::HELPER_F2I));
+
+    let ovf = items
+        .iter()
+        .find(|item| item.name.as_str() == super::i64_pair::HELPER_OVF)
+        .expect("HELPER_OVF present");
+    let ovf_refs: BTreeSet<&str> = ovf.refs.iter().map(|r| r.as_str()).collect();
+    assert!(ovf_refs.contains(super::i64_pair::HELPER_MUL_OVF));
+}
+
+#[test]
+fn i64_pair_pack_8_bytes_masks_dynamic_inputs_with_255() {
+    let (lo, hi) = super::i64_pair::pack_8_bytes([
+        jsast::id("b0"),
+        jsast::num(-1.0),
+        jsast::id("b2"),
+        jsast::id("b3"),
+        jsast::id("b4"),
+        jsast::id("b5"),
+        jsast::id("b6"),
+        jsast::id("b7"),
+    ]);
+    assert_eq!(
+        jsast::expr_to_string(&lo),
+        "b0 & 255 | 255 << 8 | ((b2 & 255) << 16 | b3 << 24)"
+    );
+    assert_eq!(
+        jsast::expr_to_string(&hi),
+        "b4 & 255 | (b5 & 255) << 8 | ((b6 & 255) << 16 | b7 << 24)"
+    );
+}
+
+#[test]
+fn flat_abi_i64_pair_param_with_param_cell_declares_box_instead_of_rebinding_missing_name() {
+    let interns = world();
+    let mut b = FuncBuilder::new(item(1), signature(vec![I64, I64], I64));
+    let x = b.param(I64, NO_ORIGIN);
+    let y = b.param(I64, NO_ORIGIN);
+    let cell = b.cell(I64, true, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    b.effect(e, OpKind::CellAlloc(cell), NO_ORIGIN);
+    b.effect(e, OpKind::CellStore { cell, v: x }, NO_ORIGIN);
+    let ptr = b.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Cell(cell),
+            path: Vec::new(),
+            mutable: true,
+        },
+        REF_I32,
+        NO_ORIGIN,
+    );
+    b.effect(e, OpKind::StoreThrough { ptr, v: y }, NO_ORIGIN);
+    let loaded = b.op(e, OpKind::CellLoad(cell), I64, NO_ORIGIN);
+    b.terminate(e, RTerm::Return(Some(loaded)));
+    let func = b.finish();
+
+    let mut plan =
+        super::super::fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
+    plan.names.insert(x, "x".to_owned());
+    plan.names.insert(y, "y".to_owned());
+    plan.cell_names.insert(cell, "x".to_owned());
+    plan.param_cells.insert(cell, x);
+
+    let flat_i64 = crate::plan::abi_flat::FlatParam {
+        ty: I64,
+        field_tys: Vec::new(),
+        passed: Vec::new(),
+        by_ref: false,
+        mutable: false,
+        written: false,
+        slice: false,
+        i64_pair: true,
+        tagged: None,
+        recursive: None,
+    };
+    let target_abi = crate::plan::abi_flat::FlatSig {
+        params: vec![Some(flat_i64.clone()), Some(flat_i64)],
+        result: None,
+        spill: 0,
+        returns_out_field: false,
+    };
+
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let opts = Opts::default();
+    let name = JsName::new("callee_addr_taken".to_owned());
+    let summary = summary(&[]);
+    let spills = [JsName::new("$r1".to_owned())];
+    let abi = crate::plan::abi_flat::AbiPlan::for_target_test(item(1), name.clone(), target_abi);
+    let input = LowerInput {
+        name: &name,
+        summary: &summary,
+        body: &body,
+        origins: None,
+        interns: &interns,
+        table: &interns.types,
+        opts: &opts,
+        items: super::host::EMPTY_ITEMS,
+        drop_glue: super::host::EMPTY_DROP_GLUE,
+        vtables: &super::unsize::EMPTY_VTABLES,
+        spills: &spills,
+        abi: Some(&abi),
+        physical: None,
+        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+    };
+    let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
+    let js = jsast::stmt_to_string(&lowered.decl);
+    assert!(
+        js.contains("function callee_addr_taken(x$lo, x$hi, y$lo, y$hi)"),
+        "expected expanded signature, got:\n{js}"
+    );
+    assert!(
+        js.contains("let x = [];") || js.contains("let x = [],"),
+        "expected boxed param cell declaration for expanded param, got:\n{js}"
+    );
+    assert!(
+        js.contains("x[0] = "),
+        "expected CellStore through boxed cell `x[0] = ...`, got:\n{js}"
+    );
+    assert!(
+        !js.contains("\n  x = ["),
+        "must not reassign undeclared `x = [...]`, got:\n{js}"
+    );
+}
+
 mod invoke;

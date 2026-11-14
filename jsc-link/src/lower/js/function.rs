@@ -168,7 +168,9 @@ pub fn lower(
             params.push(name.to_owned());
         }
     }
-    let mut param_names: HashSet<String> = params.iter().cloned().collect();
+    let formal_param_names: HashSet<String> = params.iter().cloned().collect();
+    cx.set_formal_param_names(formal_param_names.clone());
+    let mut param_names: HashSet<String> = formal_param_names.clone();
     param_names.extend(logical_param_names);
 
     // The body first: it decides how many temporaries get hoisted and which names are mentioned.
@@ -248,7 +250,7 @@ pub fn lower(
         }
     }
     for (cell, name) in &plan.cell_names {
-        if plan.param_cells.contains_key(cell) || param_names.contains(name) {
+        if formal_param_names.contains(name) {
             continue;
         }
         if !declared.insert(name.clone()) {

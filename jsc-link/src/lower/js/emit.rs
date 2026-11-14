@@ -1698,14 +1698,17 @@ impl<'a> JsCx<'a> {
             OpKind::CellStore { cell, v } => {
                 let value = self.expr_of(*v)?;
                 // A boxed parameter cell: v1 builds the box in the prelude, `x = [x];`, so the
-                // parameter's own binding becomes the box. That is what a store of the parameter
-                // value into a cell named like the parameter is.
+                // parameter's own binding becomes the box — only when the parameter's canonical
+                // name is actually a formal parameter in the JS signature (not expanded into lanes).
                 if self.plan.param_cells.contains_key(cell) {
-                    if !self.cell_boxed(*cell) {
-                        return Ok(Vec::new());
+                    let cell_name = self.cell_name(*cell)?;
+                    if self.is_formal_param_name(cell_name) {
+                        if !self.cell_boxed(*cell) {
+                            return Ok(Vec::new());
+                        }
+                        let name = jsast::id(cell_name);
+                        return Ok(vec![jsast::assign_stmt(name, jsast::array(vec![value]))]);
                     }
-                    let name = jsast::id(self.cell_name(*cell)?);
-                    return Ok(vec![jsast::assign_stmt(name, jsast::array(vec![value]))]);
                 }
                 Ok(vec![jsast::assign_stmt(self.cell_expr(*cell)?, value)])
             }
