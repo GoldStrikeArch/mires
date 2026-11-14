@@ -1261,3 +1261,93 @@ console.log(checks);
 "#;
     check_emission(&interns, &body, &terminated, harness, 24, "terminate-abi");
 }
+
+#[test]
+fn goto_chain_in_invoke_function_never_fuses_across_blocks() {
+    use rcgjs_object::jir::semantic::BinaryOp;
+    let mut interns = world();
+    let mut b = FuncBuilder::new(item(1), signature(vec![I32], I32));
+    let x = b.param(I32, NO_ORIGIN);
+    let entry = FuncBuilder::ENTRY;
+    let mid = b.block();
+    let after = b.block();
+    let cleanup = b.block();
+
+    let one = b.op(
+        entry,
+        OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+        I32,
+        NO_ORIGIN,
+    );
+    let two = b.op(
+        mid,
+        OpKind::Const(ConstTree::Scalar { bits: 2, bytes: 4 }),
+        I32,
+        NO_ORIGIN,
+    );
+    // Defined in `entry`, used in `mid` across an unconditional `Goto`: scoped fusion in
+    // `Invoke` functions must NOT fuse `added` across blocks.
+    let added = b.op(
+        entry,
+        OpKind::Binary {
+            op: BinaryOp::Add,
+            l: x,
+            r: one,
+            ty: I32,
+        },
+        I32,
+        NO_ORIGIN,
+    );
+    b.terminate(entry, RTerm::Goto(mid, Vec::new()));
+
+    let arg = b.op(
+        mid,
+        OpKind::Binary {
+            op: BinaryOp::Add,
+            l: added,
+            r: two,
+            ty: I32,
+        },
+        I32,
+        NO_ORIGIN,
+    );
+    let call_res = b.op(mid, call(&mut interns, "step", vec![arg]), I32, NO_ORIGIN);
+    b.terminate(
+        mid,
+        RTerm::Invoke {
+            normal: (after, Vec::new()),
+            unwind: (cleanup, Vec::new()),
+        },
+    );
+    b.terminate(after, RTerm::Return(Some(call_res)));
+    b.effect(cleanup, call(&mut interns, "cleanup", vec![x]), NO_ORIGIN);
+    b.terminate(cleanup, RTerm::Throw(None));
+
+    let func = b.finish();
+    func.verify(&interns.types).unwrap();
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let harness = r#"
+const assert = require('node:assert/strict');
+let trace, shouldThrow, thrown;
+function step(v) { trace.push(['step', v]); if (shouldThrow) throw thrown; return v + 10; }
+function cleanup(v) { trace.push(['cleanup', v]); }
+let checks = 0;
+for (shouldThrow of [false, true]) {
+  thrown = new Error('boom');
+  trace = [];
+  let value, caught = false;
+  try { value = entry(5); } catch (e) { value = e; caught = true; }
+  assert.equal(caught, shouldThrow);
+  if (shouldThrow) {
+    assert.equal(value, thrown);
+    assert.deepEqual(trace, [['step', 8], ['cleanup', 5]]);
+  } else {
+    assert.equal(value, 18);
+    assert.deepEqual(trace, [['step', 8]]);
+  }
+  checks++;
+}
+console.log(checks);
+"#;
+    check_emission(&interns, &body, &func, harness, 2, "goto-chain");
+}

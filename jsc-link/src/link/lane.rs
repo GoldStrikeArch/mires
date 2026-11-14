@@ -1392,11 +1392,11 @@ fn o_group_with_mode(
             let mut reach = BTreeSet::new();
             let mut work: Vec<JsName> = table
                 .iter()
-                .filter_map(|(name, item)| {
-                    (live.contains(name)
-                        && (item.linkage.root || ctx.opts.roots.iter().any(|r| r == name.as_str())))
-                    .then(|| name.clone())
+                .filter(|(name, item)| {
+                    live.contains(*name)
+                        && (item.linkage.root || ctx.opts.roots.iter().any(|r| r == name.as_str()))
                 })
+                .map(|(name, _)| name.clone())
                 .collect();
             while let Some(cur) = work.pop() {
                 if !live.contains(&cur) || !reach.insert(cur.clone()) {

@@ -255,12 +255,14 @@ pub(crate) fn run(
 
     let ok_funcs: BTreeSet<JsName> = funcs
         .iter()
-        .filter_map(|(name, res)| res.is_ok().then(|| name.clone()))
+        .filter(|(_, res)| res.is_ok())
+        .map(|(name, _)| name.clone())
         .collect();
 
     let abort_only_names: BTreeSet<JsName> = table
         .iter()
-        .filter_map(|(name, item)| is_abort_only_stdlib_item(item).then(|| name.clone()))
+        .filter(|(_, item)| is_abort_only_stdlib_item(item))
+        .map(|(name, _)| name.clone())
         .collect();
 
     let target_name_throws = |target: &JsName, may_throw: &BTreeSet<JsName>| -> bool {
@@ -285,7 +287,7 @@ pub(crate) fn run(
             OpKind::Host { payload, .. } => !host_payload_cannot_throw(payload, interns),
             OpKind::Intrinsic {
                 fallback: Some(d), ..
-            } => resolve(d.link_name).map_or(true, |n| target_name_throws(&n, may_throw)),
+            } => resolve(d.link_name).is_none_or(|n| target_name_throws(&n, may_throw)),
             OpKind::Intrinsic { fallback: None, .. } => false,
             OpKind::Drop {
                 glue: DropGlue::None,
@@ -294,7 +296,7 @@ pub(crate) fn run(
             OpKind::Drop {
                 glue: DropGlue::Direct { link_name, .. },
                 ..
-            } => resolve(*link_name).map_or(true, |n| target_name_throws(&n, may_throw)),
+            } => resolve(*link_name).is_none_or(|n| target_name_throws(&n, may_throw)),
             OpKind::Drop {
                 glue: DropGlue::Dynamic,
                 ..
@@ -322,23 +324,18 @@ pub(crate) fn run(
                 if matches!(semantic, CallSemantic::RawParts) {
                     return false;
                 }
-                if let CallSemantic::Standard(std_op) = semantic {
-                    if crate::lower::semantic_ops::registry(*std_op).is_some() {
-                        return false;
-                    }
-                }
                 match callee {
                     Callee::Nop => false,
                     Callee::Direct { link_name, .. } => {
-                        resolve(*link_name).map_or(true, |n| target_name_throws(&n, may_throw))
+                        resolve(*link_name).is_none_or(|n| target_name_throws(&n, may_throw))
                     }
                     Callee::Intrinsic {
                         fallback: Some(d), ..
-                    } => resolve(d.link_name).map_or(true, |n| target_name_throws(&n, may_throw)),
+                    } => resolve(d.link_name).is_none_or(|n| target_name_throws(&n, may_throw)),
                     Callee::Intrinsic { fallback: None, .. } => false,
                     Callee::Runtime { member } => interns
                         .str(*member)
-                        .map_or(true, |s| !is_non_host_runtime_symbol(s)),
+                        .is_none_or(|s| !is_non_host_runtime_symbol(s)),
                     Callee::Foreign { symbol, .. } => match interns.str(*symbol) {
                         None => true,
                         Some(sym) => {
@@ -389,15 +386,58 @@ pub(crate) fn run(
                 changed = true;
                 continue;
             };
-            let throws = func
-                .blocks
-                .iter()
-                .any(|b| matches!(b.term, RTerm::Throw(_)))
-                || func
-                    .blocks
-                    .iter()
-                    .flat_map(|b| &b.ops)
-                    .any(|op| op_throws(op, interns, &may_throw_host));
+            // Traverse only reachable blocks from entry, following an `Invoke` unwind edge only
+            // when the protected op can actually throw; otherwise dead `RTerm::Throw(None)`
+            // cleanup pads would falsely taint non-throwing callers and block transitive pruning.
+            let mut throws = false;
+            if !func.blocks.is_empty() {
+                let mut visited = vec![false; func.blocks.len()];
+                let mut work = vec![0usize];
+                while let Some(bi) = work.pop() {
+                    if visited.get(bi).copied().unwrap_or(true) {
+                        continue;
+                    }
+                    visited[bi] = true;
+                    let block = &func.blocks[bi];
+                    if matches!(block.term, RTerm::Throw(_)) {
+                        throws = true;
+                        break;
+                    }
+                    match &block.term {
+                        RTerm::Invoke { normal, unwind } => {
+                            let protected_idx = block.ops.len().saturating_sub(1);
+                            if block.ops[..protected_idx]
+                                .iter()
+                                .any(|op| op_throws(op, interns, &may_throw_host))
+                            {
+                                throws = true;
+                                break;
+                            }
+                            work.push(normal.0 .0 as usize);
+                            let last_throws = block
+                                .ops
+                                .last()
+                                .is_some_and(|op| op_throws(op, interns, &may_throw_host));
+                            if last_throws {
+                                work.push(unwind.0 .0 as usize);
+                            }
+                        }
+                        _ => {
+                            if block
+                                .ops
+                                .iter()
+                                .any(|op| op_throws(op, interns, &may_throw_host))
+                            {
+                                throws = true;
+                                break;
+                            }
+                            for succ in block.term.successors() {
+                                work.push(succ.0 as usize);
+                            }
+                        }
+                    }
+                }
+            }
             if throws {
                 may_throw_host.insert(name.clone());
                 changed = true;
@@ -735,5 +775,233 @@ mod tests {
             .unwrap();
         assert!(matches!(updated.blocks[0].term, RTerm::Invoke { .. }));
         assert!(matches!(updated.blocks[1].term, RTerm::Invoke { .. }));
+    }
+
+    #[test]
+    fn prunes_two_hop_invoke_chain_with_throw_none_cleanup_pads() {
+        let mut leaf_interns = Interns::new();
+        let unit_leaf = unit_types(&mut leaf_interns);
+        let mut lb = FuncBuilder::new(
+            item_id(10),
+            Signature {
+                arguments: Vec::new(),
+                result: unit_leaf,
+                abi: AbiSignature::default(),
+            },
+        );
+        lb.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let leaf = lb.finish();
+
+        let mut inner_interns = Interns::new();
+        let unit_inner = unit_types(&mut inner_interns);
+        let leaf_sym = inner_interns.intern_str("leaf");
+        let mut ib = FuncBuilder::new(
+            item_id(11),
+            Signature {
+                arguments: Vec::new(),
+                result: unit_inner,
+                abi: AbiSignature::default(),
+            },
+        );
+        let i0 = FuncBuilder::ENTRY;
+        let i_norm = ib.block();
+        let i_unw = ib.block();
+        ib.effect(
+            i0,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(10),
+                    link_name: leaf_sym,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        ib.terminate(
+            i0,
+            RTerm::Invoke {
+                normal: (i_norm, Vec::new()),
+                unwind: (i_unw, Vec::new()),
+            },
+        );
+        ib.terminate(i_norm, RTerm::Return(None));
+        ib.terminate(i_unw, RTerm::Throw(None));
+        let inner = ib.finish();
+
+        let mut outer_interns = Interns::new();
+        let unit_outer = unit_types(&mut outer_interns);
+        let inner_sym = outer_interns.intern_str("inner");
+        let mut ob = FuncBuilder::new(
+            item_id(12),
+            Signature {
+                arguments: Vec::new(),
+                result: unit_outer,
+                abi: AbiSignature::default(),
+            },
+        );
+        let o0 = FuncBuilder::ENTRY;
+        let o_norm = ob.block();
+        let o_unw = ob.block();
+        ob.effect(
+            o0,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(11),
+                    link_name: inner_sym,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        ob.terminate(
+            o0,
+            RTerm::Invoke {
+                normal: (o_norm, Vec::new()),
+                unwind: (o_unw, Vec::new()),
+            },
+        );
+        ob.terminate(o_norm, RTerm::Return(None));
+        ob.terminate(o_unw, RTerm::Throw(None));
+        let outer = ob.finish();
+
+        let mut table = BTreeMap::new();
+        table.insert(
+            JsName::new("leaf".to_owned()),
+            test_item("leaf", leaf_interns),
+        );
+        table.insert(
+            JsName::new("inner".to_owned()),
+            test_item("inner", inner_interns),
+        );
+        table.insert(
+            JsName::new("outer".to_owned()),
+            test_item("outer", outer_interns),
+        );
+        let mut funcs = BTreeMap::new();
+        funcs.insert(JsName::new("leaf".to_owned()), Ok(leaf));
+        funcs.insert(JsName::new("inner".to_owned()), Ok(inner));
+        funcs.insert(JsName::new("outer".to_owned()), Ok(outer));
+
+        let live: BTreeSet<JsName> = table.keys().cloned().collect();
+        let modified = run(&table, &mut funcs, &live);
+        assert_eq!(modified, 2, "both inner and outer Invokes must be pruned");
+        assert!(!funcs[&JsName::new("inner".to_owned())]
+            .as_ref()
+            .unwrap()
+            .has_invoke());
+        assert!(!funcs[&JsName::new("outer".to_owned())]
+            .as_ref()
+            .unwrap()
+            .has_invoke());
+    }
+
+    #[test]
+    fn preserves_standard_op_invoke_when_direct_callee_throws() {
+        use crate::jir::semantic::StandardOperation;
+
+        let mut fmt_interns = Interns::new();
+        let unit_fmt = unit_types(&mut fmt_interns);
+        let section_id = fmt_interns.intern_str("rcgjs.host.invoke");
+        let mut fb = FuncBuilder::new(
+            item_id(20),
+            Signature {
+                arguments: Vec::new(),
+                result: unit_fmt,
+                abi: AbiSignature::default(),
+            },
+        );
+        fb.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Host {
+                payload: HostPayload::Marker {
+                    section: section_id,
+                    def: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 20,
+                    },
+                    template: None,
+                    helpers: Vec::new(),
+                },
+                args: Vec::new(),
+            },
+            O,
+        );
+        fb.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let throwing_fmt = fb.finish();
+
+        let mut caller_interns = Interns::new();
+        let unit_caller = unit_types(&mut caller_interns);
+        let fmt_sym = caller_interns.intern_str("fmt_to_string_throwing");
+        let mut cb = FuncBuilder::new(
+            item_id(21),
+            Signature {
+                arguments: Vec::new(),
+                result: unit_caller,
+                abi: AbiSignature::default(),
+            },
+        );
+        let b0 = FuncBuilder::ENTRY;
+        let b_norm = cb.block();
+        let b_unw = cb.block();
+        cb.effect(
+            b0,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(20),
+                    link_name: fmt_sym,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Standard(StandardOperation::FormatArgsToString),
+                host: None,
+            },
+            O,
+        );
+        cb.terminate(
+            b0,
+            RTerm::Invoke {
+                normal: (b_norm, Vec::new()),
+                unwind: (b_unw, Vec::new()),
+            },
+        );
+        cb.terminate(b_norm, RTerm::Return(None));
+        cb.terminate(b_unw, RTerm::Throw(None));
+        let caller = cb.finish();
+
+        let mut table = BTreeMap::new();
+        table.insert(
+            JsName::new("fmt_to_string_throwing".to_owned()),
+            test_item("fmt_to_string_throwing", fmt_interns),
+        );
+        table.insert(
+            JsName::new("caller".to_owned()),
+            test_item("caller", caller_interns),
+        );
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            JsName::new("fmt_to_string_throwing".to_owned()),
+            Ok(throwing_fmt),
+        );
+        funcs.insert(JsName::new("caller".to_owned()), Ok(caller));
+
+        let live: BTreeSet<JsName> = table.keys().cloned().collect();
+        let modified = run(&table, &mut funcs, &live);
+        assert_eq!(
+            modified, 0,
+            "Standard op with throwing Callee::Direct body must not be pruned"
+        );
+        assert!(funcs[&JsName::new("caller".to_owned())]
+            .as_ref()
+            .unwrap()
+            .has_invoke());
     }
 }

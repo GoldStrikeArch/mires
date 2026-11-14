@@ -988,12 +988,24 @@ impl<'a> Planner<'a> {
         ) {
             return false;
         }
-        !uses.is_empty() && uses.iter().all(|use_| {
-            matches!(self.func.blocks[use_.block.0 as usize].ops.get(use_.position).map(|op| &op.kind),
-                Some(OpKind::Call {
-                    host: Some(HostPayload::Marker { section, template: Some(_), .. }), args, ..
-                }) if self.interns.str(*section) == Some("rcgjs.tc.template") && args.as_slice() == [result])
-        })
+        let has_invoke = self.func.has_invoke();
+        !uses.is_empty()
+            && uses.iter().all(|use_| {
+                if has_invoke && (use_.block != block || use_.edge.is_some()) {
+                    return false;
+                }
+                if matches!(
+                    self.func.blocks[use_.block.0 as usize].term,
+                    RTerm::Invoke { .. }
+                ) && use_.position + 1 >= self.func.blocks[use_.block.0 as usize].ops.len()
+                {
+                    return false;
+                }
+                matches!(self.func.blocks[use_.block.0 as usize].ops.get(use_.position).map(|op| &op.kind),
+                    Some(OpKind::Call {
+                        host: Some(HostPayload::Marker { section, template: Some(_), .. }), args, ..
+                    }) if self.interns.str(*section) == Some("rcgjs.tc.template") && args.as_slice() == [result])
+            })
     }
 
     fn inlinable(&self, result: ValueId, block: RBlockId, index: usize, purity: Purity) -> bool {
@@ -1042,6 +1054,9 @@ impl<'a> Planner<'a> {
             RTerm::Switch { scrut, .. } => Some(*scrut),
             _ => None,
         };
+        if self.func.has_invoke() && (use_.block != block || use_.edge.is_some()) {
+            return false;
+        }
         // Everything strictly between the definition and the use has to commute with it.
         let check = |slice: &[crate::jir::repr::Op]| {
             slice.iter().all(|op| commutes(purity, self.bound(op, 0)))

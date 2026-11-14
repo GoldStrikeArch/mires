@@ -547,13 +547,13 @@ fn strip_hoisted_table_stmts(stmts: &mut Vec<Stmt>, hoisted: &BTreeSet<String>) 
                 }
             }
             Stmt::Labeled(_, inner) => {
-                let mut v = vec![*inner.clone()];
+                let mut v = vec![std::mem::replace(inner.as_mut(), Stmt::Block(Vec::new()))];
                 strip_hoisted_table_stmts(&mut v, hoisted);
-                *inner = Box::new(if v.len() == 1 {
+                **inner = if v.len() == 1 {
                     v.pop().unwrap()
                 } else {
                     Stmt::Block(v)
-                });
+                };
             }
             Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
                 strip_hoisted_table_stmts(b, hoisted);
@@ -1073,16 +1073,15 @@ fn run_with_opts(
 mod tests {
     use super::*;
 
-    fn test_run(
-        opts: Opts,
-        items: Vec<(&str, Stmt)>,
-    ) -> (
+    type TestRunOutput = (
         BTreeMap<JsName, LinkItem>,
         Vec<LoweredRow>,
         BTreeSet<JsName>,
         BTreeSet<JsName>,
         bool,
-    ) {
+    );
+
+    fn test_run(opts: Opts, items: Vec<(&str, Stmt)>) -> TestRunOutput {
         let mut table = BTreeMap::new();
         let mut defined = BTreeSet::new();
         let mut live = BTreeSet::new();
@@ -1129,8 +1128,10 @@ mod tests {
                 ],
             )],
         );
-        let mut opts = Opts::default();
-        opts.optimizer = OptimizerMode::On;
+        let opts = Opts {
+            optimizer: OptimizerMode::On,
+            ..Opts::default()
+        };
         let (table, lowered, defined, live, added) = test_run(opts, vec![("crc", fn_stmt)]);
         assert!(added);
         assert_eq!(table.len(), 1);
@@ -1196,9 +1197,11 @@ mod tests {
                 ],
             )],
         );
-        let mut opts = Opts::default();
-        opts.optimizer = OptimizerMode::On;
-        opts.ecma_target = EcmaTarget::Es2018;
+        let opts = Opts {
+            optimizer: OptimizerMode::On,
+            ecma_target: EcmaTarget::Es2018,
+            ..Opts::default()
+        };
         let (table, lowered, _, _, added) = test_run(opts, vec![("demo", fn_stmt.clone())]);
         assert!(added);
         // Expect 2 constants (loc + BigInt) and 1 unreachable helper function ($ur_0).
@@ -1230,8 +1233,10 @@ mod tests {
         );
 
         // Report mode must NOT hoist anything (preserves off == report byte-identity).
-        let mut report_opts = Opts::default();
-        report_opts.optimizer = OptimizerMode::Report;
+        let report_opts = Opts {
+            optimizer: OptimizerMode::Report,
+            ..Opts::default()
+        };
         let (report_table, _, _, _, report_added) = test_run(report_opts, vec![("demo", fn_stmt)]);
         assert!(!report_added);
         assert!(report_table.is_empty());
