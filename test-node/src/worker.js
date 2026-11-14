@@ -142,7 +142,9 @@ function run(mode, timeout, program) {
     }, timeout);
     thread.on('exit', (exitCode) => {
       clearTimeout(guard);
-      code = exitCode;
+      // A thread that reported an uncaught error can still exit 0: an `exit` listener threw, or a
+      // microtask queued before the error called `process.exit(0)`. The process exits 1.
+      code = uncaught !== null && exitCode === 0 ? 1 : exitCode;
       settle();
     });
   });

@@ -558,6 +558,16 @@ console.log([1, 'two', { three: [3n] }], new Map([[1, 2]]));
                 "Function.prototype.call = null;",
                 "destroy.call is not a function",
             ),
+            // A thread that reports an uncaught error can still exit 0; the process exits 1.
+            (
+                "process.on('exit', () => { throw new Error('in exit'); });",
+                "Error: in exit",
+            ),
+            (
+                "queueMicrotask(() => { throw new Error('first'); });
+                 queueMicrotask(() => process.exit(0));",
+                "Error: first",
+            ),
             ("let b = (;", "SyntaxError: Unexpected token ';'"),
             // A strict assignment to a name nothing declares, a ReferenceError that a `vm` context
             // lets through. (Node 24 names an error that crossed from a thread `ReferenceError [Error]`.)
