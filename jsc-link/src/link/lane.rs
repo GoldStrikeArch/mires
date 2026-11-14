@@ -1493,6 +1493,7 @@ fn o_group_with_mode(
             funcs,
             &mut metadata,
             &graph,
+            ctx.items,
             &measure_imported,
             &sole,
             &zombie_free,

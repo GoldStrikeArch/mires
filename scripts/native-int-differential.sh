@@ -28,7 +28,7 @@ rustc "+$channel" --edition=2024 -O "$oracle" -o "$work/oracle"
 for mode in off on; do
 	args="js-opt=$mode js-opt-passes=native-representations"
 	JS_EXTRA_ARGS="$args" SKIP_BUILD=1 "$script_dir/build_sysroot.sh" >/dev/null
-	JS_EXTRA_ARGS="$args js-opt-warnings=off" \
+	JS_EXTRA_ARGS="$args js-lane=jir js-opt-warnings=off" \
 		"$script_dir/compile_core.sh" "$fixture" "$work/$mode.js" >/dev/null
 done
 

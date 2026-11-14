@@ -69,6 +69,25 @@ root=$(cd -- "$script_dir/.." && pwd)
 # shellcheck source=sysroot-cache.sh
 source "$script_dir/sysroot-cache.sh"
 
+# The shadow lane compares JIR against the v1 baseline lane, which refuses unwind-mode
+# cleanup on 93/157 fixtures. Default to abort mode so every fixture runs on both lanes,
+# while preserving any pre-existing build/sysroot symlink target on exit.
+export JSC_PANIC="${JSC_PANIC:-abort}"
+jsc_select_mode "$root" || exit 2
+prev_sysroot_link=""
+if [ -L "$root/build/sysroot" ]; then
+	prev_sysroot_link=$(readlink "$root/build/sysroot")
+fi
+restore_sysroot_link() {
+	if [ -n "$prev_sysroot_link" ]; then
+		local tmp="$root/build/.sysroot-restore.$$"
+		mkdir -p "$root/build"
+		ln -s "$prev_sysroot_link" "$tmp"
+		jsc_replace_symlink "$tmp" "$root/build/sysroot" || rm -f "$tmp"
+	fi
+}
+trap restore_sysroot_link EXIT
+
 build_dir="$root/build/laneshadow"
 log_dir="$root/build/logs"
 shim="$root/runtime/shim.js"
@@ -251,8 +270,8 @@ ensure_sysroot() {
 	case " $sysroot_checked " in
 	*"|$args|"*) return 0 ;;
 	esac
-	path=$(JSC_SYSROOT_ARGS="$args" jsc_sysroot_path "$root" wasm32-unknown-unknown "$dylib") || return 1
-	if [ ! -d "$path/lib/rustlib/wasm32-unknown-unknown/lib" ]; then
+	path=$(JSC_SYSROOT_ARGS="$args" jsc_sysroot_path "$root" "$jsc_target_name" "$dylib") || return 1
+	if [ ! -d "$path/lib/rustlib/$jsc_target_name/lib" ]; then
 		echo "==> building the sysroot for '$args' (about a minute)"
 		if ! SKIP_BUILD=1 JS_EXTRA_ARGS="$args" "$script_dir/build_sysroot.sh" \
 			>"$log_dir/laneshadow-sysroot.log" 2>&1; then

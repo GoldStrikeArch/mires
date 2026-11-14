@@ -273,11 +273,18 @@ console.log('metadata transport: destructors run on host throws')
 """, str(metadata_program), str(root / "runtime/shim.js")])
 rows_by_prefix = {}
 for row in json.loads(lane_report.read_text())["items"]:
-    for prefix in ["cleanup_metadata_provider$guarded$", "core$iter$adapters$try_process$"]:
+    for prefix in [
+        "cleanup_metadata_provider$guarded$",
+        "core$iter$adapters$try_process$",
+        "core$iter$adapters$impl_0_try_fold$",
+    ]:
         if row["name"].startswith(prefix):
             rows_by_prefix.setdefault(prefix, []).append(row)
 assert len(rows_by_prefix.get("cleanup_metadata_provider$guarded$", [])) == 2, rows_by_prefix
-assert rows_by_prefix.get("core$iter$adapters$try_process$"), rows_by_prefix
+assert (
+    rows_by_prefix.get("core$iter$adapters$try_process$")
+    or rows_by_prefix.get("core$iter$adapters$impl_0_try_fold$")
+), rows_by_prefix
 for rows in rows_by_prefix.values():
     for row in rows:
         assert "unwind" in row["class"], row

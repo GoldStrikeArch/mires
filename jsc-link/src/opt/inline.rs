@@ -40,11 +40,13 @@ use crate::analysis::callgraph::Callgraph;
 use crate::item::JsName;
 use crate::jir::decline::Decline;
 use crate::jir::interns::Interns;
+use crate::jir::origin::SourceFactId;
 use crate::jir::repr::{
     CellId, Func, Op, OpKind, Proj, RAssertMessage, RBlock, RBlockId, RTerm, Root, ValueId,
 };
 use crate::jir::semantic::{CallSemantic, Callee, HostPayload};
 use crate::jir::types::{NominalForm, TypeKind, TypeTable};
+use crate::lower::js::host::ItemIndex;
 
 use super::witness::{self, Witness};
 use super::{candidates, observed_carriers};
@@ -148,6 +150,7 @@ pub(crate) fn run(
         funcs,
         metadata,
         graph,
+        &ItemIndex::new(),
         measure,
         sole_referrer,
         zombie_free,
@@ -164,6 +167,7 @@ pub(crate) fn run_with_mode(
     funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
     metadata: &mut BTreeMap<JsName, Metadata<'_>>,
     graph: &Callgraph,
+    items: &ItemIndex,
     measure: &dyn Fn(&JsName, &Func, &Metadata<'_>) -> Option<Measurement>,
     sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
     zombie_free: &dyn Fn(&JsName) -> bool,
@@ -191,6 +195,7 @@ pub(crate) fn run_with_mode(
             metadata,
             funcs,
             graph,
+            items,
             zombie_free,
             allow_std_post_repr,
             &mut stats,
@@ -241,10 +246,13 @@ pub(crate) fn run_with_mode(
                 continue;
             };
             let origin = current.blocks[site.block].ops[site.op].origin;
-            let site_args_len = match &current.blocks[site.block].ops[site.op].kind {
-                OpKind::Call { args, .. } => args.len(),
-                _ => continue,
-            };
+            let (site_args_len, site_track_caller) =
+                match &current.blocks[site.block].ops[site.op].kind {
+                    OpKind::Call {
+                        args, track_caller, ..
+                    } => (args.len(), *track_caller),
+                    _ => continue,
+                };
             let (mut callee_func, imported) =
                 match current_metadata.import(provider, callee_func, origin) {
                     Ok(value) => value,
@@ -255,6 +263,9 @@ pub(crate) fn run_with_mode(
                 };
             if callee_func.sig.abi.caller_location && callee_func.params.len() == site_args_len + 1
             {
+                if let Some(site_fact) = site_track_caller {
+                    rewrite_forwarded_track_caller(&mut callee_func, site_fact, items);
+                }
                 strip_unused_last_param(&mut callee_func);
             }
             let table = &imported.interns.types;
@@ -531,6 +542,7 @@ fn collect_sites(
     metadata: &BTreeMap<JsName, Metadata<'_>>,
     funcs: &BTreeMap<JsName, Result<Func, Decline>>,
     graph: &Callgraph,
+    items: &ItemIndex,
     zombie_free: &dyn Fn(&JsName) -> bool,
     allow_std_post_repr: bool,
     stats: &mut InlineStats,
@@ -601,7 +613,9 @@ fn collect_sites(
                 callee_func,
                 &callee_metadata.interns,
                 args.len(),
-                track_caller.is_some(),
+                func.sig.abi.caller_location,
+                *track_caller,
+                items,
             ) {
                 stats.decline(reason);
                 continue;
@@ -682,12 +696,32 @@ fn strip_unused_last_param(callee: &mut Func) {
     }
 }
 
+/// Rewrites implicit `#[track_caller]` forwarding calls in `callee` to the call-site `SourceFactId`.
+fn rewrite_forwarded_track_caller(callee: &mut Func, site_fact: SourceFactId, items: &ItemIndex) {
+    for block in &mut callee.blocks {
+        for op in &mut block.ops {
+            if let OpKind::Call {
+                callee: Callee::Direct { item, .. },
+                track_caller: tc @ None,
+                ..
+            } = &mut op.kind
+            {
+                if items.get(item).is_some_and(|entry| entry.caller_location) {
+                    *tc = Some(site_fact);
+                }
+            }
+        }
+    }
+}
+
 /// The semantic boundary preventing a callee body from being spliced at this site.
 fn body_decline(
     callee: &Func,
     interns: &Interns,
     args: usize,
-    site_has_track_caller: bool,
+    caller_caller_location: bool,
+    site_track_caller: Option<SourceFactId>,
+    items: &ItemIndex,
 ) -> Option<&'static str> {
     if callee.has_invoke() {
         return Some("inline.exceptional-control-flow");
@@ -698,7 +732,7 @@ fn body_decline(
         } else {
             return Some("inline.track-caller-unavailable");
         }
-    } else if site_has_track_caller {
+    } else if site_track_caller.is_some() {
         return Some("inline.track-caller-unavailable");
     } else {
         args
@@ -712,6 +746,7 @@ fn body_decline(
     {
         return Some("inline.abi-unsupported");
     }
+    let forwards_caller_location = caller_caller_location && site_track_caller.is_none();
     callee
         .blocks
         .iter()
@@ -726,6 +761,11 @@ fn body_decline(
                         | RAssertMessage::ResumedAfterDrop(_),
                     ..
                 } => Some("inline.coroutine-unsupported"),
+                OpKind::Assert { .. }
+                    if callee.sig.abi.caller_location && !forwards_caller_location =>
+                {
+                    Some("inline.track-caller-unavailable")
+                }
                 // The original item owes the linker its compile-time required-by diagnostic.
                 OpKind::Zombie(_) => Some("inline.zombie"),
                 OpKind::Intrinsic { name, .. } if interns.str(*name) == Some("caller_location") => {
@@ -749,6 +789,32 @@ fn body_decline(
                 {
                     Some("inline.host-boundary")
                 }
+                OpKind::Call {
+                    callee: inner_callee,
+                    args: inner_args,
+                    track_caller: None,
+                    ..
+                } if callee.sig.abi.caller_location => match inner_callee {
+                    Callee::Direct { item, .. } => {
+                        let Some(entry) = items.get(item) else {
+                            return Some("inline.track-caller-unavailable");
+                        };
+                        if !entry.abi_known
+                            || entry.params != inner_args.len() + usize::from(entry.caller_location)
+                            || (entry.caller_location
+                                && site_track_caller.is_none()
+                                && !caller_caller_location)
+                        {
+                            Some("inline.track-caller-unavailable")
+                        } else {
+                            None
+                        }
+                    }
+                    Callee::Foreign { .. } | Callee::Runtime { .. } | Callee::Indirect { .. } => {
+                        None
+                    }
+                    _ => Some("inline.track-caller-unavailable"),
+                },
                 _ => None,
             }
         })
@@ -1261,20 +1327,40 @@ mod tests {
                 .collect();
             let sole_referrer = move |_: &JsName, _: &JsName| sole;
             let mut sizes = BTreeMap::new();
+            let mut items = ItemIndex::new();
             for (name, func) in funcs.iter() {
                 if let Ok(func) = func {
                     sizes.insert(name.clone(), measured(func));
+                    items.insert(
+                        func.item,
+                        crate::lower::js::host::ItemEntry {
+                            name: name.as_str().to_owned(),
+                            params: func.sig.abi.parameters as usize,
+                            abi_known: true,
+                            result: Some(func.sig.result),
+                            caller_location: func.sig.abi.caller_location,
+                            used_params: BTreeSet::new(),
+                            standard: None,
+                            keyed_purity: None,
+                            keyed_read_params: None,
+                            keyed_may_unwind: None,
+                            keyed_row_capture: None,
+                            keyed_proxy_safe_params: None,
+                        },
+                    );
                 }
             }
-            run(
+            run_with_mode(
                 funcs,
                 &mut metadata,
                 &graph,
+                &items,
                 &measure,
                 &sole_referrer,
                 &|_: &JsName| true,
                 program_bytes,
                 &sizes,
+                false,
             )
         }
 
@@ -2150,5 +2236,171 @@ mod tests {
             "DCE before pricing removes constant-folded dead arm"
         );
         assert_eq!(prog.calls_in("f"), 0);
+    }
+
+    #[test]
+    fn forwarded_track_caller_call_receives_site_fact_when_inlined() {
+        let mut prog = Prog::new();
+        let file = prog.strid("caller.rs");
+        let site_fact = prog
+            .interns
+            .intern_source_fact(crate::jir::origin::SourceFact {
+                file,
+                line: 42,
+                col: 5,
+            });
+        let caller_loc_name = prog.strid("caller_location");
+        let line_of_caller_str = prog.strid("line_of_caller");
+        let through_str = prog.strid("through");
+
+        // `#[track_caller] fn line_of_caller() -> u32 { intrinsic("caller_location") }`
+        let mut loc_sig = sig(1);
+        loc_sig.abi.caller_location = true;
+        let mut loc_b = FuncBuilder::new(item(3), loc_sig);
+        let _loc_param = loc_b.param(I32, O);
+        let loc_val = loc_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Intrinsic {
+                name: caller_loc_name,
+                types: Vec::new(),
+                args: Vec::new(),
+                fallback: None,
+            },
+            I32,
+            O,
+        );
+        loc_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(loc_val)));
+        let line_of_caller = loc_b.finish();
+
+        // `#[track_caller] fn through() -> u32 { line_of_caller() }` (track_caller: None)
+        let mut through_sig = sig(1);
+        through_sig.abi.caller_location = true;
+        let mut through_b = FuncBuilder::new(item(2), through_sig);
+        let _unused_loc = through_b.param(I32, O);
+        let forwarded = through_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(3),
+                    link_name: line_of_caller_str,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        through_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(forwarded)));
+        let through = through_b.finish();
+
+        // `fn caller() -> u32 { through() }` with `track_caller: Some(site_fact)`
+        let mut caller_b = FuncBuilder::new(item(1), sig(0));
+        let res = caller_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: through_str,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: Some(site_fact),
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        caller_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(res)));
+        let caller = caller_b.finish();
+
+        prog.add("line_of_caller", line_of_caller);
+        prog.add("through", through);
+        prog.add("caller", caller);
+        let stats = prog.run(100_000, true);
+        assert_eq!(stats.applied, 1, "through should inline into caller");
+
+        let calls: Vec<_> = prog
+            .func("caller")
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    callee: Callee::Direct { item, .. },
+                    track_caller,
+                    ..
+                } => Some((*item, *track_caller)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, vec![(item(3), Some(site_fact))]);
+    }
+
+    #[test]
+    fn track_caller_callee_with_assert_is_refused_in_non_track_caller_site() {
+        let mut prog = Prog::new();
+        let file = prog.strid("caller.rs");
+        let site_fact = prog
+            .interns
+            .intern_source_fact(crate::jir::origin::SourceFact {
+                file,
+                line: 7,
+                col: 1,
+            });
+        let g_str = prog.strid("g");
+
+        let mut g_sig = sig(2);
+        g_sig.abi.caller_location = true;
+        let mut g_b = FuncBuilder::new(item(2), g_sig);
+        let x = g_b.param(I32, O);
+        let _unused_loc = g_b.param(I32, O);
+        g_b.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Assert {
+                cond: x,
+                expected: true,
+                msg: RAssertMessage::BoundsCheck {
+                    length: x,
+                    index: x,
+                },
+            },
+            O,
+        );
+        g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(x)));
+        let g = g_b.finish();
+
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let p = f_b.param(I32, O);
+        let call = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: g_str,
+                },
+                function: None,
+                args: vec![p],
+                track_caller: Some(site_fact),
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+        let f = f_b.finish();
+
+        prog.add("g", g);
+        prog.add("f", f);
+        let stats = prog.run(100_000, true);
+        assert_eq!(stats.applied, 0);
+        assert_eq!(
+            stats.declined.get("inline.track-caller-unavailable"),
+            Some(&1)
+        );
     }
 }
