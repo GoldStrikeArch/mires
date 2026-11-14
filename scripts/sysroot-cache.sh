@@ -125,12 +125,90 @@ jsc_normalize_emit_args() {
 	jsc_normalize_args "$profile${profile:+ }$emit"
 }
 
-jsc_sysroot_args() {
-	if [ "${JSC_SYSROOT_ARGS+x}" = x ]; then
-		jsc_normalize_emit_args "$JSC_SYSROOT_ARGS"
+# The panic strategy `JSC_PANIC` selects: `abort` (unset, the default) or `unwind`.
+#
+# `abort` is the compiler as it always was: target wasm32-unknown-unknown, `-Cpanic=abort`, and
+# host-exception cleanup re-derived by the backend from unoptimized MIR (`js-cleanup=on`). `unwind`
+# compiles the sysroot and every crate for targets/mires32-unwind.json, whose panic strategy is
+# `unwind`, with `-Cpanic=unwind`: rustc's optimized MIR then keeps its unwind edges and the backend
+# lowers those instead, so `js-cleanup=off` follows the caller's backend options
+# (`jsc_mode_backend_args`). With `JSC_PANIC` unset nothing here changes a key, a flag or a path.
+jsc_panic() {
+	case "${JSC_PANIC:-}" in
+	"" | abort) printf 'abort' ;;
+	unwind) printf 'unwind' ;;
+	*)
+		echo "sysroot-cache.sh: invalid JSC_PANIC: $JSC_PANIC (expected unset, abort or unwind)" >&2
+		return 1
+		;;
+	esac
+}
+
+# The target spec the unwind mode compiles for.
+jsc_unwind_target_spec() {
+	printf '%s/targets/mires32-unwind.json' "$1"
+}
+
+# Sets, for the scripts that run rustc or cargo, what the mode compiles with:
+#
+#   jsc_panic_mode     `abort` or `unwind`;
+#   jsc_panic_flag     `-Cpanic=abort` or `-Cpanic=unwind`;
+#   jsc_target         what `--target` takes: the triple, or the spec file's path;
+#   jsc_target_name    the name rustc and cargo give the target: the triple, or the spec file's
+#                      stem. It names the sysroot's `lib/rustlib/<name>/lib` and cargo's
+#                      `target/<name>/`, and it is the `target` a cache key records;
+#   jsc_unstable_args  rustc's `-Zunstable-options`, which a target spec file requires;
+#   jsc_cargo_args     cargo's `-Zjson-target-spec`, likewise.
+#
+# In `abort` mode the two argument lists are empty, so a command line is exactly what it was.
+jsc_select_mode() {
+	local root=$1
+	jsc_panic_mode=$(jsc_panic) || return 1
+	case "$jsc_panic_mode" in
+	abort)
+		jsc_target=wasm32-unknown-unknown
+		jsc_target_name=wasm32-unknown-unknown
+		jsc_unstable_args=()
+		jsc_cargo_args=()
+		;;
+	unwind)
+		jsc_target=$(jsc_unwind_target_spec "$root")
+		if [ ! -f "$jsc_target" ]; then
+			echo "sysroot-cache.sh: JSC_PANIC=unwind needs the target spec $jsc_target" >&2
+			return 1
+		fi
+		jsc_target_name=$(basename -- "$jsc_target" .json)
+		jsc_unstable_args=(-Zunstable-options)
+		jsc_cargo_args=(-Zjson-target-spec)
+		;;
+	esac
+	jsc_panic_flag=-Cpanic=$jsc_panic_mode
+}
+
+# The caller's backend options as the mode compiles with them: unchanged in `abort` mode, and with
+# `js-cleanup=off` appended in `unwind` mode. Appended, so that it overrides a `js-cleanup=on` or a
+# release profile anywhere before it (the last value of an option wins, and an explicit option beats
+# a profile, which is how the backend parses), and a suite that pins `js-cleanup=on` runs in either
+# mode unchanged. This is the one place that override is made.
+jsc_mode_backend_args() {
+	local args=${1:-}
+	local panic
+	panic=$(jsc_panic) || return 1
+	if [ "$panic" = unwind ]; then
+		printf '%s' "$args${args:+ }js-cleanup=off"
 	else
-		jsc_normalize_emit_args "${JS_EXTRA_ARGS:-}"
+		printf '%s' "$args"
 	fi
+}
+
+jsc_sysroot_args() {
+	local args
+	if [ "${JSC_SYSROOT_ARGS+x}" = x ]; then
+		args=$(jsc_mode_backend_args "$JSC_SYSROOT_ARGS") || return 1
+	else
+		args=$(jsc_mode_backend_args "${JS_EXTRA_ARGS:-}") || return 1
+	fi
+	jsc_normalize_emit_args "$args"
 }
 
 jsc_sha256() {
@@ -183,13 +261,21 @@ jsc_sysroot_key() {
 	local channel
 	local rustc_identity
 	local rust_opt=${JSC_RUST_OPT_LEVEL:-default}
+	local panic
+	local spec
 
 	if [ ! -f "$dylib" ]; then
 		echo "sysroot-cache.sh: backend not built: $dylib" >&2
 		return 1
 	fi
+	panic=$(jsc_panic) || return 1
+	spec=$(jsc_unwind_target_spec "$root")
+	if [ "$panic" = unwind ] && [ ! -f "$spec" ]; then
+		echo "sysroot-cache.sh: JSC_PANIC=unwind needs the target spec $spec" >&2
+		return 1
+	fi
 	channel=$(jsc_pinned_channel "$root")
-	args=$(jsc_sysroot_args)
+	args=$(jsc_sysroot_args) || return 1
 	if ! rustc_identity=$(rustc "+$channel" -vV 2>/dev/null); then
 		echo "sysroot-cache.sh: cannot identify pinned toolchain $channel" >&2
 		return 1
@@ -204,6 +290,12 @@ jsc_sysroot_key() {
 		printf 'target=%s\n' "$target"
 		printf 'rust-opt=%s\n' "$rust_opt"
 		printf 'js-args=%s\n' "$args"
+		# The unwind mode's own inputs. They are absent from an `abort` key, so every key computed
+		# before the mode existed is still the key computed now.
+		if [ "$panic" = unwind ]; then
+			printf 'panic=unwind\n'
+			printf 'target-spec=%s\n' "$(jsc_sha256_file "$spec")"
+		fi
 	} | jsc_sha256
 }
 
@@ -261,7 +353,8 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 	fi
 	script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 	root=$(cd -- "$script_dir/.." && pwd)
-	target=${JSC_TARGET:-wasm32-unknown-unknown}
+	jsc_select_mode "$root" || exit 2
+	target=${JSC_TARGET:-$jsc_target_name}
 	case "$(uname -s)" in
 	Darwin) dylib="$root/target/release/librustc_codegen_mires.dylib" ;;
 	*) dylib="$root/target/release/librustc_codegen_mires.so" ;;

@@ -52,6 +52,12 @@
 # build does. It is off by default; turning it on changes the emitted JavaScript
 # in every optimizer mode, so it is a build setting rather than an optimizer
 # pass.
+#
+# $JSC_PANIC=unwind selects the unwind build mode: the crate is compiled for
+# targets/mires32-unwind.json with `-Cpanic=unwind` against the sysroot
+# build_sysroot.sh built in the same mode, and `js-cleanup=off` follows
+# $JS_EXTRA_ARGS (see `jsc_panic` in scripts/sysroot-cache.sh). Unset, the
+# command line is exactly the default one.
 
 set -euo pipefail
 
@@ -176,9 +182,11 @@ off | on) ;;
 	;;
 esac
 
+jsc_select_mode "$root" || exit 2
+
 sysroot=$(jsc_resolve_sysroot \
-	"$root" wasm32-unknown-unknown "$dylib")
-if [ ! -d "$sysroot/lib/rustlib/wasm32-unknown-unknown/lib" ]; then
+	"$root" "$jsc_target_name" "$dylib")
+if [ ! -d "$sysroot/lib/rustlib/$jsc_target_name/lib" ]; then
 	echo "compile_core.sh: no sysroot at $sysroot" >&2
 	echo "compile_core.sh: build matching settings with scripts/build_sysroot.sh" >&2
 	exit 1
@@ -201,8 +209,9 @@ trap cleanup EXIT
 
 # Rustc tracks the path but not the backend file's contents.
 backend_args=(-Cllvm-args="js-producer=$(jsc_sha256_file "$dylib")")
-if [ -n "${JS_EXTRA_ARGS:-}" ]; then
-	backend_args+=(-Cllvm-args="$JS_EXTRA_ARGS")
+extra_args=$(jsc_mode_backend_args "${JS_EXTRA_ARGS:-}")
+if [ -n "$extra_args" ]; then
+	backend_args+=(-Cllvm-args="$extra_args")
 fi
 
 rust_opt_args=()
@@ -236,11 +245,12 @@ set +e
 		rustc "+$channel" \
 			-Zcodegen-backend="$dylib" \
 			--edition 2021 \
-			--target wasm32-unknown-unknown \
+			--target "$jsc_target" \
+			${jsc_unstable_args[@]+"${jsc_unstable_args[@]}"} \
 			--sysroot "$sysroot" \
 			--crate-type "$crate_type" \
 			${name_args[@]+"${name_args[@]}"} \
-			-Ccodegen-units=1 -Cpanic=abort -Coverflow-checks=off -Cdebug-assertions=off -Cdebuginfo=0 \
+			-Ccodegen-units=1 "$jsc_panic_flag" -Coverflow-checks=off -Cdebug-assertions=off -Cdebuginfo=0 \
 			${rust_opt_args[@]+"${rust_opt_args[@]}"} \
 			${mir_inline_args[@]+"${mir_inline_args[@]}"} \
 			${remap_args[@]+"${remap_args[@]}"} \

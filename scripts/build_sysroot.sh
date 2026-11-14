@@ -9,6 +9,11 @@
 #
 # Set SKIP_BUILD=1 to reuse an already-built backend dylib.
 #
+# Set JSC_PANIC=unwind for the unwind build mode: the sysroot is built for
+# targets/mires32-unwind.json with `-Cpanic=unwind`, `js-cleanup=off` follows
+# $JS_EXTRA_ARGS, and it is keyed apart from every default sysroot (see
+# `jsc_panic` in scripts/sysroot-cache.sh).
+#
 # $JS_EXTRA_ARGS is passed on to the backend as `-Cllvm-args`, exactly as
 # scripts/compile.sh does. Any option that changes what the backend emits has to
 # be given to BOTH this script and the crate build that uses the sysroot, or the
@@ -71,7 +76,11 @@ for arg in "$@"; do
 	esac
 done
 
-target=wasm32-unknown-unknown
+# `JSC_PANIC=unwind` builds for targets/mires32-unwind.json with `-Cpanic=unwind` instead (see
+# `jsc_panic` in sysroot-cache.sh); unset, the target is wasm32-unknown-unknown as it always was.
+# `$target` is the target's name, which keys the cache and names the sysroot's library directory.
+jsc_select_mode "$root" || exit 2
+target=$jsc_target_name
 
 channel=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' \
 	"$root/rust-toolchain.toml" | head -n 1)
@@ -108,7 +117,7 @@ esac
 # Equivalent option sets share a cache entry and are also passed to rustc in
 # this canonical order. This avoids a key that claims two differently ordered
 # invocations are identical while compiling them differently.
-JS_EXTRA_ARGS=$(jsc_sysroot_args)
+JS_EXTRA_ARGS=$(jsc_sysroot_args) || exit 2
 export JS_EXTRA_ARGS
 key=$(jsc_sysroot_key "$root" "$target" "$dylib")
 case "$key" in
@@ -160,6 +169,7 @@ if [ "$clean" = 1 ]; then
 fi
 
 activate_legacy_default() {
+	[ "$jsc_panic_mode" = abort ] || return 0
 	[ -z "$JS_EXTRA_ARGS" ] || return 0
 	[ -z "${JSC_RUST_OPT_LEVEL:-}" ] || return 0
 	local legacy="$root/build/sysroot"
@@ -241,7 +251,11 @@ fi
 #
 #   -Zinline-mir             more of core lands as one MIR body, which this
 #                            backend turns into one JS function
-#   -Cpanic=abort            no unwinding: `Drop` on the panic path is out
+#   -Cpanic=abort            no unwinding: `Drop` on the panic path is out.
+#                            `JSC_PANIC=unwind` passes `-Cpanic=unwind` (and the
+#                            `-Zunstable-options` a target spec file needs)
+#                            instead, so `core` and `alloc` keep their unwind
+#                            edges for the backend to lower
 #   -Zforce-unstable-if-unmarked  the sysroot crate rule
 #   -Ccodegen-units=1        one object per crate, which is what link.rs reads
 #   -Cdebuginfo=0            there is no debug info format to emit
@@ -261,15 +275,21 @@ if [ -n "${JSC_RUST_OPT_LEVEL:-}" ]; then
 	rust_opt_arg=" -Copt-level=$JSC_RUST_OPT_LEVEL"
 fi
 
-export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="\
+rustflags="\
 -Zcodegen-backend=$dylib \
 -Zinline-mir \
--Cpanic=abort \
+$jsc_panic_flag \
 -Zforce-unstable-if-unmarked \
 -Ccodegen-units=1 \
 -Coverflow-checks=off \
 -Cdebug-assertions=off \
 -Cdebuginfo=0$backend_args$rust_opt_arg"
+if [ ${#jsc_unstable_args[@]} -gt 0 ]; then
+	rustflags="${jsc_unstable_args[*]} $rustflags"
+fi
+# Cargo names the variable after the target: the triple, or a spec file's stem.
+rustflags_variable=CARGO_TARGET_$(printf '%s' "$target" | tr 'a-z.-' 'A-Z__')_RUSTFLAGS
+export "$rustflags_variable=$rustflags"
 
 # Almost every dependency is a path dependency inside the copied tree, but not
 # quite all: compiler-builtins pulls cfg-if from crates.io. A machine that has
@@ -304,16 +324,16 @@ fi
 start=$(date +%s)
 
 echo "==> building core"
-cargo "+$channel" build --release --target "$target" \
+cargo "+$channel" ${jsc_cargo_args[@]+"${jsc_cargo_args[@]}"} build --release --target "$jsc_target" \
 	--manifest-path "$stdlib/library/core/Cargo.toml"
 
 echo "==> building compiler_builtins"
-cargo "+$channel" build --release --target "$target" \
+cargo "+$channel" ${jsc_cargo_args[@]+"${jsc_cargo_args[@]}"} build --release --target "$jsc_target" \
 	--manifest-path "$stdlib/library/compiler-builtins/compiler-builtins/Cargo.toml" \
 	--features compiler-builtins,mem
 
 echo "==> building alloc"
-cargo "+$channel" build --release --target "$target" \
+cargo "+$channel" ${jsc_cargo_args[@]+"${jsc_cargo_args[@]}"} build --release --target "$jsc_target" \
 	--manifest-path "$stdlib/library/alloc/Cargo.toml"
 
 elapsed=$(($(date +%s) - start))

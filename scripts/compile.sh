@@ -44,6 +44,11 @@
 # written to the `-o` path, so it is only correct on the normal path below; if
 # rustc names the artifact itself and the fallback rename at the bottom of this
 # script has to run, the map keeps the name rustc chose.
+#
+# $JSC_PANIC=unwind selects the unwind build mode: targets/mires32-unwind.json
+# (wasm32-unknown-unknown with an `unwind` panic strategy), `-Cpanic=unwind`,
+# and `js-cleanup=off` after $JS_EXTRA_ARGS (see `jsc_panic` in
+# scripts/sysroot-cache.sh). Unset, the command line is exactly the default one.
 
 set -euo pipefail
 
@@ -100,6 +105,8 @@ if [ ! -f "$JSC_LINK_BIN" ]; then
 	exit 1
 fi
 
+jsc_select_mode "$root" || exit 2
+
 # rustc derives the crate name from the file stem, with `-` mapped to `_`.
 crate=$(basename -- "$src" .rs | tr '-' '_')
 
@@ -125,8 +132,9 @@ stderr_file="$out_dir/.compile-stderr.$$"
 
 # Rustc tracks the path but not the backend file's contents.
 backend_args=(-Cllvm-args="js-producer=$(jsc_sha256_file "$dylib")")
-if [ -n "${JS_EXTRA_ARGS:-}" ]; then
-	backend_args+=(-Cllvm-args="$JS_EXTRA_ARGS")
+extra_args=$(jsc_mode_backend_args "${JS_EXTRA_ARGS:-}")
+if [ -n "$extra_args" ]; then
+	backend_args+=(-Cllvm-args="$extra_args")
 fi
 
 rust_opt_args=()
@@ -156,8 +164,9 @@ set +e
 		rustc "+$channel" \
 			-Zcodegen-backend="$dylib" \
 			--edition 2021 --crate-type lib --emit=obj \
-			--target wasm32-unknown-unknown \
-			-Ccodegen-units=1 -Cpanic=abort -Coverflow-checks=off -Cdebug-assertions=off -Cdebuginfo=0 \
+			--target "$jsc_target" \
+			${jsc_unstable_args[@]+"${jsc_unstable_args[@]}"} \
+			-Ccodegen-units=1 "$jsc_panic_flag" -Coverflow-checks=off -Cdebug-assertions=off -Cdebuginfo=0 \
 			${rust_opt_args[@]+"${rust_opt_args[@]}"} \
 			${mir_inline_args[@]+"${mir_inline_args[@]}"} \
 			--remap-path-prefix "$root/=" \
