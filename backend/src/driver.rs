@@ -132,10 +132,7 @@ fn codegen_cgu_inner(tcx: TyCtxt<'_>, cgu_name: Symbol) -> JsModule {
                             .with_baseline_shadow(shadow)
                     };
                     let mut item = item;
-                    if cx.opts.cleanup
-                        && item.jir.is_none()
-                        && crate::coroutine_source::cleanup_body(tcx, instance).is_some()
-                    {
+                    if item.jir.is_none() && requires_cleanup_lowering(&cx, instance) {
                         item.zombies.push(rcgjs_object::item::Zombie {
                             loc: tcx
                                 .sess
@@ -242,6 +239,35 @@ fn codegen_cgu_inner(tcx: TyCtxt<'_>, cgu_name: Symbol) -> JsModule {
     module.interns = cx.take_interns();
     crate::coroutine_source::append(tcx, &mut module.interns);
     module
+}
+
+/// Whether the body an item was lowered from carries cleanup that only the JIR lane can keep.
+///
+/// Baseline text has no lowering for an unwind edge, so an item whose JIR encoding was declined
+/// would print with its cleanup paths silently dropped. Its zombie is what refuses a program that
+/// reaches it instead. Two configurations hand the backend such a body:
+///
+/// * `js-cleanup=on`: the cleanup body re-derived from unoptimized MIR, when there is one
+///   ([`crate::coroutine_source::cleanup_body`]);
+/// * `-Cpanic=unwind` (the unwind build mode, `JSC_PANIC=unwind`): otherwise rustc's own optimized
+///   MIR, which keeps its unwind edges. Any cleanup block in it is an obligation.
+///
+/// Under `-Cpanic=abort` the second never applies (rustc removed every cleanup edge), so this is
+/// exactly the earlier `js-cleanup=on` check, evaluated in the same order.
+fn requires_cleanup_lowering<'tcx>(
+    cx: &CguCx<'tcx>,
+    instance: rustc_middle::ty::Instance<'tcx>,
+) -> bool {
+    let tcx = cx.tcx;
+    if cx.opts.cleanup && crate::coroutine_source::cleanup_body(tcx, instance).is_some() {
+        return true;
+    }
+    tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind
+        && tcx
+            .instance_mir(instance.def)
+            .basic_blocks
+            .iter()
+            .any(|block| block.is_cleanup)
 }
 
 /// Moves the JIR body out of a late-IR summary, so that the object stores it once (S3) and the
