@@ -2094,6 +2094,7 @@ fn assert_carrier_composition(with_slice_view: bool, owned_carrier: Option<Carri
             abi: None,
             physical: None,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            bigints: None,
         };
         program.push_str(&jsast::stmt_to_string(
             &lower_func(&input, func).unwrap().decl,
@@ -2499,6 +2500,7 @@ fn format_site_js(
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = lower_func(&input, &func)
         .unwrap_or_else(|decline| panic!("the format kernel declined `{name}`: {decline}"));

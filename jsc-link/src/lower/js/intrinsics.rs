@@ -26,8 +26,8 @@ use std::cell::RefCell;
 use rcgjs_object::evaluation::OperandEvaluation;
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::interns::StrId;
-use rcgjs_object::jir::repr::{Op, ValueId};
-use rcgjs_object::jir::semantic::DirectItemRef;
+use rcgjs_object::jir::repr::{Op, OpKind, ValueId};
+use rcgjs_object::jir::semantic::{ConstTree, DirectItemRef};
 use rcgjs_object::jir::types::{IntRepr, NominalForm, TypeId, TypeKind};
 use rcgjs_object::jsast::{self, BinOp, Expr, Stmt};
 use rcgjs_object::ptr;
@@ -644,15 +644,26 @@ impl Intrinsic<'_, '_> {
     }
 
     /// `rotate_left` / `rotate_right`, as the pair of shifts JavaScript spells directly.
+    ///
+    /// A constant amount of a BigInt rotate is reduced here when the declaration hoists its BigInt
+    /// constants: `amount & (bits - 1)` is then a number literal, which needs no temporary and
+    /// widens to a BigInt constant (`JsCx::to_bigint`) rather than a `BigInt(..)` call per use.
     fn rotate(&self, left: bool, int: Int) -> Res<Outcome> {
         let value = self.temp(int.zero_extend(self.arg(0)?));
-        let amount = self.temp(jsast::binary(
-            BinOp::BitAnd,
-            self.arg(1)?,
-            jsast::num((int.bits - 1) as f64),
-        ));
+        let constant = match int.repr {
+            IntRepr::BigInt if self.cx.hoists_bigints() => self.constant_u32(1),
+            _ => None,
+        };
+        let amount = match constant {
+            Some(shift) => jsast::num(shift & (int.bits - 1)),
+            None => self.temp(jsast::binary(
+                BinOp::BitAnd,
+                self.arg(1)?,
+                jsast::num((int.bits - 1) as f64),
+            )),
+        };
         let amount = match int.repr {
-            IntRepr::BigInt => jsast::to_bigint(amount),
+            IntRepr::BigInt => self.cx.to_bigint(amount),
             IntRepr::Number => amount,
         };
         let width = int.literal(i128::from(int.bits));
@@ -915,7 +926,7 @@ impl Intrinsic<'_, '_> {
     fn shift_amount(&self, int: Int, amount: Expr) -> Res<Expr> {
         let rhs_repr = self.cx.table.int_repr(self.arg_ty(1)?);
         Ok(match (int.repr, rhs_repr) {
-            (IntRepr::BigInt, IntRepr::Number) => jsast::to_bigint(amount),
+            (IntRepr::BigInt, IntRepr::Number) => self.cx.to_bigint(amount),
             (IntRepr::Number, IntRepr::BigInt) => {
                 jsast::to_number(jsast::bigint_mask(false, 32, amount))
             }
@@ -1443,6 +1454,17 @@ impl Intrinsic<'_, '_> {
                 self.args.len(),
                 index + 1
             ))),
+        }
+    }
+
+    /// The `u32` an argument holds when it is a constant. The plan names every operand of a
+    /// materializing intrinsic, a constant included (`fuse.rs`), so the value is read off the
+    /// operand's own definition rather than off its spelling.
+    fn constant_u32(&self, index: usize) -> Option<u32> {
+        let op = self.cx.def_of(*self.args.get(index)?)?;
+        match &op.kind {
+            OpKind::Const(ConstTree::Scalar { bits, bytes: 4 }) => u32::try_from(*bits).ok(),
+            _ => None,
         }
     }
 

@@ -96,6 +96,9 @@ pub struct JsCx<'a> {
     pub target_abi: Option<&'a crate::plan::abi_flat::FlatSig>,
     /// Private native-version targets selected for direct calls in this body.
     pub call_retargets: &'a crate::lower::CallRetargets,
+    /// Whether this lowering hoists BigInt constants (`crate::lower::LowerInput::bigints`), and
+    /// so widens an integer literal at compile time ([`JsCx::to_bigint`]).
+    hoists_bigints: bool,
     /// What one `view!` template instantiated in this body knows, by the value the
     /// `rcgjs.tc.template` call defined (`template.rs`).
     pub(super) instantiations: RefCell<BTreeMap<ValueId, template::Instantiation>>,
@@ -160,6 +163,7 @@ impl<'a> JsCx<'a> {
             physical: None,
             target_abi: None,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            hoists_bigints: false,
             instantiations: RefCell::new(BTreeMap::new()),
             exprs: RefCell::new(BTreeMap::new()),
             tagged_exprs: RefCell::new(BTreeMap::new()),
@@ -248,6 +252,29 @@ impl<'a> JsCx<'a> {
     pub fn with_call_retargets(mut self, call_retargets: &'a crate::lower::CallRetargets) -> Self {
         self.call_retargets = call_retargets;
         self
+    }
+
+    /// The same context, lowering for a declaration whose BigInt constants are hoisted.
+    pub fn with_bigint_hoist(mut self, hoists: bool) -> Self {
+        self.hoists_bigints = hoists;
+        self
+    }
+
+    /// Whether this lowering hoists BigInt constants.
+    pub fn hoists_bigints(&self) -> bool {
+        self.hoists_bigints
+    }
+
+    /// `BigInt(value)`, the widening of a number to a BigInt (`jsast::to_bigint`). When this
+    /// lowering hoists BigInt constants and `value` is an integer literal, the widening is done
+    /// here instead: the result is the BigInt literal, which the hoist then names like any other
+    /// constant. Without the hoist the call is kept, so `js-ecma-target=latest` and the cost trials
+    /// print what they always printed.
+    pub fn to_bigint(&self, value: Expr) -> Expr {
+        match crate::lower::bigint::integer_literal(&value) {
+            Some(integer) if self.hoists_bigints => jsast::bigint(integer),
+            _ => jsast::to_bigint(value),
+        }
     }
 
     /// Gives a semantic value a physical JavaScript expression. Slice-lane parameters use this

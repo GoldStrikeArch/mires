@@ -43,7 +43,8 @@ pub fn lower(
     .with_abi(input.abi)
     .with_physical(input.name, input.physical)
     .with_target_abi(physical)
-    .with_call_retargets(input.call_retargets);
+    .with_call_retargets(input.call_retargets)
+    .with_bigint_hoist(input.bigints.is_some());
 
     // The parameter list (`base.rs::params`): `Func.params` in order — one per MIR argument, a
     // splatted tuple already as its arity, the caller `Location` last when the body tracks it.
@@ -253,6 +254,7 @@ pub fn lower(
         plan.source_names.clone(),
         cx.take_zombies(),
         allocation_origins,
+        input.bigints,
     )
 }
 
@@ -286,7 +288,9 @@ pub fn lower_static(input: &LowerInput<'_>, plan: &Plan) -> Result<LoweredItem, 
         jsast::array(vec![value])
     };
     let decl = jsast::let_(input.name.as_str(), value);
-    finish(input, decl, Vec::new(), cx.take_zombies(), Vec::new())
+    // A static's initializer runs once, while the module evaluates, so naming its BigInt constants
+    // would buy nothing at run time and cost a declaration per value (`lower/bigint.rs`).
+    finish(input, decl, Vec::new(), cx.take_zombies(), Vec::new(), None)
 }
 
 /// A vtable: `const NAME = [<drop or null>, <size>, <align>, <method>, ..]` (`vtable.rs`).
@@ -319,7 +323,7 @@ pub fn lower_vtable(input: &LowerInput<'_>) -> Result<LoweredItem, Decline> {
         .collect();
     let _ = (size, align);
     let decl = jsast::const_(input.name.as_str(), jsast::array(slots));
-    finish(input, decl, Vec::new(), Vec::new(), Vec::new())
+    finish(input, decl, Vec::new(), Vec::new(), Vec::new(), None)
 }
 
 /// A function with no blocks, for the contexts that lower a static (constants only).
@@ -335,20 +339,30 @@ fn empty_func(input: &LowerInput<'_>) -> Func {
 }
 
 /// The `LoweredItem` around a finished declaration: refs by `visit_free_idents`, the names table
-/// led by the item's own debug path, the root location.
+/// led by the item's own debug path, the root location. `bigints` names the declaration's BigInt
+/// constants when it is a function lowered for phase C on the ES2018 target.
 fn finish(
     input: &LowerInput<'_>,
     decl: Stmt,
     originals: Vec<(String, String)>,
     zombies: Vec<rcgjs_object::item::FlatZombie>,
     js_alloc_origins: Vec<crate::analysis::js_alloc::Origin>,
+    bigints: Option<&crate::lower::bigint::BigIntNames>,
 ) -> Result<LoweredItem, Decline> {
     // A baseline item passes through the shared finished-JavaScript SROA and DCE pipeline in
     // `JsItem::new`. JIR replacements are installed directly by the linker, so run the same
     // passes here: the semantic optimizer has already done the typed work, but final structuring
     // can expose one last object literal that is only read field by field.
     let decl = rcgjs_object::sroa::analyze_jir(decl, input.opts.optimizer).decl;
-    let decl = rcgjs_object::optimizer::analyze(decl, input.opts.optimizer).decl;
+    let mut decl = rcgjs_object::optimizer::analyze(decl, input.opts.optimizer).decl;
+    // On the ES2018 target a BigInt constant is a call that parses its digits whenever it runs, so
+    // a function's final lowering names a module-level binding instead (`lower/bigint.rs`). Last,
+    // so the passes above see the constants the trials priced, and before the refs are taken, so
+    // the bindings are references like any other.
+    let mut hoisted = BTreeSet::new();
+    if let Some(names) = bigints {
+        crate::lower::bigint::hoist(&mut decl, names, &mut hoisted);
+    }
     let mut refs = BTreeSet::new();
     jsast::visit_free_idents(&decl, &mut |ident| {
         if ident != input.name.as_str() {
@@ -391,6 +405,7 @@ fn finish(
         dts: None,
         zombies,
         js_alloc_origins,
+        bigints: hoisted,
     })
 }
 

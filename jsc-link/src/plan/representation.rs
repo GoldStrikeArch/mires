@@ -320,6 +320,7 @@ fn native_lowered(name: &JsName, body: &NativeBody) -> crate::lower::LoweredItem
         dts: None,
         zombies: Vec::new(),
         js_alloc_origins: Vec::new(),
+        bigints: BTreeSet::new(),
     }
 }
 
@@ -1220,6 +1221,7 @@ impl Planner<'_> {
             abi: None,
             physical: None,
             call_retargets,
+            bigints: None,
         })
     }
 

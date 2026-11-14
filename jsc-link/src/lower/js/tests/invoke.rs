@@ -280,6 +280,7 @@ fn check_emission(
                         abi: None,
                         physical: None,
                         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+                        bigints: None,
                     };
                     let lowered = function::lower(&input, func, &plan, structured.region).unwrap();
                     let mut decl =

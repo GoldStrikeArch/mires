@@ -567,6 +567,7 @@ fn lower_retargeted(
         abi: None,
         physical: None,
         call_retargets,
+        bigints: None,
     };
     match function::lower(&input, func, plan, region) {
         Ok(item) => jsast::stmt_to_string(&item.decl),
@@ -1621,6 +1622,86 @@ fn bigint_and_float_and_casts_spell_as_v1() {
     );
 }
 
+/// `a >> 33u32` at i64, lowered as phase C lowers it with BigInt constants hoisted, and as every
+/// other lowering (the cost trials, `js-ecma-target=latest`) lowers it.
+#[test]
+fn a_hoisting_lowering_names_its_bigint_constants_and_widens_constant_shift_amounts() {
+    let interns = world();
+    let mut b = FuncBuilder::new(item(1), signature(vec![I64], I64));
+    let a = b.param(I64, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let amount = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 33, bytes: 4 }),
+        U32,
+        NO_ORIGIN,
+    );
+    let shifted = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Shr,
+            l: a,
+            r: amount,
+            ty: I64,
+        },
+        I64,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(shifted)));
+    let func = b.finish();
+    let plan = plan_of(&func, &[(0, "a")]);
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let names =
+        crate::lower::bigint::BigIntNames::allocate(&std::collections::BTreeMap::new(), &[])
+            .expect("an empty program spells no prefix");
+    let opts = Opts::default();
+    let name = JsName::new("g".to_owned());
+    let summary = summary(&[]);
+    let lowered = |bigints| {
+        let input = LowerInput {
+            name: &name,
+            summary: &summary,
+            body: &body,
+            origins: None,
+            interns: &interns,
+            table: &interns.types,
+            opts: &opts,
+            items: super::host::EMPTY_ITEMS,
+            drop_glue: super::host::EMPTY_DROP_GLUE,
+            vtables: &super::unsize::EMPTY_VTABLES,
+            spills: &[],
+            abi: None,
+            physical: None,
+            call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            bigints,
+        };
+        match function::lower(&input, &func, &plan, straight(&func)) {
+            Ok(item) => item,
+            Err(decline) => panic!("declined: {decline}"),
+        }
+    };
+
+    let inline = lowered(None);
+    assert_eq!(
+        jsast::stmt_to_string(&inline.decl),
+        "function g(a) {\n  return BigInt.asIntN(64, a >> (BigInt(33) & 63n));\n}\n"
+    );
+    assert!(inline.bigints.is_empty());
+
+    let hoisted = lowered(Some(&names));
+    assert_eq!(
+        jsast::stmt_to_string(&hoisted.decl),
+        "function g(a) {\n  return BigInt.asIntN(64, a >> ($BI_33 & $BI_63));\n}\n"
+    );
+    assert_eq!(
+        hoisted.bigints,
+        std::collections::BTreeSet::from(["33".to_owned(), "63".to_owned()])
+    );
+    // The bindings are references like any other, which is what the lane driver prepares.
+    assert!(hoisted.refs.contains(&JsName::new("$BI_33".to_owned())));
+    assert!(hoisted.refs.contains(&JsName::new("$BI_63".to_owned())));
+}
+
 #[test]
 fn enum_switch_matches_the_18_enum_shapes_golden() {
     let interns = world();
@@ -2039,6 +2120,7 @@ fn if_and_while_regions_spell_tests_and_loops() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = function::lower(&input, &func, &plan, region()).expect("lowers with maps");
     let (mapped, mappings) =
@@ -2320,6 +2402,7 @@ fn cells_slots_and_direct_calls_match_the_14_pointers_entry() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let err = function::lower(&input, &func, &plan, straight(&func))
         .err()
@@ -3098,6 +3181,7 @@ fn asserts_call_the_panic_lang_item_with_a_location() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
     assert_eq!(
@@ -3137,6 +3221,7 @@ fn statics_and_vtables() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = super::super::lower_item(&input).expect("static lowers");
     assert_eq!(jsast::stmt_to_string(&lowered.decl), "let S = [5];\n");
@@ -3181,6 +3266,7 @@ fn statics_and_vtables() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = super::super::lower_item(&input).expect("vtable lowers");
     assert_eq!(
@@ -3228,6 +3314,7 @@ fn a_dyn_drop_calls_vtable_slot_zero_when_it_is_not_null() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
     assert_eq!(
@@ -3266,6 +3353,7 @@ fn unsupported_ops_decline_with_a_class() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let err = function::lower(&input, &func, &plan, straight(&func))
         .err()
@@ -3323,6 +3411,7 @@ fn lower_with(
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     match function::lower(&input, func, plan, region) {
         Ok(item) => jsast::stmt_to_string(&item.decl),
@@ -3640,6 +3729,7 @@ fn a_static_keyed_list_lowers_after_its_dedicated_contract_is_proven() {
             abi: None,
             physical: None,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            bigints: None,
         };
         function::lower(&input, &func, &plan, straight(&func))
             .map(|lowered| jsast::stmt_to_string(&lowered.decl))

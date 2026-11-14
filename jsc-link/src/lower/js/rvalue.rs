@@ -444,7 +444,7 @@ impl<'a> JsCx<'a> {
         let mask = |value: Expr| mask(repr, signed, bits, value);
         let shift_amount = |rhs: Expr| {
             let amount = match (repr, table.int_repr(rhs_ty)) {
-                (IntRepr::BigInt, IntRepr::Number) => jsast::to_bigint(rhs),
+                (IntRepr::BigInt, IntRepr::Number) => self.to_bigint(rhs),
                 (IntRepr::Number, IntRepr::BigInt) => {
                     jsast::to_number(jsast::bigint_mask(false, 32, rhs))
                 }
