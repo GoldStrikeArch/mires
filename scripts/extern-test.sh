@@ -168,6 +168,7 @@ failures=0
 updated=0
 total=0
 skipped=0
+refused=""
 
 for src in $sources; do
 	name=$(basename -- "${src%.rs}")
@@ -192,6 +193,7 @@ for src in $sources; do
 			grep -q 'requires semantic cleanup lowering' "$log_dir/extern-$name.compile.log"; then
 			echo "    SKIP (JSC_PANIC=unwind: the baseline lane cannot build a program with cleanup)"
 			results="$results$name SKIP baseline-lane-refuses-cleanup"$'\n'
+			refused="$refused${refused:+,}$name"
 			skipped=$((skipped + 1))
 			total=$((total - 1))
 			continue
@@ -242,7 +244,12 @@ done
 # ------------------------------------------------------ the vectors themselves
 
 echo "==> contract vectors"
-if node "$script_dir/extern-check.mjs" >"$log_dir/extern-vectors.log" 2>&1; then
+# The vector driver loads every fixture's program; one the baseline lane refused above is not there.
+if [ -n "$refused" ]; then
+	echo "    SKIP (JSC_PANIC=unwind: needs $refused, which the baseline lane cannot build; js-lane=jir drives them)"
+	results="$results vectors SKIP needs-$refused"$'\n'
+	skipped=$((skipped + 1))
+elif node "$script_dir/extern-check.mjs" >"$log_dir/extern-vectors.log" 2>&1; then
 	checks=$(grep -c '^ok  ' "$log_dir/extern-vectors.log")
 	echo "    ok ($checks checks against contract/fixtures/js-extern/vectors.json)"
 	results="$results vectors PASS $checks-checks"$'\n'
