@@ -2201,11 +2201,11 @@ for (const f of [before, after]) {
 
 // -- The call-site format kernel, driven directly ----------------------------------------------
 //
-// The planner does not commit a format site yet (its `Move` renames stay baseline), so these build
-// the committed shape by hand — the constructor calls' results marked exactly as `commit_func`
-// marks them — lower it through the real `lower_func` path the kernel intercepts in, and run the
-// emitted JavaScript against the baseline representation's answer: the UTF-8 bytes of every
-// piece appended in order, decoded back.
+// These build a site in either MIR shape the kernel meets, mark it exactly as `commit_func` marks
+// a committed site — the constructor calls' results, and the single-use renames the kernel
+// reports between them and their consumers — verify the carriers, lower it through the real
+// `lower_func` path the kernel intercepts in, and run the emitted JavaScript against the baseline
+// representation's answer: the UTF-8 bytes of every piece appended in order, decoded back.
 
 /// One display argument of a hand-built format site.
 #[derive(Clone, Copy)]
@@ -2214,6 +2214,19 @@ enum SiteArg {
     Str,
     /// An `i32`, displayed through `&i32`.
     Int,
+    /// An `f64`, displayed through `&f64` (Rust's shortest `Display`).
+    F64,
+}
+
+/// The MIR shape a hand-built site is spelled in.
+#[derive(Clone, Copy, PartialEq)]
+enum SiteShape {
+    /// Optimized MIR: every operand is the constructor's result or a direct borrow.
+    Optimized,
+    /// The runtime MIR `js-cleanup=on` prepares without rustc's optimization passes: the
+    /// template and the argument array reach `Arguments::new` as `&*` reborrows, and every
+    /// constructor result reaches its consumer through a `Move`.
+    Cleanup,
 }
 
 /// The consumer of a hand-built format site.
@@ -2227,15 +2240,28 @@ enum SiteConsumer {
 
 /// The JavaScript function `name` lowered from one committed-shape format site: parameters
 /// `[builder,] args...`, an `Argument::new_display` over a borrow of each argument, the default
-/// template `template`, and `consumer`.
+/// template `template`, and `consumer`, in optimized MIR's shape.
 fn format_site_js(
     name: &str,
     template: &[u8],
     site_args: &[SiteArg],
     consumer: SiteConsumer,
 ) -> String {
+    format_site_js_in(name, template, site_args, consumer, SiteShape::Optimized)
+}
+
+/// [`format_site_js`] in `shape`. The kernel must prove the site and report exactly the renames
+/// the shape spelled; the body is marked as the commit marks it and must verify, and in the
+/// cleanup shape it must fail to verify with the renames left baseline.
+fn format_site_js_in(
+    name: &str,
+    template: &[u8],
+    site_args: &[SiteArg],
+    consumer: SiteConsumer,
+    shape: SiteShape,
+) -> String {
     use crate::jir::origin::OriginId;
-    use crate::jir::repr::{FuncBuilder, OpKind, RTerm, Root, ValueId};
+    use crate::jir::repr::{CarrierPolicy, FuncBuilder, OpKind, Proj, RTerm, Root, ValueId};
     use crate::jir::semantic::{Body, BodyKind, CallSemantic, Callee, ConstTree, ItemId};
     use crate::jir::summary::{Availability, ItemClass, ItemSummary, SemanticKey};
     use crate::lower::js::host::{ItemEntry, ItemIndex};
@@ -2247,6 +2273,7 @@ fn format_site_js(
     const ARG_LIST: TypeId = TypeId(60);
     const ARG_LIST_REF: TypeId = TypeId(61);
     const TEMPLATE: TypeId = TypeId(62);
+    const TEMPLATE_REF: TypeId = TypeId(63);
     let (mut table, mut interns) = table();
     let mut list = descriptor(
         ARG_LIST,
@@ -2269,6 +2296,7 @@ fn format_site_js(
     );
     bytes.js.is_indirect = true;
     table.insert(bytes);
+    table.insert(reference(TEMPLATE_REF, TEMPLATE, false));
 
     // The machinery items, by the exact identity the kernel resolves a callee through.
     let mut items = ItemIndex::new();
@@ -2318,10 +2346,12 @@ fn format_site_js(
     };
 
     let writes = matches!(consumer, SiteConsumer::WriteFmt);
+    let cleanup = shape == SiteShape::Cleanup;
     let mut parameters: Vec<TypeId> = writes.then_some(STRING).into_iter().collect();
     parameters.extend(site_args.iter().map(|arg| match arg {
         SiteArg::Str => STR_REF,
         SiteArg::Int => I32,
+        SiteArg::F64 => F64,
     }));
     let result_ty = if writes { FMT_RESULT } else { STRING };
     let item = ItemId {
@@ -2331,38 +2361,55 @@ fn format_site_js(
     let mut b = FuncBuilder::new(item, sig(parameters, result_ty));
     let entry = FuncBuilder::ENTRY;
     let builder = writes.then(|| b.param(STRING, ORIGIN));
-    let values: Vec<(SiteArg, ValueId)> = site_args
+    let values: Vec<(SiteArg, TypeId, ValueId)> = site_args
         .iter()
         .map(|arg| {
             let ty = match arg {
                 SiteArg::Str => STR_REF,
                 SiteArg::Int => I32,
+                SiteArg::F64 => F64,
             };
-            (*arg, b.param(ty, ORIGIN))
+            (*arg, ty, b.param(ty, ORIGIN))
         })
         .collect();
     let mut displays = Vec::new();
-    for (arg, value) in values {
+    // `(rename, renamed)`, in the order the kernel walks them: what the commit must mark.
+    let mut renames = Vec::new();
+    let mut elements = Vec::new();
+    for (arg, ty, value) in values {
         let reference_ty = match arg {
             SiteArg::Str => PIECES_REF,
             SiteArg::Int => I32_REF,
+            SiteArg::F64 => F64_REF,
         };
+        // A borrowed argument lives in a cell, as every borrowed local does.
+        let cell = b.cell(ty, true, ORIGIN);
+        b.effect(entry, OpKind::CellAlloc(cell), ORIGIN);
+        b.effect(entry, OpKind::CellStore { cell, v: value }, ORIGIN);
         let reference = b.op(
             entry,
             OpKind::BorrowView {
-                root: Root::Value(value),
+                root: Root::Cell(cell),
                 path: vec![],
                 mutable: false,
             },
             reference_ty,
             ORIGIN,
         );
-        displays.push(b.op(
+        let shown = b.op(
             entry,
             call(&display, vec![reference], CallSemantic::Ordinary),
             ARGUMENT,
             ORIGIN,
-        ));
+        );
+        displays.push(shown);
+        elements.push(if cleanup {
+            let moved = b.op(entry, OpKind::Move(shown), ARGUMENT, ORIGIN);
+            renames.push((moved, shown));
+            moved
+        } else {
+            shown
+        });
     }
     let list = b.op(
         entry,
@@ -2370,21 +2417,37 @@ fn format_site_js(
             ty: ARG_LIST,
             variant: 0,
             active_field: None,
-            fields: displays.clone(),
+            fields: elements,
         },
         ARG_LIST,
         ORIGIN,
     );
-    let list_ref = b.op(
-        entry,
-        OpKind::BorrowView {
-            root: Root::Value(list),
-            path: vec![],
-            mutable: false,
-        },
-        ARG_LIST_REF,
-        ORIGIN,
-    );
+    let borrow = |b: &mut FuncBuilder, root: ValueId, ty: TypeId| {
+        let borrowed = b.op(
+            entry,
+            OpKind::BorrowView {
+                root: Root::Value(root),
+                path: vec![],
+                mutable: false,
+            },
+            ty,
+            ORIGIN,
+        );
+        if !cleanup {
+            return borrowed;
+        }
+        b.op(
+            entry,
+            OpKind::BorrowView {
+                root: Root::Value(borrowed),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            ty,
+            ORIGIN,
+        )
+    };
+    let list_ref = borrow(&mut b, list, ARG_LIST_REF);
     let template_value = b.op(
         entry,
         OpKind::Const(ConstTree::Aggregate(
@@ -2399,16 +2462,32 @@ fn format_site_js(
         TEMPLATE,
         ORIGIN,
     );
+    let template_operand = if cleanup {
+        borrow(&mut b, template_value, TEMPLATE_REF)
+    } else {
+        template_value
+    };
     let arguments = b.op(
         entry,
-        call(&new, vec![template_value, list_ref], CallSemantic::Ordinary),
+        call(
+            &new,
+            vec![template_operand, list_ref],
+            CallSemantic::Ordinary,
+        ),
         ARGUMENTS,
         ORIGIN,
     );
+    let consumed = if cleanup {
+        let moved = b.op(entry, OpKind::Move(arguments), ARGUMENTS, ORIGIN);
+        renames.insert(0, (moved, arguments));
+        moved
+    } else {
+        arguments
+    };
     let result = match builder {
         None => b.op(
             entry,
-            call(&format, vec![arguments], CallSemantic::Ordinary),
+            call(&format, vec![consumed], CallSemantic::Ordinary),
             STRING,
             ORIGIN,
         ),
@@ -2427,7 +2506,7 @@ fn format_site_js(
                 entry,
                 call(
                     &write_fmt,
-                    vec![receiver, arguments],
+                    vec![receiver, consumed],
                     CallSemantic::Standard(StandardOperation::StringFmtWriteFmt),
                 ),
                 FMT_RESULT,
@@ -2437,8 +2516,26 @@ fn format_site_js(
     };
     b.terminate(entry, RTerm::Return(Some(result)));
     let mut func = b.finish();
+
+    // The kernel proves the site in this shape, and reports exactly the renames spelled.
+    let analysis = crate::lower::semantic_ops::fmt_kernel::analyze(
+        &func,
+        &table,
+        &interns,
+        &|item: &ItemId| items.get(item).and_then(|entry| entry.standard),
+    );
+    let [site] = analysis.sites.as_slice() else {
+        panic!("`{name}`: the kernel proved {} sites", analysis.sites.len());
+    };
+    assert_eq!(site.args_value, arguments, "`{name}`");
+    assert_eq!(
+        site.renames, renames,
+        "`{name}`: the renames the commit marks"
+    );
+
     // The committed marks (`plan::representation::commit_func`): each constructor result carries
-    // its native text, the destination its native carrier.
+    // its native text, each rename the mark of the value it renames, the destination its native
+    // carrier.
     for value in displays.iter().chain([&arguments]) {
         func.values[value.0 as usize].carrier = Carrier::HostString;
     }
@@ -2448,6 +2545,28 @@ fn format_site_js(
             func.values[builder.unwrap().0 as usize].carrier = Carrier::StringBuilder;
         }
     }
+    let policy = |func: &crate::jir::repr::Func| {
+        func.values
+            .iter()
+            .fold(CarrierPolicy::BASELINE, |policy, def| {
+                policy.with(def.carrier)
+            })
+    };
+    if cleanup {
+        // Left baseline, a rename reads a native text into a baseline value.
+        let error = func
+            .verify_carriers(&table, policy(&func))
+            .expect_err("unmarked renames must not verify");
+        assert!(
+            format!("{error}").contains("use Convert"),
+            "`{name}`: {error}"
+        );
+    }
+    for (rename, renamed) in &site.renames {
+        func.values[rename.0 as usize].carrier = func.values[renamed.0 as usize].carrier;
+    }
+    func.verify_carriers(&table, policy(&func))
+        .unwrap_or_else(|error| panic!("`{name}` does not verify: {error}"));
 
     let body = Body {
         item,
@@ -2574,6 +2693,12 @@ const KERNEL_SITES: &[(&str, &[u8], &[SiteArg])] = &[
         &[SiteArg::Str, SiteArg::Int, SiteArg::Str],
     ),
     ("dashed", b"\xc0\x01-\xc0\0", &[SiteArg::Str, SiteArg::Str]),
+    // `api::print_debug`'s shape in the idiomatic FingerprintJS port: host strings and an `f64`.
+    (
+        "debug_line",
+        b"\x03v: \xc0\x04 a: \xc0\x04 t: \xc0\x01|\0",
+        &[SiteArg::Str, SiteArg::Str, SiteArg::F64],
+    ),
 ];
 
 /// The JavaScript every kernel harness shares: the host pieces (lone halves of a surrogate pair
@@ -2584,6 +2709,15 @@ const assert = require('node:assert/strict');
 const HI = String.fromCharCode(0xd83d), LO = String.fromCharCode(0xde00);
 const PIECES = [HI, LO, HI + LO, LO + HI, 'a' + HI, LO + 'b', '', 'plain', String.fromCharCode(0xe9), HI + HI];
 const INTS = [-7, 0, 42];
+// `f64` arguments beside Rust's `Display` text for each (`scripts/native-f64-differential.sh`
+// checks the shortest writer itself against real Rust): the spellings and thresholds where
+// JavaScript's own `String(number)` differs, an exact decimal midpoint, and the extremes.
+const FLOATS = [
+  [NaN, 'NaN'], [Infinity, 'inf'], [-Infinity, '-inf'], [0, '0'], [-0, '-0'], [1.5, '1.5'],
+  [1 / 3, '0.3333333333333333'], [1e21, '1000000000000000000000'], [7.5e-11, '0.000000000075'],
+  [1.00000762939453125, '1.0000076293945313'], [Number.MAX_VALUE, '17976931348623157' + '0'.repeat(292)],
+  [Number.MIN_VALUE, '0.' + '0'.repeat(323) + '5'],
+];
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { ignoreBOM: true });
 // The baseline `Vec<u8>` String after appending `pieces` in order: their bytes, decoded back.
@@ -2597,15 +2731,20 @@ function baseline(pieces) {
 function rows(kinds) {
   let out = [[]];
   for (const kind of kinds) {
-    const choices = kind === 'Str' ? PIECES : INTS;
+    const choices = kind === 'Str' ? PIECES : kind === 'F64' ? FLOATS.map(([value]) => value) : INTS;
     out = out.flatMap((row) => choices.map((choice) => row.concat([choice])));
   }
   return out;
 }
+// The text Rust displays one argument of `kind` as.
+function shown(kind, arg) {
+  if (kind !== 'F64') return String(arg);
+  return FLOATS.find(([value]) => Object.is(value, arg))[1];
+}
 // The pieces the site appends, in order: template literal, argument, literal, ... literal.
-function sitePieces(literals, row) {
+function sitePieces(literals, row, kinds) {
   const out = [literals[0]];
-  row.forEach((arg, i) => out.push(String(arg), literals[i + 1]));
+  row.forEach((arg, i) => out.push(shown(kinds[i], arg), literals[i + 1]));
   return out;
 }
 "#;
@@ -2621,6 +2760,7 @@ fn kernel_site_table(variable: &str, prefix: &str) -> String {
             .map(|arg| match arg {
                 SiteArg::Str => "'Str'",
                 SiteArg::Int => "'Int'",
+                SiteArg::F64 => "'F64'",
             })
             .collect();
         let literals: Vec<String> = literals.iter().map(|piece| format!("{piece:?}")).collect();
@@ -2639,17 +2779,29 @@ fn kernel_site_table(variable: &str, prefix: &str) -> String {
 /// scalar the baseline never held.
 #[test]
 fn the_format_kernel_appends_adjacent_host_strings_as_the_baseline_bytes() {
+    format_kernel_case(SiteShape::Optimized);
+}
+
+/// The same `format!` sites in the shape a `js-cleanup=on` build hands the kernel (reborrowed
+/// operands, `Move` renames): proven, the renames marked, verified, and the same bytes.
+#[test]
+fn the_format_kernel_proves_and_appends_the_cleanup_shape_as_the_baseline_bytes() {
+    format_kernel_case(SiteShape::Cleanup);
+}
+
+fn format_kernel_case(shape: SiteShape) {
     let mut functions = Vec::new();
     for (carrier, prefix) in [
         (Carrier::HostString, "host"),
         (Carrier::StringBuilder, "builder"),
     ] {
         for (name, template, args) in KERNEL_SITES {
-            functions.push(format_site_js(
+            functions.push(format_site_js_in(
                 &format!("{prefix}_{name}"),
                 template,
                 args,
                 SiteConsumer::Format(carrier),
+                shape,
             ));
         }
     }
@@ -2661,13 +2813,13 @@ fn the_format_kernel_appends_adjacent_host_strings_as_the_baseline_bytes() {
 {builder_sites}
 for (const site of HOST_SITES) {{
   for (const row of rows(site.kinds)) {{
-    const expected = baseline(sitePieces(site.literals, row));
+    const expected = baseline(sitePieces(site.literals, row, site.kinds));
     assert.equal(site.fn(...row), expected.text, site.name + ' ' + JSON.stringify(row));
   }}
 }}
 for (const site of BUILDER_SITES) {{
   for (const row of rows(site.kinds)) {{
-    const expected = baseline(sitePieces(site.literals, row));
+    const expected = baseline(sitePieces(site.literals, row, site.kinds));
     const value = site.fn(...row);
     const label = site.name + ' ' + JSON.stringify(row);
     assert.equal(value.text, expected.text, label);
@@ -2686,13 +2838,24 @@ for (const site of BUILDER_SITES) {{
 /// covers it — across two appends to the same builder.
 #[test]
 fn the_write_kernel_appends_adjacent_host_strings_and_advances_the_length() {
+    write_kernel_case(SiteShape::Optimized);
+}
+
+/// The same `write!` sites in the `js-cleanup=on` shape.
+#[test]
+fn the_write_kernel_proves_and_appends_the_cleanup_shape() {
+    write_kernel_case(SiteShape::Cleanup);
+}
+
+fn write_kernel_case(shape: SiteShape) {
     let mut functions = Vec::new();
     for (name, template, args) in KERNEL_SITES {
-        functions.push(format_site_js(
+        functions.push(format_site_js_in(
             &format!("write_{name}"),
             template,
             args,
             SiteConsumer::WriteFmt,
+            shape,
         ));
     }
     let sites = kernel_site_table("WRITE_SITES", "write");
@@ -2703,13 +2866,13 @@ for (const site of WRITE_SITES) {{
   for (const row of rows(site.kinds)) {{
     const label = site.name + ' ' + JSON.stringify(row);
     const builder = {{ text: 'x', cap: 1, len: 1 }};
-    const once = ['x'].concat(sitePieces(site.literals, row));
+    const once = ['x'].concat(sitePieces(site.literals, row, site.kinds));
     assert.deepEqual(site.fn(builder, ...row), {{ TAG: 'Ok', _0: undefined }}, label);
     assert.equal(builder.text, baseline(once).text, label);
     assert.equal(builder.len, baseline(once).len, label);
     assert.ok(builder.cap >= builder.len, label + ': cap ' + builder.cap + ' < len ' + builder.len);
     site.fn(builder, ...row);
-    const twice = once.concat(sitePieces(site.literals, row));
+    const twice = once.concat(sitePieces(site.literals, row, site.kinds));
     assert.equal(builder.text, baseline(twice).text, label);
     assert.equal(builder.len, baseline(twice).len, label);
     assert.ok(builder.cap >= builder.len, label + ': cap ' + builder.cap + ' < len ' + builder.len);
