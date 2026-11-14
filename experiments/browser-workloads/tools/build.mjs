@@ -28,8 +28,17 @@ for (const name of selected) {
 }
 const workloads = availableWorkloads.filter((name) => selected.size === 0 || selected.has(name))
 if (workloads.length === 0) throw new Error('corpus workload selection is empty')
-const cleanup = String(options.cleanup || 'on')
+// `JSC_PANIC` selects the build mode (scripts/sysroot-cache.sh); unset is `abort`, the compiler as
+// it always was. `unwind` builds for targets/mires32-unwind.json with -Cpanic=unwind: rustc's own
+// unwind edges then carry host-exception cleanup, the scripts turn the backend's re-derived cleanup
+// (`js-cleanup`) off, and `--cleanup on` would name a lowering the build does not use.
+const panic = process.env.JSC_PANIC || 'abort'
+if (!['abort', 'unwind'].includes(panic)) throw new Error('JSC_PANIC must be unset, abort, or unwind')
+const cleanup = String(options.cleanup || (panic === 'unwind' ? 'off' : 'on'))
 if (!['on', 'off'].includes(cleanup)) throw new Error('--cleanup must be on or off')
+if (panic === 'unwind' && cleanup === 'on') {
+  throw new Error('JSC_PANIC=unwind keeps cleanup through rustc unwind edges; --cleanup on is the abort-mode lowering')
+}
 const compilerArgs = `js-profile=release-size js-opt=on js-ecma-target=2018 js-cleanup=${cleanup}`
 const compilerEnvironment = {
   ...process.env,
@@ -38,6 +47,7 @@ const compilerEnvironment = {
   JSC_RUST_OPT_LEVEL: 'z',
   JSC_SYSROOT_ARGS: compilerArgs,
   JS_EXTRA_ARGS: `${compilerArgs} js-opt-warnings=off js-workspace-root=${repositoryRoot}`,
+  ...(panic === 'unwind' ? { JSC_PANIC: panic } : {}),
 }
 
 for (const path of [
@@ -96,7 +106,7 @@ const { minify } = await import(pathToFileURL(resolve(modulesRoot, 'terser/main.
 const receipt = {
   schema: 3,
   generatedAt: new Date().toISOString(),
-  configuration: { compilerRoot, cleanup, ecmaTarget: 2018, lane: 'jir', optimizer: 'on', profile: 'release-size' },
+  configuration: { compilerRoot, cleanup, ecmaTarget: 2018, lane: 'jir', optimizer: 'on', panic, profile: 'release-size' },
   provenance: {
     revision: command('git', ['rev-parse', 'HEAD'], { cwd: repositoryRoot }).trim(),
     compilerRevision: command('git', [

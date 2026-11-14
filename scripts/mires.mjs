@@ -10,9 +10,14 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const help = `Usage: node scripts/mires.mjs build source.rs --out build/app.mjs
   --profile dev|report|release-size|release-balanced|release-speed
   --cleanup on|off       Default: on. off omits recoverable host-exception cleanup.
+                         With JSC_PANIC=unwind the default is off and on is refused:
+                         that mode keeps cleanup through rustc's unwind edges.
   --extern name=path     Repeat for dependencies compiled with matching settings.
   --search directory    Repeat for transitive dependencies.
   --skip-build          Reuse the existing backend/linker; still resolve the sysroot.
+
+JSC_PANIC=unwind selects the unwind build mode (scripts/sysroot-cache.sh);
+unset, the build is the abort mode as before. The receipt records the mode.
 
 Input is a no_std library with exported functions and a panic handler. Output is
 an ES module, a reached-only runtime module, source map and artifact manifest.
@@ -29,7 +34,9 @@ try {
   if (!args.length || args.includes('--help') || args[0]==='help') {console.log(help);process.exit(0);}
   if (args.shift() !== 'build') throw new Error('expected build; use --help');
   const src=args.shift(); if (!src || src.startsWith('-')) throw new Error('missing Rust source');
-  let output,profile='release-balanced',cleanup='on',skip=false;const extra=[];
+  const panic=process.env.JSC_PANIC||'abort';
+  if(!['abort','unwind'].includes(panic))throw new Error('JSC_PANIC must be unset, abort or unwind');
+  let output,profile='release-balanced',cleanup=panic==='unwind'?'off':'on',skip=false;const extra=[];
   while(args.length) {
     const k=args.shift();
     if(k==='--skip-build'){skip=true;continue;}
@@ -41,13 +48,14 @@ try {
   }
   if(!['dev','report','release-size','release-balanced','release-speed'].includes(profile))throw new Error('invalid profile');
   if(!['on','off'].includes(cleanup))throw new Error('invalid cleanup setting');
+  if(panic==='unwind'&&cleanup==='on')throw new Error('JSC_PANIC=unwind keeps cleanup through rustc unwind edges; --cleanup on is the abort-mode lowering');
   const input=resolve(src),out=resolve(output||`build/${basename(src,extname(src))}.mjs`);
   if(!existsSync(input))throw new Error(`source missing: ${input}`);
   if(!out.endsWith('.mjs') || !/^[A-Za-z0-9._-]+$/.test(basename(out)))throw new Error('output must have a simple .mjs filename');
   mkdirSync(dirname(out),{recursive:true});
   const runtimeName=basename(out,'.mjs')+'.runtime.mjs';
   const emit=`js-profile=${profile} js-cleanup=${cleanup}`;
-  const env={...process.env,JS_EXTRA_ARGS:emit,JSC_SYSROOT_ARGS:emit,JSC_REMAP_ROOT:dirname(input),SKIP_BUILD:'1'};
+  const env={...process.env,JS_EXTRA_ARGS:emit,JSC_SYSROOT_ARGS:emit,JSC_REMAP_ROOT:dirname(input),SKIP_BUILD:'1',...(panic==='unwind'?{JSC_PANIC:panic}:{})};
   delete env.JSC_RUST_OPT_LEVEL;delete env.JSC_RUST_MIR_INLINE;
   if(!skip)run('bash',['scripts/build.sh','--locked'],env);
   run('bash',['scripts/build_sysroot.sh'],env);
@@ -57,7 +65,7 @@ try {
   run(resolve(root,'target/release/jsc-link'),['--verify-artifacts',manifest],env);
   const binaryName=process.platform==='darwin'?'librustc_codegen_mires.dylib':'librustc_codegen_mires.so';
   const files=[out,resolve(dirname(out),runtimeName)];
-  const receipt={schema:1,kind:'mires-standalone-build',generatedAt:new Date().toISOString(),source:{path:input,sha256:hash(readFileSync(input))},profile,cleanup,backend:hash(readFileSync(resolve(root,'target/release',binaryName))),linker:hash(readFileSync(resolve(root,'target/release/jsc-link'))),node:process.version,artifacts:files.map(path=>{const b=readFileSync(path);return{path:basename(path),bytes:b.length,sha256:hash(b),gzip:gzipSync(b,{level:9}).length,brotli:brotliCompressSync(b,{params:{[constants.BROTLI_PARAM_QUALITY]:11}}).length};}),manifest:basename(manifest),qualification:'build-and-manifest-only'};
+  const receipt={schema:1,kind:'mires-standalone-build',generatedAt:new Date().toISOString(),source:{path:input,sha256:hash(readFileSync(input))},profile,cleanup,panic,backend:hash(readFileSync(resolve(root,'target/release',binaryName))),linker:hash(readFileSync(resolve(root,'target/release/jsc-link'))),node:process.version,artifacts:files.map(path=>{const b=readFileSync(path);return{path:basename(path),bytes:b.length,sha256:hash(b),gzip:gzipSync(b,{level:9}).length,brotli:brotliCompressSync(b,{params:{[constants.BROTLI_PARAM_QUALITY]:11}}).length};}),manifest:basename(manifest),qualification:'build-and-manifest-only'};
   writeFileSync(out+'.build.json',JSON.stringify(receipt,null,2)+'\n');
   console.log(`Built ${out}`);
 } catch(e) { console.error(`mires: ${e.message}`);process.exitCode=1; }

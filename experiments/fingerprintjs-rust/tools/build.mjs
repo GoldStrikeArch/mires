@@ -32,8 +32,18 @@ const compilerProfile = options.profile === undefined ? '' : String(options.prof
 if (compilerProfile && !['dev', 'report', 'release-size', 'release-balanced', 'release-speed'].includes(compilerProfile)) {
   throw new Error('--profile must be dev, report, release-size, release-balanced, or release-speed')
 }
-const cleanup = String(options.cleanup || (compilerProfile.startsWith('release-') ? 'on' : 'off'))
+// `JSC_PANIC` selects the build mode (scripts/sysroot-cache.sh); unset is `abort`, the compiler as
+// it always was. `unwind` builds for targets/mires32-unwind.json with -Cpanic=unwind: rustc's own
+// unwind edges then carry host-exception cleanup, the scripts turn the backend's re-derived cleanup
+// (`js-cleanup`) off, and `--cleanup on` would name a lowering the build does not use.
+const panic = process.env.JSC_PANIC || 'abort'
+if (!['abort', 'unwind'].includes(panic)) throw new Error('JSC_PANIC must be unset, abort, or unwind')
+const cleanup = String(options.cleanup || (
+  panic === 'unwind' ? 'off' : compilerProfile.startsWith('release-') ? 'on' : 'off'))
 if (!['on', 'off'].includes(cleanup)) throw new Error('--cleanup must be on or off')
+if (panic === 'unwind' && cleanup === 'on') {
+  throw new Error('JSC_PANIC=unwind keeps cleanup through rustc unwind edges; --cleanup on is the abort-mode lowering')
+}
 const buildKey = options['build-key'] === undefined ? '' : String(options['build-key'])
 if (buildKey && !/^[A-Za-z0-9._-]+$/.test(buildKey)) throw new Error('--build-key is not path-safe')
 const ecmaTargetExplicit = options['ecma-target'] !== undefined
@@ -73,6 +83,7 @@ const modeName = [
   ecmaTargetExplicit ? `ecma-${ecmaTarget}` : '',
   rustOptLevel ? `rust-${rustOptLevel}` : '',
   mirInline === 'on' ? 'mir-inline' : '',
+  panic === 'unwind' ? 'panic-unwind' : '',
 ].filter(Boolean).join('-') + compilerSuffix
 const buildRoot = resolve(artifactRoot, 'target/js-build', modeName)
 const distRoot = resolve(options.output || (
@@ -94,6 +105,7 @@ const compilerEnvironment = {
   JSC_SYSROOT_ARGS: optimizerEmitArgs,
   JSC_RUST_OPT_LEVEL: rustOptLevel,
   JSC_RUST_MIR_INLINE: mirInline,
+  ...(panic === 'unwind' ? { JSC_PANIC: panic } : {}),
 }
 const entry = resolve(artifactRoot, 'src/entry.rs')
 const exportManifest = parseExportManifest(await readFile(entry, 'utf8'))
