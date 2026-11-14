@@ -15,6 +15,7 @@ esac
 mkdir -p "$work/proc-macro"
 ln -s "$macro" "$work/proc-macro/$(basename -- "$macro")"
 node "$script_dir/make-esm-shim.mjs" "$work/shim.mjs"
+skipped=0
 for mode in off report on; do
   export JS_EXTRA_ARGS="js-opt=$mode js-minify=on js-ecma-target=2018"
   SKIP_BUILD=1 "$script_dir/build_sysroot.sh" >"$work/sysroot-$mode.log" 2>&1
@@ -23,14 +24,32 @@ for mode in off report on; do
   for lane in baseline jir; do
     mkdir -p "$work/$lane-$mode"
     program="$work/$lane-$mode/program.mjs"
+    compile_status=0
     JS_EXTRA_ARGS="$JS_EXTRA_ARGS js-lane=$lane js-modules=esm js-shim-module=../shim.mjs js-source-map=on" \
       "$script_dir/compile_core.sh" "$root/examples/promise_cleanup.rs" "$program" \
-      --extern "mires_js=$work/libmires_js.rlib" --search "$work/proc-macro" >"$program.compile.log" 2>&1
+      --extern "mires_js=$work/libmires_js.rlib" --search "$work/proc-macro" >"$program.compile.log" 2>&1 ||
+      compile_status=$?
+    if [ "$compile_status" != 0 ]; then
+      # JSC_PANIC=unwind: rustc's optimized MIR keeps cleanup blocks, which only the JIR lane lowers,
+      # so the baseline lane refuses such a program (CONTRACT.md). That refusal is a skip, printed
+      # and counted; any other failure fails the suite as before.
+      if [ "${JSC_PANIC:-}" = unwind ] && [ "$lane" = baseline ] && [ ! -e "$program" ] &&
+        grep -q 'requires semantic cleanup lowering' "$program.compile.log"; then
+        echo "$lane/$mode: SKIP (JSC_PANIC=unwind: the baseline lane cannot build a program with cleanup; refused with 'requires semantic cleanup lowering')"
+        skipped=$((skipped + 1))
+        continue
+      fi
+      cat "$program.compile.log" >&2
+      exit "$compile_status"
+    fi
     node "$script_dir/promise-cleanup-check.mjs" "$program" >"$program.result.json"
     echo "$lane/$mode: Promise cleanup passed"
     node "$script_dir/check-sourcemap.js" "$program" >"$program.map.log"
   done
 done
 for lane in baseline jir; do
+  # A lane whose rows were all skipped (above) has no programs to compare.
+  [ -e "$work/$lane-off/program.mjs" ] || [ -e "$work/$lane-report/program.mjs" ] || continue
   cmp "$work/$lane-off/program.mjs" "$work/$lane-report/program.mjs"
 done
+[ "$skipped" = 0 ] || echo "promise cleanup: $skipped row(s) skipped (JSC_PANIC=unwind, baseline lane)"

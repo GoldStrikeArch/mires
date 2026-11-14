@@ -11,6 +11,13 @@ cleanup MIR in the rlib beside that `.rmeta`, and without that rlib the compilat
 `guarded::<fn() -> u32>` is instantiated in two crates, so two objects carry a copy and the kept
 copy must have cleanup edges. The sysroot's own `alloc` copy of `core::iter::adapters::try_process`
 must have them too.
+
+Under JSC_PANIC=unwind (the unwind build mode, scripts/sysroot-cache.sh) every crate is compiled for
+targets/mires32-unwind.json with -Cpanic=unwind and js-cleanup=off: rustc's optimized MIR, which
+every rlib and `.rmeta` carries, keeps the unwind edges, and no cleanup MIR member exists. The rows
+that test that member (its producer identity, checksum and version, its import into a metadata-only
+consumer, and the refusal when its rlib is missing) are skipped there with their reason printed;
+every row that compiles, links or runs a program still runs.
 """
 
 import hashlib
@@ -24,6 +31,19 @@ import subprocess
 import sys
 
 root = Path(__file__).resolve().parent.parent
+panic_mode = os.environ.get("JSC_PANIC", "") or "abort"
+assert panic_mode in ["abort", "unwind"], "JSC_PANIC must be unset, abort or unwind"
+unwind = panic_mode == "unwind"
+skipped = []
+
+
+def skip(name, reason):
+    skipped.append(dict(name=name, reason=reason))
+    print(name, "SKIP", reason, flush=True)
+
+
+NO_MEMBER = "JSC_PANIC=unwind: no cleanup MIR member exists (js-cleanup=off; rustc's optimized MIR " \
+            "in the rlib and .rmeta carries the unwind edges)"
 if len(sys.argv) == 1:
     work = root / "build/cleanup-transport"
     shutil.rmtree(work, ignore_errors=True)
@@ -56,11 +76,13 @@ subprocess.run(["node", "scripts/make-esm-shim.mjs", str(work / "shim.mjs")], cw
 checker = root / "scripts/active-poll-cleanup-check.mjs"
 changed_checker = work / "changed-check.mjs"
 changed_checker.write_text(re.sub(r"\b80\b", "180", checker.read_text()))
-flags = f"js-opt={mode} js-minify=on js-ecma-target=2018 js-cleanup=on"
+flags = f"js-opt={mode} js-minify=on js-ecma-target=2018 js-cleanup={'off' if unwind else 'on'}"
+target = ["--target=" + str(root / "targets/mires32-unwind.json"), "-Zunstable-options"] if unwind \
+    else ["--target=wasm32-unknown-unknown"]
 base = [
     "rustc", "+" + channel, "-Zcodegen-backend=" + str(backend),
-    "--edition=2021", "--target=wasm32-unknown-unknown", "--sysroot", str(sysroot),
-    "-Ccodegen-units=1", "-Cpanic=abort", "-Coverflow-checks=off",
+    "--edition=2021", *target, "--sysroot", str(sysroot),
+    "-Ccodegen-units=1", "-Cpanic=unwind" if unwind else "-Cpanic=abort", "-Coverflow-checks=off",
     "-Cdebug-assertions=off", "-Cdebuginfo=0", "-Zquery-dep-graph", "-Zprint-mono-items=yes",
     "-Cllvm-args=js-producer=" + hashlib.sha256(backend.read_bytes()).hexdigest(),
     "--remap-path-prefix", str(root) + "/=",
@@ -128,20 +150,24 @@ for stage in ["cold", "warm", "changed", "changed-warm"]:
 
 original = (work / "cold-provider.rlib").read_bytes()
 magic = b"RCGJS-MIR-3\0"
-start = original.index(magic)
-assert original.find(magic, start + 1) == -1
+if unwind:
+    assert magic not in original, "unwind mode must not write a cleanup MIR member"
+    for name in ["producer-mismatch", "checksum-mismatch", "old-version"]:
+        skip(name, NO_MEMBER)
+start = -1 if unwind else original.index(magic)
+assert unwind or original.find(magic, start + 1) == -1
 offset = 8
 end = None
-while offset < len(original):
+while not unwind and offset < len(original):
     size = int(original[offset + 48:offset + 58])
     data = offset + 60
     if data <= start < data + size:
         end = data + size
         break
     offset = data + size + size % 2
-assert end is not None
+assert unwind or end is not None
 payload_start = start + len(magic) + 32
-for name, error in [
+for name, error in [] if unwind else [
     ("producer-mismatch", "cleanup MIR archive producer binary identity mismatch"),
     ("checksum-mismatch", "cleanup MIR archive checksum mismatch"),
     ("old-version", "invalid cleanup MIR archive header or size"),
@@ -202,7 +228,10 @@ def middle(name, provider, error=None):
 
 
 middle("metadata-middle", metadata)
-assert "cleanup-mir-import: " in (work / "metadata-middle.log").read_text()
+if unwind:
+    skip("metadata-middle-import", NO_MEMBER)
+else:
+    assert "cleanup-mir-import: " in (work / "metadata-middle.log").read_text()
 metadata_program = metadata / "program.js"
 lane_report = metadata / "lane.json"
 run("metadata-client", separate + [
@@ -257,14 +286,18 @@ metadata_only = work / "metadata-only"
 metadata_only.mkdir()
 shutil.copyfile(metadata / "libcleanup_metadata_provider.rmeta",
                 metadata_only / "libcleanup_metadata_provider.rmeta")
-middle("metadata-rlib-absent", metadata_only,
-       "cleanup MIR of `cleanup_metadata_provider` is unavailable")
+if unwind:
+    skip("metadata-rlib-absent", NO_MEMBER + "; the .rmeta alone is a complete dependency")
+else:
+    middle("metadata-rlib-absent", metadata_only,
+           "cleanup MIR of `cleanup_metadata_provider` is unavailable")
 
 (work / "result.json").write_text(json.dumps(dict(
-    passed=True, mode=mode, runtimeCases=141, producerIdentityChecked=True,
+    passed=True, mode=mode, panic=panic_mode, skipped=skipped, runtimeCases=141,
+    producerIdentityChecked=not unwind,
     coldWarmCguReuse=True, changedWarmCguReuse=True, removedSourceMapPreserved=True,
     runtimeNamespacePrepared=True, metadataOnlyDependencyImported=True,
-    metadataOnlyDependencyWithoutRlibRefused=True, duplicateCopiesKeepCleanup=True,
+    metadataOnlyDependencyWithoutRlibRefused=not unwind, duplicateCopiesKeepCleanup=True,
     allocCoreGenericCarriesCleanup=True,
     backendSha256=hashlib.sha256(backend.read_bytes()).hexdigest(),
 ), indent=2) + "\n")

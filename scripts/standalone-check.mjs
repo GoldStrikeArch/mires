@@ -13,7 +13,10 @@ assert.equal(program.sum_squares(5),30);
 assert.equal(program.sum_squares(100),328350);
 assert.equal(program.greeting(),'Hello from Rust');
 const receipt=JSON.parse(readFileSync(out+'.build.json'));
-assert.equal(receipt.cleanup,'on');
+// JSC_PANIC=unwind: the receipt records the mode and `cleanup: 'off'` (rustc's unwind edges carry the
+// cleanup there), so the default-cleanup assertion is skipped, with its reason printed.
+if((process.env.JSC_PANIC||'abort')==='unwind'){assert.equal(receipt.panic,'unwind');console.log("standalone module: SKIP receipt.cleanup === 'on' (JSC_PANIC=unwind records cleanup 'off')");}
+else assert.equal(receipt.cleanup,'on');
 assert.equal(receipt.profile,'release-balanced');
 const map=JSON.parse(readFileSync(out+'.map'));
 assert.ok(map.sources.some(s=>s.endsWith('hello.rs')));

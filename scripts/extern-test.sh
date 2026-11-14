@@ -77,6 +77,15 @@ if [ "${UPDATE_EXPECT:-0}" = 1 ] && [ "$EXTERN_OPT_MODE" != off ]; then
 	echo "extern-test.sh: expectations may only be updated in off mode" >&2
 	exit 2
 fi
+# JSC_PANIC=unwind (the unwind build mode, CONTRACT.md): the goldens record abort-mode text, so they
+# are not compared there and may not be written from it; the contract drivers still run. A fixture
+# the baseline lane must refuse (it keeps cleanup blocks only the JIR lane lowers) is a skip too.
+unwind=0
+[ "${JSC_PANIC:-}" = unwind ] && unwind=1
+if [ "${UPDATE_EXPECT:-0}" = 1 ] && [ "$unwind" = 1 ]; then
+	echo "extern-test.sh: expectations may not be updated under JSC_PANIC=unwind" >&2
+	exit 2
+fi
 echo "note: compiled with ${lane_note:-js-lane=baseline} js-opt=$EXTERN_OPT_MODE${lane:+; NN.jir.js.expected wins where it exists}"
 if [ "$EXTERN_OPT_MODE" = on ]; then
 	echo "note: EXTERN_OPT_MODE=on rewrites the printed text, so the JS goldens are not compared;"
@@ -158,6 +167,7 @@ results=""
 failures=0
 updated=0
 total=0
+skipped=0
 
 for src in $sources; do
 	name=$(basename -- "${src%.rs}")
@@ -178,6 +188,14 @@ for src in $sources; do
 	if ! JS_EXTRA_ARGS="$EXTERN_ARGS" "$script_dir/compile_core.sh" "$src" "$out" \
 		--extern js_extern_macro="$proc_macro" --extern mires_js="$mires_js" \
 		--search "$proc_macro_dir" >"$log_dir/extern-$name.compile.log" 2>&1; then
+		if [ "$unwind" = 1 ] && [ -z "$lane" ] && [ ! -e "$out" ] &&
+			grep -q 'requires semantic cleanup lowering' "$log_dir/extern-$name.compile.log"; then
+			echo "    SKIP (JSC_PANIC=unwind: the baseline lane cannot build a program with cleanup)"
+			results="$results$name SKIP baseline-lane-refuses-cleanup"$'\n'
+			skipped=$((skipped + 1))
+			total=$((total - 1))
+			continue
+		fi
 		echo "    compile failed:"
 		sed 's/^/    /' "$log_dir/extern-$name.compile.log"
 		results="$results$name FAIL compile-error"$'\n'
@@ -188,6 +206,11 @@ for src in $sources; do
 	if [ "$EXTERN_OPT_MODE" = on ]; then
 		echo "    ok (compiled; golden compare skipped under EXTERN_OPT_MODE=on)"
 		results="$results$name PASS compiled"$'\n'
+	elif [ "$unwind" = 1 ]; then
+		echo "    SKIP golden compare (JSC_PANIC=unwind: the golden records abort-mode text); compiled"
+		results="$results$name SKIP golden-is-abort-mode-text"$'\n'
+		skipped=$((skipped + 1))
+		total=$((total - 1))
 	elif [ "${UPDATE_EXPECT:-0}" = "1" ]; then
 		if ! cmp -s "$out" "$expected_js" 2>/dev/null; then
 			cp "$out" "$expected_js"
@@ -259,6 +282,7 @@ if [ "$updated" -ne 0 ]; then
 else
 	printf '%d/%d passed\n' "$((total - failures))" "$total"
 fi
+[ "$skipped" = 0 ] || printf '%d skipped (JSC_PANIC=unwind)\n' "$skipped"
 echo "================================================================"
 
 if [ "$failures" -ne 0 ]; then
