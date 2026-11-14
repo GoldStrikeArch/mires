@@ -24,6 +24,7 @@ pub mod constant;
 pub mod emit;
 pub mod function;
 pub mod host;
+pub mod i64_pair;
 pub mod intrinsics;
 pub mod place;
 pub mod ptr;
@@ -36,7 +37,7 @@ pub mod value;
 mod tests;
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use rcgjs_object::item::{FlatZombie, JsName, ZombieKind};
 use rcgjs_object::jir::decline::{Decline, LowerDecline, OpClass};
@@ -101,6 +102,14 @@ pub struct JsCx<'a> {
     pub(super) instantiations: RefCell<BTreeMap<ValueId, template::Instantiation>>,
     /// The inline expression of every value the plan inlined, once its op has been lowered.
     exprs: RefCell<BTreeMap<ValueId, Expr>>,
+    /// Normalized signed-`Int32` `(lo, hi)` pair expressions for 64-bit integer (`i64`/`u64`)
+    /// parameters, inlined values, and cached temporaries.
+    pair_exprs: RefCell<BTreeMap<ValueId, (Expr, Expr)>>,
+    /// Carried 64-bit `*WithOverflow` results `(lo, hi, overflow_flag)` keyed by the pair value.
+    pub(super) carried_i64_overflow: RefCell<BTreeMap<ValueId, (Expr, Expr, Expr)>>,
+    /// Exact JavaScript formal parameter names in the emitted `function` signature (excluding
+    /// expanded logical parameter names whose formal lanes are `<name>$lo`/`$buf`/etc.).
+    formal_param_names: RefCell<HashSet<String>>,
     /// Tagged direct-call results kept as virtual `tag, payload...` products.
     ///
     /// Their expressions are canonical object *descriptions*, but are never assigned as objects:
@@ -119,6 +128,8 @@ pub struct JsCx<'a> {
     origin: Cell<Option<OriginId>>,
     /// The value the last returning block parked for the `Region::Return` that follows it.
     pending_return: RefCell<Option<Expr>>,
+    /// The `(lo, hi)` pair parked for a `flat_abi` `i64_pair` `Region::Return`.
+    pending_return_pair: RefCell<Option<(Expr, Expr)>>,
     /// The defining op of every value an op defines: `(block, index)`.
     defs: BTreeMap<ValueId, (u32, u32)>,
     /// Overflow pairs that are never built, and how each is spelled
@@ -162,12 +173,16 @@ impl<'a> JsCx<'a> {
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             instantiations: RefCell::new(BTreeMap::new()),
             exprs: RefCell::new(BTreeMap::new()),
+            pair_exprs: RefCell::new(BTreeMap::new()),
+            carried_i64_overflow: RefCell::new(BTreeMap::new()),
+            formal_param_names: RefCell::new(HashSet::new()),
             tagged_exprs: RefCell::new(BTreeMap::new()),
             allocation_origins: RefCell::new(Vec::new()),
             temps: RefCell::new(Vec::new()),
             zombies: RefCell::new(Vec::new()),
             origin: Cell::new(None),
             pending_return: RefCell::new(None),
+            pending_return_pair: RefCell::new(None),
             defs,
             carried_pairs: rvalue::carried_overflow_pairs(func, table),
         }
@@ -262,6 +277,101 @@ impl<'a> JsCx<'a> {
         self.tagged_exprs.borrow_mut().insert(value, expression);
     }
 
+    /// Binds a 64-bit integer SSA value to its normalized signed-`Int32` `(lo, hi)` pair.
+    pub(super) fn bind_pair(&self, value: ValueId, lo: Expr, hi: Expr) {
+        self.pair_exprs.borrow_mut().insert(value, (lo, hi));
+    }
+
+    /// Records the exact JavaScript formal parameter names in the emitted signature.
+    pub(super) fn set_formal_param_names(&self, names: HashSet<String>) {
+        *self.formal_param_names.borrow_mut() = names;
+    }
+
+    /// Whether `name` is bound directly by a formal parameter in the emitted JS parameter list.
+    pub(super) fn is_formal_param_name(&self, name: &str) -> bool {
+        self.formal_param_names.borrow().contains(name)
+    }
+
+    /// Whether `ty` is a 64-bit integer lowered to signed-`Int32` `(lo, hi)` lanes.
+    pub(super) fn is_i64_ty(&self, ty: TypeId) -> bool {
+        i64_pair::is_i64(self.table, ty)
+    }
+
+    /// Whether `v`'s type is a 64-bit integer lowered to signed-`Int32` `(lo, hi)` lanes.
+    pub(super) fn is_i64_value(&self, v: ValueId) -> bool {
+        self.func.ty(v).is_some_and(|ty| self.is_i64_ty(ty))
+    }
+
+    /// Returns the normalized signed-`Int32` `(lo, hi)` expressions for a 64-bit SSA value.
+    pub fn pair_of(&self, v: ValueId) -> Res<(Expr, Expr)> {
+        if let Some(pair) = self.pair_exprs.borrow().get(&v) {
+            return Ok(pair.clone());
+        }
+        if self.plan.inline.contains(&v) {
+            let Some(def) = self.def_of(v) else {
+                return Err(decline(
+                    OpClass::Operand,
+                    format!("inline 64-bit value {} has no defining op", v.0),
+                ));
+            };
+            match &def.kind {
+                OpKind::Const(tree) => {
+                    if let Some(pair) = self.const_i64_pair(tree, self.ty_of(v)?) {
+                        self.pair_exprs.borrow_mut().insert(v, pair.clone());
+                        return Ok(pair);
+                    }
+                }
+                OpKind::Copy(src) | OpKind::Move(src) => {
+                    return self.pair_of(*src);
+                }
+                OpKind::Field {
+                    base,
+                    variant: None,
+                    field: 0,
+                } => {
+                    let mut root = *base;
+                    while let Some(def) = self.def_of(root) {
+                        match &def.kind {
+                            OpKind::Copy(src) | OpKind::Move(src) => root = *src,
+                            _ => break,
+                        }
+                    }
+                    if let Some((lo, hi, _)) = self.carried_i64_overflow.borrow().get(&root) {
+                        return Ok((lo.clone(), hi.clone()));
+                    }
+                }
+                _ => {}
+            }
+            let saved = self.origin.replace(Some(def.origin));
+            let expr = self.op_expr(def, v);
+            self.origin.set(saved);
+            let expr = expr?;
+            let pair = if i64_pair::is_trivial(&expr) {
+                i64_pair::unpack_bigint_exprs(expr)
+            } else {
+                return Err(decline(
+                    OpClass::Operand,
+                    format!(
+                        "inline 64-bit value {} requires statement lowering before pair_of",
+                        v.0
+                    ),
+                ));
+            };
+            self.pair_exprs.borrow_mut().insert(v, pair.clone());
+            return Ok(pair);
+        }
+        match self.plan.names.get(&v) {
+            Some(name) => {
+                let (lo, hi) = i64_pair::pair_names(name);
+                Ok((jsast::id(lo), jsast::id(hi)))
+            }
+            None => Err(decline(
+                OpClass::Operand,
+                format!("64-bit value {} has neither a name nor a cached pair", v.0),
+            )),
+        }
+    }
+
     /// The virtual tagged description already established for `value`.
     pub(super) fn tagged_expr(&self, value: ValueId) -> Option<Expr> {
         self.tagged_exprs.borrow().get(&value).cloned()
@@ -297,6 +407,18 @@ impl<'a> JsCx<'a> {
     pub fn expr_of(&self, v: ValueId) -> Res<Expr> {
         if let Some(expr) = self.exprs.borrow().get(&v) {
             return Ok(expr.clone());
+        }
+        if let Some(signed) = self
+            .func
+            .ty(v)
+            .and_then(|ty| i64_pair::i64_signedness(self.table, ty))
+        {
+            let (lo, hi) = self.pair_of(v)?;
+            let packed = i64_pair::pack_bigint(signed, lo, hi);
+            if self.plan.inline.contains(&v) {
+                self.exprs.borrow_mut().insert(v, packed.clone());
+            }
+            return Ok(packed);
         }
         // Every zero-sized value is `undefined`, whatever defined it and whatever it is called:
         // naming one would only spell `x = undefined; .. x ..` where v1 spells `undefined`.

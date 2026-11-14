@@ -10,7 +10,7 @@ use rcgjs_object::jir::semantic::{BinaryOp, CastKind, UnaryOp};
 use rcgjs_object::jir::types::{
     EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind, TypeTable,
 };
-use rcgjs_object::jsast::{self, BinOp as JsBinOp, Expr};
+use rcgjs_object::jsast::{self, BinOp as JsBinOp, Expr, Stmt};
 use rcgjs_object::ptr;
 
 use super::call::Lowered;
@@ -183,21 +183,8 @@ impl<'a> JsCx<'a> {
         }
     }
 
-    /// `BinOp::Cmp` (`rvalue.rs::codegen_three_way`).
-    fn three_way(
-        &self,
-        operand_ty: TypeId,
-        ordering_ty: TypeId,
-        lhs: Expr,
-        rhs: Expr,
-    ) -> Res<Expr> {
+    fn ordering_variants(&self, ordering_ty: TypeId) -> Res<(Expr, Expr, Expr)> {
         let table = self.table;
-        if table.int_info(operand_ty).is_none()
-            && !value::is_bool(table, operand_ty)
-            && !value::is_char(table, operand_ty)
-        {
-            return Err(decline(OpClass::Rvalue, "Cmp on a non-integer operand"));
-        }
         let variants = value::enum_variants(table, ordering_ty);
         let variant = |wanted: &str| -> Option<Expr> {
             let index = variants
@@ -213,9 +200,176 @@ impl<'a> JsCx<'a> {
                 "Cmp returned a type that is not `Ordering`",
             ));
         };
+        Ok((less, equal, greater))
+    }
+
+    /// `BinOp::Cmp` (`rvalue.rs::codegen_three_way`).
+    fn three_way(
+        &self,
+        operand_ty: TypeId,
+        ordering_ty: TypeId,
+        lhs: Expr,
+        rhs: Expr,
+    ) -> Res<Expr> {
+        let table = self.table;
+        if table.int_info(operand_ty).is_none()
+            && !value::is_bool(table, operand_ty)
+            && !value::is_char(table, operand_ty)
+        {
+            return Err(decline(OpClass::Rvalue, "Cmp on a non-integer operand"));
+        }
+        let (less, equal, greater) = self.ordering_variants(ordering_ty)?;
         Ok(rcgjs_object::evaluation::three_way(
             lhs, rhs, less, equal, greater,
         ))
+    }
+
+    fn i64_shift_amount(&self, rhs: ValueId) -> Res<Expr> {
+        let rhs_ty = self.ty_of(rhs)?;
+        if self.is_i64_ty(rhs_ty) {
+            return Ok(self.pair_of(rhs)?.0);
+        }
+        let expr = self.expr_of(rhs)?;
+        if self.table.int_repr(rhs_ty) == IntRepr::BigInt {
+            Ok(jsast::to_number(jsast::bigint_mask(false, 32, expr)))
+        } else {
+            Ok(expr)
+        }
+    }
+
+    /// Lowers a 64-bit integer `Binary` op whose result is itself an `i64`/`u64` pair.
+    pub(super) fn i64_binary_pair_stmts(
+        &self,
+        stmts: &mut Vec<Stmt>,
+        op: BinaryOp,
+        ty: TypeId,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> Res<(Expr, Expr)> {
+        let Some(signed) = super::i64_pair::i64_signedness(self.table, ty) else {
+            return Err(decline(
+                OpClass::Rvalue,
+                format!("64-bit pair `{op:?}` on a non-i64 operand"),
+            ));
+        };
+        let a = self.pair_of(lhs)?;
+        Ok(match op {
+            BinaryOp::Add | BinaryOp::AddUnchecked => {
+                let b = self.pair_of(rhs)?;
+                super::i64_pair::add_pair(self, stmts, a, b)
+            }
+            BinaryOp::Sub | BinaryOp::SubUnchecked => {
+                let b = self.pair_of(rhs)?;
+                super::i64_pair::sub_pair(self, stmts, a, b)
+            }
+            BinaryOp::Mul | BinaryOp::MulUnchecked => {
+                let b = self.pair_of(rhs)?;
+                super::i64_pair::mul_pair(self, stmts, a, b)
+            }
+            BinaryOp::Div => {
+                let b = self.pair_of(rhs)?;
+                super::i64_pair::div_rem_pair(self, stmts, signed, false, a, b)
+            }
+            BinaryOp::Rem => {
+                let b = self.pair_of(rhs)?;
+                super::i64_pair::div_rem_pair(self, stmts, signed, true, a, b)
+            }
+            BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
+                let b = self.pair_of(rhs)?;
+                let js_op = match op {
+                    BinaryOp::BitAnd => JsBinOp::BitAnd,
+                    BinaryOp::BitOr => JsBinOp::BitOr,
+                    _ => JsBinOp::BitXor,
+                };
+                super::i64_pair::bitwise_pair(js_op, a, b)
+            }
+            BinaryOp::Shl | BinaryOp::ShlUnchecked => {
+                let amt = self.i64_shift_amount(rhs)?;
+                super::i64_pair::shl_pair(self, stmts, a, amt)
+            }
+            BinaryOp::Shr | BinaryOp::ShrUnchecked => {
+                let amt = self.i64_shift_amount(rhs)?;
+                super::i64_pair::shr_pair(self, stmts, signed, a, amt)
+            }
+            _ => {
+                return Err(decline(
+                    OpClass::Rvalue,
+                    format!("`{op:?}` on an `i64`/`u64` operand"),
+                ))
+            }
+        })
+    }
+
+    /// Lowers a `Binary` op with 64-bit integer operands whose result is NOT a 64-bit pair
+    /// (comparisons, three-way `Cmp`, or an escaped `*WithOverflow` tuple).
+    pub(super) fn i64_binary_expr_stmts(
+        &self,
+        stmts: &mut Vec<Stmt>,
+        op: BinaryOp,
+        ty: TypeId,
+        result_ty: TypeId,
+        lhs: ValueId,
+        rhs: ValueId,
+    ) -> Res<Expr> {
+        let Some(signed) = super::i64_pair::i64_signedness(self.table, ty) else {
+            return Err(decline(
+                OpClass::Rvalue,
+                format!("64-bit `{op:?}` on a non-i64 operand"),
+            ));
+        };
+        let a = self.pair_of(lhs)?;
+        let b = self.pair_of(rhs)?;
+        match op {
+            BinaryOp::Cmp => {
+                let (less, equal, greater) = self.ordering_variants(result_ty)?;
+                Ok(super::i64_pair::three_way_ordering(
+                    self,
+                    stmts,
+                    signed,
+                    a,
+                    b,
+                    [less, equal, greater],
+                ))
+            }
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => Ok(super::i64_pair::cmp_pair(self, stmts, op, signed, a, b)),
+            BinaryOp::AddWithOverflow | BinaryOp::SubWithOverflow | BinaryOp::MulWithOverflow => {
+                let (lo, hi, ovf) =
+                    super::i64_pair::with_overflow_pair(self, stmts, op, signed, a, b);
+                let lo = super::i64_pair::materialize(self, stmts, lo);
+                let hi = super::i64_pair::materialize(self, stmts, hi);
+                Ok(jsast::array(vec![
+                    super::i64_pair::pack_bigint(signed, lo, hi),
+                    ovf,
+                ]))
+            }
+            _ => Err(decline(
+                OpClass::Rvalue,
+                format!("`{op:?}` on an `i64`/`u64` operand"),
+            )),
+        }
+    }
+
+    /// Lowers a 64-bit integer `Unary` op (`Not` or `Neg`).
+    pub(super) fn i64_unary_pair_stmts(
+        &self,
+        stmts: &mut Vec<Stmt>,
+        op: UnaryOp,
+        operand: ValueId,
+    ) -> Res<(Expr, Expr)> {
+        let a = self.pair_of(operand)?;
+        match op {
+            UnaryOp::Not => Ok(super::i64_pair::bit_not_pair(a)),
+            UnaryOp::Neg => Ok(super::i64_pair::neg_pair(self, stmts, a)),
+            UnaryOp::PtrMetadata => Err(decline(
+                OpClass::Rvalue,
+                "`PtrMetadata` producing a 64-bit integer",
+            )),
+        }
     }
 
     /// `AddWithOverflow` and its siblings as a real pair (`rvalue.rs::codegen_with_overflow`): the
@@ -939,6 +1093,106 @@ impl<'a> JsCx<'a> {
                 jsast::rt_call("f2i", vec![value, jsast::num(min), jsast::num(max)])
             }
         })
+    }
+
+    /// Lowers a `Cast` whose destination is a 64-bit integer `(lo, hi)` pair.
+    pub(super) fn i64_cast_pair_stmts(
+        &self,
+        stmts: &mut Vec<Stmt>,
+        kind: CastKind,
+        from_ty: TypeId,
+        to_ty: TypeId,
+        operand: ValueId,
+    ) -> Res<(Expr, Expr)> {
+        let table = self.table;
+        let to_signed = super::i64_pair::i64_signedness(table, to_ty).unwrap_or(false);
+        match kind {
+            CastKind::IntToInt => {
+                if self.is_i64_ty(from_ty) {
+                    return self.pair_of(operand);
+                }
+                let src = self.expr_of(operand)?;
+                let is_bool = value::is_bool(table, from_ty);
+                let (from_signed, from_bits) = table.int_info(from_ty).unwrap_or((false, 32));
+                Ok(super::i64_pair::cast_to_i64_pair(
+                    self,
+                    stmts,
+                    from_signed,
+                    from_bits,
+                    is_bool,
+                    from_bits == 128,
+                    src,
+                ))
+            }
+            CastKind::FloatToInt => {
+                let src = self.expr_of(operand)?;
+                Ok(super::i64_pair::float_to_i64_pair(
+                    self, stmts, to_signed, src,
+                ))
+            }
+            CastKind::Transmute => self.transmute_to_i64_pair(stmts, from_ty, to_ty, operand),
+            CastKind::PointerExposeProvenance => {
+                let expr = self.cast(kind, from_ty, to_ty, self.expr_of(operand)?)?;
+                let expr = super::i64_pair::materialize(self, stmts, expr);
+                Ok(super::i64_pair::unpack_bigint_exprs(expr))
+            }
+            CastKind::Subtype => self.pair_of(operand),
+            _ => Err(decline(
+                OpClass::Cast,
+                format!("unsupported cast `{kind:?}` into `i64`/`u64`"),
+            )),
+        }
+    }
+
+    /// Lowers a `Cast` whose source is a 64-bit integer `(lo, hi)` pair and whose destination is
+    /// NOT a 64-bit integer.
+    pub(super) fn i64_cast_expr_stmts(
+        &self,
+        stmts: &mut Vec<Stmt>,
+        kind: CastKind,
+        from_ty: TypeId,
+        to_ty: TypeId,
+        operand: ValueId,
+    ) -> Res<Expr> {
+        let table = self.table;
+        let from_signed = super::i64_pair::i64_signedness(table, from_ty).unwrap_or(false);
+        match kind {
+            CastKind::IntToInt => {
+                let (lo, hi) = self.pair_of(operand)?;
+                if value::is_char(table, to_ty) {
+                    return Ok(lo);
+                }
+                let Some((signed, bits)) = table.int_info(to_ty) else {
+                    return Err(decline(OpClass::Cast, "IntToInt into a non-integer"));
+                };
+                if table.int_repr(to_ty) == IntRepr::Number {
+                    Ok(mask(IntRepr::Number, signed, bits, lo))
+                } else {
+                    Ok(jsast::bigint_mask(
+                        signed,
+                        bits,
+                        super::i64_pair::pack_bigint(from_signed, lo, hi),
+                    ))
+                }
+            }
+            CastKind::IntToFloat => {
+                let (lo, hi) = self.pair_of(operand)?;
+                let float_bits = value::float_bits(table, to_ty).unwrap_or(64);
+                Ok(super::i64_pair::i64_pair_to_float(
+                    from_signed,
+                    float_bits,
+                    (lo, hi),
+                ))
+            }
+            CastKind::Transmute => self.transmute_from_i64_pair(stmts, from_ty, to_ty, operand),
+            CastKind::PointerWithExposedProvenance | CastKind::Subtype => {
+                self.cast(kind, from_ty, to_ty, self.expr_of(operand)?)
+            }
+            _ => Err(decline(
+                OpClass::Cast,
+                format!("unsupported cast `{kind:?}` from `i64`/`u64`"),
+            )),
+        }
     }
 
     /// A fresh aggregate (`rvalue.rs::codegen_aggregate`), given the already lowered fields.

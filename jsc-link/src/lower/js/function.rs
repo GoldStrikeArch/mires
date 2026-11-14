@@ -50,6 +50,7 @@ pub fn lower(
     let slice_positions = physical.map_or_else(Vec::new, |sig| sig.slice_jir_positions());
     let tagged_positions = physical.map_or_else(Vec::new, |sig| sig.tagged_jir_positions());
     let recursive_positions = physical.map_or_else(Vec::new, |sig| sig.recursive_jir_positions());
+    let i64_positions = physical.map_or_else(Vec::new, |sig| sig.i64_pair_jir_positions());
     for value in &plan.physical_slices {
         let Some(name) = cx.name_of(*value) else {
             return Err(decline(
@@ -83,6 +84,7 @@ pub fn lower(
     }
     let mut params: Vec<String> = Vec::with_capacity(func.params.len());
     let mut logical_param_names = Vec::new();
+    let mut unpacked_i64_params: Vec<(String, String, String)> = Vec::new();
     for (position, param) in func.params.iter().enumerate() {
         let Some(name) = cx.name_of(*param) else {
             return Err(decline(
@@ -101,6 +103,11 @@ pub fn lower(
                 *param,
                 ptr::fat_slice(jsast::id(buf), jsast::id(off), jsast::id(len)),
             );
+        } else if i64_positions.contains(&position) {
+            let (lo, hi) = super::i64_pair::pair_names(name);
+            params.extend([lo.clone(), hi.clone()]);
+            logical_param_names.push(name.to_owned());
+            cx.bind_pair(*param, jsast::id(lo), jsast::id(hi));
         } else if let Some((_, shape)) = tagged_positions
             .iter()
             .find(|(tagged_position, _)| *tagged_position == position)
@@ -152,11 +159,18 @@ pub fn lower(
                 ));
             };
             cx.bind_expr(*param, value);
+        } else if cx.is_i64_ty(cx.ty_of(*param)?) {
+            let (lo, hi) = super::i64_pair::pair_names(name);
+            params.push(name.to_owned());
+            cx.bind_pair(*param, jsast::id(lo.clone()), jsast::id(hi.clone()));
+            unpacked_i64_params.push((name.to_owned(), lo, hi));
         } else {
             params.push(name.to_owned());
         }
     }
-    let mut param_names: HashSet<String> = params.iter().cloned().collect();
+    let formal_param_names: HashSet<String> = params.iter().cloned().collect();
+    cx.set_formal_param_names(formal_param_names.clone());
+    let mut param_names: HashSet<String> = formal_param_names.clone();
     param_names.extend(logical_param_names);
 
     // The body first: it decides how many temporaries get hoisted and which names are mentioned.
@@ -165,6 +179,29 @@ pub fn lower(
         if matches!(body[last], Stmt::Return(None)) {
             body.truncate(last);
         }
+    }
+    let body_mentions_initial = mentioned_names(&body);
+    let mut entry_unpacks = Vec::new();
+    let mut unpacked_pair_locals = Vec::new();
+    for (canonical, lo, hi) in unpacked_i64_params {
+        let uses_lo = body_mentions_initial.contains(&lo);
+        let uses_hi = body_mentions_initial.contains(&hi);
+        if !uses_lo && !uses_hi {
+            continue;
+        }
+        let (lo_expr, hi_expr) = super::i64_pair::unpack_bigint_exprs(jsast::id(canonical));
+        if uses_lo {
+            entry_unpacks.push(jsast::assign_stmt(jsast::id(lo.clone()), lo_expr));
+            unpacked_pair_locals.push(lo);
+        }
+        if uses_hi {
+            entry_unpacks.push(jsast::assign_stmt(jsast::id(hi.clone()), hi_expr));
+            unpacked_pair_locals.push(hi);
+        }
+    }
+    if !entry_unpacks.is_empty() {
+        entry_unpacks.append(&mut body);
+        body = entry_unpacks;
     }
     // The prelude (`base.rs::codegen_body`): every local declared once — the named values, the
     // cells (a boxed one as its empty box; a parameter's cell is bound by the signature and
@@ -196,12 +233,24 @@ pub fn lower(
                     declarations.push((lane, None));
                 }
             }
+        } else if cx.is_i64_ty(cx.ty_of(*v)?) {
+            let (lo, hi) = super::i64_pair::pair_names(name);
+            for lane in [lo, hi] {
+                if declared.insert(lane.clone()) {
+                    declarations.push((lane, None));
+                }
+            }
         } else if declared.insert(name.to_owned()) {
             declarations.push((name.to_owned(), None));
         }
     }
+    for lane in unpacked_pair_locals {
+        if declared.insert(lane.clone()) {
+            declarations.push((lane, None));
+        }
+    }
     for (cell, name) in &plan.cell_names {
-        if plan.param_cells.contains_key(cell) || param_names.contains(name) {
+        if formal_param_names.contains(name) {
             continue;
         }
         if !declared.insert(name.clone()) {
@@ -218,6 +267,12 @@ pub fn lower(
     for name in &plan.copy_temps {
         if declared.insert(name.clone()) {
             declarations.push((name.clone(), None));
+        }
+        let (lo, hi) = super::i64_pair::pair_names(name);
+        for lane in [lo, hi] {
+            if body_mentions_initial.contains(&lane) && declared.insert(lane.clone()) {
+                declarations.push((lane, None));
+            }
         }
     }
     declarations.extend(cx.temps().into_iter().map(|name| (name, None)));

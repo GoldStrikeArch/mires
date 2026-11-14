@@ -47,6 +47,8 @@ pub enum Lowered {
     /// The statements capture a tagged call's scalar result lanes; `1` is its virtual canonical
     /// description and must be cached rather than assigned as a JavaScript object.
     Virtual(Vec<Stmt>, Expr),
+    /// The statements run, then `1` is the lowered 64-bit integer `(lo, hi)` pair.
+    Pair(Vec<Stmt>, (Expr, Expr)),
     /// The statements are the whole lowering; the op has no value.
     Done(Vec<Stmt>),
 }
@@ -62,7 +64,7 @@ impl Lowered {
     pub fn into_expr(self) -> Option<Expr> {
         let (prelude, value) = match self {
             Lowered::Value(prelude, value) | Lowered::Virtual(prelude, value) => (prelude, value),
-            Lowered::Done(_) => return None,
+            Lowered::Pair(..) | Lowered::Done(_) => return None,
         };
         if prelude.is_empty() {
             return Some(value);
@@ -243,9 +245,15 @@ impl JsCx<'_> {
         let tagged_positions = physical.map_or_else(Vec::new, |sig| sig.tagged_jir_positions());
         let recursive_positions =
             physical.map_or_else(Vec::new, |sig| sig.recursive_jir_positions());
+        let i64_positions = physical.map_or_else(Vec::new, |sig| sig.i64_pair_jir_positions());
         let mut arguments = Vec::with_capacity(args.len());
         let mut owned_virtual_receiver = false;
         for (position, arg) in args.iter().enumerate() {
+            if i64_positions.contains(&position) {
+                let (lo, hi) = self.pair_of(*arg)?;
+                arguments.extend([lo, hi]);
+                continue;
+            }
             let value = if position == 0 && matches!(callee, Callee::Virtual { .. }) {
                 let (value, owned) = self.virtual_receiver(*arg)?;
                 owned_virtual_receiver = owned;
@@ -333,11 +341,19 @@ impl JsCx<'_> {
                 let recursive = physical
                     .and_then(|sig| sig.result.as_ref())
                     .and_then(|result| result.recursive.as_ref());
-                if tagged.is_none() && recursive.is_none() {
+                let i64_pair = physical
+                    .and_then(|sig| sig.result.as_ref())
+                    .is_some_and(|result| result.i64_pair);
+                if tagged.is_none() && recursive.is_none() && !i64_pair {
                     return Ok(Lowered::value(call));
                 }
                 if op.result.is_none() {
                     return Ok(Lowered::Done(vec![jsast::expr_stmt(call)]));
+                }
+                if i64_pair {
+                    let (bind_lo, lo) = self.temp(call);
+                    let (bind_hi, hi) = self.temp(jsast::id(emit::spill_name_of(self.spills, 1)));
+                    return Ok(Lowered::Pair(vec![bind_lo, bind_hi], (lo, hi)));
                 }
                 // The call runs before any spill read, then every lane is copied into a local:
                 // another flattened call may reuse the module-scope registers before this value

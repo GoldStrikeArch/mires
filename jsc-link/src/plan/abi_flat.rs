@@ -83,6 +83,8 @@ pub struct FlatParam {
     /// Whether these are the physical `buf`, `off`, and `len` lanes of a slice rather than
     /// declaration-order aggregate fields.
     pub slice: bool,
+    /// Whether this 64-bit integer (`i64`/`u64`) travels as two signed-`Int32` `(lo, hi)` lanes.
+    pub i64_pair: bool,
     /// A two-variant enum carried as its physical tag followed by the payload properties named
     /// here. Unlike fixed products, this shape stays semantic JIR until JavaScript lowering: the
     /// lowerer can project and rebuild the ordinary enum object without inventing a second enum
@@ -97,6 +99,9 @@ pub struct FlatParam {
 impl FlatParam {
     /// How many JavaScript parameters the flat parameter takes.
     pub fn fields(&self) -> u32 {
+        if self.i64_pair {
+            return 2;
+        }
         self.tagged.as_ref().map_or_else(
             || {
                 self.recursive
@@ -253,6 +258,9 @@ pub struct FlatResult {
     pub field_tys: Vec<TypeId>,
     /// The non-zero-sized fields that travel as result lanes, by index into `field_tys`.
     pub passed: Vec<u32>,
+    /// Whether this 64-bit integer (`i64`/`u64`) returns as `(lo, hi)` (`lo` primary, `hi` in
+    /// spill register 1).
+    pub i64_pair: bool,
     /// The tagged-product form, when this is a small two-variant enum rather than a fixed
     /// aggregate. The physical primary return is the tag; payloads use the ordinary spill lanes.
     pub tagged: Option<TaggedShape>,
@@ -264,6 +272,9 @@ pub struct FlatResult {
 impl FlatResult {
     /// How many physical result lanes this semantic result takes.
     fn fields(&self) -> u32 {
+        if self.i64_pair {
+            return 2;
+        }
         self.tagged.as_ref().map_or_else(
             || {
                 self.recursive
@@ -339,7 +350,11 @@ impl FlatSig {
                     positions.push(cursor);
                     cursor += 1;
                 }
-                Some(param) if param.tagged.is_some() || param.recursive.is_some() => cursor += 1,
+                Some(param)
+                    if param.i64_pair || param.tagged.is_some() || param.recursive.is_some() =>
+                {
+                    cursor += 1
+                }
                 Some(param) => cursor += param.fields() as usize,
                 None => cursor += 1,
             }
@@ -361,7 +376,9 @@ impl FlatSig {
                     ));
                     cursor += 1;
                 }
-                Some(param) if param.slice || param.recursive.is_some() => cursor += 1,
+                Some(param) if param.slice || param.i64_pair || param.recursive.is_some() => {
+                    cursor += 1
+                }
                 Some(param) => cursor += param.fields() as usize,
                 None => cursor += 1,
             }
@@ -385,7 +402,31 @@ impl FlatSig {
                     ));
                     cursor += 1;
                 }
-                Some(param) if param.slice || param.tagged.is_some() => cursor += 1,
+                Some(param) if param.slice || param.i64_pair || param.tagged.is_some() => {
+                    cursor += 1
+                }
+                Some(param) => cursor += param.fields() as usize,
+                None => cursor += 1,
+            }
+        }
+        positions
+    }
+
+    /// Positions of 64-bit integer `(lo, hi)` pair parameters in JIR parameter numbering.
+    pub(crate) fn i64_pair_jir_positions(&self) -> Vec<usize> {
+        let mut positions = Vec::new();
+        let mut cursor = 0;
+        for param in &self.params {
+            match param {
+                Some(param) if param.i64_pair => {
+                    positions.push(cursor);
+                    cursor += 1;
+                }
+                Some(param)
+                    if param.slice || param.tagged.is_some() || param.recursive.is_some() =>
+                {
+                    cursor += 1
+                }
                 Some(param) => cursor += param.fields() as usize,
                 None => cursor += 1,
             }
@@ -740,6 +781,14 @@ impl AbiPlan {
         (self.names.get(&item) == Some(name))
             .then(|| self.flat.get(&item))
             .flatten()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_target_test(item: ItemId, name: JsName, sig: FlatSig) -> Self {
+        let mut plan = Self::default();
+        plan.flat.insert(item, sig);
+        plan.names.insert(item, name);
+        plan
     }
 
     /// Whether `name` is a private flat body behind a canonical wrapper.
@@ -1210,13 +1259,15 @@ pub fn plan_excluding(
         let kinds: Vec<Option<ParamKind>> = shapes
             .iter()
             .map(|shape| {
-                shape.as_ref().map(|shape| {
-                    if shape.slice {
-                        ParamKind::Slice
+                shape.as_ref().and_then(|shape| {
+                    if shape.i64_pair {
+                        None
+                    } else if shape.slice {
+                        Some(ParamKind::Slice)
                     } else if shape.by_ref {
-                        ParamKind::ByRef
+                        Some(ParamKind::ByRef)
                     } else {
-                        ParamKind::ByValue
+                        Some(ParamKind::ByValue)
                     }
                 })
             })
@@ -1458,6 +1509,8 @@ fn signature_shape(sig: &FlatSig) -> String {
     for param in sig.params.iter().flatten() {
         let kind = if param.slice {
             "slice"
+        } else if param.i64_pair {
+            "i64-pair"
         } else if param.tagged.is_some() {
             "tagged"
         } else if param.recursive.is_some() {
@@ -1468,7 +1521,9 @@ fn signature_shape(sig: &FlatSig) -> String {
         parts.push(format!("{kind}({})", param.fields()));
     }
     if let Some(result) = &sig.result {
-        let kind = if result.tagged.is_some() {
+        let kind = if result.i64_pair {
+            "i64-pair-result"
+        } else if result.tagged.is_some() {
             "tagged-result"
         } else if result.recursive.is_some() {
             "recursive-product-result"
@@ -1720,6 +1775,20 @@ fn flat_param(table: &TypeTable, ty: TypeId, written: bool) -> Option<FlatParam>
         _ => (ty, false, false),
     };
     if !by_ref {
+        if crate::lower::js::i64_pair::is_i64(table, aggregate) {
+            return Some(FlatParam {
+                ty: aggregate,
+                field_tys: vec![ty],
+                passed: vec![0],
+                by_ref: false,
+                mutable: false,
+                written: false,
+                slice: false,
+                i64_pair: true,
+                tagged: None,
+                recursive: None,
+            });
+        }
         if let Some(tagged) = tagged_shape(table, aggregate) {
             let field_tys = tagged.lane_types();
             let passed = (0..field_tys.len() as u32).collect();
@@ -1731,6 +1800,7 @@ fn flat_param(table: &TypeTable, ty: TypeId, written: bool) -> Option<FlatParam>
                 mutable: false,
                 written,
                 slice: false,
+                i64_pair: false,
                 tagged: Some(tagged),
                 recursive: None,
             });
@@ -1746,6 +1816,7 @@ fn flat_param(table: &TypeTable, ty: TypeId, written: bool) -> Option<FlatParam>
                 mutable: false,
                 written,
                 slice: false,
+                i64_pair: false,
                 tagged: None,
                 recursive: Some(recursive),
             });
@@ -1765,6 +1836,7 @@ fn flat_param(table: &TypeTable, ty: TypeId, written: bool) -> Option<FlatParam>
         mutable,
         written,
         slice: false,
+        i64_pair: false,
         tagged: None,
         recursive: None,
     })
@@ -1823,6 +1895,7 @@ fn slice_param(func: &Func, table: &TypeTable, param: ValueId, ty: TypeId) -> Op
         mutable,
         written: false,
         slice: true,
+        i64_pair: false,
         tagged: None,
         recursive: None,
     })
@@ -1830,6 +1903,16 @@ fn slice_param(func: &Func, table: &TypeTable, param: ValueId, ty: TypeId) -> Op
 
 /// The flat result shape of `ty`, or `None` when it must stay one materialized value.
 fn flat_result(table: &TypeTable, ty: TypeId) -> Option<FlatResult> {
+    if crate::lower::js::i64_pair::is_i64(table, ty) {
+        return Some(FlatResult {
+            ty,
+            field_tys: vec![ty],
+            passed: vec![0],
+            i64_pair: true,
+            tagged: None,
+            recursive: None,
+        });
+    }
     if let Some(tagged) = tagged_shape(table, ty) {
         let field_tys = tagged.lane_types();
         let passed = (0..field_tys.len() as u32).collect();
@@ -1837,6 +1920,7 @@ fn flat_result(table: &TypeTable, ty: TypeId) -> Option<FlatResult> {
             ty,
             field_tys,
             passed,
+            i64_pair: false,
             tagged: Some(tagged),
             recursive: None,
         });
@@ -1848,6 +1932,7 @@ fn flat_result(table: &TypeTable, ty: TypeId) -> Option<FlatResult> {
             ty,
             field_tys,
             passed,
+            i64_pair: false,
             tagged: None,
             recursive: Some(recursive),
         });
@@ -1857,6 +1942,7 @@ fn flat_result(table: &TypeTable, ty: TypeId) -> Option<FlatResult> {
         ty,
         field_tys,
         passed,
+        i64_pair: false,
         tagged: None,
         recursive: None,
     })
@@ -2212,6 +2298,39 @@ fn caller_accepts_result(
     potential_params: &BTreeMap<ItemId, Vec<Option<FlatParam>>>,
 ) -> Option<ResultUse> {
     let types = type_table(table, caller)?;
+    if result.i64_pair {
+        if !crate::lower::js::i64_pair::is_i64(types, result.ty) {
+            return None;
+        }
+        let func = funcs.get(caller)?.as_ref().ok()?;
+        let mut saw_call = false;
+        for block in &func.blocks {
+            for op in &block.ops {
+                let OpKind::Call {
+                    callee: Callee::Direct { item, .. },
+                    host: None,
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if *item != callee {
+                    continue;
+                }
+                saw_call = true;
+                if let Some(value) = op.result {
+                    let definition = func.values.get(value.0 as usize)?;
+                    if definition.ty != result.ty || definition.carrier != Carrier::Baseline {
+                        return None;
+                    }
+                }
+            }
+        }
+        return saw_call.then_some(ResultUse {
+            read: true,
+            ..ResultUse::default()
+        });
+    }
     let agrees = match &result.tagged {
         Some(tagged) => tagged_shape(types, result.ty).as_ref() == Some(tagged),
         None if result.recursive.is_some() => {
@@ -2416,6 +2535,9 @@ fn returns_baseline(func: &Func, ty: TypeId) -> bool {
 /// caller that cannot resolve a field would print a `Field` op for a field it does not know.
 fn shapes_agree(types: &TypeTable, shapes: &[Option<FlatParam>]) -> bool {
     shapes.iter().flatten().all(|shape| {
+        if shape.i64_pair {
+            return crate::lower::js::i64_pair::is_i64(types, shape.ty);
+        }
         if shape.slice {
             return types.get(shape.ty).is_some()
                 && shape.field_tys[1..]
@@ -2461,6 +2583,12 @@ fn close_over_forwards(candidates: &BTreeMap<ItemId, Candidate>) -> BTreeMap<Ite
                 if !flat[item][position] {
                     continue;
                 }
+                if candidate.shapes[position]
+                    .as_ref()
+                    .is_some_and(|shape| shape.i64_pair)
+                {
+                    continue;
+                }
                 let keeps = !use_.escapes
                     && use_.forwards.iter().all(|(callee, argument)| {
                         flat.get(callee)
@@ -2495,8 +2623,8 @@ pub fn rewrite_callee(func: &mut Func, sig: &FlatSig) {
             params.push(*param);
             continue;
         };
-        if flat.slice || flat.tagged.is_some() || flat.recursive.is_some() {
-            // Slice and tagged lanes are physical lowering choices. Keeping the semantic
+        if flat.slice || flat.i64_pair || flat.tagged.is_some() || flat.recursive.is_some() {
+            // Slice, i64 pair, and tagged lanes are physical lowering choices. Keeping the semantic
             // parameter here lets range/enum analysis continue over ordinary JIR; phase C
             // replaces only the JavaScript declaration and direct-call spelling.
             params.push(*param);
@@ -2573,7 +2701,9 @@ pub fn rewrite_callee(func: &mut Func, sig: &FlatSig) {
             let result_reads: Vec<ValueId> = sig
                 .result
                 .as_ref()
-                .filter(|result| result.tagged.is_none() && result.recursive.is_none())
+                .filter(|result| {
+                    !result.i64_pair && result.tagged.is_none() && result.recursive.is_none()
+                })
                 .into_iter()
                 .flat_map(|result| {
                     let base = returned.expect("a flat aggregate result returns a value");
@@ -2618,7 +2748,9 @@ pub fn rewrite_callee(func: &mut Func, sig: &FlatSig) {
             let result_offset = sig
                 .result
                 .as_ref()
-                .filter(|result| result.tagged.is_some() || result.recursive.is_some())
+                .filter(|result| {
+                    result.i64_pair || result.tagged.is_some() || result.recursive.is_some()
+                })
                 .map_or(0, |_| sig.result_spills());
             for (index, value) in spilled.into_iter().enumerate() {
                 func.blocks[block].ops.push(Op {
@@ -2637,11 +2769,9 @@ pub fn rewrite_callee(func: &mut Func, sig: &FlatSig) {
                 func.blocks[block].term = RTerm::Return(Some(*primary));
             }
         }
-        if let Some(result) = sig
-            .result
-            .as_ref()
-            .filter(|result| result.tagged.is_none() && result.recursive.is_none())
-        {
+        if let Some(result) = sig.result.as_ref().filter(|result| {
+            !result.i64_pair && result.tagged.is_none() && result.recursive.is_none()
+        }) {
             func.sig.result = result.field_tys[result.passed[0] as usize];
         } else if sig.returns_out_field {
             func.sig.result = sig.out_ty(outs[0]);
@@ -2688,7 +2818,8 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
                     flat_args.push(*arg);
                     continue;
                 };
-                if flat.slice || flat.tagged.is_some() || flat.recursive.is_some() {
+                if flat.slice || flat.i64_pair || flat.tagged.is_some() || flat.recursive.is_some()
+                {
                     flat_args.push(*arg);
                     continue;
                 }
@@ -2726,13 +2857,19 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
             let aggregate_result = op.result;
             let flat_primary = match (&sig.result, aggregate_result) {
                 (Some(result), Some(_))
-                    if result.tagged.is_none() && result.recursive.is_none() =>
+                    if !result.i64_pair
+                        && result.tagged.is_none()
+                        && result.recursive.is_none() =>
                 {
                     let value = define(func, result.field_tys[result.passed[0] as usize], origin);
                     op.result = Some(value);
                     Some(value)
                 }
-                (Some(result), None) if result.tagged.is_none() && result.recursive.is_none() => {
+                (Some(result), None)
+                    if !result.i64_pair
+                        && result.tagged.is_none()
+                        && result.recursive.is_none() =>
+                {
                     op.result = None;
                     None
                 }
@@ -2752,7 +2889,9 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
             if let (Some(result), Some(aggregate), Some(first)) =
                 (&sig.result, aggregate_result, flat_primary)
             {
-                debug_assert!(result.tagged.is_none() && result.recursive.is_none());
+                debug_assert!(
+                    !result.i64_pair && result.tagged.is_none() && result.recursive.is_none()
+                );
                 let mut lane = 0_u32;
                 let mut fields = Vec::with_capacity(result.field_tys.len());
                 for (field, ty) in result.field_tys.iter().enumerate() {
@@ -3222,6 +3361,7 @@ mod tests {
             mutable: true,
             written: true,
             slice: false,
+            i64_pair: false,
             tagged: None,
             recursive: None,
         }
@@ -3246,6 +3386,7 @@ mod tests {
             mutable: false,
             written: false,
             slice: true,
+            i64_pair: false,
             tagged: None,
             recursive: None,
         };

@@ -23,9 +23,10 @@
 use std::collections::BTreeMap;
 
 use rcgjs_object::jir::decline::OpClass;
+use rcgjs_object::jir::repr::{OpKind, ValueId};
 use rcgjs_object::jir::semantic::DefinitionId;
 use rcgjs_object::jir::types::{EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind};
-use rcgjs_object::jsast::{self, BinOp, Expr};
+use rcgjs_object::jsast::{self, BinOp, Expr, Stmt};
 
 use super::{decline, value, JsCx, Res};
 
@@ -74,6 +75,71 @@ impl JsCx<'_> {
         let (inner_to, wrappers) = self.target_wrappers(to_ty);
         let scalar = self.transmute_scalar(inner_from, inner_to, inner_value)?;
         Ok(self.rebuild(&wrappers, scalar))
+    }
+
+    /// Lowers `transmute` whose destination is a 64-bit integer `(lo, hi)` pair.
+    pub(super) fn transmute_to_i64_pair(
+        &self,
+        stmts: &mut Vec<Stmt>,
+        from_ty: TypeId,
+        to_ty: TypeId,
+        operand: ValueId,
+    ) -> Res<(Expr, Expr)> {
+        let table = self.table;
+        if from_ty == to_ty
+            || table.peeled(from_ty) == table.peeled(to_ty)
+            || self.is_i64_ty(from_ty)
+        {
+            return self.pair_of(operand);
+        }
+        if byte_array_len(table, from_ty) == Some(8) {
+            if self.is_inline(operand) {
+                if let Some(op) = self.def_of(operand) {
+                    if let OpKind::Aggregate { fields, .. } = &op.kind {
+                        if fields.len() == 8 {
+                            let mut bytes = Vec::with_capacity(8);
+                            for &v in fields {
+                                bytes.push(self.expr_of(v)?);
+                            }
+                            let arr: [Expr; 8] = bytes
+                                .try_into()
+                                .expect("verified 8 elements for [u8; 8] transmute");
+                            return Ok(super::i64_pair::pack_8_bytes(arr));
+                        }
+                    }
+                }
+            }
+            let arr = self.expr_of(operand)?;
+            return Ok(super::i64_pair::bytes_expr_to_i64_pair(self, stmts, arr));
+        }
+        if value::float_bits(table, table.peeled(from_ty)) == Some(64) {
+            let val = self.expr_of(operand)?;
+            return Ok(super::i64_pair::f64_to_bits_pair(self, stmts, val));
+        }
+        let expr = self.transmute(from_ty, to_ty, self.expr_of(operand)?)?;
+        let expr = super::i64_pair::materialize(self, stmts, expr);
+        Ok(super::i64_pair::unpack_bigint_exprs(expr))
+    }
+
+    /// Lowers `transmute` whose source is a 64-bit integer `(lo, hi)` pair and whose destination is
+    /// NOT a 64-bit integer.
+    pub(super) fn transmute_from_i64_pair(
+        &self,
+        stmts: &mut Vec<Stmt>,
+        from_ty: TypeId,
+        to_ty: TypeId,
+        operand: ValueId,
+    ) -> Res<Expr> {
+        let table = self.table;
+        if byte_array_len(table, to_ty) == Some(8) {
+            let pair = self.pair_of(operand)?;
+            return Ok(super::i64_pair::i64_pair_to_bytes_expr(self, stmts, pair));
+        }
+        if value::float_bits(table, table.peeled(to_ty)) == Some(64) {
+            let pair = self.pair_of(operand)?;
+            return Ok(super::i64_pair::bits_pair_to_f64(pair));
+        }
+        self.transmute(from_ty, to_ty, self.expr_of(operand)?)
     }
 
     /// The scalar half of a transmute, once both sides have had their wrappers removed.
