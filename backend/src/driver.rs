@@ -148,7 +148,7 @@ fn codegen_cgu_inner(tcx: TyCtxt<'_>, cgu_name: Symbol) -> JsModule {
                         });
                     }
                     if tcx.sess.panic_strategy() == rustc_target::spec::PanicStrategy::Unwind {
-                        reject_nounwind_foreign_calls(tcx, instance);
+                        reject_unwind_crossing_calls(tcx, instance);
                     }
                     if cx.claim(&item.name) {
                         module.items.push(item);
@@ -273,60 +273,220 @@ fn requires_cleanup_lowering<'tcx>(
             .any(|block| block.is_cleanup)
 }
 
-/// Under `-Cpanic=unwind` (the unwind build mode), an error for each call this function makes to a
-/// foreign import whose ABI cannot unwind.
+/// Under `-Cpanic=unwind` (the unwind build mode), an error for each place in this function where
+/// a host exception could cross a frame whose cleanup rustc removed.
 ///
-/// rustc removes the cleanup edge of such a call, so a JavaScript exception thrown by the host
-/// behind it would leave its callers without running their destructors. Declared
-/// `extern "C-unwind"` the call keeps its edge. The imports of the sysroot's own crates are the
-/// runtime's, which this compiler supplies, so only a program's own declarations are named. It is
-/// an error where the call is compiled rather than a zombie: the JIR lane replaces an item's
-/// zombies with its lowering's, and this is a property of the declaration, not of the lowering.
-fn reject_nounwind_foreign_calls<'tcx>(
+/// rustc gives a call no cleanup edge when the callee's ABI cannot unwind (`fn_can_unwind`, so
+/// every such ABI, not a list of names): the destructors this function holds across the call are
+/// then gone from its MIR, and a JavaScript exception that comes out of the call would leave
+/// without running them. Two shapes reach that point:
+///
+/// * a call whose callee has such an ABI and may let a host exception out: a foreign import, a
+///   call through a function pointer or a `dyn` method, or a Rust function whose body ends a
+///   cleanup path in `UnwindTerminate(Abi)` (which this backend lowers as a rethrow, so that an
+///   export called from JavaScript keeps its cleanup) or whose body is not available to show it
+///   does not;
+/// * such a callee inlined by rustc's MIR inliner, which leaves its `UnwindTerminate(Abi)` edges
+///   inside this body, where the cleanup of this frame is gone the same way.
+///
+/// Declared `extern "C-unwind"` the call keeps its edge, which is the fix every message names. A
+/// Rust callee whose body has no such edge cannot let anything out and is accepted.
+///
+/// The sysroot's own crates are not checked where the sysroot build compiles them
+/// ([`is_sysroot_build`]): they call no host function (the imports they declare are the runtime's,
+/// which this compiler supplies), and `compiler_builtins`' intrinsics call one another through the
+/// C ABI. Their generics are checked where a program instantiates them, and a program's call to an
+/// import a sysroot crate declares is accepted ([`is_sysroot_crate`]). It is an error where the
+/// call is compiled rather than a zombie: the JIR lane replaces an item's zombies with its
+/// lowering's, and this is a property of the program, not of the lowering.
+fn reject_unwind_crossing_calls<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: rustc_middle::ty::Instance<'tcx>,
 ) {
-    use rustc_abi::ExternAbi;
+    use rustc_middle::mir::TerminatorKind;
+    use rustc_middle::ty::{self, layout::fn_can_unwind, InstanceKind};
+    if is_sysroot_build(tcx) {
+        return;
+    }
     let body = tcx.instance_mir(instance.def);
+    let fix = "Declare it `extern \"C-unwind\"`.";
+    let consequence =
+        "under -Cpanic=unwind (JSC_PANIC=unwind) rustc gives the call no cleanup, so \
+                       a host exception thrown behind it would skip this function's destructors";
+    // rustc deduplicates an identical diagnostic, so each instance of a generic reports once.
     for block in body.basic_blocks.iter() {
         let terminator = block.terminator();
-        let rustc_middle::mir::TerminatorKind::Call { func, .. } = &terminator.kind else {
+        let span = terminator.source_info.span;
+        if ends_in_abi_terminate(&terminator.kind) {
+            if let Some((callee, call)) =
+                inlined_nounwind_frame(tcx, body, terminator.source_info.scope)
+            {
+                let abi = callee.ty(tcx, crate::value::typing_env()).fn_sig(tcx).abi();
+                tcx.dcx()
+                    .struct_span_err(
+                        call,
+                        format!(
+                            "rustc_codegen_js: `{}` has the \"{}\" ABI, which cannot unwind, and \
+                             rustc inlined it here: {consequence}. {fix}",
+                            tcx.def_path_str(callee.def_id()),
+                            abi.as_str()
+                        ),
+                    )
+                    .with_span_note(
+                        tcx.def_span(callee.def_id()),
+                        "the function is defined here",
+                    )
+                    .emit();
+            }
+        }
+        let TerminatorKind::Call { func, .. } = &terminator.kind else {
             continue;
         };
-        let rustc_middle::ty::FnDef(callee, _) = *func.ty(body, tcx).kind() else {
+        let callee_ty = instance.instantiate_mir_and_normalize_erasing_regions(
+            tcx,
+            crate::value::typing_env(),
+            ty::EarlyBinder::bind(tcx, func.ty(body, tcx)),
+        );
+        let abi = callee_ty.fn_sig(tcx).abi();
+        if fn_can_unwind(tcx, None, abi) {
+            continue;
+        }
+        let abi = abi.as_str();
+        let ty::FnDef(callee, args) = *callee_ty.kind() else {
+            tcx.dcx().span_err(
+                span,
+                format!(
+                    "rustc_codegen_js: this call goes through a `{callee_ty}`, whose \"{abi}\" ABI \
+                     cannot unwind: {consequence}. Use an `extern \"C-unwind\"` function pointer \
+                     type."
+                ),
+            );
             continue;
         };
-        if !tcx.is_foreign_item(callee) {
+        let path = tcx.def_path_str(callee);
+        if tcx.is_foreign_item(callee) {
+            if is_sysroot_crate(tcx, callee.krate) {
+                continue;
+            }
+            tcx.dcx()
+                .struct_span_err(
+                    span,
+                    format!(
+                        "rustc_codegen_js: `{path}` is a foreign import with the \"{abi}\" ABI, \
+                         which cannot unwind: under -Cpanic=unwind (JSC_PANIC=unwind) a host \
+                         exception thrown through it would skip its callers' cleanup. {fix}"
+                    ),
+                )
+                .with_span_note(tcx.def_span(callee), "the import is declared here")
+                .emit();
             continue;
         }
-        let abi = tcx.fn_sig(callee).skip_binder().abi();
-        if !matches!(
-            abi,
-            ExternAbi::C { unwind: false } | ExternAbi::System { unwind: false }
-        ) {
-            continue;
-        }
-        if matches!(
-            tcx.crate_name(callee.krate).as_str(),
-            "core" | "alloc" | "compiler_builtins"
-        ) {
-            continue;
-        }
-        // rustc deduplicates an identical diagnostic, so each instance of a generic reports once.
+        let resolved = args
+            .no_bound_vars()
+            .map(|args| ty::Instance::try_resolve(tcx, crate::value::typing_env(), callee, args));
+        let why = match resolved {
+            Some(Ok(Some(target))) => match target.def {
+                InstanceKind::Item(item) if tcx.is_mir_available(item) => {
+                    let target_body = tcx.instance_mir(target.def);
+                    if !target_body
+                        .basic_blocks
+                        .iter()
+                        .any(|block| ends_in_abi_terminate(&block.terminator().kind))
+                    {
+                        continue;
+                    }
+                    "and a host exception can leave it"
+                }
+                InstanceKind::Virtual(..) => {
+                    tcx.dcx().span_err(
+                        span,
+                        format!(
+                            "rustc_codegen_js: this call of the `dyn` method `{path}` has the \
+                             \"{abi}\" ABI, which cannot unwind: {consequence}. Declare the method \
+                             `extern \"C-unwind\"`."
+                        ),
+                    );
+                    continue;
+                }
+                _ => "and its body is not available to show that no host exception leaves it",
+            },
+            _ => "and it does not resolve to a body that shows no host exception leaves it",
+        };
         tcx.dcx()
             .struct_span_err(
-                terminator.source_info.span,
+                span,
                 format!(
-                    "rustc_codegen_js: `{}` is a foreign import with the \"{}\" ABI, which cannot \
-                     unwind: under -Cpanic=unwind (JSC_PANIC=unwind) a host exception thrown \
-                     through it would skip its callers' cleanup. Declare it `extern \"C-unwind\"`.",
-                    tcx.def_path_str(callee),
-                    abi.as_str()
+                    "rustc_codegen_js: `{path}` has the \"{abi}\" ABI, which cannot unwind, {why}: \
+                     {consequence}. {fix}"
                 ),
             )
-            .with_span_note(tcx.def_span(callee), "the import is declared here")
+            .with_span_note(tcx.def_span(callee), "the function is defined here")
             .emit();
     }
+}
+
+/// Whether a terminator can end a cleanup path in `UnwindTerminate(Abi)`: rustc's mark of a frame
+/// that cannot unwind. An `Assert` is left out: its unwind is a Rust panic, which aborts in this
+/// backend and never carries a host exception.
+fn ends_in_abi_terminate(kind: &rustc_middle::mir::TerminatorKind<'_>) -> bool {
+    use rustc_middle::mir::{TerminatorKind, UnwindAction, UnwindTerminateReason};
+    match kind {
+        TerminatorKind::UnwindTerminate(UnwindTerminateReason::Abi) => true,
+        TerminatorKind::Assert { .. } => false,
+        kind => matches!(
+            kind.unwind(),
+            Some(UnwindAction::Terminate(UnwindTerminateReason::Abi))
+        ),
+    }
+}
+
+/// The outermost function inlined at `scope` whose ABI cannot unwind, with the span of the call
+/// rustc inlined it at: the frame an `UnwindTerminate(Abi)` at `scope` belongs to, when it is not
+/// this body's own. `None` when every inlined frame there can unwind (the edge then ends this
+/// body's own cleanup, or a `#[rustc_nounwind]` function's, whose promise is not about ABIs).
+fn inlined_nounwind_frame<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &rustc_middle::mir::Body<'tcx>,
+    mut scope: rustc_middle::mir::SourceScope,
+) -> Option<(rustc_middle::ty::Instance<'tcx>, rustc_span::Span)> {
+    let mut found = None;
+    loop {
+        let data = &body.source_scopes[scope];
+        if let Some((callee, call)) = data.inlined {
+            let abi = callee.ty(tcx, crate::value::typing_env()).fn_sig(tcx).abi();
+            if !rustc_middle::ty::layout::fn_can_unwind(tcx, None, abi) {
+                found = Some((callee, call));
+            }
+        }
+        match data.parent_scope {
+            Some(parent) => scope = parent,
+            None => return found,
+        }
+    }
+}
+
+/// Whether this compilation is the sysroot build's: `scripts/build_sysroot.sh` compiles `core`,
+/// `compiler_builtins` and `alloc` with `-Zforce-unstable-if-unmarked` (rustc's own rule for the
+/// standard library's crates), which a program's compilation is never given.
+fn is_sysroot_build(tcx: TyCtxt<'_>) -> bool {
+    tcx.sess.opts.unstable_opts.force_unstable_if_unmarked
+}
+
+/// Whether `krate`, in a program's compilation, is one of the sysroot's own crates, whose foreign
+/// imports are the runtime's: decided by where rustc loaded the crate from (the target's sysroot
+/// library directory), never by its name. A crate passed with `--extern` from anywhere else is the
+/// program's, whatever it is called, and so is the crate being compiled.
+fn is_sysroot_crate(tcx: TyCtxt<'_>, krate: rustc_span::def_id::CrateNum) -> bool {
+    if krate == rustc_span::def_id::LOCAL_CRATE {
+        return false;
+    }
+    let sysroot = &tcx.sess.target_tlib_path.dir;
+    let source = tcx.used_crate_source(krate);
+    [&source.rlib, &source.rmeta, &source.dylib]
+        .into_iter()
+        .flatten()
+        .next()
+        .is_some_and(|path| path.starts_with(sysroot))
 }
 
 /// Moves the JIR body out of a late-IR summary, so that the object stores it once (S3) and the
