@@ -24,7 +24,7 @@
 //! the argument types it needs to emit.
 
 #![no_std]
-// The string-sink `extern "C"` block below is the crate's one FFI seam.
+// The string-sink `extern "C-unwind"` block below is the crate's one FFI seam.
 #![allow(unsafe_code)]
 
 /// The version the backend checks before trusting the rest of the payload.
@@ -412,7 +412,7 @@ pub fn text<T: core::fmt::Display>(v: T) -> Node {
 // side of this boundary is not C, it is the backend's own JavaScript shim, where a `&str`
 // arrives as a string and a `char` as a code point number. `CONTRACT.md` is the ABI.
 #[allow(improper_ctypes)]
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     fn sb_new() -> usize;
     fn sb_push(handle: usize, s: &str);
     fn sb_push_char(handle: usize, c: char);

@@ -30,7 +30,7 @@ use prelude::*;
 use alloc::vec::Vec;
 use core::hint::black_box;
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     fn host_throw();
 }
 

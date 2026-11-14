@@ -2,9 +2,9 @@
 //!
 //! Two mechanisms, and which one an operation uses is decided by one thing: whether it is generic.
 //!
-//! * A **monomorphic** operation is an ordinary `extern "C"` declaration. Every foreign call with a
-//!   C ABI lowers to `__rt.<symbol>(...)` already (`CONTRACT.md`, "Calls to foreign items"), so
-//!   these cost the backend nothing at all.
+//! * A **monomorphic** operation is an ordinary `extern "C-unwind"` declaration (a host exception
+//!   keeps its cleanup edge in the unwind build mode). A foreign call with a C ABI lowers to
+//!   `__rt.<symbol>(...)` already (`CONTRACT.md`, "Calls to foreign items"): it costs nothing.
 //! * A **generic** operation cannot be a foreign declaration, because rustc has no such thing. It
 //!   is a marker function instead: an ordinary Rust `fn` with an unreachable body, recognized by
 //!   the `link_section` it carries, exactly as `view-abi`'s markers are (`CONTRACT.md`,
@@ -41,7 +41,7 @@ pub(crate) struct RawMap {
     handle: u32,
 }
 
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     /// `new Map()`.
     pub(crate) fn map_new() -> RawMap;
 
