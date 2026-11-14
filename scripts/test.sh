@@ -68,6 +68,8 @@ root=$(cd -- "$script_dir/.." && pwd)
 source "$script_dir/integration-lock.sh"
 # shellcheck source=sysroot-cache.sh
 source "$script_dir/sysroot-cache.sh"
+# JSC_PANIC selects the build mode (sysroot-cache.sh); the core suite resolves that mode's sysroot.
+jsc_select_mode "$root" || exit 2
 
 require_core=${REQUIRE_CORE:-1}
 if [ "${1:-}" = --require-core ]; then
@@ -340,20 +342,20 @@ if [ -n "$core_sources" ]; then
 	Darwin) dylib="$root/target/release/librustc_codegen_mires.dylib" ;;
 	*) dylib="$root/target/release/librustc_codegen_mires.so" ;;
 	esac
-	sysroot=$(jsc_resolve_sysroot "$root" wasm32-unknown-unknown "$dylib") || exit 1
+	sysroot=$(jsc_resolve_sysroot "$root" "$jsc_target_name" "$dylib") || exit 1
 	# Preserve automatic option switching for checkouts with a default sysroot.
-	if [ ! -d "$sysroot/lib/rustlib/wasm32-unknown-unknown/lib" ] && \
+	if [ ! -d "$sysroot/lib/rustlib/$jsc_target_name/lib" ] && \
 		[ -d "$root/build/sysroot/lib/rustlib/wasm32-unknown-unknown/lib" ]; then
 		echo "==> building matching keyed sysroot: $sysroot"
 		if ! JS_EXTRA_ARGS="$(jsc_sysroot_args)" SKIP_BUILD=1 "$script_dir/build_sysroot.sh" \
 			>"$log_dir/build_sysroot.log" 2>&1; then
 			echo "    sysroot build failed, see $log_dir/build_sysroot.log"
 		fi
-		sysroot=$(jsc_resolve_sysroot "$root" wasm32-unknown-unknown "$dylib") || exit 1
+		sysroot=$(jsc_resolve_sysroot "$root" "$jsc_target_name" "$dylib") || exit 1
 	fi
 fi
 
-if [ -n "$core_sources" ] && [ ! -d "$sysroot/lib/rustlib/wasm32-unknown-unknown/lib" ]; then
+if [ -n "$core_sources" ] && [ ! -d "$sysroot/lib/rustlib/$jsc_target_name/lib" ]; then
 	echo
 	echo "==> core suite skipped: no sysroot at $sysroot"
 	echo "    build one with ./scripts/build_sysroot.sh (about a minute), then re-run"

@@ -41,6 +41,8 @@ root=$(cd -- "$script_dir/.." && pwd)
 source "$script_dir/integration-lock.sh"
 # shellcheck source=sysroot-cache.sh
 source "$script_dir/sysroot-cache.sh"
+# JSC_PANIC selects the build mode (sysroot-cache.sh); the suite resolves that mode's sysroot.
+jsc_select_mode "$root" || exit 2
 
 core_dir="$root/examples/core-tests"
 build_dir="$root/build/chunks"
@@ -59,8 +61,8 @@ case "$(uname -s)" in
 Darwin) dylib="$root/target/release/librustc_codegen_mires.dylib" ;;
 *) dylib="$root/target/release/librustc_codegen_mires.so" ;;
 esac
-sysroot=$(jsc_resolve_sysroot "$root" wasm32-unknown-unknown "$dylib") || exit 1
-if [ ! -d "$sysroot/lib/rustlib/wasm32-unknown-unknown/lib" ]; then
+sysroot=$(jsc_resolve_sysroot "$root" "$jsc_target_name" "$dylib") || exit 1
+if [ ! -d "$sysroot/lib/rustlib/$jsc_target_name/lib" ]; then
 	echo "==> building matching keyed sysroot: $sysroot"
 	if ! JS_EXTRA_ARGS="$(jsc_sysroot_args)" SKIP_BUILD=1 "$script_dir/build_sysroot.sh" \
 		>"$log_dir/chunk-sysroot.log" 2>&1; then
