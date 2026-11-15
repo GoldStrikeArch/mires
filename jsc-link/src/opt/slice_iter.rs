@@ -111,6 +111,7 @@ struct HeaderMatch {
 /// Rewrites every exact slice-adapter loop in `func` and returns exact witnesses for them.
 pub fn run(func: &mut Func, table: &TypeTable) -> Vec<SliceIteratorLoop> {
     let defs = definitions(func);
+    let single_edge = single_edge_param_sources(func);
     let uses = use_counts(func);
     let doms = Dominators::of(func);
     let outers: BTreeSet<ValueId> = func
@@ -132,7 +133,7 @@ pub fn run(func: &mut Func, table: &TypeTable) -> Vec<SliceIteratorLoop> {
     let mut matches = Vec::new();
     let mut occupied = BTreeSet::new();
     for outer in outers {
-        let Some(found) = match_loop(func, table, &defs, &uses, &doms, outer) else {
+        let Some(found) = match_loop(func, table, &defs, &single_edge, &uses, &doms, outer) else {
             continue;
         };
         if !reserve_region(&found.rewrite_blocks, found.preheader, &mut occupied) {
@@ -145,7 +146,8 @@ pub fn run(func: &mut Func, table: &TypeTable) -> Vec<SliceIteratorLoop> {
         if occupied.contains(&header) {
             continue;
         }
-        let Some(found) = match_scalarized_loop(func, table, &defs, &doms, header) else {
+        let Some(found) = match_scalarized_loop(func, table, &defs, &single_edge, &doms, header)
+        else {
             continue;
         };
         if !reserve_region(&found.rewrite_blocks, found.preheader, &mut occupied) {
@@ -180,6 +182,7 @@ fn match_loop(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     uses: &[usize],
     doms: &Dominators,
     outer: ValueId,
@@ -194,7 +197,7 @@ fn match_loop(
             let [slice_value, initial] = outer_fields.as_slice() else {
                 return None;
             };
-            if !is_scalar(func, defs, *initial, 0)
+            if !is_scalar(func, defs, single_edge, *initial, 0)
                 || func.values.get(initial.0 as usize)?.ty != types.usize_ty
             {
                 return None;
@@ -205,7 +208,7 @@ fn match_loop(
             let [inner_value, initial] = outer_fields.as_slice() else {
                 return None;
             };
-            if !is_scalar(func, defs, *initial, 0)
+            if !is_scalar(func, defs, single_edge, *initial, 0)
                 || func.values.get(initial.0 as usize)?.ty != types.usize_ty
             {
                 return None;
@@ -234,7 +237,7 @@ fn match_loop(
         }
         _ => return None,
     };
-    let raw = strip_pointer_aliases(func, table, defs, start)?;
+    let raw = strip_pointer_aliases(func, table, defs, single_edge, start)?;
     let OpKind::RawView {
         root: Root::Value(source),
         path,
@@ -248,7 +251,7 @@ fn match_loop(
     {
         return None;
     }
-    let end = strip_pointer_aliases(func, table, defs, end)?;
+    let end = strip_pointer_aliases(func, table, defs, single_edge, end)?;
     let OpKind::Binary {
         op: BinaryOp::Offset,
         l: end_base,
@@ -261,22 +264,26 @@ fn match_loop(
     if !is_raw_ptr_to(table, end_ty, types.element) {
         return None;
     }
-    if strip_pointer_aliases(func, table, defs, end_base)? != raw {
+    if strip_pointer_aliases(func, table, defs, single_edge, end_base)? != raw {
         return None;
     }
-    if !source_length_matches(func, defs, *source, len) || value_ty(func, len)? != types.usize_ty {
+    if !source_length_matches(func, defs, single_edge, *source, len)
+        || value_ty(func, len)? != types.usize_ty
+    {
         return None;
     }
 
-    let header = find_header(func, table, defs, outer, end, types)?;
+    let header = find_header(func, table, defs, single_edge, outer, end, types)?;
     let mut bodies = Vec::new();
     for block in 0..func.blocks.len() {
         let body = match header.access {
             AdapterAccess::Direct => match types.adapter {
-                Adapter::Take => match_take_body(func, table, defs, outer, types, block),
+                Adapter::Take => {
+                    match_take_body(func, table, defs, single_edge, outer, types, block)
+                }
                 Adapter::Skip => match_skip_body(func, table, outer, types, block),
                 Adapter::Plain | Adapter::Enumerate => {
-                    match_slice_direct_body(func, table, defs, outer, types, block)
+                    match_slice_direct_body(func, table, defs, single_edge, outer, types, block)
                 }
             },
             AdapterAccess::Borrowed(pointer) => match types.adapter {
@@ -707,6 +714,7 @@ fn find_header(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     outer: ValueId,
     end: ValueId,
     types: AdapterTypes,
@@ -716,7 +724,16 @@ fn find_header(
         let ops = &block.ops;
         let matched = (|| {
             if matches!(types.adapter, Adapter::Plain | Adapter::Enumerate) {
-                return find_ptr_eq_header(func, table, defs, block, outer, end, types);
+                return find_ptr_eq_header(
+                    func,
+                    table,
+                    defs,
+                    single_edge,
+                    block,
+                    outer,
+                    end,
+                    types,
+                );
             }
             let (access, n, suffix) = if let Some((n, suffix)) = direct_header(ops, outer) {
                 (AdapterAccess::Direct, n, suffix)
@@ -759,10 +776,12 @@ fn find_header(
     Some(*found)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_ptr_eq_header(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     block: &RBlock,
     outer: ValueId,
     end: ValueId,
@@ -832,7 +851,7 @@ fn find_ptr_eq_header(
     };
 
     let reads_outer_field = |val: ValueId, want_field: u32| -> bool {
-        let cur = strip_ptr_wrapper(func, table, defs, val);
+        let cur = strip_ptr_wrapper(func, table, defs, single_edge, val);
         let Some(op) = cur.and_then(|v| definition(func, defs, v)) else {
             return false;
         };
@@ -867,7 +886,7 @@ fn find_ptr_eq_header(
             return None;
         }
         let end_ok = reads_outer_field(end_side, 1)
-            || strip_ptr_wrapper(func, table, defs, end_side) == Some(end);
+            || strip_ptr_wrapper(func, table, defs, single_edge, end_side) == Some(end);
         end_ok.then_some(AdapterAccess::Direct)
     };
 
@@ -921,6 +940,7 @@ fn match_take_body(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     outer: ValueId,
     types: AdapterTypes,
     block: usize,
@@ -944,8 +964,8 @@ fn match_take_body(
         return None;
     }
     let (item_current, item_ptr) = cast_source_result(&ops[5])?;
-    if strip_pointer_aliases(func, table, defs, item_current)?
-        != strip_pointer_aliases(func, table, defs, current)?
+    if strip_pointer_aliases(func, table, defs, single_edge, item_current)?
+        != strip_pointer_aliases(func, table, defs, single_edge, current)?
     {
         return None;
     }
@@ -1092,11 +1112,12 @@ fn reads_outer_ptr_field(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     value: ValueId,
     outer: ValueId,
     types: AdapterTypes,
 ) -> bool {
-    let Some(cur) = strip_ptr_wrapper(func, table, defs, value) else {
+    let Some(cur) = strip_ptr_wrapper(func, table, defs, single_edge, value) else {
         return false;
     };
     let Some(op) = definition(func, defs, cur) else {
@@ -1163,6 +1184,7 @@ fn match_slice_direct_body(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     outer: ValueId,
     types: AdapterTypes,
     block: usize,
@@ -1186,7 +1208,7 @@ fn match_slice_direct_body(
         OpKind::Binary { l, r, .. } if r == one => (l, offset),
         _ => return None,
     };
-    if !reads_outer_ptr_field(func, table, defs, current, outer, types) {
+    if !reads_outer_ptr_field(func, table, defs, single_edge, current, outer, types) {
         return None;
     }
     let advanced = cast_result(&ops[2], step)?;
@@ -1197,8 +1219,8 @@ fn match_slice_direct_body(
         return None;
     }
     let (item_current, item_ptr) = cast_source_result(&ops[5])?;
-    if strip_pointer_aliases(func, table, defs, item_current)?
-        != strip_pointer_aliases(func, table, defs, current)?
+    if strip_pointer_aliases(func, table, defs, single_edge, item_current)?
+        != strip_pointer_aliases(func, table, defs, single_edge, current)?
     {
         return None;
     }
@@ -1243,6 +1265,7 @@ fn match_scalarized_loop(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     doms: &Dominators,
     header_idx: usize,
 ) -> Option<LoopMatch> {
@@ -1364,10 +1387,16 @@ fn match_scalarized_loop(
         |ptr_side: ValueId,
          end_side: ValueId|
          -> Option<(usize, ValueId, ValueId, Option<usize>, TypeId, TypeId)> {
-            let ptr_root =
-                strip_ptr_wrapper_stop_params(func, table, defs, &header.params, ptr_side)?;
+            let ptr_root = strip_ptr_wrapper_stop_params(
+                func,
+                table,
+                defs,
+                single_edge,
+                &header.params,
+                ptr_side,
+            )?;
             let p_idx = header.params.iter().position(|p| *p == ptr_root)?;
-            let raw = strip_ptr_wrapper(func, table, defs, preheader_args[p_idx])?;
+            let raw = strip_ptr_wrapper(func, table, defs, single_edge, preheader_args[p_idx])?;
             let source = match &definition(func, defs, raw)?.kind {
                 OpKind::RawView {
                     root: Root::Value(source),
@@ -1381,7 +1410,7 @@ fn match_scalarized_loop(
             if !is_raw_ptr_to(table, cmp_ty, elem_ty) {
                 return None;
             }
-            let end_leaf = strip_ptr_wrapper(func, table, defs, end_side)?;
+            let end_leaf = strip_ptr_wrapper(func, table, defs, single_edge, end_side)?;
             let (end_root, end_param_idx) =
                 if let Some(e_idx) = header.params.iter().position(|p| *p == end_leaf) {
                     if e_idx == p_idx {
@@ -1396,14 +1425,16 @@ fn match_scalarized_loop(
                         }
                     }
                     (
-                        strip_ptr_wrapper(func, table, defs, preheader_args[e_idx])?,
+                        strip_ptr_wrapper(func, table, defs, single_edge, preheader_args[e_idx])?,
                         Some(e_idx),
                     )
                 } else {
                     (end_leaf, None)
                 };
             let end_site = defs.get(end_root.0 as usize).copied().flatten()?;
-            if scc.contains(&end_site.block) {
+            if scc.contains(&end_site.block)
+                || !doms.dominates(RBlockId(end_site.block as u32), RBlockId(preheader as u32))
+            {
                 return None;
             }
             let OpKind::Binary {
@@ -1418,11 +1449,11 @@ fn match_scalarized_loop(
             if !is_raw_ptr_to(table, end_ty, elem_ty) {
                 return None;
             }
-            let end_base_root = strip_ptr_wrapper(func, table, defs, end_base)?;
+            let end_base_root = strip_ptr_wrapper(func, table, defs, single_edge, end_base)?;
             if end_base_root != raw && end_base_root != source {
                 return None;
             }
-            if !source_length_matches(func, defs, source, len) {
+            if !source_length_matches(func, defs, single_edge, source, len) {
                 return None;
             }
             let usize_ty = value_ty(func, len)?;
@@ -1460,8 +1491,8 @@ fn match_scalarized_loop(
         } = op.kind
         {
             if is_raw_ptr_to(table, next_ty, elem_ty)
-                && strip_ptr_wrapper(func, table, defs, base) == Some(ptr_param)
-                && is_scalar(func, defs, one, 1)
+                && strip_ptr_wrapper(func, table, defs, single_edge, base) == Some(ptr_param)
+                && is_scalar(func, defs, single_edge, one, 1)
             {
                 next_ptr_op_idx = Some(op_idx);
                 next_ptr_base_val = Some(base);
@@ -1509,13 +1540,14 @@ fn match_scalarized_loop(
             return None;
         };
         let arg = args[p_idx];
-        if strip_ptr_wrapper(func, table, defs, arg)? != next_ptr {
+        if strip_ptr_wrapper(func, table, defs, single_edge, arg)? != next_ptr {
             return None;
         }
         collect_backedge_wrapper_chain(
             func,
             table,
             defs,
+            single_edge,
             driver_idx,
             arg,
             next_ptr,
@@ -1540,7 +1572,7 @@ fn match_scalarized_loop(
         } = &op.kind
         {
             if path.as_slice() == [Proj::Deref]
-                && strip_ptr_wrapper(func, table, defs, *ptr) == Some(ptr_param)
+                && strip_ptr_wrapper(func, table, defs, single_edge, *ptr) == Some(ptr_param)
             {
                 if let Some(res) = op.result {
                     if let Some(ty) = value_ty(func, res) {
@@ -1586,7 +1618,7 @@ fn match_scalarized_loop(
     } else {
         for (op_idx, op) in driver_block.ops.iter().enumerate() {
             if let OpKind::Deref(ptr) = op.kind {
-                if strip_ptr_wrapper(func, table, defs, ptr) == Some(ptr_param) {
+                if strip_ptr_wrapper(func, table, defs, single_edge, ptr) == Some(ptr_param) {
                     if let Some(res) = op.result {
                         if value_ty(func, res) == Some(elem_ty) {
                             old_item = Some(res);
@@ -1639,11 +1671,19 @@ fn match_scalarized_loop(
         {
             continue;
         }
-        if !is_scalar(func, defs, preheader_args[i_idx], 0) {
+        if !is_scalar(func, defs, single_edge, preheader_args[i_idx], 0) {
             continue;
         }
         if let Some((counter_ops, next_idx)) = match_scalarized_enumerate_counter(
-            func, defs, driver_idx, idx_param, usize_ty, &backedges, i_idx, &scc,
+            func,
+            defs,
+            single_edge,
+            driver_idx,
+            idx_param,
+            usize_ty,
+            &backedges,
+            i_idx,
+            &scc,
         ) {
             let mut candidate_removed = removed_driver_ops.clone();
             candidate_removed.extend(counter_ops.iter().copied());
@@ -1798,6 +1838,7 @@ fn match_scalarized_loop(
 fn match_scalarized_enumerate_counter(
     func: &Func,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     driver_idx: usize,
     idx_param: ValueId,
     usize_ty: TypeId,
@@ -1820,7 +1861,7 @@ fn match_scalarized_enumerate_counter(
         {
             if ty == usize_ty
                 && strip_copies_local(func, driver_idx, l) == idx_param
-                && is_scalar(func, defs, r, 1)
+                && is_scalar(func, defs, single_edge, r, 1)
             {
                 next_idx_op = Some(op_idx);
                 next_idx = op.result;
@@ -1838,7 +1879,7 @@ fn match_scalarized_enumerate_counter(
         let RTerm::Goto(_, args) = &func.blocks[*be].term else {
             return None;
         };
-        if strip_copies(func, defs, args[i_idx])? != next_idx {
+        if strip_copies(func, defs, single_edge, args[i_idx])? != next_idx {
             return None;
         }
     }
@@ -1883,7 +1924,7 @@ fn match_scalarized_enumerate_counter(
                 },
         } = &op.kind
         {
-            if is_scalar(func, defs, *right, 1)
+            if is_scalar(func, defs, single_edge, *right, 1)
                 && strip_copies_local(func, driver_idx, *left) == idx_param
             {
                 let cmp = strip_copies_local(func, driver_idx, *cond);
@@ -2040,10 +2081,15 @@ fn strip_ptr_wrapper(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     mut value: ValueId,
 ) -> Option<ValueId> {
-    for _ in 0..16 {
+    for _ in 0..24 {
         let Some(op) = definition(func, defs, value) else {
+            if let Some(source) = single_edge.get(value.0 as usize).copied().flatten() {
+                value = source;
+                continue;
+            }
             return Some(value);
         };
         match &op.kind {
@@ -2089,14 +2135,18 @@ fn strip_ptr_wrapper_stop_params(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     params: &[ValueId],
     mut value: ValueId,
 ) -> Option<ValueId> {
-    for _ in 0..16 {
+    for _ in 0..24 {
         if params.contains(&value) {
             return Some(value);
         }
-        let op = definition(func, defs, value)?;
+        let Some(op) = definition(func, defs, value) else {
+            value = single_edge.get(value.0 as usize).copied().flatten()?;
+            continue;
+        };
         match &op.kind {
             OpKind::Copy(source) | OpKind::Move(source) => {
                 value = *source;
@@ -2202,6 +2252,7 @@ fn collect_backedge_wrapper_chain(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     driver_idx: usize,
     arg: ValueId,
     next_ptr: ValueId,
@@ -2209,11 +2260,14 @@ fn collect_backedge_wrapper_chain(
     zst_candidates: &mut Vec<ValueId>,
 ) -> Option<()> {
     let mut cur = arg;
-    for _ in 0..16 {
+    for _ in 0..24 {
         if cur == next_ptr {
             return Some(());
         }
-        let site = defs.get(cur.0 as usize).copied().flatten()?;
+        let Some(site) = defs.get(cur.0 as usize).copied().flatten() else {
+            cur = single_edge.get(cur.0 as usize).copied().flatten()?;
+            continue;
+        };
         if site.block == driver_idx {
             out.insert(site.op);
         }
@@ -3161,9 +3215,56 @@ fn definition<'a>(func: &'a Func, defs: &[Option<Site>], value: ValueId) -> Opti
     func.blocks.get(site.block)?.ops.get(site.op)
 }
 
-fn strip_copies(func: &Func, defs: &[Option<Site>], mut value: ValueId) -> Option<ValueId> {
-    for _ in 0..8 {
-        match definition(func, defs, value)?.kind {
+fn single_edge_param_sources(func: &Func) -> Vec<Option<ValueId>> {
+    let mut sources = vec![None; func.values.len()];
+    let reachable = distances(func, RBlockId(0));
+    let mut incoming: Vec<Option<(usize, Vec<ValueId>)>> = vec![None; func.blocks.len()];
+    let mut multiple = vec![false; func.blocks.len()];
+    for (pred_idx, block) in func.blocks.iter().enumerate() {
+        for (target, args) in block.term.edges() {
+            let t = target.0 as usize;
+            if t == 0 || t >= func.blocks.len() || multiple[t] {
+                continue;
+            }
+            if incoming[t].is_some() {
+                incoming[t] = None;
+                multiple[t] = true;
+            } else {
+                incoming[t] = Some((pred_idx, args.to_vec()));
+            }
+        }
+    }
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        if b_idx == 0 || multiple[b_idx] || reachable.get(b_idx).copied().flatten().is_none() {
+            continue;
+        }
+        let Some((pred_idx, args)) = &incoming[b_idx] else {
+            continue;
+        };
+        if *pred_idx == b_idx || args.len() != block.params.len() {
+            continue;
+        }
+        for (&param, &arg) in block.params.iter().zip(args.iter()) {
+            if let Some(slot) = sources.get_mut(param.0 as usize) {
+                *slot = Some(arg);
+            }
+        }
+    }
+    sources
+}
+
+fn strip_copies(
+    func: &Func,
+    defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
+    mut value: ValueId,
+) -> Option<ValueId> {
+    for _ in 0..16 {
+        let Some(op) = definition(func, defs, value) else {
+            value = single_edge.get(value.0 as usize).copied().flatten()?;
+            continue;
+        };
+        match op.kind {
             OpKind::Copy(source) | OpKind::Move(source) => value = source,
             _ => return Some(value),
         }
@@ -3171,11 +3272,23 @@ fn strip_copies(func: &Func, defs: &[Option<Site>], mut value: ValueId) -> Optio
     None
 }
 
-fn copy_root(func: &Func, defs: &[Option<Site>], mut value: ValueId) -> Option<ValueId> {
-    for _ in 0..8 {
+fn copy_root(
+    func: &Func,
+    defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
+    mut value: ValueId,
+) -> Option<ValueId> {
+    for _ in 0..16 {
         match definition(func, defs, value).map(|op| &op.kind) {
             Some(OpKind::Copy(source) | OpKind::Move(source)) => value = *source,
-            _ => return Some(value),
+            Some(_) => return Some(value),
+            None => {
+                if let Some(source) = single_edge.get(value.0 as usize).copied().flatten() {
+                    value = source;
+                } else {
+                    return Some(value);
+                }
+            }
         }
     }
     None
@@ -3184,19 +3297,20 @@ fn copy_root(func: &Func, defs: &[Option<Site>], mut value: ValueId) -> Option<V
 fn source_length_matches(
     func: &Func,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     source: ValueId,
     len: ValueId,
 ) -> bool {
-    let Some(source_root) = copy_root(func, defs, source) else {
+    let Some(source_root) = copy_root(func, defs, single_edge, source) else {
         return false;
     };
-    let Some(len_root) = copy_root(func, defs, len) else {
+    let Some(len_root) = copy_root(func, defs, single_edge, len) else {
         return false;
     };
     if let Some(op) = definition(func, defs, source_root) {
         match &op.kind {
             OpKind::SliceView { len: found, .. }
-                if copy_root(func, defs, *found) == Some(len_root) =>
+                if copy_root(func, defs, single_edge, *found) == Some(len_root) =>
             {
                 return true;
             }
@@ -3205,7 +3319,9 @@ fn source_length_matches(
                 semantic: CallSemantic::RawParts,
                 args,
                 ..
-            } if args.len() == 2 && copy_root(func, defs, args[1]) == Some(len_root) => {
+            } if args.len() == 2
+                && copy_root(func, defs, single_edge, args[1]) == Some(len_root) =>
+            {
                 return true;
             }
             _ => {}
@@ -3213,7 +3329,8 @@ fn source_length_matches(
     }
     matches!(
         definition(func, defs, len_root).map(|op| &op.kind),
-        Some(OpKind::Unary { op: UnaryOp::PtrMetadata, v, .. }) if copy_root(func, defs, *v) == Some(source_root)
+        Some(OpKind::Unary { op: UnaryOp::PtrMetadata, v, .. })
+            if copy_root(func, defs, single_edge, *v) == Some(source_root)
     )
 }
 
@@ -3221,10 +3338,15 @@ fn strip_pointer_aliases(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     mut value: ValueId,
 ) -> Option<ValueId> {
-    for _ in 0..12 {
-        match definition(func, defs, value)?.kind {
+    for _ in 0..16 {
+        let Some(op) = definition(func, defs, value) else {
+            value = single_edge.get(value.0 as usize).copied().flatten()?;
+            continue;
+        };
+        match op.kind {
             OpKind::Copy(source) | OpKind::Move(source) => value = source,
             OpKind::Cast { kind, v, from, to } if is_lossless_ptr_cast(table, kind, from, to) => {
                 value = v
@@ -3239,8 +3361,14 @@ fn value_ty(func: &Func, value: ValueId) -> Option<TypeId> {
     func.values.get(value.0 as usize).map(|def| def.ty)
 }
 
-fn is_scalar(func: &Func, defs: &[Option<Site>], value: ValueId, expected: u128) -> bool {
-    strip_copies(func, defs, value)
+fn is_scalar(
+    func: &Func,
+    defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
+    value: ValueId,
+    expected: u128,
+) -> bool {
+    strip_copies(func, defs, single_edge, value)
         .and_then(|value| definition(func, defs, value))
         .is_some_and(|op| matches!(op.kind, OpKind::Const(ConstTree::Scalar { bits, .. }) if bits == expected))
 }
@@ -3359,6 +3487,7 @@ pub fn check_lowered(
 
 fn check_loop(func: &Func, table: &TypeTable, loop_: &SliceIteratorLoop) -> Result<(), String> {
     let defs = definitions(func);
+    let single_edge = single_edge_param_sources(func);
     let header = block(func, loop_.header, "header")?;
     let direct = block(func, loop_.direct, "direct body")?;
     block(func, loop_.body, "user body")?;
@@ -3432,7 +3561,7 @@ fn check_loop(func: &Func, table: &TypeTable, loop_: &SliceIteratorLoop) -> Resu
     };
     if !valid_cursor_ty
         || !is_ref_to(table, loop_.item_ref_ty, loop_.byte_ty)
-        || !source_has_length(func, table, &defs, loop_.source, loop_.length)
+        || !source_has_length(func, table, &defs, &single_edge, loop_.source, loop_.length)
     {
         return Err("the cursor, byte, reference, or source-length types changed".to_owned());
     }
@@ -3610,7 +3739,7 @@ fn check_loop(func: &Func, table: &TypeTable, loop_: &SliceIteratorLoop) -> Resu
         loop_.adapter,
         IteratorIdentity::Take | IteratorIdentity::Slice | IteratorIdentity::Enumerate
     ) {
-        if !is_scalar(func, &defs, loop_.initial, 0) {
+        if !is_scalar(func, &defs, &single_edge, loop_.initial, 0) {
             return Err("a cursor does not start at zero".to_owned());
         }
     } else if loop_.initial != loop_.limit {
@@ -3661,10 +3790,11 @@ fn source_has_length(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    single_edge: &[Option<ValueId>],
     source: ValueId,
     len: ValueId,
 ) -> bool {
-    let Some(source) = copy_root(func, defs, source) else {
+    let Some(source) = copy_root(func, defs, single_edge, source) else {
         return false;
     };
     let Some(source_ty) = value_ty(func, source) else {
@@ -3676,7 +3806,7 @@ fn source_has_length(
     if !is_slice_pointer_for(table, source_ty, element) {
         return false;
     }
-    source_length_matches(func, defs, source, len)
+    source_length_matches(func, defs, single_edge, source, len)
 }
 
 #[cfg(test)]
@@ -6486,5 +6616,172 @@ mod tests {
         let tbl = table();
         func.verify(&tbl).expect("pre-pass Func::verify");
         assert!(run(&mut func, &tbl).is_empty());
+    }
+
+    #[test]
+    fn scalarized_spliced_iter_new_single_edge_lowers() {
+        let tbl = table();
+        let mut builder = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 109,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 2,
+                    ..AbiSignature::default()
+                },
+                arguments: vec![RAW_U8, USIZE],
+                result: USIZE,
+            },
+        );
+        let b_new = FuncBuilder::ENTRY;
+        let ptr_arg = builder.param(RAW_U8, O);
+        let len_arg = builder.param(USIZE, O);
+        let b_after_new = builder.block();
+        let start_param_after = builder.block_param(b_after_new, RAW_U8, O);
+        let end_param_after = builder.block_param(b_after_new, RAW_U8, O);
+        let preheader = builder.block();
+        let header = builder.block();
+        let sum_param = builder.block_param(header, USIZE, O);
+        let cur_param = builder.block_param(header, RAW_U8, O);
+        let driver = builder.block();
+        let exit = builder.block();
+
+        // Spliced `Iter::new` computes `raw`, `end = Offset(raw, len)`, wraps `PtrToPtr`,
+        // and passes them via a single-edge continuation to `b_after_new`.
+        let slice = builder.op(
+            b_new,
+            OpKind::SliceView {
+                ptr: ptr_arg,
+                len: len_arg,
+            },
+            REF_SLICE,
+            O,
+        );
+        let start_raw = builder.op(
+            b_new,
+            OpKind::Cast {
+                kind: CastKind::PtrToPtr,
+                v: slice,
+                from: REF_SLICE,
+                to: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let end_raw = builder.op(
+            b_new,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: start_raw,
+                r: len_arg,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let end_cast = builder.op(
+            b_new,
+            OpKind::Cast {
+                kind: CastKind::PtrToPtr,
+                v: end_raw,
+                from: RAW_U8,
+                to: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        builder.terminate(b_new, RTerm::Goto(b_after_new, vec![start_raw, end_cast]));
+
+        // `b_after_new` forwards via `Goto(preheader, [])`.
+        builder.terminate(b_after_new, RTerm::Goto(preheader, Vec::new()));
+
+        let zero = constant(&mut builder, preheader, 0);
+        builder.terminate(
+            preheader,
+            RTerm::Goto(header, vec![zero, start_param_after]),
+        );
+
+        let done = builder.op(
+            header,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: cur_param,
+                r: end_param_after,
+                ty: RAW_U8,
+            },
+            BOOL,
+            O,
+        );
+        builder.terminate(
+            header,
+            RTerm::Switch {
+                scrut: done,
+                scrut_ty: BOOL,
+                cases: vec![(0, driver, Vec::new())],
+                default: (exit, Vec::new()),
+            },
+        );
+
+        let one = constant(&mut builder, driver, 1);
+        let next_ptr = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: cur_param,
+                r: one,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let item_ref = builder.op(
+            driver,
+            OpKind::BorrowView {
+                root: Root::Value(cur_param),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            REF_U8,
+            O,
+        );
+        let item = builder.op(driver, OpKind::Deref(item_ref), U8, O);
+        let item_u = builder.op(
+            driver,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: item,
+                from: U8,
+                to: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        let next_sum = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: sum_param,
+                r: item_u,
+                ty: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        builder.terminate(driver, RTerm::Goto(header, vec![next_sum, next_ptr]));
+        builder.terminate(exit, RTerm::Return(Some(sum_param)));
+
+        let mut func = builder.finish();
+        func.verify(&tbl).expect("pre-pass Func::verify");
+        let loops = run(&mut func, &tbl);
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].cursor_ty, ISIZE);
+        check_lowered(&func, &tbl, &loops).expect("witness checks");
+        crate::opt::dce::run(&mut func, &tbl);
+        func.verify(&tbl).expect("post-dce Func::verify");
     }
 }
