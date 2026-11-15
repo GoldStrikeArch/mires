@@ -235,12 +235,19 @@ enum Site {
     },
 }
 
+/// One side of a recorded fact: either a dynamic SSA value or a switch-matched integer constant.
+#[derive(Clone, Copy, Debug)]
+enum Bound {
+    Value(ValueId),
+    Const(u128),
+}
+
 /// One known-true comparison: `x rel y`.
 #[derive(Clone, Copy, Debug)]
 struct Fact {
-    x: ValueId,
+    x: Bound,
     rel: Rel,
-    y: ValueId,
+    y: Bound,
     site: Site,
 }
 
@@ -561,7 +568,12 @@ impl Analysis {
                 return;
             }
             let mut push = |x: ValueId, rel: Rel, y: ValueId| {
-                facts.push(Fact { x, rel, y, site });
+                facts.push(Fact {
+                    x: Bound::Value(x),
+                    rel,
+                    y: Bound::Value(y),
+                    site,
+                });
             };
             match (op, positive) {
                 (BinaryOp::Lt, true) => push(*l, Rel::Lt, *r),
@@ -605,9 +617,9 @@ impl Analysis {
             };
             let RTerm::Switch {
                 scrut,
+                scrut_ty,
                 cases,
                 default,
-                ..
             } = &func.blocks[*pred as usize].term
             else {
                 continue;
@@ -620,6 +632,31 @@ impl Analysis {
             if default.0 == block.id {
                 entering.push(None);
             }
+            let site = Site::Edge {
+                target: block.id,
+                cond: *scrut,
+            };
+            if let [Some(c)] = entering.as_slice() {
+                if !matches!(
+                    self.def_kind(func, self.canon(*scrut)),
+                    Some(OpKind::Binary { .. })
+                ) && matches!(table.int_info(*scrut_ty), Some((false, bits)) if *c <= width_max(bits))
+                    && (*c > 1 || cases.iter().any(|(value, _, _)| *value > 1))
+                {
+                    facts.push(Fact {
+                        x: Bound::Const(*c),
+                        rel: Rel::Le,
+                        y: Bound::Value(*scrut),
+                        site,
+                    });
+                    facts.push(Fact {
+                        x: Bound::Value(*scrut),
+                        rel: Rel::Le,
+                        y: Bound::Const(*c),
+                        site,
+                    });
+                }
+            }
             let positive = match entering.as_slice() {
                 // The one case edge with value 0: the condition is false.
                 [Some(0)] => false,
@@ -628,10 +665,6 @@ impl Analysis {
                 // The default edge, with 0 the only case value: not zero, so true.
                 [None] if cases.iter().all(|(value, _, _)| *value == 0) => true,
                 _ => continue,
-            };
-            let site = Site::Edge {
-                target: block.id,
-                cond: *scrut,
             };
             normalize(*scrut, positive, site, &mut facts);
         }
@@ -819,15 +852,24 @@ impl Analysis {
         let mut cap: Option<u128> = None;
         for &index in facts {
             let fact = &self.facts[index];
-            if self.canon(fact.x) != self.canon(arg) {
-                continue;
-            }
-            let Some(bound) = self.interval(fact.y) else {
+            let Bound::Value(x) = fact.x else {
                 continue;
             };
+            if self.canon(x) != self.canon(arg) {
+                continue;
+            }
+            let bound_hi = match fact.y {
+                Bound::Value(y) => {
+                    let Some(bound) = self.interval(y) else {
+                        continue;
+                    };
+                    bound.hi
+                }
+                Bound::Const(c) => c,
+            };
             let bound = match fact.rel {
-                Rel::Le => bound.hi,
-                Rel::Lt => bound.hi.saturating_sub(1),
+                Rel::Le => bound_hi,
+                Rel::Lt => bound_hi.saturating_sub(1),
             };
             cap = Some(cap.map_or(bound, |current| current.min(bound)));
         }
@@ -1091,20 +1133,44 @@ impl Analysis {
                     continue;
                 }
             }
-            if self.canon(fact.y) != length_term {
+            let Bound::Value(fact_y) = fact.y else {
                 continue;
-            }
-            let (fact_base, k_fact) = self.peel(func, table, fact.x);
-            if fact_base != base {
-                continue;
-            }
-            let implied = match fact.rel {
-                Rel::Lt => k_index <= k_fact,
-                Rel::Le => k_index < k_fact,
             };
-            if !implied {
+            if self.canon(fact_y) != length_term {
                 continue;
             }
+            let offsets = match fact.x {
+                Bound::Value(vx) => {
+                    let (fact_base, k_fact) = self.peel(func, table, vx);
+                    if fact_base == base {
+                        let implied = match fact.rel {
+                            Rel::Lt => k_index <= k_fact,
+                            Rel::Le => k_index < k_fact,
+                        };
+                        implied.then_some((k_index, k_fact))
+                    } else if let (Some(iv_idx), Some(iv_fact)) =
+                        (self.interval(*idx), self.interval(vx))
+                    {
+                        let implied = match fact.rel {
+                            Rel::Lt => iv_idx.hi <= iv_fact.lo,
+                            Rel::Le => iv_idx.hi < iv_fact.lo,
+                        };
+                        implied.then_some((iv_idx.hi, iv_fact.lo))
+                    } else {
+                        None
+                    }
+                }
+                Bound::Const(c_fact) => self.interval(*idx).and_then(|iv_idx| {
+                    let implied = match fact.rel {
+                        Rel::Lt => iv_idx.hi <= c_fact,
+                        Rel::Le => iv_idx.hi < c_fact,
+                    };
+                    implied.then_some((iv_idx.hi, c_fact))
+                }),
+            };
+            let Some((offset_index, offset_fact)) = offsets else {
+                continue;
+            };
             if self.effect_between(func, fact.site, block, index) {
                 continue;
             }
@@ -1115,8 +1181,8 @@ impl Analysis {
             return Some(BoundsFact::Dominating {
                 block: fact_block,
                 cond: fact_cond,
-                offset_index: k_index,
-                offset_fact: k_fact,
+                offset_index,
+                offset_fact,
                 strict: fact.rel == Rel::Lt,
             });
         }
@@ -2110,6 +2176,121 @@ mod tests {
                 ..
             }
         ));
+        super::super::witness::check_all(&witnesses, &func, &table()).expect("witness checks");
+    }
+
+    #[test]
+    fn a_dominating_constant_bound_removes_smaller_constant_asserts() {
+        let mut b = builder();
+        let entry = FuncBuilder::ENTRY;
+        let s = b.param(REF_SLICE, NO_ORIGIN);
+        let body = b.block();
+        let exit = b.block();
+        let len = metadata(&mut b, entry, s);
+        let fifteen = constant(&mut b, entry, 15);
+        let guard = compare(&mut b, entry, BinaryOp::Lt, fifteen, len);
+        b.terminate(
+            entry,
+            RTerm::Switch {
+                scrut: guard,
+                scrut_ty: U32,
+                cases: vec![(0, exit, Vec::new())],
+                default: (body, Vec::new()),
+            },
+        );
+        let len2 = metadata(&mut b, body, s);
+        for k in [0u128, 1, 7, 15, 16] {
+            let idx = constant(&mut b, body, k);
+            bounds_assert(&mut b, body, idx, len2);
+        }
+        let ret = constant(&mut b, body, 1);
+        b.terminate(body, RTerm::Return(Some(ret)));
+        let zero = constant(&mut b, exit, 0);
+        b.terminate(exit, RTerm::Return(Some(zero)));
+        let mut func = finished(b);
+        let mut witnesses = Vec::new();
+
+        assert_eq!(run(&mut func, &table(), &mut witnesses).asserts_removed, 4);
+        assert_eq!(asserts(&func), 1, "16 < len is not implied by 15 < len");
+        super::super::witness::check_all(&witnesses, &func, &table()).expect("witness checks");
+    }
+
+    #[test]
+    fn a_dominating_ge_or_eq_constant_bound_removes_constant_asserts() {
+        for (op, expected_case, len_bound) in [
+            (BinaryOp::Ge, 1u128, 16u128),
+            (BinaryOp::Lt, 0, 16), // !(len < 16)
+            (BinaryOp::Eq, 1, 16), // len == 16
+        ] {
+            let mut b = builder();
+            let entry = FuncBuilder::ENTRY;
+            let s = b.param(REF_SLICE, NO_ORIGIN);
+            let body = b.block();
+            let exit = b.block();
+            let len = metadata(&mut b, entry, s);
+            let bound = constant(&mut b, entry, len_bound);
+            let guard = compare(&mut b, entry, op, len, bound);
+            let (cases, default) = if expected_case == 1 {
+                (vec![(0, exit, Vec::new())], (body, Vec::new()))
+            } else {
+                (vec![(0, body, Vec::new())], (exit, Vec::new()))
+            };
+            b.terminate(
+                entry,
+                RTerm::Switch {
+                    scrut: guard,
+                    scrut_ty: U32,
+                    cases,
+                    default,
+                },
+            );
+            for k in [0u128, 15, 16] {
+                let idx = constant(&mut b, body, k);
+                bounds_assert(&mut b, body, idx, len);
+            }
+            let ret = constant(&mut b, body, 1);
+            b.terminate(body, RTerm::Return(Some(ret)));
+            let zero = constant(&mut b, exit, 0);
+            b.terminate(exit, RTerm::Return(Some(zero)));
+            let mut func = finished(b);
+            let mut witnesses = Vec::new();
+
+            assert_eq!(run(&mut func, &table(), &mut witnesses).asserts_removed, 2);
+            assert_eq!(asserts(&func), 1, "16 < len stays");
+            super::super::witness::check_all(&witnesses, &func, &table()).expect("witness checks");
+        }
+    }
+
+    #[test]
+    fn a_switch_matched_constant_length_removes_constant_asserts() {
+        let mut b = builder();
+        let entry = FuncBuilder::ENTRY;
+        let s = b.param(REF_SLICE, NO_ORIGIN);
+        let body = b.block();
+        let exit = b.block();
+        let len = metadata(&mut b, entry, s);
+        b.terminate(
+            entry,
+            RTerm::Switch {
+                scrut: len,
+                scrut_ty: U32,
+                cases: vec![(16, body, Vec::new())],
+                default: (exit, Vec::new()),
+            },
+        );
+        for k in [0u128, 15, 16] {
+            let idx = constant(&mut b, body, k);
+            bounds_assert(&mut b, body, idx, len);
+        }
+        let ret = constant(&mut b, body, 1);
+        b.terminate(body, RTerm::Return(Some(ret)));
+        let zero = constant(&mut b, exit, 0);
+        b.terminate(exit, RTerm::Return(Some(zero)));
+        let mut func = finished(b);
+        let mut witnesses = Vec::new();
+
+        assert_eq!(run(&mut func, &table(), &mut witnesses).asserts_removed, 2);
+        assert_eq!(asserts(&func), 1);
         super::super::witness::check_all(&witnesses, &func, &table()).expect("witness checks");
     }
 }
