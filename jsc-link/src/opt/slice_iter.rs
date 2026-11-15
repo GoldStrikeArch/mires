@@ -12,8 +12,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::jir::repr::{
-    Carrier, Func, Op, OpKind, Proj, RAssertMessage, RBlock, RBlockId, RTerm, Root, ValueDef,
-    ValueId,
+    Carrier, Dominators, Func, Op, OpKind, Proj, RAssertMessage, RBlock, RBlockId, RTerm, Root,
+    ValueDef, ValueId,
 };
 use crate::jir::semantic::{BinaryOp, CastKind, ConstTree, TypeId, UnaryOp};
 use crate::jir::types::{IntRepr, IteratorIdentity, PinnedBoundary, TypeKind};
@@ -112,6 +112,7 @@ struct HeaderMatch {
 pub fn run(func: &mut Func, table: &TypeTable) -> Vec<SliceIteratorLoop> {
     let defs = definitions(func);
     let uses = use_counts(func);
+    let doms = Dominators::of(func);
     let outers: BTreeSet<ValueId> = func
         .values
         .iter()
@@ -131,7 +132,7 @@ pub fn run(func: &mut Func, table: &TypeTable) -> Vec<SliceIteratorLoop> {
     let mut matches = Vec::new();
     let mut occupied = BTreeSet::new();
     for outer in outers {
-        let Some(found) = match_loop(func, table, &defs, &uses, outer) else {
+        let Some(found) = match_loop(func, table, &defs, &uses, &doms, outer) else {
             continue;
         };
         if !reserve_region(&found.rewrite_blocks, found.preheader, &mut occupied) {
@@ -144,7 +145,7 @@ pub fn run(func: &mut Func, table: &TypeTable) -> Vec<SliceIteratorLoop> {
         if occupied.contains(&header) {
             continue;
         }
-        let Some(found) = match_scalarized_loop(func, table, &defs, header) else {
+        let Some(found) = match_scalarized_loop(func, table, &defs, &doms, header) else {
             continue;
         };
         if !reserve_region(&found.rewrite_blocks, found.preheader, &mut occupied) {
@@ -180,6 +181,7 @@ fn match_loop(
     table: &TypeTable,
     defs: &[Option<Site>],
     uses: &[usize],
+    doms: &Dominators,
     outer: ValueId,
 ) -> Option<LoopMatch> {
     let outer_ty = func.values.get(outer.0 as usize)?.ty;
@@ -263,7 +265,7 @@ fn match_loop(
         return None;
     }
 
-    let header = find_header(func, table, defs, outer, outer_ty, raw, end, types)?;
+    let header = find_header(func, table, defs, outer, end, types)?;
     let mut bodies = Vec::new();
     for block in 0..func.blocks.len() {
         let body = match header.access {
@@ -278,9 +280,7 @@ fn match_loop(
                 Adapter::Take | Adapter::Skip => {
                     match_borrowed_body(func, table, pointer, outer_ty, types, block)
                 }
-                Adapter::Plain | Adapter::Enumerate => {
-                    match_slice_borrowed_body(func, table, defs, pointer, outer_ty, types, block)
-                }
+                Adapter::Plain | Adapter::Enumerate => None,
             },
         };
         if let Some(body) = body {
@@ -362,6 +362,14 @@ fn match_loop(
     {
         return None;
     }
+    let header_id = RBlockId(header.block as u32);
+    if !doms.dominates(RBlockId(preheader as u32), header_id)
+        || !scc
+            .iter()
+            .all(|block| doms.dominates(header_id, RBlockId(*block as u32)))
+    {
+        return None;
+    }
 
     let mut exits = BTreeSet::new();
     for block in &scc {
@@ -371,7 +379,17 @@ fn match_loop(
             }
         }
     }
-    if !removed_prefix_is_local(func, body, &scc, &backedges, &[]) {
+    let extra_removed: Vec<ValueId> =
+        if matches!(types.adapter, Adapter::Plain | Adapter::Enumerate) {
+            func.blocks[header.block]
+                .ops
+                .iter()
+                .filter_map(|op| op.result)
+                .collect()
+        } else {
+            Vec::new()
+        };
+    if !removed_prefix_is_local(func, body, &scc, header.block, &extra_removed) {
         return None;
     }
     let tainted = tainted_values(
@@ -685,14 +703,11 @@ fn aggregate(
     None
 }
 
-#[allow(clippy::too_many_arguments)]
 fn find_header(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
     outer: ValueId,
-    outer_ty: TypeId,
-    raw: ValueId,
     end: ValueId,
     types: AdapterTypes,
 ) -> Option<HeaderMatch> {
@@ -701,9 +716,7 @@ fn find_header(
         let ops = &block.ops;
         let matched = (|| {
             if matches!(types.adapter, Adapter::Plain | Adapter::Enumerate) {
-                return find_ptr_eq_header(
-                    func, table, defs, block, outer, outer_ty, raw, end, types,
-                );
+                return find_ptr_eq_header(func, table, defs, block, outer, end, types);
             }
             let (access, n, suffix) = if let Some((n, suffix)) = direct_header(ops, outer) {
                 (AdapterAccess::Direct, n, suffix)
@@ -746,15 +759,12 @@ fn find_header(
     Some(*found)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn find_ptr_eq_header(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
     block: &RBlock,
     outer: ValueId,
-    outer_ty: TypeId,
-    raw: ValueId,
     end: ValueId,
     types: AdapterTypes,
 ) -> Option<HeaderMatch> {
@@ -770,6 +780,33 @@ fn find_ptr_eq_header(
     if *scrut_ty != types.bool_ty || !default.1.is_empty() {
         return None;
     }
+    let header_results: BTreeSet<ValueId> = block.ops.iter().filter_map(|op| op.result).collect();
+    for op in &block.ops {
+        let allowed = matches!(
+            op.kind,
+            OpKind::Copy(_)
+                | OpKind::Move(_)
+                | OpKind::Cast { .. }
+                | OpKind::Field { .. }
+                | OpKind::Aggregate { .. }
+                | OpKind::Binary {
+                    op: BinaryOp::Eq | BinaryOp::Ne,
+                    ..
+                }
+        );
+        if !allowed || op.result.is_none() {
+            return None;
+        }
+    }
+    if block
+        .term
+        .uses()
+        .iter()
+        .any(|u| header_results.contains(u) && *u != *scrut)
+    {
+        return None;
+    }
+
     let (case_val, case_target) = match cases.as_slice() {
         [(val @ (0 | 1), target, args)] if args.is_empty() => (*val, *target),
         _ => return None,
@@ -791,106 +828,44 @@ fn find_ptr_eq_header(
         _ => return None,
     };
 
-    let reads_outer_field =
-        |val: ValueId, want_field: u32, borrowed: &mut Option<ValueId>| -> bool {
-            let cur = strip_ptr_wrapper(func, table, defs, val);
-            let Some(op) = cur.and_then(|v| definition(func, defs, v)) else {
-                return false;
-            };
-            let Some((base, found_field)) = (match op.kind {
-                OpKind::Field {
-                    base,
-                    variant: None,
-                    field,
-                } => Some((base, field)),
-                _ => None,
-            }) else {
-                return false;
-            };
-            if found_field != want_field {
-                return false;
-            }
-            let slice_src = match types.adapter {
-                Adapter::Plain => base,
-                Adapter::Enumerate => {
-                    let Some(inner_op) = definition(func, defs, base) else {
-                        return false;
-                    };
-                    match inner_op.kind {
-                        OpKind::Field {
-                            base: outer_base,
-                            variant: None,
-                            field: 0,
-                        } => outer_base,
-                        OpKind::Deref(ptr) => {
-                            let Some(ptr_op) = definition(func, defs, ptr) else {
-                                return false;
-                            };
-                            match &ptr_op.kind {
-                                OpKind::BorrowView {
-                                    root: Root::Value(root_ptr),
-                                    path,
-                                    mutable: true,
-                                } if path.as_slice()
-                                    == [
-                                        Proj::Deref,
-                                        Proj::Field {
-                                            field: 0,
-                                            ty: types.slice_iter,
-                                        },
-                                    ] =>
-                                {
-                                    *borrowed = Some(*root_ptr);
-                                    return definition(func, defs, *root_ptr).is_some_and(|p| {
-                                        borrow_empty_result(p, outer, true).is_some()
-                                    });
-                                }
-                                _ => return false,
-                            }
-                        }
-                        _ => return false,
-                    }
-                }
-                _ => return false,
-            };
-            if slice_src == outer {
-                return true;
-            }
-            if let Some(deref_op) = definition(func, defs, slice_src) {
-                if let OpKind::Deref(ptr) = deref_op.kind {
-                    if definition(func, defs, ptr)
-                        .is_some_and(|p| borrow_empty_result(p, outer, true).is_some())
-                        && value_ty(func, slice_src) == Some(outer_ty)
-                    {
-                        *borrowed = Some(ptr);
-                        return true;
-                    }
-                }
-            }
-            false
+    let reads_outer_field = |val: ValueId, want_field: u32| -> bool {
+        let cur = strip_ptr_wrapper(func, table, defs, val);
+        let Some(op) = cur.and_then(|v| definition(func, defs, v)) else {
+            return false;
         };
+        let OpKind::Field {
+            base,
+            variant: None,
+            field: found_field,
+        } = op.kind
+        else {
+            return false;
+        };
+        if found_field != want_field {
+            return false;
+        }
+        let slice_src = match types.adapter {
+            Adapter::Plain => base,
+            Adapter::Enumerate => match definition(func, defs, base).map(|op| &op.kind) {
+                Some(OpKind::Field {
+                    base: outer_base,
+                    variant: None,
+                    field: 0,
+                }) => *outer_base,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        slice_src == outer
+    };
 
     let matches_ptr_and_end = |ptr_side: ValueId, end_side: ValueId| -> Option<AdapterAccess> {
-        let mut b1 = None;
-        let mut b2 = None;
-        let ptr_ok = reads_outer_field(ptr_side, 0, &mut b1)
-            || strip_ptr_wrapper(func, table, defs, ptr_side) == Some(raw);
-        if !ptr_ok {
+        if !reads_outer_field(ptr_side, 0) {
             return None;
         }
-        let end_ok = reads_outer_field(end_side, 1, &mut b2)
+        let end_ok = reads_outer_field(end_side, 1)
             || strip_ptr_wrapper(func, table, defs, end_side) == Some(end);
-        if !end_ok {
-            return None;
-        }
-        let b = b1.or(b2);
-        if b1.is_some() && b2.is_some() && b1 != b2 {
-            return None;
-        }
-        Some(match b {
-            Some(ptr) => AdapterAccess::Borrowed(ptr),
-            None => AdapterAccess::Direct,
-        })
+        end_ok.then_some(AdapterAccess::Direct)
     };
 
     let access = matches_ptr_and_end(l, r).or_else(|| matches_ptr_and_end(r, l))?;
@@ -1110,6 +1085,77 @@ fn match_borrowed_body(
     })
 }
 
+fn reads_outer_ptr_field(
+    func: &Func,
+    table: &TypeTable,
+    defs: &[Option<Site>],
+    value: ValueId,
+    outer: ValueId,
+    types: AdapterTypes,
+) -> bool {
+    let Some(cur) = strip_ptr_wrapper(func, table, defs, value) else {
+        return false;
+    };
+    let Some(op) = definition(func, defs, cur) else {
+        return false;
+    };
+    let OpKind::Field {
+        base,
+        variant: None,
+        field: 0,
+    } = op.kind
+    else {
+        return false;
+    };
+    match types.adapter {
+        Adapter::Plain => base == outer,
+        Adapter::Enumerate => definition(func, defs, base).is_some_and(|inner| {
+            matches!(
+                inner.kind,
+                OpKind::Field {
+                    base: outer_base,
+                    variant: None,
+                    field: 0,
+                } if outer_base == outer
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn borrow_outer_ptr_field(op: &Op, outer: ValueId, types: AdapterTypes) -> Option<ValueId> {
+    let OpKind::BorrowView {
+        root: Root::Value(found),
+        path,
+        mutable: true,
+    } = &op.kind
+    else {
+        return None;
+    };
+    if *found != outer {
+        return None;
+    }
+    let valid = match types.adapter {
+        Adapter::Plain => {
+            !path.is_empty()
+                && path
+                    .iter()
+                    .all(|p| matches!(p, Proj::Field { field: 0, .. }))
+        }
+        Adapter::Enumerate => {
+            matches!(
+                path.first(),
+                Some(Proj::Field { field: 0, ty }) if *ty == types.slice_iter
+            ) && path.len() >= 2
+                && path[1..]
+                    .iter()
+                    .all(|p| matches!(p, Proj::Field { field: 0, .. }))
+        }
+        _ => false,
+    };
+    valid.then_some(op.result).flatten()
+}
+
 fn match_slice_direct_body(
     func: &Func,
     table: &TypeTable,
@@ -1137,8 +1183,11 @@ fn match_slice_direct_body(
         OpKind::Binary { l, r, .. } if r == one => (l, offset),
         _ => return None,
     };
+    if !reads_outer_ptr_field(func, table, defs, current, outer, types) {
+        return None;
+    }
     let advanced = cast_result(&ops[2], step)?;
-    let state_ptr = borrow_result(&ops[3], outer, true)?;
+    let state_ptr = borrow_outer_ptr_field(&ops[3], outer, types)?;
     if !matches!(ops[4].kind, OpKind::StoreThrough { ptr, v } if ptr == state_ptr && v == advanced)
         || ops[4].result.is_some()
     {
@@ -1187,114 +1236,11 @@ fn match_slice_direct_body(
     })
 }
 
-fn match_slice_borrowed_body(
-    func: &Func,
-    table: &TypeTable,
-    defs: &[Option<Site>],
-    pointer: ValueId,
-    outer_ty: TypeId,
-    types: AdapterTypes,
-    block: usize,
-) -> Option<BodyMatch> {
-    let driver = func.blocks.get(block)?;
-    let [item_ref] = driver.params.as_slice() else {
-        return None;
-    };
-    let item_ref_ty = value_ty(func, *item_ref)?;
-    if !is_ref_to(table, item_ref_ty, types.element) {
-        return None;
-    }
-    let (old_index, update_match, body_id) = match types.adapter {
-        Adapter::Enumerate => {
-            let (old_index, next) =
-                borrowed_count_prefix(func, &driver.ops, pointer, outer_ty, types.usize_ty)?;
-            let (update_match, body_id) = if driver.ops.len() == 15 {
-                if !borrowed_count_store(&driver.ops[12..], pointer, next, types.usize_ty) {
-                    return None;
-                }
-                let RTerm::Goto(body_id, args) = &driver.term else {
-                    return None;
-                };
-                if !args.is_empty() {
-                    return None;
-                }
-                (None, *body_id)
-            } else {
-                let RTerm::Goto(update_id, args) = &driver.term else {
-                    return None;
-                };
-                if !args.is_empty() {
-                    return None;
-                }
-                let update_index = update_id.0 as usize;
-                let update = func.blocks.get(update_index)?;
-                if !update.params.is_empty()
-                    || !borrowed_count_store(&update.ops, pointer, next, types.usize_ty)
-                {
-                    return None;
-                }
-                let RTerm::Goto(body_id, args) = &update.term else {
-                    return None;
-                };
-                if !args.is_empty() {
-                    return None;
-                }
-                (Some((update_index, update.ops.len())), *body_id)
-            };
-            (Some(old_index), update_match, body_id)
-        }
-        Adapter::Plain => {
-            if !driver.ops.is_empty() {
-                return None;
-            }
-            let RTerm::Goto(body_id, args) = &driver.term else {
-                return None;
-            };
-            if !args.is_empty() {
-                return None;
-            }
-            (None, None, *body_id)
-        }
-        _ => return None,
-    };
-    let _ = defs;
-    let body_index = body_id.0 as usize;
-    let body = func.blocks.get(body_index)?;
-    if !body.params.is_empty() {
-        return None;
-    }
-    let (prefix, old_byte, origin) = match body.ops.first().and_then(|op| {
-        let b = deref_result(op, *item_ref)?;
-        (value_ty(func, b) == Some(types.element)).then_some((b, op.origin))
-    }) {
-        Some((b, orig)) => (1, Some(b), orig),
-        None => (
-            0,
-            None,
-            driver.ops.first().map_or(OriginId(0), |o| o.origin),
-        ),
-    };
-    Some(BodyMatch {
-        driver: block,
-        update: update_match,
-        body: body_index,
-        prefix,
-        driver_prefix: driver.ops.len(),
-        removed_ops: BTreeMap::new(),
-        pass_item_ref: true,
-        old_index,
-        old_item_ref: Some(*item_ref),
-        old_byte,
-        item_ref_ty,
-        byte_ty: types.element,
-        origin,
-    })
-}
-
 fn match_scalarized_loop(
     func: &Func,
     table: &TypeTable,
     defs: &[Option<Site>],
+    doms: &Dominators,
     header_idx: usize,
 ) -> Option<LoopMatch> {
     let header = func.blocks.get(header_idx)?;
@@ -1367,6 +1313,13 @@ fn match_scalarized_loop(
         .filter(|b| scc.contains(b))
         .collect();
     if backedges.is_empty() {
+        return None;
+    }
+    if !doms.dominates(RBlockId(preheader as u32), header.id)
+        || !scc
+            .iter()
+            .all(|block| doms.dominates(header.id, RBlockId(*block as u32)))
+    {
         return None;
     }
 
@@ -1652,8 +1605,10 @@ fn match_scalarized_loop(
             removed_map.insert(driver_idx, candidate_removed);
             if removed_ops_are_local(
                 func,
+                header_idx,
                 &removed_map,
                 &scc,
+                None,
                 &backedges,
                 &[i_idx, p_idx],
                 &[Some(idx_param), old_item_ref, old_item],
@@ -1678,7 +1633,16 @@ fn match_scalarized_loop(
         .ops
         .len()
         .saturating_sub(removed_driver_ops.len());
-    if driver_remaining == 0 {
+    let sole_header_pred = driver_idx != 0
+        && func.blocks.iter().enumerate().all(|(bi, b)| {
+            bi == header_idx
+                || !b
+                    .term
+                    .successors()
+                    .iter()
+                    .any(|succ| succ.0 as usize == driver_idx)
+        });
+    if driver_remaining == 0 && sole_header_pred {
         if let RTerm::Goto(next_b, args) = &driver_block.term {
             let next_idx = next_b.0 as usize;
             if next_idx != header_idx && scc.contains(&next_idx) {
@@ -1699,10 +1663,13 @@ fn match_scalarized_loop(
         }
     }
 
+    let bypassed_driver = (body_idx != driver_idx).then_some(driver_idx);
     if !removed_ops_are_local(
         func,
+        header_idx,
         &removed_ops,
         &scc,
+        bypassed_driver,
         &backedges,
         &removed_header_params,
         &[
@@ -2232,10 +2199,11 @@ fn removed_prefix_is_local(
     func: &Func,
     matched: &BodyMatch,
     rewrite_blocks: &BTreeSet<usize>,
-    _backedges: &[usize],
-    _removed_params: &[usize],
+    header_block: usize,
+    extra_removed: &[ValueId],
 ) -> bool {
     let mut removed = BTreeSet::new();
+    removed.extend(extra_removed.iter().copied());
     removed.extend(
         func.blocks[matched.driver].ops[..matched.driver_prefix]
             .iter()
@@ -2263,6 +2231,9 @@ fn removed_prefix_is_local(
         allowed.insert(v);
     }
     for (block_index, block) in func.blocks.iter().enumerate() {
+        if !extra_removed.is_empty() && block_index == header_block {
+            continue;
+        }
         for (op_index, op) in block.ops.iter().enumerate() {
             let in_removed = (block_index == matched.driver && op_index < matched.driver_prefix)
                 || matched
@@ -2306,16 +2277,24 @@ fn removed_prefix_is_local(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn removed_ops_are_local(
     func: &Func,
+    header_idx: usize,
     removed_ops: &BTreeMap<usize, BTreeSet<usize>>,
     rewrite_blocks: &BTreeSet<usize>,
+    bypassed_driver: Option<usize>,
     backedges: &[usize],
     removed_params: &[usize],
     exposed: &[Option<ValueId>],
     extra_backedge_roots: &[ValueId],
 ) -> bool {
     let mut removed = BTreeSet::new();
+    for &param_idx in removed_params {
+        if let Some(&param) = func.blocks[header_idx].params.get(param_idx) {
+            removed.insert(param);
+        }
+    }
     for (&block_idx, ops) in removed_ops {
         for &op_idx in ops {
             if let Some(res) = func.blocks[block_idx].ops[op_idx].result {
@@ -2330,6 +2309,10 @@ fn removed_ops_are_local(
     let backedge_set: BTreeSet<usize> = backedges.iter().copied().collect();
     let param_set: BTreeSet<usize> = removed_params.iter().copied().collect();
     for (block_index, block) in func.blocks.iter().enumerate() {
+        if block_index == header_idx {
+            continue;
+        }
+        let is_bypassed = bypassed_driver == Some(block_index);
         for (op_index, op) in block.ops.iter().enumerate() {
             if removed_ops
                 .get(&block_index)
@@ -2345,11 +2328,22 @@ fn removed_ops_are_local(
             {
                 return false;
             }
-            if !rewrite_blocks.contains(&block_index)
+            if (!rewrite_blocks.contains(&block_index) || is_bypassed)
                 && op.kind.uses().iter().any(|value| allowed.contains(value))
             {
                 return false;
             }
+        }
+        if is_bypassed {
+            if block
+                .term
+                .uses()
+                .iter()
+                .any(|value| allowed.contains(value))
+            {
+                return false;
+            }
+            continue;
         }
         if backedge_set.contains(&block_index) {
             if let RTerm::Goto(_, args) = &block.term {
@@ -2819,6 +2813,9 @@ fn apply(func: &mut Func, found: LoopMatch) -> SliceIteratorLoop {
                 .map(|(_, op)| op)
                 .collect();
             func.blocks[*block_idx].ops = kept;
+        }
+        if found.driver != found.body {
+            func.blocks[found.driver].term = RTerm::Unreachable;
         }
     } else if found.body_prefix > 0 {
         let tail = func.blocks[found.body].ops.split_off(found.body_prefix);
@@ -3472,6 +3469,7 @@ mod tests {
     const RAW_U32: TypeId = TypeId(18);
     const REF_U32: TypeId = TypeId(19);
     const ENUM_SLICE: TypeId = TypeId(20);
+    const MUT_REF_RAW_U8: TypeId = TypeId(21);
     const O: OriginId = OriginId(1);
 
     fn js(id: TypeId, int: Option<IntFacts>, fields: Vec<FieldDescriptor>) -> JsFacts {
@@ -3685,6 +3683,14 @@ mod tests {
             vec![SLICE_ITER],
             vec![field(SLICE_ITER, 0), field(USIZE, 1)],
             IteratorIdentity::Enumerate,
+        ));
+        table.insert(scalar(
+            MUT_REF_RAW_U8,
+            TypeKind::Reference {
+                pointee: RAW_U8,
+                mutable: true,
+            },
+            None,
         ));
         table
     }
@@ -4588,7 +4594,7 @@ mod tests {
                 body,
                 OpKind::Binary {
                     op: BinaryOp::Offset,
-                    l: raw,
+                    l: h_ptr,
                     r: one,
                     ty: RAW_U8,
                 },
@@ -4606,14 +4612,31 @@ mod tests {
                 RAW_U8,
                 O,
             );
+            let state_path = if with_enumerate {
+                vec![
+                    Proj::Field {
+                        field: 0,
+                        ty: SLICE_ITER,
+                    },
+                    Proj::Field {
+                        field: 0,
+                        ty: RAW_U8,
+                    },
+                ]
+            } else {
+                vec![Proj::Field {
+                    field: 0,
+                    ty: RAW_U8,
+                }]
+            };
             let state = builder.op(
                 body,
                 OpKind::BorrowView {
                     root: Root::Value(outer),
-                    path: Vec::new(),
+                    path: state_path,
                     mutable: true,
                 },
-                REF_U8,
+                MUT_REF_RAW_U8,
                 O,
             );
             builder.effect(
@@ -4628,7 +4651,7 @@ mod tests {
                 body,
                 OpKind::Cast {
                     kind: CastKind::PtrToPtr,
-                    v: raw,
+                    v: h_ptr,
                     from: RAW_U8,
                     to: RAW_U8,
                 },
@@ -4660,6 +4683,7 @@ mod tests {
             let mut func = builder.finish();
             let _ = outer_ty;
             let tbl = table();
+            func.verify(&tbl).expect("pre-pass Func::verify");
             let loops = run(&mut func, &tbl);
             assert_eq!(loops.len(), 1);
             check_lowered(&func, &tbl, &loops).expect("witness checks");
@@ -4675,5 +4699,541 @@ mod tests {
             crate::opt::dce::run(&mut func, &tbl);
             func.verify(&tbl).expect("Func::verify");
         }
+    }
+
+    #[test]
+    fn scalarized_slice_loop_using_ptr_param_inside_body_is_declined() {
+        let mut builder = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 100,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    ..AbiSignature::default()
+                },
+                arguments: vec![REF_SLICE],
+                result: USIZE,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let header = builder.block();
+        let body = builder.block();
+        let exit = builder.block();
+
+        let source = builder.param(REF_SLICE, O);
+        let length = builder.op(
+            entry,
+            OpKind::Unary {
+                op: UnaryOp::PtrMetadata,
+                v: source,
+                ty: REF_SLICE,
+            },
+            USIZE,
+            O,
+        );
+        let raw = builder.op(
+            entry,
+            OpKind::RawView {
+                root: Root::Value(source),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            RAW_U8,
+            O,
+        );
+        let end = builder.op(
+            entry,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: raw,
+                r: length,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let sum_init = constant(&mut builder, entry, 0);
+        builder.terminate(entry, RTerm::Goto(header, vec![sum_init, raw]));
+
+        let sum_param = builder.block_param(header, USIZE, O);
+        let ptr_param = builder.block_param(header, RAW_U8, O);
+        let eq = builder.op(
+            header,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: ptr_param,
+                r: end,
+                ty: RAW_U8,
+            },
+            BOOL,
+            O,
+        );
+        builder.terminate(
+            header,
+            RTerm::Switch {
+                scrut: eq,
+                scrut_ty: BOOL,
+                cases: vec![(0, body, Vec::new())],
+                default: (exit, Vec::new()),
+            },
+        );
+
+        let one = constant(&mut builder, body, 1);
+        let next_ptr = builder.op(
+            body,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: ptr_param,
+                r: one,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let item_ref = builder.op(
+            body,
+            OpKind::BorrowView {
+                root: Root::Value(ptr_param),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            REF_U8,
+            O,
+        );
+        let elem = builder.op(body, OpKind::Deref(item_ref), U8, O);
+        let elem_u = builder.op(
+            body,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: elem,
+                from: U8,
+                to: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        // Extra read of `ptr_param` inside `body` (`ptr_param == end`).
+        let extra_cmp = builder.op(
+            body,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: ptr_param,
+                r: end,
+                ty: RAW_U8,
+            },
+            BOOL,
+            O,
+        );
+        builder.effect(
+            body,
+            OpKind::Assert {
+                cond: extra_cmp,
+                expected: false,
+                msg: crate::jir::repr::RAssertMessage::MisalignedPointer {
+                    required: ptr_param,
+                    found: end,
+                },
+            },
+            O,
+        );
+        let next_sum = builder.op(
+            body,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: sum_param,
+                r: elem_u,
+                ty: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        builder.terminate(body, RTerm::Goto(header, vec![next_sum, next_ptr]));
+        builder.terminate(exit, RTerm::Return(Some(sum_param)));
+
+        let mut func = builder.finish();
+        let tbl = table();
+        func.verify(&tbl).expect("pre-pass Func::verify");
+        let loops = run(&mut func, &tbl);
+        assert!(loops.is_empty());
+        func.verify(&tbl).expect("declined Func::verify");
+    }
+
+    #[test]
+    fn scalarized_slice_driver_bypass_pass_item_ref_clears_driver_term() {
+        let mut builder = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 101,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    ..AbiSignature::default()
+                },
+                arguments: vec![REF_SLICE],
+                result: USIZE,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let header = builder.block();
+        let driver = builder.block();
+        let body = builder.block();
+        let exit = builder.block();
+
+        let source = builder.param(REF_SLICE, O);
+        let length = builder.op(
+            entry,
+            OpKind::Unary {
+                op: UnaryOp::PtrMetadata,
+                v: source,
+                ty: REF_SLICE,
+            },
+            USIZE,
+            O,
+        );
+        let raw = builder.op(
+            entry,
+            OpKind::RawView {
+                root: Root::Value(source),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            RAW_U8,
+            O,
+        );
+        let end = builder.op(
+            entry,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: raw,
+                r: length,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let sum_init = constant(&mut builder, entry, 0);
+        builder.terminate(entry, RTerm::Goto(header, vec![sum_init, raw]));
+
+        let sum_param = builder.block_param(header, USIZE, O);
+        let ptr_param = builder.block_param(header, RAW_U8, O);
+        let eq = builder.op(
+            header,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: ptr_param,
+                r: end,
+                ty: RAW_U8,
+            },
+            BOOL,
+            O,
+        );
+        builder.terminate(
+            header,
+            RTerm::Switch {
+                scrut: eq,
+                scrut_ty: BOOL,
+                cases: vec![(0, driver, Vec::new())],
+                default: (exit, Vec::new()),
+            },
+        );
+
+        let one = constant(&mut builder, driver, 1);
+        let next_ptr = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: ptr_param,
+                r: one,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let item_ref = builder.op(
+            driver,
+            OpKind::BorrowView {
+                root: Root::Value(ptr_param),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            REF_U8,
+            O,
+        );
+        builder.terminate(driver, RTerm::Goto(body, vec![item_ref]));
+
+        let item_param = builder.block_param(body, REF_U8, O);
+        let elem = builder.op(body, OpKind::Deref(item_param), U8, O);
+        let elem_u = builder.op(
+            body,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: elem,
+                from: U8,
+                to: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        let next_sum = builder.op(
+            body,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: sum_param,
+                r: elem_u,
+                ty: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        builder.terminate(body, RTerm::Goto(header, vec![next_sum, next_ptr]));
+        builder.terminate(exit, RTerm::Return(Some(sum_param)));
+
+        let mut func = builder.finish();
+        let tbl = table();
+        func.verify(&tbl).expect("pre-pass Func::verify");
+        let loops = run(&mut func, &tbl);
+        assert_eq!(loops.len(), 1);
+        assert_eq!(func.blocks[driver.0 as usize].term, RTerm::Unreachable);
+        check_lowered(&func, &tbl, &loops).expect("witness checks");
+        crate::opt::dce::run_with(
+            &mut func,
+            &tbl,
+            &crate::opt::dce::Options {
+                no_deletions: true,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        );
+        func.verify(&tbl).expect("post-dce Func::verify");
+    }
+
+    #[test]
+    fn scalarized_slice_two_loops_sharing_raw_end_compact_under_no_deletions() {
+        let mut builder = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 102,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    ..AbiSignature::default()
+                },
+                arguments: vec![REF_SLICE],
+                result: USIZE,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let header1 = builder.block();
+        let body1 = builder.block();
+        let between = builder.block();
+        let header2 = builder.block();
+        let body2 = builder.block();
+        let exit = builder.block();
+
+        let source = builder.param(REF_SLICE, O);
+        let length = builder.op(
+            entry,
+            OpKind::Unary {
+                op: UnaryOp::PtrMetadata,
+                v: source,
+                ty: REF_SLICE,
+            },
+            USIZE,
+            O,
+        );
+        let raw = builder.op(
+            entry,
+            OpKind::RawView {
+                root: Root::Value(source),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            RAW_U8,
+            O,
+        );
+        let end = builder.op(
+            entry,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: raw,
+                r: length,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let init1 = constant(&mut builder, entry, 0);
+        builder.terminate(entry, RTerm::Goto(header1, vec![init1, raw]));
+
+        let sum1 = builder.block_param(header1, USIZE, O);
+        let ptr1 = builder.block_param(header1, RAW_U8, O);
+        let eq1 = builder.op(
+            header1,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: ptr1,
+                r: end,
+                ty: RAW_U8,
+            },
+            BOOL,
+            O,
+        );
+        builder.terminate(
+            header1,
+            RTerm::Switch {
+                scrut: eq1,
+                scrut_ty: BOOL,
+                cases: vec![(0, body1, Vec::new())],
+                default: (between, Vec::new()),
+            },
+        );
+        let one1 = constant(&mut builder, body1, 1);
+        let next_ptr1 = builder.op(
+            body1,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: ptr1,
+                r: one1,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let ref1 = builder.op(
+            body1,
+            OpKind::BorrowView {
+                root: Root::Value(ptr1),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            REF_U8,
+            O,
+        );
+        let elem1 = builder.op(body1, OpKind::Deref(ref1), U8, O);
+        let elem1_u = builder.op(
+            body1,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: elem1,
+                from: U8,
+                to: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        let next_sum1 = builder.op(
+            body1,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: sum1,
+                r: elem1_u,
+                ty: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        builder.terminate(body1, RTerm::Goto(header1, vec![next_sum1, next_ptr1]));
+
+        builder.terminate(between, RTerm::Goto(header2, vec![sum1, raw]));
+
+        let sum2 = builder.block_param(header2, USIZE, O);
+        let ptr2 = builder.block_param(header2, RAW_U8, O);
+        let eq2 = builder.op(
+            header2,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: ptr2,
+                r: end,
+                ty: RAW_U8,
+            },
+            BOOL,
+            O,
+        );
+        builder.terminate(
+            header2,
+            RTerm::Switch {
+                scrut: eq2,
+                scrut_ty: BOOL,
+                cases: vec![(0, body2, Vec::new())],
+                default: (exit, Vec::new()),
+            },
+        );
+        let one2 = constant(&mut builder, body2, 1);
+        let next_ptr2 = builder.op(
+            body2,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: ptr2,
+                r: one2,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let ref2 = builder.op(
+            body2,
+            OpKind::BorrowView {
+                root: Root::Value(ptr2),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            REF_U8,
+            O,
+        );
+        let elem2 = builder.op(body2, OpKind::Deref(ref2), U8, O);
+        let elem2_u = builder.op(
+            body2,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: elem2,
+                from: U8,
+                to: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        let next_sum2 = builder.op(
+            body2,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: sum2,
+                r: elem2_u,
+                ty: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        builder.terminate(body2, RTerm::Goto(header2, vec![next_sum2, next_ptr2]));
+        builder.terminate(exit, RTerm::Return(Some(sum2)));
+
+        let mut func = builder.finish();
+        let tbl = table();
+        func.verify(&tbl).expect("pre-pass Func::verify");
+        let loops = run(&mut func, &tbl);
+        assert_eq!(loops.len(), 2);
+        check_lowered(&func, &tbl, &loops).expect("witness checks");
+        crate::opt::dce::run_with(
+            &mut func,
+            &tbl,
+            &crate::opt::dce::Options {
+                no_deletions: true,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+        );
+        func.verify(&tbl).expect("post-dce Func::verify");
     }
 }

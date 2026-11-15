@@ -242,19 +242,15 @@ fn default_const_tree(table: &TypeTable, ty: TypeId) -> Option<ConstTree> {
         }
         TypeKind::Adt {
             form: NominalForm::Struct,
+            variants,
             ..
-        } => {
-            if descriptor.js.fields.is_empty() {
-                return None;
-            }
-            descriptor
-                .js
-                .fields
-                .iter()
-                .map(|field| default_const_tree(table, field.ty))
-                .collect::<Option<Vec<_>>>()
-                .map(ConstTree::Aggregate)
-        }
+        } => variants
+            .first()?
+            .fields
+            .iter()
+            .map(|field| default_const_tree(table, field.ty))
+            .collect::<Option<Vec<_>>>()
+            .map(ConstTree::Aggregate),
         TypeKind::Adt {
             form: NominalForm::Enum,
             variants,
@@ -264,10 +260,13 @@ fn default_const_tree(table: &TypeTable, ty: TypeId) -> Option<ConstTree> {
             Some(EnumRepr::Number { .. } | EnumRepr::Tag { fieldless: true })
         ) && !variants.is_empty() =>
         {
-            Some(ConstTree::Variant {
-                variant: 0,
-                fields: Vec::new(),
-            })
+            let fields = variants
+                .first()?
+                .fields
+                .iter()
+                .map(|field| default_const_tree(table, field.ty))
+                .collect::<Option<Vec<_>>>()?;
+            Some(ConstTree::Variant { variant: 0, fields })
         }
         _ => None,
     }
@@ -829,8 +828,17 @@ impl Analysis {
                             if self.nodes[target_node].enum_info.is_some()
                                 && self.same_shape(target_node, src_node)
                             {
-                                implications.push((target_node, src_node));
-                                implications.push((src_node, target_node));
+                                if self.nodes[src_node]
+                                    .fields
+                                    .iter()
+                                    .any(|field| table.needs_clone(field.ty))
+                                {
+                                    seeds.insert(target_node);
+                                    seeds.insert(src_node);
+                                } else {
+                                    implications.push((target_node, src_node));
+                                    implications.push((src_node, target_node));
+                                }
                             }
                         }
                     }
@@ -944,8 +952,13 @@ impl Analysis {
         // them; a copy that escapes itself needs the original to still exist.
         for (id, node) in self.nodes.iter().enumerate() {
             if let Some(src) = node.deref_from {
-                implications.push((id, src));
-                implications.push((src, id));
+                if node.fields.iter().any(|field| table.needs_clone(field.ty)) {
+                    seeds.insert(id);
+                    seeds.insert(src);
+                } else {
+                    implications.push((id, src));
+                    implications.push((src, id));
+                }
             }
             let Some(source) = node.copied_from else {
                 continue;
@@ -3461,6 +3474,376 @@ mod unit {
         assert_eq!(stats.scalarized, 0);
         assert_eq!(stats.escaped, 1);
         assert!(func.verify(&table).is_ok());
+    }
+
+    #[test]
+    fn multi_variant_enum_inactive_fieldless_zst_payload_scalarizes_and_interprets() {
+        let mut tbl = table();
+        let zst_ty = TypeId(10);
+        let mut zst = descriptor(
+            zst_ty,
+            TypeKind::Tuple(Vec::new()),
+            js(zst_ty, Vec::new(), false),
+        );
+        zst.layout.zst = true;
+        tbl.insert(zst);
+
+        // `enum Mode { Unit(()), Other }` — `fieldless: true`, yet variant 0 carries a ZST field.
+        let mode_ty = TypeId(11);
+        let mut mode_js = js(mode_ty, Vec::new(), false);
+        mode_js.enum_repr = Some(EnumRepr::Tag { fieldless: true });
+        tbl.insert(descriptor(
+            mode_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 81,
+                },
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: StrId(0),
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Index(0),
+                            ty: zst_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: StrId(1),
+                        fields: Vec::new(),
+                        logical_discr: 1,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            mode_js,
+        ));
+
+        let outer_ty = TypeId(12);
+        let mut outer_js = js(outer_ty, Vec::new(), true);
+        outer_js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+        tbl.insert(descriptor(
+            outer_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 82,
+                },
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: StrId(0),
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Index(0),
+                            ty: I32,
+                            offset: 0,
+                        }],
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: StrId(1),
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Index(0),
+                            ty: mode_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            outer_js,
+        ));
+
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 83,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                },
+                arguments: vec![I32],
+                result: I32,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let left = b.block();
+        let right = b.block();
+        let merge = b.block();
+        let ret_num = b.block();
+        let ret_mode = b.block();
+
+        let arg = b.param(I32, NO_ORIGIN);
+        b.terminate(
+            entry,
+            RTerm::Switch {
+                scrut: arg,
+                scrut_ty: I32,
+                cases: vec![(0, left, Vec::new())],
+                default: (right, Vec::new()),
+            },
+        );
+
+        let v0 = b.op(
+            left,
+            OpKind::Aggregate {
+                ty: outer_ty,
+                variant: 0,
+                active_field: None,
+                fields: vec![arg],
+            },
+            outer_ty,
+            NO_ORIGIN,
+        );
+        b.terminate(left, RTerm::Goto(merge, vec![v0]));
+
+        let mode = b.op(
+            right,
+            OpKind::Const(ConstTree::Variant {
+                variant: 1,
+                fields: Vec::new(),
+            }),
+            mode_ty,
+            NO_ORIGIN,
+        );
+        let v1 = b.op(
+            right,
+            OpKind::Aggregate {
+                ty: outer_ty,
+                variant: 1,
+                active_field: None,
+                fields: vec![mode],
+            },
+            outer_ty,
+            NO_ORIGIN,
+        );
+        b.terminate(right, RTerm::Goto(merge, vec![v1]));
+
+        let merged = b.block_param(merge, outer_ty, NO_ORIGIN);
+        let discr = b.op(merge, OpKind::Discriminant(merged), I32, NO_ORIGIN);
+        b.terminate(
+            merge,
+            RTerm::Switch {
+                scrut: discr,
+                scrut_ty: I32,
+                cases: vec![(0, ret_num, Vec::new())],
+                default: (ret_mode, Vec::new()),
+            },
+        );
+
+        let n = b.op(
+            ret_num,
+            OpKind::Field {
+                base: merged,
+                variant: Some(0),
+                field: 0,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        b.terminate(ret_num, RTerm::Return(Some(n)));
+
+        let m = b.op(
+            ret_mode,
+            OpKind::Field {
+                base: merged,
+                variant: Some(1),
+                field: 0,
+            },
+            mode_ty,
+            NO_ORIGIN,
+        );
+        let md = b.op(ret_mode, OpKind::Discriminant(m), I32, NO_ORIGIN);
+        b.terminate(ret_mode, RTerm::Return(Some(md)));
+
+        let before = b.finish();
+        assert!(before.verify(&tbl).is_ok());
+        let mut after = before.clone();
+        let stats = run(&mut after, &tbl);
+        assert!(stats.scalarized >= 1);
+        assert_eq!(stats.escaped, 0);
+        crate::opt::dce::run(&mut after, &tbl);
+        assert!(after.verify(&tbl).is_ok());
+
+        let interns = crate::jir::interns::Interns::default();
+        for input in [0, 7] {
+            let set = vec![(
+                crate::jir::interp::Value::Int {
+                    value: input,
+                    bits: 32,
+                    signed: true,
+                },
+                None,
+            )];
+            let verdict = crate::lower::ssa::check::compare_funcs(
+                &before,
+                &after,
+                &tbl,
+                &interns,
+                &BTreeMap::new(),
+                &set,
+                100,
+            );
+            assert!(
+                matches!(verdict, crate::lower::ssa::check::Verdict::Agree),
+                "interp verdict for {input}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_variant_enum_needs_clone_deref_store_escapes_cleanly() {
+        let mut tbl = table();
+        let pair_ty = TypeId(10);
+        tbl.insert(descriptor(
+            pair_ty,
+            TypeKind::Tuple(vec![I32, I32]),
+            js(pair_ty, Vec::new(), true),
+        ));
+        let enum_ty = TypeId(11);
+        let mut enum_js = js(enum_ty, Vec::new(), true);
+        enum_js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+        tbl.insert(descriptor(
+            enum_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 84,
+                },
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: StrId(0),
+                        fields: Vec::new(),
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: StrId(1),
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Index(0),
+                            ty: pair_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            enum_js,
+        ));
+        let ref_enum_ty = TypeId(12);
+        tbl.insert(descriptor(
+            ref_enum_ty,
+            TypeKind::Reference {
+                pointee: enum_ty,
+                mutable: true,
+            },
+            js(ref_enum_ty, Vec::new(), false),
+        ));
+
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 85,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                },
+                arguments: vec![I32],
+                result: I32,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let arg = b.param(I32, NO_ORIGIN);
+        let pair = b.op(
+            entry,
+            OpKind::Aggregate {
+                ty: pair_ty,
+                variant: 0,
+                active_field: None,
+                fields: vec![arg, arg],
+            },
+            pair_ty,
+            NO_ORIGIN,
+        );
+        let x = b.op(
+            entry,
+            OpKind::Aggregate {
+                ty: enum_ty,
+                variant: 1,
+                active_field: None,
+                fields: vec![pair],
+            },
+            enum_ty,
+            NO_ORIGIN,
+        );
+        let r = b.op(
+            entry,
+            OpKind::BorrowView {
+                root: Root::Value(x),
+                path: Vec::new(),
+                mutable: true,
+            },
+            ref_enum_ty,
+            NO_ORIGIN,
+        );
+        let y = b.op(entry, OpKind::Deref(r), enum_ty, NO_ORIGIN);
+        let z = b.op(
+            entry,
+            OpKind::Aggregate {
+                ty: enum_ty,
+                variant: 0,
+                active_field: None,
+                fields: Vec::new(),
+            },
+            enum_ty,
+            NO_ORIGIN,
+        );
+        b.effect(entry, OpKind::StoreThrough { ptr: r, v: z }, NO_ORIGIN);
+        let d = b.op(entry, OpKind::Discriminant(y), I32, NO_ORIGIN);
+        b.terminate(entry, RTerm::Return(Some(d)));
+
+        let mut func = b.finish();
+        let stats = run(&mut func, &tbl);
+        assert_eq!(stats.scalarized, 0);
+        assert!(stats.escaped >= 1);
+        assert!(func.verify(&tbl).is_ok());
     }
 }
 

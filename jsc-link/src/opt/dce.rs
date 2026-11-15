@@ -92,7 +92,7 @@ pub fn run_with(
             break;
         }
     }
-    if changed {
+    if changed || has_orphaned_values(func) {
         compact_values(func);
     }
     changed
@@ -296,6 +296,25 @@ fn split_unsigned_checked_adds(
 /// it, and `Func::verify` rejects that ("value vN is never defined"). Every one of them is
 /// unreferenced by construction: a deleted op's result was unused, a removed parameter's uses were
 /// substituted first, and only unreachable blocks can name a value an unreachable block defined.
+fn has_orphaned_values(func: &Func) -> bool {
+    let mut defined = vec![false; func.values.len()];
+    for block in &func.blocks {
+        for param in &block.params {
+            if let Some(slot) = defined.get_mut(param.0 as usize) {
+                *slot = true;
+            }
+        }
+        for op in &block.ops {
+            if let Some(result) = op.result {
+                if let Some(slot) = defined.get_mut(result.0 as usize) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    defined.into_iter().any(|is_defined| !is_defined)
+}
+
 fn compact_values(func: &mut Func) {
     let mut dead: BTreeSet<ValueId> = (0..func.values.len() as u32).map(ValueId).collect();
     for block in &func.blocks {
@@ -2908,6 +2927,30 @@ mod tests {
             "a discriminant use keeps the object whole"
         );
         func.verify(&table).expect("untouched function verifies");
+    }
+
+    #[test]
+    fn orphaned_value_defs_compact_even_when_no_deletions_is_set() {
+        let mut b = builder();
+        let arg = b.param(I32, NO_ORIGIN);
+        let orphan = b.op(FuncBuilder::ENTRY, constant(7), I32, NO_ORIGIN);
+        let _ = orphan;
+        b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(arg)));
+        let mut func = finished(b);
+        // Simulate an upstream pass (such as `slice_iter`) removing an op/param while leaving its
+        // `ValueDef` in `func.values` for witness checking.
+        func.blocks[0].ops.clear();
+        let table = option_table();
+
+        let opts = Options {
+            no_deletions: true,
+            ..Options::default()
+        };
+        let mut witnesses = Vec::new();
+        let changed = run_with(&mut func, &table, &opts, &mut witnesses);
+        assert!(!changed);
+        func.verify(&table)
+            .expect("compacts orphaned ValueDefs even when no_deletions = true");
     }
 }
 
