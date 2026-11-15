@@ -73,7 +73,7 @@ if [ "$candidate_bytes" -ge "$baseline_bytes" ]; then
 	exit 1
 fi
 
-for control in wide_checksum signed_checksum other_order observed_state; do
+for control in wide_checksum signed_checksum other_order observed_state untainted_deref; do
 	baseline_control=$(jq -r --arg name "slice_iterator_cursor\$$control" \
 		'.items[] | select(.name | contains($name)) | .bytes_min' \
 		"$work/baseline.js.lane.json")

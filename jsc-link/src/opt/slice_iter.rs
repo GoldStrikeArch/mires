@@ -90,6 +90,7 @@ struct BodyMatch {
     old_index: Option<ValueId>,
     old_item_ref: Option<ValueId>,
     old_byte: Option<ValueId>,
+    folded_item_ref: Option<ValueId>,
     item_ref_ty: TypeId,
     byte_ty: TypeId,
     origin: OriginId,
@@ -409,6 +410,31 @@ fn match_loop(
         body.old_item_ref,
         body.old_byte,
     );
+    if let Some(item_ref_val) = body.folded_item_ref {
+        let item_ref_site = defs.get(item_ref_val.0 as usize).copied().flatten()?;
+        let OpKind::BorrowView {
+            root: Root::Value(ptr_val),
+            ..
+        } = &func.blocks[item_ref_site.block].ops[item_ref_site.op].kind
+        else {
+            return None;
+        };
+        if !tainted.contains(&item_ref_val)
+            || !tainted.contains(ptr_val)
+            || !scc.contains(&item_ref_site.block)
+            || item_ref_site.block == header.block
+            || item_ref_site.block == body.driver
+            || item_ref_site.block == body.body
+            || reaches_avoiding(
+                func,
+                RBlockId(body.body as u32),
+                RBlockId(item_ref_site.block as u32),
+                header.block,
+            )
+        {
+            return None;
+        }
+    }
     if !non_escaping(func, defs, &scc, &tainted) {
         return None;
     }
@@ -988,6 +1014,7 @@ fn match_take_body(
         old_index: Some(update),
         old_item_ref: None,
         old_byte: Some(old_byte),
+        folded_item_ref: None,
         item_ref_ty,
         byte_ty,
         origin: ops[18].origin,
@@ -1026,6 +1053,7 @@ fn match_skip_body(
         old_index: Some(old_index),
         old_item_ref: None,
         old_byte: Some(old_byte),
+        folded_item_ref: None,
         item_ref_ty,
         byte_ty,
         origin: body.ops[11].origin,
@@ -1088,11 +1116,12 @@ fn match_borrowed_body(
         )
     };
 
-    let (old_byte, item_ref_ty, pass_item_ref) = match driver.params.as_slice() {
+    let (old_byte, item_ref_ty, pass_item_ref, folded_item_ref) = match driver.params.as_slice() {
         [item_ref] => (
             deref_result(deref, *item_ref)?,
             value_ty(func, *item_ref)?,
             body_index == block,
+            None,
         ),
         [] => {
             let OpKind::Deref(item_ref_val) = deref.kind else {
@@ -1110,7 +1139,12 @@ fn match_borrowed_body(
             {
                 return None;
             }
-            (deref.result?, value_ty(func, item_ref_val)?, false)
+            (
+                deref.result?,
+                value_ty(func, item_ref_val)?,
+                false,
+                Some(item_ref_val),
+            )
         }
         _ => return None,
     };
@@ -1129,6 +1163,7 @@ fn match_borrowed_body(
         old_index: Some(old_index),
         old_item_ref: None,
         old_byte: Some(old_byte),
+        folded_item_ref,
         item_ref_ty,
         byte_ty,
         origin: deref.origin,
@@ -1282,6 +1317,7 @@ fn match_slice_direct_body(
         old_index,
         old_item_ref: Some(old_item_ref),
         old_byte,
+        folded_item_ref: None,
         item_ref_ty,
         byte_ty: types.element,
         origin,
@@ -6810,5 +6846,359 @@ mod tests {
         check_lowered(&func, &tbl, &loops).expect("witness checks");
         crate::opt::dce::run(&mut func, &tbl);
         func.verify(&tbl).expect("post-dce Func::verify");
+    }
+
+    fn build_borrowed_folded_take_loop(tainted_in_adapter: bool) -> (Func, TypeTable) {
+        const REF_MUT_ENUM_TAKE: TypeId = TypeId(100);
+        const REF_MUT_TAKE: TypeId = TypeId(101);
+        const REF_MUT_USIZE: TypeId = TypeId(102);
+
+        let mut tbl = table();
+        tbl.insert(scalar(
+            REF_MUT_ENUM_TAKE,
+            TypeKind::Reference {
+                pointee: ENUM_TAKE,
+                mutable: true,
+            },
+            None,
+        ));
+        tbl.insert(scalar(
+            REF_MUT_TAKE,
+            TypeKind::Reference {
+                pointee: TAKE,
+                mutable: true,
+            },
+            None,
+        ));
+        tbl.insert(scalar(
+            REF_MUT_USIZE,
+            TypeKind::Reference {
+                pointee: USIZE,
+                mutable: true,
+            },
+            None,
+        ));
+
+        let mut builder = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 110,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 3,
+                    ..AbiSignature::default()
+                },
+                arguments: vec![REF_SLICE, USIZE, RAW_U8],
+                result: USIZE,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let source = builder.param(REF_SLICE, O);
+        let limit = builder.param(USIZE, O);
+        let other = builder.param(RAW_U8, O);
+        let header = builder.block();
+        let adapter = builder.block();
+        let driver = builder.block();
+        let exit = builder.block();
+
+        let length = builder.op(
+            entry,
+            OpKind::Unary {
+                op: UnaryOp::PtrMetadata,
+                v: source,
+                ty: REF_SLICE,
+            },
+            USIZE,
+            O,
+        );
+        let raw = builder.op(
+            entry,
+            OpKind::RawView {
+                root: Root::Value(source),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            RAW_U8,
+            O,
+        );
+        let end = builder.op(
+            entry,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: raw,
+                r: length,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let zst = builder.op(entry, OpKind::Const(ConstTree::Unit), ZST, O);
+        let slice = builder.op(
+            entry,
+            OpKind::Aggregate {
+                ty: SLICE_ITER,
+                variant: 0,
+                active_field: None,
+                fields: vec![raw, end, zst],
+            },
+            SLICE_ITER,
+            O,
+        );
+        let initial = constant(&mut builder, entry, 0);
+        let inner = builder.op(
+            entry,
+            OpKind::Aggregate {
+                ty: TAKE,
+                variant: 0,
+                active_field: None,
+                fields: vec![slice, limit],
+            },
+            TAKE,
+            O,
+        );
+        let untainted_ref = builder.op(
+            entry,
+            OpKind::BorrowView {
+                root: Root::Value(other),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            REF_U8,
+            O,
+        );
+        let zero_exit = constant(&mut builder, entry, 0);
+        let outer = builder.op(
+            entry,
+            OpKind::Aggregate {
+                ty: ENUM_TAKE,
+                variant: 0,
+                active_field: None,
+                fields: vec![inner, initial],
+            },
+            ENUM_TAKE,
+            O,
+        );
+        builder.terminate(entry, RTerm::Goto(header, Vec::new()));
+
+        let pointer = builder.op(
+            header,
+            OpKind::BorrowView {
+                root: Root::Value(outer),
+                path: Vec::new(),
+                mutable: true,
+            },
+            REF_MUT_ENUM_TAKE,
+            O,
+        );
+        let inner_ptr = builder.op(
+            header,
+            OpKind::BorrowView {
+                root: Root::Value(pointer),
+                path: vec![Proj::Deref, Proj::Field { field: 0, ty: TAKE }],
+                mutable: true,
+            },
+            REF_MUT_TAKE,
+            O,
+        );
+        let inner_val = builder.op(header, OpKind::Deref(inner_ptr), TAKE, O);
+        let n = builder.op(
+            header,
+            OpKind::Field {
+                base: inner_val,
+                variant: None,
+                field: 1,
+            },
+            USIZE,
+            O,
+        );
+        builder.terminate(
+            header,
+            RTerm::Switch {
+                scrut: n,
+                scrut_ty: USIZE,
+                cases: vec![(0, exit, Vec::new())],
+                default: (adapter, Vec::new()),
+            },
+        );
+
+        let item_ref = if tainted_in_adapter {
+            let slice_val = builder.op(
+                adapter,
+                OpKind::Field {
+                    base: inner_val,
+                    variant: None,
+                    field: 0,
+                },
+                SLICE_ITER,
+                O,
+            );
+            let cur_ptr = builder.op(
+                adapter,
+                OpKind::Field {
+                    base: slice_val,
+                    variant: None,
+                    field: 0,
+                },
+                RAW_U8,
+                O,
+            );
+            builder.op(
+                adapter,
+                OpKind::BorrowView {
+                    root: Root::Value(cur_ptr),
+                    path: vec![Proj::Deref],
+                    mutable: false,
+                },
+                REF_U8,
+                O,
+            )
+        } else {
+            untainted_ref
+        };
+        builder.terminate(adapter, RTerm::Goto(driver, Vec::new()));
+
+        let first = builder.op(driver, OpKind::Deref(pointer), ENUM_TAKE, O);
+        let index = builder.op(
+            driver,
+            OpKind::Field {
+                base: first,
+                variant: None,
+                field: 1,
+            },
+            USIZE,
+            O,
+        );
+        let second = builder.op(driver, OpKind::Deref(pointer), ENUM_TAKE, O);
+        let before = builder.op(
+            driver,
+            OpKind::Field {
+                base: second,
+                variant: None,
+                field: 1,
+            },
+            USIZE,
+            O,
+        );
+        let one = constant(&mut builder, driver, 1);
+        let next = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: before,
+                r: one,
+                ty: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        let overflow = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Lt,
+                l: next,
+                r: before,
+                ty: USIZE,
+            },
+            BOOL,
+            O,
+        );
+        let checked = builder.op(driver, OpKind::Copy(overflow), BOOL, O);
+        let third = builder.op(driver, OpKind::Deref(pointer), ENUM_TAKE, O);
+        let assert_left = builder.op(
+            driver,
+            OpKind::Field {
+                base: third,
+                variant: None,
+                field: 1,
+            },
+            USIZE,
+            O,
+        );
+        let assert_one = constant(&mut builder, driver, 1);
+        builder.effect(
+            driver,
+            OpKind::Assert {
+                cond: checked,
+                expected: false,
+                msg: RAssertMessage::Overflow {
+                    op: BinaryOp::Add,
+                    left: assert_left,
+                    right: assert_one,
+                },
+            },
+            O,
+        );
+        let stored = builder.op(driver, OpKind::Copy(next), USIZE, O);
+        let count_ptr = builder.op(
+            driver,
+            OpKind::BorrowView {
+                root: Root::Value(pointer),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: 1,
+                        ty: USIZE,
+                    },
+                ],
+                mutable: true,
+            },
+            REF_MUT_USIZE,
+            O,
+        );
+        builder.effect(
+            driver,
+            OpKind::StoreThrough {
+                ptr: count_ptr,
+                v: stored,
+            },
+            O,
+        );
+        let byte = builder.op(driver, OpKind::Deref(item_ref), U8, O);
+        let byte_u = builder.op(
+            driver,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: byte,
+                from: U8,
+                to: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: index,
+                r: byte_u,
+                ty: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        builder.terminate(driver, RTerm::Goto(header, Vec::new()));
+        builder.terminate(exit, RTerm::Return(Some(zero_exit)));
+
+        (builder.finish(), tbl)
+    }
+
+    #[test]
+    fn borrowed_folded_untainted_deref_does_not_lower() {
+        let (mut func, tbl) = build_borrowed_folded_take_loop(false);
+        func.verify(&tbl).expect("pre-pass Func::verify");
+        assert!(run(&mut func, &tbl).is_empty());
+    }
+
+    #[test]
+    fn borrowed_folded_tainted_adapter_lowers() {
+        let (mut func, tbl) = build_borrowed_folded_take_loop(true);
+        func.verify(&tbl).expect("pre-pass Func::verify");
+        let loops = run(&mut func, &tbl);
+        assert_eq!(loops.len(), 1);
+        check_lowered(&func, &tbl, &loops).expect("witness checks");
     }
 }

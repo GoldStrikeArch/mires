@@ -91,6 +91,21 @@ fn early_break(values: &[u8], limit: usize, stop: u8) -> usize {
     checksum
 }
 
+// Unused iterator items fold `Take::next`'s borrow away; an unrelated `&u8`
+// deref in the body must never be confused for the slice item.
+#[inline(never)]
+fn untainted_deref(values: &[u8], limit: usize, other: *const u8, stop: u8) -> usize {
+    let mut checksum = 0;
+    for (index, _) in values.iter().take(limit).enumerate() {
+        let value = unsafe { *other };
+        if value == stop {
+            break;
+        }
+        checksum += (index + 1) * value as usize;
+    }
+    checksum
+}
+
 #[unsafe(no_mangle)]
 pub fn rust_entry() {
     let values = [
@@ -108,4 +123,6 @@ pub fn rust_entry() {
     print_usize(other_order(&values, 3));
     print_usize(observed_state(&values, 4));
     print_usize(early_break(&values, 10, 5));
+    let sentinel = 100_u8;
+    print_usize(untainted_deref(&values, 3, &sentinel as *const u8, 255));
 }
