@@ -631,6 +631,10 @@ fn collect_sites(
                 stats.decline("inline.body-unavailable");
                 continue;
             };
+            if callee_func.sig.abi.inline_never {
+                stats.decline("inline.never");
+                continue;
+            }
             let is_sole_caller = sole_referrer(&callee, caller);
             let allow_host_boundary = is_sole_caller
                 && count_item_refs(func, &caller_metadata.interns, callee.as_str()) == 1;
@@ -3272,5 +3276,45 @@ mod tests {
             false,
         );
         assert_eq!(stats.applied, 1);
+    }
+
+    #[test]
+    fn declines_inline_never_even_for_tiny_sole_caller() {
+        let mut prog = Prog::new();
+        let g_str = prog.strid("g");
+        let mut g_sig = sig(1);
+        g_sig.abi.inline_never = true;
+        let mut g_b = FuncBuilder::new(item(2), g_sig);
+        let gp = g_b.param(I32, O);
+        g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(gp)));
+        let g = g_b.finish();
+
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let fx = f_b.param(I32, O);
+        let call = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: g_str,
+                },
+                function: None,
+                args: vec![fx],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+        let f = f_b.finish();
+
+        prog.add("g", g);
+        prog.add("f", f);
+        let stats = prog.run(10_000, true);
+        assert_eq!(stats.applied, 0);
+        assert_eq!(stats.declined.get("inline.never"), Some(&1));
+        assert_eq!(prog.calls_in("f"), 1);
     }
 }

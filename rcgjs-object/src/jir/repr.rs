@@ -1444,12 +1444,18 @@ impl<'a> Verifier<'a> {
             for &block_id in &self.doms.rpo {
                 let block = &self.func.blocks[block_id.0 as usize];
                 let mut moved = moved_in[block_id.0 as usize].clone();
+                for param in &block.params {
+                    moved.remove(param);
+                }
                 let mut allocated = alloc_in[block_id.0 as usize]
                     .clone()
                     .unwrap_or_else(|| all_cells.clone());
                 for op in &block.ops {
                     if let OpKind::CellAlloc(cell) = op.kind {
                         allocated.insert(cell);
+                    }
+                    if let Some(def) = op.result {
+                        moved.remove(&def);
                     }
                     if let Some(v) = op.kind.moved() {
                         moved.insert(v);
@@ -1482,6 +1488,9 @@ impl<'a> Verifier<'a> {
         for &block_id in &self.doms.rpo {
             let block = &self.func.blocks[block_id.0 as usize];
             let mut moved = moved_in[block_id.0 as usize].clone();
+            for param in &block.params {
+                moved.remove(param);
+            }
             let mut allocated = alloc_in[block_id.0 as usize].clone().unwrap_or_default();
             for (position, op) in block.ops.iter().enumerate() {
                 for v in op.kind.uses() {
@@ -1519,6 +1528,9 @@ impl<'a> Verifier<'a> {
                 }
                 if let OpKind::CellAlloc(cell) = op.kind {
                     allocated.insert(cell);
+                }
+                if let Some(def) = op.result {
+                    moved.remove(&def);
                 }
                 if let Some(v) = op.kind.moved() {
                     moved.insert(v);

@@ -32,7 +32,8 @@ mod tests;
 /// | 8 | Phase 12 K1: the append-only `HostPayload::KeyedList` operation with typed callable, cleanup, and source facts. |
 /// | 9 | Phase 12 iterator-state lowering: exact standard iterator identity in `TypeMeta`. |
 /// | 10 | Source coroutine suspension facts in the object intern table. |
-pub const JIR_SCHEMA: u16 = 15;
+/// | 16 | `AbiSignature::inline_never` preserves `#[inline(never)]` across JIR. |
+pub const JIR_SCHEMA: u16 = 16;
 
 use serde::{Deserialize, Serialize};
 

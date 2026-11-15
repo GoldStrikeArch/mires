@@ -2567,6 +2567,7 @@ mod corpus {
                 parameters: arguments as u16,
                 spread: None,
                 caller_location: false,
+                inline_never: false,
             },
         };
         let item = |local_hash| ItemId {

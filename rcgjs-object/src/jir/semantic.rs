@@ -122,6 +122,8 @@ pub struct AbiSignature {
     pub spread: Option<SpreadArgument>,
     /// Whether the body takes a trailing caller `Location` (`#[track_caller]`).
     pub caller_location: bool,
+    /// Whether Rust marked the item `#[inline(never)]`.
+    pub inline_never: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

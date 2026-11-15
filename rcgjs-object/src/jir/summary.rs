@@ -1045,6 +1045,7 @@ impl<'a> Normalizer<'a> {
                     arity: spread.arity,
                 }),
                 caller_location: body.signature.abi.caller_location,
+                inline_never: body.signature.abi.inline_never,
             },
         };
         let kind = self.body_kind(&body.kind);
@@ -1954,6 +1955,7 @@ mod identity_tests {
                     parameters: 1,
                     spread: None,
                     caller_location: false,
+                    inline_never: false,
                 },
             },
             locals: locals(),

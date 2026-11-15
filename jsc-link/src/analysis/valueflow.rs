@@ -3339,6 +3339,7 @@ pub(crate) mod harness {
                 parameters,
                 spread: None,
                 caller_location: false,
+                inline_never: false,
             },
         }
     }

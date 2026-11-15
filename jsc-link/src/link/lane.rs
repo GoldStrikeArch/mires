@@ -700,7 +700,7 @@ fn run_with_opts(
         );
     }
     let emitting_plans = opts.optimizer == crate::opts::OptimizerMode::On;
-    if emitting_plans && opts.analyzes(OptimizerPass::AstDce) {
+    if opts.analyzes(OptimizerPass::AstDce) {
         let mut excluded: BTreeMap<JsName, Result<Func, Decline>> = BTreeMap::new();
         for name in planned_repr
             .bodies
@@ -3398,6 +3398,7 @@ mod tests {
                     parameters: 1,
                     spread: None,
                     caller_location: false,
+                    inline_never: false,
                 },
             },
             locals: vec![
@@ -3488,6 +3489,7 @@ mod tests {
                     parameters: 1,
                     spread: None,
                     caller_location: false,
+                    inline_never: false,
                 },
             },
             locals: vec![
@@ -3669,6 +3671,7 @@ mod tests {
                         parameters: 1,
                         spread: None,
                         caller_location: false,
+                        inline_never: false,
                     },
                 },
                 locals,
