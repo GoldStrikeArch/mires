@@ -123,15 +123,58 @@ export function minimalShim(programs, shimSource, { module = false, direct: decl
   }
 
   const names = [...members.keys()].filter((name) => needed.has(name));
+  if (!module) {
+    const output = [
+      "// The subset of runtime/shim.js this program reaches. Generated; do not edit.",
+      "globalThis.__rt = globalThis.__rt || {};",
+      ...names.map((name) => members.get(name)),
+      "",
+    ];
+    return { direct: [...direct].sort(), names, source: output.join("\n") };
+  }
+
+  // Lexical ESM mode avoids mutating a global `__rt` object so bundlers/minifiers can
+  // mangle, inline, and dead-strip helpers. Keep `names` unchanged for manifest checks.
+  const elideBoxes = !needed.has("box") && !needed.has("tail_ref") && !needed.has("tail_slice");
+  const errPrefixPattern = /new Error\((\s*)"rustc_codegen_js: /g;
+  const rtRefPattern =
+    /'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|(?:globalThis\.)?__rt\.([A-Za-z_$][A-Za-z0-9_$]*)/g;
+  const statements = names.map((name) => {
+    if (elideBoxes && name === "_boxes") return "let $rt__boxes = null;";
+    let stmt = members.get(name);
+    if (elideBoxes && name === "_put") {
+      stmt = stmt.replace(
+        /\r?\n\s*if\s*\(\s*value\s*!==\s*null\s*&&\s*typeof value\s*===\s*"object"\s*&&[^;{}]*_boxes\.has\(value\)\s*\)\s*\{\s*[^}]*_boxes\.set\([^;]*\);\s*\}/,
+        "",
+      );
+    }
+    stmt = stmt.replace(/^globalThis\.__rt\.([A-Za-z_$][A-Za-z0-9_$]*)\s*=/, "let $rt_$1 =");
+    return stmt.replace(rtRefPattern, (match, refName, offset, full) => {
+      if (refName === undefined) return match;
+      const before = offset === 0 ? "" : full[offset - 1];
+      if (/[A-Za-z0-9_$.]/.test(before)) return match;
+      return `$rt_${refName}`;
+    });
+  });
+
+  let body = statements.join("\n");
+  let errCount = 0;
+  for (const _ of body.matchAll(errPrefixPattern)) errCount += 1;
+
   const output = [
     "// The subset of runtime/shim.js this program reaches. Generated; do not edit.",
-    "globalThis.__rt = globalThis.__rt || {};",
-    ...names.map((name) => members.get(name)),
   ];
-  if (module) {
-    output.push(`export const {\n${names.map((name) => `  ${name},`).join("\n")}\n} = globalThis.__rt;`);
+  if (errCount >= 2) {
+    body = body.replace(errPrefixPattern, '$rt_err($1"');
+    output.push('const $rt_err = (m) => new Error("rustc_codegen_js: " + m);');
   }
-  output.push("");
+  if (body.length > 0) output.push(body);
+  output.push(
+    names.length > 0
+      ? `export {\n${names.map((name) => `  $rt_${name} as ${name},`).join("\n")}\n};`
+      : "export {};",
+    "",
+  );
   return { direct: [...direct].sort(), names, source: output.join("\n") };
 }
 
