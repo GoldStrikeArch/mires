@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::jir::repr::{Func, Op, OpKind, RBlockId, RTerm, ValueId};
+use crate::jir::repr::{CellId, Func, Op, OpKind, RBlockId, RTerm, Root, ValueId};
 use crate::jir::semantic::{BinaryOp, CallSemantic, Callee, ConstTree, TypeId};
 use crate::jir::types::{EnumRepr, NominalForm, TypeKind};
 use crate::jir::TypeTable;
@@ -1345,8 +1345,14 @@ fn remove_dead_ops(func: &mut Func, pure_call: Option<&dyn Fn(&Callee) -> bool>)
     let mut changed = false;
     loop {
         let mut used = vec![false; func.values.len()];
+        let mut used_cells = vec![false; func.cells.len()];
         let mark = |v: ValueId, used: &mut Vec<bool>| {
             if let Some(slot) = used.get_mut(v.0 as usize) {
+                *slot = true;
+            }
+        };
+        let mark_cell = |c: CellId, used_cells: &mut Vec<bool>| {
+            if let Some(slot) = used_cells.get_mut(c.0 as usize) {
                 *slot = true;
             }
         };
@@ -1359,6 +1365,26 @@ fn remove_dead_ops(func: &mut Func, pure_call: Option<&dyn Fn(&Callee) -> bool>)
                 }
             }
             for op in &block.ops {
+                match &op.kind {
+                    OpKind::CellLoad(cell) | OpKind::CellStore { cell, .. } => {
+                        mark_cell(*cell, &mut used_cells);
+                    }
+                    OpKind::BorrowView {
+                        root: Root::Cell(cell),
+                        ..
+                    }
+                    | OpKind::RawView {
+                        root: Root::Cell(cell),
+                        ..
+                    }
+                    | OpKind::Drop {
+                        root: Root::Cell(cell),
+                        ..
+                    } => {
+                        mark_cell(*cell, &mut used_cells);
+                    }
+                    _ => {}
+                }
                 for v in op.kind.uses() {
                     mark(v, &mut used);
                 }
@@ -1390,6 +1416,10 @@ fn remove_dead_ops(func: &mut Func, pure_call: Option<&dyn Fn(&Callee) -> bool>)
                     OpKind::Call { .. } => true,
                     kind => op_purity(kind) == Purity::Effect,
                 },
+                None => !matches!(
+                    op.kind,
+                    OpKind::CellAlloc(cell) if !used_cells.get(cell.0 as usize).copied().unwrap_or(true)
+                ),
                 _ => true,
             });
             round |= block.ops.len() != before;
@@ -3117,6 +3147,71 @@ mod tests {
         );
         assert_eq!(pea.escaped, 0);
         func.verify(&tbl).expect("post-pea Func::verify");
+    }
+
+    #[test]
+    fn unused_cell_alloc_is_eliminated() {
+        use crate::jir::repr::{OpKind, Root};
+
+        const REF_I32: TypeId = TypeId(3);
+        let mut tbl = table();
+        tbl.insert(TypeDescriptor {
+            id: REF_I32,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: I32,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: REF_I32,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+
+        let mut b = builder();
+        let entry = FuncBuilder::ENTRY;
+        let zero = b.op(entry, constant(0), I32, NO_ORIGIN);
+        let cell = b.cell(I32, false, NO_ORIGIN);
+        b.effect(entry, OpKind::CellAlloc(cell), NO_ORIGIN);
+        let dead_view = b.op(
+            entry,
+            OpKind::BorrowView {
+                root: Root::Cell(cell),
+                path: Vec::new(),
+                mutable: false,
+            },
+            REF_I32,
+            NO_ORIGIN,
+        );
+        let _ = dead_view;
+        b.terminate(entry, RTerm::Return(Some(zero)));
+
+        let mut func = finished(b);
+        func.verify(&tbl).expect("pre-dce Func::verify");
+        assert!(super::run(&mut func, &tbl));
+        assert!(
+            !func.blocks[entry.0 as usize]
+                .ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::CellAlloc(_))),
+            "dead CellAlloc should be removed once dead BorrowView drops"
+        );
+        func.verify(&tbl).expect("post-dce Func::verify");
     }
 }
 

@@ -200,7 +200,7 @@ pub fn lower_item(input: &LowerInput<'_>, func: &Func) -> Result<MeasuredItem, D
         ..*input
     };
     let mut stats = OptStats::default();
-    crate::opt::optimize(&mut func, input.table, input.interns, &opts, &mut stats)?;
+    crate::opt::optimize_for_probe(&mut func, input.table, input.interns, &opts, &mut stats)?;
     let lowered = crate::lower::lower_func(&input, &func)?;
     let alloc_term = Cost::new(&opts).alloc_term(&JsAllocSites::of(&lowered.decl));
     Ok(MeasuredItem {

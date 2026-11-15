@@ -288,7 +288,7 @@ fn match_loop(
             },
             AdapterAccess::Borrowed(pointer) => match types.adapter {
                 Adapter::Take | Adapter::Skip => {
-                    match_borrowed_body(func, table, pointer, outer_ty, types, block)
+                    match_borrowed_body(func, table, (defs, uses), pointer, outer_ty, types, block)
                 }
                 Adapter::Plain | Adapter::Enumerate => None,
             },
@@ -1035,58 +1035,85 @@ fn match_skip_body(
 fn match_borrowed_body(
     func: &Func,
     table: &TypeTable,
+    (defs, uses): (&[Option<Site>], &[usize]),
     pointer: ValueId,
     outer_ty: TypeId,
     types: AdapterTypes,
     block: usize,
 ) -> Option<BodyMatch> {
     let driver = func.blocks.get(block)?;
-    let [item_ref] = driver.params.as_slice() else {
-        return None;
+    let prefix = driver.ops.get(..12)?;
+    let (old_index, next) = borrowed_count_prefix(func, prefix, pointer, outer_ty, types.usize_ty)?;
+    let empty_goto = |term: &RTerm| match term {
+        RTerm::Goto(target, args) if args.is_empty() => Some(*target),
+        _ => None,
     };
-    let (old_index, next) =
-        borrowed_count_prefix(func, &driver.ops, pointer, outer_ty, types.usize_ty)?;
-    let (update_match, body_id) = if driver.ops.len() == 15 {
-        if !borrowed_count_store(&driver.ops[12..], pointer, next, types.usize_ty) {
+    let (update_match, body_index, prefix_len, driver_prefix, deref) = if driver.ops.len() >= 16 {
+        if !borrowed_count_store(&driver.ops[12..15], pointer, next, types.usize_ty) {
             return None;
         }
-        let RTerm::Goto(body_id, args) = &driver.term else {
-            return None;
-        };
-        if !args.is_empty() {
-            return None;
-        }
-        (None, *body_id)
+        (None, block, 16, 16, &driver.ops[15])
     } else {
-        let RTerm::Goto(update_id, args) = &driver.term else {
+        let (update_match, body_id) = if driver.ops.len() == 15 {
+            if !borrowed_count_store(&driver.ops[12..], pointer, next, types.usize_ty) {
+                return None;
+            }
+            (None, empty_goto(&driver.term)?)
+        } else if driver.ops.len() == 12 {
+            let update_index = empty_goto(&driver.term)?.0 as usize;
+            let update = func.blocks.get(update_index)?;
+            if !update.params.is_empty()
+                || !borrowed_count_store(&update.ops, pointer, next, types.usize_ty)
+            {
+                return None;
+            }
+            (
+                Some((update_index, update.ops.len())),
+                empty_goto(&update.term)?,
+            )
+        } else {
             return None;
         };
-        if !args.is_empty() {
+        let body_index = body_id.0 as usize;
+        let body = func.blocks.get(body_index)?;
+        if body_index == block || !body.params.is_empty() {
             return None;
         }
-        let update_index = update_id.0 as usize;
-        let update = func.blocks.get(update_index)?;
-        if !update.params.is_empty()
-            || !borrowed_count_store(&update.ops, pointer, next, types.usize_ty)
-        {
-            return None;
-        }
-        let RTerm::Goto(body_id, args) = &update.term else {
-            return None;
-        };
-        if !args.is_empty() {
-            return None;
-        }
-        (Some((update_index, update.ops.len())), *body_id)
+        (
+            update_match,
+            body_index,
+            1,
+            driver.ops.len(),
+            body.ops.first()?,
+        )
     };
-    let body_index = body_id.0 as usize;
-    let body = func.blocks.get(body_index)?;
-    if !body.params.is_empty() {
-        return None;
-    }
-    let deref = body.ops.first()?;
-    let old_byte = deref_result(deref, *item_ref)?;
-    let item_ref_ty = value_ty(func, *item_ref)?;
+
+    let (old_byte, item_ref_ty, pass_item_ref) = match driver.params.as_slice() {
+        [item_ref] => (
+            deref_result(deref, *item_ref)?,
+            value_ty(func, *item_ref)?,
+            body_index == block,
+        ),
+        [] => {
+            let OpKind::Deref(item_ref_val) = deref.kind else {
+                return None;
+            };
+            if uses.get(item_ref_val.0 as usize).copied() != Some(1)
+                || !matches!(
+                    &definition(func, defs, item_ref_val)?.kind,
+                    OpKind::BorrowView {
+                        root: Root::Value(_),
+                        path,
+                        mutable: false,
+                    } if path.as_slice() == [Proj::Deref]
+                )
+            {
+                return None;
+            }
+            (deref.result?, value_ty(func, item_ref_val)?, false)
+        }
+        _ => return None,
+    };
     let byte_ty = value_ty(func, old_byte)?;
     if byte_ty != types.element || !is_ref_to(table, item_ref_ty, byte_ty) {
         return None;
@@ -1095,10 +1122,10 @@ fn match_borrowed_body(
         driver: block,
         update: update_match,
         body: body_index,
-        prefix: 1,
-        driver_prefix: driver.ops.len(),
+        prefix: prefix_len,
+        driver_prefix,
         removed_ops: BTreeMap::new(),
-        pass_item_ref: false,
+        pass_item_ref,
         old_index: Some(old_index),
         old_item_ref: None,
         old_byte: Some(old_byte),

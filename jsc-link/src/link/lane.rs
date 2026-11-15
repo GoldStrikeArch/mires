@@ -862,12 +862,15 @@ fn run_with_opts(
         plan.rewrite(&mut funcs, &work_table);
         drop(rewrite_scope);
         // Phase C.
+        let report_probe = (opts.optimizer == crate::opts::OptimizerMode::Report)
+            .then_some((&planning_table, &planned_funcs));
         let (lowered, retry) = crate::profile::time("lane.C.lower_all", || {
             lower_all(
                 &work_table,
                 &names,
                 &ctx,
                 funcs,
+                report_probe,
                 &plan,
                 &repr,
                 &physical,
@@ -1652,6 +1655,11 @@ fn o_group_with_mode(
     group
 }
 
+type ReportProbe<'a> = (
+    &'a BTreeMap<JsName, LinkItem>,
+    &'a BTreeMap<JsName, Result<Func, Decline>>,
+);
+
 /// Phase C: optimize and print each item. Returns the declarations and whether the run must retry.
 ///
 /// Nothing here touches the table: a retry has to be decided before any item is replaced.
@@ -1661,6 +1669,7 @@ fn lower_all(
     names: &[JsName],
     ctx: &Ctx<'_>,
     mut funcs: BTreeMap<JsName, Result<Func, Decline>>,
+    report_probe: Option<ReportProbe<'_>>,
     plan: &AbiPlan,
     repr: &crate::plan::representation::ReprOutcome,
     physical: &crate::plan::physical::PhysicalPlan,
@@ -1714,13 +1723,36 @@ fn lower_all(
                 None => lower_item(&input),
                 Some(Err(decline)) => Err(decline),
                 Some(Ok(mut func)) => {
-                    match crate::opt::optimize(
-                        &mut func,
-                        input.table,
-                        input.interns,
-                        ctx.opts,
-                        &mut stats,
-                    ) {
+                    let probe = if let Some((probe_table, probe_funcs)) = report_probe {
+                        if let (Some(probe_item), Some(Ok(probe_func))) =
+                            (probe_table.get(name), probe_funcs.get(name))
+                        {
+                            if let Some(probe_interns) = probe_item.jir.interns() {
+                                let mut probe = probe_func.clone();
+                                if crate::opt::optimize(
+                                    &mut probe,
+                                    &probe_interns.types,
+                                    probe_interns,
+                                    ctx.opts,
+                                    &mut stats,
+                                )
+                                .is_err()
+                                {
+                                    stats = OptStats::default();
+                                }
+                            }
+                        }
+                        Ok(())
+                    } else {
+                        crate::opt::optimize(
+                            &mut func,
+                            input.table,
+                            input.interns,
+                            ctx.opts,
+                            &mut stats,
+                        )
+                    };
+                    match probe {
                         Err(decline) => {
                             if std::env::var("RCGJS_OPT_DEBUG_FUNC")
                                 .is_ok_and(|filter| name.as_str().contains(&filter))

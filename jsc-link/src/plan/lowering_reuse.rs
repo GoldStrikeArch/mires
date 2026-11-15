@@ -178,7 +178,7 @@ impl Deps {
         let mut optimized = func.clone();
         let mut opts = input.opts.clone();
         opts.optimizer = OptimizerMode::On;
-        let optimized_ok = crate::opt::optimize(
+        let optimized_ok = crate::opt::optimize_for_probe(
             &mut optimized,
             input.table,
             input.interns,

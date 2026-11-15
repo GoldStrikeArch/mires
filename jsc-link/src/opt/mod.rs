@@ -33,4 +33,4 @@ pub mod slice_forward;
 pub mod slice_iter;
 pub mod witness;
 
-pub use pipeline::{o_pass_enabled, observed_carriers, optimize, OptStats};
+pub use pipeline::{o_pass_enabled, observed_carriers, optimize, optimize_for_probe, OptStats};

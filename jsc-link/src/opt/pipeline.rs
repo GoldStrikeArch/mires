@@ -140,14 +140,37 @@ pub fn optimize(
     opts: &Opts,
     stats: &mut OptStats,
 ) -> Result<(), Decline> {
+    optimize_with_fault(func, table, interns, opts, stats, true)
+}
+
+/// Runs the lane's optimizer without injecting `RCGJS_WITNESS_FAULT`, for planning and sizing
+/// probes that precede Phase C transactional lowering.
+pub fn optimize_for_probe(
+    func: &mut Func,
+    table: &TypeTable,
+    interns: &crate::jir::interns::Interns,
+    opts: &Opts,
+    stats: &mut OptStats,
+) -> Result<(), Decline> {
+    optimize_with_fault(func, table, interns, opts, stats, false)
+}
+
+fn optimize_with_fault(
+    func: &mut Func,
+    table: &TypeTable,
+    interns: &crate::jir::interns::Interns,
+    opts: &Opts,
+    stats: &mut OptStats,
+    inject_fault: bool,
+) -> Result<(), Decline> {
     if reports(opts, OptimizerPass::Sroa) || reports(opts, OptimizerPass::AstDce) {
         let mut probe = func.clone();
-        if run(&mut probe, table, interns, opts, stats).is_err() {
+        if run(&mut probe, table, interns, opts, stats, inject_fault).is_err() {
             *stats = OptStats::default();
         }
         return Ok(());
     }
-    run(func, table, interns, opts, stats)
+    run(func, table, interns, opts, stats, inject_fault)
 }
 
 /// Whether `pass` is one this mode measures without keeping: `js-opt=report`'s whole job.
@@ -162,6 +185,7 @@ fn run(
     interns: &crate::jir::interns::Interns,
     opts: &Opts,
     stats: &mut OptStats,
+    inject_fault: bool,
 ) -> Result<(), Decline> {
     let passes = pass_set();
     let mut witnesses: Vec<Witness> = Vec::new();
@@ -205,7 +229,14 @@ fn run(
             stats.ast_dce_changed = true;
             verified(func, table, "ast-dce")?;
         }
-        run_slice_iter(func, table, &dce_options, &mut witnesses, stats)?;
+        run_slice_iter(
+            func,
+            table,
+            &dce_options,
+            &mut witnesses,
+            stats,
+            inject_fault,
+        )?;
     }
 
     // `dce` then the escape analysis, to a short fixpoint: the first `dce` threads the
@@ -251,7 +282,14 @@ fn run(
     }
 
     if runs_dce && passes.slice_iter {
-        run_slice_iter(func, table, &dce_options, &mut witnesses, stats)?;
+        run_slice_iter(
+            func,
+            table,
+            &dce_options,
+            &mut witnesses,
+            stats,
+            inject_fault,
+        )?;
     }
 
     if runs_dce {
@@ -278,7 +316,7 @@ fn run(
 
     // The `BoundsRemoved` witnesses name blocks and values of the function as `range` left it,
     // so they are checked before the cleanup below renumbers anything.
-    checked(&mut witnesses, func, table, stats)?;
+    checked(&mut witnesses, func, table, stats, inject_fault)?;
 
     // The removed asserts leave their comparisons and length reads dead; this cleanup's own
     // witnesses are payload-only and get their own check.
@@ -288,7 +326,7 @@ fn run(
             stats.ast_dce_changed = true;
             verified(func, table, "ast-dce")?;
         }
-        checked(&mut cleanup, func, table, stats)?;
+        checked(&mut cleanup, func, table, stats, inject_fault)?;
     }
     Ok(())
 }
@@ -301,6 +339,7 @@ fn run_slice_iter(
     dce_options: &dce::Options,
     witnesses: &mut Vec<Witness>,
     stats: &mut OptStats,
+    inject_fault: bool,
 ) -> Result<(), Decline> {
     let lowered = super::slice_iter::run(func, table);
     if lowered.is_empty() {
@@ -312,7 +351,7 @@ fn run_slice_iter(
     // These witnesses carry exact block and value ids. Check them before DCE removes the
     // old adapter graph and renumbers the generated loop. DCE then verifies its own
     // output and records a separate payload-only witness batch.
-    checked(&mut slice_witnesses, func, table, stats)?;
+    checked(&mut slice_witnesses, func, table, stats, inject_fault)?;
     if dce::run_with(func, table, dce_options, witnesses) {
         stats.ast_dce_changed = true;
     }
@@ -326,13 +365,16 @@ fn checked(
     func: &Func,
     table: &TypeTable,
     stats: &mut OptStats,
+    inject_fault: bool,
 ) -> Result<(), Decline> {
     stats.witnesses_recorded += witnesses.len() as u32;
     if !witness::enabled() || witnesses.is_empty() {
         return Ok(());
     }
-    if let Some(target) = std::env::var_os("RCGJS_WITNESS_FAULT") {
-        corrupt(witnesses, target.to_string_lossy().as_ref());
+    if inject_fault {
+        if let Some(target) = std::env::var_os("RCGJS_WITNESS_FAULT") {
+            corrupt(witnesses, target.to_string_lossy().as_ref());
+        }
     }
     if witness::check_all(witnesses, func, table).is_err() {
         stats.witnesses_failed += 1;

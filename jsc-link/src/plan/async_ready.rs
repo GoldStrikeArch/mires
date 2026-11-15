@@ -147,7 +147,7 @@ fn prove(
     let mut func = func.clone();
     let mut proof_opts = opts.clone();
     proof_opts.optimizer = OptimizerMode::On;
-    crate::opt::optimize(
+    crate::opt::optimize_for_probe(
         &mut func,
         &interns.types,
         interns,
