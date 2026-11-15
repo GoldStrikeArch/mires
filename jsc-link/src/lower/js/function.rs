@@ -1,13 +1,13 @@
 //! One item as a top level declaration: a function (`base.rs::codegen_fn` and `codegen_body`),
 //! a `static` (`base.rs::codegen_static`), or a vtable (`vtable.rs`).
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rcgjs_object::item::JsName;
 use rcgjs_object::jir::decline::{Decline, OpClass};
 use rcgjs_object::jir::repr::Func;
 use rcgjs_object::jir::semantic::{BodyKind, VtableEntry};
-use rcgjs_object::jsast::{self, Stmt};
+use rcgjs_object::jsast::{self, ArrowBody, Expr, Stmt};
 use rcgjs_object::ptr;
 use structurizer::Region;
 
@@ -280,6 +280,7 @@ pub fn lower(
     let mut local_names = declared.clone();
     local_names.extend(param_names.iter().cloned());
     if input.opts.applies(OptimizerPass::AstDce) {
+        fuse_local_bytes_str(&mut body, &local_names);
         eliminate_dead_local_writes(&mut body, &local_names);
     }
     let mentioned = mentioned_names(&body);
@@ -468,6 +469,365 @@ fn mentioned_names(body: &[Stmt]) -> HashSet<String> {
         });
     }
     names
+}
+
+/// Eliminates intra-function `let x; x = (..., __rt.bytes_str(b, o, l))` round-trips when every
+/// read of `x` is `__rt.str_bytes(x)` or `__rt.str_len(x)`, rewriting `x` to hold
+/// `{ buf: b, off: o, len: l }`, `__rt.str_bytes(x)` to `x`, and `__rt.str_len(x)` to `x.len`.
+fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) {
+    #[derive(Default)]
+    struct LocalUsage {
+        writes: usize,
+        reads: usize,
+        disqualified: bool,
+    }
+
+    fn peel_bytes_str(expr: &Expr) -> bool {
+        let tail = match expr {
+            Expr::Seq(items) => match items.last() {
+                Some(last) => last,
+                None => return false,
+            },
+            other => other,
+        };
+        matches!(
+            tail,
+            Expr::Call(callee, args)
+                if args.len() == 3
+                    && matches!(
+                        callee.as_ref(),
+                        Expr::Member(obj, name)
+                            if name == "bytes_str" && matches!(obj.as_ref(), Expr::Ident(rt) if rt == "__rt")
+                    )
+        )
+    }
+
+    fn str_view_call_target(expr: &Expr) -> Option<(&str, &str)> {
+        let Expr::Call(callee, args) = expr else {
+            return None;
+        };
+        let [Expr::Ident(arg)] = args.as_slice() else {
+            return None;
+        };
+        let Expr::Member(obj, method) = callee.as_ref() else {
+            return None;
+        };
+        if matches!(obj.as_ref(), Expr::Ident(rt) if rt == "__rt")
+            && matches!(method.as_str(), "str_bytes" | "str_len")
+        {
+            Some((method.as_str(), arg.as_str()))
+        } else {
+            None
+        }
+    }
+
+    fn scan_expr(expr: &Expr, locals: &HashSet<String>, usage: &mut HashMap<String, LocalUsage>) {
+        if let Some((_, arg)) = str_view_call_target(expr) {
+            if locals.contains(arg) {
+                usage.entry(arg.to_owned()).or_default().reads += 1;
+            }
+            return;
+        }
+        match expr {
+            Expr::Ident(name) => {
+                if locals.contains(name) {
+                    usage.entry(name.clone()).or_default().disqualified = true;
+                }
+            }
+            Expr::Member(obj, _) => scan_expr(obj, locals, usage),
+            Expr::Index(obj, idx) => {
+                scan_expr(obj, locals, usage);
+                scan_expr(idx, locals, usage);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                scan_expr(c, locals, usage);
+                for a in args {
+                    scan_expr(a, locals, usage);
+                }
+            }
+            Expr::Unary(_, inner) => scan_expr(inner, locals, usage),
+            Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
+                scan_expr(l, locals, usage);
+                scan_expr(r, locals, usage);
+            }
+            Expr::Cond(c, t, e) => {
+                scan_expr(c, locals, usage);
+                scan_expr(t, locals, usage);
+                scan_expr(e, locals, usage);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    scan_expr(v, locals, usage);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for item in items {
+                    scan_expr(item, locals, usage);
+                }
+            }
+            Expr::Arrow(params, ArrowBody::Expr(b)) => {
+                let shadow: HashSet<String> = locals
+                    .iter()
+                    .filter(|n| !params.contains(*n))
+                    .cloned()
+                    .collect();
+                // Capturing a local in an arrow disqualifies rewriting it unless only str_* reads.
+                let mut inner_usage = HashMap::new();
+                scan_expr(b, &shadow, &mut inner_usage);
+                for (name, u) in inner_usage {
+                    if u.writes > 0 || u.reads > 0 || u.disqualified {
+                        usage.entry(name).or_default().disqualified = true;
+                    }
+                }
+            }
+            Expr::Arrow(params, ArrowBody::Block(stmts)) => {
+                let shadow: HashSet<String> = locals
+                    .iter()
+                    .filter(|n| !params.contains(*n))
+                    .cloned()
+                    .collect();
+                let mut inner_usage = HashMap::new();
+                scan_stmts(stmts, &shadow, &mut inner_usage);
+                for (name, u) in inner_usage {
+                    if u.writes > 0 || u.reads > 0 || u.disqualified {
+                        usage.entry(name).or_default().disqualified = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_stmts(
+        stmts: &[Stmt],
+        locals: &HashSet<String>,
+        usage: &mut HashMap<String, LocalUsage>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::ExprStmt(Expr::Assign(target, value)) if matches!(target.as_ref(), Expr::Ident(n) if locals.contains(n)) =>
+                {
+                    let Expr::Ident(name) = target.as_ref() else {
+                        unreachable!()
+                    };
+                    if peel_bytes_str(value) {
+                        usage.entry(name.clone()).or_default().writes += 1;
+                    } else {
+                        usage.entry(name.clone()).or_default().disqualified = true;
+                    }
+                    scan_expr(value, locals, usage);
+                }
+                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Const(_, e) => {
+                    scan_expr(e, locals, usage);
+                }
+                Stmt::Let(name, Some(init)) if locals.contains(name) => {
+                    if peel_bytes_str(init) {
+                        usage.entry(name.clone()).or_default().writes += 1;
+                    } else {
+                        usage.entry(name.clone()).or_default().disqualified = true;
+                    }
+                    scan_expr(init, locals, usage);
+                }
+                Stmt::Let(_, Some(e)) | Stmt::Return(Some(e)) => scan_expr(e, locals, usage),
+                Stmt::Lets(decls) => {
+                    for (name, init) in decls {
+                        if let Some(init) = init {
+                            if locals.contains(name) {
+                                if peel_bytes_str(init) {
+                                    usage.entry(name.clone()).or_default().writes += 1;
+                                } else {
+                                    usage.entry(name.clone()).or_default().disqualified = true;
+                                }
+                            }
+                            scan_expr(init, locals, usage);
+                        }
+                    }
+                }
+                Stmt::If(test, a, b) => {
+                    scan_expr(test, locals, usage);
+                    scan_stmts(a, locals, usage);
+                    if let Some(b) = b {
+                        scan_stmts(b, locals, usage);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    scan_expr(d, locals, usage);
+                    for c in cases {
+                        for t in &c.tests {
+                            scan_expr(t, locals, usage);
+                        }
+                        scan_stmts(&c.body, locals, usage);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    scan_stmts(std::slice::from_ref(inner.as_ref()), locals, usage);
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => scan_stmts(b, locals, usage),
+                Stmt::While(t, b) => {
+                    scan_expr(t, locals, usage);
+                    scan_stmts(b, locals, usage);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    scan_stmts(body, locals, usage);
+                    scan_stmts(handler, locals, usage);
+                }
+                Stmt::FunctionDecl { body, .. } => scan_stmts(body, locals, usage),
+                _ => {}
+            }
+        }
+    }
+
+    fn rewrite_bytes_str_rhs(expr: &mut Expr) {
+        let taken = std::mem::replace(expr, Expr::Undefined);
+        let (mut pre, tail) = match taken {
+            Expr::Seq(mut items) if !items.is_empty() => {
+                let tail = items.pop().expect("non-empty seq");
+                (items, tail)
+            }
+            other => (Vec::new(), other),
+        };
+        let slice = match super::ptr::bytes_str_args(tail) {
+            Ok((b, o, l)) => ptr::fat_slice(b, o, l),
+            Err(other) => other,
+        };
+        *expr = if pre.is_empty() {
+            slice
+        } else {
+            pre.push(slice);
+            jsast::seq(pre)
+        };
+    }
+
+    fn rewrite_expr(expr: &mut Expr, eligible: &HashSet<String>) {
+        match expr {
+            Expr::Call(callee, args) if args.len() == 1 => {
+                let method = match callee.as_ref() {
+                    Expr::Member(obj, method) if matches!(obj.as_ref(), Expr::Ident(rt) if rt == "__rt") => {
+                        Some(method.as_str())
+                    }
+                    _ => None,
+                };
+                if let (Some(method), Expr::Ident(arg)) = (method, &args[0]) {
+                    if eligible.contains(arg) {
+                        if method == "str_bytes" {
+                            *expr = Expr::Ident(arg.clone());
+                            return;
+                        }
+                        if method == "str_len" {
+                            *expr = ptr::slot_len(Expr::Ident(arg.clone()));
+                            return;
+                        }
+                    }
+                }
+                rewrite_expr(callee, eligible);
+                for a in args {
+                    rewrite_expr(a, eligible);
+                }
+            }
+            Expr::Member(obj, _) => rewrite_expr(obj, eligible),
+            Expr::Index(obj, idx) => {
+                rewrite_expr(obj, eligible);
+                rewrite_expr(idx, eligible);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                rewrite_expr(c, eligible);
+                for a in args {
+                    rewrite_expr(a, eligible);
+                }
+            }
+            Expr::Unary(_, inner) => rewrite_expr(inner, eligible),
+            Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
+                rewrite_expr(l, eligible);
+                rewrite_expr(r, eligible);
+            }
+            Expr::Cond(c, t, e) => {
+                rewrite_expr(c, eligible);
+                rewrite_expr(t, eligible);
+                rewrite_expr(e, eligible);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    rewrite_expr(v, eligible);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for item in items {
+                    rewrite_expr(item, eligible);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn rewrite_stmts(stmts: &mut [Stmt], eligible: &HashSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::ExprStmt(Expr::Assign(target, value)) if matches!(target.as_ref(), Expr::Ident(n) if eligible.contains(n)) =>
+                {
+                    rewrite_expr(value, eligible);
+                    rewrite_bytes_str_rhs(value);
+                }
+                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Const(_, e) => {
+                    rewrite_expr(e, eligible);
+                }
+                Stmt::Let(name, Some(init)) if eligible.contains(name) => {
+                    rewrite_expr(init, eligible);
+                    rewrite_bytes_str_rhs(init);
+                }
+                Stmt::Let(_, Some(e)) | Stmt::Return(Some(e)) => rewrite_expr(e, eligible),
+                Stmt::Lets(decls) => {
+                    for (name, init) in decls {
+                        if let Some(init) = init {
+                            rewrite_expr(init, eligible);
+                            if eligible.contains(name) {
+                                rewrite_bytes_str_rhs(init);
+                            }
+                        }
+                    }
+                }
+                Stmt::If(test, a, b) => {
+                    rewrite_expr(test, eligible);
+                    rewrite_stmts(a, eligible);
+                    if let Some(b) = b {
+                        rewrite_stmts(b, eligible);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    rewrite_expr(d, eligible);
+                    for c in cases {
+                        for t in &mut c.tests {
+                            rewrite_expr(t, eligible);
+                        }
+                        rewrite_stmts(&mut c.body, eligible);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    rewrite_stmts(std::slice::from_mut(inner.as_mut()), eligible);
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => rewrite_stmts(b, eligible),
+                Stmt::While(t, b) => {
+                    rewrite_expr(t, eligible);
+                    rewrite_stmts(b, eligible);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    rewrite_stmts(body, eligible);
+                    rewrite_stmts(handler, eligible);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut usage = HashMap::new();
+    scan_stmts(body, locals, &mut usage);
+    let eligible: HashSet<String> = usage
+        .into_iter()
+        .filter(|(_, u)| !u.disqualified && u.writes > 0 && u.reads > 0)
+        .map(|(name, _)| name)
+        .collect();
+    if !eligible.is_empty() {
+        rewrite_stmts(body, &eligible);
+    }
 }
 
 /// Removes assignments to compiler locals that no expression ever reads. JIR values are SSA,

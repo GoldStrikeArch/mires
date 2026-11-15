@@ -622,6 +622,9 @@ impl Intrinsic<'_, '_> {
             )
         })?;
         let ty = self.cx.ty_of(arg)?;
+        if let Some(k) = self.cx.const_scalar_i32(arg) {
+            return Ok(jsast::num(f64::from(k)));
+        }
         if self.cx.is_i64_ty(ty) {
             return Ok(self.cx.pair_of(arg)?.0);
         }

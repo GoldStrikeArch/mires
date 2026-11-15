@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 use rcgjs_object::item::{ItemMap, JsName, LinkItem, Linkage};
 use rcgjs_object::jir::semantic::BinaryOp;
 use rcgjs_object::jir::types::{TypeId, TypeKind, TypeTable};
-use rcgjs_object::jsast::{self, BinOp as JsBinOp, Expr, Stmt};
+use rcgjs_object::jsast::{self, BinOp as JsBinOp, Expr, Stmt, UnOp as JsUnOp};
 use rcgjs_object::object::ItemKind;
 
 use super::JsCx;
@@ -74,14 +74,22 @@ pub fn literal_pair(raw: u128) -> (Expr, Expr) {
     (jsast::num(f64::from(lo)), jsast::num(f64::from(hi)))
 }
 
-/// If `expr` is an integer numeric literal in signed `Int32` range, returns its `i32` value.
+/// If `expr` is an integer numeric literal in signed/unsigned 32-bit range, returns its `i32` bits.
 pub fn const_i32(expr: &Expr) -> Option<i32> {
     match expr {
         Expr::Num(n) if n.is_finite() && n.fract() == 0.0 => {
             let v = *n as i64;
-            i32::try_from(v).ok()
+            i32::try_from(v)
+                .ok()
+                .or_else(|| u32::try_from(v).ok().map(|u| u as i32))
         }
-        Expr::RawNum(s) => s.parse::<i32>().ok(),
+        Expr::RawNum(s) => s
+            .parse::<i32>()
+            .ok()
+            .or_else(|| s.parse::<u32>().ok().map(|u| u as i32)),
+        Expr::Unary(JsUnOp::Neg, inner) => const_i32(inner).map(i32::wrapping_neg),
+        Expr::Unary(JsUnOp::BitNot, inner) => const_i32(inner).map(|v| !v),
+        Expr::Binary(JsBinOp::BitOr, lhs, rhs) if const_i32(rhs) == Some(0) => const_i32(lhs),
         _ => None,
     }
 }
@@ -370,10 +378,59 @@ pub fn mul_pair(
     if const_i32(&al) == Some(1) && const_i32(&ah) == Some(0) {
         return (bl, bh);
     }
+    if let Some((var, c)) = small_mul_const(&bl, &bh)
+        .map(|c| ((al.clone(), ah.clone()), c))
+        .or_else(|| small_mul_const(&al, &ah).map(|c| ((bl.clone(), bh.clone()), c)))
+    {
+        if c.is_power_of_two() {
+            return shl_pair(cx, stmts, var, jsast::num(f64::from(c.trailing_zeros())));
+        }
+        let (vl, vh) = var;
+        let vl = materialize(cx, stmts, vl);
+        let c_expr = jsast::num(f64::from(c));
+        let a0 = jsast::binary(JsBinOp::BitAnd, vl.clone(), jsast::num(65535.0));
+        let a1 = jsast::binary(JsBinOp::UShr, vl, jsast::num(16.0));
+        let p0 = materialize(
+            cx,
+            stmts,
+            jsast::call(
+                jsast::member(jsast::id("Math"), "imul"),
+                vec![a0, c_expr.clone()],
+            ),
+        );
+        let p1_sum = jsast::binary(
+            JsBinOp::Add,
+            jsast::call(
+                jsast::member(jsast::id("Math"), "imul"),
+                vec![a1, c_expr.clone()],
+            ),
+            jsast::binary(JsBinOp::UShr, p0.clone(), jsast::num(16.0)),
+        );
+        let p1 = materialize(cx, stmts, jsast::i32_wrap(p1_sum));
+        let lo = jsast::binary(
+            JsBinOp::BitOr,
+            jsast::binary(JsBinOp::BitAnd, p0, jsast::num(65535.0)),
+            jsast::binary(JsBinOp::Shl, p1.clone(), jsast::num(16.0)),
+        );
+        let hi = jsast::i32_wrap(jsast::binary(
+            JsBinOp::Add,
+            jsast::call(jsast::member(jsast::id("Math"), "imul"), vec![vh, c_expr]),
+            jsast::binary(JsBinOp::UShr, p1, jsast::num(16.0)),
+        ));
+        return (lo, hi);
+    }
     let call = jsast::call(jsast::id(HELPER_MUL), vec![al, ah, bl, bh]);
     let (bind, lo_var) = cx.temp(call);
     stmts.push(bind);
     (lo_var, jsast::id(HELPER_HI))
+}
+
+fn small_mul_const(lo: &Expr, hi: &Expr) -> Option<u32> {
+    if const_i32(hi) != Some(0) {
+        return None;
+    }
+    let c = const_i32(lo)? as u32;
+    (c <= 0xffff).then_some(c)
 }
 
 /// Computes `(lo, hi)` for `Div` or `Rem` via `$__mires_i64_div`.
@@ -1375,6 +1432,11 @@ pub fn needed_helper_items(
                 &[HELPER_HI],
                 format!(
                     "\nfunction {HELPER_DIV}(al, ah, bl, bh, signed, rem) {{\n  \
+                     if (!signed && (ah | bh) === 0 && bl !== 0) {{\n    \
+                       const u = al >>> 0, v = bl >>> 0;\n    \
+                       {HELPER_HI} = 0;\n    \
+                       return rem ? (u % v) | 0 : ((u / v) >>> 0) | 0;\n  \
+                     }}\n  \
                      const s32 = BigInt(\"32\");\n  \
                      const a = (BigInt(signed ? ah : (ah >>> 0)) << s32) | BigInt(al >>> 0);\n  \
                      const b = (BigInt(signed ? bh : (bh >>> 0)) << s32) | BigInt(bl >>> 0);\n  \

@@ -5419,4 +5419,656 @@ fn flat_abi_i64_pair_param_with_param_cell_declares_box_instead_of_rebinding_mis
     );
 }
 
+#[test]
+fn i64_pair_fast_ops_mul_rotate_and_div_u32_fast_path() {
+    let preamble = super::i64_pair::helper_preamble_js();
+    assert!(
+        preamble.contains("if (!signed && (ah | bh) === 0 && bl !== 0)"),
+        "expected u32 fast path in HELPER_DIV:\n{preamble}"
+    );
+
+    let mut interns = world();
+    let u64_ty = TypeId(90);
+    interns.types.insert(int(u64_ty, false, 64));
+    let rot_left = interns.intern_str("rotate_left");
+    let rot_right = interns.intern_str("rotate_right");
+
+    let mut b = FuncBuilder::new(item(1), signature(vec![u64_ty], u64_ty));
+    let x = b.param(u64_ty, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let c5 = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 5, bytes: 8 }),
+        u64_ty,
+        NO_ORIGIN,
+    );
+    let c8 = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 8, bytes: 8 }),
+        u64_ty,
+        NO_ORIGIN,
+    );
+    let c31 = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 31, bytes: 4 }),
+        U32,
+        NO_ORIGIN,
+    );
+    let c33 = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 33, bytes: 4 }),
+        U32,
+        NO_ORIGIN,
+    );
+    let m5 = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Mul,
+            l: x,
+            r: c5,
+            ty: u64_ty,
+        },
+        u64_ty,
+        NO_ORIGIN,
+    );
+    let m8 = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Mul,
+            l: m5,
+            r: c8,
+            ty: u64_ty,
+        },
+        u64_ty,
+        NO_ORIGIN,
+    );
+    let rl = b.op(
+        e,
+        OpKind::Intrinsic {
+            name: rot_left,
+            types: vec![u64_ty],
+            fallback: None,
+            args: vec![m8, c31],
+        },
+        u64_ty,
+        NO_ORIGIN,
+    );
+    let rr = b.op(
+        e,
+        OpKind::Intrinsic {
+            name: rot_right,
+            types: vec![u64_ty],
+            fallback: None,
+            args: vec![rl, c33],
+        },
+        u64_ty,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(rr)));
+    let func = b.finish();
+    let plan = super::super::fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower_with(
+        &interns,
+        "fast_u64",
+        &body,
+        &func,
+        &plan,
+        straight(&func),
+        super::host::EMPTY_ITEMS,
+        &super::unsize::EMPTY_VTABLES,
+    );
+    assert!(
+        !js.contains(super::i64_pair::HELPER_MUL),
+        "small const mul must inline instead of calling HELPER_MUL:\n{js}"
+    );
+    assert!(
+        js.contains("Math.imul("),
+        "mul by 5 should inline Math.imul 16-bit split:\n{js}"
+    );
+    assert!(
+        js.contains("<< 3"),
+        "mul by 8 should lower via shift:\n{js}"
+    );
+    assert!(
+        !js.contains("& 63"),
+        "constant rotate should emit branchless Int32 shifts without & 63:\n{js}"
+    );
+}
+
+#[test]
+fn ptr_str_len_folding_bytes_str_fusion_and_single_eval_byte_ptr() {
+    let mut interns = world();
+    let raw_u8 = TypeId(91);
+    interns.types.insert(descriptor(
+        raw_u8,
+        TypeKind::RawPointer {
+            pointee: U8,
+            mutable: false,
+        },
+        4,
+    ));
+    let link = interns.intern_str("next_str");
+    let ptr_link = interns.intern_str("next_ptr");
+
+    // Direct `str_len` and `str_to_bytes` simplifications.
+    let hello = interns.intern_str("hello");
+    let mut b0 = FuncBuilder::new(item(1), signature(Vec::new(), USIZE));
+    let s_lit = b0.op(
+        FuncBuilder::ENTRY,
+        OpKind::Const(ConstTree::Str(hello)),
+        STR_REF,
+        NO_ORIGIN,
+    );
+    let len0 = b0.op(
+        FuncBuilder::ENTRY,
+        OpKind::Unary {
+            op: UnaryOp::PtrMetadata,
+            v: s_lit,
+            ty: STR_REF,
+        },
+        USIZE,
+        NO_ORIGIN,
+    );
+    b0.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(len0)));
+    let f0 = b0.finish();
+    let p0 = super::super::fuse::plan(&f0, None, &interns.types, &interns, &Opts::default());
+    let body0 = body_of(BodyKind::Function, f0.sig.clone());
+    let js0 = lower_with(
+        &interns,
+        "lit_len",
+        &body0,
+        &f0,
+        &p0,
+        straight(&f0),
+        super::host::EMPTY_ITEMS,
+        &super::unsize::EMPTY_VTABLES,
+    );
+    assert!(
+        js0.contains("return 5;") && !js0.contains("str_len"),
+        "constant string literal length must fold to 5:\n{js0}"
+    );
+
+    // Non-trivial `&str -> *const u8` evaluates `str_bytes` once and preserves `off`.
+    let mut b1 = FuncBuilder::new(item(2), signature(vec![USIZE], raw_u8));
+    let n1 = b1.param(USIZE, NO_ORIGIN);
+    let e1 = FuncBuilder::ENTRY;
+    let call_s = b1.op(
+        e1,
+        OpKind::Call {
+            callee: Callee::Direct {
+                item: item(3),
+                link_name: link,
+            },
+            function: None,
+            args: Vec::new(),
+            track_caller: None,
+            semantic: CallSemantic::Ordinary,
+            host: None,
+        },
+        STR_REF,
+        NO_ORIGIN,
+    );
+    let ptr_u8 = b1.op(
+        e1,
+        OpKind::Cast {
+            kind: CastKind::PtrToPtr,
+            v: call_s,
+            from: STR_REF,
+            to: raw_u8,
+        },
+        raw_u8,
+        NO_ORIGIN,
+    );
+    let call_p = b1.op(
+        e1,
+        OpKind::Call {
+            callee: Callee::Direct {
+                item: item(4),
+                link_name: ptr_link,
+            },
+            function: None,
+            args: vec![ptr_u8],
+            track_caller: None,
+            semantic: CallSemantic::Ordinary,
+            host: None,
+        },
+        RAW_I32,
+        NO_ORIGIN,
+    );
+    let added_p = b1.op(
+        e1,
+        OpKind::Binary {
+            op: BinaryOp::Offset,
+            l: call_p,
+            r: n1,
+            ty: RAW_I32,
+        },
+        RAW_I32,
+        NO_ORIGIN,
+    );
+    let back_u8 = b1.op(
+        e1,
+        OpKind::Cast {
+            kind: CastKind::PtrToPtr,
+            v: added_p,
+            from: RAW_I32,
+            to: raw_u8,
+        },
+        raw_u8,
+        NO_ORIGIN,
+    );
+    b1.terminate(e1, RTerm::Return(Some(back_u8)));
+    let f1 = b1.finish();
+    let p1 = super::super::fuse::plan(&f1, None, &interns.types, &interns, &Opts::default());
+    let body1 = body_of(BodyKind::Function, f1.sig.clone());
+    let js1 = lower_with(
+        &interns,
+        "str_ptr_and_offset",
+        &body1,
+        &f1,
+        &p1,
+        straight(&f1),
+        super::host::EMPTY_ITEMS,
+        &super::unsize::EMPTY_VTABLES,
+    );
+    assert_eq!(
+        js1.matches("__rt.str_bytes(").count(),
+        1,
+        "str_bytes must be evaluated once:\n{js1}"
+    );
+    assert!(
+        js1.contains(".off") && !js1.contains("off: 0"),
+        "str_to_byte_ptr must preserve sb.off:\n{js1}"
+    );
+    assert_eq!(
+        js1.matches("next_ptr(").count(),
+        1,
+        "pointer offset must evaluate non-trivial pointer operand once:\n{js1}"
+    );
+}
+
+fn add_canonical_string_types(interns: &mut Interns) -> TypeId {
+    use crate::jir::types::{AllocatorIdentity, RepresentationCandidate};
+
+    let raw_u8 = TypeId(91);
+    let raw_vec = TypeId(94);
+    let vec_u8 = TypeId(95);
+    let string_ty = TypeId(96);
+    interns.types.insert(descriptor(
+        raw_u8,
+        TypeKind::RawPointer {
+            pointee: U8,
+            mutable: false,
+        },
+        4,
+    ));
+    let ptr_name = interns.intern_str("ptr");
+    let cap_name = interns.intern_str("cap");
+    let buf_name = interns.intern_str("buf");
+    let len_name = interns.intern_str("len");
+    let vec_name = interns.intern_str("vec");
+    let rv_name = interns.intern_str("RawVec");
+    let v_name = interns.intern_str("Vec");
+    let s_name = interns.intern_str("String");
+    interns.types.insert(descriptor(
+        raw_vec,
+        TypeKind::Adt {
+            def: def(94),
+            args: Vec::new(),
+            form: NominalForm::Struct,
+            variants: vec![variant(
+                rv_name,
+                vec![
+                    field(FieldKey::Name(ptr_name), raw_u8),
+                    field(FieldKey::Name(cap_name), USIZE),
+                ],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        8,
+    ));
+    let mut vec_desc = descriptor(
+        vec_u8,
+        TypeKind::Adt {
+            def: def(95),
+            args: vec![U8],
+            form: NominalForm::Struct,
+            variants: vec![variant(
+                v_name,
+                vec![
+                    field(FieldKey::Name(buf_name), raw_vec),
+                    field(FieldKey::Name(len_name), USIZE),
+                ],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        12,
+    );
+    vec_desc.meta.candidate = RepresentationCandidate::Vec;
+    vec_desc.meta.allocator = AllocatorIdentity::Global;
+    interns.types.insert(vec_desc);
+    let mut str_desc = descriptor(
+        string_ty,
+        TypeKind::Adt {
+            def: def(96),
+            args: Vec::new(),
+            form: NominalForm::Struct,
+            variants: vec![variant(
+                s_name,
+                vec![field(FieldKey::Name(vec_name), vec_u8)],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        12,
+    );
+    str_desc.meta.candidate = RepresentationCandidate::String;
+    str_desc.meta.allocator = AllocatorIdentity::Global;
+    interns.types.insert(str_desc);
+    string_ty
+}
+
+#[test]
+fn fuse_local_bytes_str_eliminates_roundtrip_local() {
+    use crate::opts::OptimizerMode;
+
+    let mut interns = world();
+    let slice_u8 = TypeId(92);
+    interns
+        .types
+        .insert(descriptor(slice_u8, TypeKind::Slice(U8), 8));
+    let ref_slice_u8 = TypeId(93);
+    let mut ref_slice_desc = pointer(ref_slice_u8, slice_u8, PointerForm::FatSlice, false);
+    ref_slice_desc.kind = TypeKind::Reference {
+        pointee: slice_u8,
+        mutable: false,
+    };
+    interns.types.insert(ref_slice_desc);
+
+    let mut b = FuncBuilder::new(item(1), signature(vec![ref_slice_u8], USIZE));
+    let raw_bytes = b.param(ref_slice_u8, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let str_val = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PtrToPtr,
+            v: raw_bytes,
+            from: ref_slice_u8,
+            to: STR_REF,
+        },
+        STR_REF,
+        NO_ORIGIN,
+    );
+    let len = b.op(
+        e,
+        OpKind::Unary {
+            op: UnaryOp::PtrMetadata,
+            v: str_val,
+            ty: STR_REF,
+        },
+        USIZE,
+        NO_ORIGIN,
+    );
+    let back_bytes = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PtrToPtr,
+            v: str_val,
+            from: STR_REF,
+            to: ref_slice_u8,
+        },
+        ref_slice_u8,
+        NO_ORIGIN,
+    );
+    let len2 = b.op(
+        e,
+        OpKind::Unary {
+            op: UnaryOp::PtrMetadata,
+            v: back_bytes,
+            ty: ref_slice_u8,
+        },
+        USIZE,
+        NO_ORIGIN,
+    );
+    let sum = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Add,
+            l: len,
+            r: len2,
+            ty: USIZE,
+        },
+        USIZE,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(sum)));
+    let func = b.finish();
+
+    let plan = super::super::fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let opts = Opts {
+        optimizer: OptimizerMode::On,
+        ..Opts::default()
+    };
+    let name = JsName::new("sb_len".to_owned());
+    let summary = summary(&[]);
+    let input = LowerInput {
+        name: &name,
+        summary: &summary,
+        body: &body,
+        origins: None,
+        interns: &interns,
+        table: &interns.types,
+        opts: &opts,
+        items: super::host::EMPTY_ITEMS,
+        drop_glue: super::host::EMPTY_DROP_GLUE,
+        vtables: &super::unsize::EMPTY_VTABLES,
+        spills: &[],
+        abi: None,
+        physical: None,
+        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+    };
+    let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
+    let js = jsast::stmt_to_string(&lowered.decl);
+    assert!(
+        !js.contains("__rt.bytes_str")
+            && !js.contains("__rt.str_len")
+            && !js.contains("__rt.str_bytes"),
+        "expected fuse_local_bytes_str to eliminate bytes_str/str_len/str_bytes roundtrip:\n{js}"
+    );
+    assert!(
+        js.contains(".len"),
+        "expected direct .len read after fusion:\n{js}"
+    );
+}
+
+#[test]
+fn simplify_addr_zero_eq_lowers_to_ptr_is_null() {
+    let mut interns = world();
+    let raw_u8 = TypeId(91);
+    interns.types.insert(descriptor(
+        raw_u8,
+        TypeKind::RawPointer {
+            pointee: U8,
+            mutable: false,
+        },
+        4,
+    ));
+
+    let mut b = FuncBuilder::new(item(1), signature(vec![raw_u8, RAW_I32], BOOL));
+    let p_u8 = b.param(raw_u8, NO_ORIGIN);
+    let p_i32 = b.param(RAW_I32, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let zero1 = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+        USIZE,
+        NO_ORIGIN,
+    );
+    let zero2 = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+        USIZE,
+        NO_ORIGIN,
+    );
+    let a1 = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PointerExposeProvenance,
+            v: p_u8,
+            from: raw_u8,
+            to: USIZE,
+        },
+        USIZE,
+        NO_ORIGIN,
+    );
+    let a4 = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PointerExposeProvenance,
+            v: p_i32,
+            from: RAW_I32,
+            to: USIZE,
+        },
+        USIZE,
+        NO_ORIGIN,
+    );
+    let eq_null = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Eq,
+            l: a1,
+            r: zero1,
+            ty: BOOL,
+        },
+        BOOL,
+        NO_ORIGIN,
+    );
+    let ne_null = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Ne,
+            l: a4,
+            r: zero2,
+            ty: BOOL,
+        },
+        BOOL,
+        NO_ORIGIN,
+    );
+    let both = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::BitAnd,
+            l: eq_null,
+            r: ne_null,
+            ty: BOOL,
+        },
+        BOOL,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(both)));
+    let func = b.finish();
+    let plan = super::super::fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower_with(
+        &interns,
+        "check_nulls",
+        &body,
+        &func,
+        &plan,
+        straight(&func),
+        super::host::EMPTY_ITEMS,
+        &super::unsize::EMPTY_VTABLES,
+    );
+    assert!(!js.contains("__rt.addr("), "{js}");
+    assert!(js.contains("__rt.ptr_is_null("), "{js}");
+    assert!(js.contains(", 4)"), "align=4 must be preserved: {js}");
+}
+
+#[test]
+fn host_string_and_string_builder_drop_elide_baseline_conversion() {
+    use crate::jir::repr::Carrier;
+
+    let mut interns = world();
+    let string_ty = add_canonical_string_types(&mut interns);
+    let drop_name = interns.intern_str("drop_str");
+    let mut b = FuncBuilder::new(item(1), signature(vec![string_ty, string_ty], UNIT));
+    let p_host = b.param(string_ty, NO_ORIGIN);
+    let p_base = b.param(string_ty, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let host_to_base = b.op(
+        e,
+        OpKind::Convert {
+            v: p_host,
+            from: Carrier::HostString,
+            to: Carrier::Baseline,
+        },
+        string_ty,
+        NO_ORIGIN,
+    );
+    b.effect(
+        e,
+        OpKind::Drop {
+            root: Root::Value(host_to_base),
+            path: Vec::new(),
+            glue: DropGlue::Direct {
+                item: item(2),
+                link_name: drop_name,
+            },
+        },
+        NO_ORIGIN,
+    );
+    let base_to_sb = b.op(
+        e,
+        OpKind::Convert {
+            v: p_base,
+            from: Carrier::Baseline,
+            to: Carrier::StringBuilder,
+        },
+        string_ty,
+        NO_ORIGIN,
+    );
+    b.effect(
+        e,
+        OpKind::Drop {
+            root: Root::Value(base_to_sb),
+            path: Vec::new(),
+            glue: DropGlue::Direct {
+                item: item(2),
+                link_name: drop_name,
+            },
+        },
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(None));
+
+    let mut func = b.finish();
+    func.values[p_host.0 as usize].carrier = Carrier::HostString;
+    func.values[p_base.0 as usize].carrier = Carrier::Baseline;
+    func.values[host_to_base.0 as usize].carrier = Carrier::Baseline;
+    func.values[base_to_sb.0 as usize].carrier = Carrier::StringBuilder;
+
+    let plan = super::super::fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower_with(
+        &interns,
+        "drop_strings",
+        &body,
+        &func,
+        &plan,
+        straight(&func),
+        super::host::EMPTY_ITEMS,
+        &super::unsize::EMPTY_VTABLES,
+    );
+    assert!(!js.contains("convert_str_block"), "{js}");
+    assert!(!js.contains("bytes_str"), "{js}");
+    assert!(js.contains("__rt.dealloc("), "{js}");
+}
+
 mod invoke;

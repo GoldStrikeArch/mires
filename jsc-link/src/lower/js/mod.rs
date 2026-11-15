@@ -302,6 +302,22 @@ impl<'a> JsCx<'a> {
         self.func.ty(v).is_some_and(|ty| self.is_i64_ty(ty))
     }
 
+    /// Returns the low 32-bit signed-`Int32` value when `v` is defined by a constant scalar integer.
+    pub(super) fn const_scalar_i32(&self, v: ValueId) -> Option<i32> {
+        let mut cur = v;
+        for _ in 0..8 {
+            let def = self.def_of(cur)?;
+            match &def.kind {
+                OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Scalar { bits, .. }) => {
+                    return Some((*bits as u32) as i32);
+                }
+                OpKind::Copy(src) | OpKind::Move(src) => cur = *src,
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// Returns the normalized signed-`Int32` `(lo, hi)` expressions for a 64-bit SSA value.
     pub fn pair_of(&self, v: ValueId) -> Res<(Expr, Expr)> {
         if let Some(pair) = self.pair_exprs.borrow().get(&v) {
