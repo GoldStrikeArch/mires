@@ -340,6 +340,7 @@ globalThis.__rt.addr = (p, size) => {
 // says so rather than an address that wraps to null.
 globalThis.__rt._addrFree = Array.from({ length: 13 }, () => []);
 globalThis.__rt._addrHeap = new WeakMap();
+let _has_minted_addrs = false;
 globalThis.__rt._addrGone = typeof FinalizationRegistry === "function"
   ? new FinalizationRegistry((held) => {
     // `held` is the base plus its granule's exponent, which is below 16.
@@ -377,8 +378,12 @@ globalThis.__rt._addr_mint = (key, es) => {
     globalThis.__rt._addrNext = base + size;
   }
   globalThis.__rt._addrs.set(key, base);
-  if (block !== undefined) globalThis.__rt._addrHeap.set(key, k);
-  else if (globalThis.__rt._addrGone !== undefined) globalThis.__rt._addrGone.register(key, base + k);
+  if (block !== undefined) {
+    _has_minted_addrs = true;
+    globalThis.__rt._addrHeap.set(key, k);
+  } else if (globalThis.__rt._addrGone !== undefined) {
+    globalThis.__rt._addrGone.register(key, base + k);
+  }
   return base;
 };
 
@@ -389,11 +394,40 @@ globalThis.__rt._addr_mint = (key, es) => {
 // run into its neighbours'. Rust lets a reallocation move, so the old address
 // ending with it is no change of meaning.
 globalThis.__rt._addr_release = (buf, bytes) => {
+  if (!_has_minted_addrs) return;
   const k = globalThis.__rt._addrHeap.get(buf);
   if (k === undefined || (bytes !== undefined && (k === 12 || bytes <= 2 ** k))) return;
   globalThis.__rt._addrHeap.delete(buf);
   globalThis.__rt._addrFree[k].push(globalThis.__rt._addrs.get(buf));
   if (bytes !== undefined) globalThis.__rt._addrs.delete(buf);
+};
+
+// ptr_is_null(ptr, size): exact boolean `(addr(ptr, size) >>> 0) === 0`, without
+// minting a synthetic address for live `{ buf: Array, off }` pointers on the fast path.
+globalThis.__rt.ptr_is_null = (ptr, size = 1) => {
+  while (ptr !== null && ptr !== undefined && typeof ptr === "object" && ptr.pr !== undefined) {
+    size = ptr.ps;
+    ptr = ptr.pr;
+  }
+  if (typeof ptr === "number") return (ptr >>> 0) === 0;
+  if (ptr === null) return true;
+  if (ptr === undefined) return false;
+  if (typeof ptr === "object" && typeof ptr.buf === "object" && ptr.buf !== null) {
+    if (ptr.off === 0 || ptr.off === undefined) return false;
+    const step = ptr.sc !== undefined ? 1 : ptr.es === undefined ? size : ptr.es;
+    if (
+      typeof ptr.off === "number" &&
+      ptr.off >= 0 &&
+      ptr.off <= 65536 &&
+      globalThis.__rt._addrNext < 2147483648 &&
+      typeof step === "number" &&
+      step >= 0 &&
+      step <= 1024
+    ) {
+      return false;
+    }
+  }
+  return (globalThis.__rt.addr(ptr, size) >>> 0) === 0;
 };
 
 // offset_from(a, b): how many elements `a` is past `b`, for an *aggregate*
@@ -647,7 +681,7 @@ globalThis.__rt._put = (buf, off, value, heap) => {
   }
   buf[off] = value;
   // An aggregate stored into a **heap block** remembers where it lives, so that
-  // `__rt.box` hands back that place rather than inventing a buffer of one.
+  // `box` hands back that place rather than inventing a buffer of one.
   //
   // `Box<dyn Trait>` is why. Its data half is the *reference* to the concrete
   // value, which for an aggregate is the object itself, so the slot naming the
@@ -2038,7 +2072,7 @@ globalThis.__rt.dealloc = (p, size, align) => {
     _blkV = undefined;
   }
   globalThis.__rt._freed.add(buf);
-  globalThis.__rt._addr_release(buf);
+  if (_has_minted_addrs) globalThis.__rt._addr_release(buf);
   buf.length = 0;
 };
 

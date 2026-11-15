@@ -27,8 +27,10 @@ test("the extractor follows dependencies and drops unused members", () => {
 
 test("module output exports exactly the retained members", () => {
   const result = minimalShim(["__rt.log(1);"], shim, { module: true });
-  assert.match(result.source, /export const \{\n  log,\n\}/);
-  assert.doesNotMatch(result.source, /  outer,/);
+  assert.match(result.source, /let \$rt_log =/);
+  assert.match(result.source, /export \{\n  \$rt_log as log,\n\};/);
+  assert.doesNotMatch(result.source, /globalThis\.__rt/);
+  assert.doesNotMatch(result.source, /outer/);
 });
 
 test("a missing runtime member is a build error", () => {
@@ -115,4 +117,133 @@ test("manifest publication distinguishes application hooks from canonical helper
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("module mode emits lexical ESM bindings, elides unused _boxes, and deduplicates errors", async () => {
+  const { parse } = await import("acorn");
+  const fullShim = readFileSync(new URL("../runtime/shim.js", import.meta.url), "utf8");
+  const withoutBox = minimalShim(["__rt._put(b, 0, v); __rt.js_abort('x'); __rt.read_array(p, 1); __rt.array_ref(p, 1);"], fullShim, { module: true });
+  const classicWithoutBox = minimalShim(["__rt._put(b, 0, v); __rt.js_abort('x'); __rt.read_array(p, 1); __rt.array_ref(p, 1);"], fullShim);
+  assert.deepEqual(withoutBox.names, classicWithoutBox.names);
+  parse(withoutBox.source, { ecmaVersion: 2018, sourceType: "module" });
+  assert.match(withoutBox.source, /let \$rt__boxes = null;/);
+  assert.doesNotMatch(withoutBox.source, /\$rt__boxes\.(?:has|set)\(/);
+  assert.match(withoutBox.source, /const \$rt_err = \(m\) => new Error\("rustc_codegen_js: " \+ m\);/);
+  assert.match(withoutBox.source, /new Error\("rust abort: " \+ msg\)/);
+  assert.doesNotMatch(withoutBox.source, /globalThis\.__rt/);
+
+  const withBox = minimalShim(["__rt._put(b, 0, v); __rt.box(v);"], fullShim, { module: true });
+  parse(withBox.source, { ecmaVersion: 2018, sourceType: "module" });
+  assert.match(withBox.source, /let \$rt__boxes = new WeakMap\(\);/);
+  assert.match(withBox.source, /\$rt__boxes\.set\(value, \{ buf, off \}\);/);
+
+  const literalShim = `${shim}globalThis.__rt.str = () => "__rt.outer";\n`;
+  const literalMod = minimalShim(["__rt.str(); __rt.outer(1);"], literalShim, { module: true });
+  assert.match(literalMod.source, /"__rt\.outer"/);
+  assert.match(literalMod.source, /let \$rt_outer =/);
+
+  const keyedMod = minimalShim(["__rt.keyed_metrics_snapshot;"], fullShim, { module: true });
+  parse(keyedMod.source, { ecmaVersion: 2018, sourceType: "module" });
+  assert.match(keyedMod.source, /globalThis\.__rt = globalThis\.__rt \|\| \{\};/);
+  assert.match(keyedMod.source, /export const \{\n[\s\S]*  keyed_metrics_snapshot,\n[\s\S]*\} = globalThis\.__rt;/);
+  assert.doesNotMatch(keyedMod.source, /\$rt_/);
+});
+
+test("ptr_is_null matches (addr(p, 1) >>> 0) === 0 without minting on live buffers", () => {
+  const fullShim = readFileSync(new URL("../runtime/shim.js", import.meta.url), "utf8");
+  const context = vm.createContext({});
+  vm.runInContext(fullShim, context);
+  const rt = context.__rt;
+
+  const stackArr = [1, 2, 3, 4];
+  const heapPtr = rt.alloc(16, 4);
+  const dangling = rt._dangling(4);
+  const cases = [
+    0,
+    -0,
+    4294967296,
+    1,
+    4095,
+    null,
+    undefined,
+    { buf: stackArr, off: 0 },
+    { buf: stackArr, off: 3 },
+    heapPtr,
+    { pr: 0, ps: 1 },
+    { pr: null, ps: 1 },
+    { pr: { buf: stackArr, off: 0 }, ps: 4 },
+    { buf: null, off: 0 },
+    { buf: 0, off: 0 },
+    dangling,
+    { buf: dangling.buf, off: -4 },
+  ];
+  for (const ptr of cases) {
+    assert.equal(rt.ptr_is_null(ptr), (rt.addr(ptr, 1) >>> 0) === 0, `mismatch for ${String(ptr)}`);
+  }
+
+  // Fresh live pointer must not mint an address or flip _addrs membership.
+  const freshArr = [10, 20];
+  assert.equal(rt.ptr_is_null({ buf: freshArr, off: 0 }), false);
+  assert.equal(rt.ptr_is_null({ buf: freshArr, off: 1 }), false);
+  assert.equal(rt._addrs.has(freshArr), false);
+
+  // Offset-wrapped pointer reaching address 0 must fall back and return true.
+  const freshContext = vm.createContext({});
+  vm.runInContext(fullShim, freshContext);
+  const frt = freshContext.__rt;
+  assert.equal(frt.ptr_is_null({ buf: [1], off: -4096 }), true);
+
+  // Projected `.pr` must preserve `.ps` for dangling/heap negative offsets and large wraps, plus 2-arg size.
+  const d4 = frt._dangling(4);
+  const dMoved = frt.offset(d4, -1, 4);
+  const dProj = frt.prefix(dMoved, "_0", 4);
+  assert.equal(frt.ptr_is_null(dProj), true);
+  assert.equal((frt.addr(dProj, 1) >>> 0) === 0, true);
+
+  const hCtx = vm.createContext({});
+  vm.runInContext(fullShim, hCtx);
+  const hrt = hCtx.__rt;
+  const h = hrt.alloc(16, 4); // base = 4096
+  const hProj = hrt.prefix(hrt.offset(h, -1024, 4), "_0", 4);
+  assert.equal(hrt.ptr_is_null(hProj), true);
+  assert.equal((hrt.addr(hProj, 1) >>> 0) === 0, true);
+
+  const wCtx = vm.createContext({});
+  vm.runInContext(fullShim, wCtx);
+  const wrt = wCtx.__rt;
+  wrt._addrNext = 1048576;
+  const largeBuf = [1];
+  const wProj = { pr: { buf: largeBuf, off: 4095 }, ps: 1048576 };
+  assert.equal(wrt.ptr_is_null(wProj), true);
+  assert.equal((wrt.addr(wProj, 1) >>> 0) === 0, true);
+  assert.equal(wrt.ptr_is_null({ buf: largeBuf, off: 4095 }, 1048576), true);
+
+  // Poisoned provenance-less pointer must throw just like addr().
+  assert.throws(() => rt.ptr_is_null({ buf: undefined, off: NaN }), /no provenance/);
+});
+
+test("dealloc skips _addrHeap WeakMap lookup when no heap address was minted", () => {
+  const fullShim = readFileSync(new URL("../runtime/shim.js", import.meta.url), "utf8");
+  const context = vm.createContext({});
+  vm.runInContext(fullShim, context);
+  const rt = context.__rt;
+
+  let addrHeapGets = 0;
+  const origGet = rt._addrHeap.get.bind(rt._addrHeap);
+  rt._addrHeap.get = (k) => {
+    addrHeapGets += 1;
+    return origGet(k);
+  };
+
+  const p1 = rt.alloc(16, 4);
+  assert.equal(rt.ptr_is_null(p1), false);
+  rt.dealloc(p1, 16, 4);
+  assert.equal(addrHeapGets, 0);
+
+  const p2 = rt.alloc(16, 4);
+  const a2 = rt.addr(p2, 1);
+  rt.dealloc(p2, 16, 4);
+  assert.equal(addrHeapGets, 1);
+  const p3 = rt.alloc(16, 4);
+  assert.equal(rt.addr(p3, 1), a2);
 });
