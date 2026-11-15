@@ -67,7 +67,7 @@ pub(crate) use remap::Metadata;
 const PROGRAM_BUDGET_DENOMINATOR: u64 = 2000;
 
 /// A shared helper must fit within this compact declaration footprint before duplication.
-const SHARED_CALLEE_FOOTPRINT: u64 = 64;
+const SHARED_CALLEE_FOOTPRINT: u64 = 96;
 /// A `#[track_caller]` helper with an unused location parameter drops an argument at every site.
 const TRACK_CALLER_SHARED_FOOTPRINT: u64 = 84;
 
@@ -239,6 +239,7 @@ pub(crate) fn run_with_mode(
                 stats.decline("inline.cost-no-opportunity");
                 continue;
             };
+            let is_sole = sole_referrer(&site.callee, caller);
             if site.host_boundary
                 && count_item_refs(&current, &current_metadata.interns, site.callee.as_str()) != 1
             {
@@ -329,7 +330,7 @@ pub(crate) fn run_with_mode(
             // The sole-referrer oracle excludes public and explicitly rooted items. Credit
             // deletion only after the emitted caller also lost every reference to the callee,
             // including function-pointer constants and retained indirect uses in this caller.
-            let removed = if criterion == Criterion::SoleCaller && !refs.contains(&site.callee) {
+            let removed = if is_sole && !refs.contains(&site.callee) {
                 sizes.get(&site.callee).copied().unwrap_or_default()
             } else {
                 0
@@ -369,9 +370,9 @@ pub(crate) fn run_with_mode(
             // to spend the whole-program compression budget.
             let bounded_loop_virtualization = matches!(criterion, Criterion::LoopVirtualizable)
                 && iterator_step
-                && callee_bytes <= 320
-                && after <= bytes.saturating_add(96);
-            let size_limit = if criterion == Criterion::SoleCaller && net <= 0 {
+                && callee_bytes <= 560
+                && after <= bytes.saturating_add(360);
+            let size_limit = if is_sole && net <= 0 {
                 limit.max(16_384)
             } else {
                 limit
@@ -2744,5 +2745,532 @@ mod tests {
         assert_eq!(stats.applied, 0);
         assert_eq!(stats.declined.get("inline.host-boundary"), Some(&2));
         assert_eq!(prog.calls_in("f"), 2);
+    }
+
+    #[test]
+    fn loop_virtualizable_sole_caller_retains_sole_credit_and_size_limit() {
+        use crate::jir::semantic::AggregateKind;
+        const REF_I32: TypeId = TypeId(2);
+        let mut prog = Prog::new();
+        prog.interns.intern_type(TypeDescriptor {
+            id: REF_I32,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: I32,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: REF_I32,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+        let g_str = prog.strid("g");
+
+        let g_sig = Signature {
+            arguments: vec![REF_I32],
+            result: I32,
+            abi: AbiSignature {
+                parameters: 1,
+                ..AbiSignature::default()
+            },
+        };
+        let mut g_b = FuncBuilder::new(item(2), g_sig);
+        let gp = g_b.param(REF_I32, O);
+        let gv = g_b.op(FuncBuilder::ENTRY, OpKind::Deref(gp), I32, O);
+        g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(gv)));
+        let g = g_b.finish();
+
+        // Call `g(&x)` inside a self-looping block so `qualifies()` returns `LoopVirtualizable`,
+        // while `f` is also `g`'s sole referrer. Before the fix, `LoopVirtualizable` shadowed
+        // `SoleCaller`, zeroing `removed` and capping `size_limit = 2 * entry_bytes`.
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let fx = f_b.param(I32, O);
+        let cell = f_b.cell(I32, false, O);
+        let header = f_b.block();
+        let exit = f_b.block();
+        f_b.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(cell), O);
+        f_b.effect(FuncBuilder::ENTRY, OpKind::CellStore { cell, v: fx }, O);
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Goto(header, Vec::new()));
+        let rx = f_b.op(
+            header,
+            OpKind::BorrowView {
+                root: Root::Cell(cell),
+                path: Vec::new(),
+                mutable: false,
+            },
+            REF_I32,
+            O,
+        );
+        let call = f_b.op(
+            header,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: g_str,
+                },
+                function: None,
+                args: vec![rx],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        let cond = f_b.op(
+            header,
+            OpKind::Binary {
+                op: BinaryOp::Lt,
+                ty: I32,
+                l: call,
+                r: fx,
+            },
+            I32,
+            O,
+        );
+        f_b.terminate(
+            header,
+            RTerm::Switch {
+                scrut: cond,
+                scrut_ty: I32,
+                cases: vec![(0, exit, Vec::new())],
+                default: (header, Vec::new()),
+            },
+        );
+        f_b.terminate(exit, RTerm::Return(Some(call)));
+        let _keep = AggregateKind::Tuple;
+        let f = f_b.finish();
+
+        prog.add("g", g);
+        prog.add("f", f);
+        let f_name = JsName::new("f".to_owned());
+        let g_name = JsName::new("g".to_owned());
+        let interns = &prog.interns;
+        let funcs = &mut prog.funcs;
+        let interns_map: BTreeMap<JsName, &Interns> =
+            funcs.keys().map(|name| (name.clone(), interns)).collect();
+        let graph = callgraph::build(funcs, &interns_map);
+        let mut metadata = funcs
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: std::borrow::Cow::Borrowed(interns),
+                        origins: None,
+                        header: None,
+                    },
+                )
+            })
+            .collect();
+        let items = ItemIndex::new();
+        // `entry_bytes = 50` (2x limit = 100) and `after = 150` (> 100), while `g` is 200 B so
+        // sole-referrer removal yields `net = 100 - 200 = -100 <= 0` and lifts `size_limit`.
+        let sizes = BTreeMap::from([(f_name.clone(), 50), (g_name.clone(), 200)]);
+        let stats = run_with_mode(
+            funcs,
+            &mut metadata,
+            &graph,
+            &items,
+            &|_name, func, _meta| {
+                let mut refs = BTreeSet::new();
+                for op in func.blocks.iter().flat_map(|b| &b.ops) {
+                    if let OpKind::Call {
+                        callee: Callee::Direct { .. },
+                        ..
+                    } = &op.kind
+                    {
+                        refs.insert(g_name.clone());
+                    }
+                }
+                let bytes = if func.item == item(1) && refs.is_empty() {
+                    150
+                } else {
+                    50
+                };
+                Some((bytes, refs))
+            },
+            &|callee, caller| callee == &g_name && caller == &f_name,
+            &|_| true,
+            10_000,
+            &sizes,
+            false,
+        );
+        assert_eq!(
+            stats.applied, 1,
+            "sole caller inside loop must receive sole credit and lifted size limit: {:?}",
+            stats.declined
+        );
+    }
+
+    #[test]
+    fn bounded_loop_virtualization_admits_up_to_560b_iterator_step() {
+        use crate::jir::types::{FieldDescriptor, FieldKey, VariantDescriptor};
+        const PAIR: TypeId = TypeId(2);
+        const REF_MUT_PAIR: TypeId = TypeId(3);
+        const OPT_I32: TypeId = TypeId(4);
+
+        let mut prog = Prog::new();
+        let pair_name = prog.strid("Pair");
+        let none_name = prog.strid("None");
+        let some_name = prog.strid("Some");
+        let g_str = prog.strid("iter_next");
+        let empty_js_facts = |peeled: TypeId| JsFacts {
+            int: None,
+            is_indirect: false,
+            needs_clone: false,
+            crosses_transparent_union: false,
+            transparent: None,
+            peeled,
+            unsized_tail: None,
+            enum_repr: None,
+            is_primitive_enum: false,
+            pointer_form: None,
+            byte_element: false,
+            fields: Vec::new(),
+        };
+        let pair_fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Index(0),
+                ty: I32,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Index(1),
+                ty: I32,
+                offset: 4,
+            },
+        ];
+        prog.interns.intern_type(TypeDescriptor {
+            id: PAIR,
+            name: None,
+            kind: TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 10,
+                },
+                args: Vec::new(),
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: pair_name,
+                    fields: pair_fields.clone(),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                is_indirect: true,
+                needs_clone: true,
+                fields: pair_fields,
+                ..empty_js_facts(PAIR)
+            },
+        });
+        prog.interns.intern_type(TypeDescriptor {
+            id: REF_MUT_PAIR,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: PAIR,
+                mutable: true,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: empty_js_facts(REF_MUT_PAIR),
+        });
+        prog.interns.intern_type(TypeDescriptor {
+            id: OPT_I32,
+            name: None,
+            kind: TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 11,
+                },
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: none_name,
+                        fields: Vec::new(),
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: some_name,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Index(0),
+                            ty: I32,
+                            offset: 4,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: empty_js_facts(OPT_I32),
+        });
+
+        let g_sig = Signature {
+            arguments: vec![REF_MUT_PAIR],
+            result: OPT_I32,
+            abi: AbiSignature {
+                parameters: 1,
+                ..AbiSignature::default()
+            },
+        };
+        let mut g_b = FuncBuilder::new(item(2), g_sig);
+        let _self_p = g_b.param(REF_MUT_PAIR, O);
+        let ret = g_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Unit),
+            OPT_I32,
+            O,
+        );
+        g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(ret)));
+        let g = g_b.finish();
+
+        // Caller calls `iter_next` twice inside a loop; the first site pushes `growth` up, so
+        // the second site (`callee_bytes = 455`, `delta = 300`) exceeds `BUDGET_FLOOR` (384) and
+        // only passes via widened `bounded_loop_virtualization` (`<= 560` and `+360`).
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let fx = f_b.param(I32, O);
+        let header = f_b.block();
+        let exit = f_b.block();
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Goto(header, Vec::new()));
+        let pair_v = f_b.op(header, OpKind::Const(ConstTree::Unit), PAIR, O);
+        let r_pair = f_b.op(
+            header,
+            OpKind::BorrowView {
+                root: Root::Value(pair_v),
+                path: Vec::new(),
+                mutable: true,
+            },
+            REF_MUT_PAIR,
+            O,
+        );
+        for _ in 0..2 {
+            let _ = f_b.op(
+                header,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: item(2),
+                        link_name: g_str,
+                    },
+                    function: None,
+                    args: vec![r_pair],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                OPT_I32,
+                O,
+            );
+        }
+        f_b.terminate(
+            header,
+            RTerm::Switch {
+                scrut: fx,
+                scrut_ty: I32,
+                cases: vec![(0, exit, Vec::new())],
+                default: (header, Vec::new()),
+            },
+        );
+        f_b.terminate(exit, RTerm::Return(Some(fx)));
+        let f = f_b.finish();
+
+        prog.add("iter_next", g);
+        prog.add("f", f);
+        let f_name = JsName::new("f".to_owned());
+        let g_name = JsName::new("iter_next".to_owned());
+        let interns = &prog.interns;
+        let funcs = &mut prog.funcs;
+        let interns_map: BTreeMap<JsName, &Interns> =
+            funcs.keys().map(|name| (name.clone(), interns)).collect();
+        let graph = callgraph::build(funcs, &interns_map);
+        let mut metadata = funcs
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: std::borrow::Cow::Borrowed(interns),
+                        origins: None,
+                        header: None,
+                    },
+                )
+            })
+            .collect();
+        let items = ItemIndex::new();
+        let sizes = BTreeMap::from([(f_name.clone(), 1_000), (g_name.clone(), 455)]);
+        let stats = run_with_mode(
+            funcs,
+            &mut metadata,
+            &graph,
+            &items,
+            &|_name, func, _meta| {
+                let calls = func
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.ops)
+                    .filter(|op| matches!(op.kind, OpKind::Call { .. }))
+                    .count() as u64;
+                let refs = if calls > 0 {
+                    BTreeSet::from([g_name.clone()])
+                } else {
+                    BTreeSet::new()
+                };
+                // 2 calls -> 1000 B; 1 call -> 1300 B (+300); 0 calls -> 1600 B (+300).
+                let bytes = if func.item == item(1) {
+                    1_000 + (2 - calls) * 300
+                } else {
+                    455
+                };
+                Some((bytes, refs))
+            },
+            &|_, _| false,
+            &|_| true,
+            1_000,
+            &sizes,
+            false,
+        );
+        assert_eq!(
+            stats.applied, 2,
+            "widened bounded_loop_virtualization must admit 455 B / +300 B steps past budget: {:?}",
+            stats.declined
+        );
+    }
+
+    #[test]
+    fn shared_callee_footprint_up_to_96_bytes_inlines_when_shrinking() {
+        let mut prog = Prog::new();
+        let g_str = prog.strid("shared_small");
+
+        let mut g_b = FuncBuilder::new(item(2), sig(1));
+        let gx = g_b.param(I32, O);
+        let res = g_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                ty: I32,
+                l: gx,
+                r: gx,
+            },
+            I32,
+            O,
+        );
+        g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(res)));
+        let g = g_b.finish();
+
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let fx = f_b.param(I32, O);
+        let call = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: g_str,
+                },
+                function: None,
+                args: vec![fx],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+        let f = f_b.finish();
+
+        prog.add("shared_small", g);
+        prog.add("f", f);
+        let f_name = JsName::new("f".to_owned());
+        let g_name = JsName::new("shared_small".to_owned());
+        let interns = &prog.interns;
+        let funcs = &mut prog.funcs;
+        let interns_map: BTreeMap<JsName, &Interns> =
+            funcs.keys().map(|name| (name.clone(), interns)).collect();
+        let graph = callgraph::build(funcs, &interns_map);
+        let mut metadata = funcs
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: std::borrow::Cow::Borrowed(interns),
+                        origins: None,
+                        header: None,
+                    },
+                )
+            })
+            .collect();
+        let items = ItemIndex::new();
+        // Shared callee at 88 B (in 65..=96): admitted when caller shrinks (`120 -> 116`).
+        let sizes = BTreeMap::from([(f_name.clone(), 120), (g_name.clone(), 88)]);
+        let stats = run_with_mode(
+            funcs,
+            &mut metadata,
+            &graph,
+            &items,
+            &|_name, func, _meta| {
+                let mut refs = BTreeSet::new();
+                for op in func.blocks.iter().flat_map(|b| &b.ops) {
+                    if matches!(op.kind, OpKind::Call { .. }) {
+                        refs.insert(g_name.clone());
+                    }
+                }
+                let bytes = if func.item == item(1) && refs.is_empty() {
+                    116
+                } else if func.item == item(1) {
+                    120
+                } else {
+                    88
+                };
+                Some((bytes, refs))
+            },
+            &|_, _| false,
+            &|_| true,
+            10_000,
+            &sizes,
+            false,
+        );
+        assert_eq!(stats.applied, 1);
     }
 }
