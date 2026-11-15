@@ -6071,4 +6071,340 @@ fn host_string_and_string_builder_drop_elide_baseline_conversion() {
     assert!(js.contains("__rt.dealloc("), "{js}");
 }
 
+#[test]
+fn fuse_local_bytes_str_rejects_aliased_mutations_non_dominance_and_inner_fn() {
+    use rcgjs_object::jsast::{ArrowBody, BinOp, Expr, Stmt};
+    use std::collections::HashSet;
+
+    let bytes_str_call = |buf: &str| {
+        Expr::Call(
+            Box::new(Expr::Member(
+                Box::new(Expr::Ident("__rt".to_owned())),
+                "bytes_str".to_owned(),
+            )),
+            vec![Expr::Ident(buf.to_owned()), Expr::Num(0.0), Expr::Num(4.0)],
+        )
+    };
+    let str_call = |method: &str, var: &str| {
+        Expr::Call(
+            Box::new(Expr::Member(
+                Box::new(Expr::Ident("__rt".to_owned())),
+                method.to_owned(),
+            )),
+            vec![Expr::Ident(var.to_owned())],
+        )
+    };
+
+    // 1. Buffer mutation between `bytes_str` and `str_bytes` must prevent lazy slice reuse.
+    let mut mut_body = vec![
+        Stmt::ExprStmt(Expr::Assign(
+            Box::new(Expr::Ident("x".to_owned())),
+            Box::new(bytes_str_call("b")),
+        )),
+        Stmt::ExprStmt(Expr::Assign(
+            Box::new(Expr::Index(
+                Box::new(Expr::Ident("b".to_owned())),
+                Box::new(Expr::Num(0.0)),
+            )),
+            Box::new(Expr::Num(90.0)),
+        )),
+        Stmt::Return(Some(str_call("str_bytes", "x"))),
+    ];
+    let locals: HashSet<String> = ["x".to_owned()].into_iter().collect();
+    function::fuse_local_bytes_str(&mut mut_body, &locals);
+    let mut_js = mut_body
+        .iter()
+        .map(jsast::stmt_to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        mut_js.contains("__rt.bytes_str(") && mut_js.contains("__rt.str_bytes(x)"),
+        "mutation before str_bytes must prevent fusion:\n{mut_js}"
+    );
+
+    // 2. Call between `bytes_str` and `str_bytes` must prevent lazy slice reuse,
+    //    whereas a call between `bytes_str` and pure `str_len` is safe.
+    let mut call_before_bytes = vec![
+        Stmt::ExprStmt(Expr::Assign(
+            Box::new(Expr::Ident("x".to_owned())),
+            Box::new(bytes_str_call("b")),
+        )),
+        Stmt::ExprStmt(Expr::Call(
+            Box::new(Expr::Ident("mutate_b".to_owned())),
+            Vec::new(),
+        )),
+        Stmt::Return(Some(str_call("str_bytes", "x"))),
+    ];
+    function::fuse_local_bytes_str(&mut call_before_bytes, &locals);
+    let call_bytes_js = call_before_bytes
+        .iter()
+        .map(jsast::stmt_to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        call_bytes_js.contains("__rt.bytes_str(") && call_bytes_js.contains("__rt.str_bytes(x)"),
+        "call before str_bytes must prevent fusion:\n{call_bytes_js}"
+    );
+
+    let mut call_before_len = vec![
+        Stmt::ExprStmt(Expr::Assign(
+            Box::new(Expr::Ident("x".to_owned())),
+            Box::new(bytes_str_call("b")),
+        )),
+        Stmt::ExprStmt(Expr::Call(
+            Box::new(Expr::Ident("mutate_b".to_owned())),
+            Vec::new(),
+        )),
+        Stmt::Return(Some(str_call("str_len", "x"))),
+    ];
+    function::fuse_local_bytes_str(&mut call_before_len, &locals);
+    let call_len_js = call_before_len
+        .iter()
+        .map(jsast::stmt_to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !call_len_js.contains("__rt.bytes_str") && call_len_js.contains("x.len"),
+        "call before str_len should still fuse scalar len:\n{call_len_js}"
+    );
+
+    // 3. Non-dominating conditional write must prevent fusion.
+    let mut cond_body = vec![
+        Stmt::If(
+            Expr::Ident("c".to_owned()),
+            vec![Stmt::ExprStmt(Expr::Assign(
+                Box::new(Expr::Ident("x".to_owned())),
+                Box::new(bytes_str_call("b")),
+            ))],
+            None,
+        ),
+        Stmt::Return(Some(str_call("str_len", "x"))),
+    ];
+    function::fuse_local_bytes_str(&mut cond_body, &locals);
+    let cond_js = cond_body
+        .iter()
+        .map(jsast::stmt_to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        cond_js.contains("__rt.bytes_str(") && cond_js.contains("__rt.str_len(x)"),
+        "non-dominating write must prevent fusion:\n{cond_js}"
+    );
+
+    // 4. Nested FunctionDecl or Arrow capturing `x` must disqualify `x`.
+    let mut fn_decl_body = vec![
+        Stmt::FunctionDecl {
+            name: "inner".to_owned(),
+            params: Vec::new(),
+            body: vec![Stmt::Return(Some(str_call("str_len", "x")))],
+        },
+        Stmt::ExprStmt(Expr::Assign(
+            Box::new(Expr::Ident("x".to_owned())),
+            Box::new(bytes_str_call("b")),
+        )),
+        Stmt::Return(Some(Expr::Binary(
+            BinOp::Add,
+            Box::new(str_call("str_len", "x")),
+            Box::new(Expr::Call(
+                Box::new(Expr::Ident("inner".to_owned())),
+                Vec::new(),
+            )),
+        ))),
+    ];
+    function::fuse_local_bytes_str(&mut fn_decl_body, &locals);
+    let fn_decl_js = fn_decl_body
+        .iter()
+        .map(jsast::stmt_to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        fn_decl_js.contains("__rt.bytes_str(") && fn_decl_js.contains("__rt.str_len(x)"),
+        "nested FunctionDecl reading outer local must prevent fusion:\n{fn_decl_js}"
+    );
+
+    // Unused closure referencing ArrowBody::Expr to silence unused import when no Arrow test above.
+    let _ = ArrowBody::Expr(Box::new(Expr::Undefined));
+}
+
+#[test]
+fn host_string_inline_call_drop_preserves_call_and_non_adjacent_baseline_dealloc_stays() {
+    use rcgjs_object::jir::repr::Carrier;
+    use rcgjs_object::opts::OptimizerMode;
+
+    let mut interns = world();
+    let string_ty = add_canonical_string_types(&mut interns);
+    let impure_name = interns.intern_str("impure_host_str");
+    let poke_name = interns.intern_str("poke_str");
+    let drop_name = interns.intern_str("drop_str");
+
+    // Case 1: `let _ = impure_host_str();` where Convert -> Drop inlines the HostString call.
+    let mut b1 = FuncBuilder::new(item(1), signature(Vec::new(), UNIT));
+    let e1 = FuncBuilder::ENTRY;
+    let host_call = b1.op(
+        e1,
+        OpKind::Call {
+            callee: Callee::Direct {
+                item: item(2),
+                link_name: impure_name,
+            },
+            function: None,
+            args: Vec::new(),
+            semantic: CallSemantic::Ordinary,
+            host: None,
+            track_caller: None,
+        },
+        string_ty,
+        NO_ORIGIN,
+    );
+    let host_to_base = b1.op(
+        e1,
+        OpKind::Convert {
+            v: host_call,
+            from: Carrier::HostString,
+            to: Carrier::Baseline,
+        },
+        string_ty,
+        NO_ORIGIN,
+    );
+    b1.effect(
+        e1,
+        OpKind::Drop {
+            root: Root::Value(host_to_base),
+            path: Vec::new(),
+            glue: DropGlue::Direct {
+                item: item(3),
+                link_name: drop_name,
+            },
+        },
+        NO_ORIGIN,
+    );
+    b1.terminate(e1, RTerm::Return(None));
+    let mut func1 = b1.finish();
+    func1.values[host_call.0 as usize].carrier = Carrier::HostString;
+    func1.values[host_to_base.0 as usize].carrier = Carrier::Baseline;
+
+    let opts = Opts {
+        optimizer: OptimizerMode::On,
+        ..Opts::default()
+    };
+    let plan1 = super::super::fuse::plan(&func1, None, &interns.types, &interns, &opts);
+    let body1 = body_of(BodyKind::Function, func1.sig.clone());
+    let input1 = LowerInput {
+        name: &JsName::new("keep_impure_host_str".to_owned()),
+        summary: &summary(&[]),
+        body: &body1,
+        origins: None,
+        interns: &interns,
+        table: &interns.types,
+        opts: &opts,
+        items: super::host::EMPTY_ITEMS,
+        drop_glue: super::host::EMPTY_DROP_GLUE,
+        vtables: &super::unsize::EMPTY_VTABLES,
+        spills: &[],
+        abi: None,
+        physical: None,
+        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+    };
+    let js1 = jsast::stmt_to_string(
+        &function::lower(&input1, &func1, &plan1, straight(&func1))
+            .expect("lowers")
+            .decl,
+    );
+    assert!(
+        js1.contains("impure_host_str()"),
+        "impure call side effect must survive drop elision:\n{js1}"
+    );
+    assert!(!js1.contains("convert_str_block"), "{js1}");
+    assert!(!js1.contains("drop_str"), "{js1}");
+
+    // Case 2: non-adjacent BaselineDealloc (intervening call between Convert and Drop) must NOT
+    // defer `src.vec` reads past the intervening call.
+    let indirect_str_ty = TypeId(97);
+    let mut indirect_str = interns
+        .types
+        .get(string_ty)
+        .expect("string descriptor")
+        .clone();
+    indirect_str.id = indirect_str_ty;
+    indirect_str.js.is_indirect = true;
+    indirect_str.js.peeled = indirect_str_ty;
+    assert!(interns.types.insert(indirect_str));
+
+    let mut b2 = FuncBuilder::new(item(4), signature(vec![indirect_str_ty], UNIT));
+    let p_base = b2.param(indirect_str_ty, NO_ORIGIN);
+    let e2 = FuncBuilder::ENTRY;
+    let base_to_sb = b2.op(
+        e2,
+        OpKind::Convert {
+            v: p_base,
+            from: Carrier::Baseline,
+            to: Carrier::StringBuilder,
+        },
+        indirect_str_ty,
+        NO_ORIGIN,
+    );
+    let _poke = b2.op(
+        e2,
+        OpKind::Call {
+            callee: Callee::Direct {
+                item: item(5),
+                link_name: poke_name,
+            },
+            function: None,
+            args: Vec::new(),
+            semantic: CallSemantic::Ordinary,
+            host: None,
+            track_caller: None,
+        },
+        UNIT,
+        NO_ORIGIN,
+    );
+    b2.effect(
+        e2,
+        OpKind::Drop {
+            root: Root::Value(base_to_sb),
+            path: Vec::new(),
+            glue: DropGlue::Direct {
+                item: item(3),
+                link_name: drop_name,
+            },
+        },
+        NO_ORIGIN,
+    );
+    b2.terminate(e2, RTerm::Return(None));
+    let mut func2 = b2.finish();
+    func2.values[p_base.0 as usize].carrier = Carrier::Baseline;
+    func2.values[base_to_sb.0 as usize].carrier = Carrier::StringBuilder;
+
+    let plan2 = super::super::fuse::plan(&func2, None, &interns.types, &interns, &opts);
+    let body2 = body_of(BodyKind::Function, func2.sig.clone());
+    let input2 = LowerInput {
+        name: &JsName::new("non_adjacent_sb_drop".to_owned()),
+        summary: &summary(&[]),
+        body: &body2,
+        origins: None,
+        interns: &interns,
+        table: &interns.types,
+        opts: &opts,
+        items: super::host::EMPTY_ITEMS,
+        drop_glue: super::host::EMPTY_DROP_GLUE,
+        vtables: &super::unsize::EMPTY_VTABLES,
+        spills: &[],
+        abi: None,
+        physical: None,
+        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+    };
+    let js2 = jsast::stmt_to_string(
+        &function::lower(&input2, &func2, &plan2, straight(&func2))
+            .expect("lowers")
+            .decl,
+    );
+    assert!(
+        !js2.contains("__rt.dealloc(")
+            && js2.contains("__rt.bytes_str(")
+            && js2.contains("drop_str("),
+        "non-adjacent BaselineDealloc must not defer src snapshot past intervening call:\n{js2}"
+    );
+}
+
 mod invoke;

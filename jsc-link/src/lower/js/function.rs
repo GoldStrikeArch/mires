@@ -280,7 +280,12 @@ pub fn lower(
     let mut local_names = declared.clone();
     local_names.extend(param_names.iter().cloned());
     if input.opts.applies(OptimizerPass::AstDce) {
-        fuse_local_bytes_str(&mut body, &local_names);
+        let uninit_locals: HashSet<String> = declarations
+            .iter()
+            .filter(|(_, init)| init.is_none())
+            .map(|(name, _)| name.clone())
+            .collect();
+        fuse_local_bytes_str(&mut body, &uninit_locals);
         eliminate_dead_local_writes(&mut body, &local_names);
     }
     let mentioned = mentioned_names(&body);
@@ -474,11 +479,12 @@ fn mentioned_names(body: &[Stmt]) -> HashSet<String> {
 /// Eliminates intra-function `let x; x = (..., __rt.bytes_str(b, o, l))` round-trips when every
 /// read of `x` is `__rt.str_bytes(x)` or `__rt.str_len(x)`, rewriting `x` to hold
 /// `{ buf: b, off: o, len: l }`, `__rt.str_bytes(x)` to `x`, and `__rt.str_len(x)` to `x.len`.
-fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) {
+pub(super) fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) {
     #[derive(Default)]
     struct LocalUsage {
         writes: usize,
         reads: usize,
+        str_bytes_reads: usize,
         disqualified: bool,
     }
 
@@ -522,9 +528,13 @@ fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) {
     }
 
     fn scan_expr(expr: &Expr, locals: &HashSet<String>, usage: &mut HashMap<String, LocalUsage>) {
-        if let Some((_, arg)) = str_view_call_target(expr) {
+        if let Some((method, arg)) = str_view_call_target(expr) {
             if locals.contains(arg) {
-                usage.entry(arg.to_owned()).or_default().reads += 1;
+                let entry = usage.entry(arg.to_owned()).or_default();
+                entry.reads += 1;
+                if method == "str_bytes" {
+                    entry.str_bytes_reads += 1;
+                }
             }
             return;
         }
@@ -571,7 +581,7 @@ fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) {
                     .filter(|n| !params.contains(*n))
                     .cloned()
                     .collect();
-                // Capturing a local in an arrow disqualifies rewriting it unless only str_* reads.
+                // Capturing a local in an arrow disqualifies rewriting it because rewrites stay local.
                 let mut inner_usage = HashMap::new();
                 scan_expr(b, &shadow, &mut inner_usage);
                 for (name, u) in inner_usage {
@@ -667,14 +677,326 @@ fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) {
                     scan_expr(t, locals, usage);
                     scan_stmts(b, locals, usage);
                 }
-                Stmt::TryCatch { body, handler, .. } => {
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    if locals.contains(binding) {
+                        usage.entry(binding.clone()).or_default().disqualified = true;
+                    }
                     scan_stmts(body, locals, usage);
                     scan_stmts(handler, locals, usage);
                 }
-                Stmt::FunctionDecl { body, .. } => scan_stmts(body, locals, usage),
+                Stmt::FunctionDecl { params, body, .. } => {
+                    let shadow: HashSet<String> = locals
+                        .iter()
+                        .filter(|n| !params.contains(*n))
+                        .cloned()
+                        .collect();
+                    let mut inner_usage = HashMap::new();
+                    scan_stmts(body, &shadow, &mut inner_usage);
+                    for (name, u) in inner_usage {
+                        if u.writes > 0 || u.reads > 0 || u.disqualified {
+                            usage.entry(name).or_default().disqualified = true;
+                        }
+                    }
+                }
                 _ => {}
             }
         }
+    }
+
+    fn count_reads_in_expr(expr: &Expr, target: &str) -> usize {
+        if let Some((_, arg)) = str_view_call_target(expr) {
+            return usize::from(arg == target);
+        }
+        match expr {
+            Expr::Member(obj, _) | Expr::Unary(_, obj) => count_reads_in_expr(obj, target),
+            Expr::Index(obj, idx)
+            | Expr::Binary(_, obj, idx)
+            | Expr::Assign(obj, idx)
+            | Expr::CompoundAssign(_, obj, idx) => {
+                count_reads_in_expr(obj, target) + count_reads_in_expr(idx, target)
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                count_reads_in_expr(c, target)
+                    + args
+                        .iter()
+                        .map(|a| count_reads_in_expr(a, target))
+                        .sum::<usize>()
+            }
+            Expr::Cond(c, t, e) => {
+                count_reads_in_expr(c, target)
+                    + count_reads_in_expr(t, target)
+                    + count_reads_in_expr(e, target)
+            }
+            Expr::Object(entries) => entries
+                .iter()
+                .map(|(_, v)| count_reads_in_expr(v, target))
+                .sum(),
+            Expr::Array(items) | Expr::Seq(items) => {
+                items.iter().map(|x| count_reads_in_expr(x, target)).sum()
+            }
+            _ => 0,
+        }
+    }
+
+    fn count_reads_in_stmts(stmts: &[Stmt], target: &str) -> usize {
+        let mut total = 0;
+        for stmt in stmts {
+            match stmt {
+                Stmt::ExprStmt(e)
+                | Stmt::Throw(e)
+                | Stmt::Const(_, e)
+                | Stmt::Let(_, Some(e))
+                | Stmt::Return(Some(e)) => total += count_reads_in_expr(e, target),
+                Stmt::Lets(decls) => {
+                    for (_, init) in decls {
+                        if let Some(e) = init {
+                            total += count_reads_in_expr(e, target);
+                        }
+                    }
+                }
+                Stmt::If(test, a, b) => {
+                    total += count_reads_in_expr(test, target)
+                        + count_reads_in_stmts(a, target)
+                        + b.as_deref().map_or(0, |s| count_reads_in_stmts(s, target));
+                }
+                Stmt::Switch(d, cases) => {
+                    total += count_reads_in_expr(d, target);
+                    for c in cases {
+                        total += c
+                            .tests
+                            .iter()
+                            .map(|t| count_reads_in_expr(t, target))
+                            .sum::<usize>();
+                        total += count_reads_in_stmts(&c.body, target);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    total += count_reads_in_stmts(std::slice::from_ref(inner.as_ref()), target);
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                    total += count_reads_in_stmts(b, target);
+                }
+                Stmt::While(t, b) => {
+                    total += count_reads_in_expr(t, target) + count_reads_in_stmts(b, target);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    total +=
+                        count_reads_in_stmts(body, target) + count_reads_in_stmts(handler, target);
+                }
+                _ => {}
+            }
+        }
+        total
+    }
+
+    fn stmt_writes_target(stmt: &Stmt, target: &str) -> bool {
+        match stmt {
+            Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+                matches!(lhs.as_ref(), Expr::Ident(n) if n == target) && peel_bytes_str(rhs)
+            }
+            Stmt::Let(name, Some(init)) => name == target && peel_bytes_str(init),
+            Stmt::Lets(decls) => decls
+                .iter()
+                .any(|(name, init)| name == target && init.as_ref().is_some_and(peel_bytes_str)),
+            _ => false,
+        }
+    }
+
+    fn expr_is_pure_until_last_str_bytes(expr: &Expr, target: &str, remaining: &mut usize) -> bool {
+        if *remaining == 0 {
+            return true;
+        }
+        if let Some((method, arg)) = str_view_call_target(expr) {
+            if arg == target {
+                if method == "str_bytes" {
+                    *remaining = remaining.saturating_sub(1);
+                }
+                return true;
+            }
+        }
+        match expr {
+            Expr::Num(_)
+            | Expr::RawNum(_)
+            | Expr::BigInt(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Undefined
+            | Expr::Null
+            | Expr::Ident(_)
+            | Expr::Arrow(..) => true,
+            Expr::Member(obj, _) | Expr::Unary(_, obj) => {
+                expr_is_pure_until_last_str_bytes(obj, target, remaining)
+            }
+            Expr::Index(obj, idx) | Expr::Binary(_, obj, idx) => {
+                expr_is_pure_until_last_str_bytes(obj, target, remaining)
+                    && expr_is_pure_until_last_str_bytes(idx, target, remaining)
+            }
+            Expr::Cond(c, t, e) => {
+                if !expr_is_pure_until_last_str_bytes(c, target, remaining) {
+                    return false;
+                }
+                if *remaining == 0 {
+                    return true;
+                }
+                // Disallow impure calls/writes on either arm while str_bytes reads remain.
+                let mut rem_t = *remaining;
+                let mut rem_e = *remaining;
+                let ok_t = expr_is_pure_until_last_str_bytes(t, target, &mut rem_t);
+                let ok_e = expr_is_pure_until_last_str_bytes(e, target, &mut rem_e);
+                *remaining =
+                    (*remaining).saturating_sub((*remaining - rem_t) + (*remaining - rem_e));
+                ok_t && ok_e && *remaining == 0
+            }
+            Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
+                let lhs_pure = match lhs.as_ref() {
+                    Expr::Ident(_) => true,
+                    Expr::Member(obj, _) => {
+                        expr_is_pure_until_last_str_bytes(obj, target, remaining)
+                    }
+                    Expr::Index(obj, idx) => {
+                        expr_is_pure_until_last_str_bytes(obj, target, remaining)
+                            && expr_is_pure_until_last_str_bytes(idx, target, remaining)
+                    }
+                    _ => false,
+                };
+                if !lhs_pure {
+                    return false;
+                }
+                if !expr_is_pure_until_last_str_bytes(rhs, target, remaining) {
+                    return false;
+                }
+                // A Member/Index store executes after evaluating lhs and rhs; unsafe if any
+                // str_bytes(target) still runs later.
+                !matches!(lhs.as_ref(), Expr::Member(..) | Expr::Index(..)) || *remaining == 0
+            }
+            Expr::Call(callee, args) | Expr::New(callee, args) => {
+                if !expr_is_pure_until_last_str_bytes(callee, target, remaining) {
+                    return false;
+                }
+                for a in args {
+                    if !expr_is_pure_until_last_str_bytes(a, target, remaining) {
+                        return false;
+                    }
+                }
+                *remaining == 0
+            }
+            Expr::Object(entries) => entries
+                .iter()
+                .all(|(_, v)| expr_is_pure_until_last_str_bytes(v, target, remaining)),
+            Expr::Array(items) | Expr::Seq(items) => items
+                .iter()
+                .all(|x| expr_is_pure_until_last_str_bytes(x, target, remaining)),
+            Expr::Raw(_) => false,
+        }
+    }
+
+    fn stmts_is_pure_until_last_str_bytes(
+        stmts: &[Stmt],
+        target: &str,
+        remaining: &mut usize,
+    ) -> bool {
+        for stmt in stmts {
+            if *remaining == 0 {
+                return true;
+            }
+            let ok = match stmt {
+                Stmt::ExprStmt(e)
+                | Stmt::Throw(e)
+                | Stmt::Const(_, e)
+                | Stmt::Let(_, Some(e))
+                | Stmt::Return(Some(e)) => expr_is_pure_until_last_str_bytes(e, target, remaining),
+                Stmt::Let(_, None)
+                | Stmt::Return(None)
+                | Stmt::Break(_)
+                | Stmt::Continue(_)
+                | Stmt::Import { .. }
+                | Stmt::Comment(_)
+                | Stmt::Loc(_) => true,
+                Stmt::Lets(decls) => decls.iter().all(|(_, init)| {
+                    init.as_ref()
+                        .is_none_or(|e| expr_is_pure_until_last_str_bytes(e, target, remaining))
+                }),
+                Stmt::Block(b) => stmts_is_pure_until_last_str_bytes(b, target, remaining),
+                Stmt::Labeled(_, inner) => stmts_is_pure_until_last_str_bytes(
+                    std::slice::from_ref(inner.as_ref()),
+                    target,
+                    remaining,
+                ),
+                Stmt::If(..)
+                | Stmt::Switch(..)
+                | Stmt::LoopForever(..)
+                | Stmt::While(..)
+                | Stmt::TryCatch { .. }
+                | Stmt::FunctionDecl { .. }
+                | Stmt::Raw(_) => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        *remaining == 0
+    }
+
+    fn write_dominates_and_safe(
+        stmts: &[Stmt],
+        target: &str,
+        total_reads: usize,
+        str_bytes_reads: usize,
+    ) -> Option<bool> {
+        for (idx, stmt) in stmts.iter().enumerate() {
+            if stmt_writes_target(stmt, target) {
+                let tail = &stmts[idx + 1..];
+                if count_reads_in_stmts(tail, target) != total_reads {
+                    return Some(false);
+                }
+                if str_bytes_reads == 0 {
+                    return Some(true);
+                }
+                let mut remaining = str_bytes_reads;
+                return Some(stmts_is_pure_until_last_str_bytes(
+                    tail,
+                    target,
+                    &mut remaining,
+                ));
+            }
+            let nested = match stmt {
+                Stmt::If(_, a, b) => {
+                    write_dominates_and_safe(a, target, total_reads, str_bytes_reads).or_else(
+                        || {
+                            b.as_deref().and_then(|s| {
+                                write_dominates_and_safe(s, target, total_reads, str_bytes_reads)
+                            })
+                        },
+                    )
+                }
+                Stmt::Switch(_, cases) => cases.iter().find_map(|c| {
+                    write_dominates_and_safe(&c.body, target, total_reads, str_bytes_reads)
+                }),
+                Stmt::Labeled(_, inner) => write_dominates_and_safe(
+                    std::slice::from_ref(inner.as_ref()),
+                    target,
+                    total_reads,
+                    str_bytes_reads,
+                ),
+                Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
+                    write_dominates_and_safe(b, target, total_reads, str_bytes_reads)
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    write_dominates_and_safe(body, target, total_reads, str_bytes_reads).or_else(
+                        || write_dominates_and_safe(handler, target, total_reads, str_bytes_reads),
+                    )
+                }
+                _ => None,
+            };
+            if nested.is_some() {
+                return nested;
+            }
+        }
+        None
     }
 
     fn rewrite_bytes_str_rhs(expr: &mut Expr) {
@@ -822,7 +1144,12 @@ fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) {
     scan_stmts(body, locals, &mut usage);
     let eligible: HashSet<String> = usage
         .into_iter()
-        .filter(|(_, u)| !u.disqualified && u.writes > 0 && u.reads > 0)
+        .filter(|(name, u)| {
+            !u.disqualified
+                && u.writes == 1
+                && u.reads > 0
+                && write_dominates_and_safe(body, name, u.reads, u.str_bytes_reads) == Some(true)
+        })
         .map(|(name, _)| name)
         .collect();
     if !eligible.is_empty() {

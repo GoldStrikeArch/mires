@@ -599,15 +599,25 @@ impl JsCx<'_> {
                 }
                 match self.dropped_string_kind(*value) {
                     Some(emit::DroppedStringKind::NoOp) => {
-                        if self.func.values.get(value.0 as usize).map(|d| d.carrier)
-                            == Some(Carrier::HostString)
-                            || self.only_used_by_empty_drop(*value)
-                        {
-                            return Ok(Lowered::Done(Vec::new()));
+                        let is_host_str = self.func.values.get(value.0 as usize).map(|d| d.carrier)
+                            == Some(Carrier::HostString);
+                        if is_host_str || self.only_used_by_empty_drop(*value) {
+                            let mut stmts = Vec::new();
+                            if self.is_inline(*value) {
+                                let target = match self.def_of(*value).map(|op| &op.kind) {
+                                    Some(OpKind::Convert { v: src, .. }) => *src,
+                                    _ => *value,
+                                };
+                                let expr = self.expr_of(target)?;
+                                if !jsast::is_droppable(&expr) {
+                                    stmts.push(jsast::expr_stmt(expr));
+                                }
+                            }
+                            return Ok(Lowered::Done(stmts));
                         }
                     }
                     Some(emit::DroppedStringKind::BaselineDealloc { src, layout })
-                        if self.only_used_by_empty_drop(*value) =>
+                        if self.is_inline(*value) || self.only_used_by_adjacent_drop(*value) =>
                     {
                         let src_expr = self.expr_of(src)?;
                         let mut stmts = Vec::new();

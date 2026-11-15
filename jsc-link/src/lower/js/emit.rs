@@ -1370,11 +1370,25 @@ impl<'a> JsCx<'a> {
                 if self.is_inline(result) {
                     return Ok(Vec::new());
                 }
-                if matches!(op.kind, OpKind::Convert { .. })
-                    && self.dropped_string_kind(result).is_some()
-                    && self.only_used_by_empty_drop(result)
+                if let (OpKind::Convert { v: src, .. }, Some(kind)) =
+                    (&op.kind, self.dropped_string_kind(result))
                 {
-                    return Ok(Vec::new());
+                    let skip = match kind {
+                        DroppedStringKind::NoOp => self.only_used_by_empty_drop(result),
+                        DroppedStringKind::BaselineDealloc { .. } => {
+                            self.only_used_by_adjacent_drop(result)
+                        }
+                    };
+                    if skip {
+                        let mut stmts = Vec::new();
+                        if matches!(kind, DroppedStringKind::NoOp) && self.is_inline(*src) {
+                            let expr = self.expr_of(*src)?;
+                            if !jsast::is_droppable(&expr) {
+                                stmts.push(jsast::expr_stmt(expr));
+                            }
+                        }
+                        return Ok(stmts);
+                    }
                 }
                 let expr = self.op_expr(op, result)?;
                 self.record_allocation_origin(result, &expr);
@@ -2180,6 +2194,31 @@ impl<'a> JsCx<'a> {
             }
         }
         drops >= 1
+    }
+
+    pub(super) fn only_used_by_adjacent_drop(&self, v: ValueId) -> bool {
+        let mut drops = 0usize;
+        let mut adjacent = false;
+        for block in &self.func.blocks {
+            for (idx, op) in block.ops.iter().enumerate() {
+                match &op.kind {
+                    OpKind::Drop {
+                        root: Root::Value(r),
+                        path,
+                        ..
+                    } if path.is_empty() && *r == v => {
+                        drops += 1;
+                        adjacent = idx > 0 && block.ops[idx - 1].result == Some(v);
+                    }
+                    kind if kind.uses().contains(&v) => return false,
+                    _ => {}
+                }
+            }
+            if block.term.uses().contains(&v) {
+                return false;
+            }
+        }
+        drops == 1 && adjacent
     }
 
     pub(super) fn dropped_string_kind(&self, v: ValueId) -> Option<DroppedStringKind> {

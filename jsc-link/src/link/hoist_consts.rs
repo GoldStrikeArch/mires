@@ -12,9 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::item::{item_map, ItemKind, JsItem, JsName, LinkItem, Linkage};
 use crate::jir::decline::Decline;
+use crate::jir::semantic::{CallSemantic, Callee, HostPayload, Terminator};
 use crate::jir::types::{
     FieldKey, NominalAbi, NominalForm, PinnedBoundary, TypeId, TypeKind, TypeTable,
 };
+use crate::jir::{DefinitionId, Interns, ItemId};
 use crate::jsast::{self, ArrowBody, BinOp, Expr, Stmt, SwitchCase, UnOp};
 use crate::lower::LoweredItem;
 use crate::opt::OptStats;
@@ -1129,48 +1131,244 @@ struct ProgramExclusions {
     boundary_variants: BTreeSet<String>,
 }
 
+fn decode_js_escape(text: &str, i: &mut usize, out: &mut String) {
+    let bytes = text.as_bytes();
+    if *i >= bytes.len() {
+        return;
+    }
+    match bytes[*i] {
+        b'\\' => {
+            out.push('\\');
+            *i += 1;
+        }
+        b'"' => {
+            out.push('"');
+            *i += 1;
+        }
+        b'\'' => {
+            out.push('\'');
+            *i += 1;
+        }
+        b'`' => {
+            out.push('`');
+            *i += 1;
+        }
+        b'n' => {
+            out.push('\n');
+            *i += 1;
+        }
+        b'r' => {
+            out.push('\r');
+            *i += 1;
+        }
+        b't' => {
+            out.push('\t');
+            *i += 1;
+        }
+        b'b' => {
+            out.push('\u{0008}');
+            *i += 1;
+        }
+        b'f' => {
+            out.push('\u{000C}');
+            *i += 1;
+        }
+        b'v' => {
+            out.push('\u{000B}');
+            *i += 1;
+        }
+        b'0' if !bytes.get(*i + 1).is_some_and(|c| c.is_ascii_digit()) => {
+            out.push('\0');
+            *i += 1;
+        }
+        b'\r' => {
+            *i += 1;
+            if bytes.get(*i) == Some(&b'\n') {
+                *i += 1;
+            }
+        }
+        b'\n' => {
+            *i += 1;
+        }
+        b'x' if *i + 3 <= bytes.len()
+            && bytes[*i + 1].is_ascii_hexdigit()
+            && bytes[*i + 2].is_ascii_hexdigit() =>
+        {
+            if let Ok(v) = u32::from_str_radix(&text[*i + 1..*i + 3], 16) {
+                if let Some(ch) = char::from_u32(v) {
+                    out.push(ch);
+                }
+                *i += 3;
+            } else {
+                out.push('x');
+                *i += 1;
+            }
+        }
+        b'u' => {
+            if bytes.get(*i + 1) == Some(&b'{') {
+                let mut end = *i + 2;
+                while end < bytes.len() && bytes[end].is_ascii_hexdigit() {
+                    end += 1;
+                }
+                if end > *i + 2 && bytes.get(end) == Some(&b'}') {
+                    if let Ok(v) = u32::from_str_radix(&text[*i + 2..end], 16) {
+                        if let Some(ch) = char::from_u32(v) {
+                            out.push(ch);
+                        }
+                        *i = end + 1;
+                        return;
+                    }
+                }
+            } else if *i + 5 <= bytes.len()
+                && bytes[*i + 1..*i + 5].iter().all(u8::is_ascii_hexdigit)
+            {
+                if let Ok(code) = u32::from_str_radix(&text[*i + 1..*i + 5], 16) {
+                    *i += 5;
+                    if (0xD800..=0xDBFF).contains(&code)
+                        && *i + 6 <= bytes.len()
+                        && bytes[*i] == b'\\'
+                        && bytes[*i + 1] == b'u'
+                        && bytes[*i + 2..*i + 6].iter().all(u8::is_ascii_hexdigit)
+                    {
+                        if let Ok(lo) = u32::from_str_radix(&text[*i + 2..*i + 6], 16) {
+                            if (0xDC00..=0xDFFF).contains(&lo) {
+                                let combined = 0x10000 + ((code - 0xD800) << 10) + (lo - 0xDC00);
+                                if let Some(ch) = char::from_u32(combined) {
+                                    out.push(ch);
+                                }
+                                *i += 6;
+                                return;
+                            }
+                        }
+                    }
+                    if let Some(ch) = char::from_u32(code) {
+                        out.push(ch);
+                    }
+                    return;
+                }
+            }
+            out.push('u');
+            *i += 1;
+        }
+        _ => {
+            if let Some(ch) = text[*i..].chars().next() {
+                out.push(ch);
+                *i += ch.len_utf8();
+            } else {
+                *i += 1;
+            }
+        }
+    }
+}
+
+fn collect_js_text_span(
+    text: &str,
+    i: &mut usize,
+    stop_on_close_brace: bool,
+    tokens: &mut BTreeSet<String>,
+    strings: &mut BTreeSet<String>,
+) {
+    let bytes = text.as_bytes();
+    let mut brace_depth = 0usize;
+    while *i < bytes.len() {
+        let b = bytes[*i];
+        if b == b'/' && bytes.get(*i + 1) == Some(&b'/') {
+            *i += 2;
+            while *i < bytes.len() && bytes[*i] != b'\n' && bytes[*i] != b'\r' {
+                *i += 1;
+            }
+        } else if b == b'/' && bytes.get(*i + 1) == Some(&b'*') {
+            *i += 2;
+            while *i + 1 < bytes.len() && !(bytes[*i] == b'*' && bytes[*i + 1] == b'/') {
+                *i += 1;
+            }
+            *i = (*i + 2).min(bytes.len());
+        } else if stop_on_close_brace && b == b'{' {
+            brace_depth += 1;
+            *i += 1;
+        } else if stop_on_close_brace && b == b'}' {
+            if brace_depth == 0 {
+                *i += 1;
+                return;
+            }
+            brace_depth -= 1;
+            *i += 1;
+        } else if b.is_ascii_alphabetic() || b == b'_' || b == b'$' {
+            let start = *i;
+            *i += 1;
+            while *i < bytes.len()
+                && (bytes[*i].is_ascii_alphanumeric() || bytes[*i] == b'_' || bytes[*i] == b'$')
+            {
+                *i += 1;
+            }
+            tokens.insert(text[start..*i].to_owned());
+        } else if b == b'"' || b == b'\'' {
+            let quote = b;
+            *i += 1;
+            let mut decoded = String::new();
+            while *i < bytes.len() && bytes[*i] != quote {
+                if bytes[*i] == b'\\' {
+                    *i += 1;
+                    decode_js_escape(text, i, &mut decoded);
+                } else if bytes[*i] < 0x80 {
+                    decoded.push(bytes[*i] as char);
+                    *i += 1;
+                } else if let Some(ch) = text[*i..].chars().next() {
+                    decoded.push(ch);
+                    *i += ch.len_utf8();
+                } else {
+                    *i += 1;
+                }
+            }
+            strings.insert(decoded);
+            if *i < bytes.len() {
+                *i += 1;
+            }
+        } else if b == b'`' {
+            *i += 1;
+            let mut decoded = String::new();
+            let mut has_interp = false;
+            while *i < bytes.len() && bytes[*i] != b'`' {
+                if bytes[*i] == b'\\' {
+                    *i += 1;
+                    decode_js_escape(text, i, &mut decoded);
+                } else if bytes[*i] == b'$' && bytes.get(*i + 1) == Some(&b'{') {
+                    has_interp = true;
+                    *i += 2;
+                    collect_js_text_span(text, i, true, tokens, strings);
+                } else if bytes[*i] < 0x80 {
+                    decoded.push(bytes[*i] as char);
+                    *i += 1;
+                } else if let Some(ch) = text[*i..].chars().next() {
+                    decoded.push(ch);
+                    *i += ch.len_utf8();
+                } else {
+                    *i += 1;
+                }
+            }
+            if !has_interp {
+                strings.insert(decoded);
+            }
+            if *i < bytes.len() {
+                *i += 1;
+            }
+        } else if b < 0x80 {
+            *i += 1;
+        } else if let Some(ch) = text[*i..].chars().next() {
+            *i += ch.len_utf8();
+        } else {
+            *i += 1;
+        }
+    }
+}
+
 fn collect_js_text_tokens_and_strings(
     text: &str,
     tokens: &mut BTreeSet<String>,
     strings: &mut BTreeSet<String>,
 ) {
-    let bytes = text.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b.is_ascii_alphabetic() || b == b'_' || b == b'$' {
-            let start = i;
-            i += 1;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
-            {
-                i += 1;
-            }
-            tokens.insert(text[start..i].to_owned());
-        } else if b == b'"' || b == b'\'' {
-            let quote = b;
-            i += 1;
-            let start = i;
-            let mut has_escape = false;
-            while i < bytes.len() && bytes[i] != quote {
-                if bytes[i] == b'\\' {
-                    has_escape = true;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            let end = i.min(bytes.len());
-            if !has_escape {
-                strings.insert(text[start..end].to_owned());
-            }
-            if i < bytes.len() {
-                i += 1;
-            }
-        } else {
-            i += 1;
-        }
-    }
+    collect_js_text_span(text, &mut i, false, tokens, strings);
 }
 
 fn collect_raw_from_stmts(
@@ -1285,91 +1483,190 @@ fn collect_raw_from_expr(
     }
 }
 
-fn walk_boundary_type(
-    ty: TypeId,
-    types: &TypeTable,
-    interns: &crate::jir::Interns,
-    visited: &mut BTreeSet<TypeId>,
-    fields: &mut BTreeSet<String>,
-    variants: &mut BTreeSet<String>,
-) {
-    if !visited.insert(ty) {
-        return;
+struct BoundaryWalkCtx<'a> {
+    items_by_id: BTreeMap<ItemId, &'a LinkItem>,
+    items_by_def: BTreeMap<DefinitionId, Vec<&'a LinkItem>>,
+    visited_types: BTreeSet<(usize, TypeId)>,
+    visited_items: BTreeSet<JsName>,
+    fields: BTreeSet<String>,
+    variants: BTreeSet<String>,
+}
+
+impl<'a> BoundaryWalkCtx<'a> {
+    fn new(table: &'a BTreeMap<JsName, LinkItem>) -> Self {
+        let mut items_by_id = BTreeMap::new();
+        let mut items_by_def: BTreeMap<DefinitionId, Vec<&'a LinkItem>> = BTreeMap::new();
+        for item in table.values() {
+            if let Some(id) = item
+                .jir
+                .summary
+                .as_ref()
+                .and_then(|s| s.key.item)
+                .or_else(|| item.jir.body.as_ref().map(|b| b.item))
+            {
+                items_by_id.entry(id).or_insert(item);
+                items_by_def.entry(id.definition).or_default().push(item);
+            }
+        }
+        Self {
+            items_by_id,
+            items_by_def,
+            visited_types: BTreeSet::new(),
+            visited_items: BTreeSet::new(),
+            fields: BTreeSet::new(),
+            variants: BTreeSet::new(),
+        }
     }
-    let Some(desc) = types.get(ty) else {
-        return;
-    };
-    match &desc.kind {
-        TypeKind::Adt {
-            form,
-            variants: adt_variants,
-            args,
-            ..
-        } => {
-            for v in adt_variants {
-                if *form == NominalForm::Enum {
-                    if let Some(name) = interns.str(v.name) {
-                        variants.insert(name.to_owned());
-                    }
-                }
-                for f in &v.fields {
-                    if let FieldKey::Name(id) = f.key {
-                        if let Some(name) = interns.str(id) {
-                            fields.insert(name.to_owned());
+
+    fn walk_item_signature(&mut self, item: &'a LinkItem) {
+        if !self.visited_items.insert(item.name.clone()) {
+            return;
+        }
+        let (Some(interns), Some(body)) = (item.jir.interns(), &item.jir.body) else {
+            return;
+        };
+        for &arg_ty in &body.signature.arguments {
+            self.walk_type(arg_ty, interns);
+        }
+        self.walk_type(body.signature.result, interns);
+    }
+
+    fn walk_item_id(&mut self, id: ItemId) {
+        if let Some(item) = self.items_by_id.get(&id).copied() {
+            self.walk_item_signature(item);
+        }
+    }
+
+    fn walk_type(&mut self, ty: TypeId, interns: &'a Interns) {
+        let types = &interns.types;
+        if !self
+            .visited_types
+            .insert((types as *const TypeTable as usize, ty))
+        {
+            return;
+        }
+        let Some(desc) = types.get(ty) else {
+            return;
+        };
+        match &desc.kind {
+            TypeKind::Adt {
+                form,
+                variants: adt_variants,
+                args,
+                ..
+            } => {
+                for v in adt_variants {
+                    if *form == NominalForm::Enum {
+                        if let Some(name) = interns.str(v.name) {
+                            self.variants.insert(name.to_owned());
                         }
                     }
-                    walk_boundary_type(f.ty, types, interns, visited, fields, variants);
-                }
-            }
-            for &arg in args {
-                walk_boundary_type(arg, types, interns, visited, fields, variants);
-            }
-        }
-        TypeKind::Tuple(elems) => {
-            for &el in elems {
-                walk_boundary_type(el, types, interns, visited, fields, variants);
-            }
-        }
-        TypeKind::Array { element, .. }
-        | TypeKind::Slice(element)
-        | TypeKind::Reference {
-            pointee: element, ..
-        }
-        | TypeKind::RawPointer {
-            pointee: element, ..
-        }
-        | TypeKind::Pattern(element) => {
-            walk_boundary_type(*element, types, interns, visited, fields, variants);
-        }
-        TypeKind::Closure { upvars, .. } | TypeKind::CoroutineClosure { upvars, .. } => {
-            for &u in upvars {
-                walk_boundary_type(u, types, interns, visited, fields, variants);
-            }
-        }
-        TypeKind::Coroutine {
-            upvars,
-            saved_locals,
-            variants: co_variants,
-            ..
-        } => {
-            for &u in upvars {
-                walk_boundary_type(u, types, interns, visited, fields, variants);
-            }
-            for &(_, lt) in saved_locals {
-                walk_boundary_type(lt, types, interns, visited, fields, variants);
-            }
-            for v in co_variants {
-                for f in &v.fields {
-                    if let FieldKey::Name(id) = f.key {
-                        if let Some(name) = interns.str(id) {
-                            fields.insert(name.to_owned());
+                    for f in &v.fields {
+                        if let FieldKey::Name(id) = f.key {
+                            if let Some(name) = interns.str(id) {
+                                self.fields.insert(name.to_owned());
+                            }
                         }
+                        self.walk_type(f.ty, interns);
                     }
-                    walk_boundary_type(f.ty, types, interns, visited, fields, variants);
+                }
+                for &arg in args {
+                    self.walk_type(arg, interns);
                 }
             }
+            TypeKind::Tuple(elems) => {
+                for &el in elems {
+                    self.walk_type(el, interns);
+                }
+            }
+            TypeKind::Array { element, .. }
+            | TypeKind::Slice(element)
+            | TypeKind::Reference {
+                pointee: element, ..
+            }
+            | TypeKind::RawPointer {
+                pointee: element, ..
+            }
+            | TypeKind::Pattern(element) => {
+                self.walk_type(*element, interns);
+            }
+            TypeKind::FnPtr { sig } => {
+                if let Some(sig_desc) = interns.sigs.get(*sig) {
+                    for &inp in &sig_desc.inputs {
+                        self.walk_type(inp, interns);
+                    }
+                    self.walk_type(sig_desc.output, interns);
+                }
+            }
+            TypeKind::FnDef { sig, instance, .. } => {
+                if let Some(sig_desc) = interns.sigs.get(*sig) {
+                    for &inp in &sig_desc.inputs {
+                        self.walk_type(inp, interns);
+                    }
+                    self.walk_type(sig_desc.output, interns);
+                }
+                if let Some(direct) = instance {
+                    self.walk_item_id(direct.item);
+                }
+            }
+            TypeKind::Closure {
+                def,
+                upvars,
+                fn_pointer_shim,
+            } => {
+                for &u in upvars {
+                    self.walk_type(u, interns);
+                }
+                if let Some(shim) = fn_pointer_shim {
+                    self.walk_item_id(shim.item);
+                }
+                let exact = ItemId {
+                    definition: *def,
+                    instantiation: ty.0,
+                };
+                if let Some(closure_item) = self.items_by_id.get(&exact).copied() {
+                    self.walk_item_signature(closure_item);
+                } else if let Some(defs) = self.items_by_def.get(def).cloned() {
+                    for closure_item in defs {
+                        self.walk_item_signature(closure_item);
+                    }
+                }
+            }
+            TypeKind::CoroutineClosure { def, upvars } => {
+                for &u in upvars {
+                    self.walk_type(u, interns);
+                }
+                if let Some(defs) = self.items_by_def.get(def).cloned() {
+                    for closure_item in defs {
+                        self.walk_item_signature(closure_item);
+                    }
+                }
+            }
+            TypeKind::Coroutine {
+                upvars,
+                saved_locals,
+                variants: co_variants,
+                ..
+            } => {
+                for &u in upvars {
+                    self.walk_type(u, interns);
+                }
+                for &(_, lt) in saved_locals {
+                    self.walk_type(lt, interns);
+                }
+                for v in co_variants {
+                    for f in &v.fields {
+                        if let FieldKey::Name(id) = f.key {
+                            if let Some(name) = interns.str(id) {
+                                self.fields.insert(name.to_owned());
+                            }
+                        }
+                        self.walk_type(f.ty, interns);
+                    }
+                }
+            }
+            _ => {}
         }
-        _ => {}
     }
 }
 
@@ -1393,8 +1690,7 @@ fn collect_program_exclusions(
 
     let mut raw_tokens = BTreeSet::new();
     let mut raw_strings = BTreeSet::new();
-    let mut boundary_fields = BTreeSet::new();
-    let mut boundary_variants = BTreeSet::new();
+    let mut ctx = BoundaryWalkCtx::new(table);
 
     for item in table.values() {
         if !live.contains(&item.name) {
@@ -1404,39 +1700,76 @@ fn collect_program_exclusions(
             collect_js_text_tokens_and_strings(&item.js, &mut raw_tokens, &mut raw_strings);
         }
         if let Some(interns) = item.jir.interns() {
-            let mut visited = BTreeSet::new();
             for desc in interns.types.descriptors() {
                 if desc.meta.boundary != PinnedBoundary::None || desc.meta.abi == NominalAbi::C {
-                    walk_boundary_type(
-                        desc.id,
-                        &interns.types,
-                        interns,
-                        &mut visited,
-                        &mut boundary_fields,
-                        &mut boundary_variants,
-                    );
+                    ctx.walk_type(desc.id, interns);
                 }
             }
-            if item.linkage.exported || item.dts.is_some() || lowered_dts.contains(&item.name) {
-                if let Some(body) = &item.jir.body {
-                    for &arg_ty in &body.signature.arguments {
-                        walk_boundary_type(
-                            arg_ty,
-                            &interns.types,
-                            interns,
-                            &mut visited,
-                            &mut boundary_fields,
-                            &mut boundary_variants,
-                        );
+            if let Some(body) = &item.jir.body {
+                if item.linkage.exported
+                    || item.kind == ItemKind::Import
+                    || item.dts.is_some()
+                    || lowered_dts.contains(&item.name)
+                    || !lowered_ok.contains(&item.name)
+                {
+                    ctx.walk_item_signature(item);
+                }
+                for block in &body.blocks {
+                    let Terminator::Call(call) = &block.terminator else {
+                        continue;
+                    };
+                    let is_boundary_call = call.host.is_some()
+                        || matches!(
+                            call.semantic,
+                            CallSemantic::Host
+                                | CallSemantic::ViewAbi
+                                | CallSemantic::RawJavaScript
+                                | CallSemantic::RawParts
+                        )
+                        || matches!(call.callee, Callee::Foreign { .. } | Callee::Runtime { .. })
+                        || match &call.callee {
+                            Callee::Direct {
+                                item: target_id,
+                                link_name,
+                            } => {
+                                let target_name = ctx
+                                    .items_by_id
+                                    .get(target_id)
+                                    .map(|it| it.name.clone())
+                                    .or_else(|| {
+                                        interns.str(*link_name).map(|s| JsName::new(s.to_owned()))
+                                    });
+                                !target_name.as_ref().is_some_and(|n| lowered_ok.contains(n))
+                            }
+                            _ => false,
+                        };
+                    if !is_boundary_call {
+                        continue;
                     }
-                    walk_boundary_type(
-                        body.signature.result,
-                        &interns.types,
-                        interns,
-                        &mut visited,
-                        &mut boundary_fields,
-                        &mut boundary_variants,
-                    );
+                    for arg in &call.arguments {
+                        ctx.walk_type(arg.ty, interns);
+                    }
+                    ctx.walk_type(call.destination.ty, interns);
+                    if let Some(host) = &call.host {
+                        for (_, helper) in host.helpers() {
+                            ctx.walk_item_id(helper.item);
+                        }
+                        if let HostPayload::KeyedList(kl) = host {
+                            ctx.walk_type(kl.collection_ty, interns);
+                            ctx.walk_type(kl.item_ty, interns);
+                            ctx.walk_type(kl.key_ty, interns);
+                            ctx.walk_type(kl.row_ty, interns);
+                            ctx.walk_type(kl.collection.ty, interns);
+                            ctx.walk_type(kl.key.ty, interns);
+                            ctx.walk_type(kl.row.ty, interns);
+                            for body_ref in [kl.collection.body, kl.key.body, kl.row.body]
+                                .into_iter()
+                                .flatten()
+                            {
+                                ctx.walk_item_id(body_ref.item);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1451,8 +1784,8 @@ fn collect_program_exclusions(
     ProgramExclusions {
         raw_tokens,
         raw_strings,
-        boundary_fields,
-        boundary_variants,
+        boundary_fields: ctx.fields,
+        boundary_variants: ctx.variants,
     }
 }
 
@@ -1547,6 +1880,21 @@ fn is_pure_obj(expr: &Expr) -> bool {
     }
 }
 
+fn is_unsigned_32_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Binary(BinOp::UShr, _, r) => matches!(&**r, Expr::Num(n) if *n == 0.0),
+        Expr::Num(n) => n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= (u32::MAX as f64),
+        Expr::RawNum(s) => s
+            .strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .map_or_else(
+                || s.parse::<u32>().is_ok(),
+                |hex| u32::from_str_radix(hex, 16).is_ok(),
+            ),
+        _ => false,
+    }
+}
+
 fn check_pack_pair<'a>(shifted: &'a Expr, low: &'a Expr) -> Option<(&'a Expr, &'a Expr)> {
     let Expr::Binary(BinOp::Shl, hi_call, shift) = shifted else {
         return None;
@@ -1556,7 +1904,7 @@ fn check_pack_pair<'a>(shifted: &'a Expr, low: &'a Expr) -> Option<(&'a Expr, &'
     }
     let hi_arg = extract_bigint_call_arg(hi_call)?;
     let lo_arg = extract_bigint_call_arg(low)?;
-    if is_pure_no_call(lo_arg) && is_pure_no_call(hi_arg) {
+    if is_pure_no_call(lo_arg) && is_pure_no_call(hi_arg) && is_unsigned_32_expr(lo_arg) {
         Some((lo_arg, hi_arg))
     } else {
         None
@@ -1752,6 +2100,132 @@ fn collect_fn_unpack_temps(params: &[String], body: &[Stmt]) -> BTreeMap<String,
             self.all_idents.insert(name.to_owned());
         }
 
+        fn mark_idents_bad_in_stmts(&mut self, stmts: &[Stmt]) {
+            for stmt in stmts {
+                match stmt {
+                    Stmt::ExprStmt(e) | Stmt::Throw(e) => self.mark_idents_bad_in_expr(e),
+                    Stmt::Const(n, e) => {
+                        self.mark_bad(n);
+                        self.mark_idents_bad_in_expr(e);
+                    }
+                    Stmt::Let(n, init) => {
+                        self.mark_bad(n);
+                        if let Some(e) = init {
+                            self.mark_idents_bad_in_expr(e);
+                        }
+                    }
+                    Stmt::Lets(decls) => {
+                        for (n, init) in decls {
+                            self.mark_bad(n);
+                            if let Some(e) = init {
+                                self.mark_idents_bad_in_expr(e);
+                            }
+                        }
+                    }
+                    Stmt::Return(Some(e)) => self.mark_idents_bad_in_expr(e),
+                    Stmt::If(t, a, b) => {
+                        self.mark_idents_bad_in_expr(t);
+                        self.mark_idents_bad_in_stmts(a);
+                        if let Some(b) = b {
+                            self.mark_idents_bad_in_stmts(b);
+                        }
+                    }
+                    Stmt::Switch(d, cases) => {
+                        self.mark_idents_bad_in_expr(d);
+                        for c in cases {
+                            for t in &c.tests {
+                                self.mark_idents_bad_in_expr(t);
+                            }
+                            self.mark_idents_bad_in_stmts(&c.body);
+                        }
+                    }
+                    Stmt::Labeled(_, inner) => {
+                        self.mark_idents_bad_in_stmts(std::slice::from_ref(inner.as_ref()));
+                    }
+                    Stmt::LoopForever(_, b) | Stmt::Block(b) => self.mark_idents_bad_in_stmts(b),
+                    Stmt::While(t, b) => {
+                        self.mark_idents_bad_in_expr(t);
+                        self.mark_idents_bad_in_stmts(b);
+                    }
+                    Stmt::TryCatch {
+                        body,
+                        binding,
+                        handler,
+                    } => {
+                        self.mark_bad(binding);
+                        self.mark_idents_bad_in_stmts(body);
+                        self.mark_idents_bad_in_stmts(handler);
+                    }
+                    Stmt::FunctionDecl { name, params, body } => {
+                        self.mark_bad(name);
+                        for p in params {
+                            self.mark_bad(p);
+                        }
+                        self.mark_idents_bad_in_stmts(body);
+                    }
+                    Stmt::Raw(text) => {
+                        let mut dummy = BTreeSet::new();
+                        collect_js_text_tokens_and_strings(text, &mut self.bad_names, &mut dummy);
+                    }
+                    Stmt::Return(None)
+                    | Stmt::Continue(_)
+                    | Stmt::Break(_)
+                    | Stmt::Import { .. }
+                    | Stmt::Comment(_)
+                    | Stmt::Loc(_) => {}
+                }
+            }
+        }
+
+        fn mark_idents_bad_in_expr(&mut self, expr: &Expr) {
+            match expr {
+                Expr::Ident(name) => self.mark_bad(name),
+                Expr::Member(obj, _) | Expr::Unary(_, obj) => self.mark_idents_bad_in_expr(obj),
+                Expr::Index(obj, idx)
+                | Expr::Binary(_, obj, idx)
+                | Expr::Assign(obj, idx)
+                | Expr::CompoundAssign(_, obj, idx) => {
+                    self.mark_idents_bad_in_expr(obj);
+                    self.mark_idents_bad_in_expr(idx);
+                }
+                Expr::Call(c, args) | Expr::New(c, args) => {
+                    self.mark_idents_bad_in_expr(c);
+                    for a in args {
+                        self.mark_idents_bad_in_expr(a);
+                    }
+                }
+                Expr::Cond(t, c, a) => {
+                    self.mark_idents_bad_in_expr(t);
+                    self.mark_idents_bad_in_expr(c);
+                    self.mark_idents_bad_in_expr(a);
+                }
+                Expr::Object(entries) => {
+                    for (_, v) in entries {
+                        self.mark_idents_bad_in_expr(v);
+                    }
+                }
+                Expr::Array(items) | Expr::Seq(items) => {
+                    for x in items {
+                        self.mark_idents_bad_in_expr(x);
+                    }
+                }
+                Expr::Arrow(params, body) => {
+                    for p in params {
+                        self.mark_bad(p);
+                    }
+                    match body {
+                        ArrowBody::Expr(b) => self.mark_idents_bad_in_expr(b),
+                        ArrowBody::Block(stmts) => self.mark_idents_bad_in_stmts(stmts),
+                    }
+                }
+                Expr::Raw(text) => {
+                    let mut dummy = BTreeSet::new();
+                    collect_js_text_tokens_and_strings(text, &mut self.bad_names, &mut dummy);
+                }
+                _ => {}
+            }
+        }
+
         fn record_assign(&mut self, name: &str, rhs: &Expr) {
             self.all_idents.insert(name.to_owned());
             if let Expr::Member(obj, prop) = rhs {
@@ -1848,7 +2322,7 @@ fn collect_fn_unpack_temps(params: &[String], body: &[Stmt]) -> BTreeMap<String,
                     for p in params {
                         self.mark_bad(p);
                     }
-                    self.visit_stmts(body);
+                    self.mark_idents_bad_in_stmts(body);
                 }
                 Stmt::Raw(text) => {
                     let mut dummy = BTreeSet::new();
@@ -1911,8 +2385,8 @@ fn collect_fn_unpack_temps(params: &[String], body: &[Stmt]) -> BTreeMap<String,
                         self.mark_bad(p);
                     }
                     match body {
-                        ArrowBody::Expr(b) => self.visit_expr(b),
-                        ArrowBody::Block(stmts) => self.visit_stmts(stmts),
+                        ArrowBody::Expr(b) => self.mark_idents_bad_in_expr(b),
+                        ArrowBody::Block(stmts) => self.mark_idents_bad_in_stmts(stmts),
                     }
                 }
                 Expr::Raw(text) => {
@@ -2120,7 +2594,7 @@ impl BigIntPropScanner {
         }
         match expr {
             Expr::Str(s) => {
-                self.excluded.insert(s.clone());
+                self.exclude_prop_and_base(s);
             }
             Expr::Object(entries) => {
                 let mut seen_keys = BTreeSet::new();
@@ -2459,15 +2933,14 @@ fn split_bigint_props(lowered: &mut [LoweredRow], exclusions: &ProgramExclusions
         excluded: BTreeSet::new(),
         has_pack_write: BTreeSet::new(),
     };
-    scanner
-        .excluded
-        .extend(exclusions.raw_tokens.iter().cloned());
-    scanner
-        .excluded
-        .extend(exclusions.raw_strings.iter().cloned());
-    scanner
-        .excluded
-        .extend(exclusions.boundary_fields.iter().cloned());
+    for s in exclusions
+        .raw_tokens
+        .iter()
+        .chain(exclusions.raw_strings.iter())
+        .chain(exclusions.boundary_fields.iter())
+    {
+        scanner.exclude_prop_and_base(s);
+    }
 
     let empty = BTreeMap::new();
     for (_, res, _, _) in lowered.iter() {
@@ -3369,5 +3842,522 @@ mod tests {
         let report_js = jsast::stmt_to_string(&report_lowered[0].1.as_ref().unwrap().decl);
         assert!(report_js.contains("\"Alpha\""), "{report_js}");
         assert!(report_js.contains("\"Beta\""), "{report_js}");
+    }
+
+    #[test]
+    fn collect_program_exclusions_protects_js_extern_host_call_and_closure_types() {
+        use crate::item::LinkJir;
+        use crate::jir::semantic::{
+            AbiSignature, BasicBlock, BlockId, BodySemantic, Call, Constant, Local, LocalId,
+            LocalRole, Operand, OperandKind, Place, Signature, Unwind,
+        };
+        use crate::jir::types::{
+            EnumRepr, FieldDescriptor, IntFacts, IntRepr, JsFacts, LayoutFacts,
+            NominalDiscriminant, TypeDescriptor, TypeMeta, VariantDescriptor,
+        };
+        use crate::jir::{Body, BodyKind, BytesId};
+
+        let mut interns = Interns::default();
+        let u64_ty = TypeId(1);
+        let struct_ty = TypeId(2);
+        let enum_ty = TypeId(3);
+        let closure_ty = TypeId(4);
+        let cb_struct_ty = TypeId(5);
+        let cb_enum_ty = TypeId(6);
+        let unit_ty = TypeId(7);
+        let fn_ty = TypeId(8);
+
+        let def_of = |n: u64| DefinitionId {
+            crate_id: 1,
+            local_hash: n,
+        };
+        let mk_desc = |id: TypeId, kind: TypeKind, size: u64| TypeDescriptor {
+            id,
+            name: None,
+            kind,
+            layout: LayoutFacts {
+                size: Some(size),
+                unsized_prefix: None,
+                align: Some(size.clamp(1, 4)),
+                sized: true,
+                zst: size == 0,
+                one_zst: size == 0,
+                needs_drop: false,
+                has_own_drop: false,
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: size == 0,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: id,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        };
+        interns.intern_type(mk_desc(unit_ty, TypeKind::Tuple(Vec::new()), 0));
+        let mut u64_desc = mk_desc(
+            u64_ty,
+            TypeKind::Integer {
+                signed: false,
+                bits: 64,
+            },
+            8,
+        );
+        u64_desc.js.int = Some(IntFacts {
+            signed: false,
+            bits: 64,
+            repr: IntRepr::BigInt,
+        });
+        interns.intern_type(u64_desc);
+        interns.intern_type(mk_desc(fn_ty, TypeKind::Opaque, 0));
+
+        let ts_key = interns.intern_str("ext_ts");
+        let cb_ts_key = interns.intern_str("cb_ts");
+        let go_key = interns.intern_str("Go");
+        let stop_key = interns.intern_str("Stop");
+        let cb_done_key = interns.intern_str("CbDone");
+        let extern_struct_key = interns.intern_str("ExternStruct");
+        let cb_struct_key = interns.intern_str("CbStruct");
+
+        interns.intern_type(mk_desc(
+            struct_ty,
+            TypeKind::Adt {
+                def: def_of(10),
+                args: Vec::new(),
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: extern_struct_key,
+                    fields: vec![FieldDescriptor {
+                        key: FieldKey::Name(ts_key),
+                        ty: u64_ty,
+                        offset: 0,
+                    }],
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            8,
+        ));
+        let mut enum_desc = mk_desc(
+            enum_ty,
+            TypeKind::Adt {
+                def: def_of(11),
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: go_key,
+                        fields: Vec::new(),
+                        logical_discr: 0,
+                        physical_tag: Some(NominalDiscriminant { bits: 0, bytes: 1 }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: stop_key,
+                        fields: Vec::new(),
+                        logical_discr: 1,
+                        physical_tag: Some(NominalDiscriminant { bits: 1, bytes: 1 }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            1,
+        );
+        enum_desc.js.enum_repr = Some(EnumRepr::Tag { fieldless: true });
+        interns.intern_type(enum_desc);
+        interns.intern_type(mk_desc(
+            cb_struct_ty,
+            TypeKind::Adt {
+                def: def_of(12),
+                args: Vec::new(),
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: cb_struct_key,
+                    fields: vec![FieldDescriptor {
+                        key: FieldKey::Name(cb_ts_key),
+                        ty: u64_ty,
+                        offset: 0,
+                    }],
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            8,
+        ));
+        interns.intern_type(mk_desc(
+            cb_enum_ty,
+            TypeKind::Adt {
+                def: def_of(13),
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![VariantDescriptor {
+                    name: cb_done_key,
+                    fields: Vec::new(),
+                    logical_discr: 0,
+                    physical_tag: Some(NominalDiscriminant { bits: 0, bytes: 1 }),
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            1,
+        ));
+
+        let closure_def = def_of(20);
+        let closure_item_id = ItemId {
+            definition: closure_def,
+            instantiation: closure_ty.0,
+        };
+        interns.intern_type(mk_desc(
+            closure_ty,
+            TypeKind::Closure {
+                def: closure_def,
+                upvars: Vec::new(),
+                fn_pointer_shim: None,
+            },
+            8,
+        ));
+
+        let caller_item_id = ItemId {
+            definition: def_of(30),
+            instantiation: 1,
+        };
+        let host_section = interns.intern_str("rcgjs.host.callback0");
+        let caller_body = Body {
+            item: caller_item_id,
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Ordinary,
+            signature: Signature {
+                arguments: Vec::new(),
+                result: unit_ty,
+                abi: AbiSignature::default(),
+            },
+            locals: vec![Local {
+                id: LocalId(0),
+                role: LocalRole::Return,
+                ty: enum_ty,
+            }],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    cleanup: false,
+                    statements: Vec::new(),
+                    terminator: Terminator::Call(Call {
+                        function: Operand {
+                            ty: fn_ty,
+                            kind: OperandKind::Constant(Constant::ZeroSized),
+                        },
+                        callee: Callee::Indirect { signature: fn_ty },
+                        semantic: CallSemantic::Host,
+                        arguments: vec![Operand {
+                            ty: struct_ty,
+                            kind: OperandKind::Constant(Constant::ZeroSized),
+                        }],
+                        destination: Place {
+                            local: LocalId(0),
+                            projection: Vec::new(),
+                            ty: enum_ty,
+                        },
+                        target: Some(BlockId(1)),
+                        unwind: Unwind::Continue,
+                        track_caller: None,
+                        host: Some(HostPayload::Extern(BytesId(0))),
+                    }),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    cleanup: false,
+                    statements: Vec::new(),
+                    terminator: Terminator::Call(Call {
+                        function: Operand {
+                            ty: fn_ty,
+                            kind: OperandKind::Constant(Constant::ZeroSized),
+                        },
+                        callee: Callee::Indirect { signature: fn_ty },
+                        semantic: CallSemantic::Host,
+                        arguments: vec![Operand {
+                            ty: closure_ty,
+                            kind: OperandKind::Constant(Constant::ZeroSized),
+                        }],
+                        destination: Place {
+                            local: LocalId(0),
+                            projection: Vec::new(),
+                            ty: unit_ty,
+                        },
+                        target: Some(BlockId(2)),
+                        unwind: Unwind::Continue,
+                        track_caller: None,
+                        host: Some(HostPayload::Marker {
+                            section: host_section,
+                            def: def_of(40),
+                            template: None,
+                            helpers: Vec::new(),
+                        }),
+                    }),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    cleanup: false,
+                    statements: Vec::new(),
+                    terminator: Terminator::Return,
+                },
+            ],
+        };
+
+        let closure_body = Body {
+            item: closure_item_id,
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Ordinary,
+            signature: Signature {
+                arguments: vec![cb_struct_ty],
+                result: cb_enum_ty,
+                abi: AbiSignature::default(),
+            },
+            locals: Vec::new(),
+            blocks: Vec::new(),
+        };
+
+        let caller_name = JsName::new("internal_caller".to_owned());
+        let closure_name = JsName::new("cb_closure".to_owned());
+        let mut table = BTreeMap::new();
+        for (name, body) in [
+            (caller_name.clone(), caller_body),
+            (closure_name.clone(), closure_body),
+        ] {
+            let mut jir = LinkJir::default();
+            jir.use_interns(interns.clone());
+            jir.body = Some(body);
+            table.insert(
+                name.clone(),
+                LinkItem {
+                    name,
+                    kind: ItemKind::Fn,
+                    js: String::new(),
+                    refs: BTreeSet::new(),
+                    zombies: Vec::new(),
+                    linkage: Linkage::internal(),
+                    debug_path: String::new(),
+                    crate_name: String::new(),
+                    order: None,
+                    map: item_map(Vec::new()),
+                    dts: None,
+                    optimization: Default::default(),
+                    late_ir: Default::default(),
+                    baseline_shadow: Default::default(),
+                    jir,
+                },
+            );
+        }
+        let live: BTreeSet<JsName> = [caller_name.clone(), closure_name].into_iter().collect();
+        let lowered = vec![(
+            caller_name,
+            Ok(LoweredItem {
+                decl: Stmt::Comment(String::new()),
+                refs: BTreeSet::new(),
+                zombies: Vec::new(),
+                loc: None,
+                names: Vec::new(),
+                dts: None,
+                js_alloc_origins: Vec::new(),
+            }),
+            OptStats::default(),
+            None,
+        )];
+
+        let exclusions = collect_program_exclusions(&table, &lowered, &live);
+        assert!(exclusions.boundary_fields.contains("ext_ts"));
+        assert!(exclusions.boundary_fields.contains("cb_ts"));
+        assert!(exclusions.boundary_variants.contains("Go"));
+        assert!(exclusions.boundary_variants.contains("Stop"));
+        assert!(exclusions.boundary_variants.contains("CbDone"));
+    }
+
+    #[test]
+    fn collect_js_text_tokens_and_strings_handles_comments_templates_escapes_and_lo_hi() {
+        let mut tokens = BTreeSet::new();
+        let mut strings = BTreeSet::new();
+        let text = r#"
+            // caller's frame shouldn't open a fake single-quoted string
+            /* another's 'block' comment */
+            const tpl = `TplOnly`;
+            const interp = `head ${fn(inner_tok, "QuotedInTpl")}`;
+            const s1 = "\u0046oo";
+            const s2 = "a\"b";
+            const x = { foo$lo: 1, after_comment: 2 };
+        "#;
+        collect_js_text_tokens_and_strings(text, &mut tokens, &mut strings);
+        assert!(tokens.contains("after_comment"));
+        assert!(tokens.contains("inner_tok"));
+        assert!(tokens.contains("foo$lo"));
+        assert!(strings.contains("Foo"));
+        assert!(strings.contains("a\"b"));
+        assert!(strings.contains("TplOnly"));
+        assert!(strings.contains("QuotedInTpl"));
+
+        // Ensure `foo$lo` exclusion also blocks splitting `foo`.
+        let make_fn = jsast::function(
+            "mk",
+            vec![],
+            vec![Stmt::Return(Some(Expr::Object(vec![
+                ("foo".to_owned(), Expr::BigInt("42".to_owned())),
+                ("bar".to_owned(), Expr::BigInt("42".to_owned())),
+            ])))],
+        );
+        let (_, lowered, _, _, _) = test_run(
+            Opts {
+                optimizer: OptimizerMode::On,
+                ecma_target: EcmaTarget::Es2018,
+                ..Opts::default()
+            },
+            vec![
+                ("mk", make_fn),
+                (
+                    "guard",
+                    jsast::function(
+                        "guard",
+                        vec![],
+                        vec![Stmt::Return(Some(Expr::Str("foo$lo".to_owned())))],
+                    ),
+                ),
+            ],
+        );
+        let mk_js = jsast::stmt_to_string(&lowered[0].1.as_ref().unwrap().decl);
+        assert!(
+            mk_js.contains("foo:"),
+            "foo$lo must block splitting foo:\n{mk_js}"
+        );
+        assert!(
+            mk_js.contains("bar$lo:"),
+            "unrelated bar should still split:\n{mk_js}"
+        );
+    }
+
+    #[test]
+    fn bigint_split_ignores_captured_arrow_locals_and_signed_lo_packs() {
+        let unpack_lo = |src: Expr| {
+            Expr::Binary(
+                BinOp::BitOr,
+                Box::new(Expr::Call(
+                    Box::new(Expr::Ident("Number".to_owned())),
+                    vec![Expr::Call(
+                        Box::new(Expr::Member(
+                            Box::new(Expr::Ident("BigInt".to_owned())),
+                            "asIntN".to_owned(),
+                        )),
+                        vec![Expr::Num(32.0), src],
+                    )],
+                )),
+                Box::new(Expr::Num(0.0)),
+            )
+        };
+        let signed_pack = Expr::Binary(
+            BinOp::BitOr,
+            Box::new(Expr::Binary(
+                BinOp::Shl,
+                Box::new(Expr::Call(
+                    Box::new(Expr::Ident("BigInt".to_owned())),
+                    vec![Expr::Ident("hi".to_owned())],
+                )),
+                Box::new(Expr::BigInt("32".to_owned())),
+            )),
+            Box::new(Expr::Call(
+                Box::new(Expr::Ident("BigInt".to_owned())),
+                vec![Expr::Num(-1.0)],
+            )),
+        );
+        let valid_pack = Expr::Binary(
+            BinOp::BitOr,
+            Box::new(Expr::Binary(
+                BinOp::Shl,
+                Box::new(Expr::Call(
+                    Box::new(Expr::Ident("BigInt".to_owned())),
+                    vec![Expr::Ident("hi".to_owned())],
+                )),
+                Box::new(Expr::BigInt("32".to_owned())),
+            )),
+            Box::new(Expr::Call(
+                Box::new(Expr::Ident("BigInt".to_owned())),
+                vec![Expr::Binary(
+                    BinOp::UShr,
+                    Box::new(Expr::Ident("lo".to_owned())),
+                    Box::new(Expr::Num(0.0)),
+                )],
+            )),
+        );
+
+        let fn_maker = jsast::function(
+            "mk",
+            vec!["lo".to_owned(), "hi".to_owned()],
+            vec![Stmt::Return(Some(Expr::Object(vec![
+                ("signed_bad".to_owned(), signed_pack),
+                ("split_ok".to_owned(), valid_pack),
+                ("byteset".to_owned(), Expr::BigInt("1".to_owned())),
+            ])))],
+        );
+        let fn_capture = jsast::function(
+            "capture_temp",
+            vec!["obj".to_owned()],
+            vec![
+                Stmt::Lets(vec![("$t0".to_owned(), None)]),
+                Stmt::ExprStmt(Expr::Assign(
+                    Box::new(Expr::Ident("$t0".to_owned())),
+                    Box::new(Expr::Member(
+                        Box::new(Expr::Ident("obj".to_owned())),
+                        "byteset".to_owned(),
+                    )),
+                )),
+                Stmt::Return(Some(Expr::Arrow(
+                    Vec::new(),
+                    ArrowBody::Expr(Box::new(unpack_lo(Expr::Ident("$t0".to_owned())))),
+                ))),
+            ],
+        );
+
+        let (_, lowered, _, _, _) = test_run(
+            Opts {
+                optimizer: OptimizerMode::On,
+                ecma_target: EcmaTarget::Es2018,
+                ..Opts::default()
+            },
+            vec![("mk", fn_maker), ("capture_temp", fn_capture)],
+        );
+        let mk_js = jsast::stmt_to_string(&lowered[0].1.as_ref().unwrap().decl);
+        let cap_js = jsast::stmt_to_string(&lowered[1].1.as_ref().unwrap().decl);
+        assert!(
+            mk_js.contains("signed_bad:"),
+            "negative lo_arg must NOT split:\n{mk_js}"
+        );
+        assert!(
+            !mk_js.contains("signed_bad$lo"),
+            "negative lo_arg must NOT emit signed_bad$lo:\n{mk_js}"
+        );
+        assert!(
+            mk_js.contains("split_ok$lo:") && mk_js.contains("split_ok$hi:"),
+            "unsigned lo_arg pack should still split:\n{mk_js}"
+        );
+        assert!(
+            mk_js.contains("byteset:") && !mk_js.contains("byteset$lo"),
+            "captured temp reading obj.byteset must prevent splitting byteset:\n{mk_js}"
+        );
+        assert!(
+            cap_js.contains("let $t0;") && !cap_js.contains("$t0$lo"),
+            "captured temp inside arrow must stay declared as $t0:\n{cap_js}"
+        );
     }
 }
