@@ -18,7 +18,7 @@ out="$root/build/core/$fixture.js"
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 
-JSC_JIR_ABI_FAULT=descend JS_EXTRA_ARGS='js-lane=jir js-opt=on' \
+JSC_JIR_ABI_FAULT=make_pair JS_EXTRA_ARGS='js-lane=jir js-opt=on' \
 	"$script_dir/test.sh" "$fixture" >"$work/fault.log" 2>&1 ||
 	{ cat "$work/fault.log" >&2 && exit 1; }
 cp "$out" "$work/fault.js"

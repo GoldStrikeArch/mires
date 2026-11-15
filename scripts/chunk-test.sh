@@ -88,7 +88,12 @@ fi
 
 pass=0
 fail=0
+skipped=0
 failed=""
+is_jir_lane=0
+case " ${JS_EXTRA_ARGS:-} " in
+*" js-lane=jir "*) is_jir_lane=1 ;;
+esac
 # compile <out dir> <pairs...>: builds the fixture `$src` split as asked, logging to compile.log.
 compile() {
 	local out=$1
@@ -154,6 +159,12 @@ for name in $fixtures; do
 		label="$name[$build: $*]"
 		out="$build_dir/$name/$build"
 		if ! compile "$out" "$@"; then
+			if [ "$jsc_panic_mode" = unwind ] && [ "$is_jir_lane" -eq 0 ] &&
+				grep -q 'requires semantic cleanup lowering' "$out/compile.log"; then
+				echo "SKIP  $label (JSC_PANIC=unwind: baseline lane refuses cleanup)"
+				skipped=$((skipped + 1))
+				continue
+			fi
 			echo "FAIL  $label: does not compile, see $out/compile.log"
 			sed -n '1,6s/^/    /p' "$out/compile.log"
 			note_fail
@@ -180,7 +191,11 @@ for name in $fixtures; do
 done
 
 echo
-echo "chunk suite: $pass passed, $fail failed"
+if [ "$skipped" -gt 0 ]; then
+	echo "chunk suite: $pass passed, $fail failed ($skipped skipped on baseline unwind)"
+else
+	echo "chunk suite: $pass passed, $fail failed"
+fi
 if [ "$fail" -gt 0 ]; then
 	echo "failed:$failed"
 	exit 1

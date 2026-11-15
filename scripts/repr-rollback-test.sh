@@ -56,9 +56,12 @@ console.log(`  rollback recorded on ${rolled.length} region(s), committed 0`);
 NODE
 
 # The plan left no trace: the faulted program is the one a build without the pass prints.
+JS_EXTRA_ARGS='js-opt=on js-opt-passes=sroa,ast-dce,future-poller,link-dedup' \
+	SKIP_BUILD=1 "$script_dir/build_sysroot.sh" >/dev/null
 JS_EXTRA_ARGS='js-lane=jir js-opt=on js-opt-passes=sroa,ast-dce,future-poller,link-dedup' \
 	SKIP_BUILD=1 "$script_dir/test.sh" "$fixture" >"$work/no-pass.log" 2>&1 ||
 	{ cat "$work/no-pass.log" >&2 && exit 1; }
 cmp "$work/fault.js" "$out"
+JS_EXTRA_ARGS='js-opt=on' SKIP_BUILD=1 "$script_dir/build_sysroot.sh" >/dev/null
 
 echo "repr rollback: PASS ($fixture declined atomically and printed the pass-less program byte for byte)"
