@@ -580,8 +580,38 @@ pub(crate) fn run(
     reachable: &[JsName],
     coroutine_sources: &crate::plan::async_graph::SourceCaptures,
 ) -> LaneRun {
-    let _lane_scope = crate::profile::scope("lane.total");
     let opts = crate::opts::get();
+    let fault = abi_fault();
+    run_with_opts(
+        dcx,
+        table,
+        reachable,
+        coroutine_sources,
+        opts,
+        fault.as_deref(),
+    )
+}
+
+fn merge_o_stats(dst: &mut OGroup, src: OGroup) {
+    dst.inline.applied += src.inline.applied;
+    dst.inline.cross_object_applied += src.inline.cross_object_applied;
+    dst.inline.bytes_before += src.inline.bytes_before;
+    dst.inline.bytes_after += src.inline.bytes_after;
+    dst.inline.items.extend(src.inline.items);
+    dst.dce_items.extend(src.dce_items);
+    dst.witnesses_recorded += src.witnesses_recorded;
+    dst.witnesses_failed += src.witnesses_failed;
+}
+
+fn run_with_opts(
+    dcx: &Sink,
+    table: &mut BTreeMap<JsName, LinkItem>,
+    reachable: &[JsName],
+    coroutine_sources: &crate::plan::async_graph::SourceCaptures,
+    opts: &crate::opts::Opts,
+    fault: Option<&str>,
+) -> LaneRun {
+    let _lane_scope = crate::profile::scope("lane.total");
     // The names the reachability walk can follow, taken before any item is replaced. Cloned
     // rather than borrowed because the loop below holds `&mut` on one item of the same table.
     let mut defined: BTreeSet<JsName> = table.keys().cloned().collect();
@@ -631,6 +661,7 @@ pub(crate) fn run(
             OGroup::default()
         }
     };
+    let pristine_table = table.clone();
     let mut planned_funcs = pristine_funcs.clone();
     let mut o_stats = crate::profile::time("lane.O", || run_o(table, &mut planned_funcs, &live));
 
@@ -690,14 +721,7 @@ pub(crate) fn run(
             true,
         );
         planned_funcs.extend(excluded);
-        o_stats.inline.applied += post_o.inline.applied;
-        o_stats.inline.cross_object_applied += post_o.inline.cross_object_applied;
-        o_stats.inline.bytes_before += post_o.inline.bytes_before;
-        o_stats.inline.bytes_after += post_o.inline.bytes_after;
-        o_stats.inline.items.extend(post_o.inline.items);
-        o_stats.dce_items.extend(post_o.dce_items);
-        o_stats.witnesses_recorded += post_o.witnesses_recorded;
-        o_stats.witnesses_failed += post_o.witnesses_failed;
+        merge_o_stats(&mut o_stats, post_o);
     }
     let mut funcs = if emitting_plans {
         planned_funcs.clone()
@@ -849,6 +873,7 @@ pub(crate) fn run(
                 &physical,
                 &defined,
                 &live,
+                fault,
             )
         });
         if retry
@@ -866,20 +891,23 @@ pub(crate) fn run(
             for clone in planned_clones.keys() {
                 defined.remove(clone);
                 live.remove(clone);
-                work_table.remove(clone);
             }
             for clone in abi_clones.keys() {
                 defined.remove(clone);
                 live.remove(clone);
-                work_table.remove(clone);
             }
             names.clone_from(&original_names);
+            *table = pristine_table.clone();
             funcs = build_funcs(table, &original_names, &ctx);
-            // The O group re-runs on the pristine Funcs (its decisions are plan-independent and
-            // deterministic), so the retried program is the one a plan-less run prints — the
-            // byte identity `abi-retry-test.sh` holds the fallback to. Its accounting replaces
-            // the first pass's: the sidecar describes the program that came out.
+            // The O group re-runs on the pristine table and Funcs (both `run_o` and `post_o`,
+            // matching a plan-less run), so the retried program is byte-identical to
+            // `js-jir-flat-abi=off`.
             o_stats = run_o(table, &mut funcs, &live);
+            work_table = table.clone();
+            if emitting_plans && opts.analyzes(OptimizerPass::AstDce) {
+                let post_o = o_group_with_mode(&mut work_table, &mut funcs, &ctx, &live, true);
+                merge_o_stats(&mut o_stats, post_o);
+            }
             continue;
         }
         break (lowered, async_plan);
@@ -1630,8 +1658,8 @@ fn lower_all(
     physical: &crate::plan::physical::PhysicalPlan,
     defined: &BTreeSet<JsName>,
     live: &BTreeSet<JsName>,
+    fault: Option<&str>,
 ) -> (Vec<Lowered>, bool) {
-    let fault = abi_fault();
     let mut lowered = Vec::with_capacity(names.len());
     let mut retry = false;
     for name in names {
@@ -1723,9 +1751,7 @@ fn lower_all(
         }
         let touched = plan.touches(name) || repr.touched.contains(name);
         if (touched || !physical.ready_futures.is_empty())
-            && fault
-                .as_deref()
-                .is_some_and(|item| name.as_str().contains(item))
+            && fault.is_some_and(|item| name.as_str().contains(item))
         {
             result = Err(Decline::Lower(LowerDecline::Other {
                 op: OpClass::Region,
@@ -3200,5 +3226,628 @@ mod tests {
         let path = Path::new("/build/program.js");
         assert_eq!(sidecar_path(path), Path::new("/build/program.js.lane.json"));
         assert_eq!(shadow_path(path), Path::new("/build/program.js.jir.js"));
+    }
+
+    #[test]
+    fn abi_fault_retry_matches_flat_abi_off_with_post_repr_vec_push() {
+        use crate::jir::origin::{Origin, OriginKind, OriginTable};
+        use crate::jir::semantic::{
+            AbiSignature, AggregateKind, BasicBlock, BinaryOp, BlockId, Body, BodyKind,
+            BodySemantic, Call, CallSemantic, Callee, Constant, DefinitionId, DirectItemRef, Local,
+            LocalId, LocalRole, Operand, OperandKind, Place, Projection, Rvalue, Signature,
+            StandardOperation, Statement, StatementKind, Terminator, Unwind,
+        };
+        use crate::jir::types::{
+            FieldDescriptor, FieldKey, IntFacts, IntRepr, JsFacts, LayoutFacts, TypeDescriptor,
+            TypeId, TypeKind, TypeMeta,
+        };
+        use crate::jir::Interns;
+        use crate::jir::OriginId;
+        use crate::opts::{Lane, OptimizerMode, Opts};
+        use rcgjs_object::item::{read_object, write_object, JirItem, JsItem, ObjectIdentity};
+
+        const U32: TypeId = TypeId(1);
+        const PAIR: TypeId = TypeId(2);
+        const FN_FLAT: TypeId = TypeId(3);
+        const FN_VEC_PUSH: TypeId = TypeId(4);
+
+        let fn_item = |local_hash: u64| ItemId {
+            definition: DefinitionId {
+                crate_id: 0,
+                local_hash,
+            },
+            instantiation: u128::from(local_hash),
+        };
+        let flat_id = fn_item(2);
+        let push_id = fn_item(3);
+
+        let mut interns = Interns::new();
+        let flat_name = interns.intern_str("flat_callee$h2");
+        let push_name = interns.intern_str("vec_push$h3");
+        let empty_js_facts = |peeled: TypeId| JsFacts {
+            int: None,
+            is_indirect: false,
+            needs_clone: false,
+            crosses_transparent_union: false,
+            transparent: None,
+            peeled,
+            unsized_tail: None,
+            enum_repr: None,
+            is_primitive_enum: false,
+            pointer_form: None,
+            byte_element: false,
+            fields: Vec::new(),
+        };
+        let u32_desc = TypeDescriptor {
+            id: U32,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            layout: LayoutFacts {
+                size: Some(4),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: Some(IntFacts {
+                    signed: false,
+                    bits: 32,
+                    repr: IntRepr::Number,
+                }),
+                ..empty_js_facts(U32)
+            },
+        };
+        let pair_desc = TypeDescriptor {
+            id: PAIR,
+            name: None,
+            kind: TypeKind::Tuple(vec![U32, U32]),
+            layout: LayoutFacts {
+                size: Some(8),
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                is_indirect: true,
+                needs_clone: true,
+                fields: vec![
+                    FieldDescriptor {
+                        key: FieldKey::Index(0),
+                        ty: U32,
+                        offset: 0,
+                    },
+                    FieldDescriptor {
+                        key: FieldKey::Index(1),
+                        ty: U32,
+                        offset: 4,
+                    },
+                ],
+                ..empty_js_facts(PAIR)
+            },
+        };
+        let fn_desc = |id: TypeId, local_hash: u64, item: ItemId, link_name| TypeDescriptor {
+            id,
+            name: None,
+            kind: TypeKind::FnDef {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash,
+                },
+                sig: crate::jir::interns::SigId(0),
+                instance: Some(DirectItemRef { item, link_name }),
+            },
+            layout: LayoutFacts {
+                size: Some(0),
+                zst: true,
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: empty_js_facts(id),
+        };
+        for desc in [
+            u32_desc,
+            pair_desc,
+            fn_desc(FN_FLAT, 2, flat_id, flat_name),
+            fn_desc(FN_VEC_PUSH, 3, push_id, push_name),
+        ] {
+            interns.types.insert(desc);
+        }
+
+        let place = |local: u32, ty: TypeId, proj: Vec<Projection>| Place {
+            local: LocalId(local),
+            projection: proj,
+            ty,
+        };
+        let copy = |local: u32, ty: TypeId| Operand {
+            ty,
+            kind: OperandKind::Copy(place(local, ty, Vec::new())),
+        };
+        let u32_const = |v: u128| Operand {
+            ty: U32,
+            kind: OperandKind::Constant(Constant::Scalar { bits: v, bytes: 4 }),
+        };
+        let assign = |dest: u32, ty: TypeId, value: Rvalue| Statement {
+            kind: StatementKind::Assign {
+                destination: place(dest, ty, Vec::new()),
+                value,
+            },
+        };
+
+        // `vec_push$h3(x: u32) -> u32`: `CallSemantic::Standard(VecLen)` defers pre-repr
+        // inlining so it only inlines during post-repr `o_group_with_mode(..., true)`.
+        let vec_push_body = Body {
+            item: push_id,
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Standard(StandardOperation::VecLen),
+            signature: Signature {
+                arguments: vec![U32],
+                result: U32,
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                },
+            },
+            locals: vec![
+                Local {
+                    id: LocalId(0),
+                    role: LocalRole::Return,
+                    ty: U32,
+                },
+                Local {
+                    id: LocalId(1),
+                    role: LocalRole::Argument,
+                    ty: U32,
+                },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                cleanup: false,
+                statements: vec![assign(
+                    0,
+                    U32,
+                    Rvalue::Binary {
+                        op: BinaryOp::Add,
+                        left: copy(1, U32),
+                        right: u32_const(1),
+                    },
+                )],
+                terminator: Terminator::Return,
+            }],
+        };
+
+        // `flat_callee$h2(p: (u32, u32)) -> u32`: big enough not to inline across 4 sites, small
+        // enough for `abi_flat` to flatten `p` into two `u32` arguments.
+        let mut flat_stmts = vec![
+            assign(
+                2,
+                U32,
+                Rvalue::Use(Operand {
+                    ty: U32,
+                    kind: OperandKind::Copy(place(
+                        1,
+                        U32,
+                        vec![Projection::Field { field: 0, ty: U32 }],
+                    )),
+                }),
+            ),
+            assign(
+                3,
+                U32,
+                Rvalue::Use(Operand {
+                    ty: U32,
+                    kind: OperandKind::Copy(place(
+                        1,
+                        U32,
+                        vec![Projection::Field { field: 1, ty: U32 }],
+                    )),
+                }),
+            ),
+            assign(
+                4,
+                U32,
+                Rvalue::Binary {
+                    op: BinaryOp::Add,
+                    left: copy(2, U32),
+                    right: copy(3, U32),
+                },
+            ),
+        ];
+        for step in 1..22u128 {
+            flat_stmts.push(assign(
+                4,
+                U32,
+                Rvalue::Binary {
+                    op: BinaryOp::BitXor,
+                    left: copy(4, U32),
+                    right: u32_const(step),
+                },
+            ));
+        }
+        flat_stmts.push(assign(0, U32, Rvalue::Use(copy(4, U32))));
+        let flat_body = Body {
+            item: flat_id,
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Ordinary,
+            signature: Signature {
+                arguments: vec![PAIR],
+                result: U32,
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                },
+            },
+            locals: vec![
+                Local {
+                    id: LocalId(0),
+                    role: LocalRole::Return,
+                    ty: U32,
+                },
+                Local {
+                    id: LocalId(1),
+                    role: LocalRole::Argument,
+                    ty: PAIR,
+                },
+                Local {
+                    id: LocalId(2),
+                    role: LocalRole::Temporary,
+                    ty: U32,
+                },
+                Local {
+                    id: LocalId(3),
+                    role: LocalRole::Temporary,
+                    ty: U32,
+                },
+                Local {
+                    id: LocalId(4),
+                    role: LocalRole::Temporary,
+                    ty: U32,
+                },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                cleanup: false,
+                statements: flat_stmts,
+                terminator: Terminator::Return,
+            }],
+        };
+
+        // `caller$h1(x: u32) -> u32`: calls `vec_push$h3(x)`, then calls `flat_callee$h2` 4 times
+        // with freshly constructed `(u32, u32)` pairs so `abi_flat` accepts `flat_callee$h2`.
+        let caller_body = {
+            let mut blocks = Vec::new();
+            blocks.push(BasicBlock {
+                id: BlockId(0),
+                cleanup: false,
+                statements: Vec::new(),
+                terminator: Terminator::Call(Call {
+                    function: Operand {
+                        ty: FN_VEC_PUSH,
+                        kind: OperandKind::Constant(Constant::ZeroSized),
+                    },
+                    callee: Callee::Direct {
+                        item: push_id,
+                        link_name: push_name,
+                    },
+                    semantic: CallSemantic::Standard(StandardOperation::VecLen),
+                    arguments: vec![copy(1, U32)],
+                    destination: place(2, U32, Vec::new()),
+                    target: Some(BlockId(1)),
+                    unwind: Unwind::Continue,
+                    track_caller: None,
+                    host: None,
+                }),
+            });
+            for idx in 0..4u32 {
+                let pair_local = 3 + idx * 2;
+                let res_local = 4 + idx * 2;
+                blocks.push(BasicBlock {
+                    id: BlockId(1 + idx),
+                    cleanup: false,
+                    statements: vec![assign(
+                        pair_local,
+                        PAIR,
+                        Rvalue::Aggregate {
+                            kind: AggregateKind::Tuple,
+                            result: PAIR,
+                            operands: vec![copy(2, U32), u32_const(u128::from(idx))],
+                        },
+                    )],
+                    terminator: Terminator::Call(Call {
+                        function: Operand {
+                            ty: FN_FLAT,
+                            kind: OperandKind::Constant(Constant::ZeroSized),
+                        },
+                        callee: Callee::Direct {
+                            item: flat_id,
+                            link_name: flat_name,
+                        },
+                        semantic: CallSemantic::Ordinary,
+                        arguments: vec![copy(pair_local, PAIR)],
+                        destination: place(res_local, U32, Vec::new()),
+                        target: Some(BlockId(2 + idx)),
+                        unwind: Unwind::Continue,
+                        track_caller: None,
+                        host: None,
+                    }),
+                });
+            }
+            blocks.push(BasicBlock {
+                id: BlockId(5),
+                cleanup: false,
+                statements: vec![
+                    assign(
+                        11,
+                        U32,
+                        Rvalue::Binary {
+                            op: BinaryOp::Add,
+                            left: copy(4, U32),
+                            right: copy(6, U32),
+                        },
+                    ),
+                    assign(
+                        12,
+                        U32,
+                        Rvalue::Binary {
+                            op: BinaryOp::Add,
+                            left: copy(8, U32),
+                            right: copy(10, U32),
+                        },
+                    ),
+                    assign(
+                        0,
+                        U32,
+                        Rvalue::Binary {
+                            op: BinaryOp::Add,
+                            left: copy(11, U32),
+                            right: copy(12, U32),
+                        },
+                    ),
+                ],
+                terminator: Terminator::Return,
+            });
+            let mut locals = vec![
+                Local {
+                    id: LocalId(0),
+                    role: LocalRole::Return,
+                    ty: U32,
+                },
+                Local {
+                    id: LocalId(1),
+                    role: LocalRole::Argument,
+                    ty: U32,
+                },
+                Local {
+                    id: LocalId(2),
+                    role: LocalRole::Temporary,
+                    ty: U32,
+                },
+            ];
+            for idx in 0..4u32 {
+                locals.push(Local {
+                    id: LocalId(3 + idx * 2),
+                    role: LocalRole::Temporary,
+                    ty: PAIR,
+                });
+                locals.push(Local {
+                    id: LocalId(4 + idx * 2),
+                    role: LocalRole::Temporary,
+                    ty: U32,
+                });
+            }
+            locals.push(Local {
+                id: LocalId(11),
+                role: LocalRole::Temporary,
+                ty: U32,
+            });
+            locals.push(Local {
+                id: LocalId(12),
+                role: LocalRole::Temporary,
+                ty: U32,
+            });
+            Body {
+                item: fn_item(1),
+                kind: BodyKind::Function,
+                semantic: BodySemantic::Ordinary,
+                signature: Signature {
+                    arguments: vec![U32],
+                    result: U32,
+                    abi: AbiSignature {
+                        parameters: 1,
+                        spread: None,
+                        caller_location: false,
+                    },
+                },
+                locals,
+                blocks,
+            }
+        };
+
+        let body_origins = |item_path, body: &Body| {
+            let stmt_count: usize = body.blocks.iter().map(|b| b.statements.len()).sum();
+            let make_origin = |kind| Origin {
+                kind,
+                source: None,
+                local_name: None,
+                inline_stack: Vec::new(),
+            };
+            OriginTable {
+                origins: vec![
+                    make_origin(OriginKind::Statement),
+                    make_origin(OriginKind::Terminator),
+                    make_origin(OriginKind::Local),
+                ],
+                statements: vec![OriginId(0); stmt_count],
+                terminators: vec![OriginId(1); body.blocks.len()],
+                locals: vec![OriginId(2); body.locals.len()],
+                item_path,
+                root: None,
+            }
+        };
+        let stub_decl = |name: &str| {
+            jsast::function(name.to_owned(), Vec::new(), vec![jsast::Stmt::Return(None)])
+        };
+        let caller_name_str = interns.intern_str("caller$h1");
+        let caller_decl = jsast::function(
+            "caller$h1".to_owned(),
+            vec!["x".to_owned()],
+            vec![jsast::Stmt::Return(Some(jsast::binary(
+                jsast::BinOp::Add,
+                jsast::call(
+                    jsast::Expr::Ident("vec_push$h3".to_owned()),
+                    vec![jsast::Expr::Ident("x".to_owned())],
+                ),
+                jsast::call(
+                    jsast::Expr::Ident("flat_callee$h2".to_owned()),
+                    vec![jsast::Expr::Array(vec![])],
+                ),
+            )))],
+        );
+
+        let caller_origins = body_origins(caller_name_str, &caller_body);
+        let flat_origins = body_origins(flat_name, &flat_body);
+        let push_origins = body_origins(push_name, &vec_push_body);
+
+        let js_items = vec![
+            JsItem::new(
+                JsName::new("caller$h1".to_owned()),
+                ItemKind::Fn,
+                caller_decl,
+                Vec::new(),
+                Linkage::exported("caller$h1".to_owned()),
+                "test::caller$h1".to_owned(),
+            )
+            .with_jir(
+                Some(JirItem {
+                    body: caller_body,
+                    origins: caller_origins,
+                }),
+                None,
+            ),
+            JsItem::new(
+                JsName::new("flat_callee$h2".to_owned()),
+                ItemKind::Fn,
+                stub_decl("flat_callee$h2"),
+                Vec::new(),
+                Linkage::internal(),
+                "test::flat_callee$h2".to_owned(),
+            )
+            .with_jir(
+                Some(JirItem {
+                    body: flat_body,
+                    origins: flat_origins,
+                }),
+                None,
+            ),
+            JsItem::new(
+                JsName::new("vec_push$h3".to_owned()),
+                ItemKind::Fn,
+                stub_decl("vec_push$h3"),
+                Vec::new(),
+                Linkage::internal(),
+                "test::vec_push$h3".to_owned(),
+            )
+            .with_jir(
+                Some(JirItem {
+                    body: vec_push_body,
+                    origins: push_origins,
+                }),
+                None,
+            ),
+        ];
+
+        let obj_bytes = write_object(
+            "",
+            &js_items,
+            true,
+            "test",
+            &ObjectIdentity::default(),
+            interns,
+            &BTreeMap::new(),
+        );
+        let read = read_object(&obj_bytes)
+            .expect("valid object")
+            .expect("format 20 object");
+        let mut pristine_table = BTreeMap::new();
+        for mut entry in read.items {
+            assert!(entry.jir.decode().expect("decode jir"));
+            pristine_table.insert(entry.name.clone(), entry);
+        }
+
+        let reachable = vec![
+            JsName::new("caller$h1".to_owned()),
+            JsName::new("flat_callee$h2".to_owned()),
+            JsName::new("vec_push$h3".to_owned()),
+        ];
+        let sources = Default::default();
+        let dcx = Sink::default();
+
+        let opts_on = Opts {
+            optimizer: OptimizerMode::On,
+            lane: Lane::Jir,
+            flat_abi: true,
+            ..Opts::default()
+        };
+        let mut fault_table = pristine_table.clone();
+        let fault_run = run_with_opts(
+            &dcx,
+            &mut fault_table,
+            &reachable,
+            &sources,
+            &opts_on,
+            Some("flat_callee"),
+        );
+
+        let opts_flat_off = Opts {
+            optimizer: OptimizerMode::On,
+            lane: Lane::Jir,
+            flat_abi: false,
+            ..Opts::default()
+        };
+        let mut off_table = pristine_table;
+        let off_run = run_with_opts(
+            &dcx,
+            &mut off_table,
+            &reachable,
+            &sources,
+            &opts_flat_off,
+            None,
+        );
+
+        assert_eq!(
+            fault_run.plan_retries, 1,
+            "abi_json={:?}, passes={:?}, outcomes={:?}",
+            fault_run.abi_json, fault_run.passes, fault_run.outcomes
+        );
+        assert_eq!(off_run.plan_retries, 0);
+        assert!(
+            fault_run.passes.applied.inline >= 1,
+            "post-repr inline must inline vec_push after retry: passes={:?}, o={:?}, caller_js={}",
+            fault_run.passes,
+            fault_run.o,
+            fault_table[&JsName::new("caller$h1".to_owned())].js
+        );
+        assert_eq!(
+            fault_run.passes.applied.inline,
+            off_run.passes.applied.inline
+        );
+
+        let caller_name = JsName::new("caller$h1".to_owned());
+        assert!(
+            !fault_table[&caller_name].js.contains("vec_push"),
+            "vec_push must be inlined into caller on retry: {}",
+            fault_table[&caller_name].js
+        );
+        for (name, off_item) in &off_table {
+            assert_eq!(
+                fault_table[name].js, off_item.js,
+                "item {name} JS diverged between ABI-fault retry and flat_abi=off"
+            );
+        }
     }
 }

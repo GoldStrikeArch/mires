@@ -44,7 +44,9 @@ use crate::jir::origin::SourceFactId;
 use crate::jir::repr::{
     CellId, Func, Op, OpKind, Proj, RAssertMessage, RBlock, RBlockId, RTerm, Root, ValueId,
 };
-use crate::jir::semantic::{CallSemantic, Callee, HostPayload};
+use crate::jir::semantic::{
+    CallSemantic, Callee, ConstTree, DropGlue, GlobalReference, HostPayload,
+};
 use crate::jir::types::{NominalForm, TypeKind, TypeTable};
 use crate::lower::js::host::ItemIndex;
 
@@ -237,6 +239,12 @@ pub(crate) fn run_with_mode(
                 stats.decline("inline.cost-no-opportunity");
                 continue;
             };
+            if site.host_boundary
+                && count_item_refs(&current, &current_metadata.interns, site.callee.as_str()) != 1
+            {
+                stats.decline("inline.host-boundary");
+                continue;
+            }
             let Some(Ok(callee_func)) = funcs.get(&site.callee) else {
                 continue;
             };
@@ -312,6 +320,11 @@ pub(crate) fn run_with_mode(
                 stats.decline("inline.cost-unavailable");
                 continue;
             };
+            if site.host_boundary && refs.contains(&site.callee) {
+                current = backup;
+                stats.decline("inline.host-boundary");
+                continue;
+            }
             let delta = after as i64 - bytes as i64;
             // The sole-referrer oracle excludes public and explicitly rooted items. Credit
             // deletion only after the emitted caller also lost every reference to the callee,
@@ -618,6 +631,8 @@ fn collect_sites(
                 continue;
             };
             let is_sole_caller = sole_referrer(&callee, caller);
+            let allow_host_boundary = is_sole_caller
+                && count_item_refs(func, &caller_metadata.interns, callee.as_str()) == 1;
             if let Some(reason) = body_decline(
                 callee_func,
                 &callee_metadata.interns,
@@ -625,7 +640,7 @@ fn collect_sites(
                 func.sig.abi.caller_location,
                 *track_caller,
                 items,
-                is_sole_caller,
+                allow_host_boundary,
             ) {
                 stats.decline(reason);
                 continue;
@@ -723,6 +738,58 @@ fn rewrite_forwarded_track_caller(callee: &mut Func, site_fact: SourceFactId, it
             }
         }
     }
+}
+
+fn const_item_refs(tree: &ConstTree, interns: &Interns, target: &str) -> usize {
+    match tree {
+        ConstTree::Aggregate(fields)
+        | ConstTree::Variant { fields, .. }
+        | ConstTree::Slice(fields) => fields
+            .iter()
+            .map(|field| const_item_refs(field, interns, target))
+            .sum(),
+        ConstTree::Reference(inner) => const_item_refs(inner, interns, target),
+        ConstTree::Global {
+            target:
+                GlobalReference::Function { link_name, .. } | GlobalReference::Static { link_name, .. },
+            ..
+        } => usize::from(interns.str(*link_name) == Some(target)),
+        ConstTree::Unit
+        | ConstTree::Scalar { .. }
+        | ConstTree::Str(_)
+        | ConstTree::Address(_)
+        | ConstTree::Global {
+            target: GlobalReference::Type(_),
+            ..
+        } => 0,
+    }
+}
+
+fn count_item_refs(func: &Func, interns: &Interns, target: &str) -> usize {
+    func.blocks
+        .iter()
+        .flat_map(|block| &block.ops)
+        .map(|op| match &op.kind {
+            OpKind::Const(tree) => const_item_refs(tree, interns, target),
+            OpKind::Drop {
+                glue: DropGlue::Direct { link_name, .. },
+                ..
+            } => usize::from(interns.str(*link_name) == Some(target)),
+            OpKind::Intrinsic {
+                fallback: Some(d), ..
+            } => usize::from(interns.str(d.link_name) == Some(target)),
+            OpKind::Call { callee, .. } => match callee {
+                Callee::Direct { link_name, .. } => {
+                    usize::from(interns.str(*link_name) == Some(target))
+                }
+                Callee::Intrinsic {
+                    fallback: Some(d), ..
+                } => usize::from(interns.str(d.link_name) == Some(target)),
+                _ => 0,
+            },
+            _ => 0,
+        })
+        .sum()
 }
 
 fn is_host_boundary_op(kind: &OpKind, interns: &Interns) -> bool {
@@ -2608,5 +2675,74 @@ mod tests {
         assert_eq!(multi_stats.applied, 0);
         assert_eq!(multi_stats.declined.get("inline.host-boundary"), Some(&1));
         assert_eq!(multi_prog.calls_in("f"), 1);
+    }
+
+    #[test]
+    fn sole_caller_calling_host_boundary_twice_declines() {
+        let mut prog = Prog::new();
+        let h_str = prog.strid("h");
+        let section = prog.strid("rcgjs.host.custom");
+
+        let mut h_b = FuncBuilder::new(item(2), sig(1));
+        let hx = h_b.param(I32, O);
+        h_b.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Host {
+                payload: HostPayload::Marker {
+                    section,
+                    def: item(2).definition,
+                    template: None,
+                    helpers: Vec::new(),
+                },
+                args: vec![hx],
+            },
+            O,
+        );
+        h_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(hx)));
+        let h = h_b.finish();
+
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let fx = f_b.param(I32, O);
+        let first = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: h_str,
+                },
+                function: None,
+                args: vec![fx],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        let second = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: h_str,
+                },
+                function: None,
+                args: vec![first],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(second)));
+        let f = f_b.finish();
+
+        prog.add("h", h);
+        prog.add("f", f);
+        let stats = prog.run(10_000, true);
+        assert_eq!(stats.applied, 0);
+        assert_eq!(stats.declined.get("inline.host-boundary"), Some(&2));
+        assert_eq!(prog.calls_in("f"), 2);
     }
 }
