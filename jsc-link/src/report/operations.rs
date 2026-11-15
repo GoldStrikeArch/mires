@@ -281,6 +281,7 @@ mod tests {
                         parameters: 1,
                         spread: None,
                         caller_location: false,
+                        inline_never: false,
                     },
                     arguments: vec![TypeId(1)],
                     result: TypeId(1),

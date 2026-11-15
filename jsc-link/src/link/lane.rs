@@ -700,7 +700,7 @@ fn run_with_opts(
         );
     }
     let emitting_plans = opts.optimizer == crate::opts::OptimizerMode::On;
-    if emitting_plans && opts.analyzes(OptimizerPass::AstDce) {
+    if opts.analyzes(OptimizerPass::AstDce) {
         let mut excluded: BTreeMap<JsName, Result<Func, Decline>> = BTreeMap::new();
         for name in planned_repr
             .bodies
@@ -1399,7 +1399,7 @@ fn o_group_with_mode(
     if !(run_inline || run_devirt || run_dce) {
         return group;
     }
-    if run_dce && !allow_std_post_repr {
+    if run_dce {
         crate::opt::prune_invoke::run(table, funcs, live);
     }
     let interns_map: BTreeMap<JsName, &crate::jir::Interns> = table
@@ -1544,10 +1544,18 @@ fn o_group_with_mode(
             item.jir.origins = origins;
         }
     }
+    let pruned_post_inline = run_dce
+        && group.inline.applied > 0
+        && crate::opt::prune_invoke::run(table, funcs, live) > 0;
     let interns_map: BTreeMap<JsName, &crate::jir::Interns> = table
         .iter()
         .filter_map(|(name, item)| Some((name.clone(), item.jir.interns()?)))
         .collect();
+    if pruned_post_inline {
+        graph = callgraph::build(funcs, &interns_map);
+        summaries = effects::compute(funcs, &interns_map, &graph);
+        group.summaries_items = summaries.len() as u32;
+    }
     if run_devirt {
         group.devirt = crate::opt::devirtualize::run(funcs, &interns_map, table, ctx.vtables);
     }
@@ -3390,6 +3398,7 @@ mod tests {
                     parameters: 1,
                     spread: None,
                     caller_location: false,
+                    inline_never: false,
                 },
             },
             locals: vec![
@@ -3480,6 +3489,7 @@ mod tests {
                     parameters: 1,
                     spread: None,
                     caller_location: false,
+                    inline_never: false,
                 },
             },
             locals: vec![
@@ -3661,6 +3671,7 @@ mod tests {
                         parameters: 1,
                         spread: None,
                         caller_location: false,
+                        inline_never: false,
                     },
                 },
                 locals,
@@ -3849,5 +3860,393 @@ mod tests {
                 "item {name} JS diverged between ABI-fault retry and flat_abi=off"
             );
         }
+    }
+
+    #[test]
+    fn o_group_prunes_invoke_after_inlining_noop_wrapper_and_in_post_repr_mode() {
+        use crate::jir::origin::{Origin, OriginKind, OriginTable};
+        use crate::jir::semantic::{
+            AbiSignature, BasicBlock, BlockId, Body, BodyKind, BodySemantic, Call, CallSemantic,
+            Callee, DefinitionId, DirectItemRef, HostPayload, Local, LocalId, LocalRole, Operand,
+            OperandKind, Place, Signature, Terminator, Unwind,
+        };
+        use crate::jir::types::{JsFacts, LayoutFacts, TypeDescriptor, TypeId, TypeKind, TypeMeta};
+        use crate::jir::{Interns, OriginId};
+        use crate::opts::{Lane, OptimizerMode, Opts};
+        use rcgjs_object::item::{read_object, write_object, JirItem, JsItem, ObjectIdentity};
+
+        const UNIT: TypeId = TypeId(1);
+        const FN_EMPTY: TypeId = TypeId(2);
+        const FN_WRAP: TypeId = TypeId(3);
+        const FN_HOST: TypeId = TypeId(4);
+
+        let fn_item = |local_hash: u64| ItemId {
+            definition: DefinitionId {
+                crate_id: 0,
+                local_hash,
+            },
+            instantiation: u128::from(local_hash),
+        };
+        let caller_id = fn_item(1);
+        let wrapper_id = fn_item(2);
+        let empty_id = fn_item(3);
+
+        let mut interns = Interns::new();
+        let caller_str = interns.intern_str("caller$h1");
+        let wrapper_str = interns.intern_str("wrapper$h2");
+        let empty_str = interns.intern_str("empty_drop$h3");
+        let host_sec = interns.intern_str("rcgjs.host.isnull");
+
+        let empty_js_facts = |peeled: TypeId| JsFacts {
+            int: None,
+            is_indirect: false,
+            needs_clone: false,
+            crosses_transparent_union: false,
+            transparent: None,
+            peeled,
+            unsized_tail: None,
+            enum_repr: None,
+            is_primitive_enum: false,
+            pointer_form: None,
+            byte_element: false,
+            fields: Vec::new(),
+        };
+        interns.types.insert(TypeDescriptor {
+            id: UNIT,
+            name: None,
+            kind: TypeKind::Tuple(Vec::new()),
+            layout: LayoutFacts {
+                size: Some(0),
+                zst: true,
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: empty_js_facts(UNIT),
+        });
+        for (ty_id, h, item_id, name) in [
+            (FN_EMPTY, 3, empty_id, empty_str),
+            (FN_WRAP, 2, wrapper_id, wrapper_str),
+            (
+                FN_HOST,
+                4,
+                fn_item(4),
+                interns.intern_str("isnull_marker$h4"),
+            ),
+        ] {
+            interns.types.insert(TypeDescriptor {
+                id: ty_id,
+                name: None,
+                kind: TypeKind::FnDef {
+                    def: DefinitionId {
+                        crate_id: 0,
+                        local_hash: h,
+                    },
+                    sig: crate::jir::interns::SigId(0),
+                    instance: Some(DirectItemRef {
+                        item: item_id,
+                        link_name: name,
+                    }),
+                },
+                layout: LayoutFacts {
+                    size: Some(0),
+                    zst: true,
+                    sized: true,
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: empty_js_facts(ty_id),
+            });
+        }
+
+        let unit_sig = Signature {
+            arguments: Vec::new(),
+            result: UNIT,
+            abi: AbiSignature::default(),
+        };
+        let unit_ret_local = Local {
+            id: LocalId(0),
+            role: LocalRole::Return,
+            ty: UNIT,
+        };
+        let unit_place = Place {
+            local: LocalId(0),
+            projection: Vec::new(),
+            ty: UNIT,
+        };
+
+        // `empty_drop$h3() { return; }`
+        let empty_body = Body {
+            item: empty_id,
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Ordinary,
+            signature: unit_sig.clone(),
+            locals: vec![unit_ret_local],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                cleanup: false,
+                statements: Vec::new(),
+                terminator: Terminator::Return,
+            }],
+        };
+
+        // `wrapper$h2() { empty_drop$h3(); return; }` — non-empty before `inline`, becomes
+        // 0-op `Return(None)` after `inline` splices `empty_drop$h3`.
+        let wrapper_body = Body {
+            item: wrapper_id,
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Ordinary,
+            signature: unit_sig.clone(),
+            locals: vec![unit_ret_local],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    cleanup: false,
+                    statements: Vec::new(),
+                    terminator: Terminator::Call(Call {
+                        function: Operand {
+                            ty: FN_EMPTY,
+                            kind: OperandKind::Constant(crate::jir::semantic::Constant::ZeroSized),
+                        },
+                        callee: Callee::Direct {
+                            item: empty_id,
+                            link_name: empty_str,
+                        },
+                        semantic: CallSemantic::Ordinary,
+                        arguments: Vec::new(),
+                        destination: unit_place.clone(),
+                        target: Some(BlockId(1)),
+                        unwind: Unwind::Continue,
+                        track_caller: None,
+                        host: None,
+                    }),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    cleanup: false,
+                    statements: Vec::new(),
+                    terminator: Terminator::Return,
+                },
+            ],
+        };
+
+        // `caller$h1()` invokes a throwing host marker; its unwind cleanup calls `wrapper$h2` and
+        // rethrows (`UnwindResume`). Only after `inline` empties `wrapper$h2` does post-inline
+        // `prune_invoke::run` discover `wrapper$h2` is a noop and prune `caller`'s `Invoke`.
+        let caller_body = Body {
+            item: caller_id,
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Ordinary,
+            signature: unit_sig,
+            locals: vec![unit_ret_local],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    cleanup: false,
+                    statements: Vec::new(),
+                    terminator: Terminator::Call(Call {
+                        function: Operand {
+                            ty: FN_HOST,
+                            kind: OperandKind::Constant(crate::jir::semantic::Constant::ZeroSized),
+                        },
+                        callee: Callee::Direct {
+                            item: fn_item(4),
+                            link_name: empty_str,
+                        },
+                        semantic: CallSemantic::Host,
+                        arguments: Vec::new(),
+                        destination: unit_place.clone(),
+                        target: Some(BlockId(1)),
+                        unwind: Unwind::Cleanup(BlockId(2)),
+                        track_caller: None,
+                        host: Some(HostPayload::Marker {
+                            section: host_sec,
+                            def: DefinitionId {
+                                crate_id: 0,
+                                local_hash: 4,
+                            },
+                            template: None,
+                            helpers: Vec::new(),
+                        }),
+                    }),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    cleanup: false,
+                    statements: Vec::new(),
+                    terminator: Terminator::Return,
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    cleanup: true,
+                    statements: Vec::new(),
+                    terminator: Terminator::Call(Call {
+                        function: Operand {
+                            ty: FN_WRAP,
+                            kind: OperandKind::Constant(crate::jir::semantic::Constant::ZeroSized),
+                        },
+                        callee: Callee::Direct {
+                            item: wrapper_id,
+                            link_name: wrapper_str,
+                        },
+                        semantic: CallSemantic::Ordinary,
+                        arguments: Vec::new(),
+                        destination: unit_place,
+                        target: Some(BlockId(3)),
+                        unwind: Unwind::Terminate(crate::jir::semantic::TerminateReason::InCleanup),
+                        track_caller: None,
+                        host: None,
+                    }),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    cleanup: true,
+                    statements: Vec::new(),
+                    terminator: Terminator::UnwindResume,
+                },
+            ],
+        };
+
+        let make_origins = |item_path, body: &Body| OriginTable {
+            origins: vec![
+                Origin {
+                    kind: OriginKind::Terminator,
+                    source: None,
+                    local_name: None,
+                    inline_stack: Vec::new(),
+                },
+                Origin {
+                    kind: OriginKind::Local,
+                    source: None,
+                    local_name: None,
+                    inline_stack: Vec::new(),
+                },
+            ],
+            statements: Vec::new(),
+            terminators: vec![OriginId(0); body.blocks.len()],
+            locals: vec![OriginId(1); body.locals.len()],
+            item_path,
+            root: None,
+        };
+        let stub_decl = |name: &str| {
+            jsast::function(name.to_owned(), Vec::new(), vec![jsast::Stmt::Return(None)])
+        };
+        let caller_decl = jsast::function(
+            "caller$h1".to_owned(),
+            Vec::new(),
+            vec![jsast::Stmt::Return(Some(jsast::call(
+                jsast::Expr::Ident("wrapper$h2".to_owned()),
+                Vec::new(),
+            )))],
+        );
+        let wrapper_decl = jsast::function(
+            "wrapper$h2".to_owned(),
+            Vec::new(),
+            vec![jsast::Stmt::Return(Some(jsast::call(
+                jsast::Expr::Ident("empty_drop$h3".to_owned()),
+                Vec::new(),
+            )))],
+        );
+        let caller_origins = make_origins(caller_str, &caller_body);
+        let wrapper_origins = make_origins(wrapper_str, &wrapper_body);
+        let empty_origins = make_origins(empty_str, &empty_body);
+
+        let js_items = vec![
+            JsItem::new(
+                JsName::new("caller$h1".to_owned()),
+                ItemKind::Fn,
+                caller_decl,
+                Vec::new(),
+                Linkage::exported("caller$h1".to_owned()),
+                "test::caller$h1".to_owned(),
+            )
+            .with_jir(
+                Some(JirItem {
+                    body: caller_body,
+                    origins: caller_origins,
+                }),
+                None,
+            ),
+            JsItem::new(
+                JsName::new("wrapper$h2".to_owned()),
+                ItemKind::Fn,
+                wrapper_decl,
+                Vec::new(),
+                Linkage::internal(),
+                "test::wrapper$h2".to_owned(),
+            )
+            .with_jir(
+                Some(JirItem {
+                    body: wrapper_body,
+                    origins: wrapper_origins,
+                }),
+                None,
+            ),
+            JsItem::new(
+                JsName::new("empty_drop$h3".to_owned()),
+                ItemKind::Fn,
+                stub_decl("empty_drop$h3"),
+                Vec::new(),
+                Linkage::internal(),
+                "test::empty_drop$h3".to_owned(),
+            )
+            .with_jir(
+                Some(JirItem {
+                    body: empty_body,
+                    origins: empty_origins,
+                }),
+                None,
+            ),
+        ];
+        let obj_bytes = write_object(
+            "",
+            &js_items,
+            true,
+            "test",
+            &ObjectIdentity::default(),
+            interns,
+            &BTreeMap::new(),
+        );
+        let read = read_object(&obj_bytes).unwrap().unwrap();
+        let mut table = BTreeMap::new();
+        for mut entry in read.items {
+            assert!(entry.jir.decode().unwrap());
+            table.insert(entry.name.clone(), entry);
+        }
+
+        let opts = Opts {
+            optimizer: OptimizerMode::On,
+            lane: Lane::Jir,
+            ..Opts::default()
+        };
+        let (items, drop_glue) = item_index(&table);
+        let vtables = vtable_index(&table);
+        let ctx = Ctx {
+            opts: &opts,
+            items: &items,
+            drop_glue: &drop_glue,
+            vtables: &vtables,
+        };
+        let names = vec![
+            JsName::new("caller$h1".to_owned()),
+            JsName::new("wrapper$h2".to_owned()),
+            JsName::new("empty_drop$h3".to_owned()),
+        ];
+        let live: BTreeSet<JsName> = names.iter().cloned().collect();
+        let mut funcs = build_funcs(&table, &names, &ctx);
+        assert!(funcs[&JsName::new("caller$h1".to_owned())]
+            .as_ref()
+            .unwrap()
+            .has_invoke());
+
+        let group = o_group_with_mode(&mut table, &mut funcs, &ctx, &live, true);
+        assert_eq!(group.inline.applied, 1);
+        assert!(
+            !funcs[&JsName::new("caller$h1".to_owned())]
+                .as_ref()
+                .unwrap()
+                .has_invoke(),
+            "post-inline prune_invoke must prune Invoke once inline empties wrapper$h2 (even with allow_std_post_repr=true)"
+        );
     }
 }

@@ -265,6 +265,7 @@ fn signature(arguments: Vec<TypeId>, result: TypeId) -> Signature {
             parameters: arguments.len() as u16,
             spread: None,
             caller_location: false,
+            inline_never: false,
         },
         arguments,
         result,
@@ -2209,4 +2210,76 @@ fn repr_direct_calls_resume_loop_parameters_and_void_calls() {
             2 * n as usize
         );
     }
+}
+
+#[test]
+fn repr_allows_move_of_loop_redefined_value_and_block_param_across_backedge() {
+    let interns = world();
+    let mut b = FuncBuilder::new(item(1), signature(vec![I32], I32));
+    let limit = b.param(I32, ORIGIN);
+    let zero = b.op(
+        FuncBuilder::ENTRY,
+        OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+        I32,
+        ORIGIN,
+    );
+    let header = b.block();
+    let counter = b.block_param(header, I32, ORIGIN);
+    let exit = b.block();
+    let exit_val = b.block_param(exit, I32, ORIGIN);
+    b.terminate(FuncBuilder::ENTRY, RTerm::Goto(header, vec![zero]));
+
+    let body_val = b.op(header, OpKind::Copy(counter), I32, ORIGIN);
+    let moved_param = b.op(header, OpKind::Move(counter), I32, ORIGIN);
+    let moved_val = b.op(header, OpKind::Move(body_val), I32, ORIGIN);
+    let more = b.op(
+        header,
+        OpKind::Binary {
+            op: BinaryOp::Lt,
+            l: moved_param,
+            r: limit,
+            ty: I32,
+        },
+        BOOL,
+        ORIGIN,
+    );
+    b.terminate(
+        header,
+        RTerm::Switch {
+            scrut: more,
+            scrut_ty: BOOL,
+            cases: vec![(0, exit, vec![moved_val])],
+            default: (header, vec![moved_val]),
+        },
+    );
+    b.terminate(exit, RTerm::Return(Some(exit_val)));
+    let func = b.finish();
+    func.verify(&interns.types).unwrap();
+}
+
+#[test]
+fn repr_rejects_move_of_loop_invariant_outer_value_across_backedge() {
+    let interns = world();
+    let mut b = FuncBuilder::new(item(1), signature(vec![I32, BOOL], I32));
+    let outer = b.param(I32, ORIGIN);
+    let cond = b.param(BOOL, ORIGIN);
+    let header = b.block();
+    let exit = b.block();
+    let exit_val = b.block_param(exit, I32, ORIGIN);
+    b.terminate(FuncBuilder::ENTRY, RTerm::Goto(header, Vec::new()));
+
+    let moved = b.op(header, OpKind::Move(outer), I32, ORIGIN);
+    b.terminate(
+        header,
+        RTerm::Switch {
+            scrut: cond,
+            scrut_ty: BOOL,
+            cases: vec![(0, exit, vec![moved])],
+            default: (header, Vec::new()),
+        },
+    );
+    b.terminate(exit, RTerm::Return(Some(exit_val)));
+    let func = b.finish();
+    let error = func.verify(&interns.types).unwrap_err();
+    assert!(error.message.contains("after being moved"), "{error}");
 }

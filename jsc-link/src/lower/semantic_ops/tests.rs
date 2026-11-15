@@ -430,6 +430,7 @@ fn sig(arguments: Vec<TypeId>, result: TypeId) -> Signature {
             parameters,
             spread: None,
             caller_location: false,
+            inline_never: false,
         },
     }
 }
@@ -445,6 +446,7 @@ fn sig_tracked(arguments: Vec<TypeId>, result: TypeId) -> Signature {
             parameters,
             spread: None,
             caller_location: true,
+            inline_never: false,
         },
     }
 }

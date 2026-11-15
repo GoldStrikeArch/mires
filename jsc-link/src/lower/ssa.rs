@@ -3301,6 +3301,7 @@ mod tests {
                 parameters: arguments.len() as u16,
                 spread: None,
                 caller_location: false,
+                inline_never: false,
             },
             arguments,
             result,

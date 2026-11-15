@@ -339,6 +339,17 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             None => None,
         };
         let caller_location = self.instance().def.requires_caller_location(self.tcx());
+        let inline_never = matches!(
+            self.instance().def,
+            ty::InstanceKind::Item(def_id)
+                if matches!(
+                    self.tcx().def_kind(def_id),
+                    rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
+                ) && matches!(
+                    self.tcx().codegen_fn_attrs(def_id).inline,
+                    rustc_hir::attrs::InlineAttr::Never
+                )
+        );
         let parameters = mir
             .arg_count
             .checked_sub(usize::from(spread.is_some()))
@@ -350,6 +361,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             parameters,
             spread,
             caller_location,
+            inline_never,
         })
     }
 

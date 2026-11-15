@@ -13,7 +13,7 @@ use crate::analysis::refs::{self, RefScan};
 use crate::item::{ItemKind, JsName, LinkItem};
 use crate::jir::decline::Decline;
 use crate::jir::interns::{Interns, StrId};
-use crate::jir::repr::{Func, Op, OpKind, RTerm};
+use crate::jir::repr::{Func, Op, OpKind, RBlockId, RTerm, ValueId};
 use crate::jir::semantic::{
     BodyKind, CallSemantic, Callee, DropGlue, HostPayload, ItemId, VtableEntry,
 };
@@ -490,6 +490,17 @@ pub(crate) fn run(
         }
     }
 
+    let noop_funcs: BTreeSet<JsName> = funcs
+        .iter()
+        .filter_map(|(name, res)| {
+            let f = res.as_ref().ok()?;
+            (f.blocks.len() == 1
+                && f.blocks[0].ops.is_empty()
+                && matches!(f.blocks[0].term, RTerm::Return(None)))
+            .then(|| name.clone())
+        })
+        .collect();
+
     let func_names: Vec<JsName> = funcs.keys().cloned().collect();
     let mut modified = 0usize;
     for name in func_names {
@@ -514,11 +525,8 @@ pub(crate) fn run(
                 .ops
                 .last()
                 .is_some_and(|op| op_throws(op, interns, &may_throw_host));
-            let passthrough_rethrow = rewritten
-                .blocks
-                .get(unwind_target.0 as usize)
-                .is_some_and(|u| u.ops.is_empty() && matches!(u.term, RTerm::Throw(None)));
-            if !last_throws || passthrough_rethrow {
+            if !last_throws || is_noop_unwind_chain(&rewritten, interns, unwind_target, &noop_funcs)
+            {
                 rewritten.blocks[bi].term = RTerm::Goto(normal_target, normal_args);
                 pruned_any = true;
             }
@@ -542,6 +550,55 @@ pub(crate) fn run(
         }
     }
     modified
+}
+
+fn is_noop_unwind_chain(
+    func: &Func,
+    interns: &Interns,
+    start: RBlockId,
+    noop_funcs: &BTreeSet<JsName>,
+) -> bool {
+    let is_unused = |v: ValueId| -> bool {
+        !func.blocks.iter().any(|b| {
+            b.ops.iter().any(|op| op.kind.uses().contains(&v)) || b.term.uses().contains(&v)
+        })
+    };
+    let is_noop_target = |link_name: StrId| -> bool {
+        interns
+            .str(link_name)
+            .is_some_and(|s| noop_funcs.contains(&JsName::new(s.to_owned())))
+    };
+    let mut cur = start;
+    for _ in 0..8 {
+        let Some(block) = func.blocks.get(cur.0 as usize) else {
+            return false;
+        };
+        let ops_noop = block.ops.iter().all(|op| match &op.kind {
+            OpKind::Copy(_) | OpKind::Move(_) => true,
+            OpKind::Drop { glue, .. } => match glue {
+                DropGlue::None => true,
+                DropGlue::Direct { link_name, .. } => is_noop_target(*link_name),
+                DropGlue::Dynamic => false,
+            },
+            OpKind::Call {
+                callee: Callee::Direct { link_name, .. },
+                semantic: CallSemantic::Ordinary,
+                host: None,
+                function: None,
+                ..
+            } => op.result.is_none_or(is_unused) && is_noop_target(*link_name),
+            _ => false,
+        });
+        if !ops_noop {
+            return false;
+        }
+        match &block.term {
+            RTerm::Throw(None) => return true,
+            RTerm::Goto(next, _) => cur = *next,
+            _ => return false,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1410,5 +1467,259 @@ mod tests {
         let updated = funcs[&JsName::new("caller".to_owned())].as_ref().unwrap();
         assert!(matches!(updated.blocks[0].term, RTerm::Invoke { .. }));
         assert!(matches!(updated.blocks[1].term, RTerm::Invoke { .. }));
+    }
+
+    #[test]
+    fn prunes_invoke_with_noop_unwind_chain_and_preserves_exceeding_hop_limit() {
+        use crate::jir::repr::Root;
+        use crate::jir::semantic::ConstTree;
+
+        let sig = |result| Signature {
+            arguments: Vec::new(),
+            result,
+            abi: AbiSignature::default(),
+        };
+        let mut noop_b = FuncBuilder::new(item_id(10), sig(UNIT));
+        noop_b.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let noop_fn = noop_b.finish();
+
+        let mut non_noop_interns = Interns::new();
+        let unit_non_noop = unit_types(&mut non_noop_interns);
+        let host_sec = non_noop_interns.intern_str("rcgjs.host.isnull");
+        let mut non_noop_b = FuncBuilder::new(item_id(11), sig(unit_non_noop));
+        non_noop_b.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Host {
+                payload: HostPayload::Marker {
+                    section: host_sec,
+                    def: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 11,
+                    },
+                    template: None,
+                    helpers: Vec::new(),
+                },
+                args: Vec::new(),
+            },
+            O,
+        );
+        non_noop_b.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let non_noop_fn = non_noop_b.finish();
+
+        // Caller has three throwing Invokes:
+        // 1) unwinds through a 4-block chain (Copy/Move + DropGlue::None + Direct noop drop +
+        //    Direct noop call -> Throw(None)) => PRUNED;
+        // 2) unwinds through a 9-block Goto chain (> 8 hops) => PRESERVED;
+        // 3) unwinds through a block calling `non_noop_fn` => PRESERVED.
+        let mut interns = Interns::new();
+        interns.intern_type(TypeDescriptor {
+            id: UNIT,
+            name: None,
+            kind: TypeKind::Tuple(Vec::new()),
+            layout: LayoutFacts {
+                size: Some(0),
+                zst: true,
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: UNIT,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+        let noop_str = interns.intern_str("noop_drop");
+        let non_noop_str = interns.intern_str("side_effect");
+        let throwing_host = HostPayload::Marker {
+            section: interns.intern_str("rcgjs.host.invoke"),
+            def: DefinitionId {
+                crate_id: 0,
+                local_hash: 50,
+            },
+            template: None,
+            helpers: Vec::new(),
+        };
+
+        let mut cb = FuncBuilder::new(item_id(1), sig(UNIT));
+        let unit_val = cb.op(FuncBuilder::ENTRY, OpKind::Const(ConstTree::Unit), UNIT, O);
+        let b1 = cb.block();
+        let b2 = cb.block();
+        let b_done = cb.block();
+
+        // Invoke #1 (entry): unwinds via 4 noop blocks -> Throw(None) => pruned.
+        let u1_a = cb.block();
+        let u1_b = cb.block();
+        let u1_c = cb.block();
+        let u1_d = cb.block();
+        cb.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Host {
+                payload: throwing_host.clone(),
+                args: Vec::new(),
+            },
+            O,
+        );
+        cb.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Invoke {
+                normal: (b1, Vec::new()),
+                unwind: (u1_a, Vec::new()),
+            },
+        );
+        let copied = cb.op(u1_a, OpKind::Copy(unit_val), UNIT, O);
+        let moved = cb.op(u1_a, OpKind::Move(copied), UNIT, O);
+        cb.effect(
+            u1_a,
+            OpKind::Drop {
+                root: Root::Value(moved),
+                path: Vec::new(),
+                glue: DropGlue::None,
+            },
+            O,
+        );
+        cb.terminate(u1_a, RTerm::Goto(u1_b, Vec::new()));
+        cb.effect(
+            u1_b,
+            OpKind::Drop {
+                root: Root::Value(unit_val),
+                path: Vec::new(),
+                glue: DropGlue::Direct {
+                    item: item_id(10),
+                    link_name: noop_str,
+                },
+            },
+            O,
+        );
+        cb.terminate(u1_b, RTerm::Goto(u1_c, Vec::new()));
+        let _unused_res = cb.op(
+            u1_c,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(10),
+                    link_name: noop_str,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            UNIT,
+            O,
+        );
+        cb.effect(
+            u1_c,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(10),
+                    link_name: noop_str,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        cb.terminate(u1_c, RTerm::Goto(u1_d, Vec::new()));
+        cb.terminate(u1_d, RTerm::Throw(None));
+
+        // Invoke #2 (b1): unwinds via 9 blocks (> 8 hops) -> Throw(None) => preserved.
+        let mut long_chain = Vec::with_capacity(9);
+        for _ in 0..9 {
+            long_chain.push(cb.block());
+        }
+        cb.effect(
+            b1,
+            OpKind::Host {
+                payload: throwing_host.clone(),
+                args: Vec::new(),
+            },
+            O,
+        );
+        cb.terminate(
+            b1,
+            RTerm::Invoke {
+                normal: (b2, Vec::new()),
+                unwind: (long_chain[0], Vec::new()),
+            },
+        );
+        for w in long_chain.windows(2) {
+            cb.terminate(w[0], RTerm::Goto(w[1], Vec::new()));
+        }
+        cb.terminate(long_chain[8], RTerm::Throw(None));
+
+        // Invoke #3 (b2): unwinds via a block calling `non_noop_fn` => preserved.
+        let u3 = cb.block();
+        cb.effect(
+            b2,
+            OpKind::Host {
+                payload: throwing_host,
+                args: Vec::new(),
+            },
+            O,
+        );
+        cb.terminate(
+            b2,
+            RTerm::Invoke {
+                normal: (b_done, Vec::new()),
+                unwind: (u3, Vec::new()),
+            },
+        );
+        cb.effect(
+            u3,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(11),
+                    link_name: non_noop_str,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        cb.terminate(u3, RTerm::Throw(None));
+        cb.terminate(b_done, RTerm::Return(None));
+
+        let caller = cb.finish();
+        let mut table = BTreeMap::new();
+        table.insert(
+            JsName::new("noop_drop".to_owned()),
+            test_item("noop_drop", Interns::new()),
+        );
+        table.insert(
+            JsName::new("side_effect".to_owned()),
+            test_item("side_effect", non_noop_interns),
+        );
+        table.insert(
+            JsName::new("caller".to_owned()),
+            test_item("caller", interns),
+        );
+        let mut funcs = BTreeMap::new();
+        funcs.insert(JsName::new("noop_drop".to_owned()), Ok(noop_fn));
+        funcs.insert(JsName::new("side_effect".to_owned()), Ok(non_noop_fn));
+        funcs.insert(JsName::new("caller".to_owned()), Ok(caller));
+
+        let live: BTreeSet<JsName> = table.keys().cloned().collect();
+        let modified = run(&table, &mut funcs, &live);
+        assert_eq!(modified, 1);
+        let updated = funcs[&JsName::new("caller".to_owned())].as_ref().unwrap();
+        assert!(matches!(updated.blocks[0].term, RTerm::Goto(..)));
+        assert!(matches!(updated.blocks[1].term, RTerm::Invoke { .. }));
+        assert!(matches!(updated.blocks[2].term, RTerm::Invoke { .. }));
     }
 }

@@ -1072,6 +1072,7 @@ mod tests {
                     parameters: 1,
                     spread: None,
                     caller_location: false,
+                    inline_never: false,
                 },
             },
             locals,
@@ -1215,7 +1216,8 @@ mod tests {
             Some(AbiSignature {
                 parameters: 1,
                 spread: None,
-                caller_location: false
+                caller_location: false,
+                inline_never: false,
             })
         );
 

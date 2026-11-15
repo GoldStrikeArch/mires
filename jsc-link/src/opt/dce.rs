@@ -1697,6 +1697,7 @@ mod tests {
                     parameters: 0,
                     spread: None,
                     caller_location: false,
+                    inline_never: false,
                 },
                 arguments: Vec::new(),
                 result: I32,
