@@ -23,7 +23,21 @@ use crate::jir::types::{EnumRepr, NominalAbi, NominalForm, PinnedBoundary, TypeK
 
 /// The most fields a scalarized aggregate may have. Above it the per-field block parameters at a
 /// merge cost more than the object they replace.
-const MAX_FIELDS: usize = 8;
+const MAX_FIELDS: usize = 12;
+
+/// One variant of a multi-variant `EnumRepr::Tag { fieldless: false }` enum eligible for
+/// scalarization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnumVariantShape {
+    pub logical_discr: i128,
+    pub fields: Vec<TypeId>,
+}
+
+/// Shape of a multi-variant `EnumRepr::Tag { fieldless: false }` enum eligible for scalarization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnumShape {
+    pub variants: Vec<EnumVariantShape>,
+}
 
 /// The field types of `ty`, in field order, or `None` when a value of it may not be scalarized —
 /// asked of a type alone, so a multi-variant enum has no answer.
@@ -112,6 +126,56 @@ pub fn variant_shape(table: &TypeTable, ty: TypeId, variant: u32) -> Option<Vec<
         return None;
     }
     Some(fields)
+}
+
+/// The variant shapes of a multi-variant `EnumRepr::Tag { fieldless: false }` enum, when every
+/// variant has at most [`MAX_FIELDS`] copy-safe fields and may be scalarized into `(tag, slots...)`.
+pub fn enum_shape(table: &TypeTable, ty: TypeId) -> Option<EnumShape> {
+    let descriptor = table.get(ty)?;
+    let layout = descriptor.layout;
+    if !layout.sized || layout.zst || layout.needs_drop {
+        return None;
+    }
+    if descriptor.meta.abi == NominalAbi::C || descriptor.meta.boundary != PinnedBoundary::None {
+        return None;
+    }
+    if descriptor.js.transparent.is_some() || descriptor.js.unsized_tail.is_some() {
+        return None;
+    }
+    if descriptor.js.enum_repr != Some(EnumRepr::Tag { fieldless: false }) {
+        return None;
+    }
+    let TypeKind::Adt {
+        form: NominalForm::Enum,
+        variants,
+        ..
+    } = &descriptor.kind
+    else {
+        return None;
+    };
+    if variants.len() <= 1 {
+        return None;
+    }
+    let mut total_fields = 0usize;
+    let mut out = Vec::with_capacity(variants.len());
+    for variant in variants {
+        if variant.fields.len() > MAX_FIELDS {
+            return None;
+        }
+        let fields: Vec<TypeId> = variant.fields.iter().map(|f| f.ty).collect();
+        if !shape_survives_copy(table, &fields) {
+            return None;
+        }
+        total_fields = total_fields.saturating_add(fields.len());
+        out.push(EnumVariantShape {
+            logical_discr: variant.logical_discr,
+            fields,
+        });
+    }
+    if total_fields == 0 || total_fields > MAX_FIELDS * 4 {
+        return None;
+    }
+    Some(EnumShape { variants: out })
 }
 
 /// Whether a node of this shape may be duplicated by sharing its field values.

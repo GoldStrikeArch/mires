@@ -51,7 +51,7 @@ use crate::jir::repr::{
     Root, ValueId,
 };
 use crate::jir::semantic::{BinaryOp, CastKind, ConstTree, TypeId};
-use crate::jir::types::TypeTable;
+use crate::jir::types::{EnumRepr, NominalForm, TypeKind, TypeTable};
 
 use super::candidates;
 
@@ -131,18 +131,38 @@ impl Shape {
     }
 }
 
+/// One variant's virtual slot layout within a scalarized multi-variant enum node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EnumVariantSlots {
+    logical_discr: i128,
+    slot_offset: usize,
+    fields: Vec<TypeId>,
+}
+
+/// Slot layout for a multi-variant `EnumRepr::Tag { fieldless: false }` enum node:
+/// slot `0` holds the virtual `tag` (`discr_ty`), followed by each variant's payload slots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EnumInfo {
+    discr_ty: TypeId,
+    discr_bytes: u8,
+    variants: Vec<EnumVariantSlots>,
+}
+
 /// One object node: the shape it would have if it never escaped.
 #[derive(Clone, Debug)]
 struct Node {
     shape: Shape,
     variant: u32,
     fields: Vec<Shape>,
+    enum_info: Option<EnumInfo>,
     /// The value the node came into existence as.
     def: ValueId,
     /// The block that value is defined in.
     block: RBlockId,
     /// For a `Copy` node, the value copied from.
     copied_from: Option<ValueId>,
+    /// For a `Deref` of a multi-variant whole-enum view, the node snapshot-copied from.
+    deref_from: Option<NodeId>,
 }
 
 impl Node {
@@ -150,6 +170,187 @@ impl Node {
     fn downcast(&self) -> Option<u32> {
         (self.variant != 0).then_some(self.variant)
     }
+
+    fn slot_of(&self, variant: Option<u32>, field: u32) -> Option<usize> {
+        if let Some(info) = &self.enum_info {
+            let v = variant.unwrap_or(0) as usize;
+            let vinfo = info.variants.get(v)?;
+            (field as usize)
+                .checked_add(vinfo.slot_offset)
+                .filter(|_| (field as usize) < vinfo.fields.len())
+        } else {
+            (variant.unwrap_or(self.variant) == self.variant
+                && (field as usize) < self.fields.len())
+            .then_some(field as usize)
+        }
+    }
+
+    fn variant_arity(&self, variant: Option<u32>) -> usize {
+        if let Some(info) = &self.enum_info {
+            info.variants
+                .get(variant.unwrap_or(0) as usize)
+                .map_or(0, |v| v.fields.len())
+        } else {
+            self.fields.len()
+        }
+    }
+}
+
+fn fits_int(value: i128, signed: bool, bits: u32) -> bool {
+    if bits == 0 {
+        return false;
+    }
+    if signed {
+        bits >= 128 || {
+            let bound = 1i128 << (bits - 1);
+            value >= -bound && value < bound
+        }
+    } else {
+        value >= 0 && (bits >= 128 || (value as u128) < (1u128 << bits))
+    }
+}
+
+fn default_const_tree(table: &TypeTable, ty: TypeId) -> Option<ConstTree> {
+    let descriptor = table.get(ty)?;
+    if descriptor.layout.zst {
+        return Some(ConstTree::Unit);
+    }
+    if let Some(inner) = descriptor.js.transparent {
+        return default_const_tree(table, inner.ty);
+    }
+    match &descriptor.kind {
+        TypeKind::Pattern(base) => default_const_tree(table, *base),
+        TypeKind::Bool => Some(ConstTree::Scalar { bits: 0, bytes: 1 }),
+        TypeKind::Char => Some(ConstTree::Scalar { bits: 0, bytes: 4 }),
+        TypeKind::Integer { bits, .. } | TypeKind::Float { bits } => Some(ConstTree::Scalar {
+            bits: 0,
+            bytes: (*bits / 8).max(1) as u8,
+        }),
+        TypeKind::RawPointer { pointee, .. }
+            if table.get(*pointee).is_some_and(|d| d.layout.sized) =>
+        {
+            Some(ConstTree::Address(0))
+        }
+        TypeKind::Tuple(elems) => elems
+            .iter()
+            .map(|elem| default_const_tree(table, *elem))
+            .collect::<Option<Vec<_>>>()
+            .map(ConstTree::Aggregate),
+        TypeKind::Array { element, length } if *length <= 16 => {
+            let elem = default_const_tree(table, *element)?;
+            Some(ConstTree::Aggregate(vec![elem; *length as usize]))
+        }
+        TypeKind::Adt {
+            form: NominalForm::Struct,
+            variants,
+            ..
+        } => variants
+            .first()?
+            .fields
+            .iter()
+            .map(|field| default_const_tree(table, field.ty))
+            .collect::<Option<Vec<_>>>()
+            .map(ConstTree::Aggregate),
+        TypeKind::Adt {
+            form: NominalForm::Enum,
+            variants,
+            ..
+        } if matches!(
+            descriptor.js.enum_repr,
+            Some(EnumRepr::Number { .. } | EnumRepr::Tag { fieldless: true })
+        ) && !variants.is_empty() =>
+        {
+            let fields = variants
+                .first()?
+                .fields
+                .iter()
+                .map(|field| default_const_tree(table, field.ty))
+                .collect::<Option<Vec<_>>>()?;
+            Some(ConstTree::Variant { variant: 0, fields })
+        }
+        _ => None,
+    }
+}
+
+fn enum_discr_type(
+    func: &Func,
+    table: &TypeTable,
+    enum_ty: TypeId,
+    shape: &candidates::EnumShape,
+) -> Option<(TypeId, u8)> {
+    let fits_all = |ty: TypeId| -> Option<u8> {
+        let (signed, bits) = table.int_info(ty)?;
+        let bytes = u8::try_from((bits / 8).max(1)).ok()?;
+        shape
+            .variants
+            .iter()
+            .all(|v| fits_int(v.logical_discr, signed, bits))
+            .then_some(bytes)
+    };
+    for block in &func.blocks {
+        for op in &block.ops {
+            if let OpKind::Discriminant(v) = op.kind {
+                if func
+                    .values
+                    .get(v.0 as usize)
+                    .is_some_and(|d| d.ty == enum_ty)
+                {
+                    if let Some(res) = op.result {
+                        let res_ty = func.values[res.0 as usize].ty;
+                        if let Some(bytes) = fits_all(res_ty) {
+                            return Some((res_ty, bytes));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some((ty, bytes)) = table
+        .descriptors()
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.kind,
+                TypeKind::Integer {
+                    signed: true,
+                    bits: 32
+                }
+            )
+        })
+        .find_map(|d| fits_all(d.id).map(|bytes| (d.id, bytes)))
+    {
+        return Some((ty, bytes));
+    }
+    table
+        .descriptors()
+        .iter()
+        .find_map(|d| fits_all(d.id).map(|bytes| (d.id, bytes)))
+}
+
+fn build_enum_info(func: &Func, table: &TypeTable, ty: TypeId) -> Option<EnumInfo> {
+    let shape = candidates::enum_shape(table, ty)?;
+    for variant in &shape.variants {
+        for &field_ty in &variant.fields {
+            default_const_tree(table, field_ty)?;
+        }
+    }
+    let (discr_ty, discr_bytes) = enum_discr_type(func, table, ty, &shape)?;
+    let mut offset = 1usize;
+    let mut variants = Vec::with_capacity(shape.variants.len());
+    for variant in shape.variants {
+        let len = variant.fields.len();
+        variants.push(EnumVariantSlots {
+            logical_discr: variant.logical_discr,
+            slot_offset: offset,
+            fields: variant.fields,
+        });
+        offset += len;
+    }
+    Some(EnumInfo {
+        discr_ty,
+        discr_bytes,
+        variants,
+    })
 }
 
 /// The escape fixpoint's result.
@@ -245,6 +446,10 @@ impl Analysis {
                     self.add_node(*param, block.id, ty, 0, fields, None);
                     continue;
                 }
+                if let Some(info) = build_enum_info(func, table, ty) {
+                    self.add_enum_node(*param, block.id, ty, info, None, None);
+                    continue;
+                }
                 // A multi-variant enum parameter, which `shape` refuses for its unknown variant,
                 // is still a candidate when every incoming edge passes the same statically built
                 // variant — the shape discriminant jump-threading leaves at each arm.
@@ -287,6 +492,9 @@ impl Analysis {
                     let Some(&parent) = self.node_of.get(&result) else {
                         continue;
                     };
+                    if self.nodes[parent].enum_info.is_some() {
+                        continue;
+                    }
                     for (index, field) in fields.iter().enumerate() {
                         if let Some(&child) = self.node_of.get(field) {
                             changed |= self.nested.insert((parent, index as u32), child).is_none();
@@ -332,6 +540,20 @@ impl Analysis {
                 active_field: None,
                 fields,
             } => {
+                if let Some(info) = build_enum_info(func, table, *aggregate_ty) {
+                    let Some(vinfo) = info.variants.get(*variant as usize) else {
+                        return false;
+                    };
+                    if vinfo.fields.len() != fields.len()
+                        || !vinfo.fields.iter().zip(fields).all(|(declared, field)| {
+                            Shape::of(func, *field) == Shape::baseline(*declared)
+                        })
+                    {
+                        return false;
+                    }
+                    self.add_enum_node(result, block, *aggregate_ty, info, None, None);
+                    return true;
+                }
                 let Some(shape) = candidates::variant_shape(table, *aggregate_ty, *variant) else {
                     return false;
                 };
@@ -351,6 +573,18 @@ impl Analysis {
                     ConstTree::Variant { variant, fields } => (*variant, fields.len()),
                     _ => return false,
                 };
+                if matches!(tree, ConstTree::Variant { .. }) {
+                    if let Some(info) = build_enum_info(func, table, ty) {
+                        let Some(vinfo) = info.variants.get(variant as usize) else {
+                            return false;
+                        };
+                        if vinfo.fields.len() != arity {
+                            return false;
+                        }
+                        self.add_enum_node(result, block, ty, info, None, None);
+                        return true;
+                    }
+                }
                 let Some(shape) = candidates::variant_shape(table, ty, variant) else {
                     return false;
                 };
@@ -366,14 +600,25 @@ impl Analysis {
                 match (self.node_of.get(v).copied(), self.view_of.get(v).copied()) {
                     (Some(node), _) => {
                         let source = self.nodes[node].clone();
-                        self.add_node(
-                            result,
-                            block,
-                            source.shape.ty,
-                            source.variant,
-                            source.fields.iter().map(|field| field.ty).collect(),
-                            Some(*v),
-                        );
+                        if let Some(info) = source.enum_info {
+                            self.add_enum_node(
+                                result,
+                                block,
+                                source.shape.ty,
+                                info,
+                                Some(*v),
+                                None,
+                            );
+                        } else {
+                            self.add_node(
+                                result,
+                                block,
+                                source.shape.ty,
+                                source.variant,
+                                source.fields.iter().map(|field| field.ty).collect(),
+                                Some(*v),
+                            );
+                        }
                         true
                     }
                     (None, Some(view)) => {
@@ -425,7 +670,9 @@ impl Analysis {
                 let Some(&parent) = self.node_of.get(base) else {
                     return false;
                 };
-                if variant.unwrap_or(self.nodes[parent].variant) != self.nodes[parent].variant {
+                if self.nodes[parent].enum_info.is_some()
+                    || variant.unwrap_or(self.nodes[parent].variant) != self.nodes[parent].variant
+                {
                     return false;
                 }
                 match self.nested.get(&(parent, *field)) {
@@ -436,10 +683,15 @@ impl Analysis {
                     _ => false,
                 }
             }
-            // Reading through a view of the whole object is the object itself.
-            OpKind::Deref(pointer) => match self.view_of.get(pointer) {
-                Some(&(node, None)) if self.nodes[node].shape == Shape::of(func, result) => {
-                    self.node_of.insert(result, node);
+            // Reading through a view of the whole object is the object itself (or a snapshot
+            // node for a multi-variant enum so later `StoreThrough` writes do not alias).
+            OpKind::Deref(pointer) => match self.view_of.get(pointer).copied() {
+                Some((node, None)) if self.nodes[node].shape == Shape::of(func, result) => {
+                    if let Some(info) = self.nodes[node].enum_info.clone() {
+                        self.add_enum_node(result, block, ty, info, None, Some(node));
+                    } else {
+                        self.node_of.insert(result, node);
+                    }
                     true
                 }
                 _ => false,
@@ -450,7 +702,7 @@ impl Analysis {
                 ..
             } => {
                 let view = if let Some(&node) = self.node_of.get(root) {
-                    match tracked_field(path, self.nodes[node].variant) {
+                    match tracked_field(path, &self.nodes[node]) {
                         Some(field) => (node, field),
                         None => return false,
                     }
@@ -458,7 +710,7 @@ impl Analysis {
                     match (field, path.split_first()) {
                         // Through a view of the whole object, the path names the field.
                         (None, Some((Proj::Deref, rest))) => {
-                            match tracked_field(rest, self.nodes[node].variant) {
+                            match tracked_field(rest, &self.nodes[node]) {
                                 Some(field) => (node, field),
                                 None => return false,
                             }
@@ -497,9 +749,40 @@ impl Analysis {
             shape: Shape::baseline(ty),
             variant,
             fields: fields.into_iter().map(Shape::baseline).collect(),
+            enum_info: None,
             def: value,
             block,
             copied_from,
+            deref_from: None,
+        });
+        self.node_of.insert(value, id);
+    }
+
+    fn add_enum_node(
+        &mut self,
+        value: ValueId,
+        block: RBlockId,
+        ty: TypeId,
+        info: EnumInfo,
+        copied_from: Option<ValueId>,
+        deref_from: Option<NodeId>,
+    ) {
+        let mut fields =
+            Vec::with_capacity(1 + info.variants.iter().map(|v| v.fields.len()).sum::<usize>());
+        fields.push(Shape::baseline(info.discr_ty));
+        for v in &info.variants {
+            fields.extend(v.fields.iter().copied().map(Shape::baseline));
+        }
+        let id = self.nodes.len();
+        self.nodes.push(Node {
+            shape: Shape::baseline(ty),
+            variant: 0,
+            fields,
+            enum_info: Some(info),
+            def: value,
+            block,
+            copied_from,
+            deref_from,
         });
         self.node_of.insert(value, id);
     }
@@ -526,9 +809,38 @@ impl Analysis {
 
         for block in &func.blocks {
             for op in &block.ops {
-                if let OpKind::SetField { base, field, .. } = &op.kind {
+                if let OpKind::SetField {
+                    base,
+                    variant,
+                    field,
+                    ..
+                } = &op.kind
+                {
                     if let Some(&node) = self.node_of.get(base) {
-                        unpinned.insert((node, *field));
+                        if let Some(slot) = self.nodes[node].slot_of(*variant, *field) {
+                            unpinned.insert((node, slot as u32));
+                        }
+                    }
+                }
+                if let OpKind::StoreThrough { ptr, v } = &op.kind {
+                    if let Some(&(target_node, None)) = self.view_of.get(ptr) {
+                        if let Some(&src_node) = self.node_of.get(v) {
+                            if self.nodes[target_node].enum_info.is_some()
+                                && self.same_shape(target_node, src_node)
+                            {
+                                if self.nodes[src_node]
+                                    .fields
+                                    .iter()
+                                    .any(|field| table.needs_clone(field.ty))
+                                {
+                                    seeds.insert(target_node);
+                                    seeds.insert(src_node);
+                                } else {
+                                    implications.push((target_node, src_node));
+                                    implications.push((src_node, target_node));
+                                }
+                            }
+                        }
                     }
                 }
                 let mut allowed = self.allowed_uses(op, func, table);
@@ -620,9 +932,15 @@ impl Analysis {
                     match (param_node, arg_node) {
                         (Some(p), Some(a)) if self.same_shape(p, a) => {
                             implications.push((a, p));
+                            if self.nodes[a].enum_info.is_some() {
+                                implications.push((p, a));
+                            }
                         }
                         (Some(p), _) => {
                             seeds.insert(p);
+                        }
+                        (None, Some(a)) if self.nodes[a].enum_info.is_some() => {
+                            seeds.insert(a);
                         }
                         (None, _) => {}
                     }
@@ -633,6 +951,15 @@ impl Analysis {
         // A copy of an object that escaped reads its fields back out, which needs `Field` to name
         // them; a copy that escapes itself needs the original to still exist.
         for (id, node) in self.nodes.iter().enumerate() {
+            if let Some(src) = node.deref_from {
+                if node.fields.iter().any(|field| table.needs_clone(field.ty)) {
+                    seeds.insert(id);
+                    seeds.insert(src);
+                } else {
+                    implications.push((id, src));
+                    implications.push((src, id));
+                }
+            }
             let Some(source) = node.copied_from else {
                 continue;
             };
@@ -692,7 +1019,10 @@ impl Analysis {
 
     fn same_shape(&self, a: NodeId, b: NodeId) -> bool {
         let (a, b) = (&self.nodes[a], &self.nodes[b]);
-        a.shape == b.shape && a.variant == b.variant && a.fields == b.fields
+        a.shape == b.shape
+            && a.fields == b.fields
+            && a.enum_info == b.enum_info
+            && (a.enum_info.is_some() || a.variant == b.variant)
     }
 
     /// The operands of `kind` a node or a view may sit in without escaping.
@@ -709,13 +1039,20 @@ impl Analysis {
                 return false;
             };
             let node = &self.nodes[id];
-            variant.unwrap_or(node.variant) == node.variant
-                && node.fields.get(field as usize) == Some(&shape)
+            let Some(slot) = node.slot_of(*variant, field) else {
+                return false;
+            };
+            let v = if node.enum_info.is_some() {
+                variant.unwrap_or(0)
+            } else {
+                node.variant
+            };
+            node.fields.get(slot) == Some(&shape)
                 && candidates::field_reads_resolve(
                     table,
                     node.shape.ty,
-                    node.variant,
-                    node.fields.len(),
+                    v,
+                    node.variant_arity(*variant),
                 )
         };
         let view_field = |view: ValueId| -> Option<(NodeId, u32)> {
@@ -733,10 +1070,24 @@ impl Analysis {
             ),
             OpKind::Discriminant(v) => single(
                 *v,
-                self.node_of.contains_key(v)
-                    && op
-                        .result
-                        .is_some_and(|result| shape_of(result).carrier == Carrier::Baseline),
+                self.node_of.get(v).is_some_and(|&id| {
+                    op.result.is_some_and(|result| {
+                        let shape = shape_of(result);
+                        shape.carrier == Carrier::Baseline
+                            && (self.nodes[id].enum_info.is_none()
+                                || table.int_info(shape.ty).is_some())
+                    })
+                }),
+            ),
+            OpKind::SetDiscriminant { base, variant } => single(
+                *base,
+                op.result.is_none()
+                    && self.node_of.get(base).is_some_and(|&id| {
+                        self.nodes[id]
+                            .enum_info
+                            .as_ref()
+                            .is_some_and(|info| (*variant as usize) < info.variants.len())
+                    }),
             ),
             OpKind::Field {
                 base,
@@ -777,12 +1128,28 @@ impl Analysis {
                     (_, None) => false,
                 },
             ),
-            OpKind::StoreThrough { ptr, v } => single(
-                *ptr,
-                view_field(*ptr).is_some_and(|(node, field)| {
-                    self.nodes[node].fields.get(field as usize) == Some(&shape_of(*v))
-                }),
-            ),
+            OpKind::StoreThrough { ptr, v } => {
+                if let Some((node, field)) = view_field(*ptr) {
+                    single(
+                        *ptr,
+                        self.nodes[node].fields.get(field as usize) == Some(&shape_of(*v)),
+                    )
+                } else if let Some(&(target_node, None)) = self.view_of.get(ptr) {
+                    if let Some(&src_node) = self.node_of.get(v) {
+                        if self.nodes[target_node].enum_info.is_some()
+                            && self.same_shape(target_node, src_node)
+                        {
+                            vec![*ptr, *v]
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            }
             // A node in another node's field: the outer object holding it is what decides.
             OpKind::Aggregate { fields, .. } => {
                 match op.result.and_then(|r| self.node_of.get(&r)) {
@@ -823,13 +1190,27 @@ impl Analysis {
 }
 
 /// The field a tracked view's path names: `[]` is the whole object, `[Field]` is one field (behind
-/// the node's own `Downcast` when it has one), and anything else is not tracked.
-fn tracked_field(path: &[Proj], variant: u32) -> Option<Option<u32>> {
+/// the node's `Downcast` when it has one), and anything else is not tracked.
+fn tracked_field(path: &[Proj], node: &Node) -> Option<Option<u32>> {
     match path {
         [] => Some(None),
-        [Proj::Field { field, .. }] if variant == 0 => Some(Some(*field)),
-        [Proj::Downcast { variant: k }, Proj::Field { field, .. }] if *k == variant => {
-            Some(Some(*field))
+        [Proj::Field { field, .. }] => {
+            if node.enum_info.is_some() {
+                node.slot_of(None, *field).map(|s| Some(s as u32))
+            } else if node.variant == 0 {
+                Some(Some(*field))
+            } else {
+                None
+            }
+        }
+        [Proj::Downcast { variant: k }, Proj::Field { field, .. }] => {
+            if node.enum_info.is_some() {
+                node.slot_of(Some(*k), *field).map(|s| Some(s as u32))
+            } else if *k == node.variant {
+                Some(Some(*field))
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -1199,6 +1580,63 @@ impl Rewriter<'_> {
         Some(())
     }
 
+    fn emit_const(
+        &mut self,
+        id: RBlockId,
+        tree: ConstTree,
+        ty: TypeId,
+        origin: OriginId,
+    ) -> ValueId {
+        let bits = match tree {
+            ConstTree::Scalar { bits, .. } => Some(bits),
+            _ => None,
+        };
+        let value = self.builder.op(id, OpKind::Const(tree), ty, origin);
+        if let Some(bits) = bits {
+            self.constants.insert(value, bits);
+        }
+        value
+    }
+
+    fn define_enum_slots(
+        &mut self,
+        id: RBlockId,
+        info: &EnumInfo,
+        active_variant: u32,
+        active_values: Vec<ValueId>,
+        origin: OriginId,
+    ) -> Option<Vec<FieldVal>> {
+        let active = active_variant as usize;
+        let vinfo = info.variants.get(active)?;
+        if active_values.len() != vinfo.fields.len() {
+            return None;
+        }
+        let mut out =
+            Vec::with_capacity(1 + info.variants.iter().map(|v| v.fields.len()).sum::<usize>());
+        let tag_tree = ConstTree::Scalar {
+            bits: mask(vinfo.logical_discr as u128, info.discr_bytes),
+            bytes: info.discr_bytes,
+        };
+        out.push(FieldVal::Value(self.emit_const(
+            id,
+            tag_tree,
+            info.discr_ty,
+            origin,
+        )));
+        for (idx, variant) in info.variants.iter().enumerate() {
+            if idx == active {
+                out.extend(active_values.iter().copied().map(FieldVal::Value));
+            } else {
+                for &field_ty in &variant.fields {
+                    let default_tree = default_const_tree(self.table, field_ty)?;
+                    let val = self.emit_const(id, default_tree, field_ty, origin);
+                    out.push(FieldVal::Value(val));
+                }
+            }
+        }
+        Some(out)
+    }
+
     /// A node's creation site. Returns whether the op was consumed.
     fn define(
         &mut self,
@@ -1210,47 +1648,69 @@ impl Rewriter<'_> {
     ) -> Option<bool> {
         let origin = self.old.values[result.0 as usize].origin;
         let fields = self.analysis.nodes[node].fields.clone();
+        let enum_info = self.analysis.nodes[node].enum_info.clone();
+        let deref_from = self.analysis.nodes[node].deref_from;
         let values: Vec<FieldVal> = match kind {
-            OpKind::Aggregate { fields, .. } => fields
-                .iter()
-                .enumerate()
-                .map(|(index, field)| {
-                    // A field the analysis pinned to a node is that node, already in the state.
-                    match self.analysis.nested.get(&(node, index as u32)) {
-                        Some(&child) if self.analysis.live_node(*field) == Some(child) => {
-                            Some(FieldVal::Node(child))
-                        }
-                        _ => self.value(*field).map(FieldVal::Value),
-                    }
-                })
-                .collect::<Option<_>>()?,
+            OpKind::Aggregate {
+                variant, fields, ..
+            } => {
+                if let Some(info) = enum_info.as_ref() {
+                    let mapped = fields
+                        .iter()
+                        .map(|f| self.value(*f))
+                        .collect::<Option<Vec<_>>>()?;
+                    self.define_enum_slots(id, info, *variant, mapped, origin)?
+                } else {
+                    fields
+                        .iter()
+                        .enumerate()
+                        .map(|(index, field)| {
+                            // A field the analysis pinned to a node is that node, already in the state.
+                            match self.analysis.nested.get(&(node, index as u32)) {
+                                Some(&child) if self.analysis.live_node(*field) == Some(child) => {
+                                    Some(FieldVal::Node(child))
+                                }
+                                _ => self.value(*field).map(FieldVal::Value),
+                            }
+                        })
+                        .collect::<Option<_>>()?
+                }
+            }
             OpKind::Const(tree) => {
-                let trees: Vec<ConstTree> = match tree {
-                    ConstTree::Aggregate(trees) => trees.clone(),
-                    ConstTree::Variant { fields, .. } => fields.clone(),
+                let (variant, trees) = match tree {
+                    ConstTree::Aggregate(trees) => (0, trees.clone()),
+                    ConstTree::Variant { variant, fields } => (*variant, fields.clone()),
                     _ => return Some(false),
                 };
-                trees
-                    .into_iter()
-                    .zip(&fields)
-                    .map(|(tree, shape)| {
-                        let bits = match tree {
-                            ConstTree::Scalar { bits, .. } => Some(bits),
-                            _ => None,
-                        };
-                        let value = self.builder.op(id, OpKind::Const(tree), shape.ty, origin);
-                        if let Some(bits) = bits {
-                            self.constants.insert(value, bits);
-                        }
-                        FieldVal::Value(value)
-                    })
-                    .collect()
+                if let Some(info) = enum_info.as_ref() {
+                    let vinfo = info.variants.get(variant as usize)?;
+                    if trees.len() != vinfo.fields.len() {
+                        return None;
+                    }
+                    let active_values: Vec<ValueId> = trees
+                        .into_iter()
+                        .zip(&vinfo.fields)
+                        .map(|(t, &ty)| self.emit_const(id, t, ty, origin))
+                        .collect();
+                    self.define_enum_slots(id, info, variant, active_values, origin)?
+                } else {
+                    trees
+                        .into_iter()
+                        .zip(&fields)
+                        .map(|(tree, shape)| {
+                            FieldVal::Value(self.emit_const(id, tree, shape.ty, origin))
+                        })
+                        .collect()
+                }
             }
             // A copy of a node that is still virtual shares its field values; a copy of one that
             // escaped reads them back out of the real object.
             OpKind::Copy(source) => match self.analysis.live_node(*source) {
                 Some(from) => state.get(&from)?.clone(),
                 None => {
+                    if enum_info.is_some() {
+                        return None;
+                    }
                     let base = self.value(*source)?;
                     let downcast = self.analysis.nodes[node].downcast();
                     fields
@@ -1275,6 +1735,7 @@ impl Rewriter<'_> {
                         .collect()
                 }
             },
+            OpKind::Deref(_) if deref_from.is_some() => state.get(&deref_from?)?.clone(),
             // A move renames, a deref of a whole-object view reads it, and a `Field` naming a
             // nested node names the node: either way it is already in the state under this id.
             OpKind::Move(_) | OpKind::Deref(_) => return Some(true),
@@ -1304,19 +1765,30 @@ impl Rewriter<'_> {
     /// An op that reads or writes a virtual node. Returns whether it was consumed.
     fn consume(&mut self, id: RBlockId, op: &Op, state: &mut State) -> Option<bool> {
         match &op.kind {
-            OpKind::Field { base, field, .. } => {
+            OpKind::Field {
+                base,
+                variant,
+                field,
+            } => {
                 let Some(node) = self.analysis.live_node(*base) else {
                     return Some(false);
                 };
-                let value = state.get(&node)?.get(*field as usize)?.value()?;
+                let slot = self.analysis.nodes[node].slot_of(*variant, *field)?;
+                let value = state.get(&node)?.get(slot)?.value()?;
                 self.map.insert(op.result?, value);
             }
-            OpKind::SetField { base, field, v, .. } => {
+            OpKind::SetField {
+                base,
+                variant,
+                field,
+                v,
+            } => {
                 let Some(node) = self.analysis.live_node(*base) else {
                     return Some(false);
                 };
+                let slot = self.analysis.nodes[node].slot_of(*variant, *field)?;
                 let value = FieldVal::Value(self.value(*v)?);
-                *state.get_mut(&node)?.get_mut(*field as usize)? = value;
+                *state.get_mut(&node)?.get_mut(slot)? = value;
             }
             OpKind::Deref(pointer) => {
                 let Some((node, Some(field))) = self.analysis.live_view(*pointer) else {
@@ -1325,36 +1797,84 @@ impl Rewriter<'_> {
                 let value = state.get(&node)?.get(field as usize)?.value()?;
                 self.map.insert(op.result?, value);
             }
-            OpKind::StoreThrough { ptr, v } => {
-                let Some((node, Some(field))) = self.analysis.live_view(*ptr) else {
-                    return Some(false);
-                };
-                let value = FieldVal::Value(self.value(*v)?);
-                *state.get_mut(&node)?.get_mut(field as usize)? = value;
-            }
+            OpKind::StoreThrough { ptr, v } => match self.analysis.live_view(*ptr) {
+                Some((node, Some(field))) => {
+                    let value = FieldVal::Value(self.value(*v)?);
+                    *state.get_mut(&node)?.get_mut(field as usize)? = value;
+                }
+                Some((target_node, None)) => {
+                    let Some(src_node) = self.analysis.live_node(*v) else {
+                        return Some(false);
+                    };
+                    if self.analysis.nodes[target_node].enum_info.is_none()
+                        || !self.analysis.same_shape(target_node, src_node)
+                    {
+                        return Some(false);
+                    }
+                    let new_slots = state.get(&src_node)?.clone();
+                    *state.get_mut(&target_node)? = new_slots;
+                }
+                None => return Some(false),
+            },
             OpKind::Discriminant(base) => {
                 let Some(node) = self.analysis.live_node(*base) else {
                     return Some(false);
                 };
                 let result = op.result?;
                 let ty = self.old.values[result.0 as usize].ty;
-                let (_, bits) = self.table.int_info(ty)?;
-                let (node_ty, variant) = {
-                    let node = &self.analysis.nodes[node];
-                    (node.shape.ty, node.variant)
+                if let Some(info) = self.analysis.nodes[node].enum_info.clone() {
+                    let tag = state.get(&node)?.first()?.value()?;
+                    let out = if ty == info.discr_ty {
+                        tag
+                    } else {
+                        self.table.int_info(ty)?;
+                        self.builder.op(
+                            id,
+                            OpKind::Cast {
+                                kind: CastKind::IntToInt,
+                                v: tag,
+                                from: info.discr_ty,
+                                to: ty,
+                            },
+                            ty,
+                            op.origin,
+                        )
+                    };
+                    self.map.insert(result, out);
+                } else {
+                    let (_, bits) = self.table.int_info(ty)?;
+                    let (node_ty, variant) = {
+                        let node = &self.analysis.nodes[node];
+                        (node.shape.ty, node.variant)
+                    };
+                    let discriminant = self
+                        .table
+                        .variants(node_ty)
+                        .get(variant as usize)?
+                        .logical_discr;
+                    let bytes = (bits / 8) as u8;
+                    let kind = OpKind::Const(ConstTree::Scalar {
+                        bits: mask(discriminant as u128, bytes),
+                        bytes,
+                    });
+                    let new = self.builder.op(id, kind, ty, op.origin);
+                    self.map.insert(result, new);
+                }
+            }
+            OpKind::SetDiscriminant { base, variant } => {
+                let Some(node) = self.analysis.live_node(*base) else {
+                    return Some(false);
                 };
-                let discriminant = self
-                    .table
-                    .variants(node_ty)
-                    .get(variant as usize)?
-                    .logical_discr;
-                let bytes = (bits / 8) as u8;
-                let kind = OpKind::Const(ConstTree::Scalar {
-                    bits: mask(discriminant as u128, bytes),
-                    bytes,
-                });
-                let new = self.builder.op(id, kind, ty, op.origin);
-                self.map.insert(result, new);
+                let Some(info) = self.analysis.nodes[node].enum_info.clone() else {
+                    return Some(false);
+                };
+                let discr = info.variants.get(*variant as usize)?.logical_discr;
+                let tag_tree = ConstTree::Scalar {
+                    bits: mask(discr as u128, info.discr_bytes),
+                    bytes: info.discr_bytes,
+                };
+                let new_tag = self.emit_const(id, tag_tree, info.discr_ty, op.origin);
+                *state.get_mut(&node)?.get_mut(0)? = FieldVal::Value(new_tag);
             }
             OpKind::Cast {
                 kind: CastKind::Transmute,
@@ -1561,9 +2081,28 @@ impl Rewriter<'_> {
         if info.shape.carrier != Carrier::Baseline {
             return None;
         }
+        let (variant, fields) = if let Some(ei) = &info.enum_info {
+            let tag_val = *fields.first()?;
+            let tag_bits = self.constants.get(&tag_val).copied()?;
+            let mut found = None;
+            for (v_idx, vinfo) in ei.variants.iter().enumerate() {
+                if mask(vinfo.logical_discr as u128, ei.discr_bytes) == tag_bits {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some((
+                        v_idx as u32,
+                        fields[vinfo.slot_offset..vinfo.slot_offset + vinfo.fields.len()].to_vec(),
+                    ));
+                }
+            }
+            found?
+        } else {
+            (info.variant, fields)
+        };
         let kind = OpKind::Aggregate {
             ty: info.shape.ty,
-            variant: info.variant,
+            variant,
             active_field: None,
             fields,
         };
@@ -2396,6 +2935,915 @@ mod unit {
                 .all(|op| !matches!(op.kind, OpKind::Aggregate { .. })),
             "no object is built anywhere else"
         );
+    }
+
+    fn enum_state_table() -> (TypeTable, TypeId, TypeId, TypeId) {
+        const STATE: TypeId = TypeId(10);
+        const REF_STATE: TypeId = TypeId(11);
+        const NINE_FIELD: TypeId = TypeId(12);
+        let field = |index: u32| FieldDescriptor {
+            key: FieldKey::Index(index),
+            ty: I32,
+            offset: 0,
+        };
+        let mut tbl = table();
+        let mut state_js = js(STATE, Vec::new(), true);
+        state_js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+        tbl.insert(descriptor(
+            STATE,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 10,
+                },
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: StrId(0),
+                        fields: Vec::new(),
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: StrId(1),
+                        fields: vec![field(0)],
+                        logical_discr: 1,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: StrId(2),
+                        fields: vec![field(0), field(1)],
+                        logical_discr: 2,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: StrId(3),
+                        fields: vec![field(0)],
+                        logical_discr: 3,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            state_js,
+        ));
+        tbl.insert(descriptor(
+            REF_STATE,
+            TypeKind::Reference {
+                pointee: STATE,
+                mutable: true,
+            },
+            js(REF_STATE, Vec::new(), false),
+        ));
+        let nine_fields: Vec<FieldDescriptor> = (0..9).map(field).collect();
+        tbl.insert(descriptor(
+            NINE_FIELD,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 12,
+                },
+                args: Vec::new(),
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: StrId(0),
+                    fields: nine_fields.clone(),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            js(NINE_FIELD, nine_fields, true),
+        ));
+        (tbl, STATE, REF_STATE, NINE_FIELD)
+    }
+
+    #[test]
+    fn nine_field_struct_is_scalarized() {
+        let (table, _, _, nine_field) = enum_state_table();
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 20,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                },
+                arguments: vec![I32],
+                result: I32,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let x = b.param(I32, NO_ORIGIN);
+        let fields = vec![x; 9];
+        let agg = b.op(
+            entry,
+            OpKind::Aggregate {
+                ty: nine_field,
+                variant: 0,
+                active_field: None,
+                fields,
+            },
+            nine_field,
+            NO_ORIGIN,
+        );
+        let read = b.op(
+            entry,
+            OpKind::Field {
+                base: agg,
+                variant: None,
+                field: 8,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        b.terminate(entry, RTerm::Return(Some(read)));
+        let mut func = b.finish();
+        let stats = run(&mut func, &table);
+        assert_eq!(stats.scalarized, 1);
+        assert_eq!(stats.escaped, 0);
+        assert!(func.verify(&table).is_ok());
+        assert!(func.blocks[0]
+            .ops
+            .iter()
+            .all(|op| !matches!(op.kind, OpKind::Aggregate { .. })));
+    }
+
+    #[test]
+    fn multi_variant_enum_loop_state_scalarizes_with_borrow_store_and_discriminant() {
+        let (table, state_ty, ref_state_ty, _) = enum_state_table();
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 21,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                },
+                arguments: vec![I32],
+                result: I32,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let header = b.block();
+        let arm_idle = b.block();
+        let arm_scan = b.block();
+        let arm_other = b.block();
+        let exit = b.block();
+
+        let limit = b.param(I32, NO_ORIGIN);
+        let zero = b.op(
+            entry,
+            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+            I32,
+            NO_ORIGIN,
+        );
+        let init_state = b.op(
+            entry,
+            OpKind::Aggregate {
+                ty: state_ty,
+                variant: 0,
+                active_field: None,
+                fields: Vec::new(),
+            },
+            state_ty,
+            NO_ORIGIN,
+        );
+        b.terminate(entry, RTerm::Goto(header, vec![zero, init_state]));
+
+        let iter_p = b.block_param(header, I32, NO_ORIGIN);
+        let state_p = b.block_param(header, state_ty, NO_ORIGIN);
+        let one = b.op(
+            header,
+            OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+            I32,
+            NO_ORIGIN,
+        );
+        let next_i = b.op(
+            header,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: iter_p,
+                r: one,
+                ty: I32,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        let discr = b.op(header, OpKind::Discriminant(state_p), I32, NO_ORIGIN);
+        b.terminate(
+            header,
+            RTerm::Switch {
+                scrut: discr,
+                scrut_ty: I32,
+                cases: vec![(0, arm_idle, Vec::new()), (1, arm_scan, Vec::new())],
+                default: (arm_other, Vec::new()),
+            },
+        );
+
+        // Arm 0 (`Idle`): borrow `&mut state_p`, store `State::Scan(iter_p)` via `StoreThrough`.
+        let r0 = b.op(
+            arm_idle,
+            OpKind::BorrowView {
+                root: Root::Value(state_p),
+                path: Vec::new(),
+                mutable: true,
+            },
+            ref_state_ty,
+            NO_ORIGIN,
+        );
+        let scan_val = b.op(
+            arm_idle,
+            OpKind::Aggregate {
+                ty: state_ty,
+                variant: 1,
+                active_field: None,
+                fields: vec![iter_p],
+            },
+            state_ty,
+            NO_ORIGIN,
+        );
+        b.effect(
+            arm_idle,
+            OpKind::StoreThrough {
+                ptr: r0,
+                v: scan_val,
+            },
+            NO_ORIGIN,
+        );
+        b.terminate(arm_idle, RTerm::Goto(header, vec![next_i, state_p]));
+
+        // Arm 1 (`Scan(pos)`): read `pos`, construct `State::Match(pos, limit)` and `Deref` check.
+        let r1 = b.op(
+            arm_scan,
+            OpKind::BorrowView {
+                root: Root::Value(state_p),
+                path: Vec::new(),
+                mutable: false,
+            },
+            ref_state_ty,
+            NO_ORIGIN,
+        );
+        let deref1 = b.op(arm_scan, OpKind::Deref(r1), state_ty, NO_ORIGIN);
+        let pos = b.op(
+            arm_scan,
+            OpKind::Field {
+                base: deref1,
+                variant: Some(1),
+                field: 0,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        let match_val = b.op(
+            arm_scan,
+            OpKind::Aggregate {
+                ty: state_ty,
+                variant: 2,
+                active_field: None,
+                fields: vec![pos, limit],
+            },
+            state_ty,
+            NO_ORIGIN,
+        );
+        b.terminate(arm_scan, RTerm::Goto(header, vec![next_i, match_val]));
+
+        // Default (`Match`/`Emit`): read `Match` field 1, `SetDiscriminant(3)` + `SetField(3, 0)` and exit!
+        let m_val = b.op(
+            arm_other,
+            OpKind::Field {
+                base: state_p,
+                variant: Some(2),
+                field: 1,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        b.effect(
+            arm_other,
+            OpKind::SetDiscriminant {
+                base: state_p,
+                variant: 3,
+            },
+            NO_ORIGIN,
+        );
+        b.effect(
+            arm_other,
+            OpKind::SetField {
+                base: state_p,
+                variant: Some(3),
+                field: 0,
+                v: m_val,
+            },
+            NO_ORIGIN,
+        );
+        b.terminate(arm_other, RTerm::Goto(exit, vec![state_p]));
+
+        let final_state = b.block_param(exit, state_ty, NO_ORIGIN);
+        let final_d = b.op(exit, OpKind::Discriminant(final_state), I32, NO_ORIGIN);
+        let final_f = b.op(
+            exit,
+            OpKind::Field {
+                base: final_state,
+                variant: Some(3),
+                field: 0,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        let out = b.op(
+            exit,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: final_d,
+                r: final_f,
+                ty: I32,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        b.terminate(exit, RTerm::Return(Some(out)));
+
+        let mut func = b.finish();
+        let stats = run(&mut func, &table);
+        assert_eq!(stats.escaped, 0, "multi-variant enum loop must not escape");
+        assert!(stats.scalarized >= 5);
+        assert!(func.verify(&table).is_ok());
+        crate::opt::dce::run(&mut func, &table);
+        assert!(func.verify(&table).is_ok());
+        for block in &func.blocks {
+            assert!(block.ops.iter().all(|op| !matches!(
+                op.kind,
+                OpKind::Aggregate { .. }
+                    | OpKind::BorrowView { .. }
+                    | OpKind::StoreThrough { .. }
+                    | OpKind::Discriminant(_)
+                    | OpKind::SetDiscriminant { .. }
+            )));
+        }
+    }
+
+    #[test]
+    fn multi_variant_enum_const_and_branch_merge_scalarizes() {
+        let (table, state_ty, _, _) = enum_state_table();
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 22,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                },
+                arguments: vec![I32],
+                result: I32,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let left = b.block();
+        let right = b.block();
+        let merge = b.block();
+
+        let arg = b.param(I32, NO_ORIGIN);
+        b.terminate(
+            entry,
+            RTerm::Switch {
+                scrut: arg,
+                scrut_ty: I32,
+                cases: vec![(0, left, Vec::new())],
+                default: (right, Vec::new()),
+            },
+        );
+
+        let c_idle = b.op(
+            left,
+            OpKind::Const(ConstTree::Variant {
+                variant: 0,
+                fields: Vec::new(),
+            }),
+            state_ty,
+            NO_ORIGIN,
+        );
+        b.terminate(left, RTerm::Goto(merge, vec![c_idle]));
+
+        let v_emit = b.op(
+            right,
+            OpKind::Aggregate {
+                ty: state_ty,
+                variant: 3,
+                active_field: None,
+                fields: vec![arg],
+            },
+            state_ty,
+            NO_ORIGIN,
+        );
+        b.terminate(right, RTerm::Goto(merge, vec![v_emit]));
+
+        let merged = b.block_param(merge, state_ty, NO_ORIGIN);
+        let discr = b.op(merge, OpKind::Discriminant(merged), I32, NO_ORIGIN);
+        let payload = b.op(
+            merge,
+            OpKind::Field {
+                base: merged,
+                variant: Some(3),
+                field: 0,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        let sum = b.op(
+            merge,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: discr,
+                r: payload,
+                ty: I32,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        b.terminate(merge, RTerm::Return(Some(sum)));
+
+        let mut func = b.finish();
+        let stats = run(&mut func, &table);
+        assert_eq!(stats.escaped, 0);
+        assert_eq!(stats.scalarized, 3);
+        assert!(func.verify(&table).is_ok());
+        crate::opt::dce::run(&mut func, &table);
+        assert!(func.verify(&table).is_ok());
+    }
+
+    #[test]
+    fn multi_variant_enum_escaping_through_call_falls_back_cleanly() {
+        let (table, state_ty, ref_state_ty, _) = enum_state_table();
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 23,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                },
+                arguments: vec![I32],
+                result: I32,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let arg = b.param(I32, NO_ORIGIN);
+        let st = b.op(
+            entry,
+            OpKind::Aggregate {
+                ty: state_ty,
+                variant: 1,
+                active_field: None,
+                fields: vec![arg],
+            },
+            state_ty,
+            NO_ORIGIN,
+        );
+        let r = b.op(
+            entry,
+            OpKind::BorrowView {
+                root: Root::Value(st),
+                path: Vec::new(),
+                mutable: true,
+            },
+            ref_state_ty,
+            NO_ORIGIN,
+        );
+        b.effect(
+            entry,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: ItemId {
+                        definition: DefinitionId {
+                            crate_id: 0,
+                            local_hash: 99,
+                        },
+                        instantiation: 0,
+                    },
+                    link_name: StrId(0),
+                },
+                function: None,
+                args: vec![r],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            NO_ORIGIN,
+        );
+        let discr = b.op(entry, OpKind::Discriminant(st), I32, NO_ORIGIN);
+        b.terminate(entry, RTerm::Return(Some(discr)));
+
+        let mut func = b.finish();
+        let stats = run(&mut func, &table);
+        assert_eq!(stats.scalarized, 0);
+        assert_eq!(stats.escaped, 1);
+        assert!(func.verify(&table).is_ok());
+    }
+
+    #[test]
+    fn multi_variant_enum_inactive_fieldless_zst_payload_scalarizes_and_interprets() {
+        let mut tbl = table();
+        let zst_ty = TypeId(10);
+        let mut zst = descriptor(
+            zst_ty,
+            TypeKind::Tuple(Vec::new()),
+            js(zst_ty, Vec::new(), false),
+        );
+        zst.layout.zst = true;
+        tbl.insert(zst);
+
+        // `enum Mode { Unit(()), Other }` — `fieldless: true`, yet variant 0 carries a ZST field.
+        let mode_ty = TypeId(11);
+        let mut mode_js = js(mode_ty, Vec::new(), false);
+        mode_js.enum_repr = Some(EnumRepr::Tag { fieldless: true });
+        tbl.insert(descriptor(
+            mode_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 81,
+                },
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: StrId(0),
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Index(0),
+                            ty: zst_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: StrId(1),
+                        fields: Vec::new(),
+                        logical_discr: 1,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            mode_js,
+        ));
+
+        let outer_ty = TypeId(12);
+        let mut outer_js = js(outer_ty, Vec::new(), true);
+        outer_js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+        tbl.insert(descriptor(
+            outer_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 82,
+                },
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: StrId(0),
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Index(0),
+                            ty: I32,
+                            offset: 0,
+                        }],
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: StrId(1),
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Index(0),
+                            ty: mode_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            outer_js,
+        ));
+
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 83,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                },
+                arguments: vec![I32],
+                result: I32,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let left = b.block();
+        let right = b.block();
+        let merge = b.block();
+        let ret_num = b.block();
+        let ret_mode = b.block();
+
+        let arg = b.param(I32, NO_ORIGIN);
+        b.terminate(
+            entry,
+            RTerm::Switch {
+                scrut: arg,
+                scrut_ty: I32,
+                cases: vec![(0, left, Vec::new())],
+                default: (right, Vec::new()),
+            },
+        );
+
+        let v0 = b.op(
+            left,
+            OpKind::Aggregate {
+                ty: outer_ty,
+                variant: 0,
+                active_field: None,
+                fields: vec![arg],
+            },
+            outer_ty,
+            NO_ORIGIN,
+        );
+        b.terminate(left, RTerm::Goto(merge, vec![v0]));
+
+        let mode = b.op(
+            right,
+            OpKind::Const(ConstTree::Variant {
+                variant: 1,
+                fields: Vec::new(),
+            }),
+            mode_ty,
+            NO_ORIGIN,
+        );
+        let v1 = b.op(
+            right,
+            OpKind::Aggregate {
+                ty: outer_ty,
+                variant: 1,
+                active_field: None,
+                fields: vec![mode],
+            },
+            outer_ty,
+            NO_ORIGIN,
+        );
+        b.terminate(right, RTerm::Goto(merge, vec![v1]));
+
+        let merged = b.block_param(merge, outer_ty, NO_ORIGIN);
+        let discr = b.op(merge, OpKind::Discriminant(merged), I32, NO_ORIGIN);
+        b.terminate(
+            merge,
+            RTerm::Switch {
+                scrut: discr,
+                scrut_ty: I32,
+                cases: vec![(0, ret_num, Vec::new())],
+                default: (ret_mode, Vec::new()),
+            },
+        );
+
+        let n = b.op(
+            ret_num,
+            OpKind::Field {
+                base: merged,
+                variant: Some(0),
+                field: 0,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        b.terminate(ret_num, RTerm::Return(Some(n)));
+
+        let m = b.op(
+            ret_mode,
+            OpKind::Field {
+                base: merged,
+                variant: Some(1),
+                field: 0,
+            },
+            mode_ty,
+            NO_ORIGIN,
+        );
+        let md = b.op(ret_mode, OpKind::Discriminant(m), I32, NO_ORIGIN);
+        b.terminate(ret_mode, RTerm::Return(Some(md)));
+
+        let before = b.finish();
+        assert!(before.verify(&tbl).is_ok());
+        let mut after = before.clone();
+        let stats = run(&mut after, &tbl);
+        assert!(stats.scalarized >= 1);
+        assert_eq!(stats.escaped, 0);
+        crate::opt::dce::run(&mut after, &tbl);
+        assert!(after.verify(&tbl).is_ok());
+
+        let interns = crate::jir::interns::Interns::default();
+        for input in [0, 7] {
+            let set = vec![(
+                crate::jir::interp::Value::Int {
+                    value: input,
+                    bits: 32,
+                    signed: true,
+                },
+                None,
+            )];
+            let verdict = crate::lower::ssa::check::compare_funcs(
+                &before,
+                &after,
+                &tbl,
+                &interns,
+                &BTreeMap::new(),
+                &set,
+                100,
+            );
+            assert!(
+                matches!(verdict, crate::lower::ssa::check::Verdict::Agree),
+                "interp verdict for {input}: {verdict:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_variant_enum_needs_clone_deref_store_escapes_cleanly() {
+        let mut tbl = table();
+        let pair_ty = TypeId(10);
+        tbl.insert(descriptor(
+            pair_ty,
+            TypeKind::Tuple(vec![I32, I32]),
+            js(pair_ty, Vec::new(), true),
+        ));
+        let enum_ty = TypeId(11);
+        let mut enum_js = js(enum_ty, Vec::new(), true);
+        enum_js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+        tbl.insert(descriptor(
+            enum_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 84,
+                },
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![
+                    VariantDescriptor {
+                        name: StrId(0),
+                        fields: Vec::new(),
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    VariantDescriptor {
+                        name: StrId(1),
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Index(0),
+                            ty: pair_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+            enum_js,
+        ));
+        let ref_enum_ty = TypeId(12);
+        tbl.insert(descriptor(
+            ref_enum_ty,
+            TypeKind::Reference {
+                pointee: enum_ty,
+                mutable: true,
+            },
+            js(ref_enum_ty, Vec::new(), false),
+        ));
+
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 85,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 1,
+                    spread: None,
+                    caller_location: false,
+                },
+                arguments: vec![I32],
+                result: I32,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let arg = b.param(I32, NO_ORIGIN);
+        let pair = b.op(
+            entry,
+            OpKind::Aggregate {
+                ty: pair_ty,
+                variant: 0,
+                active_field: None,
+                fields: vec![arg, arg],
+            },
+            pair_ty,
+            NO_ORIGIN,
+        );
+        let x = b.op(
+            entry,
+            OpKind::Aggregate {
+                ty: enum_ty,
+                variant: 1,
+                active_field: None,
+                fields: vec![pair],
+            },
+            enum_ty,
+            NO_ORIGIN,
+        );
+        let r = b.op(
+            entry,
+            OpKind::BorrowView {
+                root: Root::Value(x),
+                path: Vec::new(),
+                mutable: true,
+            },
+            ref_enum_ty,
+            NO_ORIGIN,
+        );
+        let y = b.op(entry, OpKind::Deref(r), enum_ty, NO_ORIGIN);
+        let z = b.op(
+            entry,
+            OpKind::Aggregate {
+                ty: enum_ty,
+                variant: 0,
+                active_field: None,
+                fields: Vec::new(),
+            },
+            enum_ty,
+            NO_ORIGIN,
+        );
+        b.effect(entry, OpKind::StoreThrough { ptr: r, v: z }, NO_ORIGIN);
+        let d = b.op(entry, OpKind::Discriminant(y), I32, NO_ORIGIN);
+        b.terminate(entry, RTerm::Return(Some(d)));
+
+        let mut func = b.finish();
+        let stats = run(&mut func, &tbl);
+        assert_eq!(stats.scalarized, 0);
+        assert!(stats.escaped >= 1);
+        assert!(func.verify(&tbl).is_ok());
     }
 }
 
