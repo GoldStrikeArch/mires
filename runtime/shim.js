@@ -402,30 +402,32 @@ globalThis.__rt._addr_release = (buf, bytes) => {
   if (bytes !== undefined) globalThis.__rt._addrs.delete(buf);
 };
 
-// ptr_is_null(ptr): exact boolean `(addr(ptr, 1) >>> 0) === 0`, without minting
-// a synthetic address for live `{ buf: Array, off }` pointers on the fast path.
-globalThis.__rt.ptr_is_null = (ptr) => {
+// ptr_is_null(ptr, size): exact boolean `(addr(ptr, size) >>> 0) === 0`, without
+// minting a synthetic address for live `{ buf: Array, off }` pointers on the fast path.
+globalThis.__rt.ptr_is_null = (ptr, size = 1) => {
   while (ptr !== null && ptr !== undefined && typeof ptr === "object" && ptr.pr !== undefined) {
+    size = ptr.ps;
     ptr = ptr.pr;
   }
   if (typeof ptr === "number") return (ptr >>> 0) === 0;
   if (ptr === null) return true;
   if (ptr === undefined) return false;
-  if (
-    typeof ptr === "object" &&
-    typeof ptr.buf === "object" &&
-    ptr.buf !== null &&
-    (ptr.off === 0 ||
-      ptr.off === undefined ||
-      (typeof ptr.off === "number" &&
-        ptr.off >= 0 &&
-        ptr.off <= 65536 &&
-        globalThis.__rt._addrNext < 2147483648 &&
-        (ptr.es === undefined || (ptr.es >= 0 && ptr.es <= 1024))))
-  ) {
-    return false;
+  if (typeof ptr === "object" && typeof ptr.buf === "object" && ptr.buf !== null) {
+    if (ptr.off === 0 || ptr.off === undefined) return false;
+    const step = ptr.sc !== undefined ? 1 : ptr.es === undefined ? size : ptr.es;
+    if (
+      typeof ptr.off === "number" &&
+      ptr.off >= 0 &&
+      ptr.off <= 65536 &&
+      globalThis.__rt._addrNext < 2147483648 &&
+      typeof step === "number" &&
+      step >= 0 &&
+      step <= 1024
+    ) {
+      return false;
+    }
   }
-  return (globalThis.__rt.addr(ptr, 1) >>> 0) === 0;
+  return (globalThis.__rt.addr(ptr, size) >>> 0) === 0;
 };
 
 // offset_from(a, b): how many elements `a` is past `b`, for an *aggregate*

@@ -190,7 +190,33 @@ test("ptr_is_null matches (addr(p, 1) >>> 0) === 0 without minting on live buffe
   // Offset-wrapped pointer reaching address 0 must fall back and return true.
   const freshContext = vm.createContext({});
   vm.runInContext(fullShim, freshContext);
-  assert.equal(freshContext.__rt.ptr_is_null({ buf: [1], off: -4096 }), true);
+  const frt = freshContext.__rt;
+  assert.equal(frt.ptr_is_null({ buf: [1], off: -4096 }), true);
+
+  // Projected `.pr` must preserve `.ps` for dangling/heap negative offsets and large wraps, plus 2-arg size.
+  const d4 = frt._dangling(4);
+  const dMoved = frt.offset(d4, -1, 4);
+  const dProj = frt.prefix(dMoved, "_0", 4);
+  assert.equal(frt.ptr_is_null(dProj), true);
+  assert.equal((frt.addr(dProj, 1) >>> 0) === 0, true);
+
+  const hCtx = vm.createContext({});
+  vm.runInContext(fullShim, hCtx);
+  const hrt = hCtx.__rt;
+  const h = hrt.alloc(16, 4); // base = 4096
+  const hProj = hrt.prefix(hrt.offset(h, -1024, 4), "_0", 4);
+  assert.equal(hrt.ptr_is_null(hProj), true);
+  assert.equal((hrt.addr(hProj, 1) >>> 0) === 0, true);
+
+  const wCtx = vm.createContext({});
+  vm.runInContext(fullShim, wCtx);
+  const wrt = wCtx.__rt;
+  wrt._addrNext = 1048576;
+  const largeBuf = [1];
+  const wProj = { pr: { buf: largeBuf, off: 4095 }, ps: 1048576 };
+  assert.equal(wrt.ptr_is_null(wProj), true);
+  assert.equal((wrt.addr(wProj, 1) >>> 0) === 0, true);
+  assert.equal(wrt.ptr_is_null({ buf: largeBuf, off: 4095 }, 1048576), true);
 
   // Poisoned provenance-less pointer must throw just like addr().
   assert.throws(() => rt.ptr_is_null({ buf: undefined, off: NaN }), /no provenance/);
