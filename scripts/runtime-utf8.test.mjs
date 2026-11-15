@@ -317,3 +317,85 @@ test('pure-JS UTF-8 decoder matches TextDecoder(ignoreBOM: true) on invalid and 
     assert.deepEqual(view(rt.str_bytes(text)), utf8(text))
   }
 })
+
+test('ASCII source tracking and 4-slot subslice ring make bytes_str -> str_bytes/str_len zero-copy', () => {
+  const { rt, jobs, unwind } = scheduled()
+  const doc = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!!'
+  const rec = rt.str_bytes(doc)
+  assert.deepEqual(Object.getOwnPropertySymbols(rec.buf), [])
+  assert.equal(Object.keys(rec.buf).length, doc.length)
+  assert.equal(rt.bytes_str(rec.buf, 0, doc.length), doc)
+
+  // Up to 4 subslices share the parent buffer with non-zero offsets without touching _str_memo.
+  const s1 = rt.bytes_str(rec.buf, 4, 20)
+  const s2 = rt.bytes_str(rec.buf, 10, 22)
+  const s3 = rt.bytes_str(rec.buf, 20, 24)
+  const s4 = rt.bytes_str(rec.buf, 30, 18)
+  const r1 = rt.str_bytes(s1)
+  const r2 = rt.str_bytes(s2)
+  assert.equal(r1.buf, rec.buf)
+  assert.equal(r1.off, 4)
+  assert.equal(r1.len, 20)
+  assert.equal(r2.buf, rec.buf)
+  assert.equal(r2.off, 10)
+  assert.equal(rt.str_len(s1), 20)
+  assert.equal(rt.str_len(s3), 24)
+  assert.equal(rt._str_memo.map.has(s1), false)
+  assert.equal(rt._str_memo.bytes, doc.length)
+
+  // Nested subslice preserves parent buffer provenance and offset arithmetic.
+  const nested = rt.bytes_str(r1.buf, r1.off + 2, 17)
+  const rn = rt.str_bytes(nested)
+  assert.equal(rn.buf, rec.buf)
+  assert.equal(rn.off, 6)
+  assert.equal(rn.len, 17)
+  assert.equal(rt.str_len(nested), 17)
+
+  // convert_str_block and convert_sb_block slice from shared.off, not 0.
+  const blk = rt.convert_str_block(s2)
+  assert.notEqual(blk.buf, rec.buf)
+  assert.equal(blk.off, 0)
+  assert.equal(blk.len, 22)
+  assert.deepEqual(view(blk), utf8(s2))
+  const sbBlk = rt.convert_sb_block({ text: s4, cap: 24, len: 18 })
+  assert.notEqual(sbBlk.buf, rec.buf)
+  assert.equal(sbBlk.len, 18)
+  assert.equal(sbBlk.cap, 24)
+  assert.deepEqual(Array.from(sbBlk.buf.slice(0, 18)), utf8(s4))
+
+  // Unwinding clears the subslice ring; turn 2 bytes_str re-arms queueMicrotask.
+  unwind()
+  assert.equal(rt._str_memo.map.size, 0)
+  const turn2 = rt.bytes_str(rec.buf, 3, 19)
+  assert.equal(jobs.length, 1)
+  assert.equal(rt.str_bytes(turn2).buf, rec.buf)
+  assert.equal(rt.str_bytes(turn2).off, 3)
+  unwind()
+  assert.equal(rt.str_bytes(turn2).off, 0)
+
+  // Huge eviction and budget overflow reset the subslice ring.
+  const hugeA = 'A'.repeat(2 * 1024 * 1024)
+  const hugeB = 'B'.repeat(2 * 1024 * 1024)
+  const hugeC = 'C'.repeat(2 * 1024 * 1024)
+  const ha = rt.str_bytes(hugeA)
+  rt.str_bytes(hugeB)
+  const hSub = rt.bytes_str(ha.buf, 5, 20)
+  assert.equal(rt.str_bytes(hSub).buf, ha.buf)
+  rt.str_bytes(hugeC) // evicts hugeA and resets subslice ring
+  assert.notEqual(rt.str_bytes(hSub).buf, ha.buf)
+
+  // Mutable and non-ASCII/lone-surrogate strings never enter _ascii_src.
+  const mut = rt.str_bytes_mut(doc)
+  mut.buf[0] = 0x58
+  assert.equal(rt.bytes_str(mut.buf, 0, doc.length), 'X' + doc.slice(1))
+  const lone = '\ud800abcdefghijklmnop'
+  const loneRec = rt.str_bytes(lone)
+  assert.notEqual(loneRec.buf.length, lone.length)
+  assert.equal(rt.bytes_str(loneRec.buf, 3, 16), 'abcdefghijklmnop')
+  assert.notEqual(rt.str_bytes('abcdefghijklmnop').buf, loneRec.buf)
+
+  // Long (> 4096B) ASCII slice roundtrips without Uint8Array copy.
+  const bigAscii = 'abcdefgh'.repeat(700)
+  const bigRec = rt.str_bytes(bigAscii)
+  assert.equal(rt.bytes_str(bigRec.buf, 100, 5000), bigAscii.slice(100, 5100))
+})
