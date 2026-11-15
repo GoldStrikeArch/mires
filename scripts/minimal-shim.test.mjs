@@ -141,6 +141,12 @@ test("module mode emits lexical ESM bindings, elides unused _boxes, and deduplic
   const literalMod = minimalShim(["__rt.str(); __rt.outer(1);"], literalShim, { module: true });
   assert.match(literalMod.source, /"__rt\.outer"/);
   assert.match(literalMod.source, /let \$rt_outer =/);
+
+  const keyedMod = minimalShim(["__rt.keyed_metrics_snapshot;"], fullShim, { module: true });
+  parse(keyedMod.source, { ecmaVersion: 2018, sourceType: "module" });
+  assert.match(keyedMod.source, /globalThis\.__rt = globalThis\.__rt \|\| \{\};/);
+  assert.match(keyedMod.source, /export const \{\n[\s\S]*  keyed_metrics_snapshot,\n[\s\S]*\} = globalThis\.__rt;/);
+  assert.doesNotMatch(keyedMod.source, /\$rt_/);
 });
 
 test("ptr_is_null matches (addr(p, 1) >>> 0) === 0 without minting on live buffers", () => {

@@ -123,13 +123,19 @@ export function minimalShim(programs, shimSource, { module = false, direct: decl
   }
 
   const names = [...members.keys()].filter((name) => needed.has(name));
-  if (!module) {
+  // Keyed DOM/hydration bundles and lifecycle tests still read hooks and state
+  // through `globalThis.__rt`, so preserve the classic global object for them.
+  const preserveGlobal = !module || names.some((name) => name.startsWith("keyed_") || name === "_keyed_states");
+  if (preserveGlobal) {
     const output = [
       "// The subset of runtime/shim.js this program reaches. Generated; do not edit.",
       "globalThis.__rt = globalThis.__rt || {};",
       ...names.map((name) => members.get(name)),
-      "",
     ];
+    if (module) {
+      output.push(`export const {\n${names.map((name) => `  ${name},`).join("\n")}\n} = globalThis.__rt;`);
+    }
+    output.push("");
     return { direct: [...direct].sort(), names, source: output.join("\n") };
   }
 
