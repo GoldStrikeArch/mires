@@ -15,8 +15,8 @@ use crate::jir::repr::{
     Carrier, Dominators, Func, Op, OpKind, Proj, RAssertMessage, RBlock, RBlockId, RTerm, Root,
     ValueDef, ValueId,
 };
-use crate::jir::semantic::{BinaryOp, CallSemantic, CastKind, ConstTree, TypeId, UnaryOp};
-use crate::jir::types::{IntRepr, IteratorIdentity, PinnedBoundary, TypeKind};
+use crate::jir::semantic::{BinaryOp, CallSemantic, Callee, CastKind, ConstTree, TypeId, UnaryOp};
+use crate::jir::types::{IntRepr, IteratorIdentity, NominalForm, PinnedBoundary, TypeKind};
 use crate::jir::{OriginId, TypeTable};
 
 use super::witness::SliceIteratorLoop;
@@ -234,7 +234,7 @@ fn match_loop(
         }
         _ => return None,
     };
-    let raw = strip_pointer_aliases(func, defs, start)?;
+    let raw = strip_pointer_aliases(func, table, defs, start)?;
     let OpKind::RawView {
         root: Root::Value(source),
         path,
@@ -248,17 +248,20 @@ fn match_loop(
     {
         return None;
     }
-    let end = strip_pointer_aliases(func, defs, end)?;
+    let end = strip_pointer_aliases(func, table, defs, end)?;
     let OpKind::Binary {
         op: BinaryOp::Offset,
         l: end_base,
         r: len,
-        ..
+        ty: end_ty,
     } = definition(func, defs, end)?.kind
     else {
         return None;
     };
-    if strip_pointer_aliases(func, defs, end_base)? != raw {
+    if !is_raw_ptr_to(table, end_ty, types.element) {
+        return None;
+    }
+    if strip_pointer_aliases(func, table, defs, end_base)? != raw {
         return None;
     }
     if !source_length_matches(func, defs, *source, len) || value_ty(func, len)? != types.usize_ty {
@@ -651,10 +654,7 @@ fn is_slice_pointer_for(table: &TypeTable, ty: TypeId, element: TypeId) -> bool 
 }
 
 fn sized_non_zst_slice_element(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
-    let pointee = match table
-        .get(table.peeled(ty))
-        .map(|descriptor| &descriptor.kind)
-    {
+    let pointee = match table.get(ty).map(|descriptor| &descriptor.kind) {
         Some(TypeKind::Reference {
             pointee,
             mutable: false,
@@ -662,7 +662,7 @@ fn sized_non_zst_slice_element(table: &TypeTable, ty: TypeId) -> Option<TypeId> 
         | Some(TypeKind::RawPointer {
             pointee,
             mutable: false,
-        }) => table.peeled(*pointee),
+        }) => *pointee,
         _ => return None,
     };
     let TypeKind::Slice(element) = table.get(pointee)?.kind else {
@@ -817,11 +817,14 @@ fn find_ptr_eq_header(
         op: cmp_kind @ (BinaryOp::Eq | BinaryOp::Ne),
         l,
         r,
-        ..
+        ty: cmp_ty,
     } = cmp_op.kind
     else {
         return None;
     };
+    if !is_raw_ptr_to(table, cmp_ty, types.element) {
+        return None;
+    }
     let eq_false_target = match (cmp_kind, case_val) {
         (BinaryOp::Eq, 0) | (BinaryOp::Ne, 1) => case_target,
         (BinaryOp::Eq, 1) | (BinaryOp::Ne, 0) => default.0,
@@ -941,8 +944,8 @@ fn match_take_body(
         return None;
     }
     let (item_current, item_ptr) = cast_source_result(&ops[5])?;
-    if strip_pointer_aliases(func, defs, item_current)?
-        != strip_pointer_aliases(func, defs, current)?
+    if strip_pointer_aliases(func, table, defs, item_current)?
+        != strip_pointer_aliases(func, table, defs, current)?
     {
         return None;
     }
@@ -1194,8 +1197,8 @@ fn match_slice_direct_body(
         return None;
     }
     let (item_current, item_ptr) = cast_source_result(&ops[5])?;
-    if strip_pointer_aliases(func, defs, item_current)?
-        != strip_pointer_aliases(func, defs, current)?
+    if strip_pointer_aliases(func, table, defs, item_current)?
+        != strip_pointer_aliases(func, table, defs, current)?
     {
         return None;
     }
@@ -1270,7 +1273,7 @@ fn match_scalarized_loop(
         op: cmp_kind @ (BinaryOp::Eq | BinaryOp::Ne),
         l,
         r,
-        ..
+        ty: cmp_ty,
     } = cmp_op.kind
     else {
         return None;
@@ -1375,6 +1378,9 @@ fn match_scalarized_loop(
                 _ => return None,
             };
             let elem_ty = sized_non_zst_slice_element(table, value_ty(func, source)?)?;
+            if !is_raw_ptr_to(table, cmp_ty, elem_ty) {
+                return None;
+            }
             let end_leaf = strip_ptr_wrapper(func, table, defs, end_side)?;
             let (end_root, end_param_idx) =
                 if let Some(e_idx) = header.params.iter().position(|p| *p == end_leaf) {
@@ -1404,11 +1410,14 @@ fn match_scalarized_loop(
                 op: BinaryOp::Offset,
                 l: end_base,
                 r: len,
-                ..
+                ty: end_ty,
             } = definition(func, defs, end_root)?.kind
             else {
                 return None;
             };
+            if !is_raw_ptr_to(table, end_ty, elem_ty) {
+                return None;
+            }
             let end_base_root = strip_ptr_wrapper(func, table, defs, end_base)?;
             if end_base_root != raw && end_base_root != source {
                 return None;
@@ -1447,10 +1456,11 @@ fn match_scalarized_loop(
             op: BinaryOp::Offset,
             l: base,
             r: one,
-            ..
+            ty: next_ty,
         } = op.kind
         {
-            if strip_ptr_wrapper(func, table, defs, base) == Some(ptr_param)
+            if is_raw_ptr_to(table, next_ty, elem_ty)
+                && strip_ptr_wrapper(func, table, defs, base) == Some(ptr_param)
                 && is_scalar(func, defs, one, 1)
             {
                 next_ptr_op_idx = Some(op_idx);
@@ -1936,12 +1946,24 @@ fn strip_copies_local(func: &Func, block: usize, mut val: ValueId) -> ValueId {
     val
 }
 
+fn is_raw_ptr_to(table: &TypeTable, ptr: TypeId, pointee: TypeId) -> bool {
+    matches!(
+        table.get(ptr).map(|descriptor| &descriptor.kind),
+        Some(TypeKind::RawPointer { pointee: found, .. }) if *found == pointee
+    )
+}
+
 fn ptr_wrapper_field(table: &TypeTable, ty: TypeId) -> Option<usize> {
-    let descriptor = table.get(table.peeled(ty))?;
+    let descriptor = table.get(ty)?;
     if descriptor.meta.iterator != IteratorIdentity::None {
         return None;
     }
-    let TypeKind::Adt { variants, .. } = &descriptor.kind else {
+    let TypeKind::Adt {
+        form: NominalForm::Struct,
+        variants,
+        ..
+    } = &descriptor.kind
+    else {
         return None;
     };
     let [variant] = variants.as_slice() else {
@@ -1953,10 +1975,65 @@ fn ptr_wrapper_field(table: &TypeTable, ty: TypeId) -> Option<usize> {
             if non_zst.is_some() {
                 return None;
             }
-            non_zst = Some(idx);
+            non_zst = Some((idx, field.ty));
         }
     }
-    non_zst
+    let (idx, field_ty) = non_zst?;
+    matches!(
+        table.get(table.peeled(field_ty)).map(|d| &d.kind),
+        Some(TypeKind::RawPointer { .. } | TypeKind::Reference { .. })
+    )
+    .then_some(idx)
+}
+
+fn ptr_wrapper_aggregate_field(table: &TypeTable, ty: TypeId, fields_len: usize) -> Option<usize> {
+    let idx = ptr_wrapper_field(table, ty)?;
+    let TypeKind::Adt { variants, .. } = &table.get(ty)?.kind else {
+        return None;
+    };
+    let [variant] = variants.as_slice() else {
+        return None;
+    };
+    (fields_len == variant.fields.len() && idx < fields_len).then_some(idx)
+}
+
+fn resolve_ptr_pointee(table: &TypeTable, mut ty: TypeId) -> Option<TypeId> {
+    for _ in 0..8 {
+        if let Some(TypeKind::RawPointer { pointee, .. } | TypeKind::Reference { pointee, .. }) =
+            table
+                .get(table.peeled(ty))
+                .map(|descriptor| &descriptor.kind)
+        {
+            return Some(*pointee);
+        }
+        let idx = ptr_wrapper_field(table, ty)?;
+        let TypeKind::Adt { variants, .. } = &table.get(ty)?.kind else {
+            return None;
+        };
+        ty = variants.first()?.fields.get(idx)?.ty;
+    }
+    None
+}
+
+fn is_lossless_ptr_cast(table: &TypeTable, kind: CastKind, from: TypeId, to: TypeId) -> bool {
+    if !matches!(
+        kind,
+        CastKind::PtrToPtr | CastKind::PointerCoercion | CastKind::Subtype | CastKind::Transmute
+    ) {
+        return false;
+    }
+    let (Some(from_p), Some(to_p)) = (
+        resolve_ptr_pointee(table, from),
+        resolve_ptr_pointee(table, to),
+    ) else {
+        return false;
+    };
+    table.peeled(from_p) == table.peeled(to_p)
+        || (matches!(kind, CastKind::PtrToPtr)
+            && matches!(
+                table.get(from_p).map(|descriptor| &descriptor.kind),
+                Some(TypeKind::Slice(elem)) if *elem == to_p
+            ))
 }
 
 fn strip_ptr_wrapper(
@@ -1970,7 +2047,15 @@ fn strip_ptr_wrapper(
             return Some(value);
         };
         match &op.kind {
-            OpKind::Copy(source) | OpKind::Move(source) | OpKind::Cast { v: source, .. } => {
+            OpKind::Copy(source) | OpKind::Move(source) => {
+                value = *source;
+            }
+            OpKind::Cast {
+                kind,
+                v: source,
+                from,
+                to,
+            } if is_lossless_ptr_cast(table, *kind, *from, *to) => {
                 value = *source;
             }
             OpKind::Field {
@@ -1988,8 +2073,10 @@ fn strip_ptr_wrapper(
                 active_field: None,
                 fields,
                 ..
-            } if ptr_wrapper_field(table, *ty).is_some_and(|idx| idx < fields.len()) => {
-                let idx = ptr_wrapper_field(table, *ty)?;
+            } => {
+                let Some(idx) = ptr_wrapper_aggregate_field(table, *ty, fields.len()) else {
+                    return Some(value);
+                };
                 value = fields[idx];
             }
             _ => return Some(value),
@@ -2011,7 +2098,15 @@ fn strip_ptr_wrapper_stop_params(
         }
         let op = definition(func, defs, value)?;
         match &op.kind {
-            OpKind::Copy(source) | OpKind::Move(source) | OpKind::Cast { v: source, .. } => {
+            OpKind::Copy(source) | OpKind::Move(source) => {
+                value = *source;
+            }
+            OpKind::Cast {
+                kind,
+                v: source,
+                from,
+                to,
+            } if is_lossless_ptr_cast(table, *kind, *from, *to) => {
                 value = *source;
             }
             OpKind::Field {
@@ -2029,8 +2124,8 @@ fn strip_ptr_wrapper_stop_params(
                 active_field: None,
                 fields,
                 ..
-            } if ptr_wrapper_field(table, *ty).is_some_and(|idx| idx < fields.len()) => {
-                let idx = ptr_wrapper_field(table, *ty)?;
+            } => {
+                let idx = ptr_wrapper_aggregate_field(table, *ty, fields.len())?;
                 value = fields[idx];
             }
             _ => return None,
@@ -2062,7 +2157,13 @@ fn collect_ptr_wrapper_chain_in_block(
         }
         let op = &func.blocks[block].ops[site.op];
         let next = match &op.kind {
-            OpKind::Copy(s) | OpKind::Move(s) | OpKind::Cast { v: s, .. } => *s,
+            OpKind::Copy(s) | OpKind::Move(s) => *s,
+            OpKind::Cast {
+                kind,
+                v: s,
+                from,
+                to,
+            } if is_lossless_ptr_cast(table, *kind, *from, *to) => *s,
             OpKind::Field {
                 base,
                 variant: None,
@@ -2079,7 +2180,7 @@ fn collect_ptr_wrapper_chain_in_block(
                 fields,
                 ..
             } => {
-                let Some(idx) = ptr_wrapper_field(table, *ty).filter(|&i| i < fields.len()) else {
+                let Some(idx) = ptr_wrapper_aggregate_field(table, *ty, fields.len()) else {
                     break;
                 };
                 for (i, &field_val) in fields.iter().enumerate() {
@@ -2117,7 +2218,13 @@ fn collect_backedge_wrapper_chain(
             out.insert(site.op);
         }
         cur = match &func.blocks[site.block].ops[site.op].kind {
-            OpKind::Copy(s) | OpKind::Move(s) | OpKind::Cast { v: s, .. } => *s,
+            OpKind::Copy(s) | OpKind::Move(s) => *s,
+            OpKind::Cast {
+                kind,
+                v: s,
+                from,
+                to,
+            } if is_lossless_ptr_cast(table, *kind, *from, *to) => *s,
             OpKind::Field {
                 base,
                 variant: None,
@@ -2134,7 +2241,7 @@ fn collect_backedge_wrapper_chain(
                 fields,
                 ..
             } => {
-                let idx = ptr_wrapper_field(table, *ty).filter(|&i| i < fields.len())?;
+                let idx = ptr_wrapper_aggregate_field(table, *ty, fields.len())?;
                 if site.block == driver_idx {
                     for (i, &field_val) in fields.iter().enumerate() {
                         if i != idx {
@@ -3094,6 +3201,7 @@ fn source_length_matches(
                 return true;
             }
             OpKind::Call {
+                callee: Callee::Runtime { .. },
                 semantic: CallSemantic::RawParts,
                 args,
                 ..
@@ -3111,13 +3219,16 @@ fn source_length_matches(
 
 fn strip_pointer_aliases(
     func: &Func,
+    table: &TypeTable,
     defs: &[Option<Site>],
     mut value: ValueId,
 ) -> Option<ValueId> {
     for _ in 0..12 {
         match definition(func, defs, value)?.kind {
             OpKind::Copy(source) | OpKind::Move(source) => value = source,
-            OpKind::Cast { v, .. } => value = v,
+            OpKind::Cast { kind, v, from, to } if is_lossless_ptr_cast(table, kind, from, to) => {
+                value = v
+            }
             _ => return Some(value),
         }
     }
@@ -3823,12 +3934,14 @@ mod tests {
             },
             None,
         ));
-        table.insert(aggregate_type(
+        let mut non_null_u8 = aggregate_type(
             NON_NULL_U8,
             vec![U8],
             vec![field(ZST, 0), field(RAW_U8, 1)],
             IteratorIdentity::None,
-        ));
+        );
+        non_null_u8.js.peeled = RAW_U8;
+        table.insert(non_null_u8);
         table
     }
 
@@ -5594,11 +5707,11 @@ mod tests {
             REF_SLICE,
             O,
         );
-        // Simulate rustc's direct Transmute from SliceView (&[u8]) to *const u8 without RawView.
+        // Simulate rustc's direct PtrToPtr from SliceView (&[u8]) to *const u8 without RawView.
         let start_ptr = builder.op(
             entry,
             OpKind::Cast {
-                kind: CastKind::Transmute,
+                kind: CastKind::PtrToPtr,
                 v: slice,
                 from: REF_SLICE,
                 to: RAW_U8,
@@ -5717,5 +5830,661 @@ mod tests {
         check_lowered(&func, &tbl, &loops).expect("witness checks");
         crate::opt::dce::run(&mut func, &tbl);
         func.verify(&tbl).expect("post-dce Func::verify");
+    }
+
+    fn base_scalarized_sig() -> Signature {
+        Signature {
+            abi: AbiSignature {
+                parameters: 2,
+                ..AbiSignature::default()
+            },
+            arguments: vec![RAW_U8, USIZE],
+            result: USIZE,
+        }
+    }
+
+    #[test]
+    fn scalarized_truncated_int_cast_u8_compare_does_not_lower() {
+        let mut builder = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 105,
+                },
+                instantiation: 0,
+            },
+            base_scalarized_sig(),
+        );
+        let entry = FuncBuilder::ENTRY;
+        let ptr_arg = builder.param(RAW_U8, O);
+        let len_arg = builder.param(USIZE, O);
+        let header = builder.block();
+        let driver = builder.block();
+        let exit = builder.block();
+
+        let slice = builder.op(
+            entry,
+            OpKind::SliceView {
+                ptr: ptr_arg,
+                len: len_arg,
+            },
+            REF_SLICE,
+            O,
+        );
+        let raw = builder.op(
+            entry,
+            OpKind::RawView {
+                root: Root::Value(slice),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            RAW_U8,
+            O,
+        );
+        let end = builder.op(
+            entry,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: raw,
+                r: len_arg,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let zero = constant(&mut builder, entry, 0);
+        builder.terminate(entry, RTerm::Goto(header, vec![zero, raw]));
+
+        let sum_param = builder.block_param(header, USIZE, O);
+        let cur_param = builder.block_param(header, RAW_U8, O);
+        let cur_addr = builder.op(
+            header,
+            OpKind::Cast {
+                kind: CastKind::PointerExposeProvenance,
+                v: cur_param,
+                from: RAW_U8,
+                to: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        let cur_u8 = builder.op(
+            header,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: cur_addr,
+                from: USIZE,
+                to: U8,
+            },
+            U8,
+            O,
+        );
+        let end_addr = builder.op(
+            header,
+            OpKind::Cast {
+                kind: CastKind::PointerExposeProvenance,
+                v: end,
+                from: RAW_U8,
+                to: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        let end_u8 = builder.op(
+            header,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: end_addr,
+                from: USIZE,
+                to: U8,
+            },
+            U8,
+            O,
+        );
+        let done = builder.op(
+            header,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: cur_u8,
+                r: end_u8,
+                ty: U8,
+            },
+            BOOL,
+            O,
+        );
+        builder.terminate(
+            header,
+            RTerm::Switch {
+                scrut: done,
+                scrut_ty: BOOL,
+                cases: vec![(0, driver, Vec::new())],
+                default: (exit, Vec::new()),
+            },
+        );
+
+        let one = constant(&mut builder, driver, 1);
+        let next_ptr = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: cur_param,
+                r: one,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let item_ref = builder.op(
+            driver,
+            OpKind::BorrowView {
+                root: Root::Value(cur_param),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            REF_U8,
+            O,
+        );
+        let item = builder.op(driver, OpKind::Deref(item_ref), U8, O);
+        let item_u = builder.op(
+            driver,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: item,
+                from: U8,
+                to: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        let next_sum = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: sum_param,
+                r: item_u,
+                ty: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        builder.terminate(driver, RTerm::Goto(header, vec![next_sum, next_ptr]));
+        builder.terminate(exit, RTerm::Return(Some(sum_param)));
+
+        let mut func = builder.finish();
+        let tbl = table();
+        func.verify(&tbl).expect("pre-pass Func::verify");
+        assert!(run(&mut func, &tbl).is_empty());
+    }
+
+    #[test]
+    fn scalarized_wrong_stride_zst_ptr_offset_does_not_lower() {
+        const RAW_ZST: TypeId = TypeId(23);
+        let mut tbl = table();
+        tbl.insert(scalar(
+            RAW_ZST,
+            TypeKind::RawPointer {
+                pointee: ZST,
+                mutable: false,
+            },
+            None,
+        ));
+
+        let mut builder = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 106,
+                },
+                instantiation: 0,
+            },
+            base_scalarized_sig(),
+        );
+        let entry = FuncBuilder::ENTRY;
+        let ptr_arg = builder.param(RAW_U8, O);
+        let len_arg = builder.param(USIZE, O);
+        let header = builder.block();
+        let driver = builder.block();
+        let exit = builder.block();
+
+        let slice = builder.op(
+            entry,
+            OpKind::SliceView {
+                ptr: ptr_arg,
+                len: len_arg,
+            },
+            REF_SLICE,
+            O,
+        );
+        let raw_u8 = builder.op(
+            entry,
+            OpKind::RawView {
+                root: Root::Value(slice),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            RAW_U8,
+            O,
+        );
+        let start_u = builder.op(
+            entry,
+            OpKind::Cast {
+                kind: CastKind::PtrToPtr,
+                v: raw_u8,
+                from: RAW_U8,
+                to: RAW_ZST,
+            },
+            RAW_ZST,
+            O,
+        );
+        let end_u = builder.op(
+            entry,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: start_u,
+                r: len_arg,
+                ty: RAW_ZST,
+            },
+            RAW_ZST,
+            O,
+        );
+        let zero = constant(&mut builder, entry, 0);
+        builder.terminate(entry, RTerm::Goto(header, vec![zero, start_u]));
+
+        let sum_param = builder.block_param(header, USIZE, O);
+        let cur_param = builder.block_param(header, RAW_ZST, O);
+        let done = builder.op(
+            header,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: cur_param,
+                r: end_u,
+                ty: RAW_ZST,
+            },
+            BOOL,
+            O,
+        );
+        builder.terminate(
+            header,
+            RTerm::Switch {
+                scrut: done,
+                scrut_ty: BOOL,
+                cases: vec![(0, driver, Vec::new())],
+                default: (exit, Vec::new()),
+            },
+        );
+
+        let one = constant(&mut builder, driver, 1);
+        let next_u = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: cur_param,
+                r: one,
+                ty: RAW_ZST,
+            },
+            RAW_ZST,
+            O,
+        );
+        let cur_u8 = builder.op(
+            driver,
+            OpKind::Cast {
+                kind: CastKind::PtrToPtr,
+                v: cur_param,
+                from: RAW_ZST,
+                to: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let item_ref = builder.op(
+            driver,
+            OpKind::BorrowView {
+                root: Root::Value(cur_u8),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            REF_U8,
+            O,
+        );
+        let item = builder.op(driver, OpKind::Deref(item_ref), U8, O);
+        let item_u = builder.op(
+            driver,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: item,
+                from: U8,
+                to: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        let next_sum = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: sum_param,
+                r: item_u,
+                ty: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        builder.terminate(driver, RTerm::Goto(header, vec![next_sum, next_u]));
+        builder.terminate(exit, RTerm::Return(Some(sum_param)));
+
+        let mut func = builder.finish();
+        func.verify(&tbl).expect("pre-pass Func::verify");
+        assert!(run(&mut func, &tbl).is_empty());
+    }
+
+    #[test]
+    fn transparent_unsized_bytes_wrapper_does_not_lower() {
+        const BYTES: TypeId = TypeId(23);
+        const REF_BYTES: TypeId = TypeId(24);
+        const RAW_BYTES: TypeId = TypeId(25);
+        let mut tbl = table();
+        let mut bytes_desc = aggregate_type(
+            BYTES,
+            Vec::new(),
+            vec![field(SLICE, 0)],
+            IteratorIdentity::None,
+        );
+        bytes_desc.layout.sized = false;
+        bytes_desc.js.peeled = SLICE;
+        tbl.insert(bytes_desc);
+        let mut ref_bytes = scalar(
+            REF_BYTES,
+            TypeKind::Reference {
+                pointee: BYTES,
+                mutable: false,
+            },
+            None,
+        );
+        ref_bytes.js.peeled = REF_SLICE;
+        tbl.insert(ref_bytes);
+        tbl.insert(scalar(
+            RAW_BYTES,
+            TypeKind::RawPointer {
+                pointee: BYTES,
+                mutable: false,
+            },
+            None,
+        ));
+
+        let mut builder = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 107,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 2,
+                    ..AbiSignature::default()
+                },
+                arguments: vec![REF_BYTES, USIZE],
+                result: USIZE,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let bytes_ref = builder.param(REF_BYTES, O);
+        let len_arg = builder.param(USIZE, O);
+        let header = builder.block();
+        let driver = builder.block();
+        let exit = builder.block();
+
+        let raw_bytes = builder.op(
+            entry,
+            OpKind::RawView {
+                root: Root::Value(bytes_ref),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            RAW_BYTES,
+            O,
+        );
+        let raw_u8 = builder.op(
+            entry,
+            OpKind::Cast {
+                kind: CastKind::PtrToPtr,
+                v: raw_bytes,
+                from: RAW_BYTES,
+                to: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let end = builder.op(
+            entry,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: raw_u8,
+                r: len_arg,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let zero = constant(&mut builder, entry, 0);
+        builder.terminate(entry, RTerm::Goto(header, vec![zero, raw_u8]));
+
+        let sum_param = builder.block_param(header, USIZE, O);
+        let cur_param = builder.block_param(header, RAW_U8, O);
+        let done = builder.op(
+            header,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: cur_param,
+                r: end,
+                ty: RAW_U8,
+            },
+            BOOL,
+            O,
+        );
+        builder.terminate(
+            header,
+            RTerm::Switch {
+                scrut: done,
+                scrut_ty: BOOL,
+                cases: vec![(0, driver, Vec::new())],
+                default: (exit, Vec::new()),
+            },
+        );
+
+        let one = constant(&mut builder, driver, 1);
+        let next_ptr = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: cur_param,
+                r: one,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let item_ref = builder.op(
+            driver,
+            OpKind::BorrowView {
+                root: Root::Value(cur_param),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            REF_U8,
+            O,
+        );
+        let item = builder.op(driver, OpKind::Deref(item_ref), U8, O);
+        let item_u = builder.op(
+            driver,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: item,
+                from: U8,
+                to: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        let next_sum = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: sum_param,
+                r: item_u,
+                ty: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        builder.terminate(driver, RTerm::Goto(header, vec![next_sum, next_ptr]));
+        builder.terminate(exit, RTerm::Return(Some(sum_param)));
+
+        let mut func = builder.finish();
+        func.verify(&tbl).expect("pre-pass Func::verify");
+        assert!(run(&mut func, &tbl).is_empty());
+    }
+
+    #[test]
+    fn direct_call_with_raw_parts_semantic_does_not_match_source_length() {
+        let mut builder = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 108,
+                },
+                instantiation: 0,
+            },
+            base_scalarized_sig(),
+        );
+        let entry = FuncBuilder::ENTRY;
+        let ptr_arg = builder.param(RAW_U8, O);
+        let len_arg = builder.param(USIZE, O);
+        let header = builder.block();
+        let driver = builder.block();
+        let exit = builder.block();
+
+        let source = builder.op(
+            entry,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: ItemId {
+                        definition: DefinitionId {
+                            crate_id: 1,
+                            local_hash: 777,
+                        },
+                        instantiation: 0,
+                    },
+                    link_name: StrId(1),
+                },
+                function: None,
+                args: vec![ptr_arg, len_arg],
+                track_caller: None,
+                semantic: CallSemantic::RawParts,
+                host: None,
+            },
+            REF_SLICE,
+            O,
+        );
+        let raw = builder.op(
+            entry,
+            OpKind::RawView {
+                root: Root::Value(source),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            RAW_U8,
+            O,
+        );
+        let end = builder.op(
+            entry,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: raw,
+                r: len_arg,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let zero = constant(&mut builder, entry, 0);
+        builder.terminate(entry, RTerm::Goto(header, vec![zero, raw]));
+
+        let sum_param = builder.block_param(header, USIZE, O);
+        let cur_param = builder.block_param(header, RAW_U8, O);
+        let done = builder.op(
+            header,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: cur_param,
+                r: end,
+                ty: RAW_U8,
+            },
+            BOOL,
+            O,
+        );
+        builder.terminate(
+            header,
+            RTerm::Switch {
+                scrut: done,
+                scrut_ty: BOOL,
+                cases: vec![(0, driver, Vec::new())],
+                default: (exit, Vec::new()),
+            },
+        );
+
+        let one = constant(&mut builder, driver, 1);
+        let next_ptr = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Offset,
+                l: cur_param,
+                r: one,
+                ty: RAW_U8,
+            },
+            RAW_U8,
+            O,
+        );
+        let item_ref = builder.op(
+            driver,
+            OpKind::BorrowView {
+                root: Root::Value(cur_param),
+                path: vec![Proj::Deref],
+                mutable: false,
+            },
+            REF_U8,
+            O,
+        );
+        let item = builder.op(driver, OpKind::Deref(item_ref), U8, O);
+        let item_u = builder.op(
+            driver,
+            OpKind::Cast {
+                kind: CastKind::IntToInt,
+                v: item,
+                from: U8,
+                to: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        let next_sum = builder.op(
+            driver,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: sum_param,
+                r: item_u,
+                ty: USIZE,
+            },
+            USIZE,
+            O,
+        );
+        builder.terminate(driver, RTerm::Goto(header, vec![next_sum, next_ptr]));
+        builder.terminate(exit, RTerm::Return(Some(sum_param)));
+
+        let mut func = builder.finish();
+        let tbl = table();
+        func.verify(&tbl).expect("pre-pass Func::verify");
+        assert!(run(&mut func, &tbl).is_empty());
     }
 }

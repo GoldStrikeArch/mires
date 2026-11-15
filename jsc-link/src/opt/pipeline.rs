@@ -196,6 +196,18 @@ fn run(
     });
     let runs_pea = opts.analyzes(OptimizerPass::Sroa) && passes.pea && pea_carriers;
 
+    // Run `slice_iter` once before PEA (after an initial `dce` cleanup) so whole-object
+    // `Enumerate<Take|Skip<SliceIter<u8>>>` loops lower before PEA scalarizes their outer
+    // adapter aggregates, and once after PEA so scalarized `Plain`/`Enumerate<SliceIter<T>>`
+    // loops lower as well.
+    if runs_dce && passes.slice_iter {
+        if dce::run_with(func, table, &dce_options, &mut witnesses) {
+            stats.ast_dce_changed = true;
+            verified(func, table, "ast-dce")?;
+        }
+        run_slice_iter(func, table, &dce_options, &mut witnesses, stats)?;
+    }
+
     // `dce` then the escape analysis, to a short fixpoint: the first `dce` threads the
     // variant-per-path merges the escape analysis then scalarizes, and a scalarized outer object
     // exposes its inner one to the next round (a `Some((a, b))` merge takes two). The trailing
@@ -239,20 +251,7 @@ fn run(
     }
 
     if runs_dce && passes.slice_iter {
-        let lowered = super::slice_iter::run(func, table);
-        if !lowered.is_empty() {
-            stats.slice_iterator_loops_would_lower += lowered.len() as u32;
-            let mut slice_witnesses = [Witness::SliceIteratorCursor { loops: lowered }];
-
-            // These witnesses carry exact block and value ids. Check them before DCE removes the
-            // old adapter graph and renumbers the generated loop. DCE then verifies its own
-            // output and records a separate payload-only witness batch.
-            checked(&mut slice_witnesses, func, table, stats)?;
-            if dce::run_with(func, table, &dce_options, &mut witnesses) {
-                stats.ast_dce_changed = true;
-            }
-            verified(func, table, "slice-iterator-cursor")?;
-        }
+        run_slice_iter(func, table, &dce_options, &mut witnesses, stats)?;
     }
 
     if runs_dce {
@@ -292,6 +291,32 @@ fn run(
         checked(&mut cleanup, func, table, stats)?;
     }
     Ok(())
+}
+
+/// Runs `slice_iter` once, validates any cursor witnesses before DCE renumbers blocks,
+/// and cleans up the dead adapter graph.
+fn run_slice_iter(
+    func: &mut Func,
+    table: &TypeTable,
+    dce_options: &dce::Options,
+    witnesses: &mut Vec<Witness>,
+    stats: &mut OptStats,
+) -> Result<(), Decline> {
+    let lowered = super::slice_iter::run(func, table);
+    if lowered.is_empty() {
+        return Ok(());
+    }
+    stats.slice_iterator_loops_would_lower += lowered.len() as u32;
+    let mut slice_witnesses = [Witness::SliceIteratorCursor { loops: lowered }];
+
+    // These witnesses carry exact block and value ids. Check them before DCE removes the
+    // old adapter graph and renumbers the generated loop. DCE then verifies its own
+    // output and records a separate payload-only witness batch.
+    checked(&mut slice_witnesses, func, table, stats)?;
+    if dce::run_with(func, table, dce_options, witnesses) {
+        stats.ast_dce_changed = true;
+    }
+    verified(func, table, "slice-iterator-cursor")
 }
 
 /// Runs the independent witness checks over one batch, when they are enabled, and turns a
