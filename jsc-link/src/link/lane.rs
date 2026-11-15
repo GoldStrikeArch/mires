@@ -669,16 +669,11 @@ pub(crate) fn run(
         );
     }
     let emitting_plans = opts.optimizer == crate::opts::OptimizerMode::On;
-    if emitting_plans
-        && repr_ran
-        && (planned_repr.block.committed > 0 || !planned_repr.touched.is_empty())
-        && opts.analyzes(OptimizerPass::AstDce)
-    {
+    if emitting_plans && opts.analyzes(OptimizerPass::AstDce) {
         let mut excluded: BTreeMap<JsName, Result<Func, Decline>> = BTreeMap::new();
         for name in planned_repr
-            .touched
-            .iter()
-            .chain(planned_repr.bodies.keys())
+            .bodies
+            .keys()
             .chain(planned_repr.call_retargets.keys())
         {
             if let Some(entry) = planned_funcs.remove(name) {

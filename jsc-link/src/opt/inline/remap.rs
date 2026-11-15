@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 
-use crate::jir::interns::{Interns, SigId, StrId};
+use crate::jir::interns::{BytesId, Interns, SigId, StrId};
 use crate::jir::origin::{Origin, OriginId, OriginKind, OriginTable, SourceFactId};
 use crate::jir::repr::{Func, OpKind, Proj, RTerm};
 use crate::jir::semantic::{
@@ -303,14 +303,45 @@ impl Remap<'_> {
         Ok(())
     }
 
+    fn bytes(&mut self, id: BytesId) -> Res<BytesId> {
+        let value = self.source.bytes(id).ok_or("inline.host-boundary")?;
+        Ok(self.target.intern_bytes(value))
+    }
+
     fn host(&mut self, payload: &mut HostPayload) -> Res<()> {
-        if !super::independent_host(payload, self.source) {
-            return Err("inline.host-boundary");
+        match payload {
+            HostPayload::Extern(id) | HostPayload::Block(id) => {
+                *id = self.bytes(*id)?;
+            }
+            HostPayload::Marker {
+                section,
+                template,
+                helpers,
+                ..
+            } => {
+                *section = self.string(*section)?;
+                if let Some(tree) = template {
+                    self.constant(tree)?;
+                }
+                for (name, direct) in helpers {
+                    *name = self.string(*name)?;
+                    self.direct(direct)?;
+                }
+            }
+            HostPayload::ViewAbi {
+                marker, helpers, ..
+            } => {
+                *marker = self.string(*marker)?;
+                for (name, direct) in helpers {
+                    *name = self.string(*name)?;
+                    self.direct(direct)?;
+                }
+            }
+            HostPayload::Map { marker } => {
+                *marker = self.string(*marker)?;
+            }
+            HostPayload::KeyedList(_) => return Err("inline.host-boundary"),
         }
-        let HostPayload::Marker { section, .. } = payload else {
-            unreachable!("independent host operations are marker payloads")
-        };
-        *section = self.string(*section)?;
         Ok(())
     }
 

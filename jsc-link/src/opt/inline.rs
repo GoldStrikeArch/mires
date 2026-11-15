@@ -65,7 +65,7 @@ pub(crate) use remap::Metadata;
 const PROGRAM_BUDGET_DENOMINATOR: u64 = 2000;
 
 /// A shared helper must fit within this compact declaration footprint before duplication.
-const SHARED_CALLEE_FOOTPRINT: u64 = 44;
+const SHARED_CALLEE_FOOTPRINT: u64 = 64;
 /// A `#[track_caller]` helper with an unused location parameter drops an argument at every site.
 const TRACK_CALLER_SHARED_FOOTPRINT: u64 = 84;
 
@@ -123,6 +123,7 @@ struct Site {
     op: usize,
     callee: JsName,
     has_track_caller: bool,
+    host_boundary: bool,
 }
 
 type Measurement = (u64, BTreeSet<JsName>);
@@ -196,6 +197,7 @@ pub(crate) fn run_with_mode(
             funcs,
             graph,
             items,
+            sole_referrer,
             zombie_free,
             allow_std_post_repr,
             &mut stats,
@@ -356,7 +358,12 @@ pub(crate) fn run_with_mode(
                 && iterator_step
                 && callee_bytes <= 320
                 && after <= bytes.saturating_add(96);
-            if after > limit
+            let size_limit = if criterion == Criterion::SoleCaller && net <= 0 {
+                limit.max(16_384)
+            } else {
+                limit
+            };
+            if after > size_limit
                 || after > bytes.saturating_add(callee_bytes)
                 || (!bounded_loop_virtualization && growth + charge > budget as i64)
                 || (!growth_allowed && net > 0)
@@ -369,7 +376,7 @@ pub(crate) fn run_with_mode(
             }
             let record = Witness::Inline {
                 callee_bytes: callee_bytes.min(u32::MAX as u64) as u32,
-                limit: limit.min(u32::MAX as u64) as u32,
+                limit: size_limit.min(u32::MAX as u64) as u32,
                 bytes_before: bytes.min(u32::MAX as u64) as u32,
                 bytes_after: after.min(u32::MAX as u64) as u32,
             };
@@ -408,8 +415,9 @@ pub(crate) fn run_with_mode(
 /// general iterator adapters and arbitrary ADTs; those belong to the physical ABI rather than the
 /// compression-budget exception above.
 fn bounded_iterator_step(func: &Func, table: &TypeTable) -> bool {
-    let [self_param, _step] = func.params.as_slice() else {
-        return false;
+    let self_param = match func.params.as_slice() {
+        [self_param] | [self_param, _] => *self_param,
+        _ => return false,
     };
     let self_ty = func.values[self_param.0 as usize].ty;
     let Some(TypeKind::Reference {
@@ -487,6 +495,9 @@ fn qualifies(
     table: &crate::jir::TypeTable,
     looping: &BTreeSet<u32>,
 ) -> Option<Criterion> {
+    if site.host_boundary {
+        return sole_referrer(callee, caller).then_some(Criterion::SoleCaller);
+    }
     let loop_shape = || -> bool {
         if !looping.contains(&(site.block as u32)) {
             return false;
@@ -543,6 +554,7 @@ fn collect_sites(
     funcs: &BTreeMap<JsName, Result<Func, Decline>>,
     graph: &Callgraph,
     items: &ItemIndex,
+    sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
     zombie_free: &dyn Fn(&JsName) -> bool,
     allow_std_post_repr: bool,
     stats: &mut InlineStats,
@@ -569,11 +581,7 @@ fn collect_sites(
                 CallSemantic::Ordinary => true,
                 CallSemantic::Standard(std_op) if allow_std_post_repr => !matches!(
                     std_op,
-                    crate::jir::semantic::StandardOperation::VecNew
-                        | crate::jir::semantic::StandardOperation::VecWithCapacity
-                        | crate::jir::semantic::StandardOperation::VecAsSlice
-                        | crate::jir::semantic::StandardOperation::VecPush
-                        | crate::jir::semantic::StandardOperation::FormatArgumentNewDisplay
+                    crate::jir::semantic::StandardOperation::FormatArgumentNewDisplay
                         | crate::jir::semantic::StandardOperation::FormatArgsNew
                         | crate::jir::semantic::StandardOperation::FormatArgsToString
                 ),
@@ -609,6 +617,7 @@ fn collect_sites(
                 stats.decline("inline.body-unavailable");
                 continue;
             };
+            let is_sole_caller = sole_referrer(&callee, caller);
             if let Some(reason) = body_decline(
                 callee_func,
                 &callee_metadata.interns,
@@ -616,6 +625,7 @@ fn collect_sites(
                 func.sig.abi.caller_location,
                 *track_caller,
                 items,
+                is_sole_caller,
             ) {
                 stats.decline(reason);
                 continue;
@@ -641,6 +651,7 @@ fn collect_sites(
                 callee,
                 has_track_caller: track_caller.is_some()
                     || (callee_func.sig.abi.caller_location && unused_caller_location(callee_func)),
+                host_boundary: callee_has_host_boundary(callee_func, &callee_metadata.interns),
             });
         }
     }
@@ -714,6 +725,31 @@ fn rewrite_forwarded_track_caller(callee: &mut Func, site_fact: SourceFactId, it
     }
 }
 
+fn is_host_boundary_op(kind: &OpKind, interns: &Interns) -> bool {
+    match kind {
+        OpKind::Host { payload, .. } => !independent_host(payload, interns),
+        OpKind::Call { host, semantic, .. } => {
+            !host
+                .as_ref()
+                .is_some_and(|payload| independent_host(payload, interns))
+                && (host.is_some()
+                    || matches!(
+                        semantic,
+                        CallSemantic::Host | CallSemantic::ViewAbi | CallSemantic::RawJavaScript
+                    ))
+        }
+        _ => false,
+    }
+}
+
+fn callee_has_host_boundary(callee: &Func, interns: &Interns) -> bool {
+    callee
+        .blocks
+        .iter()
+        .flat_map(|block| &block.ops)
+        .any(|op| is_host_boundary_op(&op.kind, interns))
+}
+
 /// The semantic boundary preventing a callee body from being spliced at this site.
 fn body_decline(
     callee: &Func,
@@ -722,6 +758,7 @@ fn body_decline(
     caller_caller_location: bool,
     site_track_caller: Option<SourceFactId>,
     items: &ItemIndex,
+    allow_host_boundary: bool,
 ) -> Option<&'static str> {
     if callee.has_invoke() {
         return Some("inline.exceptional-control-flow");
@@ -772,21 +809,7 @@ fn body_decline(
                     Some("inline.track-caller-unavailable")
                 }
                 // Host and template lowering may own item-local bindings and observable ordering.
-                OpKind::Host { payload, .. } if !independent_host(payload, interns) => {
-                    Some("inline.host-boundary")
-                }
-                OpKind::Call { host, semantic, .. }
-                    if !host
-                        .as_ref()
-                        .is_some_and(|payload| independent_host(payload, interns))
-                        && (host.is_some()
-                            || matches!(
-                                semantic,
-                                CallSemantic::Host
-                                    | CallSemantic::ViewAbi
-                                    | CallSemantic::RawJavaScript
-                            )) =>
-                {
+                _ if !allow_host_boundary && is_host_boundary_op(&op.kind, interns) => {
                     Some("inline.host-boundary")
                 }
                 OpKind::Call {
@@ -840,10 +863,41 @@ fn independent_host(payload: &HostPayload, interns: &Interns) -> bool {
 }
 
 /// Whether a value of `ty` is something the escape analysis could scalarize at some variant —
-/// the briefs' "virtualizable" (an `Option` return counts through its `Some`).
+/// the briefs' "virtualizable" (an `Option` return counts through its `Some`), or a reference
+/// `&T`/`&mut T` to a scalar or virtualizable target.
 fn virtualizable(table: &crate::jir::TypeTable, ty: crate::jir::semantic::TypeId) -> bool {
-    candidates::variant_shape(table, ty, 0).is_some()
-        || candidates::variant_shape(table, ty, 1).is_some()
+    let mut cur = table.peeled(ty);
+    let mut is_ref = false;
+    for _ in 0..8 {
+        if let Some(TypeKind::Reference { pointee, .. }) =
+            table.get(cur).map(|descriptor| &descriptor.kind)
+        {
+            is_ref = true;
+            cur = table.peeled(*pointee);
+        } else {
+            break;
+        }
+    }
+    if candidates::variant_shape(table, cur, 0).is_some()
+        || candidates::variant_shape(table, cur, 1).is_some()
+    {
+        return true;
+    }
+    if is_ref {
+        if let Some(descriptor) = table.get(cur) {
+            return descriptor.layout.sized
+                && !descriptor.layout.zst
+                && matches!(
+                    descriptor.kind,
+                    TypeKind::Integer { .. }
+                        | TypeKind::Bool
+                        | TypeKind::Float { .. }
+                        | TypeKind::Char
+                        | TypeKind::RawPointer { .. }
+                );
+        }
+    }
+    false
 }
 
 /// The blocks that sit on a cycle of the CFG: reachable from themselves.
@@ -1536,30 +1590,32 @@ mod tests {
     #[test]
     fn a_budget_overrun_declines_the_whole_site() {
         let mut prog = Prog::new();
-        // Removing a sole callee still cannot spend more than the caller's own growth limit.
+        // Removing a sole callee still cannot spend more than the caller's lifted 16 KiB growth cap.
+        let ext = prog.strid("ext_step");
         let mut b = FuncBuilder::new(item(2), sig(1));
         let x = b.param(I32, O);
-        let mut acc = x;
-        for bits in 0..70 {
-            let c = b.op(
+        for _ in 0..400 {
+            let _ = b.op(
                 FuncBuilder::ENTRY,
-                OpKind::Const(ConstTree::Scalar { bits, bytes: 4 }),
-                I32,
-                O,
-            );
-            acc = b.op(
-                FuncBuilder::ENTRY,
-                OpKind::Binary {
-                    op: BinaryOp::Add,
-                    l: acc,
-                    r: c,
-                    ty: I32,
+                OpKind::Call {
+                    callee: Callee::Foreign {
+                        definition: DefinitionId {
+                            crate_id: 0,
+                            local_hash: 99,
+                        },
+                        symbol: ext,
+                    },
+                    function: None,
+                    args: vec![x],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
                 },
                 I32,
                 O,
             );
         }
-        b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(acc)));
+        b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(x)));
         let f = calls_g(&mut prog);
         prog.add("g", b.finish());
         prog.add("f", f);
@@ -1654,7 +1710,7 @@ mod tests {
         let f = calls_g(&mut prog);
         prog.add("g", b.finish());
         prog.add("f", f);
-        let stats = prog.run(100_000, true);
+        let stats = prog.run(100_000, false);
         assert_eq!(stats.applied, 0);
         assert_eq!(prog.calls_in("f"), 1);
     }
@@ -2402,5 +2458,155 @@ mod tests {
             stats.declined.get("inline.track-caller-unavailable"),
             Some(&1)
         );
+    }
+
+    #[test]
+    fn sole_caller_negative_net_lifts_two_x_caller_limit() {
+        let mut prog = Prog::new();
+        let g_str = prog.strid("g");
+
+        let mut g_b = FuncBuilder::new(item(2), sig(1));
+        let gx = g_b.param(I32, O);
+        g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(gx)));
+        let g = g_b.finish();
+
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let fx = f_b.param(I32, O);
+        let call = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: g_str,
+                },
+                function: None,
+                args: vec![fx],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            O,
+        );
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+        let f = f_b.finish();
+
+        prog.add("g", g);
+        prog.add("f", f);
+        let f_name = JsName::new("f".to_owned());
+        let g_name = JsName::new("g".to_owned());
+        let interns = &prog.interns;
+        let funcs = &mut prog.funcs;
+        let interns_map: BTreeMap<JsName, &Interns> =
+            funcs.keys().map(|name| (name.clone(), interns)).collect();
+        let graph = callgraph::build(funcs, &interns_map);
+        let mut metadata = funcs
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: std::borrow::Cow::Borrowed(interns),
+                        origins: None,
+                        header: None,
+                    },
+                )
+            })
+            .collect();
+        let items = ItemIndex::new();
+        let mut sizes = BTreeMap::new();
+        // Tiny caller (40 B) would fail `after > entry_bytes * 2` (= 80 B) when `after = 120 B`,
+        // yet sole-caller removal shrinks total program (120 - 40 - 200 = -120 <= 0).
+        sizes.insert(f_name.clone(), 40);
+        sizes.insert(g_name.clone(), 200);
+        let stats = run_with_mode(
+            funcs,
+            &mut metadata,
+            &graph,
+            &items,
+            &|_name, func, _meta| {
+                let mut refs = BTreeSet::new();
+                for op in func.blocks.iter().flat_map(|b| &b.ops) {
+                    if let OpKind::Call {
+                        callee: Callee::Direct { .. },
+                        ..
+                    } = &op.kind
+                    {
+                        refs.insert(g_name.clone());
+                    }
+                }
+                let bytes = if func.item == item(1) && refs.is_empty() {
+                    120
+                } else {
+                    40
+                };
+                Some((bytes, refs))
+            },
+            &|callee, caller| callee == &g_name && caller == &f_name,
+            &|_| true,
+            10_000,
+            &sizes,
+            false,
+        );
+        assert_eq!(stats.applied, 1, "sole-caller net <= 0 lifts 2x entry cap");
+        assert_eq!(prog.calls_in("f"), 0);
+    }
+
+    #[test]
+    fn sole_caller_inlines_host_boundary_while_multi_caller_declines() {
+        let make_prog = |sole: bool| {
+            let mut prog = Prog::new();
+            let h_str = prog.strid("h");
+            let bytes_id = prog.interns.intern_bytes(&[1, 2, 3]);
+
+            let mut h_b = FuncBuilder::new(item(2), sig(1));
+            let hx = h_b.param(I32, O);
+            h_b.effect(
+                FuncBuilder::ENTRY,
+                OpKind::Host {
+                    payload: HostPayload::Block(bytes_id),
+                    args: vec![hx],
+                },
+                O,
+            );
+            h_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(hx)));
+            let h = h_b.finish();
+
+            let mut f_b = FuncBuilder::new(item(1), sig(1));
+            let fx = f_b.param(I32, O);
+            let call = f_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: item(2),
+                        link_name: h_str,
+                    },
+                    function: None,
+                    args: vec![fx],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                I32,
+                O,
+            );
+            f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+            let f = f_b.finish();
+
+            prog.add("h", h);
+            prog.add("f", f);
+            let stats = prog.run(10_000, sole);
+            (prog, stats)
+        };
+
+        let (sole_prog, sole_stats) = make_prog(true);
+        assert_eq!(sole_stats.applied, 1, "sole caller should inline Host op");
+        assert_eq!(sole_prog.calls_in("f"), 0);
+
+        let (multi_prog, multi_stats) = make_prog(false);
+        assert_eq!(multi_stats.applied, 0);
+        assert_eq!(multi_stats.declined.get("inline.host-boundary"), Some(&1));
+        assert_eq!(multi_prog.calls_in("f"), 1);
     }
 }

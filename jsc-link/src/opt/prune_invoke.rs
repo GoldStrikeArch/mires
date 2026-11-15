@@ -24,7 +24,14 @@ use crate::jir::types::{TypeId, TypeKind, TypeTable};
 /// Any panic/abort helper here throws an `AbortError`, which every `TryCatch` handler
 /// immediately rethrows (`if (__rt.is_abort($caught)) throw $caught;`) without running `Drop`s.
 fn is_non_host_runtime_symbol(sym: &str) -> bool {
-    if sym.starts_with("___rust_") || sym.ends_with("rust_begin_unwind") {
+    if sym.starts_with("___rust_")
+        || sym.ends_with("rust_begin_unwind")
+        || sym.contains("___rust_alloc")
+        || sym.contains("___rust_dealloc")
+        || sym.contains("___rust_realloc")
+        || sym.contains("___rust_alloc_zeroed")
+        || sym.contains("___rust_no_alloc_shim_is_unstable")
+    {
         return true;
     }
     matches!(
@@ -78,6 +85,25 @@ fn is_non_host_runtime_symbol(sym: &str) -> bool {
             | "f2i"
             | "fmod"
             | "fmodf"
+            | "clone"
+            | "u8array_from_bytes"
+            | "native_str_new"
+            | "native_str_len"
+            | "native_str_push_str"
+            | "native_str_push_char"
+            | "native_str_clear"
+            | "native_str_as_str"
+            | "convert_block_str"
+            | "convert_str_block"
+            | "convert_str_builder"
+            | "convert_builder_str"
+            | "convert_builder_block"
+            | "convert_block_builder"
+            | "_utf8_width"
+            | "map_new"
+            | "map_len"
+            | "map_clear"
+            | "ptr_is_null"
     )
 }
 
@@ -462,16 +488,22 @@ pub(crate) fn run(
         }
         let mut rewritten = func.clone();
         let mut pruned_any = false;
-        for block in &mut rewritten.blocks {
-            let RTerm::Invoke { normal, .. } = &block.term else {
-                continue;
+        let block_count = rewritten.blocks.len();
+        for bi in 0..block_count {
+            let (normal_target, normal_args, unwind_target) = match &rewritten.blocks[bi].term {
+                RTerm::Invoke { normal, unwind } => (normal.0, normal.1.clone(), unwind.0),
+                _ => continue,
             };
-            let last_throws = block
+            let last_throws = rewritten.blocks[bi]
                 .ops
                 .last()
                 .is_some_and(|op| op_throws(op, interns, &may_throw_host));
-            if !last_throws {
-                block.term = RTerm::Goto(normal.0, normal.1.clone());
+            let passthrough_rethrow = rewritten
+                .blocks
+                .get(unwind_target.0 as usize)
+                .is_some_and(|u| u.ops.is_empty() && matches!(u.term, RTerm::Throw(None)));
+            if !last_throws || passthrough_rethrow {
+                rewritten.blocks[bi].term = RTerm::Goto(normal_target, normal_args);
                 pruned_any = true;
             }
         }
@@ -746,6 +778,24 @@ mod tests {
             },
         );
         cb.terminate(c_norm, RTerm::Return(None));
+        cb.effect(
+            c_unw,
+            OpKind::Call {
+                callee: Callee::Foreign {
+                    definition: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 13,
+                    },
+                    symbol: foreign_sym,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
         cb.terminate(c_unw, RTerm::Throw(None));
         let caller = cb.finish();
 
@@ -940,6 +990,7 @@ mod tests {
         let mut caller_interns = Interns::new();
         let unit_caller = unit_types(&mut caller_interns);
         let fmt_sym = caller_interns.intern_str("fmt_to_string_throwing");
+        let cleanup_sym = caller_interns.intern_str("cleanup_pad");
         let mut cb = FuncBuilder::new(
             item_id(21),
             Signature {
@@ -974,6 +1025,24 @@ mod tests {
             },
         );
         cb.terminate(b_norm, RTerm::Return(None));
+        cb.effect(
+            b_unw,
+            OpKind::Call {
+                callee: Callee::Foreign {
+                    definition: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 22,
+                    },
+                    symbol: cleanup_sym,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
         cb.terminate(b_unw, RTerm::Throw(None));
         let caller = cb.finish();
 
@@ -1003,5 +1072,184 @@ mod tests {
             .as_ref()
             .unwrap()
             .has_invoke());
+    }
+
+    #[test]
+    fn prunes_v0_mangled_alloc_shim_and_passthrough_rethrow_invoke() {
+        let mut leaf_interns = Interns::new();
+        let unit_leaf = unit_types(&mut leaf_interns);
+        let rust_alloc_sym = leaf_interns.intern_str("_RNvCsxyz_7___rustc12___rust_alloc");
+        let rt_sym = leaf_interns.intern_str("native_str_new");
+        let mut lb = FuncBuilder::new(
+            item_id(30),
+            Signature {
+                arguments: Vec::new(),
+                result: unit_leaf,
+                abi: AbiSignature::default(),
+            },
+        );
+        lb.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Foreign {
+                    definition: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 31,
+                    },
+                    symbol: rust_alloc_sym,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        lb.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Runtime { member: rt_sym },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        lb.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let non_throwing_alloc_fn = lb.finish();
+
+        // Throwing callee that guarantees an unwind edge cannot be dropped by calleepurity alone,
+        // yet a caller Invoke targeting a pure pass-through `Throw(None)` unwind block IS pruned.
+        let mut throw_interns = Interns::new();
+        let unit_throw = unit_types(&mut throw_interns);
+        let section_id = throw_interns.intern_str("rcgjs.host.invoke");
+        let mut tb = FuncBuilder::new(
+            item_id(32),
+            Signature {
+                arguments: Vec::new(),
+                result: unit_throw,
+                abi: AbiSignature::default(),
+            },
+        );
+        tb.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Host {
+                payload: HostPayload::Marker {
+                    section: section_id,
+                    def: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 32,
+                    },
+                    template: None,
+                    helpers: Vec::new(),
+                },
+                args: Vec::new(),
+            },
+            O,
+        );
+        tb.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let throwing_callee = tb.finish();
+
+        let mut caller_interns = Interns::new();
+        let unit_c = unit_types(&mut caller_interns);
+        let alloc_fn_sym = caller_interns.intern_str("non_throwing_alloc_fn");
+        let throw_fn_sym = caller_interns.intern_str("throwing_callee");
+        let mut cb = FuncBuilder::new(
+            item_id(33),
+            Signature {
+                arguments: Vec::new(),
+                result: unit_c,
+                abi: AbiSignature::default(),
+            },
+        );
+        let b0 = FuncBuilder::ENTRY;
+        let b_mid = cb.block();
+        let b_norm = cb.block();
+        let b_unw = cb.block();
+        cb.effect(
+            b0,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(30),
+                    link_name: alloc_fn_sym,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        cb.terminate(
+            b0,
+            RTerm::Invoke {
+                normal: (b_mid, Vec::new()),
+                unwind: (b_unw, Vec::new()),
+            },
+        );
+        cb.effect(
+            b_mid,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(32),
+                    link_name: throw_fn_sym,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        cb.terminate(
+            b_mid,
+            RTerm::Invoke {
+                normal: (b_norm, Vec::new()),
+                unwind: (b_unw, Vec::new()),
+            },
+        );
+        cb.terminate(b_norm, RTerm::Return(None));
+        cb.terminate(b_unw, RTerm::Throw(None));
+        let caller = cb.finish();
+
+        let mut table = BTreeMap::new();
+        table.insert(
+            JsName::new("non_throwing_alloc_fn".to_owned()),
+            test_item("non_throwing_alloc_fn", leaf_interns),
+        );
+        table.insert(
+            JsName::new("throwing_callee".to_owned()),
+            test_item("throwing_callee", throw_interns),
+        );
+        table.insert(
+            JsName::new("caller".to_owned()),
+            test_item("caller", caller_interns),
+        );
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            JsName::new("non_throwing_alloc_fn".to_owned()),
+            Ok(non_throwing_alloc_fn),
+        );
+        funcs.insert(
+            JsName::new("throwing_callee".to_owned()),
+            Ok(throwing_callee),
+        );
+        funcs.insert(JsName::new("caller".to_owned()), Ok(caller));
+
+        let live: BTreeSet<JsName> = table.keys().cloned().collect();
+        let modified = run(&table, &mut funcs, &live);
+        assert_eq!(modified, 1);
+        assert!(
+            !funcs[&JsName::new("caller".to_owned())]
+                .as_ref()
+                .unwrap()
+                .has_invoke(),
+            "both non-throwing alloc shim invoke and pass-through rethrow invoke must prune"
+        );
     }
 }
