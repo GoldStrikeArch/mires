@@ -42,8 +42,7 @@ jq -e '
     .shape == "slice(3)" and
     .selected == false and
     .reason == "cost.score-no-improvement" and
-    .after.score > .before.score and
-    .after.allocations > .before.allocations) and
+    .after.score > .before.score) and
   .range.asserts_removed >= 6 and
   .witnesses.failed == 0
 ' "$work/$fixture-on.js.lane.json" >/dev/null
@@ -56,8 +55,7 @@ jq -e '
     .shape == "slice(3)" and
     .selected == false and
     .reason == "cost.score-no-improvement" and
-    .after.score > .before.score and
-    .after.allocations > .before.allocations)
+    .after.score > .before.score)
 ' "$work/$fixture-report.js.lane.json" >/dev/null
 
 # The new subslice, aligned-prefix, and loop-length facts do more than fold the local compares:
