@@ -1432,15 +1432,24 @@ fn remove_trivial_params(func: &mut Func, constant_merge: bool) -> bool {
     // what lets two different `Const` ops count as one incoming value.
     let mut uses = vec![0usize; func.values.len()];
     let mut leaf = vec![false; func.values.len()];
+    let mut is_view = vec![false; func.values.len()];
     let mut constants: BTreeMap<ValueId, &ConstTree> = BTreeMap::new();
     for block in &func.blocks {
         for param in &block.params {
             leaf[param.0 as usize] = true;
         }
         for op in &block.ops {
-            if let (Some(result), OpKind::Const(tree)) = (op.result, &op.kind) {
-                leaf[result.0 as usize] = true;
-                constants.insert(result, tree);
+            if let Some(result) = op.result {
+                match &op.kind {
+                    OpKind::Const(tree) => {
+                        leaf[result.0 as usize] = true;
+                        constants.insert(result, tree);
+                    }
+                    OpKind::BorrowView { .. } | OpKind::RawView { .. } => {
+                        is_view[result.0 as usize] = true;
+                    }
+                    _ => {}
+                }
             }
             for v in op.kind.uses() {
                 uses[v.0 as usize] += 1;
@@ -1496,7 +1505,11 @@ fn remove_trivial_params(func: &mut Func, constant_merge: bool) -> bool {
                 continue;
             };
             if passed.iter().all(|arg| *arg == first) {
-                if stays_named(&uses, &leaf, first, passed.len()) {
+                if stays_named(&uses, &leaf, first, passed.len())
+                    || (passed.len() == 1
+                        && uses[first.0 as usize] == 1
+                        && is_view[first.0 as usize])
+                {
                     candidates.push((index, position, *param, Replacement::Value(first)));
                 }
             } else if let (true, Some(&tree)) = (constant_merge, constants.get(&first)) {
@@ -2952,6 +2965,158 @@ mod tests {
         assert!(!changed);
         func.verify(&table)
             .expect("compacts orphaned ValueDefs even when no_deletions = true");
+    }
+
+    #[test]
+    fn single_use_borrow_view_trivial_param_eliminates_so_pea_scalarizes() {
+        use crate::jir::repr::{OpKind, Root};
+        use crate::jir::types::{FieldDescriptor, FieldKey, NominalForm, VariantDescriptor};
+
+        const PAIR: TypeId = TypeId(3);
+        const MUT_REF_PAIR: TypeId = TypeId(4);
+        let mut tbl = table();
+        let fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Index(0),
+                ty: I32,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Index(1),
+                ty: I32,
+                offset: 4,
+            },
+        ];
+        tbl.insert(TypeDescriptor {
+            id: PAIR,
+            name: None,
+            kind: TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 99,
+                },
+                args: Vec::new(),
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: StrId(0),
+                    fields: fields.clone(),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: true,
+                needs_clone: true,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: PAIR,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields,
+            },
+        });
+        tbl.insert(TypeDescriptor {
+            id: MUT_REF_PAIR,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: PAIR,
+                mutable: true,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: MUT_REF_PAIR,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+
+        let mut b = builder();
+        let callee_entry = b.block();
+        let exit = b.block();
+        let entry = FuncBuilder::ENTRY;
+
+        let f0 = b.op(entry, constant(42), I32, NO_ORIGIN);
+        let f1 = b.op(entry, constant(7), I32, NO_ORIGIN);
+        let iter = b.op(
+            entry,
+            OpKind::Aggregate {
+                ty: PAIR,
+                variant: 0,
+                active_field: None,
+                fields: vec![f0, f1],
+            },
+            PAIR,
+            NO_ORIGIN,
+        );
+        let view = b.op(
+            entry,
+            OpKind::BorrowView {
+                root: Root::Value(iter),
+                path: Vec::new(),
+                mutable: true,
+            },
+            MUT_REF_PAIR,
+            NO_ORIGIN,
+        );
+        b.terminate(entry, RTerm::Goto(callee_entry, vec![view]));
+
+        let self_param = b.block_param(callee_entry, MUT_REF_PAIR, NO_ORIGIN);
+        let deref_val = b.op(callee_entry, OpKind::Deref(self_param), PAIR, NO_ORIGIN);
+        let read0 = b.op(
+            callee_entry,
+            OpKind::Field {
+                base: deref_val,
+                variant: None,
+                field: 0,
+            },
+            I32,
+            NO_ORIGIN,
+        );
+        b.terminate(callee_entry, RTerm::Goto(exit, vec![]));
+        let _ = (read0, exit);
+        b.terminate(exit, RTerm::Return(Some(read0)));
+
+        let mut func = finished(b);
+        func.verify(&tbl).expect("pre-dce Func::verify");
+        assert!(super::run(&mut func, &tbl));
+        assert!(
+            func.blocks[callee_entry.0 as usize].params.is_empty(),
+            "single-use BorrowView trivial param should be eliminated"
+        );
+        func.verify(&tbl).expect("post-dce Func::verify");
+
+        let pea = crate::opt::partial_escape::run(&mut func, &tbl);
+        assert_eq!(
+            pea.scalarized, 1,
+            "iter should scalarize once view edge is removed"
+        );
+        assert_eq!(pea.escaped, 0);
+        func.verify(&tbl).expect("post-pea Func::verify");
     }
 }
 
