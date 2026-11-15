@@ -544,8 +544,18 @@ impl<'a> JsCx<'a> {
                     format!("`{op:?}` on an operand that does not compare by value"),
                 ));
             }
-            BinaryOp::Eq => return Ok(compare(JsBinOp::StrictEq)),
-            BinaryOp::Ne => return Ok(compare(JsBinOp::StrictNe)),
+            BinaryOp::Eq => {
+                if let Some(check) = super::ptr::simplify_addr_zero_eq(&lhs, &rhs) {
+                    return Ok(check);
+                }
+                return Ok(compare(JsBinOp::StrictEq));
+            }
+            BinaryOp::Ne => {
+                if let Some(check) = super::ptr::simplify_addr_zero_eq(&lhs, &rhs) {
+                    return Ok(jsast::not(check));
+                }
+                return Ok(compare(JsBinOp::StrictNe));
+            }
             BinaryOp::Lt => return Ok(compare(JsBinOp::Lt)),
             BinaryOp::Le => return Ok(compare(JsBinOp::Le)),
             BinaryOp::Gt => return Ok(compare(JsBinOp::Gt)),

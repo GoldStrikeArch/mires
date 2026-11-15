@@ -590,11 +590,59 @@ impl JsCx<'_> {
     /// A `Drop` op (`base.rs::codegen_drop`): the glue called with a reference to the place.
     fn lower_drop(&self, root: &Root, path: &[Proj], glue: DropGlue) -> Res<Lowered> {
         if let Root::Value(value) = root {
-            if path.is_empty() && self.typed_storage(*value).is_some() {
-                // Eligibility proves a POD element and an unobservable global allocator. The
-                // exact backing store becomes unreachable with this value, so running the
-                // generic NativeVec release helper can have no Rust-visible effect.
-                return Ok(Lowered::Done(Vec::new()));
+            if path.is_empty() {
+                if self.typed_storage(*value).is_some() {
+                    // Eligibility proves a POD element and an unobservable global allocator. The
+                    // exact backing store becomes unreachable with this value, so running the
+                    // generic NativeVec release helper can have no Rust-visible effect.
+                    return Ok(Lowered::Done(Vec::new()));
+                }
+                match self.dropped_string_kind(*value) {
+                    Some(emit::DroppedStringKind::NoOp) => {
+                        let is_host_str = self.func.values.get(value.0 as usize).map(|d| d.carrier)
+                            == Some(Carrier::HostString);
+                        if is_host_str || self.only_used_by_empty_drop(*value) {
+                            let mut stmts = Vec::new();
+                            if self.is_inline(*value) {
+                                let target = match self.def_of(*value).map(|op| &op.kind) {
+                                    Some(OpKind::Convert { v: src, .. }) => *src,
+                                    _ => *value,
+                                };
+                                let expr = self.expr_of(target)?;
+                                if !jsast::is_droppable(&expr) {
+                                    stmts.push(jsast::expr_stmt(expr));
+                                }
+                            }
+                            return Ok(Lowered::Done(stmts));
+                        }
+                    }
+                    Some(emit::DroppedStringKind::BaselineDealloc { src, layout })
+                        if self.is_inline(*value) || self.only_used_by_adjacent_drop(*value) =>
+                    {
+                        let src_expr = self.expr_of(src)?;
+                        let mut stmts = Vec::new();
+                        let base = if matches!(src_expr, Expr::Ident(_)) {
+                            src_expr
+                        } else {
+                            let (bind, name) = self.temp(src_expr);
+                            stmts.push(bind);
+                            name
+                        };
+                        let cap = layout.member(base.clone(), &layout.cap);
+                        let ptr = layout.member(base, &layout.ptr);
+                        if cap != jsast::num(0) {
+                            stmts.push(jsast::if_(
+                                jsast::binary(jsast::BinOp::StrictNe, cap.clone(), jsast::num(0)),
+                                vec![jsast::expr_stmt(jsast::rt_call(
+                                    "dealloc",
+                                    vec![ptr, cap, jsast::num(1)],
+                                ))],
+                            ));
+                        }
+                        return Ok(Lowered::Done(stmts));
+                    }
+                    _ => {}
+                }
             }
         }
         match glue {

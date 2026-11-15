@@ -19,7 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rcgjs_object::item::JsName;
 use rcgjs_object::jir::decline::OpClass;
-use rcgjs_object::jir::repr::{Op, OpKind, RAssertMessage, RBlockId, RTerm, Root, ValueId};
+use rcgjs_object::jir::repr::{
+    Carrier, Op, OpKind, RAssertMessage, RBlockId, RTerm, Root, ValueId,
+};
 use rcgjs_object::jir::semantic::{
     BinaryOp, CoroutineDesugaring, CoroutineKind, HostPayload, TypeId,
 };
@@ -598,12 +600,16 @@ impl Emitter<'_, '_> {
                 }
             }
             Test::Eq(v) => {
+                let rhs = self.case_literal(scrut, v);
+                if let Some(check) = super::ptr::simplify_addr_zero_eq(&value, &rhs) {
+                    return if negated { jsast::not(check) } else { check };
+                }
                 let op = if negated {
                     BinOp::StrictNe
                 } else {
                     BinOp::StrictEq
                 };
-                jsast::binary(op, value, self.case_literal(scrut, v))
+                jsast::binary(op, value, rhs)
             }
             Test::Lt(v) => {
                 let op = if negated { BinOp::Le } else { BinOp::Gt };
@@ -1364,6 +1370,26 @@ impl<'a> JsCx<'a> {
                 if self.is_inline(result) {
                     return Ok(Vec::new());
                 }
+                if let (OpKind::Convert { v: src, .. }, Some(kind)) =
+                    (&op.kind, self.dropped_string_kind(result))
+                {
+                    let skip = match kind {
+                        DroppedStringKind::NoOp => self.only_used_by_empty_drop(result),
+                        DroppedStringKind::BaselineDealloc { .. } => {
+                            self.only_used_by_adjacent_drop(result)
+                        }
+                    };
+                    if skip {
+                        let mut stmts = Vec::new();
+                        if matches!(kind, DroppedStringKind::NoOp) && self.is_inline(*src) {
+                            let expr = self.expr_of(*src)?;
+                            if !jsast::is_droppable(&expr) {
+                                stmts.push(jsast::expr_stmt(expr));
+                            }
+                        }
+                        return Ok(stmts);
+                    }
+                }
                 let expr = self.op_expr(op, result)?;
                 self.record_allocation_origin(result, &expr);
                 // A zero-sized value reads as `undefined` everywhere (`expr_of`), so its
@@ -1854,6 +1880,11 @@ impl<'a> JsCx<'a> {
                         ..
                     } => *root == v,
                     OpKind::SliceView { ptr: pointer, .. } => *pointer == v,
+                    OpKind::Binary {
+                        op: BinaryOp::Offset,
+                        l,
+                        ..
+                    } => *l == v,
                     _ => false,
                 });
             }
@@ -2132,4 +2163,83 @@ fn record_clone(value: Expr, fields: &[&str], sliced: &[&str]) -> Expr {
     }
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     wrap(jsast::object(entries))
+}
+
+/// How a `String` drop whose carrier differs from (or bypasses) its drop glue should lower.
+pub(super) enum DroppedStringKind {
+    NoOp,
+    BaselineDealloc {
+        src: ValueId,
+        layout: super::adapters::StringLayout,
+    },
+}
+
+impl<'a> JsCx<'a> {
+    pub(super) fn only_used_by_empty_drop(&self, v: ValueId) -> bool {
+        let mut drops = 0usize;
+        for block in &self.func.blocks {
+            for op in &block.ops {
+                match &op.kind {
+                    OpKind::Drop {
+                        root: Root::Value(r),
+                        path,
+                        ..
+                    } if path.is_empty() && *r == v => drops += 1,
+                    kind if kind.uses().contains(&v) => return false,
+                    _ => {}
+                }
+            }
+            if block.term.uses().contains(&v) {
+                return false;
+            }
+        }
+        drops >= 1
+    }
+
+    pub(super) fn only_used_by_adjacent_drop(&self, v: ValueId) -> bool {
+        let mut drops = 0usize;
+        let mut adjacent = false;
+        for block in &self.func.blocks {
+            for (idx, op) in block.ops.iter().enumerate() {
+                match &op.kind {
+                    OpKind::Drop {
+                        root: Root::Value(r),
+                        path,
+                        ..
+                    } if path.is_empty() && *r == v => {
+                        drops += 1;
+                        adjacent = idx > 0 && block.ops[idx - 1].result == Some(v);
+                    }
+                    kind if kind.uses().contains(&v) => return false,
+                    _ => {}
+                }
+            }
+            if block.term.uses().contains(&v) {
+                return false;
+            }
+        }
+        drops == 1 && adjacent
+    }
+
+    pub(super) fn dropped_string_kind(&self, v: ValueId) -> Option<DroppedStringKind> {
+        if let Some(op) = self.def_of(v) {
+            if let OpKind::Convert { v: src, from, to } = &op.kind {
+                return match (*from, *to) {
+                    (Carrier::HostString, Carrier::Baseline | Carrier::StringBuilder)
+                    | (Carrier::StringBuilder, Carrier::Baseline) => Some(DroppedStringKind::NoOp),
+                    (Carrier::Baseline, Carrier::StringBuilder) => {
+                        let ty = self.ty_of(*src).ok()?;
+                        let layout =
+                            super::adapters::StringLayout::of(self.table, self.interns, ty).ok()?;
+                        Some(DroppedStringKind::BaselineDealloc { src: *src, layout })
+                    }
+                    _ => None,
+                };
+            }
+        }
+        if self.func.values.get(v.0 as usize).map(|d| d.carrier) == Some(Carrier::HostString) {
+            return Some(DroppedStringKind::NoOp);
+        }
+        None
+    }
 }

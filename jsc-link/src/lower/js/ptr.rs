@@ -89,15 +89,22 @@ impl<'a> JsCx<'a> {
         if size == Some(0) {
             return pointer;
         }
+        let reads: &[&str] = if size == Some(1) {
+            &[BUF, OFF, ptr::SCALE]
+        } else {
+            &[BUF, OFF]
+        };
+        let (setup, pointer) = self.reread(pointer, reads);
         let off = jsast::binary(BinOp::Add, ptr::slot_off(pointer.clone()), count);
-        match size {
+        let slot = match size {
             Some(1) => jsast::object_of(vec![
                 (BUF, ptr::slot_buf(pointer.clone())),
                 (OFF, off),
                 (ptr::SCALE, ptr::slot_scale(pointer)),
             ]),
             _ => ptr::slot(ptr::slot_buf(pointer), off),
-        }
+        };
+        sequenced(setup, slot)
     }
 
     /// `pointer.wrapping_add(count)` (`ptr.rs::wrapping_add`).
@@ -309,12 +316,21 @@ impl<'a> JsCx<'a> {
 
     /// `s.as_bytes()` (`ptr.rs::str_to_bytes`).
     pub fn str_to_bytes(&self, string: Expr) -> Expr {
-        jsast::rt_call("str_bytes", vec![string])
+        let (pre, tail) = peel_seq(string);
+        match bytes_str_args(tail) {
+            Ok((buf, off, len)) => sequenced_vec(pre, ptr::fat_slice(buf, off, len)),
+            Err(tail) => jsast::rt_call("str_bytes", vec![sequenced_vec(pre, tail)]),
+        }
     }
 
     /// `s.as_ptr()` (`ptr.rs::str_to_byte_ptr`).
     pub fn str_to_byte_ptr(&self, string: Expr) -> Expr {
-        ptr::slot(ptr::slot_buf(self.str_to_bytes(string)), jsast::num(0))
+        let bytes = self.str_to_bytes(string);
+        let (setup, sb) = self.reread(bytes, &[BUF, OFF]);
+        sequenced(
+            setup,
+            ptr::slot(ptr::slot_buf(sb.clone()), ptr::slot_off(sb)),
+        )
     }
 
     /// `s.as_bytes_mut()` (`ptr.rs::str_to_bytes_mut`): a fresh byte view no other `as_bytes`
@@ -340,16 +356,35 @@ impl<'a> JsCx<'a> {
 
     /// `__rt.str_len(s)` (`ptr.rs::str_len`).
     pub fn str_len(&self, string: Expr) -> Expr {
-        jsast::rt_call("str_len", vec![string])
+        let (mut pre, tail) = peel_seq(string);
+        match tail {
+            Expr::Str(s) => sequenced_vec(pre, jsast::num(s.len() as f64)),
+            other => match bytes_str_args(other) {
+                Ok((buf, off, len)) => {
+                    if !jsast::is_droppable(&buf) {
+                        pre.push(buf);
+                    }
+                    if !jsast::is_droppable(&off) {
+                        pre.push(off);
+                    }
+                    sequenced_vec(pre, len)
+                }
+                Err(tail) => jsast::rt_call("str_len", vec![sequenced_vec(pre, tail)]),
+            },
+        }
     }
 
     /// The length of a fat slice (`ptr.rs::slice_len`): `slice.len`, except over a `&str`'s byte
     /// view, where `__rt.str_bytes(s).len` is `__rt.str_len(s)`. `str::len` is
     /// `self.as_bytes().len()`, and a length needs no bytes.
     pub fn slice_len(&self, slice: Expr) -> Expr {
-        match str_bytes_operand(slice) {
-            Ok(string) => self.str_len(string),
-            Err(slice) => ptr::slot_len(slice),
+        let (pre, tail) = peel_seq(slice);
+        match str_bytes_operand(tail) {
+            Ok(string) => self.str_len(sequenced_vec(pre, string)),
+            Err(Expr::Object(entries)) if jsast::folds_property(&entries, LEN) => {
+                sequenced_vec(pre, ptr::slot_len(Expr::Object(entries)))
+            }
+            Err(tail) => ptr::slot_len(sequenced_vec(pre, tail)),
         }
     }
 
@@ -396,7 +431,12 @@ impl<'a> JsCx<'a> {
                     self.str_to_bytes(value)
                 }),
                 _ if value::is_u8(table, to_pointee) => Ok(if mutable {
-                    ptr::slot(ptr::slot_buf(self.str_to_bytes_mut(value)), jsast::num(0))
+                    let bytes = self.str_to_bytes_mut(value);
+                    let (setup, sb) = self.reread(bytes, &[BUF, OFF]);
+                    sequenced(
+                        setup,
+                        ptr::slot(ptr::slot_buf(sb.clone()), ptr::slot_off(sb)),
+                    )
                 } else {
                     self.str_to_byte_ptr(value)
                 }),
@@ -808,6 +848,96 @@ pub fn sequenced(setup: Option<Expr>, value: Expr) -> Expr {
         Some(setup) => jsast::seq(vec![setup, value]),
         None => value,
     }
+}
+
+fn peel_seq(expr: Expr) -> (Vec<Expr>, Expr) {
+    match expr {
+        Expr::Seq(mut items) if !items.is_empty() => {
+            let tail = items.pop().expect("non-empty seq");
+            (items, tail)
+        }
+        other => (Vec::new(), other),
+    }
+}
+
+fn sequenced_vec(mut pre: Vec<Expr>, tail: Expr) -> Expr {
+    if pre.is_empty() {
+        tail
+    } else {
+        pre.push(tail);
+        jsast::seq(pre)
+    }
+}
+
+fn is_rt_call(callee: &Expr, method: &str) -> bool {
+    matches!(
+        callee,
+        Expr::Member(object, name)
+            if name == method && matches!(object.as_ref(), Expr::Ident(rt) if rt == "__rt")
+    )
+}
+
+/// If `expr` is `__rt.bytes_str(b, o, l)`, returns `Ok((b, o, l))`.
+pub(super) fn bytes_str_args(expr: Expr) -> Result<(Expr, Expr, Expr), Expr> {
+    match expr {
+        Expr::Call(callee, mut args) if args.len() == 3 && is_rt_call(&callee, "bytes_str") => {
+            let len = args.pop().expect("3 args");
+            let off = args.pop().expect("3 args");
+            let buf = args.pop().expect("3 args");
+            Ok((buf, off, len))
+        }
+        other => Err(other),
+    }
+}
+
+fn is_zero_num(expr: &Expr) -> bool {
+    match expr {
+        Expr::Num(n) => *n == 0.0,
+        Expr::RawNum(s) => s == "0",
+        _ => false,
+    }
+}
+
+fn unwrap_addr_ptr(expr: &Expr) -> Option<(Expr, Expr)> {
+    let inner = match expr {
+        Expr::Binary(BinOp::UShr, lhs, rhs) if is_zero_num(rhs) => lhs.as_ref(),
+        other => other,
+    };
+    let Expr::Call(callee, args) = inner else {
+        return None;
+    };
+    if args.len() == 2 && is_rt_call(callee, "addr") && jsast::is_droppable(&args[1]) {
+        Some((args[0].clone(), args[1].clone()))
+    } else {
+        None
+    }
+}
+
+fn is_one_num(expr: &Expr) -> bool {
+    match expr {
+        Expr::Num(n) => *n == 1.0,
+        Expr::RawNum(s) => s == "1",
+        _ => false,
+    }
+}
+
+/// Matches a strict comparison between `__rt.addr(ptr, align)` (optionally `>>> 0`) and `0`,
+/// returning `__rt.ptr_is_null(ptr)` (or `__rt.ptr_is_null(ptr, align)` when `align != 1`) so
+/// callers avoid `_addr_mint`.
+pub fn simplify_addr_zero_eq(lhs: &Expr, rhs: &Expr) -> Option<Expr> {
+    let (ptr, align) = if is_zero_num(rhs) {
+        unwrap_addr_ptr(lhs)?
+    } else if is_zero_num(lhs) {
+        unwrap_addr_ptr(rhs)?
+    } else {
+        return None;
+    };
+    let args = if is_one_num(&align) {
+        vec![ptr]
+    } else {
+        vec![ptr, align]
+    };
+    Some(jsast::rt_call("ptr_is_null", args))
 }
 
 /// Whether reading `reads` off `value` several times costs no more than reading it once.
