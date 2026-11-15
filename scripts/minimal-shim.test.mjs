@@ -247,3 +247,40 @@ test("dealloc skips _addrHeap WeakMap lookup when no heap address was minted", (
   const p3 = rt.alloc(16, 4);
   assert.equal(rt.addr(p3, 1), a2);
 });
+
+test("minimalShim isolates _ASCII_CHUNK subslice state cleanly in classic and module modes", async () => {
+  const { parse } = await import("acorn");
+  const fullShim = readFileSync(new URL("../runtime/shim.js", import.meta.url), "utf8");
+
+  for (const mod of [false, true]) {
+    const bytesOnly = minimalShim(["__rt.bytes_str(b, 0, n);"], fullShim, { module: mod });
+    assert.ok(bytesOnly.names.includes("_ASCII_CHUNK"));
+    assert.ok(!bytesOnly.names.includes("_str_memo"));
+    assert.ok(!bytesOnly.names.includes("str_bytes"));
+    parse(bytesOnly.source, { ecmaVersion: 2018, sourceType: mod ? "module" : "script" });
+
+    const lenOnly = minimalShim(["__rt.str_len(s);"], fullShim, { module: mod });
+    assert.ok(lenOnly.names.includes("_ASCII_CHUNK"));
+    assert.ok(lenOnly.names.includes("_str_memo"));
+    assert.ok(!lenOnly.names.includes("bytes_str"));
+    assert.ok(!lenOnly.names.includes("str_bytes"));
+    parse(lenOnly.source, { ecmaVersion: 2018, sourceType: mod ? "module" : "script" });
+  }
+
+  const combined = minimalShim(
+    ["__rt.str_bytes(s); __rt.bytes_str(b, 0, n); __rt.str_len(s);"],
+    fullShim,
+    { module: true },
+  );
+  parse(combined.source, { ecmaVersion: 2018, sourceType: "module" });
+  const mod = await import(
+    `data:text/javascript;base64,${Buffer.from(combined.source).toString("base64")}`
+  );
+  const src = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const rec = mod.str_bytes(src);
+  const sub = mod.bytes_str(rec.buf, 5, 22);
+  assert.equal(sub, src.slice(5, 27));
+  assert.equal(mod.str_bytes(sub).buf, rec.buf);
+  assert.equal(mod.str_bytes(sub).off, 5);
+  assert.equal(mod.str_len(sub), 22);
+});

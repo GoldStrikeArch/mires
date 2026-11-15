@@ -1373,7 +1373,16 @@ globalThis.__rt._str_memo_clear = () => {
   memo.bytes = 0;
   memo.huge.length = 0;
   memo.armed = false;
+  _sub_reset();
 };
+
+function _arm_str_memo() {
+  const memo = globalThis.__rt._str_memo;
+  if (!memo.armed) {
+    memo.armed = true;
+    if (typeof queueMicrotask === "function") queueMicrotask(globalThis.__rt._str_memo_clear);
+  }
+}
 
 // str_bytes(s): the UTF-8 bytes of a JavaScript string as `{ buf, off, len }`,
 // which is `str::as_bytes` and `str::as_ptr`.
@@ -1389,17 +1398,27 @@ globalThis.__rt._str_memo_clear = () => {
 // shapes a program actually writes and a byte slice compared with itself takes
 // the fast path. Correctness never depends on it.
 globalThis.__rt.str_bytes = (s) => {
+  if (s !== "") {
+    if (s === _sub_k0) return _sub_v0;
+    if (s === _sub_k1) return _sub_v1;
+    if (s === _sub_k2) return _sub_v2;
+    if (s === _sub_k3) return _sub_v3;
+  }
   const memo = globalThis.__rt._str_memo;
   let record = memo.map.get(s);
   if (record !== undefined) return record;
   const bytes = globalThis.__rt._utf8(s);
   record = { buf: bytes, off: 0, len: bytes.length };
-  if (!memo.armed) {
-    memo.armed = true;
-    if (typeof queueMicrotask === "function") queueMicrotask(globalThis.__rt._str_memo_clear);
+  if (bytes.length === s.length) {
+    (_ascii_src || (_ascii_src = new WeakMap())).set(bytes, s);
   }
+  if (_sub_arm === undefined) _sub_arm = _arm_str_memo;
+  _arm_str_memo();
   if (bytes.length > memo.budget / 4) {
-    if (memo.huge.length === 2) memo.map.delete(memo.huge.shift());
+    if (memo.huge.length === 2) {
+      memo.map.delete(memo.huge.shift());
+      _sub_reset();
+    }
     memo.huge.push(s);
   } else {
     if (memo.bytes + bytes.length > memo.budget) {
@@ -1407,6 +1426,7 @@ globalThis.__rt.str_bytes = (s) => {
       memo.map.clear();
       memo.huge.forEach((key, i) => memo.map.set(key, huge[i]));
       memo.bytes = 0;
+      _sub_reset();
     }
     memo.bytes += bytes.length;
   }
@@ -1435,6 +1455,12 @@ globalThis.__rt.str_bytes_mut = (s) => {
 // per token of a long document from costing a scan each time.
 globalThis.__rt.str_len = (s) => {
   const n = s.length;
+  if (n > 16) {
+    if (s === _sub_k0) return _sub_v0.len;
+    if (s === _sub_k1) return _sub_v1.len;
+    if (s === _sub_k2) return _sub_v2.len;
+    if (s === _sub_k3) return _sub_v3.len;
+  }
   const map = globalThis.__rt._str_memo.map;
   if (n > 64 && map.size !== 0) {
     const record = map.get(s);
@@ -1472,11 +1498,50 @@ globalThis.__rt.str_len = (s) => {
 // or at the first byte that is not ASCII (a negative `i8` included), the
 // decoder takes over.
 globalThis.__rt._ASCII_CHUNK = 4096;
+let _ascii_src;
+let _sub_k0 = "";
+let _sub_v0;
+let _sub_k1 = "";
+let _sub_v1;
+let _sub_k2 = "";
+let _sub_v2;
+let _sub_k3 = "";
+let _sub_v3;
+let _sub_i = 0;
+let _sub_arm;
+function _sub_reset() {
+  _sub_k0 = _sub_k1 = _sub_k2 = _sub_k3 = "";
+  _sub_v0 = _sub_v1 = _sub_v2 = _sub_v3 = undefined;
+}
 globalThis.__rt.bytes_str = (buf, off, len) => {
   // A zero length `str` reads nothing, and the buffer it names may not exist at
   // all: `let none: [u8; 0] = []` is a zero sized place, whose JavaScript value
   // is `undefined`.
   if (len === 0) return "";
+  if (_ascii_src !== undefined && typeof buf === "object" && buf !== null) {
+    const src = _ascii_src.get(buf);
+    if (src !== undefined && off >= 0 && len >= 0 && off + len <= src.length) {
+      if (off === 0 && len === src.length) return src;
+      const sub = src.slice(off, off + len);
+      if (_sub_arm !== undefined) _sub_arm();
+      const slot = { buf, off, len };
+      if (_sub_i === 0) {
+        _sub_k0 = sub;
+        _sub_v0 = slot;
+      } else if (_sub_i === 1) {
+        _sub_k1 = sub;
+        _sub_v1 = slot;
+      } else if (_sub_i === 2) {
+        _sub_k2 = sub;
+        _sub_v2 = slot;
+      } else {
+        _sub_k3 = sub;
+        _sub_v3 = slot;
+      }
+      _sub_i = (_sub_i + 1) & 3;
+      return sub;
+    }
+  }
   const typed = buf instanceof Uint8Array;
   if (len <= globalThis.__rt._ASCII_CHUNK) {
     let i = 0;
@@ -3639,7 +3704,7 @@ globalThis.__rt.convert_host_sb = (s) => {
 // share its allocation, so the bytes are copied into a new plain array.
 globalThis.__rt.convert_str_block = (s) => {
   const shared = globalThis.__rt.str_bytes(s);
-  const copy = shared.buf.slice();
+  const copy = shared.buf.slice(shared.off, shared.off + shared.len);
   // The baseline String's byte block is a heap block: reads reach it through
   // `unscale`, which answers from the block registry, so the fresh copy is
   // registered exactly as `alloc` would have (already element-typed at 1 byte).
@@ -3658,7 +3723,7 @@ globalThis.__rt.convert_str_block = (s) => {
 globalThis.__rt.convert_sb_block = (sb) => {
   const shared = globalThis.__rt.str_bytes(sb.text);
   const cap = Math.max(sb.cap, shared.len);
-  const copy = shared.buf.slice(0, shared.len);
+  const copy = shared.buf.slice(shared.off, shared.off + shared.len);
   copy.length = cap;
   const p = globalThis.__rt._register(copy, cap, false);
   globalThis.__rt._blk_get(copy).fresh = false;

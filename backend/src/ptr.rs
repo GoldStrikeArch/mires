@@ -1183,8 +1183,9 @@ pub(crate) fn str_to_bytes(string: Expr) -> Expr {
 ///
 /// The same byte view as [`str_to_bytes`], reduced to a slot: a thin pointer carries no length, and
 /// leaving one on the record would put a `len` on a pointer that is about to be offset past it.
-pub(crate) fn str_to_byte_ptr(string: Expr) -> Expr {
-    slot(slot_buf(str_to_bytes(string)), jsast::num(0))
+pub(crate) fn str_to_byte_ptr<'tcx>(fx: &FnCx<'_, 'tcx>, string: Expr) -> Expr {
+    let (setup, b) = reread(fx, str_to_bytes(string), &[BUF, OFF]);
+    sequenced(setup, slot(slot_buf(b.clone()), slot_off(b)))
 }
 
 /// `s.as_bytes_mut()`: a fresh byte view no other `as_bytes` shares, so a write through it — lost,
@@ -1301,7 +1302,7 @@ fn cast_str_as<'tcx>(
             ty::Slice(element) if is_u8(*element) && mutable => str_to_bytes_mut(value),
             ty::Slice(element) if is_u8(*element) => str_to_bytes(value),
             _ if is_u8(to) && mutable => slot(slot_buf(str_to_bytes_mut(value)), jsast::num(0)),
-            _ if is_u8(to) => str_to_byte_ptr(value),
+            _ if is_u8(to) => str_to_byte_ptr(fx, value),
             _ => unsupported(),
         },
         (false, true) => match from.kind() {
