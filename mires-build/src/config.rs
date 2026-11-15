@@ -1430,9 +1430,9 @@ mod tests {
             .unwrap();
         let source = fs::read_to_string(published).unwrap();
 
-        assert!(source.contains("globalThis.__rt.host_task ="), "{source}");
-        assert!(source.contains("  host_task,"), "{source}");
-        assert!(!source.contains("globalThis.__rt.host_try ="), "{source}");
+        assert!(source.contains("let $rt_host_task ="), "{source}");
+        assert!(source.contains("$rt_host_task as host_task,"), "{source}");
+        assert!(!source.contains("host_try"), "{source}");
     }
 
     #[test]
