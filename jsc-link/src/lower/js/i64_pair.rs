@@ -374,6 +374,10 @@ pub fn mul_pair(
     if (const_i32(&al) == Some(0) && const_i32(&ah) == Some(0))
         || (const_i32(&bl) == Some(0) && const_i32(&bh) == Some(0))
     {
+        discard_effect(stmts, al);
+        discard_effect(stmts, ah);
+        discard_effect(stmts, bl);
+        discard_effect(stmts, bh);
         return (jsast::num(0.0), jsast::num(0.0));
     }
     if const_i32(&bl) == Some(1) && const_i32(&bh) == Some(0) {
@@ -462,15 +466,33 @@ pub fn div_rem_pair(
     (lo_var, jsast::id(HELPER_HI))
 }
 
+/// Emits `expr` as a statement when it may have side effects (calls, assignments, raw JS).
+fn discard_effect(stmts: &mut Vec<Stmt>, expr: Expr) {
+    if !jsast::is_droppable(&expr) {
+        stmts.push(Stmt::ExprStmt(expr));
+    }
+}
+
+/// Returns `val` directly if `dropped` is droppable, otherwise `(dropped, val)`.
+fn keep_effect(dropped: Expr, val: Expr) -> Expr {
+    if jsast::is_droppable(&dropped) {
+        val
+    } else {
+        jsast::seq(vec![dropped, val])
+    }
+}
+
 /// Computes `(lo, hi)` for bitwise `&`, `|`, `^`.
 pub fn bitwise_pair(op: JsBinOp, (al, ah): (Expr, Expr), (bl, bh): (Expr, Expr)) -> (Expr, Expr) {
     let half = |l: Expr, r: Expr| match (op, const_i32(&l), const_i32(&r)) {
-        (JsBinOp::BitAnd, Some(0), _) | (JsBinOp::BitAnd, _, Some(0)) => jsast::num(0.0),
+        (JsBinOp::BitAnd, Some(0), _) => keep_effect(r, jsast::num(0.0)),
+        (JsBinOp::BitAnd, _, Some(0)) => keep_effect(l, jsast::num(0.0)),
         (JsBinOp::BitAnd, Some(-1), _) => r,
         (JsBinOp::BitAnd, _, Some(-1)) => l,
         (JsBinOp::BitOr, Some(0), _) => r,
         (JsBinOp::BitOr, _, Some(0)) => l,
-        (JsBinOp::BitOr, Some(-1), _) | (JsBinOp::BitOr, _, Some(-1)) => jsast::num(-1.0),
+        (JsBinOp::BitOr, Some(-1), _) => keep_effect(r, jsast::num(-1.0)),
+        (JsBinOp::BitOr, _, Some(-1)) => keep_effect(l, jsast::num(-1.0)),
         (JsBinOp::BitXor, Some(0), _) => r,
         (JsBinOp::BitXor, _, Some(0)) => l,
         (JsBinOp::BitXor, Some(-1), _) => jsast::bit_not(r),
@@ -515,7 +537,7 @@ fn mask_shift_63(amount: Expr, amount_is_i64: bool, amount_is_bigint: bool) -> E
 
 fn fold_shl(lhs: Expr, rhs: Expr) -> Expr {
     if const_i32(&lhs) == Some(0) {
-        return jsast::num(0.0);
+        return keep_effect(rhs, jsast::num(0.0));
     }
     if let Some(k) = const_i32(&rhs) {
         let s = (k as u32) & 31;
@@ -532,7 +554,7 @@ fn fold_shl(lhs: Expr, rhs: Expr) -> Expr {
 
 fn fold_ushr_pos_shift(lhs: Expr, rhs: Expr) -> Expr {
     if const_i32(&lhs) == Some(0) {
-        return jsast::num(0.0);
+        return keep_effect(rhs, jsast::num(0.0));
     }
     if let Some(k) = const_i32(&rhs) {
         let s = (k as u32) & 31;
@@ -546,7 +568,7 @@ fn fold_ushr_pos_shift(lhs: Expr, rhs: Expr) -> Expr {
 
 fn fold_ushr_i32(lhs: Expr, rhs: Expr) -> Expr {
     if const_i32(&lhs) == Some(0) {
-        return jsast::num(0.0);
+        return keep_effect(rhs, jsast::num(0.0));
     }
     if let Some(k) = const_i32(&rhs) {
         let s = (k as u32) & 31;
@@ -563,8 +585,8 @@ fn fold_ushr_i32(lhs: Expr, rhs: Expr) -> Expr {
 
 fn fold_shr_signed(lhs: Expr, rhs: Expr) -> Expr {
     match const_i32(&lhs) {
-        Some(0) => return jsast::num(0.0),
-        Some(-1) => return jsast::num(-1.0),
+        Some(0) => return keep_effect(rhs, jsast::num(0.0)),
+        Some(-1) => return keep_effect(rhs, jsast::num(-1.0)),
         _ => {}
     }
     if let Some(k) = const_i32(&rhs) {
@@ -584,7 +606,8 @@ fn fold_bit_or_i32(lhs: Expr, rhs: Expr) -> Expr {
     match (const_i32(&lhs), const_i32(&rhs)) {
         (Some(0), _) => rhs,
         (_, Some(0)) => lhs,
-        (Some(-1), _) | (_, Some(-1)) => jsast::num(-1.0),
+        (Some(-1), _) => keep_effect(rhs, jsast::num(-1.0)),
+        (_, Some(-1)) => keep_effect(lhs, jsast::num(-1.0)),
         (Some(a), Some(b)) => jsast::num(f64::from(a | b)),
         _ => jsast::binary(JsBinOp::BitOr, lhs, rhs),
     }
@@ -593,7 +616,7 @@ fn fold_bit_or_i32(lhs: Expr, rhs: Expr) -> Expr {
 fn fold_cond_i32(cond: Expr, then_expr: Expr, else_expr: Expr) -> Expr {
     if let (Some(a), Some(b)) = (const_i32(&then_expr), const_i32(&else_expr)) {
         if a == b {
-            return then_expr;
+            return keep_effect(cond, then_expr);
         }
     }
     jsast::cond(cond, then_expr, else_expr)
@@ -627,12 +650,24 @@ pub fn shl_pair(
             return (lo, hi);
         }
         if k == 32 {
+            if !jsast::is_droppable(&ah) {
+                let al = materialize(cx, stmts, al);
+                stmts.push(Stmt::ExprStmt(ah));
+                return (jsast::num(0.0), al);
+            }
             return (jsast::num(0.0), al);
+        }
+        if !jsast::is_droppable(&ah) {
+            let al = materialize(cx, stmts, al);
+            stmts.push(Stmt::ExprStmt(ah));
+            let hi = fold_shl(al, jsast::num(f64::from(k - 32)));
+            return (jsast::num(0.0), hi);
         }
         let hi = fold_shl(al, jsast::num(f64::from(k - 32)));
         return (jsast::num(0.0), hi);
     }
     if const_i32(&al) == Some(0) && const_i32(&ah) == Some(0) {
+        discard_effect(stmts, shift_amount);
         return (jsast::num(0.0), jsast::num(0.0));
     }
     let al = materialize(cx, stmts, al);
@@ -705,6 +740,7 @@ pub fn shr_pair(
             let hi = shift_hi(ah, jsast::num(f64::from(k)));
             return (lo, hi);
         }
+        discard_effect(stmts, al);
         if k == 32 {
             let ah = materialize(cx, stmts, ah);
             return (ah.clone(), fill_hi(ah));
@@ -716,6 +752,7 @@ pub fn shr_pair(
     }
 
     if const_i32(&al) == Some(0) && const_i32(&ah) == Some(0) {
+        discard_effect(stmts, shift_amount);
         return (jsast::num(0.0), jsast::num(0.0));
     }
     let al = materialize(cx, stmts, al);
@@ -791,6 +828,7 @@ pub fn rotate_pair(
     }
 
     if const_i32(&al) == Some(0) && const_i32(&ah) == Some(0) {
+        discard_effect(stmts, shift_amount);
         return (jsast::num(0.0), jsast::num(0.0));
     }
     let al = materialize(cx, stmts, al);
@@ -1782,5 +1820,123 @@ mod tests {
             assert_eq!(jsast::expr_to_string(&rot_lo), "v << 8");
             assert_eq!(jsast::expr_to_string(&rot_hi), "v >>> 24");
         });
+    }
+
+    #[test]
+    fn peepholes_preserve_impure_call_operands() {
+        let bump = |tag: f64| jsast::call(jsast::id("bump"), vec![jsast::num(tag)]);
+        let stmts_contain = |stmts: &[Stmt], needle: &str| {
+            stmts.iter().any(|s| match s {
+                Stmt::ExprStmt(e) | Stmt::Let(_, Some(e)) | Stmt::Const(_, e) => {
+                    jsast::expr_to_string(e).contains(needle)
+                }
+                _ => false,
+            })
+        };
+
+        // 0u64 << call(), 0u64 >> call(), 0i64 >> call(), rotate_pair(0, call())
+        with_cx(|cx, stmts| {
+            let (lo, hi) = shl_pair(cx, stmts, (jsast::num(0.0), jsast::num(0.0)), bump(1.0));
+            assert_eq!(jsast::expr_to_string(&lo), "0");
+            assert_eq!(jsast::expr_to_string(&hi), "0");
+            assert!(stmts_contain(stmts, "bump(1)"), "{stmts:?}");
+        });
+        with_cx(|cx, stmts| {
+            let (lo, hi) = shr_pair(
+                cx,
+                stmts,
+                false,
+                (jsast::num(0.0), jsast::num(0.0)),
+                bump(2.0),
+            );
+            assert_eq!(jsast::expr_to_string(&lo), "0");
+            assert_eq!(jsast::expr_to_string(&hi), "0");
+            assert!(stmts_contain(stmts, "bump(2)"), "{stmts:?}");
+        });
+        with_cx(|cx, stmts| {
+            let (lo, hi) = shr_pair(
+                cx,
+                stmts,
+                true,
+                (jsast::num(0.0), jsast::num(0.0)),
+                bump(3.0),
+            );
+            assert_eq!(jsast::expr_to_string(&lo), "0");
+            assert_eq!(jsast::expr_to_string(&hi), "0");
+            assert!(stmts_contain(stmts, "bump(3)"), "{stmts:?}");
+        });
+        with_cx(|cx, stmts| {
+            let (lo, hi) = rotate_pair(
+                cx,
+                stmts,
+                true,
+                (jsast::num(0.0), jsast::num(0.0)),
+                bump(4.0),
+            );
+            assert_eq!(jsast::expr_to_string(&lo), "0");
+            assert_eq!(jsast::expr_to_string(&hi), "0");
+            assert!(stmts_contain(stmts, "bump(4)"), "{stmts:?}");
+        });
+
+        // Constant shifts dropping one lane (`k >= 32`) & `0u64 * call()`
+        with_cx(|cx, stmts| {
+            let (lo, hi) = shl_pair(cx, stmts, (bump(5.0), bump(6.0)), jsast::num(32.0));
+            assert!(stmts_contain(stmts, "bump(5)"), "{stmts:?}");
+            assert!(stmts_contain(stmts, "bump(6)"), "{stmts:?}");
+            assert_eq!(jsast::expr_to_string(&lo), "0");
+            assert!(!jsast::expr_to_string(&hi).is_empty());
+        });
+        with_cx(|cx, stmts| {
+            let (lo, hi) = shr_pair(cx, stmts, false, (bump(7.0), bump(8.0)), jsast::num(40.0));
+            assert!(stmts_contain(stmts, "bump(7)"), "{stmts:?}");
+            assert!(stmts_contain(stmts, "bump(8)"), "{stmts:?}");
+            assert_eq!(jsast::expr_to_string(&hi), "0");
+            assert!(jsast::expr_to_string(&lo).contains(">>> 8"));
+        });
+        with_cx(|cx, stmts| {
+            let (lo, hi) = mul_pair(
+                cx,
+                stmts,
+                (jsast::num(0.0), jsast::num(0.0)),
+                (bump(9.0), bump(10.0)),
+            );
+            assert_eq!(jsast::expr_to_string(&lo), "0");
+            assert_eq!(jsast::expr_to_string(&hi), "0");
+            assert!(stmts_contain(stmts, "bump(9)"), "{stmts:?}");
+            assert!(stmts_contain(stmts, "bump(10)"), "{stmts:?}");
+        });
+
+        // Pure expression helpers: fold_bit_or_i32, fold_shl, fold_shr_signed, fold_cond_i32, bitwise_pair
+        let bor = fold_bit_or_i32(jsast::num(-1.0), bump(11.0));
+        assert!(jsast::expr_to_string(&bor).contains("bump(11)"), "{bor:?}");
+        let fshl = fold_shl(jsast::num(0.0), bump(12.0));
+        assert!(
+            jsast::expr_to_string(&fshl).contains("bump(12)"),
+            "{fshl:?}"
+        );
+        let fshr = fold_shr_signed(jsast::num(-1.0), bump(13.0));
+        assert!(
+            jsast::expr_to_string(&fshr).contains("bump(13)"),
+            "{fshr:?}"
+        );
+        let fcond = fold_cond_i32(bump(14.0), jsast::num(0.0), jsast::num(0.0));
+        assert!(
+            jsast::expr_to_string(&fcond).contains("bump(14)"),
+            "{fcond:?}"
+        );
+        let (and_lo, and_hi) = bitwise_pair(
+            JsBinOp::BitAnd,
+            (jsast::num(0.0), jsast::num(0.0)),
+            (bump(15.0), bump(16.0)),
+        );
+        assert!(jsast::expr_to_string(&and_lo).contains("bump(15)"));
+        assert!(jsast::expr_to_string(&and_hi).contains("bump(16)"));
+        let (or_lo, or_hi) = bitwise_pair(
+            JsBinOp::BitOr,
+            (jsast::num(-1.0), jsast::num(-1.0)),
+            (bump(17.0), bump(18.0)),
+        );
+        assert!(jsast::expr_to_string(&or_lo).contains("bump(17)"));
+        assert!(jsast::expr_to_string(&or_hi).contains("bump(18)"));
     }
 }
