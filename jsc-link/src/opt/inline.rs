@@ -40,12 +40,12 @@ use crate::analysis::callgraph::Callgraph;
 use crate::item::JsName;
 use crate::jir::decline::Decline;
 use crate::jir::interns::Interns;
-use crate::jir::origin::{Origin, OriginId, SourceFactId};
+use crate::jir::origin::{OriginId, SourceFactId};
 use crate::jir::repr::{
     CellId, Func, Op, OpKind, Proj, RAssertMessage, RBlock, RBlockId, RTerm, Root, ValueId,
 };
 use crate::jir::semantic::{
-    CallSemantic, Callee, ConstTree, DropGlue, GlobalReference, HostPayload, TypeId,
+    BinaryOp, CallSemantic, Callee, ConstTree, DropGlue, GlobalReference, HostPayload, TypeId,
 };
 use crate::jir::types::{NominalForm, TypeKind, TypeTable};
 use crate::lower::js::host::ItemIndex;
@@ -654,9 +654,25 @@ fn bounded_iterator_step(func: &Func, table: &TypeTable) -> bool {
 
 const SENTINEL_ASSERT_ORIGIN: OriginId = OriginId(u32::MAX - 1);
 
+/// Overflow asserts for wrapping/checked integer ops are skipped by `lower::js::emit`, whereas
+/// every other `OpKind::Assert` resolves its panic lang item from the caller's `summary.deps`.
+fn is_optional_assert(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Assert {
+            msg: RAssertMessage::Overflow {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Shl | BinaryOp::Shr,
+                ..
+            },
+            ..
+        }
+    )
+}
+
 /// Prepares an imported callee for splicing at a call site, resolving any `#[track_caller]`
-/// location substitution and returning an optional sentinel origin if surviving callee `Assert`
-/// ops must be rejected after DCE.
+/// location substitution and tagging non-optional callee `Assert` ops with a sentinel origin so
+/// any assert surviving DCE rejects inlining (because `lower::js::emit` resolves panic lang items
+/// from the caller's `summary.deps` and would otherwise fall back to `js_abort`).
 #[allow(clippy::too_many_arguments)]
 fn prepare_callee_for_site<'a>(
     current_metadata: &Metadata<'a>,
@@ -664,66 +680,18 @@ fn prepare_callee_for_site<'a>(
     callee_func: &Func,
     origin: OriginId,
     site_args_len: usize,
-    caller_caller_location: bool,
+    _caller_caller_location: bool,
     site_track_caller: Option<SourceFactId>,
     items: &ItemIndex,
 ) -> Result<(Func, Metadata<'a>, Option<OriginId>), &'static str> {
-    let (mut callee_func, mut imported) = current_metadata.import(provider, callee_func, origin)?;
+    let (mut callee_func, imported) = current_metadata.import(provider, callee_func, origin)?;
     let mut sentinel_assert_origin = None;
     if callee_func.sig.abi.caller_location && callee_func.params.len() == site_args_len + 1 {
-        let forwards_caller_location = caller_caller_location && site_track_caller.is_none();
-        if !forwards_caller_location {
-            let has_assert = callee_func
-                .blocks
-                .iter()
-                .flat_map(|block| &block.ops)
-                .any(|op| matches!(op.kind, OpKind::Assert { .. }));
-            if has_assert {
-                if let (Some(site_fact), false, Some(origins_cow)) = (
-                    site_track_caller,
-                    caller_caller_location,
-                    imported.origins.as_mut(),
-                ) {
-                    let origins = origins_cow.to_mut();
-                    if origins.origins.len() < 65536 {
-                        let base_origin =
-                            origins.origin(origin).cloned().unwrap_or_else(|| Origin {
-                                source: Some(site_fact),
-                                local_name: None,
-                                kind: crate::jir::origin::OriginKind::Statement,
-                                inline_stack: Vec::new(),
-                            });
-                        let assert_origin_id = OriginId(origins.origins.len() as u32);
-                        origins.origins.push(Origin {
-                            source: Some(site_fact),
-                            ..base_origin
-                        });
-                        for block in &mut callee_func.blocks {
-                            for op in &mut block.ops {
-                                if matches!(op.kind, OpKind::Assert { .. }) {
-                                    op.origin = assert_origin_id;
-                                }
-                            }
-                        }
-                    } else {
-                        sentinel_assert_origin = Some(SENTINEL_ASSERT_ORIGIN);
-                        for block in &mut callee_func.blocks {
-                            for op in &mut block.ops {
-                                if matches!(op.kind, OpKind::Assert { .. }) {
-                                    op.origin = SENTINEL_ASSERT_ORIGIN;
-                                }
-                            }
-                        }
-                    }
-                } else {
+        for block in &mut callee_func.blocks {
+            for op in &mut block.ops {
+                if matches!(op.kind, OpKind::Assert { .. }) && !is_optional_assert(&op.kind) {
+                    op.origin = SENTINEL_ASSERT_ORIGIN;
                     sentinel_assert_origin = Some(SENTINEL_ASSERT_ORIGIN);
-                    for block in &mut callee_func.blocks {
-                        for op in &mut block.ops {
-                            if matches!(op.kind, OpKind::Assert { .. }) {
-                                op.origin = SENTINEL_ASSERT_ORIGIN;
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -4003,100 +3971,13 @@ mod tests {
     }
 
     #[test]
-    fn track_caller_assert_rewrites_origin_with_origins_and_folds_dead_assert() {
+    fn track_caller_dead_assert_folds_and_live_assert_declines() {
         use crate::jir::origin::{Origin, OriginKind, OriginTable, SourceFact};
         use std::borrow::Cow;
 
-        let mut prog = Prog::new();
-        let caller_file = prog.strid("caller.rs");
-        let core_file = prog.strid("core/slice.rs");
-        let site_fact = prog.interns.intern_source_fact(SourceFact {
-            file: caller_file,
-            line: 55,
-            col: 12,
-        });
-        let core_fact = prog.interns.intern_source_fact(SourceFact {
-            file: core_file,
-            line: 999,
-            col: 1,
-        });
-        let g_str = prog.strid("g_assert");
-
-        // Callee with Assert using core_fact origin
-        let mut g_sig = sig(2);
-        g_sig.abi.caller_location = true;
-        let mut g_b = FuncBuilder::new(item(2), g_sig);
-        let x = g_b.param(I32, OriginId(0));
-        let _loc = g_b.param(I32, OriginId(0));
-        let zero = g_b.op(
-            FuncBuilder::ENTRY,
-            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
-            I32,
-            OriginId(0),
-        );
-        let cmp = g_b.op(
-            FuncBuilder::ENTRY,
-            OpKind::Binary {
-                op: BinaryOp::Eq,
-                l: x,
-                r: zero,
-                ty: I32,
-            },
-            I32,
-            OriginId(0),
-        );
-        g_b.effect(
-            FuncBuilder::ENTRY,
-            OpKind::Assert {
-                cond: cmp,
-                expected: false,
-                msg: RAssertMessage::RemainderByZero(x),
-            },
-            OriginId(0),
-        );
-        g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(x)));
-        let g = g_b.finish();
-
-        // Caller passes dynamic arg `p` (so Assert stays live) with OriginTable present
-        let mut f_b = FuncBuilder::new(item(1), sig(1));
-        let p = f_b.param(I32, OriginId(0));
-        let call = f_b.op(
-            FuncBuilder::ENTRY,
-            OpKind::Call {
-                callee: Callee::Direct {
-                    item: item(2),
-                    link_name: g_str,
-                },
-                function: None,
-                args: vec![p],
-                track_caller: Some(site_fact),
-                semantic: CallSemantic::Ordinary,
-                host: None,
-            },
-            I32,
-            OriginId(0),
-        );
-        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
-        let f = f_b.finish();
-
-        prog.add("g_assert", g);
-        prog.add("f", f);
-        let caller_origins = OriginTable {
+        let build_origins = |fact| OriginTable {
             origins: vec![Origin {
-                source: Some(site_fact),
-                local_name: None,
-                kind: OriginKind::Statement,
-                inline_stack: Vec::new(),
-            }],
-            statements: Vec::new(),
-            terminators: Vec::new(),
-            locals: Vec::new(),
-            item_path: StrId(0),
-            root: None,
-        };
-        let callee_origins = OriginTable {
-            origins: vec![Origin {
-                source: Some(core_fact),
+                source: Some(fact),
                 local_name: None,
                 kind: OriginKind::Statement,
                 inline_stack: Vec::new(),
@@ -4108,57 +3989,233 @@ mod tests {
             root: None,
         };
 
-        let interns = &prog.interns;
-        let funcs = &mut prog.funcs;
-        let interns_map: BTreeMap<JsName, &Interns> =
-            funcs.keys().map(|name| (name.clone(), interns)).collect();
-        let graph = callgraph::build(funcs, &interns_map);
-        let f_name = JsName::new("f".to_owned());
-        let g_name = JsName::new("g_assert".to_owned());
-        let mut metadata = BTreeMap::from([
-            (
-                f_name.clone(),
-                Metadata {
-                    universe: interns,
-                    interns: Cow::Borrowed(interns),
-                    origins: Some(Cow::Owned(caller_origins)),
-                    header: None,
+        let make_assert_callee = || {
+            let mut g_sig = sig(2);
+            g_sig.abi.caller_location = true;
+            let mut g_b = FuncBuilder::new(item(2), g_sig);
+            let x = g_b.param(I32, OriginId(0));
+            let _loc = g_b.param(I32, OriginId(0));
+            let zero = g_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+                I32,
+                OriginId(0),
+            );
+            let cmp = g_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Binary {
+                    op: BinaryOp::Eq,
+                    l: x,
+                    r: zero,
+                    ty: I32,
                 },
-            ),
-            (
-                g_name.clone(),
-                Metadata {
-                    universe: interns,
-                    interns: Cow::Borrowed(interns),
-                    origins: Some(Cow::Owned(callee_origins)),
-                    header: None,
+                I32,
+                OriginId(0),
+            );
+            g_b.effect(
+                FuncBuilder::ENTRY,
+                OpKind::Assert {
+                    cond: cmp,
+                    expected: false,
+                    msg: RAssertMessage::RemainderByZero(x),
                 },
-            ),
-        ]);
-        let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name.clone(), 120)]);
-        let stats = run_with_mode(
-            funcs,
-            &mut metadata,
-            &graph,
-            &ItemIndex::new(),
-            &|_, func, _| Some(measurement(func, &metadata_dummy_refs(func, interns))),
-            &|_, _| true,
-            &|_| true,
-            100_000,
-            &sizes,
-            false,
-        );
-        assert_eq!(stats.applied, 1);
-        let f_after = funcs.get(&f_name).unwrap().as_ref().unwrap();
-        let f_origins = metadata.get(&f_name).unwrap().origins.as_ref().unwrap();
-        let assert_op = f_after
-            .blocks
-            .iter()
-            .flat_map(|b| &b.ops)
-            .find(|op| matches!(op.kind, OpKind::Assert { .. }))
-            .expect("live assert kept");
-        let assert_source = f_origins.origin(assert_op.origin).unwrap().source;
-        assert_eq!(assert_source, Some(site_fact));
+                OriginId(0),
+            );
+            g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(x)));
+            g_b.finish()
+        };
+
+        // Case 1: Live non-optional Assert inside #[track_caller] callee MUST decline even when
+        // OriginTable is present (both direct site_track_caller = Some(...) and forwarded None).
+        for forward_in_track_caller in [false, true] {
+            let mut prog = Prog::new();
+            let caller_file = prog.strid("caller.rs");
+            let core_file = prog.strid("core/slice.rs");
+            let site_fact = prog.interns.intern_source_fact(SourceFact {
+                file: caller_file,
+                line: 55,
+                col: 12,
+            });
+            let core_fact = prog.interns.intern_source_fact(SourceFact {
+                file: core_file,
+                line: 999,
+                col: 1,
+            });
+            let g_str = prog.strid("g_assert");
+            let g = make_assert_callee();
+
+            let mut f_sig = sig(1);
+            f_sig.abi.caller_location = forward_in_track_caller;
+            let mut f_b = FuncBuilder::new(item(1), f_sig);
+            let p = f_b.param(I32, OriginId(0));
+            let call = f_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: item(2),
+                        link_name: g_str,
+                    },
+                    function: None,
+                    args: vec![p],
+                    track_caller: if forward_in_track_caller {
+                        None
+                    } else {
+                        Some(site_fact)
+                    },
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                I32,
+                OriginId(0),
+            );
+            f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+            let f = f_b.finish();
+
+            prog.add("g_assert", g);
+            prog.add("f", f);
+
+            let interns = &prog.interns;
+            let funcs = &mut prog.funcs;
+            let interns_map: BTreeMap<JsName, &Interns> =
+                funcs.keys().map(|name| (name.clone(), interns)).collect();
+            let graph = callgraph::build(funcs, &interns_map);
+            let f_name = JsName::new("f".to_owned());
+            let g_name = JsName::new("g_assert".to_owned());
+            let mut metadata = BTreeMap::from([
+                (
+                    f_name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: Cow::Borrowed(interns),
+                        origins: Some(Cow::Owned(build_origins(site_fact))),
+                        header: None,
+                    },
+                ),
+                (
+                    g_name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: Cow::Borrowed(interns),
+                        origins: Some(Cow::Owned(build_origins(core_fact))),
+                        header: None,
+                    },
+                ),
+            ]);
+            let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name.clone(), 120)]);
+            let stats = run_with_mode(
+                funcs,
+                &mut metadata,
+                &graph,
+                &ItemIndex::new(),
+                &|_, func, _| Some(measurement(func, &metadata_dummy_refs(func, interns))),
+                &|_, _| true,
+                &|_| true,
+                100_000,
+                &sizes,
+                false,
+            );
+            assert_eq!(
+                stats.applied, 0,
+                "live Assert in #[track_caller] callee must decline (forward={forward_in_track_caller})"
+            );
+            assert_eq!(
+                stats
+                    .declined
+                    .get("inline.track-caller-unavailable")
+                    .copied()
+                    .unwrap_or(0),
+                1
+            );
+        }
+
+        // Case 2: Dead constant-folded Assert (e.g. ChunksExact::new(_, 16)) folds in DCE and inlines.
+        {
+            let mut prog = Prog::new();
+            let caller_file = prog.strid("caller.rs");
+            let site_fact = prog.interns.intern_source_fact(SourceFact {
+                file: caller_file,
+                line: 77,
+                col: 5,
+            });
+            let g_str = prog.strid("g_assert");
+            let g = make_assert_callee();
+
+            let mut f_b = FuncBuilder::new(item(1), sig(0));
+            let sixteen = f_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Const(ConstTree::Scalar { bits: 16, bytes: 4 }),
+                I32,
+                OriginId(0),
+            );
+            let call = f_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: item(2),
+                        link_name: g_str,
+                    },
+                    function: None,
+                    args: vec![sixteen],
+                    track_caller: Some(site_fact),
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                I32,
+                OriginId(0),
+            );
+            f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+            let f = f_b.finish();
+
+            prog.add("g_assert", g);
+            prog.add("f", f);
+
+            let interns = &prog.interns;
+            let funcs = &mut prog.funcs;
+            let interns_map: BTreeMap<JsName, &Interns> =
+                funcs.keys().map(|name| (name.clone(), interns)).collect();
+            let graph = callgraph::build(funcs, &interns_map);
+            let f_name = JsName::new("f".to_owned());
+            let g_name = JsName::new("g_assert".to_owned());
+            let mut metadata = BTreeMap::from([
+                (
+                    f_name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: Cow::Borrowed(interns),
+                        origins: Some(Cow::Owned(build_origins(site_fact))),
+                        header: None,
+                    },
+                ),
+                (
+                    g_name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: Cow::Borrowed(interns),
+                        origins: Some(Cow::Owned(build_origins(site_fact))),
+                        header: None,
+                    },
+                ),
+            ]);
+            let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name.clone(), 120)]);
+            let stats = run_with_mode(
+                funcs,
+                &mut metadata,
+                &graph,
+                &ItemIndex::new(),
+                &|_, func, _| Some(measurement(func, &metadata_dummy_refs(func, interns))),
+                &|_, _| true,
+                &|_| true,
+                100_000,
+                &sizes,
+                false,
+            );
+            assert_eq!(
+                stats.applied, 1,
+                "constant-folded dead Assert in #[track_caller] callee should inline (declined={:?})",
+                stats.declined
+            );
+            assert_eq!(prog.calls_in("f"), 0);
+        }
     }
 
     fn metadata_dummy_refs<'a>(func: &Func, interns: &'a Interns) -> Metadata<'a> {

@@ -295,7 +295,11 @@ pub(crate) fn unbox_cells(func: &mut Func, table: &TypeTable) -> bool {
     let mut changed = false;
     for (idx, cell) in func.cells.iter_mut().enumerate() {
         let id = CellId(idx as u32);
-        if cell.boxed && !table.is_indirect(cell.ty) && !cell_rooted.contains(&id) {
+        if cell.boxed
+            && !table.is_indirect(cell.ty)
+            && !table.needs_clone(cell.ty)
+            && !cell_rooted.contains(&id)
+        {
             cell.boxed = false;
             changed = true;
         }
@@ -312,6 +316,21 @@ pub(crate) fn demote_boxed_cells(func: &mut Func, table: &TypeTable) -> bool {
     let promoted = promote_cell_borrows(func, table);
     let unboxed = unbox_cells(func, table);
     promoted || unboxed
+}
+
+fn count_value_uses(func: &Func, target: ValueId) -> usize {
+    func.blocks
+        .iter()
+        .map(|block| {
+            block
+                .ops
+                .iter()
+                .flat_map(|op| op.kind.uses())
+                .chain(block.term.uses())
+                .filter(|v| *v == target)
+                .count()
+        })
+        .sum()
 }
 
 /// Prevents `fuse.rs` / `emit.rs` from treating a mutated cell as a read-only `param_cells`
@@ -331,7 +350,7 @@ fn guard_mutated_param_cells(func: &mut Func, table: &TypeTable) {
         }
     }
 
-    let mut insertions: Vec<(usize, CellId, ValueId)> = Vec::new();
+    let mut insertions: Vec<(usize, CellId, ValueId, bool)> = Vec::new();
     let mut touched = BTreeSet::new();
     for (op_idx, op) in func.blocks[0].ops.iter().enumerate() {
         match &op.kind {
@@ -339,8 +358,13 @@ fn guard_mutated_param_cells(func: &mut Func, table: &TypeTable) {
             OpKind::CellStore { cell, v } if touched.insert(*cell) => {
                 let count = store_counts.get(cell.0 as usize).copied().unwrap_or(0);
                 let cell_ty = func.cells[cell.0 as usize].ty;
-                if count > 1 && func.params.contains(v) && !table.needs_clone(cell_ty) {
-                    insertions.push((op_idx, *cell, *v));
+                if count > 1 && func.params.contains(v) {
+                    if !table.needs_clone(cell_ty) {
+                        insertions.push((op_idx, *cell, *v, false));
+                    } else if !func.cells[cell.0 as usize].boxed && count_value_uses(func, *v) == 1
+                    {
+                        insertions.push((op_idx, *cell, *v, true));
+                    }
                 }
             }
             other => match other {
@@ -367,7 +391,7 @@ fn guard_mutated_param_cells(func: &mut Func, table: &TypeTable) {
     }
 
     // Apply back-to-front so earlier indices stay valid.
-    for (op_idx, _cell, param) in insertions.into_iter().rev() {
+    for (op_idx, _cell, param, needs_move) in insertions.into_iter().rev() {
         let param_def = func.values[param.0 as usize];
         let copy_id = ValueId(func.values.len() as u32);
         func.values.push(param_def);
@@ -375,12 +399,17 @@ fn guard_mutated_param_cells(func: &mut Func, table: &TypeTable) {
         if let OpKind::CellStore { v, .. } = &mut func.blocks[0].ops[op_idx].kind {
             *v = copy_id;
         }
+        let kind = if needs_move {
+            OpKind::Move(param)
+        } else {
+            OpKind::Copy(param)
+        };
         func.blocks[0].ops.insert(
             op_idx,
             Op {
                 result: Some(copy_id),
                 origin,
-                kind: OpKind::Copy(param),
+                kind,
             },
         );
     }
@@ -4403,6 +4432,7 @@ mod tests {
         const MUT_I32: TypeId = TypeId(4);
         const PAIR: TypeId = TypeId(5);
         const REF_PAIR: TypeId = TypeId(6);
+        const MAYBE_PAIR: TypeId = TypeId(7);
 
         fn item(n: u64) -> ItemId {
             ItemId {
@@ -4572,6 +4602,43 @@ mod tests {
                     ..js_facts(REF_PAIR)
                 },
             });
+            let maybe_name = interns.intern_str("MaybeUninitPair");
+            interns.intern_type(TypeDescriptor {
+                id: MAYBE_PAIR,
+                name: Some(maybe_name),
+                kind: TypeKind::Adt {
+                    def: item(98).definition,
+                    form: NominalForm::Union,
+                    args: Vec::new(),
+                    variants: vec![VariantDescriptor {
+                        name: maybe_name,
+                        logical_discr: 0,
+                        physical_tag: None,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(f_a),
+                            ty: PAIR,
+                            offset: 0,
+                        }],
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    }],
+                    niche: None,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(8),
+                    align: Some(4),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    is_indirect: false,
+                    needs_clone: true,
+                    crosses_transparent_union: true,
+                    peeled: PAIR,
+                    ..js_facts(PAIR)
+                },
+            });
             interns
         }
 
@@ -4643,6 +4710,7 @@ mod tests {
             b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(final_v)));
             let mut func = b.finish();
             func.verify(table).expect("valid before");
+            let before = func.clone();
 
             let opts = crate::opts::Opts {
                 optimizer: crate::opts::OptimizerMode::On,
@@ -4652,6 +4720,17 @@ mod tests {
             crate::opt::optimize(&mut func, table, &interns, &opts, &mut stats)
                 .expect("opt succeeds");
             func.verify(table).expect("valid after");
+            let sets = super::ssa::check::argument_sets(&[I32], table).expect("i32 sets");
+            let results = std::collections::BTreeMap::new();
+            for set in &sets {
+                assert!(
+                    matches!(
+                        super::compare(&before, &func, table, &interns, &results, set),
+                        super::Verdict::Agree
+                    ),
+                    "unboxing optimization diverged under JIR interpreter"
+                );
+            }
             assert!(!func.cells[0].boxed, "cell should be unboxed");
             assert!(
                 !func.blocks[0]
@@ -4828,6 +4907,98 @@ mod tests {
             b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(deref)));
             let mut func = b.finish();
             assert!(!super::super::promote_cell_borrows(&mut func, table));
+        }
+
+        #[test]
+        fn refuses_unboxing_for_transparent_needs_clone_and_guards_unboxed_move() {
+            let interns = world();
+            let table = &interns.types;
+            let sig = Signature {
+                arguments: vec![MAYBE_PAIR],
+                result: MAYBE_PAIR,
+                abi: AbiSignature {
+                    parameters: 1,
+                    ..AbiSignature::default()
+                },
+            };
+
+            // 1. `!is_indirect && needs_clone` (`MaybeUninit<Pair>`) must NEVER be unboxed.
+            {
+                let mut b = FuncBuilder::new(item(6), sig.clone());
+                let p = b.param(MAYBE_PAIR, O);
+                let cell = b.cell(MAYBE_PAIR, true, O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(cell), O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellStore { cell, v: p }, O);
+                let replacement = b.op(
+                    FuncBuilder::ENTRY,
+                    OpKind::Const(ConstTree::Aggregate(vec![ConstTree::Aggregate(vec![
+                        ConstTree::Scalar { bits: 99, bytes: 4 },
+                        ConstTree::Scalar {
+                            bits: 100,
+                            bytes: 4,
+                        },
+                    ])])),
+                    MAYBE_PAIR,
+                    O,
+                );
+                b.effect(
+                    FuncBuilder::ENTRY,
+                    OpKind::CellStore {
+                        cell,
+                        v: replacement,
+                    },
+                    O,
+                );
+                let out = b.op(FuncBuilder::ENTRY, OpKind::CellLoad(cell), MAYBE_PAIR, O);
+                b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(out)));
+                let mut func = b.finish();
+                assert!(!super::super::unbox_cells(&mut func, table));
+                assert!(
+                    func.cells[0].boxed,
+                    "transparent needs_clone cell must remain boxed"
+                );
+            }
+
+            // 2. An unboxed mutated `needs_clone` param cell is guarded with `Move(param)`.
+            {
+                let mut b = FuncBuilder::new(item(7), sig);
+                let p = b.param(MAYBE_PAIR, O);
+                let cell = b.cell(MAYBE_PAIR, false, O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(cell), O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellStore { cell, v: p }, O);
+                let replacement = b.op(
+                    FuncBuilder::ENTRY,
+                    OpKind::Const(ConstTree::Aggregate(vec![ConstTree::Aggregate(vec![
+                        ConstTree::Scalar { bits: 99, bytes: 4 },
+                        ConstTree::Scalar {
+                            bits: 100,
+                            bytes: 4,
+                        },
+                    ])])),
+                    MAYBE_PAIR,
+                    O,
+                );
+                b.effect(
+                    FuncBuilder::ENTRY,
+                    OpKind::CellStore {
+                        cell,
+                        v: replacement,
+                    },
+                    O,
+                );
+                let out = b.op(FuncBuilder::ENTRY, OpKind::CellLoad(cell), MAYBE_PAIR, O);
+                b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(out)));
+                let mut func = b.finish();
+                super::super::guard_mutated_param_cells(&mut func, table);
+                func.verify(table).expect("valid after Move guard");
+                assert!(
+                    func.blocks[0]
+                        .ops
+                        .iter()
+                        .any(|op| matches!(op.kind, OpKind::Move(v) if v == p)),
+                    "expected Move(param) guard before initial CellStore"
+                );
+            }
         }
     }
 }

@@ -47,6 +47,15 @@ fn murmur_chunks(bytes: &[u8]) -> u64 {
     acc
 }
 
+fn touch_ref<T>(_: &T) {}
+
+#[inline(never)]
+fn overwrite_param(mut m: core::mem::MaybeUninit<(i32, i32)>) -> (i32, i32) {
+    touch_ref(&m);
+    m = core::mem::MaybeUninit::new((99, 100));
+    unsafe { m.assume_init() }
+}
+
 #[unsafe(no_mangle)]
 pub fn rust_entry() {
     print_u32(max_pair(17, 42));
@@ -55,4 +64,7 @@ pub fn rust_entry() {
     print_i32(step_adds(1, 2, 3, 4));
     let data = [1u8, 2, 3, 4, 10, 20, 30, 40, 99];
     print_u64(murmur_chunks(&data));
+    let pair = overwrite_param(core::mem::MaybeUninit::new((1, 2)));
+    print_i32(pair.0);
+    print_i32(pair.1);
 }
