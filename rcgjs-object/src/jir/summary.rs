@@ -1503,8 +1503,9 @@ impl<'a> Normalizer<'a> {
                 slot: *slot,
                 receiver: *receiver,
             },
-            Callee::Runtime { member } => Callee::Runtime {
+            Callee::Runtime { member, sysroot } => Callee::Runtime {
                 member: self.string(*member),
+                sysroot: *sysroot,
             },
             Callee::Nop => Callee::Nop,
         }

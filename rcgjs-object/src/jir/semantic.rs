@@ -756,7 +756,8 @@ pub enum Callee {
     /// the three header entries), `receiver` the `dyn` type dispatched on.
     Virtual { slot: u32, receiver: TypeId },
     /// A call the lowering emits as `__rt.<member>(...)` with the arguments passed through.
-    Runtime { member: StrId },
+    /// `sysroot` is `true` only when rustc provenance places the foreign item in a sysroot crate.
+    Runtime { member: StrId, sysroot: bool },
     /// A call that lowers to nothing at all: `drop_in_place::<T>` for a `T` whose drop glue is
     /// empty (`ShimKind::DropGlue(_, None)`), which is never emitted as an item, so naming it
     /// would dangle. The arguments are still evaluated for their side effects, of which a place
