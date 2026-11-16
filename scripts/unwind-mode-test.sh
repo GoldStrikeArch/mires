@@ -17,12 +17,18 @@
 #   297  an extern "C" import called only through a function pointer.
 #   298  an extern "C" import declared in a dependency compiled as `--crate-name compiler_builtins`.
 #   299  a dependency's non-generic `extern "C" fn`.
+#   310  Audit F02: an `extern "C" fn` calling an `extern "C"` import across a live guard.
+#   311  2-hop `extern "C" fn` -> `extern "Rust" fn` -> `extern "C"` import across a live guard.
+#   312  `extern "C" fn` calling an `extern "C" fn` pointer or dropping a local whose `Drop`
+#        calls an `extern "C"` import.
+#   313  positive control: mutually recursive pure `extern "C"` cycle (`even`/`odd`), accepted in
+#        both modes and followed by an `extern "C-unwind"` throw verifying `[9, 1]`.
 #
-# 290 and 293-299 lose a destructor on a host exception if they build in unwind mode, so there each
-# must be refused, with messages that contain every fragment `refusal` lists (each names the fix,
-# extern "C-unwind"), and nothing may be linked. In abort mode every fixture compiles and
-# js-cleanup keeps the drop. A fixture that `dependency` names is compiled against that crate,
-# built from examples/unwind-tests/deps/ first.
+# 290, 293-299, and 310-312 lose a destructor on a host exception if they build in unwind mode, so
+# there each must be refused, with messages that contain every fragment `refusal` lists (each names
+# the fix, extern "C-unwind"), and nothing may be linked. In abort mode every fixture compiles and
+# js-cleanup keeps the drop. 313 compiles and passes in both modes. A fixture that `dependency`
+# names is compiled against that crate, built from examples/unwind-tests/deps/ first.
 #
 # Every result is retained. SKIP_BUILD=1 reuses the backend.
 set -euo pipefail
@@ -65,6 +71,90 @@ refusal() {
 		;;
 	298_import_from_sysroot_named_crate)
 		printf '%s\n' '`compiler_builtins::host_note` is a foreign import with the "C" ABI, which cannot unwind' "$fix"
+		;;
+	310_transitive_extern_c_import_rejected)
+		printf '%s\n' '`bridge` has the "C" ABI, which cannot unwind' "$fix"
+		;;
+	311_transitive_c_rust_c_rejected)
+		printf '%s\n' '`bridge` has the "C" ABI, which cannot unwind' "$fix"
+		;;
+	312_transitive_c_fn_ptr_and_drop_rejected)
+		printf '%s\n' '`bridge_fn_ptr` has the "C" ABI, which cannot unwind' \
+			'`bridge_drop` has the "C" ABI, which cannot unwind' \
+			"$fix"
+		;;
+	esac
+}
+
+# Runs the compiled fixture $1 in node; uses scripts/unwind-mode-check.mjs for 290..299 and
+# handles 310..313 locally so this script stays self-contained for the qualification fixtures.
+run_fixture_check() {
+	local program=$1 shim=$2 name=$3
+	case "$name" in
+	310_* | 311_* | 312_* | 313_*)
+		node --input-type=module - "$program" "$shim" "$name" <<'EOF'
+import { readFileSync } from 'node:fs'
+import vm from 'node:vm'
+
+const [program, shim, name] = process.argv.slice(2)
+const fixtures = {
+  '310_transitive_extern_c_import_rejected': { exports: ['audit_entry'], throwNote: -1 },
+  '311_transitive_c_rust_c_rejected': { exports: ['guarded_c_rust_c'], throwNote: -1 },
+  '312_transitive_c_fn_ptr_and_drop_rejected': { exports: ['guarded_c_fn_ptr', 'guarded_c_drop'], throwNote: -1 },
+  '313_transitive_c_pure_cycle_accepted': { exports: ['guarded_pure_cycle'], throwNote: 9 },
+}
+const spec = fixtures[name]
+if (!spec) throw new Error(`unknown fixture ${name}`)
+const context = vm.createContext({ TextDecoder, TextEncoder })
+vm.runInContext(readFileSync(shim, 'utf8'), context)
+const marker = new Error('unwind-mode host marker')
+let notes
+context.__rt.host_note = (value) => {
+  const n = Number(value)
+  notes.push(n)
+  if (n === -1 || (spec.throwNote === 9 && n === 9)) throw marker
+}
+context.__rt.host_throw = (throwing) => {
+  if (throwing) {
+    notes.push(-1)
+    throw marker
+  }
+  notes.push(2)
+}
+vm.runInContext(readFileSync(program, 'utf8'), context)
+const rows = []
+for (const fn of spec.exports) {
+  for (const throwing of [false, true]) {
+    notes = []
+    let returned
+    let caught
+    try {
+      returned = context[fn](throwing)
+    } catch (error) {
+      caught = error
+    }
+    const expected = throwing ? [spec.throwNote, 1] : [2, 1]
+    const passed = JSON.stringify(notes) === JSON.stringify(expected)
+      && (throwing ? caught === marker && returned === undefined : caught === undefined && returned === 3)
+    rows.push({
+      export: fn,
+      row: throwing ? 'host-throw' : 'normal',
+      passed,
+      notes,
+      expected,
+      returned: returned ?? null,
+      thrownIsMarker: caught === marker,
+      thrown: caught === undefined || caught === marker ? null : String(caught),
+    })
+  }
+}
+const report = { program, fixture: name, passed: rows.every((row) => row.passed), rows }
+console.log(JSON.stringify(report))
+if (!report.passed) process.exitCode = 1
+EOF
+		;;
+	*)
+		node "$script_dir/unwind-mode-check.mjs" "$program" "$shim" "$name"
 		;;
 	esac
 }
@@ -130,7 +220,7 @@ for setting in defaults inline-z; do
 				failures=$((failures + 1))
 				continue
 			fi
-			if node "$script_dir/unwind-mode-check.mjs" "$program" "$root/runtime/shim.js" "$name" \
+			if run_fixture_check "$program" "$root/runtime/shim.js" "$name" \
 				>"$program.result.json" 2>"$program.result.log"; then
 				echo "$tag: normal and host-throw rows passed"
 			else
