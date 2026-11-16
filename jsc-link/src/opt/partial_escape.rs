@@ -47,8 +47,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::jir::origin::OriginId;
 use crate::jir::repr::{
-    Carrier, Dominators, Func, FuncBuilder, Op, OpKind, Proj, RAssertMessage, RBlockId, RTerm,
-    Root, ValueId,
+    Carrier, CellId, Dominators, Func, FuncBuilder, Op, OpKind, Proj, RAssertMessage, RBlockId,
+    RTerm, Root, ValueId,
 };
 use crate::jir::semantic::{BinaryOp, CastKind, ConstTree, TypeId};
 use crate::jir::types::{EnumRepr, NominalForm, TypeKind, TypeTable};
@@ -90,6 +90,7 @@ pub fn run(func: &mut Func, table: &TypeTable) -> PeaStats {
         Some((built, params_added)) => {
             *func = built;
             stats.params_added = params_added;
+            unbox_cells(func, table);
         }
         // The rewrite found the function in a shape it does not model. Doing nothing is always
         // correct here, so the function is left exactly as the builder made it.
@@ -99,6 +100,319 @@ pub fn run(func: &mut Func, table: &TypeTable) -> PeaStats {
         }
     }
     stats
+}
+
+fn pointer_pointee(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
+    let peeled = table.peeled(ty);
+    match &table.get(peeled)?.kind {
+        TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
+            Some(*pointee)
+        }
+        _ => None,
+    }
+}
+
+/// Promotes `BorrowView { root: Root::Cell(c), path: [] }` whose only uses (including `Copy`/`Move`
+/// aliases and `[Proj::Deref]` reborrows) are `Deref`/`StoreThrough` into direct `CellLoad(c)` /
+/// `CellStore { cell: c, v }` ops for direct, non-cloned cell types.
+///
+/// Dead `BorrowView` / alias ops are left unused for `dce` to sweep so `Func::verify` stays valid.
+pub(crate) fn promote_cell_borrows(func: &mut Func, table: &TypeTable) -> bool {
+    let mut term_uses: BTreeSet<ValueId> = BTreeSet::new();
+    let mut value_uses: BTreeMap<ValueId, Vec<(usize, usize)>> = BTreeMap::new();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        for v in block.term.uses() {
+            term_uses.insert(v);
+        }
+        for (op_idx, op) in block.ops.iter().enumerate() {
+            for v in op.kind.uses() {
+                let list = value_uses.entry(v).or_default();
+                if list.last().copied() != Some((block_idx, op_idx)) {
+                    list.push((block_idx, op_idx));
+                }
+            }
+        }
+    }
+
+    let mut rewrites: Vec<(usize, usize, OpKind)> = Vec::new();
+    for block in &func.blocks {
+        for op in &block.ops {
+            let OpKind::BorrowView {
+                root: Root::Cell(cell),
+                path,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !path.is_empty() {
+                continue;
+            }
+            let Some(root_val) = op.result else {
+                continue;
+            };
+            let Some(cell_def) = func.cells.get(cell.0 as usize) else {
+                continue;
+            };
+            let cell_ty = cell_def.ty;
+            if table.is_indirect(cell_ty) || table.needs_clone(cell_ty) {
+                continue;
+            }
+            let root_def = func.values[root_val.0 as usize];
+            if root_def.carrier != Carrier::Baseline
+                || pointer_pointee(table, root_def.ty) != Some(cell_ty)
+            {
+                continue;
+            }
+
+            let mut aliases = BTreeSet::new();
+            let mut queue = Vec::new();
+            aliases.insert(root_val);
+            queue.push(root_val);
+            let mut derefs: Vec<(usize, usize)> = Vec::new();
+            let mut stores: Vec<(usize, usize, ValueId)> = Vec::new();
+            let mut ok = true;
+
+            while let Some(ptr) = queue.pop() {
+                if term_uses.contains(&ptr) {
+                    ok = false;
+                    break;
+                }
+                let Some(uses) = value_uses.get(&ptr) else {
+                    continue;
+                };
+                for &(b_idx, o_idx) in uses {
+                    let use_op = &func.blocks[b_idx].ops[o_idx];
+                    match &use_op.kind {
+                        OpKind::Copy(src) | OpKind::Move(src) if *src == ptr => {
+                            if let Some(res) = use_op.result {
+                                let res_def = func.values[res.0 as usize];
+                                if res_def.carrier != Carrier::Baseline
+                                    || pointer_pointee(table, res_def.ty) != Some(cell_ty)
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                                if aliases.insert(res) {
+                                    queue.push(res);
+                                }
+                            }
+                        }
+                        OpKind::BorrowView {
+                            root: Root::Value(src),
+                            path,
+                            ..
+                        } if *src == ptr && path.as_slice() == [Proj::Deref] => {
+                            if let Some(res) = use_op.result {
+                                let res_def = func.values[res.0 as usize];
+                                if res_def.carrier != Carrier::Baseline
+                                    || pointer_pointee(table, res_def.ty) != Some(cell_ty)
+                                {
+                                    ok = false;
+                                    break;
+                                }
+                                if aliases.insert(res) {
+                                    queue.push(res);
+                                }
+                            }
+                        }
+                        OpKind::Deref(p) if *p == ptr => {
+                            if let Some(res) = use_op.result {
+                                let res_def = func.values[res.0 as usize];
+                                if res_def.ty != cell_ty || res_def.carrier != Carrier::Baseline {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            derefs.push((b_idx, o_idx));
+                        }
+                        OpKind::StoreThrough { ptr: p, v } if *p == ptr && *v != ptr => {
+                            let val_def = func.values[v.0 as usize];
+                            if val_def.ty != cell_ty || val_def.carrier != Carrier::Baseline {
+                                ok = false;
+                                break;
+                            }
+                            stores.push((b_idx, o_idx, *v));
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    break;
+                }
+            }
+
+            if !ok || (derefs.is_empty() && stores.is_empty()) {
+                continue;
+            }
+            for (b_idx, o_idx) in derefs {
+                rewrites.push((b_idx, o_idx, OpKind::CellLoad(*cell)));
+            }
+            for (b_idx, o_idx, v) in stores {
+                rewrites.push((b_idx, o_idx, OpKind::CellStore { cell: *cell, v }));
+            }
+        }
+    }
+
+    if rewrites.is_empty() {
+        return false;
+    }
+    for (b_idx, o_idx, kind) in rewrites {
+        func.blocks[b_idx].ops[o_idx].kind = kind;
+    }
+    guard_mutated_param_cells(func, table);
+    true
+}
+
+/// Demotes `CellDef { boxed: true }` to `boxed: false` when zero ops in `func` mention
+/// `Root::Cell(c)` (no `BorrowView`, `RawView`, or `Drop` references the cell).
+pub(crate) fn unbox_cells(func: &mut Func, table: &TypeTable) -> bool {
+    let mut cell_rooted = BTreeSet::new();
+    for block in &func.blocks {
+        for op in &block.ops {
+            match &op.kind {
+                OpKind::BorrowView {
+                    root: Root::Cell(cell),
+                    ..
+                }
+                | OpKind::RawView {
+                    root: Root::Cell(cell),
+                    ..
+                }
+                | OpKind::Drop {
+                    root: Root::Cell(cell),
+                    ..
+                } => {
+                    cell_rooted.insert(*cell);
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut changed = false;
+    for (idx, cell) in func.cells.iter_mut().enumerate() {
+        let id = CellId(idx as u32);
+        if cell.boxed
+            && !table.is_indirect(cell.ty)
+            && !table.needs_clone(cell.ty)
+            && !cell_rooted.contains(&id)
+        {
+            cell.boxed = false;
+            changed = true;
+        }
+    }
+    if changed {
+        guard_mutated_param_cells(func, table);
+    }
+    changed
+}
+
+/// Promotes cell borrows and unboxes cells with no remaining `Root::Cell` references.
+#[allow(dead_code)]
+pub(crate) fn demote_boxed_cells(func: &mut Func, table: &TypeTable) -> bool {
+    let promoted = promote_cell_borrows(func, table);
+    let unboxed = unbox_cells(func, table);
+    promoted || unboxed
+}
+
+fn count_value_uses(func: &Func, target: ValueId) -> usize {
+    func.blocks
+        .iter()
+        .map(|block| {
+            block
+                .ops
+                .iter()
+                .flat_map(|op| op.kind.uses())
+                .chain(block.term.uses())
+                .filter(|v| *v == target)
+                .count()
+        })
+        .sum()
+}
+
+/// Prevents `fuse.rs` / `emit.rs` from treating a mutated cell as a read-only `param_cells`
+/// alias, because `emit.rs` drops `CellStore` writes on unboxed `param_cells`.
+fn guard_mutated_param_cells(func: &mut Func, table: &TypeTable) {
+    if func.blocks.is_empty() {
+        return;
+    }
+    let mut store_counts = vec![0usize; func.cells.len()];
+    for block in &func.blocks {
+        for op in &block.ops {
+            if let OpKind::CellStore { cell, .. } = op.kind {
+                if let Some(slot) = store_counts.get_mut(cell.0 as usize) {
+                    *slot += 1;
+                }
+            }
+        }
+    }
+
+    let mut insertions: Vec<(usize, CellId, ValueId, bool)> = Vec::new();
+    let mut touched = BTreeSet::new();
+    for (op_idx, op) in func.blocks[0].ops.iter().enumerate() {
+        match &op.kind {
+            OpKind::CellAlloc(_) => {}
+            OpKind::CellStore { cell, v } if touched.insert(*cell) => {
+                let count = store_counts.get(cell.0 as usize).copied().unwrap_or(0);
+                let cell_ty = func.cells[cell.0 as usize].ty;
+                if count > 1 && func.params.contains(v) {
+                    if !table.needs_clone(cell_ty) {
+                        insertions.push((op_idx, *cell, *v, false));
+                    } else if !func.cells[cell.0 as usize].boxed && count_value_uses(func, *v) == 1
+                    {
+                        insertions.push((op_idx, *cell, *v, true));
+                    }
+                }
+            }
+            other => match other {
+                OpKind::CellLoad(cell) | OpKind::CellStore { cell, .. } => {
+                    touched.insert(*cell);
+                }
+                OpKind::BorrowView {
+                    root: Root::Cell(cell),
+                    ..
+                }
+                | OpKind::RawView {
+                    root: Root::Cell(cell),
+                    ..
+                }
+                | OpKind::Drop {
+                    root: Root::Cell(cell),
+                    ..
+                } => {
+                    touched.insert(*cell);
+                }
+                _ => {}
+            },
+        }
+    }
+
+    // Apply back-to-front so earlier indices stay valid.
+    for (op_idx, _cell, param, needs_move) in insertions.into_iter().rev() {
+        let param_def = func.values[param.0 as usize];
+        let copy_id = ValueId(func.values.len() as u32);
+        func.values.push(param_def);
+        let origin = func.blocks[0].ops[op_idx].origin;
+        if let OpKind::CellStore { v, .. } = &mut func.blocks[0].ops[op_idx].kind {
+            *v = copy_id;
+        }
+        let kind = if needs_move {
+            OpKind::Move(param)
+        } else {
+            OpKind::Copy(param)
+        };
+        func.blocks[0].ops.insert(
+            op_idx,
+            Op {
+                result: Some(copy_id),
+                origin,
+                kind,
+            },
+        );
+    }
 }
 
 /// A node index into `Analysis::nodes`.
@@ -4095,6 +4409,596 @@ mod tests {
             ssa::check::Verdict::Agree => Verdict::Agree,
             ssa::check::Verdict::Skipped(_) => Verdict::Skipped,
             ssa::check::Verdict::Mismatch(why) => Verdict::Mismatch(why),
+        }
+    }
+
+    mod cell_demotion_tests {
+        use crate::jir::interns::Interns;
+        use crate::jir::origin::OriginId;
+        use crate::jir::repr::{FuncBuilder, OpKind, Proj, RTerm, Root};
+        use crate::jir::semantic::{
+            AbiSignature, BinaryOp, CallSemantic, Callee, ConstTree, DefinitionId, ItemId,
+            Signature, TypeId,
+        };
+        use crate::jir::types::{
+            FieldDescriptor, FieldKey, IntFacts, IntRepr, JsFacts, LayoutFacts, NominalForm,
+            PointerForm, TypeDescriptor, TypeKind, TypeMeta, VariantDescriptor,
+        };
+
+        const O: OriginId = OriginId(0);
+        const I32: TypeId = TypeId(1);
+        const BOOL: TypeId = TypeId(2);
+        const REF_I32: TypeId = TypeId(3);
+        const MUT_I32: TypeId = TypeId(4);
+        const PAIR: TypeId = TypeId(5);
+        const REF_PAIR: TypeId = TypeId(6);
+        const MAYBE_PAIR: TypeId = TypeId(7);
+
+        fn item(n: u64) -> ItemId {
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: n,
+                },
+                instantiation: 0,
+            }
+        }
+
+        fn js_facts(peeled: TypeId) -> JsFacts {
+            JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            }
+        }
+
+        fn world() -> Interns {
+            let mut interns = Interns::new();
+            let f_a = interns.intern_str("a");
+            let f_b = interns.intern_str("b");
+            let pair_name = interns.intern_str("Pair");
+            interns.intern_type(TypeDescriptor {
+                id: I32,
+                name: None,
+                kind: TypeKind::Integer {
+                    signed: true,
+                    bits: 32,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(4),
+                    align: Some(4),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    int: Some(IntFacts {
+                        signed: true,
+                        bits: 32,
+                        repr: IntRepr::Number,
+                    }),
+                    ..js_facts(I32)
+                },
+            });
+            interns.intern_type(TypeDescriptor {
+                id: BOOL,
+                name: None,
+                kind: TypeKind::Bool,
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(1),
+                    align: Some(1),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: js_facts(BOOL),
+            });
+            interns.intern_type(TypeDescriptor {
+                id: REF_I32,
+                name: None,
+                kind: TypeKind::Reference {
+                    pointee: I32,
+                    mutable: false,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(4),
+                    align: Some(4),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    pointer_form: Some(PointerForm::Slot),
+                    ..js_facts(REF_I32)
+                },
+            });
+            interns.intern_type(TypeDescriptor {
+                id: MUT_I32,
+                name: None,
+                kind: TypeKind::Reference {
+                    pointee: I32,
+                    mutable: true,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(4),
+                    align: Some(4),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    pointer_form: Some(PointerForm::Slot),
+                    ..js_facts(MUT_I32)
+                },
+            });
+            let fields = vec![
+                FieldDescriptor {
+                    key: FieldKey::Name(f_a),
+                    ty: I32,
+                    offset: 0,
+                },
+                FieldDescriptor {
+                    key: FieldKey::Name(f_b),
+                    ty: I32,
+                    offset: 4,
+                },
+            ];
+            interns.intern_type(TypeDescriptor {
+                id: PAIR,
+                name: Some(pair_name),
+                kind: TypeKind::Adt {
+                    def: item(99).definition,
+                    form: NominalForm::Struct,
+                    args: Vec::new(),
+                    variants: vec![VariantDescriptor {
+                        name: pair_name,
+                        logical_discr: 0,
+                        physical_tag: None,
+                        fields: fields.clone(),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    }],
+                    niche: None,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(8),
+                    align: Some(4),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    is_indirect: true,
+                    needs_clone: true,
+                    fields,
+                    ..js_facts(PAIR)
+                },
+            });
+            interns.intern_type(TypeDescriptor {
+                id: REF_PAIR,
+                name: None,
+                kind: TypeKind::Reference {
+                    pointee: PAIR,
+                    mutable: true,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(4),
+                    align: Some(4),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    pointer_form: Some(PointerForm::Thin),
+                    ..js_facts(REF_PAIR)
+                },
+            });
+            let maybe_name = interns.intern_str("MaybeUninitPair");
+            interns.intern_type(TypeDescriptor {
+                id: MAYBE_PAIR,
+                name: Some(maybe_name),
+                kind: TypeKind::Adt {
+                    def: item(98).definition,
+                    form: NominalForm::Union,
+                    args: Vec::new(),
+                    variants: vec![VariantDescriptor {
+                        name: maybe_name,
+                        logical_discr: 0,
+                        physical_tag: None,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(f_a),
+                            ty: PAIR,
+                            offset: 0,
+                        }],
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    }],
+                    niche: None,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    size: Some(8),
+                    align: Some(4),
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    is_indirect: false,
+                    needs_clone: true,
+                    crosses_transparent_union: true,
+                    peeled: PAIR,
+                    ..js_facts(PAIR)
+                },
+            });
+            interns
+        }
+
+        #[test]
+        fn promotes_cell_borrow_copy_and_reborrow_and_unboxes_mutated_param() {
+            let interns = world();
+            let table = &interns.types;
+            let sig = Signature {
+                arguments: vec![I32],
+                result: I32,
+                abi: AbiSignature {
+                    parameters: 1,
+                    ..AbiSignature::default()
+                },
+            };
+            let mut b = FuncBuilder::new(item(1), sig);
+            let a = b.param(I32, O);
+            let cell = b.cell(I32, true, O);
+            b.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(cell), O);
+            b.effect(FuncBuilder::ENTRY, OpKind::CellStore { cell, v: a }, O);
+            let r = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::BorrowView {
+                    root: Root::Cell(cell),
+                    path: Vec::new(),
+                    mutable: true,
+                },
+                MUT_I32,
+                O,
+            );
+            let r_copy = b.op(FuncBuilder::ENTRY, OpKind::Copy(r), MUT_I32, O);
+            let r_reborrow = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::BorrowView {
+                    root: Root::Value(r),
+                    path: vec![Proj::Deref],
+                    mutable: true,
+                },
+                MUT_I32,
+                O,
+            );
+            let old = b.op(FuncBuilder::ENTRY, OpKind::Deref(r_copy), I32, O);
+            let one = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+                I32,
+                O,
+            );
+            let next = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Binary {
+                    op: BinaryOp::Add,
+                    l: old,
+                    r: one,
+                    ty: I32,
+                },
+                I32,
+                O,
+            );
+            b.effect(
+                FuncBuilder::ENTRY,
+                OpKind::StoreThrough {
+                    ptr: r_reborrow,
+                    v: next,
+                },
+                O,
+            );
+            let final_v = b.op(FuncBuilder::ENTRY, OpKind::CellLoad(cell), I32, O);
+            b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(final_v)));
+            let mut func = b.finish();
+            func.verify(table).expect("valid before");
+            let before = func.clone();
+
+            let opts = crate::opts::Opts {
+                optimizer: crate::opts::OptimizerMode::On,
+                ..crate::opts::Opts::default()
+            };
+            let mut stats = crate::opt::OptStats::default();
+            crate::opt::optimize(&mut func, table, &interns, &opts, &mut stats)
+                .expect("opt succeeds");
+            func.verify(table).expect("valid after");
+            let sets = super::ssa::check::argument_sets(&[I32], table).expect("i32 sets");
+            let results = std::collections::BTreeMap::new();
+            for set in &sets {
+                assert!(
+                    matches!(
+                        super::compare(&before, &func, table, &interns, &results, set),
+                        super::Verdict::Agree
+                    ),
+                    "unboxing optimization diverged under JIR interpreter"
+                );
+            }
+            assert!(!func.cells[0].boxed, "cell should be unboxed");
+            assert!(
+                !func.blocks[0]
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::BorrowView { .. })),
+                "dead BorrowView ops should be removed"
+            );
+            // Guard ensures mutated param cell is not dropped by `emit.rs` `param_cells`.
+            let stores = func.blocks[0]
+                .ops
+                .iter()
+                .filter(|op| matches!(op.kind, OpKind::CellStore { .. }))
+                .count();
+            assert_eq!(stores, 2);
+            let first_store = func.blocks[0]
+                .ops
+                .iter()
+                .find_map(|op| match op.kind {
+                    OpKind::CellStore { v, .. } => Some(v),
+                    _ => None,
+                })
+                .expect("initial store");
+            assert!(
+                !func.params.contains(&first_store),
+                "mutated param cell's initial store must use Copy(param) so param_cells doesn't drop the second store"
+            );
+        }
+
+        #[test]
+        fn refuses_promotion_when_borrow_escapes_to_call_or_raw_view_or_eq() {
+            let mut interns = world();
+            let sink_str = interns.intern_str("sink");
+            let table = &interns.types;
+            let sig = Signature {
+                arguments: vec![I32],
+                result: I32,
+                abi: AbiSignature {
+                    parameters: 1,
+                    ..AbiSignature::default()
+                },
+            };
+
+            // 1. Escapes via Call
+            {
+                let mut b = FuncBuilder::new(item(2), sig.clone());
+                let a = b.param(I32, O);
+                let cell = b.cell(I32, true, O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(cell), O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellStore { cell, v: a }, O);
+                let r = b.op(
+                    FuncBuilder::ENTRY,
+                    OpKind::BorrowView {
+                        root: Root::Cell(cell),
+                        path: Vec::new(),
+                        mutable: false,
+                    },
+                    REF_I32,
+                    O,
+                );
+                let _v = b.op(FuncBuilder::ENTRY, OpKind::Deref(r), I32, O);
+                let res = b.op(
+                    FuncBuilder::ENTRY,
+                    OpKind::Call {
+                        callee: Callee::Direct {
+                            item: item(9),
+                            link_name: sink_str,
+                        },
+                        function: None,
+                        args: vec![r],
+                        track_caller: None,
+                        semantic: CallSemantic::Ordinary,
+                        host: None,
+                    },
+                    I32,
+                    O,
+                );
+                b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(res)));
+                let mut func = b.finish();
+                assert!(!super::super::promote_cell_borrows(&mut func, table));
+                assert!(!super::super::unbox_cells(&mut func, table));
+                assert!(func.cells[0].boxed);
+            }
+
+            // 2. Escapes via BinaryOp::Eq
+            {
+                let mut b = FuncBuilder::new(item(3), sig.clone());
+                let a = b.param(I32, O);
+                let cell = b.cell(I32, true, O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(cell), O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellStore { cell, v: a }, O);
+                let r = b.op(
+                    FuncBuilder::ENTRY,
+                    OpKind::BorrowView {
+                        root: Root::Cell(cell),
+                        path: Vec::new(),
+                        mutable: false,
+                    },
+                    REF_I32,
+                    O,
+                );
+                let _cmp = b.op(
+                    FuncBuilder::ENTRY,
+                    OpKind::Binary {
+                        op: BinaryOp::Eq,
+                        l: r,
+                        r,
+                        ty: REF_I32,
+                    },
+                    BOOL,
+                    O,
+                );
+                let v = b.op(FuncBuilder::ENTRY, OpKind::Deref(r), I32, O);
+                b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(v)));
+                let mut func = b.finish();
+                assert!(!super::super::promote_cell_borrows(&mut func, table));
+                assert!(func.cells[0].boxed);
+            }
+
+            // 3. RawView on Cell prevents unboxing
+            {
+                let mut b = FuncBuilder::new(item(4), sig);
+                let a = b.param(I32, O);
+                let cell = b.cell(I32, true, O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(cell), O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellStore { cell, v: a }, O);
+                let raw = b.op(
+                    FuncBuilder::ENTRY,
+                    OpKind::RawView {
+                        root: Root::Cell(cell),
+                        path: Vec::new(),
+                        mutable: false,
+                    },
+                    REF_I32,
+                    O,
+                );
+                let v = b.op(FuncBuilder::ENTRY, OpKind::Deref(raw), I32, O);
+                b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(v)));
+                let mut func = b.finish();
+                assert!(!super::super::promote_cell_borrows(&mut func, table));
+                assert!(!super::super::unbox_cells(&mut func, table));
+                assert!(func.cells[0].boxed);
+            }
+        }
+
+        #[test]
+        fn refuses_promotion_for_indirect_aggregate_cell() {
+            let interns = world();
+            let table = &interns.types;
+            let sig = Signature {
+                arguments: vec![PAIR],
+                result: PAIR,
+                abi: AbiSignature {
+                    parameters: 1,
+                    ..AbiSignature::default()
+                },
+            };
+            let mut b = FuncBuilder::new(item(5), sig);
+            let p = b.param(PAIR, O);
+            let cell = b.cell(PAIR, false, O);
+            b.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(cell), O);
+            b.effect(FuncBuilder::ENTRY, OpKind::CellStore { cell, v: p }, O);
+            let r = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::BorrowView {
+                    root: Root::Cell(cell),
+                    path: Vec::new(),
+                    mutable: true,
+                },
+                REF_PAIR,
+                O,
+            );
+            let deref = b.op(FuncBuilder::ENTRY, OpKind::Deref(r), PAIR, O);
+            b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(deref)));
+            let mut func = b.finish();
+            assert!(!super::super::promote_cell_borrows(&mut func, table));
+        }
+
+        #[test]
+        fn refuses_unboxing_for_transparent_needs_clone_and_guards_unboxed_move() {
+            let interns = world();
+            let table = &interns.types;
+            let sig = Signature {
+                arguments: vec![MAYBE_PAIR],
+                result: MAYBE_PAIR,
+                abi: AbiSignature {
+                    parameters: 1,
+                    ..AbiSignature::default()
+                },
+            };
+
+            // 1. `!is_indirect && needs_clone` (`MaybeUninit<Pair>`) must NEVER be unboxed.
+            {
+                let mut b = FuncBuilder::new(item(6), sig.clone());
+                let p = b.param(MAYBE_PAIR, O);
+                let cell = b.cell(MAYBE_PAIR, true, O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(cell), O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellStore { cell, v: p }, O);
+                let replacement = b.op(
+                    FuncBuilder::ENTRY,
+                    OpKind::Const(ConstTree::Aggregate(vec![ConstTree::Aggregate(vec![
+                        ConstTree::Scalar { bits: 99, bytes: 4 },
+                        ConstTree::Scalar {
+                            bits: 100,
+                            bytes: 4,
+                        },
+                    ])])),
+                    MAYBE_PAIR,
+                    O,
+                );
+                b.effect(
+                    FuncBuilder::ENTRY,
+                    OpKind::CellStore {
+                        cell,
+                        v: replacement,
+                    },
+                    O,
+                );
+                let out = b.op(FuncBuilder::ENTRY, OpKind::CellLoad(cell), MAYBE_PAIR, O);
+                b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(out)));
+                let mut func = b.finish();
+                assert!(!super::super::unbox_cells(&mut func, table));
+                assert!(
+                    func.cells[0].boxed,
+                    "transparent needs_clone cell must remain boxed"
+                );
+            }
+
+            // 2. An unboxed mutated `needs_clone` param cell is guarded with `Move(param)`.
+            {
+                let mut b = FuncBuilder::new(item(7), sig);
+                let p = b.param(MAYBE_PAIR, O);
+                let cell = b.cell(MAYBE_PAIR, false, O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(cell), O);
+                b.effect(FuncBuilder::ENTRY, OpKind::CellStore { cell, v: p }, O);
+                let replacement = b.op(
+                    FuncBuilder::ENTRY,
+                    OpKind::Const(ConstTree::Aggregate(vec![ConstTree::Aggregate(vec![
+                        ConstTree::Scalar { bits: 99, bytes: 4 },
+                        ConstTree::Scalar {
+                            bits: 100,
+                            bytes: 4,
+                        },
+                    ])])),
+                    MAYBE_PAIR,
+                    O,
+                );
+                b.effect(
+                    FuncBuilder::ENTRY,
+                    OpKind::CellStore {
+                        cell,
+                        v: replacement,
+                    },
+                    O,
+                );
+                let out = b.op(FuncBuilder::ENTRY, OpKind::CellLoad(cell), MAYBE_PAIR, O);
+                b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(out)));
+                let mut func = b.finish();
+                super::super::guard_mutated_param_cells(&mut func, table);
+                func.verify(table).expect("valid after Move guard");
+                assert!(
+                    func.blocks[0]
+                        .ops
+                        .iter()
+                        .any(|op| matches!(op.kind, OpKind::Move(v) if v == p)),
+                    "expected Move(param) guard before initial CellStore"
+                );
+            }
         }
     }
 }

@@ -246,6 +246,11 @@ fn run(
     // per-field parameters are deleted wherever nothing varies.
     for _ in 0..3 {
         let mut round = false;
+        if runs_pea && super::partial_escape::promote_cell_borrows(func, table) {
+            stats.sroa_changed = true;
+            round = true;
+            verified(func, table, "sroa")?;
+        }
         if runs_dce {
             let changed = dce::run_with(func, table, &dce_options, &mut witnesses);
             stats.ast_dce_changed |= changed;
@@ -266,6 +271,10 @@ fn run(
                 witnesses.push(Witness::Scalarize {
                     scalarized: pea.scalarized,
                 });
+                verified(func, table, "sroa")?;
+            } else if super::partial_escape::unbox_cells(func, table) {
+                stats.sroa_changed = true;
+                round = true;
                 verified(func, table, "sroa")?;
             }
         }
@@ -327,6 +336,24 @@ fn run(
             verified(func, table, "ast-dce")?;
         }
         checked(&mut cleanup, func, table, stats, inject_fault)?;
+    }
+    if runs_pea {
+        if super::partial_escape::promote_cell_borrows(func, table) {
+            stats.sroa_changed = true;
+            verified(func, table, "sroa")?;
+            if runs_dce {
+                let mut cleanup: Vec<Witness> = Vec::new();
+                if dce::run_with(func, table, &dce_options, &mut cleanup) {
+                    stats.ast_dce_changed = true;
+                    verified(func, table, "ast-dce")?;
+                }
+                checked(&mut cleanup, func, table, stats, inject_fault)?;
+            }
+        }
+        if super::partial_escape::unbox_cells(func, table) {
+            stats.sroa_changed = true;
+            verified(func, table, "sroa")?;
+        }
     }
     Ok(())
 }

@@ -40,12 +40,12 @@ use crate::analysis::callgraph::Callgraph;
 use crate::item::JsName;
 use crate::jir::decline::Decline;
 use crate::jir::interns::Interns;
-use crate::jir::origin::SourceFactId;
+use crate::jir::origin::{OriginId, SourceFactId};
 use crate::jir::repr::{
     CellId, Func, Op, OpKind, Proj, RAssertMessage, RBlock, RBlockId, RTerm, Root, ValueId,
 };
 use crate::jir::semantic::{
-    CallSemantic, Callee, ConstTree, DropGlue, GlobalReference, HostPayload,
+    BinaryOp, CallSemantic, Callee, ConstTree, DropGlue, GlobalReference, HostPayload, TypeId,
 };
 use crate::jir::types::{NominalForm, TypeKind, TypeTable};
 use crate::lower::js::host::ItemIndex;
@@ -231,6 +231,7 @@ pub(crate) fn run_with_mode(
                 &site.callee,
                 &current,
                 site,
+                funcs,
                 &sizes,
                 sole_referrer,
                 &current_metadata.interns.types,
@@ -250,6 +251,7 @@ pub(crate) fn run_with_mode(
                 continue;
             };
             let callee_bytes = sizes.get(&site.callee).copied().unwrap_or(u64::MAX);
+            let trivial_leaf = trivial_pure_leaf(callee_func);
             let iterator_step = metadata
                 .get(&site.callee)
                 .is_some_and(|meta| bounded_iterator_step(callee_func, &meta.interns.types));
@@ -264,21 +266,22 @@ pub(crate) fn run_with_mode(
                     } => (args.len(), *track_caller),
                     _ => continue,
                 };
-            let (mut callee_func, imported) =
-                match current_metadata.import(provider, callee_func, origin) {
-                    Ok(value) => value,
-                    Err(reason) => {
-                        stats.decline(reason);
-                        continue;
-                    }
-                };
-            if callee_func.sig.abi.caller_location && callee_func.params.len() == site_args_len + 1
-            {
-                if let Some(site_fact) = site_track_caller {
-                    rewrite_forwarded_track_caller(&mut callee_func, site_fact, items);
+            let (callee_func, imported, sentinel_assert_origin) = match prepare_callee_for_site(
+                &current_metadata,
+                provider,
+                callee_func,
+                origin,
+                site_args_len,
+                current.sig.abi.caller_location,
+                site_track_caller,
+                items,
+            ) {
+                Ok(value) => value,
+                Err(reason) => {
+                    stats.decline(reason);
+                    continue;
                 }
-                strip_unused_last_param(&mut callee_func);
-            }
+            };
             let table = &imported.interns.types;
             let backup = current.clone();
             splice(&mut current, site.block, site.op, &callee_func);
@@ -291,29 +294,11 @@ pub(crate) fn run_with_mode(
                 continue;
             }
             // Clean a clone so the remaining collected sites keep their block/op positions.
-            // Price and retain the same verified shape, including the merges and DCE cleanup.
+            // Price and retain the same verified shape, including the merges, cell unboxing, and DCE cleanup.
             let mut candidate = current.clone();
-            collapse_forwarders(&mut candidate);
-            fuse_straight_lines(&mut candidate);
-            let dce_opts = crate::opt::dce::Options {
-                no_constant_params: false,
-                no_deletions: false,
-                pure_call: None,
-            };
-            let mut candidate_dce = candidate.clone();
-            if crate::opt::dce::run_with(&mut candidate_dce, table, &dce_opts, &mut Vec::new())
-                && candidate_dce
-                    .verify_carriers(table, observed_carriers(&candidate_dce))
-                    .is_ok()
-            {
-                candidate = candidate_dce;
-            }
-            if candidate
-                .verify_carriers(table, observed_carriers(&candidate))
-                .is_err()
-            {
+            if let Err(reason) = clean_candidate(&mut candidate, table, sentinel_assert_origin) {
                 current = backup;
-                stats.decline("inline.cleanup-invalid");
+                stats.decline(reason);
                 continue;
             }
             let Some((after, refs)) = measure(caller, &candidate, &imported) else {
@@ -345,7 +330,17 @@ pub(crate) fn run_with_mode(
             } else {
                 0
             };
-            let charge = if net <= 0 {
+            let trivial_leaf_slack = if !site.host_boundary
+                && trivial_leaf
+                && matches!(criterion, Criterion::SmallCallee | Criterion::SoleCaller)
+                && net > 0
+                && net <= 16
+            {
+                net
+            } else {
+                0
+            };
+            let charge = if net <= 0 || trivial_leaf_slack > 0 {
                 0
             } else if tiny_accessor_slack > 0 {
                 tiny_accessor_slack
@@ -360,10 +355,12 @@ pub(crate) fn run_with_mode(
                     site.callee,
                 );
             }
-            // Only loop virtualization (or <=2B tiny accessors) may spend net growth. Other sites
-            // must repay their caller growth through local cleanup or sole-callee removal.
-            let growth_allowed =
-                matches!(criterion, Criterion::LoopVirtualizable) || tiny_accessor_slack > 0;
+            // Only loop virtualization (or <=2B tiny accessors, or <=16B trivial pure leaves) may spend
+            // temporary net growth. Other sites must repay their caller growth through local cleanup or
+            // sole-callee removal.
+            let growth_allowed = matches!(criterion, Criterion::LoopVirtualizable)
+                || tiny_accessor_slack > 0
+                || trivial_leaf_slack > 0;
             // A small loop helper may expose enough scalar replacement to repay a modest
             // pre-cleanup growth in the later per-item pipeline. Bound both the duplicated body
             // and that temporary growth; this is the iterator-state case, not a general license
@@ -408,6 +405,175 @@ pub(crate) fn run_with_mode(
                 u32::from(!std::ptr::eq(current_metadata.universe, provider.universe));
             current_metadata = imported;
             accepted = Some(candidate);
+        }
+
+        // Multi-site sole-caller batching: when a callee has K > 1 sites in its sole referrer
+        // and intermediate sites left `removed == 0` with `net > 0`, try splicing all remaining
+        // sites to that callee as one atomic transaction.
+        let mut sole_site_counts: BTreeMap<JsName, usize> = BTreeMap::new();
+        for site in &sites {
+            if !site.host_boundary && sole_referrer(&site.callee, caller) {
+                *sole_site_counts.entry(site.callee.clone()).or_default() += 1;
+            }
+        }
+        let batch_callees: Vec<JsName> = sole_site_counts
+            .into_iter()
+            .filter_map(|(callee, count)| (count > 1).then_some(callee))
+            .collect();
+        if !batch_callees.is_empty() {
+            if let Some(clean) = accepted.as_ref() {
+                current = clean.clone();
+            }
+            for callee in batch_callees {
+                let mut throwaway_stats = InlineStats::default();
+                let remaining: Vec<Site> = collect_sites(
+                    caller,
+                    &current,
+                    &current_metadata,
+                    metadata,
+                    funcs,
+                    graph,
+                    items,
+                    sole_referrer,
+                    zombie_free,
+                    allow_std_post_repr,
+                    &mut throwaway_stats,
+                )
+                .into_iter()
+                .filter(|site| site.callee == callee)
+                .collect();
+                if remaining.is_empty()
+                    || remaining.iter().any(|site| site.host_boundary)
+                    || count_item_refs(&current, &current_metadata.interns, callee.as_str())
+                        != remaining.len()
+                {
+                    continue;
+                }
+                let Some(Ok(callee_func)) = funcs.get(&callee) else {
+                    continue;
+                };
+                let Some(provider) = metadata.get(&callee) else {
+                    continue;
+                };
+                let callee_bytes = sizes.get(&callee).copied().unwrap_or(u64::MAX);
+                let batch_backup = current.clone();
+                let batch_meta = current_metadata.clone();
+                let batch_bytes = bytes;
+                let mut sentinel_origin: Option<OriginId> = None;
+                let mut batch_err: Option<&'static str> = None;
+
+                for site in remaining.iter().rev() {
+                    let origin = current.blocks[site.block].ops[site.op].origin;
+                    let (site_args_len, site_track_caller) =
+                        match &current.blocks[site.block].ops[site.op].kind {
+                            OpKind::Call {
+                                args, track_caller, ..
+                            } => (args.len(), *track_caller),
+                            _ => {
+                                batch_err = Some("inline.splice-invalid");
+                                break;
+                            }
+                        };
+                    let (prepared, next_meta, site_sentinel) = match prepare_callee_for_site(
+                        &current_metadata,
+                        provider,
+                        callee_func,
+                        origin,
+                        site_args_len,
+                        current.sig.abi.caller_location,
+                        site_track_caller,
+                        items,
+                    ) {
+                        Ok(value) => value,
+                        Err(reason) => {
+                            batch_err = Some(reason);
+                            break;
+                        }
+                    };
+                    if sentinel_origin.is_none() {
+                        sentinel_origin = site_sentinel;
+                    }
+                    splice(&mut current, site.block, site.op, &prepared);
+                    if current
+                        .verify_carriers(&next_meta.interns.types, observed_carriers(&current))
+                        .is_err()
+                    {
+                        batch_err = Some("inline.splice-invalid");
+                        break;
+                    }
+                    current_metadata = next_meta;
+                }
+                if let Some(reason) = batch_err {
+                    current = batch_backup;
+                    current_metadata = batch_meta;
+                    bytes = batch_bytes;
+                    stats.decline(reason);
+                    continue;
+                }
+
+                let mut candidate = current.clone();
+                let table = &current_metadata.interns.types;
+                if let Err(reason) = clean_candidate(&mut candidate, table, sentinel_origin) {
+                    current = batch_backup;
+                    current_metadata = batch_meta;
+                    bytes = batch_bytes;
+                    stats.decline(reason);
+                    continue;
+                }
+                let Some((after, refs)) = measure(caller, &candidate, &current_metadata) else {
+                    current = batch_backup;
+                    current_metadata = batch_meta;
+                    bytes = batch_bytes;
+                    stats.decline("inline.cost-unavailable");
+                    continue;
+                };
+                let delta = after as i64 - batch_bytes as i64;
+                let removed = if !refs.contains(&callee) {
+                    callee_bytes
+                } else {
+                    0
+                };
+                let net = delta.saturating_sub(removed.min(i64::MAX as u64) as i64);
+                let size_limit = limit.max(16_384);
+                if std::env::var("RCGJS_O_DEBUG_FUNC")
+                    .is_ok_and(|filter| caller.as_str().contains(&filter))
+                {
+                    eprintln!(
+                        "inline-batch {caller:?} <- {callee:?} ({} sites): before={batch_bytes}, after={after}, callee={callee_bytes}, delta={delta}, removed={removed}, net={net}, limit={size_limit}",
+                        remaining.len(),
+                    );
+                }
+                if net > 0 || after > size_limit || after > batch_bytes.saturating_add(callee_bytes)
+                {
+                    current = batch_backup;
+                    current_metadata = batch_meta;
+                    bytes = batch_bytes;
+                    stats.declined_budget += 1;
+                    stats.decline("inline.cost-rejected");
+                    continue;
+                }
+                let record = Witness::Inline {
+                    callee_bytes: callee_bytes.min(u32::MAX as u64) as u32,
+                    limit: size_limit.min(u32::MAX as u64) as u32,
+                    bytes_before: batch_bytes.min(u32::MAX as u64) as u32,
+                    bytes_after: after.min(u32::MAX as u64) as u32,
+                };
+                stats.witnesses_recorded += 1;
+                if witness::enabled() && record.check(&candidate, table).is_err() {
+                    stats.witnesses_failed += 1;
+                    current = batch_backup;
+                    current_metadata = batch_meta;
+                    bytes = batch_bytes;
+                    stats.decline("inline.witness-invalid");
+                    continue;
+                }
+                bytes = after;
+                applied_here += remaining.len() as u32;
+                stats.cross_object_applied += (remaining.len() as u32)
+                    * u32::from(!std::ptr::eq(batch_meta.universe, provider.universe));
+                current = candidate.clone();
+                accepted = Some(candidate);
+            }
         }
         if let Some(current) = accepted {
             stats.applied += applied_here;
@@ -486,6 +652,212 @@ fn bounded_iterator_step(func: &Func, table: &TypeTable) -> bool {
         })
 }
 
+const SENTINEL_ASSERT_ORIGIN: OriginId = OriginId(u32::MAX - 1);
+
+/// Overflow asserts for wrapping/checked integer ops are skipped by `lower::js::emit`, whereas
+/// every other `OpKind::Assert` resolves its panic lang item from the caller's `summary.deps`.
+fn is_optional_assert(kind: &OpKind) -> bool {
+    matches!(
+        kind,
+        OpKind::Assert {
+            msg: RAssertMessage::Overflow {
+                op: BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Shl | BinaryOp::Shr,
+                ..
+            },
+            ..
+        }
+    )
+}
+
+/// Prepares an imported callee for splicing at a call site, resolving any `#[track_caller]`
+/// location substitution and tagging non-optional callee `Assert` ops with a sentinel origin so
+/// any assert surviving DCE rejects inlining (because `lower::js::emit` resolves panic lang items
+/// from the caller's `summary.deps` and would otherwise fall back to `js_abort`).
+#[allow(clippy::too_many_arguments)]
+fn prepare_callee_for_site<'a>(
+    current_metadata: &Metadata<'a>,
+    provider: &Metadata<'a>,
+    callee_func: &Func,
+    origin: OriginId,
+    site_args_len: usize,
+    _caller_caller_location: bool,
+    site_track_caller: Option<SourceFactId>,
+    items: &ItemIndex,
+) -> Result<(Func, Metadata<'a>, Option<OriginId>), &'static str> {
+    let (mut callee_func, imported) = current_metadata.import(provider, callee_func, origin)?;
+    let mut sentinel_assert_origin = None;
+    if callee_func.sig.abi.caller_location && callee_func.params.len() == site_args_len + 1 {
+        for block in &mut callee_func.blocks {
+            for op in &mut block.ops {
+                if matches!(op.kind, OpKind::Assert { .. }) && !is_optional_assert(&op.kind) {
+                    op.origin = SENTINEL_ASSERT_ORIGIN;
+                    sentinel_assert_origin = Some(SENTINEL_ASSERT_ORIGIN);
+                }
+            }
+        }
+        if let Some(site_fact) = site_track_caller {
+            rewrite_forwarded_track_caller(&mut callee_func, site_fact, items);
+            if !unused_caller_location(&callee_func) {
+                bind_caller_location_param(&mut callee_func, site_fact, &imported.interns, origin)?;
+            }
+        }
+        strip_unused_last_param(&mut callee_func);
+    }
+    Ok((callee_func, imported, sentinel_assert_origin))
+}
+
+fn clean_candidate(
+    candidate: &mut Func,
+    table: &TypeTable,
+    sentinel_assert_origin: Option<OriginId>,
+) -> Result<(), &'static str> {
+    collapse_forwarders(candidate);
+    fuse_straight_lines(candidate);
+    super::partial_escape::promote_cell_borrows(candidate, table);
+    let dce_opts = crate::opt::dce::Options {
+        no_constant_params: false,
+        no_deletions: false,
+        pure_call: None,
+    };
+    let mut candidate_dce = candidate.clone();
+    if crate::opt::dce::run_with(&mut candidate_dce, table, &dce_opts, &mut Vec::new())
+        && candidate_dce
+            .verify_carriers(table, observed_carriers(&candidate_dce))
+            .is_ok()
+    {
+        *candidate = candidate_dce;
+    }
+    super::partial_escape::unbox_cells(candidate, table);
+    if let Some(sentinel) = sentinel_assert_origin {
+        if candidate.blocks.iter().any(|block| {
+            block
+                .ops
+                .iter()
+                .any(|op| matches!(op.kind, OpKind::Assert { .. }) && op.origin == sentinel)
+        }) {
+            return Err("inline.track-caller-unavailable");
+        }
+    }
+    candidate
+        .verify_carriers(table, observed_carriers(candidate))
+        .map_err(|_| "inline.cleanup-invalid")
+}
+
+/// Whether `func` is a trivial single-block pure scalar wrapper (`<= 3` pure ops, no calls,
+/// no invokes, no aggregates, no asserts) whose inlining reduces to inline JS operators.
+fn trivial_pure_leaf(func: &Func) -> bool {
+    if func.blocks.len() != 1 || func.has_invoke() {
+        return false;
+    }
+    let block = &func.blocks[0];
+    if block.ops.len() > 3 || !matches!(block.term, RTerm::Return(_)) {
+        return false;
+    }
+    block.ops.iter().all(|op| {
+        matches!(
+            op.kind,
+            OpKind::Copy(_)
+                | OpKind::Move(_)
+                | OpKind::Const(ConstTree::Unit | ConstTree::Scalar { .. })
+                | OpKind::Binary { .. }
+                | OpKind::Unary { .. }
+                | OpKind::Cast { .. }
+        )
+    })
+}
+
+/// Returns the number of fields if `ty` is `&Location` (`file: &str, line: u32, col: u32, ZST...`).
+fn location_param_fields(table: &TypeTable, ty: TypeId) -> Option<usize> {
+    let TypeKind::Reference { pointee, .. } = table.get(table.peeled(ty))?.kind else {
+        return None;
+    };
+    let TypeKind::Adt {
+        form: NominalForm::Struct,
+        variants,
+        ..
+    } = &table.get(table.peeled(pointee))?.kind
+    else {
+        return None;
+    };
+    let [variant] = variants.as_slice() else {
+        return None;
+    };
+    if variant.fields.len() < 3 {
+        return None;
+    }
+    let TypeKind::Reference {
+        pointee: file_pointee,
+        ..
+    } = table.get(table.peeled(variant.fields[0].ty))?.kind
+    else {
+        return None;
+    };
+    if !matches!(table.get(table.peeled(file_pointee))?.kind, TypeKind::Str) {
+        return None;
+    }
+    for field in &variant.fields[1..3] {
+        if table.int_info(field.ty) != Some((false, 32)) {
+            return None;
+        }
+    }
+    for field in &variant.fields[3..] {
+        if !table.is_zst(field.ty) {
+            return None;
+        }
+    }
+    Some(variant.fields.len())
+}
+
+fn bind_caller_location_param(
+    callee: &mut Func,
+    site_fact: SourceFactId,
+    interns: &Interns,
+    origin: OriginId,
+) -> Result<(), &'static str> {
+    let Some(&last_param) = callee.params.last() else {
+        return Err("inline.track-caller-unavailable");
+    };
+    let last_def = callee.values[last_param.0 as usize];
+    let Some(field_count) = location_param_fields(&interns.types, last_def.ty) else {
+        return Err("inline.track-caller-unavailable");
+    };
+    let Some(fact) = interns.source_fact(site_fact) else {
+        return Err("inline.track-caller-unavailable");
+    };
+    let mut fields = Vec::with_capacity(field_count);
+    fields.push(ConstTree::Str(fact.file));
+    fields.push(ConstTree::Scalar {
+        bits: u128::from(fact.line),
+        bytes: 4,
+    });
+    fields.push(ConstTree::Scalar {
+        bits: u128::from(fact.col + 1),
+        bytes: 4,
+    });
+    fields.resize_with(field_count, || ConstTree::Unit);
+    let tree = ConstTree::Reference(Box::new(ConstTree::Aggregate(fields)));
+    let const_val = ValueId(callee.values.len() as u32);
+    callee.values.push(last_def);
+    let replace = |v: ValueId| if v == last_param { const_val } else { v };
+    for block in &mut callee.blocks {
+        for op in &mut block.ops {
+            map_op(&mut op.kind, &replace, &|c| c);
+        }
+        block.term = map_term(&block.term, &replace, &|b| b);
+    }
+    if let Some(entry) = callee.blocks.first_mut() {
+        entry.ops.insert(
+            0,
+            Op {
+                result: Some(const_val),
+                origin,
+                kind: OpKind::Const(tree),
+            },
+        );
+    }
+    Ok(())
+}
+
 /// Which of D6's criteria admitted a site: the in-loop virtualizable shape may pay for growth
 /// (the escape analysis cashes it), the size plays may not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -504,6 +876,7 @@ fn qualifies(
     callee: &JsName,
     func: &Func,
     site: &Site,
+    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
     sizes: &BTreeMap<JsName, u64>,
     sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
     table: &crate::jir::TypeTable,
@@ -543,7 +916,7 @@ fn qualifies(
     // brotli, N copies of a body are not — measured on the idiomatic FingerprintJS bundle,
     // where accepting these sites cost ~500 brotli bytes while the minified count fell. So the
     // small-callee criterion only stands where the duplication is degenerate: a body at or
-    // under the call's own post-minify footprint.
+    // under the call's own post-minify footprint, or a trivial 1..=3 op pure scalar wrapper.
     let footprint_limit = if site.has_track_caller {
         TRACK_CALLER_SHARED_FOOTPRINT
     } else {
@@ -552,6 +925,10 @@ fn qualifies(
     if sizes
         .get(callee)
         .is_some_and(|bytes| *bytes <= footprint_limit)
+        || funcs
+            .get(callee)
+            .and_then(|res| res.as_ref().ok())
+            .is_some_and(trivial_pure_leaf)
     {
         return Some(Criterion::SmallCallee);
     }
@@ -641,6 +1018,7 @@ fn collect_sites(
             if let Some(reason) = body_decline(
                 callee_func,
                 &callee_metadata.interns,
+                &caller_metadata.interns,
                 args.len(),
                 func.sig.abi.caller_location,
                 *track_caller,
@@ -823,9 +1201,11 @@ fn callee_has_host_boundary(callee: &Func, interns: &Interns) -> bool {
 }
 
 /// The semantic boundary preventing a callee body from being spliced at this site.
+#[allow(clippy::too_many_arguments)]
 fn body_decline(
     callee: &Func,
     interns: &Interns,
+    caller_interns: &Interns,
     args: usize,
     caller_caller_location: bool,
     site_track_caller: Option<SourceFactId>,
@@ -836,7 +1216,18 @@ fn body_decline(
         return Some("inline.exceptional-control-flow");
     }
     let expected_params = if callee.sig.abi.caller_location {
-        if unused_caller_location(callee) && callee.params.len() == args + 1 {
+        let can_bind_used_loc = site_track_caller.is_some_and(|fact| {
+            caller_interns.source_fact(fact).is_some()
+                && callee
+                    .params
+                    .last()
+                    .and_then(|p| {
+                        location_param_fields(&interns.types, callee.values[p.0 as usize].ty)
+                    })
+                    .is_some()
+        });
+        if callee.params.len() == args + 1 && (unused_caller_location(callee) || can_bind_used_loc)
+        {
             args + 1
         } else {
             return Some("inline.track-caller-unavailable");
@@ -871,7 +1262,9 @@ fn body_decline(
                     ..
                 } => Some("inline.coroutine-unsupported"),
                 OpKind::Assert { .. }
-                    if callee.sig.abi.caller_location && !forwards_caller_location =>
+                    if callee.sig.abi.caller_location
+                        && !forwards_caller_location
+                        && site_track_caller.is_none() =>
                 {
                     Some("inline.track-caller-unavailable")
                 }
@@ -3316,5 +3709,683 @@ mod tests {
         assert_eq!(stats.applied, 0);
         assert_eq!(stats.declined.get("inline.never"), Some(&1));
         assert_eq!(prog.calls_in("f"), 1);
+    }
+
+    #[test]
+    fn used_track_caller_location_param_is_substituted_when_site_fact_known() {
+        use crate::jir::origin::SourceFact;
+        use crate::jir::types::{
+            FieldDescriptor, FieldKey, NominalForm, PointerForm, VariantDescriptor,
+        };
+
+        let mut prog = Prog::new();
+        let file = prog.strid("caller_site.rs");
+        let site_fact = prog.interns.intern_source_fact(SourceFact {
+            file,
+            line: 77,
+            col: 8,
+        });
+        let str_ty = TypeId(10);
+        let ref_str_ty = TypeId(11);
+        let u32_ty = TypeId(12);
+        let loc_ty = TypeId(13);
+        let ref_loc_ty = TypeId(14);
+
+        let loc_name = prog.strid("Location");
+        let f_file = prog.strid("file");
+        let f_line = prog.strid("line");
+        let f_col = prog.strid("col");
+        let g_str = prog.strid("used_loc_callee");
+
+        let js_facts = |peeled: TypeId| JsFacts {
+            int: None,
+            is_indirect: false,
+            needs_clone: false,
+            crosses_transparent_union: false,
+            transparent: None,
+            peeled,
+            unsized_tail: None,
+            enum_repr: None,
+            is_primitive_enum: false,
+            pointer_form: None,
+            byte_element: false,
+            fields: Vec::new(),
+        };
+
+        prog.interns.intern_type(TypeDescriptor {
+            id: str_ty,
+            name: None,
+            kind: TypeKind::Str,
+            layout: LayoutFacts {
+                sized: false,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: js_facts(str_ty),
+        });
+        prog.interns.intern_type(TypeDescriptor {
+            id: ref_str_ty,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: str_ty,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(8),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                pointer_form: Some(PointerForm::Str),
+                ..js_facts(ref_str_ty)
+            },
+        });
+        prog.interns.intern_type(TypeDescriptor {
+            id: u32_ty,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: Some(IntFacts {
+                    signed: false,
+                    bits: 32,
+                    repr: IntRepr::Number,
+                }),
+                ..js_facts(u32_ty)
+            },
+        });
+        let loc_fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Name(f_file),
+                ty: ref_str_ty,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Name(f_line),
+                ty: u32_ty,
+                offset: 8,
+            },
+            FieldDescriptor {
+                key: FieldKey::Name(f_col),
+                ty: u32_ty,
+                offset: 12,
+            },
+        ];
+        prog.interns.intern_type(TypeDescriptor {
+            id: loc_ty,
+            name: Some(loc_name),
+            kind: TypeKind::Adt {
+                def: item(99).definition,
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![VariantDescriptor {
+                    name: loc_name,
+                    logical_discr: 0,
+                    physical_tag: None,
+                    fields: loc_fields.clone(),
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(16),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                is_indirect: true,
+                needs_clone: true,
+                fields: loc_fields,
+                ..js_facts(loc_ty)
+            },
+        });
+        prog.interns.intern_type(TypeDescriptor {
+            id: ref_loc_ty,
+            name: None,
+            kind: TypeKind::Reference {
+                pointee: loc_ty,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                pointer_form: Some(PointerForm::Thin),
+                ..js_facts(ref_loc_ty)
+            },
+        });
+
+        let mut g_sig = Signature {
+            arguments: vec![u32_ty],
+            result: u32_ty,
+            abi: AbiSignature {
+                parameters: 2,
+                caller_location: true,
+                ..AbiSignature::default()
+            },
+        };
+        g_sig.abi.caller_location = true;
+        let mut g_b = FuncBuilder::new(item(2), g_sig);
+        let x = g_b.param(u32_ty, O);
+        let loc_param = g_b.param(ref_loc_ty, O);
+        let loc_val = g_b.op(FuncBuilder::ENTRY, OpKind::Deref(loc_param), loc_ty, O);
+        let line_val = g_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Field {
+                base: loc_val,
+                variant: None,
+                field: 1,
+            },
+            u32_ty,
+            O,
+        );
+        let sum = g_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: x,
+                r: line_val,
+                ty: u32_ty,
+            },
+            u32_ty,
+            O,
+        );
+        g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(sum)));
+        let g = g_b.finish();
+
+        let f_sig = Signature {
+            arguments: vec![u32_ty],
+            result: u32_ty,
+            abi: AbiSignature {
+                parameters: 1,
+                ..AbiSignature::default()
+            },
+        };
+        let mut f_b = FuncBuilder::new(item(1), f_sig);
+        let p = f_b.param(u32_ty, O);
+        let call = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: g_str,
+                },
+                function: None,
+                args: vec![p],
+                track_caller: Some(site_fact),
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            u32_ty,
+            O,
+        );
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+        let f = f_b.finish();
+
+        prog.add("used_loc_callee", g);
+        prog.add("f", f);
+        let stats = prog.run(100_000, true);
+        assert_eq!(
+            stats.applied, 1,
+            "used #[track_caller] callee should inline"
+        );
+        assert_eq!(prog.calls_in("f"), 0);
+        let f_after = prog.func("f");
+        f_after.verify(&prog.interns.types).expect("verified");
+        let has_loc_const = f_after.blocks.iter().flat_map(|b| &b.ops).any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Const(ConstTree::Reference(inner))
+                    if matches!(
+                        inner.as_ref(),
+                        ConstTree::Aggregate(fields)
+                            if fields.len() == 3
+                                && fields[0] == ConstTree::Str(file)
+                                && fields[1] == ConstTree::Scalar { bits: 77, bytes: 4 }
+                                && fields[2] == ConstTree::Scalar { bits: 9, bytes: 4 }
+                    )
+            )
+        });
+        assert!(
+            has_loc_const,
+            "expected bound Location constant for site_fact"
+        );
+    }
+
+    #[test]
+    fn track_caller_dead_assert_folds_and_live_assert_declines() {
+        use crate::jir::origin::{Origin, OriginKind, OriginTable, SourceFact};
+        use std::borrow::Cow;
+
+        let build_origins = |fact| OriginTable {
+            origins: vec![Origin {
+                source: Some(fact),
+                local_name: None,
+                kind: OriginKind::Statement,
+                inline_stack: Vec::new(),
+            }],
+            statements: Vec::new(),
+            terminators: Vec::new(),
+            locals: Vec::new(),
+            item_path: StrId(0),
+            root: None,
+        };
+
+        let make_assert_callee = || {
+            let mut g_sig = sig(2);
+            g_sig.abi.caller_location = true;
+            let mut g_b = FuncBuilder::new(item(2), g_sig);
+            let x = g_b.param(I32, OriginId(0));
+            let _loc = g_b.param(I32, OriginId(0));
+            let zero = g_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+                I32,
+                OriginId(0),
+            );
+            let cmp = g_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Binary {
+                    op: BinaryOp::Eq,
+                    l: x,
+                    r: zero,
+                    ty: I32,
+                },
+                I32,
+                OriginId(0),
+            );
+            g_b.effect(
+                FuncBuilder::ENTRY,
+                OpKind::Assert {
+                    cond: cmp,
+                    expected: false,
+                    msg: RAssertMessage::RemainderByZero(x),
+                },
+                OriginId(0),
+            );
+            g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(x)));
+            g_b.finish()
+        };
+
+        // Case 1: Live non-optional Assert inside #[track_caller] callee MUST decline even when
+        // OriginTable is present (both direct site_track_caller = Some(...) and forwarded None).
+        for forward_in_track_caller in [false, true] {
+            let mut prog = Prog::new();
+            let caller_file = prog.strid("caller.rs");
+            let core_file = prog.strid("core/slice.rs");
+            let site_fact = prog.interns.intern_source_fact(SourceFact {
+                file: caller_file,
+                line: 55,
+                col: 12,
+            });
+            let core_fact = prog.interns.intern_source_fact(SourceFact {
+                file: core_file,
+                line: 999,
+                col: 1,
+            });
+            let g_str = prog.strid("g_assert");
+            let g = make_assert_callee();
+
+            let mut f_sig = sig(1);
+            f_sig.abi.caller_location = forward_in_track_caller;
+            let mut f_b = FuncBuilder::new(item(1), f_sig);
+            let p = f_b.param(I32, OriginId(0));
+            let call = f_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: item(2),
+                        link_name: g_str,
+                    },
+                    function: None,
+                    args: vec![p],
+                    track_caller: if forward_in_track_caller {
+                        None
+                    } else {
+                        Some(site_fact)
+                    },
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                I32,
+                OriginId(0),
+            );
+            f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+            let f = f_b.finish();
+
+            prog.add("g_assert", g);
+            prog.add("f", f);
+
+            let interns = &prog.interns;
+            let funcs = &mut prog.funcs;
+            let interns_map: BTreeMap<JsName, &Interns> =
+                funcs.keys().map(|name| (name.clone(), interns)).collect();
+            let graph = callgraph::build(funcs, &interns_map);
+            let f_name = JsName::new("f".to_owned());
+            let g_name = JsName::new("g_assert".to_owned());
+            let mut metadata = BTreeMap::from([
+                (
+                    f_name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: Cow::Borrowed(interns),
+                        origins: Some(Cow::Owned(build_origins(site_fact))),
+                        header: None,
+                    },
+                ),
+                (
+                    g_name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: Cow::Borrowed(interns),
+                        origins: Some(Cow::Owned(build_origins(core_fact))),
+                        header: None,
+                    },
+                ),
+            ]);
+            let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name.clone(), 120)]);
+            let stats = run_with_mode(
+                funcs,
+                &mut metadata,
+                &graph,
+                &ItemIndex::new(),
+                &|_, func, _| Some(measurement(func, &metadata_dummy_refs(func, interns))),
+                &|_, _| true,
+                &|_| true,
+                100_000,
+                &sizes,
+                false,
+            );
+            assert_eq!(
+                stats.applied, 0,
+                "live Assert in #[track_caller] callee must decline (forward={forward_in_track_caller})"
+            );
+            assert_eq!(
+                stats
+                    .declined
+                    .get("inline.track-caller-unavailable")
+                    .copied()
+                    .unwrap_or(0),
+                1
+            );
+        }
+
+        // Case 2: Dead constant-folded Assert (e.g. ChunksExact::new(_, 16)) folds in DCE and inlines.
+        {
+            let mut prog = Prog::new();
+            let caller_file = prog.strid("caller.rs");
+            let site_fact = prog.interns.intern_source_fact(SourceFact {
+                file: caller_file,
+                line: 77,
+                col: 5,
+            });
+            let g_str = prog.strid("g_assert");
+            let g = make_assert_callee();
+
+            let mut f_b = FuncBuilder::new(item(1), sig(0));
+            let sixteen = f_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Const(ConstTree::Scalar { bits: 16, bytes: 4 }),
+                I32,
+                OriginId(0),
+            );
+            let call = f_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: item(2),
+                        link_name: g_str,
+                    },
+                    function: None,
+                    args: vec![sixteen],
+                    track_caller: Some(site_fact),
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                I32,
+                OriginId(0),
+            );
+            f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+            let f = f_b.finish();
+
+            prog.add("g_assert", g);
+            prog.add("f", f);
+
+            let interns = &prog.interns;
+            let funcs = &mut prog.funcs;
+            let interns_map: BTreeMap<JsName, &Interns> =
+                funcs.keys().map(|name| (name.clone(), interns)).collect();
+            let graph = callgraph::build(funcs, &interns_map);
+            let f_name = JsName::new("f".to_owned());
+            let g_name = JsName::new("g_assert".to_owned());
+            let mut metadata = BTreeMap::from([
+                (
+                    f_name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: Cow::Borrowed(interns),
+                        origins: Some(Cow::Owned(build_origins(site_fact))),
+                        header: None,
+                    },
+                ),
+                (
+                    g_name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: Cow::Borrowed(interns),
+                        origins: Some(Cow::Owned(build_origins(site_fact))),
+                        header: None,
+                    },
+                ),
+            ]);
+            let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name.clone(), 120)]);
+            let stats = run_with_mode(
+                funcs,
+                &mut metadata,
+                &graph,
+                &ItemIndex::new(),
+                &|_, func, _| Some(measurement(func, &metadata_dummy_refs(func, interns))),
+                &|_, _| true,
+                &|_| true,
+                100_000,
+                &sizes,
+                false,
+            );
+            assert_eq!(
+                stats.applied, 1,
+                "constant-folded dead Assert in #[track_caller] callee should inline (declined={:?})",
+                stats.declined
+            );
+            assert_eq!(prog.calls_in("f"), 0);
+        }
+    }
+
+    fn metadata_dummy_refs<'a>(func: &Func, interns: &'a Interns) -> Metadata<'a> {
+        let _ = func;
+        Metadata {
+            universe: interns,
+            interns: std::borrow::Cow::Borrowed(interns),
+            origins: None,
+            header: None,
+        }
+    }
+
+    #[test]
+    fn trivial_pure_leaf_wrapper_inlines_even_above_96_bytes() {
+        let mut prog = Prog::new();
+        let g = add_one(&mut prog);
+        let f = calls_g(&mut prog);
+        prog.add("g", g);
+        prog.add("f", f);
+
+        let f_name = JsName::new("f".to_owned());
+        let g_name = JsName::new("g".to_owned());
+        let interns = &prog.interns;
+        let funcs = &mut prog.funcs;
+        let interns_map: BTreeMap<JsName, &Interns> =
+            funcs.keys().map(|name| (name.clone(), interns)).collect();
+        let graph = callgraph::build(funcs, &interns_map);
+        let mut metadata = funcs
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: std::borrow::Cow::Borrowed(interns),
+                        origins: None,
+                        header: None,
+                    },
+                )
+            })
+            .collect();
+        // Shared callee (`sole_referrer = false`) priced at 120 bytes (> 96B SHARED_CALLEE_FOOTPRINT),
+        // with +12B temporary caller growth (within <=16B trivial leaf slack) and 0 budget charge.
+        let sizes = BTreeMap::from([(f_name.clone(), 100), (g_name.clone(), 120)]);
+        let stats = run_with_mode(
+            funcs,
+            &mut metadata,
+            &graph,
+            &ItemIndex::new(),
+            &|_, func, _| {
+                let mut refs = BTreeSet::new();
+                for op in func.blocks.iter().flat_map(|b| &b.ops) {
+                    if matches!(op.kind, OpKind::Call { .. }) {
+                        refs.insert(g_name.clone());
+                    }
+                }
+                let bytes = if func.item == item(1) && refs.is_empty() {
+                    112
+                } else if func.item == item(1) {
+                    100
+                } else {
+                    120
+                };
+                Some((bytes, refs))
+            },
+            &|_, _| false,
+            &|_| true,
+            10_000,
+            &sizes,
+            false,
+        );
+        assert_eq!(
+            stats.applied, 1,
+            "trivial pure leaf above 96B should inline"
+        );
+        assert_eq!(prog.calls_in("f"), 0);
+    }
+
+    #[test]
+    fn multi_site_sole_caller_batching_inlines_when_single_sites_have_positive_net() {
+        let mut prog = Prog::new();
+        let g = add_one(&mut prog);
+        let g_str = prog.strid("g");
+
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let mut cur = f_b.param(I32, O);
+        for _ in 0..3 {
+            cur = f_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: item(2),
+                        link_name: g_str,
+                    },
+                    function: None,
+                    args: vec![cur],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                I32,
+                O,
+            );
+        }
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(cur)));
+        let f = f_b.finish();
+
+        prog.add("g", g);
+        prog.add("f", f);
+
+        let f_name = JsName::new("f".to_owned());
+        let g_name = JsName::new("g".to_owned());
+        let interns = &prog.interns;
+        let funcs = &mut prog.funcs;
+        let interns_map: BTreeMap<JsName, &Interns> =
+            funcs.keys().map(|name| (name.clone(), interns)).collect();
+        let graph = callgraph::build(funcs, &interns_map);
+        let mut metadata = funcs
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    Metadata {
+                        universe: interns,
+                        interns: std::borrow::Cow::Borrowed(interns),
+                        origins: None,
+                        header: None,
+                    },
+                )
+            })
+            .collect();
+        // Make each intermediate site grow by +25B (>16B slack so single-site rejects when refs still contain g),
+        // while batching all 3 sites yields 150 -> 180 (+30B) - 80B removed = -50B net!
+        let sizes = BTreeMap::from([(f_name.clone(), 150), (g_name.clone(), 80)]);
+        let stats = run_with_mode(
+            funcs,
+            &mut metadata,
+            &graph,
+            &ItemIndex::new(),
+            &|_, func, _| {
+                let mut call_count = 0u64;
+                let mut refs = BTreeSet::new();
+                for op in func.blocks.iter().flat_map(|b| &b.ops) {
+                    if matches!(op.kind, OpKind::Call { .. }) {
+                        call_count += 1;
+                        refs.insert(g_name.clone());
+                    }
+                }
+                let bytes = if func.item == item(1) {
+                    match call_count {
+                        3 => 150,
+                        2 => 175,
+                        1 => 178,
+                        _ => 180,
+                    }
+                } else {
+                    80
+                };
+                Some((bytes, refs))
+            },
+            &|_, _| true,
+            &|_| true,
+            10_000,
+            &sizes,
+            false,
+        );
+        assert_eq!(
+            stats.applied, 3,
+            "all 3 sole-caller sites should batch-inline"
+        );
+        assert_eq!(prog.calls_in("f"), 0);
     }
 }
