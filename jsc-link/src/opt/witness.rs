@@ -754,7 +754,7 @@ pub(crate) fn check_invoke_pruning(
                 verify_noop_unwind_chain(pre_func, interns, unwind.0, pre_funcs)?;
             }
             InvokePruneReason::ProtectedOpCannotThrow => {
-                verify_protected_block_cannot_throw(block, interns, &mut cx)?;
+                verify_protected_block_cannot_throw(pre_func, block, interns, &mut cx)?;
             }
         }
     }
@@ -1047,17 +1047,59 @@ fn build_witness_indirect_scope(
         for block in &func.blocks {
             for op in &block.ops {
                 refs::scan_op(func, op, types, &mut scan);
-                if let (Some(types), OpKind::Call { host: Some(_), .. } | OpKind::Host { .. }) =
-                    (types, &op.kind)
-                {
+                let fn_ptr_boundary = match &op.kind {
+                    OpKind::Host { args, .. }
+                    | OpKind::Call {
+                        host: Some(_),
+                        args,
+                        ..
+                    } => Some(args.as_slice()),
+                    OpKind::Call {
+                        callee: Callee::Runtime { sysroot: false, .. },
+                        args,
+                        ..
+                    } => Some(args.as_slice()),
+                    OpKind::Call {
+                        callee: Callee::Foreign { symbol, .. },
+                        args,
+                        ..
+                    } => {
+                        let known_ok = table
+                            .get(name)
+                            .and_then(|it| it.jir.interns())
+                            .and_then(|i| i.str(*symbol))
+                            .is_some_and(|s| {
+                                pre_funcs
+                                    .get(&JsName::new(s.to_owned()))
+                                    .is_some_and(Result::is_ok)
+                            });
+                        (!known_ok).then_some(args.as_slice())
+                    }
+                    _ => None,
+                };
+                if let Some(args) = fn_ptr_boundary {
+                    let Some(types) = types else {
+                        return Err(format!(
+                            "unbounded indirect call: missing types for `{name}`"
+                        ));
+                    };
                     if let Some(res_val) = op.result {
                         if let Some(vdef) = func.values.get(res_val.0 as usize) {
                             if witness_type_contains_fn_ptr(vdef.ty, types, &mut BTreeSet::new()) {
                                 return Err(format!(
-                                    "unbounded indirect call: host op in `{name}` returns a fn ptr"
+                                    "unbounded indirect call: external/host op in `{name}` returns a fn ptr"
                                 ));
                             }
                         }
+                    }
+                    if args.iter().any(|arg| {
+                        func.values.get(arg.0 as usize).is_some_and(|vdef| {
+                            witness_type_contains_fn_ptr(vdef.ty, types, &mut BTreeSet::new())
+                        })
+                    }) {
+                        return Err(format!(
+                            "unbounded indirect call: external/host op in `{name}` receives a fn ptr"
+                        ));
                     }
                 }
             }
@@ -1071,6 +1113,7 @@ fn build_witness_indirect_scope(
 }
 
 fn verify_protected_block_cannot_throw(
+    pre_func: &Func,
     block: &crate::jir::repr::RBlock,
     interns: &Interns,
     cx: &mut InvokeCheckCx<'_>,
@@ -1079,11 +1122,25 @@ fn verify_protected_block_cannot_throw(
     let mut visited_callees = BTreeSet::new();
     if let Some((last, prefix)) = block.ops.split_last() {
         for op in prefix {
-            check_op_no_throw(op, interns, cx, &mut visited_callees, &mut queue)?;
+            check_op_no_throw(pre_func, op, interns, cx, &mut visited_callees, &mut queue)?;
         }
-        check_op_no_throw(last, interns, cx, &mut visited_callees, &mut queue)?;
+        check_op_no_throw(
+            pre_func,
+            last,
+            interns,
+            cx,
+            &mut visited_callees,
+            &mut queue,
+        )?;
     }
+    drain_callee_queue(cx, &mut visited_callees, &mut queue)
+}
 
+fn drain_callee_queue(
+    cx: &mut InvokeCheckCx<'_>,
+    visited_callees: &mut BTreeSet<JsName>,
+    queue: &mut VecDeque<JsName>,
+) -> Result<(), String> {
     while let Some(callee_name) = queue.pop_front() {
         if let Some(Ok(callee_func)) = cx.pre_funcs.get(&callee_name) {
             let callee_interns = cx
@@ -1107,16 +1164,44 @@ fn verify_protected_block_cannot_throw(
                         "callee `{callee_name}` reaches RTerm::Throw at bb{bi}"
                     ));
                 }
-                for op in &cb.ops {
-                    check_op_no_throw(op, callee_interns, cx, &mut visited_callees, &mut queue)?;
-                }
                 match &cb.term {
-                    RTerm::Invoke { normal, .. } => {
-                        // Every op in `cb.ops` (including the protected op) was verified
-                        // non-throwing above, so `unwind` is unreachable.
+                    RTerm::Invoke { normal, unwind } => {
                         work.push(normal.0 .0 as usize);
+                        if let Some((last, prefix)) = cb.ops.split_last() {
+                            for op in prefix {
+                                check_op_no_throw(
+                                    callee_func,
+                                    op,
+                                    callee_interns,
+                                    cx,
+                                    visited_callees,
+                                    queue,
+                                )?;
+                            }
+                            if op_no_throw_isolated(
+                                callee_func,
+                                last,
+                                callee_interns,
+                                cx,
+                                visited_callees,
+                            )
+                            .is_err()
+                            {
+                                work.push(unwind.0 .0 as usize);
+                            }
+                        }
                     }
                     other => {
+                        for op in &cb.ops {
+                            check_op_no_throw(
+                                callee_func,
+                                op,
+                                callee_interns,
+                                cx,
+                                visited_callees,
+                                queue,
+                            )?;
+                        }
                         for succ in other.successors() {
                             work.push(succ.0 as usize);
                         }
@@ -1155,13 +1240,81 @@ fn verify_protected_block_cannot_throw(
     Ok(())
 }
 
+fn op_no_throw_isolated(
+    func: &Func,
+    op: &Op,
+    interns: &Interns,
+    cx: &mut InvokeCheckCx<'_>,
+    outer_visited: &BTreeSet<JsName>,
+) -> Result<(), String> {
+    let mut sub_visited = outer_visited.clone();
+    let mut sub_queue = VecDeque::new();
+    check_op_no_throw(func, op, interns, cx, &mut sub_visited, &mut sub_queue)?;
+    drain_callee_queue(cx, &mut sub_visited, &mut sub_queue)
+}
+
 fn enqueue_callee(name: JsName, visited: &mut BTreeSet<JsName>, queue: &mut VecDeque<JsName>) {
     if visited.insert(name.clone()) {
         queue.push_back(name);
     }
 }
 
+fn witness_is_marker_name(name: &str) -> bool {
+    name.starts_with("rcgjs.host.")
+        || name.starts_with("rcgjs.tc.")
+        || name.starts_with("rcgjs.map.")
+}
+
+fn check_intrinsic_without_fallback(
+    func: &Func,
+    name: StrId,
+    args: &[ValueId],
+    interns: &Interns,
+    visited: &mut BTreeSet<JsName>,
+    queue: &mut VecDeque<JsName>,
+) -> Result<(), String> {
+    let sym = interns
+        .str(name)
+        .ok_or_else(|| format!("unresolvable intrinsic str#{}", name.0))?;
+    match sym {
+        "catch_unwind" => Err("intrinsic `catch_unwind` calls closure uncaught".to_owned()),
+        "const_eval_select" => {
+            let runtime_arg = args
+                .get(2)
+                .ok_or_else(|| "const_eval_select missing runtime arm".to_owned())?;
+            let vdef = func
+                .values
+                .get(runtime_arg.0 as usize)
+                .ok_or_else(|| "const_eval_select runtime arm value missing".to_owned())?;
+            let peeled = interns.types.peeled(vdef.ty);
+            let desc = interns
+                .types
+                .get(peeled)
+                .ok_or_else(|| "const_eval_select runtime arm type missing".to_owned())?;
+            let TypeKind::FnDef {
+                instance: Some(instance),
+                ..
+            } = &desc.kind
+            else {
+                return Err("const_eval_select runtime arm is not a resolved FnDef".to_owned());
+            };
+            let target = interns
+                .str(instance.link_name)
+                .ok_or_else(|| "const_eval_select target link_name unresolvable".to_owned())?;
+            if witness_is_marker_name(target) {
+                return Err(format!(
+                    "const_eval_select target `{target}` is a host marker"
+                ));
+            }
+            enqueue_callee(JsName::new(target.to_owned()), visited, queue);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 fn check_op_no_throw(
+    func: &Func,
     op: &Op,
     interns: &Interns,
     cx: &mut InvokeCheckCx<'_>,
@@ -1183,6 +1336,12 @@ fn check_op_no_throw(
             enqueue_callee(name, visited, queue);
             Ok(())
         }
+        OpKind::Intrinsic {
+            name,
+            fallback: None,
+            args,
+            ..
+        } => check_intrinsic_without_fallback(func, *name, args, interns, visited, queue),
         OpKind::Drop { glue, .. } => match glue {
             DropGlue::None => Ok(()),
             DropGlue::Direct { link_name, .. } => {
@@ -1200,6 +1359,7 @@ fn check_op_no_throw(
         },
         OpKind::Call {
             callee,
+            args,
             semantic,
             host,
             ..
@@ -1213,14 +1373,16 @@ fn check_op_no_throw(
             ) {
                 return Err(format!("call semantic {semantic:?} may throw"));
             }
-            if matches!(semantic, CallSemantic::RawParts) {
-                return Ok(());
-            }
             match callee {
-                Callee::Nop | Callee::Intrinsic { fallback: None, .. } => Ok(()),
+                Callee::Nop => Ok(()),
                 Callee::Direct { link_name, .. } => {
-                    let name = resolve(*link_name, "direct call")?;
-                    enqueue_callee(name, visited, queue);
+                    let s = interns
+                        .str(*link_name)
+                        .ok_or_else(|| format!("unresolvable direct call str#{}", link_name.0))?;
+                    if witness_is_marker_name(s) {
+                        return Err(format!("marker-named direct call `{s}` may throw"));
+                    }
+                    enqueue_callee(JsName::new(s.to_owned()), visited, queue);
                     Ok(())
                 }
                 Callee::Intrinsic {
@@ -1230,6 +1392,11 @@ fn check_op_no_throw(
                     enqueue_callee(name, visited, queue);
                     Ok(())
                 }
+                Callee::Intrinsic {
+                    name,
+                    fallback: None,
+                    ..
+                } => check_intrinsic_without_fallback(func, *name, args, interns, visited, queue),
                 Callee::Runtime { member, sysroot } => {
                     if !*sysroot {
                         let m = interns.str(*member).unwrap_or("<invalid>");
@@ -1277,7 +1444,7 @@ fn check_op_no_throw(
                                 format!("unbounded indirect call for signature ty#{}", signature.0)
                             })?;
                     let mut names = indirect.static_fn_refs.clone();
-                    for item_id in targets {
+                    for item_id in indirect.scan.named.iter().chain(targets.iter()) {
                         let item_names = indirect.by_item.get(item_id).ok_or_else(|| {
                             format!("indirect target {item_id:?} has no JIR item")
                         })?;
