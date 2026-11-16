@@ -282,18 +282,19 @@ fn requires_cleanup_lowering<'tcx>(
 /// without running them. Two shapes reach that point:
 ///
 /// * a call whose callee has such an ABI and may let a host exception out: a foreign import, a
-///   call through a function pointer or a `dyn` method, or a Rust function whose body ends a
-///   cleanup path in `UnwindTerminate(Abi)` (which this backend lowers as a rethrow, so that an
-///   export called from JavaScript keeps its cleanup) or whose body is not available to show it
-///   does not;
+///   call through a function pointer or a `dyn` method, or a Rust function whose transitive call
+///   and drop graph cannot be proven free of `UnwindTerminate(Abi)`, non-sysroot foreign imports,
+///   indirect or `dyn` dispatch (including dropping a `dyn` value), inline assembly, tail calls,
+///   or unresolved / bodyless non-sysroot callees;
 /// * such a callee inlined by rustc's MIR inliner, which leaves its `UnwindTerminate(Abi)` edges
 ///   inside this body, where the cleanup of this frame is gone the same way.
 ///
 /// Either is refused only where this frame holds a value with drop glue across it
 /// ([`HeldDrops`]): with nothing to drop the exception passes this frame as it would with the
 /// edge, and the next frame up decides for itself. Declared `extern "C-unwind"` the call keeps its
-/// edge, which is the fix every message names. A Rust callee whose body has no such edge cannot
-/// let anything out and is accepted.
+/// edge, which is the fix every message names. A Rust callee whose transitive call and drop graph
+/// is available and free of those hazards (cycles included) cannot let anything out and is
+/// accepted.
 ///
 /// The sysroot's own crates are not checked where the sysroot build compiles them
 /// ([`is_sysroot_build`]): they call no host function (the imports they declare are the runtime's,
@@ -390,19 +391,8 @@ fn reject_unwind_crossing_calls<'tcx>(
             .no_bound_vars()
             .map(|args| ty::Instance::try_resolve(tcx, crate::value::typing_env(), callee, args));
         let why = match resolved {
-            Some(Ok(Some(target))) => match target.def {
-                InstanceKind::Item(item) if tcx.is_mir_available(item) => {
-                    let target_body = tcx.instance_mir(target.def);
-                    if !target_body
-                        .basic_blocks
-                        .iter()
-                        .any(|block| ends_in_abi_terminate(&block.terminator().kind))
-                    {
-                        continue;
-                    }
-                    "and a host exception can leave it"
-                }
-                InstanceKind::Virtual(..) => {
+            Some(Ok(Some(target))) => {
+                if matches!(target.def, InstanceKind::Virtual(..)) {
                     tcx.dcx().span_err(
                         span,
                         format!(
@@ -413,8 +403,11 @@ fn reject_unwind_crossing_calls<'tcx>(
                     );
                     continue;
                 }
-                _ => "and its body is not available to show that no host exception leaves it",
-            },
+                match callee_may_pass_host_exception(tcx, target) {
+                    None => continue,
+                    Some(why) => why,
+                }
+            }
             _ => "and it does not resolve to a body that shows no host exception leaves it",
         };
         tcx.dcx()
@@ -428,6 +421,131 @@ fn reject_unwind_crossing_calls<'tcx>(
             .with_span_note(tcx.def_span(callee), "the function is defined here")
             .emit();
     }
+}
+
+/// Returns `None` iff `root`'s transitive call and drop graph is available and proven free of any
+/// way for a host exception to leave `root`; otherwise returns `Some(why)` describing the hazard.
+fn callee_may_pass_host_exception<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    root: rustc_middle::ty::Instance<'tcx>,
+) -> Option<&'static str> {
+    use rustc_data_structures::fx::FxHashSet;
+    use rustc_middle::mir::TerminatorKind;
+    use rustc_middle::ty::{self, InstanceKind, ShimKind};
+
+    let mut visited = FxHashSet::default();
+    let mut work = vec![root];
+
+    while let Some(inst) = work.pop() {
+        if !visited.insert(inst) {
+            continue;
+        }
+        match inst.def {
+            InstanceKind::Intrinsic(_)
+            | InstanceKind::LlvmIntrinsic(_)
+            | InstanceKind::Shim(ShimKind::DropGlue(_, None) | ShimKind::ThreadLocal(..)) => {
+                continue;
+            }
+            InstanceKind::Virtual(..) => {
+                return Some(
+                    "and it dispatches through a `dyn` method that may pass a host exception",
+                );
+            }
+            InstanceKind::Shim(ShimKind::DropGlue(_, Some(drop_ty)))
+                if matches!(drop_ty.kind(), ty::Dynamic(..)) =>
+            {
+                return Some("and dropping a `dyn` value inside it may pass a host exception");
+            }
+            InstanceKind::Item(def_id) => {
+                if tcx.is_foreign_item(def_id) {
+                    if is_sysroot_crate(tcx, def_id.krate) {
+                        continue;
+                    }
+                    return Some("and a host exception can leave it");
+                }
+                if !tcx.is_mir_available(def_id) {
+                    if is_sysroot_crate(tcx, def_id.krate) {
+                        continue;
+                    }
+                    return Some(
+                        "and a callee's body is not available to show that no host exception \
+                         leaves it",
+                    );
+                }
+            }
+            // Other shims (`DropGlue(_, Some(_))`, `CloneShim`, `ClosureOnceShim`, `FnPtrShim`,
+            // `ReifyShim`, `VTableShim`, etc.) provide compiler-synthesized MIR via `instance_mir`.
+            InstanceKind::Shim(_) => {}
+        }
+
+        let body = tcx.instance_mir(inst.def);
+        for data in body.basic_blocks.iter() {
+            let term = data.terminator();
+            if ends_in_abi_terminate(&term.kind) {
+                return Some("and a host exception can leave it");
+            }
+            match &term.kind {
+                TerminatorKind::InlineAsm { .. } => {
+                    return Some("and inline assembly inside it may pass a host exception");
+                }
+                TerminatorKind::TailCall { .. } => {
+                    return Some("and a tail call inside it may pass a host exception");
+                }
+                TerminatorKind::Drop { place, .. } => {
+                    let drop_ty = inst.instantiate_mir_and_normalize_erasing_regions(
+                        tcx,
+                        crate::value::typing_env(),
+                        ty::EarlyBinder::bind(tcx, place.ty(&body.local_decls, tcx).ty),
+                    );
+                    if matches!(drop_ty.kind(), ty::Dynamic(..)) {
+                        return Some(
+                            "and dropping a `dyn` value inside it may pass a host exception",
+                        );
+                    }
+                    let drop_inst = ty::Instance::resolve_drop_glue(tcx, drop_ty);
+                    if !matches!(
+                        drop_inst.def,
+                        InstanceKind::Shim(ShimKind::DropGlue(_, None))
+                    ) {
+                        work.push(drop_inst);
+                    }
+                }
+                TerminatorKind::Call { func, .. } => {
+                    let callee_ty = inst.instantiate_mir_and_normalize_erasing_regions(
+                        tcx,
+                        crate::value::typing_env(),
+                        ty::EarlyBinder::bind(tcx, func.ty(body, tcx)),
+                    );
+                    let ty::FnDef(callee_def, callee_args) = *callee_ty.kind() else {
+                        return Some(
+                            "and it calls through a function pointer that may pass a host \
+                             exception",
+                        );
+                    };
+                    if tcx.is_foreign_item(callee_def) {
+                        if is_sysroot_crate(tcx, callee_def.krate) {
+                            continue;
+                        }
+                        return Some("and a host exception can leave it");
+                    }
+                    match callee_args.no_bound_vars().map(|args| {
+                        ty::Instance::try_resolve(tcx, crate::value::typing_env(), callee_def, args)
+                    }) {
+                        Some(Ok(Some(next))) => work.push(next),
+                        _ => {
+                            return Some(
+                                "and a call inside it does not resolve to a body that shows no \
+                                 host exception leaves it",
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    None
 }
 
 /// Which values a frame holds across a call, asked only where a refusal is in question.
