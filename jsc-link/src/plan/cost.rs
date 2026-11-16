@@ -43,7 +43,7 @@ use crate::opts::{OptimizerMode, Opts};
 pub const INF: u64 = u64::MAX / 4;
 
 /// The consumer-side runtime, whose members price the `Helper` facility nodes.
-const SHIM: &str = include_str!("../../../runtime/shim.js");
+pub(crate) const SHIM: &str = include_str!("../../../runtime/shim.js");
 
 pub fn runtime_source_sha256() -> String {
     rcgjs_object::artifact::sha256(SHIM.as_bytes())

@@ -1,4 +1,13 @@
+//! Rust's own text for every case `scripts/native-f64-differential.sh` checks, one line per
+//! `f64`: its bits, then `{}`, then each call shape of `301_f64_format_paths.rs` (`debug_line`,
+//! `text`, `reciprocal_text`), tab separated.
+
+extern crate alloc;
+
 use std::io::{self, BufWriter, Write};
+
+#[path = "301_f64_format_paths.rs"]
+mod paths;
 
 const EXPONENTS: u64 = 1 << 11;
 const MANTISSA_BUCKETS: u64 = 1 << 9;
@@ -12,7 +21,14 @@ fn mix(mut value: u64) -> u64 {
 }
 
 fn write_case(out: &mut impl Write, bits: u64) -> io::Result<()> {
-    writeln!(out, "{bits:016x}\t{}", f64::from_bits(bits))
+    let value = f64::from_bits(bits);
+    writeln!(
+        out,
+        "{bits:016x}\t{value}\t{}\t{}\t{}",
+        paths::debug_line("x", value),
+        paths::text(value),
+        paths::reciprocal_text(value),
+    )
 }
 
 fn main() -> io::Result<()> {
@@ -61,6 +77,26 @@ fn main() -> io::Result<()> {
     let mut out = BufWriter::new(io::stdout().lock());
     for bits in directed {
         write_case(&mut out, bits)?;
+    }
+
+    // One set mantissa bit at every exponent, subnormals included: `(1 + 2^-k) * 2^e` has a short
+    // exact decimal, among them the exact midpoints between two shortest candidates (`1 + 2^-17`
+    // is `1.00000762939453125`, which Rust prints as `1.0000076293945313`).
+    for exponent in 0..EXPONENTS - 1 {
+        for bit in 0..52 {
+            let bits = (exponent << 52) | (1 << bit);
+            write_case(&mut out, bits)?;
+            write_case(&mut out, bits | (1 << 63))?;
+        }
+    }
+
+    // Every finite power of ten and its two neighbours: the thresholds where JavaScript's own
+    // `String(number)` switches to an exponent are all among them.
+    for power in -323..=308 {
+        let bits = format!("1e{power}").parse::<f64>().unwrap().to_bits();
+        for neighbour in [bits - 1, bits, bits + 1] {
+            write_case(&mut out, neighbour)?;
+        }
     }
 
     for exponent in 0..EXPONENTS {

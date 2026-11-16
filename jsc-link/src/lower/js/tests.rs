@@ -568,6 +568,7 @@ fn lower_retargeted(
         abi: None,
         physical: None,
         call_retargets,
+        bigints: None,
     };
     match function::lower(&input, func, plan, region) {
         Ok(item) => jsast::stmt_to_string(&item.decl),
@@ -921,19 +922,8 @@ impl OverflowHarness {
              want [${wrapped}, ${overflowed}]`);\n}\nconsole.log(cases.length);\n",
         );
         // The program is too long for an argument; it goes in on stdin.
-        let mut node = std::process::Command::new("node")
-            .arg("-")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
+        let output = test_node::run(test_node::Node::Stdin(&self.source))
             .expect("Node is required by the compiler semantic tests");
-        std::io::Write::write_all(
-            &mut node.stdin.take().expect("piped stdin"),
-            self.source.as_bytes(),
-        )
-        .expect("write the program to Node");
-        let output = node.wait_with_output().expect("Node runs to completion");
         assert!(
             output.status.success(),
             "{}",
@@ -1766,6 +1756,93 @@ fn bigint_and_float_and_casts_spell_as_v1() {
     );
 }
 
+/// `a >> 33u32` at i128 (`IntRepr::BigInt`), lowered as phase C lowers it with BigInt constants
+/// hoisted, and as every other lowering (the cost trials, `js-ecma-target=latest`) lowers it.
+#[test]
+fn a_hoisting_lowering_names_its_bigint_constants_and_widens_constant_shift_amounts() {
+    let mut interns = world();
+    const I128: TypeId = TypeId(63);
+    interns.intern_type(int(I128, true, 128));
+    let mut b = FuncBuilder::new(item(1), signature(vec![I128], I128));
+    let a = b.param(I128, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let amount = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 33, bytes: 4 }),
+        U32,
+        NO_ORIGIN,
+    );
+    let shifted = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Shr,
+            l: a,
+            r: amount,
+            ty: I128,
+        },
+        I128,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(shifted)));
+    let func = b.finish();
+    let plan = plan_of(&func, &[(0, "a")]);
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let names =
+        crate::lower::bigint::BigIntNames::allocate(&std::collections::BTreeMap::new(), &[])
+            .expect("an empty program spells no prefix");
+    let opts = Opts::default();
+    let name = JsName::new("g".to_owned());
+    let summary = summary(&[]);
+    let lowered = |bigints| {
+        let input = LowerInput {
+            name: &name,
+            summary: &summary,
+            body: &body,
+            origins: None,
+            interns: &interns,
+            table: &interns.types,
+            opts: &opts,
+            items: super::host::EMPTY_ITEMS,
+            drop_glue: super::host::EMPTY_DROP_GLUE,
+            vtables: &super::unsize::EMPTY_VTABLES,
+            spills: &[],
+            abi: None,
+            physical: None,
+            call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            bigints,
+        };
+        match function::lower(&input, &func, &plan, straight(&func)) {
+            Ok(item) => item,
+            Err(decline) => panic!("declined: {decline}"),
+        }
+    };
+
+    let inline = lowered(None);
+    assert_eq!(
+        jsast::stmt_to_string(&inline.decl),
+        "function g(a) {\n  return BigInt.asIntN(128, a >> (BigInt(33) & 127n));\n}\n"
+    );
+    assert!(inline.bigints.is_empty());
+
+    let hoisted = lowered(Some(&names));
+    assert_eq!(
+        jsast::stmt_to_string(&hoisted.decl),
+        "function g(a) {\n  return BigInt.asIntN(128, a >> (($BI_ok ? $BI_33 : $BI_no()) & $BI_127));\n}\n"
+    );
+    assert_eq!(
+        hoisted.bigints,
+        std::collections::BTreeSet::from(["127".to_owned(), "33".to_owned()])
+    );
+    // The bindings, the `BigInt` test and the throwing function are references like any other,
+    // which is what the lane driver prepares.
+    for name in ["$BI_33", "$BI_127", "$BI_ok", "$BI_no"] {
+        assert!(
+            hoisted.refs.contains(&JsName::new(name.to_owned())),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn enum_switch_matches_the_18_enum_shapes_golden() {
     let interns = world();
@@ -2184,6 +2261,7 @@ fn if_and_while_regions_spell_tests_and_loops() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = function::lower(&input, &func, &plan, region()).expect("lowers with maps");
     let (mapped, mappings) =
@@ -2465,6 +2543,7 @@ fn cells_slots_and_direct_calls_match_the_14_pointers_entry() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let err = function::lower(&input, &func, &plan, straight(&func))
         .err()
@@ -3243,6 +3322,7 @@ fn asserts_call_the_panic_lang_item_with_a_location() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
     assert_eq!(
@@ -3282,6 +3362,7 @@ fn statics_and_vtables() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = super::super::lower_item(&input).expect("static lowers");
     assert_eq!(jsast::stmt_to_string(&lowered.decl), "let S = [5];\n");
@@ -3326,6 +3407,7 @@ fn statics_and_vtables() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = super::super::lower_item(&input).expect("vtable lowers");
     assert_eq!(
@@ -3373,6 +3455,7 @@ fn a_dyn_drop_calls_vtable_slot_zero_when_it_is_not_null() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
     assert_eq!(
@@ -3411,6 +3494,7 @@ fn unsupported_ops_decline_with_a_class() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let err = function::lower(&input, &func, &plan, straight(&func))
         .err()
@@ -3468,6 +3552,7 @@ fn lower_with(
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     match function::lower(&input, func, plan, region) {
         Ok(item) => jsast::stmt_to_string(&item.decl),
@@ -3785,6 +3870,7 @@ fn a_static_keyed_list_lowers_after_its_dedicated_contract_is_proven() {
             abi: None,
             physical: None,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            bigints: None,
         };
         function::lower(&input, &func, &plan, straight(&func))
             .map(|lowered| jsast::stmt_to_string(&lowered.decl))
@@ -5399,6 +5485,7 @@ fn flat_abi_i64_pair_param_with_param_cell_declares_box_instead_of_rebinding_mis
         abi: Some(&abi),
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
     let js = jsast::stmt_to_string(&lowered.decl);
@@ -5418,6 +5505,24 @@ fn flat_abi_i64_pair_param_with_param_cell_declares_box_instead_of_rebinding_mis
         !js.contains("\n  x = ["),
         "must not reassign undeclared `x = [...]`, got:\n{js}"
     );
+}
+
+#[test]
+fn i64_pair_to_f32_uses_sticky_helpers_without_double_rounding() {
+    let u32_expr =
+        super::i64_pair::i64_pair_to_float(false, 32, (jsast::id("lo"), jsast::id("hi")));
+    let i32_expr = super::i64_pair::i64_pair_to_float(true, 32, (jsast::id("lo"), jsast::id("hi")));
+    let u64_expr =
+        super::i64_pair::i64_pair_to_float(false, 64, (jsast::id("lo"), jsast::id("hi")));
+    assert_eq!(jsast::expr_to_string(&u32_expr), "$__mires_u64_f32(lo, hi)");
+    assert_eq!(jsast::expr_to_string(&i32_expr), "$__mires_i64_f32(lo, hi)");
+    assert_eq!(
+        jsast::expr_to_string(&u64_expr),
+        "(hi >>> 0) * 4294967296 + (lo >>> 0)"
+    );
+    let preamble = super::i64_pair::helper_preamble_js();
+    assert!(preamble.contains("function $__mires_u64_f32(lo, hi)"));
+    assert!(preamble.contains("function $__mires_i64_f32(lo, hi)"));
 }
 
 #[test]
@@ -5874,6 +5979,7 @@ fn fuse_local_bytes_str_eliminates_roundtrip_local() {
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
     let js = jsast::stmt_to_string(&lowered.decl);
@@ -6305,6 +6411,7 @@ fn host_string_inline_call_drop_preserves_call_and_non_adjacent_baseline_dealloc
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let js1 = jsast::stmt_to_string(
         &function::lower(&input1, &func1, &plan1, straight(&func1))
@@ -6394,6 +6501,7 @@ fn host_string_inline_call_drop_preserves_call_and_non_adjacent_baseline_dealloc
         abi: None,
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
     };
     let js2 = jsast::stmt_to_string(
         &function::lower(&input2, &func2, &plan2, straight(&func2))

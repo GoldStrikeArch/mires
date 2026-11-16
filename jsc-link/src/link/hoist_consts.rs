@@ -29,56 +29,68 @@ pub(super) type LoweredRow = (
     Option<String>,
 );
 
-fn is_pure_scalar_lit(expr: &Expr) -> bool {
+fn is_pure_scalar_lit(expr: &Expr, allow_bigint: bool) -> bool {
     match expr {
         Expr::Num(_)
         | Expr::RawNum(_)
-        | Expr::BigInt(_)
         | Expr::Str(_)
         | Expr::Bool(_)
         | Expr::Undefined
         | Expr::Null => true,
+        Expr::BigInt(_) => allow_bigint,
         Expr::Unary(op, inner) => {
             matches!(
                 op,
                 jsast::UnOp::Neg | jsast::UnOp::Pos | jsast::UnOp::Not | jsast::UnOp::BitNot
-            ) && is_pure_scalar_lit(inner)
+            ) && is_pure_scalar_lit(inner, allow_bigint)
         }
         _ => false,
     }
 }
 
-fn is_pure_factory_expr(expr: &Expr) -> bool {
+fn is_pure_factory_expr(expr: &Expr, allow_bigint: bool) -> bool {
     match expr {
         Expr::Num(_)
         | Expr::RawNum(_)
-        | Expr::BigInt(_)
         | Expr::Str(_)
         | Expr::Bool(_)
         | Expr::Undefined
         | Expr::Null => true,
+        Expr::BigInt(_) => allow_bigint,
         Expr::Unary(op, inner) => {
             matches!(op, UnOp::Neg | UnOp::Pos | UnOp::Not | UnOp::BitNot)
-                && is_pure_factory_expr(inner)
+                && is_pure_factory_expr(inner, allow_bigint)
         }
         Expr::Call(callee, args) => {
-            matches!(&**callee, Expr::Ident(n) if n == "BigInt")
+            allow_bigint
+                && matches!(&**callee, Expr::Ident(n) if n == "BigInt")
                 && args.len() == 1
                 && matches!(&args[0], Expr::Str(_) | Expr::Num(_))
         }
-        Expr::Array(items) => items.len() <= 32 && items.iter().all(is_pure_factory_expr),
+        Expr::Array(items) => {
+            items.len() <= 32
+                && items
+                    .iter()
+                    .all(|item| is_pure_factory_expr(item, allow_bigint))
+        }
         Expr::Object(entries) => {
-            entries.len() <= 32 && entries.iter().all(|(_, v)| is_pure_factory_expr(v))
+            entries.len() <= 32
+                && entries
+                    .iter()
+                    .all(|(_, v)| is_pure_factory_expr(v, allow_bigint))
         }
         _ => false,
     }
 }
 
-fn is_scalar_array_lit(expr: &Expr, min_len: usize) -> bool {
+fn is_scalar_array_lit(expr: &Expr, min_len: usize, allow_bigint: bool) -> bool {
     let Expr::Array(elems) = expr else {
         return false;
     };
-    elems.len() >= min_len && elems.iter().all(is_pure_scalar_lit)
+    elems.len() >= min_len
+        && elems
+            .iter()
+            .all(|elem| is_pure_scalar_lit(elem, allow_bigint))
 }
 
 fn is_location_object(expr: &Expr) -> bool {
@@ -127,7 +139,7 @@ struct ConstUsage {
 }
 
 struct HoistCollector {
-    bigint_enabled: bool,
+    allow_bigint: bool,
     counts: BTreeMap<String, (Expr, ConstUsage)>,
     unreachable_throws: usize,
 }
@@ -225,19 +237,13 @@ impl HoistCollector {
 
     fn visit_expr(&mut self, expr: &Expr, in_loop: bool, is_assign_target: bool) {
         if !is_assign_target {
-            if self.bigint_enabled {
-                if let Expr::BigInt(digits) = expr {
-                    self.record(format!("bi:{digits}"), expr, in_loop);
-                    return;
-                }
-            }
             if is_location_object(expr) {
                 let key = format!("loc:{expr}");
                 self.record(key, expr, in_loop);
                 return;
             }
             if let Expr::Index(obj, idx) = expr {
-                if is_scalar_array_lit(obj, 4) {
+                if is_scalar_array_lit(obj, 4, self.allow_bigint) {
                     let key = format!("arr:{obj}");
                     self.record(key, obj, in_loop);
                     self.visit_expr(idx, in_loop, false);
@@ -245,7 +251,7 @@ impl HoistCollector {
                 }
             }
             if let Expr::Arrow(params, ArrowBody::Expr(inner)) = expr {
-                if params.is_empty() && is_pure_factory_expr(inner) {
+                if params.is_empty() && is_pure_factory_expr(inner, self.allow_bigint) {
                     let key = format!("fn:{expr}");
                     self.record(key, expr, in_loop);
                     return;
@@ -355,9 +361,10 @@ fn collect_declared_locals(stmts: &[Stmt], params: &BTreeSet<String>, out: &mut 
 /// Checks whether `local` across the entire `body` (at any nesting depth, including inside loops)
 /// is declared once, initialized once to a pure scalar array literal (`len >= 8`), and only ever
 /// read as `local[index_expr]` in rvalue position (never mutated, shadowed, or escaped).
-fn find_read_only_table_init(body: &[Stmt], local: &str) -> Option<Expr> {
+fn find_read_only_table_init(body: &[Stmt], local: &str, allow_bigint: bool) -> Option<Expr> {
     struct Check<'a> {
         local: &'a str,
+        allow_bigint: bool,
         decl_count: usize,
         found_init: Option<Expr>,
         reads: usize,
@@ -371,7 +378,8 @@ fn find_read_only_table_init(body: &[Stmt], local: &str) -> Option<Expr> {
             match s {
                 Stmt::ExprStmt(Expr::Assign(lhs, rhs)) if matches!(lhs.as_ref(), Expr::Ident(n) if n == self.local) =>
                 {
-                    if self.found_init.is_some() || !is_scalar_array_lit(rhs, 8) {
+                    if self.found_init.is_some() || !is_scalar_array_lit(rhs, 8, self.allow_bigint)
+                    {
                         self.bad = true;
                         return;
                     }
@@ -386,7 +394,9 @@ fn find_read_only_table_init(body: &[Stmt], local: &str) -> Option<Expr> {
                             return;
                         }
                         if let Some(rhs) = init {
-                            if self.found_init.is_some() || !is_scalar_array_lit(rhs, 8) {
+                            if self.found_init.is_some()
+                                || !is_scalar_array_lit(rhs, 8, self.allow_bigint)
+                            {
                                 self.bad = true;
                                 return;
                             }
@@ -407,7 +417,9 @@ fn find_read_only_table_init(body: &[Stmt], local: &str) -> Option<Expr> {
                                 return;
                             }
                             if let Some(rhs) = init {
-                                if self.found_init.is_some() || !is_scalar_array_lit(rhs, 8) {
+                                if self.found_init.is_some()
+                                    || !is_scalar_array_lit(rhs, 8, self.allow_bigint)
+                                {
                                     self.bad = true;
                                     return;
                                 }
@@ -541,6 +553,7 @@ fn find_read_only_table_init(body: &[Stmt], local: &str) -> Option<Expr> {
 
     let mut check = Check {
         local,
+        allow_bigint,
         decl_count: 0,
         found_init: None,
         reads: 0,
@@ -562,7 +575,7 @@ fn strip_hoisted_table_stmts(stmts: &mut Vec<Stmt>, hoisted: &BTreeSet<String>) 
         match &mut s {
             Stmt::ExprStmt(Expr::Assign(lhs, rhs))
                 if matches!(lhs.as_ref(), Expr::Ident(n) if hoisted.contains(n))
-                    && is_scalar_array_lit(rhs, 8) =>
+                    && is_scalar_array_lit(rhs, 8, true) =>
             {
                 continue;
             }
@@ -697,7 +710,7 @@ fn replace_ident_in_expr(expr: &mut Expr, from: &str, to: &str) {
 }
 
 struct HoistRewriter<'a> {
-    bigint_enabled: bool,
+    allow_bigint: bool,
     const_map: &'a BTreeMap<String, JsName>,
     unreachable_fn: Option<&'a JsName>,
     changed: bool,
@@ -780,16 +793,6 @@ impl HoistRewriter<'_> {
 
     fn rewrite_expr(&mut self, expr: &mut Expr, is_assign_target: bool) {
         if !is_assign_target {
-            if self.bigint_enabled {
-                if let Expr::BigInt(digits) = expr {
-                    let key = format!("bi:{digits}");
-                    if let Some(hoisted) = self.const_map.get(&key) {
-                        *expr = Expr::Ident(hoisted.as_str().to_owned());
-                        self.changed = true;
-                        return;
-                    }
-                }
-            }
             if is_location_object(expr) {
                 let key = format!("loc:{expr}");
                 if let Some(hoisted) = self.const_map.get(&key) {
@@ -799,7 +802,7 @@ impl HoistRewriter<'_> {
                 }
             }
             if let Expr::Index(obj, idx) = expr {
-                if is_scalar_array_lit(obj, 4) {
+                if is_scalar_array_lit(obj, 4, self.allow_bigint) {
                     let key = format!("arr:{obj}");
                     if let Some(hoisted) = self.const_map.get(&key) {
                         **obj = Expr::Ident(hoisted.as_str().to_owned());
@@ -810,7 +813,7 @@ impl HoistRewriter<'_> {
                 }
             }
             if let Expr::Arrow(params, ArrowBody::Expr(inner)) = expr {
-                if params.is_empty() && is_pure_factory_expr(inner) {
+                if params.is_empty() && is_pure_factory_expr(inner, self.allow_bigint) {
                     let key = format!("fn:{expr}");
                     if let Some(hoisted) = self.const_map.get(&key) {
                         *expr = Expr::Ident(hoisted.as_str().to_owned());
@@ -958,6 +961,7 @@ fn run_with_opts(
     let mut counter = 0usize;
     let mut synthesized: Vec<LinkItem> = Vec::new();
     let mut table_dedup: BTreeMap<String, JsName> = BTreeMap::new();
+    let allow_bigint = opts.ecma_target != EcmaTarget::Es2018;
 
     // Pass 1: Hoist single-assignment read-only scalar lookup tables at any nesting depth.
     for (item_name, res, _, _) in lowered.iter_mut() {
@@ -971,7 +975,7 @@ fn run_with_opts(
 
         let mut candidates: Vec<(String, Expr)> = Vec::new();
         for local in &declared_locals {
-            if let Some(arr_expr) = find_read_only_table_init(body, local) {
+            if let Some(arr_expr) = find_read_only_table_init(body, local, allow_bigint) {
                 candidates.push((local.clone(), arr_expr));
             }
         }
@@ -1017,11 +1021,11 @@ fn run_with_opts(
     split_bigint_props(lowered, &exclusions);
     encode_internal_tags(lowered, &exclusions);
 
-    // Pass 2: Expression constants (`BigInt("...")` on ES2018, `Location` objects, inline
-    // `[...][i]`, capture-free `() => <const>`) and shared unreachable-abort outlining.
-    let bigint_enabled = opts.ecma_target == EcmaTarget::Es2018;
+    // Pass 2: Expression constants (`Location` objects, inline `[...][i]`, capture-free
+    // `() => <const>`) and shared unreachable-abort outlining. ES2018 BigInt constants are hoisted
+    // afterwards by `lower::bigint::hoist` with load-safe `$BI_ok` / `$BI_no()` guards.
     let mut collector = HoistCollector {
-        bigint_enabled,
+        allow_bigint,
         counts: BTreeMap::new(),
         unreachable_throws: 0,
     };
@@ -1033,7 +1037,7 @@ fn run_with_opts(
 
     let mut const_map: BTreeMap<String, JsName> = BTreeMap::new();
     for (key, (expr, usage)) in &collector.counts {
-        let qualify = if key.starts_with("bi:") || key.starts_with("loc:") {
+        let qualify = if key.starts_with("loc:") {
             usage.in_loop || usage.count >= 2
         } else if key.starts_with("arr:") {
             let len = match expr {
@@ -1105,7 +1109,7 @@ fn run_with_opts(
         for (item_name, res, _, _) in lowered.iter_mut() {
             let Ok(lowered_item) = res else { continue };
             let mut rewriter = HoistRewriter {
-                bigint_enabled,
+                allow_bigint,
                 const_map: &const_map,
                 unreachable_fn: unreachable_fn.as_ref(),
                 changed: false,
@@ -3374,6 +3378,7 @@ mod tests {
                     names: Vec::new(),
                     dts: None,
                     js_alloc_origins: Vec::new(),
+                    bigints: BTreeSet::new(),
                 }),
                 OptStats::default(),
                 None,
@@ -3477,11 +3482,12 @@ mod tests {
         };
         let (table, lowered, _, _, added) = test_run(opts, vec![("demo", fn_stmt.clone())]);
         assert!(added);
-        // Expect 2 constants (loc + BigInt) and 1 unreachable helper function ($ur_0).
-        assert_eq!(table.len(), 3);
+        // Expect 1 constant (loc) and 1 unreachable helper function ($ur_0); BigInt constants are
+        // left for `lower::bigint::hoist` so they get load-safe `$BI_ok`/`$BI_no()` guards.
+        assert_eq!(table.len(), 2);
         assert_eq!(
             table.values().filter(|i| i.kind == ItemKind::Const).count(),
-            2
+            1
         );
         assert_eq!(table.values().filter(|i| i.kind == ItemKind::Fn).count(), 1);
         let Ok(item) = &lowered[0].1 else {
@@ -3497,8 +3503,8 @@ mod tests {
             "throws outlined: {rendered}"
         );
         assert!(
-            !rendered.contains("BigInt("),
-            "BigInt hoisted on Es2018: {rendered}"
+            rendered.contains("BigInt(\"12345678901234567890\")"),
+            "BigInt left for lower::bigint::hoist on Es2018: {rendered}"
         );
         assert!(
             !rendered.contains("lib.rs"),
@@ -3679,6 +3685,7 @@ mod tests {
                     names: Vec::new(),
                     dts: None,
                     js_alloc_origins: Vec::new(),
+                    bigints: BTreeSet::new(),
                 }),
                 OptStats::default(),
                 None,
@@ -3793,6 +3800,7 @@ mod tests {
                 names: Vec::new(),
                 dts: None,
                 js_alloc_origins: Vec::new(),
+                bigints: BTreeSet::new(),
             }),
             OptStats::default(),
             None,
@@ -4175,6 +4183,7 @@ mod tests {
                 names: Vec::new(),
                 dts: None,
                 js_alloc_origins: Vec::new(),
+                bigints: BTreeSet::new(),
             }),
             OptStats::default(),
             None,

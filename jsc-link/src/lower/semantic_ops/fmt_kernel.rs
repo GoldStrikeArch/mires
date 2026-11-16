@@ -16,7 +16,9 @@
 //! commit would drop, and — when the destination labels native — **marks** the site in band by
 //! committing carriers onto the constructor calls' results (`Arguments::new` → the concatenated
 //! [`Carrier::HostString`]; each `Argument::new_display` → the argument's host text, at
-//! [`Carrier::StringBuilder`] when the display source is a committed builder). The marks travel
+//! [`Carrier::StringBuilder`] when the display source is a committed builder; each single-use
+//! rename between those results and their consumers, [`Site::renames`], → the mark of the value
+//! it renames). The marks travel
 //! with the `Func` through phase C's optimizer, so [`intercept`] — the emission hook in
 //! `lower/js/call.rs` — needs no side table: a marked constructor call lowers to its text, the
 //! consumer call to the concatenation in the native `String` layout, and an *unmarked* machinery
@@ -107,6 +109,14 @@ pub(crate) struct Site {
     pub args_value: ValueId,
     /// `(block index, op index)` of each `Argument::new_display` call.
     pub display_calls: Vec<(usize, usize)>,
+    /// The single-use `Copy`/`Move` renames between a constructor call's result and the operand
+    /// that consumes it, each beside the result it renames: the `Arguments` operand of the
+    /// consumer back to `args_value`, and each argument-array element back to its
+    /// `new_display` result. The runtime MIR `js-cleanup=on` prepares (rustc-cleanup: drop
+    /// elaboration without the optimization passes) keeps them where optimized MIR's copy
+    /// propagation would not; the commit gives each the mark of the value it renames, so the
+    /// whole spine carries the native text the use-once check promised.
+    pub renames: Vec<(ValueId, ValueId)>,
     /// The static template pieces; always `args.len() + 1` of them.
     pub pieces: Vec<String>,
     pub args: Vec<DisplayArg>,
@@ -213,7 +223,7 @@ impl<'a> View<'a> {
                 root: Root::Value(inner),
                 path,
                 ..
-            } if path.is_empty() => self.const_bytes(*inner),
+            } if is_borrow_or_reborrow(path) => self.const_bytes(*inner),
             OpKind::Aggregate { fields, .. } => fields
                 .iter()
                 .map(|field| match self.def(*field).map(|op| &op.kind) {
@@ -241,7 +251,7 @@ impl<'a> View<'a> {
                     root: Root::Value(inner),
                     path,
                     ..
-                } if path.is_empty() => at = *inner,
+                } if is_borrow_or_reborrow(path) => at = *inner,
                 OpKind::Aggregate { fields, .. } => return Some((fields.clone(), spine)),
                 OpKind::Const(tree) => {
                     // The empty argument list of `format!("literal")` is a constant.
@@ -320,6 +330,15 @@ impl<'a> View<'a> {
             }
         }
     }
+}
+
+/// A borrow path the template and argument-list chases see through: `&v` itself (`[]`), or the
+/// reborrow `&*v` of a reference `v` (`[Deref]`), which names exactly what `v` already points at.
+/// Optimized MIR folds the reborrow away (`InstSimplify`); the runtime MIR `js-cleanup=on`
+/// prepares without the optimization passes keeps it, so a cleanup build's `Arguments::new`
+/// receives its template as `&*template`.
+fn is_borrow_or_reborrow(path: &[Proj]) -> bool {
+    matches!(path, [] | [Proj::Deref])
 }
 
 /// [`ConstTree`] to raw bytes, references peeled (v1 `const_tree_bytes`).
@@ -557,10 +576,12 @@ fn prove_site(
 ) -> Option<Site> {
     // The Arguments operand, through single-use renames to the `Arguments::new` call.
     let mut spine = vec![arguments];
+    let mut chain = Vec::new();
     let mut at = arguments;
     let args_value = loop {
         match view.def(at).map(|op| &op.kind) {
             Some(OpKind::Copy(inner) | OpKind::Move(inner)) => {
+                chain.push(at);
                 at = *inner;
                 spine.push(at);
             }
@@ -568,6 +589,10 @@ fn prove_site(
             _ => return None,
         }
     };
+    let mut renames: Vec<(ValueId, ValueId)> = chain
+        .into_iter()
+        .map(|rename| (rename, args_value))
+        .collect();
     let new_call = view.def_at(args_value)?;
     let (StandardOperation::FormatArgsNew, new_item) = *machinery.get(&new_call)? else {
         return None;
@@ -591,9 +616,11 @@ fn prove_site(
     for element in &elements {
         let mut at = *element;
         spine.push(at);
+        let mut chain = Vec::new();
         let value = loop {
             match view.def(at).map(|op| &op.kind) {
                 Some(OpKind::Copy(inner) | OpKind::Move(inner)) => {
+                    chain.push(at);
                     at = *inner;
                     spine.push(at);
                 }
@@ -601,6 +628,7 @@ fn prove_site(
                 _ => return None,
             }
         };
+        renames.extend(chain.into_iter().map(|rename| (rename, value)));
         let display_call = view.def_at(value)?;
         let (StandardOperation::FormatArgumentNewDisplay, display_item) =
             *machinery.get(&display_call)?
@@ -654,6 +682,7 @@ fn prove_site(
         new_call,
         args_value,
         display_calls,
+        renames,
         pieces,
         args,
         callees,

@@ -30,6 +30,8 @@ pub const HELPER_F64_VIEW: &str = "$__mires_i64_f64_view";
 pub const HELPER_I32_VIEW: &str = "$__mires_i64_i32_view";
 pub const HELPER_F64_TO_BITS: &str = "$__mires_i64_f64_to_bits";
 pub const HELPER_BITS_TO_F64: &str = "$__mires_i64_bits_to_f64";
+pub const HELPER_U64_F32: &str = "$__mires_u64_f32";
+pub const HELPER_I64_F32: &str = "$__mires_i64_f32";
 
 /// All linker helper names that `i64_pair` lowering may reference.
 pub const HELPER_NAMES: &[&str] = &[
@@ -43,6 +45,8 @@ pub const HELPER_NAMES: &[&str] = &[
     HELPER_I32_VIEW,
     HELPER_F64_TO_BITS,
     HELPER_BITS_TO_F64,
+    HELPER_U64_F32,
+    HELPER_I64_F32,
 ];
 
 /// Returns `Some(signed)` if `ty` peels to a 64-bit integer (`i64` or `u64`), `None` otherwise
@@ -1169,16 +1173,20 @@ pub fn cast_to_i64_pair(
     (lo, hi)
 }
 
-/// Converts a 64-bit `(lo, hi)` pair into `f32` or `f64` with ZERO `BigInt`.
+/// Converts a 64-bit `(lo, hi)` pair into `f32` or `f64` with ZERO `BigInt` and without
+/// `f64` intermediate double-rounding on `f32`.
 pub fn i64_pair_to_float(signed: bool, float_bits: u32, (lo, hi): (Expr, Expr)) -> Expr {
+    if float_bits == 32 {
+        let helper = if signed {
+            HELPER_I64_F32
+        } else {
+            HELPER_U64_F32
+        };
+        return jsast::call(jsast::id(helper), vec![lo, hi]);
+    }
     let hi_num = if signed { hi } else { jsast::u32_wrap(hi) };
     let hi_scaled = jsast::binary(JsBinOp::Mul, hi_num, jsast::num(4294967296.0));
-    let exact_f64 = jsast::binary(JsBinOp::Add, hi_scaled, jsast::u32_wrap(lo));
-    if float_bits == 32 {
-        jsast::fround(exact_f64)
-    } else {
-        exact_f64
-    }
+    jsast::binary(JsBinOp::Add, hi_scaled, jsast::u32_wrap(lo))
 }
 
 /// Converts an `f32`/`f64` expression into `(lo, hi)` using Rust saturating float-to-int rules.
@@ -1488,6 +1496,30 @@ pub fn needed_helper_items(
                      {HELPER_I32_VIEW}[0] = lo;\n  \
                      {HELPER_I32_VIEW}[1] = hi;\n  \
                      return {HELPER_F64_VIEW}[0];\n\
+                     }}\n"
+                ),
+            ),
+            HELPER_U64_F32 => make(
+                name,
+                ItemKind::Fn,
+                &[],
+                format!(
+                    "\nfunction {HELPER_U64_F32}(lo, hi) {{\n  \
+                     const h = hi >>> 0;\n  \
+                     const l = h >= 2097152 ? (((lo & -4096) | ((lo & 4095) !== 0 ? 2048 : 0)) >>> 0) : (lo >>> 0);\n  \
+                     return Math.fround(h * 4294967296 + l);\n\
+                     }}\n"
+                ),
+            ),
+            HELPER_I64_F32 => make(
+                name,
+                ItemKind::Fn,
+                &[],
+                format!(
+                    "\nfunction {HELPER_I64_F32}(lo, hi) {{\n  \
+                     const h = hi | 0;\n  \
+                     const l = (((h + 2097152) | 0) >>> 0) >= 4194304 ? (((lo & -4096) | ((lo & 4095) !== 0 ? 2048 : 0)) >>> 0) : (lo >>> 0);\n  \
+                     return Math.fround(h * 4294967296 + l);\n\
                      }}\n"
                 ),
             ),

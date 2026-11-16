@@ -196,6 +196,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "structurizer",
+ "test-node",
 ]
 
 [[package]]
@@ -300,6 +301,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "structurizer",
+ "test-node",
 ]
 
 [[package]]
@@ -410,6 +412,10 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "test-node"
+version = "0.1.0"
 
 [[package]]
 name = "thiserror"
