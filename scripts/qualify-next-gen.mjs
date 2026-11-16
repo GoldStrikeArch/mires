@@ -762,7 +762,7 @@ const MAIN_DYLIB = resolve(MAIN_ROOT, 'target/release/librustc_codegen_mires.dyl
 const MAIN_JSC_LINK = resolve(MAIN_ROOT, 'target/release/jsc-link');
 const MAIN_RB_SYSROOT = resolve(
   MAIN_ROOT,
-  'build/sysroots/b845d7a91c66afe024a793f544e1643a22e071f479569f53c30b21d43d2d5d15',
+  'build/sysroots/c40e0513c4b5de215d41712d4ce772e34359f199557a7c5ba6ce67b585f10da3',
 );
 const MAIN_DEFAULT_SYSROOT = resolve(MAIN_ROOT, 'build/sysroot');
 const mainSysroot = existsSync(MAIN_RB_SYSROOT) ? MAIN_RB_SYSROOT : MAIN_DEFAULT_SYSROOT;
