@@ -608,7 +608,7 @@ impl<'a> JsCx<'a> {
         let mask = |value: Expr| mask(repr, signed, bits, value);
         let shift_amount = |rhs: Expr| {
             let amount = match (repr, table.int_repr(rhs_ty)) {
-                (IntRepr::BigInt, IntRepr::Number) => jsast::to_bigint(rhs),
+                (IntRepr::BigInt, IntRepr::Number) => self.to_bigint(rhs),
                 (IntRepr::Number, IntRepr::BigInt) => {
                     jsast::to_number(jsast::bigint_mask(false, 32, rhs))
                 }
@@ -688,6 +688,11 @@ impl<'a> JsCx<'a> {
             CastKind::IntToInt => self.int_to_int(from_ty, to_ty, value),
             CastKind::FloatToInt => self.float_to_int(to_ty, value),
             CastKind::IntToFloat => {
+                if table.int_repr(from_ty) == IntRepr::BigInt
+                    && value::float_bits(table, to_ty) == Some(32)
+                {
+                    return Ok(jsast::rt_call("i2f32_big", vec![value]));
+                }
                 let value = match table.int_repr(from_ty) {
                     IntRepr::BigInt => jsast::to_number(value),
                     IntRepr::Number => value,

@@ -836,6 +836,15 @@ fn run_with_opts(
             live.insert(helper_name);
         }
     }
+    // ES2018 spells a BigInt constant as a call that parses its digits whenever it runs, so phase
+    // C names a module-level binding for each one instead (`lower/bigint.rs`). The prefix is
+    // allocated around every name the program spells, its first-pass clones and registers
+    // included; a retry spells a subset of those.
+    let bigint_names = if opts.ecma_target == crate::opts::EcmaTarget::Es2018 {
+        crate::lower::bigint::BigIntNames::allocate(&work_table, plan.spill_names())
+    } else {
+        None
+    };
     let mut plan_retries = 0;
     let mut ready_allowed = true;
     let mut physical = planned_physical;
@@ -877,6 +886,7 @@ fn run_with_opts(
                 &defined,
                 &live,
                 fault,
+                bigint_names.as_ref(),
             )
         });
         if retry
@@ -922,6 +932,16 @@ fn run_with_opts(
     let mut added_items = !spills.is_empty() || !repr.clones.is_empty() || !abi_clones.is_empty();
     if opts.optimizer == crate::opts::OptimizerMode::On {
         added_items |= super::hoist_consts::run(table, &mut lowered, &mut defined, &mut live);
+        if let Some(names) = &bigint_names {
+            for (item_name, result, _, _) in lowered.iter_mut() {
+                let Ok(lowering) = result else { continue };
+                if !matches!(lowering.decl, jsast::Stmt::FunctionDecl { .. }) {
+                    continue;
+                }
+                crate::lower::bigint::hoist(&mut lowering.decl, names, &mut lowering.bigints);
+                lowering.refs = refs_of(&lowering.decl, item_name);
+            }
+        }
     }
     for spill in spills {
         // Never `insert`: a register's name was allocated around every name the program already
@@ -937,6 +957,41 @@ fn run_with_opts(
             )),
         }
     }
+
+    // One `const` per BigInt constant the lowerings name, plus the `BigInt` test and the throwing
+    // function the guarded uses name, the same way: prepared before `apply` checks a lowering
+    // against `defined` and `live`, and never over an item the program defines (the prefix was
+    // allocated around all of them). A binding no installed item ends up naming is unreachable and
+    // is not printed.
+    let constants: BTreeSet<&String> = lowered
+        .iter()
+        .filter_map(|(_, result, _, _)| result.as_ref().ok())
+        .flat_map(|lowering| &lowering.bigints)
+        .collect();
+    let mut added_bigints = false;
+    let support = match &bigint_names {
+        Some(names) if !constants.is_empty() => names.support().to_vec(),
+        _ => Vec::new(),
+    };
+    let hoisted = constants
+        .into_iter()
+        .filter_map(|digits| bigint_names.as_ref().and_then(|names| names.item(digits)));
+    for constant in support.into_iter().chain(hoisted) {
+        defined.insert(constant.name.clone());
+        live.insert(constant.name.clone());
+        match table.entry(constant.name.clone()) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(constant);
+                added_bigints = true;
+            }
+            std::collections::btree_map::Entry::Occupied(slot) => dcx.err(format!(
+                "rustc_codegen_js: the BigInt constant hoist allocated the name `{}`, which the \
+                 program already defines; this is a compiler bug, please report it",
+                slot.key().as_str()
+            )),
+        }
+    }
+    let added_items = added_items || added_bigints;
 
     let mut passes = Passes::default();
     let mut range_asserts: u64 = 0;
@@ -1175,6 +1230,7 @@ fn lower_input_with_retargets<'a>(
         abi: None,
         physical: None,
         call_retargets,
+        bigints: None,
     })
 }
 
@@ -1676,6 +1732,7 @@ fn lower_all(
     defined: &BTreeSet<JsName>,
     live: &BTreeSet<JsName>,
     fault: Option<&str>,
+    bigints: Option<&crate::lower::bigint::BigIntNames>,
 ) -> (Vec<Lowered>, bool) {
     let mut lowered = Vec::with_capacity(names.len());
     let mut retry = false;
@@ -1708,6 +1765,7 @@ fn lower_all(
         };
         input.abi = Some(plan);
         input.physical = Some(physical);
+        input.bigints = bigints;
         crate::profile::bump(crate::profile::Counter::LowerFinal);
         let mut stats = OptStats::default();
         let mut alloc = None;
@@ -1716,7 +1774,13 @@ fn lower_all(
             // `Func` whole (Phase 4, D7), exactly like the `RCGJS_REPR_FORCE` harness.
             Some(body) => {
                 funcs.remove(name);
-                Ok(native_body_item(name, body))
+                Ok(native_body_item(
+                    name,
+                    body,
+                    (ctx.opts.optimizer != crate::opts::OptimizerMode::On)
+                        .then_some(bigints)
+                        .flatten(),
+                ))
             }
             None => match funcs.remove(name) {
                 // A `static` or a vtable: no `Func`, no passes, lowered from its own tree.
@@ -1826,17 +1890,23 @@ fn lower_all(
 }
 
 /// The [`LoweredItem`] of one committed standard-operation body: the registry's statements as a
-/// function declaration, its refs exactly as `js::function::finish` reports them (the driver
-/// demands equality with the declaration's own identifiers).
+/// function declaration, its BigInt constants hoisted as `js::function::finish` hoists them, its
+/// refs exactly as `finish` reports them (the driver demands equality with the declaration's own
+/// identifiers).
 fn native_body_item(
     name: &JsName,
     body: &crate::plan::representation::NativeBody,
+    bigint_names: Option<&crate::lower::bigint::BigIntNames>,
 ) -> crate::lower::LoweredItem {
-    let decl = jsast::function(
+    let mut decl = jsast::function(
         name.as_str().to_owned(),
         body.parameters.clone(),
         body.statements.clone(),
     );
+    let mut bigints = BTreeSet::new();
+    if let Some(names) = bigint_names {
+        crate::lower::bigint::hoist(&mut decl, names, &mut bigints);
+    }
     let refs = refs_of(&decl, name);
     crate::lower::LoweredItem {
         decl,
@@ -1846,6 +1916,7 @@ fn native_body_item(
         dts: None,
         zombies: Vec::new(),
         js_alloc_origins: Vec::new(),
+        bigints,
     }
 }
 
@@ -2787,6 +2858,7 @@ mod tests {
             dts: None,
             zombies: Vec::new(),
             js_alloc_origins: Vec::new(),
+            bigints: BTreeSet::new(),
         }
     }
 

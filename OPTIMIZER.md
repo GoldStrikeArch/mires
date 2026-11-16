@@ -8,7 +8,7 @@ This document records the current generic optimizer architecture for the Rust-to
 
 ## Contract
 
-In `on` mode, the optimizer may change the internal representation of an ordinary Rust `Vec`, `String`, or aggregate that contains them. It must preserve Rust-visible length, capacity, mutation, move, alias, panic, and drop behavior for every operation it lowers. A rejected proof keeps the existing representation for the complete connected region. There is no runtime deoptimization or speculative representation test. The planner may insert statically selected `Convert` adapters at proven cut edges.
+In `on` mode, the optimizer may change the internal representation of an ordinary Rust `Vec`, `String`, or aggregate that contains them. It must preserve Rust-visible length, mutation, move, alias, panic, and drop behavior for every operation it lowers. Capacity is preserved with one exception: a native `String` grows exact-fit (`CONTRACT.md`, "`str` is a hybrid"), so after a committed `format!` or `to_string` its `capacity()` equals its length where Rust's amortized growth reports more (3 for `"0.5"`, where Rust gives 8); it is never below `len`. A rejected proof keeps the existing representation for the complete connected region. There is no runtime deoptimization or speculative representation test. The planner may insert statically selected `Convert` adapters at proven cut edges.
 
 Exported candidate slots stay on the baseline carrier. Native shapes are private until the linker can emit and verify a stable canonical wrapper; publishing a representation row is not itself an external adapter. Exchange across artifacts or between `off` and `on` output remains unsupported unless an explicit host contract says otherwise.
 

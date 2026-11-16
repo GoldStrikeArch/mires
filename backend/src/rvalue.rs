@@ -562,6 +562,11 @@ impl<'tcx> FnCx<'_, 'tcx> {
             CastKind::IntToInt => self.codegen_int_to_int(from_ty, to_ty, value),
             CastKind::FloatToInt => self.codegen_float_to_int(to_ty, value),
             CastKind::IntToFloat => {
+                if int_repr(from_ty) == IntRepr::BigInt
+                    && matches!(to_ty.kind(), ty::Float(ty::FloatTy::F32))
+                {
+                    return jsast::rt_call("i2f32_big", vec![value]);
+                }
                 let value = match int_repr(from_ty) {
                     IntRepr::BigInt => jsast::to_number(value),
                     IntRepr::Number => value,

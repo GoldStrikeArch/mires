@@ -1,0 +1,14 @@
+[package]
+name = "test-node"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Test only: runs the JavaScript the unit tests check in a few reused node workers"
+
+# A dev-dependency of the crates whose tests run JavaScript, and of nothing else, so no build of
+# the compiler (and no backend dylib) contains or depends on it.
+[lib]
+crate-type = ["rlib"]
+
+[lints]
+workspace = true

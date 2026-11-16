@@ -362,7 +362,9 @@ impl Queuer<'_> {
                 // `Object.assign({}, v)` is how an aggregate is cloned.
                 (Expr::Ident(name), "assign") if name == "Object" => Purity::Read,
                 // The saturating float casts; every other shim member has effects.
-                (Expr::Ident(name), "f2i" | "f2i_big") if name == "__rt" => Purity::Read,
+                (Expr::Ident(name), "f2i" | "f2i_big" | "i2f32_big") if name == "__rt" => {
+                    Purity::Read
+                }
                 // The `str` conversions. Each is a function of its arguments and writes nothing a
                 // program can read: `str_bytes` fills a memo, but the identity that memo restores
                 // is documented as not guaranteed, so nothing may depend on where the call lands.

@@ -3852,3 +3852,18 @@ globalThis.__rt.u8array_into_bytes = (src, dst) => {
   const off = dst.off;
   for (let i = 0; i < len; i += 1) buf[off + i] = src[i];
 };
+
+// Exact BigInt -> f32 conversion without intermediate f64 double-rounding when
+// |x| > 2^53. Collapses bits below the top 53 bits of |x| into a single sticky
+// LSB before scaling by the exact power of 2 and rounding once with Math.fround.
+globalThis.__rt.i2f32_big = (x) => {
+  const neg = x < BigInt("0");
+  const n = neg ? -x : x;
+  const bits = n.toString(2).length;
+  if (bits <= 53) return Math.fround(Number(x));
+  const shift = BigInt(bits - 53);
+  const q = n >> shift;
+  const sticky = (q << shift) !== n ? BigInt("1") : BigInt("0");
+  const scaled = Number(q | sticky) * Math.pow(2, bits - 53);
+  return Math.fround(neg ? -scaled : scaled);
+};

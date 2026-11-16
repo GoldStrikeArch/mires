@@ -46,6 +46,7 @@
 //! `linkage` and `order` are not in [`LoweredItem`] at all, because they are what the item IS
 //! and no lane may move an item in the program.
 
+pub mod bigint;
 pub mod fuse;
 pub mod js;
 pub mod plan;
@@ -116,6 +117,12 @@ pub struct LowerInput<'a> {
     /// encoded `StrId` remains untouched; version names are a linker decision and never mutate an
     /// object file's shared intern table.
     pub call_retargets: &'a CallRetargets,
+    /// The names of the program's module-level BigInt constants (`bigint.rs`). `Some` only for
+    /// the lowering phase C installs on the ES2018 target, which then spells every BigInt constant
+    /// of a function as its binding's name and widens an integer literal at compile time
+    /// (`JsCx::to_bigint`); a `static` or vtable keeps its inline constants. `None` everywhere
+    /// else, the whole-program cost trials included: they price the inline spelling.
+    pub bigints: Option<&'a bigint::BigIntNames>,
 }
 
 /// One lowered item, as an AST plus what the printer needs around it.
@@ -137,6 +144,10 @@ pub struct LoweredItem {
     pub zombies: Vec<FlatZombie>,
     /// JIR provenance for allocation-bearing expressions in [`Self::decl`].
     pub js_alloc_origins: Vec<crate::analysis::js_alloc::Origin>,
+    /// The digits of every BigInt constant [`Self::decl`] names by its module-level binding
+    /// ([`LowerInput::bigints`]): the bindings the driver adds to the program. Empty unless the
+    /// constants were hoisted.
+    pub bigints: BTreeSet<String>,
 }
 
 /// Lowers one item's JIR-S body to a JavaScript declaration.
@@ -233,6 +244,7 @@ fn forced_semantic_rewrite(input: &LowerInput<'_>) -> Option<Result<LoweredItem,
                 dts: None,
                 zombies: Vec::new(),
                 js_alloc_origins: Vec::new(),
+                bigints: BTreeSet::new(),
             }))
         }
         Err(decline) => decline_with(format!(

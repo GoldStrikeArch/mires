@@ -50,7 +50,9 @@ use crate::analysis::valueflow::{self, CandidateKind, NodeKey, Site, Step, Union
 use crate::item::{prologue, write_program, JsName, LinkItem};
 use crate::jir::decline::{CostDecline, Decline, VersionDecline};
 use crate::jir::interns::Interns;
-use crate::jir::repr::{Carrier, CarrierPolicy, Func, Op, OpKind, Proj, Root, ValueDef, ValueId};
+use crate::jir::repr::{
+    Carrier, CarrierPolicy, Func, Op, OpKind, Proj, RBlockId, RTerm, Root, ValueDef, ValueId,
+};
 use crate::jir::semantic::{
     BodySemantic, CallSemantic, Callee, DropGlue, ItemId, StandardOperation,
 };
@@ -320,6 +322,7 @@ fn native_lowered(name: &JsName, body: &NativeBody) -> crate::lower::LoweredItem
         dts: None,
         zombies: Vec::new(),
         js_alloc_origins: Vec::new(),
+        bigints: BTreeSet::new(),
     }
 }
 
@@ -1220,6 +1223,7 @@ impl Planner<'_> {
             abi: None,
             physical: None,
             call_retargets,
+            bigints: None,
         })
     }
 
@@ -2704,6 +2708,12 @@ impl Planner<'_> {
                         _ => Carrier::HostString,
                     };
                 }
+                // A rename on the spine reads a marked value and is its one consumer's operand:
+                // it carries the same native text, or the carrier verifier sees a native value
+                // moved into a baseline one.
+                for (rename, renamed) in &site.renames {
+                    out.values[rename.0 as usize].carrier = out.values[renamed.0 as usize].carrier;
+                }
                 if matches!(site.kind, SiteKind::WriteFmt { .. })
                     || dest == Some(Carrier::StringBuilder)
                 {
@@ -2720,8 +2730,15 @@ impl Planner<'_> {
             }
         }
 
+        // The result converts of invoked calls, by the normal successor they open.
+        let mut normal_heads: Vec<(RBlockId, Op)> = Vec::new();
         for block_index in 0..out.blocks.len() {
             let taken = std::mem::take(&mut out.blocks[block_index].ops);
+            let last = taken.len().checked_sub(1);
+            let invoke_normal = match &out.blocks[block_index].term {
+                RTerm::Invoke { normal, .. } => Some(normal.0),
+                _ => None,
+            };
             let mut rebuilt = Vec::with_capacity(taken.len());
             for (op_index, mut op) in taken.into_iter().enumerate() {
                 if fmt_elide.contains(&(block_index, op_index)) {
@@ -2891,11 +2908,19 @@ impl Planner<'_> {
                                 let fresh = push_value(&mut out.values, ty, from, origin);
                                 op.result = Some(fresh);
                                 rebuilt.push(op);
-                                rebuilt.push(Op {
+                                let convert = Op {
                                     result: Some(result),
                                     origin,
                                     kind: OpKind::Convert { v: fresh, from, to },
-                                });
+                                };
+                                // An invoked call must stay its block's last op, and its result
+                                // is defined only at the private normal successor
+                                // (`RTerm::Invoke`): the convert opens that block instead, where
+                                // `fresh` is defined and `result` still dominates every use.
+                                match invoke_normal.filter(|_| Some(op_index) == last) {
+                                    Some(normal) => normal_heads.push((normal, convert)),
+                                    None => rebuilt.push(convert),
+                                }
                                 adapters += 1;
                                 touched = true;
                                 self.conversion_members(types, interns, ty, from, to, &mut members);
@@ -2992,6 +3017,15 @@ impl Planner<'_> {
                 }
             }
             out.blocks[block_index].ops = rebuilt;
+        }
+        for (normal, convert) in normal_heads {
+            let Some(block) = out.blocks.iter_mut().find(|block| block.id == normal) else {
+                return Err((
+                    BTreeSet::new(),
+                    format!("`{}` invoke has no normal successor", name.as_str()),
+                ));
+            };
+            block.ops.insert(0, convert);
         }
 
         if !touched {
@@ -4279,6 +4313,98 @@ mod tests {
                 .commit_func(problem, &name, func, &carriers, &BTreeMap::new(), false)
                 .expect_err("the boxed cell refuses the cut");
             assert!(error.1.contains("boxed cell"), "{}", error.1);
+        });
+    }
+
+    /// A cut at an invoked call (the `js-cleanup=on` shape of every call that may unwind): the
+    /// argument's convert precedes the call, the call stays its block's last op, and the
+    /// result's convert opens the private normal successor, where the result is defined. The
+    /// rewrite verifies; spelling the result convert after the call would not.
+    #[test]
+    fn a_cut_invoked_call_converts_its_result_at_the_normal_successor() {
+        let mut prog = Prog::new();
+        prog.add("callee", identity_func(2, STRING, STRING));
+        let mut b = FuncBuilder::new(item(1), sig(vec![STRING], STRING));
+        let p = b.param(STRING, NO_ORIGIN);
+        let entry = FuncBuilder::ENTRY;
+        let normal = b.block();
+        let unwind = b.block();
+        let r = b.op(
+            entry,
+            OpKind::Call {
+                callee: direct(2),
+                function: None,
+                args: vec![p],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            STRING,
+            NO_ORIGIN,
+        );
+        b.terminate(
+            entry,
+            RTerm::Invoke {
+                normal: (normal, Vec::new()),
+                unwind: (unwind, Vec::new()),
+            },
+        );
+        b.terminate(normal, RTerm::Return(Some(r)));
+        b.terminate(unwind, RTerm::Throw(None));
+        prog.add("caller", b.finish());
+        let name = JsName::new("caller".to_owned());
+        with_planner(&prog, |planner, problem, _| {
+            // The callee native at both slots, the caller baseline: one convert on each side.
+            let mut carriers: Vec<Option<Carrier>> = vec![None; problem.nodes.len()];
+            for key in [
+                value_node("callee", Site::Value(ValueId(0)), &[]),
+                value_node("callee", Site::Ret, &[]),
+            ] {
+                carriers[problem.resolution[&key]] = Some(Carrier::StringBuilder);
+            }
+            let func = prog.funcs[&name].as_ref().expect("the func lowered");
+            let (out, adapters, _) = planner
+                .commit_func(problem, &name, func, &carriers, &BTreeMap::new(), false)
+                .unwrap_or_else(|error| panic!("the invoke commit refused: {}", error.1))
+                .expect("the cut touches the caller");
+            assert_eq!(adapters, 2);
+            let ops = &out.blocks[0].ops;
+            assert!(
+                matches!(
+                    ops.as_slice(),
+                    [
+                        Op {
+                            kind: OpKind::Convert {
+                                from: Carrier::Baseline,
+                                to: Carrier::StringBuilder,
+                                ..
+                            },
+                            ..
+                        },
+                        Op {
+                            kind: OpKind::Call { .. },
+                            ..
+                        },
+                    ]
+                ),
+                "{ops:?}"
+            );
+            let head = &out.blocks[normal.0 as usize].ops;
+            assert!(
+                matches!(
+                    head.as_slice(),
+                    [Op {
+                        result: Some(converted),
+                        kind: OpKind::Convert {
+                            from: Carrier::StringBuilder,
+                            to: Carrier::Baseline,
+                            ..
+                        },
+                        ..
+                    }] if *converted == r
+                ),
+                "{head:?}"
+            );
         });
     }
 }
