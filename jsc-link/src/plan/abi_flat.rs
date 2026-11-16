@@ -1203,7 +1203,18 @@ pub fn plan_excluding(
         .filter_map(|(name, item)| item.jir.interns().map(|interns| (name.clone(), interns)))
         .collect();
     let graph = crate::analysis::callgraph::build(funcs, &interns);
-    let effects = crate::analysis::effects::compute(funcs, &interns, &graph);
+    let has_custom_allocator = table.values().any(|item| {
+        matches!(
+            item.late_ir.artifact_allocator_provider(),
+            crate::late_ir::AllocatorProvider::Custom | crate::late_ir::AllocatorProvider::Conflict
+        )
+    });
+    let effects = crate::analysis::effects::compute_with_allocator(
+        funcs,
+        &interns,
+        &graph,
+        has_custom_allocator,
+    );
 
     // The candidates, with the shape each parameter would take and how the body uses it.
     let mut candidates: BTreeMap<ItemId, Candidate> = BTreeMap::new();
@@ -1330,11 +1341,11 @@ pub fn plan_excluding(
                 .as_ref()
                 .is_some_and(|shape| shape.is_scalar_ref() && !shape.mutable)
                 && (!read_only_callee || use_.mutated);
-            let unflattened_loop_entry_mut_enum = entry_targeted
+            let unflattened_loop_entry_by_ref = entry_targeted
                 && shape
                     .as_ref()
-                    .is_some_and(|shape| shape.is_mut_enum(Some(types)));
-            if unflattened_shared_scalar || unflattened_loop_entry_mut_enum {
+                    .is_some_and(|shape| shape.is_scalar_ref() || shape.is_mut_enum(Some(types)));
+            if unflattened_shared_scalar || unflattened_loop_entry_by_ref {
                 *shape = None;
             }
         }
@@ -1358,7 +1369,12 @@ pub fn plan_excluding(
             );
             continue;
         }
-        if result.is_some() && invoke_call_sites.contains(&func.item) {
+        let has_mut_enum = shapes.iter().any(|shape| {
+            shape
+                .as_ref()
+                .is_some_and(|shape| shape.is_mut_enum(Some(types)))
+        });
+        if (result.is_some() || has_mut_enum) && invoke_call_sites.contains(&func.item) {
             plan.decline(
                 name.clone(),
                 Decline::Boundary(BoundaryDecline::NonCallReference),
@@ -1858,12 +1874,17 @@ fn flat_param_with(
     ty: TypeId,
     written: bool,
 ) -> Option<FlatParam> {
-    let (aggregate, by_ref, mutable) = match table.get(table.peeled(ty)).map(|d| &d.kind) {
-        Some(TypeKind::Reference { pointee, mutable }) => (*pointee, true, *mutable),
-        _ => (ty, false, false),
-    };
+    let unpeeled_desc = table.get(ty);
+    let (aggregate, by_ref, mutable) =
+        match unpeeled_desc.map(|d| (&d.kind, d.meta.boundary, d.js.transparent)) {
+            Some((TypeKind::Reference { pointee, mutable }, PinnedBoundary::None, None)) => {
+                (*pointee, true, *mutable)
+            }
+            _ => (ty, false, false),
+        };
     if by_ref {
-        if is_flattenable_scalar(table, aggregate) {
+        let is_slot = unpeeled_desc.is_some_and(|d| d.js.pointer_form == Some(PointerForm::Slot));
+        if is_slot && is_flattenable_scalar(table, aggregate) {
             return Some(FlatParam {
                 ty: aggregate,
                 field_tys: vec![aggregate],
@@ -3368,6 +3389,8 @@ fn rewrite_callee_with(func: &mut Func, sig: &FlatSig, types: Option<&TypeTable>
                 .or_else(|| sig.returns_out_field.then(|| &out_reads[0]))
             {
                 func.blocks[cur_block.0 as usize].term = RTerm::Return(Some(*primary));
+            } else if cur_block.0 as usize != block {
+                func.blocks[cur_block.0 as usize].term = RTerm::Return(returned);
             }
         }
         if let Some(result) = sig.result.as_ref().filter(|result| {
@@ -5343,13 +5366,15 @@ mod tests {
             repr: crate::jir::types::IntRepr::Number,
         });
         interns.types.insert(i32_desc);
-        interns.types.insert(descriptor(
+        let mut ref_i32_desc = descriptor(
             ref_i32_ty,
             TypeKind::Reference {
                 pointee: i32_ty,
                 mutable: true,
             },
-        ));
+        );
+        ref_i32_desc.js.pointer_form = Some(PointerForm::Slot);
+        interns.types.insert(ref_i32_desc);
         let loading_name = StrId(interns.strings.len() as u32);
         interns.strings.push("Loading".to_owned());
         let ready_name = StrId(interns.strings.len() as u32);
@@ -5710,5 +5735,202 @@ mod tests {
             crate::lower::fuse::plan(&caller_func, None, &interns.types, &interns, &opts);
         crate::lower::structure::structure(&caller_func, &plan_caller, &interns.types, false)
             .expect("caller structures");
+    }
+
+    #[test]
+    fn pin_transparent_ref_is_not_scalar_or_mut_enum_flattened() {
+        let mut types = TypeTable::default();
+        let i32_ty = TypeId(200);
+        let ref_i32_ty = TypeId(201);
+        let pin_i32_ty = TypeId(202);
+        let non_slot_ref_ty = TypeId(203);
+        let mut i32_desc = descriptor(
+            i32_ty,
+            TypeKind::Integer {
+                signed: true,
+                bits: 32,
+            },
+        );
+        i32_desc.js.int = Some(crate::jir::types::IntFacts {
+            signed: true,
+            bits: 32,
+            repr: crate::jir::types::IntRepr::Number,
+        });
+        types.insert(i32_desc);
+
+        let mut ref_i32_desc = descriptor(
+            ref_i32_ty,
+            TypeKind::Reference {
+                pointee: i32_ty,
+                mutable: true,
+            },
+        );
+        ref_i32_desc.js.pointer_form = Some(PointerForm::Slot);
+        types.insert(ref_i32_desc);
+
+        // `Pin<&mut i32>` peels to `&mut i32` but is itself an ADT with `transparent = Some(...)`.
+        let mut pin_i32_desc = descriptor(
+            pin_i32_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 202,
+                },
+                args: vec![ref_i32_ty],
+                form: NominalForm::Struct,
+                variants: Vec::new(),
+                niche: None,
+            },
+        );
+        pin_i32_desc.js.transparent = Some(crate::jir::types::TransparentField {
+            field: 0,
+            ty: ref_i32_ty,
+        });
+        pin_i32_desc.js.peeled = ref_i32_ty;
+        pin_i32_desc.js.pointer_form = Some(PointerForm::Thin);
+        types.insert(pin_i32_desc);
+
+        // A reference without `PointerForm::Slot` (e.g. Thin) is not scalar-ref flattened.
+        let mut non_slot_desc = descriptor(
+            non_slot_ref_ty,
+            TypeKind::Reference {
+                pointee: i32_ty,
+                mutable: true,
+            },
+        );
+        non_slot_desc.js.pointer_form = Some(PointerForm::Thin);
+        types.insert(non_slot_desc);
+
+        assert!(
+            flat_param_with(None, &types, ref_i32_ty, true).is_some_and(|p| p.is_scalar_ref()),
+            "plain &mut i32 with PointerForm::Slot must flatten"
+        );
+        assert!(
+            flat_param_with(None, &types, pin_i32_ty, true).is_none_or(|p| !p.by_ref),
+            "Pin<&mut i32> must not flatten via peeled Reference"
+        );
+        assert!(
+            flat_param_with(None, &types, non_slot_ref_ty, true).is_none_or(|p| !p.is_scalar_ref()),
+            "Reference without PointerForm::Slot must not scalar-ref flatten"
+        );
+    }
+
+    #[test]
+    fn mut_enum_rewrite_preserves_scalar_return_value() {
+        let mut interns = interns();
+        let i32_ty = TypeId(300);
+        let state_ty = TypeId(301);
+        let ref_state_ty = TypeId(302);
+        let mut i32_desc = descriptor(
+            i32_ty,
+            TypeKind::Integer {
+                signed: true,
+                bits: 32,
+            },
+        );
+        i32_desc.js.int = Some(crate::jir::types::IntFacts {
+            signed: true,
+            bits: 32,
+            repr: crate::jir::types::IntRepr::Number,
+        });
+        interns.types.insert(i32_desc);
+        let idle_name = StrId(interns.strings.len() as u32);
+        interns.strings.push("Idle".to_owned());
+        let active_name = StrId(interns.strings.len() as u32);
+        interns.strings.push("Active".to_owned());
+        let val_name = StrId(interns.strings.len() as u32);
+        interns.strings.push("v".to_owned());
+        let mut state_desc = descriptor(
+            state_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 301,
+                },
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![
+                    crate::jir::types::VariantDescriptor {
+                        name: idle_name,
+                        fields: Vec::new(),
+                        logical_discr: 0,
+                        physical_tag: Some(crate::jir::types::NominalDiscriminant {
+                            bits: 0,
+                            bytes: 1,
+                        }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    crate::jir::types::VariantDescriptor {
+                        name: active_name,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(val_name),
+                            ty: i32_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 1,
+                        physical_tag: Some(crate::jir::types::NominalDiscriminant {
+                            bits: 1,
+                            bytes: 1,
+                        }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+        );
+        state_desc.js.is_indirect = true;
+        state_desc.js.needs_clone = true;
+        state_desc.js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+        interns.types.insert(state_desc);
+        interns.types.insert(descriptor(
+            ref_state_ty,
+            TypeKind::Reference {
+                pointee: state_ty,
+                mutable: true,
+            },
+        ));
+
+        let mut b = FuncBuilder::new(item(310), signature(vec![ref_state_ty, i32_ty], i32_ty));
+        let p_s = b.param(ref_state_ty, NO_ORIGIN);
+        let p_i = b.param(i32_ty, NO_ORIGIN);
+        let agg = b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Aggregate {
+                ty: state_ty,
+                variant: 1,
+                active_field: None,
+                fields: vec![p_i],
+            },
+            state_ty,
+            NO_ORIGIN,
+        );
+        b.effect(
+            FuncBuilder::ENTRY,
+            OpKind::StoreThrough { ptr: p_s, v: agg },
+            NO_ORIGIN,
+        );
+        b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(p_i)));
+        let mut func = b.finish();
+
+        let p0 = flat_param_with(Some(&func), &interns.types, ref_state_ty, true)
+            .expect("mut_enum param");
+        let sig = FlatSig {
+            params: vec![Some(p0), None],
+            result: None,
+            spill: 2,
+            returns_out_field: false,
+        };
+        rewrite_callee_with(&mut func, &sig, Some(&interns.types));
+        func.verify(&interns.types)
+            .expect("callee returning scalar verifies");
+        assert!(
+            func.blocks
+                .iter()
+                .any(|block| matches!(block.term, RTerm::Return(Some(v)) if v == p_i)),
+            "Return block after mut_enum split must keep Return(Some(p_i)): {:#?}",
+            func.blocks
+        );
     }
 }

@@ -385,7 +385,7 @@ pub fn compute_read_origins(
     graph: &Callgraph,
     summaries: &Summaries,
 ) -> BTreeMap<JsName, ReadOrigins> {
-    let cx = Cx::new(funcs, interns, graph);
+    let cx = Cx::new(funcs, interns, graph, false);
     let taints: BTreeMap<JsName, Taints> = funcs
         .iter()
         .filter_map(|(name, func)| {
@@ -432,7 +432,18 @@ pub fn compute(
     interns: &BTreeMap<JsName, &Interns>,
     graph: &Callgraph,
 ) -> Summaries {
-    let cx = Cx::new(funcs, interns, graph);
+    compute_with_allocator(funcs, interns, graph, false)
+}
+
+/// Computes the summary of every `Ok` func, bottom-up over `graph`'s components, accounting
+/// for whether a custom/conflicting global allocator can unwind out of `CallKind::Registry` ops.
+pub fn compute_with_allocator(
+    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+    interns: &BTreeMap<JsName, &Interns>,
+    graph: &Callgraph,
+    has_custom_allocator: bool,
+) -> Summaries {
+    let cx = Cx::new(funcs, interns, graph, has_custom_allocator);
     let mut done: BTreeMap<JsName, Summary> = BTreeMap::new();
     for scc in &graph.sccs {
         let recursive = scc.len() > 1
@@ -542,8 +553,11 @@ struct Cx<'a> {
     interns: &'a BTreeMap<JsName, &'a Interns>,
     graph: &'a Callgraph,
     /// Whether indirect function-pointer targets may originate outside the lowered `ReifyFnPointer`
-    /// set (unlowered bodies, `FnPtr` parameters, `ConstTree` function globals, or opaque calls).
+    /// set (unlowered bodies, `FnPtr` parameters, `ConstTree` globals/statics, or opaque calls).
     indirect_unclosed: bool,
+    /// Whether a custom or conflicting `#[global_allocator]` is present (so `Registry` alloc/free
+    /// ops may call into unwinding `__rust_alloc` / `__rust_dealloc`).
+    has_custom_allocator: bool,
 }
 
 impl<'a> Cx<'a> {
@@ -551,6 +565,7 @@ impl<'a> Cx<'a> {
         funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
         interns: &'a BTreeMap<JsName, &'a Interns>,
         graph: &'a Callgraph,
+        has_custom_allocator: bool,
     ) -> Self {
         let indirect_unclosed = Self::has_unclosed_fn_ptrs(funcs, interns, graph);
         Self {
@@ -558,6 +573,7 @@ impl<'a> Cx<'a> {
             interns,
             graph,
             indirect_unclosed,
+            has_custom_allocator,
         }
     }
 
@@ -583,22 +599,48 @@ impl<'a> Cx<'a> {
             for block in &func.blocks {
                 for op in &block.ops {
                     match &op.kind {
-                        OpKind::Const(tree) if const_has_fn_ptr(tree) => return true,
-                        OpKind::Cast { to, .. } => {
-                            if types.is_none_or(|t| type_has_fn_ptr(*to, t, &mut BTreeSet::new()))
-                                && types.is_none_or(|t| {
+                        OpKind::Const(tree)
+                            if op_const_has_fn_ptr(
+                                tree,
+                                op.result.and_then(|r| func.ty(r)),
+                                types,
+                            ) =>
+                        {
+                            return true;
+                        }
+                        OpKind::Cast { from, to, .. } => {
+                            if types.is_none_or(|t| type_has_fn_ptr(*to, t, &mut BTreeSet::new())) {
+                                let closed_reify = types.is_some_and(|t| {
                                     let to_peeled = t.peeled(*to);
+                                    let from_peeled = t.peeled(*from);
+                                    let from_ok = matches!(
+                                        t.get(from_peeled).map(|d| &d.kind),
+                                        Some(
+                                            TypeKind::FnDef {
+                                                instance: Some(_),
+                                                ..
+                                            } | TypeKind::Closure {
+                                                fn_pointer_shim: Some(_),
+                                                ..
+                                            }
+                                        )
+                                    );
                                     matches!(
                                         t.get(to_peeled).map(|d| &d.kind),
                                         Some(TypeKind::FnPtr { .. })
-                                    ) && !graph.fn_pointer_targets.get(&to_peeled).is_some_and(
-                                        |targets| {
-                                            targets.iter().all(|id| graph.by_item.contains_key(id))
-                                        },
-                                    )
-                                })
-                            {
-                                return true;
+                                    ) && from_ok
+                                        && graph.fn_pointer_targets.get(&to_peeled).is_some_and(
+                                            |targets| {
+                                                !targets.is_empty()
+                                                    && targets
+                                                        .iter()
+                                                        .all(|id| graph.by_item.contains_key(id))
+                                            },
+                                        )
+                                });
+                                if !closed_reify {
+                                    return true;
+                                }
                             }
                         }
                         OpKind::Host { args, .. }
@@ -682,6 +724,33 @@ fn const_has_fn_ptr(tree: &ConstTree) -> bool {
         ConstTree::Reference(inner) => const_has_fn_ptr(inner),
         _ => false,
     }
+}
+
+fn const_has_static_global(tree: &ConstTree) -> bool {
+    match tree {
+        ConstTree::Global {
+            target: GlobalReference::Static { .. },
+            ..
+        } => true,
+        ConstTree::Aggregate(fields)
+        | ConstTree::Slice(fields)
+        | ConstTree::Variant { fields, .. } => fields.iter().any(const_has_static_global),
+        ConstTree::Reference(inner) => const_has_static_global(inner),
+        _ => false,
+    }
+}
+
+fn op_const_has_fn_ptr(
+    tree: &ConstTree,
+    result_ty: Option<TypeId>,
+    types: Option<&TypeTable>,
+) -> bool {
+    if const_has_fn_ptr(tree) {
+        return true;
+    }
+    const_has_static_global(tree)
+        && result_ty
+            .is_none_or(|ty| types.is_none_or(|t| type_has_fn_ptr(ty, t, &mut BTreeSet::new())))
 }
 
 /// How a call site contributes, decided once and shared by the taint and facts passes.
@@ -1426,6 +1495,7 @@ impl Facts {
                     Purity::Read
                 });
                 self.summary.may_unwind |= entry.effects.can_throw
+                    || cx.has_custom_allocator
                     || registry_drop_may_unwind(entry.id, types, func, args);
                 // ponytail: one coarse may-allocate bit for every registry op; per-op facts
                 // when a consumer needs them.
@@ -1647,8 +1717,11 @@ mod tests {
     use crate::jir::origin::OriginId;
     use crate::jir::repr::{FuncBuilder, OpKind, RTerm};
     use crate::jir::semantic::{
-        AbiSignature, ConstTree, DefinitionId, Signature, StandardOperation, TypeId,
+        AbiSignature, CastKind, ConstTree, DefinitionId, DirectItemRef, GlobalReference, Signature,
+        StandardOperation, TypeId,
     };
+    use crate::jir::types::{JsFacts, LayoutFacts, NominalForm, TypeDescriptor, TypeMeta};
+    use crate::jir::SigId;
 
     const O: OriginId = OriginId(0);
     const TY: TypeId = TypeId(1);
@@ -2437,6 +2510,338 @@ mod tests {
             .get(&JsName::new("caller".to_owned()))
             .expect("summarized");
         assert!(caller_summary.may_unwind);
+    }
+
+    #[test]
+    fn static_fn_ptr_marks_indirect_call_may_unwind() {
+        let fn_def_ty = TypeId(40);
+        let fn_ptr_ty = TypeId(41);
+        let mut prog = Prog::new();
+        let target_name = prog.intern("pure_fn");
+        let static_name = prog.intern("HOOK_FN");
+        let make_ty = |id, kind| TypeDescriptor {
+            id,
+            name: None,
+            kind,
+            layout: LayoutFacts::default(),
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: id,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        };
+        prog.interns
+            .types
+            .insert(make_ty(TY, TypeKind::Tuple(Vec::new())));
+        prog.interns.types.insert(make_ty(
+            fn_def_ty,
+            TypeKind::FnDef {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 2,
+                },
+                sig: SigId(0),
+                instance: Some(DirectItemRef {
+                    item: id(2),
+                    link_name: target_name,
+                }),
+            },
+        ));
+        prog.interns
+            .types
+            .insert(make_ty(fn_ptr_ty, TypeKind::FnPtr { sig: SigId(0) }));
+
+        let mut pure = FuncBuilder::new(id(2), sig(0));
+        pure.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        prog.add("pure_fn", pure.finish());
+
+        // Even with a benign ReifyFnPointer closing `fn_ptr_ty`, reading a static containing a
+        // fn pointer leaves indirect calls unclosed (`may_unwind = true`).
+        let mut caller = FuncBuilder::new(id(1), sig(0));
+        let c_def = caller.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Unit),
+            fn_def_ty,
+            O,
+        );
+        let _reified = caller.op(
+            FuncBuilder::ENTRY,
+            OpKind::Cast {
+                kind: CastKind::PointerCoercion,
+                v: c_def,
+                from: fn_def_ty,
+                to: fn_ptr_ty,
+            },
+            fn_ptr_ty,
+            O,
+        );
+        let from_static = caller.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Global {
+                target: GlobalReference::Static {
+                    definition: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 99,
+                    },
+                    link_name: static_name,
+                },
+                offset: 0,
+            }),
+            fn_ptr_ty,
+            O,
+        );
+        caller.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Indirect {
+                    signature: fn_ptr_ty,
+                },
+                function: Some(from_static),
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        caller.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        prog.add("caller", caller.finish());
+
+        let summaries = prog.compute();
+        assert!(
+            summaries
+                .get(&JsName::new("caller".to_owned()))
+                .expect("summarized")
+                .may_unwind
+        );
+    }
+
+    #[test]
+    fn fn_ptr_cast_and_composite_transmute_mark_indirect_call_may_unwind() {
+        let fn_def_ty = TypeId(40);
+        let fn_ptr_a = TypeId(41);
+        let fn_ptr_b = TypeId(42);
+        let opt_fn_ty = TypeId(43);
+        let make_ty = |id, kind| TypeDescriptor {
+            id,
+            name: None,
+            kind,
+            layout: LayoutFacts::default(),
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: id,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        };
+        let check_cast = |from_ty: TypeId, to_ty: TypeId| {
+            let mut prog = Prog::new();
+            let target_name = prog.intern("pure_fn");
+            prog.interns
+                .types
+                .insert(make_ty(TY, TypeKind::Tuple(Vec::new())));
+            prog.interns.types.insert(make_ty(
+                fn_def_ty,
+                TypeKind::FnDef {
+                    def: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 2,
+                    },
+                    sig: SigId(0),
+                    instance: Some(DirectItemRef {
+                        item: id(2),
+                        link_name: target_name,
+                    }),
+                },
+            ));
+            prog.interns
+                .types
+                .insert(make_ty(fn_ptr_a, TypeKind::FnPtr { sig: SigId(0) }));
+            prog.interns
+                .types
+                .insert(make_ty(fn_ptr_b, TypeKind::FnPtr { sig: SigId(1) }));
+            prog.interns
+                .types
+                .insert(make_ty(opt_fn_ty, TypeKind::Tuple(vec![fn_ptr_b])));
+
+            let mut pure = FuncBuilder::new(id(2), sig(0));
+            pure.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+            prog.add("pure_fn", pure.finish());
+
+            let mut caller = FuncBuilder::new(id(1), sig(0));
+            let c_def = caller.op(
+                FuncBuilder::ENTRY,
+                OpKind::Const(ConstTree::Unit),
+                fn_def_ty,
+                O,
+            );
+            let reified = caller.op(
+                FuncBuilder::ENTRY,
+                OpKind::Cast {
+                    kind: CastKind::PointerCoercion,
+                    v: c_def,
+                    from: fn_def_ty,
+                    to: fn_ptr_a,
+                },
+                fn_ptr_a,
+                O,
+            );
+            let _casted = caller.op(
+                FuncBuilder::ENTRY,
+                OpKind::Cast {
+                    kind: CastKind::Transmute,
+                    v: reified,
+                    from: from_ty,
+                    to: to_ty,
+                },
+                to_ty,
+                O,
+            );
+            caller.effect(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Indirect {
+                        signature: fn_ptr_a,
+                    },
+                    function: Some(reified),
+                    args: Vec::new(),
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                O,
+            );
+            caller.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+            prog.add("caller", caller.finish());
+            prog.compute()
+                .get(&JsName::new("caller".to_owned()))
+                .expect("summarized")
+                .may_unwind
+        };
+
+        assert!(
+            check_cast(fn_ptr_a, fn_ptr_b),
+            "FnPtr->FnPtr cast must mark indirect calls unclosed"
+        );
+        assert!(
+            check_cast(fn_ptr_a, opt_fn_ty),
+            "Transmute to composite containing FnPtr must mark indirect calls unclosed"
+        );
+    }
+
+    #[test]
+    fn custom_allocator_marks_registry_vec_drop_may_unwind() {
+        let vec_plain = TypeId(30);
+        let ref_plain = TypeId(31);
+        let mut prog = Prog::new();
+        let make_ty = |id, kind| TypeDescriptor {
+            id,
+            name: None,
+            kind,
+            layout: LayoutFacts {
+                needs_drop: false,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: id,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        };
+        prog.interns
+            .types
+            .insert(make_ty(TY, TypeKind::Tuple(Vec::new())));
+        prog.interns.types.insert(make_ty(
+            vec_plain,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 10,
+                },
+                args: vec![TY],
+                form: NominalForm::Struct,
+                variants: Vec::new(),
+                niche: None,
+            },
+        ));
+        prog.interns.types.insert(make_ty(
+            ref_plain,
+            TypeKind::Reference {
+                pointee: vec_plain,
+                mutable: true,
+            },
+        ));
+        let mut b = FuncBuilder::new(
+            id(1),
+            Signature {
+                arguments: vec![ref_plain],
+                result: TY,
+                abi: AbiSignature::default(),
+            },
+        );
+        let p = b.param(ref_plain, O);
+        b.effect(
+            FuncBuilder::ENTRY,
+            call(
+                StrId(0),
+                CallSemantic::Standard(StandardOperation::VecDrop),
+                vec![p],
+            ),
+            O,
+        );
+        b.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        prog.add("f", b.finish());
+
+        let default_summaries = prog.compute();
+        assert!(
+            !default_summaries
+                .get(&JsName::new("f".to_owned()))
+                .expect("summarized")
+                .may_unwind
+        );
+
+        let interns: BTreeMap<JsName, &Interns> = prog
+            .funcs
+            .keys()
+            .map(|name| (name.clone(), &prog.interns))
+            .collect();
+        let graph = crate::analysis::callgraph::build(&prog.funcs, &interns);
+        let custom_summaries = compute_with_allocator(&prog.funcs, &interns, &graph, true);
+        assert!(
+            custom_summaries
+                .get(&JsName::new("f".to_owned()))
+                .expect("summarized")
+                .may_unwind
+        );
     }
 
     // -- components and the fixpoint ----------------------------------------------------------

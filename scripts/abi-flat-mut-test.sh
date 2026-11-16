@@ -10,7 +10,14 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd -- "$script_dir/.." && pwd)
 work=$(mktemp -d)
-trap 'rm -rf -- "$work"' EXIT
+orig_sysroot=$(readlink "$root/build/sysroot" 2>/dev/null || true)
+cleanup() {
+	if [ -n "$orig_sysroot" ]; then
+		ln -sfn "$orig_sysroot" "$root/build/sysroot"
+	fi
+	rm -rf -- "$work"
+}
+trap cleanup EXIT
 
 export JSC_PANIC=unwind
 export RCGJS_WITNESS_CHECK=1
@@ -32,6 +39,136 @@ for fixture in \
 		"$work/$fixture.js" --crate-type cdylib >/dev/null
 done
 
+# Independent e2e fixtures for non-unit return values with &mut Enum + &mut i32 (`-> i32` and `-> u64`)
+# and `Pin<&mut T>` rejection (`transparent = Some`, non-reference unpeeled `TypeId`).
+cat > "$work/ret_i32.rs" << 'EOF'
+#![no_std]
+#![no_main]
+
+enum State {
+    Idle,
+    Loading { progress: i32, retries: i32 },
+    Ready { value: i32, flags: i32, checksum: i32 },
+}
+
+#[inline(never)]
+fn step_state_ret(state: &mut State, i: i32, acc: &mut i32) -> i32 {
+    match *state {
+        State::Idle => *state = State::Loading { progress: i, retries: 1 },
+        State::Loading { progress, retries } => {
+            if (i & 3) == 3 {
+                *state = State::Ready { value: progress.wrapping_add(i), flags: retries, checksum: i.wrapping_mul(31) };
+            } else {
+                *state = State::Loading { progress: progress.wrapping_add(i), retries: retries.wrapping_add(1) };
+            }
+        }
+        State::Ready { value, flags, checksum } => {
+            *acc = acc.wrapping_add(value).wrapping_add(flags).wrapping_add(checksum);
+            *state = State::Idle;
+        }
+    }
+    *acc ^ i
+}
+
+#[unsafe(no_mangle)]
+pub fn run_ret_i32(n: i32) -> i32 {
+    let mut state = State::Idle;
+    let mut acc = 0;
+    let mut last = 0;
+    for i in 0..n {
+        last = step_state_ret(&mut state, i, &mut acc);
+    }
+    acc.wrapping_add(last)
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! { loop {} }
+EOF
+
+cat > "$work/ret_u64.rs" << 'EOF'
+#![no_std]
+#![no_main]
+
+enum State {
+    Idle,
+    Loading { progress: i32, retries: i32 },
+    Ready { value: i32, flags: i32, checksum: i32 },
+}
+
+#[inline(never)]
+fn step_state_ret_u64(state: &mut State, i: i32, acc: &mut i32) -> u64 {
+    match *state {
+        State::Idle => *state = State::Loading { progress: i, retries: 1 },
+        State::Loading { progress, retries } => {
+            if (i & 3) == 3 {
+                *state = State::Ready { value: progress.wrapping_add(i), flags: retries, checksum: i.wrapping_mul(31) };
+            } else {
+                *state = State::Loading { progress: progress.wrapping_add(i), retries: retries.wrapping_add(1) };
+            }
+        }
+        State::Ready { value, flags, checksum } => {
+            *acc = acc.wrapping_add(value).wrapping_add(flags).wrapping_add(checksum);
+            *state = State::Idle;
+        }
+    }
+    ((*acc as u32 as u64) << 16) | (i as u32 as u64)
+}
+
+#[unsafe(no_mangle)]
+pub fn run_ret_u64(n: i32) -> u32 {
+    let mut state = State::Idle;
+    let mut acc = 0;
+    let mut mixed = 0u64;
+    for i in 0..n {
+        mixed ^= step_state_ret_u64(&mut state, i, &mut acc);
+    }
+    (mixed ^ (mixed >> 32)) as u32
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! { loop {} }
+EOF
+
+cat > "$work/pin_guard.rs" << 'EOF'
+#![no_std]
+#![no_main]
+use core::pin::Pin;
+
+enum State {
+    Idle,
+    Active { v: i32 },
+}
+
+#[inline(never)]
+fn step_pin(state: Pin<&mut State>, acc: Pin<&mut i32>, x: i32) -> i32 {
+    let s = unsafe { state.get_unchecked_mut() };
+    let a = unsafe { acc.get_unchecked_mut() };
+    match *s {
+        State::Idle => *s = State::Active { v: x },
+        State::Active { v } => { *a += v; *s = State::Idle; }
+    }
+    *a
+}
+
+#[unsafe(no_mangle)]
+pub fn run_pin() -> i32 {
+    let mut s = State::Idle;
+    let mut a = 5;
+    let p_s = unsafe { Pin::new_unchecked(&mut s) };
+    let _ = step_pin(p_s, unsafe { Pin::new_unchecked(&mut a) }, 10);
+    let p_s2 = unsafe { Pin::new_unchecked(&mut s) };
+    step_pin(p_s2, unsafe { Pin::new_unchecked(&mut a) }, 20)
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! { loop {} }
+EOF
+
+for extra in ret_i32 ret_u64 pin_guard; do
+	JS_EXTRA_ARGS="$args" "$script_dir/compile_core.sh" \
+		"$work/$extra.rs" "$work/$extra.js" --crate-type cdylib >/dev/null
+done
+
 # 314: Positive check — flattened in .lane.json, zero TAG/overwrite/slot-boxing in JS, checksum 71197732 in V8 & JSC
 jq -e '
   .abi.applied == true and
@@ -47,7 +184,10 @@ node - "$root/runtime/shim.js" \
 	"$work/314_abi_flat_mut_enum_and_scalar.js.lane.json" \
 	"$work/315_abi_flat_mut_unwind_drop.js.lane.json" \
 	"$work/316_abi_flat_mut_indirect_throw.js.lane.json" \
-	"$work/317_abi_flat_mut_escape_and_alias.js.lane.json" <<'NODE'
+	"$work/317_abi_flat_mut_escape_and_alias.js.lane.json" \
+	"$work/ret_i32.js" "$work/ret_i32.js.lane.json" \
+	"$work/ret_u64.js" "$work/ret_u64.js.lane.json" \
+	"$work/pin_guard.js" "$work/pin_guard.js.lane.json" <<'NODE'
 const fs = require('node:fs');
 const vm = require('node:vm');
 
@@ -55,6 +195,9 @@ const [
   shimPath,
   f314, f315, f316, f317,
   l314, l315, l316, l317,
+  fRetI32, lRetI32,
+  fRetU64, lRetU64,
+  fPin, lPin,
 ] = process.argv.slice(2);
 const shim = fs.readFileSync(shimPath, 'utf8');
 
@@ -87,6 +230,63 @@ vm.runInContext(shim + '\n' + code314, ctx314);
 const sum314 = ctx314.bench_enum_state(4096);
 if (sum314 !== 71197732) {
   throw new Error(`314 checksum mismatch: got ${sum314}, expected 71197732`);
+}
+// Independent JS reference for run_ret_i32(4096) and run_ret_u64(4096).
+let refTag = 0, refP = 0, refR = 0, refV = 0, refF = 0, refC = 0, refAcc = 0;
+let refLast = 0, refMixed = 0n;
+for (let i = 0; i < 4096; i++) {
+  if (refTag === 0) {
+    refTag = 1; refP = i; refR = 1;
+  } else if (refTag === 1) {
+    if ((i & 3) === 3) {
+      refTag = 2; refV = (refP + i) | 0; refF = refR; refC = Math.imul(i, 31) | 0;
+    } else {
+      refP = (refP + i) | 0; refR = (refR + 1) | 0;
+    }
+  } else {
+    refAcc = (refAcc + refV + refF + refC) | 0;
+    refTag = 0;
+  }
+  refLast = refAcc ^ i;
+  const word = (BigInt(refAcc >>> 0) << 16n) | BigInt(i >>> 0);
+  refMixed ^= word;
+}
+const expectedRet = (refAcc + refLast) | 0;
+const expectedU64Mix = Number((refMixed ^ (refMixed >> 32n)) & 0xffff_ffffn) >>> 0;
+
+const laneRetI32 = JSON.parse(fs.readFileSync(lRetI32, 'utf8'));
+const decRetI32 = laneRetI32.physical.decisions.find((d) => d.item.includes('step_state_ret'));
+if (!decRetI32 || decRetI32.shape !== 'mut-enum(6)+scalar-ref(1)' || !decRetI32.selected) {
+  throw new Error(`ret_i32 expected step_state_ret selected, got ${JSON.stringify(decRetI32)}`);
+}
+const ctxRetI32 = vm.createContext({ TextDecoder, TextEncoder });
+vm.runInContext(shim + '\n' + fs.readFileSync(fRetI32, 'utf8'), ctxRetI32);
+const gotRet = ctxRetI32.run_ret_i32(4096);
+if (gotRet !== expectedRet) {
+  throw new Error(`ret_i32 mismatch: got ${gotRet}, expected ${expectedRet}`);
+}
+
+const laneRetU64 = JSON.parse(fs.readFileSync(lRetU64, 'utf8'));
+const decRetU64 = laneRetU64.physical.decisions.find((d) => d.item.includes('step_state_ret_u64'));
+if (!decRetU64 || !decRetU64.shape?.includes('mut-enum(6)+scalar-ref(1)') || !decRetU64.selected) {
+  throw new Error(`ret_u64 expected step_state_ret_u64 selected, got ${JSON.stringify(decRetU64)}`);
+}
+const ctxRetU64 = vm.createContext({ TextDecoder, TextEncoder });
+vm.runInContext(shim + '\n' + fs.readFileSync(fRetU64, 'utf8'), ctxRetU64);
+const gotU64 = ctxRetU64.run_ret_u64(4096) >>> 0;
+if (gotU64 !== expectedU64Mix) {
+  throw new Error(`ret_u64 mismatch: got ${gotU64}, expected ${expectedU64Mix}`);
+}
+
+const lanePin = JSON.parse(fs.readFileSync(lPin, 'utf8'));
+const decPin = lanePin.physical.decisions.find((d) => d.item.includes('step_pin'));
+if (!decPin || decPin.shape !== null || decPin.selected !== false) {
+  throw new Error(`pin_guard expected step_pin shape=null (not Pin<&mut T> flattened), got ${JSON.stringify(decPin)}`);
+}
+const ctxPin = vm.createContext({ TextDecoder, TextEncoder });
+vm.runInContext(shim + '\n' + fs.readFileSync(fPin, 'utf8'), ctxPin);
+if (ctxPin.run_pin() !== 15) {
+  throw new Error(`pin_guard mismatch: got ${ctxPin.run_pin()}, expected 15`);
 }
 
 // 315: host_note(-1) throws -> Drop observer MUST see acc=99, Ready.total=77; step_and_throw declined with ExceptionalCopyBack
