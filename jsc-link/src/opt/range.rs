@@ -24,10 +24,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::jir::interns::Interns;
 use crate::jir::repr::{
     Dominators, Func, Op, OpKind, Proj, RAssertMessage, RBlockId, RTerm, Root, ValueId,
 };
-use crate::jir::semantic::{BinaryOp, CastKind, ConstTree, TypeId, UnaryOp};
+use crate::jir::semantic::{BinaryOp, CallSemantic, Callee, CastKind, ConstTree, TypeId, UnaryOp};
 use crate::jir::types::TypeKind;
 use crate::jir::TypeTable;
 use crate::lower::fuse::{op_purity, Purity};
@@ -52,6 +53,26 @@ impl RangeStats {
 
 /// Runs the pass over `func` in place.
 pub fn run(func: &mut Func, table: &TypeTable, witnesses: &mut Vec<Witness>) -> RangeStats {
+    run_impl(func, table, None, witnesses)
+}
+
+/// Runs the pass over `func` in place with `interns` for exact sysroot runtime shim matching.
+#[allow(dead_code)]
+pub fn run_with_interns(
+    func: &mut Func,
+    table: &TypeTable,
+    interns: &Interns,
+    witnesses: &mut Vec<Witness>,
+) -> RangeStats {
+    run_impl(func, table, Some(interns), witnesses)
+}
+
+fn run_impl(
+    func: &mut Func,
+    table: &TypeTable,
+    interns: Option<&Interns>,
+    witnesses: &mut Vec<Witness>,
+) -> RangeStats {
     let any = func.blocks.iter().any(|block| {
         block.ops.iter().any(|op| {
             matches!(
@@ -89,7 +110,7 @@ pub fn run(func: &mut Func, table: &TypeTable, witnesses: &mut Vec<Witness>) -> 
     if !any && !aligned_candidate {
         return RangeStats::default();
     }
-    let analysis = Analysis::of(func, table);
+    let analysis = Analysis::of(func, table, interns);
     let mut stats = RangeStats::default();
 
     // A fixed-size chunk prefix is the largest multiple of `chunk` no greater than the slice
@@ -277,7 +298,7 @@ struct Analysis {
 }
 
 impl Analysis {
-    fn of(func: &Func, table: &TypeTable) -> Self {
+    fn of(func: &Func, table: &TypeTable, interns: Option<&Interns>) -> Self {
         let n = func.values.len();
         let doms = Dominators::of(func);
 
@@ -319,10 +340,10 @@ impl Analysis {
             entry_facts: vec![Vec::new(); func.blocks.len()],
             preds,
         };
-        analysis.number_values(func, table);
+        analysis.number_values(func, table, interns);
         analysis.collect_facts(func, table);
         analysis.scope_facts(func);
-        analysis.compute_intervals(func, table);
+        analysis.compute_intervals(func, table, interns);
         analysis
     }
 
@@ -438,7 +459,7 @@ impl Analysis {
     /// Value numbering: congruent pure ops share one class representative, so equality of terms
     /// is equality of representatives. Assigned in reverse postorder, which is a dominance
     /// order, so an op's operands are numbered before it.
-    fn number_values(&mut self, func: &Func, table: &TypeTable) {
+    fn number_values(&mut self, func: &Func, table: &TypeTable, interns: Option<&Interns>) {
         #[derive(Clone, Ord, PartialOrd, Eq, PartialEq)]
         enum Key {
             Scalar(u128, u8, TypeId),
@@ -513,13 +534,18 @@ impl Analysis {
                         v,
                         ty: operand_ty,
                     } => {
-                        // The `SliceView` lens: the metadata of a built view is its length
-                        // operand.
-                        let base = self.canon(*v);
-                        if let Some(OpKind::SliceView { len, .. }) = self.def_kind(func, base) {
-                            self.canon[result.0 as usize] = self.canon(*len);
-                            continue;
-                        }
+                        // Peel `SliceView`, sysroot `slice_from_parts` (`RawParts`), sysroot
+                        // `byte_slice_ref`, whole-slice reborrows, and lossless slice pointer
+                        // casts so `PtrMetadata` recovers the exact underlying length or root.
+                        let meta_bits = self.widths[result.0 as usize];
+                        let base = match self.peel_slice_source(func, table, interns, *v, meta_bits)
+                        {
+                            Ok(len) => {
+                                self.canon[result.0 as usize] = len;
+                                continue;
+                            }
+                            Err(root) => root,
+                        };
                         Key::Unary(UnaryOp::PtrMetadata as u8, base, *operand_ty)
                     }
                     OpKind::Const(ConstTree::Scalar { bits, bytes }) => {
@@ -729,7 +755,7 @@ impl Analysis {
     /// facts at each edge; ops transfer in reverse postorder. A widening round keeps counted
     /// loops from crawling one trip at a time, and a failure to stabilize falls back to full
     /// ranges for every parameter, which one more transfer pass makes consistent.
-    fn compute_intervals(&mut self, func: &Func, table: &TypeTable) {
+    fn compute_intervals(&mut self, func: &Func, table: &TypeTable, interns: Option<&Interns>) {
         const WIDEN: usize = 4;
         const CAP: usize = 8;
 
@@ -805,7 +831,7 @@ impl Analysis {
                     let Some(bits) = self.widths[result.0 as usize] else {
                         continue;
                     };
-                    let next = self.transfer(func, table, &op.kind, bits);
+                    let next = self.transfer(func, table, interns, &op.kind, bits);
                     let slot = &mut self.intervals[result.0 as usize];
                     if *slot != next {
                         *slot = next;
@@ -838,7 +864,8 @@ impl Analysis {
                     let Some(bits) = self.widths[result.0 as usize] else {
                         continue;
                     };
-                    self.intervals[result.0 as usize] = self.transfer(func, table, &op.kind, bits);
+                    self.intervals[result.0 as usize] =
+                        self.transfer(func, table, interns, &op.kind, bits);
                 }
             }
         }
@@ -882,7 +909,14 @@ impl Analysis {
 
     /// The interval an op's result takes from its operands; `None` when an operand is still
     /// unknown (bottom), so optimism survives until the fixpoint fills it in.
-    fn transfer(&self, func: &Func, table: &TypeTable, kind: &OpKind, bits: u32) -> Option<Iv> {
+    fn transfer(
+        &self,
+        func: &Func,
+        table: &TypeTable,
+        interns: Option<&Interns>,
+        kind: &OpKind,
+        bits: u32,
+    ) -> Option<Iv> {
         let max = width_max(bits);
         let top = Some(Iv::full(max));
         match kind {
@@ -897,7 +931,7 @@ impl Analysis {
                 op: UnaryOp::PtrMetadata,
                 v,
                 ..
-            } => Some(self.metadata_interval(func, table, *v, bits)),
+            } => Some(self.metadata_interval(func, table, interns, *v, bits)),
             OpKind::Binary { op, l, r, ty } => {
                 if !matches!(table.int_info(*ty), Some((false, w)) if w == bits) {
                     return top;
@@ -966,11 +1000,107 @@ impl Analysis {
     /// reborrows preserve the source. The construction's own legality ensures a reachable
     /// end-relative view has enough source elements; saturating the lower endpoint keeps the
     /// interval conservative even before that guard is visible here.
-    fn metadata_interval(&self, func: &Func, table: &TypeTable, pointer: ValueId, bits: u32) -> Iv {
+    /// Peels slice-length-preserving constructors and wrappers off `pointer`.
+    ///
+    /// Returns `Ok(len)` when a length-supplying op (`SliceView` or sysroot `slice_from_parts`)
+    /// is reached, or `Err(root)` with the innermost slice pointer value after peeling copies,
+    /// whole-slice reborrows, lossless slice casts, and sysroot `byte_slice_ref` calls.
+    fn peel_slice_source(
+        &self,
+        func: &Func,
+        table: &TypeTable,
+        interns: Option<&Interns>,
+        pointer: ValueId,
+        expected_bits: Option<u32>,
+    ) -> Result<ValueId, ValueId> {
+        let mut pointer = self.canon(pointer);
+        for _ in 0..8 {
+            let ptr_ty = func.values[pointer.0 as usize].ty;
+            match self.def_kind(func, pointer) {
+                Some(OpKind::SliceView { len, .. }) => return Ok(self.canon(*len)),
+                Some(OpKind::Call {
+                    callee:
+                        Callee::Runtime {
+                            member,
+                            sysroot: true,
+                        },
+                    semantic: CallSemantic::RawParts,
+                    args,
+                    ..
+                }) if args.len() == 2
+                    && is_slice_pointer(table, ptr_ty)
+                    && expected_bits.is_none_or(|b| self.widths[args[1].0 as usize] == Some(b))
+                    && self.widths[args[1].0 as usize].is_some()
+                    && interns.is_none_or(|i| i.str(*member) == Some("slice_from_parts")) =>
+                {
+                    return Ok(self.canon(args[1]));
+                }
+                Some(OpKind::Call {
+                    callee:
+                        Callee::Runtime {
+                            member,
+                            sysroot: true,
+                        },
+                    semantic: CallSemantic::Ordinary | CallSemantic::RawParts,
+                    args,
+                    ..
+                }) if args.len() == 1
+                    && same_slice_pointer(table, ptr_ty, func.values[args[0].0 as usize].ty)
+                    && interns.is_none_or(|i| i.str(*member) == Some("byte_slice_ref")) =>
+                {
+                    pointer = self.canon(args[0]);
+                }
+                Some(
+                    OpKind::BorrowView {
+                        root: Root::Value(source),
+                        path,
+                        ..
+                    }
+                    | OpKind::RawView {
+                        root: Root::Value(source),
+                        path,
+                        ..
+                    },
+                ) if path.as_slice() == [Proj::Deref]
+                    && is_slice_pointer(table, ptr_ty)
+                    && is_slice_pointer(table, func.values[source.0 as usize].ty) =>
+                {
+                    pointer = self.canon(*source);
+                }
+                Some(OpKind::Cast {
+                    kind:
+                        CastKind::PtrToPtr
+                        | CastKind::PointerCoercion
+                        | CastKind::Subtype
+                        | CastKind::Transmute,
+                    v: source,
+                    from,
+                    to,
+                }) if same_slice_or_str_pointer(table, *to, *from) => {
+                    pointer = self.canon(*source);
+                }
+                Some(OpKind::Copy(source) | OpKind::Move(source)) => {
+                    pointer = self.canon(*source);
+                }
+                _ => break,
+            }
+        }
+        Err(pointer)
+    }
+
+    fn metadata_interval(
+        &self,
+        func: &Func,
+        table: &TypeTable,
+        interns: Option<&Interns>,
+        pointer: ValueId,
+        bits: u32,
+    ) -> Iv {
         let max = width_max(bits);
         let mut pointer = self.canon(pointer);
         let mut trim = 0_u128;
         for _ in 0..8 {
+            let ptr_ty = func.values[pointer.0 as usize].ty;
             match self.def_kind(func, pointer) {
                 Some(OpKind::SliceView { len, .. }) => {
                     let Some(mut interval) = self.interval(*len) else {
@@ -979,6 +1109,42 @@ impl Analysis {
                     interval.lo = interval.lo.saturating_sub(trim);
                     interval.hi = interval.hi.saturating_sub(trim);
                     return interval;
+                }
+                Some(OpKind::Call {
+                    callee:
+                        Callee::Runtime {
+                            member,
+                            sysroot: true,
+                        },
+                    semantic: CallSemantic::RawParts,
+                    args,
+                    ..
+                }) if args.len() == 2
+                    && is_slice_pointer(table, ptr_ty)
+                    && self.widths[args[1].0 as usize] == Some(bits)
+                    && interns.is_none_or(|i| i.str(*member) == Some("slice_from_parts")) =>
+                {
+                    let Some(mut interval) = self.interval(args[1]) else {
+                        return self.metadata_bound(func, table, pointer, bits);
+                    };
+                    interval.lo = interval.lo.saturating_sub(trim);
+                    interval.hi = interval.hi.saturating_sub(trim);
+                    return interval;
+                }
+                Some(OpKind::Call {
+                    callee:
+                        Callee::Runtime {
+                            member,
+                            sysroot: true,
+                        },
+                    semantic: CallSemantic::Ordinary | CallSemantic::RawParts,
+                    args,
+                    ..
+                }) if args.len() == 1
+                    && same_slice_pointer(table, ptr_ty, func.values[args[0].0 as usize].ty)
+                    && interns.is_none_or(|i| i.str(*member) == Some("byte_slice_ref")) =>
+                {
+                    pointer = self.canon(args[0]);
                 }
                 Some(
                     OpKind::BorrowView {
@@ -1014,6 +1180,18 @@ impl Analysis {
                     }
                     _ => break,
                 },
+                Some(OpKind::Cast {
+                    kind:
+                        CastKind::PtrToPtr
+                        | CastKind::PointerCoercion
+                        | CastKind::Subtype
+                        | CastKind::Transmute,
+                    v: source,
+                    from,
+                    to,
+                }) if same_slice_or_str_pointer(table, *to, *from) => {
+                    pointer = self.canon(*source);
+                }
                 Some(OpKind::Copy(source) | OpKind::Move(source)) => {
                     pointer = self.canon(*source);
                 }
@@ -1277,6 +1455,10 @@ impl Analysis {
 
 /// Whether `ty` is a reference or raw pointer to a slice or `str`.
 pub(super) fn is_slice_pointer(table: &TypeTable, ty: TypeId) -> bool {
+    slice_pointee_element(table, ty).is_some()
+}
+
+fn slice_pointee_element(table: &TypeTable, ty: TypeId) -> Option<Option<TypeId>> {
     let pointee = match table
         .get(table.peeled(ty))
         .map(|descriptor| &descriptor.kind)
@@ -1284,12 +1466,34 @@ pub(super) fn is_slice_pointer(table: &TypeTable, ty: TypeId) -> bool {
         Some(TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. }) => {
             *pointee
         }
-        _ => return false,
+        _ => return None,
     };
+    match table.get(table.peeled(pointee)).map(|d| &d.kind) {
+        Some(TypeKind::Slice(element)) => Some(Some(*element)),
+        Some(TypeKind::Str) => Some(None),
+        _ => None,
+    }
+}
+
+fn same_slice_pointer(table: &TypeTable, a: TypeId, b: TypeId) -> bool {
     matches!(
-        table.get(table.peeled(pointee)).map(|d| &d.kind),
-        Some(TypeKind::Slice(_) | TypeKind::Str)
+        (slice_pointee_element(table, a), slice_pointee_element(table, b)),
+        (Some(Some(ea)), Some(Some(eb))) if table.peeled(ea) == table.peeled(eb)
     )
+}
+
+fn same_slice_or_str_pointer(table: &TypeTable, a: TypeId, b: TypeId) -> bool {
+    match (
+        slice_pointee_element(table, a),
+        slice_pointee_element(table, b),
+    ) {
+        (Some(Some(ea)), Some(Some(eb))) => table.peeled(ea) == table.peeled(eb),
+        (Some(None), Some(None)) => true,
+        (Some(None), Some(Some(elem))) | (Some(Some(elem)), Some(None)) => {
+            table.int_info(table.peeled(elem)) == Some((false, 8))
+        }
+        _ => false,
+    }
 }
 
 /// The interval of `l op r` at an unsigned type whose largest value is `max`; anything that
@@ -2293,6 +2497,195 @@ mod tests {
         assert_eq!(run(&mut func, &table(), &mut witnesses).asserts_removed, 2);
         assert_eq!(asserts(&func), 1);
         super::super::witness::check_all(&witnesses, &func, &table()).expect("witness checks");
+    }
+
+    fn str_and_raw_table() -> (TypeTable, TypeId, TypeId, TypeId) {
+        const RAW_U8: TypeId = TypeId(5);
+        const STR: TypeId = TypeId(6);
+        const REF_STR: TypeId = TypeId(7);
+
+        let mut tbl = table();
+        let make = |id, kind, pointer_form| TypeDescriptor {
+            id,
+            name: None,
+            kind,
+            layout: LayoutFacts {
+                sized: id != STR,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: id,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        };
+        tbl.insert(make(
+            RAW_U8,
+            TypeKind::RawPointer {
+                pointee: U8,
+                mutable: false,
+            },
+            None,
+        ));
+        tbl.insert(make(STR, TypeKind::Str, None));
+        tbl.insert(make(
+            REF_STR,
+            TypeKind::Reference {
+                pointee: STR,
+                mutable: false,
+            },
+            Some(PointerForm::FatSlice),
+        ));
+        (tbl, RAW_U8, STR, REF_STR)
+    }
+
+    #[test]
+    fn peels_raw_parts_byte_slice_ref_and_str_cast_with_interns() {
+        let (tbl, raw_u8, _str_ty, ref_str) = str_and_raw_table();
+        let mut interns = Interns::default();
+        interns.strings.push("slice_from_parts".to_string()); // StrId(0)
+        interns.strings.push("byte_slice_ref".to_string()); // StrId(1)
+        interns.strings.push("unknown_runtime".to_string()); // StrId(2)
+
+        // Positive: `slice_from_parts(ptr, 16)` -> `byte_slice_ref` -> `&[u8] -> &str` cast -> `PtrMetadata`.
+        {
+            let mut b = builder();
+            let entry = FuncBuilder::ENTRY;
+            let ptr = b.param(raw_u8, NO_ORIGIN);
+            let sixteen = constant(&mut b, entry, 16);
+            let raw_slice = b.op(
+                entry,
+                OpKind::Call {
+                    callee: Callee::Runtime {
+                        member: StrId(0),
+                        sysroot: true,
+                    },
+                    function: None,
+                    args: vec![ptr, sixteen],
+                    track_caller: None,
+                    semantic: CallSemantic::RawParts,
+                    host: None,
+                },
+                REF_SLICE,
+                NO_ORIGIN,
+            );
+            let byte_slice = b.op(
+                entry,
+                OpKind::Call {
+                    callee: Callee::Runtime {
+                        member: StrId(1),
+                        sysroot: true,
+                    },
+                    function: None,
+                    args: vec![raw_slice],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                REF_SLICE,
+                NO_ORIGIN,
+            );
+            let as_str = b.op(
+                entry,
+                OpKind::Cast {
+                    kind: CastKind::PtrToPtr,
+                    v: byte_slice,
+                    from: REF_SLICE,
+                    to: ref_str,
+                },
+                ref_str,
+                NO_ORIGIN,
+            );
+            let meta = b.op(
+                entry,
+                OpKind::Unary {
+                    op: UnaryOp::PtrMetadata,
+                    v: as_str,
+                    ty: ref_str,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            let idx15 = constant(&mut b, entry, 15);
+            bounds_assert(&mut b, entry, idx15, meta);
+            let idx16 = constant(&mut b, entry, 16);
+            bounds_assert(&mut b, entry, idx16, meta);
+            b.terminate(entry, RTerm::Return(Some(meta)));
+
+            let mut func = finished(b);
+            let mut witnesses = Vec::new();
+            let res = run_with_interns(&mut func, &tbl, &interns, &mut witnesses);
+            assert_eq!(res.asserts_removed, 1, "15 < 16 eliminated, 16 < 16 kept");
+            assert_eq!(asserts(&func), 1);
+            super::super::witness::check_all(&witnesses, &func, &tbl).expect("witness checks");
+        }
+
+        // Negative controls: `sysroot: false`, `Callee::Foreign`, and unknown sysroot fn must NOT peel.
+        for (label, callee) in [
+            (
+                "sysroot_false",
+                Callee::Runtime {
+                    member: StrId(0),
+                    sysroot: false,
+                },
+            ),
+            (
+                "foreign",
+                Callee::Foreign {
+                    definition: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 0,
+                    },
+                    symbol: StrId(0),
+                },
+            ),
+            (
+                "unknown_sysroot",
+                Callee::Runtime {
+                    member: StrId(2),
+                    sysroot: true,
+                },
+            ),
+        ] {
+            let mut b = builder();
+            let entry = FuncBuilder::ENTRY;
+            let ptr = b.param(raw_u8, NO_ORIGIN);
+            let sixteen = constant(&mut b, entry, 16);
+            let s = b.op(
+                entry,
+                OpKind::Call {
+                    callee,
+                    function: None,
+                    args: vec![ptr, sixteen],
+                    track_caller: None,
+                    semantic: CallSemantic::RawParts,
+                    host: None,
+                },
+                REF_SLICE,
+                NO_ORIGIN,
+            );
+            let meta = metadata(&mut b, entry, s);
+            let idx15 = constant(&mut b, entry, 15);
+            bounds_assert(&mut b, entry, idx15, meta);
+            b.terminate(entry, RTerm::Return(Some(meta)));
+            let mut func = finished(b);
+            let mut witnesses = Vec::new();
+            let res = run_with_interns(&mut func, &tbl, &interns, &mut witnesses);
+            assert_eq!(
+                res.asserts_removed, 0,
+                "{label} must not peel slice_from_parts"
+            );
+        }
     }
 }
 

@@ -26,8 +26,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::jir::repr::{CellId, Func, Op, OpKind, RBlockId, RTerm, Root, ValueId};
-use crate::jir::semantic::{BinaryOp, CallSemantic, Callee, ConstTree, TypeId};
+use crate::jir::repr::{
+    Carrier, CellId, Dominators, Func, Op, OpKind, RBlockId, RTerm, Root, ValueId,
+};
+use crate::jir::semantic::{BinaryOp, CallSemantic, Callee, CastKind, ConstTree, TypeId};
 use crate::jir::types::{EnumRepr, NominalForm, TypeKind};
 use crate::jir::TypeTable;
 use crate::lower::fuse::{op_purity, Purity};
@@ -76,6 +78,10 @@ pub fn run_with(
     };
     for _ in 0..ROUNDS {
         let mut round = fold_constant_comparisons(func, table, witnesses);
+        if !options.no_deletions {
+            round |= fold_signed_lt_step_overflow(func, table);
+            round |= elide_redundant_copies(func, table);
+        }
         round |= remove_settled_asserts(func);
         round |= fold_constant_switches(func, table, witnesses);
         if !options.no_deletions {
@@ -290,6 +296,489 @@ fn split_unsigned_checked_adds(
     true
 }
 
+/// Rewrites `AddWithOverflow(x, 1)` at signed `iN` (`N >= 2`) to `Add(x, 1)` + `overflow = false`
+/// when dominated by a `Switch` edge proving `x < y` at the same signed type `iN`.
+///
+/// For any two's-complement signed integer `x < y` (`x, y: iN`), `x <= iN::MAX - 1` and
+/// `x >= iN::MIN`, so `x + 1` is strictly within `[iN::MIN + 1, iN::MAX]` and cannot overflow.
+/// This removes the `unreachable_unchecked` branch and panic payload inside `Range<iN>::next`.
+fn fold_signed_lt_step_overflow(func: &mut Func, table: &TypeTable) -> bool {
+    let n_values = func.values.len();
+    let n_blocks = func.blocks.len();
+    if n_blocks == 0 {
+        return false;
+    }
+
+    let mut has_signed_add_ovf = false;
+    let mut defs: Vec<Option<(usize, usize)>> = vec![None; n_values];
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        for (op_idx, op) in block.ops.iter().enumerate() {
+            if let Some(result) = op.result {
+                defs[result.0 as usize] = Some((b_idx, op_idx));
+            }
+            if let OpKind::Binary {
+                op: BinaryOp::AddWithOverflow,
+                ty,
+                ..
+            } = op.kind
+            {
+                if matches!(table.int_info(ty), Some((true, bits)) if bits >= 2) {
+                    has_signed_add_ovf = true;
+                }
+            }
+        }
+    }
+    if !has_signed_add_ovf {
+        return false;
+    }
+
+    let doms = Dominators::of(func);
+    let mut reachable = vec![false; n_blocks];
+    reachable[0] = true;
+    let mut stack = vec![0usize];
+    while let Some(b) = stack.pop() {
+        for succ in func.blocks[b].term.successors() {
+            let s = succ.0 as usize;
+            if s < n_blocks && !reachable[s] {
+                reachable[s] = true;
+                stack.push(s);
+            }
+        }
+    }
+
+    let mut preds: Vec<Vec<(usize, Vec<ValueId>)>> = vec![Vec::new(); n_blocks];
+    for (pred_idx, block) in func.blocks.iter().enumerate() {
+        if !reachable[pred_idx] {
+            continue;
+        }
+        for (target, args) in block.term.edges() {
+            let t = target.0 as usize;
+            if t < n_blocks {
+                preds[t].push((pred_idx, args.to_vec()));
+            }
+        }
+    }
+
+    let mut single_edge: Vec<Option<ValueId>> = vec![None; n_values];
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        if b_idx == 0 || !reachable[b_idx] {
+            continue;
+        }
+        let mut unique_pred: Option<(usize, &[ValueId])> = None;
+        let mut ok = true;
+        for (pred_idx, args) in &preds[b_idx] {
+            match unique_pred {
+                None => unique_pred = Some((*pred_idx, args.as_slice())),
+                Some((prev, _)) if prev == *pred_idx => ok = false,
+                Some(_) => ok = false,
+            }
+        }
+        if let (true, Some((pred_idx, args))) = (ok, unique_pred) {
+            if pred_idx != b_idx && args.len() == block.params.len() {
+                for (&param, &arg) in block.params.iter().zip(args.iter()) {
+                    single_edge[param.0 as usize] = Some(arg);
+                }
+            }
+        }
+    }
+
+    let def_op = |v: ValueId| -> Option<&Op> {
+        let (b, i) = defs.get(v.0 as usize).copied().flatten()?;
+        func.blocks.get(b)?.ops.get(i)
+    };
+
+    let strip_aliases = |mut v: ValueId| -> ValueId {
+        for _ in 0..16 {
+            if let Some(op) = def_op(v) {
+                match op.kind {
+                    OpKind::Copy(s) | OpKind::Move(s) => v = s,
+                    _ => break,
+                }
+            } else if let Some(src) = single_edge.get(v.0 as usize).copied().flatten() {
+                v = src;
+            } else {
+                break;
+            }
+        }
+        v
+    };
+
+    let mask_bits = |x: u128, bits: u32| -> u128 {
+        match bits {
+            0 => 0,
+            1..=127 => x & ((1u128 << bits) - 1),
+            _ => x,
+        }
+    };
+
+    let eval_const_int = |start: ValueId| -> Option<(u128, TypeId)> {
+        let mut chain: Vec<(bool, u32, u32, TypeId)> = Vec::new();
+        let mut cur = start;
+        let mut base: Option<(u128, TypeId)> = None;
+        for _ in 0..16 {
+            if let Some(op) = def_op(cur) {
+                match op.kind {
+                    OpKind::Const(ConstTree::Scalar { bits, bytes }) => {
+                        base = Some((mask(bits, bytes), func.values[cur.0 as usize].ty));
+                        break;
+                    }
+                    OpKind::Copy(s) | OpKind::Move(s) => cur = s,
+                    OpKind::Cast {
+                        kind: CastKind::IntToInt,
+                        v,
+                        from,
+                        to,
+                    } => {
+                        let (from_signed, from_bits) = table.int_info(from)?;
+                        let (_, to_bits) = table.int_info(to)?;
+                        chain.push((from_signed, from_bits, to_bits, to));
+                        cur = v;
+                    }
+                    _ => return None,
+                }
+            } else {
+                let src = single_edge.get(cur.0 as usize).copied().flatten()?;
+                cur = src;
+            }
+        }
+        let (mut val, mut val_ty) = base?;
+        for (from_signed, from_bits, to_bits, to) in chain.into_iter().rev() {
+            let extended = if from_signed {
+                signed_value(val, from_bits) as u128
+            } else {
+                mask_bits(val, from_bits)
+            };
+            val = mask_bits(extended, to_bits);
+            val_ty = to;
+        }
+        Some((val, val_ty))
+    };
+
+    let is_signed_one = |v: ValueId, target_ty: TypeId| -> bool {
+        let Some((true, bits)) = table.int_info(target_ty) else {
+            return false;
+        };
+        if bits < 2 {
+            return false;
+        }
+        let Some((val, val_ty)) = eval_const_int(v) else {
+            return false;
+        };
+        val_ty == target_ty && signed_value(val, bits) == 1
+    };
+
+    // Collect edge facts `(target_block, x_root, signed_ty)` where entering `target_block`
+    // proves `x_root < some_y` at `signed_ty`.
+    let mut edge_facts: Vec<(RBlockId, ValueId, TypeId)> = Vec::new();
+    for t_idx in 1..n_blocks {
+        if !reachable[t_idx] || preds[t_idx].len() != 1 {
+            continue;
+        }
+        let pred_idx = preds[t_idx][0].0;
+        if pred_idx == t_idx {
+            continue;
+        }
+        let RTerm::Switch {
+            scrut,
+            scrut_ty,
+            cases,
+            default,
+        } = &func.blocks[pred_idx].term
+        else {
+            continue;
+        };
+        let t_id = RBlockId(t_idx as u32);
+        let width_bytes = table
+            .int_info(*scrut_ty)
+            .map_or(1, |(_, bits)| (bits / 8).max(1) as u8);
+        let mut reaches_t = false;
+        let mut all_nonzero = true;
+        for (val, target, _) in cases {
+            if *target == t_id {
+                reaches_t = true;
+                if mask(*val, width_bytes) == 0 {
+                    all_nonzero = false;
+                    break;
+                }
+            }
+        }
+        if default.0 == t_id {
+            reaches_t = true;
+            if !cases.iter().any(|(val, _, _)| mask(*val, width_bytes) == 0) {
+                all_nonzero = false;
+            }
+        }
+        if !reaches_t || !all_nonzero {
+            continue;
+        }
+        let scrut_root = strip_aliases(*scrut);
+        let Some(scrut_op) = def_op(scrut_root) else {
+            continue;
+        };
+        let OpKind::Binary {
+            op: cmp_op @ (BinaryOp::Lt | BinaryOp::Gt),
+            l,
+            r,
+            ty: cmp_ty,
+        } = scrut_op.kind
+        else {
+            continue;
+        };
+        if !matches!(table.int_info(cmp_ty), Some((true, bits)) if bits >= 2) {
+            continue;
+        }
+        let x = if cmp_op == BinaryOp::Lt { l } else { r };
+        edge_facts.push((t_id, strip_aliases(x), cmp_ty));
+    }
+    if edge_facts.is_empty() {
+        return false;
+    }
+
+    let dominates = |a: RBlockId, b: RBlockId| -> bool {
+        let mut at = b;
+        loop {
+            if at == a {
+                return true;
+            }
+            match doms.idom.get(at.0 as usize).copied().flatten() {
+                Some(up) if up != at => at = up,
+                _ => return false,
+            }
+        }
+    };
+
+    #[derive(Clone, Copy)]
+    struct Candidate {
+        ty: TypeId,
+        has_ovf_proj: bool,
+        valid: bool,
+    }
+
+    let mut candidates: BTreeMap<ValueId, Candidate> = BTreeMap::new();
+    for (b_idx, block) in func.blocks.iter().enumerate() {
+        if !reachable[b_idx] {
+            continue;
+        }
+        let b_id = RBlockId(b_idx as u32);
+        for op in &block.ops {
+            let (
+                Some(result),
+                OpKind::Binary {
+                    op: BinaryOp::AddWithOverflow,
+                    l,
+                    r,
+                    ty,
+                },
+            ) = (op.result, &op.kind)
+            else {
+                continue;
+            };
+            if !matches!(table.int_info(*ty), Some((true, bits)) if bits >= 2) {
+                continue;
+            }
+            let l_root = strip_aliases(*l);
+            let r_root = strip_aliases(*r);
+            let proven = (is_signed_one(*r, *ty)
+                && edge_facts.iter().any(|&(fact_b, fact_x, fact_ty)| {
+                    fact_ty == *ty && fact_x == l_root && dominates(fact_b, b_id)
+                }))
+                || (is_signed_one(*l, *ty)
+                    && edge_facts.iter().any(|&(fact_b, fact_x, fact_ty)| {
+                        fact_ty == *ty && fact_x == r_root && dominates(fact_b, b_id)
+                    }));
+            if proven {
+                candidates.insert(
+                    result,
+                    Candidate {
+                        ty: *ty,
+                        has_ovf_proj: false,
+                        valid: true,
+                    },
+                );
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return false;
+    }
+
+    for block in &func.blocks {
+        for op in &block.ops {
+            for used in op.kind.uses() {
+                let Some(cand) = candidates.get_mut(&used) else {
+                    continue;
+                };
+                match (&op.kind, op.result) {
+                    (
+                        OpKind::Field {
+                            base,
+                            variant: None,
+                            field: 0,
+                        },
+                        Some(result),
+                    ) if *base == used && func.values[result.0 as usize].ty == cand.ty => {}
+                    (
+                        OpKind::Field {
+                            base,
+                            variant: None,
+                            field: 1,
+                        },
+                        Some(result),
+                    ) if *base == used
+                        && matches!(
+                            table
+                                .get(func.values[result.0 as usize].ty)
+                                .map(|d| &d.kind),
+                            Some(TypeKind::Bool)
+                        ) =>
+                    {
+                        cand.has_ovf_proj = true;
+                    }
+                    _ => cand.valid = false,
+                }
+            }
+        }
+        for used in block.term.uses() {
+            if let Some(cand) = candidates.get_mut(&used) {
+                cand.valid = false;
+            }
+        }
+    }
+    candidates.retain(|_, cand| cand.valid && cand.has_ovf_proj);
+    if candidates.is_empty() {
+        return false;
+    }
+
+    for (&pair, cand) in &candidates {
+        func.values[pair.0 as usize].ty = cand.ty;
+    }
+    for block in &mut func.blocks {
+        for op in &mut block.ops {
+            if let Some(_pair) = op.result.filter(|r| candidates.contains_key(r)) {
+                if let OpKind::Binary {
+                    op: BinaryOp::AddWithOverflow,
+                    l,
+                    r,
+                    ty,
+                } = op.kind
+                {
+                    op.kind = OpKind::Binary {
+                        op: BinaryOp::Add,
+                        l,
+                        r,
+                        ty,
+                    };
+                }
+                continue;
+            }
+            if let OpKind::Field {
+                base,
+                variant: None,
+                field,
+            } = op.kind
+            {
+                if candidates.contains_key(&base) {
+                    op.kind = match field {
+                        0 => OpKind::Copy(base),
+                        1 => OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 1 }),
+                        _ => unreachable!("candidate validation accepted only fields 0 and 1"),
+                    };
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Rewrites redundant same-block chained `OpKind::Copy(v1)` into `OpKind::Move(v1)`.
+///
+/// When `v1` is a non-primitive (`needs_clone`) value with total syntactic use count `1`, defined
+/// in the exact same basic block before `v2 = Copy(v1)`, and `v1` is already a uniquely-owned
+/// fresh value (`Copy(_)` or `Aggregate` whose `needs_clone` fields are themselves single-use,
+/// same-block, uniquely-owned fresh values, or `Move` of one), cloning `v1` again is redundant and
+/// can never create an observable alias.
+fn elide_redundant_copies(func: &mut Func, table: &TypeTable) -> bool {
+    let n_values = func.values.len();
+    let mut total_uses = vec![0usize; n_values];
+    for block in &func.blocks {
+        for op in &block.ops {
+            for v in op.kind.uses() {
+                if let Some(slot) = total_uses.get_mut(v.0 as usize) {
+                    *slot += 1;
+                }
+            }
+        }
+        for v in block.term.uses() {
+            if let Some(slot) = total_uses.get_mut(v.0 as usize) {
+                *slot += 1;
+            }
+        }
+    }
+
+    let mut changed = false;
+    let mut fresh_owned = vec![false; n_values];
+    let mut def_in_block: Vec<Option<usize>> = vec![None; n_values];
+    for (b_idx, block) in func.blocks.iter_mut().enumerate() {
+        for op in &mut block.ops {
+            let Some(res) = op.result else {
+                continue;
+            };
+            let res_def = func.values[res.0 as usize];
+            def_in_block[res.0 as usize] = Some(b_idx);
+            if res_def.carrier != Carrier::Baseline {
+                continue;
+            }
+            match &op.kind {
+                OpKind::Copy(v1) => {
+                    let v1_val = *v1;
+                    let v1_def = func.values[v1_val.0 as usize];
+                    let can_elide = table.needs_clone(res_def.ty)
+                        && v1_def.ty == res_def.ty
+                        && v1_def.carrier == Carrier::Baseline
+                        && total_uses.get(v1_val.0 as usize).copied() == Some(1)
+                        && def_in_block.get(v1_val.0 as usize).copied().flatten() == Some(b_idx)
+                        && fresh_owned.get(v1_val.0 as usize).copied().unwrap_or(false);
+                    if can_elide {
+                        op.kind = OpKind::Move(v1_val);
+                        changed = true;
+                    }
+                    // Either as a fresh `Copy` or a `Move` of an unaliased fresh value, `res` is fresh.
+                    fresh_owned[res.0 as usize] = true;
+                }
+                OpKind::Move(v1) => {
+                    if total_uses.get(v1.0 as usize).copied() == Some(1)
+                        && def_in_block.get(v1.0 as usize).copied().flatten() == Some(b_idx)
+                        && fresh_owned.get(v1.0 as usize).copied().unwrap_or(false)
+                    {
+                        fresh_owned[res.0 as usize] = true;
+                    }
+                }
+                OpKind::Aggregate {
+                    active_field: None,
+                    fields,
+                    ..
+                } => {
+                    let all_fields_fresh = fields.iter().all(|f| {
+                        let f_ty = func.values[f.0 as usize].ty;
+                        if !table.needs_clone(f_ty) || table.is_zst(f_ty) {
+                            return true;
+                        }
+                        func.values[f.0 as usize].carrier == Carrier::Baseline
+                            && total_uses.get(f.0 as usize).copied() == Some(1)
+                            && def_in_block.get(f.0 as usize).copied().flatten() == Some(b_idx)
+                            && fresh_owned.get(f.0 as usize).copied().unwrap_or(false)
+                    });
+                    if all_fields_fresh {
+                        fresh_owned[res.0 as usize] = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    changed
+}
+
 /// Drops the value-table entries of every definition the rounds above deleted.
 ///
 /// Deleting an op, a block or a block parameter leaves its `ValueDef` behind with nothing defining
@@ -343,14 +832,65 @@ fn fold_constant_comparisons(
     table: &TypeTable,
     witnesses: &mut Vec<Witness>,
 ) -> bool {
+    let mask_bits = |x: u128, bits: u32| -> u128 {
+        match bits {
+            0 => 0,
+            1..=127 => x & ((1u128 << bits) - 1),
+            _ => x,
+        }
+    };
     let mut constants: BTreeMap<ValueId, (u128, u8)> = BTreeMap::new();
-    for block in &func.blocks {
-        for op in &block.ops {
-            if let (Some(result), OpKind::Const(ConstTree::Scalar { bits, bytes })) =
-                (op.result, &op.kind)
-            {
-                constants.insert(result, (*bits, *bytes));
+    for _ in 0..4 {
+        let before = constants.len();
+        for block in &func.blocks {
+            for op in &block.ops {
+                let Some(result) = op.result else {
+                    continue;
+                };
+                if constants.contains_key(&result) {
+                    continue;
+                }
+                match &op.kind {
+                    OpKind::Const(ConstTree::Scalar { bits, bytes }) => {
+                        constants.insert(result, (*bits, *bytes));
+                    }
+                    OpKind::Copy(src) | OpKind::Move(src) => {
+                        if let Some(c) = constants.get(src).copied() {
+                            constants.insert(result, c);
+                        }
+                    }
+                    OpKind::Cast {
+                        kind: CastKind::IntToInt,
+                        v,
+                        from,
+                        to,
+                    } => {
+                        if let (
+                            Some((raw, raw_bytes)),
+                            Some((from_signed, from_bits)),
+                            Some((_, to_bits)),
+                        ) = (
+                            constants.get(v).copied(),
+                            table.int_info(*from),
+                            table.int_info(*to),
+                        ) {
+                            let masked = mask(raw, raw_bytes);
+                            let extended = if from_signed {
+                                signed_value(masked, from_bits) as u128
+                            } else {
+                                mask_bits(masked, from_bits)
+                            };
+                            let out_bits = mask_bits(extended, to_bits);
+                            let out_bytes = (to_bits / 8).max(1) as u8;
+                            constants.insert(result, (out_bits, out_bytes));
+                        }
+                    }
+                    _ => {}
+                }
             }
+        }
+        if constants.len() == before {
+            break;
         }
     }
     let mut changed = false;
@@ -365,31 +905,42 @@ fn fold_constant_comparisons(
             else {
                 continue;
             };
-            let (Some((signed, bits)), Some(l), Some(r)) = (
-                table.int_info(*ty),
-                constants.get(l).copied(),
-                constants.get(r).copied(),
-            ) else {
+            let (Some(l), Some(r)) = (constants.get(l).copied(), constants.get(r).copied()) else {
                 continue;
             };
-            let ordering = match signed {
-                true => signed_value(l.0, bits).cmp(&signed_value(r.0, bits)),
-                false => mask(l.0, (bits / 8) as u8).cmp(&mask(r.0, (bits / 8) as u8)),
-            };
-            let value = match binary {
-                BinaryOp::Eq => ordering.is_eq(),
-                BinaryOp::Ne => ordering.is_ne(),
-                BinaryOp::Lt => ordering.is_lt(),
-                BinaryOp::Le => ordering.is_le(),
-                BinaryOp::Gt => ordering.is_gt(),
-                BinaryOp::Ge => ordering.is_ge(),
+            let (is_bool, ordering, l_witness, r_witness) =
+                if let Some((signed, bits)) = table.int_info(*ty) {
+                    let ord = match signed {
+                        true => signed_value(l.0, bits).cmp(&signed_value(r.0, bits)),
+                        false => mask(l.0, (bits / 8) as u8).cmp(&mask(r.0, (bits / 8) as u8)),
+                    };
+                    (false, ord, l, r)
+                } else if matches!(
+                    table.get(table.peeled(*ty)).map(|d| &d.kind),
+                    Some(TypeKind::Bool)
+                ) {
+                    let lb = mask(l.0, l.1) != 0;
+                    let rb = mask(r.0, r.1) != 0;
+                    (true, lb.cmp(&rb), (u128::from(lb), 1), (u128::from(rb), 1))
+                } else {
+                    continue;
+                };
+            let (value, witness_op) = match binary {
+                BinaryOp::Eq => (ordering.is_eq(), BinaryOp::Eq),
+                BinaryOp::Ne => (ordering.is_ne(), BinaryOp::Ne),
+                BinaryOp::Lt => (ordering.is_lt(), BinaryOp::Lt),
+                BinaryOp::Le => (ordering.is_le(), BinaryOp::Le),
+                BinaryOp::Gt => (ordering.is_gt(), BinaryOp::Gt),
+                BinaryOp::Ge => (ordering.is_ge(), BinaryOp::Ge),
+                // For `TypeKind::Bool`, `l ^ r` is `l != r`.
+                BinaryOp::BitXor if is_bool => (ordering.is_ne(), BinaryOp::Ne),
                 _ => continue,
             };
             witnesses.push(Witness::ConstFold {
-                op: *binary,
+                op: witness_op,
                 ty: *ty,
-                l,
-                r,
+                l: l_witness,
+                r: r_witness,
                 result: value,
             });
             op.kind = OpKind::Const(ConstTree::Scalar {
@@ -3212,6 +3763,428 @@ mod tests {
             "dead CellAlloc should be removed once dead BorrowView drops"
         );
         func.verify(&tbl).expect("post-dce Func::verify");
+    }
+
+    fn signed_and_checked_table() -> TypeTable {
+        use crate::jir::types::{FieldDescriptor, FieldKey};
+
+        const BOOL: TypeId = TypeId(2);
+        const U32: TypeId = TypeId(3);
+        const CHECKED_I32: TypeId = TypeId(4);
+        const I64: TypeId = TypeId(5);
+        const CHECKED_I64: TypeId = TypeId(6);
+        const STRUCT: TypeId = TypeId(7);
+        const CHECKED_U32: TypeId = TypeId(8);
+        const FOUR_STRUCT: TypeId = TypeId(9);
+
+        let mut tbl = table();
+        let make = |id, kind, int| TypeDescriptor {
+            id,
+            name: None,
+            kind,
+            layout: LayoutFacts {
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: id,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        };
+        tbl.insert(make(BOOL, TypeKind::Bool, None));
+        tbl.insert(make(
+            U32,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            Some(IntFacts {
+                signed: false,
+                bits: 32,
+                repr: IntRepr::Number,
+            }),
+        ));
+        tbl.insert(make(
+            I64,
+            TypeKind::Integer {
+                signed: true,
+                bits: 64,
+            },
+            Some(IntFacts {
+                signed: true,
+                bits: 64,
+                repr: IntRepr::BigInt,
+            }),
+        ));
+        for (pair_id, elem_ty, elem_bytes) in [
+            (CHECKED_I32, I32, 4u64),
+            (CHECKED_U32, U32, 4u64),
+            (CHECKED_I64, I64, 8u64),
+        ] {
+            let mut d = make(pair_id, TypeKind::Tuple(vec![elem_ty, BOOL]), None);
+            d.js.is_indirect = true;
+            d.js.needs_clone = true;
+            d.js.fields = vec![
+                FieldDescriptor {
+                    key: FieldKey::Index(0),
+                    ty: elem_ty,
+                    offset: 0,
+                },
+                FieldDescriptor {
+                    key: FieldKey::Index(1),
+                    ty: BOOL,
+                    offset: elem_bytes,
+                },
+            ];
+            tbl.insert(d);
+        }
+        let mut st = make(STRUCT, TypeKind::Tuple(vec![I32]), None);
+        st.js.is_indirect = true;
+        st.js.needs_clone = true;
+        st.js.fields = vec![FieldDescriptor {
+            key: FieldKey::Index(0),
+            ty: I32,
+            offset: 0,
+        }];
+        tbl.insert(st);
+        let mut four = make(
+            FOUR_STRUCT,
+            TypeKind::Tuple(vec![STRUCT, STRUCT, STRUCT, STRUCT]),
+            None,
+        );
+        four.js.is_indirect = true;
+        four.js.needs_clone = true;
+        four.js.fields = (0..4)
+            .map(|i| FieldDescriptor {
+                key: FieldKey::Index(i),
+                ty: STRUCT,
+                offset: u64::from(i) * 4,
+            })
+            .collect();
+        tbl.insert(four);
+        tbl
+    }
+
+    #[test]
+    fn signed_lt_step_overflow_folds_i32_and_i64_and_rejects_unsafe_shapes() {
+        use crate::jir::repr::RAssertMessage;
+
+        const BOOL: TypeId = TypeId(2);
+        const U32: TypeId = TypeId(3);
+        const CHECKED_I32: TypeId = TypeId(4);
+        const I64: TypeId = TypeId(5);
+        const CHECKED_I64: TypeId = TypeId(6);
+        const CHECKED_U32: TypeId = TypeId(8);
+        let tbl = signed_and_checked_table();
+
+        let run_case = |val_ty: TypeId,
+                        pair_ty: TypeId,
+                        cmp_op: BinaryOp,
+                        cmp_left_is_x: bool,
+                        step: u128,
+                        join_from_both: bool| {
+            let mut b = FuncBuilder::new(
+                ItemId {
+                    definition: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 201,
+                    },
+                    instantiation: 0,
+                },
+                Signature {
+                    abi: AbiSignature {
+                        parameters: 2,
+                        ..AbiSignature::default()
+                    },
+                    arguments: vec![val_ty, val_ty],
+                    result: val_ty,
+                },
+            );
+            let entry = FuncBuilder::ENTRY;
+            let body = b.block();
+            let exit = b.block();
+            let x = b.param(val_ty, NO_ORIGIN);
+            let y = b.param(val_ty, NO_ORIGIN);
+            let (l, r) = if cmp_left_is_x { (x, y) } else { (y, x) };
+            let cmp = b.op(
+                entry,
+                OpKind::Binary {
+                    op: cmp_op,
+                    l,
+                    r,
+                    ty: val_ty,
+                },
+                BOOL,
+                NO_ORIGIN,
+            );
+            let fallback = if join_from_both { body } else { exit };
+            b.terminate(
+                entry,
+                RTerm::Switch {
+                    scrut: cmp,
+                    scrut_ty: BOOL,
+                    cases: vec![(0, fallback, Vec::new())],
+                    default: (body, Vec::new()),
+                },
+            );
+            let bytes = if val_ty == I64 { 8 } else { 4 };
+            let step_val = b.op(
+                body,
+                OpKind::Const(ConstTree::Scalar { bits: step, bytes }),
+                val_ty,
+                NO_ORIGIN,
+            );
+            let pair = b.op(
+                body,
+                OpKind::Binary {
+                    op: BinaryOp::AddWithOverflow,
+                    l: x,
+                    r: step_val,
+                    ty: val_ty,
+                },
+                pair_ty,
+                NO_ORIGIN,
+            );
+            let sum = b.op(
+                body,
+                OpKind::Field {
+                    base: pair,
+                    variant: None,
+                    field: 0,
+                },
+                val_ty,
+                NO_ORIGIN,
+            );
+            let ovf = b.op(
+                body,
+                OpKind::Field {
+                    base: pair,
+                    variant: None,
+                    field: 1,
+                },
+                BOOL,
+                NO_ORIGIN,
+            );
+            b.effect(
+                body,
+                OpKind::Assert {
+                    cond: ovf,
+                    expected: false,
+                    msg: RAssertMessage::Overflow {
+                        op: BinaryOp::Add,
+                        left: x,
+                        right: step_val,
+                    },
+                },
+                NO_ORIGIN,
+            );
+            b.terminate(body, RTerm::Return(Some(sum)));
+            b.terminate(exit, RTerm::Return(Some(x)));
+
+            let mut func = b.finish();
+            func.verify(&tbl).expect("pre-dce Func::verify");
+            let mut probe = func.clone();
+            let folded_signed = fold_signed_lt_step_overflow(&mut probe, &tbl);
+            let changed = super::run(&mut func, &tbl);
+            func.verify(&tbl).expect("post-dce Func::verify");
+            let has_ovf_add = func.blocks.iter().any(|blk| {
+                blk.ops.iter().any(|op| {
+                    matches!(
+                        op.kind,
+                        OpKind::Binary {
+                            op: BinaryOp::AddWithOverflow,
+                            ..
+                        }
+                    )
+                })
+            });
+            let has_assert = func.blocks.iter().any(|blk| {
+                blk.ops
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::Assert { .. }))
+            });
+            (folded_signed, changed, has_ovf_add, has_assert)
+        };
+
+        // Positive cases: signed i32 Lt (`x < y`), signed i32 Gt (`y > x`), signed i64 Lt (`x < y`).
+        for (ty, pair_ty, cmp_op, left_x) in [
+            (I32, CHECKED_I32, BinaryOp::Lt, true),
+            (I32, CHECKED_I32, BinaryOp::Gt, false),
+            (I64, CHECKED_I64, BinaryOp::Lt, true),
+        ] {
+            let (folded_signed, changed, has_ovf_add, has_assert) =
+                run_case(ty, pair_ty, cmp_op, left_x, 1, false);
+            assert!(folded_signed);
+            assert!(changed);
+            assert!(
+                !has_ovf_add,
+                "signed x < y step + 1 should fold AddWithOverflow"
+            );
+            assert!(
+                !has_assert,
+                "signed x < y step + 1 overflow assert should fold away"
+            );
+        }
+
+        // Negative cases: unsigned Lt, signed Le (`x <= y`), step + 2, non-dominated join block.
+        for (label, ty, pair_ty, cmp_op, step, join) in [
+            ("unsigned Lt", U32, CHECKED_U32, BinaryOp::Lt, 1u128, false),
+            ("signed Le", I32, CHECKED_I32, BinaryOp::Le, 1u128, false),
+            ("step + 2", I32, CHECKED_I32, BinaryOp::Lt, 2u128, false),
+            ("non-dominated", I32, CHECKED_I32, BinaryOp::Lt, 1u128, true),
+        ] {
+            let (folded_signed, _, _, has_assert) = run_case(ty, pair_ty, cmp_op, true, step, join);
+            assert!(
+                !folded_signed,
+                "{label} must not trigger fold_signed_lt_step_overflow"
+            );
+            assert!(has_assert, "{label} must preserve overflow Assert");
+        }
+    }
+
+    #[test]
+    fn elide_redundant_copies_turns_fresh_chain_to_move_and_preserves_aliases() {
+        const STRUCT: TypeId = TypeId(7);
+        const FOUR_STRUCT: TypeId = TypeId(9);
+        let tbl = signed_and_checked_table();
+
+        // Positive: `Aggregate` -> `Copy` -> `Copy` -> `Return` becomes `Move`.
+        {
+            let mut b = FuncBuilder::new(
+                ItemId {
+                    definition: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 202,
+                    },
+                    instantiation: 0,
+                },
+                Signature {
+                    abi: AbiSignature {
+                        parameters: 1,
+                        ..AbiSignature::default()
+                    },
+                    arguments: vec![I32],
+                    result: STRUCT,
+                },
+            );
+            let entry = FuncBuilder::ENTRY;
+            let x = b.param(I32, NO_ORIGIN);
+            let agg = b.op(
+                entry,
+                OpKind::Aggregate {
+                    ty: STRUCT,
+                    variant: 0,
+                    active_field: None,
+                    fields: vec![x],
+                },
+                STRUCT,
+                NO_ORIGIN,
+            );
+            let c1 = b.op(entry, OpKind::Copy(agg), STRUCT, NO_ORIGIN);
+            let c2 = b.op(entry, OpKind::Copy(c1), STRUCT, NO_ORIGIN);
+            b.terminate(entry, RTerm::Return(Some(c2)));
+            let mut func = b.finish();
+            func.verify(&tbl).expect("pre-dce Func::verify");
+            assert!(super::run(&mut func, &tbl));
+            let copy_count = func.blocks[entry.0 as usize]
+                .ops
+                .iter()
+                .filter(|op| matches!(op.kind, OpKind::Copy(_)))
+                .count();
+            assert_eq!(
+                copy_count, 0,
+                "chained copies of fresh aggregate must become Move"
+            );
+        }
+
+        // Negative: param copy, 2-use copy, cross-block copy must stay Copy.
+        {
+            let mut b = FuncBuilder::new(
+                ItemId {
+                    definition: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 203,
+                    },
+                    instantiation: 0,
+                },
+                Signature {
+                    abi: AbiSignature {
+                        parameters: 2,
+                        ..AbiSignature::default()
+                    },
+                    arguments: vec![I32, STRUCT],
+                    result: FOUR_STRUCT,
+                },
+            );
+            let entry = FuncBuilder::ENTRY;
+            let next = b.block();
+            let x = b.param(I32, NO_ORIGIN);
+            let p_struct = b.param(STRUCT, NO_ORIGIN);
+            let copy_param = b.op(entry, OpKind::Copy(p_struct), STRUCT, NO_ORIGIN);
+            let two_use_agg = b.op(
+                entry,
+                OpKind::Aggregate {
+                    ty: STRUCT,
+                    variant: 0,
+                    active_field: None,
+                    fields: vec![x],
+                },
+                STRUCT,
+                NO_ORIGIN,
+            );
+            let u1 = b.op(entry, OpKind::Copy(two_use_agg), STRUCT, NO_ORIGIN);
+            let u2 = b.op(entry, OpKind::Copy(two_use_agg), STRUCT, NO_ORIGIN);
+            let cross_agg = b.op(
+                entry,
+                OpKind::Aggregate {
+                    ty: STRUCT,
+                    variant: 0,
+                    active_field: None,
+                    fields: vec![x],
+                },
+                STRUCT,
+                NO_ORIGIN,
+            );
+            b.terminate(entry, RTerm::Goto(next, Vec::new()));
+            let cross_copy = b.op(next, OpKind::Copy(cross_agg), STRUCT, NO_ORIGIN);
+            let out = b.op(
+                next,
+                OpKind::Aggregate {
+                    ty: FOUR_STRUCT,
+                    variant: 0,
+                    active_field: None,
+                    fields: vec![copy_param, u1, u2, cross_copy],
+                },
+                FOUR_STRUCT,
+                NO_ORIGIN,
+            );
+            b.terminate(next, RTerm::Return(Some(out)));
+
+            let mut func = b.finish();
+            func.verify(&tbl).expect("pre-dce Func::verify");
+            assert!(!super::run(&mut func, &tbl));
+            let remaining_copies: usize = func
+                .blocks
+                .iter()
+                .flat_map(|blk| &blk.ops)
+                .filter(|op| matches!(op.kind, OpKind::Copy(_)))
+                .count();
+            assert_eq!(
+                remaining_copies, 4,
+                "param, 2-use, and cross-block Copy must remain Copy"
+            );
+        }
     }
 }
 
