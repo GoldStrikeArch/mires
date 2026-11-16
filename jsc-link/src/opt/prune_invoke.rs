@@ -159,6 +159,7 @@ fn host_payload_cannot_throw(payload: &HostPayload, interns: &Interns) -> bool {
 /// exception, converting them to `RTerm::Goto` and sweeping unreachable cleanup blocks with DCE.
 ///
 /// Returns the number of functions modified.
+#[cfg(test)]
 pub(crate) fn run(
     table: &BTreeMap<JsName, LinkItem>,
     funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,

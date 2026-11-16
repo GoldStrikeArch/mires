@@ -1459,7 +1459,9 @@ fn o_group_with_mode(
         return group;
     }
     if run_dce {
-        crate::opt::prune_invoke::run(table, funcs, live);
+        let pruned = crate::opt::prune_invoke::run_checked(table, funcs, live);
+        group.witnesses_recorded += pruned.witnesses_recorded;
+        group.witnesses_failed += pruned.witnesses_failed;
     }
     let interns_map: BTreeMap<JsName, &crate::jir::Interns> = table
         .iter()
@@ -1603,9 +1605,14 @@ fn o_group_with_mode(
             item.jir.origins = origins;
         }
     }
-    let pruned_post_inline = run_dce
-        && group.inline.applied > 0
-        && crate::opt::prune_invoke::run(table, funcs, live) > 0;
+    let pruned_post_inline = if run_dce && group.inline.applied > 0 {
+        let pruned = crate::opt::prune_invoke::run_checked(table, funcs, live);
+        group.witnesses_recorded += pruned.witnesses_recorded;
+        group.witnesses_failed += pruned.witnesses_failed;
+        pruned.modified > 0
+    } else {
+        false
+    };
     let interns_map: BTreeMap<JsName, &crate::jir::Interns> = table
         .iter()
         .filter_map(|(name, item)| Some((name.clone(), item.jir.interns()?)))
