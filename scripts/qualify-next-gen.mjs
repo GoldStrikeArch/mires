@@ -4,9 +4,11 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -760,12 +762,34 @@ writeFileSync(enumSources.local_inlinable_helper, makeEnumSource(false));
 
 const MAIN_DYLIB = resolve(MAIN_ROOT, 'target/release/librustc_codegen_mires.dylib');
 const MAIN_JSC_LINK = resolve(MAIN_ROOT, 'target/release/jsc-link');
-const MAIN_RB_SYSROOT = resolve(
-  MAIN_ROOT,
-  'build/sysroots/c40e0513c4b5de215d41712d4ce772e34359f199557a7c5ba6ce67b585f10da3',
-);
-const MAIN_DEFAULT_SYSROOT = resolve(MAIN_ROOT, 'build/sysroot');
-const mainSysroot = existsSync(MAIN_RB_SYSROOT) ? MAIN_RB_SYSROOT : MAIN_DEFAULT_SYSROOT;
+// `main` (44161c24+) builds for the `mires32-unwind` JSON target spec with JIR schema 17; the old
+// `wasm32-unknown-unknown` sysroots under MAIN_ROOT/build/sysroots are schema 16 and must not be
+// mixed with MAIN_DYLIB. Pick the newest existing `mires32-unwind` sysroot that main's own
+// `build_sysroot.sh` built for the release-balanced argument set (read-only: nothing is built or
+// written under MAIN_ROOT).
+const MAIN_TARGET_NAME = 'mires32-unwind';
+const MAIN_TARGET_SPEC = resolve(MAIN_ROOT, `targets/${MAIN_TARGET_NAME}.json`);
+const MAIN_RB_JS_ARGS = 'js-cleanup=off js-ecma-target=2018 js-minify=on js-opt=on';
+function findMainUnwindSysroot() {
+  const sysrootsDir = resolve(MAIN_ROOT, 'build/sysroots');
+  if (!existsSync(sysrootsDir)) return null;
+  const candidates = readdirSync(sysrootsDir)
+    .map((name) => resolve(sysrootsDir, name))
+    .filter(
+      (dir) =>
+        readTrim(resolve(dir, '.target')) === MAIN_TARGET_NAME &&
+        readTrim(resolve(dir, '.js-args')) === MAIN_RB_JS_ARGS &&
+        existsSync(resolve(dir, `lib/rustlib/${MAIN_TARGET_NAME}/lib`)),
+    )
+    .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+  return candidates[0] || null;
+}
+const mainSysroot = findMainUnwindSysroot();
+if (!mainSysroot || !existsSync(MAIN_TARGET_SPEC)) {
+  throw new Error(
+    `old_main: no ${MAIN_TARGET_NAME} release-balanced sysroot (${MAIN_RB_JS_ARGS}) under ${MAIN_ROOT}/build/sysroots, or missing ${MAIN_TARGET_SPEC}`,
+  );
+}
 const mainSysrootArgs = readTrim(resolve(mainSysroot, '.js-args')) || '';
 const mainShimCode = readFileSync(resolve(MAIN_ROOT, 'runtime/shim.js'), 'utf8');
 
@@ -782,13 +806,14 @@ for (const [variant, srcPath] of Object.entries(enumSources)) {
     '--edition',
     '2021',
     '--target',
-    'wasm32-unknown-unknown',
+    MAIN_TARGET_SPEC,
+    '-Zunstable-options',
     '--sysroot',
     mainSysroot,
     '--crate-type',
     'cdylib',
     '-Ccodegen-units=1',
-    '-Cpanic=abort',
+    '-Cpanic=unwind',
     '-Coverflow-checks=off',
     '-Cdebug-assertions=off',
     '-Cdebuginfo=0',

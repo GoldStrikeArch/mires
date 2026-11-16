@@ -51,13 +51,15 @@ impl RangeStats {
     }
 }
 
-/// Runs the pass over `func` in place.
+/// Runs the pass over `func` in place, without interned names: every sysroot runtime shim with the
+/// right shape is trusted. Production uses [`run_with_interns`]; this form serves the unit and
+/// corpus tests, whose functions carry no intern table.
+#[cfg(test)]
 pub fn run(func: &mut Func, table: &TypeTable, witnesses: &mut Vec<Witness>) -> RangeStats {
     run_impl(func, table, None, witnesses)
 }
 
 /// Runs the pass over `func` in place with `interns` for exact sysroot runtime shim matching.
-#[allow(dead_code)]
 pub fn run_with_interns(
     func: &mut Func,
     table: &TypeTable,

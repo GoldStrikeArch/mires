@@ -314,7 +314,7 @@ fn run(
     }
 
     if opts.analyzes(OptimizerPass::AstDce) && passes.range {
-        let range = range::run(func, table, &mut witnesses);
+        let range = range::run_with_interns(func, table, interns, &mut witnesses);
         if range.changed() {
             stats.range_changed = true;
             stats.asserts_removed += range.asserts_removed;

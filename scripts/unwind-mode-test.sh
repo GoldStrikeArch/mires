@@ -182,6 +182,10 @@ for setting in defaults inline-z; do
 		SKIP_BUILD=1 "$script_dir/build_sysroot.sh" >"$work/sysroot-$setting-$mode.log" 2>&1
 		for source in "$root"/examples/unwind-tests/*.rs; do
 			name=$(basename -- "$source" .rs)
+			case "$name" in
+			# 314..317 are owned by scripts/abi-flat-mut-test.sh and expose their own exports.
+			314_* | 315_* | 316_* | 317_*) continue ;;
+			esac
 			tag="$panic/$setting/$mode $name"
 			program="$work/$name-$setting-$mode.js"
 			externs=()

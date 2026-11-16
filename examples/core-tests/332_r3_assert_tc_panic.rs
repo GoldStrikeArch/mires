@@ -57,9 +57,9 @@ fn caller_outer() -> u32 {
 #[unsafe(no_mangle)]
 pub fn rust_entry(mode: i32) {
     let v = match mode {
-        0 => caller_div(),
         1 => caller_idx(),
-        _ => caller_outer(),
+        2 => caller_outer(),
+        _ => caller_div(),
     };
     unsafe { js_log_i32(v as i32) };
 }

@@ -9,6 +9,9 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
     "$root/scripts/build.sh"
 fi
 
+# The fixture compiles against a sysroot built with the same backend options.
+JS_EXTRA_ARGS="js-lane=jir js-opt=on" SKIP_BUILD=1 "$root/scripts/build_sysroot.sh" >/dev/null
+
 work="$(mktemp -d "${TMPDIR:-/tmp}/mires-r3-loops-bounds.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 
