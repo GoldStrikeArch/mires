@@ -17,15 +17,21 @@
 //! never renumbers) names blocks and values of the final `Func` and is checked structurally
 //! against it.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use crate::analysis::refs::{self, RefScan};
+use crate::item::{ItemKind, JsName, LinkItem};
+use crate::jir::decline::Decline;
 use crate::jir::interns::{Interns, StrId};
 use crate::jir::interp::{self, Hooks, Trap, Value};
-use crate::jir::repr::{Dominators, Func, FuncBuilder, OpKind, RBlockId, RTerm, ValueId};
+use crate::jir::repr::{Dominators, Func, FuncBuilder, Op, OpKind, RBlockId, RTerm, ValueId};
 use crate::jir::semantic::{
-    AbiSignature, BinaryOp, Callee, ConstTree, DefinitionId, DirectItemRef, ItemId, Signature,
-    TypeId,
+    AbiSignature, BinaryOp, BodyKind, CallSemantic, Callee, ConstTree, DefinitionId, DirectItemRef,
+    DropGlue, HostPayload, ItemId, Signature, TypeId, VtableEntry,
 };
-use crate::jir::types::IteratorIdentity;
+use crate::jir::types::{IteratorIdentity, TypeKind};
 use crate::jir::{OriginId, TypeTable};
+use crate::late_ir::AllocatorProvider;
 
 /// Exact evidence for one standard-library slice-adapter loop replaced by a scalar cursor.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,6 +179,11 @@ pub enum Witness {
         /// Exact generated blocks, values, edges, and adapter semantics for every loop.
         loops: Vec<SliceIteratorLoop>,
     },
+    /// Non-throwing or noop-unwind `RTerm::Invoke` terminators were pruned to `RTerm::Goto`.
+    InvokePruned {
+        /// Number of pruned `RTerm::Invoke` sites in the function.
+        count: u32,
+    },
 }
 
 /// The evidence a [`Witness::BoundsRemoved`] carries.
@@ -261,6 +272,13 @@ impl Witness {
             }
             Self::SliceIteratorCursor { loops } => {
                 super::slice_iter::check_lowered(func, table, loops)
+            }
+            Self::InvokePruned { count } => {
+                if *count == 0 {
+                    Err("an invoke-pruned witness pruned no invokes".to_owned())
+                } else {
+                    check_carriers(func, table)
+                }
             }
         }
     }
@@ -645,6 +663,739 @@ fn check_inline(
         ));
     }
     Ok(())
+}
+
+/// Reason an `RTerm::Invoke` terminator was proven safe to lower to `RTerm::Goto`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InvokePruneReason {
+    NoopUnwindChain,
+    ProtectedOpCannotThrow,
+}
+
+/// One pre-DCE `RTerm::Invoke` block pruned by `prune_invoke`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InvokePrunedSite {
+    pub block: RBlockId,
+    pub reason: InvokePruneReason,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_WITNESS_FAULT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ScopedWitnessFault {
+    prev: Option<String>,
+}
+
+#[cfg(test)]
+impl ScopedWitnessFault {
+    pub(crate) fn new(val: &str) -> Self {
+        let prev = TEST_WITNESS_FAULT.with(|cell| cell.borrow_mut().replace(val.to_owned()));
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedWitnessFault {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        TEST_WITNESS_FAULT.with(|cell| *cell.borrow_mut() = prev);
+    }
+}
+
+fn current_witness_fault() -> Option<String> {
+    #[cfg(test)]
+    if let Some(val) = TEST_WITNESS_FAULT.with(|cell| cell.borrow().clone()) {
+        return Some(val);
+    }
+    std::env::var("RCGJS_WITNESS_FAULT").ok()
+}
+
+/// Independent validator for `prune_invoke`: shares no helper code with `prune_invoke.rs` and
+/// re-derives every pruned `Invoke` claim directly against pre-prune `pre_funcs`, `table`, and
+/// `live`.
+pub(crate) fn check_invoke_pruning(
+    pre_func: &Func,
+    interns: &Interns,
+    sites: &[InvokePrunedSite],
+    table: &BTreeMap<JsName, LinkItem>,
+    pre_funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+    live: &BTreeSet<JsName>,
+) -> Result<(), String> {
+    if let Some(fault) = current_witness_fault() {
+        if fault
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .any(|tok| matches!(tok, "prune-invoke" | "all" | "1"))
+        {
+            return Err("injected prune-invoke witness fault".to_owned());
+        }
+    }
+    if sites.is_empty() {
+        return Err("no invoke pruning sites recorded".to_owned());
+    }
+
+    let mut cx = InvokeCheckCx::new(table, pre_funcs, live);
+    for site in sites {
+        let block = pre_func
+            .blocks
+            .get(site.block.0 as usize)
+            .ok_or_else(|| format!("pruned block bb{} does not exist", site.block.0))?;
+        let RTerm::Invoke { unwind, .. } = &block.term else {
+            return Err(format!(
+                "pruned block bb{} did not terminate in RTerm::Invoke",
+                site.block.0
+            ));
+        };
+        match site.reason {
+            InvokePruneReason::NoopUnwindChain => {
+                verify_noop_unwind_chain(pre_func, interns, unwind.0, pre_funcs)?;
+            }
+            InvokePruneReason::ProtectedOpCannotThrow => {
+                verify_protected_block_cannot_throw(block, interns, &mut cx)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_noop_unwind_chain(
+    func: &Func,
+    interns: &Interns,
+    start: RBlockId,
+    pre_funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+) -> Result<(), String> {
+    let mut cur = start;
+    let mut visited = BTreeSet::new();
+    for _ in 0..8 {
+        if !visited.insert(cur) {
+            return Err(format!("noop unwind chain cycles at bb{}", cur.0));
+        }
+        let block = func
+            .blocks
+            .get(cur.0 as usize)
+            .ok_or_else(|| format!("missing unwind block bb{}", cur.0))?;
+        for op in &block.ops {
+            match &op.kind {
+                OpKind::Copy(_) | OpKind::Move(_) => {}
+                OpKind::Drop { glue, .. } => match glue {
+                    DropGlue::None => {}
+                    DropGlue::Direct { link_name, .. } => {
+                        verify_empty_return_callee(interns, *link_name, pre_funcs)?;
+                    }
+                    DropGlue::Dynamic => {
+                        return Err(format!("dynamic drop in unwind block bb{}", cur.0));
+                    }
+                },
+                OpKind::Call {
+                    callee: Callee::Direct { link_name, .. },
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                    function: None,
+                    ..
+                } => {
+                    if let Some(res) = op.result {
+                        if value_is_used_anywhere(func, res) {
+                            return Err(format!("unwind call result v{} is used", res.0));
+                        }
+                    }
+                    verify_empty_return_callee(interns, *link_name, pre_funcs)?;
+                }
+                other => {
+                    return Err(format!("non-noop op {other:?} in unwind block bb{}", cur.0));
+                }
+            }
+        }
+        match &block.term {
+            RTerm::Throw(None) => return Ok(()),
+            RTerm::Goto(next, _) => cur = *next,
+            other => {
+                return Err(format!(
+                    "unwind block bb{} ends in non-noop terminator {other:?}",
+                    cur.0
+                ));
+            }
+        }
+    }
+    Err("noop unwind chain exceeds 8-block bound".to_owned())
+}
+
+fn value_is_used_anywhere(func: &Func, val: ValueId) -> bool {
+    func.blocks.iter().any(|b| {
+        b.ops.iter().any(|op| op.kind.uses().contains(&val)) || b.term.uses().contains(&val)
+    })
+}
+
+fn verify_empty_return_callee(
+    interns: &Interns,
+    link_name: StrId,
+    pre_funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+) -> Result<(), String> {
+    let name = interns
+        .str(link_name)
+        .ok_or_else(|| format!("unresolvable str#{} in unwind noop call", link_name.0))?;
+    let js_name = JsName::new(name.to_owned());
+    let callee = pre_funcs
+        .get(&js_name)
+        .and_then(|res| res.as_ref().ok())
+        .ok_or_else(|| format!("unwind callee `{name}` has no compiled JIR body"))?;
+    if callee.blocks.len() == 1
+        && callee.blocks[0].ops.is_empty()
+        && matches!(callee.blocks[0].term, RTerm::Return(None))
+    {
+        Ok(())
+    } else {
+        Err(format!("unwind callee `{name}` is not an empty return"))
+    }
+}
+
+struct InvokeCheckCx<'a> {
+    table: &'a BTreeMap<JsName, LinkItem>,
+    pre_funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
+    live: &'a BTreeSet<JsName>,
+    has_custom_allocator: bool,
+    vtable_scope: Option<Result<WitnessVtableScope, String>>,
+    indirect_scope: Option<Result<WitnessIndirectScope, String>>,
+}
+
+struct WitnessVtableScope {
+    drops: Vec<JsName>,
+    methods: BTreeMap<u32, Vec<JsName>>,
+}
+
+struct WitnessIndirectScope {
+    scan: RefScan,
+    by_item: BTreeMap<ItemId, Vec<JsName>>,
+    static_fn_refs: Vec<JsName>,
+}
+
+impl<'a> InvokeCheckCx<'a> {
+    fn new(
+        table: &'a BTreeMap<JsName, LinkItem>,
+        pre_funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
+        live: &'a BTreeSet<JsName>,
+    ) -> Self {
+        let has_custom_allocator = table
+            .values()
+            .any(|item| item.late_ir.artifact_allocator_provider() == AllocatorProvider::Custom);
+        Self {
+            table,
+            pre_funcs,
+            live,
+            has_custom_allocator,
+            vtable_scope: None,
+            indirect_scope: None,
+        }
+    }
+
+    fn vtables(&mut self) -> Result<&WitnessVtableScope, String> {
+        if self.vtable_scope.is_none() {
+            self.vtable_scope = Some(build_witness_vtable_scope(self.table, self.live));
+        }
+        match self.vtable_scope.as_ref().expect("initialized above") {
+            Ok(scope) => Ok(scope),
+            Err(err) => Err(err.clone()),
+        }
+    }
+
+    fn indirect(&mut self) -> Result<&WitnessIndirectScope, String> {
+        if self.indirect_scope.is_none() {
+            self.indirect_scope = Some(build_witness_indirect_scope(
+                self.table,
+                self.pre_funcs,
+                self.live,
+            ));
+        }
+        match self.indirect_scope.as_ref().expect("initialized above") {
+            Ok(scope) => Ok(scope),
+            Err(err) => Err(err.clone()),
+        }
+    }
+}
+
+fn build_witness_vtable_scope(
+    table: &BTreeMap<JsName, LinkItem>,
+    live: &BTreeSet<JsName>,
+) -> Result<WitnessVtableScope, String> {
+    let mut drops = Vec::new();
+    let mut methods: BTreeMap<u32, Vec<JsName>> = BTreeMap::new();
+    for name in live {
+        let Some(item) = table.get(name) else {
+            continue;
+        };
+        if item.kind != ItemKind::Vtable {
+            continue;
+        }
+        let (Some(body), Some(interns)) = (item.jir.body.as_ref(), item.jir.interns()) else {
+            return Err(format!("live vtable `{name}` lacks JIR body or interns"));
+        };
+        let BodyKind::Vtable { entries, .. } = &body.kind else {
+            return Err(format!("live vtable `{name}` has non-vtable body kind"));
+        };
+        for (slot, entry) in entries.iter().enumerate() {
+            match entry {
+                VtableEntry::Drop(Some(d)) => {
+                    let s = interns.str(d.link_name).ok_or_else(|| {
+                        format!("live vtable `{name}` drop entry has invalid str")
+                    })?;
+                    drops.push(JsName::new(s.to_owned()));
+                }
+                VtableEntry::Method(m) => {
+                    let s = interns.str(m.link_name).ok_or_else(|| {
+                        format!("live vtable `{name}` slot {slot} has invalid str")
+                    })?;
+                    methods
+                        .entry(slot as u32)
+                        .or_default()
+                        .push(JsName::new(s.to_owned()));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(WitnessVtableScope { drops, methods })
+}
+
+fn witness_type_contains_fn_ptr(
+    ty: TypeId,
+    types: &TypeTable,
+    seen: &mut BTreeSet<TypeId>,
+) -> bool {
+    if !seen.insert(ty) {
+        return false;
+    }
+    let Some(desc) = types.get(ty) else {
+        return true;
+    };
+    match &desc.kind {
+        TypeKind::FnPtr { .. } => true,
+        TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
+            witness_type_contains_fn_ptr(*pointee, types, seen)
+        }
+        TypeKind::Slice(elem) | TypeKind::Array { element: elem, .. } => {
+            witness_type_contains_fn_ptr(*elem, types, seen)
+        }
+        TypeKind::Tuple(fields) => fields
+            .iter()
+            .any(|f| witness_type_contains_fn_ptr(*f, types, seen)),
+        TypeKind::Adt { variants, .. } => variants.iter().any(|v| {
+            v.fields
+                .iter()
+                .any(|f| witness_type_contains_fn_ptr(f.ty, types, seen))
+        }),
+        _ => false,
+    }
+}
+
+fn build_witness_indirect_scope(
+    table: &BTreeMap<JsName, LinkItem>,
+    pre_funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+    live: &BTreeSet<JsName>,
+) -> Result<WitnessIndirectScope, String> {
+    let extra_roots = &crate::opts::get().roots;
+    let mut static_fn_refs = Vec::new();
+    for name in live {
+        let Some(item) = table.get(name) else {
+            continue;
+        };
+        match item.kind {
+            ItemKind::Fn => {
+                if !pre_funcs.get(name).is_some_and(Result::is_ok) {
+                    return Err(format!(
+                        "unbounded indirect call: live function `{name}` has no JIR body"
+                    ));
+                }
+            }
+            ItemKind::Vtable | ItemKind::Alloc | ItemKind::Import => {}
+            _ => {
+                for r in &item.refs {
+                    if pre_funcs.get(r).is_some_and(Result::is_ok)
+                        || table
+                            .get(r)
+                            .is_some_and(|it| matches!(it.kind, ItemKind::Fn | ItemKind::Import))
+                    {
+                        static_fn_refs.push(r.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut scan = RefScan::default();
+    let mut by_item: BTreeMap<ItemId, Vec<JsName>> = BTreeMap::new();
+    for (name, res) in pre_funcs {
+        let Ok(func) = res else { continue };
+        by_item.entry(func.item).or_default().push(name.clone());
+        let types = table
+            .get(name)
+            .and_then(|it| it.jir.interns())
+            .map(|i| &i.types);
+        if let (Some(item), Some(types)) = (table.get(name), types) {
+            let is_root = item.linkage.root || extra_roots.iter().any(|r| r == name.as_str());
+            if is_root
+                && func.sig.arguments.iter().any(|&arg_ty| {
+                    witness_type_contains_fn_ptr(arg_ty, types, &mut BTreeSet::new())
+                })
+            {
+                return Err(format!(
+                    "unbounded indirect call: root `{name}` accepts a function pointer"
+                ));
+            }
+        }
+        for block in &func.blocks {
+            for op in &block.ops {
+                refs::scan_op(func, op, types, &mut scan);
+                if let (Some(types), OpKind::Call { host: Some(_), .. } | OpKind::Host { .. }) =
+                    (types, &op.kind)
+                {
+                    if let Some(res_val) = op.result {
+                        if let Some(vdef) = func.values.get(res_val.0 as usize) {
+                            if witness_type_contains_fn_ptr(vdef.ty, types, &mut BTreeSet::new()) {
+                                return Err(format!(
+                                    "unbounded indirect call: host op in `{name}` returns a fn ptr"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(WitnessIndirectScope {
+        scan,
+        by_item,
+        static_fn_refs,
+    })
+}
+
+fn verify_protected_block_cannot_throw(
+    block: &crate::jir::repr::RBlock,
+    interns: &Interns,
+    cx: &mut InvokeCheckCx<'_>,
+) -> Result<(), String> {
+    let mut queue = VecDeque::new();
+    let mut visited_callees = BTreeSet::new();
+    if let Some((last, prefix)) = block.ops.split_last() {
+        for op in prefix {
+            check_op_no_throw(op, interns, cx, &mut visited_callees, &mut queue)?;
+        }
+        check_op_no_throw(last, interns, cx, &mut visited_callees, &mut queue)?;
+    }
+
+    while let Some(callee_name) = queue.pop_front() {
+        if let Some(Ok(callee_func)) = cx.pre_funcs.get(&callee_name) {
+            let callee_interns = cx
+                .table
+                .get(&callee_name)
+                .and_then(|item| item.jir.interns())
+                .ok_or_else(|| format!("callee `{callee_name}` missing JIR interns"))?;
+            if callee_func.blocks.is_empty() {
+                continue;
+            }
+            let mut visited_blocks = vec![false; callee_func.blocks.len()];
+            let mut work = vec![0usize];
+            while let Some(bi) = work.pop() {
+                if visited_blocks.get(bi).copied().unwrap_or(true) {
+                    continue;
+                }
+                visited_blocks[bi] = true;
+                let cb = &callee_func.blocks[bi];
+                if matches!(cb.term, RTerm::Throw(_)) {
+                    return Err(format!(
+                        "callee `{callee_name}` reaches RTerm::Throw at bb{bi}"
+                    ));
+                }
+                for op in &cb.ops {
+                    check_op_no_throw(op, callee_interns, cx, &mut visited_callees, &mut queue)?;
+                }
+                match &cb.term {
+                    RTerm::Invoke { normal, .. } => {
+                        // Every op in `cb.ops` (including the protected op) was verified
+                        // non-throwing above, so `unwind` is unreachable.
+                        work.push(normal.0 .0 as usize);
+                    }
+                    other => {
+                        for succ in other.successors() {
+                            work.push(succ.0 as usize);
+                        }
+                    }
+                }
+            }
+        } else {
+            let item = cx
+                .table
+                .get(&callee_name)
+                .ok_or_else(|| format!("unresolved callee `{callee_name}` may throw"))?;
+            match item.kind {
+                ItemKind::Alloc => {
+                    if cx.has_custom_allocator {
+                        return Err(format!(
+                            "allocator shim `{callee_name}` with custom allocator may throw"
+                        ));
+                    }
+                }
+                ItemKind::Import => {
+                    return Err(format!("foreign import `{callee_name}` may throw"));
+                }
+                ItemKind::Fn => {
+                    return Err(format!(
+                        "JIR-declined or opaque function `{callee_name}` may throw"
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "callee `{callee_name}` of kind {other:?} may throw"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn enqueue_callee(name: JsName, visited: &mut BTreeSet<JsName>, queue: &mut VecDeque<JsName>) {
+    if visited.insert(name.clone()) {
+        queue.push_back(name);
+    }
+}
+
+fn check_op_no_throw(
+    op: &Op,
+    interns: &Interns,
+    cx: &mut InvokeCheckCx<'_>,
+    visited: &mut BTreeSet<JsName>,
+    queue: &mut VecDeque<JsName>,
+) -> Result<(), String> {
+    let resolve = |id: StrId, label: &str| -> Result<JsName, String> {
+        interns
+            .str(id)
+            .map(|s| JsName::new(s.to_owned()))
+            .ok_or_else(|| format!("unresolvable {label} str#{}", id.0))
+    };
+    match &op.kind {
+        OpKind::Host { payload, .. } => verify_host_payload_no_throw(payload, interns),
+        OpKind::Intrinsic {
+            fallback: Some(d), ..
+        } => {
+            let name = resolve(d.link_name, "intrinsic fallback")?;
+            enqueue_callee(name, visited, queue);
+            Ok(())
+        }
+        OpKind::Drop { glue, .. } => match glue {
+            DropGlue::None => Ok(()),
+            DropGlue::Direct { link_name, .. } => {
+                let name = resolve(*link_name, "direct drop")?;
+                enqueue_callee(name, visited, queue);
+                Ok(())
+            }
+            DropGlue::Dynamic => {
+                let drops = cx.vtables()?.drops.clone();
+                for name in drops {
+                    enqueue_callee(name, visited, queue);
+                }
+                Ok(())
+            }
+        },
+        OpKind::Call {
+            callee,
+            semantic,
+            host,
+            ..
+        } => {
+            if let Some(hp) = host {
+                return verify_host_payload_no_throw(hp, interns);
+            }
+            if matches!(
+                semantic,
+                CallSemantic::Host | CallSemantic::ViewAbi | CallSemantic::RawJavaScript
+            ) {
+                return Err(format!("call semantic {semantic:?} may throw"));
+            }
+            if matches!(semantic, CallSemantic::RawParts) {
+                return Ok(());
+            }
+            match callee {
+                Callee::Nop | Callee::Intrinsic { fallback: None, .. } => Ok(()),
+                Callee::Direct { link_name, .. } => {
+                    let name = resolve(*link_name, "direct call")?;
+                    enqueue_callee(name, visited, queue);
+                    Ok(())
+                }
+                Callee::Intrinsic {
+                    fallback: Some(d), ..
+                } => {
+                    let name = resolve(d.link_name, "intrinsic fallback")?;
+                    enqueue_callee(name, visited, queue);
+                    Ok(())
+                }
+                Callee::Runtime { member, sysroot } => {
+                    if !*sysroot {
+                        let m = interns.str(*member).unwrap_or("<invalid>");
+                        return Err(format!("non-sysroot Callee::Runtime `{m}` may throw"));
+                    }
+                    let m = interns
+                        .str(*member)
+                        .ok_or_else(|| format!("unresolvable runtime member str#{}", member.0))?;
+                    if !witness_sysroot_shim_is_non_throwing(m) {
+                        return Err(format!("sysroot runtime member `{m}` may throw"));
+                    }
+                    Ok(())
+                }
+                Callee::Foreign { symbol, .. } => {
+                    let sym = interns
+                        .str(*symbol)
+                        .ok_or_else(|| format!("unresolvable foreign symbol str#{}", symbol.0))?;
+                    let js_name = JsName::new(sym.to_owned());
+                    if !cx.table.contains_key(&js_name) {
+                        return Err(format!("unresolved foreign symbol `{sym}` may throw"));
+                    }
+                    enqueue_callee(js_name, visited, queue);
+                    Ok(())
+                }
+                Callee::Virtual { slot, .. } => {
+                    let targets = cx
+                        .vtables()?
+                        .methods
+                        .get(slot)
+                        .ok_or_else(|| format!("unbounded virtual call at slot {slot}"))?
+                        .clone();
+                    for name in targets {
+                        enqueue_callee(name, visited, queue);
+                    }
+                    Ok(())
+                }
+                Callee::Indirect { signature } => {
+                    let indirect = cx.indirect()?;
+                    let targets =
+                        indirect
+                            .scan
+                            .fn_pointer_targets
+                            .get(signature)
+                            .ok_or_else(|| {
+                                format!("unbounded indirect call for signature ty#{}", signature.0)
+                            })?;
+                    let mut names = indirect.static_fn_refs.clone();
+                    for item_id in targets {
+                        let item_names = indirect.by_item.get(item_id).ok_or_else(|| {
+                            format!("indirect target {item_id:?} has no JIR item")
+                        })?;
+                        names.extend(item_names.iter().cloned());
+                    }
+                    for name in names {
+                        enqueue_callee(name, visited, queue);
+                    }
+                    Ok(())
+                }
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
+fn verify_host_payload_no_throw(payload: &HostPayload, interns: &Interns) -> Result<(), String> {
+    let HostPayload::Marker {
+        section,
+        template: None,
+        helpers,
+        ..
+    } = payload
+    else {
+        return Err("non-marker or templated host payload may throw".to_owned());
+    };
+    if !helpers.is_empty() {
+        return Err("host payload with helpers may throw".to_owned());
+    }
+    let sec = interns
+        .str(*section)
+        .ok_or_else(|| "unresolvable host payload section".to_owned())?;
+    let op_name = sec
+        .strip_prefix("rcgjs.host.")
+        .ok_or_else(|| format!("unknown host marker `{sec}` may throw"))?;
+    let op = rcgjs_object::host::HostOperation::from_marker(op_name)
+        .ok_or_else(|| format!("unrecognized host operation `{op_name}` may throw"))?;
+    if op.may_throw() {
+        Err(format!("host operation `{op_name}` may throw"))
+    } else {
+        Ok(())
+    }
+}
+
+fn witness_sysroot_shim_is_non_throwing(sym: &str) -> bool {
+    matches!(
+        sym,
+        "alloc"
+            | "dealloc"
+            | "realloc"
+            | "alloc_zeroed"
+            | "alloc_error"
+            | "panic"
+            | "abort"
+            | "abort_error"
+            | "js_abort"
+            | "unreachable"
+            | "memcpy"
+            | "memmove"
+            | "memset"
+            | "memcmp"
+            | "bcmp"
+            | "strlen"
+            | "copy"
+            | "copy_nonoverlapping"
+            | "write_bytes"
+            | "overwrite"
+            | "_put"
+            | "box"
+            | "unscale"
+            | "scale"
+            | "retype"
+            | "retype_rc"
+            | "offset"
+            | "offset_from"
+            | "ptr_eq"
+            | "slice_ptr_eq"
+            | "fat_ptr_eq"
+            | "ptr_cmp"
+            | "addr"
+            | "slice_from_parts"
+            | "chunk_slice"
+            | "thin"
+            | "tail_raw"
+            | "tail_ref"
+            | "read_array"
+            | "write_array"
+            | "byte_slice_ref"
+            | "str_bytes"
+            | "str_bytes_mut"
+            | "bytes_str"
+            | "str_len"
+            | "f2i"
+            | "fmod"
+            | "fmodf"
+            | "clone"
+            | "u8array_from_bytes"
+            | "native_str_wf"
+            | "native_str_utf16_index"
+            | "native_str_byte_index"
+            | "native_str_is_char_boundary"
+            | "native_f64_to_string"
+            | "native_str_push"
+            | "native_str_pop"
+            | "native_str_truncate"
+            | "_sb_check"
+            | "native_vec_new"
+            | "typed_vec_push"
+            | "native_vec_set_capacity"
+            | "native_vec_set_len"
+            | "convert_host_sb"
+            | "convert_str_block"
+            | "convert_sb_block"
+            | "convert_nv_block"
+            | "convert_block_nv"
+            | "convert_sv_nv"
+            | "ptr_is_null"
+    )
 }
 
 #[cfg(test)]

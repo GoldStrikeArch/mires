@@ -5710,7 +5710,10 @@ mod tests {
         let source = builder.op(
             entry,
             OpKind::Call {
-                callee: rcgjs_object::jir::Callee::Runtime { member: StrId(0) },
+                callee: rcgjs_object::jir::Callee::Runtime {
+                    member: StrId(0),
+                    sysroot: true,
+                },
                 function: None,
                 args: vec![buf_ptr, slice_len],
                 track_caller: None,

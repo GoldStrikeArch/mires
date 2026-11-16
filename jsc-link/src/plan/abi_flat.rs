@@ -3739,7 +3739,10 @@ mod tests {
                 result: None,
                 origin: NO_ORIGIN,
                 kind: OpKind::Call {
-                    callee: Callee::Runtime { member: StrId(0) },
+                    callee: Callee::Runtime {
+                        member: StrId(0),
+                        sysroot: true,
+                    },
                     function: None,
                     args: vec![closure],
                     track_caller: None,

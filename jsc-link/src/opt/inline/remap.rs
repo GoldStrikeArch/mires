@@ -190,7 +190,7 @@ impl Remap<'_> {
             Callee::Foreign { symbol, .. } => *symbol = self.string(*symbol)?,
             Callee::Indirect { signature } => self.need(*signature),
             Callee::Virtual { receiver, .. } => self.need(*receiver),
-            Callee::Runtime { member } => *member = self.string(*member)?,
+            Callee::Runtime { member, .. } => *member = self.string(*member)?,
             Callee::Intrinsic {
                 name,
                 types,

@@ -398,7 +398,7 @@ impl JsCx<'_> {
                 jsast::id(self.link_name(*symbol)?),
                 arguments,
             ))),
-            Callee::Runtime { member } => Ok(Lowered::value(jsast::rt_call(
+            Callee::Runtime { member, .. } => Ok(Lowered::value(jsast::rt_call(
                 self.link_name(*member)?,
                 arguments,
             ))),

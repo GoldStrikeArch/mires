@@ -1343,6 +1343,7 @@ mod tests {
             },
             callee: Callee::Runtime {
                 member: crate::jir::StrId(0),
+                sysroot: true,
             },
             semantic: CallSemantic::Ordinary,
             arguments: Vec::new(),

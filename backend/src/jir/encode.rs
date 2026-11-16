@@ -828,8 +828,18 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                         symbol: self.types.str(symbol),
                     }
                 } else {
+                    let sysroot = tcx.sess.opts.unstable_opts.force_unstable_if_unmarked
+                        || (definition.krate != rustc_span::def_id::LOCAL_CRATE && {
+                            let dir = &tcx.sess.target_tlib_path.dir;
+                            let source = tcx.used_crate_source(definition.krate);
+                            [&source.rlib, &source.rmeta, &source.dylib]
+                                .into_iter()
+                                .flatten()
+                                .any(|path| path.starts_with(dir))
+                        });
                     Callee::Runtime {
                         member: self.types.str(&crate::jsast::sanitize_ident(symbol)),
+                        sysroot,
                     }
                 };
             return Ok((callee, false));

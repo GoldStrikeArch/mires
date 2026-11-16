@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::witness::{self, InvokePruneReason, InvokePrunedSite, Witness};
 use crate::analysis::refs::{self, RefScan};
 use crate::item::{ItemKind, JsName, LinkItem};
 use crate::jir::decline::Decline;
@@ -20,23 +21,20 @@ use crate::jir::semantic::{
 use crate::jir::types::{TypeId, TypeKind, TypeTable};
 use crate::late_ir::AllocatorProvider;
 
-fn is_rust_alloc_shim_symbol(sym: &str) -> bool {
-    sym.contains("___rust_alloc")
-        || sym.contains("___rust_dealloc")
-        || sym.contains("___rust_realloc")
-        || sym.contains("___rust_alloc_zeroed")
-        || sym.contains("___rust_alloc_error_handler")
-        || sym.contains("___rust_no_alloc_shim_is_unstable")
+/// Statistics and witness outcomes for one [`run_checked`] pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PruneInvokeStats {
+    pub modified: usize,
+    pub witnesses_recorded: u32,
+    pub witnesses_failed: u32,
 }
 
-/// Known non-host-throwing runtime helpers and abort/runtime symbols.
+/// Known non-host-throwing sysroot runtime helpers and abort/runtime symbols.
 ///
 /// Any panic/abort helper here throws an `AbortError`, which every `TryCatch` handler
 /// immediately rethrows (`if (__rt.is_abort($caught)) throw $caught;`) without running `Drop`s.
-fn is_non_host_runtime_symbol(sym: &str) -> bool {
-    if sym.ends_with("rust_begin_unwind") {
-        return true;
-    }
+/// Consulted ONLY for `Callee::Runtime { sysroot: true, .. }`.
+pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
     matches!(
         sym,
         "alloc"
@@ -49,7 +47,6 @@ fn is_non_host_runtime_symbol(sym: &str) -> bool {
             | "abort_error"
             | "js_abort"
             | "unreachable"
-            | "rust_begin_unwind"
             | "memcpy"
             | "memmove"
             | "memset"
@@ -113,21 +110,6 @@ fn is_non_host_runtime_symbol(sym: &str) -> bool {
     )
 }
 
-fn is_abort_only_stdlib_item(item: &LinkItem) -> bool {
-    let path = item.debug_path.as_str();
-    let crate_name = item.crate_name.as_str();
-    if !matches!(crate_name, "core" | "alloc" | "std")
-        && !item.name.as_str().contains("rust_begin_unwind")
-    {
-        return false;
-    }
-    item.name.as_str().contains("rust_begin_unwind")
-        || path.starts_with("core::panicking::")
-        || path.starts_with("core::slice::index::slice_")
-        || path.starts_with("alloc::raw_vec::handle_error")
-        || path.starts_with("alloc::alloc::handle_alloc_error")
-}
-
 fn type_contains_fn_ptr(ty: TypeId, types: &TypeTable, seen: &mut BTreeSet<TypeId>) -> bool {
     if !seen.insert(ty) {
         return false;
@@ -182,6 +164,15 @@ pub(crate) fn run(
     funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
     live: &BTreeSet<JsName>,
 ) -> usize {
+    run_checked(table, funcs, live).modified
+}
+
+/// Prunes `RTerm::Invoke` terminators with independent witness checking and per-function rollback.
+pub(crate) fn run_checked(
+    table: &BTreeMap<JsName, LinkItem>,
+    funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
+    live: &BTreeSet<JsName>,
+) -> PruneInvokeStats {
     let interns_map: BTreeMap<JsName, &Interns> = table
         .iter()
         .filter_map(|(name, item)| Some((name.clone(), item.jir.interns()?)))
@@ -229,9 +220,6 @@ pub(crate) fn run(
     let has_custom_allocator = table
         .values()
         .any(|item| item.late_ir.artifact_allocator_provider() == AllocatorProvider::Custom);
-    let non_throwing_external = |sym: &str| -> bool {
-        is_non_host_runtime_symbol(sym) || (!has_custom_allocator && is_rust_alloc_shim_symbol(sym))
-    };
 
     let mut has_opaque_fn = false;
     let mut vtable_methods: BTreeMap<u32, BTreeSet<JsName>> = BTreeMap::new();
@@ -245,10 +233,7 @@ pub(crate) fn run(
         };
         match item.kind {
             ItemKind::Fn => {
-                if !funcs.get(name).is_some_and(Result::is_ok)
-                    && !non_throwing_external(name.as_str())
-                    && !is_abort_only_stdlib_item(item)
-                {
+                if !funcs.get(name).is_some_and(Result::is_ok) {
                     has_opaque_fn = true;
                 }
             }
@@ -298,28 +283,17 @@ pub(crate) fn run(
         .map(|(name, _)| name.clone())
         .collect();
 
-    let abort_only_names: BTreeSet<JsName> = table
-        .iter()
-        .filter(|(_, item)| is_abort_only_stdlib_item(item))
-        .map(|(name, _)| name.clone())
-        .collect();
-
     let target_name_throws = |target: &JsName, may_throw: &BTreeSet<JsName>| -> bool {
-        if abort_only_names.contains(target) {
-            return false;
-        }
         if ok_funcs.contains(target) {
             return may_throw.contains(target);
         }
         if let Some(item) = table.get(target) {
             return match item.kind {
-                ItemKind::Alloc => false,
-                ItemKind::Import => true,
-                ItemKind::Fn => !non_throwing_external(target.as_str()),
+                ItemKind::Alloc => !has_custom_allocator,
                 _ => true,
             };
         }
-        !non_throwing_external(target.as_str())
+        true
     };
 
     let op_throws = |op: &Op, interns: &Interns, may_throw: &BTreeSet<JsName>| -> bool {
@@ -375,9 +349,12 @@ pub(crate) fn run(
                         fallback: Some(d), ..
                     } => resolve(d.link_name).is_none_or(|n| target_name_throws(&n, may_throw)),
                     Callee::Intrinsic { fallback: None, .. } => false,
-                    Callee::Runtime { member } => interns
-                        .str(*member)
-                        .is_none_or(|s| !is_non_host_runtime_symbol(s)),
+                    Callee::Runtime { member, sysroot } => {
+                        !*sysroot
+                            || interns
+                                .str(*member)
+                                .is_none_or(|s| !is_non_throwing_sysroot_shim_member(s))
+                    }
                     Callee::Foreign { symbol, .. } => match interns.str(*symbol) {
                         None => true,
                         Some(sym) => {
@@ -385,7 +362,7 @@ pub(crate) fn run(
                             if table.contains_key(&js_name) {
                                 target_name_throws(&js_name, may_throw)
                             } else {
-                                !non_throwing_external(sym)
+                                true
                             }
                         }
                     },
@@ -398,9 +375,13 @@ pub(crate) fn run(
                     Callee::Indirect { signature } => {
                         external_fn_ptr
                             || has_opaque_fn
-                            || static_refs
-                                .iter()
-                                .any(|n| ok_funcs.contains(n) && target_name_throws(n, may_throw))
+                            || static_refs.iter().any(|n| {
+                                (ok_funcs.contains(n)
+                                    || table.get(n).is_some_and(|it| {
+                                        matches!(it.kind, ItemKind::Fn | ItemKind::Import)
+                                    }))
+                                    && target_name_throws(n, may_throw)
+                            })
                             || scan.fn_pointer_targets.get(signature).is_none_or(|items| {
                                 items.iter().any(|it| {
                                     by_item.get(it).is_none_or(|names| {
@@ -419,7 +400,7 @@ pub(crate) fn run(
     loop {
         let mut changed = false;
         for (name, res) in funcs.iter() {
-            if abort_only_names.contains(name) || may_throw_host.contains(name) {
+            if may_throw_host.contains(name) {
                 continue;
             }
             let Ok(func) = res else { continue };
@@ -502,7 +483,7 @@ pub(crate) fn run(
         .collect();
 
     let func_names: Vec<JsName> = funcs.keys().cloned().collect();
-    let mut modified = 0usize;
+    let mut pending: Vec<(JsName, Func, Vec<InvokePrunedSite>, Vec<Witness>)> = Vec::new();
     for name in func_names {
         let Some(interns) = interns_map.get(&name).copied() else {
             continue;
@@ -514,24 +495,36 @@ pub(crate) fn run(
             continue;
         }
         let mut rewritten = func.clone();
-        let mut pruned_any = false;
+        let mut pruned_sites = Vec::new();
         let block_count = rewritten.blocks.len();
         for bi in 0..block_count {
             let (normal_target, normal_args, unwind_target) = match &rewritten.blocks[bi].term {
                 RTerm::Invoke { normal, unwind } => (normal.0, normal.1.clone(), unwind.0),
                 _ => continue,
             };
+            let protected_idx = rewritten.blocks[bi].ops.len().saturating_sub(1);
+            let prefix_throws = rewritten.blocks[bi].ops[..protected_idx]
+                .iter()
+                .any(|op| op_throws(op, interns, &may_throw_host));
             let last_throws = rewritten.blocks[bi]
                 .ops
                 .last()
                 .is_some_and(|op| op_throws(op, interns, &may_throw_host));
-            if !last_throws || is_noop_unwind_chain(&rewritten, interns, unwind_target, &noop_funcs)
-            {
+            if !prefix_throws && !last_throws {
                 rewritten.blocks[bi].term = RTerm::Goto(normal_target, normal_args);
-                pruned_any = true;
+                pruned_sites.push(InvokePrunedSite {
+                    block: RBlockId(bi as u32),
+                    reason: InvokePruneReason::ProtectedOpCannotThrow,
+                });
+            } else if is_noop_unwind_chain(func, interns, unwind_target, &noop_funcs) {
+                rewritten.blocks[bi].term = RTerm::Goto(normal_target, normal_args);
+                pruned_sites.push(InvokePrunedSite {
+                    block: RBlockId(bi as u32),
+                    reason: InvokePruneReason::NoopUnwindChain,
+                });
             }
         }
-        if !pruned_any {
+        if pruned_sites.is_empty() {
             continue;
         }
         let dce_opts = crate::opt::dce::Options {
@@ -539,17 +532,59 @@ pub(crate) fn run(
             no_deletions: false,
             pure_call: None,
         };
-        let _ =
-            crate::opt::dce::run_with(&mut rewritten, &interns.types, &dce_opts, &mut Vec::new());
-        if rewritten
-            .verify_carriers(&interns.types, crate::opt::observed_carriers(&rewritten))
-            .is_ok()
-        {
-            funcs.insert(name, Ok(rewritten));
-            modified += 1;
-        }
+        let mut dce_witnesses = Vec::new();
+        let _ = crate::opt::dce::run_with(
+            &mut rewritten,
+            &interns.types,
+            &dce_opts,
+            &mut dce_witnesses,
+        );
+        pending.push((name, rewritten, pruned_sites, dce_witnesses));
     }
-    modified
+
+    let mut stats = PruneInvokeStats::default();
+    let mut approved = Vec::with_capacity(pending.len());
+    for (name, rewritten, pruned_sites, dce_witnesses) in pending {
+        let Some(interns) = interns_map.get(&name).copied() else {
+            continue;
+        };
+        let Some(Ok(pre_func)) = funcs.get(&name) else {
+            continue;
+        };
+        let verified = rewritten
+            .verify_carriers(&interns.types, crate::opt::observed_carriers(&rewritten))
+            .is_ok();
+        let invoke_witness = Witness::InvokePruned {
+            count: pruned_sites.len() as u32,
+        };
+        let checked = if witness::enabled() {
+            witness::check_all(&dce_witnesses, &rewritten, &interns.types).is_ok()
+                && invoke_witness.check(&rewritten, &interns.types).is_ok()
+                && witness::check_invoke_pruning(
+                    pre_func,
+                    interns,
+                    &pruned_sites,
+                    table,
+                    funcs,
+                    live,
+                )
+                .is_ok()
+        } else {
+            true
+        };
+        if !verified || !checked {
+            stats.witnesses_failed += 1;
+            continue;
+        }
+        stats.witnesses_recorded += 1;
+        approved.push((name, rewritten));
+    }
+
+    for (name, rewritten) in approved {
+        funcs.insert(name, Ok(rewritten));
+        stats.modified += 1;
+    }
+    stats
 }
 
 fn is_noop_unwind_chain(
@@ -1182,7 +1217,10 @@ mod tests {
         lb.effect(
             FuncBuilder::ENTRY,
             OpKind::Call {
-                callee: Callee::Runtime { member: rt_sym },
+                callee: Callee::Runtime {
+                    member: rt_sym,
+                    sysroot: true,
+                },
                 function: None,
                 args: Vec::new(),
                 track_caller: None,
@@ -1290,7 +1328,13 @@ mod tests {
         cb.terminate(b_unw, RTerm::Throw(None));
         let caller = cb.finish();
 
+        let mut alloc_shim_item = test_item("_RNvCsxyz_7___rustc12___rust_alloc", Interns::new());
+        alloc_shim_item.kind = ItemKind::Alloc;
         let mut table = BTreeMap::new();
+        table.insert(
+            JsName::new("_RNvCsxyz_7___rustc12___rust_alloc".to_owned()),
+            alloc_shim_item,
+        );
         table.insert(
             JsName::new("non_throwing_alloc_fn".to_owned()),
             test_item("non_throwing_alloc_fn", leaf_interns),
@@ -1721,5 +1765,585 @@ mod tests {
         assert!(matches!(updated.blocks[0].term, RTerm::Goto(..)));
         assert!(matches!(updated.blocks[1].term, RTerm::Invoke { .. }));
         assert!(matches!(updated.blocks[2].term, RTerm::Invoke { .. }));
+    }
+
+    fn build_caller_with_cleanup_drop(
+        caller_interns: &mut Interns,
+        unit: TypeId,
+        callee: Callee,
+        drop_name: &str,
+    ) -> Func {
+        use crate::jir::repr::Root;
+        use crate::jir::semantic::ConstTree;
+
+        let drop_str = caller_interns.intern_str(drop_name);
+        let mut cb = FuncBuilder::new(
+            item_id(101),
+            Signature {
+                arguments: Vec::new(),
+                result: unit,
+                abi: AbiSignature::default(),
+            },
+        );
+        let unit_val = cb.op(FuncBuilder::ENTRY, OpKind::Const(ConstTree::Unit), unit, O);
+        let b0 = FuncBuilder::ENTRY;
+        let b_norm = cb.block();
+        let b_unw = cb.block();
+        cb.effect(
+            b0,
+            OpKind::Call {
+                callee,
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        cb.terminate(
+            b0,
+            RTerm::Invoke {
+                normal: (b_norm, Vec::new()),
+                unwind: (b_unw, Vec::new()),
+            },
+        );
+        cb.terminate(b_norm, RTerm::Return(None));
+        cb.effect(
+            b_unw,
+            OpKind::Drop {
+                root: Root::Value(unit_val),
+                path: Vec::new(),
+                glue: DropGlue::Direct {
+                    item: item_id(102),
+                    link_name: drop_str,
+                },
+            },
+            O,
+        );
+        cb.terminate(b_unw, RTerm::Throw(None));
+        cb.finish()
+    }
+
+    fn build_non_empty_drop(drop_interns: &mut Interns, unit: TypeId) -> Func {
+        let host_throw = drop_interns.intern_str("host_note");
+        let mut db = FuncBuilder::new(
+            item_id(102),
+            Signature {
+                arguments: Vec::new(),
+                result: unit,
+                abi: AbiSignature::default(),
+            },
+        );
+        db.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Runtime {
+                    member: host_throw,
+                    sysroot: false,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        db.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        db.finish()
+    }
+
+    #[test]
+    fn preserves_invoke_calling_user_rust_begin_unwind_and_drop() {
+        let mut unwind_interns = Interns::new();
+        let unit_u = unit_types(&mut unwind_interns);
+        let host_throw = unwind_interns.intern_str("host_throw");
+        let mut ub = FuncBuilder::new(
+            item_id(100),
+            Signature {
+                arguments: Vec::new(),
+                result: unit_u,
+                abi: AbiSignature::default(),
+            },
+        );
+        ub.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Runtime {
+                    member: host_throw,
+                    sysroot: false,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        ub.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let user_unwind = ub.finish();
+
+        let mut drop_interns = Interns::new();
+        let unit_d = unit_types(&mut drop_interns);
+        let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+        let mut caller_interns = Interns::new();
+        let unit_c = unit_types(&mut caller_interns);
+        let unwind_str = caller_interns.intern_str("user_rust_begin_unwind");
+        let caller = build_caller_with_cleanup_drop(
+            &mut caller_interns,
+            unit_c,
+            Callee::Direct {
+                item: item_id(100),
+                link_name: unwind_str,
+            },
+            "real_drop",
+        );
+
+        let mut table = BTreeMap::new();
+        table.insert(
+            JsName::new("user_rust_begin_unwind".to_owned()),
+            test_item("user_rust_begin_unwind", unwind_interns),
+        );
+        table.insert(
+            JsName::new("real_drop".to_owned()),
+            test_item("real_drop", drop_interns),
+        );
+        table.insert(
+            JsName::new("caller".to_owned()),
+            test_item("caller", caller_interns),
+        );
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            JsName::new("user_rust_begin_unwind".to_owned()),
+            Ok(user_unwind),
+        );
+        funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+        funcs.insert(JsName::new("caller".to_owned()), Ok(caller));
+
+        let live: BTreeSet<JsName> = table.keys().cloned().collect();
+        let stats = run_checked(&table, &mut funcs, &live);
+        assert_eq!(stats.modified, 0);
+        assert!(funcs[&JsName::new("caller".to_owned())]
+            .as_ref()
+            .unwrap()
+            .has_invoke());
+    }
+
+    #[test]
+    fn preserves_non_sysroot_runtime_imports_and_unresolved_foreign() {
+        for sym in ["clone", "copy", "alloc", "custom_rust_begin_unwind"] {
+            let mut drop_interns = Interns::new();
+            let unit_d = unit_types(&mut drop_interns);
+            let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+            let mut caller_interns = Interns::new();
+            let unit_c = unit_types(&mut caller_interns);
+            let sym_id = caller_interns.intern_str(sym);
+            let caller = build_caller_with_cleanup_drop(
+                &mut caller_interns,
+                unit_c,
+                Callee::Runtime {
+                    member: sym_id,
+                    sysroot: false,
+                },
+                "real_drop",
+            );
+
+            let mut table = BTreeMap::new();
+            table.insert(
+                JsName::new("real_drop".to_owned()),
+                test_item("real_drop", drop_interns),
+            );
+            table.insert(
+                JsName::new("caller".to_owned()),
+                test_item("caller", caller_interns),
+            );
+            let mut funcs = BTreeMap::new();
+            funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+            funcs.insert(JsName::new("caller".to_owned()), Ok(caller));
+
+            let live: BTreeSet<JsName> = table.keys().cloned().collect();
+            let stats = run_checked(&table, &mut funcs, &live);
+            assert_eq!(
+                stats.modified, 0,
+                "non-sysroot Callee::Runtime `{sym}` must not be pruned"
+            );
+            assert!(funcs[&JsName::new("caller".to_owned())]
+                .as_ref()
+                .unwrap()
+                .has_invoke());
+        }
+
+        // Unresolved Callee::Foreign not in `table` must also not be pruned even if named `clone`.
+        let mut drop_interns = Interns::new();
+        let unit_d = unit_types(&mut drop_interns);
+        let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+        let mut caller_interns = Interns::new();
+        let unit_c = unit_types(&mut caller_interns);
+        let foreign_sym = caller_interns.intern_str("clone");
+        let caller = build_caller_with_cleanup_drop(
+            &mut caller_interns,
+            unit_c,
+            Callee::Foreign {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 109,
+                },
+                symbol: foreign_sym,
+            },
+            "real_drop",
+        );
+
+        let mut table = BTreeMap::new();
+        table.insert(
+            JsName::new("real_drop".to_owned()),
+            test_item("real_drop", drop_interns),
+        );
+        table.insert(
+            JsName::new("caller".to_owned()),
+            test_item("caller", caller_interns),
+        );
+        let mut funcs = BTreeMap::new();
+        funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+        funcs.insert(JsName::new("caller".to_owned()), Ok(caller));
+
+        let live: BTreeSet<JsName> = table.keys().cloned().collect();
+        let stats = run_checked(&table, &mut funcs, &live);
+        assert_eq!(stats.modified, 0);
+        assert!(funcs[&JsName::new("caller".to_owned())]
+            .as_ref()
+            .unwrap()
+            .has_invoke());
+    }
+
+    #[test]
+    fn preserves_spoofed_core_crate_fn_calling_throwing_host() {
+        let mut spoof_interns = Interns::new();
+        let unit_s = unit_types(&mut spoof_interns);
+        let host_throw = spoof_interns.intern_str("host_throw");
+        let mut sb = FuncBuilder::new(
+            item_id(110),
+            Signature {
+                arguments: Vec::new(),
+                result: unit_s,
+                abi: AbiSignature::default(),
+            },
+        );
+        sb.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Runtime {
+                    member: host_throw,
+                    sysroot: false,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        sb.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let spoof_fn = sb.finish();
+
+        let mut spoof_item = test_item("core::panicking::panic_spoof", spoof_interns);
+        spoof_item.crate_name = "core".to_owned();
+        spoof_item.debug_path = "core::panicking::panic".to_owned();
+
+        let mut drop_interns = Interns::new();
+        let unit_d = unit_types(&mut drop_interns);
+        let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+        let mut caller_interns = Interns::new();
+        let unit_c = unit_types(&mut caller_interns);
+        let spoof_str = caller_interns.intern_str("core::panicking::panic_spoof");
+        let caller = build_caller_with_cleanup_drop(
+            &mut caller_interns,
+            unit_c,
+            Callee::Direct {
+                item: item_id(110),
+                link_name: spoof_str,
+            },
+            "real_drop",
+        );
+
+        let mut table = BTreeMap::new();
+        table.insert(
+            JsName::new("core::panicking::panic_spoof".to_owned()),
+            spoof_item,
+        );
+        table.insert(
+            JsName::new("real_drop".to_owned()),
+            test_item("real_drop", drop_interns),
+        );
+        table.insert(
+            JsName::new("caller".to_owned()),
+            test_item("caller", caller_interns),
+        );
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            JsName::new("core::panicking::panic_spoof".to_owned()),
+            Ok(spoof_fn),
+        );
+        funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+        funcs.insert(JsName::new("caller".to_owned()), Ok(caller));
+
+        let live: BTreeSet<JsName> = table.keys().cloned().collect();
+        let stats = run_checked(&table, &mut funcs, &live);
+        assert_eq!(stats.modified, 0);
+        assert!(funcs[&JsName::new("caller".to_owned())]
+            .as_ref()
+            .unwrap()
+            .has_invoke());
+    }
+
+    #[test]
+    fn negative_witness_rejects_false_claims_and_fault_injection_rolls_back() {
+        // 1) False ProtectedOpCannotThrow: callee calls `user_rust_begin_unwind` (throwing).
+        {
+            let mut unwind_interns = Interns::new();
+            let unit_u = unit_types(&mut unwind_interns);
+            let host_throw = unwind_interns.intern_str("host_throw");
+            let mut ub = FuncBuilder::new(
+                item_id(120),
+                Signature {
+                    arguments: Vec::new(),
+                    result: unit_u,
+                    abi: AbiSignature::default(),
+                },
+            );
+            ub.effect(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Runtime {
+                        member: host_throw,
+                        sysroot: false,
+                    },
+                    function: None,
+                    args: Vec::new(),
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                O,
+            );
+            ub.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+            let user_unwind = ub.finish();
+
+            let mut drop_interns = Interns::new();
+            let unit_d = unit_types(&mut drop_interns);
+            let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+            let mut caller_interns = Interns::new();
+            let unit_c = unit_types(&mut caller_interns);
+            let unwind_str = caller_interns.intern_str("user_rust_begin_unwind");
+            let caller = build_caller_with_cleanup_drop(
+                &mut caller_interns,
+                unit_c,
+                Callee::Direct {
+                    item: item_id(120),
+                    link_name: unwind_str,
+                },
+                "real_drop",
+            );
+
+            let mut table = BTreeMap::new();
+            table.insert(
+                JsName::new("user_rust_begin_unwind".to_owned()),
+                test_item("user_rust_begin_unwind", unwind_interns),
+            );
+            table.insert(
+                JsName::new("real_drop".to_owned()),
+                test_item("real_drop", drop_interns),
+            );
+            let caller_item = test_item("caller", caller_interns);
+            let caller_interns_ref = caller_item.jir.interns().unwrap().clone();
+            table.insert(JsName::new("caller".to_owned()), caller_item);
+
+            let mut funcs = BTreeMap::new();
+            funcs.insert(
+                JsName::new("user_rust_begin_unwind".to_owned()),
+                Ok(user_unwind),
+            );
+            funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+            funcs.insert(JsName::new("caller".to_owned()), Ok(caller.clone()));
+
+            let live: BTreeSet<JsName> = table.keys().cloned().collect();
+            let false_protected = [InvokePrunedSite {
+                block: FuncBuilder::ENTRY,
+                reason: InvokePruneReason::ProtectedOpCannotThrow,
+            }];
+            assert!(
+                witness::check_invoke_pruning(
+                    &caller,
+                    &caller_interns_ref,
+                    &false_protected,
+                    &table,
+                    &funcs,
+                    &live,
+                )
+                .is_err(),
+                "false ProtectedOpCannotThrow for user_rust_begin_unwind must fail"
+            );
+
+            let false_noop = [InvokePrunedSite {
+                block: FuncBuilder::ENTRY,
+                reason: InvokePruneReason::NoopUnwindChain,
+            }];
+            assert!(
+                witness::check_invoke_pruning(
+                    &caller,
+                    &caller_interns_ref,
+                    &false_noop,
+                    &table,
+                    &funcs,
+                    &live,
+                )
+                .is_err(),
+                "false NoopUnwindChain with real DropGlue::Direct must fail"
+            );
+        }
+
+        // 2) False ProtectedOpCannotThrow: direct non-sysroot `Callee::Runtime { member: "clone", sysroot: false }`.
+        {
+            let mut drop_interns = Interns::new();
+            let unit_d = unit_types(&mut drop_interns);
+            let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+            let mut caller_interns = Interns::new();
+            let unit_c = unit_types(&mut caller_interns);
+            let clone_str = caller_interns.intern_str("clone");
+            let caller = build_caller_with_cleanup_drop(
+                &mut caller_interns,
+                unit_c,
+                Callee::Runtime {
+                    member: clone_str,
+                    sysroot: false,
+                },
+                "real_drop",
+            );
+
+            let mut table = BTreeMap::new();
+            table.insert(
+                JsName::new("real_drop".to_owned()),
+                test_item("real_drop", drop_interns),
+            );
+            let caller_item = test_item("caller", caller_interns);
+            let caller_interns_ref = caller_item.jir.interns().unwrap().clone();
+            table.insert(JsName::new("caller".to_owned()), caller_item);
+
+            let mut funcs = BTreeMap::new();
+            funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+            funcs.insert(JsName::new("caller".to_owned()), Ok(caller.clone()));
+
+            let live: BTreeSet<JsName> = table.keys().cloned().collect();
+            let false_protected = [InvokePrunedSite {
+                block: FuncBuilder::ENTRY,
+                reason: InvokePruneReason::ProtectedOpCannotThrow,
+            }];
+            assert!(
+                witness::check_invoke_pruning(
+                    &caller,
+                    &caller_interns_ref,
+                    &false_protected,
+                    &table,
+                    &funcs,
+                    &live,
+                )
+                .is_err(),
+                "false ProtectedOpCannotThrow for non-sysroot clone must fail"
+            );
+        }
+
+        // 3) `RCGJS_WITNESS_FAULT=prune-invoke` rolls back all Invokes and increments `witnesses_failed`.
+        {
+            let mut callee_interns = Interns::new();
+            let unit_callee = unit_types(&mut callee_interns);
+            let mut cb = FuncBuilder::new(
+                item_id(130),
+                Signature {
+                    arguments: Vec::new(),
+                    result: unit_callee,
+                    abi: AbiSignature::default(),
+                },
+            );
+            cb.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+            let callee_func = cb.finish();
+
+            let mut caller_interns = Interns::new();
+            let unit_caller = unit_types(&mut caller_interns);
+            let target_str = caller_interns.intern_str("non_throwing_callee");
+            let mut b = FuncBuilder::new(
+                item_id(131),
+                Signature {
+                    arguments: Vec::new(),
+                    result: unit_caller,
+                    abi: AbiSignature::default(),
+                },
+            );
+            let b0 = FuncBuilder::ENTRY;
+            let b_norm = b.block();
+            let b_unw = b.block();
+            b.effect(
+                b0,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: item_id(130),
+                        link_name: target_str,
+                    },
+                    function: None,
+                    args: Vec::new(),
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                O,
+            );
+            b.terminate(
+                b0,
+                RTerm::Invoke {
+                    normal: (b_norm, Vec::new()),
+                    unwind: (b_unw, Vec::new()),
+                },
+            );
+            b.terminate(b_norm, RTerm::Return(None));
+            b.terminate(b_unw, RTerm::Throw(None));
+            let caller_func = b.finish();
+
+            let mut table = BTreeMap::new();
+            table.insert(
+                JsName::new("non_throwing_callee".to_owned()),
+                test_item("non_throwing_callee", callee_interns),
+            );
+            table.insert(
+                JsName::new("caller".to_owned()),
+                test_item("caller", caller_interns),
+            );
+            let mut funcs = BTreeMap::new();
+            funcs.insert(
+                JsName::new("non_throwing_callee".to_owned()),
+                Ok(callee_func),
+            );
+            funcs.insert(JsName::new("caller".to_owned()), Ok(caller_func));
+            let live: BTreeSet<JsName> = table.keys().cloned().collect();
+
+            let _fault = witness::ScopedWitnessFault::new("prune-invoke");
+            let stats = run_checked(&table, &mut funcs, &live);
+            assert_eq!(stats.modified, 0, "fault injection must roll back");
+            assert!(stats.witnesses_failed > 0);
+            assert_eq!(stats.witnesses_recorded, 0);
+            assert!(
+                funcs[&JsName::new("caller".to_owned())]
+                    .as_ref()
+                    .unwrap()
+                    .has_invoke(),
+                "rolled-back caller must preserve its RTerm::Invoke"
+            );
+        }
     }
 }

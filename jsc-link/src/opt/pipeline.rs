@@ -389,6 +389,9 @@ fn corrupt(witnesses: &mut [Witness], target: &str) {
         if target == "slice-iterator" && !matches!(witness, Witness::SliceIteratorCursor { .. }) {
             continue;
         }
+        if target == "prune-invoke" && !matches!(witness, Witness::InvokePruned { .. }) {
+            continue;
+        }
         match witness {
             Witness::ConstFold { result, .. } => *result = !*result,
             Witness::BranchFold { taken, .. } => *taken = u32::MAX,
@@ -416,6 +419,7 @@ fn corrupt(witnesses: &mut [Witness], target: &str) {
                     loops.clear();
                 }
             }
+            Witness::InvokePruned { count } => *count = 0,
         }
     }
 }

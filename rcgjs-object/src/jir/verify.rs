@@ -514,7 +514,7 @@ fn verify_call(call: &Call, context: &Context<'_>) -> Result<(), VerifyError> {
                 ));
             }
         }
-        Callee::Runtime { member } => context.str(*member)?,
+        Callee::Runtime { member, .. } => context.str(*member)?,
         Callee::Nop => {}
     }
     call.arguments

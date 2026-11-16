@@ -675,6 +675,7 @@ fn verify_rejects_broken_bodies() {
     if let Terminator::Call(call) = &mut bad_string.blocks[2].terminator {
         call.callee = Callee::Runtime {
             member: super::interns::StrId(4242),
+            sysroot: true,
         };
     }
     assert!(bad_string.verify(&interns.types, &interns).is_err());
