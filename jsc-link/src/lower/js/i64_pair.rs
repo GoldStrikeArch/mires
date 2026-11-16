@@ -513,6 +513,92 @@ fn mask_shift_63(amount: Expr, amount_is_i64: bool, amount_is_bigint: bool) -> E
     }
 }
 
+fn fold_shl(lhs: Expr, rhs: Expr) -> Expr {
+    if const_i32(&lhs) == Some(0) {
+        return jsast::num(0.0);
+    }
+    if let Some(k) = const_i32(&rhs) {
+        let s = (k as u32) & 31;
+        if let Some(v) = const_i32(&lhs) {
+            return jsast::num(f64::from(v.wrapping_shl(s)));
+        }
+        if s == 0 {
+            return lhs;
+        }
+        return jsast::binary(JsBinOp::Shl, lhs, jsast::num(f64::from(s)));
+    }
+    jsast::binary(JsBinOp::Shl, lhs, rhs)
+}
+
+fn fold_ushr_pos_shift(lhs: Expr, rhs: Expr) -> Expr {
+    if const_i32(&lhs) == Some(0) {
+        return jsast::num(0.0);
+    }
+    if let Some(k) = const_i32(&rhs) {
+        let s = (k as u32) & 31;
+        if let Some(v) = const_i32(&lhs) {
+            return jsast::num(f64::from(((v as u32) >> s) as i32));
+        }
+        return jsast::binary(JsBinOp::UShr, lhs, jsast::num(f64::from(s)));
+    }
+    jsast::binary(JsBinOp::UShr, lhs, rhs)
+}
+
+fn fold_ushr_i32(lhs: Expr, rhs: Expr) -> Expr {
+    if const_i32(&lhs) == Some(0) {
+        return jsast::num(0.0);
+    }
+    if let Some(k) = const_i32(&rhs) {
+        let s = (k as u32) & 31;
+        if let Some(v) = const_i32(&lhs) {
+            return jsast::num(f64::from(((v as u32) >> s) as i32));
+        }
+        if s == 0 {
+            return lhs;
+        }
+        return jsast::binary(JsBinOp::UShr, lhs, jsast::num(f64::from(s)));
+    }
+    jsast::i32_wrap(jsast::binary(JsBinOp::UShr, lhs, rhs))
+}
+
+fn fold_shr_signed(lhs: Expr, rhs: Expr) -> Expr {
+    match const_i32(&lhs) {
+        Some(0) => return jsast::num(0.0),
+        Some(-1) => return jsast::num(-1.0),
+        _ => {}
+    }
+    if let Some(k) = const_i32(&rhs) {
+        let s = (k as u32) & 31;
+        if let Some(v) = const_i32(&lhs) {
+            return jsast::num(f64::from(v >> s));
+        }
+        if s == 0 {
+            return lhs;
+        }
+        return jsast::binary(JsBinOp::Shr, lhs, jsast::num(f64::from(s)));
+    }
+    jsast::binary(JsBinOp::Shr, lhs, rhs)
+}
+
+fn fold_bit_or_i32(lhs: Expr, rhs: Expr) -> Expr {
+    match (const_i32(&lhs), const_i32(&rhs)) {
+        (Some(0), _) => rhs,
+        (_, Some(0)) => lhs,
+        (Some(-1), _) | (_, Some(-1)) => jsast::num(-1.0),
+        (Some(a), Some(b)) => jsast::num(f64::from(a | b)),
+        _ => jsast::binary(JsBinOp::BitOr, lhs, rhs),
+    }
+}
+
+fn fold_cond_i32(cond: Expr, then_expr: Expr, else_expr: Expr) -> Expr {
+    if let (Some(a), Some(b)) = (const_i32(&then_expr), const_i32(&else_expr)) {
+        if a == b {
+            return then_expr;
+        }
+    }
+    jsast::cond(cond, then_expr, else_expr)
+}
+
 /// Computes `(lo, hi)` for 64-bit left shift `(a << (amount & 63))`.
 pub fn shl_pair(
     cx: &JsCx<'_>,
@@ -524,21 +610,30 @@ pub fn shl_pair(
         if k == 0 {
             return (al, ah);
         }
+        if let (Some(alo), Some(ahi)) = (const_i32(&al), const_i32(&ah)) {
+            let av = u64::from(alo as u32) | (u64::from(ahi as u32) << 32);
+            return literal_pair(u128::from(av.wrapping_shl(k)));
+        }
         if k < 32 {
+            if const_i32(&al) == Some(0) {
+                return (jsast::num(0.0), fold_shl(ah, jsast::num(f64::from(k))));
+            }
             let al = materialize(cx, stmts, al);
-            let lo = jsast::binary(JsBinOp::Shl, al.clone(), jsast::num(f64::from(k)));
-            let hi = jsast::binary(
-                JsBinOp::BitOr,
-                jsast::binary(JsBinOp::Shl, ah, jsast::num(f64::from(k))),
-                jsast::binary(JsBinOp::UShr, al, jsast::num(f64::from(32 - k))),
+            let lo = fold_shl(al.clone(), jsast::num(f64::from(k)));
+            let hi = fold_bit_or_i32(
+                fold_shl(ah, jsast::num(f64::from(k))),
+                fold_ushr_pos_shift(al, jsast::num(f64::from(32 - k))),
             );
             return (lo, hi);
         }
         if k == 32 {
             return (jsast::num(0.0), al);
         }
-        let hi = jsast::binary(JsBinOp::Shl, al, jsast::num(f64::from(k - 32)));
+        let hi = fold_shl(al, jsast::num(f64::from(k - 32)));
         return (jsast::num(0.0), hi);
+    }
+    if const_i32(&al) == Some(0) && const_i32(&ah) == Some(0) {
+        return (jsast::num(0.0), jsast::num(0.0));
     }
     let al = materialize(cx, stmts, al);
     let ah = materialize(cx, stmts, ah);
@@ -548,24 +643,20 @@ pub fn shl_pair(
         jsast::binary(JsBinOp::BitAnd, k.clone(), jsast::num(32.0)),
         jsast::num(0.0),
     );
-    let lo = jsast::cond(
+    let lo = fold_cond_i32(
         high_flag.clone(),
         jsast::num(0.0),
-        jsast::binary(JsBinOp::Shl, al.clone(), k.clone()),
+        fold_shl(al.clone(), k.clone()),
     );
     // `(al >>> 1) >>> (31 - k)` equals `al >>> (32 - k)` for `1..=31` and `0` when `k == 0`
     // because `(al >>> 1)` has only 31 significant bits, avoiding JS `x >>> 32 == x`.
-    let cross = jsast::binary(
-        JsBinOp::UShr,
-        jsast::binary(JsBinOp::UShr, al.clone(), jsast::num(1.0)),
+    let al_shr1 = fold_ushr_pos_shift(al.clone(), jsast::num(1.0));
+    let cross = fold_ushr_pos_shift(
+        al_shr1,
         jsast::binary(JsBinOp::Sub, jsast::num(31.0), k.clone()),
     );
-    let hi_lt32 = jsast::binary(
-        JsBinOp::BitOr,
-        jsast::binary(JsBinOp::Shl, ah, k.clone()),
-        cross,
-    );
-    let hi = jsast::cond(high_flag, jsast::binary(JsBinOp::Shl, al, k), hi_lt32);
+    let hi_lt32 = fold_bit_or_i32(fold_shl(ah, k.clone()), cross);
+    let hi = fold_cond_i32(high_flag, fold_shl(al, k), hi_lt32);
     (lo, hi)
 }
 
@@ -579,14 +670,14 @@ pub fn shr_pair(
 ) -> (Expr, Expr) {
     let shift_hi = |expr: Expr, amt: Expr| {
         if signed {
-            jsast::binary(JsBinOp::Shr, expr, amt)
+            fold_shr_signed(expr, amt)
         } else {
-            jsast::i32_wrap(jsast::binary(JsBinOp::UShr, expr, amt))
+            fold_ushr_i32(expr, amt)
         }
     };
     let fill_hi = |ah_expr: Expr| {
         if signed {
-            jsast::binary(JsBinOp::Shr, ah_expr, jsast::num(31.0))
+            fold_shr_signed(ah_expr, jsast::num(31.0))
         } else {
             jsast::num(0.0)
         }
@@ -596,12 +687,20 @@ pub fn shr_pair(
         if k == 0 {
             return (al, ah);
         }
+        if let (Some(alo), Some(ahi)) = (const_i32(&al), const_i32(&ah)) {
+            let av = u64::from(alo as u32) | (u64::from(ahi as u32) << 32);
+            let shifted = if signed {
+                (av as i64).wrapping_shr(k) as u64
+            } else {
+                av.wrapping_shr(k)
+            };
+            return literal_pair(u128::from(shifted));
+        }
         if k < 32 {
             let ah = materialize(cx, stmts, ah);
-            let lo = jsast::binary(
-                JsBinOp::BitOr,
-                jsast::binary(JsBinOp::UShr, al, jsast::num(f64::from(k))),
-                jsast::binary(JsBinOp::Shl, ah.clone(), jsast::num(f64::from(32 - k))),
+            let lo = fold_bit_or_i32(
+                fold_ushr_pos_shift(al, jsast::num(f64::from(k))),
+                fold_shl(ah.clone(), jsast::num(f64::from(32 - k))),
             );
             let hi = shift_hi(ah, jsast::num(f64::from(k)));
             return (lo, hi);
@@ -616,6 +715,9 @@ pub fn shr_pair(
         return (lo, hi);
     }
 
+    if const_i32(&al) == Some(0) && const_i32(&ah) == Some(0) {
+        return (jsast::num(0.0), jsast::num(0.0));
+    }
     let al = materialize(cx, stmts, al);
     let ah = materialize(cx, stmts, ah);
     let k = materialize(cx, stmts, mask_shift_63(shift_amount, true, false));
@@ -625,18 +727,24 @@ pub fn shr_pair(
         jsast::num(0.0),
     );
     // `(ah << 1) << (31 - k)` equals `ah << (32 - k)` for `1..=31` and `0` when `k == 0`.
-    let cross = jsast::binary(
-        JsBinOp::Shl,
-        jsast::binary(JsBinOp::Shl, ah.clone(), jsast::num(1.0)),
+    let ah_shl1 = fold_shl(ah.clone(), jsast::num(1.0));
+    let cross = fold_shl(
+        ah_shl1,
         jsast::binary(JsBinOp::Sub, jsast::num(31.0), k.clone()),
     );
-    let lo_lt32 = jsast::binary(
-        JsBinOp::BitOr,
-        jsast::binary(JsBinOp::UShr, al, k.clone()),
-        cross,
-    );
-    let lo = jsast::cond(high_flag.clone(), shift_hi(ah.clone(), k.clone()), lo_lt32);
-    let hi = jsast::cond(high_flag, fill_hi(ah.clone()), shift_hi(ah, k));
+    let lo_lt32 = if const_i32(&cross) == Some(0) {
+        fold_ushr_i32(al, k.clone())
+    } else if const_i32(&al) == Some(0) {
+        cross
+    } else {
+        jsast::binary(
+            JsBinOp::BitOr,
+            jsast::binary(JsBinOp::UShr, al, k.clone()),
+            cross,
+        )
+    };
+    let lo = fold_cond_i32(high_flag.clone(), shift_hi(ah.clone(), k.clone()), lo_lt32);
+    let hi = fold_cond_i32(high_flag, fill_hi(ah.clone()), shift_hi(ah, k));
     (lo, hi)
 }
 
@@ -657,6 +765,10 @@ pub fn rotate_pair(
         if k == 0 {
             return (al, ah);
         }
+        if let (Some(alo), Some(ahi)) = (const_i32(&al), const_i32(&ah)) {
+            let av = u64::from(alo as u32) | (u64::from(ahi as u32) << 32);
+            return literal_pair(u128::from(av.rotate_left(k)));
+        }
         if k == 32 {
             return (ah, al);
         }
@@ -667,19 +779,20 @@ pub fn rotate_pair(
         } else {
             (ah, al, k - 32)
         };
-        let lo = jsast::binary(
-            JsBinOp::BitOr,
-            jsast::binary(JsBinOp::Shl, a.clone(), jsast::num(f64::from(r))),
-            jsast::binary(JsBinOp::UShr, b.clone(), jsast::num(f64::from(32 - r))),
+        let lo = fold_bit_or_i32(
+            fold_shl(a.clone(), jsast::num(f64::from(r))),
+            fold_ushr_pos_shift(b.clone(), jsast::num(f64::from(32 - r))),
         );
-        let hi = jsast::binary(
-            JsBinOp::BitOr,
-            jsast::binary(JsBinOp::Shl, b, jsast::num(f64::from(r))),
-            jsast::binary(JsBinOp::UShr, a, jsast::num(f64::from(32 - r))),
+        let hi = fold_bit_or_i32(
+            fold_shl(b, jsast::num(f64::from(r))),
+            fold_ushr_pos_shift(a, jsast::num(f64::from(32 - r))),
         );
         return (lo, hi);
     }
 
+    if const_i32(&al) == Some(0) && const_i32(&ah) == Some(0) {
+        return (jsast::num(0.0), jsast::num(0.0));
+    }
     let al = materialize(cx, stmts, al);
     let ah = materialize(cx, stmts, ah);
     let raw_masked = mask_shift_63(shift_amount, true, false);
@@ -703,14 +816,10 @@ pub fn rotate_pair(
         jsast::binary(JsBinOp::Sub, jsast::num(31.0), m.clone()),
     );
     let rot = |x: Expr, y: Expr| {
-        jsast::binary(
-            JsBinOp::BitOr,
-            jsast::binary(JsBinOp::Shl, x, m.clone()),
-            jsast::binary(
-                JsBinOp::UShr,
-                jsast::binary(JsBinOp::UShr, y, jsast::num(1.0)),
-                inv_m.clone(),
-            ),
+        let y_shr1 = fold_ushr_pos_shift(y, jsast::num(1.0));
+        fold_bit_or_i32(
+            fold_shl(x, m.clone()),
+            fold_ushr_pos_shift(y_shr1, inv_m.clone()),
         )
     };
     let r_lo = materialize(cx, stmts, rot(al.clone(), ah.clone()));
@@ -721,8 +830,8 @@ pub fn rotate_pair(
         jsast::num(0.0),
     );
     let swap = materialize(cx, stmts, swap);
-    let lo = jsast::cond(swap.clone(), r_hi.clone(), r_lo.clone());
-    let hi = jsast::cond(swap, r_lo, r_hi);
+    let lo = fold_cond_i32(swap.clone(), r_hi.clone(), r_lo.clone());
+    let hi = fold_cond_i32(swap, r_lo, r_hi);
     (lo, hi)
 }
 
@@ -1542,4 +1651,136 @@ pub fn helper_preamble_js() -> String {
         out.push_str(&item.js);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgjs_object::item::Availability;
+    use rcgjs_object::jir::interns::Interns;
+    use rcgjs_object::jir::repr::{FuncBuilder, RTerm};
+    use rcgjs_object::jir::semantic::{AbiSignature, DefinitionId, ItemId, Signature};
+    use rcgjs_object::jir::summary::{ItemClass, ItemSummary, SemanticKey};
+    use rcgjs_object::object::BlobRef;
+    use rcgjs_object::opts::Opts;
+
+    fn with_cx(f: impl FnOnce(&JsCx<'_>, &mut Vec<Stmt>)) {
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 1,
+                },
+                instantiation: 1,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 0,
+                    spread: None,
+                    caller_location: false,
+                    inline_never: false,
+                },
+                arguments: Vec::new(),
+                result: TypeId(1),
+            },
+        );
+        b.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let func = b.finish();
+        let interns = Interns::new();
+        let opts = Opts::default();
+        let plan = crate::lower::fuse::plan(&func, None, &interns.types, &interns, &opts);
+        let summary = ItemSummary {
+            key: SemanticKey {
+                link_name: "test".to_owned(),
+                item: None,
+            },
+            body_hash: None,
+            semantic_hash: None,
+            availability: Availability::Available,
+            deps: Vec::new(),
+            abi: None,
+            physical: None,
+            kind: ItemKind::Fn,
+            linkage: Linkage::internal(),
+            order: None,
+            dts: false,
+            fallback: BlobRef {
+                offset: 0,
+                clen: 0,
+                ulen: 0,
+            },
+            body: None,
+            origin: None,
+            estimated_bytes: 0,
+            class: ItemClass::default(),
+        };
+        let cx = JsCx::new(
+            &func,
+            &plan,
+            &interns.types,
+            &interns,
+            &opts,
+            &summary,
+            None,
+        );
+        let mut stmts = Vec::new();
+        f(&cx, &mut stmts);
+    }
+
+    #[test]
+    fn shl_shr_rotate_peepholes_fold_zero_lanes_and_one_u64_bitmask() {
+        with_cx(|cx, stmts| {
+            // 1u64 << f (byteset bitmask in TwoWaySearcher): no `0 <<` and no `1 >>> 1`
+            let (lo, hi) = shl_pair(
+                cx,
+                stmts,
+                (jsast::num(1.0), jsast::num(0.0)),
+                jsast::id("f"),
+            );
+            let lo_s = jsast::expr_to_string(&lo);
+            let hi_s = jsast::expr_to_string(&hi);
+            assert!(
+                !lo_s.contains("0 <<") && !hi_s.contains("0 <<"),
+                "{lo_s} / {hi_s}"
+            );
+            assert!(!hi_s.contains(">>> 1"), "{hi_s}");
+
+            // (v, 0) << 8: no `0 << 8 |`
+            let (lo8, hi8) = shl_pair(
+                cx,
+                stmts,
+                (jsast::id("v"), jsast::num(0.0)),
+                jsast::num(8.0),
+            );
+            assert_eq!(jsast::expr_to_string(&lo8), "v << 8");
+            assert_eq!(jsast::expr_to_string(&hi8), "v >>> 24");
+
+            // (v, 0) >>> k (unsigned dynamic shift): folds hi to 0 and keeps | 0 on lo
+            let (rlo, rhi) = shr_pair(
+                cx,
+                stmts,
+                false,
+                (jsast::id("v"), jsast::num(0.0)),
+                jsast::id("k"),
+            );
+            let rlo_s = jsast::expr_to_string(&rlo);
+            assert!(!rlo_s.contains("0 <<"), "{rlo_s}");
+            assert!(
+                rlo_s.contains("| 0"),
+                "dynamic u32>>>k must stay Int32: {rlo_s}"
+            );
+            assert_eq!(jsast::expr_to_string(&rhi), "0");
+
+            // rotate_left((v, 0), 8): folds zero lane terms away
+            let (rot_lo, rot_hi) = rotate_pair(
+                cx,
+                stmts,
+                true,
+                (jsast::id("v"), jsast::num(0.0)),
+                jsast::num(8.0),
+            );
+            assert_eq!(jsast::expr_to_string(&rot_lo), "v << 8");
+            assert_eq!(jsast::expr_to_string(&rot_hi), "v >>> 24");
+        });
+    }
 }

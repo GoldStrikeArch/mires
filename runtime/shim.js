@@ -475,6 +475,9 @@ globalThis.__rt.offset_from = (a, b) => {
 globalThis.__rt.ptr_eq = (a, b) => {
   if (a === b) return true;
   if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  if (a.buf !== undefined && b.buf !== undefined && a.pr === undefined && b.pr === undefined) {
+    return a.buf === b.buf && a.off === b.off && a.sc === b.sc;
+  }
   globalThis.__rt._named(a, "ptr_eq");
   globalThis.__rt._named(b, "ptr_eq");
   if (!("buf" in a) || !("buf" in b)) return false;
@@ -606,6 +609,45 @@ globalThis.__rt._scales = (a, b, op) => {
 // is above. Which store each element gets is `_rebinds`.
 globalThis.__rt.copy = (dst, src, count, clone) => {
   if (count === 0) return;
+  if (
+    count > 0 &&
+    clone === undefined &&
+    dst !== null &&
+    src !== null &&
+    typeof dst === "object" &&
+    typeof src === "object" &&
+    dst.sc === undefined &&
+    src.sc === undefined
+  ) {
+    const db = dst.buf;
+    const sb = src.buf;
+    if (Array.isArray(db) && Array.isArray(sb)) {
+      const doff = dst.off;
+      const soff = src.off;
+      if (
+        typeof doff === "number" &&
+        typeof soff === "number" &&
+        doff >= 0 &&
+        soff >= 0 &&
+        doff + count <= db.length &&
+        soff + count <= sb.length
+      ) {
+        if (db === sb) {
+          db.copyWithin(doff, soff, soff + count);
+          return;
+        }
+        if (
+          count !== 1 ||
+          sb[soff] === null ||
+          typeof sb[soff] !== "object" ||
+          !globalThis.__rt._boxed.has(db)
+        ) {
+          for (let i = 0; i < count; i++) db[doff + i] = sb[soff + i];
+          return;
+        }
+      }
+    }
+  }
   globalThis.__rt._scales(dst, src, "copy");
   const d = globalThis.__rt._run(dst, count, "copy");
   const s = globalThis.__rt._run(src, count, "copy");
@@ -702,6 +744,38 @@ globalThis.__rt._put = (buf, off, value, heap) => {
 // the direction never matters.
 globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone) => {
   if (count === 0) return;
+  if (
+    count > 0 &&
+    clone === undefined &&
+    dst !== null &&
+    src !== null &&
+    typeof dst === "object" &&
+    typeof src === "object" &&
+    dst.sc === undefined &&
+    src.sc === undefined
+  ) {
+    const db = dst.buf;
+    const sb = src.buf;
+    if (Array.isArray(db) && Array.isArray(sb)) {
+      const doff = dst.off;
+      const soff = src.off;
+      if (
+        typeof doff === "number" &&
+        typeof soff === "number" &&
+        doff >= 0 &&
+        soff >= 0 &&
+        doff + count <= db.length &&
+        soff + count <= sb.length &&
+        (count !== 1 ||
+          sb[soff] === null ||
+          typeof sb[soff] !== "object" ||
+          !globalThis.__rt._boxed.has(db))
+      ) {
+        for (let i = 0; i < count; i++) db[doff + i] = sb[soff + i];
+        return;
+      }
+    }
+  }
   globalThis.__rt._scales(dst, src, "copy_nonoverlapping");
   const d = globalThis.__rt._run(dst, count, "copy_nonoverlapping");
   const s = globalThis.__rt._run(src, count, "copy_nonoverlapping");
@@ -760,6 +834,37 @@ globalThis.__rt.write_bytes = (dst, byte, count, zero) => {
 // intrinsic looks at.
 globalThis.__rt.compare_bytes = (a, b, count) => {
   if (count === 0) return 0;
+  if (
+    count > 0 &&
+    a !== null &&
+    b !== null &&
+    typeof a === "object" &&
+    typeof b === "object" &&
+    a.sc === undefined &&
+    b.sc === undefined
+  ) {
+    const ab = a.buf;
+    const bb = b.buf;
+    if (Array.isArray(ab) && Array.isArray(bb)) {
+      const aoff = a.off;
+      const boff = b.off;
+      if (
+        typeof aoff === "number" &&
+        typeof boff === "number" &&
+        aoff >= 0 &&
+        boff >= 0 &&
+        aoff + count <= ab.length &&
+        boff + count <= bb.length
+      ) {
+        for (let i = 0; i < count; i++) {
+          const left = ab[aoff + i];
+          const right = bb[boff + i];
+          if (left !== right) return left - right;
+        }
+        return 0;
+      }
+    }
+  }
   globalThis.__rt._scales(a, b, "compare_bytes");
   const x = globalThis.__rt._run(a, count, "compare_bytes");
   const y = globalThis.__rt._run(b, count, "compare_bytes");
@@ -1315,7 +1420,7 @@ globalThis.__rt._decoder = {
 globalThis.__rt._utf8_scratch = null;
 globalThis.__rt._utf8 = (s) => {
   const n = s.length;
-  if (n <= 48) {
+  if (n <= 65536) {
     const bytes = new Array(n);
     let i = 0;
     for (; i < n; i++) {
@@ -1398,15 +1503,44 @@ function _arm_str_memo() {
 // shapes a program actually writes and a byte slice compared with itself takes
 // the fast path. Correctness never depends on it.
 globalThis.__rt.str_bytes = (s) => {
+  if (s === _mru_k && _mru_v !== undefined) return _mru_v;
   if (s !== "") {
-    if (s === _sub_k0) return _sub_v0;
-    if (s === _sub_k1) return _sub_v1;
-    if (s === _sub_k2) return _sub_v2;
-    if (s === _sub_k3) return _sub_v3;
+    if (s === _sub_k0) {
+      _mru_k = s;
+      _mru_v = _sub_v0;
+      return _sub_v0;
+    }
+    if (s === _sub_k1) {
+      _mru_k = s;
+      _mru_v = _sub_v1;
+      return _sub_v1;
+    }
+    if (s === _sub_k2) {
+      _mru_k = s;
+      _mru_v = _sub_v2;
+      return _sub_v2;
+    }
+    if (s === _sub_k3) {
+      _mru_k = s;
+      _mru_v = _sub_v3;
+      return _sub_v3;
+    }
   }
   const memo = globalThis.__rt._str_memo;
   let record = memo.map.get(s);
-  if (record !== undefined) return record;
+  if (record !== undefined) {
+    _mru_k = s;
+    _mru_v = record;
+    return record;
+  }
+  if (_sub_map !== undefined && _sub_map.size !== 0) {
+    record = _sub_map.get(s);
+    if (record !== undefined) {
+      _mru_k = s;
+      _mru_v = record;
+      return record;
+    }
+  }
   const bytes = globalThis.__rt._utf8(s);
   record = { buf: bytes, off: 0, len: bytes.length };
   if (bytes.length === s.length) {
@@ -1431,6 +1565,8 @@ globalThis.__rt.str_bytes = (s) => {
     memo.bytes += bytes.length;
   }
   memo.map.set(s, record);
+  _mru_k = s;
+  _mru_v = record;
   return record;
 };
 
@@ -1455,16 +1591,48 @@ globalThis.__rt.str_bytes_mut = (s) => {
 // per token of a long document from costing a scan each time.
 globalThis.__rt.str_len = (s) => {
   const n = s.length;
+  if (n === 0) return 0;
+  if (s === _mru_k && _mru_v !== undefined) return _mru_v.len;
   if (n > 16) {
-    if (s === _sub_k0) return _sub_v0.len;
-    if (s === _sub_k1) return _sub_v1.len;
-    if (s === _sub_k2) return _sub_v2.len;
-    if (s === _sub_k3) return _sub_v3.len;
-  }
-  const map = globalThis.__rt._str_memo.map;
-  if (n > 64 && map.size !== 0) {
-    const record = map.get(s);
-    if (record !== undefined) return record.len;
+    if (s === _sub_k0) {
+      _mru_k = s;
+      _mru_v = _sub_v0;
+      return _sub_v0.len;
+    }
+    if (s === _sub_k1) {
+      _mru_k = s;
+      _mru_v = _sub_v1;
+      return _sub_v1.len;
+    }
+    if (s === _sub_k2) {
+      _mru_k = s;
+      _mru_v = _sub_v2;
+      return _sub_v2.len;
+    }
+    if (s === _sub_k3) {
+      _mru_k = s;
+      _mru_v = _sub_v3;
+      return _sub_v3.len;
+    }
+    if (_sub_map !== undefined && _sub_map.size !== 0) {
+      const sub = _sub_map.get(s);
+      if (sub !== undefined) {
+        _mru_k = s;
+        _mru_v = sub;
+        return sub.len;
+      }
+    }
+    if (n > 64) {
+      const map = globalThis.__rt._str_memo.map;
+      if (map.size !== 0) {
+        const record = map.get(s);
+        if (record !== undefined) {
+          _mru_k = s;
+          _mru_v = record;
+          return record.len;
+        }
+      }
+    }
   }
   let len = n;
   for (let i = 0; i < n; i++) {
@@ -1499,6 +1667,8 @@ globalThis.__rt.str_len = (s) => {
 // decoder takes over.
 globalThis.__rt._ASCII_CHUNK = 4096;
 let _ascii_src;
+let _mru_k = "";
+let _mru_v;
 let _sub_k0 = "";
 let _sub_v0;
 let _sub_k1 = "";
@@ -1509,9 +1679,17 @@ let _sub_k3 = "";
 let _sub_v3;
 let _sub_i = 0;
 let _sub_arm;
+let _sub_map;
+function _sub_spill(k, v) {
+  if (_sub_map === undefined) _sub_map = new Map();
+  if (_sub_map.size < 4096 && !_sub_map.has(k)) _sub_map.set(k, v);
+}
 function _sub_reset() {
+  _mru_k = "";
+  _mru_v = undefined;
   _sub_k0 = _sub_k1 = _sub_k2 = _sub_k3 = "";
   _sub_v0 = _sub_v1 = _sub_v2 = _sub_v3 = undefined;
+  if (_sub_map !== undefined) _sub_map.clear();
 }
 globalThis.__rt.bytes_str = (buf, off, len) => {
   // A zero length `str` reads nothing, and the buffer it names may not exist at
@@ -1525,16 +1703,22 @@ globalThis.__rt.bytes_str = (buf, off, len) => {
       const sub = src.slice(off, off + len);
       if (_sub_arm !== undefined) _sub_arm();
       const slot = { buf, off, len };
+      _mru_k = sub;
+      _mru_v = slot;
       if (_sub_i === 0) {
+        if (_sub_v0 !== undefined) _sub_spill(_sub_k0, _sub_v0);
         _sub_k0 = sub;
         _sub_v0 = slot;
       } else if (_sub_i === 1) {
+        if (_sub_v1 !== undefined) _sub_spill(_sub_k1, _sub_v1);
         _sub_k1 = sub;
         _sub_v1 = slot;
       } else if (_sub_i === 2) {
+        if (_sub_v2 !== undefined) _sub_spill(_sub_k2, _sub_v2);
         _sub_k2 = sub;
         _sub_v2 = slot;
       } else {
+        if (_sub_v3 !== undefined) _sub_spill(_sub_k3, _sub_v3);
         _sub_k3 = sub;
         _sub_v3 = slot;
       }
