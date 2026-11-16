@@ -1,28 +1,28 @@
 {
   "schema": 1,
-  "generatedAt": "2026-11-16T03:38:55.771Z",
+  "generatedAt": "2026-11-16T10:26:07.540Z",
   "provenance": {
-    "compilerCommit": "dfdcf1280feb6c78ae9944da3ea896b9325b6188",
+    "compilerCommit": "895ed1cb9aa5f9f84a27941f1ab2d3c327e5a504",
     "gitStatusClean": true,
     "gitStatusPorcelain": "",
     "dylib": {
-      "path": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/target/release/librustc_codegen_mires.dylib",
+      "path": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/target/release/librustc_codegen_mires.dylib",
       "bytes": 11003136,
-      "sha256": "03e05e35e64e2a4ab4a3264f1338695268a846a807d44e6f129ab79ffe12a6f4"
+      "sha256": "295bf7fe970b6f870752b22ff6510d55e8cf19f0d365b04846b8db1deae79206"
     },
     "jscLink": {
-      "path": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/target/release/jsc-link",
-      "bytes": 10870240,
-      "sha256": "dd44540f6629d4a619acae71cee8f34d9f94b9598529332b3f803adc631f9fd0"
+      "path": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/target/release/jsc-link",
+      "bytes": 10845520,
+      "sha256": "290a15298f8c4e08e9f77528ea07db8ec06107ffaa61199438b53f2906e83cfc"
     },
     "runtimeShim": {
-      "path": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/runtime/shim.js",
-      "bytes": 160776,
-      "sha256": "0ea2a34ec10f68bbe0d1573dc3ccdde66700f2b9604e25cee73603b841d1497c"
+      "path": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/runtime/shim.js",
+      "bytes": 165209,
+      "sha256": "34d2660fc5564ca09d9ebd870e95047b59d1099e93a8fdccb012903559bce149"
     },
     "sysroot": {
-      "linkTarget": "sysroots/d676a2077f120650a933fe71879960d2155a5f6ef6fa34bd43dcf914f24cb09f",
-      "cacheKey": "d676a2077f120650a933fe71879960d2155a5f6ef6fa34bd43dcf914f24cb09f",
+      "linkTarget": "sysroots/04e9a8f714c27f8499f2337591752b812ac360305a0bd6b433928e5ee32bb519",
+      "cacheKey": "04e9a8f714c27f8499f2337591752b812ac360305a0bd6b433928e5ee32bb519",
       "target": "mires32-unwind",
       "rustOptLevel": "",
       "jsArgs": "js-cleanup=off"
@@ -30,171 +30,171 @@
   },
   "compact": {
     "release-balanced": {
-      "elapsedSec": 18.41,
+      "elapsedSec": 17.43,
       "kernelsExit": 0,
       "kernels": {
         "passed": 58,
         "total": 58
       },
       "min": {
-        "bytes": 158035,
-        "gzip9": 48172,
-        "brotli11": 36969,
+        "bytes": 157065,
+        "gzip9": 48221,
+        "brotli11": 37055,
         "tryCount": 187,
         "topLevelFns": 0,
         "bigintMentions": 0,
-        "sha256": "b263b1db2a2eac4b46dfeafb0974058b64f25da2e820379164ea42c69d530c9b"
+        "sha256": "d6615f435fa2c94c720501b279d6fddb62a27ab611f4512b762ccc891e9780bc"
       },
       "raw": {
-        "bytes": 165463,
-        "gzip9": 47840,
-        "brotli11": 36141,
+        "bytes": 163242,
+        "gzip9": 47741,
+        "brotli11": 36023,
         "tryCount": 186,
-        "topLevelFns": 516,
+        "topLevelFns": 503,
         "bigintMentions": 0,
-        "sha256": "5763b43dd14daf032bdb94a717375a34e5174763e1106a5f91f58b6ab3ad4c72"
+        "sha256": "f46fa38cd50f2c463971395fb155af40a2544c4b2a913f77d0b49ec38f71a574"
       },
       "lane": {
-        "items": 507,
+        "items": 494,
         "fallbackCount": 0,
-        "inlineApplied": 738,
-        "crossObjectInline": 92,
-        "sroaApplied": 378,
+        "inlineApplied": 811,
+        "crossObjectInline": 113,
+        "sroaApplied": 386,
         "reprApplied": 0,
-        "sliceIterWouldLower": 1,
-        "sliceIterEmitted": 1,
-        "rangeAssertsRemoved": 46,
+        "sliceIterWouldLower": 3,
+        "sliceIterEmitted": 3,
+        "rangeAssertsRemoved": 48,
         "rangeComparisonsFolded": 2,
-        "witnessesRecorded": 1346,
+        "witnessesRecorded": 1368,
         "witnessesFailed": 0
       }
     },
     "release-size": {
-      "elapsedSec": 16.92,
+      "elapsedSec": 17.58,
       "kernelsExit": 0,
       "kernels": {
         "passed": 58,
         "total": 58
       },
       "min": {
-        "bytes": 158035,
-        "gzip9": 48172,
-        "brotli11": 36969,
+        "bytes": 157234,
+        "gzip9": 48209,
+        "brotli11": 37100,
         "tryCount": 187,
         "topLevelFns": 0,
         "bigintMentions": 0,
-        "sha256": "b263b1db2a2eac4b46dfeafb0974058b64f25da2e820379164ea42c69d530c9b"
+        "sha256": "871eda4d319873f27076eb0f2cdde0d56671205187a4dab62e59692ea7f6d6b9"
       },
       "raw": {
-        "bytes": 165463,
-        "gzip9": 47840,
-        "brotli11": 36141,
+        "bytes": 163400,
+        "gzip9": 47747,
+        "brotli11": 35994,
         "tryCount": 186,
-        "topLevelFns": 516,
+        "topLevelFns": 503,
         "bigintMentions": 0,
-        "sha256": "5763b43dd14daf032bdb94a717375a34e5174763e1106a5f91f58b6ab3ad4c72"
+        "sha256": "ad0a5212ea05129a903e5b9df08057f8b1ef0d0d86670bc5bc6e30c41dc6adad"
       },
       "lane": {
-        "items": 507,
+        "items": 494,
         "fallbackCount": 0,
-        "inlineApplied": 738,
-        "crossObjectInline": 92,
-        "sroaApplied": 378,
+        "inlineApplied": 811,
+        "crossObjectInline": 113,
+        "sroaApplied": 364,
         "reprApplied": 0,
-        "sliceIterWouldLower": 1,
-        "sliceIterEmitted": 1,
-        "rangeAssertsRemoved": 46,
+        "sliceIterWouldLower": 3,
+        "sliceIterEmitted": 3,
+        "rangeAssertsRemoved": 48,
         "rangeComparisonsFolded": 2,
-        "witnessesRecorded": 1346,
+        "witnessesRecorded": 1344,
         "witnessesFailed": 0
       }
     }
   },
   "idiomatic": {
     "release-balanced-default": {
-      "elapsedSec": 44.67,
+      "elapsedSec": 48.41,
       "kernelsExit": 0,
       "kernels": {
         "passed": 58,
         "total": 58
       },
       "min": {
-        "bytes": 271278,
-        "gzip9": 79341,
-        "brotli11": 63672,
+        "bytes": 268482,
+        "gzip9": 78892,
+        "brotli11": 63330,
         "tryCount": 358,
         "topLevelFns": 0,
-        "bigintMentions": 248,
-        "sha256": "146cfced4379cbae9b534666e526cd0dae1656cb3c137e5865c6e66e4704a214"
+        "bigintMentions": 228,
+        "sha256": "c1ead6a1333baf4ab0524a3720ba629a7fc043892711e4d61c0cdd07056067bd"
       },
       "raw": {
-        "bytes": 290075,
-        "gzip9": 80877,
-        "brotli11": 64228,
+        "bytes": 285774,
+        "gzip9": 80213,
+        "brotli11": 63785,
         "tryCount": 354,
-        "topLevelFns": 648,
-        "bigintMentions": 240,
-        "sha256": "a84af60551d7233437c8e47b3b3f2fb231d4663fd9453921e5c1ab3f2aea251f"
+        "topLevelFns": 636,
+        "bigintMentions": 220,
+        "sha256": "1800032ede85b9b178c60446b30ed6d4d311535ccf5fe1d8c60ed01379fd158d"
       },
       "lane": {
-        "items": 646,
+        "items": 634,
         "fallbackCount": 0,
-        "inlineApplied": 989,
-        "crossObjectInline": 157,
-        "sroaApplied": 488,
+        "inlineApplied": 1053,
+        "crossObjectInline": 191,
+        "sroaApplied": 499,
         "reprApplied": 2,
-        "sliceIterWouldLower": 2,
-        "sliceIterEmitted": 2,
-        "rangeAssertsRemoved": 112,
+        "sliceIterWouldLower": 3,
+        "sliceIterEmitted": 3,
+        "rangeAssertsRemoved": 111,
         "rangeComparisonsFolded": 6,
-        "witnessesRecorded": 1994,
+        "witnessesRecorded": 2019,
         "witnessesFailed": 0
       }
     },
     "release-balanced-oz": {
-      "elapsedSec": 38.08,
+      "elapsedSec": 43.11,
       "kernelsExit": 0,
       "kernels": {
         "passed": 58,
         "total": 58
       },
       "min": {
-        "bytes": 271187,
-        "gzip9": 79935,
-        "brotli11": 64072,
+        "bytes": 268935,
+        "gzip9": 79447,
+        "brotli11": 63785,
         "tryCount": 358,
         "topLevelFns": 0,
-        "bigintMentions": 248,
-        "sha256": "fe594886a46371d58030f77ec8309c9f3c3a30979a06b9673b29bc7ff274d3bc"
+        "bigintMentions": 228,
+        "sha256": "cc8d16feaef593a7d21b8eb400502407d468cc78f9683a7108170c1c20d5c0a2"
       },
       "raw": {
-        "bytes": 290834,
-        "gzip9": 81526,
-        "brotli11": 64921,
+        "bytes": 286567,
+        "gzip9": 80942,
+        "brotli11": 64345,
         "tryCount": 354,
-        "topLevelFns": 655,
-        "bigintMentions": 240,
-        "sha256": "cd9f0639a355682cd2e503ad775523cc0aa311daadd78aed24251d9d31796c99"
+        "topLevelFns": 643,
+        "bigintMentions": 220,
+        "sha256": "2346504d4a531e3e9b4cf059c26b27644f3704d6d638083ceaa0e7883caefdfc"
       },
       "lane": {
-        "items": 653,
+        "items": 641,
         "fallbackCount": 0,
-        "inlineApplied": 993,
-        "crossObjectInline": 158,
-        "sroaApplied": 486,
+        "inlineApplied": 1057,
+        "crossObjectInline": 191,
+        "sroaApplied": 497,
         "reprApplied": 0,
-        "sliceIterWouldLower": 2,
-        "sliceIterEmitted": 2,
-        "rangeAssertsRemoved": 112,
+        "sliceIterWouldLower": 3,
+        "sliceIterEmitted": 3,
+        "rangeAssertsRemoved": 127,
         "rangeComparisonsFolded": 6,
-        "witnessesRecorded": 1985,
+        "witnessesRecorded": 2025,
         "witnessesFailed": 0
       }
     }
   },
   "corpus": {
-    "buildElapsedSec": 35.92,
-    "runElapsedSec": 3.16,
+    "buildElapsedSec": 37.42,
+    "runElapsedSec": 3.38,
     "status": {
       "browserPassed": true,
       "buildReceiptMatched": true,
@@ -207,299 +207,299 @@
     "workloads": {
       "marked": {
         "min": {
-          "bytes": 27264,
-          "gzip9": 9993,
-          "brotli11": 8777,
+          "bytes": 27348,
+          "gzip9": 10194,
+          "brotli11": 8976,
           "tryCount": 0,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "46d68a250af6b8172623ba5e572a701021ea4486f3b654c6a73574e3152b6ee7"
+          "sha256": "e663cb20e5e548b17a0264c3999bf8b89e3c399fb7bb7b1428c56ccc85783484"
         },
         "raw": {
-          "bytes": 22084,
-          "gzip9": 7415,
-          "brotli11": 6445,
+          "bytes": 21003,
+          "gzip9": 7183,
+          "brotli11": 6143,
           "tryCount": 0,
-          "topLevelFns": 48,
+          "topLevelFns": 43,
           "bigintMentions": 0,
-          "sha256": "55d2c26c3619b84c29a45cc2f7eceddde2ebd8d59471012da087dcd1cabb3ffb"
+          "sha256": "7a1630a65d2c553d8aef5fd5d743d3eccac3d0017d17f9c3d26c1a2ad7087f6c"
         },
         "lane": {
-          "items": 41,
+          "items": 37,
           "fallbackCount": 0,
-          "inlineApplied": 72,
-          "crossObjectInline": 21,
+          "inlineApplied": 84,
+          "crossObjectInline": 14,
           "sroaApplied": 38,
           "reprApplied": 0,
           "sliceIterWouldLower": 0,
           "sliceIterEmitted": 0,
-          "rangeAssertsRemoved": 23,
+          "rangeAssertsRemoved": 22,
           "rangeComparisonsFolded": 0,
-          "witnessesRecorded": 176,
+          "witnessesRecorded": 182,
           "witnessesFailed": 0
         }
       },
       "minisearch": {
         "min": {
-          "bytes": 48154,
-          "gzip9": 14602,
-          "brotli11": 12968,
+          "bytes": 48144,
+          "gzip9": 14655,
+          "brotli11": 13008,
           "tryCount": 0,
           "topLevelFns": 0,
           "bigintMentions": 8,
-          "sha256": "9ecf7edf6c385e8126f0118f191a2952f5423dfe318bc8b23e0157eac9b81e43"
+          "sha256": "bb1dc549c15c9d186b4750250bb21e2a2d114c45ea74613773599c92038e3a52"
         },
         "raw": {
-          "bytes": 41084,
-          "gzip9": 11511,
-          "brotli11": 10118,
+          "bytes": 39496,
+          "gzip9": 11117,
+          "brotli11": 9765,
           "tryCount": 0,
-          "topLevelFns": 104,
+          "topLevelFns": 103,
           "bigintMentions": 8,
-          "sha256": "9c01a3288ff9f5dad270b91330b2836fc056b254737c4a973929f596c72d505f"
+          "sha256": "796f834f45a3c04aef36facadc0667862f44184eea7926640fa6a337059fce3d"
         },
         "lane": {
-          "items": 95,
+          "items": 94,
           "fallbackCount": 0,
-          "inlineApplied": 148,
-          "crossObjectInline": 39,
-          "sroaApplied": 76,
+          "inlineApplied": 152,
+          "crossObjectInline": 41,
+          "sroaApplied": 78,
           "reprApplied": 9,
-          "sliceIterWouldLower": 1,
-          "sliceIterEmitted": 1,
+          "sliceIterWouldLower": 2,
+          "sliceIterEmitted": 2,
           "rangeAssertsRemoved": 29,
           "rangeComparisonsFolded": 0,
-          "witnessesRecorded": 382,
+          "witnessesRecorded": 383,
           "witnessesFailed": 0
         }
       },
       "fflate": {
         "min": {
-          "bytes": 14373,
-          "gzip9": 5608,
-          "brotli11": 5052,
+          "bytes": 12537,
+          "gzip9": 5124,
+          "brotli11": 4670,
           "tryCount": 1,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "3145d76835d041603b877afa3f7b00180dd4df333cd327fd3f6e0e59583d2283"
+          "sha256": "632253265e38293c7636b57079916f08e41db650d9fc08b078e2918e672c868e"
         },
         "raw": {
-          "bytes": 8820,
-          "gzip9": 3116,
-          "brotli11": 2774,
+          "bytes": 6447,
+          "gzip9": 2516,
+          "brotli11": 2276,
           "tryCount": 0,
-          "topLevelFns": 26,
+          "topLevelFns": 22,
           "bigintMentions": 0,
-          "sha256": "c584ecfc0d6adc89818938c94de2595789e7c79532df89672a24cec618dd6cef"
+          "sha256": "b8707a224e4785a467f5958c672a7f111f96163bfc0ef5dc152a484b7c621003"
         },
         "lane": {
-          "items": 19,
+          "items": 15,
           "fallbackCount": 0,
-          "inlineApplied": 55,
-          "crossObjectInline": 23,
-          "sroaApplied": 26,
+          "inlineApplied": 54,
+          "crossObjectInline": 19,
+          "sroaApplied": 28,
           "reprApplied": 0,
-          "sliceIterWouldLower": 0,
-          "sliceIterEmitted": 0,
+          "sliceIterWouldLower": 1,
+          "sliceIterEmitted": 1,
           "rangeAssertsRemoved": 0,
           "rangeComparisonsFolded": 0,
-          "witnessesRecorded": 119,
+          "witnessesRecorded": 130,
           "witnessesFailed": 0
         }
       },
       "uplot": {
         "min": {
-          "bytes": 1935,
-          "gzip9": 1069,
-          "brotli11": 976,
+          "bytes": 1877,
+          "gzip9": 1057,
+          "brotli11": 947,
           "tryCount": 0,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "673b617d9813101a236ca49ffb606937edd7ed49e40c7571d71f2bd1bbcd80bd"
+          "sha256": "e26b91bfceaf5ffc3c0ec4fb91f7b409757a966bcd554460c04a43ebab30cb9e"
         },
         "raw": {
-          "bytes": 2171,
-          "gzip9": 1133,
-          "brotli11": 988,
+          "bytes": 2114,
+          "gzip9": 1126,
+          "brotli11": 984,
           "tryCount": 0,
-          "topLevelFns": 13,
+          "topLevelFns": 12,
           "bigintMentions": 0,
-          "sha256": "169cd3941c73f4cbaac63784a67b66a7865a96e628ff3dacd12482225b28b2c3"
+          "sha256": "92708af815f818a308837826b150930d9d18419be1d42623655d0589362f6bb3"
         },
         "lane": {
-          "items": 12,
+          "items": 11,
           "fallbackCount": 0,
-          "inlineApplied": 14,
+          "inlineApplied": 16,
           "crossObjectInline": 2,
-          "sroaApplied": 3,
+          "sroaApplied": 4,
           "reprApplied": 0,
           "sliceIterWouldLower": 0,
           "sliceIterEmitted": 0,
           "rangeAssertsRemoved": 0,
           "rangeComparisonsFolded": 0,
-          "witnessesRecorded": 18,
+          "witnessesRecorded": 19,
           "witnessesFailed": 0
         }
       },
       "idb": {
         "min": {
-          "bytes": 27669,
-          "gzip9": 9771,
-          "brotli11": 8661,
+          "bytes": 24164,
+          "gzip9": 8842,
+          "brotli11": 7875,
           "tryCount": 36,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "b3185bcb8a8f3f3725af3dd3da27ee9673fc51b153460e70c05371b28f1485a6"
+          "sha256": "ea09d15655369fe83208c3f3d271f8059ec791632ea02e8fdd46ac01b1dcabf3"
         },
         "raw": {
-          "bytes": 20319,
-          "gzip9": 6444,
-          "brotli11": 5616,
+          "bytes": 16269,
+          "gzip9": 5413,
+          "brotli11": 4690,
           "tryCount": 32,
-          "topLevelFns": 71,
+          "topLevelFns": 67,
           "bigintMentions": 0,
-          "sha256": "d579727084be8502df4c03f34d9e6c695373cb55f5a1dd4fad198df8a25ed0f5"
+          "sha256": "13e5b589d0b2531ac53eed9d52759f930f5953b019c0e7bd171dcc7918523a09"
         },
         "lane": {
-          "items": 64,
+          "items": 61,
           "fallbackCount": 0,
           "inlineApplied": 75,
-          "crossObjectInline": 11,
-          "sroaApplied": 45,
-          "reprApplied": 0,
+          "crossObjectInline": 8,
+          "sroaApplied": 48,
+          "reprApplied": 6,
           "sliceIterWouldLower": 0,
           "sliceIterEmitted": 0,
           "rangeAssertsRemoved": 2,
           "rangeComparisonsFolded": 0,
-          "witnessesRecorded": 209,
+          "witnessesRecorded": 210,
           "witnessesFailed": 0
         }
       },
       "idb_lines": {
         "min": {
-          "bytes": 30066,
-          "gzip9": 10541,
-          "brotli11": 9361,
+          "bytes": 26491,
+          "gzip9": 9671,
+          "brotli11": 8568,
           "tryCount": 36,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "5c859d30852dd0df91fd8d92eeb27d15db7715cd51b9def781606faa5790413a"
+          "sha256": "eb497c635a58f1b74552a4d98979485abe524a86f574d908e5e4f236780c28b2"
         },
         "raw": {
-          "bytes": 22799,
-          "gzip9": 7207,
-          "brotli11": 6247,
+          "bytes": 19109,
+          "gzip9": 6328,
+          "brotli11": 5446,
           "tryCount": 32,
-          "topLevelFns": 74,
+          "topLevelFns": 70,
           "bigintMentions": 0,
-          "sha256": "38cf07efb151d391b6ed9f09df7730f647386a8cd463eea02107ced2423bc092"
+          "sha256": "8d4e06e6a3bbb18db9ab625285a92bbd98dae43691907c66576cb97da61db1de"
         },
         "lane": {
-          "items": 67,
+          "items": 64,
           "fallbackCount": 0,
-          "inlineApplied": 71,
-          "crossObjectInline": 11,
-          "sroaApplied": 49,
-          "reprApplied": 0,
+          "inlineApplied": 74,
+          "crossObjectInline": 10,
+          "sroaApplied": 51,
+          "reprApplied": 6,
           "sliceIterWouldLower": 0,
           "sliceIterEmitted": 0,
-          "rangeAssertsRemoved": 3,
+          "rangeAssertsRemoved": 4,
           "rangeComparisonsFolded": 0,
-          "witnessesRecorded": 226,
+          "witnessesRecorded": 225,
           "witnessesFailed": 0
         }
       },
       "ky": {
         "min": {
-          "bytes": 26669,
-          "gzip9": 9542,
-          "brotli11": 8484,
+          "bytes": 27624,
+          "gzip9": 9861,
+          "brotli11": 8787,
           "tryCount": 43,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "56ea1b28bdb7f78dd2e254c57a2b03a5f0ccef8ad70dacdf241909dd548de58f"
+          "sha256": "ab3fb823930fd587af4185ba7dae3e1b5600c9e12a53d6c7b18c64720714eb9e"
         },
         "raw": {
-          "bytes": 18170,
-          "gzip9": 5984,
-          "brotli11": 5211,
+          "bytes": 18193,
+          "gzip9": 6035,
+          "brotli11": 5254,
           "tryCount": 39,
-          "topLevelFns": 65,
+          "topLevelFns": 64,
           "bigintMentions": 0,
-          "sha256": "dc48fb649e015041f0e2ddc5c648508b986f85ea6470041310a2acaffa88cd5e"
+          "sha256": "014817602072edc60ee723659f972095d8970cd02604acf4924b10e169eea1d2"
         },
         "lane": {
-          "items": 59,
+          "items": 58,
           "fallbackCount": 0,
-          "inlineApplied": 77,
-          "crossObjectInline": 22,
-          "sroaApplied": 40,
+          "inlineApplied": 83,
+          "crossObjectInline": 24,
+          "sroaApplied": 42,
           "reprApplied": 7,
           "sliceIterWouldLower": 0,
           "sliceIterEmitted": 0,
           "rangeAssertsRemoved": 21,
           "rangeComparisonsFolded": 0,
-          "witnessesRecorded": 214,
+          "witnessesRecorded": 217,
           "witnessesFailed": 0
         }
       },
       "explorer": {
         "min": {
-          "bytes": 82463,
-          "gzip9": 25730,
-          "brotli11": 22322,
+          "bytes": 82072,
+          "gzip9": 25664,
+          "brotli11": 22217,
           "tryCount": 48,
           "topLevelFns": 0,
           "bigintMentions": 8,
-          "sha256": "86f9045b6b3c259c0a1d561f2a36de30d5b36ea35e53fc6613f972e5ff6f5d1d"
+          "sha256": "629864a52b2e274758d6621d9d17a3c85abffdbde12754b989436bbc6c12c28d"
         },
         "raw": {
-          "bytes": 79715,
-          "gzip9": 23651,
-          "brotli11": 20296,
+          "bytes": 77817,
+          "gzip9": 23251,
+          "brotli11": 19822,
           "tryCount": 44,
-          "topLevelFns": 230,
+          "topLevelFns": 225,
           "bigintMentions": 8,
-          "sha256": "f8499e4ee18b996c5e7662bc8b5f17c4294ae9331c4a252ee17f09185e8b3a26"
+          "sha256": "d785f4a1f213c72da91448bfd006d19b19c8867650127cf9e250346bf029045d"
         },
         "lane": {
-          "items": 221,
+          "items": 216,
           "fallbackCount": 0,
-          "inlineApplied": 242,
-          "crossObjectInline": 35,
-          "sroaApplied": 144,
+          "inlineApplied": 267,
+          "crossObjectInline": 32,
+          "sroaApplied": 146,
           "reprApplied": 2,
-          "sliceIterWouldLower": 0,
-          "sliceIterEmitted": 0,
+          "sliceIterWouldLower": 1,
+          "sliceIterEmitted": 1,
           "rangeAssertsRemoved": 54,
           "rangeComparisonsFolded": 0,
-          "witnessesRecorded": 678,
+          "witnessesRecorded": 700,
           "witnessesFailed": 0
         }
       },
       "workbox": {
         "min": {
-          "bytes": 25484,
-          "gzip9": 8663,
-          "brotli11": 7617,
+          "bytes": 25958,
+          "gzip9": 8804,
+          "brotli11": 7735,
           "tryCount": 51,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "acb0a0eba4a4f07b8ad62b160c2ef74f109a15293768f5b89cd5ed81baa4c328"
+          "sha256": "324366697c649129a2244e532fd3782fd51948cca6777e5a5aa3b5758a63eefe"
         },
         "raw": {
-          "bytes": 19390,
-          "gzip9": 5983,
-          "brotli11": 5071,
+          "bytes": 19398,
+          "gzip9": 5973,
+          "brotli11": 5044,
           "tryCount": 47,
-          "topLevelFns": 57,
+          "topLevelFns": 56,
           "bigintMentions": 0,
-          "sha256": "4fefd4592156f09057bc4771ec0274e3a9c856651b94318573f15e24177c5641"
+          "sha256": "375a37c6211bf80df3bba18e9111c60236a659881df97ec27365186371e147ca"
         },
         "lane": {
-          "items": 52,
+          "items": 51,
           "fallbackCount": 0,
-          "inlineApplied": 75,
+          "inlineApplied": 77,
           "crossObjectInline": 12,
           "sroaApplied": 27,
           "reprApplied": 0,
@@ -507,35 +507,35 @@
           "sliceIterEmitted": 0,
           "rangeAssertsRemoved": 0,
           "rangeComparisonsFolded": 0,
-          "witnessesRecorded": 182,
+          "witnessesRecorded": 184,
           "witnessesFailed": 0
         }
       },
       "workbox_direct": {
         "min": {
-          "bytes": 5125,
-          "gzip9": 2108,
-          "brotli11": 1892,
+          "bytes": 5548,
+          "gzip9": 2258,
+          "brotli11": 2023,
           "tryCount": 0,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "ff950ad2bf2a0062f943b2ea4fff053e0552f26cfc436e7640aa342fa922f09a"
+          "sha256": "e10088e3f052e1e4d410545ab1700f8ce4beb301e78b2fb21549a93c3c96fbb0"
         },
         "raw": {
-          "bytes": 2542,
-          "gzip9": 1103,
-          "brotli11": 943,
+          "bytes": 2525,
+          "gzip9": 1095,
+          "brotli11": 923,
           "tryCount": 0,
           "topLevelFns": 14,
           "bigintMentions": 0,
-          "sha256": "8358d6f346b8ff05d87f97cd431d34648d9aa46a513e30c6e08ea20d9e9175cb"
+          "sha256": "869662ff1aec140e22c40b771e43d3f6fc49b94da9a948a3dc2110508878f126"
         },
         "lane": {
           "items": 13,
           "fallbackCount": 0,
           "inlineApplied": 24,
           "crossObjectInline": 2,
-          "sroaApplied": 13,
+          "sroaApplied": 14,
           "reprApplied": 0,
           "sliceIterWouldLower": 0,
           "sliceIterEmitted": 0,
@@ -553,90 +553,90 @@
             {
               "calibration": {
                 "calls": 16,
-                "milliseconds": 20.879208000000006
+                "milliseconds": 20.13820799999999
               },
               "checksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "coldImportMs": 0.7157920000000004,
+              "coldImportMs": 0.8121249999999982,
               "finalChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "firstCallMs": 5.877834,
+              "firstCallMs": 5.111999999999998,
               "implementation": "rust",
               "iterationsPerSample": 16,
               "key": "rust",
               "label": "R",
               "perCallMs": {
                 "count": 9,
-                "max": 1.380338499999997,
-                "mean": 1.0464730833333329,
-                "min": 0.9634999999999998,
-                "p50": 0.9959895625000001,
-                "p95": 1.380338499999997
+                "max": 1.509703124999998,
+                "mean": 1.0430430972222213,
+                "min": 0.948703124999998,
+                "p50": 0.9708515624999983,
+                "p95": 1.509703124999998
               },
               "rawBytes": 12860,
               "rawChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
               "sampleMs": [
-                16.35375000000002,
-                15.416792000000015,
-                16.509582999999992,
-                15.623125000000016,
-                15.827207999999985,
-                15.935833000000002,
-                15.415999999999997,
-                17.52441699999997,
-                22.085415999999952
+                16.201707999999996,
+                15.380666999999988,
+                15.641665999999987,
+                15.533624999999972,
+                15.482915999999989,
+                15.40020800000002,
+                15.179249999999968,
+                17.222915999999998,
+                24.155249999999967
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 22.085415999999952,
-                "mean": 16.743569333333326,
-                "min": 15.415999999999997,
-                "p50": 15.935833000000002,
-                "p95": 22.085415999999952
+                "max": 24.155249999999967,
+                "mean": 16.68868955555554,
+                "min": 15.179249999999968,
+                "p50": 15.533624999999972,
+                "p95": 24.155249999999967
               },
-              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/experiments/browser-workloads/dist/marked/index.min.js?instance=a"
+              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/marked/index.min.js?instance=a"
             },
             {
               "calibration": {
                 "calls": 32,
-                "milliseconds": 20.201166999999998
+                "milliseconds": 20.077542
               },
               "checksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "coldImportMs": 5.272208000000003,
+              "coldImportMs": 5.198042000000001,
               "finalChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "firstCallMs": 16.19175,
+              "firstCallMs": 15.784167,
               "implementation": "js",
               "iterationsPerSample": 32,
               "key": "js",
               "label": "J",
               "perCallMs": {
                 "count": 9,
-                "max": 0.4937838437500002,
-                "mean": 0.48681163194444427,
-                "min": 0.47749218749999933,
-                "p50": 0.48826040624999933,
-                "p95": 0.4937838437500002
+                "max": 0.4820768124999999,
+                "mean": 0.47797164583333335,
+                "min": 0.4716718750000002,
+                "p50": 0.47770571875000023,
+                "p95": 0.4820768124999999
               },
               "rawBytes": 12860,
               "rawChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
               "sampleMs": [
-                15.703125,
-                15.703082999999992,
-                15.60291699999999,
-                15.801083000000006,
-                15.787083999999993,
-                15.624332999999979,
-                15.414666000000011,
-                15.285708999999997,
-                15.279749999999979
+                15.426457999999997,
+                15.286583000000007,
+                15.241667000000007,
+                15.418834000000004,
+                15.226165999999978,
+                15.369958999999994,
+                15.197125000000028,
+                15.093500000000006,
+                15.395541999999978
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 15.801083000000006,
-                "mean": 15.577972222222217,
-                "min": 15.279749999999979,
-                "p50": 15.624332999999979,
-                "p95": 15.801083000000006
+                "max": 15.426457999999997,
+                "mean": 15.295092666666667,
+                "min": 15.093500000000006,
+                "p50": 15.286583000000007,
+                "p95": 15.426457999999997
               },
-              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/experiments/browser-workloads/reference/marked.mjs"
+              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/reference/marked.mjs"
             }
           ],
           "checksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
@@ -647,7 +647,7 @@
             "crossOriginIsolated": null,
             "node": "v26.8.1",
             "runtime": "node",
-            "timerResolutionMs": 0.0001249999999988205,
+            "timerResolutionMs": 0.00008300000000005525,
             "userAgent": "Node.js/26",
             "v8": "14.6.202.34-node.28"
           },
@@ -659,14 +659,14 @@
           "inputVerified": true,
           "loadAverage": {
             "end": [
-              3.6484375,
-              4.412109375,
-              4.78515625
+              4.48046875,
+              5.033203125,
+              5.50830078125
             ],
             "start": [
-              3.705078125,
-              4.43603515625,
-              4.7958984375
+              4.609375,
+              5.06787109375,
+              5.5234375
             ]
           },
           "minSampleMs": 20,
@@ -684,17 +684,17 @@
           "pair": "rust-vs-js",
           "protocol": 1,
           "ratio": {
-            "min": 2.0178340614211643,
+            "min": 2.011362507039449,
             "of": "rust/js",
-            "p50": 2.0398737021285998,
-            "p95": 2.7954306676320786,
+            "p50": 2.0323214154530107,
+            "p95": 3.1316650912348085,
             "paired": {
               "count": 9,
-              "max": 2.8908085538048702,
-              "mean": 2.152105444712814,
-              "min": 1.9635369691416675,
-              "p50": 2.0398737021285998,
-              "p95": 2.8908085538048702
+              "max": 3.1379538310505732,
+              "mean": 2.1817357177236687,
+              "min": 1.9976475813681784,
+              "p50": 2.03372483920115,
+              "p95": 3.1379538310505732
             }
           },
           "samples": 9,
@@ -708,91 +708,91 @@
           "arms": [
             {
               "calibration": {
-                "calls": 16,
-                "milliseconds": 20.707583
+                "calls": 17,
+                "milliseconds": 20.894374999999997
               },
               "checksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "coldImportMs": 0.5077499999999979,
+              "coldImportMs": 0.5133749999999999,
               "finalChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "firstCallMs": 5.294291999999999,
+              "firstCallMs": 5.097000000000001,
               "implementation": "rust",
-              "iterationsPerSample": 16,
+              "iterationsPerSample": 17,
               "key": "rust-a",
               "label": "A",
               "perCallMs": {
                 "count": 9,
-                "max": 1.0475104375000015,
-                "mean": 1.0143689305555557,
-                "min": 0.9967578125000003,
-                "p50": 1.0077369999999988,
-                "p95": 1.0475104375000015
+                "max": 1.137375,
+                "mean": 1.0063455882352943,
+                "min": 0.9653039411764707,
+                "p50": 0.985951,
+                "p95": 1.137375
               },
               "rawBytes": 12860,
               "rawChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
               "sampleMs": [
-                16.06245800000002,
-                16.251291999999978,
-                15.948125000000005,
-                16.34508299999999,
-                16.760167000000024,
-                16.08449999999999,
-                16.12379199999998,
-                16.422667000000047,
-                16.071041999999977
+                19.335375,
+                16.761167,
+                16.608790999999997,
+                17.32766699999999,
+                17.501374999999996,
+                17.060292000000004,
+                16.545915999999977,
+                16.410167,
+                16.42012500000004
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 16.760167000000024,
-                "mean": 16.22990288888889,
-                "min": 15.948125000000005,
-                "p50": 16.12379199999998,
-                "p95": 16.760167000000024
+                "max": 19.335375,
+                "mean": 17.107875,
+                "min": 16.410167,
+                "p50": 16.761167,
+                "p95": 19.335375
               },
-              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/experiments/browser-workloads/dist/marked/index.min.js?instance=a"
+              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/marked/index.min.js?instance=a"
             },
             {
               "calibration": {
                 "calls": 16,
-                "milliseconds": 20.932000000000002
+                "milliseconds": 20.917417000000004
               },
               "checksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "coldImportMs": 0.8980420000000002,
+              "coldImportMs": 0.7350829999999995,
               "finalChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "firstCallMs": 4.757334,
+              "firstCallMs": 4.541458000000002,
               "implementation": "rust",
               "iterationsPerSample": 16,
               "key": "rust-b",
               "label": "B",
               "perCallMs": {
                 "count": 9,
-                "max": 1.0281379999999984,
-                "mean": 1.0082436458333333,
-                "min": 0.9930963750000004,
-                "p50": 1.0099140625000018,
-                "p95": 1.0281379999999984
+                "max": 1.0651301874999994,
+                "mean": 0.9999837986111112,
+                "min": 0.9642474375000027,
+                "p50": 0.9883593749999982,
+                "p95": 1.0651301874999994
               },
               "rawBytes": 12860,
               "rawChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
               "sampleMs": [
-                15.894292000000007,
-                16.30683400000001,
-                15.889542000000006,
-                16.35058399999997,
-                16.450207999999975,
-                16.15862500000003,
-                15.947749999999985,
-                15.998749999999973,
-                16.190500000000043
+                17.04208299999999,
+                15.737749999999977,
+                15.490999999999985,
+                15.81374999999997,
+                16.60316700000004,
+                16.388874999999985,
+                15.934708,
+                15.558375000000012,
+                15.427959000000044
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 16.450207999999975,
-                "mean": 16.131898333333332,
-                "min": 15.889542000000006,
-                "p50": 16.15862500000003,
-                "p95": 16.450207999999975
+                "max": 17.04208299999999,
+                "mean": 15.99974077777778,
+                "min": 15.427959000000044,
+                "p50": 15.81374999999997,
+                "p95": 17.04208299999999
               },
-              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/experiments/browser-workloads/dist/marked/index.min.js?instance=b"
+              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/marked/index.min.js?instance=b"
             }
           ],
           "checksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
@@ -803,7 +803,7 @@
             "crossOriginIsolated": null,
             "node": "v26.8.1",
             "runtime": "node",
-            "timerResolutionMs": 0.0001249999999988205,
+            "timerResolutionMs": 0.00012500000000059686,
             "userAgent": "Node.js/26",
             "v8": "14.6.202.34-node.28"
           },
@@ -815,14 +815,14 @@
           "inputVerified": true,
           "loadAverage": {
             "end": [
-              3.6484375,
-              4.412109375,
-              4.78515625
+              4.48046875,
+              5.033203125,
+              5.50830078125
             ],
             "start": [
-              3.6484375,
-              4.412109375,
-              4.78515625
+              4.48046875,
+              5.033203125,
+              5.50830078125
             ]
           },
           "minSampleMs": 20,
@@ -840,22 +840,22 @@
           "pair": "rust-vs-rust",
           "protocol": 1,
           "ratio": {
-            "min": 1.0036868904087983,
+            "min": 1.0010956769345503,
             "of": "rust-a/rust-b",
-            "p50": 0.9978443091537771,
-            "p95": 1.0188422541526556,
+            "p50": 0.9975632598213598,
+            "p95": 1.0678272133752669,
             "paired": {
               "count": 9,
-              "max": 1.0264968825689553,
-              "mean": 1.0061040965060066,
-              "min": 0.9926217226151097,
-              "p50": 1.0036868904087983,
-              "p95": 1.0264968825689553
+              "max": 1.0678272133752669,
+              "mean": 1.0060098016938823,
+              "min": 0.9772772004061442,
+              "p50": 1.001703160743274,
+              "p95": 1.0678272133752669
             }
           },
           "samples": 9,
           "seed": 1384348684,
-          "sink": 4938240,
+          "sink": 5092560,
           "status": "ok",
           "warmups": 2,
           "workload": "marked"
@@ -864,91 +864,91 @@
           "arms": [
             {
               "calibration": {
-                "calls": 56,
-                "milliseconds": 20.390375
+                "calls": 65,
+                "milliseconds": 20.200625000000002
               },
               "checksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "coldImportMs": 1.1784159999999986,
+              "coldImportMs": 1.0126250000000017,
               "finalChecksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "firstCallMs": 3.0123330000000017,
+              "firstCallMs": 2.7634159999999994,
               "implementation": "rust",
-              "iterationsPerSample": 55,
+              "iterationsPerSample": 65,
               "key": "rust",
               "label": "R",
               "perCallMs": {
                 "count": 9,
-                "max": 0.2764409090909091,
-                "mean": 0.24870967878787884,
-                "min": 0.229742418181818,
-                "p50": 0.2461151454545457,
-                "p95": 0.2764409090909091
+                "max": 0.35333141538461543,
+                "mean": 0.29968062735042733,
+                "min": 0.22724678461538456,
+                "p50": 0.28923846153846156,
+                "p95": 0.35333141538461543
               },
               "rawBytes": 61,
               "rawChecksum": "sha256:c0bb55e1c7d8e2c943ca06123dfff2c36685dcd82e9d4cea426b95764f635191",
               "sampleMs": [
-                14.213375000000013,
-                13.946958999999993,
-                12.934958000000023,
-                13.536333000000013,
-                13.527625000000029,
-                13.044375000000002,
-                14.067582999999956,
-                12.635832999999991,
-                15.204250000000002
+                14.771040999999997,
+                22.63537500000001,
+                18.177333000000004,
+                22.052291999999994,
+                15.311416999999949,
+                22.966542000000004,
+                17.81925000000001,
+                18.8005,
+                22.779417000000024
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 15.204250000000002,
-                "mean": 13.679032333333335,
-                "min": 12.635832999999991,
-                "p50": 13.536333000000013,
-                "p95": 15.204250000000002
+                "max": 22.966542000000004,
+                "mean": 19.479240777777775,
+                "min": 14.771040999999997,
+                "p50": 18.8005,
+                "p95": 22.966542000000004
               },
-              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/experiments/browser-workloads/dist/minisearch/index.min.js?instance=a"
+              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/minisearch/index.min.js?instance=a"
             },
             {
               "calibration": {
-                "calls": 649,
-                "milliseconds": 20.001584
+                "calls": 670,
+                "milliseconds": 20.014125
               },
               "checksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "coldImportMs": 1.1770830000000032,
+              "coldImportMs": 0.923209,
               "finalChecksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "firstCallMs": 0.9366249999999994,
+              "firstCallMs": 0.8571249999999999,
               "implementation": "js",
-              "iterationsPerSample": 649,
+              "iterationsPerSample": 670,
               "key": "js",
               "label": "J",
               "perCallMs": {
                 "count": 9,
-                "max": 0.04301662865947611,
-                "mean": 0.025148619243280254,
-                "min": 0.02189015100154082,
-                "p50": 0.023179762711864366,
-                "p95": 0.04301662865947611
+                "max": 0.023740797014925395,
+                "mean": 0.022776561857379782,
+                "min": 0.021768159701492488,
+                "p50": 0.02285995074626867,
+                "p95": 0.023740797014925395
               },
               "rawBytes": 265,
               "rawChecksum": "sha256:3d3ae7e42b27042b48bc8d71305029c0fcc944790792611ebcbd0f397a517300",
               "sampleMs": [
-                15.575417000000002,
-                14.747666999999979,
-                27.91779199999999,
-                15.043665999999973,
-                15.11420899999996,
-                14.369334000000038,
-                14.863875000000007,
-                14.206707999999992,
-                15.054417
+                15.906334000000015,
+                15.76916700000001,
+                14.913207999999997,
+                15.247875000000022,
+                15.598500000000001,
+                14.633250000000032,
+                15.316167000000007,
+                14.584666999999968,
+                15.373500000000035
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 27.91779199999999,
-                "mean": 16.321453888888882,
-                "min": 14.206707999999992,
-                "p50": 15.043665999999973,
-                "p95": 27.91779199999999
+                "max": 15.906334000000015,
+                "mean": 15.260296444444455,
+                "min": 14.584666999999968,
+                "p50": 15.316167000000007,
+                "p95": 15.906334000000015
               },
-              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/experiments/browser-workloads/reference/minisearch.mjs"
+              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/reference/minisearch.mjs"
             }
           ],
           "checksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
@@ -959,7 +959,7 @@
             "crossOriginIsolated": null,
             "node": "v26.8.1",
             "runtime": "node",
-            "timerResolutionMs": 0.0001249999999988205,
+            "timerResolutionMs": 0.00008300000000005525,
             "userAgent": "Node.js/26",
             "v8": "14.6.202.34-node.28"
           },
@@ -971,14 +971,14 @@
           "inputVerified": true,
           "loadAverage": {
             "end": [
-              3.6484375,
-              4.412109375,
-              4.78515625
+              4.48046875,
+              5.033203125,
+              5.50830078125
             ],
             "start": [
-              3.6484375,
-              4.412109375,
-              4.78515625
+              4.48046875,
+              5.033203125,
+              5.50830078125
             ]
           },
           "minSampleMs": 20,
@@ -996,22 +996,22 @@
           "pair": "rust-vs-js",
           "protocol": 1,
           "ratio": {
-            "min": 10.495241360630484,
+            "min": 10.43941186262998,
             "of": "rust/js",
-            "p50": 10.617673205454071,
-            "p95": 6.42637318882525,
+            "p50": 12.652628378286105,
+            "p95": 14.882879254747959,
             "paired": {
               "count": 9,
-              "max": 11.917442568516602,
-              "mean": 10.31845903716033,
-              "min": 5.467212607644627,
-              "p50": 10.711952620768619,
-              "p95": 11.917442568516602
+              "max": 16.17768085064438,
+              "mean": 13.187507856823357,
+              "min": 9.571994759591211,
+              "p50": 13.287226182865174,
+              "p95": 16.17768085064438
             }
           },
           "samples": 9,
           "seed": 2028689212,
-          "sink": 2104141,
+          "sink": 2178180,
           "status": "ok",
           "warmups": 2,
           "workload": "minisearch"
@@ -1020,91 +1020,91 @@
           "arms": [
             {
               "calibration": {
-                "calls": 57,
-                "milliseconds": 20.050292000000002
+                "calls": 65,
+                "milliseconds": 20.257583000000004
               },
               "checksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "coldImportMs": 0.7177500000000023,
+              "coldImportMs": 0.7762499999999992,
               "finalChecksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "firstCallMs": 2.874500000000001,
+              "firstCallMs": 2.987833000000002,
               "implementation": "rust",
-              "iterationsPerSample": 57,
+              "iterationsPerSample": 65,
               "key": "rust-a",
               "label": "A",
               "perCallMs": {
                 "count": 9,
-                "max": 0.32642470175438665,
-                "mean": 0.2613086393762184,
-                "min": 0.2276725087719301,
-                "p50": 0.26034649122806985,
-                "p95": 0.32642470175438665
+                "max": 0.3689608923076924,
+                "mean": 0.28558055213675215,
+                "min": 0.22986089230769222,
+                "p50": 0.2720589692307691,
+                "p95": 0.3689608923076924
               },
               "rawBytes": 61,
               "rawChecksum": "sha256:c0bb55e1c7d8e2c943ca06123dfff2c36685dcd82e9d4cea426b95764f635191",
               "sampleMs": [
-                15.683791999999983,
-                12.977333000000016,
-                14.097000000000008,
-                14.063042000000024,
-                14.839749999999981,
-                13.036749999999984,
-                15.717540999999983,
-                18.606208000000038,
-                15.029916000000014
+                14.940957999999995,
+                15.918041000000017,
+                15.195917000000009,
+                23.98245800000001,
+                17.683832999999993,
+                17.42012500000004,
+                19.649624999999958,
+                22.575666000000012,
+                19.69799999999998
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 18.606208000000038,
-                "mean": 14.894592444444449,
-                "min": 12.977333000000016,
-                "p50": 14.839749999999981,
-                "p95": 18.606208000000038
+                "max": 23.98245800000001,
+                "mean": 18.56273588888889,
+                "min": 14.940957999999995,
+                "p50": 17.683832999999993,
+                "p95": 23.98245800000001
               },
-              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/experiments/browser-workloads/dist/minisearch/index.min.js?instance=a"
+              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/minisearch/index.min.js?instance=a"
             },
             {
               "calibration": {
-                "calls": 58,
-                "milliseconds": 20.139207999999996
+                "calls": 67,
+                "milliseconds": 20.147292
               },
               "checksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "coldImportMs": 1.0443750000000005,
+              "coldImportMs": 0.9546659999999996,
               "finalChecksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "firstCallMs": 2.947291,
+              "firstCallMs": 2.4282499999999985,
               "implementation": "rust",
-              "iterationsPerSample": 58,
+              "iterationsPerSample": 67,
               "key": "rust-b",
               "label": "B",
               "perCallMs": {
                 "count": 9,
-                "max": 0.2698786034482751,
-                "mean": 0.24759219540229882,
-                "min": 0.22117096551724116,
-                "p50": 0.2411336206896551,
-                "p95": 0.2698786034482751
+                "max": 0.24257586567164202,
+                "mean": 0.2278034792703152,
+                "min": 0.2042344477611944,
+                "p50": 0.2281405373134328,
+                "p95": 0.24257586567164202
               },
               "rawBytes": 61,
               "rawChecksum": "sha256:c0bb55e1c7d8e2c943ca06123dfff2c36685dcd82e9d4cea426b95764f635191",
               "sampleMs": [
-                13.786292000000003,
-                13.819582999999994,
-                13.298417,
-                15.566917000000018,
-                12.827915999999988,
-                13.985749999999996,
-                14.711999999999989,
-                15.59329200000002,
-                15.652958999999953
+                14.466167000000013,
+                14.828292000000005,
+                16.225791000000015,
+                14.640458000000024,
+                13.683708000000024,
+                15.285415999999998,
+                15.854457999999966,
+                16.252583000000016,
+                16.128625
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 15.652958999999953,
-                "mean": 14.36034733333333,
-                "min": 12.827915999999988,
-                "p50": 13.985749999999996,
-                "p95": 15.652958999999953
+                "max": 16.252583000000016,
+                "mean": 15.262833111111117,
+                "min": 13.683708000000024,
+                "p50": 15.285415999999998,
+                "p95": 16.252583000000016
               },
-              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/experiments/browser-workloads/dist/minisearch/index.min.js?instance=b"
+              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/minisearch/index.min.js?instance=b"
             }
           ],
           "checksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
@@ -1127,14 +1127,14 @@
           "inputVerified": true,
           "loadAverage": {
             "end": [
-              3.6484375,
-              4.412109375,
-              4.78515625
+              4.48046875,
+              5.033203125,
+              5.50830078125
             ],
             "start": [
-              3.6484375,
-              4.412109375,
-              4.78515625
+              4.48046875,
+              5.033203125,
+              5.50830078125
             ]
           },
           "minSampleMs": 20,
@@ -1152,22 +1152,22 @@
           "pair": "rust-vs-rust",
           "protocol": 1,
           "ratio": {
-            "min": 1.0293960070187518,
+            "min": 1.1254756228805343,
             "of": "rust-a/rust-b",
-            "p50": 1.0796772780314288,
-            "p95": 1.209524199338571,
+            "p50": 1.192506042260252,
+            "p95": 1.5210123698254836,
             "paired": {
               "count": 9,
-              "max": 1.214152386920889,
-              "mean": 1.0572140190260595,
-              "min": 0.9192418791137467,
-              "p50": 1.07864836765712,
-              "p95": 1.214152386920889
+              "max": 1.6884977085153587,
+              "mean": 1.2555516757385359,
+              "min": 0.9653448437073466,
+              "p50": 1.2588855099360476,
+              "p95": 1.6884977085153587
             }
           },
           "samples": 9,
           "seed": 3302953305,
-          "sink": 84180,
+          "sink": 96624,
           "status": "ok",
           "warmups": 2,
           "workload": "minisearch"
@@ -1176,91 +1176,91 @@
           "arms": [
             {
               "calibration": {
-                "calls": 16,
-                "milliseconds": 20.591291000000002
+                "calls": 23,
+                "milliseconds": 20.252792
               },
               "checksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "coldImportMs": 0.5096249999999998,
+              "coldImportMs": 0.5200000000000031,
               "finalChecksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "firstCallMs": 3.8908330000000007,
+              "firstCallMs": 2.6069579999999988,
               "implementation": "rust",
-              "iterationsPerSample": 16,
+              "iterationsPerSample": 23,
               "key": "rust",
               "label": "R",
               "perCallMs": {
                 "count": 9,
-                "max": 0.7537812499999994,
-                "mean": 0.654995069444444,
-                "min": 0.5984426875000004,
-                "p50": 0.6422447499999997,
-                "p95": 0.7537812499999994
+                "max": 0.6284383913043464,
+                "mean": 0.6008582801932367,
+                "min": 0.5707681304347827,
+                "p50": 0.6012046956521752,
+                "p95": 0.6284383913043464
               },
               "rawBytes": 61287,
               "rawChecksum": "sha256:d752557f5755aec3e4799d433ef3918ac246af63fe8f2943136f1acf90310df1",
               "sampleMs": [
-                10.920083000000005,
-                9.575083000000006,
-                10.275915999999995,
-                10.135207999999977,
-                9.66945800000002,
-                9.743166999999971,
-                12.06049999999999,
-                10.573874999999987,
-                11.365999999999985
+                13.623165999999998,
+                13.431125000000009,
+                13.553832999999997,
+                13.127667000000002,
+                13.82770800000003,
+                13.950958000000014,
+                14.129665999999986,
+                14.454082999999969,
+                14.279457999999977
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 12.06049999999999,
-                "mean": 10.479921111111103,
-                "min": 9.575083000000006,
-                "p50": 10.275915999999995,
-                "p95": 12.06049999999999
+                "max": 14.454082999999969,
+                "mean": 13.819740444444442,
+                "min": 13.127667000000002,
+                "p50": 13.82770800000003,
+                "p95": 14.454082999999969
               },
-              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/experiments/browser-workloads/dist/fflate/index.min.js?instance=a"
+              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/fflate/index.min.js?instance=a"
             },
             {
               "calibration": {
-                "calls": 123,
-                "milliseconds": 20.020916999999997
+                "calls": 129,
+                "milliseconds": 20.049625
               },
               "checksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "coldImportMs": 2.1712919999999993,
+              "coldImportMs": 2.4465830000000004,
               "finalChecksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "firstCallMs": 0.6757500000000007,
+              "firstCallMs": 0.6929580000000009,
               "implementation": "js",
-              "iterationsPerSample": 123,
+              "iterationsPerSample": 129,
               "key": "js",
               "label": "J",
               "perCallMs": {
                 "count": 9,
-                "max": 0.19102811382113835,
-                "mean": 0.184058078590786,
-                "min": 0.14975237398373978,
-                "p50": 0.18874728455284548,
-                "p95": 0.19102811382113835
+                "max": 0.20007590697674432,
+                "mean": 0.18504313867355726,
+                "min": 0.14514599999999986,
+                "p50": 0.18803972868217034,
+                "p95": 0.20007590697674432
               },
               "rawBytes": 61287,
               "rawChecksum": "sha256:2dc154433ce5b74455925796807a8077a451eef1291f5e234d4c6e7cdb5e44f3",
               "sampleMs": [
-                18.419541999999993,
-                22.54441700000001,
-                23.397209000000004,
-                23.232917000000015,
-                23.215915999999993,
-                23.355792000000008,
-                23.161958000000027,
-                22.928084000000013,
-                23.49645800000002
+                18.723833999999982,
+                24.257124999999974,
+                24.598041999999992,
+                24.255957999999964,
+                24.131500000000017,
+                24.47954199999998,
+                24.374124999999992,
+                24.20516600000002,
+                25.809792000000016
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 23.49645800000002,
-                "mean": 22.639143666666676,
-                "min": 18.419541999999993,
-                "p50": 23.215915999999993,
-                "p95": 23.49645800000002
+                "max": 25.809792000000016,
+                "mean": 23.870564888888882,
+                "min": 18.723833999999982,
+                "p50": 24.257124999999974,
+                "p95": 25.809792000000016
               },
-              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/experiments/browser-workloads/reference/fflate.mjs"
+              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/reference/fflate.mjs"
             }
           ],
           "checksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
@@ -1271,7 +1271,7 @@
             "crossOriginIsolated": null,
             "node": "v26.8.1",
             "runtime": "node",
-            "timerResolutionMs": 0.00012500000000059686,
+            "timerResolutionMs": 0.0001249999999988205,
             "userAgent": "Node.js/26",
             "v8": "14.6.202.34-node.28"
           },
@@ -1283,14 +1283,14 @@
           "inputVerified": true,
           "loadAverage": {
             "end": [
-              3.6484375,
-              4.412109375,
-              4.78515625
+              4.48046875,
+              5.033203125,
+              5.50830078125
             ],
             "start": [
-              3.6484375,
-              4.412109375,
-              4.78515625
+              4.48046875,
+              5.033203125,
+              5.50830078125
             ]
           },
           "minSampleMs": 20,
@@ -1308,22 +1308,22 @@
           "pair": "rust-vs-js",
           "protocol": 1,
           "ratio": {
-            "min": 3.9962150287178737,
+            "min": 3.9323724417812636,
             "of": "rust/js",
-            "p50": 3.402670144481914,
-            "p95": 3.9459178804737234,
+            "p50": 3.1972216715348862,
+            "p95": 3.1409998375136317,
             "paired": {
               "count": 9,
-              "max": 4.557558383509214,
-              "mean": 3.580911501465615,
-              "min": 3.201853348151336,
-              "p50": 3.3763045947061445,
-              "p95": 4.557558383509214
+              "max": 4.0807984044850825,
+              "mean": 3.269578054493374,
+              "min": 3.0355052901265362,
+              "p50": 3.196411006311352,
+              "p95": 4.0807984044850825
             }
           },
           "samples": 9,
           "seed": 1319426053,
-          "sink": 102226716,
+          "sink": 111787488,
           "status": "ok",
           "warmups": 2,
           "workload": "fflate"
@@ -1332,91 +1332,91 @@
           "arms": [
             {
               "calibration": {
-                "calls": 16,
-                "milliseconds": 20.328249999999997
+                "calls": 24,
+                "milliseconds": 20.355375000000002
               },
               "checksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "coldImportMs": 0.6065830000000005,
+              "coldImportMs": 0.5857080000000003,
               "finalChecksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "firstCallMs": 3.9798329999999993,
+              "firstCallMs": 2.8034580000000027,
               "implementation": "rust",
-              "iterationsPerSample": 16,
+              "iterationsPerSample": 24,
               "key": "rust-a",
               "label": "A",
               "perCallMs": {
                 "count": 9,
-                "max": 0.6309323125000006,
-                "mean": 0.6017983263888893,
-                "min": 0.5807942500000003,
-                "p50": 0.5953828125000005,
-                "p95": 0.6309323125000006
+                "max": 0.612208333333335,
+                "mean": 0.5854886157407406,
+                "min": 0.5729670416666673,
+                "p50": 0.5791510416666649,
+                "p95": 0.612208333333335
               },
               "rawBytes": 61287,
               "rawChecksum": "sha256:d752557f5755aec3e4799d433ef3918ac246af63fe8f2943136f1acf90310df1",
               "sampleMs": [
-                9.644208000000006,
-                9.974542000000014,
-                10.09491700000001,
-                9.819209,
-                9.526125000000008,
-                9.292708000000005,
-                9.466416999999979,
-                9.444542000000013,
-                9.39629100000002
+                13.980207999999976,
+                13.814999999999998,
+                14.190583000000004,
+                13.884832999999986,
+                13.89833299999998,
+                13.751209000000017,
+                14.69300000000004,
+                14.352750000000015,
+                13.899624999999958
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 10.09491700000001,
-                "mean": 9.628773222222229,
-                "min": 9.292708000000005,
-                "p50": 9.526125000000008,
-                "p95": 10.09491700000001
+                "max": 14.69300000000004,
+                "mean": 14.051726777777775,
+                "min": 13.751209000000017,
+                "p50": 13.899624999999958,
+                "p95": 14.69300000000004
               },
-              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/experiments/browser-workloads/dist/fflate/index.min.js?instance=a"
+              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/fflate/index.min.js?instance=a"
             },
             {
               "calibration": {
-                "calls": 16,
-                "milliseconds": 20.838583000000003
+                "calls": 24,
+                "milliseconds": 20.185292
               },
               "checksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "coldImportMs": 0.3739170000000023,
+              "coldImportMs": 0.31662500000000193,
               "finalChecksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "firstCallMs": 3.1067500000000017,
+              "firstCallMs": 2.9865829999999995,
               "implementation": "rust",
-              "iterationsPerSample": 16,
+              "iterationsPerSample": 24,
               "key": "rust-b",
               "label": "B",
               "perCallMs": {
                 "count": 9,
-                "max": 0.76376825,
-                "mean": 0.6187034166666673,
-                "min": 0.5733176875000012,
-                "p50": 0.5827083750000028,
-                "p95": 0.76376825
+                "max": 0.6108090000000009,
+                "mean": 0.5793719074074077,
+                "min": 0.5667465416666673,
+                "p50": 0.5745537916666675,
+                "p95": 0.6108090000000009
               },
               "rawBytes": 61287,
               "rawChecksum": "sha256:d752557f5755aec3e4799d433ef3918ac246af63fe8f2943136f1acf90310df1",
               "sampleMs": [
-                9.272790999999998,
-                9.977000000000004,
-                9.904541999999992,
-                10.736667000000011,
-                12.220292,
-                9.223666000000009,
-                9.261917000000011,
-                9.17308300000002,
-                9.323334000000045
+                13.728749999999991,
+                13.78929100000002,
+                14.008582999999987,
+                13.641791000000012,
+                13.937333999999993,
+                13.601917000000014,
+                14.659416000000022,
+                14.043375000000026,
+                13.733875000000012
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 12.220292,
-                "mean": 9.899254666666677,
-                "min": 9.17308300000002,
-                "p50": 9.323334000000045,
-                "p95": 12.220292
+                "max": 14.659416000000022,
+                "mean": 13.904925777777786,
+                "min": 13.601917000000014,
+                "p50": 13.78929100000002,
+                "p95": 14.659416000000022
               },
-              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/next-gen-qualify/experiments/browser-workloads/dist/fflate/index.min.js?instance=b"
+              "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/fflate/index.min.js?instance=b"
             }
           ],
           "checksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
@@ -1427,7 +1427,7 @@
             "crossOriginIsolated": null,
             "node": "v26.8.1",
             "runtime": "node",
-            "timerResolutionMs": 0.0001249999999988205,
+            "timerResolutionMs": 0.00008300000000005525,
             "userAgent": "Node.js/26",
             "v8": "14.6.202.34-node.28"
           },
@@ -1439,14 +1439,14 @@
           "inputVerified": true,
           "loadAverage": {
             "end": [
-              3.6484375,
-              4.412109375,
-              4.78515625
+              4.48046875,
+              5.033203125,
+              5.50830078125
             ],
             "start": [
-              3.6484375,
-              4.412109375,
-              4.78515625
+              4.48046875,
+              5.033203125,
+              5.50830078125
             ]
           },
           "minSampleMs": 20,
@@ -1464,22 +1464,22 @@
           "pair": "rust-vs-rust",
           "protocol": 1,
           "ratio": {
-            "min": 1.0130408718639072,
+            "min": 1.0109758058367804,
             "of": "rust-a/rust-b",
-            "p50": 1.0217509101357907,
-            "p95": 0.826078214824982,
+            "p50": 1.0080014266143151,
+            "p95": 1.0022909507445603,
             "paired": {
               "count": 9,
-              "max": 1.0400544992332954,
-              "mean": 0.9800105231503857,
-              "min": 0.7795333368466161,
-              "p50": 1.0078252050178589,
-              "p95": 1.0400544992332954
+              "max": 1.0220299607466146,
+              "mean": 1.0106173008845685,
+              "min": 0.9972016886443266,
+              "p50": 1.012068698746708,
+              "p95": 1.0220299607466146
             }
           },
           "samples": 9,
           "seed": 335142564,
-          "sink": 23534208,
+          "sink": 35301312,
           "status": "ok",
           "warmups": 2,
           "workload": "fflate"
@@ -1496,73 +1496,89 @@
     },
     "timingSummary": {
       "marked": {
-        "initialAaRatio": 0.9978443091537771,
-        "initialRustJsRatio": 2.0398737021285998,
-        "finalAaRatio": 0.9978443091537771,
-        "finalRustJsRatio": 2.0398737021285998,
+        "initialAaRatio": 0.9975632598213598,
+        "initialRustJsRatio": 2.0323214154530107,
+        "finalAaRatio": 0.9975632598213598,
+        "finalRustJsRatio": 2.0323214154530107,
         "aaWithinGate": true,
         "retryCount": 0
       },
       "minisearch": {
-        "initialAaRatio": 1.0796772780314288,
-        "initialRustJsRatio": 10.617673205454071,
-        "finalAaRatio": 1.0796772780314288,
-        "finalRustJsRatio": 10.617673205454071,
-        "aaWithinGate": true,
-        "retryCount": 0
+        "initialAaRatio": 1.192506042260252,
+        "initialRustJsRatio": 12.652628378286105,
+        "finalAaRatio": 1.192506042260252,
+        "finalRustJsRatio": 12.652628378286105,
+        "aaWithinGate": false,
+        "retryCount": 3
       },
       "fflate": {
-        "initialAaRatio": 1.0217509101357907,
-        "initialRustJsRatio": 3.402670144481914,
-        "finalAaRatio": 1.0217509101357907,
-        "finalRustJsRatio": 3.402670144481914,
+        "initialAaRatio": 1.0080014266143151,
+        "initialRustJsRatio": 3.1972216715348862,
+        "finalAaRatio": 1.0080014266143151,
+        "finalRustJsRatio": 3.1972216715348862,
         "aaWithinGate": true,
         "retryCount": 0
       }
     },
     "timingRetries": {
       "marked": [],
-      "minisearch": [],
+      "minisearch": [
+        {
+          "attempt": 1,
+          "aaRatioP50": 1.363540035640303,
+          "rustJsRatioP50": 10.535126182723216
+        },
+        {
+          "attempt": 2,
+          "aaRatioP50": 0.7600363905146641,
+          "rustJsRatioP50": 10.034597974601658
+        },
+        {
+          "attempt": 3,
+          "aaRatioP50": 0.7370700223920045,
+          "rustJsRatioP50": 11.845225211714192
+        }
+      ],
       "fflate": []
     }
   },
   "kernels": {
     "artifacts": {
       "rawProgram": {
-        "bytes": 19936,
-        "gzip9": 7388,
-        "brotli11": 6044,
+        "bytes": 14772,
+        "gzip9": 6481,
+        "brotli11": 5443,
         "tryCount": 0,
-        "topLevelFns": 45,
+        "topLevelFns": 38,
         "bigintMentions": 0,
-        "sha256": "283ff7a569ecbacd24e80a7b010ed37747c8d719cc058c9c1c0908ca88ad1168"
+        "sha256": "0101252b22960b11e935d37009a7dcdf84a542f9c01a16355144440631b99f7a"
       },
       "minimalRuntime": {
-        "bytes": 25385,
-        "gzip9": 6827,
-        "brotli11": 6040,
+        "bytes": 27337,
+        "gzip9": 7228,
+        "brotli11": 6391,
         "tryCount": 0,
-        "topLevelFns": 2,
+        "topLevelFns": 3,
         "bigintMentions": 0,
-        "sha256": "9e61c65ef5a1534d7d381723fd665176d53a9f65cd9c09de391fbb8372c9172f"
+        "sha256": "4dcb8dbddda2a57cc4f0d91137362096da58fce9d7eb191947c69c5d7053f5f0"
       },
       "minimalRuntimeEsm": {
-        "bytes": 25025,
-        "gzip9": 7087,
-        "brotli11": 6261,
+        "bytes": 26965,
+        "gzip9": 7490,
+        "brotli11": 6619,
         "tryCount": 0,
-        "topLevelFns": 2,
+        "topLevelFns": 3,
         "bigintMentions": 0,
-        "sha256": "9c0cc337a66d8aeaf118d71c5253577fbda1ef8ebce280835a142d8a4effeea5"
+        "sha256": "6bd416bb0b2986929569488747871c5e8c4eefbdb0485be43b9e3b79c95c5bc3"
       },
       "minifiedBundleWithMinimalShim": {
-        "bytes": 31257,
-        "gzip9": 10896,
-        "brotli11": 9271,
+        "bytes": 27401,
+        "gzip9": 10343,
+        "brotli11": 8846,
         "tryCount": 0,
         "topLevelFns": 0,
         "bigintMentions": 0,
-        "sha256": "998908d162a2c91255b7204b3d65801bf4741d28d390794243b8922a8d07f91e"
+        "sha256": "49e85732b7a253f10b05a5025914d93b23ef33134842005f117bcea45af00c46"
       },
       "zeroBigIntInProgram": true,
       "crcTableHoistedAtTopLevel": true
@@ -1572,45 +1588,45 @@
       "v8Baseline": {
         "ok": true,
         "value": 3914845223,
-        "perRound": 54,
-        "medianUs": 242.762,
-        "p10Us": 239.073,
-        "minUs": 238.439,
-        "maxUs": 246.762,
-        "sink": -380122073
+        "perRound": 55,
+        "medianUs": 243.383,
+        "p10Us": 240.508,
+        "minUs": 240.391,
+        "maxUs": 245.208,
+        "sink": 0
       },
       "v8Opt": {
         "ok": true,
         "value": 3914845223,
-        "perRound": 929,
-        "medianUs": 15.598,
-        "p10Us": 15.47,
-        "minUs": 15.455,
-        "maxUs": 15.802,
-        "sink": -380122073
+        "perRound": 1173,
+        "medianUs": 12.308,
+        "p10Us": 12.207,
+        "minUs": 12.159,
+        "maxUs": 13.024,
+        "sink": 0
       },
-      "v8SpeedupMedian": 15.56,
+      "v8SpeedupMedian": 19.77,
       "jscBaseline": {
         "ok": true,
         "value": 3914845223,
-        "perRound": 38,
-        "medianUs": 351.71,
-        "p10Us": 344.238,
-        "minUs": 341.925,
-        "maxUs": 360.422,
-        "sink": 0
+        "perRound": 36,
+        "medianUs": 348.802,
+        "p10Us": 346.388,
+        "minUs": 344.469,
+        "maxUs": 360.758,
+        "sink": -380122073
       },
       "jscOpt": {
         "ok": true,
         "value": 3914845223,
-        "perRound": 748,
-        "medianUs": 9.008,
-        "p10Us": 8.13,
-        "minUs": 8.096,
-        "maxUs": 10.262,
+        "perRound": 1126,
+        "medianUs": 7.1,
+        "p10Us": 6.691,
+        "minUs": 6.667,
+        "maxUs": 8.194,
         "sink": -380122073
       },
-      "jscSpeedupMedian": 39.04
+      "jscSpeedupMedian": 49.13
     },
     "crc32_table_8192": {
       "value": 4234064631,
@@ -1618,44 +1634,44 @@
         "ok": true,
         "value": 4234064631,
         "perRound": 23,
-        "medianUs": 525.277,
-        "p10Us": 516.875,
-        "minUs": 516.587,
-        "maxUs": 532.341,
+        "medianUs": 520.476,
+        "p10Us": 515.263,
+        "minUs": 513.605,
+        "maxUs": 529.596,
         "sink": 0
       },
       "v8Opt": {
         "ok": true,
         "value": 4234064631,
-        "perRound": 481,
-        "medianUs": 30.494,
-        "p10Us": 30.042,
-        "minUs": 29.754,
-        "maxUs": 31.505,
+        "perRound": 495,
+        "medianUs": 29.902,
+        "p10Us": 29.659,
+        "minUs": 29.642,
+        "maxUs": 30.197,
         "sink": -60902665
       },
-      "v8SpeedupMedian": 17.23,
+      "v8SpeedupMedian": 17.41,
       "jscBaseline": {
         "ok": true,
         "value": 4234064631,
-        "perRound": 257,
-        "medianUs": 54.303,
-        "p10Us": 52.938,
-        "minUs": 52.891,
-        "maxUs": 55.14,
-        "sink": 0
+        "perRound": 258,
+        "medianUs": 52.721,
+        "p10Us": 51.845,
+        "minUs": 51.631,
+        "maxUs": 53.559,
+        "sink": -60902665
       },
       "jscOpt": {
         "ok": true,
         "value": 4234064631,
-        "perRound": 483,
-        "medianUs": 30.484,
-        "p10Us": 29.907,
-        "minUs": 29.868,
-        "maxUs": 31.714,
+        "perRound": 498,
+        "medianUs": 30.016,
+        "p10Us": 29.737,
+        "minUs": 29.648,
+        "maxUs": 32.43,
         "sink": -60902665
       },
-      "jscSpeedupMedian": 1.78
+      "jscSpeedupMedian": 1.76
     },
     "crc32_table_16384": {
       "value": 1943956215,
@@ -1663,44 +1679,44 @@
         "ok": true,
         "value": 1943956215,
         "perRound": 10,
-        "medianUs": 1078.638,
-        "p10Us": 1043.762,
-        "minUs": 1039.3,
-        "maxUs": 1426.654,
+        "medianUs": 1059.617,
+        "p10Us": 1042.933,
+        "minUs": 1042.196,
+        "maxUs": 1424.092,
         "sink": 0
       },
       "v8Opt": {
         "ok": true,
         "value": 1943956215,
-        "perRound": 239,
-        "medianUs": 60.902,
-        "p10Us": 60.238,
-        "minUs": 59.383,
-        "maxUs": 63.193,
-        "sink": 1943956215
+        "perRound": 245,
+        "medianUs": 59.993,
+        "p10Us": 59.486,
+        "minUs": 59.281,
+        "maxUs": 60.543,
+        "sink": 0
       },
-      "v8SpeedupMedian": 17.71,
+      "v8SpeedupMedian": 17.66,
       "jscBaseline": {
         "ok": true,
         "value": 1943956215,
-        "perRound": 129,
-        "medianUs": 107.318,
-        "p10Us": 105.442,
-        "minUs": 104.17,
-        "maxUs": 115.287,
+        "perRound": 133,
+        "medianUs": 102.956,
+        "p10Us": 101.693,
+        "minUs": 101.008,
+        "maxUs": 105.489,
         "sink": 0
       },
       "jscOpt": {
         "ok": true,
         "value": 1943956215,
-        "perRound": 243,
-        "medianUs": 60.09,
-        "p10Us": 59.86,
-        "minUs": 59.757,
-        "maxUs": 62.057,
+        "perRound": 248,
+        "medianUs": 59.504,
+        "p10Us": 59.011,
+        "minUs": 58.989,
+        "maxUs": 59.742,
         "sink": 0
       },
-      "jscSpeedupMedian": 1.79
+      "jscSpeedupMedian": 1.73
     },
     "enum_state_4096": {
       "value": 71197732,
@@ -1708,42 +1724,42 @@
         "ok": true,
         "value": 71197732,
         "perRound": 29,
-        "medianUs": 469.876,
-        "p10Us": 466.892,
-        "minUs": 466.293,
-        "maxUs": 507.759,
-        "sink": 71197732
+        "medianUs": 467.055,
+        "p10Us": 455.388,
+        "minUs": 454.284,
+        "maxUs": 531.28,
+        "sink": 0
       },
       "v8Opt": {
         "ok": true,
         "value": 71197732,
-        "perRound": 28,
-        "medianUs": 504.537,
-        "p10Us": 498.623,
-        "minUs": 496.007,
-        "maxUs": 528.64,
+        "perRound": 30,
+        "medianUs": 481.771,
+        "p10Us": 478.518,
+        "minUs": 475.721,
+        "maxUs": 500.782,
         "sink": 71197732
       },
-      "v8SpeedupMedian": 0.93,
+      "v8SpeedupMedian": 0.97,
       "jscBaseline": {
         "ok": true,
         "value": 71197732,
         "perRound": 25,
-        "medianUs": 569.561,
-        "p10Us": 561.514,
-        "minUs": 561.436,
-        "maxUs": 603.877,
-        "sink": 71197732
+        "medianUs": 568.76,
+        "p10Us": 551.279,
+        "minUs": 548.643,
+        "maxUs": 603.467,
+        "sink": 0
       },
       "jscOpt": {
         "ok": true,
         "value": 71197732,
-        "perRound": 22,
-        "medianUs": 640.914,
-        "p10Us": 637.64,
-        "minUs": 634.222,
-        "maxUs": 688.621,
-        "sink": 0
+        "perRound": 23,
+        "medianUs": 640.476,
+        "p10Us": 632.876,
+        "minUs": 631.836,
+        "maxUs": 660.836,
+        "sink": 71197732
       },
       "jscSpeedupMedian": 0.89
     },
@@ -1752,84 +1768,52 @@
       "v8Baseline": {
         "ok": true,
         "value": 6652,
-        "perRound": 60,
-        "medianUs": 217.769,
-        "p10Us": 204.146,
-        "minUs": 196.954,
-        "maxUs": 238.014,
-        "sink": 6652
+        "perRound": 63,
+        "medianUs": 205.376,
+        "p10Us": 200.237,
+        "minUs": 199.522,
+        "maxUs": 214.258,
+        "sink": 0
       },
       "v8Opt": {
         "ok": true,
         "value": 6652,
-        "perRound": 108,
-        "medianUs": 136.939,
-        "p10Us": 129.442,
-        "minUs": 128.991,
-        "maxUs": 147.506,
-        "sink": 0
+        "perRound": 115,
+        "medianUs": 133.296,
+        "p10Us": 128.265,
+        "minUs": 126.725,
+        "maxUs": 142.558,
+        "sink": 6652
       },
-      "v8SpeedupMedian": 1.59,
+      "v8SpeedupMedian": 1.54,
       "jscBaseline": {
         "ok": true,
         "value": 6652,
-        "perRound": 64,
-        "medianUs": 179.409,
-        "p10Us": 170.593,
-        "minUs": 166.389,
-        "maxUs": 291.172,
+        "perRound": 67,
+        "medianUs": 166.209,
+        "p10Us": 161.435,
+        "minUs": 160.958,
+        "maxUs": 246.863,
         "sink": 0
       },
       "jscOpt": {
         "ok": true,
         "value": 6652,
-        "perRound": 124,
-        "medianUs": 87.556,
-        "p10Us": 82.783,
-        "minUs": 82.693,
-        "maxUs": 140.08,
+        "perRound": 143,
+        "medianUs": 81.789,
+        "p10Us": 76.442,
+        "minUs": 73.468,
+        "maxUs": 122.021,
         "sink": 0
       },
-      "jscSpeedupMedian": 2.05
+      "jscSpeedupMedian": 2.03
     }
   },
   "enumStateMatrix": {
     "opaque_helper": {
       "old_main": {
-        "sysrootUsed": "/Users/mikhail.pertsev/Desktop/OSS/mires/build/sysroots/c40e0513c4b5de215d41712d4ce772e34359f199557a7c5ba6ce67b585f10da3",
+        "sysrootUsed": "/Users/mikhail.pertsev/Desktop/OSS/mires/build/sysroots/35a767ce53c12c920ba8d585c4809c255cba0cd1dacd653600621931db6a18ad",
         "llvmArgs": "js-lane=jir js-cleanup=off js-ecma-target=2018 js-minify=on js-opt=on js-modules=esm",
-        "artifact": {
-          "bytes": 2291,
-          "gzip9": 967,
-          "brotli11": 877,
-          "tryCount": 0,
-          "topLevelFns": 8,
-          "bigintMentions": 0,
-          "sha256": "dc72aadc2bb70ac9f4a1454f45eeb4a39e68ce3fdeae466a44558ed28f3834de"
-        },
-        "v8": {
-          "ok": true,
-          "value": 71197732,
-          "perRound": 30,
-          "medianUs": 461.506,
-          "p10Us": 456.667,
-          "minUs": 456.585,
-          "maxUs": 475.375,
-          "sink": 0
-        },
-        "jsc": {
-          "ok": true,
-          "value": 71197732,
-          "perRound": 25,
-          "medianUs": 568.369,
-          "p10Us": 551.162,
-          "minUs": 549.17,
-          "maxUs": 589.199,
-          "sink": 0
-        }
-      },
-      "new_qualify": {
-        "llvmArgs": "js-lane=jir js-profile=release-balanced js-opt=on js-ecma-target=2018 js-cleanup=off js-modules=esm",
         "artifact": {
           "bytes": 1534,
           "gzip9": 854,
@@ -1843,64 +1827,64 @@
           "ok": true,
           "value": 71197732,
           "perRound": 29,
-          "medianUs": 497.944,
-          "p10Us": 489.034,
-          "minUs": 485.484,
-          "maxUs": 519.543,
-          "sink": 0
+          "medianUs": 487.057,
+          "p10Us": 479.734,
+          "minUs": 475.753,
+          "maxUs": 508.619,
+          "sink": 71197732
         },
         "jsc": {
           "ok": true,
           "value": 71197732,
           "perRound": 23,
-          "medianUs": 635.954,
-          "p10Us": 630.127,
-          "minUs": 620.701,
-          "maxUs": 670.516,
-          "sink": 71197732
-        }
-      },
-      "speedup": {
-        "v8Median": 0.93,
-        "jscMedian": 0.89
-      }
-    },
-    "local_inlinable_helper": {
-      "old_main": {
-        "sysrootUsed": "/Users/mikhail.pertsev/Desktop/OSS/mires/build/sysroots/c40e0513c4b5de215d41712d4ce772e34359f199557a7c5ba6ce67b585f10da3",
-        "llvmArgs": "js-lane=jir js-cleanup=off js-ecma-target=2018 js-minify=on js-opt=on js-modules=esm",
-        "artifact": {
-          "bytes": 2291,
-          "gzip9": 967,
-          "brotli11": 877,
-          "tryCount": 0,
-          "topLevelFns": 8,
-          "bigintMentions": 0,
-          "sha256": "dc72aadc2bb70ac9f4a1454f45eeb4a39e68ce3fdeae466a44558ed28f3834de"
-        },
-        "v8": {
-          "ok": true,
-          "value": 71197732,
-          "perRound": 30,
-          "medianUs": 458.854,
-          "p10Us": 454.135,
-          "minUs": 453.587,
-          "maxUs": 485.369,
-          "sink": 71197732
-        },
-        "jsc": {
-          "ok": true,
-          "value": 71197732,
-          "perRound": 26,
-          "medianUs": 566.153,
-          "p10Us": 551.993,
-          "minUs": 551.917,
-          "maxUs": 1116.727,
+          "medianUs": 634.957,
+          "p10Us": 625.096,
+          "minUs": 616.784,
+          "maxUs": 653.745,
           "sink": 0
         }
       },
       "new_qualify": {
         "llvmArgs": "js-lane=jir js-profile=release-balanced js-opt=on js-ecma-target=2018 js-cleanup=off js-modules=esm",
+        "artifact": {
+          "bytes": 1508,
+          "gzip9": 804,
+          "brotli11": 685,
+          "tryCount": 0,
+          "topLevelFns": 4,
+          "bigintMentions": 0,
+          "sha256": "ac8bb23a2f56a682ea50e9cb8ca33dbf96d7fdd5216c8e9fc9c97287f114a65c"
+        },
+        "v8": {
+          "ok": true,
+          "value": 71197732,
+          "perRound": 764,
+          "medianUs": 19.344,
+          "p10Us": 19.228,
+          "minUs": 19.18,
+          "maxUs": 19.651,
+          "sink": 0
+        },
+        "jsc": {
+          "ok": true,
+          "value": 71197732,
+          "perRound": 1356,
+          "medianUs": 10.968,
+          "p10Us": 10.687,
+          "minUs": 10.606,
+          "maxUs": 12.259,
+          "sink": 71197732
+        }
+      },
+      "speedup": {
+        "v8Median": 25.18,
+        "jscMedian": 57.89
+      }
+    },
+    "local_inlinable_helper": {
+      "old_main": {
+        "sysrootUsed": "/Users/mikhail.pertsev/Desktop/OSS/mires/build/sysroots/35a767ce53c12c920ba8d585c4809c255cba0cd1dacd653600621931db6a18ad",
+        "llvmArgs": "js-lane=jir js-cleanup=off js-ecma-target=2018 js-minify=on js-opt=on js-modules=esm",
         "artifact": {
           "bytes": 1423,
           "gzip9": 870,
@@ -1913,27 +1897,59 @@
         "v8": {
           "ok": true,
           "value": 71197732,
-          "perRound": 3980,
-          "medianUs": 3.908,
-          "p10Us": 3.716,
-          "minUs": 3.712,
-          "maxUs": 4.173,
-          "sink": 0
+          "perRound": 4345,
+          "medianUs": 3.382,
+          "p10Us": 3.36,
+          "minUs": 3.359,
+          "maxUs": 6.275,
+          "sink": 71197732
         },
         "jsc": {
           "ok": true,
           "value": 71197732,
-          "perRound": 4623,
-          "medianUs": 3.148,
-          "p10Us": 3.092,
-          "minUs": 3.079,
-          "maxUs": 3.265,
+          "perRound": 4734,
+          "medianUs": 3.11,
+          "p10Us": 3.041,
+          "minUs": 3.024,
+          "maxUs": 3.355,
           "sink": 0
         }
       },
+      "new_qualify": {
+        "llvmArgs": "js-lane=jir js-profile=release-balanced js-opt=on js-ecma-target=2018 js-cleanup=off js-modules=esm",
+        "artifact": {
+          "bytes": 793,
+          "gzip9": 529,
+          "brotli11": 463,
+          "tryCount": 0,
+          "topLevelFns": 3,
+          "bigintMentions": 0,
+          "sha256": "ac09ff6f84ad52467181c97aa301209c81074e4a989650e9ee1892cf7d8bcf07"
+        },
+        "v8": {
+          "ok": true,
+          "value": 71197732,
+          "perRound": 4736,
+          "medianUs": 3.136,
+          "p10Us": 2.938,
+          "minUs": 2.851,
+          "maxUs": 3.314,
+          "sink": 71197732
+        },
+        "jsc": {
+          "ok": true,
+          "value": 71197732,
+          "perRound": 4889,
+          "medianUs": 3.06,
+          "p10Us": 2.873,
+          "minUs": 2.759,
+          "maxUs": 3.413,
+          "sink": 71197732
+        }
+      },
       "speedup": {
-        "v8Median": 117.41,
-        "jscMedian": 179.85
+        "v8Median": 1.08,
+        "jscMedian": 1.02
       }
     }
   }
