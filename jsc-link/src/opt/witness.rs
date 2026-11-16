@@ -877,9 +877,12 @@ impl<'a> InvokeCheckCx<'a> {
         pre_funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
         live: &'a BTreeSet<JsName>,
     ) -> Self {
-        let has_custom_allocator = table
-            .values()
-            .any(|item| item.late_ir.artifact_allocator_provider() == AllocatorProvider::Custom);
+        let has_custom_allocator = table.values().any(|item| {
+            matches!(
+                item.late_ir.artifact_allocator_provider(),
+                AllocatorProvider::Custom | AllocatorProvider::Conflict
+            )
+        });
         Self {
             table,
             pre_funcs,

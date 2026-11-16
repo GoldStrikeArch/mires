@@ -245,6 +245,47 @@ fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
 }
 EOF
 
+cat >"$work/alloc_zero_try.rs" <<'EOF'
+#![no_std]
+#![no_main]
+extern crate alloc;
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
+unsafe extern "C-unwind" {
+    fn host_note(v: u32);
+}
+
+struct Guard(u32);
+impl Drop for Guard {
+    fn drop(&mut self) {
+        unsafe { host_note(self.0) }
+    }
+}
+
+#[no_mangle]
+pub fn build_boxes(n: u32) -> u32 {
+    let _g = Guard(1);
+    let mut v: Vec<Box<u32>> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        v.push(Box::new(i.wrapping_mul(3).wrapping_add(1)));
+        i += 1;
+    }
+    let mut sum = 0u32;
+    for b in v {
+        sum = sum.wrapping_add(*b);
+    }
+    sum
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    loop {}
+}
+EOF
+
 export RCGJS_WITNESS_CHECK=1
 
 for opt in off on; do
@@ -269,6 +310,7 @@ SKIP_BUILD=1 "$script_dir/build_sysroot.sh" >"$work/sysroot-rollback.log" 2>&1
 "$script_dir/compile_core.sh" "$work/rollback_probe.rs" "$work/rollback-clean.js" >"$work/rollback-clean.log" 2>&1
 RCGJS_WITNESS_FAULT=prune-invoke \
 	"$script_dir/compile_core.sh" "$work/rollback_probe.rs" "$work/rollback-fault.js" >"$work/rollback-fault.log" 2>&1
+"$script_dir/compile_core.sh" "$work/alloc_zero_try.rs" "$work/alloc-zero-try.js" >"$work/alloc-zero-try.log" 2>&1
 
 node --input-type=module - "$work" "$root/runtime/shim.js" <<'NODE'
 import assert from 'node:assert/strict';
@@ -369,5 +411,22 @@ assert.equal(faultRes.normal.ret, 12);
 assert.equal(cleanRes.throw.same, true);
 assert.equal(faultRes.throw.same, true);
 
-console.log(`prune-invoke-test: PASS (clean tries=${cleanTries}, fault tries=${faultTries}, fault witnesses.failed=${faultLane.witnesses.failed})`);
+// 4. Default-allocator Vec<Box<u32>> + Guard under js-opt=on emits zero `try {` blocks
+const allocJs = join(work, 'alloc-zero-try.js');
+const allocLane = readLane(allocJs);
+assert.equal(allocLane.witnesses?.failed ?? 0, 0, 'alloc-zero-try witnesses.failed must be 0');
+const allocTries = countTry(allocJs);
+assert.equal(allocTries, 0, `expected 0 try blocks in default-allocator Vec<Box<u32>> + Guard, got ${allocTries}`);
+{
+  const trace = [];
+  const ctx = vm.createContext({ TextEncoder, TextDecoder, console });
+  vm.runInContext(shimCode, ctx);
+  ctx.__rt.host_note = (v) => trace.push(Number(v));
+  vm.runInContext(readFileSync(allocJs, 'utf8'), ctx);
+  const sum = ctx.build_boxes(5);
+  assert.equal(sum, 1 + 4 + 7 + 10 + 13);
+  assert.deepEqual(trace, [1]);
+}
+
+console.log(`prune-invoke-test: PASS (clean tries=${cleanTries}, fault tries=${faultTries}, fault witnesses.failed=${faultLane.witnesses.failed}, allocTries=${allocTries})`);
 NODE

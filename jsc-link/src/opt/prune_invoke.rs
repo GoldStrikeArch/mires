@@ -258,9 +258,12 @@ pub(crate) fn run_checked(
         }
     }
 
-    let has_custom_allocator = table
-        .values()
-        .any(|item| item.late_ir.artifact_allocator_provider() == AllocatorProvider::Custom);
+    let has_custom_allocator = table.values().any(|item| {
+        matches!(
+            item.late_ir.artifact_allocator_provider(),
+            AllocatorProvider::Custom | AllocatorProvider::Conflict
+        )
+    });
 
     let mut has_opaque_fn = false;
     let mut vtable_methods: BTreeMap<u32, BTreeSet<JsName>> = BTreeMap::new();
@@ -324,7 +327,7 @@ pub(crate) fn run_checked(
         }
         if let Some(item) = table.get(target) {
             return match item.kind {
-                ItemKind::Alloc => !has_custom_allocator,
+                ItemKind::Alloc => has_custom_allocator,
                 _ => true,
             };
         }
@@ -3242,6 +3245,147 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .has_invoke());
+        }
+    }
+
+    #[test]
+    fn alloc_shim_invoke_with_non_noop_drop_prunes_default_and_preserves_custom_and_conflict() {
+        let rust_alloc_name = "_RNvCsxyz_7___rustc12___rust_alloc";
+        for direct_to_alloc in [false, true] {
+            for provider in [
+                AllocatorProvider::Default,
+                AllocatorProvider::Custom,
+                AllocatorProvider::Conflict,
+            ] {
+                let mut drop_interns = Interns::new();
+                let unit_d = unit_types(&mut drop_interns);
+                let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+                let mut leaf_interns = Interns::new();
+                let unit_leaf = unit_types(&mut leaf_interns);
+                let rust_alloc_leaf_sym = leaf_interns.intern_str(rust_alloc_name);
+                let mut lb = FuncBuilder::new(
+                    item_id(180),
+                    Signature {
+                        arguments: Vec::new(),
+                        result: unit_leaf,
+                        abi: AbiSignature::default(),
+                    },
+                );
+                lb.effect(
+                    FuncBuilder::ENTRY,
+                    OpKind::Call {
+                        callee: Callee::Foreign {
+                            definition: DefinitionId {
+                                crate_id: 0,
+                                local_hash: 181,
+                            },
+                            symbol: rust_alloc_leaf_sym,
+                        },
+                        function: None,
+                        args: Vec::new(),
+                        track_caller: None,
+                        semantic: CallSemantic::Ordinary,
+                        host: None,
+                    },
+                    O,
+                );
+                lb.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+                let non_throwing_alloc_fn = lb.finish();
+
+                let mut caller_interns = Interns::new();
+                let unit_c = unit_types(&mut caller_interns);
+                let callee = if direct_to_alloc {
+                    let alloc_sym = caller_interns.intern_str(rust_alloc_name);
+                    Callee::Foreign {
+                        definition: DefinitionId {
+                            crate_id: 0,
+                            local_hash: 181,
+                        },
+                        symbol: alloc_sym,
+                    }
+                } else {
+                    let wrapper_sym = caller_interns.intern_str("non_throwing_alloc_fn");
+                    Callee::Direct {
+                        item: item_id(180),
+                        link_name: wrapper_sym,
+                    }
+                };
+                let caller = build_caller_with_cleanup_drop(
+                    &mut caller_interns,
+                    unit_c,
+                    callee,
+                    "real_drop",
+                );
+
+                let mut alloc_shim_item = test_item(rust_alloc_name, Interns::new());
+                alloc_shim_item.kind = ItemKind::Alloc;
+                alloc_shim_item.late_ir.allocator_provider = provider;
+
+                let mut table = BTreeMap::new();
+                table.insert(JsName::new(rust_alloc_name.to_owned()), alloc_shim_item);
+                table.insert(
+                    JsName::new("real_drop".to_owned()),
+                    test_item("real_drop", drop_interns),
+                );
+                if !direct_to_alloc {
+                    table.insert(
+                        JsName::new("non_throwing_alloc_fn".to_owned()),
+                        test_item("non_throwing_alloc_fn", leaf_interns),
+                    );
+                }
+                let caller_item = test_item("caller", caller_interns);
+                let caller_interns_ref = caller_item.jir.interns().unwrap().clone();
+                table.insert(JsName::new("caller".to_owned()), caller_item);
+
+                let mut funcs = BTreeMap::new();
+                funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+                if !direct_to_alloc {
+                    funcs.insert(
+                        JsName::new("non_throwing_alloc_fn".to_owned()),
+                        Ok(non_throwing_alloc_fn),
+                    );
+                }
+                funcs.insert(JsName::new("caller".to_owned()), Ok(caller.clone()));
+
+                let live: BTreeSet<JsName> = table.keys().cloned().collect();
+                let stats = run_checked(&table, &mut funcs, &live);
+                let updated = funcs[&JsName::new("caller".to_owned())].as_ref().unwrap();
+                if provider == AllocatorProvider::Default {
+                    assert_eq!(
+                        stats.modified, 1,
+                        "default allocator alloc invoke must prune (direct={direct_to_alloc})"
+                    );
+                    assert_eq!(stats.witnesses_recorded, 1);
+                    assert_eq!(stats.witnesses_failed, 0);
+                    assert!(
+                        !updated.has_invoke(),
+                        "default allocator caller must have zero remaining Invoke (direct={direct_to_alloc})"
+                    );
+                } else {
+                    assert_eq!(
+                        stats.modified, 0,
+                        "custom/conflict allocator alloc invoke must NOT prune ({provider:?}, direct={direct_to_alloc})"
+                    );
+                    assert!(updated.has_invoke());
+                    let forged = [InvokePrunedSite {
+                        block: FuncBuilder::ENTRY,
+                        reason: InvokePruneReason::ProtectedOpCannotThrow,
+                    }];
+                    assert!(
+                        witness::check_invoke_pruning(
+                            &caller,
+                            &caller_interns_ref,
+                            &forged,
+                            &table,
+                            &funcs,
+                            &live,
+                        )
+                        .is_err(),
+                        "forged ProtectedOpCannotThrow with {provider:?} must fail witness check"
+                    );
+                }
+            }
         }
     }
 }
