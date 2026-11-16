@@ -1726,7 +1726,7 @@ impl<'a> JsCx<'a> {
                 // A boxed parameter cell: v1 builds the box in the prelude, `x = [x];`, so the
                 // parameter's own binding becomes the box — only when the parameter's canonical
                 // name is actually a formal parameter in the JS signature (not expanded into lanes).
-                if self.plan.param_cells.contains_key(cell) {
+                if self.plan.param_cells.get(cell).is_some_and(|p| p == v) {
                     let cell_name = self.cell_name(*cell)?;
                     if self.is_formal_param_name(cell_name) {
                         if !self.cell_boxed(*cell) {

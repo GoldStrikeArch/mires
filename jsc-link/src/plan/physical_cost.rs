@@ -20,6 +20,7 @@ use crate::plan::abi_flat::AbiPlan;
 
 const COMPRESSED_GROWTH_BPS: u64 = 50;
 const SPEED_GROWTH_BPS: u64 = 500;
+const HOT_ALLOC_SMALL_PROGRAM_SLACK_BYTES: u64 = 256;
 
 /// Exact metrics of one fully lowered, deduplicated, renamed program and its helper closure.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -362,19 +363,14 @@ fn decide_incremental(
             0,
         );
     };
-    let cap = match profile {
-        Profile::ReleaseSpeed => SPEED_GROWTH_BPS,
-        _ => COMPRESSED_GROWTH_BPS,
-    };
     let global_ok = match profile {
-        Profile::ReleaseSpeed => {
-            within_growth(after.min, baseline.min, cap)
-                && within_growth(after.gzip, baseline.gzip, cap)
-                && within_growth(after.brotli, baseline.brotli, cap)
+        Profile::ReleaseSpeed => speed_within_budget(baseline, after),
+        Profile::ReleaseBalanced | Profile::Dev | Profile::Report => {
+            balanced_compressed_within_budget(baseline, after)
         }
-        _ => {
-            within_growth(after.gzip, baseline.gzip, cap)
-                && within_growth(after.brotli, baseline.brotli, cap)
+        Profile::ReleaseSize => {
+            within_growth(after.gzip, baseline.gzip, COMPRESSED_GROWTH_BPS)
+                && within_growth(after.brotli, baseline.brotli, COMPRESSED_GROWTH_BPS)
         }
     };
     if global_ok {
@@ -452,8 +448,6 @@ fn decide(
     let budget = growth_bps(after.min, before.min)
         .max(growth_bps(after.gzip, before.gzip))
         .max(growth_bps(after.brotli, before.brotli));
-    let compressed_safe = within_growth(after.gzip, before.gzip, COMPRESSED_GROWTH_BPS)
-        && within_growth(after.brotli, before.brotli, COMPRESSED_GROWTH_BPS);
 
     match profile {
         Profile::ReleaseSize => {
@@ -473,7 +467,7 @@ fn decide(
         Profile::ReleaseBalanced | Profile::Dev | Profile::Report => {
             let reason = if after.balanced_score() >= before.balanced_score() {
                 Some("cost.score-no-improvement".to_owned())
-            } else if !compressed_safe {
+            } else if !balanced_compressed_within_budget(before, after) {
                 Some("cost.compressed-growth-budget".to_owned())
             } else if after.allocations > before.allocations
                 || after.loop_allocations > before.loop_allocations
@@ -486,9 +480,7 @@ fn decide(
         }
         Profile::ReleaseSpeed => {
             let hot = after.loop_allocations < before.loop_allocations;
-            let bounded = within_growth(after.min, before.min, SPEED_GROWTH_BPS)
-                && within_growth(after.gzip, before.gzip, SPEED_GROWTH_BPS)
-                && within_growth(after.brotli, before.brotli, SPEED_GROWTH_BPS);
+            let bounded = speed_within_budget(before, after);
             let reason = if !hot {
                 Some("cost.hotness-evidence-missing".to_owned())
             } else if !bounded {
@@ -504,6 +496,55 @@ fn decide(
             )
         }
     }
+}
+
+fn balanced_compressed_within_budget(before: ProgramMetrics, after: ProgramMetrics) -> bool {
+    let strict = within_growth(after.gzip, before.gzip, COMPRESSED_GROWTH_BPS)
+        && within_growth(after.brotli, before.brotli, COMPRESSED_GROWTH_BPS);
+    if strict {
+        return true;
+    }
+    // On small kernels/benchmarks, eliminating loop allocations by flattening mutable references
+    // can cut total allocation weight heavily while adding ~100-200B of switch plumbing that looks
+    // large only against a tiny program denominator.
+    let major_hot_alloc_win = after.loop_allocations < before.loop_allocations
+        && after.alloc_term.saturating_mul(4) <= before.alloc_term.saturating_mul(3);
+    major_hot_alloc_win
+        && within_growth_or_bytes(
+            after.gzip,
+            before.gzip,
+            COMPRESSED_GROWTH_BPS,
+            HOT_ALLOC_SMALL_PROGRAM_SLACK_BYTES,
+        )
+        && within_growth_or_bytes(
+            after.brotli,
+            before.brotli,
+            COMPRESSED_GROWTH_BPS,
+            HOT_ALLOC_SMALL_PROGRAM_SLACK_BYTES,
+        )
+}
+
+fn speed_within_budget(before: ProgramMetrics, after: ProgramMetrics) -> bool {
+    within_growth_or_bytes(
+        after.min,
+        before.min,
+        SPEED_GROWTH_BPS,
+        HOT_ALLOC_SMALL_PROGRAM_SLACK_BYTES,
+    ) && within_growth_or_bytes(
+        after.gzip,
+        before.gzip,
+        SPEED_GROWTH_BPS,
+        HOT_ALLOC_SMALL_PROGRAM_SLACK_BYTES,
+    ) && within_growth_or_bytes(
+        after.brotli,
+        before.brotli,
+        SPEED_GROWTH_BPS,
+        HOT_ALLOC_SMALL_PROGRAM_SLACK_BYTES,
+    )
+}
+
+fn within_growth_or_bytes(after: u64, before: u64, basis_points: u64, max_bytes: u64) -> bool {
+    within_growth(after, before, basis_points) || after <= before.saturating_add(max_bytes)
 }
 
 fn within_growth(after: u64, before: u64, basis_points: u64) -> bool {
@@ -642,5 +683,53 @@ mod tests {
             Some(first)
         );
         assert_eq!(cache.hits, 1);
+    }
+
+    #[test]
+    fn balanced_allows_small_slack_only_for_major_hot_alloc_reduction() {
+        let before = ProgramMetrics {
+            min: 6652,
+            gzip: 2294,
+            brotli: 2080,
+            allocations: 15,
+            loop_allocations: 13,
+            alloc_term: 1296,
+        };
+        let major_win = ProgramMetrics {
+            min: 6850,
+            gzip: 2429,
+            brotli: 2175,
+            allocations: 8,
+            loop_allocations: 8,
+            alloc_term: 768,
+        };
+        assert!(decide(Profile::ReleaseBalanced, Some(before), Some(major_win)).0);
+
+        let minor_before = ProgramMetrics {
+            min: 15983,
+            gzip: 4444,
+            brotli: 4003,
+            allocations: 95,
+            loop_allocations: 54,
+            alloc_term: 6168,
+        };
+        let minor_after = ProgramMetrics {
+            min: 15976,
+            gzip: 4481,
+            brotli: 4034,
+            allocations: 91,
+            loop_allocations: 50,
+            alloc_term: 5784,
+        };
+        assert_eq!(
+            decide(
+                Profile::ReleaseBalanced,
+                Some(minor_before),
+                Some(minor_after)
+            )
+            .1
+            .as_deref(),
+            Some("cost.compressed-growth-budget")
+        );
     }
 }

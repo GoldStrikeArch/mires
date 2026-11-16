@@ -1285,6 +1285,22 @@ fn param_shape(types: &TypeTable, param: &FlatParam) -> ValueShape {
     if let Some(recursive) = &param.recursive {
         return ValueShape::Product(product_lanes(types, &recursive.root));
     }
+    if param.is_scalar_ref() {
+        return ValueShape::Product(vec![lane_kind(types, param.ty)]);
+    }
+    if param.is_mut_enum(Some(types)) {
+        return ValueShape::Product(
+            std::iter::once(LaneKind::Tag)
+                .chain(
+                    param
+                        .passed
+                        .iter()
+                        .skip(1)
+                        .map(|field| lane_kind(types, param.field_tys[*field as usize])),
+                )
+                .collect(),
+        );
+    }
     ValueShape::Product(
         param
             .passed

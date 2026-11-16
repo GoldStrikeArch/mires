@@ -44,12 +44,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use crate::analysis::effects::Purity;
 use crate::analysis::param_use::{self, ParamKind, ParamUse};
 use crate::analysis::refs::{self, RefScan};
 use crate::item::{ItemKind, ItemMap, JsName, LinkItem, Linkage};
 use crate::jir::decline::{BoundaryDecline, Decline, LowerDecline, OpClass};
 use crate::jir::origin::OriginId;
-use crate::jir::repr::{Carrier, Func, Op, OpKind, Proj, RTerm, Root, ValueDef, ValueId};
+use crate::jir::repr::{
+    Carrier, CellDef, CellId, Func, Op, OpKind, Proj, RBlock, RBlockId, RTerm, Root, ValueDef,
+    ValueId,
+};
 use crate::jir::semantic::{BodySemantic, Callee, ConstTree, ItemId, TypeId};
 use crate::jir::summary::{self, ItemClass};
 use crate::jir::types::{
@@ -97,6 +101,29 @@ pub struct FlatParam {
 }
 
 impl FlatParam {
+    /// Whether this parameter is a flattened 1-lane scalar reference (`&T` / `&mut T`).
+    pub(crate) fn is_scalar_ref(&self) -> bool {
+        self.by_ref
+            && !self.slice
+            && !self.i64_pair
+            && self.tagged.is_none()
+            && self.recursive.is_none()
+            && self.field_tys.len() == 1
+            && self.field_tys[0] == self.ty
+            && self.passed.as_slice() == [0]
+    }
+
+    /// Whether this parameter is a flattened `&mut Enum` (`EnumRepr::Tag { fieldless: false }`).
+    pub(crate) fn is_mut_enum(&self, types: Option<&TypeTable>) -> bool {
+        self.by_ref
+            && self.mutable
+            && !self.slice
+            && !self.i64_pair
+            && self.tagged.is_none()
+            && self.recursive.is_none()
+            && types.is_some_and(|types| is_mut_enum_ty(types, self.ty))
+    }
+
     /// How many JavaScript parameters the flat parameter takes.
     pub fn fields(&self) -> u32 {
         if self.i64_pair {
@@ -747,10 +774,15 @@ impl AbiPlan {
         self.declined.insert(name, decline);
     }
 
+    #[allow(dead_code)]
     fn select(&mut self, name: &JsName, sig: &FlatSig) {
+        self.select_with_types(name, sig, None);
+    }
+
+    fn select_with_types(&mut self, name: &JsName, sig: &FlatSig, types: Option<&TypeTable>) {
         self.consider(name, "not-considered.no-physical-shape");
         let decision = self.decisions.get_mut(name).expect("just inserted");
-        decision.shape = Some(signature_shape(sig));
+        decision.shape = Some(signature_shape(sig, types));
         decision.selected = true;
         decision.reason = None;
     }
@@ -934,7 +966,7 @@ impl AbiPlan {
             let Ok(func) = entry else { continue };
             if self.names.get(&func.item) == Some(name) {
                 if let Some(sig) = self.flat.get(&func.item) {
-                    rewrite_callee(func, sig);
+                    rewrite_callee_with(func, sig, type_table(table, name));
                 }
             }
         }
@@ -948,6 +980,7 @@ impl AbiPlan {
             let Some(types) = types else {
                 continue;
             };
+            unbox_scalar_ref_cells(func, types);
             // Under the carriers the values already have: a committed representation plan
             // (Phase 4, B1) runs before this rewrite and its carriers must not decline it.
             if let Err(err) = func.verify_carriers(types, crate::opt::observed_carriers(func)) {
@@ -1046,7 +1079,7 @@ pub fn plan_excluding(
                 func.params.iter().any(|param| {
                     let ty = func.values[param.0 as usize].ty;
                     slice_param(func, types, *param, ty).is_some()
-                        || flat_param(types, ty, true).is_some()
+                        || flat_param_with(Some(func), types, ty, true).is_some()
                 }) || flat_result(types, func.sig.result).is_some()
             })
         });
@@ -1085,11 +1118,13 @@ pub fn plan_excluding(
     // (`lower/js/call.rs::callee_takes_caller_location`). That count comes from the summary index,
     // which the plan does not rewrite, so a callee called from such a body keeps its shape.
     let mut pinned_by_tracked_caller: BTreeSet<ItemId> = BTreeSet::new();
+    let mut invoke_call_sites: BTreeSet<ItemId> = BTreeSet::new();
     for (name, func) in funcs {
         let Ok(func) = func else { continue };
         let types = type_table(table, name);
         for block in &func.blocks {
-            for op in &block.ops {
+            let last_op = block.ops.len().saturating_sub(1);
+            for (op_index, op) in block.ops.iter().enumerate() {
                 refs::scan_op(func, op, types, &mut scan);
                 if let OpKind::Call {
                     callee: Callee::Direct { item, .. },
@@ -1103,6 +1138,9 @@ pub fn plan_excluding(
                     }
                     if func.sig.abi.caller_location {
                         pinned_by_tracked_caller.insert(*item);
+                    }
+                    if matches!(block.term, RTerm::Invoke { .. }) && op_index == last_op {
+                        invoke_call_sites.insert(*item);
                     }
                 }
             }
@@ -1135,7 +1173,8 @@ pub fn plan_excluding(
                         return None;
                     }
                     let ty = func.values[param.0 as usize].ty;
-                    slice_param(func, types, *param, ty).or_else(|| flat_param(types, ty, true))
+                    slice_param(func, types, *param, ty)
+                        .or_else(|| flat_param_with(Some(func), types, ty, true))
                 })
                 .collect();
             Some((func.item, shapes))
@@ -1264,6 +1303,10 @@ pub fn plan_excluding(
                         None
                     } else if shape.slice {
                         Some(ParamKind::Slice)
+                    } else if shape.is_mut_enum(Some(types)) {
+                        Some(ParamKind::ByRefEnum)
+                    } else if shape.is_scalar_ref() {
+                        Some(ParamKind::ByRefScalar)
                     } else if shape.by_ref {
                         Some(ParamKind::ByRef)
                     } else {
@@ -1273,21 +1316,52 @@ pub fn plan_excluding(
             })
             .collect();
         let uses = param_use::summarize(func, types, &kinds);
+        // Shared `&Scalar` references (`!mutable`) could alias another `&mut` or global written by
+        // the callee, so only flatten them when the callee is proven pure/read-only.
+        let read_only_callee = effects
+            .usable(name)
+            .is_some_and(|summary| summary.purity <= Purity::Read);
+        let entry_targeted = func
+            .blocks
+            .iter()
+            .any(|block| block.term.successors().contains(&RBlockId(0)));
+        for (shape, use_) in shapes.iter_mut().zip(&uses) {
+            let unflattened_shared_scalar = shape
+                .as_ref()
+                .is_some_and(|shape| shape.is_scalar_ref() && !shape.mutable)
+                && (!read_only_callee || use_.mutated);
+            let unflattened_loop_entry_mut_enum = entry_targeted
+                && shape
+                    .as_ref()
+                    .is_some_and(|shape| shape.is_mut_enum(Some(types)));
+            if unflattened_shared_scalar || unflattened_loop_entry_mut_enum {
+                *shape = None;
+            }
+        }
         // Copy-back runs only after a normal return. A direct or transitive throw must not
         // hide writes in a reconstructed private aggregate from the caller's cleanup code.
-        if !effects
-            .usable(name)
-            .is_some_and(|summary| !summary.may_unwind)
-            && shapes.iter().zip(&uses).any(|(shape, use_)| {
-                shape
-                    .as_ref()
-                    .is_some_and(|shape| shape.by_ref && shape.mutable)
-                    && use_.written
-            })
+        let has_written_mut_ref = shapes.iter().zip(&uses).any(|(shape, use_)| {
+            shape
+                .as_ref()
+                .is_some_and(|shape| shape.by_ref && shape.mutable)
+                && use_.written
+        });
+        if has_written_mut_ref
+            && (!effects
+                .usable(name)
+                .is_some_and(|summary| !summary.may_unwind)
+                || invoke_call_sites.contains(&func.item))
         {
             plan.decline(
                 name.clone(),
                 Decline::Boundary(BoundaryDecline::ExceptionalCopyBack),
+            );
+            continue;
+        }
+        if result.is_some() && invoke_call_sites.contains(&func.item) {
+            plan.decline(
+                name.clone(),
+                Decline::Boundary(BoundaryDecline::NonCallReference),
             );
             continue;
         }
@@ -1449,7 +1523,7 @@ pub fn plan_excluding(
         if let Some(item_callers) = callers.get(&item) {
             plan.callers.insert(item, item_callers.clone());
         }
-        plan.select(&candidate.name, &sig);
+        plan.select_with_types(&candidate.name, &sig, type_table(table, &candidate.name));
         plan.names.insert(item, target);
         plan.flat.insert(item, sig);
     }
@@ -1504,7 +1578,7 @@ fn terminal_reason(reason: &str) -> String {
     format!("{terminal}.{reason}")
 }
 
-fn signature_shape(sig: &FlatSig) -> String {
+fn signature_shape(sig: &FlatSig, types: Option<&TypeTable>) -> String {
     let mut parts = Vec::new();
     for param in sig.params.iter().flatten() {
         let kind = if param.slice {
@@ -1513,6 +1587,10 @@ fn signature_shape(sig: &FlatSig) -> String {
             "i64-pair"
         } else if param.tagged.is_some() {
             "tagged"
+        } else if param.is_mut_enum(types) {
+            "mut-enum"
+        } else if param.is_scalar_ref() {
+            "scalar-ref"
         } else if param.recursive.is_some() {
             "recursive-product"
         } else {
@@ -1769,11 +1847,57 @@ fn refuses(
 /// [`crate::opt::candidates::shape`], so the flat ABI and the escape analysis agree about which
 /// aggregates have fields worth naming — which is the point: the callee's rebuilt aggregate is
 /// only worth building because the escape analysis takes it apart again.
+#[allow(dead_code)]
 fn flat_param(table: &TypeTable, ty: TypeId, written: bool) -> Option<FlatParam> {
+    flat_param_with(None, table, ty, written)
+}
+
+fn flat_param_with(
+    func: Option<&Func>,
+    table: &TypeTable,
+    ty: TypeId,
+    written: bool,
+) -> Option<FlatParam> {
     let (aggregate, by_ref, mutable) = match table.get(table.peeled(ty)).map(|d| &d.kind) {
         Some(TypeKind::Reference { pointee, mutable }) => (*pointee, true, *mutable),
         _ => (ty, false, false),
     };
+    if by_ref {
+        if is_flattenable_scalar(table, aggregate) {
+            return Some(FlatParam {
+                ty: aggregate,
+                field_tys: vec![aggregate],
+                passed: vec![0],
+                by_ref: true,
+                mutable,
+                written,
+                slice: false,
+                i64_pair: false,
+                tagged: None,
+                recursive: None,
+            });
+        }
+        if mutable {
+            if let Some(mut_enum) = mut_enum_shape(func, table, aggregate, None) {
+                let mut field_tys = Vec::with_capacity(1 + mut_enum.payload_tys.len());
+                field_tys.push(mut_enum.discr_ty);
+                field_tys.extend_from_slice(&mut_enum.payload_tys);
+                let passed = (0..field_tys.len() as u32).collect();
+                return Some(FlatParam {
+                    ty: aggregate,
+                    field_tys,
+                    passed,
+                    by_ref: true,
+                    mutable: true,
+                    written,
+                    slice: false,
+                    i64_pair: false,
+                    tagged: None,
+                    recursive: None,
+                });
+            }
+        }
+    }
     if !by_ref {
         if crate::lower::js::i64_pair::is_i64(table, aggregate) {
             return Some(FlatParam {
@@ -2544,6 +2668,12 @@ fn shapes_agree(types: &TypeTable, shapes: &[Option<FlatParam>]) -> bool {
                     .iter()
                     .all(|ty| types.get(*ty).is_some());
         }
+        if shape.is_scalar_ref() {
+            return is_flattenable_scalar(types, shape.ty);
+        }
+        if shape.is_mut_enum(Some(types)) {
+            return mut_enum_shape(None, types, shape.ty, Some(&shape.field_tys)).is_some();
+        }
         if let Some(tagged) = &shape.tagged {
             return tagged_shape(types, shape.ty).as_ref() == Some(tagged);
         }
@@ -2559,6 +2689,292 @@ fn shapes_agree(types: &TypeTable, shapes: &[Option<FlatParam>]) -> bool {
                     .iter()
                     .all(|field| store_view_ty(types, shape.field_tys[*field as usize]).is_some()))
     })
+}
+
+/// Whether `ty` is a non-ZST `Copy` 1-lane scalar eligible for `&Scalar` / `&mut Scalar`
+/// flattening (`Bool`, `Char`, `Integer { bits <= 32 }`, `Float`, `is_primitive_enum`).
+fn is_flattenable_scalar(table: &TypeTable, ty: TypeId) -> bool {
+    let Some(outer) = table.get(ty) else {
+        return false;
+    };
+    if !outer.layout.sized
+        || outer.layout.zst
+        || outer.layout.needs_drop
+        || outer.js.crosses_transparent_union
+        || outer.meta.boundary != PinnedBoundary::None
+        || outer.meta.abi == NominalAbi::C
+    {
+        return false;
+    }
+    let Some(peeled) = table.get(table.peeled(ty)) else {
+        return false;
+    };
+    if !peeled.layout.sized
+        || peeled.layout.zst
+        || peeled.layout.needs_drop
+        || peeled.js.is_indirect
+        || peeled.js.needs_clone
+        || peeled.js.pointer_form.is_some()
+    {
+        return false;
+    }
+    matches!(
+        peeled.kind,
+        TypeKind::Bool | TypeKind::Char | TypeKind::Float { .. }
+    ) || matches!(peeled.kind, TypeKind::Integer { bits, .. } if bits <= 32)
+        || peeled.js.is_primitive_enum
+}
+
+fn has_pattern_type(table: &TypeTable, ty: TypeId) -> bool {
+    let mut cur = ty;
+    for _ in 0..16 {
+        let Some(desc) = table.get(cur) else {
+            return true;
+        };
+        if matches!(desc.kind, TypeKind::Pattern(_)) {
+            return true;
+        }
+        if let Some(inner) = desc.js.transparent {
+            cur = inner.ty;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn is_mut_enum_ty(table: &TypeTable, ty: TypeId) -> bool {
+    let Some(descriptor) = table.get(ty) else {
+        return false;
+    };
+    matches!(
+        (&descriptor.kind, descriptor.js.enum_repr),
+        (
+            TypeKind::Adt {
+                form: NominalForm::Enum,
+                variants,
+                ..
+            },
+            Some(EnumRepr::Tag { fieldless: false })
+        ) if (2..=4).contains(&variants.len())
+    )
+}
+
+#[derive(Clone, Debug)]
+struct MutEnumVariant {
+    logical_discr: i128,
+    field_tys: Vec<TypeId>,
+}
+
+#[derive(Clone, Debug)]
+struct MutEnumShape {
+    ty: TypeId,
+    discr_ty: TypeId,
+    discr_bytes: u8,
+    variants: Vec<MutEnumVariant>,
+    payload_tys: Vec<TypeId>,
+}
+
+fn mut_enum_shape(
+    func: Option<&Func>,
+    table: &TypeTable,
+    ty: TypeId,
+    expected_field_tys: Option<&[TypeId]>,
+) -> Option<MutEnumShape> {
+    const MAX_MUT_ENUM_VARIANTS: usize = 4;
+    const MAX_MUT_ENUM_PAYLOADS: usize = 8;
+
+    let descriptor = table.get(ty)?;
+    if !descriptor.layout.sized
+        || descriptor.layout.zst
+        || descriptor.layout.needs_drop
+        || descriptor.meta.abi == NominalAbi::C
+        || descriptor.meta.boundary != PinnedBoundary::None
+        || descriptor.js.transparent.is_some()
+        || descriptor.js.unsized_tail.is_some()
+        || !table.is_indirect(ty)
+        || descriptor.js.enum_repr != Some(EnumRepr::Tag { fieldless: false })
+    {
+        return None;
+    }
+    let TypeKind::Adt {
+        form: NominalForm::Enum,
+        variants,
+        ..
+    } = &descriptor.kind
+    else {
+        return None;
+    };
+    if !(2..=MAX_MUT_ENUM_VARIANTS).contains(&variants.len()) {
+        return None;
+    }
+
+    let mut payload_tys = Vec::new();
+    let mut out_variants = Vec::with_capacity(variants.len());
+    for (variant_index, variant) in variants.iter().enumerate() {
+        if !candidates::field_reads_resolve(table, ty, variant_index as u32, variant.fields.len()) {
+            return None;
+        }
+        let mut field_tys = Vec::with_capacity(variant.fields.len());
+        for field in &variant.fields {
+            field_tys.push(field.ty);
+            if table.is_zst(field.ty) {
+                continue;
+            }
+            if !is_flattenable_scalar(table, field.ty)
+                || has_pattern_type(table, field.ty)
+                || default_const_tree(table, field.ty).is_none()
+            {
+                return None;
+            }
+            payload_tys.push(field.ty);
+            if payload_tys.len() > MAX_MUT_ENUM_PAYLOADS {
+                return None;
+            }
+        }
+        out_variants.push(MutEnumVariant {
+            logical_discr: variant.logical_discr,
+            field_tys,
+        });
+    }
+    if payload_tys.is_empty() {
+        return None;
+    }
+
+    let (discr_ty, discr_bytes) = if let Some(expected) = expected_field_tys {
+        let (&discr_ty, rest) = expected.split_first()?;
+        if rest != payload_tys.as_slice() {
+            return None;
+        }
+        let bytes = fits_discr_ty(table, discr_ty, &out_variants)?;
+        (discr_ty, bytes)
+    } else {
+        enum_discr_type(func, table, ty, &out_variants)?
+    };
+
+    Some(MutEnumShape {
+        ty,
+        discr_ty,
+        discr_bytes,
+        variants: out_variants,
+        payload_tys,
+    })
+}
+
+fn fits_int(value: i128, signed: bool, bits: u32) -> bool {
+    if bits == 0 {
+        return false;
+    }
+    if signed {
+        bits >= 128 || {
+            let bound = 1i128 << (bits - 1);
+            value >= -bound && value < bound
+        }
+    } else {
+        value >= 0 && (bits >= 128 || (value as u128) < (1u128 << bits))
+    }
+}
+
+fn fits_discr_ty(table: &TypeTable, ty: TypeId, variants: &[MutEnumVariant]) -> Option<u8> {
+    let (signed, bits) = table.int_info(ty)?;
+    if bits > 32 {
+        return None;
+    }
+    let bytes = u8::try_from((bits / 8).max(1)).ok()?;
+    variants
+        .iter()
+        .all(|v| fits_int(v.logical_discr, signed, bits))
+        .then_some(bytes)
+}
+
+fn enum_discr_type(
+    func: Option<&Func>,
+    table: &TypeTable,
+    enum_ty: TypeId,
+    variants: &[MutEnumVariant],
+) -> Option<(TypeId, u8)> {
+    if let Some(func) = func {
+        for block in &func.blocks {
+            for op in &block.ops {
+                if let OpKind::Discriminant(v) = op.kind {
+                    if func
+                        .values
+                        .get(v.0 as usize)
+                        .is_some_and(|d| d.ty == enum_ty)
+                    {
+                        if let Some(res) = op.result {
+                            let res_ty = func.values[res.0 as usize].ty;
+                            if let Some(bytes) = fits_discr_ty(table, res_ty, variants) {
+                                return Some((res_ty, bytes));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some((ty, bytes)) = table
+        .descriptors()
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.kind,
+                TypeKind::Integer {
+                    signed: true,
+                    bits: 32
+                }
+            )
+        })
+        .find_map(|d| fits_discr_ty(table, d.id, variants).map(|bytes| (d.id, bytes)))
+    {
+        return Some((ty, bytes));
+    }
+    table
+        .descriptors()
+        .iter()
+        .find_map(|d| fits_discr_ty(table, d.id, variants).map(|bytes| (d.id, bytes)))
+}
+
+fn default_const_tree(table: &TypeTable, ty: TypeId) -> Option<ConstTree> {
+    let descriptor = table.get(ty)?;
+    if descriptor.layout.zst {
+        return Some(ConstTree::Unit);
+    }
+    if let Some(inner) = descriptor.js.transparent {
+        return default_const_tree(table, inner.ty);
+    }
+    match &descriptor.kind {
+        TypeKind::Bool => Some(ConstTree::Scalar { bits: 0, bytes: 1 }),
+        TypeKind::Char => Some(ConstTree::Scalar { bits: 0, bytes: 4 }),
+        TypeKind::Integer { bits, .. } | TypeKind::Float { bits } if *bits <= 64 => {
+            Some(ConstTree::Scalar {
+                bits: 0,
+                bytes: (*bits / 8).max(1) as u8,
+            })
+        }
+        TypeKind::Adt {
+            form: NominalForm::Enum,
+            variants,
+            ..
+        } if descriptor.js.is_primitive_enum && !variants.is_empty() => {
+            let fields = variants
+                .first()?
+                .fields
+                .iter()
+                .map(|field| table.is_zst(field.ty).then_some(ConstTree::Unit))
+                .collect::<Option<Vec<_>>>()?;
+            Some(ConstTree::Variant { variant: 0, fields })
+        }
+        _ => None,
+    }
+}
+
+fn mask_bits(bits: u128, bytes: u8) -> u128 {
+    match bytes {
+        0 => 0,
+        1..=15 => bits & ((1_u128 << (u32::from(bytes) * 8)) - 1),
+        _ => bits,
+    }
 }
 
 /// Closes the per-parameter summaries over the calls between them.
@@ -2613,12 +3029,28 @@ fn close_over_forwards(candidates: &BTreeMap<ItemId, Candidate>) -> BTreeMap<Ite
 /// The old parameter's [`ValueId`] is kept and *redefined* by the op that rebuilds it — the
 /// aggregate itself for a by-value parameter, a borrow of that aggregate for a by-reference one —
 /// so not a single use in the body has to be touched.
+#[cfg(test)]
 pub fn rewrite_callee(func: &mut Func, sig: &FlatSig) {
+    rewrite_callee_with(func, sig, None);
+}
+
+fn rewrite_callee_with(func: &mut Func, sig: &FlatSig, types: Option<&TypeTable>) {
     let mut entry_ops: Vec<Op> = Vec::new();
     let mut params: Vec<ValueId> = Vec::new();
     // The rebuilt aggregate of each flat parameter, for the copy-back below.
     let mut aggregates: BTreeMap<usize, ValueId> = BTreeMap::new();
+    let mut scalar_cells: BTreeMap<usize, CellId> = BTreeMap::new();
+    struct MutEnumEntry {
+        orig_param: ValueId,
+        shape: MutEnumShape,
+        tag_param: ValueId,
+        payload_params: Vec<ValueId>,
+    }
+    let mut mut_enum_entries: Vec<MutEnumEntry> = Vec::new();
+    let mut orig_params_by_pos: BTreeMap<usize, ValueId> = BTreeMap::new();
+
     for (position, param) in func.params.clone().iter().enumerate() {
+        orig_params_by_pos.insert(position, *param);
         let Some(flat) = sig.params.get(position).and_then(Option::as_ref) else {
             params.push(*param);
             continue;
@@ -2631,6 +3063,60 @@ pub fn rewrite_callee(func: &mut Func, sig: &FlatSig) {
             continue;
         }
         let origin = func.values[param.0 as usize].origin;
+        if flat.is_scalar_ref() {
+            let v_in = define(func, flat.ty, origin);
+            params.push(v_in);
+            let cell = CellId(func.cells.len() as u32);
+            func.cells.push(CellDef {
+                ty: flat.ty,
+                boxed: true,
+                origin,
+            });
+            entry_ops.push(Op {
+                result: None,
+                origin,
+                kind: OpKind::CellAlloc(cell),
+            });
+            entry_ops.push(Op {
+                result: None,
+                origin,
+                kind: OpKind::CellStore { cell, v: v_in },
+            });
+            entry_ops.push(Op {
+                result: Some(*param),
+                origin,
+                kind: OpKind::BorrowView {
+                    root: Root::Cell(cell),
+                    path: Vec::new(),
+                    mutable: flat.mutable,
+                },
+            });
+            scalar_cells.insert(position, cell);
+            continue;
+        }
+        if flat.is_mut_enum(types) {
+            let shape = types
+                .and_then(|types| mut_enum_shape(None, types, flat.ty, Some(&flat.field_tys)))
+                .expect("mut_enum parameter shape validated before rewrite");
+            let tag_param = define(func, shape.discr_ty, origin);
+            params.push(tag_param);
+            let payload_params: Vec<ValueId> = shape
+                .payload_tys
+                .iter()
+                .map(|ty| {
+                    let value = define(func, *ty, origin);
+                    params.push(value);
+                    value
+                })
+                .collect();
+            mut_enum_entries.push(MutEnumEntry {
+                orig_param: *param,
+                shape,
+                tag_param,
+                payload_params,
+            });
+            continue;
+        }
         // One value per field of the aggregate, in declaration order: a parameter for a field the
         // caller passes, its own zero-sized constant for one the caller leaves out.
         let fields: Vec<ValueId> = flat
@@ -2681,14 +3167,90 @@ pub fn rewrite_callee(func: &mut Func, sig: &FlatSig) {
     }
     func.params.clone_from(&params);
     func.blocks[0].params = params;
-    let ops = std::mem::take(&mut func.blocks[0].ops);
-    func.blocks[0].ops = entry_ops.into_iter().chain(ops).collect();
+    let orig_ops = std::mem::take(&mut func.blocks[0].ops);
+    if mut_enum_entries.is_empty() {
+        func.blocks[0].ops = entry_ops.into_iter().chain(orig_ops).collect();
+    } else {
+        let orig_term = std::mem::replace(&mut func.blocks[0].term, RTerm::Unreachable);
+        func.blocks[0].ops = entry_ops;
+        let mut cur_block = RBlockId(0);
+        for entry in mut_enum_entries {
+            let origin = func.values[entry.orig_param.0 as usize].origin;
+            let k = entry.shape.variants.len();
+            let join = push_block(func);
+            let mut arms = Vec::with_capacity(k);
+            let mut payload_cursor = 0usize;
+            for (variant_index, variant) in entry.shape.variants.iter().enumerate() {
+                let arm = push_block(func);
+                let mut fields = Vec::with_capacity(variant.field_tys.len());
+                for &field_ty in &variant.field_tys {
+                    if types.is_some_and(|types| types.is_zst(field_ty)) {
+                        let unit = define(func, field_ty, origin);
+                        func.blocks[arm.0 as usize].ops.push(Op {
+                            result: Some(unit),
+                            origin,
+                            kind: OpKind::Const(ConstTree::Unit),
+                        });
+                        fields.push(unit);
+                    } else {
+                        fields.push(entry.payload_params[payload_cursor]);
+                        payload_cursor += 1;
+                    }
+                }
+                let agg_v = define(func, entry.shape.ty, origin);
+                func.blocks[arm.0 as usize].ops.push(Op {
+                    result: Some(agg_v),
+                    origin,
+                    kind: OpKind::Aggregate {
+                        ty: entry.shape.ty,
+                        variant: variant_index as u32,
+                        active_field: None,
+                        fields,
+                    },
+                });
+                func.blocks[arm.0 as usize].term = RTerm::Goto(join, vec![agg_v]);
+                arms.push(arm);
+            }
+            let cases: Vec<(u128, RBlockId, Vec<ValueId>)> = entry.shape.variants[..k - 1]
+                .iter()
+                .enumerate()
+                .map(|(variant_index, variant)| {
+                    (
+                        mask_bits(variant.logical_discr as u128, entry.shape.discr_bytes),
+                        arms[variant_index],
+                        Vec::new(),
+                    )
+                })
+                .collect();
+            func.blocks[cur_block.0 as usize].term = RTerm::Switch {
+                scrut: entry.tag_param,
+                scrut_ty: entry.shape.discr_ty,
+                cases,
+                default: (arms[k - 1], Vec::new()),
+            };
+            let agg_init = define(func, entry.shape.ty, origin);
+            func.blocks[join.0 as usize].params.push(agg_init);
+            func.blocks[join.0 as usize].ops.push(Op {
+                result: Some(entry.orig_param),
+                origin,
+                kind: OpKind::BorrowView {
+                    root: Root::Value(agg_init),
+                    path: Vec::new(),
+                    mutable: true,
+                },
+            });
+            cur_block = join;
+        }
+        func.blocks[cur_block.0 as usize].ops.extend(orig_ops);
+        func.blocks[cur_block.0 as usize].term = orig_term;
+    }
 
     // Result lanes and mutable-reference out-fields leave at every `Return`. A `Throw` writes no
     // spill state: the caller never reaches the immediately-following reads.
     let outs = sig.out_fields();
     if sig.result.is_some() || !outs.is_empty() {
-        for block in 0..func.blocks.len() {
+        let orig_block_count = func.blocks.len();
+        for block in 0..orig_block_count {
             let returned = match &func.blocks[block].term {
                 RTerm::Return(value) => *value,
                 _ => continue,
@@ -2726,23 +3288,62 @@ pub fn rewrite_callee(func: &mut Func, sig: &FlatSig) {
                     value
                 })
                 .collect();
-            let out_reads: Vec<ValueId> = outs
-                .iter()
-                .map(|out| {
-                    let value = define(func, sig.out_ty(*out), origin);
-                    let base = aggregates[&out.0];
-                    func.blocks[block].ops.push(Op {
+
+            let mut cur_block = RBlockId(block as u32);
+            let mut out_reads: Vec<ValueId> = Vec::with_capacity(outs.len());
+            for (position, param_opt) in sig.params.iter().enumerate() {
+                let Some(param) = param_opt else { continue };
+                if !(param.by_ref && param.mutable && param.written) {
+                    continue;
+                }
+                if param.is_scalar_ref() {
+                    let value = define(func, param.ty, origin);
+                    func.blocks[cur_block.0 as usize].ops.push(Op {
                         result: Some(value),
                         origin,
-                        kind: OpKind::Field {
-                            base,
-                            variant: None,
-                            field: out.1,
-                        },
+                        kind: OpKind::CellLoad(scalar_cells[&position]),
                     });
-                    value
-                })
-                .collect();
+                    out_reads.push(value);
+                } else if param.is_mut_enum(types) {
+                    let types = types.expect("mut_enum requires TypeTable");
+                    let shape = mut_enum_shape(None, types, param.ty, Some(&param.field_tys))
+                        .expect("validated mut_enum shape");
+                    let cur = define(func, shape.ty, origin);
+                    func.blocks[cur_block.0 as usize].ops.push(Op {
+                        result: Some(cur),
+                        origin,
+                        kind: OpKind::Deref(orig_params_by_pos[&position]),
+                    });
+                    let discr = define(func, shape.discr_ty, origin);
+                    func.blocks[cur_block.0 as usize].ops.push(Op {
+                        result: Some(discr),
+                        origin,
+                        kind: OpKind::Discriminant(cur),
+                    });
+                    let join = push_block(func);
+                    let extracted = emit_mut_enum_extract(
+                        func, types, cur_block, cur, discr, &shape, join, origin,
+                    );
+                    cur_block = join;
+                    out_reads.extend(extracted);
+                } else {
+                    let base = aggregates[&position];
+                    for &field in &param.passed {
+                        let value = define(func, param.field_tys[field as usize], origin);
+                        func.blocks[cur_block.0 as usize].ops.push(Op {
+                            result: Some(value),
+                            origin,
+                            kind: OpKind::Field {
+                                base,
+                                variant: None,
+                                field,
+                            },
+                        });
+                        out_reads.push(value);
+                    }
+                }
+            }
+
             let mut spilled: Vec<ValueId> = result_reads.iter().skip(1).copied().collect();
             spilled.extend(out_reads.iter().skip(usize::from(sig.returns_out_field)));
             let result_offset = sig
@@ -2753,7 +3354,7 @@ pub fn rewrite_callee(func: &mut Func, sig: &FlatSig) {
                 })
                 .map_or(0, |_| sig.result_spills());
             for (index, value) in spilled.into_iter().enumerate() {
-                func.blocks[block].ops.push(Op {
+                func.blocks[cur_block.0 as usize].ops.push(Op {
                     result: None,
                     origin,
                     kind: OpKind::SpillWrite {
@@ -2766,7 +3367,7 @@ pub fn rewrite_callee(func: &mut Func, sig: &FlatSig) {
                 .first()
                 .or_else(|| sig.returns_out_field.then(|| &out_reads[0]))
             {
-                func.blocks[block].term = RTerm::Return(Some(*primary));
+                func.blocks[cur_block.0 as usize].term = RTerm::Return(Some(*primary));
             }
         }
         if let Some(result) = sig.result.as_ref().filter(|result| {
@@ -2787,13 +3388,112 @@ pub fn rewrite_callee(func: &mut Func, sig: &FlatSig) {
         .collect();
 }
 
+/// Emits the switch + arms extracting `(tag, payload_lanes...)` from `enum_val` into `join`
+/// block parameters, returning `join`'s parameter `ValueId`s.
+#[allow(clippy::too_many_arguments)]
+fn emit_mut_enum_extract(
+    func: &mut Func,
+    types: &TypeTable,
+    switch_block: RBlockId,
+    enum_val: ValueId,
+    discr: ValueId,
+    shape: &MutEnumShape,
+    join: RBlockId,
+    origin: OriginId,
+) -> Vec<ValueId> {
+    let k = shape.variants.len();
+    let mut arms = Vec::with_capacity(k);
+    for (variant_index, variant) in shape.variants.iter().enumerate() {
+        let arm = push_block(func);
+        let tag_val = define(func, shape.discr_ty, origin);
+        func.blocks[arm.0 as usize].ops.push(Op {
+            result: Some(tag_val),
+            origin,
+            kind: OpKind::Const(ConstTree::Scalar {
+                bits: mask_bits(variant.logical_discr as u128, shape.discr_bytes),
+                bytes: shape.discr_bytes,
+            }),
+        });
+        let mut edge_args = Vec::with_capacity(1 + shape.payload_tys.len());
+        edge_args.push(tag_val);
+        for (w_index, w_variant) in shape.variants.iter().enumerate() {
+            for (field_index, &field_ty) in w_variant.field_tys.iter().enumerate() {
+                if types.is_zst(field_ty) {
+                    continue;
+                }
+                let val = define(func, field_ty, origin);
+                if w_index == variant_index {
+                    func.blocks[arm.0 as usize].ops.push(Op {
+                        result: Some(val),
+                        origin,
+                        kind: OpKind::Field {
+                            base: enum_val,
+                            variant: (variant_index != 0).then_some(variant_index as u32),
+                            field: field_index as u32,
+                        },
+                    });
+                } else {
+                    let dummy =
+                        default_const_tree(types, field_ty).expect("validated mut_enum field");
+                    func.blocks[arm.0 as usize].ops.push(Op {
+                        result: Some(val),
+                        origin,
+                        kind: OpKind::Const(dummy),
+                    });
+                }
+                edge_args.push(val);
+            }
+        }
+        func.blocks[arm.0 as usize].term = RTerm::Goto(join, edge_args);
+        arms.push(arm);
+    }
+    let cases: Vec<(u128, RBlockId, Vec<ValueId>)> = shape.variants[..k - 1]
+        .iter()
+        .enumerate()
+        .map(|(variant_index, variant)| {
+            (
+                mask_bits(variant.logical_discr as u128, shape.discr_bytes),
+                arms[variant_index],
+                Vec::new(),
+            )
+        })
+        .collect();
+    func.blocks[switch_block.0 as usize].term = RTerm::Switch {
+        scrut: discr,
+        scrut_ty: shape.discr_ty,
+        cases,
+        default: (arms[k - 1], Vec::new()),
+    };
+    let mut join_params = Vec::with_capacity(1 + shape.payload_tys.len());
+    let tag_join = define(func, shape.discr_ty, origin);
+    join_params.push(tag_join);
+    for &ty in &shape.payload_tys {
+        join_params.push(define(func, ty, origin));
+    }
+    func.blocks[join.0 as usize].params = join_params.clone();
+    join_params
+}
+
+fn push_block(func: &mut Func) -> RBlockId {
+    let id = RBlockId(func.blocks.len() as u32);
+    func.blocks.push(RBlock {
+        id,
+        params: Vec::new(),
+        ops: Vec::new(),
+        term: RTerm::Unreachable,
+    });
+    id
+}
+
 /// Rewrites every call `func` makes to a flat callee, in place.
 ///
 /// `table` is the *caller's* type table, which is what the copy-back's views are typed out of.
 pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>) {
-    for block in 0..func.blocks.len() {
+    let orig_block_count = func.blocks.len();
+    for block in 0..orig_block_count {
         let ops = std::mem::take(&mut func.blocks[block].ops);
-        let mut out: Vec<Op> = Vec::with_capacity(ops.len());
+        let orig_term = std::mem::replace(&mut func.blocks[block].term, RTerm::Unreachable);
+        let mut cur_block = RBlockId(block as u32);
         for mut op in ops {
             let sig = match &op.kind {
                 OpKind::Call {
@@ -2804,7 +3504,7 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
                 _ => None,
             };
             let (Some(sig), OpKind::Call { args, .. }) = (sig, &op.kind) else {
-                out.push(op);
+                func.blocks[cur_block.0 as usize].ops.push(op);
                 continue;
             };
             let origin = op.origin;
@@ -2823,13 +3523,49 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
                     flat_args.push(*arg);
                     continue;
                 }
+                if flat.is_scalar_ref() {
+                    let val = define(func, flat.ty, origin);
+                    func.blocks[cur_block.0 as usize].ops.push(Op {
+                        result: Some(val),
+                        origin,
+                        kind: OpKind::Deref(*arg),
+                    });
+                    flat_args.push(val);
+                    pointers.insert(position, *arg);
+                    continue;
+                }
+                if flat.is_mut_enum(table) {
+                    let types = table.expect("mut_enum requires TypeTable");
+                    let shape = mut_enum_shape(None, types, flat.ty, Some(&flat.field_tys))
+                        .expect("validated mut_enum shape");
+                    let cur = define(func, shape.ty, origin);
+                    func.blocks[cur_block.0 as usize].ops.push(Op {
+                        result: Some(cur),
+                        origin,
+                        kind: OpKind::Deref(*arg),
+                    });
+                    let discr = define(func, shape.discr_ty, origin);
+                    func.blocks[cur_block.0 as usize].ops.push(Op {
+                        result: Some(discr),
+                        origin,
+                        kind: OpKind::Discriminant(cur),
+                    });
+                    let join = push_block(func);
+                    let extracted = emit_mut_enum_extract(
+                        func, types, cur_block, cur, discr, &shape, join, origin,
+                    );
+                    cur_block = join;
+                    flat_args.extend(extracted);
+                    pointers.insert(position, *arg);
+                    continue;
+                }
                 // Reading the pointee by value is exactly what a `Deref` is; the *writes* below
                 // go back through the pointer rather than through this copy.
                 let base = match flat.by_ref {
                     false => *arg,
                     true => {
                         let base = define(func, flat.ty, origin);
-                        out.push(Op {
+                        func.blocks[cur_block.0 as usize].ops.push(Op {
                             result: Some(base),
                             origin,
                             kind: OpKind::Deref(*arg),
@@ -2840,7 +3576,7 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
                 for field in &flat.passed {
                     let ty = flat.field_tys[*field as usize];
                     let value = define(func, ty, origin);
-                    out.push(Op {
+                    func.blocks[cur_block.0 as usize].ops.push(Op {
                         result: Some(value),
                         origin,
                         kind: OpKind::Field {
@@ -2882,7 +3618,7 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
             if let OpKind::Call { args, .. } = &mut op.kind {
                 *args = flat_args;
             }
-            out.push(op);
+            func.blocks[cur_block.0 as usize].ops.push(op);
 
             // Rebuild the semantic aggregate result under its original ValueId. Partial escape
             // analysis removes this node because selection proved every alias is field-only.
@@ -2901,7 +3637,7 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
                             first
                         } else {
                             let value = define(func, *ty, origin);
-                            out.push(Op {
+                            func.blocks[cur_block.0 as usize].ops.push(Op {
                                 result: Some(value),
                                 origin,
                                 kind: OpKind::SpillRead(lane),
@@ -2912,7 +3648,7 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
                         value
                     } else {
                         let value = define(func, *ty, origin);
-                        out.push(Op {
+                        func.blocks[cur_block.0 as usize].ops.push(Op {
                             result: Some(value),
                             origin,
                             kind: OpKind::Const(ConstTree::Unit),
@@ -2921,7 +3657,7 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
                     };
                     fields.push(value);
                 }
-                out.push(Op {
+                func.blocks[cur_block.0 as usize].ops.push(Op {
                     result: Some(aggregate),
                     origin,
                     kind: OpKind::Aggregate {
@@ -2933,57 +3669,309 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
                 });
             }
 
-            // Copy mutable-reference out-fields back through the caller's pointer. Result lanes
-            // occupy the first spill registers; an out-field uses the primary return only in the
-            // old `fn(..) -> ()` case. `BorrowView`/`StoreThrough` is `lower/ssa.rs`'s shape for
-            // `(*p).f = v`; a `SetField` would mutate only the `Deref` copy.
-            for (index, out_field) in outs.iter().enumerate() {
-                let field_ty = sig.out_ty(*out_field);
-                let value = match (index, sig.returns_out_field) {
+            // Read every out-field from primary / SpillRead immediately after the Call so later
+            // control flow cannot clobber spill registers, then store back per parameter.
+            let out_values: Vec<ValueId> = outs
+                .iter()
+                .enumerate()
+                .map(|(index, out_field)| match (index, sig.returns_out_field) {
                     (0, true) => primary.expect("a flat return defines a value"),
                     _ => {
                         let register = sig.result_spills() + index as u32 + 1
                             - u32::from(sig.returns_out_field);
-                        let value = define(func, field_ty, origin);
-                        out.push(Op {
+                        let value = define(func, sig.out_ty(*out_field), origin);
+                        func.blocks[cur_block.0 as usize].ops.push(Op {
                             result: Some(value),
                             origin,
                             kind: OpKind::SpillRead(register),
                         });
                         value
                     }
-                };
-                let view_ty = table
-                    .and_then(|table| store_view_ty(table, field_ty))
-                    .unwrap_or(field_ty);
-                let view = define(func, view_ty, origin);
-                out.push(Op {
-                    result: Some(view),
-                    origin,
-                    kind: OpKind::BorrowView {
-                        root: Root::Value(pointers[&out_field.0]),
-                        path: vec![
-                            Proj::Deref,
-                            Proj::Field {
-                                field: out_field.1,
-                                ty: field_ty,
+                })
+                .collect();
+
+            let mut out_cursor = 0usize;
+            for (position, param_opt) in sig.params.iter().enumerate() {
+                let Some(param) = param_opt else { continue };
+                if !(param.by_ref && param.mutable && param.written) {
+                    continue;
+                }
+                if param.is_scalar_ref() {
+                    let value = out_values[out_cursor];
+                    out_cursor += 1;
+                    func.blocks[cur_block.0 as usize].ops.push(Op {
+                        result: None,
+                        origin,
+                        kind: OpKind::StoreThrough {
+                            ptr: pointers[&position],
+                            v: value,
+                        },
+                    });
+                } else if param.is_mut_enum(table) {
+                    let types = table.expect("mut_enum requires TypeTable");
+                    let shape = mut_enum_shape(None, types, param.ty, Some(&param.field_tys))
+                        .expect("validated mut_enum shape");
+                    let out_tag = out_values[out_cursor];
+                    let out_payloads =
+                        &out_values[out_cursor + 1..out_cursor + 1 + shape.payload_tys.len()];
+                    out_cursor += 1 + shape.payload_tys.len();
+                    let k = shape.variants.len();
+                    let join = push_block(func);
+                    let mut arms = Vec::with_capacity(k);
+                    let mut payload_cursor = 0usize;
+                    for (variant_index, variant) in shape.variants.iter().enumerate() {
+                        let arm = push_block(func);
+                        let mut fields = Vec::with_capacity(variant.field_tys.len());
+                        for &field_ty in &variant.field_tys {
+                            if types.is_zst(field_ty) {
+                                let unit = define(func, field_ty, origin);
+                                func.blocks[arm.0 as usize].ops.push(Op {
+                                    result: Some(unit),
+                                    origin,
+                                    kind: OpKind::Const(ConstTree::Unit),
+                                });
+                                fields.push(unit);
+                            } else {
+                                fields.push(out_payloads[payload_cursor]);
+                                payload_cursor += 1;
+                            }
+                        }
+                        let agg_v = define(func, shape.ty, origin);
+                        func.blocks[arm.0 as usize].ops.push(Op {
+                            result: Some(agg_v),
+                            origin,
+                            kind: OpKind::Aggregate {
+                                ty: shape.ty,
+                                variant: variant_index as u32,
+                                active_field: None,
+                                fields,
                             },
-                        ],
-                        mutable: true,
-                    },
-                });
-                out.push(Op {
-                    result: None,
-                    origin,
-                    kind: OpKind::StoreThrough {
-                        ptr: view,
-                        v: value,
-                    },
-                });
+                        });
+                        func.blocks[arm.0 as usize].term = RTerm::Goto(join, vec![agg_v]);
+                        arms.push(arm);
+                    }
+                    let cases: Vec<(u128, RBlockId, Vec<ValueId>)> = shape.variants[..k - 1]
+                        .iter()
+                        .enumerate()
+                        .map(|(variant_index, variant)| {
+                            (
+                                mask_bits(variant.logical_discr as u128, shape.discr_bytes),
+                                arms[variant_index],
+                                Vec::new(),
+                            )
+                        })
+                        .collect();
+                    func.blocks[cur_block.0 as usize].term = RTerm::Switch {
+                        scrut: out_tag,
+                        scrut_ty: shape.discr_ty,
+                        cases,
+                        default: (arms[k - 1], Vec::new()),
+                    };
+                    let rebuilt = define(func, shape.ty, origin);
+                    func.blocks[join.0 as usize].params.push(rebuilt);
+                    func.blocks[join.0 as usize].ops.push(Op {
+                        result: None,
+                        origin,
+                        kind: OpKind::StoreThrough {
+                            ptr: pointers[&position],
+                            v: rebuilt,
+                        },
+                    });
+                    cur_block = join;
+                } else {
+                    for &field in &param.passed {
+                        let field_ty = param.field_tys[field as usize];
+                        let value = out_values[out_cursor];
+                        out_cursor += 1;
+                        let view_ty = table
+                            .and_then(|table| store_view_ty(table, field_ty))
+                            .unwrap_or(field_ty);
+                        let view = define(func, view_ty, origin);
+                        func.blocks[cur_block.0 as usize].ops.push(Op {
+                            result: Some(view),
+                            origin,
+                            kind: OpKind::BorrowView {
+                                root: Root::Value(pointers[&position]),
+                                path: vec![
+                                    Proj::Deref,
+                                    Proj::Field {
+                                        field,
+                                        ty: field_ty,
+                                    },
+                                ],
+                                mutable: true,
+                            },
+                        });
+                        func.blocks[cur_block.0 as usize].ops.push(Op {
+                            result: None,
+                            origin,
+                            kind: OpKind::StoreThrough {
+                                ptr: view,
+                                v: value,
+                            },
+                        });
+                    }
+                }
             }
         }
-        func.blocks[block].ops = out;
+        func.blocks[cur_block.0 as usize].term = orig_term;
     }
+}
+
+/// Unboxes boxed scalar cells whose entire address-taken use closure has been reduced to direct
+/// `Deref`/`StoreThrough` operations after `rewrite_callee`/`rewrite_calls`.
+fn unbox_scalar_ref_cells(func: &mut Func, types: &TypeTable) {
+    let mut dead_views: BTreeSet<ValueId> = BTreeSet::new();
+    for cell_idx in 0..func.cells.len() {
+        let cell_id = CellId(cell_idx as u32);
+        let cell = func.cells[cell_idx];
+        if !cell.boxed || !is_flattenable_scalar(types, cell.ty) {
+            continue;
+        }
+        let mut views = BTreeSet::new();
+        let mut cell_ok = true;
+        for block in &func.blocks {
+            for op in &block.ops {
+                match &op.kind {
+                    OpKind::BorrowView {
+                        root: Root::Cell(c),
+                        path,
+                        ..
+                    } if *c == cell_id => {
+                        if !path.is_empty() {
+                            cell_ok = false;
+                            break;
+                        }
+                        if let Some(result) = op.result {
+                            views.insert(result);
+                        } else {
+                            cell_ok = false;
+                            break;
+                        }
+                    }
+                    OpKind::RawView {
+                        root: Root::Cell(c),
+                        ..
+                    }
+                    | OpKind::Drop {
+                        root: Root::Cell(c),
+                        ..
+                    } if *c == cell_id => {
+                        cell_ok = false;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if !cell_ok {
+                break;
+            }
+        }
+        if !cell_ok || views.is_empty() {
+            continue;
+        }
+        loop {
+            let before = views.len();
+            for block in &func.blocks {
+                for op in &block.ops {
+                    match &op.kind {
+                        OpKind::Copy(src) | OpKind::Move(src) if views.contains(src) => {
+                            if let Some(result) = op.result {
+                                views.insert(result);
+                            }
+                        }
+                        OpKind::BorrowView {
+                            root: Root::Value(src),
+                            path,
+                            ..
+                        } if views.contains(src) && path.as_slice() == [Proj::Deref] => {
+                            if let Some(result) = op.result {
+                                views.insert(result);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if views.len() == before {
+                break;
+            }
+        }
+
+        let mut uses_ok = true;
+        for block in &func.blocks {
+            if block.term.uses().iter().any(|u| views.contains(u)) {
+                uses_ok = false;
+                break;
+            }
+            for op in &block.ops {
+                let uses_view = op.kind.uses().iter().any(|u| views.contains(u));
+                if !uses_view {
+                    continue;
+                }
+                let allowed = match &op.kind {
+                    OpKind::Deref(ptr) if views.contains(ptr) => true,
+                    OpKind::StoreThrough { ptr, v }
+                        if views.contains(ptr) && !views.contains(v) =>
+                    {
+                        true
+                    }
+                    OpKind::Copy(src) | OpKind::Move(src)
+                        if views.contains(src) && op.result.is_some() =>
+                    {
+                        true
+                    }
+                    OpKind::BorrowView {
+                        root: Root::Value(src),
+                        path,
+                        ..
+                    } if views.contains(src)
+                        && path.as_slice() == [Proj::Deref]
+                        && op.result.is_some() =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+                if !allowed {
+                    uses_ok = false;
+                    break;
+                }
+            }
+            if !uses_ok {
+                break;
+            }
+        }
+        if !uses_ok {
+            continue;
+        }
+
+        func.cells[cell_idx].boxed = false;
+        for block in &mut func.blocks {
+            let mut new_ops = Vec::with_capacity(block.ops.len());
+            for mut op in std::mem::take(&mut block.ops) {
+                if let Some(r) = op.result.filter(|r| views.contains(r)) {
+                    dead_views.insert(r);
+                    continue;
+                }
+                match &op.kind {
+                    OpKind::Deref(ptr) if views.contains(ptr) => {
+                        op.kind = OpKind::CellLoad(cell_id);
+                    }
+                    OpKind::StoreThrough { ptr, v } if views.contains(ptr) => {
+                        op.kind = OpKind::CellStore {
+                            cell: cell_id,
+                            v: *v,
+                        };
+                    }
+                    _ => {}
+                }
+                new_ops.push(op);
+            }
+            block.ops = new_ops;
+        }
+    }
+    crate::lower::ssa::compact_values(func, &dead_views);
 }
 
 /// Defines a fresh SSA value of type `ty`. The caller owes it exactly one definition site.
@@ -4333,5 +5321,394 @@ mod tests {
             OpKind::BorrowView { path, .. }
                 if matches!(path.as_slice(), [Proj::Deref, Proj::Field { field: 1, .. }])
         )));
+    }
+
+    #[test]
+    fn scalar_ref_and_mut_enum_rewrite_verify_and_unbox() {
+        let mut interns = interns();
+        let i32_ty = TypeId(100);
+        let ref_i32_ty = TypeId(101);
+        let state_ty = TypeId(102);
+        let ref_state_ty = TypeId(103);
+        let mut i32_desc = descriptor(
+            i32_ty,
+            TypeKind::Integer {
+                signed: true,
+                bits: 32,
+            },
+        );
+        i32_desc.js.int = Some(crate::jir::types::IntFacts {
+            signed: true,
+            bits: 32,
+            repr: crate::jir::types::IntRepr::Number,
+        });
+        interns.types.insert(i32_desc);
+        interns.types.insert(descriptor(
+            ref_i32_ty,
+            TypeKind::Reference {
+                pointee: i32_ty,
+                mutable: true,
+            },
+        ));
+        let loading_name = StrId(interns.strings.len() as u32);
+        interns.strings.push("Loading".to_owned());
+        let ready_name = StrId(interns.strings.len() as u32);
+        interns.strings.push("Ready".to_owned());
+        let idle_name = StrId(interns.strings.len() as u32);
+        interns.strings.push("Idle".to_owned());
+        let p_name = StrId(interns.strings.len() as u32);
+        interns.strings.push("progress".to_owned());
+        let r_name = StrId(interns.strings.len() as u32);
+        interns.strings.push("retries".to_owned());
+        let v_name = StrId(interns.strings.len() as u32);
+        interns.strings.push("value".to_owned());
+        let mut state_desc = descriptor(
+            state_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 42,
+                },
+                args: Vec::new(),
+                form: NominalForm::Enum,
+                variants: vec![
+                    crate::jir::types::VariantDescriptor {
+                        name: idle_name,
+                        fields: Vec::new(),
+                        logical_discr: 0,
+                        physical_tag: Some(crate::jir::types::NominalDiscriminant {
+                            bits: 0,
+                            bytes: 1,
+                        }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    crate::jir::types::VariantDescriptor {
+                        name: loading_name,
+                        fields: vec![
+                            FieldDescriptor {
+                                key: FieldKey::Name(p_name),
+                                ty: i32_ty,
+                                offset: 0,
+                            },
+                            FieldDescriptor {
+                                key: FieldKey::Name(r_name),
+                                ty: i32_ty,
+                                offset: 4,
+                            },
+                        ],
+                        logical_discr: 1,
+                        physical_tag: Some(crate::jir::types::NominalDiscriminant {
+                            bits: 1,
+                            bytes: 1,
+                        }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                    crate::jir::types::VariantDescriptor {
+                        name: ready_name,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(v_name),
+                            ty: i32_ty,
+                            offset: 0,
+                        }],
+                        logical_discr: 2,
+                        physical_tag: Some(crate::jir::types::NominalDiscriminant {
+                            bits: 2,
+                            bytes: 1,
+                        }),
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    },
+                ],
+                niche: None,
+            },
+        );
+        state_desc.js.is_indirect = true;
+        state_desc.js.needs_clone = true;
+        state_desc.js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+        interns.types.insert(state_desc);
+        interns.types.insert(descriptor(
+            ref_state_ty,
+            TypeKind::Reference {
+                pointee: state_ty,
+                mutable: true,
+            },
+        ));
+
+        let mut callee_b = FuncBuilder::new(
+            item(10),
+            signature(vec![ref_state_ty, i32_ty, ref_i32_ty], UNIT),
+        );
+        let p_state = callee_b.param(ref_state_ty, NO_ORIGIN);
+        let p_i = callee_b.param(i32_ty, NO_ORIGIN);
+        let p_acc = callee_b.param(ref_i32_ty, NO_ORIGIN);
+        let cur_s = callee_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Deref(p_state),
+            state_ty,
+            NO_ORIGIN,
+        );
+        let d = callee_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Discriminant(cur_s),
+            i32_ty,
+            NO_ORIGIN,
+        );
+        let arm_idle = callee_b.block();
+        let arm_loading = callee_b.block();
+        let arm_ready = callee_b.block();
+        let ret_block = callee_b.block();
+        callee_b.terminate(
+            FuncBuilder::ENTRY,
+            RTerm::Switch {
+                scrut: d,
+                scrut_ty: i32_ty,
+                cases: vec![(0, arm_idle, Vec::new()), (1, arm_loading, Vec::new())],
+                default: (arm_ready, Vec::new()),
+            },
+        );
+        // Idle -> Ready { value: p_i }
+        let agg0 = callee_b.op(
+            arm_idle,
+            OpKind::Aggregate {
+                ty: state_ty,
+                variant: 2,
+                active_field: None,
+                fields: vec![p_i],
+            },
+            state_ty,
+            NO_ORIGIN,
+        );
+        callee_b.effect(
+            arm_idle,
+            OpKind::StoreThrough {
+                ptr: p_state,
+                v: agg0,
+            },
+            NO_ORIGIN,
+        );
+        callee_b.terminate(arm_idle, RTerm::Goto(ret_block, Vec::new()));
+
+        // Loading -> Idle
+        let agg1 = callee_b.op(
+            arm_loading,
+            OpKind::Aggregate {
+                ty: state_ty,
+                variant: 0,
+                active_field: None,
+                fields: Vec::new(),
+            },
+            state_ty,
+            NO_ORIGIN,
+        );
+        callee_b.effect(
+            arm_loading,
+            OpKind::StoreThrough {
+                ptr: p_state,
+                v: agg1,
+            },
+            NO_ORIGIN,
+        );
+        callee_b.terminate(arm_loading, RTerm::Goto(ret_block, Vec::new()));
+
+        // Ready -> *acc += value; *state = Idle
+        let s_r = callee_b.op(arm_ready, OpKind::Deref(p_state), state_ty, NO_ORIGIN);
+        let f_val = callee_b.op(
+            arm_ready,
+            OpKind::Field {
+                base: s_r,
+                variant: Some(2),
+                field: 0,
+            },
+            i32_ty,
+            NO_ORIGIN,
+        );
+        let cur_acc = callee_b.op(arm_ready, OpKind::Deref(p_acc), i32_ty, NO_ORIGIN);
+        let new_acc = callee_b.op(
+            arm_ready,
+            OpKind::Binary {
+                op: crate::jir::semantic::BinaryOp::Add,
+                l: cur_acc,
+                r: f_val,
+                ty: i32_ty,
+            },
+            i32_ty,
+            NO_ORIGIN,
+        );
+        let re_acc = callee_b.op(
+            arm_ready,
+            OpKind::BorrowView {
+                root: Root::Value(p_acc),
+                path: vec![Proj::Deref],
+                mutable: true,
+            },
+            ref_i32_ty,
+            NO_ORIGIN,
+        );
+        callee_b.effect(
+            arm_ready,
+            OpKind::StoreThrough {
+                ptr: re_acc,
+                v: new_acc,
+            },
+            NO_ORIGIN,
+        );
+        let agg2 = callee_b.op(
+            arm_ready,
+            OpKind::Aggregate {
+                ty: state_ty,
+                variant: 0,
+                active_field: None,
+                fields: Vec::new(),
+            },
+            state_ty,
+            NO_ORIGIN,
+        );
+        callee_b.effect(
+            arm_ready,
+            OpKind::StoreThrough {
+                ptr: p_state,
+                v: agg2,
+            },
+            NO_ORIGIN,
+        );
+        callee_b.terminate(arm_ready, RTerm::Goto(ret_block, Vec::new()));
+
+        callee_b.terminate(ret_block, RTerm::Return(None));
+        let mut callee_func = callee_b.finish();
+
+        let mut caller_b = FuncBuilder::new(item(11), signature(vec![i32_ty], i32_ty));
+        let x = caller_b.param(i32_ty, NO_ORIGIN);
+        let init_s = caller_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Aggregate {
+                ty: state_ty,
+                variant: 0,
+                active_field: None,
+                fields: Vec::new(),
+            },
+            state_ty,
+            NO_ORIGIN,
+        );
+        let acc_cell = caller_b.cell(i32_ty, true, NO_ORIGIN);
+        caller_b.effect(FuncBuilder::ENTRY, OpKind::CellAlloc(acc_cell), NO_ORIGIN);
+        caller_b.effect(
+            FuncBuilder::ENTRY,
+            OpKind::CellStore {
+                cell: acc_cell,
+                v: x,
+            },
+            NO_ORIGIN,
+        );
+        let s_ptr = caller_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::BorrowView {
+                root: Root::Value(init_s),
+                path: Vec::new(),
+                mutable: true,
+            },
+            ref_state_ty,
+            NO_ORIGIN,
+        );
+        let a_ptr = caller_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::BorrowView {
+                root: Root::Cell(acc_cell),
+                path: Vec::new(),
+                mutable: true,
+            },
+            ref_i32_ty,
+            NO_ORIGIN,
+        );
+        caller_b.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(10),
+                    link_name: StrId(0),
+                },
+                function: None,
+                args: vec![s_ptr, x, a_ptr],
+                track_caller: None,
+                semantic: crate::jir::semantic::CallSemantic::Ordinary,
+                host: None,
+            },
+            NO_ORIGIN,
+        );
+        let out_a = caller_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::CellLoad(acc_cell),
+            i32_ty,
+            NO_ORIGIN,
+        );
+        caller_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(out_a)));
+        let mut caller_func = caller_b.finish();
+
+        let p0 = flat_param_with(Some(&callee_func), &interns.types, ref_state_ty, true)
+            .expect("mut_enum param");
+        let p2 = flat_param_with(Some(&callee_func), &interns.types, ref_i32_ty, true)
+            .expect("scalar_ref param");
+        assert!(p0.is_mut_enum(Some(&interns.types)));
+        assert!(p2.is_scalar_ref());
+        let sig = FlatSig {
+            params: vec![Some(p0), None, Some(p2)],
+            result: None,
+            spill: 4,
+            returns_out_field: true,
+        };
+        let mut plan = AbiPlan {
+            registers: 4,
+            ..AbiPlan::default()
+        };
+        plan.flat.insert(item(10), sig.clone());
+        plan.names.insert(item(10), JsName::new("step".to_owned()));
+
+        rewrite_callee_with(&mut callee_func, &sig, Some(&interns.types));
+        unbox_scalar_ref_cells(&mut callee_func, &interns.types);
+        callee_func.verify(&interns.types).expect("callee verifies");
+        assert!(!callee_func.cells[0].boxed, "callee cell unboxed");
+
+        rewrite_calls(&mut caller_func, &plan, Some(&interns.types));
+        unbox_scalar_ref_cells(&mut caller_func, &interns.types);
+        caller_func.verify(&interns.types).expect("caller verifies");
+        assert!(!caller_func.cells[0].boxed, "caller cell unboxed");
+
+        let mut opts = Opts::default();
+        opts.optimizer = crate::opts::OptimizerMode::On;
+        let mut stats = crate::opt::OptStats::default();
+        crate::opt::optimize(
+            &mut callee_func,
+            &interns.types,
+            &interns,
+            &opts,
+            &mut stats,
+        )
+        .expect("callee optimizes");
+        assert!(
+            callee_func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.ops)
+                .any(|op| matches!(op.kind, OpKind::Binary { .. })),
+            "optimized callee kept Add in Ready branch: {callee_func:#?}"
+        );
+        crate::opt::optimize(
+            &mut caller_func,
+            &interns.types,
+            &interns,
+            &opts,
+            &mut stats,
+        )
+        .expect("caller optimizes");
+
+        let plan_callee =
+            crate::lower::fuse::plan(&callee_func, None, &interns.types, &interns, &opts);
+        crate::lower::structure::structure(&callee_func, &plan_callee, &interns.types, false)
+            .expect("callee structures");
+        let plan_caller =
+            crate::lower::fuse::plan(&caller_func, None, &interns.types, &interns, &opts);
+        crate::lower::structure::structure(&caller_func, &plan_caller, &interns.types, false)
+            .expect("caller structures");
     }
 }

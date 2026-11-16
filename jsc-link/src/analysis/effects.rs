@@ -61,9 +61,10 @@ use crate::jir::decline::Decline;
 use crate::jir::interns::{Interns, StrId};
 use crate::jir::repr::{Func, OpKind, Proj, RTerm, Root, ValueId};
 use crate::jir::semantic::{
-    CallSemantic, Callee, DropGlue, HostParameterClass, HostPayload, ItemId,
+    CallSemantic, Callee, ConstTree, DropGlue, GlobalReference, HostParameterClass, HostPayload,
+    ItemId, StandardOperation, TypeId,
 };
-use crate::jir::types::TypeTable;
+use crate::jir::types::{TypeKind, TypeTable};
 use crate::lower::semantic_ops::{self, ReferenceRequirement, SignatureSlot};
 
 /// Whether the caller's world can observe a call to the function.
@@ -384,11 +385,7 @@ pub fn compute_read_origins(
     graph: &Callgraph,
     summaries: &Summaries,
 ) -> BTreeMap<JsName, ReadOrigins> {
-    let cx = Cx {
-        interns,
-        graph,
-        funcs,
-    };
+    let cx = Cx::new(funcs, interns, graph);
     let taints: BTreeMap<JsName, Taints> = funcs
         .iter()
         .filter_map(|(name, func)| {
@@ -435,11 +432,7 @@ pub fn compute(
     interns: &BTreeMap<JsName, &Interns>,
     graph: &Callgraph,
 ) -> Summaries {
-    let cx = Cx {
-        interns,
-        graph,
-        funcs,
-    };
+    let cx = Cx::new(funcs, interns, graph);
     let mut done: BTreeMap<JsName, Summary> = BTreeMap::new();
     for scc in &graph.sccs {
         let recursive = scc.len() > 1
@@ -548,15 +541,146 @@ struct Cx<'a> {
     funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
     interns: &'a BTreeMap<JsName, &'a Interns>,
     graph: &'a Callgraph,
+    /// Whether indirect function-pointer targets may originate outside the lowered `ReifyFnPointer`
+    /// set (unlowered bodies, `FnPtr` parameters, `ConstTree` function globals, or opaque calls).
+    indirect_unclosed: bool,
 }
 
 impl<'a> Cx<'a> {
+    fn new(
+        funcs: &'a BTreeMap<JsName, Result<Func, Decline>>,
+        interns: &'a BTreeMap<JsName, &'a Interns>,
+        graph: &'a Callgraph,
+    ) -> Self {
+        let indirect_unclosed = Self::has_unclosed_fn_ptrs(funcs, interns, graph);
+        Self {
+            funcs,
+            interns,
+            graph,
+            indirect_unclosed,
+        }
+    }
+
+    fn has_unclosed_fn_ptrs(
+        funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+        interns: &BTreeMap<JsName, &Interns>,
+        graph: &Callgraph,
+    ) -> bool {
+        if funcs.values().any(Result::is_err) {
+            return true;
+        }
+        for (name, res) in funcs {
+            let Ok(func) = res else { continue };
+            let types = interns.get(name).map(|i| &i.types);
+            if func
+                .sig
+                .arguments
+                .iter()
+                .any(|ty| types.is_none_or(|t| type_has_fn_ptr(*ty, t, &mut BTreeSet::new())))
+            {
+                return true;
+            }
+            for block in &func.blocks {
+                for op in &block.ops {
+                    match &op.kind {
+                        OpKind::Const(tree) if const_has_fn_ptr(tree) => return true,
+                        OpKind::Cast { to, .. } => {
+                            if types.is_none_or(|t| type_has_fn_ptr(*to, t, &mut BTreeSet::new()))
+                                && types.is_none_or(|t| {
+                                    let to_peeled = t.peeled(*to);
+                                    matches!(
+                                        t.get(to_peeled).map(|d| &d.kind),
+                                        Some(TypeKind::FnPtr { .. })
+                                    ) && !graph.fn_pointer_targets.get(&to_peeled).is_some_and(
+                                        |targets| {
+                                            targets.iter().all(|id| graph.by_item.contains_key(id))
+                                        },
+                                    )
+                                })
+                            {
+                                return true;
+                            }
+                        }
+                        OpKind::Host { args, .. }
+                        | OpKind::Intrinsic { args, .. }
+                        | OpKind::Call {
+                            host: Some(_),
+                            args,
+                            ..
+                        }
+                        | OpKind::Call {
+                            callee:
+                                Callee::Foreign { .. }
+                                | Callee::Runtime { .. }
+                                | Callee::Virtual { .. }
+                                | Callee::Intrinsic { .. },
+                            args,
+                            ..
+                        } => {
+                            let touches_fn_ptr = |val: ValueId| {
+                                let Some(ty) = func.ty(val) else {
+                                    return true;
+                                };
+                                types.is_none_or(|t| type_has_fn_ptr(ty, t, &mut BTreeSet::new()))
+                            };
+                            if op.result.is_some_and(touches_fn_ptr)
+                                || args.iter().copied().any(touches_fn_ptr)
+                            {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn func_of(&self, name: &JsName) -> Option<&'a Func> {
         self.funcs.get(name)?.as_ref().ok()
     }
 
     fn interns_of(&self, name: &JsName) -> Option<&'a Interns> {
         self.interns.get(name).copied()
+    }
+}
+
+fn type_has_fn_ptr(ty: TypeId, types: &TypeTable, seen: &mut BTreeSet<TypeId>) -> bool {
+    if !seen.insert(ty) {
+        return false;
+    }
+    let Some(desc) = types.get(ty) else {
+        return true;
+    };
+    match &desc.kind {
+        TypeKind::FnPtr { .. } => true,
+        TypeKind::Reference { pointee, .. }
+        | TypeKind::RawPointer { pointee, .. }
+        | TypeKind::Pattern(pointee) => type_has_fn_ptr(*pointee, types, seen),
+        TypeKind::Slice(elem) | TypeKind::Array { element: elem, .. } => {
+            type_has_fn_ptr(*elem, types, seen)
+        }
+        TypeKind::Tuple(fields) => fields.iter().any(|f| type_has_fn_ptr(*f, types, seen)),
+        TypeKind::Closure { upvars, .. } => upvars.iter().any(|f| type_has_fn_ptr(*f, types, seen)),
+        TypeKind::Adt { variants, .. } => variants
+            .iter()
+            .any(|v| v.fields.iter().any(|f| type_has_fn_ptr(f.ty, types, seen))),
+        _ => false,
+    }
+}
+
+fn const_has_fn_ptr(tree: &ConstTree) -> bool {
+    match tree {
+        ConstTree::Global {
+            target: GlobalReference::Function { .. },
+            ..
+        } => true,
+        ConstTree::Aggregate(fields)
+        | ConstTree::Slice(fields)
+        | ConstTree::Variant { fields, .. } => fields.iter().any(const_has_fn_ptr),
+        ConstTree::Reference(inner) => const_has_fn_ptr(inner),
+        _ => false,
     }
 }
 
@@ -1216,7 +1340,16 @@ impl Facts {
                 ..
             } => {
                 let kind = classify(cx.graph, interns, callee, semantic, host);
-                self.call(types, func, taints, &kind, &cx.graph.by_item, args, current);
+                self.call(
+                    cx,
+                    types,
+                    func,
+                    taints,
+                    &kind,
+                    &cx.graph.by_item,
+                    args,
+                    current,
+                );
             }
             _ => {}
         }
@@ -1275,6 +1408,7 @@ impl Facts {
     #[allow(clippy::too_many_arguments)]
     fn call(
         &mut self,
+        cx: &Cx<'_>,
         types: Option<&TypeTable>,
         func: &Func,
         taints: &Taints,
@@ -1291,7 +1425,8 @@ impl Facts {
                 } else {
                     Purity::Read
                 });
-                self.summary.may_unwind |= entry.effects.can_throw;
+                self.summary.may_unwind |= entry.effects.can_throw
+                    || registry_drop_may_unwind(entry.id, types, func, args);
                 // ponytail: one coarse may-allocate bit for every registry op; per-op facts
                 // when a consumer needs them.
                 self.summary.allocates = true;
@@ -1321,7 +1456,11 @@ impl Facts {
                 self.summary.allocates = true;
                 match descriptor {
                     Some(descriptor) => {
-                        self.summary.may_unwind |= descriptor.fallible;
+                        self.summary.may_unwind |= descriptor.fallible
+                            || descriptor
+                                .slots
+                                .iter()
+                                .any(|(_, facts)| facts.has(Fact::Throws));
                         for (index, arg) in args.iter().enumerate() {
                             let slot = Slot::Parameter(index as u32);
                             let taint = taints.value(*arg);
@@ -1376,16 +1515,20 @@ impl Facts {
                         IndirectTargets::Unbounded,
                     )
                     .join(&IndirectTargets::Bounded(targets.iter().copied().collect()));
-                    // Every body an item in the bound may stand for contributes; an item with
-                    // no body claims nothing, so the whole site does not either.
-                    for target in targets.iter() {
-                        match by_item.get(target) {
-                            Some(names) => {
-                                for name in names {
-                                    self.direct(taints, name, args, current);
+                    if cx.indirect_unclosed {
+                        self.opaque(taints, args);
+                    } else {
+                        // Every body an item in the bound may stand for contributes; an item with
+                        // no body claims nothing, so the whole site does not either.
+                        for target in targets.iter() {
+                            match by_item.get(target) {
+                                Some(names) => {
+                                    for name in names {
+                                        self.direct(taints, name, args, current);
+                                    }
                                 }
+                                None => self.opaque(taints, args),
                             }
-                            None => self.opaque(taints, args),
                         }
                     }
                 }
@@ -1457,6 +1600,43 @@ impl Facts {
             RTerm::Goto(..) | RTerm::Switch { .. } | RTerm::Unreachable => {}
         }
     }
+}
+
+fn registry_drop_may_unwind(
+    operation: StandardOperation,
+    types: Option<&TypeTable>,
+    func: &Func,
+    args: &[ValueId],
+) -> bool {
+    if !matches!(
+        operation,
+        StandardOperation::VecClear | StandardOperation::VecDrop | StandardOperation::BoxDrop
+    ) {
+        return false;
+    }
+    let Some(types) = types else { return true };
+    let Some(arg0) = args.first() else {
+        return true;
+    };
+    let Some(arg_ty) = func.ty(*arg0) else {
+        return true;
+    };
+    let pointee = match types.get(types.peeled(arg_ty)).map(|d| &d.kind) {
+        Some(TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. }) => {
+            *pointee
+        }
+        _ => arg_ty,
+    };
+    let Some(desc) = types.get(types.peeled(pointee)) else {
+        return true;
+    };
+    let inner_ty = match &desc.kind {
+        TypeKind::Adt { args, .. } => args.first().copied(),
+        _ => None,
+    };
+    inner_ty
+        .and_then(|ty| types.get(ty))
+        .is_none_or(|d| d.layout.needs_drop)
 }
 
 #[cfg(test)]
@@ -1966,6 +2146,297 @@ mod tests {
         assert!(!mutates.params[0].reads_fields_only);
         let throws = build(SlotFacts::default().with(DFact::Reads).with(DFact::Throws));
         assert!(throws.may_unwind);
+    }
+
+    #[test]
+    fn host_result_slot_throws_marks_may_unwind() {
+        let mut prog = Prog::new();
+        let descriptor = Descriptor {
+            shape: Shape::Call,
+            nullable: false,
+            fallible: false,
+            global: true,
+            module: String::new(),
+            name: "hostCall".to_owned(),
+            slots: vec![(DSlot::Result, SlotFacts::default().with(DFact::Throws))],
+        };
+        let encoded = descriptor.encode();
+        let body = encoded
+            .strip_prefix(crate::descriptor::PREFIX)
+            .expect("encode writes the prefix");
+        prog.interns.bytes.push(body.as_bytes().to_vec());
+        let bytes = BytesId((prog.interns.bytes.len() - 1) as u32);
+        let mut b = FuncBuilder::new(id(1), sig(0));
+        b.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: id(61),
+                    link_name: StrId(0),
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Host,
+                host: Some(HostPayload::Extern(bytes)),
+            },
+            O,
+        );
+        b.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        prog.add("f", b.finish());
+        let summaries = prog.compute();
+        let summary = prog
+            .funcs
+            .keys()
+            .next()
+            .and_then(|name| summaries.get(name))
+            .expect("summarized");
+        assert!(summary.may_unwind);
+    }
+
+    #[test]
+    fn registry_drop_marks_may_unwind_when_element_needs_drop() {
+        use crate::jir::types::{JsFacts, LayoutFacts, NominalForm, TypeDescriptor, TypeMeta};
+        let make_ty = |id: TypeId, kind: TypeKind, needs_drop: bool| TypeDescriptor {
+            id,
+            name: None,
+            kind,
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                needs_drop,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: id,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        };
+        let elem_plain = TypeId(10);
+        let elem_drop = TypeId(11);
+        let vec_plain = TypeId(12);
+        let vec_drop = TypeId(13);
+        let ref_plain = TypeId(14);
+        let ref_drop = TypeId(15);
+
+        let run = |ref_ty: TypeId| {
+            let mut prog = Prog::new();
+            prog.interns.types.insert(make_ty(
+                elem_plain,
+                TypeKind::Integer {
+                    signed: true,
+                    bits: 32,
+                },
+                false,
+            ));
+            prog.interns.types.insert(make_ty(
+                elem_drop,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 50,
+                    },
+                    args: Vec::new(),
+                    form: NominalForm::Struct,
+                    variants: Vec::new(),
+                    niche: None,
+                },
+                true,
+            ));
+            prog.interns.types.insert(make_ty(
+                vec_plain,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 51,
+                    },
+                    args: vec![elem_plain],
+                    form: NominalForm::Struct,
+                    variants: Vec::new(),
+                    niche: None,
+                },
+                true,
+            ));
+            prog.interns.types.insert(make_ty(
+                vec_drop,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 51,
+                    },
+                    args: vec![elem_drop],
+                    form: NominalForm::Struct,
+                    variants: Vec::new(),
+                    niche: None,
+                },
+                true,
+            ));
+            prog.interns.types.insert(make_ty(
+                ref_plain,
+                TypeKind::Reference {
+                    pointee: vec_plain,
+                    mutable: true,
+                },
+                false,
+            ));
+            prog.interns.types.insert(make_ty(
+                ref_drop,
+                TypeKind::Reference {
+                    pointee: vec_drop,
+                    mutable: true,
+                },
+                false,
+            ));
+            let mut b = FuncBuilder::new(
+                id(1),
+                Signature {
+                    arguments: vec![ref_ty],
+                    result: TY,
+                    abi: AbiSignature::default(),
+                },
+            );
+            let p = b.param(ref_ty, O);
+            b.effect(
+                FuncBuilder::ENTRY,
+                call(
+                    StrId(0),
+                    CallSemantic::Standard(StandardOperation::VecDrop),
+                    vec![p],
+                ),
+                O,
+            );
+            b.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+            prog.add("f", b.finish());
+            let summaries = prog.compute();
+            Prog::summary(&summaries, "f")
+                .expect("summarized")
+                .may_unwind
+        };
+
+        assert!(!run(ref_plain), "Vec<i32> drop cannot unwind");
+        assert!(run(ref_drop), "Vec<DropGuard> drop may unwind");
+    }
+
+    #[test]
+    fn indirect_call_with_unclosed_fn_ptrs_marks_may_unwind() {
+        use crate::jir::interns::SigId;
+        use crate::jir::semantic::{CastKind, DirectItemRef};
+        use crate::jir::types::{JsFacts, LayoutFacts, TypeDescriptor, TypeMeta};
+        let fn_def_ty = TypeId(20);
+        let fn_ptr_ty = TypeId(21);
+        let make_ty = |id: TypeId, kind: TypeKind| TypeDescriptor {
+            id,
+            name: None,
+            kind,
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: id,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        };
+        let mut prog = Prog::new();
+        let target_name = prog.intern("pure_fn");
+        prog.interns
+            .types
+            .insert(make_ty(TY, TypeKind::Tuple(Vec::new())));
+        prog.interns.types.insert(make_ty(
+            fn_def_ty,
+            TypeKind::FnDef {
+                def: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 2,
+                },
+                sig: SigId(0),
+                instance: Some(DirectItemRef {
+                    item: id(2),
+                    link_name: target_name,
+                }),
+            },
+        ));
+        prog.interns
+            .types
+            .insert(make_ty(fn_ptr_ty, TypeKind::FnPtr { sig: SigId(0) }));
+
+        let mut pure = FuncBuilder::new(id(2), sig(0));
+        pure.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        prog.add("pure_fn", pure.finish());
+
+        // Caller takes an external `fn()` parameter and also reifies `pure_fn` so
+        // `fn_pointer_targets` is non-empty, yet external fn pointers can still arrive.
+        let mut caller = FuncBuilder::new(
+            id(1),
+            Signature {
+                arguments: vec![fn_ptr_ty],
+                result: TY,
+                abi: AbiSignature::default(),
+            },
+        );
+        let fp = caller.param(fn_ptr_ty, O);
+        let c_def = caller.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Unit),
+            fn_def_ty,
+            O,
+        );
+        let _reified = caller.op(
+            FuncBuilder::ENTRY,
+            OpKind::Cast {
+                kind: CastKind::PointerCoercion,
+                v: c_def,
+                from: fn_def_ty,
+                to: fn_ptr_ty,
+            },
+            fn_ptr_ty,
+            O,
+        );
+        caller.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Indirect {
+                    signature: fn_ptr_ty,
+                },
+                function: Some(fp),
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            O,
+        );
+        caller.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        prog.add("caller", caller.finish());
+
+        let summaries = prog.compute();
+        let caller_summary = summaries
+            .get(&JsName::new("caller".to_owned()))
+            .expect("summarized");
+        assert!(caller_summary.may_unwind);
     }
 
     // -- components and the fixpoint ----------------------------------------------------------
