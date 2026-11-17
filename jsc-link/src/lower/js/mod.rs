@@ -120,6 +120,9 @@ pub struct JsCx<'a> {
     /// captured scalar locals. Move/Copy aliases share the same description because tagged ABI
     /// admission has already proved every use field-only or a whole-value direct-call forward.
     tagged_exprs: RefCell<BTreeMap<ValueId, Expr>>,
+    /// `js-str=bytes`: the `as_bytes()` views this body holds as the string itself
+    /// ([`JsCx::byte_string_view`]). Computed on first use.
+    byte_string_views: std::cell::OnceCell<std::collections::BTreeSet<ValueId>>,
     /// Allocation-bearing expressions paired with the JIR value that produced them. The final
     /// JavaScript allocation walker uses these only for provenance; they never affect emission.
     allocation_origins: RefCell<Vec<(ValueId, Expr)>>,
@@ -181,6 +184,7 @@ impl<'a> JsCx<'a> {
             carried_i64_overflow: RefCell::new(BTreeMap::new()),
             formal_param_names: RefCell::new(HashSet::new()),
             tagged_exprs: RefCell::new(BTreeMap::new()),
+            byte_string_views: std::cell::OnceCell::new(),
             allocation_origins: RefCell::new(Vec::new()),
             temps: RefCell::new(Vec::new()),
             zombies: RefCell::new(Vec::new()),
@@ -522,6 +526,114 @@ impl<'a> JsCx<'a> {
     /// Whether the plan inlined `v` (its op becomes an expression consumed at its use site).
     pub fn is_inline(&self, v: ValueId) -> bool {
         self.plan.inline.contains(&v)
+    }
+
+    /// `js-str=bytes`: whether `v` is a `&str`'s byte view (`as_bytes()`, a cast of a `&str` to a
+    /// `&[u8]`) that this body only ever indexes for one byte and asks the length of. Such a view
+    /// is held as the byte string itself, which is its bytes: `(*v)[i]` is `s.charCodeAt(i)` and
+    /// its length is `s.length` (`place.rs`, `emit.rs`), so no byte array is built. Any other
+    /// use — a borrow of an element that is not read at once, a subslice, a call argument, a
+    /// rename, a terminator operand — keeps the ordinary `__rt.str_bytes` view.
+    pub fn byte_string_view(&self, v: ValueId) -> bool {
+        crate::lower::bstr::enabled()
+            && self
+                .byte_string_views
+                .get_or_init(|| self.find_byte_string_views())
+                .contains(&v)
+    }
+
+    fn find_byte_string_views(&self) -> std::collections::BTreeSet<ValueId> {
+        use rcgjs_object::jir::repr::Proj;
+        use rcgjs_object::jir::semantic::UnaryOp;
+        use std::collections::BTreeSet;
+        let table = self.table;
+        let byte_slice_ref = |ty: TypeId| {
+            matches!(
+                table.get(table.peeled(ty)).map(|d| &d.kind),
+                Some(rcgjs_object::jir::types::TypeKind::Reference { pointee, mutable: false })
+                    if matches!(
+                        value::kind(table, *pointee),
+                        Some(rcgjs_object::jir::types::TypeKind::Slice(element))
+                            if value::is_u8(table, *element)
+                    )
+            )
+        };
+        let ops = || self.func.blocks.iter().flat_map(|block| block.ops.iter());
+        let mut views: BTreeSet<ValueId> = ops()
+            .filter_map(|op| match (&op.kind, op.result) {
+                (OpKind::Cast { from, to, .. }, Some(result))
+                    if crate::lower::bstr::is_str_pointer(table, *from) && byte_slice_ref(*to) =>
+                {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .collect();
+        if views.is_empty() {
+            return views;
+        }
+        let mut refused = BTreeSet::new();
+        let mut elements: BTreeMap<ValueId, ValueId> = BTreeMap::new();
+        for op in ops() {
+            for used in op.kind.uses() {
+                if !views.contains(&used) {
+                    continue;
+                }
+                let admitted = match (&op.kind, op.result) {
+                    (
+                        OpKind::Unary {
+                            op: UnaryOp::PtrMetadata,
+                            ..
+                        },
+                        _,
+                    ) => true,
+                    (
+                        OpKind::BorrowView {
+                            root: Root::Value(root),
+                            path,
+                            mutable: false,
+                        },
+                        Some(element),
+                    ) if *root == used
+                        && match path.as_slice() {
+                            [Proj::Deref, Proj::Index(index)] => *index != used,
+                            [Proj::Deref, Proj::ConstantIndex { .. }] => true,
+                            _ => false,
+                        }
+                        && self.is_inline(element) =>
+                    {
+                        elements.insert(element, used);
+                        true
+                    }
+                    _ => false,
+                };
+                if !admitted {
+                    refused.insert(used);
+                }
+            }
+        }
+        for block in &self.func.blocks {
+            for used in block.term.uses() {
+                if views.contains(&used) {
+                    refused.insert(used);
+                }
+                if let Some(view) = elements.get(&used) {
+                    refused.insert(*view);
+                }
+            }
+        }
+        // An element borrow is spelled as a read only when its one consumer reads it.
+        for op in ops() {
+            for used in op.kind.uses() {
+                if let Some(view) = elements.get(&used) {
+                    if !matches!(op.kind, OpKind::Deref(source) if source == used) {
+                        refused.insert(*view);
+                    }
+                }
+            }
+        }
+        views.retain(|view| !refused.contains(view));
+        views
     }
 
     /// The `let` name of a value the plan named.

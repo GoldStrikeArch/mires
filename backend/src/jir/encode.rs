@@ -941,6 +941,11 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             {
                 return call_semantic_for_operation(standard_operation_v2(operation));
             }
+            if matches!(instance.def, ty::InstanceKind::Item(_)) {
+                if let Some(operation) = str_operation(tcx, instance.def_id(), instance.args) {
+                    return CallSemantic::Standard(operation);
+                }
+            }
         }
         if let Some(operation) = crate::late_ir::standard_operation(tcx, definition, arguments) {
             return call_semantic_for_operation(standard_operation_v2(operation));
@@ -2123,6 +2128,92 @@ pub(crate) fn item_id<'tcx>(cgu: &CguCx<'tcx>, instance: Instance<'tcx>) -> Item
     ItemId {
         definition: definition_id(tcx, instance.def_id()),
         instantiation: tcx.type_id_hash(instance.ty(tcx, typing_env())).as_u128(),
+    }
+}
+
+/// The `str` call-site identity of a resolved method instance (`StandardOperation::is_str`), for
+/// the link step's `js-str=bytes` lowering (`jsc-link/src/lower/bstr.rs`).
+///
+/// Identity is the rustc definition, never a name alone: an inherent method of `impl str`, or
+/// the `Index`/`PartialEq`/`Ord` impl whose self type is `str`, with the exact argument types the
+/// lowering spells (a `&str` receiver; a `&str` or `char` pattern; a `usize` range of the four
+/// `core::ops` shapes). Anything else, a user method of the same name included, is untagged.
+fn str_operation<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    definition: DefId,
+    arguments: ty::GenericArgsRef<'tcx>,
+) -> Option<StandardOperation> {
+    let associated = tcx.opt_associated_item(definition)?;
+    let trait_id = match associated.container {
+        ty::AssocContainer::InherentImpl => None,
+        ty::AssocContainer::TraitImpl(Ok(trait_item)) => Some(tcx.parent(trait_item)),
+        _ => return None,
+    };
+    let owner = tcx.normalize_erasing_regions(
+        typing_env(),
+        tcx.type_of(tcx.parent(definition))
+            .instantiate(tcx, arguments),
+    );
+    if !owner.is_str() {
+        return None;
+    }
+    let signature = tcx
+        .fn_sig(definition)
+        .instantiate(tcx, arguments)
+        .skip_binder();
+    let str_ref = |ty: Ty<'tcx>| matches!(ty.kind(), ty::Ref(_, pointee, rustc_hir::Mutability::Not) if pointee.is_str());
+    let [receiver, rest @ ..] = signature.inputs() else {
+        return None;
+    };
+    if !str_ref(*receiver) {
+        return None;
+    }
+    let symbol = associated.name();
+    let name = symbol.as_str();
+    let lang = tcx.lang_items();
+    match (trait_id, name, rest) {
+        (None, "len", []) => Some(StandardOperation::StrLen),
+        (None, "is_char_boundary", [index])
+            if matches!(index.kind(), ty::Uint(ty::UintTy::Usize)) =>
+        {
+            Some(StandardOperation::StrIsCharBoundary)
+        }
+        (None, "starts_with" | "ends_with" | "find" | "rfind" | "contains", [pattern])
+            if str_ref(*pattern) || matches!(pattern.kind(), ty::Char) =>
+        {
+            Some(match name {
+                "starts_with" => StandardOperation::StrStartsWith,
+                "ends_with" => StandardOperation::StrEndsWith,
+                "find" => StandardOperation::StrFind,
+                "rfind" => StandardOperation::StrRFind,
+                _ => StandardOperation::StrContains,
+            })
+        }
+        (Some(trait_id), "index", [index]) if lang.index_trait() == Some(trait_id) => {
+            let ty::Adt(range, range_args) = index.kind() else {
+                return None;
+            };
+            let usize_or_none = range_args
+                .types()
+                .all(|ty| matches!(ty.kind(), ty::Uint(ty::UintTy::Usize)));
+            let shapes = [
+                lang.range_struct(),
+                lang.range_from_struct(),
+                lang.range_to_struct(),
+                lang.range_full_struct(),
+            ];
+            (usize_or_none && shapes.contains(&Some(range.did())))
+                .then_some(StandardOperation::StrIndex)
+        }
+        (Some(trait_id), "eq", [other]) if lang.eq_trait() == Some(trait_id) && str_ref(*other) => {
+            Some(StandardOperation::StrEq)
+        }
+        (Some(trait_id), "cmp", [other])
+            if tcx.is_diagnostic_item(rustc_span::sym::Ord, trait_id) && str_ref(*other) =>
+        {
+            Some(StandardOperation::StrCmp)
+        }
+        _ => None,
     }
 }
 

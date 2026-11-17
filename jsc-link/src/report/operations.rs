@@ -13,8 +13,11 @@ use super::{json_string, write_strings};
 
 pub(super) fn write_registry(out: &mut String) {
     out.push('[');
+    // The `str` call-site identities exist only for `js-str=bytes`; every other mode forgets
+    // them at decode and does not list them.
     for (index, operation) in (0..128u8)
         .map_while(|tag| postcard::from_bytes::<StandardOperation>(&[tag]).ok())
+        .filter(|operation| !operation.is_str() || crate::lower::bstr::enabled())
         .enumerate()
     {
         if index != 0 {
