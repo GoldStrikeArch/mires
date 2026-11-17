@@ -22,8 +22,8 @@ const WT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const MAIN_ROOT = '/Users/mikhail.pertsev/Desktop/OSS/mires';
 const OUT = resolve(WT, 'build/qualify-next-gen');
 const REPO_RECEIPT = resolve(WT, 'experiments/qualification/next-gen-qualify-receipt.json');
-const SCRATCH_RECEIPT =
-  '/Users/mikhail.pertsev/.gemini/antigravity/brain/5d6afc81-e4f3-4960-a29d-593b8c3ce186/scratch/next-gen-qualify-receipt.json';
+// An extra copy of the receipt, written only when QUALIFY_SCRATCH_RECEIPT names a path.
+const SCRATCH_RECEIPT = process.env.QUALIFY_SCRATCH_RECEIPT || null;
 const JSC = '/System/Library/Frameworks/JavaScriptCore.framework/Versions/Current/Helpers/jsc';
 const BENCH_RS = resolve(MAIN_ROOT, 'build/arch-research/q456/src/bench_kernels.rs');
 const BASELINE_PROG = resolve(MAIN_ROOT, 'build/arch-research/q456/baseline/rb_clean_on.mjs');
@@ -896,8 +896,10 @@ for (const [variant, srcPath] of Object.entries(enumSources)) {
 }
 
 mkdirSync(dirname(REPO_RECEIPT), { recursive: true });
-mkdirSync(dirname(SCRATCH_RECEIPT), { recursive: true });
 writeFileSync(REPO_RECEIPT, JSON.stringify(results, null, 2) + '\n');
-writeFileSync(SCRATCH_RECEIPT, JSON.stringify(results, null, 2) + '\n');
+if (SCRATCH_RECEIPT) {
+  mkdirSync(dirname(SCRATCH_RECEIPT), { recursive: true });
+  writeFileSync(SCRATCH_RECEIPT, JSON.stringify(results, null, 2) + '\n');
+}
 cleanupEnv();
-console.log(`\nSaved qualification receipt to:\n  - ${REPO_RECEIPT}\n  - ${SCRATCH_RECEIPT}`);
+console.log(`\nSaved qualification receipt to:\n  - ${REPO_RECEIPT}${SCRATCH_RECEIPT ? `\n  - ${SCRATCH_RECEIPT}` : ''}`);
