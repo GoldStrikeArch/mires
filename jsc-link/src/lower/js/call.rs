@@ -411,26 +411,28 @@ impl JsCx<'_> {
                 arguments,
             ))),
             Callee::Runtime { member, .. } => {
-                // An `extern "C"` item is the host's (`__rt.<symbol>`): under `js-str=bytes` a
-                // `str` argument is decoded to the host text it encodes and a `str` result is
-                // encoded into the byte string Rust holds (`lower/bstr.rs`).
+                // An `extern "C"` item is the host's (`__rt.<symbol>`): under `js-str=bytes` every
+                // `str` an argument reaches is decoded to the host text it encodes and every `str`
+                // the result reaches is encoded into the byte string Rust holds (`lower/bstr.rs`).
                 if crate::lower::bstr::enabled() {
                     for (argument, arg) in arguments.iter_mut().zip(args.iter()) {
-                        if crate::lower::bstr::is_str_pointer(self.table, self.ty_of(*arg)?) {
-                            *argument = crate::lower::bstr::host_out(argument.clone());
-                        }
+                        *argument = host::crossing(
+                            self,
+                            self.ty_of(*arg)?,
+                            argument.clone(),
+                            crate::lower::bstr::Crossing::Out,
+                        )?;
                     }
                 }
                 let call = jsast::rt_call(self.link_name(*member)?, arguments);
                 match op.result {
-                    Some(result)
-                        if crate::lower::bstr::enabled()
-                            && crate::lower::bstr::is_str_pointer(
-                                self.table,
-                                self.ty_of(result)?,
-                            ) =>
-                    {
-                        Ok(Lowered::value(crate::lower::bstr::host_in(call)))
+                    Some(result) if crate::lower::bstr::enabled() => {
+                        Ok(Lowered::value(host::crossing(
+                            self,
+                            self.ty_of(result)?,
+                            call,
+                            crate::lower::bstr::Crossing::In,
+                        )?))
                     }
                     _ => Ok(Lowered::value(call)),
                 }

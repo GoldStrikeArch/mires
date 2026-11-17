@@ -2300,6 +2300,7 @@ fn format_site_js_in(
                 params,
                 abi_known: true,
                 result: None,
+                arguments: Vec::new(),
                 caller_location: false,
                 used_params: BTreeSet::new(),
                 standard: Some(standard),

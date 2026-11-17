@@ -26,11 +26,13 @@ base=${JS_EXTRA_ARGS:-js-lane=jir js-opt=on}
 if [ "${SKIP_BUILD:-0}" != 1 ]; then
 	"$script_dir/build.sh" >/dev/null
 fi
-(cd "$root" && cargo build -p js-extern-macro) >"$work/js-extern-macro.log" 2>&1
+(cd "$root" && cargo build -p js-extern-macro -p js-macro) >"$work/js-extern-macro.log" 2>&1
 case "$(uname -s)" in
-Darwin) proc_macro="$root/target/debug/libjs_extern_macro.dylib" ;;
-*) proc_macro="$root/target/debug/libjs_extern_macro.so" ;;
+Darwin) dylib=dylib ;;
+*) dylib=so ;;
 esac
+proc_macro="$root/target/debug/libjs_extern_macro.$dylib"
+js_macro="$root/target/debug/libjs_macro.$dylib"
 mkdir -p "$work/proc-macro"
 ln -sf "$proc_macro" "$work/proc-macro/$(basename -- "$proc_macro")"
 
@@ -55,6 +57,17 @@ for repr in utf16 bytes; do
 		status=1
 		continue
 	}
+	# The representation probes: what the host is handed, and what Rust measures of what the host
+	# hands back, must be the same in both representations (`repr/`).
+	JS_EXTRA_ARGS="$args" "$script_dir/compile_core.sh" "$probes/repr/repr.rs" "$work/$repr/repr.js" \
+		--extern "mires_js=$work/$repr/libmires_js.rlib" --extern "js_macro=$js_macro" \
+		--search "$work/proc-macro" >"$work/compile-repr-$repr.log" 2>&1 &&
+		cat "$root/runtime/shim.js" "$work/$repr/repr.js" "$probes/repr/repr.js" | node - \
+			>"$work/repr-$repr.out" 2>"$work/repr-$repr.err" || {
+		echo "js-str=$repr: the representation probe failed:" >&2
+		sed 's/^/    /' "$work/compile-repr-$repr.log" "$work/repr-$repr.err" >&2
+		status=1
+	}
 	total=$(wc -l <"$work/native.out" | tr -d ' ')
 	if diff "$work/native.out" "$work/$repr.out" >"$work/$repr.diff"; then
 		echo "js-str=$repr: $total/$total lines agree with native Rust"
@@ -65,4 +78,26 @@ for repr in utf16 bytes; do
 		[ "$repr" = bytes ] && status=1
 	fi
 done
+repr_total=$(wc -l <"$work/repr-utf16.out" | tr -d ' ')
+if diff "$work/repr-utf16.out" "$work/repr-bytes.out" >"$work/repr.diff"; then
+	echo "representation probes: $repr_total/$repr_total host lines identical under utf16 and bytes"
+else
+	echo "representation probes: utf16 and bytes differ (< utf16, > bytes):"
+	sed 's/^/    /' "$work/repr.diff"
+	status=1
+fi
+
+# A `str` the host could write back through is refused under bytes, with the reason.
+if JS_EXTRA_ARGS="$base js-str=bytes" "$script_dir/compile_core.sh" "$probes/repr/refuse.rs" \
+	"$work/refuse.js" --extern "mires_js=$work/bytes/libmires_js.rlib" --search "$work/proc-macro" \
+	>"$work/refuse.log" 2>&1; then
+	echo "refusal probe: compiled under js-str=bytes, but must be refused" >&2
+	status=1
+elif grep -q 'cannot convert this value at the host boundary' "$work/refuse.log"; then
+	echo "refusal probe: refused under js-str=bytes, as expected"
+else
+	echo "refusal probe: failed for another reason:" >&2
+	sed 's/^/    /' "$work/refuse.log" >&2
+	status=1
+fi
 exit "$status"

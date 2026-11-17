@@ -1860,6 +1860,7 @@ mod tests {
                             params: func.sig.abi.parameters as usize,
                             abi_known: true,
                             result: Some(func.sig.result),
+                            arguments: func.sig.arguments.clone(),
                             caller_location: func.sig.abi.caller_location,
                             used_params: BTreeSet::new(),
                             standard: None,
