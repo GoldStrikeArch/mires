@@ -398,10 +398,31 @@ impl JsCx<'_> {
                 jsast::id(self.link_name(*symbol)?),
                 arguments,
             ))),
-            Callee::Runtime { member, .. } => Ok(Lowered::value(jsast::rt_call(
-                self.link_name(*member)?,
-                arguments,
-            ))),
+            Callee::Runtime { member, .. } => {
+                // An `extern "C"` item is the host's (`__rt.<symbol>`): under `js-str=bytes` a
+                // `str` argument is decoded to the host text it encodes and a `str` result is
+                // encoded into the byte string Rust holds (`lower/bstr.rs`).
+                if crate::lower::bstr::enabled() {
+                    for (argument, arg) in arguments.iter_mut().zip(args.iter()) {
+                        if crate::lower::bstr::is_str_pointer(self.table, self.ty_of(*arg)?) {
+                            *argument = crate::lower::bstr::host_out(argument.clone());
+                        }
+                    }
+                }
+                let call = jsast::rt_call(self.link_name(*member)?, arguments);
+                match op.result {
+                    Some(result)
+                        if crate::lower::bstr::enabled()
+                            && crate::lower::bstr::is_str_pointer(
+                                self.table,
+                                self.ty_of(result)?,
+                            ) =>
+                    {
+                        Ok(Lowered::value(crate::lower::bstr::host_in(call)))
+                    }
+                    _ => Ok(Lowered::value(call)),
+                }
+            }
             Callee::Indirect { .. } => {
                 let Some(function) = function else {
                     return Err(decline(

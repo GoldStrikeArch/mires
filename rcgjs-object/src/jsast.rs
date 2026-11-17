@@ -1924,6 +1924,10 @@ fn write_number(out: &mut String, n: f64) {
 
 /// Writes a string as a double quoted JavaScript literal.
 fn write_js_string(out: &mut String, s: &str) {
+    // Under `js-str=bytes` a Rust `str` literal is a byte string, every unit below U+0100; its
+    // non-ASCII units are written `\xNN`, which is the same JavaScript value as the raw
+    // character, so the escape is harmless for every other string the program spells.
+    let bytes = crate::opts::get().str_repr == crate::opts::StrRepr::Bytes;
     out.push('"');
     for ch in s.chars() {
         match ch {
@@ -1938,7 +1942,10 @@ fn write_js_string(out: &mut String, s: &str) {
             // Line separators terminate a string literal in older parsers.
             '\u{2028}' => out.push_str("\\u2028"),
             '\u{2029}' => out.push_str("\\u2029"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+            c if (c as u32) < 0x20
+                || c as u32 == 0x7f
+                || (bytes && (0x80..0x100).contains(&(c as u32))) =>
+            {
                 out.push_str("\\x");
                 out.push(hex_digit((c as u32) >> 4));
                 out.push(hex_digit(c as u32 & 0xf));

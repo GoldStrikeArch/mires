@@ -1566,6 +1566,289 @@ globalThis.__rt.bytes_str = (buf, off, len) => {
 };
 
 // ---------------------------------------------------------------------------
+// Byte strings (`-Cllvm-args=js-str=bytes`, experimental)
+// ---------------------------------------------------------------------------
+//
+// Under the link-time switch `js-str=bytes` a Rust `str` is a *byte string*: a
+// JavaScript string whose code unit `i` is byte `i` of the UTF-8 text, so every
+// unit is below 256, `length` is the Rust length and a byte offset is an index
+// (js_of_ocaml holds OCaml strings the same way). A program linked that way
+// never calls the UTF-16 helpers above; it calls these. Only two of them are
+// codecs, and they run where Rust text meets the host: `bstr_in` (host text
+// becoming a Rust `str`) and `bstr_out` (Rust text reaching the host). Every
+// other conversion is a copy of code units.
+
+// _bstr_units(buf, off, len): the byte string of `len` bytes at `buf[off]`, a
+// plain array or a typed array. An `i8` element is read as its byte.
+// `String.fromCharCode` takes a bounded run of arguments, so long runs chunk.
+globalThis.__rt._bstr_units = (buf, off, len) => {
+  if (len <= 0) return "";
+  let out = "";
+  for (let at = 0; at < len; at += 4096) {
+    const end = Math.min(len, at + 4096);
+    const codes = new Array(end - at);
+    for (let i = at; i < end; i++) codes[i - at] = buf[off + i] & 0xff;
+    out += String.fromCharCode.apply(null, codes);
+  }
+  return out;
+};
+
+// bstr_in(s): host text as the byte string of its UTF-8 bytes -- exactly the
+// bytes `TextEncoder` writes, so a lone surrogate is U+FFFD (EF BF BD). ASCII
+// text is its own byte string and comes back as is.
+globalThis.__rt.bstr_in = (s) => {
+  const n = s.length;
+  let i = 0;
+  while (i < n && s.charCodeAt(i) < 0x80) i++;
+  if (i === n) return s;
+  const bytes = globalThis.__rt._encoder.encode(s);
+  return globalThis.__rt._bstr_units(bytes, 0, bytes.length);
+};
+
+// bstr_out(s): a byte string as the host text it encodes. A byte string is
+// always well-formed UTF-8 (Rust's invariant), so this is a plain decode; ASCII
+// text is its own host text and comes back as is.
+globalThis.__rt.bstr_out = (s) => {
+  const n = s.length;
+  let i = 0;
+  while (i < n && s.charCodeAt(i) < 0x80) i++;
+  if (i === n) return s;
+  const bytes = new Uint8Array(n);
+  for (let j = 0; j < n; j++) bytes[j] = s.charCodeAt(j);
+  return globalThis.__rt._decoder.decode(bytes);
+};
+
+// bstr_char(point): the byte string of one Rust `char`, its UTF-8 bytes.
+globalThis.__rt.bstr_char = (c) => {
+  if (c < 0x80) return String.fromCharCode(c);
+  if (c < 0x800) return String.fromCharCode(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+  if (c < 0x10000) {
+    return String.fromCharCode(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+  }
+  return String.fromCharCode(
+    0xf0 | (c >> 18),
+    0x80 | ((c >> 12) & 0x3f),
+    0x80 | ((c >> 6) & 0x3f),
+    0x80 | (c & 0x3f),
+  );
+};
+
+// The byte-view memo of `bstr_bytes`: the same contract and bounds as the
+// UTF-16 memo above (`_str_memo`), over byte strings. A view's buffer is the
+// string's code units, so `_bstr_src` maps every memoized buffer back to its
+// string and `bstr_of` over any range of it is a `slice`; the four-entry
+// `_bsub_*` cache maps such a slice back to its view, so asking for the bytes of
+// a slice just made copies nothing.
+globalThis.__rt._bstr_memo = { map: new Map(), bytes: 0, huge: [], armed: false, budget: 4194304 };
+let _bstr_src;
+let _bsub_k0 = "";
+let _bsub_v0;
+let _bsub_k1 = "";
+let _bsub_v1;
+let _bsub_k2 = "";
+let _bsub_v2;
+let _bsub_k3 = "";
+let _bsub_v3;
+let _bsub_i = 0;
+let _bsub_arm;
+function _bsub_reset() {
+  _bsub_k0 = _bsub_k1 = _bsub_k2 = _bsub_k3 = "";
+  _bsub_v0 = _bsub_v1 = _bsub_v2 = _bsub_v3 = undefined;
+}
+function _arm_bstr_memo() {
+  const memo = globalThis.__rt._bstr_memo;
+  if (!memo.armed) {
+    memo.armed = true;
+    if (typeof queueMicrotask === "function") queueMicrotask(globalThis.__rt._bstr_memo_clear);
+  }
+}
+
+globalThis.__rt._bstr_memo_clear = () => {
+  const memo = globalThis.__rt._bstr_memo;
+  memo.map.clear();
+  memo.bytes = 0;
+  memo.huge.length = 0;
+  memo.armed = false;
+  _bsub_reset();
+};
+
+// bstr_bytes(s): `str::as_bytes` of a byte string, `{ buf, off, len }` over a
+// plain array of its code units, memoized for the operation like `str_bytes`.
+globalThis.__rt.bstr_bytes = (s) => {
+  if (s !== "") {
+    if (s === _bsub_k0) return _bsub_v0;
+    if (s === _bsub_k1) return _bsub_v1;
+    if (s === _bsub_k2) return _bsub_v2;
+    if (s === _bsub_k3) return _bsub_v3;
+  }
+  const memo = globalThis.__rt._bstr_memo;
+  let record = memo.map.get(s);
+  if (record !== undefined) return record;
+  const n = s.length;
+  const bytes = new Array(n);
+  for (let i = 0; i < n; i++) bytes[i] = s.charCodeAt(i);
+  record = { buf: bytes, off: 0, len: n };
+  (_bstr_src || (_bstr_src = new WeakMap())).set(bytes, s);
+  if (_bsub_arm === undefined) _bsub_arm = _arm_bstr_memo;
+  _arm_bstr_memo();
+  if (n > memo.budget / 4) {
+    if (memo.huge.length === 2) {
+      memo.map.delete(memo.huge.shift());
+      _bsub_reset();
+    }
+    memo.huge.push(s);
+  } else {
+    if (memo.bytes + n > memo.budget) {
+      const huge = memo.huge.map((key) => memo.map.get(key));
+      memo.map.clear();
+      memo.huge.forEach((key, i) => memo.map.set(key, huge[i]));
+      memo.bytes = 0;
+      _bsub_reset();
+    }
+    memo.bytes += n;
+  }
+  memo.map.set(s, record);
+  return record;
+};
+
+// bstr_bytes_mut(s): `as_bytes_mut`/`as_mut_ptr` -- the same bytes in a fresh,
+// unmemoized record, for the containment `str_bytes_mut` documents.
+globalThis.__rt.bstr_bytes_mut = (s) => {
+  const n = s.length;
+  const bytes = new Array(n);
+  for (let i = 0; i < n; i++) bytes[i] = s.charCodeAt(i);
+  return { buf: bytes, off: 0, len: n };
+};
+
+// bstr_of(buf, off, len): `len` bytes at `buf[off]` as a byte string -- what
+// `from_utf8_unchecked` and a raw `str` pointer are. No decoding: a byte is a
+// code unit. A range of a memoized view is a slice of the string it came from.
+globalThis.__rt.bstr_of = (buf, off, len) => {
+  // A zero length `str` reads nothing; its buffer may not exist at all.
+  if (len === 0) return "";
+  if (_bstr_src !== undefined && typeof buf === "object" && buf !== null) {
+    const src = _bstr_src.get(buf);
+    if (src !== undefined && off >= 0 && len >= 0 && off + len <= src.length) {
+      if (off === 0 && len === src.length) return src;
+      const sub = src.slice(off, off + len);
+      if (_bsub_arm !== undefined) _bsub_arm();
+      const slot = { buf, off, len };
+      if (_bsub_i === 0) {
+        _bsub_k0 = sub;
+        _bsub_v0 = slot;
+      } else if (_bsub_i === 1) {
+        _bsub_k1 = sub;
+        _bsub_v1 = slot;
+      } else if (_bsub_i === 2) {
+        _bsub_k2 = sub;
+        _bsub_v2 = slot;
+      } else {
+        _bsub_k3 = sub;
+        _bsub_v3 = slot;
+      }
+      _bsub_i = (_bsub_i + 1) & 3;
+      return sub;
+    }
+  }
+  return globalThis.__rt._bstr_units(buf, off, len);
+};
+
+// bstr_boundary(text, index): whether `index` is a char boundary of the byte
+// string `text`: 0..=len, and not the index of a continuation byte.
+globalThis.__rt.bstr_boundary = (text, index) =>
+  Number.isInteger(index) && index >= 0 && index <= text.length &&
+  (index === text.length || (text.charCodeAt(index) & 0xc0) !== 0x80);
+
+// bstr_push(value, point): `native_str_push` over a byte-string builder
+// `{ text, cap, len }`, whose `len` is always `text.length`.
+globalThis.__rt.bstr_push = (value, point) => {
+  value.text += globalThis.__rt.bstr_char(point);
+  value.len = value.text.length;
+};
+
+// bstr_pop(value): `native_str_pop` over a byte-string builder: -1 for `None`,
+// otherwise the last scalar, decoded from its UTF-8 bytes. Capacity is kept.
+globalThis.__rt.bstr_pop = (value) => {
+  const text = value.text;
+  if (text.length === 0) return -1;
+  let at = text.length - 1;
+  while (at > 0 && (text.charCodeAt(at) & 0xc0) === 0x80) at -= 1;
+  const b0 = text.charCodeAt(at);
+  const n = text.length - at;
+  let point = n === 1 ? b0 : n === 2 ? b0 & 0x1f : n === 3 ? b0 & 0x0f : b0 & 0x07;
+  for (let i = at + 1; i < text.length; i++) point = (point << 6) | (text.charCodeAt(i) & 0x3f);
+  value.text = text.slice(0, at);
+  value.len = at;
+  return point;
+};
+
+// bstr_truncate(value, byteIndex): `native_str_truncate` over a byte-string
+// builder: a no-op at or past the length, a refusal off a char boundary.
+globalThis.__rt.bstr_truncate = (value, byteIndex) => {
+  if (byteIndex >= value.len) return;
+  if (!globalThis.__rt.bstr_boundary(value.text, byteIndex)) {
+    throw __rt.abort_error(new RangeError("native String truncate index is not a UTF-8 boundary"));
+  }
+  value.text = value.text.slice(0, byteIndex);
+  value.len = byteIndex;
+};
+
+// bstr_host_sb(s): `convert_host_sb` for a byte string: an exact-fit builder.
+globalThis.__rt.bstr_host_sb = (s) => ({ text: s, cap: s.length, len: s.length });
+
+// bstr_block(s): `convert_str_block` for a byte string: its bytes as a fresh,
+// registered, exact-fit `{ buf, off, len, cap }` baseline block.
+globalThis.__rt.bstr_block = (s) => {
+  const n = s.length;
+  const copy = new Array(n);
+  for (let i = 0; i < n; i++) copy[i] = s.charCodeAt(i);
+  const p = globalThis.__rt._register(copy, n, false);
+  globalThis.__rt._blk_get(copy).fresh = false;
+  return { buf: p.buf, off: 0, len: n, cap: n };
+};
+
+// bstr_sb_block(sb): `convert_sb_block` for a byte-string builder: a fresh
+// registered block of capacity `max(cap, len)`, `[0, len)` initialized.
+globalThis.__rt.bstr_sb_block = (sb) => {
+  const text = sb.text;
+  const n = text.length;
+  const cap = Math.max(sb.cap, n);
+  const copy = new Array(n);
+  for (let i = 0; i < n; i++) copy[i] = text.charCodeAt(i);
+  copy.length = cap;
+  const p = globalThis.__rt._register(copy, cap, false);
+  globalThis.__rt._blk_get(copy).fresh = false;
+  return { buf: p.buf, off: 0, len: n, cap };
+};
+
+// bstr_sb_check(value): `_sb_check` (`RCGJS_SB_VERIFY=1`) for a byte-string
+// builder: `len` is `text.length`, `cap` at least that, and the text is a
+// byte string holding well-formed UTF-8.
+globalThis.__rt.bstr_sb_check = (value) => {
+  const text = value.text;
+  const bytes = new Uint8Array(text.length);
+  let valid = true;
+  for (let i = 0; i < text.length; i++) {
+    const unit = text.charCodeAt(i);
+    if (unit > 0xff) valid = false;
+    bytes[i] = unit;
+  }
+  if (valid && typeof TextDecoder === "function") {
+    try {
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch (_) {
+      valid = false;
+    }
+  }
+  if (value.len !== text.length || !(value.cap >= text.length) || !valid) {
+    const detail = "len " + value.len + ", cap " + value.cap + ", text measures " + text.length +
+      (valid ? "" : ", text is not a UTF-8 byte string");
+    throw __rt.abort_error(new RangeError("native String length drift: " + detail));
+  }
+  return value;
+};
+
+// ---------------------------------------------------------------------------
 // Native String and Vec primitives
 // ---------------------------------------------------------------------------
 //

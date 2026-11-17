@@ -42,13 +42,18 @@ if (panic === 'unwind' && cleanup === 'on') {
 const mirInline = String(options['mir-inline'] ?? (process.env.JSC_RUST_MIR_INLINE || 'off'))
 if (!['off', 'on'].includes(mirInline)) throw new Error('--mir-inline must be off or on')
 const compilerArgs = `js-profile=release-size js-opt=on js-ecma-target=2018 js-cleanup=${cleanup}`
+// `--str bytes` links every workload with `js-str=bytes` (experimental): a link-only option, so the
+// sysroot and its arguments are the default build's.
+const strRepr = String(options.str || 'utf16')
+if (!['utf16', 'bytes'].includes(strRepr)) throw new Error('--str must be utf16 or bytes')
+const strArgs = strRepr === 'utf16' ? '' : ` js-str=${strRepr}`
 const compilerEnvironment = {
   ...process.env,
   JSC_REMAP_ROOT: root,
   JSC_RUST_MIR_INLINE: mirInline,
   JSC_RUST_OPT_LEVEL: 'z',
   JSC_SYSROOT_ARGS: compilerArgs,
-  JS_EXTRA_ARGS: `${compilerArgs} js-opt-warnings=off js-workspace-root=${repositoryRoot}`,
+  JS_EXTRA_ARGS: `${compilerArgs} js-opt-warnings=off js-workspace-root=${repositoryRoot}${strArgs}`,
   JSC_PANIC: panic,
 }
 
