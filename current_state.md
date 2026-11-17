@@ -1,5 +1,27 @@
 # Current state: mires, the lost v2 compiler, and its reconstruction
 
+## Current checkpoint — 2026-11-17
+
+**Latest inspected compiler implementation:** `933d5d0ad82010879c96c29d2cd56e8bba9fd6c5`, already on main with receipt commit `ba72c43`. Subsequent documentation commits do not change its implementation. Read [RESTORATION-STATUS.md](RESTORATION-STATUS.md) for the current comparison with the lost compiler and [the fresh status receipt](docs/main-restoration-status-2026-11-17.json) for exact scope.
+
+**We are close to the old OSS size waypoint, not finished restoring semantic coverage.** Compact is 155,681 minified / 47,856 gzip bytes; default idiomatic is 267,044 / 78,583. Relative to the recorded October dev12 waypoints these are +7.24% and +5.68% gzip. The comparison is historical and not fully input/compressor matched. It does not mean the compiler is 93% or 95% complete.
+
+Main now includes next-gen qualification repairs and selected Round 3 private-ABI, inlining, cell, loop/bounds and integer-pair work. The proposed Round 3 runtime fast paths were removed; the runtime remains identical to the qualification baseline. Older statements below saying that all cleanup-edge pruning is held back or that only the first promotion is on main are historical.
+
+Fresh checks during this assessment: **174/174 explicit JIR+optimizer fixtures in each of unwind and abort modes**, including six intended compile refusals per mode; **88/88 runtime tests**; **14/14 exact artifact remeasurements**; and **58/58 package-kernel comparisons for each of compact and default idiomatic**. These are not all-profile or browser qualification. The known-gap inventories remain **5/6, 2/5, 0/4**.
+
+New native-controlled capability probes for boxed slices, shared `Rc::make_mut`, and a constant closure coerced to a function pointer fail in both optimizer modes. They are not byte-exact historical fixtures or newly attributed Round 3 regressions. They demonstrate why package-size recovery must not substitute for restoring ordinary Rust behavior. Sources and outcomes are preserved in [the Round 3 evidence archive](research/v2-restoration/round3/README.md).
+
+The remaining hardening gaps are explicit: exceptional-edge witness checks are optional in ordinary release links; the timing driver records but does not enforce A/A validity (the current MiniSearch arm is false); and sysroot identities omit `CARGO_INCREMENTAL`, which the retained review found can change code generation. None was silently fixed by this documentation task.
+
+The latest original candidate was October 7 dev13, whose receipts explicitly denied production/timing authority. Its generic browser, worker and clean-prebuilt evidence was broader than the new compiler's latest qualification; its Topcoat-specific islands/keyed UI are not standalone restoration requirements. Current runtime improvements are meaningful diagnostics, but no matched dev13 runtime comparison exists.
+
+**The sections below preserve the November 12 snapshot and its evidence as written. Their uses of “current,” branch names, file counts, dates and pass totals describe that snapshot unless this checkpoint or the newer status report supersedes them.** The original text was committed separately before this update so its provenance is retained.
+
+---
+
+## Historical snapshot — 2026-11-12
+
 **As of:** 2026-11-12.  
 **Repository:** `mires`, standalone Rust-to-JavaScript compiler.  
 **Repository revision inspected for this document:** `a868dcba9dca98cc924f362fe07b7be757a686fc` on local `main`.  

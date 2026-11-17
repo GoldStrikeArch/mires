@@ -1,0 +1,66 @@
+[
+  {
+    "path": "experiments-2026-09-05/rc-step5-dev13/receipt.json",
+    "sha256": "688dcd99b985440b30b1b731132fa85c2c2e10f6585ec6e7a1510309b531ab5e",
+    "status": "pass-scoped-node-chrome-safari; firefox-not-launched; e13-not-run",
+    "candidate": {
+      "head": "b2e8718dbfe54422bf6a5cb856b9d315f10a08bd",
+      "identitySha256": "dd9c6d8a77b0bd7f903ff4d9f327eb84023ee5302ae205131cfe9508059eb680"
+    },
+    "limits": [
+      "Firefox was not run: it cannot launch from this process tree (firefoxNotRun). The three-browser obligation is not met.",
+      "The realm/page and promise/task cleanup harnesses build their own cleanup-off arms; cleanup-on coverage in the browser comes from the release-balanced island pages, keyed DOM test and the keyed package (cleanup on by profile default).",
+      "Executable debugging (breakpoints through delivered maps) was not run: keyed-source-maps.mjs / keyed-source-debugger.mjs / firefox-keyed-debugger.mjs need an EXP-00 matched-baseline receipt that does not exist.",
+      "No timing; E13 not run."
+    ],
+    "productionQualified": false,
+    "timingAuthority": false
+  },
+  {
+    "path": "experiments-2026-09-05/rc-step5-dev13-firefox/receipt.json",
+    "sha256": "f574ecdb9d58c1296a9e6c53bad0528dedf099cbb381819f7d0dca296fd09401",
+    "status": "pass-scoped-firefox-cells; completes-chrome-safari-rc-step5; prebuilt-multicrate-and-procedure-identity-firefox-not-run",
+    "candidate": {
+      "head": "b2e8718dbfe54422bf6a5cb856b9d315f10a08bd",
+      "identitySha256": "dd9c6d8a77b0bd7f903ff4d9f327eb84023ee5302ae205131cfe9508059eb680"
+    },
+    "limits": [
+      "Firefox ran attached (one LaunchServices-started headless process for every cell), not as a fresh geckodriver-launched process per harness as Chrome was; each harness still opened and quit its own WebDriver session.",
+      "The prebuilt multicrate browser cell (step 47) and the procedure-identity cell (step 48) were not run in Firefox (results.closure); the p14-prebuilt-step5-dev13 receipt remains Chrome/Safari only.",
+      "The realm/page matrices are cleanup-off arms, as in rc-step5-dev13; cleanup-on Firefox coverage comes from the release-balanced island pages and the keyed DOM test.",
+      "No timing; E13 not run."
+    ],
+    "productionQualified": false,
+    "timingAuthority": false
+  },
+  {
+    "path": "experiments-2026-09-05/p08-keyed-step5-dev13/receipt.json",
+    "sha256": "f66147720bfd0b57fccad1dcab262423d56166d68c8bbe9026ea24e5c2a312bc",
+    "status": "pass-scoped-detector-packages-maps-es2018-three-profiles; upstream-duration-memory-startup-and-v1-rerun-not-run",
+    "candidate": {
+      "head": "b2e8718dbfe54422bf6a5cb856b9d315f10a08bd",
+      "identitySha256": "dd9c6d8a77b0bd7f903ff4d9f327eb84023ee5302ae205131cfe9508059eb680"
+    },
+    "limitations": [
+      "The upstream duration, memory, startup and transfer suites, the v1 rerun from K0 and exact v1/v2 browser authority were not run (results.notRun); no performance, memory or promotion claim.",
+      "The isKeyed detector drives Chrome only; Firefox not launched."
+    ],
+    "productionQualified": false,
+    "timingAuthority": false
+  },
+  {
+    "path": "experiments-2026-09-05/p14-prebuilt-step5-dev13/receipt.json",
+    "sha256": "7a79e49258b139f5105fcf180baf3f59deb3a90b2b9efdfb141ff2f9bc7cc9dd",
+    "status": "pass-scoped-clean-archive-prebuilt-chrome-safari-unsigned; firefox-not-launched; capability-and-nightly-arm-not-run",
+    "candidate": {
+      "head": "b2e8718dbfe54422bf6a5cb856b9d315f10a08bd",
+      "identitySha256": "dd9c6d8a77b0bd7f903ff4d9f327eb84023ee5302ae205131cfe9508059eb680"
+    },
+    "limitations": [
+      "Unsigned: public distribution needs an authorised release identity.",
+      "capability.mjs not run.",
+      "Firefox not launched."
+    ],
+    "productionQualified": false
+  }
+]

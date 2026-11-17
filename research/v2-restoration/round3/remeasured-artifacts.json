@@ -1,0 +1,134 @@
+{
+  "node": "v26.8.1",
+  "zlib": "1.3.2.1-motley-8002e91",
+  "brotli": "1.2.0",
+  "scope": "retained exact Round3 artifacts; not a new build",
+  "rows": [
+    {
+      "name": "compact/release-balanced",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/build/qualify-next-gen/compact-release-balanced/dist/fp.esm.min.js",
+      "bytes": 155681,
+      "gzip9": 47856,
+      "brotli11": 36762,
+      "sha256": "64df2a453d780462f27c30dae7adce8a80ea3f92c1bbb086c188fa059a617b20",
+      "matches": true
+    },
+    {
+      "name": "compact/release-size",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/build/qualify-next-gen/compact-release-size/dist/fp.esm.min.js",
+      "bytes": 155681,
+      "gzip9": 47856,
+      "brotli11": 36762,
+      "sha256": "64df2a453d780462f27c30dae7adce8a80ea3f92c1bbb086c188fa059a617b20",
+      "matches": true
+    },
+    {
+      "name": "idiomatic/release-balanced-default",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/build/qualify-next-gen/idiomatic-release-balanced-default/dist/boundary/fp.esm.min.js",
+      "bytes": 267044,
+      "gzip9": 78583,
+      "brotli11": 63111,
+      "sha256": "b70037ef70187837be87361e09c998f767386ca12123431ebadce541d16eeb6b",
+      "matches": true
+    },
+    {
+      "name": "idiomatic/release-balanced-oz",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/build/qualify-next-gen/idiomatic-release-balanced-oz/dist/boundary/fp.esm.min.js",
+      "bytes": 267497,
+      "gzip9": 79136,
+      "brotli11": 63586,
+      "sha256": "f138cbebdb6fa6fe6b9b911d532e2ffb423084ee59d290bbd4ef65c0e522ffb0",
+      "matches": true
+    },
+    {
+      "name": "corpus/marked",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/marked/index.min.js",
+      "bytes": 25970,
+      "gzip9": 9825,
+      "brotli11": 8653,
+      "sha256": "cac7438ef53bac1af790cdfeddbcd507ebf24e80a71496cdf92069c3ab491a74",
+      "matches": true
+    },
+    {
+      "name": "corpus/minisearch",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/minisearch/index.min.js",
+      "bytes": 46760,
+      "gzip9": 14314,
+      "brotli11": 12698,
+      "sha256": "84ce3640f96c53996883727dad1ff9adf35d3d5fd60873ff4145ef16524429e1",
+      "matches": true
+    },
+    {
+      "name": "corpus/fflate",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/fflate/index.min.js",
+      "bytes": 12049,
+      "gzip9": 4977,
+      "brotli11": 4539,
+      "sha256": "c068b03a981e83b8d4888694f98c11cbfeec905da73fc4f07099077fb72acfaf",
+      "matches": true
+    },
+    {
+      "name": "corpus/uplot",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/uplot/index.min.js",
+      "bytes": 1877,
+      "gzip9": 1057,
+      "brotli11": 947,
+      "sha256": "e26b91bfceaf5ffc3c0ec4fb91f7b409757a966bcd554460c04a43ebab30cb9e",
+      "matches": true
+    },
+    {
+      "name": "corpus/idb",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/idb/index.min.js",
+      "bytes": 23618,
+      "gzip9": 8692,
+      "brotli11": 7764,
+      "sha256": "58a7fb8dfc8c7c8d3fe5d7bc23ab8d64cd9bbc3b0a04b7b1372e1ad0982e7d5d",
+      "matches": true
+    },
+    {
+      "name": "corpus/idb_lines",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/idb_lines/index.min.js",
+      "bytes": 25947,
+      "gzip9": 9518,
+      "brotli11": 8422,
+      "sha256": "bd4e78ae1f625480dabd69c75cc176d082c4dc85274ece06adc7e0d189bbf938",
+      "matches": true
+    },
+    {
+      "name": "corpus/ky",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/ky/index.min.js",
+      "bytes": 26715,
+      "gzip9": 9600,
+      "brotli11": 8546,
+      "sha256": "979c407968d9235f4132721781ab304881bc55f27140bec1cf719c605e9cda5b",
+      "matches": true
+    },
+    {
+      "name": "corpus/explorer",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/explorer/index.min.js",
+      "bytes": 80626,
+      "gzip9": 25339,
+      "brotli11": 21908,
+      "sha256": "fa4651bd47d9cee20338a1d355cec6dc8c70bda36e58ac082808fb0ae1b06cd2",
+      "matches": true
+    },
+    {
+      "name": "corpus/workbox",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/workbox/index.min.js",
+      "bytes": 25510,
+      "gzip9": 8656,
+      "brotli11": 7607,
+      "sha256": "01f9d9bc8d3c6c4fd4e7ef57d05ab750764970cfe5ffcb41d62b4fb671b43dd6",
+      "matches": true
+    },
+    {
+      "name": "corpus/workbox_direct",
+      "sourcePath": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/workbox_direct/index.min.js",
+      "bytes": 5104,
+      "gzip9": 2097,
+      "brotli11": 1864,
+      "sha256": "1c85fe587bcffe3307b15cfee7009e57d6d5f9fdf9772a13cd30442903219b2d",
+      "matches": true
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "scope": "New November 17 probes of historically relevant capabilities, not recovered original October fixtures",
+  "files": [
+    {
+      "file": "capability-probes/october_box_slice-native.rs",
+      "auditSourceSha256": "38528c6f4b5720565eeb4de72a8174ed1a75df38cb8589022eddc6e669314519",
+      "committedSha256": "38528c6f4b5720565eeb4de72a8174ed1a75df38cb8589022eddc6e669314519",
+      "adaptation": "none"
+    },
+    {
+      "file": "capability-probes/october_box_slice.expected",
+      "auditSourceSha256": "f23147dd257bd6a97400f0f42fa24ee04a287fb99a660c063627223d00b3f097",
+      "committedSha256": "f23147dd257bd6a97400f0f42fa24ee04a287fb99a660c063627223d00b3f097",
+      "adaptation": "none"
+    },
+    {
+      "file": "capability-probes/october_box_slice.rs",
+      "auditSourceSha256": "e09bca516622ec32970420511045b62ffeaf21aeb2601f355a744bc1d2c305a7",
+      "committedSha256": "574c3fbe3917092b0d50ff00768c75cefc2bc5961d72f3823527cacc621a1ace",
+      "adaptation": "absolute prelude path made repository-relative"
+    },
+    {
+      "file": "capability-probes/october_const_closure-native.rs",
+      "auditSourceSha256": "b0a9b072c1004fec756cdc3f5030403be911d702941c5ae86126cf48d90087ed",
+      "committedSha256": "b0a9b072c1004fec756cdc3f5030403be911d702941c5ae86126cf48d90087ed",
+      "adaptation": "none"
+    },
+    {
+      "file": "capability-probes/october_const_closure.expected",
+      "auditSourceSha256": "084c799cd551dd1d8d5c5f9a5d593b2e931f5e36122ee5c793c1d08a19839cc0",
+      "committedSha256": "084c799cd551dd1d8d5c5f9a5d593b2e931f5e36122ee5c793c1d08a19839cc0",
+      "adaptation": "none"
+    },
+    {
+      "file": "capability-probes/october_const_closure.rs",
+      "auditSourceSha256": "889c79e3ec8db0521e1d7e50b17a58cf5f04c2d7d6a668db09bf1b9873c8dd5d",
+      "committedSha256": "61cf34d5adb3330e794732102969179bc00492961b24177cc7a224bcfeae240d",
+      "adaptation": "absolute prelude path made repository-relative"
+    },
+    {
+      "file": "capability-probes/october_rc_make_mut-native.rs",
+      "auditSourceSha256": "695ed5ddfd06bf577411f0440799aeb11bdd58b6e680a2f635076643abc0e55d",
+      "committedSha256": "695ed5ddfd06bf577411f0440799aeb11bdd58b6e680a2f635076643abc0e55d",
+      "adaptation": "none"
+    },
+    {
+      "file": "capability-probes/october_rc_make_mut.expected",
+      "auditSourceSha256": "68016e4fa1f8d8e9b6001b4de0aa9771f1c9f92f60f6532c89c1cee254a8d960",
+      "committedSha256": "68016e4fa1f8d8e9b6001b4de0aa9771f1c9f92f60f6532c89c1cee254a8d960",
+      "adaptation": "none"
+    },
+    {
+      "file": "capability-probes/october_rc_make_mut.rs",
+      "auditSourceSha256": "854a382522919383d529de4270dfb301e80c5bfbd60897c7026a36fb47853505",
+      "committedSha256": "e76215d8e7ecaf091b67bcb471e584d6367896c615c4e4c0c0a4df0b7a014bdf",
+      "adaptation": "absolute prelude path made repository-relative"
+    }
+  ]
+}

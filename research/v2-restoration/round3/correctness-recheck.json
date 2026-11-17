@@ -1,0 +1,92 @@
+{
+ "verdict": "PASS",
+ "candidate": "933d5d0ad82010879c96c29d2cd56e8bba9fd6c5",
+ "base": "44161c247bb9461b447be97456aed101f870dc20",
+ "cargoIncremental": "unset on both sides (both rebuilt non-incremental)",
+ "hashes": {
+  "candidate": {
+   "jsc-link": "5d7ef8123479aee8d7066f821966b7ab6760ec42d981af2054c18cca47217189 (matches implementer reference)",
+   "dylib": "07c53ab83362a0a77a30e140f93bfa956cc818b6725445020550c19fc5deb6f6 (path-dependent)",
+   "shim.js": "0ea2a34ec10f68bbe0d1573dc3ccdde66700f2b9604e25cee73603b841d1497c (= base)"
+  },
+  "base": {
+   "jsc-link": "dd44540f6629d4a619acae71cee8f34d9f94b9598529332b3f803adc631f9fd0 (matches main receipt dd44540f6629d4a6)",
+   "dylib": "63931cc23d451ebfd68325d93f5cf9b471ad3966a977510e4f37b60c1a2456e9",
+   "shim.js": "0ea2a34ec10f68bbe0d1573dc3ccdde66700f2b9604e25cee73603b841d1497c"
+  }
+ },
+ "diffCheck": "git diff 895ed1c 933d5d0: only experiments/qualification receipt, runtime/shim.js, runtime/test/r3-fastpaths.test.mjs (deleted), scripts/qualify-next-gen.mjs; git diff 44161c2 933d5d0 -- runtime/ is empty",
+ "failReasons": [],
+ "preExisting": [
+  {
+   "id": "P1-P7",
+   "summary": "all pre-existing defects from results.json reproduce on 933d5d0 with byte-identical output to base (P1 abort-mode handler skipped; P2 track_caller location under inline-z incl. fixture 332; P3 track_caller fn pointer TypeError; P4 make_ascii_* lost; P5 remaining drops skipped after throwing destructor under js-cleanup=on; P6 SpreadNotTuple refusal; P7 empty-array iter_mut ptr_eq refusal)"
+  },
+  {
+   "id": "P8",
+   "summary": "Cloning a tuple `(String, [u64; 2], P)` (derive Clone, P: Copy struct with array) crashes at run time: TypeError: Cannot set properties of undefined (setting 0) in core::clone::Clone::clone, in gate-u/gate-a/off-u/off-a/relz-a/rel-u; under inline-z the program is refused (transmute in core/src/array/equality.rs unsupported). Identical on base.",
+   "examples": [
+    "probes/fa_clone.rs"
+   ]
+  },
+  {
+   "id": "P9",
+   "summary": "Rc::make_mut on Rc<i32> (shared, then unique) aborts: `rustc_codegen_js: this pointer is a byte view of 12-byte elements, not of 4-byte ones` (fail-loud) in all settings; relz-a refuses at compile. Identical on base.",
+   "examples": [
+    "probes/fa_rc.rs"
+   ]
+  },
+  {
+   "id": "P10",
+   "summary": "Under inline-z in unwind mode and in sizez-a (relz-u, latz-u, sizez-a), `v == u` on two Vec<u32> of length 1 aborts: `compare_bytes over 4 elements at 0 reaches past the end of a buffer of 1` (fail-loud). Identical on base (base shim).",
+   "examples": [
+    "probes/fa_sort.rs"
+   ]
+  }
+ ],
+ "held": [
+  {
+   "check": "implementer-reported flipped fixtures (21_vec, 274_bigint_static_cycle, 29_rc, 300_native_float_format_cleanup, 72_repr_format_min, 94_repr_box_nested, 101_btree_map_nodes, plus reason-number-only 20_alloc_box, 202_pointer_element_moves, 113_unsized_tail, 27_dangling) compiled by 933d5d0 and base in all 9 settings; stdout+exit compared to base and to .expected",
+   "result": "99/99 byte-identical to base; 90/90 of the ones my driver can build match .expected in every setting (113_unsized_tail needs --extern mires_js, which my driver does not pass: compile error on both sides; it is covered by the gate suite)"
+  },
+  {
+   "check": "native-box / direct drop-plan path (the 94_repr_box_nested flip): probes nb94_1..3 (variants of fixture 94), nb_plain, bx_drop_order, bx_count (nested/moved Boxes, Vec<Box>, Box<dyn>, Box<[T]>, Option<Box>, mem::replace/take, linked list, drop counts via Cell), uw_nb94_1..4, uw_nb_throw, uw_nb_throw2, uw_box_throw, uw_box_throw2 (host exceptions while native boxes and Drop observers are live, and during drop)",
+   "result": "all native-identical in every setting run (9 settings non-unwind, 6 unwind settings); lane reports confirm 933d5d0 selects native-box (4 decisions) with 5 direct drop plans in nb94_1/nb94_2 and uw_nb94_1..4 in gate-u/rel-u; only uw_box_throw relz-a differs from native, byte-identical on base (P5: remaining tuple fields not dropped after a throwing field destructor under js-cleanup=on)"
+  },
+  {
+   "check": "flat-ABI flip patterns from the implementer list: fa_sort (sort/sort_by/sort_unstable/sort_by_key stability, n up to 257 to reach drift merge), fa_rc (Rc<RefCell<Vec>>, iter().fold over Rc slices, Weak, ptr_eq), fa_float (f64/f32 integer-decode by bit manipulation incl. subnormal/inf/NaN), fa_clone (derive Clone on arrays/tuples/Option<String>/Box)",
+   "result": "36 runs: 15 native-identical, 21 differ from native but byte-identical to base (P2, P8, P9, P10); 0 regressions"
+  },
+  {
+   "check": "core gate suite on 933d5d0: JS_EXTRA_ARGS=\"js-lane=jir js-opt=on\" scripts/test.sh --require-core, RCGJS_WITNESS_CHECK=1, CARGO_INCREMENTAL unset",
+   "result": "174/174 in mires32-unwind and 174/174 in JSC_PANIC=abort, 0 skipped",
+   "logs": "build/r3v-correctness/recheck/suite-*.log"
+  },
+  {
+   "check": "committed scripts on 933d5d0 (SKIP_BUILD=1): abi-flat-mut-test (forces unwind), r3-loops-bounds-test, r3-inline-cells-test, unwind-mode-test, each in unwind and JSC_PANIC=abort (abi-flat-mut-test unwind only, since it pins JSC_PANIC=unwind)",
+   "result": "all exit 0; unwind-mode-test 56/56 rows in each mode",
+   "logs": "build/r3v-correctness/recheck/script-*.log"
+  },
+  {
+   "check": "targeted probes re-run on 933d5d0 and base: 49 non-unwind probes (the 45 from round 1 plus sb_iter_shapes2, bx_drop_order, bx_count and the earlier ancillary ones) in 9 settings, and 16 host-throw probes (14 from round 1 plus uw_box_throw, uw_box_throw2) in 6 unwind/cleanup settings",
+   "result": "non-unwind: 441 runs, 358 native-identical, 83 byte-identical to base (pre-existing); host-throw: 96 runs, 92 native-identical, 4 identical to base; 0 regressions, 0 candidate-only changes. Decision diff 895ed1c->933d5d0 over these probes (scratchpad/v1/recheck-decdiff.txt): 250 program/config pairs flipped (mostly 140 flat-ABI selections dropped, e.g. core::alloc::layout::repeat_packed, inline counts -2/-3, a few drop-plan/repr changes), all with native- or base-identical output"
+  },
+  {
+   "check": "fixture-corpus differential in sizez-a (release-size, js-cleanup=off, inline-z, abort; the setting of the compact/release-size flat-ABI flip): all 151 base core-test fixtures compiled by 933d5d0 and base",
+   "result": "151/151 byte-identical stdout+exit to base; 134 match .expected (same 134 as round 1)"
+  },
+  {
+   "check": "generated programs gen2 (seeds 0-39) + gen3 (seeds 100-259) on 933d5d0 in gate-u, relz-a, sizez-a vs native wasm32, base run on any mismatch",
+   "result": "200 programs x 3 settings: 182 all-native; 18 have settings that differ from native but are byte-identical to base (P1 in sizez-a, P2, P4); 0 REGRESSION, 0 CHANGED",
+   "log": "scratchpad/v1/recheck-gen.log"
+  }
+ ],
+ "limits": [
+  "Same limits as results.json (overflow checks forced off; no custom #[global_allocator]; unsafe from_raw_parts not used; ESM and JSC engine not tested beyond committed scripts; Rust panics never unwind; abort mode without js-cleanup skips destructors on host throws).",
+  "I did not re-run the release-balanced + inline-z core suite on 933d5d0 (not required by the recheck brief); the sizez-a and all-9-settings fixture differentials above cover the flipped fixtures."
+ ],
+ "unfinished": [
+  "No mutation re-run (guards are unchanged between 895ed1c and 933d5d0; only shim.js/test/qualify script differ).",
+  "No randomly generated host-throw programs (same as round 1)."
+ ]
+}

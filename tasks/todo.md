@@ -565,3 +565,19 @@ Execution: at most three subagents (user). Verifiers Opus 5.5 high, implementers
   - Fix P1–P10.
 - Removable: the Round 3 worktrees, about 186 GB: `r3v-*`, `r3-*` and `round3-opt`. All their branches are merged. The verifiers' `results*.json` are in their `build/` folders; copy them out first if wanted.
 - 2026-11-17 ~03:57: both verifiers ended on a network outage (API `ENOTFOUND`) during their first builds; resumed at ~04:00 with their context and briefs unchanged (same agents, not new spawns), told to confirm the builds completed and re-check any background command before using it. An unfinished verification is not a pass.
+
+
+## Current-main restoration assessment — 2026-11-17
+
+- [x] Commit the previously uncommitted narrative, task decisions and development-speed record without rewriting their historical content (`0f0407d`).
+- [x] Preserve the independent Round 3 initial/recheck verdicts under `research/v2-restoration/round3/`, with original identities and limitations.
+- [x] Re-run explicit JIR+optimizer core fixtures on main: 174/174 in unwind and abort; runtime subset 88/88; exact retained package/corpus hashes and sizes 14/14; OSS kernels 58/58 each.
+- [x] Re-run strict known-gap inventories: 5/6, 2/5, 0/4; do not convert failures into accepted output.
+- [x] Add native-controlled restoration probes: boxed-slice construction/drop, shared Rc::make_mut, constant closure-to-fn pointer. All six off/on compiler runs fail; no Round 3 attribution without a named baseline/bisect.
+- [ ] Make semantic Invoke-pruning validation mandatory in ordinary release links (the current `witness::enabled()` conditional still bypasses it without the environment flag).
+- [ ] Make missing/out-of-band A/A controls invalidate qualification. Current MiniSearch `aaWithinGate=false` coexists with successful outer receipt status; do not publish it as qualified timing.
+- [ ] Bind CARGO_INCREMENTAL in sysroot identity and test mode switching; preserve the non-incremental baseline rather than borrowing incompatible caches.
+- [ ] Pin immutable baseline compiler/source/runtime/sysroots for each qualification arm; the mutable `old_main` path is not a historical baseline after a merge.
+- [ ] Restore the historically supported positive capability families and qualify current Pro/worker/browser/clean-consumer behavior separately from OSS kernel parity.
+
+Current main and the lost-v2 comparison are consolidated in `RESTORATION-STATUS.md`; `current_state.md` retains its November 12 body under a dated historical heading. This assessment changes documentation/evidence only and pushes nothing.

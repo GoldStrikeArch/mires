@@ -1,0 +1,74 @@
+[
+  {
+    "name": "october_box_slice",
+    "optimizer": "off",
+    "nativeO0O3Agree": true,
+    "expected": "3\n6\n2\n9\n",
+    "compileExit": 0,
+    "passed": false,
+    "sourceSha256": "e09bca516622ec32970420511045b62ffeaf21aeb2601f355a744bc1d2c305a7",
+    "runExit": 1,
+    "actual": "3\n0\n2\n9\n",
+    "error": "[stdin]:2129\n    throw __rt.abort_error(new Error(\n    ^\n\nError: rustc_codegen_js: this pointer does not name a live heap block, so it cannot be deallocated\n    at globalThis.__rt.dealloc ([stdin]:2129:28)\n    at _RNvCs1lVxXr9ZvqQ_7___rustc14___rust_dealloc ([stdin]:3873:67)\n    at $f ([stdin]:3881:56)\n    at $m ([stdin]:3883:253)\n    at $h ([stdin]:3903:16)\n    at rust_entry ([stdin]:3914:1719)\n    at [stdin]:3940:1\n    at runScriptInThisContext (node:internal/vm:219:10)\n    at node:internal/process/execution:485:12\n    at [stdin]-wrapper:6:24\n\nNode.js v26.8.1\n"
+  },
+  {
+    "name": "october_box_slice",
+    "optimizer": "on",
+    "nativeO0O3Agree": true,
+    "expected": "3\n6\n2\n9\n",
+    "compileExit": 0,
+    "passed": false,
+    "sourceSha256": "e09bca516622ec32970420511045b62ffeaf21aeb2601f355a744bc1d2c305a7",
+    "runExit": 1,
+    "actual": "3\n0\n2\n9\n",
+    "error": "[stdin]:2129\n    throw __rt.abort_error(new Error(\n    ^\n\nError: rustc_codegen_js: this pointer does not name a live heap block, so it cannot be deallocated\n    at globalThis.__rt.dealloc ([stdin]:2129:28)\n    at _RNvCs1lVxXr9ZvqQ_7___rustc14___rust_dealloc ([stdin]:3874:67)\n    at $c ([stdin]:3879:100)\n    at rust_entry ([stdin]:3886:1091)\n    at [stdin]:3888:1\n    at runScriptInThisContext (node:internal/vm:219:10)\n    at node:internal/process/execution:485:12\n    at [stdin]-wrapper:6:24\n    at runScriptInContext (node:internal/process/execution:483:60)\n    at evalFunction (node:internal/process/execution:317:30)\n\nNode.js v26.8.1\n"
+  },
+  {
+    "name": "october_const_closure",
+    "optimizer": "off",
+    "nativeO0O3Agree": true,
+    "expected": "42\n",
+    "compileExit": 0,
+    "passed": false,
+    "sourceSha256": "889c79e3ec8db0521e1d7e50b17a58cf5f04c2d7d6a668db09bf1b9873c8dd5d",
+    "runExit": 0,
+    "actual": "0\n",
+    "error": ""
+  },
+  {
+    "name": "october_const_closure",
+    "optimizer": "on",
+    "nativeO0O3Agree": true,
+    "expected": "42\n",
+    "compileExit": 0,
+    "passed": false,
+    "sourceSha256": "889c79e3ec8db0521e1d7e50b17a58cf5f04c2d7d6a668db09bf1b9873c8dd5d",
+    "runExit": 0,
+    "actual": "0\n",
+    "error": ""
+  },
+  {
+    "name": "october_rc_make_mut",
+    "optimizer": "off",
+    "nativeO0O3Agree": true,
+    "expected": "9\n7\n1\n10\n",
+    "compileExit": 0,
+    "passed": false,
+    "sourceSha256": "854a382522919383d529de4270dfb301e80c5bfbd60897c7026a36fb47853505",
+    "runExit": 1,
+    "actual": "",
+    "error": "[stdin]:3966\nfunction rust_entry(){let x,I,c,M,g,d,N,v,B,C,w,O,E,t,D,H,F,G,f,J,e,y,z,A,L,u,K,b,l,m,n,o,p,q,r,s,h,i,j,k,a;x=7;I=$7(x);c=$S(I);M=c;try{g=$P(M);l=1}catch($caught){if(__rt.is_abort($caught))throw $caught;a=$caught;l=0}if(l){d=!0;N=c;try{v=$x(N);m=1}catch($caught){if(__rt.is_abort($caught))throw $caught;a=$caught;m=0}if(m){B=9;v.buf[v.off]=B;C=c;try{w=$l(C);n=1}catch($caught){if(__rt.is_abort($caught))throw $caught;a=$caught;n=0}if(n){O=w.buf[w.off];try{$j(O);o=1}catch($caught){if(__rt.is_abort($caught))throw $caught;a=$caught;o=0}if(o){E=g;try{t=$l(E);p=1}catch($caught){if(__rt.is_abort($caught))throw $caught;a=$caught;p=0}if(p){D=t.buf[t.off];try{$j(D);q=1}catch($caught){if(__rt.is_abort($caught))throw $caught;a=$caught;q=0}if(q){H=c;try{F=$L(H);r=1}catch($caught){if(__rt.is_abort($caught))throw $caught;a=$caught;r=0}if(r){G=F>>>0;try{$j(G);s=1}catch($caught){if(__rt.is_abort($caught))throw $caught;a=$caught;s=0}if(s){f=!1;try{$ae(g);h=1}catch($caught){if(__rt.is_abort($caught))throw $caught;a=$caught;h=0}if(h){J=c;try{e=$x(J);i=1}catch($caught){if(__rt.is_abort($caught))throw $caught;a=$caught;i=0}if(i){y=e.buf[e.off];z=1;A=y+z>>>0;e.buf[e.off]=A;L=c;try{u=$l(L);j=1}catch($caught){if(__rt.is_abort($caught))throw $caught;a=$caught;j=0}if(j){K=u.buf[u.off];try{$j(K);k=1}catch($caught){if(__rt.is_abort($caught))throw $caught;a=$caught;k=0}if(k){$d(c);return}else b=f}else b=f}else b=f}else b=f}else b=d}else b=d}else b=d}else b=d}else b=d}else b=d}else b=d;if(b)$d(g)}$d(c);throw a}\n                                                                                                                                                                                                                                                                                                 ^\n\nError: rustc_codegen_js: this pointer is a byte view of 12-byte elements, not of 4-byte ones\n    at globalThis.__rt.unscale ([stdin]:1108:30)\n    at globalThis.__rt.unscale_scalar ([stdin]:1148:26)\n    at $W ([stdin]:3906:28)\n    at $K ([stdin]:3891:273)\n    at $x ([stdin]:3893:1476)\n    at rust_entry ([stdin]:3966:239)\n    at [stdin]:4024:1\n    at runScriptInThisContext (node:internal/vm:219:10)\n    at node:internal/process/execution:485:12\n    at [stdin]-wrapper:6:24\n\nNode.js v26.8.1\n"
+  },
+  {
+    "name": "october_rc_make_mut",
+    "optimizer": "on",
+    "nativeO0O3Agree": true,
+    "expected": "9\n7\n1\n10\n",
+    "compileExit": 0,
+    "passed": false,
+    "sourceSha256": "854a382522919383d529de4270dfb301e80c5bfbd60897c7026a36fb47853505",
+    "runExit": 1,
+    "actual": "",
+    "error": "[stdin]:3917\nfunction rust_entry(){let y,I,a,v,h,f,L,w,x,M,r,F,s,G,H,u,J,e,t,K,c,z,d,o,A,B,p,C,N,q,g,D,E,l,m,n,i,j,k,b;y=7;E=y;I=E;B={strong:1,weak:1,value:I};N=B;q={size:12,align:4};g=$v(q.size,q.align);__rt._put(__rt.unscale(g,12,$c).buf,__rt.unscale(g,12,$c).off,N);D=__rt.unscale(g,12,$c);p=D;C={ptr:{buf:p.buf,off:p.off},phantom:void 0,alloc:void 0};a=C;v=a;d=v.ptr;o=d.buf[d.off].strong+1>>>0;d.buf[d.off].strong=o;if(o===0){__rt.js_abort(\"rustc_codegen_js: `abort` intrinsic\");throw $a()}else{A={ptr:v.ptr,phantom:void 0,alloc:void 0};h=A;f=!0;L=a;try{w=$q(L);k=1}catch($caught){if(__rt.is_abort($caught))throw $caught;b=$caught;k=0}if(k){w.buf[w.off]=9;x=$i(a);M=x.buf[x.off];try{$g(M);l=1}catch($caught){if(__rt.is_abort($caught))throw $caught;b=$caught;l=0}if(l){r=$i(h);F=r.buf[r.off];try{$g(F);m=1}catch($caught){if(__rt.is_abort($caught))throw $caught;b=$caught;m=0}if(m){s=a;z=s.ptr.buf[s.ptr.off].strong;G=z;H=G>>>0;try{$g(H);j=1}catch($caught){if(__rt.is_abort($caught))throw $caught;b=$caught;j=0}if(j){u=!1;$b(h);J=a;try{e=$q(J);i=1}catch($caught){if(__rt.is_abort($caught))throw $caught;b=$caught;i=0}if(i){e.buf[e.off]=e.buf[e.off]+1>>>0;t=$i(a);K=t.buf[t.off];try{$g(K);n=1}catch($caught){if(__rt.is_abort($caught))throw $caught;b=$caught;n=0}if(n){$b(a);return}else c=u}else c=u}else c=f}else c=f}else c=f}else c=f;if(c)$b(h);$b(a);throw b}}\n                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       ^\n\nError: rustc_codegen_js: this pointer is a byte view of 12-byte elements, not of 4-byte ones\n    at globalThis.__rt.unscale ([stdin]:1108:30)\n    at globalThis.__rt.unscale_scalar ([stdin]:1148:26)\n    at $B ([stdin]:3900:28)\n    at $q ([stdin]:3891:623)\n    at rust_entry ([stdin]:3917:549)\n    at [stdin]:3919:1\n    at runScriptInThisContext (node:internal/vm:219:10)\n    at node:internal/process/execution:485:12\n    at [stdin]-wrapper:6:24\n    at runScriptInContext (node:internal/process/execution:483:60)\n\nNode.js v26.8.1\n"
+  }
+]

@@ -6,7 +6,7 @@ This is a working development reconstruction based on the coherent September 7 v
 
 ## Current optimization-restoration checkpoint
 
-Selected round-1 wins are integrated locally; cleanup remains enabled. See [the comprehensive promotion and remaining-work report](round_1_integration_report.md) and [verification receipt](docs/round1-promotion-verification.json). The audited cleanup-edge-removal pass and failed/unverified size candidates are intentionally held back. Known correctness failures remain visible; this is not production admission.
+Main includes the next-generation qualification repairs and selected Round 3 optimizer work. See [the current restoration assessment](RESTORATION-STATUS.md), [current evidence](docs/main-restoration-status-2026-11-17.json), and [the full project history](current_state.md). OSS bundle sizes are close to the recorded October waypoint; semantic gaps and qualification hardening remain. The rejected Round 3 runtime fast paths are not included. This is not production admission.
 
 ## Preserved restoration work
 
@@ -60,7 +60,7 @@ Legacy template-marker lowering remains internally for compatibility with recove
 
 ## Profiles and cleanup
 
-`release-size`, `release-balanced`, and `release-speed` select the JIR lane and optimizer, an ES2018 syntax ceiling, and **host-exception cleanup on**. `js-cleanup=off` is an explicit opt-out and changes recoverable-exception semantics. ES2018 is a syntax ceiling, not a promise that every reached host capability exists in an ES2018 engine.
+`release-size`, `release-balanced`, and `release-speed` select the JIR lane and optimizer with an ES2018 syntax ceiling. The default `JSC_PANIC=unwind` mode uses `mires32-unwind` and rustc optimized-MIR cleanup edges; its driver appends `js-cleanup=off` to disable the older reconstruction bridge, **not to disable host-exception cleanup**. `JSC_PANIC=abort` selects the legacy target/pipeline, where the release profiles enable the reconstruction bridge; explicitly disabling that bridge in abort mode changes host-exception cleanup behavior. Rust panics still abort. See [the contract](CONTRACT.md) for ABI refusals and limits. ES2018 is a syntax ceiling, not a guarantee that every reached runtime capability exists in every ES2018 engine. Independent pruning checks currently require `RCGJS_WITNESS_CHECK=1` for a release linker; default enforcement remains open.
 
 The primitive build drivers remain available:
 
@@ -96,7 +96,7 @@ npm run test:corpus
 
 Fingerprint Pro's exact self-contained 4.1.4 reference module and declarations are present locally, but its original source checkout is incomplete. Its Rust ports can be rebuilt independently. Do not mistake an API/import check for full browser parity, and do not publish private recovered material.
 
-The later October cleanup/formatter optimizations, union-string work, constant pooling, trailing arguments and remaining memory-model repairs are not all reimplemented. Restored historical measurements are targets and evidence about their original inputs—not performance claims for this compiler. Other-language comparison ports have not been restored.
+The useful October capabilities have been partly recovered and partly replaced by newer implementations. Union-string policy, broad immutable pooling/trailing-argument work, and remaining memory-model repairs are not all restored. Historical measurements remain scoped to their original inputs. All seven other-language comparator families have been restored; their browser/product qualification is distinct from successful offline builds and kernel checks.
 
 ## Other-language compiler comparisons
 

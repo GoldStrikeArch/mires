@@ -1,4 +1,21 @@
-# Current verdict — selected round-1 main promotion
+# Current verdict — standalone main, selected Round 3
+
+## Assessment — 2026-11-17
+
+**Working development compiler; near the old OSS size waypoint, not exact dev13 and not production-qualified.** Main contains compiler implementation `933d5d0` and its receipt `ba72c43`, including the repaired next-gen pipeline and selected Round 3 work. The rejected R3-D runtime fast paths remain out.
+
+See [RESTORATION-STATUS.md](RESTORATION-STATUS.md), [the current machine-readable status](docs/main-restoration-status-2026-11-17.json), and [preserved independent reviews](research/v2-restoration/round3/README.md).
+
+Fresh main checks: explicit JIR+optimizer fixture gate **174/174 in each panic mode**, runtime **88/88**, retained artifacts **14/14 exact hash/size matches**, and standard OSS kernels **58/58 each**. The fixture totals include six intended compile refusals per mode and do not certify every profile/MIR configuration. Open inventories remain **5/6, 2/5, 0/4**; six additional boxed-slice/Rc/constant-closure runs fail their native expectations.
+
+Current compact is **155,681 min / 47,856 gzip / 36,762 Brotli**; default idiomatic is **267,044 / 78,583 / 63,111**. Historical October comparisons are not fully input/compressor matched. Current MiniSearch timing fails its A/A band despite the outer receipt's success fields, so no authoritative runtime qualification is claimed.
+
+Outstanding promotion/release hardening: mandatory release exceptional-edge validation, timing-failure enforcement, incremental-sensitive sysroot identities, complete immutable per-arm inputs, and recovery of the supported semantic/lifecycle/consumer contracts. Inherited errors are not Round 3 regressions, but remain errors.
+
+## Historical promotion and consolidation records
+
+**The sections below retain the November 11–12 evidence. They are not current branch-status or test-count claims.**
+
 
 ## Current consolidation — 2026-11-12
 

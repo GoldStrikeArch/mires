@@ -1,0 +1,762 @@
+{
+ "verifier": "V2 recheck",
+ "compilerCommit": "933d5d0ad82010879c96c29d2cd56e8bba9fd6c5",
+ "receiptCommit": "ba72c43fc13366e46ff59a071a4e0585c41e1347",
+ "hashes": {
+  "round3-opt": {
+   "jsc-link": "5d7ef8123479aee8d7066f821966b7ab6760ec42d981af2054c18cca47217189",
+   "dylib": "295bf7fe970b6f870752b22ff6510d55e8cf19f0d365b04846b8db1deae79206",
+   "shim": "0ea2a34ec10f68bbe0d1573dc3ccdde66700f2b9604e25cee73603b841d1497c",
+   "matchesImplementer": true,
+   "incrementalDir": "absent"
+  },
+  "r3v-attr-noshim": {
+   "commit": "933d5d0",
+   "build": "CARGO_INCREMENTAL unset, build.sh --locked",
+   "jsc-link": "5d7ef8123479aee8... (= implementer/receipt)",
+   "dylib": "0ed34f6f67a3ef96 (path-embedded)",
+   "shim": "0ea2a34ec10f68bb (= base)"
+  },
+  "afterGates": "every recheck status row records 5d7ef812/295bf7fe/0ea2a34e (round3-opt) and 5d7ef812/0ed34f6f/0ea2a34e (r3v-attr-noshim); trees clean"
+ },
+ "diffReview": {
+  "0a65083..933d5d0": "runtime/shim.js (214 lines, restore), runtime/test/r3-fastpaths.test.mjs deleted, scripts/qualify-next-gen.mjs (SCRATCH_RECEIPT only from QUALIFY_SCRATCH_RECEIPT env; mkdir/write guarded; log line) \u2014 nothing else",
+  "44161c2..933d5d0 -- runtime/": "empty (0 bytes)",
+  "933d5d0..ba72c43": "only experiments/qualification/next-gen-qualify-receipt.json"
+ },
+ "environment": "CARGO_INCREMENTAL unset for every build and gate; SKIP_BUILD=1, RCGJS_WITNESS_CHECK=1. Control side = my earlier r3v-ctl/r3v-attr-base runs (same binaries, same environment), reused.",
+ "earlierEvidenceIntact": "round3-opt/build/r3v-gates/ (results.json, logs, status files) intact; recheck evidence in round3-opt/build/r3v-recheck/ and r3v-attr-noshim/build/r3v-recheck/",
+ "gates": [
+  {
+   "name": "cargo-test",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "node-test",
+   "mode": "unwind",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "test-jir-opt",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "test-jir-opt",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "test-default",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "test-default",
+   "mode": "abort",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "test-rb-inline-z",
+   "mode": "unwind",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "test-rb-inline-z",
+   "mode": "abort",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "cargo-test",
+   "mode": "abort",
+   "r933d5d0": "101",
+   "r895ed1c": "101",
+   "control": "101"
+  },
+  {
+   "name": "node-test",
+   "mode": "abort",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "chunk-jir-opt",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "chunk-jir-opt",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "chunk-default",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "chunk-default",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "check",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "check",
+   "mode": "abort",
+   "r933d5d0": "101",
+   "r895ed1c": "101",
+   "control": "101"
+  },
+  {
+   "name": "unwind-mode",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "unwind-mode",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "abi-flat-mut",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "N/A (no base suite)"
+  },
+  {
+   "name": "abi-flat-mut",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "N/A (no base suite)"
+  },
+  {
+   "name": "r3-loops-bounds",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "N/A (no base suite)"
+  },
+  {
+   "name": "r3-loops-bounds",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "N/A (no base suite)"
+  },
+  {
+   "name": "r3-inline-cells",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "N/A (no base suite)"
+  },
+  {
+   "name": "r3-inline-cells",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "N/A (no base suite)"
+  },
+  {
+   "name": "lane-shadow",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "lane-shadow",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "prune-invoke",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "prune-invoke",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "active-poll-cleanup",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "active-poll-cleanup",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "noop-landing-pads",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "noop-landing-pads",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "sroa",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "sroa",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "slice-iterator",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "slice-iterator",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "es2018",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "es2018",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "emit",
+   "mode": "unwind",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "emit",
+   "mode": "abort",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "dedup",
+   "mode": "unwind",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "dedup",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "native-int",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "native-int",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "native-f64",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "native-f64",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "native-i64-pair",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "native-i64-pair",
+   "mode": "abort",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "known-gaps",
+   "mode": "unwind",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "known-gaps",
+   "mode": "abort",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "round1-open",
+   "mode": "unwind",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "round1-open",
+   "mode": "abort",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "round2-open",
+   "mode": "unwind",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "round2-open",
+   "mode": "abort",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  },
+  {
+   "name": "test-rs-latest",
+   "mode": "unwind",
+   "r933d5d0": "0",
+   "r895ed1c": "0",
+   "control": "0"
+  },
+  {
+   "name": "test-rs-latest-inline-z",
+   "mode": "unwind",
+   "r933d5d0": "1",
+   "r895ed1c": "1",
+   "control": "1"
+  }
+ ],
+ "gateFindings": [
+  "Every gate has the same exit status on 933d5d0 as on 895ed1c and as on control for shared suites; every gate that passed on 895ed1c passes (incl. abi-flat-mut, r3-loops-bounds, r3-inline-cells, unwind-mode, lane-shadow 168/168, native i64-pair 18068 cases, chunk 17/17, check.sh unwind exit 0).",
+  "Qualification gate jir+opt: 174/174, 0 skipped, both modes (control 170/170). Rows identical to 895ed1c; size changes vs 895ed1c: unwind 6 by size (94_repr_box_nested -304, 101_btree_map_nodes -2, 72_repr_format_min +27, 274_bigint_static_cycle +90, 29_rc +122, 21_vec +226), abort 1 (274 +90).",
+  "Default lane: 76/76+98 skipped unwind, 172/174 abort (same pre-existing 102_str_lines/26_async budget rows), 0 size changes vs 895ed1c.",
+  "rb + MIR inline + Oz: same rows as 895ed1c (unwind 163/172 +2 skipped incl. pre-existing 332 location bug; abort 171/174); sizes moved: unwind 5 fixtures (-101..+666, largest core/117_overflow_arith +666), abort 7 (largest 101_btree_map_nodes +340, 30_hashmap +292, 213 +267, 274 +83).",
+  "Extra package settings: release-size+latest 174/174 (9 size changes, max 72_repr_format_min +267); release-size+latest+inline+Oz same rows as 895ed1c (13 size changes, max 19_float_fmt -1164).",
+  "node --test: 96 tests, 89 pass, same 7 keyed-* jsdom failures as base (895ed1c had 102/95 because of the deleted r3-fastpaths test). cargo test --workspace 1203 passed 0 failed unset-mode; abort-env cargo test and check.sh abort fail the same non-hermetic mires-build test as on base.",
+  "emit: same failing goldens as base, and every emitted filtered JS byte-identical to base. dedup, known-gaps, round1-open, round2-open: rows identical to base in both modes (inventories not worse)."
+ ],
+ "flips": {
+  "method": "ran test.sh jir+opt in both modes in r3v-attr-cand (895ed1c) and r3v-attr-noshim (933d5d0) and copied build/core + build/*.js; sha256 per emitted program",
+  "unwind": "162 identical, 7 differ: core/101_btree_map_nodes, 21_vec, 274_bigint_static_cycle, 29_rc, 300_native_float_format_cleanup (same size, different text), 72_repr_format_min, 94_repr_box_nested -- exactly the implementer's list",
+  "abort": "168 identical, 1 differs: core/274_bigint_static_cycle -- matches the implementer",
+  "causes": "lane.json: physical (flat-ABI) selections flip: 274 drops walk; 21_vec drops slice sort drift logical_merge; 29_rc drops slice iter fold; 300 adds FloatExt::integer_decode; 72 adds a clone impl; 94 representation 0->4 applied; 101 unchanged decision counts (2-byte change). All flipped programs pass in both modes (two independent test.sh runs, 174/174). Note 274 is now 4205 B vs base 4147 (+58) in jir+opt, where 895ed1c was below base.",
+  "otherSettings": "Programs also move under rb+inline+Oz and release-size+latest (lists above); all those runs have the same pass/fail rows as 895ed1c. Correctness of flipped programs beyond the suite is V1's scope."
+ },
+ "sizes": {
+  "table": [
+   {
+    "artifact": "compact/release-balanced",
+    "base": {
+     "min": 158035,
+     "gzip9": 48172,
+     "brotli11": 36969
+    },
+    "r895ed1c": {
+     "min": 157065,
+     "gzip9": 48221,
+     "brotli11": 37055
+    },
+    "r933d5d0": {
+     "min": 155681,
+     "gzip9": 47856,
+     "brotli11": 36762
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "compact/release-size",
+    "base": {
+     "min": 158035,
+     "gzip9": 48172,
+     "brotli11": 36969
+    },
+    "r895ed1c": {
+     "min": 157234,
+     "gzip9": 48209,
+     "brotli11": 37100
+    },
+    "r933d5d0": {
+     "min": 155681,
+     "gzip9": 47856,
+     "brotli11": 36762
+    },
+    "programRawSameAs895": false,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "idiomatic/release-balanced-default",
+    "base": {
+     "min": 271278,
+     "gzip9": 79341,
+     "brotli11": 63672
+    },
+    "r895ed1c": {
+     "min": 268482,
+     "gzip9": 78892,
+     "brotli11": 63330
+    },
+    "r933d5d0": {
+     "min": 267044,
+     "gzip9": 78583,
+     "brotli11": 63111
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "idiomatic/release-balanced-oz",
+    "base": {
+     "min": 271187,
+     "gzip9": 79935,
+     "brotli11": 64072
+    },
+    "r895ed1c": {
+     "min": 268935,
+     "gzip9": 79447,
+     "brotli11": 63785
+    },
+    "r933d5d0": {
+     "min": 267497,
+     "gzip9": 79136,
+     "brotli11": 63586
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "marked",
+    "base": {
+     "min": 27264,
+     "gzip9": 9993,
+     "brotli11": 8777
+    },
+    "r895ed1c": {
+     "min": 27348,
+     "gzip9": 10194,
+     "brotli11": 8976
+    },
+    "r933d5d0": {
+     "min": 25970,
+     "gzip9": 9825,
+     "brotli11": 8653
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "minisearch",
+    "base": {
+     "min": 48154,
+     "gzip9": 14602,
+     "brotli11": 12968
+    },
+    "r895ed1c": {
+     "min": 48144,
+     "gzip9": 14655,
+     "brotli11": 13008
+    },
+    "r933d5d0": {
+     "min": 46760,
+     "gzip9": 14314,
+     "brotli11": 12698
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "fflate",
+    "base": {
+     "min": 14373,
+     "gzip9": 5608,
+     "brotli11": 5052
+    },
+    "r895ed1c": {
+     "min": 12537,
+     "gzip9": 5124,
+     "brotli11": 4670
+    },
+    "r933d5d0": {
+     "min": 12049,
+     "gzip9": 4977,
+     "brotli11": 4539
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "uplot",
+    "base": {
+     "min": 1935,
+     "gzip9": 1069,
+     "brotli11": 976
+    },
+    "r895ed1c": {
+     "min": 1877,
+     "gzip9": 1057,
+     "brotli11": 947
+    },
+    "r933d5d0": {
+     "min": 1877,
+     "gzip9": 1057,
+     "brotli11": 947
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "idb",
+    "base": {
+     "min": 27669,
+     "gzip9": 9771,
+     "brotli11": 8661
+    },
+    "r895ed1c": {
+     "min": 24164,
+     "gzip9": 8842,
+     "brotli11": 7875
+    },
+    "r933d5d0": {
+     "min": 23618,
+     "gzip9": 8692,
+     "brotli11": 7764
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "idb_lines",
+    "base": {
+     "min": 30066,
+     "gzip9": 10541,
+     "brotli11": 9361
+    },
+    "r895ed1c": {
+     "min": 26491,
+     "gzip9": 9671,
+     "brotli11": 8568
+    },
+    "r933d5d0": {
+     "min": 25947,
+     "gzip9": 9518,
+     "brotli11": 8422
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "ky",
+    "base": {
+     "min": 26669,
+     "gzip9": 9542,
+     "brotli11": 8484
+    },
+    "r895ed1c": {
+     "min": 27624,
+     "gzip9": 9861,
+     "brotli11": 8787
+    },
+    "r933d5d0": {
+     "min": 26715,
+     "gzip9": 9600,
+     "brotli11": 8546
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "explorer",
+    "base": {
+     "min": 82463,
+     "gzip9": 25730,
+     "brotli11": 22322
+    },
+    "r895ed1c": {
+     "min": 82072,
+     "gzip9": 25664,
+     "brotli11": 22217
+    },
+    "r933d5d0": {
+     "min": 80626,
+     "gzip9": 25339,
+     "brotli11": 21908
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "workbox",
+    "base": {
+     "min": 25484,
+     "gzip9": 8663,
+     "brotli11": 7617
+    },
+    "r895ed1c": {
+     "min": 25958,
+     "gzip9": 8804,
+     "brotli11": 7735
+    },
+    "r933d5d0": {
+     "min": 25510,
+     "gzip9": 8656,
+     "brotli11": 7607
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   },
+   {
+    "artifact": "workbox_direct",
+    "base": {
+     "min": 5125,
+     "gzip9": 2108,
+     "brotli11": 1892
+    },
+    "r895ed1c": {
+     "min": 5548,
+     "gzip9": 2258,
+     "brotli11": 2023
+    },
+    "r933d5d0": {
+     "min": 5104,
+     "gzip9": 2097,
+     "brotli11": 1864
+    },
+    "programRawSameAs895": true,
+    "programRawSameAsBase": false,
+    "reproducesReceipt": true
+   }
+  ],
+  "reproduction": "sizes-only rebuild (qualify steps 1,2,3a) in r3v-attr-noshim: all 14 artifacts (min and raw program.js sha256, gz9) byte-identical to the ba72c43 receipt",
+  "findings": [
+   "Program (raw/program.js) is byte-identical to 895ed1c for 13 of 14 artifacts; their change vs 895ed1c is exactly the minimal shim change (-147..-369 gz).",
+   "compact/release-size program changed: on 895ed1c 4 physical candidates (handle_alloc_error, alloc_impl_runtime, box_new_uninit, sources_async start_rendering closure; product(2)/product-result(2)) were rejected \"cost.compressed-no-improvement\" (bundle gzip 56062->56074); on 933d5d0 they are selected (55459->55468) -- the physical cost is scored on the bundle including the shim. Its program is now byte-identical to compact/release-balanced (sha f46fa38c), as on base where rs == rb.",
+   "vs base: every artifact is now at or below base except ky +58 gz (9542 -> 9600). ky program is unchanged from 895ed1c, so this is the R3-C over-inlining of <Result as Try>::branch found in my first report (R3-C alone +77). workbox -7, workbox_direct -11, uplot -12, marked -168, minisearch -288, compact -316, idiomatic -758/-799, fflate -631, idb -1079, idb_lines -1023, explorer -391."
+  ]
+ },
+ "receipt": {
+  "provenance": "compilerCommit 933d5d0, gitStatusClean true, porcelain empty; dylib 295bf7fe / jsc-link 5d7ef812 / shim 0ea2a34e = round3-opt binaries; generatedAt 2026-11-17T11:59:23Z; sysroot field again only the default sysroot 04e9a8f7",
+  "scratchCopy": "~/.gemini/antigravity/brain/5d6afc81-.../scratch/next-gen-qualify-receipt.json mtime Nov 16 11:29:20 2026: not rewritten; the script now writes it only when QUALIFY_SCRATCH_RECEIPT is set (diff reviewed)",
+  "AA": "minisearch aaWithinGate false again while corpus.status.timingPassed/passed true: the A/A band is still not enforced (unchanged code, same on base). No timing claims.",
+  "packageChecks": "on the rebuilt 933d5d0 artifacts (r3v-attr-noshim): check-oss-kernels 58/58 on compact x2 and idiomatic x2; browser-workloads run.mjs --pure (samples 1, timing ignored) status.passed true, pure fflate/marked/minisearch/uplot passed"
+ },
+ "failReasons": [],
+ "verdict": "PASS",
+ "verdictReasons": [
+  "933d5d0 passes every gate 895ed1c passed, in both modes, with identical row-level pass/fail; nothing newly skipped.",
+  "Receipt binds 933d5d0, clean tree, reproduced artifacts 14/14, scratch copy untouched.",
+  "Shim restore flips 7 programs (unwind) / 1 (abort) in jir+opt plus some under other settings; all pass the suites. Remaining above-base size: ky +58 gz (R3-C over-inlining, unchanged) and fixture 274 +58 B."
+ ],
+ "unfinished": [
+  "Control side reused from my first verification (r3v-ctl / r3v-attr-base, same binaries and same CARGO_INCREMENTAL-unset environment), not rerun.",
+  "No timing claims.",
+  "Correctness of flipped programs beyond the suite expectations is not probed by me (V1).",
+  "qualify-next-gen.mjs not rerun end-to-end (timing sections, step 5 matrix); its size artifacts reproduced and package checks rerun."
+ ]
+}
