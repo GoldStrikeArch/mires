@@ -178,7 +178,8 @@ for setting in defaults inline-z; do
 		unset JSC_RUST_MIR_INLINE JSC_RUST_OPT_LEVEL
 	fi
 	for mode in off on; do
-		export JS_EXTRA_ARGS="js-profile=release-balanced js-opt=$mode"
+		# `UNWIND_MODE_LINK_ARGS` adds link-only options (`js-str=bytes`) to every build.
+		export JS_EXTRA_ARGS="js-profile=release-balanced js-opt=$mode${UNWIND_MODE_LINK_ARGS:+ $UNWIND_MODE_LINK_ARGS}"
 		SKIP_BUILD=1 "$script_dir/build_sysroot.sh" >"$work/sysroot-$setting-$mode.log" 2>&1
 		for source in "$root"/examples/unwind-tests/*.rs; do
 			name=$(basename -- "$source" .rs)

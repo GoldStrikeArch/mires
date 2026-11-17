@@ -224,6 +224,18 @@ impl JsCx<'_> {
             }
         }
 
+        // `js-str=bytes`: a `str` method with a producer-tagged identity is the JavaScript string
+        // operation it is on a byte string (`lower/bstr.rs`).
+        if let CallSemantic::Standard(operation) = semantic {
+            if operation.is_str() && crate::lower::bstr::enabled() {
+                if let Some(lowered) =
+                    self.lower_str_call(op, *operation, callee, args, *track_caller)?
+                {
+                    return Ok(lowered);
+                }
+            }
+        }
+
         // A format call the representation plan committed (Phase 4, W4g): the constructor's text
         // or the consumer's concatenation, inlined at the site. Inert unless the plan marked the
         // site's carriers, so `off`/`report` and every uncommitted call stay plain calls.
@@ -596,6 +608,309 @@ impl JsCx<'_> {
             ));
         }
         Ok(entry.caller_location)
+    }
+
+    /// A call to one of the producer-tagged `str` identities under `js-str=bytes`, spelled as the
+    /// JavaScript string operation it is on byte strings: a length is `length`, a `&str` or `char`
+    /// pattern is a substring search (UTF-8 is self-synchronizing, so a byte-string match of
+    /// well-formed text is a match at a char boundary, which is what Rust's searcher reports),
+    /// equality is `===` and order is `<` (code-unit order of byte strings is UTF-8 byte order,
+    /// which is Rust's). A slice is `substring` behind the char-boundary checks; when they fail
+    /// the original call runs instead, so the panic, its message and its location are Rust's own.
+    ///
+    /// `None` (an ordinary call) for anything the lowering does not see exactly: a callee the
+    /// flat ABI reshaped, an unused result, or argument types other than the producer's.
+    fn lower_str_call(
+        &self,
+        op: &Op,
+        operation: StandardOperation,
+        callee: &Callee,
+        args: &[ValueId],
+        track_caller: Option<SourceFactId>,
+    ) -> Res<Option<Lowered>> {
+        let Callee::Direct { item, link_name } = callee else {
+            return Ok(None);
+        };
+        if self
+            .abi
+            .is_some_and(|abi| abi.call_signature(*item).is_some())
+        {
+            return Ok(None);
+        }
+        let Some(result) = op.result else {
+            return Ok(None);
+        };
+        let table = self.table;
+        let is_str = |value: ValueId| -> Res<bool> {
+            Ok(crate::lower::bstr::is_str_pointer(
+                table,
+                self.ty_of(value)?,
+            ))
+        };
+        let is_char = |value: ValueId| -> Res<bool> {
+            Ok(matches!(
+                value::kind(table, self.ty_of(value)?),
+                Some(rcgjs_object::jir::types::TypeKind::Char)
+            ))
+        };
+        let mut prelude = Vec::new();
+        // Each argument is evaluated once, in order; one read more than once is held.
+        let mut hold = |expr: Expr, prelude: &mut Vec<Stmt>| -> Expr {
+            if matches!(expr, Expr::Ident(_) | Expr::Str(_) | Expr::Num(_)) {
+                expr
+            } else {
+                let (bind, held) = self.temp(expr);
+                prelude.push(bind);
+                held
+            }
+        };
+        let string = |value: ValueId,
+                      prelude: &mut Vec<Stmt>,
+                      hold: &mut dyn FnMut(Expr, &mut Vec<Stmt>) -> Expr|
+         -> Res<Expr> { Ok(hold(self.expr_of(value)?, prelude)) };
+        let needle = |value: ValueId,
+                      prelude: &mut Vec<Stmt>,
+                      hold: &mut dyn FnMut(Expr, &mut Vec<Stmt>) -> Expr|
+         -> Res<Option<Expr>> {
+            if is_str(value)? {
+                return Ok(Some(hold(self.expr_of(value)?, prelude)));
+            }
+            if is_char(value)? {
+                return Ok(Some(match self.expr_of(value)? {
+                    Expr::Num(point) if (0.0..128.0).contains(&point) => {
+                        jsast::string(char::from(point as u8).to_string())
+                    }
+                    point => hold(crate::lower::bstr::char_text(point), prelude),
+                }));
+            }
+            Ok(None)
+        };
+        let value = match (operation, args) {
+            (StandardOperation::StrLen, [s]) if is_str(*s)? => {
+                jsast::member(string(*s, &mut prelude, &mut hold)?, "length")
+            }
+            (StandardOperation::StrIsCharBoundary, [s, index]) if is_str(*s)? => {
+                let s = string(*s, &mut prelude, &mut hold)?;
+                let index = hold(self.expr_of(*index)?, &mut prelude);
+                jsast::rt_call("bstr_boundary", vec![s, index])
+            }
+            (
+                StandardOperation::StrStartsWith
+                | StandardOperation::StrEndsWith
+                | StandardOperation::StrContains
+                | StandardOperation::StrFind
+                | StandardOperation::StrRFind,
+                [s, pattern],
+            ) if is_str(*s)? && (is_str(*pattern)? || is_char(*pattern)?) => {
+                let find = matches!(
+                    operation,
+                    StandardOperation::StrFind | StandardOperation::StrRFind
+                );
+                let variants = match find {
+                    true => match self.option_variants(result)? {
+                        Some(variants) => Some(variants),
+                        None => return Ok(None),
+                    },
+                    false => None,
+                };
+                let s = string(*s, &mut prelude, &mut hold)?;
+                let Some(pattern) = needle(*pattern, &mut prelude, &mut hold)? else {
+                    return Ok(None);
+                };
+                let method = match operation {
+                    StandardOperation::StrStartsWith => "startsWith",
+                    StandardOperation::StrEndsWith => "endsWith",
+                    StandardOperation::StrContains => "includes",
+                    StandardOperation::StrFind => "indexOf",
+                    _ => "lastIndexOf",
+                };
+                let found = jsast::method_call(s, method, vec![pattern]);
+                match variants {
+                    Some((none, some)) => {
+                        let (bind, at) = self.temp(found);
+                        prelude.push(bind);
+                        let ty = self.ty_of(result)?;
+                        let (Some(none), Some(some)) = (
+                            value::enum_value(table, self.interns, ty, none, Vec::new()),
+                            value::enum_value(
+                                table,
+                                self.interns,
+                                ty,
+                                some.0,
+                                vec![(some.1, at.clone())],
+                            ),
+                        ) else {
+                            return Ok(None);
+                        };
+                        jsast::cond(
+                            jsast::binary(jsast::BinOp::Lt, at, jsast::num(0)),
+                            none,
+                            some,
+                        )
+                    }
+                    _ => found,
+                }
+            }
+            (StandardOperation::StrEq, [a, b]) if is_str(*a)? && is_str(*b)? => {
+                let a = string(*a, &mut prelude, &mut hold)?;
+                let b = string(*b, &mut prelude, &mut hold)?;
+                jsast::binary(jsast::BinOp::StrictEq, a, b)
+            }
+            (StandardOperation::StrCmp, [a, b]) if is_str(*a)? && is_str(*b)? => {
+                let ty = self.ty_of(result)?;
+                let variant = |name: &str| -> Option<Expr> {
+                    let index = table
+                        .variants(table.peeled(ty))
+                        .iter()
+                        .position(|v| value::variant_name(self.interns, v) == name)?;
+                    value::enum_value(table, self.interns, ty, index as u32, Vec::new())
+                };
+                let (Some(less), Some(equal), Some(greater)) =
+                    (variant("Less"), variant("Equal"), variant("Greater"))
+                else {
+                    return Ok(None);
+                };
+                let a = string(*a, &mut prelude, &mut hold)?;
+                let b = string(*b, &mut prelude, &mut hold)?;
+                jsast::cond(
+                    jsast::binary(jsast::BinOp::Lt, a.clone(), b.clone()),
+                    less,
+                    jsast::cond(jsast::binary(jsast::BinOp::StrictEq, a, b), equal, greater),
+                )
+            }
+            (StandardOperation::StrIndex, [s, range]) if is_str(*s)? => {
+                let range_ty = table.peeled(self.ty_of(*range)?);
+                let variants = table.variants(range_ty);
+                let [variant] = variants else {
+                    return Ok(None);
+                };
+                let mut keys = Vec::new();
+                for field in &variant.fields {
+                    match value::key_name(self.interns, field.key) {
+                        Some(key) => keys.push(key),
+                        None => return Ok(None),
+                    }
+                }
+                let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+                let s = string(*s, &mut prelude, &mut hold)?;
+                // A range spelled as an object literal is read field by field and rebuilt only on
+                // the failing path, so the fast path allocates nothing.
+                let (fields, range) = match self.expr_of(*range)? {
+                    Expr::Object(entries)
+                        if entries
+                            .iter()
+                            .map(|(k, _)| k.as_str())
+                            .eq(keys.iter().copied()) =>
+                    {
+                        let held: Vec<(String, Expr)> = entries
+                            .into_iter()
+                            .map(|(key, value)| (key, hold(value, &mut prelude)))
+                            .collect();
+                        (held.clone(), Expr::Object(held))
+                    }
+                    other => {
+                        let held = hold(other, &mut prelude);
+                        let fields = keys
+                            .iter()
+                            .map(|key| ((*key).to_owned(), jsast::member(held.clone(), *key)))
+                            .collect();
+                        (fields, held)
+                    }
+                };
+                if keys.is_empty() {
+                    s
+                } else {
+                    let length = jsast::member(s.clone(), "length");
+                    let boundary = |at: Expr| {
+                        jsast::binary(
+                            jsast::BinOp::StrictNe,
+                            jsast::binary(
+                                jsast::BinOp::BitAnd,
+                                jsast::method_call(s.clone(), "charCodeAt", vec![at]),
+                                jsast::num(0xc0),
+                            ),
+                            jsast::num(0x80),
+                        )
+                    };
+                    let and = |l, r| jsast::binary(jsast::BinOp::And, l, r);
+                    let le = |l, r| jsast::binary(jsast::BinOp::Le, l, r);
+                    let field = |key: &str| {
+                        fields
+                            .iter()
+                            .find(|(k, _)| k == key)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_else(jsast::undefined)
+                    };
+                    let (test, slice) = match keys.as_slice() {
+                        ["start", "end"] => {
+                            let (start, end) = (field("start"), field("end"));
+                            (
+                                and(
+                                    and(le(start.clone(), end.clone()), le(end.clone(), length)),
+                                    and(boundary(start.clone()), boundary(end.clone())),
+                                ),
+                                jsast::method_call(s.clone(), "substring", vec![start, end]),
+                            )
+                        }
+                        ["start"] => {
+                            let start = field("start");
+                            (
+                                and(le(start.clone(), length), boundary(start.clone())),
+                                jsast::method_call(s.clone(), "substring", vec![start]),
+                            )
+                        }
+                        ["end"] => {
+                            let end = field("end");
+                            (
+                                and(le(end.clone(), length), boundary(end.clone())),
+                                jsast::method_call(
+                                    s.clone(),
+                                    "substring",
+                                    vec![jsast::num(0), end],
+                                ),
+                            )
+                        }
+                        _ => return Ok(None),
+                    };
+                    let name = match self.call_retargets.get(item) {
+                        Some(name) => name.as_str().to_owned(),
+                        None => self.link_name(*link_name)?,
+                    };
+                    let mut arguments = vec![s, range];
+                    if let Some(location) =
+                        self.caller_location_argument(callee, args.len(), track_caller)?
+                    {
+                        arguments.push(location);
+                    }
+                    jsast::cond(test, slice, jsast::call(jsast::id(name), arguments))
+                }
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Lowered::Value(prelude, value)))
+    }
+
+    /// The `(None, (Some, field key))` variant indices of an `Option` result.
+    fn option_variants(&self, result: ValueId) -> Res<Option<(u32, (u32, String))>> {
+        let table = self.table;
+        let peeled = table.peeled(self.ty_of(result)?);
+        let variants = table.variants(peeled);
+        let index = |name: &str| {
+            variants
+                .iter()
+                .position(|variant| value::variant_name(self.interns, variant) == name)
+        };
+        let (Some(none), Some(some)) = (index("None"), index("Some")) else {
+            return Ok(None);
+        };
+        let Some(key) = variants[some]
+            .fields
+            .first()
+            .and_then(|field| value::key_name(self.interns, field.key))
+        else {
+            return Ok(None);
+        };
+        Ok(Some((none as u32, (some as u32, key))))
     }
 
     /// An interned link name, as a `String`.

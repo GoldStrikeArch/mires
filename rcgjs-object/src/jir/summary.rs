@@ -1463,7 +1463,13 @@ impl<'a> Normalizer<'a> {
         Call {
             function: self.operand(&call.function),
             callee: self.callee(&call.callee),
-            semantic: call.semantic,
+            // A `str` call-site identity (`StandardOperation::is_str`) is only a lowering hint
+            // for `js-str=bytes`; the link step forgets it in every other mode, so it is no part
+            // of what the body means and the hash is the same with or without it.
+            semantic: match call.semantic {
+                CallSemantic::Standard(operation) if operation.is_str() => CallSemantic::Ordinary,
+                semantic => semantic,
+            },
             arguments: call
                 .arguments
                 .iter()
