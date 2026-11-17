@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "generatedAt": "2026-11-16T10:26:07.540Z",
+  "generatedAt": "2026-11-17T11:59:23.051Z",
   "provenance": {
-    "compilerCommit": "895ed1cb9aa5f9f84a27941f1ab2d3c327e5a504",
+    "compilerCommit": "933d5d0ad82010879c96c29d2cd56e8bba9fd6c5",
     "gitStatusClean": true,
     "gitStatusPorcelain": "",
     "dylib": {
@@ -12,13 +12,13 @@
     },
     "jscLink": {
       "path": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/target/release/jsc-link",
-      "bytes": 10845520,
-      "sha256": "290a15298f8c4e08e9f77528ea07db8ec06107ffaa61199438b53f2906e83cfc"
+      "bytes": 10829008,
+      "sha256": "5d7ef8123479aee8d7066f821966b7ab6760ec42d981af2054c18cca47217189"
     },
     "runtimeShim": {
       "path": "/Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/runtime/shim.js",
-      "bytes": 165209,
-      "sha256": "34d2660fc5564ca09d9ebd870e95047b59d1099e93a8fdccb012903559bce149"
+      "bytes": 160776,
+      "sha256": "0ea2a34ec10f68bbe0d1573dc3ccdde66700f2b9604e25cee73603b841d1497c"
     },
     "sysroot": {
       "linkTarget": "sysroots/04e9a8f714c27f8499f2337591752b812ac360305a0bd6b433928e5ee32bb519",
@@ -30,20 +30,20 @@
   },
   "compact": {
     "release-balanced": {
-      "elapsedSec": 17.43,
+      "elapsedSec": 16.29,
       "kernelsExit": 0,
       "kernels": {
         "passed": 58,
         "total": 58
       },
       "min": {
-        "bytes": 157065,
-        "gzip9": 48221,
-        "brotli11": 37055,
+        "bytes": 155681,
+        "gzip9": 47856,
+        "brotli11": 36762,
         "tryCount": 187,
         "topLevelFns": 0,
         "bigintMentions": 0,
-        "sha256": "d6615f435fa2c94c720501b279d6fddb62a27ab611f4512b762ccc891e9780bc"
+        "sha256": "64df2a453d780462f27c30dae7adce8a80ea3f92c1bbb086c188fa059a617b20"
       },
       "raw": {
         "bytes": 163242,
@@ -70,62 +70,62 @@
       }
     },
     "release-size": {
-      "elapsedSec": 17.58,
+      "elapsedSec": 14.94,
       "kernelsExit": 0,
       "kernels": {
         "passed": 58,
         "total": 58
       },
       "min": {
-        "bytes": 157234,
-        "gzip9": 48209,
-        "brotli11": 37100,
+        "bytes": 155681,
+        "gzip9": 47856,
+        "brotli11": 36762,
         "tryCount": 187,
         "topLevelFns": 0,
         "bigintMentions": 0,
-        "sha256": "871eda4d319873f27076eb0f2cdde0d56671205187a4dab62e59692ea7f6d6b9"
+        "sha256": "64df2a453d780462f27c30dae7adce8a80ea3f92c1bbb086c188fa059a617b20"
       },
       "raw": {
-        "bytes": 163400,
-        "gzip9": 47747,
-        "brotli11": 35994,
+        "bytes": 163242,
+        "gzip9": 47741,
+        "brotli11": 36023,
         "tryCount": 186,
         "topLevelFns": 503,
         "bigintMentions": 0,
-        "sha256": "ad0a5212ea05129a903e5b9df08057f8b1ef0d0d86670bc5bc6e30c41dc6adad"
+        "sha256": "f46fa38cd50f2c463971395fb155af40a2544c4b2a913f77d0b49ec38f71a574"
       },
       "lane": {
         "items": 494,
         "fallbackCount": 0,
         "inlineApplied": 811,
         "crossObjectInline": 113,
-        "sroaApplied": 364,
+        "sroaApplied": 386,
         "reprApplied": 0,
         "sliceIterWouldLower": 3,
         "sliceIterEmitted": 3,
         "rangeAssertsRemoved": 48,
         "rangeComparisonsFolded": 2,
-        "witnessesRecorded": 1344,
+        "witnessesRecorded": 1368,
         "witnessesFailed": 0
       }
     }
   },
   "idiomatic": {
     "release-balanced-default": {
-      "elapsedSec": 48.41,
+      "elapsedSec": 37.47,
       "kernelsExit": 0,
       "kernels": {
         "passed": 58,
         "total": 58
       },
       "min": {
-        "bytes": 268482,
-        "gzip9": 78892,
-        "brotli11": 63330,
+        "bytes": 267044,
+        "gzip9": 78583,
+        "brotli11": 63111,
         "tryCount": 358,
         "topLevelFns": 0,
         "bigintMentions": 228,
-        "sha256": "c1ead6a1333baf4ab0524a3720ba629a7fc043892711e4d61c0cdd07056067bd"
+        "sha256": "b70037ef70187837be87361e09c998f767386ca12123431ebadce541d16eeb6b"
       },
       "raw": {
         "bytes": 285774,
@@ -152,20 +152,20 @@
       }
     },
     "release-balanced-oz": {
-      "elapsedSec": 43.11,
+      "elapsedSec": 37.33,
       "kernelsExit": 0,
       "kernels": {
         "passed": 58,
         "total": 58
       },
       "min": {
-        "bytes": 268935,
-        "gzip9": 79447,
-        "brotli11": 63785,
+        "bytes": 267497,
+        "gzip9": 79136,
+        "brotli11": 63586,
         "tryCount": 358,
         "topLevelFns": 0,
         "bigintMentions": 228,
-        "sha256": "cc8d16feaef593a7d21b8eb400502407d468cc78f9683a7108170c1c20d5c0a2"
+        "sha256": "f138cbebdb6fa6fe6b9b911d532e2ffb423084ee59d290bbd4ef65c0e522ffb0"
       },
       "raw": {
         "bytes": 286567,
@@ -193,8 +193,8 @@
     }
   },
   "corpus": {
-    "buildElapsedSec": 37.42,
-    "runElapsedSec": 3.38,
+    "buildElapsedSec": 36.09,
+    "runElapsedSec": 3.37,
     "status": {
       "browserPassed": true,
       "buildReceiptMatched": true,
@@ -207,13 +207,13 @@
     "workloads": {
       "marked": {
         "min": {
-          "bytes": 27348,
-          "gzip9": 10194,
-          "brotli11": 8976,
+          "bytes": 25970,
+          "gzip9": 9825,
+          "brotli11": 8653,
           "tryCount": 0,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "e663cb20e5e548b17a0264c3999bf8b89e3c399fb7bb7b1428c56ccc85783484"
+          "sha256": "cac7438ef53bac1af790cdfeddbcd507ebf24e80a71496cdf92069c3ab491a74"
         },
         "raw": {
           "bytes": 21003,
@@ -241,13 +241,13 @@
       },
       "minisearch": {
         "min": {
-          "bytes": 48144,
-          "gzip9": 14655,
-          "brotli11": 13008,
+          "bytes": 46760,
+          "gzip9": 14314,
+          "brotli11": 12698,
           "tryCount": 0,
           "topLevelFns": 0,
           "bigintMentions": 8,
-          "sha256": "bb1dc549c15c9d186b4750250bb21e2a2d114c45ea74613773599c92038e3a52"
+          "sha256": "84ce3640f96c53996883727dad1ff9adf35d3d5fd60873ff4145ef16524429e1"
         },
         "raw": {
           "bytes": 39496,
@@ -275,13 +275,13 @@
       },
       "fflate": {
         "min": {
-          "bytes": 12537,
-          "gzip9": 5124,
-          "brotli11": 4670,
+          "bytes": 12049,
+          "gzip9": 4977,
+          "brotli11": 4539,
           "tryCount": 1,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "632253265e38293c7636b57079916f08e41db650d9fc08b078e2918e672c868e"
+          "sha256": "c068b03a981e83b8d4888694f98c11cbfeec905da73fc4f07099077fb72acfaf"
         },
         "raw": {
           "bytes": 6447,
@@ -343,13 +343,13 @@
       },
       "idb": {
         "min": {
-          "bytes": 24164,
-          "gzip9": 8842,
-          "brotli11": 7875,
+          "bytes": 23618,
+          "gzip9": 8692,
+          "brotli11": 7764,
           "tryCount": 36,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "ea09d15655369fe83208c3f3d271f8059ec791632ea02e8fdd46ac01b1dcabf3"
+          "sha256": "58a7fb8dfc8c7c8d3fe5d7bc23ab8d64cd9bbc3b0a04b7b1372e1ad0982e7d5d"
         },
         "raw": {
           "bytes": 16269,
@@ -377,13 +377,13 @@
       },
       "idb_lines": {
         "min": {
-          "bytes": 26491,
-          "gzip9": 9671,
-          "brotli11": 8568,
+          "bytes": 25947,
+          "gzip9": 9518,
+          "brotli11": 8422,
           "tryCount": 36,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "eb497c635a58f1b74552a4d98979485abe524a86f574d908e5e4f236780c28b2"
+          "sha256": "bd4e78ae1f625480dabd69c75cc176d082c4dc85274ece06adc7e0d189bbf938"
         },
         "raw": {
           "bytes": 19109,
@@ -411,13 +411,13 @@
       },
       "ky": {
         "min": {
-          "bytes": 27624,
-          "gzip9": 9861,
-          "brotli11": 8787,
+          "bytes": 26715,
+          "gzip9": 9600,
+          "brotli11": 8546,
           "tryCount": 43,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "ab3fb823930fd587af4185ba7dae3e1b5600c9e12a53d6c7b18c64720714eb9e"
+          "sha256": "979c407968d9235f4132721781ab304881bc55f27140bec1cf719c605e9cda5b"
         },
         "raw": {
           "bytes": 18193,
@@ -445,13 +445,13 @@
       },
       "explorer": {
         "min": {
-          "bytes": 82072,
-          "gzip9": 25664,
-          "brotli11": 22217,
+          "bytes": 80626,
+          "gzip9": 25339,
+          "brotli11": 21908,
           "tryCount": 48,
           "topLevelFns": 0,
           "bigintMentions": 8,
-          "sha256": "629864a52b2e274758d6621d9d17a3c85abffdbde12754b989436bbc6c12c28d"
+          "sha256": "fa4651bd47d9cee20338a1d355cec6dc8c70bda36e58ac082808fb0ae1b06cd2"
         },
         "raw": {
           "bytes": 77817,
@@ -479,13 +479,13 @@
       },
       "workbox": {
         "min": {
-          "bytes": 25958,
-          "gzip9": 8804,
-          "brotli11": 7735,
+          "bytes": 25510,
+          "gzip9": 8656,
+          "brotli11": 7607,
           "tryCount": 51,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "324366697c649129a2244e532fd3782fd51948cca6777e5a5aa3b5758a63eefe"
+          "sha256": "01f9d9bc8d3c6c4fd4e7ef57d05ab750764970cfe5ffcb41d62b4fb671b43dd6"
         },
         "raw": {
           "bytes": 19398,
@@ -513,13 +513,13 @@
       },
       "workbox_direct": {
         "min": {
-          "bytes": 5548,
-          "gzip9": 2258,
-          "brotli11": 2023,
+          "bytes": 5104,
+          "gzip9": 2097,
+          "brotli11": 1864,
           "tryCount": 0,
           "topLevelFns": 0,
           "bigintMentions": 0,
-          "sha256": "e10088e3f052e1e4d410545ab1700f8ce4beb301e78b2fb21549a93c3c96fbb0"
+          "sha256": "1c85fe587bcffe3307b15cfee7009e57d6d5f9fdf9772a13cd30442903219b2d"
         },
         "raw": {
           "bytes": 2525,
@@ -552,89 +552,89 @@
           "arms": [
             {
               "calibration": {
-                "calls": 16,
-                "milliseconds": 20.13820799999999
+                "calls": 18,
+                "milliseconds": 20.887749999999997
               },
               "checksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "coldImportMs": 0.8121249999999982,
+              "coldImportMs": 0.7432499999999997,
               "finalChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "firstCallMs": 5.111999999999998,
+              "firstCallMs": 4.890375000000002,
               "implementation": "rust",
-              "iterationsPerSample": 16,
+              "iterationsPerSample": 18,
               "key": "rust",
               "label": "R",
               "perCallMs": {
                 "count": 9,
-                "max": 1.509703124999998,
-                "mean": 1.0430430972222213,
-                "min": 0.948703124999998,
-                "p50": 0.9708515624999983,
-                "p95": 1.509703124999998
+                "max": 1.325923611111111,
+                "mean": 1.015797574074074,
+                "min": 0.9229328333333342,
+                "p50": 0.985814833333333,
+                "p95": 1.325923611111111
               },
               "rawBytes": 12860,
               "rawChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
               "sampleMs": [
-                16.201707999999996,
-                15.380666999999988,
-                15.641665999999987,
-                15.533624999999972,
-                15.482915999999989,
-                15.40020800000002,
-                15.179249999999968,
-                17.222915999999998,
-                24.155249999999967
+                19.701458000000002,
+                23.866625,
+                17.96033299999999,
+                16.654875000000004,
+                17.744666999999993,
+                17.84020800000002,
+                16.612791000000016,
+                17.115124999999978,
+                17.063124999999957
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 24.155249999999967,
-                "mean": 16.68868955555554,
-                "min": 15.179249999999968,
-                "p50": 15.533624999999972,
-                "p95": 24.155249999999967
+                "max": 23.866625,
+                "mean": 18.284356333333328,
+                "min": 16.612791000000016,
+                "p50": 17.744666999999993,
+                "p95": 23.866625
               },
               "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/marked/index.min.js?instance=a"
             },
             {
               "calibration": {
-                "calls": 32,
-                "milliseconds": 20.077542
+                "calls": 33,
+                "milliseconds": 20.204834000000005
               },
               "checksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "coldImportMs": 5.198042000000001,
+              "coldImportMs": 5.162666999999999,
               "finalChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "firstCallMs": 15.784167,
+              "firstCallMs": 15.227208000000001,
               "implementation": "js",
-              "iterationsPerSample": 32,
+              "iterationsPerSample": 33,
               "key": "js",
               "label": "J",
               "perCallMs": {
                 "count": 9,
-                "max": 0.4820768124999999,
-                "mean": 0.47797164583333335,
-                "min": 0.4716718750000002,
-                "p50": 0.47770571875000023,
-                "p95": 0.4820768124999999
+                "max": 0.5577525151515144,
+                "mean": 0.5063315117845116,
+                "min": 0.48211993939393993,
+                "p50": 0.5068459696969692,
+                "p95": 0.5577525151515144
               },
               "rawBytes": 12860,
               "rawChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
               "sampleMs": [
-                15.426457999999997,
-                15.286583000000007,
-                15.241667000000007,
-                15.418834000000004,
-                15.226165999999978,
-                15.369958999999994,
-                15.197125000000028,
-                15.093500000000006,
-                15.395541999999978
+                17.114458000000013,
+                15.964624999999984,
+                16.965749999999986,
+                15.909958000000017,
+                16.435666999999967,
+                16.766542000000015,
+                16.091709000000037,
+                16.72591699999998,
+                18.405832999999973
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 15.426457999999997,
-                "mean": 15.295092666666667,
-                "min": 15.093500000000006,
-                "p50": 15.286583000000007,
-                "p95": 15.426457999999997
+                "max": 18.405832999999973,
+                "mean": 16.708939888888885,
+                "min": 15.909958000000017,
+                "p50": 16.72591699999998,
+                "p95": 18.405832999999973
               },
               "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/reference/marked.mjs"
             }
@@ -659,14 +659,14 @@
           "inputVerified": true,
           "loadAverage": {
             "end": [
-              4.48046875,
-              5.033203125,
-              5.50830078125
+              3.388671875,
+              4.5732421875,
+              6.4267578125
             ],
             "start": [
-              4.609375,
-              5.06787109375,
-              5.5234375
+              3.3359375,
+              4.5830078125,
+              6.44140625
             ]
           },
           "minSampleMs": 20,
@@ -684,22 +684,22 @@
           "pair": "rust-vs-js",
           "protocol": 1,
           "ratio": {
-            "min": 2.011362507039449,
+            "min": 1.91432205540706,
             "of": "rust/js",
-            "p50": 2.0323214154530107,
-            "p95": 3.1316650912348085,
+            "p50": 1.9449988601521833,
+            "p95": 2.3772615543489244,
             "paired": {
               "count": 9,
-              "max": 3.1379538310505732,
-              "mean": 2.1817357177236687,
-              "min": 1.9976475813681784,
-              "p50": 2.03372483920115,
-              "p95": 3.1379538310505732
+              "max": 2.740777134863281,
+              "mean": 2.0121757346762004,
+              "min": 1.6995914193795685,
+              "p50": 1.9408088158004615,
+              "p95": 2.740777134863281
             }
           },
           "samples": 9,
           "seed": 92205245,
-          "sink": 7407360,
+          "sink": 7870320,
           "status": "ok",
           "warmups": 2,
           "workload": "marked"
@@ -709,88 +709,88 @@
             {
               "calibration": {
                 "calls": 17,
-                "milliseconds": 20.894374999999997
+                "milliseconds": 20.779791999999993
               },
               "checksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "coldImportMs": 0.5133749999999999,
+              "coldImportMs": 0.47524999999999906,
               "finalChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "firstCallMs": 5.097000000000001,
+              "firstCallMs": 4.931541000000001,
               "implementation": "rust",
               "iterationsPerSample": 17,
               "key": "rust-a",
               "label": "A",
               "perCallMs": {
                 "count": 9,
-                "max": 1.137375,
-                "mean": 1.0063455882352943,
-                "min": 0.9653039411764707,
-                "p50": 0.985951,
-                "p95": 1.137375
+                "max": 1.274000000000001,
+                "mean": 0.9578126209150327,
+                "min": 0.8981592941176473,
+                "p50": 0.9098921764705878,
+                "p95": 1.274000000000001
               },
               "rawBytes": 12860,
               "rawChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
               "sampleMs": [
-                19.335375,
-                16.761167,
-                16.608790999999997,
-                17.32766699999999,
-                17.501374999999996,
-                17.060292000000004,
-                16.545915999999977,
-                16.410167,
-                16.42012500000004
+                16.315915999999987,
+                15.816708000000006,
+                15.373875000000027,
+                15.839665999999994,
+                15.468166999999994,
+                15.268708000000004,
+                21.658000000000015,
+                15.424874999999986,
+                15.379415999999992
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 19.335375,
-                "mean": 17.107875,
-                "min": 16.410167,
-                "p50": 16.761167,
-                "p95": 19.335375
+                "max": 21.658000000000015,
+                "mean": 16.282814555555557,
+                "min": 15.268708000000004,
+                "p50": 15.468166999999994,
+                "p95": 21.658000000000015
               },
               "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/marked/index.min.js?instance=a"
             },
             {
               "calibration": {
                 "calls": 16,
-                "milliseconds": 20.917417000000004
+                "milliseconds": 20.148041999999997
               },
               "checksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "coldImportMs": 0.7350829999999995,
+              "coldImportMs": 0.7149999999999999,
               "finalChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
-              "firstCallMs": 4.541458000000002,
+              "firstCallMs": 4.291875000000001,
               "implementation": "rust",
               "iterationsPerSample": 16,
               "key": "rust-b",
               "label": "B",
               "perCallMs": {
                 "count": 9,
-                "max": 1.0651301874999994,
-                "mean": 0.9999837986111112,
-                "min": 0.9642474375000027,
-                "p50": 0.9883593749999982,
-                "p95": 1.0651301874999994
+                "max": 0.974895812499998,
+                "mean": 0.948125006944444,
+                "min": 0.9208567499999987,
+                "p50": 0.9559166875000003,
+                "p95": 0.974895812499998
               },
               "rawBytes": 12860,
               "rawChecksum": "sha256:910b1ae20ebddd0a9c4623c8e76b617f79144db32c3499a8b364be85300a3527",
               "sampleMs": [
-                17.04208299999999,
-                15.737749999999977,
-                15.490999999999985,
-                15.81374999999997,
-                16.60316700000004,
-                16.388874999999985,
-                15.934708,
-                15.558375000000012,
-                15.427959000000044
+                15.364292000000006,
+                15.33408399999999,
+                14.902500000000003,
+                14.78716700000001,
+                14.733707999999979,
+                15.294667000000004,
+                15.598332999999968,
+                15.552374999999984,
+                14.962874999999997
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 17.04208299999999,
-                "mean": 15.99974077777778,
-                "min": 15.427959000000044,
-                "p50": 15.81374999999997,
-                "p95": 17.04208299999999
+                "max": 15.598332999999968,
+                "mean": 15.170000111111104,
+                "min": 14.733707999999979,
+                "p50": 15.294667000000004,
+                "p95": 15.598332999999968
               },
               "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/marked/index.min.js?instance=b"
             }
@@ -803,7 +803,7 @@
             "crossOriginIsolated": null,
             "node": "v26.8.1",
             "runtime": "node",
-            "timerResolutionMs": 0.00012500000000059686,
+            "timerResolutionMs": 0.00008300000000005525,
             "userAgent": "Node.js/26",
             "v8": "14.6.202.34-node.28"
           },
@@ -815,14 +815,14 @@
           "inputVerified": true,
           "loadAverage": {
             "end": [
-              4.48046875,
-              5.033203125,
-              5.50830078125
+              3.388671875,
+              4.5732421875,
+              6.4267578125
             ],
             "start": [
-              4.48046875,
-              5.033203125,
-              5.50830078125
+              3.388671875,
+              4.5732421875,
+              6.4267578125
             ]
           },
           "minSampleMs": 20,
@@ -840,17 +840,17 @@
           "pair": "rust-vs-rust",
           "protocol": 1,
           "ratio": {
-            "min": 1.0010956769345503,
+            "min": 0.9753518059325172,
             "of": "rust-a/rust-b",
-            "p50": 0.9975632598213598,
-            "p95": 1.0678272133752669,
+            "p50": 0.9518530101720686,
+            "p95": 1.306806310648712,
             "paired": {
               "count": 9,
-              "max": 1.0678272133752669,
-              "mean": 1.0060098016938823,
-              "min": 0.9772772004061442,
-              "p50": 1.001703160743274,
-              "p95": 1.0678272133752669
+              "max": 1.306806310648712,
+              "mean": 1.0094109242776077,
+              "min": 0.9334606072554648,
+              "p50": 0.9709464460167574,
+              "p95": 1.306806310648712
             }
           },
           "samples": 9,
@@ -864,89 +864,89 @@
           "arms": [
             {
               "calibration": {
-                "calls": 65,
-                "milliseconds": 20.200625000000002
+                "calls": 63,
+                "milliseconds": 20.070417
               },
               "checksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "coldImportMs": 1.0126250000000017,
+              "coldImportMs": 0.9247080000000008,
               "finalChecksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "firstCallMs": 2.7634159999999994,
+              "firstCallMs": 2.870583,
               "implementation": "rust",
-              "iterationsPerSample": 65,
+              "iterationsPerSample": 63,
               "key": "rust",
               "label": "R",
               "perCallMs": {
                 "count": 9,
-                "max": 0.35333141538461543,
-                "mean": 0.29968062735042733,
-                "min": 0.22724678461538456,
-                "p50": 0.28923846153846156,
-                "p95": 0.35333141538461543
+                "max": 0.25639947619047615,
+                "mean": 0.22976689770723097,
+                "min": 0.20364880952380976,
+                "p50": 0.23049404761904782,
+                "p95": 0.25639947619047615
               },
               "rawBytes": 61,
               "rawChecksum": "sha256:c0bb55e1c7d8e2c943ca06123dfff2c36685dcd82e9d4cea426b95764f635191",
               "sampleMs": [
-                14.771040999999997,
-                22.63537500000001,
-                18.177333000000004,
-                22.052291999999994,
-                15.311416999999949,
-                22.966542000000004,
-                17.81925000000001,
-                18.8005,
-                22.779417000000024
+                14.29416599999999,
+                13.28533299999998,
+                14.883458000000019,
+                14.066000000000003,
+                14.521125000000012,
+                14.566790999999967,
+                12.829875000000015,
+                15.677915999999982,
+                16.153166999999996
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 22.966542000000004,
-                "mean": 19.479240777777775,
-                "min": 14.771040999999997,
-                "p50": 18.8005,
-                "p95": 22.966542000000004
+                "max": 16.153166999999996,
+                "mean": 14.475314555555551,
+                "min": 12.829875000000015,
+                "p50": 14.521125000000012,
+                "p95": 16.153166999999996
               },
               "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/minisearch/index.min.js?instance=a"
             },
             {
               "calibration": {
-                "calls": 670,
-                "milliseconds": 20.014125
+                "calls": 674,
+                "milliseconds": 20.010707999999994
               },
               "checksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "coldImportMs": 0.923209,
+              "coldImportMs": 0.9579159999999991,
               "finalChecksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "firstCallMs": 0.8571249999999999,
+              "firstCallMs": 0.8562079999999987,
               "implementation": "js",
-              "iterationsPerSample": 670,
+              "iterationsPerSample": 674,
               "key": "js",
               "label": "J",
               "perCallMs": {
                 "count": 9,
-                "max": 0.023740797014925395,
-                "mean": 0.022776561857379782,
-                "min": 0.021768159701492488,
-                "p50": 0.02285995074626867,
-                "p95": 0.023740797014925395
+                "max": 0.043366097922848734,
+                "mean": 0.024330764424662067,
+                "min": 0.021334261127596385,
+                "p50": 0.022079872403560828,
+                "p95": 0.043366097922848734
               },
               "rawBytes": 265,
               "rawChecksum": "sha256:3d3ae7e42b27042b48bc8d71305029c0fcc944790792611ebcbd0f397a517300",
               "sampleMs": [
-                15.906334000000015,
-                15.76916700000001,
-                14.913207999999997,
-                15.247875000000022,
-                15.598500000000001,
-                14.633250000000032,
-                15.316167000000007,
-                14.584666999999968,
-                15.373500000000035
+                15.198625000000007,
+                14.942374999999998,
+                15.130707999999998,
+                14.881833999999998,
+                14.814833000000021,
+                14.481708000000026,
+                14.53229200000004,
+                14.379291999999964,
+                29.228750000000048
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 15.906334000000015,
-                "mean": 15.260296444444455,
-                "min": 14.584666999999968,
-                "p50": 15.316167000000007,
-                "p95": 15.906334000000015
+                "max": 29.228750000000048,
+                "mean": 16.398935222222235,
+                "min": 14.379291999999964,
+                "p50": 14.881833999999998,
+                "p95": 29.228750000000048
               },
               "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/reference/minisearch.mjs"
             }
@@ -959,7 +959,7 @@
             "crossOriginIsolated": null,
             "node": "v26.8.1",
             "runtime": "node",
-            "timerResolutionMs": 0.00008300000000005525,
+            "timerResolutionMs": 0.00012500000000059686,
             "userAgent": "Node.js/26",
             "v8": "14.6.202.34-node.28"
           },
@@ -971,14 +971,14 @@
           "inputVerified": true,
           "loadAverage": {
             "end": [
-              4.48046875,
-              5.033203125,
-              5.50830078125
+              3.388671875,
+              4.5732421875,
+              6.4267578125
             ],
             "start": [
-              4.48046875,
-              5.033203125,
-              5.50830078125
+              3.388671875,
+              4.5732421875,
+              6.4267578125
             ]
           },
           "minSampleMs": 20,
@@ -996,22 +996,22 @@
           "pair": "rust-vs-js",
           "protocol": 1,
           "ratio": {
-            "min": 10.43941186262998,
+            "min": 9.545622803893831,
             "of": "rust/js",
-            "p50": 12.652628378286105,
-            "p95": 14.882879254747959,
+            "p50": 10.439102337469848,
+            "p95": 5.912440557751551,
             "paired": {
               "count": 9,
-              "max": 16.17768085064438,
-              "mean": 13.187507856823357,
-              "min": 9.571994759591211,
-              "p50": 13.287226182865174,
-              "p95": 16.17768085064438
+              "max": 11.664608773439461,
+              "mean": 9.831003091357177,
+              "min": 5.912440557751551,
+              "p50": 10.11191718815524,
+              "p95": 11.664608773439461
             }
           },
           "samples": 9,
           "seed": 2028689212,
-          "sink": 2178180,
+          "sink": 2189436,
           "status": "ok",
           "warmups": 2,
           "workload": "minisearch"
@@ -1020,89 +1020,89 @@
           "arms": [
             {
               "calibration": {
-                "calls": 65,
-                "milliseconds": 20.257583000000004
+                "calls": 64,
+                "milliseconds": 20.210040999999997
               },
               "checksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "coldImportMs": 0.7762499999999992,
+              "coldImportMs": 0.7789580000000011,
               "finalChecksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "firstCallMs": 2.987833000000002,
+              "firstCallMs": 2.821249999999999,
               "implementation": "rust",
-              "iterationsPerSample": 65,
+              "iterationsPerSample": 64,
               "key": "rust-a",
               "label": "A",
               "perCallMs": {
                 "count": 9,
-                "max": 0.3689608923076924,
-                "mean": 0.28558055213675215,
-                "min": 0.22986089230769222,
-                "p50": 0.2720589692307691,
-                "p95": 0.3689608923076924
+                "max": 0.35944596875000023,
+                "mean": 0.2857500711805555,
+                "min": 0.23008137500000014,
+                "p50": 0.27835742187499957,
+                "p95": 0.35944596875000023
               },
               "rawBytes": 61,
               "rawChecksum": "sha256:c0bb55e1c7d8e2c943ca06123dfff2c36685dcd82e9d4cea426b95764f635191",
               "sampleMs": [
-                14.940957999999995,
-                15.918041000000017,
-                15.195917000000009,
-                23.98245800000001,
-                17.683832999999993,
-                17.42012500000004,
-                19.649624999999958,
-                22.575666000000012,
-                19.69799999999998
+                16.858291999999977,
+                23.004542000000015,
+                14.72520800000001,
+                18.651625000000024,
+                18.748917000000006,
+                16.46720799999997,
+                17.814874999999972,
+                22.88954100000001,
+                15.431832999999983
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 23.98245800000001,
-                "mean": 18.56273588888889,
-                "min": 14.940957999999995,
-                "p50": 17.683832999999993,
-                "p95": 23.98245800000001
+                "max": 23.004542000000015,
+                "mean": 18.288004555555553,
+                "min": 14.72520800000001,
+                "p50": 17.814874999999972,
+                "p95": 23.004542000000015
               },
               "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/minisearch/index.min.js?instance=a"
             },
             {
               "calibration": {
-                "calls": 67,
-                "milliseconds": 20.147292
+                "calls": 70,
+                "milliseconds": 20.071666999999998
               },
               "checksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "coldImportMs": 0.9546659999999996,
+              "coldImportMs": 0.9322079999999993,
               "finalChecksum": "sha256:a1e2daf9775acf62fbbb3cd3e6dc2247812bb0060d8f9c4656ceffa5bac5b015",
-              "firstCallMs": 2.4282499999999985,
+              "firstCallMs": 2.5158330000000007,
               "implementation": "rust",
-              "iterationsPerSample": 67,
+              "iterationsPerSample": 70,
               "key": "rust-b",
               "label": "B",
               "perCallMs": {
                 "count": 9,
-                "max": 0.24257586567164202,
-                "mean": 0.2278034792703152,
-                "min": 0.2042344477611944,
-                "p50": 0.2281405373134328,
-                "p95": 0.24257586567164202
+                "max": 0.25477321428571387,
+                "mean": 0.23009504126984126,
+                "min": 0.19715238571428617,
+                "p50": 0.23801964285714317,
+                "p95": 0.25477321428571387
               },
               "rawBytes": 61,
               "rawChecksum": "sha256:c0bb55e1c7d8e2c943ca06123dfff2c36685dcd82e9d4cea426b95764f635191",
               "sampleMs": [
-                14.466167000000013,
-                14.828292000000005,
-                16.225791000000015,
-                14.640458000000024,
-                13.683708000000024,
-                15.285415999999998,
-                15.854457999999966,
-                16.252583000000016,
-                16.128625
+                15.432999999999993,
+                15.252084000000025,
+                16.68383399999999,
+                16.96191699999997,
+                16.66137500000002,
+                17.834124999999972,
+                13.800667000000033,
+                15.44358299999999,
+                16.889291000000014
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 16.252583000000016,
-                "mean": 15.262833111111117,
-                "min": 13.683708000000024,
-                "p50": 15.285415999999998,
-                "p95": 16.252583000000016
+                "max": 17.834124999999972,
+                "mean": 16.10665288888889,
+                "min": 13.800667000000033,
+                "p50": 16.66137500000002,
+                "p95": 17.834124999999972
               },
               "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/minisearch/index.min.js?instance=b"
             }
@@ -1115,7 +1115,7 @@
             "crossOriginIsolated": null,
             "node": "v26.8.1",
             "runtime": "node",
-            "timerResolutionMs": 0.0001249999999988205,
+            "timerResolutionMs": 0.00012500000000059686,
             "userAgent": "Node.js/26",
             "v8": "14.6.202.34-node.28"
           },
@@ -1127,14 +1127,14 @@
           "inputVerified": true,
           "loadAverage": {
             "end": [
-              4.48046875,
-              5.033203125,
-              5.50830078125
+              3.388671875,
+              4.5732421875,
+              6.4267578125
             ],
             "start": [
-              4.48046875,
-              5.033203125,
-              5.50830078125
+              3.388671875,
+              4.5732421875,
+              6.4267578125
             ]
           },
           "minSampleMs": 20,
@@ -1152,22 +1152,22 @@
           "pair": "rust-vs-rust",
           "protocol": 1,
           "ratio": {
-            "min": 1.1254756228805343,
+            "min": 1.1670230322925677,
             "of": "rust-a/rust-b",
-            "p50": 1.192506042260252,
-            "p95": 1.5210123698254836,
+            "p50": 1.169472479387202,
+            "p95": 1.4108467789981318,
             "paired": {
               "count": 9,
-              "max": 1.6884977085153587,
-              "mean": 1.2555516757385359,
-              "min": 0.9653448437073466,
-              "p50": 1.2588855099360476,
-              "p95": 1.6884977085153587
+              "max": 1.6496904824612804,
+              "mean": 1.2539508688841476,
+              "min": 0.9653474285347133,
+              "p50": 1.2027069135965034,
+              "p95": 1.6496904824612804
             }
           },
           "samples": 9,
           "seed": 3302953305,
-          "sink": 96624,
+          "sink": 98088,
           "status": "ok",
           "warmups": 2,
           "workload": "minisearch"
@@ -1176,89 +1176,89 @@
           "arms": [
             {
               "calibration": {
-                "calls": 23,
-                "milliseconds": 20.252792
+                "calls": 24,
+                "milliseconds": 20.132625000000004
               },
               "checksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "coldImportMs": 0.5200000000000031,
+              "coldImportMs": 0.48612500000000125,
               "finalChecksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "firstCallMs": 2.6069579999999988,
+              "firstCallMs": 2.6039170000000027,
               "implementation": "rust",
-              "iterationsPerSample": 23,
+              "iterationsPerSample": 24,
               "key": "rust",
               "label": "R",
               "perCallMs": {
                 "count": 9,
-                "max": 0.6284383913043464,
-                "mean": 0.6008582801932367,
-                "min": 0.5707681304347827,
-                "p50": 0.6012046956521752,
-                "p95": 0.6284383913043464
+                "max": 0.5798784999999995,
+                "mean": 0.5634512037037037,
+                "min": 0.5510260416666656,
+                "p50": 0.5661649166666649,
+                "p95": 0.5798784999999995
               },
               "rawBytes": 61287,
               "rawChecksum": "sha256:d752557f5755aec3e4799d433ef3918ac246af63fe8f2943136f1acf90310df1",
               "sampleMs": [
-                13.623165999999998,
-                13.431125000000009,
-                13.553832999999997,
-                13.127667000000002,
-                13.82770800000003,
-                13.950958000000014,
-                14.129665999999986,
-                14.454082999999969,
-                14.279457999999977
+                13.594667000000015,
+                13.224624999999975,
+                13.354917,
+                13.225707999999997,
+                13.69987500000002,
+                13.917083999999988,
+                13.706084000000033,
+                13.587957999999958,
+                13.394542000000001
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 14.454082999999969,
-                "mean": 13.819740444444442,
-                "min": 13.127667000000002,
-                "p50": 13.82770800000003,
-                "p95": 14.454082999999969
+                "max": 13.917083999999988,
+                "mean": 13.522828888888888,
+                "min": 13.224624999999975,
+                "p50": 13.587957999999958,
+                "p95": 13.917083999999988
               },
               "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/fflate/index.min.js?instance=a"
             },
             {
               "calibration": {
-                "calls": 129,
-                "milliseconds": 20.049625
+                "calls": 130,
+                "milliseconds": 20.138458000000007
               },
               "checksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "coldImportMs": 2.4465830000000004,
+              "coldImportMs": 2.318624999999999,
               "finalChecksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "firstCallMs": 0.6929580000000009,
+              "firstCallMs": 0.6552499999999988,
               "implementation": "js",
-              "iterationsPerSample": 129,
+              "iterationsPerSample": 130,
               "key": "js",
               "label": "J",
               "perCallMs": {
                 "count": 9,
-                "max": 0.20007590697674432,
-                "mean": 0.18504313867355726,
-                "min": 0.14514599999999986,
-                "p50": 0.18803972868217034,
-                "p95": 0.20007590697674432
+                "max": 0.18653750000000002,
+                "mean": 0.18008878205128206,
+                "min": 0.14846955384615404,
+                "p50": 0.18327435384615395,
+                "p95": 0.18653750000000002
               },
               "rawBytes": 61287,
               "rawChecksum": "sha256:2dc154433ce5b74455925796807a8077a451eef1291f5e234d4c6e7cdb5e44f3",
               "sampleMs": [
-                18.723833999999982,
-                24.257124999999974,
-                24.598041999999992,
-                24.255957999999964,
-                24.131500000000017,
-                24.47954199999998,
-                24.374124999999992,
-                24.20516600000002,
-                25.809792000000016
+                19.301042000000024,
+                23.727000000000004,
+                24.249875000000003,
+                23.843124999999986,
+                23.769499999999994,
+                24.240583000000015,
+                23.93074999999999,
+                23.825666000000012,
+                23.816333999999983
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 25.809792000000016,
-                "mean": 23.870564888888882,
-                "min": 18.723833999999982,
-                "p50": 24.257124999999974,
-                "p95": 25.809792000000016
+                "max": 24.249875000000003,
+                "mean": 23.41154166666667,
+                "min": 19.301042000000024,
+                "p50": 23.825666000000012,
+                "p95": 24.249875000000003
               },
               "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/reference/fflate.mjs"
             }
@@ -1283,14 +1283,14 @@
           "inputVerified": true,
           "loadAverage": {
             "end": [
-              4.48046875,
-              5.033203125,
-              5.50830078125
+              3.388671875,
+              4.5732421875,
+              6.4267578125
             ],
             "start": [
-              4.48046875,
-              5.033203125,
-              5.50830078125
+              3.388671875,
+              4.5732421875,
+              6.4267578125
             ]
           },
           "minSampleMs": 20,
@@ -1308,22 +1308,22 @@
           "pair": "rust-vs-js",
           "protocol": 1,
           "ratio": {
-            "min": 3.9323724417812636,
+            "min": 3.711373998184473,
             "of": "rust/js",
-            "p50": 3.1972216715348862,
-            "p95": 3.1409998375136317,
+            "p50": 3.089166076896503,
+            "p95": 3.1086430342424416,
             "paired": {
               "count": 9,
-              "max": 4.0807984044850825,
-              "mean": 3.269578054493374,
-              "min": 3.0355052901265362,
-              "p50": 3.196411006311352,
-              "p95": 4.0807984044850825
+              "max": 3.815223011448466,
+              "mean": 3.1435184295918095,
+              "min": 2.983072438517724,
+              "p50": 3.089166076896503,
+              "p95": 3.815223011448466
             }
           },
           "samples": 9,
           "seed": 1319426053,
-          "sink": 111787488,
+          "sink": 113258376,
           "status": "ok",
           "warmups": 2,
           "workload": "fflate"
@@ -1332,89 +1332,89 @@
           "arms": [
             {
               "calibration": {
-                "calls": 24,
-                "milliseconds": 20.355375000000002
+                "calls": 25,
+                "milliseconds": 20.227583000000003
               },
               "checksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "coldImportMs": 0.5857080000000003,
+              "coldImportMs": 0.5380830000000003,
               "finalChecksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "firstCallMs": 2.8034580000000027,
+              "firstCallMs": 2.9549169999999982,
               "implementation": "rust",
-              "iterationsPerSample": 24,
+              "iterationsPerSample": 25,
               "key": "rust-a",
               "label": "A",
               "perCallMs": {
                 "count": 9,
-                "max": 0.612208333333335,
-                "mean": 0.5854886157407406,
-                "min": 0.5729670416666673,
-                "p50": 0.5791510416666649,
-                "p95": 0.612208333333335
+                "max": 0.5813466799999992,
+                "mean": 0.5630357377777779,
+                "min": 0.5547150000000011,
+                "p50": 0.5600150000000008,
+                "p95": 0.5813466799999992
               },
               "rawBytes": 61287,
               "rawChecksum": "sha256:d752557f5755aec3e4799d433ef3918ac246af63fe8f2943136f1acf90310df1",
               "sampleMs": [
-                13.980207999999976,
-                13.814999999999998,
-                14.190583000000004,
-                13.884832999999986,
-                13.89833299999998,
-                13.751209000000017,
-                14.69300000000004,
-                14.352750000000015,
-                13.899624999999958
+                14.117916000000008,
+                13.921166999999997,
+                14.53366699999998,
+                14.365499999999997,
+                13.877999999999986,
+                14.00037500000002,
+                14.061958000000004,
+                13.936582999999985,
+                13.867875000000026
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 14.69300000000004,
-                "mean": 14.051726777777775,
-                "min": 13.751209000000017,
-                "p50": 13.899624999999958,
-                "p95": 14.69300000000004
+                "max": 14.53366699999998,
+                "mean": 14.075893444444445,
+                "min": 13.867875000000026,
+                "p50": 14.00037500000002,
+                "p95": 14.53366699999998
               },
               "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/fflate/index.min.js?instance=a"
             },
             {
               "calibration": {
-                "calls": 24,
-                "milliseconds": 20.185292
+                "calls": 25,
+                "milliseconds": 20.079750000000004
               },
               "checksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "coldImportMs": 0.31662500000000193,
+              "coldImportMs": 0.3212080000000004,
               "finalChecksum": "sha256:0e32a0f2114e36f56bd6b03b195ca31e8ddeb3a7c513054e386627c2b8c4e979",
-              "firstCallMs": 2.9865829999999995,
+              "firstCallMs": 2.5045,
               "implementation": "rust",
-              "iterationsPerSample": 24,
+              "iterationsPerSample": 25,
               "key": "rust-b",
               "label": "B",
               "perCallMs": {
                 "count": 9,
-                "max": 0.6108090000000009,
-                "mean": 0.5793719074074077,
-                "min": 0.5667465416666673,
-                "p50": 0.5745537916666675,
-                "p95": 0.6108090000000009
+                "max": 0.5855666399999996,
+                "mean": 0.5593394355555554,
+                "min": 0.5487183200000004,
+                "p50": 0.5554283199999986,
+                "p95": 0.5855666399999996
               },
               "rawBytes": 61287,
               "rawChecksum": "sha256:d752557f5755aec3e4799d433ef3918ac246af63fe8f2943136f1acf90310df1",
               "sampleMs": [
-                13.728749999999991,
-                13.78929100000002,
-                14.008582999999987,
-                13.641791000000012,
-                13.937333999999993,
-                13.601917000000014,
-                14.659416000000022,
-                14.043375000000026,
-                13.733875000000012
+                13.844750000000005,
+                13.843000000000018,
+                14.639165999999989,
+                14.075999999999993,
+                13.71795800000001,
+                13.885707999999966,
+                13.811167000000012,
+                14.066416000000004,
+                13.967207999999971
               ],
               "sampleSummary": {
                 "count": 9,
-                "max": 14.659416000000022,
-                "mean": 13.904925777777786,
-                "min": 13.601917000000014,
-                "p50": 13.78929100000002,
-                "p95": 14.659416000000022
+                "max": 14.639165999999989,
+                "mean": 13.983485888888886,
+                "min": 13.71795800000001,
+                "p50": 13.885707999999966,
+                "p95": 14.639165999999989
               },
               "url": "file:///Users/mikhail.pertsev/Desktop/OSS/mires/.claude/worktrees/round3-opt/experiments/browser-workloads/dist/fflate/index.min.js?instance=b"
             }
@@ -1427,7 +1427,7 @@
             "crossOriginIsolated": null,
             "node": "v26.8.1",
             "runtime": "node",
-            "timerResolutionMs": 0.00008300000000005525,
+            "timerResolutionMs": 0.00012500000000059686,
             "userAgent": "Node.js/26",
             "v8": "14.6.202.34-node.28"
           },
@@ -1439,14 +1439,14 @@
           "inputVerified": true,
           "loadAverage": {
             "end": [
-              4.48046875,
-              5.033203125,
-              5.50830078125
+              3.388671875,
+              4.5732421875,
+              6.4267578125
             ],
             "start": [
-              4.48046875,
-              5.033203125,
-              5.50830078125
+              3.388671875,
+              4.5732421875,
+              6.4267578125
             ]
           },
           "minSampleMs": 20,
@@ -1464,22 +1464,22 @@
           "pair": "rust-vs-rust",
           "protocol": 1,
           "ratio": {
-            "min": 1.0109758058367804,
+            "min": 1.010928521577338,
             "of": "rust-a/rust-b",
-            "p50": 1.0080014266143151,
-            "p95": 1.0022909507445603,
+            "p50": 1.0082579152607887,
+            "p95": 0.9927933736115836,
             "paired": {
               "count": 9,
-              "max": 1.0220299607466146,
-              "mean": 1.0106173008845685,
-              "min": 0.9972016886443266,
-              "p50": 1.012068698746708,
-              "p95": 1.0220299607466146
+              "max": 1.0205669224211427,
+              "mean": 1.0067198721246953,
+              "min": 0.9907700013990758,
+              "p50": 1.0082579152607887,
+              "p95": 1.0205669224211427
             }
           },
           "samples": 9,
           "seed": 335142564,
-          "sink": 35301312,
+          "sink": 36772200,
           "status": "ok",
           "warmups": 2,
           "workload": "fflate"
@@ -1496,26 +1496,26 @@
     },
     "timingSummary": {
       "marked": {
-        "initialAaRatio": 0.9975632598213598,
-        "initialRustJsRatio": 2.0323214154530107,
-        "finalAaRatio": 0.9975632598213598,
-        "finalRustJsRatio": 2.0323214154530107,
+        "initialAaRatio": 0.9518530101720686,
+        "initialRustJsRatio": 1.9449988601521833,
+        "finalAaRatio": 0.9518530101720686,
+        "finalRustJsRatio": 1.9449988601521833,
         "aaWithinGate": true,
         "retryCount": 0
       },
       "minisearch": {
-        "initialAaRatio": 1.192506042260252,
-        "initialRustJsRatio": 12.652628378286105,
-        "finalAaRatio": 1.192506042260252,
-        "finalRustJsRatio": 12.652628378286105,
+        "initialAaRatio": 1.169472479387202,
+        "initialRustJsRatio": 10.439102337469848,
+        "finalAaRatio": 1.169472479387202,
+        "finalRustJsRatio": 10.439102337469848,
         "aaWithinGate": false,
         "retryCount": 3
       },
       "fflate": {
-        "initialAaRatio": 1.0080014266143151,
-        "initialRustJsRatio": 3.1972216715348862,
-        "finalAaRatio": 1.0080014266143151,
-        "finalRustJsRatio": 3.1972216715348862,
+        "initialAaRatio": 1.0082579152607887,
+        "initialRustJsRatio": 3.089166076896503,
+        "finalAaRatio": 1.0082579152607887,
+        "finalRustJsRatio": 3.089166076896503,
         "aaWithinGate": true,
         "retryCount": 0
       }
@@ -1525,18 +1525,18 @@
       "minisearch": [
         {
           "attempt": 1,
-          "aaRatioP50": 1.363540035640303,
-          "rustJsRatioP50": 10.535126182723216
+          "aaRatioP50": 0.8166766142901262,
+          "rustJsRatioP50": 14.034935566984784
         },
         {
           "attempt": 2,
-          "aaRatioP50": 0.7600363905146641,
-          "rustJsRatioP50": 10.034597974601658
+          "aaRatioP50": 0.7883619300113442,
+          "rustJsRatioP50": 9.53841334707675
         },
         {
           "attempt": 3,
-          "aaRatioP50": 0.7370700223920045,
-          "rustJsRatioP50": 11.845225211714192
+          "aaRatioP50": 0.7778119296530775,
+          "rustJsRatioP50": 16.006474594413532
         }
       ],
       "fflate": []
@@ -1554,31 +1554,31 @@
         "sha256": "0101252b22960b11e935d37009a7dcdf84a542f9c01a16355144440631b99f7a"
       },
       "minimalRuntime": {
-        "bytes": 27337,
-        "gzip9": 7228,
-        "brotli11": 6391,
+        "bytes": 25385,
+        "gzip9": 6827,
+        "brotli11": 6040,
         "tryCount": 0,
-        "topLevelFns": 3,
+        "topLevelFns": 2,
         "bigintMentions": 0,
-        "sha256": "4dcb8dbddda2a57cc4f0d91137362096da58fce9d7eb191947c69c5d7053f5f0"
+        "sha256": "9e61c65ef5a1534d7d381723fd665176d53a9f65cd9c09de391fbb8372c9172f"
       },
       "minimalRuntimeEsm": {
-        "bytes": 26965,
-        "gzip9": 7490,
-        "brotli11": 6619,
+        "bytes": 25025,
+        "gzip9": 7087,
+        "brotli11": 6261,
         "tryCount": 0,
-        "topLevelFns": 3,
+        "topLevelFns": 2,
         "bigintMentions": 0,
-        "sha256": "6bd416bb0b2986929569488747871c5e8c4eefbdb0485be43b9e3b79c95c5bc3"
+        "sha256": "9c0cc337a66d8aeaf118d71c5253577fbda1ef8ebce280835a142d8a4effeea5"
       },
       "minifiedBundleWithMinimalShim": {
-        "bytes": 27401,
-        "gzip9": 10343,
-        "brotli11": 8846,
+        "bytes": 26647,
+        "gzip9": 10099,
+        "brotli11": 8621,
         "tryCount": 0,
         "topLevelFns": 0,
         "bigintMentions": 0,
-        "sha256": "49e85732b7a253f10b05a5025914d93b23ef33134842005f117bcea45af00c46"
+        "sha256": "eb3648ed4590414110f21ada295ed806abda03981d9936967d79fd1513d98141"
       },
       "zeroBigIntInProgram": true,
       "crcTableHoistedAtTopLevel": true
@@ -1588,45 +1588,45 @@
       "v8Baseline": {
         "ok": true,
         "value": 3914845223,
-        "perRound": 55,
-        "medianUs": 243.383,
-        "p10Us": 240.508,
-        "minUs": 240.391,
-        "maxUs": 245.208,
+        "perRound": 57,
+        "medianUs": 236.768,
+        "p10Us": 235.595,
+        "minUs": 233.983,
+        "maxUs": 238.453,
         "sink": 0
       },
       "v8Opt": {
         "ok": true,
         "value": 3914845223,
-        "perRound": 1173,
-        "medianUs": 12.308,
-        "p10Us": 12.207,
-        "minUs": 12.159,
-        "maxUs": 13.024,
-        "sink": 0
+        "perRound": 1186,
+        "medianUs": 12.11,
+        "p10Us": 12.069,
+        "minUs": 12.063,
+        "maxUs": 12.252,
+        "sink": -380122073
       },
-      "v8SpeedupMedian": 19.77,
+      "v8SpeedupMedian": 19.55,
       "jscBaseline": {
         "ok": true,
         "value": 3914845223,
-        "perRound": 36,
-        "medianUs": 348.802,
-        "p10Us": 346.388,
-        "minUs": 344.469,
-        "maxUs": 360.758,
+        "perRound": 39,
+        "medianUs": 341.071,
+        "p10Us": 329.565,
+        "minUs": 328.438,
+        "maxUs": 396.491,
         "sink": -380122073
       },
       "jscOpt": {
         "ok": true,
         "value": 3914845223,
-        "perRound": 1126,
-        "medianUs": 7.1,
-        "p10Us": 6.691,
-        "minUs": 6.667,
-        "maxUs": 8.194,
+        "perRound": 632,
+        "medianUs": 8.016,
+        "p10Us": 7.179,
+        "minUs": 7.117,
+        "maxUs": 17.004,
         "sink": -380122073
       },
-      "jscSpeedupMedian": 49.13
+      "jscSpeedupMedian": 42.55
     },
     "crc32_table_8192": {
       "value": 4234064631,
@@ -1634,179 +1634,179 @@
         "ok": true,
         "value": 4234064631,
         "perRound": 23,
-        "medianUs": 520.476,
-        "p10Us": 515.263,
-        "minUs": 513.605,
-        "maxUs": 529.596,
-        "sink": 0
+        "medianUs": 523.366,
+        "p10Us": 519.87,
+        "minUs": 514.989,
+        "maxUs": 533.828,
+        "sink": -60902665
       },
       "v8Opt": {
         "ok": true,
         "value": 4234064631,
-        "perRound": 495,
-        "medianUs": 29.902,
-        "p10Us": 29.659,
-        "minUs": 29.642,
-        "maxUs": 30.197,
-        "sink": -60902665
+        "perRound": 470,
+        "medianUs": 31.567,
+        "p10Us": 31.515,
+        "minUs": 30.878,
+        "maxUs": 32.048,
+        "sink": 0
       },
-      "v8SpeedupMedian": 17.41,
+      "v8SpeedupMedian": 16.58,
       "jscBaseline": {
         "ok": true,
         "value": 4234064631,
-        "perRound": 258,
-        "medianUs": 52.721,
-        "p10Us": 51.845,
-        "minUs": 51.631,
-        "maxUs": 53.559,
-        "sink": -60902665
+        "perRound": 264,
+        "medianUs": 51.738,
+        "p10Us": 50.997,
+        "minUs": 50.853,
+        "maxUs": 52.838,
+        "sink": 0
       },
       "jscOpt": {
         "ok": true,
         "value": 4234064631,
-        "perRound": 498,
-        "medianUs": 30.016,
-        "p10Us": 29.737,
-        "minUs": 29.648,
-        "maxUs": 32.43,
+        "perRound": 486,
+        "medianUs": 29.22,
+        "p10Us": 29.01,
+        "minUs": 28.959,
+        "maxUs": 29.716,
         "sink": -60902665
       },
-      "jscSpeedupMedian": 1.76
+      "jscSpeedupMedian": 1.77
     },
     "crc32_table_16384": {
       "value": 1943956215,
       "v8Baseline": {
         "ok": true,
         "value": 1943956215,
-        "perRound": 10,
-        "medianUs": 1059.617,
-        "p10Us": 1042.933,
-        "minUs": 1042.196,
-        "maxUs": 1424.092,
-        "sink": 0
+        "perRound": 11,
+        "medianUs": 1037.466,
+        "p10Us": 1023.659,
+        "minUs": 1011.867,
+        "maxUs": 1386.409,
+        "sink": 1943956215
       },
       "v8Opt": {
         "ok": true,
         "value": 1943956215,
-        "perRound": 245,
-        "medianUs": 59.993,
-        "p10Us": 59.486,
-        "minUs": 59.281,
-        "maxUs": 60.543,
+        "perRound": 250,
+        "medianUs": 59.021,
+        "p10Us": 58.622,
+        "minUs": 58.536,
+        "maxUs": 59.741,
         "sink": 0
       },
-      "v8SpeedupMedian": 17.66,
+      "v8SpeedupMedian": 17.58,
       "jscBaseline": {
         "ok": true,
         "value": 1943956215,
-        "perRound": 133,
-        "medianUs": 102.956,
-        "p10Us": 101.693,
-        "minUs": 101.008,
-        "maxUs": 105.489,
-        "sink": 0
+        "perRound": 137,
+        "medianUs": 100.074,
+        "p10Us": 98.998,
+        "minUs": 98.795,
+        "maxUs": 117.774,
+        "sink": 1943956215
       },
       "jscOpt": {
         "ok": true,
         "value": 1943956215,
-        "perRound": 248,
-        "medianUs": 59.504,
-        "p10Us": 59.011,
-        "minUs": 58.989,
-        "maxUs": 59.742,
-        "sink": 0
+        "perRound": 256,
+        "medianUs": 58.295,
+        "p10Us": 57.781,
+        "minUs": 57.781,
+        "maxUs": 59.776,
+        "sink": 1943956215
       },
-      "jscSpeedupMedian": 1.73
+      "jscSpeedupMedian": 1.72
     },
     "enum_state_4096": {
       "value": 71197732,
       "v8Baseline": {
         "ok": true,
         "value": 71197732,
-        "perRound": 29,
-        "medianUs": 467.055,
-        "p10Us": 455.388,
-        "minUs": 454.284,
-        "maxUs": 531.28,
+        "perRound": 30,
+        "medianUs": 461.09,
+        "p10Us": 457.421,
+        "minUs": 456.029,
+        "maxUs": 507.037,
         "sink": 0
       },
       "v8Opt": {
         "ok": true,
         "value": 71197732,
-        "perRound": 30,
-        "medianUs": 481.771,
-        "p10Us": 478.518,
-        "minUs": 475.721,
-        "maxUs": 500.782,
-        "sink": 71197732
+        "perRound": 29,
+        "medianUs": 498.849,
+        "p10Us": 481.902,
+        "minUs": 480.078,
+        "maxUs": 520.269,
+        "sink": 0
       },
-      "v8SpeedupMedian": 0.97,
+      "v8SpeedupMedian": 0.92,
       "jscBaseline": {
         "ok": true,
         "value": 71197732,
-        "perRound": 25,
-        "medianUs": 568.76,
-        "p10Us": 551.279,
-        "minUs": 548.643,
-        "maxUs": 603.467,
-        "sink": 0
+        "perRound": 26,
+        "medianUs": 563.852,
+        "p10Us": 553.194,
+        "minUs": 551.589,
+        "maxUs": 589.309,
+        "sink": 71197732
       },
       "jscOpt": {
         "ok": true,
         "value": 71197732,
         "perRound": 23,
-        "medianUs": 640.476,
-        "p10Us": 632.876,
-        "minUs": 631.836,
-        "maxUs": 660.836,
-        "sink": 71197732
+        "medianUs": 622.782,
+        "p10Us": 616.784,
+        "minUs": 615.563,
+        "maxUs": 645.391,
+        "sink": 0
       },
-      "jscSpeedupMedian": 0.89
+      "jscSpeedupMedian": 0.91
     },
     "string_vec_builder_200": {
       "value": 6652,
       "v8Baseline": {
         "ok": true,
         "value": 6652,
-        "perRound": 63,
-        "medianUs": 205.376,
-        "p10Us": 200.237,
-        "minUs": 199.522,
-        "maxUs": 214.258,
+        "perRound": 66,
+        "medianUs": 200.8,
+        "p10Us": 198.006,
+        "minUs": 197.624,
+        "maxUs": 214.607,
         "sink": 0
       },
       "v8Opt": {
         "ok": true,
         "value": 6652,
         "perRound": 115,
-        "medianUs": 133.296,
-        "p10Us": 128.265,
-        "minUs": 126.725,
-        "maxUs": 142.558,
+        "medianUs": 127.319,
+        "p10Us": 122.323,
+        "minUs": 121.128,
+        "maxUs": 131.588,
         "sink": 6652
       },
-      "v8SpeedupMedian": 1.54,
+      "v8SpeedupMedian": 1.58,
       "jscBaseline": {
         "ok": true,
         "value": 6652,
-        "perRound": 67,
-        "medianUs": 166.209,
-        "p10Us": 161.435,
-        "minUs": 160.958,
-        "maxUs": 246.863,
+        "perRound": 70,
+        "medianUs": 159.044,
+        "p10Us": 153.397,
+        "minUs": 152.644,
+        "maxUs": 238.4,
         "sink": 0
       },
       "jscOpt": {
         "ok": true,
         "value": 6652,
-        "perRound": 143,
-        "medianUs": 81.789,
-        "p10Us": 76.442,
-        "minUs": 73.468,
-        "maxUs": 122.021,
-        "sink": 0
+        "perRound": 141,
+        "medianUs": 84.426,
+        "p10Us": 72.482,
+        "minUs": 70.69,
+        "maxUs": 134.156,
+        "sink": 6652
       },
-      "jscSpeedupMedian": 2.03
+      "jscSpeedupMedian": 1.88
     }
   },
   "enumStateMatrix": {
@@ -1826,21 +1826,21 @@
         "v8": {
           "ok": true,
           "value": 71197732,
-          "perRound": 29,
-          "medianUs": 487.057,
-          "p10Us": 479.734,
-          "minUs": 475.753,
-          "maxUs": 508.619,
-          "sink": 71197732
+          "perRound": 30,
+          "medianUs": 483.129,
+          "p10Us": 475.783,
+          "minUs": 471.781,
+          "maxUs": 509.29,
+          "sink": 0
         },
         "jsc": {
           "ok": true,
           "value": 71197732,
           "perRound": 23,
-          "medianUs": 634.957,
-          "p10Us": 625.096,
-          "minUs": 616.784,
-          "maxUs": 653.745,
+          "medianUs": 630.647,
+          "p10Us": 619.077,
+          "minUs": 617.485,
+          "maxUs": 651.123,
           "sink": 0
         }
       },
@@ -1858,27 +1858,27 @@
         "v8": {
           "ok": true,
           "value": 71197732,
-          "perRound": 764,
-          "medianUs": 19.344,
-          "p10Us": 19.228,
-          "minUs": 19.18,
-          "maxUs": 19.651,
+          "perRound": 779,
+          "medianUs": 18.875,
+          "p10Us": 18.434,
+          "minUs": 18.392,
+          "maxUs": 19.264,
           "sink": 0
         },
         "jsc": {
           "ok": true,
           "value": 71197732,
-          "perRound": 1356,
-          "medianUs": 10.968,
-          "p10Us": 10.687,
-          "minUs": 10.606,
-          "maxUs": 12.259,
+          "perRound": 1309,
+          "medianUs": 10.838,
+          "p10Us": 10.475,
+          "minUs": 10.247,
+          "maxUs": 11.171,
           "sink": 71197732
         }
       },
       "speedup": {
-        "v8Median": 25.18,
-        "jscMedian": 57.89
+        "v8Median": 25.6,
+        "jscMedian": 58.19
       }
     },
     "local_inlinable_helper": {
@@ -1897,21 +1897,21 @@
         "v8": {
           "ok": true,
           "value": 71197732,
-          "perRound": 4345,
-          "medianUs": 3.382,
-          "p10Us": 3.36,
-          "minUs": 3.359,
-          "maxUs": 6.275,
-          "sink": 71197732
+          "perRound": 2889,
+          "medianUs": 3.87,
+          "p10Us": 3.584,
+          "minUs": 3.381,
+          "maxUs": 3.896,
+          "sink": 0
         },
         "jsc": {
           "ok": true,
           "value": 71197732,
-          "perRound": 4734,
-          "medianUs": 3.11,
-          "p10Us": 3.041,
-          "minUs": 3.024,
-          "maxUs": 3.355,
+          "perRound": 4281,
+          "medianUs": 3.102,
+          "p10Us": 3.016,
+          "minUs": 3.003,
+          "maxUs": 3.423,
           "sink": 0
         }
       },
@@ -1929,27 +1929,27 @@
         "v8": {
           "ok": true,
           "value": 71197732,
-          "perRound": 4736,
-          "medianUs": 3.136,
-          "p10Us": 2.938,
-          "minUs": 2.851,
-          "maxUs": 3.314,
+          "perRound": 4686,
+          "medianUs": 3.109,
+          "p10Us": 2.748,
+          "minUs": 2.733,
+          "maxUs": 3.331,
           "sink": 71197732
         },
         "jsc": {
           "ok": true,
           "value": 71197732,
-          "perRound": 4889,
-          "medianUs": 3.06,
-          "p10Us": 2.873,
-          "minUs": 2.759,
-          "maxUs": 3.413,
-          "sink": 71197732
+          "perRound": 4995,
+          "medianUs": 2.818,
+          "p10Us": 2.772,
+          "minUs": 2.77,
+          "maxUs": 3.257,
+          "sink": 0
         }
       },
       "speedup": {
-        "v8Median": 1.08,
-        "jscMedian": 1.02
+        "v8Median": 1.24,
+        "jscMedian": 1.1
       }
     }
   }
