@@ -489,6 +489,10 @@ fn resolve(
     if references_changed {
         (reachable, parents) = reach(dcx, &table);
     }
+    if crate::lower::bstr::enabled() {
+        byte_string_facades(dcx, &mut table, &mut reachable);
+        refuse_hybrid_strings(dcx, &table, &reachable);
+    }
     dedup.retain_reachable(&reachable);
     if let Some(lane_run) = &mut lane_run {
         lane_run.retain_reachable(&reachable);
@@ -681,6 +685,165 @@ struct PrintedUnit {
     /// Prologue, exports, source map comment, and other link-synthesized text.
     synthesized_bytes: usize,
     artifacts: BTreeMap<String, Artifact>,
+}
+
+/// `js-str=bytes`: an exported function that takes or returns a `str` gets a **facade**.
+///
+/// An export is the item itself, called by the host under its fixed name, so the host's text
+/// would reach a byte-string body unencoded and Rust's byte string would reach the host
+/// undecoded. The body is renamed `<name>$bstr` — every reference to it in the program with it,
+/// so a Rust caller keeps calling the body directly and converts nothing — and a facade takes
+/// the exported name: `function name(a0, a1) { return __rt.bstr_out(name$bstr(__rt.bstr_in(a0),
+/// a1)); }`, converting exactly the `str` pointers of the signature. A signature that holds a
+/// `str` anywhere else (inside an aggregate passed by value) is refused rather than half
+/// converted, and so is one whose JavaScript parameters are not one per Rust argument.
+fn byte_string_facades(
+    dcx: &Sink,
+    table: &mut BTreeMap<JsName, LinkItem>,
+    reachable: &mut Vec<JsName>,
+) {
+    use crate::lower::bstr;
+    let mut facades = Vec::new();
+    for name in reachable.iter() {
+        let Some(item) = table.get(name) else {
+            continue;
+        };
+        if !item.linkage.exported {
+            continue;
+        }
+        let (Some(body), Some(interns)) = (item.jir.body.as_ref(), item.jir.interns()) else {
+            continue;
+        };
+        let types = &interns.types;
+        let signature = &body.signature;
+        let holds = |ty: &crate::jir::types::TypeId| bstr::holds_str(types, *ty);
+        if !signature.arguments.iter().any(holds) && !holds(&signature.result) {
+            continue;
+        }
+        let refuse = |why: &str| {
+            dcx.err(format!(
+                "rustc_codegen_js: `js-str=bytes` cannot give the exported `{}` a byte-string \
+                 facade: {why}",
+                name.as_str()
+            ))
+        };
+        if signature.abi.spread.is_some()
+            || signature.abi.caller_location
+            || usize::from(signature.abi.parameters) != signature.arguments.len()
+        {
+            refuse("its JavaScript parameters are not one per Rust argument");
+            continue;
+        }
+        let shallow = |ty: &crate::jir::types::TypeId| {
+            !bstr::holds_str(types, *ty) || bstr::is_str_pointer(types, *ty)
+        };
+        if !signature.arguments.iter().all(shallow) || !shallow(&signature.result) {
+            refuse("a `str` is held inside an aggregate passed by value");
+            continue;
+        }
+        let inner = JsName::new(format!("{}$bstr", name.as_str()));
+        if table.contains_key(&inner) {
+            refuse("its body's private name is taken");
+            continue;
+        }
+        let params: Vec<String> = (0..signature.arguments.len())
+            .map(|i| format!("a{i}"))
+            .collect();
+        let arguments = signature
+            .arguments
+            .iter()
+            .zip(&params)
+            .map(|(ty, param)| match bstr::is_str_pointer(types, *ty) {
+                true => jsast::rt_call("bstr_in", vec![jsast::id(param.clone())]),
+                false => jsast::id(param.clone()),
+            })
+            .collect();
+        let call = jsast::call(jsast::id(inner.as_str().to_owned()), arguments);
+        let result = match bstr::is_str_pointer(types, signature.result) {
+            true => jsast::rt_call("bstr_out", vec![call]),
+            false => call,
+        };
+        let decl = jsast::function(name.as_str().to_owned(), params, vec![jsast::ret(result)]);
+        facades.push((name.clone(), inner, decl));
+    }
+    if facades.is_empty() {
+        return;
+    }
+    let renames: BTreeMap<String, String> = facades
+        .iter()
+        .map(|(name, inner, _)| (name.as_str().to_owned(), inner.as_str().to_owned()))
+        .collect();
+    for item in table.values_mut() {
+        if !item.refs.iter().any(|r| renames.contains_key(r.as_str()))
+            && !renames.contains_key(item.name.as_str())
+        {
+            continue;
+        }
+        let (js, map) = crate::minify::apply_renames_mapped(&item.js, &item.map, &renames);
+        item.js = js;
+        item.map = map;
+        item.refs = std::mem::take(&mut item.refs)
+            .into_iter()
+            .map(|r| match renames.get(r.as_str()) {
+                Some(to) => JsName::new(to.clone()),
+                None => r,
+            })
+            .collect();
+    }
+    let style = match crate::opts::get().minify {
+        true => jsast::Style::Compact,
+        false => jsast::Style::Readable,
+    };
+    for (name, inner, decl) in facades {
+        let Some(mut body) = table.remove(&name) else {
+            continue;
+        };
+        let facade = LinkItem {
+            name: name.clone(),
+            kind: ItemKind::Fn,
+            js: jsast::program_to_string_styled_for_target(
+                std::slice::from_ref(&decl),
+                style,
+                crate::opts::get().ecma_target,
+            ),
+            refs: [inner.clone(), JsName::new(SHIM_NAMESPACE.to_owned())]
+                .into_iter()
+                .collect(),
+            zombies: Vec::new(),
+            linkage: body.linkage.clone(),
+            debug_path: format!("{} (js-str=bytes facade)", body.debug_path),
+            crate_name: body.crate_name.clone(),
+            order: None,
+            map: ItemMap::default(),
+            dts: body.dts.take(),
+            optimization: Default::default(),
+            late_ir: Default::default(),
+            baseline_shadow: Default::default(),
+            jir: Default::default(),
+        };
+        body.name = inner.clone();
+        body.linkage = Linkage::internal();
+        table.insert(inner.clone(), body);
+        table.insert(name, facade);
+        reachable.push(inner);
+    }
+}
+
+/// `js-str=bytes`: no item the program prints may still call a UTF-16 `str` helper — a verbatim
+/// fragment the byte-string rewrite cannot see, or synthesized text that predates it.
+fn refuse_hybrid_strings(dcx: &Sink, table: &BTreeMap<JsName, LinkItem>, reachable: &[JsName]) {
+    for name in reachable {
+        let Some(item) = table.get(name) else {
+            continue;
+        };
+        if let Some(helper) = crate::lower::bstr::leftover_helper(&item.js) {
+            dcx.err(format!(
+                "rustc_codegen_js: `js-str=bytes`, but `{}` still calls the UTF-16 helper \
+                 `__rt.{helper}`",
+                name.as_str()
+            ));
+        }
+    }
 }
 
 fn print_units(

@@ -41,12 +41,20 @@ impl<'a> JsCx<'a> {
     /// The producer decided whether to hoist (`js-hoist-consts`) and the item's `deps` say what it
     /// decided: a hoisted string is referenced by name there. Following `deps` rather than the
     /// link-time option is what keeps the lowering's `refs` equal to the baseline's.
+    ///
+    /// Under `js-str=bytes` the literal is the byte string of `text` (`lower/bstr.rs`). The shared
+    /// `const` the producer hoisted holds the UTF-16 text, which is the same string only when the
+    /// text is ASCII, so a non-ASCII literal is spelled inline.
     pub fn string_literal(&self, text: &str) -> Expr {
-        if text.len() >= HOIST_STRING_BYTES {
+        let bytes = crate::lower::bstr::enabled();
+        if text.len() >= HOIST_STRING_BYTES && (!bytes || text.is_ascii()) {
             let name = hoisted_name("s", text);
             if self.summary.deps.iter().any(|dep| dep == &name) {
                 return jsast::id(name);
             }
+        }
+        if bytes {
+            return jsast::string(crate::lower::bstr::byte_string(text));
         }
         jsast::string(text)
     }
@@ -511,9 +519,17 @@ impl<'a> JsCx<'a> {
         let line = fact.line;
         let column = fact.col + 1;
         let hoisted = hoisted_name("loc", &format!("loc\u{1}{file}\u{1}{line}\u{1}{column}"));
-        if self.summary.deps.iter().any(|dep| dep == &hoisted) {
+        // `Location::file` is a Rust `str`: a byte string under `js-str=bytes`, which the
+        // producer's hoisted constant is only when the path is ASCII.
+        let bytes = crate::lower::bstr::enabled();
+        if (!bytes || file.is_ascii()) && self.summary.deps.iter().any(|dep| dep == &hoisted) {
             return Ok(jsast::id(hoisted));
         }
+        let file = if bytes {
+            crate::lower::bstr::byte_string(&file)
+        } else {
+            file
+        };
         let (file_key, line_key, col_key) = self.location_field_keys()?;
         Ok(jsast::object(vec![
             (file_key, jsast::string(file)),

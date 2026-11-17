@@ -47,6 +47,7 @@
 //! and no lane may move an item in the program.
 
 pub mod bigint;
+pub mod bstr;
 pub mod fuse;
 pub mod js;
 pub mod plan;
