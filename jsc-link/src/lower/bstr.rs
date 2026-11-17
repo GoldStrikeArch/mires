@@ -76,10 +76,9 @@ pub fn is_str_pointer(table: &TypeTable, ty: TypeId) -> bool {
     value::pointee_of(table, ty).is_some_and(|pointee| value::is_str(table, pointee))
 }
 
-/// Whether a value of type `ty` holds a `str` pointer in its own JavaScript value: it is one, or
-/// a field or element held by value is. What an export signature is checked against; a pointer
-/// to anything but a `str` (the panic handler's `&PanicInfo`) is a handle the host does not read.
-pub fn holds_str(table: &TypeTable, ty: TypeId) -> bool {
+/// Whether a value of type `ty` reaches a `str` anywhere the host can see it: itself, a field,
+/// an element, a variant's payload, or the pointee of any pointer it holds.
+pub fn reaches_str(table: &TypeTable, ty: TypeId) -> bool {
     fn walk(table: &TypeTable, ty: TypeId, seen: &mut BTreeSet<TypeId>) -> bool {
         let ty = table.peeled(ty);
         if !seen.insert(ty) {
@@ -91,7 +90,7 @@ pub fn holds_str(table: &TypeTable, ty: TypeId) -> bool {
         match &descriptor.kind {
             TypeKind::Str => true,
             TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
-                value::is_str(table, *pointee)
+                walk(table, *pointee, seen)
             }
             TypeKind::Tuple(elements) => elements.iter().any(|e| walk(table, *e, seen)),
             TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
@@ -105,6 +104,223 @@ pub fn holds_str(table: &TypeTable, ty: TypeId) -> bool {
         }
     }
     walk(table, ty, &mut BTreeSet::new())
+}
+
+/// Which way a value crosses the host boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Crossing {
+    /// Rust text reaching the host: every `str` in the value is decoded.
+    Out,
+    /// Host text becoming Rust's: every `str` in the value is encoded.
+    In,
+}
+
+/// `value`, a JavaScript value of Rust type `ty`, as it must cross the host boundary in
+/// `direction`: every `str` it reaches converted, everything else exactly as it was, so the host
+/// sees what it sees under `js-str=utf16` (the same keys in the same order, the same array
+/// elements) and Rust holds what it would have held.
+///
+/// Type-directed, never a walk of the run-time value: an enum's `TAG`, a field of a host type
+/// and a `JsValue` are strings or objects too, and must not be touched. A container is copied
+/// (`Object.assign`, an array literal, `map`), so the copy shares nothing the host could write
+/// back through. Refused, with the reason, where an exact copy is not possible: a mutable or
+/// raw pointer the host could write through, a union, a coroutine state, a value with no
+/// described layout.
+pub fn host_convert(
+    table: &TypeTable,
+    interns: &crate::jir::interns::Interns,
+    ty: TypeId,
+    value: Expr,
+    direction: Crossing,
+) -> Result<Expr, String> {
+    convert(table, interns, ty, value, direction, 0)
+}
+
+fn convert(
+    table: &TypeTable,
+    interns: &crate::jir::interns::Interns,
+    ty: TypeId,
+    value: Expr,
+    direction: Crossing,
+    depth: usize,
+) -> Result<Expr, String> {
+    use crate::jir::types::{EnumRepr, FieldKey, NominalForm, PointerForm};
+    if !reaches_str(table, ty) {
+        return Ok(value);
+    }
+    if is_str_pointer(table, ty) {
+        return Ok(match direction {
+            Crossing::Out => host_out(value),
+            Crossing::In => host_in(value),
+        });
+    }
+    if depth > 12 {
+        return Err("a `str` nested more than 12 levels deep".to_owned());
+    }
+    let peeled = table.peeled(ty);
+    if peeled != ty {
+        if table.crosses_transparent_union(ty) {
+            return Err("a `str` inside a union".to_owned());
+        }
+        return convert(table, interns, peeled, value, direction, depth + 1);
+    }
+    let Some(descriptor) = table.get(ty) else {
+        return Err("a type with no described layout".to_owned());
+    };
+    // Each container is read through a parameter, so the value is evaluated exactly once.
+    let param = format!("$s{depth}");
+    let held = || jsast::id(param.clone());
+    let wrap =
+        |body: Expr| jsast::call(jsast::arrow(vec![param.clone()], body), vec![value.clone()]);
+    let element = |element: TypeId| -> Result<Expr, String> {
+        let inner = format!("$e{depth}");
+        let converted = convert(
+            table,
+            interns,
+            element,
+            jsast::id(inner.clone()),
+            direction,
+            depth + 1,
+        )?;
+        // A buffer's element is `undefined` where nothing was written (spare capacity).
+        Ok(jsast::arrow(
+            vec![inner.clone()],
+            jsast::cond(
+                jsast::binary(
+                    jsast::BinOp::StrictEq,
+                    jsast::id(inner.clone()),
+                    jsast::undefined(),
+                ),
+                jsast::id(inner),
+                converted,
+            ),
+        ))
+    };
+    let assign = |replaced: Vec<(String, Expr)>| {
+        jsast::call(
+            jsast::member(jsast::id("Object"), "assign"),
+            vec![jsast::object(vec![]), held(), jsast::object(replaced)],
+        )
+    };
+    let named_fields =
+        |fields: &[crate::jir::types::FieldDescriptor]| -> Result<Vec<(String, Expr)>, String> {
+            let mut replaced = Vec::new();
+            for field in fields {
+                if !reaches_str(table, field.ty) {
+                    continue;
+                }
+                let FieldKey::Name(_) = field.key else {
+                    return Err("a `str` in a field with no property of its own".to_owned());
+                };
+                let key = value::key_name(interns, field.key).unwrap_or_default();
+                let read = jsast::member(held(), key.clone());
+                replaced.push((
+                    key,
+                    convert(table, interns, field.ty, read, direction, depth + 1)?,
+                ));
+            }
+            Ok(replaced)
+        };
+    match &descriptor.kind {
+        TypeKind::Reference { pointee, mutable } | TypeKind::RawPointer { pointee, mutable } => {
+            if *mutable || matches!(descriptor.kind, TypeKind::RawPointer { .. }) {
+                return Err(
+                    "a `str` behind a mutable or raw pointer, which the host could write through"
+                        .to_owned(),
+                );
+            }
+            match table.pointer_form(ty) {
+                // The reference is the pointee's own object.
+                Some(PointerForm::Thin) => {
+                    convert(table, interns, *pointee, value, direction, depth + 1)
+                }
+                // `{ buf, off }` / `{ buf, off, len }`: the buffer, element by element.
+                Some(PointerForm::Slot) => {
+                    let map = jsast::method_call(
+                        jsast::member(held(), "buf"),
+                        "map",
+                        vec![element(*pointee)?],
+                    );
+                    Ok(wrap(assign(vec![("buf".to_owned(), map)])))
+                }
+                Some(PointerForm::FatSlice) => {
+                    let Some(TypeKind::Slice(item)) = value::kind(table, *pointee) else {
+                        return Err("a slice pointer to a non-slice".to_owned());
+                    };
+                    let map = jsast::method_call(
+                        jsast::member(held(), "buf"),
+                        "map",
+                        vec![element(*item)?],
+                    );
+                    Ok(wrap(assign(vec![("buf".to_owned(), map)])))
+                }
+                _ => Err("a `str` behind a pointer of no convertible form".to_owned()),
+            }
+        }
+        TypeKind::Tuple(_) => {
+            let mut items = Vec::new();
+            for (index, field) in descriptor.js.fields.iter().enumerate() {
+                let read = jsast::index(held(), jsast::num(index as f64));
+                items.push(convert(
+                    table,
+                    interns,
+                    field.ty,
+                    read,
+                    direction,
+                    depth + 1,
+                )?);
+            }
+            Ok(wrap(jsast::array(items)))
+        }
+        TypeKind::Array { element: item, .. } => Ok(wrap(jsast::method_call(
+            held(),
+            "map",
+            vec![element(*item)?],
+        ))),
+        TypeKind::Adt {
+            form: NominalForm::Struct,
+            variants,
+            ..
+        } => {
+            let [variant] = variants.as_slice() else {
+                return Err("a struct with no single variant".to_owned());
+            };
+            Ok(wrap(assign(named_fields(&variant.fields)?)))
+        }
+        TypeKind::Adt {
+            form: NominalForm::Enum,
+            variants,
+            ..
+        } => {
+            if !matches!(
+                table.enum_repr(ty),
+                Some(EnumRepr::Tag { fieldless: false })
+            ) {
+                return Err("a `str` in an enum whose value is not a tagged object".to_owned());
+            }
+            let mut converted = held();
+            for variant in variants.iter().rev() {
+                let replaced = named_fields(&variant.fields)?;
+                if replaced.is_empty() {
+                    continue;
+                }
+                converted = jsast::cond(
+                    jsast::binary(
+                        jsast::BinOp::StrictEq,
+                        jsast::member(held(), value::TAG),
+                        value::tag_literal(interns, variant),
+                    ),
+                    assign(replaced),
+                    converted,
+                );
+            }
+            Ok(wrap(converted))
+        }
+        _ => Err(
+            "a `str` inside a value of no convertible shape (a union, closure or coroutine)"
+                .to_owned(),
+        ),
+    }
 }
 
 /// `__rt.bstr_in(value)`: host text as the Rust `str` it becomes.

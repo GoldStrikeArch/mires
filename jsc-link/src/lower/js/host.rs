@@ -350,7 +350,7 @@ fn host_marker(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<Ex
             let Some(result) = op.result else {
                 return Ok(value);
             };
-            Ok(boundary_value(cx, cx.ty_of(result)?, value))
+            boundary_value(cx, cx.ty_of(result)?, value)
         }
         "throw" => Ok(throw_expr(one()?)),
         other => Err(decline(
@@ -509,6 +509,22 @@ fn closure_item(cx: &JsCx<'_>, ty: TypeId) -> Res<(String, usize, bool)> {
             "the closure a host marker was given has no item in this program",
         ));
     };
+    // `js-str=bytes`: the host calls the thunk with its own values and takes its result, and a
+    // closure handed to a host marker is typed `JsValue` by the mires-js API. One whose body
+    // takes or returns a `str` anywhere would cross unconverted, so it is refused.
+    if crate::lower::bstr::enabled()
+        && entry
+            .arguments
+            .iter()
+            .chain(entry.result.iter())
+            .any(|ty| crate::lower::bstr::reaches_str(cx.table, *ty))
+    {
+        return Err(decline(
+            OpClass::Host,
+            "`js-str=bytes` cannot convert this value at the host boundary: a closure handed to \
+             the host takes or returns a `str`",
+        ));
+    }
     // A closure body takes its environment and then the elements a caller splats out of the
     // `"rust-call"` tuple; `AbiSignature::params` already counts the tuple as its arity.
     let arity = entry
@@ -655,21 +671,22 @@ fn future_driver(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<
 /// Applies the representation rules a typed JavaScript result must satisfy before Rust sees it
 /// (v1 `js_extern.rs::host_boundary_value`).
 ///
-/// Under `js-str=bytes` a `str` result is host text becoming a Rust `str`: UTF-8 encoded into its
-/// byte string (`__rt.bstr_in`).
-fn boundary_value(cx: &JsCx<'_>, ty: TypeId, value: Expr) -> Expr {
-    if crate::lower::bstr::enabled() && crate::lower::bstr::is_str_pointer(cx.table, ty) {
-        return crate::lower::bstr::host_in(value);
+/// Under `js-str=bytes` every `str` the result reaches is host text becoming a Rust `str`:
+/// UTF-8 encoded into its byte string, wherever it sits in the value (`bstr::host_convert`), or
+/// the lowering declines with the reason when it cannot be rebuilt exactly.
+fn boundary_value(cx: &JsCx<'_>, ty: TypeId, value: Expr) -> Res<Expr> {
+    if crate::lower::bstr::enabled() && crate::lower::bstr::reaches_str(cx.table, ty) {
+        return crossing(cx, ty, value, crate::lower::bstr::Crossing::In);
     }
-    match value::float_bits(cx.table, ty) {
+    Ok(match value::float_bits(cx.table, ty) {
         Some(32) => jsast::fround(value),
         _ => value,
-    }
+    })
 }
 
-/// What the host is handed for the Rust value `arg`, spelled `value`. Under `js-str=bytes` a
-/// `str` — or a `String` the plan keeps as its host string — is decoded to the host text it
-/// encodes (`__rt.bstr_out`); everything else crosses as it is.
+/// What the host is handed for the Rust value `arg`, spelled `value`. Under `js-str=bytes` every
+/// `str` it reaches — or a `String` the plan keeps as its host string — is decoded to the host
+/// text it encodes (`__rt.bstr_out`, `bstr::host_convert`); everything else crosses as it is.
 fn host_argument(cx: &JsCx<'_>, arg: ValueId, value: Expr) -> Res<Expr> {
     if !crate::lower::bstr::enabled() {
         return Ok(value);
@@ -679,10 +696,25 @@ fn host_argument(cx: &JsCx<'_>, arg: ValueId, value: Expr) -> Res<Expr> {
         .values
         .get(arg.0 as usize)
         .is_some_and(|v| v.carrier == rcgjs_object::jir::repr::Carrier::HostString);
-    if host_string || crate::lower::bstr::is_str_pointer(cx.table, cx.ty_of(arg)?) {
+    if host_string {
         return Ok(crate::lower::bstr::host_out(value));
     }
-    Ok(value)
+    crossing(cx, cx.ty_of(arg)?, value, crate::lower::bstr::Crossing::Out)
+}
+
+/// [`crate::lower::bstr::host_convert`] at a host crossing, its refusal a decline that names it.
+pub(super) fn crossing(
+    cx: &JsCx<'_>,
+    ty: TypeId,
+    value: Expr,
+    direction: crate::lower::bstr::Crossing,
+) -> Res<Expr> {
+    crate::lower::bstr::host_convert(cx.table, cx.interns, ty, value, direction).map_err(|why| {
+        decline(
+            OpClass::Host,
+            format!("`js-str=bytes` cannot convert this value at the host boundary: {why}"),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -718,7 +750,7 @@ fn js_block(cx: &JsCx<'_>, op: &Op, bytes: &[u8], args: &[ValueId]) -> Res<Expr>
     // The block's value is host JavaScript: a `str` result is host text (`js-str=bytes`).
     match op.result {
         Some(result) if crate::lower::bstr::enabled() => {
-            Ok(boundary_value(cx, cx.ty_of(result)?, value))
+            boundary_value(cx, cx.ty_of(result)?, value)
         }
         _ => Ok(value),
     }
@@ -862,14 +894,14 @@ fn js_extern_value(
                     .to_owned(),
             ));
         }
-        let value = boundary_value(cx, ok_ty, value);
+        let value = boundary_value(cx, ok_ty, value)?;
         return Ok(jsast::rt_call(
             "host_try",
             vec![jsast::arrow(Vec::new(), value)],
         ));
     }
     if !descriptor.nullable {
-        return Ok(boundary_value(cx, result_ty, value));
+        return boundary_value(cx, result_ty, value);
     }
     nullable(cx, result_ty, value)
 }
@@ -930,7 +962,7 @@ fn nullable(cx: &JsCx<'_>, ty: TypeId, value: Expr) -> Res<Expr> {
         cx.interns,
         peeled,
         some,
-        vec![("_0".to_owned(), boundary_value(cx, value_ty, held.clone()))],
+        vec![("_0".to_owned(), boundary_value(cx, value_ty, held.clone())?)],
     )
     .ok_or_else(|| decline(OpClass::Host, "an `Option` with no enum representation"))?;
     let none = value::enum_value(cx.table, cx.interns, peeled, none, Vec::new())
@@ -1132,6 +1164,9 @@ pub struct ItemEntry {
     /// Whether the item supplied an ABI, including a known zero-parameter ABI.
     pub abi_known: bool,
     pub result: Option<TypeId>,
+    /// The Rust argument types of the body, when it has one: what a `js-str=bytes` closure thunk
+    /// checks the host's arguments against.
+    pub arguments: Vec<TypeId>,
     pub caller_location: bool,
     /// Direct SSA parameters mentioned by the body before optimization. This conservative set
     /// lets special call boundaries reject a live argument lane they cannot represent yet.

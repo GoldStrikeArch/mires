@@ -402,6 +402,16 @@ impl LaneRun {
         }
     }
 
+    /// `js-str=bytes` moved the lowered body of an export to `to` and put a facade under its
+    /// name (`link.rs::byte_string_facades`); the outcome follows the body.
+    pub(crate) fn rename(&mut self, from: &JsName, to: &JsName) {
+        for outcome in &mut self.outcomes {
+            if &outcome.name == from {
+                outcome.name = to.clone();
+            }
+        }
+    }
+
     /// Whether the lane added items to the program, so the link step re-walks reachability.
     pub(crate) fn added_items(&self) -> bool {
         self.added_items
@@ -1988,6 +1998,12 @@ fn item_index(table: &BTreeMap<JsName, LinkItem>) -> (ItemIndex, DropGlueIndex) 
                 params: abi.parameters as usize,
                 abi_known: summary.abi.is_some(),
                 result: item.jir.body.as_ref().map(|body| body.signature.result),
+                arguments: item
+                    .jir
+                    .body
+                    .as_ref()
+                    .map(|body| body.signature.arguments.clone())
+                    .unwrap_or_default(),
                 caller_location: abi.caller_location,
                 used_params: BTreeSet::new(),
                 standard: match item.jir.body.as_ref().map(|body| body.semantic) {
