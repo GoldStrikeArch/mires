@@ -188,6 +188,64 @@ pub enum StandardOperation {
     FormatArgsToString,
     /// Compiler-generated drop glue for a default-allocator `Box<T>`.
     BoxDrop,
+    // The `str` call-site identities (`js-str=bytes`, experimental). The producer tags *calls*
+    // with them, never bodies; the link step reads them only under `js-str=bytes` and turns them
+    // back into `CallSemantic::Ordinary` otherwise ([`StandardOperation::is_str`]).
+    /// `str::len`.
+    StrLen,
+    /// `str::is_char_boundary`.
+    StrIsCharBoundary,
+    /// `str::starts_with` with a `&str` or `char` pattern.
+    StrStartsWith,
+    /// `str::ends_with` with a `&str` or `char` pattern.
+    StrEndsWith,
+    /// `str::find` with a `&str` or `char` pattern.
+    StrFind,
+    /// `str::rfind` with a `&str` or `char` pattern.
+    StrRFind,
+    /// `str::contains` with a `&str` or `char` pattern.
+    StrContains,
+    /// `<str as Index<I>>::index` for `I` one of `Range`, `RangeFrom`, `RangeTo`, `RangeFull`
+    /// of `usize`.
+    StrIndex,
+    /// `<str as PartialEq>::eq`.
+    StrEq,
+    /// `<str as Ord>::cmp`.
+    StrCmp,
+}
+
+impl StandardOperation {
+    /// Whether this is one of the `str` call-site identities.
+    pub fn is_str(self) -> bool {
+        matches!(
+            self,
+            Self::StrLen
+                | Self::StrIsCharBoundary
+                | Self::StrStartsWith
+                | Self::StrEndsWith
+                | Self::StrFind
+                | Self::StrRFind
+                | Self::StrContains
+                | Self::StrIndex
+                | Self::StrEq
+                | Self::StrCmp
+        )
+    }
+}
+
+impl Body {
+    /// Turns every `str` call-site identity back into an ordinary call: what the link step does
+    /// unless it holds `str` as byte strings, so every other mode sees the bodies it always saw.
+    pub fn forget_str_calls(&mut self) {
+        for block in &mut self.blocks {
+            if let Terminator::Call(call) = &mut block.terminator {
+                if matches!(call.semantic, CallSemantic::Standard(operation) if operation.is_str())
+                {
+                    call.semantic = CallSemantic::Ordinary;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]

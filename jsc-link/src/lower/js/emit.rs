@@ -1652,6 +1652,14 @@ impl<'a> JsCx<'a> {
                     self.expr_of(*r)?,
                 )
             }
+            // `js-str=bytes`: a byte view held as its string (`JsCx::byte_string_view`) is that
+            // string, and its length is the string's.
+            OpKind::Unary {
+                op: rcgjs_object::jir::semantic::UnaryOp::PtrMetadata,
+                v,
+                ..
+            } if self.byte_string_view(*v) => Ok(jsast::member(self.expr_of(*v)?, "length")),
+            OpKind::Cast { v, .. } if self.byte_string_view(result) => self.expr_of(*v),
             OpKind::Unary { op: un, v, ty } => self.unary(*un, *ty, self.expr_of(*v)?),
             OpKind::Cast { kind, v, from, to } => self.cast(*kind, *from, *to, self.expr_of(*v)?),
             OpKind::Call { .. } | OpKind::Intrinsic { .. } | OpKind::Host { .. } => {

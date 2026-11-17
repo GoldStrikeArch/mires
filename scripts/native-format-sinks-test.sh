@@ -24,7 +24,8 @@ lane="${NATIVE_LANE:-jir}"
 for mode in off report on; do
 	args="js-opt=$mode js-opt-passes=native-representations"
 	if [ "$lane" = jir ]; then
-		args="js-lane=jir $args"
+		# `NATIVE_LINK_ARGS` adds link-only options (`js-str=bytes`) to the jir-lane builds.
+		args="js-lane=jir $args${NATIVE_LINK_ARGS:+ $NATIVE_LINK_ARGS}"
 	fi
 	JS_EXTRA_ARGS="$args" SKIP_BUILD=1 "$script_dir/build_sysroot.sh" >/dev/null
 	JS_EXTRA_ARGS="$args js-opt-warnings=off js-opt-report=$work/$mode.json" \

@@ -695,7 +695,10 @@ impl LinkJir {
             return Ok(false);
         };
         match object.decode_verified(summary) {
-            Ok(Some((body, origins))) => {
+            Ok(Some((mut body, origins))) => {
+                if crate::opts::get().str_repr != crate::opts::StrRepr::Bytes {
+                    body.forget_str_calls();
+                }
                 self.body = Some(body);
                 self.origins = Some(origins);
                 Ok(true)

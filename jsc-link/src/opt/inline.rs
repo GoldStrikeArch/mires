@@ -970,6 +970,9 @@ fn collect_sites(
             }
             let semantic_ok = match semantic {
                 CallSemantic::Ordinary => true,
+                // A `str` identity (`js-str=bytes` only) stays a call: `lower/js/call.rs` spells
+                // it as the string operation it is, which inlining its body would take away.
+                CallSemantic::Standard(std_op) if std_op.is_str() => false,
                 CallSemantic::Standard(std_op) if allow_std_post_repr => !matches!(
                     std_op,
                     crate::jir::semantic::StandardOperation::FormatArgumentNewDisplay

@@ -1595,24 +1595,23 @@ globalThis.__rt._bstr_units = (buf, off, len) => {
 
 // bstr_in(s): host text as the byte string of its UTF-8 bytes -- exactly the
 // bytes `TextEncoder` writes, so a lone surrogate is U+FFFD (EF BF BD). ASCII
-// text is its own byte string and comes back as is.
+// text is its own byte string and comes back as is; the engine's regular
+// expression scan answers that faster than a loop over the code units.
 globalThis.__rt.bstr_in = (s) => {
-  const n = s.length;
-  let i = 0;
-  while (i < n && s.charCodeAt(i) < 0x80) i++;
-  if (i === n) return s;
+  if (!globalThis.__rt._bstr_wide.test(s)) return s;
   const bytes = globalThis.__rt._encoder.encode(s);
   return globalThis.__rt._bstr_units(bytes, 0, bytes.length);
 };
+
+// _bstr_wide: matches any code unit outside ASCII.
+globalThis.__rt._bstr_wide = /[^\x00-\x7f]/;
 
 // bstr_out(s): a byte string as the host text it encodes. A byte string is
 // always well-formed UTF-8 (Rust's invariant), so this is a plain decode; ASCII
 // text is its own host text and comes back as is.
 globalThis.__rt.bstr_out = (s) => {
+  if (!globalThis.__rt._bstr_wide.test(s)) return s;
   const n = s.length;
-  let i = 0;
-  while (i < n && s.charCodeAt(i) < 0x80) i++;
-  if (i === n) return s;
   const bytes = new Uint8Array(n);
   for (let j = 0; j < n; j++) bytes[j] = s.charCodeAt(j);
   return globalThis.__rt._decoder.decode(bytes);
@@ -1674,17 +1673,24 @@ globalThis.__rt._bstr_memo_clear = () => {
 
 // bstr_bytes(s): `str::as_bytes` of a byte string, `{ buf, off, len }` over a
 // plain array of its code units, memoized for the operation like `str_bytes`.
+//
+// A string of at most 64 units is copied and never memoized: copying it costs
+// less than hashing it into the memo, and the memo exists for the long text a
+// parser re-reads per token, not for the short pieces it appends.
 globalThis.__rt.bstr_bytes = (s) => {
-  if (s !== "") {
-    if (s === _bsub_k0) return _bsub_v0;
-    if (s === _bsub_k1) return _bsub_v1;
-    if (s === _bsub_k2) return _bsub_v2;
-    if (s === _bsub_k3) return _bsub_v3;
+  const n = s.length;
+  if (n <= 64) {
+    const bytes = new Array(n);
+    for (let i = 0; i < n; i++) bytes[i] = s.charCodeAt(i);
+    return { buf: bytes, off: 0, len: n };
   }
+  if (s === _bsub_k0) return _bsub_v0;
+  if (s === _bsub_k1) return _bsub_v1;
+  if (s === _bsub_k2) return _bsub_v2;
+  if (s === _bsub_k3) return _bsub_v3;
   const memo = globalThis.__rt._bstr_memo;
   let record = memo.map.get(s);
   if (record !== undefined) return record;
-  const n = s.length;
   const bytes = new Array(n);
   for (let i = 0; i < n; i++) bytes[i] = s.charCodeAt(i);
   record = { buf: bytes, off: 0, len: n };

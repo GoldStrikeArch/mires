@@ -63,6 +63,40 @@ impl<'a> JsCx<'a> {
     /// The place walk (`place.rs::walk_place`).
     pub fn walk_place(&self, root: &Root, path: &[Proj]) -> Res<Walk> {
         let table = self.table;
+        // `js-str=bytes`: one byte of a byte view held as its string is that string's code unit
+        // (`JsCx::byte_string_view` admits only this path, and only where it is read).
+        if let (
+            Root::Value(view),
+            [Proj::Deref, step @ (Proj::Index(_) | Proj::ConstantIndex { .. })],
+        ) = (root, path)
+        {
+            if self.byte_string_view(*view) {
+                let string = self.expr_of(*view)?;
+                let index = match step {
+                    Proj::Index(index) => self.expr_of(*index)?,
+                    Proj::ConstantIndex {
+                        offset,
+                        from_end: false,
+                        ..
+                    } => jsast::num(*offset as f64),
+                    Proj::ConstantIndex { offset, .. } => jsast::binary(
+                        BinOp::Sub,
+                        jsast::member(string.clone(), "length"),
+                        jsast::num(*offset as f64),
+                    ),
+                    _ => unreachable!("matched above"),
+                };
+                let pointee = value::pointee_of(table, self.ty_of(*view)?)
+                    .ok_or_else(|| decline(OpClass::Place, "a byte view that is not a pointer"))?;
+                let element = self.element_ty(pointee)?;
+                return Ok(Walk {
+                    place: JsPlace::Var(jsast::method_call(string, "charCodeAt", vec![index])),
+                    ty: element,
+                    identity: None,
+                    object: false,
+                });
+            }
+        }
         let (mut current, mut ty) = self.root_place(root)?;
         let mut variant: Option<u32> = None;
         let mut identity = None;
