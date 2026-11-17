@@ -358,7 +358,9 @@ impl<'a> JsCx<'a> {
     pub fn str_len(&self, string: Expr) -> Expr {
         let (mut pre, tail) = peel_seq(string);
         match tail {
-            Expr::Str(s) => sequenced_vec(pre, jsast::num(s.len() as f64)),
+            Expr::Str(s) => {
+                sequenced_vec(pre, jsast::num(crate::lower::bstr::literal_len(&s) as f64))
+            }
             other => match bytes_str_args(other) {
                 Ok((buf, off, len)) => {
                     if !jsast::is_droppable(&buf) {

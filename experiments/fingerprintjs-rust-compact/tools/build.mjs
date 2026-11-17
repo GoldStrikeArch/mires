@@ -215,6 +215,8 @@ async function buildBoundary() {
         `js-opt-report=${optimizerReport}`,
         lane === 'baseline' ? '' : `js-lane=${lane}`,
         laneReport ? `js-lane-report=${laneReportPath}` : '',
+        // `--str bytes`: link with `js-str=bytes` (experimental; link-only, needs `--lane jir`).
+        options.str ? `js-str=${options.str}` : '',
       ].filter(Boolean).join(' '),
     },
   )

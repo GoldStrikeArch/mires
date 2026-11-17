@@ -164,9 +164,19 @@ pub fn lower_call(cx: &JsCx<'_>, op: &Op) -> Res<Expr> {
             "a call with a host payload this lowering does not recognize",
         ));
     };
+    // The view-abi template boundary hands Rust text to the DOM through holes, text nodes and
+    // keyed rows; none of those crossings converts a byte string yet, so a byte-string program
+    // that reaches one is refused rather than given UTF-8 bytes as DOM text.
+    if crate::lower::bstr::enabled() && matches!(family, Family::ViewAbi(_) | Family::KeyedList(_))
+    {
+        return Err(decline(
+            OpClass::Host,
+            "`js-str=bytes` does not convert Rust text at the view-abi template boundary yet",
+        ));
+    }
     match family {
         Family::Extern(bytes) => js_extern(cx, op, bytes, args),
-        Family::Block(bytes) => js_block(cx, bytes, args),
+        Family::Block(bytes) => js_block(cx, op, bytes, args),
         Family::Host(marker) => host_marker(cx, op, &marker, args),
         Family::ViewAbi(marker) => super::template::lower_marker(cx, op, &marker, args),
         Family::Map(marker) => map_marker(cx, op, &marker, args),
@@ -231,8 +241,11 @@ fn host_marker(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<Ex
             format!("`{HOST_PREFIX}{marker}` {what}"),
         ))
     };
-    let values =
-        |cx: &JsCx<'_>| -> Res<Vec<Expr>> { args.iter().map(|arg| cx.expr_of(*arg)).collect() };
+    let values = |cx: &JsCx<'_>| -> Res<Vec<Expr>> {
+        args.iter()
+            .map(|arg| host_argument(cx, *arg, cx.expr_of(*arg)?))
+            .collect()
+    };
 
     // The markers that read a closure rather than a value come first: their argument is a Rust
     // closure environment and what the host is handed is a thunk that calls its body.
@@ -641,11 +654,35 @@ fn future_driver(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<
 
 /// Applies the representation rules a typed JavaScript result must satisfy before Rust sees it
 /// (v1 `js_extern.rs::host_boundary_value`).
+///
+/// Under `js-str=bytes` a `str` result is host text becoming a Rust `str`: UTF-8 encoded into its
+/// byte string (`__rt.bstr_in`).
 fn boundary_value(cx: &JsCx<'_>, ty: TypeId, value: Expr) -> Expr {
+    if crate::lower::bstr::enabled() && crate::lower::bstr::is_str_pointer(cx.table, ty) {
+        return crate::lower::bstr::host_in(value);
+    }
     match value::float_bits(cx.table, ty) {
         Some(32) => jsast::fround(value),
         _ => value,
     }
+}
+
+/// What the host is handed for the Rust value `arg`, spelled `value`. Under `js-str=bytes` a
+/// `str` — or a `String` the plan keeps as its host string — is decoded to the host text it
+/// encodes (`__rt.bstr_out`); everything else crosses as it is.
+fn host_argument(cx: &JsCx<'_>, arg: ValueId, value: Expr) -> Res<Expr> {
+    if !crate::lower::bstr::enabled() {
+        return Ok(value);
+    }
+    let host_string = cx
+        .func
+        .values
+        .get(arg.0 as usize)
+        .is_some_and(|v| v.carrier == rcgjs_object::jir::repr::Carrier::HostString);
+    if host_string || crate::lower::bstr::is_str_pointer(cx.table, cx.ty_of(arg)?) {
+        return Ok(crate::lower::bstr::host_out(value));
+    }
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -653,7 +690,7 @@ fn boundary_value(cx: &JsCx<'_>, ty: TypeId, value: Expr) -> Expr {
 // ---------------------------------------------------------------------------------------------
 
 /// Lowers a call to a `js!{}` marker (v1 `js_block.rs::codegen_js_block`).
-fn js_block(cx: &JsCx<'_>, bytes: &[u8], args: &[ValueId]) -> Res<Expr> {
+fn js_block(cx: &JsCx<'_>, op: &Op, bytes: &[u8], args: &[ValueId]) -> Res<Expr> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| decline(OpClass::Host, "a `js!{}` block section is not UTF-8"))?;
     let block = Block::decode(text).map_err(|why| decline(OpClass::Host, why))?;
@@ -667,14 +704,24 @@ fn js_block(cx: &JsCx<'_>, bytes: &[u8], args: &[ValueId]) -> Res<Expr> {
             ),
         ));
     }
-    Ok(match block.slots {
+    let value = match block.slots {
         0 => jsast::raw_expr(block.text),
         slots => {
-            let captures: Res<Vec<Expr>> = args.iter().map(|arg| cx.expr_of(*arg)).collect();
+            let captures: Res<Vec<Expr>> = args
+                .iter()
+                .map(|arg| host_argument(cx, *arg, cx.expr_of(*arg)?))
+                .collect();
             let params = (0..slots).map(block::slot_name).collect();
             jsast::call(jsast::arrow(params, jsast::raw_expr(block.text)), captures?)
         }
-    })
+    };
+    // The block's value is host JavaScript: a `str` result is host text (`js-str=bytes`).
+    match op.result {
+        Some(result) if crate::lower::bstr::enabled() => {
+            Ok(boundary_value(cx, cx.ty_of(result)?, value))
+        }
+        _ => Ok(value),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -707,7 +754,7 @@ fn js_extern(cx: &JsCx<'_>, op: &Op, bytes: &[u8], args: &[ValueId]) -> Res<Expr
     }
     let lowered: Vec<Expr> = args
         .iter()
-        .map(|arg| cx.expr_of(*arg))
+        .map(|arg| host_argument(cx, *arg, cx.expr_of(*arg)?))
         .collect::<Res<Vec<Expr>>>()?;
     let (setup, arguments) = rcgjs_object::evaluation::OperandEvaluation::Materialize
         .capture(lowered, |value| cx.temp(value));

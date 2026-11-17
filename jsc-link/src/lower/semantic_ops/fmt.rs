@@ -50,7 +50,7 @@ pub(super) fn primitive_to_string(
         StandardOperation::BoolToString => {
             jsast::cond(value, jsast::string("true"), jsast::string("false"))
         }
-        _ => jsast::method_call(jsast::id("String"), "fromCodePoint", vec![value]),
+        _ => crate::lower::bstr::char_text(value),
     };
     match carrier {
         Some(Carrier::HostString) => Ok(vec![jsast::ret(text)]),
@@ -198,9 +198,7 @@ fn format_display_text(
         FormatDisplayKind::Bool => {
             jsast::cond(loaded, jsast::string("true"), jsast::string("false"))
         }
-        FormatDisplayKind::Char => {
-            jsast::method_call(jsast::id("String"), "fromCodePoint", vec![loaded])
-        }
+        FormatDisplayKind::Char => crate::lower::bstr::char_text(loaded),
         // The one display text a host may have made: taken as Rust holds it (lone surrogate to
         // U+FFFD), so the concatenated `Arguments` text is well formed piece by piece.
         FormatDisplayKind::Str => super::string::well_formed(receiver(), helpers),
@@ -228,7 +226,7 @@ pub fn concat_format_pieces(pieces: &[String], texts: &[Expr]) -> Expr {
     let mut parts = Vec::new();
     for (index, piece) in pieces.iter().enumerate() {
         if !piece.is_empty() {
-            parts.push(jsast::string(piece.clone()));
+            parts.push(crate::lower::bstr::literal(piece));
         }
         if let Some(text) = texts.get(index) {
             parts.push(text.clone());

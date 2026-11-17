@@ -1106,6 +1106,19 @@ fn run_with_opts(
         outcomes.push(outcome);
     }
 
+    // `js-str=bytes` is a JIR-lane representation: an item that keeps the baseline's text holds
+    // its `str` values as UTF-16 text, and the program would mix the two. Refused, never mixed.
+    if crate::lower::bstr::enabled() {
+        for outcome in outcomes.iter().filter(|o| o.lane == ItemLane::Fallback) {
+            dcx.err(format!(
+                "rustc_codegen_js: `js-str=bytes` needs every item on the JIR lane, but `{}` fell \
+                 back to the baseline text ({:?})",
+                outcome.name.as_str(),
+                outcome.decline
+            ));
+        }
+    }
+
     let referenced: BTreeSet<JsName> = table
         .values()
         .flat_map(|item| item.refs.iter().cloned())
@@ -2599,10 +2612,18 @@ fn vtable_index(table: &BTreeMap<JsName, LinkItem>) -> VtableIndex {
 fn apply(
     dcx: &Sink,
     item: &mut LinkItem,
-    lowered: LoweredItem,
+    mut lowered: LoweredItem,
     defined: &BTreeSet<JsName>,
     live: &BTreeSet<JsName>,
 ) -> Result<Applied, Decline> {
+    // `js-str=bytes`: the lowering spoke the hybrid's helpers; the installed item speaks the
+    // byte-string ones (`lower/bstr.rs`).
+    // A helper that became a property read (`str_len`) or nothing (`native_str_wf`) takes its
+    // `__rt` mention with it, so the refs are the rewritten declaration's.
+    if crate::lower::bstr::enabled() {
+        crate::lower::bstr::rewrite(&mut lowered.decl);
+        lowered.refs = refs_of(&lowered.decl, &item.name);
+    }
     // Before `shorten_locals`, which renames locals and so changes the identifier set: the
     // baseline's `refs` was taken at the same point in the backend.
     let refs = refs_of(&lowered.decl, &item.name);

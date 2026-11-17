@@ -897,7 +897,7 @@ fn display_text(
     Ok(match kind {
         DisplayKind::Integer => jsast::call(jsast::id("String"), vec![loaded]),
         DisplayKind::Bool => jsast::cond(loaded, jsast::string("true"), jsast::string("false")),
-        DisplayKind::Char => jsast::method_call(jsast::id("String"), "fromCodePoint", vec![loaded]),
+        DisplayKind::Char => crate::lower::bstr::char_text(loaded),
         // The planner accounts the members a site reaches (`representation`): the set is a sink.
         DisplayKind::Str => super::string::well_formed(loaded, &mut BTreeSet::new()),
         DisplayKind::F64 => {

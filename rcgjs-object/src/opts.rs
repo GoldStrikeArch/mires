@@ -40,6 +40,7 @@
 //! -Cllvm-args=js-jir-flat-abi=on    on|off          plan the JIR lane's flat direct-call ABI
 //! -Cllvm-args=js-jir-typed-storage=off on|off       opt in to proven exact numeric Vec storage
 //! -Cllvm-args=js-jir-ready-futures=off on|off       opt in to proven nonsuspending Promise drivers
+//! -Cllvm-args=js-str=utf16        utf16|bytes        how a Rust `str` is held at run time
 //! -Cllvm-args=js-opt-weight-alloc=24 an integer     the representation cost model's bytes per
 //!                                                   allocation site (Phase 4)
 //! -Cllvm-args=js-jir-dump-conflicts=PATH a file path where a dedup conflict autopsy is written
@@ -128,6 +129,34 @@ impl Lane {
             Self::Baseline => "baseline",
             Self::Shadow => "shadow",
             Self::Jir => "jir",
+        }
+    }
+}
+
+/// How a Rust `str` is held at run time (`js-str`, experimental).
+///
+/// `Utf16` is CONTRACT.md's hybrid: a `&str` is a JavaScript string holding the UTF-16 text, and
+/// every byte-level operation converts. `Bytes` makes it a **byte string**: a JavaScript string
+/// whose code unit `i` is byte `i` of the UTF-8 text, so every unit is below 256, its `length` is
+/// the Rust length and a byte offset is an index. Host text is UTF-8 encoded where it becomes a
+/// Rust `str` and decoded where Rust text reaches the host.
+///
+/// Link-only: every `str` operation the lowering emits is chosen at link time on the JIR lane,
+/// and nothing an object file carries depends on it, so it never joins the sysroot key. The
+/// baseline text in the objects is UTF-16 text, which is why `bytes` refuses any item that
+/// falls back to it (`jsc-link/src/link/lane.rs`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum StrRepr {
+    #[default]
+    Utf16,
+    Bytes,
+}
+
+impl StrRepr {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Utf16 => "utf16",
+            Self::Bytes => "bytes",
         }
     }
 }
@@ -523,6 +552,9 @@ pub struct Opts {
     pub lane_only: Vec<String>,
     /// Where the link step writes the autopsy of the items two objects defined differently.
     pub jir_dump_conflicts: Option<String>,
+    /// How a Rust `str` is held at run time. See [`StrRepr`]. Link-only.
+    #[serde(default)]
+    pub str_repr: StrRepr,
     /// The alias bundle this compilation named, if any. See [`Profile`].
     ///
     /// Recorded rather than expanded away so that a report can say which profile a build ran
@@ -583,6 +615,7 @@ impl Default for Opts {
             weight_alloc: 24,
             lane_only: Vec::new(),
             jir_dump_conflicts: None,
+            str_repr: StrRepr::Utf16,
             profile: None,
         }
     }
@@ -944,6 +977,11 @@ pub fn parse_args(args: &[String], dcx: &dyn Diagnostics) -> Opts {
                 Some(path) if !path.is_empty() => opts.jir_dump_conflicts = Some(path.to_owned()),
                 other => bad_value(dcx, key, other, "a file path"),
             },
+            "js-str" => match value {
+                Some("utf16") => opts.str_repr = StrRepr::Utf16,
+                Some("bytes") => opts.str_repr = StrRepr::Bytes,
+                other => bad_value(dcx, key, other, "utf16`, `bytes"),
+            },
             // Already resolved, ahead of this loop, so that an explicit option wins.
             "js-profile" => {}
             _ => {
@@ -1029,6 +1067,15 @@ pub fn parse_args(args: &[String], dcx: &dyn Diagnostics) -> Opts {
         dcx.warn(
             "`-Cllvm-args=js-lane-report` with `js-jir=off` reports every item as unavailable: \
              the objects carry no JIR bodies to choose from",
+        );
+    }
+
+    // Byte strings exist only in the JIR lowering: the baseline text every object carries holds a
+    // `str` as UTF-16 text, and a program that printed some items from it would mix the two.
+    if opts.str_repr == StrRepr::Bytes && opts.lane != Lane::Jir {
+        dcx.err(
+            "`-Cllvm-args=js-str=bytes` needs `-Cllvm-args=js-lane=jir`: byte strings are a \
+             JIR-lane lowering, and the baseline lane prints a `str` as UTF-16 text",
         );
     }
 
