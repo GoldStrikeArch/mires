@@ -27,8 +27,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
-use crate::item::JsName;
-use crate::jir::interns::Interns;
+use crate::item::{JsName, LinkItem};
+use crate::jir::interns::{Interns, StrId};
 use crate::jir::repr::{Carrier, CellId, Func, OpKind, Proj, RTerm, Root, ValueId};
 use crate::jir::semantic::{
     BinaryOp, BodySemantic, CallSemantic, Callee, CastKind, ConstTree, ItemId, StandardOperation,
@@ -525,6 +525,100 @@ pub(crate) fn is_immutable_u8_slice_ref(table: &TypeTable, ty: TypeId) -> bool {
     is_u8_slice_ref(table, ty)
 }
 
+pub(crate) fn item_origin_info<'a>(item: &'a LinkItem, interns: &'a Interns) -> (&'a str, &'a str) {
+    let path = item
+        .jir
+        .origins
+        .as_ref()
+        .and_then(|o| interns.str(o.item_path))
+        .unwrap_or("");
+    (item.crate_name.as_str(), path)
+}
+
+pub(crate) fn is_stdlib_string_op_path(crate_name: &str, item_path: &str) -> Option<BstrStringOp> {
+    match (crate_name, item_path) {
+        ("alloc", "string::String::is_empty") | (_, "alloc::string::String::is_empty") => {
+            Some(BstrStringOp::IsEmpty)
+        }
+        ("alloc", "string::String::reserve") | (_, "alloc::string::String::reserve") => {
+            Some(BstrStringOp::Reserve)
+        }
+        ("alloc", "string::String::reserve_exact") | (_, "alloc::string::String::reserve_exact") => {
+            Some(BstrStringOp::ReserveExact)
+        }
+        ("alloc", "string::String::as_bytes") | (_, "alloc::string::String::as_bytes") => {
+            Some(BstrStringOp::AsBytes)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn is_stdlib_str_as_bytes_path(crate_name: &str, item_path: &str) -> bool {
+    (crate_name == "core" && item_path == "str::<impl str>::as_bytes")
+        || item_path == "core::str::<impl str>::as_bytes"
+}
+
+pub(crate) fn is_stdlib_raw_vec_reserve_path(crate_name: &str, item_path: &str) -> bool {
+    let in_raw_vec = (crate_name == "alloc" && item_path.starts_with("raw_vec::RawVecInner::"))
+        || item_path.starts_with("alloc::raw_vec::RawVecInner::");
+    in_raw_vec && (item_path.ends_with("::reserve_exact") || item_path.ends_with("::reserve"))
+}
+
+pub(crate) fn is_raw_vec_reserve_in_table(
+    table: &BTreeMap<JsName, LinkItem>,
+    interns_map: &BTreeMap<JsName, &Interns>,
+    lowered: &BTreeMap<ItemId, JsName>,
+    item_id: ItemId,
+) -> bool {
+    let Some(name) = lowered.get(&item_id) else {
+        return false;
+    };
+    let (Some(item), Some(callee_interns)) = (table.get(name), interns_map.get(name).copied())
+    else {
+        return false;
+    };
+    let (crate_name, item_path) = item_origin_info(item, callee_interns);
+    is_stdlib_raw_vec_reserve_path(crate_name, item_path)
+}
+
+fn has_terminal_method(sym: &str, needle: &str) -> bool {
+    let mut idx = 0;
+    while let Some(pos) = sym[idx..].find(needle) {
+        let after = &sym[idx + pos + needle.len()..];
+        if after.is_empty() || after.starts_with("$h") {
+            return true;
+        }
+        idx += pos + needle.len();
+    }
+    false
+}
+
+pub(crate) fn is_raw_vec_reserve_by_link_name(
+    interns: &Interns,
+    items: Option<&crate::lower::js::host::ItemIndex>,
+    item_id: ItemId,
+    link_name: StrId,
+) -> bool {
+    let sym = items
+        .and_then(|m| m.get(&item_id))
+        .map(|e| e.name.as_str())
+        .or_else(|| interns.str(link_name))
+        .unwrap_or("");
+    sym.starts_with("alloc$raw_vec$")
+        && (has_terminal_method(sym, "_reserve_exact") || has_terminal_method(sym, "_reserve"))
+}
+
+fn is_stdlib_alloc_helper_path(crate_name: &str, item_path: &str) -> bool {
+    (crate_name == "alloc"
+        && (item_path.starts_with("raw_vec::") || item_path.starts_with("alloc::")))
+        || item_path.starts_with("alloc::raw_vec::")
+        || item_path.starts_with("alloc::alloc::")
+        || (crate_name == "core"
+            && (item_path.starts_with("panicking::") || item_path.starts_with("hint::")))
+        || item_path.starts_with("core::panicking::")
+        || item_path.starts_with("core::hint::")
+}
+
 /// Returns `true` for a trivial `&str -> &[u8]` wrapper (`core::str::<impl str>::as_bytes`),
 /// strictly under `crate::lower::bstr::enabled()`.
 pub(crate) fn is_trivial_str_as_bytes(
@@ -532,8 +626,13 @@ pub(crate) fn is_trivial_str_as_bytes(
     func: &Func,
     table: &TypeTable,
     interns: &Interns,
+    crate_name: &str,
+    item_path: &str,
 ) -> bool {
-    if !crate::lower::bstr::enabled() || semantic != BodySemantic::Ordinary {
+    if !crate::lower::bstr::enabled()
+        || semantic != BodySemantic::Ordinary
+        || !is_stdlib_str_as_bytes_path(crate_name, item_path)
+    {
         return false;
     }
     let abi = func.sig.abi;
@@ -813,28 +912,34 @@ pub(crate) fn lower_bstr_op(
     })
 }
 
-/// Structurally classifies a `BodySemantic::Ordinary` function into [`BstrStringOp`] from JIR
-/// types and ops alone (never inspects `debug_path`). Returns `None` whenever `bstr` is disabled.
-pub(crate) fn classify_bstr_op<'a, F>(
+/// Structurally classifies a stdlib `alloc::string::String` `BodySemantic::Ordinary` function into
+/// [`BstrStringOp`]. Restricted strictly to canonical `alloc::string::String::*` item paths and
+/// returns `None` whenever `bstr` is disabled.
+pub(crate) fn classify_bstr_op<'a, F, P>(
     semantic: BodySemantic,
     func: &Func,
     table: &TypeTable,
     interns: &Interns,
+    crate_name: &str,
+    item_path: &str,
     mut resolve_callee: F,
+    mut resolve_path: P,
 ) -> Option<BstrStringOp>
 where
     F: FnMut(ItemId) -> Option<&'a Func>,
+    P: FnMut(ItemId) -> Option<(&'a str, &'a str)>,
 {
     if !crate::lower::bstr::enabled() || semantic != BodySemantic::Ordinary {
         return None;
     }
+    let expected = is_stdlib_string_op_path(crate_name, item_path)?;
     let abi = func.sig.abi;
     if abi.spread.is_some() || abi.caller_location {
         return None;
     }
     let args = func.sig.arguments.as_slice();
-    match args {
-        [arg0] if abi.parameters == 1 && func.params.len() == 1 => {
+    match (expected, args) {
+        (BstrStringOp::IsEmpty, [arg0]) if abi.parameters == 1 && func.params.len() == 1 => {
             let TypeKind::Reference {
                 pointee,
                 mutable: false,
@@ -844,18 +949,25 @@ where
             };
             let parts = string_parts(table, interns, *pointee)?;
             let res_desc = table.get(table.peeled(func.sig.result))?;
-            if matches!(res_desc.kind, TypeKind::Bool) {
-                if classify_is_empty_body(func, &parts) {
-                    return Some(BstrStringOp::IsEmpty);
-                }
-            } else if is_u8_slice_ref(table, func.sig.result)
-                && classify_as_bytes_body(func, table, interns, &parts)
-            {
-                return Some(BstrStringOp::AsBytes);
-            }
-            None
+            (matches!(res_desc.kind, TypeKind::Bool) && classify_is_empty_body(func, &parts))
+                .then_some(BstrStringOp::IsEmpty)
         }
-        [arg0, arg1] if abi.parameters == 2 && func.params.len() == 2 => {
+        (BstrStringOp::AsBytes, [arg0]) if abi.parameters == 1 && func.params.len() == 1 => {
+            let TypeKind::Reference {
+                pointee,
+                mutable: false,
+            } = table.get(table.peeled(*arg0)).map(|d| &d.kind)?
+            else {
+                return None;
+            };
+            let parts = string_parts(table, interns, *pointee)?;
+            (is_u8_slice_ref(table, func.sig.result)
+                && classify_as_bytes_body(func, table, interns, &parts))
+            .then_some(BstrStringOp::AsBytes)
+        }
+        (BstrStringOp::Reserve | BstrStringOp::ReserveExact, [arg0, arg1])
+            if abi.parameters == 2 && func.params.len() == 2 =>
+        {
             let TypeKind::Reference {
                 pointee,
                 mutable: true,
@@ -873,7 +985,23 @@ where
             {
                 return None;
             }
-            classify_reserve_body(func, table, &parts, &mut resolve_callee)
+            let classified = classify_reserve_body(
+                func,
+                table,
+                interns,
+                &parts,
+                &mut resolve_callee,
+                &mut resolve_path,
+            )?;
+            match (expected, classified) {
+                (BstrStringOp::Reserve, BstrStringOp::Reserve | BstrStringOp::ReserveExact) => {
+                    Some(BstrStringOp::Reserve)
+                }
+                (BstrStringOp::ReserveExact, BstrStringOp::ReserveExact) => {
+                    Some(BstrStringOp::ReserveExact)
+                }
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -1259,14 +1387,17 @@ fn classify_vec_subpath(rest: &[Proj], parts: &StringParts) -> Option<VecProjKin
     }
 }
 
-fn classify_reserve_body<'a, F>(
+fn classify_reserve_body<'a, F, P>(
     func: &Func,
     table: &TypeTable,
+    interns: &Interns,
     parts: &StringParts,
     resolve_callee: &mut F,
+    resolve_path: &mut P,
 ) -> Option<BstrStringOp>
 where
     F: FnMut(ItemId) -> Option<&'a Func>,
+    P: FnMut(ItemId) -> Option<(&'a str, &'a str)>,
 {
     let (v0, v1) = (func.params[0], func.params[1]);
     // Form A: single-block wrapper `Vec::reserve(&mut self.vec, additional)` or 1-hop `Vec::reserve_exact`.
@@ -1337,7 +1468,17 @@ where
                         && vec_mut.contains(&args[0])
                         && add_vals.contains(&args[1]) =>
                     {
-                        forwarded_vec_exact = Some(*item);
+                        let stdlib_vec_reserve = resolve_path(*item).is_some_and(|(c, p)| {
+                            ((c == "alloc" && p.starts_with("vec::Vec::"))
+                                || p.starts_with("alloc::vec::Vec::"))
+                                && (p.ends_with("::reserve_exact") || p.ends_with("::reserve"))
+                        });
+                        if stdlib_vec_reserve {
+                            forwarded_vec_exact = Some(*item);
+                        } else {
+                            form_a_ok = false;
+                            break;
+                        }
                     }
                     OpKind::Const(ConstTree::Unit) => {}
                     _ => {
@@ -1356,7 +1497,14 @@ where
                             && vec_func.sig.abi.parameters == 2
                             && !vec_func.sig.abi.caller_location
                             && vec_func.sig.abi.spread.is_none()
-                            && classify_reserve_raw_inner(vec_func, table, parts, false)
+                            && classify_reserve_raw_inner(
+                                vec_func,
+                                table,
+                                interns,
+                                parts,
+                                false,
+                                resolve_path,
+                            )
                         {
                             return Some(BstrStringOp::ReserveExact);
                         }
@@ -1366,207 +1514,372 @@ where
         }
     }
 
-    if classify_reserve_raw_inner(func, table, parts, true) {
+    if classify_reserve_raw_inner(func, table, interns, parts, true, resolve_path) {
         Some(BstrStringOp::ReserveExact)
     } else {
         None
     }
 }
 
-fn classify_reserve_raw_inner(
+fn classify_reserve_raw_inner<'a, P>(
     func: &Func,
     table: &TypeTable,
+    interns: &Interns,
     parts: &StringParts,
     receiver_is_string: bool,
-) -> bool {
+    resolve_path: &mut P,
+) -> bool
+where
+    P: FnMut(ItemId) -> Option<(&'a str, &'a str)>,
+{
     // Form B: MIR-inlined `RawVec::reserve_exact` / `reserve` on `(&mut String | &mut Vec<u8>, additional: usize)`.
     // Soundness invariants:
-    // 1. Receiver is ONLY projected into `vec.len` (read-only!) and `vec.buf` (raw buffer), never
-    //    mutating `vec.len`, creating `&str`/`&[u8]`, pushing, or escaping `&String`/`&mut Vec`.
-    // 2. `additional` (`v1`) enters capacity arithmetic (`Add`/`AddWithOverflow` with `len`, or
-    //    comparison against `cap - len`).
-    // 3. A `&mut RawVec*` call exists (not arbitrary `&mut String`/`&mut Vec` user code).
+    // 1. Fixed-point tracking across ops AND CFG block-param edges (`Deref(v0) -> Field(vec) -> Field(len)`
+    //    and `BorrowView` paths). Receiver/vec/len refs never escape or get written.
+    // 2. `additional` (`v1`) enters capacity arithmetic (`Add*` with `len`, or `cap - len`).
+    // 3. Strict op/call whitelist: ONLY pure ops, `cold_path`/`likely`/`unlikely`/`assume` intrinsics,
+    //    `StoreThrough` strictly into `buf_refs`, and direct calls to `alloc::raw_vec`/`alloc::alloc`/
+    //    `core::panicking`/`core::hint` helpers (with at least one grow call taking a `buf_ref`/`buf_val`).
     let (v0, v1) = (func.params[0], func.params[1]);
+    let block_map: BTreeMap<crate::jir::repr::RBlockId, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
     let mut recv_refs = BTreeSet::from([v0]);
+    let mut recv_vals = BTreeSet::new();
+    let mut vec_refs = BTreeSet::new();
+    let mut vec_vals = BTreeSet::new();
     let mut len_refs = BTreeSet::new();
     let mut len_vals = BTreeSet::new();
     let mut buf_refs = BTreeSet::new();
-    let mut add_vals = BTreeSet::from([v1]);
+    let mut buf_vals = BTreeSet::new();
     let mut cap_vals = BTreeSet::new();
-    let mut saw_add_or_sub = false;
-    let mut saw_raw_grow_call = false;
+    let mut add_vals = BTreeSet::from([v1]);
 
-    for block in &func.blocks {
-        for &p in &block.params {
-            let Some(p_ty) = func.ty(p) else { return false };
-            if p_ty == func.sig.arguments[0] {
-                recv_refs.insert(p);
-            } else if !unsigned_bits_opt(table, Some(p_ty))
-                && !table.get(p_ty).is_some_and(|d| {
-                    matches!(d.kind, TypeKind::RawPointer { .. } | TypeKind::Reference { .. })
-                })
-            {
-                return false;
-            }
-        }
-        for op in &block.ops {
-            match &op.kind {
-                OpKind::Copy(s) | OpKind::Move(s) => {
-                    if let Some(r) = op.result {
-                        if recv_refs.contains(s) {
-                            recv_refs.insert(r);
-                        } else if len_refs.contains(s) {
-                            len_refs.insert(r);
-                        } else if len_vals.contains(s) {
-                            len_vals.insert(r);
-                        } else if buf_refs.contains(s) {
-                            buf_refs.insert(r);
-                        } else if add_vals.contains(s) {
-                            add_vals.insert(r);
-                        } else if cap_vals.contains(s) {
-                            cap_vals.insert(r);
+    fn prop(set: &mut BTreeSet<ValueId>, from: ValueId, to: ValueId) -> bool {
+        set.contains(&from) && set.insert(to)
+    }
+
+    let max_iters = func.values.len().saturating_add(4);
+    for _ in 0..max_iters {
+        let mut changed = false;
+        for block in &func.blocks {
+            for op in &block.ops {
+                let Some(r) = op.result else { continue };
+                match &op.kind {
+                    OpKind::Copy(s) | OpKind::Move(s) => {
+                        changed |= prop(&mut recv_refs, *s, r);
+                        changed |= prop(&mut recv_vals, *s, r);
+                        changed |= prop(&mut vec_refs, *s, r);
+                        changed |= prop(&mut vec_vals, *s, r);
+                        changed |= prop(&mut len_refs, *s, r);
+                        changed |= prop(&mut len_vals, *s, r);
+                        changed |= prop(&mut buf_refs, *s, r);
+                        changed |= prop(&mut buf_vals, *s, r);
+                        changed |= prop(&mut cap_vals, *s, r);
+                        changed |= prop(&mut add_vals, *s, r);
+                    }
+                    OpKind::Cast { v, .. } => {
+                        changed |= prop(&mut len_vals, *v, r);
+                        changed |= prop(&mut add_vals, *v, r);
+                        changed |= prop(&mut cap_vals, *v, r);
+                        changed |= prop(&mut buf_refs, *v, r);
+                        if buf_vals.contains(v) && unsigned_bits_opt(table, func.ty(r)) {
+                            changed |= cap_vals.insert(r);
                         }
                     }
-                }
-                OpKind::BorrowView {
-                    root: Root::Value(s),
-                    path,
-                    mutable,
-                }
-                | OpKind::RawView {
-                    root: Root::Value(s),
-                    path,
-                    mutable,
-                } if recv_refs.contains(s) => {
-                    let Some(r) = op.result else { return false };
-                    let rest = match path.as_slice() {
-                        [] | [Proj::Deref] => {
-                            recv_refs.insert(r);
-                            continue;
-                        }
-                        [Proj::Deref, rest @ ..] => rest,
-                        rest => rest,
-                    };
-                    let vec_tail = if receiver_is_string {
-                        match rest {
-                            [Proj::Field { field: f, .. }, tail @ ..] if *f == parts.vec_field => {
-                                if tail.is_empty() {
-                                    recv_refs.insert(r);
+                    OpKind::BorrowView {
+                        root: Root::Value(s),
+                        path,
+                        mutable,
+                    }
+                    | OpKind::RawView {
+                        root: Root::Value(s),
+                        path,
+                        mutable,
+                    } => {
+                        if recv_refs.contains(s) {
+                            let rest = match path.as_slice() {
+                                [] | [Proj::Deref] => {
+                                    changed |= recv_refs.insert(r);
                                     continue;
                                 }
-                                tail
+                                [Proj::Deref, rest @ ..] => rest,
+                                rest => rest,
+                            };
+                            let vec_tail = if receiver_is_string {
+                                match rest {
+                                    [Proj::Field { field: f, .. }, tail @ ..]
+                                        if *f == parts.vec_field =>
+                                    {
+                                        if tail.is_empty() {
+                                            changed |= vec_refs.insert(r);
+                                            continue;
+                                        }
+                                        tail
+                                    }
+                                    _ => return false,
+                                }
+                            } else {
+                                rest
+                            };
+                            match vec_tail {
+                                [Proj::Field { field: f2, .. }]
+                                    if *f2 == parts.len_field && !*mutable =>
+                                {
+                                    changed |= len_refs.insert(r);
+                                }
+                                [Proj::Field { field: f2, .. }, tail @ ..]
+                                    if *f2 == parts.buf_field
+                                        && tail.iter().all(|p| {
+                                            matches!(p, Proj::Field { .. } | Proj::Deref)
+                                        }) =>
+                                {
+                                    changed |= buf_refs.insert(r);
+                                }
+                                _ => return false,
                             }
-                            _ => return false,
+                        } else if vec_refs.contains(s) {
+                            let rest = match path.as_slice() {
+                                [] | [Proj::Deref] => {
+                                    changed |= vec_refs.insert(r);
+                                    continue;
+                                }
+                                [Proj::Deref, rest @ ..] => rest,
+                                rest => rest,
+                            };
+                            match rest {
+                                [Proj::Field { field: f2, .. }]
+                                    if *f2 == parts.len_field && !*mutable =>
+                                {
+                                    changed |= len_refs.insert(r);
+                                }
+                                [Proj::Field { field: f2, .. }, tail @ ..]
+                                    if *f2 == parts.buf_field
+                                        && tail.iter().all(|p| {
+                                            matches!(p, Proj::Field { .. } | Proj::Deref)
+                                        }) =>
+                                {
+                                    changed |= buf_refs.insert(r);
+                                }
+                                _ => return false,
+                            }
+                        } else if buf_refs.contains(s) {
+                            if !path
+                                .iter()
+                                .all(|p| matches!(p, Proj::Field { .. } | Proj::Deref))
+                            {
+                                return false;
+                            }
+                            changed |= buf_refs.insert(r);
                         }
-                    } else {
-                        rest
+                    }
+                    OpKind::Deref(ptr) => {
+                        if recv_refs.contains(ptr) {
+                            changed |= recv_vals.insert(r);
+                            if !receiver_is_string {
+                                changed |= vec_vals.insert(r);
+                            }
+                        } else if vec_refs.contains(ptr) {
+                            changed |= vec_vals.insert(r);
+                        } else if len_refs.contains(ptr) {
+                            changed |= len_vals.insert(r);
+                        } else if buf_refs.contains(ptr) {
+                            if unsigned_bits_opt(table, func.ty(r)) {
+                                changed |= cap_vals.insert(r);
+                            } else {
+                                changed |= buf_vals.insert(r);
+                            }
+                        }
+                    }
+                    OpKind::Field { base, field, .. } => {
+                        if recv_vals.contains(base) && receiver_is_string {
+                            if *field == parts.vec_field {
+                                changed |= vec_vals.insert(r);
+                            } else {
+                                return false;
+                            }
+                        } else if vec_vals.contains(base) {
+                            if *field == parts.len_field {
+                                changed |= len_vals.insert(r);
+                            } else if *field == parts.buf_field {
+                                changed |= buf_vals.insert(r);
+                            } else {
+                                return false;
+                            }
+                        } else if buf_vals.contains(base) {
+                            if unsigned_bits_opt(table, func.ty(r)) {
+                                changed |= cap_vals.insert(r);
+                            } else {
+                                changed |= buf_vals.insert(r);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut propagate_edge = |target: crate::jir::repr::RBlockId, args: &[ValueId], changed: &mut bool| {
+                let Some(&bi) = block_map.get(&target) else {
+                    return;
+                };
+                let params = &func.blocks[bi].params;
+                for (&arg, &param) in args.iter().zip(params.iter()) {
+                    *changed |= prop(&mut recv_refs, arg, param);
+                    *changed |= prop(&mut recv_vals, arg, param);
+                    *changed |= prop(&mut vec_refs, arg, param);
+                    *changed |= prop(&mut vec_vals, arg, param);
+                    *changed |= prop(&mut len_refs, arg, param);
+                    *changed |= prop(&mut len_vals, arg, param);
+                    *changed |= prop(&mut buf_refs, arg, param);
+                    *changed |= prop(&mut buf_vals, arg, param);
+                    *changed |= prop(&mut cap_vals, arg, param);
+                    *changed |= prop(&mut add_vals, arg, param);
+                }
+            };
+            match &block.term {
+                RTerm::Goto(target, args) => propagate_edge(*target, args, &mut changed),
+                RTerm::Switch { cases, default, .. } => {
+                    for (_, target, args) in cases {
+                        propagate_edge(*target, args, &mut changed);
+                    }
+                    propagate_edge(default.0, &default.1, &mut changed);
+                }
+                _ => {}
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let protected = |u: &ValueId| {
+        recv_refs.contains(u)
+            || recv_vals.contains(u)
+            || vec_refs.contains(u)
+            || vec_vals.contains(u)
+            || len_refs.contains(u)
+    };
+    let mut tracked_defs = BTreeSet::new();
+    tracked_defs.extend(recv_refs.iter().copied());
+    tracked_defs.extend(recv_vals.iter().copied());
+    tracked_defs.extend(vec_refs.iter().copied());
+    tracked_defs.extend(vec_vals.iter().copied());
+    tracked_defs.extend(len_refs.iter().copied());
+    tracked_defs.extend(len_vals.iter().copied());
+    tracked_defs.extend(buf_refs.iter().copied());
+    tracked_defs.extend(buf_vals.iter().copied());
+    tracked_defs.extend(cap_vals.iter().copied());
+
+    let mut saw_add_or_sub = false;
+    let mut saw_raw_grow_call = false;
+    for block in &func.blocks {
+        for op in &block.ops {
+            match &op.kind {
+                OpKind::Const(_)
+                | OpKind::Copy(_)
+                | OpKind::Move(_)
+                | OpKind::Cast { .. }
+                | OpKind::Unary { .. }
+                | OpKind::Aggregate { .. }
+                | OpKind::Discriminant(_)
+                | OpKind::Assert { .. } => {
+                    let is_tracked_prop = op.result.is_some_and(|r| tracked_defs.contains(&r));
+                    if !is_tracked_prop && op.kind.uses().iter().any(protected) {
+                        return false;
+                    }
+                }
+                OpKind::BorrowView { .. }
+                | OpKind::RawView { .. }
+                | OpKind::Deref(_)
+                | OpKind::Field { .. } => {
+                    let is_tracked_prop = op.result.is_some_and(|r| tracked_defs.contains(&r));
+                    if !is_tracked_prop && op.kind.uses().iter().any(protected) {
+                        return false;
+                    }
+                }
+                OpKind::Binary {
+                    op: bin_op,
+                    l,
+                    r,
+                    ..
+                } => {
+                    if protected(l) || protected(r) {
+                        return false;
+                    }
+                    match bin_op {
+                        BinaryOp::Add | BinaryOp::AddWithOverflow | BinaryOp::AddUnchecked => {
+                            if (len_vals.contains(l) && add_vals.contains(r))
+                                || (len_vals.contains(r) && add_vals.contains(l))
+                            {
+                                saw_add_or_sub = true;
+                            }
+                        }
+                        BinaryOp::Sub | BinaryOp::SubWithOverflow | BinaryOp::SubUnchecked => {
+                            if cap_vals.contains(l) && len_vals.contains(r) {
+                                saw_add_or_sub = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                OpKind::StoreThrough { ptr, v } => {
+                    if !buf_refs.contains(ptr) || protected(v) {
+                        return false;
+                    }
+                }
+                OpKind::Intrinsic { name, args, .. } => {
+                    if !matches!(
+                        interns.str(*name),
+                        Some("cold_path" | "likely" | "unlikely" | "assume")
+                    ) {
+                        return false;
+                    }
+                    if args.iter().any(protected) {
+                        return false;
+                    }
+                }
+                OpKind::Call {
+                    callee: Callee::Direct { item, .. },
+                    args,
+                    semantic,
+                    host: None,
+                    ..
+                } => {
+                    if !matches!(semantic, CallSemantic::Ordinary | CallSemantic::GlobalAllocator) {
+                        return false;
+                    }
+                    if args.iter().any(protected) {
+                        return false;
+                    }
+                    let Some((c, p)) = resolve_path(*item) else {
+                        return false;
                     };
-                    match vec_tail {
-                        [Proj::Field { field: f2, .. }] if *f2 == parts.len_field && !*mutable => {
-                            len_refs.insert(r);
-                        }
-                        [Proj::Field { field: f2, .. }, tail @ ..]
-                            if *f2 == parts.buf_field
-                                && tail
-                                    .iter()
-                                    .all(|p| matches!(p, Proj::Field { .. } | Proj::Deref)) =>
-                        {
-                            buf_refs.insert(r);
-                        }
-                        _ => return false,
-                    }
-                }
-                OpKind::BorrowView {
-                    root: Root::Value(s),
-                    path,
-                    ..
-                }
-                | OpKind::RawView {
-                    root: Root::Value(s),
-                    path,
-                    ..
-                } if buf_refs.contains(s) => {
-                    if !path
-                        .iter()
-                        .all(|p| matches!(p, Proj::Field { .. } | Proj::Deref))
-                    {
+                    if !is_stdlib_alloc_helper_path(c, p) {
                         return false;
                     }
-                    if let Some(r) = op.result {
-                        buf_refs.insert(r);
-                    }
-                }
-                OpKind::Field { base: v, .. } if len_refs.contains(v) => return false,
-                OpKind::Field { base: v, .. } if buf_refs.contains(v) => {
-                    if let Some(r) = op.result {
-                        if unsigned_bits_opt(table, func.ty(r)) {
-                            cap_vals.insert(r);
-                        } else {
-                            buf_refs.insert(r);
-                        }
-                    }
-                }
-                OpKind::Deref(ptr) if len_refs.contains(ptr) => {
-                    if let Some(r) = op.result {
-                        len_vals.insert(r);
-                    }
-                }
-                OpKind::Deref(ptr) if buf_refs.contains(ptr) => {
-                    if let Some(r) = op.result {
-                        if unsigned_bits_opt(table, func.ty(r)) {
-                            cap_vals.insert(r);
-                        } else {
-                            buf_refs.insert(r);
-                        }
-                    }
-                }
-                OpKind::StoreThrough { ptr, .. } if len_refs.contains(ptr) => return false,
-                OpKind::Binary {
-                    op: BinaryOp::Add | BinaryOp::AddWithOverflow | BinaryOp::AddUnchecked,
-                    l,
-                    r,
-                    ..
-                } => {
-                    if (len_vals.contains(l) && add_vals.contains(r))
-                        || (len_vals.contains(r) && add_vals.contains(l))
-                    {
-                        saw_add_or_sub = true;
-                    }
-                }
-                OpKind::Binary {
-                    op: BinaryOp::Sub | BinaryOp::SubWithOverflow | BinaryOp::SubUnchecked,
-                    l,
-                    r,
-                    ..
-                } => {
-                    if cap_vals.contains(l) && len_vals.contains(r) {
-                        saw_add_or_sub = true;
-                    }
-                }
-                OpKind::SliceView { .. } => return false,
-                OpKind::Call { args, semantic, .. } => {
-                    if !matches!(semantic, CallSemantic::Ordinary | CallSemantic::GlobalAllocator)
-                    {
-                        return false;
-                    }
-                    if args.iter().any(|a| recv_refs.contains(a) || len_refs.contains(a)) {
-                        return false;
-                    }
-                    if args.iter().any(|a| buf_refs.contains(a)) {
+                    if args.iter().any(|a| buf_refs.contains(a) || buf_vals.contains(a)) {
                         saw_raw_grow_call = true;
                     }
                 }
-                _ => {
-                    if op
-                        .kind
-                        .uses()
-                        .iter()
-                        .any(|u| recv_refs.contains(u) || len_refs.contains(u))
-                    {
-                        return false;
-                    }
+                _ => return false,
+            }
+        }
+        match &block.term {
+            RTerm::Goto(_, _) | RTerm::Switch { .. } | RTerm::Unreachable => {}
+            RTerm::Return(None) => {}
+            RTerm::Return(Some(v)) if !protected(v) && !buf_refs.contains(v) && !buf_vals.contains(v) => {
+                let is_unit = func
+                    .ty(*v)
+                    .and_then(|t| table.get(table.peeled(t)))
+                    .is_some_and(|d| d.layout.zst && matches!(&d.kind, TypeKind::Tuple(f) if f.is_empty()));
+                if !is_unit {
+                    return false;
                 }
             }
+            _ => return false,
         }
     }
     saw_add_or_sub && saw_raw_grow_call
@@ -1641,12 +1954,66 @@ impl VecUf {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InlNodeKind {
+    StringVal,
     VecRef,
     LenRef,
     LenVal,
     BufChain,
     DataPtr,
     SliceVal,
+}
+
+fn const_align_is_one(tree: &ConstTree) -> bool {
+    match tree {
+        ConstTree::Scalar { bits, .. } => *bits == 1,
+        ConstTree::Variant { variant, fields } => *variant == 0 && fields.is_empty(),
+        ConstTree::Aggregate(fields) => fields.len() == 1 && const_align_is_one(&fields[0]),
+        _ => false,
+    }
+}
+
+fn is_byte_layout_const(tree: &ConstTree) -> bool {
+    match tree {
+        ConstTree::Aggregate(fields) if fields.len() == 2 => {
+            matches!(fields[0], ConstTree::Scalar { bits: 1, .. }) && const_align_is_one(&fields[1])
+        }
+        _ => false,
+    }
+}
+
+fn is_byte_layout_operand(
+    func: &Func,
+    op_of_res: &[Option<(usize, usize)>],
+    v: ValueId,
+) -> bool {
+    let mut cur = v;
+    for _ in 0..16 {
+        let Some(&(bi, oi)) = op_of_res.get(cur.0 as usize).and_then(|x| x.as_ref()) else {
+            return false;
+        };
+        let Some(op) = func.blocks.get(bi).and_then(|b| b.ops.get(oi)) else {
+            return false;
+        };
+        match &op.kind {
+            OpKind::Const(tree) => return is_byte_layout_const(tree),
+            OpKind::Copy(src) | OpKind::Move(src) => cur = *src,
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn root_is_direct_ref(func: &Func, table: &TypeTable, root: Root) -> bool {
+    let ty = match root {
+        Root::Cell(c) => func.cells.get(c.0 as usize).map(|cd| cd.ty),
+        Root::Value(v) => func.ty(v),
+    };
+    ty.is_some_and(|t| {
+        matches!(
+            table.get(table.peeled(t)).map(|d| &d.kind),
+            Some(TypeKind::Reference { .. } | TypeKind::RawPointer { .. })
+        )
+    })
 }
 
 fn canonical_string_root(
@@ -1712,12 +2079,31 @@ fn canonical_string_root(
 /// Identifies closed MIR-inlined `String.vec` operations (`len`/`is_empty`, `reserve`, `as_bytes`)
 /// inside any function, strictly gated behind `crate::lower::bstr::enabled()`.
 /// Disqualifies any component whose intermediate values escape outside the whitelist.
-pub(crate) fn analyze_inlined_string_vec(
+pub(crate) fn analyze_inlined_string_vec<P>(
     func: &Func,
     table: &TypeTable,
     interns: &Interns,
-) -> Option<InlinedStringVecAnalysis> {
-    if !crate::lower::bstr::enabled() || func.values.is_empty() {
+    is_raw_vec_reserve: P,
+) -> Option<InlinedStringVecAnalysis>
+where
+    P: FnMut(ItemId, StrId) -> bool,
+{
+    if !crate::lower::bstr::enabled() {
+        return None;
+    }
+    analyze_inlined_string_vec_inner(func, table, interns, is_raw_vec_reserve)
+}
+
+fn analyze_inlined_string_vec_inner<P>(
+    func: &Func,
+    table: &TypeTable,
+    interns: &Interns,
+    mut is_raw_vec_reserve: P,
+) -> Option<InlinedStringVecAnalysis>
+where
+    P: FnMut(ItemId, StrId) -> bool,
+{
+    if func.values.is_empty() {
         return None;
     }
     let n = func.values.len();
@@ -1727,6 +2113,7 @@ pub(crate) fn analyze_inlined_string_vec(
     let mut poisoned = vec![false; n];
     let mut is_mut_node = vec![false; n];
     let mut valid_def = vec![false; n];
+    let mut is_deref_def = vec![false; n];
     let mut op_of_res: Vec<Option<(usize, usize)>> = vec![None; n];
     let mut reserve_site: Vec<Option<(usize, usize, ValueId)>> = vec![None; n];
 
@@ -1734,6 +2121,9 @@ pub(crate) fn analyze_inlined_string_vec(
         for (oi, op) in block.ops.iter().enumerate() {
             if let Some(res) = op.result {
                 op_of_res[res.0 as usize] = Some((bi, oi));
+                if matches!(op.kind, OpKind::Deref(_)) {
+                    is_deref_def[res.0 as usize] = true;
+                }
             }
         }
     }
@@ -1755,7 +2145,7 @@ pub(crate) fn analyze_inlined_string_vec(
                             canonical_string_root(func, table, *root)
                         {
                             if let Some(parts) = string_parts(table, interns, str_ty) {
-                                let rest = if is_ref {
+                                let rest = if root_is_direct_ref(func, table, *root) {
                                     match path.as_slice() {
                                         [Proj::Deref, tail @ ..] => tail,
                                         tail => tail,
@@ -1787,6 +2177,14 @@ pub(crate) fn analyze_inlined_string_vec(
                                 let (_, _, str_ty) = node_root[s].unwrap();
                                 let parts = string_parts(table, interns, str_ty).unwrap();
                                 let nk = match (src_k, path.as_slice()) {
+                                    (InlNodeKind::StringVal, p) => {
+                                        match classify_vec_subpath(p, &parts) {
+                                            Some(VecProjKind::Vec) => Some(InlNodeKind::VecRef),
+                                            Some(VecProjKind::Len) => Some(InlNodeKind::LenRef),
+                                            Some(VecProjKind::Buf) => Some(InlNodeKind::BufChain),
+                                            _ => None,
+                                        }
+                                    }
                                     (InlNodeKind::VecRef, [] | [Proj::Deref]) => {
                                         Some(InlNodeKind::VecRef)
                                     }
@@ -1832,24 +2230,13 @@ pub(crate) fn analyze_inlined_string_vec(
                     }
                     OpKind::Field { base: v, field, .. } => {
                         let s = v.0 as usize;
-                        if let Some((s_root, is_ref, str_ty)) =
-                            canonical_string_root(func, table, Root::Value(*v))
-                        {
-                            if !is_ref
-                                && string_parts(table, interns, str_ty)
-                                    .is_some_and(|p| p.vec_field == *field)
-                            {
-                                node_kind[r] = Some(InlNodeKind::VecRef);
-                                node_root[r] = Some((s_root, false, str_ty));
-                                valid_def[r] = true;
-                                changed = true;
-                                continue;
-                            }
-                        }
                         if let Some(src_k) = node_kind[s] {
                             let (_, _, str_ty) = node_root[s].unwrap();
                             let parts = string_parts(table, interns, str_ty).unwrap();
                             let nk = match src_k {
+                                InlNodeKind::StringVal if *field == parts.vec_field => {
+                                    Some(InlNodeKind::VecRef)
+                                }
                                 InlNodeKind::VecRef if *field == parts.len_field => {
                                     Some(InlNodeKind::LenVal)
                                 }
@@ -1865,6 +2252,22 @@ pub(crate) fn analyze_inlined_string_vec(
                                 node_root[r] = node_root[s];
                                 valid_def[r] = true;
                                 changed = true;
+                                continue;
+                            }
+                        }
+                        if !is_deref_def[s] {
+                            if let Some((s_root, is_ref, str_ty)) =
+                                canonical_string_root(func, table, Root::Value(*v))
+                            {
+                                if !is_ref
+                                    && string_parts(table, interns, str_ty)
+                                        .is_some_and(|p| p.vec_field == *field)
+                                {
+                                    node_kind[r] = Some(InlNodeKind::VecRef);
+                                    node_root[r] = Some((s_root, false, str_ty));
+                                    valid_def[r] = true;
+                                    changed = true;
+                                }
                             }
                         }
                     }
@@ -1896,6 +2299,15 @@ pub(crate) fn analyze_inlined_string_vec(
                                 uf.union(s, r);
                                 node_kind[r] = Some(nk);
                                 node_root[r] = node_root[s];
+                                valid_def[r] = true;
+                                changed = true;
+                            }
+                        } else if root_is_direct_ref(func, table, Root::Value(*ptr)) {
+                            if let Some((s_root, is_ref, str_ty)) =
+                                canonical_string_root(func, table, Root::Value(*ptr))
+                            {
+                                node_kind[r] = Some(InlNodeKind::StringVal);
+                                node_root[r] = Some((s_root, is_ref, str_ty));
                                 valid_def[r] = true;
                                 changed = true;
                             }
@@ -2050,6 +2462,31 @@ pub(crate) fn analyze_inlined_string_vec(
                 {
                     let v0 = args[0].0 as usize;
                     reserve_site[v0] = Some((bi, oi, args[1]));
+                    is_mut_node[v0] = true;
+                    continue;
+                }
+            }
+            if let OpKind::Call {
+                callee: Callee::Direct { item, link_name },
+                args,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+                ..
+            } = &op.kind
+            {
+                if args.len() == 4
+                    && is_raw_vec_reserve(*item, *link_name)
+                    && node_kind[args[0].0 as usize] == Some(InlNodeKind::BufChain)
+                    && node_kind[args[1].0 as usize] == Some(InlNodeKind::LenVal)
+                    && node_kind[args[2].0 as usize].is_none()
+                    && node_root[args[0].0 as usize].map(|x| x.0)
+                        == node_root[args[1].0 as usize].map(|x| x.0)
+                    && is_byte_layout_operand(func, &op_of_res, args[3])
+                {
+                    let v0 = args[0].0 as usize;
+                    let v1 = args[1].0 as usize;
+                    uf.union(v0, v1);
+                    reserve_site[v0] = Some((bi, oi, args[2]));
                     is_mut_node[v0] = true;
                     continue;
                 }
@@ -2466,15 +2903,26 @@ mod bstr_tests {
             BodySemantic::Ordinary,
             &f_str_as_bytes,
             &table,
-            &interns
+            &interns,
+            "core",
+            "core::str::<impl str>::as_bytes",
         ));
         assert_eq!(
-            classify_bstr_op(BodySemantic::Ordinary, &f_empty, &table, &interns, |_| None),
+            classify_bstr_op(
+                BodySemantic::Ordinary,
+                &f_empty,
+                &table,
+                &interns,
+                "alloc",
+                "alloc::string::String::is_empty",
+                |_| None,
+                |_| None,
+            ),
             None
         );
         let cx = bstr_cx(&sig_is_empty, &table, &interns);
         assert!(lower_bstr_op(BstrStringOp::IsEmpty, &cx, &[Carrier::HostString]).is_err());
-        assert!(analyze_inlined_string_vec(&f_empty, &table, &interns).is_none());
+        assert!(analyze_inlined_string_vec(&f_empty, &table, &interns, |_, _| false).is_none());
     }
 
     #[test]
@@ -2637,7 +3085,14 @@ mod bstr_tests {
         );
         b_vec.terminate(ev, RTerm::Return(None));
         assert_eq!(
-            classify_reserve_body(&b_vec.finish(), &table, &parts, &mut |_| None),
+            classify_reserve_body(
+                &b_vec.finish(),
+                &table,
+                &interns,
+                &parts,
+                &mut |_| None,
+                &mut |_| None,
+            ),
             Some(BstrStringOp::Reserve)
         );
 
@@ -2716,7 +3171,15 @@ mod bstr_tests {
         ba.terminate(ea, RTerm::Return(None));
         let fa = ba.finish();
         assert_eq!(
-            classify_reserve_body(&fa, &table, &parts, &mut |_| None),
+            classify_reserve_body(
+                &fa,
+                &table,
+                &interns,
+                &parts,
+                &mut |_| None,
+                &mut |id| (id == item(900))
+                    .then_some(("alloc", "alloc::raw_vec::RawVecInner::<Global>::finish_grow")),
+            ),
             Some(BstrStringOp::ReserveExact)
         );
 
@@ -2825,9 +3288,18 @@ mod bstr_tests {
         bo.terminate(eo, RTerm::Return(None));
         let f_outer = bo.finish();
         assert_eq!(
-            classify_reserve_body(&f_outer, &table, &parts, &mut |id| {
-                (id == item(21)).then_some(&f_inner)
-            }),
+            classify_reserve_body(
+                &f_outer,
+                &table,
+                &interns,
+                &parts,
+                &mut |id| (id == item(21)).then_some(&f_inner),
+                &mut |id| match id.definition.local_hash {
+                    21 => Some(("alloc", "alloc::vec::Vec::<u8>::reserve_exact")),
+                    901 => Some(("alloc", "alloc::raw_vec::RawVecInner::<Global>::finish_grow")),
+                    _ => None,
+                },
+            ),
             Some(BstrStringOp::ReserveExact)
         );
 
@@ -2866,7 +3338,14 @@ mod bstr_tests {
         );
         bbad.terminate(eb, RTerm::Return(None));
         assert_eq!(
-            classify_reserve_body(&bbad.finish(), &table, &parts, &mut |_| None),
+            classify_reserve_body(
+                &bbad.finish(),
+                &table,
+                &interns,
+                &parts,
+                &mut |_| None,
+                &mut |_| None,
+            ),
             None
         );
 
@@ -2973,5 +3452,345 @@ mod bstr_tests {
             assert!(printed.contains(expected_substr), "{printed}");
             assert!(helpers.contains("bstr_bytes"), "{helpers:?}");
         }
+    }
+
+    #[test]
+    fn bstr_stdlib_path_whitelist_and_side_effect_rejection() {
+        let (table, interns) = build_table();
+        let parts = string_parts(&table, &interns, STRING).expect("canonical String parts");
+
+        // Exact user-defined `reserve_and_count` shape MUST NOT match stdlib path allowlist.
+        assert_eq!(
+            is_stdlib_string_op_path("my_crate", "my_crate::reserve_and_count"),
+            None
+        );
+        assert_eq!(
+            is_stdlib_string_op_path("my_crate", "alloc::string::String::reserve_exact"),
+            Some(BstrStringOp::ReserveExact)
+        );
+        assert_eq!(
+            is_stdlib_string_op_path("alloc", "string::String::reserve"),
+            Some(BstrStringOp::Reserve)
+        );
+        assert!(!is_stdlib_str_as_bytes_path("my_crate", "my_crate::as_bytes"));
+        assert!(is_stdlib_str_as_bytes_path("core", "str::<impl str>::as_bytes"));
+        assert!(is_stdlib_str_as_bytes_path(
+            "my_crate",
+            "core::str::<impl str>::as_bytes"
+        ));
+        assert!(is_stdlib_raw_vec_reserve_path(
+            "alloc",
+            "raw_vec::RawVecInner::<A>::reserve_exact"
+        ));
+        assert!(is_stdlib_raw_vec_reserve_path(
+            "my_crate",
+            "alloc::raw_vec::RawVecInner::<A>::reserve_exact"
+        ));
+        assert!(!is_stdlib_raw_vec_reserve_path(
+            "my_crate",
+            "my_crate::RawVecInner::reserve_exact"
+        ));
+
+        // Even inside `String::reserve_exact`, any arbitrary non-stdlib call (e.g. atomic counter / panic)
+        // or extra store MUST reject reserve classification.
+        let s_res = sig(vec![STRING_MUT, USIZE], UNIT);
+        let mut b = FuncBuilder::new(item(31), s_res);
+        let p = b.param(STRING_MUT, NO_ORIGIN);
+        let add = b.param(USIZE, NO_ORIGIN);
+        let e = FuncBuilder::ENTRY;
+        let len_ref = b.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Value(p),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                    Proj::Field {
+                        field: parts.len_field,
+                        ty: USIZE,
+                    },
+                ],
+                mutable: false,
+            },
+            LEN_REF,
+            NO_ORIGIN,
+        );
+        let len_val = b.op(e, OpKind::Deref(len_ref), USIZE, NO_ORIGIN);
+        let _sum = b.op(
+            e,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: len_val,
+                r: add,
+                ty: USIZE,
+            },
+            USIZE,
+            NO_ORIGIN,
+        );
+        b.effect(
+            e,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(902),
+                    link_name: crate::jir::interns::StrId(0),
+                },
+                function: None,
+                args: vec![add],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(None));
+        let func = b.finish();
+        assert_eq!(
+            classify_reserve_body(
+                &func,
+                &table,
+                &interns,
+                &parts,
+                &mut |_| None,
+                &mut |id| (id == item(902)).then_some(("my_crate", "my_crate::tick")),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn bstr_classify_real_stdlib_reserve_exact_cfg() {
+        let (table, interns) = build_table();
+        let parts = string_parts(&table, &interns, STRING).expect("canonical String parts");
+
+        // Multi-block CFG mirroring real `alloc::string::String::reserve_exact`:
+        // Entry: `Deref(self) -> Field(vec) -> Field(len)` across `Goto(b1, [len])`
+        // b1: `BorrowView(&mut self.vec.buf.inner)` -> `Deref -> Field(cap) -> Cast` across `Goto(b2, [cap])`
+        // b2: calls `alloc::raw_vec::RawVecInner::<Global>::finish_grow`, returns `()`.
+        let s_res = sig(vec![STRING_MUT, USIZE], UNIT);
+        let mut b = FuncBuilder::new(item(32), s_res);
+        let p = b.param(STRING_MUT, NO_ORIGIN);
+        let add = b.param(USIZE, NO_ORIGIN);
+        let e = FuncBuilder::ENTRY;
+        let b1 = b.block();
+        let b2 = b.block();
+        let len_p = b.block_param(b1, USIZE, NO_ORIGIN);
+        let cap_p = b.block_param(b2, USIZE, NO_ORIGIN);
+
+        let str_val = b.op(e, OpKind::Deref(p), STRING, NO_ORIGIN);
+        let vec_val = b.op(
+            e,
+            OpKind::Field {
+                base: str_val,
+                variant: None,
+                field: parts.vec_field,
+            },
+            VEC_U8,
+            NO_ORIGIN,
+        );
+        let len_val = b.op(
+            e,
+            OpKind::Field {
+                base: vec_val,
+                variant: None,
+                field: parts.len_field,
+            },
+            USIZE,
+            NO_ORIGIN,
+        );
+        let inner_ref = b.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Value(p),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                    Proj::Field {
+                        field: parts.buf_field,
+                        ty: RAW_VEC,
+                    },
+                ],
+                mutable: true,
+            },
+            BUF_REF,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Goto(b1, vec![len_val]));
+
+        let raw_val = b.op(b1, OpKind::Deref(inner_ref), RAW_VEC, NO_ORIGIN);
+        let cap_val = b.op(
+            b1,
+            OpKind::Field {
+                base: raw_val,
+                variant: None,
+                field: 0,
+            },
+            USIZE,
+            NO_ORIGIN,
+        );
+        let cap_cast = b.op(
+            b1,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: cap_val,
+                from: USIZE,
+                to: USIZE,
+            },
+            USIZE,
+            NO_ORIGIN,
+        );
+        b.terminate(b1, RTerm::Goto(b2, vec![cap_cast]));
+
+        let _need = b.op(
+            b2,
+            OpKind::Binary {
+                op: BinaryOp::Sub,
+                l: cap_p,
+                r: len_p,
+                ty: USIZE,
+            },
+            USIZE,
+            NO_ORIGIN,
+        );
+        b.effect(
+            b2,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(903),
+                    link_name: crate::jir::interns::StrId(0),
+                },
+                function: None,
+                args: vec![inner_ref, len_p, add],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            NO_ORIGIN,
+        );
+        b.terminate(b2, RTerm::Return(None));
+
+        let func = b.finish();
+        assert_eq!(
+            classify_reserve_body(
+                &func,
+                &table,
+                &interns,
+                &parts,
+                &mut |_| None,
+                &mut |id| (id == item(903))
+                    .then_some(("alloc", "alloc::raw_vec::RawVecInner::<Global>::finish_grow")),
+            ),
+            Some(BstrStringOp::ReserveExact)
+        );
+    }
+
+    #[test]
+    fn bstr_analyze_inlined_raw_vec_reserve_exact() {
+        let (table, interns) = build_table();
+        let parts = string_parts(&table, &interns, STRING).expect("canonical String parts");
+
+        let mut b = FuncBuilder::new(item(33), sig(vec![USIZE], UNIT));
+        let add = b.param(USIZE, NO_ORIGIN);
+        let s_cell = b.cell(STRING, false, NO_ORIGIN);
+        let e = FuncBuilder::ENTRY;
+
+        let s_mut = b.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Cell(s_cell),
+                path: Vec::new(),
+                mutable: true,
+            },
+            STRING_MUT,
+            NO_ORIGIN,
+        );
+        let str_val = b.op(e, OpKind::Deref(s_mut), STRING, NO_ORIGIN);
+        let vec_val = b.op(
+            e,
+            OpKind::Field {
+                base: str_val,
+                variant: None,
+                field: parts.vec_field,
+            },
+            VEC_U8,
+            NO_ORIGIN,
+        );
+        let len_val = b.op(
+            e,
+            OpKind::Field {
+                base: vec_val,
+                variant: None,
+                field: parts.len_field,
+            },
+            USIZE,
+            NO_ORIGIN,
+        );
+        let buf_ref = b.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Value(s_mut),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                    Proj::Field {
+                        field: parts.buf_field,
+                        ty: RAW_VEC,
+                    },
+                ],
+                mutable: true,
+            },
+            BUF_REF,
+            NO_ORIGIN,
+        );
+        let layout_const = b.op(
+            e,
+            OpKind::Const(ConstTree::Aggregate(vec![
+                ConstTree::Scalar { bits: 1, bytes: 4 },
+                ConstTree::Variant {
+                    variant: 0,
+                    fields: Vec::new(),
+                },
+            ])),
+            USIZE,
+            NO_ORIGIN,
+        );
+        b.effect(
+            e,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(904),
+                    link_name: crate::jir::interns::StrId(0),
+                },
+                function: None,
+                args: vec![buf_ref, len_val, add, layout_const],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(None));
+
+        let func = b.finish();
+        let analysis =
+            analyze_inlined_string_vec_inner(&func, &table, &interns, |id, _| id == item(904))
+                .expect("recognizes MIR-inlined RawVecInner::reserve_exact on String Cell");
+        assert_eq!(analysis.clusters.len(), 1);
+        let c = &analysis.clusters[0];
+        assert_eq!(c.root, StringRoot::Cell(s_cell));
+        assert!(!c.root_is_ref);
+        assert!(c.is_mut);
+        assert!(c.len_values.contains(&len_val));
+        assert!(c.internal_values.contains(&buf_ref));
+        assert!(c.internal_values.contains(&str_val));
+        assert_eq!(c.reserve_calls.get(&(0, 6)), Some(&add));
     }
 }

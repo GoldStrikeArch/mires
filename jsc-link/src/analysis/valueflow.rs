@@ -74,7 +74,8 @@ use crate::jir::types::{NominalForm, TypeDescriptor, TypeKind, TypeTable};
 use crate::jir::{Interns, TypeId};
 use crate::late_ir::AllocatorProvider;
 use crate::lower::semantic_ops::string::{
-    analyze_inlined_string_vec, bstr_spec, classify_bstr_op, StringRoot,
+    analyze_inlined_string_vec, bstr_spec, classify_bstr_op, is_raw_vec_reserve_in_table,
+    item_origin_info, StringRoot,
 };
 use crate::lower::semantic_ops::{
     self, ReferenceRequirement, SemanticOp, SignatureSlot, SlotRequirement,
@@ -962,16 +963,32 @@ impl<'a> Collector<'a> {
                 return;
             }
             Some(sem) if crate::lower::bstr::enabled() => {
-                let bstr_op = self.interns.get(name).copied().and_then(|interns| {
+                let bstr_op = self.table.get(name).and_then(|item| {
+                    let interns = self.interns.get(name).copied()?;
+                    let (crate_name, item_path) = item_origin_info(item, interns);
                     let funcs = self.funcs;
                     let table = self.table;
+                    let interns_map = &self.interns;
                     let lowered = &self.lowered;
-                    let _ = table;
-                    classify_bstr_op(sem, func, types, interns, |item| {
-                        lowered
-                            .get(&item)
-                            .and_then(|cn| funcs.get(cn)?.as_ref().ok())
-                    })
+                    classify_bstr_op(
+                        sem,
+                        func,
+                        types,
+                        interns,
+                        crate_name,
+                        item_path,
+                        |item| {
+                            lowered
+                                .get(&item)
+                                .and_then(|cn| funcs.get(cn)?.as_ref().ok())
+                        },
+                        |sub_item| {
+                            let cn = lowered.get(&sub_item)?;
+                            let sub = table.get(cn)?;
+                            let si = interns_map.get(cn).copied()?;
+                            Some(item_origin_info(sub, si))
+                        },
+                    )
                 });
                 if let Some(op) = bstr_op {
                     self.summarize_slot_reqs(name, func, types, bstr_spec(op).slots);
@@ -1042,10 +1059,11 @@ impl<'a> Collector<'a> {
         }
 
         let inlined_string_vec = if crate::lower::bstr::enabled() {
-            self.interns
-                .get(name)
-                .copied()
-                .and_then(|interns| analyze_inlined_string_vec(func, types, interns))
+            self.interns.get(name).copied().and_then(|interns| {
+                analyze_inlined_string_vec(func, types, interns, |item, _| {
+                    is_raw_vec_reserve_in_table(self.table, &self.interns, &self.lowered, item)
+                })
+            })
         } else {
             None
         };
@@ -1738,24 +1756,35 @@ impl<'a> Collector<'a> {
                             _ => None,
                         };
                         let bstr_cut = if cut.is_none() && crate::lower::bstr::enabled() {
-                            let callee_sem = self
-                                .table
-                                .get(callee_name)
+                            let callee_item = self.table.get(callee_name);
+                            let callee_sem = callee_item
                                 .and_then(|item| item.jir.body.as_ref())
                                 .map(|body| body.semantic);
-                            if let (Some(sem), Some(callee_interns)) =
-                                (callee_sem, self.interns.get(callee_name).copied())
+                            if let (Some(callee_item), Some(sem), Some(callee_interns)) =
+                                (callee_item, callee_sem, self.interns.get(callee_name).copied())
                             {
+                                let (crate_name, item_path) =
+                                    item_origin_info(callee_item, callee_interns);
                                 let lowered_map = &self.lowered;
+                                let table = self.table;
+                                let interns_map = &self.interns;
                                 classify_bstr_op(
                                     sem,
                                     callee_func,
                                     &callee_interns.types,
                                     callee_interns,
+                                    crate_name,
+                                    item_path,
                                     |sub_item| {
                                         lowered_map
                                             .get(&sub_item)
                                             .and_then(|n| funcs.get(n)?.as_ref().ok())
+                                    },
+                                    |sub_item| {
+                                        let cn = lowered_map.get(&sub_item)?;
+                                        let sub = table.get(cn)?;
+                                        let si = interns_map.get(cn).copied()?;
+                                        Some(item_origin_info(sub, si))
                                     },
                                 )
                             } else {

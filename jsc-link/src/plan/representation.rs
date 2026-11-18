@@ -62,7 +62,8 @@ use crate::link::lane::{ReprBlock, ReprDecision, ReprExport};
 use crate::lower::js::adapters;
 use crate::lower::semantic_ops::string::{
     analyze_inlined_string_vec, bstr_spec, classify_bstr_op, is_immutable_str_ref,
-    is_immutable_u8_slice_ref, is_trivial_str_as_bytes, lower_bstr_op, BstrStringOp, StringRoot,
+    is_immutable_u8_slice_ref, is_raw_vec_reserve_in_table, is_trivial_str_as_bytes,
+    item_origin_info, lower_bstr_op, BstrStringOp, StringRoot,
 };
 use crate::lower::semantic_ops::{
     self, LowerCx, ReferenceRequirement, SignatureSlot, SlotRequirement,
@@ -595,7 +596,15 @@ fn collect_bstr_ops(
         else {
             continue;
         };
-        if is_trivial_str_as_bytes(body.semantic, func, &item_interns.types, item_interns) {
+        let (crate_name, item_path) = item_origin_info(item, item_interns);
+        if is_trivial_str_as_bytes(
+            body.semantic,
+            func,
+            &item_interns.types,
+            item_interns,
+            crate_name,
+            item_path,
+        ) {
             as_bytes_items.insert(func.item);
         }
         if let Some(op) = classify_bstr_op(
@@ -603,10 +612,18 @@ fn collect_bstr_ops(
             func,
             &item_interns.types,
             item_interns,
+            crate_name,
+            item_path,
             |sub| {
                 lowered
                     .get(&sub)
                     .and_then(|cn| funcs.get(cn)?.as_ref().ok())
+            },
+            |sub| {
+                let cn = lowered.get(&sub)?;
+                let sub_item = table.get(cn)?;
+                let sub_interns = interns.get(cn).copied()?;
+                Some(item_origin_info(sub_item, sub_interns))
             },
         ) {
             out.insert(name.clone(), op);
@@ -616,16 +633,21 @@ fn collect_bstr_ops(
 }
 
 fn inlined_vec_elide_set(
+    table: &BTreeMap<JsName, LinkItem>,
+    interns_map: &BTreeMap<JsName, &Interns>,
+    lowered: &BTreeMap<ItemId, JsName>,
+    name: &JsName,
     func: &Func,
-    interns: Option<&Interns>,
 ) -> BTreeSet<(usize, usize)> {
     if !crate::lower::bstr::enabled() {
         return BTreeSet::new();
     }
-    let Some(interns) = interns else {
+    let Some(interns) = interns_map.get(name).copied() else {
         return BTreeSet::new();
     };
-    let Some(analysis) = analyze_inlined_string_vec(func, &interns.types, interns) else {
+    let Some(analysis) = analyze_inlined_string_vec(func, &interns.types, interns, |item, _| {
+        is_raw_vec_reserve_in_table(table, interns_map, lowered, item)
+    }) else {
         return BTreeSet::new();
     };
     analysis.op_cluster.keys().copied().collect()
@@ -1174,9 +1196,9 @@ impl Planner<'_> {
             if self.is_candidate_glue_or_standard(name) {
                 continue;
             }
+            let inlined_elide =
+                inlined_vec_elide_set(self.table, &self.interns, &self.lowered, name, func);
             for (bi, block) in func.blocks.iter().enumerate() {
-                let inlined_elide =
-                    inlined_vec_elide_set(func, self.interns.get(name).copied());
                 for (oi, op) in block.ops.iter().enumerate() {
                     if inlined_elide.contains(&(bi, oi)) {
                         continue;
@@ -2502,8 +2524,13 @@ impl Planner<'_> {
             if self.is_candidate_glue_or_standard(caller_name) {
                 continue;
             }
-            let inlined_elide =
-                inlined_vec_elide_set(caller_func, self.interns.get(caller_name).copied());
+            let inlined_elide = inlined_vec_elide_set(
+                self.table,
+                &self.interns,
+                &self.lowered,
+                caller_name,
+                caller_func,
+            );
             for (bi, block) in caller_func.blocks.iter().enumerate() {
                 for (oi, op) in block.ops.iter().enumerate() {
                     if inlined_elide.contains(&(bi, oi)) {
@@ -2892,7 +2919,9 @@ impl Planner<'_> {
         // conversions.
         let mut inlined_vec_elide: BTreeSet<(usize, usize)> = BTreeSet::new();
         if crate::lower::bstr::enabled() {
-            if let Some(analysis) = analyze_inlined_string_vec(&out, types, interns) {
+            if let Some(analysis) = analyze_inlined_string_vec(&out, types, interns, |item, _| {
+                is_raw_vec_reserve_in_table(self.table, &self.interns, &self.lowered, item)
+            }) {
                 for (cid, cluster) in analysis.clusters.iter().enumerate() {
                     let root_carrier = match cluster.root {
                         StringRoot::Cell(c) => label(name, Site::Cell(c), &[]),

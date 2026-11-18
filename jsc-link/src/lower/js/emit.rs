@@ -1943,7 +1943,7 @@ impl<'a> JsCx<'a> {
         if !crate::lower::bstr::enabled() {
             return None;
         }
-        let analysis = self.inlined_string_vec.as_ref()?;
+        let analysis = self.inlined_string_vec()?;
         let &cid = analysis.value_cluster.get(&v)?;
         let cluster = analysis.clusters.get(cid)?;
         let carrier = cluster
@@ -2005,26 +2005,52 @@ impl<'a> JsCx<'a> {
             return Ok(None);
         }
         let OpKind::Call {
+            callee,
             args,
-            semantic:
-                rcgjs_object::jir::semantic::CallSemantic::Standard(
-                    rcgjs_object::jir::semantic::StandardOperation::VecReserve,
-                ),
+            semantic,
             host: None,
             ..
         } = &op.kind
         else {
             return Ok(None);
         };
-        let Some(&vec_mut) = args.first() else {
-            return Ok(None);
+        let (anchor, add, is_raw_vec) = match semantic {
+            rcgjs_object::jir::semantic::CallSemantic::Standard(
+                rcgjs_object::jir::semantic::StandardOperation::VecReserve,
+            ) => {
+                if args.len() != 2 {
+                    return Ok(None);
+                }
+                (args[0], args[1], false)
+            }
+            rcgjs_object::jir::semantic::CallSemantic::Ordinary => {
+                let rcgjs_object::jir::semantic::Callee::Direct { item, link_name } = callee
+                else {
+                    return Ok(None);
+                };
+                if args.len() != 4
+                    || !crate::lower::semantic_ops::string::is_raw_vec_reserve_by_link_name(
+                        self.interns,
+                        Some(self.items),
+                        *item,
+                        *link_name,
+                    )
+                {
+                    return Ok(None);
+                }
+                (args[0], args[2], true)
+            }
+            _ => return Ok(None),
         };
-        let Some((carrier, cluster)) = self.inlined_vec_cluster_of(vec_mut) else {
+        let Some((carrier, cluster)) = self.inlined_vec_cluster_of(anchor) else {
             return Ok(None);
         };
         if carrier != rcgjs_object::jir::repr::Carrier::StringBuilder
-            || !cluster.internal_values.contains(&vec_mut)
+            || !cluster.internal_values.contains(&anchor)
         {
+            return Ok(None);
+        }
+        if is_raw_vec && !cluster.len_values.contains(&args[1]) {
             return Ok(None);
         }
         let sb_expr = match cluster.root {
@@ -2034,10 +2060,10 @@ impl<'a> JsCx<'a> {
             }
             crate::lower::semantic_ops::string::StringRoot::Value(v) => self.expr_of(v)?,
         };
-        let add_expr = self.expr_of(args[1])?;
+        let add_expr = self.expr_of(add)?;
         let ptr_bits = self
             .table
-            .get(self.ty_of(vec_mut)?)
+            .get(self.ty_of(anchor)?)
             .and_then(|d| d.layout.size)
             .and_then(|b| b.checked_mul(8))
             .and_then(|bits| u32::try_from(bits).ok())

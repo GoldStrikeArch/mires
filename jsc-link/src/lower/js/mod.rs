@@ -125,7 +125,7 @@ pub struct JsCx<'a> {
     byte_string_views: std::cell::OnceCell<std::collections::BTreeMap<ValueId, ByteView>>,
     /// Stage 3 (`js-str=bytes`): closed MIR-inlined `String.vec` operations in this body.
     pub(super) inlined_string_vec:
-        Option<crate::lower::semantic_ops::string::InlinedStringVecAnalysis>,
+        std::cell::OnceCell<Option<crate::lower::semantic_ops::string::InlinedStringVecAnalysis>>,
     /// Allocation-bearing expressions paired with the JIR value that produced them. The final
     /// JavaScript allocation walker uses these only for provenance; they never affect emission.
     allocation_origins: RefCell<Vec<(ValueId, Expr)>>,
@@ -164,11 +164,7 @@ impl<'a> JsCx<'a> {
                 }
             }
         }
-        let inlined_string_vec = if crate::lower::bstr::enabled() {
-            crate::lower::semantic_ops::string::analyze_inlined_string_vec(func, table, interns)
-        } else {
-            None
-        };
+        let inlined_string_vec = std::cell::OnceCell::new();
         JsCx {
             func,
             plan,
@@ -553,13 +549,39 @@ impl<'a> JsCx<'a> {
             .is_some_and(|view| view.mode == ByteViewMode::FullSlice)
     }
 
+    pub(super) fn inlined_string_vec(
+        &self,
+    ) -> Option<&crate::lower::semantic_ops::string::InlinedStringVecAnalysis> {
+        self.inlined_string_vec
+            .get_or_init(|| {
+                if crate::lower::bstr::enabled() {
+                    crate::lower::semantic_ops::string::analyze_inlined_string_vec(
+                        self.func,
+                        self.table,
+                        self.interns,
+                        |item, link_name| {
+                            crate::lower::semantic_ops::string::is_raw_vec_reserve_by_link_name(
+                                self.interns,
+                                Some(self.items),
+                                item,
+                                link_name,
+                            )
+                        },
+                    )
+                } else {
+                    None
+                }
+            })
+            .as_ref()
+    }
+
     fn find_byte_string_views(&self) -> std::collections::BTreeMap<ValueId, ByteView> {
         byte_view_analysis::analyze(
             self.func,
             self.plan,
             self.table,
             self.interns,
-            self.inlined_string_vec.as_ref(),
+            self.inlined_string_vec(),
         )
     }
 
