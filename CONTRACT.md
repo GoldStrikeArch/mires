@@ -1092,6 +1092,39 @@ The same enums **transmute to and from the integer of their own width**, as the 
 "Transmuting between an enum and an integer" under "Enums". That is how `escape_ascii` builds its
 output (`u8` to `AsciiChar`) and how `core::mem::Alignment` is read as a `usize`.
 
+### Byte strings (`js-str=bytes`)
+
+Passing `-Cllvm-args=js-str=bytes` (with `-Cllvm-args=js-lane=jir`; default is `utf16`, and sysroot
+objects are unchanged because the flag acts only at link time) switches `str` from a UTF-16 host
+string to a **byte string**: a JS string whose UTF-16 code units store Rust's UTF-8 bytes verbatim
+(`0..=255` per code unit, one code unit per byte). Under `js-str=bytes`:
+
+- **Direct `str`, `StringBuilder`, and byte-view lowerings:** `str::len` is `.length`, code-unit
+  reads give raw UTF-8 bytes (`charCodeAt`), and `is_char_boundary`, `&s[a..b]`, `str::get`,
+  `strip_prefix`/`strip_suffix`, `trim*`, and `PartialOrd` lower directly over byte strings
+  (`__rt.bstr_sub*`, `__rt.bstr_get*`, `__rt.bstr_trim*`, `__rt.bstr_strip*`, `__rt.bstr_cmp`)
+  without UTF-8 array encoding. Closed read-only `as_bytes`/`as_ptr`/subslice/`offset`/`offset_from`
+  clusters over immutable `&str`/`&String` (including MIR-inlined `String.vec`) stay directly on the
+  byte string (`s.length`, `s.charCodeAt`); escaping views materialize `{ buf, off, len }` via
+  `__rt.bstr_bytes`/`__rt.bstr_of` (memoized via `_bstr_memo` / `_bstr_src`, with single-pass
+  `__rt.bstr_utf8_bytes` fusion for converted host strings). Native `String` builders
+  (`{ text, cap, len }`) keep byte-string `text` and exact `reserve`/`reserve_exact` capacity
+  tracking (throwing `RangeError` on 32-bit overflow).
+- **ASCII elision & host boundary conversions:** Interprocedural `KnownAscii` provenance proves
+  ASCII-only (`b < 0x80`) `str`, `HostString`, and unmutated `Option<&str>` values and omits
+  `__rt.bstr_out` at host crossings. All other `str`-reaching values crossing `js_bindings!`,
+  `#[no_mangle]` exports, `extern "C"`, `js!`, and closures/callbacks convert via deduplicated
+  `$bstr$out$...` / `$bstr$in$...` link-table helpers (by-value literals; lone host surrogates
+  normalize to `U+FFFD` via `__rt.bstr_in`). References, `&mut`, `Cell`, slices, `Box`/`Rc`/`Arc`,
+  `RawVec`/`Vec`/`VecDeque`, and `BTreeMap` nodes cross as live `WeakMap`-cached `Proxy` views
+  (`__rt.bstr_ref` / `__rt.bstr_ref_in`) preserving JS identity (`===`, `WeakMap`/`Set`), cycles,
+  live Rust mutations, `TypeError`-checked write-back, and round-trip unwrapping; `[&str; 0]`
+  short-circuits as a ZST identity.
+- **Unsafe-only link refusals:** Crossing `str` at the host boundary stays refused at link time only
+  for untagged multi-field `union` types (transparent single-variant unions such as `MaybeUninit`
+  are supported), bare `*const`/`*mut` raw pointers outside safe smart-pointer/buffer forms, raw
+  coroutine values in `js!`, `FatDyn` pointers reaching `str`, or conversion nesting depth > 64.
+
 ### Runtime shim additions
 
 ```js

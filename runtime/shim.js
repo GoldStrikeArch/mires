@@ -1685,20 +1685,8 @@ globalThis.__rt.bstr_char = (c) => {
 // a slice just made copies nothing.
 globalThis.__rt._bstr_memo = { map: new Map(), utf8: new Map(), bytes: 0, huge: [], armed: false, budget: 4194304 };
 let _bstr_src;
-let _bsub_k0 = "";
-let _bsub_v0;
-let _bsub_k1 = "";
-let _bsub_v1;
-let _bsub_k2 = "";
-let _bsub_v2;
-let _bsub_k3 = "";
-let _bsub_v3;
-let _bsub_i = 0;
 let _bsub_arm;
-function _bsub_reset() {
-  _bsub_k0 = _bsub_k1 = _bsub_k2 = _bsub_k3 = "";
-  _bsub_v0 = _bsub_v1 = _bsub_v2 = _bsub_v3 = undefined;
-}
+let _bsub_clear;
 function _arm_bstr_memo() {
   const memo = globalThis.__rt._bstr_memo;
   if (!memo.armed) {
@@ -1714,7 +1702,7 @@ function _bstr_memo_put(map, key, record, n) {
     if (memo.huge.length === 2) {
       const evicted = memo.huge.shift();
       evicted.map.delete(evicted.key);
-      _bsub_reset();
+      if (_bsub_clear !== undefined) _bsub_clear();
     }
     memo.huge.push({ map, key });
   } else {
@@ -1724,7 +1712,7 @@ function _bstr_memo_put(map, key, record, n) {
       memo.utf8.clear();
       for (let i = 0; i < kept.length; i++) kept[i].map.set(kept[i].key, kept[i].val);
       memo.bytes = 0;
-      _bsub_reset();
+      if (_bsub_clear !== undefined) _bsub_clear();
     }
     memo.bytes += n;
   }
@@ -1738,8 +1726,24 @@ globalThis.__rt._bstr_memo_clear = () => {
   memo.bytes = 0;
   memo.huge.length = 0;
   memo.armed = false;
-  _bsub_reset();
+  if (_bsub_clear !== undefined) _bsub_clear();
 };
+
+// _bstr_sub_reset / _bsub_*: isolate the 4-entry subslice cache outside `_bstr_memo`
+// so bundles using only `bstr_utf8_bytes` (without `bstr_of` or `bstr_bytes`) tree-shake it.
+globalThis.__rt._bstr_sub_reset = () => {
+  _bsub_k0 = _bsub_k1 = _bsub_k2 = _bsub_k3 = "";
+  _bsub_v0 = _bsub_v1 = _bsub_v2 = _bsub_v3 = undefined;
+};
+let _bsub_k0 = "";
+let _bsub_v0;
+let _bsub_k1 = "";
+let _bsub_v1;
+let _bsub_k2 = "";
+let _bsub_v2;
+let _bsub_k3 = "";
+let _bsub_v3;
+let _bsub_i = 0;
 
 // bstr_bytes(s): `str::as_bytes` of a byte string, `{ buf, off, len }` over a
 // plain array of its code units, memoized for the operation like `str_bytes`.
@@ -1836,6 +1840,7 @@ globalThis.__rt.bstr_of = (buf, off, len) => {
       if (off === 0 && len === src.length) return src;
       const sub = src.slice(off, off + len);
       if (_bsub_arm !== undefined) _bsub_arm();
+      if (_bsub_clear === undefined) _bsub_clear = globalThis.__rt._bstr_sub_reset;
       const slot = { buf, off, len };
       if (_bsub_i === 0) {
         _bsub_k0 = sub;
