@@ -1,6 +1,6 @@
-//! Under `js-str=bytes` a `str` the host could write back through a mutable pointer cannot be
-//! converted exactly, so the link step must refuse it (`scripts/bstr-probes.sh` expects the
-//! compile to fail with the reason).
+//! Under `js-str=bytes`, a `str` behind an unsafe raw `*const`/`*mut` pointer outside
+//! `Box`/`Rc`/`Arc`/`RawVec` cannot cross safely, so the link step must refuse it
+//! (`scripts/bstr-probes.sh` expects the compile to fail with the reason).
 
 #![no_std]
 #![no_main]
@@ -17,12 +17,12 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 }
 
 js_bindings! {
-    #[js(call = "globalThis.bstrRewrite")]
-    fn rewrite(value: &mut (&'static str, u32));
+    #[js(call = "globalThis.bstrRawPtr")]
+    fn raw_ptr(value: *const (&'static str, u32));
 }
 
 #[unsafe(no_mangle)]
 pub fn rust_entry() {
-    let mut pair = ("é", 1);
-    rewrite(&mut pair);
+    let pair = ("é", 1u32);
+    raw_ptr(&pair as *const _);
 }

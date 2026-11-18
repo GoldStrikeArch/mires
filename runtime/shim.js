@@ -1854,6 +1854,188 @@ globalThis.__rt.bstr_sb_check = (value) => {
   return value;
 };
 
+globalThis.__rt._bstr_out_ref = new WeakMap();
+globalThis.__rt._bstr_in_ref = new WeakMap();
+
+globalThis.__rt.bstr_str_in = (s) => {
+  if (typeof s !== "string") {
+    throw new TypeError(`expected a string for \`str\`, got ${typeof s}`);
+  }
+  return globalThis.__rt.bstr_in(s);
+};
+
+globalThis.__rt._bstr_has = Object.prototype.hasOwnProperty;
+
+globalThis.__rt._bstr_is_idx = (p) => {
+  if (typeof p !== "string" || p.length === 0) return false;
+  const c = p.charCodeAt(0);
+  if (c < 48 || c > 57) return false;
+  const n = p >>> 0;
+  return n < 4294967295 && String(n) === p;
+};
+
+globalThis.__rt._bstr_conv = (spec, val, out, allowUndef) => {
+  if (spec === "s" || spec === "u") {
+    if (val === undefined && (out || allowUndef || spec === "u")) return undefined;
+    return out ? globalThis.__rt.bstr_out(val) : globalThis.__rt.bstr_str_in(val);
+  }
+  if (val === undefined) return undefined;
+  return (out ? spec[0] : spec[1])(val);
+};
+
+globalThis.__rt._bstr_wrap = (value, spec, out) => {
+  if (value === null || typeof value !== "object") return value;
+  const cache = out ? globalThis.__rt._bstr_out_ref : globalThis.__rt._bstr_in_ref;
+  const hit = cache.get(value);
+  if (hit !== undefined) return hit;
+  let target = value;
+  if (
+    !out &&
+    Object.isFrozen(value) &&
+    (Array.isArray(value) ? value.length > 0 : Object.keys(value).length > 0)
+  ) {
+    target = Array.isArray(value) ? value.slice() : Object.assign({}, value);
+  }
+  const has = globalThis.__rt._bstr_has;
+  const isIdx = globalThis.__rt._bstr_is_idx;
+  const conv = globalThis.__rt._bstr_conv;
+  const k = spec.k;
+  let proxy;
+  if (k === "tbuf") {
+    const hdr = spec.h;
+    const elem = spec.c;
+    proxy = new Proxy(target, {
+      get(t, prop) {
+        const raw = Reflect.get(t, prop, t);
+        if (isIdx(prop)) {
+          if (prop === "0") {
+            return hdr ? conv(hdr, raw, out, true) : raw;
+          }
+          return elem ? conv(elem, raw, out, true) : raw;
+        }
+        return raw;
+      },
+      set(t, prop, val) {
+        if (isIdx(prop)) {
+          const next = prop === "0"
+            ? (hdr ? conv(hdr, val, !out, false) : val)
+            : (elem ? conv(elem, val, !out, false) : val);
+          return Reflect.set(t, prop, next, t);
+        }
+        return Reflect.set(t, prop, val, t);
+      },
+    });
+  } else if (k === "tail") {
+    const tailPtrSpec = { k: "tailptr", h: spec.h, c: spec.c };
+    proxy = new Proxy(target, {
+      get(t, prop) {
+        const raw = Reflect.get(t, prop, t);
+        if (prop === "ptr" && raw !== null && typeof raw === "object") {
+          return globalThis.__rt._bstr_wrap(raw, tailPtrSpec, out);
+        }
+        return raw;
+      },
+      set(t, prop, val) {
+        return Reflect.set(t, prop, val, t);
+      },
+    });
+  } else if (k === "tailptr") {
+    const tbufSpec = { k: "tbuf", h: spec.h, c: spec.c };
+    proxy = new Proxy(target, {
+      get(t, prop) {
+        const raw = Reflect.get(t, prop, t);
+        if (prop === "buf" && Array.isArray(raw)) {
+          if (Object.isFrozen(raw) && raw.length === 0) return raw;
+          return globalThis.__rt._bstr_wrap(raw, tbufSpec, out);
+        }
+        return raw;
+      },
+      set(t, prop, val) {
+        return Reflect.set(t, prop, val, t);
+      },
+    });
+  } else if (k === "slot") {
+    const elem = spec.c;
+    let partialCache;
+    proxy = new Proxy(target, {
+      get(t, prop) {
+        const raw = Reflect.get(t, prop, t);
+        if (prop === "buf" && raw !== null && typeof raw === "object") {
+          if (Array.isArray(raw) && Object.isFrozen(raw) && raw.length === 0) return raw;
+          if (t.pr === undefined && typeof t.off === "number") {
+            return globalThis.__rt._bstr_wrap(raw, { k: "a", c: elem }, out);
+          }
+          const key = t.off;
+          if (partialCache !== undefined && partialCache[0] === raw && partialCache[1] === key) {
+            return partialCache[2];
+          }
+          const p = new Proxy(raw, {
+            get(bt, bprop) {
+              const braw = Reflect.get(bt, bprop, bt);
+              if (bprop === String(key)) return conv(elem, braw, out, true);
+              return braw;
+            },
+            set(bt, bprop, val) {
+              const next = bprop === String(key) ? conv(elem, val, !out, false) : val;
+              return Reflect.set(bt, bprop, next, bt);
+            },
+          });
+          partialCache = [raw, key, p];
+          return p;
+        }
+        return raw;
+      },
+      set(t, prop, val) {
+        return Reflect.set(t, prop, val, t);
+      },
+    });
+  } else {
+    const fieldsFor = (t) => {
+      if (k === "e") {
+        const tag = t.TAG;
+        return typeof tag === "string" && has.call(spec.v, tag) ? spec.v[tag] : null;
+      }
+      return k === "o" ? spec.f : null;
+    };
+    proxy = new Proxy(target, {
+      get(t, prop) {
+        const raw = Reflect.get(t, prop, t);
+        if (k === "a") {
+          return isIdx(prop) ? conv(spec.c, raw, out, true) : raw;
+        }
+        if (typeof prop === "string") {
+          const fields = fieldsFor(t);
+          if (fields !== null && has.call(fields, prop)) {
+            return conv(fields[prop], raw, out, out);
+          }
+        }
+        return raw;
+      },
+      set(t, prop, val) {
+        if (k === "a") {
+          const next = isIdx(prop) ? conv(spec.c, val, !out, false) : val;
+          return Reflect.set(t, prop, next, t);
+        }
+        if (typeof prop === "string") {
+          const fields = fieldsFor(t);
+          if (fields !== null && has.call(fields, prop)) {
+            const next = conv(fields[prop], val, !out, false);
+            return Reflect.set(t, prop, next, t);
+          }
+        }
+        return Reflect.set(t, prop, val, t);
+      },
+    });
+  }
+  cache.set(value, proxy);
+  const rev = out ? globalThis.__rt._bstr_in_ref : globalThis.__rt._bstr_out_ref;
+  rev.set(proxy, value);
+  return proxy;
+};
+
+globalThis.__rt.bstr_ref = (value, spec) => globalThis.__rt._bstr_wrap(value, spec, true);
+globalThis.__rt.bstr_ref_in = (value, spec) => globalThis.__rt._bstr_wrap(value, spec, false);
+
 // ---------------------------------------------------------------------------
 // Native String and Vec primitives
 // ---------------------------------------------------------------------------

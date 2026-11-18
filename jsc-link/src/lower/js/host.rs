@@ -403,7 +403,7 @@ fn throw_expr(value: Expr) -> Expr {
 /// call form runs in the marker's own effect or accessor and matches v1's direct spelling.
 pub(super) fn closure_thunk(cx: &JsCx<'_>, closure: ValueId) -> Res<(Option<Expr>, Expr, Expr)> {
     let ty = cx.ty_of(closure)?;
-    let (name, arity, has_environment) = closure_item(cx, ty)?;
+    let (name, arity, param_tys, result_ty, has_environment) = closure_item(cx, ty)?;
     let params: Vec<String> = (0..arity).map(|index| format!("$a{index}")).collect();
     let (setup, environment) = match has_environment {
         true => {
@@ -418,22 +418,57 @@ pub(super) fn closure_thunk(cx: &JsCx<'_>, closure: ValueId) -> Res<(Option<Expr
         }
         false => (None, None),
     };
-    let mut arguments = Vec::with_capacity(arity + 1);
-    arguments.extend(environment.clone());
-    arguments.extend(params.iter().cloned().map(jsast::id));
-    let call = jsast::call(jsast::id(name.clone()), arguments);
+    let mut raw_arguments = Vec::with_capacity(arity + 1);
+    raw_arguments.extend(environment.clone());
+    raw_arguments.extend(params.iter().cloned().map(jsast::id));
+    let call = jsast::call(jsast::id(name.clone()), raw_arguments);
+
+    let convert_params = || -> Res<Vec<Expr>> {
+        if !crate::lower::bstr::enabled() {
+            return Ok(params.iter().cloned().map(jsast::id).collect());
+        }
+        params
+            .iter()
+            .zip(&param_tys)
+            .map(|(param, param_ty)| {
+                crossing(
+                    cx,
+                    *param_ty,
+                    jsast::id(param.clone()),
+                    crate::lower::bstr::Crossing::In,
+                )
+            })
+            .collect()
+    };
+    let convert_result = |call_expr: Expr| -> Res<Expr> {
+        if !crate::lower::bstr::enabled() {
+            return Ok(call_expr);
+        }
+        match result_ty {
+            Some(res_ty) => crossing(cx, res_ty, call_expr, crate::lower::bstr::Crossing::Out),
+            None => Ok(call_expr),
+        }
+    };
+
     let arrow = match environment.clone().filter(|_| function_has_cycle(cx)) {
         Some(environment) => {
             let mut arguments = Vec::with_capacity(arity + 1);
             arguments.push(jsast::id(CAPTURED_ENVIRONMENT));
-            arguments.extend(params.iter().cloned().map(jsast::id));
-            let inner = jsast::arrow(params, jsast::call(jsast::id(name), arguments));
+            arguments.extend(convert_params()?);
+            let inner_call = convert_result(jsast::call(jsast::id(name), arguments))?;
+            let inner = jsast::arrow(params, inner_call);
             jsast::call(
                 jsast::arrow(vec![CAPTURED_ENVIRONMENT.to_owned()], inner),
                 vec![environment],
             )
         }
-        None => jsast::arrow(params, call.clone()),
+        None => {
+            let mut arguments = Vec::with_capacity(arity + 1);
+            arguments.extend(environment);
+            arguments.extend(convert_params()?);
+            let arrow_call = convert_result(jsast::call(jsast::id(name), arguments))?;
+            jsast::arrow(params, arrow_call)
+        }
     };
     Ok((setup, arrow, call))
 }
@@ -487,11 +522,14 @@ fn function_has_cycle(cx: &JsCx<'_>) -> bool {
 
 /// The JavaScript name, the splatted arity and whether it takes an environment, of the body a
 /// closure or function-item value calls.
-fn closure_item(cx: &JsCx<'_>, ty: TypeId) -> Res<(String, usize, bool)> {
+fn closure_item(
+    cx: &JsCx<'_>,
+    ty: TypeId,
+) -> Res<(String, usize, Vec<TypeId>, Option<TypeId>, bool)> {
     let peeled = cx.table.peeled(ty);
-    let (definition, has_environment) = match value::kind(cx.table, peeled) {
-        Some(TypeKind::Closure { def, .. }) => (*def, true),
-        Some(TypeKind::FnDef { def, .. }) => (*def, false),
+    let (definition, sig_id, has_environment) = match value::kind(cx.table, peeled) {
+        Some(TypeKind::Closure { def, .. }) => (*def, None, true),
+        Some(TypeKind::FnDef { def, sig, .. }) => (*def, Some(*sig), false),
         _ => {
             return Err(decline(
                 OpClass::Host,
@@ -509,29 +547,71 @@ fn closure_item(cx: &JsCx<'_>, ty: TypeId) -> Res<(String, usize, bool)> {
             "the closure a host marker was given has no item in this program",
         ));
     };
-    // `js-str=bytes`: the host calls the thunk with its own values and takes its result, and a
-    // closure handed to a host marker is typed `JsValue` by the mires-js API. One whose body
-    // takes or returns a `str` anywhere would cross unconverted, so it is refused.
-    if crate::lower::bstr::enabled()
-        && entry
-            .arguments
-            .iter()
-            .chain(entry.result.iter())
-            .any(|ty| crate::lower::bstr::reaches_str(cx.table, *ty))
-    {
-        return Err(decline(
-            OpClass::Host,
-            "`js-str=bytes` cannot convert this value at the host boundary: a closure handed to \
-             the host takes or returns a `str`",
-        ));
-    }
     // A closure body takes its environment and then the elements a caller splats out of the
     // `"rust-call"` tuple; `AbiSignature::params` already counts the tuple as its arity.
     let arity = entry
         .params
         .saturating_sub(usize::from(has_environment))
         .saturating_sub(usize::from(entry.caller_location));
-    Ok((entry.name.clone(), arity, has_environment))
+    if !crate::lower::bstr::enabled() {
+        return Ok((entry.name.clone(), arity, Vec::new(), None, has_environment));
+    }
+    let mut result_ty = entry.result;
+    let param_tys = if has_environment {
+        let user_end = entry
+            .arguments
+            .len()
+            .saturating_sub(usize::from(entry.caller_location));
+        let user_args = entry.arguments.get(1..user_end).unwrap_or(&[]);
+        if user_args.len() == 1 {
+            match value::kind(cx.table, cx.table.peeled(user_args[0])) {
+                Some(TypeKind::Tuple(elems)) if elems.len() == arity => elems.clone(),
+                _ if arity == 1 => vec![user_args[0]],
+                _ if arity == 0 => Vec::new(),
+                _ => {
+                    return Err(decline(
+                        OpClass::Host,
+                        "closure parameter shape disagrees with its arity",
+                    ));
+                }
+            }
+        } else if user_args.len() == arity {
+            user_args.to_vec()
+        } else if arity == 0 {
+            Vec::new()
+        } else {
+            return Err(decline(
+                OpClass::Host,
+                "closure parameter count disagrees with its arity",
+            ));
+        }
+    } else if let Some(sig) = sig_id.and_then(|id| cx.interns.sigs.get(id)) {
+        if sig.spread_arity.is_none() && sig.inputs.len() >= arity {
+            result_ty = Some(sig.output);
+            sig.inputs[..arity].to_vec()
+        } else if entry.arguments.len() >= arity {
+            entry.arguments[..arity].to_vec()
+        } else {
+            return Err(decline(
+                OpClass::Host,
+                "function item parameter count disagrees with its arity",
+            ));
+        }
+    } else if entry.arguments.len() >= arity {
+        entry.arguments[..arity].to_vec()
+    } else {
+        return Err(decline(
+            OpClass::Host,
+            "function item parameter count disagrees with its arity",
+        ));
+    };
+    Ok((
+        entry.name.clone(),
+        arity,
+        param_tys,
+        result_ty,
+        has_environment,
+    ))
 }
 
 /// The drop glue of a value a host marker takes ownership of, or `None` when the glue is empty
@@ -691,15 +771,30 @@ fn host_argument(cx: &JsCx<'_>, arg: ValueId, value: Expr) -> Res<Expr> {
     if !crate::lower::bstr::enabled() {
         return Ok(value);
     }
-    let host_string = cx
+    let carrier = cx
         .func
         .values
         .get(arg.0 as usize)
-        .is_some_and(|v| v.carrier == rcgjs_object::jir::repr::Carrier::HostString);
-    if host_string {
+        .map(|v| v.carrier)
+        .unwrap_or(rcgjs_object::jir::repr::Carrier::Baseline);
+    if carrier == rcgjs_object::jir::repr::Carrier::HostString {
         return Ok(crate::lower::bstr::host_out(value));
     }
-    crossing(cx, cx.ty_of(arg)?, value, crate::lower::bstr::Crossing::Out)
+    let ty = cx.ty_of(arg)?;
+    crate::lower::bstr::host_convert_carrier(
+        cx.table,
+        cx.interns,
+        ty,
+        carrier,
+        value,
+        crate::lower::bstr::Crossing::Out,
+    )
+    .map_err(|why| {
+        decline(
+            OpClass::Host,
+            format!("`js-str=bytes` cannot convert this value at the host boundary: {why}"),
+        )
+    })
 }
 
 /// [`crate::lower::bstr::host_convert`] at a host crossing, its refusal a decline that names it.

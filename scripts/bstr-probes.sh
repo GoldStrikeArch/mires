@@ -87,17 +87,71 @@ else
 	status=1
 fi
 
-# A `str` the host could write back through is refused under bytes, with the reason.
-if JS_EXTRA_ARGS="$base js-str=bytes" "$script_dir/compile_core.sh" "$probes/repr/refuse.rs" \
-	"$work/refuse.js" --extern "mires_js=$work/bytes/libmires_js.rlib" --search "$work/proc-macro" \
-	>"$work/refuse.log" 2>&1; then
-	echo "refusal probe: compiled under js-str=bytes, but must be refused" >&2
-	status=1
-elif grep -q 'cannot convert this value at the host boundary' "$work/refuse.log"; then
-	echo "refusal probe: refused under js-str=bytes, as expected"
-else
-	echo "refusal probe: failed for another reason:" >&2
-	sed 's/^/    /' "$work/refuse.log" >&2
+# Genuinely unconvertible unsafe shapes (`*const`/`*mut`, multi-field untagged `union`,
+# raw coroutine in `js!`) are refused under `js-str=bytes`, with the reason.
+for refuse_src in "$probes/repr/refuse.rs" "$probes/repr/refuse_union.rs" "$probes/repr/refuse_coro.rs"; do
+	refuse_name=$(basename -- "$refuse_src" .rs)
+	if JS_EXTRA_ARGS="$base js-str=bytes" "$script_dir/compile_core.sh" "$refuse_src" \
+		"$work/$refuse_name.js" --extern "mires_js=$work/bytes/libmires_js.rlib" \
+		--extern "js_macro=$js_macro" --search "$work/proc-macro" \
+		>"$work/$refuse_name.log" 2>&1; then
+		echo "refusal probe ($refuse_name): compiled under js-str=bytes, but must be refused" >&2
+		status=1
+	elif grep -q 'cannot convert this value at the host boundary' "$work/$refuse_name.log"; then
+		echo "refusal probe ($refuse_name): refused under js-str=bytes, as expected"
+	else
+		echo "refusal probe ($refuse_name): failed for another reason:" >&2
+		sed 's/^/    /' "$work/$refuse_name.log" >&2
+		status=1
+	fi
+done
+
+# Verify `repr.js` omits `rust_begin_unwind` facade, uses deduplicated `$bstr$` helpers
+# without inline `Object.assign` trees, and throws `TypeError` on invalid Proxy writes.
+if grep -q 'rust_begin_unwind\$bstr' "$work/bytes/repr.js"; then
+	echo "facade check: unexpected rust_begin_unwind facade emitted" >&2
 	status=1
 fi
+if awk '/^function \$bstr\$/,/^}/' "$work/bytes/repr.js" | grep -q 'Object\.assign'; then
+	echo "dedup check: unexpected inline Object.assign found in \$bstr\$ helpers" >&2
+	status=1
+fi
+cat "$root/runtime/shim.js" "$work/bytes/repr.js" - <<'EOF' | node - || status=1
+{
+  globalThis.bstrSee = () => {};
+  const kept = new Map();
+  globalThis.bstrKeep = (l, v) => { kept.set(l, v); return true; };
+  globalThis.bstrReadKept = (l) => kept.get(l);
+  globalThis.bstrMutPair = (v) => {
+    let threw = false;
+    try { v[0] = 123; } catch (e) { threw = e instanceof TypeError; }
+    if (!threw) throw new Error("expected TypeError on non-string write to &mut (&str, u32)");
+    v[0] = "ok";
+  };
+  globalThis.bstrMutNamed = () => {};
+  globalThis.bstrMutOpt = (v) => {
+    let threw = false;
+    try { v._0 = 42; } catch (e) { threw = e instanceof TypeError; }
+    if (!threw) throw new Error("expected TypeError on non-string write to &mut Option<&str>");
+  };
+  globalThis.bstrMutCell = (v) => {
+    let threw = false;
+    try { v.buf[v.off] = null; } catch (e) { threw = e instanceof TypeError; }
+    if (!threw) throw new Error("expected TypeError on non-string write to &Cell<&str>");
+  };
+  globalThis.bstrCall = () => {};
+  globalThis.bstrCall0 = () => {};
+  globalThis.bstrCall2 = () => {};
+  globalThis.bstrCheckCyc = () => {};
+  globalThis.bstrGetOpt = () => ({ TAG: "None" });
+  globalThis.bstrGetPair = () => ["a", 1];
+  globalThis.bstrGetNamed = () => ({ name: "a", n: 1 });
+  globalThis.bstrMaybe = () => null;
+  globalThis.bstrTry = () => "ok";
+  globalThis.__rt.bstr_ext_pair = () => {};
+  globalThis.__rt.bstr_ext_opt = () => ({ TAG: "None" });
+  rust_entry();
+  console.log("bytes write-back TypeError checks passed");
+}
+EOF
 exit "$status"

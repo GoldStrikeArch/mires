@@ -470,31 +470,56 @@ fn resolve(
         let (live, _) = reach(dcx, &table);
         reject_cleanup_fallbacks(dcx, &table, &live, lane_run.as_ref());
     }
-    let mut dedup = crate::profile::time("link.dedup", || {
-        crate::link_dedup::merge_duplicates(
-            &mut table,
-            &reachable,
-            &BTreeSet::new(),
-            &mut conflicts,
-        )
-    });
-    let references_changed = baseline_count != reachable.len() || dedup.references_changed()
-        // The flat-call ABI adds the spill registers to the table, and an item nothing has walked
-        // to yet is an item `order` will not place and `print_units` will not print. A lowering
-        // the lane accepted may also reach *fewer* items than the baseline did — a folded branch
-        // is the ordinary case — and what nothing reaches any more must stop being printed.
-        || lane_run
-            .as_ref()
-            .is_some_and(|run| run.added_items() || run.references_changed());
+    let (mut dedup, references_changed) = if crate::lower::bstr::enabled() {
+        let pre_changed = baseline_count != reachable.len()
+            || lane_run
+                .as_ref()
+                .is_some_and(|run| run.added_items() || run.references_changed());
+        if pre_changed {
+            (reachable, parents) = reach(dcx, &table);
+        }
+        let facades = byte_string_facades(dcx, &mut table, &mut reachable);
+        for (name, body) in &facades {
+            if let Some(run) = &mut lane_run {
+                run.rename(name, body);
+            }
+        }
+        let pre_synth = reachable.len();
+        crate::lower::bstr::synthesize_converters(&mut table, &mut reachable);
+        let added_bstr = !facades.is_empty() || reachable.len() != pre_synth;
+        let dedup = crate::profile::time("link.dedup", || {
+            crate::link_dedup::merge_duplicates(
+                &mut table,
+                &reachable,
+                &BTreeSet::new(),
+                &mut conflicts,
+            )
+        });
+        let references_changed = added_bstr || dedup.references_changed();
+        (dedup, references_changed)
+    } else {
+        let dedup = crate::profile::time("link.dedup", || {
+            crate::link_dedup::merge_duplicates(
+                &mut table,
+                &reachable,
+                &BTreeSet::new(),
+                &mut conflicts,
+            )
+        });
+        let references_changed = baseline_count != reachable.len() || dedup.references_changed()
+            // The flat-call ABI adds the spill registers to the table, and an item nothing has walked
+            // to yet is an item `order` will not place and `print_units` will not print. A lowering
+            // the lane accepted may also reach *fewer* items than the baseline did — a folded branch
+            // is the ordinary case — and what nothing reaches any more must stop being printed.
+            || lane_run
+                .as_ref()
+                .is_some_and(|run| run.added_items() || run.references_changed());
+        (dedup, references_changed)
+    };
     if references_changed {
         (reachable, parents) = reach(dcx, &table);
     }
     if crate::lower::bstr::enabled() {
-        for (name, body) in byte_string_facades(dcx, &mut table, &mut reachable) {
-            if let Some(run) = &mut lane_run {
-                run.rename(&name, &body);
-            }
-        }
         refuse_hybrid_strings(dcx, &table, &reachable);
     }
     dedup.retain_reachable(&reachable);
@@ -716,6 +741,10 @@ fn byte_string_facades(
         if !item.linkage.exported {
             continue;
         }
+        let s = name.as_str();
+        if s == "rust_begin_unwind" || s.ends_with("17rust_begin_unwind") {
+            continue;
+        }
         let (Some(body), Some(interns)) = (item.jir.body.as_ref(), item.jir.interns()) else {
             continue;
         };
@@ -810,6 +839,14 @@ fn byte_string_facades(
         let Some(mut body) = table.remove(&name) else {
             continue;
         };
+        let mut refs: BTreeSet<JsName> = BTreeSet::new();
+        refs.insert(inner.clone());
+        refs.insert(JsName::new(SHIM_NAMESPACE.to_owned()));
+        jsast::visit_free_idents(&decl, &mut |ident| {
+            if ident != name.as_str() {
+                refs.insert(JsName::new(ident.to_owned()));
+            }
+        });
         let facade = LinkItem {
             name: name.clone(),
             kind: ItemKind::Fn,
@@ -818,9 +855,7 @@ fn byte_string_facades(
                 style,
                 crate::opts::get().ecma_target,
             ),
-            refs: [inner.clone(), JsName::new(SHIM_NAMESPACE.to_owned())]
-                .into_iter()
-                .collect(),
+            refs,
             zombies: Vec::new(),
             linkage: body.linkage.clone(),
             debug_path: format!("{} (js-str=bytes facade)", body.debug_path),

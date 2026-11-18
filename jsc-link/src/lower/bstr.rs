@@ -25,9 +25,15 @@
 //! calls a hybrid helper after the rewrite (a verbatim `js!` fragment, say), rather than mixing
 //! the two representations.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::jir::types::{TypeId, TypeKind, TypeTable};
+use crate::item::{item_map, ItemKind, JsItem, JsName, LinkItem, Linkage};
+use crate::jir::interns::Interns;
+use crate::jir::repr::Carrier;
+use crate::jir::types::{
+    EnumRepr, FieldDescriptor, FieldKey, NominalForm, PointerForm, RepresentationCandidate,
+    TypeDescriptor, TypeId, TypeKind, TypeTable,
+};
 use crate::jsast::{self, ArrowBody, Expr, Stmt};
 use crate::opts::StrRepr;
 
@@ -96,10 +102,25 @@ pub fn reaches_str(table: &TypeTable, ty: TypeId) -> bool {
             TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
                 walk(table, *element, seen)
             }
-            TypeKind::Adt { .. } => table
-                .variants(ty)
+            TypeKind::Adt { args, .. } => {
+                args.iter().any(|a| walk(table, *a, seen))
+                    || table
+                        .variants(ty)
+                        .iter()
+                        .any(|variant| variant.fields.iter().any(|f| walk(table, f.ty, seen)))
+            }
+            TypeKind::Closure { upvars, .. } | TypeKind::CoroutineClosure { upvars, .. } => {
+                upvars.iter().any(|u| walk(table, *u, seen))
+            }
+            TypeKind::Coroutine {
+                upvars,
+                saved_locals,
+                ..
+            } => upvars
                 .iter()
-                .any(|variant| variant.fields.iter().any(|f| walk(table, f.ty, seen))),
+                .copied()
+                .chain(saved_locals.iter().map(|(_, ty)| *ty))
+                .any(|u| walk(table, u, seen)),
             _ => false,
         }
     }
@@ -107,7 +128,7 @@ pub fn reaches_str(table: &TypeTable, ty: TypeId) -> bool {
 }
 
 /// Which way a value crosses the host boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Crossing {
     /// Rust text reaching the host: every `str` in the value is decoded.
     Out,
@@ -115,211 +136,1631 @@ pub enum Crossing {
     In,
 }
 
-/// `value`, a JavaScript value of Rust type `ty`, as it must cross the host boundary in
-/// `direction`: every `str` it reaches converted, everything else exactly as it was, so the host
-/// sees what it sees under `js-str=utf16` (the same keys in the same order, the same array
-/// elements) and Rust holds what it would have held.
-///
-/// Type-directed, never a walk of the run-time value: an enum's `TAG`, a field of a host type
-/// and a `JsValue` are strings or objects too, and must not be touched. A container is copied
-/// (`Object.assign`, an array literal, `map`), so the copy shares nothing the host could write
-/// back through. Refused, with the reason, where an exact copy is not possible: a mutable or
-/// raw pointer the host could write through, a union, a coroutine state, a value with no
-/// described layout.
-pub fn host_convert(
-    table: &TypeTable,
-    interns: &crate::jir::interns::Interns,
-    ty: TypeId,
-    value: Expr,
-    direction: Crossing,
-) -> Result<Expr, String> {
-    convert(table, interns, ty, value, direction, 0)
+const MAX_DEPTH: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Mode {
+    Val,
+    Ref,
 }
 
-fn convert(
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ConvTarget {
+    Type(TypeId, Mode),
+    RawVecInner(TypeId, TypeId),
+    RawVecPtr(TypeId),
+    FatTail(TypeId),
+    FatTailHeader(TypeId),
+    ArrayBuf(TypeId),
+    NativeVecCarrier(TypeId),
+    SliceViewCarrier(TypeId),
+}
+
+#[derive(Clone, Copy)]
+struct PeelInfo {
+    cur: TypeId,
+    allow_undef: bool,
+    via_safe_ptr: bool,
+    raw_vec_elem: Option<TypeId>,
+}
+
+enum LeafKind {
+    Str,
+    MaybeUninitStr,
+}
+
+struct Hasher(u64);
+
+impl Hasher {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    fn byte(&mut self, b: u8) {
+        self.0 ^= u64::from(b);
+        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    fn u32(&mut self, n: u32) {
+        for b in n.to_le_bytes() {
+            self.byte(b);
+        }
+    }
+
+    fn bool(&mut self, v: bool) {
+        self.byte(u8::from(v));
+    }
+
+    fn str(&mut self, s: &str) {
+        self.u32(s.len() as u32);
+        for &b in s.as_bytes() {
+            self.byte(b);
+        }
+    }
+}
+
+fn is_raw_vec(
     table: &TypeTable,
-    interns: &crate::jir::interns::Interns,
-    ty: TypeId,
-    value: Expr,
-    direction: Crossing,
-    depth: usize,
-) -> Result<Expr, String> {
-    use crate::jir::types::{EnumRepr, FieldKey, NominalForm, PointerForm};
-    if !reaches_str(table, ty) {
-        return Ok(value);
-    }
-    if is_str_pointer(table, ty) {
-        return Ok(match direction {
-            Crossing::Out => host_out(value),
-            Crossing::In => host_in(value),
-        });
-    }
-    if depth > 12 {
-        return Err("a `str` nested more than 12 levels deep".to_owned());
-    }
-    let peeled = table.peeled(ty);
-    if peeled != ty {
-        if table.crosses_transparent_union(ty) {
-            return Err("a `str` inside a union".to_owned());
-        }
-        return convert(table, interns, peeled, value, direction, depth + 1);
-    }
-    let Some(descriptor) = table.get(ty) else {
-        return Err("a type with no described layout".to_owned());
+    interns: &Interns,
+    desc: &TypeDescriptor,
+) -> Option<(TypeId, TypeId)> {
+    let TypeKind::Adt {
+        form: NominalForm::Struct,
+        args,
+        variants,
+        ..
+    } = &desc.kind
+    else {
+        return None;
     };
-    // Each container is read through a parameter, so the value is evaluated exactly once.
-    let param = format!("$s{depth}");
-    let held = || jsast::id(param.clone());
-    let wrap =
-        |body: Expr| jsast::call(jsast::arrow(vec![param.clone()], body), vec![value.clone()]);
-    let element = |element: TypeId| -> Result<Expr, String> {
-        let inner = format!("$e{depth}");
-        let converted = convert(
-            table,
-            interns,
-            element,
-            jsast::id(inner.clone()),
-            direction,
-            depth + 1,
-        )?;
-        // A buffer's element is `undefined` where nothing was written (spare capacity).
-        Ok(jsast::arrow(
-            vec![inner.clone()],
-            jsast::cond(
-                jsast::binary(
-                    jsast::BinOp::StrictEq,
-                    jsast::id(inner.clone()),
-                    jsast::undefined(),
-                ),
-                jsast::id(inner),
-                converted,
-            ),
-        ))
+    let elem_ty = *args.first()?;
+    let [variant] = variants.as_slice() else {
+        return None;
     };
-    let assign = |replaced: Vec<(String, Expr)>| {
-        jsast::call(
-            jsast::member(jsast::id("Object"), "assign"),
-            vec![jsast::object(vec![]), held(), jsast::object(replaced)],
-        )
+    if interns.str(variant.name) != Some("RawVec") {
+        return None;
+    }
+    let inner_ty = variant
+        .fields
+        .iter()
+        .find(|f| value::key_name(interns, f.key).as_deref() == Some("inner"))?
+        .ty;
+    let inner_desc = table.get(table.peeled(inner_ty))?;
+    let TypeKind::Adt {
+        form: NominalForm::Struct,
+        variants: inner_variants,
+        ..
+    } = &inner_desc.kind
+    else {
+        return None;
     };
-    let named_fields =
-        |fields: &[crate::jir::types::FieldDescriptor]| -> Result<Vec<(String, Expr)>, String> {
-            let mut replaced = Vec::new();
-            for field in fields {
-                if !reaches_str(table, field.ty) {
-                    continue;
-                }
-                let FieldKey::Name(_) = field.key else {
-                    return Err("a `str` in a field with no property of its own".to_owned());
-                };
-                let key = value::key_name(interns, field.key).unwrap_or_default();
-                let read = jsast::member(held(), key.clone());
-                replaced.push((
-                    key,
-                    convert(table, interns, field.ty, read, direction, depth + 1)?,
-                ));
-            }
-            Ok(replaced)
+    let [inner_var] = inner_variants.as_slice() else {
+        return None;
+    };
+    let has_ptr = inner_var
+        .fields
+        .iter()
+        .any(|f| value::key_name(interns, f.key).as_deref() == Some("ptr"));
+    let has_cap = inner_var
+        .fields
+        .iter()
+        .any(|f| value::key_name(interns, f.key).as_deref() == Some("cap"));
+    (has_ptr && has_cap).then_some((inner_ty, elem_ty))
+}
+
+fn unwrap_layers(table: &TypeTable, interns: &Interns, ty: TypeId) -> Result<PeelInfo, String> {
+    let mut cur = ty;
+    let mut allow_undef = false;
+    let mut via_safe_ptr = false;
+    for _ in 0..16 {
+        let Some(desc) = table.get(cur) else {
+            return Err("a type with no described layout".to_owned());
         };
-    match &descriptor.kind {
-        TypeKind::Reference { pointee, mutable } | TypeKind::RawPointer { pointee, mutable } => {
-            if *mutable || matches!(descriptor.kind, TypeKind::RawPointer { .. }) {
-                return Err(
-                    "a `str` behind a mutable or raw pointer, which the host could write through"
-                        .to_owned(),
-                );
-            }
-            match table.pointer_form(ty) {
-                // The reference is the pointee's own object.
-                Some(PointerForm::Thin) => {
-                    convert(table, interns, *pointee, value, direction, depth + 1)
-                }
-                // `{ buf, off }` / `{ buf, off, len }`: the buffer, element by element.
-                Some(PointerForm::Slot) => {
-                    let map = jsast::method_call(
-                        jsast::member(held(), "buf"),
-                        "map",
-                        vec![element(*pointee)?],
-                    );
-                    Ok(wrap(assign(vec![("buf".to_owned(), map)])))
-                }
-                Some(PointerForm::FatSlice) => {
-                    let Some(TypeKind::Slice(item)) = value::kind(table, *pointee) else {
-                        return Err("a slice pointer to a non-slice".to_owned());
-                    };
-                    let map = jsast::method_call(
-                        jsast::member(held(), "buf"),
-                        "map",
-                        vec![element(*item)?],
-                    );
-                    Ok(wrap(assign(vec![("buf".to_owned(), map)])))
-                }
-                _ => Err("a `str` behind a pointer of no convertible form".to_owned()),
-            }
+        if is_raw_vec(table, interns, desc).is_some() {
+            let TypeKind::Adt { args, .. } = &desc.kind else {
+                unreachable!()
+            };
+            return Ok(PeelInfo {
+                cur,
+                allow_undef,
+                via_safe_ptr,
+                raw_vec_elem: args.first().copied(),
+            });
         }
-        TypeKind::Tuple(_) => {
-            let mut items = Vec::new();
-            for (index, field) in descriptor.js.fields.iter().enumerate() {
-                let read = jsast::index(held(), jsast::num(index as f64));
-                items.push(convert(
-                    table,
-                    interns,
-                    field.ty,
-                    read,
-                    direction,
-                    depth + 1,
-                )?);
-            }
-            Ok(wrap(jsast::array(items)))
+        if desc.meta.candidate == RepresentationCandidate::Box {
+            via_safe_ptr = true;
         }
-        TypeKind::Array { element: item, .. } => Ok(wrap(jsast::method_call(
-            held(),
-            "map",
-            vec![element(*item)?],
-        ))),
-        TypeKind::Adt {
+        if let TypeKind::Adt {
             form: NominalForm::Struct,
             variants,
             ..
-        } => {
+        } = &desc.kind
+        {
+            if let [variant] = variants.as_slice() {
+                if matches!(interns.str(variant.name), Some("NonNull" | "Unique")) {
+                    via_safe_ptr = true;
+                }
+            }
+        }
+        if let TypeKind::Adt {
+            form: NominalForm::Union,
+            ..
+        } = &desc.kind
+        {
+            if desc.js.transparent.is_none() {
+                return Err("a `str` inside a union".to_owned());
+            }
+            allow_undef = true;
+        }
+        if let TypeKind::Pattern(base) = desc.kind {
+            cur = base;
+            continue;
+        }
+        if let Some(next) = desc.js.transparent {
+            cur = next.ty;
+        } else {
+            return Ok(PeelInfo {
+                cur,
+                allow_undef,
+                via_safe_ptr,
+                raw_vec_elem: None,
+            });
+        }
+    }
+    let cur = table.peeled(ty);
+    Ok(PeelInfo {
+        cur,
+        allow_undef,
+        via_safe_ptr,
+        raw_vec_elem: None,
+    })
+}
+
+fn leaf_kind(table: &TypeTable, interns: &Interns, ty: TypeId) -> Option<LeafKind> {
+    if !is_str_pointer(table, ty) {
+        return None;
+    }
+    let info = unwrap_layers(table, interns, ty).ok();
+    let allow_undef = info.is_some_and(|i| i.allow_undef) || table.crosses_transparent_union(ty);
+    Some(if allow_undef {
+        LeafKind::MaybeUninitStr
+    } else {
+        LeafKind::Str
+    })
+}
+
+fn vec_elem_ty(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
+    let peeled = table.peeled(ty);
+    let desc = table.get(peeled)?;
+    match &desc.kind {
+        TypeKind::Slice(elem) => Some(*elem),
+        TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
+            match &table.get(table.peeled(*pointee))?.kind {
+                TypeKind::Slice(elem) => Some(*elem),
+                _ => None,
+            }
+        }
+        TypeKind::Adt { args, .. } if desc.meta.candidate == RepresentationCandidate::Vec => {
+            args.first().copied()
+        }
+        _ => None,
+    }
+}
+
+fn field_prop_name(interns: &Interns, key: FieldKey) -> Result<String, String> {
+    match key {
+        FieldKey::Name(_) => value::key_name(interns, key)
+            .ok_or_else(|| "a `str` in an unnamed field".to_owned()),
+        FieldKey::Index(i) => Ok(i.to_string()),
+        FieldKey::Transparent => Err("a `str` in a transparent field with no key".to_owned()),
+    }
+}
+
+fn tuple_or_closure_fields(desc: &TypeDescriptor, elems: &[TypeId]) -> Vec<FieldDescriptor> {
+    if desc.js.fields.len() == elems.len() {
+        desc.js.fields.clone()
+    } else {
+        elems
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| FieldDescriptor {
+                key: FieldKey::Index(i as u32),
+                ty: *ty,
+                offset: 0,
+            })
+            .collect()
+    }
+}
+
+fn header_convertible_fields<'a>(
+    table: &TypeTable,
+    desc: &'a TypeDescriptor,
+    tail_field_idx: u32,
+) -> Result<Vec<(usize, &'a FieldDescriptor)>, String> {
+    let TypeKind::Adt {
+        form: NominalForm::Struct,
+        variants,
+        ..
+    } = &desc.kind
+    else {
+        return Err("an unsized tail on a non-struct".to_owned());
+    };
+    let [variant] = variants.as_slice() else {
+        return Err("a struct with no single variant".to_owned());
+    };
+    Ok(variant
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(idx, f)| {
+            *idx != tail_field_idx as usize && !table.is_zst(f.ty) && reaches_str(table, f.ty)
+        })
+        .collect())
+}
+
+fn fat_tail_parts(
+    table: &TypeTable,
+    pointee: TypeId,
+) -> Result<(TypeId, Option<TypeId>, Option<TypeId>), String> {
+    let peeled_pt = table.peeled(pointee);
+    let pt_desc = table
+        .get(peeled_pt)
+        .ok_or_else(|| "an unsized tail pointee with no layout".to_owned())?;
+    let tail_field = pt_desc
+        .js
+        .unsized_tail
+        .ok_or_else(|| "a fat-tail pointer without an unsized tail".to_owned())?;
+    let header_needed = !header_convertible_fields(table, pt_desc, tail_field.field)?.is_empty();
+    let header = header_needed.then_some(peeled_pt);
+    let tail_peeled = table.peeled(tail_field.ty);
+    let tail_kind = &table
+        .get(tail_peeled)
+        .ok_or_else(|| "an unsized tail with no layout".to_owned())?
+        .kind;
+    let slice_elem = match tail_kind {
+        TypeKind::Str => None,
+        TypeKind::Slice(elem) => {
+            if reaches_str(table, *elem) && !table.is_zst(*elem) {
+                Some(*elem)
+            } else {
+                None
+            }
+        }
+        _ => return Err("a `str` inside an unsupported unsized struct tail".to_owned()),
+    };
+    Ok((peeled_pt, header, slice_elem))
+}
+
+fn target_is_identity(
+    table: &TypeTable,
+    interns: &Interns,
+    target: ConvTarget,
+    seen: &mut BTreeSet<ConvTarget>,
+) -> Result<bool, String> {
+    if !seen.insert(target) {
+        return Ok(false);
+    }
+    match target {
+        ConvTarget::NativeVecCarrier(ty) | ConvTarget::SliceViewCarrier(ty) => {
+            Ok(vec_elem_ty(table, ty).is_none_or(|e| !reaches_str(table, e) || table.is_zst(e)))
+        }
+        ConvTarget::ArrayBuf(elem) | ConvTarget::RawVecPtr(elem) => {
+            Ok(!reaches_str(table, elem) || table.is_zst(elem) || {
+                if leaf_kind(table, interns, elem).is_some() {
+                    false
+                } else {
+                    target_is_identity(table, interns, ConvTarget::Type(elem, Mode::Ref), seen)?
+                }
+            })
+        }
+        ConvTarget::RawVecInner(inner_ty, elem_ty) => {
+            let elem_noop = !reaches_str(table, elem_ty)
+                || table.is_zst(elem_ty)
+                || target_is_identity(table, interns, ConvTarget::RawVecPtr(elem_ty), seen)?;
+            if !elem_noop {
+                return Ok(false);
+            }
+            let peeled = table.peeled(inner_ty);
+            let Some(desc) = table.get(peeled) else {
+                return Err("a type with no described layout".to_owned());
+            };
+            let TypeKind::Adt {
+                form: NominalForm::Struct,
+                variants,
+                ..
+            } = &desc.kind
+            else {
+                return Err("a struct with no single variant".to_owned());
+            };
             let [variant] = variants.as_slice() else {
                 return Err("a struct with no single variant".to_owned());
             };
-            Ok(wrap(assign(named_fields(&variant.fields)?)))
-        }
-        TypeKind::Adt {
-            form: NominalForm::Enum,
-            variants,
-            ..
-        } => {
-            if !matches!(
-                table.enum_repr(ty),
-                Some(EnumRepr::Tag { fieldless: false })
-            ) {
-                return Err("a `str` in an enum whose value is not a tagged object".to_owned());
-            }
-            let mut converted = held();
-            for variant in variants.iter().rev() {
-                let replaced = named_fields(&variant.fields)?;
-                if replaced.is_empty() {
+            for field in &variant.fields {
+                if value::key_name(interns, field.key).as_deref() == Some("ptr")
+                    || table.is_zst(field.ty)
+                    || !reaches_str(table, field.ty)
+                {
                     continue;
                 }
-                converted = jsast::cond(
-                    jsast::binary(
-                        jsast::BinOp::StrictEq,
-                        jsast::member(held(), value::TAG),
-                        value::tag_literal(interns, variant),
-                    ),
-                    assign(replaced),
-                    converted,
+                if !field_is_identity(table, interns, field.ty, Mode::Ref, seen)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        ConvTarget::FatTailHeader(peeled_pt) => {
+            let Some(pt_desc) = table.get(peeled_pt) else {
+                return Err("an unsized tail pointee with no layout".to_owned());
+            };
+            let tail_idx = pt_desc
+                .js
+                .unsized_tail
+                .ok_or_else(|| "a fat-tail pointer without an unsized tail".to_owned())?
+                .field;
+            Ok(header_convertible_fields(table, pt_desc, tail_idx)?.is_empty())
+        }
+        ConvTarget::FatTail(pointee) => {
+            let (_, header, slice_elem) = fat_tail_parts(table, pointee)?;
+            let header_noop = match header {
+                Some(h) => target_is_identity(table, interns, ConvTarget::FatTailHeader(h), seen)?,
+                None => true,
+            };
+            let elem_noop = match slice_elem {
+                Some(e) => field_is_identity(table, interns, e, Mode::Ref, seen)?,
+                None => true,
+            };
+            Ok(header_noop && elem_noop)
+        }
+        ConvTarget::Type(ty, mode) => {
+            if !reaches_str(table, ty) || table.is_zst(ty) {
+                return Ok(true);
+            }
+            if leaf_kind(table, interns, ty).is_some() {
+                return Ok(false);
+            }
+            let info = unwrap_layers(table, interns, ty)?;
+            if let Some(elem_ty) = info.raw_vec_elem {
+                let inner_ty = is_raw_vec(
+                    table,
+                    interns,
+                    table
+                        .get(info.cur)
+                        .ok_or_else(|| "a type with no described layout".to_owned())?,
+                )
+                .map(|(i, _)| i)
+                .ok_or_else(|| "invalid RawVec layout".to_owned())?;
+                return target_is_identity(
+                    table,
+                    interns,
+                    ConvTarget::RawVecInner(inner_ty, elem_ty),
+                    seen,
                 );
             }
-            Ok(wrap(converted))
+            let Some(desc) = table.get(info.cur) else {
+                return Err("a type with no described layout".to_owned());
+            };
+            match &desc.kind {
+                TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
+                    if matches!(desc.kind, TypeKind::RawPointer { .. }) && !info.via_safe_ptr {
+                        return Err("a `str` behind a raw pointer".to_owned());
+                    }
+                    if table.is_zst(*pointee) || !reaches_str(table, *pointee) {
+                        return Ok(true);
+                    }
+                    match table.pointer_form(info.cur) {
+                        Some(PointerForm::Thin) => {
+                            target_is_identity(table, interns, ConvTarget::Type(*pointee, Mode::Ref), seen)
+                        }
+                        Some(PointerForm::Slot) => {
+                            field_is_identity(table, interns, *pointee, Mode::Ref, seen)
+                        }
+                        Some(PointerForm::FatSlice) => {
+                            let TypeKind::Slice(elem) =
+                                table.get(table.peeled(*pointee)).map(|d| &d.kind).ok_or_else(
+                                    || "a slice pointer with no pointee layout".to_owned(),
+                                )?
+                            else {
+                                return Err("a slice pointer to a non-slice".to_owned());
+                            };
+                            field_is_identity(table, interns, *elem, Mode::Ref, seen)
+                        }
+                        Some(PointerForm::FatTail) => {
+                            target_is_identity(table, interns, ConvTarget::FatTail(*pointee), seen)
+                        }
+                        _ => Err("a `str` behind a pointer of no convertible form".to_owned()),
+                    }
+                }
+                TypeKind::Tuple(elems) => {
+                    let fields = tuple_or_closure_fields(desc, elems);
+                    for f in fields {
+                        if !field_is_identity(table, interns, f.ty, mode, seen)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                TypeKind::Closure { upvars, .. } => {
+                    let fields = tuple_or_closure_fields(desc, upvars);
+                    for f in fields {
+                        if !field_is_identity(table, interns, f.ty, mode, seen)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                TypeKind::Array { element, .. } => {
+                    field_is_identity(table, interns, *element, mode, seen)
+                }
+                TypeKind::Adt {
+                    form: NominalForm::Struct,
+                    variants,
+                    ..
+                } => {
+                    let [variant] = variants.as_slice() else {
+                        return Err("a struct with no single variant".to_owned());
+                    };
+                    for f in &variant.fields {
+                        if !field_is_identity(table, interns, f.ty, mode, seen)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                TypeKind::Adt {
+                    form: NominalForm::Enum,
+                    variants,
+                    ..
+                } => match table.enum_repr(info.cur) {
+                    Some(EnumRepr::Number { .. }) | Some(EnumRepr::Tag { fieldless: true }) => {
+                        Ok(true)
+                    }
+                    Some(EnumRepr::Tag { fieldless: false }) => {
+                        for variant in variants {
+                            for f in &variant.fields {
+                                if !field_is_identity(table, interns, f.ty, mode, seen)? {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                        Ok(true)
+                    }
+                    _ => Err("a `str` in an enum whose value is not a tagged object".to_owned()),
+                },
+                TypeKind::Adt {
+                    form: NominalForm::Union,
+                    ..
+                } => Err("a `str` inside a union".to_owned()),
+                TypeKind::Coroutine { .. } | TypeKind::CoroutineClosure { .. } => {
+                    Err("a `str` inside a coroutine".to_owned())
+                }
+                _ => Err("a `str` inside a value of no convertible shape".to_owned()),
+            }
         }
-        _ => Err(
-            "a `str` inside a value of no convertible shape (a union, closure or coroutine)"
-                .to_owned(),
-        ),
+    }
+}
+
+fn field_is_identity(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+    mode: Mode,
+    seen: &mut BTreeSet<ConvTarget>,
+) -> Result<bool, String> {
+    if !reaches_str(table, ty) || table.is_zst(ty) {
+        return Ok(true);
+    }
+    if leaf_kind(table, interns, ty).is_some() {
+        return Ok(false);
+    }
+    target_is_identity(table, interns, ConvTarget::Type(ty, mode), seen)
+}
+
+fn hash_target(
+    table: &TypeTable,
+    interns: &Interns,
+    target: ConvTarget,
+    dir: Crossing,
+    depth: usize,
+    stack: &mut Vec<ConvTarget>,
+    h: &mut Hasher,
+) -> Result<(), String> {
+    if let Some(pos) = stack.iter().rposition(|t| *t == target) {
+        h.byte(b'C');
+        h.u32((stack.len() - 1 - pos) as u32);
+        return Ok(());
+    }
+    if depth > MAX_DEPTH {
+        return Err(format!("a `str` nested more than {MAX_DEPTH} levels deep"));
+    }
+    h.byte(match dir {
+        Crossing::Out => b'O',
+        Crossing::In => b'I',
+    });
+    stack.push(target);
+    let res = (|| -> Result<(), String> {
+        match target {
+            ConvTarget::NativeVecCarrier(ty) => {
+                h.str("NativeVec");
+                let elem = vec_elem_ty(table, ty)
+                    .ok_or_else(|| "a native Vec without element type".to_owned())?;
+                hash_target(table, interns, ConvTarget::ArrayBuf(elem), dir, depth + 1, stack, h)
+            }
+            ConvTarget::SliceViewCarrier(ty) => {
+                h.str("SliceView");
+                let elem = vec_elem_ty(table, ty)
+                    .ok_or_else(|| "a slice view without element type".to_owned())?;
+                hash_field_child(table, interns, elem, Mode::Ref, dir, depth + 1, stack, h)
+            }
+            ConvTarget::ArrayBuf(elem) => {
+                h.str("ArrayBuf");
+                hash_field_child(table, interns, elem, Mode::Ref, dir, depth + 1, stack, h)
+            }
+            ConvTarget::RawVecPtr(elem) => {
+                h.str("RawVecPtr");
+                hash_field_child(table, interns, elem, Mode::Ref, dir, depth + 1, stack, h)
+            }
+            ConvTarget::RawVecInner(inner_ty, elem_ty) => {
+                h.str("RawVecInner");
+                let peeled = table.peeled(inner_ty);
+                let desc = table
+                    .get(peeled)
+                    .ok_or_else(|| "a type with no described layout".to_owned())?;
+                let TypeKind::Adt {
+                    form: NominalForm::Struct,
+                    variants,
+                    ..
+                } = &desc.kind
+                else {
+                    return Err("a struct with no single variant".to_owned());
+                };
+                let [variant] = variants.as_slice() else {
+                    return Err("a struct with no single variant".to_owned());
+                };
+                for field in &variant.fields {
+                    let prop = field_prop_name(interns, field.key)?;
+                    if prop == "ptr" {
+                        h.str("ptr");
+                        hash_target(
+                            table,
+                            interns,
+                            ConvTarget::RawVecPtr(elem_ty),
+                            dir,
+                            depth + 1,
+                            stack,
+                            h,
+                        )?;
+                    } else if !table.is_zst(field.ty) && reaches_str(table, field.ty) {
+                        h.str(&prop);
+                        hash_field_child(
+                            table,
+                            interns,
+                            field.ty,
+                            Mode::Ref,
+                            dir,
+                            depth + 1,
+                            stack,
+                            h,
+                        )?;
+                    }
+                }
+                Ok(())
+            }
+            ConvTarget::FatTailHeader(peeled_pt) => {
+                h.str("FatTailHeader");
+                let pt_desc = table
+                    .get(peeled_pt)
+                    .ok_or_else(|| "an unsized tail pointee with no layout".to_owned())?;
+                let tail_idx = pt_desc
+                    .js
+                    .unsized_tail
+                    .ok_or_else(|| "a fat-tail pointer without an unsized tail".to_owned())?
+                    .field;
+                for (_, f) in header_convertible_fields(table, pt_desc, tail_idx)? {
+                    let prop = field_prop_name(interns, f.key)?;
+                    h.str(&prop);
+                    hash_field_child(table, interns, f.ty, Mode::Ref, dir, depth + 1, stack, h)?;
+                }
+                Ok(())
+            }
+            ConvTarget::FatTail(pointee) => {
+                h.str("FatTail");
+                let (_, header, slice_elem) = fat_tail_parts(table, pointee)?;
+                h.bool(header.is_some());
+                if let Some(hdr) = header {
+                    hash_target(
+                        table,
+                        interns,
+                        ConvTarget::FatTailHeader(hdr),
+                        dir,
+                        depth + 1,
+                        stack,
+                        h,
+                    )?;
+                }
+                h.bool(slice_elem.is_some());
+                if let Some(elem) = slice_elem {
+                    hash_field_child(table, interns, elem, Mode::Ref, dir, depth + 1, stack, h)?;
+                }
+                Ok(())
+            }
+            ConvTarget::Type(ty, mode) => {
+                h.byte(match mode {
+                    Mode::Val => b'V',
+                    Mode::Ref => b'R',
+                });
+                let info = unwrap_layers(table, interns, ty)?;
+                h.bool(info.allow_undef);
+                if let Some(elem_ty) = info.raw_vec_elem {
+                    h.str("RawVec");
+                    let desc = table
+                        .get(info.cur)
+                        .ok_or_else(|| "a type with no described layout".to_owned())?;
+                    let (inner_ty, _) = is_raw_vec(table, interns, desc)
+                        .ok_or_else(|| "invalid RawVec layout".to_owned())?;
+                    let TypeKind::Adt { variants, .. } = &desc.kind else {
+                        unreachable!()
+                    };
+                    for f in &variants[0].fields {
+                        let prop = field_prop_name(interns, f.key)?;
+                        if prop == "inner" {
+                            h.str("inner");
+                            hash_target(
+                                table,
+                                interns,
+                                ConvTarget::RawVecInner(inner_ty, elem_ty),
+                                dir,
+                                depth + 1,
+                                stack,
+                                h,
+                            )?;
+                        } else if !table.is_zst(f.ty) && reaches_str(table, f.ty) {
+                            h.str(&prop);
+                            hash_field_child(
+                                table,
+                                interns,
+                                f.ty,
+                                Mode::Ref,
+                                dir,
+                                depth + 1,
+                                stack,
+                                h,
+                            )?;
+                        }
+                    }
+                    return Ok(());
+                }
+                let desc = table
+                    .get(info.cur)
+                    .ok_or_else(|| "a type with no described layout".to_owned())?;
+                match &desc.kind {
+                    TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
+                        if matches!(desc.kind, TypeKind::RawPointer { .. }) && !info.via_safe_ptr {
+                            return Err("a `str` behind a raw pointer".to_owned());
+                        }
+                        match table.pointer_form(info.cur) {
+                            Some(PointerForm::Thin) => {
+                                h.str("Thin");
+                                hash_target(
+                                    table,
+                                    interns,
+                                    ConvTarget::Type(*pointee, Mode::Ref),
+                                    dir,
+                                    depth + 1,
+                                    stack,
+                                    h,
+                                )
+                            }
+                            Some(PointerForm::Slot) => {
+                                h.str("Slot");
+                                hash_field_child(
+                                    table,
+                                    interns,
+                                    *pointee,
+                                    Mode::Ref,
+                                    dir,
+                                    depth + 1,
+                                    stack,
+                                    h,
+                                )
+                            }
+                            Some(PointerForm::FatSlice) => {
+                                h.str("FatSlice");
+                                let TypeKind::Slice(elem) = table
+                                    .get(table.peeled(*pointee))
+                                    .map(|d| &d.kind)
+                                    .ok_or_else(|| {
+                                        "a slice pointer with no pointee layout".to_owned()
+                                    })?
+                                else {
+                                    return Err("a slice pointer to a non-slice".to_owned());
+                                };
+                                hash_field_child(
+                                    table,
+                                    interns,
+                                    *elem,
+                                    Mode::Ref,
+                                    dir,
+                                    depth + 1,
+                                    stack,
+                                    h,
+                                )
+                            }
+                            Some(PointerForm::FatTail) => {
+                                h.str("FatTailPtr");
+                                hash_target(
+                                    table,
+                                    interns,
+                                    ConvTarget::FatTail(*pointee),
+                                    dir,
+                                    depth + 1,
+                                    stack,
+                                    h,
+                                )
+                            }
+                            _ => Err("a `str` behind a pointer of no convertible form".to_owned()),
+                        }
+                    }
+                    TypeKind::Tuple(elems) | TypeKind::Closure { upvars: elems, .. } => {
+                        h.str(if matches!(desc.kind, TypeKind::Closure { .. }) {
+                            "Closure"
+                        } else {
+                            "Tuple"
+                        });
+                        let fields = tuple_or_closure_fields(desc, elems);
+                        h.u32(fields.len() as u32);
+                        for f in &fields {
+                            let prop = field_prop_name(interns, f.key)?;
+                            h.str(&prop);
+                            hash_field_child(table, interns, f.ty, mode, dir, depth + 1, stack, h)?;
+                        }
+                        Ok(())
+                    }
+                    TypeKind::Array { element, .. } => {
+                        h.str("Array");
+                        hash_field_child(table, interns, *element, mode, dir, depth + 1, stack, h)
+                    }
+                    TypeKind::Adt {
+                        form: NominalForm::Struct,
+                        variants,
+                        ..
+                    } => {
+                        h.str("Struct");
+                        let [variant] = variants.as_slice() else {
+                            return Err("a struct with no single variant".to_owned());
+                        };
+                        h.u32(variant.fields.len() as u32);
+                        for f in &variant.fields {
+                            let prop = field_prop_name(interns, f.key)?;
+                            h.str(&prop);
+                            hash_field_child(table, interns, f.ty, mode, dir, depth + 1, stack, h)?;
+                        }
+                        Ok(())
+                    }
+                    TypeKind::Adt {
+                        form: NominalForm::Enum,
+                        variants,
+                        ..
+                    } => {
+                        if !matches!(table.enum_repr(info.cur), Some(EnumRepr::Tag { fieldless: false })) {
+                            return Err(
+                                "a `str` in an enum whose value is not a tagged object".to_owned(),
+                            );
+                        }
+                        h.str("Enum");
+                        h.u32(variants.len() as u32);
+                        for variant in variants {
+                            h.str(value::variant_name(interns, variant));
+                            h.u32(variant.fields.len() as u32);
+                            for f in &variant.fields {
+                                let prop = field_prop_name(interns, f.key)?;
+                                h.str(&prop);
+                                hash_field_child(
+                                    table,
+                                    interns,
+                                    f.ty,
+                                    mode,
+                                    dir,
+                                    depth + 1,
+                                    stack,
+                                    h,
+                                )?;
+                            }
+                        }
+                        Ok(())
+                    }
+                    TypeKind::Adt {
+                        form: NominalForm::Union,
+                        ..
+                    } => Err("a `str` inside a union".to_owned()),
+                    TypeKind::Coroutine { .. } | TypeKind::CoroutineClosure { .. } => {
+                        Err("a `str` inside a coroutine".to_owned())
+                    }
+                    _ => Err("a `str` inside a value of no convertible shape".to_owned()),
+                }
+            }
+        }
+    })();
+    stack.pop();
+    res
+}
+
+fn hash_field_child(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+    mode: Mode,
+    dir: Crossing,
+    depth: usize,
+    stack: &mut Vec<ConvTarget>,
+    h: &mut Hasher,
+) -> Result<(), String> {
+    if depth > MAX_DEPTH {
+        return Err(format!("a `str` nested more than {MAX_DEPTH} levels deep"));
+    }
+    if !reaches_str(table, ty) || table.is_zst(ty) {
+        h.byte(b'-');
+        return Ok(());
+    }
+    match leaf_kind(table, interns, ty) {
+        Some(LeafKind::Str) => {
+            h.byte(b's');
+            Ok(())
+        }
+        Some(LeafKind::MaybeUninitStr) => {
+            h.byte(b'u');
+            Ok(())
+        }
+        None => hash_target(table, interns, ConvTarget::Type(ty, mode), dir, depth, stack, h),
+    }
+}
+
+fn target_name(
+    table: &TypeTable,
+    interns: &Interns,
+    target: ConvTarget,
+    dir: Crossing,
+    cache: &mut BTreeMap<(ConvTarget, Crossing), Result<Option<JsName>, String>>,
+) -> Result<Option<JsName>, String> {
+    if let Some(cached) = cache.get(&(target, dir)) {
+        return cached.clone();
+    }
+    let res = (|| -> Result<Option<JsName>, String> {
+        if target_is_identity(table, interns, target, &mut BTreeSet::new())? {
+            return Ok(None);
+        }
+        let mut h = Hasher::new();
+        let mut stack = Vec::new();
+        hash_target(table, interns, target, dir, 0, &mut stack, &mut h)?;
+        let prefix = match (dir, is_ref_target(table, interns, target)) {
+            (Crossing::Out, false) => "$bstr$out$",
+            (Crossing::In, false) => "$bstr$in$",
+            (Crossing::Out, true) => "$bstr$out$r$",
+            (Crossing::In, true) => "$bstr$in$r$",
+        };
+        Ok(Some(JsName::new(format!("{prefix}{:016x}", h.0))))
+    })();
+    cache.insert((target, dir), res.clone());
+    res
+}
+
+fn is_ref_target(table: &TypeTable, interns: &Interns, target: ConvTarget) -> bool {
+    match target {
+        ConvTarget::Type(_, Mode::Ref) => true,
+        ConvTarget::Type(ty, Mode::Val) => {
+            let Ok(info) = unwrap_layers(table, interns, ty) else {
+                return false;
+            };
+            info.raw_vec_elem.is_some()
+                || table.get(info.cur).is_some_and(|d| {
+                    matches!(
+                        d.kind,
+                        TypeKind::Reference { .. } | TypeKind::RawPointer { .. }
+                    )
+                })
+        }
+        _ => true,
+    }
+}
+
+/// `value`, a JavaScript value of Rust type `ty`, as it must cross the host boundary in
+/// `direction`: every `str` it reaches converted, everything else exactly as it was, so the host
+/// sees what it sees under `js-str=utf16` and Rust holds what it would have held.
+pub fn host_convert(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+    value: Expr,
+    direction: Crossing,
+) -> Result<Expr, String> {
+    host_convert_carrier(table, interns, ty, Carrier::Baseline, value, direction)
+}
+
+/// Like [`host_convert`], accounting for an explicit non-baseline value [`Carrier`] at the host
+/// boundary (`Carrier::NativeVec` / `Carrier::SliceView`).
+pub fn host_convert_carrier(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+    carrier: Carrier,
+    value: Expr,
+    direction: Crossing,
+) -> Result<Expr, String> {
+    if !reaches_str(table, ty) || table.is_zst(ty) {
+        return Ok(value);
+    }
+    if let Some(leaf) = leaf_kind(table, interns, ty) {
+        return Ok(wrap_leaf(leaf, value, direction));
+    }
+    let target = match carrier {
+        Carrier::NativeVec => ConvTarget::NativeVecCarrier(ty),
+        Carrier::SliceView => ConvTarget::SliceViewCarrier(ty),
+        _ => ConvTarget::Type(ty, Mode::Val),
+    };
+    let mut cache = BTreeMap::new();
+    match target_name(table, interns, target, direction, &mut cache)? {
+        Some(name) => Ok(jsast::call(jsast::id(name.as_str().to_owned()), vec![value])),
+        None => Ok(value),
+    }
+}
+
+fn wrap_leaf(leaf: LeafKind, value: Expr, dir: Crossing) -> Expr {
+    let conv = match dir {
+        Crossing::Out => host_out(value.clone()),
+        Crossing::In => host_in(value.clone()),
+    };
+    match leaf {
+        LeafKind::Str => conv,
+        LeafKind::MaybeUninitStr => {
+            let param = "$u0".to_owned();
+            let id = jsast::id(param.clone());
+            let body = match dir {
+                Crossing::Out => host_out(id.clone()),
+                Crossing::In => host_in(id.clone()),
+            };
+            jsast::call(
+                jsast::arrow(
+                    vec![param],
+                    jsast::cond(
+                        jsast::binary(jsast::BinOp::StrictEq, id, jsast::undefined()),
+                        jsast::undefined(),
+                        body,
+                    ),
+                ),
+                vec![value],
+            )
+        }
+    }
+}
+
+fn spec_ref_fn(
+    dir: Crossing,
+) -> &'static str {
+    match dir {
+        Crossing::Out => "bstr_ref",
+        Crossing::In => "bstr_ref_in",
+    }
+}
+
+fn child_spec_expr(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+    cache: &mut BTreeMap<(ConvTarget, Crossing), Result<Option<JsName>, String>>,
+    pending: &mut Vec<(ConvTarget, Crossing)>,
+) -> Result<Option<Expr>, String> {
+    if !reaches_str(table, ty) || table.is_zst(ty) {
+        return Ok(None);
+    }
+    if let Some(leaf) = leaf_kind(table, interns, ty) {
+        return Ok(Some(jsast::string(match leaf {
+            LeafKind::Str => "s",
+            LeafKind::MaybeUninitStr => "u",
+        })));
+    }
+    target_pair_expr(table, interns, ConvTarget::Type(ty, Mode::Ref), cache, pending)
+}
+
+fn target_pair_expr(
+    table: &TypeTable,
+    interns: &Interns,
+    target: ConvTarget,
+    cache: &mut BTreeMap<(ConvTarget, Crossing), Result<Option<JsName>, String>>,
+    pending: &mut Vec<(ConvTarget, Crossing)>,
+) -> Result<Option<Expr>, String> {
+    let Some(out_name) = target_name(table, interns, target, Crossing::Out, cache)? else {
+        return Ok(None);
+    };
+    let Some(in_name) = target_name(table, interns, target, Crossing::In, cache)? else {
+        return Ok(None);
+    };
+    pending.push((target, Crossing::Out));
+    pending.push((target, Crossing::In));
+    Ok(Some(jsast::array(vec![
+        jsast::id(out_name.as_str().to_owned()),
+        jsast::id(in_name.as_str().to_owned()),
+    ])))
+}
+
+fn child_val_expr(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+    read: Expr,
+    dir: Crossing,
+    cache: &mut BTreeMap<(ConvTarget, Crossing), Result<Option<JsName>, String>>,
+    pending: &mut Vec<(ConvTarget, Crossing)>,
+) -> Result<Expr, String> {
+    if !reaches_str(table, ty) || table.is_zst(ty) {
+        return Ok(read);
+    }
+    if let Some(leaf) = leaf_kind(table, interns, ty) {
+        return Ok(match leaf {
+            LeafKind::Str => match dir {
+                Crossing::Out => host_out(read),
+                Crossing::In => host_in(read),
+            },
+            LeafKind::MaybeUninitStr => wrap_leaf(leaf, read, dir),
+        });
+    }
+    let target = ConvTarget::Type(ty, Mode::Val);
+    match target_name(table, interns, target, dir, cache)? {
+        Some(name) => {
+            pending.push((target, dir));
+            Ok(jsast::call(jsast::id(name.as_str().to_owned()), vec![read]))
+        }
+        None => Ok(read),
+    }
+}
+
+fn build_decl(
+    table: &TypeTable,
+    interns: &Interns,
+    name: &JsName,
+    target: ConvTarget,
+    dir: Crossing,
+    cache: &mut BTreeMap<(ConvTarget, Crossing), Result<Option<JsName>, String>>,
+    pending: &mut Vec<(ConvTarget, Crossing)>,
+) -> Result<Stmt, String> {
+    let param = "v".to_owned();
+    let p = || jsast::id(param.clone());
+    let ref_call = |spec: Expr| {
+        jsast::rt_call(spec_ref_fn(dir), vec![p(), spec])
+    };
+    let mut body: Vec<Stmt> = Vec::new();
+    match target {
+        ConvTarget::NativeVecCarrier(ty) => {
+            let elem = vec_elem_ty(table, ty)
+                .ok_or_else(|| "a native Vec without element type".to_owned())?;
+            let buf_pair =
+                target_pair_expr(table, interns, ConvTarget::ArrayBuf(elem), cache, pending)?
+                    .ok_or_else(|| "a native Vec buffer with no conversion".to_owned())?;
+            let spec = jsast::object_of(vec![
+                ("k", jsast::string("o")),
+                ("f", jsast::object(vec![("buf".to_owned(), buf_pair)])),
+            ]);
+            body.push(jsast::ret(ref_call(spec)));
+        }
+        ConvTarget::SliceViewCarrier(ty) => {
+            let elem = vec_elem_ty(table, ty)
+                .ok_or_else(|| "a slice view without element type".to_owned())?;
+            let elem_spec = child_spec_expr(table, interns, elem, cache, pending)?
+                .unwrap_or_else(|| jsast::string("s"));
+            let spec = jsast::object_of(vec![("k", jsast::string("slot")), ("c", elem_spec)]);
+            body.push(jsast::ret(ref_call(spec)));
+        }
+        ConvTarget::ArrayBuf(elem) => {
+            let elem_spec = child_spec_expr(table, interns, elem, cache, pending)?
+                .unwrap_or_else(|| jsast::string("s"));
+            let spec = jsast::object_of(vec![("k", jsast::string("a")), ("c", elem_spec)]);
+            body.push(jsast::ret(ref_call(spec)));
+        }
+        ConvTarget::RawVecPtr(elem) => {
+            let elem_spec = child_spec_expr(table, interns, elem, cache, pending)?
+                .unwrap_or_else(|| jsast::string("s"));
+            let spec = jsast::object_of(vec![("k", jsast::string("slot")), ("c", elem_spec)]);
+            body.push(jsast::ret(ref_call(spec)));
+        }
+        ConvTarget::RawVecInner(inner_ty, elem_ty) => {
+            let peeled = table.peeled(inner_ty);
+            let desc = table
+                .get(peeled)
+                .ok_or_else(|| "a type with no described layout".to_owned())?;
+            let TypeKind::Adt {
+                form: NominalForm::Struct,
+                variants,
+                ..
+            } = &desc.kind
+            else {
+                return Err("a struct with no single variant".to_owned());
+            };
+            let mut entries = Vec::new();
+            for f in &variants[0].fields {
+                let prop = field_prop_name(interns, f.key)?;
+                if prop == "ptr" {
+                    if let Some(pair) = target_pair_expr(
+                        table,
+                        interns,
+                        ConvTarget::RawVecPtr(elem_ty),
+                        cache,
+                        pending,
+                    )? {
+                        entries.push((prop, pair));
+                    }
+                } else if let Some(spec) = child_spec_expr(table, interns, f.ty, cache, pending)? {
+                    entries.push((prop, spec));
+                }
+            }
+            let spec = jsast::object_of(vec![("k", jsast::string("o")), ("f", jsast::object(entries))]);
+            body.push(jsast::ret(ref_call(spec)));
+        }
+        ConvTarget::FatTailHeader(peeled_pt) => {
+            let pt_desc = table
+                .get(peeled_pt)
+                .ok_or_else(|| "an unsized tail pointee with no layout".to_owned())?;
+            let tail_idx = pt_desc
+                .js
+                .unsized_tail
+                .ok_or_else(|| "a fat-tail pointer without an unsized tail".to_owned())?
+                .field;
+            let mut entries = Vec::new();
+            for (_, f) in header_convertible_fields(table, pt_desc, tail_idx)? {
+                let prop = field_prop_name(interns, f.key)?;
+                if let Some(spec) = child_spec_expr(table, interns, f.ty, cache, pending)? {
+                    entries.push((prop, spec));
+                }
+            }
+            let spec = jsast::object_of(vec![("k", jsast::string("o")), ("f", jsast::object(entries))]);
+            body.push(jsast::ret(ref_call(spec)));
+        }
+        ConvTarget::FatTail(pointee) => {
+            let (_, header, slice_elem) = fat_tail_parts(table, pointee)?;
+            let hdr_expr = match header {
+                Some(h) => target_pair_expr(
+                    table,
+                    interns,
+                    ConvTarget::FatTailHeader(h),
+                    cache,
+                    pending,
+                )?
+                .unwrap_or_else(jsast::null),
+                None => jsast::null(),
+            };
+            let elem_expr = match slice_elem {
+                Some(e) => {
+                    child_spec_expr(table, interns, e, cache, pending)?.unwrap_or_else(jsast::null)
+                }
+                None => jsast::null(),
+            };
+            let spec = jsast::object_of(vec![
+                ("k", jsast::string("tail")),
+                ("h", hdr_expr),
+                ("c", elem_expr),
+            ]);
+            body.push(jsast::ret(ref_call(spec)));
+        }
+        ConvTarget::Type(ty, mode) => {
+            let info = unwrap_layers(table, interns, ty)?;
+            if info.allow_undef && mode == Mode::Val && info.raw_vec_elem.is_none() {
+                body.push(jsast::if_else(
+                    jsast::binary(jsast::BinOp::StrictEq, p(), jsast::undefined()),
+                    vec![jsast::ret(jsast::undefined())],
+                    Vec::new(),
+                ));
+            }
+            if let Some(elem_ty) = info.raw_vec_elem {
+                let desc = table
+                    .get(info.cur)
+                    .ok_or_else(|| "a type with no described layout".to_owned())?;
+                let (inner_ty, _) = is_raw_vec(table, interns, desc)
+                    .ok_or_else(|| "invalid RawVec layout".to_owned())?;
+                let TypeKind::Adt { variants, .. } = &desc.kind else {
+                    unreachable!()
+                };
+                let mut entries = Vec::new();
+                for f in &variants[0].fields {
+                    let prop = field_prop_name(interns, f.key)?;
+                    if prop == "inner" {
+                        if let Some(pair) = target_pair_expr(
+                            table,
+                            interns,
+                            ConvTarget::RawVecInner(inner_ty, elem_ty),
+                            cache,
+                            pending,
+                        )? {
+                            entries.push((prop, pair));
+                        }
+                    } else if let Some(spec) =
+                        child_spec_expr(table, interns, f.ty, cache, pending)?
+                    {
+                        entries.push((prop, spec));
+                    }
+                }
+                let spec =
+                    jsast::object_of(vec![("k", jsast::string("o")), ("f", jsast::object(entries))]);
+                body.push(jsast::ret(ref_call(spec)));
+            } else {
+                let desc = table
+                    .get(info.cur)
+                    .ok_or_else(|| "a type with no described layout".to_owned())?;
+                match &desc.kind {
+                    TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
+                        match table.pointer_form(info.cur) {
+                            Some(PointerForm::Thin) => {
+                                let inner_target = ConvTarget::Type(*pointee, Mode::Ref);
+                                let Some(inner_name) =
+                                    target_name(table, interns, inner_target, dir, cache)?
+                                else {
+                                    return Err("unreachable thin identity".to_owned());
+                                };
+                                pending.push((inner_target, dir));
+                                body.push(jsast::ret(jsast::call(
+                                    jsast::id(inner_name.as_str().to_owned()),
+                                    vec![p()],
+                                )));
+                            }
+                            Some(PointerForm::Slot) => {
+                                let c = child_spec_expr(table, interns, *pointee, cache, pending)?
+                                    .unwrap_or_else(jsast::null);
+                                let spec =
+                                    jsast::object_of(vec![("k", jsast::string("slot")), ("c", c)]);
+                                body.push(jsast::ret(ref_call(spec)));
+                            }
+                            Some(PointerForm::FatSlice) => {
+                                let TypeKind::Slice(elem) =
+                                    table.get(table.peeled(*pointee)).map(|d| &d.kind).ok_or_else(
+                                        || "a slice pointer with no pointee layout".to_owned(),
+                                    )?
+                                else {
+                                    return Err("a slice pointer to a non-slice".to_owned());
+                                };
+                                let c = child_spec_expr(table, interns, *elem, cache, pending)?
+                                    .unwrap_or_else(jsast::null);
+                                let spec =
+                                    jsast::object_of(vec![("k", jsast::string("slot")), ("c", c)]);
+                                body.push(jsast::ret(ref_call(spec)));
+                            }
+                            Some(PointerForm::FatTail) => {
+                                let inner_target = ConvTarget::FatTail(*pointee);
+                                let Some(inner_name) =
+                                    target_name(table, interns, inner_target, dir, cache)?
+                                else {
+                                    return Err("unreachable fat-tail identity".to_owned());
+                                };
+                                pending.push((inner_target, dir));
+                                body.push(jsast::ret(jsast::call(
+                                    jsast::id(inner_name.as_str().to_owned()),
+                                    vec![p()],
+                                )));
+                            }
+                            _ => return Err("a `str` behind a pointer of no convertible form".to_owned()),
+                        }
+                    }
+                    TypeKind::Tuple(elems) | TypeKind::Closure { upvars: elems, .. } => {
+                        let fields = tuple_or_closure_fields(desc, elems);
+                        if mode == Mode::Ref {
+                            let mut entries = Vec::new();
+                            for (i, f) in fields.iter().enumerate() {
+                                if let Some(spec) =
+                                    child_spec_expr(table, interns, f.ty, cache, pending)?
+                                {
+                                    entries.push((i.to_string(), spec));
+                                }
+                            }
+                            let spec = jsast::object_of(vec![
+                                ("k", jsast::string("o")),
+                                ("f", jsast::object(entries)),
+                            ]);
+                            body.push(jsast::ret(ref_call(spec)));
+                        } else {
+                            let mut items = Vec::with_capacity(fields.len());
+                            for (i, f) in fields.iter().enumerate() {
+                                let read = jsast::index(p(), jsast::num(i as f64));
+                                items.push(child_val_expr(
+                                    table, interns, f.ty, read, dir, cache, pending,
+                                )?);
+                            }
+                            body.push(jsast::ret(jsast::array(items)));
+                        }
+                    }
+                    TypeKind::Array { element, .. } => {
+                        if mode == Mode::Ref {
+                            let c = child_spec_expr(table, interns, *element, cache, pending)?
+                                .unwrap_or_else(jsast::null);
+                            let spec = jsast::object_of(vec![("k", jsast::string("a")), ("c", c)]);
+                            body.push(jsast::ret(ref_call(spec)));
+                        } else {
+                            let elem_param = "$e".to_owned();
+                            let elem_id = jsast::id(elem_param.clone());
+                            let converted = child_val_expr(
+                                table,
+                                interns,
+                                *element,
+                                elem_id.clone(),
+                                dir,
+                                cache,
+                                pending,
+                            )?;
+                            let guarded = jsast::cond(
+                                jsast::binary(
+                                    jsast::BinOp::StrictEq,
+                                    elem_id,
+                                    jsast::undefined(),
+                                ),
+                                jsast::undefined(),
+                                converted,
+                            );
+                            body.push(jsast::ret(jsast::method_call(
+                                p(),
+                                "map",
+                                vec![jsast::arrow(vec![elem_param], guarded)],
+                            )));
+                        }
+                    }
+                    TypeKind::Adt {
+                        form: NominalForm::Struct,
+                        variants,
+                        ..
+                    } => {
+                        let [variant] = variants.as_slice() else {
+                            return Err("a struct with no single variant".to_owned());
+                        };
+                        if mode == Mode::Ref {
+                            let mut entries = Vec::new();
+                            for f in &variant.fields {
+                                if let Some(spec) =
+                                    child_spec_expr(table, interns, f.ty, cache, pending)?
+                                {
+                                    entries.push((field_prop_name(interns, f.key)?, spec));
+                                }
+                            }
+                            let spec = jsast::object_of(vec![
+                                ("k", jsast::string("o")),
+                                ("f", jsast::object(entries)),
+                            ]);
+                            body.push(jsast::ret(ref_call(spec)));
+                        } else {
+                            let mut entries = Vec::with_capacity(variant.fields.len());
+                            for f in &variant.fields {
+                                let key = field_prop_name(interns, f.key)?;
+                                let read = jsast::member(p(), key.clone());
+                                let expr = child_val_expr(
+                                    table, interns, f.ty, read, dir, cache, pending,
+                                )?;
+                                entries.push((key, expr));
+                            }
+                            body.push(jsast::ret(jsast::object(entries)));
+                        }
+                    }
+                    TypeKind::Adt {
+                        form: NominalForm::Enum,
+                        variants,
+                        ..
+                    } => {
+                        if mode == Mode::Ref {
+                            let mut v_entries = Vec::new();
+                            for variant in variants {
+                                let mut f_entries = Vec::new();
+                                for f in &variant.fields {
+                                    if let Some(spec) =
+                                        child_spec_expr(table, interns, f.ty, cache, pending)?
+                                    {
+                                        f_entries.push((field_prop_name(interns, f.key)?, spec));
+                                    }
+                                }
+                                if !f_entries.is_empty() {
+                                    v_entries.push((
+                                        value::variant_name(interns, variant).to_owned(),
+                                        jsast::object(f_entries),
+                                    ));
+                                }
+                            }
+                            let spec = jsast::object_of(vec![
+                                ("k", jsast::string("e")),
+                                ("v", jsast::object(v_entries)),
+                            ]);
+                            body.push(jsast::ret(ref_call(spec)));
+                        } else {
+                            for variant in variants {
+                                let has_conv = variant.fields.iter().any(|f| {
+                                    !table.is_zst(f.ty) && reaches_str(table, f.ty)
+                                });
+                                if !has_conv {
+                                    continue;
+                                }
+                                let mut entries = Vec::with_capacity(variant.fields.len() + 1);
+                                entries.push((
+                                    value::TAG.to_owned(),
+                                    value::tag_literal(interns, variant),
+                                ));
+                                let mut any_changed = false;
+                                for f in &variant.fields {
+                                    let key = field_prop_name(interns, f.key)?;
+                                    let read = jsast::member(p(), key.clone());
+                                    let expr = child_val_expr(
+                                        table, interns, f.ty, read.clone(), dir, cache, pending,
+                                    )?;
+                                    if expr != read {
+                                        any_changed = true;
+                                    }
+                                    entries.push((key, expr));
+                                }
+                                if any_changed {
+                                    body.push(jsast::if_else(
+                                        jsast::binary(
+                                            jsast::BinOp::StrictEq,
+                                            jsast::member(p(), value::TAG),
+                                            value::tag_literal(interns, variant),
+                                        ),
+                                        vec![jsast::ret(jsast::object(entries))],
+                                        Vec::new(),
+                                    ));
+                                }
+                            }
+                            body.push(jsast::ret(p()));
+                        }
+                    }
+                    _ => return Err("unsupported type in converter synthesis".to_owned()),
+                }
+            }
+        }
+    }
+    Ok(jsast::function(name.as_str().to_owned(), vec![param], body))
+}
+
+fn make_link_item(name: JsName, decl: Stmt) -> LinkItem {
+    let mut refs = BTreeSet::new();
+    jsast::visit_free_idents(&decl, &mut |ident| {
+        if ident != name.as_str() {
+            refs.insert(JsName::new(ident.to_owned()));
+        }
+    });
+    let mut js_item = JsItem {
+        name: name.clone(),
+        kind: ItemKind::Fn,
+        decl,
+        refs: refs.clone(),
+        zombies: Vec::new(),
+        linkage: Linkage::internal(),
+        debug_path: name.as_str().to_owned(),
+        order: None,
+        loc: None,
+        names: Vec::new(),
+        dts: None,
+        optimization: Default::default(),
+        late_ir: Default::default(),
+        baseline_shadow: Default::default(),
+        jir: None,
+        jir_decline: None,
+        jir_item: None,
+    };
+    crate::minify::shorten_locals(std::slice::from_mut(&mut js_item));
+    let (js, mappings) = js_item.to_js_mapped(crate::opts::get().comments);
+    LinkItem {
+        name,
+        kind: ItemKind::Fn,
+        js,
+        refs,
+        zombies: Vec::new(),
+        linkage: Linkage::internal(),
+        debug_path: js_item.debug_path,
+        crate_name: "generated".to_owned(),
+        order: None,
+        map: item_map(mappings),
+        dts: None,
+        optimization: Default::default(),
+        late_ir: Default::default(),
+        baseline_shadow: Default::default(),
+        jir: Default::default(),
+    }
+}
+
+/// Synthesizes deduplicated `$bstr$out$...` and `$bstr$in$...` converter [`LinkItem`]s into
+/// `table` (and appends them to `reachable`) for every `$bstr$` helper called by reachable items.
+pub fn synthesize_converters(
+    table: &mut BTreeMap<JsName, LinkItem>,
+    reachable: &mut Vec<JsName>,
+) {
+    let mut needed: BTreeSet<JsName> = BTreeSet::new();
+    for name in reachable.iter() {
+        let Some(item) = table.get(name) else {
+            continue;
+        };
+        for r in &item.refs {
+            if r.as_str().starts_with("$bstr$") && !table.contains_key(r) {
+                needed.insert(r.clone());
+            }
+        }
+    }
+    if needed.is_empty() {
+        return;
+    }
+
+    let source_names: Vec<JsName> = reachable
+        .iter()
+        .filter(|name| table.get(*name).is_some_and(|i| i.jir.interns().is_some()))
+        .cloned()
+        .collect();
+
+    let mut synthesized: Vec<(JsName, LinkItem)> = Vec::new();
+    for src_name in &source_names {
+        if needed.is_empty() {
+            break;
+        }
+        let Some(interns_ref) = table.get(src_name).and_then(|i| i.jir.interns()) else {
+            continue;
+        };
+        let interns: Interns = interns_ref.clone();
+        let types = &interns.types;
+        let mut cache = BTreeMap::new();
+        let mut pending: Vec<(ConvTarget, Crossing)> = Vec::new();
+        let mut expanded: BTreeSet<(ConvTarget, Crossing)> = BTreeSet::new();
+
+        for desc in types.descriptors() {
+            if needed.is_empty() {
+                break;
+            }
+            if desc.layout.zst || !reaches_str(types, desc.id) {
+                continue;
+            }
+            let mut candidates = [
+                (ConvTarget::Type(desc.id, Mode::Val), Crossing::Out),
+                (ConvTarget::Type(desc.id, Mode::Val), Crossing::In),
+                (ConvTarget::Type(desc.id, Mode::Ref), Crossing::Out),
+                (ConvTarget::Type(desc.id, Mode::Ref), Crossing::In),
+            ]
+            .to_vec();
+            if vec_elem_ty(types, desc.id).is_some() {
+                candidates.push((ConvTarget::NativeVecCarrier(desc.id), Crossing::Out));
+                candidates.push((ConvTarget::NativeVecCarrier(desc.id), Crossing::In));
+                candidates.push((ConvTarget::SliceViewCarrier(desc.id), Crossing::Out));
+                candidates.push((ConvTarget::SliceViewCarrier(desc.id), Crossing::In));
+            }
+            for (target, dir) in candidates {
+                if needed.is_empty() {
+                    break;
+                }
+                let Ok(Some(cname)) = target_name(types, &interns, target, dir, &mut cache) else {
+                    continue;
+                };
+                if !needed.contains(&cname) {
+                    continue;
+                }
+                pending.push((target, dir));
+                while let Some((cur_target, cur_dir)) = pending.pop() {
+                    if !expanded.insert((cur_target, cur_dir)) {
+                        continue;
+                    }
+                    let Ok(Some(cur_name)) =
+                        target_name(types, &interns, cur_target, cur_dir, &mut cache)
+                    else {
+                        continue;
+                    };
+                    needed.remove(&cur_name);
+                    if table.contains_key(&cur_name) {
+                        continue;
+                    }
+                    if let Ok(decl) = build_decl(
+                        types,
+                        &interns,
+                        &cur_name,
+                        cur_target,
+                        cur_dir,
+                        &mut cache,
+                        &mut pending,
+                    ) {
+                        let item = make_link_item(cur_name.clone(), decl);
+                        synthesized.push((cur_name, item));
+                    }
+                }
+            }
+        }
+    }
+
+    for (name, item) in synthesized {
+        if !table.contains_key(&name) {
+            table.insert(name.clone(), item);
+            reachable.push(name);
+        }
     }
 }
 
@@ -521,6 +1962,7 @@ fn rewrite_expr(expr: &mut Expr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jir::types::VariantDescriptor;
 
     fn rt(member: &str, args: Vec<Expr>) -> Expr {
         jsast::rt_call(member, args)
@@ -562,5 +2004,325 @@ mod tests {
             Some("str_bytes_mut")
         );
         assert_eq!(leftover_helper("__rt.bstr_bytes(s); __rt.str_lenx"), None);
+    }
+
+    fn make_desc(id: u128, kind: TypeKind, zst: bool) -> TypeDescriptor {
+        use crate::jir::types::{JsFacts, LayoutFacts, TypeMeta};
+        let mut d = TypeDescriptor {
+            id: TypeId(id),
+            name: None,
+            kind,
+            layout: LayoutFacts {
+                size: Some(if zst { 0 } else { 8 }),
+                unsized_prefix: None,
+                align: Some(1),
+                sized: true,
+                zst,
+                one_zst: zst,
+                needs_drop: false,
+                has_own_drop: false,
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: TypeId(id),
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        };
+        if zst {
+            d.js.is_indirect = true;
+        }
+        d
+    }
+
+    #[test]
+    fn reaches_str_walks_adt_args_closures_and_coroutines_while_excluding_string() {
+        use crate::jir::semantic::DefinitionId;
+        let mut interns = Interns::new();
+        let def = DefinitionId {
+            crate_id: 1,
+            local_hash: 1,
+        };
+        let str_id = TypeId(1);
+        let ref_str_id = TypeId(2);
+        let u8_id = TypeId(3);
+        let phantom_str_id = TypeId(4);
+        let string_raw_id = TypeId(5);
+        let closure_id = TypeId(6);
+        let coro_id = TypeId(7);
+        let coro_closure_id = TypeId(8);
+        let zst_arr_id = TypeId(9);
+
+        let mut ref_str = make_desc(
+            ref_str_id.0,
+            TypeKind::Reference {
+                pointee: str_id,
+                mutable: false,
+            },
+            false,
+        );
+        ref_str.js.pointer_form = Some(PointerForm::Str);
+
+        let mut phantom_str = make_desc(
+            phantom_str_id.0,
+            TypeKind::Adt {
+                def,
+                args: vec![ref_str_id],
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: interns.intern_str("PhantomData"),
+                    fields: Vec::new(),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            true,
+        );
+        phantom_str.js.fields = Vec::new();
+
+        let string_adt = make_desc(
+            string_raw_id.0,
+            TypeKind::Adt {
+                def,
+                args: vec![u8_id],
+                form: NominalForm::Struct,
+                variants: vec![VariantDescriptor {
+                    name: interns.intern_str("String"),
+                    fields: vec![FieldDescriptor {
+                        key: FieldKey::Name(interns.intern_str("buf")),
+                        ty: u8_id,
+                        offset: 0,
+                    }],
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            false,
+        );
+
+        let closure_d = make_desc(
+            closure_id.0,
+            TypeKind::Closure {
+                def,
+                upvars: vec![ref_str_id],
+                fn_pointer_shim: None,
+            },
+            false,
+        );
+
+        let coro_d = make_desc(
+            coro_id.0,
+            TypeKind::Coroutine {
+                def,
+                upvars: Vec::new(),
+                saved_locals: vec![(0, ref_str_id)],
+                states: Vec::new(),
+                variants: Vec::new(),
+            },
+            false,
+        );
+
+        let coro_closure_d = make_desc(
+            coro_closure_id.0,
+            TypeKind::CoroutineClosure {
+                def,
+                upvars: vec![ref_str_id],
+            },
+            false,
+        );
+
+        let zst_arr_d = make_desc(
+            zst_arr_id.0,
+            TypeKind::Array {
+                element: ref_str_id,
+                length: 0,
+            },
+            true,
+        );
+
+        let table = TypeTable::from(vec![
+            make_desc(str_id.0, TypeKind::Str, false),
+            ref_str,
+            make_desc(
+                u8_id.0,
+                TypeKind::Integer {
+                    signed: false,
+                    bits: 8,
+                },
+                false,
+            ),
+            phantom_str,
+            string_adt,
+            closure_d,
+            coro_d,
+            coro_closure_d,
+            zst_arr_d,
+        ]);
+
+        assert!(reaches_str(&table, phantom_str_id));
+        assert!(!reaches_str(&table, string_raw_id));
+        assert!(reaches_str(&table, closure_id));
+        assert!(reaches_str(&table, coro_id));
+        assert!(reaches_str(&table, coro_closure_id));
+        assert!(reaches_str(&table, zst_arr_id));
+
+        // ZST array `[&str; 0]` short-circuits without `.map()`.
+        let passed = host_convert(&table, &interns, zst_arr_id, jsast::id("z"), Crossing::Out)
+            .expect("zst array must pass");
+        assert_eq!(passed, jsast::id("z"));
+
+        // Coroutine value in `js!` is refused.
+        assert!(host_convert(&table, &interns, coro_id, jsast::id("g"), Crossing::Out).is_err());
+
+        // Closure value emits a deduplicated helper function call (not inline Object.assign).
+        let clo_call =
+            host_convert(&table, &interns, closure_id, jsast::id("c"), Crossing::Out)
+                .expect("closure converts");
+        assert!(
+            matches!(clo_call, Expr::Call(ref f, _) if matches!(&**f, Expr::Ident(n) if n.starts_with("$bstr$out$"))),
+            "{clo_call:?}"
+        );
+    }
+
+    #[test]
+    fn depth_cap_allows_64_and_refuses_65_and_refuses_raw_and_union() {
+        use crate::jir::semantic::DefinitionId;
+        let mut interns = Interns::new();
+        let def = DefinitionId {
+            crate_id: 2,
+            local_hash: 1,
+        };
+        let str_id = TypeId(1);
+        let ref_str_id = TypeId(2);
+        let mut ref_str = make_desc(
+            ref_str_id.0,
+            TypeKind::Reference {
+                pointee: str_id,
+                mutable: false,
+            },
+            false,
+        );
+        ref_str.js.pointer_form = Some(PointerForm::Str);
+
+        let mut descs = vec![make_desc(str_id.0, TypeKind::Str, false), ref_str];
+        let mut cur = ref_str_id;
+        let f_name = interns.intern_str("_0");
+        let s_name = interns.intern_str("Wrap");
+        for lvl in 1..=66u128 {
+            let id = TypeId(100 + lvl);
+            let d = make_desc(
+                id.0,
+                TypeKind::Adt {
+                    def,
+                    args: Vec::new(),
+                    form: NominalForm::Struct,
+                    variants: vec![VariantDescriptor {
+                        name: s_name,
+                        fields: vec![FieldDescriptor {
+                            key: FieldKey::Name(f_name),
+                            ty: cur,
+                            offset: 0,
+                        }],
+                        logical_discr: 0,
+                        physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                    }],
+                    niche: None,
+                },
+                false,
+            );
+            descs.push(d);
+            cur = id;
+        }
+        let d63 = TypeId(163);
+        let d64 = TypeId(164);
+        let d65 = TypeId(165);
+        let raw_pair = TypeId(200);
+        let tup = TypeId(201);
+        let uni = TypeId(202);
+        let u32_id = TypeId(203);
+
+        descs.push(make_desc(
+            u32_id.0,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            false,
+        ));
+        let mut tup_d = make_desc(tup.0, TypeKind::Tuple(vec![ref_str_id, u32_id]), false);
+        tup_d.js.fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Index(0),
+                ty: ref_str_id,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Index(1),
+                ty: u32_id,
+                offset: 4,
+            },
+        ];
+        descs.push(tup_d);
+        descs.push(make_desc(
+            raw_pair.0,
+            TypeKind::RawPointer {
+                pointee: tup,
+                mutable: false,
+            },
+            false,
+        ));
+        descs.push(make_desc(
+            uni.0,
+            TypeKind::Adt {
+                def,
+                args: Vec::new(),
+                form: NominalForm::Union,
+                variants: vec![VariantDescriptor {
+                    name: interns.intern_str("U"),
+                    fields: vec![
+                        FieldDescriptor {
+                            key: FieldKey::Name(interns.intern_str("a")),
+                            ty: ref_str_id,
+                            offset: 0,
+                        },
+                        FieldDescriptor {
+                            key: FieldKey::Name(interns.intern_str("n")),
+                            ty: u32_id,
+                            offset: 0,
+                        },
+                    ],
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            false,
+        ));
+
+        let table = TypeTable::from(descs);
+        assert!(host_convert(&table, &interns, d63, jsast::id("v"), Crossing::Out).is_ok());
+        assert!(host_convert(&table, &interns, d64, jsast::id("v"), Crossing::Out).is_ok());
+        assert!(host_convert(&table, &interns, d65, jsast::id("v"), Crossing::Out).is_err());
+        assert!(host_convert(&table, &interns, raw_pair, jsast::id("p"), Crossing::Out).is_err());
+        assert!(host_convert(&table, &interns, uni, jsast::id("u"), Crossing::Out).is_err());
     }
 }
