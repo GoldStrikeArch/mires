@@ -688,7 +688,7 @@ fn boundary_value(cx: &JsCx<'_>, ty: TypeId, value: Expr) -> Res<Expr> {
 /// `str` it reaches — or a `String` the plan keeps as its host string — is decoded to the host
 /// text it encodes (`__rt.bstr_out`, `bstr::host_convert`); everything else crosses as it is.
 fn host_argument(cx: &JsCx<'_>, arg: ValueId, value: Expr) -> Res<Expr> {
-    if !crate::lower::bstr::enabled() {
+    if !crate::lower::bstr::enabled() || cx.is_known_ascii(arg) {
         return Ok(value);
     }
     let host_string = cx

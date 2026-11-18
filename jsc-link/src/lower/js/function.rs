@@ -18,11 +18,23 @@ use super::super::{LowerInput, LoweredItem};
 use super::{decline, emit, value, JsCx};
 
 /// Lowers a function body whose SSA form, plan and region tree are in hand.
+#[allow(dead_code)]
 pub fn lower(
     input: &LowerInput<'_>,
     func: &Func,
     plan: &Plan,
     region: Region<BlockPayload, RScrut>,
+) -> Result<LoweredItem, Decline> {
+    lower_with_ascii(input, func, plan, region, None)
+}
+
+/// [`lower`] carrying whole-program ASCII provenance facts (`js-str=bytes`).
+pub fn lower_with_ascii(
+    input: &LowerInput<'_>,
+    func: &Func,
+    plan: &Plan,
+    region: Region<BlockPayload, RScrut>,
+    ascii: Option<crate::analysis::ascii::FuncAsciiFacts<'_>>,
 ) -> Result<LoweredItem, Decline> {
     let physical = input
         .abi
@@ -44,7 +56,8 @@ pub fn lower(
     .with_physical(input.name, input.physical)
     .with_target_abi(physical)
     .with_call_retargets(input.call_retargets)
-    .with_bigint_hoist(input.bigints.is_some());
+    .with_bigint_hoist(input.bigints.is_some())
+    .with_ascii(ascii);
 
     // The parameter list (`base.rs::params`): `Func.params` in order — one per MIR argument, a
     // splatted tuple already as its arity, the caller `Location` last when the body tracks it.
@@ -287,7 +300,13 @@ pub fn lower(
             .map(|(name, _)| name.clone())
             .collect();
         fuse_local_bytes_str(&mut body, &uninit_locals);
+        if crate::lower::bstr::enabled() {
+            fuse_local_bstr_in_bytes(&mut body, &uninit_locals);
+        }
         eliminate_dead_local_writes(&mut body, &local_names);
+    }
+    if crate::lower::bstr::enabled() {
+        fold_bstr_in_bytes_stmts(&mut body);
     }
     let mentioned = mentioned_names(&body);
     if input.opts.queue {
@@ -1169,6 +1188,505 @@ pub(super) fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) 
                 && u.writes == 1
                 && u.reads > 0
                 && write_dominates_and_safe(body, name, u.reads, u.str_bytes_reads) == Some(true)
+        })
+        .map(|(name, _)| name)
+        .collect();
+    if !eligible.is_empty() {
+        rewrite_stmts(body, &eligible);
+    }
+}
+
+fn rt_unary_call<'a>(expr: &'a Expr, method: &str) -> Option<&'a Expr> {
+    let Expr::Call(callee, args) = expr else {
+        return None;
+    };
+    let [arg] = args.as_slice() else {
+        return None;
+    };
+    let Expr::Member(obj, name) = callee.as_ref() else {
+        return None;
+    };
+    (name == method && matches!(obj.as_ref(), Expr::Ident(rt) if rt == "__rt")).then_some(arg)
+}
+
+/// Folds nested `__rt.str_bytes(__rt.bstr_in(x))` and `__rt.bstr_bytes(__rt.bstr_in(x))` into
+/// `__rt.bstr_utf8_bytes(x)` under `js-str=bytes`.
+pub(crate) fn fold_bstr_in_bytes_decl(decl: &mut Stmt) {
+    match decl {
+        Stmt::FunctionDecl { body, .. } | Stmt::Block(body) => fold_bstr_in_bytes_stmts(body),
+        _ => {}
+    }
+}
+
+pub(crate) fn fold_bstr_in_bytes_stmts(stmts: &mut [Stmt]) {
+    fn visit_expr(expr: &mut Expr) {
+        match expr {
+            Expr::Member(obj, _) | Expr::Unary(_, obj) => visit_expr(obj),
+            Expr::Index(obj, idx) | Expr::Binary(_, obj, idx) | Expr::Assign(obj, idx) | Expr::CompoundAssign(_, obj, idx) => {
+                visit_expr(obj);
+                visit_expr(idx);
+            }
+            Expr::Call(callee, args) | Expr::New(callee, args) => {
+                visit_expr(callee);
+                for arg in args {
+                    visit_expr(arg);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                visit_expr(c);
+                visit_expr(t);
+                visit_expr(e);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    visit_expr(v);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for item in items {
+                    visit_expr(item);
+                }
+            }
+            Expr::Arrow(_, ArrowBody::Expr(inner)) => visit_expr(inner),
+            Expr::Arrow(_, ArrowBody::Block(stmts)) => fold_bstr_in_bytes_stmts(stmts),
+            Expr::Num(_)
+            | Expr::RawNum(_)
+            | Expr::BigInt(_)
+            | Expr::Str(_)
+            | Expr::Bool(_)
+            | Expr::Undefined
+            | Expr::Null
+            | Expr::Ident(_)
+            | Expr::Raw(_) => {}
+        }
+
+        let is_bytes_call = rt_unary_call(expr, "str_bytes").is_some()
+            || rt_unary_call(expr, "bstr_bytes").is_some();
+        if !is_bytes_call {
+            return;
+        }
+        let Expr::Call(_, args) = expr else {
+            return;
+        };
+        let inner = std::mem::replace(&mut args[0], Expr::Undefined);
+        match inner {
+            Expr::Call(ref c, ref inner_args)
+                if inner_args.len() == 1
+                    && matches!(
+                        c.as_ref(),
+                        Expr::Member(obj, name)
+                            if name == "bstr_in" && matches!(obj.as_ref(), Expr::Ident(rt) if rt == "__rt")
+                    ) =>
+            {
+                let mut inner_args = match inner {
+                    Expr::Call(_, a) => a,
+                    _ => unreachable!(),
+                };
+                *expr = jsast::rt_call("bstr_utf8_bytes", vec![inner_args.swap_remove(0)]);
+            }
+            Expr::Seq(mut items) => {
+                if let Some(last) = items.pop() {
+                    if let Some(arg) = rt_unary_call(&last, "bstr_in").cloned() {
+                        items.push(jsast::rt_call("bstr_utf8_bytes", vec![arg]));
+                        *expr = jsast::seq(items);
+                        return;
+                    }
+                    items.push(last);
+                }
+                args[0] = Expr::Seq(items);
+            }
+            other => {
+                args[0] = other;
+            }
+        }
+    }
+
+    for stmt in stmts {
+        match stmt {
+            Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Const(_, e) => visit_expr(e),
+            Stmt::Let(_, Some(e)) | Stmt::Return(Some(e)) => visit_expr(e),
+            Stmt::Lets(decls) => {
+                for (_, init) in decls {
+                    if let Some(e) = init {
+                        visit_expr(e);
+                    }
+                }
+            }
+            Stmt::If(test, a, b) => {
+                visit_expr(test);
+                fold_bstr_in_bytes_stmts(a);
+                if let Some(b) = b {
+                    fold_bstr_in_bytes_stmts(b);
+                }
+            }
+            Stmt::Switch(d, cases) => {
+                visit_expr(d);
+                for c in cases {
+                    for t in &mut c.tests {
+                        visit_expr(t);
+                    }
+                    fold_bstr_in_bytes_stmts(&mut c.body);
+                }
+            }
+            Stmt::Labeled(_, inner) => {
+                fold_bstr_in_bytes_stmts(std::slice::from_mut(inner.as_mut()));
+            }
+            Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::FunctionDecl { body: b, .. } => {
+                fold_bstr_in_bytes_stmts(b);
+            }
+            Stmt::While(t, b) => {
+                visit_expr(t);
+                fold_bstr_in_bytes_stmts(b);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                fold_bstr_in_bytes_stmts(body);
+                fold_bstr_in_bytes_stmts(handler);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Fuses single-write `x = __rt.bstr_in(host)` whose sole read in the body is `__rt.str_bytes(x)`
+/// into `x = host; ... __rt.bstr_utf8_bytes(x)` without introducing extra loop work.
+fn fuse_local_bstr_in_bytes(body: &mut [Stmt], locals: &HashSet<String>) {
+    #[derive(Default)]
+    struct Usage {
+        writes: usize,
+        reads: usize,
+        disqualified: bool,
+        write_loops: Vec<usize>,
+        read_loops: Vec<usize>,
+    }
+
+    fn peel_bstr_in(expr: &Expr) -> bool {
+        let tail = match expr {
+            Expr::Seq(items) => match items.last() {
+                Some(last) => last,
+                None => return false,
+            },
+            other => other,
+        };
+        rt_unary_call(tail, "bstr_in").is_some()
+    }
+
+    fn scan_expr(
+        expr: &Expr,
+        locals: &HashSet<String>,
+        loop_stack: &[usize],
+        usage: &mut HashMap<String, Usage>,
+    ) {
+        if let Some(Expr::Ident(arg)) = rt_unary_call(expr, "str_bytes") {
+            if locals.contains(arg) {
+                let entry = usage.entry(arg.clone()).or_default();
+                entry.reads += 1;
+                entry.read_loops = loop_stack.to_vec();
+                return;
+            }
+        }
+        match expr {
+            Expr::Ident(name) => {
+                if locals.contains(name) {
+                    usage.entry(name.clone()).or_default().disqualified = true;
+                }
+            }
+            Expr::Member(obj, _) | Expr::Unary(_, obj) => scan_expr(obj, locals, loop_stack, usage),
+            Expr::Index(obj, idx) | Expr::Binary(_, obj, idx) | Expr::Assign(obj, idx) | Expr::CompoundAssign(_, obj, idx) => {
+                scan_expr(obj, locals, loop_stack, usage);
+                scan_expr(idx, locals, loop_stack, usage);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                scan_expr(c, locals, loop_stack, usage);
+                for a in args {
+                    scan_expr(a, locals, loop_stack, usage);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                scan_expr(c, locals, loop_stack, usage);
+                scan_expr(t, locals, loop_stack, usage);
+                scan_expr(e, locals, loop_stack, usage);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    scan_expr(v, locals, loop_stack, usage);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for item in items {
+                    scan_expr(item, locals, loop_stack, usage);
+                }
+            }
+            Expr::Arrow(params, body_expr) => {
+                let shadow: HashSet<String> = locals
+                    .iter()
+                    .filter(|n| !params.contains(*n))
+                    .cloned()
+                    .collect();
+                let mut inner = HashMap::new();
+                match body_expr {
+                    ArrowBody::Expr(b) => scan_expr(b, &shadow, loop_stack, &mut inner),
+                    ArrowBody::Block(stmts) => {
+                        let mut dummy_id = 0usize;
+                        let mut dummy_stack = loop_stack.to_vec();
+                        scan_stmts(stmts, &shadow, &mut dummy_id, &mut dummy_stack, &mut inner);
+                    }
+                }
+                for (name, u) in inner {
+                    if u.writes > 0 || u.reads > 0 || u.disqualified {
+                        usage.entry(name).or_default().disqualified = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_stmts(
+        stmts: &[Stmt],
+        locals: &HashSet<String>,
+        next_loop: &mut usize,
+        loop_stack: &mut Vec<usize>,
+        usage: &mut HashMap<String, Usage>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs))
+                    if matches!(lhs.as_ref(), Expr::Ident(n) if locals.contains(n)) =>
+                {
+                    let Expr::Ident(name) = lhs.as_ref() else {
+                        unreachable!()
+                    };
+                    let entry = usage.entry(name.clone()).or_default();
+                    if peel_bstr_in(rhs) {
+                        entry.writes += 1;
+                        entry.write_loops = loop_stack.clone();
+                    } else {
+                        entry.disqualified = true;
+                    }
+                    scan_expr(rhs, locals, loop_stack, usage);
+                }
+                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Const(_, e) => {
+                    scan_expr(e, locals, loop_stack, usage);
+                }
+                Stmt::Let(name, Some(init)) if locals.contains(name) => {
+                    let entry = usage.entry(name.clone()).or_default();
+                    if peel_bstr_in(init) {
+                        entry.writes += 1;
+                        entry.write_loops = loop_stack.clone();
+                    } else {
+                        entry.disqualified = true;
+                    }
+                    scan_expr(init, locals, loop_stack, usage);
+                }
+                Stmt::Let(_, Some(e)) | Stmt::Return(Some(e)) => {
+                    scan_expr(e, locals, loop_stack, usage);
+                }
+                Stmt::Lets(decls) => {
+                    for (name, init) in decls {
+                        if let Some(init) = init {
+                            if locals.contains(name) {
+                                let entry = usage.entry(name.clone()).or_default();
+                                if peel_bstr_in(init) {
+                                    entry.writes += 1;
+                                    entry.write_loops = loop_stack.clone();
+                                } else {
+                                    entry.disqualified = true;
+                                }
+                            }
+                            scan_expr(init, locals, loop_stack, usage);
+                        }
+                    }
+                }
+                Stmt::If(test, a, b) => {
+                    scan_expr(test, locals, loop_stack, usage);
+                    scan_stmts(a, locals, next_loop, loop_stack, usage);
+                    if let Some(b) = b {
+                        scan_stmts(b, locals, next_loop, loop_stack, usage);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    scan_expr(d, locals, loop_stack, usage);
+                    for c in cases {
+                        for t in &c.tests {
+                            scan_expr(t, locals, loop_stack, usage);
+                        }
+                        scan_stmts(&c.body, locals, next_loop, loop_stack, usage);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    scan_stmts(
+                        std::slice::from_ref(inner.as_ref()),
+                        locals,
+                        next_loop,
+                        loop_stack,
+                        usage,
+                    );
+                }
+                Stmt::Block(b) => scan_stmts(b, locals, next_loop, loop_stack, usage),
+                Stmt::LoopForever(_, b) => {
+                    *next_loop += 1;
+                    loop_stack.push(*next_loop);
+                    scan_stmts(b, locals, next_loop, loop_stack, usage);
+                    loop_stack.pop();
+                }
+                Stmt::While(t, b) => {
+                    *next_loop += 1;
+                    loop_stack.push(*next_loop);
+                    scan_expr(t, locals, loop_stack, usage);
+                    scan_stmts(b, locals, next_loop, loop_stack, usage);
+                    loop_stack.pop();
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    scan_stmts(body, locals, next_loop, loop_stack, usage);
+                    scan_stmts(handler, locals, next_loop, loop_stack, usage);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn unwrap_bstr_in_rhs(expr: &mut Expr) {
+        let taken = std::mem::replace(expr, Expr::Undefined);
+        let (mut pre, tail) = match taken {
+            Expr::Seq(mut items) if !items.is_empty() => {
+                let tail = items.pop().expect("non-empty seq");
+                (items, tail)
+            }
+            other => (Vec::new(), other),
+        };
+        let unwrapped = match tail {
+            Expr::Call(c, mut args)
+                if args.len() == 1
+                    && matches!(
+                        c.as_ref(),
+                        Expr::Member(obj, name)
+                            if name == "bstr_in" && matches!(obj.as_ref(), Expr::Ident(rt) if rt == "__rt")
+                    ) =>
+            {
+                args.swap_remove(0)
+            }
+            other => other,
+        };
+        *expr = if pre.is_empty() {
+            unwrapped
+        } else {
+            pre.push(unwrapped);
+            jsast::seq(pre)
+        };
+    }
+
+    fn rewrite_expr(expr: &mut Expr, eligible: &HashSet<String>) {
+        if let Some(Expr::Ident(arg)) = rt_unary_call(expr, "str_bytes") {
+            if eligible.contains(arg) {
+                let arg = arg.clone();
+                *expr = jsast::rt_call("bstr_utf8_bytes", vec![Expr::Ident(arg)]);
+                return;
+            }
+        }
+        match expr {
+            Expr::Member(obj, _) | Expr::Unary(_, obj) => rewrite_expr(obj, eligible),
+            Expr::Index(obj, idx) | Expr::Binary(_, obj, idx) | Expr::Assign(obj, idx) | Expr::CompoundAssign(_, obj, idx) => {
+                rewrite_expr(obj, eligible);
+                rewrite_expr(idx, eligible);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                rewrite_expr(c, eligible);
+                for a in args {
+                    rewrite_expr(a, eligible);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                rewrite_expr(c, eligible);
+                rewrite_expr(t, eligible);
+                rewrite_expr(e, eligible);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    rewrite_expr(v, eligible);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for item in items {
+                    rewrite_expr(item, eligible);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn rewrite_stmts(stmts: &mut [Stmt], eligible: &HashSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs))
+                    if matches!(lhs.as_ref(), Expr::Ident(n) if eligible.contains(n)) =>
+                {
+                    unwrap_bstr_in_rhs(rhs);
+                    rewrite_expr(rhs, eligible);
+                }
+                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Const(_, e) => {
+                    rewrite_expr(e, eligible);
+                }
+                Stmt::Let(name, Some(init)) => {
+                    if eligible.contains(name) {
+                        unwrap_bstr_in_rhs(init);
+                    }
+                    rewrite_expr(init, eligible);
+                }
+                Stmt::Return(Some(e)) => rewrite_expr(e, eligible),
+                Stmt::Lets(decls) => {
+                    for (name, init) in decls {
+                        if let Some(init) = init {
+                            if eligible.contains(name) {
+                                unwrap_bstr_in_rhs(init);
+                            }
+                            rewrite_expr(init, eligible);
+                        }
+                    }
+                }
+                Stmt::If(test, a, b) => {
+                    rewrite_expr(test, eligible);
+                    rewrite_stmts(a, eligible);
+                    if let Some(b) = b {
+                        rewrite_stmts(b, eligible);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    rewrite_expr(d, eligible);
+                    for c in cases {
+                        for t in &mut c.tests {
+                            rewrite_expr(t, eligible);
+                        }
+                        rewrite_stmts(&mut c.body, eligible);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    rewrite_stmts(std::slice::from_mut(inner.as_mut()), eligible);
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => rewrite_stmts(b, eligible),
+                Stmt::While(t, b) => {
+                    rewrite_expr(t, eligible);
+                    rewrite_stmts(b, eligible);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    rewrite_stmts(body, eligible);
+                    rewrite_stmts(handler, eligible);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut usage = HashMap::new();
+    let mut next_loop = 0usize;
+    let mut loop_stack = Vec::new();
+    scan_stmts(body, locals, &mut next_loop, &mut loop_stack, &mut usage);
+    let eligible: HashSet<String> = usage
+        .into_iter()
+        .filter(|(_, u)| {
+            !u.disqualified
+                && u.writes == 1
+                && u.reads == 1
+                && u.write_loops.starts_with(&u.read_loops)
         })
         .map(|(name, _)| name)
         .collect();

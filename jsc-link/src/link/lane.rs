@@ -846,6 +846,25 @@ fn run_with_opts(
             live.insert(helper_name);
         }
     }
+    let mut bstr_const_items = Vec::new();
+    if crate::lower::bstr::enabled() {
+        for (name, item) in table.iter() {
+            if item.kind == rcgjs_object::object::ItemKind::Const
+                && name.as_str().starts_with("s$h")
+                && live.contains(name)
+            {
+                if let Some(bs_item) =
+                    super::hoist_consts::synthesize_bstr_const_item(name.as_str(), &item.js)
+                {
+                    if !table.contains_key(&bs_item.name) && !defined.contains(&bs_item.name) {
+                        defined.insert(bs_item.name.clone());
+                        live.insert(bs_item.name.clone());
+                        bstr_const_items.push(bs_item);
+                    }
+                }
+            }
+        }
+    }
     // ES2018 spells a BigInt constant as a call that parses its digits whenever it runs, so phase
     // C names a module-level binding for each one instead (`lower/bigint.rs`). The prefix is
     // allocated around every name the program spells, its first-pass clones and registers
@@ -1001,7 +1020,14 @@ fn run_with_opts(
             )),
         }
     }
-    let added_items = added_items || added_bigints;
+    let mut added_bstr_consts = false;
+    for bs_item in bstr_const_items {
+        if let std::collections::btree_map::Entry::Vacant(slot) = table.entry(bs_item.name.clone()) {
+            slot.insert(bs_item);
+            added_bstr_consts = true;
+        }
+    }
+    let added_items = added_items || added_bigints || added_bstr_consts;
 
     let mut passes = Passes::default();
     let mut range_asserts: u64 = 0;
@@ -1750,6 +1776,64 @@ type ReportProbe<'a> = (
 ///
 /// Nothing here touches the table: a retry has to be decided before any item is replaced.
 #[allow(clippy::too_many_arguments)] // One call site; the arguments are the driver's phases.
+fn prepare_opt_func(
+    name: &JsName,
+    func: &mut Func,
+    table_types: &crate::jir::types::TypeTable,
+    interns: &crate::jir::Interns,
+    opts: &crate::opts::Opts,
+    report_probe: Option<ReportProbe<'_>>,
+) -> Result<(OptStats, Option<String>), Decline> {
+    let mut stats = OptStats::default();
+    let probe = if let Some((probe_table, probe_funcs)) = report_probe {
+        if let (Some(probe_item), Some(Ok(probe_func))) =
+            (probe_table.get(name), probe_funcs.get(name))
+        {
+            if let Some(probe_interns) = probe_item.jir.interns() {
+                let mut probe = probe_func.clone();
+                if crate::opt::optimize(
+                    &mut probe,
+                    &probe_interns.types,
+                    probe_interns,
+                    opts,
+                    &mut stats,
+                )
+                .is_err()
+                {
+                    stats = OptStats::default();
+                }
+            }
+        }
+        Ok(())
+    } else {
+        crate::opt::optimize(func, table_types, interns, opts, &mut stats)
+    };
+    match probe {
+        Err(decline) => {
+            if std::env::var("RCGJS_OPT_DEBUG_FUNC")
+                .is_ok_and(|filter| name.as_str().contains(&filter))
+            {
+                eprintln!("opt-func: {} declined: {decline}", name.as_str());
+            }
+            Err(decline)
+        }
+        Ok(()) => {
+            // The `RCGJS_O_DEBUG_FUNC` precedent, after the per-item passes: the
+            // exact `Func` the alloc analysis counts and the printer prints.
+            if std::env::var("RCGJS_OPT_DEBUG_FUNC")
+                .is_ok_and(|filter| name.as_str().contains(&filter))
+            {
+                eprintln!("opt-func: {} = {func:#?}", name.as_str());
+            }
+            // Over the final `Func`, so what is counted is what is printed.
+            // Counted in every optimizer mode: `js-opt=report` rewrites nothing
+            // and this is what it has to report.
+            let alloc = crate::analysis::alloc_sites::AllocSites::of(func, interns).to_json();
+            Ok((stats, Some(alloc)))
+        }
+    }
+}
+
 fn lower_all(
     table: &BTreeMap<JsName, LinkItem>,
     names: &[JsName],
@@ -1764,6 +1848,71 @@ fn lower_all(
     fault: Option<&str>,
     bigints: Option<&crate::lower::bigint::BigIntNames>,
 ) -> (Vec<Lowered>, bool) {
+    let mut prepared_meta: BTreeMap<JsName, (OptStats, Option<String>)> = BTreeMap::new();
+    let ascii = if crate::lower::bstr::enabled() {
+        for name in names {
+            if repr.bodies.contains_key(name) {
+                continue;
+            }
+            let Some(item) = table.get(name) else {
+                continue;
+            };
+            if item.jir.summary.is_none() || item.jir.body.is_none() {
+                continue;
+            }
+            let Some(interns) = item.jir.interns() else {
+                continue;
+            };
+            let Some(entry) = funcs.get_mut(name) else {
+                continue;
+            };
+            let Ok(func) = entry else {
+                continue;
+            };
+            match prepare_opt_func(
+                name,
+                func,
+                &interns.types,
+                interns,
+                ctx.opts,
+                report_probe,
+            ) {
+                Ok(meta) => {
+                    prepared_meta.insert(name.clone(), meta);
+                }
+                Err(decline) => {
+                    *entry = Err(decline);
+                }
+            }
+        }
+        let live_funcs: BTreeMap<JsName, &Func> = funcs
+            .iter()
+            .filter_map(|(name, res)| {
+                if repr.bodies.contains_key(name) {
+                    return None;
+                }
+                res.as_ref().ok().map(|f| (name.clone(), f))
+            })
+            .collect();
+        let roots: BTreeSet<JsName> = ctx
+            .opts
+            .roots
+            .iter()
+            .map(|r| JsName::new(r.clone()))
+            .collect();
+        Some(crate::analysis::ascii::compute(
+            &live_funcs,
+            table,
+            repr,
+            plan,
+            &roots,
+            defined,
+            live,
+        ))
+    } else {
+        None
+    };
+
     let mut lowered = Vec::with_capacity(names.len());
     let mut retry = false;
     for name in names {
@@ -1817,60 +1966,27 @@ fn lower_all(
                 None => lower_item(&input),
                 Some(Err(decline)) => Err(decline),
                 Some(Ok(mut func)) => {
-                    let probe = if let Some((probe_table, probe_funcs)) = report_probe {
-                        if let (Some(probe_item), Some(Ok(probe_func))) =
-                            (probe_table.get(name), probe_funcs.get(name))
-                        {
-                            if let Some(probe_interns) = probe_item.jir.interns() {
-                                let mut probe = probe_func.clone();
-                                if crate::opt::optimize(
-                                    &mut probe,
-                                    &probe_interns.types,
-                                    probe_interns,
-                                    ctx.opts,
-                                    &mut stats,
-                                )
-                                .is_err()
-                                {
-                                    stats = OptStats::default();
-                                }
-                            }
-                        }
-                        Ok(())
-                    } else {
-                        crate::opt::optimize(
+                    let prepared = match prepared_meta.remove(name) {
+                        Some(meta) => Ok(meta),
+                        None => prepare_opt_func(
+                            name,
                             &mut func,
                             input.table,
                             input.interns,
                             ctx.opts,
-                            &mut stats,
-                        )
+                            report_probe,
+                        ),
                     };
-                    match probe {
-                        Err(decline) => {
-                            if std::env::var("RCGJS_OPT_DEBUG_FUNC")
-                                .is_ok_and(|filter| name.as_str().contains(&filter))
-                            {
-                                eprintln!("opt-func: {} declined: {decline}", name.as_str());
-                            }
-                            Err(decline)
-                        }
-                        Ok(()) => {
-                            // The `RCGJS_O_DEBUG_FUNC` precedent, after the per-item passes: the
-                            // exact `Func` the alloc analysis counts and the printer prints.
-                            if std::env::var("RCGJS_OPT_DEBUG_FUNC")
-                                .is_ok_and(|filter| name.as_str().contains(&filter))
-                            {
-                                eprintln!("opt-func: {} = {func:#?}", name.as_str());
-                            }
-                            // Over the final `Func`, so what is counted is what is printed.
-                            // Counted in every optimizer mode: `js-opt=report` rewrites nothing
-                            // and this is what it has to report.
-                            alloc = Some(
-                                crate::analysis::alloc_sites::AllocSites::of(&func, input.interns)
-                                    .to_json(),
-                            );
-                            crate::lower::lower_func(&input, &func)
+                    match prepared {
+                        Err(decline) => Err(decline),
+                        Ok((opt_stats, opt_alloc)) => {
+                            stats = opt_stats;
+                            alloc = opt_alloc;
+                            crate::lower::lower_func_with_ascii(
+                                &input,
+                                &func,
+                                ascii.as_ref().map(|a| a.for_item(name)),
+                            )
                         }
                     }
                 }
@@ -2638,6 +2754,7 @@ fn apply(
     // `__rt` mention with it, so the refs are the rewritten declaration's.
     if crate::lower::bstr::enabled() {
         crate::lower::bstr::rewrite(&mut lowered.decl);
+        crate::lower::js::function::fold_bstr_in_bytes_decl(&mut lowered.decl);
         lowered.refs = refs_of(&lowered.decl, &item.name);
     }
     // Before `shorten_locals`, which renames locals and so changes the identifier set: the

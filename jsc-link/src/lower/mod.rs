@@ -295,13 +295,22 @@ pub fn build_func(input: &LowerInput<'_>) -> Result<Func, Decline> {
 
 /// The back half: `fuse::plan → structure::structure → js::function::lower` over a built [`Func`].
 pub fn lower_func(input: &LowerInput<'_>, func: &Func) -> Result<LoweredItem, Decline> {
+    lower_func_with_ascii(input, func, None)
+}
+
+/// [`lower_func`] carrying whole-program ASCII facts (`js-str=bytes`).
+pub fn lower_func_with_ascii(
+    input: &LowerInput<'_>,
+    func: &Func,
+    ascii: Option<crate::analysis::ascii::FuncAsciiFacts<'_>>,
+) -> Result<LoweredItem, Decline> {
     if let Some(forced) = forced_semantic_rewrite(input) {
         return forced;
     }
     let plan = fuse::plan(func, input.origins, input.table, input.interns, input.opts);
     let force_dispatch = matches!(input.opts.structure, crate::opts::Structure::Trampoline);
     let structured = structure::structure(func, &plan, input.table, force_dispatch)?;
-    js::function::lower(input, func, &plan, structured.region)
+    js::function::lower_with_ascii(input, func, &plan, structured.region, ascii)
 }
 
 #[cfg(test)]

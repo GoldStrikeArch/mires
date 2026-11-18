@@ -39,6 +39,13 @@ use super::{decline, emit, host, intrinsics, value, JsCx, Res, CALLER_LOCATION_P
 /// The vtable slot holding the drop glue (`abi.rs::VTABLE_DROP_SLOT`).
 pub const VTABLE_DROP_SLOT: f64 = 0.0;
 
+enum StrRange {
+    Full,
+    From { start: Expr, range: Expr },
+    To { end: Expr, range: Expr },
+    Bounds { start: Expr, end: Expr, range: Expr },
+}
+
 /// What one call-shaped op became: statements that have to run first, and either a value or
 /// nothing.
 pub enum Lowered {
@@ -416,6 +423,9 @@ impl JsCx<'_> {
                 // the result reaches is encoded into the byte string Rust holds (`lower/bstr.rs`).
                 if crate::lower::bstr::enabled() {
                     for (argument, arg) in arguments.iter_mut().zip(args.iter()) {
+                        if self.is_known_ascii(*arg) {
+                            continue;
+                        }
                         *argument = host::crossing(
                             self,
                             self.ty_of(*arg)?,
@@ -633,10 +643,10 @@ impl JsCx<'_> {
         let Callee::Direct { item, link_name } = callee else {
             return Ok(None);
         };
-        if self
-            .abi
-            .is_some_and(|abi| abi.call_signature(*item).is_some())
-        {
+        if self.abi.is_some_and(|abi| {
+            abi.call_signature(*item)
+                .is_some_and(|sig| sig.result.is_some())
+        }) {
             return Ok(None);
         }
         let Some(result) = op.result else {
@@ -759,137 +769,263 @@ impl JsCx<'_> {
                 jsast::binary(jsast::BinOp::StrictEq, a, b)
             }
             (StandardOperation::StrCmp, [a, b]) if is_str(*a)? && is_str(*b)? => {
-                let ty = self.ty_of(result)?;
-                let variant = |name: &str| -> Option<Expr> {
-                    let index = table
-                        .variants(table.peeled(ty))
-                        .iter()
-                        .position(|v| value::variant_name(self.interns, v) == name)?;
-                    value::enum_value(table, self.interns, ty, index as u32, Vec::new())
+                let ordering_ty = self.ty_of(result)?;
+                let a = string(*a, &mut prelude, &mut hold)?;
+                let b = string(*b, &mut prelude, &mut hold)?;
+                let Some(cmp) = self.str_cmp_expr(ordering_ty, a, b) else {
+                    return Ok(None);
                 };
-                let (Some(less), Some(equal), Some(greater)) =
-                    (variant("Less"), variant("Equal"), variant("Greater"))
-                else {
+                cmp
+            }
+            (StandardOperation::StrPartialCmp, [a, b]) if is_str(*a)? && is_str(*b)? => {
+                let Some((_, some)) = self.option_variants(result)? else {
+                    return Ok(None);
+                };
+                let result_ty = self.ty_of(result)?;
+                let Some(ordering_field) = table.field(result_ty, Some(some.0), 0) else {
                     return Ok(None);
                 };
                 let a = string(*a, &mut prelude, &mut hold)?;
                 let b = string(*b, &mut prelude, &mut hold)?;
+                let Some(cmp) = self.str_cmp_expr(ordering_field.ty, a, b) else {
+                    return Ok(None);
+                };
+                let Some(wrapped) =
+                    value::enum_value(table, self.interns, result_ty, some.0, vec![(some.1, cmp)])
+                else {
+                    return Ok(None);
+                };
+                wrapped
+            }
+            (
+                StandardOperation::StrTrim
+                | StandardOperation::StrTrimStart
+                | StandardOperation::StrTrimEnd,
+                [s],
+            ) if is_str(*s)? => {
+                let helper = match operation {
+                    StandardOperation::StrTrim => "bstr_trim",
+                    StandardOperation::StrTrimStart => "bstr_trim_start",
+                    _ => "bstr_trim_end",
+                };
+                jsast::rt_call(helper, vec![string(*s, &mut prelude, &mut hold)?])
+            }
+            (StandardOperation::StrStripPrefix | StandardOperation::StrStripSuffix, [s, pattern])
+                if is_str(*s)? && (is_str(*pattern)? || is_char(*pattern)?) =>
+            {
+                let Some((none, some)) = self.option_variants(result)? else {
+                    return Ok(None);
+                };
+                let s = string(*s, &mut prelude, &mut hold)?;
+                let Some(pattern) = needle(*pattern, &mut prelude, &mut hold)? else {
+                    return Ok(None);
+                };
+                let ty = self.ty_of(result)?;
+                let (method, rest) = if matches!(operation, StandardOperation::StrStripPrefix) {
+                    (
+                        "startsWith",
+                        jsast::method_call(
+                            s.clone(),
+                            "slice",
+                            vec![jsast::member(pattern.clone(), "length")],
+                        ),
+                    )
+                } else {
+                    let end = jsast::binary(
+                        jsast::BinOp::Sub,
+                        jsast::member(s.clone(), "length"),
+                        jsast::member(pattern.clone(), "length"),
+                    );
+                    ("endsWith", jsast::method_call(s.clone(), "slice", vec![jsast::num(0), end]))
+                };
+                let (Some(none), Some(some)) = (
+                    value::enum_value(table, self.interns, ty, none, Vec::new()),
+                    value::enum_value(table, self.interns, ty, some.0, vec![(some.1, rest)]),
+                ) else {
+                    return Ok(None);
+                };
+                jsast::cond(jsast::method_call(s, method, vec![pattern]), some, none)
+            }
+            (StandardOperation::StrGet, [s, range]) if is_str(*s)? => {
+                let Some((none, some)) = self.option_variants(result)? else {
+                    return Ok(None);
+                };
+                let ty = self.ty_of(result)?;
+                let s = string(*s, &mut prelude, &mut hold)?;
+                let Some(shape) = self.decompose_str_range(*range, &mut prelude, &mut hold)? else {
+                    return Ok(None);
+                };
+                let Some(none_val) = value::enum_value(table, self.interns, ty, none, Vec::new())
+                else {
+                    return Ok(None);
+                };
+                let got = match shape {
+                    StrRange::Full => {
+                        let Some(some_val) =
+                            value::enum_value(table, self.interns, ty, some.0, vec![(some.1, s)])
+                        else {
+                            return Ok(None);
+                        };
+                        return Ok(Some(Lowered::Value(prelude, some_val)));
+                    }
+                    StrRange::From { start, .. } => jsast::rt_call("bstr_get_from", vec![s, start]),
+                    StrRange::To { end, .. } => jsast::rt_call("bstr_get_to", vec![s, end]),
+                    StrRange::Bounds { start, end, .. } => {
+                        jsast::rt_call("bstr_get", vec![s, start, end])
+                    }
+                };
+                let (bind, at) = self.temp(got);
+                prelude.push(bind);
+                let Some(some_val) =
+                    value::enum_value(table, self.interns, ty, some.0, vec![(some.1, at.clone())])
+                else {
+                    return Ok(None);
+                };
                 jsast::cond(
-                    jsast::binary(jsast::BinOp::Lt, a.clone(), b.clone()),
-                    less,
-                    jsast::cond(jsast::binary(jsast::BinOp::StrictEq, a, b), equal, greater),
+                    jsast::binary(jsast::BinOp::StrictEq, at, jsast::undefined()),
+                    none_val,
+                    some_val,
                 )
             }
             (StandardOperation::StrIndex, [s, range]) if is_str(*s)? => {
-                let range_ty = table.peeled(self.ty_of(*range)?);
-                let variants = table.variants(range_ty);
-                let [variant] = variants else {
+                let s = string(*s, &mut prelude, &mut hold)?;
+                let Some(shape) = self.decompose_str_range(*range, &mut prelude, &mut hold)? else {
                     return Ok(None);
                 };
-                let mut keys = Vec::new();
-                for field in &variant.fields {
-                    match value::key_name(self.interns, field.key) {
-                        Some(key) => keys.push(key),
-                        None => return Ok(None),
+                let (helper, mut sub_args, range_expr) = match shape {
+                    StrRange::Full => return Ok(Some(Lowered::Value(prelude, s))),
+                    StrRange::Bounds { start, end, range } => {
+                        ("bstr_sub", vec![s.clone(), start, end], range)
                     }
-                }
-                let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
-                let s = string(*s, &mut prelude, &mut hold)?;
-                // A range spelled as an object literal is read field by field and rebuilt only on
-                // the failing path, so the fast path allocates nothing.
-                let (fields, range) = match self.expr_of(*range)? {
-                    Expr::Object(entries)
-                        if entries
-                            .iter()
-                            .map(|(k, _)| k.as_str())
-                            .eq(keys.iter().copied()) =>
-                    {
-                        let held: Vec<(String, Expr)> = entries
-                            .into_iter()
-                            .map(|(key, value)| (key, hold(value, &mut prelude)))
-                            .collect();
-                        (held.clone(), Expr::Object(held))
+                    StrRange::From { start, range } => {
+                        ("bstr_sub_from", vec![s.clone(), start], range)
                     }
-                    other => {
-                        let held = hold(other, &mut prelude);
-                        let fields = keys
-                            .iter()
-                            .map(|key| ((*key).to_owned(), jsast::member(held.clone(), *key)))
-                            .collect();
-                        (fields, held)
-                    }
+                    StrRange::To { end, range } => ("bstr_sub_to", vec![s.clone(), end], range),
                 };
-                if keys.is_empty() {
-                    s
-                } else {
-                    let length = jsast::member(s.clone(), "length");
-                    let boundary = |at: Expr| {
-                        jsast::binary(
-                            jsast::BinOp::StrictNe,
-                            jsast::binary(
-                                jsast::BinOp::BitAnd,
-                                jsast::method_call(s.clone(), "charCodeAt", vec![at]),
-                                jsast::num(0xc0),
-                            ),
-                            jsast::num(0x80),
-                        )
-                    };
-                    let and = |l, r| jsast::binary(jsast::BinOp::And, l, r);
-                    let le = |l, r| jsast::binary(jsast::BinOp::Le, l, r);
-                    let field = |key: &str| {
-                        fields
-                            .iter()
-                            .find(|(k, _)| k == key)
-                            .map(|(_, v)| v.clone())
-                            .unwrap_or_else(jsast::undefined)
-                    };
-                    let (test, slice) = match keys.as_slice() {
-                        ["start", "end"] => {
-                            let (start, end) = (field("start"), field("end"));
-                            (
-                                and(
-                                    and(le(start.clone(), end.clone()), le(end.clone(), length)),
-                                    and(boundary(start.clone()), boundary(end.clone())),
-                                ),
-                                jsast::method_call(s.clone(), "substring", vec![start, end]),
-                            )
-                        }
-                        ["start"] => {
-                            let start = field("start");
-                            (
-                                and(le(start.clone(), length), boundary(start.clone())),
-                                jsast::method_call(s.clone(), "substring", vec![start]),
-                            )
-                        }
-                        ["end"] => {
-                            let end = field("end");
-                            (
-                                and(le(end.clone(), length), boundary(end.clone())),
-                                jsast::method_call(
-                                    s.clone(),
-                                    "substring",
-                                    vec![jsast::num(0), end],
-                                ),
-                            )
-                        }
-                        _ => return Ok(None),
-                    };
-                    let name = match self.call_retargets.get(item) {
-                        Some(name) => name.as_str().to_owned(),
-                        None => self.link_name(*link_name)?,
-                    };
-                    let mut arguments = vec![s, range];
-                    if let Some(location) =
-                        self.caller_location_argument(callee, args.len(), track_caller)?
-                    {
-                        arguments.push(location);
+                let location = self.caller_location_argument(callee, args.len(), track_caller)?;
+                match (self.ascii().and_then(|a| a.slice_error_fail), location) {
+                    (Some(fail_fn), Some(loc)) => {
+                        sub_args.push(jsast::id(fail_fn));
+                        sub_args.push(loc);
                     }
-                    jsast::cond(test, slice, jsast::call(jsast::id(name), arguments))
+                    (_, loc) => {
+                        if self
+                            .abi
+                            .is_some_and(|abi| abi.call_signature(*item).is_some())
+                        {
+                            return Ok(None);
+                        }
+                        let name = match self.call_retargets.get(item) {
+                            Some(name) => name.as_str().to_owned(),
+                            None => self.link_name(*link_name)?,
+                        };
+                        let mut orig_args = vec![s, range_expr];
+                        if let Some(loc) = loc {
+                            orig_args.push(loc);
+                        }
+                        sub_args.push(jsast::arrow(
+                            Vec::new(),
+                            jsast::call(jsast::id(name), orig_args),
+                        ));
+                    }
                 }
+                jsast::rt_call(helper, sub_args)
             }
             _ => return Ok(None),
         };
         Ok(Some(Lowered::Value(prelude, value)))
+    }
+
+    /// Three-way `Ordering` result expression `a < b ? Less : a === b ? Equal : Greater`.
+    fn str_cmp_expr(&self, ordering_ty: rcgjs_object::jir::types::TypeId, a: Expr, b: Expr) -> Option<Expr> {
+        let table = self.table;
+        let variant = |name: &str| -> Option<Expr> {
+            let index = table
+                .variants(table.peeled(ordering_ty))
+                .iter()
+                .position(|v| value::variant_name(self.interns, v) == name)?;
+            value::enum_value(table, self.interns, ordering_ty, index as u32, Vec::new())
+        };
+        let (Some(less), Some(equal), Some(greater)) =
+            (variant("Less"), variant("Equal"), variant("Greater"))
+        else {
+            return None;
+        };
+        Some(jsast::cond(
+            jsast::binary(jsast::BinOp::Lt, a.clone(), b.clone()),
+            less,
+            jsast::cond(jsast::binary(jsast::BinOp::StrictEq, a, b), equal, greater),
+        ))
+    }
+
+    /// Decomposes a `Range`, `RangeFrom`, `RangeTo`, or `RangeFull` value into held endpoints plus
+    /// a lazy fallback range expression.
+    fn decompose_str_range(
+        &self,
+        range: ValueId,
+        prelude: &mut Vec<Stmt>,
+        hold: &mut dyn FnMut(Expr, &mut Vec<Stmt>) -> Expr,
+    ) -> Res<Option<StrRange>> {
+        let table = self.table;
+        let range_ty = table.peeled(self.ty_of(range)?);
+        let variants = table.variants(range_ty);
+        let [variant] = variants else {
+            return Ok(None);
+        };
+        let mut keys = Vec::new();
+        for field in &variant.fields {
+            match value::key_name(self.interns, field.key) {
+                Some(key) => keys.push(key),
+                None => return Ok(None),
+            }
+        }
+        let key_strs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let (fields, range_expr) = match self.expr_of(range)? {
+            Expr::Object(entries)
+                if entries
+                    .iter()
+                    .map(|(k, _)| k.as_str())
+                    .eq(key_strs.iter().copied()) =>
+            {
+                let held: Vec<(String, Expr)> = entries
+                    .into_iter()
+                    .map(|(key, value)| (key, hold(value, prelude)))
+                    .collect();
+                (held.clone(), Expr::Object(held))
+            }
+            other => {
+                let held = hold(other, prelude);
+                let fields = key_strs
+                    .iter()
+                    .map(|key| ((*key).to_owned(), jsast::member(held.clone(), *key)))
+                    .collect();
+                (fields, held)
+            }
+        };
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(jsast::undefined)
+        };
+        Ok(match key_strs.as_slice() {
+            [] => Some(StrRange::Full),
+            ["start", "end"] => Some(StrRange::Bounds {
+                start: field("start"),
+                end: field("end"),
+                range: range_expr,
+            }),
+            ["start"] => Some(StrRange::From {
+                start: field("start"),
+                range: range_expr,
+            }),
+            ["end"] => Some(StrRange::To {
+                end: field("end"),
+                range: range_expr,
+            }),
+            _ => None,
+        })
     }
 
     /// The `(None, (Some, field key))` variant indices of an `Option` result.

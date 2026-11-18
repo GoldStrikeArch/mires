@@ -212,6 +212,20 @@ pub enum StandardOperation {
     StrEq,
     /// `<str as Ord>::cmp`.
     StrCmp,
+    /// `str::strip_prefix` with a `&str` or `char` pattern.
+    StrStripPrefix,
+    /// `str::strip_suffix` with a `&str` or `char` pattern.
+    StrStripSuffix,
+    /// `str::trim`.
+    StrTrim,
+    /// `str::trim_start`.
+    StrTrimStart,
+    /// `str::trim_end`.
+    StrTrimEnd,
+    /// `str::get` with `Range`, `RangeFrom`, `RangeTo`, or `RangeFull` of `usize`.
+    StrGet,
+    /// `<str as PartialOrd>::partial_cmp`.
+    StrPartialCmp,
 }
 
 impl StandardOperation {
@@ -229,6 +243,13 @@ impl StandardOperation {
                 | Self::StrIndex
                 | Self::StrEq
                 | Self::StrCmp
+                | Self::StrStripPrefix
+                | Self::StrStripSuffix
+                | Self::StrTrim
+                | Self::StrTrimStart
+                | Self::StrTrimEnd
+                | Self::StrGet
+                | Self::StrPartialCmp
         )
     }
 }
