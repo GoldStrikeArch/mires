@@ -1840,13 +1840,15 @@ globalThis.__rt.native_vec_set_len = (value, length) => {
 // does `Box::new`. See `CONTRACT.md`'s "Allocation" section.
 //
 // The table is a `WeakMap`, so a block nothing points at is collected with its
-// entry; `_freed` is a `WeakSet` of blocks that were deallocated, kept only so
-// that a use after free is a refusal naming itself rather than a read of an
-// emptied array.
+// entry; `_freed` is the key of a mark `dealloc` writes onto the emptied array
+// of a block it frees, kept only so that a use after free is a refusal naming
+// itself rather than a read of an emptied array. The mark lives on the array,
+// not in a side table: a `WeakSet` insert per free cost an allocation-heavy
+// program a third of its run time.
 globalThis.__rt._blocks = new WeakMap();
 let _blkK = null;
 let _blkV;
-globalThis.__rt._freed = new WeakSet();
+globalThis.__rt._freed = Symbol("rustc_codegen_js.freed");
 // Stack arrays reached through `MaybeUninit<u8>` need the same one-time scale
 // bookkeeping without becoming heap blocks. In particular, `_put` must not
 // attach heap ownership metadata to values stored in sort scratch space.
@@ -1868,7 +1870,7 @@ globalThis.__rt._blk_get = (buf) => {
 globalThis.__rt._heap_block = (buf) => {
   const block = globalThis.__rt._blk_get(buf);
   if (block !== undefined) return block;
-  if (globalThis.__rt._freed.has(buf)) {
+  if (buf != null && buf[globalThis.__rt._freed] === true) {
     throw __rt.abort_error(new Error(
       "rustc_codegen_js: this pointer names a heap block that has been freed",
     ));
@@ -2120,7 +2122,7 @@ globalThis.__rt.alloc_zeroed = (size, align) =>
 
 // dealloc(ptr, size, align): `__rust_dealloc`. The block is unregistered and
 // poisoned: emptying the array makes every stale pointer into it read
-// `undefined` rather than the value it used to hold, and the `_freed` set turns
+// `undefined` rather than the value it used to hold, and the `_freed` mark turns
 // a later cast through that pointer into a refusal that says so. Its synthetic
 // address, if it was ever asked for, goes back to the free list (`addr`).
 globalThis.__rt.dealloc = (p, size, align) => {
@@ -2136,9 +2138,9 @@ globalThis.__rt.dealloc = (p, size, align) => {
     _blkK = null;
     _blkV = undefined;
   }
-  globalThis.__rt._freed.add(buf);
   if (_has_minted_addrs) globalThis.__rt._addr_release(buf);
   buf.length = 0;
+  buf[globalThis.__rt._freed] = true;
 };
 
 // realloc(ptr, size, align, new_size): `__rust_realloc`, in place.
