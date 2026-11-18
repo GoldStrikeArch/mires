@@ -973,12 +973,18 @@ fn collect_sites(
                 // A `str` identity (`js-str=bytes` only) stays a call: `lower/js/call.rs` spells
                 // it as the string operation it is, which inlining its body would take away.
                 CallSemantic::Standard(std_op) if std_op.is_str() => false,
-                CallSemantic::Standard(std_op) if allow_std_post_repr => !matches!(
-                    std_op,
-                    crate::jir::semantic::StandardOperation::FormatArgumentNewDisplay
-                        | crate::jir::semantic::StandardOperation::FormatArgsNew
-                        | crate::jir::semantic::StandardOperation::FormatArgsToString
-                ),
+                CallSemantic::Standard(std_op) if allow_std_post_repr => {
+                    !matches!(
+                        std_op,
+                        crate::jir::semantic::StandardOperation::FormatArgumentNewDisplay
+                            | crate::jir::semantic::StandardOperation::FormatArgsNew
+                            | crate::jir::semantic::StandardOperation::FormatArgsToString
+                    ) && !(crate::lower::bstr::enabled()
+                        && matches!(
+                            std_op,
+                            crate::jir::semantic::StandardOperation::StringAsStr
+                        ))
+                }
                 _ => false,
             };
             if !semantic_ok || host.is_some() {

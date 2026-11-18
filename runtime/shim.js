@@ -1775,6 +1775,9 @@ globalThis.__rt.bstr_bytes = (s) => {
 // `TextEncoder`. Only pure-ASCII arrays are registered in `_bstr_src`, and keys
 // live in `memo.utf8` so host strings never collide with Rust byte strings.
 globalThis.__rt.bstr_utf8_bytes = (s) => {
+  if (typeof s !== "string") {
+    throw new TypeError("expected a string for str, got " + typeof s);
+  }
   const n = s.length;
   if (n <= 64) {
     const bytes = new Array(n);

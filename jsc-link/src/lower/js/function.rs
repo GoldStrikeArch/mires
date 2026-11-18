@@ -515,6 +515,395 @@ fn mentioned_names(body: &[Stmt]) -> HashSet<String> {
     names
 }
 
+fn seq_tail(expr: &Expr) -> Option<&Expr> {
+    match expr {
+        Expr::Seq(items) => items.last(),
+        other => Some(other),
+    }
+}
+
+fn str_view_call_target(expr: &Expr) -> Option<(&'static str, &str)> {
+    let Expr::Call(callee, args) = expr else {
+        return None;
+    };
+    let [Expr::Ident(arg)] = args.as_slice() else {
+        return None;
+    };
+    let Expr::Member(obj, method) = callee.as_ref() else {
+        return None;
+    };
+    if !matches!(obj.as_ref(), Expr::Ident(rt) if rt == "__rt") {
+        return None;
+    }
+    match method.as_str() {
+        "str_bytes" => Some(("str_bytes", arg.as_str())),
+        "str_len" => Some(("str_len", arg.as_str())),
+        _ => None,
+    }
+}
+
+fn str_bytes_call_target(expr: &Expr) -> Option<(&'static str, &str)> {
+    let Expr::Ident(arg) = rt_unary_call(expr, "str_bytes")? else {
+        return None;
+    };
+    Some(("str_bytes", arg.as_str()))
+}
+
+struct LocalFusePolicy {
+    peel_rhs: fn(&Expr) -> bool,
+    read_call: fn(&Expr) -> Option<(&'static str, &str)>,
+    allow_early_exit: bool,
+}
+
+fn count_reads_in_expr(expr: &Expr, target: &str, policy: &LocalFusePolicy) -> usize {
+    if let Some((_, arg)) = (policy.read_call)(expr) {
+        return usize::from(arg == target);
+    }
+    match expr {
+        Expr::Member(obj, _) | Expr::Unary(_, obj) => count_reads_in_expr(obj, target, policy),
+        Expr::Index(obj, idx)
+        | Expr::Binary(_, obj, idx)
+        | Expr::Assign(obj, idx)
+        | Expr::CompoundAssign(_, obj, idx) => {
+            count_reads_in_expr(obj, target, policy) + count_reads_in_expr(idx, target, policy)
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            count_reads_in_expr(c, target, policy)
+                + args
+                    .iter()
+                    .map(|a| count_reads_in_expr(a, target, policy))
+                    .sum::<usize>()
+        }
+        Expr::Cond(c, t, e) => {
+            count_reads_in_expr(c, target, policy)
+                + count_reads_in_expr(t, target, policy)
+                + count_reads_in_expr(e, target, policy)
+        }
+        Expr::Object(entries) => entries
+            .iter()
+            .map(|(_, v)| count_reads_in_expr(v, target, policy))
+            .sum(),
+        Expr::Array(items) | Expr::Seq(items) => {
+            items.iter().map(|x| count_reads_in_expr(x, target, policy)).sum()
+        }
+        _ => 0,
+    }
+}
+
+fn count_reads_in_stmts(stmts: &[Stmt], target: &str, policy: &LocalFusePolicy) -> usize {
+    let mut total = 0;
+    for stmt in stmts {
+        match stmt {
+            Stmt::ExprStmt(e)
+            | Stmt::Throw(e)
+            | Stmt::Const(_, e)
+            | Stmt::Let(_, Some(e))
+            | Stmt::Return(Some(e)) => total += count_reads_in_expr(e, target, policy),
+            Stmt::Lets(decls) => {
+                for (_, init) in decls {
+                    if let Some(e) = init {
+                        total += count_reads_in_expr(e, target, policy);
+                    }
+                }
+            }
+            Stmt::If(test, a, b) => {
+                total += count_reads_in_expr(test, target, policy)
+                    + count_reads_in_stmts(a, target, policy)
+                    + b.as_deref()
+                        .map_or(0, |s| count_reads_in_stmts(s, target, policy));
+            }
+            Stmt::Switch(d, cases) => {
+                total += count_reads_in_expr(d, target, policy);
+                for c in cases {
+                    total += c
+                        .tests
+                        .iter()
+                        .map(|t| count_reads_in_expr(t, target, policy))
+                        .sum::<usize>();
+                    total += count_reads_in_stmts(&c.body, target, policy);
+                }
+            }
+            Stmt::Labeled(_, inner) => {
+                total += count_reads_in_stmts(std::slice::from_ref(inner.as_ref()), target, policy);
+            }
+            Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                total += count_reads_in_stmts(b, target, policy);
+            }
+            Stmt::While(t, b) => {
+                total +=
+                    count_reads_in_expr(t, target, policy) + count_reads_in_stmts(b, target, policy);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                total += count_reads_in_stmts(body, target, policy)
+                    + count_reads_in_stmts(handler, target, policy);
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+fn stmt_writes_target(stmt: &Stmt, target: &str, policy: &LocalFusePolicy) -> bool {
+    match stmt {
+        Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+            matches!(lhs.as_ref(), Expr::Ident(n) if n == target) && (policy.peel_rhs)(rhs)
+        }
+        Stmt::Let(name, Some(init)) => name == target && (policy.peel_rhs)(init),
+        Stmt::Lets(decls) => decls
+            .iter()
+            .any(|(name, init)| name == target && init.as_ref().is_some_and(policy.peel_rhs)),
+        _ => false,
+    }
+}
+
+fn expr_is_pure_until_last_str_bytes(
+    expr: &Expr,
+    target: &str,
+    remaining: &mut usize,
+    policy: &LocalFusePolicy,
+) -> bool {
+    if *remaining == 0 {
+        return true;
+    }
+    if let Some((method, arg)) = (policy.read_call)(expr) {
+        if arg == target {
+            if method == "str_bytes" {
+                *remaining = remaining.saturating_sub(1);
+            }
+            return true;
+        }
+    }
+    match expr {
+        Expr::Num(_)
+        | Expr::RawNum(_)
+        | Expr::BigInt(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Undefined
+        | Expr::Null
+        | Expr::Ident(_)
+        | Expr::Arrow(..) => true,
+        Expr::Member(obj, _) | Expr::Unary(_, obj) => {
+            expr_is_pure_until_last_str_bytes(obj, target, remaining, policy)
+        }
+        Expr::Index(obj, idx) => {
+            expr_is_pure_until_last_str_bytes(obj, target, remaining, policy)
+                && expr_is_pure_until_last_str_bytes(idx, target, remaining, policy)
+        }
+        Expr::Binary(op, obj, idx) => {
+            if !expr_is_pure_until_last_str_bytes(obj, target, remaining, policy) {
+                return false;
+            }
+            if *remaining == 0 {
+                return true;
+            }
+            if !policy.allow_early_exit && matches!(op, jsast::BinOp::And | jsast::BinOp::Or) {
+                // Short-circuit RHS is not guaranteed to run `bstr_utf8_bytes`'s TypeError check.
+                let before = *remaining;
+                return expr_is_pure_until_last_str_bytes(idx, target, remaining, policy)
+                    && *remaining == before;
+            }
+            expr_is_pure_until_last_str_bytes(idx, target, remaining, policy)
+        }
+        Expr::Cond(c, t, e) => {
+            if !expr_is_pure_until_last_str_bytes(c, target, remaining, policy) {
+                return false;
+            }
+            if *remaining == 0 {
+                return true;
+            }
+            // Disallow impure calls/writes on either arm while str_bytes reads remain.
+            let mut rem_t = *remaining;
+            let mut rem_e = *remaining;
+            let ok_t = expr_is_pure_until_last_str_bytes(t, target, &mut rem_t, policy);
+            let ok_e = expr_is_pure_until_last_str_bytes(e, target, &mut rem_e, policy);
+            if !policy.allow_early_exit {
+                // With strict validation preservation, neither arm may conditionally consume the
+                // target read before it runs unconditionally later.
+                return ok_t && ok_e && rem_t == *remaining && rem_e == *remaining;
+            }
+            *remaining = (*remaining).saturating_sub((*remaining - rem_t) + (*remaining - rem_e));
+            ok_t && ok_e && *remaining == 0
+        }
+        Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
+            let lhs_pure = match lhs.as_ref() {
+                Expr::Ident(_) => true,
+                Expr::Member(obj, _) => {
+                    expr_is_pure_until_last_str_bytes(obj, target, remaining, policy)
+                }
+                Expr::Index(obj, idx) => {
+                    expr_is_pure_until_last_str_bytes(obj, target, remaining, policy)
+                        && expr_is_pure_until_last_str_bytes(idx, target, remaining, policy)
+                }
+                _ => false,
+            };
+            if !lhs_pure {
+                return false;
+            }
+            if !expr_is_pure_until_last_str_bytes(rhs, target, remaining, policy) {
+                return false;
+            }
+            // A Member/Index store executes after evaluating lhs and rhs; unsafe if any
+            // str_bytes(target) still runs later.
+            !matches!(lhs.as_ref(), Expr::Member(..) | Expr::Index(..)) || *remaining == 0
+        }
+        Expr::Call(callee, args) | Expr::New(callee, args) => {
+            if !expr_is_pure_until_last_str_bytes(callee, target, remaining, policy) {
+                return false;
+            }
+            for a in args {
+                if !expr_is_pure_until_last_str_bytes(a, target, remaining, policy) {
+                    return false;
+                }
+            }
+            *remaining == 0
+        }
+        Expr::Object(entries) => entries
+            .iter()
+            .all(|(_, v)| expr_is_pure_until_last_str_bytes(v, target, remaining, policy)),
+        Expr::Array(items) | Expr::Seq(items) => items
+            .iter()
+            .all(|x| expr_is_pure_until_last_str_bytes(x, target, remaining, policy)),
+        Expr::Raw(_) => false,
+    }
+}
+
+fn stmts_is_pure_until_last_str_bytes(
+    stmts: &[Stmt],
+    target: &str,
+    remaining: &mut usize,
+    policy: &LocalFusePolicy,
+) -> bool {
+    for stmt in stmts {
+        if *remaining == 0 {
+            return true;
+        }
+        let ok = match stmt {
+            Stmt::ExprStmt(e) | Stmt::Const(_, e) | Stmt::Let(_, Some(e)) => {
+                expr_is_pure_until_last_str_bytes(e, target, remaining, policy)
+            }
+            Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                expr_is_pure_until_last_str_bytes(e, target, remaining, policy)
+                    && (policy.allow_early_exit || *remaining == 0)
+            }
+            Stmt::Let(_, None) | Stmt::Import { .. } | Stmt::Comment(_) | Stmt::Loc(_) => true,
+            Stmt::Return(None) | Stmt::Break(_) | Stmt::Continue(_) => policy.allow_early_exit,
+            Stmt::Lets(decls) => decls.iter().all(|(_, init)| {
+                init.as_ref()
+                    .is_none_or(|e| expr_is_pure_until_last_str_bytes(e, target, remaining, policy))
+            }),
+            Stmt::Block(b) => stmts_is_pure_until_last_str_bytes(b, target, remaining, policy),
+            Stmt::Labeled(_, inner) => stmts_is_pure_until_last_str_bytes(
+                std::slice::from_ref(inner.as_ref()),
+                target,
+                remaining,
+                policy,
+            ),
+            Stmt::If(..)
+            | Stmt::Switch(..)
+            | Stmt::LoopForever(..)
+            | Stmt::While(..)
+            | Stmt::TryCatch { .. }
+            | Stmt::FunctionDecl { .. }
+            | Stmt::Raw(_) => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    *remaining == 0
+}
+
+fn write_dominates_and_safe(
+    stmts: &[Stmt],
+    target: &str,
+    total_reads: usize,
+    str_bytes_reads: usize,
+    policy: &LocalFusePolicy,
+) -> Option<bool> {
+    for (idx, stmt) in stmts.iter().enumerate() {
+        if stmt_writes_target(stmt, target, policy) {
+            let mut remaining = str_bytes_reads;
+            let mut pre_reads = 0usize;
+            if !policy.allow_early_exit {
+                if let Stmt::Lets(decls) = stmt {
+                    if let Some(pos) = decls.iter().position(|(name, init)| {
+                        name == target && init.as_ref().is_some_and(policy.peel_rhs)
+                    }) {
+                        for (_, init) in &decls[pos + 1..] {
+                            if let Some(init_expr) = init {
+                                pre_reads += count_reads_in_expr(init_expr, target, policy);
+                                if !expr_is_pure_until_last_str_bytes(
+                                    init_expr,
+                                    target,
+                                    &mut remaining,
+                                    policy,
+                                ) {
+                                    return Some(false);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let tail = &stmts[idx + 1..];
+            if pre_reads + count_reads_in_stmts(tail, target, policy) != total_reads {
+                return Some(false);
+            }
+            if str_bytes_reads == 0 {
+                return Some(true);
+            }
+            return Some(stmts_is_pure_until_last_str_bytes(
+                tail,
+                target,
+                &mut remaining,
+                policy,
+            ));
+        }
+        let nested = match stmt {
+            Stmt::If(_, a, b) => {
+                write_dominates_and_safe(a, target, total_reads, str_bytes_reads, policy).or_else(
+                    || {
+                        b.as_deref().and_then(|s| {
+                            write_dominates_and_safe(s, target, total_reads, str_bytes_reads, policy)
+                        })
+                    },
+                )
+            }
+            Stmt::Switch(_, cases) => cases.iter().find_map(|c| {
+                write_dominates_and_safe(&c.body, target, total_reads, str_bytes_reads, policy)
+            }),
+            Stmt::Labeled(_, inner) => write_dominates_and_safe(
+                std::slice::from_ref(inner.as_ref()),
+                target,
+                total_reads,
+                str_bytes_reads,
+                policy,
+            ),
+            Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
+                write_dominates_and_safe(b, target, total_reads, str_bytes_reads, policy)
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                write_dominates_and_safe(body, target, total_reads, str_bytes_reads, policy)
+                    .or_else(|| {
+                        write_dominates_and_safe(
+                            handler,
+                            target,
+                            total_reads,
+                            str_bytes_reads,
+                            policy,
+                        )
+                    })
+            }
+            _ => None,
+        };
+        if nested.is_some() {
+            return nested;
+        }
+    }
+    None
+}
+
 /// Eliminates intra-function `let x; x = (..., __rt.bytes_str(b, o, l))` round-trips when every
 /// read of `x` is `__rt.str_bytes(x)` or `__rt.str_len(x)`, rewriting `x` to hold
 /// `{ buf: b, off: o, len: l }`, `__rt.str_bytes(x)` to `x`, and `__rt.str_len(x)` to `x.len`.
@@ -528,12 +917,8 @@ pub(super) fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) 
     }
 
     fn peel_bytes_str(expr: &Expr) -> bool {
-        let tail = match expr {
-            Expr::Seq(items) => match items.last() {
-                Some(last) => last,
-                None => return false,
-            },
-            other => other,
+        let Some(tail) = seq_tail(expr) else {
+            return false;
         };
         matches!(
             tail,
@@ -545,25 +930,6 @@ pub(super) fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) 
                             if name == "bytes_str" && matches!(obj.as_ref(), Expr::Ident(rt) if rt == "__rt")
                     )
         )
-    }
-
-    fn str_view_call_target(expr: &Expr) -> Option<(&str, &str)> {
-        let Expr::Call(callee, args) = expr else {
-            return None;
-        };
-        let [Expr::Ident(arg)] = args.as_slice() else {
-            return None;
-        };
-        let Expr::Member(obj, method) = callee.as_ref() else {
-            return None;
-        };
-        if matches!(obj.as_ref(), Expr::Ident(rt) if rt == "__rt")
-            && matches!(method.as_str(), "str_bytes" | "str_len")
-        {
-            Some((method.as_str(), arg.as_str()))
-        } else {
-            None
-        }
     }
 
     fn scan_expr(expr: &Expr, locals: &HashSet<String>, usage: &mut HashMap<String, LocalUsage>) {
@@ -746,298 +1112,6 @@ pub(super) fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) 
         }
     }
 
-    fn count_reads_in_expr(expr: &Expr, target: &str) -> usize {
-        if let Some((_, arg)) = str_view_call_target(expr) {
-            return usize::from(arg == target);
-        }
-        match expr {
-            Expr::Member(obj, _) | Expr::Unary(_, obj) => count_reads_in_expr(obj, target),
-            Expr::Index(obj, idx)
-            | Expr::Binary(_, obj, idx)
-            | Expr::Assign(obj, idx)
-            | Expr::CompoundAssign(_, obj, idx) => {
-                count_reads_in_expr(obj, target) + count_reads_in_expr(idx, target)
-            }
-            Expr::Call(c, args) | Expr::New(c, args) => {
-                count_reads_in_expr(c, target)
-                    + args
-                        .iter()
-                        .map(|a| count_reads_in_expr(a, target))
-                        .sum::<usize>()
-            }
-            Expr::Cond(c, t, e) => {
-                count_reads_in_expr(c, target)
-                    + count_reads_in_expr(t, target)
-                    + count_reads_in_expr(e, target)
-            }
-            Expr::Object(entries) => entries
-                .iter()
-                .map(|(_, v)| count_reads_in_expr(v, target))
-                .sum(),
-            Expr::Array(items) | Expr::Seq(items) => {
-                items.iter().map(|x| count_reads_in_expr(x, target)).sum()
-            }
-            _ => 0,
-        }
-    }
-
-    fn count_reads_in_stmts(stmts: &[Stmt], target: &str) -> usize {
-        let mut total = 0;
-        for stmt in stmts {
-            match stmt {
-                Stmt::ExprStmt(e)
-                | Stmt::Throw(e)
-                | Stmt::Const(_, e)
-                | Stmt::Let(_, Some(e))
-                | Stmt::Return(Some(e)) => total += count_reads_in_expr(e, target),
-                Stmt::Lets(decls) => {
-                    for (_, init) in decls {
-                        if let Some(e) = init {
-                            total += count_reads_in_expr(e, target);
-                        }
-                    }
-                }
-                Stmt::If(test, a, b) => {
-                    total += count_reads_in_expr(test, target)
-                        + count_reads_in_stmts(a, target)
-                        + b.as_deref().map_or(0, |s| count_reads_in_stmts(s, target));
-                }
-                Stmt::Switch(d, cases) => {
-                    total += count_reads_in_expr(d, target);
-                    for c in cases {
-                        total += c
-                            .tests
-                            .iter()
-                            .map(|t| count_reads_in_expr(t, target))
-                            .sum::<usize>();
-                        total += count_reads_in_stmts(&c.body, target);
-                    }
-                }
-                Stmt::Labeled(_, inner) => {
-                    total += count_reads_in_stmts(std::slice::from_ref(inner.as_ref()), target);
-                }
-                Stmt::LoopForever(_, b) | Stmt::Block(b) => {
-                    total += count_reads_in_stmts(b, target);
-                }
-                Stmt::While(t, b) => {
-                    total += count_reads_in_expr(t, target) + count_reads_in_stmts(b, target);
-                }
-                Stmt::TryCatch { body, handler, .. } => {
-                    total +=
-                        count_reads_in_stmts(body, target) + count_reads_in_stmts(handler, target);
-                }
-                _ => {}
-            }
-        }
-        total
-    }
-
-    fn stmt_writes_target(stmt: &Stmt, target: &str) -> bool {
-        match stmt {
-            Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
-                matches!(lhs.as_ref(), Expr::Ident(n) if n == target) && peel_bytes_str(rhs)
-            }
-            Stmt::Let(name, Some(init)) => name == target && peel_bytes_str(init),
-            Stmt::Lets(decls) => decls
-                .iter()
-                .any(|(name, init)| name == target && init.as_ref().is_some_and(peel_bytes_str)),
-            _ => false,
-        }
-    }
-
-    fn expr_is_pure_until_last_str_bytes(expr: &Expr, target: &str, remaining: &mut usize) -> bool {
-        if *remaining == 0 {
-            return true;
-        }
-        if let Some((method, arg)) = str_view_call_target(expr) {
-            if arg == target {
-                if method == "str_bytes" {
-                    *remaining = remaining.saturating_sub(1);
-                }
-                return true;
-            }
-        }
-        match expr {
-            Expr::Num(_)
-            | Expr::RawNum(_)
-            | Expr::BigInt(_)
-            | Expr::Str(_)
-            | Expr::Bool(_)
-            | Expr::Undefined
-            | Expr::Null
-            | Expr::Ident(_)
-            | Expr::Arrow(..) => true,
-            Expr::Member(obj, _) | Expr::Unary(_, obj) => {
-                expr_is_pure_until_last_str_bytes(obj, target, remaining)
-            }
-            Expr::Index(obj, idx) | Expr::Binary(_, obj, idx) => {
-                expr_is_pure_until_last_str_bytes(obj, target, remaining)
-                    && expr_is_pure_until_last_str_bytes(idx, target, remaining)
-            }
-            Expr::Cond(c, t, e) => {
-                if !expr_is_pure_until_last_str_bytes(c, target, remaining) {
-                    return false;
-                }
-                if *remaining == 0 {
-                    return true;
-                }
-                // Disallow impure calls/writes on either arm while str_bytes reads remain.
-                let mut rem_t = *remaining;
-                let mut rem_e = *remaining;
-                let ok_t = expr_is_pure_until_last_str_bytes(t, target, &mut rem_t);
-                let ok_e = expr_is_pure_until_last_str_bytes(e, target, &mut rem_e);
-                *remaining =
-                    (*remaining).saturating_sub((*remaining - rem_t) + (*remaining - rem_e));
-                ok_t && ok_e && *remaining == 0
-            }
-            Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
-                let lhs_pure = match lhs.as_ref() {
-                    Expr::Ident(_) => true,
-                    Expr::Member(obj, _) => {
-                        expr_is_pure_until_last_str_bytes(obj, target, remaining)
-                    }
-                    Expr::Index(obj, idx) => {
-                        expr_is_pure_until_last_str_bytes(obj, target, remaining)
-                            && expr_is_pure_until_last_str_bytes(idx, target, remaining)
-                    }
-                    _ => false,
-                };
-                if !lhs_pure {
-                    return false;
-                }
-                if !expr_is_pure_until_last_str_bytes(rhs, target, remaining) {
-                    return false;
-                }
-                // A Member/Index store executes after evaluating lhs and rhs; unsafe if any
-                // str_bytes(target) still runs later.
-                !matches!(lhs.as_ref(), Expr::Member(..) | Expr::Index(..)) || *remaining == 0
-            }
-            Expr::Call(callee, args) | Expr::New(callee, args) => {
-                if !expr_is_pure_until_last_str_bytes(callee, target, remaining) {
-                    return false;
-                }
-                for a in args {
-                    if !expr_is_pure_until_last_str_bytes(a, target, remaining) {
-                        return false;
-                    }
-                }
-                *remaining == 0
-            }
-            Expr::Object(entries) => entries
-                .iter()
-                .all(|(_, v)| expr_is_pure_until_last_str_bytes(v, target, remaining)),
-            Expr::Array(items) | Expr::Seq(items) => items
-                .iter()
-                .all(|x| expr_is_pure_until_last_str_bytes(x, target, remaining)),
-            Expr::Raw(_) => false,
-        }
-    }
-
-    fn stmts_is_pure_until_last_str_bytes(
-        stmts: &[Stmt],
-        target: &str,
-        remaining: &mut usize,
-    ) -> bool {
-        for stmt in stmts {
-            if *remaining == 0 {
-                return true;
-            }
-            let ok = match stmt {
-                Stmt::ExprStmt(e)
-                | Stmt::Throw(e)
-                | Stmt::Const(_, e)
-                | Stmt::Let(_, Some(e))
-                | Stmt::Return(Some(e)) => expr_is_pure_until_last_str_bytes(e, target, remaining),
-                Stmt::Let(_, None)
-                | Stmt::Return(None)
-                | Stmt::Break(_)
-                | Stmt::Continue(_)
-                | Stmt::Import { .. }
-                | Stmt::Comment(_)
-                | Stmt::Loc(_) => true,
-                Stmt::Lets(decls) => decls.iter().all(|(_, init)| {
-                    init.as_ref()
-                        .is_none_or(|e| expr_is_pure_until_last_str_bytes(e, target, remaining))
-                }),
-                Stmt::Block(b) => stmts_is_pure_until_last_str_bytes(b, target, remaining),
-                Stmt::Labeled(_, inner) => stmts_is_pure_until_last_str_bytes(
-                    std::slice::from_ref(inner.as_ref()),
-                    target,
-                    remaining,
-                ),
-                Stmt::If(..)
-                | Stmt::Switch(..)
-                | Stmt::LoopForever(..)
-                | Stmt::While(..)
-                | Stmt::TryCatch { .. }
-                | Stmt::FunctionDecl { .. }
-                | Stmt::Raw(_) => false,
-            };
-            if !ok {
-                return false;
-            }
-        }
-        *remaining == 0
-    }
-
-    fn write_dominates_and_safe(
-        stmts: &[Stmt],
-        target: &str,
-        total_reads: usize,
-        str_bytes_reads: usize,
-    ) -> Option<bool> {
-        for (idx, stmt) in stmts.iter().enumerate() {
-            if stmt_writes_target(stmt, target) {
-                let tail = &stmts[idx + 1..];
-                if count_reads_in_stmts(tail, target) != total_reads {
-                    return Some(false);
-                }
-                if str_bytes_reads == 0 {
-                    return Some(true);
-                }
-                let mut remaining = str_bytes_reads;
-                return Some(stmts_is_pure_until_last_str_bytes(
-                    tail,
-                    target,
-                    &mut remaining,
-                ));
-            }
-            let nested = match stmt {
-                Stmt::If(_, a, b) => {
-                    write_dominates_and_safe(a, target, total_reads, str_bytes_reads).or_else(
-                        || {
-                            b.as_deref().and_then(|s| {
-                                write_dominates_and_safe(s, target, total_reads, str_bytes_reads)
-                            })
-                        },
-                    )
-                }
-                Stmt::Switch(_, cases) => cases.iter().find_map(|c| {
-                    write_dominates_and_safe(&c.body, target, total_reads, str_bytes_reads)
-                }),
-                Stmt::Labeled(_, inner) => write_dominates_and_safe(
-                    std::slice::from_ref(inner.as_ref()),
-                    target,
-                    total_reads,
-                    str_bytes_reads,
-                ),
-                Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
-                    write_dominates_and_safe(b, target, total_reads, str_bytes_reads)
-                }
-                Stmt::TryCatch { body, handler, .. } => {
-                    write_dominates_and_safe(body, target, total_reads, str_bytes_reads).or_else(
-                        || write_dominates_and_safe(handler, target, total_reads, str_bytes_reads),
-                    )
-                }
-                _ => None,
-            };
-            if nested.is_some() {
-                return nested;
-            }
-        }
-        None
-    }
-
     fn rewrite_bytes_str_rhs(expr: &mut Expr) {
         let taken = std::mem::replace(expr, Expr::Undefined);
         let (mut pre, tail) = match taken {
@@ -1181,13 +1255,19 @@ pub(super) fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) 
 
     let mut usage = HashMap::new();
     scan_stmts(body, locals, &mut usage);
+    let policy = LocalFusePolicy {
+        peel_rhs: peel_bytes_str,
+        read_call: str_view_call_target,
+        allow_early_exit: true,
+    };
     let eligible: HashSet<String> = usage
         .into_iter()
         .filter(|(name, u)| {
             !u.disqualified
                 && u.writes == 1
                 && u.reads > 0
-                && write_dominates_and_safe(body, name, u.reads, u.str_bytes_reads) == Some(true)
+                && write_dominates_and_safe(body, name, u.reads, u.str_bytes_reads, &policy)
+                    == Some(true)
         })
         .map(|(name, _)| name)
         .collect();
@@ -1348,39 +1428,25 @@ pub(crate) fn fold_bstr_in_bytes_stmts(stmts: &mut [Stmt]) {
 }
 
 /// Fuses single-write `x = __rt.bstr_in(host)` whose sole read in the body is `__rt.str_bytes(x)`
-/// into `x = host; ... __rt.bstr_utf8_bytes(x)` without introducing extra loop work.
+/// into `x = host; ... __rt.bstr_utf8_bytes(x)` only when the write dominates the read with no
+/// intervening side effects, branches, or early exits so `__rt.bstr_in`'s `TypeError` check runs at
+/// the same observable point via `__rt.bstr_utf8_bytes`.
 fn fuse_local_bstr_in_bytes(body: &mut [Stmt], locals: &HashSet<String>) {
     #[derive(Default)]
     struct Usage {
         writes: usize,
         reads: usize,
         disqualified: bool,
-        write_loops: Vec<usize>,
-        read_loops: Vec<usize>,
     }
 
     fn peel_bstr_in(expr: &Expr) -> bool {
-        let tail = match expr {
-            Expr::Seq(items) => match items.last() {
-                Some(last) => last,
-                None => return false,
-            },
-            other => other,
-        };
-        rt_unary_call(tail, "bstr_in").is_some()
+        seq_tail(expr).is_some_and(|tail| rt_unary_call(tail, "bstr_in").is_some())
     }
 
-    fn scan_expr(
-        expr: &Expr,
-        locals: &HashSet<String>,
-        loop_stack: &[usize],
-        usage: &mut HashMap<String, Usage>,
-    ) {
+    fn scan_expr(expr: &Expr, locals: &HashSet<String>, usage: &mut HashMap<String, Usage>) {
         if let Some(Expr::Ident(arg)) = rt_unary_call(expr, "str_bytes") {
             if locals.contains(arg) {
-                let entry = usage.entry(arg.clone()).or_default();
-                entry.reads += 1;
-                entry.read_loops = loop_stack.to_vec();
+                usage.entry(arg.clone()).or_default().reads += 1;
                 return;
             }
         }
@@ -1390,30 +1456,33 @@ fn fuse_local_bstr_in_bytes(body: &mut [Stmt], locals: &HashSet<String>) {
                     usage.entry(name.clone()).or_default().disqualified = true;
                 }
             }
-            Expr::Member(obj, _) | Expr::Unary(_, obj) => scan_expr(obj, locals, loop_stack, usage),
-            Expr::Index(obj, idx) | Expr::Binary(_, obj, idx) | Expr::Assign(obj, idx) | Expr::CompoundAssign(_, obj, idx) => {
-                scan_expr(obj, locals, loop_stack, usage);
-                scan_expr(idx, locals, loop_stack, usage);
+            Expr::Member(obj, _) | Expr::Unary(_, obj) => scan_expr(obj, locals, usage),
+            Expr::Index(obj, idx)
+            | Expr::Binary(_, obj, idx)
+            | Expr::Assign(obj, idx)
+            | Expr::CompoundAssign(_, obj, idx) => {
+                scan_expr(obj, locals, usage);
+                scan_expr(idx, locals, usage);
             }
             Expr::Call(c, args) | Expr::New(c, args) => {
-                scan_expr(c, locals, loop_stack, usage);
+                scan_expr(c, locals, usage);
                 for a in args {
-                    scan_expr(a, locals, loop_stack, usage);
+                    scan_expr(a, locals, usage);
                 }
             }
             Expr::Cond(c, t, e) => {
-                scan_expr(c, locals, loop_stack, usage);
-                scan_expr(t, locals, loop_stack, usage);
-                scan_expr(e, locals, loop_stack, usage);
+                scan_expr(c, locals, usage);
+                scan_expr(t, locals, usage);
+                scan_expr(e, locals, usage);
             }
             Expr::Object(entries) => {
                 for (_, v) in entries {
-                    scan_expr(v, locals, loop_stack, usage);
+                    scan_expr(v, locals, usage);
                 }
             }
             Expr::Array(items) | Expr::Seq(items) => {
                 for item in items {
-                    scan_expr(item, locals, loop_stack, usage);
+                    scan_expr(item, locals, usage);
                 }
             }
             Expr::Arrow(params, body_expr) => {
@@ -1424,12 +1493,8 @@ fn fuse_local_bstr_in_bytes(body: &mut [Stmt], locals: &HashSet<String>) {
                     .collect();
                 let mut inner = HashMap::new();
                 match body_expr {
-                    ArrowBody::Expr(b) => scan_expr(b, &shadow, loop_stack, &mut inner),
-                    ArrowBody::Block(stmts) => {
-                        let mut dummy_id = 0usize;
-                        let mut dummy_stack = loop_stack.to_vec();
-                        scan_stmts(stmts, &shadow, &mut dummy_id, &mut dummy_stack, &mut inner);
-                    }
+                    ArrowBody::Expr(b) => scan_expr(b, &shadow, &mut inner),
+                    ArrowBody::Block(stmts) => scan_stmts(stmts, &shadow, &mut inner),
                 }
                 for (name, u) in inner {
                     if u.writes > 0 || u.reads > 0 || u.disqualified {
@@ -1441,13 +1506,7 @@ fn fuse_local_bstr_in_bytes(body: &mut [Stmt], locals: &HashSet<String>) {
         }
     }
 
-    fn scan_stmts(
-        stmts: &[Stmt],
-        locals: &HashSet<String>,
-        next_loop: &mut usize,
-        loop_stack: &mut Vec<usize>,
-        usage: &mut HashMap<String, Usage>,
-    ) {
+    fn scan_stmts(stmts: &[Stmt], locals: &HashSet<String>, usage: &mut HashMap<String, Usage>) {
         for stmt in stmts {
             match stmt {
                 Stmt::ExprStmt(Expr::Assign(lhs, rhs))
@@ -1459,27 +1518,25 @@ fn fuse_local_bstr_in_bytes(body: &mut [Stmt], locals: &HashSet<String>) {
                     let entry = usage.entry(name.clone()).or_default();
                     if peel_bstr_in(rhs) {
                         entry.writes += 1;
-                        entry.write_loops = loop_stack.clone();
                     } else {
                         entry.disqualified = true;
                     }
-                    scan_expr(rhs, locals, loop_stack, usage);
+                    scan_expr(rhs, locals, usage);
                 }
                 Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Const(_, e) => {
-                    scan_expr(e, locals, loop_stack, usage);
+                    scan_expr(e, locals, usage);
                 }
                 Stmt::Let(name, Some(init)) if locals.contains(name) => {
                     let entry = usage.entry(name.clone()).or_default();
                     if peel_bstr_in(init) {
                         entry.writes += 1;
-                        entry.write_loops = loop_stack.clone();
                     } else {
                         entry.disqualified = true;
                     }
-                    scan_expr(init, locals, loop_stack, usage);
+                    scan_expr(init, locals, usage);
                 }
                 Stmt::Let(_, Some(e)) | Stmt::Return(Some(e)) => {
-                    scan_expr(e, locals, loop_stack, usage);
+                    scan_expr(e, locals, usage);
                 }
                 Stmt::Lets(decls) => {
                     for (name, init) in decls {
@@ -1488,57 +1545,62 @@ fn fuse_local_bstr_in_bytes(body: &mut [Stmt], locals: &HashSet<String>) {
                                 let entry = usage.entry(name.clone()).or_default();
                                 if peel_bstr_in(init) {
                                     entry.writes += 1;
-                                    entry.write_loops = loop_stack.clone();
                                 } else {
                                     entry.disqualified = true;
                                 }
                             }
-                            scan_expr(init, locals, loop_stack, usage);
+                            scan_expr(init, locals, usage);
                         }
                     }
                 }
                 Stmt::If(test, a, b) => {
-                    scan_expr(test, locals, loop_stack, usage);
-                    scan_stmts(a, locals, next_loop, loop_stack, usage);
+                    scan_expr(test, locals, usage);
+                    scan_stmts(a, locals, usage);
                     if let Some(b) = b {
-                        scan_stmts(b, locals, next_loop, loop_stack, usage);
+                        scan_stmts(b, locals, usage);
                     }
                 }
                 Stmt::Switch(d, cases) => {
-                    scan_expr(d, locals, loop_stack, usage);
+                    scan_expr(d, locals, usage);
                     for c in cases {
                         for t in &c.tests {
-                            scan_expr(t, locals, loop_stack, usage);
+                            scan_expr(t, locals, usage);
                         }
-                        scan_stmts(&c.body, locals, next_loop, loop_stack, usage);
+                        scan_stmts(&c.body, locals, usage);
                     }
                 }
                 Stmt::Labeled(_, inner) => {
-                    scan_stmts(
-                        std::slice::from_ref(inner.as_ref()),
-                        locals,
-                        next_loop,
-                        loop_stack,
-                        usage,
-                    );
+                    scan_stmts(std::slice::from_ref(inner.as_ref()), locals, usage);
                 }
-                Stmt::Block(b) => scan_stmts(b, locals, next_loop, loop_stack, usage),
-                Stmt::LoopForever(_, b) => {
-                    *next_loop += 1;
-                    loop_stack.push(*next_loop);
-                    scan_stmts(b, locals, next_loop, loop_stack, usage);
-                    loop_stack.pop();
-                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => scan_stmts(b, locals, usage),
                 Stmt::While(t, b) => {
-                    *next_loop += 1;
-                    loop_stack.push(*next_loop);
-                    scan_expr(t, locals, loop_stack, usage);
-                    scan_stmts(b, locals, next_loop, loop_stack, usage);
-                    loop_stack.pop();
+                    scan_expr(t, locals, usage);
+                    scan_stmts(b, locals, usage);
                 }
-                Stmt::TryCatch { body, handler, .. } => {
-                    scan_stmts(body, locals, next_loop, loop_stack, usage);
-                    scan_stmts(handler, locals, next_loop, loop_stack, usage);
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    if locals.contains(binding) {
+                        usage.entry(binding.clone()).or_default().disqualified = true;
+                    }
+                    scan_stmts(body, locals, usage);
+                    scan_stmts(handler, locals, usage);
+                }
+                Stmt::FunctionDecl { params, body, .. } => {
+                    let shadow: HashSet<String> = locals
+                        .iter()
+                        .filter(|n| !params.contains(*n))
+                        .cloned()
+                        .collect();
+                    let mut inner = HashMap::new();
+                    scan_stmts(body, &shadow, &mut inner);
+                    for (name, u) in inner {
+                        if u.writes > 0 || u.reads > 0 || u.disqualified {
+                            usage.entry(name).or_default().disqualified = true;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1677,16 +1739,19 @@ fn fuse_local_bstr_in_bytes(body: &mut [Stmt], locals: &HashSet<String>) {
     }
 
     let mut usage = HashMap::new();
-    let mut next_loop = 0usize;
-    let mut loop_stack = Vec::new();
-    scan_stmts(body, locals, &mut next_loop, &mut loop_stack, &mut usage);
+    scan_stmts(body, locals, &mut usage);
+    let policy = LocalFusePolicy {
+        peel_rhs: peel_bstr_in,
+        read_call: str_bytes_call_target,
+        allow_early_exit: false,
+    };
     let eligible: HashSet<String> = usage
         .into_iter()
-        .filter(|(_, u)| {
+        .filter(|(name, u)| {
             !u.disqualified
                 && u.writes == 1
                 && u.reads == 1
-                && u.write_loops.starts_with(&u.read_loops)
+                && write_dominates_and_safe(body, name, u.reads, u.reads, &policy) == Some(true)
         })
         .map(|(name, _)| name)
         .collect();
@@ -1848,6 +1913,78 @@ mod tests {
             body.is_empty(),
             "{}",
             jsast::stmt_to_string(&Stmt::Block(body))
+        );
+    }
+
+    #[test]
+    fn fuse_local_bstr_in_bytes_respects_dominance_and_purity() {
+        let rt_call = |method: &str, arg: Expr| jsast::rt_call(method, vec![arg]);
+        let locals: HashSet<String> = ["x".to_owned(), "y".to_owned()].into_iter().collect();
+
+        // Pure straight-line sequence fuses cleanly.
+        let mut pure_body = vec![
+            jsast::assign_stmt(jsast::id("x"), rt_call("bstr_in", jsast::id("host"))),
+            jsast::assign_stmt(jsast::id("y"), jsast::num(1.0)),
+            Stmt::Return(Some(rt_call("str_bytes", jsast::id("x")))),
+        ];
+        fuse_local_bstr_in_bytes(&mut pure_body, &locals);
+        let printed_pure = jsast::stmt_to_string(&Stmt::Block(pure_body));
+        assert!(printed_pure.contains("x = host;"), "{printed_pure}");
+        assert!(
+            printed_pure.contains("__rt.bstr_utf8_bytes(x)"),
+            "{printed_pure}"
+        );
+        assert!(!printed_pure.contains("bstr_in"), "{printed_pure}");
+
+        // Intervening impure call blocks fusion so `bstr_in`'s TypeError runs first.
+        let mut impure_body = vec![
+            jsast::assign_stmt(jsast::id("x"), rt_call("bstr_in", jsast::id("host"))),
+            Stmt::ExprStmt(jsast::call(jsast::id("host_log"), Vec::new())),
+            Stmt::Return(Some(rt_call("str_bytes", jsast::id("x")))),
+        ];
+        fuse_local_bstr_in_bytes(&mut impure_body, &locals);
+        let printed_impure = jsast::stmt_to_string(&Stmt::Block(impure_body));
+        assert!(printed_impure.contains("bstr_in"), "{printed_impure}");
+        assert!(!printed_impure.contains("bstr_utf8_bytes"), "{printed_impure}");
+
+        // Early return / conditional read / short-circuit logical op blocks fusion.
+        let mut early_ret = vec![
+            jsast::assign_stmt(jsast::id("x"), rt_call("bstr_in", jsast::id("host"))),
+            Stmt::If(jsast::id("flag"), vec![Stmt::Return(None)], None),
+            Stmt::Return(Some(rt_call("str_bytes", jsast::id("x")))),
+        ];
+        fuse_local_bstr_in_bytes(&mut early_ret, &locals);
+        assert!(
+            jsast::stmt_to_string(&Stmt::Block(early_ret)).contains("bstr_in"),
+            "early return must block fusion"
+        );
+
+        let mut short_circuit = vec![
+            jsast::assign_stmt(jsast::id("x"), rt_call("bstr_in", jsast::id("host"))),
+            Stmt::Return(Some(Expr::Binary(
+                jsast::BinOp::And,
+                Box::new(jsast::id("flag")),
+                Box::new(rt_call("str_bytes", jsast::id("x"))),
+            ))),
+        ];
+        fuse_local_bstr_in_bytes(&mut short_circuit, &locals);
+        assert!(
+            jsast::stmt_to_string(&Stmt::Block(short_circuit)).contains("bstr_in"),
+            "short-circuit And must block fusion"
+        );
+
+        let mut cond_arm = vec![
+            jsast::assign_stmt(jsast::id("x"), rt_call("bstr_in", jsast::id("host"))),
+            Stmt::Return(Some(Expr::Cond(
+                Box::new(jsast::id("flag")),
+                Box::new(rt_call("str_bytes", jsast::id("x"))),
+                Box::new(jsast::num(0.0)),
+            ))),
+        ];
+        fuse_local_bstr_in_bytes(&mut cond_arm, &locals);
+        assert!(
+            jsast::stmt_to_string(&Stmt::Block(cond_arm)).contains("bstr_in"),
+            "conditional arm must block fusion"
         );
     }
 }

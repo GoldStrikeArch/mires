@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::analysis::refs::{self, RefScan};
 use crate::item::{JsName, LinkItem};
-use crate::jir::repr::{Carrier, Func, OpKind, Proj, RTerm, Root, ValueId};
+use crate::jir::repr::{Carrier, Func, Op, OpKind, Proj, RTerm, Root, ValueId};
 use crate::jir::semantic::{
     CallSemantic, Callee, ConstTree, HostPayload, ItemId, StandardOperation, TypeId,
 };
@@ -275,6 +275,14 @@ where
         }
 
         // Ops and calls.
+        let mut defs: Vec<Option<&Op>> = vec![None; func.values.len()];
+        for block in &func.blocks {
+            for op in &block.ops {
+                if let Some(res) = op.result {
+                    defs[res.0 as usize] = Some(op);
+                }
+            }
+        }
         let mut returns = Vec::new();
         for block in &func.blocks {
             for op in &block.ops {
@@ -383,6 +391,8 @@ where
                         *semantic,
                         callee,
                         args,
+                        &defs,
+                        &disqualified,
                         &val_types,
                         interns,
                         repr,
@@ -589,6 +599,8 @@ fn classify_call_result(
     semantic: CallSemantic,
     callee: &Callee,
     args: &[ValueId],
+    defs: &[Option<&Op>],
+    disqualified: &BTreeSet<ValueId>,
     val_types: &[AsciiType],
     interns: &Interns,
     repr: &ReprOutcome,
@@ -629,7 +641,19 @@ fn classify_call_result(
                 }
                 return Rule::Never;
             }
-            // Explicit safeguard: `String::as_str`, `char::to_string`, `format!` remain unproven.
+            // Only an immutable whole-value borrow of an SSA `HostString` preserves ASCII across
+            // `String::as_str`; `Baseline` / field-projected / mutated `String` stays unproven.
+            StandardOperation::StringAsStr if r_ty == AsciiType::SharedStr => {
+                if let Some(&recv) = args.first() {
+                    if let Some(host_str) =
+                        peel_shared_host_string_borrow(defs, val_types, disqualified, recv)
+                    {
+                        return Rule::Single(host_str);
+                    }
+                }
+                return Rule::Never;
+            }
+            // Explicit safeguard: arbitrary `String::as_str`, `char::to_string`, `format!` remain unproven.
             StandardOperation::StringAsStr
             | StandardOperation::CharToString
             | StandardOperation::FormatArgsToString => return Rule::Never,
@@ -647,6 +671,39 @@ fn classify_call_result(
         return Rule::Never;
     };
     Rule::CallReturn(callee_idx)
+}
+
+fn peel_shared_host_string_borrow(
+    defs: &[Option<&Op>],
+    val_types: &[AsciiType],
+    disqualified: &BTreeSet<ValueId>,
+    mut reference: ValueId,
+) -> Option<ValueId> {
+    for _ in 0..defs.len() {
+        let def = (*defs.get(reference.0 as usize)?)?;
+        match &def.kind {
+            OpKind::Move(value) | OpKind::Copy(value) => reference = *value,
+            OpKind::BorrowView {
+                root: Root::Value(value),
+                path,
+                mutable: false,
+            } if path.as_slice() == [Proj::Deref] && !disqualified.contains(value) => {
+                reference = *value;
+            }
+            OpKind::BorrowView {
+                root: Root::Value(value),
+                path,
+                mutable: false,
+            } if path.is_empty()
+                && !disqualified.contains(value)
+                && val_types.get(value.0 as usize).copied() == Some(AsciiType::HostString) =>
+            {
+                return Some(*value);
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn resolve_callee(
@@ -1044,6 +1101,107 @@ mod tests {
             STR_REF,
             o,
         );
+        // Test `String::as_str`: Baseline (`other_str`) and mutated `HostString` stay MaybeNonAscii;
+        // immutable whole-value borrow of `IntToString` (`HostString`) preserves KnownAscii.
+        let mut other_str_b = FuncBuilder::new(item_id(11), sig(vec![], STR_REF, false));
+        let base_str = other_str_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(90),
+                    link_name: helper_link,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Standard(StandardOperation::IntToString),
+                host: None,
+            },
+            STRING_TY,
+            o,
+        );
+        let base_borrow = other_str_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::BorrowView {
+                root: Root::Value(base_str),
+                path: Vec::new(),
+                mutable: false,
+            },
+            STRING_TY,
+            o,
+        );
+        let base_as_str = other_str_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(91),
+                    link_name: helper_link,
+                },
+                function: None,
+                args: vec![base_borrow],
+                track_caller: None,
+                semantic: CallSemantic::Standard(StandardOperation::StringAsStr),
+                host: None,
+            },
+            STR_REF,
+            o,
+        );
+        let host_mutated = other_str_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(90),
+                    link_name: helper_link,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Standard(StandardOperation::IntToString),
+                host: None,
+            },
+            STRING_TY,
+            o,
+        );
+        other_str_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::BorrowView {
+                root: Root::Value(host_mutated),
+                path: Vec::new(),
+                mutable: true,
+            },
+            STRING_TY,
+            o,
+        );
+        let host_mut_borrow = other_str_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::BorrowView {
+                root: Root::Value(host_mutated),
+                path: Vec::new(),
+                mutable: false,
+            },
+            STRING_TY,
+            o,
+        );
+        let host_mut_as_str = other_str_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(91),
+                    link_name: helper_link,
+                },
+                function: None,
+                args: vec![host_mut_borrow],
+                track_caller: None,
+                semantic: CallSemantic::Standard(StandardOperation::StringAsStr),
+                host: None,
+            },
+            STR_REF,
+            o,
+        );
+        other_str_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(base_as_str)));
+        let mut string_cases_func = other_str_b.finish();
+        string_cases_func.values[host_mutated.0 as usize].carrier = Carrier::HostString;
+
         let int_str = caller_b.op(
             FuncBuilder::ENTRY,
             OpKind::Call {
@@ -1060,6 +1218,16 @@ mod tests {
             STRING_TY,
             o,
         );
+        let int_str_ref = caller_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::BorrowView {
+                root: Root::Value(int_str),
+                path: Vec::new(),
+                mutable: false,
+            },
+            STRING_TY,
+            o,
+        );
         let as_str = caller_b.op(
             FuncBuilder::ENTRY,
             OpKind::Call {
@@ -1068,7 +1236,7 @@ mod tests {
                     link_name: helper_link,
                 },
                 function: None,
-                args: vec![int_str],
+                args: vec![int_str_ref],
                 track_caller: None,
                 semantic: CallSemantic::Standard(StandardOperation::StringAsStr),
                 host: None,
@@ -1205,6 +1373,7 @@ mod tests {
         funcs.insert(JsName::new("cycle".to_owned()), cycle_func);
         funcs.insert(JsName::new("exported".to_owned()), exp_func);
         funcs.insert(JsName::new("caller".to_owned()), caller_func);
+        funcs.insert(JsName::new("string_cases".to_owned()), string_cases_func);
         funcs.insert(
             JsName::new("core$str$slice_error_fail$h123".to_owned()),
             fail_func,
@@ -1232,6 +1401,10 @@ mod tests {
             link_item("caller", Linkage::internal(), ""),
         );
         table.insert(
+            JsName::new("string_cases".to_owned()),
+            link_item("string_cases", Linkage::internal(), ""),
+        );
+        table.insert(
             JsName::new("core$str$slice_error_fail$h123".to_owned()),
             link_item(
                 "core$str$slice_error_fail$h123",
@@ -1239,14 +1412,20 @@ mod tests {
                 "str::slice_error_fail",
             ),
         );
-        let roots = BTreeSet::from([JsName::new("caller".to_owned())]);
+        let roots = BTreeSet::from([
+            JsName::new("caller".to_owned()),
+            JsName::new("string_cases".to_owned()),
+        ]);
         let facts = run(&funcs, &table, &interns, &roots);
 
         let caller_facts = facts.for_item(&JsName::new("caller".to_owned()));
         assert!(caller_facts.is_known_ascii(lit_ascii));
         assert!(!caller_facts.is_known_ascii(lit_wide));
         assert!(caller_facts.is_known_ascii(int_str));
-        assert!(!caller_facts.is_known_ascii(as_str)); // String::as_str must be MaybeNonAscii
+        assert!(caller_facts.is_known_ascii(as_str)); // immutable HostString borrow preserves KnownAscii
+        let sc_facts = facts.for_item(&JsName::new("string_cases".to_owned()));
+        assert!(!sc_facts.is_known_ascii(base_as_str)); // Baseline String::as_str stays MaybeNonAscii
+        assert!(!sc_facts.is_known_ascii(host_mut_as_str)); // mut-borrowed HostString stays MaybeNonAscii
         assert!(!caller_facts.is_known_ascii(opt_strip)); // Option<&str> is not scalar &str
         assert!(caller_facts.is_known_ascii(unwrapped));
         assert!(caller_facts.is_known_ascii(call_callee));
