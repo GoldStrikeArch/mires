@@ -1102,8 +1102,8 @@ string to a **byte string**: a JS string whose UTF-16 code units store Rust's UT
 - **Direct `str`, `StringBuilder`, and byte-view lowerings:** `str::len` is `.length`, code-unit
   reads give raw UTF-8 bytes (`charCodeAt`), and `is_char_boundary`, `&s[a..b]`, `str::get`,
   `strip_prefix`/`strip_suffix`, `trim*`, and `PartialOrd` lower directly over byte strings
-  (`__rt.bstr_sub*`, `__rt.bstr_get*`, `__rt.bstr_trim*`, `__rt.bstr_strip*`, `__rt.bstr_cmp`)
-  without UTF-8 array encoding. Closed read-only `as_bytes`/`as_ptr`/subslice/`offset`/`offset_from`
+  (`__rt.bstr_boundary`, `__rt.bstr_sub*`, `__rt.bstr_get*`, `__rt.bstr_trim*`, plus inline
+  `startsWith`/`endsWith`/`substring` and `<`/`===`) without UTF-8 array encoding. Closed read-only `as_bytes`/`as_ptr`/subslice/`offset`/`offset_from`
   clusters over immutable `&str`/`&String` (including MIR-inlined `String.vec`) stay directly on the
   byte string (`s.length`, `s.charCodeAt`); escaping views materialize `{ buf, off, len }` via
   `__rt.bstr_bytes`/`__rt.bstr_of` (memoized via `_bstr_memo` / `_bstr_src`, with single-pass
