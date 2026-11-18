@@ -100,6 +100,8 @@ pub struct JsCx<'a> {
     /// Whether this lowering hoists BigInt constants (`crate::lower::LowerInput::bigints`), and
     /// so widens an integer literal at compile time ([`JsCx::to_bigint`]).
     hoists_bigints: bool,
+    /// Whole-program ASCII provenance facts for this function (`js-str=bytes`).
+    ascii: Option<crate::analysis::ascii::FuncAsciiFacts<'a>>,
     /// What one `view!` template instantiated in this body knows, by the value the
     /// `rcgjs.tc.template` call defined (`template.rs`).
     pub(super) instantiations: RefCell<BTreeMap<ValueId, template::Instantiation>>,
@@ -178,6 +180,7 @@ impl<'a> JsCx<'a> {
             target_abi: None,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             hoists_bigints: false,
+            ascii: None,
             instantiations: RefCell::new(BTreeMap::new()),
             exprs: RefCell::new(BTreeMap::new()),
             pair_exprs: RefCell::new(BTreeMap::new()),
@@ -282,6 +285,25 @@ impl<'a> JsCx<'a> {
     /// Whether this lowering hoists BigInt constants.
     pub fn hoists_bigints(&self) -> bool {
         self.hoists_bigints
+    }
+
+    /// The same context, carrying whole-program ASCII facts (`js-str=bytes`).
+    pub fn with_ascii(
+        mut self,
+        ascii: Option<crate::analysis::ascii::FuncAsciiFacts<'a>>,
+    ) -> Self {
+        self.ascii = ascii;
+        self
+    }
+
+    /// Whole-program ASCII facts for this item, when available.
+    pub fn ascii(&self) -> Option<crate::analysis::ascii::FuncAsciiFacts<'a>> {
+        self.ascii
+    }
+
+    /// Whether `value` is statically proven to hold only ASCII bytes (`b < 0x80`).
+    pub fn is_known_ascii(&self, value: ValueId) -> bool {
+        self.ascii.is_some_and(|ascii| ascii.is_known_ascii(value))
     }
 
     /// `BigInt(value)`, the widening of a number to a BigInt (`jsast::to_bigint`). When this

@@ -140,8 +140,13 @@ struct ConstUsage {
 
 struct HoistCollector {
     allow_bigint: bool,
+    bstr_strings: bool,
     counts: BTreeMap<String, (Expr, ConstUsage)>,
     unreachable_throws: usize,
+}
+
+fn is_hoistable_bstr(s: &str) -> bool {
+    !s.is_ascii() && s.chars().count() >= crate::lower::js::constant::HOIST_STRING_BYTES
 }
 
 impl HoistCollector {
@@ -255,6 +260,14 @@ impl HoistCollector {
                     let key = format!("fn:{expr}");
                     self.record(key, expr, in_loop);
                     return;
+                }
+            }
+            if self.bstr_strings {
+                if let Expr::Str(s) = expr {
+                    if is_hoistable_bstr(s) {
+                        self.record(format!("str:{s}"), expr, in_loop);
+                        return;
+                    }
                 }
             }
         }
@@ -711,6 +724,7 @@ fn replace_ident_in_expr(expr: &mut Expr, from: &str, to: &str) {
 
 struct HoistRewriter<'a> {
     allow_bigint: bool,
+    bstr_strings: bool,
     const_map: &'a BTreeMap<String, JsName>,
     unreachable_fn: Option<&'a JsName>,
     changed: bool,
@@ -819,6 +833,17 @@ impl HoistRewriter<'_> {
                         *expr = Expr::Ident(hoisted.as_str().to_owned());
                         self.changed = true;
                         return;
+                    }
+                }
+            }
+            if self.bstr_strings {
+                if let Expr::Str(s) = expr {
+                    if is_hoistable_bstr(s) {
+                        if let Some(hoisted) = self.const_map.get(&format!("str:{s}")) {
+                            *expr = Expr::Ident(hoisted.as_str().to_owned());
+                            self.changed = true;
+                            return;
+                        }
                     }
                 }
             }
@@ -1024,8 +1049,10 @@ fn run_with_opts(
     // Pass 2: Expression constants (`Location` objects, inline `[...][i]`, capture-free
     // `() => <const>`) and shared unreachable-abort outlining. ES2018 BigInt constants are hoisted
     // afterwards by `lower::bigint::hoist` with load-safe `$BI_ok` / `$BI_no()` guards.
+    let bstr_strings = crate::lower::bstr::enabled();
     let mut collector = HoistCollector {
         allow_bigint,
+        bstr_strings,
         counts: BTreeMap::new(),
         unreachable_throws: 0,
     };
@@ -1037,7 +1064,7 @@ fn run_with_opts(
 
     let mut const_map: BTreeMap<String, JsName> = BTreeMap::new();
     for (key, (expr, usage)) in &collector.counts {
-        let qualify = if key.starts_with("loc:") {
+        let qualify = if key.starts_with("loc:") || key.starts_with("str:") {
             usage.in_loop || usage.count >= 2
         } else if key.starts_with("arr:") {
             let len = match expr {
@@ -1110,6 +1137,7 @@ fn run_with_opts(
             let Ok(lowered_item) = res else { continue };
             let mut rewriter = HoistRewriter {
                 allow_bigint,
+                bstr_strings,
                 const_map: &const_map,
                 unreachable_fn: unreachable_fn.as_ref(),
                 changed: false,
@@ -1126,6 +1154,51 @@ fn run_with_opts(
     }
 
     added_any
+}
+
+/// Extracts the byte-string sibling `const bs$h... = "<byte_string>";` for a non-ASCII
+/// backend-hoisted `const s$h... = "<utf16>";` constant under `js-str=bytes`.
+pub(super) fn synthesize_bstr_const_item(s_name: &str, js: &str) -> Option<LinkItem> {
+    let (_, rhs) = js.split_once('=')?;
+    let rhs = rhs.trim();
+    let quote = rhs.as_bytes().first().copied()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let mut i = 1usize;
+    let bytes = rhs.as_bytes();
+    let mut text = String::new();
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == quote {
+            let tail = rhs[i + 1..].trim_start();
+            if !(tail.is_empty() || tail.starts_with(';')) {
+                return None;
+            }
+            if text.is_ascii() || text.len() < crate::lower::js::constant::HOIST_STRING_BYTES {
+                return None;
+            }
+            if crate::lower::js::constant::hoisted_name("s", &text) != s_name {
+                return None;
+            }
+            let bs_name = JsName::new(crate::lower::js::constant::hoisted_name("bs", &text));
+            let encoded = crate::lower::bstr::byte_string(&text);
+            return Some(build_synthesized_link_item(
+                bs_name.clone(),
+                ItemKind::Const,
+                jsast::const_(bs_name.as_str(), jsast::string(encoded)),
+                "hoisted byte-string constant",
+            ));
+        } else if b == b'\\' {
+            i += 1;
+            decode_js_escape(rhs, &mut i, &mut text);
+        } else {
+            let ch = rhs[i..].chars().next()?;
+            text.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    None
 }
 
 struct ProgramExclusions {

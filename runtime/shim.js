@@ -1595,27 +1595,72 @@ globalThis.__rt._bstr_units = (buf, off, len) => {
 
 // bstr_in(s): host text as the byte string of its UTF-8 bytes -- exactly the
 // bytes `TextEncoder` writes, so a lone surrogate is U+FFFD (EF BF BD). ASCII
-// text is its own byte string and comes back as is; the engine's regular
-// expression scan answers that faster than a loop over the code units.
+// text is its own byte string and comes back as is.
 globalThis.__rt.bstr_in = (s) => {
-  if (!globalThis.__rt._bstr_wide.test(s)) return s;
+  if (globalThis.__rt._bstr_is_ascii(s)) return s;
   const bytes = globalThis.__rt._encoder.encode(s);
   return globalThis.__rt._bstr_units(bytes, 0, bytes.length);
 };
 
-// _bstr_wide: matches any code unit outside ASCII.
-globalThis.__rt._bstr_wide = /[^\x00-\x7f]/;
+// _bstr_is_ascii(s): fast ASCII predicate. Short strings (< 24 code units) run
+// a charCodeAt loop to avoid JIT->RegExp C++ transitions; longer strings use the
+// engine's SIMD regexp scan.
+globalThis.__rt._bstr_is_ascii = (s) => {
+  const n = s.length;
+  if (n < 24) {
+    for (let i = 0; i < n; i++) if (s.charCodeAt(i) > 127) return false;
+    return true;
+  }
+  return !_bstr_wide.test(s);
+};
+const _bstr_wide = /[^\x00-\x7f]/;
 
 // bstr_out(s): a byte string as the host text it encodes. A byte string is
-// always well-formed UTF-8 (Rust's invariant), so this is a plain decode; ASCII
-// text is its own host text and comes back as is.
+// always well-formed UTF-8 (Rust's invariant), so ASCII text comes back as is;
+// non-ASCII strings <= 48 bytes decode in pure JS (zero Uint8Array /
+// TextDecoder C++ call), 49..=1024 reuse a shared scratch Uint8Array, and larger
+// strings allocate a fresh Uint8Array.
 globalThis.__rt.bstr_out = (s) => {
-  if (!globalThis.__rt._bstr_wide.test(s)) return s;
+  if (globalThis.__rt._bstr_is_ascii(s)) return s;
   const n = s.length;
-  const bytes = new Uint8Array(n);
+  if (n <= 48) {
+    let out = "";
+    let i = 0;
+    while (i < n) {
+      const start = i;
+      while (i < n && s.charCodeAt(i) < 0x80) i++;
+      if (i > start) out += s.slice(start, i);
+      if (i >= n) break;
+      const b0 = s.charCodeAt(i);
+      if (b0 < 0xe0) {
+        out += String.fromCharCode(((b0 & 0x1f) << 6) | (s.charCodeAt(i + 1) & 0x3f));
+        i += 2;
+      } else if (b0 < 0xf0) {
+        out += String.fromCharCode(
+          ((b0 & 0x0f) << 12) | ((s.charCodeAt(i + 1) & 0x3f) << 6) | (s.charCodeAt(i + 2) & 0x3f),
+        );
+        i += 3;
+      } else {
+        const cp =
+          (((b0 & 0x07) << 18) |
+            ((s.charCodeAt(i + 1) & 0x3f) << 12) |
+            ((s.charCodeAt(i + 2) & 0x3f) << 6) |
+            (s.charCodeAt(i + 3) & 0x3f)) -
+          0x10000;
+        out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+        i += 4;
+      }
+    }
+    return out;
+  }
+  const bytes =
+    n <= 1024
+      ? (_bstr_out_buf || (_bstr_out_buf = new Uint8Array(1024))).subarray(0, n)
+      : new Uint8Array(n);
   for (let j = 0; j < n; j++) bytes[j] = s.charCodeAt(j);
   return globalThis.__rt._decoder.decode(bytes);
 };
+let _bstr_out_buf;
 
 // bstr_char(point): the byte string of one Rust `char`, its UTF-8 bytes.
 globalThis.__rt.bstr_char = (c) => {
@@ -1638,7 +1683,7 @@ globalThis.__rt.bstr_char = (c) => {
 // string and `bstr_of` over any range of it is a `slice`; the four-entry
 // `_bsub_*` cache maps such a slice back to its view, so asking for the bytes of
 // a slice just made copies nothing.
-globalThis.__rt._bstr_memo = { map: new Map(), bytes: 0, huge: [], armed: false, budget: 4194304 };
+globalThis.__rt._bstr_memo = { map: new Map(), utf8: new Map(), bytes: 0, huge: [], armed: false, budget: 4194304 };
 let _bstr_src;
 let _bsub_k0 = "";
 let _bsub_v0;
@@ -1661,10 +1706,35 @@ function _arm_bstr_memo() {
     if (typeof queueMicrotask === "function") queueMicrotask(globalThis.__rt._bstr_memo_clear);
   }
 }
+function _bstr_memo_put(map, key, record, n) {
+  const memo = globalThis.__rt._bstr_memo;
+  if (_bsub_arm === undefined) _bsub_arm = _arm_bstr_memo;
+  _arm_bstr_memo();
+  if (n > memo.budget / 4) {
+    if (memo.huge.length === 2) {
+      const evicted = memo.huge.shift();
+      evicted.map.delete(evicted.key);
+      _bsub_reset();
+    }
+    memo.huge.push({ map, key });
+  } else {
+    if (memo.bytes + n > memo.budget) {
+      const kept = memo.huge.map((e) => ({ map: e.map, key: e.key, val: e.map.get(e.key) }));
+      memo.map.clear();
+      memo.utf8.clear();
+      for (let i = 0; i < kept.length; i++) kept[i].map.set(kept[i].key, kept[i].val);
+      memo.bytes = 0;
+      _bsub_reset();
+    }
+    memo.bytes += n;
+  }
+  map.set(key, record);
+}
 
 globalThis.__rt._bstr_memo_clear = () => {
   const memo = globalThis.__rt._bstr_memo;
   memo.map.clear();
+  memo.utf8.clear();
   memo.bytes = 0;
   memo.huge.length = 0;
   memo.armed = false;
@@ -1695,25 +1765,53 @@ globalThis.__rt.bstr_bytes = (s) => {
   for (let i = 0; i < n; i++) bytes[i] = s.charCodeAt(i);
   record = { buf: bytes, off: 0, len: n };
   (_bstr_src || (_bstr_src = new WeakMap())).set(bytes, s);
-  if (_bsub_arm === undefined) _bsub_arm = _arm_bstr_memo;
-  _arm_bstr_memo();
-  if (n > memo.budget / 4) {
-    if (memo.huge.length === 2) {
-      memo.map.delete(memo.huge.shift());
-      _bsub_reset();
-    }
-    memo.huge.push(s);
-  } else {
-    if (memo.bytes + n > memo.budget) {
-      const huge = memo.huge.map((key) => memo.map.get(key));
-      memo.map.clear();
-      memo.huge.forEach((key, i) => memo.map.set(key, huge[i]));
-      memo.bytes = 0;
-      _bsub_reset();
-    }
-    memo.bytes += n;
+  _bstr_memo_put(memo.map, s, record, n);
+  return record;
+};
+
+// bstr_utf8_bytes(s): `{ buf, off, len }` of host UTF-16 string `s` encoded as
+// UTF-8 in a single pass, fusing `bstr_bytes(bstr_in(s))`. ASCII fills a plain
+// array in one charCodeAt scan; on the first non-ASCII code unit it switches to
+// `TextEncoder`. Only pure-ASCII arrays are registered in `_bstr_src`, and keys
+// live in `memo.utf8` so host strings never collide with Rust byte strings.
+globalThis.__rt.bstr_utf8_bytes = (s) => {
+  if (typeof s !== "string") {
+    throw new TypeError("expected a string for str, got " + typeof s);
   }
-  memo.map.set(s, record);
+  const n = s.length;
+  if (n <= 64) {
+    const bytes = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const code = s.charCodeAt(i);
+      if (code > 127) {
+        const enc = globalThis.__rt._encoder.encode(s);
+        const arr = new Array(enc.length);
+        for (let j = 0; j < enc.length; j++) arr[j] = enc[j];
+        return { buf: arr, off: 0, len: arr.length };
+      }
+      bytes[i] = code;
+    }
+    return { buf: bytes, off: 0, len: n };
+  }
+  const memo = globalThis.__rt._bstr_memo;
+  let record = memo.utf8.get(s);
+  if (record !== undefined) return record;
+  let bytes = new Array(n);
+  let ascii = true;
+  for (let i = 0; i < n; i++) {
+    const code = s.charCodeAt(i);
+    if (code > 127) {
+      ascii = false;
+      const enc = globalThis.__rt._encoder.encode(s);
+      bytes = new Array(enc.length);
+      for (let j = 0; j < enc.length; j++) bytes[j] = enc[j];
+      break;
+    }
+    bytes[i] = code;
+  }
+  record = { buf: bytes, off: 0, len: bytes.length };
+  if (ascii) (_bstr_src || (_bstr_src = new WeakMap())).set(bytes, s);
+  _bstr_memo_put(memo.utf8, s, record, bytes.length);
   return record;
 };
 
@@ -1764,6 +1862,136 @@ globalThis.__rt.bstr_of = (buf, off, len) => {
 globalThis.__rt.bstr_boundary = (text, index) =>
   Number.isInteger(index) && index >= 0 && index <= text.length &&
   (index === text.length || (text.charCodeAt(index) & 0xc0) !== 0x80);
+
+// bstr_get*, shared `str::get` / `&s[a..b]` slice-and-boundary helpers: return
+// the substring when valid, or `undefined` otherwise.
+globalThis.__rt.bstr_get = (s, start, end) => {
+  const len = s.length;
+  if (
+    start >= 0 &&
+    start <= end &&
+    end <= len &&
+    (start === len || (s.charCodeAt(start) & 0xc0) !== 0x80) &&
+    (end === len || (s.charCodeAt(end) & 0xc0) !== 0x80)
+  ) {
+    return s.slice(start, end);
+  }
+  return undefined;
+};
+
+globalThis.__rt.bstr_get_from = (s, start) => {
+  const len = s.length;
+  if (start >= 0 && start <= len && (start === len || (s.charCodeAt(start) & 0xc0) !== 0x80)) {
+    return s.slice(start);
+  }
+  return undefined;
+};
+
+globalThis.__rt.bstr_get_to = (s, end) => {
+  const len = s.length;
+  if (end >= 0 && end <= len && (end === len || (s.charCodeAt(end) & 0xc0) !== 0x80)) {
+    return s.slice(0, end);
+  }
+  return undefined;
+};
+
+// bstr_sub*, outlined `&s[a..b]` / `&s[a..]` / `&s[..b]` helpers: preserve
+// exact char-boundary checks and delegate invalid slices either to linked
+// `core::str::slice_error_fail` (4 args with caller location) or to a fallback
+// thunk when `loc === undefined`.
+globalThis.__rt.bstr_sub = (s, start, end, fail, loc) => {
+  const r = globalThis.__rt.bstr_get(s, start, end);
+  return r !== undefined ? r : loc === undefined ? fail() : fail(s, start, end, loc);
+};
+
+globalThis.__rt.bstr_sub_from = (s, start, fail, loc) => {
+  const r = globalThis.__rt.bstr_get_from(s, start);
+  return r !== undefined ? r : loc === undefined ? fail() : fail(s, start, s.length, loc);
+};
+
+globalThis.__rt.bstr_sub_to = (s, end, fail, loc) => {
+  const r = globalThis.__rt.bstr_get_to(s, end);
+  return r !== undefined ? r : loc === undefined ? fail() : fail(s, 0, end, loc);
+};
+
+// bstr_trim_start(s), bstr_trim_end(s), bstr_trim(s): exact Rust `str::trim*`
+// matching Unicode `White_Space` over a byte string.
+globalThis.__rt.bstr_trim_start = (s) => s.slice(_bstr_ws_start(s));
+function _bstr_ws_start(s) {
+  const n = s.length;
+  let i = 0;
+  while (i < n) {
+    const b0 = s.charCodeAt(i);
+    if (b0 === 0x20 || (b0 >= 0x09 && b0 <= 0x0d)) {
+      i += 1;
+    } else if (b0 === 0xc2) {
+      const b1 = s.charCodeAt(i + 1);
+      if (b1 === 0x85 || b1 === 0xa0) i += 2;
+      else break;
+    } else if (b0 === 0xe1) {
+      if (s.charCodeAt(i + 1) === 0x9a && s.charCodeAt(i + 2) === 0x80) i += 3;
+      else break;
+    } else if (b0 === 0xe2) {
+      const b1 = s.charCodeAt(i + 1);
+      const b2 = s.charCodeAt(i + 2);
+      if (
+        (b1 === 0x80 && ((b2 >= 0x80 && b2 <= 0x8a) || b2 === 0xa8 || b2 === 0xa9 || b2 === 0xaf)) ||
+        (b1 === 0x81 && b2 === 0x9f)
+      ) {
+        i += 3;
+      } else {
+        break;
+      }
+    } else if (b0 === 0xe3) {
+      if (s.charCodeAt(i + 1) === 0x80 && s.charCodeAt(i + 2) === 0x80) i += 3;
+      else break;
+    } else {
+      break;
+    }
+  }
+  return i;
+}
+
+globalThis.__rt.bstr_trim_end = (s) => s.slice(0, _bstr_ws_end(s, 0));
+function _bstr_ws_end(s, min) {
+  let j = s.length;
+  while (j > min) {
+    const b = s.charCodeAt(j - 1);
+    if (b === 0x20 || (b >= 0x09 && b <= 0x0d)) {
+      j -= 1;
+    } else if ((b & 0xc0) === 0x80) {
+      if (j - 2 >= min && s.charCodeAt(j - 2) === 0xc2 && (b === 0x85 || b === 0xa0)) {
+        j -= 2;
+      } else if (j - 3 >= min) {
+        const b0 = s.charCodeAt(j - 3);
+        const b1 = s.charCodeAt(j - 2);
+        if (b0 === 0xe1 && b1 === 0x9a && b === 0x80) {
+          j -= 3;
+        } else if (
+          b0 === 0xe2 &&
+          ((b1 === 0x80 && ((b >= 0x80 && b <= 0x8a) || b === 0xa8 || b === 0xa9 || b === 0xaf)) ||
+            (b1 === 0x81 && b === 0x9f))
+        ) {
+          j -= 3;
+        } else if (b0 === 0xe3 && b1 === 0x80 && b === 0x80) {
+          j -= 3;
+        } else {
+          break;
+        }
+      } else {
+        break;
+      }
+    } else {
+      break;
+    }
+  }
+  return j;
+}
+
+globalThis.__rt.bstr_trim = (s) => {
+  const start = _bstr_ws_start(s);
+  return s.slice(start, _bstr_ws_end(s, start));
+};
 
 // bstr_push(value, point): `native_str_push` over a byte-string builder
 // `{ text, cap, len }`, whose `len` is always `text.length`.

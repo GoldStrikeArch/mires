@@ -47,10 +47,13 @@ impl<'a> JsCx<'a> {
     /// text is ASCII, so a non-ASCII literal is spelled inline.
     pub fn string_literal(&self, text: &str) -> Expr {
         let bytes = crate::lower::bstr::enabled();
-        if text.len() >= HOIST_STRING_BYTES && (!bytes || text.is_ascii()) {
+        if text.len() >= HOIST_STRING_BYTES {
             let name = hoisted_name("s", text);
             if self.summary.deps.iter().any(|dep| dep == &name) {
-                return jsast::id(name);
+                if !bytes || text.is_ascii() {
+                    return jsast::id(name);
+                }
+                return jsast::id(hoisted_name("bs", text));
             }
         }
         if bytes {

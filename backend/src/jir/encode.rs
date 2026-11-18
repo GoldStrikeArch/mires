@@ -2171,6 +2171,21 @@ fn str_operation<'tcx>(
     let symbol = associated.name();
     let name = symbol.as_str();
     let lang = tcx.lang_items();
+    let is_str_range_index = |index: Ty<'tcx>| {
+        let ty::Adt(range, range_args) = index.kind() else {
+            return false;
+        };
+        let usize_or_none = range_args
+            .types()
+            .all(|ty| matches!(ty.kind(), ty::Uint(ty::UintTy::Usize)));
+        let shapes = [
+            lang.range_struct(),
+            lang.range_from_struct(),
+            lang.range_to_struct(),
+            lang.range_full_struct(),
+        ];
+        usize_or_none && shapes.contains(&Some(range.did()))
+    };
     match (trait_id, name, rest) {
         (None, "len", []) => Some(StandardOperation::StrLen),
         (None, "is_char_boundary", [index])
@@ -2178,32 +2193,33 @@ fn str_operation<'tcx>(
         {
             Some(StandardOperation::StrIsCharBoundary)
         }
-        (None, "starts_with" | "ends_with" | "find" | "rfind" | "contains", [pattern])
-            if str_ref(*pattern) || matches!(pattern.kind(), ty::Char) =>
+        (None, "trim", []) => Some(StandardOperation::StrTrim),
+        (None, "trim_start", []) => Some(StandardOperation::StrTrimStart),
+        (None, "trim_end", []) => Some(StandardOperation::StrTrimEnd),
+        (
+            None,
+            "starts_with"
+            | "ends_with"
+            | "find"
+            | "rfind"
+            | "contains"
+            | "strip_prefix"
+            | "strip_suffix",
+            [pattern],
+        ) if str_ref(*pattern) || matches!(pattern.kind(), ty::Char) => Some(match name {
+            "starts_with" => StandardOperation::StrStartsWith,
+            "ends_with" => StandardOperation::StrEndsWith,
+            "find" => StandardOperation::StrFind,
+            "rfind" => StandardOperation::StrRFind,
+            "contains" => StandardOperation::StrContains,
+            "strip_prefix" => StandardOperation::StrStripPrefix,
+            _ => StandardOperation::StrStripSuffix,
+        }),
+        (None, "get", [index]) if is_str_range_index(*index) => Some(StandardOperation::StrGet),
+        (Some(trait_id), "index", [index])
+            if lang.index_trait() == Some(trait_id) && is_str_range_index(*index) =>
         {
-            Some(match name {
-                "starts_with" => StandardOperation::StrStartsWith,
-                "ends_with" => StandardOperation::StrEndsWith,
-                "find" => StandardOperation::StrFind,
-                "rfind" => StandardOperation::StrRFind,
-                _ => StandardOperation::StrContains,
-            })
-        }
-        (Some(trait_id), "index", [index]) if lang.index_trait() == Some(trait_id) => {
-            let ty::Adt(range, range_args) = index.kind() else {
-                return None;
-            };
-            let usize_or_none = range_args
-                .types()
-                .all(|ty| matches!(ty.kind(), ty::Uint(ty::UintTy::Usize)));
-            let shapes = [
-                lang.range_struct(),
-                lang.range_from_struct(),
-                lang.range_to_struct(),
-                lang.range_full_struct(),
-            ];
-            (usize_or_none && shapes.contains(&Some(range.did())))
-                .then_some(StandardOperation::StrIndex)
+            Some(StandardOperation::StrIndex)
         }
         (Some(trait_id), "eq", [other]) if lang.eq_trait() == Some(trait_id) && str_ref(*other) => {
             Some(StandardOperation::StrEq)
@@ -2212,6 +2228,11 @@ fn str_operation<'tcx>(
             if tcx.is_diagnostic_item(rustc_span::sym::Ord, trait_id) && str_ref(*other) =>
         {
             Some(StandardOperation::StrCmp)
+        }
+        (Some(trait_id), "partial_cmp", [other])
+            if lang.partial_ord_trait() == Some(trait_id) && str_ref(*other) =>
+        {
+            Some(StandardOperation::StrPartialCmp)
         }
         _ => None,
     }
