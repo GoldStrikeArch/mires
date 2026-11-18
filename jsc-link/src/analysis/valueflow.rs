@@ -73,7 +73,13 @@ use crate::jir::semantic::{
 use crate::jir::types::{NominalForm, TypeDescriptor, TypeKind, TypeTable};
 use crate::jir::{Interns, TypeId};
 use crate::late_ir::AllocatorProvider;
-use crate::lower::semantic_ops::{self, ReferenceRequirement, SemanticOp, SignatureSlot};
+use crate::lower::semantic_ops::string::{
+    analyze_inlined_string_vec, bstr_spec, classify_bstr_op, is_raw_vec_reserve_in_table,
+    item_origin_info, StringRoot,
+};
+use crate::lower::semantic_ops::{
+    self, ReferenceRequirement, SemanticOp, SignatureSlot, SlotRequirement,
+};
 
 /// One step of a value path.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -956,6 +962,39 @@ impl<'a> Collector<'a> {
             {
                 return;
             }
+            Some(sem) if crate::lower::bstr::enabled() => {
+                let bstr_op = self.table.get(name).and_then(|item| {
+                    let interns = self.interns.get(name).copied()?;
+                    let (crate_name, item_path) = item_origin_info(item, interns);
+                    let funcs = self.funcs;
+                    let table = self.table;
+                    let interns_map = &self.interns;
+                    let lowered = &self.lowered;
+                    classify_bstr_op(
+                        sem,
+                        func,
+                        types,
+                        interns,
+                        crate_name,
+                        item_path,
+                        |item| {
+                            lowered
+                                .get(&item)
+                                .and_then(|cn| funcs.get(cn)?.as_ref().ok())
+                        },
+                        |sub_item| {
+                            let cn = lowered.get(&sub_item)?;
+                            let sub = table.get(cn)?;
+                            let si = interns_map.get(cn).copied()?;
+                            Some(item_origin_info(sub, si))
+                        },
+                    )
+                });
+                if let Some(op) = bstr_op {
+                    self.summarize_slot_reqs(name, func, types, bstr_spec(op).slots);
+                    return;
+                }
+            }
             _ => {}
         }
 
@@ -1019,8 +1058,59 @@ impl<'a> Collector<'a> {
             }
         }
 
-        for block in &func.blocks {
-            for op in &block.ops {
+        let inlined_string_vec = if crate::lower::bstr::enabled() {
+            self.interns.get(name).copied().and_then(|interns| {
+                analyze_inlined_string_vec(func, types, interns, |item, _| {
+                    is_raw_vec_reserve_in_table(self.table, &self.interns, &self.lowered, item)
+                })
+            })
+        } else {
+            None
+        };
+        if let Some(ref analysis) = inlined_string_vec {
+            for cluster in &analysis.clusters {
+                let (root_site, root_ty, prefix): (Site, TypeId, &[Step]) = match cluster.root {
+                    StringRoot::Cell(c) => (Site::Cell(c), cluster.str_ty, &[]),
+                    StringRoot::Value(v) => {
+                        if cluster.root_is_ref {
+                            (Site::Value(v), cx.ty(v), &[Step::Deref])
+                        } else {
+                            (Site::Value(v), cluster.str_ty, &[])
+                        }
+                    }
+                };
+                self.ensure(name, root_site, root_ty, types);
+                if cluster.is_mut {
+                    self.mark_mut(name, root_site, root_ty, types, Some(prefix));
+                    self.constrain(
+                        name,
+                        root_site,
+                        root_ty,
+                        types,
+                        prefix,
+                        &[Carrier::StringBuilder],
+                    );
+                } else {
+                    self.constrain(
+                        name,
+                        root_site,
+                        root_ty,
+                        types,
+                        prefix,
+                        &[Carrier::HostString, Carrier::StringBuilder],
+                    );
+                }
+            }
+        }
+
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (oi, op) in block.ops.iter().enumerate() {
+                if inlined_string_vec
+                    .as_ref()
+                    .is_some_and(|a| a.op_cluster.contains_key(&(bi, oi)))
+                {
+                    continue;
+                }
                 self.collect_op(&cx, types, block.id.0, op.result, &op.kind);
             }
             match &block.term {
@@ -1665,6 +1755,44 @@ impl<'a> Collector<'a> {
                             CallSemantic::Standard(operation) => semantic_ops::registry(operation),
                             _ => None,
                         };
+                        let bstr_cut = if cut.is_none() && crate::lower::bstr::enabled() {
+                            let callee_item = self.table.get(callee_name);
+                            let callee_sem = callee_item
+                                .and_then(|item| item.jir.body.as_ref())
+                                .map(|body| body.semantic);
+                            if let (Some(callee_item), Some(sem), Some(callee_interns)) =
+                                (callee_item, callee_sem, self.interns.get(callee_name).copied())
+                            {
+                                let (crate_name, item_path) =
+                                    item_origin_info(callee_item, callee_interns);
+                                let lowered_map = &self.lowered;
+                                let table = self.table;
+                                let interns_map = &self.interns;
+                                classify_bstr_op(
+                                    sem,
+                                    callee_func,
+                                    &callee_interns.types,
+                                    callee_interns,
+                                    crate_name,
+                                    item_path,
+                                    |sub_item| {
+                                        lowered_map
+                                            .get(&sub_item)
+                                            .and_then(|n| funcs.get(n)?.as_ref().ok())
+                                    },
+                                    |sub_item| {
+                                        let cn = lowered_map.get(&sub_item)?;
+                                        let sub = table.get(cn)?;
+                                        let si = interns_map.get(cn).copied()?;
+                                        Some(item_origin_info(sub, si))
+                                    },
+                                )
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
                         match cut {
                             Some(op) => {
                                 // By-value paths keep their priced adapter edges (mixing stays
@@ -1689,6 +1817,24 @@ impl<'a> Collector<'a> {
                                 let ret = result.map(|result| (Site::Value(result), cx.ty(result)));
                                 self.standard_slots(name, op, &slots, ret, types);
                                 self.standard_flows(name, op.id, &slots, ret, types);
+                            }
+                            None if bstr_cut.is_some() => {
+                                let spec = bstr_spec(bstr_cut.unwrap());
+                                self.boundary_edges(
+                                    cx,
+                                    types,
+                                    block,
+                                    args,
+                                    result,
+                                    FarSide::Lowered(callee_name, callee_func),
+                                    true,
+                                );
+                                let slots: Vec<(Site, TypeId)> = args
+                                    .iter()
+                                    .map(|arg| (Site::Value(*arg), cx.ty(*arg)))
+                                    .collect();
+                                let ret = result.map(|result| (Site::Value(result), cx.ty(result)));
+                                self.apply_slot_reqs(name, spec.slots, &slots, ret, types);
                             }
                             None => self.boundary_edges(
                                 cx,
@@ -2188,15 +2334,37 @@ impl<'a> Collector<'a> {
         self.standard_flows(name, op.id, &slots, ret, types);
     }
 
-    /// The mutability marks and carrier-set constraints of one standard operation's slot
-    /// requirements, applied to a summarized body's own slots or (the D2 cut) a call site's
-    /// arguments. `Effects::mutates` and the requirement's reference kind replace v1's
-    /// `mutable_receiver` table; the requirement's carriers constrain the node the family
-    /// sub-solves label.
-    fn standard_slots(
+    /// Summarizes a byte-string-widened `String` method body (`BstrStringOp`) strictly under
+    /// `crate::lower::bstr::enabled()` via its slot requirements.
+    fn summarize_slot_reqs(
         &mut self,
         name: &JsName,
-        op: &'static SemanticOp,
+        func: &Func,
+        types: &TypeTable,
+        slot_reqs: &[SlotRequirement],
+    ) {
+        for param in &func.params {
+            self.ensure(
+                name,
+                Site::Value(*param),
+                func.values[param.0 as usize].ty,
+                types,
+            );
+        }
+        self.ensure(name, Site::Ret, func.sig.result, types);
+        let slots: Vec<(Site, TypeId)> = func
+            .params
+            .iter()
+            .map(|param| (Site::Value(*param), func.values[param.0 as usize].ty))
+            .collect();
+        let ret = Some((Site::Ret, func.sig.result));
+        self.apply_slot_reqs(name, slot_reqs, &slots, ret, types);
+    }
+
+    fn apply_slot_reqs(
+        &mut self,
+        name: &JsName,
+        slot_reqs: &[SlotRequirement],
         slots: &[(Site, TypeId)],
         ret: Option<(Site, TypeId)>,
         types: &TypeTable,
@@ -2205,7 +2373,7 @@ impl<'a> Collector<'a> {
             SignatureSlot::Result => ret,
             SignatureSlot::Argument(index) => slots.get(usize::from(index)).copied(),
         };
-        for requirement in op.slots {
+        for requirement in slot_reqs {
             let Some((site, ty)) = at(requirement.slot) else {
                 continue;
             };
@@ -2219,6 +2387,22 @@ impl<'a> Collector<'a> {
             };
             self.constrain(name, site, ty, types, prefix, requirement.carriers);
         }
+    }
+
+    /// The mutability marks and carrier-set constraints of one standard operation's slot
+    /// requirements, applied to a summarized body's own slots or (the D2 cut) a call site's
+    /// arguments. `Effects::mutates` and the requirement's reference kind replace v1's
+    /// `mutable_receiver` table; the requirement's carriers constrain the node the family
+    /// sub-solves label.
+    fn standard_slots(
+        &mut self,
+        name: &JsName,
+        op: &'static SemanticOp,
+        slots: &[(Site, TypeId)],
+        ret: Option<(Site, TypeId)>,
+        types: &TypeTable,
+    ) {
+        self.apply_slot_reqs(name, op.slots, slots, ret, types);
         if matches!(
             op.id,
             StandardOperation::F64SpecToString | StandardOperation::StringWithCapacity

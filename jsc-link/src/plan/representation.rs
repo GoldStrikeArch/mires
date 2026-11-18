@@ -54,12 +54,17 @@ use crate::jir::repr::{
     Carrier, CarrierPolicy, Func, Op, OpKind, Proj, RBlockId, RTerm, Root, ValueDef, ValueId,
 };
 use crate::jir::semantic::{
-    BodySemantic, CallSemantic, Callee, DropGlue, ItemId, StandardOperation,
+    BodySemantic, CallSemantic, Callee, CastKind, DropGlue, ItemId, StandardOperation,
 };
 use crate::jir::types::{RepresentationCandidate, TypeId, TypeTable};
 use crate::jsast;
 use crate::link::lane::{ReprBlock, ReprDecision, ReprExport};
 use crate::lower::js::adapters;
+use crate::lower::semantic_ops::string::{
+    analyze_inlined_string_vec, bstr_spec, classify_bstr_op, is_immutable_str_ref,
+    is_immutable_u8_slice_ref, is_raw_vec_reserve_in_table, is_trivial_str_as_bytes,
+    item_origin_info, lower_bstr_op, BstrStringOp, StringRoot,
+};
 use crate::lower::semantic_ops::{
     self, LowerCx, ReferenceRequirement, SignatureSlot, SlotRequirement,
 };
@@ -228,6 +233,7 @@ pub(crate) fn plan_and_commit(
     let mut problem = Problem::build(&graph, &terms);
 
     let (outcome, committed_funcs) = {
+        let (bstr_ops, str_as_bytes_items) = collect_bstr_ops(table, funcs, &interns_map, &lowered);
         let planner = Planner {
             table,
             funcs,
@@ -237,6 +243,8 @@ pub(crate) fn plan_and_commit(
             graph: &graph,
             lowered,
             fmt: &fmt,
+            bstr_ops,
+            str_as_bytes_items,
             member_bytes: cost::helper_bytes(),
             reached: reached_members(table),
         };
@@ -558,8 +566,111 @@ struct Planner<'a> {
     lowered: BTreeMap<ItemId, JsName>,
     /// The proven format sites per consumer item (W4g).
     fmt: &'a BTreeMap<JsName, semantic_ops::fmt_kernel::Analysis>,
+    /// Stage 3 (`js-str=bytes`): structurally recognized `String` methods (`is_empty`,
+    /// `reserve`, `reserve_exact`, `as_bytes`), empty when `bstr` is disabled.
+    bstr_ops: BTreeMap<JsName, BstrStringOp>,
+    /// Stage 3 (`js-str=bytes`): trivial `&str -> &[u8]` wrappers (`str::as_bytes`) folded into
+    /// `Cast(Transmute)` at call sites so `byte_view_analysis` sees them regardless of inline budget.
+    str_as_bytes_items: BTreeSet<ItemId>,
     member_bytes: BTreeMap<String, u64>,
     reached: BTreeSet<String>,
+}
+
+fn collect_bstr_ops(
+    table: &BTreeMap<JsName, LinkItem>,
+    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+    interns: &BTreeMap<JsName, &Interns>,
+    lowered: &BTreeMap<ItemId, JsName>,
+) -> (BTreeMap<JsName, BstrStringOp>, BTreeSet<ItemId>) {
+    let mut out = BTreeMap::new();
+    let mut as_bytes_items = BTreeSet::new();
+    if !crate::lower::bstr::enabled() {
+        return (out, as_bytes_items);
+    }
+    for (name, func) in funcs {
+        let Ok(func) = func else { continue };
+        let Some(item) = table.get(name) else {
+            continue;
+        };
+        let (Some(body), Some(item_interns)) = (item.jir.body.as_ref(), interns.get(name).copied())
+        else {
+            continue;
+        };
+        let (crate_name, item_path) = item_origin_info(item, item_interns);
+        if is_trivial_str_as_bytes(
+            body.semantic,
+            func,
+            &item_interns.types,
+            item_interns,
+            crate_name,
+            item_path,
+        ) {
+            as_bytes_items.insert(func.item);
+        }
+        if let Some(op) = classify_bstr_op(
+            body.semantic,
+            func,
+            &item_interns.types,
+            item_interns,
+            crate_name,
+            item_path,
+            |sub| {
+                lowered
+                    .get(&sub)
+                    .and_then(|cn| funcs.get(cn)?.as_ref().ok())
+            },
+            |sub| {
+                let cn = lowered.get(&sub)?;
+                let sub_item = table.get(cn)?;
+                let sub_interns = interns.get(cn).copied()?;
+                Some(item_origin_info(sub_item, sub_interns))
+            },
+        ) {
+            out.insert(name.clone(), op);
+        }
+    }
+    (out, as_bytes_items)
+}
+
+fn inlined_vec_elide_set(
+    table: &BTreeMap<JsName, LinkItem>,
+    interns_map: &BTreeMap<JsName, &Interns>,
+    lowered: &BTreeMap<ItemId, JsName>,
+    name: &JsName,
+    func: &Func,
+) -> BTreeSet<(usize, usize)> {
+    if !crate::lower::bstr::enabled() {
+        return BTreeSet::new();
+    }
+    let Some(interns) = interns_map.get(name).copied() else {
+        return BTreeSet::new();
+    };
+    let Some(analysis) = analyze_inlined_string_vec(func, &interns.types, interns, |item, _| {
+        is_raw_vec_reserve_in_table(table, interns_map, lowered, item)
+    }) else {
+        return BTreeSet::new();
+    };
+    analysis.op_cluster.keys().copied().collect()
+}
+
+impl<'a> Planner<'a> {
+    fn call_cut_slots(
+        &self,
+        semantic: CallSemantic,
+        callee_name: &JsName,
+    ) -> Option<(&'static [SlotRequirement], bool)> {
+        match semantic {
+            CallSemantic::Standard(operation) => Some((
+                semantic_ops::registry(operation)?.slots,
+                operation == StandardOperation::StringAsStr,
+            )),
+            CallSemantic::Ordinary if crate::lower::bstr::enabled() => {
+                let &op = self.bstr_ops.get(callee_name)?;
+                Some((bstr_spec(op).slots, false))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Planner<'_> {
@@ -870,6 +981,60 @@ impl Planner<'_> {
                 element_glue: None,
             };
             let Ok((op, slots)) = semantic_ops::support_of(&probe) else {
+                if let Some(&bstr_op) = self.bstr_ops.get(name) {
+                    let spec = bstr_spec(bstr_op);
+                    let Some(node) = spec
+                        .slots
+                        .first()
+                        .and_then(|slot| self.slot_node(problem, name, func, slot))
+                    else {
+                        continue;
+                    };
+                    let Some(input) = self.lower_input(name, item) else {
+                        continue;
+                    };
+                    let Some(baseline) = cost::measure_item(&input, func) else {
+                        continue;
+                    };
+                    let slot_carriers = spec
+                        .slots
+                        .first()
+                        .map(|slot| slot.carriers)
+                        .unwrap_or_default();
+                    let mut native = Vec::new();
+                    let mut helpers = BTreeSet::new();
+                    for carrier in slot_carriers {
+                        let selected: Vec<Carrier> = spec.slots.iter().map(|_| *carrier).collect();
+                        if let Ok(rw) = lower_bstr_op(bstr_op, &probe, &selected) {
+                            let decl = jsast::function(
+                                name.as_str().to_owned(),
+                                rw.parameters.clone(),
+                                rw.statements.clone(),
+                            );
+                            helpers.extend(rw.runtime_helpers.iter().copied());
+                            let rewrite = semantic_ops::Rewrite {
+                                operation: StandardOperation::StringLen,
+                                parameters: rw.parameters,
+                                statements: rw.statements,
+                                runtime_helpers: rw.runtime_helpers,
+                                item_references: rw.item_references,
+                            };
+                            native.push((*carrier, cost::measure_decl(&decl), rewrite));
+                        }
+                    }
+                    if !native.is_empty() {
+                        entries.insert(
+                            name.clone(),
+                            OpEntry {
+                                name: name.clone(),
+                                node,
+                                baseline,
+                                native,
+                                helpers,
+                            },
+                        );
+                    }
+                }
                 continue;
             };
             // The exact monomorphic child drop glue, where the operation needs one.
@@ -1031,22 +1196,28 @@ impl Planner<'_> {
             if self.is_candidate_glue_or_standard(name) {
                 continue;
             }
-            for block in &func.blocks {
-                for op in &block.ops {
+            let inlined_elide =
+                inlined_vec_elide_set(self.table, &self.interns, &self.lowered, name, func);
+            for (bi, block) in func.blocks.iter().enumerate() {
+                for (oi, op) in block.ops.iter().enumerate() {
+                    if inlined_elide.contains(&(bi, oi)) {
+                        continue;
+                    }
                     let OpKind::Call {
                         callee: Callee::Direct { item, .. },
                         args,
-                        semantic: CallSemantic::Standard(operation),
+                        semantic,
                         host: None,
                         ..
                     } = &op.kind
                     else {
                         continue;
                     };
-                    let Some(entry) = semantic_ops::registry(*operation) else {
+                    let Some(callee_name) = self.lowered.get(item) else {
                         continue;
                     };
-                    let Some(callee_name) = self.lowered.get(item) else {
+                    let Some((slots, is_as_str)) = self.call_cut_slots(*semantic, callee_name)
+                    else {
                         continue;
                     };
                     let Some(Ok(callee_func)) = self.funcs.get(callee_name) else {
@@ -1055,9 +1226,8 @@ impl Planner<'_> {
                     if !call_aligns(callee_func, args.len()) {
                         continue;
                     }
-                    let cuttable = *operation == StandardOperation::StringAsStr
-                        || versionable.contains(callee_name);
-                    for (slot_index, requirement) in entry.slots.iter().enumerate() {
+                    let cuttable = is_as_str || versionable.contains(callee_name);
+                    for (slot_index, requirement) in slots.iter().enumerate() {
                         let caller = site_slot_key(name, args, op.result, requirement)
                             .and_then(|key| problem.resolution.get(&key))
                             .copied();
@@ -1066,7 +1236,7 @@ impl Planner<'_> {
                         match (caller, callee_node) {
                             (Some(caller), Some(callee)) if caller != callee => {
                                 if requirement.reference != ReferenceRequirement::Value
-                                    && *operation != StandardOperation::StringAsStr
+                                    && !is_as_str
                                     && cuttable
                                 {
                                     reference_callers
@@ -1826,6 +1996,9 @@ impl Planner<'_> {
     /// Whether a body is semantic-tagged over candidate values (a standard operation, or
     /// registry-owned candidate drop glue).
     fn is_candidate_glue_or_standard(&self, name: &JsName) -> bool {
+        if self.bstr_ops.contains_key(name) {
+            return true;
+        }
         let Some(item) = self.table.get(name) else {
             return false;
         };
@@ -2351,27 +2524,38 @@ impl Planner<'_> {
             if self.is_candidate_glue_or_standard(caller_name) {
                 continue;
             }
-            for block in &caller_func.blocks {
-                for op in &block.ops {
+            let inlined_elide = inlined_vec_elide_set(
+                self.table,
+                &self.interns,
+                &self.lowered,
+                caller_name,
+                caller_func,
+            );
+            for (bi, block) in caller_func.blocks.iter().enumerate() {
+                for (oi, op) in block.ops.iter().enumerate() {
+                    if inlined_elide.contains(&(bi, oi)) {
+                        continue;
+                    }
                     let OpKind::Call {
                         callee: Callee::Direct { item, .. },
                         args,
-                        semantic: CallSemantic::Standard(operation),
+                        semantic,
                         host: None,
                         ..
                     } = &op.kind
                     else {
                         continue;
                     };
-                    if *operation == StandardOperation::StringAsStr {
-                        continue;
-                    }
-                    let Some(registry) = semantic_ops::registry(*operation) else {
-                        continue;
-                    };
                     let Some(callee_name) = self.lowered.get(item) else {
                         continue;
                     };
+                    let Some((slots, is_as_str)) = self.call_cut_slots(*semantic, callee_name)
+                    else {
+                        continue;
+                    };
+                    if is_as_str {
+                        continue;
+                    }
                     let (Some(op_entry), Some(Ok(callee_func))) =
                         (ops.get(callee_name), self.funcs.get(callee_name))
                     else {
@@ -2382,8 +2566,7 @@ impl Planner<'_> {
                     }
                     let mut site_native = BTreeSet::new();
                     let mut site_baseline = false;
-                    for requirement in registry
-                        .slots
+                    for requirement in slots
                         .iter()
                         .filter(|requirement| requirement.reference != ReferenceRequirement::Value)
                     {
@@ -2730,6 +2913,45 @@ impl Planner<'_> {
             }
         }
 
+        // Stage 3 (`js-str=bytes`): closed MIR-inlined `String.vec` operations (`len`/`is_empty`,
+        // `reserve`, `as_bytes`): mark witness intermediates with the root's committed carrier so
+        // `emit.rs` & `byte_view_analysis` see it cleanly, and keep elided calls out of boundary
+        // conversions.
+        let mut inlined_vec_elide: BTreeSet<(usize, usize)> = BTreeSet::new();
+        if crate::lower::bstr::enabled() {
+            if let Some(analysis) = analyze_inlined_string_vec(&out, types, interns, |item, _| {
+                is_raw_vec_reserve_in_table(self.table, &self.interns, &self.lowered, item)
+            }) {
+                for (cid, cluster) in analysis.clusters.iter().enumerate() {
+                    let root_carrier = match cluster.root {
+                        StringRoot::Cell(c) => label(name, Site::Cell(c), &[]),
+                        StringRoot::Value(v) => {
+                            let path: &[Step] = if cluster.root_is_ref {
+                                &[Step::Deref]
+                            } else {
+                                &[]
+                            };
+                            label(name, Site::Value(v), path)
+                        }
+                    };
+                    if let Some(c @ (Carrier::HostString | Carrier::StringBuilder)) = root_carrier {
+                        for &w in &cluster.witness_values {
+                            out.values[w.0 as usize].carrier = c;
+                            touched = true;
+                        }
+                        if !cluster.slice_values.is_empty() {
+                            members.insert("bstr_bytes".to_owned());
+                        }
+                        for (&pos, &op_cid) in &analysis.op_cluster {
+                            if op_cid == cid {
+                                inlined_vec_elide.insert(pos);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // The result converts of invoked calls, by the normal successor they open.
         let mut normal_heads: Vec<(RBlockId, Op)> = Vec::new();
         for block_index in 0..out.blocks.len() {
@@ -2741,9 +2963,11 @@ impl Planner<'_> {
             };
             let mut rebuilt = Vec::with_capacity(taken.len());
             for (op_index, mut op) in taken.into_iter().enumerate() {
-                if fmt_elide.contains(&(block_index, op_index)) {
-                    // An inlined format call: the emission hook spells it whole; no generic
-                    // boundary conversion may touch it.
+                if fmt_elide.contains(&(block_index, op_index))
+                    || inlined_vec_elide.contains(&(block_index, op_index))
+                {
+                    // An inlined format or `String.vec` op: emission handles it directly; no
+                    // generic boundary conversion may touch it.
                     rebuilt.push(op);
                     continue;
                 }
@@ -2756,72 +2980,104 @@ impl Planner<'_> {
                         host,
                         ..
                     } if host.is_none() && *semantic != CallSemantic::Host => {
+                        if crate::lower::bstr::enabled()
+                            && *semantic == CallSemantic::Ordinary
+                            && !(invoke_normal.is_some() && Some(op_index) == last)
+                        {
+                            if let (Callee::Direct { item, .. }, Some(res)) = (callee, op.result) {
+                                if self.str_as_bytes_items.contains(item) && args.len() == 1 {
+                                    let arg = args[0];
+                                    let arg_ty = out.values[arg.0 as usize].ty;
+                                    let res_ty = out.values[res.0 as usize].ty;
+                                    if out.values[arg.0 as usize].carrier == Carrier::Baseline
+                                        && out.values[res.0 as usize].carrier == Carrier::Baseline
+                                        && is_immutable_str_ref(types, arg_ty)
+                                        && is_immutable_u8_slice_ref(types, res_ty)
+                                    {
+                                        op.kind = OpKind::Cast {
+                                            kind: CastKind::Transmute,
+                                            v: arg,
+                                            from: arg_ty,
+                                            to: res_ty,
+                                        };
+                                        touched = true;
+                                        rebuilt.push(op);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                         // The D2 cut's soundness net at reference slots: a registry-covered
                         // standard call shares storage through its reference requirements, which
                         // no `Convert` can spell, so the caller's label behind the deref and the
                         // callee's must agree — a disagreement rolls both regions back (the
                         // error names both items' labeled nodes).
-                        if let (CallSemantic::Standard(operation), Callee::Direct { item, .. }) =
-                            (semantic, callee)
-                        {
-                            if let (Some(entry), Some(callee_name)) =
-                                (semantic_ops::registry(*operation), self.lowered.get(item))
-                            {
-                                if let Some(Ok(callee_func)) = self.funcs.get(callee_name) {
-                                    if call_aligns(callee_func, args.len()) {
-                                        for requirement in entry.slots {
-                                            if requirement.reference == ReferenceRequirement::Value
-                                            {
-                                                continue;
-                                            }
-                                            let SignatureSlot::Argument(index) = requirement.slot
-                                            else {
-                                                continue;
-                                            };
-                                            let index = usize::from(index);
-                                            let Some(arg) = args.get(index) else {
-                                                continue;
-                                            };
-                                            let near =
-                                                label(name, Site::Value(*arg), &[Step::Deref])
-                                                    .unwrap_or(Carrier::Baseline);
-                                            let far = callee_func
-                                                .params
-                                                .get(index)
-                                                .and_then(|param| {
-                                                    label(
-                                                        callee_name,
-                                                        Site::Value(*param),
-                                                        &[Step::Deref],
-                                                    )
-                                                })
+                        if let Callee::Direct { item, .. } = callee {
+                            if let Some(callee_name) = self.lowered.get(item) {
+                                if let Some((slots, is_as_str)) =
+                                    self.call_cut_slots(*semantic, callee_name)
+                                {
+                                    if let Some(Ok(callee_func)) = self.funcs.get(callee_name) {
+                                        if call_aligns(callee_func, args.len()) {
+                                            for requirement in slots {
+                                                if requirement.reference
+                                                    == ReferenceRequirement::Value
+                                                {
+                                                    continue;
+                                                }
+                                                let SignatureSlot::Argument(index) =
+                                                    requirement.slot
+                                                else {
+                                                    continue;
+                                                };
+                                                let index = usize::from(index);
+                                                let Some(arg) = args.get(index) else {
+                                                    continue;
+                                                };
+                                                let near = label(
+                                                    name,
+                                                    Site::Value(*arg),
+                                                    &[Step::Deref],
+                                                )
                                                 .unwrap_or(Carrier::Baseline);
-                                            let callsite_cut = *operation
-                                                == StandardOperation::StringAsStr
-                                                && matches!(
-                                                    near,
-                                                    Carrier::HostString | Carrier::StringBuilder
-                                                );
-                                            let versioned_cut = native_versions
-                                                .get(callee_name)
-                                                .is_some_and(|need| need.carrier == near);
-                                            if near != far && !callsite_cut && !versioned_cut {
-                                                let mut failed =
-                                                    self.nodes_of_item(problem, name, carriers);
-                                                failed.extend(self.nodes_of_item(
-                                                    problem,
-                                                    callee_name,
-                                                    carriers,
-                                                ));
-                                                return Err((
-                                                    failed,
-                                                    format!(
-                                                        "`{}` cut standard call to `{}` \
-                                                         disagrees at reference slot {index}",
-                                                        name.as_str(),
-                                                        callee_name.as_str()
-                                                    ),
-                                                ));
+                                                let far = callee_func
+                                                    .params
+                                                    .get(index)
+                                                    .and_then(|param| {
+                                                        label(
+                                                            callee_name,
+                                                            Site::Value(*param),
+                                                            &[Step::Deref],
+                                                        )
+                                                    })
+                                                    .unwrap_or(Carrier::Baseline);
+                                                let callsite_cut = is_as_str
+                                                    && matches!(
+                                                        near,
+                                                        Carrier::HostString
+                                                            | Carrier::StringBuilder
+                                                    );
+                                                let versioned_cut = native_versions
+                                                    .get(callee_name)
+                                                    .is_some_and(|need| need.carrier == near);
+                                                if near != far && !callsite_cut && !versioned_cut {
+                                                    let mut failed =
+                                                        self.nodes_of_item(problem, name, carriers);
+                                                    failed.extend(self.nodes_of_item(
+                                                        problem,
+                                                        callee_name,
+                                                        carriers,
+                                                    ));
+                                                    return Err((
+                                                        failed,
+                                                        format!(
+                                                            "`{}` cut standard call to `{}` \
+                                                             disagrees at reference slot {index}",
+                                                            name.as_str(),
+                                                            callee_name.as_str()
+                                                        ),
+                                                    ));
+                                                }
                                             }
                                         }
                                     }
@@ -3740,6 +3996,13 @@ mod tests {
         let terms = legality::terms(&graph);
         let mut problem = Problem::build(&graph, &terms);
         let fmt = BTreeMap::new();
+        let lowered_map: BTreeMap<ItemId, JsName> = prog
+            .funcs
+            .iter()
+            .filter_map(|(name, func)| Some((func.as_ref().ok()?.item, name.clone())))
+            .collect();
+        let (bstr_ops, str_as_bytes_items) =
+            collect_bstr_ops(&prog.table, &prog.funcs, &interns_map, &lowered_map);
         let planner = Planner {
             table: &prog.table,
             funcs: &prog.funcs,
@@ -3747,12 +4010,10 @@ mod tests {
             cx: &cx,
             interns: &interns_map,
             graph: &graph,
-            lowered: prog
-                .funcs
-                .iter()
-                .filter_map(|(name, func)| Some((func.as_ref().ok()?.item, name.clone())))
-                .collect(),
+            lowered: lowered_map,
             fmt: &fmt,
+            bstr_ops,
+            str_as_bytes_items,
             member_bytes: cost::helper_bytes(),
             reached: reached_members(&prog.table),
         };
