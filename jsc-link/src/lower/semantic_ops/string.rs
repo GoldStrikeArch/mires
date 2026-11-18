@@ -24,18 +24,23 @@
 //! the sum of its pieces' lengths, and two adjacent halves never pair into a scalar the baseline
 //! never held.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use crate::item::JsName;
-use crate::jir::repr::Carrier;
-use crate::jir::semantic::StandardOperation;
-use crate::jir::types::TypeKind;
+use crate::jir::interns::Interns;
+use crate::jir::repr::{Carrier, CellId, Func, OpKind, Proj, RTerm, Root, ValueId};
+use crate::jir::semantic::{
+    BinaryOp, BodySemantic, CallSemantic, Callee, CastKind, ConstTree, ItemId, StandardOperation,
+};
+use crate::jir::types::{AllocatorIdentity, RepresentationCandidate, TypeId, TypeKind, TypeTable};
 use crate::jsast::{self, BinOp, Expr, Stmt};
+use crate::lower::js::adapters::{string_parts, StringParts};
 
 use super::{
     capacity_guard, is_shared_str, pointer_limit, slot_type, string_capacity_limit, type_get,
-    unsigned_bits, LowerCx, SemanticDecline, SignatureSlot,
+    unsigned_bits, Effects, LowerCx, LowerFn, ReferenceRequirement, SemanticDecline, SignatureSlot,
+    SlotRequirement,
 };
 
 pub(super) fn receiver() -> Expr {
@@ -369,4 +374,2604 @@ pub(super) fn legality_string_candidate_return(cx: &LowerCx<'_>) -> Result<(), S
         return Err(SemanticDecline::WrongReturnType);
     }
     Ok(())
+}
+
+// ============================================================================================
+// Stage 3 (`js-str=bytes`): Byte-String Widened `String` Operations & Inlined `String.vec`
+// ============================================================================================
+
+/// Additional `alloc::string::String` operations recognized and lowered ONLY when
+/// `crate::lower::bstr::enabled()`. Never activates under `js-str=utf16`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) enum BstrStringOp {
+    IsEmpty,
+    Reserve,
+    ReserveExact,
+    AsBytes,
+}
+
+/// Lowering contract for a [`BstrStringOp`], mirroring [`super::SemanticOp`] without touching
+/// `rcgjs-object`'s wire `StandardOperation` enum or `semantic_ops/mod.rs`.
+pub(crate) struct BstrOpSpec {
+    pub(crate) op: BstrStringOp,
+    pub(crate) parameters: u16,
+    pub(crate) slots: &'static [SlotRequirement],
+    pub(crate) carriers: &'static [Carrier],
+    pub(crate) effects: Effects,
+    pub(crate) legality: fn(&LowerCx<'_>) -> Result<(), SemanticDecline>,
+    pub(crate) lower: LowerFn,
+    pub(crate) helpers: &'static [&'static str],
+    pub(crate) cost_hint: u32,
+}
+
+pub(crate) struct BstrRewrite {
+    pub(crate) parameters: Vec<String>,
+    pub(crate) statements: Vec<Stmt>,
+    pub(crate) runtime_helpers: BTreeSet<&'static str>,
+    pub(crate) item_references: BTreeSet<JsName>,
+}
+
+const BSTR_HOST_OR_BUILDER: &[Carrier] = &[Carrier::HostString, Carrier::StringBuilder];
+const BSTR_BUILDER_ONLY: &[Carrier] = &[Carrier::StringBuilder];
+const BSTR_RECEIVER_STRING: &[SlotRequirement] = &[SlotRequirement {
+    slot: SignatureSlot::Argument(0),
+    reference: ReferenceRequirement::Shared,
+    carriers: BSTR_HOST_OR_BUILDER,
+}];
+const BSTR_MUT_RECEIVER_BUILDER: &[SlotRequirement] = &[SlotRequirement {
+    slot: SignatureSlot::Argument(0),
+    reference: ReferenceRequirement::Mutable,
+    carriers: BSTR_BUILDER_ONLY,
+}];
+const BSTR_PURE: Effects = Effects {
+    can_throw: false,
+    mutates: false,
+};
+const BSTR_THROWS_AND_MUTATES: Effects = Effects {
+    can_throw: true,
+    mutates: true,
+};
+
+static SPEC_IS_EMPTY: BstrOpSpec = BstrOpSpec {
+    op: BstrStringOp::IsEmpty,
+    parameters: 1,
+    slots: BSTR_RECEIVER_STRING,
+    carriers: BSTR_HOST_OR_BUILDER,
+    effects: BSTR_PURE,
+    legality: legality_is_empty,
+    lower: string_is_empty,
+    helpers: &[],
+    cost_hint: 24,
+};
+
+static SPEC_RESERVE: BstrOpSpec = BstrOpSpec {
+    op: BstrStringOp::Reserve,
+    parameters: 2,
+    slots: BSTR_MUT_RECEIVER_BUILDER,
+    carriers: BSTR_BUILDER_ONLY,
+    effects: BSTR_THROWS_AND_MUTATES,
+    legality: legality_reserve,
+    lower: string_reserve,
+    helpers: &[],
+    cost_hint: 88,
+};
+
+static SPEC_RESERVE_EXACT: BstrOpSpec = BstrOpSpec {
+    op: BstrStringOp::ReserveExact,
+    parameters: 2,
+    slots: BSTR_MUT_RECEIVER_BUILDER,
+    carriers: BSTR_BUILDER_ONLY,
+    effects: BSTR_THROWS_AND_MUTATES,
+    legality: legality_reserve,
+    lower: string_reserve,
+    helpers: &[],
+    cost_hint: 88,
+};
+
+static SPEC_AS_BYTES: BstrOpSpec = BstrOpSpec {
+    op: BstrStringOp::AsBytes,
+    parameters: 1,
+    slots: BSTR_RECEIVER_STRING,
+    carriers: BSTR_HOST_OR_BUILDER,
+    effects: BSTR_PURE,
+    legality: legality_as_bytes,
+    lower: string_as_bytes,
+    helpers: &["bstr_bytes"],
+    cost_hint: 30,
+};
+
+pub(crate) fn bstr_spec(op: BstrStringOp) -> &'static BstrOpSpec {
+    match op {
+        BstrStringOp::IsEmpty => &SPEC_IS_EMPTY,
+        BstrStringOp::Reserve => &SPEC_RESERVE,
+        BstrStringOp::ReserveExact => &SPEC_RESERVE_EXACT,
+        BstrStringOp::AsBytes => &SPEC_AS_BYTES,
+    }
+}
+
+fn is_global_string_ty(table: &TypeTable, ty: TypeId) -> bool {
+    table.get(table.peeled(ty)).is_some_and(|d| {
+        d.meta.candidate == RepresentationCandidate::String
+            && d.meta.allocator == AllocatorIdentity::Global
+    })
+}
+
+fn is_u8_slice_ref(table: &TypeTable, ty: TypeId) -> bool {
+    matches!(
+        type_get(table, ty).map(|d| &d.kind),
+        Ok(TypeKind::Reference {
+            pointee,
+            mutable: false,
+        }) if matches!(
+            type_get(table, *pointee).map(|d| &d.kind),
+            Ok(TypeKind::Slice(el)) if table.byte_element(*el)
+        )
+    )
+}
+
+pub(crate) fn is_immutable_str_ref(table: &TypeTable, ty: TypeId) -> bool {
+    matches!(
+        table.get(table.peeled(ty)).map(|d| &d.kind),
+        Some(TypeKind::Reference {
+            pointee,
+            mutable: false,
+        }) if table
+            .get(table.peeled(*pointee))
+            .is_some_and(|d| matches!(d.kind, TypeKind::Str))
+    )
+}
+
+pub(crate) fn is_immutable_u8_slice_ref(table: &TypeTable, ty: TypeId) -> bool {
+    is_u8_slice_ref(table, ty)
+}
+
+/// Returns `true` for a trivial `&str -> &[u8]` wrapper (`core::str::<impl str>::as_bytes`),
+/// strictly under `crate::lower::bstr::enabled()`.
+pub(crate) fn is_trivial_str_as_bytes(
+    semantic: BodySemantic,
+    func: &Func,
+    table: &TypeTable,
+    interns: &Interns,
+) -> bool {
+    if !crate::lower::bstr::enabled() || semantic != BodySemantic::Ordinary {
+        return false;
+    }
+    let abi = func.sig.abi;
+    if abi.spread.is_some() || abi.caller_location || abi.parameters != 1 || func.params.len() != 1
+    {
+        return false;
+    }
+    let [arg0] = func.sig.arguments.as_slice() else {
+        return false;
+    };
+    if !is_immutable_str_ref(table, *arg0) || !is_u8_slice_ref(table, func.sig.result) {
+        return false;
+    }
+    if func.blocks.len() != 1 {
+        return false;
+    }
+    let entry = &func.blocks[0];
+    let RTerm::Return(Some(ret_v)) = entry.term else {
+        return false;
+    };
+    let mut vals = BTreeSet::from([func.params[0]]);
+    for op in &entry.ops {
+        let Some(res) = op.result else {
+            return false;
+        };
+        let passthrough = match &op.kind {
+            OpKind::Copy(v) | OpKind::Move(v) => vals.contains(v),
+            OpKind::BorrowView {
+                root: Root::Value(v),
+                path,
+                mutable: false,
+            } => (path.is_empty() || path.as_slice() == [Proj::Deref]) && vals.contains(v),
+            OpKind::Cast {
+                kind: CastKind::Transmute | CastKind::PtrToPtr | CastKind::PointerCoercion,
+                v,
+                ..
+            } => vals.contains(v),
+            OpKind::Intrinsic { name, args, .. }
+                if args.len() == 1
+                    && matches!(
+                        interns.str(*name),
+                        Some("transmute" | "transmute_unchecked")
+                    ) =>
+            {
+                vals.contains(&args[0])
+            }
+            _ => false,
+        };
+        if !passthrough {
+            return false;
+        }
+        vals.insert(res);
+    }
+    vals.contains(&ret_v)
+}
+
+fn legality_is_empty(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    if cx.sig.arguments.len() != 1 {
+        return Err(SemanticDecline::SignatureArgumentCount {
+            expected: 1,
+            actual: u16::try_from(cx.sig.arguments.len()).unwrap_or(u16::MAX),
+        });
+    }
+    let result = type_get(cx.table, cx.sig.result)?;
+    if !matches!(result.kind, TypeKind::Bool) {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    Ok(())
+}
+
+fn legality_reserve(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    let additional = slot_type(cx.sig, SignatureSlot::Argument(1))?;
+    if unsigned_bits(type_get(cx.table, additional)?).is_err() {
+        return Err(SemanticDecline::WrongArgumentType(1));
+    }
+    legality_unit_return(cx)
+}
+
+fn legality_as_bytes(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    if cx.sig.arguments.len() != 1 {
+        return Err(SemanticDecline::SignatureArgumentCount {
+            expected: 1,
+            actual: u16::try_from(cx.sig.arguments.len()).unwrap_or(u16::MAX),
+        });
+    }
+    if !is_u8_slice_ref(cx.table, cx.sig.result) {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    Ok(())
+}
+
+pub(super) fn string_is_empty(
+    _cx: &LowerCx<'_>,
+    carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    let length = match carrier {
+        Some(Carrier::HostString) => jsast::member(receiver(), "length"),
+        Some(Carrier::StringBuilder) => {
+            if verify_builders() {
+                builder_len(receiver(), helpers)
+            } else {
+                jsast::member(member("text"), "length")
+            }
+        }
+        _ => return Err(SemanticDecline::WrongCarrier(SignatureSlot::Argument(0))),
+    };
+    Ok(vec![jsast::ret(jsast::binary(
+        BinOp::StrictEq,
+        length,
+        jsast::num(0),
+    ))])
+}
+
+/// Emits the shared JS statements updating `cap` and checking 32-bit overflow for
+/// `String::reserve` / `String::reserve_exact` on a [`Carrier::StringBuilder`] receiver `sb_expr`.
+pub(crate) fn reserve_builder_stmts_with(
+    sb_init: Stmt,
+    sb_id: Expr,
+    req_name: &str,
+    req_init: impl FnOnce(Expr) -> Stmt,
+    req_id: Expr,
+    maximum: u64,
+    helpers: &mut BTreeSet<&'static str>,
+) -> Vec<Stmt> {
+    let len_expr = if verify_builders() {
+        helpers.insert("_sb_check");
+        jsast::member(jsast::rt_call("_sb_check", vec![sb_id.clone()]), "len")
+    } else {
+        jsast::member(sb_id.clone(), "len")
+    };
+    let _ = req_name;
+    let mut statements = vec![
+        sb_init,
+        req_init(len_expr),
+        capacity_guard(req_id.clone(), maximum, "String"),
+        jsast::if_(
+            jsast::binary(
+                BinOp::Lt,
+                jsast::member(sb_id.clone(), "cap"),
+                req_id.clone(),
+            ),
+            vec![jsast::assign_stmt(jsast::member(sb_id.clone(), "cap"), req_id)],
+        ),
+    ];
+    statements.extend(builder_checked(sb_id, helpers));
+    statements
+}
+
+pub(crate) fn reserve_builder_stmts(
+    sb_expr: Expr,
+    additional: Expr,
+    maximum: u64,
+    helpers: &mut BTreeSet<&'static str>,
+) -> Vec<Stmt> {
+    reserve_builder_stmts_with(
+        jsast::const_("$nativeSb", sb_expr),
+        jsast::id("$nativeSb"),
+        "$nativeRequired",
+        |len_expr| jsast::const_("$nativeRequired", jsast::binary(BinOp::Add, len_expr, additional)),
+        jsast::id("$nativeRequired"),
+        maximum,
+        helpers,
+    )
+}
+
+pub(super) fn string_reserve(
+    cx: &LowerCx<'_>,
+    carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    if carrier != Some(Carrier::StringBuilder) {
+        return Err(SemanticDecline::WrongCarrier(SignatureSlot::Argument(0)));
+    }
+    let maximum = string_capacity_limit(cx)?;
+    let mut statements = reserve_builder_stmts(receiver(), jsast::id("$native1"), maximum, helpers);
+    statements.push(jsast::ret_void());
+    Ok(statements)
+}
+
+pub(super) fn string_as_bytes(
+    _cx: &LowerCx<'_>,
+    carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    helpers.insert("bstr_bytes");
+    let text = match carrier {
+        Some(Carrier::HostString) => receiver(),
+        Some(Carrier::StringBuilder) => member("text"),
+        _ => return Err(SemanticDecline::WrongCarrier(SignatureSlot::Argument(0))),
+    };
+    Ok(vec![jsast::ret(jsast::rt_call("bstr_bytes", vec![text]))])
+}
+
+/// Validates and lowers one [`BstrStringOp`], matching `semantic_ops::lower`'s slot and ABI
+/// checks strictly under `crate::lower::bstr::enabled()`.
+pub(crate) fn lower_bstr_op(
+    op: BstrStringOp,
+    cx: &LowerCx<'_>,
+    selected: &[Carrier],
+) -> Result<BstrRewrite, SemanticDecline> {
+    if !crate::lower::bstr::enabled() {
+        return Err(SemanticDecline::WrongCarrier(SignatureSlot::Argument(0)));
+    }
+    let spec = bstr_spec(op);
+    let abi = cx.sig.abi;
+    if abi.spread.is_some() {
+        return Err(SemanticDecline::SpreadAbi);
+    }
+    if abi.caller_location {
+        return Err(SemanticDecline::CallerLocationAbi);
+    }
+    if abi.parameters != spec.parameters {
+        return Err(SemanticDecline::ParameterCount {
+            expected: spec.parameters,
+            actual: abi.parameters,
+        });
+    }
+    let actual_args = u16::try_from(cx.sig.arguments.len()).unwrap_or(u16::MAX);
+    if actual_args != spec.parameters {
+        return Err(SemanticDecline::SignatureArgumentCount {
+            expected: spec.parameters,
+            actual: actual_args,
+        });
+    }
+    if selected.len() != spec.slots.len() {
+        return Err(SemanticDecline::WrongCarrier(SignatureSlot::Argument(0)));
+    }
+    for (req, carrier) in spec.slots.iter().zip(selected) {
+        let arg_ty = slot_type(cx.sig, req.slot)?;
+        let expected_mut = match req.reference {
+            ReferenceRequirement::Shared => false,
+            ReferenceRequirement::Mutable => true,
+            ReferenceRequirement::Value => {
+                if !is_global_string_ty(cx.table, arg_ty) {
+                    return Err(SemanticDecline::WrongNativeType(req.slot));
+                }
+                if !req.carriers.contains(carrier) {
+                    return Err(SemanticDecline::WrongCarrier(req.slot));
+                }
+                continue;
+            }
+        };
+        let TypeKind::Reference { pointee, mutable } = type_get(cx.table, arg_ty)?.kind else {
+            return Err(SemanticDecline::WrongReferenceKind(req.slot));
+        };
+        if mutable != expected_mut {
+            return Err(SemanticDecline::WrongReferenceKind(req.slot));
+        }
+        if !is_global_string_ty(cx.table, pointee) {
+            return Err(SemanticDecline::WrongNativeType(req.slot));
+        }
+        if !req.carriers.contains(carrier) {
+            return Err(SemanticDecline::WrongCarrier(req.slot));
+        }
+    }
+    (spec.legality)(cx)?;
+    let parameters = (0..spec.parameters)
+        .map(|i| format!("$native{i}"))
+        .collect();
+    let mut runtime_helpers = BTreeSet::new();
+    let mut item_references = BTreeSet::new();
+    let statements = (spec.lower)(
+        cx,
+        selected.first().copied(),
+        &mut runtime_helpers,
+        &mut item_references,
+    )?;
+    Ok(BstrRewrite {
+        parameters,
+        statements,
+        runtime_helpers,
+        item_references,
+    })
+}
+
+/// Structurally classifies a `BodySemantic::Ordinary` function into [`BstrStringOp`] from JIR
+/// types and ops alone (never inspects `debug_path`). Returns `None` whenever `bstr` is disabled.
+pub(crate) fn classify_bstr_op<'a, F>(
+    semantic: BodySemantic,
+    func: &Func,
+    table: &TypeTable,
+    interns: &Interns,
+    mut resolve_callee: F,
+) -> Option<BstrStringOp>
+where
+    F: FnMut(ItemId) -> Option<&'a Func>,
+{
+    if !crate::lower::bstr::enabled() || semantic != BodySemantic::Ordinary {
+        return None;
+    }
+    let abi = func.sig.abi;
+    if abi.spread.is_some() || abi.caller_location {
+        return None;
+    }
+    let args = func.sig.arguments.as_slice();
+    match args {
+        [arg0] if abi.parameters == 1 && func.params.len() == 1 => {
+            let TypeKind::Reference {
+                pointee,
+                mutable: false,
+            } = table.get(table.peeled(*arg0)).map(|d| &d.kind)?
+            else {
+                return None;
+            };
+            let parts = string_parts(table, interns, *pointee)?;
+            let res_desc = table.get(table.peeled(func.sig.result))?;
+            if matches!(res_desc.kind, TypeKind::Bool) {
+                if classify_is_empty_body(func, &parts) {
+                    return Some(BstrStringOp::IsEmpty);
+                }
+            } else if is_u8_slice_ref(table, func.sig.result)
+                && classify_as_bytes_body(func, table, interns, &parts)
+            {
+                return Some(BstrStringOp::AsBytes);
+            }
+            None
+        }
+        [arg0, arg1] if abi.parameters == 2 && func.params.len() == 2 => {
+            let TypeKind::Reference {
+                pointee,
+                mutable: true,
+            } = table.get(table.peeled(*arg0)).map(|d| &d.kind)?
+            else {
+                return None;
+            };
+            let parts = string_parts(table, interns, *pointee)?;
+            let arg1_desc = table.get(table.peeled(*arg1))?;
+            if unsigned_bits(arg1_desc).is_err() {
+                return None;
+            }
+            let res_desc = table.get(table.peeled(func.sig.result))?;
+            if !res_desc.layout.zst || !matches!(&res_desc.kind, TypeKind::Tuple(f) if f.is_empty())
+            {
+                return None;
+            }
+            classify_reserve_body(func, table, &parts, &mut resolve_callee)
+        }
+        _ => None,
+    }
+}
+
+fn is_zero_const(tree: &ConstTree) -> bool {
+    matches!(tree, ConstTree::Scalar { bits: 0, .. })
+}
+
+fn classify_is_empty_body(func: &Func, parts: &StringParts) -> bool {
+    if func.blocks.len() != 1 || func.params.is_empty() {
+        return false;
+    }
+    let entry = &func.blocks[0];
+    let RTerm::Return(Some(ret_val)) = entry.term else {
+        return false;
+    };
+    let v0 = func.params[0];
+    let mut str_refs = BTreeSet::from([v0]);
+    let mut vec_vals = BTreeSet::new();
+    let mut len_refs = BTreeSet::new();
+    let mut len_vals = BTreeSet::new();
+    let mut zero_consts = BTreeSet::new();
+    let mut bool_res = BTreeSet::new();
+
+    for op in &entry.ops {
+        let Some(res) = op.result else {
+            return false;
+        };
+        match &op.kind {
+            OpKind::Const(tree) if is_zero_const(tree) => {
+                zero_consts.insert(res);
+            }
+            OpKind::Copy(src) | OpKind::Move(src) => {
+                if str_refs.contains(src) {
+                    str_refs.insert(res);
+                } else if vec_vals.contains(src) {
+                    vec_vals.insert(res);
+                } else if len_refs.contains(src) {
+                    len_refs.insert(res);
+                } else if len_vals.contains(src) {
+                    len_vals.insert(res);
+                } else if zero_consts.contains(src) {
+                    zero_consts.insert(res);
+                } else if bool_res.contains(src) {
+                    bool_res.insert(res);
+                } else {
+                    return false;
+                }
+            }
+            OpKind::BorrowView {
+                root: Root::Value(src),
+                path,
+                mutable: false,
+            }
+            | OpKind::RawView {
+                root: Root::Value(src),
+                path,
+                mutable: false,
+            } if str_refs.contains(src) => match path.as_slice() {
+                [] | [Proj::Deref] => {
+                    str_refs.insert(res);
+                }
+                [Proj::Deref, Proj::Field { field: f, .. }] if *f == parts.vec_field => {
+                    vec_vals.insert(res);
+                }
+                [Proj::Deref, Proj::Field { field: f1, .. }, Proj::Field { field: f2, .. }]
+                    if *f1 == parts.vec_field && *f2 == parts.len_field =>
+                {
+                    len_refs.insert(res);
+                }
+                _ => return false,
+            },
+            OpKind::BorrowView {
+                root: Root::Value(src),
+                path,
+                mutable: false,
+            }
+            | OpKind::RawView {
+                root: Root::Value(src),
+                path,
+                mutable: false,
+            } if vec_vals.contains(src) => match path.as_slice() {
+                [] | [Proj::Deref] => {
+                    vec_vals.insert(res);
+                }
+                [Proj::Field { field: f, .. }] | [Proj::Deref, Proj::Field { field: f, .. }]
+                    if *f == parts.len_field =>
+                {
+                    len_refs.insert(res);
+                }
+                _ => return false,
+            },
+            OpKind::Field { base: v, field, .. }
+                if vec_vals.contains(v) && *field == parts.len_field =>
+            {
+                len_vals.insert(res);
+            }
+            OpKind::Deref(ptr) if len_refs.contains(ptr) => {
+                len_vals.insert(res);
+            }
+            OpKind::Deref(ptr) if str_refs.contains(ptr) => {
+                str_refs.insert(res);
+            }
+            OpKind::Call {
+                args,
+                semantic: CallSemantic::Standard(StandardOperation::StringLen),
+                host: None,
+                ..
+            } if args.len() == 1 && str_refs.contains(&args[0]) => {
+                len_vals.insert(res);
+            }
+            OpKind::Call {
+                args,
+                semantic: CallSemantic::Standard(StandardOperation::VecLen),
+                host: None,
+                ..
+            } if args.len() == 1 && vec_vals.contains(&args[0]) => {
+                len_vals.insert(res);
+            }
+            OpKind::Call {
+                args,
+                semantic: CallSemantic::Standard(StandardOperation::VecIsEmpty),
+                host: None,
+                ..
+            } if args.len() == 1 && vec_vals.contains(&args[0]) => {
+                bool_res.insert(res);
+            }
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l,
+                r,
+                ..
+            } if (len_vals.contains(l) && zero_consts.contains(r))
+                || (len_vals.contains(r) && zero_consts.contains(l)) =>
+            {
+                bool_res.insert(res);
+            }
+            _ => return false,
+        }
+    }
+    bool_res.contains(&ret_val)
+}
+
+fn classify_as_bytes_body(
+    func: &Func,
+    table: &TypeTable,
+    interns: &Interns,
+    parts: &StringParts,
+) -> bool {
+    if func.blocks.len() != 1 || func.params.is_empty() {
+        return false;
+    }
+    let entry = &func.blocks[0];
+    let RTerm::Return(Some(ret_val)) = entry.term else {
+        return false;
+    };
+    let v0 = func.params[0];
+    let mut str_refs = BTreeSet::from([v0]);
+    let mut vec_vals = BTreeSet::new();
+    let mut len_refs = BTreeSet::new();
+    let mut len_vals = BTreeSet::new();
+    let mut buf_chain = BTreeSet::new();
+    let mut data_ptrs = BTreeSet::new();
+    let mut slice_vals = BTreeSet::new();
+
+    for op in &entry.ops {
+        let Some(res) = op.result else {
+            return false;
+        };
+        let is_u8_ptr = func.ty(res).is_some_and(|ty| {
+            matches!(
+                table.get(table.peeled(ty)).map(|d| &d.kind),
+                Some(TypeKind::RawPointer {
+                    pointee,
+                    mutable: false,
+                }) if table.byte_element(*pointee)
+            )
+        });
+        match &op.kind {
+            OpKind::Copy(src) | OpKind::Move(src) => {
+                if str_refs.contains(src) {
+                    str_refs.insert(res);
+                } else if vec_vals.contains(src) {
+                    vec_vals.insert(res);
+                } else if len_refs.contains(src) {
+                    len_refs.insert(res);
+                } else if len_vals.contains(src) {
+                    len_vals.insert(res);
+                } else if buf_chain.contains(src) {
+                    buf_chain.insert(res);
+                } else if data_ptrs.contains(src) {
+                    data_ptrs.insert(res);
+                } else if slice_vals.contains(src) {
+                    slice_vals.insert(res);
+                } else {
+                    return false;
+                }
+            }
+            OpKind::BorrowView {
+                root: Root::Value(src),
+                path,
+                mutable: false,
+            }
+            | OpKind::RawView {
+                root: Root::Value(src),
+                path,
+                mutable: false,
+            } => {
+                if slice_vals.contains(src) && path.as_slice() == [Proj::Deref] {
+                    slice_vals.insert(res);
+                } else if let Some(kind) = classify_vec_proj_from_value(
+                    src,
+                    path,
+                    parts,
+                    &str_refs,
+                    &vec_vals,
+                    &buf_chain,
+                ) {
+                    match kind {
+                        VecProjKind::Str => str_refs.insert(res),
+                        VecProjKind::Vec => vec_vals.insert(res),
+                        VecProjKind::Len => len_refs.insert(res),
+                        VecProjKind::Buf => buf_chain.insert(res),
+                    };
+                } else {
+                    return false;
+                }
+            }
+            OpKind::Field { base: v, field, .. } => {
+                if vec_vals.contains(v) && *field == parts.len_field {
+                    len_vals.insert(res);
+                } else if vec_vals.contains(v) && *field == parts.buf_field {
+                    buf_chain.insert(res);
+                } else if buf_chain.contains(v) {
+                    buf_chain.insert(res);
+                } else if str_refs.contains(v) && *field == parts.vec_field {
+                    vec_vals.insert(res);
+                } else {
+                    return false;
+                }
+            }
+            OpKind::Deref(ptr) => {
+                if str_refs.contains(ptr) {
+                    str_refs.insert(res);
+                } else if vec_vals.contains(ptr) {
+                    vec_vals.insert(res);
+                } else if len_refs.contains(ptr) {
+                    len_vals.insert(res);
+                } else if buf_chain.contains(ptr) {
+                    if is_u8_ptr {
+                        data_ptrs.insert(res);
+                    } else {
+                        buf_chain.insert(res);
+                    }
+                } else {
+                    return false;
+                }
+            }
+            OpKind::Cast {
+                kind: CastKind::Transmute | CastKind::PtrToPtr | CastKind::PointerCoercion,
+                v,
+                ..
+            } if is_u8_ptr && (buf_chain.contains(v) || data_ptrs.contains(v)) => {
+                data_ptrs.insert(res);
+            }
+            OpKind::Cast {
+                kind: CastKind::Transmute | CastKind::PtrToPtr | CastKind::PointerCoercion,
+                v,
+                ..
+            } if buf_chain.contains(v) => {
+                buf_chain.insert(res);
+            }
+            OpKind::Intrinsic { name, args, .. }
+                if args.len() == 1
+                    && matches!(
+                        interns.str(*name),
+                        Some("transmute" | "transmute_unchecked")
+                    ) =>
+            {
+                let v = &args[0];
+                if buf_chain.contains(v) || data_ptrs.contains(v) {
+                    if is_u8_ptr {
+                        data_ptrs.insert(res);
+                    } else {
+                        buf_chain.insert(res);
+                    }
+                } else {
+                    return false;
+                }
+            }
+            OpKind::SliceView { ptr, len }
+                if (data_ptrs.contains(ptr) || buf_chain.contains(ptr))
+                    && len_vals.contains(len) =>
+            {
+                slice_vals.insert(res);
+            }
+            OpKind::Call {
+                args,
+                semantic: CallSemantic::Standard(StandardOperation::VecAsSlice),
+                host: None,
+                ..
+            } if args.len() == 1 && vec_vals.contains(&args[0]) => {
+                slice_vals.insert(res);
+            }
+            _ => return false,
+        }
+    }
+    slice_vals.contains(&ret_val)
+}
+
+#[derive(Clone, Copy)]
+enum VecProjKind {
+    Str,
+    Vec,
+    Len,
+    Buf,
+}
+
+fn classify_vec_proj_from_value(
+    src: &ValueId,
+    path: &[Proj],
+    parts: &StringParts,
+    str_refs: &BTreeSet<ValueId>,
+    vec_vals: &BTreeSet<ValueId>,
+    buf_chain: &BTreeSet<ValueId>,
+) -> Option<VecProjKind> {
+    if str_refs.contains(src) {
+        let rest = match path {
+            [] | [Proj::Deref] => return Some(VecProjKind::Str),
+            [Proj::Deref, rest @ ..] => rest,
+            rest => rest,
+        };
+        return classify_vec_subpath(rest, parts);
+    }
+    if vec_vals.contains(src) {
+        let rest = match path {
+            [] | [Proj::Deref] => return Some(VecProjKind::Vec),
+            [Proj::Deref, rest @ ..] => rest,
+            rest => rest,
+        };
+        return match rest {
+            [Proj::Field { field: f, .. }] if *f == parts.len_field => Some(VecProjKind::Len),
+            [Proj::Field { field: f, .. }, tail @ ..]
+                if *f == parts.buf_field
+                    && tail
+                        .iter()
+                        .all(|p| matches!(p, Proj::Field { .. } | Proj::Deref)) =>
+            {
+                Some(VecProjKind::Buf)
+            }
+            _ => None,
+        };
+    }
+    if buf_chain.contains(src)
+        && path
+            .iter()
+            .all(|p| matches!(p, Proj::Field { .. } | Proj::Deref))
+    {
+        return Some(VecProjKind::Buf);
+    }
+    None
+}
+
+fn classify_vec_subpath(rest: &[Proj], parts: &StringParts) -> Option<VecProjKind> {
+    match rest {
+        [Proj::Field { field: f, .. }] if *f == parts.vec_field => Some(VecProjKind::Vec),
+        [Proj::Field { field: f1, .. }, Proj::Field { field: f2, .. }]
+            if *f1 == parts.vec_field && *f2 == parts.len_field =>
+        {
+            Some(VecProjKind::Len)
+        }
+        [Proj::Field { field: f1, .. }, Proj::Field { field: f2, .. }, tail @ ..]
+            if *f1 == parts.vec_field
+                && *f2 == parts.buf_field
+                && tail
+                    .iter()
+                    .all(|p| matches!(p, Proj::Field { .. } | Proj::Deref)) =>
+        {
+            Some(VecProjKind::Buf)
+        }
+        _ => None,
+    }
+}
+
+fn classify_reserve_body<'a, F>(
+    func: &Func,
+    table: &TypeTable,
+    parts: &StringParts,
+    resolve_callee: &mut F,
+) -> Option<BstrStringOp>
+where
+    F: FnMut(ItemId) -> Option<&'a Func>,
+{
+    let (v0, v1) = (func.params[0], func.params[1]);
+    // Form A: single-block wrapper `Vec::reserve(&mut self.vec, additional)` or 1-hop `Vec::reserve_exact`.
+    if func.blocks.len() == 1 {
+        let entry = &func.blocks[0];
+        if let RTerm::Return(None | Some(_)) = entry.term {
+            let mut str_mut = BTreeSet::from([v0]);
+            let mut add_vals = BTreeSet::from([v1]);
+            let mut vec_mut = BTreeSet::new();
+            let mut saw_reserve = false;
+            let mut forwarded_vec_exact: Option<ItemId> = None;
+            let mut form_a_ok = true;
+            for op in &entry.ops {
+                match &op.kind {
+                    OpKind::Copy(s) | OpKind::Move(s) => {
+                        let Some(r) = op.result else {
+                            form_a_ok = false;
+                            break;
+                        };
+                        if str_mut.contains(s) {
+                            str_mut.insert(r);
+                        } else if add_vals.contains(s) {
+                            add_vals.insert(r);
+                        } else if vec_mut.contains(s) {
+                            vec_mut.insert(r);
+                        } else {
+                            form_a_ok = false;
+                            break;
+                        }
+                    }
+                    OpKind::BorrowView {
+                        root: Root::Value(s),
+                        path,
+                        mutable: true,
+                    } if str_mut.contains(s)
+                        && matches!(
+                            path.as_slice(),
+                            [Proj::Deref, Proj::Field { field, .. }] if *field == parts.vec_field
+                        ) =>
+                    {
+                        if let Some(r) = op.result {
+                            vec_mut.insert(r);
+                        } else {
+                            form_a_ok = false;
+                            break;
+                        }
+                    }
+                    OpKind::Call {
+                        args,
+                        semantic: CallSemantic::Standard(StandardOperation::VecReserve),
+                        host: None,
+                        ..
+                    } if args.len() == 2
+                        && vec_mut.contains(&args[0])
+                        && add_vals.contains(&args[1]) =>
+                    {
+                        saw_reserve = true;
+                    }
+                    OpKind::Call {
+                        callee: Callee::Direct { item, .. },
+                        args,
+                        semantic: CallSemantic::Ordinary,
+                        host: None,
+                        ..
+                    } if !saw_reserve
+                        && forwarded_vec_exact.is_none()
+                        && args.len() == 2
+                        && vec_mut.contains(&args[0])
+                        && add_vals.contains(&args[1]) =>
+                    {
+                        forwarded_vec_exact = Some(*item);
+                    }
+                    OpKind::Const(ConstTree::Unit) => {}
+                    _ => {
+                        form_a_ok = false;
+                        break;
+                    }
+                }
+            }
+            if form_a_ok && saw_reserve {
+                return Some(BstrStringOp::Reserve);
+            }
+            if form_a_ok {
+                if let Some(vec_item) = forwarded_vec_exact {
+                    if let Some(vec_func) = resolve_callee(vec_item) {
+                        if vec_func.params.len() == 2
+                            && vec_func.sig.abi.parameters == 2
+                            && !vec_func.sig.abi.caller_location
+                            && vec_func.sig.abi.spread.is_none()
+                            && classify_reserve_raw_inner(vec_func, table, parts, false)
+                        {
+                            return Some(BstrStringOp::ReserveExact);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if classify_reserve_raw_inner(func, table, parts, true) {
+        Some(BstrStringOp::ReserveExact)
+    } else {
+        None
+    }
+}
+
+fn classify_reserve_raw_inner(
+    func: &Func,
+    table: &TypeTable,
+    parts: &StringParts,
+    receiver_is_string: bool,
+) -> bool {
+    // Form B: MIR-inlined `RawVec::reserve_exact` / `reserve` on `(&mut String | &mut Vec<u8>, additional: usize)`.
+    // Soundness invariants:
+    // 1. Receiver is ONLY projected into `vec.len` (read-only!) and `vec.buf` (raw buffer), never
+    //    mutating `vec.len`, creating `&str`/`&[u8]`, pushing, or escaping `&String`/`&mut Vec`.
+    // 2. `additional` (`v1`) enters capacity arithmetic (`Add`/`AddWithOverflow` with `len`, or
+    //    comparison against `cap - len`).
+    // 3. A `&mut RawVec*` call exists (not arbitrary `&mut String`/`&mut Vec` user code).
+    let (v0, v1) = (func.params[0], func.params[1]);
+    let mut recv_refs = BTreeSet::from([v0]);
+    let mut len_refs = BTreeSet::new();
+    let mut len_vals = BTreeSet::new();
+    let mut buf_refs = BTreeSet::new();
+    let mut add_vals = BTreeSet::from([v1]);
+    let mut cap_vals = BTreeSet::new();
+    let mut saw_add_or_sub = false;
+    let mut saw_raw_grow_call = false;
+
+    for block in &func.blocks {
+        for &p in &block.params {
+            let Some(p_ty) = func.ty(p) else { return false };
+            if p_ty == func.sig.arguments[0] {
+                recv_refs.insert(p);
+            } else if !unsigned_bits_opt(table, Some(p_ty))
+                && !table.get(p_ty).is_some_and(|d| {
+                    matches!(d.kind, TypeKind::RawPointer { .. } | TypeKind::Reference { .. })
+                })
+            {
+                return false;
+            }
+        }
+        for op in &block.ops {
+            match &op.kind {
+                OpKind::Copy(s) | OpKind::Move(s) => {
+                    if let Some(r) = op.result {
+                        if recv_refs.contains(s) {
+                            recv_refs.insert(r);
+                        } else if len_refs.contains(s) {
+                            len_refs.insert(r);
+                        } else if len_vals.contains(s) {
+                            len_vals.insert(r);
+                        } else if buf_refs.contains(s) {
+                            buf_refs.insert(r);
+                        } else if add_vals.contains(s) {
+                            add_vals.insert(r);
+                        } else if cap_vals.contains(s) {
+                            cap_vals.insert(r);
+                        }
+                    }
+                }
+                OpKind::BorrowView {
+                    root: Root::Value(s),
+                    path,
+                    mutable,
+                }
+                | OpKind::RawView {
+                    root: Root::Value(s),
+                    path,
+                    mutable,
+                } if recv_refs.contains(s) => {
+                    let Some(r) = op.result else { return false };
+                    let rest = match path.as_slice() {
+                        [] | [Proj::Deref] => {
+                            recv_refs.insert(r);
+                            continue;
+                        }
+                        [Proj::Deref, rest @ ..] => rest,
+                        rest => rest,
+                    };
+                    let vec_tail = if receiver_is_string {
+                        match rest {
+                            [Proj::Field { field: f, .. }, tail @ ..] if *f == parts.vec_field => {
+                                if tail.is_empty() {
+                                    recv_refs.insert(r);
+                                    continue;
+                                }
+                                tail
+                            }
+                            _ => return false,
+                        }
+                    } else {
+                        rest
+                    };
+                    match vec_tail {
+                        [Proj::Field { field: f2, .. }] if *f2 == parts.len_field && !*mutable => {
+                            len_refs.insert(r);
+                        }
+                        [Proj::Field { field: f2, .. }, tail @ ..]
+                            if *f2 == parts.buf_field
+                                && tail
+                                    .iter()
+                                    .all(|p| matches!(p, Proj::Field { .. } | Proj::Deref)) =>
+                        {
+                            buf_refs.insert(r);
+                        }
+                        _ => return false,
+                    }
+                }
+                OpKind::BorrowView {
+                    root: Root::Value(s),
+                    path,
+                    ..
+                }
+                | OpKind::RawView {
+                    root: Root::Value(s),
+                    path,
+                    ..
+                } if buf_refs.contains(s) => {
+                    if !path
+                        .iter()
+                        .all(|p| matches!(p, Proj::Field { .. } | Proj::Deref))
+                    {
+                        return false;
+                    }
+                    if let Some(r) = op.result {
+                        buf_refs.insert(r);
+                    }
+                }
+                OpKind::Field { base: v, .. } if len_refs.contains(v) => return false,
+                OpKind::Field { base: v, .. } if buf_refs.contains(v) => {
+                    if let Some(r) = op.result {
+                        if unsigned_bits_opt(table, func.ty(r)) {
+                            cap_vals.insert(r);
+                        } else {
+                            buf_refs.insert(r);
+                        }
+                    }
+                }
+                OpKind::Deref(ptr) if len_refs.contains(ptr) => {
+                    if let Some(r) = op.result {
+                        len_vals.insert(r);
+                    }
+                }
+                OpKind::Deref(ptr) if buf_refs.contains(ptr) => {
+                    if let Some(r) = op.result {
+                        if unsigned_bits_opt(table, func.ty(r)) {
+                            cap_vals.insert(r);
+                        } else {
+                            buf_refs.insert(r);
+                        }
+                    }
+                }
+                OpKind::StoreThrough { ptr, .. } if len_refs.contains(ptr) => return false,
+                OpKind::Binary {
+                    op: BinaryOp::Add | BinaryOp::AddWithOverflow | BinaryOp::AddUnchecked,
+                    l,
+                    r,
+                    ..
+                } => {
+                    if (len_vals.contains(l) && add_vals.contains(r))
+                        || (len_vals.contains(r) && add_vals.contains(l))
+                    {
+                        saw_add_or_sub = true;
+                    }
+                }
+                OpKind::Binary {
+                    op: BinaryOp::Sub | BinaryOp::SubWithOverflow | BinaryOp::SubUnchecked,
+                    l,
+                    r,
+                    ..
+                } => {
+                    if cap_vals.contains(l) && len_vals.contains(r) {
+                        saw_add_or_sub = true;
+                    }
+                }
+                OpKind::SliceView { .. } => return false,
+                OpKind::Call { args, semantic, .. } => {
+                    if !matches!(semantic, CallSemantic::Ordinary | CallSemantic::GlobalAllocator)
+                    {
+                        return false;
+                    }
+                    if args.iter().any(|a| recv_refs.contains(a) || len_refs.contains(a)) {
+                        return false;
+                    }
+                    if args.iter().any(|a| buf_refs.contains(a)) {
+                        saw_raw_grow_call = true;
+                    }
+                }
+                _ => {
+                    if op
+                        .kind
+                        .uses()
+                        .iter()
+                        .any(|u| recv_refs.contains(u) || len_refs.contains(u))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    saw_add_or_sub && saw_raw_grow_call
+}
+
+fn unsigned_bits_opt(table: &TypeTable, ty: Option<TypeId>) -> bool {
+    ty.and_then(|t| table.get(table.peeled(t)))
+        .is_some_and(|d| unsigned_bits(d).is_ok())
+}
+
+// ============================================================================================
+// Closed Inlined `String.vec` Analysis (`valueflow` + `representation` + `emit` + `mod`)
+// ============================================================================================
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) enum StringRoot {
+    Value(ValueId),
+    Cell(CellId),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct InlinedVecCluster {
+    pub(crate) root: StringRoot,
+    pub(crate) root_is_ref: bool,
+    pub(crate) str_ty: TypeId,
+    /// ONLY internal intermediates (`VecRef`, `LenRef`, `BufChain`, `DataPtr`) — never `usize` or
+    /// `&[u8]` leaves — so `commit_func` never leaks non-Baseline carriers across edges.
+    pub(crate) witness_values: Vec<ValueId>,
+    /// Internal intermediate value results whose baseline `.vec`/`.buf` ops are bypassed in `emit`.
+    pub(crate) internal_values: BTreeSet<ValueId>,
+    /// `usize` SSA values producing `(*root).vec.len`.
+    pub(crate) len_values: BTreeSet<ValueId>,
+    /// `Call(Standard(VecReserve), [vec_mut, additional])` `(block_idx, op_idx)` -> `additional`.
+    pub(crate) reserve_calls: BTreeMap<(usize, usize), ValueId>,
+    /// `SliceView` / `Call(Standard(VecDeref))` SSA values producing `&[u8]` (`as_bytes`).
+    pub(crate) slice_values: BTreeSet<ValueId>,
+    pub(crate) is_mut: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InlinedStringVecAnalysis {
+    pub(crate) clusters: Vec<InlinedVecCluster>,
+    pub(crate) op_cluster: BTreeMap<(usize, usize), usize>,
+    pub(crate) value_cluster: BTreeMap<ValueId, usize>,
+}
+
+struct VecUf {
+    parent: Vec<usize>,
+}
+
+impl VecUf {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+        }
+    }
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]];
+            x = self.parent[x];
+        }
+        x
+    }
+    fn union(&mut self, a: usize, b: usize) {
+        let ra = self.find(a);
+        let rb = self.find(b);
+        if ra != rb {
+            self.parent[rb] = ra;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InlNodeKind {
+    VecRef,
+    LenRef,
+    LenVal,
+    BufChain,
+    DataPtr,
+    SliceVal,
+}
+
+fn canonical_string_root(
+    func: &Func,
+    table: &TypeTable,
+    start: Root,
+) -> Option<(StringRoot, bool, TypeId)> {
+    let mut cur = start;
+    let mut seen = BTreeSet::new();
+    for _ in 0..=func.values.len() {
+        match cur {
+            Root::Cell(c) => {
+                let ty = func.cells.get(c.0 as usize)?.ty;
+                return is_global_string_ty(table, ty).then_some((StringRoot::Cell(c), false, ty));
+            }
+            Root::Value(v) => {
+                if !seen.insert(v) {
+                    return None;
+                }
+                let ty = func.ty(v)?;
+                let peeled = table.get(table.peeled(ty))?;
+                match &peeled.kind {
+                    _ if is_global_string_ty(table, ty) => {
+                        return Some((StringRoot::Value(v), false, ty));
+                    }
+                    TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. }
+                        if is_global_string_ty(table, *pointee) =>
+                    {
+                        let mut next = None;
+                        for block in &func.blocks {
+                            for op in &block.ops {
+                                if op.result == Some(v) {
+                                    match &op.kind {
+                                        OpKind::Copy(s) | OpKind::Move(s) => {
+                                            next = Some(Root::Value(*s));
+                                        }
+                                        OpKind::BorrowView { root, path, .. }
+                                        | OpKind::RawView { root, path, .. }
+                                            if path.is_empty()
+                                                || path.as_slice() == [Proj::Deref] =>
+                                        {
+                                            next = Some(*root);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(n) = next {
+                            cur = n;
+                            continue;
+                        }
+                        return Some((StringRoot::Value(v), true, *pointee));
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Identifies closed MIR-inlined `String.vec` operations (`len`/`is_empty`, `reserve`, `as_bytes`)
+/// inside any function, strictly gated behind `crate::lower::bstr::enabled()`.
+/// Disqualifies any component whose intermediate values escape outside the whitelist.
+pub(crate) fn analyze_inlined_string_vec(
+    func: &Func,
+    table: &TypeTable,
+    interns: &Interns,
+) -> Option<InlinedStringVecAnalysis> {
+    if !crate::lower::bstr::enabled() || func.values.is_empty() {
+        return None;
+    }
+    let n = func.values.len();
+    let mut uf = VecUf::new(n);
+    let mut node_kind: Vec<Option<InlNodeKind>> = vec![None; n];
+    let mut node_root: Vec<Option<(StringRoot, bool, TypeId)>> = vec![None; n];
+    let mut poisoned = vec![false; n];
+    let mut is_mut_node = vec![false; n];
+    let mut valid_def = vec![false; n];
+    let mut op_of_res: Vec<Option<(usize, usize)>> = vec![None; n];
+    let mut reserve_site: Vec<Option<(usize, usize, ValueId)>> = vec![None; n];
+
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (oi, op) in block.ops.iter().enumerate() {
+            if let Some(res) = op.result {
+                op_of_res[res.0 as usize] = Some((bi, oi));
+            }
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &func.blocks {
+            for op in &block.ops {
+                let Some(res) = op.result else { continue };
+                let r = res.0 as usize;
+                if node_kind[r].is_some() {
+                    continue;
+                }
+                match &op.kind {
+                    OpKind::BorrowView { root, path, mutable }
+                    | OpKind::RawView { root, path, mutable } => {
+                        if let Some((s_root, is_ref, str_ty)) =
+                            canonical_string_root(func, table, *root)
+                        {
+                            if let Some(parts) = string_parts(table, interns, str_ty) {
+                                let rest = if is_ref {
+                                    match path.as_slice() {
+                                        [Proj::Deref, tail @ ..] => tail,
+                                        tail => tail,
+                                    }
+                                } else {
+                                    path.as_slice()
+                                };
+                                if let Some(pk) = classify_vec_subpath(rest, &parts) {
+                                    let nk = match pk {
+                                        VecProjKind::Str => continue,
+                                        VecProjKind::Vec => InlNodeKind::VecRef,
+                                        VecProjKind::Len => InlNodeKind::LenRef,
+                                        VecProjKind::Buf => InlNodeKind::BufChain,
+                                    };
+                                    node_kind[r] = Some(nk);
+                                    node_root[r] = Some((s_root, is_ref, str_ty));
+                                    valid_def[r] = true;
+                                    if *mutable {
+                                        is_mut_node[r] = true;
+                                    }
+                                    changed = true;
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Root::Value(src) = root {
+                            if let Some(src_k) = node_kind[src.0 as usize] {
+                                let s = src.0 as usize;
+                                let (_, _, str_ty) = node_root[s].unwrap();
+                                let parts = string_parts(table, interns, str_ty).unwrap();
+                                let nk = match (src_k, path.as_slice()) {
+                                    (InlNodeKind::VecRef, [] | [Proj::Deref]) => {
+                                        Some(InlNodeKind::VecRef)
+                                    }
+                                    (
+                                        InlNodeKind::VecRef,
+                                        [Proj::Field { field: f, .. }]
+                                        | [Proj::Deref, Proj::Field { field: f, .. }],
+                                    ) if *f == parts.len_field => Some(InlNodeKind::LenRef),
+                                    (
+                                        InlNodeKind::VecRef,
+                                        [Proj::Field { field: f, .. }, tail @ ..]
+                                        | [Proj::Deref, Proj::Field { field: f, .. }, tail @ ..],
+                                    ) if *f == parts.buf_field
+                                        && tail
+                                            .iter()
+                                            .all(|p| matches!(p, Proj::Field { .. } | Proj::Deref)) =>
+                                    {
+                                        Some(InlNodeKind::BufChain)
+                                    }
+                                    (InlNodeKind::BufChain, p)
+                                        if p.iter()
+                                            .all(|p| matches!(p, Proj::Field { .. } | Proj::Deref)) =>
+                                    {
+                                        Some(InlNodeKind::BufChain)
+                                    }
+                                    (InlNodeKind::SliceVal, [Proj::Deref]) => {
+                                        Some(InlNodeKind::SliceVal)
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(nk) = nk {
+                                    uf.union(s, r);
+                                    node_kind[r] = Some(nk);
+                                    node_root[r] = node_root[s];
+                                    valid_def[r] = true;
+                                    if *mutable {
+                                        is_mut_node[r] = true;
+                                    }
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    OpKind::Field { base: v, field, .. } => {
+                        let s = v.0 as usize;
+                        if let Some((s_root, is_ref, str_ty)) =
+                            canonical_string_root(func, table, Root::Value(*v))
+                        {
+                            if !is_ref
+                                && string_parts(table, interns, str_ty)
+                                    .is_some_and(|p| p.vec_field == *field)
+                            {
+                                node_kind[r] = Some(InlNodeKind::VecRef);
+                                node_root[r] = Some((s_root, false, str_ty));
+                                valid_def[r] = true;
+                                changed = true;
+                                continue;
+                            }
+                        }
+                        if let Some(src_k) = node_kind[s] {
+                            let (_, _, str_ty) = node_root[s].unwrap();
+                            let parts = string_parts(table, interns, str_ty).unwrap();
+                            let nk = match src_k {
+                                InlNodeKind::VecRef if *field == parts.len_field => {
+                                    Some(InlNodeKind::LenVal)
+                                }
+                                InlNodeKind::VecRef if *field == parts.buf_field => {
+                                    Some(InlNodeKind::BufChain)
+                                }
+                                InlNodeKind::BufChain => Some(InlNodeKind::BufChain),
+                                _ => None,
+                            };
+                            if let Some(nk) = nk {
+                                uf.union(s, r);
+                                node_kind[r] = Some(nk);
+                                node_root[r] = node_root[s];
+                                valid_def[r] = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                    OpKind::Deref(ptr) => {
+                        let s = ptr.0 as usize;
+                        if let Some(src_k) = node_kind[s] {
+                            let nk = match src_k {
+                                InlNodeKind::LenRef => Some(InlNodeKind::LenVal),
+                                InlNodeKind::VecRef => Some(InlNodeKind::VecRef),
+                                InlNodeKind::BufChain => {
+                                    let is_u8_ptr = func.ty(res).is_some_and(|ty| {
+                                        matches!(
+                                            table.get(table.peeled(ty)).map(|d| &d.kind),
+                                            Some(TypeKind::RawPointer {
+                                                pointee,
+                                                mutable: false,
+                                            }) if table.byte_element(*pointee)
+                                        )
+                                    });
+                                    Some(if is_u8_ptr {
+                                        InlNodeKind::DataPtr
+                                    } else {
+                                        InlNodeKind::BufChain
+                                    })
+                                }
+                                _ => None,
+                            };
+                            if let Some(nk) = nk {
+                                uf.union(s, r);
+                                node_kind[r] = Some(nk);
+                                node_root[r] = node_root[s];
+                                valid_def[r] = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                    OpKind::Copy(src) | OpKind::Move(src) => {
+                        let s = src.0 as usize;
+                        if let Some(src_k) = node_kind[s] {
+                            if src_k != InlNodeKind::LenVal && src_k != InlNodeKind::SliceVal {
+                                uf.union(s, r);
+                                node_kind[r] = Some(src_k);
+                                node_root[r] = node_root[s];
+                                valid_def[r] = true;
+                                changed = true;
+                            }
+                        }
+                    }
+                    OpKind::Cast {
+                        kind: CastKind::Transmute | CastKind::PtrToPtr | CastKind::PointerCoercion,
+                        v,
+                        ..
+                    } => {
+                        let s = v.0 as usize;
+                        if matches!(
+                            node_kind[s],
+                            Some(InlNodeKind::BufChain | InlNodeKind::DataPtr)
+                        ) {
+                            let is_u8_ptr = func.ty(res).is_some_and(|ty| {
+                                matches!(
+                                    table.get(table.peeled(ty)).map(|d| &d.kind),
+                                    Some(TypeKind::RawPointer {
+                                        pointee,
+                                        mutable: false,
+                                    }) if table.byte_element(*pointee)
+                                )
+                            });
+                            let nk = if is_u8_ptr {
+                                InlNodeKind::DataPtr
+                            } else {
+                                InlNodeKind::BufChain
+                            };
+                            uf.union(s, r);
+                            node_kind[r] = Some(nk);
+                            node_root[r] = node_root[s];
+                            valid_def[r] = true;
+                            changed = true;
+                        }
+                    }
+                    OpKind::Intrinsic { name, args, .. }
+                        if args.len() == 1
+                            && matches!(
+                                interns.str(*name),
+                                Some("transmute" | "transmute_unchecked")
+                            ) =>
+                    {
+                        let s = args[0].0 as usize;
+                        if matches!(
+                            node_kind[s],
+                            Some(InlNodeKind::BufChain | InlNodeKind::DataPtr)
+                        ) {
+                            let is_u8_ptr = func.ty(res).is_some_and(|ty| {
+                                matches!(
+                                    table.get(table.peeled(ty)).map(|d| &d.kind),
+                                    Some(TypeKind::RawPointer {
+                                        pointee,
+                                        mutable: false,
+                                    }) if table.byte_element(*pointee)
+                                )
+                            });
+                            let nk = if is_u8_ptr {
+                                InlNodeKind::DataPtr
+                            } else {
+                                InlNodeKind::BufChain
+                            };
+                            uf.union(s, r);
+                            node_kind[r] = Some(nk);
+                            node_root[r] = node_root[s];
+                            valid_def[r] = true;
+                            changed = true;
+                        }
+                    }
+                    OpKind::SliceView { ptr, len } => {
+                        let p = ptr.0 as usize;
+                        let l = len.0 as usize;
+                        if matches!(
+                            node_kind[p],
+                            Some(InlNodeKind::DataPtr | InlNodeKind::BufChain)
+                        ) && node_kind[l] == Some(InlNodeKind::LenVal)
+                            && node_root[p].map(|x| x.0) == node_root[l].map(|x| x.0)
+                        {
+                            uf.union(p, r);
+                            uf.union(l, r);
+                            node_kind[r] = Some(InlNodeKind::SliceVal);
+                            node_root[r] = node_root[p];
+                            valid_def[r] = true;
+                            changed = true;
+                        }
+                    }
+                    OpKind::Call {
+                        args,
+                        semantic: CallSemantic::Standard(StandardOperation::VecLen),
+                        host: None,
+                        ..
+                    } if args.len() == 1
+                        && node_kind[args[0].0 as usize] == Some(InlNodeKind::VecRef) =>
+                    {
+                        let s = args[0].0 as usize;
+                        uf.union(s, r);
+                        node_kind[r] = Some(InlNodeKind::LenVal);
+                        node_root[r] = node_root[s];
+                        valid_def[r] = true;
+                        changed = true;
+                    }
+                    OpKind::Call {
+                        args,
+                        semantic: CallSemantic::Standard(StandardOperation::VecAsSlice),
+                        host: None,
+                        ..
+                    } if args.len() == 1
+                        && node_kind[args[0].0 as usize] == Some(InlNodeKind::VecRef) =>
+                    {
+                        let s = args[0].0 as usize;
+                        uf.union(s, r);
+                        node_kind[r] = Some(InlNodeKind::SliceVal);
+                        node_root[r] = node_root[s];
+                        valid_def[r] = true;
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if node_kind.iter().all(Option::is_none) {
+        return None;
+    }
+
+    // Pass 2: verify every use of every internal node strictly stays in the whitelist.
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (oi, op) in block.ops.iter().enumerate() {
+            if let OpKind::Call {
+                args,
+                semantic: CallSemantic::Standard(StandardOperation::VecReserve),
+                host: None,
+                ..
+            } = &op.kind
+            {
+                if args.len() == 2
+                    && node_kind[args[0].0 as usize] == Some(InlNodeKind::VecRef)
+                    && node_kind[args[1].0 as usize].is_none()
+                {
+                    let v0 = args[0].0 as usize;
+                    reserve_site[v0] = Some((bi, oi, args[1]));
+                    is_mut_node[v0] = true;
+                    continue;
+                }
+            }
+
+            let op_is_valid_consumer = op.result.is_some_and(|r| valid_def[r.0 as usize]);
+            for u in op.kind.uses() {
+                let ui = u.0 as usize;
+                let Some(nk) = node_kind[ui] else { continue };
+                if matches!(nk, InlNodeKind::LenVal | InlNodeKind::SliceVal) {
+                    continue;
+                }
+                if !op_is_valid_consumer {
+                    poisoned[ui] = true;
+                }
+            }
+        }
+        for u in block.term.uses() {
+            let ui = u.0 as usize;
+            if let Some(nk) = node_kind[ui] {
+                if !matches!(nk, InlNodeKind::LenVal | InlNodeKind::SliceVal) {
+                    poisoned[ui] = true;
+                }
+            }
+        }
+    }
+
+    let mut comp_poisoned: BTreeMap<usize, bool> = BTreeMap::new();
+    let mut comp_members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for v in 0..n {
+        if node_kind[v].is_none() {
+            continue;
+        }
+        let root_id = uf.find(v);
+        comp_members.entry(root_id).or_default().push(v);
+        if poisoned[v] {
+            comp_poisoned.insert(root_id, true);
+        }
+    }
+
+    let mut out = InlinedStringVecAnalysis::default();
+    for (root_id, members) in comp_members {
+        if *comp_poisoned.get(&root_id).unwrap_or(&false) {
+            continue;
+        }
+        let mut s_root = None;
+        let mut root_is_ref = false;
+        let mut str_ty = None;
+        let mut mixed = false;
+        let mut has_mut = false;
+        for &m in &members {
+            if let Some((sr, ir, ty)) = node_root[m] {
+                if s_root.is_none() {
+                    s_root = Some(sr);
+                    root_is_ref = ir;
+                    str_ty = Some(ty);
+                } else if s_root != Some(sr) {
+                    mixed = true;
+                }
+                if ir {
+                    root_is_ref = true;
+                }
+            }
+            if is_mut_node[m] {
+                has_mut = true;
+            }
+        }
+        if mixed {
+            continue;
+        }
+        let (Some(root), Some(str_ty)) = (s_root, str_ty) else {
+            continue;
+        };
+        let mut witness_values = Vec::new();
+        let mut internal_values = BTreeSet::new();
+        let mut len_values = BTreeSet::new();
+        let mut slice_values = BTreeSet::new();
+        let mut reserve_calls = BTreeMap::new();
+        let cid = out.clusters.len();
+
+        for &m in &members {
+            let vid = ValueId(m as u32);
+            out.value_cluster.insert(vid, cid);
+            if let Some(pos) = op_of_res[m] {
+                out.op_cluster.insert(pos, cid);
+            }
+            if let Some((bi, oi, add)) = reserve_site[m] {
+                reserve_calls.insert((bi, oi), add);
+                out.op_cluster.insert((bi, oi), cid);
+            }
+            match node_kind[m].unwrap() {
+                InlNodeKind::LenVal => {
+                    len_values.insert(vid);
+                }
+                InlNodeKind::SliceVal => {
+                    slice_values.insert(vid);
+                }
+                _ => {
+                    internal_values.insert(vid);
+                    witness_values.push(vid);
+                }
+            }
+        }
+        out.clusters.push(InlinedVecCluster {
+            root,
+            root_is_ref,
+            str_ty,
+            witness_values,
+            internal_values,
+            len_values,
+            reserve_calls,
+            slice_values,
+            is_mut: has_mut,
+        });
+    }
+
+    (!out.clusters.is_empty()).then_some(out)
+}
+
+#[cfg(test)]
+mod bstr_tests {
+    use super::*;
+    use crate::jir::interns::Interns;
+    use crate::jir::repr::{FuncBuilder, OpKind, Proj, RTerm, Root};
+    use crate::jir::semantic::{
+        AbiSignature, BinaryOp, BodySemantic, CallSemantic, Callee, CastKind, ConstTree,
+        DefinitionId, ItemId, Signature,
+    };
+    use crate::jir::types::{
+        AllocatorIdentity, FieldDescriptor, FieldKey, IntFacts, IntRepr, JsFacts, LayoutFacts,
+        NominalAbi, NominalForm, PinnedBoundary, PointerForm, RepresentationCandidate,
+        TypeDescriptor, TypeId, TypeKind, TypeMeta, TypeTable, VariantDescriptor,
+    };
+    use crate::lower::plan::NO_ORIGIN;
+
+    const UNIT: TypeId = TypeId(1);
+    const BOOL: TypeId = TypeId(2);
+    const U8: TypeId = TypeId(3);
+    const USIZE: TypeId = TypeId(4);
+    const STR: TypeId = TypeId(5);
+    const STR_REF: TypeId = TypeId(6);
+    const SLICE_U8: TypeId = TypeId(7);
+    const REF_SLICE_U8: TypeId = TypeId(8);
+    const RAW_U8: TypeId = TypeId(9);
+    const UNIQUE_U8: TypeId = TypeId(10);
+    const CAP: TypeId = TypeId(11);
+    const ALLOC_ZST: TypeId = TypeId(12);
+    const MARKER_ZST: TypeId = TypeId(13);
+    const RAW_VEC_INNER: TypeId = TypeId(14);
+    const RAW_VEC: TypeId = TypeId(15);
+    const VEC_U8: TypeId = TypeId(16);
+    const VEC_U8_REF: TypeId = TypeId(17);
+    const VEC_U8_MUT: TypeId = TypeId(18);
+    const STRING: TypeId = TypeId(19);
+    const STRING_REF: TypeId = TypeId(20);
+    const STRING_MUT: TypeId = TypeId(21);
+    const LEN_REF: TypeId = TypeId(22);
+    const BUF_REF: TypeId = TypeId(23);
+    const PTR_U8_REF: TypeId = TypeId(24);
+    const PTR_U8: TypeId = TypeId(25);
+    const STR_REF_MUT_NONE: TypeId = SLICE_U8;
+
+    fn def(n: u64) -> DefinitionId {
+        DefinitionId {
+            crate_id: 1,
+            local_hash: n,
+        }
+    }
+
+    fn item(n: u64) -> ItemId {
+        ItemId {
+            definition: def(n),
+            instantiation: n as u128,
+        }
+    }
+
+    fn desc(id: TypeId, kind: TypeKind, size: u64) -> TypeDescriptor {
+        let sized = !matches!(kind, TypeKind::Str | TypeKind::Slice(_));
+        let zst = sized && size == 0;
+        TypeDescriptor {
+            id,
+            name: None,
+            kind,
+            layout: LayoutFacts {
+                size: sized.then_some(size),
+                unsized_prefix: None,
+                align: Some(size.clamp(1, 4)),
+                sized,
+                zst,
+                one_zst: zst,
+                needs_drop: false,
+                has_own_drop: false,
+            },
+            meta: TypeMeta {
+                candidate: RepresentationCandidate::None,
+                abi: NominalAbi::Rust,
+                boundary: PinnedBoundary::None,
+                allocator: AllocatorIdentity::NotApplicable,
+                iterator: crate::jir::types::IteratorIdentity::None,
+            },
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: id,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        }
+    }
+
+    fn int_desc(id: TypeId, signed: bool, bits: u32) -> TypeDescriptor {
+        let mut d = desc(id, TypeKind::Integer { signed, bits }, u64::from(bits / 8));
+        d.js.int = Some(IntFacts {
+            signed,
+            bits,
+            repr: IntRepr::Number,
+        });
+        d.js.byte_element = bits == 8 && !signed;
+        d
+    }
+
+    fn ref_desc(id: TypeId, pointee: TypeId, mutable: bool, form: PointerForm) -> TypeDescriptor {
+        let mut d = desc(id, TypeKind::Reference { pointee, mutable }, 4);
+        d.js.pointer_form = Some(form);
+        d
+    }
+
+    fn field(interns: &mut Interns, name: &str, ty: TypeId) -> FieldDescriptor {
+        FieldDescriptor {
+            key: FieldKey::Name(interns.intern_str(name)),
+            ty,
+            offset: 0,
+        }
+    }
+
+    fn strukt(
+        interns: &mut Interns,
+        id: TypeId,
+        name: &str,
+        fields: Vec<FieldDescriptor>,
+        args: Vec<TypeId>,
+        size: u64,
+    ) -> TypeDescriptor {
+        let variant = VariantDescriptor {
+            name: interns.intern_str(name),
+            fields,
+            logical_discr: 0,
+            physical_tag: None,
+            result_ok: false,
+            saved_local_keys: Vec::new(),
+        };
+        let mut d = desc(
+            id,
+            TypeKind::Adt {
+                def: def(id.0 as u64),
+                args,
+                form: NominalForm::Struct,
+                variants: vec![variant],
+                niche: None,
+            },
+            size,
+        );
+        d.js.is_indirect = true;
+        d
+    }
+
+    fn build_table() -> (TypeTable, Interns) {
+        let mut interns = Interns::new();
+        let mut table = TypeTable::new();
+        let put = |d: TypeDescriptor, t: &mut TypeTable| {
+            interns.intern_type(d.clone());
+            assert!(t.insert(d));
+        };
+        let _ = STR_REF_MUT_NONE;
+
+        // Helper closure without capturing mutable `interns` twice:
+        let add = |t: &mut TypeTable, i: &mut Interns, d: TypeDescriptor| {
+            i.intern_type(d.clone());
+            assert!(t.insert(d));
+        };
+        let _ = put;
+
+        add(&mut table, &mut interns, desc(UNIT, TypeKind::Tuple(Vec::new()), 0));
+        add(&mut table, &mut interns, desc(BOOL, TypeKind::Bool, 1));
+        add(&mut table, &mut interns, int_desc(U8, false, 8));
+        add(&mut table, &mut interns, int_desc(USIZE, false, 32));
+        add(&mut table, &mut interns, desc(STR, TypeKind::Str, 0));
+        add(&mut table, &mut interns, ref_desc(STR_REF, STR, false, PointerForm::Str));
+        add(&mut table, &mut interns, desc(SLICE_U8, TypeKind::Slice(U8), 0));
+        add(&mut table, &mut interns, ref_desc(REF_SLICE_U8, SLICE_U8, false, PointerForm::FatSlice));
+        let mut raw_ptr = desc(RAW_U8, TypeKind::RawPointer { pointee: U8, mutable: false }, 4);
+        raw_ptr.js.pointer_form = Some(PointerForm::Slot);
+        add(&mut table, &mut interns, raw_ptr);
+        let mut ptr_u8 = desc(PTR_U8, TypeKind::RawPointer { pointee: U8, mutable: false }, 4);
+        ptr_u8.js.pointer_form = Some(PointerForm::Slot);
+        add(&mut table, &mut interns, ptr_u8);
+        add(&mut table, &mut interns, ref_desc(LEN_REF, USIZE, false, PointerForm::Slot));
+        add(&mut table, &mut interns, ref_desc(PTR_U8_REF, U8, false, PointerForm::Slot));
+
+        let mut unique = strukt(&mut interns, UNIQUE_U8, "Unique", Vec::new(), Vec::new(), 4);
+        unique.js.peeled = RAW_U8;
+        add(&mut table, &mut interns, unique);
+        let mut cap = strukt(&mut interns, CAP, "Cap", Vec::new(), Vec::new(), 4);
+        cap.js.peeled = USIZE;
+        add(&mut table, &mut interns, cap);
+        let d = strukt(&mut interns, ALLOC_ZST, "Global", Vec::new(), Vec::new(), 0);
+        add(&mut table, &mut interns, d);
+        let d = strukt(&mut interns, MARKER_ZST, "PhantomData", Vec::new(), Vec::new(), 0);
+        add(&mut table, &mut interns, d);
+
+        let inner_fields = vec![
+            field(&mut interns, "ptr", UNIQUE_U8),
+            field(&mut interns, "cap", CAP),
+            field(&mut interns, "alloc", ALLOC_ZST),
+        ];
+        let d = strukt(&mut interns, RAW_VEC_INNER, "RawVecInner", inner_fields, Vec::new(), 8);
+        add(&mut table, &mut interns, d);
+        let raw_fields = vec![
+            field(&mut interns, "inner", RAW_VEC_INNER),
+            field(&mut interns, "_marker", MARKER_ZST),
+        ];
+        let d = strukt(&mut interns, RAW_VEC, "RawVec", raw_fields, Vec::new(), 8);
+        add(&mut table, &mut interns, d);
+        add(&mut table, &mut interns, ref_desc(BUF_REF, RAW_VEC, true, PointerForm::Slot));
+
+        let vec_fields = vec![
+            field(&mut interns, "buf", RAW_VEC),
+            field(&mut interns, "len", USIZE),
+        ];
+        let mut vec_u8 = strukt(&mut interns, VEC_U8, "Vec", vec_fields, vec![U8, ALLOC_ZST], 12);
+        vec_u8.meta.candidate = RepresentationCandidate::Vec;
+        vec_u8.meta.allocator = AllocatorIdentity::Global;
+        add(&mut table, &mut interns, vec_u8);
+        add(&mut table, &mut interns, ref_desc(VEC_U8_REF, VEC_U8, false, PointerForm::Slot));
+        add(&mut table, &mut interns, ref_desc(VEC_U8_MUT, VEC_U8, true, PointerForm::Slot));
+
+        let str_fields = vec![field(&mut interns, "vec", VEC_U8)];
+        let mut string = strukt(&mut interns, STRING, "String", str_fields, Vec::new(), 12);
+        string.meta.candidate = RepresentationCandidate::String;
+        string.meta.allocator = AllocatorIdentity::Global;
+        add(&mut table, &mut interns, string);
+        add(&mut table, &mut interns, ref_desc(STRING_REF, STRING, false, PointerForm::Slot));
+        add(&mut table, &mut interns, ref_desc(STRING_MUT, STRING, true, PointerForm::Slot));
+
+        (table, interns)
+    }
+
+    fn sig(arguments: Vec<TypeId>, result: TypeId) -> Signature {
+        Signature {
+            abi: AbiSignature {
+                parameters: u16::try_from(arguments.len()).unwrap(),
+                spread: None,
+                caller_location: false,
+                inline_never: false,
+            },
+            arguments,
+            result,
+        }
+    }
+
+    fn bstr_cx<'a>(
+        sig: &'a Signature,
+        table: &'a TypeTable,
+        interns: &'a Interns,
+    ) -> LowerCx<'a> {
+        LowerCx {
+            semantic: BodySemantic::Ordinary,
+            sig,
+            table,
+            interns,
+            element_glue: None,
+        }
+    }
+
+    #[test]
+    fn bstr_disabled_gate_blocks_all_entry_points() {
+        let (table, interns) = build_table();
+        let sig_is_empty = sig(vec![STRING_REF], BOOL);
+        let mut b = FuncBuilder::new(item(1), sig_is_empty.clone());
+        let _p = b.param(STRING_REF, NO_ORIGIN);
+        let zero = b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+            USIZE,
+            NO_ORIGIN,
+        );
+        b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(zero)));
+        let f_empty = b.finish();
+
+        let mut bs = FuncBuilder::new(item(2), sig(vec![STR_REF], REF_SLICE_U8));
+        let ps = bs.param(STR_REF, NO_ORIGIN);
+        let cast = bs.op(
+            FuncBuilder::ENTRY,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: ps,
+                from: STR_REF,
+                to: REF_SLICE_U8,
+            },
+            REF_SLICE_U8,
+            NO_ORIGIN,
+        );
+        bs.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(cast)));
+        let f_str_as_bytes = bs.finish();
+
+        assert!(!is_trivial_str_as_bytes(
+            BodySemantic::Ordinary,
+            &f_str_as_bytes,
+            &table,
+            &interns
+        ));
+        assert_eq!(
+            classify_bstr_op(BodySemantic::Ordinary, &f_empty, &table, &interns, |_| None),
+            None
+        );
+        let cx = bstr_cx(&sig_is_empty, &table, &interns);
+        assert!(lower_bstr_op(BstrStringOp::IsEmpty, &cx, &[Carrier::HostString]).is_err());
+        assert!(analyze_inlined_string_vec(&f_empty, &table, &interns).is_none());
+    }
+
+    #[test]
+    fn bstr_classify_and_lower_is_empty() {
+        let (table, interns) = build_table();
+        let parts = string_parts(&table, &interns, STRING).expect("canonical String parts");
+
+        let s = sig(vec![STRING_REF], BOOL);
+        let mut b = FuncBuilder::new(item(10), s.clone());
+        let p = b.param(STRING_REF, NO_ORIGIN);
+        let e = FuncBuilder::ENTRY;
+        let len_ref = b.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Value(p),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                    Proj::Field {
+                        field: parts.len_field,
+                        ty: USIZE,
+                    },
+                ],
+                mutable: false,
+            },
+            LEN_REF,
+            NO_ORIGIN,
+        );
+        let len_val = b.op(e, OpKind::Deref(len_ref), USIZE, NO_ORIGIN);
+        let zero = b.op(
+            e,
+            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+            USIZE,
+            NO_ORIGIN,
+        );
+        let is_zero = b.op(
+            e,
+            OpKind::Binary {
+                op: BinaryOp::Eq,
+                l: len_val,
+                r: zero,
+                ty: BOOL,
+            },
+            BOOL,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(is_zero)));
+        let func = b.finish();
+        assert!(classify_is_empty_body(&func, &parts));
+
+        // Negative: Ne is not `is_empty`.
+        let mut bad = FuncBuilder::new(item(11), s.clone());
+        let p2 = bad.param(STRING_REF, NO_ORIGIN);
+        let e2 = FuncBuilder::ENTRY;
+        let lr2 = bad.op(
+            e2,
+            OpKind::BorrowView {
+                root: Root::Value(p2),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                    Proj::Field {
+                        field: parts.len_field,
+                        ty: USIZE,
+                    },
+                ],
+                mutable: false,
+            },
+            LEN_REF,
+            NO_ORIGIN,
+        );
+        let lv2 = bad.op(e2, OpKind::Deref(lr2), USIZE, NO_ORIGIN);
+        let z2 = bad.op(
+            e2,
+            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+            USIZE,
+            NO_ORIGIN,
+        );
+        let ne = bad.op(
+            e2,
+            OpKind::Binary {
+                op: BinaryOp::Ne,
+                l: lv2,
+                r: z2,
+                ty: BOOL,
+            },
+            BOOL,
+            NO_ORIGIN,
+        );
+        bad.terminate(e2, RTerm::Return(Some(ne)));
+        assert!(!classify_is_empty_body(&bad.finish(), &parts));
+
+        let cx = bstr_cx(&s, &table, &interns);
+        assert!(legality_is_empty(&cx).is_ok());
+
+        for (carrier, expected_substr) in [
+            (Carrier::HostString, "$native0.length === 0"),
+            (Carrier::StringBuilder, "$native0.text.length === 0"),
+        ] {
+            let mut helpers = BTreeSet::new();
+            let mut refs = BTreeSet::new();
+            let stmts = string_is_empty(&cx, Some(carrier), &mut helpers, &mut refs)
+                .expect("is_empty lowers");
+            let printed = jsast::stmt_to_string(&jsast::function(
+                "f",
+                vec!["$native0".to_owned()],
+                stmts,
+            ));
+            assert!(printed.contains(expected_substr), "{printed}");
+            assert!(helpers.is_empty(), "{helpers:?}");
+        }
+    }
+
+    #[test]
+    fn bstr_classify_and_lower_reserve_and_exact() {
+        let (table, interns) = build_table();
+        let parts = string_parts(&table, &interns, STRING).expect("canonical String parts");
+        // Form A (`VecReserve` semantic call) AND inlined `RawVec` reserve on `&mut self`.
+        let s_res = sig(vec![STRING_MUT, USIZE], UNIT);
+        let mut b_vec = FuncBuilder::new(item(19), s_res.clone());
+        let pv = b_vec.param(STRING_MUT, NO_ORIGIN);
+        let addv = b_vec.param(USIZE, NO_ORIGIN);
+        let ev = FuncBuilder::ENTRY;
+        let vec_ref_v = b_vec.op(
+            ev,
+            OpKind::BorrowView {
+                root: Root::Value(pv),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                ],
+                mutable: true,
+            },
+            VEC_U8_MUT,
+            NO_ORIGIN,
+        );
+        b_vec.effect(
+            ev,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(899),
+                    link_name: crate::jir::interns::StrId(0),
+                },
+                function: None,
+                args: vec![vec_ref_v, addv],
+                track_caller: None,
+                semantic: CallSemantic::Standard(StandardOperation::VecReserve),
+                host: None,
+            },
+            NO_ORIGIN,
+        );
+        b_vec.terminate(ev, RTerm::Return(None));
+        assert_eq!(
+            classify_reserve_body(&b_vec.finish(), &table, &parts, &mut |_| None),
+            Some(BstrStringOp::Reserve)
+        );
+
+        // Inlined `RawVec` grow inside `String::reserve_exact` (`Form B` direct).
+        let mut ba = FuncBuilder::new(item(20), s_res.clone());
+        let pa = ba.param(STRING_MUT, NO_ORIGIN);
+        let adda = ba.param(USIZE, NO_ORIGIN);
+        let ea = FuncBuilder::ENTRY;
+        let len_ref = ba.op(
+            ea,
+            OpKind::BorrowView {
+                root: Root::Value(pa),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                    Proj::Field {
+                        field: parts.len_field,
+                        ty: USIZE,
+                    },
+                ],
+                mutable: false,
+            },
+            LEN_REF,
+            NO_ORIGIN,
+        );
+        let len_val = ba.op(ea, OpKind::Deref(len_ref), USIZE, NO_ORIGIN);
+        let _sum = ba.op(
+            ea,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: len_val,
+                r: adda,
+                ty: USIZE,
+            },
+            USIZE,
+            NO_ORIGIN,
+        );
+        let buf_ref = ba.op(
+            ea,
+            OpKind::BorrowView {
+                root: Root::Value(pa),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                    Proj::Field {
+                        field: parts.buf_field,
+                        ty: RAW_VEC,
+                    },
+                ],
+                mutable: true,
+            },
+            BUF_REF,
+            NO_ORIGIN,
+        );
+        ba.effect(
+            ea,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(900),
+                    link_name: crate::jir::interns::StrId(0),
+                },
+                function: None,
+                args: vec![buf_ref, len_val, adda],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            NO_ORIGIN,
+        );
+        ba.terminate(ea, RTerm::Return(None));
+        let fa = ba.finish();
+        assert_eq!(
+            classify_reserve_body(&fa, &table, &parts, &mut |_| None),
+            Some(BstrStringOp::ReserveExact)
+        );
+
+        // Form B: 1-hop `String::reserve_exact` delegating `&mut self.vec` to `Vec::reserve_exact`.
+        let mut bi = FuncBuilder::new(item(21), sig(vec![VEC_U8_MUT, USIZE], UNIT));
+        let pi = bi.param(VEC_U8_MUT, NO_ORIGIN);
+        let addi = bi.param(USIZE, NO_ORIGIN);
+        let ei = FuncBuilder::ENTRY;
+        let li_ref = bi.op(
+            ei,
+            OpKind::BorrowView {
+                root: Root::Value(pi),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.len_field,
+                        ty: USIZE,
+                    },
+                ],
+                mutable: false,
+            },
+            LEN_REF,
+            NO_ORIGIN,
+        );
+        let li_val = bi.op(ei, OpKind::Deref(li_ref), USIZE, NO_ORIGIN);
+        let _sumi = bi.op(
+            ei,
+            OpKind::Binary {
+                op: BinaryOp::Add,
+                l: li_val,
+                r: addi,
+                ty: USIZE,
+            },
+            USIZE,
+            NO_ORIGIN,
+        );
+        let bi_ref = bi.op(
+            ei,
+            OpKind::BorrowView {
+                root: Root::Value(pi),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.buf_field,
+                        ty: RAW_VEC,
+                    },
+                ],
+                mutable: true,
+            },
+            BUF_REF,
+            NO_ORIGIN,
+        );
+        bi.effect(
+            ei,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(901),
+                    link_name: crate::jir::interns::StrId(0),
+                },
+                function: None,
+                args: vec![bi_ref, li_val, addi],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            NO_ORIGIN,
+        );
+        bi.terminate(ei, RTerm::Return(None));
+        let f_inner = bi.finish();
+
+        let mut bo = FuncBuilder::new(item(22), s_res.clone());
+        let po = bo.param(STRING_MUT, NO_ORIGIN);
+        let addo = bo.param(USIZE, NO_ORIGIN);
+        let eo = FuncBuilder::ENTRY;
+        let vec_mut = bo.op(
+            eo,
+            OpKind::BorrowView {
+                root: Root::Value(po),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                ],
+                mutable: true,
+            },
+            VEC_U8_MUT,
+            NO_ORIGIN,
+        );
+        bo.effect(
+            eo,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(21),
+                    link_name: crate::jir::interns::StrId(0),
+                },
+                function: None,
+                args: vec![vec_mut, addo],
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            NO_ORIGIN,
+        );
+        bo.terminate(eo, RTerm::Return(None));
+        let f_outer = bo.finish();
+        assert_eq!(
+            classify_reserve_body(&f_outer, &table, &parts, &mut |id| {
+                (id == item(21)).then_some(&f_inner)
+            }),
+            Some(BstrStringOp::ReserveExact)
+        );
+
+        // Negative: writing through `len_ref` is rejected.
+        let mut bbad = FuncBuilder::new(item(23), s_res.clone());
+        let pb = bbad.param(STRING_MUT, NO_ORIGIN);
+        let addb = bbad.param(USIZE, NO_ORIGIN);
+        let eb = FuncBuilder::ENTRY;
+        let lr_bad = bbad.op(
+            eb,
+            OpKind::BorrowView {
+                root: Root::Value(pb),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                    Proj::Field {
+                        field: parts.len_field,
+                        ty: USIZE,
+                    },
+                ],
+                mutable: false,
+            },
+            LEN_REF,
+            NO_ORIGIN,
+        );
+        bbad.effect(
+            eb,
+            OpKind::StoreThrough {
+                ptr: lr_bad,
+                v: addb,
+            },
+            NO_ORIGIN,
+        );
+        bbad.terminate(eb, RTerm::Return(None));
+        assert_eq!(
+            classify_reserve_body(&bbad.finish(), &table, &parts, &mut |_| None),
+            None
+        );
+
+        // Lowering check: 32-bit overflow RangeError precedes `.cap = Math.max(...)` mutation.
+        let cx = bstr_cx(&s_res, &table, &interns);
+        assert!(legality_reserve(&cx).is_ok());
+        let mut helpers = BTreeSet::new();
+        let mut refs = BTreeSet::new();
+        assert!(string_reserve(&cx, Some(Carrier::HostString), &mut helpers, &mut refs).is_err());
+        let stmts = string_reserve(&cx, Some(Carrier::StringBuilder), &mut helpers, &mut refs)
+            .expect("reserve lowers on StringBuilder");
+        let printed = jsast::stmt_to_string(&jsast::function(
+            "f",
+            vec!["$native0".to_owned(), "$native1".to_owned()],
+            stmts,
+        ));
+        let range_pos = printed.find("RangeError").expect("overflow throws RangeError");
+        let cap_pos = printed.find(".cap =").expect("updates .cap");
+        assert!(range_pos < cap_pos, "overflow guard must precede .cap write:\n{printed}");
+        assert!(printed.contains("2147483647"), "{printed}");
+        assert!(printed.contains("$nativeSb.cap < $nativeRequired"), "{printed}");
+    }
+
+    #[test]
+    fn bstr_classify_and_lower_as_bytes() {
+        let (table, interns) = build_table();
+        let parts = string_parts(&table, &interns, STRING).expect("canonical String parts");
+
+        let s = sig(vec![STRING_REF], REF_SLICE_U8);
+        let mut b = FuncBuilder::new(item(30), s.clone());
+        let p = b.param(STRING_REF, NO_ORIGIN);
+        let e = FuncBuilder::ENTRY;
+        let len_ref = b.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Value(p),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                    Proj::Field {
+                        field: parts.len_field,
+                        ty: USIZE,
+                    },
+                ],
+                mutable: false,
+            },
+            LEN_REF,
+            NO_ORIGIN,
+        );
+        let len_val = b.op(e, OpKind::Deref(len_ref), USIZE, NO_ORIGIN);
+        let buf_chain = b.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Value(p),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                    Proj::Field {
+                        field: parts.buf_field,
+                        ty: RAW_VEC,
+                    },
+                ],
+                mutable: false,
+            },
+            PTR_U8_REF,
+            NO_ORIGIN,
+        );
+        let ptr_val = b.op(e, OpKind::Deref(buf_chain), PTR_U8, NO_ORIGIN);
+        let slice = b.op(
+            e,
+            OpKind::SliceView {
+                ptr: ptr_val,
+                len: len_val,
+            },
+            REF_SLICE_U8,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(slice)));
+        let func = b.finish();
+        assert!(classify_as_bytes_body(&func, &table, &interns, &parts));
+
+        let cx = bstr_cx(&s, &table, &interns);
+        assert!(legality_as_bytes(&cx).is_ok());
+
+        for (carrier, expected_substr) in [
+            (Carrier::HostString, "__rt.bstr_bytes($native0)"),
+            (Carrier::StringBuilder, "__rt.bstr_bytes($native0.text)"),
+        ] {
+            let mut helpers = BTreeSet::new();
+            let mut refs = BTreeSet::new();
+            let stmts = string_as_bytes(&cx, Some(carrier), &mut helpers, &mut refs)
+                .expect("as_bytes lowers");
+            let printed = jsast::stmt_to_string(&jsast::function(
+                "f",
+                vec!["$native0".to_owned()],
+                stmts,
+            ));
+            assert!(printed.contains(expected_substr), "{printed}");
+            assert!(helpers.contains("bstr_bytes"), "{helpers:?}");
+        }
+    }
 }

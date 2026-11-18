@@ -533,3 +533,69 @@ fn single_real_field(table: &TypeTable, interns: &Interns, ty: TypeId) -> Option
     let first = real.next()?;
     real.next().is_none().then_some(first)
 }
+
+/// Canonical positional field indices of `alloc::string::String { vec: Vec<u8> }`
+/// (`Vec { buf: RawVec, len }`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StringParts {
+    pub(crate) vec_field: u32,
+    pub(crate) len_field: u32,
+    pub(crate) buf_field: u32,
+}
+
+/// Resolves the canonical `String { vec: Vec<u8> { buf, len } }` field indices when `ty` matches.
+pub(crate) fn string_parts(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+) -> Option<StringParts> {
+    StringLayout::of(table, interns, ty).ok()?;
+    let descriptor = table.get(ty)?;
+    let TypeKind::Adt { variants, .. } = &descriptor.kind else {
+        return None;
+    };
+    let [variant] = variants.as_slice() else {
+        return None;
+    };
+    let mut real_str = variant
+        .fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !table.is_zst(f.ty));
+    let (vec_idx, vec_f) = real_str.next()?;
+    if real_str.next().is_some() {
+        return None;
+    }
+    let vec_desc = table.get(vec_f.ty)?;
+    let TypeKind::Adt {
+        variants: vec_vars, ..
+    } = &vec_desc.kind
+    else {
+        return None;
+    };
+    let [vec_var] = vec_vars.as_slice() else {
+        return None;
+    };
+    let mut len_f = None;
+    let mut buf_f = None;
+    for (idx, f) in vec_var.fields.iter().enumerate() {
+        if table.is_zst(f.ty) {
+            continue;
+        }
+        let f_desc = table.get(f.ty)?;
+        match &f_desc.kind {
+            TypeKind::Integer { signed: false, .. } if len_f.is_none() => {
+                len_f = Some(idx as u32);
+            }
+            TypeKind::Adt { .. } if buf_f.is_none() => {
+                buf_f = Some(idx as u32);
+            }
+            _ => return None,
+        }
+    }
+    Some(StringParts {
+        vec_field: vec_idx as u32,
+        len_field: len_f?,
+        buf_field: buf_f?,
+    })
+}
