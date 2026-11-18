@@ -176,6 +176,7 @@ Runtime bytes are counted on their own side:
 | Scala.js | Scala.js runtime leftovers after DCE |
 | Elm | Elm runtime plus `js/` host, split in `dist/attribution.json` |
 | Kotlin/JS | Kotlin/JS stdlib / runtime leftover |
+| GopherJS | GopherJS prelude plus the Go runtime / stdlib packages the program reaches, measured against a one-export empty program |
 
 Readable output remains a first-class diagnostic column, but every toolchain
 also exposes an explicit production profile where possible:
@@ -227,6 +228,7 @@ node tools/run-kernel-matrix.mjs
 | Scala.js | n/a | `@JSExportTopLevel`, `js.Dynamic` | No product `.js` | Scala.js + DCE'd stdlib, counted | Idiomatic Scala 3 |
 | Elm | n/a | Ports and flags only | JS host under `js/`, allow-listed | Elm runtime + JS host, split | Elm kernel + JS host |
 | Kotlin/JS | n/a | `@JsExport`; `js()` only when needed | No product `.js` | Kotlin/JS runtime, counted | Idiomatic Kotlin |
+| GopherJS | n/a (no `unsafe` package) | `github.com/gopherjs/gopherjs/js`; embedded JS (`eval` / `Function`) only when Go cannot express it, listed in `NOTES.md` | No product `.js`; the build script generates the ESM / IIFE facade, as for JSOO | GopherJS prelude + Go runtime/stdlib, counted | Idiomatic Go 1.21 |
 
 ### Compact Rust
 
@@ -301,6 +303,7 @@ Heavy sources first: `dom_blockers`, `webgl`, `audio`, `canvas`, `fonts`,
 | Scala.js | `../fingerprintjs-scalajs` | Scala 3.8 + scala-cli |
 | Elm | `../fingerprintjs-elm` | Elm 0.19 + JS host |
 | Kotlin/JS | `../fingerprintjs-kotlin` | Kotlin toolchain 0.11 |
+| GopherJS | `../fingerprintjs-gopherjs` | GopherJS 1.21.0 + Go 1.21.13 (added 2026-11-18) |
 
 A port agent edits only its own directory. Compiler changes to
 `spike/rustc-codegen-js` are out of scope for the ports.

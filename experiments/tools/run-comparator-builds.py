@@ -2,14 +2,14 @@
 """Build restored comparator sources; retain exit codes instead of treating old dist files as passes."""
 import argparse, datetime, hashlib, json, os, pathlib, signal, subprocess, time
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-LANGUAGES = ('rescript', 'melange', 'jsoo', 'scalajs', 'dart', 'kotlin', 'elm')
+LANGUAGES = ('rescript', 'melange', 'jsoo', 'scalajs', 'dart', 'kotlin', 'elm', 'gopherjs')
 
 def source_inventory(port, language, suite):
     """Hash authored inputs, excluding generated code and compiler caches."""
     excluded = {'node_modules','dist','_build','build','target','elm-stuff','kotlin-emit'}
     if language == 'rescript': excluded.add('lib')
     generated = {'compiled.js','elm.js','elm.raw.js','.static-agent-entry.mjs'}
-    extensions = {'.res','.resi','.ml','.mli','.elm','.scala','.kt','.dart','.js','.mjs','.cjs','.json','.sbt','.kts','.toml','.yaml','.yml'}
+    extensions = {'.res','.resi','.ml','.mli','.elm','.scala','.kt','.dart','.js','.mjs','.cjs','.json','.sbt','.kts','.toml','.yaml','.yml','.go'}
     files = {}
     for file in sorted(port.rglob('*')):
         if not file.is_file(): continue
@@ -17,7 +17,7 @@ def source_inventory(port, language, suite):
         if any(x in excluded or x.startswith('.') for x in parts[:-1]): continue
         if file.name in generated or file.name.endswith('.res.mjs'): continue
         if language == 'rescript' and suite == 'pro' and parts == ('src','index.js'): continue
-        if file.suffix not in extensions and file.name not in {'dune','dune-project','pubspec.lock'}: continue
+        if file.suffix not in extensions and file.name not in {'dune','dune-project','pubspec.lock','go.mod','go.sum'}: continue
         files[str(file.relative_to(ROOT))] = hashlib.sha256(file.read_bytes()).hexdigest()
     for name in ['package.json','package-lock.json','experiments-pro/shared/package-port.mjs','experiments/tools/kotlin']:
         file=ROOT/name
@@ -41,6 +41,7 @@ env.setdefault('MIRES_OPAM_SWITCH','mires-comparators')
 env.setdefault('KOTLIN_BIN',str(ROOT/'experiments/tools/kotlin'))
 env.setdefault('DART','dart')
 env.setdefault('DUNE_JOBS','4')
+env.setdefault('MIRES_GO_ROOT',str(ROOT/'.toolchains/go'))
 env.setdefault('COURSIER_REPOSITORIES','https://repo.maven.apache.org/maven2')
 suites=('oss','pro') if a.suite=='all' else (a.suite,)
 failed=False

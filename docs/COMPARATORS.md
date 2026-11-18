@@ -25,8 +25,9 @@ Each family has an OSS directory `experiments/fingerprintjs-<family>/` and a Pro
 | `dart` | Dart SDK 3.13.7, dart2js | `o1/` and `o2/` | Pass, `-O2` |
 | `kotlin` | Kotlin Toolchain 0.12.0; Gradle 9.4.1 / Kotlin plugin 2.4.10 | `readable/`, `proxy-production/`, `production/` | Pass, Toolchain JS application |
 | `elm` | Elm 0.19.2 | `standard/` and compiler-aware-minified `production/` | Pass |
+| `gopherjs` | GopherJS 1.21.0, Go 1.21.13 | Default: `gopherjs build -m` + Terser (added 2026-11-18) | See [GopherJS](#gopherjs-added-2026-11-18) |
 
-The family name `dart` means Dart-to-JavaScript, not Dart-to-Wasm. The `jsoo` family is js_of_ocaml, distinct from Melange.
+The family name `dart` means Dart-to-JavaScript, not Dart-to-Wasm. The `jsoo` family is js_of_ocaml, distinct from Melange. The `gopherjs` family is Go compiled by GopherJS, not Go's own `GOOS=js GOARCH=wasm` target.
 
 The original source archive is `experiments-2026-09-05/p14-prebuilt-current/source/source.tar.gz`, SHA-256 `3aca257b220d0bbdb2940aba9c2b4f86456097d3c531266547aeb0f6451f437d`. It supplied 1,155 files across the 14 ports. A further 34 files under `experiments/fingerprintjs-compare/` restore shared comparison support and historical records.
 
@@ -45,10 +46,13 @@ brew install opam scala-cli
 # Local OCaml switch; does not change the user's default opam switch or shell startup files.
 npm run setup:comparators:ocaml
 
+# Local Go 1.21.13 + GopherJS 1.21.0 under .toolchains/go; does not use or change the system Go.
+npm run setup:comparators:go
+
 # The OSS TypeScript reference must exist before packaging/comparing its ports.
 npm run build:oss-reference
 
-# Build all seven families, OSS and Pro.
+# Build all eight families, OSS and Pro.
 npm run build:comparators
 
 # Exact built-artifact checks, deterministic kernels, numerical boundaries, and Pro validation.
@@ -77,7 +81,7 @@ python3 experiments/tools/run-comparator-builds.py \
   --languages melange,jsoo --suite pro
 ```
 
-Supported family names are `rescript,melange,jsoo,scalajs,dart,kotlin,elm`. The suite is `oss`, `pro`, or `all`. A build timeout defaults to 1,200 seconds per port and can be set with `--timeout`. Timed-out builds fail; old output is not accepted as a pass.
+Supported family names are `rescript,melange,jsoo,scalajs,dart,kotlin,elm,gopherjs`. The suite is `oss`, `pro`, or `all`. A build timeout defaults to 1,200 seconds per port and can be set with `--timeout`. Timed-out builds fail; old output is not accepted as a pass.
 
 Individual port builders also work from their directories using `npm run build`. Use the common runner when results need build receipts and source/artifact identities.
 
@@ -88,6 +92,77 @@ The setup script uses `.toolchains/opam`, switch `mires-comparators`, OCaml 5.3.
 `MIRES_OPAM_ROOT`, `MIRES_OPAM_SWITCH`, and `MIRES_BUILD_JOBS` permit explicit overrides. The checked setup was also rerun successfully against the exported solution.
 
 Dune's automatic CPU/job detection crashed on this Mac. Explicit `DUNE_JOBS=4` avoids that path and is set by the setup/common runner and direct OCaml builders. The failed initial installation/build logs are retained. The workaround does not disable opam's sandbox and does not change compiler semantics.
+
+### GopherJS (added 2026-11-18)
+
+GopherJS is the eighth family, added after the restoration as a new port rather than a restored one. Its OSS port is `experiments/fingerprintjs-gopherjs/` and its Pro port is `experiments-pro/fp-pro-gopherjs/`.
+
+The toolchain is GopherJS 1.21.0, the latest release (2026-06-26). It compiles Go 1.21 and needs a Go 1.21 distribution for the standard library (`GOPHERJS_GOROOT`), so the setup script installs Go 1.21.13 next to it under `.toolchains/go`. The system Go is never used. The Go archive is verified against its go.dev SHA-256. GopherJS and its module dependencies are verified by the Go checksum database. `MIRES_GO_ROOT` overrides the location.
+
+On current macOS, Go 1.21's internal linker produces binaries without `LC_UUID`. dyld refuses such a binary when it links system frameworks ("missing LC_UUID load command"); GopherJS links CoreFoundation and Security, while a pure-Go binary still runs. Go fixed this only from 1.22. The script therefore links GopherJS with the system linker (`-linkmode=external`) and re-signs it ad hoc, because Go rewrites the binary after the linker's signature. This changes how the GopherJS tool itself is linked, not the JavaScript it emits.
+
+GopherJS has no optimisation levels beyond `-m`, so each port has one variant: the root `dist/`, which is also the production row. It cannot emit ES modules. The program fills GopherJS's `js.Module.exports`, and the build script wraps the emit in a function that binds `window` and `module`, then re-exports through the ESM / IIFE facade, much as for js_of_ocaml.
+
+**Emit policy (both ports).** The GopherJS emit ships untouched; only the packaging needed to load it is added. As a result, importing either port has GopherJS's runtime side effects, which each port documents:
+- `globalThis.fs` is defined;
+- `Error.stackTraceLimit` becomes `Infinity`;
+- if a page-global `require` exists, it is called with `fs` and `util`.
+
+The one transformation is in the Pro build: it renames GopherJS's reused `s` loop labels apart. That works around Rollup 3.30's tree-shaking, which drops an outer label when a nested function reuses its name. It is a pure renaming and adds 0 bytes to the minified output.
+
+Go builds use `GOCACHE=.toolchains/go/cache`, so the user's global Go build cache is not used.
+
+**Results (2026-11-18), independently verified.** Two Go ports were written:
+
+| Port | Size | Structure | Embedded JavaScript |
+| --- | --- | --- | --- |
+| OSS | 3,644 lines of Go | `package main` | None: no `eval`, no `Function`, no product `.js` |
+| Pro | 6,467 lines of Go, 22 files | — | None (`maxEmbeddedJsLines: 0`; the only `.js` is a 12-line re-export) |
+
+Both use idiomatic `uint64` Murmur. All async work runs on JS Promises, `MessageChannel` and timers; neither uses goroutines.
+
+Checks that passed:
+- Fresh runner builds of both ports, deterministic: the clean-room toolchain and repeated builds give byte-identical `dist/`.
+- OSS: package 3/3, kernels 58/58, seeds 477/477, on both the minified and the readable ESM.
+- Pro: package 5/5, validation PASS (all five error codes), and ownership `PASS target=6489 js=13 embedded=0`.
+- SSR-safe import for both.
+- Chrome 158 and Firefox 160:
+  - the OSS differential, plus `run-feature-parity`, shows 0 normalized differences;
+  - the Pro strict differential shows 0 differences, 0 missing signals and 0 value mismatches, with 144/144 and 145/145 fields.
+- The strict OSS static audit gives contract PASS, strict PASS and 0 metadata differences.
+- `check-comparators.py --suite all`: 67/67 across all eight families.
+
+Not covered:
+- **Safari** was not run: WebDriver needs Safari's "Allow Remote Automation" setting, which is off on this machine.
+- **One timing-sensitive Pro signal is flaky on Firefox.** In one window GopherJS passed 4 of 10 attempts and the interleaved Scala.js control 3 of 5, which is consistent with host load (inferred, not measured). Both a later idle window (5/5) and the final build (4/4) passed.
+- **One Pro browser signal is stubbed on WebKit and Android**, as in the Scala and Rust Pro ports. A Chrome/Firefox differential cannot see this. Details are in the private `experiments-pro/fp-pro-gopherjs/VERDICT.md`.
+
+Each port's `NOTES.md` / `VERDICT.md` lists its remaining observable deviations, all outside the checked contract:
+- error-message wording;
+- constructible async exports;
+- a BigInt seed being accepted;
+- null-argument error classes;
+- the import side effects above.
+
+Sizes, by the same method as `measure-comparators.mjs` (Node zlib), main module:
+
+| Suite | Artifact | Bytes | gzip-9 | Brotli-11 |
+| --- | --- | ---: | ---: | ---: |
+| OSS | GopherJS `fp.esm.min.js` | 201,379 | 57,352 | 47,866 |
+| OSS | GopherJS runtime floor (one-export empty program, `fp.min.js` shape) | 42,619 | 14,111 | 12,707 |
+| OSS | TypeScript oracle `fp.min.js`, for scale | 36,746 | 16,344 | 14,239 |
+| Pro | GopherJS `fp.esm.min.js` | 298,020 | 79,614 | 63,897 |
+
+Among the OSS production rows, only Scala.js `full` (229,475 / 68,148) is larger than GopherJS. js_of_ocaml (136,633 / 48,435) and Dart `-O2` (152,185 / 52,634) are the nearest. Among the Pro rows, GopherJS is about the size of Scala.js (296,145 / 84,827) and the largest raw.
+
+Of the OSS `-m` output, the prelude is about 42 KB and the program 127 KB. The `strings` package and what it links (`internal/abi`, `internal/reflectlite`) add about 62 KB. These are static sizes, not a qualified ranking.
+
+**GopherJS defects found** (each reproduced with a minimal program built by this toolchain; candidates for upstream reports):
+- `math.Trunc` goes through a 32-bit integer path: `Trunc(4294967295) == 1`, `Trunc(2**53) == 0`. Also, `Modf(-0.5)` returns +0 as the integer part.
+- A lone high surrogate in a JS → Go string conversion swallows the next code unit (`"\ud800 x"` → U+2420, the space lost). At the end of a string it produces invalid UTF-8.
+- A JS `throw null` passes through Go `defer` / `recover()` unseen: `recover()` returns nil and the function returns zero values.
+
+Rollup 3.30's tree-shaking drops an outer label that a nested function reuses (minimal repro: `export function f(a){ s: while(true){ if(a) break s; return function(){ s: while(true){ if(a) break s; return } } } }`). The Pro build renames GopherJS's labels apart for this reason.
 
 ## Which output to compare
 
@@ -102,6 +177,7 @@ Some archived builders deliberately retain their readable/development variant as
 | Dart | `dist/o2/fp.esm.min.js` |
 | Kotlin/JS | `dist/production/fp.esm.min.js` |
 | Elm | `dist/production/fp.esm.min.js` |
+| GopherJS | `dist/fp.esm.min.js` |
 
 Scala's root alias is fast-link; Dart's is `-O1`; Kotlin's is the toolchain/readable variant; Elm's is the standard-minifier variant. Their additional variants are all built and checked. The Kotlin packaging proxy is not presented as the Gradle optimizing compiler.
 

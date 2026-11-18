@@ -563,6 +563,10 @@ Execution: at most three subagents (user). Verifiers Opus 5.5 high, implementers
   - Fix ky's `<Result as Try>::branch` over-inlining.
   - Stop step 5a of the qualify script reading the main checkout. That arm now compares against Round 3, not the old `main`.
   - Fix P1–P10.
+  - Speed vs hand-written JS (2026-11-17, `scratchpad/timing/kernels3-r5.json`, `ab2-r7.json`): the biggest loss is enum_state, about 125× slower in Node.
+    - Its `#[inline(never)] step_state(&mut State)` is exactly R3-A's flat-ABI shape (`mut-enum(6)+scalar-ref(1)`), but the size-scored cost model declines it as `cost.score-no-improvement`.
+    - The receipt's enum matrix shows the same pattern with an inlinable helper runs at about 3 µs, on par with JS.
+    - Candidate: let the cost model weigh hot-loop calls, not only bytes.
 - Removable: the Round 3 worktrees, about 186 GB: `r3v-*`, `r3-*` and `round3-opt`. All their branches are merged. The verifiers' `results*.json` are in their `build/` folders; copy them out first if wanted.
 - 2026-11-17 ~03:57: both verifiers ended on a network outage (API `ENOTFOUND`) during their first builds; resumed at ~04:00 with their context and briefs unchanged (same agents, not new spawns), told to confirm the builds completed and re-check any background command before using it. An unfinished verification is not a pass.
 
@@ -581,3 +585,217 @@ Execution: at most three subagents (user). Verifiers Opus 5.5 high, implementers
 - [ ] Restore the historically supported positive capability families and qualify current Pro/worker/browser/clean-consumer behavior separately from OSS kernel parity.
 
 Current main and the lost-v2 comparison are consolidated in `RESTORATION-STATUS.md`; `current_state.md` retains its November 12 body under a dated historical heading. This assessment changes documentation/evidence only and pushes nothing.
+
+## Strings: profile, then byte-string experiment (2026-11-17; user request)
+
+Question: how much of marked's and minisearch's time goes to byte-memory string work, i.e. the ceiling for a better string representation? Then prototype js_of_ocaml-style byte strings (a JS string with one char per UTF-8 byte) and measure them against that ceiling.
+
+- [x] P1 Profile (coordinator):
+  - Results (2026-11-17, Node 26.8.1, new head `ba72c43` bundles, load average about 4):
+    - Tools: `scratchpad/strings/prof.mjs`, `analyze.mjs`, `count.mjs`; profiles in `scratchpad/strings/prof/`.
+    - The readable `index.js` runs within 5% of `index.min.js`, so its profiles are representative.
+
+    | Share of time | marked (0.98 ms/call) | minisearch (0.33 ms/call) | fflate (control) |
+    |---|---|---|---|
+    | string conversion | **53.7%** (str_bytes 24.9, str_len 14.8, bytes_str 14.0) | 9.2% | 0% |
+    | byte-memory ops | 13.9% | 22.4% | 11.8% |
+    | allocator | 1.3% | **43.6%** (`$rt_dealloc` 32% self) | 1.9% |
+    | GC | 1.2% | 9.1% | 0.9% |
+    | program code | 27.4% | 14.0% | 85.4% |
+
+  - Per call:
+    - **marked** (7,658-char input): 45,069 `str_bytes` calls covering **9.0 M chars** (1,175× the input; 78% cache hits, but a hit still hashes or compares the whole string), 10,769 `bytes_str`, 7,499 `str_len`, 7,180 copies.
+      - Cause: `inline_into` evaluates `source[index..].starts_with("**")` / `source[index + 1..].find("](")` at every byte. Each slice becomes a new JS string, then is converted back to bytes, so the work is quadratic. In native Rust those slices are free.
+    - **minisearch**: 270 deallocs per call, 210 of them align-1 byte buffers; 1,415 `str_bytes` calls covering 78 K chars.
+  - Probe on minisearch: removing `$rt__freed.add(buf)` from `$rt_dealloc` (a WeakSet used for use-after-free detection) takes 0.334 → 0.220 ms (−34%). Removing `buf.length = 0` changes nothing; removing the WeakMap delete is slower.
+    - A separate, non-string finding (follow-up: find cheaper freed-block bookkeeping).
+  - Upper bounds:
+    - marked: eliminating conversions and byte ops would cut up to about 68% of its time (≈0.3 ms per call vs JS 0.47 ms; an upper bound, not a prediction).
+    - minisearch: limited by the allocator, not by string conversion.
+  - Node `--cpu-prof` on the readable `index.js` bundles of the new head, with the same inputs as the timing protocol.
+  - Report self time and inclusive time per category:
+    - string conversion: `$rt_str_bytes` / `$rt_bytes_str` / `$rt_str_len` / memo / TextEncoder / TextDecoder;
+    - byte-memory ops: copy / compare / slices / alloc;
+    - program code;
+    - GC.
+  - Instrumented counts: calls and bytes converted per run, memo hit rate.
+  - fflate as a non-string control.
+- [x] P2 Design (brief `scratchpad/briefs/bstr-exp.md`). Byte strings sit behind a link-time switch (`js-str=bytes`, default off and byte-identical to `main`).
+  - Phase A is correctness: shim, emission, host boundary and literals, plus non-ASCII / ordering probes.
+  - Phase B removes conversions: slicing, `starts_with` / `find` / `len` / `as_bytes()[i]` / `==` are lowered directly.
+  - The minisearch allocator WeakSet is out of scope.
+  - The coordinator does the timing.
+- [x] P3 Experiment (implementer, Opus 5.5 xhigh): worktree `.claude/worktrees/bstr-exp`, branch `exp/byte-strings`, `ba72c43` → `91488e5` (Phase A) → `b0870cf` (Phase B). No trailers, not pushed, not for merge.
+  - Switch: `-Cllvm-args=js-str=bytes`, link-only (not in the sysroot key), requires `js-lane=jir`.
+  - Implementer's gates, all PASS: core 174/174 in both modes, rows identical on/off; off-mode core JS byte-identical to main; chunk, unwind-mode, native-format, row 55, cargo test, compact 58/58; probes 131/131 = native (on), 8/131 differ (off).
+  - Coordinator checked: off-mode marked/minisearch/fflate bundles (`index.js`, `index.min.js`) sha256 = main's; on/off outputs equal on 60 non-ASCII / emoji / lone-surrogate inputs.
+  - Results: `bstr-exp/build/bstr/results.json`.
+- [x] P4 Verification (Opus 5.5 high): brief `scratchpad/briefs/bstr-verify.md`, verdict `bstr-exp/build/bstr/verify/verdict.json`. **FAIL**, with 2 blocking findings of one cause.
+  - **B1:** `js_bindings!` params `Option<&str>` / `(&str, u32)` reach the host undecoded (mojibake, no error). The coordinator reproduced it.
+  - **B2:** the same for `js!` captures of `Option<&str>`, tuples, arrays and `&&str`.
+  - Cause: `host.rs` `host_argument` decodes only a top-level `&str`.
+  - Confirmed:
+    - switch-off output = main: all 169 core `.js` files byte-identical against a fresh main build, both modes;
+    - Phase B lowerings exact: 3,844 probe lines = main = native, both modes;
+    - top-level host boundary complete; aggregate exports hard-refused;
+    - all 3 betterThanMain cases.
+  - **Two bugs on main**, independent of this work:
+    - `chars().count()` aborts on text of 16 bytes or more ("this buffer holds no [E; 4] elements, so it cannot be read at chunk granularity");
+    - `String::from_utf8_lossy(b"a")` throws "bad block 1".
+- [x] P5 Phase C (implementer): `6e88a2f`, no trailers.
+  - **Fix:** a type-directed `host_convert` (`jsc-link/src/lower/bstr.rs`) on every host crossing, both directions. Nested-`str` exports now convert instead of being refused.
+  - **New refusals:** `&mut` / raw pointer to `str`; union, closure or coroutine; depth over 12; a host-marker closure taking `str`.
+  - **Gates:** all pass. Verifier repros: `bindopt` 6/6, `jscap` 14/14 = main. New repr probes 34/34.
+  - **On bundles:** only a never-run `rust_begin_unwind` facade, +6 B.
+  - **Coordinator checks:** phaseC-off `index.js` / `index.min.js` = main (marked, minisearch, fflate).
+  - **Re-timed (5 reps, timing-cell), on / off / JS:**
+    - marked 0.396 / 0.919 / 0.462, on/off 0.424, on/JS 0.871, A/A 0.994;
+    - fflate on/off 1.042;
+    - minisearch: the cell is unusable (A/A 1.22), as before.
+- [x] P6 Re-verification of Phase C: **FAIL**, 3 new blocking findings. Verdict in `verify/verdict.json` `phaseC`; the Phase B verdict is in `verify-phaseB.json`.
+  - **Passed:**
+    - B1/B2 fixed, both modes; main in abort mode = main in unwind;
+    - 59/61 adversarial lines = main;
+    - refusals really are hard errors;
+    - switch-off: 169/169 core JS = main, both modes;
+    - repr probes 34/34 = real main.
+  - **Blocking** (the coordinator checked C1–C3 from the run outputs):
+    - **C1:** a `str` inside a `Vec` (also `&Vec<&str>`, a struct with a `Vec<&str>` field, an export returning `Vec<&str>`) crosses undecoded. `RawVecInner` erases the element type (`PhantomData`), so `reaches_str` says false. `VecDeque`, `Rc`, `Arc` and `BTreeMap` are probably the same.
+    - **C2:** a closure capturing `&str` in a `js!` capture crosses undecoded; `reaches_str` says false for closures.
+    - **C3:** object identity is lost. `same_pair(&p, &p)` → `a === b` is true on main, false under bytes, because the converter copies. This breaks CONTRACT.md:134/667 (a reference to an aggregate is its JS object).
+  - **Notes:**
+    - `[&str; 0]` param/field crashes at run time (`reading 'map'`);
+    - newly refused programs: `&mut` / raw / union / `Box<[&str]>` / 14-deep nesting;
+    - the nesting limit is really 13/14.
+  - **Design point:** main hands the host its internal layout for arbitrary aggregates (`{"vec":{"buf":{"inner":…}}}`). Under bytes, a copy-convert of such a value cannot keep both text and identity, so the exact answer is a refusal by default for anything that is not a by-value value whose whole type is visible. Waiting on the user's call (Phase D vs stop).
+- [x] P4 Timing (coordinator, Node 26.8.1, timing-cell protocol, 7 reps; plus steady-state alternating processes). Drivers: `scratchpad/bstr/timing/{ab-bstr,steady}.mjs`, `scratchpad/bstr/kb/kernels-bstr.mjs`.
+  - Workloads, median ms per call (switch on / off / JS):
+    | Workload | On | Off | JS | Result |
+    |---|---|---|---|---|
+    | marked | 0.400 | 0.932 | 0.468 | on/off 0.429 [0.423–0.443], A/A 1.011; on/JS 0.856 — **faster than the JS library** |
+    | minisearch | 0.249 | 0.249 | 0.022 | steady state, 8 alternating reps: no change. The cell A/A is unusable (1.27). |
+    | fflate | 0.564 | 0.542 | 0.178 | +3.7–3.9% (on/off 1.037, A/A 0.993): ASCII-scan of the 61K input at the boundary |
+  - Kernels (Node / JSC), on vs off: murmur 0.997 / 1.022, crc32 1.000 / 0.998, enum_state 1.001 / 0.998, string_vec 0.989 / 1.029. All unchanged: owned `String` building still runs in byte memory.
+  - Sizes (gzip-9), off → on: marked 9,825 → 7,238 (−26%); minisearch −96 B; fflate +45 B; ky −170 B; compact +90 B.
+  - Left over (from the implementer): raw-pointer byte views (marked `escape_slice`, 5,900/call); `push_str` into a baseline `String` (7,180/call); untagged `strip_prefix` / `split` / `trim` / `get` / `&String` patterns; view-abi.
+
+## Allocator: cheaper freed-block bookkeeping (2026-11-18; user chose this before byte strings Phase D)
+
+Byte strings are paused at `exp/byte-strings` `6e88a2f` (verdict FAIL C1–C3; Phase D, refuse-by-default boundary, not started).
+
+- [x] F1 Change: `__rt._freed` becomes a marker symbol written onto the emptied array (`buf[_freed] = true` in `dealloc`, `buf != null && buf[_freed] === true` in `_heap_block`), replacing the `WeakSet` add/has. The use-after-free refusal and its message stay as they are (`guard_use_after_free`, `runtime-shim-perf.test.mjs`, CONTRACT "Freeing"). Worktree `.claude/worktrees/alloc-freed`, branch `fix/freed-marker` from main.
+  - Done: `runtime/shim.js` only, +9/−7 lines. A pre-change probe on main's minisearch bundle: WeakSet 0.271 ms, marker 0.180 ms, no tracking at all 0.183 ms (6 alternating fresh processes).
+- [x] F2 Gates: build; core suite jir+opt in unwind and abort (abort enforces `.maxbytes`); `node --test scripts/runtime-shim-perf.test.mjs`; `cargo test --workspace`; emitted-JS diff against main (expect only shim text in programs that reach `dealloc`/`_heap_block`).
+  - Core suite: 174/174 in unwind and abort (`guard_use_after_free` passes, 1985 B). `runtime-shim-perf.test.mjs` 6/6.
+  - Emitted JS vs main: unwind 141/150 identical, abort 149/150. The control (same worktree, main's shim) = main 150/150 in both modes, so the 10 differences come from the shim's member bytes. The cost model prices `Helper(member)` by source bytes; +~44 B across `_freed` / `_heap_block` / `dealloc` flips marginal native-box size-gate decisions both ways (e.g. 107: native box now commits, −304 B; 101: +185 B). Net program bytes over the 10: −163. All pass.
+  - `cargo test --workspace` (witness check on) 1203/0; `minimal-shim` + `runtime-shim-perf` node tests 16/0.
+  - Workload bundles: `raw/program.js` byte-identical to main for marked/minisearch/fflate; only the 3 shim lines differ (+30 B min, +11–13 B gz).
+- [x] F3 Timing: minisearch / marked / fflate new vs main (timing-cell + steady-state alternating), kernels.
+  - Timing-cell (5 reps): marked new/main 0.992 (A/A 0.990), fflate 1.005 (A/A 0.995): unchanged. minisearch: the cell is unusable (A/A 0.81).
+  - Steady state, 8 alternating fresh processes: minisearch **0.283 → 0.189 ms (−33%)**, every new run below every main run; now ~8.6× JS (was ~12.9×).
+  - Kernels (`bench_kernels.rs`) not re-timed: skipped, the workloads cover the change.
+  - Commit `a61fca8` on `fix/freed-marker`, no trailers.
+- [x] F4 Verification (Opus 5.5 high): **PASS-WITH-NOTES**, nothing blocking. Verdict `alloc-freed/build/freed/verify/verdict.json`.
+  - 126 shim probe cases (every `_heap_block` caller × 17 buffer kinds, double free, realloc after free, re-registration): main = branch.
+  - The mark is written only onto fresh registered arrays (strict ESM probe too). The minimal shim keeps `_freed` in the closure.
+  - Core 174/174 in both modes, emitted JS byte-identical to the coordinator's. The control = main 150/150.
+  - Flip mechanism confirmed: the shim grows exactly 42 B (`_freed` +19, `_heap_block` +20, `dealloc` +3). `CarrierEconomics::accepts` refuses any gzip/brotli growth, and the flips sit on that edge (107 brotli 4887→4892, 101 15982→15998, 50 8136→8137).
+    - Correction to my summary: not all flips are native-box. 50 is native-vec/string-builder; 110/21/23/30/46 are scalarization/spill.
+  - Notes:
+    1. The mark is an own enumerable symbol, so `Object.assign` / spread / `__rt.overwrite` of a freed backing array would carry it. This is unreachable in the pointer model (copies are of `buf[off]` elements) and already UB. A non-enumerable `defineProperty` mark closes it, but costs 0.173 → 0.191 ms on minisearch (coordinator probe: orig 0.258), so I kept the plain mark.
+    2. Freed arrays now show the symbol to `Reflect.ownKeys` / `inspect`.
+    3. `guard_use_after_free.expect_abort` checks only that the program aborts and prints `5`, not the message. Follow-up: an expected-message check in `test.sh`.
+- [x] F5 Merge (the user's OK, plain mark): fast-forwarded main `5f9ef93` → `a61fca8`. Main was rebuilt (`target/release/jsc-link` sha256 `61ad1f17…`) and the keyed jir+opt sysroots rebuilt for both modes. Gate: 174/174 in unwind and in abort; main's abort-mode core JS = the branch build (150/150). Not pushed. The `alloc-freed` worktree and `fix/freed-marker` branch can now be removed (merged).
+
+## Byte Strings: complete safe boundary + size & speed optimization (2026-11-18; planned)
+
+Cross-compiler survey (js_of_ocaml 6.4, Melange 7.0 / ReScript 12.3, Scala.js 1.22, Kotlin/JS 2.4, GopherJS, dart2js) and staged plan in `byte_strings_plan.md`. Execution: 1 implementer subagent + 1 independent verifier subagent per stage (`unset CARGO_INCREMENTAL`, `bash scripts/build.sh --locked`, `RCGJS_WITNESS_CHECK=1`, no trailers).
+
+- [ ] Stage 1 — Rebase `exp/byte-strings` onto `main` (`a61fca8`) + complete safe host boundary:
+  - [ ] Traverse `TypeKind::Adt { args }`, `Closure`, `Coroutine`, `CoroutineClosure` in `reaches_str`; guard `descriptor.layout.zst` (`[&str; 0]`).
+  - [ ] Synthesize deduplicated per-`(TypeId, Crossing)` converter items using direct literals (replacing per-site `Object.assign` IIFEs); skip `rust_begin_unwind` facade.
+  - [ ] Add `__rt.bstr_ref` (`WeakMap`-cached live `Proxy` view) for `&T`, `&mut T`, `&Cell`, `Slot`, `FatSlice`, `Box<T>`, `Rc<T>`, `RawVec<T>` (`Vec<&str>`, `VecDeque<&str>`), and closure upvars + callback `str` thunks.
+  - [ ] Independent verification: C1–C3 + `[&str; 0]` fixed (`same_pair(&p, &p) === true`, `&mut` write-back + lone-surrogate sanitization, `Vec<&str>`/`Box<[&str]>`/closures = `main`), core 174/174 unwind + abort, switch-off byte-identical to `a61fca8`.
+- [ ] Stage 2 — Codec speedups, interprocedural `is_ascii` elimination & slice outlining:
+  - [ ] Interprocedural `is_ascii` fixpoint in `jsc-link` to elide `bstr_out` on ASCII-proven values.
+  - [ ] `_bstr_is_ascii` (`< 24` char loop + `>= 24` regex) and shared `1024`-byte `Uint8Array` scratch buffer + short-string pure-JS UTF-8 decode in `runtime/shim.js`.
+  - [ ] Peephole `bstr_bytes(bstr_in(x))` -> single `TextEncoder.encode` byte view (`fflate`).
+  - [ ] Outline `StrIndex` slow path via `__rt.bstr_slice` (evicting `core::str` `SliceIndex` via DCE) + link-time hoisting of `>= 32`-byte non-ASCII byte-string literals.
+  - [ ] Independent verification: differential probes + `compact` and `fflate` <= `main` on size and runtime.
+- [ ] Stage 3 — Raw-pointer byte views & byte-string-backed owned `String`:
+  - [ ] Extend `byte_string_view` (`s.charCodeAt(i)`) to raw-pointer byte reads (`marked` `escape_slice`) + tag `strip_prefix`/`strip_suffix`/`trim*`/`get`/`PartialOrd`.
+  - [ ] Widen `StringBuilder` / `HostString` under `js-str=bytes` (`is_empty`, `reserve`, read-only `as_bytes`, `Site` Move/Copy spine fix) so owned `String` builders commit `{ text, cap, len }`.
+  - [ ] Independent verification: differential `String` fuzz + `55`/`56`/`57`/`70` + `repr-report` + `marked` profile/size/timing.
+- [ ] Stage 4 — Full qualification matrix + `release-*` / default enablement & `CONTRACT.md` update.
+
+## GopherJS comparator family (2026-11-18)
+
+Goal: add GopherJS (Go → JS) as the eighth comparator family, OSS and Pro, built, checked and sized exactly like
+rescript / melange / jsoo / scalajs / dart / kotlin / elm (`docs/COMPARATORS.md`). Work happens on main, in the main
+checkout. Nothing is committed until verification passes and the user says OK.
+
+- [x] G0 Toolchain. `experiments/tools/setup-go-comparators.sh` (`npm run setup:comparators:go`) installs Go 1.21.13
+  (go.dev archive, SHA-256 pinned per host) and GopherJS v1.21.0 (latest, 2026-06-26; needs a Go 1.21 GOROOT) under
+  `.toolchains/go`. macOS fix: Go 1.21's internal linker omits `LC_UUID`, which dyld refuses in a binary linking system frameworks
+  (GopherJS links CoreFoundation/Security; a pure-Go binary runs), so GopherJS is linked with
+  `-linkmode=external` and re-signed ad hoc. A hello-world compiles (`-m`: 52 KB) and runs under Node.
+- [x] G2a Runner registration: `gopherjs` in `run-comparator-builds.py` (LANGUAGES, `.go`/`go.mod`/`go.sum` inventory,
+  `MIRES_GO_ROOT`), `check-comparators.py`, `measure-comparators.mjs` (production variant `default`),
+  `fingerprintjs-compare/ports.json`.
+- [x] G1 OSS port `experiments/fingerprintjs-gopherjs` (implementer report; awaiting verification). One Go `package main`,
+  3,639 lines; `uint64` Murmur; async on Promises/MessageChannel, no goroutines; no embedded JS. Runner PASS; package
+  3/3, kernels 58/58, seeds 477/477; SSR-safe; differential 0 normalized diffs in Chrome and Firefox (also the min ESM
+  and `run-feature-parity`). Safari not driven: needs Safari ▸ Develop ▸ "Allow Remote Automation" (user setting).
+  `fp.min.js` 201,074 / gz 57,341 / br 47,845; runtime floor 42,619 / 14,111 / 12,707. GopherJS bugs found and
+  worked around: `math.Trunc(4294967295) == 1` (32-bit int path), lone high surrogates mangled by string conversion,
+  `throw null` passing through `defer` frames.
+- [x] G2c Shared static audit fix (`fingerprintjs-compare/tools/check-feature-parity-static.mjs`): the IIFE sandbox
+  injected host intrinsics (`Array`, `Object`, `Promise`, …) into a fresh V8 context, a split-realm global no browser
+  has; GopherJS compares slice constructors against `Array` and broke. Now only host APIs the context lacks are
+  injected. Before/after on all 17 rows: 16 identical (timestamps aside); gopherjs import error → contract PASS,
+  strict PASS, 0 metadata diffs.
+- [x] G3 Pro port `experiments-pro/fp-pro-gopherjs` (implementer report; awaiting verification). 6,611 Go lines in
+  22 files; no goroutines; no embedded JS (`maxEmbeddedJsLines: 0`). Runner PASS; package 5/5; validation PASS; SSR
+  ESM+CJS; ownership `PASS target=6633 js=13 embedded=0`; strict differential 0/0/0 on Chrome 158 and Firefox 160
+  (144/144, 145/145 fields); Safari not driven. `fp.esm.min.js` 297,862 / gz 79,647 / br 63,908 (oracle 218,567 /
+  85,504 / 70,741). Additive Go support in `experiments-pro/shared/` (ownership detector, language-agent, port lists),
+  with a before/after identity proof. Open: `compile.mjs` rewrites the GopherJS prelude (global probe → `globalThis`,
+  no `fs` shim, local `js.Module`) and renames labels for a Rollup 3.30 bug, while the OSS port ships the prelude
+  untouched, so the two follow different policies. Process slip: the implementer spawned 3 sub-implementers (lesson
+  recorded).
+- [x] G2b Docs: `docs/COMPARATORS.md` (family rows, setup, emit policy, verified results, sizes, GopherJS defects),
+  `docs/comparator-toolchains.json`, `fingerprintjs-compare/{CONTRACT,toolchains}.md`, `experiments/README.md`,
+  private `experiments-pro/README.md`. `.gitignore` already covers the new `dist/` / `build/` / `.toolchains/`.
+- [x] G4a OSS verification (2026-11-18): **FAIL** on 2 undocumented items; all 7 headline claims re-ran exact
+  (package 3/3, kernels 58/58, seeds 477/477 on min *and* readable ESM; differential 0/0 Chrome/Firefox on both ESMs;
+  feature parity 0/0; sizes exact; three GopherJS bugs reproduced; clean-room toolchain + 4 builds byte-identical;
+  `check-comparators --suite oss` 51/51 across eight languages; static-audit fix confirmed, 16 rows identical).
+  - B1 `withIframe` removes the iframe twice when `removeChild` throws after success (`src/dom.go:90-96` vs `fail`
+    at 39-46); oracle removes once. Sent back; **fixed** (success path removes once and rejects directly on a throw); coordinator
+    re-ran the probe on esm / esm-min / iife: oracle = port (1 attempt, `rm1`); package/kernels/seeds PASS. New sizes
+    `fp.min.js` 201,163 / 57,372 / 47,821. Docs: deviations 1, 3, 5, 6, 7, 9 corrected or added.
+  - B2 the facade binds `$global` to `globalThis`, so the prelude calls a page-global `require('fs')` /
+    `require('util')`. Closed as documentation under the shared emit policy (NOTES deviation 1); `GOCACHE` moved
+    in-repo; dist byte-identical.
+  - Notes: TextDecoder needed on import; async exports constructible; BigInt seed accepted; surrogate bug wider; my
+    LC_UUID wording overstated (fixed: dyld refuses only framework-linking binaries; setup script also retries
+    downloads now).
+- [x] G4b Pro verification (2026-11-18): **PASS-WITH-NOTES**, no blocking. Build deterministic; package 5/5;
+  validation PASS; SSR; ownership PASS; Chrome 0/0/0 first run; one timing-sensitive Firefox signal flaky under host load (GopherJS 4/10,
+  Scala control 3/5 in the same window); sizes exact; shared-tool changes additive, 10 ports identical; pro checks
+  16/16. Emit rewrites: probe + `module` binding needed, the two `fs` rewrites not; label renaming forced by Rollup 3.30
+  tree-shaking (minimal repro). The OSS wrapper works for Pro (+787 / +91 / +164 B).
+  - **Decision (coordinator): one emit policy for both ports.** The GopherJS emit ships untouched plus loading-only
+    packaging (wrapper function; Pro keeps the label renaming). GopherJS runtime side effects are documented, not
+    patched out: `globalThis.fs`, `stackTraceLimit`, page-global `require('fs'|'util')`. This closes OSS B2 as
+    documentation. Sent to both implementers along with: Pro real `typeof` (toStringTag spoof), the 62 dead lines,
+    VERDICT notes (one signal stubbed on WebKit/Android as in Scala/Rust, deferred-start timer, null-arg errors, cache
+    shape, the Firefox flake, detector false negatives 12/18; details only in the private VERDICT.md), and `GOCACHE` inside `.toolchains/go/cache`.
+  - Privacy (local only): earlier Pro builds wrote 4 entries into `~/Library/Caches/go-build` (paths in the Pro
+    verdict.json). Told the user; not deleted.
+- [x] G4c Pro round 2 (PASS-WITH-NOTES, final): emit inside `compiled.js` = raw `gopherjs build -m` byte-for-byte
+  apart from the wrapper and the pure label renaming (225 labels, 471 jumps); `$typeOf` / `$instanceOf` / `$id`
+  compile to direct prelude calls, and both toStringTag spoof cases match the oracle; Go 6,467 lines, ownership
+  `target=6489 embedded=0`; Chrome/Firefox 0/0/0, the flaky Firefox signal 4/4; `fp.esm.min.js` 298,020 / 79,506 / 63,897 (system gzip).
+  Whole suite: `check-comparators --suite all` **67/67** (OSS 51, Pro 16); `measure-comparators` 25 rows.
+- [ ] G5 Report with sizes next to the other families (done in COMPARATORS.md); **user OK before any commit**.

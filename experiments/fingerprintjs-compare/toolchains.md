@@ -63,3 +63,15 @@ Ports that need Rollup or Terser import them from
 `experiments/fingerprintjs/node_modules`. Do not install a second copy.
 Terser options are `experiments/fingerprintjs/terser.config.ts`
 (`comments: false`, `safari10: true`).
+
+## GopherJS (added 2026-11-18)
+
+| Tool | Version | Notes |
+| --- | --- | --- |
+| GopherJS | 1.21.0 | latest release (2026-06-26); `.toolchains/go/bin/gopherjs` |
+| Go | 1.21.13 | GopherJS 1.21 compiles Go 1.21 and needs a Go 1.21 `GOROOT` (`GOPHERJS_GOROOT`); `.toolchains/go/go1.21.13`. The system Go is not used. |
+
+Install with `npm run setup:comparators:go` (`experiments/tools/setup-go-comparators.sh`). The Go archive is checked
+against its go.dev SHA-256; GopherJS and its dependencies against the Go checksum database. On macOS the script links
+GopherJS with the system linker and re-signs it ad hoc. Go 1.21's internal linker omits `LC_UUID`, and current dyld
+refuses such a binary when it links system frameworks; GopherJS links CoreFoundation and Security.

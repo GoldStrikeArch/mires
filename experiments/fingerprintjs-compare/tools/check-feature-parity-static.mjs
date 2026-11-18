@@ -192,6 +192,10 @@ async function inspectPort(port) {
 async function inspectIife(dist) {
   const path = resolve(dist, 'fp.min.js')
   if (!existsSync(path)) return { present: false }
+  // Only host APIs a bare V8 context lacks are injected. The context keeps its own
+  // intrinsics (Object, Array, Promise, ...): injecting the host's would give the
+  // program a split-realm global no browser has, where `[]` and `Array` come from
+  // different realms, which breaks emits that compare constructors (GopherJS).
   const sandbox = {
     console,
     setTimeout,
@@ -202,40 +206,6 @@ async function inspectIife(dist) {
     performance,
     URL,
     URLSearchParams,
-    Promise,
-    ArrayBuffer,
-    DataView,
-    Uint8Array,
-    Uint16Array,
-    Uint32Array,
-    Int8Array,
-    Int16Array,
-    Int32Array,
-    Float32Array,
-    Float64Array,
-    BigInt64Array,
-    BigUint64Array,
-    WeakMap,
-    WeakSet,
-    Map,
-    Set,
-    BigInt,
-    Math,
-    Date,
-    JSON,
-    Object,
-    Array,
-    String,
-    Number,
-    Boolean,
-    RegExp,
-    Error,
-    TypeError,
-    RangeError,
-    Symbol,
-    Reflect,
-    Proxy,
-    Intl,
   }
   sandbox.globalThis = sandbox
   sandbox.self = sandbox
