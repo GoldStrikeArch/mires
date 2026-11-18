@@ -1245,7 +1245,7 @@ fn build_decl(
                 .ok_or_else(|| "a slice view without element type".to_owned())?;
             let elem_spec = child_spec_expr(table, interns, elem, cache, pending)?
                 .unwrap_or_else(|| jsast::string("s"));
-            let spec = jsast::object_of(vec![("k", jsast::string("slot")), ("c", elem_spec)]);
+            let spec = jsast::object_of(vec![("k", jsast::string("slice")), ("c", elem_spec)]);
             body.push(jsast::ret(ref_call(spec)));
         }
         ConvTarget::ArrayBuf(elem) => {
@@ -1257,7 +1257,7 @@ fn build_decl(
         ConvTarget::RawVecPtr(elem) => {
             let elem_spec = child_spec_expr(table, interns, elem, cache, pending)?
                 .unwrap_or_else(|| jsast::string("s"));
-            let spec = jsast::object_of(vec![("k", jsast::string("slot")), ("c", elem_spec)]);
+            let spec = jsast::object_of(vec![("k", jsast::string("slice")), ("c", elem_spec)]);
             body.push(jsast::ret(ref_call(spec)));
         }
         ConvTarget::RawVecInner(inner_ty, elem_ty) => {
@@ -1416,7 +1416,7 @@ fn build_decl(
                                 let c = child_spec_expr(table, interns, *elem, cache, pending)?
                                     .unwrap_or_else(jsast::null);
                                 let spec =
-                                    jsast::object_of(vec![("k", jsast::string("slot")), ("c", c)]);
+                                    jsast::object_of(vec![("k", jsast::string("slice")), ("c", c)]);
                                 body.push(jsast::ret(ref_call(spec)));
                             }
                             Some(PointerForm::FatTail) => {
@@ -2324,5 +2324,85 @@ mod tests {
         assert!(host_convert(&table, &interns, d65, jsast::id("v"), Crossing::Out).is_err());
         assert!(host_convert(&table, &interns, raw_pair, jsast::id("p"), Crossing::Out).is_err());
         assert!(host_convert(&table, &interns, uni, jsast::id("u"), Crossing::Out).is_err());
+    }
+
+    #[test]
+    fn slot_pointer_and_slice_pointer_emit_distinct_descriptors() {
+        let interns = Interns::default();
+        let str_id = TypeId(1);
+        let ref_str_id = TypeId(2);
+        let slot_ref_id = TypeId(3);
+        let slice_id = TypeId(4);
+        let ref_slice_id = TypeId(5);
+
+        let mut ref_str = make_desc(
+            ref_str_id.0,
+            TypeKind::Reference {
+                pointee: str_id,
+                mutable: false,
+            },
+            false,
+        );
+        ref_str.js.pointer_form = Some(PointerForm::Str);
+
+        let mut slot_ref = make_desc(
+            slot_ref_id.0,
+            TypeKind::Reference {
+                pointee: ref_str_id,
+                mutable: false,
+            },
+            false,
+        );
+        slot_ref.js.pointer_form = Some(PointerForm::Slot);
+
+        let slice_desc = make_desc(slice_id.0, TypeKind::Slice(ref_str_id), false);
+
+        let mut ref_slice = make_desc(
+            ref_slice_id.0,
+            TypeKind::Reference {
+                pointee: slice_id,
+                mutable: false,
+            },
+            false,
+        );
+        ref_slice.js.pointer_form = Some(PointerForm::FatSlice);
+
+        let table = TypeTable::from(vec![
+            make_desc(str_id.0, TypeKind::Str, false),
+            ref_str,
+            slot_ref,
+            slice_desc,
+            ref_slice,
+        ]);
+
+        let mut cache = BTreeMap::new();
+        let mut pending = Vec::new();
+        let slot_stmt = build_decl(
+            &table,
+            &interns,
+            &JsName::new("slot_fn".to_owned()),
+            ConvTarget::Type(slot_ref_id, Mode::Val),
+            Crossing::Out,
+            &mut cache,
+            &mut pending,
+        )
+        .expect("slot decl");
+        let slot_js = make_link_item(JsName::new("slot_fn".to_owned()), slot_stmt).js;
+        assert!(slot_js.contains("k: \"slot\"") || slot_js.contains("k:\"slot\""), "slot JS: {slot_js}");
+        assert!(!slot_js.contains("k: \"slice\"") && !slot_js.contains("k:\"slice\""));
+
+        let slice_stmt = build_decl(
+            &table,
+            &interns,
+            &JsName::new("slice_fn".to_owned()),
+            ConvTarget::Type(ref_slice_id, Mode::Val),
+            Crossing::Out,
+            &mut cache,
+            &mut pending,
+        )
+        .expect("slice decl");
+        let slice_js = make_link_item(JsName::new("slice_fn".to_owned()), slice_stmt).js;
+        assert!(slice_js.contains("k: \"slice\"") || slice_js.contains("k:\"slice\""), "slice JS: {slice_js}");
+        assert!(!slice_js.contains("k: \"slot\"") && !slice_js.contains("k:\"slot\""));
     }
 }

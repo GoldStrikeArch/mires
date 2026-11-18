@@ -1954,25 +1954,48 @@ globalThis.__rt._bstr_wrap = (value, spec, out) => {
         return Reflect.set(t, prop, val, t);
       },
     });
+  } else if (k === "slice") {
+    const elem = spec.c;
+    proxy = new Proxy(target, {
+      get(t, prop) {
+        const raw = Reflect.get(t, prop, t);
+        if (prop === "buf" && raw !== null && typeof raw === "object") {
+          if (Array.isArray(raw) && Object.isFrozen(raw) && raw.length === 0) return raw;
+          return globalThis.__rt._bstr_wrap(raw, { k: "a", c: elem }, out);
+        }
+        return raw;
+      },
+      set(t, prop, val) {
+        return Reflect.set(t, prop, val, t);
+      },
+    });
   } else if (k === "slot") {
     const elem = spec.c;
+    const rev = out ? globalThis.__rt._bstr_in_ref : globalThis.__rt._bstr_out_ref;
     let partialCache;
     proxy = new Proxy(target, {
       get(t, prop) {
         const raw = Reflect.get(t, prop, t);
         if (prop === "buf" && raw !== null && typeof raw === "object") {
           if (Array.isArray(raw) && Object.isFrozen(raw) && raw.length === 0) return raw;
-          if (t.pr === undefined && typeof t.off === "number") {
-            return globalThis.__rt._bstr_wrap(raw, { k: "a", c: elem }, out);
-          }
+          const existing = cache.get(raw);
+          if (existing !== undefined) return existing;
           const key = t.off;
           if (partialCache !== undefined && partialCache[0] === raw && partialCache[1] === key) {
             return partialCache[2];
           }
-          const p = new Proxy(raw, {
+          let rawTarget = raw;
+          if (
+            !out &&
+            Object.isFrozen(raw) &&
+            (Array.isArray(raw) ? raw.length > 0 : Object.keys(raw).length > 0)
+          ) {
+            rawTarget = Array.isArray(raw) ? raw.slice() : Object.assign({}, raw);
+          }
+          const p = new Proxy(rawTarget, {
             get(bt, bprop) {
               const braw = Reflect.get(bt, bprop, bt);
-              if (bprop === String(key)) return conv(elem, braw, out, true);
+              if (bprop === String(key)) return conv(elem, braw, out, out);
               return braw;
             },
             set(bt, bprop, val) {
@@ -1980,6 +2003,7 @@ globalThis.__rt._bstr_wrap = (value, spec, out) => {
               return Reflect.set(bt, bprop, next, bt);
             },
           });
+          rev.set(p, raw);
           partialCache = [raw, key, p];
           return p;
         }

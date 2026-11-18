@@ -80,6 +80,19 @@
   globalThis.bstrCheckCyc = (label, v) => {
     console.log(`check-cyc ${label}: label=${v.label} selfSame=${v.next._0 === v}`);
   };
+  let leakedHetBuf;
+  let leakedHetBufAfter;
+  globalThis.bstrSeeSlot = (label, v) => {
+    if (label === "het_slot") leakedHetBuf = v.buf;
+    if (label === "het_slot_after_tup") leakedHetBufAfter = v.buf;
+    console.log(`see-slot ${label}: s=${q(v.buf[v.off])} js=${q(v.buf[2])} n=${v.buf[3]}`);
+    return v.buf;
+  };
+  globalThis.bstrMutHetTup = (v) => {
+    v[0] = "new_é";
+    v[1] = { TAG: "Some", _0: "mut_€" };
+    v[3] = 99;
+  };
   globalThis.bstrGetOpt = (which) => (which === 0 ? { TAG: "None" } : { TAG: "Some", _0: "ëins" });
   globalThis.bstrGetPair = () => ["zwëi", 2];
   globalThis.bstrGetNamed = () => ({ name: "drëi", n: 3 });
@@ -119,4 +132,11 @@
   jsCyc.next = { TAG: "Some", _0: jsCyc };
   const retCyc = bstr_exp_cyc(jsCyc);
   console.log(`exp_cyc_same: ${retCyc === jsCyc} label=${retCyc.label}`);
+  const jsHet = ["hé", { TAG: "Some", _0: "😀" }, 10];
+  console.log(`exp_in_slot_tup: ${bstr_exp_in_slot({ buf: jsHet, off: 0 })} ${bstr_exp_in_tup(jsHet)}`);
+  const jsHetRev = ["hé", { TAG: "Some", _0: "😀" }, 10];
+  console.log(`exp_in_tup_slot: ${bstr_exp_in_tup(jsHetRev)} ${bstr_exp_in_slot({ buf: jsHetRev, off: 0 })}`);
+  const frozenSlotBuf = Object.freeze(["hé", 10]);
+  console.log(`exp_in_frozen_slot: ${bstr_exp_in_slot({ buf: frozenSlotBuf, off: 0 })}`);
+  console.log(`exp_in_leaked_het: ${bstr_exp_in_het4(leakedHetBuf)} ${bstr_exp_in_het4(leakedHetBufAfter)}`);
 }

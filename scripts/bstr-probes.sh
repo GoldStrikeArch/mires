@@ -143,6 +143,8 @@ cat "$root/runtime/shim.js" "$work/bytes/repr.js" - <<'EOF' | node - || status=1
   globalThis.bstrCall0 = () => {};
   globalThis.bstrCall2 = () => {};
   globalThis.bstrCheckCyc = () => {};
+  globalThis.bstrSeeSlot = (l, v) => v.buf;
+  globalThis.bstrMutHetTup = () => {};
   globalThis.bstrGetOpt = () => ({ TAG: "None" });
   globalThis.bstrGetPair = () => ["a", 1];
   globalThis.bstrGetNamed = () => ({ name: "a", n: 1 });

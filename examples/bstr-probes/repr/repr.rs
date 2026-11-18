@@ -114,6 +114,8 @@ pub enum Shape {
     Empty,
 }
 
+type HetTup = (&'static str, Option<&'static str>, JsValue, u32);
+
 js_bindings! {
     #[js(call = "globalThis.bstrSee")]
     fn see_opt(label: &str, value: Option<&str>);
@@ -195,6 +197,12 @@ js_bindings! {
     fn host_call_cb0(label: &str, cb: JsValue);
     #[js(call = "globalThis.bstrCall2")]
     fn host_call_cb2(label: &str, cb: JsValue, a: &str, b: (&str, u32));
+    #[js(call = "globalThis.bstrSeeSlot")]
+    fn see_het_slot(label: &str, value: &&'static str) -> JsValue;
+    #[js(call = "globalThis.bstrSee")]
+    fn see_het_tup(label: &str, value: &HetTup);
+    #[js(call = "globalThis.bstrMutHetTup")]
+    fn mut_het_tup(value: &mut HetTup);
 
     #[js(call = "globalThis.bstrGetOpt")]
     fn get_opt(which: u32) -> Option<&'static str>;
@@ -420,6 +428,41 @@ pub fn rust_entry() {
     let _: JsValue = read_kept("cell");
     mut_cell(&cell);
     say(&format!("after-mut-cell {} {}", cell.get().len(), cell.get()));
+
+    // Heterogeneous tuple slot borrowing (`&tup.0`) must not corrupt siblings or poison `_bstr_out_ref`.
+    let mut het: HetTup = ("é", Some("😀"), JsValue::erase("hôst"), 42);
+    let leaked_slot_buf = see_het_slot("het_slot", &het.0);
+    see_het_tup("het_tup", &het);
+    mut_het_tup(&mut het);
+    say(&format!(
+        "after-mut-het {} {:?} {}",
+        het.0.len(),
+        het.1.map(|s| (s.len(), s)),
+        het.3
+    ));
+    see_het_tup("het_tup_after_mut", &het);
+    let _: JsValue = see_het_slot("het_slot_after_tup", &het.0);
+    say(&format!("leaked_slot_buf_len {}", bstr_exp_het_in_out(&leaked_slot_buf)));
+}
+
+#[inline(never)]
+fn bstr_exp_het_in_out(_v: &JsValue) -> usize {
+    1
+}
+
+#[unsafe(no_mangle)]
+pub fn bstr_exp_in_slot(r: &&'static str) -> usize {
+    r.len()
+}
+
+#[unsafe(no_mangle)]
+pub fn bstr_exp_in_tup(t: &(&'static str, Option<&'static str>, u32)) -> usize {
+    t.0.len() + t.1.map_or(0, |s| s.len()) + t.2 as usize
+}
+
+#[unsafe(no_mangle)]
+pub fn bstr_exp_in_het4(t: &HetTup) -> usize {
+    t.0.len() + t.1.map_or(0, |s| s.len()) + t.3 as usize
 }
 
 #[unsafe(no_mangle)]
