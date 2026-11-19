@@ -66,6 +66,12 @@ Dart must be available on PATH; this machine already had Dart 3.13.7. The archiv
 
 `experiments/tools/kotlin` is the version-pinned Kotlin Toolchain 0.12.0 bootstrap wrapper, copied with its original checksums and copyright. It downloads its own compiler/JDK dependencies as needed. The OSS production builder downloads Gradle 9.4.1 and verifies the archive against its published SHA-256 before unpacking it. Existing archives and generated outputs are not a substitute for a successful current build.
 
+**Kotlin production determinism (2026-11-19).** The Kotlin/JS 2.4.10 IR compiler orders the supertypes in `initMetadataForClass(...)` by iterating identity-hashed sets. So the Gradle production emit could flip the order of two interface lists between builds: `[Collection, KtSet]` vs `[KtSet, Collection]` for `AbstractMutableSet` and `HashSet`. The size stayed the same.
+
+`gradle-production/gradle.properties` now runs the compiler in-process with a constant JVM identity hash (`-XX:+UnlockExperimentalVMOptions -XX:hashCode=2`). This changes no compiler setting and patches no emit; it only fixes which of the compiler's own orders is produced.
+
+With the setting, three clean builds were byte-identical, and the OSS and Pro Kotlin checks pass 12/12. Against the Nov-8 artifact, the production output differs only in those two reordered lists: raw bytes are unchanged and gzip-9 moved by +1 byte (29,232). The Toolchain variants and the Pro port were already stable: unchanged across clean builds and identical to their recorded artifacts. The library matrix's Kotlin template uses the same setting.
+
 Scala's project directives pin Scala 3.8.4 and Scala.js 1.22.0 even though the installed Scala CLI's default Scala version is newer. Record the CLI version separately from the language/linker versions. Dependency downloads use the central Maven repository by default through the common runner.
 
 ### Run a smaller selection

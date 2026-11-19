@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "pilot",
+  "language": "dart",
+  "entry": "src/main.dart",
+  "boundary": "run(input: Input) with a dart:js_interop extension type: `text` becomes a Dart String and `top` an int; the result goes back with .toJS. main() publishes run on globalThis.__matrixExports for the generated facade."
+}

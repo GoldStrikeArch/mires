@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "minisearch",
+  "language": "gopherjs",
+  "package": "./src",
+  "boundary": "run(input *js.Object): the operation script is read with Get/Index/Length into Go values; document text, queries, terms in options, string ids and stored strings cross as UTF-16 code units ([]uint16, charCodeAt per unit, never through a Go string), names (fields, stored fields, idField, op) as Go strings (.String(), ASCII in the parity domain), numbers with .Float(); the result is built as JS objects and arrays (Object/Array New, Set, SetIndex), strings from code units with String.fromCharCode.apply. Published on js.Module.exports."
+}

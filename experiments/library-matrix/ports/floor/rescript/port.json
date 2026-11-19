@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "the boundary only: input.text in, the same string out (see ports/pilot/rescript/port.json for the conversions)"
+}

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_floor",
+  "boundary": "the boundary only: input.text in, the same string out (see ports/pilot/rust/port.json for the conversions)"
+}

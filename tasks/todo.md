@@ -707,26 +707,34 @@ Byte strings are paused at `exp/byte-strings` `6e88a2f` (verdict FAIL C1–C3; P
     3. `guard_use_after_free.expect_abort` checks only that the program aborts and prints `5`, not the message. Follow-up: an expected-message check in `test.sh`.
 - [x] F5 Merge (the user's OK, plain mark): fast-forwarded main `5f9ef93` → `a61fca8`. Main was rebuilt (`target/release/jsc-link` sha256 `61ad1f17…`) and the keyed jir+opt sysroots rebuilt for both modes. Gate: 174/174 in unwind and in abort; main's abort-mode core JS = the branch build (150/150). Not pushed. The `alloc-freed` worktree and `fix/freed-marker` branch can now be removed (merged).
 
-## Byte Strings: complete safe boundary + size & speed optimization (2026-11-18; planned)
+## Byte Strings: complete safe boundary + size & speed optimization (2026-11-19; Stage 5: fixing re-audit blockers + release-* default)
 
-Cross-compiler survey (js_of_ocaml 6.4, Melange 7.0 / ReScript 12.3, Scala.js 1.22, Kotlin/JS 2.4, GopherJS, dart2js) and staged plan in `byte_strings_plan.md`. Execution: 1 implementer subagent + 1 independent verifier subagent per stage (`unset CARGO_INCREMENTAL`, `bash scripts/build.sh --locked`, `RCGJS_WITNESS_CHECK=1`, no trailers).
+Cross-compiler survey (js_of_ocaml 6.4, Melange 7.0 / ReScript 12.3, Scala.js 1.22, Kotlin/JS 2.4, GopherJS, dart2js) and staged plan in `byte_strings_plan.md`. Branch `feat/byte-strings` (`5d69917`, integrated code SHA `41444a0`), worktree `.claude/worktrees/bstr-feat`, rebased onto `a61fca8` (`0` overlapping files with `46383cb`; ready for fast-forward/merge on user OK).
 
-- [ ] Stage 1 — Rebase `exp/byte-strings` onto `main` (`a61fca8`) + complete safe host boundary:
-  - [ ] Traverse `TypeKind::Adt { args }`, `Closure`, `Coroutine`, `CoroutineClosure` in `reaches_str`; guard `descriptor.layout.zst` (`[&str; 0]`).
-  - [ ] Synthesize deduplicated per-`(TypeId, Crossing)` converter items using direct literals (replacing per-site `Object.assign` IIFEs); skip `rust_begin_unwind` facade.
-  - [ ] Add `__rt.bstr_ref` (`WeakMap`-cached live `Proxy` view) for `&T`, `&mut T`, `&Cell`, `Slot`, `FatSlice`, `Box<T>`, `Rc<T>`, `RawVec<T>` (`Vec<&str>`, `VecDeque<&str>`), and closure upvars + callback `str` thunks.
-  - [ ] Independent verification: C1–C3 + `[&str; 0]` fixed (`same_pair(&p, &p) === true`, `&mut` write-back + lone-surrogate sanitization, `Vec<&str>`/`Box<[&str]>`/closures = `main`), core 174/174 unwind + abort, switch-off byte-identical to `a61fca8`.
-- [ ] Stage 2 — Codec speedups, interprocedural `is_ascii` elimination & slice outlining:
-  - [ ] Interprocedural `is_ascii` fixpoint in `jsc-link` to elide `bstr_out` on ASCII-proven values.
-  - [ ] `_bstr_is_ascii` (`< 24` char loop + `>= 24` regex) and shared `1024`-byte `Uint8Array` scratch buffer + short-string pure-JS UTF-8 decode in `runtime/shim.js`.
-  - [ ] Peephole `bstr_bytes(bstr_in(x))` -> single `TextEncoder.encode` byte view (`fflate`).
-  - [ ] Outline `StrIndex` slow path via `__rt.bstr_slice` (evicting `core::str` `SliceIndex` via DCE) + link-time hoisting of `>= 32`-byte non-ASCII byte-string literals.
-  - [ ] Independent verification: differential probes + `compact` and `fflate` <= `main` on size and runtime.
-- [ ] Stage 3 — Raw-pointer byte views & byte-string-backed owned `String`:
-  - [ ] Extend `byte_string_view` (`s.charCodeAt(i)`) to raw-pointer byte reads (`marked` `escape_slice`) + tag `strip_prefix`/`strip_suffix`/`trim*`/`get`/`PartialOrd`.
-  - [ ] Widen `StringBuilder` / `HostString` under `js-str=bytes` (`is_empty`, `reserve`, read-only `as_bytes`, `Site` Move/Copy spine fix) so owned `String` builders commit `{ text, cap, len }`.
-  - [ ] Independent verification: differential `String` fuzz + `55`/`56`/`57`/`70` + `repr-report` + `marked` profile/size/timing.
-- [ ] Stage 4 — Full qualification matrix + `release-*` / default enablement & `CONTRACT.md` update.
+- [x] Stage 1 — Rebase `exp/byte-strings` onto `main` (`a61fca8`) + complete safe host boundary (`bstr/s1-boundary` `e23fea9`, verifier **PASS 32/32**, `build/bstr-verify/stage-s1/verdict.json`):
+  - [x] Traverse `TypeKind::Adt { args }` (excluding `String`), `Closure`, `Coroutine`, `CoroutineClosure` in `reaches_str`; guard `descriptor.layout.zst` (`[&str; 0]`); depth cap 64.
+  - [x] Synthesize deduplicated per-`(TypeId, Crossing)` `$bstr$out$*` / `$bstr$in$*` converter items using direct literals (`0` `Object.assign` across `46` helpers); skip `rust_begin_unwind` facade.
+  - [x] Add `__rt.bstr_ref` / `__rt.bstr_ref_in` (`WeakMap`-cached live `Proxy` view) with distinct `{ k: "slice" }` vs `{ k: "slot" }` descriptors for `&T`, `&mut T`, `&Cell`, `Slot`, `FatSlice`, `Box<T>`, `Rc<T>`/`Arc<T>`, `RawVec<T>` (`Vec<&str>`, `VecDeque<&str>`), `BTreeMap`, and closure upvars + callback `str` thunks.
+  - [x] Independent verification (round 1 FAIL on heterogeneous tuple `Slot` cache poisoning → fixed in `e23fea9`, round 2 **PASS 32/32**): C1–C3 + `[&str; 0]` fixed, core `174/174` unwind + abort, switch-off `169/169` SHA-256 identical to `a61fca8`.
+- [x] Stage 2 — Codec speedups, interprocedural `is_ascii` elimination & slice outlining (`bstr/s2-codecs` `bd1e142`, verifier **PASS 27/27**, `build/bstr-verify/stage-s2/verdict.json`):
+  - [x] Two-phase interprocedural `KnownAscii` fixpoint (`jsc-link/src/analysis/ascii.rs`) eliding `bstr_out` on ASCII-proven `str`, immutable `HostString`, and unmutated `Option<&str>`, plus `StringAsStr` post-repr inline guard (`jsc-link/src/opt/inline.rs`).
+  - [x] `_bstr_is_ascii` (`< 24` char loop + `>= 24` regex) and `bstr_out` (`<= 48` pure-JS UTF-8 decode + `49..=1024` shared `Uint8Array(1024).subarray` scratch) in `runtime/shim.js`.
+  - [x] Single-pass `__rt.bstr_utf8_bytes` fusion for `bstr_bytes(bstr_in(x))` with `typeof !== "string"` `TypeError` validation and dominance/purity guard.
+  - [x] Outlined `__rt.bstr_sub*` / `__rt.bstr_get*` / exact 25-codepoint Unicode `White_Space` `__rt.bstr_trim*`, `StrStrip*`/`StrGet`/`StrPartialCmp` tags, and non-ASCII constant hoisting.
+  - [x] Independent verification (round 1 FAIL on `StringAsStr` `HostString` inline & `bstr_utf8_bytes` validation/dominance → fixed in `bd1e142`, round 2 **PASS 27/27**).
+- [x] Stage 3 — Raw-pointer byte views & byte-string-backed owned `String` (`bstr/s3-strings` `1d7f327`, verifier **PASS 29/29**, `build/bstr-verify/stage-s3/verdict.json`):
+  - [x] Closed intra-`Func` `byte_view_analysis` (`as_ptr()`/`RawView` + offset + loop block params + `offset_from` + `Deref` → `s.charCodeAt(i)`), including MIR-inlined `String.vec`.
+  - [x] Stdlib-whitelisted `BstrStringOp` (`IsEmpty`, `Reserve`, `ReserveExact`, `AsBytes`) + real `alloc` `String::reserve_exact` CFG/MIR-inline support so owned `String` builders commit `{ text, cap, len }`.
+  - [x] Independent verification (round 1 FAIL on real `reserve_exact` CFG & stdlib path guard → fixed in `1d7f327`, round 2 **PASS 29/29**).
+- [x] Stage 4 — Integrated qualification & `CONTRACT.md` update (`bstr/s4-integrated` `41444a0` + doc align `5d69917`, verifier **PASS 60/60**, `build/bstr-verify/stage-integrated/verdict.json`):
+  - [x] Switch-off byte-identity vs `a61fca8`: `169/169` `.js` files in unwind and abort + all workload/`compact` bundles SHA-256 identical; `runtime/shim.js` strictly additive (`0` existing lines changed); `cargo test --workspace` `1,221/0`; core `174/174 × 4` (`RCGJS_WITNESS_CHECK=1`).
+  - [x] Qualified `--str bytes` vs `off` metrics (`41444a0`):
+    - **`marked`:** `min` `26,000 → 11,036 B` (**`−57.6%`**), `gzip-9` `9,838 → 4,208 B` (**`−57.2%`**), `brotli-11` `8,655 → 3,744 B` (**`−56.7%`**); Node `p50` **`0.9997 → 0.1354 ms` (`0.135×` = `7.38×` faster)**; `str_bytes 45,069 → 1`, `copy_nonoverlapping 7,180 → 0`, `alloc/dealloc/realloc 2/2/11 → 0/0/0`.
+    - **`compact` (`58/58`):** `min` `155,711 → 153,271 B` (**`−2,440 B`**), `gzip-9` `47,866 → 46,899 B` (**`−967 B` / `−2.0%`**), `brotli-11` `36,806 → 36,015 B` (**`−791 B` / `−2.1%`**).
+    - **`minisearch`:** `gzip-9` `14,325 → 14,290 B` (`−35 B`), `brotli-11` `12,765 → 12,695 B` (`−70 B`); `p50` **`0.2552 → 0.1684 ms` (`0.660×` = `1.52×` faster)**.
+    - **`fflate`:** `gzip-9` `4,989 → 5,069 B` (`+80 B`), `p50` **`0.5695 → 0.5654 ms` (`0.993×`)**; `bstr_in`/`_bstr_units`/`_bstr_sub_reset`/`rust_begin_unwind$bstr` all tree-shaken (`0`).
+    - **`ky`:** `gzip-9` `9,612 → 9,655 B` (`+43 B`).
+  - [ ] Merge `feat/byte-strings` onto `main` and decide whether to flip `release-*` profiles to `js-str=bytes` by default (**awaiting user OK**).
 
 ## GopherJS comparator family (2026-11-18)
 
@@ -799,3 +807,362 @@ checkout. Nothing is committed until verification passes and the user says OK.
   `target=6489 embedded=0`; Chrome/Firefox 0/0/0, the flaky Firefox signal 4/4; `fp.esm.min.js` 298,020 / 79,506 / 63,897 (system gzip).
   Whole suite: `check-comparators --suite all` **67/67** (OSS 51, Pro 16); `measure-comparators` 25 rows.
 - [ ] G5 Report with sizes next to the other families (done in COMPARATORS.md); **user OK before any commit**.
+
+## Library matrix: faithful ports × all compilers (2026-11-18)
+
+Goal: a matrix of real JS/TS libraries × compilers. Each cell is a **faithful port** of the library's algorithm for a
+defined API subset, checked for exact output parity against the pinned npm package, then sized and timed against that
+package (with an A/A noise control). User decisions (2026-11-18): faithful ports (not the reduced recreations); all
+ten workloads; research further candidate libraries now, in parallel.
+
+**Scope.** The ten `browser-workloads` entries map to 7 libraries plus a composite:
+- minisearch 7.2.0, marked 18.1.1, fflate 0.8.3 (already pinned);
+- idb, Ky, uPlot, Workbox (pins to choose: newest release ≥ 2 weeks old);
+- Explorer, a composite rebuilt per language from that language's own ports.
+
+`idb_lines` and `workbox_direct` are Rust-only diagnostic variants of idb / Workbox, so they stay in `browser-workloads`
+and are not separate rows. The existing reduced corpus stays as it is: it is a compiler diagnostic, not a matrix row.
+
+**Languages (9 compiled + the JS original as the baseline):**
+- Rust via mires;
+- ReScript, Melange, js_of_ocaml, Scala.js, Dart, Kotlin/JS, Elm, GopherJS.
+
+Toolchains are the existing comparator setups. Melange and js_of_ocaml may share one OCaml source with per-compiler
+interop modules: the same program through two compilers.
+
+**Rules carried over from the FingerprintJS comparison:**
+- idiomatic code in each language;
+- each family's allowed-techniques row;
+- no product JS, except Elm's allow-listed JS host and its "mostly JS" label;
+- compiler emit untouched, plus loading-only packaging;
+- the production profile per family;
+- the ports change no compiler source;
+- a Rust port that hits a mires bug reports it with a minimal repro, and does not work around it silently.
+
+**Cost.** About 63 ports (7 × 9), each roughly FingerprintJS-sized (1–3k lines), each with independent verification. At
+≤ 3 agents at a time, that is many waves. The harness and all toolchains are proven end to end first, so no expensive
+port starts on broken plumbing.
+
+- [x] L0 Harness, `experiments/library-matrix/` (implementer report; **verification running**).
+  - Contents: registry `matrix.json`; per-language production builders; build runner with receipts; exact checker
+    (string / bytes / strict JSON); N-arm timing (triplet port-a / JS / port-b in a Williams order, so port/js and A/A
+    come from one process or page; `--design pairs` gives the old two-cell form); sizes; `MATRIX.md`; a `floor`
+    identity library for uniform runtime floors.
+  - Pilot results: 9/9 builds, and a clean rebuild is byte-identical; 9/9 exact parity in Node 26.8.1, Chrome 158 and
+    Firefox 160 (Safari unavailable); bench 27/27 cells, A/A 0.95–1.05 at load 11–13; negative controls (wrong
+    output, stale `dist/`, failed and timed-out builds) all refused.
+  - Open, for the verifier: the Rust profile (the harness uses browser-workloads' `release-size`, MIR inline off;
+    the FingerprintJS Rust uses `release-balanced`, and compact uses MIR inline on); the Elm port-sleep emit patch;
+    Melange `emit_stdlib`; drift since the docs (Dart 3.14.0, scala-cli 1.19.0).
+- [x] L0v Harness verification: round 1 FAIL (4 blocking). Sent back with exactly B1–B4. The implementer reports all
+  fixed:
+  - check protocol /3 runs first / repeat / rewritten-in-place, comparing outputs and input state;
+  - bench /2 uses a fresh clone per call, plus random and last in-sample output checks;
+  - bench and the matrix are gated on a current check pass;
+  - `libraryBinding` covers corpus, reference, normalisation and output digests;
+  - Kotlin uses `-XX:hashCode=2` in-process (8/8 identical).
+  - Pilot after the fixes: 9/9 identical builds, 9/9 parity in 3 envs, 27/27 cells, A/A 0.90–1.07.
+  - Round 2: **PASS-WITH-NOTES**. All four controls refused. Kotlin 6/6 identical; `hashCode=2` picks one of the
+    compiler's natural outputs, a JVM setting, not an emit patch. Pilot check 9/9 × 10/10 in 3 envs; bench 18/18,
+    A/A 0.93–1.05.
+  - Residuals:
+    - content-cache memoisation is black-box undetectable (benched 0.01);
+    - in-sample checks catch rare divergence probabilistically (~1.3% of calls verified);
+    - dynamic `import()`, normalisation imports and the harness code are not bound by digest.
+- [x] L0h Harness hardening. Round-3 verification: **PASS-WITH-NOTES**.
+  - Every mechanism held on the controls: the eval import is caught in 3 envs; the microtask hang is killed and the
+    browsers recover; a real Rust panic throws; the image / prefetch / iframe-realm requests are caught; 24 samples
+    give 8/8/8 Williams positions; warm calibration gives 17–21 ms samples; the variant is neutral between arms.
+  - Medium follow-ups:
+    - R3-1 a prefix cache evades the append-only variant;
+    - R3-2 a globalThis cache shared across instances (A/A 0.01 or 97 still `ok`);
+    - R3-3 the browser request log is time-attributed and blamed an innocent port.
+  - Low: process.binding / data: import / wasm gaps; symlink and run-time file-read binding escape; HARNESS_CODE
+    misses registry.mjs and cells.mjs.
+- [ ] L0f Final harness round (sent): fix R3-1…R3-6 and write the threat model in the README (catches accidental
+  divergence and common shortcuts; not a sandbox against adversarial ports; source review plus the lint are part of
+  acceptance). After this the harness is frozen except for bugs.
+- [ ] (Former L0h item list, kept for the record:) Protocols are now check /4 and
+  bench /3; receipts are bound to the harness code by digest.
+  - Caching: a bench-variant hook (the content-cache control goes from 0.018 to 1.39 with it) plus a module-state
+    lint.
+  - Binding: crypto-seeded picks; the module graph follows static and literal dynamic imports; package-dir,
+    normalisation and variant digests; a same-major Node / browser policy.
+  - Guards: the both-threw loophole is closed; the runtime guard blocks network APIs and Node module loads (browser
+    gap documented); call timeouts kill hung cells (5 s); Rust panics throw.
+  - Reporting: the lexer-based embedded-JS counter plus an eval-refs column; the comparator Elm formula; warm
+    re-calibration; 24 samples.
+  - Pilot 27/27 cells with the variant, A/A 0.98–1.15; selftest 15/15.
+  - mires note: the runtime shim's `__rt._str_memo` (a content-keyed host-string memo) could favour Rust on fixed
+    inputs; the variant neutralises it.
+  - The items it was sent:
+  - a no-memoisation rule plus a bench-variant hook and a module-level-cache lint;
+  - a crypto-seeded random pick;
+  - binding by digest for dynamic imports, normalisation imports and the harness code, plus Node and browser
+    versions;
+  - the both-threw loophole;
+  - a runtime import guard;
+  - embedded-JS counter fixes;
+  - the Elm formula;
+  - warm calibration and balanced sample counts;
+  - `--receipts` relocating the work dir;
+  - Rust panics failing fast, plus per-call hang timeouts.
+- [x] K1 FingerprintJS Kotlin comparator (user OK 2026-11-19): `gradle-production/gradle.properties` now has
+  in-process + `-XX:hashCode=2`.
+  - The first rebuild was Gradle UP-TO-DATE (no recompile), so the compile caches were cleaned (toolchains kept).
+  - 3 clean builds are byte-identical.
+  - Against Nov-8, production differs only in 2 reordered interface lists; raw bytes are equal, gzip +1 (29,232).
+    The Toolchain variants and Pro were unchanged.
+  - Kotlin checks: 12/12 PASS. Sizes regenerated. Documented in COMPARATORS.md. Not committed yet.
+- [ ] M1 mires fixes for the 5 matrix bugs (user OK 2026-11-19). Implementer **done**; **verification running**.
+  - Branch `fix/matrix-minisearch-bugs`, HEAD `d93c692`, worktree `.claude/worktrees/mires-matrix-bugs` (0.82 GB).
+  - Commits: `95ca59e` (1, aggregate container liveness in both lanes), `fed7d0f` (2, the SliceView shortcut only
+    for real array refs), `3b84f6c` (3, sysroot patch 0014 disables in-place collect), `c153828` (4,
+    `niche_to_scalar` encode), `d93c692` (5, `__rt._bytes` in compare_bytes).
+  - Gate 174/174 → 180/180 in both modes; check.sh exit 0 (1,203 cargo tests); runtime 88/88; 0 of 150 core and 0 of
+    19 example outputs changed; fixtures 340–345 fail before and pass after.
+  - Gate gap: the MIR inliner is never on in `test.sh` (only side scripts).
+  - Nearby, not fixed (M2 candidates):
+    - a silent miscompile: the `NonZero::new(5)` const decodes to `{}` under inline + `-Oz`;
+    - `(1..6).map(Wrapped)` refused;
+    - `Box<str>::from` drop refused;
+    - the rest of the bug-5 class (byte copy / write_bytes / add through the alloc pointer);
+    - multi-niche transmutes;
+    - coroutine clone shims;
+    - side effect of the bug-3 patch: `capacity()` after collect.
+  - **Verification (2026-11-19): APPROVE WITH CHANGES.**
+    - Reproduced: gate 180/180 in both modes, 0 changed outputs; the inline-on gate is 176/180 on head vs 170/180 on
+      base (4 pre-existing failures: 15_intrinsics, 10_panic, 15_ptr, 332_r3_assert_tc_panic); all 5 original repros
+      pass on head; the MiniSearch port is 58/58 on head (+513 B).
+    - Sent back:
+      1. async-closure clone (the `CoroutineClosure` arm in both `fresh_container`s);
+      2. narrow patch 0014 to different-type collects only (the blanket version costs +39–73% time on collect-heavy
+         code);
+      3. correct the false "round-trip" claim for niche transmutes (signed-niche decode is broken, pre-existing;
+         queued).
+  - Round 2 (implementer, HEAD `eb24b87`):
+    - `34d7b4b`: async-closure container, plus fixture 346;
+    - `92514de`: patch 0014 narrowed to same type + same size, with 343 proving reuse by capacity;
+    - `eb24b87`: round-trip claim corrected.
+    - Gate 181/181 in both modes; 0 changed outputs. **Re-verification running.**
+- [ ] M2 mires follow-up queue (from M1 implementer and verifier; all pre-existing on 46383cb unless noted). New:
+  dropping an async closure that captured a `Vec<T>` throws `native_vec_set_len … buf.fill is not a function` (not
+  checked on base).
+  - **Silent miscompiles:**
+    - the `NonZero::new(5)` const decodes to `{}` under inline + `-Oz`;
+    - `[u16]` read through a `u8` view returns elements (`Hash` for `Vec<u16>` is wrong in JIR, throws in v1);
+    - byte arithmetic on a retyped allocation pointer reads whole elements (33 vs 22);
+    - v1 transmute `NonNull<u8>` → `usize` returns 0;
+    - signed-niche decode (`niche_from_scalar` compares 254, not -2).
+  - **Refusals:**
+    - `(1..6).map(Wrapped)` under inline + `-Oz`;
+    - `Box<str>` drop (any source);
+    - `Rc::make_mut` on a shared `Rc<(String, u32)>`;
+    - `as_chunks` / slices of `Vec<[u8; 3]>`;
+    - coroutine clone shims (unstable);
+    - multi-niche transmutes.
+  - **Infra:**
+    - the gate never runs MIR-inline-on (4 inline-on core failures exist);
+    - the cost model prices shim helpers by unminified source bytes, so a few bytes of shim text can flip flat-ABI
+      choices (price by minified size).
+- [x] L1f minisearch contract fixes: the verifier's letter-permutation bench variant is registered; 9 extra cases
+  (58 total); 80/80 MiniSearch mutants caught (coordinator re-ran: 80 caught, only identity escapes); Math.log facts,
+  `-0` ids, `removeAll(null)` and `fields: []` corrected.
+  - Rust: 58/58 in 3 envs; 318,135 / 74,245 / 59,654 B.
+  - Bench with the variant, 24 samples: Node index 8.99× / search 11.94×; Chrome 6.56 / 9.72; Firefox 6.19 / 8.45;
+    A/A 0.92–1.09.
+- [ ] L1c minisearch, other 8 languages. All registered in `matrix.json` by the coordinator, so agents never touch
+  it. Generic brief: `scratchpad/briefs/matrix-port-template.md`.
+  - ReScript (implementer report, verification pending):
+    - 1,367 lines; 58/58 in 3 envs; build reproduces;
+    - 19,642 / 6,476 / 5,930 B, about the JS reference (20,006 / 6,419 / 5,789);
+    - bench port/js 0.90–1.19 at load 22–53 (rough), A/A 0.90–1.01; lint 0 / 0 / 0.
+    - Finding: ReScript 12's `Iterator.find` (ES2025 iterator helpers) is slow in V8; plain loops fixed it.
+  - OCaml (implementer report, verification pending): one core of 6 byte-identical files for Melange and jsoo; only
+    `host.ml` and the entry differ.
+    - Melange: 1,355 lines; 58/58 in 3 envs; 51,339 / 14,251 / 12,700 B; bench Node 1.62 / 1.36, Chrome 1.52 / 1.33,
+      Firefox 0.69 / 0.86.
+    - jsoo: 1,362 lines; 96,987 / 31,920 / 27,993 B (floor 67,208).
+    - Findings: Melange `Hashtbl` pulls in Printf / CamlinternalFormat (one table ≈ 65 KB min; switching to
+      `Map.Make` halved Melange's size); Melange's arity checks on stdlib higher-order calls cost ≈ 20% of
+      bench-index.
+  - **Harness bug fixed by the coordinator:** `languages/jsoo/build.mjs` failed the whole build when the
+    diagnostic-only `--no-runtime` attribution compile hit js_of_ocaml 6.4.1's "Unresolved internal primitive
+    %int_mul / %int_div / %int_mod". It is now caught and recorded as `runtime: null` plus `runtimeUnavailable`; the
+    stderr is in the build log. Repro: `build/library-matrix/jsoo-bugs/no-runtime-int-arith/`.
+    - Re-ran officially: jsoo minisearch / pilot / floor builds PASS (pilot and floor sizes unchanged); minisearch
+      jsoo 58/58 in 3 envs; pilot 10/10 and floor 3/3 in 3 envs.
+    - jsoo bench (load ≈ 10): Node 1.43 / 1.37, Chrome 1.41 / 1.21, Firefox 0.77 / 0.92; A/A 0.97–1.07.
+  - **Wave 1 verified:** ReScript ACCEPT; Melange and jsoo ACCEPT-WITH-NOTES; the jsoo builder fix
+    ACCEPT-WITH-NOTES.
+    - Reproduced: byte-identical builds; 58/58 in 3 envs; bench within ~10%.
+    - Fuzzer: 5,300 random operation scripts, 0 differences.
+    - Deviations: only contract-allowed (the fuzzy walk stopping past the matrix costs the reference 0.8%) or
+      equivalent; the perf rewrites are idiomatic.
+    - Notes handled by the coordinator: jsoo NOTES.md rewritten for the official results; `runtimeUnavailable` no
+      longer embeds absolute paths (rebuilt, re-checked 3 envs).
+    - Noted: the jsoo runtime installs a global uncaughtException / error handler at import (a family trait).
+  - Scala.js (implementer report, verification pending in wave 2):
+    - 970 lines; 58/58 in 3 envs; reproducible build;
+    - 306,336 / 77,766 / 62,192 B (floor 11,335 / 3,604; the Scala collections library dominates);
+    - bench Node 2.06 / 1.68, Chrome 1.81 / 1.47, Firefox 1.55 / 2.13; A/A 0.93–1.04;
+    - lint module-state 13, all class-field false positives (the lint can't tell class fields from `object`
+      fields).
+    - **Contract fix by the coordinator:** the Scala.js guidance said `java.util.regex` `\p{Z}` / `\p{P}`, which
+      works only on ES2018 links; the builder's ES2015 (the comparator production default) throws
+      PatternSyntaxException. Now points at `js.RegExp(..., "u")` and forbids raising the ES version per port.
+    - Watch-out for future corpora: MiniSearch's timer-driven vacuum continuation can crash after `run` returns if
+      later ops mutate the tree mid-batch.
+  - Kotlin (implementer report, verification pending in wave 2):
+    - 1,162 lines; 58/58 in 3 envs; `--clean` rebuild identical;
+    - 71,755 / 23,521 / 20,518 B; bench Node 2.82 / 2.01, Chrome 2.40 / 2.16, Firefox 1.26 / 1.52 (A/A 0.95–1.10);
+      lint 0. Its LinkedHashMap's string hashing dominates.
+    - **Harness bug fixed by the coordinator:** the Kotlin builder's Gradle reported the compile UP-TO-DATE without
+      recompiling, so "reproduced" proved nothing. Added `--rerun-tasks`. Two forced rebuilds give the same hashes
+      for minisearch / pilot / floor; Node checks pass.
+    - Kotlin guidance added to the contract (-0 vs 0 compare, `round` vs `roundToInt`,
+      ConcurrentModificationException, callable-reference allocation, `Regex` passing `u` to the host).
+  - Dart (implementer report, verification pending in wave 2):
+    - 1,371 lines; 58/58 in 3 envs for min and readable; rebuild identical;
+    - 99,208 / 33,799 / 29,377 B (floor 38,726 / 13,118);
+    - bench Node 2.09 / 1.59, Chrome 1.86 / 1.57, Firefox 1.69 / 2.18; A/A 0.99–1.02;
+    - module-state 1 (MiniSearch's own module RegExp constant).
+    - Findings: dart2js `as` casts go through the general RTI check while `is` / type patterns are `instanceof` (≈ 11%
+      of indexing); generic node classes cost reified checks; `Map.[]=` covariance checks remain at `-O2`.
+    - Fuzz: 3,000 scripts, 0 diffs.
+    - It hit an API timeout mid-run and was resumed.
+  - Reference hazard confirmed by two ports: MiniSearch's async vacuum continuation can reject unhandled after `run`
+    returns (about 340 / 1,500 fuzz scripts). The corpus does not trigger it; future corpus cases of that shape could
+    kill a reference cell.
+  - GopherJS (implementer report, verification in wave 2):
+    - 2,079 lines; 58/58 in 3 envs for min and readable; `--clean` rebuild identical;
+    - 134,177 / 35,615 / 30,804 B (floor 41,652 / 13,739);
+    - bench Node 2.84 / 2.69, Chrome 2.32 / 2.70, Firefox 1.72 / 2.03 (from 7.6× / 7.2×); lint 0.
+    - Text as `[]uint16`; native Go `unicode` tokenizer; host `toLowerCase` for non-ASCII.
+    - GopherJS findings (repros in `build/library-matrix/gopherjs-bugs/`):
+      - `-m` makes `&slice[i]` ≈ 20× slower (`$indexPtr` defineProperty) — an upstream candidate;
+      - calls through function values or interfaces make callers blocking state machines, so it avoided closures,
+        `sort.Interface`, `slices.*Func` and `strconv`. **Idiom judgement is with the wave-2 verifier.**
+    - **Contract fix by the coordinator:** the tokenizer rule said native tables must equal `separators.json`
+      (Unicode 17), while the GopherJS guidance allowed Go's Unicode 15 tables. Now: Unicode ≥ 15.0 standard tables
+      qualify, and the 14 code points new in Unicode 16 / 17 are outside the parity domain (none is in the corpus).
+      README GopherJS hazards updated.
+  - **Wave 2 verified:** Kotlin ACCEPT; Scala.js, Dart and GopherJS ACCEPT-WITH-NOTES; no blocking.
+    - Reproduced: identical in-place and `--clean` builds; 58/58 min and readable in 3 envs; 44 extra adversarial
+      cases (90-way ties, 8,192-unit chunk edges, int32 ids, maxFuzzy 20) pass for all four; bench within 0.18;
+      A/A 0.93–1.05.
+    - GopherJS rewrites: idiomatic for GopherJS and faithful; **footnote in the matrix** that its receipts time the
+      optimised port (the first idiomatic version was 7.6× / 7.2×).
+    - Scala.js lint 13 = class fields. Dart's tie-break gives a strict total order.
+    - My Unicode amendment confirmed (exactly 14 code points differ; all 398 corpus code points agree). Kotlin
+      `--rerun-tasks` confirmed (4 tasks executed).
+    - Parity-domain wording fixed (15.1 → 13.0, with the 14 excluded).
+  - Elm (implementer report; **wave-3 verifier running**):
+    - 2,275 lines in 6 modules plus a 27-line JS host (2.4%, not "mostly JS"); 58/58 in 3 envs; rebuild identical;
+    - 47,275 / 16,632 / 14,347 B (floor 9,679 / 3,886);
+    - bench Node 3.03 / 2.82, Chrome 2.49 / 2.89, Firefox 1.92 / 2.71; A/A 0.98–1.01;
+    - persistent index; insertion-ordered list nodes; native tokenizer from `separators.json`; `logBase e` checked
+      equal to Math.log in 3 engines; fuzz 11,000 scripts with 0 diffs.
+    - **elm/core 1.0.5 defect:** `String.toList "\u{DC00}"` never returns (`while (i--)` reaches -1);
+      foldl / uncons / map / filter mis-decode lone surrogates; `Char.toCode` of a lone high surrogate is NaN.
+      Repro in `scratchpad/elm-bugs/` (a write under `build/` was refused by permissions). Contract Elm guidance
+      corrected.
+- [x] **M1 merged (user OK 2026-11-19):** main fast-forwarded 46383cb → `eb24b87` (8 commits, no overlap with the
+  dirty files).
+  - Coordinator on main: rebuild OK; gate **181/181 unwind, 181/181 abort**.
+  - Matrix Rust ports rebuilt with the fixed compiler: minisearch 318,772 B (+637), pilot 103,060, floor 416; all
+    pass in 3 envs (58/58, 10/10, 3/3).
+  - The original tuple-clone repro now passes.
+  - Rust minisearch re-timed at load 6–19: Node 9.26 / 13.46, Chrome 6.46 / 10.93, Firefox 6.75 / 11.30.
+  - Sizes and matrix regenerated: 27 rows, 9/9 minisearch ports at 58/58 in 3 envs.
+- [ ] L1-commit (user: "commit now"): the verified matrix work plus the Kotlin determinism fix, docs and task notes.
+  The Elm port is excluded until wave 3 passes. Done after the main gate and the Rust minisearch rebuild.
+- [x] L1v minisearch verification: Rust port **accepted** (faithful and safe; 49/49 exact in 3 envs under check/5;
+  passes 9 adversarial extras). Contract had **2 blocking findings**, sent back:
+  - no bench variant (the proposed one leaves texts unchanged); adopt the verifier's letter-permutation variant;
+  - corpus gaps: 10 of 81 MiniSearch mutants escape (unstable autoSuggest sort, AND order, null vs absent, average
+    field-length holes, wildcard + constructor boost, the vacuum boundary on the last term, the remove-term warning);
+    add 9 extra cases.
+  - Plus factual corrections: Math.log figures (Chrome 158 is correctly rounded; Node / Firefox differ on 41 args);
+    `-0` ids; `removeAll(null)`; `fields: []`.
+  - Fresh bench, bench/4, 24 samples, no variant: Node 8.18× / 13.62×; Chrome 6.25 / 9.81; Firefox 6.34 / 9.15;
+    A/A 1.01–1.06.
+  - **Rust profile decision: keep `release-size`, `-Oz`, MIR inline off.** `release-balanced` without inline is
+    within noise and not smaller. MIR inline exposes a new mires miscompile, `[u16] == [u16]` reading past the
+    buffer, sent to M1 as bug 5.
+  - README Math.log figure corrected by the coordinator.
+- [x] L0f Final harness round done, harness **frozen** (bugs only):
+  - R3-3 requests attributed by page load (`/__load/N/`) and drained between loads;
+  - R3-2 disjoint variant ranges per arm, a globalThis diff with per-family `runtimeGlobals`, and `--aa-range`
+    [0.5, 2];
+  - R3-1 a rotating pilot variant plus the variant rule;
+  - R3-4 process.binding / dlopen blocked, a browser CSP refusing data: and blob:, wasm counted as eval refs;
+  - R3-5 symlinks followed, no run-time file reads;
+  - R3-6 HARNESS_CODE completed;
+  - the threat model in the README;
+  - bugs: the per-env reference digest for the bench gate, partial `sizes.mjs` merging, the undici and mires
+    globals allow-listed.
+  - Pilot 27/27 cells, A/A 0.90–1.02, selftest 18/18. Coordinator re-ran selftest (18/18) and the pilot Node check
+    (9/9).
+  - B1: timed calls are unchecked and share one input object (memo / hot-path-wrong controls benched "ok").
+  - B2: bench and the matrix ignore parity (a port failing 9/10 still gets a ratio).
+  - B3: receipts are not bound to the corpus / reference / normalisation digests.
+  - B4: Kotlin output is not byte-reproducible (interface order flips; 4 hashes in 7 builds).
+  - Reproduced fine: 9/9 builds, parity in Node / Chrome / Firefox, 27/27 cells, sizes, stale-dist refusal; the Elm
+    patch is the comparator's verbatim. No same-process A/A bias found.
+- [ ] L0q Queued after B1–B4, from the same verdict's notes:
+  - the checker counts "reference throws + port returns a non-serialisable value" as both threw;
+  - the shape gate is syntactic (`import()` hidden in eval passed in Node);
+  - embedded-JS counter misses (Kotlin `js( ... )` with a space, multi-line triple-quoted `js()`, eval idioms) and
+    double counts (`%%raw`);
+  - Elm "mostly JS" formula differs from the comparator's (1.3% vs 5.6%);
+  - calibration on cold code, so most samples are below `--min-sample-ms`; 9 samples is unbalanced for 3 arms (use
+    12/18); with 9 samples "p95" is the max;
+  - `--receipts` does not move the work dir;
+  - the Rust pilot panic handler is `loop {}` (hangs a cell until timeout);
+  - receipts lack the Node version and a harness digest.
+- [x] L0r Rust profile: **decided, keep release-size / -Oz / MIR inline off** (see L1v). Original note: the verifier recommends `js-profile=release-balanced`, `-Oz`, `JSC_RUST_MIR_INLINE=on` (the
+  repo's "real package settings"; the same sysroot as release-size). On the pilot it is within noise, ~−250 B gzip.
+  Decide after measuring on minisearch with ≥3 seeds.
+- [x] L1a minisearch contract + Rust port (implementer report; **verification pending until the harness is frozen**).
+  - Contract:
+    - broad API subset: add / remove / discard / replace / vacuum, search (prefix, fuzzy, boost, weights, bm25,
+      AND / OR / AND_NOT, nested trees, wildcard, declarative filter and boost callbacks), autoSuggest, and a
+      `toJSON` state probe;
+    - 49 generated cases plus bench-index (1,200 docs) and bench-search (400 docs, 120 queries), with bench
+      variants (id offset, query rotation);
+    - UTF-16 code units everywhere; tokenizer via host `u`-RegExp or the native `separators.json`; full lowercasing
+      with Final_Sigma;
+    - radix-node insertion-order rules; host `Math.log`, which differs per engine, so parity is defined per
+      environment.
+  - Rust: 2,270 lines, safe, no `js!{}`; parity 49/49 in Node / Chrome / Firefox.
+  - Sizes: 317,744 / 74,101 / 59,614 B (JS ref 20,006 / 6,419). Unicode lowercase tables ≈ 25 KB; one shared sort
+    instantiation ≈ 14.6 KB (each core sort instantiation is ≈ 18 KB under mires).
+  - Bench (old 9-sample run): Node index 7.9×, search 13.2×; Chrome index 6.4×; Firefox 6.1× / 8.9×. Time goes to
+    mires heap side-table bookkeeping and GC.
+  - **mires bugs (repros in `build/library-matrix/mires-bugs/`):**
+    - `tuple-clone-uninitialized`, a miscompile: `(String, usize)::clone` emits `b[0]=…; return b` with `b`
+      undefined. Coordinator reproduced it: TypeError on main 46383cb.
+    - `boxed-slice-dealloc`: a run-time refusal on drop of `Box<[u16]>::from(&[u16])`.
+    - `in-place-collect`: a compile refusal ("cannot cast a pointer to (u32, usize) into a pointer to usize").
+    - `slice-partial-ord-lt`: a compile refusal on `<` for slices (`ControlFlow<bool>` transmute).
+  - Harness bugs it found (sent to the final round): the per-engine reference digest for the bench gate; a
+    per-library `sizes.mjs` run overwriting the shared table. Coordinator found: the globalThis guard flags undici
+    and mires runtime globals.
+- (M1 moved below, user OK.)
+- [x] L-R Research → `research/library-matrix/candidates.{md,json}`: 39 ranked candidates with sources, plus 35
+  rejected. Downloads (npm API, week 2026-11-11..17) spot-checked by the coordinator for earcut, long, lz-string,
+  big.js and jmespath: exact. Recommended next wave: earcut, long, @noble/hashes (SHA-2/3/BLAKE2 subset), lz-string,
+  diff, d3-hierarchy, big.js, jmespath. Alternates: entities, functional-red-black-tree; lru-cache is BlueOak-1.0.0.
+  To decide later: js-yaml 4.x vs 5.x; time `long` with and without its WASM path.
+- [ ] L1 Pure-compute libraries, one library at a time. Per library:
+  - (a) a contract: API subset, corpus, canonical output, exact-parity rule, reference adapter;
+  - (b) the Rust port, which proves the contract and the checker;
+  - (c) the 8 other languages in waves of 3;
+  - (d) independent verification per wave.
+  - Order: minisearch → fflate → marked.
+- [ ] L2 Host-API libraries: idb, Ky, uPlot (Canvas2D checked as a recorded call stream), Workbox (a service-worker
+  subset; Chrome lifecycle). Browser checks are required.
+- [ ] L3 Explorer composite per language.
+- [ ] L4 Matrix report: parity, sizes and timing with A/A per cell. **Re-time every cell in one quiet window with no
+  agents or builds running** (agent-time benches ran at load 5–53). User review before any commit.

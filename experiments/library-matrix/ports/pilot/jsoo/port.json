@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "pilot",
+  "language": "jsoo",
+  "entry": "src/main.ml",
+  "boundary": "run(input: input Js.t): Js.to_string turns the UTF-16 `text` into an OCaml UTF-8 string, `top` is read as an int; Js.string converts the result back. Published with Js.export."
+}

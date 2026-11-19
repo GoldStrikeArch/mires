@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "minisearch",
+  "language": "dart",
+  "entry": "src/main.dart",
+  "boundary": "run(input: Input) over dart:js_interop extension types (no copy): options, queries, ids and the declarative filter/boostDocument/boostTerm are read into Dart classes, records and closures as each operation runs; documents stay JS objects that MiniSearch reads through extractField (document[name], each value read into a FieldValue); strings are JS strings throughout (Dart strings on the web, UTF-16, no conversion). The result is built as plain JS objects (JSObject) and arrays (List.toJS) in the adapter's key order. main() publishes run on globalThis.__matrixExports for the generated facade."
+}

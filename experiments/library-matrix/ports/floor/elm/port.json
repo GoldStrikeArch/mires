@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "the boundary only: input.text in, the same string out (see ports/pilot/elm/port.json for the conversions)"
+}

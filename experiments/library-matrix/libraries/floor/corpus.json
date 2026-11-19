@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "cases": [
+    {
+      "id": "empty",
+      "note": "empty string",
+      "input": {
+        "text": ""
+      }
+    },
+    {
+      "id": "ascii",
+      "note": "ASCII",
+      "input": {
+        "text": "The quick brown fox jumps over the lazy dog."
+      }
+    },
+    {
+      "id": "unicode",
+      "note": "BMP and astral code points, a ZWJ sequence: the UTF-16 <-> host string conversion both ways",
+      "input": {
+        "text": "Ünïcödé café — ПРИВЕТ 東京 😀 𝒳𝒴 𠜎 👩‍💻"
+      }
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "minisearch",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "run(input): the input is typed as records, a @tag(\"op\") variant for operations and @unboxed variants for queries, ids and option unions, whose runtime representation is the JSON value itself, so reading it converts nothing; the declarative filter/boostDocument/boostTerm become closures as in the reference adapter; the result is built as JSON.t (plain objects and arrays, JS strings)."
+}

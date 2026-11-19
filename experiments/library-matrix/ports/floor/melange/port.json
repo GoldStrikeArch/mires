@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "language": "melange",
+  "entry": "src/index.ml",
+  "boundary": "the boundary only: input.text in, the same string out (see ports/pilot/melange/port.json for the conversions)"
+}

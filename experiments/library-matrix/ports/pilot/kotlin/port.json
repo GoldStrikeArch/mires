@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "pilot",
+  "language": "kotlin",
+  "boundary": "run(input: Input) with an external interface: `text` is the JS string, `top` a JS number read as Int; the String result is a JS string. Exported with @JsExport as a native ES module export."
+}
