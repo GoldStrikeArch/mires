@@ -8,13 +8,16 @@
 //! retyped at most once (`CONTRACT.md`, "Allocation"), so that cast has no meaning unless the two
 //! types happen to share one. When they did not, the reuse was a compile-time refusal (`(u32,
 //! usize)` to `usize`), a run-time one (a newtype to its field) or a buffer projected into its
-//! first element (a one-tuple to its field). The custom sysroot therefore never collects in place
-//! (`patches/0014-no-in-place-collect.patch`); the result is collected into an allocation of its
-//! own, as it is whenever the layouts do not fit.
+//! first element (a one-tuple to its field). The custom sysroot therefore collects in place only
+//! when the element type stays the same, where the cast is the identity
+//! (`patches/0014-same-type-in-place-collect.patch`); every other pair is collected into an
+//! allocation of its own, as it is whenever the layouts do not fit.
 //!
-//! Covered: a smaller element, a newtype, a one-tuple, two same-sized aggregates, the same type,
+//! Covered, changing type: a smaller element, a newtype, a one-tuple, two same-sized aggregates,
 //! an owning element, a partly consumed source whose remaining elements must still drop, a
-//! `filter_map`, and the shape the MiniSearch port collected (four fields to a struct).
+//! `filter_map`, and the shape the MiniSearch port collected (four fields to a struct). Keeping
+//! the type, in place: a `map`, and a `filter` and a `take` over a `Drop` element, each checked
+//! for the reused allocation (the source's capacity), the values and the drop counts.
 
 #![no_std]
 #![no_main]
@@ -78,6 +81,23 @@ fn points(pairs: Vec<(u32, u32)>) -> Vec<Point> {
 #[inline(never)]
 fn scaled(values: Vec<u32>) -> Vec<u32> {
     values.into_iter().map(|value| value * 10).collect()
+}
+
+/// The same element type: collected in place, so the result keeps the source's allocation, and
+/// with it the source's capacity (a fresh collect sizes its own).
+#[inline(never)]
+fn doubled(values: Vec<u32>) -> Vec<u32> {
+    values.into_iter().map(|value| value * 2).collect()
+}
+
+#[inline(never)]
+fn odd_kept(items: Vec<Counted<'_>>) -> Vec<Counted<'_>> {
+    items.into_iter().filter(|item| item.value % 2 == 1).collect()
+}
+
+#[inline(never)]
+fn first_two_kept(items: Vec<Counted<'_>>) -> Vec<Counted<'_>> {
+    items.into_iter().take(2).collect()
 }
 
 #[inline(never)]
@@ -166,6 +186,45 @@ pub fn rust_entry() {
     print_u32(drops.get());
 
     print_all(&even_sums(vec![(1, 1), (1, 2), (2, 4), (3, 4)]));
+
+    // Keeping the element type: in place, so each result has its source's capacity.
+    let mut source = Vec::with_capacity(8);
+    source.extend_from_slice(&[5, 6, 7]);
+    let doubled = doubled(source);
+    print_usize(doubled.capacity());
+    print_all(&doubled);
+
+    let drops = Cell::new(0);
+    let items: Vec<Counted<'_>> = (1..6)
+        .map(|value| Counted {
+            value,
+            drops: &drops,
+        })
+        .collect();
+    let kept = odd_kept(items);
+    print_usize(kept.capacity());
+    print_usize(kept.len());
+    for item in &kept {
+        print_u32(item.value);
+    }
+    print_u32(drops.get());
+    drop(kept);
+    print_u32(drops.get());
+
+    let drops = Cell::new(0);
+    let items: Vec<Counted<'_>> = (1..5)
+        .map(|value| Counted {
+            value,
+            drops: &drops,
+        })
+        .collect();
+    let kept = first_two_kept(items);
+    print_usize(kept.capacity());
+    print_usize(kept.len());
+    print_u32(kept[0].value + kept[1].value);
+    print_u32(drops.get());
+    drop(kept);
+    print_u32(drops.get());
 
     let rows = vec![
         (vec![1u16, 2], 1.5f64, vec![vec![3u16]], 7u32),

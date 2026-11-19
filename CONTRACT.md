@@ -1517,11 +1517,15 @@ source is still being read, through a cast between the two element pointers. A b
 element representation and is retyped at most once, so that cast has an answer only when the two
 types share a representation; otherwise the reuse was a compile-time refusal (`(u32, usize)` to
 `usize`), a run-time one (a newtype to its field) or a buffer projected into its first element (a
-one-tuple to its field). `patches/0014-no-in-place-collect.patch` makes `in_place_collectible`
-false, so `into_iter().map(..).collect()` and its relatives always collect into an allocation of
-their own, as they do natively whenever the layouts do not fit. The result's `capacity()` is the
-one that path gives (the iterator's lower size bound) rather than the source's.
-`examples/core-tests/343_into_iter_collect.rs` covers the shapes.
+one-tuple to its field). `patches/0014-same-type-in-place-collect.patch` keeps the reuse only
+when the element type stays the same (`into_iter().filter(..)` or `.map(..)` back to the element
+type, the common case), which always shares a representation: the cast is the identity and the
+array's slots are overwritten in order. The test is a comparison of the two type names, which is
+the same type up to lifetimes (a `TypeId` needs `'static`), together with equal sizes. Every other
+pair collects into an allocation of its own, as it does natively whenever the layouts do not fit;
+its `capacity()` is the one that path gives (the iterator's lower size bound) rather than the
+source's. `examples/core-tests/343_into_iter_collect.rs` covers both: the pairs that change type,
+and same-type collects that must keep the allocation, the values and the drop counts.
 
 ### The zero element factory
 
