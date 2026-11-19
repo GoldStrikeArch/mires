@@ -40,7 +40,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::repr::{Op, OpKind, ValueId};
-use rcgjs_object::jir::semantic::{Callee, HostPayload, ItemId, KeyedListPayload, TypeId};
+use rcgjs_object::jir::semantic::{
+    Callee, DefinitionId, HostPayload, ItemId, KeyedListPayload, TypeId,
+};
 use rcgjs_object::jir::types::TypeKind;
 use rcgjs_object::jsast::{self, BinOp, Expr, UnOp};
 use rcgjs_object::ptr;
@@ -1275,6 +1277,12 @@ pub struct ItemEntry {
     /// checks the host's arguments against.
     pub arguments: Vec<TypeId>,
     pub caller_location: bool,
+    /// The `DefinitionId` of `core::panic::Location` when this item directly calls the
+    /// `caller_location` intrinsic, letting non-intrinsic `caller_location_value` sites
+    /// disambiguate `core::panic::Location` from user-defined `Location` structs.
+    pub caller_location_def: Option<DefinitionId>,
+    /// Whether this item belongs to an authenticated `core` crate (`crate_name == "core"`).
+    pub is_core: bool,
     /// Direct SSA parameters mentioned by the body before optimization. This conservative set
     /// lets special call boundaries reject a live argument lane they cannot represent yet.
     pub used_params: BTreeSet<u16>,

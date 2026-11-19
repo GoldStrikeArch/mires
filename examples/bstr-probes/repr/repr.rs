@@ -61,6 +61,13 @@ pub struct SchemaB {
     pub t: &'static str,
 }
 
+/// Deliberate `Location` struct name collision with `core::panic::Location`.
+pub struct Location<'a> {
+    pub name: &'a str,
+    pub x: u32,
+    pub y: u32,
+}
+
 #[derive(Clone, Copy)]
 pub struct WithZstArr {
     pub label: &'static str,
@@ -464,7 +471,7 @@ pub fn rust_entry() {
     say(&format!("leaked_slot_buf_len {}", bstr_exp_het_in_out(&leaked_slot_buf)));
 
     // Reflection & freeze checks via safe `js_bindings!` and `extern "C-unwind"`.
-    for mode in 0..4u32 {
+    for mode in 0..7u32 {
         let mut s_bind = SchemaA { s: "é", n: 7 };
         reflect_mut(mode, &mut s_bind);
         let mut s_arr = ("é", 7u32);
@@ -479,12 +486,20 @@ pub fn rust_entry() {
         ));
     }
 
-    // `#[track_caller]` exported function called directly from Rust.
+    // `#[track_caller]` exported functions (including `Location` struct name collision) called from Rust.
     say(&format!(
         "tc_from_rust {} {}",
         tc_exported("é"),
         tc_exported_file("é")
     ));
+    let u_loc = Location { name: "é", x: 3, y: 4 };
+    let (tf, tl, tc, tu) = call_tc_ambig_from_rust(&u_loc);
+    say(&format!("tc_ambig_from_rust {} {} {} {}", tf, tl, tc, tu));
+}
+
+#[inline(never)]
+fn call_tc_ambig_from_rust(u: &Location<'_>) -> (&'static str, u32, u32, usize) {
+    tc_ambig_exported(u)
 }
 
 #[inline(never)]
@@ -614,4 +629,11 @@ pub fn tc_exported(s: &str) -> usize {
 pub fn tc_exported_file(s: &str) -> &'static str {
     let _ = s;
     core::panic::Location::caller().file()
+}
+
+#[track_caller]
+#[unsafe(no_mangle)]
+pub fn tc_ambig_exported(u: &Location<'_>) -> (&'static str, u32, u32, usize) {
+    let loc = core::panic::Location::caller();
+    (loc.file(), loc.line(), loc.column(), u.name.len() + (u.x + u.y) as usize)
 }

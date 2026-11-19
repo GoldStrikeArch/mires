@@ -2,10 +2,13 @@
 //! shares, the caller `Location` value, and the `static` initializer (v1 `backend/src/constant.rs`
 //! and `intrinsics.rs::caller_location_value`, over the decoded tree instead of an allocation).
 
+use std::collections::BTreeSet;
+
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::origin::SourceFact;
-use rcgjs_object::jir::semantic::{ConstTree, GlobalReference};
-use rcgjs_object::jir::types::{EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind};
+use rcgjs_object::jir::semantic::{CallSemantic, Callee, ConstTree, DefinitionId, GlobalReference};
+use rcgjs_object::jir::types::{EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind, TypeTable};
+use rcgjs_object::jir::Interns;
 use rcgjs_object::jsast::{self, Expr};
 use rcgjs_object::ptr;
 
@@ -541,66 +544,255 @@ impl<'a> JsCx<'a> {
         ]))
     }
 
-    /// The field keys of the `panic_location` lang item's struct: the encoder describes its
-    /// reference type in the table whenever it records a `track_caller` fact; here it is found
-    /// by shape (a struct whose first field points at `str` and whose next two are integers).
+    /// The field keys of the `panic_location` lang item's struct: prefer the exact result type of
+    /// any `caller_location` intrinsic in this body, then `core::panic::Location`'s qualified path
+    /// or authentic `core` crate provenance, then an unambiguous `Location` struct.
     fn location_field_keys(&self) -> Res<(String, String, String)> {
-        let table = self.table;
-        // Every struct shaped like a location, with its name.
-        let mut candidates: Vec<(&str, (String, String, String))> = Vec::new();
-        for descriptor in table.descriptors() {
-            let TypeKind::Adt {
-                form: NominalForm::Struct,
-                variants,
-                ..
-            } = &descriptor.kind
-            else {
-                continue;
-            };
-            let Some(variant) = variants.first() else {
-                continue;
-            };
-            if variant.fields.len() < 3 {
-                continue;
+        let mut exact_tys = BTreeSet::new();
+        let mut global_loc_defs = BTreeSet::new();
+        let mut std_core_crates = BTreeSet::new();
+        let mut named_core_crates = BTreeSet::new();
+        for block in &self.func.blocks {
+            for op in &block.ops {
+                match &op.kind {
+                    rcgjs_object::jir::repr::OpKind::Intrinsic { name, .. }
+                        if self.interns.str(*name) == Some("caller_location") =>
+                    {
+                        if let Some(res_val) = op.result {
+                            if let Some(info) = self.func.values.get(res_val.0 as usize) {
+                                let loc_ty =
+                                    value::pointee_of(self.table, info.ty).unwrap_or(info.ty);
+                                exact_tys.insert(self.table.peeled(loc_ty));
+                            }
+                        }
+                    }
+                    rcgjs_object::jir::repr::OpKind::Call {
+                        callee: Callee::Direct { item, .. },
+                        semantic: CallSemantic::Standard(std_op),
+                        ..
+                    } if std_op.is_str()
+                        || matches!(
+                            std_op,
+                            rcgjs_object::jir::semantic::StandardOperation::SliceSwap
+                        ) =>
+                    {
+                        std_core_crates.insert(item.definition.crate_id);
+                    }
+                    _ => {}
+                }
             }
-            let file_points_at_str = value::pointee_of(table, variant.fields[0].ty)
-                .is_some_and(|pointee| value::is_str(table, pointee));
-            let ints = table.int_info(variant.fields[1].ty).is_some()
-                && table.int_info(variant.fields[2].ty).is_some();
-            if !file_points_at_str || !ints {
-                continue;
+        }
+        for (item_id, entry) in self.items {
+            if let Some(def) = entry.caller_location_def {
+                global_loc_defs.insert(def);
             }
-            let keys = (
-                self.field_key_name(variant.fields[0].key)?,
-                self.field_key_name(variant.fields[1].key)?,
-                self.field_key_name(variant.fields[2].key)?,
-            );
-            candidates.push((self.interns.str(variant.name).unwrap_or(""), keys));
+            if entry.is_core {
+                named_core_crates.insert(item_id.definition.crate_id);
+            }
+            if entry.standard.is_some_and(|std_op| {
+                std_op.is_str()
+                    || matches!(
+                        std_op,
+                        rcgjs_object::jir::semantic::StandardOperation::SliceSwap
+                    )
+            }) {
+                std_core_crates.insert(item_id.definition.crate_id);
+            }
         }
-        // The lang item is literally `Location`; a program has exactly one.
-        let named: Vec<&(String, String, String)> = candidates
-            .iter()
-            .filter(|(name, _)| *name == "Location")
-            .map(|(_, keys)| keys)
-            .collect();
-        if let [keys] = named.as_slice() {
-            return Ok((*keys).clone());
-        }
-        let mut keys = candidates.iter().map(|(_, keys)| keys);
-        let Some(first) = keys.next() else {
-            return Err(decline(
+        let core_crate_ids = if !std_core_crates.is_empty() {
+            std_core_crates
+        } else {
+            named_core_crates
+        };
+        match resolve_location_field_keys(
+            self.table,
+            self.interns,
+            &exact_tys,
+            &global_loc_defs,
+            &core_crate_ids,
+            Some(self.func.item.definition.crate_id),
+            true,
+        )? {
+            LocationKeysOutcome::Found(keys) => Ok(keys),
+            LocationKeysOutcome::Missing => Err(decline(
                 OpClass::Constant,
                 "a caller location is needed, but the type table describes no `Location` struct",
-            ));
-        };
-        if keys.all(|other| other == first) {
-            return Ok(first.clone());
+            )),
+            LocationKeysOutcome::Ambiguous => Err(decline(
+                OpClass::Constant,
+                "the caller `Location` type is ambiguous in the type table",
+            )),
         }
-        Err(decline(
-            OpClass::Constant,
-            "the caller `Location` type is ambiguous in the type table",
-        ))
     }
+}
+
+pub(crate) enum LocationKeysOutcome {
+    Found((String, String, String)),
+    Missing,
+    Ambiguous,
+}
+
+struct LocationCandidate<'a> {
+    ty_id: TypeId,
+    def: DefinitionId,
+    desc_name: Option<&'a str>,
+    variant_name: &'a str,
+    keys: (String, String, String),
+}
+
+pub(crate) fn resolve_location_field_keys(
+    types: &TypeTable,
+    interns: &Interns,
+    exact_tys: &BTreeSet<TypeId>,
+    global_loc_defs: &BTreeSet<DefinitionId>,
+    core_crate_ids: &BTreeSet<u64>,
+    exclude_same_crate: Option<u64>,
+    decline_on_transparent: bool,
+) -> Res<LocationKeysOutcome> {
+    let key_name = |key: FieldKey| -> Res<Option<String>> {
+        match key {
+            FieldKey::Name(id) => Ok(interns.str(id).map(str::to_owned)),
+            FieldKey::Index(index) => Ok(Some(format!("_{index}"))),
+            FieldKey::Transparent => {
+                if decline_on_transparent {
+                    Err(decline(
+                        OpClass::Constant,
+                        "a named field of a zero-sized aggregate has no key in the type table",
+                    ))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    };
+    let is_int = |ty: TypeId| {
+        types.int_info(ty).is_some()
+            || matches!(
+                types.get(types.peeled(ty)).map(|d| &d.kind),
+                Some(TypeKind::Integer { .. })
+            )
+    };
+
+    let mut candidates: Vec<LocationCandidate<'_>> = Vec::new();
+    for descriptor in types.descriptors() {
+        let TypeKind::Adt {
+            def,
+            form: NominalForm::Struct,
+            variants,
+            ..
+        } = &descriptor.kind
+        else {
+            continue;
+        };
+        let Some(variant) = variants.first() else {
+            continue;
+        };
+        if variant.fields.len() < 3 {
+            continue;
+        }
+        let file_points_at_str = value::pointee_of(types, variant.fields[0].ty)
+            .is_some_and(|pointee| value::is_str(types, pointee));
+        let ints = is_int(variant.fields[1].ty) && is_int(variant.fields[2].ty);
+        if !file_points_at_str || !ints {
+            continue;
+        }
+        if let (Some(k0), Some(k1), Some(k2)) = (
+            key_name(variant.fields[0].key)?,
+            key_name(variant.fields[1].key)?,
+            key_name(variant.fields[2].key)?,
+        ) {
+            candidates.push(LocationCandidate {
+                ty_id: descriptor.id,
+                def: *def,
+                desc_name: descriptor.name.and_then(|id| interns.str(id)),
+                variant_name: interns.str(variant.name).unwrap_or(""),
+                keys: (k0, k1, k2),
+            });
+        }
+    }
+
+    if candidates.is_empty() {
+        return Ok(LocationKeysOutcome::Missing);
+    }
+
+    let unanimous = |mut iter: Box<dyn Iterator<Item = &LocationCandidate<'_>> + '_>| -> Option<(String, String, String)> {
+        let first = iter.next()?;
+        if iter.all(|other| other.keys == first.keys) {
+            Some(first.keys.clone())
+        } else {
+            None
+        }
+    };
+
+    if !exact_tys.is_empty() {
+        if let Some(keys) = unanimous(Box::new(
+            candidates
+                .iter()
+                .filter(|cand| exact_tys.contains(&types.peeled(cand.ty_id))),
+        )) {
+            return Ok(LocationKeysOutcome::Found(keys));
+        }
+    }
+
+    if !global_loc_defs.is_empty() {
+        if let Some(keys) = unanimous(Box::new(
+            candidates
+                .iter()
+                .filter(|cand| global_loc_defs.contains(&cand.def)),
+        )) {
+            return Ok(LocationKeysOutcome::Found(keys));
+        }
+    }
+
+    let is_core_location_path = |name: &str| {
+        matches!(
+            name,
+            "core::panic::location::Location" | "core::panic::Location"
+        ) || name.starts_with("core::panic::location::Location<")
+            || name.starts_with("core::panic::Location<")
+    };
+    if let Some(keys) = unanimous(Box::new(
+        candidates
+            .iter()
+            .filter(|cand| cand.desc_name.is_some_and(is_core_location_path)),
+    )) {
+        return Ok(LocationKeysOutcome::Found(keys));
+    }
+
+    if !core_crate_ids.is_empty() {
+        if let Some(keys) = unanimous(Box::new(candidates.iter().filter(|cand| {
+            cand.variant_name == "Location" && core_crate_ids.contains(&cand.def.crate_id)
+        }))) {
+            return Ok(LocationKeysOutcome::Found(keys));
+        }
+    }
+
+    let named: Vec<&LocationCandidate<'_>> = candidates
+        .iter()
+        .filter(|cand| cand.variant_name == "Location")
+        .collect();
+    if let Some(keys) = unanimous(Box::new(named.iter().copied())) {
+        return Ok(LocationKeysOutcome::Found(keys));
+    }
+
+    if let Some(own_crate) = exclude_same_crate {
+        if named.len() > 1 && named.iter().any(|cand| cand.def.crate_id == own_crate) {
+            if let Some(keys) = unanimous(Box::new(
+                named
+                    .iter()
+                    .copied()
+                    .filter(|cand| cand.def.crate_id != own_crate),
+            )) {
+                return Ok(LocationKeysOutcome::Found(keys));
+            }
+        }
+    }
+
+    if let Some(keys) = unanimous(Box::new(candidates.iter())) {
+        return Ok(LocationKeysOutcome::Found(keys));
+    }
+
+    Ok(LocationKeysOutcome::Ambiguous)
 }
 
 /// The tag key, re-exported for the constant tests.

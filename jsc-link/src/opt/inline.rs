@@ -1868,6 +1868,8 @@ mod tests {
                             result: Some(func.sig.result),
                             arguments: func.sig.arguments.clone(),
                             caller_location: func.sig.abi.caller_location,
+                            caller_location_def: None,
+                            is_core: false,
                             used_params: BTreeSet::new(),
                             standard: None,
                             keyed_purity: None,

@@ -215,6 +215,10 @@ cat "$root/runtime/shim.js" "$work/bytes/repr.js" - <<'EOF' | node - || status=1
   if (tc_exported("é") !== 2 + "<host>".length + 0 + 1) {
     throw new Error("expected tc_exported('é') === 9, got " + tc_exported("é"));
   }
+  const ambigDefault = tc_ambig_exported({ name: "é", x: 3, y: 4 });
+  if (JSON.stringify(ambigDefault) !== JSON.stringify(["<host>", 0, 1, 9])) {
+    throw new Error("expected tc_ambig_exported default-loc ['<host>',0,1,9], got " + JSON.stringify(ambigDefault));
+  }
   console.log("bytes write-back TypeError & #[track_caller] default-loc checks passed");
 }
 EOF

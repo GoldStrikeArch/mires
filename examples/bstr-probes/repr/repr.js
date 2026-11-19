@@ -121,6 +121,25 @@
         threw = e instanceof TypeError;
       }
       console.log(`reflect ${label} freeze: val=${q(val)} threw=${threw}`);
+    } else if (mode === 4) {
+      Object.defineProperty(v, key, { writable: false });
+      const d = Object.getOwnPropertyDescriptor(v, key);
+      let threw = false;
+      try {
+        (function () { "use strict"; v[key] = "x"; })();
+      } catch (e) {
+        threw = e instanceof TypeError;
+      }
+      console.log(`reflect ${label} ro_cfg: w=${d && d.writable} e=${d && d.enumerable} c=${d && d.configurable} val=${q(d && d.value)} threw=${threw}`);
+    } else if (mode === 5) {
+      Object.defineProperty(v, key, { value: "€", writable: false, configurable: false });
+      const d = Object.getOwnPropertyDescriptor(v, key);
+      console.log(`reflect ${label} def_val_lock: e=${d && d.enumerable} w=${d && d.writable} c=${d && d.configurable} keys=${q(Object.keys(v))} json=${JSON.stringify(v)}`);
+    } else if (mode === 6) {
+      Object.defineProperty(v, key, { value: "€", configurable: false });
+      (function () { "use strict"; v[key] = "ü"; })();
+      const d = Object.getOwnPropertyDescriptor(v, key);
+      console.log(`reflect ${label} def_val_keep_rw: w=${d && d.writable} e=${d && d.enumerable} val=${q(v[key])} keys=${q(Object.keys(v))} json=${JSON.stringify(v)}`);
     }
   };
   globalThis.bstrReflectMut = (mode, v) => runReflect("bind", mode, v, "s");
@@ -175,10 +194,11 @@
   console.log(`schema_frozen: ${bstr_exp_a_len(Object.freeze({ s: "é", n: 7 }))}`);
   const idObj = { s: "é", n: 7 };
   console.log(`schema_id_same: ${bstr_exp_a_identity(idObj) === idObj} ${bstr_exp_a_same(idObj, idObj)}`);
-  for (let mode = 0; mode < 4; mode++) {
+  for (let mode = 0; mode < 7; mode++) {
     const res = bstr_exp_reflect_export(mode, { s: "é", n: 7 });
     console.log(`exp_reflect mode=${mode} len=${res}`);
   }
   const hostLoc = { filename: "hôst.rs", line: 12, col: 4 };
   console.log(`tc_with_loc: ${tc_exported("é", hostLoc)} ${q(tc_exported_file("é", hostLoc))}`);
+  console.log(`tc_ambig_with_loc: ${q(tc_ambig_exported({ name: "é", x: 3, y: 4 }, hostLoc))}`);
 }

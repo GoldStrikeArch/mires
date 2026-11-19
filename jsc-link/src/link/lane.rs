@@ -2099,6 +2099,7 @@ fn abi_fault() -> Option<String> {
 fn item_index(table: &BTreeMap<JsName, LinkItem>) -> (ItemIndex, DropGlueIndex) {
     let mut index = ItemIndex::new();
     let mut drop_glue = DropGlueIndex::new();
+    let (_, core_crate_ids) = super::collect_panic_location_context(table);
     for (name, item) in table {
         let Some(summary) = item.jir.summary.as_ref() else {
             continue;
@@ -2107,6 +2108,12 @@ fn item_index(table: &BTreeMap<JsName, LinkItem>) -> (ItemIndex, DropGlueIndex) 
             continue;
         };
         let abi = summary.abi.unwrap_or_default();
+        let caller_location_def = item
+            .jir
+            .body
+            .as_ref()
+            .zip(item.jir.interns())
+            .and_then(|(body, interns)| super::item_caller_location_def(body, interns));
         index.insert(
             id,
             ItemEntry {
@@ -2121,6 +2128,8 @@ fn item_index(table: &BTreeMap<JsName, LinkItem>) -> (ItemIndex, DropGlueIndex) 
                     .map(|body| body.signature.arguments.clone())
                     .unwrap_or_default(),
                 caller_location: abi.caller_location,
+                caller_location_def,
+                is_core: core_crate_ids.contains(&id.definition.crate_id),
                 used_params: BTreeSet::new(),
                 standard: match item.jir.body.as_ref().map(|body| body.semantic) {
                     Some(BodySemantic::Standard(operation)) => Some(operation),

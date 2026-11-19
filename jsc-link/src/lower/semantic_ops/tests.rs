@@ -2302,6 +2302,8 @@ fn format_site_js_in(
                 result: None,
                 arguments: Vec::new(),
                 caller_location: false,
+                caller_location_def: None,
+                is_core: false,
                 used_params: BTreeSet::new(),
                 standard: Some(standard),
                 keyed_purity: None,

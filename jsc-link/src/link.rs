@@ -727,73 +727,121 @@ struct PrintedUnit {
 /// value itself, a field, an element, a variant payload, a shared pointee). A signature that
 /// conversion cannot rebuild exactly is refused with the reason, and so is one whose JavaScript
 /// parameters are not one per Rust argument.
+pub(crate) fn item_caller_location_def(
+    body: &crate::jir::Body,
+    interns: &crate::jir::Interns,
+) -> Option<crate::jir::DefinitionId> {
+    use crate::jir::semantic::{Callee, Terminator};
+    use crate::jir::types::TypeKind;
+    use crate::lower::js::value;
+
+    let types = &interns.types;
+    for block in &body.blocks {
+        let Terminator::Call(call) = &block.terminator else {
+            continue;
+        };
+        if let Callee::Intrinsic { name, .. } = &call.callee {
+            if interns.str(*name) == Some("caller_location") {
+                let loc_ty =
+                    value::pointee_of(types, call.destination.ty).unwrap_or(call.destination.ty);
+                if let Some(TypeKind::Adt { def, .. }) =
+                    types.get(types.peeled(loc_ty)).map(|d| &d.kind)
+                {
+                    return Some(*def);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn collect_panic_location_context(
+    table: &BTreeMap<JsName, LinkItem>,
+) -> (BTreeSet<crate::jir::DefinitionId>, BTreeSet<u64>) {
+    use crate::jir::semantic::{CallSemantic, Callee, StandardOperation, Terminator};
+
+    let mut global_loc_defs = BTreeSet::new();
+    let mut std_core_crates = BTreeSet::new();
+    let mut named_core_crates = BTreeSet::new();
+    for item in table.values() {
+        let (Some(body), Some(interns)) = (item.jir.body.as_ref(), item.jir.interns()) else {
+            continue;
+        };
+        if let Some(def) = item_caller_location_def(body, interns) {
+            global_loc_defs.insert(def);
+        }
+        for block in &body.blocks {
+            let Terminator::Call(call) = &block.terminator else {
+                continue;
+            };
+            if let Callee::Direct {
+                item: callee_item, ..
+            } = &call.callee
+            {
+                if matches!(
+                    call.semantic,
+                    CallSemantic::Standard(op)
+                        if op.is_str() || matches!(op, StandardOperation::SliceSwap)
+                ) {
+                    std_core_crates.insert(callee_item.definition.crate_id);
+                }
+            }
+        }
+        if item.crate_name == "core" {
+            let (origin_crate, _) =
+                crate::lower::semantic_ops::string::item_origin_info(item, interns);
+            if origin_crate == "core" {
+                named_core_crates.insert(body.item.definition.crate_id);
+            }
+        }
+    }
+    let core_crate_ids = if !std_core_crates.is_empty() {
+        std_core_crates
+    } else {
+        named_core_crates
+    };
+    (global_loc_defs, core_crate_ids)
+}
+
 fn panic_location_field_keys(
     types: &crate::jir::types::TypeTable,
     interns: &crate::jir::Interns,
+    body: Option<&crate::jir::Body>,
+    global_loc_defs: &BTreeSet<crate::jir::DefinitionId>,
+    core_crate_ids: &BTreeSet<u64>,
 ) -> (String, String, String) {
-    use crate::jir::types::{FieldKey, NominalForm, TypeKind};
+    use crate::jir::semantic::{Callee, Terminator};
+    use crate::lower::js::constant::{resolve_location_field_keys, LocationKeysOutcome};
     use crate::lower::js::value;
 
-    let key_name = |key: FieldKey| -> Option<String> {
-        match key {
-            FieldKey::Name(id) => interns.str(id).map(str::to_owned),
-            FieldKey::Index(i) => Some(format!("_{i}")),
-            FieldKey::Transparent => None,
-        }
-    };
-
-    let mut candidates: Vec<(&str, (String, String, String))> = Vec::new();
-    for descriptor in types.descriptors() {
-        let TypeKind::Adt {
-            form: NominalForm::Struct,
-            variants,
-            ..
-        } = &descriptor.kind
-        else {
-            continue;
-        };
-        let Some(variant) = variants.first() else {
-            continue;
-        };
-        if variant.fields.len() < 3 {
-            continue;
-        }
-        let file_points_at_str = value::pointee_of(types, variant.fields[0].ty)
-            .is_some_and(|pointee| value::is_str(types, pointee));
-        let is_int = |ty| {
-            types.int_info(ty).is_some()
-                || matches!(
-                    types.get(types.peeled(ty)).map(|d| &d.kind),
-                    Some(TypeKind::Integer { .. })
-                )
-        };
-        let ints = is_int(variant.fields[1].ty) && is_int(variant.fields[2].ty);
-        if !file_points_at_str || !ints {
-            continue;
-        }
-        if let (Some(k0), Some(k1), Some(k2)) = (
-            key_name(variant.fields[0].key),
-            key_name(variant.fields[1].key),
-            key_name(variant.fields[2].key),
-        ) {
-            candidates.push((interns.str(variant.name).unwrap_or(""), (k0, k1, k2)));
+    let mut exact_tys = BTreeSet::new();
+    let mut own_crate = None;
+    if let Some(body) = body {
+        own_crate = Some(body.item.definition.crate_id);
+        for block in &body.blocks {
+            if let Terminator::Call(call) = &block.terminator {
+                if let Callee::Intrinsic { name, .. } = &call.callee {
+                    if interns.str(*name) == Some("caller_location") {
+                        let loc_ty = value::pointee_of(types, call.destination.ty)
+                            .unwrap_or(call.destination.ty);
+                        exact_tys.insert(types.peeled(loc_ty));
+                    }
+                }
+            }
         }
     }
-    let named: Vec<&(String, String, String)> = candidates
-        .iter()
-        .filter(|(name, _)| *name == "Location")
-        .map(|(_, keys)| keys)
-        .collect();
-    if let [keys] = named.as_slice() {
-        return (*keys).clone();
+    match resolve_location_field_keys(
+        types,
+        interns,
+        &exact_tys,
+        global_loc_defs,
+        core_crate_ids,
+        own_crate,
+        false,
+    ) {
+        Ok(LocationKeysOutcome::Found(keys)) => keys,
+        _ => ("filename".to_owned(), "line".to_owned(), "col".to_owned()),
     }
-    let mut keys = candidates.iter().map(|(_, keys)| keys);
-    if let Some(first) = keys.next() {
-        if keys.all(|other| other == first) {
-            return first.clone();
-        }
-    }
-    ("file".to_owned(), "line".to_owned(), "col".to_owned())
 }
 
 fn byte_string_facades(
@@ -802,6 +850,7 @@ fn byte_string_facades(
     reachable: &mut Vec<JsName>,
 ) -> Vec<(JsName, JsName)> {
     use crate::lower::bstr::{self, Crossing};
+    let (global_loc_defs, core_crate_ids) = collect_panic_location_context(table);
     let mut facades = Vec::new();
     for name in reachable.iter() {
         let Some(item) = table.get(name) else {
@@ -865,7 +914,13 @@ fn byte_string_facades(
         };
         if signature.abi.caller_location {
             let loc_param = "a_loc".to_owned();
-            let (file_key, line_key, col_key) = panic_location_field_keys(types, interns);
+            let (file_key, line_key, col_key) = panic_location_field_keys(
+                types,
+                interns,
+                Some(body),
+                &global_loc_defs,
+                &core_crate_ids,
+            );
             let default_loc = jsast::object(vec![
                 (file_key.clone(), bstr::literal("<host>")),
                 (line_key, jsast::num(0)),
@@ -3007,5 +3062,247 @@ mod tests {
         assert!(facade_js.contains("<host>"), "{facade_js}");
         assert!(facade_js.contains("filename"), "{facade_js}");
         assert!(facade_js.contains("bstr_ref_in"), "{facade_js}");
+    }
+
+    #[test]
+    fn track_caller_export_disambiguates_core_location_from_user_location_struct() {
+        use crate::jir::interns::{Interns, StrId};
+        use crate::jir::semantic::*;
+        use crate::jir::types::*;
+        use rcgjs_object::item::LinkJir;
+
+        let mut interns = Interns::new();
+        let loc_name = interns.intern_str("Location");
+        let name_key = interns.intern_str("name");
+        let x_key = interns.intern_str("x");
+        let y_key = interns.intern_str("y");
+        let filename_key = interns.intern_str("filename");
+        let line_key = interns.intern_str("line");
+        let col_key = interns.intern_str("col");
+        let intrinsic_name = interns.intern_str("caller_location");
+
+        let make_desc = |id: u128, kind: TypeKind| TypeDescriptor {
+            id: TypeId(id),
+            name: None,
+            kind,
+            layout: LayoutFacts::default(),
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: TypeId(id),
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        };
+
+        let str_ty = TypeId(1);
+        let str_ref_ty = TypeId(2);
+        let u32_ty = TypeId(3);
+        let user_loc_ty = TypeId(4);
+        let user_loc_ref_ty = TypeId(5);
+        let core_loc_ty = TypeId(6);
+        let core_loc_ref_ty = TypeId(7);
+
+        let make_loc_struct =
+            |ty: u128, crate_id: u64, local_hash: u64, keys: (StrId, StrId, StrId)| {
+                make_desc(
+                    ty,
+                    TypeKind::Adt {
+                        def: DefinitionId {
+                            crate_id,
+                            local_hash,
+                        },
+                        args: Vec::new(),
+                        form: NominalForm::Struct,
+                        variants: vec![VariantDescriptor {
+                            name: loc_name,
+                            fields: vec![
+                                FieldDescriptor {
+                                    key: FieldKey::Name(keys.0),
+                                    ty: str_ref_ty,
+                                    offset: 0,
+                                },
+                                FieldDescriptor {
+                                    key: FieldKey::Name(keys.1),
+                                    ty: u32_ty,
+                                    offset: 4,
+                                },
+                                FieldDescriptor {
+                                    key: FieldKey::Name(keys.2),
+                                    ty: u32_ty,
+                                    offset: 8,
+                                },
+                            ],
+                            logical_discr: 0,
+                            physical_tag: None,
+                            result_ok: false,
+                            saved_local_keys: Vec::new(),
+                        }],
+                        niche: None,
+                    },
+                )
+            };
+
+        let mut str_ref_desc = make_desc(
+            str_ref_ty.0,
+            TypeKind::Reference {
+                pointee: str_ty,
+                mutable: false,
+            },
+        );
+        str_ref_desc.js.pointer_form = Some(PointerForm::Str);
+
+        let mut user_loc_desc = make_loc_struct(user_loc_ty.0, 7, 100, (name_key, x_key, y_key));
+        user_loc_desc.js.is_indirect = true;
+        user_loc_desc.js.fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Name(name_key),
+                ty: str_ref_ty,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Name(x_key),
+                ty: u32_ty,
+                offset: 4,
+            },
+            FieldDescriptor {
+                key: FieldKey::Name(y_key),
+                ty: u32_ty,
+                offset: 8,
+            },
+        ];
+
+        let mut user_loc_ref_desc = make_desc(
+            user_loc_ref_ty.0,
+            TypeKind::Reference {
+                pointee: user_loc_ty,
+                mutable: false,
+            },
+        );
+        user_loc_ref_desc.js.pointer_form = Some(PointerForm::Thin);
+
+        let mut core_loc_desc =
+            make_loc_struct(core_loc_ty.0, 99, 200, (filename_key, line_key, col_key));
+        core_loc_desc.js.is_indirect = true;
+
+        let mut core_loc_ref_desc = make_desc(
+            core_loc_ref_ty.0,
+            TypeKind::Reference {
+                pointee: core_loc_ty,
+                mutable: false,
+            },
+        );
+        core_loc_ref_desc.js.pointer_form = Some(PointerForm::Thin);
+
+        interns.types = TypeTable::from(vec![
+            make_desc(str_ty.0, TypeKind::Str),
+            str_ref_desc,
+            make_desc(
+                u32_ty.0,
+                TypeKind::Integer {
+                    signed: false,
+                    bits: 32,
+                },
+            ),
+            user_loc_desc,
+            user_loc_ref_desc,
+            core_loc_desc,
+            core_loc_ref_desc,
+        ]);
+
+        let mut tc_item = duplicate(
+            "tc_ambig",
+            "function tc_ambig(u, $loc) { return u.name.length + $loc.filename.length; }",
+            Some(1),
+            Some(1),
+        );
+        tc_item.linkage = Linkage::exported("tc_ambig".to_owned());
+        tc_item.jir = LinkJir::default();
+        tc_item.jir.use_interns(interns);
+        tc_item.jir.body = Some(Body {
+            item: ItemId {
+                definition: DefinitionId {
+                    crate_id: 7,
+                    local_hash: 1,
+                },
+                instantiation: 0,
+            },
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Ordinary,
+            signature: Signature {
+                arguments: vec![user_loc_ref_ty],
+                result: u32_ty,
+                abi: AbiSignature {
+                    parameters: 2,
+                    spread: None,
+                    caller_location: true,
+                    inline_never: false,
+                },
+            },
+            locals: vec![
+                Local {
+                    id: LocalId(0),
+                    role: LocalRole::Return,
+                    ty: u32_ty,
+                },
+                Local {
+                    id: LocalId(1),
+                    role: LocalRole::Argument,
+                    ty: user_loc_ref_ty,
+                },
+                Local {
+                    id: LocalId(2),
+                    role: LocalRole::Temporary,
+                    ty: core_loc_ref_ty,
+                },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                cleanup: false,
+                statements: Vec::new(),
+                terminator: Terminator::Call(Call {
+                    function: Operand {
+                        ty: TypeId(1),
+                        kind: OperandKind::Constant(Constant::ZeroSized),
+                    },
+                    callee: Callee::Intrinsic {
+                        name: intrinsic_name,
+                        types: Vec::new(),
+                        fallback: None,
+                    },
+                    arguments: Vec::new(),
+                    destination: Place {
+                        local: LocalId(2),
+                        projection: Vec::new(),
+                        ty: core_loc_ref_ty,
+                    },
+                    target: None,
+                    unwind: Unwind::Continue,
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                }),
+            }],
+        });
+
+        let mut table = BTreeMap::from([(JsName::new("tc_ambig".to_owned()), tc_item)]);
+        let mut reachable = vec![JsName::new("tc_ambig".to_owned())];
+        let dcx = Sink::new();
+        let moved = byte_string_facades(&dcx, &mut table, &mut reachable);
+        assert_eq!(dcx.errors(), 0);
+        assert_eq!(moved.len(), 1);
+        let facade_js = &table[&JsName::new("tc_ambig".to_owned())].js;
+        assert!(facade_js.contains("filename:"), "{facade_js}");
+        assert!(facade_js.contains("col: 1"), "{facade_js}");
+        assert!(!facade_js.contains("file:"), "{facade_js}");
+        assert!(!facade_js.contains("{ name:"), "{facade_js}");
     }
 }

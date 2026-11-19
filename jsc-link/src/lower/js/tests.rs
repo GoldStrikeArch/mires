@@ -3682,6 +3682,8 @@ fn a_call_inside_a_track_caller_body_forwards_its_own_location() {
             result: Some(I32),
             arguments: Vec::new(),
             caller_location: true,
+            caller_location_def: None,
+            is_core: false,
             used_params: BTreeSet::new(),
             standard: None,
             keyed_purity: None,
@@ -3813,6 +3815,8 @@ fn a_static_keyed_list_lowers_after_its_dedicated_contract_is_proven() {
             result: Some(ARRAY),
             arguments: Vec::new(),
             caller_location: false,
+            caller_location_def: None,
+            is_core: false,
             used_params: BTreeSet::new(),
             standard: None,
             keyed_purity: Some(super::host::KeyedPurity::Const),
@@ -3831,6 +3835,8 @@ fn a_static_keyed_list_lowers_after_its_dedicated_contract_is_proven() {
             result: Some(I32),
             arguments: Vec::new(),
             caller_location: false,
+            caller_location_def: None,
+            is_core: false,
             used_params: BTreeSet::new(),
             standard: None,
             keyed_purity: Some(super::host::KeyedPurity::Const),
@@ -3849,6 +3855,8 @@ fn a_static_keyed_list_lowers_after_its_dedicated_contract_is_proven() {
             result: Some(POINT),
             arguments: Vec::new(),
             caller_location: false,
+            caller_location_def: None,
+            is_core: false,
             used_params: BTreeSet::new(),
             standard: None,
             keyed_purity: Some(super::host::KeyedPurity::Const),
@@ -6517,6 +6525,289 @@ fn host_string_inline_call_drop_preserves_call_and_non_adjacent_baseline_dealloc
             && js2.contains("__rt.bytes_str(")
             && js2.contains("drop_str("),
         "non-adjacent BaselineDealloc must not defer src snapshot past intervening call:\n{js2}"
+    );
+}
+
+#[test]
+fn caller_location_value_disambiguates_core_location_from_user_location_struct() {
+    use rcgjs_object::jir::{Origin, OriginId, OriginKind, OriginTable, SourceFact};
+
+    let mut interns = world();
+    let loc_name = interns.intern_str("Location");
+    let name_key = interns.intern_str("name");
+    let x_key = interns.intern_str("x");
+    let y_key = interns.intern_str("y");
+
+    let user_loc_ty = TypeId(9901);
+    let user_loc_ref_ty = TypeId(9902);
+    let mut user_loc = descriptor(
+        user_loc_ty,
+        TypeKind::Adt {
+            def: DefinitionId {
+                crate_id: 1,
+                local_hash: 999,
+            },
+            args: Vec::new(),
+            form: NominalForm::Struct,
+            variants: vec![variant(
+                loc_name,
+                vec![
+                    field(FieldKey::Name(name_key), STR_REF),
+                    field(FieldKey::Name(x_key), U32),
+                    field(FieldKey::Name(y_key), U32),
+                ],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        12,
+    );
+    user_loc.js.is_indirect = true;
+    user_loc.js.needs_clone = true;
+    interns.intern_type(user_loc);
+    interns.intern_type(pointer(user_loc_ref_ty, user_loc_ty, PointerForm::Thin, false));
+
+    // Re-register `LOCATION` under a distinct crate id (`99`) so both `Intrinsic("caller_location")`
+    // and non-intrinsic `track_caller` calls resolve `core`'s `(file, line, column)`.
+    let file_key = interns.intern_str("file");
+    let line_key = interns.intern_str("line");
+    let col_key = interns.intern_str("column");
+    let mut core_loc = descriptor(
+        LOCATION,
+        TypeKind::Adt {
+            def: DefinitionId {
+                crate_id: 99,
+                local_hash: 16,
+            },
+            args: Vec::new(),
+            form: NominalForm::Struct,
+            variants: vec![variant(
+                loc_name,
+                vec![
+                    field(FieldKey::Name(file_key), STR_REF),
+                    field(FieldKey::Name(line_key), U32),
+                    field(FieldKey::Name(col_key), U32),
+                ],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        12,
+    );
+    core_loc.js.is_indirect = true;
+    core_loc.js.needs_clone = true;
+    interns.types.replace(core_loc);
+
+    let file_id = interns.intern_str("probe.rs");
+    let intr_name = interns.intern_str("caller_location");
+    let link = interns.intern_str("tc_callee$h2");
+    let item_path = interns.intern_str("test::fn");
+    let fact = interns.intern_source_fact(SourceFact {
+        file: file_id,
+        line: 12,
+        col: 3,
+    });
+    let origins = OriginTable {
+        origins: vec![Origin {
+            kind: OriginKind::Statement,
+            source: Some(fact),
+            local_name: None,
+            inline_stack: Vec::new(),
+        }],
+        statements: Vec::new(),
+        terminators: Vec::new(),
+        locals: Vec::new(),
+        item_path,
+        root: None,
+    };
+
+    // 1) Direct `caller_location` intrinsic alongside `&user::Location` parameter.
+    let e = FuncBuilder::ENTRY;
+    let mut b1 = FuncBuilder::new(item(1), signature(vec![user_loc_ref_ty], REF_LOCATION));
+    let _u = b1.param(user_loc_ref_ty, NO_ORIGIN);
+    let call_intr = b1.op(
+        e,
+        OpKind::Intrinsic {
+            name: intr_name,
+            types: Vec::new(),
+            fallback: None,
+            args: Vec::new(),
+        },
+        REF_LOCATION,
+        OriginId(0),
+    );
+    b1.terminate(e, RTerm::Return(Some(call_intr)));
+    let f1 = b1.finish();
+    let p1 = plan_of(&f1, &[(0, "u")]);
+    let body1 = body_of(BodyKind::Function, f1.sig.clone());
+    let mut input1 = LowerInput {
+        name: &JsName::new("direct_intr".to_owned()),
+        summary: &summary(&[]),
+        body: &body1,
+        origins: Some(&origins),
+        interns: &interns,
+        table: &interns.types,
+        opts: &Opts::default(),
+        items: super::host::EMPTY_ITEMS,
+        drop_glue: super::host::EMPTY_DROP_GLUE,
+        vtables: &super::unsize::EMPTY_VTABLES,
+        spills: &[],
+        abi: None,
+        physical: None,
+        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
+    };
+    let js1 = jsast::stmt_to_string(
+        &function::lower(&input1, &f1, &p1, straight(&f1))
+            .expect("direct caller_location lowers")
+            .decl,
+    );
+    assert!(
+        js1.contains("file:") && js1.contains("line:") && js1.contains("column:") && !js1.contains("name:"),
+        "{js1}"
+    );
+
+    // 2) Call to another `#[track_caller]` fn without `caller_location` intrinsic in caller body.
+    let mut b2 = FuncBuilder::new(item(1), signature(vec![user_loc_ref_ty], I32));
+    let _u2 = b2.param(user_loc_ref_ty, NO_ORIGIN);
+    let call_tc = b2.op(
+        e,
+        OpKind::Call {
+            callee: Callee::Direct {
+                item: item(2),
+                link_name: link,
+            },
+            function: None,
+            args: Vec::new(),
+            track_caller: Some(fact),
+            semantic: CallSemantic::Ordinary,
+            host: None,
+        },
+        I32,
+        OriginId(0),
+    );
+    b2.terminate(e, RTerm::Return(Some(call_tc)));
+    let f2 = b2.finish();
+    let p2 = plan_of(&f2, &[(0, "u")]);
+    let mut items = super::host::ItemIndex::new();
+    items.insert(
+        item(2),
+        super::host::ItemEntry {
+            abi_known: true,
+            name: "tc_callee$h2".to_owned(),
+            params: 1,
+            result: Some(I32),
+            arguments: Vec::new(),
+            caller_location: true,
+            caller_location_def: None,
+            is_core: false,
+            used_params: BTreeSet::new(),
+            standard: None,
+            keyed_purity: None,
+            keyed_read_params: None,
+            keyed_may_unwind: None,
+            keyed_row_capture: None,
+            keyed_proxy_safe_params: None,
+        },
+    );
+    input1.items = &items;
+    let body2 = body_of(BodyKind::Function, f2.sig.clone());
+    input1.body = &body2;
+    let js2 = jsast::stmt_to_string(
+        &function::lower(&input1, &f2, &p2, straight(&f2))
+            .expect("forwarding track_caller call lowers")
+            .decl,
+    );
+    assert!(
+        js2.contains("file:") && js2.contains("line:") && js2.contains("column:") && !js2.contains("name:"),
+        "{js2}"
+    );
+
+    // 3) Third-crate (`alloc`) caller whose crate-scope TypeTable mentions `user::Location`,
+    //    while `core` panic item in `ItemIndex` carries `is_core: true`.
+    let alloc_item = ItemId {
+        definition: DefinitionId {
+            crate_id: 77,
+            local_hash: 500,
+        },
+        instantiation: 0,
+    };
+    let core_panic_item = ItemId {
+        definition: DefinitionId {
+            crate_id: 99,
+            local_hash: 501,
+        },
+        instantiation: 0,
+    };
+    let mut b3 = FuncBuilder::new(alloc_item, signature(vec![], I32));
+    let call_panic = b3.op(
+        e,
+        OpKind::Call {
+            callee: Callee::Direct {
+                item: core_panic_item,
+                link_name: link,
+            },
+            function: None,
+            args: Vec::new(),
+            track_caller: Some(fact),
+            semantic: CallSemantic::Ordinary,
+            host: None,
+        },
+        I32,
+        OriginId(0),
+    );
+    b3.terminate(e, RTerm::Return(Some(call_panic)));
+    let f3 = b3.finish();
+    let p3 = plan_of(&f3, &[]);
+    let mut items3 = super::host::ItemIndex::new();
+    items3.insert(
+        core_panic_item,
+        super::host::ItemEntry {
+            abi_known: true,
+            name: "tc_callee$h2".to_owned(),
+            params: 1,
+            result: Some(I32),
+            arguments: Vec::new(),
+            caller_location: true,
+            caller_location_def: None,
+            is_core: true,
+            used_params: BTreeSet::new(),
+            standard: None,
+            keyed_purity: None,
+            keyed_read_params: None,
+            keyed_may_unwind: None,
+            keyed_row_capture: None,
+            keyed_proxy_safe_params: None,
+        },
+    );
+    let body3 = body_of(BodyKind::Function, f3.sig.clone());
+    let input3 = LowerInput {
+        name: &JsName::new("alloc_caller".to_owned()),
+        summary: &summary(&[]),
+        body: &body3,
+        origins: Some(&origins),
+        interns: &interns,
+        table: &interns.types,
+        opts: &Opts::default(),
+        items: &items3,
+        drop_glue: super::host::EMPTY_DROP_GLUE,
+        vtables: &super::unsize::EMPTY_VTABLES,
+        spills: &[],
+        abi: None,
+        physical: None,
+        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
+    };
+    let js3 = jsast::stmt_to_string(
+        &function::lower(&input3, &f3, &p3, straight(&f3))
+            .expect("cross-crate alloc caller resolves core Location via is_core")
+            .decl,
+    );
+    assert!(
+        js3.contains("file:") && js3.contains("line:") && js3.contains("column:") && !js3.contains("name:"),
+        "{js3}"
     );
 }
 
