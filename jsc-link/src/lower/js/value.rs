@@ -586,19 +586,20 @@ fn clone_enum(
     copy
 }
 
-/// The empty container a value of `ty` is assembled in when MIR writes its fields one by one into
-/// a local that was never assigned whole (`lower/assembly.rs`, v1 `value.rs::fresh_container`):
-/// `[]` for a tuple, an array or a closure environment, `{}` for a struct, a union or an enum with a
-/// payload. `None` for every other value, including a zero-sized one and a transparent wrapper
-/// around a scalar, whose field write is a write of the whole value.
+/// The empty container a value of `ty` is assembled in when MIR writes its fields one by one into a
+/// local that was never assigned whole (`lower/assembly.rs`, v1 `value.rs::fresh_container`): `[]`
+/// for a tuple, an array or the environment of a closure or an async closure, `{}` for a struct, a
+/// union or an enum with a payload. `None` for every other value, including a zero-sized one and a
+/// transparent wrapper around a scalar, whose field write is a write of the whole value.
 pub fn fresh_container(table: &TypeTable, ty: TypeId) -> Option<Expr> {
     if table.is_zst(ty) {
         return None;
     }
     match kind(table, ty)? {
-        TypeKind::Tuple(_) | TypeKind::Array { .. } | TypeKind::Closure { .. } => {
-            Some(jsast::array(Vec::new()))
-        }
+        TypeKind::Tuple(_)
+        | TypeKind::Array { .. }
+        | TypeKind::Closure { .. }
+        | TypeKind::CoroutineClosure { .. } => Some(jsast::array(Vec::new())),
         TypeKind::Adt {
             form: NominalForm::Struct | NominalForm::Union,
             ..

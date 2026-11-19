@@ -14,9 +14,9 @@
 //! Here an aggregate is a JavaScript array or object, and nothing in that body creates one: `_0`
 //! was declared `let _0;` and the first field write threw `Cannot set properties of undefined`.
 //!
-//! So such a local is given an empty container (`[]` for a tuple, an array or a closure, `{}` for
-//! a struct or an object-form enum, `value::fresh_container`) wherever its storage starts over and
-//! a field write can follow before the whole local is assigned:
+//! So such a local is given an empty container (`[]` for a tuple, an array or a closure of either
+//! kind, `{}` for a struct or an object-form enum, `value::fresh_container`) wherever its storage
+//! starts over and a field write can follow before the whole local is assigned:
 //!
 //! * at the top of the function, in its declaration, for a local that is not a parameter;
 //! * at its `StorageLive`;

@@ -514,7 +514,8 @@ pub(crate) fn peel_transparent<'tcx>(tcx: TyCtxt<'tcx>, mut ty: Ty<'tcx>) -> Ty<
 
 /// The empty JavaScript container a value of `ty` is assembled in, when MIR writes its fields one
 /// by one into a local that was never assigned whole (`assembly.rs`): `[]` for a tuple, an array
-/// or a closure environment, `{}` for a struct, a union or an enum with a payload.
+/// or the environment of a closure or an async closure, `{}` for a struct, a union or an enum with
+/// a payload.
 ///
 /// `None` for everything whose value is not such a container: a scalar, a pointer, a primitive
 /// enum, a zero-sized value (`undefined`), a coroutine, and a transparent wrapper around any of
@@ -525,7 +526,9 @@ pub(crate) fn fresh_container<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<E
     }
     let peeled = peel_pattern(peel_transparent(tcx, ty));
     match peeled.kind() {
-        ty::Tuple(_) | ty::Array(..) | ty::Closure(..) => Some(jsast::array(Vec::new())),
+        ty::Tuple(_) | ty::Array(..) | ty::Closure(..) | ty::CoroutineClosure(..) => {
+            Some(jsast::array(Vec::new()))
+        }
         ty::Adt(def, _) if def.is_struct() || def.is_union() => Some(jsast::object(Vec::new())),
         ty::Adt(def, _)
             if def.is_enum()
