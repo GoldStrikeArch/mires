@@ -1489,6 +1489,21 @@ The separate table is important: stores into sort scratch space must not acquire
 ownership or deallocation behavior. `examples/core-tests/100_uninit_stack_retype.rs` pins this
 path.
 
+### Collecting in place
+
+`alloc` reuses the allocation of a `vec::IntoIter` for the `Vec` an adapter chain over it collects
+into, whenever the destination element fits in the source's (`vec/in_place_collect.rs`). That
+reinterprets a block of source elements as a block of destination elements while the rest of the
+source is still being read, through a cast between the two element pointers. A block here holds one
+element representation and is retyped at most once, so that cast has an answer only when the two
+types share a representation; otherwise the reuse was a compile-time refusal (`(u32, usize)` to
+`usize`), a run-time one (a newtype to its field) or a buffer projected into its first element (a
+one-tuple to its field). `patches/0014-no-in-place-collect.patch` makes `in_place_collectible`
+false, so `into_iter().map(..).collect()` and its relatives always collect into an allocation of
+their own, as they do natively whenever the layouts do not fit. The result's `capacity()` is the
+one that path gives (the iterator's lower size bound) rather than the source's.
+`examples/core-tests/343_into_iter_collect.rs` covers the shapes.
+
 ### The zero element factory
 
 A block from `alloc_zeroed` holds zero *bytes*, and a zero element is not always the number `0`: it

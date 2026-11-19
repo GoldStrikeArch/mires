@@ -1,0 +1,52 @@
+rustc_codegen_js: never collect a `Vec` in place.
+
+`alloc::vec::in_place_collect` reuses the allocation of a `vec::IntoIter` for the `Vec` an
+adapter chain over it collects into, whenever the destination element fits in the source's.
+That reinterprets a block of `SRC` elements as a block of `DEST` elements: the buffer pointer is
+cast from `*mut SRC` to `*mut DEST` and written through while the rest of the source is still
+being read. A heap block on this target is a JavaScript array of one element representation,
+retyped at most once, so the cast has an answer only when the two types share a representation;
+otherwise it is a compile-time refusal (`(u32, usize)` to `usize`), a run-time one (a newtype to
+its field) or a projection into the first element (a one-tuple to its field). Select the
+ordinary `from_iter` impls instead, which collect into a fresh allocation.
+
+--- a/library/alloc/src/vec/in_place_collect.rs
++++ b/library/alloc/src/vec/in_place_collect.rs
+@@ -166,27 +166,17 @@
+ use crate::alloc::{Global, handle_alloc_error};
+ 
+ const fn in_place_collectible<DEST, SRC>(
+-    step_merge: Option<NonZero<usize>>,
+-    step_expand: Option<NonZero<usize>>,
++    _step_merge: Option<NonZero<usize>>,
++    _step_expand: Option<NonZero<usize>>,
+ ) -> bool {
+-    // Require matching alignments because an alignment-changing realloc is inefficient on many
+-    // system allocators and better implementations would require the unstable Allocator trait.
+-    if const { SRC::IS_ZST || DEST::IS_ZST || align_of::<SRC>() != align_of::<DEST>() } {
+-        return false;
+-    }
+-
+-    match (step_merge, step_expand) {
+-        (Some(step_merge), Some(step_expand)) => {
+-            // At least N merged source items -> at most M expanded destination items
+-            // e.g.
+-            // - 1 x [u8; 4] -> 4x u8, via flatten
+-            // - 4 x u8 -> 1x [u8; 4], via array_chunks
+-            size_of::<SRC>() * step_merge.get() >= size_of::<DEST>() * step_expand.get()
+-        }
+-        // Fall back to other from_iter impls if an overflow occurred in the step merge/expansion
+-        // tracking.
+-        _ => false,
+-    }
++    // rustc_codegen_js: never reuse the source allocation. Collecting in place reinterprets a
++    // heap block of `SRC` elements as one of `DEST` elements while the rest of the source is still
++    // being read, and a block on this target is a JavaScript array of one element
++    // representation, retyped at most once: the cast between the two element pointers has no
++    // meaning unless the two types happen to share one. The other `from_iter` impls collect into
++    // an allocation of their own, which is always correct and is what happens natively whenever
++    // the layouts do not fit.
++    false
+ }
+ 
+ const fn needs_realloc<SRC, DEST>(src_cap: usize, dst_cap: usize) -> bool {
