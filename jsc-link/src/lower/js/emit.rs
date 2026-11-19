@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rcgjs_object::item::JsName;
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::repr::{
-    Carrier, Op, OpKind, RAssertMessage, RBlockId, RTerm, Root, ValueId,
+    Carrier, CellId, Op, OpKind, RAssertMessage, RBlockId, RTerm, Root, ValueId,
 };
 use rcgjs_object::jir::semantic::{
     BinaryOp, CoroutineDesugaring, CoroutineKind, HostPayload, TypeId,
@@ -783,7 +783,17 @@ impl<'a> JsCx<'a> {
         for op_ref in &payload.ops {
             let op = self.op(*op_ref)?;
             self.at(op.origin);
-            let mut stmts = self.op_stmts(op)?;
+            let mut stmts = match op.kind {
+                OpKind::CellAlloc(cell)
+                    if self
+                        .plan
+                        .fresh_allocs
+                        .contains(&(op_ref.block, op_ref.index)) =>
+                {
+                    self.fresh_container(cell)?
+                }
+                _ => self.op_stmts(op)?,
+            };
             let block = &self.func.blocks[op_ref.block.0 as usize];
             if matches!(block.term, RTerm::Invoke { .. })
                 && op_ref.index as usize + 1 == block.ops.len()
@@ -1688,6 +1698,16 @@ impl<'a> JsCx<'a> {
         }
     }
 
+    /// A `CellAlloc` that creates its cell's container ([`plan::Plan::fresh_allocs`]): the cell
+    /// holds an aggregate that MIR assembles field by field, so its storage is a new empty array or
+    /// object (v1 `assembly.rs`).
+    fn fresh_container(&self, cell: CellId) -> Res<Vec<Stmt>> {
+        let Some(container) = value::fresh_container(self.table, self.cell_ty(cell)?) else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![jsast::assign_stmt(self.cell_expr(cell)?, container)])
+    }
+
     /// The statements of an op with no result.
     fn effect_stmts(&self, op: &Op) -> Res<Vec<Stmt>> {
         let table = self.table;
@@ -1719,7 +1739,8 @@ impl<'a> JsCx<'a> {
                 self.set_discriminant(JsPlace::Var(target), base_ty, *variant)
             }
             // The prelude declares the cell (`let x = []` when boxed); bringing it into existence
-            // is nothing at the alloc site, exactly as v1 declared every local once.
+            // is nothing at the alloc site, exactly as v1 declared every local once. The allocs
+            // that make an aggregate's container are `payload`'s (`fresh_container`).
             OpKind::CellAlloc(_) => Ok(Vec::new()),
             OpKind::CellStore { cell, v } => {
                 let value = self.expr_of(*v)?;

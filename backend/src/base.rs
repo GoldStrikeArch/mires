@@ -39,7 +39,7 @@ use std::cell::{Cell, RefCell};
 use rustc_hir::def_id::DefId;
 use rustc_hir::LangItem;
 use rustc_middle::mir::{
-    self, AssertKind, BasicBlock, BasicBlockData, Body, Local, Statement, StatementKind,
+    self, AssertKind, BasicBlock, BasicBlockData, Body, Local, Location, Statement, StatementKind,
     SwitchTargets, Terminator, TerminatorKind, START_BLOCK,
 };
 use rustc_middle::ty::print::with_no_trimmed_paths;
@@ -168,6 +168,8 @@ pub(crate) struct FnCx<'a, 'tcx> {
     /// call worked out — the cloner, the walk, where every hole writes — has to be waiting when
     /// the later ones are lowered. See `abi.rs`.
     pub(crate) templates: RefCell<std::collections::HashMap<Local, crate::abi::Instantiation>>,
+    /// Where the locals MIR assembles field by field get their containers (`assembly.rs`).
+    pub(crate) assembly: crate::assembly::Assembly,
 }
 
 impl<'a, 'tcx> FnCx<'a, 'tcx> {
@@ -198,7 +200,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             boxed: Vec::new(),
             consumed: Vec::new(),
             templates: RefCell::new(std::collections::HashMap::new()),
+            assembly: crate::assembly::Assembly::default(),
         };
+        fx.assembly = crate::assembly::Assembly::of(&fx, mir);
         fx.consumed = crate::abi::consumed_locals(fx.tcx, mir, &fx.uses);
         // Counted a second time now that the dropped assignments are known, because a borrow one of
         // them takes is not in the emitted program and so needs no box to point at. The first round
@@ -440,7 +444,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     }
                 }
                 (false, _) => {
-                    let init = boxed.then(|| jsast::array(Vec::new()));
+                    let init = boxed
+                        .then(|| jsast::array(Vec::new()))
+                        .or_else(|| self.assembly.at_entry(local).cloned());
                     declarations.push((self.local_name(local), init));
                 }
             }
@@ -570,7 +576,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         // `-Cllvm-args=js-source-map=on`: the same runs, marked rather than commented. A marker
         // prints nothing, so the two options are independent.
         let mut locs = Locs::new(self.tcx);
-        for statement in &data.statements {
+        for (index, statement) in data.statements.iter().enumerate() {
             lines.at(&mut stmts, statement.source_info.span);
             locs.at(
                 &mut stmts,
@@ -580,6 +586,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 ),
             );
             stmts.extend(self.codegen_statement(statement));
+            stmts.extend(self.fresh_containers(Location {
+                block: bb,
+                statement_index: index,
+            }));
         }
         // The two halves run in this order and neither lowers what the other does: a terminator's
         // statements and the value its edge branches on are disjoint parts of it.
@@ -592,6 +602,11 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             ),
         );
         stmts.extend(self.terminator_stmts(data.terminator()));
+        // A call that moved a local assembled in place hands it a new container on its way back.
+        stmts.extend(self.fresh_containers(Location {
+            block: bb,
+            statement_index: data.statements.len(),
+        }));
         // An empty self-loop still executes its backedge. Keep that origin for
         // the loop header; other trailing markers only obstruct block peepholes.
         let empty_loop = matches!(data.terminator().kind, TerminatorKind::Goto { target } if target == bb)
@@ -602,6 +617,17 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             }
         }
         (stmts, self.terminator_term(data.terminator(), blocks))
+    }
+
+    /// The assignments that give a local assembled in place its next container, right after
+    /// `location` started its storage over (`assembly.rs`).
+    fn fresh_containers(&self, location: Location) -> Vec<Stmt> {
+        self.assembly
+            .after(location)
+            .map(|(local, container)| {
+                jsast::assign_stmt(jsast::id(self.local_name(local)), container.clone())
+            })
+            .collect()
     }
 
     /// `StatementKind::SetDiscriminant`: the variant of an already built enum place is changed

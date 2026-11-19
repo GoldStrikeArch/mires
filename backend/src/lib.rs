@@ -44,6 +44,7 @@ use rustc_target::spec::{Arch, Os};
 
 mod abi;
 mod alloc_support;
+mod assembly;
 mod async_analysis;
 mod base;
 pub(crate) use rcgjs_object::baseline_shadow;

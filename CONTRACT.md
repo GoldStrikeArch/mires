@@ -334,6 +334,40 @@ read as generated glue and are stepped over.
 - `&*p` where `*p` is unsized is the **identity**: the fat pointer already carries everything a
   place of that type is (`buf`/`off`/`len`, or `ptr`/`meta`), so there is nothing to re-wrap.
 
+### Aggregates assembled in place
+
+MIR can give a local its value one field at a time, through projections, with no assignment of the
+whole. rustc's clone shim for a tuple or a closure is that shape -- `_0.0 = <A as Clone>::clone(..);
+_0.1 = ..; return` -- and so is every body its MIR inliner splices the shim into, where the return
+place becomes the call's destination local. An aggregate here is a JavaScript array or object, so
+such a local's storage is a container that has to be created, and created again whenever the
+storage starts over: in its declaration at the top of the function, at its `StorageLive`, and after
+it has been moved out whole, because the object that left is the moved value's now. MIR built
+without storage markers has nothing else between two loop iterations that assemble one local and
+move it into a `Vec`.
+
+The container is `[]` for a tuple, an array or a closure environment and `{}` for a struct, a union
+or an enum with a payload (`value::fresh_container`); a zero-sized value, a scalar and a transparent
+wrapper around one need none, since a write to such a wrapper's field is a write of the whole. It is
+made at one of those points only when a field write -- an assignment, a call destination or a
+`SetDiscriminant` through a projection that does not start with a deref -- can follow before a whole
+assignment, a `StorageLive`, a `StorageDead` or a whole move ends the question. A local assigned
+whole before every field write it gets, which is all of the MIR rustc builds from source, has no
+such point and is lowered exactly as before.
+
+`backend/src/assembly.rs` answers this for the baseline lane over rustc's MIR and
+`jsc-link/src/lower/assembly.rs` for the JIR lane over JIR-S. The JIR lane makes such a local a cell
+and puts a `CellAlloc` at each point after the entry; a `CellAlloc` of a container-typed cell is
+spelled as the empty container when the cell's storage is written in place (a mutable view rooted at
+the cell with a path, or a `SetDiscriminant` on a load of it) before a store replaces it
+(`fuse::fresh_cell_allocs`), and as nothing otherwise. Before this, the first field write threw `Cannot set properties of undefined`: every
+clone of a `(String, usize)`, and every `Vec` of such tuples cloned.
+`examples/core-tests/340_assembled_aggregates.rs` writes the shapes in custom MIR (the return
+place for a pair, a triple, a struct, an array and an enum; a local assembled and moved in a loop,
+with storage markers and without; assembled on one path and assigned whole on the other; assigned
+whole once and assembled again after each move) and `341_clone_shim_aggregates.rs` pins the clone
+shims themselves.
+
 ### Runtime shim additions
 
 `runtime/shim.js` defines these beyond the print/abort members above:

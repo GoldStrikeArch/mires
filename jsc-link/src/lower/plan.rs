@@ -172,6 +172,10 @@ pub struct Plan {
     /// Cells that hold an entry parameter, with the parameter value: the cell and the parameter
     /// share a name and the entry `CellAlloc`+`CellStore` is the prelude rebinding.
     pub param_cells: BTreeMap<CellId, ValueId>,
+    /// The `CellAlloc` ops, by block and index, that create their cell's container: the cell holds
+    /// an aggregate that is written in place before anything stores it whole (`lower/assembly.rs`),
+    /// so the alloc is spelled `x = []` or `x = {}` rather than nothing.
+    pub fresh_allocs: BTreeSet<(RBlockId, u32)>,
     /// JavaScript name to Rust name, for every name whose spelling had to change (the source
     /// map's `names` table; v1 `LocalNames::originals`).
     pub source_names: Vec<(String, String)>,

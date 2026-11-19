@@ -179,6 +179,8 @@ struct Analysis {
     /// The locals that are cells before any demotion, with whether each is boxed.
     cells: BTreeSet<LocalId>,
     boxed: BTreeSet<LocalId>,
+    /// Where the locals assembled field by field need a fresh container.
+    assembly: super::assembly::Assembly,
     /// `(pointee, mutable)` to a reference type in the table, for synthetic views. Built on first
     /// use: it walks the whole crate-scope table and most bodies never need it.
     references: std::cell::OnceCell<BTreeMap<(TypeId, bool), TypeId>>,
@@ -251,6 +253,10 @@ impl Analysis {
         }
         let mut cells = BTreeSet::new();
         let mut boxed = BTreeSet::new();
+        // A local assembled in place needs its container made at points SSA values cannot
+        // express (`assembly.rs`), so it is storage: a cell, allocated again at each point.
+        let assembly = super::assembly::Assembly::of(body, table);
+        cells.extend(assembly.locals());
         for local in &body.locals {
             let use_ = uses[local.id.0 as usize];
             let is_arg = local.role == LocalRole::Argument;
@@ -270,6 +276,7 @@ impl Analysis {
             uses,
             cells,
             boxed,
+            assembly,
             references: std::cell::OnceCell::new(),
             location_ty,
             copy_nonoverlapping: std::cell::OnceCell::new(),
@@ -1117,6 +1124,9 @@ impl<'a> Builder<'a> {
         for (index, statement) in data.statements.iter().enumerate() {
             self.origin = self.statement_origin(block, index);
             self.statement(&statement.kind)?;
+            if let Some(locals) = self.analysis.assembly.after_statement.get(&(block, index)) {
+                self.fresh_storage(locals);
+            }
         }
         self.origin = self.terminator_origin(block);
         let shape = self.terminator(&data.terminator)?;
@@ -1139,6 +1149,9 @@ impl<'a> Builder<'a> {
                     let unit = self.op(OpKind::Const(ConstTree::Unit), call.destination.ty);
                     self.write_place(&call.destination, unit)?;
                 }
+                if let Some(locals) = self.analysis.assembly.after_call.get(&source) {
+                    self.fresh_storage(locals);
+                }
                 call.target
             }
             Terminator::Drop { target, .. } => Some(*target),
@@ -1149,6 +1162,20 @@ impl<'a> Builder<'a> {
             None => TermShape::Unreachable,
         });
         Ok(())
+    }
+
+    /// Gives each local assembled in place fresh storage where `assembly.rs` found its storage
+    /// starting over with a field write to follow: its `StorageLive`, or the statement or call that
+    /// moved it out. The emitter spells the alloc as the local's empty container.
+    fn fresh_storage(&mut self, locals: &[LocalId]) {
+        let origin = self.origin;
+        for local in locals {
+            if let LocalKind::Cell(cell) = self.kinds[local.0 as usize] {
+                self.origin = self.local_origin(*local);
+                self.effect(OpKind::CellAlloc(cell));
+            }
+        }
+        self.origin = origin;
     }
 
     // -- reading and writing locals -----------------------------------------------------------
@@ -1834,8 +1861,30 @@ impl<'a> Builder<'a> {
                     self.effect(OpKind::SetDiscriminant { base, variant });
                 }
                 LocalKind::Cell(cell) => {
-                    // Load, set, store back: exact under value semantics; the store is `x = x`.
                     let ty = self.local_ty(place.local);
+                    // A variant with no fields has nothing in the storage to keep, so the write
+                    // is the whole value. Loading the cell instead would read storage that may
+                    // not hold a value yet: MIR can give a local its value by `SetDiscriminant`
+                    // alone (`assembly.rs`), and a load of an uninitialized cell is undefined.
+                    let fieldless = self
+                        .table
+                        .variants(self.table.peeled(ty))
+                        .get(variant as usize)
+                        .is_some_and(|descriptor| descriptor.fields.is_empty());
+                    if fieldless && self.table.peeled(ty) == self.table.peeled(place.ty) {
+                        let whole = self.op(
+                            OpKind::Aggregate {
+                                ty: place.ty,
+                                variant,
+                                active_field: None,
+                                fields: Vec::new(),
+                            },
+                            place.ty,
+                        );
+                        self.effect(OpKind::CellStore { cell, v: whole });
+                        return Ok(());
+                    }
+                    // Load, set, store back: exact under value semantics; the store is `x = x`.
                     let base = self.op(OpKind::CellLoad(cell), ty);
                     self.effect(OpKind::SetDiscriminant { base, variant });
                     self.effect(OpKind::CellStore { cell, v: base });
@@ -2084,6 +2133,11 @@ impl<'a> Builder<'a> {
                 // A `()`-returning call still defines its destination.
                 let unit = self.op(OpKind::Const(ConstTree::Unit), dest_ty);
                 self.write_place(&call.destination, unit)?;
+            }
+        }
+        if !diverges {
+            if let Some(locals) = self.analysis.assembly.after_call.get(&self.block) {
+                self.fresh_storage(locals);
             }
         }
         Ok(match call.target {

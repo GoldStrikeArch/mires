@@ -46,6 +46,7 @@
 //! `linkage` and `order` are not in [`LoweredItem`] at all, because they are what the item IS
 //! and no lane may move an item in the program.
 
+pub mod assembly;
 pub mod bigint;
 pub mod fuse;
 pub mod js;

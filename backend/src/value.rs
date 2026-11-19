@@ -512,6 +512,31 @@ pub(crate) fn peel_transparent<'tcx>(tcx: TyCtxt<'tcx>, mut ty: Ty<'tcx>) -> Ty<
     ty
 }
 
+/// The empty JavaScript container a value of `ty` is assembled in, when MIR writes its fields one
+/// by one into a local that was never assigned whole (`assembly.rs`): `[]` for a tuple, an array
+/// or a closure environment, `{}` for a struct, a union or an enum with a payload.
+///
+/// `None` for everything whose value is not such a container: a scalar, a pointer, a primitive
+/// enum, a zero-sized value (`undefined`), a coroutine, and a transparent wrapper around any of
+/// those. A write to a field of such a wrapper is a write of the whole value, which needs nothing.
+pub(crate) fn fresh_container<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Expr> {
+    if is_zst(tcx, ty) {
+        return None;
+    }
+    let peeled = peel_pattern(peel_transparent(tcx, ty));
+    match peeled.kind() {
+        ty::Tuple(_) | ty::Array(..) | ty::Closure(..) => Some(jsast::array(Vec::new())),
+        ty::Adt(def, _) if def.is_struct() || def.is_union() => Some(jsast::object(Vec::new())),
+        ty::Adt(def, _)
+            if def.is_enum()
+                && enum_repr(tcx, peeled) == Some(EnumRepr::Tag { fieldless: false }) =>
+        {
+            Some(jsast::object(Vec::new()))
+        }
+        _ => None,
+    }
+}
+
 /// Whether a reference to a place of this type is the place's own JS value (and `Deref` a no-op).
 ///
 /// See the module documentation: everything except the JS primitives is indirect.
