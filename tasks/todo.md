@@ -971,7 +971,7 @@ port starts on broken plumbing.
   - Rust: 58/58 in 3 envs; 318,135 / 74,245 / 59,654 B.
   - Bench with the variant, 24 samples: Node index 8.99× / search 11.94×; Chrome 6.56 / 9.72; Firefox 6.19 / 8.45;
     A/A 0.92–1.09.
-- [ ] L1c minisearch, other 8 languages. All registered in `matrix.json` by the coordinator, so agents never touch
+- [x] L1c minisearch, other 8 languages. **All 9 languages verified.** All registered in `matrix.json` by the coordinator, so agents never touch
   it. Generic brief: `scratchpad/briefs/matrix-port-template.md`.
   - ReScript (implementer report, verification pending):
     - 1,367 lines; 58/58 in 3 envs; build reproduces;
@@ -1057,7 +1057,16 @@ port starts on broken plumbing.
     - My Unicode amendment confirmed (exactly 14 code points differ; all 398 corpus code points agree). Kotlin
       `--rerun-tasks` confirmed (4 tasks executed).
     - Parity-domain wording fixed (15.1 → 13.0, with the 14 excluded).
-  - Elm (implementer report; **wave-3 verifier running**):
+  - **Wave 3 verified:** Elm ACCEPT-WITH-NOTES, no blocking.
+    - Reproduced: identical rebuilds; 58/58 in 3 envs, min and readable; bench within ~8%.
+    - The JS host is I/O only (2.40%, not "mostly JS").
+    - Snapshot walks are equivalent to MiniSearch's live iterator: 7 hand cases, 43,000 fuzz scripts with 0
+      mismatches, 6 of 7 mutants caught (the survivor is provably equivalent).
+    - The elm/core defect reproduced independently and is unreachable from the port.
+    - `logBase e` is bit-identical on 720,606 arguments per engine.
+    - Coordinator: the contract now puts fractional count options (`batchSize`, `minDirtCount`) outside the domain
+      (Elm rejects them); Elm NOTES line count fixed; Elm rebuilt (same artifact) and the matrix regenerated.
+  - Elm (implementer report):
     - 2,275 lines in 6 modules plus a 27-line JS host (2.4%, not "mostly JS"); 58/58 in 3 envs; rebuild identical;
     - 47,275 / 16,632 / 14,347 B (floor 9,679 / 3,886);
     - bench Node 3.03 / 2.82, Chrome 2.49 / 2.89, Firefox 1.92 / 2.71; A/A 0.98–1.01;
@@ -1075,8 +1084,8 @@ port starts on broken plumbing.
   - The original tuple-clone repro now passes.
   - Rust minisearch re-timed at load 6–19: Node 9.26 / 13.46, Chrome 6.46 / 10.93, Firefox 6.75 / 11.30.
   - Sizes and matrix regenerated: 27 rows, 9/9 minisearch ports at 58/58 in 3 envs.
-- [ ] L1-commit (user: "commit now"): the verified matrix work plus the Kotlin determinism fix, docs and task notes.
-  The Elm port is excluded until wave 3 passes. Done after the main gate and the Rust minisearch rebuild.
+- [x] L1-commit (user: "commit now"): `f72c452` holds the matrix plus 8 verified ports, the Kotlin fix, docs and notes.
+  The Elm port follows in its own commit after wave 3.
 - [x] L1v minisearch verification: Rust port **accepted** (faithful and safe; 49/49 exact in 3 envs under check/5;
   passes 9 adversarial extras). Contract had **2 blocking findings**, sent back:
   - no bench variant (the proposed one leaves texts unchanged); adopt the verifier's letter-permutation variant;

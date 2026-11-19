@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "generatedAt": "2026-11-19T06:40:20.425Z",
+  "generatedAt": "2026-11-19T06:45:58.663Z",
   "tool": "experiments/library-matrix/tools/matrix.mjs",
   "registry": {
     "path": "experiments/library-matrix/matrix.json",
@@ -4114,8 +4114,8 @@
       "production": "elm make --optimize; comparator wrapper; compiler-aware Terser on the Elm module; Rollup over the JS host; common Terser",
       "build": {
         "status": "pass",
-        "seconds": 2.055,
-        "reproducible": true,
+        "seconds": 3.521,
+        "reproducible": null,
         "receipt": "build/library-matrix/builds/minisearch--elm.json",
         "artifact": {
           "path": "experiments/library-matrix/ports/minisearch/elm/dist/index.min.js",

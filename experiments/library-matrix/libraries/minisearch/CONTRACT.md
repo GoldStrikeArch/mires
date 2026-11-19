@@ -489,6 +489,9 @@ of the non-negative `term.length * fuzzy` rounds halves up (`floor(x)`, plus 1 w
 - `fuzzy` is a boolean, a number in (0, 1), or an integer from 1 to 20; `maxFuzzy` is an integer
   from 0 to 20; query terms used with fuzzy matching are at most 200 code units (so the
   `Uint8Array` never wraps).
+- `batchSize` (in `autoVacuum` and in `vacuum`'s options), `minDirtCount` and every other count-like
+  option are non-negative integers. The reference accepts fractions; some ports reject them (Elm
+  decodes them as `Int` and fails fast), so fractional counts are outside the domain.
 - `bm25`, when given, has all of `k`, `b` and `d`; every option number is finite; `boost`,
   `boostDocument` and `boostTerm` factors are finite; no score is NaN or infinite (so the sort's
   comparator is consistent; `--verify` checks it).
