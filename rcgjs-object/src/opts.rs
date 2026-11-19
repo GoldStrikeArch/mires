@@ -40,7 +40,7 @@
 //! -Cllvm-args=js-jir-flat-abi=on    on|off          plan the JIR lane's flat direct-call ABI
 //! -Cllvm-args=js-jir-typed-storage=off on|off       opt in to proven exact numeric Vec storage
 //! -Cllvm-args=js-jir-ready-futures=off on|off       opt in to proven nonsuspending Promise drivers
-//! -Cllvm-args=js-str=utf16        utf16|bytes        how a Rust `str` is held at run time
+//! -Cllvm-args=js-str=utf16        utf16|bytes        how a Rust `str` is held at run time (release profiles default to `bytes` on the JIR lane)
 //! -Cllvm-args=js-opt-weight-alloc=24 an integer     the representation cost model's bytes per
 //!                                                   allocation site (Phase 4)
 //! -Cllvm-args=js-jir-dump-conflicts=PATH a file path where a dedup conflict autopsy is written
@@ -133,13 +133,16 @@ impl Lane {
     }
 }
 
-/// How a Rust `str` is held at run time (`js-str`, experimental).
+/// How a Rust `str` is held at run time (`js-str`).
 ///
 /// `Utf16` is CONTRACT.md's hybrid: a `&str` is a JavaScript string holding the UTF-16 text, and
 /// every byte-level operation converts. `Bytes` makes it a **byte string**: a JavaScript string
 /// whose code unit `i` is byte `i` of the UTF-8 text, so every unit is below 256, its `length` is
 /// the Rust length and a byte offset is an index. Host text is UTF-8 encoded where it becomes a
 /// Rust `str` and decoded where Rust text reaches the host.
+///
+/// The three `release-*` profiles select `Bytes` by default when running on the JIR lane; `dev`,
+/// `report`, unprofiled invocations, and non-JIR overrides default to `Utf16`.
 ///
 /// Link-only: every `str` operation the lowering emits is chosen at link time on the JIR lane,
 /// and nothing an object file carries depends on it, so it never joins the sysroot key. The
@@ -179,11 +182,11 @@ pub enum Profile {
     Dev,
     /// `js-opt=report js-lane=baseline`: analyses run and are reported, nothing is rewritten.
     Report,
-    /// `js-lane=jir js-minify=on js-opt=on`: compiler-side size policy.
+    /// `js-lane=jir js-minify=on js-opt=on js-str=bytes`: compiler-side size policy.
     ReleaseSize,
-    /// `js-lane=jir js-minify=on js-opt=on`: weighted bytes and allocation policy.
+    /// `js-lane=jir js-minify=on js-opt=on js-str=bytes`: weighted bytes and allocation policy.
     ReleaseBalanced,
-    /// `js-lane=jir js-minify=locals js-opt=on`: item names kept, so a profile still reads.
+    /// `js-lane=jir js-minify=locals js-opt=on js-str=bytes`: item names kept, so a profile still reads.
     ReleaseSpeed,
 }
 
@@ -239,10 +242,12 @@ impl Profile {
             Self::Dev => {
                 opts.optimizer = OptimizerMode::Off;
                 opts.lane = Lane::Baseline;
+                opts.str_repr = StrRepr::Utf16;
             }
             Self::Report => {
                 opts.optimizer = OptimizerMode::Report;
                 opts.lane = Lane::Baseline;
+                opts.str_repr = StrRepr::Utf16;
             }
             Self::ReleaseSize | Self::ReleaseBalanced => {
                 opts.cleanup = true;
@@ -251,6 +256,7 @@ impl Profile {
                 opts.minify = true;
                 opts.minify_items = true;
                 opts.optimizer = OptimizerMode::On;
+                opts.str_repr = StrRepr::Bytes;
             }
             Self::ReleaseSpeed => {
                 opts.cleanup = true;
@@ -259,6 +265,7 @@ impl Profile {
                 opts.minify = true;
                 opts.minify_items = false;
                 opts.optimizer = OptimizerMode::On;
+                opts.str_repr = StrRepr::Bytes;
             }
         }
     }
@@ -725,6 +732,7 @@ pub trait Diagnostics {
 
 pub fn parse_args(args: &[String], dcx: &dyn Diagnostics) -> Opts {
     let mut opts = Opts::default();
+    let mut explicit_str = false;
 
     // The alias layer, resolved first so that an explicitly spelled option overrides whatever the
     // profile asked for regardless of which side of it the option was written on. A profile is a
@@ -977,11 +985,14 @@ pub fn parse_args(args: &[String], dcx: &dyn Diagnostics) -> Opts {
                 Some(path) if !path.is_empty() => opts.jir_dump_conflicts = Some(path.to_owned()),
                 other => bad_value(dcx, key, other, "a file path"),
             },
-            "js-str" => match value {
-                Some("utf16") => opts.str_repr = StrRepr::Utf16,
-                Some("bytes") => opts.str_repr = StrRepr::Bytes,
-                other => bad_value(dcx, key, other, "utf16`, `bytes"),
-            },
+            "js-str" => {
+                explicit_str = true;
+                match value {
+                    Some("utf16") => opts.str_repr = StrRepr::Utf16,
+                    Some("bytes") => opts.str_repr = StrRepr::Bytes,
+                    other => bad_value(dcx, key, other, "utf16`, `bytes"),
+                }
+            }
             // Already resolved, ahead of this loop, so that an explicit option wins.
             "js-profile" => {}
             _ => {
@@ -1068,6 +1079,13 @@ pub fn parse_args(args: &[String], dcx: &dyn Diagnostics) -> Opts {
             "`-Cllvm-args=js-lane-report` with `js-jir=off` reports every item as unavailable: \
              the objects carry no JIR bodies to choose from",
         );
+    }
+
+    // Release profiles default to byte strings on the JIR lane. If an explicit `js-lane` or
+    // `js-jir=off` takes compilation off that lane without spelling `js-str`, revert to UTF-16
+    // rather than failing validation.
+    if !explicit_str && (opts.lane != Lane::Jir || !opts.jir) {
+        opts.str_repr = StrRepr::Utf16;
     }
 
     // Byte strings exist only in the JIR lowering: the baseline text every object carries holds a
@@ -1280,16 +1298,19 @@ mod tests {
         assert_eq!(dev.profile, Some(Profile::Dev));
         assert_eq!(dev.optimizer, OptimizerMode::Off);
         assert_eq!(dev.lane, Lane::Baseline);
+        assert_eq!(dev.str_repr, StrRepr::Utf16);
         assert!(!dev.minify);
 
         let report = opts_of("js-profile=report");
         assert_eq!(report.optimizer, OptimizerMode::Report);
         assert_eq!(report.lane, Lane::Baseline);
+        assert_eq!(report.str_repr, StrRepr::Utf16);
 
         for name in ["release-size", "release-balanced"] {
             let opts = opts_of(&format!("js-profile={name}"));
             assert_eq!(opts.ecma_target, EcmaTarget::Es2018, "{name}");
             assert_eq!(opts.lane, Lane::Jir, "{name}");
+            assert_eq!(opts.str_repr, StrRepr::Bytes, "{name}");
             assert!(opts.minify, "{name}");
             assert!(opts.minify_items, "{name}");
             assert_eq!(opts.optimizer, OptimizerMode::On, "{name}");
@@ -1300,6 +1321,7 @@ mod tests {
         let speed = opts_of("js-profile=release-speed");
         assert_eq!(speed.ecma_target, EcmaTarget::Es2018);
         assert_eq!(speed.lane, Lane::Jir);
+        assert_eq!(speed.str_repr, StrRepr::Bytes);
         assert!(speed.minify);
         assert!(!speed.minify_items);
         assert_eq!(speed.optimizer, OptimizerMode::On);
@@ -1308,6 +1330,55 @@ mod tests {
         assert_eq!(collected.errors.borrow().len(), 1);
         let (_, collected) = parse_line("js-profile");
         assert_eq!(collected.errors.borrow().len(), 1);
+    }
+
+    #[test]
+    fn release_profiles_default_to_byte_strings_while_overrides_and_non_jir_keep_utf16() {
+        assert_eq!(opts_of("").str_repr, StrRepr::Utf16);
+        assert_eq!(opts_of("js-lane=jir").str_repr, StrRepr::Utf16);
+
+        for profile in ["release-size", "release-balanced", "release-speed"] {
+            let default_opts = opts_of(&format!("js-profile={profile}"));
+            assert_eq!(default_opts.lane, Lane::Jir, "{profile}");
+            assert_eq!(default_opts.str_repr, StrRepr::Bytes, "{profile}");
+
+            for line in [
+                format!("js-profile={profile} js-str=utf16"),
+                format!("js-str=utf16 js-profile={profile}"),
+            ] {
+                let overridden = opts_of(&line);
+                assert_eq!(overridden.lane, Lane::Jir, "{line}");
+                assert_eq!(overridden.str_repr, StrRepr::Utf16, "{line}");
+            }
+
+            for line in [
+                format!("js-profile={profile} js-lane=baseline"),
+                format!("js-lane=baseline js-profile={profile}"),
+                format!("js-profile={profile} js-lane=shadow"),
+            ] {
+                let non_jir = opts_of(&line);
+                assert_ne!(non_jir.lane, Lane::Jir, "{line}");
+                assert_eq!(non_jir.str_repr, StrRepr::Utf16, "{line}");
+            }
+
+            let (no_jir, collected) = parse_line(&format!("js-profile={profile} js-jir=off"));
+            assert!(collected.errors.borrow().is_empty(), "{profile}");
+            assert_eq!(no_jir.str_repr, StrRepr::Utf16, "{profile}");
+
+            let (_, explicit_err) = parse_line(&format!("js-profile={profile} js-str=bytes js-lane=baseline"));
+            assert_eq!(explicit_err.errors.borrow().len(), 1, "{profile}");
+        }
+
+        let (_, collected) = parse_line("js-str=bytes js-lane=baseline");
+        assert_eq!(collected.errors.borrow().len(), 1);
+
+        // `js-str` is link-only and never joins normalized emit args or sysroot keys.
+        let with_bytes = ["js-profile=release-size".to_owned(), "js-str=bytes".to_owned()];
+        let with_utf16 = ["js-profile=release-size".to_owned(), "js-str=utf16".to_owned()];
+        assert_eq!(
+            crate::item::normalized_emit_args(&with_bytes),
+            crate::item::normalized_emit_args(&with_utf16)
+        );
     }
 
     #[test]

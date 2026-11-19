@@ -164,16 +164,6 @@ pub fn lower_call(cx: &JsCx<'_>, op: &Op) -> Res<Expr> {
             "a call with a host payload this lowering does not recognize",
         ));
     };
-    // The view-abi template boundary hands Rust text to the DOM through holes, text nodes and
-    // keyed rows; none of those crossings converts a byte string yet, so a byte-string program
-    // that reaches one is refused rather than given UTF-8 bytes as DOM text.
-    if crate::lower::bstr::enabled() && matches!(family, Family::ViewAbi(_) | Family::KeyedList(_))
-    {
-        return Err(decline(
-            OpClass::Host,
-            "`js-str=bytes` does not convert Rust text at the view-abi template boundary yet",
-        ));
-    }
     match family {
         Family::Extern(bytes) => js_extern(cx, op, bytes, args),
         Family::Block(bytes) => js_block(cx, op, bytes, args),
@@ -402,8 +392,18 @@ fn throw_expr(value: Expr) -> Expr {
 /// A bare identifier in a body with no cycle is neither, and is spelled as v1 spelled it. The
 /// call form runs in the marker's own effect or accessor and matches v1's direct spelling.
 pub(super) fn closure_thunk(cx: &JsCx<'_>, closure: ValueId) -> Res<(Option<Expr>, Expr, Expr)> {
+    closure_thunk_with(cx, closure, true, true)
+}
+
+pub(super) fn closure_thunk_with(
+    cx: &JsCx<'_>,
+    closure: ValueId,
+    convert_params_in: bool,
+    convert_result_out: bool,
+) -> Res<(Option<Expr>, Expr, Expr)> {
     let ty = cx.ty_of(closure)?;
-    let (name, arity, param_tys, result_ty, has_environment) = closure_item(cx, ty)?;
+    let (name, arity, param_tys, result_ty, has_environment) =
+        closure_item(cx, ty, convert_params_in, convert_result_out)?;
     let params: Vec<String> = (0..arity).map(|index| format!("$a{index}")).collect();
     let (setup, environment) = match has_environment {
         true => {
@@ -418,13 +418,9 @@ pub(super) fn closure_thunk(cx: &JsCx<'_>, closure: ValueId) -> Res<(Option<Expr
         }
         false => (None, None),
     };
-    let mut raw_arguments = Vec::with_capacity(arity + 1);
-    raw_arguments.extend(environment.clone());
-    raw_arguments.extend(params.iter().cloned().map(jsast::id));
-    let call = jsast::call(jsast::id(name.clone()), raw_arguments);
 
     let convert_params = || -> Res<Vec<Expr>> {
-        if !crate::lower::bstr::enabled() {
+        if !crate::lower::bstr::enabled() || !convert_params_in {
             return Ok(params.iter().cloned().map(jsast::id).collect());
         }
         params
@@ -441,7 +437,7 @@ pub(super) fn closure_thunk(cx: &JsCx<'_>, closure: ValueId) -> Res<(Option<Expr
             .collect()
     };
     let convert_result = |call_expr: Expr| -> Res<Expr> {
-        if !crate::lower::bstr::enabled() {
+        if !crate::lower::bstr::enabled() || !convert_result_out {
             return Ok(call_expr);
         }
         match result_ty {
@@ -449,6 +445,11 @@ pub(super) fn closure_thunk(cx: &JsCx<'_>, closure: ValueId) -> Res<(Option<Expr
             None => Ok(call_expr),
         }
     };
+
+    let mut raw_arguments = Vec::with_capacity(arity + 1);
+    raw_arguments.extend(environment.clone());
+    raw_arguments.extend(params.iter().cloned().map(jsast::id));
+    let call = convert_result(jsast::call(jsast::id(name.clone()), raw_arguments))?;
 
     let arrow = match environment.clone().filter(|_| function_has_cycle(cx)) {
         Some(environment) => {
@@ -525,6 +526,8 @@ fn function_has_cycle(cx: &JsCx<'_>) -> bool {
 fn closure_item(
     cx: &JsCx<'_>,
     ty: TypeId,
+    convert_params_in: bool,
+    convert_result_out: bool,
 ) -> Res<(String, usize, Vec<TypeId>, Option<TypeId>, bool)> {
     let peeled = cx.table.peeled(ty);
     let (definition, sig_id, has_environment) = match value::kind(cx.table, peeled) {
@@ -553,11 +556,20 @@ fn closure_item(
         .params
         .saturating_sub(usize::from(has_environment))
         .saturating_sub(usize::from(entry.caller_location));
-    if !crate::lower::bstr::enabled() {
+    if !crate::lower::bstr::enabled() || (!convert_params_in && !convert_result_out) {
         return Ok((entry.name.clone(), arity, Vec::new(), None, has_environment));
     }
     let mut result_ty = entry.result;
-    let param_tys = if has_environment {
+    let param_tys = if !convert_params_in {
+        if !has_environment {
+            if let Some(sig) = sig_id.and_then(|id| cx.interns.sigs.get(id)) {
+                if sig.spread_arity.is_none() && sig.inputs.len() >= arity {
+                    result_ty = Some(sig.output);
+                }
+            }
+        }
+        Vec::new()
+    } else if has_environment {
         let user_end = entry
             .arguments
             .len()

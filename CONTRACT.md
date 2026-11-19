@@ -272,6 +272,7 @@ js-hoist-consts=on|off       share repeated constants (default on; see "Hoisted 
 js-modules=esm|script        ES module or plain script (default script; see "Modules")
 js-shim-module=SPEC          where `__rt` is imported from (default `./shim.js`)
 js-dom-module=SPEC           where the DOM runtime is imported from (default `topcoat-dom`)
+js-str=utf16|bytes           how a Rust `str` is held (link-only; release profiles default to `bytes`)
 js-profile=NAME              dev, report, release-size, release-balanced, or release-speed
 ```
 
@@ -279,7 +280,7 @@ js-profile=NAME              dev, report, release-size, release-balanced, or rel
 `scripts/compile_core.sh` and `scripts/build_sysroot.sh` (which turns each space separated option
 into its own `-Cllvm-args=`, since rustflags are split on whitespace).
 
-`js-profile` is an alias layer: profiles expand before explicit options, so a spelled-out option always wins regardless of command-line order. The three release profiles select `js-ecma-target=2018`, the JIR lane, and optimizer emission; release-size and release-balanced use full minification, while release-speed keeps item names. Dev and report retain the `latest` syntax target.
+`js-profile` is an alias layer: profiles expand before explicit options, so a spelled-out option always wins regardless of command-line order. The three release profiles select `js-ecma-target=2018`, the JIR lane, optimizer emission, and `js-str=bytes` (unless `-Cllvm-args=js-str=utf16` or a non-JIR lane is selected); release-size and release-balanced use full minification, while release-speed keeps item names. Dev and report retain the `latest` syntax target and `js-str=utf16`.
 
 **An option is emit-affecting when it can change the text of an item two crates might both
 codegen.** That is the whole of the rule, and everything below follows from it: an option that
@@ -1094,10 +1095,14 @@ output (`u8` to `AsciiChar`) and how `core::mem::Alignment` is read as a `usize`
 
 ### Byte strings (`js-str=bytes`)
 
-Passing `-Cllvm-args=js-str=bytes` (with `-Cllvm-args=js-lane=jir`; default is `utf16`, and sysroot
-objects are unchanged because the flag acts only at link time) switches `str` from a UTF-16 host
-string to a **byte string**: a JS string whose UTF-16 code units store Rust's UTF-8 bytes verbatim
-(`0..=255` per code unit, one code unit per byte). Under `js-str=bytes`:
+`js-profile=release-size`, `js-profile=release-balanced`, and `js-profile=release-speed` select
+`js-str=bytes` by default on the JIR lane (overridable via `-Cllvm-args=js-str=utf16`, and
+automatically reverting to `utf16` when an explicit `js-lane` or `js-jir=off` leaves the JIR lane
+without an explicit `js-str`). `dev`, `report`, and unprofiled invocations default to `utf16`;
+explicit `-Cllvm-args=js-str=bytes` requires `-Cllvm-args=js-lane=jir`. Sysroot objects are unchanged
+because `js-str` acts only at link time. Under `js-str=bytes`, `str` is a **byte string**: a JS
+string whose UTF-16 code units store Rust's UTF-8 bytes verbatim (`0..=255` per code unit, one code
+unit per byte). Under `js-str=bytes`:
 
 - **Direct `str`, `StringBuilder`, and byte-view lowerings:** `str::len` is `.length`, code-unit
   reads give raw UTF-8 bytes (`charCodeAt`), and `is_char_boundary`, `&s[a..b]`, `str::get`,
@@ -1113,14 +1118,24 @@ string to a **byte string**: a JS string whose UTF-16 code units store Rust's UT
 - **ASCII elision & host boundary conversions:** Interprocedural `KnownAscii` provenance proves
   ASCII-only (`b < 0x80`) `str`, `HostString`, and unmutated `Option<&str>` values and omits
   `__rt.bstr_out` at host crossings. All other `str`-reaching values crossing `js_bindings!`,
-  `#[no_mangle]` exports, `extern "C"`, `js!`, and closures/callbacks convert via deduplicated
-  `$bstr$out$...` / `$bstr$in$...` link-table helpers (by-value literals; lone host surrogates
-  normalize to `U+FFFD` via `__rt.bstr_in`). References, `&mut`, `Cell`, slices, `Box`/`Rc`/`Arc`,
-  `RawVec`/`Vec`/`VecDeque`, and `BTreeMap` nodes cross as live `WeakMap`-cached `Proxy` views
-  (`__rt.bstr_ref` / `__rt.bstr_ref_in`) preserving JS identity (`===`, `WeakMap`/`Set`), cycles,
-  live Rust mutations, `TypeError`-checked write-back, and round-trip unwrapping; `[&str; 0]`
-  short-circuits as a ZST identity.
-- **Unsafe-only link refusals:** Crossing `str` at the host boundary stays refused at link time only
+  `#[no_mangle]` exports (including `#[track_caller]` exports), `extern "C"`, `js!`, and
+  closures/callbacks convert via deduplicated `$bstr$out$...` / `$bstr$in$...` link-table helpers
+  (by-value literals; lone host surrogates normalize to `U+FFFD` via `__rt.bstr_in`). References,
+  `&mut`, `Cell`, slices, `Box`/`Rc`/`Arc`, and `RawVec`/`Vec`/`VecDeque` cross as live
+  schema-keyed `WeakMap`-cached `Proxy` views (`__rt.bstr_ref` / `__rt.bstr_ref_in`) preserving JS
+  identity (`===`, `WeakMap`/`Set`), cycles, live Rust mutations, `TypeError`-checked write-back,
+  round-trip unwrapping, and full `Proxy` reflection/invariant traps (`getOwnPropertyDescriptor`,
+  `defineProperty`, `Object.freeze`, and non-configurable properties); `[&str; 0]` short-circuits as
+  a ZST identity. Escaping populated `BTreeMap` values hit the baseline representation's
+  pre-existing `insert` pointer-cast limitation rather than a byte-string boundary gap.
+- **`view-abi` templates and `keyed_list_v1`:** `rcgjs.tc.*` template markers and `keyed_list_v1`
+  lower natively under `js-str=bytes`. Reactive `Sig<&str>` / `Selector<&str>` values, `keyed_list_v1`
+  collections, and `&str` keys stay in Rust's byte-string representation (preserving exact UTF-8
+  `===` identity), while DOM-facing boundaries (`hole`, `effect`, `text`, `push_keyed`, `content`,
+  and `display_to_str`) decode non-ASCII Rust text with `__rt.bstr_out` (eliding `KnownAscii` `&str`),
+  and host-to-Rust crossings (`Event::target_value`, `on_settled`, `host_value`) encode host text
+  with `__rt.bstr_in`.
+- **Link refusals and limits:** Crossing `str` at the host boundary stays refused at link time only
   for untagged multi-field `union` types (transparent single-variant unions such as `MaybeUninit`
   are supported), bare `*const`/`*mut` raw pointers outside safe smart-pointer/buffer forms, raw
   coroutine values in `js!`, `FatDyn` pointers reaching `str`, or conversion nesting depth > 64.

@@ -700,8 +700,8 @@ fn sequence(mut effects: Vec<Expr>, value: Expr) -> Expr {
 pub fn lower_marker(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<Expr> {
     match marker {
         "template" => lower_template(cx, op, args),
-        "hole" | "handler" | "component" => lower_fill(cx, args, false),
-        "effect" => lower_fill(cx, args, true),
+        "hole" | "handler" | "component" => lower_fill(cx, marker, args, false),
+        "effect" => lower_fill(cx, marker, args, true),
         "signal" => lower_signal(cx, args),
         "selector" => lower_selector(cx, args),
         "selis" => lower_selector_read(cx, args),
@@ -724,7 +724,7 @@ pub fn lower_marker(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> R
         "settled" => lower_settled(cx, args),
         "owner" => Ok(jsast::call(dom("getOwner"), Vec::new())),
         "withowner" => lower_with_owner(cx, args),
-        "hostval" => lower_host_value(cx, args),
+        "hostval" => lower_host_value(cx, op, args),
         other => Err(decline(
             OpClass::Template,
             format!("`rcgjs.tc.{other}` is not a `view-abi` marker this backend knows"),
@@ -867,7 +867,8 @@ pub fn lower_keyed_list(cx: &JsCx<'_>, payload: &KeyedListPayload, args: &[Value
     let mut setup = Vec::new();
     let mut callables = Vec::new();
     for (index, argument) in args.iter().enumerate() {
-        let (materialize, callable, _) = super::host::closure_thunk(cx, *argument)?;
+        let (materialize, callable, _) =
+            super::host::closure_thunk_with(cx, *argument, false, false)?;
         setup.extend(materialize);
         callables.push(if index == 0 {
             collection_lane.adapt(cx, callable)?
@@ -1436,7 +1437,7 @@ fn lower_template(cx: &JsCx<'_>, op: &Op, args: &[ValueId]) -> Res<Expr> {
 }
 
 /// `hole(&root, index, value)` and `effect(&root, index, closure)` (v1 `abi.rs::codegen_fill`).
-fn lower_fill(cx: &JsCx<'_>, args: &[ValueId], tracked: bool) -> Res<Expr> {
+fn lower_fill(cx: &JsCx<'_>, marker: &str, args: &[ValueId], tracked: bool) -> Res<Expr> {
     let [root, index, value] = args else {
         return Err(decline(
             OpClass::Template,
@@ -1450,9 +1451,17 @@ fn lower_fill(cx: &JsCx<'_>, args: &[ValueId], tracked: bool) -> Res<Expr> {
         )
     })?;
 
+    let Some(resolved_root) = resolve_instantiation_root(cx, *root) else {
+        return Err(decline(
+            OpClass::Template,
+            "the `root` of a `view-abi` hole marker does not name a template this body \
+             instantiated",
+        ));
+    };
+
     let (hole, target, shared) = {
         let instantiations = cx.instantiations.borrow();
-        let Some(instantiation) = instantiations.get(root) else {
+        let Some(instantiation) = instantiations.get(&resolved_root) else {
             return Err(decline(
                 OpClass::Template,
                 "the `root` of a `view-abi` hole marker does not name a template this body \
@@ -1493,7 +1502,19 @@ fn lower_fill(cx: &JsCx<'_>, args: &[ValueId], tracked: bool) -> Res<Expr> {
     // a loop then snapshots that value through `host::closure_thunk`'s IIFE.
     let (setup, fill) = match as_function {
         true => {
-            let (setup, accessor, call) = super::host::closure_thunk(cx, *value)?;
+            let (convert_params_in, convert_result_out) = if tracked {
+                (false, true)
+            } else if marker == "component" || matches!(hole.kind, HoleKind::Component) {
+                (false, false)
+            } else {
+                (true, false)
+            };
+            let (setup, accessor, call) = super::host::closure_thunk_with(
+                cx,
+                *value,
+                convert_params_in,
+                convert_result_out,
+            )?;
             let fill = match tracked {
                 true => Fill::Tracked {
                     accessor,
@@ -1503,7 +1524,20 @@ fn lower_fill(cx: &JsCx<'_>, args: &[ValueId], tracked: bool) -> Res<Expr> {
             };
             (setup, fill)
         }
-        false => (None, Fill::Once(cx.expr_of(*value)?)),
+        false => {
+            let expr = cx.expr_of(*value)?;
+            let expr = if crate::lower::bstr::enabled() {
+                let ty = cx.ty_of(*value)?;
+                if cx.is_known_ascii(*value) && crate::lower::bstr::is_str_pointer(cx.table, ty) {
+                    expr
+                } else {
+                    super::host::crossing(cx, ty, expr, crate::lower::bstr::Crossing::Out)?
+                }
+            } else {
+                expr
+            };
+            (None, Fill::Once(expr))
+        }
     };
     let setup: Vec<Expr> = setup.into_iter().collect();
 
@@ -1512,7 +1546,7 @@ fn lower_fill(cx: &JsCx<'_>, args: &[ValueId], tracked: bool) -> Res<Expr> {
     };
     let writes = {
         let mut instantiations = cx.instantiations.borrow_mut();
-        let Some(instantiation) = instantiations.get_mut(root) else {
+        let Some(instantiation) = instantiations.get_mut(&resolved_root) else {
             return Ok(sequence(setup, jsast::undefined()));
         };
         instantiation
@@ -1752,7 +1786,12 @@ fn lower_event_target_value(cx: &JsCx<'_>, args: &[ValueId]) -> Res<Expr> {
         ));
     };
     let value = jsast::member(jsast::member(cx.expr_of(*event)?, "target"), "value");
-    Ok(jsast::binary(BinOp::Or, value, jsast::string("")))
+    let text = jsast::binary(BinOp::Or, value, jsast::string(""));
+    if crate::lower::bstr::enabled() {
+        Ok(crate::lower::bstr::host_in(text))
+    } else {
+        Ok(text)
+    }
 }
 
 /// `epd(event)`: `event.preventDefault()`.
@@ -1783,7 +1822,13 @@ fn lower_content(cx: &JsCx<'_>, args: &[ValueId]) -> Res<Expr> {
     {
         return Ok(jsast::null());
     }
-    cx.expr_of(*value)
+    let expr = cx.expr_of(*value)?;
+    if !crate::lower::bstr::enabled()
+        || (cx.is_known_ascii(*value) && crate::lower::bstr::is_str_pointer(cx.table, ty))
+    {
+        return Ok(expr);
+    }
+    super::host::crossing(cx, ty, expr, crate::lower::bstr::Crossing::Out)
 }
 
 /// `text(v)`: the string a hole's value renders as (v1 `abi.rs::codegen_text`).
@@ -1801,7 +1846,9 @@ fn lower_text(cx: &JsCx<'_>, op: &Op, args: &[ValueId]) -> Res<Expr> {
 fn text_value(cx: &JsCx<'_>, op: &Op, value: ValueId) -> Res<Expr> {
     let ty = cx.ty_of(value)?;
     let operand = cx.expr_of(value)?;
-    if let Some(converted) = text_conversion(cx, ty, operand.clone()) {
+    let elide_bstr_out =
+        cx.is_known_ascii(value) && crate::lower::bstr::is_str_pointer(cx.table, ty);
+    if let Some(converted) = text_conversion(cx, ty, operand.clone(), elide_bstr_out) {
         return Ok(converted);
     }
     // The general path: `T`'s own `Display`, through `view_abi::display_to_str::<T>`, which the
@@ -1822,22 +1869,36 @@ fn text_value(cx: &JsCx<'_>, op: &Op, value: ValueId) -> Res<Expr> {
         ));
     };
     let name = cx.interns.str(helper.link_name).unwrap_or("").to_owned();
-    Ok(jsast::call(jsast::id(name), vec![operand]))
+    let call = jsast::call(jsast::id(name), vec![operand]);
+    Ok(if crate::lower::bstr::enabled() {
+        crate::lower::bstr::host_out(call)
+    } else {
+        call
+    })
 }
 
 /// How a `view_abi::text` value of type `ty` becomes a JavaScript string, or `None` for a type
 /// that needs its own `Display` (v1 `abi.rs::text_conversion`).
-fn text_conversion(cx: &JsCx<'_>, ty: TypeId, value: Expr) -> Option<Expr> {
+fn text_conversion(
+    cx: &JsCx<'_>,
+    ty: TypeId,
+    value: Expr,
+    elide_bstr_out: bool,
+) -> Option<Expr> {
     let peeled = cx.table.peeled(ty);
     match value::kind(cx.table, peeled)? {
-        TypeKind::Str => Some(value),
+        TypeKind::Str => Some(if crate::lower::bstr::enabled() && !elide_bstr_out {
+            crate::lower::bstr::host_out(value)
+        } else {
+            value
+        }),
         TypeKind::Reference { pointee, .. } => {
             let pointee = *pointee;
             let read = match value::is_slot(cx.table, peeled) {
                 true => ptr::slot_element(value),
                 false => value,
             };
-            text_conversion(cx, pointee, read)
+            text_conversion(cx, pointee, read, elide_bstr_out)
         }
         TypeKind::Char => Some(jsast::call(jsast::id("String.fromCodePoint"), vec![value])),
         TypeKind::Bool | TypeKind::Integer { .. } | TypeKind::Float { .. } => {
@@ -1862,7 +1923,7 @@ fn lower_cond(cx: &JsCx<'_>, args: &[ValueId]) -> Res<Expr> {
         // The call, not the arrow: each closure is called from inside the one accessor this
         // builds, rather than being handed over as a function of its own. Its environment still
         // belongs to that closure's call.
-        let (setup, _, call) = super::host::closure_thunk(cx, *closure)?;
+        let (setup, _, call) = super::host::closure_thunk_with(cx, *closure, false, false)?;
         effects.extend(setup);
         calls.push(call);
     }
@@ -1880,6 +1941,17 @@ fn lower_cond(cx: &JsCx<'_>, args: &[ValueId]) -> Res<Expr> {
     Ok(sequence(effects, dispatch))
 }
 
+/// Resolves a `view_abi::push` / `push_keyed` list argument to its JS array expression,
+/// dereferencing `&Node` when unoptimized MIR keeps the `list()` temporary in a local cell.
+fn list_expr(cx: &JsCx<'_>, list: ValueId) -> Res<Expr> {
+    if super::value::pointee_of(cx.table, cx.ty_of(list)?).is_some() {
+        let place = cx.pointee_place(list)?;
+        Ok(cx.read_place(&place.place))
+    } else {
+        cx.expr_of(list)
+    }
+}
+
 /// `push(&list, row)`: one row appended to the list the loop is filling.
 fn lower_push(cx: &JsCx<'_>, args: &[ValueId]) -> Res<Expr> {
     let [list, row] = args else {
@@ -1889,7 +1961,7 @@ fn lower_push(cx: &JsCx<'_>, args: &[ValueId]) -> Res<Expr> {
         ));
     };
     Ok(jsast::method_call(
-        cx.expr_of(*list)?,
+        list_expr(cx, *list)?,
         "push",
         vec![cx.expr_of(*row)?],
     ))
@@ -1911,7 +1983,7 @@ fn lower_push_keyed(cx: &JsCx<'_>, op: &Op, args: &[ValueId]) -> Res<Expr> {
     // recompilation and unique for the same reason: a `for` has exactly one `push_keyed` in it.
     let site = jsast::string(format!("{}#{}", cx.summary.key.link_name, op.origin.0));
     let cached = jsast::rt_call("keyed_row", vec![site, key, row]);
-    Ok(jsast::method_call(cx.expr_of(*list)?, "push", vec![cached]))
+    Ok(jsast::method_call(list_expr(cx, *list)?, "push", vec![cached]))
 }
 
 /// `micro(f)`: `__rt.microtask(() => f())`.
@@ -1922,7 +1994,7 @@ fn lower_microtask(cx: &JsCx<'_>, args: &[ValueId]) -> Res<Expr> {
             "`view_abi::microtask` takes one closure",
         ));
     };
-    let (setup, arrow, _) = super::host::closure_thunk(cx, *f)?;
+    let (setup, arrow, _) = super::host::closure_thunk_with(cx, *f, false, false)?;
     Ok(sequence(
         setup.into_iter().collect(),
         jsast::rt_call("microtask", vec![arrow]),
@@ -1937,7 +2009,7 @@ fn lower_cleanup(cx: &JsCx<'_>, args: &[ValueId]) -> Res<Expr> {
             "`view_abi::on_cleanup` takes one closure",
         ));
     };
-    let (setup, arrow, _) = super::host::closure_thunk(cx, *f)?;
+    let (setup, arrow, _) = super::host::closure_thunk_with(cx, *f, false, false)?;
     Ok(sequence(
         setup.into_iter().collect(),
         jsast::call(dom("onCleanup"), vec![arrow]),
@@ -1969,22 +2041,76 @@ fn lower_with_owner(cx: &JsCx<'_>, args: &[ValueId]) -> Res<Expr> {
         ));
     };
     let owner = cx.expr_of(*owner)?;
-    let (setup, arrow, _) = super::host::closure_thunk(cx, *f)?;
+    let (setup, arrow, _) = super::host::closure_thunk_with(cx, *f, false, false)?;
     Ok(sequence(
         setup.into_iter().collect(),
         jsast::call(dom("runWithOwner"), vec![owner, arrow]),
     ))
 }
 
-/// `hostval(value)`: the identity.
-fn lower_host_value(cx: &JsCx<'_>, args: &[ValueId]) -> Res<Expr> {
+/// `hostval(value)`: the host value interpreted as Rust `V`.
+fn lower_host_value(cx: &JsCx<'_>, op: &Op, args: &[ValueId]) -> Res<Expr> {
     let [value] = args else {
         return Err(decline(
             OpClass::Template,
             "`view_abi::host_value` takes one argument",
         ));
     };
-    cx.expr_of(*value)
+    let expr = cx.expr_of(*value)?;
+    match op.result {
+        Some(result) if crate::lower::bstr::enabled() => {
+            super::host::crossing(cx, cx.ty_of(result)?, expr, crate::lower::bstr::Crossing::In)
+        }
+        _ => Ok(expr),
+    }
+}
+
+/// Resolves a `view-abi` hole marker's `&root` operand back to the `ValueId` produced by
+/// `rcgjs.tc.template`, chasing unoptimized-MIR stack cells and reborrows (`BorrowView` /
+/// `CellStore`).
+fn resolve_instantiation_root(cx: &JsCx<'_>, value: ValueId) -> Option<ValueId> {
+    use rcgjs_object::jir::repr::{CellId, Proj, Root};
+
+    let cell_store_source = |cell: CellId| -> Option<ValueId> {
+        let mut found = None;
+        for block in &cx.func.blocks {
+            for op in &block.ops {
+                if let OpKind::CellStore { cell: stored, v } = &op.kind {
+                    if *stored == cell {
+                        if found.is_some() {
+                            return None;
+                        }
+                        found = Some(*v);
+                    }
+                }
+            }
+        }
+        found
+    };
+
+    let mut cur = value;
+    for _ in 0..8 {
+        if cx.instantiations.borrow().contains_key(&cur) {
+            return Some(cur);
+        }
+        let op = cx.def_of(cur)?;
+        cur = match &op.kind {
+            OpKind::Copy(src) | OpKind::Move(src) | OpKind::Deref(src) => *src,
+            OpKind::BorrowView {
+                root: Root::Value(src),
+                path,
+                ..
+            } if path.is_empty() || path.as_slice() == [Proj::Deref] => *src,
+            OpKind::BorrowView {
+                root: Root::Cell(cell),
+                path,
+                ..
+            } if path.is_empty() || path.as_slice() == [Proj::Deref] => cell_store_source(*cell)?,
+            OpKind::CellLoad(cell) => cell_store_source(*cell)?,
+            _ => return None,
+        };
+    }
+    cx.instantiations.borrow().contains_key(&cur).then_some(cur)
 }
 
 /// The `u32` a constant operand names, for a hole index.
