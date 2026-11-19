@@ -7,9 +7,10 @@
 //! its niche value and the other is its payload transmuted to the integer. Before it existed the
 //! transmute was a zombie, and with it `a < b` on slices and every `sort` of slices.
 //!
-//! The encode is the general one, the exact mirror of the decode `NonZero::new` already used, so
-//! the transmutes at the end pin it for the other two-variant niche enums: `Option<NonZero<u32>>`,
-//! `Option<bool>` and `Option<char>`, each round-tripped.
+//! The encode is the general one, under the conditions of the decode `NonZero::new` already used,
+//! so the transmutes at the end pin it for the other two-variant niche enums:
+//! `Option<NonZero<u32>>`, `Option<bool>` and `Option<char>`, each round-tripped. Their niches are
+//! unsigned; a signed niche with its high bit set does not decode back (`CONTRACT.md`).
 
 #![no_std]
 #![no_main]

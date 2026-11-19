@@ -399,7 +399,9 @@ impl JsCx<'_> {
     /// `core` writes `PartialOrd::lt` for `[T]` as a transmute of a `ControlFlow<bool>` to `u8`
     /// (`slice/cmp.rs`, `as_underlying`). The empty variant is the niche value, re-signed at the
     /// destination's width, and the other is its one payload field transmuted into the integer.
-    /// The conditions are the decode's, so the two directions round trip.
+    /// The encode matches rustc's layout; the decode does not round trip a signed niche with its
+    /// high bit set, because it compares against the niche's raw unsigned bits (`CONTRACT.md`,
+    /// "Transmuting between an enum and an integer").
     fn niche_to_scalar(&self, from: TypeId, to: TypeId, value: Expr) -> Res<Option<Expr>> {
         let table = self.table;
         let Some((signed, bits)) = table.int_info(to) else {

@@ -2169,12 +2169,14 @@ fn niche_from_scalar<'tcx>(
 /// the integer its layout stores, encoded at run time.
 ///
 /// `core` implements `PartialOrd::lt` and its siblings for `[T]` as a transmute of a
-/// `ControlFlow<bool>` to `u8` (`slice/cmp.rs`, `as_underlying`): `Break(false)` is 0, `Break(true)`
-/// is 1 and `Continue(())` is the niche. Here the enum is an object, so the bit pattern is computed:
-/// the empty variant is the niche value, re-signed at the destination's width, and the other is its
-/// payload transmuted into the integer recursively. The conditions are exactly the decode's, so the
-/// two directions round trip: the tag as wide as the integer, one niche variant carrying no data,
-/// and one payload field.
+/// `ControlFlow<bool>` to `u8` (`slice/cmp.rs`, `as_underlying`): `Break(false)` is 0,
+/// `Break(true)` is 1 and `Continue(())` is the niche. Here the enum is an object, so the bit
+/// pattern is computed: the empty variant is the niche value, re-signed at the destination's width,
+/// and the other is its payload transmuted into the integer recursively, under the decode's
+/// conditions: the tag as wide as the integer, one niche variant carrying no data, and one payload
+/// field. The encode matches rustc's layout; the decode does not round trip a signed niche with its
+/// high bit set, because it compares against the niche's raw unsigned bits (`CONTRACT.md`,
+/// "Transmuting between an enum and an integer").
 fn niche_to_scalar<'tcx>(
     fx: &FnCx<'_, 'tcx>,
     from_ty: Ty<'tcx>,
