@@ -68,6 +68,58 @@ for repr in utf16 bytes; do
 		sed 's/^/    /' "$work/compile-repr-$repr.log" "$work/repr-$repr.err" >&2
 		status=1
 	}
+
+	# Blocker 1 regressions: lexical collision (`--crate-name aaa_collide`) and `--crate-name core`
+	# spoofing of `core::str::slice_error_fail` must never hijack `&"é"[1..2]` panics.
+	cat >"$work/collide-driver.js" <<'EOF'
+{
+  const logs = [];
+  let aborted = null;
+  globalThis.__rt.js_log_str = (s) => logs.push(s);
+  globalThis.__rt.js_abort = (s) => { aborted = s; throw new Error("abort:" + s); };
+  try { rust_entry(); } catch (e) { if (aborted !== "EXPECTED_PANIC") throw e; }
+  if (aborted !== "EXPECTED_PANIC" || logs.length !== 1 || logs[0] !== "HIJACKED") {
+    throw new Error("collide check failed: aborted=" + aborted + " logs=" + JSON.stringify(logs));
+  }
+}
+EOF
+	cat >"$work/spoof-driver.js" <<'EOF'
+{
+  const logs = [];
+  let aborted = null;
+  globalThis.__rt.js_log_str = (s) => logs.push(s);
+  globalThis.__rt.js_abort = (s) => { aborted = s; throw new Error("abort:" + s); };
+  try { rust_entry(); } catch (e) { if (aborted !== "EXPECTED_PANIC") throw e; }
+  if (aborted !== "EXPECTED_PANIC" || logs.length !== 0) {
+    throw new Error("spoof_core check failed: aborted=" + aborted + " logs=" + JSON.stringify(logs));
+  }
+}
+EOF
+	if JS_EXTRA_ARGS="$args" "$script_dir/compile_core.sh" "$probes/collide.rs" \
+		"$work/$repr/collide.js" --crate-name aaa_collide >"$work/compile-collide-$repr.log" 2>&1 &&
+		cat "$root/runtime/shim.js" "$work/$repr/collide.js" "$work/collide-driver.js" | node - \
+			>"$work/collide-$repr.out" 2>"$work/collide-$repr.err"; then
+		echo "js-str=$repr: collide regression passed"
+	else
+		echo "js-str=$repr: collide regression failed:" >&2
+		sed 's/^/    /' "$work/compile-collide-$repr.log" "$work/collide-$repr.err" >&2
+		status=1
+	fi
+
+	if JS_EXTRA_ARGS="$(jsc_normalize_emit_args "$args")" "$script_dir/compile_core.sh" \
+		"$probes/spoof_core_dep.rs" "$work/$repr/libspoof_core.rlib" \
+		--crate-type rlib --crate-name core >"$work/compile-spoof-dep-$repr.log" 2>&1 &&
+		JS_EXTRA_ARGS="$args" "$script_dir/compile_core.sh" "$probes/spoof_core.rs" \
+			"$work/$repr/spoof_core.js" --extern "spoof_core=$work/$repr/libspoof_core.rlib" \
+			>"$work/compile-spoof-$repr.log" 2>&1 &&
+		cat "$root/runtime/shim.js" "$work/$repr/spoof_core.js" "$work/spoof-driver.js" | node - \
+			>"$work/spoof-$repr.out" 2>"$work/spoof-$repr.err"; then
+		echo "js-str=$repr: --crate-name core spoof regression passed"
+	else
+		echo "js-str=$repr: --crate-name core spoof regression failed:" >&2
+		sed 's/^/    /' "$work/compile-spoof-dep-$repr.log" "$work/compile-spoof-$repr.log" "$work/spoof-$repr.err" >&2
+		status=1
+	fi
 	total=$(wc -l <"$work/native.out" | tr -d ' ')
 	if diff "$work/native.out" "$work/$repr.out" >"$work/$repr.diff"; then
 		echo "js-str=$repr: $total/$total lines agree with native Rust"
@@ -150,10 +202,20 @@ cat "$root/runtime/shim.js" "$work/bytes/repr.js" - <<'EOF' | node - || status=1
   globalThis.bstrGetNamed = () => ({ name: "a", n: 1 });
   globalThis.bstrMaybe = () => null;
   globalThis.bstrTry = () => "ok";
+  globalThis.bstrReflectMut = () => {};
+  globalThis.bstrReflectArr = () => {};
   globalThis.__rt.bstr_ext_pair = () => {};
   globalThis.__rt.bstr_ext_opt = () => ({ TAG: "None" });
+  globalThis.__rt.bstr_ext_reflect_mut = () => {};
   rust_entry();
-  console.log("bytes write-back TypeError checks passed");
+  // `#[track_caller]` export without explicit JS location synthesizes default byte-string location.
+  if (tc_exported_file("é") !== "<host>") {
+    throw new Error("expected default tc_exported_file '<host>', got " + JSON.stringify(tc_exported_file("é")));
+  }
+  if (tc_exported("é") !== 2 + "<host>".length + 0 + 1) {
+    throw new Error("expected tc_exported('é') === 9, got " + tc_exported("é"));
+  }
+  console.log("bytes write-back TypeError & #[track_caller] default-loc checks passed");
 }
 EOF
 exit "$status"

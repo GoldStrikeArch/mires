@@ -30,6 +30,7 @@ unsafe extern "C-unwind" {
     fn js_abort(msg: &str) -> !;
     fn bstr_ext_pair(value: (&str, u32));
     fn bstr_ext_opt() -> Option<&'static str>;
+    fn bstr_ext_reflect_mut(mode: u32, value: &mut SchemaA);
 }
 
 #[panic_handler]
@@ -45,6 +46,19 @@ fn say(line: &str) {
 pub struct Named {
     pub name: &'static str,
     pub n: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct SchemaA {
+    pub s: &'static str,
+    pub n: u32,
+}
+
+#[derive(Clone, Copy)]
+pub struct SchemaB {
+    pub s: &'static str,
+    pub n: u32,
+    pub t: &'static str,
 }
 
 #[derive(Clone, Copy)]
@@ -214,6 +228,11 @@ js_bindings! {
     fn maybe(which: u32) -> Option<&'static str>;
     #[js(fallible, call = "globalThis.bstrTry")]
     fn attempt(which: u32) -> Result<&'static str, JsValue>;
+
+    #[js(call = "globalThis.bstrReflectMut")]
+    fn reflect_mut(mode: u32, value: &mut SchemaA);
+    #[js(call = "globalThis.bstrReflectArr")]
+    fn reflect_arr(mode: u32, value: &mut (&'static str, u32));
 }
 
 #[inline(never)]
@@ -443,6 +462,29 @@ pub fn rust_entry() {
     see_het_tup("het_tup_after_mut", &het);
     let _: JsValue = see_het_slot("het_slot_after_tup", &het.0);
     say(&format!("leaked_slot_buf_len {}", bstr_exp_het_in_out(&leaked_slot_buf)));
+
+    // Reflection & freeze checks via safe `js_bindings!` and `extern "C-unwind"`.
+    for mode in 0..4u32 {
+        let mut s_bind = SchemaA { s: "é", n: 7 };
+        reflect_mut(mode, &mut s_bind);
+        let mut s_arr = ("é", 7u32);
+        reflect_arr(mode, &mut s_arr);
+        let mut s_ext = SchemaA { s: "é", n: 7 };
+        unsafe { bstr_ext_reflect_mut(mode, &mut s_ext) };
+        say(&format!(
+            "reflect-rust mode={mode} bind={} arr={} ext={}",
+            s_bind.s.len(),
+            s_arr.0.len(),
+            s_ext.s.len()
+        ));
+    }
+
+    // `#[track_caller]` exported function called directly from Rust.
+    say(&format!(
+        "tc_from_rust {} {}",
+        tc_exported("é"),
+        tc_exported_file("é")
+    ));
 }
 
 #[inline(never)]
@@ -532,4 +574,44 @@ pub fn bstr_exp_shape(value: Shape) -> usize {
 pub fn bstr_exp_owned(value: &str) -> usize {
     let owned = String::from(value);
     owned.len()
+}
+
+#[unsafe(no_mangle)]
+pub fn bstr_exp_a_len(v: &SchemaA) -> usize {
+    v.s.len()
+}
+
+#[unsafe(no_mangle)]
+pub fn bstr_exp_b_len(v: &SchemaB) -> usize {
+    v.t.len()
+}
+
+#[unsafe(no_mangle)]
+pub fn bstr_exp_a_identity(v: &SchemaA) -> &SchemaA {
+    v
+}
+
+#[unsafe(no_mangle)]
+pub fn bstr_exp_a_same(a: &SchemaA, b: &SchemaA) -> bool {
+    core::ptr::eq(a, b)
+}
+
+#[unsafe(no_mangle)]
+pub fn bstr_exp_reflect_export(mode: u32, v: &mut SchemaA) -> usize {
+    reflect_mut(mode, v);
+    v.s.len()
+}
+
+#[track_caller]
+#[unsafe(no_mangle)]
+pub fn tc_exported(s: &str) -> usize {
+    let loc = core::panic::Location::caller();
+    s.len() + loc.file().len() + loc.line() as usize + loc.column() as usize
+}
+
+#[track_caller]
+#[unsafe(no_mangle)]
+pub fn tc_exported_file(s: &str) -> &'static str {
+    let _ = s;
+    core::panic::Location::caller().file()
 }

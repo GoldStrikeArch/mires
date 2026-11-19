@@ -727,6 +727,75 @@ struct PrintedUnit {
 /// value itself, a field, an element, a variant payload, a shared pointee). A signature that
 /// conversion cannot rebuild exactly is refused with the reason, and so is one whose JavaScript
 /// parameters are not one per Rust argument.
+fn panic_location_field_keys(
+    types: &crate::jir::types::TypeTable,
+    interns: &crate::jir::Interns,
+) -> (String, String, String) {
+    use crate::jir::types::{FieldKey, NominalForm, TypeKind};
+    use crate::lower::js::value;
+
+    let key_name = |key: FieldKey| -> Option<String> {
+        match key {
+            FieldKey::Name(id) => interns.str(id).map(str::to_owned),
+            FieldKey::Index(i) => Some(format!("_{i}")),
+            FieldKey::Transparent => None,
+        }
+    };
+
+    let mut candidates: Vec<(&str, (String, String, String))> = Vec::new();
+    for descriptor in types.descriptors() {
+        let TypeKind::Adt {
+            form: NominalForm::Struct,
+            variants,
+            ..
+        } = &descriptor.kind
+        else {
+            continue;
+        };
+        let Some(variant) = variants.first() else {
+            continue;
+        };
+        if variant.fields.len() < 3 {
+            continue;
+        }
+        let file_points_at_str = value::pointee_of(types, variant.fields[0].ty)
+            .is_some_and(|pointee| value::is_str(types, pointee));
+        let is_int = |ty| {
+            types.int_info(ty).is_some()
+                || matches!(
+                    types.get(types.peeled(ty)).map(|d| &d.kind),
+                    Some(TypeKind::Integer { .. })
+                )
+        };
+        let ints = is_int(variant.fields[1].ty) && is_int(variant.fields[2].ty);
+        if !file_points_at_str || !ints {
+            continue;
+        }
+        if let (Some(k0), Some(k1), Some(k2)) = (
+            key_name(variant.fields[0].key),
+            key_name(variant.fields[1].key),
+            key_name(variant.fields[2].key),
+        ) {
+            candidates.push((interns.str(variant.name).unwrap_or(""), (k0, k1, k2)));
+        }
+    }
+    let named: Vec<&(String, String, String)> = candidates
+        .iter()
+        .filter(|(name, _)| *name == "Location")
+        .map(|(_, keys)| keys)
+        .collect();
+    if let [keys] = named.as_slice() {
+        return (*keys).clone();
+    }
+    let mut keys = candidates.iter().map(|(_, keys)| keys);
+    if let Some(first) = keys.next() {
+        if keys.all(|other| other == first) {
+            return first.clone();
+        }
+    }
+    ("file".to_owned(), "line".to_owned(), "col".to_owned())
+}
+
 fn byte_string_facades(
     dcx: &Sink,
     table: &mut BTreeMap<JsName, LinkItem>,
@@ -751,7 +820,10 @@ fn byte_string_facades(
         let types = &interns.types;
         let signature = &body.signature;
         let reaches = |ty: &crate::jir::types::TypeId| bstr::reaches_str(types, *ty);
-        if !signature.arguments.iter().any(reaches) && !reaches(&signature.result) {
+        if !signature.arguments.iter().any(reaches)
+            && !reaches(&signature.result)
+            && !signature.abi.caller_location
+        {
             continue;
         }
         let refuse = |why: &str| {
@@ -762,8 +834,8 @@ fn byte_string_facades(
             ))
         };
         if signature.abi.spread.is_some()
-            || signature.abi.caller_location
-            || usize::from(signature.abi.parameters) != signature.arguments.len()
+            || usize::from(signature.abi.parameters)
+                != signature.arguments.len() + usize::from(signature.abi.caller_location)
         {
             refuse("its JavaScript parameters are not one per Rust argument");
             continue;
@@ -773,7 +845,7 @@ fn byte_string_facades(
             refuse("its body's private name is taken");
             continue;
         }
-        let params: Vec<String> = (0..signature.arguments.len())
+        let mut params: Vec<String> = (0..signature.arguments.len())
             .map(|i| format!("a{i}"))
             .collect();
         let arguments: Result<Vec<_>, String> = signature
@@ -784,13 +856,39 @@ fn byte_string_facades(
                 bstr::host_convert(types, interns, *ty, jsast::id(param.clone()), Crossing::In)
             })
             .collect();
-        let arguments = match arguments {
+        let mut arguments = match arguments {
             Ok(arguments) => arguments,
             Err(why) => {
                 refuse(&why);
                 continue;
             }
         };
+        if signature.abi.caller_location {
+            let loc_param = "a_loc".to_owned();
+            let (file_key, line_key, col_key) = panic_location_field_keys(types, interns);
+            let default_loc = jsast::object(vec![
+                (file_key.clone(), bstr::literal("<host>")),
+                (line_key, jsast::num(0)),
+                (col_key, jsast::num(1)),
+            ]);
+            let loc_spec = jsast::object_of(vec![
+                ("k", jsast::string("o")),
+                ("f", jsast::object(vec![(file_key, jsast::string("s"))])),
+            ]);
+            let wrapped_loc =
+                jsast::rt_call("bstr_ref_in", vec![jsast::id(loc_param.clone()), loc_spec]);
+            let loc_expr = jsast::cond(
+                jsast::binary(
+                    jsast::BinOp::Eq,
+                    jsast::id(loc_param.clone()),
+                    jsast::null(),
+                ),
+                default_loc,
+                wrapped_loc,
+            );
+            params.push(loc_param);
+            arguments.push(loc_expr);
+        }
         let call = jsast::call(jsast::id(inner.as_str().to_owned()), arguments);
         let result = match bstr::host_convert(types, interns, signature.result, call, Crossing::Out)
         {
@@ -2764,5 +2862,150 @@ mod tests {
             .map(|item| item.name.as_str())
             .collect();
         assert_eq!(placed, ["own_index", "own_other"]);
+    }
+
+    #[test]
+    fn track_caller_export_gets_byte_string_facade_with_default_and_wrapped_location() {
+        use crate::jir::interns::Interns;
+        use crate::jir::semantic::*;
+        use crate::jir::types::*;
+        use rcgjs_object::item::LinkJir;
+
+        let mut interns = Interns::new();
+        let loc_name = interns.intern_str("Location");
+        let filename_key = interns.intern_str("filename");
+        let line_key = interns.intern_str("line");
+        let col_key = interns.intern_str("col");
+
+        let make_desc = |id: u128, kind: TypeKind| TypeDescriptor {
+            id: TypeId(id),
+            name: None,
+            kind,
+            layout: LayoutFacts::default(),
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: TypeId(id),
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        };
+
+        let str_ty = TypeId(1);
+        let str_ref_ty = TypeId(2);
+        let u32_ty = TypeId(3);
+        let loc_ty = TypeId(4);
+        interns.types = TypeTable::from(vec![
+            make_desc(str_ty.0, TypeKind::Str),
+            make_desc(
+                str_ref_ty.0,
+                TypeKind::Reference {
+                    pointee: str_ty,
+                    mutable: false,
+                },
+            ),
+            make_desc(
+                u32_ty.0,
+                TypeKind::Integer {
+                    signed: false,
+                    bits: 32,
+                },
+            ),
+            make_desc(
+                loc_ty.0,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id: 1,
+                        local_hash: 42,
+                    },
+                    args: Vec::new(),
+                    form: NominalForm::Struct,
+                    variants: vec![VariantDescriptor {
+                        name: loc_name,
+                        fields: vec![
+                            FieldDescriptor {
+                                key: FieldKey::Name(filename_key),
+                                ty: str_ref_ty,
+                                offset: 0,
+                            },
+                            FieldDescriptor {
+                                key: FieldKey::Name(line_key),
+                                ty: u32_ty,
+                                offset: 4,
+                            },
+                            FieldDescriptor {
+                                key: FieldKey::Name(col_key),
+                                ty: u32_ty,
+                                offset: 8,
+                            },
+                        ],
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: Vec::new(),
+                    }],
+                    niche: None,
+                },
+            ),
+        ]);
+
+        let mut tc_item = duplicate(
+            "tc_exported",
+            "function tc_exported(s, $loc) { return s.length + $loc.filename.length; }",
+            Some(1),
+            Some(1),
+        );
+        tc_item.linkage = Linkage::exported("tc_exported".to_owned());
+        tc_item.jir = LinkJir::default();
+        tc_item.jir.use_interns(interns);
+        tc_item.jir.body = Some(Body {
+            item: ItemId {
+                definition: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 1,
+                },
+                instantiation: 0,
+            },
+            kind: BodyKind::Function,
+            semantic: BodySemantic::Ordinary,
+            signature: Signature {
+                arguments: vec![str_ref_ty],
+                result: u32_ty,
+                abi: AbiSignature {
+                    parameters: 2,
+                    spread: None,
+                    caller_location: true,
+                    inline_never: false,
+                },
+            },
+            locals: Vec::new(),
+            blocks: Vec::new(),
+        });
+
+        let mut table = BTreeMap::from([(JsName::new("tc_exported".to_owned()), tc_item)]);
+        let mut reachable = vec![JsName::new("tc_exported".to_owned())];
+        let dcx = Sink::new();
+        let moved = byte_string_facades(&dcx, &mut table, &mut reachable);
+        assert_eq!(dcx.errors(), 0);
+        assert_eq!(
+            moved,
+            vec![(
+                JsName::new("tc_exported".to_owned()),
+                JsName::new("tc_exported$bstr".to_owned())
+            )]
+        );
+        let facade_js = &table[&JsName::new("tc_exported".to_owned())].js;
+        assert!(facade_js.contains("a_loc"), "{facade_js}");
+        assert!(facade_js.contains("<host>"), "{facade_js}");
+        assert!(facade_js.contains("filename"), "{facade_js}");
+        assert!(facade_js.contains("bstr_ref_in"), "{facade_js}");
     }
 }
