@@ -2,7 +2,7 @@
 """Check exact fresh-build comparator artifacts offline; do not equate this with browser parity."""
 import argparse, datetime, hashlib, json, pathlib, subprocess
 ROOT=pathlib.Path(__file__).resolve().parents[2]
-p=argparse.ArgumentParser(description=__doc__);p.add_argument('--languages',default='rescript,melange,jsoo,scalajs,dart,kotlin,elm');p.add_argument('--suite',choices=('oss','pro','all'),default='all');a=p.parse_args()
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('--languages',default='rescript,melange,jsoo,scalajs,dart,kotlin,elm,gopherjs');p.add_argument('--suite',choices=('oss','pro','all'),default='all');a=p.parse_args()
 out=ROOT/'build/comparators';(out/'logs').mkdir(parents=True,exist_ok=True)
 rows=[]
 for lang in a.languages.split(','):

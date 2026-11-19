@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "pilot",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "run(input) in the JS host sends the input through the `request` port; Main.elm decodes { text, top } with Json.Decode and answers through the `response` port, which the host returns."
+}

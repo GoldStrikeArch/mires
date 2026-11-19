@@ -13,6 +13,7 @@
     "build:corpus": "node experiments/browser-workloads/tools/build.mjs",
     "test:corpus": "node experiments/browser-workloads/tools/run.mjs --pure",
     "setup:comparators:ocaml": "bash experiments/tools/setup-ocaml-comparators.sh",
+    "setup:comparators:go": "bash experiments/tools/setup-go-comparators.sh",
     "build:comparators": "python3 experiments/tools/run-comparator-builds.py",
     "check:comparators": "python3 experiments/tools/check-comparators.py"
   },

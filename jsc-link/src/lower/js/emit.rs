@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rcgjs_object::item::JsName;
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::repr::{
-    Carrier, Op, OpKind, RAssertMessage, RBlockId, RTerm, Root, ValueId,
+    Carrier, CellId, Op, OpKind, RAssertMessage, RBlockId, RTerm, Root, ValueId,
 };
 use rcgjs_object::jir::semantic::{
     BinaryOp, CoroutineDesugaring, CoroutineKind, HostPayload, TypeId,
@@ -783,7 +783,17 @@ impl<'a> JsCx<'a> {
         for op_ref in &payload.ops {
             let op = self.op(*op_ref)?;
             self.at(op.origin);
-            let mut stmts = self.op_stmts(op)?;
+            let mut stmts = match op.kind {
+                OpKind::CellAlloc(cell)
+                    if self
+                        .plan
+                        .fresh_allocs
+                        .contains(&(op_ref.block, op_ref.index)) =>
+                {
+                    self.fresh_container(cell)?
+                }
+                _ => self.op_stmts(op)?,
+            };
             let block = &self.func.blocks[op_ref.block.0 as usize];
             if matches!(block.term, RTerm::Invoke { .. })
                 && op_ref.index as usize + 1 == block.ops.len()
@@ -2221,12 +2231,22 @@ impl<'a> JsCx<'a> {
                 let Some(pointee) = value::pointee_of(table, result_ty) else {
                     return Err(decline(OpClass::Rvalue, "SliceView at a non-pointer type"));
                 };
-                match table.pointer_form(pointer_ty) {
-                    // A reference to an array: the array object is the buffer.
-                    Some(rcgjs_object::jir::types::PointerForm::Thin) => {
-                        Ok(ptr::fat_slice(data, jsast::num(0), len))
-                    }
-                    _ => self.build_fat(pointee, data, len),
+                // A reference to an array: the array object is the buffer. The test is on the
+                // pointee as well as the form, because a thin form says only that the pointer is
+                // its pointee's reference form. `from_raw_parts` takes its data half as
+                // `ptr as *const ()`, whose form is thin too and whose value is whatever the
+                // erased pointer was (a slot, a byte view, an address); `build_fat` asks that
+                // value, as v1's `aggregate_raw_ptr` does.
+                let array_reference = table.pointer_form(pointer_ty) == Some(PointerForm::Thin)
+                    && matches!(
+                        value::pointee_of(table, pointer_ty)
+                            .and_then(|pointee| value::kind(table, pointee)),
+                        Some(TypeKind::Array { .. })
+                    );
+                if array_reference {
+                    Ok(ptr::fat_slice(data, jsast::num(0), len))
+                } else {
+                    self.build_fat(pointee, data, len)
                 }
             }
             OpKind::Deref(pointer) => {
@@ -2285,6 +2305,16 @@ impl<'a> JsCx<'a> {
         }
     }
 
+    /// A `CellAlloc` that creates its cell's container ([`plan::Plan::fresh_allocs`]): the cell
+    /// holds an aggregate that MIR assembles field by field, so its storage is a new empty array or
+    /// object (v1 `assembly.rs`).
+    fn fresh_container(&self, cell: CellId) -> Res<Vec<Stmt>> {
+        let Some(container) = value::fresh_container(self.table, self.cell_ty(cell)?) else {
+            return Ok(Vec::new());
+        };
+        Ok(vec![jsast::assign_stmt(self.cell_expr(cell)?, container)])
+    }
+
     /// The statements of an op with no result.
     fn effect_stmts(&self, op: &Op) -> Res<Vec<Stmt>> {
         let table = self.table;
@@ -2316,7 +2346,8 @@ impl<'a> JsCx<'a> {
                 self.set_discriminant(JsPlace::Var(target), base_ty, *variant)
             }
             // The prelude declares the cell (`let x = []` when boxed); bringing it into existence
-            // is nothing at the alloc site, exactly as v1 declared every local once.
+            // is nothing at the alloc site, exactly as v1 declared every local once. The allocs
+            // that make an aggregate's container are `payload`'s (`fresh_container`).
             OpKind::CellAlloc(_) => Ok(Vec::new()),
             OpKind::CellStore { cell, v } => {
                 let value = self.expr_of(*v)?;

@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "minisearch",
+  "language": "kotlin",
+  "boundary": "run(input: Input) over external interfaces (read in place, no copy): options, queries and ids are read into Kotlin classes, sealed types and lambdas (the declarative filter/boostDocument/boostTerm, as in the adapter); documents stay host objects that MiniSearch reads by field name (document[name], each value read into a Value); strings are JS strings throughout (UTF-16, no conversion). The result is built as plain JS objects (kotlin.js.json) and arrays in the adapter's key order. Exported with @JsExport as a native ES module export."
+}

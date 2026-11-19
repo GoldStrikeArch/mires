@@ -335,6 +335,43 @@ read as generated glue and are stepped over.
 - `&*p` where `*p` is unsized is the **identity**: the fat pointer already carries everything a
   place of that type is (`buf`/`off`/`len`, or `ptr`/`meta`), so there is nothing to re-wrap.
 
+### Aggregates assembled in place
+
+MIR can give a local its value one field at a time, through projections, with no assignment of the
+whole. rustc's clone shim for a tuple, a closure or an async closure is that shape -- `_0.0 = <A as
+Clone>::clone(..); _0.1 = ..; return` -- and so is every body its MIR inliner splices the shim into,
+where the return place becomes the call's destination local. An aggregate here is a JavaScript array
+or object, so such a local's storage is a container that has to be created, and created again
+whenever the storage starts over: in its declaration at the top of the function, at its
+`StorageLive`, and after it has been moved out whole, because the object that left is the moved
+value's now. MIR built without storage markers has nothing else between two loop iterations that
+assemble one local and move it into a `Vec`.
+
+The container is `[]` for a tuple, an array or the environment of a closure or an async closure and
+`{}` for a struct, a union or an enum with a payload (`value::fresh_container`); a zero-sized value,
+a scalar and a transparent wrapper around one need none, since a write to such a wrapper's field is
+a write of the whole. It is made at one of those points only when a field write -- an assignment, a
+call destination or a `SetDiscriminant` through a projection that does not start with a deref -- can
+follow before a whole assignment, a `StorageLive`, a `StorageDead` or a whole move ends the
+question. A local assigned whole before every field write it gets, which is all of the MIR rustc
+builds from source, has no such point and is lowered exactly as before.
+
+`backend/src/assembly.rs` answers this for the baseline lane over rustc's MIR and
+`jsc-link/src/lower/assembly.rs` for the JIR lane over JIR-S. The JIR lane makes such a local a cell
+and puts a `CellAlloc` at each point after the entry; a `CellAlloc` of a container-typed cell is
+spelled as the empty container when the cell's storage is written in place (a mutable view rooted at
+the cell with a path, or a `SetDiscriminant` on a load of it) before a store replaces it
+(`fuse::fresh_cell_allocs`), and as nothing otherwise. Before this, the first field write threw
+`Cannot set properties of undefined`: every clone of a `(String, usize)`, and every `Vec` of such
+tuples cloned. `examples/core-tests/340_assembled_aggregates.rs` writes the shapes in custom MIR
+(the return place for a pair, a triple, a struct, an array and an enum; a local assembled and moved
+in a loop, with storage markers and without; assembled on one path and assigned whole on the other;
+assigned whole once and assembled again after each move), `341_clone_shim_aggregates.rs` pins the
+clone shims of tuples and closures, and `346_async_closure_clone.rs` the clone of an async closure
+(which the baseline lane refuses earlier: it cannot take a field of one). The clone of a coroutine
+(unstable `coroutine_clone`) and a nested field write into a container not made yet (`_0.1.0 = ..`,
+custom MIR only) are not covered.
+
 ### Runtime shim additions
 
 `runtime/shim.js` defines these beyond the print/abort members above:
@@ -857,7 +894,13 @@ ordinary slot to the compiler, so a write through it is immediately visible thro
 pointer and a repeated cast preserves pointer identity. Its synthetic address and a cast back to
 bytes continue to use the original buffer. Width alone is not enough to reconstruct a pointer,
 enum or aggregate, so those types keep the refusing `unscale` path.
-Building a raw slice through `slice_from_parts` normalizes a dangling data address. Creating a
+Building a raw slice through `slice_from_parts` normalizes a dangling data address. The data half
+is asked by its value, never by its type: `with_metadata_of`, which is how `Box::clone_from_ref`
+(`Box<[T]>::from(&[T])`) rebuilds its fat pointer, hands `from_raw_parts` the data pointer as
+`ptr as *const ()`, and a pointer to `()` says nothing about what the value is. Only a *reference to
+an array* is its own buffer; the JIR lane used to take that shortcut for every pointer whose form
+was the reference form, built a slice over the pointer record, and read every element of such a box
+wrong before refusing to free it (`examples/core-tests/342_boxed_slice_from_ref.rs`). Creating a
 `u8` or `i8` slice reference through `byte_slice_ref` seals initialized heap storage as bytes. A later scalar view aliases that storage
 without changing its byte capacity, including a partial word at the end. Cached views acquire new
 word slots after heap growth. Raw slices and `MaybeUninit<u8>` slices leave allocation retyping
@@ -996,7 +1039,12 @@ turns back into a dereferenceable pointer.
 - `compare_bytes` goes through `__rt.compare_bytes`: two unscaled byte buffers compare exactly, so
   the byte length is the element count and the bytewise `PartialEq` of `str` and `[u8]` works; two
   scaled slots of equal `sc` compare element by element over `count / sc`, which is what makes
-  `[i32] == [i32]` work; a mismatched pair throws;
+  `[i32] == [i32]` work; a mismatched pair throws. A byte pointer may also be the pointer a heap
+  block was allocated as, which `RawVecInner` keeps as its `*mut u8`: with rustc's MIR inliner on,
+  GVN folds `NonNull<u8> -> *const T -> *const u8` into one cast of that stored pointer, so
+  `[u16] == [u16]` hands it to the intrinsic with no byte view made. Into a block retyped to
+  `es`-byte elements such a pointer is keyed in elements (`_retype`), so the intrinsic reads it as
+  the scaled slot `scale` would have made (`examples/core-tests/345_byte_compare_heap_pointer.rs`);
 - `raw_eq` is `===` on two scalars, and `every` over an array of them — a fixed size array compares
   through a single `raw_eq` of the whole array, so without that arm no `[T; N] == [T; N]` would
   work. An array of scalars has no padding, so element by element asks what the bytes would.
@@ -1360,6 +1408,20 @@ transmute would be observing is not part of the value. No rule claims it, so it 
 [zombie](#the-zombie-census-in-core-and-alloc) rather than a guess. Nothing in `core` or `alloc`
 reaches one: every fieldless enum they transmute has an integer `repr`.
 
+An enum with a payload is an object, and a **two-variant niche-encoded** one is the other shape
+`core` transmutes. From an integer it is decoded at run time -- the niche value is the empty
+variant, anything else is the payload (`NonZero::new`, `Option<&T>`, `Option<char>`) -- and to an
+integer it is encoded the same way round: the empty variant is its niche value, re-signed at the
+integer's width, and the other is its one payload field transmuted into the integer. The encode
+gives the bit pattern rustc's layout stores. The two directions do **not** round trip for a signed
+niche whose high bit is set: the decode compares the integer with the niche's raw unsigned bits, so
+`transmute::<i8, Option<Ordering>>(-2)`, whose niche is `-2`, decodes as `Some` rather than `None`.
+That is a known gap in the decode, in both lanes; an unsigned niche, and a signed one below the high
+bit, round trip. `PartialOrd::lt` and its siblings for `[T]` need the encode: `core` writes them as
+a transmute of a `ControlFlow<bool>` to `u8` (`slice/cmp.rs`, `as_underlying`), which made `a < b`
+on slices, and every sort of slices, a zombie before. `examples/core-tests/344_slice_partial_ord.rs`
+pins both directions for unsigned niches.
+
 The same rule is what makes a slice of one byte elements readable as text: a `[u8]`, an `[i8]` and a
 slice of a fieldless one-byte `#[repr(int)]` enum are all buffers of JavaScript numbers, and
 `__rt.bytes_str` reads all three. `[AsciiChar]::as_str` is the cast that needs it, and it sits on
@@ -1497,6 +1559,25 @@ the first retype, using a misaligned offset, or presenting non-array storage is 
 The separate table is important: stores into sort scratch space must not acquire allocator
 ownership or deallocation behavior. `examples/core-tests/100_uninit_stack_retype.rs` pins this
 path.
+
+### Collecting in place
+
+`alloc` reuses the allocation of a `vec::IntoIter` for the `Vec` an adapter chain over it collects
+into, whenever the destination element fits in the source's (`vec/in_place_collect.rs`). That
+reinterprets a block of source elements as a block of destination elements while the rest of the
+source is still being read, through a cast between the two element pointers. A block here holds one
+element representation and is retyped at most once, so that cast has an answer only when the two
+types share a representation; otherwise the reuse was a compile-time refusal (`(u32, usize)` to
+`usize`), a run-time one (a newtype to its field) or a buffer projected into its first element (a
+one-tuple to its field). `patches/0014-same-type-in-place-collect.patch` keeps the reuse only
+when the element type stays the same (`into_iter().filter(..)` or `.map(..)` back to the element
+type, the common case), which always shares a representation: the cast is the identity and the
+array's slots are overwritten in order. The test is a comparison of the two type names, which is
+the same type up to lifetimes (a `TypeId` needs `'static`), together with equal sizes. Every other
+pair collects into an allocation of its own, as it does natively whenever the layouts do not fit;
+its `capacity()` is the one that path gives (the iterator's lower size bound) rather than the
+source's. `examples/core-tests/343_into_iter_collect.rs` covers both: the pairs that change type,
+and same-type collects that must keep the allocation, the values and the drop counts.
 
 ### The zero element factory
 

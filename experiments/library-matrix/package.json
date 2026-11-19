@@ -1,0 +1,17 @@
+{
+  "name": "mires-library-matrix",
+  "version": "0.0.0-experiment",
+  "private": true,
+  "type": "module",
+  "description": "Library x compiler matrix: npm libraries ported to nine compiled languages, checked for exact parity, sized and timed.",
+  "scripts": {
+    "selftest": "node tools/selftest.mjs",
+    "build": "node tools/build.mjs --library all --language all",
+    "check": "node tools/check.mjs --library all",
+    "bench": "node tools/bench.mjs --library all",
+    "sizes": "node tools/sizes.mjs",
+    "matrix": "node tools/matrix.mjs",
+    "all": "npm run build && npm run check && npm run bench && npm run sizes && npm run matrix",
+    "pilot": "node tools/build.mjs --library pilot,floor --language all && node tools/check.mjs --library pilot,floor && node tools/bench.mjs --library pilot && node tools/sizes.mjs && node tools/matrix.mjs"
+  }
+}

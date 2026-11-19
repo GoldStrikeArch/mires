@@ -223,6 +223,8 @@ struct Queuer<'a> {
     reads: HashMap<String, usize>,
     /// Whether `js-scoped-lets` asked for declarations at the assignment rather than the prelude.
     scoped: bool,
+    /// Locals `assembly.rs` gives a container, whose MIR assignment is not their only binding.
+    assembled: HashSet<Local>,
 }
 
 impl<'a> Queuer<'a> {
@@ -247,6 +249,12 @@ impl<'a> Queuer<'a> {
             unit_return: value::is_zst(fx.tcx, return_ty),
             reads,
             scoped: crate::opts::get().scoped_lets,
+            assembled: fx
+                .mir
+                .local_decls
+                .indices()
+                .filter(|local| fx.assembly.assembles(*local))
+                .collect(),
         }
     }
 
@@ -1155,8 +1163,9 @@ impl Queuer<'_> {
             // everything below is a branch, a loop body or a `switch` case, and the cases of one
             // `switch` share a block scope, so a declaration in one would collide with the same
             // declaration in another. Reading it before the declaration would be reading it before
-            // its only assignment, which MIR does not produce.
-            if self.scoped && top && self.uses.constant(local) {
+            // its only assignment, which MIR does not produce. A local assembled in place is
+            // also bound by the containers `assembly.rs` gives it, so it keeps its prelude `let`.
+            if self.scoped && top && self.uses.constant(local) && !self.assembled.contains(&local) {
                 out.push(jsast::const_(name, value));
                 return;
             }

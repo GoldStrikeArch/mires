@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "pilot",
+  "language": "melange",
+  "entry": "src/index.ml",
+  "boundary": "run(input: < text : string; top : int > Js.t): Melange strings and ints are the JS values, read with ##; the result is a JS string."
+}

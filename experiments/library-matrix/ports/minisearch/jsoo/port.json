@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "minisearch",
+  "language": "jsoo",
+  "entry": "src/main.ml",
+  "boundary": "run(input: Js.Unsafe.top Js.t): the input is read in place (Js.typeof, Js.Unsafe.get); document text, terms and string ids stay Js.js_string values (UTF-16, never Js.to_string), only field and option names become OCaml strings; the result is built as JS objects and arrays (Js.Unsafe.obj, Js.array). Published with Js.export."
+}

@@ -133,6 +133,24 @@
       ],
       "exitCode": 0,
       "output": "6.4.1+6.4.1"
+    },
+    "goForGopherjs": {
+      "command": [
+        ".toolchains/go/go1.21.13/bin/go",
+        "version"
+      ],
+      "exitCode": 0,
+      "output": "go version go1.21.13 darwin/arm64",
+      "capturedAt": "2026-11-18T10:22:42.659790+00:00"
+    },
+    "gopherjs": {
+      "command": [
+        ".toolchains/go/bin/gopherjs",
+        "version"
+      ],
+      "exitCode": 0,
+      "output": "GopherJS 1.21.0+go1.21.13",
+      "capturedAt": "2026-11-18T10:22:42.659790+00:00"
     }
   },
   "projectPins": {
@@ -145,7 +163,9 @@
     "ocaml": "5.3.0",
     "dune": "3.24.2",
     "jsOfOcaml": "6.4.1",
-    "lwt": "6.1.2"
+    "lwt": "6.1.2",
+    "goForGopherjs": "1.21.13",
+    "gopherjs": "1.21.0"
   },
   "npmLockSha256": "77e0631552241d2cce198bb9e533be53e9242320c0778ed8168a9efab7729b9a",
   "ocamlSwitchExportSha256": "e7abe1d350bf001038b9778e38e04d597cd3fbdec616464cca5cb359b3b5b5c1",
@@ -154,5 +174,6 @@
     "Installed Kotlin Toolchain 0.12.0 replaces the archived 0.11.1 js/app runner; actual metadata is emitted.",
     "Installed Dart 3.13.7 satisfies archived SDK ^3.13.0; this is a fresh build, not a historical binary reconstruction.",
     "Scala CLI is 1.18.0; Scala and Scala.js source versions remain pinned."
-  ]
+  ],
+  "goSetupScriptSha256": "0723121b573703930472f6d21a37e2070aa57c152c00e2fed8bcbebc1d36fb4f"
 }

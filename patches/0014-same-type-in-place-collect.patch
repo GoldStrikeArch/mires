@@ -1,0 +1,63 @@
+rustc_codegen_js: collect a `Vec` in place only for the same element type.
+
+`alloc::vec::in_place_collect` reuses the allocation of a `vec::IntoIter` for the `Vec` an
+adapter chain over it collects into, whenever the destination element fits in the source's.
+That reinterprets a block of `SRC` elements as a block of `DEST` elements: the buffer pointer is
+cast from `*mut SRC` to `*mut DEST` and written through while the rest of the source is still
+being read. A heap block on this target is a JavaScript array of one element representation,
+retyped at most once, so the cast has an answer only when the two types share a representation;
+otherwise it is a compile-time refusal (`(u32, usize)` to `usize`), a run-time one (a newtype to
+its field) or a projection into the first element (a one-tuple to its field). Keep the reuse for
+the same element type, which always shares one and is the common case, and send every other
+pair to the ordinary `from_iter` impls, which collect into a fresh allocation. The test is a
+type-name comparison (a `TypeId` needs `'static`) with equal sizes.
+
+--- a/library/alloc/src/vec/in_place_collect.rs
++++ b/library/alloc/src/vec/in_place_collect.rs
+@@ -174,6 +174,17 @@
+     if const { SRC::IS_ZST || DEST::IS_ZST || align_of::<SRC>() != align_of::<DEST>() } {
+         return false;
+     }
++    // rustc_codegen_js: reuse the source allocation only when the element type stays the same.
++    // Collecting in place reinterprets a heap block of `SRC` elements as one of `DEST` elements
++    // while the rest of the source is still being read, and a block on this target is a
++    // JavaScript array of one element representation, retyped at most once: the cast between the
++    // two element pointers has an answer only when the two types share a representation. The same
++    // type always does, and is the common case (`into_iter().filter(..)` or `.map(..)` back to the
++    // element type). Everything else collects into an allocation of its own through the other
++    // `from_iter` impls, as it does natively whenever the layouts do not fit.
++    if const { size_of::<SRC>() != size_of::<DEST>() || !same_type_name::<SRC, DEST>() } {
++        return false;
++    }
+ 
+     match (step_merge, step_expand) {
+         (Some(step_merge), Some(step_expand)) => {
+@@ -186,7 +197,28 @@
+         // Fall back to other from_iter impls if an overflow occurred in the step merge/expansion
+         // tracking.
+         _ => false,
++    }
++}
++
++/// rustc_codegen_js: whether `A` and `B` print the same type name, which is the same type up to
++/// its lifetimes; a lifetime does not change a representation. A `TypeId` would be exact but needs
++/// `'static`. Two distinct types can share a name (two closures in one function, one path in two
++/// versions of a crate); with equal sizes, which the caller also requires, their reuse is the same
++/// in-place overwrite of a JavaScript array, and nothing else is reached.
++const fn same_type_name<A, B>() -> bool {
++    let a = const { core::intrinsics::type_name::<A>() }.as_bytes();
++    let b = const { core::intrinsics::type_name::<B>() }.as_bytes();
++    if a.len() != b.len() {
++        return false;
+     }
++    let mut index = 0;
++    while index < a.len() {
++        if a[index] != b[index] {
++            return false;
++        }
++        index += 1;
++    }
++    true
+ }
+ 
+ const fn needs_realloc<SRC, DEST>(src_cap: usize, dst_cap: usize) -> bool {

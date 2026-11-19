@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "language": "kotlin",
+  "boundary": "the boundary only: input.text in, the same string out (see ports/pilot/kotlin/port.json for the conversions)"
+}

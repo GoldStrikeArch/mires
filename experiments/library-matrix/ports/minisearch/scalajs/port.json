@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "minisearch",
+  "language": "scalajs",
+  "boundary": "run(input: Input) over @js.native facade traits (no copy): options, queries, ids and the declarative filter/boostDocument/boostTerm are read into Scala case classes, enums and closures as each operation runs; documents stay host objects that MiniSearch reads through extractField (document[name], each value read into a Value); strings are JS strings throughout (UTF-16, no conversion). The result is built as js.Dictionary / js.Array plain objects in the adapter's key order. Exported with @JSExportTopLevel as a native ES module export."
+}

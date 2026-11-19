@@ -8,8 +8,8 @@ import {resolve,dirname,relative} from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {parse} from 'acorn';
 const root=resolve(dirname(fileURLToPath(import.meta.url)),'../..');
-const languages=['rescript','melange','jsoo','scalajs','dart','kotlin','elm'];
-const production={rescript:'default',melange:'default',jsoo:'default',scalajs:'full',dart:'o2',kotlin:'production',elm:'production'};
+const languages=['rescript','melange','jsoo','scalajs','dart','kotlin','elm','gopherjs'];
+const production={rescript:'default',melange:'default',jsoo:'default',scalajs:'full',dart:'o2',kotlin:'production',elm:'production',gopherjs:'default'};
 const rows=[];
 async function resource(file){const b=await readFile(file);return {path:relative(root,file),bytes:b.length,gzip9:gzipSync(b,{level:9,mtime:0}).length,brotli11:brotliCompressSync(b,{params:{[constants.BROTLI_PARAM_QUALITY]:11}}).length,sha256:createHash('sha256').update(b).digest('hex')};}
 for(const suite of ['oss','pro'])for(const language of languages){

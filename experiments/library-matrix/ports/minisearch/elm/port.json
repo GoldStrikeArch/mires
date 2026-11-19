@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "minisearch",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "run(input) in the JS host sends the input through the `request` port; Main.elm decodes it with Json.Decode (options, queries and documents into the port's types, the declarative filter/boostDocument/boostTerm into callbacks, as the reference adapter does; strings stay JS strings, read as UTF-16 code units), runs the script and answers the result, built with Json.Encode, through the `response` port, which the host returns."
+}

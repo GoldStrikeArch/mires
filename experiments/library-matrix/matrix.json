@@ -1,0 +1,122 @@
+{
+  "schema": 1,
+  "description": "Library x compiler matrix registry: which libraries exist, which languages build ports, and which ports exist. See README.md for every field.",
+  "environments": {
+    "node": { "kind": "node" },
+    "chrome": { "kind": "browser", "webdriver": "chrome", "headless": true },
+    "firefox": { "kind": "browser", "webdriver": "firefox", "headless": true },
+    "safari": { "kind": "browser", "webdriver": "safari", "headless": false }
+  },
+  "languages": {
+    "rust": {
+      "label": "Rust (mires)",
+      "runtimeGlobals": ["__rt", "@@rustc_codegen_js.abort-errors.v1"],
+      "builder": "languages/rust/build.mjs",
+      "production": "mires js-profile=release-size js-opt=on js-ecma-target=2018 js-cleanup=off, unwind mode, JSC_RUST_OPT_LEVEL=z, js-lane=jir; minimal shim, Rollup, Terser ecma 2018",
+      "sources": { "extensions": [".rs"], "lineComment": "//", "blockComment": ["/*", "*/"] }
+    },
+    "rescript": {
+      "label": "ReScript",
+      "builder": "languages/rescript/build.mjs",
+      "production": "ReScript 12.3.0 esmodule; Rollup + node-resolve (@rescript/runtime); common Terser",
+      "sources": { "extensions": [".res", ".resi"], "lineComment": "//", "blockComment": ["/*", "*/"] }
+    },
+    "melange": {
+      "label": "Melange",
+      "builder": "languages/melange/build.mjs",
+      "production": "Melange 7.0.1 melange.emit es6, emit_stdlib; Rollup + node-resolve; common Terser",
+      "sources": { "extensions": [".ml", ".mli"], "blockComment": ["(*", "*)"] }
+    },
+    "jsoo": {
+      "label": "js_of_ocaml",
+      "builder": "languages/jsoo/build.mjs",
+      "production": "js_of_ocaml 6.4.1 whole_program --opt=3 --effects=disabled --target-env=browser --no-extern-fs; module facade; common Terser",
+      "sources": { "extensions": [".ml", ".mli"], "blockComment": ["(*", "*)"] }
+    },
+    "scalajs": {
+      "label": "Scala.js",
+      "builder": "languages/scalajs/build.mjs",
+      "production": "Scala 3.8.4 / Scala.js 1.22.0 fullLinkJS (scala-cli --js-mode release, ES modules); common Terser",
+      "sources": { "extensions": [".scala"], "lineComment": "//", "blockComment": ["/*", "*/"] }
+    },
+    "dart": {
+      "label": "Dart (dart2js)",
+      "builder": "languages/dart/build.mjs",
+      "production": "dart compile js -O2 --no-source-maps; comparator facade; common Terser",
+      "sources": { "extensions": [".dart"], "lineComment": "//", "blockComment": ["/*", "*/"] }
+    },
+    "kotlin": {
+      "label": "Kotlin/JS",
+      "builder": "languages/kotlin/build.mjs",
+      "production": "Gradle 9.4.1 / Kotlin plugin 2.4.10 compileProductionExecutableKotlinJs, whole-program ES module, ES2015; Terser 2 passes",
+      "sources": { "extensions": [".kt", ".kts"], "lineComment": "//", "blockComment": ["/*", "*/"] }
+    },
+    "elm": {
+      "label": "Elm (+ JS host)",
+      "builder": "languages/elm/build.mjs",
+      "production": "elm make --optimize; comparator wrapper; compiler-aware Terser on the Elm module; Rollup over the JS host; common Terser",
+      "sources": { "extensions": [".elm"], "lineComment": "--", "blockComment": ["{-", "-}"] },
+      "hostJs": ["js"]
+    },
+    "gopherjs": {
+      "label": "Go (GopherJS)",
+      "runtimeGlobals": ["fs"],
+      "builder": "languages/gopherjs/build.mjs",
+      "production": "GopherJS 1.21.0 + Go 1.21.13 gopherjs build -m; comparator facade; common Terser",
+      "sources": { "extensions": [".go"], "lineComment": "//", "blockComment": ["/*", "*/"] }
+    }
+  },
+  "libraries": {
+    "pilot": {
+      "label": "pilot-wordfreq (harness stand-in)",
+      "npm": null,
+      "package": {
+        "name": "pilot-wordfreq",
+        "version": "1.0.0",
+        "entry": "libraries/pilot/package/index.mjs",
+        "standIn": "a handwritten module in this harness that stands in for an npm package"
+      },
+      "reference": "libraries/pilot/reference.mjs",
+      "contract": "libraries/pilot/CONTRACT.md",
+      "corpus": "libraries/pilot/corpus.json",
+      "output": { "form": "string", "async": false },
+      "normalisation": null,
+      "environments": ["node", "chrome", "firefox", "safari"],
+      "bench": { "cases": ["bench"], "baseIterations": 1, "variant": "libraries/pilot/bench-variant.mjs" }
+    },
+    "floor": {
+      "label": "runtime floor (identity program)",
+      "role": "floor",
+      "npm": null,
+      "package": {
+        "name": "matrix-floor",
+        "version": "1.0.0",
+        "entry": "libraries/floor/package/index.mjs",
+        "standIn": "the identity program; its ports measure each language's runtime floor uniformly"
+      },
+      "reference": "libraries/floor/reference.mjs",
+      "contract": "libraries/floor/CONTRACT.md",
+      "corpus": "libraries/floor/corpus.json",
+      "output": { "form": "string", "async": false },
+      "normalisation": null,
+      "environments": ["node"],
+      "bench": null
+    },
+    "minisearch": {
+      "label": "MiniSearch 7.2.0",
+      "npm": { "package": "minisearch", "version": "7.2.0", "entry": "dist/es/index.js" },
+      "reference": "libraries/minisearch/reference.mjs",
+      "contract": "libraries/minisearch/CONTRACT.md",
+      "corpus": "libraries/minisearch/corpus.json",
+      "output": { "form": "json", "async": false },
+      "normalisation": null,
+      "environments": ["node", "chrome", "firefox", "safari"],
+      "bench": { "cases": ["bench-index", "bench-search"], "baseIterations": 1, "variant": "libraries/minisearch/bench-variant.mjs" }
+    }
+  },
+  "ports": {
+    "pilot": ["rust", "rescript", "melange", "jsoo", "scalajs", "dart", "kotlin", "elm", "gopherjs"],
+    "floor": ["rust", "rescript", "melange", "jsoo", "scalajs", "dart", "kotlin", "elm", "gopherjs"],
+    "minisearch": ["rust", "rescript", "melange", "jsoo", "scalajs", "dart", "kotlin", "elm", "gopherjs"]
+  }
+}

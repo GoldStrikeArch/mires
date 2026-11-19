@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "language": "dart",
+  "entry": "src/main.dart",
+  "boundary": "the boundary only: input.text in, the same string out (see ports/pilot/dart/port.json for the conversions)"
+}

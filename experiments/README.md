@@ -14,4 +14,4 @@ Use explicit `--cleanup off` only for a labeled diagnostic comparison. All runti
 
 ## Restored other-language ports
 
-All seven non-Rust OSS comparator families build in the standalone checkout. Run `npm run build:comparators -- --suite oss` and `npm run check:comparators -- --suite oss` from the repository root. See [the current guide](../docs/COMPARATORS.md). Old `STATUS.md` files and archived matrices are historical, not current qualification.
+All eight non-Rust OSS comparator families (GopherJS was added on 2026-11-18) build in the standalone checkout. Run `npm run build:comparators -- --suite oss` and `npm run check:comparators -- --suite oss` from the repository root. See [the current guide](../docs/COMPARATORS.md). Old `STATUS.md` files and archived matrices are historical, not current qualification.

@@ -164,6 +164,7 @@ pub fn plan(
         }
     }
     planner.pin_host_environments();
+    planner.plan.fresh_allocs = fresh_cell_allocs(func, table);
     planner.name();
     planner.copies();
     planner.name_invokes();
@@ -1604,6 +1605,98 @@ fn slot_use_allowed(kind: &OpKind, value: ValueId) -> bool {
         } => *root == value && matches!(path.first(), Some(Proj::Deref)),
         _ => false,
     }
+}
+
+/// The `CellAlloc` ops that must create their cell's container ([`Plan::fresh_allocs`]).
+///
+/// A cell is storage, and an aggregate's storage is its JavaScript object, so bringing an
+/// aggregate cell into existence is making its container -- but only where something writes into
+/// that storage before a whole store replaces it: a mutable view rooted at the cell with a path
+/// (how `ssa.rs` spells a field, element or variant write into a cell), or a `SetDiscriminant` or
+/// `SetField` on a load of the cell (how it sets the variant of a whole one). That is the shape
+/// `lower/assembly.rs` gives a `CellAlloc` for. Everywhere else, which is nearly every cell, the
+/// container would be dead and the alloc stays the nothing v1 declares: a read before any store is
+/// only a drop-flag-guarded path that never runs. A backward liveness over the function: such a
+/// write needs the container, a store or another alloc ends the question.
+pub fn fresh_cell_allocs(func: &Func, table: &TypeTable) -> BTreeSet<(RBlockId, u32)> {
+    let candidate: Vec<bool> = func
+        .cells
+        .iter()
+        .map(|cell| !cell.boxed && super::js::value::fresh_container(table, cell.ty).is_some())
+        .collect();
+    let mut fresh = BTreeSet::new();
+    if !candidate.iter().any(|candidate| *candidate) {
+        return fresh;
+    }
+    let is_candidate = |cell: CellId| candidate.get(cell.0 as usize).copied().unwrap_or(false);
+    // The cell each `CellLoad` result reads, for the writes made on a loaded whole value.
+    let loads: BTreeMap<ValueId, CellId> = func
+        .blocks
+        .iter()
+        .flat_map(|block| &block.ops)
+        .filter_map(|op| match (op.result, &op.kind) {
+            (Some(result), OpKind::CellLoad(cell)) => Some((result, *cell)),
+            _ => None,
+        })
+        .collect();
+    let transfer = |kind: &OpKind, need: &mut BTreeSet<CellId>| match kind {
+        OpKind::CellAlloc(cell) | OpKind::CellStore { cell, .. } => {
+            need.remove(cell);
+        }
+        OpKind::BorrowView {
+            root: Root::Cell(cell),
+            path,
+            mutable: true,
+        }
+        | OpKind::RawView {
+            root: Root::Cell(cell),
+            path,
+            mutable: true,
+        } if !path.is_empty() && is_candidate(*cell) => {
+            need.insert(*cell);
+        }
+        OpKind::SetDiscriminant { base, .. } | OpKind::SetField { base, .. } => {
+            if let Some(cell) = loads.get(base).copied().filter(|cell| is_candidate(*cell)) {
+                need.insert(cell);
+            }
+        }
+        _ => {}
+    };
+    let block_need = |block: &crate::jir::repr::RBlock,
+                      need_in: &[BTreeSet<CellId>],
+                      fresh: &mut Option<&mut BTreeSet<(RBlockId, u32)>>| {
+        let mut need = BTreeSet::new();
+        for successor in block.term.successors() {
+            if let Some(successor) = need_in.get(successor.0 as usize) {
+                need.extend(successor.iter().copied());
+            }
+        }
+        for (index, op) in block.ops.iter().enumerate().rev() {
+            if let (OpKind::CellAlloc(cell), Some(fresh)) = (&op.kind, fresh.as_deref_mut()) {
+                if need.contains(cell) {
+                    fresh.insert((block.id, index as u32));
+                }
+            }
+            transfer(&op.kind, &mut need);
+        }
+        need
+    };
+    let mut need_in: Vec<BTreeSet<CellId>> = vec![BTreeSet::new(); func.blocks.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (index, block) in func.blocks.iter().enumerate().rev() {
+            let need = block_need(block, &need_in, &mut None);
+            if need != need_in[index] {
+                need_in[index] = need;
+                changed = true;
+            }
+        }
+    }
+    for block in &func.blocks {
+        block_need(block, &need_in, &mut Some(&mut fresh));
+    }
+    fresh
 }
 
 /// The cells an op touches (loads, stores, borrows, drops).

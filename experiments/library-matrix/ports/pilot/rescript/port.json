@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "pilot",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "run(input: {text: string, top: int}): the record type is the JS object itself, so no conversion happens on either side; the result is a JS string."
+}

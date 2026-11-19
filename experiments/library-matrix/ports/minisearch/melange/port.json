@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "minisearch",
+  "language": "melange",
+  "entry": "src/index.ml",
+  "boundary": "run(input: Js.Json.t): the input is read in place (Js.Json.classify, obj[name] through a [@@mel.get_index] external); Melange strings are the JS strings, so document text, terms and string ids stay UTF-16 with no conversion; the result is built as JS objects and arrays (Js.Json, Js.Dict.fromList)."
+}

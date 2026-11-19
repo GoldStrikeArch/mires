@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "minisearch",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_minisearch",
+  "boundary": "run(input: JsValue): Reflect.get / index bindings walk the operation script; document text, terms, ids-as-strings in options and queries cross as UTF-16 code units (charCodeAt), names as host strings read into Rust UTF-8; the result is built as host objects and arrays (new Object, index_set, push), strings from UTF-16 (String::from_utf16, or String.fromCharCode for lone surrogates)."
+}

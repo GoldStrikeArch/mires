@@ -1,0 +1,86 @@
+{
+  "schema": 1,
+  "library": "pilot",
+  "cases": [
+    {
+      "id": "empty",
+      "note": "empty text: no tokens, mean defined as 0",
+      "input": {
+        "text": "",
+        "top": 3
+      }
+    },
+    {
+      "id": "ascii",
+      "note": "ASCII sentence with case folding and punctuation",
+      "input": {
+        "text": "The quick brown fox jumps over the lazy dog. The dog sleeps; the fox runs! THE END.",
+        "top": 5
+      }
+    },
+    {
+      "id": "ties",
+      "note": "equal counts and lengths: the explicit length tie-break, then first-occurrence order",
+      "input": {
+        "text": "beta alpha gamma beta alpha gamma delta",
+        "top": 4
+      }
+    },
+    {
+      "id": "unicode-bmp",
+      "note": "non-ASCII BMP text: only ASCII letters fold; the em dash is a word character",
+      "input": {
+        "text": "Ünïcödé café CAFÉ naïve Straße STRASSE — ПРИВЕТ привет мир, мир! 東京 東京 大阪 Ελληνικά",
+        "top": 8
+      }
+    },
+    {
+      "id": "astral",
+      "note": "astral code points (emoji, math letters, CJK extension B), a flag pair and a ZWJ sequence",
+      "input": {
+        "text": "😀 rocket 🚀 rocket 😀 😀 𝒳𝒴 𝒳𝒴 𠜎 a😀b 🇺🇳 👩‍💻 👩‍💻",
+        "top": 6
+      }
+    },
+    {
+      "id": "punctuation-digits",
+      "note": "digits, underscores, hyphens, apostrophes and brackets split words",
+      "input": {
+        "text": "a1 b2 A1 B2 a1; 42 42 0042 --- x_y x-y it's (nested [brackets]) e-mail@example.com",
+        "top": 7
+      }
+    },
+    {
+      "id": "whitespace",
+      "note": "ASCII whitespace separates; U+00A0 and U+3000 are word characters under the contract",
+      "input": {
+        "text": "\t\n  lots   of\r\nwhite space　here\n  lots\tof\n",
+        "top": 5
+      }
+    },
+    {
+      "id": "top-zero",
+      "note": "top 0: header lines only",
+      "input": {
+        "text": "zero rows requested",
+        "top": 0
+      }
+    },
+    {
+      "id": "top-large",
+      "note": "top larger than the number of distinct words",
+      "input": {
+        "text": "one two two three three three",
+        "top": 100
+      }
+    },
+    {
+      "id": "bench",
+      "note": "deterministic 160-phrase mix (LCG seed 7) of the other cases; also the timing input",
+      "input": {
+        "text": "x_y x-y it's e-mail@example.com Ελληνικά γλώσσα lorem ipsum dolor sit amet 東京 東京 大阪 The quick brown fox jumps over the lazy dog. Ελληνικά γλώσσα alpha beta gamma delta 東京 東京 大阪 The quick brown fox jumps over the lazy dog. 𝒳𝒴 𠜎 a😀b alpha beta gamma delta a1 b2 A1 B2 42 0042 rocket 🚀 rocket 😀 Ünïcödé café CAFÉ naïve Straße lorem ipsum dolor sit amet a1 b2 A1 B2 42 0042 The quick brown fox jumps over the lazy dog. Ελληνικά γλώσσα alpha beta gamma delta a1 b2 A1 B2 42 0042 rocket 🚀 rocket 😀 Ünïcödé café CAFÉ naïve Straße ПРИВЕТ привет мир, мир! a1 b2 A1 B2 42 0042 x_y x-y it's e-mail@example.com 𝒳𝒴 𠜎 a😀b ПРИВЕТ привет мир, мир! 東京 東京 大阪 The quick brown fox jumps over the lazy dog. 𝒳𝒴 𠜎 a😀b lorem ipsum dolor sit amet THE END the end The End rocket 🚀 rocket 😀 𝒳𝒴 𠜎 a😀b alpha beta gamma delta a1 b2 A1 B2 42 0042 rocket 🚀 rocket 😀 Ünïcödé café CAFÉ naïve Straße alpha beta gamma delta a1 b2 A1 B2 42 0042 x_y x-y it's e-mail@example.com 𝒳𝒴 𠜎 a😀b ПРИВЕТ привет мир, мир! THE END the end The End rocket 🚀 rocket 😀 𝒳𝒴 𠜎 a😀b ПРИВЕТ привет мир, мир! a1 b2 A1 B2 42 0042 The quick brown fox jumps over the lazy dog. 𝒳𝒴 𠜎 a😀b ПРИВЕТ привет мир, мир! 東京 東京 大阪 rocket 🚀 rocket 😀 Ünïcödé café CAFÉ naïve Straße lorem ipsum dolor sit amet 東京 東京 大阪 rocket 🚀 rocket 😀 𝒳𝒴 𠜎 a😀b lorem ipsum dolor sit amet THE END the end The End x_y x-y it's e-mail@example.com 𝒳𝒴 𠜎 a😀b alpha beta gamma delta 東京 東京 大阪 rocket 🚀 rocket 😀 Ünïcödé café CAFÉ naïve Straße ПРИВЕТ привет мир, мир! THE END the end The End rocket 🚀 rocket 😀 Ελληνικά γλώσσα alpha beta gamma delta THE END the end The End rocket 🚀 rocket 😀 𝒳𝒴 𠜎 a😀b alpha beta gamma delta THE END the end The End x_y x-y it's e-mail@example.com Ελληνικά γλώσσα lorem ipsum dolor sit amet 東京 東京 大阪 The quick brown fox jumps over the lazy dog. Ελληνικά γλώσσα lorem ipsum dolor sit amet 東京 東京 大阪 x_y x-y it's e-mail@example.com Ελληνικά γλώσσα ПРИВЕТ привет мир, мир! THE END the end The End The quick brown fox jumps over the lazy dog. 𝒳𝒴 𠜎 a😀b lorem ipsum dolor sit amet THE END the end The End rocket 🚀 rocket 😀 Ελληνικά γλώσσα alpha beta gamma delta THE END the end The End x_y x-y it's e-mail@example.com Ελληνικά γλώσσα lorem ipsum dolor sit amet THE END the end The End x_y x-y it's e-mail@example.com 𝒳𝒴 𠜎 a😀b lorem ipsum dolor sit amet a1 b2 A1 B2 42 0042 x_y x-y it's e-mail@example.com 𝒳𝒴 𠜎 a😀b ПРИВЕТ привет мир, мир! 東京 東京 大阪 rocket 🚀 rocket 😀 Ünïcödé café CAFÉ naïve Straße lorem ipsum dolor sit amet 東京 東京 大阪 rocket 🚀 rocket 😀 Ünïcödé café CAFÉ naïve Straße alpha beta gamma delta 東京 東京 大阪 x_y x-y it's e-mail@example.com Ελληνικά γλώσσα alpha beta gamma delta 東京 東京 大阪 x_y x-y it's e-mail@example.com Ελληνικά γλώσσα ПРИВЕТ привет мир, мир! a1 b2 A1 B2 42 0042 rocket 🚀 rocket 😀 Ελληνικά γλώσσα alpha beta gamma delta a1 b2 A1 B2 42 0042 rocket 🚀 rocket 😀 𝒳𝒴 𠜎 a😀b ПРИВЕТ привет мир, мир! a1 b2 A1 B2 42 0042 x_y x-y it's e-mail@example.com 𝒳𝒴 𠜎 a😀b ПРИВЕТ привет мир, мир! THE END the end The End x_y x-y it's e-mail@example.com Ελληνικά γλώσσα lorem ipsum dolor sit amet 東京 東京 大阪 x_y x-y it's e-mail@example.com Ελληνικά γλώσσα lorem ipsum dolor sit amet THE END the end The End rocket 🚀 rocket 😀 Ünïcödé café CAFÉ naïve Straße ПРИВЕТ привет мир, мир! THE END the end The End x_y x-y it's e-mail@example.com 𝒳𝒴 𠜎 a😀b lorem ipsum dolor sit amet a1 b2 A1 B2 42 0042 rocket 🚀 rocket 😀 Ελληνικά γλώσσα alpha beta gamma delta a1 b2 A1 B2 42 0042 The quick brown fox jumps over the lazy dog. Ελληνικά γλώσσα alpha beta gamma delta 東京 東京 大阪",
+        "top": 12
+      }
+    }
+  ]
+}

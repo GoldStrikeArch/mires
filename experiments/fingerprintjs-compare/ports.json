@@ -192,6 +192,18 @@
       "runtimeDefault": true,
       "sizeDefault": true,
       "frozen": false
+    },
+    {
+      "id": "gopherjs",
+      "label": "GopherJS 1.21.0",
+      "dir": "../fingerprintjs-gopherjs",
+      "dist": "../fingerprintjs-gopherjs/dist",
+      "kind": "gopherjs",
+      "family": "gopherjs",
+      "profile": "production",
+      "runtimeDefault": true,
+      "sizeDefault": true,
+      "frozen": false
     }
   ]
 }
