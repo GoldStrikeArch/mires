@@ -254,12 +254,15 @@ impl JsCx<'_> {
             {
                 value
             }
-            _ => match self.niche_from_scalar(from, to, value)? {
+            _ => match self.niche_from_scalar(from, to, value.clone())? {
                 Some(decoded) => decoded,
-                None => self.zombie(
-                    "`transmute` between these types is not supported by rustc_codegen_js"
-                        .to_owned(),
-                ),
+                None => match self.niche_to_scalar(from, to, value)? {
+                    Some(encoded) => encoded,
+                    None => self.zombie(
+                        "`transmute` between these types is not supported by rustc_codegen_js"
+                            .to_owned(),
+                    ),
+                },
             },
         })
     }
@@ -386,6 +389,77 @@ impl JsCx<'_> {
         );
         Ok(Some(jsast::call(
             jsast::arrow(vec![NICHE_PARAM.to_owned()], decoded),
+            vec![value],
+        )))
+    }
+
+    /// The other direction of [`Self::niche_from_scalar`]: a niche encoded two variant enum
+    /// transmuted to the integer its layout stores (`intrinsics.rs::niche_to_scalar`).
+    ///
+    /// `core` writes `PartialOrd::lt` for `[T]` as a transmute of a `ControlFlow<bool>` to `u8`
+    /// (`slice/cmp.rs`, `as_underlying`). The empty variant is the niche value, re-signed at the
+    /// destination's width, and the other is its one payload field transmuted into the integer.
+    /// The conditions are the decode's, so the two directions round trip.
+    fn niche_to_scalar(&self, from: TypeId, to: TypeId, value: Expr) -> Res<Option<Expr>> {
+        let table = self.table;
+        let Some((signed, bits)) = table.int_info(to) else {
+            return Ok(None);
+        };
+        let int = Repr {
+            repr: table.int_repr(to),
+            signed,
+            bits,
+        };
+        let peeled = table.peeled(from);
+        let Some(TypeKind::Adt {
+            form: NominalForm::Enum,
+            variants,
+            niche: Some(niche),
+            ..
+        }) = value::kind(table, peeled)
+        else {
+            return Ok(None);
+        };
+        if variants.len() != 2 || value::size_of(table, to) != value::size_of(table, peeled) {
+            return Ok(None);
+        }
+        let untagged = niche.untagged_variant;
+        let empty_index = if untagged == 0 { 1 } else { 0 };
+        let empty = &variants[empty_index as usize];
+        if empty.fields.iter().any(|field| !table.is_zst(field.ty)) {
+            return Ok(None);
+        }
+        let payload = &variants[untagged as usize];
+        let mut live = payload.fields.iter().filter(|f| !table.is_zst(f.ty));
+        let Some(field) = live.next() else {
+            return Ok(None);
+        };
+        if live.next().is_some() {
+            return Ok(None);
+        }
+        let (Some(repr), Some(empty_tag)) = (
+            table.enum_repr(peeled),
+            value::variant_tag(table, self.interns, peeled, empty_index),
+        ) else {
+            return Ok(None);
+        };
+        let bound = jsast::id(NICHE_PARAM);
+        let is_empty = jsast::binary(
+            BinOp::StrictEq,
+            value::tag_expr(repr, bound.clone()),
+            empty_tag,
+        );
+        let niche_value = int.literal(value::resign(signed, bits, niche.niche_start));
+        let payload_bits = self.transmute(
+            field.ty,
+            to,
+            value::field_expr(self.interns, bound, field.key),
+        )?;
+        Ok(Some(jsast::call(
+            jsast::arrow(
+                vec![NICHE_PARAM.to_owned()],
+                jsast::cond(is_empty, niche_value, payload_bits),
+            ),
             vec![value],
         )))
     }

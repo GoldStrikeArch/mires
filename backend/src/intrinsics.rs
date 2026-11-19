@@ -1952,8 +1952,10 @@ fn transmute_scalar<'tcx>(
         {
             value
         }
-        _ => match niche_from_scalar(fx, inner_from, inner_to, value) {
-            Some(decoded) => decoded,
+        _ => match niche_from_scalar(fx, inner_from, inner_to, value.clone())
+            .or_else(|| niche_to_scalar(fx, inner_from, inner_to, value))
+        {
+            Some(converted) => converted,
             None => fx.zombie(format!(
                 "`transmute` from `{from_ty}` to `{to_ty}` is not supported by rustc_codegen_js"
             )),
@@ -2159,6 +2161,91 @@ fn niche_from_scalar<'tcx>(
     );
     Some(jsast::call(
         jsast::arrow(vec![NICHE_PARAM.to_string()], decoded),
+        vec![value],
+    ))
+}
+
+/// The other direction of [`niche_from_scalar`]: a niche encoded two variant enum transmuted to
+/// the integer its layout stores, encoded at run time.
+///
+/// `core` implements `PartialOrd::lt` and its siblings for `[T]` as a transmute of a
+/// `ControlFlow<bool>` to `u8` (`slice/cmp.rs`, `as_underlying`): `Break(false)` is 0, `Break(true)`
+/// is 1 and `Continue(())` is the niche. Here the enum is an object, so the bit pattern is computed:
+/// the empty variant is the niche value, re-signed at the destination's width, and the other is its
+/// payload transmuted into the integer recursively. The conditions are exactly the decode's, so the
+/// two directions round trip: the tag as wide as the integer, one niche variant carrying no data,
+/// and one payload field.
+fn niche_to_scalar<'tcx>(
+    fx: &FnCx<'_, 'tcx>,
+    from_ty: Ty<'tcx>,
+    to_ty: Ty<'tcx>,
+    value: Expr,
+) -> Option<Expr> {
+    use rustc_abi::{TagEncoding, Variants};
+
+    let tcx = fx.tcx;
+    let (signed, bits) = int_info(tcx, to_ty)?;
+    let int = Int {
+        repr: int_repr(to_ty),
+        signed,
+        bits,
+    };
+
+    let ty::Adt(def, args) = from_ty.kind() else {
+        return None;
+    };
+    if !def.is_enum() {
+        return None;
+    }
+    let layout = tcx.layout_of(typing_env().as_query_input(from_ty)).ok()?;
+    let Variants::Multiple {
+        tag,
+        tag_encoding:
+            TagEncoding::Niche {
+                untagged_variant,
+                niche_variants,
+                niche_start,
+            },
+        ..
+    } = &layout.variants
+    else {
+        return None;
+    };
+    if tag.size(&tcx).bits() as u32 != bits || niche_variants.start != niche_variants.last {
+        return None;
+    }
+
+    let empty_index = niche_variants.start;
+    let empty = def.variant(empty_index);
+    let normalize = |ty| tcx.normalize_erasing_regions(typing_env(), ty);
+    let live = |ty| !is_zst(tcx, normalize(ty));
+    if empty.fields.iter().any(|field| live(field.ty(tcx, args))) {
+        return None;
+    }
+
+    let payload = def.variant(*untagged_variant);
+    let mut fields = payload
+        .fields
+        .iter_enumerated()
+        .filter(|(_, field)| live(field.ty(tcx, args)));
+    let (field_index, field) = fields.next()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    let field_ty = normalize(field.ty(tcx, args));
+    let key = value::field_key(tcx, from_ty, Some(*untagged_variant), field_index)?;
+
+    let bound = jsast::id(NICHE_PARAM);
+    let is_empty = jsast::binary(
+        JsBinOp::StrictEq,
+        value::tag_expr(value::enum_repr(tcx, from_ty)?, bound.clone()),
+        value::variant_tag(tcx, from_ty, empty_index)?,
+    );
+    let niche = int.literal(value::resign(signed, bits, *niche_start));
+    let payload_bits = codegen_transmute(fx, field_ty, to_ty, value::field_expr(bound, key));
+    let encoded = jsast::cond(is_empty, niche, payload_bits);
+    Some(jsast::call(
+        jsast::arrow(vec![NICHE_PARAM.to_string()], encoded),
         vec![value],
     ))
 }

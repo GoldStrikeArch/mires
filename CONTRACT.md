@@ -1351,6 +1351,17 @@ transmute would be observing is not part of the value. No rule claims it, so it 
 [zombie](#the-zombie-census-in-core-and-alloc) rather than a guess. Nothing in `core` or `alloc`
 reaches one: every fieldless enum they transmute has an integer `repr`.
 
+An enum with a payload is an object, and a **two-variant niche-encoded** one is the other shape
+`core` transmutes. From an integer it is decoded at run time -- the niche value is the empty
+variant, anything else is the payload (`NonZero::new`, `Option<&T>`, `Option<char>`) -- and to an
+integer it is encoded the same way round: the empty variant is its niche value, re-signed at the
+integer's width, and the other is its one payload field transmuted into the integer. The conditions
+are the same in both directions (the tag as wide as the integer, one niche variant carrying no data,
+one payload field), so the two round trip. `PartialOrd::lt` and its siblings for `[T]` need the
+encode: `core` writes them as a transmute of a `ControlFlow<bool>` to `u8` (`slice/cmp.rs`,
+`as_underlying`), which made `a < b` on slices, and every sort of slices, a zombie before.
+`examples/core-tests/344_slice_partial_ord.rs` pins both directions.
+
 The same rule is what makes a slice of one byte elements readable as text: a `[u8]`, an `[i8]` and a
 slice of a fieldless one-byte `#[repr(int)]` enum are all buffers of JavaScript numbers, and
 `__rt.bytes_str` reads all three. `[AsciiChar]::as_str` is the cast that needs it, and it sits on
