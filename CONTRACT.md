@@ -890,7 +890,13 @@ ordinary slot to the compiler, so a write through it is immediately visible thro
 pointer and a repeated cast preserves pointer identity. Its synthetic address and a cast back to
 bytes continue to use the original buffer. Width alone is not enough to reconstruct a pointer,
 enum or aggregate, so those types keep the refusing `unscale` path.
-Building a raw slice through `slice_from_parts` normalizes a dangling data address. Creating a
+Building a raw slice through `slice_from_parts` normalizes a dangling data address. The data half
+is asked by its value, never by its type: `with_metadata_of`, which is how `Box::clone_from_ref`
+(`Box<[T]>::from(&[T])`) rebuilds its fat pointer, hands `from_raw_parts` the data pointer as
+`ptr as *const ()`, and a pointer to `()` says nothing about what the value is. Only a *reference to
+an array* is its own buffer; the JIR lane used to take that shortcut for every pointer whose form
+was the reference form, built a slice over the pointer record, and read every element of such a box
+wrong before refusing to free it (`examples/core-tests/342_boxed_slice_from_ref.rs`). Creating a
 `u8` or `i8` slice reference through `byte_slice_ref` seals initialized heap storage as bytes. A later scalar view aliases that storage
 without changing its byte capacity, including a partial word at the end. Cached views acquire new
 word slots after heap growth. Raw slices and `MaybeUninit<u8>` slices leave allocation retyping

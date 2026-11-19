@@ -1635,12 +1635,22 @@ impl<'a> JsCx<'a> {
                 let Some(pointee) = value::pointee_of(table, result_ty) else {
                     return Err(decline(OpClass::Rvalue, "SliceView at a non-pointer type"));
                 };
-                match table.pointer_form(pointer_ty) {
-                    // A reference to an array: the array object is the buffer.
-                    Some(rcgjs_object::jir::types::PointerForm::Thin) => {
-                        Ok(ptr::fat_slice(data, jsast::num(0), len))
-                    }
-                    _ => self.build_fat(pointee, data, len),
+                // A reference to an array: the array object is the buffer. The test is on the
+                // pointee as well as the form, because a thin form says only that the pointer is
+                // its pointee's reference form. `from_raw_parts` takes its data half as
+                // `ptr as *const ()`, whose form is thin too and whose value is whatever the
+                // erased pointer was (a slot, a byte view, an address); `build_fat` asks that
+                // value, as v1's `aggregate_raw_ptr` does.
+                let array_reference = table.pointer_form(pointer_ty) == Some(PointerForm::Thin)
+                    && matches!(
+                        value::pointee_of(table, pointer_ty)
+                            .and_then(|pointee| value::kind(table, pointee)),
+                        Some(TypeKind::Array { .. })
+                    );
+                if array_reference {
+                    Ok(ptr::fat_slice(data, jsast::num(0), len))
+                } else {
+                    self.build_fat(pointee, data, len)
                 }
             }
             OpKind::Deref(pointer) => {
