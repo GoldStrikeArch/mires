@@ -749,6 +749,21 @@ globalThis.__rt.write_bytes = (dst, byte, count, zero) => {
   for (let i = 0; i < d.n; i++) d.buf[d.off + i] = value;
 };
 
+// _bytes(p): a byte pointer as the byte view of its buffer. Usually it is one
+// already: an unscaled slot over bytes, or the scaled slot an `as *const u8`
+// cast made of an element pointer. The exception is the pointer a heap block
+// was allocated as, which `RawVecInner` keeps as its `*mut u8`: once rustc's GVN
+// folds `NonNull<u8> -> *const T -> *const u8` into one cast, `[u16] == [u16]`
+// hands that stored pointer to `compare_bytes`. Into a block retyped to `es`-byte
+// elements an unscaled pointer is keyed in elements (`_retype`), so its bytes
+// are the scaled view `scale` would have made of it.
+globalThis.__rt._bytes = (p) => {
+  if (p === null || typeof p !== "object" || p.sc !== undefined) return p;
+  const block = globalThis.__rt._heap_block(p.buf);
+  if (block === undefined || block.es === 1) return p;
+  return { buf: p.buf, off: p.off * block.es, sc: block.es };
+};
+
 // compare_bytes(a, b, count): the lexicographic comparison of `count` bytes, as
 // a negative number, zero or a positive one. Unscaled byte buffers compare
 // exactly -- the byte count is the element count, so the difference of two
@@ -758,8 +773,13 @@ globalThis.__rt.write_bytes = (dst, byte, count, zero) => {
 // `[i32] == [i32]` work; the sign of the answer is then the order of two whole
 // elements rather than of their first differing byte, which no caller of this
 // intrinsic looks at.
+//
+// Both pointers are byte pointers, and one may be the pointer a heap block was
+// allocated as rather than a byte view of it (`_bytes`).
 globalThis.__rt.compare_bytes = (a, b, count) => {
   if (count === 0) return 0;
+  a = globalThis.__rt._bytes(a);
+  b = globalThis.__rt._bytes(b);
   globalThis.__rt._scales(a, b, "compare_bytes");
   const x = globalThis.__rt._run(a, count, "compare_bytes");
   const y = globalThis.__rt._run(b, count, "compare_bytes");

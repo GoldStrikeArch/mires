@@ -1035,7 +1035,12 @@ turns back into a dereferenceable pointer.
 - `compare_bytes` goes through `__rt.compare_bytes`: two unscaled byte buffers compare exactly, so
   the byte length is the element count and the bytewise `PartialEq` of `str` and `[u8]` works; two
   scaled slots of equal `sc` compare element by element over `count / sc`, which is what makes
-  `[i32] == [i32]` work; a mismatched pair throws;
+  `[i32] == [i32]` work; a mismatched pair throws. A byte pointer may also be the pointer a heap
+  block was allocated as, which `RawVecInner` keeps as its `*mut u8`: with rustc's MIR inliner on,
+  GVN folds `NonNull<u8> -> *const T -> *const u8` into one cast of that stored pointer, so
+  `[u16] == [u16]` hands it to the intrinsic with no byte view made. Into a block retyped to
+  `es`-byte elements such a pointer is keyed in elements (`_retype`), so the intrinsic reads it as
+  the scaled slot `scale` would have made (`examples/core-tests/345_byte_compare_heap_pointer.rs`);
 - `raw_eq` is `===` on two scalars, and `every` over an array of them — a fixed size array compares
   through a single `raw_eq` of the whole array, so without that arm no `[T; N] == [T; N]` would
   work. An array of scalars has no padding, so element by element asks what the bytes would.
