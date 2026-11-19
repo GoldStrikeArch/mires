@@ -2191,7 +2191,28 @@ globalThis.__rt._bstr_wrap = (value, spec, out) => {
   const makeMembrane = (real, readVal, writeVal) => {
     const isArr = Array.isArray(real);
     const shadow = isArr ? [] : Object.create(Object.getPrototypeOf(real));
-    return new Proxy(shadow, {
+    const findPropDesc = (obj, prop) => {
+      let cur = obj;
+      while (cur !== null && cur !== undefined) {
+        const d = Reflect.getOwnPropertyDescriptor(cur, prop);
+        if (d !== undefined) return { owner: cur, desc: d };
+        cur = Object.getPrototypeOf(cur);
+      }
+      return undefined;
+    };
+    const wrapAccDesc = (prop, desc) => {
+      const outDesc = { ...desc };
+      if ("get" in desc) {
+        const g = desc.get;
+        outDesc.get = g ? function () { return writeVal(real, prop, g.call(proxy)); } : undefined;
+      }
+      if ("set" in desc) {
+        const s = desc.set;
+        outDesc.set = s ? function (raw) { s.call(proxy, readVal(real, prop, raw)); } : undefined;
+      }
+      return outDesc;
+    };
+    const proxy = new Proxy(shadow, {
       get(st, prop, recv) {
         const stDesc = Reflect.getOwnPropertyDescriptor(st, prop);
         if (stDesc !== undefined) {
@@ -2205,12 +2226,46 @@ globalThis.__rt._bstr_wrap = (value, spec, out) => {
         const raw = Reflect.get(real, prop, real);
         return readVal(real, prop, raw);
       },
-      set(st, prop, val) {
+      set(st, prop, val, recv) {
         const stDesc = Reflect.getOwnPropertyDescriptor(st, prop);
         if (stDesc !== undefined) {
-          if ("value" in stDesc ? !stDesc.writable : !stDesc.set) return false;
-        } else if (!Reflect.isExtensible(st)) {
-          return false;
+          if ("value" in stDesc) {
+            if (!stDesc.writable) return false;
+          } else {
+            if (!stDesc.set) return false;
+            stDesc.set.call(recv, val);
+            return true;
+          }
+        } else {
+          const found = findPropDesc(real, prop);
+          if (found !== undefined) {
+            if ("value" in found.desc) {
+              if (!found.desc.writable) return false;
+            } else {
+              if (!found.desc.set) return false;
+              const isOwnReal = found.owner === real;
+              const setterArg = isOwnReal ? writeVal(real, prop, val) : val;
+              found.desc.set.call(recv === proxy && isOwnReal ? real : recv, setterArg);
+              return true;
+            }
+          } else if (recv === proxy && !Reflect.isExtensible(st)) {
+            return false;
+          }
+        }
+        if (recv !== proxy) {
+          if (recv === null || (typeof recv !== "object" && typeof recv !== "function")) return false;
+          const rDesc = Reflect.getOwnPropertyDescriptor(recv, prop);
+          if (rDesc !== undefined) {
+            if (!("value" in rDesc) || !rDesc.writable) return false;
+            return Reflect.defineProperty(recv, prop, { value: val });
+          }
+          if (!Reflect.isExtensible(recv)) return false;
+          return Reflect.defineProperty(recv, prop, {
+            value: val,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+          });
         }
         const next = writeVal(real, prop, val);
         if (!Reflect.set(real, prop, next, real)) return false;
@@ -2287,6 +2342,9 @@ globalThis.__rt._bstr_wrap = (value, spec, out) => {
         }
         const hasVal = "value" in desc;
         const hasAcc = "get" in desc || "set" in desc;
+        if (hasVal && hasAcc) {
+          return Reflect.defineProperty(st, prop, desc);
+        }
         if (stDesc !== undefined && !stDesc.configurable) {
           if ("value" in stDesc && !stDesc.writable) {
             return Reflect.defineProperty(st, prop, desc);
@@ -2294,6 +2352,9 @@ globalThis.__rt._bstr_wrap = (value, spec, out) => {
           if (desc.configurable === true) return false;
           if ("enumerable" in desc && desc.enumerable !== stDesc.enumerable) return false;
           if ("value" in stDesc ? hasAcc : hasVal) return false;
+          if (!("value" in stDesc)) {
+            return Reflect.defineProperty(st, prop, desc);
+          }
           const realDesc = Reflect.getOwnPropertyDescriptor(real, prop);
           if (hasVal) {
             const next = writeVal(real, prop, desc.value);
@@ -2306,14 +2367,16 @@ globalThis.__rt._bstr_wrap = (value, spec, out) => {
             }
             if (!Reflect.defineProperty(real, prop, realArg)) return false;
           }
-          if ("value" in stDesc && !hasVal && !hasAcc && realDesc !== undefined && "value" in realDesc) {
+          if (!hasVal && !hasAcc && realDesc !== undefined && "value" in realDesc) {
             Reflect.defineProperty(st, prop, { value: readVal(real, prop, realDesc.value) });
           }
           return Reflect.defineProperty(st, prop, desc);
         }
         const rawVal = hasVal ? writeVal(real, prop, desc.value) : undefined;
         const realDesc = Reflect.getOwnPropertyDescriptor(real, prop);
-        const realArg = hasVal ? { ...desc, value: rawVal } : { ...desc };
+        const realArg = hasVal
+          ? { ...desc, value: rawVal }
+          : (hasAcc ? wrapAccDesc(prop, desc) : { ...desc });
         if (realDesc === undefined) {
           if (realArg.configurable === undefined || realArg.configurable === false) realArg.configurable = true;
           if (hasVal && (realArg.writable === undefined || realArg.writable === false)) realArg.writable = true;
@@ -2362,7 +2425,14 @@ globalThis.__rt._bstr_wrap = (value, spec, out) => {
           const key = keys[i];
           if (isArr && key === "length") continue;
           const stDesc = Reflect.getOwnPropertyDescriptor(st, key);
-          if (stDesc !== undefined && !stDesc.configurable) continue;
+          if (stDesc !== undefined) {
+            if (!stDesc.configurable || !("value" in stDesc)) continue;
+            const liveDesc = Reflect.getOwnPropertyDescriptor(real, key);
+            if (liveDesc !== undefined && "value" in liveDesc) {
+              Reflect.defineProperty(st, key, { value: readVal(real, key, liveDesc.value) });
+            }
+            continue;
+          }
           let desc = Reflect.getOwnPropertyDescriptor(real, key);
           if (desc === undefined) continue;
           if ("value" in desc) {
@@ -2376,6 +2446,7 @@ globalThis.__rt._bstr_wrap = (value, spec, out) => {
         return Reflect.isExtensible(st);
       },
     });
+    return proxy;
   };
   const k = spec.k;
   let proxy;

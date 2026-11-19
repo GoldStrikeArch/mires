@@ -140,6 +140,23 @@
       (function () { "use strict"; v[key] = "ü"; })();
       const d = Object.getOwnPropertyDescriptor(v, key);
       console.log(`reflect ${label} def_val_keep_rw: w=${d && d.writable} e=${d && d.enumerable} val=${q(v[key])} keys=${q(Object.keys(v))} json=${JSON.stringify(v)}`);
+    } else if (mode === 7) {
+      let backing = "€";
+      let gThis = false;
+      let sThis = false;
+      const g = function () { gThis = (this === v); return backing; };
+      const s = function (next) { sThis = (this === v); backing = next; };
+      Object.defineProperty(v, key, { get: g, set: s, enumerable: true, configurable: true });
+      const r1 = v[key];
+      v[key] = "😀";
+      const r2 = v[key];
+      const d = Object.getOwnPropertyDescriptor(v, key);
+      globalThis.__r2LastBacking = () => backing;
+      console.log(`reflect ${label} acc: r1=${q(r1)} r2=${q(r2)} back=${q(backing)} sameGet=${Boolean(d && d.get === g)} sameSet=${Boolean(d && d.set === s)} gThis=${gThis} sThis=${sThis}`);
+    } else if (mode === 8) {
+      const child = Object.create(v);
+      child[key] = "€";
+      console.log(`reflect ${label} proto_child: parent=${q(v[key])} child=${q(child[key])} own=${Object.prototype.hasOwnProperty.call(child, key)}`);
     }
   };
   globalThis.bstrReflectMut = (mode, v) => runReflect("bind", mode, v, "s");
@@ -194,9 +211,12 @@
   console.log(`schema_frozen: ${bstr_exp_a_len(Object.freeze({ s: "é", n: 7 }))}`);
   const idObj = { s: "é", n: 7 };
   console.log(`schema_id_same: ${bstr_exp_a_identity(idObj) === idObj} ${bstr_exp_a_same(idObj, idObj)}`);
-  for (let mode = 0; mode < 7; mode++) {
-    const res = bstr_exp_reflect_export(mode, { s: "é", n: 7 });
-    console.log(`exp_reflect mode=${mode} len=${res}`);
+  for (let mode = 0; mode < 9; mode++) {
+    globalThis.__r2LastBacking = null;
+    const obj = { s: "é", n: 7 };
+    const res = bstr_exp_reflect_export(mode, obj);
+    const tail = mode === 7 && globalThis.__r2LastBacking ? ` afterRust=${q(globalThis.__r2LastBacking())} objS=${q(obj.s)}` : "";
+    console.log(`exp_reflect mode=${mode} len=${res}${tail}`);
   }
   const hostLoc = { filename: "hôst.rs", line: 12, col: 4 };
   console.log(`tc_with_loc: ${tc_exported("é", hostLoc)} ${q(tc_exported_file("é", hostLoc))}`);

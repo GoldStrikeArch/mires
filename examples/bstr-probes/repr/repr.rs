@@ -470,16 +470,28 @@ pub fn rust_entry() {
     let _: JsValue = see_het_slot("het_slot_after_tup", &het.0);
     say(&format!("leaked_slot_buf_len {}", bstr_exp_het_in_out(&leaked_slot_buf)));
 
-    // Reflection & freeze checks via safe `js_bindings!` and `extern "C-unwind"`.
-    for mode in 0..7u32 {
+    // Reflection, freeze, accessor, and prototype-child checks via safe `js_bindings!` and `extern "C-unwind"`.
+    for mode in 0..9u32 {
         let mut s_bind = SchemaA { s: "é", n: 7 };
         reflect_mut(mode, &mut s_bind);
+        let len_bind = s_bind.s.len();
+        if mode == 7 {
+            s_bind.s = "ü";
+        }
         let mut s_arr = ("é", 7u32);
         reflect_arr(mode, &mut s_arr);
+        let len_arr = s_arr.0.len();
+        if mode == 7 {
+            s_arr.0 = "ü";
+        }
         let mut s_ext = SchemaA { s: "é", n: 7 };
         unsafe { bstr_ext_reflect_mut(mode, &mut s_ext) };
+        let len_ext = s_ext.s.len();
+        if mode == 7 {
+            s_ext.s = "ü";
+        }
         say(&format!(
-            "reflect-rust mode={mode} bind={} arr={} ext={}",
+            "reflect-rust mode={mode} bind={len_bind}/{} arr={len_arr}/{} ext={len_ext}/{}",
             s_bind.s.len(),
             s_arr.0.len(),
             s_ext.s.len()
@@ -614,7 +626,11 @@ pub fn bstr_exp_a_same(a: &SchemaA, b: &SchemaA) -> bool {
 #[unsafe(no_mangle)]
 pub fn bstr_exp_reflect_export(mode: u32, v: &mut SchemaA) -> usize {
     reflect_mut(mode, v);
-    v.s.len()
+    let len = v.s.len();
+    if mode == 7 {
+        v.s = "ü";
+    }
+    len
 }
 
 #[track_caller]
