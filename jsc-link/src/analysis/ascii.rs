@@ -180,22 +180,16 @@ where
 
     let mut open_items = scan.ineligible();
 
-    // Locate `core::str::slice_error_fail` if live and keeping its standard 4-arg ABI.
-    let slice_error_fail = table.iter().find_map(|(name, item)| {
-        if item.debug_path != "str::slice_error_fail"
-            && item.debug_path != "core::str::slice_error_fail"
-        {
-            return None;
-        }
-        if !defined.contains(name) || !live.contains(name) || repr.bodies.contains_key(name) {
-            return None;
-        }
-        let func = funcs.get(name)?;
-        (func.sig.abi.caller_location
-            && func.params.len() == 4
-            && abi.call_signature(func.item).is_none())
-        .then(|| name.clone())
-    });
+    // Locate authentic `core::str::slice_error_fail` if live and keeping its standard 4-arg ABI.
+    let slice_error_fail = find_slice_error_fail(
+        funcs,
+        table,
+        &get_interns,
+        repr,
+        abi,
+        defined,
+        live,
+    );
     if let Some(fail_name) = &slice_error_fail {
         // Outlined `StrIndex` jumps directly to `slice_error_fail` without modifying JIR calls.
         open_names.insert(fail_name.clone());
@@ -766,6 +760,125 @@ fn is_shared_str_ref(table: &TypeTable, ty: TypeId) -> bool {
     )
 }
 
+/// Locates the unique live `core::str::slice_error_fail` item authenticated by `StrIndex`
+/// callees' `StableCrateId` (`core` by Rust coherence/orphan rules), origin metadata, and exact
+/// 4-parameter `(s: &str, start: usize, end: usize, $loc) -> !` ABI without a flat call shape.
+fn find_slice_error_fail<'a, F>(
+    funcs: &BTreeMap<JsName, &'a Func>,
+    table: &BTreeMap<JsName, LinkItem>,
+    get_interns: &F,
+    repr: &ReprOutcome,
+    abi: &AbiPlan,
+    defined: &BTreeSet<JsName>,
+    live: &BTreeSet<JsName>,
+) -> Option<JsName>
+where
+    F: Fn(&JsName) -> Option<&'a Interns>,
+{
+    let mut core_crate_ids = BTreeSet::new();
+    for (name, func) in funcs {
+        if !defined.contains(name) || !live.contains(name) || repr.bodies.contains_key(name) {
+            continue;
+        }
+        for block in &func.blocks {
+            for op in &block.ops {
+                if let OpKind::Call {
+                    callee: Callee::Direct { item, .. },
+                    function: None,
+                    semantic: CallSemantic::Standard(StandardOperation::StrIndex),
+                    host: None,
+                    ..
+                } = &op.kind
+                {
+                    core_crate_ids.insert(item.definition.crate_id);
+                }
+            }
+        }
+    }
+    if core_crate_ids.len() != 1 {
+        return None;
+    }
+    let core_crate_id = *core_crate_ids.iter().next()?;
+
+    let mut candidates = Vec::new();
+    for (name, func) in funcs {
+        if !defined.contains(name) || !live.contains(name) || repr.bodies.contains_key(name) {
+            continue;
+        }
+        if func.item.definition.crate_id != core_crate_id {
+            continue;
+        }
+        let Some(item) = table.get(name) else {
+            continue;
+        };
+        if item.crate_name != "core" {
+            continue;
+        }
+        if item.debug_path != "str::slice_error_fail"
+            && item.debug_path != "core::str::slice_error_fail"
+        {
+            continue;
+        }
+        let Some(interns) = get_interns(name) else {
+            continue;
+        };
+        let (origin_crate, origin_path) =
+            crate::lower::semantic_ops::string::item_origin_info(item, interns);
+        if origin_crate != "core"
+            || !matches!(
+                origin_path,
+                "str::slice_error_fail" | "core::str::slice_error_fail"
+            )
+        {
+            continue;
+        }
+        if !func.sig.abi.caller_location
+            || func.params.len() != 4
+            || abi.call_signature(func.item).is_some()
+        {
+            continue;
+        }
+        let type_table = &interns.types;
+        if !matches!(
+            type_table
+                .get(type_table.peeled(func.sig.result))
+                .map(|d| &d.kind),
+            Some(TypeKind::Never)
+        ) {
+            continue;
+        }
+        let [p0, p1, p2, _p3] = func.params.as_slice() else {
+            continue;
+        };
+        let p0_ty = func.values.get(p0.0 as usize).map(|v| v.ty);
+        let p1_ty = func.values.get(p1.0 as usize).map(|v| v.ty);
+        let p2_ty = func.values.get(p2.0 as usize).map(|v| v.ty);
+        let is_usize = |ty: Option<TypeId>| {
+            ty.is_some_and(|ty| {
+                matches!(
+                    type_table.get(type_table.peeled(ty)).map(|d| &d.kind),
+                    Some(TypeKind::Integer {
+                        signed: false,
+                        bits: 32,
+                    })
+                )
+            })
+        };
+        if !p0_ty.is_some_and(|ty| is_shared_str_ref(type_table, ty))
+            || !is_usize(p1_ty)
+            || !is_usize(p2_ty)
+        {
+            continue;
+        }
+        candidates.push(name.clone());
+    }
+    if candidates.len() == 1 {
+        candidates.into_iter().next()
+    } else {
+        None
+    }
+}
+
 fn classify_value_type(
     table: &TypeTable,
     interns: &Interns,
@@ -850,6 +963,8 @@ mod tests {
     const BOOL_TY: TypeId = TypeId(4);
     const OPT_STR: TypeId = TypeId(5);
     const USIZE_TY: TypeId = TypeId(6);
+    const NEVER_TY: TypeId = TypeId(7);
+    const CORE_CRATE_ID: u64 = 77;
 
     fn desc(id: TypeId, kind: TypeKind) -> TypeDescriptor {
         TypeDescriptor {
@@ -916,9 +1031,10 @@ mod tests {
             USIZE_TY,
             TypeKind::Integer {
                 signed: false,
-                bits: 64,
+                bits: 32,
             },
         ));
+        interns.types.insert(desc(NEVER_TY, TypeKind::Never));
         interns.types.insert(desc(
             OPT_STR,
             TypeKind::Adt {
@@ -957,9 +1073,13 @@ mod tests {
     }
 
     fn item_id(hash: u64) -> ItemId {
+        item_id_in(1, hash)
+    }
+
+    fn item_id_in(crate_id: u64, hash: u64) -> ItemId {
         ItemId {
             definition: DefinitionId {
-                crate_id: 1,
+                crate_id,
                 local_hash: hash,
             },
             instantiation: hash as u128,
@@ -1098,6 +1218,28 @@ mod tests {
         let lit_wide = caller_b.op(
             FuncBuilder::ENTRY,
             OpKind::Const(ConstTree::Str(wide_id)),
+            STR_REF,
+            o,
+        );
+        let slice_idx_arg = caller_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+            USIZE_TY,
+            o,
+        );
+        caller_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id_in(CORE_CRATE_ID, 200),
+                    link_name: helper_link,
+                },
+                function: None,
+                args: vec![lit_ascii, slice_idx_arg],
+                track_caller: None,
+                semantic: CallSemantic::Standard(StandardOperation::StrIndex),
+                host: None,
+            },
             STR_REF,
             o,
         );
@@ -1356,8 +1498,14 @@ mod tests {
         let mut caller_func = caller_b.finish();
         caller_func.values[int_str.0 as usize].carrier = Carrier::HostString;
 
+        let fail_path = StrId(interns.strings.len() as u32);
+        interns.strings.push("str::slice_error_fail".to_owned());
+
         // Also test live `core::str::slice_error_fail` detection.
-        let mut fail_b = FuncBuilder::new(item_id(10), sig(vec![STR_REF, USIZE_TY, USIZE_TY], STR_REF, true));
+        let mut fail_b = FuncBuilder::new(
+            item_id_in(CORE_CRATE_ID, 10),
+            sig(vec![STR_REF, USIZE_TY, USIZE_TY], NEVER_TY, true),
+        );
         let _ = (
             fail_b.param(STR_REF, o),
             fail_b.param(USIZE_TY, o),
@@ -1404,13 +1552,23 @@ mod tests {
             JsName::new("string_cases".to_owned()),
             link_item("string_cases", Linkage::internal(), ""),
         );
+        let mut fail_item = link_item(
+            "core$str$slice_error_fail$h123",
+            Linkage::internal(),
+            "str::slice_error_fail",
+        );
+        fail_item.crate_name = "core".to_owned();
+        fail_item.jir.origins = Some(rcgjs_object::jir::OriginTable {
+            origins: Vec::new(),
+            statements: Vec::new(),
+            terminators: Vec::new(),
+            locals: Vec::new(),
+            item_path: fail_path,
+            root: None,
+        });
         table.insert(
             JsName::new("core$str$slice_error_fail$h123".to_owned()),
-            link_item(
-                "core$str$slice_error_fail$h123",
-                Linkage::internal(),
-                "str::slice_error_fail",
-            ),
+            fail_item,
         );
         let roots = BTreeSet::from([
             JsName::new("caller".to_owned()),
@@ -1448,5 +1606,124 @@ mod tests {
             facts.slice_error_fail,
             Some(JsName::new("core$str$slice_error_fail$h123".to_owned()))
         );
+    }
+
+    #[test]
+    fn slice_error_fail_rejects_lexical_and_crate_name_spoofs() {
+        let (mut interns, ascii_id, _, _, helper_link) = test_interns();
+        let fail_path = StrId(interns.strings.len() as u32);
+        interns.strings.push("str::slice_error_fail".to_owned());
+        let core_fail_path = StrId(interns.strings.len() as u32);
+        interns.strings.push("core::str::slice_error_fail".to_owned());
+        let o = OriginId(0);
+
+        let mut caller_b = FuncBuilder::new(item_id(5), sig(vec![], STR_REF, false));
+        let lit = caller_b.op(FuncBuilder::ENTRY, OpKind::Const(ConstTree::Str(ascii_id)), STR_REF, o);
+        let idx = caller_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+            USIZE_TY,
+            o,
+        );
+        caller_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id_in(CORE_CRATE_ID, 200),
+                    link_name: helper_link,
+                },
+                function: None,
+                args: vec![lit, idx],
+                track_caller: None,
+                semantic: CallSemantic::Standard(StandardOperation::StrIndex),
+                host: None,
+            },
+            STR_REF,
+            o,
+        );
+        caller_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(lit)));
+        let caller_func = caller_b.finish();
+
+        let make_fail_fn = |crate_id, hash, ret_ty| {
+            let mut b = FuncBuilder::new(
+                item_id_in(crate_id, hash),
+                sig(vec![STR_REF, USIZE_TY, USIZE_TY], ret_ty, true),
+            );
+            let _ = (
+                b.param(STR_REF, o),
+                b.param(USIZE_TY, o),
+                b.param(USIZE_TY, o),
+                b.param(USIZE_TY, o),
+            );
+            b.terminate(FuncBuilder::ENTRY, RTerm::Unreachable);
+            b.finish()
+        };
+        let make_fail_item = |name: &str, crate_name: &str, debug_path: &str, path_id| {
+            let mut item = link_item(name, Linkage::internal(), debug_path);
+            item.crate_name = crate_name.to_owned();
+            item.jir.origins = Some(rcgjs_object::jir::OriginTable {
+                origins: Vec::new(),
+                statements: Vec::new(),
+                terminators: Vec::new(),
+                locals: Vec::new(),
+                item_path: path_id,
+                root: None,
+            });
+            item
+        };
+
+        let lex_spoof_name = JsName::new("aaa_audit$str$slice_error_fail$h1".to_owned());
+        let crate_spoof_name = JsName::new("core$str$slice_error_fail$h0_spoof".to_owned());
+        let real_name = JsName::new("core$str$slice_error_fail$h999".to_owned());
+
+        let mut funcs = BTreeMap::new();
+        funcs.insert(JsName::new("caller".to_owned()), caller_func);
+        // Lexical spoof sorting before `core`.
+        funcs.insert(lex_spoof_name.clone(), make_fail_fn(2, 1, STR_REF));
+        // `--crate-name core` spoof matching `Never`, 4 params, `#[track_caller]`, `"core"` path.
+        funcs.insert(crate_spoof_name.clone(), make_fail_fn(3, 2, NEVER_TY));
+
+        let mut table = BTreeMap::new();
+        table.insert(
+            JsName::new("caller".to_owned()),
+            link_item("caller", Linkage::exported("caller".to_owned()), "caller"),
+        );
+        table.insert(
+            lex_spoof_name.clone(),
+            make_fail_item(lex_spoof_name.as_str(), "aaa_audit", "str::slice_error_fail", fail_path),
+        );
+        table.insert(
+            crate_spoof_name.clone(),
+            make_fail_item(
+                crate_spoof_name.as_str(),
+                "core",
+                "core::str::slice_error_fail",
+                core_fail_path,
+            ),
+        );
+
+        let roots = BTreeSet::from([JsName::new("caller".to_owned())]);
+        // Without the authentic `core` item, both spoofs must be rejected.
+        assert_eq!(run(&funcs, &table, &interns, &roots).slice_error_fail, None);
+
+        // With the authentic `core` item present, it wins over both lexicographically earlier spoofs.
+        funcs.insert(real_name.clone(), make_fail_fn(CORE_CRATE_ID, 3, NEVER_TY));
+        table.insert(
+            real_name.clone(),
+            make_fail_item(real_name.as_str(), "core", "str::slice_error_fail", fail_path),
+        );
+        assert_eq!(
+            run(&funcs, &table, &interns, &roots).slice_error_fail,
+            Some(real_name.clone())
+        );
+
+        // Non-unique authentic `core` candidates must fall back to `None`.
+        let dup_name = JsName::new("core$str$slice_error_fail$h999b".to_owned());
+        funcs.insert(dup_name.clone(), make_fail_fn(CORE_CRATE_ID, 4, NEVER_TY));
+        table.insert(
+            dup_name.clone(),
+            make_fail_item(dup_name.as_str(), "core", "str::slice_error_fail", fail_path),
+        );
+        assert_eq!(run(&funcs, &table, &interns, &roots).slice_error_fail, None);
     }
 }

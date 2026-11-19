@@ -59,6 +59,18 @@ case " ${JS_EXTRA_ARGS:-} " in
 	;;
 esac
 
+str_repr=""
+case " ${JS_EXTRA_ARGS:-} " in
+*" js-str=bytes "*)
+	if [ -z "$lane" ]; then
+		echo "extern-test.sh: js-str=bytes requires js-lane=jir in JS_EXTRA_ARGS" >&2
+		exit 2
+	fi
+	str_repr=bytes
+	EXTERN_ARGS="$EXTERN_ARGS js-str=bytes"
+	;;
+esac
+
 # The optimizer mode, its own control rather than something read out of $JS_EXTRA_ARGS: the flags
 # here are pinned, so an option arriving through the environment would silently be dropped. Unlike
 # `js-lane`, `js-opt` IS emit-affecting, so `on` and `report` link against their own keyed sysroot,
@@ -73,8 +85,8 @@ report | on) EXTERN_ARGS="$EXTERN_ARGS js-opt=$EXTERN_OPT_MODE" ;;
 	exit 2
 	;;
 esac
-if [ "${UPDATE_EXPECT:-0}" = 1 ] && [ "$EXTERN_OPT_MODE" != off ]; then
-	echo "extern-test.sh: expectations may only be updated in off mode" >&2
+if [ "${UPDATE_EXPECT:-0}" = 1 ] && { [ "$EXTERN_OPT_MODE" != off ] || [ -n "$str_repr" ]; }; then
+	echo "extern-test.sh: expectations may only be updated in off mode (utf16)" >&2
 	exit 2
 fi
 # JSC_PANIC=unwind (the unwind build mode, CONTRACT.md): the goldens record abort-mode text, so they
@@ -86,9 +98,9 @@ if [ "${UPDATE_EXPECT:-0}" = 1 ] && [ "$unwind" = 1 ]; then
 	echo "extern-test.sh: expectations may not be updated under JSC_PANIC=unwind" >&2
 	exit 2
 fi
-echo "note: compiled with ${lane_note:-js-lane=baseline} js-opt=$EXTERN_OPT_MODE${lane:+; NN.jir.js.expected wins where it exists}"
-if [ "$EXTERN_OPT_MODE" = on ]; then
-	echo "note: EXTERN_OPT_MODE=on rewrites the printed text, so the JS goldens are not compared;"
+echo "note: compiled with ${lane_note:-js-lane=baseline} js-opt=$EXTERN_OPT_MODE${str_repr:+ js-str=$str_repr}${lane:+; NN.jir.js.expected wins where it exists}"
+if [ "$EXTERN_OPT_MODE" = on ] || [ -n "$str_repr" ]; then
+	echo "note: golden comparison skipped (${str_repr:+js-str=$str_repr }EXTERN_OPT_MODE=$EXTERN_OPT_MODE);"
 	echo "      the extern-check and globals-check vectors still are"
 fi
 
@@ -207,6 +219,9 @@ for src in $sources; do
 
 	if [ "$EXTERN_OPT_MODE" = on ]; then
 		echo "    ok (compiled; golden compare skipped under EXTERN_OPT_MODE=on)"
+		results="$results$name PASS compiled"$'\n'
+	elif [ -n "$str_repr" ]; then
+		echo "    ok (compiled; golden compare skipped under js-str=$str_repr)"
 		results="$results$name PASS compiled"$'\n'
 	elif [ "$unwind" = 1 ]; then
 		echo "    SKIP golden compare (JSC_PANIC=unwind: the golden records abort-mode text); compiled"

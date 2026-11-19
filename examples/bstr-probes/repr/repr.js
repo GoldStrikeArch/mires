@@ -103,6 +103,29 @@
   };
   globalThis.__rt.bstr_ext_pair = (value) => console.log(`ext_pair: ${q(value)}`);
   globalThis.__rt.bstr_ext_opt = () => ({ TAG: "Some", _0: "sëchs" });
+  const runReflect = (label, mode, v, key) => {
+    if (mode === 0) {
+      const d = Object.getOwnPropertyDescriptor(v, key);
+      console.log(`reflect ${label} desc: ${q(d && d.value)}`);
+    } else if (mode === 1) {
+      v[key] = "€";
+    } else if (mode === 2) {
+      Object.defineProperty(v, key, { value: "€", writable: true, configurable: true, enumerable: true });
+    } else if (mode === 3) {
+      Object.freeze(v);
+      const val = v[key];
+      let threw = false;
+      try {
+        (function () { "use strict"; v[key] = "x"; })();
+      } catch (e) {
+        threw = e instanceof TypeError;
+      }
+      console.log(`reflect ${label} freeze: val=${q(val)} threw=${threw}`);
+    }
+  };
+  globalThis.bstrReflectMut = (mode, v) => runReflect("bind", mode, v, "s");
+  globalThis.bstrReflectArr = (mode, v) => runReflect("arr", mode, v, "0");
+  globalThis.__rt.bstr_ext_reflect_mut = (mode, v) => runReflect("ext", mode, v, "s");
   rust_entry();
   console.log(`exp_opt: ${q(bstr_exp_opt({ TAG: "Some", _0: "ééé" }))} ${q(bstr_exp_opt({ TAG: "None" }))}`);
   console.log(`exp_pair: ${q(bstr_exp_pair(["日本", 1]))}`);
@@ -139,4 +162,23 @@
   const frozenSlotBuf = Object.freeze(["hé", 10]);
   console.log(`exp_in_frozen_slot: ${bstr_exp_in_slot({ buf: frozenSlotBuf, off: 0 })}`);
   console.log(`exp_in_leaked_het: ${bstr_exp_in_het4(leakedHetBuf)} ${bstr_exp_in_het4(leakedHetBufAfter)}`);
+
+  // Blocker 2 schema aliasing, readonly/frozen inputs, identity, reflection via exports, `#[track_caller]` export.
+  console.log(`schema_fresh_B: ${bstr_exp_b_len({ s: "é", n: 7, t: "€" })}`);
+  const ab1 = { s: "é", n: 7, t: "€" };
+  console.log(`schema_A_then_B: ${bstr_exp_a_len(ab1)} ${bstr_exp_b_len(ab1)}`);
+  const ab2 = { s: "é", n: 7, t: "€" };
+  console.log(`schema_B_then_A: ${bstr_exp_b_len(ab2)} ${bstr_exp_a_len(ab2)}`);
+  const roField = { n: 7 };
+  Object.defineProperty(roField, "s", { value: "é", writable: false, enumerable: true, configurable: false });
+  console.log(`schema_readonly: ${bstr_exp_a_len(roField)}`);
+  console.log(`schema_frozen: ${bstr_exp_a_len(Object.freeze({ s: "é", n: 7 }))}`);
+  const idObj = { s: "é", n: 7 };
+  console.log(`schema_id_same: ${bstr_exp_a_identity(idObj) === idObj} ${bstr_exp_a_same(idObj, idObj)}`);
+  for (let mode = 0; mode < 4; mode++) {
+    const res = bstr_exp_reflect_export(mode, { s: "é", n: 7 });
+    console.log(`exp_reflect mode=${mode} len=${res}`);
+  }
+  const hostLoc = { filename: "hôst.rs", line: 12, col: 4 };
+  console.log(`tc_with_loc: ${tc_exported("é", hostLoc)} ${q(tc_exported_file("é", hostLoc))}`);
 }

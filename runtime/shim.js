@@ -2089,6 +2089,63 @@ globalThis.__rt.bstr_sb_check = (value) => {
 
 globalThis.__rt._bstr_out_ref = new WeakMap();
 globalThis.__rt._bstr_in_ref = new WeakMap();
+globalThis.__rt._bstr_unwrap_rust = new WeakMap();
+globalThis.__rt._bstr_unwrap_js = new WeakMap();
+
+globalThis.__rt._bstr_spec_key = (() => {
+  const fnIds = new WeakMap();
+  let nextId = 1;
+  const childKey = (c) => {
+    if (c === "s" || c === "u") return c;
+    if (c === null) return "n";
+    if (c === undefined) return "_";
+    if (Array.isArray(c)) {
+      let s = "f(";
+      for (let i = 0; i < c.length; i++) {
+        const fn = c[i];
+        let id = 0;
+        if (typeof fn === "function" || (typeof fn === "object" && fn !== null)) {
+          id = fnIds.get(fn);
+          if (id === undefined) {
+            id = nextId++;
+            fnIds.set(fn, id);
+          }
+        }
+        if (i > 0) s += ",";
+        s += id;
+      }
+      return s + ")";
+    }
+    return specKey(c);
+  };
+  const mapKey = (obj) => {
+    const keys = Object.keys(obj).sort();
+    let s = "{";
+    for (let i = 0; i < keys.length; i++) {
+      if (i > 0) s += ",";
+      const k = keys[i];
+      s += JSON.stringify(k) + ":" + childKey(obj[k]);
+    }
+    return s + "}";
+  };
+  const specKey = (spec) => {
+    const k = spec.k;
+    if (k === "o") return "o" + mapKey(spec.f);
+    if (k === "e") {
+      const tags = Object.keys(spec.v).sort();
+      let s = "e{";
+      for (let i = 0; i < tags.length; i++) {
+        if (i > 0) s += ",";
+        const t = tags[i];
+        s += JSON.stringify(t) + ":" + mapKey(spec.v[t]);
+      }
+      return s + "}";
+    }
+    if (k === "a" || k === "slice" || k === "slot") return k + "(" + childKey(spec.c) + ")";
+    return k + "(" + childKey(spec.h) + "," + childKey(spec.c) + ")";
+  };
+  return specKey;
+})();
 
 globalThis.__rt.bstr_str_in = (s) => {
   if (typeof s !== "string") {
@@ -2118,134 +2175,273 @@ globalThis.__rt._bstr_conv = (spec, val, out, allowUndef) => {
 
 globalThis.__rt._bstr_wrap = (value, spec, out) => {
   if (value === null || typeof value !== "object") return value;
+  const unwrap = out ? globalThis.__rt._bstr_unwrap_js : globalThis.__rt._bstr_unwrap_rust;
+  if (unwrap.has(value)) return unwrap.get(value);
   const cache = out ? globalThis.__rt._bstr_out_ref : globalThis.__rt._bstr_in_ref;
-  const hit = cache.get(value);
-  if (hit !== undefined) return hit;
-  let target = value;
-  if (
-    !out &&
-    Object.isFrozen(value) &&
-    (Array.isArray(value) ? value.length > 0 : Object.keys(value).length > 0)
-  ) {
-    target = Array.isArray(value) ? value.slice() : Object.assign({}, value);
+  const specKey = globalThis.__rt._bstr_spec_key(spec);
+  let perObj = cache.get(value);
+  if (perObj !== undefined) {
+    const hit = perObj.get(specKey);
+    if (hit !== undefined) return hit;
   }
+  const rev = out ? globalThis.__rt._bstr_unwrap_rust : globalThis.__rt._bstr_unwrap_js;
   const has = globalThis.__rt._bstr_has;
   const isIdx = globalThis.__rt._bstr_is_idx;
   const conv = globalThis.__rt._bstr_conv;
+  const makeMembrane = (real, readVal, writeVal) => {
+    const isArr = Array.isArray(real);
+    const shadow = isArr ? [] : Object.create(Object.getPrototypeOf(real));
+    return new Proxy(shadow, {
+      get(st, prop) {
+        const stDesc = Reflect.getOwnPropertyDescriptor(st, prop);
+        if (stDesc !== undefined && !stDesc.configurable) {
+          if ("value" in stDesc) {
+            if (!stDesc.writable) return stDesc.value;
+          } else if (stDesc.get === undefined) {
+            return undefined;
+          }
+        }
+        const raw = Reflect.get(real, prop, real);
+        return readVal(real, prop, raw);
+      },
+      set(st, prop, val) {
+        const stDesc = Reflect.getOwnPropertyDescriptor(st, prop);
+        if (stDesc !== undefined) {
+          if ("value" in stDesc ? !stDesc.writable : !stDesc.set) return false;
+        } else if (!Reflect.isExtensible(st)) {
+          return false;
+        }
+        const next = writeVal(real, prop, val);
+        if (!Reflect.set(real, prop, next, real)) return false;
+        if (isArr && prop === "length") {
+          const lenDesc = Reflect.getOwnPropertyDescriptor(st, "length");
+          if (lenDesc && lenDesc.writable) Reflect.defineProperty(st, "length", { value: real.length });
+        } else if (stDesc !== undefined && "value" in stDesc) {
+          Reflect.defineProperty(st, prop, { value: val });
+        }
+        return true;
+      },
+      has(st, prop) {
+        return Reflect.has(st, prop) || Reflect.has(real, prop);
+      },
+      ownKeys(st) {
+        if (!Reflect.isExtensible(st)) return Reflect.ownKeys(st);
+        if (isArr) {
+          const lenDesc = Reflect.getOwnPropertyDescriptor(st, "length");
+          if (lenDesc && lenDesc.writable && st.length !== real.length) {
+            Reflect.defineProperty(st, "length", { value: real.length });
+          }
+        }
+        const keys = Reflect.ownKeys(real);
+        const stKeys = Reflect.ownKeys(st);
+        for (let i = 0; i < stKeys.length; i++) {
+          if (!Reflect.getOwnPropertyDescriptor(real, stKeys[i])) keys.push(stKeys[i]);
+        }
+        return keys;
+      },
+      getOwnPropertyDescriptor(st, prop) {
+        const stDesc = Reflect.getOwnPropertyDescriptor(st, prop);
+        if (stDesc !== undefined && !stDesc.configurable) {
+          if ("value" in stDesc && !stDesc.writable) return stDesc;
+          if (isArr && prop === "length") {
+            const realLen = real.length;
+            if (stDesc.value !== realLen) Reflect.defineProperty(st, "length", { value: realLen });
+            return Reflect.getOwnPropertyDescriptor(st, "length");
+          }
+          const liveDesc = Reflect.getOwnPropertyDescriptor(real, prop);
+          if (liveDesc === undefined) return stDesc;
+          const outDesc = "value" in liveDesc
+            ? { ...liveDesc, value: readVal(real, prop, liveDesc.value) }
+            : { ...liveDesc };
+          outDesc.configurable = false;
+          return outDesc;
+        }
+        if (!Reflect.isExtensible(st) && stDesc === undefined) return undefined;
+        let desc = Reflect.getOwnPropertyDescriptor(real, prop);
+        if (desc === undefined) return undefined;
+        if ("value" in desc) {
+          desc = { ...desc, value: readVal(real, prop, desc.value) };
+        }
+        if (!desc.configurable) {
+          if (!desc.writable && "value" in desc && Reflect.isExtensible(st)) {
+            Reflect.defineProperty(st, prop, desc);
+            return Reflect.getOwnPropertyDescriptor(st, prop);
+          }
+          return { ...desc, configurable: true };
+        }
+        return desc;
+      },
+      defineProperty(st, prop, desc) {
+        const stDesc = Reflect.getOwnPropertyDescriptor(st, prop);
+        if (!Reflect.isExtensible(st) && stDesc === undefined) return false;
+        if (isArr && prop === "length") {
+          if (stDesc && !stDesc.writable) return Reflect.defineProperty(st, "length", desc);
+          if (stDesc && stDesc.writable) Reflect.defineProperty(st, "length", { value: real.length });
+          if (!Reflect.defineProperty(real, "length", desc)) return false;
+          return Reflect.defineProperty(st, "length", desc);
+        }
+        if (stDesc !== undefined && !stDesc.configurable) {
+          if ("value" in stDesc && !stDesc.writable) {
+            return Reflect.defineProperty(st, prop, desc);
+          }
+          if ("value" in desc) {
+            const next = writeVal(real, prop, desc.value);
+            const realDesc = Reflect.getOwnPropertyDescriptor(real, prop);
+            const realArg = { ...desc, value: next };
+            if (realArg.configurable === false && (!realDesc || realDesc.configurable !== false)) {
+              delete realArg.configurable;
+            }
+            if (realArg.writable === false && (!realDesc || realDesc.writable !== false)) {
+              delete realArg.writable;
+            }
+            if (!Reflect.defineProperty(real, prop, realArg)) return false;
+          }
+          return Reflect.defineProperty(st, prop, desc);
+        }
+        const hasVal = "value" in desc;
+        const hasAcc = "get" in desc || "set" in desc;
+        const rawVal = hasVal ? writeVal(real, prop, desc.value) : undefined;
+        const realDesc = Reflect.getOwnPropertyDescriptor(real, prop);
+        const realArg = hasVal ? { ...desc, value: rawVal } : { ...desc };
+        if (realDesc === undefined) {
+          if (realArg.configurable === undefined || realArg.configurable === false) realArg.configurable = true;
+          if (hasVal && (realArg.writable === undefined || realArg.writable === false)) realArg.writable = true;
+          if (realArg.enumerable === undefined) realArg.enumerable = false;
+        } else {
+          if (realArg.configurable === false && realDesc.configurable !== false) delete realArg.configurable;
+          if (realArg.writable === false && realDesc.writable !== false) delete realArg.writable;
+        }
+        if (!Reflect.defineProperty(real, prop, realArg)) return false;
+        const locksSt =
+          desc.configurable === false ||
+          desc.writable === false ||
+          (realDesc === undefined && desc.configurable !== true && (hasVal || hasAcc));
+        if (stDesc !== undefined || !Reflect.isExtensible(st) || locksSt) {
+          if (stDesc === undefined && !hasVal && !hasAcc) {
+            const base = realDesc !== undefined ? { ...realDesc } : { enumerable: false, writable: true, configurable: true };
+            if ("value" in base) base.value = readVal(real, prop, base.value);
+            Reflect.defineProperty(st, prop, base);
+          }
+          return Reflect.defineProperty(st, prop, desc);
+        }
+        return true;
+      },
+      deleteProperty(st, prop) {
+        const stDesc = Reflect.getOwnPropertyDescriptor(st, prop);
+        if (stDesc !== undefined && !stDesc.configurable) return false;
+        if (!Reflect.deleteProperty(real, prop)) return false;
+        if (stDesc !== undefined) Reflect.deleteProperty(st, prop);
+        return true;
+      },
+      preventExtensions(st) {
+        if (isArr) {
+          const lenDesc = Reflect.getOwnPropertyDescriptor(st, "length");
+          if (lenDesc && lenDesc.writable) Reflect.defineProperty(st, "length", { value: real.length });
+        }
+        const keys = Reflect.ownKeys(real);
+        for (let i = 0; i < keys.length; i++) {
+          const key = keys[i];
+          if (isArr && key === "length") continue;
+          const stDesc = Reflect.getOwnPropertyDescriptor(st, key);
+          if (stDesc !== undefined && !stDesc.configurable) continue;
+          let desc = Reflect.getOwnPropertyDescriptor(real, key);
+          if (desc === undefined) continue;
+          if ("value" in desc) {
+            desc = { ...desc, value: readVal(real, key, desc.value) };
+          }
+          Reflect.defineProperty(st, key, desc);
+        }
+        return Reflect.preventExtensions(st);
+      },
+      isExtensible(st) {
+        return Reflect.isExtensible(st);
+      },
+    });
+  };
   const k = spec.k;
   let proxy;
   if (k === "tbuf") {
     const hdr = spec.h;
     const elem = spec.c;
-    proxy = new Proxy(target, {
-      get(t, prop) {
-        const raw = Reflect.get(t, prop, t);
-        if (isIdx(prop)) {
-          if (prop === "0") {
-            return hdr ? conv(hdr, raw, out, true) : raw;
-          }
-          return elem ? conv(elem, raw, out, true) : raw;
-        }
-        return raw;
+    proxy = makeMembrane(
+      value,
+      (_t, prop, raw) => {
+        if (!isIdx(prop)) return raw;
+        const c = prop === "0" ? hdr : elem;
+        return c ? conv(c, raw, out, true) : raw;
       },
-      set(t, prop, val) {
-        if (isIdx(prop)) {
-          const next = prop === "0"
-            ? (hdr ? conv(hdr, val, !out, false) : val)
-            : (elem ? conv(elem, val, !out, false) : val);
-          return Reflect.set(t, prop, next, t);
-        }
-        return Reflect.set(t, prop, val, t);
+      (_t, prop, val) => {
+        if (!isIdx(prop)) return val;
+        const c = prop === "0" ? hdr : elem;
+        return c ? conv(c, val, !out, false) : val;
       },
-    });
+    );
   } else if (k === "tail") {
     const tailPtrSpec = { k: "tailptr", h: spec.h, c: spec.c };
-    proxy = new Proxy(target, {
-      get(t, prop) {
-        const raw = Reflect.get(t, prop, t);
-        if (prop === "ptr" && raw !== null && typeof raw === "object") {
-          return globalThis.__rt._bstr_wrap(raw, tailPtrSpec, out);
-        }
-        return raw;
-      },
-      set(t, prop, val) {
-        return Reflect.set(t, prop, val, t);
-      },
-    });
+    proxy = makeMembrane(
+      value,
+      (_t, prop, raw) => (prop === "ptr" && raw !== null && typeof raw === "object"
+        ? globalThis.__rt._bstr_wrap(raw, tailPtrSpec, out)
+        : raw),
+      (_t, _prop, val) => val,
+    );
   } else if (k === "tailptr") {
     const tbufSpec = { k: "tbuf", h: spec.h, c: spec.c };
-    proxy = new Proxy(target, {
-      get(t, prop) {
-        const raw = Reflect.get(t, prop, t);
+    proxy = makeMembrane(
+      value,
+      (_t, prop, raw) => {
         if (prop === "buf" && Array.isArray(raw)) {
           if (Object.isFrozen(raw) && raw.length === 0) return raw;
           return globalThis.__rt._bstr_wrap(raw, tbufSpec, out);
         }
         return raw;
       },
-      set(t, prop, val) {
-        return Reflect.set(t, prop, val, t);
-      },
-    });
+      (_t, _prop, val) => val,
+    );
   } else if (k === "slice") {
     const elem = spec.c;
-    proxy = new Proxy(target, {
-      get(t, prop) {
-        const raw = Reflect.get(t, prop, t);
+    proxy = makeMembrane(
+      value,
+      (_t, prop, raw) => {
         if (prop === "buf" && raw !== null && typeof raw === "object") {
           if (Array.isArray(raw) && Object.isFrozen(raw) && raw.length === 0) return raw;
           return globalThis.__rt._bstr_wrap(raw, { k: "a", c: elem }, out);
         }
         return raw;
       },
-      set(t, prop, val) {
-        return Reflect.set(t, prop, val, t);
-      },
-    });
+      (_t, _prop, val) => val,
+    );
   } else if (k === "slot") {
     const elem = spec.c;
-    const rev = out ? globalThis.__rt._bstr_in_ref : globalThis.__rt._bstr_out_ref;
+    const arrSpecKey = globalThis.__rt._bstr_spec_key({ k: "a", c: elem });
     let partialCache;
-    proxy = new Proxy(target, {
-      get(t, prop) {
-        const raw = Reflect.get(t, prop, t);
+    proxy = makeMembrane(
+      value,
+      (t, prop, raw) => {
         if (prop === "buf" && raw !== null && typeof raw === "object") {
+          if (unwrap.has(raw)) return unwrap.get(raw);
           if (Array.isArray(raw) && Object.isFrozen(raw) && raw.length === 0) return raw;
-          const existing = cache.get(raw);
+          const rawMap = cache.get(raw);
+          const existing = rawMap !== undefined ? rawMap.get(arrSpecKey) : undefined;
           if (existing !== undefined) return existing;
           const key = t.off;
           if (partialCache !== undefined && partialCache[0] === raw && partialCache[1] === key) {
             return partialCache[2];
           }
-          let rawTarget = raw;
-          if (
-            !out &&
-            Object.isFrozen(raw) &&
-            (Array.isArray(raw) ? raw.length > 0 : Object.keys(raw).length > 0)
-          ) {
-            rawTarget = Array.isArray(raw) ? raw.slice() : Object.assign({}, raw);
-          }
-          const p = new Proxy(rawTarget, {
-            get(bt, bprop) {
-              const braw = Reflect.get(bt, bprop, bt);
-              if (bprop === String(key)) return conv(elem, braw, out, out);
-              return braw;
-            },
-            set(bt, bprop, val) {
-              const next = bprop === String(key) ? conv(elem, val, !out, false) : val;
-              return Reflect.set(bt, bprop, next, bt);
-            },
-          });
+          const slotKey = String(key);
+          const p = makeMembrane(
+            raw,
+            (_bt, bprop, braw) => (bprop === slotKey && elem ? conv(elem, braw, out, out) : braw),
+            (_bt, bprop, bval) => (bprop === slotKey && elem ? conv(elem, bval, !out, false) : bval),
+          );
           rev.set(p, raw);
           partialCache = [raw, key, p];
           return p;
         }
         return raw;
       },
-      set(t, prop, val) {
-        return Reflect.set(t, prop, val, t);
-      },
-    });
+      (_t, _prop, val) => val,
+    );
   } else {
     const fieldsFor = (t) => {
       if (k === "e") {
@@ -2254,11 +2450,11 @@ globalThis.__rt._bstr_wrap = (value, spec, out) => {
       }
       return k === "o" ? spec.f : null;
     };
-    proxy = new Proxy(target, {
-      get(t, prop) {
-        const raw = Reflect.get(t, prop, t);
+    proxy = makeMembrane(
+      value,
+      (t, prop, raw) => {
         if (k === "a") {
-          return isIdx(prop) ? conv(spec.c, raw, out, true) : raw;
+          return isIdx(prop) && spec.c ? conv(spec.c, raw, out, true) : raw;
         }
         if (typeof prop === "string") {
           const fields = fieldsFor(t);
@@ -2268,24 +2464,25 @@ globalThis.__rt._bstr_wrap = (value, spec, out) => {
         }
         return raw;
       },
-      set(t, prop, val) {
+      (t, prop, val) => {
         if (k === "a") {
-          const next = isIdx(prop) ? conv(spec.c, val, !out, false) : val;
-          return Reflect.set(t, prop, next, t);
+          return isIdx(prop) && spec.c ? conv(spec.c, val, !out, false) : val;
         }
         if (typeof prop === "string") {
           const fields = fieldsFor(t);
           if (fields !== null && has.call(fields, prop)) {
-            const next = conv(fields[prop], val, !out, false);
-            return Reflect.set(t, prop, next, t);
+            return conv(fields[prop], val, !out, false);
           }
         }
-        return Reflect.set(t, prop, val, t);
+        return val;
       },
-    });
+    );
   }
-  cache.set(value, proxy);
-  const rev = out ? globalThis.__rt._bstr_in_ref : globalThis.__rt._bstr_out_ref;
+  if (perObj === undefined) {
+    perObj = new Map();
+    cache.set(value, perObj);
+  }
+  perObj.set(specKey, proxy);
   rev.set(proxy, value);
   return proxy;
 };
