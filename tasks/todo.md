@@ -707,9 +707,9 @@ Byte strings are paused at `exp/byte-strings` `6e88a2f` (verdict FAIL C1–C3; P
     3. `guard_use_after_free.expect_abort` checks only that the program aborts and prints `5`, not the message. Follow-up: an expected-message check in `test.sh`.
 - [x] F5 Merge (the user's OK, plain mark): fast-forwarded main `5f9ef93` → `a61fca8`. Main was rebuilt (`target/release/jsc-link` sha256 `61ad1f17…`) and the keyed jir+opt sysroots rebuilt for both modes. Gate: 174/174 in unwind and in abort; main's abort-mode core JS = the branch build (150/150). Not pushed. The `alloc-freed` worktree and `fix/freed-marker` branch can now be removed (merged).
 
-## Byte Strings: complete safe boundary + size & speed optimization (2026-11-19; Stage 5: fixing re-audit blockers + release-* default)
+## Byte Strings: complete safe boundary + size & speed optimization (2026-11-19; merged to local `main`)
 
-Cross-compiler survey (js_of_ocaml 6.4, Melange 7.0 / ReScript 12.3, Scala.js 1.22, Kotlin/JS 2.4, GopherJS, dart2js) and staged plan in `byte_strings_plan.md`. Branch `feat/byte-strings` (`5d69917`, integrated code SHA `41444a0`), worktree `.claude/worktrees/bstr-feat`, rebased onto `a61fca8` (`0` overlapping files with `46383cb`; ready for fast-forward/merge on user OK).
+Cross-compiler survey (js_of_ocaml 6.4, Melange 7.0 / ReScript 12.3, Scala.js 1.22, Kotlin/JS 2.4, GopherJS, dart2js) and staged plan in `byte_strings_plan.md`. Merged `feat/byte-strings` (`3e2ffbb`) onto local `main` (not pushed to `origin/main`).
 
 - [x] Stage 1 — Rebase `exp/byte-strings` onto `main` (`a61fca8`) + complete safe host boundary (`bstr/s1-boundary` `e23fea9`, verifier **PASS 32/32**, `build/bstr-verify/stage-s1/verdict.json`):
   - [x] Traverse `TypeKind::Adt { args }` (excluding `String`), `Closure`, `Coroutine`, `CoroutineClosure` in `reaches_str`; guard `descriptor.layout.zst` (`[&str; 0]`); depth cap 64.
@@ -726,15 +726,19 @@ Cross-compiler survey (js_of_ocaml 6.4, Melange 7.0 / ReScript 12.3, Scala.js 1.
   - [x] Closed intra-`Func` `byte_view_analysis` (`as_ptr()`/`RawView` + offset + loop block params + `offset_from` + `Deref` → `s.charCodeAt(i)`), including MIR-inlined `String.vec`.
   - [x] Stdlib-whitelisted `BstrStringOp` (`IsEmpty`, `Reserve`, `ReserveExact`, `AsBytes`) + real `alloc` `String::reserve_exact` CFG/MIR-inline support so owned `String` builders commit `{ text, cap, len }`.
   - [x] Independent verification (round 1 FAIL on real `reserve_exact` CFG & stdlib path guard → fixed in `1d7f327`, round 2 **PASS 29/29**).
-- [x] Stage 4 — Integrated qualification & `CONTRACT.md` update (`bstr/s4-integrated` `41444a0` + doc align `5d69917`, verifier **PASS 60/60**, `build/bstr-verify/stage-integrated/verdict.json`):
-  - [x] Switch-off byte-identity vs `a61fca8`: `169/169` `.js` files in unwind and abort + all workload/`compact` bundles SHA-256 identical; `runtime/shim.js` strictly additive (`0` existing lines changed); `cargo test --workspace` `1,221/0`; core `174/174 × 4` (`RCGJS_WITNESS_CHECK=1`).
-  - [x] Qualified `--str bytes` vs `off` metrics (`41444a0`):
-    - **`marked`:** `min` `26,000 → 11,036 B` (**`−57.6%`**), `gzip-9` `9,838 → 4,208 B` (**`−57.2%`**), `brotli-11` `8,655 → 3,744 B` (**`−56.7%`**); Node `p50` **`0.9997 → 0.1354 ms` (`0.135×` = `7.38×` faster)**; `str_bytes 45,069 → 1`, `copy_nonoverlapping 7,180 → 0`, `alloc/dealloc/realloc 2/2/11 → 0/0/0`.
-    - **`compact` (`58/58`):** `min` `155,711 → 153,271 B` (**`−2,440 B`**), `gzip-9` `47,866 → 46,899 B` (**`−967 B` / `−2.0%`**), `brotli-11` `36,806 → 36,015 B` (**`−791 B` / `−2.1%`**).
-    - **`minisearch`:** `gzip-9` `14,325 → 14,290 B` (`−35 B`), `brotli-11` `12,765 → 12,695 B` (`−70 B`); `p50` **`0.2552 → 0.1684 ms` (`0.660×` = `1.52×` faster)**.
-    - **`fflate`:** `gzip-9` `4,989 → 5,069 B` (`+80 B`), `p50` **`0.5695 → 0.5654 ms` (`0.993×`)**; `bstr_in`/`_bstr_units`/`_bstr_sub_reset`/`rust_begin_unwind$bstr` all tree-shaken (`0`).
-    - **`ky`:** `gzip-9` `9,612 → 9,655 B` (`+43 B`).
-  - [ ] Merge `feat/byte-strings` onto `main` and decide whether to flip `release-*` profiles to `js-str=bytes` by default (**awaiting user OK**).
+- [x] Stage 4 — Initial integrated qualification (`bstr/s4-integrated` `41444a0` + `5d69917`, `build/bstr-verify/stage-integrated/verdict.json`), followed by external re-audit (`bstr-reaudit-20261119`) identifying 2 safe-Rust blockers (`slice_error_fail` path-only match, `_bstr_in_ref` schema-less cache + non-configurable read-only input properties), `view-abi`/`KeyedList` & `#[track_caller]` refusals, `extern-test.sh` flag drop, `CONTRACT.md` overstatements, and vacuous `fflate` JSON checksum.
+- [x] Stage 5 — Blocker removal, ES2018 shadow-target `Proxy` membrane, `view-abi`/`KeyedList` lowering, `release-*` default & 3-round adversarial qualification (`eedd4fc` + `main` merge `3e2ffbb`, verifier **PASS 11/11 groups / 275/275 probes**, `build/bstr-verify-s5/verdict.json`):
+  - [x] Authenticate `core`'s `StableCrateId` via `StandardOperation::StrIndex` direct callees + `Never` return + `(&str, u32, u32)` + uniqueness in `find_slice_error_fail` (`jsc-link/src/analysis/ascii.rs`, `examples/bstr-probes/{collide,spoof_core,spoof_core_dep}.rs`).
+  - [x] Replace raw-target `Proxy` with schema-keyed `WeakMap<object, Map<specKey, Proxy>>` (`_bstr_spec_key`) + full ES2018 shadow-target membrane (`makeMembrane` in `runtime/shim.js`, `+1015/-0` lines, 100% tree-shaken in all 5 workloads) handling multi-schema aliasing, frozen/sealed/non-configurable read-only properties, partial `Object.defineProperty`, bidirectional accessor wrapping (`this === proxy`), and prototype-receiver `OrdinarySet`.
+  - [x] Lower `#[track_caller]` export facades (`resolve_location_field_keys` disambiguating `core::panic::Location` against colliding user `struct Location`), `Family::ViewAbi` (`rcgjs.tc.*`), and `Family::KeyedList` (`keyed_list_v1`) under `js-str=bytes` (`examples/view-abi-bstr`, `scripts/view-abi-bstr-test.sh`); forward `js-str=bytes` in `scripts/extern-test.sh` (`5/5` passed, `0` skipped in `unwind` & `abort`).
+  - [x] Default `StrRepr::Bytes` in `Profile::ReleaseSize | Profile::ReleaseBalanced | Profile::ReleaseSpeed` (`rcgjs-object/src/opts.rs`, `js-str=utf16` overrides cleanly; sysroot cache keys unchanged); align `CONTRACT.md` (`BTreeMap` note, exact refusal list, `KnownAscii` scope).
+  - [x] Qualified `utf16` vs default `bytes` metrics (`eedd4fc`, non-vacuous outputs verified; note single-cell `minisearch` timing is bimodal on V8 module instances):
+    - **`marked`:** `min` `26,000 → 11,036 B` (**`−57.6%`**), `gzipSync-9` `9,838 → 4,208 B` / `gzip -9c` `9,819 → 4,202 B` (**`−57.2%`**), `brotli-11` `8,655 → 3,744 B` (**`−56.7%`**); Node `p50` `0.9997 → 0.1354 ms` (`7.38×`, same-build control `0.99×`).
+    - **`compact` (`58/58`):** `min` `155,711 → 153,271 B` (**`−2,440 B`**), `gzipSync-9` `47,866 → 46,899 B` (**`−967 B`**), `brotli-11` `36,806 → 36,015 B` (**`−791 B`**).
+    - **`minisearch`:** `min` `46,790 → 47,148 B` (`+358 B`), `gzipSync-9` `14,325 → 14,290 B` (`−35 B`), `brotli-11` `12,765 → 12,695 B` (`−70 B`); full JSON scores/order SHA-256 verified.
+    - **`fflate`:** `min` `12,079 → 12,617 B` (`+538 B`), `gzipSync-9` `4,989 → 5,069 B` (`+80 B`), `brotli-11` `4,549 → 4,619 B` (`+70 B`); real `61,287 B` & `28,823 B` `Uint8Array` + `zlib.gunzipSync` round-trips verified.
+    - **`ky`:** `min` `26,745 → 27,029 B` (`+284 B`), `gzipSync-9` `9,612 → 9,655 B` (`+43 B`), `brotli-11` `8,548 → 8,600 B` (`+52 B`); live HTTP retry `"200|ok-café-😀/probe|3"` verified.
+  - [x] Fast-forwarded local `main` (`2d1c826` → `3e2ffbb`, pre-merge `340..346` + `bstr-probes` verified) and rebuilt root release toolchain & sysroots; not pushed to `origin/main`.
 
 ## GopherJS comparator family (2026-11-18)
 
