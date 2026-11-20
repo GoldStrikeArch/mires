@@ -1,12 +1,462 @@
 module Parser exposing (compile)
 
+{-| jmespath's Lexer and Pratt parser. The AST is a `V`, as in jmespath, where nodes are plain
+objects that `compile` returns and `&expr` passes around as values; each node gets its own identity.
+`Undefined` stands for jmespath's undefined nodes (`a.`, `()`).
+
+The lexer and the operator loop of `expression` are tail calls, so a long chain (`a.a.a…`,
+`a || a || …`) costs no stack; only nesting does.
+
+-}
+
 import Array exposing (Array)
-import Char
-import Values exposing (V(..), field, fromJson)
+import Values exposing (V(..), fresh)
+
+
+type TokenType
+    = EOF
+    | UnquotedIdentifier
+    | QuotedIdentifier
+    | Rbracket
+    | Rparen
+    | Comma
+    | Colon
+    | Rbrace
+    | Number
+    | Current
+    | Expref
+    | Pipe
+    | Or
+    | And
+    | EQ
+    | GT
+    | LT
+    | GTE
+    | LTE
+    | NE
+    | Flatten
+    | Star
+    | Filter
+    | Dot
+    | Not
+    | Lbrace
+    | Lbracket
+    | Lparen
+    | Literal
+
+
+{-| jmespath's `bindingPower` table. It has no entry for Colon and Literal: `rbp < bindingPower[Colon]`
+is false, and so is `bindingPower[Literal] < 10` in `_parseProjectionRHS`, which therefore rejects a
+literal after a projection.
+-}
+bindingPower : TokenType -> Maybe Int
+bindingPower t =
+    case t of
+        Colon ->
+            Nothing
+
+        Literal ->
+            Nothing
+
+        Pipe ->
+            Just 1
+
+        Or ->
+            Just 2
+
+        And ->
+            Just 3
+
+        EQ ->
+            Just 5
+
+        GT ->
+            Just 5
+
+        LT ->
+            Just 5
+
+        GTE ->
+            Just 5
+
+        LTE ->
+            Just 5
+
+        NE ->
+            Just 5
+
+        Flatten ->
+            Just 9
+
+        Star ->
+            Just 20
+
+        Filter ->
+            Just 21
+
+        Dot ->
+            Just 40
+
+        Not ->
+            Just 45
+
+        Lbrace ->
+            Just 50
+
+        Lbracket ->
+            Just 55
+
+        Lparen ->
+            Just 60
+
+        _ ->
+            Just 0
+
+
+{-| jmespath's TOK\_\* names of the comparators, which name Comparator nodes.
+-}
+comparatorName : TokenType -> Maybe String
+comparatorName t =
+    case t of
+        EQ ->
+            Just "EQ"
+
+        NE ->
+            Just "NE"
+
+        GT ->
+            Just "GT"
+
+        GTE ->
+            Just "GTE"
+
+        LT ->
+            Just "LT"
+
+        LTE ->
+            Just "LTE"
+
+        _ ->
+            Nothing
 
 
 type alias Token =
-    { k : String, v : V }
+    { kind : TokenType, value : V }
+
+
+
+-- LEXER
+
+
+{-| The code unit at `i` as a one-unit string, empty past the end (where jmespath reads undefined).
+-}
+at : String -> Int -> String
+at source i =
+    String.slice i (i + 1) source
+
+
+isAlpha : String -> Bool
+isAlpha c =
+    (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c == "_"
+
+
+isNum : String -> Bool
+isNum c =
+    (c >= "0" && c <= "9") || c == "-"
+
+
+isAlphaNum : String -> Bool
+isAlphaNum c =
+    isAlpha c || (c >= "0" && c <= "9")
+
+
+basicToken : String -> Maybe TokenType
+basicToken c =
+    case c of
+        "." ->
+            Just Dot
+
+        "*" ->
+            Just Star
+
+        "," ->
+            Just Comma
+
+        ":" ->
+            Just Colon
+
+        "{" ->
+            Just Lbrace
+
+        "}" ->
+            Just Rbrace
+
+        "]" ->
+            Just Rbracket
+
+        "(" ->
+            Just Lparen
+
+        ")" ->
+            Just Rparen
+
+        "@" ->
+            Just Current
+
+        _ ->
+            Nothing
+
+
+{-| The end of a run of characters that pass `test`, from `i`.
+-}
+skipWhile : (String -> Bool) -> String -> Int -> Int
+skipWhile test source i =
+    if i < String.length source && test (at source i) then
+        skipWhile test source (i + 1)
+
+    else
+        i
+
+
+{-| The end of a quoted body starting at `i`, where a backslash escapes `quote` or another backslash.
+-}
+skipQuoted : String -> String -> Int -> Int
+skipQuoted quote source i =
+    if i >= String.length source || at source i == quote then
+        i
+
+    else if at source i == "\\" && (at source (i + 1) == "\\" || at source (i + 1) == quote) then
+        skipQuoted quote source (i + 2)
+
+    else
+        skipQuoted quote source (i + 1)
+
+
+{-| JS `text.replace(from, to)` with a string pattern: the first occurrence only.
+-}
+replaceFirst : String -> String -> String -> String
+replaceFirst from to text =
+    case String.indexes from text of
+        i :: _ ->
+            String.left i text ++ to ++ String.dropLeft (i + String.length from) text
+
+        [] ->
+            text
+
+
+{-| `parseInt` of a run of digits and dashes: an optional sign, then the leading digits.
+-}
+parseInt : String -> Float
+parseInt run =
+    let
+        sign =
+            if String.startsWith "-" run then
+                "-"
+
+            else
+                ""
+
+        digits =
+            String.dropLeft (String.length sign) run
+
+        leading =
+            String.left (skipWhile (\c -> c >= "0" && c <= "9") digits 0) digits
+    in
+    if leading == "" then
+        0 / 0
+
+    else
+        String.toFloat (sign ++ leading) |> Maybe.withDefault (0 / 0)
+
+
+{-| A backtick literal: after JS's `trimLeft` (Elm's `String.trimLeft` is it) and the first
+`` \` `` unescaped, JSON when it looks like JSON, else a JSON string of the text.
+-}
+backtickLiteral : String -> Result () V
+backtickLiteral body =
+    let
+        literalString =
+            replaceFirst "\\`" "`" (String.trimLeft body)
+
+        first =
+            String.left 1 literalString
+
+        looksLikeJson =
+            if literalString == "" then
+                False
+
+            else if String.contains first "[{\"" then
+                True
+
+            else if literalString == "true" || literalString == "false" || literalString == "null" then
+                True
+
+            else if String.contains first "-0123456789" then
+                case Values.literal literalString of
+                    Ok _ ->
+                        True
+
+                    Err () ->
+                        False
+
+            else
+                False
+    in
+    if looksLikeJson then
+        Values.literal literalString
+
+    else
+        Values.literal ("\"" ++ literalString ++ "\"")
+
+
+tokenize : String -> Result () (Array Token)
+tokenize source =
+    lex source 0 []
+
+
+lex : String -> Int -> List Token -> Result () (Array Token)
+lex source i tokens =
+    if i >= String.length source then
+        Ok (Array.fromList (List.reverse (Token EOF (Str "") :: tokens)))
+
+    else
+        let
+            c =
+                at source i
+        in
+        if isAlpha c then
+            let
+                end =
+                    skipWhile isAlphaNum source (i + 1)
+            in
+            lex source end (Token UnquotedIdentifier (Str (String.slice i end source)) :: tokens)
+
+        else
+            case basicToken c of
+                Just t ->
+                    lex source (i + 1) (Token t (Str c) :: tokens)
+
+                Nothing ->
+                    if isNum c then
+                        let
+                            end =
+                                skipWhile isNum source (i + 1)
+                        in
+                        lex source end (Token Number (Num (parseInt (String.slice i end source))) :: tokens)
+
+                    else if c == "[" then
+                        case at source (i + 1) of
+                            "?" ->
+                                lex source (i + 2) (Token Filter (Str "[?") :: tokens)
+
+                            "]" ->
+                                lex source (i + 2) (Token Flatten (Str "[]") :: tokens)
+
+                            _ ->
+                                lex source (i + 1) (Token Lbracket (Str "[") :: tokens)
+
+                    else if c == "\"" then
+                        let
+                            end =
+                                skipQuoted "\"" source (i + 1) + 1
+                        in
+                        case Values.literal (String.slice i end source) of
+                            Ok name ->
+                                lex source end (Token QuotedIdentifier name :: tokens)
+
+                            Err () ->
+                                Err ()
+
+                    else if c == "'" then
+                        -- An unterminated raw string runs to the end of the expression.
+                        let
+                            end =
+                                skipQuoted "'" source (i + 1)
+                        in
+                        lex source (end + 1) (Token Literal (Str (replaceFirst "\\'" "'" (String.slice (i + 1) end source))) :: tokens)
+
+                    else if c == "`" then
+                        let
+                            end =
+                                skipQuoted "`" source (i + 1)
+                        in
+                        case backtickLiteral (String.slice (i + 1) end source) of
+                            Ok value ->
+                                lex source (end + 1) (Token Literal value :: tokens)
+
+                            Err () ->
+                                Err ()
+
+                    else if c == "<" || c == ">" || c == "=" || c == "!" then
+                        -- A lone `=` makes no token in jmespath (it pushes undefined, and parsing
+                        -- fails on it); that syntax error is raised here.
+                        case ( c, at source (i + 1) == "=" ) of
+                            ( "!", True ) ->
+                                lex source (i + 2) (Token NE (Str "!=") :: tokens)
+
+                            ( "!", False ) ->
+                                lex source (i + 1) (Token Not (Str "!") :: tokens)
+
+                            ( "<", True ) ->
+                                lex source (i + 2) (Token LTE (Str "<=") :: tokens)
+
+                            ( "<", False ) ->
+                                lex source (i + 1) (Token LT (Str "<") :: tokens)
+
+                            ( ">", True ) ->
+                                lex source (i + 2) (Token GTE (Str ">=") :: tokens)
+
+                            ( ">", False ) ->
+                                lex source (i + 1) (Token GT (Str ">") :: tokens)
+
+                            ( _, True ) ->
+                                lex source (i + 2) (Token EQ (Str "==") :: tokens)
+
+                            ( _, False ) ->
+                                Err ()
+
+                    else if c == " " || c == "\t" || c == "\n" then
+                        lex source (i + 1) tokens
+
+                    else if c == "&" then
+                        if at source (i + 1) == "&" then
+                            lex source (i + 2) (Token And (Str "&&") :: tokens)
+
+                        else
+                            lex source (i + 1) (Token Expref (Str "&") :: tokens)
+
+                    else if c == "|" then
+                        if at source (i + 1) == "|" then
+                            lex source (i + 2) (Token Or (Str "||") :: tokens)
+
+                        else
+                            lex source (i + 1) (Token Pipe (Str "|") :: tokens)
+
+                    else
+                        Err ()
+
+
+
+-- AST NODES
+
+
+node : String -> List ( String, V ) -> V
+node nodeType properties =
+    Obj (fresh ()) (( "type", Str nodeType ) :: properties)
+
+
+identityNode : () -> V
+identityNode () =
+    node "Identity" []
+
+
+branch : String -> List V -> V
+branch nodeType children =
+    node nodeType [ ( "children", Arr (fresh ()) children ) ]
+
+
+
+-- PARSER
 
 
 type alias State =
@@ -14,549 +464,418 @@ type alias State =
 
 
 type alias Parsed =
-    Result String ( V, State )
+    Result () ( V, State )
 
 
-node k =
-    Obj [ ( "type", Str k ) ]
+token : Int -> State -> Token
+token offset state =
+    Array.get (state.pos + offset) state.tokens |> Maybe.withDefault (Token EOF (Str ""))
 
 
-named k name =
-    Obj [ ( "type", Str k ), ( "name", name ) ]
+lookahead : Int -> State -> TokenType
+lookahead offset state =
+    (token offset state).kind
 
 
-leaf k v =
-    Obj [ ( "type", Str k ), ( "value", v ) ]
+advance : State -> State
+advance state =
+    { state | pos = state.pos + 1 }
 
 
-branch k cs =
-    Obj [ ( "type", Str k ), ( "children", Arr cs ) ]
+match : TokenType -> State -> Result () State
+match t state =
+    if lookahead 0 state == t then
+        Ok (advance state)
+
+    else
+        Err ()
 
 
-replaceFirst needle replacement source =
-    case List.head (String.indexes needle source) of
-        Just i ->
-            String.left i source ++ replacement ++ String.dropLeft (i + String.length needle) source
+{-| `compile`: the AST of an expression, which must end at EOF.
+-}
+compile : String -> Result () V
+compile source =
+    case tokenize source of
+        Err () ->
+            Err ()
+
+        Ok tokens ->
+            case expression 0 { tokens = tokens, pos = 0 } of
+                Ok ( ast, state ) ->
+                    if lookahead 0 state == EOF then
+                        Ok ast
+
+                    else
+                        Err ()
+
+                Err () ->
+                    Err ()
+
+
+expression : Int -> State -> Parsed
+expression rbp state =
+    case nud (token 0 state) (advance state) of
+        Ok ( left, next ) ->
+            operators rbp left next
+
+        Err () ->
+            Err ()
+
+
+{-| The `while (rbp < bindingPower[currentToken])` loop of `expression`, as a tail call.
+-}
+operators : Int -> V -> State -> Parsed
+operators rbp left state =
+    let
+        currentToken =
+            lookahead 0 state
+    in
+    case bindingPower currentToken of
+        Just power ->
+            if rbp < power then
+                case led currentToken left (advance state) of
+                    Ok ( next, after ) ->
+                        operators rbp next after
+
+                    Err () ->
+                        Err ()
+
+            else
+                Ok ( left, state )
 
         Nothing ->
-            source
+            Ok ( left, state )
 
 
-literal s =
-    let
-        raw =
-            replaceFirst "\\`" "`" (String.trimLeft s)
+{-| A node built from one parsed child.
+-}
+wrap : (V -> V) -> Parsed -> Parsed
+wrap build parsed =
+    case parsed of
+        Ok ( child, state ) ->
+            Ok ( build child, state )
 
-        initial =
-            String.left 1 raw
-
-        quoted _ =
-            fromJson ("\"" ++ raw ++ "\"")
-    in
-    if List.member initial [ "[", "{", "\"" ] || List.member raw [ "true", "false", "null" ] then
-        fromJson raw
-
-    else if (initial >= "0" && initial <= "9") || initial == "-" then
-        case fromJson raw of
-            Ok x ->
-                Ok x
-
-            Err _ ->
-                quoted ()
-
-    else
-        quoted ()
+        Err () ->
+            Err ()
 
 
-tokens src =
-    let
-        n =
-            String.length src
+nud : Token -> State -> Parsed
+nud t state =
+    case t.kind of
+        Literal ->
+            Ok ( node "Literal" [ ( "value", t.value ) ], state )
 
-        ch i =
-            String.slice i (i + 1) src
+        UnquotedIdentifier ->
+            Ok ( node "Field" [ ( "name", t.value ) ], state )
 
-        alpha x =
-            (x >= "a" && x <= "z") || (x >= "A" && x <= "Z") || x == "_"
-
-        digit x =
-            x >= "0" && x <= "9"
-
-        endWhile f i =
-            if i < n && f (ch i) then
-                endWhile f (i + 1)
+        QuotedIdentifier ->
+            if lookahead 0 state == Lparen then
+                Err ()
 
             else
-                i
+                Ok ( node "Field" [ ( "name", t.value ) ], state )
 
-        endQuote quote i =
-            if i >= n || ch i == quote then
-                i
+        Not ->
+            wrap (\right -> branch "NotExpression" [ right ]) (expression 45 state)
 
-            else if ch i == "\\" && (ch (i + 1) == quote || ch (i + 1) == "\\") then
-                endQuote quote (i + 2)
-
-            else
-                endQuote quote (i + 1)
-
-        punctuation =
-            [ ( "[?", "Filter" )
-            , ( "[]", "Flatten" )
-            , ( "&&", "And" )
-            , ( "||", "Or" )
-            , ( "!=", "NE" )
-            , ( "==", "EQ" )
-            , ( "<=", "LTE" )
-            , ( ">=", "GTE" )
-            , ( "<", "LT" )
-            , ( ">", "GT" )
-            , ( "!", "Not" )
-            , ( "&", "Expref" )
-            , ( "|", "Pipe" )
-            , ( "[", "Lbracket" )
-            , ( "]", "Rbracket" )
-            , ( "{", "Lbrace" )
-            , ( "}", "Rbrace" )
-            , ( "(", "Lparen" )
-            , ( ")", "Rparen" )
-            , ( "*", "Star" )
-            , ( "@", "Current" )
-            , ( ",", "Comma" )
-            , ( ".", "Dot" )
-            , ( ":", "Colon" )
-            ]
-
-        lex i acc =
-            if i >= n then
-                Ok { tokens = Array.fromList (List.reverse (Token "EOF" Missing :: acc)), pos = 0 }
+        Star ->
+            if lookahead 0 state == Rbracket then
+                Ok ( branch "ValueProjection" [ identityNode (), identityNode () ], state )
 
             else
-                let
-                    x =
-                        ch i
+                wrap (\right -> branch "ValueProjection" [ identityNode (), right ]) (parseProjectionRHS 20 state)
 
-                    next k v j =
-                        lex j (Token k v :: acc)
-                in
-                if alpha x then
-                    let
-                        e =
-                            endWhile (\c -> alpha c || digit c) (i + 1)
-                    in
-                    next "Field" (Str (String.slice i e src)) e
+        Filter ->
+            led Filter (identityNode ()) state
 
-                else if digit x || x == "-" then
-                    let
-                        e =
-                            endWhile (\c -> c == "-" || digit c) (i + 1)
+        Lbrace ->
+            parseMultiselectHash state []
 
-                        cut =
-                            endWhile digit
-                                (if x == "-" then
-                                    i + 1
+        Flatten ->
+            wrap (\right -> branch "Projection" [ branch "Flatten" [ identityNode () ], right ]) (parseProjectionRHS 9 state)
 
-                                 else
-                                    i
-                                )
+        Lbracket ->
+            if lookahead 0 state == Number || lookahead 0 state == Colon then
+                parseIndexExpression (identityNode ()) state
 
-                        parsed =
-                            String.toFloat (String.slice i cut src) |> Maybe.withDefault (0 / 0)
-                    in
-                    next "Number" (Num parsed) e
+            else if lookahead 0 state == Star && lookahead 1 state == Rbracket then
+                wrap (\right -> branch "Projection" [ identityNode (), right ]) (parseProjectionRHS 20 (advance (advance state)))
 
-                else if List.member x [ "\"", "'", "`" ] then
-                    let
-                        e =
-                            endQuote x (i + 1)
+            else
+                parseMultiselectList state []
 
-                        inside =
-                            String.slice (i + 1) e src
+        Current ->
+            Ok ( node "Current" [], state )
 
-                        val =
-                            if x == "\"" then
-                                fromJson (String.slice i (e + 1) src)
+        Expref ->
+            wrap (\child -> branch "ExpressionReference" [ child ]) (expression 0 state)
 
-                            else if x == "'" then
-                                Ok (Str (replaceFirst "\\'" "'" inside))
+        Lparen ->
+            -- `args[0]`: undefined for `()`.
+            case parseArguments False state [] of
+                Ok ( first :: _, after ) ->
+                    Ok ( first, after )
+
+                Ok ( [], after ) ->
+                    Ok ( Undefined, after )
+
+                Err () ->
+                    Err ()
+
+        _ ->
+            Err ()
+
+
+led : TokenType -> V -> State -> Parsed
+led tokenName left state =
+    case tokenName of
+        Dot ->
+            if lookahead 0 state /= Star then
+                wrap (\right -> branch "Subexpression" [ left, right ]) (parseDotRHS 40 state)
+
+            else
+                wrap (\right -> branch "ValueProjection" [ left, right ]) (parseProjectionRHS 40 (advance state))
+
+        Pipe ->
+            wrap (\right -> branch "Pipe" [ left, right ]) (expression 1 state)
+
+        Or ->
+            wrap (\right -> branch "OrExpression" [ left, right ]) (expression 2 state)
+
+        And ->
+            wrap (\right -> branch "AndExpression" [ left, right ]) (expression 3 state)
+
+        Lparen ->
+            -- `left.name`: a TypeError (syntax) when there is no left node, as after `()`.
+            case left of
+                Obj _ fields ->
+                    case parseArguments True state [] of
+                        Ok ( args, after ) ->
+                            Ok ( node "Function" [ ( "name", Values.field "name" fields ), ( "children", Arr (fresh ()) args ) ], after )
+
+                        Err () ->
+                            Err ()
+
+                _ ->
+                    Err ()
+
+        Filter ->
+            case expression 0 state of
+                Ok ( condition, afterCondition ) ->
+                    case match Rbracket afterCondition of
+                        Ok afterBracket ->
+                            if lookahead 0 afterBracket == Flatten then
+                                Ok ( branch "FilterProjection" [ left, identityNode (), condition ], afterBracket )
 
                             else
-                                literal inside
-                    in
-                    val
-                        |> Result.andThen
-                            (\v ->
-                                next
-                                    (if x == "\"" then
-                                        "Quoted"
+                                wrap (\right -> branch "FilterProjection" [ left, right, condition ]) (parseProjectionRHS 21 afterBracket)
 
-                                     else
-                                        "Literal"
-                                    )
-                                    v
-                                    (e + 1)
-                            )
+                        Err () ->
+                            Err ()
 
-                else if List.member x [ " ", "\t", "\n" ] then
-                    lex (i + 1) acc
+                Err () ->
+                    Err ()
 
-                else
-                    case List.filter (\( sym, _ ) -> String.slice i (i + String.length sym) src == sym) punctuation |> List.head of
-                        Just ( sym, k ) ->
-                            next k Missing (i + String.length sym)
+        Flatten ->
+            wrap (\right -> branch "Projection" [ branch "Flatten" [ left ], right ]) (parseProjectionRHS 9 state)
 
-                        Nothing ->
-                            Err "syntax"
-    in
-    lex 0 []
+        Lbracket ->
+            if lookahead 0 state == Number || lookahead 0 state == Colon then
+                parseIndexExpression left state
 
+            else
+                case match Star state |> Result.andThen (match Rbracket) of
+                    Ok after ->
+                        wrap (\right -> branch "Projection" [ left, right ]) (parseProjectionRHS 20 after)
 
-token s offset =
-    Array.get (s.pos + offset) s.tokens |> Maybe.withDefault (Token "EOF" Missing)
+                    Err () ->
+                        Err ()
+
+        _ ->
+            case comparatorName tokenName of
+                Just name ->
+                    wrap (\right -> node "Comparator" [ ( "name", Str name ), ( "children", Arr (fresh ()) [ left, right ] ) ]) (expression 5 state)
+
+                Nothing ->
+                    Err ()
 
 
-peek s =
-    (token s 0).k
-
-
-advance n s =
-    { s | pos = s.pos + n }
-
-
-power k =
-    if k == "Pipe" then
-        1
-
-    else if k == "Or" then
-        2
-
-    else if k == "And" then
-        3
-
-    else if List.member k [ "LT", "LTE", "GT", "GTE", "NE", "EQ" ] then
-        5
+{-| The argument loops of `(…)` and of a function call. An argument that starts with `@` is the bare
+Current node, so `abs(@.a)` fails on the `.` as in jmespath. Calls may separate arguments with
+commas; parentheses may not.
+-}
+parseArguments : Bool -> State -> List V -> Result () ( List V, State )
+parseArguments commas state args =
+    if lookahead 0 state == Rparen then
+        Ok ( List.reverse args, advance state )
 
     else
-        case k of
-            "Flatten" ->
-                9
+        let
+            argument =
+                if lookahead 0 state == Current then
+                    Ok ( node "Current" [], advance state )
 
-            "Star" ->
-                20
+                else
+                    expression 0 state
+        in
+        case argument of
+            Ok ( value, after ) ->
+                parseArguments commas
+                    (if commas && lookahead 0 after == Comma then
+                        advance after
 
-            "Filter" ->
-                21
+                     else
+                        after
+                    )
+                    (value :: args)
 
-            "Dot" ->
-                40
+            Err () ->
+                Err ()
 
-            "Not" ->
-                45
 
-            "Lbrace" ->
-                50
+{-| `_parseIndexExpression` and `_projectIfSlice` on `left`.
+-}
+parseIndexExpression : V -> State -> Parsed
+parseIndexExpression left state =
+    if lookahead 0 state == Colon || lookahead 1 state == Colon then
+        case parseSlice state 0 [ Null, Null, Null ] of
+            Ok ( slice, after ) ->
+                wrap (\right -> branch "Projection" [ branch "IndexExpression" [ left, slice ], right ]) (parseProjectionRHS 20 after)
 
-            "Lbracket" ->
-                55
+            Err () ->
+                Err ()
 
-            "Lparen" ->
-                60
+    else
+        case match Rbracket (advance state) of
+            Ok after ->
+                Ok ( branch "IndexExpression" [ left, node "Index" [ ( "value", (token 0 state).value ) ] ], after )
+
+            Err () ->
+                Err ()
+
+
+{-| `[start:stop:step]`, each part optional; a later number in one part replaces an earlier one.
+-}
+parseSlice : State -> Int -> List V -> Parsed
+parseSlice state index parts =
+    if lookahead 0 state /= Rbracket && index < 3 then
+        case lookahead 0 state of
+            Colon ->
+                parseSlice (advance state) (index + 1) parts
+
+            Number ->
+                parseSlice (advance state) index (List.indexedMap (\i p -> if i == index then (token 0 state).value else p) parts)
 
             _ ->
-                0
-
-
-syntax =
-    Err "syntax"
-
-
-expect k s =
-    if peek s == k then
-        Ok (advance 1 s)
+                Err ()
 
     else
-        syntax
+        case match Rbracket state of
+            Ok after ->
+                Ok ( branch "Slice" parts, after )
+
+            Err () ->
+                Err ()
 
 
-expression rbp s =
+{-| Undefined (no error) when nothing that can follow a dot follows it, as in jmespath.
+-}
+parseDotRHS : Int -> State -> Parsed
+parseDotRHS rbp state =
+    case lookahead 0 state of
+        UnquotedIdentifier ->
+            expression rbp state
+
+        QuotedIdentifier ->
+            expression rbp state
+
+        Star ->
+            expression rbp state
+
+        Lbracket ->
+            parseMultiselectList (advance state) []
+
+        Lbrace ->
+            parseMultiselectHash (advance state) []
+
+        _ ->
+            Ok ( Undefined, state )
+
+
+parseProjectionRHS : Int -> State -> Parsed
+parseProjectionRHS rbp state =
     let
-        more ( left, rest ) =
-            let
-                k =
-                    peek rest
-            in
-            if power k > rbp then
-                infixExpr k left (advance 1 rest) |> Result.andThen more
-
-            else
-                Ok ( left, rest )
+        next =
+            lookahead 0 state
     in
-    prefix (token s 0) (advance 1 s) |> Result.andThen more
+    if Maybe.withDefault False (Maybe.map (\power -> power < 10) (bindingPower next)) then
+        Ok ( identityNode (), state )
+
+    else if next == Lbracket || next == Filter then
+        expression rbp state
+
+    else if next == Dot then
+        parseDotRHS rbp (advance state)
+
+    else
+        Err ()
 
 
-projection rbp s =
+{-| `[a, b]`; the comma between elements is optional, a trailing one is an error.
+-}
+parseMultiselectList : State -> List V -> Parsed
+parseMultiselectList state expressions =
+    if lookahead 0 state == Rbracket then
+        Ok ( branch "MultiSelectList" (List.reverse expressions), advance state )
+
+    else
+        case expression 0 state of
+            Ok ( value, after ) ->
+                if lookahead 0 after == Comma then
+                    if lookahead 1 after == Rbracket then
+                        Err ()
+
+                    else
+                        parseMultiselectList (advance after) (value :: expressions)
+
+                else
+                    parseMultiselectList after (value :: expressions)
+
+            Err () ->
+                Err ()
+
+
+{-| `{k: v, …}`; as in jmespath, the comma between pairs is optional too.
+-}
+parseMultiselectHash : State -> List V -> Parsed
+parseMultiselectHash state pairs =
     let
-        k =
-            peek s
+        keyToken =
+            token 0 state
     in
-    if power k < 10 then
-        Ok ( node "Identity", s )
-
-    else if k == "Lbracket" || k == "Filter" then
-        expression rbp s
-
-    else if k == "Dot" then
-        dot rbp (advance 1 s)
+    if keyToken.kind /= UnquotedIdentifier && keyToken.kind /= QuotedIdentifier then
+        Err ()
 
     else
-        syntax
+        case match Colon (advance state) of
+            Err () ->
+                Err ()
 
+            Ok afterColon ->
+                case expression 0 afterColon of
+                    Err () ->
+                        Err ()
 
-dot rbp s =
-    case peek s of
-        "Lbracket" ->
-            multi (advance 1 s) []
+                    Ok ( value, after ) ->
+                        let
+                            collected =
+                                node "KeyValuePair" [ ( "name", keyToken.value ), ( "value", value ) ] :: pairs
+                        in
+                        if lookahead 0 after == Comma then
+                            parseMultiselectHash (advance after) collected
 
-        "Lbrace" ->
-            hash (advance 1 s) []
-
-        k ->
-            if List.member k [ "Field", "Quoted", "Star" ] then
-                expression rbp s
-
-            else
-                Ok ( Missing, s )
-
-
-multi s acc =
-    if peek s == "Rbracket" then
-        Ok ( branch "MultiSelectList" (List.reverse acc), advance 1 s )
-
-    else
-        expression 0 s
-            |> Result.andThen
-                (\( v, t ) ->
-                    if peek t == "Comma" then
-                        if (token t 1).k == "Rbracket" then
-                            syntax
+                        else if lookahead 0 after == Rbrace then
+                            Ok ( branch "MultiSelectHash" (List.reverse collected), advance after )
 
                         else
-                            multi (advance 1 t) (v :: acc)
-
-                    else
-                        multi t (v :: acc)
-                )
-
-
-hash s acc =
-    let
-        t =
-            token s 0
-    in
-    if not (List.member t.k [ "Quoted", "Field" ]) then
-        syntax
-
-    else
-        expect "Colon" (advance 1 s)
-            |> Result.andThen (expression 0)
-            |> Result.andThen
-                (\( v, after ) ->
-                    let
-                        pairs =
-                            Obj [ ( "type", Str "KeyValuePair" ), ( "name", t.v ), ( "value", v ) ] :: acc
-                    in
-                    if peek after == "Rbrace" then
-                        Ok ( branch "MultiSelectHash" (List.reverse pairs), advance 1 after )
-
-                    else
-                        hash
-                            (if peek after == "Comma" then
-                                advance 1 after
-
-                             else
-                                after
-                            )
-                            pairs
-                )
-
-
-bracket left s =
-    if peek s == "Colon" || (token s 1).k == "Colon" then
-        let
-            scan i parts t =
-                if peek t == "Rbracket" || i >= 3 then
-                    expect "Rbracket" t
-                        |> Result.andThen (projection 20)
-                        |> Result.map
-                            (\( rhs, rest ) ->
-                                ( branch "Projection" [ branch "IndexExpression" [ left, branch "Slice" (Array.toList parts) ], rhs ], rest )
-                            )
-
-                else if peek t == "Colon" then
-                    scan (i + 1) parts (advance 1 t)
-
-                else if peek t == "Number" then
-                    scan i (Array.set i (token t 0).v parts) (advance 1 t)
-
-                else
-                    syntax
-        in
-        scan 0 (Array.repeat 3 Null) s
-
-    else
-        expect "Rbracket" (advance 1 s) |> Result.map (\t -> ( branch "IndexExpression" [ left, leaf "Index" (token s 0).v ], t ))
-
-
-args commas s acc =
-    if peek s == "Rparen" then
-        Ok ( List.reverse acc, advance 1 s )
-
-    else
-        let
-            item =
-                if peek s == "Current" then
-                    Ok ( node "Current", advance 1 s )
-
-                else
-                    expression 0 s
-        in
-        item
-            |> Result.andThen
-                (\( v, t ) ->
-                    args commas
-                        (if commas && peek t == "Comma" then
-                            advance 1 t
-
-                         else
-                            t
-                        )
-                        (v :: acc)
-                )
-
-
-wrap k before parsed =
-    Result.map (\( rhs, t ) -> ( branch k (before ++ [ rhs ]), t )) parsed
-
-
-prefix t s =
-    case t.k of
-        "Literal" ->
-            Ok ( leaf "Literal" t.v, s )
-
-        "Quoted" ->
-            if peek s == "Lparen" then
-                syntax
-
-            else
-                Ok ( named "Field" t.v, s )
-
-        "Field" ->
-            Ok ( named "Field" t.v, s )
-
-        "Not" ->
-            wrap "NotExpression" [] (expression 45 s)
-
-        "Current" ->
-            Ok ( node "Current", s )
-
-        "Expref" ->
-            wrap "ExpressionReference" [] (expression 0 s)
-
-        "Star" ->
-            wrap "ValueProjection" [ node "Identity" ] (projection 20 s)
-
-        "Filter" ->
-            infixExpr t.k (node "Identity") s
-
-        "Flatten" ->
-            infixExpr t.k (node "Identity") s
-
-        "Lbrace" ->
-            hash s []
-
-        "Lbracket" ->
-            if List.member (peek s) [ "Number", "Colon" ] then
-                bracket (node "Identity") s
-
-            else if peek s == "Star" && (token s 1).k == "Rbracket" then
-                wrap "Projection" [ node "Identity" ] (projection 20 (advance 2 s))
-
-            else
-                multi s []
-
-        "Lparen" ->
-            args False s [] |> Result.map (\( cs, rest ) -> ( Maybe.withDefault Missing (List.head cs), rest ))
-
-        _ ->
-            syntax
-
-
-infixExpr k left s =
-    case k of
-        "Dot" ->
-            if peek s == "Star" then
-                wrap "ValueProjection" [ left ] (projection 40 (advance 1 s))
-
-            else
-                wrap "Subexpression" [ left ] (dot 40 s)
-
-        "Or" ->
-            wrap "OrExpression" [ left ] (expression 2 s)
-
-        "And" ->
-            wrap "AndExpression" [ left ] (expression 3 s)
-
-        "Pipe" ->
-            wrap k [ left ] (expression 1 s)
-
-        "Lparen" ->
-            if left == Missing then
-                syntax
-
-            else
-                args True s [] |> Result.map (\( cs, t ) -> ( Obj [ ( "type", Str "Function" ), ( "name", field "name" left ), ( "children", Arr cs ) ], t ))
-
-        "Filter" ->
-            expression 0 s
-                |> Result.andThen
-                    (\( cond, t ) ->
-                        expect "Rbracket" t
-                            |> Result.andThen
-                                (\rest ->
-                                    (if peek rest == "Flatten" then
-                                        Ok ( node "Identity", rest )
-
-                                     else
-                                        projection 21 rest
-                                    )
-                                        |> Result.map (\( rhs, final ) -> ( branch "FilterProjection" [ left, rhs, cond ], final ))
-                                )
-                    )
-
-        "Flatten" ->
-            wrap "Projection" [ branch k [ left ] ] (projection 9 s)
-
-        "Lbracket" ->
-            if List.member (peek s) [ "Number", "Colon" ] then
-                bracket left s
-
-            else
-                expect "Star" s |> Result.andThen (expect "Rbracket") |> Result.andThen (projection 20) |> wrap "Projection" [ left ]
-
-        _ ->
-            if power k == 5 then
-                expression 5 s |> Result.map (\( rhs, t ) -> ( Obj [ ( "type", Str "Comparator" ), ( "name", Str k ), ( "children", Arr [ left, rhs ] ) ], t ))
-
-            else
-                syntax
-
-
-compile s =
-    tokens s |> Result.andThen (expression 0)
-        |> Result.andThen
-            (\( v, t ) ->
-                if peek t == "EOF" then
-                    Ok v
-
-                else
-                    syntax
-            )
+                            parseMultiselectHash after collected

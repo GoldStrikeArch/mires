@@ -1,265 +1,396 @@
+// jmespath's Pratt parser, method by method. Nodes are plain JS objects with jmespath's property
+// order, since compile returns them and `&expr` passes them around as values. js.Undefined stands
+// for jmespath's undefined nodes (`a.`, `()`).
+
 package main
 
 import "github.com/gopherjs/gopherjs/js"
 
-func (p *parser) current(offset int) string {
-	return p.tokenAt(p.index + offset).kind
+func newNode(typ string) *js.Object {
+	node := newObject()
+	node.Set("type", typ)
+	return node
 }
-func (p *parser) next() token {
-	result := p.tokenAt(p.index)
-	if result.kind == "EOF" {
-		panic("syntax")
-	}
-	p.index += 1
-	return result
+
+// nodeWith is a node with one more property after its type: Field's name, Literal's value.
+func nodeWith(typ, key string, value *js.Object) *js.Object {
+	node := newNode(typ)
+	node.Set(key, value)
+	return node
 }
-func (p *parser) take(kind string) {
-	if p.next().kind != kind {
-		panic("syntax")
-	}
+
+func branch(typ string, children ...*js.Object) *js.Object {
+	node := newNode(typ)
+	node.Set("children", newArray(children...))
+	return node
 }
-func (p *parser) power(k string) int {
-	if k == "Pipe" {
-		return 1
-	}
-	if k == "Or" {
-		return 2
-	}
-	if k == "And" {
-		return 3
-	}
-	if k == "EQ" || k == "NE" || k == "GT" || k == "LT" || k == "GTE" || k == "LTE" {
-		return 5
-	}
-	if k == "Flatten" {
-		return 9
-	}
-	if k == "Star" {
-		return 20
-	}
-	if k == "Filter" {
-		return 21
-	}
-	if k == "Dot" {
-		return 40
-	}
-	if k == "Not" {
-		return 45
-	}
-	if k == "Lbrace" {
-		return 50
-	}
-	if k == "Lbracket" {
-		return 55
-	}
-	if k == "Lparen" {
-		return 60
-	}
-	return 0
+
+// binaryNodeTypes are the node types of the binary operators led builds alike.
+var binaryNodeTypes = map[tokenType]string{tokPipe: "Pipe", tokOr: "OrExpression", tokAnd: "AndExpression"}
+
+type parser struct {
+	tokens []token
+	index  int
 }
-func (p *parser) parse() value {
-	ast := p.expression(0)
-	if p.current(0) != "EOF" {
-		panic("syntax")
+
+// compile is jmespath's compile: the AST of an expression.
+func compile(expression *js.Object) (*js.Object, error) {
+	tokens, err := tokenize(expression)
+	if err != nil {
+		return nil, err
 	}
-	return ast
+	p := &parser{tokens: append(tokens, token{tokEOF, jsString(""), expression.Length()})}
+	ast, err := p.expression(0)
+	if err != nil {
+		return nil, err
+	}
+	if p.lookahead(0) != tokEOF {
+		return nil, syntaxError("Unexpected token")
+	}
+	return ast, nil
 }
-func (p *parser) expression(rbp int) value {
-	left := p.applyPrefix(p.next())
-	for p.power(p.current(0)) > rbp {
-		op := p.next().kind
-		left = p.applyInfix(op, left)
+
+func (p *parser) expression(rbp int) (*js.Object, error) {
+	leftToken := p.lookaheadToken(0)
+	p.advance()
+	left, err := p.nud(leftToken)
+	if err != nil {
+		return nil, err
 	}
-	return left
+	currentToken := p.lookahead(0)
+	// `rbp < bindingPower[currentToken]`, false where the table has no entry.
+	for power, ok := bindingPower[currentToken]; ok && rbp < power; power, ok = bindingPower[currentToken] {
+		p.advance()
+		if left, err = p.led(currentToken, left); err != nil {
+			return nil, err
+		}
+		currentToken = p.lookahead(0)
+	}
+	return left, nil
 }
-func (p *parser) projection(rbp int) value {
-	k := p.current(0)
-	if p.power(k) < 10 {
-		return node("Identity")
+
+func (p *parser) lookahead(number int) tokenType  { return p.tokens[p.index+number].typ }
+func (p *parser) lookaheadToken(number int) token { return p.tokens[p.index+number] }
+func (p *parser) advance()                        { p.index++ }
+
+func (p *parser) match(typ tokenType) error {
+	if p.lookahead(0) != typ {
+		return syntaxError("Unexpected token")
 	}
-	if k == "Lbracket" || k == "Filter" {
-		return p.expression(rbp)
-	}
-	if k == "Dot" {
-		p.next()
-		return p.dot(rbp)
-	}
-	panic("syntax")
+	p.advance()
+	return nil
 }
-func (p *parser) dot(rbp int) value {
-	k := p.current(0)
-	if k == "Field" || k == "Quoted" || k == "Star" {
-		return p.expression(rbp)
-	}
-	if k == "Lbracket" {
-		p.next()
-		return p.listExpression()
-	}
-	if k == "Lbrace" {
-		p.next()
-		return p.hashExpression()
-	}
-	return js.Undefined
-}
-func (p *parser) listExpression() value {
-	items := arr()
-	for p.current(0) != "Rbracket" {
-		push(items, p.expression(0))
-		if p.current(0) == "Comma" {
-			p.next()
-			if p.current(0) == "Rbracket" {
-				panic("syntax")
+
+func (p *parser) nud(t token) (*js.Object, error) {
+	switch t.typ {
+	case tokLiteral:
+		return nodeWith("Literal", "value", t.value), nil
+	case tokUnquotedIdentifier:
+		return nodeWith("Field", "name", t.value), nil
+	case tokQuotedIdentifier:
+		field := nodeWith("Field", "name", t.value)
+		if p.lookahead(0) == tokLparen {
+			return nil, syntaxError("Quoted identifier not allowed for function names.")
+		}
+		return field, nil
+	case tokNot:
+		right, err := p.expression(bindingPower[tokNot])
+		if err != nil {
+			return nil, err
+		}
+		return branch("NotExpression", right), nil
+	case tokStar:
+		right := newNode("Identity")
+		if p.lookahead(0) != tokRbracket {
+			var err error
+			if right, err = p.parseProjectionRHS(bindingPower[tokStar]); err != nil {
+				return nil, err
 			}
 		}
-	}
-	p.take("Rbracket")
-	return branch("MultiSelectList", items)
-}
-func (p *parser) hashExpression() value {
-	items := arr()
-	for true {
-		key := p.next()
-		if key.kind != "Field" && key.kind != "Quoted" {
-			panic("syntax")
+		return branch("ValueProjection", newNode("Identity"), right), nil
+	case tokFilter:
+		return p.led(t.typ, newNode("Identity"))
+	case tokLbrace:
+		return p.parseMultiselectHash()
+	case tokFlatten:
+		left := branch("Flatten", newNode("Identity"))
+		right, err := p.parseProjectionRHS(bindingPower[tokFlatten])
+		if err != nil {
+			return nil, err
 		}
-		p.take("Colon")
-		pair := named("KeyValuePair", key.value)
-		put(pair, "value", p.expression(0))
-		push(items, pair)
-		if p.current(0) == "Comma" {
-			p.next()
-		} else if p.current(0) == "Rbrace" {
-			p.next()
-			return branch("MultiSelectHash", items)
-		}
-	}
-	panic("syntax")
-}
-func (p *parser) bracket(left value) value {
-	if p.current(0) == "Colon" || p.current(1) == "Colon" {
-		parts := three(nil, nil, nil)
-		i := 0
-		for p.current(0) != "Rbracket" && i < 3 {
-			token := p.next()
-			if token.kind == "Colon" {
-				i += 1
-			} else if token.kind == "Number" {
-				setIndex(parts, i, token.value)
-			} else {
-				panic("syntax")
+		return branch("Projection", left, right), nil
+	case tokLbracket:
+		switch {
+		case p.lookahead(0) == tokNumber || p.lookahead(0) == tokColon:
+			right, err := p.parseIndexExpression()
+			if err != nil {
+				return nil, err
 			}
+			return p.projectIfSlice(newNode("Identity"), right)
+		case p.lookahead(0) == tokStar && p.lookahead(1) == tokRbracket:
+			p.advance()
+			p.advance()
+			right, err := p.parseProjectionRHS(bindingPower[tokStar])
+			if err != nil {
+				return nil, err
+			}
+			return branch("Projection", newNode("Identity"), right), nil
 		}
-		p.take("Rbracket")
-		ix := branch("IndexExpression", two(left, branch("Slice", parts)))
-		return branch("Projection", two(ix, p.projection(20)))
+		return p.parseMultiselectList()
+	case tokCurrent:
+		return newNode("Current"), nil
+	case tokExpref:
+		expression, err := p.expression(bindingPower[tokExpref])
+		if err != nil {
+			return nil, err
+		}
+		return branch("ExpressionReference", expression), nil
+	case tokLparen:
+		args, err := p.parseArguments(false)
+		if err != nil {
+			return nil, err
+		}
+		// args[0]: undefined for `()`.
+		if len(args) == 0 {
+			return js.Undefined, nil
+		}
+		return args[0], nil
 	}
-	token := p.next()
-	p.take("Rbracket")
-	return branch("IndexExpression", two(left, leaf("Index", token.value)))
+	return nil, syntaxError("Invalid token")
 }
-func (p *parser) arguments(commas bool) value {
-	args := arr()
-	for p.current(0) != "Rparen" {
-		if p.current(0) == "Current" {
-			p.next()
-			push(args, node("Current"))
+
+func (p *parser) led(tokenName tokenType, left *js.Object) (*js.Object, error) {
+	switch tokenName {
+	case tokDot:
+		rbp := bindingPower[tokDot]
+		if p.lookahead(0) != tokStar {
+			right, err := p.parseDotRHS(rbp)
+			if err != nil {
+				return nil, err
+			}
+			return branch("Subexpression", left, right), nil
+		}
+		p.advance()
+		right, err := p.parseProjectionRHS(rbp)
+		if err != nil {
+			return nil, err
+		}
+		return branch("ValueProjection", left, right), nil
+	case tokPipe, tokOr, tokAnd:
+		right, err := p.expression(bindingPower[tokenName])
+		if err != nil {
+			return nil, err
+		}
+		return branch(binaryNodeTypes[tokenName], left, right), nil
+	case tokLparen:
+		// left.name: a TypeError (syntax) when there is no left node, as after `()`.
+		if isUndefined(left) || isNull(left) {
+			return nil, syntaxError("Function call without a name")
+		}
+		name := left.Get("name")
+		args, err := p.parseArguments(true)
+		if err != nil {
+			return nil, err
+		}
+		function := nodeWith("Function", "name", name)
+		function.Set("children", newArray(args...))
+		return function, nil
+	case tokFilter:
+		condition, err := p.expression(0)
+		if err != nil {
+			return nil, err
+		}
+		if err := p.match(tokRbracket); err != nil {
+			return nil, err
+		}
+		var right *js.Object
+		if p.lookahead(0) == tokFlatten {
+			right = newNode("Identity")
+		} else if right, err = p.parseProjectionRHS(bindingPower[tokFilter]); err != nil {
+			return nil, err
+		}
+		return branch("FilterProjection", left, right, condition), nil
+	case tokFlatten:
+		leftNode := branch("Flatten", left)
+		right, err := p.parseProjectionRHS(bindingPower[tokFlatten])
+		if err != nil {
+			return nil, err
+		}
+		return branch("Projection", leftNode, right), nil
+	case tokEQ, tokNE, tokGT, tokGTE, tokLT, tokLTE:
+		return p.parseComparator(left, tokenName)
+	case tokLbracket:
+		if t := p.lookaheadToken(0); t.typ == tokNumber || t.typ == tokColon {
+			right, err := p.parseIndexExpression()
+			if err != nil {
+				return nil, err
+			}
+			return p.projectIfSlice(left, right)
+		}
+		if err := p.match(tokStar); err != nil {
+			return nil, err
+		}
+		if err := p.match(tokRbracket); err != nil {
+			return nil, err
+		}
+		right, err := p.parseProjectionRHS(bindingPower[tokStar])
+		if err != nil {
+			return nil, err
+		}
+		return branch("Projection", left, right), nil
+	}
+	return nil, syntaxError("Invalid token")
+}
+
+// parseArguments is the argument loop of `(…)` and of a function call. An argument that starts with
+// `@` is the bare Current node, so `abs(@.a)` fails on the `.` as in jmespath. Calls may separate
+// arguments with commas; parentheses may not.
+func (p *parser) parseArguments(commas bool) ([]*js.Object, error) {
+	var args []*js.Object
+	for p.lookahead(0) != tokRparen {
+		var expression *js.Object
+		if p.lookahead(0) == tokCurrent {
+			p.advance()
+			expression = newNode("Current")
 		} else {
-			push(args, p.expression(0))
+			var err error
+			if expression, err = p.expression(0); err != nil {
+				return nil, err
+			}
 		}
-		if commas && p.current(0) == "Comma" {
-			p.next()
+		if commas && p.lookahead(0) == tokComma {
+			p.advance()
 		}
+		args = append(args, expression)
 	}
-	p.take("Rparen")
-	return args
+	return args, p.match(tokRparen)
 }
-func (p *parser) applyPrefix(t token) value {
-	k := t.kind
-	if k == "Literal" {
-		return leaf("Literal", t.value)
+
+func (p *parser) parseIndexExpression() (*js.Object, error) {
+	if p.lookahead(0) == tokColon || p.lookahead(1) == tokColon {
+		return p.parseSliceExpression()
 	}
-	if k == "Quoted" && p.current(0) == "Lparen" {
-		panic("syntax")
-	}
-	if k == "Quoted" || k == "Field" {
-		return named("Field", t.value)
-	}
-	if k == "Not" {
-		return branch("NotExpression", one(p.expression(45)))
-	}
-	if k == "Current" {
-		return node("Current")
-	}
-	if k == "Expref" {
-		return branch("ExpressionReference", one(p.expression(0)))
-	}
-	if k == "Star" {
-		return branch("ValueProjection", two(node("Identity"), p.projection(20)))
-	}
-	if k == "Filter" || k == "Flatten" {
-		return p.applyInfix(k, node("Identity"))
-	}
-	if k == "Lbrace" {
-		return p.hashExpression()
-	}
-	if k == "Lbracket" {
-		if p.current(0) == "Colon" || p.current(0) == "Number" {
-			return p.bracket(node("Identity"))
-		}
-		if p.current(0) == "Star" && p.current(1) == "Rbracket" {
-			p.index += 2
-			return branch("Projection", two(node("Identity"), p.projection(20)))
-		}
-		return p.listExpression()
-	}
-	if k == "Lparen" {
-		return at(p.arguments(false), 0)
-	}
-	panic("syntax")
+	index := nodeWith("Index", "value", p.lookaheadToken(0).value)
+	p.advance()
+	return index, p.match(tokRbracket)
 }
-func (p *parser) applyInfix(k string, left value) value {
-	if k == "Dot" {
-		if p.current(0) == "Star" {
-			p.next()
-			return branch("ValueProjection", two(left, p.projection(40)))
+
+func (p *parser) projectIfSlice(left, right *js.Object) (*js.Object, error) {
+	indexExpr := branch("IndexExpression", left, right)
+	if right.Get("type").String() != "Slice" {
+		return indexExpr, nil
+	}
+	rhs, err := p.parseProjectionRHS(bindingPower[tokStar])
+	if err != nil {
+		return nil, err
+	}
+	return branch("Projection", indexExpr, rhs), nil
+}
+
+// parseSliceExpression: `[start:stop:step]`, each part optional; a later number in one part
+// replaces an earlier one.
+func (p *parser) parseSliceExpression() (*js.Object, error) {
+	parts := []*js.Object{nil, nil, nil}
+	index := 0
+	for currentToken := p.lookahead(0); currentToken != tokRbracket && index < 3; currentToken = p.lookahead(0) {
+		switch currentToken {
+		case tokColon:
+			index++
+		case tokNumber:
+			parts[index] = p.lookaheadToken(0).value
+		default:
+			return nil, syntaxError("Syntax error, unexpected token")
 		}
-		return branch("Subexpression", two(left, p.dot(40)))
+		p.advance()
 	}
-	if k == "Or" || k == "And" {
-		return branch(k+"Expression", two(left, p.expression(p.power(k))))
+	return branch("Slice", parts...), p.match(tokRbracket)
+}
+
+func (p *parser) parseComparator(left *js.Object, comparator tokenType) (*js.Object, error) {
+	right, err := p.expression(bindingPower[comparator])
+	if err != nil {
+		return nil, err
 	}
-	if k == "Pipe" {
-		return branch(k, two(left, p.expression(1)))
+	node := nodeWith("Comparator", "name", jsString(comparatorNames[comparator]))
+	node.Set("children", newArray(left, right))
+	return node, nil
+}
+
+// parseDotRHS is undefined (no error) when nothing that can follow a dot follows it, as in jmespath.
+func (p *parser) parseDotRHS(rbp int) (*js.Object, error) {
+	switch p.lookahead(0) {
+	case tokUnquotedIdentifier, tokQuotedIdentifier, tokStar:
+		return p.expression(rbp)
+	case tokLbracket:
+		p.advance()
+		return p.parseMultiselectList()
+	case tokLbrace:
+		p.advance()
+		return p.parseMultiselectHash()
 	}
-	if k == "Lparen" {
-		f := named("Function", field(left, "name"))
-		put(f, "children", p.arguments(true))
-		return f
+	return js.Undefined, nil
+}
+
+func (p *parser) parseProjectionRHS(rbp int) (*js.Object, error) {
+	next := p.lookahead(0)
+	if power, ok := bindingPower[next]; ok && power < 10 {
+		return newNode("Identity"), nil
 	}
-	if k == "Filter" {
-		condition := p.expression(0)
-		p.take("Rbracket")
-		rhs := node("Identity")
-		if p.current(0) != "Flatten" {
-			rhs = p.projection(21)
+	switch next {
+	case tokLbracket, tokFilter:
+		return p.expression(rbp)
+	case tokDot:
+		p.advance()
+		return p.parseDotRHS(rbp)
+	}
+	return nil, syntaxError("Sytanx error, unexpected token")
+}
+
+// parseMultiselectList: `[a, b]`; the comma between elements is optional, a trailing one is an
+// error.
+func (p *parser) parseMultiselectList() (*js.Object, error) {
+	var expressions []*js.Object
+	for p.lookahead(0) != tokRbracket {
+		expression, err := p.expression(0)
+		if err != nil {
+			return nil, err
 		}
-		return branch("FilterProjection", three(left, rhs, condition))
-	}
-	if k == "Flatten" {
-		return branch("Projection", two(branch("Flatten", one(left)), p.projection(9)))
-	}
-	if p.power(k) == 5 {
-		cmp := named("Comparator", str(k))
-		put(cmp, "children", two(left, p.expression(5)))
-		return cmp
-	}
-	if k == "Lbracket" {
-		if p.current(0) == "Colon" || p.current(0) == "Number" {
-			return p.bracket(left)
+		expressions = append(expressions, expression)
+		if p.lookahead(0) == tokComma {
+			p.advance()
+			if p.lookahead(0) == tokRbracket {
+				return nil, syntaxError("Unexpected token Rbracket")
+			}
 		}
-		p.take("Star")
-		p.take("Rbracket")
-		return branch("Projection", two(left, p.projection(20)))
 	}
-	panic("syntax")
+	p.advance()
+	return branch("MultiSelectList", expressions...), nil
+}
+
+// parseMultiselectHash: `{k: v, …}`; as in jmespath, the comma between pairs is optional too.
+func (p *parser) parseMultiselectHash() (*js.Object, error) {
+	var pairs []*js.Object
+	for {
+		keyToken := p.lookaheadToken(0)
+		if keyToken.typ != tokUnquotedIdentifier && keyToken.typ != tokQuotedIdentifier {
+			return nil, syntaxError("Expecting an identifier token")
+		}
+		p.advance()
+		if err := p.match(tokColon); err != nil {
+			return nil, err
+		}
+		value, err := p.expression(0)
+		if err != nil {
+			return nil, err
+		}
+		pair := nodeWith("KeyValuePair", "name", keyToken.value)
+		pair.Set("value", value)
+		pairs = append(pairs, pair)
+		if p.lookahead(0) == tokComma {
+			p.advance()
+		} else if p.lookahead(0) == tokRbrace {
+			p.advance()
+			return branch("MultiSelectHash", pairs...), nil
+		}
+	}
 }

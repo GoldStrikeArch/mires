@@ -82,5 +82,8 @@ js_bindings! {
     #[js(method = "localeCompare")] pub fn locale_compare(v: V,b: V) -> i32;
     #[js(method = "join")] pub fn join(v: V,sep: V) -> V;
     #[js(method = "sort")] pub fn sort(v: V) -> V;
+    #[js(method = "sort")] pub fn sort_with(v: V, comparator: V) -> V;
+    #[js(call = "Math.max")] pub fn math_max(a: f64, b: f64) -> f64;
+    #[js(call = "Math.min")] pub fn math_min(a: f64, b: f64) -> f64;
     #[js(method = "reverse")] pub fn reverse(v: V) -> V;
 }

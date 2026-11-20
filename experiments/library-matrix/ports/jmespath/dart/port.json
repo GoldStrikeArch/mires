@@ -2,6 +2,6 @@
   "schema": 1,
   "library": "jmespath",
   "language": "dart",
-  "boundary": "The target compiles expressions with a Pratt parser and visits the AST against JSON values.",
+  "boundary": "run(input: Input) over dart:js_interop extension types, no copy: the document stays a JSAny? (jmespath returns parts of it and compares them with ===), AST nodes are JSObjects in jmespath's property order seen through an extension type, expressions are Dart strings (JS strings on the web), and each result is a JSObject { value } or { error } with the reference's category. main() publishes run on globalThis.__matrixExports for the generated facade.",
   "entry": "src/main.dart"
 }

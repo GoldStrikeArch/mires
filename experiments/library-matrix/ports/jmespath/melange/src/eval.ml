@@ -9,10 +9,15 @@ let object_kind v=let t=kind v in t="object"||t="expref"
 let falsy v=match kind v with
   |"null"->true|"boolean"->strict v(bool false)|"array"|"string"->length v=0|"object"|"expref"->length(keys v)=0|_->false
 let every n f=let rec loop i=i=n||f i&&loop(i+1)in loop 0
+(* jmespath's strictDeepEqual: ===, then the same Object.prototype.toString tag (expression
+   references are objects there), then by content. Objects compare every own key of a against
+   b[key], so an undefined value equals a missing key, then require b's own keys to be among a's. *)
 let rec equal a b=
-  if strict a b then true else let t=kind a in
-  if t<>kind b then false else if t="array"then length a=length b && every(length a)(fun i->equal(at a i)(at b i))
-  else if t="object"then let ks=keys a in length ks=length(keys b)&&every(length ks)(fun i->let k=at ks i in equal(prop a k)(prop b k))else false
+  if strict a b then true else let tag v=match kind v with "expref"->"object"|t->t in let t=tag a in
+  if t<>tag b then false else if t="array"then length a=length b && every(length a)(fun i->equal(at a i)(at b i))
+  else if t="object"then let ka=keys a and kb=keys b in
+    every(length ka)(fun i->let k=at ka i in equal(prop a k)(prop b k))&&every(length kb)(fun i->index ka(at kb i)>=0)
+  else false
 let cmp a b=
   let primitive v=if typeof v="object"&&not(strict v nil)then as_string v else v in
   let x=primitive a and y=primitive b in
@@ -37,21 +42,24 @@ let rec eval n v=
   |"Field"->if not(object_kind v)then nil else let x=prop v(get n "name")in if strict x und then nil else x
   |"Identity"|"Current"->v|"Literal"->get n "value"|"Pipe"|"IndexExpression"|"Subexpression"->eval(child n 1)(arg 0)
   |"Index"->if not(is_array v)then nil else let f=number(get n "value")in let p=if f<0. then f+.float_of_int(length v)else f in
-    if p>=0.&&p<float_of_int(length v)then at v(int_of_float p)else nil
+    (* value[index], and null for undefined: off the end, or an undefined element (`[3:0:-]`) *)
+    let x=if p>=0.&&p<float_of_int(length v)then at v(int_of_float p)else und in if strict x und then nil else x
   |"Slice"->if not(is_array v)then nil else begin
+    (* computeSliceParams in JS numbers: the bounds are parseInt results, so they may be NaN
+       (`[0:3:-]`) or past 2^53, and the loop reads value[i] as it goes, undefined one past the end *)
     let p = child n 2 in
     let step = if strict p nil then 1. else number p in
     if step = 0. then raise (Error "invalid-value");
     let len = float_of_int (length v) in
-    let low, high = if step < 0. then -1., len -. 1. else 0., len in
-    let bound x default =
-      if strict x nil then default else
-      let raw = number x in
-      max low (min high (if raw < 0. then raw +. len else raw)) in
-    let i = ref (bound (child n 0) (if step < 0. then high else low)) in
-    let stop = bound (child n 1) (if step < 0. then low else high) in
+    let cap x =
+      if x < 0. then (let y = x +. len in if y < 0. then (if step < 0. then -1. else 0.) else y)
+      else if x >= len then (if step < 0. then len -. 1. else len)
+      else x in
+    let bound x default = if strict x nil then default else cap (number x) in
+    let i = ref (bound (child n 0) (if step < 0. then len -. 1. else 0.)) in
+    let stop = bound (child n 1) (if step < 0. then -1. else len) in
     let out = array () in
-    while (if step < 0. then !i > stop else !i < stop) do
+    while (if step > 0. then !i < stop else !i > stop) do
       push out (at v (int_of_float !i));
       i := !i +. step
     done;
@@ -59,9 +67,12 @@ let rec eval n v=
   end
   |"Projection"|"ValueProjection"|"FilterProjection"->let base=arg 0 in
     let src=if k<>"ValueProjection"then base else if object_kind base then values base else nil in
-    if not(is_array src)then nil else let out=array()in
-    for i=0 to length src-1 do let x=at src i in if k<>"FilterProjection"||not(falsy(eval(child n 2)x))then
-      let y=eval(child n 1)x in if not(strict y nil)then push out y done;out
+    if not(is_array src)then nil else
+    (* every condition first, then the projection, as jmespath does: the first error is its own *)
+    let src=if k<>"FilterProjection"then src else begin let kept=array()in
+      for i=0 to length src-1 do let x=at src i in if not(falsy(eval(child n 2)x))then push kept x done;kept end in
+    let out=array()in
+    for i=0 to length src-1 do let y=eval(child n 1)(at src i)in if not(strict y nil)then push out y done;out
   |"Flatten"->let src=arg 0 in if not(is_array src)then nil else let out=array()in
     for i=0 to length src-1 do let x=at src i in if is_array x then (for j=0 to length x-1 do push out(at x j) done)else push out x done;out
   |"Comparator"->let a=arg 0 in let b=arg 1 in
@@ -86,7 +97,7 @@ and call name args=
     num(if name="avg"then !total/.float_of_int(length a)else !total)
   |"contains"->bool(index a b>=0)|"starts_with"->bool(last_index a b=0)|"ends_with"->bool(index_from a b(length a-length b)>=0)
   |"length"->num(float_of_int(if kind a="object"then length(keys a)else length a))
-  |"join"->join b a|"type"->str(kind a)|"keys"->keys a|"values"->values a|"to_array"->if is_array a then a else list[a]
+  |"join"->join b a|"type"->(match kind a with "number"|"string"|"array"|"object"|"boolean"|"expref"|"null" as t->str t|_->und)|"keys"->keys a|"values"->values a|"to_array"->if is_array a then a else list[a]
   |"to_number"->if typeof a="number"then a else if typeof a="string"&&not(Float.is_nan(number a))then num(number a)else nil
   |"to_string"->if typeof a="string"then a else json a
   |"not_null"->let rec loop i=if i=length args then nil else let x=at args i in if strict x nil then loop(i+1)else x in loop 0
@@ -95,19 +106,37 @@ and call name args=
   |"sort"->sorted(slice a 0(length a))
   |"merge"->let out=obj()in for i=0 to length args-1 do let x=at args i in
     if not(strict x nil||strict x und)then let ks=keys x in for j=0 to length ks-1 do let k=at ks j in put out k(prop x k)done done;out
-  |"max"|"min"->if length a=0 then nil else let best=ref(at a 0)in
-    for i=1 to length a-1 do let x=at a i in let d=if typeof x="string"then locale_cmp x !best else Option.value ~default:0(cmp x !best)in
-      if (if name="min"then d<0 else d>0)then best:=x done;!best
+  |"max"|"min"->let max_=name="max"in if length a=0 then nil
+    else if typeof(at a 0)="number"then begin
+      (* Math.max.apply / Math.min.apply: NaN wins, and +0 is larger than -0 *)
+      let best=ref(if max_ then neg_infinity else infinity)in
+      for i=0 to length a-1 do best:=(if max_ then math_max else math_min) !best(number(at a i))done;num !best end
+    else let best=ref(at a 0)in
+    for i=1 to length a-1 do let x=at a i in
+      if (if max_ then locale_cmp !best x<0 else locale_cmp x !best<0)then best:=x done;!best
   |"map"->let out=array()in for i=0 to length b-1 do push out(eval a(at b i))done;out
   |"min_by"|"max_by"->let max_=name="max_by"in let extreme=ref(num(if max_ then neg_infinity else infinity)) and out=ref und in
     for i=0 to length a-1 do let x=at a i in let key=eval b x in
       if kind key<>"number"&&kind key<>"string"then raise(Error "invalid-type");
       (match cmp key !extreme with Some d when (if max_ then d>0 else d<0)->extreme:=key;out:=x|_->())done;!out
-  |"sort_by"->let out=array()in if length a>0 then begin
-    let ty=kind(eval b(at a 0))in if ty<>"number"&&ty<>"string"then raise(Error "invalid-type");
-    let pairs=Array.init(length a)(fun i->let item=at a i in let key=eval b item in
-      if kind key<>ty then raise(Error "invalid-type");key,item)in
-    Array.stable_sort(fun (x,_) (y,_)->Option.value ~default:0(cmp x y))pairs;
-    Array.iter(fun (_,item)->push out item)pairs
-  end;out
+  |"sort_by"->if length a=0 then array() else begin
+    (* decorate with the index, sort with the engine's Array.prototype.sort and check each key's type
+       inside the comparator, as jmespath does. jmespath's first error ends its sort; here the
+       comparator keeps that error and answers 0 to the calls the engine makes after it, and the
+       result is discarded. With NaN keys the comparator is inconsistent, and the engine's
+       algorithm decides the order. *)
+    let items=slice a 0(length a)in
+    let ty=kind(eval b(at items 0))in if ty<>"number"&&ty<>"string"then raise(Error "invalid-type");
+    let decorated=array()in for i=0 to length items-1 do push decorated(num(float_of_int i))done;
+    let failure=ref None in
+    let compare_keys x y=match !failure with Some _->0. |None->
+      (try let i=int_of_float(number x)and j=int_of_float(number y)in
+        let ka=eval b(at items i)in let kb=eval b(at items j)in
+        if kind ka<>ty||kind kb<>ty then raise(Error "invalid-type");
+        (match cmp ka kb with Some c when c>0->1. |Some c when c<0-> -1. |_->float_of_int(i-j))
+      with Error c->failure:=Some c;0.)in
+    sort_with decorated compare_keys;
+    (match !failure with Some c->raise(Error c)|None->());
+    let out=array()in for i=0 to length decorated-1 do push out(at items(int_of_float(number(at decorated i))))done;out
+  end
   |_->raise(Error "unknown-function")

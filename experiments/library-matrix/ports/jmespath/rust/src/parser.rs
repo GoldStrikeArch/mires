@@ -9,7 +9,7 @@ struct Token {
     value: V,
 }
 
-fn letter(c: u32) -> bool {
+fn is_alpha(c: u32) -> bool {
     (65..=90).contains(&c) || (97..=122).contains(&c) || c == 95
 }
 fn digit(c: u32) -> bool {
@@ -29,8 +29,8 @@ fn lex(source: V) -> Result<Vec<Token>, &'static str> {
         i += 1;
         let next = if i < length { unit(source, i) } else { 0 };
         let mut value = und();
-        let kind = if letter(c) {
-            while i < length && (letter(unit(source, i)) || digit(unit(source, i))) {
+        let kind = if is_alpha(c) {
+            while i < length && (is_alpha(unit(source, i)) || digit(unit(source, i))) {
                 i += 1;
             }
             value = slice(source, start, i);
@@ -142,8 +142,12 @@ fn lex(source: V) -> Result<Vec<Token>, &'static str> {
     Ok(tokens)
 }
 
-fn power(k: &str) -> i32 {
-    match k {
+/// jmespath's `bindingPower` table. It has no entry for Colon and Literal: `rbp < bindingPower[Colon]`
+/// is false, and so is `bindingPower[Literal] < 10` in `_parseProjectionRHS`, which therefore
+/// rejects a literal after a projection.
+fn power(k: &str) -> Option<i32> {
+    Some(match k {
+        "Colon" | "Literal" => return None,
         "Pipe" => 1,
         "Or" => 2,
         "And" => 3,
@@ -157,7 +161,7 @@ fn power(k: &str) -> i32 {
         "Lbracket" => 55,
         "Lparen" => 60,
         _ => 0,
-    }
+    })
 }
 
 struct Parser {
@@ -186,7 +190,7 @@ impl Parser {
     fn expr(&mut self, rbp: i32) -> Answer {
         let token = self.next()?;
         let mut left = self.nud(token)?;
-        while rbp < power(self.look(0)) {
+        while power(self.look(0)).is_some_and(|p| rbp < p) {
             let op = self.next()?;
             left = self.led(op.kind, left)?;
         }
@@ -194,7 +198,7 @@ impl Parser {
     }
     fn projection(&mut self, rbp: i32) -> Answer {
         let k = self.look(0);
-        if power(k) < 10 {
+        if power(k).is_some_and(|p| p < 10) {
             Ok(node("Identity"))
         } else {
             match k {
@@ -326,14 +330,9 @@ impl Parser {
                 children("ValueProjection", &[left, self.projection(40)?])
             }
             "Dot" => children("Subexpression", &[left, self.dot(40)?]),
-            "Or" | "And" | "Pipe" => children(
-                match k {
-                    "Or" => "OrExpression",
-                    "And" => "AndExpression",
-                    _ => "Pipe",
-                },
-                &[left, self.expr(power(k))?],
-            ),
+            "Or" => children("OrExpression", &[left, self.expr(2)?]),
+            "And" => children("AndExpression", &[left, self.expr(3)?]),
+            "Pipe" => children("Pipe", &[left, self.expr(1)?]),
             "Lparen" => {
                 if left.is_undefined() {
                     return Err("syntax");

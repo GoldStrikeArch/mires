@@ -1,376 +1,276 @@
-open Host
+// jmespath's Pratt parser, method by method. Nodes are plain JS objects with jmespath's property
+// order, built as object literals, since `compile` returns them and `&expr` passes them around as
+// values. A parse result is `option<node>`: `None` is jmespath's `undefined` node.
 
-exception Error(string)
-let syntax = () => throw(Error("syntax"))
-type token = {kind: string, value: value}
-type parser = {tokens: array<token>, mutable pos: int}
-let node = t => {
-  let n = obj()
-  set(n, "type", str(t))
-  n
-}
-let named = (t, v) => {
-  let n = node(t)
-  set(n, "name", v)
-  n
-}
-let leaf = (t, v) => {
-  let n = node(t)
-  set(n, "value", v)
-  n
-}
-let list = xs => {
-  let a = array()
-  List.forEach(xs, v => push(a, v))
-  a
-}
-let children = (t, xs) => {
-  let n = node(t)
-  set(n, "children", list(xs))
-  n
-}
-let letter = c => (c >= 65 && c <= 90) || ((c >= 97 && c <= 122) || c == 95)
-let digit = c => c >= 48 && c <= 57
-let json_value = v =>
-  try parse(v) catch {
-  | _ => syntax()
+open Host
+open Lexer
+
+let node = (nodeType): option<node> => Some(nodeOf({"type": nodeType}))
+let identity = () => node("Identity")
+let branch = (nodeType, children: array<option<node>>) =>
+  Some(nodeOf({"type": nodeType, "children": children}))
+
+let power = tokenType => bindingPower(tokenType)->Option.getOrThrow
+
+// `rbp < bindingPower[type]`, false where jmespath's table has no entry.
+let bindsTighterThan = (tokenType, rbp) =>
+  switch bindingPower(tokenType) {
+  | Some(power) => rbp < power
+  | None => false
   }
-let lex = source => {
-  let n = length(source)
-  let i = ref(0)
-  let tokens = ref(list{})
-  let add = (k, v) => tokens := list{{kind: k, value: v}, ...tokens.contents}
-  while i.contents < n {
-    let start = i.contents
-    let c = unit_at(source, i.contents)
-    i := i.contents + 1
-    let next = if i.contents < n {
-      unit_at(source, i.contents)
+
+let comparatorName = tokenType =>
+  switch tokenType {
+  | EQ => "EQ"
+  | NE => "NE"
+  | GT => "GT"
+  | GTE => "GTE"
+  | LT => "LT"
+  | _ => "LTE"
+  }
+
+type parser = {tokens: array<token>, mutable index: int}
+
+let lookaheadToken = (p, number) => p.tokens->Array.getUnsafe(p.index + number)
+let lookahead = (p, number) => lookaheadToken(p, number).tokenType
+let advance = p => p.index = p.index + 1
+
+let match_ = (p, tokenType) =>
+  if lookahead(p, 0) == tokenType {
+    advance(p)
+  } else {
+    throw(Errors.syntaxError("Unexpected token"))
+  }
+
+let errorToken = () => Errors.syntaxError("Invalid token")
+
+let rec expression = (p, rbp) => {
+  let leftToken = lookaheadToken(p, 0)
+  advance(p)
+  let left = ref(nud(p, leftToken))
+  let currentToken = ref(lookahead(p, 0))
+  while bindsTighterThan(currentToken.contents, rbp) {
+    advance(p)
+    left := led(p, currentToken.contents, left.contents)
+    currentToken := lookahead(p, 0)
+  }
+  left.contents
+}
+
+and nud = (p, token) =>
+  switch token.tokenType {
+  | Literal => Some(nodeOf({"type": "Literal", "value": token.value}))
+  | UnquotedIdentifier => Some(nodeOf({"type": "Field", "name": token.value}))
+  | QuotedIdentifier =>
+    let field = Some(nodeOf({"type": "Field", "name": token.value}))
+    if lookahead(p, 0) == Lparen {
+      throw(Errors.syntaxError("Quoted identifier not allowed for function names."))
+    }
+    field
+  | Not => branch("NotExpression", [expression(p, power(Not))])
+  | Star =>
+    let right = lookahead(p, 0) == Rbracket ? identity() : parseProjectionRHS(p, power(Star))
+    branch("ValueProjection", [identity(), right])
+  | Filter => led(p, token.tokenType, identity())
+  | Lbrace => parseMultiselectHash(p)
+  | Flatten =>
+    let left = branch("Flatten", [identity()])
+    branch("Projection", [left, parseProjectionRHS(p, power(Flatten))])
+  | Lbracket =>
+    if lookahead(p, 0) == Number || lookahead(p, 0) == Colon {
+      projectIfSlice(p, identity(), parseIndexExpression(p))
+    } else if lookahead(p, 0) == Star && lookahead(p, 1) == Rbracket {
+      advance(p)
+      advance(p)
+      branch("Projection", [identity(), parseProjectionRHS(p, power(Star))])
     } else {
-      0
+      parseMultiselectList(p)
     }
-    if letter(c) {
-      while (
-        i.contents < n && {
-            let ch = unit_at(source, i.contents)
-            letter(ch) || digit(ch)
-          }
-      ) {
-        i := i.contents + 1
-      }
-      add("Field", slice(source, start, i.contents))
-    } else if c == 45 || digit(c) {
-      while (
-        i.contents < n && {
-            let ch = unit_at(source, i.contents)
-            ch == 45 || digit(ch)
-          }
-      ) {
-        i := i.contents + 1
-      }
-      add("Number", num(parse_int(slice(source, start, i.contents))))
-    } else if c == 34 || (c == 39 || c == 96) {
-      while i.contents < n && unit_at(source, i.contents) != c {
-        if (
-          unit_at(source, i.contents) == 92 &&
-            (i.contents + 1 < n &&
-            (unit_at(source, i.contents + 1) == c || unit_at(source, i.contents + 1) == 92))
-        ) {
-          i := i.contents + 1
-        }
-        i := i.contents + 1
-      }
-      let raw = slice(source, start + 1, i.contents)
-      i := i.contents + 1
-      if c == 34 {
-        add("Quoted", json_value(slice(source, start, i.contents)))
-      } else if c == 39 {
-        add("Literal", replace(raw, "\\'", "'"))
-      } else {
-        let v = replace(trim_start(raw), "\\`", "`")
-        let first = if length(v) == 0 {
-          0
-        } else {
-          unit_at(v, 0)
-        }
-        let quoted = () => json_value(concat(concat(str("\""), v), str("\"")))
-        let x = if (
-          first == 91 ||
-            (first == 123 ||
-            (first == 34 || List.some(list{"true", "false", "null"}, x => x == text(v))))
-        ) {
-          json_value(v)
-        } else if digit(first) || first == 45 {
-          try parse(v) catch {
-          | _ => quoted()
-          }
-        } else {
-          quoted()
-        }
-        add("Literal", x)
-      }
-    } else if c != 32 && (c != 9 && c != 10) {
-      let two = switch (c, next) {
-      | (91, 63) => "Filter"
-      | (91, 93) => "Flatten"
-      | (38, 38) => "And"
-      | (124, 124) => "Or"
-      | (33, 61) => "NE"
-      | (61, 61) => "EQ"
-      | (60, 61) => "LTE"
-      | (62, 61) => "GTE"
-      | _ => ""
-      }
-      let k = if two != "" {
-        i := i.contents + 1
-        two
-      } else {
-        switch c {
-        | 60 => "LT"
-        | 62 => "GT"
-        | 33 => "Not"
-        | 38 => "Expref"
-        | 124 => "Pipe"
-        | 91 => "Lbracket"
-        | 93 => "Rbracket"
-        | 123 => "Lbrace"
-        | 125 => "Rbrace"
-        | 40 => "Lparen"
-        | 41 => "Rparen"
-        | 42 => "Star"
-        | 64 => "Current"
-        | 44 => "Comma"
-        | 46 => "Dot"
-        | 58 => "Colon"
-        | _ => syntax()
-        }
-      }
-      add(k, und)
-    }
+  | Current => node("Current")
+  | Expref => branch("ExpressionReference", [expression(p, power(Expref))])
+  // `args[0]`: undefined for `()`.
+  | Lparen =>
+    let args = parseArguments(p, ~commas=false)
+    Array.length(args) == 0 ? None : args->Array.getUnsafe(0)
+  | _ => throw(errorToken())
   }
-  add("EOF", und)
-  List.toArray(List.reverse(tokens.contents))
-}
-let power = x =>
-  switch x {
-  | "Pipe" => 1
-  | "Or" => 2
-  | "And" => 3
-  | "EQ" | "NE" | "GT" | "LT" | "GTE" | "LTE" => 5
-  | "Flatten" => 9
-  | "Star" => 20
-  | "Filter" => 21
-  | "Dot" => 40
-  | "Not" => 45
-  | "Lbrace" => 50
-  | "Lbracket" => 55
-  | "Lparen" => 60
-  | _ => 0
-  }
-let look = (p, n) =>
-  if p.pos + n < Array.length(p.tokens) {
-    Array.getUnsafe(p.tokens, p.pos + n).kind
-  } else {
-    "EOF"
-  }
-let next = p => {
-  if p.pos >= Array.length(p.tokens) {
-    syntax()
-  }
-  let t = Array.getUnsafe(p.tokens, p.pos)
-  p.pos = p.pos + 1
-  t
-}
-let take = (p, k) =>
-  if next(p).kind != k {
-    syntax()
-  }
-let rec expr = (p, rbp) => {
-  let lhs = ref(nud(p, next(p)))
-  while rbp < power(look(p, 0)) {
-    let k = next(p).kind
-    lhs := led(p, k, lhs.contents)
-  }
-  lhs.contents
-}
-and projection = (p, rbp) => {
-  let k = look(p, 0)
-  if power(k) < 10 {
-    node("Identity")
-  } else {
-    switch k {
-    | "Lbracket" | "Filter" => expr(p, rbp)
-    | "Dot" =>
-      ignore(next(p))
-      dot(p, rbp)
-    | _ => syntax()
-    }
-  }
-}
-and dot = (p, rbp) =>
-  switch look(p, 0) {
-  | "Field" | "Quoted" | "Star" => expr(p, rbp)
-  | "Lbracket" =>
-    ignore(next(p))
-    multi(p)
-  | "Lbrace" =>
-    ignore(next(p))
-    hash(p)
-  | _ => und
-  }
-and multi = p => {
-  let acc = ref(list{})
-  while look(p, 0) != "Rbracket" {
-    acc := list{expr(p, 0), ...acc.contents}
-    if look(p, 0) == "Comma" {
-      ignore(next(p))
-      if look(p, 0) == "Rbracket" {
-        syntax()
-      }
-    }
-  }
-  take(p, "Rbracket")
-  children("MultiSelectList", List.reverse(acc.contents))
-}
-and hash = p => {
-  let rec loop = acc => {
-    let n = next(p)
-    if n.kind != "Field" && n.kind != "Quoted" {
-      syntax()
-    }
-    take(p, "Colon")
-    let pair = named("KeyValuePair", n.value)
-    set(pair, "value", expr(p, 0))
-    if look(p, 0) == "Comma" {
-      ignore(next(p))
-      loop(list{pair, ...acc})
-    } else if look(p, 0) == "Rbrace" {
-      ignore(next(p))
-      children("MultiSelectHash", List.reverse(list{pair, ...acc}))
+
+and led = (p, tokenName, left) =>
+  switch tokenName {
+  | Dot =>
+    let rbp = power(Dot)
+    if lookahead(p, 0) != Star {
+      branch("Subexpression", [left, parseDotRHS(p, rbp)])
     } else {
-      loop(list{pair, ...acc})
+      advance(p)
+      branch("ValueProjection", [left, parseProjectionRHS(p, rbp)])
     }
-  }
-  loop(list{})
-}
-and bracket = (p, lhs) =>
-  if look(p, 0) == "Colon" || look(p, 1) == "Colon" {
-    let parts = Array.make(~length=3, nil)
-    let i = ref(0)
-    while look(p, 0) != "Rbracket" && i.contents < 3 {
-      let t = next(p)
-      if t.kind == "Colon" {
-        i := i.contents + 1
-      } else if t.kind == "Number" {
-        parts[i.contents] = t.value
-      } else {
-        syntax()
-      }
+  | Pipe => branch("Pipe", [left, expression(p, power(Pipe))])
+  | Or => branch("OrExpression", [left, expression(p, power(Or))])
+  | And => branch("AndExpression", [left, expression(p, power(And))])
+  | Lparen =>
+    switch left {
+    // `left.name`: a TypeError (syntax) when there is no left node, as after `()`.
+    | None => throw(Errors.syntaxError("Function call without a name"))
+    | Some(left) =>
+      let name = left.name
+      Some(nodeOf({"type": "Function", "name": name, "children": parseArguments(p, ~commas=true)}))
     }
-    take(p, "Rbracket")
-    let ix = children("IndexExpression", list{lhs, children("Slice", List.fromArray(parts))})
-    children("Projection", list{ix, projection(p, 20)})
-  } else {
-    let t = next(p)
-    take(p, "Rbracket")
-    children("IndexExpression", list{lhs, leaf("Index", t.value)})
+  | Filter =>
+    let condition = expression(p, 0)
+    match_(p, Rbracket)
+    let right = lookahead(p, 0) == Flatten ? identity() : parseProjectionRHS(p, power(Filter))
+    branch("FilterProjection", [left, right, condition])
+  | Flatten =>
+    branch("Projection", [branch("Flatten", [left]), parseProjectionRHS(p, power(Flatten))])
+  | EQ | NE | GT | GTE | LT | LTE => parseComparator(p, left, tokenName)
+  | Lbracket =>
+    let token = lookaheadToken(p, 0)
+    if token.tokenType == Number || token.tokenType == Colon {
+      projectIfSlice(p, left, parseIndexExpression(p))
+    } else {
+      match_(p, Star)
+      match_(p, Rbracket)
+      branch("Projection", [left, parseProjectionRHS(p, power(Star))])
+    }
+  | _ => throw(errorToken())
   }
-and args = (p, commas) => {
-  let acc = ref(list{})
-  while look(p, 0) != "Rparen" {
-    let v = if look(p, 0) == "Current" {
-      ignore(next(p))
+
+// The argument loops of `(…)` and of a function call. An argument that starts with `@` is the bare
+// Current node, so `abs(@.a)` fails on the `.` as in jmespath. Calls may separate arguments with
+// commas; parentheses may not.
+and parseArguments = (p, ~commas) => {
+  let args = []
+  while lookahead(p, 0) != Rparen {
+    let argument = if lookahead(p, 0) == Current {
+      advance(p)
       node("Current")
     } else {
-      expr(p, 0)
+      expression(p, 0)
     }
-    acc := list{v, ...acc.contents}
-    if commas && look(p, 0) == "Comma" {
-      ignore(next(p))
+    if commas && lookahead(p, 0) == Comma {
+      match_(p, Comma)
     }
+    args->Array.push(argument)
   }
-  take(p, "Rparen")
-  List.reverse(acc.contents)
+  match_(p, Rparen)
+  args
 }
-and nud = (p, t) =>
-  switch t.kind {
-  | "Literal" => leaf("Literal", t.value)
-  | "Quoted" if look(p, 0) == "Lparen" => syntax()
-  | "Field" | "Quoted" => named("Field", t.value)
-  | "Not" => children("NotExpression", list{expr(p, 45)})
-  | "Current" => node("Current")
-  | "Expref" => children("ExpressionReference", list{expr(p, 0)})
-  | "Star" => children("ValueProjection", list{node("Identity"), projection(p, 20)})
-  | "Filter" | "Flatten" => led(p, t.kind, node("Identity"))
-  | "Lbrace" => hash(p)
-  | "Lbracket" =>
-    if look(p, 0) == "Colon" || look(p, 0) == "Number" {
-      bracket(p, node("Identity"))
-    } else if look(p, 0) == "Star" && look(p, 1) == "Rbracket" {
-      p.pos = p.pos + 2
-      children("Projection", list{node("Identity"), projection(p, 20)})
-    } else {
-      multi(p)
-    }
-  | "Lparen" =>
-    switch args(p, false) {
-    | list{h, ..._} => h
-    | list{} => und
-    }
-  | _ => syntax()
+
+and parseIndexExpression = p =>
+  if lookahead(p, 0) == Colon || lookahead(p, 1) == Colon {
+    parseSliceExpression(p)
+  } else {
+    let index = nodeOf({"type": "Index", "value": lookaheadToken(p, 0).value})
+    advance(p)
+    match_(p, Rbracket)
+    index
   }
-and led = (p, k, lhs) =>
-  switch k {
-  | "Dot" if look(p, 0) == "Star" =>
-    ignore(next(p))
-    children("ValueProjection", list{lhs, projection(p, 40)})
-  | "Dot" => children("Subexpression", list{lhs, dot(p, 40)})
-  | "Or" | "And" | "Pipe" =>
-    children(
-      if k == "Pipe" {
-        k
-      } else {
-        k ++ "Expression"
-      },
-      list{lhs, expr(p, power(k))},
-    )
-  | "Lparen" =>
-    if strict(lhs, und) {
-      syntax()
+
+and projectIfSlice = (p, left, right) => {
+  let indexExpr = branch("IndexExpression", [left, Some(right)])
+  stringValue(right.nodeType) == Some("Slice")
+    ? branch("Projection", [indexExpr, parseProjectionRHS(p, power(Star))])
+    : indexExpr
+}
+
+// `[start:stop:step]`, each part optional; a later number in one part replaces an earlier one.
+and parseSliceExpression = p => {
+  let parts = [jsNull, jsNull, jsNull]
+  let index = ref(0)
+  let currentToken = ref(lookahead(p, 0))
+  while currentToken.contents != Rbracket && index.contents < 3 {
+    switch currentToken.contents {
+    | Colon =>
+      index := index.contents + 1
+      advance(p)
+    | Number =>
+      parts->Array.setUnsafe(index.contents, lookaheadToken(p, 0).value)
+      advance(p)
+    | _ => throw(Errors.syntaxError("Syntax error, unexpected token"))
     }
-    let n = named("Function", get(lhs, "name"))
-    set(n, "children", list(args(p, true)))
-    n
-  | "Filter" =>
-    let condition = expr(p, 0)
-    take(p, "Rbracket")
-    let right = if look(p, 0) == "Flatten" {
-      node("Identity")
-    } else {
-      projection(p, 21)
-    }
-    children("FilterProjection", list{lhs, right, condition})
-  | "Flatten" => children("Projection", list{children("Flatten", list{lhs}), projection(p, 9)})
-  | "EQ" | "NE" | "LT" | "GT" | "LTE" | "GTE" =>
-    let n = named("Comparator", str(k))
-    let rhs = expr(p, 5)
-    set(n, "children", list(list{lhs, rhs}))
-    n
-  | "Lbracket" =>
-    if look(p, 0) == "Colon" || look(p, 0) == "Number" {
-      bracket(p, lhs)
-    } else {
-      take(p, "Star")
-      take(p, "Rbracket")
-      children("Projection", list{lhs, projection(p, 20)})
-    }
-  | _ => syntax()
+    currentToken := lookahead(p, 0)
   }
-let compile = s => {
-  let p = {tokens: lex(s), pos: 0}
-  let v = expr(p, 0)
-  if look(p, 0) != "EOF" {
-    syntax()
+  match_(p, Rbracket)
+  nodeOf({"type": "Slice", "children": parts})
+}
+
+and parseComparator = (p, left, comparator) => {
+  let right = expression(p, power(comparator))
+  Some(nodeOf({"type": "Comparator", "name": comparatorName(comparator), "children": [left, right]}))
+}
+
+// Undefined (no error) when nothing that can follow a dot follows it, as in jmespath.
+and parseDotRHS = (p, rbp) =>
+  switch lookahead(p, 0) {
+  | UnquotedIdentifier | QuotedIdentifier | Star => expression(p, rbp)
+  | Lbracket =>
+    match_(p, Lbracket)
+    parseMultiselectList(p)
+  | Lbrace =>
+    match_(p, Lbrace)
+    parseMultiselectHash(p)
+  | _ => None
   }
-  v
+
+and parseProjectionRHS = (p, rbp) => {
+  let next = lookahead(p, 0)
+  switch bindingPower(next) {
+  | Some(power) if power < 10 => identity()
+  | _ if next == Lbracket || next == Filter => expression(p, rbp)
+  | _ if next == Dot =>
+    match_(p, Dot)
+    parseDotRHS(p, rbp)
+  | _ => throw(Errors.syntaxError("Sytanx error, unexpected token"))
+  }
+}
+
+// `[a, b]`; the comma between elements is optional, a trailing one is an error.
+and parseMultiselectList = p => {
+  let expressions = []
+  while lookahead(p, 0) != Rbracket {
+    expressions->Array.push(expression(p, 0))
+    if lookahead(p, 0) == Comma {
+      match_(p, Comma)
+      if lookahead(p, 0) == Rbracket {
+        throw(Errors.syntaxError("Unexpected token Rbracket"))
+      }
+    }
+  }
+  match_(p, Rbracket)
+  branch("MultiSelectList", expressions)
+}
+
+// `{k: v, …}`; as in jmespath, the comma between pairs is optional too.
+and parseMultiselectHash = p => {
+  let pairs = []
+  let finished = ref(false)
+  while !finished.contents {
+    let keyToken = lookaheadToken(p, 0)
+    if keyToken.tokenType != UnquotedIdentifier && keyToken.tokenType != QuotedIdentifier {
+      throw(Errors.syntaxError("Expecting an identifier token"))
+    }
+    advance(p)
+    match_(p, Colon)
+    let value = expression(p, 0)
+    pairs->Array.push(Some(nodeOf({"type": "KeyValuePair", "name": keyToken.value, "value": value})))
+    if lookahead(p, 0) == Comma {
+      match_(p, Comma)
+    } else if lookahead(p, 0) == Rbrace {
+      match_(p, Rbrace)
+      finished := true
+    }
+  }
+  branch("MultiSelectHash", pairs)
+}
+
+let parse = expression_ => {
+  let tokens = tokenize(expression_)
+  tokens->Array.push({tokenType: EOF, value: fromString(""), start: String.length(expression_)})
+  let p = {tokens, index: 0}
+  let ast = expression(p, 0)
+  if lookahead(p, 0) != EOF {
+    throw(Errors.syntaxError("Unexpected token type"))
+  }
+  ast
 }

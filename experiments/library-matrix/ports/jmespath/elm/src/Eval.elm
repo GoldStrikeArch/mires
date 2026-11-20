@@ -1,740 +1,1248 @@
-module Eval exposing (Step(..), bind, evaluate, map)
+module Eval exposing (Step(..), andThen, evaluate)
 
-import Char
-import Json.Encode as E
-import String
-import Values exposing (V(..), array, asNumber, asString, equal, field, fields, index, kind, put, raw, sortFields, stringValue, tag, toNumber, truth)
+{-| jmespath's TreeInterpreter and Runtime over `V`.
 
+Two JS operations have no Elm counterpart, so an evaluation can stop and ask the host: `Collate`
+for `localeCompare` (max and min of strings), `Identical` for `===` between tokens (contains). The
+host answers and the evaluation resumes from the continuation. Between those, everything is pure.
 
+`traverse` loops while each step is done, so wide arrays cost no stack.
 
--- ECMAScript uses the active locale for min/max of strings. Elm suspends only
--- that primitive and resumes from the exact comparison in the current query.
+-}
+
+import Array
+import Values exposing (Token, V(..), field, fieldList, fresh, isFalse, jsNumber, jsString, jsonText, put, relation, sortFields, strictDeepEqual)
 
 
 type Step a
     = Done a
-    | Error String
+    | Failed String
     | Collate String String (Order -> Step a)
-    | RefEq E.Value E.Value (Bool -> Step a)
+    | Identical Token (List Token) (Bool -> Step a)
 
 
-bind f result =
-    case result of
-        Done v ->
-            f v
+andThen : (a -> Step b) -> Step a -> Step b
+andThen f step =
+    case step of
+        Done a ->
+            f a
 
-        Error e ->
-            Error e
+        Failed category ->
+            Failed category
 
-        Collate a b k ->
-            Collate a b (k >> bind f)
+        Collate a b resume ->
+            Collate a b (resume >> andThen f)
 
-        RefEq a b k ->
-            RefEq a b (k >> bind f)
+        Identical target candidates resume ->
+            Identical target candidates (resume >> andThen f)
 
 
+map : (a -> b) -> Step a -> Step b
 map f =
-    bind (f >> Done)
+    andThen (f >> Done)
 
 
-traverse f xs =
-    let
-        go tail acc =
-            case tail of
-                [] ->
-                    Done (List.reverse acc)
-
-                x :: rest ->
-                    f x |> bind (\v -> go rest (v :: acc))
-    in
-    go xs []
+{-| `f` over a list in order, stopping at the first failure.
+-}
+traverse : (a -> Step b) -> List a -> Step (List b)
+traverse f items =
+    traverseHelp f items []
 
 
-children n =
-    array (field "children" n)
+traverseHelp : (a -> Step b) -> List a -> List b -> Step (List b)
+traverseHelp f items acc =
+    case items of
+        [] ->
+            Done (List.reverse acc)
+
+        x :: rest ->
+            case f x of
+                Done y ->
+                    traverseHelp f rest (y :: acc)
+
+                Failed category ->
+                    Failed category
+
+                suspended ->
+                    suspended |> andThen (\y -> traverseHelp f rest (y :: acc))
 
 
-child i n =
-    index i (children n)
+array : List V -> V
+array items =
+    Arr (fresh ()) items
 
 
-compareJS a b =
-    let
-        primitive v =
-            case raw v of
-                Obj _ ->
-                    Str (stringValue v)
+object : List ( String, V ) -> V
+object fields =
+    Obj (fresh ()) (sortFields fields)
 
-                Arr _ ->
-                    Str (stringValue v)
 
-                _ ->
-                    v
 
-        x =
-            primitive a
+-- NODES
 
-        y =
-            primitive b
-    in
-    case ( x, y ) of
-        ( Str i, Str j ) ->
-            Just (compare i j)
+
+nodeType : List ( String, V ) -> String
+nodeType fields =
+    case field "type" fields of
+        Str t ->
+            t
 
         _ ->
-            let
-                u =
-                    toNumber x
-
-                v =
-                    toNumber y
-            in
-            if isNaN u || isNaN v then
-                Nothing
-
-            else
-                Just (compare u v)
+            ""
 
 
-clamped v fallback step len =
-    if v == Null then
-        fallback
+children : List ( String, V ) -> List V
+children fields =
+    case field "children" fields of
+        Arr _ items ->
+            items
 
-    else
-        let
-            n =
-                toNumber v
-
-            i =
-                if n < 0 then
-                    len + n
-
-                else
-                    n
-        in
-        if step < 0 then
-            clamp -1 (len - 1) i
-
-        else
-            clamp 0 len i
+        _ ->
+            []
 
 
-slice n xs =
-    let
-        len =
-            toFloat (List.length xs)
-
-        stride =
-            child 2 n
-
-        step =
-            if stride == Null then
-                1
-
-            else
-                toNumber stride
-
-        start =
-            clamped (child 0 n)
-                (if step < 0 then
-                    len - 1
-
-                 else
-                    0
-                )
-                step
-                len
-
-        stop =
-            clamped (child 1 n)
-                (if step < 0 then
-                    -1
-
-                 else
-                    len
-                )
-                step
-                len
-
-        loop i acc =
-            if (step > 0 && i < stop) || (step < 0 && i > stop) then
-                loop (i + step) (index (truncate i) xs :: acc)
-
-            else
-                List.reverse acc
-    in
-    if step == 0 then
-        Error "invalid-value"
-
-    else
-        Done (Arr (loop start []))
+{-| `node.children[i]`.
+-}
+child : Int -> List ( String, V ) -> V
+child i fields =
+    children fields |> List.drop i |> List.head |> Maybe.withDefault Undefined
 
 
-evaluate n v =
-    evaluateRaw n v |> map tag
+
+-- INTERPRETER
 
 
-evaluateRaw n v =
-    let
-        k =
-            asString (field "type" n)
+{-| jmespath's `visit`.
+-}
+evaluate : V -> V -> Step V
+evaluate node value =
+    case node of
+        Obj _ fields ->
+            visit (nodeType fields) fields value
 
-        c i =
-            child i n
+        -- `node.type` of a missing node is a TypeError in jmespath.
+        _ ->
+            Failed "syntax"
 
-        eval i =
-            evaluate (c i) v
 
-        next () =
-            eval 0 |> bind (evaluate (c 1))
-
-        project base filter =
-            case raw base of
-                Arr xs ->
-                    let
-                        visit item =
-                            (if filter then
-                                evaluate (c 2) item |> map truth
-
-                             else
-                                Done True
-                            )
-                                |> bind
-                                    (\yes ->
-                                        if yes then
-                                            evaluate (c 1) item
-
-                                        else
-                                            Done Null
-                                    )
-                    in
-                    traverse visit xs |> map (List.filter ((/=) Null) >> Arr)
-
-                _ ->
-                    Done Null
-    in
-    case k of
+visit : String -> List ( String, V ) -> V -> Step V
+visit kind fields value =
+    case kind of
         "Field" ->
-            case raw v of
-                Obj _ ->
-                    let
-                        x =
-                            field (asString (field "name" n)) v
-                    in
-                    Done
-                        (if x == Missing then
-                            Null
+            case value of
+                Obj _ object_ ->
+                    case field (Values.jsString (field "name" fields)) object_ of
+                        Undefined ->
+                            Done Null
 
-                         else
-                            x
-                        )
+                        x ->
+                            Done x
 
                 _ ->
                     Done Null
-
-        "Identity" ->
-            Done v
-
-        "Current" ->
-            Done v
-
-        "Literal" ->
-            Done (field "value" n)
-
-        "Pipe" ->
-            next ()
-
-        "IndexExpression" ->
-            next ()
 
         "Subexpression" ->
-            next ()
+            evaluate (child 0 fields) value |> andThen (evaluate (child 1 fields))
+
+        "IndexExpression" ->
+            evaluate (child 0 fields) value |> andThen (evaluate (child 1 fields))
+
+        "Pipe" ->
+            evaluate (child 0 fields) value |> andThen (evaluate (child 1 fields))
 
         "Index" ->
-            case raw v of
-                Arr xs ->
-                    let
-                        ix =
-                            asNumber (field "value" n)
-
-                        len =
-                            toFloat (List.length xs)
-
-                        pos =
-                            if ix < 0 then len + ix else ix
-                    in
-                    if pos >= 0 && pos < len then
-                        Done (index (truncate pos) xs)
-
-                    else
-                        Done Null
+            case value of
+                Arr _ items ->
+                    Done (index (jsNumber (field "value" fields)) items)
 
                 _ ->
                     Done Null
 
         "Slice" ->
-            case raw v of
-                Arr xs ->
-                    slice n xs
+            case value of
+                Arr _ items ->
+                    slice (children fields) items
 
                 _ ->
                     Done Null
 
-        "Flatten" ->
-            eval 0
-                |> map
+        "Projection" ->
+            evaluate (child 0 fields) value
+                |> andThen
                     (\base ->
-                        case raw base of
-                            Arr xs ->
-                                Arr
-                                    (List.concatMap
-                                        (\x ->
-                                            case raw x of
-                                                Arr ls ->
-                                                    ls
-
-                                                _ ->
-                                                    [ x ]
-                                        )
-                                        xs
-                                    )
+                        case base of
+                            Arr _ items ->
+                                project (child 1 fields) items
 
                             _ ->
-                                Null
+                                Done Null
+                    )
+
+        "ValueProjection" ->
+            evaluate (child 0 fields) value
+                |> andThen
+                    (\base ->
+                        case base of
+                            Obj _ object_ ->
+                                project (child 1 fields) (List.map Tuple.second object_)
+
+                            _ ->
+                                Done Null
                     )
 
         "FilterProjection" ->
-            eval 0 |> bind (\base -> project base True)
-
-        "Projection" ->
-            eval 0 |> bind (\base -> project base False)
-
-        "ValueProjection" ->
-            eval 0
-                |> bind
+            evaluate (child 0 fields) value
+                |> andThen
                     (\base ->
-                        case raw base of
-                            Obj xs ->
-                                project (Arr (List.map Tuple.second xs)) False
+                        case base of
+                            Arr _ items ->
+                                -- Every condition first, then the projection: the first error is jmespath's.
+                                traverse (evaluate (child 2 fields)) items
+                                    |> andThen
+                                        (\conditions ->
+                                            List.map2 Tuple.pair items conditions
+                                                |> List.filter (Tuple.second >> isFalse >> not)
+                                                |> List.map Tuple.first
+                                                |> project (child 1 fields)
+                                        )
 
                             _ ->
                                 Done Null
                     )
 
         "Comparator" ->
-            let
-                check a b =
-                    case asString (field "name" n) of
-                        "EQ" ->
-                            equal a b
-
-                        "NE" ->
-                            not (equal a b)
-
-                        op ->
-                            case compareJS a b of
-                                Just LT ->
-                                    op == "LT" || op == "LTE"
-
-                                Just GT ->
-                                    op == "GT" || op == "GTE"
-
-                                Just EQ ->
-                                    op == "LTE" || op == "GTE"
-
-                                Nothing ->
-                                    False
-            in
-            eval 0 |> bind (\a -> eval 1 |> map (check a >> Flag))
-
-        "NotExpression" ->
-            eval 0 |> map (truth >> not >> Flag)
-
-        "AndExpression" ->
-            eval 0
-                |> bind
-                    (\a ->
-                        if truth a then
-                            eval 1
-
-                        else
-                            Done a
+            evaluate (child 0 fields) value
+                |> andThen
+                    (\first ->
+                        evaluate (child 1 fields) value
+                            |> andThen (\second -> comparator (field "name" fields) first second)
                     )
 
-        "OrExpression" ->
-            eval 0
-                |> bind
-                    (\a ->
-                        if truth a then
-                            Done a
+        "Flatten" ->
+            evaluate (child 0 fields) value
+                |> map
+                    (\base ->
+                        case base of
+                            Arr _ items ->
+                                array
+                                    (List.concatMap
+                                        (\item ->
+                                            case item of
+                                                Arr _ inner ->
+                                                    inner
 
-                        else
-                            eval 1
+                                                _ ->
+                                                    [ item ]
+                                        )
+                                        items
+                                    )
+
+                            _ ->
+                                Null
                     )
 
-        "ExpressionReference" ->
-            Done (Obj (put "jmespathType" (Str "Expref") (fields (c 0))))
+        "Identity" ->
+            Done value
 
-        "Function" ->
-            traverse (\item -> evaluate item v) (children n) |> bind (call (asString (field "name" n)))
+        "Current" ->
+            Done value
 
         "MultiSelectList" ->
-            if v == Null then
-                Done Null
+            case value of
+                Null ->
+                    Done Null
 
-            else
-                traverse (\item -> evaluate item v) (children n) |> map Arr
+                _ ->
+                    traverse (\c -> evaluate c value) (children fields) |> map array
 
         "MultiSelectHash" ->
-            let
-                pair item =
-                    evaluate (field "value" item) v |> map (Tuple.pair (asString (field "name" item)))
-            in
-            if v == Null then
-                Done Null
+            case value of
+                Null ->
+                    Done Null
+
+                _ ->
+                    traverse
+                        (\pair ->
+                            let
+                                pairFields =
+                                    fieldList pair
+                            in
+                            evaluate (field "value" pairFields) value |> map (Tuple.pair (jsString (field "name" pairFields)))
+                        )
+                        (children fields)
+                        |> map (List.foldl (\( k, v ) -> put k v) [] >> object)
+
+        "OrExpression" ->
+            evaluate (child 0 fields) value
+                |> andThen
+                    (\matched ->
+                        if isFalse matched then
+                            evaluate (child 1 fields) value
+
+                        else
+                            Done matched
+                    )
+
+        "AndExpression" ->
+            evaluate (child 0 fields) value
+                |> andThen
+                    (\first ->
+                        if isFalse first then
+                            Done first
+
+                        else
+                            evaluate (child 1 fields) value
+                    )
+
+        "NotExpression" ->
+            evaluate (child 0 fields) value |> map (isFalse >> Flag)
+
+        "Literal" ->
+            Done (field "value" fields)
+
+        "Function" ->
+            traverse (\c -> evaluate c value) (children fields) |> andThen (callFunction (field "name" fields))
+
+        "ExpressionReference" ->
+            -- jmespath tags the referenced node in place and returns the node itself: the same
+            -- node, so the same identity, each time.
+            case child 0 fields of
+                Obj token refFields ->
+                    Done (Obj token (put "jmespathType" (Str "Expref") refFields))
+
+                _ ->
+                    Failed "syntax"
+
+        _ ->
+            Failed "syntax"
+
+
+{-| `value[index]` for a JS number index, negative from the end, and null for undefined.
+-}
+index : Float -> List V -> V
+index i items =
+    let
+        length =
+            toFloat (List.length items)
+
+        position =
+            if i < 0 then
+                length + i
 
             else
-                traverse pair (children n) |> map (List.foldl (\( name, x ) -> put name x) [] >> sortFields >> Obj)
+                i
+    in
+    if 0 <= position && position < length && position == toFloat (floor position) then
+        case items |> List.drop (floor position) |> List.head of
+            Just Undefined ->
+                Null
 
-        _ ->
-            Error "syntax"
+            Just x ->
+                x
 
-
-signature name =
-    if List.member name [ "abs", "ceil", "floor" ] then
-        [ [ "number" ] ]
-
-    else if List.member name [ "avg", "sum" ] then
-        [ [ "numbers" ] ]
-
-    else if name == "contains" then
-        [ [ "string", "array" ], [ "any" ] ]
-
-    else if name == "starts_with" || name == "ends_with" then
-        [ [ "string" ], [ "string" ] ]
-
-    else if name == "length" then
-        [ [ "object", "string", "array" ] ]
-
-    else if name == "map" then
-        [ [ "expref" ], [ "array" ] ]
-
-    else if List.member name [ "max", "min", "sort" ] then
-        [ [ "numbers", "strings" ] ]
-
-    else if List.member name [ "keys", "values", "merge" ] then
-        [ [ "object" ] ]
-
-    else if List.member name [ "max_by", "min_by", "sort_by" ] then
-        [ [ "array" ], [ "expref" ] ]
-
-    else if name == "join" then
-        [ [ "string" ], [ "strings" ] ]
-
-    else if name == "reverse" then
-        [ [ "string", "array" ] ]
-
-    else if List.member name [ "to_array", "to_number", "to_string", "type", "not_null" ] then
-        [ [ "any" ] ]
+            Nothing ->
+                Null
 
     else
-        []
+        Null
 
 
-valid x target =
-    case target of
-        "any" ->
-            True
-
-        "numbers" ->
-            kind x == "array" && List.all (kind >> (==) "number") (array x)
-
-        "strings" ->
-            kind x == "array" && List.all (kind >> (==) "string") (array x)
-
-        _ ->
-            kind x == target
-
-
-minMax lower xs =
-    let
-        loop best rest =
-            case rest of
-                [] ->
-                    Done best
-
-                v :: tail ->
-                    let
-                        take ord =
-                            if
-                                ord
-                                    == (if lower then
-                                            LT
-
-                                        else
-                                            GT
-                                       )
-                            then
-                                loop v tail
-
-                            else
-                                loop best tail
-                    in
-                    case ( v, best ) of
-                        ( Str a, Str b ) ->
-                            Collate a b take
+{-| Projections keep every result except null; undefined (an empty max\_by) is kept.
+-}
+project : V -> List V -> Step V
+project right items =
+    traverse (evaluate right) items
+        |> map
+            (List.filter
+                (\x ->
+                    case x of
+                        Null ->
+                            False
 
                         _ ->
-                            take (Maybe.withDefault EQ (compareJS v best))
+                            True
+                )
+                >> array
+            )
+
+
+comparator : V -> V -> V -> Step V
+comparator name first second =
+    let
+        ordered test =
+            Done (Flag (Maybe.withDefault False (Maybe.map test (relation first second))))
     in
-    case xs of
+    case name of
+        Str "EQ" ->
+            Done (Flag (strictDeepEqual first second))
+
+        Str "NE" ->
+            Done (Flag (not (strictDeepEqual first second)))
+
+        Str "GT" ->
+            ordered ((==) GT)
+
+        Str "GTE" ->
+            ordered ((/=) LT)
+
+        Str "LT" ->
+            ordered ((==) LT)
+
+        Str "LTE" ->
+            ordered ((/=) GT)
+
+        _ ->
+            Failed "syntax"
+
+
+
+-- SLICES
+--
+-- Elm's `>` and `>=` call NaN greater than everything, so these comparisons use only `<` and `<=`,
+-- which are right about NaN, with the operands swapped where JS has `>`.
+
+
+{-| jmespath's capSliceRange, in JS numbers.
+-}
+capSliceRange : Float -> Float -> Float -> Float
+capSliceRange length actual step =
+    if actual < 0 then
+        if actual + length < 0 then
+            if step < 0 then
+                -1
+
+            else
+                0
+
+        else
+            actual + length
+
+    else if length <= actual then
+        if step < 0 then
+            length - 1
+
+        else
+            length
+
+    else
+        actual
+
+
+{-| `Slice` with jmespath's computeSliceParams: the bounds are parseInt results, so they may be NaN
+(`[0:3:-]`) or past 2^53, and the loop reads `value[i]`, which is undefined one past the end.
+-}
+slice : List V -> List V -> Step V
+slice params items =
+    let
+        part i =
+            case params |> List.drop i |> List.head of
+                Just (Num x) ->
+                    Just x
+
+                _ ->
+                    Nothing
+
+        step =
+            Maybe.withDefault 1 (part 2)
+
+        values =
+            Array.fromList items
+
+        length =
+            toFloat (Array.length values)
+
+        bound i default =
+            Maybe.withDefault default (Maybe.map (\x -> capSliceRange length x step) (part i))
+
+        start =
+            bound 0
+                (if step < 0 then
+                    length - 1
+
+                 else
+                    0
+                )
+
+        stop =
+            bound 1
+                (if step < 0 then
+                    -1
+
+                 else
+                    length
+                )
+
+        ascending =
+            0 < step
+
+        loop i acc =
+            if (ascending && i < stop) || (not ascending && stop < i) then
+                loop (i + step) (Maybe.withDefault Undefined (Array.get (floor i) values) :: acc)
+
+            else
+                List.reverse acc
+    in
+    -- Elm compiles `step == 0` to `!step`, which NaN passes too.
+    if step == 0 && not (isNaN step) then
+        Failed "invalid-value"
+
+    else
+        Done (array (loop start []))
+
+
+
+-- RUNTIME
+
+
+{-| jmespath's TYPE\_\* constants.
+-}
+type JmesType
+    = TypeNumber
+    | TypeAny
+    | TypeString
+    | TypeArray
+    | TypeObject
+    | TypeBoolean
+    | TypeExpref
+    | TypeNull
+    | TypeArrayNumber
+    | TypeArrayString
+
+
+{-| jmespath's `_getTypeName`; Nothing where its switch falls through (undefined).
+-}
+typeName : V -> Maybe JmesType
+typeName value =
+    case value of
+        Str _ ->
+            Just TypeString
+
+        Num _ ->
+            Just TypeNumber
+
+        Arr _ _ ->
+            Just TypeArray
+
+        Flag _ ->
+            Just TypeBoolean
+
+        Null ->
+            Just TypeNull
+
+        Obj _ fields ->
+            case field "jmespathType" fields of
+                Str "Expref" ->
+                    Just TypeExpref
+
+                _ ->
+                    Just TypeObject
+
+        Undefined ->
+            Nothing
+
+
+type alias Parameter =
+    { types : List JmesType, variadic : Bool }
+
+
+parameter : List JmesType -> Parameter
+parameter types =
+    { types = types, variadic = False }
+
+
+{-| jmespath's function table, without the functions, which `call` dispatches by name.
+-}
+signature : String -> Maybe (List Parameter)
+signature name =
+    case name of
+        "abs" ->
+            Just [ parameter [ TypeNumber ] ]
+
+        "avg" ->
+            Just [ parameter [ TypeArrayNumber ] ]
+
+        "ceil" ->
+            Just [ parameter [ TypeNumber ] ]
+
+        "contains" ->
+            Just [ parameter [ TypeString, TypeArray ], parameter [ TypeAny ] ]
+
+        "ends_with" ->
+            Just [ parameter [ TypeString ], parameter [ TypeString ] ]
+
+        "floor" ->
+            Just [ parameter [ TypeNumber ] ]
+
+        "length" ->
+            Just [ parameter [ TypeString, TypeArray, TypeObject ] ]
+
+        "map" ->
+            Just [ parameter [ TypeExpref ], parameter [ TypeArray ] ]
+
+        "max" ->
+            Just [ parameter [ TypeArrayNumber, TypeArrayString ] ]
+
+        "merge" ->
+            Just [ { types = [ TypeObject ], variadic = True } ]
+
+        "max_by" ->
+            Just [ parameter [ TypeArray ], parameter [ TypeExpref ] ]
+
+        "sum" ->
+            Just [ parameter [ TypeArrayNumber ] ]
+
+        "starts_with" ->
+            Just [ parameter [ TypeString ], parameter [ TypeString ] ]
+
+        "min" ->
+            Just [ parameter [ TypeArrayNumber, TypeArrayString ] ]
+
+        "min_by" ->
+            Just [ parameter [ TypeArray ], parameter [ TypeExpref ] ]
+
+        "type" ->
+            Just [ parameter [ TypeAny ] ]
+
+        "keys" ->
+            Just [ parameter [ TypeObject ] ]
+
+        "values" ->
+            Just [ parameter [ TypeObject ] ]
+
+        "sort" ->
+            Just [ parameter [ TypeArrayString, TypeArrayNumber ] ]
+
+        "sort_by" ->
+            Just [ parameter [ TypeArray ], parameter [ TypeExpref ] ]
+
+        "join" ->
+            Just [ parameter [ TypeString ], parameter [ TypeArrayString ] ]
+
+        "reverse" ->
+            Just [ parameter [ TypeString, TypeArray ] ]
+
+        "to_array" ->
+            Just [ parameter [ TypeAny ] ]
+
+        "to_string" ->
+            Just [ parameter [ TypeAny ] ]
+
+        "to_number" ->
+            Just [ parameter [ TypeAny ] ]
+
+        "not_null" ->
+            Just [ { types = [ TypeAny ], variadic = True } ]
+
+        _ ->
+            Nothing
+
+
+typeMatches : Maybe JmesType -> JmesType -> V -> Bool
+typeMatches actual expected argValue =
+    case ( expected, argValue ) of
+        ( TypeAny, _ ) ->
+            True
+
+        ( TypeArray, _ ) ->
+            actual == Just TypeArray
+
+        ( TypeArrayNumber, Arr _ items ) ->
+            List.all (\item -> typeMatches (typeName item) TypeNumber item) items
+
+        ( TypeArrayString, Arr _ items ) ->
+            List.all (\item -> typeMatches (typeName item) TypeString item) items
+
+        ( TypeArrayNumber, _ ) ->
+            False
+
+        ( TypeArrayString, _ ) ->
+            False
+
+        _ ->
+            actual == Just expected
+
+
+{-| `_validateArgs`: the arity first, then each declared argument's type.
+-}
+validateArgs : List V -> List Parameter -> Maybe String
+validateArgs args parameters =
+    let
+        variadic =
+            List.reverse parameters |> List.head |> Maybe.map .variadic |> Maybe.withDefault False
+
+        arityOk =
+            if variadic then
+                List.length args >= List.length parameters
+
+            else
+                List.length args == List.length parameters
+
+        typesOk =
+            List.map2 (\arg p -> List.any (\t -> typeMatches (typeName arg) t arg) p.types) args parameters
+                |> List.all identity
+    in
+    if not arityOk then
+        Just "invalid-arity"
+
+    else if not typesOk then
+        Just "invalid-type"
+
+    else
+        Nothing
+
+
+{-| `callFunction`: the name must be a known function.
+-}
+callFunction : V -> List V -> Step V
+callFunction name args =
+    case name of
+        Str functionName ->
+            case signature functionName of
+                Just parameters ->
+                    case validateArgs args parameters of
+                        Just category ->
+                            Failed category
+
+                        Nothing ->
+                            call functionName args
+
+                Nothing ->
+                    Failed "unknown-function"
+
+        _ ->
+            Failed "unknown-function"
+
+
+{-| A built-in whose arguments `validateArgs` accepted.
+-}
+call : String -> List V -> Step V
+call name args =
+    let
+        a =
+            List.head args |> Maybe.withDefault Undefined
+
+        b =
+            List.drop 1 args |> List.head |> Maybe.withDefault Undefined
+
+        items v =
+            case v of
+                Arr _ xs ->
+                    xs
+
+                _ ->
+                    []
+
+        text v =
+            case v of
+                Str s ->
+                    s
+
+                _ ->
+                    ""
+
+        number v =
+            case v of
+                Num x ->
+                    x
+
+                _ ->
+                    0
+
+        total =
+            List.foldl (\x sum -> sum + number x) 0 (items a)
+    in
+    case name of
+        "abs" ->
+            Done (Num (jsAbs (number a)))
+
+        "avg" ->
+            Done (Num (total / toFloat (List.length (items a))))
+
+        "ceil" ->
+            Done (Num (toFloat (ceiling (number a))))
+
+        "contains" ->
+            contains a b
+
+        "ends_with" ->
+            Done (Flag (String.endsWith (text b) (text a)))
+
+        "floor" ->
+            Done (Num (toFloat (floor (number a))))
+
+        "length" ->
+            Done
+                (Num
+                    (toFloat
+                        (case a of
+                            Str s ->
+                                String.length s
+
+                            Arr _ xs ->
+                                List.length xs
+
+                            _ ->
+                                List.length (fieldList a)
+                        )
+                    )
+                )
+
+        "map" ->
+            traverse (evaluate a) (items b) |> map array
+
+        "max" ->
+            extreme True (items a)
+
+        "merge" ->
+            Done (object (List.foldl (\arg fields -> List.foldl (\( k, v ) -> put k v) fields (forInEntries arg)) [] args))
+
+        "max_by" ->
+            extremeBy True b (items a)
+
+        "sum" ->
+            Done (Num total)
+
+        "starts_with" ->
+            -- `lastIndexOf(prefix) === 0`, searching from the end: `starts_with('abab', 'ab')` is false.
+            Done
+                (Flag
+                    (if text b == "" then
+                        text a == ""
+
+                     else
+                        String.startsWith (text b) (text a) && not (String.contains (text b) (String.dropLeft 1 (text a)))
+                    )
+                )
+
+        "min" ->
+            extreme False (items a)
+
+        "min_by" ->
+            extremeBy False b (items a)
+
+        "type" ->
+            Done
+                (case typeName a of
+                    Just TypeNumber ->
+                        Str "number"
+
+                    Just TypeString ->
+                        Str "string"
+
+                    Just TypeArray ->
+                        Str "array"
+
+                    Just TypeObject ->
+                        Str "object"
+
+                    Just TypeBoolean ->
+                        Str "boolean"
+
+                    Just TypeExpref ->
+                        Str "expref"
+
+                    Just TypeNull ->
+                        Str "null"
+
+                    _ ->
+                        Undefined
+                )
+
+        "keys" ->
+            Done (array (List.map (Tuple.first >> Str) (fieldList a)))
+
+        "values" ->
+            Done (array (List.map Tuple.second (fieldList a)))
+
+        "sort" ->
+            -- The engine's default sort: elements compared as strings, numbers too.
+            Done (array (List.sortWith (\x y -> compare (jsString x) (jsString y)) (items a)))
+
+        "sort_by" ->
+            sortBy b (items a)
+
+        "join" ->
+            Done (Str (String.join (text a) (List.map text (items b))))
+
+        "reverse" ->
+            Done
+                (case a of
+                    Str s ->
+                        -- Code unit by code unit, as jmespath does: surrogate pairs come out reversed.
+                        Str (List.range 0 (String.length s - 1) |> List.map (\i -> String.slice i (i + 1) s) |> List.reverse |> String.concat)
+
+                    _ ->
+                        array (List.reverse (items a))
+                )
+
+        "to_array" ->
+            Done
+                (case a of
+                    Arr _ _ ->
+                        a
+
+                    _ ->
+                        array [ a ]
+                )
+
+        "to_string" ->
+            Done
+                (case a of
+                    Str _ ->
+                        a
+
+                    Undefined ->
+                        -- JSON.stringify(undefined) is undefined.
+                        Undefined
+
+                    _ ->
+                        Str (jsonText a)
+                )
+
+        "to_number" ->
+            Done
+                (case a of
+                    Num _ ->
+                        a
+
+                    Str _ ->
+                        if isNaN (jsNumber a) then
+                            Null
+
+                        else
+                            Num (jsNumber a)
+
+                    _ ->
+                        Null
+                )
+
+        "not_null" ->
+            -- Undefined is not null here: `not_null(max_by(`[]`, &a))` is undefined.
+            Done (List.filter ((/=) (Just TypeNull) << typeName) args |> List.head |> Maybe.withDefault Null)
+
+        _ ->
+            Failed "unknown-function"
+
+
+{-| `Math.abs`, for which -0 is +0: Elm's `abs` keeps -0, and -0 + 0 is +0.
+-}
+jsAbs : Float -> Float
+jsAbs x =
+    if x < 0 then
+        negate x
+
+    else
+        x + 0
+
+
+{-| `for (key in value)` over a value merge did not type-check: an object's own keys, an array's or
+a string's indices, and nothing for other primitives, null and undefined.
+-}
+forInEntries : V -> List ( String, V )
+forInEntries value =
+    case value of
+        Obj _ fields ->
+            fields
+
+        Arr _ xs ->
+            List.indexedMap (\i x -> ( String.fromInt i, x )) xs
+
+        Str s ->
+            List.range 0 (String.length s - 1) |> List.map (\i -> ( String.fromInt i, Str (String.slice i (i + 1) s) ))
+
+        _ ->
+            []
+
+
+{-| contains: `String.prototype.indexOf`, which converts its argument with String(), or
+`Array.prototype.indexOf`, which compares with `===`: primitives by value (NaN never, -0 as 0),
+arrays and objects by identity, which the host compares.
+-}
+contains : V -> V -> Step V
+contains subject search =
+    case subject of
+        Str s ->
+            Done (Flag (String.contains (jsString search) s))
+
+        Arr _ candidates ->
+            case search of
+                Arr token _ ->
+                    Identical token (List.filterMap identityOf candidates) (Done << Flag)
+
+                Obj token _ ->
+                    Identical token (List.filterMap identityOf candidates) (Done << Flag)
+
+                _ ->
+                    Done (Flag (List.any (strictlyEqual search) candidates))
+
+        _ ->
+            Done (Flag False)
+
+
+identityOf : V -> Maybe Token
+identityOf value =
+    case value of
+        Arr token _ ->
+            Just token
+
+        Obj token _ ->
+            Just token
+
+        _ ->
+            Nothing
+
+
+{-| `===` between a primitive and a value.
+-}
+strictlyEqual : V -> V -> Bool
+strictlyEqual primitive value =
+    case ( primitive, value ) of
+        ( Num x, Num y ) ->
+            x == y
+
+        ( Str x, Str y ) ->
+            x == y
+
+        ( Flag x, Flag y ) ->
+            x == y
+
+        ( Null, Null ) ->
+            True
+
+        ( Undefined, Undefined ) ->
+            True
+
+        _ ->
+            False
+
+
+{-| max and min: `Math.max.apply`/`Math.min.apply` over numbers, `localeCompare` over strings.
+-}
+extreme : Bool -> List V -> Step V
+extreme isMax values =
+    case values of
         [] ->
             Done Null
 
-        a :: tail ->
-            loop a tail
-
-
-byKey op expr xs =
-    let
-        keyed v =
-            evaluate expr v |> map (\key -> ( key, v ))
-
-        check pairs =
+        (Num _) :: _ ->
             let
-                firstType =
-                    List.head pairs |> Maybe.map (Tuple.first >> kind)
-
-                good ( k, _ ) =
-                    kind k == "number" || kind k == "string"
-
-                sorted =
-                    List.sortWith (\( a, _ ) ( b, _ ) -> Maybe.withDefault EQ (compareJS a b)) pairs
-
-                extreme ( k, v ) ( best, old ) =
-                    if
-                        compareJS k best
-                            == Just
-                                (if op == "min_by" then
-                                    LT
-
-                                 else
-                                    GT
-                                )
-                    then
-                        ( k, v )
-
-                    else
-                        ( best, old )
-            in
-            if not (List.all good pairs) then
-                Error "invalid-type"
-
-            else if op == "sort_by" then
-                if List.all (\( key, _ ) -> Just (kind key) == firstType) pairs then
-                    Done (Arr (List.map Tuple.second sorted))
-
-                else
-                    Error "invalid-type"
-
-            else
-                List.foldl extreme
-                    ( Num
-                        (if op == "min_by" then
-                            1 / 0
-
-                         else
-                            -1 / 0
-                        )
-                    , Missing
-                    )
-                    pairs
-                    |> Tuple.second
-                    |> Done
-    in
-    traverse keyed xs |> bind check
-
-
-call name args =
-    let
-        sig =
-            signature name
-
-        a =
-            index 0 args
-
-        b =
-            index 1 args
-
-        xs =
-            array a
-
-        text =
-            asString a
-
-        revUnits s =
-            List.range 0 (String.length s - 1) |> List.map (\i -> String.slice i (i + 1) s) |> List.reverse |> String.concat
-
-        keyOrder x y =
-            compare (stringValue x) (stringValue y)
-
-        contains target remaining =
-            case remaining of
-                [] ->
-                    Done (Flag False)
-
-                candidate :: tail ->
-                    case ( target, candidate ) of
-                        ( Box left _, Box right _ ) ->
-                            RefEq left
-                                right
-                                (\same ->
-                                    if same then
-                                        Done (Flag True)
-
-                                    else
-                                        contains target tail
-                                )
-
-                        _ ->
-                            if target == candidate then
-                                Done (Flag True)
+                pick x best =
+                    case x of
+                        Num n ->
+                            if isMax then
+                                jsMax best n
 
                             else
-                                contains target tail
+                                jsMin best n
 
-        merge v pairs =
-            List.foldl (\( k, x ) -> put k x) pairs (fields v)
-
-        total =
-            List.foldl (\v sum -> sum + asNumber v) 0 xs
-    in
-    if List.isEmpty sig then
-        Error "unknown-function"
-
-    else if List.length args < List.length sig || (not (List.member name [ "merge", "not_null" ]) && List.length args > List.length sig) then
-        Error "invalid-arity"
-
-    else if not (List.all identity (List.map2 (\v types -> List.any (valid v) types) args sig)) then
-        Error "invalid-type"
-
-    else
-        case name of
-            "abs" ->
-                Done (Num (abs (asNumber a)))
-
-            "floor" ->
-                Done (Num (toFloat (floor (asNumber a))))
-
-            "ceil" ->
-                Done (Num (toFloat (ceiling (asNumber a))))
-
-            "type" ->
-                Done (Str (kind a))
-
-            "length" ->
-                Done
-                    (Num
-                        (toFloat
-                            (if kind a == "string" then
-                                String.length text
-
-                             else
-                                List.length (fields a)
-                            )
-                        )
-                    )
-
-            "keys" ->
-                Done (Arr (List.map (Tuple.first >> Str) (fields a)))
-
-            "values" ->
-                Done (Arr (List.map Tuple.second (fields a)))
-
-            "contains" ->
-                if kind a == "string" then
-                    Done (Flag (String.contains (stringValue b) text))
-
-                else
-                    contains b xs
-
-            "starts_with" ->
-                Done
-                    (Flag
-                        (if asString b == "" then
-                            text == ""
+                        _ ->
+                            best
+            in
+            Done
+                (Num
+                    (List.foldl pick
+                        (if isMax then
+                            -1 / 0
 
                          else
-                            String.startsWith (asString b) text && not (String.contains (asString b) (String.dropLeft 1 text))
+                            1 / 0
                         )
+                        values
                     )
+                )
 
-            "ends_with" ->
-                Done (Flag (String.endsWith (asString b) text))
+        first :: rest ->
+            extremeString isMax first rest
 
-            "join" ->
-                Done (Str (String.join text (List.map asString (array b))))
 
-            "reverse" ->
-                Done
-                    (if kind a == "string" then
-                        Str (revUnits text)
+{-| `if (best.localeCompare(x) < 0) best = x` for max, `if (x.localeCompare(best) < 0)` for min,
+each comparison asked of the host.
+-}
+extremeString : Bool -> V -> List V -> Step V
+extremeString isMax best rest =
+    case rest of
+        [] ->
+            Done best
+
+        x :: more ->
+            let
+                ( left, right ) =
+                    if isMax then
+                        ( best, x )
+
+                    else
+                        ( x, best )
+            in
+            Collate (jsString left)
+                (jsString right)
+                (\order ->
+                    if order == LT then
+                        extremeString isMax x more
+
+                    else
+                        extremeString isMax best more
+                )
+
+
+{-| `Math.max`: NaN wins, and +0 is larger than -0.
+-}
+jsMax : Float -> Float -> Float
+jsMax a b =
+    if isNaN a || isNaN b then
+        0 / 0
+
+    else if a < b then
+        b
+
+    else if b < a then
+        a
+
+    else if 1 / a < 0 then
+        b
+
+    else
+        a
+
+
+{-| `Math.min`: NaN wins, and -0 is smaller than +0.
+-}
+jsMin : Float -> Float -> Float
+jsMin a b =
+    if isNaN a || isNaN b then
+        0 / 0
+
+    else if a < b then
+        a
+
+    else if b < a then
+        b
+
+    else if 1 / a < 0 then
+        a
+
+    else
+        b
+
+
+{-| `createKeyFunction` over the elements in order: each key evaluated and type-checked.
+-}
+keys : V -> List V -> Step (List ( V, V ))
+keys exprefNode elements =
+    traverse
+        (\element ->
+            evaluate exprefNode element
+                |> andThen
+                    (\key ->
+                        case key of
+                            Num _ ->
+                                Done ( key, element )
+
+                            Str _ ->
+                                Done ( key, element )
+
+                            _ ->
+                                Failed "invalid-type"
+                    )
+        )
+        elements
+
+
+{-| max\_by and min\_by: the first element whose key beats the running one with JS `>` or `<`,
+starting from ∓∞, and undefined when none does.
+-}
+extremeBy : Bool -> V -> List V -> Step V
+extremeBy isMax exprefNode elements =
+    let
+        better key best =
+            relation key best
+                == Just
+                    (if isMax then
+                        GT
 
                      else
-                        Arr (List.reverse xs)
+                        LT
                     )
 
-            "sort" ->
-                Done (Arr (List.sortWith keyOrder xs))
+        initial =
+            Num
+                (if isMax then
+                    -1 / 0
 
-            "sum" ->
-                Done (Num total)
+                 else
+                    1 / 0
+                )
+    in
+    keys exprefNode elements
+        |> map
+            (List.foldl
+                (\( key, element ) ( best, record ) ->
+                    if better key best then
+                        ( key, element )
 
-            "avg" ->
-                Done (Num (total / toFloat (List.length xs)))
+                    else
+                        ( best, record )
+                )
+                ( initial, Undefined )
+                >> Tuple.second
+            )
 
-            "not_null" ->
-                Done (Maybe.withDefault Null (List.head (List.filter ((/=) Null) args)))
 
-            "to_number" ->
-                if kind a == "number" || (kind a == "string" && not (isNaN (toNumber a))) then
-                    Done (Num (toNumber a))
+{-| sort\_by: the keys in order, each of the first key's type (number or string), then the engine's
+sort (Elm's `List.sortWith` is `Array.prototype.sort`) with jmespath's comparator, the index
+breaking ties. With NaN keys the comparator is inconsistent, and the engine's algorithm decides the
+order, as it does for jmespath.
 
-                else
-                    Done Null
+jmespath checks the keys inside its comparator, in the order the engine compares them; here they are
+checked in element order, which reports the same error unless one key fails to evaluate and another
+has the wrong type (a CONTRACT exclusion).
 
-            "to_string" ->
-                Done
-                    (if kind a == "string" then
-                        a
+-}
+sortBy : V -> List V -> Step V
+sortBy exprefNode elements =
+    case elements of
+        [] ->
+            Done (array [])
 
-                     else if a == Missing then
-                        Missing
+        first :: _ ->
+            evaluate exprefNode first
+                |> andThen
+                    (\firstKey ->
+                        let
+                            required =
+                                typeName firstKey
+                        in
+                        if required /= Just TypeNumber && required /= Just TypeString then
+                            Failed "invalid-type"
 
-                     else
-                        Str (Values.jsonText a)
+                        else
+                            traverse
+                                (\element ->
+                                    evaluate exprefNode element
+                                        |> andThen
+                                            (\key ->
+                                                if typeName key == required then
+                                                    Done ( key, element )
+
+                                                else
+                                                    Failed "invalid-type"
+                                            )
+                                )
+                                elements
+                                |> map
+                                    (List.indexedMap (\i ( key, element ) -> ( i, key, element ))
+                                        >> List.sortWith
+                                            (\( i, keyA, _ ) ( j, keyB, _ ) ->
+                                                case relation keyA keyB of
+                                                    Just GT ->
+                                                        GT
+
+                                                    Just LT ->
+                                                        LT
+
+                                                    _ ->
+                                                        compare i j
+                                            )
+                                        >> List.map (\( _, _, element ) -> element)
+                                        >> array
+                                    )
                     )
-
-            "to_array" ->
-                Done
-                    (if kind a == "array" then
-                        a
-
-                     else
-                        Arr [ a ]
-                    )
-
-            "merge" ->
-                Done (Obj (sortFields (List.foldl merge [] args)))
-
-            "map" ->
-                traverse (evaluate a) (array b) |> map Arr
-
-            "min" ->
-                minMax True xs
-
-            "max" ->
-                minMax False xs
-
-            _ ->
-                byKey name b xs

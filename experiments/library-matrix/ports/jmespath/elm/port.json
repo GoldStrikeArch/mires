@@ -4,5 +4,5 @@
   "language": "elm",
   "main": "src/Main.elm",
   "host": "js/index.js",
-  "boundary": "Reads the query batch, compiles expressions with a Pratt parser and evaluates their ASTs against the input JSON document."
+  "boundary": "The JS host sends { data, queries } through the request port, with the document as flat postfix instructions (primitives, { array, token }, { object, token }) that carry each array and object as its identity token; Elm rebuilds it into V, compiles and evaluates each query, asks the host for localeCompare and === when it needs them, and returns the result array as postfix instructions that the host rebuilds."
 }

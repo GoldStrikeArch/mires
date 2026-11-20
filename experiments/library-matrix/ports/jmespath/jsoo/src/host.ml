@@ -41,3 +41,7 @@ let join v x=meth v "join" [|x|]
 let sorted v=meth v "sort" [||]
 let reversed v=meth v "reverse" [||]
 let typeof v=Js.to_string(Js.typeof v)
+let math_max (a:float) (b:float):float=Js.float_of_number(Js.Unsafe.coerce(scoped "Math" "max" [|num a;num b|]))
+let math_min (a:float) (b:float):float=Js.float_of_number(Js.Unsafe.coerce(scoped "Math" "min" [|num a;num b|]))
+(* Array.prototype.sort with an OCaml comparator, in place *)
+let sort_with a compare=ignore(meth a "sort" [|box(Js.wrap_callback(fun x y->Js.number_of_float(compare x y)))|])

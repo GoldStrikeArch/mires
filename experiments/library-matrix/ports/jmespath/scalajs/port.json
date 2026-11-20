@@ -2,5 +2,5 @@
   "schema": 1,
   "library": "jmespath",
   "language": "scalajs",
-  "boundary": "The target compiles expressions with a Pratt parser and visits the AST against JSON values."
+  "boundary": "run(input: Input) over @js.native facade traits, no copy: the document stays a js.Any (jmespath returns parts of it and compares them with ===), AST nodes are JS objects in jmespath's property order seen through a facade trait, and each result is a js.Dictionary { value } or { error } with the reference's category. Exported with @JSExportTopLevel as a native ES module export."
 }

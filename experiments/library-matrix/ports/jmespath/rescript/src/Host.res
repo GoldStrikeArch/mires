@@ -1,41 +1,91 @@
-// Native JSON and UTF-16 string operations.
+// The JavaScript values jmespath works on, and the host functions it calls.
+//
+// jmespath 0.16.0 evaluates over plain JS values (the JSON document, objects it builds, and its own
+// AST nodes, which `&expr` hands to functions and to the caller) and leans on JS semantics for them:
+// `Object.keys` order, `===` identity in `contains`, relational operators with type coercion,
+// `JSON.parse`/`JSON.stringify`, `parseInt`, `Number(string)`, `localeCompare` and the default
+// `Array.prototype.sort`. The port keeps those values as they are, as the abstract type `value`,
+// and binds those functions, so every one of those semantics is the engine's own.
+
 type value
-external box: 'a => value = "%identity"
-external text: value => string = "%identity"
-external float_value: value => float = "%identity"
-@new external obj: unit => value = "Object"
-@new external array: unit => value = "Array"
-@get_index external get: (value, string) => value = ""
-@get_index external prop: (value, value) => value = ""
-@set_index external set: (value, string, value) => unit = ""
-@set_index external put: (value, value, value) => unit = ""
-@get_index external at: (value, int) => value = ""
-@send external push: (value, value) => unit = "push"
-@get external length: value => int = "length"
-@scope("Object") @val external keys: value => value = "keys"
-@scope("Object") @val external values: value => value = "values"
-@scope("Array") @val external is_array: value => bool = "isArray"
-@scope("JSON") @val external json: value => value = "stringify"
-@scope("JSON") @val external parse: value => value = "parse"
-@val external number: value => float = "Number"
-@val external as_string: value => value = "String"
-@val external parse_int: value => float = "parseInt"
-@send external concat: (value, value) => value = "concat"
-@send external unit_at: (value, int) => int = "charCodeAt"
-@send external slice: (value, int, int) => value = "slice"
-@send external replace: (value, string, string) => value = "replace"
-@send external trim_start: value => value = "trimStart"
-@send external index: (value, value) => int = "indexOf"
-@send external index_from: (value, value, int) => int = "indexOf"
-@send external last_index: (value, value) => int = "lastIndexOf"
-@send external locale_cmp: (value, value) => int = "localeCompare"
-@send external join: (value, value) => value = "join"
-@send external sorted: value => value = "sort"
-@send external reversed: value => value = "reverse"
-external typeof: value => string = "#typeof"
-let strict = (x: value, y: value) => x === y
-let nil = box(Nullable.null)
-let und = box(Nullable.undefined)
-let str = (s: string) => box(s)
-let num = (n: float) => box(n)
-let bool = (b: bool) => box(b)
+
+// An AST node as jmespath builds it: a plain object whose properties depend on its type. The parser
+// builds each shape as an object literal; this record is the view the interpreter reads it through.
+// `None` children are jmespath's `undefined` nodes (`a.`, `()`).
+type rec node = {
+  @as("type") nodeType: value,
+  name: value,
+  @as("value") nodeValue: value,
+  children: array<option<node>>,
+  mutable jmespathType: value,
+}
+
+external fromString: string => value = "%identity"
+external fromFloat: float => value = "%identity"
+external fromBool: bool => value = "%identity"
+external fromArray: array<value> => value = "%identity"
+external fromDict: dict<value> => value = "%identity"
+external fromNode: option<node> => value = "%identity"
+external fromStrings: array<string> => value = "%identity"
+external nodeOf: {..} => node = "%identity"
+
+external asString: value => string = "%identity"
+external asFloat: value => float = "%identity"
+external asArray: value => array<value> = "%identity"
+external asDict: value => dict<value> = "%identity"
+external asNode: value => node = "%identity"
+external asOptionNode: value => option<node> = "%identity"
+external asStrings: value => array<string> = "%identity"
+
+// A Slice node's children are its numbers and nulls.
+external sliceParams: array<option<node>> => array<value> = "%identity"
+
+@val external jsUndefined: value = "undefined"
+external fromNull: Null.t<value> => value = "%identity"
+let jsNull = fromNull(Null.null)
+
+let isUndefined = (v: value) => v === jsUndefined
+let isNull = (v: value) => v === jsNull
+let isString = (v: value) => Type.typeof(v) == #string
+let isNumber = (v: value) => Type.typeof(v) == #number
+@val external isArray: value => bool = "Array.isArray"
+
+// jmespath's `isObject`: `Object.prototype.toString` is `[object Object]`, which for these values
+// means a non-null, non-array object (JSON objects, built objects and AST nodes alike).
+let isObject = (v: value) => Type.typeof(v) == #object && !isNull(v) && !isArray(v)
+
+let stringValue = (v: value) => isString(v) ? Some(asString(v)) : None
+
+@val external keys: value => array<string> = "Object.keys"
+
+// `object[key]`, through the prototype chain as in JS.
+let property = (object: value, key: string) => asDict(object)->Dict.getUnsafe(key)
+
+// `array[index]` for a JS number index: an element, or undefined off the end, at NaN and at ±∞.
+let elementAt = (array: array<value>, index: float) =>
+  index >= 0.0 && index < Int.toFloat(Array.length(array)) && index == Math.floor(index)
+    ? array->Array.getUnsafe(Float.toInt(index))
+    : jsUndefined
+
+@val external parseJson: string => value = "JSON.parse"
+@val external stringify: value => value = "JSON.stringify"
+@val external parseInt: string => float = "parseInt"
+
+// `Number(value)`: the unary `+` that `to_number` applies to strings.
+@val external toNumber: value => float = "Number"
+
+// `String(value)`: the conversion `String.prototype.indexOf` applies to its argument.
+@val external toString: value => string = "String"
+
+// The default `Array.prototype.sort`, in place: elements compared as strings, numbers too.
+@send external sortDefault: array<value> => unit = "sort"
+
+// jmespath's relational operators (`first > second`) coerce their operands themselves: arrays and
+// objects through their string forms, then strings by code unit or everything else as numbers.
+// ReScript compiles float comparisons to those very operators, so seen as floats the values compare
+// exactly as in jmespath.
+external operand: value => float = "%identity"
+let greater = (a, b) => operand(a) > operand(b)
+let greaterOrEqual = (a, b) => operand(a) >= operand(b)
+let less = (a, b) => operand(a) < operand(b)
+let lessOrEqual = (a, b) => operand(a) <= operand(b)

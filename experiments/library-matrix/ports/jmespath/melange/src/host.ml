@@ -33,6 +33,11 @@ external join : value -> value -> value = "join" [@@mel.send]
 external sorted : value -> value = "sort" [@@mel.send]
 external reversed : value -> value = "reverse" [@@mel.send]
 external typeof : value -> string = "#typeof"
+external math_max : float -> float -> float = "max" [@@mel.scope "Math"]
+external math_min : float -> float -> float = "min" [@@mel.scope "Math"]
+external sort_by_function : value -> (value -> value -> float [@u]) -> value = "sort" [@@mel.send]
+(* Array.prototype.sort with an OCaml comparator, in place *)
+let sort_with a compare = ignore (sort_by_function a (fun [@u] x y -> compare x y))
 let strict (x:value)y=x==y
 let nil=box Js.null
 let und=box Js.undefined

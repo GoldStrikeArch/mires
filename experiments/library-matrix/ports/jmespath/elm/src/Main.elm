@@ -1,20 +1,28 @@
 port module Main exposing (main)
 
+{-| The Elm side of the port: what libraries/jmespath/reference.mjs does, on the port's jmespath.
+
+The host sends the input as `{ data, queries }`, with the document as postfix instructions
+(Values.Op). Each query compiles or searches and gives `{ value }` or `{ error }`; the result array
+goes back as postfix instructions too. An evaluation that needs `localeCompare` or `===` from the
+host sends that request instead and waits in the model; the answer resumes it.
+
+-}
+
 import Eval exposing (Step(..))
 import Json.Decode as D
 import Json.Encode as E
 import Parser
-import Platform
 import Values exposing (V(..))
 
 
 port request : (D.Value -> msg) -> Sub msg
 
 
-port comparison : (Int -> msg) -> Sub msg
+port collated : (Int -> msg) -> Sub msg
 
 
-port identityResult : (Bool -> msg) -> Sub msg
+port identical : (Bool -> msg) -> Sub msg
 
 
 port response : E.Value -> Cmd msg
@@ -22,102 +30,119 @@ port response : E.Value -> Cmd msg
 
 type Msg
     = Begin D.Value
-    | Compared Int
-    | Same Bool
+    | GotCollation Int
+    | GotIdentity Bool
 
 
 type Model
     = Idle
-    | Waiting (Order -> Step V)
-    | Equality (Bool -> Step V)
+    | Collating (Order -> Step V)
+    | ComparingIdentity (Bool -> Step V)
 
 
 type alias Query =
     { op : String, expression : String }
 
 
-decoder =
+inputDecoder : D.Decoder ( V, List Query )
+inputDecoder =
     D.map2 Tuple.pair
-        (D.field "data" Values.decode)
+        (D.field "data" (D.list Values.opDecoder) |> D.map Values.fromInput)
         (D.field "queries" (D.list (D.map2 Query (D.field "op" D.string) (D.field "expression" D.string))))
 
 
-collect data qs acc =
-    case qs of
+result : String -> V -> V
+result key value =
+    Obj (Values.fresh ()) [ ( key, value ) ]
+
+
+{-| The queries in order, each as `{ value }` or `{ error }`; one failing query does not stop the
+rest.
+-}
+runQueries : V -> List Query -> List V -> Step V
+runQueries data queries done =
+    case queries of
         [] ->
-            Done (Arr (List.reverse acc))
+            Done (Arr (Values.fresh ()) (List.reverse done))
 
-        q :: tail ->
+        query :: rest ->
             let
-                forward step =
-                    case step of
-                        Done v ->
-                            collect data tail (Obj [ ( "value", v ) ] :: acc)
+                outcome =
+                    case Parser.compile query.expression of
+                        Err () ->
+                            Failed "syntax"
 
-                        Error category ->
-                            collect data tail (Obj [ ( "error", Str category ) ] :: acc)
+                        Ok ast ->
+                            if query.op == "compile" then
+                                Done ast
 
-                        Collate a b k ->
-                            Collate a b (k >> forward)
+                            else
+                                Eval.evaluate ast data
 
-                        RefEq a b k ->
-                            RefEq a b (k >> forward)
+                continue answer =
+                    runQueries data rest (answer :: done)
             in
-            case Parser.compile q.expression of
-                Err e ->
-                    forward (Error e)
+            case outcome of
+                Done value ->
+                    continue (result "value" value)
 
-                Ok ast ->
-                    forward
-                        (if q.op == "compile" then
-                            Done ast
+                Failed category ->
+                    continue (result "error" (Str category))
 
-                         else
-                            Eval.evaluate ast data
-                        )
+                suspended ->
+                    recover suspended |> Eval.andThen continue
 
 
+{-| A suspended query's own outcome, its failure included, once the host has answered.
+-}
+recover : Step V -> Step V
+recover step =
+    case step of
+        Done value ->
+            Done (result "value" value)
+
+        Failed category ->
+            Done (result "error" (Str category))
+
+        Collate a b resume ->
+            Collate a b (resume >> recover)
+
+        Identical target candidates resume ->
+            Identical target candidates (resume >> recover)
+
+
+deliver : Step V -> ( Model, Cmd Msg )
 deliver step =
     case step of
-        Done v ->
-            ( Idle, response (E.object [ ( "value", Values.wire v ) ]) )
+        Done value ->
+            ( Idle, response (E.object [ ( "value", Values.toOutput value ) ]) )
 
-        Error e ->
-            ( Idle, response (E.object [ ( "error", E.string e ) ]) )
+        Failed category ->
+            ( Idle, response (E.object [ ( "error", E.string category ) ]) )
 
-        Collate a b k ->
-            ( Waiting k, response (E.object [ ( "collate", E.list E.string [ a, b ] ) ]) )
+        Collate a b resume ->
+            ( Collating resume, response (E.object [ ( "collate", E.list E.string [ a, b ] ) ]) )
 
-        RefEq a b k ->
-            ( Equality k, response (E.object [ ( "identity", E.list identity [ a, b ] ) ]) )
+        Identical target candidates resume ->
+            ( ComparingIdentity resume, response (E.object [ ( "identical", E.list identity (target :: candidates) ) ]) )
 
 
+update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case ( msg, model ) of
         ( Begin input, _ ) ->
-            case D.decodeValue decoder input of
-                Ok ( data, qs ) ->
-                    deliver (collect data qs [])
+            case D.decodeValue inputDecoder input of
+                Ok ( data, queries ) ->
+                    deliver (runQueries data queries [])
 
                 Err e ->
-                    deliver (Error (D.errorToString e))
+                    deliver (Failed (D.errorToString e))
 
-        ( Compared i, Waiting resume ) ->
-            deliver
-                (resume
-                    (if i < 0 then
-                        LT
+        ( GotCollation sign, Collating resume ) ->
+            deliver (resume (compare sign 0))
 
-                     else if i > 0 then
-                        GT
-
-                     else
-                        EQ
-                    )
-                )
-
-        ( Same equal, Equality resume ) ->
-            deliver (resume equal)
+        ( GotIdentity same, ComparingIdentity resume ) ->
+            deliver (resume same)
 
         _ ->
             ( model, Cmd.none )
@@ -125,4 +150,8 @@ update msg model =
 
 main : Program () Model Msg
 main =
-    Platform.worker { init = \_ -> ( Idle, Cmd.none ), update = update, subscriptions = \_ -> Sub.batch [ request Begin, comparison Compared, identityResult Same ] }
+    Platform.worker
+        { init = \_ -> ( Idle, Cmd.none )
+        , update = update
+        , subscriptions = \_ -> Sub.batch [ request Begin, collated GotCollation, identical GotIdentity ]
+        }

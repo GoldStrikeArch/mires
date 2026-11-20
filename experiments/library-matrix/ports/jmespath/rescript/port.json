@@ -3,5 +3,5 @@
   "library": "jmespath",
   "language": "rescript",
   "entry": "src/Index.res",
-  "boundary": "Native Pratt parsing, projection evaluation, and typed built-ins operate on JSON values, preserving UTF-16 string and JavaScript object semantics."
+  "boundary": "run(input): the input record is the corpus object itself, so reading it converts nothing; the document stays the JS value it is as the abstract Host.value (jmespath returns parts of it and compares them with ===), AST nodes are JS object literals in jmespath's property order read through a record view, and each result is a dict { value } or { error } with the reference's category."
 }

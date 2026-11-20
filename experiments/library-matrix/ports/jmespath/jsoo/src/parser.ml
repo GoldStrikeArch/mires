@@ -9,7 +9,7 @@ let named t v=let n=node t in set n "name" v;n
 let leaf t v=let n=node t in set n "value" v;n
 let list xs=let a=array()in List.iter(fun v->push a v)xs;a
 let children t xs=let n=node t in set n "children"(list xs);n
-let letter c=(c>=65&&c<=90)||(c>=97&&c<=122)||c=95
+let is_alpha c=(c>=65&&c<=90)||(c>=97&&c<=122)||c=95
 let digit c=c>=48&&c<=57
 let json_value v=try parse v with _->syntax()
 let lex source=
@@ -18,8 +18,8 @@ let lex source=
   while !i<n do
     let start= !i and c=unit_at source !i in incr i;
     let next=if !i<n then unit_at source !i else 0 in
-    if letter c then begin
-      while !i<n && (let ch=unit_at source !i in letter ch||digit ch)do incr i done;
+    if is_alpha c then begin
+      while !i<n && (let ch=unit_at source !i in is_alpha ch||digit ch)do incr i done;
       add "Field"(slice source start !i)
     end else if c=45||digit c then begin
       while !i<n && (let ch=unit_at source !i in ch=45||digit ch)do incr i done;
@@ -47,16 +47,22 @@ let lex source=
       add k und
     end
   done;add "EOF" und;Array.of_list(List.rev !tokens)
+(* jmespath's bindingPower table. It has no entry for Colon and Literal: `rbp < bindingPower[Colon]`
+   is false, and so is `bindingPower[Literal] < 10` in _parseProjectionRHS, which therefore rejects a
+   literal after a projection. *)
 let power=function
-  |"Pipe"->1|"Or"->2|"And"->3|"EQ"|"NE"|"GT"|"LT"|"GTE"|"LTE"->5|"Flatten"->9|"Star"->20|"Filter"->21|"Dot"->40|"Not"->45|"Lbrace"->50|"Lbracket"->55|"Lparen"->60|_->0
+  |"Colon"|"Literal"->None
+  |"Pipe"->Some 1|"Or"->Some 2|"And"->Some 3|"EQ"|"NE"|"GT"|"LT"|"GTE"|"LTE"->Some 5|"Flatten"->Some 9|"Star"->Some 20
+  |"Filter"->Some 21|"Dot"->Some 40|"Not"->Some 45|"Lbrace"->Some 50|"Lbracket"->Some 55|"Lparen"->Some 60|_->Some 0
+let binds rbp k=match power k with Some p->rbp<p|None->false
 let look p n=if p.pos+n<Array.length p.tokens then p.tokens.(p.pos+n).kind else "EOF"
 let next p=if p.pos>=Array.length p.tokens then syntax();let t=p.tokens.(p.pos)in p.pos<-p.pos+1;t
 let take p k=if (next p).kind<>k then syntax()
 let rec expr p rbp=
   let lhs=ref(nud p(next p))in
-  while rbp<power(look p 0)do let k=(next p).kind in lhs:=led p k !lhs done;!lhs
+  while binds rbp (look p 0)do let k=(next p).kind in lhs:=led p k !lhs done;!lhs
 and projection p rbp=
-  let k=look p 0 in if power k<10 then node "Identity"else match k with "Lbracket"|"Filter"->expr p rbp|"Dot"->ignore(next p);dot p rbp|_->syntax()
+  let k=look p 0 in if (match power k with Some b->b<10|None->false)then node "Identity"else match k with "Lbracket"|"Filter"->expr p rbp|"Dot"->ignore(next p);dot p rbp|_->syntax()
 and dot p rbp=match look p 0 with "Field"|"Quoted"|"Star"->expr p rbp|"Lbracket"->ignore(next p);multi p|"Lbrace"->ignore(next p);hash p|_->und
 and multi p=
   let acc=ref []in while look p 0<>"Rbracket"do acc:=expr p 0::!acc;
@@ -92,7 +98,7 @@ and nud p t=match t.kind with
 and led p k lhs=match k with
   |"Dot" when look p 0="Star"->ignore(next p);children "ValueProjection"[lhs;projection p 40]
   |"Dot"->children "Subexpression"[lhs;dot p 40]
-  |"Or"|"And"|"Pipe"->children(if k="Pipe"then k else k^"Expression")[lhs;expr p(power k)]
+  |"Or"->children "OrExpression"[lhs;expr p 2]|"And"->children "AndExpression"[lhs;expr p 3]|"Pipe"->children "Pipe"[lhs;expr p 1]
   |"Lparen"->if strict lhs und then syntax();let n=named "Function"(get lhs "name")in set n "children"(list(args p true));n
   |"Filter"->let condition=expr p 0 in take p "Rbracket";let right=if look p 0="Flatten"then node "Identity"else projection p 21 in children "FilterProjection"[lhs;right;condition]
   |"Flatten"->children "Projection"[children "Flatten"[lhs];projection p 9]
