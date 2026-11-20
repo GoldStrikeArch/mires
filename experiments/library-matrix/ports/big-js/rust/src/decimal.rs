@@ -9,6 +9,25 @@ pub const POWER: &str = "[big.js] Invalid exponent";
 pub const ZERO_DIV: &str = "[big.js] Division by zero";
 pub const NO_ROOT: &str = "[big.js] No square root";
 
+// Upstream's `n !== ~~n || n < lo || n > hi`, negated: an integer in the range (all ranges lie
+// within int32, so the cast is exact once the range holds).
+fn is_int_in(n: f64, lo: f64, hi: f64) -> bool {
+    n >= lo && n <= hi && n == (n as i32) as f64
+}
+
+// ECMAScript ToInt32, for upstream's `| 0` and `&` on exponents: `%` keeps the sign and the
+// fraction, the cast truncates (NaN and infinities become 0), and i64 to i32 keeps the low bits.
+fn to_int32(v: f64) -> i32 {
+    (v % 4294967296.0) as i64 as i32
+}
+
+// `Array.prototype.slice(0, end)`, where a negative end counts from the back.
+fn head(digits: &[u8], end: f64) -> &[u8] {
+    let n = digits.len() as f64;
+    let end = if end < 0.0 { (n + end).max(0.0) } else { end.min(n) };
+    &digits[..end as usize]
+}
+
 #[derive(Clone)]
 pub struct Decimal {
     pub sign: i32,
@@ -36,9 +55,15 @@ impl Decimal {
         while digits[end - 1] == 0 {
             end -= 1;
         }
+        // One decrement per leading zero, as upstream's `--ye`: past 2^53 a run of decrements
+        // rounds differently from one subtraction.
+        let mut exponent = exponent;
+        for _ in offset..start {
+            exponent -= 1.0;
+        }
         Self {
             sign,
-            exponent: exponent - (start - offset) as f64,
+            exponent,
             digits: digits[start..end].to_vec(),
         }
     }
@@ -210,11 +235,13 @@ impl Decimal {
             Self::normalize(sign, exponent + 1.0, product, 0)
         }
     }
-    fn rounded(&self, sd: f64, mode: i32, more: bool) -> Result<Self, &'static str> {
-        if !(0..=3).contains(&mode) {
+    fn rounded(&self, sd: f64, mode: f64, more: bool) -> Result<Self, &'static str> {
+        if mode != 0.0 && mode != 1.0 && mode != 2.0 && mode != 3.0 {
             return Err(MODE);
         }
-        if sd >= self.digits.len() as f64 {
+        let mode = mode as i32;
+        // Upstream rounds only when sd < 1 or sd < xc.length; a NaN sd fails both.
+        if !(sd < self.digits.len() as f64) {
             return Ok(self.clone());
         }
         let guard = if sd >= 0.0 {
@@ -254,8 +281,8 @@ impl Decimal {
         }
         Ok(Self::normalize(self.sign, self.exponent, digits, 0))
     }
-    pub fn div(&self, y: &Self, dp: i32, mode: i32) -> Result<Self, &'static str> {
-        if !(0..=1_000_000).contains(&dp) {
+    pub fn div(&self, y: &Self, dp: f64, mode: f64) -> Result<Self, &'static str> {
+        if !is_int_in(dp, 0.0, 1_000_000.0) {
             return Err(PLACES);
         }
         if y.zero() {
@@ -277,6 +304,10 @@ impl Decimal {
             pos += 1;
         }
         let mut exponent = self.exponent - y.exponent;
+        // Upstream's precision dp + q.e + 1. When it is NaN (an Infinity - Infinity exponent),
+        // upstream's `k--` stops after the first digit, which it keeps even when it is zero, and
+        // `qi > p` never rounds.
+        let precision = dp + exponent + 1.0;
         let mut digits = Vec::new();
         loop {
             let mut q = 0;
@@ -307,9 +338,19 @@ impl Decimal {
             } else {
                 digits.push(q);
             }
+            if precision.is_nan() {
+                if digits.is_empty() {
+                    digits.push(0);
+                }
+                return Ok(Self {
+                    sign,
+                    exponent,
+                    digits,
+                });
+            }
             let more = !rest.is_empty() || pos < self.digits.len();
-            if !digits.is_empty() && (!more || digits.len() as f64 > dp as f64 + exponent + 1.0) {
-                let sd = dp as f64 + exponent + 1.0;
+            if !digits.is_empty() && (!more || digits.len() as f64 > dp + exponent + 1.0) {
+                let sd = dp + exponent + 1.0;
                 let value = Self {
                     sign,
                     exponent,
@@ -331,10 +372,11 @@ impl Decimal {
             pos += 1;
         }
     }
-    pub fn pow(&self, n: i32, dp: i32, mode: i32) -> Result<Self, &'static str> {
-        if !(-1_000_000..=1_000_000).contains(&n) {
-            return Err(POWER);
-        }
+    pub fn pow(&self, n: Option<f64>, dp: f64, mode: f64) -> Result<Self, &'static str> {
+        let n = match n {
+            Some(n) if is_int_in(n, -1_000_000.0, 1_000_000.0) => n as i32,
+            _ => return Err(POWER),
+        };
         let one = Self::single(1, 0.0, 1);
         let mut result = one.clone();
         let mut base = self.clone();
@@ -354,98 +396,84 @@ impl Decimal {
             Ok(result)
         }
     }
-    pub fn sqrt(&self, dp: i32, mode: i32) -> Result<Self, &'static str> {
+    pub fn sqrt(&self, dp: f64, mode: f64) -> Result<Self, &'static str> {
         if self.zero() {
             return Ok(self.clone());
         }
         if self.sign < 0 {
             return Err(NO_ROOT);
         }
-        // The root is below a tenth of the last requested decimal place.
-        if (0..=999996).contains(&dp)
-            && (0..=3).contains(&mode)
-            && self.exponent < (-2 * dp - 2) as f64
-        {
-            return Ok(if mode == 3 {
-                Self::single(1, -f64::from(dp), 1)
-            } else {
-                Self::single(1, 0.0, 0)
-            });
-        }
-        // big.js seeds Newton iteration with the platform's binary64 square root.
-        // The exact initial approximation matters when the final digit is a tie.
-        let scientific = self.format("toExponential", None, mode)?;
-        let estimate = crate::root_estimate(&scientific);
-        let mut root = if estimate > 0.0 && estimate.is_finite() {
-            Self::parse(crate::number_text(estimate))?
-        } else {
+        // Upstream's estimate: the host's binary64 square root of the exponential string.
+        let mut estimate = crate::root_estimate(&self.format("toExponential", None, mode)?);
+        let mut root = if estimate == 0.0 || estimate == f64::INFINITY {
+            // Math.sqrt underflow/overflow? Re-estimate from the coefficient as an integer, then
+            // set upstream's exponent ((e + 1) / 2 | 0) - (e < 0 || e & 1).
+            let e = self.exponent;
             let mut coefficient = String::new();
             for d in &self.digits {
                 coefficient.push((b'0' + *d) as char);
             }
-            if (self.digits.len() as f64 + self.exponent) % 2.0 == 0.0 {
+            if to_int32(coefficient.len() as f64 + e) & 1 == 0 {
                 coefficient.push('0');
             }
-            let fallback = crate::root_estimate(&coefficient);
-            let mut r = if fallback.is_finite() {
-                Self::parse(crate::number_text(fallback))?
-            } else {
+            estimate = crate::root_estimate(&coefficient);
+            let exponent = to_int32((e + 1.0) / 2.0) - i32::from(e < 0.0 || to_int32(e) & 1 != 0);
+            // Upstream parses the digits of toExponential() before its `e`: the shortest digits
+            // of the estimate, the ones String() prints, placed at this exponent.
+            let mut r = if estimate == f64::INFINITY {
                 Self::single(1, 0.0, 5)
+            } else {
+                Self::parse(crate::number_text(estimate))?
             };
-            r.exponent = crate::floor(self.exponent / 2.0);
+            r.exponent = f64::from(exponent);
             r
+        } else {
+            // A NaN estimate prints as "NaN", which upstream rejects as an invalid number.
+            Self::parse(crate::number_text(estimate))?
         };
-        let root_exp = root.exponent;
+        // Big.DP += 4 for the iteration (div validates it), and the stop test compares the first
+        // r.e + DP + 4 digits of successive estimates, as joined strings.
         let half = Self::single(1, -1.0, 5);
-        let work = ((dp + 4) as f64).max(5.0 - root_exp).min(1_000_001.0) as i32;
-        let count = (root_exp + work as f64).max(1.0) as usize;
+        let places = dp + 4.0;
+        let compared = root.exponent + places;
         loop {
-            let next = half.times(&root.add(&self.div(&root, work, mode)?, false));
-            let mut matched = root.exponent == next.exponent;
-            let n = count.min(root.digits.len().max(next.digits.len()));
-            for i in 0..n {
-                if i >= root.digits.len()
-                    || i >= next.digits.len()
-                    || root.digits[i] != next.digits[i]
-                {
-                    matched = false;
-                    break;
-                }
-            }
+            let next = half.times(&root.add(&self.div(&root, places, mode)?, false));
+            let same = head(&root.digits, compared) == head(&next.digits, compared);
             root = next;
-            if matched {
+            if same {
                 break;
             }
         }
-        root.rounded(dp as f64 + root.exponent + 1.0, mode, false)
+        root.rounded(dp + root.exponent + 1.0, mode, false)
     }
-    pub fn round(&self, n: i32, mode: i32) -> Result<Self, &'static str> {
-        if !(-1_000_000..=1_000_000).contains(&n) {
+    pub fn round(&self, n: Option<f64>, mode: f64) -> Result<Self, &'static str> {
+        let n = n.unwrap_or(0.0);
+        if !is_int_in(n, -1_000_000.0, 1_000_000.0) {
             return Err(PLACES);
         }
-        self.rounded(n as f64 + self.exponent + 1.0, mode, false)
+        self.rounded(n + self.exponent + 1.0, mode, false)
     }
-    pub fn format(&self, op: &str, n: Option<i32>, mode: i32) -> Result<String, &'static str> {
+    pub fn format(&self, op: &str, n: Option<f64>, mode: f64) -> Result<String, &'static str> {
         let mut value = self.clone();
         if let Some(n) = n {
             let sd = if op == "toPrecision" {
-                if !(1..=1_000_000).contains(&n) {
+                if !is_int_in(n, 1.0, 1_000_000.0) {
                     return Err(PRECISION);
                 }
-                n as f64
+                n
             } else {
-                if !(0..=1_000_000).contains(&n) {
+                if !is_int_in(n, 0.0, 1_000_000.0) {
                     return Err(PLACES);
                 }
                 if op == "toFixed" {
-                    n as f64 + value.exponent + 1.0
+                    n + value.exponent + 1.0
                 } else {
-                    (n + 1) as f64
+                    n + 1.0
                 }
             };
             value = value.rounded(sd, mode, false)?;
             let width = if op == "toFixed" {
-                n as f64 + value.exponent + 1.0
+                n + value.exponent + 1.0
             } else {
                 sd
             };
@@ -458,7 +486,7 @@ impl Decimal {
             || op != "toFixed"
                 && (e <= -7.0
                     || e >= 21.0
-                    || op == "toPrecision" && n.is_some_and(|n| n as f64 <= e));
+                    || op == "toPrecision" && n.is_some_and(|n| n <= e));
         let mut s = String::new();
         if self.sign < 0 && !self.zero() {
             s.push('-');

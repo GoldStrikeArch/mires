@@ -1,17 +1,45 @@
-type input
-external get : input -> string -> 'a = "" [@@mel.get_index]
-let optional v k = Js.Nullable.toOption (get v k)
-let integer v k fallback = match optional v k with
-  | None -> fallback
-  | Some n -> let i=int_of_float n in if float_of_int i=n && i <> -2000002 then i else -2000001
-let run x =
-  let lines=ref [] in
-  for _i=1 to integer x "repeat" 1 do
-    Array.iter (fun c ->
-      let rm=integer c "rm" 1 in
-      let result=try Decimal.operate (get c "op") (Float_host.text (get c "x")) (Float_host.text (get c "y"))
-        (integer c "n" (-2000002)) (integer c "dp" 20) rm (integer c "mode" rm)
-        with Failure msg -> msg in
-      lines:=result :: !lines) (get x "cases")
+(* The boundary (Melange): what libraries/big-js/reference.mjs does. dp, rm and repeat are
+   nullable: undefined and null select the defaults, as the adapter's ?? does. n and mode are
+   optional (undefined) and reach the methods as upstream's optional arguments. *)
+
+type operand
+
+external js_string : operand -> string = "String"
+
+type operation =
+  < op : string
+  ; x : operand
+  ; y : operand
+  ; n : float Js.undefined
+  ; mode : float Js.undefined
+  ; dp : float Js.nullable
+  ; rm : float Js.nullable >
+  Js.t
+
+type input = < cases : operation array ; repeat : int Js.nullable > Js.t
+
+(* The Big constructor's conversion: a number goes through String(), except that -0 becomes
+   "-0". *)
+let text (v : operand) =
+  match Js.Types.classify v with
+  | JSString s -> s
+  | JSNumber n when n = 0. && 1. /. n < 0. -> "-0"
+  | _ -> js_string v
+
+let option_or v default = Option.value (Js.Nullable.toOption v) ~default
+
+let run (input : input) =
+  let outputs = ref [] in
+  for _ = 1 to option_or input##repeat 1 do
+    input##cases
+    |> Array.iter (fun c ->
+           let result =
+             try
+               Big.operate ~op:c##op ~x:(text c##x) ~y:(text c##y)
+                 ~n:(Js.Undefined.toOption c##n) ~mode:(Js.Undefined.toOption c##mode)
+                 ~dp:(option_or c##dp 20.) ~rm:(option_or c##rm 1.)
+             with Big.Big_error message -> message
+           in
+           outputs := result :: !outputs)
   done;
-  String.concat "\n" (List.rev !lines)
+  String.concat "\n" (List.rev !outputs)

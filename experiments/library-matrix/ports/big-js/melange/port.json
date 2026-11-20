@@ -3,5 +3,5 @@
   "library": "big-js",
   "language": "melange",
   "entry": "src/index.ml",
-  "boundary": "Converts JSON fields to decimal operands and options, evaluates each operation and joins the results with newlines."
+  "boundary": "Js.t objects are read with ##; Js.nullable options take their defaults, operands pass through JS String() with -0 as \"-0\", and the results join with newlines."
 }

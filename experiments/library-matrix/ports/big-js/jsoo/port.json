@@ -3,5 +3,5 @@
   "library": "big-js",
   "language": "jsoo",
   "entry": "src/main.ml",
-  "boundary": "Converts JSON fields to decimal operands and options, evaluates each operation and joins the results with newlines."
+  "boundary": "Class types read the JS input; Opt/Optdef options take their defaults, operands cross with Js.to_string or JS String() with -0 as \"-0\", and the joined result returns through Js.string."
 }

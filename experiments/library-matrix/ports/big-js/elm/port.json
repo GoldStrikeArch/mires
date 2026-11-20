@@ -4,5 +4,5 @@
   "language": "elm",
   "main": "src/Main.elm",
   "host": "js/index.js",
-  "boundary": "Converts JSON fields to decimal operands and options, evaluates each operation and joins the results with newlines."
+  "boundary": "The JS host sends the input through a port; Json.Decode reads options as Maybe Float (absent and null take the defaults), operands as strings or String.fromFloat with -0 as \"-0\", and the reply joins the results with newlines."
 }

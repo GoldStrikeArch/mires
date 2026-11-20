@@ -4,7 +4,7 @@
 extern crate alloc;
 mod decimal;
 use alloc::string::{String, ToString};
-use decimal::{Decimal, POWER};
+use decimal::Decimal;
 use mires_js::{js_bindings, js_export, throw_value, JsValue};
 
 #[panic_handler]
@@ -21,8 +21,6 @@ js_bindings! {
     fn element(v:JsValue,i:usize)->JsValue;
     #[js(call = "Number")]
     fn number(v:JsValue)->f64;
-    #[js(call = "Math.floor")]
-    fn floor(v:f64)->f64;
     #[js(call = "Math.sqrt")]
     fn machine_root(v:f64)->f64;
     #[js(call = "String")]
@@ -37,25 +35,35 @@ fn number_text(n: f64) -> &'static str {
 fn field(v: JsValue, key: &str) -> JsValue {
     property(v, JsValue::erase(key))
 }
-fn integer(v: JsValue, key: &str) -> Option<i32> {
+// A number option: undefined and JSON null are absent, as for the adapter's `??`.
+fn number_field(v: JsValue, key: &str) -> Option<f64> {
     let raw = field(v, key);
-    if raw.is_undefined() {
-        return None;
+    if raw.is_undefined() || raw.is_null() {
+        None
+    } else {
+        Some(raw.read::<f64>())
     }
-    let value = raw.read::<f64>();
-    let n = value as i32;
-    Some(if n as f64 == value { n } else { i32::MIN })
+}
+// The Big constructor's conversion: a number goes through String(), except that -0 becomes "-0".
+fn text(v: JsValue) -> &'static str {
+    if v.is_number() {
+        let n = v.read::<f64>();
+        if n == 0.0 && 1.0 / n < 0.0 {
+            return "-0";
+        }
+    }
+    string(v).read::<&str>()
 }
 fn operation(c: JsValue) -> Result<String, &'static str> {
     let op = field(c, "op").read::<&str>();
-    let x = Decimal::parse(string(field(c, "x")).read::<&str>())?;
-    let dp = integer(c, "dp").unwrap_or(20);
-    let rm = integer(c, "rm").unwrap_or(1);
-    let n = integer(c, "n");
-    let mode = integer(c, "mode").unwrap_or(rm);
+    let x = Decimal::parse(text(field(c, "x")))?;
+    let dp = number_field(c, "dp").unwrap_or(20.0);
+    let rm = number_field(c, "rm").unwrap_or(1.0);
+    let n = number_field(c, "n");
+    let mode = number_field(c, "mode").unwrap_or(rm);
     let result = match op {
         "plus" | "minus" | "times" | "div" | "cmp" => {
-            let y = Decimal::parse(string(field(c, "y")).read::<&str>())?;
+            let y = Decimal::parse(text(field(c, "y")))?;
             match op {
                 "plus" | "minus" => x.add(&y, op == "minus"),
                 "times" => x.times(&y),
@@ -63,9 +71,9 @@ fn operation(c: JsValue) -> Result<String, &'static str> {
                 _ => return Ok(x.cmp(&y).to_string()),
             }
         }
-        "pow" => x.pow(n.ok_or(POWER)?, dp, rm)?,
+        "pow" => x.pow(n, dp, rm)?,
         "sqrt" => x.sqrt(dp, rm)?,
-        "round" => x.round(n.unwrap_or(0), mode)?,
+        "round" => x.round(n, mode)?,
         "toFixed" | "toExponential" | "toPrecision" | "toString" => {
             return x.format(op, if op == "toString" { None } else { n }, mode);
         }
@@ -76,7 +84,7 @@ fn operation(c: JsValue) -> Result<String, &'static str> {
 #[js_export]
 pub fn matrix_run(input: JsValue) -> JsValue {
     let cases = field(input, "cases");
-    let repeats = integer(input, "repeat").unwrap_or(1);
+    let repeats = number_field(input, "repeat").unwrap_or(1.0) as usize;
     let mut result = String::new();
     for k in 0..repeats {
         for i in 0..length(cases) {

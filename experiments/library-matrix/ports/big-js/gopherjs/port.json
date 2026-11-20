@@ -3,5 +3,5 @@
   "library": "big-js",
   "language": "gopherjs",
   "package": "./src",
-  "boundary": "Converts JSON fields to decimal operands and options, evaluates each operation and joins the results with newlines."
+  "boundary": "*js.Object reads each case; number options become *float64 (undefined and null nil), operands pass through the host String() with -0 as \"-0\", and the results join with newlines."
 }

@@ -4,5 +4,5 @@
   "language": "rust",
   "entry": "src/lib.rs",
   "crateName": "matrix_big_js",
-  "boundary": "Reads JSON operations, converts numeric inputs to decimal text and returns newline-separated computation results."
+  "boundary": "Reflect.get reads each case; number options become Option<f64> (undefined and null absent), operands pass through the host String() with -0 as \"-0\", and the results join with newlines."
 }

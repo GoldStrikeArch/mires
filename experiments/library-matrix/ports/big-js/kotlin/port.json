@@ -2,5 +2,5 @@
   "schema": 1,
   "library": "big-js",
   "language": "kotlin",
-  "boundary": "Converts JSON fields to decimal operands and options, evaluates each operation and joins the results with newlines."
+  "boundary": "External interfaces view the JS input with no copy; undefined and null options take their defaults, operands pass through JS String() with -0 as \"-0\", and the results join with newlines."
 }

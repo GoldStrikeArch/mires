@@ -3,5 +3,5 @@
   "library": "big-js",
   "language": "rescript",
   "entry": "src/Index.res",
-  "boundary": "Converts JSON fields to decimal operands and options, evaluates each operation and joins the results with newlines."
+  "boundary": "Records are the JS objects themselves; Nullable options take their defaults, an @unboxed operand variant passes numbers through String() with -0 as \"-0\", and the results join with newlines."
 }
