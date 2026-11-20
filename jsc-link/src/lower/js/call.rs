@@ -701,6 +701,20 @@ impl JsCx<'_> {
             (StandardOperation::StrLen, [s]) if is_str(*s)? => {
                 jsast::member(string(*s, &mut prelude, &mut hold)?, "length")
             }
+            // A byte string is ASCII when every code unit is; `core`'s word-at-a-time scan would
+            // first build the string's byte array and then read it through scalar views.
+            (StandardOperation::StrIsAscii, [s]) if is_str(*s)? => {
+                jsast::rt_call("_bstr_is_ascii", vec![string(*s, &mut prelude, &mut hold)?])
+            }
+            // The same answer one byte at a time over a `{ buf, off, len }` slice.
+            (StandardOperation::SliceIsAscii, [bytes])
+                if crate::lower::semantic_ops::string::is_immutable_u8_slice_ref(
+                    table,
+                    self.ty_of(*bytes)?,
+                ) =>
+            {
+                jsast::rt_call("bytes_is_ascii", vec![self.expr_of(*bytes)?])
+            }
             (StandardOperation::StrIsCharBoundary, [s, index]) if is_str(*s)? => {
                 let s = string(*s, &mut prelude, &mut hold)?;
                 let index = hold(self.expr_of(*index)?, &mut prelude);

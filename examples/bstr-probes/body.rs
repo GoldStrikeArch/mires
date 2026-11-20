@@ -260,6 +260,28 @@ pub fn inside(out: &mut dyn FnMut(&str)) {
         char::from_u32(0xd800),
         'é'.to_string().repeat(3)
     ));
+
+    // `str::is_ascii` and `<[u8]>::is_ascii` from every byte offset of a word (MIRES-018: `core`'s
+    // scan reads its first and last word unaligned).
+    let mut line = String::from("is_ascii");
+    for s in [
+        "The quick brown fox jumps over the lazy dog",
+        "a\u{e9} quick brown fox jumps",
+        "\u{1f600}abcdefghijk",
+        "The quick brown fox jumps \u{f6}",
+        "",
+    ] {
+        line.push(' ');
+        for start in 0..6 {
+            if let Some(part) = s.get(start..) {
+                line.push(if part.is_ascii() { 'T' } else { 'f' });
+                line.push(if part.as_bytes().is_ascii() { 'T' } else { 'f' });
+                let owned = String::from(part);
+                line.push(if owned.is_ascii() { 'T' } else { 'f' });
+            }
+        }
+    }
+    out(&line);
 }
 
 /// Host-boundary probes over one `&str` the host passed: `(name, answer)` pairs.

@@ -1645,6 +1645,15 @@ globalThis.__rt._bstr_is_ascii = (s) => {
 };
 const _bstr_wide = /[^\x00-\x7f]/;
 
+// bytes_is_ascii(s): `<[u8]>::is_ascii` on a `{ buf, off, len }` byte slice, one byte at a time
+// (`js-str=bytes`), where `core` reads a JavaScript array a word at a time through scalar views.
+// A byte is tested the way `core`'s own byte loop tests it, `b < 128`.
+globalThis.__rt.bytes_is_ascii = (s) => {
+  const buf = s.buf;
+  for (let i = s.off, end = s.off + s.len; i < end; i++) if (!(buf[i] < 128)) return false;
+  return true;
+};
+
 // bstr_out(s): a byte string as the host text it encodes. A byte string is
 // always well-formed UTF-8 (Rust's invariant), so ASCII text comes back as is;
 // non-ASCII strings <= 48 bytes decode in pure JS (zero Uint8Array /

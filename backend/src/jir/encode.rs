@@ -2175,6 +2175,8 @@ pub(crate) fn item_id<'tcx>(cgu: &CguCx<'tcx>, instance: Instance<'tcx>) -> Item
 /// the `Index`/`PartialEq`/`Ord` impl whose self type is `str`, with the exact argument types the
 /// lowering spells (a `&str` receiver; a `&str` or `char` pattern; a `usize` range of the four
 /// `core::ops` shapes). Anything else, a user method of the same name included, is untagged.
+/// One method of `impl [u8]` joins them, `is_ascii` (`&[u8] -> bool`), which `str::is_ascii` is
+/// written with: an inherent impl of a primitive type is one only `core` can write.
 fn str_operation<'tcx>(
     tcx: TyCtxt<'tcx>,
     definition: DefId,
@@ -2191,13 +2193,24 @@ fn str_operation<'tcx>(
         tcx.type_of(tcx.parent(definition))
             .instantiate(tcx, arguments),
     );
-    if !owner.is_str() {
-        return None;
-    }
     let signature = tcx
         .fn_sig(definition)
         .instantiate(tcx, arguments)
         .skip_binder();
+    let symbol = associated.name();
+    let name = symbol.as_str();
+    let byte_slice = |ty: Ty<'tcx>| matches!(ty.kind(), ty::Slice(element) if matches!(element.kind(), ty::Uint(ty::UintTy::U8)));
+    if byte_slice(owner) {
+        let byte_slice_ref = |ty: Ty<'tcx>| matches!(ty.kind(), ty::Ref(_, pointee, rustc_hir::Mutability::Not) if byte_slice(*pointee));
+        let exact = trait_id.is_none()
+            && name == "is_ascii"
+            && matches!(signature.inputs(), [receiver] if byte_slice_ref(*receiver))
+            && signature.output().is_bool();
+        return exact.then_some(StandardOperation::SliceIsAscii);
+    }
+    if !owner.is_str() {
+        return None;
+    }
     let str_ref = |ty: Ty<'tcx>| matches!(ty.kind(), ty::Ref(_, pointee, rustc_hir::Mutability::Not) if pointee.is_str());
     let [receiver, rest @ ..] = signature.inputs() else {
         return None;
@@ -2205,8 +2218,6 @@ fn str_operation<'tcx>(
     if !str_ref(*receiver) {
         return None;
     }
-    let symbol = associated.name();
-    let name = symbol.as_str();
     let lang = tcx.lang_items();
     let is_str_range_index = |index: Ty<'tcx>| {
         let ty::Adt(range, range_args) = index.kind() else {
@@ -2233,6 +2244,7 @@ fn str_operation<'tcx>(
         (None, "trim", []) => Some(StandardOperation::StrTrim),
         (None, "trim_start", []) => Some(StandardOperation::StrTrimStart),
         (None, "trim_end", []) => Some(StandardOperation::StrTrimEnd),
+        (None, "is_ascii", []) => Some(StandardOperation::StrIsAscii),
         (
             None,
             "starts_with"

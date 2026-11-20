@@ -1162,7 +1162,9 @@ unit per byte). Under `js-str=bytes`:
   reads give raw UTF-8 bytes (`charCodeAt`), and `is_char_boundary`, `&s[a..b]`, `str::get`,
   `strip_prefix`/`strip_suffix`, `trim*`, and `PartialOrd` lower directly over byte strings
   (`__rt.bstr_boundary`, `__rt.bstr_sub*`, `__rt.bstr_get*`, `__rt.bstr_trim*`, plus inline
-  `startsWith`/`endsWith`/`slice` and `<`/`===`) without UTF-8 array encoding. Closed read-only `as_bytes`/`as_ptr`/subslice/`offset`/`offset_from`
+  `startsWith`/`endsWith`/`slice` and `<`/`===`) without UTF-8 array encoding. A call of
+  `str::is_ascii` is `__rt._bstr_is_ascii(s)` and a call of `<[u8]>::is_ascii` is the byte loop
+  `__rt.bytes_is_ascii(slice)`, in place of `core`'s word-at-a-time scan. Closed read-only `as_bytes`/`as_ptr`/subslice/`offset`/`offset_from`
   clusters over immutable `&str`/`&String` (including MIR-inlined `String.vec`) stay directly on the
   byte string (`s.length`, `s.charCodeAt`); escaping views materialize `{ buf, off, len }` via
   `__rt.bstr_bytes`/`__rt.bstr_of` (memoized via `_bstr_memo` / `_bstr_src`, with single-pass

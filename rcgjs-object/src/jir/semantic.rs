@@ -226,10 +226,15 @@ pub enum StandardOperation {
     StrGet,
     /// `<str as PartialOrd>::partial_cmp`.
     StrPartialCmp,
+    /// `str::is_ascii`.
+    StrIsAscii,
+    /// `<[u8]>::is_ascii`, the byte-slice method `str::is_ascii` is written with. It is a `str`
+    /// call-site identity for the one reason the others are: only `js-str=bytes` lowers it.
+    SliceIsAscii,
 }
 
 impl StandardOperation {
-    /// Whether this is one of the `str` call-site identities.
+    /// Whether this is one of the `str` call-site identities (with `<[u8]>::is_ascii`).
     pub fn is_str(self) -> bool {
         matches!(
             self,
@@ -250,6 +255,8 @@ impl StandardOperation {
                 | Self::StrTrimEnd
                 | Self::StrGet
                 | Self::StrPartialCmp
+                | Self::StrIsAscii
+                | Self::SliceIsAscii
         )
     }
 }
