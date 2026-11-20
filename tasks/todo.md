@@ -1205,3 +1205,319 @@ port starts on broken plumbing.
 - [x] Added permanent regressions for Diff UTF-16 and patch filenames, JMESPath own properties and oversized bounds, Ky per-request errors, headers and method matching, Workbox Request normalization, Big.js wide exponents, Long shift and rotation counts, and d3-hierarchy signed-zero aggregation.
 - [x] Corrected uPlot's per-frame path capture, empty nearest indexes and fractional canvas sizing. The native canvas verifier passed 19 snapshots and 100 generated charts per port in each browser. Rebuilt all nine Explorer component locks and verified the same transitions through the app, including the separate 1,152-comparison Chrome and Firefox audit.
 - [x] Added benchmark input collision tests, verified the builds, and refreshed the [matrix report](../experiments/library-matrix/MATRIX.md). Across the ten reviewed workloads, all 486 readable and minified checks passed on the available engines, covering 45,414 corpus comparisons. All 324 timing cells passed with 24 samples per arm. Timing workloads ran one at a time after the last parity check. The other 72 report rows matched the previous report exactly. Safari WebDriver required remote automation to be enabled.
+
+## Correctness batch + library-matrix double-check (2026-11-20; plan `~/.claude/plans/expressive-cuddling-shell.md`, approved)
+
+User decisions: full read of every matrix port before the merge; compiler bugs MIRES-017..020 first, then MIRES-006..010; **up to 5 concurrent subagents this round** (2 compiler + 3 review; exception to the 3-agent cap). Implementers Opus 5.5 xhigh; verifiers and reviewers Opus 5.5 high. Briefs: `build/correctness-batch/briefs/`, `build/library-matrix/review-20261120/briefs/`.
+
+- [x] Step 0: snapshot commit of the matrix on `codex/library-matrix-earcut` (`8a66f74`; `main` untouched at `f525806`). Workstream A branches start from `8a66f74` (compiler sources = `f525806`; the commit adds the repros and ports the A gates use).
+- [x] Shared base build for verifier control runs: `.claude/worktrees/cb-base` @ `8a66f74` (jsc-link `f70f74b6…`, dylib `e59a41bb…`). Core gate: unwind 181/181, abort 181/181, **inline-on + `-Oz` 170/181**.
+  - The 11 failures are 08_closures, 09_drop, 10_dyn, 103_boxed_fn_once, 115_zst_element_pointers, 15_ptr (compile-error); 15_intrinsics, 10_panic, 25_array_ref, 332_r3_assert_tc_panic (output-mismatch); guard_use_after_free (unexpected-success).
+  - The M1 verifier measured 176/180 with only 4 failures on `d93c692`.
+- [ ] A10 (queued) triage of the 7 new inline-on failures: bisect `d93c692..f525806` under identical settings. Either something regressed or the M1 run's settings differed.
+
+### Workstream A — compiler correctness (branches `fix/mires-0NN`, stacked on `fix/correctness-batch`)
+- [x] A1 MIRES-019 promoted `Option<&T>` constant decodes to None (fixtures 347–349)
+  - Implementer PASS (`fix/mires-019`: `10cd489` fix, `ebae673` fixtures; worktree `agent-ad7c33423a8a7dbbf`).
+  - **Verifier: PASS-WITH-NOTES.** Evidence `build/a1-019-verify/`.
+    - The gate equals cb-base plus 347–349. Head JS is byte-identical to the implementer's.
+    - The adversarial probes (offsets into constants, nested `Option`s, tables, newtypes, fn-pointer tables, generic/assoc/trait consts) match native in JIR and v1.
+    - The `check.sh` fmt and clippy failures are confirmed pre-existing on cb-base. `cargo test`: 1226 passed.
+  - **Integrated:** `fix/correctness-batch` = `ebae673`.
+  - **Accepted limits** (predate the change; proposed CONTRACT.md text):
+    - "Constants and statics holding a reference into the middle of another `static`, or a `&dyn` pointer (also inside `Option`), are refused at compile time."
+    - The `&dyn` case was silently None before, and is now a refusal.
+  - Gate (base → head):
+    - unwind 181/184 → 184/184;
+    - abort 181/184 → 184/184;
+    - inline 170/184 → 173/184.
+    - Only 347–349 flip.
+  - Root cause: `raw::variant_index` read a provenance tag's offset bytes as a number.
+  - Workaround-reverted ports all pass on head: marked, long, big-js, diff.
+  - MIRES-006 and 010 probes are unchanged, so they have a different root cause. The probes now sit in the A1 evidence dir `build/a1-019/probes-006-010/`, because the M1 path is gone.
+  - `check.sh` fails at `cargo fmt --check` and at workspace clippy (jsc-link). The implementer says this is pre-existing; the verifier checks it on cb-base.
+  - Adjacent: an `Option<&dyn Fn>` constant used to be silently None and is now a compile refusal (`raw::is_wide_pointee`). Queued.
+- [x] A2 MIRES-017 structurizer switch last case without `break` / `from_utf8_lossy` "bad block" (350–352)
+  - Implementer PASS (`fix/mires-017`: `aeb0515` fix, `284c99b` fixtures; worktree `agent-ac263c33e7e823cb1`). Verification is running.
+  - Root cause: `structurizer` `compile_dispatch` let a dispatch's last case fall into `default: throw`. The fix is `close_last_case`, and the property test now models the guard.
+  - `from_utf8_lossy` (`Utf8Chunks::next`) has the same cause: fixture 351.
+  - Gate equals cb-base row for row, plus the 2 new rows. The only emitted-JS change is one `break;` per affected program.
+  - diff with the workaround reverted: 234 → 251/251.
+  - marked: no pre-workaround source survives. A reconstruction that adds back the `text` accumulator shows 64/80 on base and 80/80 on head.
+  - Its denied tool call (`cargo fmt --check` naming git in cb-base) was redone in its own worktree.
+  - **Verifier: PASS-WITH-NOTES.** Evidence `agent-ac263c33e7e823cb1/build/a2-017-verify/`.
+    - The gate equals the implementer's, row for row.
+    - The property test with the guard: 5 seeds × 60k graphs × 3 option sets fail on base and pass on head.
+    - The probes match native: `from_utf8_lossy` in every form, async/dyn/closure, and a new 14-state user machine (v04, which fails on base inline).
+    - Reconstruction C is accepted as evidence. `cargo test`: 1230 passed.
+  - **Integrated:** cherry-picked onto `fix/correctness-batch`, which is now `b952e89` (A2 = `635edac`, `b952e89`). Integration worktree: `.claude/worktrees/cb-integration`.
+  - Adjacent (predates the change; reproduces on cb-base):
+    - `String::into_boxed_str()` with spare capacity, then drop, throws "not a live heap block". This is the queued **MIRES-011**.
+    - **New, MIRES-022:** `Vec<String>::sort_unstable()` with ≥40 elements throws "`copy_nonoverlapping` … reaches past the end of a buffer of 1" in core smallsort `sort4_stable`, in all modes. Repro: verifier `probes/v05_sort.rs`.
+  - Follow-up: the verifier's `probes/v04_wide.rs` could become fixture 352.
+- [ ] Infra (found by A1 and A2): `scripts/check.sh` fails on base at `cargo fmt --all --check` (16+ files) and at workspace clippy (14 jsc-link errors), so it is not a usable gate as it stands. Queue a fmt+clippy cleanup commit, separate from the fixes.
+- [~] A3 MIRES-018 `is_ascii` under `js-str=bytes` (353–355): **implementer PASS, verifier not started (pause)**.
+  - Branch `fix/mires-018` (`251fcc6` runtime fix + fixtures, `a149912` direct lowering), base `ebae673`. Worktree `agent-ae3e1aeab0a4d3c4c`. It must be rebased onto `fix/correctness-batch` (`09d8e85`) at integration.
+  - **Root cause:** `__rt._scalar_view` named element `i` as the word at byte `i*width`, so `off % width != 0` threw. The bug is not bytes-specific: utf16 fails on the first word, bytes on the last.
+  - **Fix:**
+    - per-phase views (byte offset mod width); `scale` and `addr` add the phase back;
+    - `StrIsAscii` / `SliceIsAscii` StandardOperations, authenticated as inherent impls on the primitive with the exact signature;
+    - `str::is_ascii` lowers to `_bstr_is_ascii`, and `[u8]::is_ascii` to `__rt.bytes_is_ascii`.
+  - **Gate:** unwind and abort 184 → 187/187; inline 173 → 176/187 (the same 11 failures); bytes and utf16 core 187/187; `bstr-probes` 132/132.
+  - marked with the workaround reverted: 70/80 → 80/80. Emitted-JS flips come from the embedded shim text; attribution was proved with a control build.
+  - **For the verifier and the user:** `scripts/native-values.test.mjs` had an assertion that an odd-offset u32 view throws. That assertion encoded the bug, and the implementer changed it to assert values. Confirm it is the bug's own expectation.
+  - Adjacent:
+    - **MIRES-025 (safe Rust, silent):** `str::to_ascii_lowercase` / `make_ascii_lowercase` through `&mut str` return the text unchanged, because writes through `str_bytes_mut` land in a detached copy.
+    - **v1-lane `byte_add` on a word pointer cast from bytes** reads one byte (unsafe only). It is newly reached: it threw before and is now wrong. Proposed fix: pass the scalar kind to `thin`. Decide whether it blocks A3.
+    - SipHasher `copy_nonoverlapping` scale mismatch.
+    - Proposed CONTRACT limit: a fresh block written only via `*mut u8` retypes on its first word cast.
+- [x] A4 MIRES-020 `SpreadNotTuple` closure call with cleanup (356–358)
+  - Implementer PASS (`fix/mires-020`: `4fa6cd3`, `1d97b60`, `09d8e85`; worktree `agent-ab253368484116b80`). Verification is running.
+  - Root cause: at `-Oz`, a literal closure argument tuple with a one-scalar layout becomes `ConstValue::Scalar`, which `call_arguments` refused. The fix decodes it through a scratch allocation by its type.
+  - Gate (base `b952e89`):
+    - unwind and abort: 189/189, logs byte-identical;
+    - inline: 175 → 179/189, with **103_boxed_fn_once FAIL→PASS** (same root cause);
+    - z census: 25 declines → 0.
+  - noble with the workaround reverted: 285/285.
+  - Adjacent: `cargo test` `lower::ssa::fixtures` dual-interpreter mismatch on a base-built `-Oz` object (`x114_zst_aggregate_drops::partial`). Queued for triage.
+  - **Verifier: PASS-WITH-NOTES.** Evidence `agent-ab253368484116b80/build/a4-020-verify/`.
+    - The gate and JS equal the implementer's.
+    - The probes cover `Fn`/`FnMut`/`FnOnce`, generic fn items and pointers, nested dyn packs, and extreme ints, floats and niches. They match native, except one pre-existing NaN-payload line.
+    - `cargo test` passes. The x114 SSA mismatch did not recur; it came from a stray base-built object.
+  - **Integrated:** `fix/correctness-batch` fast-forwarded to `09d8e85`.
+  - New adjacent bugs (reproduce on cb-base):
+    - **MIRES-023**: f32/f64 NaN payloads in constants are lost under inline + `-Oz` (native 2143289344, mires …345). Repro: verifier `probes/src/v4p_nan_plain.rs`.
+    - **MIRES-024**: a promoted `&fn_item` passed to `F: Fn` is refused in every mode ("constants of type `fn(u32) -> u32 {twice}` cannot be read out of an allocation"). Safe Rust. Repro: `probes/src/v3_fnitem_ref.rs`.
+- [ ] A5 MIRES-006 `NonZero::new(5)` const under inline + `-Oz` (359–361; after A1)
+- [ ] A6 MIRES-010 signed-niche decode (362–364)
+- [ ] A7 MIRES-007 `u8` view of `[u16]`/`[u32]` (365–367)
+- [ ] A8 MIRES-008 byte arithmetic on a retyped allocation pointer (368–370; accepted limit if unsafe-only)
+- [ ] A9 MIRES-009 v1 `NonNull<u8>`→`usize` transmute (371–373)
+- [ ] A11 MIRES-022 `sort_unstable` on `Vec<String>` (≥40 elements) throws in smallsort `sort4_stable` (374–376). New, from the A2 verifier.
+- [ ] A12 MIRES-011 `Box<str>` drop / `into_boxed_str` with spare capacity (377–379).
+- [ ] A13 MIRES-023 NaN payload in f32/f64 constants under inline + `-Oz` (380–382).
+- [ ] A14 MIRES-024 promoted `&fn_item` constant refused (383–385).
+- [ ] A15 MIRES-025 `to_ascii_lowercase`/`make_ascii_lowercase` via `&mut str` silently unchanged (386–388).
+- [ ] Integrated gate on `fix/correctness-batch`; merge into `main` after the matrix merge, user OK; update `MIRES-BUGS.md`.
+
+### Workstream B — matrix port review (read-only, then fixes)
+- [x] B1 marked: Rust, ReScript, Scala.js, Kotlin, Dart. Evidence `build/library-matrix/review-20261120/b1/`.
+  - ReScript, Scala.js, Kotlin and Dart are ACCEPT, with 0 divergences on ~319k differential inputs.
+  - **Rust is FIX**, with 4 in-domain divergences. The coordinator re-ran `b1/rust-repro.mjs`: every case is DIFF on readable and min. The four:
+    1. `.` in marked's regexes stops at `\r`, U+2028 and U+2029, but the Rust scanners treat only `\n` as a line end. This hits heading, lheading, table rows, def `<.*?>` and the pedantic link.
+    2. `slice(indent)` and the `{1,999}` label bound count UTF-16 code units in JS; Rust counts code points (`lexer.rs:692,1554`, `block_rules.rs:1303`, `inline_rules.rs:955`).
+    3. `is_lheading_table_at` does not backtrack the optional leading `|` (`block_rules.rs:1779`).
+    4. `match_pedantic_href_title` does not backtrack the quote (`inline_rules.rs:894`).
+  - For B-fix:
+    - correct the overclaim at `NOTES.md:32`;
+    - `raw_len` `1 +` (`lexer.rs:162`) is a note only;
+    - `CONTRACT.md` should state the `.` and UTF-16 count rules, and fix two off-by-one line references;
+    - add the `rust-repro.mjs` cases to the marked corpus. The corpus change re-checks all 9 marked ports.
+- [x] B2 marked: OCaml core (Melange/jsoo), Elm, GopherJS. Evidence `build/library-matrix/review-20261120/b2/`; about 1.1M differential comparisons per port.
+  - GopherJS: ACCEPT-WITH-NOTES. The regex rules are exact; strings are `*js.Object`, with the reason declared in NOTES.
+  - **OCaml core: FIX for both Melange and jsoo** (9 shared files are byte-identical).
+    - `rules.ml:84` has a stray `}`: `{re|})(?: +|$|/?>)` after the tag list. So `- a\n<ul>…` diverges.
+    - The `advance` closures in `lexer.ml:115` (block) and `:242` (inline) recurse without being tail calls. The coordinator reproduced "Maximum call stack size exceeded" on 20 KB `# h\n`×5000 and `_a_ `×5000 in both builds. NOTES claims the loops are tail-recursive.
+  - **Elm: FIX**, three matcher divergences. They are the same classes as Rust's:
+    1. `lineEnd` (`BlockRules.elm:70`) ignores `\r`, U+2028 and U+2029;
+    2. `isLHeadingTableAt` (`:3062`) does not backtrack the optional leading `|`;
+    3. `matchDefPedantic` (`:2607`) does not backtrack the optional `<`.
+  - Notes:
+    - Elm stops silently where marked throws "Infinite loop"; this is undeclared.
+    - OCaml has two equivalent undeclared simplifications (skipping `inline.del`, `splitCells` without `findPipe`).
+    - CONTRACT says "compiled at module load", but the reference builds its indent regexes lazily.
+    - Proposed: B2's `regex-capture.mjs` as a standing check for the host-RegExp ports.
+  - Corpus additions proposed by B1 and B2: `- a\n<ul>…`, `|\n---\n`, `# a b`, pedantic `[a]: <>`, the 20 KB repeat inputs, and B1's `rust-repro.mjs` cases.
+- [ ] **marked B-fix** (one implementer owns corpus, CONTRACT and the Rust, OCaml and Elm ports). After it, all 9 marked ports are re-checked in 3 envs and re-timed in the quiet window, because the corpus digest changes.
+- [x] B3 minisearch: 9/9 no blocking (7 ACCEPT, Rust and GopherJS ACCEPT-WITH-NOTES); corpus 58/58 on readable + min, differential fuzz 19,100 scripts with 0 diffs. Evidence `build/library-matrix/review-20261120/b3/`. For B-fix:
+  - Rust: workarounds for the fixed MIRES-001..004 are untagged (`index.rs:645,1005`, `searchable_map.rs:229`, `options.rs:94-107`). `NOTES.md:51` cites "bug 1..4" and old paths. Retag them, and remove each or give a reason it stays. This rebuilds the Rust row on the current compiler, which picks up `js-str=bytes`.
+  - `CONTRACT.md:629` Rust guidance is stale (fixed bugs, old repro dir). `CONTRACT.md:708` GopherJS "special-case Σ" is not enough: İ (U+0130) needs the host path.
+  - The GopherJS row times the tuned rewrite (the idiomatic one was 7.6×/7.2×). Add the MATRIX.md footnote decided in wave 2, which was never added.
+- [x] B4 fflate. Evidence `build/library-matrix/review-20261120/b4/`.
+  - ReScript, Melange, jsoo and Scala.js: ACCEPT. GopherJS and Dart: ACCEPT-WITH-NOTES (Gunzip recursion overflows at 4,000 and 6,000 members; npm at ~7,000). **Rust, Kotlin and Elm: FIX.**
+  - The blocking finding: npm drops literals past its output buffer, and these three ports keep them. The coordinator re-ran `litrun.mjs`: npm gives 150,084 B, Rust and Kotlin 200,000 B, ReScript matches npm.
+  - Rust has two more findings:
+    - Gunzip recursion overflows at 2,150 members.
+    - `vec![0u8; ISIZE]` throws or OOMs at 128 to 512 MiB. This is a mires defect, so it becomes MIRES-021.
+  - Coordinator decisions:
+    - reproduce npm's literal drop (faithful), and correct `CONTRACT.md:345`;
+    - bound the multi-member gzip domain at 1,000 members, with no loop rewrites;
+    - log MIRES-021 with a repro; no port workaround.
+  - Brief: `briefs/fix-fflate.md`.
+- [x] **fflate B-fix**: committed `f0f4099`.
+  - The literal drop now matches npm in Rust, Kotlin and Elm. Elm tracks npm's `cap` and the zero-fill.
+  - CONTRACT gets the buffer rule, the 1,000-member gzip bound, quirk 3, empty-first-push and the guard text.
+  - MIRES-021 has a repro. The abort starts at ~224 MiB, not 512.
+  - The corpus goes from 83 to 89 cases (1.2 to 3.1 MB). 54/54 receipts pass.
+  - Checker time is 108 → 182 s across all ports.
+- [x] R-big-js: committed.
+  - Kotlin, Dart, Scala.js, GopherJS, ReScript and Melange/jsoo are rewritten by hand, function by function against `big.mjs`; Melange and jsoo share one OCaml core. Rust and Elm were fixed in place.
+  - sqrt validates dp via `div(DP+4)` and runs npm's exact iteration. Inputs where npm never terminates are outside the domain.
+  - The exponent is parsed once, and null dp/rm take the defaults.
+  - The corpus goes from 16 to 28 cases (3,263 ops). 54/54 receipts pass; the shim grep is clean.
+  - Minified sizes grew for the honest code: Kotlin 20.5 → 40.7 KB, Scala.js 47 → 75 KB, Melange 12 → 17 KB, Dart 57 → 67 KB.
+- [ ] **minisearch B-fix** (small): Rust retag/remove the MIRES-001..004 workarounds and update NOTES; the two `CONTRACT.md` corrections; the GopherJS footnote.
+- [x] marked B-fix: committed `819b612`.
+  - Rust: F1–F4, plus two more backtracking cases (pedantic def `<?`, nolink) and the m-flag anchors.
+  - OCaml: the stray `}`, and the loops are now direct tail calls (100 KB inputs pass).
+  - Elm: the three findings, plus the label bound, pedanticHrefTitle and nolink.
+  - The corpus goes from 80 to 111 cases. Receipt `marked.summary.json`: 54/54 cells pass (9 ports × 3 envs × readable and min).
+  - Fuzz reruns: 0 divergences, apart from B2 `stress`: a 200-level nested list that Rust handles only to ~200–280 levels (others ~500–1,000, marked ~2,490; already so on `8a66f74`).
+  - Implementer correction: the `Tokenizer.ts` line references 474/783 were right (1-based); B1 was wrong.
+- [ ] **marked follow-up** (coordinator decision):
+  - add a nesting-depth bound of 100 levels to the `CONTRACT.md` parity domain, with a corpus case at 100;
+  - log **PERF-005**: mires-generated frames are large, so Rust marked overflows at ~200 nested levels against ~1,000 for other ports;
+  - a fresh reviewer re-checks B1 and B2's fail reasons on `819b612`.
+- Note: an empty untracked file `выаовылав` appeared at the repo root at 12:13. No agent created it. It is left in place and never committed; ask the user.
+- [~] fflate B-fix: running.
+- [x] B5 earcut + noble-hashes: **no blocking** across 18 ports. 194 + 300 earcut edge cases, large rings up to 100k vertices, 1,506 noble boundary cases and multi-MiB messages all match npm. No stack issues: npm's earcut recursion depth is ≤53. All 9 noble ports keep noble's hi/lo 32-bit lanes. Evidence `build/library-matrix/review-20261120/b5/`.
+- [ ] **docs B-fix: earcut + noble**:
+  - noble `CONTRACT.md`: optional fields may not be `null` (coordinator decision: outside the domain; Melange, Dart, Kotlin and Elm treat null as absent where npm throws). Also say that npm ignores `dkLen`, `key`, `salt` and `personalization` on SHA-2/3.
+  - earcut `CONTRACT.md:333`: hole indices are strictly increasing. Complete the Caching row (`steiners`, `filteredOut`, `indexActive`, …), and fix the `steiner` flag wording.
+  - earcut corpus: one case with an Infinity z-order scale and one with Morton arguments above 2^64.
+  - noble: a `NOTES.md` for the 8 ports without one, declaring the carry formula, the shared BLAKE2 mix and the one-call `digest(chunks)`.
+  - Rust earcut: per-site PERF-004 comments.
+- [x] B6 diff + jmespath: **all 18 ports FIX**. The core algorithms are faithful, but the ports were transliterated from one shared design and repeat the same in-domain divergences. The coordinator re-ran `b6/repro.mjs` and every listed case reproduces. Evidence `build/library-matrix/review-20261120/b6/`.
+  - diff:
+    - D1 git extended headers matched by prefix, not npm's regex (`.`/`\d`, CRLF) — all 9;
+    - D2 hunk headers split on spaces, so CRLF patches throw — 7;
+    - D3 index/file-name extraction — all 9;
+    - D4 the applyPatch first-candidate clamp — all 9;
+    - D5 an early return that does not throw — all 9;
+    - D6 the Scala.js UTF-8 decoder;
+    - D7 Elm recursion overflows at 3,000 files;
+    - the ReScript diff port is OCaml in ReScript syntax with stdlib shims (an idiom finding, blocking).
+  - jmespath:
+    - J1 single-pass filters (wrong error wins) — all 9;
+    - J2 `max`/`min` vs `Math.max`/`Math.min` for -0 and NaN — all 9;
+    - J3 `type(undefined)` — all 9;
+    - J4 the JS `trimLeft` set — Scala.js, Kotlin, Dart, GopherJS;
+    - J5 `__proto__` — Dart, Elm;
+    - J6 Elm `traverse` overflows at 2,000 records;
+    - J7 Elm `abs(-0)`.
+  - Coordinator decisions:
+    - J5: inherited names go outside the domain;
+    - nesting depth: a measured bound in `CONTRACT.md` for both libraries;
+    - Elm wide-input overflows are fixed in the port.
+  - Harness: jmespath `category()` maps a stack overflow to `"syntax"`. The coordinator fixes this after the reviews.
+- [x] **R-diff**: committed.
+  - Rewritten by hand: Kotlin, Scala.js, ReScript, and **Dart**, which also came from `jvm/gen.py` and which the census missed.
+  - Rust, OCaml, GopherJS and Elm were fixed. D1–D7 are fixed in all 9, plus 4 shared defects: `__proto__` keys, UTF-16 line length, astral-safe quoted names, and `reversePatch` copies.
+  - The domain is narrowed explicitly (patch options, no apply options, `diffArrays` ignoreCase, integer hunk positions). The `diffJson` nesting bound is 1,000.
+  - The corpus goes from 251 to 411 cases. 54/54 receipts pass.
+  - Re-review notes:
+    - GopherJS keeps pre-1.21 `smaller`/`larger` helpers (Go 1.21 has builtin `min`/`max`);
+    - `differ.ml` keeps its dense layout outside the rewritten Myers function.
+- [ ] **jmespath B-fix** (`briefs/fix-jmespath.md`): all 9 ports, corpus and contract.
+- [x] B7 d3-hierarchy + lz-string. Evidence `b7/`.
+  - lz-string: 9/9 ACCEPT-WITH-NOTES (4,158 random and corrupt cases, plus 300k-unit inputs).
+  - d3 Rust: ACCEPT-WITH-NOTES. **The 8 other d3 ports: FIX.**
+    - The geometry is generated by `dev-d3/emit.py` in 7 ports.
+    - `roundf` is `floor(x+0.5)`, not `Math.round`.
+    - The recursive `hierarchy()` build overflows on deep chains: Elm at 1,500, ReScript at 2,500, the others at 4,000–6,000; npm is iterative.
+    - Elm NaN comparisons are inverted (`_Utils_cmp`): wrong squarify layouts and 16 pack hangs.
+  - Harness: `structuredClone` fails above ~1,500–2,000 nesting levels, so deep cases must travel as flat rows. `verify.mjs`'s `deepEqual` hides -0.
+- [x] B8 long + big-js. Evidence `b8/`.
+  - long: 7 ACCEPT-WITH-NOTES. **GopherJS FIX**: `Get(n).Int()` reads 1e21 as 1. **Scala.js FIX**: the Int facades wrap past int32.
+  - **big.js: all 9 FIX.**
+    - sqrt computes `max(dp+4, …)` and so never throws for an invalid dp, where npm throws.
+    - **7 ports are generated by `dev-big-js/translate.py`** from `core.py`; jsoo is a byte copy of Melange.
+    - Dart and Elm sum the exponent digit by digit in a double, so it is wrong above 2^53.
+  - Notes: the sqrt early-return shortcuts are undeclared; per-port recursion limits on leading hyphens; null-option handling.
+- [x] **Generator census (coordinator).** `build/library-matrix/dev-*` holds git-ignored Python generators that wrote port sources, none of it declared:
+
+  | Library | Generated ports | Script |
+  |---|---|---|
+  | big-js | 7 | `translate.py` |
+  | idb | 6 | `translate.py` |
+  | ky | 7 | `translate.py` + `dart.py` |
+  | workbox | 7 | `dev-wb-comparators` |
+  | noble-hashes | 8 | sha2/sha3/blake generators |
+  | d3 geometry | 7 | `emit.py` |
+  | uplot | Kotlin, Scala.js, Dart, GopherJS | `emit.py` |
+  | jmespath | Dart, Kotlin, Scala.js, plus ReScript via `resgen` | `native/emit.py` |
+  | diff | Kotlin, Scala.js (`jvm/gen.py`), plus ReScript via `resgen` | |
+
+  earcut has only post-edit scripts. marked, minisearch, fflate, earcut, lz-string, long, the Rust ports and most Elm ports are hand-written.
+- [x] **User decision (2026-11-20):** rewrite every generated port by hand, idiomatically, before the merge. Hold the diff and jmespath fixes until their rewrites, so each library is one rewrite-plus-fix item.
+- [ ] **R-items (rewrite + fix, one implementer per library; no code generators allowed; afterwards a fresh reviewer):**
+  - R-big-js: 7 ports, plus the sqrt dp fix in all 9, plus the Dart/Elm exponent parse.
+  - R-noble: 8 ports.
+  - R-d3: the geometry in 7 ports, `roundf`, iterative `hierarchy()`, Elm NaN, and a contract domain bound.
+  - R-jmespath: Dart/Kotlin/Scala.js/ReScript, plus J1–J7 in all 9 (`briefs/fix-jmespath.md`).
+  - R-diff: Kotlin/Scala.js/ReScript, plus D1–D7 in all 9 (`briefs/fix-diff.md`).
+  - R-idb, R-ky, R-workbox, R-uplot: after the B9 and B10 findings.
+  - long-fix (small): GopherJS `Int()` and the Scala.js Int facades.
+- [x] B9 idb + ky + workbox (27 ports). Evidence `b9/`. The coordinator re-ran `ky-probe.mjs`: the divergences reproduce.
+  - Generated (re-run and diffed by the reviewer):
+    - idb: 6 ports;
+    - ky: 7 ports;
+    - workbox: 6 ports.
+
+    Rust ky and Dart idb follow the generated design. No port has a NOTES.md.
+  - **The Elm hosts implement the library** in all 3 rows.
+  - The Rust error paths skip cleanup: idb leaks a database, workbox leaks a cache.
+  - ky, all 9:
+    - only `Retry-After` is read;
+    - no HTTP-date parsing;
+    - 413 with an empty value does not retry;
+    - the value is trimmed;
+    - the charset is ignored;
+    - no option validation;
+    - the trim set varies per language.
+  - workbox:
+    - no http-protocol check (`data:,x` is served);
+    - the `relative()` helper diverges.
+  - **The idb and workbox ports are flattened scenario reimplementations** (no `openDB`/`wrap`/`tx.done`; no PrecacheController/Strategy).
+- [x] **User decisions (2026-11-20):**
+  - idb and workbox: re-scope the contracts so ports implement the library's real structure for a subset;
+  - Elm host-API rows: all library logic moves into Elm, and the host only executes I/O primitives.
+- [ ] R-idb and R-workbox, in two phases each:
+  1. Contract redesign plus the reference adapter plus the corpus, proved with a Rust rewrite (`briefs/r-host-contract.md`), then a fresh reviewer checks the contract against npm.
+  2. The 8 other ports, in 2 batches of 4 languages.
+- [ ] R-ky (`briefs/r-ky.md`): 7 generated ports plus Rust rewritten, Elm logic moved into Elm, all divergences fixed.
+- [x] R-jmespath: committed `724efe4`.
+  - Rewritten: Kotlin, Dart, Scala.js, ReScript, plus GopherJS (a transliteration of the shared core) and Elm. Rust, Melange and jsoo were fixed in place; Melange/jsoo stay byte-identical.
+  - J1–J7 fixed in all 9, plus the expref tag, the NaN slice and 4 more shared defects:
+    - binding power `[a[*] \`1\`]`;
+    - `strictDeepEqual` with undefined values;
+    - `sort_by` via the engine sort;
+    - an undefined index gives null.
+  - Nesting bound 500 (npm's lowest is 918, in Firefox). Rust needed its `eval` arms split.
+  - The corpus goes from 227 to 247 cases. 54/54 receipts pass, plus 18 unavailable for Safari. The shim grep is clean, and every port has a NOTES.md.
+  - Two Elm-only exclusions are documented: `sort_by` error order, and a re-evaluated expref.
+  - Lesson: NOTES.md is part of the build fingerprint.
+- [x] R-noble: committed.
+  - All 8 generated ports were rewritten by hand on noble's own structure: `_u64` helpers, a HashMD base, keccakP, `_BLAKE2` with separate b/s mixes, and HMAC. Melange and jsoo share 9 byte-identical files. Rust changed only its NOTES.
+  - The corpus goes from 285 to 431 cases (5.6 MB), with 2 MiB messages and 200k updates. 54/54 receipts pass; the provenance grep is clean.
+  - Sizes grew modestly: ReScript 11.8 → 15.8 KB, GopherJS 75.8 → 93.1 KB.
+  - Dart and Kotlin still treat null as absent, which is out of the domain and declared.
+- [x] B10 uplot + Explorer glue (+ pilot/floor sanity). Evidence `b10/`.
+  - **uplot: all 9 FIX.**
+    - Plot size uses `Math.round(d*2)/2` instead of `incrRound` with `fixFloat`/`roundDec` (`[32.24999999,20]`).
+    - GopherJS `rounded()` is `floor(v+0.5)`.
+    - The Elm host computes stroke, offset and clip, which is library logic.
+    - Kotlin, Scala.js, Dart and GopherJS are generated (`dev-uplot-cmp/emit.py`).
+    - No port has a NOTES.md.
+  - Explorer: ACCEPT or ACCEPT-WITH-NOTES. Its component locks are stale after the marked and fflate fixes.
+  - pilot and floor: 9/9 ACCEPT.
+- [ ] **R-uplot** (`briefs/r-uplot.md`).
+- [ ] **Explorer re-lock and rebuild** after all component fixes and rewrites (minisearch, marked, fflate, idb, uplot). Also the Elm Explorer host `reply` check, and declare the `Array.from` boundary step in `CONTRACT.md`.
+- [~] R-diff: running.
+- [ ] B-fix per library with FIX verdicts; fresh reviewer re-checks only the fail reasons
+- [ ] B-time: quiet window, re-time changed cells (24 samples), regenerate MATRIX.md, no stale receipts
+- [ ] Merge: commit fixes on the branch; user OK; fast-forward `main`
+
+### PAUSE — user, 2026-11-20: "stop all agents after the current ones are done" (reached: all five finished; no agent running)
+Running at the pause, allowed to finish: A3 implementer (MIRES-018), A4 verifier (MIRES-020), R-diff, R-big-js, R-noble. No new agent is launched. On resume, the queue is:
+- A3 verifier;
+- A5–A9, A10 (inline-on triage), A11 (MIRES-022), A12 (MIRES-011), the SSA-fixture mismatch triage, and the `check.sh` fmt/clippy cleanup;
+- R-d3, R-uplot, R-ky;
+- R-idb and R-workbox, phase 1 then phase 2;
+- long-fix;
+- docs fix (earcut, noble, minisearch Rust retag, marked nesting bound, PERF-005);
+- Explorer re-lock;
+- the re-reviews of every fixed or rewritten library;
+- the jmespath harness `category()` bug;
+- the quiet re-time;
+- the matrix merge, then the correctness-batch merge (user OK each).
