@@ -300,8 +300,11 @@ pub fn changes(mode: u8, before: &[String], after: &[String], o: &Options) -> Ve
     for r in runs {
         let mut value = String::new();
         for j in 0..r.count {
+            // diffJson keeps the longer of two equal lines, by UTF-16 length.
             let token = if r.kind == REMOVE
-                || (mode == JSON && r.kind == KEEP && before[old + j].len() > after[new + j].len())
+                || (mode == JSON
+                    && r.kind == KEEP
+                    && crate::utf16::units(&before[old + j]) > crate::utf16::units(&after[new + j]))
             {
                 &before[old + j]
             } else {

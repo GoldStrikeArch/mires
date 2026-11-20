@@ -31,7 +31,7 @@ js_bindings! {
     #[js(get="length")] fn len(a:JsValue)->usize;
     #[js(new="Array")] fn array(n:usize)->JsValue;
     #[js(new="Object")] fn obj()->JsValue;
-    #[js(call="Object.create")] fn dictionary(proto:JsValue)->JsValue;
+    #[js(call="Reflect.deleteProperty")] fn delete(o:JsValue,k:JsValue)->bool;
     #[js(call="Object.keys")] fn keys(o:JsValue)->JsValue;
     #[js(method="sort")] fn sort_keys(v:JsValue)->JsValue;
     #[js(call="Array.isArray")] fn is_array(o:JsValue)->bool;
@@ -49,6 +49,14 @@ fn prop(o: JsValue, k: &str, v: JsValue) {
 }
 fn number(o: JsValue, k: &str, n: usize) {
     prop(o, k, JsValue::erase(n as u32))
+}
+fn float(o: JsValue, k: &str) -> f64 {
+    let x = field(o, k);
+    if x.is_number() {
+        x.read::<f64>()
+    } else {
+        f64::NAN
+    }
 }
 fn text(v: JsValue) -> String {
     utf16::read(v)
@@ -90,8 +98,10 @@ fn canonical(v: JsValue) -> JsValue {
     if !v.is_object() {
         return v;
     }
+    // canonicalize() assigns the sorted keys to a plain object, so a
+    // "__proto__" key sets its prototype and is not serialized.
     let names = sort_keys(keys(v));
-    let o = dictionary(JsValue::null());
+    let o = obj();
     for i in 0..len(names) {
         let key = at(names, i);
         put(o, key, canonical(get(v, key)))
@@ -173,30 +183,23 @@ fn read_patch(o: JsValue) -> Patch {
     for i in 0..len(hunks) {
         let h = at(hunks, i);
         p.hunks.push(Hunk {
-            old_start: nat(h, "oldStart", 1),
-            old_lines: nat(h, "oldLines", 0),
-            new_start: nat(h, "newStart", 1),
-            new_lines: nat(h, "newLines", 0),
+            old_start: float(h, "oldStart"),
+            old_lines: float(h, "oldLines"),
+            new_start: float(h, "newStart"),
+            new_lines: float(h, "newLines"),
             lines: str_array(field(h, "lines")),
         })
     }
     p
 }
-fn hunks(p: &Patch, reversed: bool) -> JsValue {
+fn hunks(p: &Patch) -> JsValue {
     let hunks = array(p.hunks.len());
     for (i, h) in p.hunks.iter().enumerate() {
         let x = obj();
-        if reversed {
-            number(x, "oldLines", h.old_lines);
-            number(x, "oldStart", h.old_start);
-            number(x, "newLines", h.new_lines);
-            number(x, "newStart", h.new_start)
-        } else {
-            number(x, "oldStart", h.old_start);
-            number(x, "oldLines", h.old_lines);
-            number(x, "newStart", h.new_start);
-            number(x, "newLines", h.new_lines)
-        }
+        prop(x, "oldStart", JsValue::erase(h.old_start));
+        prop(x, "oldLines", JsValue::erase(h.old_lines));
+        prop(x, "newStart", JsValue::erase(h.new_start));
+        prop(x, "newLines", JsValue::erase(h.new_lines));
         let lines = array(h.lines.len());
         for (j, l) in h.lines.iter().enumerate() {
             set(lines, j, utf16::write(&l))
@@ -227,7 +230,7 @@ fn value(p: &Patch, key: &str) -> JsValue {
 fn write_patch(p: &Patch, parsed: bool) -> JsValue {
     let o = obj();
     if parsed {
-        prop(o, "hunks", hunks(p, false));
+        prop(o, "hunks", hunks(p));
         for key in &p.metadata_order {
             prop(o, key, value(p, key))
         }
@@ -235,46 +238,89 @@ fn write_patch(p: &Patch, parsed: bool) -> JsValue {
         for key in ["oldFileName", "newFileName", "oldHeader", "newHeader"] {
             prop(o, key, value(p, key))
         }
-        prop(o, "hunks", hunks(p, false))
+        prop(o, "hunks", hunks(p))
     }
     o
 }
+/// `swapPrefix`, applied to Git names.
+fn swap_prefix(v: JsValue) -> JsValue {
+    if !v.is_string() {
+        return v;
+    }
+    let name = text(v);
+    if let Some(rest) = name.strip_prefix("a/") {
+        utf16::write(&(String::from("b/") + rest))
+    } else if let Some(rest) = name.strip_prefix("b/") {
+        utf16::write(&(String::from("a/") + rest))
+    } else {
+        v
+    }
+}
+fn reverse_line(l: JsValue) -> JsValue {
+    let s = text(l);
+    if let Some(rest) = s.strip_prefix('-') {
+        utf16::write(&(String::from("+") + rest))
+    } else if let Some(rest) = s.strip_prefix('+') {
+        utf16::write(&(String::from("-") + rest))
+    } else {
+        l
+    }
+}
+fn reverse_hunk(h: JsValue) -> JsValue {
+    let x = obj();
+    prop(x, "oldLines", field(h, "newLines"));
+    prop(x, "oldStart", field(h, "newStart"));
+    prop(x, "newLines", field(h, "oldLines"));
+    prop(x, "newStart", field(h, "oldStart"));
+    let lines = field(h, "lines");
+    let reversed = array(len(lines));
+    for i in 0..len(lines) {
+        set(reversed, i, reverse_line(at(lines, i)))
+    }
+    prop(x, "lines", reversed);
+    x
+}
+/// `reversePatch` on one structured patch: a copy of its properties with the
+/// sides swapped, as `Object.assign({}, patch, {...})` builds it.
 fn reverse(v: JsValue) -> JsValue {
-    let mut p = read_patch(v);
-    let copy = p.copy;
-    patch::reverse(&mut p);
+    let git = flag(v, "isGit");
+    let name = |k: &str| {
+        if git {
+            swap_prefix(field(v, k))
+        } else {
+            field(v, k)
+        }
+    };
     let o = obj();
     let names = keys(v);
     for i in 0..len(names) {
         let key = at(names, i);
-        let k = key.read::<&str>();
-        if !(copy && (k == "isCreate" || k == "isCopy" || k == "isRename")) {
-            put(o, key, get(v, key))
+        put(o, key, get(v, key))
+    }
+    prop(o, "oldFileName", name("newFileName"));
+    prop(o, "oldHeader", field(v, "newHeader"));
+    prop(o, "newFileName", name("oldFileName"));
+    prop(o, "newHeader", field(v, "oldHeader"));
+    prop(o, "oldMode", field(v, "newMode"));
+    prop(o, "newMode", field(v, "oldMode"));
+    prop(o, "isCreate", field(v, "isDelete"));
+    prop(o, "isDelete", field(v, "isCreate"));
+    let source = field(v, "hunks");
+    let reversed = array(len(source));
+    for i in 0..len(source) {
+        set(reversed, i, reverse_hunk(at(source, i)))
+    }
+    prop(o, "hunks", reversed);
+    if flag(v, "isCopy") {
+        // Reversing a copy deletes the copy destination.
+        prop(o, "newFileName", JsValue::erase("/dev/null"));
+        prop(o, "newHeader", JsValue::undefined());
+        prop(o, "isDelete", JsValue::erase(true));
+        for k in ["isCreate", "isCopy", "isRename"] {
+            delete(o, JsValue::erase(k));
         }
+        prop(o, "hunks", array(0))
     }
-    for k in [
-        "oldFileName",
-        "oldHeader",
-        "newFileName",
-        "newHeader",
-        "oldMode",
-        "newMode",
-    ] {
-        prop(o, k, value(&p, k))
-    }
-    if !copy {
-        prop(o, "isCreate", field(v, "isDelete"))
-    }
-    prop(
-        o,
-        "isDelete",
-        if copy {
-            JsValue::erase(true)
-        } else {
-            field(v, "isCreate")
-        },
-    );
-    prop(o, "hunks", hunks(&p, true));
     o
 }
 #[js_export]
@@ -349,7 +395,7 @@ pub fn matrix_run(input: JsValue) -> JsValue {
             }
         }
         "applyPatch" => {
-            let mut p = if patch.is_string() {
+            let p = if patch.is_string() {
                 let mut ps = match patch::parse(&text(patch)) {
                     Ok(v) => v,
                     Err(_) => fail(),
@@ -366,7 +412,7 @@ pub fn matrix_run(input: JsValue) -> JsValue {
             } else {
                 read_patch(patch)
             };
-            match patch::apply(&text(a), &mut p) {
+            match patch::apply(&text(a), p) {
                 Some(s) => utf16::write(&s),
                 None => JsValue::erase(false),
             }

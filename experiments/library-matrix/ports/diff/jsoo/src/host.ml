@@ -65,6 +65,8 @@ let absent v=Js.Unsafe.equals v Js.null
 let boolean b=box(Js.bool b)
 let number n=box n
 let integer (v:value) :int=Js.Unsafe.coerce v |> Obj.magic
+let float_value (v:value) :float=Js.float_of_number (Js.Unsafe.coerce v)
+let delete o (k:string)=ignore (call(global "Reflect")"deleteProperty"[|o;box(Js.string k)|])
 let is_string v=Js.to_string(Js.typeof v)="string"
 let object_value v=Js.to_string(Js.typeof v)="object"&&not(absent v)
 let key_get o k=Js.Unsafe.get o k

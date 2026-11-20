@@ -1,17 +1,22 @@
-use crate::diff::{line_tokens, myers, Options, ADD, KEEP, REMOVE};
+use crate::diff::{line_tokens, myers, ws, Options, ADD, KEEP, REMOVE};
+use crate::utf16::{drop_first_unit, drop_last_unit};
 use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
 
+/// Hunk ranges are JavaScript numbers: parsed headers can exceed `u32` or be
+/// `NaN`, exactly as `+match[1]` gives them in parse.js.
 #[derive(Default)]
 pub struct Hunk {
-    pub old_start: usize,
-    pub old_lines: usize,
-    pub new_start: usize,
-    pub new_lines: usize,
+    pub old_start: f64,
+    pub old_lines: f64,
+    pub new_start: f64,
+    pub new_lines: f64,
     pub lines: Vec<String>,
 }
+/// A file patch. `metadata_order` records the order in which parse.js first
+/// assigns each property, which is the order of the object it returns.
 #[derive(Default)]
 pub struct Patch {
     pub metadata_order: Vec<&'static str>,
@@ -29,6 +34,40 @@ pub struct Patch {
     pub create: bool,
     pub delete: bool,
     pub hunks: Vec<Hunk>,
+}
+impl Patch {
+    fn record(&mut self, key: &'static str) {
+        if !self.metadata_order.contains(&key) {
+            self.metadata_order.push(key)
+        }
+    }
+    fn set_old_name(&mut self, name: String) {
+        self.record("oldFileName");
+        self.old_name = Some(name)
+    }
+    fn set_new_name(&mut self, name: String) {
+        self.record("newFileName");
+        self.new_name = Some(name)
+    }
+    fn set_flag(&mut self, key: &'static str) {
+        self.record(key);
+        match key {
+            "isGit" => self.git = true,
+            "isRename" => self.rename = true,
+            "isCopy" => self.copy = true,
+            "isCreate" => self.create = true,
+            "isDelete" => self.delete = true,
+            _ => self.binary = true,
+        }
+    }
+    fn set_old_mode(&mut self, mode: &str) {
+        self.record("oldMode");
+        self.old_mode = Some(mode.to_string())
+    }
+    fn set_new_mode(&mut self, mode: &str) {
+        self.record("newMode");
+        self.new_mode = Some(mode.to_string())
+    }
 }
 fn prefix(mark: char, s: &str) -> String {
     let mut out = String::new();
@@ -52,10 +91,10 @@ fn emit(h: &mut Hunk, kind: u8, lines: &[String]) {
             h.lines.push("\\ No newline at end of file".to_string())
         }
         if kind != ADD {
-            h.old_lines += 1
+            h.old_lines += 1.0
         }
         if kind != REMOVE {
-            h.new_lines += 1
+            h.new_lines += 1.0
         }
     }
 }
@@ -83,8 +122,8 @@ pub fn create(before: &str, after: &str, context: usize, mut patch: Patch) -> Pa
         } else {
             if !active {
                 let k = context.min(last_keep);
-                pending.old_start = old + 1 - k;
-                pending.new_start = new + 1 - k;
+                pending.old_start = (old + 1 - k) as f64;
+                pending.new_start = (new + 1 - k) as f64;
                 emit(&mut pending, KEEP, &after[new - k..new]);
                 active = true;
             }
@@ -167,6 +206,13 @@ fn file_header(out: &mut String, tag: &str, name: &Option<String>, header: &Opti
         out.push('\n')
     }
 }
+/// The start printed for an empty range is one lower (format.js); created
+/// hunks hold nonnegative integers.
+fn range(out: &mut String, start: f64, lines: f64) {
+    number(out, (start - if lines == 0.0 { 1.0 } else { 0.0 }) as usize);
+    out.push(',');
+    number(out, lines as usize);
+}
 pub fn format(p: &Patch) -> String {
     let mut out = String::new();
     if p.old_name == p.new_name {
@@ -181,13 +227,9 @@ pub fn format(p: &Patch) -> String {
     file_header(&mut out, "+++ ", &p.new_name, &p.new_header);
     for h in &p.hunks {
         out.push_str("@@ -");
-        number(&mut out, h.old_start - usize::from(h.old_lines == 0));
-        out.push(',');
-        number(&mut out, h.old_lines);
+        range(&mut out, h.old_start, h.old_lines);
         out.push_str(" +");
-        number(&mut out, h.new_start - usize::from(h.new_lines == 0));
-        out.push(',');
-        number(&mut out, h.new_lines);
+        range(&mut out, h.new_start, h.new_lines);
         out.push_str(" @@\n");
         for l in &h.lines {
             out.push_str(l);
@@ -196,6 +238,80 @@ pub fn format(p: &Patch) -> String {
     }
     out
 }
+
+// Line classes of parse.js. Each regex is anchored at the start of the line;
+// `\s` is the ECMAScript whitespace set (`ws`) and `\w` is ASCII.
+const UNDERLINE: &str = "===================================================================";
+fn space_after(line: &str, start: &str) -> bool {
+    line.strip_prefix(start)
+        .is_some_and(|rest| rest.starts_with(ws))
+}
+/// `/^diff --git /`
+fn is_git_header(line: &str) -> bool {
+    line.starts_with("diff --git ")
+}
+/// `/^(---|\+\+\+)\s/`
+fn is_file_header(line: &str) -> bool {
+    space_after(line, "---") || space_after(line, "+++")
+}
+/// `/^@@\s/`
+fn is_hunk_header(line: &str) -> bool {
+    space_after(line, "@@")
+}
+fn is_word(b: &u8) -> bool {
+    b.is_ascii_alphanumeric() || *b == b'_'
+}
+/// The end of `diff(?: -r \w+)+` in a match of `/^diff(?: -r \w+)+\s/`. The
+/// repetition is greedy; when the last group is not followed by whitespace,
+/// backtracking gives it up and the space that starts it matches `\s`.
+fn hg_prefix(line: &str) -> Option<usize> {
+    if !line.starts_with("diff") {
+        return None;
+    }
+    let b = line.as_bytes();
+    let mut ends = Vec::new();
+    let mut at = 4;
+    while line[at..].starts_with(" -r ") && b.get(at + 4).is_some_and(is_word) {
+        at += 4;
+        while b.get(at).is_some_and(is_word) {
+            at += 1
+        }
+        ends.push(at)
+    }
+    match ends.last() {
+        Some(&end) if line[end..].starts_with(ws) => Some(end),
+        _ if ends.len() >= 2 => Some(ends[ends.len() - 2]),
+        _ => None,
+    }
+}
+/// The length of the match of `/^(?:Index:|diff(?: -r \w+)+)\s+/`.
+fn index_header(line: &str) -> Option<usize> {
+    let start = if line.starts_with("Index:") {
+        6
+    } else {
+        hg_prefix(line)?
+    };
+    let rest = &line[start..];
+    let spaces = rest.len() - rest.trim_start_matches(ws).len();
+    (spaces > 0).then_some(start + spaces)
+}
+/// `isDiffHeader`: a Git, `Index:` or Mercurial header.
+fn is_diff_header(line: &str) -> bool {
+    is_git_header(line) || index_header(line).is_some()
+}
+/// The capture of `(.*)`: `.` stops at the line terminators \r, U+2028 and U+2029.
+fn rest_of_line(s: &str) -> &str {
+    match s.find(|c| matches!(c, '\r' | '\u{2028}' | '\u{2029}')) {
+        Some(end) => &s[..end],
+        None => s,
+    }
+}
+/// The capture of `(\d+)`, ASCII digits only.
+fn mode(s: &str) -> Option<&str> {
+    let n = s.bytes().take_while(u8::is_ascii_digit).count();
+    (n > 0).then(|| &s[..n])
+}
+
 // WORKAROUND(MIRES-017): Utf8Chunks in String::from_utf8_lossy falls through
 // the final successful state into the generated "bad block" exception.
 fn utf8_filename(mut bytes: &[u8]) -> String {
@@ -219,7 +335,11 @@ fn utf8_filename(mut bytes: &[u8]) -> String {
         }
     }
 }
-
+fn octal(b: &[u8], i: usize) -> bool {
+    b.get(i).is_some_and(|c| (b'0'..=b'7').contains(c))
+}
+/// `parseQuotedFileName`: the unescaped name and the length of the quoted
+/// text, or `None` for an unterminated quote or an unknown escape.
 fn quoted(s: &str) -> Option<(String, usize)> {
     let b = s.as_bytes();
     // WORKAROUND(MIRES-019): compare a copied byte to avoid a promoted Option<&u8>.
@@ -227,531 +347,529 @@ fn quoted(s: &str) -> Option<(String, usize)> {
         return None;
     }
     let mut out = String::new();
-    let mut i = 1;
-    while i < b.len() {
-        match b[i] {
-            b'"' => return Some((out, i + 1)),
-            b'\\' if i + 1 < b.len() => {
-                if (b'0'..=b'7').contains(&b[i + 1]) {
-                    let mut bytes = Vec::new();
-                    while i + 1 < b.len() && b[i] == b'\\' && (b'0'..=b'7').contains(&b[i + 1]) {
-                        if i + 3 >= b.len()
-                            || !b[i + 2..=i + 3].iter().all(|c| (b'0'..=b'7').contains(c))
-                        {
+    let mut j = 1;
+    while j < b.len() {
+        match b[j] {
+            b'"' => return Some((out, j + 1)),
+            b'\\' if j + 1 < b.len() => {
+                j += 1;
+                let escaped = match b[j] {
+                    b'a' => '\x07',
+                    b'b' => '\x08',
+                    b'f' => '\x0c',
+                    b'n' => '\n',
+                    b'r' => '\r',
+                    b't' => '\t',
+                    b'v' => '\x0b',
+                    b'\\' => '\\',
+                    b'"' => '"',
+                    b'0'..=b'7' => {
+                        // A run of three-digit octal escapes holds raw bytes,
+                        // decoded together as UTF-8 by TextDecoder (which also
+                        // consumes a leading BOM). Uint8Array keeps the low byte.
+                        let value = |at: usize| {
+                            (((b[at] - b'0') as u32) << 6 | ((b[at + 1] - b'0') as u32) << 3
+                                | (b[at + 2] - b'0') as u32) as u8
+                        };
+                        if !octal(b, j + 1) || !octal(b, j + 2) {
                             return None;
                         }
-                        bytes.push(
-                            ((b[i + 1] - 48) << 6) | ((b[i + 2] - 48) << 3) | (b[i + 3] - 48),
+                        let mut bytes = Vec::new();
+                        bytes.push(value(j));
+                        j += 3;
+                        while b.get(j).copied() == Some(b'\\') && octal(b, j + 1) {
+                            if !octal(b, j + 2) || !octal(b, j + 3) {
+                                return None;
+                            }
+                            bytes.push(value(j + 1));
+                            j += 4;
+                        }
+                        let decoded = utf8_filename(&bytes);
+                        out.push_str(
+                            &decoded
+                                .strip_prefix('\u{feff}')
+                                .unwrap_or(&decoded)
+                                .replace('\u{e800}', "\u{e800}\u{e800}"),
                         );
-                        i += 4;
+                        continue;
                     }
-                    let decoded = utf8_filename(&bytes);
-                    out.push_str(
-                        &decoded
-                            .strip_prefix('\u{feff}')
-                            .unwrap_or(&decoded)
-                            .replace('\u{e800}', "\u{e800}\u{e800}"),
-                    );
-                } else {
-                    out.push(match b[i + 1] {
-                        b'a' => '\x07',
-                        b'b' => '\x08',
-                        b't' => '\t',
-                        b'n' => '\n',
-                        b'v' => '\x0b',
-                        b'f' => '\x0c',
-                        b'r' => '\r',
-                        b'"' => '"',
-                        b'\\' => '\\',
-                        _ => return None,
-                    });
-                    i += 2;
-                }
+                    _ => return None,
+                };
+                out.push(escaped);
+                j += 1;
             }
             _ => {
-                let start = i;
-                while i < b.len() && b[i] != b'\\' && b[i] != b'"' {
-                    i += 1;
+                let start = j;
+                j += 1;
+                while j < b.len() && b[j] != b'\\' && b[j] != b'"' {
+                    j += 1;
                 }
-                if i == start {
-                    return None;
-                }
-                out.push_str(&s[start..i]);
+                out.push_str(&s[start..j]);
             }
         }
     }
     None
 }
+/// `unquoteIfQuoted`
 fn unquote(s: &str) -> String {
-    match quoted(s) {
-        Some((n, _)) => n,
-        None => s.to_string(),
-    }
-}
-fn git_names(rest: &str, p: &mut Patch) {
-    if let Some((s, len)) = quoted(rest) {
-        let next = rest[len..].trim_start_matches(crate::diff::ws);
-        if !next.is_empty() {
-            p.old_name = Some(s);
-            p.new_name = Some(unquote(next))
-        }
-    } else if let Some(q) = rest.find('"') {
-        if q > 0 {
-            if let Some((s, _)) = quoted(&rest[q..]) {
-                p.old_name = Some(rest[..q].trim_end().to_string());
-                p.new_name = Some(s)
-            }
-        }
-    } else if rest.starts_with("a/") {
-        let mut splits = Vec::new();
-        for (at, _) in rest.match_indices(" b/") {
-            splits.push(at)
-        }
-        if !splits.is_empty() {
-            let at = splits[splits.len() / 2];
-            p.old_name = Some(rest[..at].to_string());
-            p.new_name = Some(rest[at + 1..].to_string())
+    if s.starts_with('"') {
+        if let Some((name, _)) = quoted(s) {
+            return name;
         }
     }
+    s.to_string()
 }
-fn note(p: &mut Patch, name: &'static str) {
-    if !p.metadata_order.contains(&name) {
-        p.metadata_order.push(name)
+/// `parseGitDiffHeader`: the names after `diff --git `, when they can be
+/// split. Both quoted forms skip the one UTF-16 unit assumed to be a space.
+fn git_names(rest: &str) -> Option<(String, String)> {
+    if rest.starts_with('"') {
+        let (old, length) = quoted(rest)?;
+        let after = drop_first_unit(&rest[length..]);
+        let new = if after.starts_with('"') {
+            quoted(&after)?.0
+        } else {
+            after
+        };
+        return Some((old, new));
+    }
+    if let Some(at) = rest.find('"').filter(|&at| at > 0) {
+        let (new, _) = quoted(&rest[at..])?;
+        return Some((drop_last_unit(&rest[..at]), new));
+    }
+    if rest.starts_with("a/") {
+        // Split on the middle ` b/`, which is right when both names agree.
+        let splits: Vec<usize> = rest.match_indices(" b/").map(|(at, _)| at).collect();
+        let mid = *splits.get(splits.len() / 2)?;
+        return Some((rest[..mid].to_string(), rest[mid + 1..].to_string()));
+    }
+    None
+}
+/// One Git extended header line. At most one of parse.js's regexes matches.
+fn extended_header(p: &mut Patch, line: &str) {
+    if let Some(v) = line.strip_prefix("rename from ") {
+        p.set_old_name(String::from("a/") + &unquote(rest_of_line(v)));
+        p.set_flag("isRename")
+    } else if let Some(v) = line.strip_prefix("rename to ") {
+        p.set_new_name(String::from("b/") + &unquote(rest_of_line(v)));
+        p.set_flag("isRename")
+    } else if let Some(v) = line.strip_prefix("copy from ") {
+        p.set_old_name(String::from("a/") + &unquote(rest_of_line(v)));
+        p.set_flag("isCopy")
+    } else if let Some(v) = line.strip_prefix("copy to ") {
+        p.set_new_name(String::from("b/") + &unquote(rest_of_line(v)));
+        p.set_flag("isCopy")
+    } else if let Some(m) = line.strip_prefix("new file mode ").and_then(mode) {
+        p.set_flag("isCreate");
+        p.set_new_mode(m)
+    } else if let Some(m) = line.strip_prefix("deleted file mode ").and_then(mode) {
+        p.set_flag("isDelete");
+        p.set_old_mode(m)
+    } else if let Some(m) = line.strip_prefix("old mode ").and_then(mode) {
+        p.set_old_mode(m)
+    } else if let Some(m) = line.strip_prefix("new mode ").and_then(mode) {
+        p.set_new_mode(m)
+    } else if line.starts_with("Binary files ") {
+        p.set_flag("isBinary")
     }
 }
-fn ext(p: &mut Patch, line: &str) {
-    for (i, tag) in [
-        "rename from ",
-        "rename to ",
-        "copy from ",
-        "copy to ",
-        "new file mode ",
-        "deleted file mode ",
-        "old mode ",
-        "new mode ",
-    ]
-    .iter()
-    .enumerate()
-    {
-        if let Some(v) = line.strip_prefix(tag) {
-            match i {
-                0..=3 => {
-                    note(
-                        p,
-                        if i % 2 == 0 {
-                            "oldFileName"
-                        } else {
-                            "newFileName"
-                        },
-                    );
-                    note(p, if i < 2 { "isRename" } else { "isCopy" });
-                }
-                4 => {
-                    note(p, "isCreate");
-                    note(p, "newMode")
-                }
-                5 => {
-                    note(p, "isDelete");
-                    note(p, "oldMode")
-                }
-                6 => note(p, "oldMode"),
-                _ => note(p, "newMode"),
-            }
-            match i {
-                0 | 2 => {
-                    p.old_name = Some(String::from("a/") + &unquote(v));
-                    if i == 0 {
-                        p.rename = true
-                    } else {
-                        p.copy = true
-                    }
-                }
-                1 | 3 => {
-                    p.new_name = Some(String::from("b/") + &unquote(v));
-                    if i == 1 {
-                        p.rename = true
-                    } else {
-                        p.copy = true
-                    }
-                }
-                4 => {
-                    p.create = true;
-                    p.new_mode = Some(v.to_string())
-                }
-                5 => {
-                    p.delete = true;
-                    p.old_mode = Some(v.to_string())
-                }
-                6 => p.old_mode = Some(v.to_string()),
-                _ => p.new_mode = Some(v.to_string()),
-            }
-            return;
-        }
-    }
-    if line.starts_with("Binary files ") {
-        note(p, "isBinary");
-        p.binary = true
-    }
-}
-fn file(line: &str) -> bool {
-    line.starts_with("--- ")
-        || line.starts_with("+++ ")
-        || line.starts_with("---\t")
-        || line.starts_with("+++\t")
-}
-fn header(line: &str) -> bool {
-    line.starts_with("diff --git ") || line.starts_with("Index: ") || line.starts_with("diff -r ")
-}
-fn parse_file(line: &str, p: &mut Patch) {
-    let mut parts = line[3..].trim_matches(crate::diff::ws).split('\t');
-    let n = parts.next().unwrap_or("");
-    let name = if n.starts_with('"') {
-        unquote(n)
-    } else {
-        n.replace("\\\\", "\\")
+/// `parseFileHeader`: a `---` or `+++` line, if there is one.
+fn parse_file_header(lines: &[&str], i: &mut usize, p: &mut Patch) {
+    let Some(&line) = lines.get(*i) else {
+        return;
     };
-    let h = parts
-        .next()
-        .unwrap_or("")
-        .trim_matches(crate::diff::ws)
-        .to_string();
-    if line.starts_with("---") {
-        note(p, "oldFileName");
-        note(p, "oldHeader");
-        p.old_name = Some(name);
-        p.old_header = Some(h)
+    if !is_file_header(line) {
+        return;
+    }
+    let mut data = line[3..].trim_matches(ws).split('\t');
+    let name = data.next().unwrap_or("");
+    let header = data.next().unwrap_or("").trim_matches(ws).to_string();
+    let name = if name.starts_with('"') {
+        unquote(name)
     } else {
-        note(p, "newFileName");
-        note(p, "newHeader");
-        p.new_name = Some(name);
-        p.new_header = Some(h)
+        name.replace("\\\\", "\\")
+    };
+    if line.starts_with("---") {
+        p.set_old_name(name);
+        p.record("oldHeader");
+        p.old_header = Some(header)
+    } else {
+        p.set_new_name(name);
+        p.record("newHeader");
+        p.new_header = Some(header)
+    }
+    *i += 1
+}
+fn digits(s: &str) -> Option<(f64, &str)> {
+    let n = s.bytes().take_while(u8::is_ascii_digit).count();
+    // A run of ASCII digits always parses; huge runs round to infinity as `+s` does.
+    (n > 0).then(|| (s[..n].parse::<f64>().unwrap_or(f64::NAN), &s[n..]))
+}
+fn optional_count(s: &str) -> (Option<f64>, &str) {
+    match s.strip_prefix(',').and_then(digits) {
+        Some((n, rest)) => (Some(n), rest),
+        None => (None, s),
     }
 }
-fn range(s: &str) -> Result<(usize, usize), ()> {
-    let (a, b) = s.split_once(',').unwrap_or((s, "1"));
-    let start = a.parse::<usize>().map_err(|_| ())?;
-    let n = b.parse::<usize>().map_err(|_| ())?;
-    Ok((start + usize::from(n == 0), n))
+type Range = (f64, Option<f64>, f64, Option<f64>);
+/// The captures of `/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/` at the
+/// start of `s`; the leading `@@ -` is already consumed.
+fn range_at(s: &str) -> Option<Range> {
+    let (old_start, s) = digits(s)?;
+    let (old_lines, s) = optional_count(s);
+    let (new_start, s) = digits(s.strip_prefix(" +")?)?;
+    let (new_lines, s) = optional_count(s);
+    s.starts_with(" @@")
+        .then_some((old_start, old_lines, new_start, new_lines))
 }
+/// The leftmost match of the range regex, which `split` finds anywhere in the line.
+fn hunk_range(line: &str) -> Option<Range> {
+    let mut from = 0;
+    while let Some(at) = line[from..].find("@@ -") {
+        let start = from + at;
+        if let Some(range) = range_at(&line[start + 4..]) {
+            return Some(range);
+        }
+        from = start + 1
+    }
+    None
+}
+/// `parseHunk`: an unmatched header gives NaN starts and one line per side.
 fn parse_hunk(lines: &[&str], i: &mut usize) -> Result<Hunk, ()> {
-    let line = lines[*i];
+    let (old_start, old_lines, new_start, new_lines) =
+        hunk_range(lines[*i]).unwrap_or((f64::NAN, None, f64::NAN, None));
     *i += 1;
-    let (head, _) = line
-        .strip_prefix("@@ -")
-        .ok_or(())?
-        .split_once(" @@")
-        .ok_or(())?;
-    let (a, b) = head.split_once(" +").ok_or(())?;
-    let (old_start, old_lines) = range(a)?;
-    let (new_start, new_lines) = range(b)?;
     let mut h = Hunk {
         old_start,
-        old_lines,
+        old_lines: old_lines.unwrap_or(1.0),
         new_start,
-        new_lines,
+        new_lines: new_lines.unwrap_or(1.0),
         lines: Vec::new(),
     };
-    let mut old = 0;
-    let mut new = 0;
-    while *i < lines.len()
-        && (old < h.old_lines || new < h.new_lines || lines[*i].starts_with('\\'))
-    {
-        let l = lines[*i];
-        let op = l
-            .as_bytes()
-            .first()
-            .copied()
-            .unwrap_or(if *i + 1 < lines.len() { 32 } else { 0 });
-        match op {
-            32 => {
-                new += 1;
-                old += 1
+    if h.old_lines == 0.0 {
+        h.old_start += 1.0
+    }
+    if h.new_lines == 0.0 {
+        h.new_start += 1.0
+    }
+    let mut adds = 0usize;
+    let mut removes = 0usize;
+    while let Some(&line) = lines.get(*i) {
+        if !((removes as f64) < h.old_lines || (adds as f64) < h.new_lines || line.starts_with('\\'))
+        {
+            break;
+        }
+        // An empty line is context, except the last one: `''[0]` is undefined.
+        let operation = if line.is_empty() && *i + 1 != lines.len() {
+            Some(' ')
+        } else {
+            line.chars().next()
+        };
+        match operation {
+            Some('+') => adds += 1,
+            Some('-') => removes += 1,
+            Some(' ') => {
+                adds += 1;
+                removes += 1
             }
-            43 => new += 1,
-            45 => old += 1,
-            92 => (),
+            Some('\\') => (),
             _ => return Err(()),
         }
-        h.lines.push(l.to_string());
-        *i += 1;
+        h.lines.push(line.to_string());
+        *i += 1
     }
-    if old == 0 && h.old_lines == 1 {
-        h.old_lines = 0
+    if adds == 0 && h.new_lines == 1.0 {
+        h.new_lines = 0.0
     }
-    if new == 0 && h.new_lines == 1 {
-        h.new_lines = 0
+    if removes == 0 && h.old_lines == 1.0 {
+        h.old_lines = 0.0
     }
-    if old != h.old_lines || new != h.new_lines {
+    if adds as f64 != h.new_lines || removes as f64 != h.old_lines {
         return Err(());
     }
-    if *i < lines.len()
-        && matches!(lines[*i].as_bytes().first(), Some(32 | 43 | 45))
-        && !file(lines[*i])
-    {
-        return Err(());
+    if let Some(&next) = lines.get(*i) {
+        if next.starts_with(['+', ' ', '-']) && !is_file_header(next) {
+            return Err(());
+        }
     }
     Ok(h)
 }
-pub fn parse(s: &str) -> Result<Vec<Patch>, ()> {
-    let mut lines = Vec::new();
-    for l in s.split('\n') {
-        lines.push(l)
+/// `parseIndex`: one file's metadata, file headers and hunks.
+fn parse_index(lines: &[&str], i: &mut usize) -> Result<Patch, ()> {
+    let mut p = Patch::default();
+    let mut seen_diff_header = false;
+    while let Some(&line) = lines.get(*i) {
+        if is_file_header(line) || is_hunk_header(line) {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            // A second diff header belongs to the next file; this one ends here.
+            if seen_diff_header {
+                return Ok(p);
+            }
+            seen_diff_header = true;
+            p.set_flag("isGit");
+            if let Some((old, new)) = git_names(rest) {
+                p.set_old_name(old);
+                p.set_new_name(new)
+            }
+            *i += 1;
+            while let Some(&ext) = lines.get(*i) {
+                if is_file_header(ext) || is_hunk_header(ext) || is_diff_header(ext) {
+                    break;
+                }
+                extended_header(&mut p, ext);
+                *i += 1
+            }
+            continue;
+        }
+        if let Some(length) = index_header(line) {
+            if seen_diff_header {
+                return Ok(p);
+            }
+            seen_diff_header = true;
+            p.record("index");
+            p.index = Some(line[length..].trim_matches(ws).to_string())
+        }
+        *i += 1
     }
+    parse_file_header(lines, i, &mut p);
+    parse_file_header(lines, i, &mut p);
+    if p.old_name.is_some() != p.new_name.is_some() {
+        return Err(());
+    }
+    while let Some(&line) = lines.get(*i) {
+        if is_diff_header(line) || is_file_header(line) || line.starts_with(UNDERLINE) {
+            break;
+        }
+        if is_hunk_header(line) {
+            p.hunks.push(parse_hunk(lines, i)?)
+        } else {
+            *i += 1
+        }
+    }
+    Ok(p)
+}
+pub fn parse(s: &str) -> Result<Vec<Patch>, ()> {
+    let lines: Vec<&str> = s.split('\n').collect();
     let mut out = Vec::new();
     let mut i = 0;
     while i < lines.len() {
-        let mut p = Patch::default();
-        let mut seen = false;
-        while i < lines.len() && !file(lines[i]) && !lines[i].starts_with("@@ ") {
-            let l = lines[i];
-            if header(l) {
-                if seen {
-                    break;
-                }
-                seen = true;
-                if let Some(rest) = l.strip_prefix("diff --git ") {
-                    note(&mut p, "isGit");
-                    p.git = true;
-                    git_names(rest, &mut p);
-                    if p.old_name.is_some() {
-                        note(&mut p, "oldFileName");
-                        note(&mut p, "newFileName");
-                    }
-                } else if let Some(rest) = l.strip_prefix("Index: ") {
-                    note(&mut p, "index");
-                    p.index = Some(rest.trim_matches(crate::diff::ws).to_string())
-                } else if let Some(last) = l.rsplit_once(' ') {
-                    note(&mut p, "index");
-                    p.index = Some(last.1.to_string())
-                }
-            } else if p.git {
-                ext(&mut p, l)
-            }
-            i += 1
-        }
-        for _ in 0..2 {
-            if i < lines.len() && file(lines[i]) {
-                parse_file(lines[i], &mut p);
-                i += 1
-            }
-        }
-        if p.old_name.is_some() != p.new_name.is_some() {
-            return Err(());
-        }
-        while i < lines.len() {
-            let l = lines[i];
-            if file(l)
-                || header(l)
-                || l.starts_with(
-                    "===================================================================",
-                )
-            {
-                break;
-            }
-            if l.starts_with("@@ ") {
-                p.hunks.push(parse_hunk(&lines, &mut i)?)
-            } else {
-                i += 1
-            }
-        }
-        out.push(p);
+        out.push(parse_index(&lines, &mut i)?)
     }
     Ok(out)
 }
-fn swap(n: &mut Option<String>) {
-    if let Some(s) = n {
-        if s.starts_with("a/") {
-            *s = String::from("b/") + &s[2..]
-        } else if s.starts_with("b/") {
-            *s = String::from("a/") + &s[2..]
-        }
-    }
+
+// Line-ending conversion of apply.js and line-endings.js.
+fn only_win_line_endings(s: &str) -> bool {
+    s.contains("\r\n")
+        && !s.starts_with('\n')
+        && !s.as_bytes().windows(2).any(|w| w[1] == b'\n' && w[0] != b'\r')
 }
-pub fn reverse(p: &mut Patch) {
-    core::mem::swap(&mut p.old_name, &mut p.new_name);
-    core::mem::swap(&mut p.old_header, &mut p.new_header);
-    core::mem::swap(&mut p.old_mode, &mut p.new_mode);
-    core::mem::swap(&mut p.create, &mut p.delete);
-    if p.git {
-        swap(&mut p.old_name);
-        swap(&mut p.new_name)
-    }
-    if p.copy {
-        p.copy = false;
-        p.rename = false;
-        p.delete = true;
-        p.create = false;
-        p.new_name = Some("/dev/null".to_string());
-        p.new_header = None;
-        p.hunks.clear();
-        return;
-    }
+fn only_unix_line_endings(s: &str) -> bool {
+    !s.contains("\r\n") && s.contains('\n')
+}
+fn before_marker(lines: &[String], i: usize) -> bool {
+    lines.get(i + 1).is_some_and(|next| next.starts_with('\\'))
+}
+fn is_unix(p: &Patch) -> bool {
+    !p.hunks.iter().any(|h| {
+        h.lines
+            .iter()
+            .any(|l| !l.starts_with('\\') && l.ends_with('\r'))
+    })
+}
+fn is_win(p: &Patch) -> bool {
+    p.hunks
+        .iter()
+        .any(|h| h.lines.iter().any(|l| l.ends_with('\r')))
+        && p.hunks.iter().all(|h| {
+            h.lines.iter().enumerate().all(|(i, l)| {
+                l.starts_with('\\') || l.ends_with('\r') || before_marker(&h.lines, i)
+            })
+        })
+}
+fn unix_to_win(p: &mut Patch) {
     for h in &mut p.hunks {
-        core::mem::swap(&mut h.old_start, &mut h.new_start);
-        core::mem::swap(&mut h.old_lines, &mut h.new_lines);
+        for i in 0..h.lines.len() {
+            let l = &h.lines[i];
+            if !(l.starts_with('\\') || l.ends_with('\r') || before_marker(&h.lines, i)) {
+                h.lines[i].push('\r')
+            }
+        }
+    }
+}
+fn win_to_unix(p: &mut Patch) {
+    for h in &mut p.hunks {
         for l in &mut h.lines {
-            if l.starts_with('+') {
-                *l = prefix('-', &l[1..])
-            } else if l.starts_with('-') {
-                *l = prefix('+', &l[1..])
-            }
-        }
-    }
-}
-fn convert(source: &str, p: &mut Patch) {
-    let mut unix = false;
-    let mut win = false;
-    for l in source.split_inclusive('\n') {
-        if l.ends_with("\r\n") {
-            win = true
-        } else if l.ends_with('\n') {
-            unix = true
-        }
-    }
-    if unix == win {
-        return;
-    }
-    let mut patch_win = false;
-    let mut patch_unix = false;
-    for h in &p.hunks {
-        for (i, l) in h.lines.iter().enumerate() {
-            if l.starts_with('\\') {
-                continue;
-            }
             if l.ends_with('\r') {
-                patch_win = true
-            } else if !h.lines.get(i + 1).is_some_and(|s| s.starts_with('\\')) {
-                patch_unix = true
-            }
-        }
-    }
-    if win && !patch_win {
-        for h in &mut p.hunks {
-            for i in 0..h.lines.len() {
-                if !h.lines[i].starts_with('\\')
-                    && !h.lines.get(i + 1).is_some_and(|s| s.starts_with('\\'))
-                {
-                    h.lines[i].push('\r')
-                }
-            }
-        }
-    }
-    if unix && patch_win && !patch_unix {
-        for h in &mut p.hunks {
-            for l in &mut h.lines {
-                if l.ends_with('\r') {
-                    l.pop();
-                }
+                l.pop();
             }
         }
     }
 }
-fn matches_at(h: &Hunk, lines: &[&str], mut i: usize) -> bool {
-    for l in &h.lines {
-        if l.starts_with('+') || l.starts_with('\\') {
-            continue;
-        }
-        let content = if l.is_empty() { "" } else { &l[1..] };
-        if i >= lines.len() || lines[i] != content {
-            return false;
-        }
-        i += 1
-    }
-    true
+/// `distanceIterator`: the positions after `start`, alternating forward and
+/// backward by increasing distance, within `[min, max]`.
+struct Distance {
+    start: isize,
+    min: isize,
+    max: isize,
+    want_forward: bool,
+    backward_exhausted: bool,
+    forward_exhausted: bool,
+    offset: isize,
 }
-pub fn apply(source: &str, p: &mut Patch) -> Option<String> {
-    if p.hunks.is_empty() {
+impl Distance {
+    fn new(start: isize, min: isize, max: isize) -> Self {
+        Distance {
+            start,
+            min,
+            max,
+            want_forward: true,
+            backward_exhausted: false,
+            forward_exhausted: false,
+            offset: 1,
+        }
+    }
+}
+impl Iterator for Distance {
+    type Item = isize;
+    fn next(&mut self) -> Option<isize> {
+        if self.want_forward && !self.forward_exhausted {
+            if self.backward_exhausted {
+                self.offset += 1
+            } else {
+                self.want_forward = false
+            }
+            if self.start + self.offset <= self.max {
+                return Some(self.start + self.offset);
+            }
+            self.forward_exhausted = true
+        }
+        if !self.backward_exhausted {
+            if !self.forward_exhausted {
+                self.want_forward = true
+            }
+            if self.min <= self.start - self.offset {
+                let position = self.start - self.offset;
+                self.offset += 1;
+                return Some(position);
+            }
+            self.backward_exhausted = true;
+            return self.next();
+        }
+        None
+    }
+}
+/// `lines[i]`, where a position outside the array reads as undefined.
+fn source_line<'a>(lines: &[&'a str], i: isize) -> Option<&'a str> {
+    usize::try_from(i).ok().and_then(|i| lines.get(i).copied())
+}
+struct Fitted<'a> {
+    patched: Vec<&'a str>,
+    last_old_line: isize,
+}
+/// `applyHunk` with no errors allowed: every removed and context line must
+/// equal the source line at its position. Trailing context is given back.
+fn fit<'a>(hunk: &'a [String], lines: &[&'a str], mut to_pos: isize) -> Option<Fitted<'a>> {
+    let mut patched = Vec::new();
+    let mut context = 0;
+    for l in hunk {
+        let (operation, content) = match l.chars().next() {
+            Some(c) => (c, &l[c.len_utf8()..]),
+            None => (' ', ""),
+        };
+        match operation {
+            '-' => {
+                if source_line(lines, to_pos) != Some(content) {
+                    return None;
+                }
+                to_pos += 1;
+                context = 0
+            }
+            '+' => {
+                patched.push(content);
+                context = 0
+            }
+            ' ' => {
+                context += 1;
+                let line = source_line(lines, to_pos).filter(|&line| line == content)?;
+                patched.push(line);
+                to_pos += 1
+            }
+            _ => (),
+        }
+    }
+    patched.truncate(patched.len() - context);
+    Some(Fitted {
+        patched,
+        last_old_line: to_pos - context as isize - 1,
+    })
+}
+pub fn apply(source: &str, mut p: Patch) -> Option<String> {
+    if only_win_line_endings(source) && is_unix(&p) {
+        unix_to_win(&mut p)
+    } else if only_unix_line_endings(source) && is_win(&p) {
+        win_to_unix(&mut p)
+    }
+    let mut lines: Vec<&str> = source.split('\n').collect();
+    let Some(last) = p.hunks.last() else {
         return Some(source.to_string());
-    }
-    convert(source, p);
-    let mut lines = Vec::new();
-    for l in source.split('\n') {
-        lines.push(l)
-    }
-    let mut add_eof = false;
-    let mut remove_eof = false;
-    let mut prev = 0;
-    for l in &p.hunks.last()?.lines {
-        if l.starts_with('\\') {
-            if prev == 43 {
-                remove_eof = true
-            }
-            if prev == 45 {
-                add_eof = true
+    };
+    let mut remove_eofnl = false;
+    let mut add_eofnl = false;
+    let mut previous = "";
+    for line in &last.lines {
+        if line.starts_with('\\') {
+            if previous.starts_with('+') {
+                remove_eofnl = true
+            } else if previous.starts_with('-') {
+                add_eofnl = true
             }
         }
-        prev = l.as_bytes().first().copied().unwrap_or(32)
+        previous = line
     }
     // WORKAROUND(MIRES-019): querying the referenced line avoids a promoted Some(&"").
     let eof = lines.last().is_some_and(|line| line.is_empty());
-    match (remove_eof, add_eof) {
-        (true, true) if eof => return None,
-        (true, false) => {
-            if !eof {
-                return None;
-            }
-            lines.pop();
-        }
-        (false, true) => {
+    if remove_eofnl {
+        if add_eofnl {
             if eof {
                 return None;
             }
-            lines.push("")
+        } else if eof {
+            lines.pop();
+        } else {
+            return None;
         }
-        _ => (),
+    } else if add_eofnl {
+        if eof {
+            return None;
+        }
+        lines.push("")
     }
-    let mut min = 0;
-    let mut offset = 0isize;
-    let mut result = Vec::new();
+    let mut result: Vec<&str> = Vec::new();
+    let mut min_line: isize = 0;
+    let mut offset: isize = 0;
     for h in &p.hunks {
-        let desired = h.old_start as isize - 1 + offset;
-        let max = lines.len().checked_sub(h.old_lines)?;
-        let mut pos = None;
-        // Increasing distance from the declared line, with the later candidate first.
-        let first = desired.clamp(min as isize, max.max(min) as isize);
-        if min <= max {
-            let extent = (first - min as isize).max(max as isize - first);
-            for d in 0..=extent {
-                let hi = first + d;
-                let lo = first - d;
-                if hi <= max as isize && matches_at(h, &lines, hi as usize) {
-                    pos = Some(hi as usize);
-                    break;
-                }
-                if lo >= min as isize && lo < hi && matches_at(h, &lines, lo as usize) {
-                    pos = Some(lo as usize);
-                    break;
-                }
+        let old_start = h.old_start as isize;
+        let max_line = lines.len() as isize - h.old_lines as isize;
+        // The declared position first, then the distance iterator around it.
+        let mut to_pos = old_start + offset - 1;
+        let mut candidates = Distance::new(to_pos, min_line, max_line);
+        let fitted = loop {
+            if let Some(fitted) = fit(&h.lines, &lines, to_pos) {
+                break fitted;
             }
+            to_pos = candidates.next()?
+        };
+        for i in min_line..to_pos {
+            result.push(source_line(&lines, i).unwrap_or(""))
         }
-        let at = pos?;
-        for l in &lines[min..at] {
-            result.push(*l)
-        }
-        let mut cursor = at;
-        let mut context = 0;
-        for l in &h.lines {
-            let op = l.as_bytes().first().copied().unwrap_or(32);
-            if op == 43 {
-                result.push(&l[1..]);
-                context = 0
-            }
-            if op == 45 {
-                cursor += 1;
-                context = 0
-            }
-            if op == 32 {
-                result.push(lines[cursor]);
-                cursor += 1;
-                context += 1
-            }
-        }
-        result.truncate(result.len() - context);
-        min = cursor - context;
-        offset = at as isize + 1 - h.old_start as isize;
+        result.extend(fitted.patched);
+        min_line = fitted.last_old_line + 1;
+        offset = to_pos + 1 - old_start
     }
-    for l in &lines[min..] {
-        result.push(*l)
+    for i in min_line..lines.len() as isize {
+        result.push(source_line(&lines, i).unwrap_or(""))
     }
     Some(result.join("\n"))
 }

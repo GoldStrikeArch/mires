@@ -4,46 +4,79 @@ type span = { kind : kind; count : int }
 type options = { ignore_case : bool; individual : bool; strip_cr : bool; ignore_ws : bool; newline_token : bool; ignore_eof : bool }
 let defaults = {ignore_case=false; individual=false; strip_cr=false; ignore_ws=false; newline_token=false; ignore_eof=false}
 type path = { old : int; spans : span list }
+
+(* base.js: Myers' search over the furthest-reaching path on each diagonal, with jsdiff's choice
+   of predecessor and its pruning at the edges of the edit graph. [best] holds the path on each
+   diagonal, offset by [base]. *)
 let myers old newer individual =
   let limit = Array.length old + Array.length newer in
-  let base = limit+1 in
-  let best = Array.make (base*2+1) {old=(-2);spans=[]} in
+  let base = limit + 1 in
+  let best = Array.make ((base * 2) + 1) None in
   let add k n previous =
-    if n=0 then previous else if individual then begin
-      let spans=ref previous in for _=1 to n do spans:={kind=k;count=1}::!spans done; !spans
-    end else match previous with
-    | h::t when h.kind=k -> {kind=k;count=h.count+n}::t
-    | _ -> {kind=k;count=n}::previous in
+    if n = 0 then previous
+    else if individual then begin
+      let spans = ref previous in
+      for _ = 1 to n do
+        spans := { kind = k; count = 1 } :: !spans
+      done;
+      !spans
+    end
+    else
+      match previous with
+      | h :: t when h.kind = k -> { kind = k; count = h.count + n } :: t
+      | _ -> { kind = k; count = n } :: previous
+  in
   let common k p =
-    let i=ref p.old and j=ref (p.old-k) in
-    while !i+1<Array.length old && !j+1<Array.length newer && old.(!i+1)=newer.(!j+1) do incr i; incr j done;
-    {old= !i;spans=add Keep (!i-p.old) p.spans}, !j in
-  let first,j=common 0 {old=(-1);spans=[]} in
-  let finished p j=p.old+1=Array.length old && j+1=Array.length newer in
-  if finished first j then List.rev first.spans else begin
-    best.(base)<-first;
-    let low=ref (-limit) and high=ref limit in
-    let exception Done of span list in
-    try
-      for d=1 to limit do
-        let k=ref (max !low (-d)) and stop=min !high d in
-        while !k<=stop do
-          let i=base+ !k in let r=best.(i-1) and a=best.(i+1) in best.(i-1)<-{old=(-2);spans=[]};
-          let can_remove=r.old>= -1 && r.old+1<Array.length old
-          and can_add=a.old>= -1 && a.old- !k>=0 && a.old- !k<Array.length newer in
-          if can_add || can_remove then begin
-            let p=if not can_remove || (can_add && r.old<a.old) then {a with spans=add Add 1 a.spans}
-              else {old=r.old+1;spans=add Remove 1 r.spans} in
-            let p,j=common !k p in
-            if finished p j then raise(Done(List.rev p.spans));
-            best.(i)<-p;
-            if p.old+1=Array.length old then high:=min !high (!k-1);
-            if j+1=Array.length newer then low:=max !low (!k+1)
-          end else best.(i)<-{old=(-2);spans=[]};
-          k:= !k+2
-        done
-      done; []
-    with Done spans -> spans
+    let i = ref p.old and j = ref (p.old - k) in
+    while !i + 1 < Array.length old && !j + 1 < Array.length newer && old.(!i + 1) = newer.(!j + 1) do
+      incr i;
+      incr j
+    done;
+    ({ old = !i; spans = add Keep (!i - p.old) p.spans }, !j)
+  in
+  let finished p j = p.old + 1 = Array.length old && j + 1 = Array.length newer in
+  let first, j = common 0 { old = -1; spans = [] } in
+  if finished first j then List.rev first.spans
+  else begin
+    best.(base) <- Some first;
+    (* Once a path reaches the right or bottom edge, the diagonals beyond it are pointless. *)
+    let low = ref (-limit) and high = ref limit in
+    (* One edit length: the finished history, if a path reaches the end. *)
+    let rec diagonals k d =
+      if k > min !high d then None
+      else begin
+        let i = base + k in
+        let remove = best.(i - 1) and insert = best.(i + 1) in
+        best.(i - 1) <- None;
+        let can_remove = match remove with Some r -> r.old + 1 < Array.length old | None -> false in
+        let can_add = match insert with Some a -> a.old - k >= 0 && a.old - k < Array.length newer | None -> false in
+        let next =
+          match (insert, remove) with
+          | Some a, Some r when can_add && ((not can_remove) || r.old < a.old) -> Some { a with spans = add Add 1 a.spans }
+          | Some a, _ when can_add && not can_remove -> Some { a with spans = add Add 1 a.spans }
+          | _, Some r when can_remove -> Some { old = r.old + 1; spans = add Remove 1 r.spans }
+          | _ -> None
+        in
+        match next with
+        | None ->
+            best.(i) <- None;
+            diagonals (k + 2) d
+        | Some p ->
+            let p, j = common k p in
+            if finished p j then Some (List.rev p.spans)
+            else begin
+              best.(i) <- Some p;
+              if p.old + 1 = Array.length old then high := min !high (k - 1);
+              if j + 1 = Array.length newer then low := max !low (k + 1);
+              diagonals (k + 2) d
+            end
+      end
+    in
+    let rec rounds d =
+      if d > limit then []
+      else match diagonals (max !low (-d)) d with Some spans -> spans | None -> rounds (d + 1)
+    in
+    rounds 1
   end
 
 let sub s i j=String.sub s i (j-i)
@@ -113,12 +146,17 @@ let clean changes =
     |None,Some e->d.value<-cut_r d.value(overlap(right d.value)(left e.value))|_->())
   |_->() in
   Array.iter(fun c->match c.span.kind with Add->ins:=Some c|Remove->del:=Some c|Keep->adjust(Some c);start:=Some c;del:=None;ins:=None)changes;adjust None
+(* JavaScript's length: the UTF-16 units of a WTF-8 string. *)
+let units s =
+  let n = ref 0 in
+  String.iter (fun c -> let b = Char.code c in if b land 0xc0 <> 0x80 then incr n; if b >= 0xf0 then incr n) s;
+  !n
 let changes op old newer o =
   let spans=myers(Array.map(key op o)old)(Array.map(key op o)newer)o.individual in
   let a=ref 0 and b=ref 0 in
   let out=Array.of_list(List.map(fun span->
     let buf=Buffer.create 24 in for j=0 to span.count-1 do
-      let s=if span.kind=Remove || op="diffJson" && span.kind=Keep && len old.(!a+j)>len newer.(!b+j) then old.(!a+j) else newer.(!b+j) in
+      let s=if span.kind=Remove || op="diffJson" && span.kind=Keep && units old.(!a+j)>units newer.(!b+j) then old.(!a+j) else newer.(!b+j) in
       Buffer.add_string buf (if op="diffWords"&&j>0 then cut_l s(left_ws s)else s)
     done;
     if span.kind<>Add then a:= !a+span.count;if span.kind<>Remove then b:= !b+span.count;

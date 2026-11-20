@@ -31,6 +31,9 @@ let absent v=Js.Nullable.isNullable (cast v)
 let boolean b=box b
 let number n=box n
 let integer v : int=cast v
+let float_value v : float=cast v
+external delete_property : value -> string -> bool = "deleteProperty" [@@mel.scope "Reflect"]
+let delete o k=ignore (delete_property o k)
 let is_string v=typeof v="string"
 let object_value v=typeof v="object" && not(absent v)
 let cp s i =

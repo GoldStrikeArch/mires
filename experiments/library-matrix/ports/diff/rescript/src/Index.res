@@ -1,130 +1,93 @@
-open Support
+// The boundary of the ReScript port: one operation per input, as libraries/diff/reference.mjs runs
+// it. The input record is the JS object itself (no conversion); strings are JS strings and JSON
+// documents are JSON.t values. Change objects, hunks and structured patches are records, which are
+// the JS objects jsdiff returns, keys in its order; `false` for a patch that does not apply.
+
 open Host
-open Differ
-let canonical = v => {
-  let rec visit = v =>
-    if is_array(v) {
-      let a = array(length(v))
-      for i in 0 to length(v) - 1 {
-        put(a, i, visit(at(v, i)))
-      }
-      a
-    } else if object_value(v) {
-      let o = null_object(Host.null)
-      let ks = sorted(keys(v))
-      for i in 0 to length(ks) - 1 {
-        let k = at(ks, i)
-        key_set(o, k, visit(key_get(v, k)))
-      }
-      o
-    } else {
-      v
-    }
-  visit(v)
+
+type options = {
+  ignoreCase?: bool,
+  oneChangePerToken?: bool,
+  stripTrailingCr?: bool,
+  ignoreWhitespace?: bool,
+  newlineIsToken?: bool,
+  ignoreNewlineAtEof?: bool,
+  context?: int,
 }
-let document = (op, v) =>
-  if op == "diffJson" && !is_string(v) {
-    read(pretty(canonical(v), Host.null, 2))
-  } else {
-    read(v)
-  }
-let write_change = (span, v) => {
-  let o = obj()
-  set(o, "count", number(span.count))
-  set(o, "added", boolean(span.kind == Add))
-  set(o, "removed", boolean(span.kind == Remove))
-  set(o, "value", v)
-  o
+
+type input = {
+  op: string,
+  before?: JSON.t,
+  after?: JSON.t,
+  patch?: JSON.t,
+  oldFileName?: string,
+  newFileName?: string,
+  oldHeader?: string,
+  newHeader?: string,
+  options?: options,
 }
-let run = input => {
-  let op = read(get(input, "op"))
 
-  let a = get(input, "before")
-
-  let b = get(input, "after")
-
-  let arg = get(input, "patch")
-
-  let opts = get(input, "options")
-  let flag = key => !absent(opts) && truth(get(opts, key))
-  let o = {
-    ignore_case: flag("ignoreCase"),
-    individual: flag("oneChangePerToken"),
-    strip_cr: flag("stripTrailingCr"),
-    ignore_ws: flag("ignoreWhitespace"),
-    newline_token: flag("newlineIsToken"),
-    ignore_eof: flag("ignoreNewlineAtEof"),
+let diffOptions = input => {
+  let flag = read => input.options->Option.flatMap(read) == Some(true)
+  {
+    Diff.ignoreCase: flag(o => o.ignoreCase),
+    oneChangePerToken: flag(o => o.oneChangePerToken),
+    stripTrailingCr: flag(o => o.stripTrailingCr),
+    ignoreWhitespace: flag(o => o.ignoreWhitespace),
+    newlineIsToken: flag(o => o.newlineIsToken),
+    ignoreNewlineAtEof: flag(o => o.ignoreNewlineAtEof),
   }
-  switch op {
-  | "diffArrays" =>
-    let values = v => Patch.array_of_js(x => read(json(x)), v)
-    let spans = List.toArray(myers(values(a), values(b), o.individual))
-    let old = ref(0)
-    let newer = ref(0)
-    Patch.array_to_js(span => {
-      let value = array(span.count)
-      for i in 0 to span.count - 1 {
-        put(
-          value,
-          i,
-          if span.kind == Remove {
-            at(a, old.contents + i)
-          } else {
-            at(b, newer.contents + i)
-          },
-        )
-      }
-      if span.kind != Add {
-        old := old.contents + span.count
-      }
-      if span.kind != Remove {
-        newer := newer.contents + span.count
-      }
-      write_change(span, value)
-    }, spans)
-  | "diffChars" | "diffWords" | "diffLines" | "diffJson" =>
-    let tokens = v => tokenize(op, document(op, v), o)
-    Patch.array_to_js(c => write_change(c.span, str(c.value)), changes(op, tokens(a), tokens(b), o))
-  | "structuredPatch" | "createTwoFilesPatch" =>
-    let ctx = if absent(opts) || absent(get(opts, "context")) {
-      4
-    } else {
-      integer(get(opts, "context"))
-    }
-    let p = Patch.create(input, ctx)
-    if op == "structuredPatch" {
-      Patch.write(false, p)
-    } else {
-      str(Patch.format(p))
-    }
-  | "parsePatch" => Patch.array_to_js(p => Patch.write(false, p), Patch.parse(read(arg)))
-  | "reversePatch" =>
-    if is_array(arg) {
-      let n = length(arg)
-      let v = array(n)
-      for i in 0 to n - 1 {
-        put(v, n - i - 1, Patch.reverse(at(arg, i)))
-      }
-      v
-    } else {
-      Patch.reverse(arg)
-    }
+}
+
+let text = value =>
+  switch value {
+  | Some(JSON.String(text)) => text
+  | _ => JsError.TypeError.throwWithMessage("expected a string")
+  }
+
+let document = value =>
+  switch value {
+  | Some(document) => document
+  | None => JsError.TypeError.throwWithMessage("expected a JSON document")
+  }
+
+let elements = value =>
+  switch value {
+  | Some(JSON.Array(elements)) => elements
+  | _ => JsError.TypeError.throwWithMessage("expected an array")
+  }
+
+let structuredPatch = input =>
+  Patch.structuredPatch(
+    ~oldFileName=input.oldFileName,
+    ~newFileName=input.newFileName,
+    text(input.before),
+    text(input.after),
+    ~oldHeader=input.oldHeader,
+    ~newHeader=input.newHeader,
+    ~context=input.options->Option.flatMap(o => o.context)->Option.getOr(4),
+  )
+
+let run = (input: input): unknown =>
+  switch input.op {
+  | "diffChars" => Diff.chars(text(input.before), text(input.after), diffOptions(input))->toUnknown
+  | "diffWords" => Words.words(text(input.before), text(input.after), diffOptions(input))->toUnknown
+  | "diffLines" => Diff.lines(text(input.before), text(input.after), diffOptions(input))->toUnknown
+  | "diffJson" => Diff.json(document(input.before), document(input.after), diffOptions(input))->toUnknown
+  | "diffArrays" => Diff.arrays(elements(input.before), elements(input.after), diffOptions(input))->toUnknown
+  | "structuredPatch" => structuredPatch(input)->toUnknown
+  | "createTwoFilesPatch" => structuredPatch(input)->Patch.formatPatch->toUnknown
+  | "parsePatch" => Patch.parsePatch(text(input.patch))->toUnknown
   | "applyPatch" =>
-    let p = if is_string(arg) {
-      let ps = Patch.parse(read(arg))
-      if Array.length(ps) != 1 {
-        invalid("multiple patches")
-      }
-      Array.getUnsafe(ps, 0)
-    } else if is_array(arg) {
-      if length(arg) != 1 {
-        invalid("multiple patches")
-      }
-      Patch.read_patch(at(arg, 0))
-    } else {
-      Patch.read_patch(arg)
+    let patches = switch document(input.patch) {
+    | String(text) => Patch.parsePatch(text)
+    | Array(patches) => patches->Array.map(fromJson)
+    | patch => [fromJson(patch)]
     }
-    Patch.apply(read(a), p)
-  | _ => invalid("unknown operation")
+    switch Patch.applyPatch(text(input.before), patches) {
+    | Some(text) => toUnknown(text)
+    | None => toUnknown(false)
+    }
+  | "reversePatch" => Patch.reversePatch(document(input.patch))
+  | _ => JsError.throwWithMessage("unknown diff operation")
   }
-}

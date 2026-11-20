@@ -249,7 +249,8 @@ func changes(op string, old, new []string, o options) []change {
 		var v strings.Builder
 		for j := 0; j < r.count; j++ {
 			var s string
-			if r.kind == remove || op == "diffJson" && r.kind == keep && len(old[a+j]) > len(new[b+j]) {
+			// diffJson keeps the longer of two equal lines, by UTF-16 length.
+			if r.kind == remove || op == "diffJson" && r.kind == keep && units(old[a+j]) > units(new[b+j]) {
 				s = old[a+j]
 			} else {
 				s = new[b+j]

@@ -37,6 +37,54 @@ func point(s string) (rune, int) {
 	return utf8.DecodeRuneInString(s)
 }
 
+// units is JavaScript's length: the UTF-16 units of a WTF-8 string.
+func units(s string) int {
+	n := 0
+	for len(s) > 0 {
+		c, w := point(s)
+		n++
+		if c > 0xffff {
+			n++
+		}
+		s = s[w:]
+	}
+	return n
+}
+
+// surrogate is a lone UTF-16 surrogate in WTF-8.
+func surrogate(u rune) string {
+	return string([]byte{0xed, byte(0x80 | u>>6&63), byte(0x80 | u&63)})
+}
+
+// dropFirstUnit is s.substring(1): dropping the first unit of an astral
+// character leaves its low surrogate.
+func dropFirstUnit(s string) string {
+	if s == "" {
+		return s
+	}
+	c, w := point(s)
+	if c > 0xffff {
+		return surrogate(0xdc00|(c-0x10000)&0x3ff) + s[w:]
+	}
+	return s[w:]
+}
+
+// dropLastUnit is s.substring(0, s.length - 1): dropping the last unit of an
+// astral character leaves its high surrogate.
+func dropLastUnit(s string) string {
+	start := 0
+	var last rune
+	for i := 0; i < len(s); {
+		c, w := point(s[i:])
+		start, last = i, c
+		i += w
+	}
+	if last > 0xffff {
+		return s[:start] + surrogate(0xd800|(last-0x10000)>>10)
+	}
+	return s[:start]
+}
+
 func writeText(s string) *js.Object {
 	if utf8.ValidString(s) {
 		return js.Global.Get("String").Invoke(s)

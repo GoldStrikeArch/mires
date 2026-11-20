@@ -30,7 +30,9 @@ func canonical(v *js.Object) *js.Object {
 	if js.Global.Get("Object").Get("prototype").Get("toString").Call("call", v).String() != "[object Object]" {
 		return v
 	}
-	a := js.Global.Get("Object").Call("create", nil)
+	// canonicalize() assigns the sorted keys to a plain object, so a
+	// "__proto__" key sets its prototype and is not serialized.
+	a := object()
 	ks := js.Global.Get("Object").Call("keys", v).Call("sort")
 	reflect := js.Global.Get("Reflect")
 	for i := 0; i < ks.Length(); i++ {
@@ -39,8 +41,11 @@ func canonical(v *js.Object) *js.Object {
 	}
 	return a
 }
+func isString(v *js.Object) bool {
+	return v != nil && js.Global.Get("Object").Get("prototype").Get("toString").Call("call", v).String() == "[object String]"
+}
 func doc(v *js.Object, op string) string {
-	if op == "diffJson" && (v == nil || js.Global.Get("Object").Get("prototype").Get("toString").Call("call", v).String() != "[object String]") {
+	if op == "diffJson" && !isString(v) {
 		return readText(js.Global.Get("JSON").Call("stringify", canonical(v), nil, 2))
 	}
 	return readText(v)
@@ -103,14 +108,14 @@ func run(input *js.Object) interface{} {
 		}
 		p := create(input, ctx)
 		if op == "structuredPatch" {
-			return p.write(false)
+			return p.write()
 		}
 		return writeText(format(p))
 	case "parsePatch":
 		ps := parse(readText(arg))
 		out := arr(len(ps))
 		for i, p := range ps {
-			out.SetIndex(i, p.write(false))
+			out.SetIndex(i, p.write())
 		}
 		return out
 	case "reversePatch":
@@ -124,22 +129,21 @@ func run(input *js.Object) interface{} {
 		}
 		return reverse(arg)
 	case "applyPatch":
-		var p patch
-		if isArray(arg) {
-			if arg.Length() != 1 {
-				panic("multiple file patches")
+		var patches []patch
+		switch {
+		case isString(arg):
+			patches = parse(readText(arg))
+		case isArray(arg):
+			for i := 0; i < arg.Length(); i++ {
+				patches = append(patches, readPatch(arg.Index(i)))
 			}
-			p = readPatch(arg.Index(0))
-		} else if arg.Get("hunks") != js.Undefined {
-			p = readPatch(arg)
-		} else {
-			ps := parse(readText(arg))
-			if len(ps) != 1 {
-				panic("multiple file patches")
-			}
-			p = ps[0]
+		default:
+			patches = []patch{readPatch(arg)}
 		}
-		return apply(readText(a), p)
+		if len(patches) != 1 {
+			panic("applyPatch only works with a single input")
+		}
+		return apply(readText(a), patches[0])
 	default:
 		panic("unknown diff operation")
 	}

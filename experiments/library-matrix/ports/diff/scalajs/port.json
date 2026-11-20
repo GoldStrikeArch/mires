@@ -2,5 +2,5 @@
   "schema": 1,
   "library": "diff",
   "language": "scalajs",
-  "boundary": "Native Myers search, token processing and unified diff parsing and application with language-specific JSON bindings."
+  "boundary": "run(input) reads the corpus object in place through @js.native facade traits: strings are JS strings, and JSON documents, array elements and structured patches stay host values. Results are js.Dynamic literals and js.Arrays in jsdiff's key order, false for a patch that does not apply."
 }

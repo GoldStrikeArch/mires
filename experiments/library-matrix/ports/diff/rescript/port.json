@@ -3,5 +3,5 @@
   "library": "diff",
   "language": "rescript",
   "entry": "src/Index.res",
-  "boundary": "Native ReScript Myers paths, token policies and unified patch processing with JSON and UTF-8 string bindings."
+  "boundary": "The input record is the corpus object itself (no conversion): strings are JS strings and JSON documents are JSON.t values. Change objects, hunks and structured patches are records, which are the JS objects jsdiff returns; parsed patches are dicts in jsdiff's key order; false for a patch that does not apply."
 }

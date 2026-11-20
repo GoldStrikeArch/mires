@@ -2,6 +2,6 @@
   "schema": 1,
   "library": "diff",
   "language": "dart",
-  "boundary": "Native Myers search, token processing and unified diff parsing and application with language-specific JSON bindings.",
+  "boundary": "run(input) reads the corpus object in place through dart:js_interop extension types: strings are JS strings (Dart strings on the web), and JSON documents, array elements and structured patches stay JS values. Results are JSObjects and List.toJS arrays in jsdiff's key order, false for a patch that does not apply. main() publishes run on globalThis.__matrixExports for the generated facade.",
   "entry": "src/main.dart"
 }

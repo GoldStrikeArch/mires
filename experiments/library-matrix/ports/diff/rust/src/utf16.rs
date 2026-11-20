@@ -74,6 +74,59 @@ pub fn scalar_text(s: &str) -> String {
     result
 }
 
+/// The number of UTF-16 code units, JavaScript's `length`.
+pub fn units(s: &str) -> usize {
+    let mut n = 0;
+    let mut i = 0;
+    while i < s.len() {
+        let (code, width) = decoded(&s[i..]);
+        n += if code > 0xffff { 2 } else { 1 };
+        i += width;
+    }
+    n
+}
+
+fn lone(unit: u32) -> String {
+    let mut s = String::new();
+    s.push(ESC);
+    s.push(char::from_u32(PAYLOAD + unit - 0xd800).unwrap());
+    s
+}
+
+/// `s.substring(1)`: dropping the first unit of an astral character leaves
+/// its low surrogate.
+pub fn drop_first_unit(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let (code, width) = decoded(s);
+    let mut out = if code > 0xffff {
+        lone(0xdc00 + ((code - 0x10000) & 0x3ff))
+    } else {
+        String::new()
+    };
+    out.push_str(&s[width..]);
+    out
+}
+
+/// `s.substring(0, s.length - 1)`: dropping the last unit of an astral
+/// character leaves its high surrogate.
+pub fn drop_last_unit(s: &str) -> String {
+    let mut last = (0, 0);
+    let mut i = 0;
+    while i < s.len() {
+        let (code, width) = decoded(&s[i..]);
+        last = (i, code);
+        i += width;
+    }
+    let (start, code) = last;
+    let mut out = s[..start].to_string();
+    if code > 0xffff {
+        out.push_str(&lone(0xd800 + ((code - 0x10000) >> 10)))
+    }
+    out
+}
+
 pub fn write(s: &str) -> JsValue {
     if !s.contains(ESC) {
         return JsValue::erase(s);

@@ -41,18 +41,79 @@ change kind count v =
     E.object [ ( "count", E.int count ), ( "added", E.bool (kind == Add) ), ( "removed", E.bool (kind == Remove) ), ( "value", v ) ]
 
 
-canonical v =
+{-| An array or object of a JSON document while `canonical` visits it: the key it has in its
+parent, its members still to visit (array members under the key ""), and its finished members,
+latest first.
+-}
+type alias Container =
+    { key : String, isArray : Bool, pending : List ( String, D.Value ), done : List ( String, E.Value ) }
+
+
+container : String -> D.Value -> Maybe Container
+container key v =
     case D.decodeValue (D.list D.value) v of
-        Ok xs ->
-            E.list canonical xs
+        Ok items ->
+            Just (Container key True (List.map (Tuple.pair "") items) [])
 
         Err _ ->
             case D.decodeValue (D.keyValuePairs D.value) v of
-                Ok xs ->
-                    E.object (List.sortBy Tuple.first xs |> List.map (Tuple.mapSecond canonical))
+                Ok fields ->
+                    Just (Container key False (List.sortBy Tuple.first fields) [])
 
                 Err _ ->
-                    v
+                    Nothing
+
+
+{-| jsdiff's canonicalize for JSON documents: arrays in order, object keys sorted and assigned to
+a plain object (so a `__proto__` key sets the prototype and is not serialized). npm recurses
+once per nesting level; this visits the document with a stack of open containers in a loop, so
+nesting costs heap, not call stack.
+-}
+canonical : D.Value -> E.Value
+canonical root =
+    case container "" root of
+        Just open ->
+            canonicalize [ open ]
+
+        Nothing ->
+            root
+
+
+canonicalize : List Container -> E.Value
+canonicalize stack =
+    case stack of
+        [] ->
+            E.null
+
+        open :: below ->
+            case open.pending of
+                ( key, member ) :: rest ->
+                    let
+                        visited =
+                            { open | pending = rest }
+                    in
+                    case container key member of
+                        Just inner ->
+                            canonicalize (inner :: visited :: below)
+
+                        Nothing ->
+                            canonicalize ({ visited | done = ( key, member ) :: visited.done } :: below)
+
+                [] ->
+                    let
+                        value =
+                            if open.isArray then
+                                E.list Tuple.second (List.reverse open.done)
+
+                            else
+                                E.object (List.reverse open.done)
+                    in
+                    case below of
+                        [] ->
+                            value
+
+                        parent :: rest ->
+                            canonicalize ({ parent | done = ( open.key, value ) :: parent.done } :: rest)
 
 
 run input =
@@ -102,8 +163,8 @@ run input =
                 _ ->
                     Err "multiple file patches"
 
-        reverse v =
-            Patch.read v |> Patch.reverse |> Patch.write True
+        reverse =
+            Patch.reverse
     in
     case op of
         "diffChars" ->
@@ -171,10 +232,10 @@ run input =
             Ok (E.string (Patch.format (patch ())))
 
         "structuredPatch" ->
-            Ok (Patch.write False (patch ()))
+            Ok (Patch.write (patch ()))
 
         "parsePatch" ->
-            Patch.parse (string arg) |> Result.map (E.list (Patch.write False))
+            Patch.parse (string arg) |> Result.map (E.list Patch.write)
 
         "applyPatch" ->
             case D.decodeValue D.string arg of
