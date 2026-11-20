@@ -81,7 +81,7 @@ let html_begin_table =
       let s = string_of_int n in
       Re.of_string
         ({re|^ {0,|re} ^ s ^ {re|}(?:</?(?:|re} ^ _tag
-       ^ {re|})(?: +|$|/?>)|<(?:(?:script|pre|style|textarea)(?:[\s>]|$)|!--)|<\?|<![A-Za-z]|<!\[CDATA\[)|re})
+       ^ {re|)(?: +|$|/?>)|<(?:(?:script|pre|style|textarea)(?:[\s>]|$)|!--)|<\?|<![A-Za-z]|<!\[CDATA\[)|re})
         "i")
 
 let blockquote_begin_table =

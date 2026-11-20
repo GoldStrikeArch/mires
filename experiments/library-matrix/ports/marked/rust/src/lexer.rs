@@ -625,7 +625,7 @@ impl Lexer {
             } else {
                 let first_ns = first_non_space_index(&line).unwrap_or(0);
                 let rel_indent = if first_ns > 4 { 1 } else { first_ns };
-                item_contents.push_str(slice_after_chars(&line, rel_indent));
+                item_contents.push_str(slice_utf16_from(&line, rel_indent));
                 indent = rel_indent + bullet_indent;
             }
 
@@ -670,7 +670,7 @@ impl Lexer {
                         || trim_js(next_line_str).is_empty();
                     if dedentable {
                         item_contents.push('\n');
-                        item_contents.push_str(slice_after_chars(&next_line_no_tabs, indent));
+                        item_contents.push_str(slice_utf16_from(&next_line_no_tabs, indent));
                     } else {
                         if blank_line {
                             break;
@@ -689,7 +689,7 @@ impl Lexer {
 
                     blank_line = trim_js(next_line_str).is_empty();
                     pos = (raw_line_end + 1).min(n);
-                    line = String::from(slice_after_chars(&next_line_no_tabs, indent));
+                    line = String::from(slice_utf16_from(&next_line_no_tabs, indent));
                 }
             }
 
@@ -1551,20 +1551,16 @@ fn first_non_space_index(s: &str) -> Option<usize> {
     None
 }
 
-fn slice_after_chars(s: &str, count: usize) -> &str {
-    let bytes = s.as_bytes();
-    let mut byte_idx = 0usize;
-    let mut seen = 0usize;
-    while byte_idx < bytes.len() && seen < count {
-        let (_, clen) = crate::unicode::decode_utf8_at(bytes, byte_idx);
-        byte_idx += clen;
-        seen += 1;
-    }
-    if seen < count {
-        ""
-    } else {
-        &s[byte_idx..]
-    }
+/// JS `s.slice(units)`: the suffix after `units` UTF-16 code units, or `""` past the end.
+///
+/// `Tokenizer.list` slices `line` by `indent` code units. When that cut falls inside an astral
+/// character, JS keeps the character's lone low surrogate and this keeps the whole character.
+/// The only readers of such a line test how it starts (indented code, fence, heading, hr), and a
+/// lone surrogate and an astral character both start it with a non-space, non-marker unit, so
+/// the two answer those tests alike. The other slices cut a run of leading spaces or a
+/// whitespace-only line, which hold BMP characters only, so they are exact.
+fn slice_utf16_from(s: &str, units: usize) -> &str {
+    &s[utf16_offset_to_utf8_byte(s, units)..]
 }
 
 fn is_line_indented_4_with_tabs(bytes: &[u8]) -> bool {
@@ -1604,7 +1600,7 @@ fn utf16_offset_to_utf8_byte(s: &str, target_u16: usize) -> usize {
         let (_, clen) = crate::unicode::decode_utf8_at(bytes, i);
         let step = if clen == 4 { 2 } else { 1 };
         if units + step > target_u16 {
-            // `target_u16` falls inside an astral surrogate pair (outside well-formed-UTF-16 domain).
+            // `target_u16` falls inside an astral surrogate pair: stop at that character's start.
             return i;
         }
         units += step;

@@ -1,14 +1,16 @@
 # marked 18.1.1: Elm port
 
-A faithful port of the `marked@18.1.1` synchronous Markdown-to-HTML subset defined in
-`libraries/marked/CONTRACT.md` to Elm 0.19.2: the exact block/inline `Lexer`, `Tokenizer`,
+A port of the `marked@18.1.1` synchronous Markdown-to-HTML subset defined in
+`libraries/marked/CONTRACT.md` to Elm 0.19.2: the block/inline `Lexer`, `Tokenizer`,
 `Parser`, `Renderer`, `TextRenderer`, helpers, and CommonMark / GFM / pedantic rule precedence of
 `node_modules/marked/lib/marked.esm.js` (and its embedded TypeScript sources). No kernel code, no
 `Debug`, no packages beyond the default `elm/core 1.0.5` and `elm/json 1.1.3`, zero embedded JS,
 zero `RegExp`, and a minimal 27-line I/O-only JS host (`js/index.js`, `mostlyJs: false`, 1.1%
-comparator share). The port reaches exact character-for-character parity on all 80 corpus cases in
-Node, Chrome, and Firefox (both minified and readable bundles) plus 3,744/3,744 adversarial and
-randomized differential cases across all 8 `(gfm, breaks, pedantic)` option combinations.
+comparator share). The port matches `marked@18.1.1` character for character on all 111 corpus
+cases in Node, Chrome, and Firefox (both minified and readable bundles). The 2026-11-20 pre-merge
+review found divergences in the hand-written scanners (regex `.` line terminators, the `{1,999}`
+label bound counted in code points, and backtracking in four rules); they are fixed, and the
+review's differential fuzzers plus a targeted line-terminator fuzzer find no divergence.
 
 | File | What it is |
 | --- | --- |
@@ -36,12 +38,26 @@ randomized differential cases across all 8 `(gfm, breaks, pedantic)` option comb
   suffix strings on every token.
 - **Native deterministic scanners + `unicode-classes.json` tables.** Elm's default packages do not
   include a regex engine (`elm/regex` also lacks the `u` flag), so all CommonMark, GFM, and
-  pedantic grammars are implemented natively as cursor scanners. Unicode classes (`\p{P}\p{S}`,
+  pedantic grammars are implemented natively as hand-written cursor scanners. A scanner moves
+  forward and must reproduce the regex's backtracking by reasoning about where the regex can
+  succeed (the optional `|` of `lheadingGfm`'s table lookahead, `pedanticHrefTitle`'s `[^'"]*`, the
+  pedantic `def`'s `<?`, and `reflinkSearch`'s `nolink(?!\()`, each commented at the scanner), so
+  equivalence rests on the corpus and on differential testing, not on construction. Unicode classes (`\p{P}\p{S}`,
   `[\p{Pi}\p{Ps}"']`, BMP `[\p{L}\p{N}]`, and ECMA-262 `\s`) use ASCII bitmasks plus binary search
   over sorted `Array Int` tables generated from `libraries/marked/unicode-classes.json`. HTML tag
   tables (`HTML_BLOCK_TAGS`, `HTML_TYPE1_TAGS`, `PEDANTIC_INLINE_TAGS`) are written as `case`
   expressions over lowercase strings, compiling to JS `switch` statements.
-- **Exact `marked@18.1.1` semantics.** Preserves every upstream nuance: `breaks` requires
+- **Regex `.`, `m`-flag lines and UTF-16 counts.** No marked rule has the `s` flag, so a regex `.`
+  matches any code unit except the line terminators `\n`, `\r`, U+2028 and U+2029. Scanners
+  that stand for `.` (heading, lheading, `def`'s `<.*?>`, the GFM table header and rows, the link
+  `<...>` escape, the pedantic link and `pedanticHrefTitle`) stop at all four via
+  `BlockRules.dotRunEnd` / `Unicode.isLineTerminator`; scanners for `[^\n]` use `lineEnd`. The
+  three `m`-flag rules (`codeRemoveIndent`, `blockquoteSetextReplace2`, `spaceLine`) go through
+  `BlockRules.mapJsLines`, which splits at all four. `parse` turns `\r` into `\n`, `parseInline`
+  keeps it. Counts are UTF-16 code units because `Src` is UTF-16 aligned; the one bound that
+  counts characters, `_boundedBlockLabel`'s `{1,999}`, adds `charWidth` per item, so an astral
+  character is two.
+- **Upstream behaviours kept.** Preserves upstream nuances: `breaks` requires
   `gfm && !pedantic` while task lists check `options.gfm` directly; `indentCodeCompensation`
   applies only to backtick fences; paragraph HTML interrupts are case-sensitive while `block.html`
   and list HTML breaks are case-insensitive; `Dict String LinkDef` handles prototype keys
@@ -60,12 +76,21 @@ randomized differential cases across all 8 `(gfm, breaks, pedantic)` option comb
   `maskedCodes` is computed lazily within each `inlineTokens` call only when `*`, `_`, or `~` is
   encountered, and hot integer comparisons compare differences against `0` (`a - b < 0`,
   `a - b == 0`) to avoid Elm's generic `_Utils_cmp` / `_Utils_eq` calls.
+- **No `Infinite loop` error (declared deviation).** marked throws `Infinite loop on byte: N` when
+  no block or inline rule consumes input. `blockTokensLoop` and `inlineTokensLoop` stop silently
+  instead (`BlockDone` / `InlineDone`, or a step that does not advance): Elm has no exceptions,
+  and surfacing the error would mean threading a `Result` through every recursive lexer entry. No
+  string input reaches either condition, in marked or here: the block `text` rule (`^[^\n]+`)
+  and `space` take any non-empty source, and `inlineText` (`^(`+|[^`])...`) takes at least one
+  code unit.
 - **Zero cross-call state.** The `Platform.worker` model is `()`, and `js/index.js` has only the
   standard two host module-state lines (`let app` and `let response`, identical to `pilot`,
   `minisearch`, and `fflate`). Every `run(input)` builds a fresh `Lexer` from its own input.
 
 ## Size and performance
 
+- After the 2026-11-20 review fixes `dist/index.min.js` is `101,368 B` (`32,958 B` gzip-9,
+  `26,748 B` brotli-11); the other figures in this section are from the build before them.
 - `dist/index.min.js`: `101,212 B` (`32,868 B` gzip-9, `26,675 B` brotli-11; `9,249` Elm code
   lines, `0` embedded JS, `0` eval refs, `27` host-JS lines / `1,125 B`, `mostlyJs: false` at
   `1.11%` comparator share / `0.26%` rendered share, `2` host module-state lines). By `meta.json`,
@@ -78,8 +103,15 @@ randomized differential cases across all 8 `(gfm, breaks, pedantic)` option comb
 
 ## Verification beyond the corpus
 
-In addition to exact `80/80` corpus parity in Node, Chrome, and Firefox (for both `index.min.js`
-and `index.js`) and `reproducibility.identical === true` across clean rebuilds:
+After the 2026-11-20 review fixes: `111/111` corpus parity in Node, Chrome, and Firefox (both
+artifacts); B1's differential fuzzers (194,000 inputs), B2's (1.09 million inputs: random fuzz plus
+generators for HTML blocks, links and labels, pedantic, block structure, emphasis, GFM URLs,
+fences, Unicode whitespace and stress sizes) and a targeted fuzzer for the fixed classes (400,000
+inputs) all find no divergence, and 100 KB inputs of up to 50,000 tokens match marked.
+
+Before the review, with the 80-case corpus, the port's own verification was exact `80/80` corpus
+parity in Node, Chrome, and Firefox (for both `index.min.js` and `index.js`) and
+`reproducibility.identical === true` across clean rebuilds, plus:
 - `1,024` adversarial cases (`64` edge-case documents × all `8` `(gfm, breaks, pedantic)` combos ×
   `parse`/`parseInline`): `1,024/1,024` exact match.
 - `2,700` randomized & grammar-targeted differential fuzz cases (HTML/pedantic HTML, links/defs/

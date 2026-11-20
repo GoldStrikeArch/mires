@@ -17,6 +17,7 @@ module BlockRules exposing
     , isHtmlInterrupt
     , isListTask
     , isNextBullet
+    , dotRunEnd
     , lineEnd
     , matchBlockCode
     , matchBlockLabel
@@ -63,6 +64,8 @@ import Unicode
         , isAsciiDigit
         , isAsciiWord
         , isJsSpace
+        , isLineTerminator
+        , slice
         , startsWithAsciiCi
         )
 
@@ -74,6 +77,44 @@ lineEnd codes pos end =
 
     else
         lineEnd codes (pos + 1) end
+
+
+{-| End of the run a regex `.*` matches from `pos`: the first line terminator (`\n`, `\r`,
+U+2028, U+2029), or `end`. `lineEnd` stands for `[^\n]*`, which crosses the other three.
+-}
+dotRunEnd : Array Int -> Int -> Int -> Int
+dotRunEnd codes pos end =
+    if pos - end >= 0 || isLineTerminator (at pos codes) then
+        pos
+
+    else
+        dotRunEnd codes (pos + 1) end
+
+
+{-| Applies `f` to every line a regex with the `m` flag sees: `^` and `$` match at every line
+terminator (`\n`, `\r`, U+2028, U+2029), not only at `\n`. The terminators are kept as they are.
+-}
+mapJsLines : (String -> String) -> String -> String
+mapJsLines f str =
+    mapJsLinesLoop f (fromString str) 0 []
+        |> List.reverse
+        |> String.concat
+
+
+mapJsLinesLoop : (String -> String) -> Src -> Int -> List String -> List String
+mapJsLinesLoop f src start acc =
+    let
+        end =
+            dotRunEnd src.codes start src.len
+
+        line =
+            f (slice start end src)
+    in
+    if end - src.len >= 0 then
+        line :: acc
+
+    else
+        mapJsLinesLoop f src (end + 1) (slice end (end + 1) src :: line :: acc)
 
 
 leadingSpacesUpTo : Array Int -> Int -> Int -> Int -> Int
@@ -904,15 +945,20 @@ matchHeading codes pos end pedantic =
 
     else
         let
+            -- `(.*)(?:\n+|$)`: the text cannot cross a line terminator other than `\n`.
             le =
-                lineEnd codes hEnd end
+                dotRunEnd codes hEnd end
         in
-        Just
-            { rawEnd = le
-            , depth = depth
-            , textStart = hEnd
-            , textEnd = le
-            }
+        if le - end < 0 && at le codes /= 10 then
+            Nothing
+
+        else
+            Just
+                { rawEnd = le
+                , depth = depth
+                , textStart = hEnd
+                , textEnd = le
+                }
 
 
 skipHashesUpTo6 : Array Int -> Int -> Int -> Int -> Int
@@ -2285,17 +2331,14 @@ matchBlockLabel codes pos end maxItems =
         matchBlockLabelLoop codes end limit pos 0
 
 
+{-| `limit` is the `{1,999}` bound of `_boundedBlockLabel` (`-1` for none). The regex has no `u`
+flag, so an item is one UTF-16 code unit (`\\[\s\S]` takes the backslash and one more unit): a
+BMP character is one item and an astral character, escaped or not, is two.
+-}
 matchBlockLabelLoop : Array Int -> Int -> Int -> Int -> Int -> Maybe Int
 matchBlockLabelLoop codes end limit i items =
     if i - end >= 0 then
         Nothing
-
-    else if limit >= 0 && items - limit >= 0 then
-        if items > 0 && at i codes == 93 then
-            Just i
-
-        else
-            Nothing
 
     else
         let
@@ -2312,15 +2355,23 @@ matchBlockLabelLoop codes end limit i items =
         else if b == 91 then
             Nothing
 
-        else if b == 92 then
-            if i + 1 - end >= 0 then
+        else
+            let
+                chStart =
+                    if b == 92 then
+                        i + 1
+
+                    else
+                        i
+
+                width =
+                    charWidth (at chStart codes)
+            in
+            if chStart - end >= 0 || (limit >= 0 && items + width - limit > 0) then
                 Nothing
 
             else
-                matchBlockLabelLoop codes end limit (i + 1 + charWidth (at (i + 1) codes)) (items + 1)
-
-        else
-            matchBlockLabelLoop codes end limit (i + charWidth b) (items + 1)
+                matchBlockLabelLoop codes end limit (chStart + width) (items + width)
 
 
 matchDefTitle : Array Int -> Int -> Int -> Maybe Int
@@ -2512,7 +2563,7 @@ matchDef src pos pedantic =
 
 scanDefAngleHref : Array Int -> Int -> Int -> Int -> Int -> Int -> Maybe DefSpan
 scanDefAngleHref codes n labelStart labelEnd hrefStart j =
-    if j - n >= 0 || at j codes == 10 then
+    if j - n >= 0 || isLineTerminator (at j codes) then
         Nothing
 
     else if at j codes == 62 then
@@ -2636,11 +2687,17 @@ matchDefPedantic codes pos n =
                     else
                         i1
 
-                hrefStart =
-                    i2
-
                 hrefEnd =
-                    scanPedanticDefHref codes hrefStart n
+                    scanPedanticDefHref codes i2 n
+
+                -- `<?([^\s>]+)`: the optional `<` is taken greedily, but when no href character
+                -- follows it, it backtracks to empty and the `<` itself becomes the href.
+                hrefStart =
+                    if hrefEnd - i2 == 0 then
+                        i1
+
+                    else
+                        i2
             in
             if hrefEnd - hrefStart == 0 then
                 Nothing
@@ -2865,10 +2922,11 @@ matchTableAt src pos =
 
     else
         let
+            -- Header `([^\n ].*)\n`: one character other than `\n`, then a `.` run that must end at `\n`.
             headerEnd =
-                lineEnd codes headerStart n
+                dotRunEnd codes (headerStart + charWidth (at headerStart codes)) n
         in
-        if headerEnd - n >= 0 then
+        if headerEnd - n >= 0 || at headerEnd codes /= 10 then
             Nothing
 
         else
@@ -2941,17 +2999,18 @@ scanTableBodyRows src cur =
 
         else
             let
+                -- A row is `.*(?:\n|$)`: a row holding another line terminator ends the table before it.
                 le =
-                    lineEnd codes cur n
-
-                nextCur =
-                    if le - n < 0 then
-                        le + 1
-
-                    else
-                        n
+                    dotRunEnd codes cur n
             in
-            scanTableBodyRows src nextCur
+            if le - n >= 0 then
+                n
+
+            else if at le codes /= 10 then
+                cur
+
+            else
+                scanTableBodyRows src (le + 1)
 
 
 isCodeIndentNonBlank : Array Int -> Int -> Int -> Bool
@@ -3059,23 +3118,13 @@ scanUntilGtOrNl codes j n =
         j
 
 
+{-| Checks lheadingGfm's table interrupt ` {0,3}\|?(?:[:\- ]*\|)+[\:\- ]*\n`. The optional leading
+`|` can backtrack to empty and count as the group's pipe, so the line matches when it holds only
+`[ :|-]` and at least one `|`, wherever that pipe sits.
+-}
 isLHeadingTableAt : Array Int -> Int -> Int -> Bool
 isLHeadingTableAt codes pos n =
-    let
-        sp =
-            leadingSpacesUpTo codes pos n 3
-
-        i0 =
-            pos + sp
-
-        i1 =
-            if i0 - n < 0 && at i0 codes == 124 then
-                i0 + 1
-
-            else
-                i0
-    in
-    scanLHeadingTableLoop codes i1 n 0
+    scanLHeadingTableLoop codes pos n 0
 
 
 scanLHeadingTableLoop : Array Int -> Int -> Int -> Int -> Bool
@@ -3133,10 +3182,11 @@ matchLHeadingAt src pos mode =
 
     else if isPedantic mode then
         let
+            -- `^(.+?)\n`: one line of `.` characters ending at `\n`.
             le =
-                lineEnd codes pos n
+                dotRunEnd codes pos n
         in
-        if le - pos == 0 || le - n >= 0 then
+        if le - pos == 0 || le - n >= 0 || at le codes /= 10 then
             Nothing
 
         else
@@ -3177,13 +3227,15 @@ matchLHeadingAt src pos mode =
             scanLHeadingLines codes n gfm pos pos
 
 
+{-| The text `(?:.|\n(?!...))+?` crosses only `\n`: any other line terminator ends the match.
+-}
 scanLHeadingLines : Array Int -> Int -> Bool -> Int -> Int -> Maybe LHeadingSpan
 scanLHeadingLines codes n gfm startPos cur =
     let
         le =
-            lineEnd codes cur n
+            dotRunEnd codes cur n
     in
-    if le - n >= 0 then
+    if le - n >= 0 || at le codes /= 10 then
         Nothing
 
     else
@@ -3394,6 +3446,10 @@ matchBlockquoteLoop src i any =
 -- LINE TRANSFORMATION HELPERS
 
 
+{-| `chunk.replace(blockquoteSetextReplace, '\n    $1').replace(blockquoteSetextReplace2, '')`. The
+setext replace sees `\n` lines only (`\n {0,3}((?:=+|-+) *)(?=\n|$)` has no `m` flag); the marker
+strip `^ {0,3}>[ \t]?` runs with the `m` flag, so it also strips after `\r`, U+2028 and U+2029.
+-}
 stripBlockquoteMarkers : String -> String
 stripBlockquoteMarkers chunk =
     String.split "\n" chunk
@@ -3419,19 +3475,8 @@ stripBqMarkersLoop isFirst acc lines =
             if not isFirst && isSetextOnlyLine s.codes sp s.len then
                 stripBqMarkersLoop False (("    " ++ String.dropLeft sp line) :: acc) rest
 
-            else if sp - s.len < 0 && at sp s.codes == 62 then
-                let
-                    after =
-                        if sp + 1 - s.len < 0 && (at (sp + 1) s.codes == 32 || at (sp + 1) s.codes == 9) then
-                            sp + 2
-
-                        else
-                            sp + 1
-                in
-                stripBqMarkersLoop False (String.dropLeft after line :: acc) rest
-
             else
-                stripBqMarkersLoop False (line :: acc) rest
+                stripBqMarkersLoop False (stripOneBlockquotePrefix line :: acc) rest
 
 
 isSetextOnlyLine : Array Int -> Int -> Int -> Bool
@@ -3458,35 +3503,35 @@ isSetextOnlyLine codes sp len =
             k2 - len == 0
 
 
+{-| `text.replace(/^ {0,3}>[ \t]?/gm, '')`, over `m`-flag lines.
+-}
 stripOneBlockquotePrefix : String -> String
 stripOneBlockquotePrefix text =
-    String.split "\n" text
-        |> List.foldl
-            (\line acc ->
-                let
-                    s =
-                        fromString line
+    mapJsLines stripLineBlockquoteMarker text
 
-                    sp =
-                        leadingSpacesUpTo s.codes 0 s.len 3
-                in
-                if sp - s.len < 0 && at sp s.codes == 62 then
-                    let
-                        after =
-                            if sp + 1 - s.len < 0 && (at (sp + 1) s.codes == 32 || at (sp + 1) s.codes == 9) then
-                                sp + 2
 
-                            else
-                                sp + 1
-                    in
-                    String.dropLeft after line :: acc
+stripLineBlockquoteMarker : String -> String
+stripLineBlockquoteMarker line =
+    let
+        s =
+            fromString line
+
+        sp =
+            leadingSpacesUpTo s.codes 0 s.len 3
+    in
+    if sp - s.len < 0 && at sp s.codes == 62 then
+        let
+            after =
+                if sp + 1 - s.len < 0 && (at (sp + 1) s.codes == 32 || at (sp + 1) s.codes == 9) then
+                    sp + 2
 
                 else
-                    line :: acc
-            )
-            []
-        |> List.reverse
-        |> String.join "\n"
+                    sp + 1
+        in
+        String.dropLeft after line
+
+    else
+        line
 
 
 hasDoubleBlankLineEnd : Array Int -> Int -> Int -> Bool
@@ -3766,30 +3811,29 @@ allDashes codes i end =
         False
 
 
+{-| `raw.replace(/^(?: {0,3}\t| {1,4})/gm, '')`, over `m`-flag lines.
+-}
 removeCodeIndent : String -> String
 removeCodeIndent raw =
-    String.split "\n" raw
-        |> List.foldl
-            (\line acc ->
-                let
-                    s =
-                        fromString line
+    mapJsLines
+        (\line ->
+            let
+                s =
+                    fromString line
 
-                    sp =
-                        leadingSpacesUpTo s.codes 0 s.len 4
+                sp =
+                    leadingSpacesUpTo s.codes 0 s.len 4
 
-                    strip =
-                        if sp < 4 && sp - s.len < 0 && at sp s.codes == 9 then
-                            sp + 1
+                strip =
+                    if sp < 4 && sp - s.len < 0 && at sp s.codes == 9 then
+                        sp + 1
 
-                        else
-                            sp
-                in
-                String.dropLeft strip line :: acc
-            )
-            []
-        |> List.reverse
-        |> String.join "\n"
+                    else
+                        sp
+            in
+            String.dropLeft strip line
+        )
+        raw
 
 
 indentCodeCompensation : String -> String -> String
@@ -3867,28 +3911,27 @@ stripUpToNJsSpaces codes i len maxChars seen =
             i
 
 
+{-| `src.replace(/\t/g, '    ').replace(/^ +$/gm, '')`, over `m`-flag lines.
+-}
 preprocessPedanticBlock : String -> String
 preprocessPedanticBlock src =
-    String.split "\n" src
-        |> List.foldl
-            (\line acc ->
-                let
-                    noTab =
-                        if String.contains "\t" line then
-                            String.replace "\t" "    " line
+    mapJsLines
+        (\line ->
+            let
+                noTab =
+                    if String.contains "\t" line then
+                        String.replace "\t" "    " line
 
-                        else
-                            line
-                in
-                if isAllAsciiSpacesNonEmpty noTab then
-                    "" :: acc
+                    else
+                        line
+            in
+            if isAllAsciiSpacesNonEmpty noTab then
+                ""
 
-                else
-                    noTab :: acc
-            )
-            []
-        |> List.reverse
-        |> String.join "\n"
+            else
+                noTab
+        )
+        src
 
 
 isAllAsciiSpacesNonEmpty : String -> Bool

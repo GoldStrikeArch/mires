@@ -359,6 +359,33 @@ pub fn js_space_len_at(bytes: &[u8], pos: usize) -> usize {
     }
 }
 
+/// If `bytes[pos..]` starts with an ECMA-262 line terminator (`\n`, `\r`, U+2028, U+2029),
+/// returns its UTF-8 byte length. A regex `.` without the `s` flag matches every code unit
+/// except these four, so the scanners that stand for `.` stop at them.
+#[inline]
+pub fn line_terminator_len_at(bytes: &[u8], pos: usize) -> usize {
+    let n = bytes.len();
+    if pos >= n {
+        return 0;
+    }
+    match bytes[pos] {
+        b'\n' | b'\r' => 1,
+        // U+2028 and U+2029 are `E2 80 A8` and `E2 80 A9` in UTF-8.
+        0xE2 if pos + 2 < n && bytes[pos + 1] == 0x80 && matches!(bytes[pos + 2], 0xA8 | 0xA9) => 3,
+        _ => 0,
+    }
+}
+
+/// End of the run a regex `.*` matches from `start`: the first line terminator, or the end.
+#[inline]
+pub fn dot_run_end(bytes: &[u8], start: usize) -> usize {
+    let mut i = start;
+    while i < bytes.len() && line_terminator_len_at(bytes, i) == 0 {
+        i += 1;
+    }
+    i
+}
+
 /// Returns byte index of first non-JS-whitespace char in `bytes`.
 #[inline]
 pub fn trim_start_js_bytes(bytes: &[u8]) -> usize {

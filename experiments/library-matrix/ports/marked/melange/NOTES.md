@@ -4,10 +4,13 @@ A faithful port of the synchronous CommonMark and GFM compilation pipeline in
 `libraries/marked/CONTRACT.md`, written as **one OCaml program compiled by two compilers**: this
 directory (Melange 7.0.1) and `../jsoo/` (js_of_ocaml 6.4.1) share the same 9-module OCaml core
 byte-for-byte, differing only in `src/host.ml` and the entry module (`src/index.ml` vs
-`src/main.ml`). It reaches character-for-character parity with `marked@18.1.1` on all 80 corpus
-cases in Node, Chrome, and Firefox (both minified and readable artifacts), plus 1,638 adversarial
-and randomized differential cases across all 8 `(gfm, breaks, pedantic)` combinations and both
-`parse` and `parseInline`.
+`src/main.ml`). It matches `marked@18.1.1` character for character on all 111 corpus cases in Node,
+Chrome, and Firefox (both minified and readable artifacts). The 2026-11-20 pre-merge review found
+two defects in the shared core, both fixed: a stray `}` in `htmlBeginRegex` (`ul}`) and lexer loops
+that recursed once per token (see "Constant-stack lexer loops" below). Every
+rule regex the core builds now has the source and flags of the matching compiled marked rule, up
+to `\t` spelled for a literal tab (all `RegExp` constructions captured through a proxy and compared
+with `Lexer.rules` and `rules.other`), and the review's differential fuzzers find no divergence.
 
 | File | Shared with `../jsoo/` | What it is |
 | --- | --- | --- |
@@ -44,8 +47,21 @@ per-compiler entry points.
   `match_group_or_empty` + `match_group_is_nonempty`, hoisting stateless regex replacers
   (`escape_replacer`, `decode_ncr_replacer`, `expand_tabs_zero_replacer`,
   `mask_punct_outside_code_replacer`, `mask_block_skip_replacer`) via `Re.make_replacer1` /
-  `make_replacer3`, and writing tail-recursive unboxed loops in `Lexer` cut Node `bench-parse` from
-  1.73× JS down to ~1.32× JS and `bench-gfm` from 1.60× JS down to ~1.32× JS.
+  `make_replacer3`, and unboxed loops in `Lexer` cut Node `bench-parse` from 1.73× JS down to
+  ~1.32× JS and `bench-gfm` from 1.60× JS down to ~1.32× JS.
+- **Constant-stack lexer loops.** marked's `blockTokens` and `inlineTokens` are `while` loops. The
+  port's `block_tokens` / `inline_tokens_inner` loops are local `let rec loop`s whose every
+  recursive call is a direct self tail call (`loop (push_token tokens s tok) ...`), which Melange
+  and js_of_ocaml both compile to a JS `while` loop. Until the 2026-11-20 review, most branches
+  went through a local `advance` closure that called `loop`; neither compiler turns that into a
+  loop, so the stack grew by one frame per token and inputs of about 2,500-3,000 tokens (12 KB of
+  `# h\n`) threw `RangeError`. Both builds now lex 100 KB inputs of up to 50,000 tokens (headings,
+  emphasis, links, lists, tables, URLs, code spans, escapes; `parse` and `parseInline`) exactly as
+  marked does, and the corpus pins 5,000 headings and 5,000 emphasis runs.
+- **Two marked rules are not built.** `inline.del` is defined in `rules.ts` but never read by
+  marked's `Tokenizer` (strikethrough goes through `delLDelim` / `delRDelim`), so `rules.ml` omits
+  it; `other.findPipe` (`/\|/g`, used by `splitCells` to put a space before every unescaped `|`)
+  is replaced by an `indexOf` loop in `helpers.ml`'s `split_cells` with the same result.
 - **Native JS `Array` (`Vec`) and `Map` (`StrMap`).** Token vectors, `inline_queue`, and `split`/`join`
   buffers wrap JS `Array` directly with zero copying; `tokens.links` wraps JS `Map` (avoiding both
   prototype-key collisions like `__proto__`/`constructor` and Melange's `Hashtbl`/`Printf` pull-in).

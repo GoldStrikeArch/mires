@@ -12,8 +12,8 @@ use crate::block_rules::match_block_label;
 use crate::helpers::normalize_label;
 use crate::tokens::{LinkDef, Mode};
 use crate::unicode::{
-    decode_utf8_at, is_all_js_space_bytes, is_js_space, is_open_quote, is_punct,
-    is_punct_or_space, js_space_len_at,
+    decode_utf8_at, dot_run_end, is_all_js_space_bytes, is_js_space, is_open_quote, is_punct,
+    is_punct_or_space, js_space_len_at, line_terminator_len_at,
 };
 
 #[inline]
@@ -780,8 +780,9 @@ pub fn match_inline_link(bytes: &[u8], pos: usize, pedantic: bool) -> Option<Lin
         let paren_open = close_bracket + 1;
 
         if pedantic {
+            // `\((.*?)\)`: the href is the shortest `.` run up to a `)`.
             let mut j = paren_open + 1;
-            while j < n && bytes[j] != b')' && bytes[j] != b'\n' {
+            while j < n && bytes[j] != b')' && line_terminator_len_at(bytes, j) == 0 {
                 j += 1;
             }
             if j < n && bytes[j] == b')' {
@@ -829,7 +830,8 @@ pub fn match_inline_link(bytes: &[u8], pos: usize, pedantic: bool) -> Option<Lin
                     break;
                 }
                 if b == b'\\' {
-                    if j + 1 < n && bytes[j + 1] != b'\n' {
+                    // `\\.`: an escape takes any character but a line terminator.
+                    if j + 1 < n && line_terminator_len_at(bytes, j + 1) == 0 {
                         let (_, clen) = decode_utf8_at(bytes, j + 1);
                         j += 1 + clen;
                     } else {
@@ -891,42 +893,43 @@ pub fn match_inline_link(bytes: &[u8], pos: usize, pedantic: bool) -> Option<Lin
     None
 }
 
+/// Matches `other.pedanticHrefTitle` `^([^'"]*[^\s])\s+(['"])(.*)\2` on a pedantic href,
+/// returning `(href, title)`.
+///
+/// The regex backtracks `[^'"]*` from the first quote down to the start, so the href ends at the
+/// last split point `k` (at most the first quote) where a non-space character is followed by a
+/// whitespace run and then a quote; that non-space character may itself be the first quote. The
+/// title then runs to the last matching quote before the end of the `.*` run.
 pub fn match_pedantic_href_title(href: &str) -> Option<(&str, &str)> {
     let bytes = href.as_bytes();
     let n = bytes.len();
-    let mut q = 0;
-    while q < n && bytes[q] != b'\'' && bytes[q] != b'"' {
-        q += 1;
-    }
-    if q >= n {
-        return None;
-    }
-    let quote_char = bytes[q];
-    let mut close_q = n;
-    let mut k = n;
-    while k > q + 1 {
-        k -= 1;
-        if bytes[k] == quote_char {
-            close_q = k;
-            break;
-        }
-    }
-    if close_q == n {
-        return None;
-    }
-    let mut ws_start = q;
-    while ws_start > 0 {
-        let (ch, len) = crate::unicode::decode_utf8_rev(bytes, ws_start);
+    let first_quote = bytes.iter().position(|&b| b == b'\'' || b == b'"')?;
+    let mut end = first_quote + 1;
+    while end > 0 {
+        let (ch, len) = crate::unicode::decode_utf8_rev(bytes, end);
+        let href_end = end;
+        end -= len;
         if is_js_space(ch) {
-            ws_start -= len;
-        } else {
-            break;
+            continue;
+        }
+        let mut q = href_end;
+        while q < n {
+            let sl = js_space_len_at(bytes, q);
+            if sl == 0 {
+                break;
+            }
+            q += sl;
+        }
+        if q == href_end || q >= n || (bytes[q] != b'\'' && bytes[q] != b'"') {
+            continue;
+        }
+        let title_start = q + 1;
+        let run_end = dot_run_end(bytes, title_start);
+        if let Some(close) = bytes[title_start..run_end].iter().rposition(|&b| b == bytes[q]) {
+            return Some((&href[..href_end], &href[title_start..title_start + close]));
         }
     }
-    if ws_start == q || ws_start == 0 {
-        return None;
-    }
-    Some((&href[..ws_start], &href[q + 1..close_q]))
+    None
 }
 
 pub struct ReflinkSpan {
@@ -1007,9 +1010,16 @@ pub fn match_reflink_at(
         } else {
             close + 1
         };
-        if bounded && end < n && bytes[end] == b'(' {
-            return None;
-        }
+        // `nolink(?!\()`: when `[]` is followed by `(`, `(?:\[\])?` backtracks to empty and the
+        // lookahead then sees the `[`.
+        let end = if bounded && end < n && bytes[end] == b'(' {
+            if end == close + 1 {
+                return None;
+            }
+            close + 1
+        } else {
+            end
+        };
         return Some(ReflinkSpan {
             raw_end: end,
             is_image,

@@ -89,6 +89,11 @@ let last_token_opt (tokens : token Vec.t) : token option =
   let n = Vec.length tokens in
   if n > 0 then Some (Vec.get tokens (n - 1)) else None
 
+(* Pushes [tok] onto [tokens] and returns the rest of [src] after the token's raw text. *)
+let push_token (tokens : token Vec.t) (src : Jstr.t) (tok : token) : Jstr.t =
+  Vec.push tokens tok;
+  Jstr.substring_from src (Jstr.length (token_raw tok))
+
 let merge_into_last_text (lex : lexer) (last : text_token) (raw : Jstr.t) (text : Jstr.t)
     ~(pop_queue : bool) : unit =
   let sep = if Jstr.ends_with last.t_raw s_nl then Jstr.empty else s_nl in
@@ -107,15 +112,13 @@ let block_tokens (lex : lexer) (src_in : Jstr.t) (tokens : token Vec.t)
         Rules.Other.space_line Jstr.empty
     else src_in
   in
+  (* Every [loop] call below is a direct self tail call, which Melange and js_of_ocaml both
+     compile to a JS loop, so the stack stays flat however many tokens the source holds. *)
   let rec loop s prev_len last_clipped =
     let cur_len = Jstr.length s in
     if cur_len = 0 then ()
     else if cur_len >= prev_len then infinite_loop_error s
     else
-      let advance tok next_clipped =
-        Vec.push tokens tok;
-        loop (Jstr.substring_from s (Jstr.length (token_raw tok))) cur_len next_clipped
-      in
       match Tokenizer.space lex s with
       | Some (Space sp as tok) ->
           if Jstr.length sp.raw = 1 then (
@@ -133,22 +136,22 @@ let block_tokens (lex : lexer) (src_in : Jstr.t) (tokens : token Vec.t)
               loop (Jstr.substring_from s (Jstr.length c.raw)) cur_len last_clipped
           | _ -> (
               match Tokenizer.fences lex s with
-              | Some tok -> advance tok last_clipped
+              | Some tok -> loop (push_token tokens s tok) cur_len last_clipped
               | None -> (
                   match Tokenizer.heading lex s with
-                  | Some tok -> advance tok last_clipped
+                  | Some tok -> loop (push_token tokens s tok) cur_len last_clipped
                   | None -> (
                       match Tokenizer.hr lex s with
-                      | Some tok -> advance tok last_clipped
+                      | Some tok -> loop (push_token tokens s tok) cur_len last_clipped
                       | None -> (
                           match Tokenizer.blockquote lex s with
-                          | Some tok -> advance tok last_clipped
+                          | Some tok -> loop (push_token tokens s tok) cur_len last_clipped
                           | None -> (
                               match Tokenizer.list lex s with
-                              | Some tok -> advance tok last_clipped
+                              | Some tok -> loop (push_token tokens s tok) cur_len last_clipped
                               | None -> (
                                   match Tokenizer.html lex s with
-                                  | Some tok -> advance tok last_clipped
+                                  | Some tok -> loop (push_token tokens s tok) cur_len last_clipped
                                   | None -> (
                                       match Tokenizer.def lex s with
                                       | Some (Def d as tok) ->
@@ -165,10 +168,12 @@ let block_tokens (lex : lexer) (src_in : Jstr.t) (tokens : token Vec.t)
                                             last_clipped
                                       | _ -> (
                                           match Tokenizer.table lex s with
-                                          | Some tok -> advance tok last_clipped
+                                          | Some tok ->
+                                              loop (push_token tokens s tok) cur_len last_clipped
                                           | None -> (
                                               match Tokenizer.lheading lex s with
-                                              | Some tok -> advance tok last_clipped
+                                              | Some tok ->
+                                                  loop (push_token tokens s tok) cur_len last_clipped
                                               | None ->
                                                   let para =
                                                     if lex.state.top then Tokenizer.paragraph lex s
@@ -233,24 +238,21 @@ let inline_tokens_inner (lex : lexer) (src_in : Jstr.t) (tokens : token Vec.t) :
       mask_punct_outside_code_replacer
   in
   let masked_src = Re.replace_with3 masked lex.rules.inline.block_skip mask_block_skip_replacer in
+  (* As in [block_tokens], every [loop] call is a direct self tail call. *)
   let rec loop s prev_len prev_char keep_prev =
     let cur_len = Jstr.length s in
     if cur_len = 0 then ()
     else if cur_len >= prev_len then infinite_loop_error s
     else
       let prev_char = if keep_prev then prev_char else Jstr.empty in
-      let advance tok =
-        Vec.push tokens tok;
-        loop (Jstr.substring_from s (Jstr.length (token_raw tok))) cur_len prev_char false
-      in
       match Tokenizer.escape lex s with
-      | Some tok -> advance tok
+      | Some tok -> loop (push_token tokens s tok) cur_len prev_char false
       | None -> (
           match Tokenizer.tag lex s with
-          | Some tok -> advance tok
+          | Some tok -> loop (push_token tokens s tok) cur_len prev_char false
           | None -> (
               match Tokenizer.link lex s with
-              | Some tok -> advance tok
+              | Some tok -> loop (push_token tokens s tok) cur_len prev_char false
               | None -> (
                   match Tokenizer.reflink lex s with
                   | Some tok ->
@@ -263,26 +265,29 @@ let inline_tokens_inner (lex : lexer) (src_in : Jstr.t) (tokens : token Vec.t) :
                         false
                   | None -> (
                       match Tokenizer.em_strong lex s masked_src prev_char with
-                      | Some tok -> advance tok
+                      | Some tok -> loop (push_token tokens s tok) cur_len prev_char false
                       | None -> (
                           match Tokenizer.codespan lex s with
-                          | Some tok -> advance tok
+                          | Some tok -> loop (push_token tokens s tok) cur_len prev_char false
                           | None -> (
                               match Tokenizer.br lex s with
-                              | Some tok -> advance tok
+                              | Some tok -> loop (push_token tokens s tok) cur_len prev_char false
                               | None -> (
                                   match Tokenizer.del lex s masked_src prev_char with
-                                  | Some tok -> advance tok
+                                  | Some tok ->
+                                      loop (push_token tokens s tok) cur_len prev_char false
                                   | None -> (
                                       match Tokenizer.autolink lex s with
-                                      | Some tok -> advance tok
+                                      | Some tok ->
+                                          loop (push_token tokens s tok) cur_len prev_char false
                                       | None ->
                                           let url_tok =
                                             if not lex.state.in_link then Tokenizer.url lex s
                                             else None
                                           in
                                           (match url_tok with
-                                          | Some tok -> advance tok
+                                          | Some tok ->
+                                              loop (push_token tokens s tok) cur_len prev_char false
                                           | None -> (
                                               match Tokenizer.inline_text lex s with
                                               | Some (Text t as tok) ->

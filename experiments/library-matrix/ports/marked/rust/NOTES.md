@@ -1,13 +1,17 @@
 # marked 18.1.1: Rust port (mires)
 
-A faithful port of the `marked@18.1.1` synchronous Markdown-to-HTML subset defined in
-`libraries/marked/CONTRACT.md`: the exact block/inline `Lexer`, `Tokenizer`, `Parser`, `Renderer`,
+A port of the `marked@18.1.1` synchronous Markdown-to-HTML subset defined in
+`libraries/marked/CONTRACT.md`: the block/inline `Lexer`, `Tokenizer`, `Parser`, `Renderer`,
 `TextRenderer`, helpers, and CommonMark / GFM / pedantic rule precedence of
 `node_modules/marked/lib/marked.esm.js` (and its embedded TypeScript sources), in safe `no_std`
-Rust (`#![deny(unsafe_code)]`, zero `js!{}`, zero host `RegExp`). It reaches exact bit-for-bit
-parity on all 80 corpus cases in Node, Chrome, and Firefox (both minified and readable artifacts)
-plus 1,500/1,500 randomized differential cases across all 8 `(gfm, breaks, pedantic)` option
-combinations.
+Rust (`#![deny(unsafe_code)]`, zero `js!{}`, zero host `RegExp`). It matches `marked@18.1.1`
+character for character on all 111 corpus cases in Node, Chrome, and Firefox (both minified and
+readable artifacts). The 2026-11-20 pre-merge review found four classes of divergence in the
+hand-written matchers (regex `.` line terminators, UTF-16 counts, and two backtracking cases); they
+are fixed. Re-run on the fixed build, the review's differential fuzzers (B1's 194,000 and B2's
+1.09 million inputs) and a targeted fuzzer for the fixed classes (400,000 inputs with `\r`, U+2028,
+U+2029, astral text, lone pipes and pedantic links, across all 8 `(gfm, breaks, pedantic)`
+combinations and both operations) find no divergence except the nesting-depth limit below.
 
 | File | What it is |
 | --- | --- |
@@ -23,13 +27,39 @@ combinations.
 
 ## Decisions
 
-- **Pure-Rust rule matchers instead of host `RegExp`.** `no_std` Rust has no built-in regex engine,
-  so every CommonMark, GFM, and pedantic regex from `src/rules.ts` is translated directly into
-  pure-Rust byte-slice matchers (`block_rules.rs`, `inline_rules.rs`). Unicode character classes
-  (`\p{P}`/`\p{S}`, `[\p{Pi}\p{Ps}"']`, BMP alphanumeric, JS `\s`) use immutable sorted tables in
-  `src/unicode.rs` generated from `libraries/marked/unicode-classes.json` so behavior is
+- **Hand-written rule matchers instead of host `RegExp`.** `no_std` Rust has no built-in regex
+  engine, so each CommonMark, GFM, and pedantic regex from `src/rules.ts` is a hand-written
+  byte-cursor matcher (`block_rules.rs`, `inline_rules.rs`) that decides what the regex would
+  match. They are not a mechanical translation: a matcher scans forward and has to reproduce the
+  regex's backtracking by reasoning about where it can succeed (for example the optional leading
+  `|` of `lheadingGfm`'s table lookahead, `pedanticHrefTitle`'s `[^'"]*`, the pedantic `def`'s `<?`,
+  and `reflinkSearch`'s `nolink(?!\()`, each commented at the matcher). Equivalence rests on the
+  corpus and on differential testing against marked, not on construction. Unicode character
+  classes (`\p{P}`/`\p{S}`, `[\p{Pi}\p{Ps}"']`, BMP alphanumeric, JS `\s`) use immutable sorted
+  tables in `src/unicode.rs` generated from `libraries/marked/unicode-classes.json` so behavior is
   self-contained and identical across JS engines (`0` embedded JS, `0` host JS, `0` module state).
-- **Exact `marked@18.1.1` semantics.** Preserves subtle upstream behaviors rather than substituting
+- **Regex `.` and `m`-flag lines.** No marked rule has the `s` flag, so a regex `.` matches any
+  code unit except the line terminators `\n`, `\r`, U+2028 and U+2029. Matchers that stand for
+  `.` (heading, lheading, `def`'s `<.*?>`, the GFM table header and rows, the link `<...>` escape,
+  the pedantic link and `pedanticHrefTitle`) stop at all four through
+  `unicode::line_terminator_len_at` / `dot_run_end`; matchers that stand for `[^\n]` stop at `\n`
+  only (`block_rules::line_end`). The three `m`-flag rules (`codeRemoveIndent`,
+  `blockquoteSetextReplace2`, `spaceLine`) iterate `block_rules::js_lines`, which splits at all
+  four terminators. `parse` turns `\r` into `\n` first, but `parseInline` keeps it.
+- **UTF-16 counts.** Positions are UTF-8 byte offsets, which is exact wherever JS uses a count as
+  an offset into the same string. Where a count is compared with a bound or carried to another
+  string it is converted to UTF-16 code units, as JS counts: the `_boundedBlockLabel` `{1,999}`
+  bound (`match_block_label`: an astral character is two items), `Tokenizer.list`'s
+  `line.slice(indent)` (`slice_utf16_from`) and the `linkLen` truncation (`utf16_len`). Only
+  marked's `[...str]` spreads (`emStrong`/`del` delimiter lengths) and `expandTabs` count code
+  points, and the port counts scalar values there.
+- **Recursion depth (declared deviation).** Like marked, nested blocks recurse (`block_tokens` ->
+  `tok_list` -> `block_tokens` for each list level). Each level holds two large mires-compiled
+  frames, so under Node's default stack a list nested about 200-280 levels deep (`- - - ... a`)
+  throws `RangeError`, where marked itself reaches about 2,490 levels; the host-`RegExp` ports
+  reach about 600-1,000. Nesting that deep is not in the corpus; the flat token loops are iterative
+  and run in constant stack (100 KB inputs of 50,000 tokens match marked).
+- **Upstream behaviours kept.** Preserves subtle upstream behaviors rather than substituting
   generic CommonMark heuristics: `breaks` requires `gfm && !pedantic` (`pedantic` overrides grammar
   rules, while task lists still check `options.gfm`); `indentCodeCompensation` applies only to
   backtick fences, not tilde fences; paragraph HTML interrupts are case-sensitive while `block.html`
@@ -86,7 +116,10 @@ under `experiments/library-matrix/mires-bugs/`:
 
 ## Size
 
-`dist/index.min.js` is `288,482 B` (`85,290 B` gzip-9, `68,384 B` brotli-11; `7,129` lines;
+After the 2026-11-20 review fixes `dist/index.min.js` is `289,307 B` (`85,738 B` gzip-9,
+`68,688 B` brotli-11); the figures below are from the build before them.
+
+`dist/index.min.js` was `288,482 B` (`85,290 B` gzip-9, `68,384 B` brotli-11; `7,129` lines;
 `0` embedded JS, `0` eval refs, `0` host JS, `0` module state; `688` items: `438` JIR, `250`
 non-ordinary fallback, `ordinaryFallback: 0`). By `optimizer-report.json` (`310,364 B` linked
 `program.js` before Rollup/Terser):

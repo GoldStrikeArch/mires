@@ -14,6 +14,7 @@ module Unicode exposing
     , isBmpAlnum
     , isInlinePunctuationPrev
     , isJsSpace
+    , isLineTerminator
     , isOpenQuote
     , isPunct
     , isPunctOrSpace
@@ -208,6 +209,14 @@ isJsSpace cp =
             || cp == 0x205F
             || cp == 0x3000
             || cp == 0xFEFF
+
+
+{-| ECMA-262 line terminators: `\n`, `\r`, U+2028 and U+2029. A regex `.` without the `s` flag
+matches every code unit except these four.
+-}
+isLineTerminator : Int -> Bool
+isLineTerminator cp =
+    cp == 10 || cp == 13 || cp == 0x2028 || cp == 0x2029
 
 
 {-| Matches `/[\p{P}\p{S}]/u`.

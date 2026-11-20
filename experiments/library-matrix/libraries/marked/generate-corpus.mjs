@@ -1077,7 +1077,148 @@ add('parse-inline-trailing-br-ws', 'parseInline trailing 2 spaces + LF + trailin
   markdown: 'line  \n   ',
 })
 
-// 13. Bench cases (2)
+// 13. Regressions from the 2026-11-20 pre-merge review (31): native-scanner ports (Rust, Elm)
+// must give regex `.` and the `m`-flag anchors JS's line terminators (\n, \r, U+2028, U+2029),
+// count quantifier bounds and slices in UTF-16 code units, and backtrack where the regex does;
+// the OCaml ports must build marked's exact rule sources and lex in constant stack.
+const party = '\u{1F389}'
+const P = { pedantic: true }
+
+add('regress-dot-heading-u2028', 'ATX heading `(.*)(?:\\n+|$)` cannot cross U+2028 (JS `.` excludes \\r, U+2028, U+2029): a paragraph', {
+  op: 'parse',
+  markdown: '# a b',
+})
+add('regress-dot-heading-u2029', 'ATX heading text cannot cross U+2029: a paragraph', {
+  op: 'parse',
+  markdown: '# a b',
+})
+add('regress-dot-heading-cr', 'parse normalises the lone \\r to \\n before lexing: a heading, then a paragraph', {
+  op: 'parse',
+  markdown: '# a\rb',
+})
+add('regress-dot-pedantic-heading-u2028', 'pedantic heading `^(#{1,6})(.*)(?:\\n+|$)` cannot cross U+2028', {
+  op: 'parse',
+  markdown: '#a b',
+  options: P,
+})
+add('regress-dot-lheading-u2029', 'setext heading text `(?:.|\\n(?!...))+?` cannot cross U+2029: a paragraph', {
+  op: 'parse',
+  markdown: 'a b\n===',
+})
+add('regress-dot-pedantic-lheading-lookahead', 'pedantic paragraph: its lheading lookahead stops at U+2028, so the lines stay one paragraph', {
+  op: 'parse',
+  markdown: 'a\nb c\n===\n',
+  options: P,
+})
+add('regress-dot-table-header-u2028', 'GFM table header `([^\\n ].*)\\n` cannot cross U+2028: no table', {
+  op: 'parse',
+  markdown: 'a |b\n-|-\nc|d',
+})
+add('regress-dot-table-row-u2028', 'GFM table row `.*(?:\\n|$)`: a row holding U+2028 ends the table before it', {
+  op: 'parse',
+  markdown: 'a|b\n-|-\nc |d',
+})
+add('regress-dot-def-angle-u2028', 'def destination `<.*?>` cannot cross U+2028: no definition', {
+  op: 'parse',
+  markdown: '[a]: <b c>\n\n[a]',
+})
+add('regress-dot-pedantic-inline-link-cr', 'parseInline keeps \\r, and the pedantic link `\\((.*?)\\)` cannot cross it: literal text', {
+  op: 'parseInline',
+  markdown: '[a](b\rc)',
+  options: P,
+})
+add('regress-dot-link-angle-escape-cr', 'parseInline link `<(?:\\\\.|[^\\n<>\\\\])+>`: the escape `\\\\.` cannot take \\r, so no link', {
+  op: 'parseInline',
+  markdown: '[a](<b\\\rc>)',
+})
+add('regress-mflag-code-indent', 'indented code: `codeRemoveIndent` has the `m` flag, so `^` also matches after U+2028', {
+  op: 'parse',
+  markdown: '    a     b',
+})
+add('regress-mflag-blockquote-marker', 'blockquote: `blockquoteSetextReplace2` (`m` flag) strips a `>` marker after U+2028', {
+  op: 'parse',
+  markdown: '> a > b',
+})
+add('regress-mflag-pedantic-space-line', 'pedantic preprocessing `^ +$` (`m` flag) empties the space run before U+2028', {
+  op: 'parse',
+  markdown: 'x\n   y',
+  options: P,
+})
+add('regress-utf16-list-lazy-astral', 'list `line.slice(indent)` counts UTF-16 code units: an astral lazy line shifts the next indentation test', {
+  op: 'parse',
+  markdown: `* a\n${party}    o\na`,
+})
+add('regress-utf16-list-lazy-astral-tab', 'as above with a tab after the astral character', {
+  op: 'parse',
+  markdown: `- a\n${party}\tb\nc`,
+})
+add('regress-utf16-list-lazy-heading', '`x🎉` is 3 code units, so `slice(3)` leaves `# h`, a heading start that ends the item', {
+  op: 'parse',
+  markdown: `1. a\nx${party}# h\nc`,
+})
+add('regress-utf16-bounded-label', '`_boundedBlockLabel` `{1,999}` counts code units: a 1,202-unit label is not masked, so the `*` pair stays literal', {
+  op: 'parse',
+  markdown: `[${party.repeat(600)}*b]: /u\n\n*a [${party.repeat(600)}*b] c*`,
+})
+add('regress-utf16-bounded-label-edge', 'a 1,000-unit label (499 astral + `*b`) is one over the bound: not masked', {
+  op: 'parse',
+  markdown: `[${party.repeat(499)}*b]: /u\n\n*a [${party.repeat(499)}*b] c*`,
+})
+add('regress-lheading-table-pipe-dash', 'lheadingGfm table interrupt `\\|?(?:[:\\- ]*\\|)+`: `\\|?` backtracks, so a `|-` line interrupts the setext heading', {
+  op: 'parse',
+  markdown: 'a|b\n|-\nbar\n===',
+})
+add('regress-lheading-table-lone-pipe', 'a lone `|` line interrupts the setext heading', {
+  op: 'parse',
+  markdown: 'a\n|\nb\n===',
+})
+add('regress-lheading-table-lone-pipe-hr', 'a lone `|` line before `---` is a table interrupt: a paragraph and a thematic break, not an h2', {
+  op: 'parse',
+  markdown: '|\n---\n',
+})
+add('regress-pedantic-href-title-backtrack', 'pedanticHrefTitle `^([^\'"]*[^\\s])\\s+([\'"])(.*)\\2` backtracks: href `a\'`, title `t`', {
+  op: 'parse',
+  markdown: '[x](a\' "t")',
+  options: P,
+})
+add('regress-pedantic-inline-href-title-backtrack', 'the same split through parseInline', {
+  op: 'parseInline',
+  markdown: '[x](a\' "t")',
+  options: P,
+})
+add('regress-pedantic-href-title-mirror', 'the mirror case: href `a"`, title `t`', {
+  op: 'parse',
+  markdown: '[x](a" \'t\')',
+  options: P,
+})
+add('regress-pedantic-def-empty-angle', 'pedantic def `<?([^\\s>]+)>?`: `<?` backtracks, the href is `<`, and the definition is consumed', {
+  op: 'parse',
+  markdown: '[a]: <>\n',
+  options: P,
+})
+add('regress-pedantic-def-angle-title', '`<?` backtracks before a title: href `<`, title `t`', {
+  op: 'parse',
+  markdown: '[a]: < (t)\n\n[a]',
+  options: P,
+})
+add('regress-nolink-empty-ref-paren', 'reflinkSearch `nolink(?!\\()`: `(?:\\[\\])?` backtracks before `(`, so `[*a]` is masked and `*x ... (*` pairs', {
+  op: 'parse',
+  markdown: '*x [*a][](* y\n\n[*a]: /u',
+})
+add('regress-html-begin-ul', 'a `<ul>` line (the last `_tag` entry) ends a list item at its indentation', {
+  op: 'parse',
+  markdown: '- a\n<ul>\n<li>x</li>\n</ul>\n',
+})
+add('regress-size-atx-headings', '5,000 ATX headings (20 KB, 5,000 block tokens): the block loop runs in constant stack', {
+  op: 'parse',
+  markdown: '# h\n'.repeat(5000),
+})
+add('regress-size-emphasis', '5,000 emphasis runs (20 KB, 10,000 inline tokens): the inline loop runs in constant stack', {
+  op: 'parse',
+  markdown: '_a_ '.repeat(5000),
+})
+
+// 14. Bench cases (2)
 const benchParseMd = makeBenchParse(0x18112026, 32)
 const benchGfmMd = makeBenchGfm(0x7f4a7c15, 44)
 
@@ -1173,6 +1314,22 @@ if (process.argv.includes('--verify')) {
   assert(outputs.get('table-header-only').includes('<thead>') && !outputs.get('table-header-only').includes('<tbody>'), 'table-header-only must omit <tbody>')
   assert(outputs.get('list-task-loose').includes('<p><input '), 'list-task-loose must place checkbox inside <p>')
   assert(outputs.get('list-task-tight').includes('<li><input '), 'list-task-tight must place checkbox inside <li>')
+  // Regression cases keep the behaviour they were added for
+  assert(!outputs.get('regress-dot-heading-u2028').includes('<h1>'), 'U+2028 must stop the ATX heading regex')
+  assert(outputs.get('regress-dot-heading-cr') === '<h1>a</h1>\n<p>b</p>\n', 'parse must normalise a lone \\r before lexing')
+  assert(!outputs.get('regress-dot-lheading-u2029').includes('<h1>'), 'U+2029 must stop the setext heading regex')
+  assert(outputs.get('regress-dot-table-row-u2028').includes('</table>\n<p>'), 'a U+2028 row must end the table')
+  assert(!outputs.get('regress-dot-pedantic-inline-link-cr').includes('<a '), 'pedantic link must not cross \\r')
+  assert(outputs.get('regress-utf16-list-lazy-astral').endsWith('</ul>\n<p>a</p>\n'), 'astral lazy line must end the item by UTF-16 indentation')
+  assert(!outputs.get('regress-utf16-bounded-label').includes('<em>'), 'a label over 999 code units must not be masked')
+  assert(!outputs.get('regress-utf16-bounded-label-edge').includes('<em>'), 'a 1,000-unit label must not be masked')
+  assert(outputs.get('regress-lheading-table-lone-pipe-hr') === '<p>|</p>\n<hr>\n', 'a lone pipe must interrupt the setext heading')
+  assert(outputs.get('regress-pedantic-href-title-backtrack').includes('title="t"'), 'pedanticHrefTitle must backtrack')
+  assert(outputs.get('regress-pedantic-def-empty-angle') === '', 'pedantic `[a]: <>` must be a definition')
+  assert(outputs.get('regress-nolink-empty-ref-paren').startsWith('<p><em>'), 'nolink must backtrack `[]` before `(`')
+  assert(outputs.get('regress-html-begin-ul').startsWith('<ul>\n<li>a</li>\n</ul>\n<ul>'), 'a `<ul>` line must end the list item')
+  assert(outputs.get('regress-size-atx-headings').split('<h1>').length === 5001, 'size case must render 5,000 headings')
+  assert(outputs.get('regress-size-emphasis').split('<em>').length === 5001, 'size case must render 5,000 emphasis runs')
   assert(outputs.get('images-text-renderer').includes('alt="bold em code del lnk sub &lt;b&gt;h&lt;/b&gt; ab * &amp; A &quot;q&quot;"'), `unexpected TextRenderer alt: ${outputs.get('images-text-renderer')}`)
 
   // Verify bench-variant for k = 1..50 on both bench cases

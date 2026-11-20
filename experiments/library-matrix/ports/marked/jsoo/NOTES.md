@@ -4,10 +4,13 @@ A faithful port of the synchronous CommonMark and GFM compilation pipeline in
 `libraries/marked/CONTRACT.md`, written as **one OCaml program compiled by two compilers**: this
 directory (js_of_ocaml 6.4.1) and `../melange/` (Melange 7.0.1) share the same 9-module OCaml core
 byte-for-byte, differing only in `src/host.ml` and the entry module (`src/main.ml` vs
-`src/index.ml`). It reaches character-for-character parity with `marked@18.1.1` on all 80 corpus
-cases in Node, Chrome, and Firefox (both minified and readable artifacts), plus 1,638 adversarial
-and randomized differential cases across all 8 `(gfm, breaks, pedantic)` combinations and both
-`parse` and `parseInline`.
+`src/index.ml`). It matches `marked@18.1.1` character for character on all 111 corpus cases in Node,
+Chrome, and Firefox (both minified and readable artifacts). The 2026-11-20 pre-merge review found
+two defects in the shared core, both fixed: a stray `}` in `htmlBeginRegex` (`ul}`) and lexer loops
+that recursed once per token (see "Constant-stack lexer loops" in `../melange/NOTES.md`). Every
+rule regex the core builds now has the source and flags of the matching compiled marked rule, up
+to `\t` spelled for a literal tab (all `RegExp` constructions captured through a proxy and compared
+with `Lexer.rules` and `rules.other`), and the review's differential fuzzers find no divergence.
 
 | File | Shared with `../melange/` | What it is |
 | --- | --- | --- |

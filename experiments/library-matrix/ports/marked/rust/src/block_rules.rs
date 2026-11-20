@@ -6,7 +6,10 @@
 use alloc::string::String;
 
 use crate::tokens::Mode;
-use crate::unicode::{decode_utf8_at, is_all_js_space_bytes, js_space_len_at, trim_end_js};
+use crate::unicode::{
+    decode_utf8_at, dot_run_end, is_all_js_space_bytes, js_space_len_at, line_terminator_len_at,
+    trim_end_js,
+};
 
 #[inline]
 pub fn line_end(bytes: &[u8], start: usize) -> usize {
@@ -15,6 +18,43 @@ pub fn line_end(bytes: &[u8], start: usize) -> usize {
         i += 1;
     }
     i
+}
+
+/// The lines a regex with the `m` flag sees: `^` and `$` match at every ECMA-262 line
+/// terminator (`\n`, `\r`, U+2028, U+2029), not only at `\n`. Yields `(line, terminator)` pairs,
+/// the last with an empty terminator, so concatenating them gives back the input.
+pub struct JsLines<'a> {
+    s: &'a str,
+    pos: usize,
+    done: bool,
+}
+
+impl<'a> Iterator for JsLines<'a> {
+    type Item = (&'a str, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        let bytes = self.s.as_bytes();
+        let end = dot_run_end(bytes, self.pos);
+        let term_len = line_terminator_len_at(bytes, end);
+        let item = (&self.s[self.pos..end], &self.s[end..end + term_len]);
+        if term_len == 0 {
+            self.done = true;
+        } else {
+            self.pos = end + term_len;
+        }
+        Some(item)
+    }
+}
+
+pub fn js_lines(s: &str) -> JsLines<'_> {
+    JsLines {
+        s,
+        pos: 0,
+        done: false,
+    }
 }
 
 #[inline]
@@ -468,7 +508,11 @@ pub fn match_heading(bytes: &[u8], pos: usize, pedantic: bool) -> Option<Heading
     if !pedantic && i < n && js_space_len_at(bytes, i) == 0 {
         return None;
     }
-    let le = line_end(bytes, i);
+    // `(.*)(?:\n+|$)`: the text cannot cross a line terminator other than `\n`.
+    let le = dot_run_end(bytes, i);
+    if le < n && bytes[le] != b'\n' {
+        return None;
+    }
     Some(HeadingSpan {
         raw_end: le,
         depth,
@@ -1300,6 +1344,10 @@ pub struct DefSpan {
 }
 
 /// Parses `_blockLabel`: `(?!\s*\])(?:\\[\s\S]|[^\[\]\\])+` at `bytes[pos..]`, returning `]` index.
+///
+/// `max_items` is the `{1,999}` bound of `_boundedBlockLabel`. The regex has no `u` flag, so an
+/// item is one UTF-16 code unit (`\\[\s\S]` takes the backslash and one more unit): a BMP
+/// character is one item and an astral character, escaped or not, is two.
 pub fn match_block_label(bytes: &[u8], pos: usize, max_items: Option<usize>) -> Option<usize> {
     let n = bytes.len();
     let mut w = pos;
@@ -1317,27 +1365,23 @@ pub fn match_block_label(bytes: &[u8], pos: usize, max_items: Option<usize>) -> 
     let mut i = pos;
     let mut items = 0usize;
     while i < n {
-        if let Some(max) = max_items {
-            if items >= max {
-                break;
-            }
-        }
         let b = bytes[i];
         if b == b'[' || b == b']' {
             break;
         }
-        if b == b'\\' {
-            if i + 1 >= n {
-                return None;
-            }
-            let (_, clen) = decode_utf8_at(bytes, i + 1);
-            i += 1 + clen;
-            items += 1;
-        } else {
-            let (_, clen) = decode_utf8_at(bytes, i);
-            i += clen;
-            items += 1;
+        let ch_start = if b == b'\\' { i + 1 } else { i };
+        if ch_start >= n {
+            return None;
         }
+        let (_, clen) = decode_utf8_at(bytes, ch_start);
+        let units = if clen == 4 { 2 } else { 1 };
+        if let Some(max) = max_items {
+            if items + units > max {
+                break;
+            }
+        }
+        i = ch_start + clen;
+        items += units;
     }
     if items > 0 && i < n && bytes[i] == b']' {
         Some(i)
@@ -1445,18 +1489,24 @@ pub fn match_def(bytes: &[u8], pos: usize, pedantic: bool) -> Option<DefSpan> {
         while i < n && bytes[i] == b' ' {
             i += 1;
         }
+        // `<?([^\s>]+)`: the optional `<` is taken greedily, but when no href character
+        // follows it, it backtracks to empty and the `<` itself becomes the href.
+        let angle = i;
         if i < n && bytes[i] == b'<' {
             i += 1;
         }
-        let href_start = i;
+        let mut href_start = i;
         while i < n && bytes[i] != b'>' && js_space_len_at(bytes, i) == 0 {
             let (_, clen) = decode_utf8_at(bytes, i);
             i += clen;
         }
-        let href_end = i;
-        if href_end == href_start {
-            return None;
+        if i == href_start {
+            if href_start == angle {
+                return None;
+            }
+            href_start = angle;
         }
+        let href_end = i;
         if i < n && bytes[i] == b'>' {
             i += 1;
         }
@@ -1521,9 +1571,9 @@ pub fn match_def(bytes: &[u8], pos: usize, pedantic: bool) -> Option<DefSpan> {
     let href_start = i;
     if bytes[i] == b'<' {
         // `<.*?>` is lazy and backtracks across `>` on the same line until the
-        // optional title and line-end anchor match.
+        // optional title and line-end anchor match; `.` stops at every line terminator.
         let mut j = i + 1;
-        while j < n && bytes[j] != b'\n' {
+        while j < n && line_terminator_len_at(bytes, j) == 0 {
             if bytes[j] == b'>' {
                 let href_end = j + 1;
                 if let Some(span) =
@@ -1684,9 +1734,11 @@ pub fn match_table_at(bytes: &[u8], pos: usize) -> Option<TableSpan> {
     if i >= n || bytes[i] == b'\n' {
         return None;
     }
+    // Header `([^\n ].*)\n`: one character other than `\n`, then a `.` run that must end at `\n`.
     let header_start = i;
-    let header_end = line_end(bytes, header_start);
-    if header_end >= n {
+    let (_, first_len) = decode_utf8_at(bytes, header_start);
+    let header_end = dot_run_end(bytes, header_start + first_len);
+    if header_end >= n || bytes[header_end] != b'\n' {
         return None;
     }
     let (align_start, align_end) = match_table_align_line(bytes, header_end + 1)?;
@@ -1721,7 +1773,11 @@ pub fn match_table_at(bytes: &[u8], pos: usize) -> Option<TableSpan> {
         {
             break;
         }
-        let le = line_end(bytes, cur);
+        // A row is `.*(?:\n|$)`: a row holding another line terminator ends the table before it.
+        let le = dot_run_end(bytes, cur);
+        if le < n && bytes[le] != b'\n' {
+            break;
+        }
         cur = if le < n { le + 1 } else { n };
     }
     let mut raw_end = cur;
@@ -1776,14 +1832,13 @@ fn is_lheading_html_at(bytes: &[u8], pos: usize) -> bool {
     j > i + 1 && j + 1 < n && bytes[j] == b'>' && bytes[j + 1] == b'\n'
 }
 
+/// Checks lheadingGfm's table interrupt ` {0,3}\|?(?:[:\- ]*\|)+[\:\- ]*\n`. The optional leading
+/// `|` can backtrack to empty and count as the group's pipe, so the line matches when it holds
+/// only `[ :|-]` and at least one `|`, wherever that pipe sits.
 fn is_lheading_table_at(bytes: &[u8], pos: usize) -> bool {
     let n = bytes.len();
-    let sp = leading_spaces_up_to(bytes, pos, 3);
-    let mut i = pos + sp;
+    let mut i = pos;
     let mut pipes = 0usize;
-    if i < n && bytes[i] == b'|' {
-        i += 1;
-    }
     while i < n && bytes[i] != b'\n' {
         let b = bytes[i];
         if b == b'|' {
@@ -1813,8 +1868,9 @@ pub fn match_lheading_at(bytes: &[u8], pos: usize, mode: Mode) -> Option<LHeadin
         return None;
     }
     if mode.is_pedantic() {
-        let le = line_end(bytes, pos);
-        if le == pos || le >= n {
+        // `^(.+?)\n`: one line of `.` characters ending at `\n`.
+        let le = dot_run_end(bytes, pos);
+        if le == pos || le >= n || bytes[le] != b'\n' {
             return None;
         }
         let (ch, u_end) = match_setext_underline(bytes, le + 1)?;
@@ -1838,10 +1894,11 @@ pub fn match_lheading_at(bytes: &[u8], pos: usize, mode: Mode) -> Option<LHeadin
         return None;
     }
 
+    // The text `(?:.|\n(?!...))+?` crosses only `\n`: any other line terminator ends the match.
     let mut cur = pos;
     loop {
-        let le = line_end(bytes, cur);
-        if le >= n {
+        let le = dot_run_end(bytes, cur);
+        if le >= n || bytes[le] != b'\n' {
             return None;
         }
         let next_start = le + 1;
@@ -1965,6 +2022,10 @@ pub fn match_blockquote(bytes: &[u8], pos: usize) -> Option<usize> {
     if any { Some(i) } else { None }
 }
 
+/// `chunk.replace(blockquoteSetextReplace, '\n    $1').replace(blockquoteSetextReplace2, '')`. The
+/// setext replace sees `\n` lines only (`\n {0,3}((?:=+|-+) *)(?=\n|$)` has no `m` flag); the
+/// marker strip `^ {0,3}>[ \t]?` runs with the `m` flag, so it also strips after `\r`, U+2028 and
+/// U+2029.
 pub fn strip_blockquote_markers(chunk: &str) -> String {
     let mut out = String::with_capacity(chunk.len());
     let mut first = true;
@@ -1993,28 +2054,21 @@ pub fn strip_blockquote_markers(chunk: &str) -> String {
             }
         }
         first = false;
-        let sp = leading_spaces_up_to(lb, 0, 3);
-        if sp < lb.len() && lb[sp] == b'>' {
-            let mut after = sp + 1;
-            if after < lb.len() && (lb[after] == b' ' || lb[after] == b'\t') {
-                after += 1;
-            }
-            out.push_str(&line[after..]);
-        } else {
-            out.push_str(line);
-        }
+        push_without_blockquote_markers(&mut out, line);
     }
     out
 }
 
+/// `text.replace(/^ {0,3}>[ \t]?/gm, '')`.
 pub fn strip_one_blockquote_prefix(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut first = true;
-    for line in text.split('\n') {
-        if !first {
-            out.push('\n');
-        }
-        first = false;
+    push_without_blockquote_markers(&mut out, text);
+    out
+}
+
+/// Pushes `text` with `^ {0,3}>[ \t]?` removed from the start of every `m`-flag line.
+fn push_without_blockquote_markers(out: &mut String, text: &str) {
+    for (line, terminator) in js_lines(text) {
         let lb = line.as_bytes();
         let sp = leading_spaces_up_to(lb, 0, 3);
         if sp < lb.len() && lb[sp] == b'>' {
@@ -2026,8 +2080,8 @@ pub fn strip_one_blockquote_prefix(text: &str) -> String {
         } else {
             out.push_str(line);
         }
+        out.push_str(terminator);
     }
-    out
 }
 
 pub fn has_double_blank_line_end(bytes: &[u8]) -> bool {
@@ -2181,14 +2235,10 @@ pub fn parse_table_align(cell: &str) -> crate::tokens::Align {
     }
 }
 
+/// `raw.replace(/^(?: {0,3}\t| {1,4})/gm, '')`, over `m`-flag lines.
 pub fn remove_code_indent(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
-    let mut first = true;
-    for line in raw.split('\n') {
-        if !first {
-            out.push('\n');
-        }
-        first = false;
+    for (line, terminator) in js_lines(raw) {
         let lb = line.as_bytes();
         let sp = leading_spaces_up_to(lb, 0, 4);
         let strip = if sp < 4 && sp < lb.len() && lb[sp] == b'\t' {
@@ -2197,6 +2247,7 @@ pub fn remove_code_indent(raw: &str) -> String {
             sp
         };
         out.push_str(&line[strip..]);
+        out.push_str(terminator);
     }
     out
 }
@@ -2248,14 +2299,10 @@ pub fn indent_code_compensation(raw: &str, text: &str) -> String {
     out
 }
 
+/// `src.replace(/\t/g, '    ').replace(/^ +$/gm, '')`, over `m`-flag lines.
 pub fn preprocess_pedantic_block(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
-    let mut first = true;
-    for line in src.split('\n') {
-        if !first {
-            out.push('\n');
-        }
-        first = false;
+    for (line, terminator) in js_lines(src) {
         let lb = line.as_bytes();
         let line_no_tab = if lb.contains(&b'\t') {
             let mut buf = String::with_capacity(line.len() + 8);
@@ -2291,6 +2338,7 @@ pub fn preprocess_pedantic_block(src: &str) -> String {
         if !all_spaces {
             out.push_str(&line_no_tab);
         }
+        out.push_str(terminator);
     }
     out
 }

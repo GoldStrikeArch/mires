@@ -17,10 +17,10 @@
 | Output form | `string` (raw rendered HTML directly, zero framing), synchronous |
 | Normalisation | none |
 | Parity environments | node, chrome, firefox, safari (unavailable on this machine) |
-| Corpus | `corpus.json`, 80 cases, written deterministically by `generate-corpus.mjs` (`--verify` validates all invariants and option mutant-killers) |
+| Corpus | `corpus.json`, 111 cases, written deterministically by `generate-corpus.mjs` (`--verify` validates all invariants, option mutant-killers and regression expectations) |
 | Bench cases | `bench-parse`, `bench-gfm`; `baseIterations` 1; variant `bench-variant.mjs` (k-seeded case-preserving ASCII letter bijection preserving `<...>`, `&...;`, `[x]`/`[X]`, and autolink scheme prefixes) |
 | Shared data | `unicode-classes.json`: inclusive code-point ranges read off host `RegExp` for `/[\p{P}\p{S}]/u`, `/[\p{Pi}\p{Ps}"']/u`, `/[\p{L}\p{N}]/u`, and `/\s/u` |
-| Caching | Immutable compiled grammar rules / character-class tables at module load; no cross-call mutable state or input memoisation |
+| Caching | Grammar rules compiled at module load, except the six indent-dependent `other.*Regex(indent)` rules (`nextBulletRegex`, `hrRegex`, `fencesBeginRegex`, `headingBeginRegex`, `htmlBeginRegex`, `blockquoteBeginRegex`), which `rules.ts` builds on first use and keeps in a module-level 4-entry cache (`cachedIndentRegex`, indent clamped to 0..3); ports may build those 4 entries eagerly, and may hold immutable character-class tables. No other cross-call state or input memoisation |
 | Files | none: neither the adapter nor a port reads files at run time |
 
 ## Why this subset
@@ -87,6 +87,31 @@ ECMAScript regex features used in `src/rules.ts`:
   the target language, using the code-point tables in `unicode-classes.json` (or equivalent Unicode
   15.0+ tables).
 
+Native scanners must keep three ECMAScript semantics that a line-by-line reading of the rules
+easily misses:
+
+- **Line terminators.** No rule uses the `s` flag, so a regex `.` matches any code unit except the
+  four ECMA-262 line terminators `\n`, `\r`, U+2028 and U+2029, while `[^\n]` crosses the last
+  three. `.` appears in `heading` (all modes), `lheading` (all modes, and the `lheading` lookahead of
+  the pedantic `paragraph`), `def`'s `<.*?>`, `gfmTable`'s header and rows (and the GFM
+  `paragraph`'s table lookahead), `inline.link`'s `<(?:\\.|[^\n<>\\])+>`, the pedantic
+  `inline.link`'s `\((.*?)\)` and `other.pedanticHrefTitle` (also in `other.hrefBrackets` and
+  `other.anyLine`, whose inputs never hold a terminator). The three `m`-flag rules (`codeRemoveIndent`, `blockquoteSetextReplace2`,
+  `spaceLine`) anchor `^` and `$` at all four terminators. `parse` turns every `\r` into `\n`
+  first, but U+2028 and U+2029 reach every block and inline rule, and `parseInline` keeps `\r`.
+- **UTF-16 counts.** Every rule outside the `u`-flag list above counts quantifier bounds in UTF-16
+  code units: `_boundedBlockLabel`'s `(?:\\[\s\S]|[^\[\]\\]){1,999}` takes
+  an astral character, escaped or not, as two items. Every JS `length`, index and `slice` count is
+  in code units too, notably `Tokenizer#list`'s `line.slice(indent)` and the `linkLen` truncation;
+  only `[...str]` spreads (`emStrong` and `del` delimiter lengths) and `expandTabs` count code
+  points.
+- **Backtracking.** A scanner must find what the backtracking regex finds, not only the greedy
+  first try. Cases the corpus pins: `lheadingGfm`'s table lookahead
+  ` {0,3}\|?(?:[:\- ]*\|)+[\:\- ]*\n` (the optional `|` backtracks, so a lone `|` or `|-` line
+  interrupts), `other.pedanticHrefTitle` (`[^'"]*` backtracks, so the href may end in a quote),
+  the pedantic `def`'s `<?([^\s>]+)` (`[a]: <>` has href `<`), and `reflinkSearch`'s
+  `nolink(?!\()` (`(?:\[\])?` backtracks when `(` follows).
+
 Both styles must implement `marked@18.1.1`'s actual Lexer/Tokenizer/Parser/Renderer/TextRenderer
 architecture and match `marked@18.1.1` character-for-character on every input in the parity domain.
 
@@ -109,7 +134,8 @@ else:
 Notice that `breaks: true` has **no effect** when `gfm: false` or `pedantic: true`, and `pedantic: true`
 disables the grammar-selected GFM rules (`table`, `del`, `url`, tilde-in-emphasis) as well as fenced
 code blocks — **however**, `Tokenizer#list` checks `task: !!this.options.gfm && ...` directly
-(`Tokenizer.ts:474`), so GFM task-list checkboxes remain **enabled** when `{ gfm: true, pedantic: true }`
+(`Tokenizer.ts:474`; line numbers here are 1-based lines of `src/Tokenizer.ts` as embedded in
+`marked.esm.js.map`), so GFM task-list checkboxes remain **enabled** when `{ gfm: true, pedantic: true }`
 and are disabled only when `gfm: false`.
 
 ### Entry preprocessing
@@ -168,9 +194,9 @@ In the block loop, rules are tried in this exact order:
    appends `'\n'` to `lastToken.raw` instead of pushing a `space` token.
 2. **`code`** (indented, `/^((?: {4}| {0,3}\t)[^\n]+(?:\n(?:[ \t]*(?:\n|$))*)?)+/`):
    `raw = pedantic ? cap[0] : trimTrailingBlankLines(cap[0])`; strips `/^(?: {0,3}\t| {1,4})/gm`
-   to form `text`. If `lastToken` is `paragraph` or `text`, appends to `lastToken` (updating the
-   last `inlineQueue` entry's `src` with `token.text`) because indented code cannot interrupt a
-   paragraph.
+   to form `text`. If `lastToken` is `paragraph` or `text`, appends to `lastToken` (setting the
+   last `inlineQueue` entry's `src` to the merged `lastToken.text`) because indented code cannot
+   interrupt a paragraph.
 3. **`fences`** (disabled in `pedantic`): 0–3 leading spaces, `≥3` backticks (info string has no
    backticks) or `≥3` tildes, info string, body lines until ` {0,3}\1[~`]* *(?=\n|$)` or EOF.
    - `indentCodeCompensation`: **only** when `raw` starts with `/^(\s+)(?:```)/` (backtick fences,
@@ -272,8 +298,8 @@ Each `inlineTokens(src, tokens)` call:
 The following inputs are excluded from the contract (no corpus case or bench variant produces them):
 
 - **Lone UTF-16 surrogates** (including upstream `marked` extra-`)` link truncation splitting an
-  astral surrogate pair, e.g. `[x](  🚀))`, where `Tokenizer.ts:783`'s UTF-16 `substring(0, linkLen)`
-  slices between high and low surrogates and leaves a lone surrogate in the remainder): all corpus
+  astral surrogate pair, e.g. `[x](  🚀))`, where `Tokenizer.ts:785`'s UTF-16
+  `cap[0].substring(0, linkLen)` (`linkLen` from line 783) slices between high and low surrogates and leaves a lone surrogate in the remainder): all corpus
   `markdown` strings are well-formed UTF-16 and stay well-formed UTF-16 across UTF-16 `linkLen`
   truncation (BMP non-ASCII cases like `[x](  é))` and `[x](    日本語))` ARE in the parity domain),
   so UTF-8-native languages (Rust, Go/GopherJS, Elm) decode identical text and `cleanUrl` never
@@ -305,7 +331,7 @@ window modified.
 
 ## Corpus
 
-80 deterministic cases generated by `generate-corpus.mjs`:
+111 deterministic cases generated by `generate-corpus.mjs`:
 
 | Group | Cases | What they exercise |
 | --- | --- | --- |
@@ -321,4 +347,8 @@ window modified.
 | GFM Autolinks (3) | `gfm-autolinks-urls`, `gfm-autolinks-backpedal`, `gfm-autolinks-disabled-in-normal` | `http`/`https`/`ftp`/`www`/`mailto`/`xmpp`/email autolinks, `_backpedal` trimming, `inLink` & `gfm: false` |
 | Emphasis, Strong, Del & Codespans (8) | `em-strong-asterisk-flanking`, `em-strong-underscore-flanking`, `em-strong-unicode-punctuation`, `em-strong-masking`, `em-strong-gfm-tilde`, `em-strong-pedantic`, `gfm-strikethrough`, `codespans-edge-cases` | `*`/`_` flanking, rule 9–10, isolated `midRun`, `foo___bar___` prevChar, orphan skip, Unicode `\p{P}`/`\p{S}` & astral `prevChar`, pre-scan masking (incl. escapes inside span), GFM `~` in emphasis, pedantic `_openQuote`, `~`/`~~` del, code spans |
 | Escapes, Breaks, Entities, Unicode (6) | `backslash-escapes`, `hard-breaks`, `html-entities-and-ncr`, `unicode-cjk-emoji-rtl`, `parse-inline-options`, `parse-inline-trailing-br-ws` | 32 ASCII escapes, hard breaks & `(?!\s*$)` trailing-ws lookahead, NCR decoding + bare `&` + raw block, CJK/RTL/emoji/Unicode whitespace, `parseInline` + options |
+| Review regressions: line terminators (14) | `regress-dot-heading-u2028`, `regress-dot-heading-u2029`, `regress-dot-heading-cr`, `regress-dot-pedantic-heading-u2028`, `regress-dot-lheading-u2029`, `regress-dot-pedantic-lheading-lookahead`, `regress-dot-table-header-u2028`, `regress-dot-table-row-u2028`, `regress-dot-def-angle-u2028`, `regress-dot-pedantic-inline-link-cr`, `regress-dot-link-angle-escape-cr`, `regress-mflag-code-indent`, `regress-mflag-blockquote-marker`, `regress-mflag-pedantic-space-line` | regex `.` stops at `\r`, U+2028 and U+2029 in heading, lheading, table, def, link and pedantic link; `\r` normalised by `parse`, kept by `parseInline`; `m`-flag `^`/`$` at every terminator in code-indent removal, blockquote marker stripping and pedantic space lines |
+| Review regressions: UTF-16 counts (5) | `regress-utf16-list-lazy-astral`, `regress-utf16-list-lazy-astral-tab`, `regress-utf16-list-lazy-heading`, `regress-utf16-bounded-label`, `regress-utf16-bounded-label-edge` | `Tokenizer#list`'s `line.slice(indent)` in code units after an astral character; `_boundedBlockLabel` `{1,999}` counting an astral character as two units (1,202 and 1,000 units: unmasked) |
+| Review regressions: backtracking and rule sources (10) | `regress-lheading-table-pipe-dash`, `regress-lheading-table-lone-pipe`, `regress-lheading-table-lone-pipe-hr`, `regress-pedantic-href-title-backtrack`, `regress-pedantic-inline-href-title-backtrack`, `regress-pedantic-href-title-mirror`, `regress-pedantic-def-empty-angle`, `regress-pedantic-def-angle-title`, `regress-nolink-empty-ref-paren`, `regress-html-begin-ul` | lheadingGfm's optional `\|` backtracking, `pedanticHrefTitle` and pedantic `def` `<?` backtracking, `reflinkSearch` `nolink(?!\()` backtracking `[]`, and `htmlBeginRegex`'s last `_tag` entry (`ul`) ending a list item |
+| Review regressions: stack depth (2) | `regress-size-atx-headings`, `regress-size-emphasis` | 5,000 headings and 5,000 emphasis runs (20 KB each): block and inline loops in constant stack |
 | Bench (2) | `bench-parse`, `bench-gfm` | 52 KB mixed handbook (default options) and 46 KB GFM tracker (`breaks: true`) |

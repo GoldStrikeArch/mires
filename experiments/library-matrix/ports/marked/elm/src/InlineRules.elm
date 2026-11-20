@@ -32,7 +32,7 @@ All loops are directly self-tail-recursive and operate on UTF-16-aligned `Src` /
 -}
 
 import Array exposing (Array)
-import BlockRules exposing (matchBlockLabel)
+import BlockRules exposing (dotRunEnd, matchBlockLabel)
 import Dict exposing (Dict)
 import Helpers exposing (normalizeLabel)
 import Tokens exposing (LinkDef, Mode, isBreaks, isGfm, isPedantic)
@@ -48,6 +48,7 @@ import Unicode
         , isAsciiAlnum
         , isAsciiAlpha
         , isJsSpace
+        , isLineTerminator
         , isOpenQuote
         , isPunct
         , isPunctOrSpace
@@ -1241,7 +1242,7 @@ matchPedanticLinkDest : Array Int -> Int -> Bool -> Int -> Int -> Int -> Maybe L
 matchPedanticLinkDest codes end isImage labelStart closeBracket parenOpen =
     let
         j =
-            scanUntilRparenOrNl codes (parenOpen + 1) end
+            scanUntilRparenOrLineEnd codes (parenOpen + 1) end
     in
     if j - end < 0 && at j codes == 41 then
         Just
@@ -1258,18 +1259,20 @@ matchPedanticLinkDest codes end isImage labelStart closeBracket parenOpen =
         Nothing
 
 
-scanUntilRparenOrNl : Array Int -> Int -> Int -> Int
-scanUntilRparenOrNl codes j end =
+{-| Pedantic `\((.*?)\)`: the href is the shortest `.` run up to a `)`.
+-}
+scanUntilRparenOrLineEnd : Array Int -> Int -> Int -> Int
+scanUntilRparenOrLineEnd codes j end =
     if j - end < 0 then
         let
             b =
                 at j codes
         in
-        if b == 41 || b == 10 then
+        if b == 41 || isLineTerminator b then
             j
 
         else
-            scanUntilRparenOrNl codes (j + 1) end
+            scanUntilRparenOrLineEnd codes (j + 1) end
 
     else
         j
@@ -1372,7 +1375,8 @@ scanLinkAngleHref codes j end =
             Nothing
 
         else if b == 92 then
-            if j + 1 - end < 0 && at (j + 1) codes /= 10 then
+            -- `\\.`: an escape takes any character but a line terminator.
+            if j + 1 - end < 0 && not (isLineTerminator (at (j + 1) codes)) then
                 scanLinkAngleHref codes (j + 1 + charWidth (at (j + 1) codes)) end
 
             else
@@ -1416,43 +1420,59 @@ backtrackBareHrefRparen codes isImage labelStart closeBracket hrefStart cand =
             backtrackBareHrefRparen codes isImage labelStart closeBracket hrefStart c
 
 
+{-| Matches `other.pedanticHrefTitle` `^([^'"]*[^\s])\s+(['"])(.*)\2` on a pedantic href,
+returning `( href, title )`.
+
+The regex backtracks `[^'"]*` from the first quote down to the start, so the href ends at the
+last split point (at most just past the first quote) where a non-space character is followed by
+a whitespace run and then a quote; that non-space character may itself be the first quote. The
+title then runs to the last matching quote before the end of the `.*` run.
+-}
 matchPedanticHrefTitle : String -> Maybe ( String, String )
 matchPedanticHrefTitle href =
     let
         src =
             fromString href
 
-        codes =
-            src.codes
-
-        n =
-            src.len
-
         q =
-            findFirstQuote codes 0 n
+            findFirstQuote src.codes 0 src.len
     in
-    if q - n >= 0 then
+    if q - src.len >= 0 then
+        Nothing
+
+    else
+        matchPedanticHrefTitleAt href src.codes src.len (q + 1)
+
+
+matchPedanticHrefTitleAt : String -> Array Int -> Int -> Int -> Maybe ( String, String )
+matchPedanticHrefTitleAt href codes n hrefEnd =
+    if hrefEnd <= 0 then
         Nothing
 
     else
         let
+            ( c, w ) =
+                decodeRevAt codes hrefEnd
+
+            shorter =
+                hrefEnd - w
+
+            q =
+                skipJsSpaces codes hrefEnd n
+
             quoteChar =
                 at q codes
         in
-        case findLastQuote codes quoteChar q (n - 1) of
-            Nothing ->
-                Nothing
+        if isJsSpace c || q - hrefEnd == 0 || q - n >= 0 || (quoteChar /= 39 && quoteChar /= 34) then
+            matchPedanticHrefTitleAt href codes n shorter
 
-            Just closeQ ->
-                let
-                    wsStart =
-                        skipJsSpaceRev codes q
-                in
-                if wsStart - q == 0 || wsStart == 0 then
-                    Nothing
+        else
+            case findLastQuote codes quoteChar q (dotRunEnd codes (q + 1) n - 1) of
+                Just closeQ ->
+                    Just ( String.slice 0 hrefEnd href, String.slice (q + 1) closeQ href )
 
-                else
-                    Just ( String.slice 0 wsStart href, String.slice (q + 1) closeQ href )
+                Nothing ->
+                    matchPedanticHrefTitleAt href codes n shorter
 
 
 findFirstQuote : Array Int -> Int -> Int -> Int
@@ -1482,24 +1502,6 @@ findLastQuote codes quoteChar q k =
 
     else
         findLastQuote codes quoteChar q (k - 1)
-
-
-skipJsSpaceRev : Array Int -> Int -> Int
-skipJsSpaceRev codes end =
-    if end <= 0 then
-        0
-
-    else
-        let
-            ( c, w ) =
-                decodeRevAt codes end
-        in
-        if isJsSpace c then
-            skipJsSpaceRev codes (end - w)
-
-        else
-            end
-
 
 
 -- 7. REFLINK / NOLINK
@@ -1565,19 +1567,32 @@ matchReflinkAt codes pos end pedantic bounded =
 
                         Just close ->
                             let
-                                rawEnd =
-                                    if close + 2 - end < 0 && at (close + 1) codes == 91 && at (close + 2) codes == 93 then
+                                withEmptyRef =
+                                    close + 2 - end < 0 && at (close + 1) codes == 91 && at (close + 2) codes == 93
+
+                                fullEnd =
+                                    if withEmptyRef then
                                         close + 3
 
                                     else
                                         close + 1
+
+                                -- `nolink(?!\()`: when `[]` is followed by `(`, `(?:\[\])?` backtracks
+                                -- to empty and the lookahead then sees the `[`.
+                                parenAfter =
+                                    bounded && fullEnd - end < 0 && at fullEnd codes == 40
                             in
-                            if bounded && rawEnd - end < 0 && at rawEnd codes == 40 then
+                            if parenAfter && not withEmptyRef then
                                 Nothing
 
                             else
                                 Just
-                                    { rawEnd = rawEnd
+                                    { rawEnd =
+                                        if parenAfter then
+                                            close + 1
+
+                                        else
+                                            fullEnd
                                     , isImage = isImage
                                     , labelStart = labelStart
                                     , labelEnd = close
