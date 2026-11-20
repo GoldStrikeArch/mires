@@ -77,8 +77,21 @@ test("scalar byte views alias storage and aggregate byte punning still refuses",
     () => rt.unscale(pointer, 4, () => ({ value: 0 }), null),
     /is not a byte view of 4-byte elements/,
   );
+  // An unaligned word is the bytes at its offset (MIRES-018), in the view of its own phase.
+  const odd = rt.unscale_scalar({ buf: bytes, off: 1 }, 4, () => 0, "u32");
+  assert.equal(odd.buf[odd.off], 0xff89abcd);
+  assert.notEqual(odd.buf, words.buf);
+  assert.equal(rt.unscale_scalar({ buf: bytes, off: 1 }, 4, () => 0, "u32").buf, odd.buf);
+  assert.deepEqual(rt.scale(odd, 4), { buf: bytes, off: 1 });
+  assert.equal(rt.addr(odd, 4), rt.addr(pointer, 1) + 1);
+  odd.buf[odd.off] = 0x01020304;
+  assert.deepEqual(bytes.slice(0, 6), [0xef, 0x04, 0x03, 0x02, 0x01, 0xff]);
+  assert.equal(words.buf[words.off], 0x020304ef);
+  const half = rt.unscale_scalar({ buf: bytes, off: 3 }, 2, () => 0, "u16");
+  assert.equal(half.buf[half.off], 0x0102);
+  assert.equal(half.buf[half.off + 1], 0xffff);
   assert.throws(
-    () => rt.unscale_scalar({ buf: bytes, off: 1 }, 4, () => 0, "u32"),
+    () => rt.unscale_scalar({ buf: bytes, off: 1 }, 2, () => 0, "u32"),
     /cannot form a u32 scalar view/,
   );
 });

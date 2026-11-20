@@ -296,6 +296,7 @@ globalThis.__rt.addr = (p, size) => {
   const align = globalThis.__rt._dangling_of.get(key);
   if (align !== undefined) {
     const at = typeof p.off === "number" ? p.off : 0;
+    if (scalar !== undefined) return align + at * scalar.size + scalar.phase;
     return align + (p.sc !== undefined ? at : at * (p.es === undefined ? size : p.es));
   }
   let base = globalThis.__rt._addrs.get(key);
@@ -306,7 +307,8 @@ globalThis.__rt.addr = (p, size) => {
   // A slot keyed by a property name (a field of an aggregate) has no address of
   // its own, and reports the address of the object it is a field of.
   let off = typeof p.off === "number" ? p.off : 0;
-  if (scalar !== undefined) off *= scalar.size;
+  // A scalar view's element `i` is the scalar at byte `i * size + phase` (`_scalar_view`).
+  if (scalar !== undefined) off = off * scalar.size + scalar.phase;
   if (p.sc !== undefined || scalar !== undefined) return base + off;
   // `es` is the element size a `*const ()` remembers (see `erase`): the caller
   // that reaches here for an erased pointer knows only that the pointee is zero
@@ -993,7 +995,7 @@ globalThis.__rt.scale = (p, size) => {
           size + "-byte elements",
       ));
     }
-    return { buf: scalar.buf, off: p.off * size };
+    return { buf: scalar.buf, off: p.off * size + scalar.phase };
   }
   return { buf: p.buf, off: p.off * size, sc: size };
 };
@@ -1001,7 +1003,8 @@ globalThis.__rt.scale = (p, size) => {
 // Aliasing scalar views over buffers whose elements really are bytes. Numeric properties on the
 // view are accessors, so the compiler's ordinary `p.buf[p.off]` load/store spelling continues to
 // work while every read and write observes the original byte buffer. Views are cached per source
-// buffer and scalar kind, preserving pointer identity for repeated casts.
+// buffer, scalar kind and phase (the byte offset modulo the scalar's width), preserving pointer
+// identity for repeated casts.
 globalThis.__rt._scalar_views = new WeakMap();
 globalThis.__rt._scalar_view_of = new WeakMap();
 
@@ -1054,9 +1057,13 @@ globalThis.__rt._scalar_store = (buf, off, parts, value) => {
   }
 };
 
+// A byte offset that is not a multiple of the width is as good a place for a scalar as any other:
+// `read_unaligned`, and the first and last words of `<[u8]>::is_ascii`, read one there. Its view
+// is the one whose element `i` starts at byte `i * size + phase`, so an unaligned pointer is an
+// element too, and the strict offset (`off + n`) moves it by whole scalars in the same view.
 globalThis.__rt._scalar_view = (p, size, kind) => {
   const parts = globalThis.__rt._scalar_parts(kind);
-  if (parts === null || parts.size !== size || p.off % size !== 0) {
+  if (parts === null || parts.size !== size || !Number.isInteger(p.off) || p.off < 0) {
     throw __rt.abort_error(new Error(
       "rustc_codegen_js: byte offset " + p.off + " cannot form a " + kind + " scalar view",
     ));
@@ -1069,22 +1076,25 @@ globalThis.__rt._scalar_view = (p, size, kind) => {
     views = new Map();
     globalThis.__rt._scalar_views.set(p.buf, views);
   }
-  let view = views.get(kind);
+  const phase = p.off % size;
+  const key = phase === 0 ? kind : kind + "@" + phase;
+  let view = views.get(key);
   if (view === undefined) {
     view = [];
-    views.set(kind, view);
-    globalThis.__rt._scalar_view_of.set(view, { buf: p.buf, size, kind });
+    views.set(key, view);
+    globalThis.__rt._scalar_view_of.set(view, { buf: p.buf, size, kind, phase });
   }
   // Reallocation preserves the byte buffer's identity and can add new words.
-  for (let i = view.length; i < Math.floor(p.buf.length / size); i++) {
+  for (let i = view.length; i < Math.floor((p.buf.length - phase) / size); i++) {
+    const at = i * size + phase;
     Object.defineProperty(view, i, {
-      get: () => globalThis.__rt._scalar_load(p.buf, i * size, parts),
-      set: (value) => globalThis.__rt._scalar_store(p.buf, i * size, parts, value),
+      get: () => globalThis.__rt._scalar_load(p.buf, at, parts),
+      set: (value) => globalThis.__rt._scalar_store(p.buf, at, parts, value),
       enumerable: true,
       configurable: false,
     });
   }
-  return { buf: view, off: p.off / size };
+  return { buf: view, off: (p.off - phase) / size };
 };
 
 // unscale(p, size, mk): turns a byte-granular pointer into a slot over

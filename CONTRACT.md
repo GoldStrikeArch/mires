@@ -888,12 +888,17 @@ cast rows.
 `examples/core-tests/101_btree_map_nodes.rs` pins both directions through the standard library's
 B-tree node types.
 
-An integer, `f32`, `f64` or `char` read through a suitably aligned byte pointer gets a cached view
-whose indexed properties decode and encode the source bytes in little-endian order. The view is an
-ordinary slot to the compiler, so a write through it is immediately visible through the byte
-pointer and a repeated cast preserves pointer identity. Its synthetic address and a cast back to
-bytes continue to use the original buffer. Width alone is not enough to reconstruct a pointer,
-enum or aggregate, so those types keep the refusing `unscale` path.
+An integer, `f32`, `f64` or `char` read through a byte pointer gets a cached view whose indexed
+properties decode and encode the source bytes in little-endian order. The pointer's byte offset may
+be anything: a buffer has one view per scalar kind and per offset modulo the scalar's width, whose
+element `i` is the scalar at byte `width * i + phase`, so an unaligned read (`read_unaligned`, and
+the first and last words of `<[u8]>::is_ascii`) and the aligned reads between them are each an
+element of a view (`examples/core-tests/355_unaligned_scalar_views.rs`). Pointer arithmetic on the
+cast pointer moves by whole scalars and stays in its view. The view is an ordinary slot to the
+compiler, so a write through it is immediately visible through the byte pointer and a repeated cast
+preserves pointer identity. Its synthetic address and a cast back to bytes continue to use the
+original buffer, at the view's phase plus its offset in scalars. Width alone is not enough to
+reconstruct a pointer, enum or aggregate, so those types keep the refusing `unscale` path.
 Building a raw slice through `slice_from_parts` normalizes a dangling data address. The data half
 is asked by its value, never by its type: `with_metadata_of`, which is how `Box::clone_from_ref`
 (`Box<[T]>::from(&[T])`) rebuilds its fat pointer, hands `from_raw_parts` the data pointer as
@@ -938,9 +943,10 @@ The check is deliberately narrow. `pack` is what separates this from every ordin
 plain `struct Meters(f64)` is layout-identical to its field too and keeps its object form, because
 nothing about it says the two are interchangeable.
 
-`read_unaligned` still does not reinterpret a buffer. Reading four bytes of a `[u8; N]` as a `u32`
-asks for an element that buffer does not have, and `__rt.unscale` refuses it at the cast whether the
-read is aligned or not; `u32::from_le_bytes` is the spelling that works.
+`read_unaligned` of an integer, float or `char` out of byte storage, a `[u8; N]` included, reads
+through the scalar view above at any byte offset. Out of bytes, a pointer, enum or aggregate is
+still an element the buffer does not have, and `__rt.unscale` refuses that cast whether the read is
+aligned or not; `from_le_bytes` is the value spelling.
 
 The two halves differ in one thing, and it is what the directness rule reads. A **union**'s value
 may be nothing at all, so a transparent union is **direct** whatever its field is — a reference to
