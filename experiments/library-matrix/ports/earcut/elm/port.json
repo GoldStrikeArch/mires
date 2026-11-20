@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "earcut",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "The host sends input into an Elm worker and returns its synchronous response. Elm handles decoding, triangulation, refinement, deviation, flattening, and output construction."
+}

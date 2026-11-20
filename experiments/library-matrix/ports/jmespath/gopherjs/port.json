@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "jmespath",
+  "language": "gopherjs",
+  "package": "./src",
+  "boundary": "Reads the query batch, compiles expressions with a Pratt parser and evaluates their ASTs against the input JSON document."
+}

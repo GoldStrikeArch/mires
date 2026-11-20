@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "library": "explorer",
+  "language": "dart",
+  "boundary": "The native driver consumes database, search, rendering, compression and chart results. The bundle links the five components compiled for this language.",
+  "entry": "src/main.dart",
+  "components": [
+    "idb",
+    "minisearch",
+    "marked",
+    "fflate",
+    "uplot"
+  ]
+}

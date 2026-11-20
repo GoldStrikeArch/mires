@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "idb",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_idb",
+  "boundary": "Rust async futures wrap native IndexedDB requests and transaction events and resolve an array of outcomes."
+}

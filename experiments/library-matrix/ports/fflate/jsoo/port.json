@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "fflate",
+  "language": "jsoo",
+  "entry": "src/main.ml",
+  "boundary": "run(input: Js.Unsafe.top Js.t) -> Typed_array.uint8Array Js.t: reads the input JSON in place via Js.typeof and Js.Unsafe.get; text stays Js.js_string Js.t (UTF-8 via TextEncoder/TextDecoder, Latin-1 via charCodeAt/String.fromCharCode); internal buffers and outputs are JS Typed_array uint8Array/uint16Array/int32Array returned directly with zero copy. Published with Js.export."
+}

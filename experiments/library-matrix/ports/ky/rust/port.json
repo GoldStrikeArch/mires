@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "ky",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_ky",
+  "boundary": "Drives real Fetch Request and Response objects, AbortSignals and timers from Rust and resolves the trace and parsed results."
+}

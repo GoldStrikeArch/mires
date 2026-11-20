@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "ky",
+  "language": "scalajs",
+  "boundary": "Dispatches native Fetch objects through an injected transport and resolves JSON results and hook traces."
+}

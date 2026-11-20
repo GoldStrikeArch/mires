@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "big-js",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_big_js",
+  "boundary": "Reads JSON operations, converts numeric inputs to decimal text and returns newline-separated computation results."
+}

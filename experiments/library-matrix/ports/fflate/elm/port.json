@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "fflate",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "run(input) in the JS host sends the input through the `request` port; Main.elm decodes it with Json.Decode into the port's types, executes the fflate operation in pure Elm (including UTF-8/Latin-1 codecs, compression/decompression, framing, and streaming), encodes the output bytes with Json.Encode through the `response` port, and the host wraps the returned byte array in a Uint8Array."
+}

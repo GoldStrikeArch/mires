@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "diff",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "The JS host relays JSON requests and restores fields marked undefined by the Elm encoder. Diff and patch algorithms run in the Elm worker."
+}

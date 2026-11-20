@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "workbox",
+  "language": "kotlin",
+  "boundary": "Browser CacheStorage, Fetch and service-worker events are used for revisioned precaching, routing and runtime strategies."
+}

@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "language": "melange",
+  "linker": {
+    "experiments/library-matrix/languages/composite/build.mjs": "5ff0a7be84664b63a9959dac3af9b840ad4ddb7c8e9dfb70c881cdf1c1362e91",
+    "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
+  },
+  "sources": {
+    "idb": "7b767c52f2314a9566ece2d0a00f35313eae1cd681af9fd2325a42343de8314c",
+    "minisearch": "430c9d56369ef472303f34cbd04eac07e700b8d034ccdf74be86ee101cacca51",
+    "marked": "0ad095d0337eeb36b0d51efbdc07e1181dfc03a7e66345964c4de1c0432ae22d",
+    "fflate": "56481f6a2d9296f73b96bd38b4811cf02af05af2f28d8b06b4fac139c299eb5a",
+    "uplot": "579487089209dea72e4e922315be1c51a92992b256d0ce80aa47e8e2d11c24e1"
+  },
+  "toolchain": {
+    "melange": "Melange 7.0.1-53 (Using OCaml:5.3.0+Melange)",
+    "ocaml": "5.3.0",
+    "dune": "3.24.2",
+    "opamSwitch": "mires-comparators",
+    "rollup": "3.30.0",
+    "nodeResolve": "15.0.1",
+    "terser": "5.31.6"
+  },
+  "artifacts": {
+    "idb": {
+      "readable": "7db9a0a89a70d71ca4782d4cced18e436d3499704b8a1d6322eefe1f41aa3eb4",
+      "production": "4a68a1e1ade4ba983af15089c71714365bc37fb30bd0b366ce68436196600c94"
+    },
+    "minisearch": {
+      "readable": "7af8b7978e95a01965fc71ba82c99b202e3f1686ad396d92661ce172d421dd3f",
+      "production": "069db748110a8aa0f4e31dd09c381554171629ae9b453631e4f92e1952d36f55"
+    },
+    "marked": {
+      "readable": "f4b9336f0d8c434aab09eeb1cbe8933a9d15ecb325e5917cfe1329f1eb0c253f",
+      "production": "2d1ee5acdf251b43e43c81def20fb754f8b7f463501173dd0b51b6fb8744e8b5"
+    },
+    "fflate": {
+      "readable": "6fcb23ca12633503caa9e2934ec13f44ee6cd727288fc043e5057b1a960aac49",
+      "production": "653358f5b6fd7e2fc5d819847a89790426eeeba1d374f19f129d767ceb662f87"
+    },
+    "uplot": {
+      "readable": "0ebda422ddc5292a7ff2afc3e8367b9af03bbbfaa01258480504e65aed9b96a0",
+      "production": "c2afb44fb57c12c2b3d8abae07867db604e82641197ec8bd56a4f15f30c4fa55"
+    }
+  }
+}

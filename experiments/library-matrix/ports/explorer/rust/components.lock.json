@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "language": "rust",
+  "linker": {
+    "experiments/library-matrix/languages/composite/build.mjs": "5ff0a7be84664b63a9959dac3af9b840ad4ddb7c8e9dfb70c881cdf1c1362e91",
+    "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
+  },
+  "sources": {
+    "idb": "11d6161cfdbaaccc27f8d6b1703defd5187a4ec429b80f8056fb5c6764928575",
+    "minisearch": "2ff36ad540323bdefd5e18e5d226b541caaa956f20f91c60a8376194bbff4f2a",
+    "marked": "be54bf0afd6e51fca1dcc8f3df2784363a59e1e1a7d685c4f78a938544e9e85f",
+    "fflate": "ffe22a052184148d3987d72a195eb33e8953af4ecb4b39ec284cda9b904c2c24",
+    "uplot": "0fb191d09e07f07fa8af4f3463228f54789e1ad4bf5be0a69fe4f388f9435342"
+  },
+  "toolchain": {
+    "compiler": "mires (rustc_codegen_mires + jsc-link)",
+    "backend": "920589d8b4abf2ce94f6a27be3b870e6fa5e5bc65f93e6b15a3d38524c102fa2",
+    "linker": "f70f74b69cf829fa082575638c948bb40b4749bd70f915805cb6065bbc0a7e0e",
+    "sysrootKey": "ea4b9aa617a2a079e9bc873fc179a1394ad6e08d7e1a35b4a197808e768fa9dd",
+    "rustc": "rustc 1.99.0-nightly (dc3f85158 2026-07-26)",
+    "rollup": "3.30.0",
+    "terser": "5.31.6"
+  },
+  "artifacts": {
+    "idb": {
+      "readable": "36ca19ea7cfec89ae87b0cc97e1c2d464d1e65604c8f1fc8fbe65c9e59ecd482",
+      "production": "833afeef829b2a9c879d5394b6769703a65680912b41cb1baa500a2c59441a62"
+    },
+    "minisearch": {
+      "readable": "14acc86b5d3c35fa804d72de057dc608658aebdc06814ecd0064a72c24038c96",
+      "production": "aaf68eb5df731177f720ca336fbdbbb1a8762ef6cfcad7af7c9258ea573d603e"
+    },
+    "marked": {
+      "readable": "4f619cdc73e448f2e23517153bb7321228f5a4de54bc52c615b40563558a91f5",
+      "production": "5d8e9ade33e664191d93c18cd2ff8f8f3d8831cf294a67387f396c19e5ba7f79"
+    },
+    "fflate": {
+      "readable": "da48c1fa5e514dad545565409e96596405f18c3e4e79ccc43fb9d43a21da71c1",
+      "production": "bc3aaa2b6a1f1347e6f4980fe99198124bd79d17558bf018b58cc4000053c589"
+    },
+    "uplot": {
+      "readable": "971f039cb4469c49396c90f33dae811c99332ce0f095d8e1110eab0a333238d6",
+      "production": "8bb46c2ca33cb62d6bcfe0c7f5b85df0a7ec06a9d9f68c01ccab2f7ae6f97b0f"
+    }
+  }
+}

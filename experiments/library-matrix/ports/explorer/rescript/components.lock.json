@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "language": "rescript",
+  "linker": {
+    "experiments/library-matrix/languages/composite/build.mjs": "5ff0a7be84664b63a9959dac3af9b840ad4ddb7c8e9dfb70c881cdf1c1362e91",
+    "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
+  },
+  "sources": {
+    "idb": "056e020183e0f65218ceb672073bf4c523809bef2e745f87b60d38861fcfa909",
+    "minisearch": "6d671661bc1e5d6239fcac108cd98e95ad4e0acf9110d118e5fa971a3841bc6a",
+    "marked": "d128752fb2d63febe1e1fececd6c2c5515400706f6a6e323b7215c26991b6def",
+    "fflate": "e6882d47cf707665c1fec0a8e69f45fe651a212d5dc8dcc7ce82bb25ec6eb6ee",
+    "uplot": "46b3fca4758842d1b20f51a29600f113631e9124a4b4b170d21a99215adfffd4"
+  },
+  "toolchain": {
+    "compiler": "rescript 12.3.0",
+    "rollup": "3.30.0",
+    "nodeResolve": "15.0.1",
+    "terser": "5.31.6"
+  },
+  "artifacts": {
+    "idb": {
+      "readable": "a606a3d672ec884877a108e207916226291f359062f7a424658f9dedd04906fd",
+      "production": "09e871b2617a79d0950542ed4e4c4be011b611e35fd33936f758cd9ad6f3e099"
+    },
+    "minisearch": {
+      "readable": "d5d8deab506a7fbf85ffc28d3e6ae88f06bc7c269130ce7e99091c7f852eb12c",
+      "production": "e26acdb6234bfaed9b5d25bfc3f445387e4b6c52e046b4e9aa3bc9908c565dc0"
+    },
+    "marked": {
+      "readable": "4972b5da4a6731eeeb4d04f0d6b76461a078d9f27a424d11c162e034322d4678",
+      "production": "a6617e650dd9db8765507284b82080bbcf24bee6ac7013d561f49ee9c6df28ea"
+    },
+    "fflate": {
+      "readable": "bc5f36241f1c02fd9997496fdda832678892f8a3942df223ed4653dbe381c941",
+      "production": "f3dc9c9524a9ccba7097f875177cdda42e9ca35f1590ca46997fac34c9a26656"
+    },
+    "uplot": {
+      "readable": "f5d821a04e97abb3d2c17642cede526ea39e6bb578755627b3e100ddb583ecbd",
+      "production": "6f37b9b321b83c0a2de7a3498da526652a653a0f08bb1a704453c48854611b01"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "big-js",
+  "language": "jsoo",
+  "entry": "src/main.ml",
+  "boundary": "Converts JSON fields to decimal operands and options, evaluates each operation and joins the results with newlines."
+}

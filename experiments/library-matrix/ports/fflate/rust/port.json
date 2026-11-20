@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "fflate",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_fflate",
+  "boundary": "run(input: JsValue): Reflect.get / index bindings parse the operation object; UTF-8 text payloads cross via JsValue::read::<&str>().as_bytes(), Latin-1 strings via charCodeAt, byte arrays via index reads; output bytes return in one bulk copy via JsUint8Array::from_slice."
+}

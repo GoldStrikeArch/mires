@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "idb",
+  "language": "melange",
+  "entry": "src/index.ml",
+  "boundary": "Wraps browser IndexedDB requests and transaction completion events and resolves JSON arrays of their outcomes."
+}

@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "lz-string",
+  "language": "scalajs",
+  "boundary": "Read and return UTF-16 code units or unsigned bytes. The target language implements the dictionary and bit stream."
+}

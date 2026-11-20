@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "uplot",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_uplot",
+  "boundary": "Rust draws the aligned series on Canvas 2D and returns its geometry and coordinate queries."
+}

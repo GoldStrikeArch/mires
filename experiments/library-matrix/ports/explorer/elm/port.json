@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "library": "explorer",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "The native driver requests each component and consumes its result before assembling the snapshot.",
+  "components": [
+    "idb",
+    "minisearch",
+    "marked",
+    "fflate",
+    "uplot"
+  ]
+}

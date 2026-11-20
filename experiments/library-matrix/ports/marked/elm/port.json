@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "marked",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "run(input) in the JS host sends the input through the `request` port; Main.elm decodes op, markdown and options with Json.Decode, runs the Elm Lexer/Tokenizer/Parser/Renderer pipeline, and answers the raw HTML string through the `response` port, which the host returns directly (or throws TypeError on error)."
+}

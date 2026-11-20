@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "marked",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_marked",
+  "boundary": "run(input: JsValue): Reflect.get parses op, markdown (JsValue::read::<&str>()), and optional { gfm, breaks, pedantic } booleans; rendered HTML String crosses back via JsValue::erase(html.as_str())."
+}

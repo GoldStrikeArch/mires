@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "noble-hashes",
+  "language": "gopherjs",
+  "package": "./src",
+  "boundary": "Decode byte arrays, feed native incremental hash states and return a lowercase hexadecimal digest."
+}

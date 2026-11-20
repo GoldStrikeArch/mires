@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "fflate",
+  "language": "melange",
+  "entry": "src/index.ml",
+  "boundary": "run(input: Js.Json.t) -> Js.Typed_array.Uint8Array.t: reads the input JSON in place via Js.Json and [@@mel.get_index]; Melange strings are JS UTF-16 strings (UTF-8 via TextEncoder/TextDecoder, Latin-1 via charCodeAt/String.fromCharCode); internal buffers and outputs are JS Uint8Array/Uint16Array/Int32Array returned directly with zero copy."
+}

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "long",
+  "language": "jsoo",
+  "entry": "src/main.ml",
+  "boundary": "js_of_ocaml converts JS strings, arrays and flags to OCaml values. A call returns the command results joined with newlines."
+}

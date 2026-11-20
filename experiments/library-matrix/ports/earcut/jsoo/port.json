@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "earcut",
+  "language": "jsoo",
+  "entry": "src/main.ml",
+  "boundary": "Js.to_array and Js.array translate coordinate/index arrays; Js.export publishes run. All geometry runs in OCaml."
+}

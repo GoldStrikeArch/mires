@@ -1,0 +1,318 @@
+{
+  "bench-cache": [
+    [
+      [
+        "docs/index.html",
+        "guide.html",
+        "a?lang=en"
+      ],
+      []
+    ],
+    [],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'beta'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'beta'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'beta'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'beta'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'beta'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'beta'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'beta'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'beta'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ]
+  ],
+  "cache-first": [
+    [
+      "no-response"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ]
+  ],
+  "cache-only": [
+    [
+      "no-response"
+    ],
+    null
+  ],
+  "conflict": {
+    "error": "conflict"
+  },
+  "duplicate": [
+    [
+      [
+        "docs/index.html"
+      ],
+      []
+    ],
+    [
+      [],
+      [
+        "docs/index.html"
+      ]
+    ],
+    []
+  ],
+  "empty": [
+    [
+      [],
+      []
+    ],
+    [],
+    null
+  ],
+  "method": [
+    [
+      [
+        "docs/index.html",
+        "guide.html",
+        "a?lang=en"
+      ],
+      []
+    ],
+    null,
+    null
+  ],
+  "network-only": [
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'beta'\n"
+    ],
+    [
+      "no-response"
+    ]
+  ],
+  "removed": [
+    [
+      [
+        "docs/index.html",
+        "guide.html",
+        "a?lang=en"
+      ],
+      []
+    ],
+    [],
+    [
+      [],
+      []
+    ],
+    [
+      "a?lang=en&__WB_REVISION__=x+%2F+2",
+      "docs/index.html?__WB_REVISION__=1",
+      "guide.html?__WB_REVISION__=old"
+    ],
+    null
+  ],
+  "request-method-casing": [
+    [
+      [
+        "docs/index.html",
+        "guide.html",
+        "a?lang=en"
+      ],
+      []
+    ],
+    [],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    null,
+    [
+      200,
+      "export default 'beta'\n"
+    ]
+  ],
+  "revisionless": [
+    [
+      [
+        "bundle.218.js"
+      ],
+      []
+    ],
+    [],
+    [
+      200,
+      "export default 'alpha'\n"
+    ]
+  ],
+  "route-precedence": [
+    [
+      [
+        "first/item"
+      ],
+      []
+    ],
+    [],
+    [
+      200,
+      "export default 'alpha'\n"
+    ]
+  ],
+  "upgrade": [
+    [
+      [
+        "docs/index.html",
+        "guide.html",
+        "a?lang=en"
+      ],
+      []
+    ],
+    [],
+    [
+      [
+        "guide.html"
+      ],
+      [
+        "docs/index.html"
+      ]
+    ],
+    [
+      "a?lang=en&__WB_REVISION__=x+%2F+2",
+      "guide.html?__WB_REVISION__=old"
+    ],
+    [
+      200,
+      "export default 'beta'\n"
+    ]
+  ],
+  "url-variations": [
+    [
+      [
+        "docs/index.html",
+        "guide.html",
+        "a?lang=en"
+      ],
+      []
+    ],
+    [],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    null,
+    [
+      200,
+      "export default 'alpha'\n"
+    ],
+    null
+  ]
+}

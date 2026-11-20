@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "diff",
+  "language": "kotlin",
+  "boundary": "Native Myers search, token processing and unified diff parsing and application with language-specific JSON bindings."
+}

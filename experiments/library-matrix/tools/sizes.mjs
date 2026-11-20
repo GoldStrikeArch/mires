@@ -18,9 +18,11 @@ import { brotliCompressSync, constants, gzipSync } from 'node:zlib'
 import { SYNTAX, codeLines, embeddedJs, moduleState } from './lib/source-stats.mjs'
 
 import {
-  currentBinding, freshness, harnessRoot, loadRegistry, parseOptions, receiptPaths, receiptsRoot, repoPath, repositoryRoot,
+  currentBinding, harnessRoot, loadRegistry, parseOptions, receiptPaths, receiptsRoot, repoPath, repositoryRoot,
   selectPorts, sha256, usageError, walkFiles, writeJson,
 } from './lib/registry.mjs'
+
+import { componentsOf, compositeFreshness } from './lib/composite.mjs'
 
 const USAGE = 'usage: node tools/sizes.mjs [--library <id,...|all>] [--language <id,...|all>] [--matrix <registry>] [--receipts <dir>]'
 const fail = (message) => usageError('sizes.mjs', USAGE, message)
@@ -43,8 +45,11 @@ export function measure(bytes) {
 
 function sourceStats(port) {
   const language = registry.languages[port.language]
-  const hostDirs = (language.hostJs || []).map((dir) => resolve(port.dir, dir))
-  const files = walkFiles(port.dir, { skip: (path, entry) => entry.name.startsWith('.') || (entry.isDirectory() && path === resolve(port.dir, 'dist')) })
+  const sources = [port, ...componentsOf(registry, port)]
+  const hostDirs = sources.flatMap(source => (language.hostJs || []).map(dir => resolve(source.dir, dir)))
+  const files = sources.flatMap(source => walkFiles(source.dir, {
+    skip: (path, entry) => entry.name.startsWith('.') || (entry.isDirectory() && path === resolve(source.dir, 'dist')),
+  }))
   const target = { files: 0, nonBlank: 0, code: 0 }
   const embedded = { lines: 0, constructs: [], evalReferences: [] }
   const host = { files: 0, nonBlank: 0, bytes: 0, paths: [] }
@@ -97,7 +102,7 @@ async function referenceSize(library) {
 const refused = []
 const rows = []
 for (const port of ports) {
-  const state = freshness(registry, paths, port)
+  const state = compositeFreshness(registry, paths, port)
   if (state.status === 'stale') {
     refused.push({ port: port.key, reasons: state.reasons })
     continue

@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "library": "explorer",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "The native driver requests each component and consumes its result before assembling the snapshot.",
+  "components": [
+    "idb",
+    "minisearch",
+    "marked",
+    "fflate",
+    "uplot"
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "uplot",
+  "language": "kotlin",
+  "boundary": "Aligned arrays in, chart geometries and probes out. The port computes paths, extrema, gap rectangles, and scale transforms and renders the paths through the browser canvas."
+}

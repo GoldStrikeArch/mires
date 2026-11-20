@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "mires_bug_tuple_clone",
+  "boundary": "the floor boundary, with the text passed through a cloned (String, usize) tuple"
+}

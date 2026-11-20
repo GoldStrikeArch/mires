@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "lz-string",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_lz_string",
+  "boundary": "Typed JSON arrays carry UTF-16 code units or unsigned bytes. Dictionary construction and bit packing run in Rust."
+}

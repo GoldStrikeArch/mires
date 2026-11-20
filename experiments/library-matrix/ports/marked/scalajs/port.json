@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "marked",
+  "language": "scalajs",
+  "boundary": "run(input: Input) reads the JSON corpus object through @js.native facade traits (op, markdown, options) with no copy, decodes the three boolean options into MarkedOptions, runs Marked.parse or Marked.parseInline using native Scala classes backed by host js.RegExp and js.Array/Object.create(null), and returns the rendered JS String directly. Exported with @JSExportTopLevel(\"run\") as a native ES module export."
+}

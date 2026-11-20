@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "earcut",
+  "language": "gopherjs",
+  "package": "./src",
+  "boundary": "Go reads JS arrays and returns plain JS numbers, arrays and objects. Each call owns its triangulation and refinement scratch."
+}

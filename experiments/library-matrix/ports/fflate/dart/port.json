@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "fflate",
+  "language": "dart",
+  "entry": "src/main.dart",
+  "boundary": "run(input: InputJson) over dart:js_interop extension types (no copy): strings cross as JS strings (Dart String on web, UTF-16) encoded directly via strToU8, small byte arrays read from JSArray<JSNumber>, options into Dart value classes. Outputs return raw Dart Uint8List via .toJS (zero-copy JS Uint8Array on dart2js), with strFromU8 encoded as UTF-16LE bytes and streaming callbacks framed as [u32le(len), final, ...chunk]. main() publishes run on globalThis.__matrixExports for the generated facade."
+}

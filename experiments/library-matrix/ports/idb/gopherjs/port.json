@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "idb",
+  "language": "gopherjs",
+  "package": "./src",
+  "boundary": "Wraps browser IndexedDB requests and transaction completion events and resolves JSON arrays of their outcomes."
+}

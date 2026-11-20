@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "earcut",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_earcut",
+  "boundary": "run(input: JsValue): Reflect.get and typed index bindings read coordinate/index arrays into Vec<f64>/Vec<u32> without mutating input; flatten reads components as JsValue to preserve missing coordinates. Results are plain JS arrays, numbers and objects."
+}

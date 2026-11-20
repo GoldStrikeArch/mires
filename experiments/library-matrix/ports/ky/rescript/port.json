@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "ky",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "Dispatches native Fetch objects through an injected transport and resolves JSON results and hook traces."
+}

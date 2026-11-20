@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "earcut",
+  "language": "melange",
+  "entry": "src/index.ml",
+  "boundary": "Native JavaScript arrays, numbers and records at the boundary. The OCaml triangulator allocates per call."
+}

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "diff",
+  "language": "gopherjs",
+  "package": "./src",
+  "boundary": "JSON input and output use the GopherJS object bindings. Myers paths, token processing and unified patch operations run in Go."
+}

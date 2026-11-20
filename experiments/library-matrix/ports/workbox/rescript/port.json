@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "workbox",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "Browser CacheStorage, Fetch and service-worker events are used for revisioned precaching, routing and runtime strategies."
+}

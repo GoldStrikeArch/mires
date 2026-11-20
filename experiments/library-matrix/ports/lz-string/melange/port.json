@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "lz-string",
+  "language": "melange",
+  "entry": "src/index.ml",
+  "boundary": "Read and return UTF-16 code units or unsigned bytes. The target language implements the dictionary and bit stream."
+}

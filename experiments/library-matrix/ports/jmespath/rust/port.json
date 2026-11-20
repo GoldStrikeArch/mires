@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "jmespath",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_jmespath",
+  "boundary": "Rust tokenizes, parses and interprets JMESPath. JavaScript supplies JSON primitives and UTF-16 string operations."
+}

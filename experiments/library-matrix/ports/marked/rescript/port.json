@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "marked",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "run(input): the input is typed as a ReScript record matching the corpus JSON object directly (zero input conversion); optional { gfm, breaks, pedantic } booleans resolve to marked's defaults, unknown ops throw TypeError, and parse/parseInline return the rendered HTML JS string directly."
+}

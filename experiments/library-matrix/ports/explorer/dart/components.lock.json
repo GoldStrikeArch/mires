@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "language": "dart",
+  "linker": {
+    "experiments/library-matrix/languages/composite/build.mjs": "5ff0a7be84664b63a9959dac3af9b840ad4ddb7c8e9dfb70c881cdf1c1362e91",
+    "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
+  },
+  "sources": {
+    "idb": "2778069266d0616aa51ef72805b617d93ea9b82344abdbfc634781d3e8895b26",
+    "minisearch": "635d1b68193cf7d1919ce464c5941ff2c294dc23bff032ec3e110d7db1c1fe22",
+    "marked": "da604e75a9d8954cc75db79f4c2af206f5a07a796bf828e680c13e054fc84787",
+    "fflate": "d65ad087104d21aa8abce556e735afb9e7c732f993ea06eae1f6d3fdc6d4d980",
+    "uplot": "d2d757d23036294e9a6a576013447ef5af82736aa9dc15885f46ab6703fd15d1"
+  },
+  "toolchain": {
+    "dart": "Dart SDK version: 3.14.0 (stable) (Wed Nov 4 16:28:39 2026 -0800) on \"macos_arm64\"",
+    "terser": "5.31.6"
+  },
+  "artifacts": {
+    "idb": {
+      "readable": "1d6143c94605948b49c8d1379305045f2193e4534dcc4c7967fee202bf0fdc22",
+      "production": "696519dc0dd75f348f752d94b6a7c027d5bcafb1aa0c5ae69f4d8047f9779cf9"
+    },
+    "minisearch": {
+      "readable": "2feae12a9fce82476aacca8705637373c171069d02b2491bb172a916fd292ad3",
+      "production": "605512f7b725023b37ff9ba827e2882648d9b7b0aa6cdadbf9c2b6833d32a8c7"
+    },
+    "marked": {
+      "readable": "cb994e6fd36c136196b01f8a98d8c25a5797f74b6fbf9538013b51e4d5599281",
+      "production": "b063feccd90e54e5696dc360fb54c41e52dc77de102e2a545e3fcffdeb2121a5"
+    },
+    "fflate": {
+      "readable": "5e700b8390dc0c8fcf92cfe6cd1cc1edce18d8a1af9a1d8d9a89698c99bdd256",
+      "production": "0de698926b91daa5bc06f8f16b7ff3fae149f1bcc44647212b493cf85e9bbbad"
+    },
+    "uplot": {
+      "readable": "ef0e733c15280835f9e0a71faef1672a6e8d41476d50889133fdf1c7f78b0ec0",
+      "production": "0c31929a9b46005bba1da8c587ef269bc2a71efc267235423477800b84abe983"
+    }
+  }
+}

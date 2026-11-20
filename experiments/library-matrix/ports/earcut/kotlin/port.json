@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "earcut",
+  "language": "kotlin",
+  "boundary": "Kotlin/JS external interfaces read JS arrays directly. The native @JsExport function returns a number, a plain array or a flatten result object."
+}

@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "noble-hashes",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_noble_hashes",
+  "boundary": "Reads JSON byte arrays into Rust Vecs, updates a per-call native hash state, and returns a lowercase hexadecimal digest."
+}

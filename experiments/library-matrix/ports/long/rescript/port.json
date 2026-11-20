@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "long",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "ReScript records and arrays represent commands without boundary copies. A call returns the command results joined with newlines."
+}

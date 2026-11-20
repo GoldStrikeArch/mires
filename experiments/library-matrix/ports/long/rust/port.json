@@ -1,0 +1,1 @@
+{"schema":1,"library":"long","language":"rust","entry":"src/lib.rs","crateName":"matrix_long","boundary":"Reads command records through mires-js and returns a newline-separated JS string. All 64-bit operations run in Rust."}

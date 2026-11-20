@@ -1,10 +1,6 @@
 # Library × compiler matrix
 
-Real JavaScript libraries (minisearch, fflate, marked, idb, Ky, uPlot, Workbox, and later more),
-each ported for a defined API subset to nine compiled languages, then checked for exact output
-parity against the pinned npm package, sized and timed against it. This directory is the shared
-harness. It is proven end to end on all nine toolchains by the `pilot` library (a handwritten
-stand-in for an npm package) and measures every language's runtime floor with the `floor` library.
+The matrix compares defined API subsets of 15 JavaScript libraries across nine compiled languages. It checks exact output against each pinned npm release and measures production bundle size and time against that reference. A sixteenth workload, Explorer, links each language's own IndexedDB, search, Markdown, compression and chart ports into an offline application. The `pilot` program exercises the harness and `floor` measures each language's runtime overhead.
 
 | Language id | Family | Production variant built here |
 | --- | --- | --- |
@@ -23,7 +19,12 @@ to compare"), built with the same toolchain invocations as the comparator ports
 (`experiments/fingerprintjs-<family>/tools/build.mjs`). "Common Terser" is the comparator ports'
 pass: `{ format: { comments: false }, safari10: true, module: true }`.
 
-The current state of every port is in [`MATRIX.md`](MATRIX.md) (generated; do not edit).
+[`MATRIX.md`](MATRIX.md) reports parity, size and timings for each port. Start a new library
+with its Rust port and check it against the pinned npm package before completing its other eight
+ports. Record each mires compiler defect and its workaround in [`MIRES-BUGS.md`](MIRES-BUGS.md).
+Runnable examples live in [`mires-bugs/`](mires-bugs/).
+
+The browser workloads use real host APIs. In the Elm rows, JavaScript drives IndexedDB events, Fetch, the service worker and the Canvas context. Elm drives the transaction sequence, Ky retry decisions and chart geometry. The source and bundle figures in the report include the JavaScript host. Each workload's `CONTRACT.md` describes its API coverage and additional verifiers. [IndexedDB](libraries/idb/CONTRACT.md) · [Ky](libraries/ky/CONTRACT.md) · [uPlot](libraries/uplot/CONTRACT.md) · [Workbox](libraries/workbox/CONTRACT.md) · [Explorer](libraries/explorer/CONTRACT.md)
 
 ## Commands
 

@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "language": "gopherjs",
+  "linker": {
+    "experiments/library-matrix/languages/composite/build.mjs": "5ff0a7be84664b63a9959dac3af9b840ad4ddb7c8e9dfb70c881cdf1c1362e91",
+    "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
+  },
+  "sources": {
+    "idb": "dff2e61dbada57588bc79dc0684373d47e7a0012420239cd87b97b70651accb3",
+    "minisearch": "8744c19fa867df54cd95b36aaee1f7f8bc9d30ca0e53c44baa5d719a32fc2145",
+    "marked": "c68ebbe7ee7023e6387a7559d71c01fb928e3849491a6b5d0d2995b2ed303ff7",
+    "fflate": "1028b44e8204d495d1e2caa619523ebb3df11a977e69ebcc31611b36f963412a",
+    "uplot": "b299c1227a2ba08025ffc174fe44f49721d5807bb950127fc2ddcf39867dcee3"
+  },
+  "toolchain": {
+    "gopherjs": "GopherJS 1.21.0+go1.21.13",
+    "terser": "5.31.6"
+  },
+  "artifacts": {
+    "idb": {
+      "readable": "b3e1b8c959a436f8d79cf4d3a83592c915337e87446cb4a4eaf94ea070715123",
+      "production": "ffd817db997b8a52767556d752dd89e8dc6f52dfc210e5ed8343276d36b8111f"
+    },
+    "minisearch": {
+      "readable": "07785ad5c20fe7952b557b71f2ac24fed87541c22904fd31ecaeafb6ebc6fc01",
+      "production": "cc0a2856df78eb1a6fee9ebd4c556c23c512f88941551492edde4782f9c57256"
+    },
+    "marked": {
+      "readable": "492f685eeb9a426a5ab2cd3fee5694e6a41609e4775387e3f7a29399fc78d3ef",
+      "production": "ad7b278938bf6b88095273494730beb52dabdcba4c3c359269bb96531d4f79b8"
+    },
+    "fflate": {
+      "readable": "035dd4ef66d92bd4d0cf9928dc0ce360005aa90f167c4c830af2ed35de3b2a57",
+      "production": "01d945babad9337ce26e38d26ffb638cd0009ba419e7377755a659ebace60cc5"
+    },
+    "uplot": {
+      "readable": "3ab7a7f6364060a32e3a98053a5c6e16d6f7b3b014d7a09b0f3b89eb065253d5",
+      "production": "fbb5851355b8e7c64b32694ad937fcc136238ce45e27ba8d88ecca9c43c87dfd"
+    }
+  }
+}

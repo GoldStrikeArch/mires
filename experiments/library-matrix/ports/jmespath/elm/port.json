@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "jmespath",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "Reads the query batch, compiles expressions with a Pratt parser and evaluates their ASTs against the input JSON document."
+}

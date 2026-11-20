@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "big-js",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "Converts JSON fields to decimal operands and options, evaluates each operation and joins the results with newlines."
+}

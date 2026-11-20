@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "language": "jsoo",
+  "linker": {
+    "experiments/library-matrix/languages/composite/build.mjs": "5ff0a7be84664b63a9959dac3af9b840ad4ddb7c8e9dfb70c881cdf1c1362e91",
+    "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
+  },
+  "sources": {
+    "idb": "730dd23a7c8ecda45ad45ef1a2a53e58ee24fc0f6db141795b2589aac7bb1d29",
+    "minisearch": "532bae4f676cd31544ed7f669943bd264a805d32ce3a92f8fc9b113f90845e18",
+    "marked": "7ae91ee444dfc20d50b7ca203ca21f4aaaf481bacae5359d1f4f6713a492eee7",
+    "fflate": "165c65015cb7c84a291191fae1c858b184467f2578891790cb72938c6d603148",
+    "uplot": "3918da2bc5d0508365acc6d162d601d8f834a7ef1351b43640225b0a6b4beb0a"
+  },
+  "toolchain": {
+    "jsOfOcaml": "6.4.1+6.4.1",
+    "ocaml": "5.3.0",
+    "dune": "3.24.2",
+    "opamSwitch": "mires-comparators",
+    "terser": "5.31.6"
+  },
+  "artifacts": {
+    "idb": {
+      "readable": "a4b39e9144d3cf28e26b22b8399ce74777b3bb7c160395978f1a246a79d47838",
+      "production": "4c873f6d68770a88a1edf988490b339dfe481cbd73d86f86a4acbf95db6dd24d"
+    },
+    "minisearch": {
+      "readable": "e7b83ed51e185d59bc019d7d7235d8e5b0d9af5d29ba4abd8dd89960fa738800",
+      "production": "cfefe17e08421a615dec2aff33594cfd32f899188586467f1ab5f852931fd7cb"
+    },
+    "marked": {
+      "readable": "da56f9caf456da2b74fcc797322367f37d81fb2362389e206a6e351791f79b79",
+      "production": "e51b79168efe7cb65003761e420aa59cc0180832f7b577dc71dee09591510603"
+    },
+    "fflate": {
+      "readable": "d484abc917280acd26b7e9f98cbdd7c7e916910a036450f4da7368cda9056953",
+      "production": "0b5ef081b03b593ba12bad2b4ddfbac09be155b560bfc91aa01d3b9b6a683cf8"
+    },
+    "uplot": {
+      "readable": "52c29c825f6e3281c8c1c46ccad0a48853b96ae0e5bcda7249c2874cf839655a",
+      "production": "4f47967dd79edbd781646f907ee701c28ad3720a6b923fb12711fee68bc1f642"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "marked",
+  "language": "gopherjs",
+  "package": "./src",
+  "boundary": "run(input *js.Object) *js.Object: reads input.op via .String(), optional options.{gfm,breaks,pedantic} via Get/Bool, and passes input.markdown directly as a JS string (*js.Object) through host RegExp-backed Go Lexer/Tokenizer/Parser/Renderer/TextRenderer, returning the rendered HTML JS string directly with zero UTF-16/UTF-8 round-trip copy. Published on js.Module.exports."
+}

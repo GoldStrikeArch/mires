@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "long",
+  "language": "gopherjs",
+  "package": "./src",
+  "boundary": "The Go boundary reads command records and pairs of JS words through js.Object. A call returns the command results joined with newlines."
+}

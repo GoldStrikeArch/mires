@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "fflate",
+  "language": "scalajs",
+  "boundary": "run(input: Input) reads the JSON corpus object through @js.native facade traits with no copy. Payloads convert UTF-8 strings via host TextEncoder (wrapped zero-copy as Array[Byte] via int8Array2ByteArray), Latin-1 strings via charAt byte loops, and JSON byte arrays via direct copy; options and streaming steps decode into lean Scala classes. Core DEFLATE/Inflate/framing/streaming runs on unboxed Scala Array[Byte] (Int8Array), Array[Char] (Uint16Array), and Array[Int] (Int32Array), returning a raw js.typedarray.Uint8Array view over the output buffer (zero-copy for one-shot outputs). Exported with @JSExportTopLevel(\"run\") as a native ES module export."
+}

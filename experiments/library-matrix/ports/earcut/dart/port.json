@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "earcut",
+  "language": "dart",
+  "boundary": "dart:js_interop reads numeric arrays and converts results to JS arrays. main publishes run via the standard dart2js export facade.",
+  "entry": "src/main.dart"
+}

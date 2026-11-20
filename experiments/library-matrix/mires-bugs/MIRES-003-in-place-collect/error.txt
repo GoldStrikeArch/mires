@@ -1,0 +1,17 @@
+error: rustc_codegen_js: `alloc$vec$in_place_collect$from_iter_in_place$h9dd4528c867fde6c` requires semantic cleanup lowering; baseline fallback would discard its cleanup paths
+  = note: JIR lowering declined: cast: a pointer cast from pointee 20505b461f6ac7096e589d7e33eefad9 to pointee d126e484f7fef0ebcd0edc871c1a88c1 has no row in the cast matrix
+error: core/src/ptr/non_null.rs:506:18: 506:52: rustc_codegen_js cannot cast a pointer to `(u32, usize)` into a pointer to `usize`
+  = note: in `alloc::vec::in_place_collect::from_iter_in_place`
+  = note: required by `second_halves`
+  = note: required by `matrix_run`
+error: alloc/src/vec/in_place_collect.rs:261:13: 261:34: rustc_codegen_js cannot cast a pointer to `(u32, usize)` into a pointer to `usize`
+  = note: in `alloc::vec::in_place_collect::from_iter_in_place`
+  = note: required by `second_halves`
+  = note: required by `matrix_run`
+error: rustc_codegen_js: the link step reported errors
+
+error: aborting due to 1 previous error
+
+Error: /Users/mikhail.pertsev/Desktop/OSS/mires/scripts/compile_core.sh /Users/mikhail.pertsev/Desktop/OSS/mires/build/library-matrix/mires-bugs/in-place-collect/receipts/work/floor/in-place-collect/stage/src/lib.rs /Users/mikhail.pertsev/Desktop/OSS/mires/build/library-matrix/mires-bugs/in-place-collect/receipts/work/floor/in-place-collect/compile/program.js --crate-name mires_bug_in_place_collect --extern mires_js=/Users/mikhail.pertsev/Desktop/OSS/mires/build/library-matrix/mires-bugs/in-place-collect/receipts/work/floor/in-place-collect/compile/libmires_js.rlib --search /Users/mikhail.pertsev/Desktop/OSS/mires/build/library-matrix/mires-bugs/in-place-collect/receipts/work/floor/in-place-collect/compile/proc-macro --search /Users/mikhail.pertsev/Desktop/OSS/mires/build/library-matrix/mires-bugs/in-place-collect/receipts/work/floor/in-place-collect/compile failed (exit 1)
+
+[build.mjs] exit 1

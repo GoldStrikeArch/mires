@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "earcut",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "Native input records and arrays. Triangulation and refinement run in ReScript and return plain arrays and numbers."
+}

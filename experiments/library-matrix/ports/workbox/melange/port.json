@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "workbox",
+  "language": "melange",
+  "entry": "src/index.ml",
+  "boundary": "Browser CacheStorage, Fetch and service-worker events are used for revisioned precaching, routing and runtime strategies."
+}

@@ -1,0 +1,1 @@
+The Rust port stores normalized decimal digits in `Vec<u8>`, aligns coefficients for addition, uses schoolbook multiplication and decimal long division, and iterates the square root by Newton's method. Parsing the leading sign with a direct byte comparison avoids MIRES-019, where a promoted `Some(&b'-')` compares incorrectly in generated JavaScript.

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "diff",
+  "language": "dart",
+  "boundary": "Native Myers search, token processing and unified diff parsing and application with language-specific JSON bindings.",
+  "entry": "src/main.dart"
+}

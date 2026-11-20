@@ -1,0 +1,11 @@
+error: core/src/slice/cmp.rs:52:14: `transmute` between these types is not supported by rustc_codegen_js
+  = note: in `core::slice::cmp::<impl core::cmp::PartialOrd for [T]>::lt`
+  = note: required by `less`
+  = note: required by `matrix_run`
+error: rustc_codegen_js: the link step reported errors
+
+error: aborting due to 1 previous error
+
+Error: /Users/mikhail.pertsev/Desktop/OSS/mires/scripts/compile_core.sh /Users/mikhail.pertsev/Desktop/OSS/mires/build/library-matrix/mires-bugs/slice-partial-ord-lt/receipts/work/floor/slice-partial-ord-lt/stage/src/lib.rs /Users/mikhail.pertsev/Desktop/OSS/mires/build/library-matrix/mires-bugs/slice-partial-ord-lt/receipts/work/floor/slice-partial-ord-lt/compile/program.js --crate-name mires_bug_slice_lt --extern mires_js=/Users/mikhail.pertsev/Desktop/OSS/mires/build/library-matrix/mires-bugs/slice-partial-ord-lt/receipts/work/floor/slice-partial-ord-lt/compile/libmires_js.rlib --search /Users/mikhail.pertsev/Desktop/OSS/mires/build/library-matrix/mires-bugs/slice-partial-ord-lt/receipts/work/floor/slice-partial-ord-lt/compile/proc-macro --search /Users/mikhail.pertsev/Desktop/OSS/mires/build/library-matrix/mires-bugs/slice-partial-ord-lt/receipts/work/floor/slice-partial-ord-lt/compile failed (exit 1)
+
+[build.mjs] exit 1

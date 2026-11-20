@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "fflate",
+  "language": "kotlin",
+  "boundary": "run(input: InputJson) over external interfaces (read in place, no copy): UTF-8 text payloads decode via host TextEncoder and are viewed zero-copy as Kotlin ByteArray (Int8Array); Latin-1 text payloads read UTF-16 code units directly into ByteArray; JSON byte arrays copy into ByteArray. Output ByteArrays return zero-copy as raw JS Uint8Arrays over the same ArrayBuffer (with strFromU8 encoded to UTF-16LE and streaming records framed as [u32le(len), final, ...chunk]). Exported with @JsExport as a native ES module export."
+}

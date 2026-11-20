@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "long",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "An Elm worker decodes the command array and sends its result string through a port. A call returns the command results joined with newlines."
+}

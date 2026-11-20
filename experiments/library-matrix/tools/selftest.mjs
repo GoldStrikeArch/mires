@@ -14,7 +14,8 @@ import { CanonicalError, canonicalText } from './lib/canonical.mjs'
 import { runCheck } from './lib/check-runner.mjs'
 import { balancedOrders, runCell, williamsRows } from './lib/protocol.mjs'
 import { attributeRequest, startServer } from './lib/browser.mjs'
-import { directoryDigest, moduleGraph, repositoryRoot } from './lib/registry.mjs'
+import { componentsOf, componentSources, compositeFreshness, lockPath } from './lib/composite.mjs'
+import { directoryDigest, fileRecord, moduleGraph, receiptPaths, repositoryRoot, sourceInventory, writeJson } from './lib/registry.mjs'
 import { codeLines, embeddedJs, moduleState, SYNTAX } from './lib/source-stats.mjs'
 
 let passed = 0
@@ -321,6 +322,41 @@ await test('registry: the package-directory digest follows symbolic links', () =
   writeFileSync(resolve(dir, 'options-real.json'), '{"a":2}')
   assert.notEqual(directoryDigest(pack).sha256, before.sha256)
   assert.equal(embeddedJs('let f: string => unit = %raw(`(b) => WebAssembly.instantiate(b)`)\nlet u = "data:text/javascript,1"\n', 'rescript').evalReferences.length, 2)
+})
+
+await test('composite freshness binds the selected language source and the linked artifact', () => {
+  const app = { library: 'app', id: 'test', language: 'test', key: 'app--test', dir: resolve(dir, 'app') }
+  const dep = { library: 'dep', id: 'test', language: 'test', key: 'dep--test', dir: resolve(dir, 'dep') }
+  const other = { ...dep, id: 'other', language: 'other', dir: resolve(dir, 'other') }
+  const registry = {
+    ports: [other, dep, app],
+    languages: { test: { builderPath: resolve(dir, 'compiler/build.mjs') } }
+  }
+  const paths = receiptPaths(resolve(dir, 'receipts'))
+  writeJson(resolve(app.dir, 'port.json'), { components: ['dep'] })
+  for (const p of [dep, other])
+    writeJson(resolve(p.dir, 'port.json'), { library: 'dep', language: p.language })
+  writeFileSync(resolve(dep.dir, 'algorithm'), 'version 1')
+  assert.deepEqual(componentsOf(registry, app), [dep])
+  assert.throws(() => componentsOf({ ...registry, ports: [app, other] }, app), /missing same-language/)
+  const inputs = componentSources(registry, app, [dep])
+  const artifacts = { dep: { production: 'production digest', readable: 'readable digest' } }
+  const toolchain = { version: '1' }
+  writeJson(lockPath(app), { ...inputs, toolchain, artifacts })
+  const meta = resolve(app.dir, 'dist/meta.json')
+  writeJson(meta, { toolchain, componentArtifacts: artifacts })
+  writeJson(resolve(paths.builds, app.key + '.json'), {
+    built: true,
+    artifacts: [fileRecord(meta)],
+    sourceAfter: sourceInventory(registry, app)
+  })
+  assert.equal(compositeFreshness(registry, paths, app).fresh, true)
+  writeFileSync(resolve(other.dir, 'algorithm'), 'unrelated change')
+  assert.equal(compositeFreshness(registry, paths, app).fresh, true)
+  writeFileSync(resolve(dep.dir, 'algorithm'), 'version 2')
+  const state = compositeFreshness(registry, paths, app)
+  assert.equal(state.status, 'stale')
+  assert.match(state.reasons[0], /components.lock.json mismatch \(dep\)/)
 })
 
 rmSync(dir, { recursive: true, force: true })

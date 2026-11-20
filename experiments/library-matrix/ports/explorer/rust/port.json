@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "library": "explorer",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_explorer",
+  "boundary": "The Rust driver requests a component call and consumes its result on each step. The module linker dispatches those calls to the five Rust matrix ports.",
+  "components": [
+    "idb",
+    "minisearch",
+    "marked",
+    "fflate",
+    "uplot"
+  ]
+}

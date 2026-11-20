@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "mires_bug_option_ref_const",
+  "boundary": "the floor boundary, checking s.as_bytes().last() == Some(&b'.')"
+}

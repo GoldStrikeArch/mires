@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "long",
+  "language": "melange",
+  "entry": "src/index.ml",
+  "boundary": "Melange reads the command and word arrays as native JS records and arrays. A call returns the command results joined with newlines."
+}

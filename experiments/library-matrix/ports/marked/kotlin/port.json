@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "marked",
+  "language": "kotlin",
+  "boundary": "run(input: InputJson) reads op, markdown, and optional options (gfm, breaks, pedantic) in place through external interfaces (no copy) and returns the rendered HTML as a native JS String directly. Exported with @JsExport as a native ES module export."
+}

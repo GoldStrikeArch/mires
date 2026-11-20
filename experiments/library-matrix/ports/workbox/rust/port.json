@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "workbox",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_workbox",
+  "boundary": "Rust futures drive real browser Fetch and CacheStorage and return the Workbox response and lifecycle reports."
+}

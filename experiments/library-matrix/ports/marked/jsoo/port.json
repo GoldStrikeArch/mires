@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "marked",
+  "language": "jsoo",
+  "entry": "src/main.ml",
+  "boundary": "run(input: Js.Unsafe.top Js.t) -> Js.js_string Js.t: reads { op, markdown, options } in place via Js.typeof and Js.Unsafe.get; Markdown and HTML stay Js.js_string Js.t (UTF-16) throughout with Js.regExp, Js.js_array (Vec), and JS Map (StrMap) bindings, returning the rendered HTML JS string directly with zero copy. Published with Js.export."
+}

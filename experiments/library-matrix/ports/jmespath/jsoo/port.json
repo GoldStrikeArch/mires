@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "jmespath",
+  "language": "jsoo",
+  "entry": "src/main.ml",
+  "boundary": "Native Pratt parsing, projection evaluation, and typed built-ins operate on JSON values, preserving UTF-16 string and JavaScript object semantics."
+}

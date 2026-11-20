@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "lz-string",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "Read and return UTF-16 code units or unsigned bytes. The target language implements the dictionary and bit stream."
+}

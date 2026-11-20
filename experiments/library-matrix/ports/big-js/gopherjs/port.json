@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "big-js",
+  "language": "gopherjs",
+  "package": "./src",
+  "boundary": "Converts JSON fields to decimal operands and options, evaluates each operation and joins the results with newlines."
+}

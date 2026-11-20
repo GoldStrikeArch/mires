@@ -1,0 +1,13 @@
+# long 5.3.2
+
+The reference loads the pinned ESM entry. Each input contains a `cases` array. A command has two pairs of signed 32-bit words `a` and `b` (low word first), their unsigned flags `u` and `v`, the operation `op`, integer argument `n`, output radix `r`, and ASCII string `s`. The result is each command's string joined with a newline. An exception contributes `!` and subsequent commands continue.
+
+Supported methods are `fromBits`, `fromString`, `toString`, `add`, `subtract`, `multiply`, `divide`, `modulo`, `and`, `or`, `xor`, `shiftLeft`, `shiftRight`, `shiftRightUnsigned`, `rotl`, `compare`, `clz` and `ctz`. Shift counts use the low six bits. `fromString` takes its input radix from `n`. A zero radix defaults to decimal. Other valid radices are 2 through 36. Strings may include leading signs and ASCII whitespace. Parsing follows the package's eight-character groups and JavaScript parseInt prefix handling. Output uses lowercase digits. Counts and comparisons return decimal strings.
+
+The browser and Node matrix baseline uses the package's default WebAssembly fast path. Version 5.3.2 checks only the dividend's high word in its signed division overflow guard. Dividing signed `[1, -2147483648]` by `[-1, -1]` therefore returns the dividend. The package's JavaScript fallback gives the mathematical quotient. The permanent `wasm-divide-guard` cases pin default behavior. Run `node bench-baselines.mjs` from this directory to compare the npm fast path and fallback on the same two workloads.
+
+The two benchmarks mix 100,000 multiplications, divisions and rotations and 12,500 string conversions. Each benchmark variant changes operand bits while retaining its signedness, loop count and radix. Integer arithmetic wraps at 64 bits. Languages with native 64-bit integers exercise their compiler's implementation.
+
+Run `node generate-corpus.mjs` to regenerate the 82 matrix case groups. After building a language, `node verify.mjs <language>` checks published test cases with fixed expected answers, shift counts across signed 32-bit boundaries, all 4,096 pairs of bit position and shift width, nearby signed and unsigned values in all radices, and pairwise arithmetic around each power of two. [Upstream 5.3.2 tests](https://github.com/dcodeIO/long.js/blob/e1bcb4f65096465b69f0fd67e68fc2a79a67ade9/tests/index.js)
+
+Rust, OCaml, Scala, Kotlin and Go use native language 64-bit types. ReScript uses its standard BigInt module with explicit 64-bit truncation. Dart and Elm emulate two 32-bit words, multiply in 16-bit limbs and divide in base 65,536 or by a shifted divisor. The npm implementation is distributed under Apache-2.0. [Pinned source](https://github.com/dcodeIO/long.js/blob/e1bcb4f65096465b69f0fd67e68fc2a79a67ade9/index.js)

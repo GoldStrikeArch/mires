@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "marked",
+  "language": "melange",
+  "entry": "src/index.ml",
+  "boundary": "run(input: Js.Json.t) -> string: reads { op, markdown, options } in place via Js.Json and [@@mel.get_index]; Markdown and HTML stay native JS UTF-16 strings throughout with host RegExp, JS Array (Vec), and JS Map (StrMap) bindings, returning the rendered HTML string directly with zero copy."
+}

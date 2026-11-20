@@ -13,9 +13,11 @@ import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 import {
-  artifactOf, bindingDifference, checkReceiptProblem, currentBinding, guardProblem, freshness, harnessIdentity, harnessRoot, loadRegistry,
+  artifactOf, bindingDifference, checkReceiptProblem, currentBinding, guardProblem, harnessIdentity, harnessRoot, loadRegistry,
   majorVersion, parseOptions, readJson, receiptPaths, receiptsRoot, repoPath, usageError, writeJson,
 } from './lib/registry.mjs'
+
+import { compositeFreshness } from './lib/composite.mjs'
 
 const USAGE = 'usage: node tools/matrix.mjs [--matrix <registry>] [--receipts <dir>] [--output <dir>]'
 const fail = (message) => usageError('matrix.mjs', USAGE, message)
@@ -24,7 +26,7 @@ const registry = loadRegistry(options.matrix && options.matrix !== true ? option
 const paths = receiptPaths(receiptsRoot(options))
 const outputDir = resolve(options.output && options.output !== true ? options.output : harnessRoot)
 
-const states = registry.ports.map((port) => ({ port, state: freshness(registry, paths, port) }))
+const states = registry.ports.map((port) => ({ port, state: compositeFreshness(registry, paths, port) }))
 const stale = states.filter(({ state }) => state.status === 'stale')
 if (stale.length) {
   process.stderr.write('matrix.mjs: refusing stale dist/ (not the output of its current build receipt):\n')
@@ -209,7 +211,12 @@ for (const [libraryId, info] of Object.entries(results.libraries)) {
   if (!rows.length) continue
   const library = registry.libraries[libraryId]
   lines.push(`## ${libraryId}: ${info.label}`, '')
-  const reference = info.npm ? `\`${info.npm.package}@${info.npm.version}\` (${info.npm.entry}) through \`${info.reference}\`` : `stand-in package \`${info.package.name}@${info.package.version}\` (\`${info.package.entry}\`) through \`${info.reference}\``
+  const packageLabel = info.npm
+    ? `\`${info.npm.package}@${info.npm.version}\` (${info.npm.entry})`
+    : info.package.entry
+      ? `stand-in package \`${info.package.name}@${info.package.version}\` (\`${info.package.entry}\`)`
+      : info.package.standIn
+  const reference = `${packageLabel} through \`${info.reference}\``
   lines.push(`Reference: ${reference}. Output form: \`${info.output.form}\`${info.output.async ? ' (async)' : ''}. Normalisation: ${info.normalisation ? `\`${info.normalisation.name}\`` : 'none'}. Corpus: \`${info.corpus}\`. Contract: ${info.contract ? `\`${info.contract}\`` : '-'}.`, '')
   if (info.jsReferenceSize?.status === 'stale') lines.push('JS reference for scale: stale (the sizes receipt measured another reference; re-run `tools/sizes.mjs`).', '')
   else if (info.jsReferenceSize) lines.push(`JS reference for scale (${info.jsReferenceSize.method}): ${integer(info.jsReferenceSize.min.bytes)} bytes, ${integer(info.jsReferenceSize.min.gzip9)} gzip-9, ${integer(info.jsReferenceSize.min.brotli11)} Brotli-11.`, '')

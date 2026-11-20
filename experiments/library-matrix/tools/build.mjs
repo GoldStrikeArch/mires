@@ -23,6 +23,8 @@ import {
   repositoryRoot, selectPorts, sha256, sourceInventory, usageError, walkFiles, writeJson,
 } from './lib/registry.mjs'
 
+import { hasComponents, compositeBuilder } from './lib/composite.mjs'
+
 const USAGE = 'usage: node tools/build.mjs --library <id,...|all> --language <id,...|all> [--clean] [--timeout 1200] [--matrix <registry>] [--receipts <dir>]'
 const fail = (message) => usageError('build.mjs', USAGE, message)
 const options = parseOptions(process.argv.slice(2), { tool: 'build.mjs', usage: USAGE, known: ['library', 'language', 'clean', 'timeout', 'matrix', 'receipts'] })
@@ -89,7 +91,9 @@ async function buildPort(port) {
     movedAside = repoPath(aside)
   }
 
-  const command = [process.execPath, language.builderPath, '--port', port.dir, '--work', workDir]
+  const command = hasComponents(port)
+    ? [process.execPath, compositeBuilder, '--port', port.dir, '--work', workDir, '--matrix', registry.path, '--receipts', paths.root]
+    : [process.execPath, language.builderPath, '--port', port.dir, '--work', workDir]
   const startedAt = new Date().toISOString()
   const started = process.hrtime.bigint()
   process.stdout.write(`BUILD ${port.key} (${language.label})\n`)

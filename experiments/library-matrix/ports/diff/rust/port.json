@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "diff",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_diff",
+  "boundary": "Reads input tokens and patch metadata, runs the Rust Myers differ and unified patch routines, and returns JSON-safe arrays, objects, strings, or false."
+}

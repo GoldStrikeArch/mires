@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "d3-hierarchy",
+  "language": "scalajs",
+  "boundary": "Reads nested records or flat stratification rows. The port language constructs the tree, applies a layout, and returns node fields and exact coordinates as arrays."
+}

@@ -1,0 +1,18 @@
+open Js_of_ocaml
+type value=Js.Unsafe.any
+let box=Js.Unsafe.inject
+let nil=box Js.null
+let str s=box(Js.string s)
+let obj()=box(Js.Unsafe.obj [||])
+let array()=box(Js.array [||])
+let get v k=Js.Unsafe.get v k
+let set v k x=Js.Unsafe.set v k x
+let at v i=Js.Unsafe.get v i
+let length v:int=Js.Unsafe.get v "length"
+let meth v k args=Js.Unsafe.meth_call v k args
+let scoped scope name args=meth(Js.Unsafe.get Js.Unsafe.global scope)name args
+let push v x=ignore(meth v "push" [|x|])
+let json v=scoped "JSON" "stringify" [|v|]
+let parse v=scoped "JSON" "parse" [|v|]
+let join v x=meth v "join" [|x|]
+let int n=box (Js.number_of_float (float_of_int n))

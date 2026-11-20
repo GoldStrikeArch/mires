@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "jmespath",
+  "language": "scalajs",
+  "boundary": "The target compiles expressions with a Pratt parser and visits the AST against JSON values."
+}

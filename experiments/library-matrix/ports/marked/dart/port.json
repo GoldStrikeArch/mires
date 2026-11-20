@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "marked",
+  "language": "dart",
+  "entry": "src/main.dart",
+  "boundary": "run(input: InputJson) reads { op, markdown, options } directly over dart:js_interop extension types (no copy, realm-safe): strings cross as JS strings (Dart String on web, UTF-16, zero conversion) and options into a Dart MarkedOptions value class. Outputs return the rendered HTML Dart String as a JSString via .toJS (cast in dart2js). main() publishes run on globalThis.__matrixExports for the generated facade."
+}

@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "long",
+  "language": "kotlin",
+  "boundary": "External Kotlin interfaces provide typed views of JS command records and word arrays. A call returns the command results joined with newlines."
+}

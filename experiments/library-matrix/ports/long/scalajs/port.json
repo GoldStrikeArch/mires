@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "long",
+  "language": "scalajs",
+  "boundary": "Scala.js native facade traits read command records and word arrays. A call returns the command results joined with newlines."
+}

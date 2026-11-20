@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "diff",
+  "language": "jsoo",
+  "entry": "src/main.ml",
+  "boundary": "The OCaml differ and unified patch code share UTF-8 byte strings. The host converts native JS values, supplies lowercase/JSON operations and preserves JS property order."
+}

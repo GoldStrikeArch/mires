@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "idb",
+  "language": "jsoo",
+  "entry": "src/main.ml",
+  "boundary": "Wraps browser IndexedDB requests and transaction completion events and resolves JSON arrays of their outcomes."
+}

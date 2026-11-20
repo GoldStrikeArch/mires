@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "workbox",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "Browser CacheStorage, Fetch and service-worker events are used for revisioned precaching, routing and runtime strategies."
+}

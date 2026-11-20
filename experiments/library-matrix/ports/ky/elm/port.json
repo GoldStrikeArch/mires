@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "ky",
+  "language": "elm",
+  "main": "src/Main.elm",
+  "host": "js/index.js",
+  "boundary": "Dispatches native Fetch objects through an injected transport and resolves JSON results and hook traces."
+}

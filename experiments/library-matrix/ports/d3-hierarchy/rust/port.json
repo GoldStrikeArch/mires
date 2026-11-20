@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "d3-hierarchy",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "matrix_d3_hierarchy",
+  "boundary": "Reads records through mires-js and returns arrays of node fields and exact coordinates. The hierarchy and all layouts run in Rust."
+}

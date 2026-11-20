@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "noble-hashes",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "Decode byte arrays, feed native incremental hash states and return a lowercase hexadecimal digest."
+}

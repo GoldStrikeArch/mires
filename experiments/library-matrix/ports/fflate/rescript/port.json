@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "fflate",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "run(input): the input is typed as records and @tag(\"op\")/@tag(\"action\") variants whose runtime representation is the JSON value itself (zero input conversion); string payloads decode via fflate's strToU8 and byte arrays via Uint8Array.fromArray; one-shot byte ops return raw Uint8Array directly, strFromU8 encodes UTF-16LE bytes, streaming ops frame ondata chunks, and expectErrorCode catches FlateError into Uint8Array([0xff, code])."
+}

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "diff",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "Native ReScript Myers paths, token policies and unified patch processing with JSON and UTF-8 string bindings."
+}

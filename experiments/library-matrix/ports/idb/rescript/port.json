@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "idb",
+  "language": "rescript",
+  "entry": "src/Index.res",
+  "boundary": "Wraps browser IndexedDB requests and transaction completion events and resolves JSON arrays of their outcomes."
+}

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "long",
+  "language": "dart",
+  "entry": "src/main.dart",
+  "boundary": "dart:js_interop reads command arrays and their two-word operands. A call returns the command results joined with newlines."
+}

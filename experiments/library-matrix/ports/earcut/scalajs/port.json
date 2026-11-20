@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "library": "earcut",
+  "language": "scalajs",
+  "boundary": "Scala.js native facade traits and js.Array expose the input directly. The named ES module export returns JS arrays, numbers and objects."
+}

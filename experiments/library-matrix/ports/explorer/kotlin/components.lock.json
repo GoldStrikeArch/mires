@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "language": "kotlin",
+  "linker": {
+    "experiments/library-matrix/languages/composite/build.mjs": "5ff0a7be84664b63a9959dac3af9b840ad4ddb7c8e9dfb70c881cdf1c1362e91",
+    "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
+  },
+  "sources": {
+    "idb": "d2b25b34cb45db89ffe50f9b2e9ce82f8d788c9bad41772eb4f1021dfa6ab332",
+    "minisearch": "746e446913e3631a1a7ff29b93e031fc15c2f392cdc2f856d83e45f82c3f71aa",
+    "marked": "5ba5da5107700c943fe4a5086bb1feeaa2c93d1c657583a3a806b0978043b01b",
+    "fflate": "6895ee3ada6ecfb4e85bdb0062fc7c4f0fb40b364c9c30c6be07ebcb384502c4",
+    "uplot": "7e0ee0b9c1ba6add765470d8506658f4a9ef95063a68eb027f891b5c15d7f3d7"
+  },
+  "toolchain": {
+    "gradle": "9.4.1",
+    "kotlinGradlePlugin": "2.4.10",
+    "java": "openjdk version \"21.0.13.0.3\" 2026-10-24 | OpenJDK Runtime Environment Homebrew (build 21.0.13.0.3) | OpenJDK 64-Bit Server VM Homebrew (build 21.0.13.0.3, mixed mode, sharing)",
+    "terser": "5.31.6"
+  },
+  "artifacts": {
+    "idb": {
+      "readable": "6225b8e25e4510bea5616ca6dc8dd6eb3b3b44552c4ab3375e78be759b4fd407",
+      "production": "7375df81b3abce35e009dcbb002308c16ed30d048befb84607598c9db9f49405"
+    },
+    "minisearch": {
+      "readable": "19abdeb52ff0b0f13760a8e21637457c8584e5f2086aab53574b929b82bc488a",
+      "production": "eb5592056ae527f9fef6ef0ec94c7bbf091ad8166bb14127d720a86aec6e923d"
+    },
+    "marked": {
+      "readable": "0697a1bb94630003856a6b03c00548ca4bb59dd86789995ad32fb7817cc1471c",
+      "production": "c947a140aff3b3c9921ca1f6541d29a21fa51fa90aa17227fca5667b5e8baa72"
+    },
+    "fflate": {
+      "readable": "f587115510df78513c141be11595e03e5829d489846529f5beb1b1f5a936c248",
+      "production": "3b42049b778f866c4ef150251667e9e90cc92cfc7b2cf40606bc6ea90ae2ee61"
+    },
+    "uplot": {
+      "readable": "49f7c4b436fc6bfa1fba6312e0c4e426798589b19f74cd43145bdebcaba25eea",
+      "production": "e6f06025446b4b0e97fda23395e20a7cfa86eae01aaf35b44a179888a30200d4"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "library": "noble-hashes",
+  "language": "melange",
+  "entry": "src/index.ml",
+  "boundary": "Decode byte arrays, feed native incremental hash states and return a lowercase hexadecimal digest."
+}

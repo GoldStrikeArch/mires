@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "library": "explorer",
+  "language": "kotlin",
+  "boundary": "The native driver consumes database, search, rendering, compression and chart results. The bundle links the five components compiled for this language.",
+  "components": [
+    "idb",
+    "minisearch",
+    "marked",
+    "fflate",
+    "uplot"
+  ]
+}

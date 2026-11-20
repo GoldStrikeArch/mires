@@ -1,0 +1,13 @@
+# JMESPath 0.16.0
+
+The input carries a JSON document in `data` and a sequence of queries. Each query names the `search` or `compile` operation and supplies an expression. `search` evaluates it against the document. `compile` returns the package's complete Pratt-parser AST, including its property order, slice arguments and expression-reference nodes. Each result has a `value` field on success or an `error` field with the JMESPath error category. One failing expression does not interrupt the remaining queries. The matrix compares the complete result arrays.
+
+The corpus exercises all 26 built-in functions and includes every correctness case in revision `53abcc37901891cf4308fcd910eab287416c4609` of the official compliance suite. Each case runs as both a search and an AST compilation. Its independent expected search result is preserved in the corpus. The reference uses the unmodified CommonJS source from the npm package, wrapped by the harness postinstall step for ES module loading. [Compliance fixtures](https://github.com/jmespath/jmespath.test/tree/53abcc37901891cf4308fcd910eab287416c4609/tests)
+
+The benchmark evaluates 100 expressions over 1,024 records. Both sides parse each expression once during its search call. Version 0.16.0 exports `compile` and `search`, while its public search entry takes an expression string. The variant rotates the records and adds a fixed-width call number to every name and detail. Record counts and queries stay fixed across calls.
+
+A search can return part of the input object directly. Firefox WebDriver supplies those objects from a different JavaScript realm. The harness normaliser copies plain records and arrays into the checking realm and preserves property order, undefined, NaN and signed zero. With prototype-identity checking alone, the npm reference failed its own output check on 46 corpus groups in Firefox.
+
+The fixed suite has 892 search assertions. Nine differ from the pinned JS release. Four cross-type comparisons use JavaScript coercion, the average of an empty list yields NaN, and the two empty min/max-by operations yield undefined. The malformed call `@(foo)` reports an unknown function, and `[:::]` returns null for the fixture's non-array input. The verification script checks the npm behavior at those nine named expressions and uses the official expected values at every other assertion.
+
+Run `node verify.mjs <language>` from this directory after building a port. The verifier also compares 5,600 generated search and compile results and 9,204 cross-type comparisons and function calls, including hexadecimal, binary and octal numeric strings.
