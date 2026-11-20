@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Writes corpus.json for the fflate library: every case is built deterministically (no clock, no
-// Math.random: all pseudo-random data uses mulberry32 with fixed seeds), so corpus.json is a pure
-// function of this script. CONTRACT.md documents every case.
+// Math.random: pseudo-random data uses mulberry32 with fixed seeds, and the 1 MiB word-salad text a
+// fixed-seed LCG), so corpus.json is a pure function of this script. CONTRACT.md documents every
+// case.
 //
 //   node libraries/fflate/generate-corpus.mjs            # writes corpus.json
 //   node libraries/fflate/generate-corpus.mjs --verify   # also runs reference.mjs on every case,
@@ -416,6 +417,77 @@ function makeInvalidDistBackrefStream() {
   bw.writeRev(0, 5) // dsym 0 (distance 1 > bt=0)
   bw.writeRev(0, 7) // EOB
   return bw.finish()
+}
+
+// One final dynamic block holding `n` literal 'a' (97) as 1-bit codes, so the run is far longer
+// than fflate's output buffer: `inflt` grows the buffer (`cbuf(bt + 131072)`) only at block start
+// and before a back-reference, and drops every literal stored past its end (`buf[bt++] = sym` on a
+// Uint8Array). Without `backref`: lit/len lengths {97: 1, 256: 1} via a code-length tree {1: 1,
+// 18: 1} (the final 18 writes 11 zero lengths from index 257, overrunning `tl = 258`, which `inflt`
+// ignores), then n zero bits and EOB. With `backref`: lit/len {97: 1, 256: 2, 257: 2} and one
+// distance code (symbol 0, distance 1) via a code-length tree {0, 1, 2, 18: 2 bits each}; the run
+// is followed by one length-3 copy at distance 1 that grows the buffer past `bt`, so the dropped
+// positions read back as the new buffer's zeros.
+function makeLiteralRunDeflate(n, backref) {
+  const bw = bitWriter()
+  bw.write(1, 1) // BFINAL
+  bw.write(2, 2) // BTYPE = 2 (dynamic)
+  bw.write(backref ? 1 : 0, 5) // HLIT: 257 or 258 lit/len lengths
+  bw.write(0, 5) // HDIST: 1 distance length
+  bw.write(14, 4) // HCLEN: 18 code-length lengths (clim[0..17])
+  const clim = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+  const cl = backref ? { 0: 2, 1: 2, 2: 2, 18: 2 } : { 1: 1, 18: 1 }
+  for (let k = 0; k < 18; k++) bw.write(cl[clim[k]] || 0, 3)
+  if (backref) {
+    // canonical code-length codes: 0 -> 00, 1 -> 01, 2 -> 10, 18 -> 11
+    bw.writeRev(3, 2); bw.write(86, 7) // 97 zeros (0..96)
+    bw.writeRev(1, 2) // 97 ('a'): 1
+    bw.writeRev(3, 2); bw.write(127, 7) // 138 zeros (98..235)
+    bw.writeRev(3, 2); bw.write(9, 7) // 20 zeros (236..255)
+    bw.writeRev(2, 2) // 256: 2
+    bw.writeRev(2, 2) // 257: 2
+    bw.writeRev(1, 2) // distance symbol 0: 1
+    // lit/len codes: 'a' -> 0, 256 -> 10, 257 -> 11; distance symbol 0 -> 0
+    for (let i = 0; i < n; i++) bw.writeRev(0, 1)
+    bw.writeRev(3, 2) // 257: length 3
+    bw.writeRev(0, 1) // distance 1
+    bw.writeRev(2, 2) // EOB
+  } else {
+    // canonical code-length codes: 1 -> 0, 18 -> 1
+    bw.writeRev(1, 1); bw.write(86, 7) // 97 zeros (0..96)
+    bw.writeRev(0, 1) // 97 ('a'): 1
+    bw.writeRev(1, 1); bw.write(127, 7) // 138 zeros (98..235)
+    bw.writeRev(1, 1); bw.write(9, 7) // 20 zeros (236..255)
+    bw.writeRev(0, 1) // 256: 1
+    bw.writeRev(1, 1); bw.write(0, 7) // 11 zeros from 257 (distance lengths; overrun ignored)
+    // lit/len codes: 'a' -> 0, 256 -> 1
+    for (let i = 0; i < n; i++) bw.writeRev(0, 1)
+    bw.writeRev(1, 1) // EOB
+  }
+  return bw.finish()
+}
+
+// Concatenation of `n` one-line GZIP members ('m0', 'm1', ...): `Gunzip.push` recurses once per
+// member, so a single final push of this input nests `n` calls.
+function makeMultiMemberGzip(n) {
+  const parts = []
+  for (let i = 0; i < n; i++) parts.push(gzipSync(strToU8(`m${i}`), { mtime: 0 }))
+  return concatBytes(...parts)
+}
+
+// Word-salad text from a 32-bit LCG (x = x * 1103515245 + 12345) over a fixed word list with
+// ASCII, 2-, 3- and 4-byte UTF-8 words: the 2026-11-20 review's large-input probe text, kept
+// byte-identical here so `zlib-1mb-l1-mem12` equals the probe that every port passed.
+function makeWordSaladText(n, seed) {
+  const words = ['alpha', 'beta', 'gamma', 'delta', '{"id":', '"event":"click"', '<div class="x">', '</div>', 'ERROR', 'info', 'été', '€', '\n', ' ', 'the', 'and', '12345', '\u{1F600}']
+  let x = seed >>> 0
+  let s = ''
+  while (s.length < n) {
+    x = (Math.imul(x, 1103515245) + 12345) >>> 0
+    s += words[(x >>> 16) % words.length]
+    if ((x & 0xff) < 9) s += String.fromCharCode(33 + ((x >>> 8) % 90))
+  }
+  return s.slice(0, n)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -942,7 +1014,43 @@ add('err-uncaught-invalid-gzip', 'Uncaught FlateError on invalid gzip data (exer
   data: { bytes: [0xde, 0xad, 0xbe, 0xef] },
 })
 
-// 11. Bench cases (2)
+// 11. Output-buffer growth, GZIP member count, and a 1 MiB input (6)
+const literalRun = makeLiteralRunDeflate(200000, false)
+const literalRunBackref = makeLiteralRunDeflate(200000, true)
+add('inflate-literal-run-200k', 'inflateSync on one dynamic block of 200,000 literals: buffer sl*3 grows once at block start, literals past its end are dropped (150,084 bytes)', {
+  op: 'inflateSync',
+  data: latin1Payload(literalRun),
+})
+add('decompress-literal-run-200k', 'decompressSync (raw DEFLATE path) on the same 200,000-literal block', {
+  op: 'decompressSync',
+  data: latin1Payload(literalRun),
+})
+// Split so the first push already runs past the 131,072-byte stream buffer: st.b overshoots the
+// buffer, the emitted chunk and the kept 32 KiB window are clamped to it, and decoding resumes.
+add('stream-inflate-literal-run-200k', 'Inflate on the 200,000-literal block in two pushes; the first runs past the 131,072-byte buffer mid-block', {
+  op: 'Inflate',
+  steps: [
+    { action: 'push', data: latin1Payload(literalRun.subarray(0, 18000)) },
+    { action: 'push', data: latin1Payload(literalRun.subarray(18000)), final: true },
+  ],
+})
+add('inflate-literal-run-200k-backref', 'inflateSync on 200,000 literals then one length-3 distance-1 copy: the copy grows the buffer past bt, dropped literals read as zeros', {
+  op: 'inflateSync',
+  data: latin1Payload(literalRunBackref),
+})
+const gzip1000 = makeMultiMemberGzip(1000)
+add('stream-gunzip-1000-members', 'Gunzip on 1,000 concatenated GZIP members in one final push (1,000 nested push calls; the parity-domain bound)', {
+  op: 'Gunzip',
+  steps: [{ action: 'push', data: latin1Payload(gzip1000), final: true }],
+})
+const salad1m = makeWordSaladText(1 << 20, 3)
+add('zlib-1mb-l1-mem12', 'zlibSync level 1, mem 12 (plvl 24) on 1 MiB of word-salad text (1,119,186 UTF-8 bytes): many blocks, window wraps, Adler-32 over 1 MB', {
+  op: 'zlibSync',
+  data: { text: salad1m },
+  options: { level: 1, mem: 12 },
+})
+
+// 12. Bench cases (2)
 add('bench-compress', 'Benchmark: gzipSync (level 6, mtime 0) on ~64 KB realistic mixed-entropy JSON/HTML/log/prose text', {
   op: 'gzipSync',
   data: { text: benchCompressText },
@@ -1144,7 +1252,47 @@ if (process.argv.includes('--verify')) {
     errors++
   }
 
-  // 11. Verify bench cases, ratios, timings, and bench-variant distinctness & equivalence
+  // 11. Verify the buffer-growth cases drop literals, and the shape of the other section-11 cases
+  {
+    const out = (id) => run(cases.find((c) => c.id === id).input)
+    const frames = (u8) => {
+      const fs = []
+      for (let o = 0; o < u8.length; o += 5 + fs[fs.length - 1].len) {
+        fs.push({ len: (u8[o] | (u8[o + 1] << 8) | (u8[o + 2] << 16) | (u8[o + 3] << 24)) >>> 0, final: u8[o + 4] })
+      }
+      return fs
+    }
+    // inflateSync: buf = sl * 3, grown at block start to max(2 * sl * 3, bt + 131072)
+    const lit = out('inflate-literal-run-200k')
+    const litCap = Math.max(6 * literalRun.length, 131072)
+    if (lit.length !== litCap || litCap >= 200000 || !lit.every((b) => b === 97)) {
+      console.error(`FAIL: inflate-literal-run-200k length ${lit.length}, expected ${litCap} 'a' bytes (< 200000)`)
+      errors++
+    }
+    if (sha(out('decompress-literal-run-200k')) !== sha(lit)) { console.error('FAIL: decompress-literal-run-200k differs from inflateSync'); errors++ }
+    const br = out('inflate-literal-run-200k-backref')
+    const brCap = Math.max(6 * literalRunBackref.length, 131072)
+    if (br.length !== 200003 || !br.subarray(0, brCap).every((b) => b === 97) || !br.subarray(brCap).every((b) => b === 0)) {
+      console.error(`FAIL: inflate-literal-run-200k-backref expected ${brCap} 'a' then ${200003 - brCap} zeros, got length ${br.length}`)
+      errors++
+    }
+    const st = frames(out('stream-inflate-literal-run-200k'))
+    const stTotal = st.reduce((a, f) => a + f.len, 0)
+    if (st.length !== 2 || st[0].len !== 131072 || st[0].final !== 0 || st[1].final !== 1 || stTotal >= 200000) {
+      console.error(`FAIL: stream-inflate-literal-run-200k frames ${JSON.stringify(st)}`)
+      errors++
+    }
+    const gz = frames(out('stream-gunzip-1000-members'))
+    if (gz.length !== 1002 || gz.slice(0, -1).some((f) => f.final !== 0) || gz[1001].final !== 1) {
+      console.error(`FAIL: stream-gunzip-1000-members emitted ${gz.length} chunks (expected 1,000 members + (empty, false) + (empty, true))`)
+      errors++
+    }
+    const saladBytes = strToU8(salad1m).length
+    if (saladBytes < 1000000 || !salad1m.isWellFormed()) { console.error(`FAIL: zlib-1mb-l1-mem12 input ${saladBytes} B, well-formed ${salad1m.isWellFormed()}`); errors++ }
+    console.log(`buffer growth: inflate ${lit.length}B (cap ${litCap}), backref ${br.length}B (${brCap} 'a'), stream frames ${st.map((f) => f.len).join('+')}; gunzip members -> ${gz.length} chunks; salad ${saladBytes}B`)
+  }
+
+  // 12. Verify bench cases, ratios, timings, and bench-variant distinctness & equivalence
   for (const id of ['bench-compress', 'bench-decompress']) {
     const c = cases.find((x) => x.id === id)
     const baseOut = run(c.input)

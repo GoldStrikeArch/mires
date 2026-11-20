@@ -5,7 +5,7 @@ subset in `libraries/fflate/CONTRACT.md` to Kotlin/JS 2.4.10 (the harness's Grad
 whole-program ES module, ES2015, production DCE and member minimisation, followed by 2-pass Terser).
 It reproduces `node_modules/fflate/esm/browser.js` algorithm by algorithm with zero `js("…")`, zero
 `eval`, zero host JS, and zero module-state lint findings. It reaches exact bit-for-bit parity on
-all 83 corpus cases in Node, Chrome, and Firefox (both `dist/index.min.js` and `dist/index.js`), and
+all 89 corpus cases in Node, Chrome, and Firefox (both `dist/index.min.js` and `dist/index.js`), and
 passes 1,490+ randomized and targeted edge-case differential checks against `reference.mjs`.
 
 | File | What it is |
@@ -48,6 +48,10 @@ passes 1,490+ randomized and targeted edge-case differential checks against `ref
   `dt >>= lft` debt rollback, `lc` empty distance tree `{ c: [0], n: 1 }`, `wblk` stored/fixed tie
   order and initial `bs = 0`, `dflt` rarest-2-byte jump and `i < s + lst` level-0 trailing empty
   block, `inflt` zero-padded OOB reads and `outSize` non-resizing truncation vs stored throw,
+  `inflt` output stores that behave like `Uint8Array` stores (a literal past the end of the buffer
+  is dropped while `bt` advances; the buffer grows only for a stored block, at Huffman block start
+  and before a back-reference, so a run of more than 131,072 literals loses its tail as in fflate;
+  before the 2026-11-20 review the port grew the buffer for literals and kept the whole run),
   `Gunzip` recursive single/multi-member emission sequence, `doubleToU32Bits` for GZIP `mtime`
   timestamps above `2^31 - 1`, and `gunzipSync` falling back to a dynamic `null` buffer when
   `gzl(data) < 0` (bit 31 set in the trailer's ISIZE) so corrupt or large trailers decode or throw

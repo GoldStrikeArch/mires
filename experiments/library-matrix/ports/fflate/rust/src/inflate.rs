@@ -110,14 +110,16 @@ fn cbuf(buf: &mut Vec<u8>, needed: usize) {
 
 /// Core DEFLATE decompressor (fflate `inflt`).
 ///
-/// When `buf` is `None`, allocates a fresh growable buffer (`noBuf = true`) and returns a slice
-/// trimmed to `bt`. When `buf` is `Some(v)`:
-/// - If `st.i == 2` (one-shot with `out` / `gunzipSync`), `resize` is `false`: stored-block
-///   overflow returns `FlateError::RangeError`, Huffman overflow silently truncates, and the
-///   returned `Vec<u8>` is truncated to `min(bt, buf.len())` (or untouched on empty-input early
-///   return, matching fflate's `return buf || new u8(0)`).
-/// - If `st.i != 2` (streaming `Inflate`), `resize` is `true` and `buf` grows as needed, returning
-///   the buffer sliced to `st.b`.
+/// When `buf` is `None`, allocates a fresh `sl * 3` buffer (`noBuf = true`). When `buf` is
+/// `Some(v)` and `st.i == 2` (one-shot with `out` / `gunzipSync`), `resize` is `false`:
+/// stored-block overflow returns `FlateError::RangeError` and Huffman overflow silently
+/// truncates. Otherwise (`noBuf`, or streaming `Inflate` with `st.i != 2`) `resize` is `true`:
+/// `buf` grows (`cbuf`) for a stored block, at the start of a Huffman block and before each
+/// back-reference, never for a literal.
+///
+/// In both modes a store past the end is dropped while `bt` advances, as fflate's typed-array
+/// stores are, and the result is truncated to `min(bt, buf.len())` (fflate's `subarray(0, bt)`).
+/// The empty-input early return hands `buf` back untouched (fflate's `return buf || new u8(0)`).
 pub fn inflt(
     dat: &[u8],
     st: &mut InflateState,
@@ -310,11 +312,10 @@ pub fn inflt(
                     return Err(FlateError::Code(2));
                 }
                 if sym < 256 {
-                    if resize && bt >= buf_len {
-                        cbuf(&mut buf, bt + 131072);
-                        buf_len = buf.len();
-                        out_sl = &mut buf;
-                    }
+                    // fflate writes `buf[bt++] = sym` into a `Uint8Array`: a store past the end is
+                    // dropped, but `bt` still advances. The buffer grows only at block start and
+                    // before a back-reference (`cbuf(bt + 131072)`), never for a literal, so a run
+                    // of more than 131072 literals loses its tail even in resize mode.
                     if bt < buf_len {
                         out_sl[bt] = sym as u8;
                     }

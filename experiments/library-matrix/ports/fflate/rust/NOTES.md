@@ -3,8 +3,10 @@
 A faithful port of the synchronous compression, decompression, framing, streaming, and text-codec
 subset defined in `libraries/fflate/CONTRACT.md`: the same algorithms, tables, tie-breaks, error
 codes, and chunk boundaries as `node_modules/fflate/esm/browser.js`, in safe `no_std` Rust
-(`#![deny(unsafe_code)]`, no `js!{}`). It reaches exact bit-for-bit parity on all 83 corpus cases
-in Node, Chrome, and Firefox (both minified and readable artifacts).
+(`#![deny(unsafe_code)]`, no `js!{}`). It reaches exact bit-for-bit parity on all 89 corpus cases
+in Node, Chrome, and Firefox (both minified and readable artifacts). One input class is outside
+what the compiler can run: a GZIP trailer claiming an ISIZE of 128 MiB or more (see "Known compiler
+limit (MIRES-021)").
 
 | File | What it is |
 | --- | --- |
@@ -24,7 +26,15 @@ in Node, Chrome, and Firefox (both minified and readable artifacts).
   distance tree returning `{ c: [0], n: 1 }`), `wblk` (stored wins ties, fixed wins ties over
   dynamic, `bs = 0` on the first block), `dflt` (exact `deo` table, rarest-2-byte jump,
   `i < s + lst` at level 0), `inflt` (zero-padded OOB reads, byte-by-byte RLE, `outSize`
-  semantics), and `Gunzip` (recursive multi-member emission sequence) matches `browser.js`.
+  semantics, typed-array output stores), and `Gunzip` (recursive multi-member emission sequence)
+  matches `browser.js`.
+- **`inflt` output stores behave like `Uint8Array` stores.** fflate writes `buf[bt++] = sym`, so a
+  store past the end of the buffer is dropped while `bt` advances, and the buffer grows (`cbuf`)
+  only for a stored block, at the start of a Huffman block and before a back-reference. The port
+  bounds-checks every store the same way and never grows the buffer for a literal, so a run of more
+  than 131,072 literals in one block loses its tail exactly as in fflate (corpus
+  `inflate-literal-run-200k` and its three siblings). Before the 2026-11-20 review the port grew
+  the buffer for literals too and returned the whole run.
 - **Zero cross-call mutable state.** Only compile-time immutable `static` arrays live at module
   scope (`0` module-state lint findings). `rev15` (4 bitwise ops) and `revfd` (`leading_zeros`)
   are computed in O(1) to avoid emitting 32 KiB static table literals into JS.
@@ -34,16 +44,38 @@ in Node, Chrome, and Firefox (both minified and readable artifacts).
 - **Zero-copy UTF-8 input & bulk byte output.** UTF-8 `{ text }` payloads borrow
   `text.read::<&str>().as_bytes()` directly without copying; outputs return in one bulk host copy
   via `mires_js::JsUint8Array::from_slice`.
-- **Hot-loop slice binding and macro inlining.** Because the matrix builds Rust with
-  `JSC_RUST_MIR_INLINE=off`, slice references (`&[u8]`, `&mut [u8]`, `&mut [u16]`, `&mut [u32]`)
-  are bound outside inner loops (`dflt`, `inflt`, `read_latin1_bytes`, `h_map`) to avoid repeated
-  `Vec` derefs, and the tightest inner-loop bit helpers (`read_bits16!` in `inflt`,
-  `write_bits16!` in `emit_symbols`) are expanded locally.
+- **Performance accommodations for mires (code kept as is).** Three code shapes are there for the
+  compiler, not for Rust; they answer the hot spots logged as performance cliffs
+  [`PERF-002` and `PERF-004`](../../../MIRES-BUGS.md#performance-cliffs):
+  - the `read_bits16!` macro in `inflt` (`src/inflate.rs`) and the `write_bits16!` macro in
+    `emit_symbols` (`src/deflate.rs`) stand in for small `#[inline]` helper functions. The matrix
+    builds with `JSC_RUST_MIR_INLINE=off`, so a helper would stay one JS call per decoded or
+    emitted symbol;
+  - slice references (`&[u8]`, `&mut [u8]`, `&mut [u16]`, `&mut [u32]`) are bound once outside the
+    inner loops of `dflt`, `inflt`, `read_latin1_bytes` and `h_map` instead of indexing the `Vec`s
+    (`PERF-004`, the slice-hoisting rewrite measured on earcut);
+  - loops are written `while i < n { ...; i += 1 }` with explicit indices rather than
+    `for i in 0..n` or iterator chains, so no `Range` or iterator adaptor has to be inlined by a
+    compiler that runs with MIR inlining off. It is not the idiomatic Rust form; `PERF-002`
+    records that the remaining gap to fflate is boxed `Array` storage plus the bounds checks these
+    loops keep.
 
 ## mires bugs and performance cliffs
 
-- **Compiler bugs / refusals met:** none (`339/339` items compiled cleanly: `198` JIR, `141`
-  non-ordinary fallback, `ordinaryFallback: 0`; `83/83` parity across Node, Chrome, and Firefox).
+- **Compile refusals met:** none (`339/339` items compiled cleanly at the original port: `198` JIR,
+  `141` non-ordinary fallback, `ordinaryFallback: 0`). Runtime defects met: one,
+  [`MIRES-021`](../../../MIRES-BUGS.md) (below).
+- **Known compiler limit (`MIRES-021`).** `gunzip_sync` allocates its output as
+  `vec![0u8; ISIZE]` (`src/framing.rs`, `gunzip_sync`), as fflate allocates `new u8(gzl(data))`.
+  Under mires a zeroed `Vec<u8>` is a boxed JS `Array` (`runtime/shim.js` `alloc_zeroed`:
+  `new Array(size).fill(0)`), not a `Uint8Array`. A GZIP whose trailer claims an ISIZE far above
+  the real output therefore fails where fflate returns the decoded bytes: from about 128 MiB the
+  allocation throws `RangeError: Invalid array length`, around 512 MiB Node dies with an
+  uncatchable heap out-of-memory, and from 2 GiB the `Layout` overflow panics. 64 MiB already
+  costs about 1.2 GB of resident memory. The port does not work around it (a smaller or lazily
+  grown buffer would change fflate's `!resize` truncation semantics); such inputs are outside the
+  corpus (`CONTRACT.md`, Parity domain). Repro:
+  [`mires-bugs/MIRES-021-alloc-zeroed-large-array/`](../../../mires-bugs/MIRES-021-alloc-zeroed-large-array/).
 - **Performance cliff logged (`PERF-002` in `MIRES-BUGS.md`):** V8 CPU profiling on
   `bench-compress` + `bench-decompress` shows `16.4%` (`13.3% $rt_alloc_zeroed` + `3.1%
   $rt__retype`) spent double-zeroing `Vec<u8>`/`Vec<u16>`/`Vec<u32>` allocations.

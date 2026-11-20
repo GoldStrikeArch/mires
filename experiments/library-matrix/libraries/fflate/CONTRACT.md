@@ -17,7 +17,7 @@ codecs — and must match `fflate@0.8.3` **bit-for-bit** on every byte of output
 | Output form | `bytes` (`Uint8Array`), synchronous |
 | Normalisation | none |
 | Parity environments | node, chrome, firefox, safari (unavailable on this machine) |
-| Corpus | `corpus.json`, 83 cases, written deterministically by `generate-corpus.mjs` (`--verify` validates all invariants) |
+| Corpus | `corpus.json`, 89 cases, written deterministically by `generate-corpus.mjs` (`--verify` validates all invariants) |
 | Bench cases | `bench-compress`, `bench-decompress`; `baseIterations` 1; variant `bench-variant.mjs` (k-seeded ASCII letter bijection on plaintext; re-compressed at level 6 for `bench-decompress`) |
 | Caching | Immutable lookup tables computed at module load (`fleb`, `fdeb`, `clim`, `fl`, `revfl`, `fd`, `revfd`, `rev`, `flt`, `fdt`, `flm`, `flrm`, `fdm`, `fdrm`, `deo`, `crct`); no cross-call mutable state or input memoisation |
 | Files | none: neither the adapter nor a port reads files at run time |
@@ -294,7 +294,10 @@ Exact tie-breaks here determine compressed output bytes bit-for-bit:
           flush block via `wblk(dat, w, 0, syms, lf, df, eb, li, bs, i - bs, pos)`, reset `li = lc = eb = 0`,
           `bs = i`, clear `lf[0..286]` and `df[0..30]`.
         - Search hash chain: `l = 2, d = 0, ch = c, dif = (imod - pimod) & 32767`.
-          If `rem > 2 && i >= dif && hv == hsh(i - dif)`:
+          If `rem > 2 && hv == hsh(i - dif)` (line 671; there is no `i >= dif` test: when `dif > i`,
+          `hsh(i - dif)` reads `dat` at negative indices, `undefined`, which the XOR turns into `0`,
+          and the chain loop below cannot run because `maxd = min(32767, i) < dif`, so a
+          bounds-checked port may test `i >= dif` first with the same result):
           `maxn = min(n, rem) - 1`, `maxd = min(32767, i)`, `ml = min(258, rem)`.
           While `dif <= maxd && --ch != 0 && imod != pimod`:
           - If `dat[i + l] == dat[i + l - dif]`:
@@ -321,13 +324,14 @@ Exact tie-breaks here determine compressed output bytes bit-for-bit:
 - Early return: if `sl == 0 || (st.f != 0 && !st.l)`, return `buf || new u8(0)` (note: when `sl == 0`
   and `buf` was provided via `outSize`, the full zero-filled `buf` is returned!).
 - `noBuf = !buf`, `resize = noBuf || st.i != 2`, `noSt = st.i` (`0` = non-final stream chunk, `1` = final stream chunk, `2` = one-shot sync).
-- When `noBuf`, allocate `buf = new u8(sl * 3)`. Helper `cbuf(l)` grows `buf` to `max(buf.length * 2, l)`.
+- When `noBuf`, allocate `buf = new u8(sl * 3)`. Helper `cbuf(l)` grows `buf` to `max(buf.length * 2, l)` when `l > buf.length`
+  (new bytes zero). `inflt` calls it only in resize mode, and only at the three places marked below.
 - `tbts = sl * 8`. Loop `do { ... } while (!final)`:
   - If `!lm`:
     - `final = bits(dat, pos, 1)`, `type = bits(dat, pos + 1, 3)`, `pos += 3`.
     - `type == 0` (stored): `s = shft(pos) + 4`, `l = dat[s - 4] | (dat[s - 3] << 8)` (OOB reads are 0; NLEN is NOT checked), `t = s + l`.
       If `t > sl`: if `noSt != 0` throw `err(0)` else break.
-      If `resize`, `cbuf(bt + l)`; else if `bt + l > buf.length` throw `RangeError` (matching JS `TypedArray.prototype.set`).
+      If `resize`, `cbuf(bt + l)` (line 261); else if `bt + l > buf.length` throw `RangeError` (matching JS `TypedArray.prototype.set`).
       Copy `dat[s..t]` into `buf[bt..bt+l]`; `st.b = bt += l; st.p = pos = t * 8; st.f = final; continue`.
     - `type == 1` (fixed): `lm = flrm, dm = fdrm, lbt = 9, dbt = 5`.
     - `type == 2` (dynamic): read `hLit = bits(dat, pos, 31) + 257`, `hDist = bits(dat, pos + 5, 31) + 1`,
@@ -337,12 +341,21 @@ Exact tie-breaks here determine compressed output bytes bit-for-bit:
       and `dm = hMap(dt, max(dt), 1)`.
     - `type == 3`: throw `err(1)` (`InvalidBlockType`).
     - If `pos > tbts`: if `noSt != 0` throw `err(0)` else break (leaving `st.l/p/b/f` untouched so the next chunk re-reads the block header).
-  - Decode symbols: if `resize`, `cbuf(bt + 131072)`. `lms = (1 << lbt) - 1`, `dms = (1 << dbt) - 1`, `lpos = pos`.
+  - Decode symbols: if `resize`, `cbuf(bt + 131072)` (line 331). `lms = (1 << lbt) - 1`, `dms = (1 << dbt) - 1`, `lpos = pos`.
     Loop (`lpos = pos` each iteration):
     - `c = lm[bits16(dat, pos) & lms]`, `sym = c >> 4`, `pos += c & 15`.
     - If `pos > tbts`: if `noSt != 0` throw `err(0)` else break.
     - If `c == 0`: throw `err(2)` (`InvalidLengthLiteral`).
-    - If `sym < 256`: write `buf[bt] = sym` (if `!resize && bt >= buf.length`, silent no-op), `bt++`.
+    - If `sym < 256`: `buf[bt++] = sym` (line 346). `buf` is a `Uint8Array`, so a store at
+      `bt >= buf.length` is dropped while `bt` still advances, **in both modes**: the buffer grows
+      only through `cbuf`, which runs for a stored block (line 261), at the start of a Huffman block
+      or of a block resumed from `st` (line 331), and before each back-reference (line 376), never
+      for a literal. More than 131,072 literals after the last `cbuf` therefore lose their tail:
+      `inflateSync` of one 200,000-literal block returns `max(2 * sl * 3, 131072)` bytes (150,084
+      for `inflate-literal-run-200k`), and a stream emits at most the 131,072-byte buffer
+      (`stream-inflate-literal-run-200k`). When a later `cbuf` grows the buffer past `bt`, the
+      dropped positions read back as the new buffer's zeros (`inflate-literal-run-200k-backref`).
+      `st.b` keeps the advanced `bt`, so `Inflate.c` clamps its `slc` calls to the returned buffer.
     - Else if `sym == 256`: `lpos = pos; lm = null; break`.
     - Else (`sym > 256`):
       - `add = sym - 254`; if `sym > 264`: `i = sym - 257; b = fleb[i]; add = bits(dat, pos, (1 << b) - 1) + fl[i]; pos += b`.
@@ -352,7 +365,7 @@ Exact tie-breaks here determine compressed output bytes bit-for-bit:
         distance trees can emit `dsym == 31`, making `fd[31]` `undefined` → `dt = NaN`, so `bt < dt` is
         false and the copy loop fills `buf[bt..end]` with `0`.)
       - If `pos > tbts`: if `noSt != 0` throw `err(0)` else break.
-      - If `resize`, `cbuf(bt + 131072)`.
+      - If `resize`, `cbuf(bt + 131072)` (line 376).
       - `end = bt + add`.
       - If `bt < dt`: `shift = dl - dt` (signed), `dend = min(dt, end)`; if `shift + bt < 0`, throw `err(3)`;
         copy `dict[shift + bt]` into `buf[bt]` for `bt < dend` (ignoring OOB writes when `!resize`).
@@ -443,6 +456,16 @@ Exact tie-breaks here determine compressed output bytes bit-for-bit:
     `ondata(slc(dt, bts, s.b), d);`
     `o = slc(dt, s.b - 32768); s.b = o.length;`
     `p = slc(p, s.p >> 3); s.p &= 7`.
+  - **Empty push before any output.** `e` keeps `p` empty for an empty chunk (line 1170), so `c`
+    calls `inflt` with no input, whose early return hands back `o` itself: the whole 32,768-byte
+    initial buffer. `c` emits an empty chunk, then `o = slc(dt, s.b - 32768)` keeps all 32,768 bytes
+    and sets `s.b = 32768`. Decoding then starts 32,768 bytes into a zero window: a back-reference
+    before the real output reads zeros instead of throwing `InvalidDistance (3)`, and a dictionary
+    copied into `o` now sits 32,768 bytes back instead of right before the output, so references
+    into it read the zero padding. Once `s.b == o.length` (after any non-empty push) an empty push
+    changes nothing. `Gunzip`, `Unzlib` and `Decompress` reach the same path when their header
+    parse leaves `p` empty. All ports reproduce it; `stream-inflate-1byte-chunks` starts with an
+    empty push, but no corpus stream refers back before its output after one.
 - **`Gunzip`**: wraps `Inflate` with `v = 1, r = 0`.
   - `push(chunk, final)`: `Inflate.e(chunk); r += chunk.length`.
     If `v != 0`: `p = this.p.subarray(v - 1); s = p.length > 3 ? gzs(p) : 4`.
@@ -450,7 +473,8 @@ Exact tie-breaks here determine compressed output bytes bit-for-bit:
     Set `this.p = p.subarray(s); v = 0`.
     Call `Inflate.c(false)`!
     If `this.s.f && !this.s.l` (member finished — enables concatenated multi-member GZIP):
-    `v = shft(this.s.p) + 9; this.s = { i: 0 }; this.o = empty; this.push(empty, final)` (recursive!).
+    `v = shft(this.s.p) + 9; this.s = { i: 0 }; this.o = empty; this.push(empty, final)` (recursive,
+    line 1345: one nested call per member, so the stack bounds the member count; see Parity domain).
     Else if `final`: call `Inflate.c(true)`.
     **Note**: even for a single-member GZIP pushed with `final = true`, `Gunzip` emits the member data
     with `final = false`, then recurses and emits `(empty, false)` and `(empty, true)`. Ports must
@@ -492,6 +516,16 @@ The following inputs are excluded from the contract (no corpus case or bench var
   non-deterministic; every `gzipSync`/`Gzip` case passes an explicit non-negative integer `mtime`
   with `0 <= Math.floor(mtime / 1000) <= 0xFFFFFFFF`.
 - **`filename` with NUL bytes**: `gzipSync`/`Gzip` filenames are Latin-1/ASCII strings without `\u0000`.
+- **More than 1,000 GZIP members in one `Gunzip` input** (also `Decompress` of GZIP). `Gunzip.push`
+  recurses once per member (line 1345), so the member count one push can hold is a stack-depth
+  limit that depends on the engine, its stack size and the caller's depth, not part of fflate's
+  behaviour: npm itself overflows (`RangeError: Maximum call stack size exceeded`) between 6,500
+  and 7,000 members in Node 26. Ports reproduce the recursion (Guidance 5), but their frames
+  differ: the 2026-11-20 review saw Node overflows from about 2,150 members for Rust (mires frames
+  are large), 4,000 for GopherJS and 6,000 for Dart, while Scala.js iterates and succeeds where npm
+  throws. The domain stops at 1,000 members per input, below every port's and npm's limit with
+  room for smaller browser stacks; `stream-gunzip-1000-members` checks the bound. Ports are not
+  required to fail beyond it.
 - **Upstream `fflate@0.8.3` quirks outside the parity domain**:
   1. `Decompress.prototype.push` (lines 1564–1567) forgets `this.p = n` when concatenating after a
      1- or 2-byte non-empty first chunk, dropping subsequent chunks. All `Decompress` cases supply a
@@ -503,13 +537,29 @@ The following inputs are excluded from the contract (no corpus case or bench var
      All corpus `flush(true)` calls occur at `level > 0` with `this.s.r < 8` (and `flush(true)` at
      `level: 0` is excluded from the parity domain).
   3. `Deflate`/`Gzip`/`Zlib` `push` after `final = true` clears `this.s = {}` and `this.b = et`
-     (lines 1082–1083), causing a JS `RangeError` rather than `FlateErrorCode.StreamFinished (4)`.
+     (lines 1082–1083), so `this.s.l` no longer guards and nothing reports
+     `FlateErrorCode.StreamFinished (4)`. A non-empty push then throws a JS `RangeError`
+     (`this.b.set(chunk, ...)` on the empty `et`). An empty push does not throw: with `final` it
+     emits a second final block (`03 00` for `Deflate`; `Gzip` follows it with its running CRC-32
+     and length again, and no header), without `final` it emits nothing. `flush()` after `final`
+     does not throw either: it emits a one-byte block (`02`), and `flush(true)` also the
+     `00 00 00 FF FF` sync marker. All ports match npm on these (2026-11-20 review); they stay
+     outside the corpus.
      Push-after-final `StreamFinished` is tested on `Inflate` (where `this.d` stays `true`).
   4. `deflateSync` with a non-empty `dictionary` on completely incompressible data where `bs = 0`
      causes `wblk` to emit dictionary bytes inside a stored block. All dictionary compression cases
      are compressible or use `level: 0` (where `st.w = dict.length` skips the dictionary cleanly).
   5. Corrupt `inflt` streams with distance symbol `dsym == 31` (JS `fd[31] === undefined` → `NaN`)
      or oversubscribed dynamic code-length trees with `v >= 32768`.
+
+**In the domain, not in the corpus.** A GZIP trailer may claim an ISIZE above the decoded size:
+`gunzipSync` allocates `new u8(ISIZE)` and returns `buf.subarray(0, bt)`, so npm returns the decoded
+bytes whatever the claim, and ports must too. The corpus has no case whose ISIZE (or `outSize`)
+needs a buffer of 64 MiB or more, because every port pays for that allocation on every call
+(64 MiB already costs the Rust port about 1.2 GB of memory). The Rust port cannot run such inputs at
+all from 128 MiB: a zeroed `Vec<u8>` is a boxed JS `Array` under mires, which V8 refuses past 2^27
+elements and which aborts the Node process from about 224 MiB
+([`MIRES-021`](../../MIRES-BUGS.md), a compiler limit, not a port deviation).
 
 ## Bench cases and variants
 
@@ -542,7 +592,7 @@ re-recorded together.
 
 ## Corpus
 
-83 deterministic cases generated by `generate-corpus.mjs`:
+89 deterministic cases generated by `generate-corpus.mjs`:
 
 | Case | Op | What it exercises |
 | --- | --- | --- |
@@ -618,6 +668,12 @@ re-recorded together.
 | `err-code-6-unzlib-short-trailer` | `Unzlib` | `FlateErrorCode.InvalidHeader (6)` on final push with `< 4` trailer bytes |
 | `err-uncaught-invalid-block` | `inflateSync` | uncaught `FlateError` verifying harness `both-threw` parity |
 | `err-uncaught-invalid-gzip` | `gunzipSync` | uncaught `FlateError` verifying harness `both-threw` parity |
+| `inflate-literal-run-200k` | `inflateSync` | one dynamic block of 200,000 one-bit literals (25,014 bytes): `buf = sl * 3` grows once at block start to 150,084 bytes and the literals past it are dropped |
+| `decompress-literal-run-200k` | `decompressSync` | the same block through format detection (raw DEFLATE) |
+| `stream-inflate-literal-run-200k` | `Inflate` | the same block in two pushes: the first overruns the 131,072-byte stream buffer mid-block (`st.b` past the buffer, clamped emit and window), the second resumes the block |
+| `inflate-literal-run-200k-backref` | `inflateSync` | 200,000 literals then one length-3, distance-1 copy: the copy's `cbuf` grows the buffer past `bt`, so the 49,916 dropped literals read back as zeros and the copy repeats one (200,003 bytes) |
+| `stream-gunzip-1000-members` | `Gunzip` | 1,000 concatenated one-line GZIP members in one final push: 1,000 nested `push` calls, the parity-domain bound |
+| `zlib-1mb-l1-mem12` | `zlibSync` | 1 MiB of word-salad text (1,119,186 UTF-8 bytes) at `level: 1`, `mem: 12` (`plvl = 24`, the largest hash table): many blocks, window wraps, Adler-32 over 1 MB |
 | `bench-compress` | `gzipSync` | benchmark: 64 KiB mixed-entropy text, `level: 6`, `mtime: 0` |
 | `bench-decompress` | `gunzipSync` | benchmark: 128 KiB mixed-entropy text compressed at `level: 6` |
 
@@ -632,7 +688,9 @@ a worked reference for every point.
    signed debt clamping & rollback), `lc` (empty `ddt` → `{ c: [0], n: 1 }`), `wblk` (exact `<=`
    vs `<` tie-breaks, `bs = 0` on first block), `dflt` (exact `deo` table, rarest-2-byte jump,
    `i < s + lst` at level 0), and `inflt` (zero-padded OOB reads in `bits`/`bits16`, byte-by-byte
-   RLE copy, silent truncation vs stored `RangeError` when `!resize`) faithfully.
+   RLE copy, silent truncation vs stored `RangeError` when `!resize`, and typed-array stores in
+   both modes: model the buffer's length, grow it only where `cbuf` runs, drop every store past
+   its end) faithfully.
 2. **Unsigned 32-bit shifts.** CRC-32 (`c >>> 8`) and `wbytes` (`v >>>= 8`) require **logical**
    unsigned right shifts; `hTree`'s `dt >>= lft` and `dflt`'s `endLen & -32768` require signed/bit-mask
    semantics. Watch `i32` overflow on `268435456 | (revfl[l] << 18) | revfd[d]` (fits in signed 31-bit

@@ -187,15 +187,11 @@ internal fun infltRaw(
             }
             if (c == 0) throw flateErr(2)
             if (sym < 256) {
-                if (bt < out.size) {
-                    out[bt] = sym.toByte()
-                } else if (resize) {
-                    val nextSize = maxOf(out.size * 2, bt + 131072)
-                    val nbuf = ByteArray(nextSize)
-                    out.copyInto(nbuf, 0, 0, out.size)
-                    out = nbuf
-                    out[bt] = sym.toByte()
-                }
+                // fflate writes `buf[bt++] = sym` into a `Uint8Array`: a store past the end is
+                // dropped, but `bt` still advances. The buffer grows only at block start and before
+                // a back-reference (`cbuf(bt + 131072)`), never for a literal, so a run of more than
+                // 131072 literals loses its tail even in resize mode.
+                if (bt < out.size) out[bt] = sym.toByte()
                 bt++
             } else if (sym == 256) {
                 lpos = pos

@@ -4,7 +4,7 @@ A faithful port of the synchronous compression, decompression, framing, streamin
 subset defined in `libraries/fflate/CONTRACT.md` to Elm 0.19.2: the exact algorithms, tables,
 tie-breaks, error codes, and chunk boundaries of `node_modules/fflate/esm/browser.js`, using only
 the default packages (`elm/core 1.0.5`, `elm/json 1.1.3`). The JS host (`js/index.js`, 27 non-blank
-lines, 1,133 bytes) is host I/O only. It reaches exact bit-for-bit parity on all 83 corpus cases in
+lines, 1,133 bytes) is host I/O only. It reaches exact bit-for-bit parity on all 89 corpus cases in
 Node, Chrome, and Firefox for both minified (`dist/index.min.js`) and readable (`dist/index.js`)
 artifacts.
 
@@ -43,6 +43,16 @@ artifacts.
     a complete `Leaf8` once every 32 bytes. Using positional constructors rather than record-update
     syntax (`{ b | ... }`, which compiles to `_Utils_update`'s `for..in` loop) eliminated 28.9% of
     CPU time in V8 profiling and more than doubled `bench-decompress` speed (33.8 ms → 14.5 ms).
+- **`inflt` output models fflate's buffer, not just its bytes:** inflate output goes to an
+  append-only `ByteBuilder`, while fflate writes into a `Uint8Array` `buf` whose length matters:
+  `buf[bt++] = sym` drops a store past the end while `bt` advances, and the buffer grows (`cbuf`,
+  to `max(2 * length, need)`) only for a stored block, at Huffman block start and before a
+  back-reference. `Inflate.elm` threads that length (`cap`: `sl * 3`, the caller's `outSize`, or
+  the stream window's length) through `decodeSymbols` and keeps the builder equal to
+  `buf[0 .. min(bt, cap)]`; when the buffer grows past `bt`, the dropped positions are filled with
+  the new buffer's zeros. So a run of more than 131,072 literals in one block loses its tail
+  exactly as in fflate. Before the 2026-11-20 review only `outSize`/ISIZE buffers were capped, and
+  resizable ones kept every literal.
 - **Sequential `BitWriter` for deflate output:** Since `dflt`/`wblk`/`wfblk` emit bits strictly
   forward (saving only the 0..7-bit partial byte in `st.r` on non-final stream calls), output is
   built directly onto a reversed `List Int` without allocating or mutating an output byte array.
@@ -92,7 +102,7 @@ Measured against `build/library-matrix/dev-elm/receipts/`:
 
 ## Verification
 
-- **Corpus parity:** `83/83` exact byte-for-byte parity in Node, Chrome, and Firefox for both
+- **Corpus parity:** `89/89` exact byte-for-byte parity in Node, Chrome, and Firefox for both
   `dist/index.min.js` and `dist/index.js` (`check.mjs --environments node,chrome,firefox --readable`).
 - **Beyond the corpus:**
   - Exhaustively verified O(1) `revfd(1..32768)` and `defaultPlvl(0..400000)` against `browser.js`

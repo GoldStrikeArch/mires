@@ -11,7 +11,8 @@ module Inflate exposing
 
 {-| Raw DEFLATE decompressor (`inflt`, `inflateSync`) matching `fflate@0.8.3` bit-for-bit,
 including zero-padded OOB reads, dynamic tree decoding, overlapping RLE back-references, custom
-dictionary lookback, and `outSize` truncation / stored-block bounds behavior.
+dictionary lookback, `outSize` truncation / stored-block bounds behavior, and the output buffer's
+length and growth rule (see OUTPUT BUFFER below).
 -}
 
 import Bitwise
@@ -86,11 +87,14 @@ type InflateBuf
     | StreamBuf Bytes
 
 
+{-| Static configuration of one `decodeSymbols` run. `resize` is fflate's `resize` flag (no
+caller buffer, or a streaming call): only then does the output buffer grow.
+-}
 type alias SymCfg =
     { dat : Bytes
     , tbts : Int
     , noSt : Int
-    , maxLen : Int -- -1 means resizable / unlimited
+    , resize : Bool
     , dict : Bytes
     , dl : Int
     , lm : IntTree
@@ -102,16 +106,18 @@ type alias SymCfg =
     }
 
 
+{-| The `Int` after `bt` is `cap`, the length of fflate's output buffer `buf`.
+-}
 type SymOutcome
-    = BlockDone Int Int ByteBuilder
-    | NeedMore Int Int ByteBuilder
+    = BlockDone Int Int Int ByteBuilder
+    | NeedMore Int Int Int ByteBuilder
     | SymErr FlateError
 
 
 type BlockInit
     = BlockErr FlateError
     | BlockStop ByteBuilder InflateState
-    | BlockContinue InflateState ByteBuilder
+    | BlockContinue InflateState Int ByteBuilder
     | BlockHuffman Int Int IntTree Int IntTree Int
 
 
@@ -119,9 +125,44 @@ type DynTrees
     = DynTrees Int IntTree Int IntTree Int
 
 
+
+-- OUTPUT BUFFER
+--
+-- fflate writes into a `Uint8Array` `buf` of length `cap` with a cursor `bt` that may run past
+-- its end: a store at `bt >= cap` is dropped, but `bt` still advances. The builder holds exactly
+-- `buf[0 .. min(bt, cap)]`, which is also what `inflt` returns (`buf.subarray(0, bt)`). In resize
+-- mode the buffer grows only through `cbuf` (stored blocks, Huffman block start, before each
+-- back-reference), never for a literal, so a long literal run loses its tail.
+
+
+{-| fflate's `cbuf(need)`: a resizable buffer grows to `max(2 * cap, need)` when `need` exceeds it.
+-}
+grownCap : Bool -> Int -> Int -> Int
+grownCap resize need cap =
+    if resize && (need - cap) > 0 then
+        if (cap * 2 - need) > 0 then
+            cap * 2
+
+        else
+            need
+
+    else
+        cap
+
+
+{-| After a growth past `bt`, the positions between the old end of the buffer and `bt` hold the new
+buffer's zeros (the stores fflate dropped there never landed).
+-}
+zeroFillTo : Int -> ByteBuilder -> ByteBuilder
+zeroFillTo bt builder =
+    builderPushRepeatByte 0 (bt - builderLength builder) builder
+
+
+{-| fflate's `buf[bt] = byte`, given that the builder holds `buf[0 .. min(bt, cap)]`.
+-}
 pushCapped : Int -> Int -> ByteBuilder -> ByteBuilder
-pushCapped maxLen byte builder =
-    if maxLen < 0 || (builderLength builder - maxLen) < 0 then
+pushCapped cap byte builder =
+    if (builderLength builder - cap) < 0 then
         builderPushByte byte builder
 
     else
@@ -129,7 +170,7 @@ pushCapped maxLen byte builder =
 
 
 copyDict : Bytes -> Int -> Int -> Int -> Int -> ByteBuilder -> ByteBuilder
-copyDict dict shift maxLen bt dend builder =
+copyDict dict shift cap bt dend builder =
     if (bt - dend) >= 0 then
         builder
 
@@ -138,36 +179,31 @@ copyDict dict shift maxLen bt dend builder =
             b =
                 ByteBuf.getByte (shift + bt) dict
         in
-        copyDict dict shift maxLen (bt + 1) dend (pushCapped maxLen b builder)
+        copyDict dict shift cap (bt + 1) dend (pushCapped cap b builder)
 
 
 copyBackref : Int -> Int -> Int -> Int -> ByteBuilder -> ByteBuilder
-copyBackref dt maxLen bt end builder =
+copyBackref dt cap bt end builder =
     if (bt - end) >= 0 then
         builder
 
     else if dt == 1 then
         let
+            rem =
+                cap - builderLength builder
+
+            want =
+                end - bt
+
             count =
-                if maxLen < 0 then
-                    end - bt
+                if rem <= 0 then
+                    0
+
+                else if (rem - want) < 0 then
+                    rem
 
                 else
-                    let
-                        rem =
-                            maxLen - builderLength builder
-
-                        want =
-                            end - bt
-                    in
-                    if rem <= 0 then
-                        0
-
-                    else if (rem - want) < 0 then
-                        rem
-
-                    else
-                        want
+                    want
 
             b =
                 builderGetByte (bt - 1) builder
@@ -179,11 +215,11 @@ copyBackref dt maxLen bt end builder =
             b =
                 builderGetByte (bt - dt) builder
         in
-        copyBackref dt maxLen (bt + 1) end (pushCapped maxLen b builder)
+        copyBackref dt cap (bt + 1) end (pushCapped cap b builder)
 
 
-decodeSymbols : SymCfg -> Int -> Int -> Int -> ByteBuilder -> SymOutcome
-decodeSymbols cfg pos lpos bt builder =
+decodeSymbols : SymCfg -> Int -> Int -> Int -> Int -> ByteBuilder -> SymOutcome
+decodeSymbols cfg pos lpos bt cap builder =
     let
         c =
             intTreeGet cfg.lmShift (Bitwise.and cfg.lms (getBits16 cfg.dat pos)) cfg.lm
@@ -199,16 +235,16 @@ decodeSymbols cfg pos lpos bt builder =
             SymErr (CodeError 0 "unexpected EOF")
 
         else
-            NeedMore lpos bt builder
+            NeedMore lpos bt cap builder
 
     else if c == 0 then
         SymErr (CodeError 2 "invalid length/literal")
 
     else if sym < 256 then
-        decodeSymbols cfg pos1 pos1 (bt + 1) (pushCapped cfg.maxLen sym builder)
+        decodeSymbols cfg pos1 pos1 (bt + 1) cap (pushCapped cap sym builder)
 
     else if sym == 256 then
-        BlockDone pos1 bt builder
+        BlockDone pos1 bt cap builder
 
     else
         let
@@ -260,12 +296,23 @@ decodeSymbols cfg pos lpos bt builder =
                     SymErr (CodeError 0 "unexpected EOF")
 
                 else
-                    NeedMore lpos bt builder
+                    NeedMore lpos bt cap builder
 
             else
                 let
                     end =
                         bt + add
+
+                    -- `if (resize) cbuf(bt + 131072)` before the copy
+                    cap1 =
+                        grownCap cfg.resize (bt + 131072) cap
+
+                    builder0 =
+                        if (cap1 - cap) == 0 then
+                            builder
+
+                        else
+                            zeroFillTo bt builder
                 in
                 if (bt - dt) < 0 then
                     let
@@ -285,19 +332,19 @@ decodeSymbols cfg pos lpos bt builder =
                                     end
 
                             builder1 =
-                                copyDict cfg.dict shift cfg.maxLen bt dend builder
+                                copyDict cfg.dict shift cap1 bt dend builder0
 
                             builder2 =
-                                copyBackref dt cfg.maxLen dend end builder1
+                                copyBackref dt cap1 dend end builder1
                         in
-                        decodeSymbols cfg pos4 pos4 end builder2
+                        decodeSymbols cfg pos4 pos4 end cap1 builder2
 
                 else
                     let
                         builder1 =
-                            copyBackref dt cfg.maxLen bt end builder
+                            copyBackref dt cap1 bt end builder0
                     in
-                    decodeSymbols cfg pos4 pos4 end builder1
+                    decodeSymbols cfg pos4 pos4 end cap1 builder1
 
 
 readDynamicTrees : Bytes -> Int -> DynTrees
@@ -484,16 +531,17 @@ inflt dat st0 inflBuf maybeDict =
 
     else
         let
-            ( maxLen, initBuilder ) =
+            -- `resize = noBuf || st.i != 2`; `initCap` is the length of the initial `buf`
+            ( resize, initCap, initBuilder ) =
                 case inflBuf of
                     AutoBuf ->
-                        ( -1, emptyBuilder )
+                        ( True, sl * 3, emptyBuilder )
 
                     FixedBuf outSize ->
-                        ( outSize, emptyBuilder )
+                        ( st0.i /= 2, outSize, emptyBuilder )
 
                     StreamBuf initO ->
-                        ( -1, ByteBuf.fromBytes (ByteBuf.slice 0 st0.b initO) )
+                        ( st0.i /= 2, ByteBuf.length initO, ByteBuf.fromBytes (ByteBuf.slice 0 st0.b initO) )
 
             dict =
                 Maybe.withDefault ByteBuf.empty maybeDict
@@ -507,7 +555,7 @@ inflt dat st0 inflBuf maybeDict =
             tbts =
                 sl * 8
 
-            runBlocks st builder =
+            runBlocks st cap builder =
                 let
                     blockInit =
                         case st.l of
@@ -540,19 +588,31 @@ inflt dat st0 inflBuf maybeDict =
                                         else
                                             BlockStop builder st
 
-                                    else if maxLen >= 0 && (st.b + l - maxLen) > 0 then
+                                    else if not resize && (st.b + l - cap) > 0 then
+                                        -- `buf.set(...)` past the end of a caller buffer throws
                                         BlockErr (PlainError "offset is out of bounds")
 
                                     else
                                         let
+                                            -- `if (resize) cbuf(bt + l)`
+                                            cap1 =
+                                                grownCap resize (st.b + l) cap
+
+                                            builder0 =
+                                                if (cap1 - cap) == 0 then
+                                                    builder
+
+                                                else
+                                                    zeroFillTo st.b builder
+
                                             nextBuilder =
-                                                ByteBuf.appendSlice s t dat builder
+                                                ByteBuf.appendSlice s t dat builder0
 
                                             nextSt =
                                                 { st | b = st.b + l, p = t * 8, f = final }
                                         in
                                         if final == 0 then
-                                            BlockContinue nextSt nextBuilder
+                                            BlockContinue nextSt cap1 nextBuilder
 
                                         else
                                             BlockStop nextBuilder nextSt
@@ -596,16 +656,27 @@ inflt dat st0 inflBuf maybeDict =
                     BlockStop outBuilder outSt ->
                         Ok ( builderToBytes outBuilder, outSt )
 
-                    BlockContinue nextSt nextBuilder ->
-                        runBlocks nextSt nextBuilder
+                    BlockContinue nextSt nextCap nextBuilder ->
+                        runBlocks nextSt nextCap nextBuilder
 
                     BlockHuffman final pos lm lbt dm dbt ->
                         let
+                            -- `if (resize) cbuf(bt + 131072)` before decoding symbols
+                            cap1 =
+                                grownCap resize (st.b + 131072) cap
+
+                            builder0 =
+                                if (cap1 - cap) == 0 then
+                                    builder
+
+                                else
+                                    zeroFillTo st.b builder
+
                             cfg =
                                 { dat = dat
                                 , tbts = tbts
                                 , noSt = noSt
-                                , maxLen = maxLen
+                                , resize = resize
                                 , dict = dict
                                 , dl = dl
                                 , lm = lm
@@ -616,22 +687,22 @@ inflt dat st0 inflBuf maybeDict =
                                 , dms = Bitwise.shiftLeftBy dbt 1 - 1
                                 }
                         in
-                        case decodeSymbols cfg pos pos st.b builder of
+                        case decodeSymbols cfg pos pos st.b cap1 builder0 of
                             SymErr err ->
                                 Err err
 
-                            BlockDone nextPos nextBt nextBuilder ->
+                            BlockDone nextPos nextBt nextCap nextBuilder ->
                                 let
                                     nextSt =
                                         { st | l = Nothing, p = nextPos, b = nextBt, f = final }
                                 in
                                 if final == 0 then
-                                    runBlocks nextSt nextBuilder
+                                    runBlocks nextSt nextCap nextBuilder
 
                                 else
                                     Ok ( builderToBytes nextBuilder, nextSt )
 
-                            NeedMore savedLpos nextBt nextBuilder ->
+                            NeedMore savedLpos nextBt _ nextBuilder ->
                                 let
                                     nextSt =
                                         { st
@@ -646,7 +717,7 @@ inflt dat st0 inflBuf maybeDict =
                                 in
                                 Ok ( builderToBytes nextBuilder, nextSt )
         in
-        runBlocks st0 initBuilder
+        runBlocks st0 initCap initBuilder
 
 
 inflateSync : Bytes -> DecompressOptions -> Result FlateError Bytes
