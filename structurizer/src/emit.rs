@@ -196,6 +196,7 @@ impl<'a, S, C> Emitter<'a, S, C> {
             };
             if i + 1 == heads.len() {
                 last_never = never;
+                close_last_case(&mut body, never);
             }
             cases.push((i as u32, Region::seq(body)));
         }
@@ -446,20 +447,27 @@ impl<'a, S, C> Emitter<'a, S, C> {
             Some(&(_, x)) => Ft::Block(x),
             None => ft,
         };
-        let (_, dispatch_code) = self.compile_branch_or_test(branch, stack, dispatch_ft)?;
-        let mut cases = vec![(0, Region::seq(dispatch_code))];
-        let mut last_never = true;
+        let (dispatch_never, dispatch_code) =
+            self.compile_branch_or_test(branch, stack, dispatch_ft)?;
+        let mut cases = vec![(0, dispatch_code)];
+        let mut last_never = dispatch_never;
         for (i, &(case, x)) in ordered.iter().enumerate() {
             let case_ft = match ordered.get(i + 1) {
                 Some(&(_, next)) => Ft::Block(next),
                 None => ft,
             };
             let (never, code) = self.compile_block(x, stack, case_ft)?;
-            if i + 1 == ordered.len() {
-                last_never = never;
-            }
-            cases.push((case, Region::seq(code)));
+            last_never = never;
+            cases.push((case, code));
         }
+        // The last case falls off towards the join, which the trailing `break` reaches.
+        if let Some((_, code)) = cases.last_mut() {
+            close_last_case(code, last_never);
+        }
+        let cases = cases
+            .into_iter()
+            .map(|(case, code)| (case, Region::seq(code)))
+            .collect();
         stack.truncate(depth);
         self.leave();
 
@@ -750,6 +758,19 @@ impl<'a, S, C> Emitter<'a, S, C> {
             },
             r => r,
         }
+    }
+}
+
+/// Ends the last case of a dispatch in a `break` when control can reach its end.
+///
+/// The cases of a [`Region::Dispatch`] fall through into each other, but the last one has no case
+/// after it: a backend prints the `default` guard there, which reports a selector naming no case.
+/// Falling off the last case would run that guard instead of the code after the dispatch, so the
+/// case leaves the `switch` explicitly, onto the trailing `break`, exactly as a [`Region::Switch`]
+/// arm that can reach its end does.
+fn close_last_case(code: &mut Vec<Skeleton>, never: bool) {
+    if !never {
+        code.push(Region::Break(None));
     }
 }
 

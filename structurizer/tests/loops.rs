@@ -350,6 +350,241 @@ fn three_entry_cycle() {
 }
 
 #[test]
+fn dispatch_whose_last_case_reaches_the_join() {
+    // Blocks 2 and 3 form a two entry cycle whose exit, 4, goes on to 5, which
+    // the entry also reaches directly: 5 is the join after the dispatch. Its
+    // last case runs 4 and falls off towards 5. A backend prints a `default`
+    // guard after that case, so the case has to leave the switch with its own
+    // `break` onto the trailing one (MIRES-017).
+    let out = run(vec![
+        cond("c0", 1, 5),
+        cond("c1", 2, 3),
+        cond("c2", 3, 4),
+        cond("c3", 2, 4),
+        goto(5),
+        ret(),
+    ]);
+    expect![[r#"
+        // irreducible
+        // dispatch x1
+        b0;
+        if (c0) {
+          b1;
+          $t0 = 0;
+          loop {
+            switch ($t0) {
+              case 0:
+                if (c1) {
+                } else {
+                  $t0 = 2;
+                  continue;
+                }
+              case 3:
+                b2;
+                if (c2) {
+                } else {
+                  $t0 = 1;
+                  continue;
+                }
+              case 2:
+                b3;
+                if (c3) {
+                  $t0 = 3;
+                  continue;
+                }
+              case 1:
+                b4;
+                break;
+            }
+            break;
+          }
+        }
+        b5;
+        return;
+    "#]]
+    .assert_eq(&out);
+}
+
+#[test]
+fn dispatch_whose_last_case_goes_round_an_enclosing_loop() {
+    // The same cycle inside a loop headed by 1: its exit, 5, goes back to the
+    // head, so the last case falls off towards the next iteration and leaves
+    // the switch with a `break`, which the trailing `break` turns into the end
+    // of the loop body.
+    let out = run(vec![
+        goto(1),
+        cond("c1", 2, 6),
+        cond("c2", 3, 4),
+        cond("c3", 4, 5),
+        cond("c4", 3, 5),
+        goto(1),
+        ret(),
+    ]);
+    expect![[r#"
+        // irreducible
+        // dispatch x1
+        b0;
+        loop {
+          b1;
+          if (c1) {
+            b2;
+            $t0 = 0;
+            loop {
+              switch ($t0) {
+                case 0:
+                  if (c2) {
+                  } else {
+                    $t0 = 2;
+                    continue;
+                  }
+                case 3:
+                  b3;
+                  if (c3) {
+                  } else {
+                    $t0 = 1;
+                    continue;
+                  }
+                case 2:
+                  b4;
+                  if (c4) {
+                    $t0 = 3;
+                    continue;
+                  }
+                case 1:
+                  b5;
+                  break;
+              }
+              break;
+            }
+          } else {
+            b6;
+            return;
+          }
+        }
+    "#]]
+    .assert_eq(&out);
+}
+
+#[test]
+fn dispatch_whose_last_case_continues_an_enclosing_loop() {
+    // The cycle has two exits: 5 leaves the loop headed by 1 for 7, which is
+    // the join after the dispatch, and 6 goes round the loop again. The last
+    // case ends in the labeled `continue` that does that, so it cannot reach
+    // its end and needs nothing added.
+    let out = run(vec![
+        goto(1),
+        cond("c1", 2, 7),
+        cond("c2", 3, 4),
+        cond("c3", 4, 5),
+        cond("c4", 3, 6),
+        goto(7),
+        goto(1),
+        ret(),
+    ]);
+    expect![[r#"
+        // irreducible
+        // dispatch x1
+        // labels: L0
+        b0;
+        L0: loop {
+          b1;
+          if (c1) {
+            b2;
+            $t0 = 0;
+            loop {
+              switch ($t0) {
+                case 0:
+                  if (c2) {
+                  } else {
+                    $t0 = 1;
+                    continue;
+                  }
+                case 2:
+                  b3;
+                  if (c3) {
+                  } else {
+                    b5;
+                    break;
+                  }
+                case 1:
+                  b4;
+                  if (c4) {
+                    $t0 = 2;
+                    continue;
+                  } else {
+                    b6;
+                    continue L0;
+                  }
+              }
+              break;
+            }
+          }
+          b7;
+          return;
+        }
+    "#]]
+    .assert_eq(&out);
+}
+
+#[test]
+fn dispatch_whose_last_case_reaches_its_end_on_one_path() {
+    // The cycle's exits: 5 goes round the loop headed by 1, and 4 leaves it
+    // for 6, which the head reaches too and which is the join after the
+    // dispatch. The last case runs 4, whose one branch re-enters the cycle and
+    // whose other falls off towards 6: only that path reaches the `break`.
+    let out = run(vec![
+        goto(1),
+        cond("c1", 2, 6),
+        cond("c2", 3, 4),
+        cond("c3", 4, 5),
+        cond("c4", 3, 6),
+        goto(1),
+        ret(),
+    ]);
+    expect![[r#"
+        // irreducible
+        // dispatch x1
+        // labels: L0
+        b0;
+        L0: loop {
+          b1;
+          if (c1) {
+            b2;
+            $t0 = 0;
+            loop {
+              switch ($t0) {
+                case 0:
+                  if (c2) {
+                  } else {
+                    $t0 = 1;
+                    continue;
+                  }
+                case 2:
+                  b3;
+                  if (c3) {
+                  } else {
+                    b5;
+                    continue L0;
+                  }
+                case 1:
+                  b4;
+                  if (c4) {
+                    $t0 = 2;
+                    continue;
+                  }
+                  break;
+              }
+              break;
+            }
+          }
+          b6;
+          return;
+        }
+    "#]]
+    .assert_eq(&out);
+}
+
+#[test]
 fn self_loop() {
     let out = run(vec![goto(1), cond("c1", 1, 2), ret()]);
     expect![[r#"

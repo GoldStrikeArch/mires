@@ -34,6 +34,9 @@ enum Outcome {
     Threw,
     Unreachable,
     OutOfSteps,
+    /// The `default` guard a backend prints after the last case of a dispatch's `switch` ran.
+    /// No graph run ends this way.
+    BadBlock,
 }
 
 /// A linear congruential generator, so the graphs are the same on every run.
@@ -341,13 +344,14 @@ impl<'a> Interp<'a> {
                 cases,
                 trailing_break,
             } => loop {
+                // Both backends print the switch with a `default` guard after its last case, so a
+                // selector naming no case, and a last case that falls off its end, run the guard.
                 let v = self.tmps.get(&sel.0).copied().unwrap_or(0);
-                let start = cases
-                    .iter()
-                    .position(|(c, _)| u128::from(*c) == v)
-                    .unwrap_or(cases.len());
+                let Some(start) = cases.iter().position(|(c, _)| u128::from(*c) == v) else {
+                    return Flow::Done(Outcome::BadBlock);
+                };
                 let mut f = Flow::Fall;
-                for (_, body) in &cases[start.min(cases.len())..] {
+                for (_, body) in &cases[start..] {
                     match self.exec(body) {
                         Flow::Fall => continue,
                         other => {
@@ -358,7 +362,8 @@ impl<'a> Interp<'a> {
                 }
                 // Leaving the switch lands after it, inside the loop.
                 match f {
-                    Flow::Fall | Flow::Break(None) => {
+                    Flow::Fall => return Flow::Done(Outcome::BadBlock),
+                    Flow::Break(None) => {
                         if *trailing_break {
                             return Flow::Fall;
                         }

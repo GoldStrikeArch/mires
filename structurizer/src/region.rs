@@ -91,7 +91,10 @@ pub enum Region<S, C> {
     ///
     /// Renders as `for (;;) { switch (sel) { case k: ... } [break;] }`. Cases
     /// fall through into each other, `trailing_break` says whether the break
-    /// after the switch is reachable and has to be emitted.
+    /// after the switch is reachable and has to be emitted. A last case that
+    /// can reach its end is terminated by an explicit `Break(None)`, so a
+    /// backend may print a `default` guard after it: no case falls into it,
+    /// and only a selector naming no case reaches it.
     Dispatch {
         sel: TmpId,
         label: Option<Label>,
