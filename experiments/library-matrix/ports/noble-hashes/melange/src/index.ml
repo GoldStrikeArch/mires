@@ -1,10 +1,32 @@
-type input
-external get : input -> string -> 'a = "" [@@mel.get_index]
-let optional x k = Js.Nullable.toOption (get x k)
-let run x =
-  let chunks = match optional x "bytes" with
-    | Some b -> [| b |]
-    | None -> Dispatch.repeat (Option.value ~default:1 (optional x "repeat")) (get x "chunks")
+(* The Melange boundary: the corpus input is a JS object read in place with [##]. Its arrays of
+   numbers are OCaml int arrays and its numbers OCaml ints or floats, so nothing is converted. *)
+
+type input =
+  < algorithm : string
+  ; bytes : int array Js.undefined
+  ; chunks : int array array Js.undefined
+  ; repeat : int Js.undefined
+  ; dkLen : float Js.undefined
+  ; key : int array Js.undefined
+  ; salt : int array Js.undefined
+  ; personalization : int array Js.undefined >
+  Js.t
+
+let run (input : input) =
+  let opt = Js.Undefined.toOption in
+  let opts : Blake2.opts =
+    {
+      dk_len = opt input##dkLen;
+      key = opt input##key;
+      salt = opt input##salt;
+      personalization = opt input##personalization;
+    }
   in
-  Dispatch.run (get x "algorithm") chunks (optional x "key") (optional x "salt")
-    (optional x "personalization") (optional x "dkLen")
+  let message : Hashes.message =
+    match opt input##bytes with
+    | Some bytes -> Bytes bytes
+    | None ->
+      let chunks = Option.get (opt input##chunks) in
+      Chunks { chunks; repeat = Option.value (opt input##repeat) ~default:1 }
+  in
+  Hashes.run input##algorithm opts message

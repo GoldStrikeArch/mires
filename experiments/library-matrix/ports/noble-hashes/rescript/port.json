@@ -3,5 +3,5 @@
   "library": "noble-hashes",
   "language": "rescript",
   "entry": "src/Index.res",
-  "boundary": "Decode byte arrays, feed native incremental hash states and return a lowercase hexadecimal digest."
+  "boundary": "The input record is the corpus object itself and its byte arrays are read in place; a noble-style create/update/digest state per call returns the lowercase hexadecimal digest as a JS string."
 }

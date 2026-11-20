@@ -1,94 +1,149 @@
-// SHA3-256 and Keccak-256, adapted from @noble/hashes 2.4.0 (MIT).
-object Sha3 {
-    private val pi = intArrayOf(20, 14, 22, 34, 36, 6, 10, 32, 16, 42, 48, 8, 30, 46, 38, 26, 24, 4, 40, 28, 44, 18, 12, 2)
-    private val rotations = intArrayOf(1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44)
-    private val rcLo = intArrayOf(1, 32898, 32906, -2147450880, 32907, -2147483647, -2147450751, 32777, 138, 136, -2147450871, -2147483638, -2147450741, 139, 32905, 32771, 32770, 128, 32778, -2147483638, -2147450751, 32896, -2147483647, -2147450872)
-    private val rcHi = intArrayOf(0, 0, -2147483648, -2147483648, 0, 0, -2147483648, -2147483648, 0, 0, 0, 0, 0, -2147483648, -2147483648, -2147483648, -2147483648, -2147483648, 0, -2147483648, -2147483648, -2147483648, 0, -2147483648)
-    // The 25 little-endian lanes occupy 50 words.
-    private fun permute(s: IntArray) {
-        val columns = IntArray(10)
-        for (round in 0 until 24) {
-            // Theta mixes column parities into every lane.
-            for (x in 0 until 10) {
-                columns[x] = s[x] xor s[x + 10] xor s[x + 20] xor s[x + 30] xor s[x + 40]
-            }
-            for (col in 0 until 5) {
-                val x = 2 * col
-                val left = (x + 8) % 10
-                val right = (x + 2) % 10
-                val low = columns[left] xor ((columns[right] shl 1) or (columns[right + 1] ushr 31))
-                val high = columns[left + 1] xor ((columns[right + 1] shl 1) or (columns[right] ushr 31))
-                for (row in 0 until 5) {
-                    val i = row * 10 + x
-                    s[i] = s[i] xor low
-                    s[i + 1] = s[i + 1] xor high
-                }
-            }
-            // Rho rotates and Pi moves the 24 non-origin lanes in a single cycle.
-            var low = s[2]
-            var high = s[3]
-            for (t in 0 until 24) {
-                val shift = rotations[t]
-                val k = shift and 31
-                val a = if (shift > 32) high else low
-                val b = if (shift > 32) low else high
-                val p = pi[t]
-                low = s[p]
-                high = s[p + 1]
-                s[p] = ((a shl k) or (b ushr (32 - k)))
-                s[p + 1] = ((b shl k) or (a ushr (32 - k)))
-            }
-            // Chi reads the original five lanes in each row.
+@file:OptIn(ExperimentalUnsignedTypes::class)
+
+// noble's sha3.ts: Keccak-f[1600] and the Keccak sponge behind SHA3-256 and Keccak-256.
+//
+// The state is noble's state32: 25 lanes of two 32-bit words, the low word first. noble derives
+// the pi, rho and iota tables at load time; they are written out here.
+
+/** Pi: the word index each rho step moves its lane to (noble's SHA3_PI). */
+private val SHA3_PI = intArrayOf(20, 14, 22, 34, 36, 6, 10, 32, 16, 42, 48, 8, 30, 46, 38, 26, 24, 4, 40, 28, 44, 18, 12, 2)
+
+/** Rho: the left rotation of each step (noble's SHA3_ROTL). */
+private val SHA3_ROTL = intArrayOf(1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44)
+
+/** Iota: the low and high words of each round constant (noble's SHA3_IOTA_H and SHA3_IOTA_L). */
+private val SHA3_IOTA_H = words(
+    0x00000001u, 0x00008082u, 0x0000808au, 0x80008000u, 0x0000808bu, 0x80000001u, 0x80008081u, 0x00008009u,
+    0x0000008au, 0x00000088u, 0x80008009u, 0x8000000au, 0x8000808bu, 0x0000008bu, 0x00008089u, 0x00008003u,
+    0x00008002u, 0x00000080u, 0x0000800au, 0x8000000au, 0x80008081u, 0x00008080u, 0x80000001u, 0x80008008u,
+)
+private val SHA3_IOTA_L = words(
+    0x00000000u, 0x00000000u, 0x80000000u, 0x80000000u, 0x00000000u, 0x00000000u, 0x80000000u, 0x80000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x80000000u, 0x80000000u, 0x80000000u,
+    0x80000000u, 0x80000000u, 0x00000000u, 0x80000000u, 0x80000000u, 0x80000000u, 0x00000000u, 0x80000000u,
+)
+
+// Left rotations of a lane by s in 1..31 (S) or 33..63 (B). As in noble, h is the lane's first
+// (low) word and l its second (high) word.
+private fun rotlSH(h: Int, l: Int, s: Int) = (h shl s) or (l ushr 32 - s)
+private fun rotlSL(h: Int, l: Int, s: Int) = (l shl s) or (h ushr 32 - s)
+private fun rotlBH(h: Int, l: Int, s: Int) = (l shl s - 32) or (h ushr 64 - s)
+private fun rotlBL(h: Int, l: Int, s: Int) = (h shl s - 32) or (l ushr 64 - s)
+private fun rotlH(h: Int, l: Int, s: Int) = if (s > 32) rotlBH(h, l, s) else rotlSH(h, l, s)
+private fun rotlL(h: Int, l: Int, s: Int) = if (s > 32) rotlBL(h, l, s) else rotlSL(h, l, s)
+
+/** noble's keccakP: the 24 rounds of Keccak-f[1600] on [s], with [b] as the theta scratch. */
+private fun keccakP(s: IntArray, b: IntArray) {
+    for (round in 0 until 24) {
+        // Theta
+        for (x in 0 until 10) b[x] = s[x] xor s[x + 10] xor s[x + 20] xor s[x + 30] xor s[x + 40]
+        for (column in 0 until 5) {
+            val x = 2 * column
+            val idx1 = (x + 8) % 10
+            val idx0 = (x + 2) % 10
+            val b0 = b[idx0]
+            val b1 = b[idx0 + 1]
+            val th = rotlH(b0, b1, 1) xor b[idx1]
+            val tl = rotlL(b0, b1, 1) xor b[idx1 + 1]
             for (row in 0 until 5) {
                 val y = 10 * row
-                val saved0 = s[y]
-                val saved1 = s[y + 1]
-                val saved2 = s[y + 2]
-                val saved3 = s[y + 3]
-                for (x in 0 until 6) {
-                    s[y + x] = s[y + x] xor (s[y + x + 2].inv() and s[y + x + 4])
-                }
-                s[y + 6] = s[y + 6] xor (s[y + 8].inv() and saved0)
-                s[y + 7] = s[y + 7] xor (s[y + 9].inv() and saved1)
-                s[y + 8] = s[y + 8] xor (saved0.inv() and saved2)
-                s[y + 9] = s[y + 9] xor (saved1.inv() and saved3)
+                s[x + y] = s[x + y] xor th
+                s[x + y + 1] = s[x + y + 1] xor tl
             }
-            s[0] = s[0] xor rcLo[round]
-            s[1] = s[1] xor rcHi[round]
         }
+        // Rho and pi
+        var curH = s[2]
+        var curL = s[3]
+        for (t in 0 until 24) {
+            val shift = SHA3_ROTL[t]
+            val th = rotlH(curH, curL, shift)
+            val tl = rotlL(curH, curL, shift)
+            val pi = SHA3_PI[t]
+            curH = s[pi]
+            curL = s[pi + 1]
+            s[pi] = th
+            s[pi + 1] = tl
+        }
+        // Chi
+        for (row in 0 until 5) {
+            val y = 10 * row
+            val b0 = s[y]
+            val b1 = s[y + 1]
+            val b2 = s[y + 2]
+            val b3 = s[y + 3]
+            for (x in 0 until 6) s[y + x] = s[y + x] xor (s[y + x + 2].inv() and s[y + x + 4])
+            s[y + 6] = s[y + 6] xor (s[y + 8].inv() and b0)
+            s[y + 7] = s[y + 7] xor (s[y + 9].inv() and b1)
+            s[y + 8] = s[y + 8] xor (b0.inv() and b2)
+            s[y + 9] = s[y + 9] xor (b1.inv() and b3)
+        }
+        // Iota
+        s[0] = s[0] xor SHA3_IOTA_H[round]
+        s[1] = s[1] xor SHA3_IOTA_L[round]
     }
-    fun digest(legacy: Boolean, chunks: Array<IntArray>): IntArray {
-        val s = IntArray(50)
+}
+
+/** noble's Keccak sponge with a byte-length rate [blockLen] and domain [suffix]. */
+class Keccak(
+    override val blockLen: Int,
+    private val suffix: Int,
+    override val outputLen: Int,
+) : Hash {
+    private val state32 = IntArray(50)
+    private val theta = IntArray(10)
+    private var pos = 0
+    private var posOut = 0
+
+    /** XORs [byte] into state byte [index], as noble does through its byte view of state32. */
+    private fun xorByte(index: Int, byte: Int) {
+        state32[index shr 2] = state32[index shr 2] xor (byte shl 8 * (index and 3))
+    }
+
+    /** The state byte at [index]. */
+    private fun stateByte(index: Int): Byte = (state32[index shr 2] ushr 8 * (index and 3)).toByte()
+
+    private fun keccak() {
+        keccakP(state32, theta)
+        posOut = 0
+        pos = 0
+    }
+
+    override fun update(data: ByteArray): Keccak {
+        val len = data.size
         var pos = 0
-        for (chunk in chunks) {
-            var index = 0
-            while (index < chunk.size) {
-                if (pos == 0 && chunk.size - index >= 136) {
-                    for (word in 0 until 34) {
-                        val i = index + 4 * word
-                        s[word] = s[word] xor (chunk[i] or (chunk[i + 1] shl 8) or (chunk[i + 2] shl 16) or (chunk[i + 3] shl 24))
-                    }
-                    index += 136
-                    permute(s)
-                } else {
-                    s[pos / 4] = s[pos / 4] xor (chunk[index] shl (8 * (pos % 4)))
-                    index++
-                    pos++
-                    if (pos == 136) {
-                        permute(s)
-                        pos = 0
-                    }
-                }
+        while (pos < len) {
+            // Whole blocks with nothing buffered are absorbed a word at a time.
+            if (this.pos == 0 && len - pos >= blockLen) {
+                for (i in 0 until blockLen / 4) state32[i] = state32[i] xor data.getUint32LE(pos + 4 * i)
+                pos += blockLen
+                this.pos = blockLen
+                keccak()
+                continue
             }
+            val take = minOf(blockLen - this.pos, len - pos)
+            repeat(take) { xorByte(this.pos++, data.u8(pos++)) }
+            if (this.pos == blockLen) keccak()
         }
-        val suffix = if (legacy) 1 else 6
-        s[pos / 4] = s[pos / 4] xor (suffix shl (8 * (pos % 4)))
-        s[33] = s[33] xor -2147483648
-        permute(s)
-        val result = IntArray(32)
-        for (i in 0 until 32) {
-            result[i] = (s[i / 4] ushr (8 * (i % 4))) and 255
+        return this
+    }
+
+    private fun finish() {
+        // The suffix holds the domain bits and the first padding bit; 0x80 closes pad10*1.
+        xorByte(pos, suffix)
+        if (suffix and 0x80 != 0 && pos == blockLen - 1) keccak()
+        xorByte(blockLen - 1, 0x80)
+        keccak()
+    }
+
+    override fun digest(): ByteArray {
+        finish()
+        val out = ByteArray(outputLen)
+        var pos = 0
+        while (pos < outputLen) {
+            if (posOut >= blockLen) keccak()
+            val take = minOf(blockLen - posOut, outputLen - pos)
+            repeat(take) { out[pos++] = stateByte(posOut++) }
         }
-        return result
+        return out
     }
 }

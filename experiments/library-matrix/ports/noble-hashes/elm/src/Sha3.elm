@@ -1,373 +1,301 @@
-module Sha3 exposing (digest)
+module Sha3 exposing (Keccak, digest, keccak, update)
 
-{-| SHA3-256 and Keccak-256 from @noble/hashes 2.4.0 (MIT).
-The state names each lane by its x and y coordinates. Each lane holds the
-low and high halves of a 64-bit word so every rotation uses exact 32-bit shifts.
+{-| noble's sha3.ts: Keccak-f[1600] and the Keccak sponge behind SHA3-256 and Keccak-256.
+
+The sponge state is noble's state32 as a list of 25 lanes in noble's order (x + 5y), each lane
+its low (first) and high (second) 32-bit word. keccakP works on the lanes as a record named the
+Keccak team's way (row b, g, k, m, s for y = 0..4; column a, e, i, o, u for x = 0..4), so each
+step is a function from the whole state to the next one. noble derives the pi, rho and iota
+tables at load time; here rho and pi are written out lane by lane in noble's cycle order and the
+iota table is literal.
+
+noble XORs each input byte into the state as it arrives. Here a partial block waits in a buffer,
+as in HashMD, and is XORed in when it completes; the permutations happen at the same points.
+
 -}
 
+import Array exposing (Array)
 import Bitwise exposing (and, complement, or, shiftLeftBy, shiftRightZfBy)
+import Words
 
 
+{-| A lane: its first (low) and second (high) 32-bit word.
+-}
 type alias Lane =
     { lo : Int, hi : Int }
 
 
+{-| The 25 lanes during a permutation.
+-}
 type alias State =
-    { a00 : Lane
-    , a10 : Lane
-    , a20 : Lane
-    , a30 : Lane
-    , a40 : Lane
-    , a01 : Lane
-    , a11 : Lane
-    , a21 : Lane
-    , a31 : Lane
-    , a41 : Lane
-    , a02 : Lane
-    , a12 : Lane
-    , a22 : Lane
-    , a32 : Lane
-    , a42 : Lane
-    , a03 : Lane
-    , a13 : Lane
-    , a23 : Lane
-    , a33 : Lane
-    , a43 : Lane
-    , a04 : Lane
-    , a14 : Lane
-    , a24 : Lane
-    , a34 : Lane
-    , a44 : Lane
+    { aba : Lane, abe : Lane, abi : Lane, abo : Lane, abu : Lane
+    , aga : Lane, age : Lane, agi : Lane, ago : Lane, agu : Lane
+    , aka : Lane, ake : Lane, aki : Lane, ako : Lane, aku : Lane
+    , ama : Lane, ame : Lane, ami : Lane, amo : Lane, amu : Lane
+    , asa : Lane, ase : Lane, asi : Lane, aso : Lane, asu : Lane
     }
 
 
-zero : Lane
-zero =
-    Lane 0 0
+{-| Iota: the low and high words of each round constant (noble's SHA3\_IOTA\_H and SHA3\_IOTA\_L).
+-}
+iota : Array Lane
+iota =
+    Array.fromList
+        [ Lane 0x01 0, Lane 0x8082 0, Lane 0x808A 0x80000000, Lane 0x80008000 0x80000000
+        , Lane 0x808B 0, Lane 0x80000001 0, Lane 0x80008081 0x80000000, Lane 0x8009 0x80000000
+        , Lane 0x8A 0, Lane 0x88 0, Lane 0x80008009 0, Lane 0x8000000A 0
+        , Lane 0x8000808B 0, Lane 0x8B 0x80000000, Lane 0x8089 0x80000000, Lane 0x8003 0x80000000
+        , Lane 0x8002 0x80000000, Lane 0x80 0x80000000, Lane 0x800A 0, Lane 0x8000000A 0x80000000
+        , Lane 0x80008081 0x80000000, Lane 0x8080 0x80000000, Lane 0x80000001 0, Lane 0x80008008 0x80000000
+        ]
 
 
-empty : State
-empty =
-    { a00 = zero
-    , a10 = zero
-    , a20 = zero
-    , a30 = zero
-    , a40 = zero
-    , a01 = zero
-    , a11 = zero
-    , a21 = zero
-    , a31 = zero
-    , a41 = zero
-    , a02 = zero
-    , a12 = zero
-    , a22 = zero
-    , a32 = zero
-    , a42 = zero
-    , a03 = zero
-    , a13 = zero
-    , a23 = zero
-    , a33 = zero
-    , a43 = zero
-    , a04 = zero
-    , a14 = zero
-    , a24 = zero
-    , a34 = zero
-    , a44 = zero
-    }
-
-
-mix : Lane -> Lane -> Lane
-mix a b =
-    Lane (Bitwise.xor a.lo b.lo) (Bitwise.xor a.hi b.hi)
-
-
-rotate : Int -> Lane -> Lane
-rotate n a =
-    let
-        k = and 31 n
-
-        half x y =
-            or (shiftLeftBy k x) (shiftRightZfBy (32-k) y)
-    in
-    if n > 32 then
-        Lane (half a.hi a.lo) (half a.lo a.hi)
+{-| noble's rotlH and rotlL: a left rotation by `s` in 1..63 except 32.
+-}
+rotl : Int -> Lane -> Lane
+rotl s { lo, hi } =
+    if s > 32 then
+        { lo = or (shiftLeftBy (s - 32) hi) (shiftRightZfBy (64 - s) lo)
+        , hi = or (shiftLeftBy (s - 32) lo) (shiftRightZfBy (64 - s) hi)
+        }
 
     else
-        Lane (half a.lo a.hi) (half a.hi a.lo)
+        { lo = or (shiftLeftBy s lo) (shiftRightZfBy (32 - s) hi)
+        , hi = or (shiftLeftBy s hi) (shiftRightZfBy (32 - s) lo)
+        }
 
 
-chi : Lane -> Lane -> Lane -> Lane
-chi a b c =
-    Lane
-        (Bitwise.xor a.lo (and (complement b.lo) c.lo))
-        (Bitwise.xor a.hi (and (complement b.hi) c.hi))
+xor : Lane -> Lane -> Lane
+xor a b =
+    { lo = Bitwise.xor a.lo b.lo, hi = Bitwise.xor a.hi b.hi }
 
 
-roundConstants : List Lane
-roundConstants =
-    [ Lane (1) (0)
-    , Lane (32898) (0)
-    , Lane (32906) (-2147483648)
-    , Lane (-2147450880) (-2147483648)
-    , Lane (32907) (0)
-    , Lane (-2147483647) (0)
-    , Lane (-2147450751) (-2147483648)
-    , Lane (32777) (-2147483648)
-    , Lane (138) (0)
-    , Lane (136) (0)
-    , Lane (-2147450871) (0)
-    , Lane (-2147483638) (0)
-    , Lane (-2147450741) (0)
-    , Lane (139) (-2147483648)
-    , Lane (32905) (-2147483648)
-    , Lane (32771) (-2147483648)
-    , Lane (32770) (-2147483648)
-    , Lane (128) (-2147483648)
-    , Lane (32778) (0)
-    , Lane (-2147483638) (-2147483648)
-    , Lane (-2147450751) (-2147483648)
-    , Lane (32896) (-2147483648)
-    , Lane (-2147483647) (0)
-    , Lane (-2147450872) (-2147483648)
-    ]
+xor5 : Lane -> Lane -> Lane -> Lane -> Lane -> Lane
+xor5 a b c d e =
+    xor (xor (xor (xor a b) c) d) e
 
 
-round : Lane -> State -> State
-round constant s =
+{-| Theta: each lane takes the parity of the column before it and the rotated parity of the
+column after it.
+-}
+theta : State -> State
+theta s =
     let
-        -- Theta mixes the five column parities into every lane.
         c0 =
-            s.a00 |> mix s.a01 |> mix s.a02 |> mix s.a03 |> mix s.a04
+            xor5 s.aba s.aga s.aka s.ama s.asa
 
         c1 =
-            s.a10 |> mix s.a11 |> mix s.a12 |> mix s.a13 |> mix s.a14
+            xor5 s.abe s.age s.ake s.ame s.ase
 
         c2 =
-            s.a20 |> mix s.a21 |> mix s.a22 |> mix s.a23 |> mix s.a24
+            xor5 s.abi s.agi s.aki s.ami s.asi
 
         c3 =
-            s.a30 |> mix s.a31 |> mix s.a32 |> mix s.a33 |> mix s.a34
+            xor5 s.abo s.ago s.ako s.amo s.aso
 
         c4 =
-            s.a40 |> mix s.a41 |> mix s.a42 |> mix s.a43 |> mix s.a44
+            xor5 s.abu s.agu s.aku s.amu s.asu
 
         d0 =
-            mix c4 (rotate 1 c1)
+            xor (rotl 1 c1) c4
 
         d1 =
-            mix c0 (rotate 1 c2)
+            xor (rotl 1 c2) c0
 
         d2 =
-            mix c1 (rotate 1 c3)
+            xor (rotl 1 c3) c1
 
         d3 =
-            mix c2 (rotate 1 c4)
+            xor (rotl 1 c4) c2
 
         d4 =
-            mix c3 (rotate 1 c0)
-
-        -- Rho and Pi have a fixed 24-lane permutation cycle.
-        b00 =
-            mix s.a00 d0
-
-        b02 =
-            rotate 1 (mix s.a10 d1)
-
-        b21 =
-            rotate 3 (mix s.a02 d0)
-
-        b12 =
-            rotate 6 (mix s.a21 d2)
-
-        b23 =
-            rotate 10 (mix s.a12 d1)
-
-        b33 =
-            rotate 15 (mix s.a23 d2)
-
-        b30 =
-            rotate 21 (mix s.a33 d3)
-
-        b01 =
-            rotate 28 (mix s.a30 d3)
-
-        b13 =
-            rotate 36 (mix s.a01 d0)
-
-        b31 =
-            rotate 45 (mix s.a13 d1)
-
-        b14 =
-            rotate 55 (mix s.a31 d3)
-
-        b44 =
-            rotate 2 (mix s.a14 d1)
-
-        b40 =
-            rotate 14 (mix s.a44 d4)
-
-        b03 =
-            rotate 27 (mix s.a40 d4)
-
-        b34 =
-            rotate 41 (mix s.a03 d0)
-
-        b43 =
-            rotate 56 (mix s.a34 d3)
-
-        b32 =
-            rotate 8 (mix s.a43 d4)
-
-        b22 =
-            rotate 25 (mix s.a32 d3)
-
-        b20 =
-            rotate 43 (mix s.a22 d2)
-
-        b04 =
-            rotate 62 (mix s.a20 d2)
-
-        b42 =
-            rotate 18 (mix s.a04 d0)
-
-        b24 =
-            rotate 39 (mix s.a42 d4)
-
-        b41 =
-            rotate 61 (mix s.a24 d2)
-
-        b11 =
-            rotate 20 (mix s.a41 d4)
-
-        b10 =
-            rotate 44 (mix s.a11 d1)
-
+            xor (rotl 1 c0) c3
     in
-    { a00 = mix constant (chi b00 b10 b20)
-    , a10 = chi b10 b20 b30
-    , a20 = chi b20 b30 b40
-    , a30 = chi b30 b40 b00
-    , a40 = chi b40 b00 b10
-    , a01 = chi b01 b11 b21
-    , a11 = chi b11 b21 b31
-    , a21 = chi b21 b31 b41
-    , a31 = chi b31 b41 b01
-    , a41 = chi b41 b01 b11
-    , a02 = chi b02 b12 b22
-    , a12 = chi b12 b22 b32
-    , a22 = chi b22 b32 b42
-    , a32 = chi b32 b42 b02
-    , a42 = chi b42 b02 b12
-    , a03 = chi b03 b13 b23
-    , a13 = chi b13 b23 b33
-    , a23 = chi b23 b33 b43
-    , a33 = chi b33 b43 b03
-    , a43 = chi b43 b03 b13
-    , a04 = chi b04 b14 b24
-    , a14 = chi b14 b24 b34
-    , a24 = chi b24 b34 b44
-    , a34 = chi b34 b44 b04
-    , a44 = chi b44 b04 b14
+    { aba = xor s.aba d0, abe = xor s.abe d1, abi = xor s.abi d2, abo = xor s.abo d3, abu = xor s.abu d4
+    , aga = xor s.aga d0, age = xor s.age d1, agi = xor s.agi d2, ago = xor s.ago d3, agu = xor s.agu d4
+    , aka = xor s.aka d0, ake = xor s.ake d1, aki = xor s.aki d2, ako = xor s.ako d3, aku = xor s.aku d4
+    , ama = xor s.ama d0, ame = xor s.ame d1, ami = xor s.ami d2, amo = xor s.amo d3, amu = xor s.amu d4
+    , asa = xor s.asa d0, ase = xor s.ase d1, asi = xor s.asi d2, aso = xor s.aso d3, asu = xor s.asu d4
     }
 
 
-word : Int -> Int -> Int -> Int -> Int
-word a b c d =
-    or (or a (shiftLeftBy 8 b)) (or (shiftLeftBy 16 c) (shiftLeftBy 24 d))
+{-| Rho and pi: noble's single cycle through the 24 lanes after the first, starting from abe;
+each lane moves to the next one's place, rotated by that step's SHA3\_ROTL.
+-}
+rhoPi : State -> State
+rhoPi s =
+    { aba = s.aba
+    , aka = rotl 1 s.abe
+    , agi = rotl 3 s.aka
+    , ake = rotl 6 s.agi
+    , ami = rotl 10 s.ake
+    , amo = rotl 15 s.ami
+    , abo = rotl 21 s.amo
+    , aga = rotl 28 s.abo
+    , ame = rotl 36 s.aga
+    , ago = rotl 45 s.ame
+    , ase = rotl 55 s.ago
+    , asu = rotl 2 s.ase
+    , abu = rotl 14 s.asu
+    , ama = rotl 27 s.abu
+    , aso = rotl 41 s.ama
+    , amu = rotl 56 s.aso
+    , ako = rotl 8 s.amu
+    , aki = rotl 25 s.ako
+    , abi = rotl 43 s.aki
+    , asa = rotl 62 s.abi
+    , aku = rotl 18 s.asa
+    , asi = rotl 39 s.aku
+    , agu = rotl 61 s.asi
+    , age = rotl 20 s.agu
+    , abe = rotl 44 s.age
+    }
 
 
--- Decode the 136-byte rate block as 17 little-endian lanes.
-decodeLanes : List Int -> List Lane -> List Lane
-decodeLanes bytes reversed =
-    case bytes of
-        a :: b :: c :: d :: e :: f :: g :: h :: rest ->
-            decodeLanes rest (Lane (word a b c d) (word e f g h) :: reversed)
-
-        _ ->
-            List.reverse reversed
+{-| Chi on one lane: `a ^ (~b & c)` for the lanes after it in the row.
+-}
+chiLane : Lane -> Lane -> Lane -> Lane
+chiLane a b c =
+    { lo = Bitwise.xor a.lo (and (complement b.lo) c.lo), hi = Bitwise.xor a.hi (and (complement b.hi) c.hi) }
 
 
-absorb : List Int -> State -> State
-absorb bytes state =
-    case decodeLanes bytes [] of
-        [ l0, l1, l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, l13, l14, l15, l16 ] ->
+chi : State -> State
+chi s =
+    { aba = chiLane s.aba s.abe s.abi, abe = chiLane s.abe s.abi s.abo, abi = chiLane s.abi s.abo s.abu, abo = chiLane s.abo s.abu s.aba, abu = chiLane s.abu s.aba s.abe
+    , aga = chiLane s.aga s.age s.agi, age = chiLane s.age s.agi s.ago, agi = chiLane s.agi s.ago s.agu, ago = chiLane s.ago s.agu s.aga, agu = chiLane s.agu s.aga s.age
+    , aka = chiLane s.aka s.ake s.aki, ake = chiLane s.ake s.aki s.ako, aki = chiLane s.aki s.ako s.aku, ako = chiLane s.ako s.aku s.aka, aku = chiLane s.aku s.aka s.ake
+    , ama = chiLane s.ama s.ame s.ami, ame = chiLane s.ame s.ami s.amo, ami = chiLane s.ami s.amo s.amu, amo = chiLane s.amo s.amu s.ama, amu = chiLane s.amu s.ama s.ame
+    , asa = chiLane s.asa s.ase s.asi, ase = chiLane s.ase s.asi s.aso, asi = chiLane s.asi s.aso s.asu, aso = chiLane s.aso s.asu s.asa, asu = chiLane s.asu s.asa s.ase
+    }
+
+
+{-| Rounds `round` to 23 of Keccak-f[1600].
+-}
+rounds : Int -> State -> State
+rounds round s =
+    case Array.get round iota of
+        Just constant ->
             let
-                absorbed =
-                    { state
-                        | a00 = mix state.a00 l0
-                        , a10 = mix state.a10 l1
-                        , a20 = mix state.a20 l2
-                        , a30 = mix state.a30 l3
-                        , a40 = mix state.a40 l4
-                        , a01 = mix state.a01 l5
-                        , a11 = mix state.a11 l6
-                        , a21 = mix state.a21 l7
-                        , a31 = mix state.a31 l8
-                        , a41 = mix state.a41 l9
-                        , a02 = mix state.a02 l10
-                        , a12 = mix state.a12 l11
-                        , a22 = mix state.a22 l12
-                        , a32 = mix state.a32 l13
-                        , a42 = mix state.a42 l14
-                        , a03 = mix state.a03 l15
-                        , a13 = mix state.a13 l16
-                    }
+                t =
+                    chi (rhoPi (theta s))
             in
-            List.foldl round absorbed roundConstants
+            rounds (round + 1) { t | aba = xor t.aba constant }
 
-        _ ->
-            state
-
-
-type alias Sponge =
-    { state : State, remainder : List Int, used : Int }
+        Nothing ->
+            s
 
 
-update : List Int -> Sponge -> Sponge
-update chunk sponge =
+{-| noble's keccakP on the lane list.
+-}
+keccakP : List Lane -> List Lane
+keccakP lanes =
     let
-        loop bytes state reversed used =
-            case bytes of
-                [] ->
-                    Sponge state reversed used
+        array =
+            Array.fromList lanes
 
-                byte :: rest ->
-                    if used == 135 then
-                        loop rest (absorb (List.reverse (byte :: reversed)) state) [] 0
+        lane i =
+            Array.get i array |> Maybe.withDefault (Lane 0 0)
 
-                    else
-                        loop rest state (byte :: reversed) (used+1)
+        s =
+            rounds 0
+                { aba = lane 0, abe = lane 1, abi = lane 2, abo = lane 3, abu = lane 4
+                , aga = lane 5, age = lane 6, agi = lane 7, ago = lane 8, agu = lane 9
+                , aka = lane 10, ake = lane 11, aki = lane 12, ako = lane 13, aku = lane 14
+                , ama = lane 15, ame = lane 16, ami = lane 17, amo = lane 18, amu = lane 19
+                , asa = lane 20, ase = lane 21, asi = lane 22, aso = lane 23, asu = lane 24
+                }
     in
-    loop chunk sponge.state sponge.remainder sponge.used
-
-
-bytesOf : Lane -> List Int
-bytesOf lane =
-    let
-        byte i x = and 255 (shiftRightZfBy i x)
-    in
-    [ byte 0 lane.lo, byte 8 lane.lo, byte 16 lane.lo, byte 24 lane.lo
-    , byte 0 lane.hi, byte 8 lane.hi, byte 16 lane.hi, byte 24 lane.hi
+    [ s.aba, s.abe, s.abi, s.abo, s.abu, s.aga, s.age, s.agi, s.ago, s.agu
+    , s.aka, s.ake, s.aki, s.ako, s.aku, s.ama, s.ame, s.ami, s.amo, s.amu
+    , s.asa, s.ase, s.asi, s.aso, s.asu
     ]
 
 
-digest : Bool -> List (List Int) -> List Int
-digest legacy chunks =
+{-| noble's Keccak sponge with a byte-length rate `blockLen` and domain `suffix`.
+-}
+type alias Keccak =
+    { blockLen : Int
+    , suffix : Int
+    , outputLen : Int
+    , lanes : List Lane
+    , buffer : List Int
+    , pos : Int
+    }
+
+
+keccak : Int -> Int -> Int -> Keccak
+keccak blockLen suffix outputLen =
+    { blockLen = blockLen
+    , suffix = suffix
+    , outputLen = outputLen
+    , lanes = List.repeat 25 (Lane 0 0)
+    , buffer = []
+    , pos = 0
+    }
+
+
+{-| XORs the rate's worth of `block` into the first lanes and permutes.
+-}
+absorbBlock : List Int -> List Lane -> List Lane
+absorbBlock block lanes =
+    keccakP (xorLanes (toLanes (Words.wordsLE block)) lanes)
+
+
+xorLanes : List Lane -> List Lane -> List Lane
+xorLanes block lanes =
+    case ( block, lanes ) of
+        ( b :: blockRest, lane :: laneRest ) ->
+            xor b lane :: xorLanes blockRest laneRest
+
+        _ ->
+            lanes
+
+
+toLanes : List Int -> List Lane
+toLanes words =
+    case words of
+        lo :: hi :: rest ->
+            Lane lo hi :: toLanes rest
+
+        _ ->
+            []
+
+
+update : List Int -> Keccak -> Keccak
+update data k =
+    absorb (k.buffer ++ data) (k.pos + List.length data) k
+
+
+absorb : List Int -> Int -> Keccak -> Keccak
+absorb bytes count k =
+    if count >= k.blockLen then
+        absorb (List.drop k.blockLen bytes) (count - k.blockLen) { k | lanes = absorbBlock (List.take k.blockLen bytes) k.lanes }
+
+    else
+        { k | buffer = bytes, pos = count }
+
+
+{-| noble's finish and writeInto: the suffix holds the domain bits and the first padding bit,
+0x80 closes pad10\*1, and the digest is read from the first lanes. Both digests here are shorter
+than the rate, so one block is squeezed.
+-}
+digest : Keccak -> List Int
+digest k =
     let
-        sponge =
-            List.foldl update (Sponge empty [] 0) chunks
+        zeros n =
+            List.repeat n 0
 
-        suffix =
-            if legacy then 1 else 6
+        lanes =
+            if k.pos == k.blockLen - 1 then
+                if and k.suffix 0x80 /= 0 then
+                    absorbBlock (zeros (k.blockLen - 1) ++ [ 0x80 ]) (absorbBlock (k.buffer ++ [ k.suffix ]) k.lanes)
 
-        padded =
-            if sponge.used == 135 then
-                List.reverse ((or suffix 128) :: sponge.remainder)
+                else
+                    absorbBlock (k.buffer ++ [ Bitwise.xor k.suffix 0x80 ]) k.lanes
 
             else
-                List.reverse (suffix :: sponge.remainder) ++ List.repeat (134 - sponge.used) 0 ++ [128]
-
-        final =
-            absorb padded sponge.state
+                absorbBlock (k.buffer ++ k.suffix :: zeros (k.blockLen - k.pos - 2) ++ [ 0x80 ]) k.lanes
     in
-    List.concatMap bytesOf [ final.a00, final.a10, final.a20, final.a30 ]
+    lanes
+        |> List.concatMap (\lane -> Words.bytesLE lane.lo ++ Words.bytesLE lane.hi)
+        |> List.take k.outputLen

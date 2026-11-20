@@ -2,5 +2,5 @@
   "schema": 1,
   "library": "noble-hashes",
   "language": "kotlin",
-  "boundary": "Decode byte arrays, feed native incremental hash states and return a lowercase hexadecimal digest."
+  "boundary": "An external interface reads the input in place; each Array<Int> is copied into a ByteArray, a create/update/digest state per call hashes them, and the hexadecimal digest is returned as a String."
 }

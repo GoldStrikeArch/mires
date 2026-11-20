@@ -2,6 +2,6 @@
   "schema": 1,
   "library": "noble-hashes",
   "language": "dart",
-  "boundary": "Decode byte arrays, feed native incremental hash states and return a lowercase hexadecimal digest.",
+  "boundary": "A dart:js_interop extension type reads the input; each JSArray<JSNumber> is copied into a Uint8List, a create/update/digest state per call hashes them, and the hexadecimal digest returns through .toJS.",
   "entry": "src/main.dart"
 }

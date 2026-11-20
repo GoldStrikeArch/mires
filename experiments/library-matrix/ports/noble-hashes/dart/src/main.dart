@@ -1,10 +1,16 @@
+/// The boundary: libraries/noble-hashes/reference.mjs in Dart. The input is the corpus object
+/// itself, read through a dart:js_interop extension type; byte arrays are copied into Uint8Lists.
+library;
+
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
 import 'dart:typed_data';
 
+import 'blake2.dart';
+import 'hmac.dart';
 import 'sha2.dart';
 import 'sha3.dart';
-import 'blake2.dart';
+import 'utils.dart';
 
 extension type HashInput._(JSObject _) implements JSObject {
   external String get algorithm;
@@ -17,51 +23,51 @@ extension type HashInput._(JSObject _) implements JSObject {
   external JSArray<JSNumber>? get personalization;
 }
 
-Uint8List read(JSArray<JSNumber>? value) => Uint8List.fromList([
-  if (value != null)
-    for (final b in value.toDart) b.toDartInt,
-]);
-
-JSString run(HashInput input) {
-  final raw = input.bytes;
-  final blocks = raw == null
-      ? input.chunks!.toDart.map(read).toList()
-      : [read(raw)];
-  final repeat = raw == null ? input.repeat ?? 1 : 1;
-  final chunks = [for (var i = 0; i < repeat; i++) ...blocks];
-  final key = read(input.key);
-  final Uint8List result;
-  switch (input.algorithm) {
-    case 'sha256':
-      result = sha2Digest(0, chunks, key);
-    case 'sha512':
-      result = sha2Digest(1, chunks, key);
-    case 'hmac_sha256':
-      if (input.key == null) throw ArgumentError('missing HMAC key');
-      result = sha2Digest(2, chunks, key);
-    case 'sha3_256':
-    case 'keccak_256':
-      result = sha3Digest(input.algorithm == 'keccak_256', chunks);
-    case 'blake2b':
-    case 'blake2s':
-      final wide = input.algorithm == 'blake2b';
-      final limit = wide ? 64 : 32;
-      final size = input.dkLen ?? limit.toDouble();
-      final salt = read(input.salt);
-      final pers = read(input.personalization);
-      if (size < 1 ||
-          size > limit ||
-          size != size.truncate() ||
-          (input.key != null && (key.isEmpty || key.length > limit)) ||
-          (input.salt != null && salt.length != limit ~/ 4) ||
-          (input.personalization != null && pers.length != limit ~/ 4)) {
-        throw ArgumentError('invalid BLAKE2 parameters');
-      }
-      result = blake2Digest(wide, chunks, size.toInt(), key, salt, pers);
-    default:
-      throw ArgumentError('unknown hash');
+/// Uint8Array.from(values).
+Uint8List _toBytes(JSArray<JSNumber> values) {
+  final list = values.toDart;
+  final out = Uint8List(list.length);
+  for (var i = 0; i < out.length; i++) {
+    out[i] = list[i].toDartInt;
   }
-  return result.map((b) => b.toRadixString(16).padLeft(2, '0')).join().toJS;
+  return out;
+}
+
+Uint8List? _optionalBytes(JSArray<JSNumber>? values) => values == null ? null : _toBytes(values);
+
+/// reference.mjs's `hashes` table plus HMAC-SHA-256: the constructor for [algorithm].
+Hash Function(Blake2Opts) _hasher(String algorithm) => switch (algorithm) {
+      'sha256' => (_) => Sha256(),
+      'sha512' => (_) => Sha512(),
+      'sha3_256' => (_) => Keccak(136, 0x06, 32),
+      'keccak_256' => (_) => Keccak(136, 0x01, 32),
+      'blake2b' => Blake2b.new,
+      'blake2s' => Blake2s.new,
+      'hmac_sha256' => (opts) => Hmac(Sha256.new, opts.key ?? (throw ArgumentError('"key" expected Uint8Array'))),
+      _ => throw ArgumentError('unknown hash'),
+    };
+
+String run(HashInput input) {
+  final create = _hasher(input.algorithm);
+  final opts = Blake2Opts(
+    dkLen: input.dkLen,
+    key: _optionalBytes(input.key),
+    salt: _optionalBytes(input.salt),
+    personalization: _optionalBytes(input.personalization),
+  );
+  final bytes = input.bytes;
+  if (bytes != null) {
+    final message = _toBytes(bytes);
+    return bytesToHex(create(opts).update(message).digest());
+  }
+  final state = create(opts);
+  final blocks = [for (final chunk in input.chunks!.toDart) _toBytes(chunk)];
+  for (var i = 0; i < (input.repeat ?? 1); i++) {
+    for (final block in blocks) {
+      state.update(block);
+    }
+  }
+  return bytesToHex(state.digest());
 }
 
 void main() {

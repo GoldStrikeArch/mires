@@ -3,5 +3,5 @@
   "library": "noble-hashes",
   "language": "gopherjs",
   "package": "./src",
-  "boundary": "Decode byte arrays, feed native incremental hash states and return a lowercase hexadecimal digest."
+  "boundary": "The input is a *js.Object read with Get; each JS byte array is copied into a []byte, a create/update/digest state per call hashes them, and the hexadecimal digest returns as a Go string."
 }

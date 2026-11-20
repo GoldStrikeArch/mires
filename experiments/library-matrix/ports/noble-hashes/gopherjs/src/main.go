@@ -1,78 +1,103 @@
+// Command main is the boundary: libraries/noble-hashes/reference.mjs in Go. The input is the
+// corpus object itself (*js.Object); byte arrays are copied into []byte.
 package main
 
 import "github.com/gopherjs/gopherjs/js"
 
-func byteArray(value *js.Object) []byte {
-	if value == js.Undefined {
-		return nil
-	}
-	out := make([]byte, value.Length())
+// toBytes is Uint8Array.from(values).
+func toBytes(values *js.Object) []byte {
+	out := make([]byte, values.Length())
 	for i := range out {
-		out[i] = byte(value.Index(i).Int())
+		out[i] = byte(values.Index(i).Int())
 	}
 	return out
 }
 
-func run(input *js.Object) string {
-	algorithm := input.Get("algorithm").String()
-	var chunks [][]byte
-	if message := input.Get("bytes"); message != js.Undefined {
-		chunks = [][]byte{byteArray(message)}
-	} else {
-		values := input.Get("chunks")
-		blocks := make([][]byte, values.Length())
-		for i := range blocks {
-			blocks[i] = byteArray(values.Index(i))
-		}
-		n := 1
-		if repeat := input.Get("repeat"); repeat != js.Undefined {
-			n = repeat.Int()
-		}
-		for i := 0; i < n; i++ {
-			chunks = append(chunks, blocks...)
-		}
+// optionalBytes is toBytes of a field that may be absent.
+func optionalBytes(input *js.Object, field string) []byte {
+	if v := input.Get(field); v != js.Undefined {
+		return toBytes(v)
 	}
-	key := byteArray(input.Get("key"))
-	var result []byte
+	return nil
+}
+
+// hasher is reference.mjs's hashes table plus HMAC-SHA-256: the constructor for algorithm.
+func hasher(algorithm string) (func(blake2Opts) (hash, error), error) {
 	switch algorithm {
 	case "sha256":
-		result = sha2Digest(0, chunks, key)
+		return func(blake2Opts) (hash, error) { return newSHA256(), nil }, nil
 	case "sha512":
-		result = sha2Digest(1, chunks, key)
+		return func(blake2Opts) (hash, error) { return newSHA512(), nil }, nil
+	case "sha3_256":
+		return func(blake2Opts) (hash, error) { return newKeccak(136, 0x06, 32), nil }, nil
+	case "keccak_256":
+		return func(blake2Opts) (hash, error) { return newKeccak(136, 0x01, 32), nil }, nil
+	case "blake2b":
+		return func(opts blake2Opts) (hash, error) { return newBlake2b(opts) }, nil
+	case "blake2s":
+		return func(opts blake2Opts) (hash, error) { return newBlake2s(opts) }, nil
 	case "hmac_sha256":
-		if key == nil {
-			panic("missing key")
-		}
-		result = sha2Digest(2, chunks, key)
-	case "sha3_256", "keccak_256":
-		result = sha3Digest(algorithm == "keccak_256", chunks)
-	case "blake2b", "blake2s":
-		wide := algorithm == "blake2b"
-		max := 32
-		if wide {
-			max = 64
-		}
-		dk := max
-		if size := input.Get("dkLen"); size != js.Undefined {
-			dk = size.Int()
-			if size.Float() != float64(dk) || dk < 1 || dk > max {
-				panic("invalid digest length")
+		return func(opts blake2Opts) (hash, error) {
+			if opts.key == nil {
+				return nil, hashError(`"key" expected Uint8Array`)
 			}
-		}
-		salt, pers := byteArray(input.Get("salt")), byteArray(input.Get("personalization"))
-		if (key != nil && (len(key) == 0 || len(key) > max)) || (salt != nil && len(salt) != max/4) || (pers != nil && len(pers) != max/4) {
-			panic("invalid BLAKE2 parameters")
-		}
-		result = blake2Digest(wide, chunks, dk, key, salt, pers)
-	default:
-		panic("unknown algorithm")
+			return newHMAC(func() hash { return newSHA256() }, opts.key), nil
+		}, nil
 	}
-	const digits = "0123456789abcdef"
-	out := make([]byte, 2*len(result))
-	for i, b := range result {
-		out[2*i] = digits[b>>4]
-		out[2*i+1] = digits[b&15]
-	}
-	return string(out)
+	return nil, hashError("unknown hash")
 }
+
+func digestInput(input *js.Object) (string, error) {
+	create, err := hasher(input.Get("algorithm").String())
+	if err != nil {
+		return "", err
+	}
+	opts := blake2Opts{
+		key:             optionalBytes(input, "key"),
+		salt:            optionalBytes(input, "salt"),
+		personalization: optionalBytes(input, "personalization"),
+	}
+	if v := input.Get("dkLen"); v != js.Undefined {
+		dkLen := v.Float()
+		opts.dkLen = &dkLen
+	}
+	if bytes := input.Get("bytes"); bytes != js.Undefined {
+		message := toBytes(bytes)
+		h, err := create(opts)
+		if err != nil {
+			return "", err
+		}
+		h.update(message)
+		return bytesToHex(h.digest()), nil
+	}
+	h, err := create(opts)
+	if err != nil {
+		return "", err
+	}
+	chunks := input.Get("chunks")
+	blocks := make([][]byte, chunks.Length())
+	for i := range blocks {
+		blocks[i] = toBytes(chunks.Index(i))
+	}
+	repeat := 1
+	if v := input.Get("repeat"); v != js.Undefined {
+		repeat = v.Int()
+	}
+	for i := 0; i < repeat; i++ {
+		for _, block := range blocks {
+			h.update(block)
+		}
+	}
+	return bytesToHex(h.digest()), nil
+}
+
+// run throws the error a hash reports, as noble does.
+func run(input *js.Object) string {
+	hex, err := digestInput(input)
+	if err != nil {
+		panic(js.Global.Get("Error").New(err.Error()))
+	}
+	return hex
+}
+
 func main() { js.Module.Get("exports").Set("run", run) }

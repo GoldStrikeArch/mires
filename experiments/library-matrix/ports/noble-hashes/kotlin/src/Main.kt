@@ -1,3 +1,6 @@
+// The boundary: libraries/noble-hashes/reference.mjs in Kotlin. The input is the corpus object
+// itself, read through an external interface; byte arrays are copied into ByteArrays.
+
 external interface HashInput {
     val algorithm: String
     val bytes: Array<Int>?
@@ -9,33 +12,41 @@ external interface HashInput {
     val personalization: Array<Int>?
 }
 
+/** Uint8Array.from(values). */
+private fun toBytes(values: Array<Int>): ByteArray = ByteArray(values.size) { values[it].toByte() }
+
+/** reference.mjs's `hashes` table plus HMAC-SHA-256: the constructor for [algorithm]. */
+private fun hasher(algorithm: String): (Blake2Opts) -> Hash = when (algorithm) {
+    "sha256" -> { _ -> Sha256() }
+    "sha512" -> { _ -> Sha512() }
+    "sha3_256" -> { _ -> Keccak(136, 0x06, 32) }
+    "keccak_256" -> { _ -> Keccak(136, 0x01, 32) }
+    "blake2b" -> { opts -> Blake2b(opts) }
+    "blake2s" -> { opts -> Blake2s(opts) }
+    "hmac_sha256" -> { opts -> Hmac({ Sha256() }, requireNotNull(opts.key) { "\"key\" expected Uint8Array" }) }
+    else -> throw IllegalArgumentException("unknown hash")
+}
+
 @OptIn(ExperimentalJsExport::class)
 @JsExport
 fun run(input: HashInput): String {
-    val blocks = input.bytes?.let { arrayOf(it.toIntArray()) }
-        ?: input.chunks!!.map { it.toIntArray() }.toTypedArray()
-    val repeat = if (input.bytes == null) input.repeat ?: 1 else 1
-    val chunks = if (repeat == 1) blocks else Array(repeat * blocks.size) { blocks[it % blocks.size] }
-    val key = input.key?.toIntArray() ?: intArrayOf()
-    val result = when (input.algorithm) {
-        "sha256" -> Sha2.digest(0, chunks, key)
-        "sha512" -> Sha2.digest(1, chunks, key)
-        "hmac_sha256" -> { require(input.key != null); Sha2.digest(2, chunks, key) }
-        "sha3_256", "keccak_256" -> Sha3.digest(input.algorithm == "keccak_256", chunks)
-        "blake2b", "blake2s" -> {
-            val wide = input.algorithm == "blake2b"
-            val limit = if (wide) 64 else 32
-            val size = input.dkLen ?: limit.toDouble()
-            val dkLen = size.toInt()
-            require(dkLen in 1..limit && dkLen.toDouble() == size)
-            require(input.key == null || key.size in 1..limit)
-            require(input.salt == null || input.salt!!.size == limit / 4)
-            require(input.personalization == null || input.personalization!!.size == limit / 4)
-            Blake2.digest(wide, chunks, dkLen, key, input.salt?.toIntArray() ?: intArrayOf(),
-                input.personalization?.toIntArray() ?: intArrayOf())
-        }
-        else -> error("unknown hash")
+    val create = hasher(input.algorithm)
+    val opts = Blake2Opts(
+        input.dkLen,
+        input.key?.let { toBytes(it) },
+        input.salt?.let { toBytes(it) },
+        input.personalization?.let { toBytes(it) },
+    )
+    val bytes = input.bytes
+    if (bytes != null) {
+        val message = toBytes(bytes)
+        return bytesToHex(create(opts).update(message).digest())
     }
-    val digits = "0123456789abcdef"
-    return buildString { for (b in result) { append(digits[b ushr 4]); append(digits[b and 15]) } }
+    val state = create(opts)
+    val chunks = requireNotNull(input.chunks) { "expected bytes or chunks" }
+    val blocks = Array(chunks.size) { toBytes(chunks[it]) }
+    repeat(input.repeat ?: 1) {
+        for (block in blocks) state.update(block)
+    }
+    return bytesToHex(state.digest())
 }

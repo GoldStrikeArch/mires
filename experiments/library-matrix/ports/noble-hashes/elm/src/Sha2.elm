@@ -1,310 +1,334 @@
-module Sha2 exposing (digest)
+module Sha2 exposing (Sha256, Sha512, sha256, sha256IV, sha512)
+
+{-| noble's sha2.ts: SHA-256 (SHA2\_32B) and SHA-512 (SHA2\_64B), with the IVs from \_md.ts.
+-}
 
 import Array exposing (Array)
-import Bitwise as B
+import Bitwise exposing (or, shiftRightZfBy)
+import Md exposing (Md, chi, maj)
+import U64 exposing (add, add3H, add3L, add4H, add4L, add5H, add5L, rotrBH, rotrBL, rotrSH, rotrSL, shrSH, shrSL)
+import Words exposing (at, rotr)
 
 
-iv256 : Array Int
-iv256 =
+sha256IV : List Int
+sha256IV =
+    [ 0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19 ]
+
+
+sha256K : Array Int
+sha256K =
     Array.fromList
-        [ 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+        [ 0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5
+        , 0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174
+        , 0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA
+        , 0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7, 0xC6E00BF3, 0xD5A79147, 0x06CA6351, 0x14292967
+        , 0x27B70A85, 0x2E1B2138, 0x4D2C6DFC, 0x53380D13, 0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85
+        , 0xA2BFE8A1, 0xA81A664B, 0xC24B8B70, 0xC76C51A3, 0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070
+        , 0x19A4C116, 0x1E376C08, 0x2748774C, 0x34B0BCB5, 0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3
+        , 0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2
         ]
 
 
-iv512 : Array Int
-iv512 =
-    Array.fromList
-        [ 0x6a09e667, 0xf3bcc908, 0xbb67ae85, 0x84caa73b, 0x3c6ef372, 0xfe94f82b, 0xa54ff53a, 0x5f1d36f1
-        , 0x510e527f, 0xade682d1, 0x9b05688c, 0x2b3e6c1f, 0x1f83d9ab, 0xfb41bd6b, 0x5be0cd19, 0x137e2179
-        ]
+{-| noble's SHA2\_32B state: A ... H.
+-}
+type alias Sha256 =
+    { a : Int, b : Int, c : Int, d : Int, e : Int, f : Int, g : Int, h : Int }
 
 
-k256 : Array Int
-k256 =
-    Array.fromList
-        [ 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5
-        , 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174
-        , 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da
-        , 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967
-        , 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85
-        , 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070
-        , 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3
-        , 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-        ]
-
-
-k512h : Array Int
-k512h =
-    Array.fromList
-        [ 0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5
-        , 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174
-        , 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da
-        , 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967
-        , 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85
-        , 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070
-        , 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3
-        , 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-        , 0xca273ece, 0xd186b8c7, 0xeada7dd6, 0xf57d4f7f, 0x06f067aa, 0x0a637dc5, 0x113f9804, 0x1b710b35
-        , 0x28db77f5, 0x32caab7b, 0x3c9ebe0a, 0x431d67c4, 0x4cc5d4be, 0x597f299c, 0x5fcb6fab, 0x6c44198c
-        ]
-
-
-k512l : Array Int
-k512l =
-    Array.fromList
-        [ 0xd728ae22, 0x23ef65cd, 0xec4d3b2f, 0x8189dbbc, 0xf348b538, 0xb605d019, 0xaf194f9b, 0xda6d8118
-        , 0xa3030242, 0x45706fbe, 0x4ee4b28c, 0xd5ffb4e2, 0xf27b896f, 0x3b1696b1, 0x25c71235, 0xcf692694
-        , 0x9ef14ad2, 0x384f25e3, 0x8b8cd5b5, 0x77ac9c65, 0x592b0275, 0x6ea6e483, 0xbd41fbd4, 0x831153b5
-        , 0xee66dfab, 0x2db43210, 0x98fb213f, 0xbeef0ee4, 0x3da88fc2, 0x930aa725, 0xe003826f, 0x0a0e6e70
-        , 0x46d22ffc, 0x5c26c926, 0x5ac42aed, 0x9d95b3df, 0x8baf63de, 0x3c77b2a8, 0x47edaee6, 0x1482353b
-        , 0x4cf10364, 0xbc423001, 0xd0f89791, 0x0654be30, 0xd6ef5218, 0x5565a910, 0x5771202a, 0x32bbd1b8
-        , 0xb8d2d0c8, 0x5141ab53, 0xdf8eeb99, 0xe19b48a8, 0xc5c95a63, 0xe3418acb, 0x7763e373, 0xd6b2b8a3
-        , 0x5defb2fc, 0x43172f60, 0xa1f0ab72, 0x1a6439ec, 0x23631e28, 0xde82bde9, 0xb2c67915, 0xe372532b
-        , 0xea26619c, 0x21c0c207, 0xcde0eb1e, 0xee6ed178, 0x72176fba, 0xa2c898a6, 0xbef90dae, 0x131c471b
-        , 0x23047d84, 0x40c72493, 0x15c9bebc, 0x9c100d4c, 0xcb3e42b6, 0xfc657e2a, 0x3ad6faec, 0x4a475817
-        ]
-
-
-type alias Word64 =
-    ( Int, Int )
-
-
-type alias Registers word =
-    { a : word, b : word, c : word, d : word, e : word, f : word, g : word, h : word }
-
-
-get zero i arr =
-    Array.get i arr |> Maybe.withDefault zero
-
-
-registers at =
-    Registers (at 0) (at 1) (at 2) (at 3) (at 4) (at 5) (at 6) (at 7)
-
-
-words r =
-    [ r.a, r.b, r.c, r.d, r.e, r.f, r.g, r.h ]
-
-
-add32 a b =
-    B.or 0 (a + b)
-
-
-add64 ( ah, al ) ( bh, bl ) =
+sha256 : Md Sha256
+sha256 =
     let
-        lo =
-            B.shiftRightZfBy 0 al + B.shiftRightZfBy 0 bl
+        words =
+            Array.fromList sha256IV
 
-        carry =
-            if lo >= 4294967296 then
-                1
-
-            else
-                0
+        iv i =
+            at i words
     in
-    ( B.or 0 (ah + bh + carry), B.or 0 lo )
+    Md.make 64 32 8 (Sha256 (iv 0) (iv 1) (iv 2) (iv 3) (iv 4) (iv 5) (iv 6) (iv 7)) process256 (\s -> [ s.a, s.b, s.c, s.d, s.e, s.f, s.g, s.h ])
 
 
-xor3 a b c =
-    B.xor a (B.xor b c)
-
-
-choose a b c =
-    B.xor (B.and a b) (B.and (B.complement a) c)
-
-
-majority a b c =
-    B.or (B.and a b) (B.and (B.or a b) c)
-
-
-ror32 n a =
-    B.or (B.shiftRightZfBy n a) (B.shiftLeftBy (32 - n) a)
-
-
-ror64 n ( hi, lo ) =
-    let
-        rotate count a b =
-            B.or (B.shiftRightZfBy count a) (B.shiftLeftBy (32 - count) b)
-    in
-    if n < 32 then
-        ( rotate n hi lo, rotate n lo hi )
+{-| Extends the 16 words of a block into the 64-word message schedule.
+-}
+schedule256 : Int -> Array Int -> Array Int
+schedule256 i w =
+    if i == 64 then
+        w
 
     else
-        ( rotate (n - 32) lo hi, rotate (n - 32) hi lo )
-
-
-shr64 n ( hi, lo ) =
-    ( B.shiftRightZfBy n hi, B.or (B.shiftRightZfBy n lo) (B.shiftLeftBy (32 - n) hi) )
-
-
-lanes op ( ah, al ) ( bh, bl ) ( ch, cl ) =
-    ( op ah bh ch, op al bl cl )
-
-
-word bytes i =
-    let
-        at offset =
-            get 0 (i * 4 + offset) bytes
-    in
-    B.or (B.or (B.shiftLeftBy 24 (at 0)) (B.shiftLeftBy 16 (at 1))) (B.or (B.shiftLeftBy 8 (at 2)) (at 3))
-
-
-schedule zero limit small0 small1 add first =
-    let
-        extend i w =
-            if i == limit then
-                w
-
-            else
-                let
-                    back n =
-                        get zero (i - n) w
-
-                    next =
-                        add (add (small0 (back 15)) (back 16)) (add (small1 (back 2)) (back 7))
-                in
-                extend (i + 1) (Array.push next w)
-    in
-    extend 16 (Array.initialize 16 first)
-
-
-rounds zero count big0 big1 ch maj add constant w initial =
-    let
-        step i r =
-            if i == count then
-                r
-
-            else
-                let
-                    t1 =
-                        add (add r.h (big1 r.e)) (add (ch r.e r.f r.g) (add (constant i) (get zero i w)))
-
-                    a =
-                        add t1 (add (big0 r.a) (maj r.a r.b r.c))
-                in
-                step (i + 1) (Registers a r.a r.b r.c (add r.d t1) r.e r.f r.g)
-    in
-    List.map2 add (words initial) (words (step 0 initial))
-
-
-compress256 bytes state =
-    let
-        small0 x =
-            xor3 (ror32 7 x) (ror32 18 x) (B.shiftRightZfBy 3 x)
-
-        small1 x =
-            xor3 (ror32 17 x) (ror32 19 x) (B.shiftRightZfBy 10 x)
-
-        big0 x =
-            xor3 (ror32 2 x) (ror32 13 x) (ror32 22 x)
-
-        big1 x =
-            xor3 (ror32 6 x) (ror32 11 x) (ror32 25 x)
-
-        w =
-            schedule 0 64 small0 small1 add32 (word bytes)
-    in
-    rounds 0 64 big0 big1 choose majority add32 (\i -> get 0 i k256) w (registers (\i -> get 0 i state))
-        |> Array.fromList
-
-
-compress512 bytes state =
-    let
-        small0 x =
-            lanes xor3 (ror64 1 x) (ror64 8 x) (shr64 7 x)
-
-        small1 x =
-            lanes xor3 (ror64 19 x) (ror64 61 x) (shr64 6 x)
-
-        big0 x =
-            lanes xor3 (ror64 28 x) (ror64 34 x) (ror64 39 x)
-
-        big1 x =
-            lanes xor3 (ror64 14 x) (ror64 18 x) (ror64 41 x)
-
-        first i =
-            ( word bytes (i * 2), word bytes (i * 2 + 1) )
-
-        constant i =
-            ( get 0 i k512h, get 0 i k512l )
-
-        initial =
-            registers (\i -> ( get 0 (i * 2) state, get 0 (i * 2 + 1) state ))
-
-        w =
-            schedule ( 0, 0 ) 80 small0 small1 add64 first
-    in
-    rounds ( 0, 0 ) 80 big0 big1 (lanes choose) (lanes majority) add64 constant w initial
-        |> List.concatMap (\( h, l ) -> [ h, l ])
-        |> Array.fromList
-
-
-hash wide chunks =
-    let
-        ( width, initial, compress ) =
-            if wide then
-                ( 128, iv512, compress512 )
-
-            else
-                ( 64, iv256, compress256 )
-
-        absorb bytes used pending state =
-            case bytes of
-                [] ->
-                    ( used, pending, state )
-
-                b :: rest ->
-                    if used + 1 == width then
-                        absorb rest 0 [] (compress (Array.fromList (List.reverse (b :: pending))) state)
-
-                    else
-                        absorb rest (used + 1) (b :: pending) state
-
-        update bytes ( used, pending, state ) =
-            absorb bytes used pending state
-
-        ( pos, tail, prefix ) =
-            List.foldl update ( 0, [], initial ) chunks
-
-        lengthBytes n bits acc =
-            if n == 0 then
-                acc
-
-            else
-                lengthBytes (n - 1) (floor (toFloat bits / 256)) (B.and 255 bits :: acc)
-
-        length =
-            List.foldl (\chunk count -> count + List.length chunk) 0 chunks
-
-        zeros =
-            modBy width (width - width // 8 - pos - 1)
-
-        padding =
-            128 :: (List.repeat zeros 0 ++ lengthBytes (width // 8) (length * 8) [])
-
-        ( _, _, result ) =
-            update padding ( pos, tail, prefix )
-
-        bytesOf x =
-            List.map (\shift -> B.and 255 (B.shiftRightZfBy shift x)) [ 24, 16, 8, 0 ]
-    in
-    Array.toList result |> List.concatMap bytesOf
-
-
-digest : Int -> List (List Int) -> List Int -> List Int
-digest mode chunks key =
-    if mode == 2 then
         let
-            k =
-                if List.length key > 64 then
-                    hash False [ key ]
+            w15 =
+                at (i - 15) w
 
-                else
-                    key
+            w2 =
+                at (i - 2) w
 
-            pad mask =
-                List.map (B.xor mask) (k ++ List.repeat (64 - List.length k) 0)
+            s0 =
+                Bitwise.xor (Bitwise.xor (rotr w15 7) (rotr w15 18)) (shiftRightZfBy 3 w15)
+
+            s1 =
+                Bitwise.xor (Bitwise.xor (rotr w2 17) (rotr w2 19)) (shiftRightZfBy 10 w2)
         in
-        hash False [ pad 0x5C, hash False (pad 0x36 :: chunks) ]
+        schedule256 (i + 1) (Array.push (or 0 (s1 + at (i - 7) w + s0 + at (i - 16) w)) w)
+
+
+{-| Round `i` onwards of the compression function.
+-}
+rounds256 : Int -> Array Int -> Sha256 -> Sha256
+rounds256 i w s =
+    if i == 64 then
+        s
 
     else
-        hash (mode == 1) chunks
+        let
+            sigma1 =
+                Bitwise.xor (Bitwise.xor (rotr s.e 6) (rotr s.e 11)) (rotr s.e 25)
+
+            t1 =
+                or 0 (s.h + sigma1 + chi s.e s.f s.g + at i sha256K + at i w)
+
+            sigma0 =
+                Bitwise.xor (Bitwise.xor (rotr s.a 2) (rotr s.a 13)) (rotr s.a 22)
+
+            t2 =
+                or 0 (sigma0 + maj s.a s.b s.c)
+        in
+        rounds256 (i + 1) w (Sha256 (or 0 (t1 + t2)) s.a s.b s.c (or 0 (s.d + t1)) s.e s.f s.g)
+
+
+process256 : List Int -> Sha256 -> Sha256
+process256 block s =
+    let
+        v =
+            rounds256 0 (schedule256 16 (Array.fromList (Words.wordsBE block))) s
+    in
+    -- Add the compressed block to the state.
+    Sha256 (or 0 (s.a + v.a))
+        (or 0 (s.b + v.b))
+        (or 0 (s.c + v.c))
+        (or 0 (s.d + v.d))
+        (or 0 (s.e + v.e))
+        (or 0 (s.f + v.f))
+        (or 0 (s.g + v.g))
+        (or 0 (s.h + v.h))
+
+
+sha512IV : List Int
+sha512IV =
+    [ 0x6A09E667, 0xF3BCC908, 0xBB67AE85, 0x84CAA73B, 0x3C6EF372, 0xFE94F82B, 0xA54FF53A, 0x5F1D36F1
+    , 0x510E527F, 0xADE682D1, 0x9B05688C, 0x2B3E6C1F, 0x1F83D9AB, 0xFB41BD6B, 0x5BE0CD19, 0x137E2179
+    ]
+
+
+{-| The 80 round constants of RFC 6234 §5.2, split into high and low halves as noble's K512 is.
+-}
+sha512Kh : Array Int
+sha512Kh =
+    Array.fromList
+        [ 0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5
+        , 0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174
+        , 0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA
+        , 0x983E5152, 0xA831C66D, 0xB00327C8, 0xBF597FC7, 0xC6E00BF3, 0xD5A79147, 0x06CA6351, 0x14292967
+        , 0x27B70A85, 0x2E1B2138, 0x4D2C6DFC, 0x53380D13, 0x650A7354, 0x766A0ABB, 0x81C2C92E, 0x92722C85
+        , 0xA2BFE8A1, 0xA81A664B, 0xC24B8B70, 0xC76C51A3, 0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070
+        , 0x19A4C116, 0x1E376C08, 0x2748774C, 0x34B0BCB5, 0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3
+        , 0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2
+        , 0xCA273ECE, 0xD186B8C7, 0xEADA7DD6, 0xF57D4F7F, 0x06F067AA, 0x0A637DC5, 0x113F9804, 0x1B710B35
+        , 0x28DB77F5, 0x32CAAB7B, 0x3C9EBE0A, 0x431D67C4, 0x4CC5D4BE, 0x597F299C, 0x5FCB6FAB, 0x6C44198C
+        ]
+
+
+sha512Kl : Array Int
+sha512Kl =
+    Array.fromList
+        [ 0xD728AE22, 0x23EF65CD, 0xEC4D3B2F, 0x8189DBBC, 0xF348B538, 0xB605D019, 0xAF194F9B, 0xDA6D8118
+        , 0xA3030242, 0x45706FBE, 0x4EE4B28C, 0xD5FFB4E2, 0xF27B896F, 0x3B1696B1, 0x25C71235, 0xCF692694
+        , 0x9EF14AD2, 0x384F25E3, 0x8B8CD5B5, 0x77AC9C65, 0x592B0275, 0x6EA6E483, 0xBD41FBD4, 0x831153B5
+        , 0xEE66DFAB, 0x2DB43210, 0x98FB213F, 0xBEEF0EE4, 0x3DA88FC2, 0x930AA725, 0xE003826F, 0x0A0E6E70
+        , 0x46D22FFC, 0x5C26C926, 0x5AC42AED, 0x9D95B3DF, 0x8BAF63DE, 0x3C77B2A8, 0x47EDAEE6, 0x1482353B
+        , 0x4CF10364, 0xBC423001, 0xD0F89791, 0x0654BE30, 0xD6EF5218, 0x5565A910, 0x5771202A, 0x32BBD1B8
+        , 0xB8D2D0C8, 0x5141AB53, 0xDF8EEB99, 0xE19B48A8, 0xC5C95A63, 0xE3418ACB, 0x7763E373, 0xD6B2B8A3
+        , 0x5DEFB2FC, 0x43172F60, 0xA1F0AB72, 0x1A6439EC, 0x23631E28, 0xDE82BDE9, 0xB2C67915, 0xE372532B
+        , 0xEA26619C, 0x21C0C207, 0xCDE0EB1E, 0xEE6ED178, 0x72176FBA, 0xA2C898A6, 0xBEF90DAE, 0x131C471B
+        , 0x23047D84, 0x40C72493, 0x15C9BEBC, 0x9C100D4C, 0xCB3E42B6, 0xFC657E2A, 0x3AD6FAEC, 0x4A475817
+        ]
+
+
+{-| noble's SHA2\_64B state: Ah, Al, ..., Hh, Hl.
+-}
+type alias Sha512 =
+    { ah : Int, al : Int, bh : Int, bl : Int, ch : Int, cl : Int, dh : Int, dl : Int
+    , eh : Int, el : Int, fh : Int, fl : Int, gh : Int, gl : Int, hh : Int, hl : Int
+    }
+
+
+sha512 : Md Sha512
+sha512 =
+    Md.make 128 64 16 (fromWords sha512IV) process512 toWords
+
+
+fromWords : List Int -> Sha512
+fromWords words =
+    let
+        array =
+            Array.fromList words
+
+        word i =
+            at i array
+    in
+    { ah = word 0, al = word 1, bh = word 2, bl = word 3, ch = word 4, cl = word 5, dh = word 6, dl = word 7
+    , eh = word 8, el = word 9, fh = word 10, fl = word 11, gh = word 12, gl = word 13, hh = word 14, hl = word 15
+    }
+
+
+toWords : Sha512 -> List Int
+toWords s =
+    [ s.ah, s.al, s.bh, s.bl, s.ch, s.cl, s.dh, s.dl, s.eh, s.el, s.fh, s.fl, s.gh, s.gl, s.hh, s.hl ]
+
+
+{-| Extends the 16 words of a block into the 80-word message schedule, as high halves `wh` and
+low halves `wl` (noble's SHA512\_W\_H and SHA512\_W\_L).
+-}
+schedule512 : Int -> Array Int -> Array Int -> ( Array Int, Array Int )
+schedule512 i wh wl =
+    if i == 80 then
+        ( wh, wl )
+
+    else
+        let
+            -- s0 = rotr(w[i-15], 1) ^ rotr(w[i-15], 8) ^ (w[i-15] >>> 7)
+            w15h =
+                at (i - 15) wh
+
+            w15l =
+                at (i - 15) wl
+
+            s0h =
+                Bitwise.xor (Bitwise.xor (rotrSH w15h w15l 1) (rotrSH w15h w15l 8)) (shrSH w15h w15l 7)
+
+            s0l =
+                Bitwise.xor (Bitwise.xor (rotrSL w15h w15l 1) (rotrSL w15h w15l 8)) (shrSL w15h w15l 7)
+
+            -- s1 = rotr(w[i-2], 19) ^ rotr(w[i-2], 61) ^ (w[i-2] >>> 6)
+            w2h =
+                at (i - 2) wh
+
+            w2l =
+                at (i - 2) wl
+
+            s1h =
+                Bitwise.xor (Bitwise.xor (rotrSH w2h w2l 19) (rotrBH w2h w2l 61)) (shrSH w2h w2l 6)
+
+            s1l =
+                Bitwise.xor (Bitwise.xor (rotrSL w2h w2l 19) (rotrBL w2h w2l 61)) (shrSL w2h w2l 6)
+
+            sumL =
+                add4L s0l s1l (at (i - 7) wl) (at (i - 16) wl)
+
+            sumH =
+                add4H sumL s0h s1h (at (i - 7) wh) (at (i - 16) wh)
+        in
+        schedule512 (i + 1) (Array.push sumH wh) (Array.push (or 0 sumL) wl)
+
+
+{-| Round `i` onwards of the compression function.
+-}
+rounds512 : Int -> Array Int -> Array Int -> Sha512 -> Sha512
+rounds512 i wh wl s =
+    if i == 80 then
+        s
+
+    else
+        let
+            -- S1 = rotr(e, 14) ^ rotr(e, 18) ^ rotr(e, 41)
+            sigma1h =
+                Bitwise.xor (Bitwise.xor (rotrSH s.eh s.el 14) (rotrSH s.eh s.el 18)) (rotrBH s.eh s.el 41)
+
+            sigma1l =
+                Bitwise.xor (Bitwise.xor (rotrSL s.eh s.el 14) (rotrSL s.eh s.el 18)) (rotrBL s.eh s.el 41)
+
+            -- T1 = H + S1 + Chi(E, F, G) + K[i] + W[i]
+            t1ll =
+                add5L s.hl sigma1l (chi s.el s.fl s.gl) (at i sha512Kl) (at i wl)
+
+            t1h =
+                add5H t1ll s.hh sigma1h (chi s.eh s.fh s.gh) (at i sha512Kh) (at i wh)
+
+            t1l =
+                or 0 t1ll
+
+            -- S0 = rotr(a, 28) ^ rotr(a, 34) ^ rotr(a, 39)
+            sigma0h =
+                Bitwise.xor (Bitwise.xor (rotrSH s.ah s.al 28) (rotrBH s.ah s.al 34)) (rotrBH s.ah s.al 39)
+
+            sigma0l =
+                Bitwise.xor (Bitwise.xor (rotrSL s.ah s.al 28) (rotrBL s.ah s.al 34)) (rotrBL s.ah s.al 39)
+
+            e =
+                add s.dh s.dl t1h t1l
+
+            all =
+                add3L t1l sigma0l (maj s.al s.bl s.cl)
+        in
+        rounds512 (i + 1)
+            wh
+            wl
+            { ah = add3H all t1h sigma0h (maj s.ah s.bh s.ch)
+            , al = or 0 all
+            , bh = s.ah
+            , bl = s.al
+            , ch = s.bh
+            , cl = s.bl
+            , dh = s.ch
+            , dl = s.cl
+            , eh = e.h
+            , el = e.l
+            , fh = s.eh
+            , fl = s.el
+            , gh = s.fh
+            , gl = s.fl
+            , hh = s.gh
+            , hl = s.gl
+            }
+
+
+process512 : List Int -> Sha512 -> Sha512
+process512 block s =
+    let
+        words =
+            Array.fromList (Words.wordsBE block)
+
+        -- Even words are the high halves, odd words the low ones.
+        ( wh, wl ) =
+            schedule512 16 (Array.initialize 16 (\i -> at (2 * i) words)) (Array.initialize 16 (\i -> at (2 * i + 1) words))
+
+        v =
+            rounds512 0 wh wl s
+
+        -- Add the compressed block to the state.
+        a =
+            add s.ah s.al v.ah v.al
+
+        b =
+            add s.bh s.bl v.bh v.bl
+
+        c =
+            add s.ch s.cl v.ch v.cl
+
+        d =
+            add s.dh s.dl v.dh v.dl
+
+        e =
+            add s.eh s.el v.eh v.el
+
+        f =
+            add s.fh s.fl v.fh v.fl
+
+        g =
+            add s.gh s.gl v.gh v.gl
+
+        h =
+            add s.hh s.hl v.hh v.hl
+    in
+    { ah = a.h, al = a.l, bh = b.h, bl = b.l, ch = c.h, cl = c.l, dh = d.h, dl = d.l
+    , eh = e.h, el = e.l, fh = f.h, fl = f.l, gh = g.h, gl = g.l, hh = h.h, hl = h.l
+    }

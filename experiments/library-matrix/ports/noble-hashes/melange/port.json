@@ -3,5 +3,5 @@
   "library": "noble-hashes",
   "language": "melange",
   "entry": "src/index.ml",
-  "boundary": "Decode byte arrays, feed native incremental hash states and return a lowercase hexadecimal digest."
+  "boundary": "The input is a Js.t object read with ## and its arrays of numbers are OCaml int arrays, so nothing is converted; a create/update/digest state per call returns the hexadecimal digest as a JS string."
 }

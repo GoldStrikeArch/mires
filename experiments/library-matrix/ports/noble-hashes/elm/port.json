@@ -4,5 +4,5 @@
   "language": "elm",
   "main": "src/Main.elm",
   "host": "js/index.js",
-  "boundary": "Decode byte arrays, feed native incremental hash states and return a lowercase hexadecimal digest."
+  "boundary": "The JS host sends the input through a port; Json.Decode reads it into lists of byte Ints, immutable create/update/digest states hash them, and a port message carries the hexadecimal digest or the error back."
 }

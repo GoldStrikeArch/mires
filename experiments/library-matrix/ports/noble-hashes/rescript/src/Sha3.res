@@ -1,118 +1,181 @@
-// SHA3-256 and Keccak-256, adapted from @noble/hashes 2.4.0 (MIT).
-let pi = [
-  20, 14, 22, 34, 36, 6, 10, 32,
-  16, 42, 48, 8, 30, 46, 38, 26,
-  24, 4, 40, 28, 44, 18, 12, 2
+// noble's sha3.ts: Keccak-f[1600] and the Keccak sponge behind SHA3-256 and Keccak-256.
+//
+// The state is noble's state32: 25 lanes of two 32-bit words, the low word first. noble derives
+// the pi, rho and iota tables at load time; they are written out here.
+
+// Pi: the word index each rho step moves its lane to (noble's SHA3_PI).
+let sha3Pi = [20, 14, 22, 34, 36, 6, 10, 32, 16, 42, 48, 8, 30, 46, 38, 26, 24, 4, 40, 28, 44, 18, 12, 2]
+
+// Rho: the left rotation of each step (noble's SHA3_ROTL).
+let sha3Rotl = [1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44]
+
+// Iota: the low and high words of each round constant (noble's SHA3_IOTA_H and SHA3_IOTA_L).
+let sha3IotaH = [
+  0x00000001, 0x00008082, 0x0000808a, 0x80008000, 0x0000808b, 0x80000001, 0x80008081, 0x00008009,
+  0x0000008a, 0x00000088, 0x80008009, 0x8000000a, 0x8000808b, 0x0000008b, 0x00008089, 0x00008003,
+  0x00008002, 0x00000080, 0x0000800a, 0x8000000a, 0x80008081, 0x00008080, 0x80000001, 0x80008008,
 ]
-let rotations = [
-  1, 3, 6, 10, 15, 21, 28, 36,
-  45, 55, 2, 14, 27, 41, 56, 8,
-  25, 43, 62, 18, 39, 61, 20, 44
-]
-let rcLo = [
-  1, 32898, 32906, -2147450880, 32907, -2147483647, -2147450751, 32777,
-  138, 136, -2147450871, -2147483638, -2147450741, 139, 32905, 32771,
-  32770, 128, 32778, -2147483638, -2147450751, 32896, -2147483647, -2147450872
-]
-let rcHi = [
-  0, 0, -2147483648, -2147483648, 0, 0, -2147483648, -2147483648,
-  0, 0, 0, 0, 0, -2147483648, -2147483648, -2147483648,
-  -2147483648, -2147483648, 0, -2147483648, -2147483648, -2147483648, 0, -2147483648
+let sha3IotaL = [
+  0x00000000, 0x00000000, 0x80000000, 0x80000000, 0x00000000, 0x00000000, 0x80000000, 0x80000000,
+  0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x80000000, 0x80000000, 0x80000000,
+  0x80000000, 0x80000000, 0x00000000, 0x80000000, 0x80000000, 0x80000000, 0x00000000, 0x80000000,
 ]
 
-external xor: (int, int) => int = "%xorint"
-external band: (int, int) => int = "%andint"
-external bor: (int, int) => int = "%orint"
-external shl: (int, int) => int = "%lslint"
-external shr: (int, int) => int = "%lsrint"
+// Left rotations of a lane by s in 1..31 (S) or 33..63 (B). As in noble, h is the lane's first
+// (low) word and l its second (high) word.
+let rotlSH = (h, l, s) => h << s ||| l >>> 32 - s
+let rotlSL = (h, l, s) => l << s ||| h >>> 32 - s
+let rotlBH = (h, l, s) => l << s - 32 ||| h >>> 64 - s
+let rotlBL = (h, l, s) => h << s - 32 ||| l >>> 64 - s
+let rotlH = (h, l, s) => s > 32 ? rotlBH(h, l, s) : rotlSH(h, l, s)
+let rotlL = (h, l, s) => s > 32 ? rotlBL(h, l, s) : rotlSL(h, l, s)
 
-let permute = s => {
-  let c = Array.make(~length=10, 0)
+// noble's keccakP: the 24 rounds of Keccak-f[1600] on s, with b as the theta scratch.
+let keccakP = (s, b) => {
+  let get = i => s->Array.getUnsafe(i)
+  let xor = (i, v) => s->Array.setUnsafe(i, get(i) ^^^ v)
   for round in 0 to 23 {
-    // Theta mixes column parities into every lane.
+    // Theta
     for x in 0 to 9 {
-      c[x] = xor(xor(xor(xor(Array.getUnsafe(s, x), Array.getUnsafe(s, x+10)), Array.getUnsafe(s, x+20)), Array.getUnsafe(s, x+30)), Array.getUnsafe(s, x+40))
+      b->Array.setUnsafe(x, get(x) ^^^ get(x + 10) ^^^ get(x + 20) ^^^ get(x + 30) ^^^ get(x + 40))
     }
-    for col in 0 to 4 {
-      let x = 2 * col
-      let left = Int.mod(x+8, 10)
-      let right = Int.mod(x+2, 10)
-      let a = Array.getUnsafe(c, right)
-      let b = Array.getUnsafe(c, right+1)
-      let lo = xor(Array.getUnsafe(c, left), bor(shl(a, 1), shr(b, 31)))
-      let hi = xor(Array.getUnsafe(c, left+1), bor(shl(b, 1), shr(a, 31)))
+    for column in 0 to 4 {
+      let x = 2 * column
+      let idx1 = mod(x + 8, 10)
+      let idx0 = mod(x + 2, 10)
+      let b0 = b->Array.getUnsafe(idx0)
+      let b1 = b->Array.getUnsafe(idx0 + 1)
+      let th = rotlH(b0, b1, 1) ^^^ b->Array.getUnsafe(idx1)
+      let tl = rotlL(b0, b1, 1) ^^^ b->Array.getUnsafe(idx1 + 1)
       for row in 0 to 4 {
-        let i = row * 10 + x
-        s[i] = xor(Array.getUnsafe(s, i), lo)
-        s[i+1] = xor(Array.getUnsafe(s, i+1), hi)
+        xor(x + 10 * row, th)
+        xor(x + 10 * row + 1, tl)
       }
     }
-    // Rotate and move the 24 non-origin lanes in one cycle.
-    let lo = ref(Array.getUnsafe(s, 2))
-    let hi = ref(Array.getUnsafe(s, 3))
+    // Rho and pi
+    let curH = ref(get(2))
+    let curL = ref(get(3))
     for t in 0 to 23 {
-      let shift = Array.getUnsafe(rotations, t)
-      let a = if shift > 32 { hi.contents } else { lo.contents }
-      let b = if shift > 32 { lo.contents } else { hi.contents }
-      let k = band(shift, 31)
-      let p = Array.getUnsafe(pi, t)
-      lo := Array.getUnsafe(s, p)
-      hi := Array.getUnsafe(s, p+1)
-      s[p] = bor(shl(a, k), shr(b, 32-k))
-      s[p+1] = bor(shl(b, k), shr(a, 32-k))
+      let shift = sha3Rotl->Array.getUnsafe(t)
+      let th = rotlH(curH.contents, curL.contents, shift)
+      let tl = rotlL(curH.contents, curL.contents, shift)
+      let pi = sha3Pi->Array.getUnsafe(t)
+      curH := get(pi)
+      curL := get(pi + 1)
+      s->Array.setUnsafe(pi, th)
+      s->Array.setUnsafe(pi + 1, tl)
     }
-    // Chi reads the original five lanes in each row.
+    // Chi
     for row in 0 to 4 {
-      let y = row * 10
-      let b0 = Array.getUnsafe(s, y)
-      let b1 = Array.getUnsafe(s, y+1)
-      let b2 = Array.getUnsafe(s, y+2)
-      let b3 = Array.getUnsafe(s, y+3)
-      let chi = (a,b,c) => xor(a, band(xor(b,-1),c))
+      let y = 10 * row
+      let b0 = get(y)
+      let b1 = get(y + 1)
+      let b2 = get(y + 2)
+      let b3 = get(y + 3)
       for x in 0 to 5 {
-        s[y+x] = chi(Array.getUnsafe(s, y+x), Array.getUnsafe(s, y+x+2), Array.getUnsafe(s, y+x+4))
+        xor(y + x, ~~~get(y + x + 2) &&& get(y + x + 4))
       }
-      s[y+6] = chi(Array.getUnsafe(s, y+6), Array.getUnsafe(s, y+8), b0)
-      s[y+7] = chi(Array.getUnsafe(s, y+7), Array.getUnsafe(s, y+9), b1)
-      s[y+8] = chi(Array.getUnsafe(s, y+8), b0, b2)
-      s[y+9] = chi(Array.getUnsafe(s, y+9), b1, b3)
+      xor(y + 6, ~~~get(y + 8) &&& b0)
+      xor(y + 7, ~~~get(y + 9) &&& b1)
+      xor(y + 8, ~~~b0 &&& b2)
+      xor(y + 9, ~~~b1 &&& b3)
     }
-    s[0] = xor(Array.getUnsafe(s, 0), Array.getUnsafe(rcLo, round))
-    s[1] = xor(Array.getUnsafe(s, 1), Array.getUnsafe(rcHi, round))
+    // Iota
+    xor(0, sha3IotaH->Array.getUnsafe(round))
+    xor(1, sha3IotaL->Array.getUnsafe(round))
   }
 }
 
-let digest = (legacy, chunks) => {
-  let s = Array.make(~length=50, 0)
+// noble's Keccak sponge with a byte-length rate `blockLen` and domain `suffix`.
+type t = {
+  blockLen: int,
+  suffix: int,
+  outputLen: int,
+  state32: array<int>,
+  theta: array<int>,
+  mutable pos: int,
+  mutable posOut: int,
+}
+
+// XORs `byte` into state byte `index`, as noble does through its byte view of state32.
+let xorByte = (k, index, byte) => {
+  let word = index >>> 2
+  k.state32->Array.setUnsafe(word, k.state32->Array.getUnsafe(word) ^^^ byte << 8 * (index &&& 3))
+}
+
+// The state byte at `index`.
+let stateByte = (k, index) => k.state32->Array.getUnsafe(index >>> 2) >>> 8 * (index &&& 3) &&& 255
+
+let keccak = k => {
+  keccakP(k.state32, k.theta)
+  k.posOut = 0
+  k.pos = 0
+}
+
+let update = (k, data) => {
+  let len = Array.length(data)
   let pos = ref(0)
-  let xorByte = (i, byte) => {
-    let word = shr(i, 2)
-    s[word] = xor(Array.getUnsafe(s, word), shl(byte, 8 * band(i,3)))
-  }
-  chunks->Array.forEach(chunk => {
-    let i = ref(0)
-    while i.contents < Array.length(chunk) {
-      if pos.contents == 0 && Array.length(chunk) - i.contents >= 136 {
-        for word in 0 to 33 {
-          let j = i.contents + word*4
-          let data = bor(bor(Array.getUnsafe(chunk, j),shl(Array.getUnsafe(chunk, j+1),8)),bor(shl(Array.getUnsafe(chunk, j+2),16),shl(Array.getUnsafe(chunk, j+3),24)))
-          s[word] = xor(Array.getUnsafe(s, word), data)
-        }
-        i := i.contents + 136
-        permute(s)
-      } else {
-        xorByte(pos.contents, Array.getUnsafe(chunk, i.contents))
+  while pos.contents < len {
+    if k.pos == 0 && len - pos.contents >= k.blockLen {
+      // Whole blocks with nothing buffered are absorbed a word at a time.
+      for i in 0 to k.blockLen / 4 - 1 {
+        let word = k.state32->Array.getUnsafe(i) ^^^ Utils.getUint32LE(data, pos.contents + 4 * i)
+        k.state32->Array.setUnsafe(i, word)
+      }
+      pos := pos.contents + k.blockLen
+      k.pos = k.blockLen
+      keccak(k)
+    } else {
+      let take = Math.Int.min(k.blockLen - k.pos, len - pos.contents)
+      for _ in 1 to take {
+        xorByte(k, k.pos, data->Array.getUnsafe(pos.contents))
+        k.pos = k.pos + 1
         pos := pos.contents + 1
-        i := i.contents + 1
-        if pos.contents == 136 {
-          permute(s)
-          pos := 0
-        }
+      }
+      if k.pos == k.blockLen {
+        keccak(k)
       }
     }
-  })
-  xorByte(pos.contents, if legacy {1} else {6})
-  xorByte(135,128)
-  permute(s)
-  Array.fromInitializer(~length=32, i => band(shr(Array.getUnsafe(s, shr(i,2)), 8 * band(i,3)),255))
+  }
+}
+
+let finish = k => {
+  // The suffix holds the domain bits and the first padding bit; 0x80 closes pad10*1.
+  xorByte(k, k.pos, k.suffix)
+  if (k.suffix &&& 0x80) != 0 && k.pos == k.blockLen - 1 {
+    keccak(k)
+  }
+  xorByte(k, k.blockLen - 1, 0x80)
+  keccak(k)
+}
+
+let digest = k => {
+  finish(k)
+  let out = Array.make(~length=k.outputLen, 0)
+  let pos = ref(0)
+  while pos.contents < k.outputLen {
+    if k.posOut >= k.blockLen {
+      keccak(k)
+    }
+    let take = Math.Int.min(k.blockLen - k.posOut, k.outputLen - pos.contents)
+    for _ in 1 to take {
+      out->Array.setUnsafe(pos.contents, stateByte(k, k.posOut))
+      k.posOut = k.posOut + 1
+      pos := pos.contents + 1
+    }
+  }
+  out
+}
+
+let make = (~blockLen, ~suffix, ~outputLen): Hash.t => {
+  let k = {
+    blockLen,
+    suffix,
+    outputLen,
+    state32: Array.make(~length=50, 0),
+    theta: Array.make(~length=10, 0),
+    pos: 0,
+    posOut: 0,
+  }
+  {blockLen, outputLen, update: data => update(k, data), digest: () => digest(k)}
 }

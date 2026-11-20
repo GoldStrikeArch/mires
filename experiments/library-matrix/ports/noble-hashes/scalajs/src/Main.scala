@@ -3,8 +3,9 @@ package noblehashes
 import scala.scalajs.js
 import scala.scalajs.js.annotation.JSExportTopLevel
 
+/** The corpus input, read in place through a facade. */
 @js.native
-trait HashInput extends js.Object {
+trait HashInput extends js.Object:
   val algorithm: String = js.native
   val bytes: js.UndefOr[js.Array[Int]] = js.native
   val chunks: js.UndefOr[js.Array[js.Array[Int]]] = js.native
@@ -13,45 +14,39 @@ trait HashInput extends js.Object {
   val key: js.UndefOr[js.Array[Int]] = js.native
   val salt: js.UndefOr[js.Array[Int]] = js.native
   val personalization: js.UndefOr[js.Array[Int]] = js.native
-}
 
-object Main {
-  private def read(x: js.UndefOr[js.Array[Int]]): Array[Int] =
-    x.toOption.fold(Array.empty[Int])(_.toArray)
+/** The boundary: libraries/noble-hashes/reference.mjs in Scala. */
+object Main:
+  /** Uint8Array.from(values). */
+  private def toBytes(values: js.Array[Int]): Array[Byte] = Array.tabulate(values.length)(i => values(i).toByte)
+
+  /** reference.mjs's `hashes` table plus HMAC-SHA-256: the constructor for `algorithm`. */
+  private def hasher(algorithm: String): Blake2Opts => Hash = algorithm match
+    case "sha256" => _ => Sha256()
+    case "sha512" => _ => Sha512()
+    case "sha3_256" => _ => Keccak(136, 0x06, 32)
+    case "keccak_256" => _ => Keccak(136, 0x01, 32)
+    case "blake2b" => opts => Blake2b(opts)
+    case "blake2s" => opts => Blake2s(opts)
+    case "hmac_sha256" =>
+      opts => Hmac(() => Sha256(), opts.key.getOrElse(throw IllegalArgumentException("\"key\" expected Uint8Array")))
+    case _ => throw IllegalArgumentException("unknown hash")
 
   @JSExportTopLevel("run")
-  def run(input: HashInput): String = {
-    val chunks = input.bytes.toOption match {
-      case Some(one) => Array(one.toArray)
+  def run(input: HashInput): String =
+    val create = hasher(input.algorithm)
+    val opts = Blake2Opts(
+      input.dkLen.toOption,
+      input.key.toOption.map(toBytes),
+      input.salt.toOption.map(toBytes),
+      input.personalization.toOption.map(toBytes),
+    )
+    input.bytes.toOption match
+      case Some(bytes) =>
+        val message = toBytes(bytes)
+        Utils.bytesToHex(create(opts).update(message).digest())
       case None =>
-        val blocks = input.chunks.get.toArray.map(_.toArray)
-        Array.tabulate(input.repeat.getOrElse(1) * blocks.length)(i => blocks(i % blocks.length))
-    }
-    val key = read(input.key)
-    val result = input.algorithm match {
-      case "sha256" => Sha2.digest(0, chunks, key)
-      case "sha512" => Sha2.digest(1, chunks, key)
-      case "hmac_sha256" => require(input.key.isDefined); Sha2.digest(2, chunks, key)
-      case "sha3_256" | "keccak_256" => Sha3.digest(input.algorithm == "keccak_256", chunks)
-      case "blake2b" | "blake2s" =>
-        val wide = input.algorithm == "blake2b"
-        val limit = if (wide) 64 else 32
-        val size = input.dkLen.getOrElse(limit.toDouble)
-        require(size == size.toInt && size >= 1 && size <= limit)
-        val salt = read(input.salt)
-        val pers = read(input.personalization)
-        require(input.key.isEmpty || (key.nonEmpty && key.length <= limit))
-        require(input.salt.isEmpty || salt.length == limit / 4)
-        require(input.personalization.isEmpty || pers.length == limit / 4)
-        Blake2.digest(wide, chunks, size.toInt, key, salt, pers)
-      case _ => throw new IllegalArgumentException("unknown hash")
-    }
-    val digits = "0123456789abcdef"
-    val buffer = new StringBuilder
-    for (b <- result) {
-      buffer.append(digits.charAt(b >>> 4))
-      buffer.append(digits.charAt(b & 15))
-    }
-    buffer.toString
-  }
-}
+        val state = create(opts)
+        val blocks = input.chunks.get.toArray.map(toBytes)
+        for _ <- 0 until input.repeat.getOrElse(1); block <- blocks do state.update(block)
+        Utils.bytesToHex(state.digest())

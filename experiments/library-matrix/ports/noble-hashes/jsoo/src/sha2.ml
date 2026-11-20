@@ -1,234 +1,150 @@
-(* SHA-256 and SHA-512 as in @noble/hashes 2.4.0. A 64-bit word consists of two 32-bit lanes. *)
-let iv256 = [|
-  1779033703; -1150833019; 1013904242; -1521486534; 1359893119; -1694144372; 528734635; 1541459225;
-|]
+(* noble's sha2.ts: SHA-256 (SHA2_32B) and SHA-512 (SHA2_64B), with the IVs from _md.ts. *)
 
-let iv512 = [|
-  1779033703; -205731576; -1150833019; -2067093701; 1013904242; -23791573; -1521486534; 1595750129;
-  1359893119; -1377402159; -1694144372; 725511199; 528734635; -79577749; 1541459225; 327033209;
-|]
+open U64
 
-let k256 = [|
-  1116352408; 1899447441; -1245643825; -373957723; 961987163; 1508970993; -1841331548; -1424204075;
-  -670586216; 310598401; 607225278; 1426881987; 1925078388; -2132889090; -1680079193; -1046744716;
-  -459576895; -272742522; 264347078; 604807628; 770255983; 1249150122; 1555081692; 1996064986;
-  -1740746414; -1473132947; -1341970488; -1084653625; -958395405; -710438585; 113926993; 338241895;
-  666307205; 773529912; 1294757372; 1396182291; 1695183700; 1986661051; -2117940946; -1838011259;
-  -1564481375; -1474664885; -1035236496; -949202525; -778901479; -694614492; -200395387; 275423344;
-  430227734; 506948616; 659060556; 883997877; 958139571; 1322822218; 1537002063; 1747873779;
-  1955562222; 2024104815; -2067236844; -1933114872; -1866530822; -1538233109; -1090935817; -965641998;
-|]
+let sha256_iv =
+  [| 0x6a09e667l; 0xbb67ae85l; 0x3c6ef372l; 0xa54ff53al; 0x510e527fl; 0x9b05688cl; 0x1f83d9abl; 0x5be0cd19l |]
 
-let k512h = [|
-  1116352408; 1899447441; -1245643825; -373957723; 961987163; 1508970993; -1841331548; -1424204075;
-  -670586216; 310598401; 607225278; 1426881987; 1925078388; -2132889090; -1680079193; -1046744716;
-  -459576895; -272742522; 264347078; 604807628; 770255983; 1249150122; 1555081692; 1996064986;
-  -1740746414; -1473132947; -1341970488; -1084653625; -958395405; -710438585; 113926993; 338241895;
-  666307205; 773529912; 1294757372; 1396182291; 1695183700; 1986661051; -2117940946; -1838011259;
-  -1564481375; -1474664885; -1035236496; -949202525; -778901479; -694614492; -200395387; 275423344;
-  430227734; 506948616; 659060556; 883997877; 958139571; 1322822218; 1537002063; 1747873779;
-  1955562222; 2024104815; -2067236844; -1933114872; -1866530822; -1538233109; -1090935817; -965641998;
-  -903397682; -779700025; -354779690; -176337025; 116418474; 174292421; 289380356; 460393269;
-  685471733; 852142971; 1017036298; 1126000580; 1288033470; 1501505948; 1607167915; 1816402316;
-|]
+let sha256_k =
+  [| 0x428a2f98l; 0x71374491l; 0xb5c0fbcfl; 0xe9b5dba5l; 0x3956c25bl; 0x59f111f1l; 0x923f82a4l; 0xab1c5ed5l;
+     0xd807aa98l; 0x12835b01l; 0x243185bel; 0x550c7dc3l; 0x72be5d74l; 0x80deb1fel; 0x9bdc06a7l; 0xc19bf174l;
+     0xe49b69c1l; 0xefbe4786l; 0x0fc19dc6l; 0x240ca1ccl; 0x2de92c6fl; 0x4a7484aal; 0x5cb0a9dcl; 0x76f988dal;
+     0x983e5152l; 0xa831c66dl; 0xb00327c8l; 0xbf597fc7l; 0xc6e00bf3l; 0xd5a79147l; 0x06ca6351l; 0x14292967l;
+     0x27b70a85l; 0x2e1b2138l; 0x4d2c6dfcl; 0x53380d13l; 0x650a7354l; 0x766a0abbl; 0x81c2c92el; 0x92722c85l;
+     0xa2bfe8a1l; 0xa81a664bl; 0xc24b8b70l; 0xc76c51a3l; 0xd192e819l; 0xd6990624l; 0xf40e3585l; 0x106aa070l;
+     0x19a4c116l; 0x1e376c08l; 0x2748774cl; 0x34b0bcb5l; 0x391c0cb3l; 0x4ed8aa4al; 0x5b9cca4fl; 0x682e6ff3l;
+     0x748f82eel; 0x78a5636fl; 0x84c87814l; 0x8cc70208l; 0x90befffal; 0xa4506cebl; 0xbef9a3f7l; 0xc67178f2l |]
 
-let k512l = [|
-  -685199838; 602891725; -330482897; -2121671748; -213338824; -1241133031; -1357295717; -630357736;
-  -1560083902; 1164996542; 1323610764; -704662302; -226784913; 991336113; 633803317; -815192428;
-  -1628353838; 944711139; -1953704523; 2007800933; 1495990901; 1856431235; -1119749164; -2096016459;
-  -295247957; 766784016; -1728372417; -1091629340; 1034457026; -1828018395; -536640913; 168717936;
-  1188179964; 1546045734; 1522805485; -1651133473; -1951439906; 1014477480; 1206759142; 344077627;
-  1290863460; -1136513023; -789014639; 106217008; -688958952; 1432725776; 1467031594; 851169720;
-  -1194143544; 1363258195; -544281703; -509917016; -976659869; -482243893; 2003034995; -692930397;
-  1575990012; 1125592928; -1578062990; 442776044; 593698344; -561857047; -1295615723; -479046869;
-  -366583396; 566280711; -840897762; -294727304; 1914138554; -1563912026; -1090974290; 320620315;
-  587496836; 1086792851; 365543100; -1676669620; -885112138; -60457430; 987167468; 1246189591;
-|]
-
-let band x n = x land n
-let bor x n = x lor n
-let bxor x n = x lxor n
-let shl x n = x lsl n
-let shr x n = x lsr n
-let inv = lnot
-let ror x n = (bor (shr x n) (shl x (32 - n)))
-let choice a b c = (bxor (band a b) (band (inv a) c))
-let majority a b c = (bxor (bxor (band a b) (band a c)) (band b c))
-let carry a b = (shr (bor (band a b) (band (bor a b) (inv (a + b)))) 31)
-let readBe data at = (bor (bor (shl data.(at) 24) (shl (data.(at + 1)) 16)) (bor (shl (data.(at + 2)) 8) (data.(at + 3))))
-let compress256 state data at wh =
+(* noble's SHA2_32B: [state] holds A ... H, [w] the message schedule (noble shares one
+   module-level SHA256_W). *)
+let process256 state w data offset =
   for i = 0 to 15 do
-    wh.(i) <- (readBe data (at + i * 4));
+    w.(i) <- Hash.get_uint32_be data (offset + (4 * i))
   done;
   for i = 16 to 63 do
-    let x = wh.(i - 15) in
-    let y = wh.(i - 2) in
-    let s0 = (bxor (bxor (ror x 7) (ror x 18)) (shr x 3)) in
-    let s1 = (bxor (bxor (ror y 17) (ror y 19)) (shr y 10)) in
-    wh.(i) <- (s1 + wh.(i - 7) + s0 + wh.(i - 16));
+    let w15 = w.(i - 15) and w2 = w.(i - 2) in
+    let s0 = U32.(rotr w15 7 lxor rotr w15 18 lxor (w15 lsr 3)) in
+    let s1 = U32.(rotr w2 17 lxor rotr w2 19 lxor (w2 lsr 10)) in
+    w.(i) <- U32.(s1 + w.(i - 7) + s0 + w.(i - 16))
   done;
-  let a = (ref state.(0)) in
-  let b = (ref state.(1)) in
-  let c = (ref state.(2)) in
-  let d = (ref state.(3)) in
-  let e = (ref state.(4)) in
-  let f = (ref state.(5)) in
-  let g = (ref state.(6)) in
-  let h = (ref state.(7)) in
+  let a = ref state.(0) and b = ref state.(1) and c = ref state.(2) and d = ref state.(3) in
+  let e = ref state.(4) and f = ref state.(5) and g = ref state.(6) and h = ref state.(7) in
   for i = 0 to 63 do
-    let s1 = (bxor (bxor (ror !e 6) (ror !e 11)) (ror !e 25)) in
-    let t1 = (!h + s1 + (choice !e !f !g) + k256.(i) + wh.(i)) in
-    let s0 = (bxor (bxor (ror !a 2) (ror !a 13)) (ror !a 22)) in
-    let newA = (t1 + s0 + (majority !a !b !c)) in
-    let newE = (!d + t1) in
+    let sigma1 = U32.(rotr !e 6 lxor rotr !e 11 lxor rotr !e 25) in
+    let t1 = U32.(!h + sigma1 + Md.chi !e !f !g + sha256_k.(i) + w.(i)) in
+    let sigma0 = U32.(rotr !a 2 lxor rotr !a 13 lxor rotr !a 22) in
+    let t2 = U32.(sigma0 + Md.maj !a !b !c) in
     h := !g;
     g := !f;
     f := !e;
-    e := newE;
+    e := U32.(!d + t1);
     d := !c;
     c := !b;
     b := !a;
-    a := newA;
+    a := U32.(t1 + t2)
   done;
-  state.(0) <- (state.(0) + !a);
-  state.(1) <- (state.(1) + !b);
-  state.(2) <- (state.(2) + !c);
-  state.(3) <- (state.(3) + !d);
-  state.(4) <- (state.(4) + !e);
-  state.(5) <- (state.(5) + !f);
-  state.(6) <- (state.(6) + !g);
-  state.(7) <- (state.(7) + !h);
-  ()
+  List.iteri (fun i word -> state.(i) <- U32.(state.(i) + word)) [ !a; !b; !c; !d; !e; !f; !g; !h ]
 
-let compress512 state data at wh wl =
+let sha256 () =
+  let state = Array.copy sha256_iv and w = Array.make 64 0l in
+  Md.to_hash
+    (Md.make ~block_len:64 ~output_len:32 ~pad_offset:8 ~process:(process256 state w) ~get:(fun () -> state))
+
+let sha512_iv =
+  [| 0x6a09e667l; 0xf3bcc908l; 0xbb67ae85l; 0x84caa73bl; 0x3c6ef372l; 0xfe94f82bl; 0xa54ff53al; 0x5f1d36f1l;
+     0x510e527fl; 0xade682d1l; 0x9b05688cl; 0x2b3e6c1fl; 0x1f83d9abl; 0xfb41bd6bl; 0x5be0cd19l; 0x137e2179l |]
+
+(* The 80 round constants of RFC 6234 §5.2, split into high and low halves as noble's K512 is. *)
+let sha512_kh =
+  [| 0x428a2f98l; 0x71374491l; 0xb5c0fbcfl; 0xe9b5dba5l; 0x3956c25bl; 0x59f111f1l; 0x923f82a4l; 0xab1c5ed5l;
+     0xd807aa98l; 0x12835b01l; 0x243185bel; 0x550c7dc3l; 0x72be5d74l; 0x80deb1fel; 0x9bdc06a7l; 0xc19bf174l;
+     0xe49b69c1l; 0xefbe4786l; 0x0fc19dc6l; 0x240ca1ccl; 0x2de92c6fl; 0x4a7484aal; 0x5cb0a9dcl; 0x76f988dal;
+     0x983e5152l; 0xa831c66dl; 0xb00327c8l; 0xbf597fc7l; 0xc6e00bf3l; 0xd5a79147l; 0x06ca6351l; 0x14292967l;
+     0x27b70a85l; 0x2e1b2138l; 0x4d2c6dfcl; 0x53380d13l; 0x650a7354l; 0x766a0abbl; 0x81c2c92el; 0x92722c85l;
+     0xa2bfe8a1l; 0xa81a664bl; 0xc24b8b70l; 0xc76c51a3l; 0xd192e819l; 0xd6990624l; 0xf40e3585l; 0x106aa070l;
+     0x19a4c116l; 0x1e376c08l; 0x2748774cl; 0x34b0bcb5l; 0x391c0cb3l; 0x4ed8aa4al; 0x5b9cca4fl; 0x682e6ff3l;
+     0x748f82eel; 0x78a5636fl; 0x84c87814l; 0x8cc70208l; 0x90befffal; 0xa4506cebl; 0xbef9a3f7l; 0xc67178f2l;
+     0xca273ecel; 0xd186b8c7l; 0xeada7dd6l; 0xf57d4f7fl; 0x06f067aal; 0x0a637dc5l; 0x113f9804l; 0x1b710b35l;
+     0x28db77f5l; 0x32caab7bl; 0x3c9ebe0al; 0x431d67c4l; 0x4cc5d4bel; 0x597f299cl; 0x5fcb6fabl; 0x6c44198cl |]
+
+let sha512_kl =
+  [| 0xd728ae22l; 0x23ef65cdl; 0xec4d3b2fl; 0x8189dbbcl; 0xf348b538l; 0xb605d019l; 0xaf194f9bl; 0xda6d8118l;
+     0xa3030242l; 0x45706fbel; 0x4ee4b28cl; 0xd5ffb4e2l; 0xf27b896fl; 0x3b1696b1l; 0x25c71235l; 0xcf692694l;
+     0x9ef14ad2l; 0x384f25e3l; 0x8b8cd5b5l; 0x77ac9c65l; 0x592b0275l; 0x6ea6e483l; 0xbd41fbd4l; 0x831153b5l;
+     0xee66dfabl; 0x2db43210l; 0x98fb213fl; 0xbeef0ee4l; 0x3da88fc2l; 0x930aa725l; 0xe003826fl; 0x0a0e6e70l;
+     0x46d22ffcl; 0x5c26c926l; 0x5ac42aedl; 0x9d95b3dfl; 0x8baf63del; 0x3c77b2a8l; 0x47edaee6l; 0x1482353bl;
+     0x4cf10364l; 0xbc423001l; 0xd0f89791l; 0x0654be30l; 0xd6ef5218l; 0x5565a910l; 0x5771202al; 0x32bbd1b8l;
+     0xb8d2d0c8l; 0x5141ab53l; 0xdf8eeb99l; 0xe19b48a8l; 0xc5c95a63l; 0xe3418acbl; 0x7763e373l; 0xd6b2b8a3l;
+     0x5defb2fcl; 0x43172f60l; 0xa1f0ab72l; 0x1a6439ecl; 0x23631e28l; 0xde82bde9l; 0xb2c67915l; 0xe372532bl;
+     0xea26619cl; 0x21c0c207l; 0xcde0eb1el; 0xee6ed178l; 0x72176fbal; 0xa2c898a6l; 0xbef90dael; 0x131c471bl;
+     0x23047d84l; 0x40c72493l; 0x15c9bebcl; 0x9c100d4cl; 0xcb3e42b6l; 0xfc657e2al; 0x3ad6faecl; 0x4a475817l |]
+
+(* noble's SHA2_64B: [state] holds Ah, Al, ..., Hh, Hl; [wh] and [wl] the halves of the message
+   schedule (noble's SHA512_W_H and SHA512_W_L). *)
+let process512 state wh wl data offset =
   for i = 0 to 15 do
-    wh.(i) <- (readBe data (at + i * 8));
-    wl.(i) <- (readBe data (at + i * 8 + 4));
+    wh.(i) <- Hash.get_uint32_be data (offset + (8 * i));
+    wl.(i) <- Hash.get_uint32_be data (offset + (8 * i) + 4)
   done;
   for i = 16 to 79 do
-    let xh = wh.(i - 15) in
-    let xl = wl.(i - 15) in
-    let yh = wh.(i - 2) in
-    let yl = wl.(i - 2) in
-    let s0h = (bxor (bxor (bor (shr xh 1) (shl xl 31)) (bor (shr xh 8) (shl xl 24))) (shr xh 7)) in
-    let s0l = (bxor (bxor (bor (shr xl 1) (shl xh 31)) (bor (shr xl 8) (shl xh 24))) (bor (shr xl 7) (shl xh 25))) in
-    let s1h = (bxor (bxor (bor (shr yh 19) (shl yl 13)) (bor (shr yl 29) (shl yh 3))) (shr yh 6)) in
-    let s1l = (bxor (bxor (bor (shr yl 19) (shl yh 13)) (bor (shr yh 29) (shl yl 3))) (bor (shr yl 6) (shl yh 26))) in
-    let nextl2 = (s0l + s1l) in
-    let nextl3 = (nextl2 + wl.(i - 7)) in
-    let nextl = (nextl3 + wl.(i - 16)) in
-    let nexth = (s0h + s1h + wh.(i - 7) + wh.(i - 16) + (carry s0l s1l) + (carry nextl2 (wl.(i - 7))) + (carry nextl3 (wl.(i - 16)))) in
-    wh.(i) <- nexth;
-    wl.(i) <- nextl;
+    (* s0 = rotr(w[i-15], 1) ^ rotr(w[i-15], 8) ^ (w[i-15] >>> 7) *)
+    let w15h = wh.(i - 15) and w15l = wl.(i - 15) in
+    let s0h = U32.(rotr_sh w15h w15l 1 lxor rotr_sh w15h w15l 8 lxor shr_sh w15h w15l 7) in
+    let s0l = U32.(rotr_sl w15h w15l 1 lxor rotr_sl w15h w15l 8 lxor shr_sl w15h w15l 7) in
+    (* s1 = rotr(w[i-2], 19) ^ rotr(w[i-2], 61) ^ (w[i-2] >>> 6) *)
+    let w2h = wh.(i - 2) and w2l = wl.(i - 2) in
+    let s1h = U32.(rotr_sh w2h w2l 19 lxor rotr_bh w2h w2l 61 lxor shr_sh w2h w2l 6) in
+    let s1l = U32.(rotr_sl w2h w2l 19 lxor rotr_bl w2h w2l 61 lxor shr_sl w2h w2l 6) in
+    let sum_h, sum_l = add4 s0h s0l s1h s1l wh.(i - 7) wl.(i - 7) wh.(i - 16) wl.(i - 16) in
+    wh.(i) <- sum_h;
+    wl.(i) <- sum_l
   done;
-  let ah = (ref state.(0)) in
-  let al = (ref state.(1)) in
-  let bh = (ref state.(2)) in
-  let bl = (ref state.(3)) in
-  let ch = (ref state.(4)) in
-  let cl = (ref state.(5)) in
-  let dh = (ref state.(6)) in
-  let dl = (ref state.(7)) in
-  let eh = (ref state.(8)) in
-  let el = (ref state.(9)) in
-  let fh = (ref state.(10)) in
-  let fl = (ref state.(11)) in
-  let gh = (ref state.(12)) in
-  let gl = (ref state.(13)) in
-  let hh = (ref state.(14)) in
-  let hl = (ref state.(15)) in
+  let ah = ref state.(0) and al = ref state.(1) and bh = ref state.(2) and bl = ref state.(3) in
+  let ch = ref state.(4) and cl = ref state.(5) and dh = ref state.(6) and dl = ref state.(7) in
+  let eh = ref state.(8) and el = ref state.(9) and fh = ref state.(10) and fl = ref state.(11) in
+  let gh = ref state.(12) and gl = ref state.(13) and hh = ref state.(14) and hl = ref state.(15) in
   for i = 0 to 79 do
-    let s1h = (bxor (bxor (bor (shr !eh 14) (shl !el 18)) (bor (shr !eh 18) (shl !el 14))) (bor (shr !el 9) (shl !eh 23))) in
-    let s1l = (bxor (bxor (bor (shr !el 14) (shl !eh 18)) (bor (shr !el 18) (shl !eh 14))) (bor (shr !eh 9) (shl !el 23))) in
-    let chh = (choice !eh !fh !gh) in
-    let chl = (choice !el !fl !gl) in
-    let t1l2 = (!hl + s1l) in
-    let t1l3 = (t1l2 + chl) in
-    let t1l4 = (t1l3 + k512l.(i)) in
-    let t1l = (t1l4 + wl.(i)) in
-    let t1h = (!hh + s1h + chh + k512h.(i) + wh.(i) + (carry !hl s1l) + (carry t1l2 chl) + (carry t1l3 k512l.(i)) + (carry t1l4 wl.(i))) in
-    let s0h = (bxor (bxor (bor (shr !ah 28) (shl !al 4)) (bor (shr !al 2) (shl !ah 30))) (bor (shr !al 7) (shl !ah 25))) in
-    let s0l = (bxor (bxor (bor (shr !al 28) (shl !ah 4)) (bor (shr !ah 2) (shl !al 30))) (bor (shr !ah 7) (shl !al 25))) in
-    let majh = (majority !ah !bh !ch) in
-    let majl = (majority !al !bl !cl) in
-    let newAl2 = (t1l + s0l) in
-    let newAl = (newAl2 + majl) in
-    let newAh = (t1h + s0h + majh + (carry t1l s0l) + (carry newAl2 majl)) in
-    let newEl = (!dl + t1l) in
-    let newEh = (!dh + t1h + (carry !dl t1l)) in
+    (* S1 = rotr(e, 14) ^ rotr(e, 18) ^ rotr(e, 41) *)
+    let sigma1h = U32.(rotr_sh !eh !el 14 lxor rotr_sh !eh !el 18 lxor rotr_bh !eh !el 41) in
+    let sigma1l = U32.(rotr_sl !eh !el 14 lxor rotr_sl !eh !el 18 lxor rotr_bl !eh !el 41) in
+    (* T1 = H + S1 + Chi(E, F, G) + K[i] + W[i] *)
+    let t1h, t1l =
+      add5 !hh !hl sigma1h sigma1l (Md.chi !eh !fh !gh) (Md.chi !el !fl !gl) sha512_kh.(i) sha512_kl.(i)
+        wh.(i) wl.(i)
+    in
+    (* S0 = rotr(a, 28) ^ rotr(a, 34) ^ rotr(a, 39) *)
+    let sigma0h = U32.(rotr_sh !ah !al 28 lxor rotr_bh !ah !al 34 lxor rotr_bh !ah !al 39) in
+    let sigma0l = U32.(rotr_sl !ah !al 28 lxor rotr_bl !ah !al 34 lxor rotr_bl !ah !al 39) in
+    let maj_h = Md.maj !ah !bh !ch and maj_l = Md.maj !al !bl !cl in
     hh := !gh;
     hl := !gl;
     gh := !fh;
     gl := !fl;
     fh := !eh;
     fl := !el;
-    eh := newEh;
-    el := newEl;
+    let next_eh, next_el = add !dh !dl t1h t1l in
+    eh := next_eh;
+    el := next_el;
     dh := !ch;
     dl := !cl;
     ch := !bh;
     cl := !bl;
     bh := !ah;
     bl := !al;
-    ah := newAh;
-    al := newAl;
+    let next_ah, next_al = add3 t1h t1l sigma0h sigma0l maj_h maj_l in
+    ah := next_ah;
+    al := next_al
   done;
-  state.(0) <- (state.(0) + !ah + (carry state.(1) !al));
-  state.(1) <- (state.(1) + !al);
-  state.(2) <- (state.(2) + !bh + (carry state.(3) !bl));
-  state.(3) <- (state.(3) + !bl);
-  state.(4) <- (state.(4) + !ch + (carry state.(5) !cl));
-  state.(5) <- (state.(5) + !cl);
-  state.(6) <- (state.(6) + !dh + (carry state.(7) !dl));
-  state.(7) <- (state.(7) + !dl);
-  state.(8) <- (state.(8) + !eh + (carry state.(9) !el));
-  state.(9) <- (state.(9) + !el);
-  state.(10) <- (state.(10) + !fh + (carry state.(11) !fl));
-  state.(11) <- (state.(11) + !fl);
-  state.(12) <- (state.(12) + !gh + (carry state.(13) !gl));
-  state.(13) <- (state.(13) + !gl);
-  state.(14) <- (state.(14) + !hh + (carry state.(15) !hl));
-  state.(15) <- (state.(15) + !hl);
-  ()
+  (* Add the compressed block to the state. *)
+  List.iteri
+    (fun i (h, l) ->
+      let sum_h, sum_l = add state.(2 * i) state.((2 * i) + 1) h l in
+      state.(2 * i) <- sum_h;
+      state.((2 * i) + 1) <- sum_l)
+    [ (!ah, !al); (!bh, !bl); (!ch, !cl); (!dh, !dl); (!eh, !el); (!fh, !fl); (!gh, !gl); (!hh, !hl) ]
 
-let hash wide chunks =
-  let block = if wide then 128 else 64 in
-  let state = Array.copy (if wide then iv512 else iv256) in
-  let wh = Array.make 80 0 and wl = Array.make 80 0 in
-  let tail = Array.make block 0 in
-  let process data at =
-    if wide then compress512 state data at wh wl else compress256 state data at wh
-  in
-  let pos = ref 0 and length = ref 0.0 in
-  Array.iter (fun chunk ->
-    let len = Array.length chunk and at = ref 0 in
-    length := !length +. float_of_int len;
-    while !at < len do
-      if !pos = 0 && len - !at >= block then begin
-        process chunk !at;
-        at := !at + block
-      end else begin
-        let take = min (block - !pos) (len - !at) in
-        Array.blit chunk !at tail !pos take;
-        at := !at + take;
-        pos := !pos + take;
-        if !pos = block then begin process tail 0; pos := 0 end
-      end
-    done) chunks;
-  tail.(!pos) <- 128;
-  Array.fill tail (!pos+1) (block - !pos-1) 0;
-  if !pos+1 > block-block/8 then begin process tail 0; Array.fill tail 0 block 0 end;
-  let bits = ref (!length *. 8.) in
-  for i = 0 to 7 do
-    tail.(block-1-i) <- int_of_float (mod_float !bits 256.);
-    bits := floor (!bits /. 256.)
-  done;
-  process tail 0;
-  Array.init (Array.length state * 4) (fun i -> (state.(i/4) lsr (24 - i mod 4*8)) land 255)
-
-let digest mode chunks key =
-  if mode <> 2 then hash (mode = 1) chunks else
-  let k = if Array.length key > 64 then hash false [|key|] else key in
-  let pad mask = Array.init 64 (fun i -> (if i < Array.length k then k.(i) else 0) lxor mask) in
-  let inner = Array.append [|pad 0x36|] chunks in
-  hash false [|pad 0x5c; hash false inner|]
+let sha512 () =
+  let state = Array.copy sha512_iv and wh = Array.make 80 0l and wl = Array.make 80 0l in
+  Md.to_hash
+    (Md.make ~block_len:128 ~output_len:64 ~pad_offset:16 ~process:(process512 state wh wl)
+       ~get:(fun () -> state))
