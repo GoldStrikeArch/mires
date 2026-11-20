@@ -8,10 +8,12 @@
 //! Nothing here reports anything. A function returns what it found or an error describing what it
 //! could not read, and the caller turns that into whichever kind of diagnostic it deals in.
 
-use rustc_abi::{Size, TagEncoding, VariantIdx, Variants};
+use rustc_abi::{Align, Size, TagEncoding, VariantIdx, Variants};
 use rustc_middle::mir::interpret::{
-    read_target_uint, write_target_uint, AllocId, Allocation, CtfeProvenance,
+    alloc_range, read_target_uint, write_target_uint, AllocId, Allocation, CtfeProvenance,
+    GlobalAlloc, Scalar,
 };
+use rustc_middle::mir::Mutability;
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_middle::ty::{self, ScalarInt, Ty, TyCtxt};
 
@@ -57,11 +59,47 @@ pub(crate) fn scratch_alloc<'tcx>(
     Some(Allocation::from_bytes_byte_aligned_immutable(bytes, ()))
 }
 
+/// Whether a value of `ty` is a pointer the readers decode by its provenance, rather than by the
+/// fields of a type wrapped around one.
+pub(crate) fn is_pointer(ty: Ty<'_>) -> bool {
+    matches!(ty.kind(), ty::Ref(..) | ty::RawPtr(..) | ty::FnPtr(..))
+}
+
+/// An allocation holding one pointer scalar, provenance included, laid out for `ty`.
+///
+/// The counterpart of [`scratch_alloc`] for a scalar constant whose bits are a pointer and whose
+/// type is not one: `Option<&T>`, `Option<NonNull<T>>`, `Option<fn()>`, a newtype around a `&T`.
+/// Such a value is a scalar only because its layout says so, and it decodes like the same value
+/// stored in memory: the pointer goes back at offset zero, where a scalar layout keeps its one
+/// scalar, together with the provenance that makes it a pointer. Without the provenance the bytes
+/// would be the offset into the pointed-at allocation and nothing else, which for `Some(&b'.')` is
+/// the number zero, `None`'s niche.
+pub(crate) fn scratch_pointer_alloc<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    pointer: Scalar,
+    ty: Ty<'tcx>,
+) -> Option<Allocation> {
+    let layout = tcx.layout_of(typing_env().as_query_input(ty)).ok()?;
+    let pointer_size = tcx.data_layout.pointer_size();
+    let size = layout.size.max(pointer_size);
+    let mut alloc = Allocation::from_bytes(
+        vec![0u8; size.bytes_usize()],
+        Align::ONE,
+        Mutability::Mut,
+        (),
+    );
+    alloc
+        .write_scalar(&tcx, alloc_range(Size::ZERO, pointer_size), pointer)
+        .ok()?;
+    alloc.mutability = Mutability::Not;
+    Some(alloc)
+}
+
 /// Why the variant of an enum could not be worked out from its bytes.
 pub(crate) enum TagError {
     /// The type has no variants at all, so no value of it exists.
     Uninhabited,
-    /// The tag's bytes could not be read.
+    /// The tag's bytes could not be read, or they hold a pointer that names no variant.
     Unreadable,
     /// The tag was read, and names no variant.
     NoSuchVariant(u128),
@@ -72,6 +110,10 @@ pub(crate) enum TagError {
 /// The bytes hold a *tag*, and which variant that tag names depends on how the layout chose to
 /// encode it. A direct tag is the discriminant itself; a niche tag is an otherwise-invalid value
 /// of some field, which is how `Option<&T>` fits in one pointer.
+///
+/// A tag can also be a pointer: the niche of `Option<&T>` is the reference itself. Its bytes are
+/// then only the offset into the allocation it points at, so they are never read as a number —
+/// `Some(&b'.')` points at offset zero, and zero is `None`'s niche. See [`pointer_tag_variant`].
 pub(crate) fn variant_index<'tcx>(
     tcx: TyCtxt<'tcx>,
     alloc: &Allocation,
@@ -90,6 +132,12 @@ pub(crate) fn variant_index<'tcx>(
         } => {
             let tag_size = tag.size(&tcx);
             let tag_offset = offset + layout.fields.offset(tag_field.as_usize());
+            if !alloc
+                .provenance()
+                .range_empty(alloc_range(tag_offset, tag_size), &tcx)
+            {
+                return pointer_tag_variant(tcx, alloc, tag_offset, tag_size, tag_encoding);
+            }
             let bits = read_scalar(tcx, alloc, tag_offset, tag_size)
                 .map(|int| int.to_uint(tag_size))
                 .ok_or(TagError::Unreadable)?;
@@ -120,6 +168,56 @@ pub(crate) fn variant_index<'tcx>(
             }
         }
     }
+}
+
+/// Which variant a tag whose bytes carry provenance names.
+///
+/// A pointer has no address at compile time, so it is compared with the niche the way rustc's own
+/// interpreter compares it (`InterpCx::read_discriminant`): it names the untagged variant when the
+/// niche is the single value zero and the pointer cannot be null, which is every `Option<&T>`,
+/// `Option<NonNull<T>>` and `Option<fn()>`. Anything else — a direct tag, a niche with more than
+/// one value, a pointer that might be null, bytes holding only part of a pointer — is a tag that
+/// interpreter refuses to read as well, and is refused here.
+fn pointer_tag_variant(
+    tcx: TyCtxt<'_>,
+    alloc: &Allocation,
+    tag_offset: Size,
+    tag_size: Size,
+    tag_encoding: &TagEncoding<VariantIdx>,
+) -> Result<VariantIdx, TagError> {
+    let TagEncoding::Niche {
+        untagged_variant,
+        niche_variants,
+        niche_start,
+    } = tag_encoding
+    else {
+        return Err(TagError::Unreadable);
+    };
+    if *niche_start != 0
+        || niche_variants.start != niche_variants.last
+        || tag_size != tcx.data_layout.pointer_size()
+    {
+        return Err(TagError::Unreadable);
+    }
+    let pointer = read_pointer(tcx, alloc, tag_offset, false);
+    match pointer.alloc_id() {
+        Some(alloc_id) if !may_be_null(tcx, alloc_id, pointer.offset) => Ok(*untagged_variant),
+        _ => Err(TagError::Unreadable),
+    }
+}
+
+/// Whether the pointer `offset` bytes into `alloc_id` may be null (`InterpCx::scalar_may_be_null`).
+///
+/// It cannot be when it is in bounds of its allocation, one past the end included, nor when the
+/// offset is not a multiple of the allocation's alignment. A `TypeId`'s pointer stands for bits
+/// that are deliberately not revealed, so it is never known not to be null.
+fn may_be_null(tcx: TyCtxt<'_>, alloc_id: AllocId, offset: Size) -> bool {
+    let global = tcx.global_alloc(alloc_id);
+    if matches!(global, GlobalAlloc::TypeId { .. }) {
+        return true;
+    }
+    let (size, align) = global.size_and_align(tcx, typing_env());
+    offset > size && offset.bytes().is_multiple_of(align.bytes())
 }
 
 /// Whether a pointer to this type carries metadata, and so occupies two pointer sized slots.

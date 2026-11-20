@@ -1148,6 +1148,21 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 bits: value.to_uint(value.size()),
                 bytes: value.size().bytes() as u8,
             }),
+            // A pointer that is the one scalar of a type around it (`Option<&T>`,
+            // `Option<NonNull<T>>`, `Option<fn()>`) decodes from a scratch allocation holding it,
+            // provenance included, as that type stored in memory does.
+            mir::ConstValue::Scalar(pointer @ Scalar::Ptr(..))
+                if !crate::constant::raw::is_pointer(ty) =>
+            {
+                let scratch = crate::constant::raw::scratch_pointer_alloc(tcx, pointer, ty)
+                    .ok_or_else(|| format!("no layout for `{ty}` in a constant"))?;
+                Ok(Constant::Memory(self.const_tree(
+                    &scratch,
+                    rustc_abi::Size::ZERO,
+                    ty,
+                    0,
+                )?))
+            }
             mir::ConstValue::Scalar(Scalar::Ptr(pointer, _)) => {
                 let (provenance, offset) = pointer.prov_and_relative_offset();
                 if let GlobalAlloc::Memory(allocation) = tcx.global_alloc(provenance.alloc_id()) {

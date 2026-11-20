@@ -114,11 +114,25 @@ pub(crate) fn codegen_const_value<'tcx>(
     match value {
         ConstValue::ZeroSized => jsast::undefined(),
         ConstValue::Scalar(Scalar::Int(int)) => scalar_to_expr(cgu, log, int, ty, span),
-        ConstValue::Scalar(Scalar::Ptr(pointer, _)) => {
+        ConstValue::Scalar(Scalar::Ptr(pointer, _)) if raw::is_pointer(ty) => {
             // A reference to a `static`, to a function, or to a promoted value like
             // `&Point { x: 1, y: 2 }`. A thin pointer, so there is no metadata to carry.
             let (provenance, offset) = pointer.prov_and_relative_offset();
             pointer_expr(cgu, log, provenance.alloc_id(), offset, ty, None, span)
+        }
+        // A pointer that is the one scalar of a type around it: `Some(&b'.')` as an
+        // `Option<&u8>`, an `Option<NonNull<u8>>`, an `Option<fn()>`. Decoded from a scratch
+        // allocation holding the pointer, as a `Scalar::Int` of such a type is.
+        ConstValue::Scalar(pointer @ Scalar::Ptr(..)) => {
+            match raw::scratch_pointer_alloc(tcx, pointer, ty) {
+                Some(alloc) => read_alloc(cgu, log, &alloc, Size::ZERO, ty, span),
+                None => zombie(
+                    cgu,
+                    log,
+                    span,
+                    format!("no layout for `{ty}` in a constant"),
+                ),
+            }
         }
         ConstValue::Slice { alloc_id, meta } => {
             let GlobalAlloc::Memory(alloc) = tcx.global_alloc(alloc_id) else {
