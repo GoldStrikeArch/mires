@@ -18,7 +18,9 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::mir;
 use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
 use rustc_middle::ty::print::with_no_trimmed_paths;
-use rustc_middle::ty::{self, ExistentialTraitRef, Instance, Ty, TyCtxt, TypeFoldable, VtblEntry};
+use rustc_middle::ty::{
+    self, ExistentialTraitRef, Instance, ScalarInt, Ty, TyCtxt, TypeFoldable, VtblEntry,
+};
 use rustc_span::Span;
 
 use rcgjs_object::jir::decline::EncodeDecline;
@@ -775,10 +777,30 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 }
                 return Ok(out);
             }
-            let OperandKind::Constant(Constant::Memory(ConstTree::Aggregate(fields))) =
-                decoded.kind
-            else {
-                return Err(EncodeDecline::SpreadNotTuple);
+            let fields = match decoded.kind {
+                OperandKind::Constant(Constant::Memory(ConstTree::Aggregate(fields))) => fields,
+                // A pack whose layout is ONE SCALAR is not memory either: const evaluation keeps
+                // such a value in a register, so it arrives as its bits. A tuple is one scalar
+                // when a single element is not zero-sized and that element is a scalar —
+                // `(usize,)`, `(u32, ())` — which is what a closure called with one literal
+                // argument passes once MIR optimization has folded the argument tuple
+                // (MIRES-020). The bits are the tuple as memory would hold it, so they go back
+                // into a scratch allocation laid out for the tuple, and the tuple is decoded from
+                // there exactly as an in-memory pack is.
+                OperandKind::Constant(Constant::Scalar { bits, bytes }) => {
+                    let scratch = ScalarInt::try_from_uint(bits, Size::from_bytes(bytes))
+                        .and_then(|int| crate::constant::raw::scratch_alloc(tcx, int, pack_ty))
+                        .ok_or_else(|| EncodeDecline::ConstantNoLayout {
+                            ty: type_name(pack_ty),
+                        })?;
+                    let ConstTree::Aggregate(fields) =
+                        self.const_tree(&scratch, Size::ZERO, pack_ty, 0)?
+                    else {
+                        return Err(EncodeDecline::SpreadNotTuple);
+                    };
+                    fields
+                }
+                _ => return Err(EncodeDecline::SpreadNotTuple),
             };
             if fields.len() != elements.len() {
                 return Err(EncodeDecline::SpreadNotTuple);
