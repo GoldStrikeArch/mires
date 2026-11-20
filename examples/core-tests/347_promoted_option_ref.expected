@@ -1,0 +1,35 @@
+Option<&u8>
+true
+false
+false
+false
+true
+Option<&u32>
+true
+false
+Option<&str>
+true
+false
+false
+true
+false
+Option<&[u8]>
+true
+false
+Option<&&str>
+true
+false
+Option<&(u8, u16)>
+true
+false
+Option<&Point>
+true
+false
+other pointer niches
+true
+false
+true
+false
+true
+false
+3
