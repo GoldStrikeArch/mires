@@ -2,5 +2,5 @@
   "schema": 1,
   "library": "ky",
   "language": "scalajs",
-  "boundary": "Dispatches native Fetch objects through an injected transport and resolves JSON results and hook traces."
+  "boundary": "run(input) reads the corpus object in place through @js.native facade traits; the option values Ky checks stay JS values until Ky's own type patterns read them, Fetch, AbortSignal and TextDecoder objects are facades over the host objects, and each result is the JS array [trace, outcome], from a Future converted to a js.Promise."
 }

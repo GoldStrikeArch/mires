@@ -4,5 +4,5 @@
   "language": "elm",
   "main": "src/Main.elm",
   "host": "js/index.js",
-  "boundary": "Dispatches native Fetch objects through an injected transport and resolves JSON results and hook traces."
+  "boundary": "The JS host sends the input through the start port; Elm reads each case with elm/json, runs Ky and the reference adapter's transport and hooks as Io actions, asks the host for each Fetch, abort, decoding and timer operation through command and gets each answer through reply, and returns the [trace, outcome] array as { done }. The host performs operations only; host objects stay behind handles."
 }

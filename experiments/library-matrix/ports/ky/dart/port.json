@@ -2,6 +2,6 @@
   "schema": 1,
   "library": "ky",
   "language": "dart",
-  "boundary": "Dispatches native Fetch objects through an injected transport and resolves JSON results and hook traces.",
+  "boundary": "run(input) reads the corpus object in place through dart:js_interop extension types; the option values Ky checks stay JSAny? until Ky's own checks read them, Fetch, AbortSignal and TextDecoder objects are extension types over the host objects, and each result is the JS array [trace, outcome], from an async function as a JSPromise; main() publishes run on globalThis.__matrixExports for the generated facade.",
   "entry": "src/main.dart"
 }

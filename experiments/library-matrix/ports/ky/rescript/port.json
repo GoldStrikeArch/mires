@@ -3,5 +3,5 @@
   "library": "ky",
   "language": "rescript",
   "entry": "src/Index.res",
-  "boundary": "Dispatches native Fetch objects through an injected transport and resolves JSON results and hook traces."
+  "boundary": "run(input) reads the corpus records in place; the option values Ky checks stay JSON.t until Ky's own checks read them, Fetch, AbortSignal and TextDecoder objects are the host objects through typed bindings, and each result is [trace, outcome] built as JSON.t, from an async function."
 }

@@ -3,5 +3,5 @@
   "library": "ky",
   "language": "melange",
   "entry": "src/index.ml",
-  "boundary": "Dispatches native Fetch objects through an injected transport and resolves JSON results and hook traces."
+  "boundary": "run(input) reads each corpus case in place through Host (shared with the js_of_ocaml port); the option values Ky checks stay Host.values until Ky's own checks read them, Fetch, AbortSignal and TextDecoder objects are the host objects behind abstract types, and each result is the JS array [trace, outcome], from a promise of results."
 }

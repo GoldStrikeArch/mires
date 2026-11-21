@@ -3,5 +3,5 @@
   "library": "ky",
   "language": "jsoo",
   "entry": "src/main.ml",
-  "boundary": "Dispatches native Fetch objects through an injected transport and resolves JSON results and hook traces."
+  "boundary": "run(input) reads each corpus case in place through Host (shared with the Melange port; js_of_ocaml's Fetch, Abort and Promise bindings); the option values Ky checks stay Host.values until Ky's own checks read them, strings cross with Js.string and Js.to_string, and each result is the JS array [trace, outcome], published with Js.export."
 }

@@ -3,5 +3,5 @@
   "library": "ky",
   "language": "gopherjs",
   "package": "./src",
-  "boundary": "Dispatches native Fetch objects through an injected transport and resolves JSON results and hook traces."
+  "boundary": "run(input) reads each corpus case in place as *js.Object; the option values Ky checks stay *js.Object until Ky's own checks read them, Fetch, AbortSignal and TextDecoder objects are Go types over the host objects, and each result is the JS array [trace, outcome], from a Promise a goroutine settles; run is published on js.Module.exports."
 }

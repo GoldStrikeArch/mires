@@ -2,5 +2,5 @@
   "schema": 1,
   "library": "ky",
   "language": "kotlin",
-  "boundary": "Dispatches native Fetch objects through an injected transport and resolves JSON results and hook traces."
+  "boundary": "run(input) reads the corpus object in place through external interfaces; the option values Ky checks stay Any? until Ky's own checks read them, Fetch, AbortSignal and TextDecoder objects are external classes, and each result is the JS array [trace, outcome], from a coroutine as a Promise."
 }

@@ -1,96 +1,139 @@
+// JS host of the Elm port: it performs the Fetch, abort, decoding and timer operations Ky's Elm
+// code asks for, and answers with what each gave or threw. It holds no Ky logic: the request
+// construction, option checks, timeouts and aborts, error wrapping, error data and the retry loop
+// are all Elm (src/Ky.elm), and so is the reference adapter's transport (src/Main.elm).
+//
+// The program sends `{ id, op, ...arguments }` through `command`; the host performs `op` and
+// answers through `reply` with `{ id, ok }` or `{ id, error }`, always on a later microtask. Host
+// objects stay here, behind the handles the answers carry, in a table that lives for one call. A
+// `timer` answers when it fires, `onAbort` when its signal aborts, and `{ clear }` cancels a
+// timer. The program ends a call with `{ done }` or, on a host answer it cannot read, `{ failed }`.
+//
+// Module state, as in the other Elm hosts: `worker` is the one Platform.worker instance, whose
+// model is reset by every `start`, and `current` is the call in progress; an answer from an
+// earlier call is dropped.
 import Elm from 'elm-program'
 
-const abortReason = () => Object.assign(new Error('cancelled'),{name:'AbortError'})
-const named = name => Object.assign(new Error(name),{name})
-const pause = ms => new Promise(resolve=>setTimeout(resolve,ms))
+let worker
+let current
 
-async function requestCase(c,plan) {
-  const trace=[['init']]
-  const user=new AbortController()
-  if(c.abort==='before') user.abort(abortReason())
-  let base
-  try {
-    const headers=new Headers(c.headers)
-    const method=c.method??'GET'
-    const common=['get','post','put','patch','head','delete','query'].includes(method.toLowerCase())
-    const init={method:common?method.toUpperCase():method,headers}
-    if(c.json!==undefined) {
-      init.body=JSON.stringify(c.json)
-      if(!headers.has('content-type')) headers.set('content-type','application/json')
-    }
-    if(!headers.get('accept')) headers.set('accept',c.read==='json'?'application/json':'text/*')
-    base=new Request(c.url,init)
-  } catch(error) {
-    return [trace,['error',error.name,null,null]]
-  }
-  let count=0
-  const failure=(name,status=null,data=null,hook=true)=>{
-    if(hook) trace.push(['beforeError',count,name])
-    return [trace,['error',name,status,data]]
-  }
-  if(user.signal.aborted)return failure(user.signal.reason.name)
-  trace.push(['beforeRequest',0])
-  base.headers.set('x-matrix','initial')
-  async function fetch(request) {
-    const h=request.headers
-    trace.push(['fetch',request.method,request.url,h.get('accept'),h.get('content-type'),h.get('x-matrix'),await request.text()])
-    if(c.abort==='fetch')user.abort(abortReason())
-    request.signal.throwIfAborted()
-    const spec=c.replies[Math.min(count,c.replies.length-1)]
-    if(spec.kind==='network')throw new TypeError('Failed to fetch')
-    if(spec.kind==='stall')return new Promise((_,reject)=>request.signal.addEventListener('abort',()=>reject(request.signal.reason),{once:true}))
-    return new Response(spec.body,{status:spec.status,headers:spec.headers})
-  }
-  for(;;){
-    const controller=new AbortController()
-    const signal=AbortSignal.any([user.signal,controller.signal])
-    const request=new Request(base.clone(),{signal})
-    let timer, name, status=null, data=null, after=null, response
-    try {
-      const sent=fetch(request)
-      response=c.timeout===false?await sent:await Promise.race([sent,new Promise((_,reject)=>{
-        timer=setTimeout(()=>{reject(named('TimeoutError'));controller.abort()},c.timeout)
-      })])
-    } catch(e) {
-      name=e.name==='TypeError' && e.message==='Failed to fetch'?'NetworkError':e.name
-    } finally {clearTimeout(timer)}
-    if(response) {
-      trace.push(['afterResponse',count,response.status])
-      const body=await response.text()
-      if(response.ok || !c.throwHttpErrors) {
-        try {return [trace,['ok',c.read==='json'?JSON.parse(body):body]]}
-        catch(e){return failure(e.name,null,null,false)}
-      }
-      name='HTTPError'
-      status=response.status
-      after=response.headers.get('Retry-After')
-      if(body!==''){
-        const mime=response.headers.get('content-type')?.split(';')[0].trim().toLowerCase()??''
-        if(mime.includes('/') && ['/json','+json','-json','.json'].some(s=>mime.endsWith(s))){
-          try {data=JSON.parse(body)} catch {data=null}
-        }else data=body
-      }
-    }
-    const delay=plan({config:c,count,method:base.method,name,status,after})
-    if(delay===null)return failure(name,status,data)
-    if(delay.backoff!==null)trace.push(['backoff',count+1,delay.backoff])
-    await pause(delay.ms)
-    count++
-    trace.push(['beforeRetry',count,name])
-    base.headers.set('x-matrix','retry-'+count)
-    if(c.abort==='retry')user.abort(abortReason())
-  }
+/** A thrown value, as Ky reads one. */
+const describe = (error) => ({
+  name: typeof error?.name === 'string' ? error.name : 'Error',
+  message: typeof error?.message === 'string' ? error.message : null,
+  // Ky's isError: an Error of this realm, or one of another realm by its internal brand.
+  isError: error instanceof Error || Object.prototype.toString.call(error) === '[object Error]',
+  hasStack: error?.stack !== undefined,
+  sentryCaptured: error !== null && typeof error === 'object' && '__sentry_captured__' in error,
+})
+
+const describeRequest = (request, store) => ({
+  handle: store.put(request),
+  method: request.method,
+  url: request.url,
+  headers: store.put(request.headers),
+  signal: store.put(request.signal),
+})
+
+const operations = {
+  abortController(_, store) {
+    const controller = new AbortController()
+    return { handle: store.put(controller), signal: store.put(controller.signal) }
+  },
+  abort({ controller, reason }, store) {
+    store.get(controller).abort(reason === null ? undefined : Object.assign(new Error(reason.message), { name: reason.name }))
+    return null
+  },
+  anySignal({ signals }, store) {
+    return store.put(AbortSignal.any(signals.map(store.get)))
+  },
+  aborted({ signal }, store) {
+    const target = store.get(signal)
+    return target.aborted ? describe(target.reason) : null
+  },
+  onAbort({ signal }, store) {
+    const target = store.get(signal)
+    return new Promise((resolve) => target.addEventListener('abort', () => resolve(describe(target.reason)), { once: true }))
+  },
+  newHeaders(_, store) {
+    return store.put(new Headers())
+  },
+  setHeader({ headers, name, value }, store) {
+    store.get(headers).set(name, value)
+    return null
+  },
+  getHeader({ headers, name }, store) {
+    return store.get(headers).get(name)
+  },
+  newRequest({ input, method, headers, body, signal }, store) {
+    const init = { method, headers: store.get(headers), signal: store.get(signal) }
+    if (body !== null) init.body = body
+    return describeRequest(new Request(input, init), store)
+  },
+  withSignal({ request, signal }, store) {
+    return describeRequest(new Request(store.get(request), { signal: store.get(signal) }), store)
+  },
+  cloneRequest({ request }, store) {
+    return describeRequest(store.get(request).clone(), store)
+  },
+  requestText({ request }, store) {
+    return store.get(request).text()
+  },
+  newResponse({ body, status, headers }, store) {
+    const response = new Response(body, { status, headers })
+    return { handle: store.put(response), status: response.status, ok: response.ok, headers: store.put(response.headers), hasBody: response.body !== null }
+  },
+  responseText({ response }, store) {
+    return store.get(response).text()
+  },
+  async arrayBuffer({ response }, store) {
+    const buffer = await store.get(response).arrayBuffer()
+    return { handle: store.put(buffer), length: buffer.byteLength }
+  },
+  textDecoder({ label }, store) {
+    return store.put(label === null ? new TextDecoder() : new TextDecoder(label))
+  },
+  decode({ decoder, bytes }, store) {
+    return store.get(decoder).decode(store.get(bytes))
+  },
+  now() {
+    return Date.now()
+  },
+  timer({ milliseconds }, store, id) {
+    return new Promise((resolve) => store.timers.set(id, setTimeout(() => resolve(null), milliseconds)))
+  },
 }
 
-export async function run(input) {
-  const app=Elm.Main.init()
-  let reply
-  const listener=value=>{reply=value}
-  app.ports.decision.subscribe(listener)
-  const plan=message=>{reply=undefined;app.ports.retry.send(message);return reply}
-  try {
-    const results=[]
-    for(const c of input.cases) results.push(await requestCase(c,plan))
-    return results
-  } finally {app.ports.decision.unsubscribe(listener)}
+export function run(input) {
+  if (!worker) {
+    worker = Elm.Main.init()
+    worker.ports.command.subscribe((message) => current?.receive(message))
+  }
+  return new Promise((resolve, reject) => {
+    const handles = []
+    const store = { put: (value) => handles.push(value) - 1, get: (handle) => handles[handle], timers: new Map() }
+    const call = {
+      receive(message) {
+        if ('done' in message) {
+          current = undefined
+          resolve(message.done)
+        } else if ('failed' in message) {
+          current = undefined
+          reject(new Error(message.failed))
+        } else if ('clear' in message) {
+          clearTimeout(store.timers.get(message.clear))
+        } else {
+          const { id, op, ...argumentsOf } = message
+          const answer = (outcome) => {
+            if (current === call) worker.ports.reply.send({ id, ...outcome })
+          }
+          Promise.resolve()
+            .then(() => operations[op](argumentsOf, store, id))
+            .then((ok) => answer({ ok }), (error) => answer({ error: describe(error) }))
+        }
+      },
+    }
+    current = call
+    worker.ports.start.send(input)
+  })
 }

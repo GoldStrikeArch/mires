@@ -4,5 +4,5 @@
   "language": "rust",
   "entry": "src/lib.rs",
   "crateName": "matrix_ky",
-  "boundary": "Drives real Fetch Request and Response objects, AbortSignals and timers from Rust and resolves the trace and parsed results."
+  "boundary": "run(input) reads each corpus case in place through Reflect.get; the option values Ky checks stay JsValues until Ky's own checks read them, Fetch, AbortSignal and TextDecoder objects are typed Copy facades over the host objects, the adapter's transport and hooks are a Callbacks implementation, and each result is the JS array [trace, outcome], resolved by future_to_promise."
 }

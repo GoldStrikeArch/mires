@@ -1,73 +1,181 @@
+(* The host APIs Ky drives, for js_of_ocaml: its Fetch, Abort and Promise bindings, and
+   Js.Unsafe for what they leave out (AbortSignal.any, TextDecoder, timers, untyped option
+   values). OCaml strings are UTF-8 here, so a string crosses with Js.string and Js.to_string;
+   the strings Ky reads (header values, URLs, bodies) are well-formed, so the conversion is exact.
+   See host.mli. *)
+
 open Js_of_ocaml
-type j = Js.Unsafe.any
+
+type value = Js.Unsafe.any
+
 let inject = Js.Unsafe.inject
-let globalValue k : j = Js.Unsafe.get Js.Unsafe.global k
-let get (x:j) k : j = Js.Unsafe.get x k
-let setProp (x:j) k (v:j) = Js.Unsafe.set x k v
-let at (x:j) i : j = Js.Unsafe.get x i
-let strVal s : j = inject (Js.string s)
-let num i : j = inject i
-let nil () : j = inject Js.null
-let undef () : j = inject Js.undefined
-let missing x = not (Js.Optdef.test (Obj.magic x))
-let truth x = Js.to_bool (Js.Unsafe.fun_call (globalValue "Boolean") [|x|])
-let equalText x s = Js.to_string (Js.Unsafe.coerce x) = s
-let equalNum x (n:int) = (Obj.magic x : int) = n
-let objectValue () : j = inject (Js.Unsafe.obj [||])
-let pack a : j = inject (Js.array a)
-let call (x:j) k (args:j array) : j = Js.Unsafe.meth_call x k args
-let push x v = ignore (call x "push" [|v|])
-let callback f : j = inject (Js.wrap_callback f)
-let promise f : j = Js.Unsafe.new_obj (globalValue "Promise") [|inject (Js.wrap_callback f)|]
-let settle f v = ignore (Js.Unsafe.fun_call f [|v|] : j)
-let chain p f = call p "then" [|callback f|]
-let always p f = call p "finally" [|callback f|]
-let mapValues a f = call a "map" [|callback f|]
-let sequence xs f =
-  let arr = Js.to_array (Js.Unsafe.coerce xs) in
-  Array.fold_left (fun p x -> chain p (fun _ -> f x)) (call (globalValue "Promise") "resolve" [||]) arr
-let makeHost k args : j = inject (Js.Unsafe.new_obj (globalValue k) args)
-let boolean b : j = inject (Js.bool b)
-let nullish x = missing x || not (Js.Opt.test (Obj.magic x))
-let as_float (v:j) = Js.float_of_number (Js.Unsafe.coerce v)
-let as_string (v:j) = Js.to_string (Js.Unsafe.coerce v)
-let boxed_float f = inject (Js.number_of_float f)
-let as_array (x:j) : j array = Js.to_array (Js.Unsafe.coerce x)
-let ok v = call (globalValue "Promise") "resolve" [|v|]
-let bad v = call (globalValue "Promise") "reject" [|v|]
-let recoverPromise p f = call p "catch" [|callback f|]
-let handled p s f = call p "then" [|callback s;callback f|]
-let timer f ms : j = Js.Unsafe.fun_call (globalValue "setTimeout") [|f;ms|]
-let stopTimer id = ignore (Js.Unsafe.fun_call (globalValue "clearTimeout") [|id|] : j)
-let isNumeric x = truth (call (globalValue "Number") "isFinite" [|x|])
-let header h k = call h "get" [|strVal k|]
-let waitTime ms = promise (fun resolve _ -> ignore (timer resolve ms);undef ())
-let lastOrIndex xs i = let a=as_array xs in a.(min (int_of_float (as_float i)) (Array.length a-1))
-let smaller a b = as_float a < as_float b
-let increment a = num (1+int_of_float (as_float a))
-let lesser a b = if smaller a b then a else b
-let retryTag a = strVal ("retry-" ^ string_of_int (int_of_float (as_float a)))
-let exponential a = boxed_float (300. *. 2. ** as_float a)
-let jsonType a =
-  if nullish a then false else
-    let raw=as_string a in
-    let stop=Option.value (String.index_opt raw ';') ~default:(String.length raw) in
-    let m=String.sub raw 0 stop |> String.trim |> String.lowercase_ascii in
-    String.contains m '/' && List.exists (fun suffix -> String.ends_with ~suffix m) ["/json";"+json";"-json";".json"]
-let parseAfter a =
-  let s=String.trim (as_string a) in
-  if s<>"" && String.for_all (fun c -> c>='0' && c<='9') s then boxed_float (1000. *. float_of_string s) else nil ()
-let canonicalMethod m =
-  match String.lowercase_ascii m with
-  | "get" | "post" | "put" | "patch" | "head" | "delete" | "query" | "options" | "trace" as known ->
-      String.uppercase_ascii known
-  | _ -> m
-let allowsMethod c m =
-  let k=canonicalMethod (as_string m) and methods=get c "methods" in
-  if missing methods then List.mem k ["GET";"PUT";"HEAD";"DELETE";"OPTIONS";"TRACE";"QUERY"]
-  else Array.exists (fun v->canonicalMethod (as_string v)=k) (as_array methods)
-let allowsStatus c status =
-  let choices=get c "statusCodes" in
-  if nullish status then false
-  else if missing choices then List.mem (int_of_float (as_float status)) [408;413;429;500;502;503;504]
-  else Array.exists (fun n->as_float n=as_float status) (as_array choices)
+let global name : value = Js.Unsafe.get Js.Unsafe.global (Js.string name)
+let call target name args : value = Js.Unsafe.meth_call target name args
+let construct name args : value = Js.Unsafe.new_obj (global name) args
+let null = inject Js.null
+let of_string text = inject (Js.string text)
+let of_int (number : int) = inject number
+let of_float number = inject (Js.number_of_float number)
+let array values = inject (Js.array (Array.of_list values))
+let get target key : value = Js.Unsafe.get target (Js.string key)
+let typeof value = Js.to_string (Js.typeof value)
+
+let field target key =
+  let value = get target key in
+  if typeof value = "undefined" then None else Some value
+
+let keys target = Array.to_list (Array.map Js.to_string (Js.to_array (Js.object_keys target)))
+let to_string value = if typeof value = "string" then Some (Js.to_string (Js.Unsafe.coerce value)) else None
+let to_number value = if typeof value = "number" then Some (Js.float_of_number (Js.Unsafe.coerce value)) else None
+let to_boolean value = if typeof value = "boolean" then Some (Js.to_bool (Js.Unsafe.coerce value)) else None
+let truthy value = Js.to_bool (Js.Unsafe.coerce value)
+
+let to_list value =
+  if truthy (call (global "Array") "isArray" [| value |]) then
+    Some (Array.to_list (Js.to_array (Js.Unsafe.coerce value : value Js.js_array Js.t)))
+  else None
+
+let is_integer value = truthy (call (global "Number") "isInteger" [| value |])
+let stringify value = Js.to_string (Js._JSON##stringify value)
+
+(* A JS exception, as the value thrown. *)
+let catching f = try Ok (f ()) with Js_error.Exn error -> Error (inject (Js_error.to_error error))
+let parse text = catching (fun () -> (Js._JSON##parse (Js.string text) : value))
+(* Ky's isError: an Error, or an Error of another realm by its internal brand. *)
+let is_error value =
+  Js.instanceof value Js.error_constr
+  || Js.to_string (Js.Unsafe.coerce (call (get (get (global "Object") "prototype") "toString") "call" [| value |]))
+     = "[object Error]"
+let error_name value = Option.value (to_string (get value "name")) ~default:"Error"
+let error_message value = to_string (get value "message")
+let has_stack value = Option.is_some (field value "stack")
+let has_property value key = truthy (call (global "Reflect") "has" [| value; of_string key |])
+let new_error message = inject (new%js Js.error_constr (Js.string message))
+let type_error message = construct "TypeError" [| of_string message |]
+let range_error message = construct "RangeError" [| of_string message |]
+let set_name error name = Js.Unsafe.set error (Js.string "name") (of_string name)
+let lowercase text = Js.to_string (Js.string text)##toLowerCase
+let uppercase text = Js.to_string (Js.string text)##toUpperCase
+let trim text = Js.to_string (Js.string text)##trim
+let number text = Js.float_of_number (Js.Unsafe.coerce (Js.Unsafe.fun_call (global "Number") [| of_string text |]))
+
+type regexp = Js.regExp Js.t
+
+let regexp pattern flags = new%js Js.regExp_withFlags (Js.string pattern) (Js.string flags)
+
+let exec (pattern : regexp) text =
+  Js.Opt.to_option (pattern##exec (Js.string text))
+  |> Option.map (fun handle ->
+         let groups = Js.match_result handle in
+         Array.init groups##.length (fun index ->
+             Js.Optdef.to_option (Js.array_get groups index) |> Option.map Js.to_string))
+
+let test (pattern : regexp) text = Js.to_bool (pattern##test (Js.string text))
+let number_of_float = Js.number_of_float
+let math_min a b = Js.float_of_number (Js.math##min (number_of_float a) (number_of_float b))
+let math_max a b = Js.float_of_number (Js.math##max (number_of_float a) (number_of_float b))
+let math_pow a b = Js.float_of_number (Js.math##pow (number_of_float a) (number_of_float b))
+let now () = Js.float_of_number (Js.Unsafe.coerce (call (global "Date") "now" [||]))
+
+type 'a promise = 'a Promise.t
+
+let resolve = Promise.resolve
+let reject error = Promise.reject (Promise.error_of_any error)
+let bind promise f = Promise.bind f promise
+
+let settle promise =
+  promise
+  |> Promise.map (fun value -> Ok value)
+  |> Promise.catch (fun error -> Promise.resolve (Error (Promise.error_to_any error)))
+
+let promise executor =
+  Promise.make (fun ~resolve ~reject -> executor resolve (fun error -> reject (Promise.error_of_any error)))
+
+let to_value promise = Promise.to_any promise
+
+(* A host call that can throw an error of another realm, run inside a JS Promise executor: no
+   OCaml [try] stands between the call and the executor, so the rejection is the thrown value
+   itself, where js_of_ocaml would catch it as a [Failure] holding its text. *)
+let attempt f = settle (Promise.make (fun ~resolve ~reject:_ -> resolve (f ())))
+
+type timer = value
+
+let set_timeout callback milliseconds =
+  Js.Unsafe.fun_call (global "setTimeout")
+    [| inject (Js.wrap_callback callback); of_float milliseconds |]
+
+let clear_timeout (timer : timer) = ignore (Js.Unsafe.fun_call (global "clearTimeout") [| timer |] : value)
+let sleep milliseconds = promise (fun resolve _ -> ignore (set_timeout resolve milliseconds))
+
+type abort_signal = Abort.signal Js.t
+type abort_controller = Abort.controller Js.t
+
+let abort_controller () = new%js Abort.controller
+let controller_signal (controller : abort_controller) = controller##.signal
+let abort (controller : abort_controller) = controller##abort
+let abort_with (controller : abort_controller) reason = controller##abort_reason reason
+
+let any_signal signals : abort_signal =
+  Js.Unsafe.coerce (call (global "AbortSignal") "any" [| inject (Js.array (Array.of_list signals)) |])
+
+let aborted (signal : abort_signal) = Js.to_bool signal##.aborted
+let reason (signal : abort_signal) = signal##.reason
+let throw_if_aborted (signal : abort_signal) = catching (fun () -> signal##throwIfAborted)
+
+let on_abort (signal : abort_signal) listener =
+  let once = Js.Unsafe.obj [| ("once", inject Js._true) |] in
+  ignore (call signal "addEventListener" [| of_string "abort"; inject (Js.wrap_callback listener); once |])
+
+type headers = Fetch.headers Js.t
+
+let headers () = new%js Fetch.headers
+
+let set_header (headers : headers) name value =
+  attempt (fun () -> ignore (call headers "set" [| of_string name; value |]))
+
+let header (headers : headers) name = Js.Opt.to_option (headers##get (Js.string name)) |> Option.map Js.to_string
+
+type request = Fetch.request Js.t
+
+let request input ~method_ ~headers ~body ~signal =
+  let init = Fetch.empty_request_init () in
+  init##._method := Js.string method_;
+  init##.headers := headers;
+  Option.iter (fun body -> init##.body := of_string body) body;
+  init##.signal := signal;
+  attempt (fun () -> new%js Fetch.request_with_init (Js.string input) init)
+
+let with_signal (request : request) signal =
+  let init = Fetch.empty_request_init () in
+  init##.signal := signal;
+  catching (fun () -> new%js Fetch.request_of_request_with_init request init)
+
+let clone_request (request : request) = catching (fun () -> request##clone)
+let request_method (request : request) = Js.to_string request##._method
+let request_url (request : request) = Js.to_string request##.url
+let request_headers (request : request) = request##.headers
+let request_signal (request : request) = request##.signal
+let request_text (request : request) = Promise.map Js.to_string request##text
+
+type response = Fetch.response Js.t
+
+let response body ~status ~headers : (response, value) result promise =
+  let init = Js.Unsafe.obj [| ("status", status); ("headers", headers) |] in
+  attempt (fun () -> Js.Unsafe.coerce (construct "Response" [| body; init |]))
+
+let status (response : response) = response##.status
+let ok (response : response) = Js.to_bool response##.ok
+let response_headers (response : response) = response##.headers
+let has_body (response : response) = Js.Opt.test (Js.Unsafe.get response (Js.string "body") : value Js.opt)
+let response_text (response : response) = Promise.map Js.to_string response##text
+
+type bytes = Typed_array.arrayBuffer Js.t
+
+let array_buffer (response : response) = response##arrayBuffer
+let byte_length (bytes : bytes) = bytes##.byteLength
+
+type text_decoder = value
+
+let utf8_decoder () = construct "TextDecoder" [||]
+let text_decoder label = attempt (fun () -> construct "TextDecoder" [| of_string label |])
+let decode decoder (bytes : bytes) = Js.to_string (Js.Unsafe.coerce (call decoder "decode" [| inject bytes |]))
