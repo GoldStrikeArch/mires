@@ -113,13 +113,14 @@ let normalize_retry_options (retry : retry_options) =
   let*! status_codes = array "retry.statusCodes must be an array" retry.status_codes in
   (* A mistyped entry only ever fails to match, so it is reported instead. *)
   let every check message values =
-    List.fold_right
-      (fun value rest ->
-        match (check value, rest) with
-        | Some item, Ok items -> Ok (item :: items)
-        | None, _ -> type_error message
-        | _, (Error _ as error) -> error)
-      values (Ok [])
+    let rec loop acc = function
+      | [] -> Ok (List.rev acc)
+      | value :: rest -> (
+          match check value with
+          | Some item -> loop (item :: acc) rest
+          | None -> type_error message)
+    in
+    loop [] values
   in
   let*! methods =
     match methods with
@@ -177,19 +178,28 @@ let validate_timeout_option value =
 (* utils/merge.js: option merging keys the headers by their lowercased name, the last spelling of
    a name winning at the place of its first, and mergeHeaders sets each one on a fresh Headers. *)
 let lowercase_headers headers =
-  List.fold_left
-    (fun merged name ->
-      let value = Host.get headers name and name = Host.lowercase name in
-      if List.mem_assoc name merged then
-        List.map (fun (known, old) -> (known, if known = name then value else old)) merged
-      else merged @ [ (name, value) ])
-    [] (Host.keys headers)
+  let seen = Hashtbl.create 16 in
+  let order = ref [] in
+  List.iter
+    (fun key ->
+      let value = Host.get headers key and name = Host.lowercase key in
+      match Hashtbl.find_opt seen name with
+      | Some cell -> cell := value
+      | None ->
+          let cell = ref value in
+          Hashtbl.add seen name cell;
+          order := (name, cell) :: !order)
+    (Host.keys headers);
+  List.rev_map (fun (name, cell) -> (name, !cell)) !order
 
 let merge_headers headers =
   let result = Host.headers () in
   let rec set_each = function
     | [] -> Ok result
-    | (name, value) :: rest -> Result.bind (thrown (Host.set_header result name value)) (fun () -> set_each rest)
+    | (name, value) :: rest -> (
+        match thrown (Host.set_header result name value) with
+        | Ok () -> set_each rest
+        | Error _ as error -> error)
   in
   set_each headers
 

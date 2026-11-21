@@ -9,6 +9,7 @@ each step hands to the next. What Ky throws, they give as `Err`.
 
 -}
 
+import Dict
 import Host exposing (AbortController, Headers, Io(..), JsError, Outcome, Request, Response, Signal, andThen, andThenOk, map)
 import Json.Decode as D
 import Json.Encode as E
@@ -179,7 +180,7 @@ integer =
 
 nonNegative : D.Value -> Maybe Float
 nonNegative value =
-    number value |> Maybe.andThen (\n -> if n >= 0 then Just n else Nothing)
+    number value |> Maybe.andThen (\n -> if not (isNaN n) && n >= 0 then Just n else Nothing)
 
 
 {-| Every value checked, or the first failure.
@@ -297,29 +298,38 @@ JS property order.
 -}
 lowercaseHeaders : D.Value -> List ( String, D.Value )
 lowercaseHeaders headers =
-    D.decodeValue (D.keyValuePairs D.value) headers
-        |> Result.withDefault []
-        |> List.foldl
-            (\( key, value ) merged ->
-                let
-                    name =
-                        String.toLower key
-                in
-                if List.any (\( known, _ ) -> known == name) merged then
-                    List.map
-                        (\( known, old ) ->
-                            if known == name then
-                                ( known, value )
+    let
+        ( values, reversedOrder ) =
+            D.decodeValue (D.keyValuePairs D.value) headers
+                |> Result.withDefault []
+                |> List.foldl
+                    (\( key, value ) ( seen, order ) ->
+                        let
+                            name =
+                                String.toLower key
 
-                            else
-                                ( known, old )
-                        )
-                        merged
+                            nextOrder =
+                                if Dict.member name seen then
+                                    order
 
-                else
-                    merged ++ [ ( name, value ) ]
-            )
-            []
+                                else
+                                    name :: order
+                        in
+                        ( Dict.insert name value seen, nextOrder )
+                    )
+                    ( Dict.empty, [] )
+    in
+    List.foldl
+        (\name acc ->
+            case Dict.get name values of
+                Just value ->
+                    ( name, value ) :: acc
+
+                Nothing ->
+                    acc
+        )
+        []
+        reversedOrder
 
 
 {-| mergeHeaders: each header set on a fresh Headers, which validates it.
@@ -388,16 +398,89 @@ isRawNetworkError error =
             False
 
 
-{-| JS whitespace: what `\s` matches (and String.trim, which is JS's own, removes).
+{-| JS whitespace: what `\s` matches (and String.trim, which is JS's own, removes), checked on a
+single UTF-16 code unit string. Every JS whitespace code point is in the BMP.
 -}
-isJsWhitespace : Char -> Bool
-isJsWhitespace char =
-    let
-        code =
-            Char.toCode char
-    in
-    List.member code [ 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xA0, 0x1680, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000, 0xFEFF ]
-        || (code >= 0x2000 && code <= 0x200A)
+isJsWhitespaceUnit : String -> Bool
+isJsWhitespaceUnit unit =
+    case unit of
+        " " ->
+            True
+
+        "\t" ->
+            True
+
+        "\n" ->
+            True
+
+        "\r" ->
+            True
+
+        "\u{000B}" ->
+            True
+
+        "\u{000C}" ->
+            True
+
+        "\u{00A0}" ->
+            True
+
+        "\u{1680}" ->
+            True
+
+        "\u{2000}" ->
+            True
+
+        "\u{2001}" ->
+            True
+
+        "\u{2002}" ->
+            True
+
+        "\u{2003}" ->
+            True
+
+        "\u{2004}" ->
+            True
+
+        "\u{2005}" ->
+            True
+
+        "\u{2006}" ->
+            True
+
+        "\u{2007}" ->
+            True
+
+        "\u{2008}" ->
+            True
+
+        "\u{2009}" ->
+            True
+
+        "\u{200A}" ->
+            True
+
+        "\u{2028}" ->
+            True
+
+        "\u{2029}" ->
+            True
+
+        "\u{202F}" ->
+            True
+
+        "\u{205F}" ->
+            True
+
+        "\u{3000}" ->
+            True
+
+        "\u{FEFF}" ->
+            True
+
+        _ ->
+            False
 
 
 {-| Matches JSON subtypes like `json`, `problem+json` and `vnd.api+json`, written out rather than
@@ -434,83 +517,144 @@ isJsonContentType contentType =
                 False
 
 
+skipJsWhitespace : Int -> Int -> String -> Int
+skipJsWhitespace pos len text =
+    if pos < len && isJsWhitespaceUnit (String.slice pos (pos + 1) text) then
+        skipJsWhitespace (pos + 1) len text
+
+    else
+        pos
+
+
+isAsciiCharset : Int -> Int -> String -> Bool
+isAsciiCharset pos len text =
+    if pos + 7 > len then
+        False
+
+    else
+        let
+            at offset lower upper =
+                let
+                    c =
+                        String.slice (pos + offset) (pos + offset + 1) text
+                in
+                c == lower || c == upper
+        in
+        at 0 "c" "C"
+            && at 1 "h" "H"
+            && at 2 "a" "A"
+            && at 3 "r" "R"
+            && at 4 "s" "S"
+            && at 5 "e" "E"
+            && at 6 "t" "T"
+
+
+findQuote : Int -> Int -> String -> Maybe Int
+findQuote pos len text =
+    if pos >= len then
+        Nothing
+
+    else if String.slice pos (pos + 1) text == "\"" then
+        Just pos
+
+    else
+        findQuote (pos + 1) len text
+
+
+scanBareCharset : Int -> Int -> String -> Int
+scanBareCharset pos len text =
+    if pos >= len then
+        pos
+
+    else
+        let
+            unit =
+                String.slice pos (pos + 1) text
+        in
+        if unit == ";" || unit == "," || isJsWhitespaceUnit unit then
+            pos
+
+        else
+            scanBareCharset (pos + 1) len text
+
+
+matchBareCharset : Int -> Int -> String -> Maybe String
+matchBareCharset start len text =
+    let
+        end =
+            scanBareCharset start len text
+    in
+    if end > start then
+        Just (String.slice start end text)
+
+    else
+        Nothing
+
+
+matchCharsetValue : Int -> Int -> String -> Maybe String
+matchCharsetValue start len text =
+    if start < len && String.slice start (start + 1) text == "\"" then
+        case findQuote (start + 1) len text of
+            Just closePos ->
+                if closePos > start + 1 then
+                    Just (String.slice (start + 1) closePos text)
+
+                else
+                    matchBareCharset start len text
+
+            Nothing ->
+                matchBareCharset start len text
+
+    else
+        matchBareCharset start len text
+
+
 {-| The charset parameter as `/;\s*charset\s*=\s*(?:"([^"]+)"|([^;,\s]+))/i` finds it: after the
 first `;` where the pattern matches, a quoted value of one or more characters, or else a run of
 characters other than `;`, `,` and whitespace. The case of `charset` is ignored for ASCII letters
-only, as a non-Unicode JS pattern ignores it. String.trimLeft is JS's trimStart.
+only, as a non-Unicode JS pattern ignores it. Scans `;` positions once in O(N) and checks each
+candidate with tail-recursive index helpers.
 -}
 charset : String -> Maybe String
 charset contentType =
-    case String.indexes ";" contentType |> List.head of
-        Nothing ->
-            Nothing
+    let
+        len =
+            String.length contentType
 
-        Just index ->
-            let
-                rest =
-                    String.dropLeft (index + 1) contentType
+        loop indices =
+            case indices of
+                [] ->
+                    Nothing
 
-                afterName =
-                    String.trimLeft rest
+                index :: rest ->
+                    let
+                        nameStart =
+                            skipJsWhitespace (index + 1) len contentType
+                    in
+                    if isAsciiCharset nameStart len contentType then
+                        let
+                            eqPos =
+                                skipJsWhitespace (nameStart + 7) len contentType
+                        in
+                        if eqPos < len && String.slice eqPos (eqPos + 1) contentType == "=" then
+                            let
+                                valueStart =
+                                    skipJsWhitespace (eqPos + 1) len contentType
+                            in
+                            case matchCharsetValue valueStart len contentType of
+                                Just label ->
+                                    Just label
 
-                isCharset =
-                    String.toList (String.left 7 afterName)
-                        |> List.map (\c -> if Char.toCode c >= 0x41 && Char.toCode c <= 0x5A then Char.fromCode (Char.toCode c + 32) else c)
-                        |> String.fromList
-                        |> (==) "charset"
-
-                value =
-                    String.dropLeft 7 afterName |> String.trimLeft |> String.dropLeft 1 |> String.trimLeft
-
-                quoted =
-                    if String.startsWith "\"" value then
-                        case String.indexes "\"" (String.dropLeft 1 value) |> List.head of
-                            Just end ->
-                                if end > 0 then
-                                    Just (String.slice 1 (end + 1) value)
-
-                                else
-                                    Nothing
-
-                            Nothing ->
-                                Nothing
-
-                    else
-                        Nothing
-
-                bare =
-                    String.toList value
-                        |> takeWhile (\c -> c /= ';' && c /= ',' && not (isJsWhitespace c))
-                        |> String.fromList
-            in
-            if isCharset && String.startsWith "=" (String.trimLeft (String.dropLeft 7 afterName)) then
-                case quoted of
-                    Just label ->
-                        Just label
-
-                    Nothing ->
-                        if bare /= "" then
-                            Just bare
+                                Nothing ->
+                                    loop rest
 
                         else
-                            charset rest
+                            loop rest
 
-            else
-                charset rest
-
-
-takeWhile : (a -> Bool) -> List a -> List a
-takeWhile keep values =
-    case values of
-        value :: rest ->
-            if keep value then
-                value :: takeWhile keep rest
-
-            else
-                []
-
-        [] ->
-            []
+                    else
+                        loop rest
+    in
+    loop (String.indexes ";" contentType)
 
 
 {-| createTextDecoder: the charset's decoder, or UTF-8 for none or an unknown label.
@@ -661,9 +805,6 @@ create input options =
         -- A content-type from options.headers counts as user-provided.
         userProvidedContentType =
             List.any (\( name, _ ) -> name == "content-type") headers
-
-        body =
-            options.json |> Maybe.map (E.encode 0)
     in
     mergeHeaders headers
         |> andThenOk
@@ -673,6 +814,11 @@ create input options =
                         Done (Err failure)
 
                     Ok ( retryOptions, throws, timeout ) ->
+                        let
+                            -- Encode JSON only after option validation succeeds, matching Ky's error order.
+                            body =
+                                options.json |> Maybe.map (E.encode 0)
+                        in
                         Host.abortController
                             |> andThen
                                 (\controller ->
@@ -840,7 +986,7 @@ calculateDelay ky =
     ky.retry.delay (ky.retryCount + 1)
         |> map
             (\retryDelay ->
-                if retryDelay >= 0 then
+                if not (isNaN retryDelay) && retryDelay >= 0 then
                     Ok (Just (min ky.retry.backoffLimit retryDelay))
 
                 else

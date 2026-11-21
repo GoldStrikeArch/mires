@@ -18,7 +18,9 @@ add('method-case',
   {method:'custom',methods:['custom'],replies:retryOnce},
   {method:'CUSTOM',methods:['custom'],replies:retryOnce},
   {method:'pAtCh',methods:['PaTcH'],replies:retryOnce},
-  {method:'qUeRy',replies:retryOnce})
+  {method:'qUeRy',replies:retryOnce},
+  {method:'OPTIONS',methods:['OPT\u0130ONS'],replies:retryOnce},
+  {method:'options',methods:['OPT\u0130ONS'],replies:retryOnce})
 add('empty-and-malformed',{replies:[response(204,null)]},{replies:[response(200,'{bad')]},{read:'text',replies:[response(204,null)]})
 add('http-errors',{replies:[response(404,'{"code":"missing"}',{'Content-Type':'application/problem+json'})]},{replies:[response(400,'plain error')]},{replies:[response(404,'{bad',{'Content-Type':'application/json'})]},{replies:[response(404,'')]})
 add('throw-disabled',{throwHttpErrors:false,replies:[response(503,'{"offline":true}')]})
@@ -73,6 +75,7 @@ add('error-data-charset',
   latin1('text/plain; charset="latin1'),latin1('text/plain; charset=""'),latin1('text/plain; xcharset=latin1'),
   latin1('text/plain; foo=1; charset=latin1'),latin1('text/plain; charset=utf-8; charset=latin1'),
   latin1('text/plain; charset=latin1, x'),latin1('text/plain;charset=latin1;x'),latin1('charset=latin1'),
+  latin1('text/plain; charset="a;b"'),latin1('text/plain; foo="; charset=latin1"'),
   {replies:[response(400,'"é"',{'Content-Type':'application/json; charset=iso-8859-1'})]},
   {replies:[response(400,null,{'Content-Type':'text/plain; charset=latin1'})]})
 const typed = contentType => ({replies:[response(404,'{"a":1}',{'Content-Type':contentType})]})
@@ -127,9 +130,19 @@ add('large-numbers',
 // Deep and wide values pass through the request body, the response body and the trace.
 const nested = depth => { let value = 0; for (let i = 0; i < depth; i++) value = [value]; return value }
 add('deep-and-wide',
-  {method:'POST',json:nested(1000)},{replies:[response(200,'['.repeat(1000)+']'.repeat(1000))]},
+  {method:'POST',json:nested(1000)},{limit:-1,method:'POST',json:nested(1000)},
+  {replies:[response(200,'['.repeat(1000)+']'.repeat(1000))]},
   {read:'text',replies:[response(200,'x'.repeat(200000))]},
   {replies:[response(404,'['.repeat(1000)+']'.repeat(1000),{'Content-Type':'application/json'})]})
+add('wide-and-long-headers',
+  {methods:[...Array(9999).fill('x'),'get'],replies:retryOnce},
+  {statusCodes:[...Array(9999).fill(499),500],replies:[response(500,'x'),ok]},
+  {headers:Object.fromEntries(Array.from({length:3000},(_,i)=>['x-h'+i,'v']))},
+  latin1('text/plain; charset='+'a'.repeat(6000)),
+  latin1('text/plain; foo='+'a'.repeat(6000)),
+  latin1('text/plain; charset="'+'a'.repeat(6000)+'"'),
+  {replies:[response(400,'{"a":1}',{'Content-Type':';'.repeat(20000)+'application/json'})]},
+  latin1('text/plain'+';'.repeat(20000)+'charset=latin1'))
 add('ok-bodies',
   {replies:[response(200,'"x"',{'Content-Type':'application/json; charset=utf-16le'})]},
   {read:'text',replies:[response(200,'é',{'Content-Type':'text/plain; charset=latin1'})]},

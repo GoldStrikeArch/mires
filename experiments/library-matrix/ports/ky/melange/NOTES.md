@@ -22,7 +22,7 @@ Each corpus case is read in place, field by field. The option values Ky checks s
 - **Promises of results.** Ky's async methods give `('a, failure) result Host.promise`: a call that Ky would throw out of resolves with `Error failure`, and no OCaml exception crosses a promise. `let*` binds a promise, `let*?` a promise of a result and `let*!` a result. A rejection from a host promise becomes a value through `Host.settle`; a synchronous host exception, through `Host.catching` (`Js.Exn.Error`).
 - **Errors.** `failure` is `Http_error`, `Network_error`, `Timeout_error` (Ky's own errors) or `Thrown` of the JS value that was thrown: a host constructor's TypeError or RangeError, `JSON.parse`'s SyntaxError, an abort reason. Ky's option checks make real JS errors (`new TypeError(..)`). `error_name` reads the JS `name`.
 - **Constructors that report errors return a result.** `Host.set_header`, `Host.request`, `Host.response` and `Host.text_decoder` give `Ok` of what they built or `Error` of what the host threw, so the constructor (`create`) is synchronous, as Ky's is. `is_error` is Ky's `isError`: `instanceof Error`, or the `[object Error]` brand.
-- **Recursion.** `retry` and `retry_from_error` call each other as `#retry` and `#retryFromError` do; every call goes through a promise, so no stack builds up.
+- **Recursion.** `retry` and `retry_from_error` call each other as `#retry` and `#retryFromError` do; every call goes through a promise, so no stack builds up. `every` (in `normalize_retry_options`) and `merge_headers` use direct tail-recursive loops so wide `retry.methods`, `retry.statusCodes` and `headers` inputs do not overflow the JS stack.
 - **The timeout race** is Ky's `utils/timeout.js` on host promises: `Host.promise` sets the timer and forwards the transport's outcome. Ky's `timedOut` flag tells a timeout from the transport's own rejection.
 - **JS semantics.** Header values, URLs and bodies are JS strings, so OCaml's `String` functions see UTF-16 code units. `Host.lowercase`, `uppercase` and `trim` are JS's `toLowerCase`, `toUpperCase` and `trim`. Ky's regular expressions (the delay digits, the three HTTP-date forms, the charset parameter) run as JS `RegExp`s with Ky's own patterns.
 - **Dates.** `create_timestamp` counts days as ECMAScript's `MakeDay` does (`days_from_civil`). It reproduces `Date.UTC`'s reading of a year from 0 to 99 as 1900 + year: the day has to exist in that year and in the year itself, so 29 Feb 0000 is rejected as Ky rejects it. Timestamps are floats; OCaml's `int` is 32-bit here.
@@ -43,4 +43,4 @@ None changes a result in the parity domain.
 
 ## Performance accommodations
 
-None.
+`lowercase_headers` uses a local `Hashtbl` of mutable value cells alongside a reversed insertion-order list (`List.rev_map` at the end) so merging wide header objects runs in O(N) time while preserving Ky's first-spelling order and last-spelling value precedence.

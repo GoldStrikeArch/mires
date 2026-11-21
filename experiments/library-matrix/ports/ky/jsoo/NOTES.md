@@ -26,4 +26,4 @@ The shared source's, in `ports/ky/melange/NOTES.md`. None changes a result in th
 
 ## Performance accommodations
 
-None.
+The shared source's (`lowercase_headers` O(N) `Hashtbl` merge), described in `ports/ky/melange/NOTES.md`.

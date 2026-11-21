@@ -25,9 +25,9 @@ The host sends the corpus input through `start`. Each request case is read in pl
 
 - **Errors.** `Failure` is `HttpError`, `NetworkError`, `TimeoutError` (Ky's own errors) or `Thrown` of a JS error as Ky reads one: its name, its message, whether it is an Error, whether it has a stack and whether it carries `__sentry_captured__`. The host describes every error it catches this way (whether it is an Error by Ky's `isError`: `instanceof Error` or the `[object Error]` brand); Ky's option checks make their TypeErrors, RangeErrors and Errors as such descriptions.
 - **JS semantics.** Elm strings are JS strings. `String.toLower`, `toUpper`, `trim` and `trimLeft` are JS's `toLowerCase`, `toUpperCase`, `trim` and `trimStart`. `Char.isDigit` is ASCII only, as `\d` is.
-- **Patterns.** elm/core has no regular expressions. Each of Ky's three HTTP-date patterns has a fixed length once the weekday is known, so `RetryTiming` checks each field at the position the pattern fixes. `charset` follows `/;\s*charset\s*=\s*(?:"([^"]+)"|([^;,\s]+))/i` with JS's whitespace set (`isJsWhitespace`) and an ASCII-only case match, as a non-Unicode pattern has.
+- **Patterns.** elm/core has no regular expressions. Each of Ky's three HTTP-date patterns has a fixed length once the weekday is known, so `RetryTiming` checks each field at the position the pattern fixes. `charset` follows `/;\s*charset\s*=\s*(?:"([^"]+)"|([^;,\s]+))/i` with JS's whitespace set (`isJsWhitespaceUnit`) and an ASCII-only case match, as a non-Unicode pattern has, scanning `;` positions once in O(N) with tail-recursive index helpers so long or semicolon-rich `Content-Type` headers neither overflow the stack nor go quadratic.
 - **Dates.** `createTimestamp` counts days as ECMAScript's `MakeDay` does (`daysFromCivil`). It reproduces `Date.UTC`'s reading of a year from 0 to 99 as 1900 + year: the day has to exist in that year and in the year itself, so 29 Feb 0000 is rejected as Ky rejects it. The clock is the host's `Date.now()`.
-- **JSON.** `Json.Encode.encode 0` is `JSON.stringify`, and `Json.Decode.decodeString` parses with `JSON.parse`; a failed parse is Ky's SyntaxError.
+- **JSON.** `Json.Encode.encode 0` is `JSON.stringify` (deferred until after option validation so validation errors take precedence, as in Ky), and `Json.Decode.decodeString` parses with `JSON.parse`; a failed parse is Ky's SyntaxError.
 
 ## Deviations from the npm source
 
@@ -44,4 +44,4 @@ None changes a result in the parity domain.
 
 ## Performance accommodations
 
-None.
+`lowercaseHeaders` uses `Dict` plus a reversed unique-key list (folded back into first-spelling order) so wide header objects merge in O(N log N) time instead of O(N²) list appends.

@@ -128,30 +128,35 @@ func contains[T comparable](values []T, value T) bool {
 	return false
 }
 
-// normalizeRequestMethod is Ky's. A method whose JS lowercase form is one of Ky's names is an
-// ASCII spelling of it, and none of the names holds the two letters (i, k) that Go's simple case
-// mapping gives a non-ASCII character, so Go's case mapping is JS's here.
+// normalizeRequestMethod is Ky's. Uses jsLowerCase so Unicode case folding matches JS's
+// toLowerCase; every name in requestMethods is pure ASCII, so strings.ToUpper agrees with JS
+// once matched.
 func normalizeRequestMethod(input string) string {
-	if contains(requestMethods, strings.ToLower(input)) {
+	if contains(requestMethods, jsLowerCase(input)) {
 		return strings.ToUpper(input)
 	}
 	return input
 }
 
 // normalizeRetryMethod: common methods for retry matching are case-insensitive, custom ones keep
-// their case.
+// their case. Uses jsLowerCase because caseInsensitiveMethods contains "options" (Go's
+// strings.ToLower folds U+0130 'İ' to ASCII 'i', whereas JS yields two code units).
 func normalizeRetryMethod(method string) string {
-	if lowercase := strings.ToLower(method); contains(caseInsensitiveMethods, lowercase) {
+	if lowercase := jsLowerCase(method); contains(caseInsensitiveMethods, lowercase) {
 		return lowercase
 	}
 	return method
 }
 
 func nonNegative(value *js.Object) (float64, bool) {
-	if typeTag(value) != "[object Number]" || value.Float() < 0 {
+	if typeTag(value) != "[object Number]" {
 		return 0, false
 	}
-	return value.Float(), true
+	n := value.Float()
+	if math.IsNaN(n) || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // normalizeRetryOptions applies the defaults for undefined values, and Ky's checks, in Ky's order.

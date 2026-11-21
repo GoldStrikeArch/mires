@@ -4,7 +4,7 @@ Each call runs a list of independent Fetch requests against a deterministic inje
 
 ## Requests
 
-A request supplies an absolute `url`, an HTTP `method`, `headers` (an object of header names to JSON values), an optional JSON body `json`, the body shortcut `read` (json or text), a list of transport `replies`, and `abort` (none, before dispatch, at fetch or during the beforeRetry hook). The retry options `limit`, `backoffLimit`, `maxRetryAfter`, `retryOnTimeout`, `methods` and `statusCodes`, `throwHttpErrors` and the per-attempt millisecond `timeout` (or false) are each any JSON value, or omitted. HTTP replies supply a status, string or null body and headers. The last reply repeats if retries exhaust the list.
+A request supplies an absolute `url`, an HTTP `method`, `headers` (an object of header names to JSON values), an optional JSON body `json`, the body shortcut `read` (json or text), a non-empty list of transport `replies`, and `abort` (none, before dispatch, at fetch or during the beforeRetry hook). The retry options `limit`, `backoffLimit`, `maxRetryAfter`, `retryOnTimeout`, `methods` and `statusCodes`, `throwHttpErrors` and the per-attempt millisecond `timeout` (or false) are each any JSON value, or omitted. HTTP replies supply a status, string or null body and headers. The last reply repeats if retries exhaust the list.
 
 ## Options
 
@@ -40,6 +40,7 @@ The observable result includes either the parsed JSON or text, or the error name
 
 - **Timeouts race stalled replies.** A reply that settles answers well before the corpus's timeouts (150 ms or more). A much shorter timeout, such as 0, races the transport's own scheduling, so its winner depends on the runtime rather than on Ky; such inputs (the review's `timeout-zero` probe) are outside the domain.
 - **JSON values.** The corpus is JSON: no option is undefined (an omitted key stands for it), NaN, Infinity or -0.
+- **JSON nesting depth.** Request `json` bodies and JSON response bodies are nested at most 1,000 levels deep (matching `deep-and-wide` in the corpus). npm `ky` 2.2.0 itself overflows its internal `cloneDeep` (inside `cloneInitHookOptions`, before `init` hooks) at ~3,407 levels (cold V8) / ~7,000 levels (warm V8), Elm's `Json.Encode.encode 0` (`JSON.stringify(v, null, 0)`) overflows around ~5,250 levels, and browser `structuredClone` in the checker bounds nesting around ~1,500 levels; ≤1,000 stays safely within npm's own non-overflowing range.
 - **Error bodies stay small.** They are well under Ky's 10 MiB error-data limit (a larger one would make the corpus impractical) and are in memory, so their reads never reach Ky's error-data timeout.
 - **The adapter's hooks** return nothing and never throw, so Ky's handling of hook results (a Request, Response, `ky.stop` or options) and of a throwing beforeRetry hook is not exercised. `totalTimeout`, `prefix`, `baseUrl`, `searchParams`, `parseJson`, `stringifyJson`, `retry.jitter`, `retry.shouldRetry`, `retry.afterStatusCodes`, `maxResponseSize` and the progress callbacks are never set.
 
