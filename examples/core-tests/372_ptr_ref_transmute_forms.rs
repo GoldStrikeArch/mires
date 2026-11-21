@@ -18,6 +18,7 @@ extern crate alloc;
 mod prelude;
 use prelude::*;
 
+use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::boxed::Box;
 use core::mem::transmute;
 use core::num::NonZero;
@@ -184,6 +185,56 @@ fn opt_nn_to_nz(o: Option<NonNull<u8>>) -> NonZero<usize> {
     unsafe { transmute(o) }
 }
 
+#[inline(never)]
+fn ref_u32_to_arr1(r: &u32) -> &[u32; 1] {
+    unsafe { transmute(r) }
+}
+
+#[inline(never)]
+fn mut_u32_to_arr1(r: &mut u32) -> &mut [u32; 1] {
+    unsafe { transmute(r) }
+}
+
+#[inline(never)]
+fn arr4_to_arr2(a: &[u8; 4]) -> &[u8; 2] {
+    unsafe { transmute(a) }
+}
+
+#[inline(never)]
+fn arr4_mut_to_arr2_mut(a: &mut [u8; 4]) -> &mut [u8; 2] {
+    unsafe { transmute(a) }
+}
+
+#[inline(never)]
+fn nn_arr2_to_ref<'a>(p: NonNull<[u32; 2]>) -> &'a [u32; 2] {
+    unsafe { transmute(p) }
+}
+
+#[inline(never)]
+fn nn_arr2_to_mut<'a>(p: NonNull<[u32; 2]>) -> &'a mut [u32; 2] {
+    unsafe { transmute(p) }
+}
+
+#[inline(never)]
+fn nn_win_to_erased(p: NonNull<[u32; 2]>) -> NonNull<()> {
+    unsafe { transmute(p) }
+}
+
+#[inline(never)]
+fn erased_to_nn_arr(p: NonNull<()>) -> NonNull<[u32; 2]> {
+    unsafe { transmute(p) }
+}
+
+#[inline(never)]
+fn erased_to_ref_arr<'a>(p: NonNull<()>) -> &'a [u32; 2] {
+    unsafe { transmute(p) }
+}
+
+#[inline(never)]
+fn byte_ptr_to_mut_pair<'a>(p: *mut u8) -> &'a mut Pair {
+    unsafe { transmute(p) }
+}
+
 #[unsafe(no_mangle)]
 pub fn rust_entry() {
     let mut b = 11u8;
@@ -238,7 +289,9 @@ pub fn rust_entry() {
     let r_from_nn = nn_pair_to_ref_pair(pp);
     print_bool(r_from_nn.a == 111 && r_from_nn.b == 222);
     let nn_from_r = ref_pair_to_nn_pair(&pair);
-    print_bool(unsafe { (*nn_from_r.as_ptr()).a } == 111 && unsafe { (*nn_from_r.as_ptr()).b } == 222);
+    print_bool(
+        unsafe { (*nn_from_r.as_ptr()).a } == 111 && unsafe { (*nn_from_r.as_ptr()).b } == 222,
+    );
     print_bool(unsafe { (*ref_pair_to_ptr_pair(&pair)).b } == 222);
     let r_from_ptr = ptr_pair_to_ref_pair(pp.as_ptr());
     print_bool(r_from_ptr.a == 111 && r_from_ptr.b == 222);
@@ -255,4 +308,52 @@ pub fn rust_entry() {
     let nz_lit = NonZero::new(0x3000usize).unwrap();
     print_bool(nz_to_opt_nn(nz_lit).map(|q| q.as_ptr() as usize) == Some(0x3000));
     print_bool(opt_nn_to_nz(Some(p_u8)).get() == a_u8);
+
+    // Array window transmutes: &T -> &[T; 1], &[E; 4] -> &[E; 2], window NonNull<[u32; 2]> -> &[u32; 2]
+    let mut scalar = 42u32;
+    print_bool(ref_u32_to_arr1(&scalar)[0] == 42);
+    mut_u32_to_arr1(&mut scalar)[0] = 99;
+    print_bool(scalar == 99);
+
+    let mut bytes4 = [10u8, 20, 30, 40];
+    let sub2 = arr4_to_arr2(&bytes4);
+    print_bool(sub2[0] == 10 && sub2[1] == 20);
+    arr4_mut_to_arr2_mut(&mut bytes4)[1] = 88;
+    print_bool(bytes4[1] == 88);
+
+    let mut big = [10u32, 20, 30, 40];
+    let nn_win: NonNull<[u32; 2]> = NonNull::from(&mut big[1]).cast::<[u32; 2]>();
+    let r_win = nn_arr2_to_ref(nn_win);
+    print_bool(r_win[0] == 20 && r_win[1] == 30);
+    nn_arr2_to_mut(nn_win)[1] = 333;
+    print_bool(big[2] == 333);
+
+    // Window erasure round-trip: NonNull<[u32; 2]> -> NonNull<()> -> NonNull<[u32; 2]> / &[u32; 2]
+    let er_win = nn_win_to_erased(nn_win);
+    let back_nn = erased_to_nn_arr(er_win);
+    print_bool(unsafe { (*back_nn.as_ptr())[0] == 20 && (*back_nn.as_ptr())[1] == 333 });
+    let back_ref = erased_to_ref_arr(er_win);
+    print_bool(back_ref[0] == 20 && back_ref[1] == 333);
+
+    // Single evaluation of `__rt.unscale` in `raw_to_ref` (must write index 1, not corrupt index 8)
+    let layout16 = Layout::array::<Pair>(16).unwrap();
+    let raw16 = unsafe { alloc_zeroed(layout16) };
+    let r16 = byte_ptr_to_mut_pair(unsafe { raw16.add(8) });
+    r16.a = 42;
+    let p16 = raw16 as *const Pair;
+    print_bool(unsafe { (*p16.add(1)).a == 42 && (*p16.add(8)).a == 0 });
+    unsafe {
+        dealloc(raw16, layout16);
+    }
+
+    let layout2 = Layout::array::<Pair>(2).unwrap();
+    let raw2 = unsafe { alloc_zeroed(layout2) };
+    let r2 = byte_ptr_to_mut_pair(unsafe { raw2.add(8) });
+    r2.a = 77;
+    r2.b = 88;
+    let p2 = raw2 as *const Pair;
+    print_bool(unsafe { (*p2.add(1)).a == 77 && (*p2.add(1)).b == 88 });
+    unsafe {
+        dealloc(raw2, layout2);
+    }
 }

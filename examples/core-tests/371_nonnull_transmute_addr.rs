@@ -22,7 +22,7 @@ use prelude::*;
 
 use alloc::boxed::Box;
 use core::hint::black_box;
-use core::mem::{ManuallyDrop, MaybeUninit, align_of, transmute};
+use core::mem::{align_of, transmute, ManuallyDrop, MaybeUninit};
 use core::num::NonZero;
 use core::ptr::NonNull;
 
@@ -191,19 +191,29 @@ pub fn rust_entry() {
 
     let h_pair = Box::new(Pair { a: 3, b: 4 });
     let ph_pair = NonNull::from(&*h_pair);
-    print_bool(nn_pair_usize(ph_pair) != 0 && nn_pair_usize(ph_pair) == (ph_pair.as_ptr() as usize));
+    print_bool(
+        nn_pair_usize(ph_pair) != 0 && nn_pair_usize(ph_pair) == (ph_pair.as_ptr() as usize),
+    );
 
     let ps_u8 = NonNull::from(&STAT_U8);
     print_bool(nn_u8_usize(ps_u8) != 0 && nn_u8_usize(ps_u8) == (ps_u8.as_ptr() as usize));
 
     let ps_pair = NonNull::from(&STAT_PAIR);
-    print_bool(nn_pair_usize(ps_pair) != 0 && nn_pair_usize(ps_pair) == (ps_pair.as_ptr() as usize));
+    print_bool(
+        nn_pair_usize(ps_pair) != 0 && nn_pair_usize(ps_pair) == (ps_pair.as_ptr() as usize),
+    );
 
     let dang_u8 = NonNull::<u8>::dangling();
-    print_bool(nn_u8_usize(dang_u8) == align_of::<u8>() && nn_u8_usize(dang_u8) == (dang_u8.as_ptr() as usize));
+    print_bool(
+        nn_u8_usize(dang_u8) == align_of::<u8>()
+            && nn_u8_usize(dang_u8) == (dang_u8.as_ptr() as usize),
+    );
 
     let dang_u32 = NonNull::<u32>::dangling();
-    print_bool(nn_u32_usize(dang_u32) == align_of::<u32>() && nn_u32_usize(dang_u32) == (dang_u32.as_ptr() as usize));
+    print_bool(
+        nn_u32_usize(dang_u32) == align_of::<u32>()
+            && nn_u32_usize(dang_u32) == (dang_u32.as_ptr() as usize),
+    );
 
     let wp = NonNull::<u8>::without_provenance(NonZero::new(0x1234).unwrap());
     print_bool(nn_u8_usize(wp) == 0x1234 && nn_u8_usize(wp) == (wp.as_ptr() as usize));

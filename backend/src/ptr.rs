@@ -1046,20 +1046,24 @@ fn is_slot_element(base: &Expr, key: &Expr) -> bool {
 
 /// `&*raw`: the reference a raw pointer to `pointee` becomes.
 ///
-/// The inverse of [`ref_to_raw`]. A reference to an aggregate is the object the slot names,
-/// [`slot_element`]; a reference to anything else is the slot itself.
+/// The inverse of [`ref_to_raw`]. For a fixed-size array pointee, `__rt.array_ref` resolves both
+/// plain and window slots; for any other aggregate it reads the object out of the slot
+/// ([`slot_element`]), hoisting non-duplicable `raw` expressions so they are evaluated once; a
+/// reference to anything else is the slot itself.
 pub(crate) fn raw_to_ref<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, raw: Expr) -> Expr {
     if crate::value::unsized_tail(fx.tcx, pointee).is_some() {
         return jsast::rt_call("tail_ref", vec![raw]);
     }
-    if !is_slot_pointee(fx.tcx, pointee) {
+    if !is_slot_pointee(fx.tcx, pointee) || !is_indirect(fx.tcx, pointee) {
         return raw;
     }
-    if is_indirect(fx.tcx, pointee) {
-        slot_element(raw)
-    } else {
-        raw
+    if let ty::Array(_, count) = peel_pattern(peel_transparent(fx.tcx, pointee)).kind() {
+        if let Some(len) = count.try_to_target_usize(fx.tcx) {
+            return jsast::rt_call("array_ref", vec![raw, jsast::num(len as f64)]);
+        }
     }
+    let (setup, raw) = reread(fx, raw, &[BUF, OFF]);
+    sequenced(setup, slot_element(raw))
 }
 
 /// A fat pointer built from its two halves: `aggregate_raw_ptr(data, meta)`, and the tail of an

@@ -213,14 +213,14 @@ impl<'a> JsCx<'a> {
         if self.table.unsized_tail(pointee).is_some() {
             return jsast::rt_call("tail_ref", vec![raw]);
         }
-        if !is_slot_pointee(self.table, pointee) {
+        if !is_slot_pointee(self.table, pointee) || !self.table.is_indirect(pointee) {
             return raw;
         }
-        if self.table.is_indirect(pointee) {
-            ptr::slot_element(raw)
-        } else {
-            raw
+        if let Some(TypeKind::Array { length, .. }) = value::kind(self.table, pointee) {
+            return jsast::rt_call("array_ref", vec![raw, jsast::num(*length as f64)]);
         }
+        let (setup, raw) = self.reread(raw, &[BUF, OFF]);
+        sequenced(setup, ptr::slot_element(raw))
     }
 
     /// The zero element factory `__rt.unscale`/`retype` take (`alloc_support.rs::zero_factory`).

@@ -7770,4 +7770,63 @@ fn transmute_single_element_array_of_pattern_pointer_to_usize() {
     );
 }
 
+#[test]
+fn transmute_to_array_ref_uses_array_ref_and_hoists_non_duplicable_raw_to_ref() {
+    const RAW_ARR: TypeId = TypeId(413);
+    const RAW_UNIT: TypeId = TypeId(414);
+    let mut interns = world();
+    interns.intern_type(pointer(RAW_ARR, ARRAY, PointerForm::Slot, true));
+    interns.intern_type(pointer(RAW_UNIT, UNIT, PointerForm::Thin, true));
+
+    let e = FuncBuilder::ENTRY;
+    // BUG-1: raw array pointer -> &array must use `__rt.array_ref(p, len)` so window slots work.
+    let mut b1 = FuncBuilder::new(item(1), signature(vec![RAW_ARR], REF_ARRAY));
+    let p = b1.param(RAW_ARR, NO_ORIGIN);
+    let arr_ref = b1.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: p,
+            from: RAW_ARR,
+            to: REF_ARRAY,
+        },
+        REF_ARRAY,
+        NO_ORIGIN,
+    );
+    b1.terminate(e, RTerm::Return(Some(arr_ref)));
+    let f1 = b1.finish();
+    let p1 = plan_of(&f1, &[(0, "p")]);
+    let body1 = body_of(BodyKind::Function, f1.sig.clone());
+    let js1 = lower(&interns, "arr_ref", &[], &body1, &f1, &p1, straight(&f1));
+    assert_eq!(js1, "function arr_ref(p) {\n  return __rt.array_ref(p, 4);\n}\n");
+
+    // BUG-2: `raw_to_ref` over a non-duplicable `cast_pointer` call (`__rt.thin`) must hoist
+    // into a temporary so `__rt.thin` is evaluated once instead of twice.
+    let mut b2 = FuncBuilder::new(item(2), signature(vec![RAW_UNIT], REF_POINT));
+    let u = b2.param(RAW_UNIT, NO_ORIGIN);
+    let pt_ref = b2.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: u,
+            from: RAW_UNIT,
+            to: REF_POINT,
+        },
+        REF_POINT,
+        NO_ORIGIN,
+    );
+    b2.terminate(e, RTerm::Return(Some(pt_ref)));
+    let f2 = b2.finish();
+    let p2 = plan_of(&f2, &[(0, "p")]);
+    let body2 = body_of(BodyKind::Function, f2.sig.clone());
+    let js2 = lower(&interns, "unbox_erased", &[], &body2, &f2, &p2, straight(&f2));
+    assert_eq!(
+        js2.matches("__rt.thin(").count(),
+        1,
+        "expected single evaluation of __rt.thin: {js2}"
+    );
+    assert!(js2.contains("$t0 = __rt.thin(p, 8)"), "{js2}");
+    assert!(js2.contains("$t0.buf[$t0.off]"), "{js2}");
+}
+
 mod invoke;
