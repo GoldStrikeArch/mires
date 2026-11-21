@@ -273,16 +273,17 @@ func unzlibSync(data []byte, opts *decompressOptions) ([]byte, *flateError) {
 	if err != nil {
 		return nil, err
 	}
+	var body []byte
 	end := len(data) - 4
-	if end < st {
-		end = st
+	if st < len(data) && end > st {
+		body = data[st:end]
 	}
 	var out, dict []byte
 	if opts != nil {
 		out = opts.out
 		dict = opts.dictionary
 	}
-	return inflt(data[st:end], &inflateState{i: 2}, out, dict)
+	return inflt(body, &inflateState{i: 2}, out, dict)
 }
 
 func decompressSync(data []byte, opts *decompressOptions) ([]byte, *flateError) {

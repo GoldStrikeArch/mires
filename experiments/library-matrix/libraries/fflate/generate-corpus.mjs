@@ -1014,7 +1014,7 @@ add('err-uncaught-invalid-gzip', 'Uncaught FlateError on invalid gzip data (exer
   data: { bytes: [0xde, 0xad, 0xbe, 0xef] },
 })
 
-// 11. Output-buffer growth, GZIP member count, and a 1 MiB input (6)
+// 11. Output-buffer growth, GZIP member count, truncated FDICT Zlib, and a 1 MiB input (9)
 const literalRun = makeLiteralRunDeflate(200000, false)
 const literalRunBackref = makeLiteralRunDeflate(200000, true)
 add('inflate-literal-run-200k', 'inflateSync on one dynamic block of 200,000 literals: buffer sl*3 grows once at block start, literals past its end are dropped (150,084 bytes)', {
@@ -1048,6 +1048,21 @@ add('zlib-1mb-l1-mem12', 'zlibSync level 1, mem 12 (plvl 24) on 1 MiB of word-sa
   op: 'zlibSync',
   data: { text: salad1m },
   options: { level: 1, mem: 12 },
+})
+add('unzlib-truncated-2byte-fdict', 'unzlibSync on truncated 2-byte FDICT=1 Zlib header [0x78, 0xBB] with dictionary (zls returns st=6 > len; subarray(6, -4) is empty)', {
+  op: 'unzlibSync',
+  data: { bytes: [0x78, 0xbb] },
+  options: { dictionary: { text: 'a' } },
+})
+add('unzlib-truncated-2byte-fdict-outsize', 'unzlibSync on truncated 2-byte FDICT=1 Zlib header [0x78, 0xBB] with dictionary and outSize: 5 returns 5 zero bytes', {
+  op: 'unzlibSync',
+  data: { bytes: [0x78, 0xbb] },
+  options: { dictionary: { text: 'a' }, outSize: 5 },
+})
+add('decompress-truncated-2byte-fdict', 'decompressSync on truncated 2-byte FDICT=1 Zlib header [0x78, 0xBB] with dictionary dispatches to unzlibSync and returns empty', {
+  op: 'decompressSync',
+  data: { bytes: [0x78, 0xbb] },
+  options: { dictionary: { text: 'a' } },
 })
 
 // 12. Bench cases (2)
@@ -1289,7 +1304,14 @@ if (process.argv.includes('--verify')) {
     }
     const saladBytes = strToU8(salad1m).length
     if (saladBytes < 1000000 || !salad1m.isWellFormed()) { console.error(`FAIL: zlib-1mb-l1-mem12 input ${saladBytes} B, well-formed ${salad1m.isWellFormed()}`); errors++ }
-    console.log(`buffer growth: inflate ${lit.length}B (cap ${litCap}), backref ${br.length}B (${brCap} 'a'), stream frames ${st.map((f) => f.len).join('+')}; gunzip members -> ${gz.length} chunks; salad ${saladBytes}B`)
+    const fdict0 = out('unzlib-truncated-2byte-fdict')
+    const fdict5 = out('unzlib-truncated-2byte-fdict-outsize')
+    const fdictDec = out('decompress-truncated-2byte-fdict')
+    if (fdict0.length !== 0 || fdictDec.length !== 0 || fdict5.length !== 5 || !fdict5.every((b) => b === 0)) {
+      console.error(`FAIL: truncated 2-byte FDICT cases gave lengths ${fdict0.length}, ${fdict5.length}, ${fdictDec.length}`)
+      errors++
+    }
+    console.log(`buffer growth: inflate ${lit.length}B (cap ${litCap}), backref ${br.length}B (${brCap} 'a'), stream frames ${st.map((f) => f.len).join('+')}; gunzip members -> ${gz.length} chunks; salad ${saladBytes}B; fdict2 -> ${fdict0.length}/${fdict5.length}/${fdictDec.length}B`)
   }
 
   // 12. Verify bench cases, ratios, timings, and bench-variant distinctness & equivalence

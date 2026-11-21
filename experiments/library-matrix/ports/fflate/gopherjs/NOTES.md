@@ -7,8 +7,9 @@ subset defined in `libraries/fflate/CONTRACT.md` to Go 1.21, compiled by GopherJ
 tie-breaks, error codes, and streaming chunk boundaries, using only Go and
 `github.com/gopherjs/gopherjs/js` (no embedded JS, no eval refs, no host JS, no standard-library
 packages beyond `runtime`, no goroutines, and no 64-bit integers). It reaches exact parity on all
-83 corpus cases in Node 26.8.1, Chrome 158, and Firefox 160 for both `dist/index.min.js` and
-`dist/index.js`, and passed 740/740 randomized differential cases against `reference.mjs` in Node.
+92 corpus cases in Node 26.8.1, Chrome 158, and Firefox 160 for both `dist/index.min.js` and
+`dist/index.js`, and passed 740/740 randomized differential cases plus the 2026-11-21 adversarial
+probes against `reference.mjs` in Node.
 
 | File | What it is |
 | --- | --- |

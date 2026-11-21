@@ -13313,6 +13313,61 @@
       }
     },
     {
+      "id": "unzlib-truncated-2byte-fdict",
+      "note": "unzlibSync on truncated 2-byte FDICT=1 Zlib header [0x78, 0xBB] with dictionary (zls returns st=6 > len; subarray(6, -4) is empty)",
+      "input": {
+        "op": "unzlibSync",
+        "data": {
+          "bytes": [
+            120,
+            187
+          ]
+        },
+        "options": {
+          "dictionary": {
+            "text": "a"
+          }
+        }
+      }
+    },
+    {
+      "id": "unzlib-truncated-2byte-fdict-outsize",
+      "note": "unzlibSync on truncated 2-byte FDICT=1 Zlib header [0x78, 0xBB] with dictionary and outSize: 5 returns 5 zero bytes",
+      "input": {
+        "op": "unzlibSync",
+        "data": {
+          "bytes": [
+            120,
+            187
+          ]
+        },
+        "options": {
+          "dictionary": {
+            "text": "a"
+          },
+          "outSize": 5
+        }
+      }
+    },
+    {
+      "id": "decompress-truncated-2byte-fdict",
+      "note": "decompressSync on truncated 2-byte FDICT=1 Zlib header [0x78, 0xBB] with dictionary dispatches to unzlibSync and returns empty",
+      "input": {
+        "op": "decompressSync",
+        "data": {
+          "bytes": [
+            120,
+            187
+          ]
+        },
+        "options": {
+          "dictionary": {
+            "text": "a"
+          }
+        }
+      }
+    },
+    {
       "id": "bench-compress",
       "note": "Benchmark: gzipSync (level 6, mtime 0) on ~64 KB realistic mixed-entropy JSON/HTML/log/prose text",
       "input": {

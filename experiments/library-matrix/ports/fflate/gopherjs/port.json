@@ -3,5 +3,5 @@
   "library": "fflate",
   "language": "gopherjs",
   "package": "./src",
-  "boundary": "run(input *js.Object) []byte: operation and action names are read via .String(), options via Get/Int/Float/Bool, text payloads (UTF-8 and Latin-1) and GZIP filenames via charCodeAt per UTF-16 code unit (encoded to UTF-8 or Latin-1 in Go), and byte arrays via Uint8Array.New wrapped zero-copy as []byte; outputs return as non-nil []byte which GopherJS externalises zero-copy as a Uint8Array subarray of the exact slice length. Published on js.Module.exports."
+  "boundary": "run(input *js.Object) []byte: operation and action names are read via .String(), options via Get/Int/Float/Bool, UTF-8 text payloads via host TextEncoder.encode wrapped zero-copy as []byte, Latin-1 text payloads and GZIP filenames via charCodeAt per UTF-16 code unit (low byte in Go), and byte arrays via Uint8Array.New wrapped zero-copy as []byte; outputs return as non-nil []byte which GopherJS externalises zero-copy as a Uint8Array subarray of the exact slice length. Published on js.Module.exports."
 }
