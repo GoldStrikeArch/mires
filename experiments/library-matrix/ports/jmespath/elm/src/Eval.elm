@@ -6,7 +6,9 @@ Two JS operations have no Elm counterpart, so an evaluation can stop and ask the
 for `localeCompare` (max and min of strings), `Identical` for `===` between tokens (contains). The
 host answers and the evaluation resumes from the continuation. Between those, everything is pure.
 
-`traverse` loops while each step is done, so wide arrays cost no stack.
+Element loops (`evalChildren`, `evalHashPairs`, `evalMap`, `filterPass`, `projectHelp`, `evalKeys`,
+`evalSortKeys`) are tail-recursive while each step is done, so wide arrays cost no stack, and
+`evaluate` pattern-matches `Done` directly on the fast path so deep expressions use minimal stack.
 
 -}
 
@@ -42,29 +44,180 @@ map f =
     andThen (f >> Done)
 
 
-{-| `f` over a list in order, stopping at the first failure.
+{-| Evaluate a list of AST child nodes against `value` in order, stopping at the first failure.
 -}
-traverse : (a -> Step b) -> List a -> Step (List b)
-traverse f items =
-    traverseHelp f items []
-
-
-traverseHelp : (a -> Step b) -> List a -> List b -> Step (List b)
-traverseHelp f items acc =
-    case items of
+evalChildren : List V -> V -> List V -> Step (List V)
+evalChildren nodes value acc =
+    case nodes of
         [] ->
             Done (List.reverse acc)
 
-        x :: rest ->
-            case f x of
+        c :: rest ->
+            case evaluate c value of
                 Done y ->
-                    traverseHelp f rest (y :: acc)
+                    evalChildren rest value (y :: acc)
 
                 Failed category ->
                     Failed category
 
                 suspended ->
-                    suspended |> andThen (\y -> traverseHelp f rest (y :: acc))
+                    suspended |> andThen (\y -> evalChildren rest value (y :: acc))
+
+
+{-| Evaluate `MultiSelectHash` key/value pair nodes against `value` in order.
+-}
+evalHashPairs : List V -> V -> List ( String, V ) -> Step (List ( String, V ))
+evalHashPairs pairs value acc =
+    case pairs of
+        [] ->
+            Done (List.reverse acc)
+
+        pair :: rest ->
+            let
+                pairFields =
+                    fieldList pair
+
+                name =
+                    jsString (field "name" pairFields)
+            in
+            case evaluate (field "value" pairFields) value of
+                Done v ->
+                    evalHashPairs rest value (( name, v ) :: acc)
+
+                Failed category ->
+                    Failed category
+
+                suspended ->
+                    suspended |> andThen (\v -> evalHashPairs rest value (( name, v ) :: acc))
+
+
+{-| Evaluate `expr` over each element of `items` in order, stopping at the first failure.
+-}
+evalMap : V -> List V -> List V -> Step (List V)
+evalMap expr items acc =
+    case items of
+        [] ->
+            Done (List.reverse acc)
+
+        x :: rest ->
+            case evaluate expr x of
+                Done y ->
+                    evalMap expr rest (y :: acc)
+
+                Failed category ->
+                    Failed category
+
+                suspended ->
+                    suspended |> andThen (\y -> evalMap expr rest (y :: acc))
+
+
+{-| Evaluate a filter condition over every item in order before any projection runs, so the first
+error raised matches jmespath's two-pass filter semantics.
+-}
+filterPass : V -> List V -> List V -> Step (List V)
+filterPass condition items kept =
+    case items of
+        [] ->
+            Done (List.reverse kept)
+
+        x :: rest ->
+            case evaluate condition x of
+                Done result ->
+                    if isFalse result then
+                        filterPass condition rest kept
+
+                    else
+                        filterPass condition rest (x :: kept)
+
+                Failed category ->
+                    Failed category
+
+                suspended ->
+                    suspended
+                        |> andThen
+                            (\result ->
+                                if isFalse result then
+                                    filterPass condition rest kept
+
+                                else
+                                    filterPass condition rest (x :: kept)
+                            )
+
+
+filterBase : V -> V -> V -> Step V
+filterBase condition right base =
+    case base of
+        Arr _ items ->
+            case filterPass condition items [] of
+                Done kept ->
+                    projectHelp right kept []
+
+                Failed category ->
+                    Failed category
+
+                suspended ->
+                    suspended |> andThen (\kept -> projectHelp right kept [])
+
+        _ ->
+            Done Null
+
+
+{-| Projections keep every result except null; undefined (an empty max\_by) is kept.
+-}
+projectHelp : V -> List V -> List V -> Step V
+projectHelp right items acc =
+    case items of
+        [] ->
+            Done (array (List.reverse acc))
+
+        x :: rest ->
+            case evaluate right x of
+                Done Null ->
+                    projectHelp right rest acc
+
+                Done y ->
+                    projectHelp right rest (y :: acc)
+
+                Failed category ->
+                    Failed category
+
+                suspended ->
+                    suspended
+                        |> andThen
+                            (\y ->
+                                case y of
+                                    Null ->
+                                        projectHelp right rest acc
+
+                                    _ ->
+                                        projectHelp right rest (y :: acc)
+                            )
+
+
+flattenValue : V -> V
+flattenValue base =
+    case base of
+        Arr _ items ->
+            array
+                (List.concatMap
+                    (\item ->
+                        case item of
+                            Arr _ inner ->
+                                inner
+
+                            _ ->
+                                [ item ]
+                    )
+                    items
+                )
+
+        _ ->
+            Null
+
+
+buildHash : List ( String, V ) -> V
+buildHash pairs =
+    object (List.foldl (\( k, v ) -> put k v) [] pairs)
 
 
 array : List V -> V
@@ -112,207 +265,303 @@ child i fields =
 -- INTERPRETER
 
 
-{-| jmespath's `visit`.
+{-| jmespath's `visit`. Pattern-matches `Done` directly on the fast path to keep JS call-stack
+depth low across deeply nested expressions (including right-nested projections and filters).
 -}
 evaluate : V -> V -> Step V
 evaluate node value =
     case node of
         Obj _ fields ->
-            visit (nodeType fields) fields value
+            case nodeType fields of
+                "Field" ->
+                    case value of
+                        Obj _ object_ ->
+                            case field (Values.jsString (field "name" fields)) object_ of
+                                Undefined ->
+                                    Done Null
 
-        -- `node.type` of a missing node is a TypeError in jmespath.
-        _ ->
-            Failed "syntax"
+                                x ->
+                                    Done x
 
-
-visit : String -> List ( String, V ) -> V -> Step V
-visit kind fields value =
-    case kind of
-        "Field" ->
-            case value of
-                Obj _ object_ ->
-                    case field (Values.jsString (field "name" fields)) object_ of
-                        Undefined ->
+                        _ ->
                             Done Null
 
-                        x ->
-                            Done x
+                "Subexpression" ->
+                    case evaluate (child 0 fields) value of
+                        Done left ->
+                            evaluate (child 1 fields) left
 
-                _ ->
-                    Done Null
+                        Failed category ->
+                            Failed category
 
-        "Subexpression" ->
-            evaluate (child 0 fields) value |> andThen (evaluate (child 1 fields))
+                        suspended ->
+                            suspended |> andThen (evaluate (child 1 fields))
 
-        "IndexExpression" ->
-            evaluate (child 0 fields) value |> andThen (evaluate (child 1 fields))
+                "IndexExpression" ->
+                    case evaluate (child 0 fields) value of
+                        Done left ->
+                            evaluate (child 1 fields) left
 
-        "Pipe" ->
-            evaluate (child 0 fields) value |> andThen (evaluate (child 1 fields))
+                        Failed category ->
+                            Failed category
 
-        "Index" ->
-            case value of
-                Arr _ items ->
-                    Done (index (jsNumber (field "value" fields)) items)
+                        suspended ->
+                            suspended |> andThen (evaluate (child 1 fields))
 
-                _ ->
-                    Done Null
+                "Pipe" ->
+                    case evaluate (child 0 fields) value of
+                        Done left ->
+                            evaluate (child 1 fields) left
 
-        "Slice" ->
-            case value of
-                Arr _ items ->
-                    slice (children fields) items
+                        Failed category ->
+                            Failed category
 
-                _ ->
-                    Done Null
+                        suspended ->
+                            suspended |> andThen (evaluate (child 1 fields))
 
-        "Projection" ->
-            evaluate (child 0 fields) value
-                |> andThen
-                    (\base ->
-                        case base of
-                            Arr _ items ->
-                                project (child 1 fields) items
+                "Index" ->
+                    case value of
+                        Arr _ items ->
+                            Done (index (jsNumber (field "value" fields)) items)
 
-                            _ ->
-                                Done Null
-                    )
+                        _ ->
+                            Done Null
 
-        "ValueProjection" ->
-            evaluate (child 0 fields) value
-                |> andThen
-                    (\base ->
-                        case base of
-                            Obj _ object_ ->
-                                project (child 1 fields) (List.map Tuple.second object_)
+                "Slice" ->
+                    case value of
+                        Arr _ items ->
+                            slice (children fields) items
 
-                            _ ->
-                                Done Null
-                    )
+                        _ ->
+                            Done Null
 
-        "FilterProjection" ->
-            evaluate (child 0 fields) value
-                |> andThen
-                    (\base ->
-                        case base of
-                            Arr _ items ->
-                                -- Every condition first, then the projection: the first error is jmespath's.
-                                traverse (evaluate (child 2 fields)) items
-                                    |> andThen
-                                        (\conditions ->
-                                            List.map2 Tuple.pair items conditions
-                                                |> List.filter (Tuple.second >> isFalse >> not)
-                                                |> List.map Tuple.first
-                                                |> project (child 1 fields)
-                                        )
+                "Projection" ->
+                    case evaluate (child 0 fields) value of
+                        Done (Arr _ items) ->
+                            projectHelp (child 1 fields) items []
 
-                            _ ->
-                                Done Null
-                    )
+                        Done _ ->
+                            Done Null
 
-        "Comparator" ->
-            evaluate (child 0 fields) value
-                |> andThen
-                    (\first ->
-                        evaluate (child 1 fields) value
-                            |> andThen (\second -> comparator (field "name" fields) first second)
-                    )
+                        Failed category ->
+                            Failed category
 
-        "Flatten" ->
-            evaluate (child 0 fields) value
-                |> map
-                    (\base ->
-                        case base of
-                            Arr _ items ->
-                                array
-                                    (List.concatMap
-                                        (\item ->
-                                            case item of
-                                                Arr _ inner ->
-                                                    inner
+                        suspended ->
+                            suspended
+                                |> andThen
+                                    (\base ->
+                                        case base of
+                                            Arr _ items ->
+                                                projectHelp (child 1 fields) items []
 
-                                                _ ->
-                                                    [ item ]
-                                        )
-                                        items
+                                            _ ->
+                                                Done Null
                                     )
 
-                            _ ->
-                                Null
-                    )
+                "ValueProjection" ->
+                    case evaluate (child 0 fields) value of
+                        Done (Obj _ object_) ->
+                            projectHelp (child 1 fields) (List.map Tuple.second object_) []
 
-        "Identity" ->
-            Done value
+                        Done _ ->
+                            Done Null
 
-        "Current" ->
-            Done value
+                        Failed category ->
+                            Failed category
 
-        "MultiSelectList" ->
-            case value of
-                Null ->
-                    Done Null
+                        suspended ->
+                            suspended
+                                |> andThen
+                                    (\base ->
+                                        case base of
+                                            Obj _ object_ ->
+                                                projectHelp (child 1 fields) (List.map Tuple.second object_) []
 
-                _ ->
-                    traverse (\c -> evaluate c value) (children fields) |> map array
+                                            _ ->
+                                                Done Null
+                                    )
 
-        "MultiSelectHash" ->
-            case value of
-                Null ->
-                    Done Null
+                "FilterProjection" ->
+                    case evaluate (child 0 fields) value of
+                        Done (Arr _ items) ->
+                            -- Every condition first, then the projection: the first error is jmespath's.
+                            case filterPass (child 2 fields) items [] of
+                                Done kept ->
+                                    projectHelp (child 1 fields) kept []
 
-                _ ->
-                    traverse
-                        (\pair ->
-                            let
-                                pairFields =
-                                    fieldList pair
-                            in
-                            evaluate (field "value" pairFields) value |> map (Tuple.pair (jsString (field "name" pairFields)))
-                        )
-                        (children fields)
-                        |> map (List.foldl (\( k, v ) -> put k v) [] >> object)
+                                Failed category ->
+                                    Failed category
 
-        "OrExpression" ->
-            evaluate (child 0 fields) value
-                |> andThen
-                    (\matched ->
-                        if isFalse matched then
-                            evaluate (child 1 fields) value
+                                suspended ->
+                                    suspended |> andThen (\kept -> projectHelp (child 1 fields) kept [])
 
-                        else
-                            Done matched
-                    )
+                        Done _ ->
+                            Done Null
 
-        "AndExpression" ->
-            evaluate (child 0 fields) value
-                |> andThen
-                    (\first ->
-                        if isFalse first then
-                            Done first
+                        Failed category ->
+                            Failed category
 
-                        else
-                            evaluate (child 1 fields) value
-                    )
+                        suspended ->
+                            suspended |> andThen (filterBase (child 2 fields) (child 1 fields))
 
-        "NotExpression" ->
-            evaluate (child 0 fields) value |> map (isFalse >> Flag)
+                "Comparator" ->
+                    case evaluate (child 0 fields) value of
+                        Done first ->
+                            case evaluate (child 1 fields) value of
+                                Done second ->
+                                    comparator (field "name" fields) first second
 
-        "Literal" ->
-            Done (field "value" fields)
+                                Failed category ->
+                                    Failed category
 
-        "Function" ->
-            traverse (\c -> evaluate c value) (children fields) |> andThen (callFunction (field "name" fields))
+                                suspended ->
+                                    suspended |> andThen (\second -> comparator (field "name" fields) first second)
 
-        "ExpressionReference" ->
-            -- jmespath tags the referenced node in place and returns the node itself: the same
-            -- node, so the same identity, each time.
-            case child 0 fields of
-                Obj token refFields ->
-                    Done (Obj token (put "jmespathType" (Str "Expref") refFields))
+                        Failed category ->
+                            Failed category
+
+                        suspended ->
+                            suspended
+                                |> andThen
+                                    (\first ->
+                                        evaluate (child 1 fields) value
+                                            |> andThen (\second -> comparator (field "name" fields) first second)
+                                    )
+
+                "Flatten" ->
+                    case evaluate (child 0 fields) value of
+                        Done base ->
+                            Done (flattenValue base)
+
+                        Failed category ->
+                            Failed category
+
+                        suspended ->
+                            suspended |> map flattenValue
+
+                "Identity" ->
+                    Done value
+
+                "Current" ->
+                    Done value
+
+                "MultiSelectList" ->
+                    case value of
+                        Null ->
+                            Done Null
+
+                        _ ->
+                            case evalChildren (children fields) value [] of
+                                Done items ->
+                                    Done (array items)
+
+                                Failed category ->
+                                    Failed category
+
+                                suspended ->
+                                    suspended |> map array
+
+                "MultiSelectHash" ->
+                    case value of
+                        Null ->
+                            Done Null
+
+                        _ ->
+                            case evalHashPairs (children fields) value [] of
+                                Done pairs ->
+                                    Done (buildHash pairs)
+
+                                Failed category ->
+                                    Failed category
+
+                                suspended ->
+                                    suspended |> map buildHash
+
+                "OrExpression" ->
+                    case evaluate (child 0 fields) value of
+                        Done matched ->
+                            if isFalse matched then
+                                evaluate (child 1 fields) value
+
+                            else
+                                Done matched
+
+                        Failed category ->
+                            Failed category
+
+                        suspended ->
+                            suspended
+                                |> andThen
+                                    (\matched ->
+                                        if isFalse matched then
+                                            evaluate (child 1 fields) value
+
+                                        else
+                                            Done matched
+                                    )
+
+                "AndExpression" ->
+                    case evaluate (child 0 fields) value of
+                        Done first ->
+                            if isFalse first then
+                                Done first
+
+                            else
+                                evaluate (child 1 fields) value
+
+                        Failed category ->
+                            Failed category
+
+                        suspended ->
+                            suspended
+                                |> andThen
+                                    (\first ->
+                                        if isFalse first then
+                                            Done first
+
+                                        else
+                                            evaluate (child 1 fields) value
+                                    )
+
+                "NotExpression" ->
+                    case evaluate (child 0 fields) value of
+                        Done result ->
+                            Done (Flag (isFalse result))
+
+                        Failed category ->
+                            Failed category
+
+                        suspended ->
+                            suspended |> map (isFalse >> Flag)
+
+                "Literal" ->
+                    Done (field "value" fields)
+
+                "Function" ->
+                    case evalChildren (children fields) value [] of
+                        Done args ->
+                            callFunction (field "name" fields) args
+
+                        Failed category ->
+                            Failed category
+
+                        suspended ->
+                            suspended |> andThen (callFunction (field "name" fields))
+
+                "ExpressionReference" ->
+                    -- jmespath tags the referenced node in place and returns the node itself: the same
+                    -- node, so the same identity, each time.
+                    case child 0 fields of
+                        Obj token refFields ->
+                            Done (Obj token (put "jmespathType" (Str "Expref") refFields))
+
+                        _ ->
+                            Failed "syntax"
 
                 _ ->
                     Failed "syntax"
 
+        -- `node.type` of a missing node is a TypeError in jmespath.
         _ ->
             Failed "syntax"
 
@@ -345,25 +594,6 @@ index i items =
 
     else
         Null
-
-
-{-| Projections keep every result except null; undefined (an empty max\_by) is kept.
--}
-project : V -> List V -> Step V
-project right items =
-    traverse (evaluate right) items
-        |> map
-            (List.filter
-                (\x ->
-                    case x of
-                        Null ->
-                            False
-
-                        _ ->
-                            True
-                )
-                >> array
-            )
 
 
 comparator : V -> V -> V -> Step V
@@ -788,7 +1018,15 @@ call name args =
                 )
 
         "map" ->
-            traverse (evaluate a) (items b) |> map array
+            case evalMap a (items b) [] of
+                Done mapped ->
+                    Done (array mapped)
+
+                Failed category ->
+                    Failed category
+
+                suspended ->
+                    suspended |> map array
 
         "max" ->
             extreme True (items a)
@@ -1126,32 +1364,44 @@ jsMin a b =
 
 {-| `createKeyFunction` over the elements in order: each key evaluated and type-checked.
 -}
-keys : V -> List V -> Step (List ( V, V ))
-keys exprefNode elements =
-    traverse
-        (\element ->
-            evaluate exprefNode element
-                |> andThen
-                    (\key ->
-                        case key of
-                            Num _ ->
-                                Done ( key, element )
+evalKeys : V -> List V -> List ( V, V ) -> Step (List ( V, V ))
+evalKeys exprefNode elements acc =
+    case elements of
+        [] ->
+            Done (List.reverse acc)
 
-                            Str _ ->
-                                Done ( key, element )
+        element :: rest ->
+            case evaluate exprefNode element of
+                Done ((Num _) as key) ->
+                    evalKeys exprefNode rest (( key, element ) :: acc)
 
-                            _ ->
-                                Failed "invalid-type"
-                    )
-        )
-        elements
+                Done ((Str _) as key) ->
+                    evalKeys exprefNode rest (( key, element ) :: acc)
+
+                Done _ ->
+                    Failed "invalid-type"
+
+                Failed category ->
+                    Failed category
+
+                suspended ->
+                    suspended
+                        |> andThen
+                            (\key ->
+                                case key of
+                                    Num _ ->
+                                        evalKeys exprefNode rest (( key, element ) :: acc)
+
+                                    Str _ ->
+                                        evalKeys exprefNode rest (( key, element ) :: acc)
+
+                                    _ ->
+                                        Failed "invalid-type"
+                            )
 
 
-{-| max\_by and min\_by: the first element whose key beats the running one with JS `>` or `<`,
-starting from ∓∞, and undefined when none does.
--}
-extremeBy : Bool -> V -> List V -> Step V
-extremeBy isMax exprefNode elements =
+pickExtreme : Bool -> List ( V, V ) -> V
+pickExtreme isMax keyed =
     let
         better key best =
             relation key best
@@ -1172,19 +1422,103 @@ extremeBy isMax exprefNode elements =
                     1 / 0
                 )
     in
-    keys exprefNode elements
-        |> map
-            (List.foldl
-                (\( key, element ) ( best, record ) ->
-                    if better key best then
-                        ( key, element )
+    List.foldl
+        (\( key, element ) ( best, record ) ->
+            if better key best then
+                ( key, element )
+
+            else
+                ( best, record )
+        )
+        ( initial, Undefined )
+        keyed
+        |> Tuple.second
+
+
+{-| max\_by and min\_by: the first element whose key beats the running one with JS `>` or `<`,
+starting from ∓∞, and undefined when none does.
+-}
+extremeBy : Bool -> V -> List V -> Step V
+extremeBy isMax exprefNode elements =
+    case evalKeys exprefNode elements [] of
+        Done keyed ->
+            Done (pickExtreme isMax keyed)
+
+        Failed category ->
+            Failed category
+
+        suspended ->
+            suspended |> map (pickExtreme isMax)
+
+
+evalSortKeys : Maybe JmesType -> V -> List V -> List ( V, V ) -> Step (List ( V, V ))
+evalSortKeys required exprefNode elements acc =
+    case elements of
+        [] ->
+            Done (List.reverse acc)
+
+        element :: rest ->
+            case evaluate exprefNode element of
+                Done key ->
+                    if typeName key == required then
+                        evalSortKeys required exprefNode rest (( key, element ) :: acc)
 
                     else
-                        ( best, record )
-                )
-                ( initial, Undefined )
-                >> Tuple.second
+                        Failed "invalid-type"
+
+                Failed category ->
+                    Failed category
+
+                suspended ->
+                    suspended
+                        |> andThen
+                            (\key ->
+                                if typeName key == required then
+                                    evalSortKeys required exprefNode rest (( key, element ) :: acc)
+
+                                else
+                                    Failed "invalid-type"
+                            )
+
+
+sortKeyed : List ( V, V ) -> V
+sortKeyed keyed =
+    List.indexedMap (\i ( key, element ) -> ( i, key, element )) keyed
+        |> List.sortWith
+            (\( i, keyA, _ ) ( j, keyB, _ ) ->
+                case relation keyA keyB of
+                    Just GT ->
+                        GT
+
+                    Just LT ->
+                        LT
+
+                    _ ->
+                        compare i j
             )
+        |> List.map (\( _, _, element ) -> element)
+        |> array
+
+
+sortByAfterFirst : V -> V -> List V -> V -> Step V
+sortByAfterFirst exprefNode first rest firstKey =
+    let
+        required =
+            typeName firstKey
+    in
+    if required /= Just TypeNumber && required /= Just TypeString then
+        Failed "invalid-type"
+
+    else
+        case evalSortKeys required exprefNode rest [ ( firstKey, first ) ] of
+            Done keyed ->
+                Done (sortKeyed keyed)
+
+            Failed category ->
+                Failed category
+
+            suspended ->
+                suspended |> map sortKeyed
 
 
 {-| sort\_by: the keys in order, each of the first key's type (number or string), then the engine's
@@ -1192,9 +1526,10 @@ sort (Elm's `List.sortWith` is `Array.prototype.sort`) with jmespath's comparato
 breaking ties. With NaN keys the comparator is inconsistent, and the engine's algorithm decides the
 order, as it does for jmespath.
 
-jmespath checks the keys inside its comparator, in the order the engine compares them; here they are
-checked in element order, which reports the same error unless one key fails to evaluate and another
-has the wrong type (a CONTRACT exclusion).
+jmespath evaluates both `exprA` and `exprB` inside its comparator before type-checking either, in
+the order the engine compares them; here keys are evaluated and type-checked in element order,
+which reports the same error unless a key-evaluation error races with a wrong-type key (a CONTRACT
+exclusion).
 
 -}
 sortBy : V -> List V -> Step V
@@ -1203,46 +1538,13 @@ sortBy exprefNode elements =
         [] ->
             Done (array [])
 
-        first :: _ ->
-            evaluate exprefNode first
-                |> andThen
-                    (\firstKey ->
-                        let
-                            required =
-                                typeName firstKey
-                        in
-                        if required /= Just TypeNumber && required /= Just TypeString then
-                            Failed "invalid-type"
+        first :: rest ->
+            case evaluate exprefNode first of
+                Done firstKey ->
+                    sortByAfterFirst exprefNode first rest firstKey
 
-                        else
-                            traverse
-                                (\element ->
-                                    evaluate exprefNode element
-                                        |> andThen
-                                            (\key ->
-                                                if typeName key == required then
-                                                    Done ( key, element )
+                Failed category ->
+                    Failed category
 
-                                                else
-                                                    Failed "invalid-type"
-                                            )
-                                )
-                                elements
-                                |> map
-                                    (List.indexedMap (\i ( key, element ) -> ( i, key, element ))
-                                        >> List.sortWith
-                                            (\( i, keyA, _ ) ( j, keyB, _ ) ->
-                                                case relation keyA keyB of
-                                                    Just GT ->
-                                                        GT
-
-                                                    Just LT ->
-                                                        LT
-
-                                                    _ ->
-                                                        compare i j
-                                            )
-                                        >> List.map (\( _, _, element ) -> element)
-                                        >> array
-                                    )
-                    )
+                suspended ->
+                    suspended |> andThen (sortByAfterFirst exprefNode first rest)

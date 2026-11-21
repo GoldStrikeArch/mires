@@ -6,7 +6,7 @@ This port is written by hand. It replaces the earlier Elm port, whose identity m
 | --- | --- |
 | `src/Values.elm` | `V`, the JS values jmespath sees, with identity tokens; JS semantics on them; the boundary encoding |
 | `src/Parser.elm` | the Lexer and the Pratt parser (`bindingPower`, `nud`, `led`, the `parse*` helpers) |
-| `src/Eval.elm` | `Step`, `traverse`, the interpreter (`visit`) and the Runtime (types, signatures, the 26 functions) |
+| `src/Eval.elm` | `Step`, tail-recursive element loops, the interpreter (`evaluate`) and the Runtime (types, signatures, the 26 functions) |
 | `src/Main.elm` | the queries in order, and the port protocol with the host |
 | `js/index.js` | the host: the boundary encoding, `localeCompare` and `===`, no jmespath logic |
 
@@ -30,7 +30,7 @@ Stack exhaustion is not a category: it propagates out of `run`, as it does out o
 ## Evaluation
 
 - **`Step`** is `Done`, `Failed`, `Collate` (ask the host for `a.localeCompare(b)`, for max and min of strings) or `Identical` (ask whether a token is `===` to any of some others, for contains). The host answers through ports, and the continuation resumes.
-- **`traverse` loops (a tail call) while each step is done.** A projection, filter, `map` or `sort_by` over 100,000 records costs no stack (J6). The parser's operator loop and the lexer are tail calls too.
+- **Element loops (`evalChildren`, `evalHashPairs`, `evalMap`, `filterPass`, `projectHelp`, `evalKeys`, `evalSortKeys`) are tail-recursive while each step is done.** A projection, filter, `map` or `sort_by` over 100,000 records costs no stack (J6). The parser's operator loop and the lexer are tail calls too.
 - **Faithful details.**
   - Filter projections run every condition, then the projection.
   - `max`/`min` of numbers fold JS `Math.max`/`Math.min`; NaN wins, and of +0 and -0 `max` prefers +0 and `min` -0.
@@ -42,7 +42,7 @@ Stack exhaustion is not a category: it propagates out of `run`, as it does out o
 
 ## Deviations from the npm source
 
-- **`sort_by` checks keys in element order.** jmespath checks keys inside its comparator, in the order the engine compares them, and Elm cannot raise from inside the comparator. The reported error differs only when one key raises invalid-value (a zero-step slice of an array) and another has the wrong type. CONTRACT.md excludes that case.
+- **`sort_by` checks keys in element order.** jmespath evaluates both `exprA` and `exprB` inside its comparator before type-checking either (`jmespath.js:1565-1575`), in the order the engine compares them, and Elm cannot raise from inside the comparator. The reported error can therefore differ whenever any key-evaluation error (such as `invalid-value`, `invalid-arity`, `unknown-function`, or a nested `invalid-type`) races with a wrong-type key. CONTRACT.md excludes that case.
 - **`&expr` values are snapshots.** jmespath tags the referenced node in place. An expression reference taken as a value and evaluated again later (through `@`) tags its descendants, which jmespath then shows in output serialised afterwards. Here the earlier value is unchanged. CONTRACT.md excludes this case.
 - **jmespath's engine TypeErrors are `Failed "syntax"` at the same points.** These are visiting a missing node, `left.name` of a missing node, and tagging one. A lone `=` fails in the lexer, where jmespath pushes `undefined` and fails later; the category is the same. Error messages are not produced.
 - **Elm quirks the code works around.**
@@ -53,3 +53,4 @@ Stack exhaustion is not a category: it propagates out of `run`, as it does out o
 
 - **The boundary is flat postfix lists both ways.** This is for depth (README "Per-language notes"): nested `Json.Decode` and `Json.Encode` recursion would cost the contract's nesting bound.
 - **Slices index an `Array` made once per slice.** A `List` index is linear.
+- **`evaluate` pattern-matches `Done` directly on the fast path instead of chaining `andThen` closures, and uses direct tail-recursive element helpers (`filterPass`, `projectHelp`, `evalChildren`, `evalHashPairs`, `evalMap`, `evalKeys`, `evalSortKeys`).** Chaining `andThen` closures through `visit`/`project`/`traverse` cost ~16 JS stack frames per `FilterProjection` level and overflowed V8's cold-start stack at depth 460 (below the 500-level contract bound); direct fast-path matching reduces right-nested projections and filters to 4 JS frames per level and turns right-nested `Subexpression`/`IndexExpression`/`Pipe`/`OrExpression`/`AndExpression` into tail calls.

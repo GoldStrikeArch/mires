@@ -27,7 +27,7 @@ Only jmespath's own errors become categories: the `*Error` values, among them `J
   - the `__proto__` setter on assignment (`Reflect.set` runs the same `[[Set]]`).
 
   AST nodes are JS objects in jmespath's property order, because `compile` returns them, `&expr` passes them around as values, and the interpreter tags them in place. GopherJS reads JS null as a nil `*js.Object` and undefined as `js.Undefined`. Comparing two `*js.Object`s compares the JS values with `===`.
-- **Text never becomes a Go string.** GopherJS's conversion of a JS string to a Go string mishandles lone surrogates (README "Per-language notes"). So the lexer reads the expression's code units with `charCodeAt`, cuts tokens with the host's `slice`, and keeps every name and string a JS string. Only node types, comparator and function names (ASCII) are read as Go strings.
+- **Text stays in JS strings.** GopherJS's conversion of a JS string to a Go string mishandles lone surrogates (README "Per-language notes"). So the lexer reads the expression's code units with `charCodeAt`, cuts tokens with the host's `slice`, and keeps every name and string value as a JS string `*js.Object`. Only ASCII identifiers—node types, comparator and function names, and the `"true"`/`"false"`/`"null"` check in `looksLikeJSON` (`lexer.go:290`, which still passes the original `*js.Object` to `JSON.parse`)—are read as Go strings.
 - **Host functions.**
   - `JSON.parse` (its SyntaxError recovered into a syntax error) and `JSON.stringify`;
   - `parseInt`;
@@ -38,7 +38,7 @@ Only jmespath's own errors become categories: the `*Error` values, among them `J
   - `localeCompare`, `indexOf`, `lastIndexOf`, `split`/`reverse`/`join`;
   - `Array.prototype.sort`.
 
-  Go's `math.Max`/`Min`/`Abs`/`Ceil`/`Floor` agree with `Math.*` on NaN and on signed zeros.
+  Go's `math.Abs`/`Ceil`/`Floor` agree with `Math.*` on NaN and on signed zeros; `max` and `min` (`extreme` in `functions.go`) check `math.IsNaN` explicitly before `math.Max`/`Min` because Go's `math.Max(+Inf, NaN)` returns `+Inf` and `math.Min(-Inf, NaN)` returns `-Inf`, whereas JS `Math.max`/`Math.min` return `NaN` whenever any operand is `NaN` (Go's `math.Max`/`Min` agree with JS on signed zeros).
 - **JS relational operators.** Go has no JS `<`, so `order` is the abstract relational comparison for these values. Arrays and objects become their `String()`, two strings compare by code unit (`charCodeAt`), anything else compares as numbers (`Number()`), and NaN compares as nothing. `Object.prototype.toString` gives the type tags, as in jmespath's `_getTypeName`.
 - **`sort_by` sorts the indices with the engine's `Array.prototype.sort`,** with jmespath's comparator and its NaN behaviour. jmespath's first error aborts its sort. Here the comparator keeps that error, answers 0 to the calls the engine makes after it, and `sortBy` returns the error and discards the order.
 

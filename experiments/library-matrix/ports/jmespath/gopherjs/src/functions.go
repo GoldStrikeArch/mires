@@ -231,8 +231,9 @@ func merge(args []*js.Object) *js.Object {
 	return merged
 }
 
-// extreme is max or min: Math.max.apply or Math.min.apply over numbers (Go's math.Max and math.Min
-// agree with them on NaN and on -0), and localeCompare over strings.
+// extreme is max or min: Math.max.apply or Math.min.apply over numbers (NaN checked explicitly
+// because Go's math.Max(+Inf, NaN) returns +Inf and math.Min(-Inf, NaN) returns -Inf; math.Max and
+// math.Min agree with JS on signed zeros), and localeCompare over strings.
 func extreme(items []*js.Object, max bool) *js.Object {
 	if len(items) == 0 {
 		return nil
@@ -243,10 +244,14 @@ func extreme(items []*js.Object, max bool) *js.Object {
 			result = math.Inf(-1)
 		}
 		for _, x := range items {
+			v := x.Float()
+			if math.IsNaN(v) {
+				return jsNumber(math.NaN())
+			}
 			if max {
-				result = math.Max(result, x.Float())
+				result = math.Max(result, v)
 			} else {
-				result = math.Min(result, x.Float())
+				result = math.Min(result, v)
 			}
 		}
 		return jsNumber(result)

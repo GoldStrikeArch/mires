@@ -36,9 +36,11 @@ review('filter-two-pass', 'J1: every filter condition before any projection, so 
   [1, '1', {a: 1}], searches(['[?abs(@) == `1`].nope(@)', '[?@ == `1`].abs(@)', '[?nope(@)]', '[?abs(@)].nope(@)',
     '[*].nope(@)', 'sort_by(@, &abs(@))', 'map(&nope(@), @)', 'map(&abs(@), `[]`)', '*.abs(@)', '[].abs(@)']))
 review('filter-two-pass-mixed', 'J1, the review\'s input', [1, '1'], searches(['[?abs(@) == `1`].nope(@)']))
-review('math-max-min', 'J2: Math.max/Math.min with signed zeros and NaN; J7: Math.abs(-0)', {},
+review('math-max-min', 'J2, B1: Math.max/Math.min with signed zeros, ±Infinity and NaN; J7: Math.abs(-0)', {},
   searches(['max(`[-0, 0]`)', 'min(`[0, -0]`)', 'max(`[0, -0]`)', 'min(`[-0, 0]`)', 'max(`[-0]`)', 'min(`[-0]`)',
     'max([`1`, avg(`[]`)])', 'min([`1`, avg(`[]`)])', 'max([avg(`[]`), `1`])', 'min([`1`, avg(`[]`), `0`])', 'max([avg(`[]`)])',
+    'max([`1e400`, avg(`[]`)])', 'max([avg(`[]`), `1e400`])', 'min([`-1e400`, avg(`[]`)])', 'min([avg(`[]`), `-1e400`])',
+    'max([`-1e400`, avg(`[]`)])', 'min([`1e400`, avg(`[]`)])',
     'max(`[1, 2]`)', 'abs(`-0`)', 'abs(`-1e400`)', 'ceil(`-0.5`)', 'floor(`-0.5`)', 'sum(`[-0]`)', 'sum(`[-0, -0]`)', 'avg(`[-0]`)',
     'max(`["a", "B", "b", "A", "é", "e"]`)', 'min(`["a", "B", "b", "A", "é", "e"]`)']))
 review('undefined-results', 'J3: type() and other functions of an empty max_by/min_by (undefined)', {},
@@ -109,7 +111,9 @@ const nest = (n, piece) => Array(n).fill(piece).join('')
 review('nesting-500', 'Every construct nested 500 levels: the bound in CONTRACT.md', {o: nestedObject, x: nestedArray, y: nestedArrayCopy},
   [...both(['o' + nest(499, '.a'), nest(500, '(') + 'a' + nest(500, ')'), nest(500, '!') + 'a', Array(500).fill('a').join(' || '),
     Array(500).fill('a').join(' && '), Array(500).fill('@').join(' | '), nest(500, '[') + 'a' + nest(500, ']'), nest(500, '{a:') + 'a' + nest(500, '}'),
-    'x' + nest(500, '[0]'), 'x' + nest(500, '[]'), 'x' + nest(500, '[*]'), '`' + nest(500, '[') + nest(500, ']') + '`',
+    'x' + nest(500, '[0]'), 'x' + nest(500, '[]'), 'x' + nest(500, '[*]'), 'x' + nest(500, '[?@]'), 'o' + nest(500, '.*'), 'x' + nest(500, '[::]'),
+    nest(500, '&') + '@', nest(250, 'map(&') + '@' + nest(250, ', `[1]`)'), nest(250, 'max_by(`[1]`, &') + '@' + nest(250, ')'),
+    nest(250, 'sort_by(`[1]`, &') + '@' + nest(250, ')'), '`' + nest(500, '[') + nest(500, ']') + '`',
     nest(500, 'abs(') + '`1`' + nest(500, ')'), Array(500).fill('a').join(' == ')]),
   ...searches(['length(x)', 'x == y', 'o == o.a', 'to_string(x)', 'x', '[x]', 'x[]', '!o', 'x < `1`', 'keys(o)'])])
 // Wide input: 20,000 records through projections, filters, sorts, slices and functions.

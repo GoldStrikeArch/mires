@@ -280,14 +280,14 @@ func looksLikeJSON(literalString *js.Object) bool {
 		return false
 	}
 	first := uint16(literalString.Call("charCodeAt", 0).Int())
-	switch text := literalString.String(); {
+	switch {
 	case first == '[' || first == '{' || first == '"':
-		return true
-	case text == "true" || text == "false" || text == "null":
 		return true
 	case isNum(first):
 		_, err := parseJSON(literalString)
 		return err == nil
+	default:
+		text := literalString.String()
+		return text == "true" || text == "false" || text == "null"
 	}
-	return false
 }
