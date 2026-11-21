@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "mires_bug_nan_payload_const",
+  "boundary": "the floor boundary, reading the bits of NaN-payload f32 and f64 values before returning the text"
+}

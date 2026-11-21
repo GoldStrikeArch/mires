@@ -45,19 +45,20 @@ let request_case case =
             match text reply "kind" with
             | "network" -> Host.reject (Host.type_error "Failed to fetch")
             | "stall" -> Host.promise (fun _ reject -> Host.on_abort signal (fun () -> reject (Host.reason signal)))
-            | _ ->
-                Host.bind
-                  (Host.response (Host.get reply "body") ~status:(Host.get reply "status")
-                     ~headers:(Host.get reply "headers"))
-                  (function Ok response -> Host.resolve response | Error error -> Host.reject error)))
+            | _ -> (
+                match
+                  Host.response (Host.get reply "body") ~status:(Host.get reply "status")
+                    ~headers:(Host.get reply "headers")
+                with
+                | Ok response -> Host.resolve response
+                | Error error -> Host.reject error)))
   in
   let delay attempt =
     let milliseconds = 300. *. Host.math_pow 2. (float_of_int (attempt - 1)) in
     record [ Host.of_string "backoff"; Host.of_int attempt; Host.of_float milliseconds ];
     milliseconds
   in
-  (* A valid name and value: setting the header cannot fail, and it is set before set_header
-     answers, so the hook's answer can be dropped. *)
+  (* A valid name and value: setting the header cannot fail, so its result can be dropped. *)
   let mark request label =
     ignore (Host.set_header (Host.request_headers request) "x-matrix" (Host.of_string label))
   in

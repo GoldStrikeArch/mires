@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "mires_bug_str_ascii_case",
+  "boundary": "the floor boundary, comparing str::to_ascii_lowercase and String::make_ascii_uppercase with a byte-by-byte conversion before returning the text"
+}

@@ -42,8 +42,7 @@ matches `../jsoo/src/` identically.
 - **Text codecs.** `Host.Text.t` is `string` (native JS UTF-16). UTF-8 uses module-level stateless
   `TextEncoder` / `TextDecoder` instances (matching `fflate`'s `te`/`td` and WHATWG BOM + maximal-
   subpart `U+FFFD` replacement semantics); Latin-1 uses `charCodeAt` and chunked
-  `String.fromCharCode.apply(null, ...)` (16,384-byte chunks). The port does not work around the
-  Firefox Marionette CCW timing artifact noted in `CONTRACT.md`.
+  `String.fromCharCode.apply(null, ...)` (16,384-byte chunks).
 - **Zero cross-call mutable state.** Only immutable precomputed lookup tables matching `fflate` and
   the stateless `TextEncoder`/`TextDecoder` instances exist at module scope (`0` embedded JS, `0`
   eval refs, `0` host JS, `0` module-state lint findings).

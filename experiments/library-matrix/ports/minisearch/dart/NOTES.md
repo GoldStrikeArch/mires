@@ -51,11 +51,8 @@ parity, doubles included, on all 58 corpus cases in Node, Chrome and Firefox, fo
   maps and lists). The boundary turns it into JS with `JSON.parse(JSON.stringify(...))`'s number
   rules: NaN and the infinities become null, and `-0` becomes 0.
 - **Type tests at the boundary** use `isA<JSString>()` / `isA<JSNumber>()` / `isA<JSBoolean>()`
-  (`typeof`) and `isUndefined` / `isNull`. None of them depends on the realm the input object
-  comes from. That is also why the port does not use `dartify()`: in dart2js it converts only
-  objects whose prototype is the current realm's `Object.prototype` (`isJavaScriptSimpleObject` in
-  `js_util_patch.dart`). The harness can hand Firefox an input from another realm (README,
-  `rewritable`). The `boost` object's keys come from `Object.keys`, bound with
+  (`typeof`) and `isUndefined` / `isNull`, on the input read in place; the port does not convert
+  it with `dartify()`. The `boost` object's keys come from `Object.keys`, bound with
   `@JS('Object.keys') external`.
 - **dart2js cannot emit ES module exports**: `main()` sets `globalThis.__matrixExports.run`
   (`globalContext`), which the builder's facade reads once and deletes.
@@ -103,7 +100,7 @@ parity, doubles included, on all 58 corpus cases in Node, Chrome and Firefox, fo
   `performVacuuming` could be an `async` function with `await`s. The port does not do that, for
   two reasons. The continuation would run on timers after `run` returned, on an index nothing
   observes. And it would schedule dart2js's timer and microtask machinery in the checker's and the
-  bench's realm. The contract leaves those asynchronous parts out.
+  bench's environment. The contract leaves those asynchronous parts out.
 - **Sorting.** `List.sort` is not stable in Dart (dart2js uses insertion sort up to 32 elements,
   dual-pivot quicksort above). `_sortedByScore` sorts positions with the comparator
   `sign(scores[b] - scores[a])`, then position. Equal scores, `-0` and `0` included, keep their
@@ -164,8 +161,6 @@ with.
 4. **`isUndefined` works after a `== null` test.** dart2js does not fold it, which was checked with
    a probe (`{a: null}`: `a` null, `b` undefined, both orders). The boundary still tests
    `isUndefined` first.
-5. **`dartify()` depends on the realm** (see "Type tests at the boundary"). It was avoided, not met
-   as a failure.
 
 ## Where the language forced a less idiomatic choice
 

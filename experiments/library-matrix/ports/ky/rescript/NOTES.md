@@ -18,7 +18,7 @@ The input records are the corpus JS objects themselves, read in place. The optio
 - **Async functions.** Ky's async methods are ReScript `async` functions, and `#retry` and `#retryFromError` call each other as they do in Ky.
 - **Errors.** Ky's own errors are ReScript exceptions (`HTTPError`, `NetworkError`, `TimeoutError`). Everything else stays the JS value that was thrown, as `JsExn`: a host constructor's TypeError or RangeError, `JSON.parse`'s SyntaxError, an abort reason. Ky's option checks throw real JS errors (`JsError.TypeError.throwWithMessage` and its siblings), as Ky does. `errorName` reads the JS `name`.
 - **JS semantics are native here.** Strings are JS strings; `String.toLowerCase`, `toUpperCase` and `trim` are JS's. Ky's regular expressions (the delay digits, the three HTTP-date forms, the charset parameter) are the same regex literals. `createTimestamp` uses `Date.UTC`, `setUTCFullYear` and the UTC getters, as Ky does.
-- **Ky's `isError`** accepts an Error of another realm by its `[object Error]` brand, as Ky does (`Error.prototype.isPrototypeOf`, then `Object.prototype.toString`). Under Firefox's WebDriver, the Fetch constructors throw errors of another realm.
+- **Ky's `isError`** is `Error.prototype.isPrototypeOf` (for `instanceof Error`), then the `[object Error]` brand through `Object.prototype.toString`, as in Ky.
 - **Host functions.** `JSON.parse` and `JSON.stringify` (the Stdlib's), `Number()`, `Number.isInteger`, `Reflect.has` (Ky's `in` test for `__sentry_captured__`), `Object.prototype.toString`, `Date.now`, `Math.min`, `Math.max` and `Math.pow`.
 
 ## Deviations from the npm source

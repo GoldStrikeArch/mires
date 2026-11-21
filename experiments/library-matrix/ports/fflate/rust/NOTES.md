@@ -38,9 +38,11 @@ limit (MIRES-021)").
 - **Zero cross-call mutable state.** Only compile-time immutable `static` arrays live at module
   scope (`0` module-state lint findings). `rev15` (4 bitwise ops) and `revfd` (`leading_zeros`)
   are computed in O(1) to avoid emitting 32 KiB static table literals into JS.
-- **No `core::slice::sort` and no `core::fmt`.** `h_tree` sorts at most 288 symbols using a
-  20-line in-place stable insertion sort (avoiding ~18 KB per `core::slice::sort` instantiation
-  under mires), and errors carry static `&'static str` messages / numeric codes.
+- **No `core::slice::sort` and no `core::fmt`.** `h_tree` sorts at most 288 symbols with two
+  in-place stable insertion sorts (`sort_by_freq_asc`, `sort_for_clamp`), and errors carry static
+  `&'static str` messages / numeric codes. `sort_by` in place of the insertion sorts gives the same
+  89/89 results but adds 16.9 KB to `index.min.js` for the first and 11.3 KB for the second
+  (15.6 KB and 12.7 KB of core's driftsort by the optimizer report; measured on 2026-11-21).
 - **Zero-copy UTF-8 input & bulk byte output.** UTF-8 `{ text }` payloads borrow
   `text.read::<&str>().as_bytes()` directly without copying; outputs return in one bulk host copy
   via `mires_js::JsUint8Array::from_slice`.
@@ -85,11 +87,6 @@ limit (MIRES-021)").
   uses zeroed OS-backed `Uint8Array`/`Uint16Array`/`Int32Array`. Together with JS boxed `Array`
   storage and bounds checks on `while`-loop slice indexing, this accounts for the ~2.2–3.5× gap
   against JS in Node.
-- **Firefox Marionette CCW timing note:** Under the current `browser.mjs` WebDriver harness,
-  Firefox's `executeAsyncScript` wraps `{ text }` inputs in cross-compartment wrappers (CCWs),
-  making `TextEncoder.encode()` in the JS reference `bench-compress` path take ~14 ms under
-  WebDriver (producing an artificially low `port/js` ratio on Firefox `bench-compress`). This port
-  does not work around that harness artifact; see `libraries/fflate/CONTRACT.md`.
 
 ## Size
 

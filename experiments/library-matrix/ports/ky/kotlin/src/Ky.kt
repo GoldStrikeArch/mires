@@ -23,13 +23,9 @@ class NetworkError(val request: Request, override val cause: Throwable) :
 class TimeoutError(val request: Request) :
     KyError("TimeoutError", "Request timed out: ${request.method} ${request.url}")
 
-/** The JS value a Throwable stands for: the value itself, or what a [HostError] holds. */
-internal val Throwable.jsValue: dynamic
-    get() = if (this is HostError) value else this
-
 /** `error.name`, as the hooks and the caller read it. */
 val Throwable.name: String
-    get() = if (this is KyError) errorName else jsValue.name as? String ?: "Error"
+    get() = if (this is KyError) errorName else asDynamic().name as? String ?: "Error"
 
 class Hooks(
     val init: List<() -> Unit>,
@@ -162,9 +158,9 @@ private fun lowercaseHeaders(headers: Any): Map<String, Any?> {
 }
 
 /** mergeHeaders: each header set on a fresh Headers, which validates it. */
-private suspend fun mergeHeaders(headers: Map<String, Any?>): Headers {
+private fun mergeHeaders(headers: Map<String, Any?>): Headers {
     val result = Headers()
-    for ((name, value) in headers) hostCall { result.set(name, value) }
+    for ((name, value) in headers) result.set(name, value)
     return result
 }
 
@@ -179,14 +175,11 @@ private val networkErrorMessages = setOf(
     "Network connection lost",
 )
 
-/** Ky's `isError`: an Error, or an Error of another realm by its internal brand. */
-private fun isError(value: dynamic): Boolean =
-    value is Throwable || ObjectPrototype.prototype.toString.call(value) == "[object Error]"
-
-/** utils/is-network-error.js, inlined by Ky from is-network-error 1.3.2. */
+/** utils/is-network-error.js, inlined by Ky from is-network-error 1.3.2. Its `isError` test holds
+ *  for every value Kotlin/JS catches, since a Throwable is `instanceof Error`. */
 private fun isRawNetworkError(error: Throwable): Boolean {
-    val value = error.jsValue
-    if (error is KyError || !isError(value) || error.name != "TypeError") return false
+    if (error is KyError || error.name != "TypeError") return false
+    val value = error.asDynamic()
     val message = value.message as? String ?: return false
     fun wrapped(prefix: String) = message.startsWith(prefix) && message.endsWith(")")
     if (message == "Load failed" || wrapped("Load failed (")) {
@@ -221,12 +214,12 @@ private fun isJsonContentType(contentType: String): Boolean {
 
 private val charsetPattern = Regex(""";\s*charset\s*=\s*(?:"([^"]+)"|([^;,\s]+))""", RegexOption.IGNORE_CASE)
 
-private suspend fun createTextDecoder(contentType: String): TextDecoder {
+private fun createTextDecoder(contentType: String): TextDecoder {
     val groups = charsetPattern.find(contentType)?.groups
     val charset = groups?.get(1)?.value ?: groups?.get(2)?.value
     if (!charset.isNullOrEmpty()) {
         try {
-            return hostCall { TextDecoder(charset) }
+            return TextDecoder(charset)
         } catch (_: Throwable) {
             // An unknown label falls back to UTF-8.
         }
@@ -414,7 +407,7 @@ class Ky private constructor(
         private fun createManagedSignal(user: AbortSignal?, controller: AbortController) =
             if (user != null) AbortSignal.any(arrayOf(user, controller.signal)) else controller.signal
 
-        private suspend fun create(input: String, options: Options): Ky {
+        private fun create(input: String, options: Options): Ky {
             val headers = options.headers?.let(::lowercaseHeaders) ?: emptyMap()
             val requestHeaders = mergeHeaders(headers)
             val method = normalizeRequestMethod(options.method ?: "GET")
@@ -435,7 +428,7 @@ class Ky private constructor(
             val init: Json = json("method" to method, "headers" to requestHeaders, "signal" to signal)
             if (body != null) init["body"] = body
             return Ky(
-                hostCall { Request(input, init) }, abortController, signal, options.signal, retry, timeout,
+                Request(input, init), abortController, signal, options.signal, retry, timeout,
                 throwHttpErrors, options.hooks, options.fetch,
             )
         }

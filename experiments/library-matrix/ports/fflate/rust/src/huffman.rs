@@ -73,8 +73,8 @@ struct SymFreq {
     freq: u16,
 }
 
-/// Small in-place insertion sort over `<= 288` elements, avoiding `core::slice::sort`'s ~18 KB
-/// code-size footprint under mires while preserving exact stability.
+/// Small in-place insertion sort over `<= 288` elements, preserving exact stability. It avoids
+/// `core::slice::sort`, whose instantiation is about 15 KB of JavaScript under mires.
 fn sort_by_freq_asc(slice: &mut [SymFreq]) {
     let n = slice.len();
     let mut i = 1;

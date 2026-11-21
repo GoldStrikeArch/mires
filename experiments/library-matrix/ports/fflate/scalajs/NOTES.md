@@ -41,7 +41,7 @@ readable artifacts).
   and `CONTRACT.md`, UTF-8 `strToU8` and `strFromU8` delegate to module-level stateless
   `TextEncoder` / `TextDecoder` instances through `@js.native @JSGlobal` facades (providing exact
   WHATWG single-BOM stripping and maximal-subpart `U+FFFD` replacement, and preserving parity with
-  `fflate` without working around the Firefox Marionette CCW artifact noted in `CONTRACT.md`).
+  `fflate`).
 - **Scala 3 `inline def` on inner-loop bit I/O.** Marking `shft`, `wbits`, `wbits16`, `bits`, and
   `bits16` as `inline def` expands them directly inside `wblk` and `infltRaw`, eliminating JS
   closure call overhead on the hot path.

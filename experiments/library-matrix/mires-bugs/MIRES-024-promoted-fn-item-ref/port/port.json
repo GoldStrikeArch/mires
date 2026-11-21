@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "mires_bug_fn_item_ref",
+  "boundary": "the floor boundary, returning apply_ref(&twice) (a promoted &fn-item passed to F: Fn)"
+}

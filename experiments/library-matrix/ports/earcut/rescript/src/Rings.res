@@ -140,24 +140,33 @@ let rec live = p =>
   }
 
 /* Each retained block can outlive a removed head or stop. Repair both before
- visiting its live edges, preserving the upstream append order. */
-let scanBlock = (block, visit) => {
+ visiting its live edges, preserving the upstream append order. The walk stops
+ at the first edge `visit` answers with a node, as npm returns from its loop. */
+let findInBlock = (block, visit) => {
   let stop = live(block.stop)
   block.stop = stop
   let head = live(block.head)
   block.head = head
   let rec walk = p => {
-    if p.prev.next === p {
+    let found = if p.prev.next === p {
       visit(p)
+    } else {
+      None
     }
-    if p.next !== stop {
-      walk(p.next)
+    switch found {
+    | Some(_) => found
+    | None if p.next !== stop => walk(p.next)
+    | None => None
     }
   }
   walk(head)
 }
 
-exception Touch(node)
+let scanBlock = (block, visit) =>
+  findInBlock(block, p => {
+    visit(p)
+    None
+  })->ignore
 
 let findBridge = (blocks, hole, outer) =>
   if equals(hole, outer) {
@@ -167,33 +176,50 @@ let findBridge = (blocks, hole, outer) =>
     let hy = hole.y
     let qx = ref(Float.Constants.negativeInfinity)
     let candidate = ref(None)
-    try {
-      for i in 0 to Array.length(blocks) - 1 {
+    // The ray from the hole to the left. A ring vertex it touches is the bridge.
+    let touch = p => {
+      let n = p.next
+      if equals(hole, n) {
+        Some(n)
+      } else if hy <= p.y && (hy >= n.y && n.y != p.y) {
+        let x = p.x +. (hy -. p.y) *. (n.x -. p.x) /. (n.y -. p.y)
+        if x <= hx && x > qx.contents {
+          qx := x
+          let m = if p.x < n.x {
+            p
+          } else {
+            n
+          }
+          candidate := Some(m)
+          if x == hx {
+            Some(m)
+          } else {
+            None
+          }
+        } else {
+          None
+        }
+      } else {
+        None
+      }
+    }
+    let rec ray = i =>
+      if i == Array.length(blocks) {
+        None
+      } else {
         let b = Array.getUnsafe(blocks, i)
-        if !(hy < b.ymin || (hy > b.ymax || (b.xmin > hx || b.xmax <= qx.contents))) {
-          scanBlock(b, p => {
-            let n = p.next
-            if equals(hole, n) {
-              throw(Touch(n))
-            }
-            if hy <= p.y && (hy >= n.y && n.y != p.y) {
-              let x = p.x +. (hy -. p.y) *. (n.x -. p.x) /. (n.y -. p.y)
-              if x <= hx && x > qx.contents {
-                qx := x
-                let m = if p.x < n.x {
-                  p
-                } else {
-                  n
-                }
-                candidate := Some(m)
-                if x == hx {
-                  throw(Touch(m))
-                }
-              }
-            }
-          })
+        if hy < b.ymin || (hy > b.ymax || (b.xmin > hx || b.xmax <= qx.contents)) {
+          ray(i + 1)
+        } else {
+          switch findInBlock(b, touch) {
+          | None => ray(i + 1)
+          | touched => touched
+          }
         }
       }
+    switch ray(0) {
+    | Some(_) as touched => touched
+    | None =>
       switch candidate.contents {
       | None => None
       | Some(initial) =>
@@ -243,8 +269,6 @@ let findBridge = (blocks, hole, outer) =>
         }
         Some(best.contents)
       }
-    } catch {
-    | Touch(n) => Some(n)
     }
   }
 

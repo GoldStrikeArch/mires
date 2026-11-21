@@ -307,7 +307,7 @@ final class Earcut {
 
   // Each block bounds 16 consecutive ring edges. Merged holes append new segments.
   void buildBlockIndex(int maxNodes, int numHoles) {
-    final blocks = (maxNodes + 2 * numHoles + 15 ~/ 16) + numHoles + 2;
+    final blocks = (maxNodes + 2 * numHoles + 15) ~/ 16 + numHoles + 2;
     blockBBox = Float64List(blocks * 4);
     blockHead = List<Vertex>.filled(blocks, none);
     blockStop = List<Vertex>.filled(blocks, none);

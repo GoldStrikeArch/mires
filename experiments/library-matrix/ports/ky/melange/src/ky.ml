@@ -69,7 +69,6 @@ let fail error = Host.resolve (Error error)
 let ( let*? ) outcome f = Host.bind outcome (function Ok value -> f value | Error error -> fail error)
 let ( let*! ) result f = match result with Ok value -> f value | Error error -> fail error
 let thrown result = Result.map_error (fun value -> Thrown value) result
-let thrown_later outcome = Host.bind outcome (fun result -> Host.resolve (thrown result))
 let type_error message = Error (Thrown (Host.type_error message))
 
 (* core/constants.js and utils/normalize.js *)
@@ -189,10 +188,8 @@ let lowercase_headers headers =
 let merge_headers headers =
   let result = Host.headers () in
   let rec set_each = function
-    | [] -> return result
-    | (name, value) :: rest ->
-        let*? () = thrown_later (Host.set_header result name value) in
-        set_each rest
+    | [] -> Ok result
+    | (name, value) :: rest -> Result.bind (thrown (Host.set_header result name value)) (fun () -> set_each rest)
   in
   set_each headers
 
@@ -245,10 +242,10 @@ let create_text_decoder content_type =
         match groups.(1) with Some _ as quoted -> quoted | None -> groups.(2))
   in
   match charset with
-  | Some label when label <> "" ->
-      Host.bind (Host.text_decoder label) (fun decoder ->
-          Host.resolve (Result.value decoder ~default:(Host.utf8_decoder ())))
-  | _ -> Host.resolve (Host.utf8_decoder ())
+  | Some label when label <> "" -> (
+      (* An unknown label falls back to UTF-8. *)
+      match Host.text_decoder label with Ok decoder -> decoder | Error _ -> Host.utf8_decoder ())
+  | _ -> Host.utf8_decoder ()
 
 (* An error body as text, or None when it cannot be read or is larger than
    maxErrorResponseBodySize. JSON uses UTF-8 regardless of the charset parameter (RFC 8259). *)
@@ -258,9 +255,8 @@ let read_response_text response =
     Host.resolve (Result.to_option text)
   else
     let content_type = Option.value (Host.header (Host.response_headers response) "content-type") ~default:"" in
-    let* decoder =
-      if is_json_content_type content_type then Host.resolve (Host.utf8_decoder ())
-      else create_text_decoder content_type
+    let decoder =
+      if is_json_content_type content_type then Host.utf8_decoder () else create_text_decoder content_type
     in
     let* bytes = Host.settle (Host.array_buffer response) in
     Host.resolve
@@ -300,8 +296,9 @@ let create_managed_signal user_provided_abort_signal abort_controller =
   | None -> Host.controller_signal abort_controller
 
 let create input (options : options) =
+  let ( let*! ) = Result.bind in
   let headers = Option.fold options.headers ~none:[] ~some:lowercase_headers in
-  let*? request_headers = merge_headers headers in
+  let*! request_headers = merge_headers headers in
   let method_ = normalize_request_method (Option.value options.method_ ~default:"GET") in
   let*! retry = normalize_retry_options options.retry in
   (* Defaults only replace undefined, so a null reaches the validation and is reported. *)
@@ -319,13 +316,13 @@ let create input (options : options) =
   (* A content-type from options.headers counts as user-provided. *)
   let user_provided_content_type = List.mem_assoc "content-type" headers in
   let body = Option.map Host.stringify options.json in
-  let*? () =
+  let*! () =
     if Option.is_some body && not user_provided_content_type then
-      thrown_later (Host.set_header request_headers "content-type" (Host.of_string "application/json"))
-    else return ()
+      thrown (Host.set_header request_headers "content-type" (Host.of_string "application/json"))
+    else Ok ()
   in
-  let*? request = thrown_later (Host.request input ~method_ ~headers:request_headers ~body ~signal) in
-  return
+  let*! request = thrown (Host.request input ~method_ ~headers:request_headers ~body ~signal) in
+  Ok
     {
       request;
       abort_controller;
@@ -502,12 +499,12 @@ let mime_type = function Json -> "application/json" | Text -> "text/*"
    JSON. *)
 let request input (options : options) shortcut =
   List.iter (fun hook -> hook ()) options.hooks.init;
-  let*? ky = create input options in
+  let*! ky = create input options in
   let headers = Host.request_headers ky.request in
   let accept =
     match Host.header headers "accept" with Some accept when accept <> "" -> accept | _ -> mime_type shortcut
   in
-  let*? () = thrown_later (Host.set_header headers "accept" (Host.of_string accept)) in
+  let*! () = thrown (Host.set_header headers "accept" (Host.of_string accept)) in
   let* result = run ky in
   match result with
   | Error error -> throw_processed_error ky error

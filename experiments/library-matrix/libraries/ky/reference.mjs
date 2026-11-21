@@ -46,10 +46,7 @@ async function requestCase(c) {
     beforeError:[({error,retryCount}) => {trace.push(['beforeError',retryCount,error.name])}],
   }
   try {
-    // Ky identifies header records by prototype identity. A JSON record must reach Ky as
-    // a local record even when the browser test driver cloned it in a different realm.
-    const headers = Object.prototype.toString.call(c.headers) === '[object Object]' ? {...c.headers} : c.headers
-    const result = await ky(c.url,{method:c.method,headers,json:c.json, retry,hooks,fetch,
+    const result = await ky(c.url,{method:c.method,headers:c.headers,json:c.json, retry,hooks,fetch,
       timeout:c.timeout,throwHttpErrors:c.throwHttpErrors,signal:controller.signal})[c.read]()
     return [trace,['ok',result]]
   } catch(error) {return [trace,['error',error.name,error.response?.status??null,error.data??null]]}

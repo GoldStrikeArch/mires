@@ -39,7 +39,6 @@ The observable result includes either the parsed JSON or text, or the error name
 ## Domain bounds
 
 - **Timeouts race stalled replies.** A reply that settles answers well before the corpus's timeouts (150 ms or more). A much shorter timeout, such as 0, races the transport's own scheduling, so its winner depends on the runtime rather than on Ky; such inputs (the review's `timeout-zero` probe) are outside the domain.
-- **Realms.** A browser driver can hand the port objects of another realm: under Firefox's WebDriver, the input's arrays and the errors the Fetch constructors throw fail `instanceof` in the port's realm. Ky tests arrays with `Array.isArray` and errors with its `isError` (`instanceof Error` or the `[object Error]` brand), and the ports do the same.
 - **JSON values.** The corpus is JSON: no option is undefined (an omitted key stands for it), NaN, Infinity or -0.
 - **Error bodies stay small.** They are well under Ky's 10 MiB error-data limit (a larger one would make the corpus impractical) and are in memory, so their reads never reach Ky's error-data timeout.
 - **The adapter's hooks** return nothing and never throw, so Ky's handling of hook results (a Request, Response, `ky.stop` or options) and of a throwing beforeRetry hook is not exercised. `totalTimeout`, `prefix`, `baseUrl`, `searchParams`, `parseJson`, `stringifyJson`, `retry.jitter`, `retry.shouldRetry`, `retry.afterStatusCodes`, `maxResponseSize` and the progress callbacks are never set.

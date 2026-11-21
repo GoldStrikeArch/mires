@@ -93,11 +93,6 @@ let promise executor =
 
 let to_value promise = Promise.to_any promise
 
-(* A host call that can throw an error of another realm, run inside a JS Promise executor: no
-   OCaml [try] stands between the call and the executor, so the rejection is the thrown value
-   itself, where js_of_ocaml would catch it as a [Failure] holding its text. *)
-let attempt f = settle (Promise.make (fun ~resolve ~reject:_ -> resolve (f ())))
-
 type timer = value
 
 let set_timeout callback milliseconds =
@@ -131,7 +126,7 @@ type headers = Fetch.headers Js.t
 let headers () = new%js Fetch.headers
 
 let set_header (headers : headers) name value =
-  attempt (fun () -> ignore (call headers "set" [| of_string name; value |]))
+  catching (fun () -> ignore (call headers "set" [| of_string name; value |]))
 
 let header (headers : headers) name = Js.Opt.to_option (headers##get (Js.string name)) |> Option.map Js.to_string
 
@@ -143,7 +138,7 @@ let request input ~method_ ~headers ~body ~signal =
   init##.headers := headers;
   Option.iter (fun body -> init##.body := of_string body) body;
   init##.signal := signal;
-  attempt (fun () -> new%js Fetch.request_with_init (Js.string input) init)
+  catching (fun () -> new%js Fetch.request_with_init (Js.string input) init)
 
 let with_signal (request : request) signal =
   let init = Fetch.empty_request_init () in
@@ -159,9 +154,9 @@ let request_text (request : request) = Promise.map Js.to_string request##text
 
 type response = Fetch.response Js.t
 
-let response body ~status ~headers : (response, value) result promise =
+let response body ~status ~headers : (response, value) result =
   let init = Js.Unsafe.obj [| ("status", status); ("headers", headers) |] in
-  attempt (fun () -> Js.Unsafe.coerce (construct "Response" [| body; init |]))
+  catching (fun () -> Js.Unsafe.coerce (construct "Response" [| body; init |]))
 
 let status (response : response) = response##.status
 let ok (response : response) = Js.to_bool response##.ok
@@ -177,5 +172,5 @@ let byte_length (bytes : bytes) = bytes##.byteLength
 type text_decoder = value
 
 let utf8_decoder () = construct "TextDecoder" [||]
-let text_decoder label = attempt (fun () -> construct "TextDecoder" [| of_string label |])
+let text_decoder label = catching (fun () -> construct "TextDecoder" [| of_string label |])
 let decode decoder (bytes : bytes) = Js.to_string (Js.Unsafe.coerce (call decoder "decode" [| inject bytes |]))

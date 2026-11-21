@@ -134,7 +134,7 @@ external headers : unit -> headers = "Headers" [@@mel.new]
 external headers_set : headers -> string -> value -> unit = "set" [@@mel.send]
 external headers_get : headers -> string -> string Js.null = "get" [@@mel.send]
 
-let set_header headers name value = resolve (catching (fun () -> headers_set headers name value))
+let set_header headers name value = catching (fun () -> headers_set headers name value)
 let header headers name = Js.Null.toOption (headers_get headers name)
 
 type request
@@ -151,7 +151,7 @@ external new_request : string -> request_init -> request = "Request" [@@mel.new]
 external copy_request : request -> < signal : abort_signal > Js.t -> request = "Request" [@@mel.new]
 
 let request input ~method_ ~headers ~body ~signal =
-  resolve (catching (fun () -> new_request input (request_init ~method_ ~headers ?body ~signal ())))
+  catching (fun () -> new_request input (request_init ~method_ ~headers ?body ~signal ()))
 
 let with_signal request signal = catching (fun () -> copy_request request [%mel.obj { signal }])
 
@@ -171,8 +171,7 @@ external new_response : value -> < status : value ; headers : value > Js.t -> re
   = "Response"
 [@@mel.new]
 
-let response body ~status ~headers =
-  resolve (catching (fun () -> new_response body [%mel.obj { status; headers }]))
+let response body ~status ~headers = catching (fun () -> new_response body [%mel.obj { status; headers }])
 
 external status : response -> int = "status" [@@mel.get]
 external ok : response -> bool = "ok" [@@mel.get]
@@ -193,6 +192,6 @@ type text_decoder
 external utf8_decoder : unit -> text_decoder = "TextDecoder" [@@mel.new]
 external labelled_decoder : string -> text_decoder = "TextDecoder" [@@mel.new]
 
-let text_decoder label = resolve (catching (fun () -> labelled_decoder label))
+let text_decoder label = catching (fun () -> labelled_decoder label)
 
 external decode : text_decoder -> bytes -> string = "decode" [@@mel.send]

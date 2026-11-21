@@ -28,23 +28,18 @@ packages beyond `runtime`, no goroutines, and no 64-bit integers). It reaches ex
   GopherJS's `$externalize` returns `$sliceToNativeArray(r)` (`r.$array.subarray(r.$offset, r.$offset + r.$length)`),
   yielding a JS `Uint8Array` of the exact slice length with zero copy. Empty outputs explicitly
   return `make([]byte, 0)` (never `nil`, which GopherJS externalises as `null`).
-- **UTF-8 and Latin-1 input payloads via `charCodeAt`.** Both UTF-8 and Latin-1 `{ text }`
-  payloads and GZIP `filename` strings are read with `textObj.Call("charCodeAt", i).Int()`
-  (which GopherJS compiles directly to `e.charCodeAt(i)` with no argument-array wrapper) and
-  encoded directly into a Go `[]byte` (`Uint8Array`) in Go. Three reasons drove this choice:
-  1. GopherJS's `.String()` (`$internalize(..., $String)`) runs an `x += $encodeRune(I)` JS loop
-     plus `$stringToBytes` whenever a string contains any non-ASCII character (~0.37 ms overhead
-     on `bench-compress`'s 64 KiB mixed text, plus GopherJS's known lone-surrogate defect).
-  2. Calling host `new TextEncoder().encode(textObj)` and unwrapping with `.Interface().([]byte)`
-     worked in Node and Chrome, but failed in Firefox Marionette (28/83) because Gecko's
-     cross-compartment wrapper returns a content-realm `Uint8Array` whose `.constructor !== Uint8Array`,
-     causing GopherJS's `$internalize` switch to fall through and return `map[string]interface{}`.
-  3. Encoding UTF-16 code units to UTF-8 directly in Go is faithful to `fflate`'s own `strToU8`
-     implementation, passes all three environments cleanly, and matches `TextEncoder` speed on
-     Node `bench-compress`.
+- **UTF-8 payloads through the host `TextEncoder`.** UTF-8 `{ text }` payloads are encoded with
+  `new TextEncoder().encode(textObj)`, as `fflate`'s `strToU8` does wherever the platform has a
+  `TextEncoder`. GopherJS wraps the returned `Uint8Array` as a Go `[]byte` without copying
+  (`.Interface().([]byte)`), and the string never passes through GopherJS's `.String()`
+  (`$internalize(..., $String)`), which runs an `x += $encodeRune(I)` JS loop plus
+  `$stringToBytes` on any non-ASCII string and has a known lone-surrogate defect.
+- **Latin-1 payloads and GZIP `filename` strings via `charCodeAt`.** They are read with
+  `textObj.Call("charCodeAt", i).Int()` (which GopherJS compiles directly to `e.charCodeAt(i)`
+  with no argument-array wrapper), keeping the low byte of each code unit as `fflate` does.
 - **Byte-array payloads.** `{ bytes: [...] }` is converted via
-  `js.Global.Get("Uint8Array").New(bytesObj).Interface().([]byte)`, constructing a local-realm
-  `Uint8Array` and wrapping it zero-copy as a Go `[]byte`.
+  `js.Global.Get("Uint8Array").New(bytesObj).Interface().([]byte)`, constructing a `Uint8Array`
+  from the array and wrapping it zero-copy as a Go `[]byte`.
 - **`strFromU8` in pure Go.** `strFromU8Utf16LE` implements the WHATWG Encoding Standard UTF-8
   state machine directly in Go into UTF-16LE bytes (stripping one leading UTF-8 BOM, encoding
   astral code points as surrogate pairs, and emitting maximal-subpart `U+FFFD` replacements),
@@ -83,12 +78,7 @@ at **0 `$restore` state machines**, **0 `$indexPtr` calls**, **0 `$growSlice` ca
    can run and throw the expected `FlateError`. Returning `uint32` from `gzl` and leaving `out`
    `nil` when `sz > 0x7FFFFFFF` lets `inflt` allocate dynamically and match JS on both valid and
    corrupt streams.
-4. **Firefox Marionette cross-compartment `TextEncoder.encode()`.** As noted above, `new TextEncoder().encode()`
-   under Firefox WebDriver returns a `Uint8Array` from the content compartment whose
-   `.constructor !== Uint8Array` in the module sandbox, causing GopherJS's `$internalize` to treat
-   it as a plain object (`map[string]interface{}`) rather than `[]byte`. Direct Go UTF-8 encoding
-   from `charCodeAt` avoids this cleanly.
-5. **No stdlib bloat.** Using exact integer cutoffs for `defaultPlvl`, concrete errors instead of
+4. **No stdlib bloat.** Using exact integer cutoffs for `defaultPlvl`, concrete errors instead of
    `fmt`/`errors`, and custom stable insertion sort instead of `sort` keeps the linked packages
    to just `runtime`, `github.com/gopherjs/gopherjs/js`, and `matrix/fflate/src`.
 

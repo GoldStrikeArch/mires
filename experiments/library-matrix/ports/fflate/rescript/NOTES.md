@@ -82,5 +82,3 @@ ReScript 12 behaviors worth documenting:
   - `bench-decompress`: `0.343 ms` vs `0.471 ms` JS (`port/js` `0.73`, A/A `0.996`; faster than
     the reference mainly because hoisting `growBuf` avoids `fflate`'s `cbuf` closure over `buf`
     and ReScript emits clean `| 0` integer ops and `>> 3` shifts).
-  - As noted in `libraries/fflate/CONTRACT.md`, this port stays idiomatic (`TextEncoder`) and does
-    not work around the Firefox Marionette CCW artifact.

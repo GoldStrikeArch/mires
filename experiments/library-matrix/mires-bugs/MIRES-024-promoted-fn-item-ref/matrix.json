@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "description": "mires bug repro registry: the floor library and one repro port",
+  "environments": {
+    "node": {
+      "kind": "node"
+    }
+  },
+  "languages": {
+    "rust": {
+      "label": "Rust (mires)",
+      "builder": "languages/rust/build.mjs",
+      "production": "mires js-profile=release-size js-opt=on js-ecma-target=2018 js-cleanup=off, unwind mode, JSC_RUST_OPT_LEVEL=z, js-lane=jir; minimal shim, Rollup, Terser ecma 2018",
+      "sources": {
+        "extensions": [
+          ".rs"
+        ],
+        "lineComment": "//",
+        "blockComment": [
+          "/*",
+          "*/"
+        ]
+      },
+      "embeddedJs": [
+        "js!"
+      ],
+      "runtimeGlobals": [
+        "__rt",
+        "@@rustc_codegen_js.abort-errors.v1"
+      ]
+    }
+  },
+  "libraries": {
+    "floor": {
+      "label": "runtime floor (identity program)",
+      "role": "floor",
+      "npm": null,
+      "package": {
+        "name": "matrix-floor",
+        "version": "1.0.0",
+        "entry": "libraries/floor/package/index.mjs",
+        "standIn": "the identity program; its ports measure each language's runtime floor uniformly"
+      },
+      "reference": "libraries/floor/reference.mjs",
+      "contract": "libraries/floor/CONTRACT.md",
+      "corpus": "libraries/floor/corpus.json",
+      "output": {
+        "form": "string",
+        "async": false
+      },
+      "normalisation": null,
+      "environments": [
+        "node"
+      ],
+      "bench": null
+    }
+  },
+  "ports": {
+    "floor": [
+      {
+        "id": "fn-item-ref",
+        "language": "rust",
+        "dir": "mires-bugs/MIRES-024-promoted-fn-item-ref/port"
+      }
+    ]
+  }
+}

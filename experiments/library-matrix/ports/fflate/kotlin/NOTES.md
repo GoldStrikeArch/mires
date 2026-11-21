@@ -94,5 +94,4 @@ Because Kotlin/JS lowers `ByteArray`/`ShortArray`/`IntArray` directly to JS type
 monomorphic 32-bit `| 0` integer arithmetic and zero-copy `Uint8Array` views at the boundary, both
 compression and decompression run right alongside `fflate` in V8 (with `bench-decompress` slightly
 faster than the reference thanks to zero-copy input range slicing in `infltRaw` and tight inner
-RLE loops). Note: this port does **not** work around the Firefox Marionette CCW timing artifact
-documented in `CONTRACT.md`.
+RLE loops).

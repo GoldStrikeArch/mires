@@ -95,11 +95,6 @@ internal external object JsReflect {
     fun has(target: Any, key: String): Boolean
 }
 
-@JsName("Object")
-internal external object ObjectPrototype {
-    val prototype: dynamic
-}
-
 @JsName("Date")
 internal external object JsDate {
     fun now(): Double
@@ -107,20 +102,9 @@ internal external object JsDate {
 
 internal fun isUndefined(value: Any?) = jsTypeOf(value) == "undefined"
 
-/** A JS value thrown that is no Error of this realm, as a Throwable. Kotlin/JS catches only
- *  `instanceof Error`, and a page can hand the port host objects of another realm: under Firefox's
- *  WebDriver, the Fetch constructors throw TypeErrors and RangeErrors that fail that test. */
-class HostError(val value: dynamic) : Exception()
-
-internal fun thrown(value: dynamic): Throwable = if (value is Throwable) value else HostError(value)
-
 internal suspend fun <T> Promise<T>.await(): T = suspendCoroutine { continuation ->
-    then({ value -> continuation.resume(value) }, { error -> continuation.resumeWithException(thrown(error)) })
+    then({ value -> continuation.resume(value) }, { error -> continuation.resumeWithException(error) })
 }
-
-/** Runs a host operation that can throw inside a JS Promise executor, whose rejection keeps the
- *  thrown value whatever its realm. */
-internal suspend fun <T> hostCall(operation: () -> T): T = Promise<T> { resolve, _ -> resolve(operation()) }.await()
 
 /** Runs [block] as a coroutine, settling the promise with its outcome. */
 internal fun <T> launch(block: suspend () -> T): Promise<T> = Promise { resolve, reject ->

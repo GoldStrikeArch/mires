@@ -4,61 +4,18 @@ package main
 
 import "github.com/gopherjs/gopherjs/js"
 
+// strToU8JS is fflate's strToU8: the low byte of each UTF-16 code unit for latin1, and otherwise
+// the host TextEncoder's UTF-8, which fflate uses wherever the platform has one.
 func strToU8JS(textObj *js.Object, latin1 bool) []byte {
+	if !latin1 {
+		return js.Global.Get("TextEncoder").New().Call("encode", textObj).Interface().([]byte)
+	}
 	n := textObj.Length()
-	if n == 0 {
-		return make([]byte, 0)
-	}
-	if latin1 {
-		out := make([]byte, n)
-		for i := 0; i < n; i++ {
-			out[i] = byte(textObj.Call("charCodeAt", i).Int())
-		}
-		return out
-	}
-	// Encode UTF-16 code units to UTF-8 directly in Go (matching fflate's strToU8). This avoids
-	// both GopherJS's $internalize string-concatenation loop / lone-surrogate defect and
-	// cross-compartment Uint8Array mismatch on Firefox Marionette's TextEncoder wrapper.
-	out := make([]byte, n+(n>>1)+4)
-	ai := 0
+	out := make([]byte, n)
 	for i := 0; i < n; i++ {
-		if ai+4 > len(out) {
-			next := make([]byte, ai+8+((n-i)<<1))
-			copy(next, out[:ai])
-			out = next
-		}
-		c := textObj.Call("charCodeAt", i).Int()
-		if c < 128 {
-			out[ai] = byte(c)
-			ai++
-		} else if c < 2048 {
-			out[ai] = byte(192 | (c >> 6))
-			out[ai+1] = byte(128 | (c & 63))
-			ai += 2
-		} else if c >= 0xD800 && c <= 0xDBFF && i+1 < n {
-			lo := textObj.Call("charCodeAt", i+1).Int()
-			if lo >= 0xDC00 && lo <= 0xDFFF {
-				i++
-				cp := 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00)
-				out[ai] = byte(240 | (cp >> 18))
-				out[ai+1] = byte(128 | ((cp >> 12) & 63))
-				out[ai+2] = byte(128 | ((cp >> 6) & 63))
-				out[ai+3] = byte(128 | (cp & 63))
-				ai += 4
-				continue
-			}
-			out[ai] = byte(224 | (c >> 12))
-			out[ai+1] = byte(128 | ((c >> 6) & 63))
-			out[ai+2] = byte(128 | (c & 63))
-			ai += 3
-		} else {
-			out[ai] = byte(224 | (c >> 12))
-			out[ai+1] = byte(128 | ((c >> 6) & 63))
-			out[ai+2] = byte(128 | (c & 63))
-			ai += 3
-		}
+		out[i] = byte(textObj.Call("charCodeAt", i).Int())
 	}
-	return out[:ai]
+	return out
 }
 
 func readPayload(spec *js.Object) []byte {

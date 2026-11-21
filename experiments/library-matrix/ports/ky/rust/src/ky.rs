@@ -103,6 +103,8 @@ const MAX_ERROR_RESPONSE_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 /// `normalizeRequestMethod`, with JS's full case mapping (Rust's `to_lowercase` and
 /// `to_uppercase` apply the same Unicode mappings as `toLowerCase` and `toUpperCase`).
+// WORKAROUND(MIRES-025): `str::to_ascii_lowercase` and `to_ascii_uppercase` return the text
+// unchanged under mires; the full mappings give the same result on every method name Ky matches.
 fn normalize_request_method(input: &str) -> String {
     if REQUEST_METHODS.contains(&input.to_lowercase().as_str()) {
         input.to_uppercase()
@@ -113,6 +115,7 @@ fn normalize_request_method(input: &str) -> String {
 
 /// `normalizeRetryMethod`: common methods for retry matching are case-insensitive, custom ones
 /// keep their case.
+// WORKAROUND(MIRES-025): `str::to_ascii_lowercase` returns the text unchanged under mires.
 fn normalize_retry_method(method: &str) -> String {
     let lowercase = method.to_lowercase();
     if CASE_INSENSITIVE_METHODS.contains(&lowercase.as_str()) {

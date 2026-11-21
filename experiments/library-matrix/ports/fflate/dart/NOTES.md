@@ -24,11 +24,11 @@ and Firefox for both `dist/index.min.js` and `dist/index.js` (`check.mjs --reada
 - **Zero-copy `Uint8List` / `JSUint8Array` boundary.** On dart2js, `dart:typed_data` (`Uint8List`,
   `Uint16List`, `Int32List`) compiles directly to JS typed arrays (`Uint8Array`, `Uint16Array`,
   `Int32Array`), and `Uint8List.toJS` returns the underlying JS `Uint8Array` without copying.
-- **Realm-safe `dart:js_interop` input reading.** Corpus inputs are read directly through
+- **In-place `dart:js_interop` input reading.** Corpus inputs are read directly through
   `dart:js_interop` extension types (`InputJson`, `PayloadJson`, `CompressOptionsJson`,
-  `DecompressOptionsJson`, `StreamStepJson`) without `dartify()` (which depends on the current
-  realm's `Object.prototype`). Strings stay JS strings (Dart `String` on the web, UTF-16) and are
-  encoded straight into `Uint8List` via `strToU8`.
+  `DecompressOptionsJson`, `StreamStepJson`) without converting them with `dartify()`. Strings stay
+  JS strings (Dart `String` on the web, UTF-16) and are encoded straight into `Uint8List` via
+  `strToU8`.
 - **Exact `fflate@0.8.3` algorithmic fidelity.**
   - `hTree`: flat `Uint16List`/`Int32List` node arrays avoid per-node heap allocation; two stable
     insertion sorts preserve `(f, s)` and `(-depth, f, s)` tie-breaks (Dart's `List.sort` is not
@@ -51,8 +51,6 @@ and Firefox for both `dist/index.min.js` and `dist/index.js` (`check.mjs --reada
   - `stream`: `Gunzip.push` reproduces `fflate`'s recursive multi-member progression literally so
     single- and multi-member streams emit identical `(chunk, false)` / `(empty, false)` /
     `(empty, true)` sequences.
-- **No Firefox Marionette CCW workaround.** Per `CONTRACT.md`, the port stays strictly idiomatic and
-  does not alter behavior for Firefox WebDriver cross-compartment wrappers.
 
 ## Lint columns
 

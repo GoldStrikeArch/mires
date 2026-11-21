@@ -17,7 +17,6 @@ import ky.Response
 import ky.RetryOptions
 import ky.Shortcut
 import ky.await
-import ky.hostCall
 import ky.launch
 import ky.name
 import ky.typeError
@@ -85,7 +84,7 @@ private suspend fun requestCase(case: Case): Array<Any?> {
                 "stall" -> Promise<Response> { _, reject ->
                     signal.addEventListener("abort", { reject(signal.reason) }, json("once" to true))
                 }.await()
-                else -> hostCall { Response(reply.body, json("status" to reply.status, "headers" to reply.headers)) }
+                else -> Response(reply.body, json("status" to reply.status, "headers" to reply.headers))
             }
         }
     }

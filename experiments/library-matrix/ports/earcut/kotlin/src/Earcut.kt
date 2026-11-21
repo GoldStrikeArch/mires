@@ -298,7 +298,7 @@ internal class Earcut {
 
     // Each block bounds 16 consecutive ring edges. Merged holes append new segments.
     private fun buildBlockIndex(maxNodes: Int, numHoles: Int): Unit {
-        val blocks = (maxNodes + 2 * numHoles + 15 / 16) + numHoles + 2
+        val blocks = (maxNodes + 2 * numHoles + 15) / 16 + numHoles + 2
         blockBBox = DoubleArray(blocks * 4)
         blockHead = MutableList(blocks) { none }
         blockStop = MutableList(blocks) { none }

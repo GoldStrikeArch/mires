@@ -71,40 +71,48 @@ let index_segment blocks head stop =
 let rec live p = if p.prev.next == p then p else live p.next
 
 (* Each retained block can outlive a removed head or stop. Repair both before
-   visiting its live edges, preserving the upstream append order. *)
-let scan_block block visit =
+   visiting its live edges, preserving the upstream append order. The walk stops
+   at the first edge [visit] answers with a node, as npm returns from its loop. *)
+let find_in_block block visit =
   let stop = live block.stop in
   block.stop <- stop;
   let head = live block.head in
   block.head <- head;
   let rec walk p =
-    if p.prev.next == p then visit p;
-    if p.next != stop then walk p.next
+    match if p.prev.next == p then visit p else None with
+    | Some _ as found -> found
+    | None -> if p.next != stop then walk p.next else None
   in walk head
 
-exception Touch of node
+let scan_block block visit = ignore (find_in_block block (fun p -> visit p; None) : node option)
 
 let find_bridge blocks hole outer =
   if equals hole outer then Some outer else
   let hx = hole.x and hy = hole.y in
   let qx = ref neg_infinity and candidate = ref None in
-  try
-    for i = 0 to blocks.Vector.size - 1 do
-      let b = blocks.items.(i) in
-      if not (hy < b.ymin || hy > b.ymax || b.xmin > hx || b.xmax <= !qx) then
-        scan_block b (fun p ->
-          let n = p.next in
-          if equals hole n then raise (Touch n);
-          if hy <= p.y && hy >= n.y && n.y <> p.y then begin
-            let x = p.x +. (hy -. p.y) *. (n.x -. p.x) /. (n.y -. p.y) in
-            if x <= hx && x > !qx then begin
-              qx := x;
-              let m = if p.x < n.x then p else n in
-              candidate := Some m;
-              if x = hx then raise (Touch m)
-            end
-          end)
-    done;
+  (* The ray from the hole to the left. A ring vertex it touches is the bridge. *)
+  let touch p =
+    let n = p.next in
+    if equals hole n then Some n
+    else if hy <= p.y && hy >= n.y && n.y <> p.y then begin
+      let x = p.x +. (hy -. p.y) *. (n.x -. p.x) /. (n.y -. p.y) in
+      if x <= hx && x > !qx then begin
+        qx := x;
+        let m = if p.x < n.x then p else n in
+        candidate := Some m;
+        if x = hx then Some m else None
+      end else None
+    end else None
+  in
+  let rec ray i =
+    if i = blocks.Vector.size then None else
+    let b = blocks.items.(i) in
+    if hy < b.ymin || hy > b.ymax || b.xmin > hx || b.xmax <= !qx then ray (i + 1)
+    else match find_in_block b touch with None -> ray (i + 1) | touched -> touched
+  in
+  match ray 0 with
+  | Some _ as touched -> touched
+  | None ->
     match !candidate with
     | None -> None
     | Some initial ->
@@ -126,7 +134,6 @@ let find_bridge blocks hole outer =
             end)
       done;
       Some !best
-  with Touch n -> Some n
 
 let leftmost start =
   let rec walk p best =

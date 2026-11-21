@@ -1,0 +1,5 @@
+error: src/lib.rs:28:30: 28:36: constants of type `fn(u32) -> u32 {twice}` cannot be read out of an allocation
+  = note: in `matrix_run`
+error: rustc_codegen_js: the link step reported errors
+
+error: aborting due to 1 previous error

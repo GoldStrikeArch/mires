@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "library": "floor",
+  "language": "rust",
+  "entry": "src/lib.rs",
+  "crateName": "mires_bug_sort_unstable_strings",
+  "boundary": "the floor boundary, sorting 21 two-letter Strings with sort_unstable before returning the text"
+}

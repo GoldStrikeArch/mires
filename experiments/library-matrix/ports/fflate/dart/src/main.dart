@@ -1,6 +1,6 @@
 // Entry of the Dart port and its JS interop boundary (port of libraries/fflate/reference.mjs).
 //
-// Reads corpus JSON objects directly via dart:js_interop extension types (no copy, realm-safe)
+// Reads corpus JSON objects directly via dart:js_interop extension types (no copy)
 // and returns raw Dart Uint8Lists as JS Uint8Arrays via .toJS (zero-copy on dart2js).
 // main() publishes `run` on globalThis.__matrixExports for the builder's ESM facade.
 

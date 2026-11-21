@@ -23,7 +23,7 @@ Each corpus case is read in place, field by field (`Reflect.get`). The option va
 - **Regular expressions.** Ky's patterns are anchored and made of ASCII literals and `\d`. `Scanner` matches the three HTTP-date forms piece by piece, and `charset` follows `/;\s*charset\s*=\s*(?:"([^"]+)"|([^;,\s]+))/i` with JS's whitespace set (`is_js_space`) and an ASCII-only case match, as a non-Unicode pattern has.
 - **Dates.** `create_timestamp` counts days as ECMAScript's `MakeDay` does (`days_from_civil`). It reproduces `Date.UTC`'s reading of a year from 0 to 99 as 1900 + year: the day has to exist in that year and in the year itself, so 29 Feb 0000 is rejected as Ky rejects it.
 - **JS string semantics.** `js_trim` is `String.prototype.trim`; Rust's `trim` would also strip U+0085. Rust's `to_lowercase` and `to_uppercase` apply the same full Unicode mappings as `toLowerCase` and `toUpperCase` (U+212A KELVIN SIGN becomes `k`, U+0130 becomes two characters).
-- **Ky's `isError`** accepts an Error of another realm by its `[object Error]` brand (`Object.prototype.toString` through `Reflect.apply`), as Ky does; mires's `is_error` is `instanceof Error`. Under Firefox's WebDriver, the Fetch constructors throw errors of another realm.
+- **Ky's `isError`** is `instanceof Error` (mires's `is_error`) or the `[object Error]` brand (`Object.prototype.toString` through `Reflect.apply`), as in Ky.
 - **Host functions.** `JSON.parse` and `JSON.stringify`, `Number()`, `Number.isInteger`, `Reflect.has`, `Reflect.apply`, `Date.now`, `Math.min`, `Math.max` and `Math.pow`.
 
 ## Deviations from the npm source
@@ -41,7 +41,7 @@ None changes a result in the parity domain.
 
 ## Compiler defect
 
-Under mires, `str::to_ascii_lowercase` and `str::to_ascii_uppercase` return the string unchanged (on a host string and on a `String` alike), while `to_lowercase` works. The port uses `to_lowercase` and `to_uppercase`, which are JS's case mappings anyway; with the ASCII forms, every common method failed the retry-method match and no request retried.
+**`MIRES-025`** ([`MIRES-BUGS.md`](../../../MIRES-BUGS.md), repro `mires-bugs/MIRES-025-str-ascii-case-unchanged/`): under mires, `str::to_ascii_lowercase` and `str::to_ascii_uppercase` return the string unchanged (on a host string and on a `String` alike), while `to_lowercase` works. With the ASCII forms, every common method failed the retry-method match and no request retried. `normalize_request_method` and `normalize_retry_method` (`src/ky.rs`) therefore use `to_lowercase` and `to_uppercase`, tagged `// WORKAROUND(MIRES-025)`. They are JS's case mappings, which Ky uses, and on every method name Ky matches they give the same result as the ASCII forms.
 
 ## Performance accommodations
 

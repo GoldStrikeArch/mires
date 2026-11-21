@@ -3,11 +3,6 @@
     operations Ky applies to header values. Ky is a thin layer over these, so their semantics
     (method and URL normalisation, header validation, body encoding, encoding labels, regular
     expressions) are the engine's own. A call that can throw returns the thrown value as [Error].
-    The constructors whose errors Ky reports ([Headers.set], [new Request], [new Response],
-    [new TextDecoder]) answer with a promise: a page can hand the port host objects of another
-    realm (under Firefox's WebDriver, the Fetch constructors throw errors that are not
-    [instanceof Error] there), and js_of_ocaml catches such a value only as a [Failure] with its
-    text, so its port runs them in a JS Promise executor, whose rejection keeps the value.
 
     This interface is shared, byte-identical, by the Melange and js_of_ocaml ports. Each has its
     own [host.ml]. *)
@@ -143,7 +138,7 @@ type headers
 
 val headers : unit -> headers
 
-val set_header : headers -> string -> value -> (unit, value) result promise
+val set_header : headers -> string -> value -> (unit, value) result
 (** [Headers.set]: it validates the name and the value (a TypeError) and stores the value's
     ByteString conversion, so any JSON value is accepted as JS accepts it. *)
 
@@ -157,7 +152,7 @@ val request :
   headers:headers ->
   body:string option ->
   signal:abort_signal ->
-  (request, value) result promise
+  (request, value) result
 (** [new Request(input, {method, headers, body, signal})], or the TypeError it throws. *)
 
 val with_signal : request -> abort_signal -> (request, value) result
@@ -172,7 +167,7 @@ val request_text : request -> string promise
 
 type response
 
-val response : value -> status:value -> headers:value -> (response, value) result promise
+val response : value -> status:value -> headers:value -> (response, value) result
 (** [new Response(body, {status, headers})], or the RangeError or TypeError it throws. *)
 
 val status : response -> int
@@ -192,7 +187,7 @@ type text_decoder
 
 val utf8_decoder : unit -> text_decoder
 
-val text_decoder : string -> (text_decoder, value) result promise
+val text_decoder : string -> (text_decoder, value) result
 (** A decoder for an Encoding Standard label, or the RangeError for an unknown one. *)
 
 val decode : text_decoder -> bytes -> string

@@ -113,7 +113,7 @@ object Ky:
       case None => 2.0
       case Some(limit: Double) if JsNumber.isInteger(limit) && limit >= 0 => limit
       case Some(_) => throw typeError("`retry.limit` must be a finite, non-negative integer")
-    // `Array.isArray`, which also accepts an array of another realm (a browser test driver's).
+    // Ky's own test, `Array.isArray`.
     def array(key: String, value: Option[Any]): Option[List[Any]] = value.map { values =>
       if js.Array.isArray(values.asInstanceOf[js.Any]) then values.asInstanceOf[js.Array[Any]].toList
       else throw js.JavaScriptException(js.Error(s"retry.$key must be an array"))
