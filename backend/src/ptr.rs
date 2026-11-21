@@ -631,7 +631,11 @@ fn cast_pointer_at<'tcx>(
         // the size on the record, where it is inert to every other operation.
         match size_of(tcx, from) {
             Some(size) if size > 1 && !is_indirect(tcx, from) => {
-                jsast::rt_call("erase", vec![reference, jsast::num(size as f64)])
+                let mut arguments = vec![reference, jsast::num(size as f64)];
+                if let Some(kind) = scalar_view_kind(tcx, from_pointee) {
+                    arguments.push(kind);
+                }
+                jsast::rt_call("erase", arguments)
             }
             _ => reference,
         }
@@ -807,6 +811,15 @@ fn cast_pointer_sized<'tcx>(
     // `self.cast::<u8>().addr() == 0`, so a record built out of `0..buf` would turn the one
     // pointer whose address is knowable into a record naming nothing.
     if to_size == 1 && !is_indirect(tcx, to) {
+        if matches!(to.kind(), ty::Uint(ty::UintTy::U8) | ty::Int(ty::IntTy::I8)) {
+            if let Some(kind) = scalar_view_kind(tcx, from_pointee) {
+                let mut arguments = vec![value, jsast::num(from_size as f64), kind];
+                if matches!(to.kind(), ty::Int(ty::IntTy::I8)) {
+                    arguments.push(Expr::Bool(true));
+                }
+                return jsast::rt_call("scale_scalar", arguments);
+            }
+        }
         return jsast::rt_call("scale", vec![value, jsast::num(from_size as f64)]);
     }
     // The way back. `__rt.unscale` answers for a scaled slot of exactly this element size whose
@@ -1099,6 +1112,7 @@ pub(crate) fn raw_to_ref<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, raw: Expr
 pub(crate) fn build_fat<'tcx>(
     fx: &FnCx<'_, 'tcx>,
     pointee: Ty<'tcx>,
+    data_ty: Option<Ty<'tcx>>,
     data: Expr,
     meta: Expr,
 ) -> Expr {
@@ -1112,7 +1126,33 @@ pub(crate) fn build_fat<'tcx>(
             };
             jsast::rt_call("chunk_slice", vec![data, meta, jsast::num(width as f64)])
         }
-        ty::Slice(_) => jsast::rt_call("slice_from_parts", vec![data, meta]),
+        ty::Slice(element) => {
+            let peeled_element = peel_pattern(peel_transparent(fx.tcx, *element));
+            let byte_tag = match peeled_element.kind() {
+                ty::Uint(ty::UintTy::U8) => Some(1.0),
+                ty::Int(ty::IntTy::I8) => Some(-1.0),
+                _ => None,
+            };
+            let data = if byte_tag.is_some() {
+                if let Some(from_pointee) = data_ty.and_then(|ty| ty.builtin_deref(true)) {
+                    let from_peeled = peel_pattern(peel_transparent(fx.tcx, from_pointee));
+                    if !is_zst(fx.tcx, from_peeled) && size_of(fx.tcx, from_peeled) != Some(1) {
+                        cast_pointer(fx, from_pointee, *element, data)
+                    } else {
+                        data
+                    }
+                } else {
+                    data
+                }
+            } else {
+                data
+            };
+            let mut arguments = vec![data, meta];
+            if let Some(tag) = byte_tag {
+                arguments.push(jsast::num(tag));
+            }
+            jsast::rt_call("slice_from_parts", arguments)
+        }
         // `str::from_raw_parts(p, n)`: the `n` bytes at `p`, decoded back into the JavaScript
         // string a `&str` is.
         ty::Str => {

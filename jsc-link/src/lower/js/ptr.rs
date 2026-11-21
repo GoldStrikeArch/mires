@@ -261,7 +261,13 @@ impl<'a> JsCx<'a> {
     }
 
     /// A fat pointer built from its two halves (`ptr.rs::build_fat`).
-    pub fn build_fat(&self, pointee: TypeId, data: Expr, meta: Expr) -> Res<Expr> {
+    pub fn build_fat(
+        &self,
+        pointee: TypeId,
+        data_ty: Option<TypeId>,
+        data: Expr,
+        meta: Expr,
+    ) -> Res<Expr> {
         let table = self.table;
         match value::kind(table, pointee) {
             Some(TypeKind::Dynamic { .. }) => Ok(ptr::fat_dyn(data, meta)),
@@ -274,7 +280,41 @@ impl<'a> JsCx<'a> {
                     "chunk_slice",
                     vec![data, meta, jsast::num(*length as f64)],
                 )),
-                _ => Ok(jsast::rt_call("slice_from_parts", vec![data, meta])),
+                _ => {
+                    let byte_tag = match value::kind(table, *element) {
+                        Some(TypeKind::Integer {
+                            signed: false,
+                            bits: 8,
+                        }) => Some(1.0),
+                        Some(TypeKind::Integer {
+                            signed: true,
+                            bits: 8,
+                        }) => Some(-1.0),
+                        _ => None,
+                    };
+                    let data = if byte_tag.is_some() {
+                        if let Some(from_pointee) =
+                            data_ty.and_then(|ty| value::pointee_of(table, ty))
+                        {
+                            let from_peeled = table.peeled(from_pointee);
+                            if !table.is_zst(from_peeled) && size_of(table, from_peeled) != Some(1)
+                            {
+                                self.cast_pointer(from_pointee, *element, data)?
+                            } else {
+                                data
+                            }
+                        } else {
+                            data
+                        }
+                    } else {
+                        data
+                    };
+                    let mut arguments = vec![data, meta];
+                    if let Some(tag) = byte_tag {
+                        arguments.push(jsast::num(tag));
+                    }
+                    Ok(jsast::rt_call("slice_from_parts", arguments))
+                }
             },
             Some(TypeKind::Str) => {
                 let (setup, data) = self.reread(data, &[BUF, OFF]);
@@ -520,7 +560,11 @@ impl<'a> JsCx<'a> {
             };
             return Ok(match size_of(table, from) {
                 Some(size) if size > 1 && !table.is_indirect(from) => {
-                    jsast::rt_call("erase", vec![reference, jsast::num(size as f64)])
+                    let mut arguments = vec![reference, jsast::num(size as f64)];
+                    if let Some(kind) = self.scalar_view_kind(from_pointee) {
+                        arguments.push(kind);
+                    }
+                    jsast::rt_call("erase", arguments)
                 }
                 _ => reference,
             });
@@ -650,6 +694,15 @@ impl<'a> JsCx<'a> {
             ));
         }
         if to_size == 1 && !table.is_indirect(to) {
+            if let Some(TypeKind::Integer { signed, bits: 8 }) = value::kind(table, to) {
+                if let Some(kind) = self.scalar_view_kind(from_pointee) {
+                    let mut arguments = vec![value, jsast::num(from_size as f64), kind];
+                    if *signed {
+                        arguments.push(Expr::Bool(true));
+                    }
+                    return Ok(jsast::rt_call("scale_scalar", arguments));
+                }
+            }
             return Ok(jsast::rt_call(
                 "scale",
                 vec![value, jsast::num(from_size as f64)],

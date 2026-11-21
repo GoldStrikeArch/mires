@@ -1324,7 +1324,13 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         let Some(pointee) = value::peel_pattern(pointer_ty).builtin_deref(true) else {
             return self.unsupported(format!("`{pointer_ty}` is not a pointer"));
         };
-        Outcome::Value(ptr::build_fat(self.fx, pointee, self.arg(0), self.arg(1)))
+        Outcome::Value(ptr::build_fat(
+            self.fx,
+            pointee,
+            Some(self.arg_ty(0)),
+            self.arg(0),
+            self.arg(1),
+        ))
     }
 
     /// `slice_get_unchecked(slice, index)`: a pointer to one element of a slice.

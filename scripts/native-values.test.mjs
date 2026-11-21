@@ -227,3 +227,93 @@ test("exact typed vectors keep physical allocation and logical capacity separate
     values: [1, 2, 3], len: 3, cap: 3,
   });
 });
+
+test("wider scalar byte views alias little-endian bytes and non-scalar storage refuses", () => {
+  const words = [0x0102, 0x0304];
+  const ptr = { buf: words, off: 0 };
+  const bytes = rt.scale_scalar(ptr, 2, "u16");
+  assert.deepEqual(Array.prototype.slice.call(bytes.buf, 0, 4), [0x02, 0x01, 0x04, 0x03]);
+  assert.equal(rt.scale_scalar(ptr, 2, "u16").buf, bytes.buf);
+  assert.equal(rt.addr(bytes, 1), rt.addr(ptr, 2));
+  assert.equal(rt.addr({ buf: bytes.buf, off: 2 }, 1), rt.addr({ buf: words, off: 1 }, 2));
+  assert.equal(rt.ptr_eq(bytes, ptr), true);
+  assert.equal(rt.ptr_eq({ buf: bytes.buf, off: 2 }, { buf: words, off: 1 }), true);
+  assert.equal(rt.ptr_eq({ buf: bytes.buf, off: 1 }, { buf: words, off: 1 }), false);
+
+  // Live two-way mutation (u16 and signed i16).
+  bytes.buf[1] = 0xfe;
+  assert.equal(words[0], 0xfe02);
+  words[1] = 0xabcd;
+  assert.deepEqual([bytes.buf[2], bytes.buf[3]], [0xcd, 0xab]);
+
+  const signed16 = [0];
+  const sb = rt.scale_scalar({ buf: signed16, off: 0 }, 2, "i16");
+  sb.buf[0] = 0xff;
+  sb.buf[1] = 0xff;
+  assert.equal(signed16[0], -1);
+
+  // Signed i8 byte view over u16 storage.
+  const i8bytes = rt.scale_scalar({ buf: [0xfe02], off: 0 }, 2, "u16", true);
+  assert.deepEqual([i8bytes.buf[0], i8bytes.buf[1]], [2, -2]);
+
+  // Round-trip back to original buffer via unscale_scalar and thin.
+  const back = rt.unscale_scalar({ buf: bytes.buf, off: 2 }, 2, () => 0, "u16");
+  assert.equal(back.buf, words);
+  assert.equal(back.off, 1);
+  const thinBack = rt.thin({ buf: bytes.buf, off: 2 }, 2);
+  assert.equal(thinBack.buf, words);
+  assert.equal(thinBack.off, 1);
+  assert.throws(() => rt.thin({ buf: bytes.buf, off: 1 }, 2), /not a multiple of 2/);
+
+  // BigInt (i64) and float (f64) read/write.
+  const big = [0n];
+  const bb = rt.scale_scalar({ buf: big, off: 0 }, 8, "i64");
+  bb.buf[7] = 0x80;
+  assert.equal(big[0], -9223372036854775808n);
+  assert.equal(bb.buf[7], 0x80);
+
+  const flt = [1.5];
+  const fb = rt.scale_scalar({ buf: flt, off: 0 }, 8, "f64");
+  fb.buf[7] |= 0x80;
+  assert.equal(flt[0], -1.5);
+
+  // Heap block retyped via unscale_scalar records kind for GVN-folded raw pointers.
+  const allocPtr = rt.alloc(4, 2);
+  const typed = rt.unscale_scalar(allocPtr, 2, () => 0, "u16");
+  typed.buf[0] = 0x0102;
+  typed.buf[1] = 0x0304;
+  const gvnSlice = rt.slice_from_parts(allocPtr, 4, 1);
+  assert.deepEqual(Array.prototype.slice.call(gvnSlice.buf, 0, 4), [0x02, 0x01, 0x04, 0x03]);
+  const sv = rt.convert_block_sv(rt.scale_scalar(typed, 2, "u16"), 2);
+  assert.equal(sv.buf, typed.buf);
+  assert.equal(sv.off, 0);
+  assert.equal(sv.len, 2);
+  rt.dealloc(rt.scale_scalar(typed, 2, "u16"), 4, 2);
+
+  // Non-scalar aggregate storage fails closed loudly with a registered abort.
+  const pairs = [{ a: 1, b: 2 }];
+  const scaledPair = rt.scale({ buf: pairs, off: 0 }, 8);
+  assert.throws(
+    () => rt.slice_from_parts(scaledPair, 8, 1),
+    (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
+  );
+  const pairHeap = rt.alloc(8, 4);
+  rt.unscale(pairHeap, 8, () => ({ a: 0, b: 0 }));
+  const rawPairSlice = rt.slice_from_parts(pairHeap, 8, 1);
+  assert.throws(
+    () => rt.byte_slice_ref(rawPairSlice),
+    (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
+  );
+  assert.throws(
+    () => rawPairSlice.buf[0],
+    (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
+  );
+  assert.throws(
+    () => {
+      rawPairSlice.buf[0] = 1;
+    },
+    (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
+  );
+  assert.equal(rt.unscale(rawPairSlice, 8, () => ({ a: 0, b: 0 })).buf, pairHeap.buf);
+  rt.dealloc(rawPairSlice, 8, 4);
+});

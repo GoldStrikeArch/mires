@@ -1220,6 +1220,7 @@ impl<'a> JsCx<'a> {
         variant: u32,
         active_field: Option<u32>,
         values: Vec<Expr>,
+        data_ty: Option<TypeId>,
     ) -> Res<Expr> {
         let table = self.table;
         let interns = self.interns;
@@ -1306,7 +1307,7 @@ impl<'a> JsCx<'a> {
                         "a raw pointer aggregate needs a data pointer and its metadata",
                     ));
                 };
-                self.build_fat(*pointee, data, meta)
+                self.build_fat(*pointee, data_ty, data, meta)
             }
             other => Err(decline(
                 OpClass::Rvalue,

@@ -2185,7 +2185,8 @@ impl<'a> JsCx<'a> {
                     .iter()
                     .map(|field| self.expr_of(*field))
                     .collect::<Res<Vec<_>>>()?;
-                self.aggregate(*ty, *variant, *active_field, values)
+                let data_ty = fields.first().and_then(|field| self.ty_of(*field).ok());
+                self.aggregate(*ty, *variant, *active_field, values, data_ty)
             }
             OpKind::Repeat { v, count } => {
                 let element_ty = self.ty_of(*v)?;
@@ -2246,7 +2247,7 @@ impl<'a> JsCx<'a> {
                 if array_reference {
                     Ok(ptr::fat_slice(data, jsast::num(0), len))
                 } else {
-                    self.build_fat(pointee, data, len)
+                    self.build_fat(pointee, Some(pointer_ty), data, len)
                 }
             }
             OpKind::Deref(pointer) => {

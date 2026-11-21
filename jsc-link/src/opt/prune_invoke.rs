@@ -105,6 +105,7 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "convert_sb_block"
             | "convert_nv_block"
             | "convert_block_nv"
+            | "convert_block_sv"
             | "convert_sv_nv"
             | "ptr_is_null"
     )

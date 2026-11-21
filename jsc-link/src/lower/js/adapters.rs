@@ -173,15 +173,16 @@ fn native_vec_to_baseline(
     ty: TypeId,
 ) -> Res<Expr> {
     let layout = VecLayout::of(table, interns, ty)?;
-    let size = element_size(table, ty)?;
+    let (size, scalar_kind) = element_info(table, ty)?;
     let (value, wrap) = once(value);
     // A registered, element-typed heap block: baseline reads reach the buffer through
     // `unscale`'s block registry, so a bare `{ buf, off }` record would refuse the very first
     // deref (`__rt.convert_nv_block` mirrors an `alloc` + first-cast retype).
-    let pointer = jsast::rt_call(
-        "convert_nv_block",
-        vec![value.clone(), jsast::raw_num(size.to_string())],
-    );
+    let mut args = vec![value.clone(), jsast::raw_num(size.to_string())];
+    if let Some(kind) = scalar_kind {
+        args.push(jsast::string(kind));
+    }
+    let pointer = jsast::rt_call("convert_nv_block", args);
     let length = jsast::member(value.clone(), "len");
     let capacity = jsast::member(value, "cap");
     wrap_paths(
@@ -242,8 +243,8 @@ fn wrap_paths(
     build(table, interns, ty, &mut at, cap, pointer, length, capacity)
 }
 
-/// The element's byte size, from the vec's first type argument.
-fn element_size(table: &TypeTable, ty: TypeId) -> Res<u64> {
+/// The element's byte size and optional wider-scalar view kind, from the vec's first type argument.
+fn element_info(table: &TypeTable, ty: TypeId) -> Res<(u64, Option<String>)> {
     let no = |detail: &str| decline(OpClass::Rvalue, format!("vec Convert adapter: {detail}"));
     let descriptor = table
         .get(ty)
@@ -260,7 +261,16 @@ fn element_size(table: &TypeTable, ty: TypeId) -> Res<u64> {
         .and_then(|element| element.layout.size)
         .filter(|size| *size > 0)
         .ok_or_else(|| no("the element size is unavailable or zero"))?;
-    Ok(size)
+    let scalar_kind = match table.get(table.peeled(element)).map(|d| &d.kind) {
+        Some(TypeKind::Integer { signed, bits }) if *bits > 8 => {
+            Some(format!("{}{bits}", if *signed { 'i' } else { 'u' }))
+        }
+        Some(TypeKind::Float { bits: 32 }) => Some("f32".to_owned()),
+        Some(TypeKind::Float { bits: 64 }) => Some("f64".to_owned()),
+        Some(TypeKind::Char) => Some("u32".to_owned()),
+        _ => None,
+    };
+    Ok((size, scalar_kind))
 }
 
 /// `__rt.convert_block_nv(<ptr>.buf, <ptr>.off, <len>, <cap>)`: a capacity-length native buffer
@@ -297,8 +307,15 @@ fn baseline_vec_to_slice_view(
     ty: TypeId,
 ) -> Res<Expr> {
     let layout = VecLayout::of(table, interns, ty)?;
+    let (size, _) = element_info(table, ty)?;
     let (value, wrap) = once(value);
     let pointer = layout.member(value.clone(), &layout.ptr);
+    if size > 1 {
+        return Ok(wrap(jsast::rt_call(
+            "convert_block_sv",
+            vec![pointer, layout.member(value, &layout.len)],
+        )));
+    }
     Ok(wrap(jsast::object_of(vec![
         ("buf", jsast::member(pointer.clone(), "buf")),
         ("off", jsast::member(pointer, "off")),

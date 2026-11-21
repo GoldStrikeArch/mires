@@ -1494,6 +1494,7 @@ impl Intrinsic<'_, '_> {
         };
         Ok(Outcome::Value(self.cx.build_fat(
             pointee,
+            Some(self.arg_ty(0)?),
             self.arg(0)?,
             self.arg(1)?,
         )?))

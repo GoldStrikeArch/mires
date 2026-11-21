@@ -863,7 +863,8 @@ One function owns the matrix, `ptr::cast_pointer`, and every pointer to pointer 
 | aggregate to its single non zero sized field | reproject: `{ buf: p.buf[p.off], off: "<field>" }` |
 | larger aggregate to a matching non zero sized field at layout offset zero | `__rt.prefix`, which retains the containing slot and therefore the shared address |
 | that zero-offset field back to its containing aggregate | `__rt.unproject`, which accepts only the prefix slot made by the forward cast |
-| size N to size 1 | `__rt.scale`: a scaled slot over the same buffer, and an address unchanged |
+| integer, float or `char` of size N to `u8` or `i8` | `__rt.scale_scalar`: an aliasing little-endian byte view (`Proxy`) over the wider scalar storage, an unwrapped byte pointer when scaling a scalar view back, or an address unchanged |
+| any other size N to size 1 | `__rt.scale`: a scaled slot over the same buffer, and an address unchanged |
 | size 1 to an integer, float or `char` of size N | `__rt.unscale_scalar`: allocation retyping for a fresh heap block, scale recovery for a scaled slot, or an aliasing little-endian scalar view over byte storage |
 | size 1 through a transparent union to size N | `__rt.unscale_uninit`: `unscale` plus one-time retyping of array-backed uninitialized stack storage |
 | any other size 1 to size N | `__rt.unscale`, which retypes a fresh heap block or throws |
@@ -899,6 +900,22 @@ compiler, so a write through it is immediately visible through the byte pointer 
 preserves pointer identity. Its synthetic address and a cast back to bytes continue to use the
 original buffer, at the view's phase plus its offset in scalars. Width alone is not enough to
 reconstruct a pointer, enum or aggregate, so those types keep the refusing `unscale` path.
+
+The reverse direction — viewing a wider integer, `f32`, `f64` or `char` buffer through a `u8` or
+`i8` pointer or slice (`scale_scalar` and `slice_from_parts(..., 1|-1)`) — gets a cached aliasing
+`Proxy` byte view (`_byte_view`) that reads and writes exact little-endian bytes of the underlying
+elements. That covers `core::hash::Hash::hash_slice` on `[u16]`..`[i128]`/`[usize]`/`[isize]`,
+`slice::from_raw_parts`/`from_raw_parts_mut`, `align_to::<u8>()`/`align_to_mut::<u8>()`,
+single-byte raw pointer dereferences `*(p.cast::<u8>().add(k))`, `compare_bytes`,
+`copy`/`copy_nonoverlapping`, and `write_bytes` across heap blocks (including retyped `RawVecInner`
+allocations whose `*mut u8 -> *const T -> *const u8` round-trip was folded by GVN), stack arrays,
+single locals and scalar struct fields (`examples/core-tests/365_hash_primitive_slices.rs`,
+`366_byte_views_wider_scalars.rs`). Casting back to the matching scalar type (`unscale_scalar`,
+`thin`), taking `addr`, comparing with `ptr_eq`, reallocating or freeing the heap block, and
+converting between `NativeVec`/`SliceView` and baseline `Vec` all unwrap `_byte_view_of` back to the
+underlying buffer. Non-primitive aggregate storage (such as `#[repr(C)] struct Pair { a: u32, b: u32 }`)
+has no flat byte representation, so forming a non-empty byte slice over it fails closed with a
+registered abort (`examples/core-tests/367_byte_view_non_scalar_abort.rs`).
 Building a raw slice through `slice_from_parts` normalizes a dangling data address. The data half
 is asked by its value, never by its type: `with_metadata_of`, which is how `Box::clone_from_ref`
 (`Box<[T]>::from(&[T])`) rebuilds its fat pointer, hands `from_raw_parts` the data pointer as
@@ -1213,6 +1230,7 @@ __rt.write_bytes(dst, byte, count, zero?)      // repeat a byte pattern
 __rt.compare_bytes(a, b, count)        // lexicographic byte comparison
 __rt.read_array(p, n)        // the `n` elements at `p`, as a JS array
 __rt.write_array(p, values)  // the write half of read_array
+__rt.scale_scalar(p, size, kind, signed?) // an aliasing LE byte view over wider scalar storage
 __rt.unscale(p, size, mk)    // a scaled slot back to a slot, throws if misaligned
 __rt.unscale_scalar(p, size, mk, kind) // an aliasing integer/float/char view over byte storage
 __rt.unscale_uninit(p, size, mk)       // one-time retype of uninitialized array storage

@@ -96,11 +96,12 @@ impl<'tcx> FnCx<'_, 'tcx> {
             }
             Rvalue::Aggregate(kind, operands) => {
                 let ty = self.monomorphize(rvalue.ty(&self.mir.local_decls, self.tcx));
+                let data_ty = operands.iter().next().map(|op| self.operand_ty(op));
                 let values = operands
                     .iter()
                     .map(|op| self.codegen_operand(op))
                     .collect::<Vec<_>>();
-                self.codegen_aggregate(kind, ty, values)
+                self.codegen_aggregate(kind, ty, values, data_ty)
             }
             Rvalue::Repeat(operand, count) => {
                 let element_ty = self.operand_ty(operand);
@@ -196,6 +197,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
         kind: &AggregateKind<'tcx>,
         ty: Ty<'tcx>,
         values: Vec<Expr>,
+        data_ty: Option<Ty<'tcx>>,
     ) -> Expr {
         match kind {
             AggregateKind::Array(_) | AggregateKind::Closure(..) => jsast::array(values),
@@ -282,7 +284,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         "`*const {pointee}` needs both a data pointer and its metadata"
                     ));
                 };
-                crate::ptr::build_fat(self, pointee, data, meta)
+                crate::ptr::build_fat(self, pointee, data_ty, data, meta)
             }
             _ => self.zombie(format!(
                 "`{kind:?}` aggregates are not supported by rustc_codegen_js"

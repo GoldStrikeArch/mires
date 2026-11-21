@@ -1518,7 +1518,7 @@ mod adapters {
                 Carrier::NativeVec,
                 Carrier::Baseline
             ),
-            "{ buf: { inner: { ptr: __rt.convert_nv_block(v, 4), cap: v.cap, \
+            "{ buf: { inner: { ptr: __rt.convert_nv_block(v, 4, \"u32\"), cap: v.cap, \
              alloc: undefined }, _marker: undefined }, len: v.len }"
         );
     }
@@ -1546,7 +1546,7 @@ mod adapters {
                 Carrier::Baseline,
                 Carrier::SliceView
             ),
-            "{ buf: v.buf.inner.ptr.buf, off: v.buf.inner.ptr.off, len: v.len }"
+            "__rt.convert_block_sv(v.buf.inner.ptr, v.len)"
         );
     }
 
@@ -1594,7 +1594,7 @@ mod adapters {
         let value = jsast::call(jsast::id("g"), vec![]);
         assert_eq!(
             converted_at(value, VEC_U32, Carrier::NativeVec, Carrier::Baseline),
-            "(($cv) => ({ buf: { inner: { ptr: __rt.convert_nv_block($cv, 4), \
+            "(($cv) => ({ buf: { inner: { ptr: __rt.convert_nv_block($cv, 4, \"u32\"), \
              cap: $cv.cap, alloc: undefined }, _marker: undefined }, len: $cv.len }))(g())"
         );
     }
