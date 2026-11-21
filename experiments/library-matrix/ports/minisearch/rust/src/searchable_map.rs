@@ -201,7 +201,7 @@ fn create_path<'a, T>(node: &'a mut Node<T>, key: &[u16]) -> &'a mut Node<T> {
         return node;
     }
     let Some(index) = node.edge_starting_with(key[0]) else {
-        node.entries.push(Entry::Edge { label: boxed(key), child: Node::new() });
+        node.entries.push(Entry::Edge { label: Box::from(key), child: Node::new() });
         return last_child(node);
     };
     let Entry::Edge { label, .. } = &node.entries[index] else { unreachable!() };
@@ -214,20 +214,14 @@ fn create_path<'a, T>(node: &'a mut Node<T>, key: &[u16]) -> &'a mut Node<T> {
         // Partial match: an intermediate node holds the rest of the old edge. It is set under the
         // shared part and the old edge deleted, so it moves to the end of the node.
         let Entry::Edge { label, child } = node.entries.remove(index) else { unreachable!() };
-        let intermediate = Node { entries: vec![Entry::Edge { label: boxed(&label[offset..]), child }] };
-        node.entries.push(Entry::Edge { label: boxed(&label[..offset]), child: intermediate });
+        let intermediate = Node { entries: vec![Entry::Edge { label: Box::from(&label[offset..]), child }] };
+        node.entries.push(Entry::Edge { label: Box::from(&label[..offset]), child: intermediate });
         return create_path(last_child(node), &key[offset..]);
     }
     match &mut node.entries[index] {
         Entry::Edge { child, .. } => create_path(child, &key[offset..]),
         Entry::Leaf(_) => unreachable!(),
     }
-}
-
-/// A label of these units. Through a `Vec`: a `Box<[u16]>` made by `From<&[u16]>` cannot be freed
-/// under mires (NOTES.md, bug 4).
-fn boxed(units: &[u16]) -> Box<[u16]> {
-    units.to_vec().into_boxed_slice()
 }
 
 fn last_child<T>(node: &mut Node<T>) -> &mut Node<T> {

@@ -1217,6 +1217,14 @@ add('regress-size-emphasis', '5,000 emphasis runs (20 KB, 10,000 inline tokens):
   op: 'parse',
   markdown: '_a_ '.repeat(5000),
 })
+add('regress-depth-list-100', '100 nested lists, the parity domain\'s nesting bound: one recursive blockTokens per level', {
+  op: 'parse',
+  markdown: `${'- '.repeat(100)}a\n`,
+})
+add('regress-depth-blockquote-100', '100 nested blockquotes, the parity domain\'s nesting bound: one recursive blockTokens per level', {
+  op: 'parse',
+  markdown: `${'>'.repeat(100)} a\n`,
+})
 
 // 14. Bench cases (2)
 const benchParseMd = makeBenchParse(0x18112026, 32)
@@ -1330,6 +1338,8 @@ if (process.argv.includes('--verify')) {
   assert(outputs.get('regress-html-begin-ul').startsWith('<ul>\n<li>a</li>\n</ul>\n<ul>'), 'a `<ul>` line must end the list item')
   assert(outputs.get('regress-size-atx-headings').split('<h1>').length === 5001, 'size case must render 5,000 headings')
   assert(outputs.get('regress-size-emphasis').split('<em>').length === 5001, 'size case must render 5,000 emphasis runs')
+  assert(outputs.get('regress-depth-list-100').split('<ul>').length === 101, 'depth case must render 100 nested lists')
+  assert(outputs.get('regress-depth-blockquote-100').split('<blockquote>').length === 101, 'depth case must render 100 nested blockquotes')
   assert(outputs.get('images-text-renderer').includes('alt="bold em code del lnk sub &lt;b&gt;h&lt;/b&gt; ab * &amp; A &quot;q&quot;"'), `unexpected TextRenderer alt: ${outputs.get('images-text-renderer')}`)
 
   // Verify bench-variant for k = 1..50 on both bench cases

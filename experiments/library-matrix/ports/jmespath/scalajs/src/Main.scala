@@ -34,6 +34,8 @@ object Main:
       js.Dictionary("value" -> value)
     catch
       case e: JmesPathException => js.Dictionary[js.Any]("error" -> e.category.label)
+      // An exhausted stack propagates, as it does from the reference adapter.
+      case e: Throwable if Host.isStackExhaustion(e) => throw e
       // The reference's category() default: JSON.parse's SyntaxError and engine errors.
       case _: Throwable => js.Dictionary[js.Any]("error" -> ErrorCategory.Syntax.label)
   }

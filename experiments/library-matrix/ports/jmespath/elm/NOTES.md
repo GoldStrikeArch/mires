@@ -14,6 +14,8 @@ This port is written by hand. It replaces the earlier Elm port, whose identity m
 
 The host sends `{ data, queries }`. The document is a flat postfix list of instructions: a primitive, or `{ array: n, token }` / `{ object: keys, token }` to build from the values before it. Both sides write and read such lists with loops, so no nesting depth recurses at the boundary. Each array and object carries itself as its token. The result array comes back the same way, with `{ undefined: true }` for undefined, and the host rebuilds it with `Object.fromEntries`, so a `__proto__` key stays an own property.
 
+Stack exhaustion is not a category: it propagates out of `run`, as it does out of the reference adapter. Elm code cannot catch it, with one exception: `Json.Decode.decodeString` turns any exception inside it into an `Err`. A literal is therefore parsed there with `D.value` alone, and decoded by `D.decodeValue`, which does not catch (`Values.literal`). Before this, a literal nested past about 1,465 levels came back as "syntax" in Node, where npm returns it.
+
 ## Values
 
 - **`V` is `Undefined | Null | Flag | Num | Str | Arr Token (List V) | Obj Token (List (String, V))`.** Objects keep JS key order. Decoded objects come in `for…in` order. Built objects follow assignment semantics (`put`: an existing key keeps its place, and a `__proto__` key is dropped, as the prototype setter ignores a primitive), and `sortFields` then puts array-index keys first.

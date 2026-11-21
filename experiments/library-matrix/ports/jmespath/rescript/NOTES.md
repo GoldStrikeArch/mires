@@ -15,7 +15,7 @@ This port is written by hand. It replaces the earlier port that `build/library-m
 
 ## Boundary
 
-The input record is the corpus JS object itself, so reading it converts nothing. The document stays the JS value it is, because jmespath returns parts of it and compares them by identity. Each result is a `dict`: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give.
+The input record is the corpus JS object itself, so reading it converts nothing. The document stays the JS value it is, because jmespath returns parts of it and compares them by identity. Each result is a `dict`: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give. Stack exhaustion is not a category: it propagates out of `run`, as it does out of the reference adapter (`Host.stackExhausted` recognises the engine's RangeError or InternalError, and `run` rethrows it).
 
 ## Interop decisions
 

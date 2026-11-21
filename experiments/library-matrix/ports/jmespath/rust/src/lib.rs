@@ -36,11 +36,15 @@ pub fn matrix_run(input: V) -> V {
     let out = array();
     for i in 0..len(qs) {
         let q = at(qs, i);
-        let result = try_host(|| query(q, data)).unwrap_or_else(|_| {
-            let o = obj();
-            set(o, "error", s("syntax"));
-            o
-        });
+        let result = match try_host(|| query(q, data)) {
+            Ok(result) => result,
+            Err(error) if stack_exhausted(error) => throw_value(error),
+            Err(_) => {
+                let o = obj();
+                set(o, "error", s("syntax"));
+                o
+            }
+        };
         push(out, result);
     }
     out

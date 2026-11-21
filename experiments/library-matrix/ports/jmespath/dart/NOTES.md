@@ -14,7 +14,7 @@ This port is written by hand. It replaces the earlier port that `build/library-m
 
 ## Boundary
 
-The input is the JS object itself, seen through `dart:js_interop` extension types, with no copy. The document stays the JS value it is (`JSAny?`), because jmespath returns parts of it and compares them by identity. Each expression is a Dart string, which on the web is the same JS string. Each result is a plain `JSObject`: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give.
+The input is the JS object itself, seen through `dart:js_interop` extension types, with no copy. The document stays the JS value it is (`JSAny?`), because jmespath returns parts of it and compares them by identity. Each expression is a Dart string, which on the web is the same JS string. Each result is a plain `JSObject`: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give. Stack exhaustion is not a category: it propagates out of `run`, as it does out of the reference adapter (dart2js catches it as a `StackOverflowError`, which `_query` rethrows).
 
 ## Interop decisions
 

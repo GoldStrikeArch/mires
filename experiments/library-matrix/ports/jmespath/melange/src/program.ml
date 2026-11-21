@@ -5,6 +5,8 @@ let run input=
     (try let ast=Parser.compile(get q "expression")in
       let v=if strict(get q "op")(str "compile")then ast else Eval.eval ast data in
       set out "value" v
-     with Parser.Error category->set out "error"(str category)|_->set out "error"(str "syntax"));
+     with Parser.Error category->set out "error"(str category)
+        |e when stack_exhausted e->raise e
+        |_->set out "error"(str "syntax"));
     push result out
   done;result

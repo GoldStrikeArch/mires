@@ -58,6 +58,21 @@ internal fun Array<Any?>.elementAt(index: Double): Any? =
 
 internal fun parseJson(text: String): Any? = JSON.parse(text)
 
+/**
+ * Stack exhaustion, which the reference adapter lets propagate rather than file as "syntax": the
+ * engine's RangeError "Maximum call stack size exceeded" (V8, JavaScriptCore) or InternalError
+ * "too much recursion" (SpiderMonkey). Kotlin/JS catches either as the JS error itself.
+ */
+internal fun Throwable.isStackExhaustion(): Boolean {
+    val error = asDynamic()
+    val message = error.message as? String ?: return false
+    return when (error.name as? String) {
+        "RangeError" -> "call stack" in message
+        "InternalError" -> "too much recursion" in message
+        else -> false
+    }
+}
+
 /** The relational operators of jmespath's comparators and `max_by`/`sort_by`, with JS coercion. */
 internal fun jsGreater(a: Any?, b: Any?): Boolean = a.asDynamic() > b
 internal fun jsGreaterOrEqual(a: Any?, b: Any?): Boolean = a.asDynamic() >= b

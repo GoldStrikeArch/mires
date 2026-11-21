@@ -14,7 +14,7 @@ This port is written by hand. It replaces the earlier port that `build/library-m
 
 ## Boundary
 
-The input is an `external interface` read in place. The document stays the JS value it is, because jmespath returns parts of it and compares them by identity. Each result is a plain object built with `kotlin.js.json`: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give. `compile` is a fresh `Parser().parse`. `search` is a fresh parse and a fresh `TreeInterpreter`, as in jmespath.
+The input is an `external interface` read in place. The document stays the JS value it is, because jmespath returns parts of it and compares them by identity. Each result is a plain object built with `kotlin.js.json`: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give. Stack exhaustion is not a category: it propagates out of `run`, as it does out of the reference adapter (`isStackExhaustion` in `Host.kt` recognises the engine's RangeError or InternalError, and `run` rethrows it). `compile` is a fresh `Parser().parse`. `search` is a fresh parse and a fresh `TreeInterpreter`, as in jmespath.
 
 ## Interop decisions
 

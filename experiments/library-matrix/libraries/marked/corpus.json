@@ -973,6 +973,22 @@
       }
     },
     {
+      "id": "regress-depth-list-100",
+      "note": "100 nested lists, the parity domain's nesting bound: one recursive blockTokens per level",
+      "input": {
+        "op": "parse",
+        "markdown": "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - a\n"
+      }
+    },
+    {
+      "id": "regress-depth-blockquote-100",
+      "note": "100 nested blockquotes, the parity domain's nesting bound: one recursive blockTokens per level",
+      "input": {
+        "op": "parse",
+        "markdown": ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> a\n"
+      }
+    },
+    {
       "id": "bench-parse",
       "note": "Mixed CommonMark+GFM technical handbook (~52 KB) under default options",
       "input": {

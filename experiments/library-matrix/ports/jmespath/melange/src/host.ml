@@ -44,3 +44,11 @@ let und=box Js.undefined
 let str(s:string)=box s
 let num(n:float)=box n
 let bool(b:bool)=box b
+(* Stack exhaustion, which the reference adapter lets propagate rather than file as "syntax": the
+   engine's RangeError "Maximum call stack size exceeded" (V8, JavaScriptCore) or InternalError
+   "too much recursion" (SpiderMonkey), handed over as Js.Exn.Error. *)
+let stack_exhausted=function
+  |Js.Exn.Error e->
+    let says search=match Js.Exn.message e with Some m->Js.String.includes ~search m|None->false in
+    (match Js.Exn.name e with Some "RangeError"->says "call stack"|Some "InternalError"->says "too much recursion"|_->false)
+  |_->false

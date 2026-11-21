@@ -26,11 +26,15 @@ func search(data, expression *js.Object) (*js.Object, error) {
 }
 
 // query runs one query as reference.mjs does. A panic is an engine error inside a host call (a
-// TypeError on a malformed node), which the reference's category() files as syntax.
+// TypeError on a malformed node), which the reference's category() files as syntax, unless it is
+// stack exhaustion, which propagates as it does from the reference.
 func query(q, data *js.Object) (result *js.Object) {
 	result = newObject()
 	defer func() {
-		if recover() != nil {
+		if r := recover(); r != nil {
+			if stackExhausted(r) {
+				panic(r)
+			}
 			result = newObject()
 			result.Set("error", categorySyntax)
 		}

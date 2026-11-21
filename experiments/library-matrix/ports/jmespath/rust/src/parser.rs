@@ -1,7 +1,7 @@
 //! Pratt parser. Projections consume only expressions above their binding power.
 use crate::host::*;
 use alloc::vec::Vec;
-use mires_js::try_host;
+use mires_js::{throw_value, try_host};
 
 #[derive(Clone, Copy)]
 struct Token {
@@ -16,7 +16,11 @@ fn digit(c: u32) -> bool {
     (48..=57).contains(&c)
 }
 fn json(v: V) -> Answer {
-    try_host(|| parse_json(v)).map_err(|_| "syntax")
+    match try_host(|| parse_json(v)) {
+        Ok(value) => Ok(value),
+        Err(error) if stack_exhausted(error) => throw_value(error),
+        Err(_) => Err("syntax"),
+    }
 }
 
 fn lex(source: V) -> Result<Vec<Token>, &'static str> {

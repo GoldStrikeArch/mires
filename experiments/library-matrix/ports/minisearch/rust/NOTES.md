@@ -48,39 +48,41 @@ Firefox.
 - **No cross-call state.** Every `run` builds a fresh index from its own input; nothing is cached
   between calls or keyed on input identity, and the input is never written.
 
-## mires bugs met, and the workarounds
+## mires bugs met
 
-Each has a minimal repro under `build/library-matrix/mires-bugs/<name>/` (`run.sh` builds it
-through the harness with its own registry and receipts; README.md states the exact error).
+The first version of this port met four compiler bugs. They are `MIRES-001` to `MIRES-004` in
+[`MIRES-BUGS.md`](../../../MIRES-BUGS.md), each with a repro under
+[`mires-bugs/MIRES-00N-*/`](../../../mires-bugs/). All four are fixed in the compiler, and the port
+no longer works around any of them, so its sources carry no `WORKAROUND(MIRES-…)` tag:
 
-1. **`in-place-collect`** (compile-time refusal). `vec.into_iter().map(f).collect::<Vec<_>>()` is
-   refused when alloc's in-place collection applies (the source allocation reused for a smaller
-   element): `rustc_codegen_js cannot cast a pointer to (u32, usize) into a pointer to usize`, in
-   `alloc::vec::in_place_collect::from_iter_in_place`. Workaround: collect from `iter()` or push in a
-   loop (`index.rs` `auto_suggest`, and the former `property_order`).
-2. **`slice-partial-ord-lt`** (compile-time refusal). `<` on slices: core's `PartialOrd for [T]`
-   `lt` transmutes `ControlFlow<bool>` to `u8`, which the backend does not support. `sort_unstable`
-   on `Vec<&[u16]>` reaches it. Workaround: compare with `Ord::cmp` (`unique_count`).
-3. **`tuple-clone-uninitialized`** (miscompile, runtime `TypeError`). `<(A, B) as Clone>::clone` for
-   a tuple with a non-`Copy` field is emitted as `b[0]=…; b[1]=…; return b` with `b` never created:
-   `TypeError: Cannot set properties of undefined (setting '0')`. Cloning a `Vec` of tuples clones
-   each tuple, so it hits too. Workarounds: vector-valued options are `Rc<[T]>` (a merge clones the
-   `Rc`, which is also what spreading a JavaScript object does), search hits refer to stored fields
-   by short id instead of copying them, and `match` entries are moved, never cloned.
-4. **`boxed-slice-dealloc`** (runtime refusal). A `Box<[u16]>` made by `From<&[u16]>`
-   (`slice.into()`) cannot be dropped: `rustc_codegen_js: this pointer does not name a live heap
-   block, so it cannot be deallocated`. `Vec::into_boxed_slice` works. Workaround:
-   `searchable_map::boxed` goes through a `Vec`.
+- **`MIRES-003`** (`into_iter().map(..).collect()` refused in alloc's in-place collection):
+  `index.rs` `auto_suggest` collects that way again. `index.min.js` is 2.8 KB larger than with the
+  push loop it replaces.
+- **`MIRES-002`** (`Box<[T]>::from(&[T])` read the wrong elements and could not be freed): radix
+  labels are made with `Box::from` (`searchable_map.rs` `create_path`).
+- **`MIRES-004`** (`<` on slices refused, and with it `sort_unstable` of `&[u16]` keys):
+  `index.rs` `unique_count` still sorts positions through the shared `stable_order`, comparing
+  with `Ord::cmp`. That is the size decision under "Size", not a workaround: `sort_unstable` plus
+  `dedup` builds and passes now, but its second sort instantiation adds 13.4 KB.
+- **`MIRES-001`** (`<(A, B) as Clone>::clone` miscompiled): nothing in the port clones a tuple.
+  The vector-valued options stay `Rc<[T]>` on their own merit: the spread merge at every
+  query-tree node then shares each value instead of copying it, as spreading a JavaScript object
+  does. Search hits refer to stored fields by short id, and `match` entries are moved into the
+  hit; neither needs a copy.
 
 ## Size
 
-`dist/index.min.js` is about 318 KB (74 KB gzip-9, 60 KB brotli-11; the exact figures are in
-`build/library-matrix/sizes.json` and `MATRIX.md`). By the optimizer report (Rollup bytes before
-Terser, about 346 KB of program): about 25 KB is Unicode lower-casing (core's
-conversion tables, `Cased`/`Case_Ignorable` for Final_Sigma, `to_lowercase`), 14.6 KB the single
-stable-sort instantiation, 6 KB `core::fmt` reached from panic paths (`Vec::remove`'s
-`assert_failed` formats its indices, `Rc<[T]>`'s layout `unwrap`), and the rest is the port and
-its generic instantiations (`Vec`, iterator adapters, `Option`, drop glue, the host-map wrappers).
+`dist/index.min.js` is 322,184 bytes (74,845 gzip-9, 60,023 Brotli-11). The first build, before the
+release profile defaulted to `js-str=bytes`, was 318,772 bytes (74,318 gzip-9, 59,667 Brotli-11).
+The current compiler adds 434 bytes to the unchanged source, and dropping the MIRES-002 and
+MIRES-003 workarounds adds 2,978 more. The figures the matrix reports are in
+`build/library-matrix/sizes.json` and `MATRIX.md`. By the optimizer report (about 352 KB of
+program, in Rollup bytes before Terser), about 21 KB is Unicode lower-casing (core's conversion
+tables, `Cased`/`Case_Ignorable` for Final_Sigma, `to_lowercase`). The single stable-sort
+instantiation is 14.7 KB. `core::fmt` reached from panic paths is 6.6 KB: `Vec::remove`'s
+`assert_failed` formats its indices, and `Rc<[T]>`'s layout calls `unwrap`. The rest is the port
+and its generic instantiations (`Vec`, iterator adapters, `Option`, drop glue, the host-map
+wrappers).
 
 Every sort goes through one `sort_by` on positions (`index.rs` `stable_order`): under mires each
 instantiation of core's driftsort is about 18 KB of JavaScript, and five element types (hits,

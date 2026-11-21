@@ -555,10 +555,17 @@ pop n stack taken =
 {-| A JSON literal of the expression, from `JSON.parse` (Elm's `D.decodeString`): its arrays and
 objects get the tokens of the objects JSON.parse made, so the literal keeps one identity however
 often its node is evaluated.
+
+`D.decodeString` turns any exception inside it into an `Err`, so it only runs `JSON.parse`; the
+recursive `jsonValue` runs in `D.decodeValue`, which does not catch. A stack exhausted while
+decoding a deep literal then propagates out of the program, as the reference adapter lets it,
+instead of coming back as a syntax error.
 -}
 literal : String -> Result () V
 literal text =
-    D.decodeString jsonValue text |> Result.mapError (\_ -> ())
+    D.decodeString D.value text
+        |> Result.andThen (D.decodeValue jsonValue)
+        |> Result.mapError (\_ -> ())
 
 
 jsonValue : D.Decoder V

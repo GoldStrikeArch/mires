@@ -12,7 +12,7 @@ A port of `jmespath.js` 0.16.0 (the subset in `libraries/jmespath/CONTRACT.md`) 
 
 ## Boundary
 
-Rust drives host `JsValue`s throughout, and the AST and values are JS objects. JavaScript supplies the JSON primitives and the UTF-16 string operations. Each result is `{ value }`, or `{ error }` with the reference adapter's category. A host exception inside a query (an engine TypeError on a malformed node) becomes "syntax", as `category()` does.
+Rust drives host `JsValue`s throughout, and the AST and values are JS objects. JavaScript supplies the JSON primitives and the UTF-16 string operations. Each result is `{ value }`, or `{ error }` with the reference adapter's category. A host exception inside a query (an engine TypeError on a malformed node) becomes "syntax", as `category()` does. Stack exhaustion is not a category: `stack_exhausted` recognises it after a host call (in `matrix_run`, and around `JSON.parse` in the lexer), and it is thrown on out of `matrix_run`, as the reference adapter lets it propagate.
 
 ## Review fixes (2026-11-20)
 

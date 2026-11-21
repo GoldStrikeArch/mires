@@ -9,6 +9,7 @@ import jmespath.ErrorCategory
 import jmespath.JmesPathException
 import jmespath.Parser
 import jmespath.TreeInterpreter
+import jmespath.isStackExhaustion
 import kotlin.js.Json
 import kotlin.js.json
 
@@ -36,6 +37,8 @@ fun run(input: Input): Array<Json> = input.queries.map { query ->
     } catch (e: JmesPathException) {
         json("error" to e.category.label)
     } catch (e: Throwable) {
+        // An exhausted stack propagates, as it does from the reference adapter.
+        if (e.isStackExhaustion()) throw e
         // The reference's category() default: JSON.parse's SyntaxError and engine errors.
         json("error" to ErrorCategory.Syntax.label)
     }

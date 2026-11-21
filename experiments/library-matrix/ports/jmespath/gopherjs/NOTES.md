@@ -14,7 +14,7 @@ This port is written by hand. The earlier port was a Go transliteration of the s
 
 ## Boundary
 
-The input is a `*js.Object` read in place. The document stays the JS value it is, because jmespath returns parts of it and compares them by identity. Each expression stays a JS string. Each result is a plain object: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give.
+The input is a `*js.Object` read in place. The document stays the JS value it is, because jmespath returns parts of it and compares them by identity. Each expression stays a JS string. Each result is a plain object: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give. Stack exhaustion is not a category: it propagates out of `run`, as it does out of the reference adapter (`stackExhausted` in `host.go` recognises the engine's RangeError or InternalError in the recovered `*js.Error`, and `query` and `parseJSON` panic with it again).
 
 ## Interop decisions
 

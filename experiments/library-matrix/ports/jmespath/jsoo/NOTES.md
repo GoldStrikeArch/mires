@@ -13,7 +13,7 @@ A port of `jmespath.js` 0.16.0 (the subset in `libraries/jmespath/CONTRACT.md`) 
 
 ## Boundary
 
-Native Pratt parsing, projection evaluation and typed built-ins operate on host JSON values. They keep UTF-16 string semantics and JavaScript object semantics. Each result is `{ value }`, or `{ error }` with the reference adapter's category. Any other exception inside a query becomes "syntax", as `category()` does.
+Native Pratt parsing, projection evaluation and typed built-ins operate on host JSON values. They keep UTF-16 string semantics and JavaScript object semantics. Each result is `{ value }`, or `{ error }` with the reference adapter's category. Any other exception inside a query becomes "syntax", as `category()` does. Stack exhaustion is the exception: js_of_ocaml raises `Stack_overflow` for the engine's RangeError or InternalError, `Host.stack_exhausted` recognises it, and `run` and `json_value` raise it again, as the reference adapter lets it propagate.
 
 ## Review fixes (2026-11-20)
 

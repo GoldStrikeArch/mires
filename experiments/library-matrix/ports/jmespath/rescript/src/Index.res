@@ -18,6 +18,8 @@ let run = (input: input): array<dict<Host.value>> =>
       dict{"value": query.op == "compile" ? compile(query.expression) : search(input.data, query.expression)}
     } catch {
     | Errors.JmesPathError(category, _) => dict{"error": Host.fromString(Errors.label(category))}
+    // An exhausted stack propagates, as it does from the reference adapter.
+    | JsExn(error) if Host.stackExhausted(error) => JsExn.throw(error)
     // The reference's category() default: JSON.parse's SyntaxError and engine errors.
     | _ => dict{"error": Host.fromString(Errors.label(Syntax))}
     }

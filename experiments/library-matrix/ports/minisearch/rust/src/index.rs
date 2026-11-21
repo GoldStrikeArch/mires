@@ -642,11 +642,10 @@ impl MiniSearch {
                 None => groups.push((phrase, hit.score, terms, 1)),
             }
         }
-        // A loop, not `into_iter().map(..).collect()`, which mires refuses here (NOTES.md, bug 1).
-        let mut suggestions: Vec<Suggestion> = Vec::with_capacity(groups.len());
-        for (suggestion, score, terms, count) in groups {
-            suggestions.push(Suggestion { suggestion, terms, score: score / f64::from(count) });
-        }
+        let suggestions: Vec<Suggestion> = groups
+            .into_iter()
+            .map(|(suggestion, score, terms, count)| Suggestion { suggestion, terms, score: score / f64::from(count) })
+            .collect();
         let order = stable_order(suggestions.len(), &|a, b| by_score(suggestions[a].score, suggestions[b].score));
         Ok(permuted(suggestions, &order))
     }

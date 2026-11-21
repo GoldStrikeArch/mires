@@ -10,7 +10,11 @@
 
 package main
 
-import "github.com/gopherjs/gopherjs/js"
+import (
+	"strings"
+
+	"github.com/gopherjs/gopherjs/js"
+)
 
 var (
 	jsObject       = js.Global.Get("Object")
@@ -88,11 +92,34 @@ func stringify(v *js.Object) *js.Object { return jsJSON.Call("stringify", v) }
 // parseJSON is JSON.parse, whose SyntaxError is a jmespath syntax error.
 func parseJSON(text *js.Object) (value *js.Object, err error) {
 	defer func() {
-		if recover() != nil {
+		if r := recover(); r != nil {
+			if stackExhausted(r) {
+				panic(r)
+			}
 			value, err = nil, syntaxError("invalid JSON")
 		}
 	}()
 	return jsJSON.Call("parse", text), nil
+}
+
+// stackExhausted reports whether a recovered panic is the engine's stack exhaustion, which the
+// reference adapter lets propagate rather than file as "syntax": a RangeError "Maximum call stack
+// size exceeded" (V8, JavaScriptCore) or an InternalError "too much recursion" (SpiderMonkey).
+// GopherJS recovers a JS exception as a *js.Error, and a re-panic with it that no one recovers
+// throws the original exception out to JS.
+func stackExhausted(r any) bool {
+	err, ok := r.(*js.Error)
+	if !ok {
+		return false
+	}
+	message := err.Get("message").String()
+	switch err.Get("name").String() {
+	case "RangeError":
+		return strings.Contains(message, "call stack")
+	case "InternalError":
+		return strings.Contains(message, "too much recursion")
+	}
+	return false
 }
 
 // compareCodeUnits orders two JS strings as JS's < does: by UTF-16 code unit.

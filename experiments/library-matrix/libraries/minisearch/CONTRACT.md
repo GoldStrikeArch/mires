@@ -626,11 +626,12 @@ is a worked example of every point.
 
 **Rust (mires).** `no_std` + `alloc`; `Vec<u16>` strings read with `charCodeAt`;
 `mires_js::collections::HashMap` (a host `Map`) for insertion-ordered maps; `Math.log` through
-`js_bindings!`. Avoid what this backend currently refuses or miscompiles (all reported under
-`build/library-matrix/mires-bugs/`): `Vec::into_iter().map(..).collect()` that collects in place,
-`<` on slices (use `cmp`), cloning tuples with non-`Copy` fields, `Box<[T]>::from(&[T])` (use
-`into_boxed_slice`). `u128`/`u64` are BigInts; `Range::contains` allocates; each `sort_by`
-instantiation is about 18 KB.
+`js_bindings!`. The four compiler bugs the first port met are fixed: an in-place
+`Vec::into_iter().map(..).collect()`, `<` on slices, cloning tuples with non-`Copy` fields, and
+`Box<[T]>::from(&[T])` are `MIRES-001` to `MIRES-004` in `MIRES-BUGS.md`, with repros under
+`mires-bugs/MIRES-00N-*/`. Write the natural Rust for them. A new bug gets the next `MIRES-NNN`, a
+repro and a `// WORKAROUND(MIRES-NNN)` tag (`MIRES-BUGS.md`, "Policy"). `u128`/`u64` are BigInts;
+`Range::contains` allocates; each `sort_by` instantiation is about 18 KB.
 
 **ReScript / Melange.** JS strings are UTF-16 natively: `String.length`, `charCodeAt`, `slice`.
 The host `RegExp` with the `u` flag (`%re("/[\\n\\r\\p{Z}\\p{P}]+/u")` / `Js.Re.fromStringWithFlags`)
@@ -704,6 +705,14 @@ surrogates (`docs/COMPARATORS.md`): read text as `[]uint16` through `*js.Object`
 (`charCodeAt`) and build output strings with `String.fromCharCode` on the JS side of the boundary.
 `unicode.Is(unicode.Z, r) || unicode.Is(unicode.P, r)` uses Go's Unicode tables (version of Go
 1.21: Unicode 15.0; fine for this corpus) and adds their size; or call the host `RegExp` through
-`js.Global`. `strings.ToLower`/`unicode.ToLower` have no Final_Sigma: call the host `toLowerCase`
-or special-case Σ. `math.Log` in GopherJS: confirm it is bound to JS `Math.log` (a pure-Go `Log`
+`js.Global`. `strings.ToLower`/`unicode.ToLower` map one rune to one rune with no context, so
+special-casing Σ is not enough: they have no Final_Sigma, and no full mappings either
+(`unicode.ToLower` maps U+0130 İ to `i`, where `toLowerCase` gives `i` + U+0307). Lower-case ASCII
+terms in Go and pass every term holding a non-ASCII unit to the host `toLowerCase`, as the accepted
+port does. `math.Log` in GopherJS: confirm it is bound to JS `Math.log` (a pure-Go `Log`
 differs in the last bit); `map` iteration is random, so keep order in slices; `sort.SliceStable`.
+
+The GopherJS timings in `MATRIX.md` are of a GopherJS-tuned rewrite. The accepted port's first,
+idiomatic version (`slices.SortStableFunc`, `IndexFunc`, `ContainsFunc`, `DeleteFunc`, value
+structs, `strconv`) ran at 7.6× (`bench-index`) and 7.2× (`bench-search`) the reference's time in
+Node. Its `NOTES.md` lists each change and the GopherJS problem behind it.

@@ -14,7 +14,7 @@ This port is written by hand. It replaces the earlier port that `build/library-m
 
 ## Boundary
 
-The input is the JS object itself, seen through `@js.native` facade traits, with no copy. The document stays the JS value it is (`js.Any`), because jmespath returns parts of it and compares them by identity. Each expression is a JS string. Each result is a `js.Dictionary`: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give.
+The input is the JS object itself, seen through `@js.native` facade traits, with no copy. The document stays the JS value it is (`js.Any`), because jmespath returns parts of it and compares them by identity. Each expression is a JS string. Each result is a `js.Dictionary`: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give. Stack exhaustion is not a category: it propagates out of `run`, as it does out of the reference adapter (`Host.isStackExhaustion` recognises the engine's RangeError or InternalError inside the `js.JavaScriptException`, and `run` rethrows it).
 
 ## Interop decisions
 
