@@ -101,6 +101,9 @@ unsafe impl<T: PointeeSized> Freeze for &mut T {}
 #[lang = "unpin"]
 pub auto trait Unpin {}
 
+#[lang = "unsafe_unpin"]
+pub unsafe auto trait UnsafeUnpin {}
+
 #[lang = "structural_peq"]
 pub trait StructuralPartialEq {}
 

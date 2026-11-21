@@ -34,7 +34,8 @@ pub fn rust_entry() {
     unsafe { dealloc(block, layout) };
 
     // The block is gone, and the cast through a pointer into it says so.
-    let again = block as *mut i32;
+    // `black_box` prevents `-Oz` MIR GVN from CSEing this cast into line 30's pre-dealloc cast.
+    let again = core::hint::black_box(block) as *mut i32;
     print_i32(unsafe { *again });
 
     // Unreachable: the cast above throws.
