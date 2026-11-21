@@ -28,7 +28,7 @@ object Main:
     if n == 0 || n.isNaN then 0.0 else n
 
   /** One frame: setSize, setData and setScale in a batch, then the recorded paths and the probes. */
-  private def frame(canvas: Canvas, ctx: Context2D, spanGaps: Boolean, f: Frame, pxRatio: Double): js.Array[Any] =
+  private def frame(canvas: Canvas, ctx: Context2D, spanGaps: Boolean, f: Frame, pxRatio: Double, state: ScaleState): js.Array[Any] =
     // The adapter passes CSS sizes; uPlot multiplies them back by pxRatio.
     val widthCss = f.size(0) / pxRatio
     val heightCss = f.size(1) / pxRatio
@@ -38,7 +38,7 @@ object Main:
 
     // x values are never null.
     val xs = f.data(0).asInstanceOf[js.Array[Double]]
-    val chart = Chart(plot, Scale(f.xRange(0), f.xRange(1)), Scale(f.yRange(0), f.yRange(1)), xs)
+    val chart = state.applyScales(plot, Scale(f.xRange(0), f.xRange(1)), Scale(f.yRange(0), f.yRange(1)), xs)
     val series = f.data.drop(1)
 
     // drawSeries runs only with data; the adapter then reports an empty trace for each series.
@@ -69,5 +69,6 @@ object Main:
     Window.document.body.appendChild(canvas)
     try
       val ctx = canvas.getContext("2d")
-      input.frames.map(frame(canvas, ctx, input.spanGaps, _, pxRatio))
+      val state = ScaleState()
+      input.frames.map(frame(canvas, ctx, input.spanGaps, _, pxRatio, state))
     finally canvas.remove()

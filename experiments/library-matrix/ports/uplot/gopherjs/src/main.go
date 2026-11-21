@@ -5,8 +5,10 @@ package main
 
 import "github.com/gopherjs/gopherjs/js"
 
-// jsString is the host's String(n), whose digits fixFloat inspects.
-func jsString(n float64) string { return js.Global.Call("String", n).String() }
+// jsString, jsNumber and jsLog10 call the host's String(n), Number(s) and Math.log10(n).
+func jsString(n float64) string   { return js.Global.Call("String", n).String() }
+func jsNumber(s string) float64   { return js.Global.Call("Number", s).Float() }
+func jsLog10(n float64) float64   { return js.Global.Get("Math").Call("log10", n).Float() }
 
 // frame is one input frame in Go values.
 type frame struct {
@@ -71,14 +73,14 @@ func precise(v float64) float64 {
 
 // drawFrame is one frame: setSize, setData and setScale in a batch, then the recorded paths and
 // the probes.
-func drawFrame(canvas, ctx *js.Object, spanGaps bool, f frame, pxRatio float64) js.S {
+func drawFrame(canvas, ctx *js.Object, spanGaps bool, f frame, pxRatio float64, state *scaleState) js.S {
 	// The adapter passes CSS sizes; uPlot multiplies them back by pxRatio.
 	widthCss, heightCss := f.size[0]/pxRatio, f.size[1]/pxRatio
 	p := newPlot(pxRatio, widthCss, heightCss)
 	canvas.Set("width", round(widthCss*pxRatio))
 	canvas.Set("height", round(heightCss*pxRatio))
 
-	u := newChart(p, scale{f.xRange[0], f.xRange[1]}, scale{f.yRange[0], f.yRange[1]}, f.xs)
+	u := state.applyScales(p, scale{f.xRange[0], f.xRange[1]}, scale{f.yRange[0], f.yRange[1]}, f.xs)
 	traces := make(js.S, len(f.series))
 	if len(f.xs) > 0 {
 		paths := make([]seriesPaths, len(f.series))
@@ -127,8 +129,9 @@ func run(input *js.Object) js.S {
 	ctx := canvas.Call("getContext", "2d")
 	frames := input.Get("frames")
 	out := make(js.S, frames.Length())
+	state := &scaleState{}
 	for i := range out {
-		out[i] = drawFrame(canvas, ctx, spanGaps, readFrame(frames.Index(i)), pxRatio)
+		out[i] = drawFrame(canvas, ctx, spanGaps, readFrame(frames.Index(i)), pxRatio, state)
 	}
 	return out
 }

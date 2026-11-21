@@ -22,10 +22,12 @@ module type Host = sig
   val array : unit -> v
   val push : v -> v -> unit
 
-  (* JS numbers: Math.round, Number.isInteger, String(x) and devicePixelRatio. *)
+  (* JS numbers: Math.round, Math.log10, Number.isInteger, String(x), Number(s) and devicePixelRatio. *)
   val round : float -> float
+  val log10 : float -> float
   val is_integer : float -> bool
   val to_string : float -> string
+  val parse_float : string -> float
   val pixel_ratio : unit -> float
 
   (* The canvas, appended to document.body, and its 2D context. *)
@@ -73,16 +75,71 @@ module Make (H : Host) = struct
         in
         find (dot + 1)
 
+  let find_neg_exp s =
+    let n = String.length s in
+    let rec loop i =
+      if i + 1 >= n then None
+      else if s.[i] = 'e' && s.[i + 1] = '-' then Some i
+      else loop (i + 1)
+    in
+    loop 0
+
   (* fixFloat: snaps a value whose JS string has a run of six or more 9s or 0s after the point to
-     the decimals before the run (17999.204999999998 becomes 17999.205). uPlot first returns
-     members of its fixedDec map unchanged; the string path returns every member unchanged too.
-     Its branch for strings with "e-" (values below 1e-6) is not reached by plot sizes of 1 px or
-     more. *)
+     the decimals before the run (17999.204999999998 becomes 17999.205), handling "e-" exponent
+     strings by rounding the mantissa. uPlot first returns members of its fixedDec map unchanged;
+     the string path returns every member unchanged too. *)
   let fix_float v =
     if H.is_integer v then v
-    else match decimals_before_run (H.to_string v) with Some dec -> round_dec ~dec v | None -> v
+    else
+      let str = H.to_string v in
+      match decimals_before_run str with
+      | None -> v
+      | Some dec -> (
+          match find_neg_exp str with
+          | Some e_pos ->
+              let mant = H.parse_float (String.sub str 0 e_pos) in
+              let exp = String.sub str e_pos (String.length str - e_pos) in
+              H.parse_float (H.to_string (round_dec ~dec mant) ^ exp)
+          | None -> round_dec ~dec v)
 
   let incr_round v incr = fix_float (round_dec (fix_float (v /. incr)) *. incr)
+  let incr_round_up v incr = fix_float (Float.ceil (fix_float (v /. incr)) *. incr)
+  let incr_round_dn v incr = fix_float (Float.floor (fix_float (v /. incr)) *. incr)
+
+  (* NaN-propagating min/max, matching JS Math.min / Math.max. *)
+  let fmin a b = if a <> a || b <> b then nan else if a < b then a else b
+  let fmax a b = if a <> a || b <> b then nan else if a > b then a else b
+
+  (* uPlot's rangeNum(min, max, 0.1, true): used by autoScaleX when all x values are equal. *)
+  let range_num min_v max_v =
+    let delta = ref (max_v -. min_v) in
+    let scalar_max = fmax (Float.abs min_v) (Float.abs max_v) in
+    if !delta < 1e-24 || Float.abs (H.log10 scalar_max -. H.log10 !delta) > 10. then begin
+      delta := 0.;
+      if min_v = 0. || max_v = 0. then delta := 1e-24
+    end;
+    let non_zero_delta =
+      if !delta <> 0. then !delta else if scalar_max <> 0. then scalar_max else 1e3
+    in
+    let base = 10. ** Float.floor (H.log10 non_zero_delta) in
+    let pad_min =
+      non_zero_delta *. if !delta = 0. then if min_v = 0. then 0.1 else 1. else 0.1
+    in
+    let new_min = round_dec ~dec:24 (incr_round_dn (min_v -. pad_min) (base /. 10.)) in
+    let soft_min = if min_v >= 0. && new_min <= 0. then 0. else infinity in
+    let min_lim =
+      if new_min < soft_min && min_v >= soft_min then soft_min else fmin soft_min new_min
+    in
+    let pad_max =
+      non_zero_delta *. if !delta = 0. then if max_v = 0. then 0.1 else 1. else 0.1
+    in
+    let new_max = round_dec ~dec:24 (incr_round_up (max_v +. pad_max) (base /. 10.)) in
+    let soft_max = if max_v <= 0. && new_max >= 0. then 0. else neg_infinity in
+    let max_lim =
+      ref (if new_max > soft_max && max_v <= soft_max then soft_max else fmax soft_max new_max)
+    in
+    if min_lim = !max_lim && min_lim = 0. then max_lim := 100.;
+    (min_lim, !max_lim)
 
   (* One axis of the plot: the scale range, calcSize's offset and size in canvas pixels, and the
      CSS size uPlot was given (the adapter divides the physical size by pxRatio). *)
@@ -98,10 +155,10 @@ module Make (H : Host) = struct
 
   let num a i = H.num (H.at a i)
 
-  let scale range ~css ~ratio ~vertical =
+  let scale (min, max) ~css ~ratio ~vertical =
     {
-      min = num range 0;
-      max = num range 1;
+      min;
+      max;
       off = incr_round (0. *. ratio) 0.5;
       dim = incr_round (css *. ratio) 0.5;
       css;
@@ -211,7 +268,9 @@ module Make (H : Host) = struct
       let limit = ref (value x (!col +. 1.)) and bucket = ref None in
       for i = !first to !last do
         let xv = num xs i in
-        if dense && xv >= !limit then begin
+        (* Melange rewrites [not (xv < !limit)] to [xv >= !limit], which is false on NaN.
+           Check [Float.is_nan] explicitly to match uPlot's [!(xVal < nextAccXVal)]. *)
+        if dense && (Float.is_nan !limit || xv >= !limit) then begin
           let next = H.round (pixel x xv) in
           if next <> !col then begin
             Option.iter (flush !col) !bucket;
@@ -252,16 +311,59 @@ module Make (H : Host) = struct
     draw ctx path gaps x y;
     pair pts (if span then H.null else gaps)
 
-  let frame canvas ctx f span ratio =
+  (* Persistent scale bounds across frames for uPlot's setScale (< 1e-16) guard. *)
+  type scale_state = { mutable x : (float * float) option; mutable y : (float * float) option }
+
+  let range_accepted lo hi =
+    let d = hi -. lo in
+    Float.is_nan d || d >= 1e-16
+
+  let apply_scales state xs ((x_min, x_max) as x_req) ((y_min, y_max) as y_req) =
+    let n = H.len xs in
+    let lo = ref 0 and hi = ref (if n > 0 then n - 1 else 0) in
+    let pend_x =
+      ref
+        (if n <= 1 || range_accepted x_min x_max then true
+         else
+           let a0 = num xs 0 and a1 = num xs (n - 1) in
+           let r0, r1 = if a0 = a1 then range_num a0 a1 else (a0, a1) in
+           let lo_a, hi_a = if r0 > r1 then (r1, r0) else (r0, r1) in
+           range_accepted lo_a hi_a)
+    in
+    let pend_y = ref (n <= 1 || range_accepted y_min y_max) in
+    if !pend_x || !pend_y then begin
+      if (not !pend_x) && state.x = None then pend_x := true;
+      if (not !pend_y) && (state.y = None || !pend_x) then pend_y := true;
+      if !pend_x then begin
+        state.x <- Some x_req;
+        if n > 0 then begin
+          let end_ = n - 1 in
+          lo := nearest xs x_min 0 end_;
+          hi := nearest xs x_max 0 end_;
+          if !hi > !lo + 1 then begin
+            if num xs !lo < x_min then incr lo;
+            if num xs !hi > x_max then decr hi
+          end
+        end
+      end;
+      if !pend_y then state.y <- Some y_req
+    end;
+    (Option.value state.x ~default:(0., 0.), Option.value state.y ~default:(0., 0.), !lo, !hi)
+
+  let frame canvas ctx f span ratio state =
     (* The adapter passes CSS sizes; uPlot multiplies them back by pxRatio. *)
     let size = H.field f "size" in
     let w = num size 0 /. ratio and h = num size 1 /. ratio in
     H.set_number canvas "width" (H.round (w *. ratio));
     H.set_number canvas "height" (H.round (h *. ratio));
-    let x = scale (H.field f "xRange") ~css:w ~ratio ~vertical:false in
-    let y = scale (H.field f "yRange") ~css:h ~ratio ~vertical:true in
     let data = H.field f "data" in
     let xs = H.at data 0 in
+    let xr = H.field f "xRange" and yr = H.field f "yRange" in
+    let x_bounds, y_bounds, lo, hi =
+      apply_scales state xs (num xr 0, num xr 1) (num yr 0, num yr 1)
+    in
+    let x = scale x_bounds ~css:w ~ratio ~vertical:false in
+    let y = scale y_bounds ~css:h ~ratio ~vertical:true in
     let paths = H.array () in
     for i = 1 to H.len data - 1 do
       (* drawSeries runs only with data; the adapter then reports an empty trace. *)
@@ -270,11 +372,6 @@ module Make (H : Host) = struct
          else pair (H.array ()) (if span then H.null else H.array ()))
     done;
     let end_ = H.len xs - 1 in
-    let lo = ref (nearest xs x.min 0 end_) and hi = ref (nearest xs x.max 0 end_) in
-    if !hi > !lo + 1 then begin
-      if num xs !lo < x.min then incr lo;
-      if num xs !hi > x.max then decr hi
-    end;
     let probes = H.field f "probes" and answers = H.array () in
     for i = 0 to H.len probes - 1 do
       let q = H.at probes i in
@@ -283,7 +380,7 @@ module Make (H : Host) = struct
       H.push result (precise (value x px));
       H.push result (precise (value y (num q 3)));
       H.push result (H.number (float_of_int (nearest xs xv 0 end_)));
-      H.push result (H.number (float_of_int (nearest xs (value x px) !lo !hi)));
+      H.push result (H.number (float_of_int (nearest xs (value x px) lo hi)));
       H.push answers result
     done;
     let out = pair (H.field canvas "width") (H.field canvas "height") in
@@ -296,8 +393,9 @@ module Make (H : Host) = struct
     let ratio = H.pixel_ratio () in
     let span = H.bool (H.field input "spanGaps") in
     let frames = H.field input "frames" and out = H.array () in
+    let state = { x = None; y = None } in
     for i = 0 to H.len frames - 1 do
-      H.push out (frame canvas ctx (H.at frames i) span ratio)
+      H.push out (frame canvas ctx (H.at frames i) span ratio state)
     done;
     out
 

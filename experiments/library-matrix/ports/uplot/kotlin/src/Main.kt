@@ -23,7 +23,7 @@ private fun precise(value: Double): Double {
 }
 
 /** One frame: setSize, setData and setScale in a batch, then the recorded paths and the probes. */
-private fun frame(canvas: Canvas, ctx: Context2D, spanGaps: Boolean, f: Frame, pxRatio: Double): Array<Any?> {
+private fun frame(canvas: Canvas, ctx: Context2D, spanGaps: Boolean, f: Frame, pxRatio: Double, state: ScaleState): Array<Any?> {
     // The adapter passes CSS sizes; uPlot multiplies them back by pxRatio.
     val widthCss = f.size[0] / pxRatio
     val heightCss = f.size[1] / pxRatio
@@ -32,7 +32,7 @@ private fun frame(canvas: Canvas, ctx: Context2D, spanGaps: Boolean, f: Frame, p
     canvas.height = JsMath.round(heightCss * pxRatio)
 
     val xs = f.data[0].unsafeCast<Array<Double>>()
-    val chart = Chart(plot, Scale(f.xRange[0], f.xRange[1]), Scale(f.yRange[0], f.yRange[1]), xs)
+    val chart = state.applyScales(plot, Scale(f.xRange[0], f.xRange[1]), Scale(f.yRange[0], f.yRange[1]), xs)
     val series = f.data.drop(1)
 
     // drawSeries runs only with data; the adapter then reports an empty trace for each series.
@@ -66,7 +66,8 @@ fun run(input: Input): Array<Array<Any?>> {
     document.body.appendChild(canvas)
     try {
         val ctx = canvas.getContext("2d")
-        return input.frames.map { frame(canvas, ctx, input.spanGaps, it, pxRatio) }.toTypedArray()
+        val state = ScaleState()
+        return input.frames.map { frame(canvas, ctx, input.spanGaps, it, pxRatio, state) }.toTypedArray()
     } finally {
         canvas.remove()
     }

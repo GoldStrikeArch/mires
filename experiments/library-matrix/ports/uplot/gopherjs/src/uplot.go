@@ -16,7 +16,9 @@ const epsilon = 0x1p-52
 
 // round is JS Math.round: the nearest integer, halves toward +Inf, and -0 for a negative value
 // that rounds to zero. math.Round rounds halves away from zero, and floor(x+0.5) is wrong for
-// 0.49999999999999994 and for odd integers past 2^52. x-floor(x) is exact for every float64.
+// 0.49999999999999994 and for odd integers past 2^52. By Sterbenz's lemma x-floor(x) is exact for
+// x >= 0 and x <= -0.5; for x in (-0.5, 0) it can round up to 1 (e.g. -2^-60 + 1 == 1), which
+// still increments r from -1 to 0 and returns -0 via the sign check, matching Math.round.
 func round(x float64) float64 {
 	r := math.Floor(x)
 	if x-r >= 0.5 {
@@ -64,22 +66,89 @@ func decimalsBeforeRun(s string) (int, bool) {
 	return 0, false
 }
 
+func findNegExp(s string) int {
+	for i := 0; i+1 < len(s); i++ {
+		if s[i] == 'e' && s[i+1] == '-' {
+			return i
+		}
+	}
+	return -1
+}
+
 // fixFloat snaps a value whose JS string has a run of six or more 9s or 0s after the point to the
-// decimals before the run (17999.204999999998 becomes 17999.205). uPlot first returns members of
-// its fixedDec map unchanged; the string path returns every member unchanged too. Its branch for
-// strings with "e-" (values below 1e-6) is not reached by plot sizes of 1 px or more.
+// decimals before the run (17999.204999999998 becomes 17999.205), handling "e-" exponent strings
+// by rounding the mantissa. uPlot first returns members of its fixedDec map unchanged; the string
+// path returns every member unchanged too.
 func fixFloat(val float64) float64 {
 	if isInt(val) {
 		return val
 	}
-	dec, ok := decimalsBeforeRun(jsString(val))
+	str := jsString(val)
+	dec, ok := decimalsBeforeRun(str)
 	if !ok {
 		return val
+	}
+	if ePos := findNegExp(str); ePos != -1 {
+		mant := jsNumber(str[:ePos])
+		return jsNumber(jsString(roundDec(mant, dec)) + str[ePos:])
 	}
 	return roundDec(val, dec)
 }
 
-func incrRound(num, incr float64) float64 { return fixFloat(roundDec(fixFloat(num/incr), 0) * incr) }
+func incrRound(num, incr float64) float64   { return fixFloat(roundDec(fixFloat(num/incr), 0) * incr) }
+func incrRoundUp(num, incr float64) float64 { return fixFloat(math.Ceil(fixFloat(num/incr)) * incr) }
+func incrRoundDn(num, incr float64) float64 { return fixFloat(math.Floor(fixFloat(num/incr)) * incr) }
+
+// rangeNum is uPlot's rangeNum(min, max, 0.1, true): used by autoScaleX when all x values are equal.
+func rangeNum(minV, maxV float64) (float64, float64) {
+	delta := maxV - minV
+	scalarMax := math.Max(math.Abs(minV), math.Abs(maxV))
+	if delta < 1e-24 || math.Abs(jsLog10(scalarMax)-jsLog10(delta)) > 10 {
+		delta = 0
+		if minV == 0 || maxV == 0 {
+			delta = 1e-24
+		}
+	}
+	nonZeroDelta := delta
+	if nonZeroDelta == 0 {
+		if scalarMax != 0 {
+			nonZeroDelta = scalarMax
+		} else {
+			nonZeroDelta = 1e3
+		}
+	}
+	base := math.Pow(10, math.Floor(jsLog10(nonZeroDelta)))
+	padMinFactor := 0.1
+	if delta == 0 && minV != 0 {
+		padMinFactor = 1
+	}
+	newMin := roundDec(incrRoundDn(minV-nonZeroDelta*padMinFactor, base/10), 24)
+	softMin := math.Inf(1)
+	if minV >= 0 && newMin <= 0 {
+		softMin = 0
+	}
+	minLim := math.Min(softMin, newMin)
+	if newMin < softMin && minV >= softMin {
+		minLim = softMin
+	}
+	padMaxFactor := 0.1
+	if delta == 0 && maxV != 0 {
+		padMaxFactor = 1
+	}
+	newMax := roundDec(incrRoundUp(maxV+nonZeroDelta*padMaxFactor, base/10), 24)
+	softMax := math.Inf(-1)
+	if maxV <= 0 && newMax >= 0 {
+		softMax = 0
+	}
+	maxLim := math.Max(softMax, newMax)
+	if newMax > softMax && maxV <= softMax {
+		maxLim = softMax
+	}
+	if minLim == maxLim && minLim == 0 {
+		maxLim = 100
+	}
+	return minLim, maxLim
+}
 
 // closestIdx is the index of the value in arr closest to num. JS `lo || 0` and
 // `hi || arr.length - 1` make a zero hi the last index.
@@ -124,6 +193,11 @@ func newPlot(pxRatio, widthCss, heightCss float64) plot {
 	return p
 }
 
+// scaleState persists x and y scale bounds across frames for uPlot's setScale (< 1e-16) guard.
+type scaleState struct {
+	x, y *scale
+}
+
 // chart is one frame's chart: what uPlot's valToPos, posToVal, valToIdx and posToIdx read.
 type chart struct {
 	plot plot
@@ -133,22 +207,65 @@ type chart struct {
 	i0, i1 int
 }
 
-func newChart(p plot, x, y scale, xs []float64) *chart {
-	u := &chart{plot: p, x: x, y: y, xs: xs}
-	if len(xs) > 0 {
-		u.i0 = closestIdx(x.min, xs, 0, 0)
-		u.i1 = closestIdx(x.max, xs, 0, 0)
-		// Don't contract same or adjacent indices; the closest ones can be outside the view.
-		if u.i1-u.i0 > 1 {
-			if xs[u.i0] < x.min {
-				u.i0++
-			}
-			if xs[u.i1] > x.max {
-				u.i1--
+// applyScales mirrors setData -> autoScaleX, explicit setScale('x'/'y'), and commit -> setScales.
+// Unset scales default to scale{0, 0}, matching JS arithmetic on null scale bounds.
+func (st *scaleState) applyScales(p plot, xReq, yReq scale, xs []float64) *chart {
+	n := len(xs)
+	lo, hi := 0, 0
+	if n > 0 {
+		hi = n - 1
+	}
+	pendX := true
+	if n > 1 && xReq.max-xReq.min < 1e-16 {
+		aMin, aMax := xs[0], xs[n-1]
+		if aMin == aMax {
+			aMin, aMax = rangeNum(aMin, aMax)
+		}
+		if aMin > aMax {
+			aMin, aMax = aMax, aMin
+		}
+		pendX = !(aMax-aMin < 1e-16)
+	}
+	pendY := !(n > 1 && yReq.max-yReq.min < 1e-16)
+
+	if pendX || pendY {
+		if !pendX && st.x == nil {
+			pendX = true
+		}
+		if !pendY && (st.y == nil || pendX) {
+			pendY = true
+		}
+		if pendX {
+			sx := xReq
+			st.x = &sx
+			if n > 0 {
+				lo = closestIdx(xReq.min, xs, 0, 0)
+				hi = closestIdx(xReq.max, xs, 0, 0)
+				// Don't contract same or adjacent indices; the closest ones can be outside the view.
+				if hi-lo > 1 {
+					if xs[lo] < xReq.min {
+						lo++
+					}
+					if xs[hi] > xReq.max {
+						hi--
+					}
+				}
 			}
 		}
+		if pendY {
+			sy := yReq
+			st.y = &sy
+		}
 	}
-	return u
+
+	var activeX, activeY scale
+	if st.x != nil {
+		activeX = *st.x
+	}
+	if st.y != nil {
+		activeY = *st.y
+	}
+	return &chart{plot: p, x: activeX, y: activeY, xs: xs, i0: lo, i1: hi}
 }
 
 // valToPosX is getHPos (ori 0, dir 1) in canvas pixels: valToPos(v, "x", true).

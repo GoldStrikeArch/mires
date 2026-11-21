@@ -82,6 +82,54 @@ add('dpr-canvas-roundtrip',false,
   plain([25.5,29.5],[0,7],[0,8],[[0,2,3,7],[1,4,null,6]],[[3,4,12,14]]))
 add('dpr-probe-roundtrip',false,plain([122.88,40],[0,1000],[0,1000],[[0,250,500,1000],[0,750,null,1000]],[[500,500,3,3]]))
 
+// Re-review (re-uplot) regressions: overflowing finite scale bounds (NaN pixels in dense
+// decimation and gap scans) and uPlot's < 1e-16 setScale range guard across frames.
+add('overflow-range',false,plain([64,40],[-1e308,1e308],[-1.5e308,1.5e308],
+  [[-1e308,0,1e308],[1e308,null,-1e308]],[[0,0,32,20],[1e308,-1e308,-1,41]]))
+const ox = lin(300).map(i => 9e307 + i * 2e304)
+add('dense-overflow-nan',false,plain([16,24],[-1e308,1e308],[-8,8],
+  [ox,ox.map((_, i) => i % 7 === 3 ? null : (i * 5) % 17 - 8)],[[1e308,0,8,12]]))
+add('dense-overflow-nan-span',true,plain([16,24],[-1e308,1e308],[-8,8],
+  [ox,ox.map((_, i) => i % 7 === 3 ? null : (i * 5) % 17 - 8)],[[1e308,0,8,12]]))
+const oy = lin(300).map(i => -1e308 + i * 6e305)
+add('dense-overflow-mixed',false,plain([16,24],[-1e308,1e308],[-8,8],
+  [oy,oy.map((_, i) => (i * 5) % 17 - 8)],[[0,0,8,12]]))
+add('tiny-range',false,
+  plain([40,20],[0,4],[0,4],[lin(5),[0,1,2,3,4]],[[2,2,20,10]]),
+  plain([40,20],[0,1e-17],[0,4],[[0,5e-18,1e-17],[1,2,3]],[[5e-18,2,20,10]]))
+add('tiny-range-recover',false,
+  plain([40,20],[0,4],[0,4],[lin(5),[0,1,2,3,4]],[[2,2,20,10]]),
+  plain([40,20],[0,1e-17],[0,4],[[0,5e-18,1e-17],[1,2,3]],[[5e-18,2,20,10]]),
+  plain([40,20],[0,10],[0,8],[[0,2,5,10],[0,4,null,8]],[[5,4,20,10]]))
+add('tiny-range-y',false,
+  plain([40,20],[0,4],[0,4],[lin(5),[0,1,2,3,4]],[[2,2,20,10]]),
+  plain([40,20],[0,4],[0,5e-17],[lin(5),[0,1e-17,2e-17,3e-17,5e-17]],[[2,1e-17,20,10]]))
+add('tiny-range-wide-data',false,
+  plain([40,20],[0,4],[0,4],[lin(5),[0,1,2,3,4]],[[2,2,20,10]]),
+  plain([40,20],[0,1e-17],[0,4],[lin(5),[1,2,3,2,1]],[[5e-18,2,20,10]]))
+add('tiny-data-normal-range',false,
+  plain([40,20],[0,4],[0,4],[lin(5),[0,1,2,3,4]],[[2,2,20,10]]),
+  plain([40,20],[0,4],[0,4],[[0,5e-18,1e-17],[1,2,3]],[[5e-18,2,20,10]]))
+add('tiny-single-frame',false,
+  plain([40,20],[0,1e-17],[0,4],[[0,5e-18,1e-17],[1,2,3]],[[5e-18,2,20,10]]))
+add('tiny-single-frame-both',false,
+  plain([40,20],[0,1e-17],[0,1e-17],[[0,5e-18,1e-17],[0,null,1e-17]],[[0,0,20,10],[5e-18,5e-18,-5,-5]]),
+  plain([40,20],[0,1e-17],[0,4],[[0,5e-18,1e-17],[1,2,3]],[[5e-18,2,20,10]]),
+  plain([40,20],[0,4],[0,4],[lin(5),[0,1,2,3,4]],[[2,2,20,10]]))
+add('tiny-range-both-recover',false,
+  plain([40,20],[0,4],[0,4],[lin(5),[0,1,2,3,4]],[[2,2,20,10]]),
+  plain([40,20],[0,1e-17],[0,1e-17],[[0,5e-18,1e-17],[0,5e-18,1e-17]],[[5e-18,5e-18,20,10]]),
+  plain([40,20],[0,10],[0,8],[[0,2,5,10],[0,4,null,8]],[[5,4,20,10]]))
+add('tiny-range-flat-x',false,
+  plain([40,20],[0,4],[0,4],[lin(5),[0,1,2,3,4]],[]),
+  plain([40,20],[0,9e-17],[0,4],[[4.9500000499999994e-17,4.9500000499999994e-17,4.9500000499999994e-17],[1,2,3]],[[4.95e-17,2,20,10]]),
+  plain([40,20],[0,9e-17],[0,4],[[4.95000005e-17,4.95000005e-17,4.95000005e-17],[1,2,3]],[[4.95e-17,2,20,10]]),
+  plain([40,20],[0,1e-17],[0,4],[[0,0,0],[1,2,3]],[[5e-18,2,20,10]]))
+add('tiny-range-exact-1e-16',false,
+  plain([40,20],[0,4],[0,4],[lin(5),[0,1,2,3,4]],[]),
+  plain([40,20],[0,9.999999999999999e-17],[0,4],[[0,9.999999999999999e-17],[1,2]],[[0,2,20,10]]),
+  plain([40,20],[0,1e-16],[0,4],[[0,1e-16],[1,2]],[[0,2,20,10]]))
+
 // JSON.stringify writes -0 as 0, so the negative-zero cases above pass through a marker.
 const text = JSON.stringify({schema:1,library:'uplot',cases}, (_, value) => Object.is(value, -0) ? 'NEGATIVE_ZERO' : value)
 writeFileSync(new URL('corpus.json',import.meta.url), text.replaceAll('"NEGATIVE_ZERO"', '-0')+'\n')

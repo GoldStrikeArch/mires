@@ -30,12 +30,19 @@ allows; only the `Host` module and the entry differ.
 
 ## Numeric semantics
 
-- **Host numbers.** `Math.round` (halves toward +∞), `Number.isInteger` and `String()` come from
-  the host; `**` is `Math.pow`, `mod_float` is JS `%`, and `epsilon` is `Number.EPSILON`.
+- **Host numbers.** `Math.round` (halves toward +∞), `Math.log10`, `Number.isInteger`, `String()`
+  and `Number()` come from the host; `**` is `Math.pow`, `mod_float` is JS `%`, and `epsilon` is
+  `Number.EPSILON`.
 - **fixFloat.** The JS string comes from the host. `decimals_before_run` scans the digits after
   the point for uPlot's `/\.\d*?(?=9{6,}|0{6,})/`: the first position where six 9s or six 0s
-  begin. A scan in the shared source, rather than each compiler's own `RegExp` binding, keeps
-  `chart.ml` identical for both.
+  begin. Strings containing `e-` round the mantissa at that precision and reattach the exponent,
+  as upstream does (reached by `rangeNum` on tiny flat x data). A scan in the shared source,
+  rather than each compiler's own `RegExp` binding, keeps `chart.ml` identical for both.
+- **Scale range guard (`< 1e-16`).** `scale_state` carries `x` and `y` bounds across frames within
+  a call, mirroring `setData` → `autoScaleX` (including `rangeNum(v, v, 0.1, true)` for flat x
+  data), explicit `setScale('x'/'y')`, and `_commit` → `setScales`. Unset scales default to
+  `(0., 0.)`, matching JS arithmetic on `null`. `range_accepted` checks `Float.is_nan d || d >= 1e-16`
+  because Melange rewrites `not (a < b)` to `a >= b`.
 - **The plot offset.** `pixel` keeps uPlot's `off + dim * pct`; the offset is
   `incr_round (0 *. ratio) 0.5`, +0, so an x value of −0 gives pixel 0, as in uPlot (review b10).
   `value` divides by the ratio and the CSS size, as `posToVal` does; the CSS offset it would
@@ -52,8 +59,10 @@ adapter's stroke, with no fill, bands or points; there are no axes, padding, cur
 
 - **Decimation.** A `bucket` holds a pixel column's first, last, lowest and highest values, which
   is uPlot's `inY`, `outY`, `minY` and `maxY` while `minY != null`; the `bucket option` is `None`
-  exactly when `minY` is null. The column advances when an x value reaches `limit`, uPlot's
-  `nextAccXVal`, and its pixel differs.
+  exactly when `minY` is null. The column advances when `Float.is_nan !limit || xv >= !limit`
+  (explicitly testing `Float.is_nan` because Melange rewrites `not (xv < !limit)` to `xv >= !limit`,
+  matching uPlot's `!(xVal < nextAccXVal)` on `NaN` limits from overflowing scales) and its pixel
+  differs.
 - **Gaps.** An inline scan of the trimmed series replaces `hasGap` and `findGaps`. With direction 1
   and `alignGaps` 0, `findGaps` spans each run of nulls from the pixel of the value before it to the
   pixel of the value after it, and so does the scan.
@@ -70,8 +79,6 @@ adapter's stroke, with no fill, bands or points; there are no axes, padding, cur
 - **fixedDec.** `fixFloat` first returns a value of uPlot's `fixedDec` map unchanged. That lookup
   is left out: the review checked that the string path returns each of the map's 358 members
   unchanged too.
-- **Exponent strings.** `fixFloat`'s branch for strings containing `e-` (values below 1e-6) is
-  left out. Plot sizes of one pixel or more never reach it (CONTRACT.md).
 
 ## Module state
 

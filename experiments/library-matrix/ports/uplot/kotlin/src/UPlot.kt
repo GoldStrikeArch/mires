@@ -4,7 +4,11 @@
 // ori 0 and the y scale ori 1, both dir 1, and the series has pxAlign 1, alignGaps 0, width 1,
 // no fill, no bands and no points.
 
+import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.pow
 
 /** Number.EPSILON, 2^-52. */
@@ -26,17 +30,51 @@ private val regex6 = Regex("""\.\d*?(?=9{6,}|0{6,})""")
 
 /**
  * fixFloat: snaps a value whose JS string has a run of six or more 9s or 0s after the point to the
- * decimals before the run (17999.204999999998 becomes 17999.205). uPlot first returns members of
- * its fixedDec map unchanged; the string path returns every member unchanged too. Its branch for
- * strings with `e-` (values below 1e-6) is not reached by plot sizes of 1 px or more.
+ * decimals before the run (17999.204999999998 becomes 17999.205), handling `e-` exponent strings
+ * by rounding the mantissa. uPlot first returns members of its fixedDec map unchanged; the string
+ * path returns every member unchanged too.
  */
 internal fun fixFloat(value: Double): Double {
     if (isInt(value)) return value
-    val match = regex6.find(value.toString()) ?: return value
-    return roundDec(value, match.value.length - 1)
+    val str = value.toString()
+    val match = regex6.find(str) ?: return value
+    val dec = match.value.length - 1
+    val ePos = str.indexOf("e-")
+    if (ePos != -1) {
+        val mant = str.substring(0, ePos).toDouble()
+        val exp = str.substring(ePos)
+        return (roundDec(mant, dec).toString() + exp).toDouble()
+    }
+    return roundDec(value, dec)
 }
 
 internal fun incrRound(num: Double, incr: Double) = fixFloat(roundDec(fixFloat(num / incr)) * incr)
+
+internal fun incrRoundUp(num: Double, incr: Double) = fixFloat(ceil(fixFloat(num / incr)) * incr)
+
+internal fun incrRoundDn(num: Double, incr: Double) = fixFloat(floor(fixFloat(num / incr)) * incr)
+
+/** uPlot's rangeNum(min, max, 0.1, true): used by autoScaleX when all x values are equal. */
+internal fun rangeNum(minV: Double, maxV: Double): Pair<Double, Double> {
+    var delta = maxV - minV
+    val scalarMax = max(abs(minV), abs(maxV))
+    if (delta < 1e-24 || abs(JsMath.log10(scalarMax) - JsMath.log10(delta)) > 10.0) {
+        delta = 0.0
+        if (minV == 0.0 || maxV == 0.0) delta = 1e-24
+    }
+    val nonZeroDelta = if (delta != 0.0) delta else if (scalarMax != 0.0) scalarMax else 1e3
+    val base = 10.0.pow(floor(JsMath.log10(nonZeroDelta)))
+    val padMin = nonZeroDelta * if (delta == 0.0) (if (minV == 0.0) 0.1 else 1.0) else 0.1
+    val newMin = roundDec(incrRoundDn(minV - padMin, base / 10.0), 24)
+    val softMin = if (minV >= 0.0 && newMin <= 0.0) 0.0 else Double.POSITIVE_INFINITY
+    val minLim = if (newMin < softMin && minV >= softMin) softMin else min(softMin, newMin)
+    val padMax = nonZeroDelta * if (delta == 0.0) (if (maxV == 0.0) 0.1 else 1.0) else 0.1
+    val newMax = roundDec(incrRoundUp(maxV + padMax, base / 10.0), 24)
+    val softMax = if (maxV <= 0.0 && newMax >= 0.0) 0.0 else Double.NEGATIVE_INFINITY
+    var maxLim = if (newMax > softMax && maxV <= softMax) softMax else max(softMax, newMax)
+    if (minLim == maxLim && minLim == 0.0) maxLim = 100.0
+    return Pair(minLim, maxLim)
+}
 
 /**
  * closestIdx: the index of the value in `arr` closest to `num`. JS `lo || 0` and
@@ -73,27 +111,65 @@ internal class Plot(val pxRatio: Double, val widthCss: Double, val heightCss: Do
     val height = incrRound(heightCss * pxRatio, 0.5)
 }
 
-/** One frame's chart: what uPlot's valToPos, posToVal, valToIdx and posToIdx read. */
-internal class Chart(val plot: Plot, val x: Scale, val y: Scale, val xs: Array<Double>) {
-    // setScales' visible window. With no data uPlot leaves it null, which closestIdx reads as 0.
-    private val i0: Int
-    private val i1: Int
+/** Persistent scale bounds across frames for uPlot's setScale (< 1e-16) guard. */
+internal class ScaleState {
+    var x: Scale? = null
+    var y: Scale? = null
 
-    init {
-        var first = 0
-        var last = 0
-        if (xs.isNotEmpty()) {
-            first = closestIdx(x.min, xs)
-            last = closestIdx(x.max, xs)
-            // Don't contract same or adjacent indices; the closest ones can be outside the view.
-            if (last - first > 1) {
-                if (xs[first] < x.min) first++
-                if (xs[last] > x.max) last--
+    /**
+     * Mirrors setData -> autoScaleX, explicit setScale("x"/"y"), and commit -> setScales.
+     * Unset scales default to Scale(0.0, 0.0), matching JS arithmetic on null scale bounds.
+     */
+    fun applyScales(plot: Plot, xReq: Scale, yReq: Scale, xs: Array<Double>): Chart {
+        val n = xs.size
+        var lo = 0
+        var hi = if (n > 0) n - 1 else 0
+        var pendX = true
+        if (n > 1 && xReq.max - xReq.min < 1e-16) {
+            var aMin = xs[0]
+            var aMax = xs[n - 1]
+            if (aMin == aMax) {
+                val (rMin, rMax) = rangeNum(aMin, aMax)
+                aMin = rMin
+                aMax = rMax
             }
+            if (aMin > aMax) {
+                val tmp = aMin
+                aMin = aMax
+                aMax = tmp
+            }
+            pendX = !(aMax - aMin < 1e-16)
         }
-        i0 = first
-        i1 = last
+        var pendY = !(n > 1 && yReq.max - yReq.min < 1e-16)
+
+        if (pendX || pendY) {
+            if (!pendX && x == null) pendX = true
+            if (!pendY && (y == null || pendX)) pendY = true
+            if (pendX) {
+                x = xReq
+                if (n > 0) {
+                    lo = closestIdx(xReq.min, xs)
+                    hi = closestIdx(xReq.max, xs)
+                    // Don't contract same or adjacent indices; the closest ones can be outside the view.
+                    if (hi - lo > 1) {
+                        if (xs[lo] < xReq.min) lo++
+                        if (xs[hi] > xReq.max) hi--
+                    }
+                }
+            }
+            if (pendY) y = yReq
+        }
+
+        return Chart(plot, x ?: Scale(0.0, 0.0), y ?: Scale(0.0, 0.0), xs, lo, hi)
     }
+}
+
+/** One frame's chart: what uPlot's valToPos, posToVal, valToIdx and posToIdx read. */
+internal class Chart(
+    val plot: Plot, val x: Scale, val y: Scale, val xs: Array<Double>,
+    // setScales' visible window. With no data uPlot leaves it null, which closestIdx reads as 0.
+    private val i0: Int, private val i1: Int,
+) {
 
     /** getHPos (ori 0, dir 1) in canvas pixels: valToPos(value, "x", true). */
     fun valToPosX(value: Double) = plot.left + plot.width * x.valToPct(value)

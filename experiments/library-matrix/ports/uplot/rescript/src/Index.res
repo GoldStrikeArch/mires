@@ -27,8 +27,15 @@ type element
 @send external clip: (ctx, path) => unit = "clip"
 @send external stroke: (ctx, path) => unit = "stroke"
 @val external round: float => float = "Math.round"
+@val external floor: float => float = "Math.floor"
+@val external ceil: float => float = "Math.ceil"
 @val external pow: (float, float) => float = "Math.pow"
+@val external log10: float => float = "Math.log10"
+@val external abs: float => float = "Math.abs"
+@val external jsMin: (float, float) => float = "Math.min"
+@val external jsMax: (float, float) => float = "Math.max"
 @val external isInteger: float => bool = "Number.isInteger"
+@val external parseFloat: string => float = "Number"
 type value
 external cast: 'a => value = "%identity"
 type frame = {
@@ -48,20 +55,65 @@ let roundDec = (v, ~dec=0) =>
     round(v *. p *. (1. +. Float.Constants.epsilon)) /. p
   }
 // uPlot's fixFloat: snaps a value whose JS string has a run of six or more 9s or 0s after the
-// point to the decimals before the run. uPlot first returns members of its fixedDec map unchanged;
-// the string path returns every member unchanged too. Its branch for strings with "e-" (values
-// below 1e-6) is not reached by plot sizes of 1 px or more.
+// point to the decimals before the run, handling "e-" exponent strings by rounding the mantissa.
+// uPlot first returns members of its fixedDec map unchanged; the string path returns every member
+// unchanged too.
 let regex6 = %re("/\.\d*?(?=9{6,}|0{6,})/")
 let fixFloat = v =>
   if isInteger(v) {
     v
   } else {
-    switch regex6->RegExp.exec(Float.toString(v)) {
-    | Some(m) => roundDec(v, ~dec=String.length(RegExp.Result.fullMatch(m)) - 1)
+    let str = Float.toString(v)
+    switch regex6->RegExp.exec(str) {
+    | Some(m) => {
+        let dec = String.length(RegExp.Result.fullMatch(m)) - 1
+        let ePos = String.indexOf(str, "e-")
+        if ePos != -1 {
+          let mant = parseFloat(String.slice(str, ~start=0, ~end=ePos))
+          let exp = String.sliceToEnd(str, ~start=ePos)
+          parseFloat(Float.toString(roundDec(mant, ~dec)) ++ exp)
+        } else {
+          roundDec(v, ~dec)
+        }
+      }
     | None => v
     }
   }
 let incrRound = (v, incr) => fixFloat(roundDec(fixFloat(v /. incr)) *. incr)
+let incrRoundUp = (v, incr) => fixFloat(ceil(fixFloat(v /. incr)) *. incr)
+let incrRoundDn = (v, incr) => fixFloat(floor(fixFloat(v /. incr)) *. incr)
+// uPlot's rangeNum(min, max, 0.1, true): used by autoScaleX when all x values are equal.
+let rangeNum = (minV, maxV) => {
+  let delta = ref(maxV -. minV)
+  let scalarMax = jsMax(abs(minV), abs(maxV))
+  if delta.contents < 1e-24 || abs(log10(scalarMax) -. log10(delta.contents)) > 10. {
+    delta := 0.
+    if minV == 0. || maxV == 0. {
+      delta := 1e-24
+    }
+  }
+  let nonZeroDelta =
+    if delta.contents != 0. {
+      delta.contents
+    } else if scalarMax != 0. {
+      scalarMax
+    } else {
+      1e3
+    }
+  let base = pow(10., floor(log10(nonZeroDelta)))
+  let padMin = nonZeroDelta *. (delta.contents == 0. ? (minV == 0. ? 0.1 : 1.) : 0.1)
+  let newMin = roundDec(incrRoundDn(minV -. padMin, base /. 10.), ~dec=24)
+  let softMin = minV >= 0. && newMin <= 0. ? 0. : Float.Constants.positiveInfinity
+  let minLim = newMin < softMin && minV >= softMin ? softMin : jsMin(softMin, newMin)
+  let padMax = nonZeroDelta *. (delta.contents == 0. ? (maxV == 0. ? 0.1 : 1.) : 0.1)
+  let newMax = roundDec(incrRoundUp(maxV +. padMax, base /. 10.), ~dec=24)
+  let softMax = maxV <= 0. && newMax >= 0. ? 0. : Float.Constants.negativeInfinity
+  let maxLim = ref(newMax > softMax && maxV <= softMax ? softMax : jsMax(softMax, newMax))
+  if minLim == maxLim.contents && minLim == 0. {
+    maxLim := 100.
+  }
+  (minLim, maxLim.contents)
+}
 // One axis of the plot: the scale range, calcSize's offset and size in canvas pixels, and the CSS
 // size uPlot was given (the adapter divides the physical size by pxRatio).
 type scale = {
@@ -74,9 +126,9 @@ type scale = {
   vertical: bool,
 }
 let elt = Array.getUnsafe
-let scale = (range, css, ratio, vertical) => {
-  low: elt(range, 0),
-  high: elt(range, 1),
+let scale = ((low, high), css, ratio, vertical) => {
+  low,
+  high,
   off: incrRound(0. *. ratio, 0.5),
   dim: incrRound(css *. ratio, 0.5),
   css,
@@ -151,7 +203,9 @@ let render = (ctx, x, y, xs, ys, span) => {
     let bucket = ref(None)
     for i in first.contents to last.contents {
       let xv = number(xs, i)
-      if dense && xv >= limit.contents {
+      // ReScript rewrites `!(xv < limit)` to `xv >= limit`, which is false when limit is NaN.
+      // Test Float.isNaN explicitly so NaN starts a new column, matching uPlot's `!(xVal < nextAccXVal)`.
+      if dense && (Float.isNaN(limit.contents) || xv >= limit.contents) {
         let next = round(pixel(x, xv))
         if next != col.contents {
           bucket.contents->Option.forEach(finish(col.contents, _))
@@ -244,15 +298,82 @@ let render = (ctx, x, y, xs, ys, span) => {
   }
   [cast(points), span ? cast(Nullable.null) : cast(gaps)]
 }
-let drawFrame = (canvas, ctx, f, span, ratio) => {
+// Persistent scale bounds across frames for uPlot's setScale (< 1e-16) guard.
+type scaleState = {
+  mutable x: option<(float, float)>,
+  mutable y: option<(float, float)>,
+}
+let rangeAccepted = (lo, hi) => {
+  let d = hi -. lo
+  Float.isNaN(d) || d >= 1e-16
+}
+let applyScales = (state, xs, xReq, yReq) => {
+  let n = Array.length(xs)
+  let lo = ref(0)
+  let hi = ref(n > 0 ? n - 1 : 0)
+  let (xMin, xMax) = xReq
+  let (yMin, yMax) = yReq
+  let pendX = ref(
+    if n <= 1 || rangeAccepted(xMin, xMax) {
+      true
+    } else {
+      let a0 = number(xs, 0)
+      let a1 = number(xs, n - 1)
+      let (r0, r1) = a0 == a1 ? rangeNum(a0, a1) : (a0, a1)
+      let (loA, hiA) = r0 > r1 ? (r1, r0) : (r0, r1)
+      rangeAccepted(loA, hiA)
+    },
+  )
+  let pendY = ref(n <= 1 || rangeAccepted(yMin, yMax))
+  if pendX.contents || pendY.contents {
+    if !pendX.contents && state.x == None {
+      pendX := true
+    }
+    if !pendY.contents && (state.y == None || pendX.contents) {
+      pendY := true
+    }
+    if pendX.contents {
+      state.x = Some(xReq)
+      if n > 0 {
+        let endIndex = n - 1
+        lo := nearest(xs, xMin, 0, endIndex)
+        hi := nearest(xs, xMax, 0, endIndex)
+        if hi.contents > lo.contents + 1 {
+          if number(xs, lo.contents) < xMin {
+            lo := lo.contents + 1
+          }
+          if number(xs, hi.contents) > xMax {
+            hi := hi.contents - 1
+          }
+        }
+      }
+    }
+    if pendY.contents {
+      state.y = Some(yReq)
+    }
+  }
+  (
+    state.x->Option.getOr((0., 0.)),
+    state.y->Option.getOr((0., 0.)),
+    lo.contents,
+    hi.contents,
+  )
+}
+let drawFrame = (canvas, ctx, f, span, ratio, state) => {
   // The adapter passes CSS sizes; uPlot multiplies them back by pxRatio.
   let w = elt(f.size, 0) /. ratio
   let h = elt(f.size, 1) /. ratio
   width(canvas, round(w *. ratio))
   height(canvas, round(h *. ratio))
-  let x = scale(f.xRange, w, ratio, false)
-  let y = scale(f.yRange, h, ratio, true)
   let xs = elt(f.data, 0)
+  let (xBounds, yBounds, lo, hi) = applyScales(
+    state,
+    xs,
+    (elt(f.xRange, 0), elt(f.xRange, 1)),
+    (elt(f.yRange, 0), elt(f.yRange, 1)),
+  )
+  let x = scale(xBounds, w, ratio, false)
+  let y = scale(yBounds, h, ratio, true)
   // drawSeries runs only with data; the adapter then reports an empty trace for each series.
   let paths = Array.fromInitializer(~length=Array.length(f.data) - 1, i =>
     Array.length(xs) > 0
@@ -260,16 +381,6 @@ let drawFrame = (canvas, ctx, f, span, ratio) => {
       : [cast([]), span ? cast(Nullable.null) : cast([])]
   )
   let endIndex = Array.length(xs) - 1
-  let lo = ref(nearest(xs, x.low, 0, endIndex))
-  let hi = ref(nearest(xs, x.high, 0, endIndex))
-  if hi.contents > lo.contents + 1 {
-    if number(xs, lo.contents) < x.low {
-      lo := lo.contents + 1
-    }
-    if number(xs, hi.contents) > x.high {
-      hi := hi.contents - 1
-    }
-  }
   let probes = f.probes->Array.map(q => {
     let xv = elt(q, 0)
     let px = elt(q, 2)
@@ -279,7 +390,7 @@ let drawFrame = (canvas, ctx, f, span, ratio) => {
       precise(valueAt(x, px)),
       precise(valueAt(y, elt(q, 3))),
       Int.toFloat(nearest(xs, xv, 0, endIndex)),
-      Int.toFloat(nearest(xs, valueAt(x, px), lo.contents, hi.contents)),
+      Int.toFloat(nearest(xs, valueAt(x, px), lo, hi)),
     ]
   })
   [cast(getWidth(canvas)), cast(getHeight(canvas)), cast(paths), cast(probes)]
@@ -290,7 +401,8 @@ let run = (input: input) => {
   let result = try {
     let ctx = context(canvas, "2d")
     let ratio = pixelRatio
-    input.frames->Array.map(f => drawFrame(canvas, ctx, f, input.spanGaps, ratio))
+    let state = {x: None, y: None}
+    input.frames->Array.map(f => drawFrame(canvas, ctx, f, input.spanGaps, ratio, state))
   } catch {
   | e =>
     remove(canvas)

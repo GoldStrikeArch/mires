@@ -13,9 +13,13 @@ js_bindings! {
     #[js(call="Reflect.get")] fn prop(v:V,k:V)->V;
     #[js(call="Reflect.set")] fn put(v:V,k:V,x:V)->bool;
     #[js(call="Math.round")] fn round(x:f64)->f64;
+    #[js(call="Math.floor")] fn floor(x:f64)->f64;
+    #[js(call="Math.ceil")] fn ceil(x:f64)->f64;
     #[js(call="Math.pow")] fn pow(x:f64,y:f64)->f64;
+    #[js(call="Math.log10")] fn log10(x:f64)->f64;
     #[js(call="Number.isInteger")] fn is_int(x:f64)->bool;
     #[js(call="String")] fn string(x:f64)->V;
+    #[js(call="Number")] fn parse_num(x:V)->f64;
     #[js(index)] fn at(v:V,i:usize)->V;
     #[js(index)] fn num(v:V,i:usize)->f64;
     #[js(get="length")] fn len(v:V)->usize;
@@ -65,20 +69,105 @@ fn decimals_before_run(text: &str) -> Option<usize> {
     (0..digits.len()).find(|&k| digits[k..].starts_with("999999") || digits[k..].starts_with("000000"))
 }
 // uPlot's fixFloat: snaps a value whose JS string has a run of six or more 9s or 0s after the
-// point to the decimals before the run. uPlot first returns members of its fixedDec map
-// unchanged; the string path returns every member unchanged too. Its branch for strings with
-// "e-" (values below 1e-6) is not reached by plot sizes of 1 px or more.
+// point to the decimals before the run, handling "e-" exponent strings by rounding the mantissa.
+// uPlot first returns members of its fixedDec map unchanged; the string path returns every member
+// unchanged too.
 fn fix_float(v: f64) -> f64 {
     if is_int(v) {
         return v;
     }
-    match decimals_before_run(string(v).read::<&str>()) {
-        Some(dec) => round_dec(v, dec as i32),
-        None => v,
+    let text_v = string(v);
+    let text = text_v.read::<&str>();
+    let Some(dec) = decimals_before_run(text) else {
+        return v;
+    };
+    if let Some(e_pos) = text.find("e-") {
+        let mut exp_buf = [0u8; 16];
+        let exp_bytes = &text.as_bytes()[e_pos..];
+        let exp_len = exp_bytes.len();
+        if exp_len <= exp_buf.len() {
+            exp_buf[..exp_len].copy_from_slice(exp_bytes);
+            let mant = parse_num(s(&text[..e_pos]));
+            let rounded_v = string(round_dec(mant, dec as i32));
+            let rounded = rounded_v.read::<&str>();
+            let mut buf = [0u8; 64];
+            let n = rounded.len();
+            if n + exp_len <= buf.len() {
+                buf[..n].copy_from_slice(rounded.as_bytes());
+                buf[n..n + exp_len].copy_from_slice(&exp_buf[..exp_len]);
+                if let Ok(joined) = core::str::from_utf8(&buf[..n + exp_len]) {
+                    return parse_num(s(joined));
+                }
+            }
+        }
     }
+    round_dec(v, dec as i32)
 }
 fn incr_round(v: f64, incr: f64) -> f64 {
     fix_float(round_dec(fix_float(v / incr), 0) * incr)
+}
+fn incr_round_up(v: f64, incr: f64) -> f64 {
+    fix_float(ceil(fix_float(v / incr)) * incr)
+}
+fn incr_round_dn(v: f64, incr: f64) -> f64 {
+    fix_float(floor(fix_float(v / incr)) * incr)
+}
+fn js_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+fn js_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+// uPlot's rangeNum(min, max, 0.1, true): used by autoScaleX when all x values are equal.
+fn range_num(min: f64, max: f64) -> (f64, f64) {
+    let mut delta = max - min;
+    let scalar_max = js_max(min.abs(), max.abs());
+    if delta < 1e-24 || (log10(scalar_max) - log10(delta)).abs() > 10.0 {
+        delta = 0.0;
+        if min == 0.0 || max == 0.0 {
+            delta = 1e-24;
+        }
+    }
+    let non_zero_delta = if delta != 0.0 {
+        delta
+    } else if scalar_max != 0.0 {
+        scalar_max
+    } else {
+        1e3
+    };
+    let base = pow(10.0, floor(log10(non_zero_delta)));
+    let pad_min = non_zero_delta * if delta == 0.0 { if min == 0.0 { 0.1 } else { 1.0 } } else { 0.1 };
+    let new_min = round_dec(incr_round_dn(min - pad_min, base / 10.0), 24);
+    let soft_min = if min >= 0.0 && new_min <= 0.0 { 0.0 } else { f64::INFINITY };
+    let min_lim = if new_min < soft_min && min >= soft_min {
+        soft_min
+    } else {
+        js_min(soft_min, new_min)
+    };
+    let pad_max = non_zero_delta * if delta == 0.0 { if max == 0.0 { 0.1 } else { 1.0 } } else { 0.1 };
+    let new_max = round_dec(incr_round_up(max + pad_max, base / 10.0), 24);
+    let soft_max = if max <= 0.0 && new_max >= 0.0 { 0.0 } else { f64::NEG_INFINITY };
+    let mut max_lim = if new_max > soft_max && max <= soft_max {
+        soft_max
+    } else {
+        js_max(soft_max, new_max)
+    };
+    if min_lim == max_lim && min_lim == 0.0 {
+        max_lim = 100.0;
+    }
+    (min_lim, max_lim)
 }
 // One axis of the plot: the scale range, calcSize's offset and size in canvas pixels, and the
 // CSS size uPlot was given (the adapter divides the physical size by pxRatio).
@@ -104,16 +193,76 @@ impl Scale {
         self.min + (self.max - self.min) * (q / self.css)
     }
 }
-fn axis(frame: V, key: &str, css: f64, ratio: f64, vertical: bool) -> Scale {
-    let range = field(frame, key);
+fn axis(range: (f64, f64), css: f64, ratio: f64, vertical: bool) -> Scale {
     Scale {
-        min: num(range, 0),
-        max: num(range, 1),
+        min: range.0,
+        max: range.1,
         off: incr_round(0.0 * ratio, 0.5),
         dim: incr_round(css * ratio, 0.5),
         css,
         ratio,
         vertical,
+    }
+}
+// Persistent scale bounds across frames for uPlot's setScale (< 1e-16) guard.
+struct ScaleState {
+    x: Option<(f64, f64)>,
+    y: Option<(f64, f64)>,
+}
+impl ScaleState {
+    fn new() -> Self {
+        Self { x: None, y: None }
+    }
+    // Mirrors setData -> autoScaleX, explicit setScale('x'/'y'), and commit -> setScales.
+    // Returns the active (x, y) bounds (None behaves as (0.0, 0.0), matching JS null arithmetic)
+    // and the visible index window (lo, hi).
+    fn apply(&mut self, xs: V, x_req: (f64, f64), y_req: (f64, f64)) -> ((f64, f64), (f64, f64), isize, isize) {
+        let n = len(xs);
+        let (mut lo, mut hi) = if n > 0 { (0, n as isize - 1) } else { (0, 0) };
+        let mut pend_x = if n <= 1 || !(x_req.1 - x_req.0 < 1e-16) {
+            true
+        } else {
+            let mut a_min = num(xs, 0);
+            let mut a_max = num(xs, n - 1);
+            if a_min == a_max {
+                let (r_min, r_max) = range_num(a_min, a_max);
+                a_min = r_min;
+                a_max = r_max;
+            }
+            if a_min > a_max {
+                core::mem::swap(&mut a_min, &mut a_max);
+            }
+            !(a_max - a_min < 1e-16)
+        };
+        let mut pend_y = !(n > 1 && y_req.1 - y_req.0 < 1e-16);
+        if pend_x || pend_y {
+            if !pend_x && self.x.is_none() {
+                pend_x = true;
+            }
+            if !pend_y && (self.y.is_none() || pend_x) {
+                pend_y = true;
+            }
+            if pend_x {
+                self.x = Some(x_req);
+                if n > 0 {
+                    let last = n as isize - 1;
+                    lo = nearest(xs, x_req.0, 0, last);
+                    hi = nearest(xs, x_req.1, 0, last);
+                    if hi > lo + 1 {
+                        if num(xs, lo as usize) < x_req.0 {
+                            lo += 1;
+                        }
+                        if num(xs, hi as usize) > x_req.1 {
+                            hi -= 1;
+                        }
+                    }
+                }
+            }
+            if pend_y {
+                self.y = Some(y_req);
+            }
+        }
+        (self.x.unwrap_or((0.0, 0.0)), self.y.unwrap_or((0.0, 0.0)), lo, hi)
     }
 }
 fn nearest(xs: V, v: f64, mut lo: isize, mut hi: isize) -> isize {
@@ -200,7 +349,7 @@ fn render(ctx: V, x: &Scale, y: &Scale, xs: V, ys: V, span: bool) -> V {
         let mut bucket: Option<Bucket> = None;
         for i in first..=last {
             let xv = num(xs, i);
-            if dense && xv >= limit {
+            if dense && !(xv < limit) {
                 let next = round(x.pixel(xv));
                 if next != col {
                     if let Some(b) = bucket.take() {
@@ -302,17 +451,20 @@ fn precise(v: f64) -> V {
     let n = round(v * 1e6);
     V::erase(if n == 0.0 || n.is_nan() { 0.0 } else { n })
 }
-fn frame(canvas: V, ctx: V, f: V, span: bool, ratio: f64) -> V {
+fn frame(canvas: V, ctx: V, f: V, span: bool, ratio: f64, state: &mut ScaleState) -> V {
     // The adapter passes CSS sizes; uPlot multiplies them back by pxRatio.
     let size = field(f, "size");
     let width = num(size, 0) / ratio;
     let height = num(size, 1) / ratio;
     put(canvas, s("width"), V::erase(round(width * ratio)));
     put(canvas, s("height"), V::erase(round(height * ratio)));
-    let x = axis(f, "xRange", width, ratio, false);
-    let y = axis(f, "yRange", height, ratio, true);
     let data = field(f, "data");
     let xs = at(data, 0);
+    let xr = field(f, "xRange");
+    let yr = field(f, "yRange");
+    let (x_bounds, y_bounds, lo, hi) = state.apply(xs, (num(xr, 0), num(xr, 1)), (num(yr, 0), num(yr, 1)));
+    let x = axis(x_bounds, width, ratio, false);
+    let y = axis(y_bounds, height, ratio, true);
     let paths = array();
     for i in 1..len(data) {
         // drawSeries runs only with data; the adapter then reports an empty trace.
@@ -326,16 +478,6 @@ fn frame(canvas: V, ctx: V, f: V, span: bool, ratio: f64) -> V {
         );
     }
     let last = len(xs) as isize - 1;
-    let mut lo = nearest(xs, x.min, 0, last);
-    let mut hi = nearest(xs, x.max, 0, last);
-    if hi > lo + 1 {
-        if num(xs, lo as usize) < x.min {
-            lo += 1
-        }
-        if num(xs, hi as usize) > x.max {
-            hi -= 1
-        }
-    }
     let probes = field(f, "probes");
     let answers = array();
     for i in 0..len(probes) {
@@ -362,8 +504,9 @@ fn frames(input: V, canvas: V) -> V {
     let span = field(input, "spanGaps").is_truthy();
     let frames = field(input, "frames");
     let result = array();
+    let mut state = ScaleState::new();
     for i in 0..len(frames) {
-        push(result, frame(canvas, ctx, at(frames, i), span, ratio));
+        push(result, frame(canvas, ctx, at(frames, i), span, ratio, &mut state));
     }
     result
 }

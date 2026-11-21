@@ -35,8 +35,13 @@ later scripts had patched by string replacement.
 - **fixFloat.** `Double.toString` is the JS string on Scala.js. `regex6` is a `js.RegExp` with
   uPlot's pattern rather than a `java.util.regex` translation. uPlot's is global and read with
   `String.prototype.match`, which returns every match; `fixFloat` uses the first, which a
-  non-global `exec` returns. `Number.isInteger` is `isFinite && math.floor(v) == v`, and
-  `Number.EPSILON` is a constant.
+  non-global `exec` returns. Strings containing `e-` round the mantissa at that precision and
+  reattach the exponent, as upstream does. `Number.isInteger` is `isFinite && math.floor(v) == v`,
+  and `Number.EPSILON` is a constant.
+- **Scale range guard (`< 1e-16`).** `ScaleState` carries `Option[Scale]` bounds for `x` and `y`
+  across frames within a call, mirroring `setData` → `autoScaleX` (including `rangeNum(v, v, 0.1,
+  true)` for flat x data), explicit `setScale('x'/'y')`, and `_commit` → `setScales`. Unset scales
+  default to `Scale(0.0, 0.0)`, matching JS arithmetic on `null`.
 - **The plot offset.** `valToPosX`/`valToPosY` keep uPlot's `off + dim * pct`; the offset is
   `incrRound(0 * pxRatio, 0.5)`, +0, so an x value of −0 gives pixel 0, as in uPlot.
 - **closestIdx.** JS `lo || 0` and `hi || arr.length - 1` are default 0 parameters and "a zero `hi`
@@ -66,8 +71,6 @@ adapter's stroke, with no fill, bands or points; there are no axes, padding, cur
 - **fixedDec.** `fixFloat` first returns a value of uPlot's `fixedDec` map unchanged. That lookup
   is left out: the review checked that the string path returns each of the map's 358 members
   unchanged too.
-- **Exponent strings.** `fixFloat`'s branch for strings containing `e-` (values below 1e-6) is
-  left out. Plot sizes of one pixel or more never reach it (CONTRACT.md).
 - **All-null series.** `nonNullIdxs` gives −1 and −1, and uPlot's loop then reads index −1, finds
   `undefined` and draws nothing. The port skips the loop.
 - **drawnAtX.** uPlot never assigns it, so its final `drawnAtX != accX` test always passes and is

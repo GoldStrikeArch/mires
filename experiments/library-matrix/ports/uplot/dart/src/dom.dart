@@ -13,6 +13,10 @@ external double get devicePixelRatio;
 @JS('Math.round')
 external double jsRound(double x);
 
+/// JS Math.log10: exact host base-10 logarithm for uPlot's rangeNum.
+@JS('Math.log10')
+external double jsLog10(double x);
+
 extension type Document._(JSObject _) implements JSObject {
   external Element get body;
   external Canvas createElement(String tagName);

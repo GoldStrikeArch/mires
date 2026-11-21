@@ -25,18 +25,52 @@ double roundDec(double value, [int dec = 0]) {
 final _regex6 = RegExp(r'\.\d*?(?=9{6,}|0{6,})');
 
 /// fixFloat: snaps a value whose JS string has a run of six or more 9s or 0s after the point to the
-/// decimals before the run (17999.204999999998 becomes 17999.205). uPlot first returns members of
-/// its fixedDec map unchanged; the string path returns every member unchanged too. Its branch for
-/// strings with `e-` (values below 1e-6) is not reached by plot sizes of 1 px or more.
+/// decimals before the run (17999.204999999998 becomes 17999.205), handling `e-` exponent strings
+/// by rounding the mantissa. uPlot first returns members of its fixedDec map unchanged; the string
+/// path returns every member unchanged too.
 double fixFloat(double value) {
   if (_isInt(value)) return value;
   // On the web a non-integral double's toString() is the JS string.
-  final match = _regex6.firstMatch(value.toString());
+  final str = value.toString();
+  final match = _regex6.firstMatch(str);
   if (match == null) return value;
-  return roundDec(value, match[0]!.length - 1);
+  final dec = match[0]!.length - 1;
+  final ePos = str.indexOf('e-');
+  if (ePos != -1) {
+    final mant = double.parse(str.substring(0, ePos));
+    final exp = str.substring(ePos);
+    return double.parse('${roundDec(mant, dec)}$exp');
+  }
+  return roundDec(value, dec);
 }
 
 double incrRound(double num, double incr) => fixFloat(roundDec(fixFloat(num / incr)) * incr);
+
+double incrRoundUp(double num, double incr) => fixFloat(fixFloat(num / incr).ceilToDouble() * incr);
+
+double incrRoundDn(double num, double incr) => fixFloat(fixFloat(num / incr).floorToDouble() * incr);
+
+/// uPlot's rangeNum(min, max, 0.1, true): used by autoScaleX when all x values are equal.
+(double, double) rangeNum(double minV, double maxV) {
+  var delta = maxV - minV;
+  final scalarMax = math.max(minV.abs(), maxV.abs());
+  if (delta < 1e-24 || (jsLog10(scalarMax) - jsLog10(delta)).abs() > 10) {
+    delta = 0;
+    if (minV == 0 || maxV == 0) delta = 1e-24;
+  }
+  final nonZeroDelta = delta != 0 ? delta : (scalarMax != 0 ? scalarMax : 1e3);
+  final base = math.pow(10, jsLog10(nonZeroDelta).floorToDouble()).toDouble();
+  final padMin = nonZeroDelta * (delta == 0 ? (minV == 0 ? 0.1 : 1.0) : 0.1);
+  final newMin = roundDec(incrRoundDn(minV - padMin, base / 10), 24);
+  final softMin = minV >= 0 && newMin <= 0 ? 0.0 : double.infinity;
+  final minLim = newMin < softMin && minV >= softMin ? softMin : math.min(softMin, newMin);
+  final padMax = nonZeroDelta * (delta == 0 ? (maxV == 0 ? 0.1 : 1.0) : 0.1);
+  final newMax = roundDec(incrRoundUp(maxV + padMax, base / 10), 24);
+  final softMax = maxV <= 0 && newMax >= 0 ? 0.0 : double.negativeInfinity;
+  var maxLim = newMax > softMax && maxV <= softMax ? softMax : math.max(softMax, newMax);
+  if (minLim == maxLim && minLim == 0) maxLim = 100;
+  return (minLim, maxLim);
+}
 
 /// closestIdx: the index of the value in [arr] closest to [num]. JS `lo || 0` and
 /// `hi || arr.length - 1` make a zero [hi] the last index.
@@ -80,6 +114,53 @@ class Plot {
         height = incrRound(heightCss * pxRatio, 0.5);
 }
 
+/// Persistent scale bounds across frames for uPlot's setScale (< 1e-16) guard.
+class ScaleState {
+  Scale? x;
+  Scale? y;
+
+  /// Mirrors setData -> autoScaleX, explicit setScale('x'/'y'), and commit -> setScales.
+  /// Unset scales default to Scale(0, 0), matching JS arithmetic on null scale bounds.
+  Chart applyScales(Plot plot, Scale xReq, Scale yReq, List<double> xs) {
+    final n = xs.length;
+    var lo = 0;
+    var hi = n > 0 ? n - 1 : 0;
+    var pendX = true;
+    if (n > 1 && xReq.max - xReq.min < 1e-16) {
+      var aMin = xs[0];
+      var aMax = xs[n - 1];
+      if (aMin == aMax) {
+        (aMin, aMax) = rangeNum(aMin, aMax);
+      }
+      if (aMin > aMax) {
+        (aMin, aMax) = (aMax, aMin);
+      }
+      pendX = !(aMax - aMin < 1e-16);
+    }
+    var pendY = !(n > 1 && yReq.max - yReq.min < 1e-16);
+
+    if (pendX || pendY) {
+      if (!pendX && x == null) pendX = true;
+      if (!pendY && (y == null || pendX)) pendY = true;
+      if (pendX) {
+        x = xReq;
+        if (n > 0) {
+          lo = closestIdx(xReq.min, xs);
+          hi = closestIdx(xReq.max, xs);
+          // Don't contract same or adjacent indices; the closest ones can be outside the view.
+          if (hi - lo > 1) {
+            if (xs[lo] < xReq.min) lo++;
+            if (xs[hi] > xReq.max) hi--;
+          }
+        }
+      }
+      if (pendY) y = yReq;
+    }
+
+    return Chart._(plot, x ?? Scale(0, 0), y ?? Scale(0, 0), xs, lo, hi);
+  }
+}
+
 /// One frame's chart: what uPlot's valToPos, posToVal, valToIdx and posToIdx read.
 class Chart {
   final Plot plot;
@@ -87,19 +168,9 @@ class Chart {
   final List<double> xs;
 
   // setScales' visible window. With no data uPlot leaves it null, which closestIdx reads as 0.
-  int _i0 = 0, _i1 = 0;
+  final int _i0, _i1;
 
-  Chart(this.plot, this.x, this.y, this.xs) {
-    if (xs.isNotEmpty) {
-      _i0 = closestIdx(x.min, xs);
-      _i1 = closestIdx(x.max, xs);
-      // Don't contract same or adjacent indices; the closest ones can be outside the view.
-      if (_i1 - _i0 > 1) {
-        if (xs[_i0] < x.min) _i0++;
-        if (xs[_i1] > x.max) _i1--;
-      }
-    }
-  }
+  Chart._(this.plot, this.x, this.y, this.xs, this._i0, this._i1);
 
   /// getHPos (ori 0, dir 1) in canvas pixels: valToPos(value, 'x', true).
   double valToPosX(double value) => plot.left + plot.width * x.valToPct(value);

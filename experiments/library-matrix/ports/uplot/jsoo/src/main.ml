@@ -20,8 +20,10 @@ module Host = struct
   let array () = new_ "Array"
   let push a x = ignore (Js.Unsafe.meth_call a "push" [| x |])
   let round x = num (Js.Unsafe.meth_call (field Js.Unsafe.global "Math") "round" [| number x |])
-  let is_integer = Float.is_integer
+  let log10 x = num (Js.Unsafe.meth_call (field Js.Unsafe.global "Math") "log10" [| number x |])
+  let is_integer x = Float.is_finite x && Float.is_integer x
   let to_string x = Js.to_string (Js.number_of_float x)##toString
+  let parse_float s = num (Js.Unsafe.fun_call (field Js.Unsafe.global "Number") [| inject (Js.string s) |])
   let pixel_ratio () = num (field Js.Unsafe.global "devicePixelRatio")
   let text s = inject (Js.string s)
 

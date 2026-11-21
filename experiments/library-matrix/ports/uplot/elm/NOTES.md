@@ -36,7 +36,16 @@ plot box), `getHPos` and `getVPos`, `posToVal`, `closestIdx` with the index wind
   is `not NaN, not infinite, and toFloat (floor v) == v`, and `epsilon` is `Number.EPSILON`.
 - **fixFloat.** `String.fromFloat` is the JS string. Core Elm has no regex, so
   `decimalsBeforeRun` scans the digits after the point for uPlot's `/\.\d*?(?=9{6,}|0{6,})/`: the
-  first position where six 9s or six 0s begin.
+  first position where six 9s or six 0s begin. Strings containing `e-` round the mantissa at that
+  precision and reattach the exponent via `String.toFloat`, as upstream does.
+- **Scale range guard (`< 1e-16`) and NaN comparisons.** `handle` folds `ScaleState` across frames,
+  mirroring `autoScaleX` (including `rangeNum(v, v, 0.1, true)` via `logBase 10`, verified against
+  `Math.log10` for the `< 1e-16` decision across all float64 exponents), explicit `setScale`, and
+  `setScales`. Unset scales default to `(0, 0)`, matching JS arithmetic on `null`. Elm compiles
+  unannotated `>=` to `_Utils_cmp > -1` (which returns `True` on `NaN`) and the Elm build passes
+  `unsafe_comps: true` to Terser, so `gaps` uses `previous <= current` (`_Utils_cmp < 1`, `False`
+  on `NaN`, verified in both `dist/index.js` and `dist/index.min.js`) and `rangeNum`/`applyScales`
+  guard `isNaN` explicitly.
 - **The remainder.** Elm has no float remainder: `width % 2` is `width - 2 * truncate (width / 2)`,
   which is exact for the widths `roundDec(devicePixelRatio, 3)` gives (below 2^31).
 - **The plot offset.** `pixel` keeps uPlot's `off + dim * pct`; the offset is
@@ -69,8 +78,6 @@ adapter's stroke, with no fill, bands or points; there are no axes, padding, cur
 - **fixedDec.** `fixFloat` first returns a value of uPlot's `fixedDec` map unchanged. That lookup
   is left out: the review checked that the string path returns each of the map's 358 members
   unchanged too.
-- **Exponent strings.** `fixFloat`'s branch for strings containing `e-` (values below 1e-6) is
-  left out. Plot sizes of one pixel or more never reach it (CONTRACT.md).
 
 ## Module state
 

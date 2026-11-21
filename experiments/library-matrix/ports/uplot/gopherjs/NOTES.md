@@ -30,15 +30,24 @@ later scripts had patched by string replacement.
 
 ## Representation and numeric semantics
 
-- **Math.round (review b10).** `round` is JS `Math.round` in Go: `r := math.Floor(x)`, plus one
-  when `x - r >= 0.5`, and −0 for a negative value that rounds to zero. `x - floor(x)` is exact
-  for every float64, so 0.49999999999999994 rounds to 0 and odd integers in [2^52, 2^53) stay put.
-  The former `floor(x + 0.5)` got both wrong. `math.Round` rounds halves away from zero.
+- **Math.round (review b10, corrected in re-uplot).** `round` is JS `Math.round` in Go:
+  `r := math.Floor(x)`, plus one when `x - r >= 0.5`, and −0 for a negative value that rounds to
+  zero. By Sterbenz's lemma `x - floor(x)` is exact for `x >= 0` and `x <= -0.5` (so
+  0.49999999999999994 rounds to 0 and odd integers in [2^52, 2^53) stay put); for `x` in
+  `(-0.5, 0)` `x - (-1)` can round up to `1` (e.g. `-2^-60 + 1 == 1`), which still increments `r`
+  from `-1` to `0` and returns `-0` via the sign check, matching `Math.round` on every float64.
+  The former `floor(x + 0.5)` got both boundaries wrong, and `math.Round` rounds halves away from
+  zero.
 - **fixFloat.** The JS string comes from the host's `String()`, as upstream builds it with a
   template literal (`jsString`, as in the big.js port). Go's `regexp` has no lookahead, so
   `decimalsBeforeRun` scans the digits after the point for uPlot's `/\.\d*?(?=9{6,}|0{6,})/`:
-  the first position where six 9s or six 0s begin. `Number.isInteger` is
+  the first position where six 9s or six 0s begin. Strings containing `e-` round the mantissa at
+  that precision and reattach the exponent via `jsNumber`, as upstream does. `Number.isInteger` is
   `!IsInf && Floor(v) == v`, and `Number.EPSILON` is `0x1p-52`.
+- **Scale range guard (`< 1e-16`).** `scaleState` carries `*scale` pointers for `x` and `y` across
+  frames within a call, mirroring `setData` → `autoScaleX` (including `rangeNum(v, v, 0.1, true)`
+  via host `Math.log10` for flat x data), explicit `setScale('x'/'y')`, and `_commit` →
+  `setScales`. Unset scales default to `scale{0, 0}`, matching JS arithmetic on `null`.
 - **JS `%`.** `math.Mod`.
 - **The plot offset.** `valToPosX`/`valToPosY` keep uPlot's `off + dim * pct`; the offset is
   `incrRound(0 * pxRatio, 0.5)`, +0, so an x value of −0 gives pixel 0, as in uPlot.
@@ -70,8 +79,6 @@ adapter's stroke, with no fill, bands or points; there are no axes, padding, cur
 - **fixedDec.** `fixFloat` first returns a value of uPlot's `fixedDec` map unchanged. That lookup
   is left out: the review checked that the string path returns each of the map's 358 members
   unchanged too.
-- **Exponent strings.** `fixFloat`'s branch for strings containing `e-` (values below 1e-6) is
-  left out. Plot sizes of one pixel or more never reach it (CONTRACT.md).
 - **All-null series.** `nonNullIdxs` gives −1 and −1, and uPlot's loop then reads index −1, finds
   `undefined` and draws nothing. The port skips the loop.
 - **drawnAtX.** uPlot never assigns it, so its final `drawnAtX != accX` test always passes and is

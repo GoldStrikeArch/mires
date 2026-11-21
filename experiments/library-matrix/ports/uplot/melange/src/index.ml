@@ -19,8 +19,10 @@ module Host = struct
   external array : unit -> v = "Array" [@@mel.new]
   external push : v -> v -> unit = "push" [@@mel.send]
   external round : float -> float = "round" [@@mel.scope "Math"]
+  external log10 : float -> float = "log10" [@@mel.scope "Math"]
   external is_integer : float -> bool = "isInteger" [@@mel.scope "Number"]
   external to_string : float -> string = "String"
+  external parse_float : string -> float = "Number"
   external window : v = "window"
 
   let pixel_ratio () = num (field window "devicePixelRatio")

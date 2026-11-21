@@ -97,10 +97,9 @@ decimalsBeforeRun text =
 
 
 {-| fixFloat: snaps a value whose JS string has a run of six or more 9s or 0s after the point to the
-decimals before the run (17999.204999999998 becomes 17999.205). uPlot first returns members of its
-fixedDec map unchanged; the string path returns every member unchanged too. Its branch for strings
-with "e-" (values below 1e-6) is not reached by plot sizes of 1 px or more. String.fromFloat is
-the JS string.
+decimals before the run (17999.204999999998 becomes 17999.205), handling "e-" exponent strings by
+rounding the mantissa. uPlot first returns members of its fixedDec map unchanged; the string path
+returns every member unchanged too. String.fromFloat is the JS string.
 -}
 fixFloat : Float -> Float
 fixFloat v =
@@ -108,9 +107,25 @@ fixFloat v =
         v
 
     else
-        case decimalsBeforeRun (String.fromFloat v) of
+        let
+            str =
+                String.fromFloat v
+        in
+        case decimalsBeforeRun str of
             Just dec ->
-                roundDec dec v
+                case String.indexes "e-" str of
+                    ePos :: _ ->
+                        let
+                            mant =
+                                String.slice 0 ePos str |> String.toFloat |> Maybe.withDefault 0
+
+                            exp =
+                                String.dropLeft ePos str
+                        in
+                        String.fromFloat (roundDec dec mant) ++ exp |> String.toFloat |> Maybe.withDefault v
+
+                    [] ->
+                        roundDec dec v
 
             Nothing ->
                 v
@@ -119,6 +134,129 @@ fixFloat v =
 incrRound : Float -> Float -> Float
 incrRound incr v =
     fixFloat (roundDec 0 (fixFloat (v / incr)) * incr)
+
+
+incrRoundUp : Float -> Float -> Float
+incrRoundUp incr v =
+    fixFloat (toFloat (ceiling (fixFloat (v / incr))) * incr)
+
+
+incrRoundDn : Float -> Float -> Float
+incrRoundDn incr v =
+    fixFloat (toFloat (floor (fixFloat (v / incr))) * incr)
+
+
+fmin : Float -> Float -> Float
+fmin a b =
+    if isNaN a || isNaN b then
+        0 / 0
+
+    else if a < b then
+        a
+
+    else
+        b
+
+
+fmax : Float -> Float -> Float
+fmax a b =
+    if isNaN a || isNaN b then
+        0 / 0
+
+    else if b < a then
+        a
+
+    else
+        b
+
+
+{-| uPlot's rangeNum(min, max, 0.1, true): used by autoScaleX when all x values are equal.
+All float comparisons use `<` or `<=` because Elm's `_Utils_cmp` returns GT for NaN.
+-}
+rangeNum : Float -> Float -> ( Float, Float )
+rangeNum minV maxV =
+    let
+        rawDelta =
+            maxV - minV
+
+        scalarMax =
+            fmax (abs minV) (abs maxV)
+
+        magDiff =
+            abs (logBase 10 scalarMax - logBase 10 rawDelta)
+
+        delta =
+            if rawDelta < 1e-24 || (not (isNaN magDiff) && 10 < magDiff) then
+                if minV == 0 || maxV == 0 then
+                    1e-24
+
+                else
+                    0
+
+            else
+                rawDelta
+
+        nonZeroDelta =
+            if delta /= 0 then
+                delta
+
+            else if scalarMax /= 0 then
+                scalarMax
+
+            else
+                1000
+
+        base =
+            10 ^ toFloat (floor (logBase 10 nonZeroDelta))
+
+        padMin =
+            nonZeroDelta * (if delta == 0 then if minV == 0 then 0.1 else 1 else 0.1)
+
+        newMin =
+            roundDec 24 (incrRoundDn (base / 10) (minV - padMin))
+
+        softMin =
+            if not (isNaN newMin) && 0 <= minV && newMin <= 0 then
+                0
+
+            else
+                1 / 0
+
+        minLim =
+            if not (isNaN newMin) && newMin < softMin && softMin <= minV then
+                softMin
+
+            else
+                fmin softMin newMin
+
+        padMax =
+            nonZeroDelta * (if delta == 0 then if maxV == 0 then 0.1 else 1 else 0.1)
+
+        newMax =
+            roundDec 24 (incrRoundUp (base / 10) (maxV + padMax))
+
+        softMax =
+            if not (isNaN newMax) && maxV <= 0 && 0 <= newMax then
+                0
+
+            else
+                -1 / 0
+
+        maxLim0 =
+            if not (isNaN newMax) && softMax < newMax && maxV <= softMax then
+                softMax
+
+            else
+                fmax softMax newMax
+
+        maxLim =
+            if minLim == maxLim0 && minLim == 0 then
+                100
+
+            else
+                maxLim0
+    in
+    ( minLim, maxLim )
 
 
 
@@ -230,7 +368,7 @@ vertices x y points =
             step ( xv, yv ) prev =
                 let
                     next =
-                        if xv >= prev.limit then round (pixel x xv) else prev.column
+                        if not (xv < prev.limit) then round (pixel x xv) else prev.column
 
                     state =
                         if next == prev.column then prev
@@ -272,7 +410,9 @@ gaps x points =
                     let
                         current = round (pixel x xv)
                     in
-                    ( current, False, if inGap && current >= previous then (previous, current) :: rev else rev )
+                    -- Use `<=` rather than `>=`: Elm compiles `>=` to `_Utils_cmp > -1`, which is True on NaN,
+                    -- whereas `<=` (`_Utils_cmp < 1`) is False on NaN, matching uPlot's `toPx >= frPx`.
+                    ( current, False, if inGap && previous <= current then (previous, current) :: rev else rev )
 
         (_, _, result) =
             List.foldl step (0, False, []) points
@@ -285,10 +425,10 @@ gaps x points =
 clipRects x y intervals =
     let
         step (left, right) (end, rev) =
-            if right <= left then
+            if not (left < right) then
                 (end, rev)
             else
-                (toFloat right, if toFloat left - end > 0 then [ end, y.off, toFloat left - end, y.off + y.dim ] :: rev else rev)
+                (toFloat right, if 0 < toFloat left - end then [ end, y.off, toFloat left - end, y.off + y.dim ] :: rev else rev)
 
         (finalEnd, rects) =
             List.foldl step (x.off, []) intervals
@@ -296,7 +436,7 @@ clipRects x y intervals =
         rest =
             x.off + x.dim - finalEnd
     in
-    List.reverse (if rest > 0 then [ finalEnd, y.off - 5, rest, y.off + y.dim + 10 ] :: rects else rects)
+    List.reverse (if 0 < rest then [ finalEnd, y.off - 5, rest, y.off + y.dim + 10 ] :: rects else rects)
 
 
 pair ( a, b ) =
@@ -365,19 +505,141 @@ frameDecoder =
         (D.field "data" columns) (D.field "probes" (D.list (D.list D.float)))
 
 
-frame ratio span f =
+type alias ScaleState =
+    { x : Maybe ( Float, Float )
+    , y : Maybe ( Float, Float )
+    }
+
+
+type alias ScaleResult =
+    { state : ScaleState
+    , xBounds : ( Float, Float )
+    , yBounds : ( Float, Float )
+    , firstVisible : Int
+    , lastVisible : Int
+    }
+
+
+rangeAccepted : Float -> Float -> Bool
+rangeAccepted lo hi =
+    let
+        d =
+            hi - lo
+    in
+    isNaN d || not (d < 1e-16)
+
+
+applyScales : ScaleState -> Array Float -> ( Float, Float ) -> ( Float, Float ) -> ScaleResult
+applyScales state xs (( xMin, xMax ) as xReq) (( yMin, yMax ) as yReq) =
+    let
+        n =
+            Array.length xs
+
+        at i =
+            Array.get i xs |> Maybe.withDefault 0
+
+        pendX0 =
+            if n <= 1 || rangeAccepted xMin xMax then
+                True
+
+            else
+                let
+                    a0 =
+                        at 0
+
+                    a1 =
+                        at (n - 1)
+
+                    ( r0, r1 ) =
+                        if a0 == a1 then
+                            rangeNum a0 a1
+
+                        else
+                            ( a0, a1 )
+
+                    ( loA, hiA ) =
+                        if not (isNaN r0) && not (isNaN r1) && r1 < r0 then
+                            ( r1, r0 )
+
+                        else
+                            ( r0, r1 )
+                in
+                rangeAccepted loA hiA
+
+        pendY0 =
+            n <= 1 || rangeAccepted yMin yMax
+
+        ( nextState, firstVisible, lastVisible ) =
+            if pendX0 || pendY0 then
+                let
+                    pendX =
+                        pendX0 || state.x == Nothing
+
+                    pendY =
+                        pendY0 || state.y == Nothing || pendX
+
+                    nextX =
+                        if pendX then
+                            Just xReq
+
+                        else
+                            state.x
+
+                    nextY =
+                        if pendY then
+                            Just yReq
+
+                        else
+                            state.y
+
+                    ( loVis, hiVis ) =
+                        if pendX && n > 0 then
+                            let
+                                last =
+                                    n - 1
+
+                                lo =
+                                    nearest xs xMin 0 last
+
+                                hi =
+                                    nearest xs xMax 0 last
+                            in
+                            ( if hi > lo + 1 && at lo < xMin then lo + 1 else lo
+                            , if hi > lo + 1 && xMax < at hi then hi - 1 else hi
+                            )
+
+                        else if n > 0 then
+                            ( 0, n - 1 )
+
+                        else
+                            ( 0, 0 )
+                in
+                ( { x = nextX, y = nextY }, loVis, hiVis )
+
+            else
+                ( state, 0, if n > 0 then n - 1 else 0 )
+    in
+    { state = nextState
+    , xBounds = Maybe.withDefault ( 0, 0 ) nextState.x
+    , yBounds = Maybe.withDefault ( 0, 0 ) nextState.y
+    , firstVisible = firstVisible
+    , lastVisible = lastVisible
+    }
+
+
+frame ratio span f state =
     let
         -- The adapter passes CSS sizes; uPlot multiplies them back by pxRatio.
         ( w, h ) = Tuple.mapBoth (\d -> d / ratio) (\d -> d / ratio) f.size
-        x = scale f.xRange w ratio False
-        y = scale f.yRange h ratio True
         xs = Array.fromList f.xs
         last = Array.length xs - 1
-        lo = nearest xs x.low 0 last
-        hi = nearest xs x.high 0 last
-        at i = Array.get i xs |> Maybe.withDefault 0
-        firstVisible = if hi > lo + 1 && at lo < x.low then lo + 1 else lo
-        lastVisible = if hi > lo + 1 && at hi > x.high then hi - 1 else hi
+        scaled =
+            applyScales state xs f.xRange f.yRange
+        nextState = scaled.state
+        firstVisible = scaled.firstVisible
+        lastVisible = scaled.lastVisible
+        x = scale scaled.xBounds w ratio False
+        y = scale scaled.yBounds h ratio True
 
         -- The adapter's precise(): Math.round(x * 1e6) || 0, which maps -0 and NaN to 0.
         precise v =
@@ -398,19 +660,36 @@ frame ratio span f =
         -- drawSeries runs only with data; the adapter then reports an empty trace for each series.
         hasData = not (List.isEmpty f.xs)
         empty = E.object [ ("geometry", E.list identity [ E.list identity [], if span then E.null else E.list identity [] ]), ("clip", E.null) ]
+
+        encoded =
+            E.object
+                [ ("canvas", E.list E.int [ round (w * ratio), round (h * ratio) ])
+                , ("paint", if hasData then paint x y else E.null)
+                , ("series", E.list (if hasData then series span x y f.xs else always empty) f.series)
+                , ("probes", E.list probe f.probes)
+                ]
     in
-    E.object
-        [ ("canvas", E.list E.int [ round (w * ratio), round (h * ratio) ])
-        , ("paint", if hasData then paint x y else E.null)
-        , ("series", E.list (if hasData then series span x y f.xs else always empty) f.series)
-        , ("probes", E.list probe f.probes)
-        ]
+    ( nextState, encoded )
 
 
 handle request_ =
     let
+        runFrames ratio span frames =
+            let
+                step f ( st, rev ) =
+                    let
+                        ( nextSt, enc ) =
+                            frame ratio span f st
+                    in
+                    ( nextSt, enc :: rev )
+
+                ( _, revEncoded ) =
+                    List.foldl step ( { x = Nothing, y = Nothing }, [] ) frames
+            in
+            E.list identity (List.reverse revEncoded)
+
         decoder =
-            D.map3 (\ratio span frames -> E.list (frame ratio span) frames)
+            D.map3 runFrames
                 (D.field "pxRatio" D.float)
                 (D.at [ "input", "spanGaps" ] D.bool)
                 (D.at [ "input", "frames" ] (D.list frameDecoder))

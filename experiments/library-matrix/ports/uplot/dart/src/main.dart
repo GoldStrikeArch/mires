@@ -33,7 +33,7 @@ double _precise(double value) {
 }
 
 /// One frame: setSize, setData and setScale in a batch, then the recorded paths and the probes.
-JSArray _frame(Canvas canvas, Context2D ctx, bool spanGaps, Frame f, double pxRatio) {
+JSArray _frame(Canvas canvas, Context2D ctx, bool spanGaps, Frame f, double pxRatio, ScaleState state) {
   final size = _doubles(f.size), xRange = _doubles(f.xRange), yRange = _doubles(f.yRange);
   // The adapter passes CSS sizes; uPlot multiplies them back by pxRatio.
   final widthCss = size[0] / pxRatio, heightCss = size[1] / pxRatio;
@@ -45,7 +45,7 @@ JSArray _frame(Canvas canvas, Context2D ctx, bool spanGaps, Frame f, double pxRa
   final columns = f.data.toDart;
   // x values are never null.
   final xs = [for (final v in columns.first.toDart) v!.toDartDouble];
-  final chart = Chart(plot, Scale(xRange[0], xRange[1]), Scale(yRange[0], yRange[1]), xs);
+  final chart = state.applyScales(plot, Scale(xRange[0], xRange[1]), Scale(yRange[0], yRange[1]), xs);
   final series = [
     for (final column in columns.skip(1)) [for (final v in column.toDart) v?.toDartDouble]
   ];
@@ -85,7 +85,8 @@ JSArray<JSArray> run(Input input) {
   document.body.appendChild(canvas);
   try {
     final ctx = canvas.getContext('2d');
-    return [for (final f in input.frames.toDart) _frame(canvas, ctx, input.spanGaps, f, pxRatio)].toJS;
+    final state = ScaleState();
+    return [for (final f in input.frames.toDart) _frame(canvas, ctx, input.spanGaps, f, pxRatio, state)].toJS;
   } finally {
     canvas.remove();
   }

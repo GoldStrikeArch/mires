@@ -39,8 +39,9 @@ internal external class Path2D {
     fun rect(x: Double, y: Double, w: Double, h: Double)
 }
 
-/** JS Math.round: halves round toward +Infinity (kotlin.math.round rounds them to even). */
+/** JS Math: round (halves toward +Infinity) and log10. */
 @JsName("Math")
 internal external object JsMath {
     fun round(x: Double): Double
+    fun log10(x: Double): Double
 }
