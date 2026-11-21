@@ -956,7 +956,9 @@ pub fn niche_variant(
     };
     // The width of the niche scalar decides how the subtraction wraps: the niche field's own
     // width when the path reaches an integer, the pointer width otherwise.
-    let width = niche_width(table, variants, niche).unwrap_or(128);
+    let width = niche_width(table, variants, niche)
+        .filter(|&w| w > 0)
+        .unwrap_or(128);
     let mask = if width >= 128 {
         u128::MAX
     } else {
@@ -989,43 +991,70 @@ fn niche_width_at(
     niche: &rcgjs_object::jir::types::Niche,
     depth: usize,
 ) -> Option<u32> {
+    enum StepFields<'a> {
+        Fields(&'a [rcgjs_object::jir::types::FieldDescriptor]),
+        Single(TypeId),
+        Array(TypeId, u64),
+    }
+
     if depth > 16 {
         return None;
     }
-    let mut fields: &[rcgjs_object::jir::types::FieldDescriptor] =
-        &variants.get(niche.untagged_variant as usize)?.fields;
-    let mut pat_base: Option<TypeId> = None;
+    let mut step_fields =
+        StepFields::Fields(&variants.get(niche.untagged_variant as usize)?.fields);
     let mut ty = None;
     for step in &niche.niche_field {
         // Follow the unpeeled field chain (`niche_facts` records rustc's unpeeled field indices,
-        // including transparent wrappers like `NonZero<T>` and `ty::Pat` single-field steps).
-        let next_ty = if let Some(base) = pat_base.take() {
-            if *step != 0 {
-                return None;
+        // including transparent wrappers like `NonZero<T>`, single-inhabited-variant enums, array
+        // elements, and `ty::Pat` single-field steps).
+        let next_ty = match step_fields {
+            StepFields::Single(base) => {
+                if *step != 0 {
+                    return None;
+                }
+                base
             }
-            base
-        } else {
-            fields.get(*step as usize)?.ty
+            StepFields::Array(element, length) => {
+                if u64::from(*step) >= length {
+                    return None;
+                }
+                element
+            }
+            StepFields::Fields(fields) => fields.get(*step as usize)?.ty,
         };
         ty = Some(next_ty);
         let descriptor = table.get(next_ty)?;
-        match &descriptor.kind {
-            TypeKind::Pattern(base) => {
-                pat_base = Some(*base);
-                fields = &[];
+        step_fields = match &descriptor.kind {
+            TypeKind::Pattern(base) => StepFields::Single(*base),
+            TypeKind::Array { element, length } => StepFields::Array(*element, *length),
+            TypeKind::Adt {
+                form: NominalForm::Enum,
+                variants,
+                ..
+            } => {
+                // Only a single-inhabited-variant enum (`Variants::Single`) has an unambiguous
+                // field list to descend into; 0 or >1 inhabited variants stop the path.
+                let mut inhabited = variants.iter().filter(|variant| {
+                    !variant
+                        .fields
+                        .iter()
+                        .any(|field| is_uninhabited(table, field.ty))
+                });
+                match (inhabited.next(), inhabited.next()) {
+                    (Some(sole), None) => StepFields::Fields(sole.fields.as_slice()),
+                    _ => StepFields::Fields(&[]),
+                }
             }
             TypeKind::Adt { variants, .. } => {
-                fields = variants.first().map_or(&[], |v| v.fields.as_slice());
+                StepFields::Fields(variants.first().map_or(&[], |v| v.fields.as_slice()))
             }
-            _ => {
-                fields = &descriptor.js.fields;
-            }
-        }
+            _ => StepFields::Fields(&descriptor.js.fields),
+        };
     }
     let ty = ty?;
     let peeled = table.peeled(ty);
     if let Some((_, bits)) = table.int_info(peeled) {
-        return Some(bits);
+        return (bits > 0).then_some(bits);
     }
     match kind(table, peeled) {
         Some(TypeKind::Bool) => Some(8),
@@ -1039,7 +1068,9 @@ fn niche_width_at(
             niche: Some(inner_niche),
             ..
         }) => niche_width_at(table, inner_variants, inner_niche, depth + 1),
-        _ => size_of(table, peeled).map(|bytes| (bytes * 8) as u32),
+        _ => size_of(table, peeled)
+            .filter(|&bytes| bytes > 0)
+            .map(|bytes| (bytes * 8) as u32),
     }
 }
 

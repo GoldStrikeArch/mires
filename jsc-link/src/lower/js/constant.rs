@@ -273,19 +273,28 @@ impl<'a> JsCx<'a> {
                     return value::enum_value(table, self.interns, ty, index as u32, Vec::new())
                         .ok_or_else(|| decline(OpClass::Constant, "scalar enum constant"));
                 }
-                // A niche or a single-variant enum: either the bit pattern selects a niche
-                // variant / the untagged variant, or the enum has only one variant carrying the
-                // scalar payload.
+                // A niche or a single-inhabited-variant (`Variants::Single`) enum: the bit pattern
+                // names a niche variant, the untagged variant, or the sole inhabited variant,
+                // whose one non-zero-sized field holds the bits.
                 let (index, carries_payload) = if let Some(niche) = niche {
                     let index = value::niche_variant(table, variants, niche, bits);
                     (index, index == niche.untagged_variant)
-                } else if variants.len() == 1 {
-                    (0, true)
                 } else {
-                    return Err(decline(
-                        OpClass::Constant,
-                        "scalar constant of an enum with neither a direct tag nor a niche",
-                    ));
+                    let mut inhabited = variants.iter().enumerate().filter(|(_, variant)| {
+                        !variant
+                            .fields
+                            .iter()
+                            .any(|field| value::is_uninhabited(table, field.ty))
+                    });
+                    match (inhabited.next(), inhabited.next()) {
+                        (Some((sole, _)), None) => (sole as u32, true),
+                        _ => {
+                            return Err(decline(
+                                OpClass::Constant,
+                                "scalar constant of an enum with neither a direct tag nor a niche",
+                            ));
+                        }
+                    }
                 };
                 let Some(variant) = variants.get(index as usize) else {
                     return Err(decline(OpClass::Constant, "niche names a missing variant"));

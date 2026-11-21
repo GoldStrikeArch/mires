@@ -132,6 +132,54 @@ const CONST_TRUE_WRAP_P: TrueWrapU8 = TrueWrapU8::P(AlmostFullU8::V84);
 const CONST_TRANS_WRAP_N2: TrueWrapTrans = TrueWrapTrans::N2;
 const CONST_TRANS_WRAP_N0: TrueWrapTrans = TrueWrapTrans::N0;
 
+// Safe-Rust single-inhabited-variant enums whose variant 0 is uninhabited (`Variants::Single`):
+// `niche_width` must follow the unique inhabited variant (not `variants[0]`) so const decode of
+// `Option<SingleLive*>` does not collapse `Some` into `None` or read the wrong field width.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SingleLiveOrd {
+    Dead(Infallible),
+    Live(Ordering),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SingleLiveOpt {
+    Dead(Infallible),
+    Live(Option<Ordering>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SingleLiveChar {
+    Dead(u8, Infallible),
+    Live(char),
+}
+
+const CONST_SL_ORD_NONE: Option<SingleLiveOrd> = None;
+const CONST_SL_ORD_LESS: Option<SingleLiveOrd> = Some(SingleLiveOrd::Live(Ordering::Less));
+const CONST_SL_ORD_EQ: Option<SingleLiveOrd> = Some(SingleLiveOrd::Live(Ordering::Equal));
+const CONST_SL_ORD_GT: Option<SingleLiveOrd> = Some(SingleLiveOrd::Live(Ordering::Greater));
+
+const CONST_SL_OPT_NONE: Option<SingleLiveOpt> = None;
+const CONST_SL_OPT_SOME_NONE: Option<SingleLiveOpt> = Some(SingleLiveOpt::Live(None));
+const CONST_SL_OPT_SOME_LESS: Option<SingleLiveOpt> =
+    Some(SingleLiveOpt::Live(Some(Ordering::Less)));
+
+const CONST_SL_CHAR_NONE: Option<SingleLiveChar> = None;
+const CONST_SL_CHAR_FF: Option<SingleLiveChar> = Some(SingleLiveChar::Live('\u{00FF}'));
+const CONST_SL_CHAR_A: Option<SingleLiveChar> = Some(SingleLiveChar::Live('A'));
+
+#[inline(never)]
+fn id_sl_ord(v: Option<SingleLiveOrd>) -> Option<SingleLiveOrd> {
+    v
+}
+#[inline(never)]
+fn id_sl_opt(v: Option<SingleLiveOpt>) -> Option<SingleLiveOpt> {
+    v
+}
+#[inline(never)]
+fn id_sl_char(v: Option<SingleLiveChar>) -> Option<SingleLiveChar> {
+    v
+}
+
 #[inline(never)]
 fn three_enc(v: Three) -> u8 {
     unsafe { transmute(v) }
@@ -353,4 +401,18 @@ pub fn rust_entry() {
     print_bool(CONST_TRUE_WRAP_P == TrueWrapU8::P(AlmostFullU8::V84));
     print_bool(CONST_TRANS_WRAP_N2 == TrueWrapTrans::N2);
     print_bool(CONST_TRANS_WRAP_N0 == TrueWrapTrans::N0);
+
+    // Safe-Rust const decoding of niche enums wrapping single-inhabited-variant enums
+    print_bool(id_sl_ord(CONST_SL_ORD_NONE).is_none());
+    print_bool(id_sl_ord(CONST_SL_ORD_LESS) == Some(SingleLiveOrd::Live(Ordering::Less)));
+    print_bool(id_sl_ord(CONST_SL_ORD_EQ) == Some(SingleLiveOrd::Live(Ordering::Equal)));
+    print_bool(id_sl_ord(CONST_SL_ORD_GT) == Some(SingleLiveOrd::Live(Ordering::Greater)));
+    print_bool(id_sl_opt(CONST_SL_OPT_NONE).is_none());
+    print_bool(id_sl_opt(CONST_SL_OPT_SOME_NONE) == Some(SingleLiveOpt::Live(None)));
+    print_bool(
+        id_sl_opt(CONST_SL_OPT_SOME_LESS) == Some(SingleLiveOpt::Live(Some(Ordering::Less))),
+    );
+    print_bool(id_sl_char(CONST_SL_CHAR_NONE).is_none());
+    print_bool(id_sl_char(CONST_SL_CHAR_FF) == Some(SingleLiveChar::Live('\u{00FF}')));
+    print_bool(id_sl_char(CONST_SL_CHAR_A) == Some(SingleLiveChar::Live('A')));
 }

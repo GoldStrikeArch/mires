@@ -7341,4 +7341,246 @@ fn multi_wrapping_niche_and_transparent_width_decode_accurately() {
     assert!(js.contains("$n === 0"), "{js}");
 }
 
+#[test]
+fn niche_width_selects_unique_inhabited_enum_variant_and_never_returns_zero() {
+    let mut interns = world();
+    let infallible_ty = TypeId(930);
+    let ordering_ty = TypeId(931);
+    let single_live_ord = TypeId(932);
+    let single_live_char = TypeId(933);
+    let opt_ord_ty = TypeId(934);
+    let single_live_opt = TypeId(935);
+
+    interns.intern_type(descriptor(
+        infallible_ty,
+        TypeKind::Adt {
+            def: def(930),
+            args: Vec::new(),
+            form: NominalForm::Enum,
+            variants: Vec::new(),
+            niche: None,
+        },
+        0,
+    ));
+
+    let less = interns.intern_str("Less");
+    let equal = interns.intern_str("Equal");
+    let greater = interns.intern_str("Greater");
+    let mut ord_desc = descriptor(
+        ordering_ty,
+        TypeKind::Adt {
+            def: def(931),
+            args: Vec::new(),
+            form: NominalForm::Enum,
+            variants: vec![
+                variant(less, Vec::new(), -1, Some(255)),
+                variant(equal, Vec::new(), 0, Some(0)),
+                variant(greater, Vec::new(), 1, Some(1)),
+            ],
+            niche: None,
+        },
+        1,
+    );
+    ord_desc.js.enum_repr = Some(EnumRepr::Number {
+        bits: 8,
+        signed: true,
+    });
+    ord_desc.js.is_primitive_enum = true;
+    interns.intern_type(ord_desc);
+
+    let dead = interns.intern_str("Dead");
+    let live = interns.intern_str("Live");
+    let none = interns.intern_str("None");
+    let some = interns.intern_str("Some");
+    let f0 = interns.intern_str("_0");
+    let f1 = interns.intern_str("_1");
+
+    // enum SingleLive { Dead(Infallible), Live(Ordering) }
+    interns.intern_type(descriptor(
+        single_live_ord,
+        TypeKind::Adt {
+            def: def(932),
+            args: Vec::new(),
+            form: NominalForm::Enum,
+            variants: vec![
+                variant(
+                    dead,
+                    vec![field(FieldKey::Name(f0), infallible_ty)],
+                    0,
+                    None,
+                ),
+                variant(live, vec![field(FieldKey::Name(f0), ordering_ty)], 1, None),
+            ],
+            niche: None,
+        },
+        1,
+    ));
+
+    // enum SingleLiveChar { Dead(u8, Infallible), Live(char) }
+    interns.intern_type(descriptor(
+        single_live_char,
+        TypeKind::Adt {
+            def: def(933),
+            args: Vec::new(),
+            form: NominalForm::Enum,
+            variants: vec![
+                variant(
+                    dead,
+                    vec![
+                        field(FieldKey::Name(f0), U8),
+                        field(FieldKey::Name(f1), infallible_ty),
+                    ],
+                    0,
+                    None,
+                ),
+                variant(live, vec![field(FieldKey::Name(f0), CHAR)], 1, None),
+            ],
+            niche: None,
+        },
+        4,
+    ));
+
+    // Option<Ordering>
+    interns.intern_type(descriptor(
+        opt_ord_ty,
+        TypeKind::Adt {
+            def: def(934),
+            args: vec![ordering_ty],
+            form: NominalForm::Enum,
+            variants: vec![
+                variant(none, Vec::new(), 0, None),
+                variant(some, vec![field(FieldKey::Name(f0), ordering_ty)], 1, None),
+            ],
+            niche: Some(rcgjs_object::jir::types::Niche {
+                untagged_variant: 1,
+                niche_field: vec![0],
+                niche_start: 254,
+                valid_range: (255, 1),
+            }),
+        },
+        1,
+    ));
+
+    // enum SingleLiveOpt { Dead(Infallible), Live(Option<Ordering>) }
+    interns.intern_type(descriptor(
+        single_live_opt,
+        TypeKind::Adt {
+            def: def(935),
+            args: Vec::new(),
+            form: NominalForm::Enum,
+            variants: vec![
+                variant(
+                    dead,
+                    vec![field(FieldKey::Name(f0), infallible_ty)],
+                    0,
+                    None,
+                ),
+                variant(live, vec![field(FieldKey::Name(f0), opt_ord_ty)], 1, None),
+            ],
+            niche: None,
+        },
+        1,
+    ));
+
+    // Option<SingleLive>: niche_field = [0, 0], niche_start = 254 -> width = 8, bits = 255 -> Some (1)
+    let opt_sl_variants = vec![
+        variant(none, Vec::new(), 0, None),
+        variant(
+            some,
+            vec![field(FieldKey::Name(f0), single_live_ord)],
+            1,
+            None,
+        ),
+    ];
+    let opt_sl_niche = rcgjs_object::jir::types::Niche {
+        untagged_variant: 1,
+        niche_field: vec![0, 0],
+        niche_start: 254,
+        valid_range: (255, 1),
+    };
+    assert_eq!(
+        super::value::niche_width(&interns.types, &opt_sl_variants, &opt_sl_niche),
+        Some(8)
+    );
+    assert_eq!(
+        super::value::niche_variant(&interns.types, &opt_sl_variants, &opt_sl_niche, 254),
+        0
+    );
+    assert_eq!(
+        super::value::niche_variant(&interns.types, &opt_sl_variants, &opt_sl_niche, 255),
+        1
+    );
+
+    // Option<SingleLiveChar>: niche_field = [0, 0] must step to char (32), NOT Dead's u8 (8)!
+    let opt_slc_variants = vec![
+        variant(none, Vec::new(), 0, None),
+        variant(
+            some,
+            vec![field(FieldKey::Name(f0), single_live_char)],
+            1,
+            None,
+        ),
+    ];
+    let opt_slc_niche = rcgjs_object::jir::types::Niche {
+        untagged_variant: 1,
+        niche_field: vec![0, 0],
+        niche_start: u32::MAX as u128,
+        valid_range: (0, 0x10_FFFF),
+    };
+    assert_eq!(
+        super::value::niche_width(&interns.types, &opt_slc_variants, &opt_slc_niche),
+        Some(32)
+    );
+    assert_eq!(
+        super::value::niche_variant(&interns.types, &opt_slc_variants, &opt_slc_niche, 0xFF),
+        1
+    );
+
+    // Option<SingleLiveOpt>: niche_field = [0, 0] recurses through inner Option<Ordering> -> Some(8)
+    let opt_slo_variants = vec![
+        variant(none, Vec::new(), 0, None),
+        variant(
+            some,
+            vec![field(FieldKey::Name(f0), single_live_opt)],
+            1,
+            None,
+        ),
+    ];
+    let opt_slo_niche = rcgjs_object::jir::types::Niche {
+        untagged_variant: 1,
+        niche_field: vec![0, 0],
+        niche_start: 253,
+        valid_range: (254, 1),
+    };
+    assert_eq!(
+        super::value::niche_width(&interns.types, &opt_slo_variants, &opt_slo_niche),
+        Some(8)
+    );
+    assert_eq!(
+        super::value::niche_variant(&interns.types, &opt_slo_variants, &opt_slo_niche, 254),
+        1
+    );
+
+    // A 0-byte leaf must return None rather than Some(0)
+    let zero_variants = vec![
+        variant(none, Vec::new(), 0, None),
+        variant(
+            some,
+            vec![field(FieldKey::Name(f0), infallible_ty)],
+            1,
+            None,
+        ),
+    ];
+    let zero_niche = rcgjs_object::jir::types::Niche {
+        untagged_variant: 1,
+        niche_field: vec![0],
+        niche_start: 0,
+        valid_range: (1, 1),
+    };
+    assert_eq!(
+        super::value::niche_width(&interns.types, &zero_variants, &zero_niche),
+        None
+    );
+}
+
 mod invoke;
