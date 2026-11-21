@@ -2,5 +2,5 @@
   "schema": 1,
   "library": "idb",
   "language": "kotlin",
-  "boundary": "Wraps browser IndexedDB requests and transaction completion events and resolves JSON arrays of their outcomes."
+  "boundary": "run(input) reads the corpus object in place through external interfaces; keys, values, versions, counts, directions, modes and options stay JS values (undefined where absent) and reach IndexedDB unchanged, idb's requests are kotlin.js.Promises awaited from coroutines on promise jobs, and the result is a plain object { log, databases } of JS arrays, returned as a Promise."
 }

@@ -285,14 +285,14 @@ Every command that carries an `id` is answered synchronously, before the host re
 
 A command whose effects come later (`open`, `deleteDatabase`, `listenVersionChange`, `transaction`, `request`, `step`) then sends them as further messages with the same id. So Elm knows at once whether a request, a move or a schema call went through. It can make the position's next action, the batch's next request or the next upgrade step in the same synchronous turn, and stop at a call that threw.
 
-The comparator wrapper makes port round trips synchronous, so an Elm reaction to a `success`, `error`, `upgradeneeded`, `blocked` or `versionchange` message runs inside that event's dispatch, while the transaction is still active. A result that is `undefined` is sent without the `result` key.
+The host sends one `{ kind: "start" }` message after it subscribes to the outgoing port, and Elm begins the script on it, because a command sent from `init` would be lost. The comparator wrapper makes port round trips synchronous, so an Elm reaction to a `success`, `error`, `upgradeneeded`, `blocked` or `versionchange` message runs inside that event's dispatch, while the transaction is still active. A result that is `undefined` is sent without the `result` key.
 
 | Command | Host call | Messages |
 | --- | --- | --- |
 | `open { id, name, version? }` | `indexedDB.open(name, version)`, plus listeners for `upgradeneeded`, `blocked`, `success` and `error` | `value` or `threw`; later `upgradeneeded { id, db, transaction, oldVersion, newVersion }`, `blocked { id, oldVersion, newVersion }`, `success { id, result }`, `error { id, name }` |
 | `deleteDatabase { id, name }` | `indexedDB.deleteDatabase(name)`, plus listeners for `blocked`, `success` and `error` | the same, without `upgradeneeded` |
 | `listenVersionChange { id, db }` | `db.addEventListener('versionchange', …)` | `value`; later `versionchange { id, oldVersion, newVersion }`, each time |
-| `close { db }` | `db.close()` | none |
+| `close { id, db }` | `db.close()` | `value` (Elm delivers the commands of one `Cmd.batch` in reverse order, so it orders a close before the next open or delete by awaiting this answer) |
 | `transaction { id, db, stores, mode }` | `db.transaction(stores, mode)`, plus listeners for `complete`, `error` and `abort` | `value` or `threw`; later `complete { id }`, `error { id, txError }`, `abort { id, txError }`, where `txError` is `tx.error?.name ?? null` when the event fires |
 | `call { id, target, method, args }` | `target[method](...args)` for `objectStore`, `index`, `createObjectStore`, `deleteObjectStore`, `createIndex`, `deleteIndex` and `abort` | `value` or `threw` |
 | `request { id, target, method, args }` | `target[method](...args)` for `get`, `getKey`, `getAll`, `getAllKeys`, `count`, `put`, `add`, `delete`, `clear`, `openCursor`, `openKeyCursor` and `update`, and a cursor's `delete`; then one `success`/`error` pair on the returned request, removed after the first event | `value` or `threw`; later `success { id, result }` or `error { id, name }` |

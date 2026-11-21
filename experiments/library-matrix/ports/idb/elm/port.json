@@ -4,5 +4,5 @@
   "language": "elm",
   "main": "src/Main.elm",
   "host": "js/index.js",
-  "boundary": "Wraps browser IndexedDB requests and transaction completion events and resolves JSON arrays of their outcomes."
+  "boundary": "The JS host passes the input and a UUID as flags and executes only the contract's IndexedDB primitives, answering each command synchronously and reporting events as messages; Elm decodes the script with Json.Decode (host values stay Json.Value), runs idb and the script interpreter on a fiber runtime, and sends the output { log, databases } with finish."
 }

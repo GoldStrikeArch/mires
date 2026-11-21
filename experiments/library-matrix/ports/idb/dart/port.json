@@ -2,6 +2,6 @@
   "schema": 1,
   "library": "idb",
   "language": "dart",
-  "boundary": "Wraps browser IndexedDB requests and transaction completion events and resolves JSON arrays of their outcomes.",
+  "boundary": "run(input) reads the corpus object in place through dart:js_interop extension types; keys, values, versions, counts, directions, modes and options stay JSAny? host values and reach IndexedDB unchanged (argument lists hold only the arguments present), idb's requests are Futures awaited in async functions, and the result is a plain object { log, databases } of JS arrays, returned as a JSPromise; main() publishes run on globalThis.__matrixExports for the generated facade.",
   "entry": "src/main.dart"
 }

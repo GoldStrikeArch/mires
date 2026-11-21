@@ -2,5 +2,5 @@
   "schema": 1,
   "library": "idb",
   "language": "scalajs",
-  "boundary": "Wraps browser IndexedDB requests and transaction completion events and resolves JSON arrays of their outcomes."
+  "boundary": "run(input) reads the corpus object in place through @js.native facade traits; keys, values, versions, counts, directions, modes and options stay JS values (js.UndefOr where absent) and reach IndexedDB unchanged, idb's requests are Futures on JSExecutionContext.queue, and the result is a plain object { log, databases } of JS arrays, returned as a js.Promise."
 }
