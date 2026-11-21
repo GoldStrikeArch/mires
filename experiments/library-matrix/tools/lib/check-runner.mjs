@@ -39,8 +39,9 @@ import {
 // 1: one call per case. 2: the first / repeat / rewritten sequence (skipped `rewritten` in Firefox).
 // 3: realm-independent inputs. 4: uncanonicalisable outputs are not "throwing"; runtime guard.
 // 5: globalThis diff, reference-phase guard, per-load request attribution, CSP.
+// 6: browser cells run in the page realm (tools/lib/page.mjs), not in Firefox's WebDriver sandbox.
 // The version string is for people: receipts are bound to this code's digest (registry.mjs).
-export const CHECK_PROTOCOL = 'library-matrix-check/5'
+export const CHECK_PROTOCOL = 'library-matrix-check/6'
 
 async function evaluate(run, object, output, normalise) {
   let result
@@ -169,9 +170,8 @@ export async function runCheck(config, hooks = {}) {
   }
   let restore = () => {}
   try {
-    // Parsed by this module's own JSON.parse, so the inputs belong to the page realm (Firefox gives
-    // Response.json() objects of another realm to a module imported from a WebDriver script).
-    const cases = config.cases ?? JSON.parse(await (await fetch(config.casesUrl)).text()).cases
+    // A browser page fetches the corpus itself, so the inputs keep their key order.
+    const cases = config.cases ?? (await (await fetch(config.casesUrl)).json()).cases
     const normalise = config.normalisationUrl ? (await import(config.normalisationUrl)).apply : (value) => value
     if (typeof normalise !== 'function') throw new Error('the normalisation module does not export apply(value)')
     hooks.referencePhase?.(true)

@@ -121,14 +121,10 @@ export function inputText(value) {
 
 // Whether `target` (an input object a call has seen) can take `source`'s contents in place: both
 // plain objects, or both arrays. Primitives have no identity to reuse.
-// The test is realm-independent: in Firefox, objects a WebDriver-imported module gets from
-// Response.json() or structuredClone belong to another realm than the module's Object.prototype.
 export function rewritable(target, source) {
   const kind = (value) => {
     if (Array.isArray(value)) return 'array'
-    if (value === null || typeof value !== 'object' || Object.prototype.toString.call(value) !== '[object Object]') return null
-    const prototype = Object.getPrototypeOf(value)
-    return prototype !== null && Object.getPrototypeOf(prototype) === null ? 'object' : null
+    return value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype ? 'object' : null
   }
   return kind(target) !== null && kind(target) === kind(source)
 }

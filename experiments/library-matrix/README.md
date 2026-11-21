@@ -39,7 +39,7 @@ node tools/matrix.mjs                                    # MATRIX.md + matrix-re
 
 npm run pilot                                            # all five for the pilot (and the floor)
 npm run all                                              # all five for every library
-node tools/selftest.mjs                                  # the harness's own logic, no toolchains
+node tools/selftest.mjs                                  # the harness's own logic, no toolchains (Chrome and Firefox for the realm test)
 ```
 
 | Tool | Options |
@@ -48,7 +48,7 @@ node tools/selftest.mjs                                  # the harness's own log
 | `check.mjs` | `--library` (required), `--language`, `--environments node,chrome,firefox,safari` (default: the library's list), `--readable` (also check `dist/index.js`), `--call-timeout 30` (seconds a call may run without progress before the cell is `hang`) |
 | `bench.mjs` | `--library` (required), `--language`, `--environments`, `--design triplet\|pairs`, `--samples 24`, `--warmups 2`, `--min-sample-ms 20`, `--seed 1`, `--call-timeout 30`, `--aa-range 0.5,2` (an A/A p50 outside it refuses the cell) |
 | `sizes.mjs` (partial run) | `--library` / `--language` update those rows of the shared `sizes.json` and keep every other library's rows |
-| `selftest.mjs` | `--receipts <dir>` (its scratch modules go to `<dir>/selftest`) |
+| `selftest.mjs` | `--receipts <dir>` (its scratch modules go to `<dir>/selftest`; the directory must be inside the repository, whose files the browser test serves) |
 | `sizes.mjs` | `--library`, `--language` |
 | `matrix.mjs` | `--output <dir>` (default: this directory) |
 | all | `--matrix <registry>` (default `matrix.json`), `--receipts <dir>` (default `build/library-matrix`; the build work directories go to `<dir>/work`) |
@@ -69,7 +69,7 @@ languages/<language>/       build.mjs, plus shared templates (kotlin/gradle-temp
 ports/<library>/<language>/ one port: port.json and sources; dist/ is build output (git-ignored)
 tools/                      build, check, bench, sizes, matrix, selftest, and the per-cell entry points
 tools/lib/                  registry and receipts (Node), canonical forms, check runner and timing
-                            protocol (browser-safe), browser driving
+                            protocol (browser-safe), browser driving and its page-realm bootstrap
 MATRIX.md, matrix-results.json   generated report
 
 build/library-matrix/       (repository build/, git-ignored)
@@ -308,10 +308,10 @@ on it, and the report shows `stale` and counts nothing from it.
   normalisation module and its module graph; the output form; the bench-variant module and its
   graph.
 - **The harness code**, by content: `harness.sha256` over `tools/lib/canonical.mjs`,
-  `check-runner.mjs`, `tools/check.mjs`, `tools/check-cell.mjs`, `browser.mjs`, `cells.mjs` and
-  `registry.mjs` for check receipts, and over `canonical.mjs`, `protocol.mjs`, `tools/bench.mjs`,
-  `tools/bench-cell.mjs`, `browser.mjs`, `cells.mjs` and `registry.mjs` for bench receipts
-  (`HARNESS_CODE` in `registry.mjs`).
+  `check-runner.mjs`, `tools/check.mjs`, `tools/check-cell.mjs`, `browser.mjs`, `page.mjs`,
+  `cells.mjs` and `registry.mjs` for check receipts, and over `canonical.mjs`, `protocol.mjs`,
+  `tools/bench.mjs`, `tools/bench-cell.mjs`, `browser.mjs`, `page.mjs`, `cells.mjs` and
+  `registry.mjs` for bench receipts (`HARNESS_CODE` in `registry.mjs`).
   The protocol version strings are kept for people; any edit to these files makes their receipts
   stale. Build receipts record `harness` for `tools/build.mjs` and the Node version.
 - **The environment's major version.** A Node receipt is current only under the same Node major as
@@ -330,6 +330,18 @@ One cell is one port in one environment: a fresh Node process (`tools/check-cell
 page load in a WebDriver session, running `tools/lib/check-runner.mjs`. The reference adapter is
 imported and run on every case first, then the port, so nothing the port does at import time can
 reach the reference.
+
+**Page realm.** In a browser, the page itself loads the code. WebDriver inserts the same-origin
+bootstrap `tools/lib/page.mjs` as a `<script type="module">` and waits for its result, and the
+bootstrap imports the runner, which imports the reference and the port. So all of them run in the
+page's realm (`globalThis === window`), as on any web page, never in the realm of the WebDriver
+script. In Firefox that realm is Marionette's sandbox: a module imported from it has its own
+`Error`, `Object` and `Uint8Array`, so host errors (`fetch`, `URL`, `Cache.put`) fail
+`instanceof Error`, IndexedDB values and `structuredClone` results are objects of another realm, and
+`TextEncoder` output is a cross-compartment `Uint8Array`, an order of magnitude slower to index.
+The cell's request and its result cross WebDriver as JSON text (WebDriver argument objects lose
+their key order); the result event carries a per-load token that only the bootstrap holds.
+`tools/selftest.mjs` checks the realm in Chrome and Firefox, for check and bench cells.
 
 Each case runs as a **call sequence on one input object**, identically on both sides: `first` (a
 fresh `structuredClone` of the case input), `repeat` (the same object again), and `rewritten` (the
@@ -415,7 +427,8 @@ same digests everywhere.
 `tools/bench.mjs` runs the N-arm protocol of `tools/lib/protocol.mjs`, a generalisation of
 `experiments/browser-workloads/tools/timing-protocol.mjs` (same steps, calibration rule, sink,
 seeding and order statistics; that file is not modified). A cell runs in a **fresh Node process**
-(`tools/bench-cell.mjs`) or a **fresh browser page load**, and:
+(`tools/bench-cell.mjs`) or a **fresh browser page load**, in the page realm as in the checker (the
+input reaches the page inside the cell's JSON request, in its key order), and:
 
 0. **parity gate** (in `bench.mjs`, before the cell starts): the port's check receipt for that
    environment must be a pass for the current artifact, library binding and check code, from the
@@ -578,9 +591,9 @@ Reproduce with temporary copies of a port, a temporary registry naming them
 
 Writing such controls: the ReScript builder refuses a direct `eval` (Rollup's EVAL warning fails the
 build), and Terser removes a call to a side-effect-free infinite loop, so a hang control's loop
-must write somewhere. `tools/selftest.mjs` covers identity and content caches, argument mutation,
+must write somewhere (to a float: an int32 counter wraps negative within seconds and ends the loop). `tools/selftest.mjs` covers identity and content caches, argument mutation,
 hot-path divergence, output-form loopholes, the network guard, literal and computed dynamic imports
-and the source statistics on synthetic modules.
+and the source statistics on synthetic modules, and the page realm of browser cells.
 
 ## Per-language notes for faithful ports
 

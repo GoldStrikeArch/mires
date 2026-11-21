@@ -4,25 +4,36 @@
 // --headless=new, Firefox -headless, Safari headed (it has no headless mode). A browser whose
 // WebDriver session cannot start is `unavailable` with the driver's error, never a pass.
 //
+// The code under test runs in the page's own realm. WebDriver only loads the page, inserts the
+// same-origin bootstrap tools/lib/page.mjs as <script type="module"> and waits for its result; the
+// page imports the cell runner, the reference and the port. (A module imported from a WebDriver
+// script would run in Firefox in Marionette's sandbox, whose globalThis is not the window, so host
+// objects would come from another realm than the module's own Error, Object and Uint8Array.) The
+// request and the result cross WebDriver as JSON text, so they keep their key order (WebDriver
+// argument objects do not) and no object crosses a realm.
+//
 // Files are served from a loopback server at their repository-relative URLs under a per-load path
-// token, /__load/<N>/<repository path>, from an explicit whitelist, with cache-control: no-store;
-// relative imports between served files resolve as they do in Node (and keep the token), with no
-// import map (Firefox does not apply a page's import map to modules imported from a WebDriver
-// script). Every request is attributed to the page load that made it: by the token in its path,
-// or by the token in its Referer (an absolute-path image or fetch from the page); each load is
-// closed out (about:blank, then a short drain) before the next starts, so a late request is
-// charged to its own cell. The pages are served with COOP same-origin and COEP require-corp, so
-// performance.now() gets cross-origin-isolated resolution, and with a Content-Security-Policy that
-// allows scripts and connections only from this origin: a data: or blob: module or script is
-// refused, and the page reports it (`cspViolations`).
+// token, /__load/<N>/<repository path>, from an explicit whitelist (plus the bootstrap), with
+// cache-control: no-store; relative imports between served files resolve as they do in Node (and
+// keep the token), with no import map. Every request is attributed to the page load that made it:
+// by the token in its path, or by the token in its Referer (an absolute-path image or fetch from
+// the page); each load is closed out (about:blank, then a short drain) before the next starts, so
+// a late request is charged to its own cell. The pages are served with COOP same-origin and COEP
+// require-corp, so performance.now() gets cross-origin-isolated resolution, and with a
+// Content-Security-Policy that allows scripts and connections only from this origin: a data: or
+// blob: module or script is refused, and the page reports it (`cspViolations`).
 
 import { spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { createServer } from 'node:http'
 import { readFile } from 'node:fs/promises'
 import { extname, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { repositoryRoot } from './registry.mjs'
+import { harnessRoot, repositoryRoot } from './registry.mjs'
+
+// The page-realm bootstrap every server serves and runInPage inserts.
+export const BOOTSTRAP = resolve(harnessRoot, 'tools/lib/page.mjs')
 
 const CONTENT_TYPES = {
   '.js': 'text/javascript; charset=utf-8',
@@ -49,7 +60,7 @@ export function attributeRequest(pathname, referer) {
 
 export async function startServer(files) {
   const served = new Map()
-  for (const path of files) served.set(`/${relative(repositoryRoot, path)}`, path)
+  for (const path of [...files, BOOTSTRAP]) served.set(`/${relative(repositoryRoot, path)}`, path)
   const requests = []
   const beats = new Map()
   const server = createServer(async (request, response) => {
@@ -150,30 +161,47 @@ export async function openBrowser(name, { scriptTimeoutMs = 600_000 } = {}) {
   }
 }
 
-// Loads a fresh page, imports `moduleUrl` in it and calls its `exportName(config, { heartbeat })`;
-// resolves with the result (a JSON-compatible record). The heartbeat posts a beacon to the server
-// through the page's original navigator.sendBeacon, captured before the module can replace it.
+// Loads a fresh page in which the bootstrap (tools/lib/page.mjs, in the page realm) imports
+// `moduleUrl` and calls its `exportName(config, { heartbeat })`; resolves with the result (a
+// JSON-compatible record). The heartbeat posts a beacon to the server through the page's original
+// navigator.sendBeacon, which the bootstrap binds before the module can replace it. `config` must
+// be JSON-compatible: it reaches the page as JSON text, in its key order. The result event carries
+// a per-load random token that only the bootstrap holds, so no other script can report a result.
 export async function runInPage(driver, origin, load, moduleUrl, exportName, config) {
   await driver.get(`${origin}/__load/${load}${PAGE}?load=${load}`)
-  return driver.executeAsyncScript(`
+  const token = randomUUID()
+  const request = JSON.stringify({ moduleUrl, exportName, config, heartbeatUrl: `${origin}${HEARTBEAT}?load=${load}`, token })
+  const text = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
-    const [moduleUrl, exportName, config, heartbeatUrl] = arguments
-    const beacon = navigator.sendBeacon.bind(navigator)
-    const heartbeat = (label) => { try { beacon(heartbeatUrl + '&label=' + encodeURIComponent(String(label).slice(0, 200))) } catch {} }
+    const [bootstrapUrl, request, token] = arguments
     const cspViolations = []
     document.addEventListener('securitypolicyviolation', (event) => {
       cspViolations.push({ directive: event.effectiveDirective || event.violatedDirective, blocked: String(event.blockedURI).slice(0, 120) })
     })
     // Violation events are dispatched asynchronously (Chrome after a module load fails), so the
     // page waits briefly for them before reporting.
-    const finish = (result) => setTimeout(() => {
-      if (result && typeof result === 'object') result.cspViolations = cspViolations
-      done(result)
-    }, 250)
-    import(moduleUrl)
-      .then((module) => module[exportName](config, { heartbeat }))
-      .then(finish, (error) => finish({ status: 'error', error: { name: String(error && error.name), message: String(error && error.message || error), stack: String(error && error.stack) } }))
-  `, moduleUrl, exportName, config, `${origin}${HEARTBEAT}?load=${load}`)
+    let finished = false
+    const finish = (result) => {
+      if (finished) return
+      finished = true
+      setTimeout(() => {
+        if (result && typeof result === 'object') result.cspViolations = cspViolations
+        done(JSON.stringify(result))
+      }, 250)
+    }
+    document.addEventListener('library-matrix-result', (event) => {
+      let message = null
+      try { message = JSON.parse(String(event.detail)) } catch {}
+      if (message && message.token === token) finish(message.result)
+    })
+    const script = document.createElement('script')
+    script.type = 'module'
+    script.dataset.libraryMatrix = request
+    script.addEventListener('error', () => finish({ status: 'error', error: { name: 'Error', message: 'the page could not load the bootstrap ' + bootstrapUrl } }))
+    script.src = bootstrapUrl
+    document.head.append(script)
+  `, `${origin}/__load/${load}/${relative(repositoryRoot, BOOTSTRAP)}`, request, token)
+  return typeof text === 'string' ? JSON.parse(text) : null
 }
 
 // Ends a session whose page is stuck in a call that never returns. WebDriver commands queue behind

@@ -1,21 +1,23 @@
 #!/usr/bin/env node
 // Self-test of the harness's own logic, on synthetic modules (no toolchain needed): canonical
 // forms, the Williams design's balance, the checker's case semantics (async contract, both-threw,
-// normalisation, bytes and json forms) and the timing protocol's gate and async path.
+// normalisation, bytes and json forms), the timing protocol's gate and async path, and, in Chrome
+// and Firefox, that browser cells run the code under test in the page realm.
 //
-//   node tools/selftest.mjs [--receipts <dir>]
+//   node tools/selftest.mjs [--receipts <dir>]   (<dir> inside the repository: the browser test
+//                                                 serves its scratch modules from there)
 
 import assert from 'node:assert/strict'
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { CanonicalError, canonicalText } from './lib/canonical.mjs'
+import { CanonicalError, canonicalText, digestText } from './lib/canonical.mjs'
 import { runCheck } from './lib/check-runner.mjs'
 import { balancedOrders, runCell, williamsRows } from './lib/protocol.mjs'
-import { attributeRequest, startServer } from './lib/browser.mjs'
+import { attributeRequest, openBrowser, runWatched, startServer } from './lib/browser.mjs'
 import { componentsOf, componentSources, compositeFreshness, lockPath } from './lib/composite.mjs'
-import { directoryDigest, fileRecord, moduleGraph, receiptPaths, repositoryRoot, sourceInventory, writeJson } from './lib/registry.mjs'
+import { directoryDigest, fileRecord, harnessRoot, moduleGraph, receiptPaths, repositoryRoot, sourceInventory, writeJson } from './lib/registry.mjs'
 import { codeLines, embeddedJs, moduleState, SYNTAX } from './lib/source-stats.mjs'
 
 let passed = 0
@@ -305,6 +307,68 @@ await test('browser server: requests are charged to their own page load, late on
     const byLoad = (load) => server.requests.filter((request) => request.load === load).map((request) => request.path)
     assert.deepEqual(byLoad('1'), ['/late-image-probe'])
     assert.deepEqual(byLoad('2'), ['/library-matrix.html', '/experiments/innocent.mjs'])
+  } finally {
+    await server.close()
+  }
+})
+
+// The module under test reports its realm. In a module imported from a WebDriver script, Firefox
+// (Marionette's sandbox) gives globalThis !== window, its own Error, and host objects (a URL
+// error, a structuredClone result, TextEncoder output) from the window's realm instead.
+await test('browsers: check and bench cells run the code under test in the page realm', async () => {
+  assert.ok(!relative(repositoryRoot, dir).startsWith('..'), `the scratch directory ${dir} must be inside the repository, which the page server serves`)
+  const source = `export function run(input) {
+    let hostError = null
+    try { new URL('http://[') } catch (error) { hostError = error }
+    return {
+      globalThisIsWindow: globalThis === window,
+      errorIsWindowError: Error === window.Error,
+      hostErrorIsError: hostError instanceof Error,
+      inputIsPlain: Object.getPrototypeOf(input) === Object.prototype,
+      cloneIsPlain: Object.getPrototypeOf(structuredClone({ a: 1 })) === Object.prototype,
+      encodedIsUint8Array: new TextEncoder().encode('a') instanceof Uint8Array,
+      inputKeys: Object.keys(input).join(','),
+    }
+  }`
+  const paths = ['realm-reference', 'realm-port'].map((name) => {
+    writeFileSync(resolve(dir, `${name}.mjs`), source)
+    return resolve(dir, `${name}.mjs`)
+  })
+  const input = { zeta: 1, alpha: 2 }
+  const corpus = resolve(dir, 'realm-corpus.json')
+  writeFileSync(corpus, JSON.stringify({ schema: 1, cases: [{ id: 'realm', input }] }))
+  const facts = { globalThisIsWindow: true, errorIsWindowError: true, hostErrorIsError: true, inputIsPlain: true, cloneIsPlain: true, encodedIsUint8Array: true, inputKeys: 'zeta,alpha' }
+  const expected = await digestText(canonicalText(facts, 'json'))
+  const runner = resolve(harnessRoot, 'tools/lib/check-runner.mjs')
+  const protocol = resolve(harnessRoot, 'tools/lib/protocol.mjs')
+  const server = await startServer([runner, protocol, resolve(harnessRoot, 'tools/lib/canonical.mjs'), ...paths, corpus])
+  const output = { form: 'json', async: false }
+  let load = 0
+  try {
+    for (const browser of ['chrome', 'firefox']) {
+      const session = await openBrowser(browser)
+      assert.ok(!session.error, `${browser}: ${session.error}`)
+      try {
+        const query = () => `?load=${++load}`
+        let q = query()
+        const check = await runWatched(session, server, load, server.url(runner, q), 'runCheck', {
+          referenceUrl: server.url(paths[0], q), portUrl: server.url(paths[1], q), casesUrl: server.url(corpus, q), output, guard: { network: 'blocked' }, allowedGlobals: [],
+        }, { callTimeoutMs: 30_000 })
+        assert.equal(check.result.status, 'ok', `${browser} check: ${JSON.stringify(check.result.error)}`)
+        assert.deepEqual(check.result.cases.map((item) => [item.status, item.referenceDigest, item.portDigest]), [['equal', expected, expected]], `${browser} check cell realm facts`)
+        assert.deepEqual([check.result.guard.violations, check.result.guard.newGlobals, check.result.cspViolations], [[], [], []], `${browser} check guard`)
+        q = query()
+        const bench = await runWatched(session, server, load, server.url(protocol, q), 'runCell', {
+          library: 'self', port: 'p', case: 'realm', design: 'checksum', mode: 'checksum', input, output, expectedChecksum: expected, comparisons: [],
+          arms: [{ key: 'port-a', label: 'A', kind: 'port', url: server.url(paths[1], `${q}&instance=a`) }, { key: 'js', label: 'J', kind: 'reference', url: server.url(paths[0], q) }],
+          warmups: 0, samples: 1, minSampleMs: 1, baseIterations: 1, seed: 1,
+        }, { callTimeoutMs: 30_000 })
+        assert.equal(bench.result.status, 'ok', `${browser} bench cell realm facts: ${JSON.stringify(bench.result.error ?? { checksum: bench.result.arms?.map((arm) => arm.checksum), expected })}`)
+        assert.equal(bench.result.checksumMatchesExpected, true)
+      } finally {
+        await session.driver.quit().catch(() => {})
+      }
+    }
   } finally {
     await server.close()
   }

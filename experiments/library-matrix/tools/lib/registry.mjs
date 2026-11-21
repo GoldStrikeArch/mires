@@ -401,9 +401,9 @@ export async function currentBinding(library) {
 // other code is stale, whatever the protocol version string says.
 export const HARNESS_CODE = {
   check: ['tools/lib/canonical.mjs', 'tools/lib/check-runner.mjs', 'tools/check.mjs', 'tools/check-cell.mjs', 'tools/lib/browser.mjs',
-    'tools/lib/cells.mjs', 'tools/lib/registry.mjs'],
+    'tools/lib/page.mjs', 'tools/lib/cells.mjs', 'tools/lib/registry.mjs'],
   bench: ['tools/lib/canonical.mjs', 'tools/lib/protocol.mjs', 'tools/bench.mjs', 'tools/bench-cell.mjs', 'tools/lib/browser.mjs',
-    'tools/lib/cells.mjs', 'tools/lib/registry.mjs'],
+    'tools/lib/page.mjs', 'tools/lib/cells.mjs', 'tools/lib/registry.mjs'],
   build: ['tools/build.mjs', 'tools/lib/registry.mjs'],
 }
 

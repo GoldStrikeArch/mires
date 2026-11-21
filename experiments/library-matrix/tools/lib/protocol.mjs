@@ -39,8 +39,10 @@ import { canonicalText, describeEnvironment, digestText, errorRecord, inputText,
 
 // 2: fresh inputs, in-sample output verification. 3: crypto-seeded output picks, bench variants,
 // warm re-calibration, p95IsMax, heartbeats. 4: disjoint variant ranges per arm, A/A range gate,
-// per-environment expected checksum. Receipts are bound to this code's digest.
-export const PROTOCOL_VERSION = 'library-matrix/4 (N-arm generalisation of browser-workloads timing protocol 1)'
+// per-environment expected checksum. 5: browser cells run in the page realm (tools/lib/page.mjs),
+// and the input reaches the page as JSON text, in its key order. Receipts are bound to this code's
+// digest.
+export const PROTOCOL_VERSION = 'library-matrix/5 (N-arm generalisation of browser-workloads timing protocol 1)'
 
 const MAX_ITERATIONS = 1_000_000
 // Memory for the fresh input clones of one batch of timed calls (estimated at 4 bytes per

@@ -18,7 +18,7 @@ import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { HEARTBEAT, PAGE, openBrowser, runWatched, startServer } from './lib/browser.mjs'
+import { BOOTSTRAP, HEARTBEAT, PAGE, openBrowser, runWatched, startServer } from './lib/browser.mjs'
 import { runNodeCell } from './lib/cells.mjs'
 import { inputText, digestText } from './lib/canonical.mjs'
 import { CHECK_PROTOCOL } from './lib/check-runner.mjs'
@@ -229,7 +229,7 @@ async function browserCell(port, context, browser, artifactName, session, server
   // Request accounting: during the cell the page may fetch only the files this cell needs. An
   // import() of a module the page already loaded makes no request and is not visible here
   // (README "Runtime guard"); the Node cell's resolve hook sees those.
-  const allowed = new Set([PAGE, HEARTBEAT, '/favicon.ico', server.servedPath(runnerPath), server.servedPath(resolve(harnessRoot, 'tools/lib/canonical.mjs')),
+  const allowed = new Set([PAGE, HEARTBEAT, '/favicon.ico', server.servedPath(BOOTSTRAP), server.servedPath(runnerPath), server.servedPath(resolve(harnessRoot, 'tools/lib/canonical.mjs')),
     server.servedPath(context.library.corpusPath), server.servedPath(resolve(port.dir, 'dist', artifactName)),
     ...[...context.identity.modules, ...context.identity.normalisationModules].map((module) => `/${module.path}`)])
   const unexpected = [...new Set(requests.map((request) => request.path).filter((path) => !allowed.has(path)))]
