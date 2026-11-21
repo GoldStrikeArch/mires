@@ -4,5 +4,5 @@
   "language": "rust",
   "entry": "src/lib.rs",
   "crateName": "matrix_idb",
-  "boundary": "Rust async futures wrap native IndexedDB requests and transaction events and resolve an array of outcomes."
+  "boundary": "Rust decodes the script into typed steps; keys, values and options stay JsValue, idb's requests are host Promises awaited as futures, and the result is a JS object of log entries and database dumps."
 }
