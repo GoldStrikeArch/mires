@@ -3,5 +3,5 @@
   "library": "workbox",
   "language": "jsoo",
   "entry": "src/main.ml",
-  "boundary": "Browser CacheStorage, Fetch and service-worker events are used for revisioned precaching, routing and runtime strategies."
+  "boundary": "run(input) reads the script in place through Host (shared with the Melange port; js_of_ocaml's Promise binding and Js.Unsafe); Workbox's controller, router, strategies and plugins run as promises of results over the host's CacheStorage, Fetch, Request, Response and URL, strings cross with Js.string and Js.to_string, and the output is a JS object, from a promise published with Js.export."
 }

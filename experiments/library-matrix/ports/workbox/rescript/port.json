@@ -3,5 +3,5 @@
   "library": "workbox",
   "language": "rescript",
   "entry": "src/Index.res",
-  "boundary": "Browser CacheStorage, Fetch and service-worker events are used for revisioned precaching, routing and runtime strategies."
+  "boundary": "run(input) reads the script's step objects in place as ReScript records; Workbox's controller, router, strategies and plugins are ReScript async functions over bindings to the host's CacheStorage, Fetch, Request, Response and URL, thrown values stay the JS values they are, and the output is built as JSON.t in the contract's key order."
 }

@@ -3,5 +3,5 @@
   "library": "workbox",
   "language": "gopherjs",
   "package": "./src",
-  "boundary": "Browser CacheStorage, Fetch and service-worker events are used for revisioned precaching, routing and runtime strategies."
+  "boundary": "run(input) reads the script in place as *js.Object; Workbox's controller, router, strategies and plugins are Go functions that continue in callbacks on host promises (tasks with typed outcomes, no goroutines), over Go types for the host's CacheStorage, Fetch, Request, Response and URL, and the output is a JS object, from a promise; run is published on js.Module.exports."
 }
