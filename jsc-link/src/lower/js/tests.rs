@@ -7583,4 +7583,191 @@ fn niche_width_selects_unique_inhabited_enum_variant_and_never_returns_zero() {
     );
 }
 
+#[test]
+fn transmute_ref_aggregate_to_usize_boxes_before_addr() {
+    let interns = world();
+    let e = FuncBuilder::ENTRY;
+    let mut b = FuncBuilder::new(item(1), signature(vec![REF_POINT], USIZE));
+    let r = b.param(REF_POINT, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: r,
+            from: REF_POINT,
+            to: USIZE,
+        },
+        USIZE,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let func = b.finish();
+    let plan = plan_of(&func, &[(0, "r")]);
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+    assert_eq!(
+        js,
+        "function f(r) {\n  return __rt.addr(__rt.box(r), 8) >>> 0;\n}\n"
+    );
+}
+
+#[test]
+fn transmute_between_ref_and_raw_aggregate_converts_slot_form() {
+    let interns = world();
+    let e = FuncBuilder::ENTRY;
+
+    let mut b1 = FuncBuilder::new(item(1), signature(vec![REF_POINT], RAW_POINT));
+    let r = b1.param(REF_POINT, NO_ORIGIN);
+    let raw = b1.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: r,
+            from: REF_POINT,
+            to: RAW_POINT,
+        },
+        RAW_POINT,
+        NO_ORIGIN,
+    );
+    b1.terminate(e, RTerm::Return(Some(raw)));
+    let f1 = b1.finish();
+    let p1 = plan_of(&f1, &[(0, "r")]);
+    let body1 = body_of(BodyKind::Function, f1.sig.clone());
+    let js1 = lower(&interns, "to_raw", &[], &body1, &f1, &p1, straight(&f1));
+    assert_eq!(js1, "function to_raw(r) {\n  return __rt.box(r);\n}\n");
+
+    let mut b2 = FuncBuilder::new(item(2), signature(vec![RAW_POINT], REF_POINT));
+    let p = b2.param(RAW_POINT, NO_ORIGIN);
+    let rf = b2.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: p,
+            from: RAW_POINT,
+            to: REF_POINT,
+        },
+        REF_POINT,
+        NO_ORIGIN,
+    );
+    b2.terminate(e, RTerm::Return(Some(rf)));
+    let f2 = b2.finish();
+    let p2 = plan_of(&f2, &[(0, "p")]);
+    let body2 = body_of(BodyKind::Function, f2.sig.clone());
+    let js2 = lower(&interns, "to_ref", &[], &body2, &f2, &p2, straight(&f2));
+    assert_eq!(js2, "function to_ref(p) {\n  return p.buf[p.off];\n}\n");
+}
+
+#[test]
+fn transmute_and_expose_fn_ptr_to_usize_calls_addr() {
+    const FN_PTR: TypeId = TypeId(410);
+    let mut interns = world();
+    let fn_desc = descriptor(
+        FN_PTR,
+        TypeKind::FnPtr {
+            sig: rcgjs_object::jir::interns::SigId(0),
+        },
+        4,
+    );
+    interns.intern_type(fn_desc);
+
+    let e = FuncBuilder::ENTRY;
+    for (idx, kind) in [CastKind::Transmute, CastKind::PointerExposeProvenance]
+        .into_iter()
+        .enumerate()
+    {
+        let mut b = FuncBuilder::new(item(idx as u64 + 1), signature(vec![FN_PTR], USIZE));
+        let f = b.param(FN_PTR, NO_ORIGIN);
+        let out = b.op(
+            e,
+            OpKind::Cast {
+                kind,
+                v: f,
+                from: FN_PTR,
+                to: USIZE,
+            },
+            USIZE,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let func = b.finish();
+        let plan = plan_of(&func, &[(0, "f")]);
+        let body = body_of(BodyKind::Function, func.sig.clone());
+        let js = lower(&interns, "addr", &[], &body, &func, &plan, straight(&func));
+        assert_eq!(
+            js,
+            "function addr(f) {\n  return __rt.addr(f, 1) >>> 0;\n}\n"
+        );
+    }
+}
+
+#[test]
+fn transmute_signed_isize_to_thin_pointer_masks_unsigned() {
+    let interns = world();
+    let e = FuncBuilder::ENTRY;
+    let mut b = FuncBuilder::new(item(1), signature(vec![ISIZE], RAW_I32));
+    let x = b.param(ISIZE, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: x,
+            from: ISIZE,
+            to: RAW_I32,
+        },
+        RAW_I32,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let func = b.finish();
+    let plan = plan_of(&func, &[(0, "x")]);
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+    assert_eq!(js, "function f(x) {\n  return x >>> 0;\n}\n");
+}
+
+#[test]
+fn transmute_single_element_array_of_pattern_pointer_to_usize() {
+    const PAT_RAW: TypeId = TypeId(411);
+    const ARR_ONE: TypeId = TypeId(412);
+    let mut interns = world();
+    let mut pat = descriptor(PAT_RAW, TypeKind::Pattern(RAW_I32), 4);
+    pat.js.peeled = RAW_I32;
+    pat.js.pointer_form = Some(PointerForm::Slot);
+    interns.intern_type(pat);
+    let mut arr = descriptor(
+        ARR_ONE,
+        TypeKind::Array {
+            element: PAT_RAW,
+            length: 1,
+        },
+        4,
+    );
+    arr.js.is_indirect = true;
+    interns.intern_type(arr);
+
+    let e = FuncBuilder::ENTRY;
+    let mut b = FuncBuilder::new(item(1), signature(vec![ARR_ONE], USIZE));
+    let a = b.param(ARR_ONE, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: a,
+            from: ARR_ONE,
+            to: USIZE,
+        },
+        USIZE,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let func = b.finish();
+    let plan = plan_of(&func, &[(0, "a")]);
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+    assert_eq!(
+        js,
+        "function f(a) {\n  return __rt.addr(a[0], 4) >>> 0;\n}\n"
+    );
+}
+
 mod invoke;
