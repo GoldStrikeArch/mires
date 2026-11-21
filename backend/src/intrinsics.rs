@@ -1919,26 +1919,37 @@ fn transmute_scalar<'tcx>(
         {
             int_to_bytes(from, value)
         }
-        // A **fieldless enum with an integer `repr`** and the integer of its own width. Such a
+        // A **fieldless enum with an integer `repr`** and an integer of its own width. Such a
         // value *is* its discriminant, in this model as on a real machine (`value::EnumRepr`), so
-        // moving between the two moves nothing at all. `core` transmutes both ways: `u8` to
-        // `AsciiChar` on the ASCII escaping path, and `Alignment` to `usize` under
-        // `NonNull::dangling`.
+        // moving between the two moves nothing at all when the signedness agrees and re-masks to
+        // the destination's signedness when they differ. `core` transmutes both ways: `u8` to
+        // `AsciiChar` on the ASCII escaping path, `Alignment` to `usize` under
+        // `NonNull::dangling`, and `Ordering` (`#[repr(i8)]`) inside `Option<Ordering>` <-> `u8`.
         //
-        // The widths and the signedness have to agree exactly. Where they do, the number is already
-        // in range for the destination and needs no mask; where they do not, this says nothing and
-        // the rows below report. A fieldless enum *without* an integer `repr` is a variant name
-        // rather than a number, and no row here claims it: the discriminant such a transmute would
-        // be observing is not part of the value, so the zombie at the end reports instead.
+        // A fieldless enum *without* an integer `repr` is a variant name rather than a number, and
+        // no row here claims it: the discriminant such a transmute would be observing is not part
+        // of the value, so the zombie at the end reports instead.
         (ReprClass::Other, ReprClass::Int(to))
-            if value::direct_tag(tcx, inner_from) == Some((u64::from(to.bits), to.signed)) =>
+            if value::direct_tag(tcx, inner_from)
+                .is_some_and(|(bits, _)| bits == u64::from(to.bits)) =>
         {
-            value
+            let (_, from_signed) = value::direct_tag(tcx, inner_from).unwrap();
+            if from_signed == to.signed {
+                value
+            } else {
+                mask(to.repr, to.signed, to.bits, value)
+            }
         }
         (ReprClass::Int(from), ReprClass::Other)
-            if value::direct_tag(tcx, inner_to) == Some((u64::from(from.bits), from.signed)) =>
+            if value::direct_tag(tcx, inner_to)
+                .is_some_and(|(bits, _)| bits == u64::from(from.bits)) =>
         {
-            value
+            let (_, to_signed) = value::direct_tag(tcx, inner_to).unwrap();
+            if from.signed == to_signed {
+                value
+            } else {
+                mask(from.repr, to_signed, from.bits, value)
+            }
         }
         // The same value seen as a *pointer* rather than as an integer. `NonNull::dangling()` is
         // `without_provenance(align)` and is written as a transmute of an `Alignment` straight to a
@@ -2061,40 +2072,33 @@ fn int_to_bytes(int: Int, value: Expr) -> Expr {
 /// The parameter the niche decode binds the incoming scalar to.
 const NICHE_PARAM: &str = "$n";
 
-/// A `transmute` from an integer into a niche encoded two variant enum, decoded at run time.
+/// A `transmute` from an integer into a niche encoded enum, decoded at run time.
 ///
 /// This is how `NonZero::<T>::new` is written — `transmute::<u32, Option<NonZero<u32>>>(n)` — and
-/// through it how `i32::pow`, `next_power_of_two` and a good deal of `core::num` are written. The
-/// bit pattern is the payload for every value except one, the *niche*, which stands for the empty
-/// variant; the two are told apart by a comparison and rebuilt into the ordinary shape `value.rs`
-/// gives that enum.
+/// through it how `i32::pow`, `next_power_of_two` and a good deal of `core::num` are written. Each
+/// inhabited niche variant occupies its exact wrapped bit pattern
+/// `truncate(bits, niche_start.wrapping_add(v - niche_variants.start))`, formatted at the source
+/// integer's width and signedness via [`value::int_literal`] (so signed niches with their high bit
+/// set and `u128` niches `>= 2^127` compare accurately against the runtime scalar); every other
+/// value decodes to the untagged variant's single payload field, transmuted recursively.
 ///
 /// Deliberately narrow. It applies only when
 ///
 /// * the destination is an enum whose tag is niche encoded and as wide as the source integer;
-/// * exactly **one** variant is niche encoded, so the comparison has a single answer (with several,
-///   the discriminant would be a function of the value rather than a constant, and this would have
-///   to build an arithmetic expression instead);
-/// * that variant carries no data, and the other carries exactly one non-zero-sized field, which
-///   the payload is transmuted into recursively.
-///
-/// `Option<NonZero<T>>`, `Option<&T>` and `Option<char>` all satisfy that; anything else stays a
-/// zombie rather than a guess.
+/// * every inhabited niche variant carries no non-zero-sized data;
+/// * the untagged variant carries exactly one non-zero-sized field, which the payload is
+///   transmuted into recursively.
 fn niche_from_scalar<'tcx>(
     fx: &FnCx<'_, 'tcx>,
     from_ty: Ty<'tcx>,
     to_ty: Ty<'tcx>,
     value: Expr,
 ) -> Option<Expr> {
-    use rustc_abi::{TagEncoding, Variants};
+    use rustc_abi::{TagEncoding, VariantIdx, Variants};
+    use rustc_middle::ty::layout::LayoutCx;
 
     let tcx = fx.tcx;
-    let (signed, bits) = int_info(tcx, from_ty)?;
-    let int = Int {
-        repr: int_repr(from_ty),
-        signed,
-        bits,
-    };
+    let (_, bits) = int_info(tcx, from_ty)?;
 
     let ty::Adt(def, args) = to_ty.kind() else {
         return None;
@@ -2116,15 +2120,35 @@ fn niche_from_scalar<'tcx>(
     else {
         return None;
     };
-    if tag.size(&tcx).bits() as u32 != bits || niche_variants.start != niche_variants.last {
+    let tag_size = tag.size(&tcx);
+    if tag_size.bits() as u32 != bits {
         return None;
     }
 
-    let empty_index = niche_variants.start;
-    let empty = def.variant(empty_index);
     let normalize = |ty| tcx.normalize_erasing_regions(typing_env(), ty);
     let live = |ty| !is_zst(tcx, normalize(ty));
-    if empty.fields.iter().any(|field| live(field.ty(tcx, args))) {
+    let layout_cx = LayoutCx::new(tcx, typing_env());
+
+    let mut niche_cases = Vec::new();
+    for raw_idx in niche_variants.start.index()..=niche_variants.last.index() {
+        let variant_idx = VariantIdx::from_usize(raw_idx);
+        if variant_idx == *untagged_variant {
+            continue;
+        }
+        if layout.for_variant(&layout_cx, variant_idx).is_uninhabited() {
+            continue;
+        }
+        let variant = def.variant(variant_idx);
+        if variant.fields.iter().any(|field| live(field.ty(tcx, args))) {
+            return None;
+        }
+        let offset = (raw_idx - niche_variants.start.index()) as u128;
+        let raw_bits = tag_size.truncate(niche_start.wrapping_add(offset));
+        let niche_lit = value::int_literal(tcx, from_ty, raw_bits)?;
+        let empty_value = value::enum_value(tcx, to_ty, variant_idx, Vec::new())?;
+        niche_cases.push((niche_lit, empty_value));
+    }
+    if niche_cases.is_empty() {
         return None;
     }
 
@@ -2139,12 +2163,7 @@ fn niche_from_scalar<'tcx>(
     }
     let field_ty = normalize(field.ty(tcx, args));
 
-    // The niche is the one value that is not a payload. With a single niche variant the tag *is*
-    // `niche_start`, so the test is an equality rather than the range check the general encoding
-    // would need.
     let bound = jsast::id(NICHE_PARAM);
-    let niche = int.literal(i128::try_from(*niche_start).ok()?);
-    let empty_value = value::enum_value(tcx, to_ty, empty_index, Vec::new())?;
     let filled = value::enum_value(
         tcx,
         to_ty,
@@ -2154,44 +2173,41 @@ fn niche_from_scalar<'tcx>(
             codegen_transmute(fx, from_ty, field_ty, bound.clone()),
         )],
     )?;
-    let decoded = jsast::cond(
-        jsast::binary(JsBinOp::StrictEq, bound, niche),
-        empty_value,
-        filled,
-    );
+    let mut decoded = filled;
+    for (niche_lit, empty_value) in niche_cases.into_iter().rev() {
+        decoded = jsast::cond(
+            jsast::binary(JsBinOp::StrictEq, bound.clone(), niche_lit),
+            empty_value,
+            decoded,
+        );
+    }
     Some(jsast::call(
         jsast::arrow(vec![NICHE_PARAM.to_string()], decoded),
         vec![value],
     ))
 }
 
-/// The other direction of [`niche_from_scalar`]: a niche encoded two variant enum transmuted to
-/// the integer its layout stores, encoded at run time.
+/// The other direction of [`niche_from_scalar`]: a niche encoded enum transmuted to the integer
+/// its layout stores, encoded at run time.
 ///
 /// `core` implements `PartialOrd::lt` and its siblings for `[T]` as a transmute of a
 /// `ControlFlow<bool>` to `u8` (`slice/cmp.rs`, `as_underlying`): `Break(false)` is 0,
 /// `Break(true)` is 1 and `Continue(())` is the niche. Here the enum is an object, so the bit
-/// pattern is computed: the empty variant is the niche value, re-signed at the destination's width,
-/// and the other is its payload transmuted into the integer recursively, under the decode's
-/// conditions: the tag as wide as the integer, one niche variant carrying no data, and one payload
-/// field. The encode matches rustc's layout; the decode does not round trip a signed niche with its
-/// high bit set, because it compares against the niche's raw unsigned bits (`CONTRACT.md`,
-/// "Transmuting between an enum and an integer").
+/// pattern is computed: each inhabited niche variant maps to its wrapped niche bit pattern,
+/// formatted at the destination integer's width and signedness via [`value::int_literal`], and
+/// the untagged variant is its payload transmuted into the integer recursively. Both directions
+/// round trip across all signed and unsigned integer widths and wrapping niche ranges.
 fn niche_to_scalar<'tcx>(
     fx: &FnCx<'_, 'tcx>,
     from_ty: Ty<'tcx>,
     to_ty: Ty<'tcx>,
     value: Expr,
 ) -> Option<Expr> {
-    use rustc_abi::{TagEncoding, Variants};
+    use rustc_abi::{TagEncoding, VariantIdx, Variants};
+    use rustc_middle::ty::layout::LayoutCx;
 
     let tcx = fx.tcx;
-    let (signed, bits) = int_info(tcx, to_ty)?;
-    let int = Int {
-        repr: int_repr(to_ty),
-        signed,
-        bits,
-    };
+    let (_, bits) = int_info(tcx, to_ty)?;
 
     let ty::Adt(def, args) = from_ty.kind() else {
         return None;
@@ -2213,15 +2229,36 @@ fn niche_to_scalar<'tcx>(
     else {
         return None;
     };
-    if tag.size(&tcx).bits() as u32 != bits || niche_variants.start != niche_variants.last {
+    let tag_size = tag.size(&tcx);
+    if tag_size.bits() as u32 != bits {
         return None;
     }
 
-    let empty_index = niche_variants.start;
-    let empty = def.variant(empty_index);
     let normalize = |ty| tcx.normalize_erasing_regions(typing_env(), ty);
     let live = |ty| !is_zst(tcx, normalize(ty));
-    if empty.fields.iter().any(|field| live(field.ty(tcx, args))) {
+    let layout_cx = LayoutCx::new(tcx, typing_env());
+    let repr = value::enum_repr(tcx, from_ty)?;
+
+    let mut niche_cases = Vec::new();
+    for raw_idx in niche_variants.start.index()..=niche_variants.last.index() {
+        let variant_idx = VariantIdx::from_usize(raw_idx);
+        if variant_idx == *untagged_variant {
+            continue;
+        }
+        if layout.for_variant(&layout_cx, variant_idx).is_uninhabited() {
+            continue;
+        }
+        let variant = def.variant(variant_idx);
+        if variant.fields.iter().any(|field| live(field.ty(tcx, args))) {
+            return None;
+        }
+        let offset = (raw_idx - niche_variants.start.index()) as u128;
+        let raw_bits = tag_size.truncate(niche_start.wrapping_add(offset));
+        let niche_lit = value::int_literal(tcx, to_ty, raw_bits)?;
+        let tag_lit = value::variant_tag(tcx, from_ty, variant_idx)?;
+        niche_cases.push((tag_lit, niche_lit));
+    }
+    if niche_cases.is_empty() {
         return None;
     }
 
@@ -2238,14 +2275,17 @@ fn niche_to_scalar<'tcx>(
     let key = value::field_key(tcx, from_ty, Some(*untagged_variant), field_index)?;
 
     let bound = jsast::id(NICHE_PARAM);
-    let is_empty = jsast::binary(
-        JsBinOp::StrictEq,
-        value::tag_expr(value::enum_repr(tcx, from_ty)?, bound.clone()),
-        value::variant_tag(tcx, from_ty, empty_index)?,
-    );
-    let niche = int.literal(value::resign(signed, bits, *niche_start));
-    let payload_bits = codegen_transmute(fx, field_ty, to_ty, value::field_expr(bound, key));
-    let encoded = jsast::cond(is_empty, niche, payload_bits);
+    let payload_bits =
+        codegen_transmute(fx, field_ty, to_ty, value::field_expr(bound.clone(), key));
+    let mut encoded = payload_bits;
+    for (tag_lit, niche_lit) in niche_cases.into_iter().rev() {
+        let is_variant = jsast::binary(
+            JsBinOp::StrictEq,
+            value::tag_expr(repr, bound.clone()),
+            tag_lit,
+        );
+        encoded = jsast::cond(is_variant, niche_lit, encoded);
+    }
     Some(jsast::call(
         jsast::arrow(vec![NICHE_PARAM.to_string()], encoded),
         vec![value],

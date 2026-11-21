@@ -1407,28 +1407,31 @@ numeric decision tree is untouched for integers, for `char`, and for `#[repr(int
 ### Transmuting between an enum and an integer
 
 A fieldless enum with an integer `repr` **is** its discriminant, in this model as on a real machine,
-so a `transmute` between it and the integer of its own width and signedness is the **identity** --
-in both directions, and to a thin pointer as well (`NonNull::dangling()` is a transmute of a
-`mem::Alignment` straight to a pointer). The widths and the signedness have to agree exactly.
+so a `transmute` between it and an integer of its own width is the **identity** when the signedness
+agrees and re-masks to the destination's signedness when they differ -- in both directions, and to a
+thin pointer as well (`NonNull::dangling()` is a transmute of a `mem::Alignment` straight to a
+pointer).
 
 A fieldless enum **without** an integer `repr` is a variant name, and the discriminant such a
 transmute would be observing is not part of the value. No rule claims it, so it is a
 [zombie](#the-zombie-census-in-core-and-alloc) rather than a guess. Nothing in `core` or `alloc`
 reaches one: every fieldless enum they transmute has an integer `repr`.
 
-An enum with a payload is an object, and a **two-variant niche-encoded** one is the other shape
-`core` transmutes. From an integer it is decoded at run time -- the niche value is the empty
-variant, anything else is the payload (`NonZero::new`, `Option<&T>`, `Option<char>`) -- and to an
-integer it is encoded the same way round: the empty variant is its niche value, re-signed at the
-integer's width, and the other is its one payload field transmuted into the integer. The encode
-gives the bit pattern rustc's layout stores. The two directions do **not** round trip for a signed
-niche whose high bit is set: the decode compares the integer with the niche's raw unsigned bits, so
-`transmute::<i8, Option<Ordering>>(-2)`, whose niche is `-2`, decodes as `Some` rather than `None`.
-That is a known gap in the decode, in both lanes; an unsigned niche, and a signed one below the high
-bit, round trip. `PartialOrd::lt` and its siblings for `[T]` need the encode: `core` writes them as
-a transmute of a `ControlFlow<bool>` to `u8` (`slice/cmp.rs`, `as_underlying`), which made `a < b`
-on slices, and every sort of slices, a zombie before. `examples/core-tests/344_slice_partial_ord.rs`
-pins both directions for unsigned niches.
+An enum with a payload is an object, and a **niche-encoded** one whose niche scalar is as wide as
+the integer, whose inhabited niche variants are fieldless (ZST fields only), and whose untagged
+variant carries a single non-ZST field is the other shape `core` transmutes. From an integer it is
+decoded at run time -- each inhabited niche variant compares against its wrapped niche bit pattern
+formatted at the source integer's width and signedness (`NonZero::new`, `Option<&T>`, `Option<char>`,
+`Option<Ordering>`, multi-variant niche enums), anything else decodes as the payload -- and to an
+integer it is encoded the same way round: each niche variant maps to its niche value formatted at
+the destination integer's width and signedness, and the untagged variant is its one payload field
+transmuted into the integer. Both directions match rustc's layout and round trip across all signed
+and unsigned integer widths (`i8/u8`..`i128/u128`, including wrapping niche ranges) in both lanes.
+`PartialOrd::lt` and its siblings for `[T]` need the encode: `core` writes them as a transmute of a
+`ControlFlow<bool>` to `u8` (`slice/cmp.rs`, `as_underlying`), which made `a < b` on slices, and
+every sort of slices, a zombie before. `examples/core-tests/344_slice_partial_ord.rs` and
+`examples/core-tests/362_signed_niche_transmute.rs`..`364_multi_wrapping_niche_transmute.rs` pin
+both directions across signed, unsigned, wide, and multi-variant wrapping niches.
 
 The same rule is what makes a slice of one byte elements readable as text: a `[u8]`, an `[i8]` and a
 slice of a fieldless one-byte `#[repr(int)]` enum are all buffers of JavaScript numbers, and

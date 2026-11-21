@@ -843,17 +843,85 @@ fn zero_variant(
     (variants.len() == 1).then_some(0)
 }
 
-/// Whether a type is uninhabited (`!`, or an enum with no variants), shallowly.
-fn is_uninhabited(table: &TypeTable, ty: TypeId) -> bool {
+/// Whether a type is uninhabited (`!`, a 0-variant enum, or an aggregate containing one).
+pub fn is_uninhabited(table: &TypeTable, ty: TypeId) -> bool {
+    is_uninhabited_at(table, ty, 0)
+}
+
+fn is_uninhabited_at(table: &TypeTable, ty: TypeId, depth: usize) -> bool {
+    if depth > 16 {
+        return false;
+    }
     match kind(table, ty) {
         Some(TypeKind::Never) => true,
+        Some(TypeKind::Pattern(base)) => is_uninhabited_at(table, *base, depth + 1),
+        Some(TypeKind::Tuple(elements)) => elements
+            .iter()
+            .any(|element| is_uninhabited_at(table, *element, depth + 1)),
+        Some(TypeKind::Array { element, length }) => {
+            *length > 0 && is_uninhabited_at(table, *element, depth + 1)
+        }
+        Some(TypeKind::Adt {
+            form: NominalForm::Struct,
+            variants,
+            ..
+        }) => variants.first().is_some_and(|variant| {
+            variant
+                .fields
+                .iter()
+                .any(|field| is_uninhabited_at(table, field.ty, depth + 1))
+        }),
         Some(TypeKind::Adt {
             form: NominalForm::Enum,
             variants,
             ..
-        }) => variants.is_empty(),
+        }) => variants.iter().all(|variant| {
+            variant
+                .fields
+                .iter()
+                .any(|field| is_uninhabited_at(table, field.ty, depth + 1))
+        }),
         _ => false,
     }
+}
+
+/// The inhabited niche variants of a niche-encoded enum and the raw tag bit pattern each one
+/// occupies at width `bits` (`(variant_index, raw_bits)`).
+///
+/// Matches rustc's `TagEncoding::Niche` numbering (`niche_start.wrapping_add(v - start) & mask`,
+/// skipping `untagged_variant` and uninhabited variants while preserving their slot offsets).
+pub fn niche_variant_tags(
+    table: &TypeTable,
+    variants: &[VariantDescriptor],
+    niche: &rcgjs_object::jir::types::Niche,
+    bits: u32,
+) -> Option<Vec<(u32, u128)>> {
+    let present = |index: usize| {
+        !variants[index]
+            .fields
+            .iter()
+            .any(|field| is_uninhabited(table, field.ty))
+    };
+    let start = (0..variants.len())
+        .find(|index| *index as u32 != niche.untagged_variant && present(*index))?;
+    let end = (0..variants.len())
+        .rev()
+        .find(|index| *index as u32 != niche.untagged_variant && present(*index))?;
+    let mask = if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    let mut out = Vec::new();
+    for index in start..=end {
+        if index as u32 == niche.untagged_variant || !present(index) {
+            continue;
+        }
+        let offset = (index - start) as u128;
+        let raw_bits = niche.niche_start.wrapping_add(offset) & mask;
+        out.push((index as u32, raw_bits));
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// The variant a niche-encoded enum holds when its niche scalar reads `bits`
@@ -898,7 +966,7 @@ pub fn niche_variant(
     let count = (end - start + 1) as u128;
     if relative < count {
         let variant = start as u128 + relative;
-        if variant as u32 != niche.untagged_variant {
+        if variant as u32 != niche.untagged_variant && present(variant as usize) {
             return variant as u32;
         }
     }
@@ -912,46 +980,66 @@ pub fn niche_width(
     variants: &[VariantDescriptor],
     niche: &rcgjs_object::jir::types::Niche,
 ) -> Option<u32> {
+    niche_width_at(table, variants, niche, 0)
+}
+
+fn niche_width_at(
+    table: &TypeTable,
+    variants: &[VariantDescriptor],
+    niche: &rcgjs_object::jir::types::Niche,
+    depth: usize,
+) -> Option<u32> {
+    if depth > 16 {
+        return None;
+    }
     let mut fields: &[rcgjs_object::jir::types::FieldDescriptor] =
         &variants.get(niche.untagged_variant as usize)?.fields;
+    let mut pat_base: Option<TypeId> = None;
     let mut ty = None;
-    let mut in_array = false;
     for step in &niche.niche_field {
-        let field = if in_array {
-            fields.first()?
+        // Follow the unpeeled field chain (`niche_facts` records rustc's unpeeled field indices,
+        // including transparent wrappers like `NonZero<T>` and `ty::Pat` single-field steps).
+        let next_ty = if let Some(base) = pat_base.take() {
+            if *step != 0 {
+                return None;
+            }
+            base
         } else {
-            fields.get(*step as usize)?
+            fields.get(*step as usize)?.ty
         };
-        ty = Some(field.ty);
-        // Walk unpeeled ADT/tuple/array fields: `niche.niche_field` records layout steps through
-        // transparent wrappers like `NonZero<T>` -> `NonZeroInner` -> `Pattern(T)`. Peeling
-        // transparent wrappers here would discard their field list before the remaining path steps
-        // are consumed.
-        let mut cur_ty = field.ty;
-        for _ in 0..16 {
-            match table.get(cur_ty).map(|d| &d.kind) {
-                Some(TypeKind::Pattern(base)) => cur_ty = *base,
-                _ => break,
+        ty = Some(next_ty);
+        let descriptor = table.get(next_ty)?;
+        match &descriptor.kind {
+            TypeKind::Pattern(base) => {
+                pat_base = Some(*base);
+                fields = &[];
+            }
+            TypeKind::Adt { variants, .. } => {
+                fields = variants.first().map_or(&[], |v| v.fields.as_slice());
+            }
+            _ => {
+                fields = &descriptor.js.fields;
             }
         }
-        let descriptor = table.get(cur_ty)?;
-        in_array = matches!(descriptor.kind, TypeKind::Array { .. });
-        fields = match &descriptor.kind {
-            TypeKind::Adt { variants, .. } => &variants.first()?.fields,
-            _ => &descriptor.js.fields,
-        };
     }
     let ty = ty?;
-    if let Some((_, bits)) = table.int_info(ty) {
+    let peeled = table.peeled(ty);
+    if let Some((_, bits)) = table.int_info(peeled) {
         return Some(bits);
     }
-    match kind(table, ty) {
+    match kind(table, peeled) {
         Some(TypeKind::Bool) => Some(8),
         Some(TypeKind::Char) => Some(32),
         Some(TypeKind::Reference { .. } | TypeKind::RawPointer { .. } | TypeKind::FnPtr { .. }) => {
             Some(32)
         }
-        _ => size_of(table, ty).map(|bytes| (bytes * 8) as u32),
+        Some(TypeKind::Adt {
+            form: NominalForm::Enum,
+            variants: inner_variants,
+            niche: Some(inner_niche),
+            ..
+        }) => niche_width_at(table, inner_variants, inner_niche, depth + 1),
+        _ => size_of(table, peeled).map(|bytes| (bytes * 8) as u32),
     }
 }
 

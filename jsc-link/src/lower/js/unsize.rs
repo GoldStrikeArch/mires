@@ -235,17 +235,28 @@ impl JsCx<'_> {
             {
                 int_to_bytes(a, value)
             }
-            // A fieldless enum with an integer `repr` and the integer of its own width: such a
-            // value *is* its discriminant, so moving between the two moves nothing at all.
+            // A fieldless enum with an integer `repr` and an integer of its own width: such a
+            // value *is* its discriminant, so moving between the two moves nothing at all when the
+            // signedness matches and masks to the destination's signedness when they differ.
             (ReprClass::Other, ReprClass::Int(b))
-                if direct_tag(table, from) == Some((b.bits, b.signed)) =>
+                if direct_tag(table, from).is_some_and(|(bits, _)| bits == b.bits) =>
             {
-                value
+                let (_, from_signed) = direct_tag(table, from).unwrap();
+                if from_signed == b.signed {
+                    value
+                } else {
+                    value::mask(b.repr, b.signed, b.bits, value)
+                }
             }
             (ReprClass::Int(a), ReprClass::Other)
-                if direct_tag(table, to) == Some((a.bits, a.signed)) =>
+                if direct_tag(table, to).is_some_and(|(bits, _)| bits == a.bits) =>
             {
-                value
+                let (_, to_signed) = direct_tag(table, to).unwrap();
+                if a.signed == to_signed {
+                    value
+                } else {
+                    value::mask(a.repr, to_signed, a.bits, value)
+                }
             }
             // The same value seen as a *pointer* rather than as an integer
             // (`NonNull::dangling()` is a transmute of an `Alignment` straight to a pointer).
@@ -314,21 +325,16 @@ impl JsCx<'_> {
         value
     }
 
-    /// A `transmute` from an integer into a niche encoded two variant enum, decoded at run time.
+    /// A `transmute` from an integer into a niche encoded enum, decoded at run time.
     ///
     /// This is how `NonZero::<T>::new` is written, and through it a good deal of `core::num`. It
-    /// applies only when the destination is a two variant enum whose tag is niche encoded and as
-    /// wide as the source integer, the niche variant carries no data, and the other carries
-    /// exactly one non-zero-sized field.
+    /// applies only when the destination is an enum whose tag is niche encoded and as wide as the
+    /// source integer, every inhabited niche variant carries no non-zero-sized data, and the
+    /// untagged variant carries exactly one non-zero-sized field.
     fn niche_from_scalar(&self, from: TypeId, to: TypeId, value: Expr) -> Res<Option<Expr>> {
         let table = self.table;
-        let Some((signed, bits)) = table.int_info(from) else {
+        let Some((_, bits)) = table.int_info(from) else {
             return Ok(None);
-        };
-        let int = Repr {
-            repr: table.int_repr(from),
-            signed,
-            bits,
         };
         let peeled = table.peeled(to);
         let Some(TypeKind::Adt {
@@ -340,23 +346,32 @@ impl JsCx<'_> {
         else {
             return Ok(None);
         };
-        if variants.len() != 2 {
+        if value::size_of(table, from) != value::size_of(table, peeled)
+            || value::niche_width(table, variants, niche) != Some(bits)
+        {
             return Ok(None);
         }
-        // The niche scalar is the payload field, and a transmute promises the two sides have the
-        // same size, so the tag is as wide as the source integer exactly when the sizes agree.
-        // (The niche field *path* walks rustc's unpeeled field chain, which the type table does
-        // not reproduce step for step, so the sizes are what this asks.)
-        if value::size_of(table, from) != value::size_of(table, peeled) {
+        let Some(tags) = value::niche_variant_tags(table, variants, niche, bits) else {
             return Ok(None);
+        };
+        let mut niche_cases = Vec::with_capacity(tags.len());
+        for (variant_index, raw_bits) in tags {
+            let empty = &variants[variant_index as usize];
+            if empty.fields.iter().any(|field| !table.is_zst(field.ty)) {
+                return Ok(None);
+            }
+            let Some(niche_lit) = value::int_literal(table, from, raw_bits) else {
+                return Ok(None);
+            };
+            let Some(empty_value) =
+                value::enum_value(table, self.interns, to, variant_index, Vec::new())
+            else {
+                return Ok(None);
+            };
+            niche_cases.push((niche_lit, empty_value));
         }
-        let _ = bits;
+
         let untagged = niche.untagged_variant;
-        let empty_index = if untagged == 0 { 1 } else { 0 };
-        let empty = &variants[empty_index as usize];
-        if empty.fields.iter().any(|field| !table.is_zst(field.ty)) {
-            return Ok(None);
-        }
         let payload = &variants[untagged as usize];
         let mut live = payload.fields.iter().filter(|f| !table.is_zst(f.ty));
         let Some(field) = live.next() else {
@@ -365,52 +380,42 @@ impl JsCx<'_> {
         if live.next().is_some() {
             return Ok(None);
         }
-        let Ok(niche_start) = i128::try_from(niche.niche_start) else {
-            return Ok(None);
-        };
         let Some(key) = value::key_name(self.interns, field.key) else {
             return Ok(None);
         };
         let bound = jsast::id(NICHE_PARAM);
-        let Some(empty_value) = value::enum_value(table, self.interns, to, empty_index, Vec::new())
-        else {
-            return Ok(None);
-        };
         let filled_field = self.transmute(from, field.ty, bound.clone())?;
         let Some(filled) =
             value::enum_value(table, self.interns, to, untagged, vec![(key, filled_field)])
         else {
             return Ok(None);
         };
-        let decoded = jsast::cond(
-            jsast::binary(BinOp::StrictEq, bound, int.literal(niche_start)),
-            empty_value,
-            filled,
-        );
+        let mut decoded = filled;
+        for (niche_lit, empty_value) in niche_cases.into_iter().rev() {
+            decoded = jsast::cond(
+                jsast::binary(BinOp::StrictEq, bound.clone(), niche_lit),
+                empty_value,
+                decoded,
+            );
+        }
         Ok(Some(jsast::call(
             jsast::arrow(vec![NICHE_PARAM.to_owned()], decoded),
             vec![value],
         )))
     }
 
-    /// The other direction of [`Self::niche_from_scalar`]: a niche encoded two variant enum
-    /// transmuted to the integer its layout stores (`intrinsics.rs::niche_to_scalar`).
+    /// The other direction of [`Self::niche_from_scalar`]: a niche encoded enum transmuted to the
+    /// integer its layout stores (`intrinsics.rs::niche_to_scalar`).
     ///
     /// `core` writes `PartialOrd::lt` for `[T]` as a transmute of a `ControlFlow<bool>` to `u8`
-    /// (`slice/cmp.rs`, `as_underlying`). The empty variant is the niche value, re-signed at the
-    /// destination's width, and the other is its one payload field transmuted into the integer.
-    /// The encode matches rustc's layout; the decode does not round trip a signed niche with its
-    /// high bit set, because it compares against the niche's raw unsigned bits (`CONTRACT.md`,
-    /// "Transmuting between an enum and an integer").
+    /// (`slice/cmp.rs`, `as_underlying`). Each inhabited niche variant maps to its wrapped niche
+    /// bit pattern formatted at the destination integer's width and signedness, and the untagged
+    /// variant is its one payload field transmuted into the integer. Both directions round trip
+    /// across all signed and unsigned integer widths and wrapping niche ranges.
     fn niche_to_scalar(&self, from: TypeId, to: TypeId, value: Expr) -> Res<Option<Expr>> {
         let table = self.table;
-        let Some((signed, bits)) = table.int_info(to) else {
+        let Some((_, bits)) = table.int_info(to) else {
             return Ok(None);
-        };
-        let int = Repr {
-            repr: table.int_repr(to),
-            signed,
-            bits,
         };
         let peeled = table.peeled(from);
         let Some(TypeKind::Adt {
@@ -422,15 +427,34 @@ impl JsCx<'_> {
         else {
             return Ok(None);
         };
-        if variants.len() != 2 || value::size_of(table, to) != value::size_of(table, peeled) {
+        if value::size_of(table, to) != value::size_of(table, peeled)
+            || value::niche_width(table, variants, niche) != Some(bits)
+        {
             return Ok(None);
         }
+        let Some(repr) = table.enum_repr(peeled) else {
+            return Ok(None);
+        };
+        let Some(tags) = value::niche_variant_tags(table, variants, niche, bits) else {
+            return Ok(None);
+        };
+        let mut niche_cases = Vec::with_capacity(tags.len());
+        for (variant_index, raw_bits) in tags {
+            let empty = &variants[variant_index as usize];
+            if empty.fields.iter().any(|field| !table.is_zst(field.ty)) {
+                return Ok(None);
+            }
+            let Some(niche_lit) = value::int_literal(table, to, raw_bits) else {
+                return Ok(None);
+            };
+            let Some(tag_lit) = value::variant_tag(table, self.interns, peeled, variant_index)
+            else {
+                return Ok(None);
+            };
+            niche_cases.push((tag_lit, niche_lit));
+        }
+
         let untagged = niche.untagged_variant;
-        let empty_index = if untagged == 0 { 1 } else { 0 };
-        let empty = &variants[empty_index as usize];
-        if empty.fields.iter().any(|field| !table.is_zst(field.ty)) {
-            return Ok(None);
-        }
         let payload = &variants[untagged as usize];
         let mut live = payload.fields.iter().filter(|f| !table.is_zst(f.ty));
         let Some(field) = live.next() else {
@@ -439,29 +463,23 @@ impl JsCx<'_> {
         if live.next().is_some() {
             return Ok(None);
         }
-        let (Some(repr), Some(empty_tag)) = (
-            table.enum_repr(peeled),
-            value::variant_tag(table, self.interns, peeled, empty_index),
-        ) else {
-            return Ok(None);
-        };
         let bound = jsast::id(NICHE_PARAM);
-        let is_empty = jsast::binary(
-            BinOp::StrictEq,
-            value::tag_expr(repr, bound.clone()),
-            empty_tag,
-        );
-        let niche_value = int.literal(value::resign(signed, bits, niche.niche_start));
         let payload_bits = self.transmute(
             field.ty,
             to,
-            value::field_expr(self.interns, bound, field.key),
+            value::field_expr(self.interns, bound.clone(), field.key),
         )?;
+        let mut encoded = payload_bits;
+        for (tag_lit, niche_lit) in niche_cases.into_iter().rev() {
+            let is_variant = jsast::binary(
+                BinOp::StrictEq,
+                value::tag_expr(repr, bound.clone()),
+                tag_lit,
+            );
+            encoded = jsast::cond(is_variant, niche_lit, encoded);
+        }
         Ok(Some(jsast::call(
-            jsast::arrow(
-                vec![NICHE_PARAM.to_owned()],
-                jsast::cond(is_empty, niche_value, payload_bits),
-            ),
+            jsast::arrow(vec![NICHE_PARAM.to_owned()], encoded),
             vec![value],
         )))
     }
@@ -579,15 +597,6 @@ struct Repr {
     repr: IntRepr,
     signed: bool,
     bits: u32,
-}
-
-impl Repr {
-    fn literal(self, value: i128) -> Expr {
-        match self.repr {
-            IntRepr::BigInt => jsast::bigint(value),
-            IntRepr::Number => jsast::num(value as f64),
-        }
-    }
 }
 
 /// How a value is represented, at the granularity a transmute cares about.

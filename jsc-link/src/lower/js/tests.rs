@@ -6988,4 +6988,357 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
     );
 }
 
+#[test]
+fn signed_niche_from_scalar_compares_signed_literal() {
+    let mut interns = world();
+    let i8_ty = TypeId(901);
+    let ordering = TypeId(902);
+    let opt_ordering = TypeId(903);
+    interns.intern_type(int(i8_ty, true, 8));
+
+    let less = interns.intern_str("Less");
+    let equal = interns.intern_str("Equal");
+    let greater = interns.intern_str("Greater");
+    let mut ord_desc = descriptor(
+        ordering,
+        TypeKind::Adt {
+            def: def(902),
+            args: Vec::new(),
+            form: NominalForm::Enum,
+            variants: vec![
+                variant(less, Vec::new(), -1, Some(255)),
+                variant(equal, Vec::new(), 0, Some(0)),
+                variant(greater, Vec::new(), 1, Some(1)),
+            ],
+            niche: None,
+        },
+        1,
+    );
+    ord_desc.js.enum_repr = Some(EnumRepr::Number {
+        bits: 8,
+        signed: true,
+    });
+    ord_desc.js.is_primitive_enum = true;
+    interns.intern_type(ord_desc);
+
+    let none = interns.intern_str("None");
+    let some = interns.intern_str("Some");
+    let f0 = interns.intern_str("_0");
+    let mut opt_ord = descriptor(
+        opt_ordering,
+        TypeKind::Adt {
+            def: def(903),
+            args: vec![ordering],
+            form: NominalForm::Enum,
+            variants: vec![
+                variant(none, Vec::new(), 0, None),
+                variant(some, vec![field(FieldKey::Name(f0), ordering)], 1, None),
+            ],
+            niche: Some(rcgjs_object::jir::types::Niche {
+                untagged_variant: 1,
+                niche_field: vec![0],
+                niche_start: 254,
+                valid_range: (255, 1),
+            }),
+        },
+        1,
+    );
+    opt_ord.js.is_indirect = true;
+    opt_ord.js.needs_clone = true;
+    opt_ord.js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+    interns.intern_type(opt_ord);
+
+    // i8 -> Option<Ordering> compares against -2 (NOT 254!)
+    let mut b = FuncBuilder::new(item(901), signature(vec![i8_ty], opt_ordering));
+    let e = FuncBuilder::ENTRY;
+    let p = b.param(i8_ty, NO_ORIGIN);
+    let cast = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: p,
+            from: i8_ty,
+            to: opt_ordering,
+        },
+        opt_ordering,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(cast)));
+    let func = b.finish();
+    let plan = plan_of(&func, &[(p.0, "x")]);
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower(
+        &interns,
+        "dec_i8",
+        &[],
+        &body,
+        &func,
+        &plan,
+        straight(&func),
+    );
+    assert!(js.contains("$n === -2"), "{js}");
+    assert!(!js.contains("$n === 254"), "{js}");
+
+    // u8 -> Option<Ordering> compares against 254 and sign-extends payload to i8
+    let mut b2 = FuncBuilder::new(item(902), signature(vec![U8], opt_ordering));
+    let p2 = b2.param(U8, NO_ORIGIN);
+    let cast2 = b2.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: p2,
+            from: U8,
+            to: opt_ordering,
+        },
+        opt_ordering,
+        NO_ORIGIN,
+    );
+    b2.terminate(e, RTerm::Return(Some(cast2)));
+    let func2 = b2.finish();
+    let plan2 = plan_of(&func2, &[(p2.0, "x")]);
+    let body2 = body_of(BodyKind::Function, func2.sig.clone());
+    let js2 = lower(
+        &interns,
+        "dec_u8",
+        &[],
+        &body2,
+        &func2,
+        &plan2,
+        straight(&func2),
+    );
+    assert!(js2.contains("$n === 254"), "{js2}");
+    assert!(js2.contains("<< 24"), "{js2}");
+}
+
+#[test]
+fn wide_u128_high_bit_niche_roundtrips_without_sign_flip() {
+    let mut interns = world();
+    let u128_ty = TypeId(910);
+    let i128_ty = TypeId(911);
+    let hi_enum = TypeId(912);
+    let opt_hi = TypeId(913);
+    interns.intern_type(int(u128_ty, false, 128));
+    interns.intern_type(int(i128_ty, true, 128));
+
+    let a_name = interns.intern_str("A");
+    let b_name = interns.intern_str("B");
+    let mut hi_desc = descriptor(
+        hi_enum,
+        TypeKind::Adt {
+            def: def(912),
+            args: Vec::new(),
+            form: NominalForm::Enum,
+            variants: vec![
+                variant(a_name, Vec::new(), 0, Some(0)),
+                variant(b_name, Vec::new(), 1, Some(1)),
+            ],
+            niche: None,
+        },
+        16,
+    );
+    hi_desc.js.enum_repr = Some(EnumRepr::Number {
+        bits: 128,
+        signed: false,
+    });
+    hi_desc.js.is_primitive_enum = true;
+    interns.intern_type(hi_desc);
+
+    let none = interns.intern_str("None");
+    let some = interns.intern_str("Some");
+    let f0 = interns.intern_str("_0");
+    let mut opt_desc = descriptor(
+        opt_hi,
+        TypeKind::Adt {
+            def: def(913),
+            args: vec![hi_enum],
+            form: NominalForm::Enum,
+            variants: vec![
+                variant(none, Vec::new(), 0, None),
+                variant(some, vec![field(FieldKey::Name(f0), hi_enum)], 1, None),
+            ],
+            niche: Some(rcgjs_object::jir::types::Niche {
+                untagged_variant: 1,
+                niche_field: vec![0],
+                niche_start: u128::MAX,
+                valid_range: (0, 1),
+            }),
+        },
+        16,
+    );
+    opt_desc.js.is_indirect = true;
+    opt_desc.js.needs_clone = true;
+    opt_desc.js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+    interns.intern_type(opt_desc);
+
+    let e = FuncBuilder::ENTRY;
+    // u128 -> opt_hi must compare against 340282366920938463463374607431768211455n
+    let mut bd = FuncBuilder::new(item(910), signature(vec![u128_ty], opt_hi));
+    let pd = bd.param(u128_ty, NO_ORIGIN);
+    let cd = bd.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: pd,
+            from: u128_ty,
+            to: opt_hi,
+        },
+        opt_hi,
+        NO_ORIGIN,
+    );
+    bd.terminate(e, RTerm::Return(Some(cd)));
+    let fd = bd.finish();
+    let js_dec = lower(
+        &interns,
+        "dec_u128",
+        &[],
+        &body_of(BodyKind::Function, fd.sig.clone()),
+        &fd,
+        &plan_of(&fd, &[(pd.0, "x")]),
+        straight(&fd),
+    );
+    assert!(
+        js_dec.contains("340282366920938463463374607431768211455n"),
+        "{js_dec}"
+    );
+    assert!(!js_dec.contains("-1n"), "{js_dec}");
+
+    // opt_hi -> u128 must encode None as 340282366920938463463374607431768211455n (NOT -1n!)
+    let mut be = FuncBuilder::new(item(911), signature(vec![opt_hi], u128_ty));
+    let pe = be.param(opt_hi, NO_ORIGIN);
+    let ce = be.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: pe,
+            from: opt_hi,
+            to: u128_ty,
+        },
+        u128_ty,
+        NO_ORIGIN,
+    );
+    be.terminate(e, RTerm::Return(Some(ce)));
+    let fe = be.finish();
+    let js_enc = lower(
+        &interns,
+        "enc_u128",
+        &[],
+        &body_of(BodyKind::Function, fe.sig.clone()),
+        &fe,
+        &plan_of(&fe, &[(pe.0, "x")]),
+        straight(&fe),
+    );
+    assert!(
+        js_enc.contains("340282366920938463463374607431768211455n"),
+        "{js_enc}"
+    );
+    assert!(!js_enc.contains("-1n"), "{js_enc}");
+}
+
+#[test]
+fn multi_wrapping_niche_and_transparent_width_decode_accurately() {
+    let mut interns = world();
+    let i8_ty = TypeId(920);
+    let wrap_ty = TypeId(921);
+    let wrap_enum = TypeId(922);
+    interns.intern_type(int(i8_ty, true, 8));
+
+    let f0 = interns.intern_str("_0");
+    let wrap_name = interns.intern_str("Wrap");
+    let pat_u8 = TypeId(923);
+    let mut pat_desc = descriptor(pat_u8, TypeKind::Pattern(U8), 1);
+    pat_desc.js.peeled = U8;
+    interns.intern_type(pat_desc);
+    let mut wrap_desc = descriptor(
+        wrap_ty,
+        TypeKind::Adt {
+            def: def(921),
+            args: Vec::new(),
+            form: NominalForm::Struct,
+            variants: vec![variant(
+                wrap_name,
+                vec![field(FieldKey::Transparent, pat_u8)],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        1,
+    );
+    wrap_desc.js.peeled = U8;
+    interns.intern_type(wrap_desc);
+
+    let p_name = interns.intern_str("P");
+    let n0_name = interns.intern_str("N0");
+    let n1_name = interns.intern_str("N1");
+    let n2_name = interns.intern_str("N2");
+    let niche = rcgjs_object::jir::types::Niche {
+        untagged_variant: 0,
+        niche_field: vec![0, 0, 0],
+        niche_start: 254,
+        valid_range: (1, 253),
+    };
+    let variants = vec![
+        variant(p_name, vec![field(FieldKey::Name(f0), wrap_ty)], 0, None),
+        variant(n0_name, Vec::new(), 1, None),
+        variant(n1_name, Vec::new(), 2, None),
+        variant(n2_name, Vec::new(), 3, None),
+    ];
+    let mut enum_desc = descriptor(
+        wrap_enum,
+        TypeKind::Adt {
+            def: def(922),
+            args: Vec::new(),
+            form: NominalForm::Enum,
+            variants: variants.clone(),
+            niche: Some(niche.clone()),
+        },
+        1,
+    );
+    enum_desc.js.is_indirect = true;
+    enum_desc.js.needs_clone = true;
+    enum_desc.js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+    interns.intern_type(enum_desc);
+
+    // niche_width must walk unpeeled transparent wrapper [0, 0] and return Some(8)
+    assert_eq!(
+        super::value::niche_width(&interns.types, &variants, &niche),
+        Some(8)
+    );
+    // bits = 0 wraps: (0 - 254) & 0xFF == 2 -> variant 3 (N2)
+    assert_eq!(
+        super::value::niche_variant(&interns.types, &variants, &niche, 0),
+        3
+    );
+
+    // i8 -> wrap_enum checks -2, -1, 0
+    let e = FuncBuilder::ENTRY;
+    let mut b = FuncBuilder::new(item(920), signature(vec![i8_ty], wrap_enum));
+    let p = b.param(i8_ty, NO_ORIGIN);
+    let c = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: p,
+            from: i8_ty,
+            to: wrap_enum,
+        },
+        wrap_enum,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(c)));
+    let f = b.finish();
+    let js = lower(
+        &interns,
+        "dec_wrap_i8",
+        &[],
+        &body_of(BodyKind::Function, f.sig.clone()),
+        &f,
+        &plan_of(&f, &[(p.0, "x")]),
+        straight(&f),
+    );
+    assert!(js.contains("$n === -2"), "{js}");
+    assert!(js.contains("$n === -1"), "{js}");
+    assert!(js.contains("$n === 0"), "{js}");
+}
+
 mod invoke;
