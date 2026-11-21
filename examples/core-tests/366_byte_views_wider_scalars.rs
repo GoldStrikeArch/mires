@@ -60,6 +60,12 @@ struct Holder {
     value: u32,
 }
 
+#[repr(C)]
+struct PrefixWrap {
+    a: u32,
+    b: u32,
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_entry() {
     // 1. Read every wider primitive type through slice::from_raw_parts, align_to, and *p.add(k).
@@ -271,5 +277,67 @@ pub extern "C" fn rust_entry() {
         print_bool(ptr::eq(bp.add(2).cast::<u16>(), p.add(1)));
         print_bool(ptr::eq(p.byte_add(4), p.add(2)));
         print_u32(u32::from(*bp.add(2).cast::<u16>()));
+
+        // Layered _scalar_view over _byte_view: unaligned u16, cross-type u32, signed i16 addr/ptr_eq.
+        let unal = bp.add(1).cast::<u16>();
+        print_bool(unal.addr() == p.addr() + 1);
+        print_bool(ptr::eq(unal.cast::<()>(), bp.add(1).cast::<()>()));
+        let p32 = bp.cast::<u32>();
+        print_bool(p32.addr() == p.addr());
+        print_bool(ptr::eq(p32.cast::<()>(), p.cast::<()>()));
+        let pi16 = bp.cast::<i16>();
+        print_bool(pi16.addr() == p.addr());
+    }
+
+    // 5. GVN-folded Vec::new()+push direct raw deref, offset slice, ptr::eq, copy, write_bytes.
+    let mut gvn: Vec<u16> = Vec::new();
+    gvn.push(black_box(0x0102));
+    gvn.push(black_box(0x0304));
+    unsafe {
+        let gp = gvn.as_ptr().cast::<u8>();
+        print_i32(i32::from(*gp));
+        print_i32(i32::from(*gp.add(1)));
+        let gs = slice::from_raw_parts(gp.add(1), 2);
+        print_bool(gs == &[0x01, 0x04]);
+        print_bool(ptr::eq(
+            gp.add(2).cast::<()>(),
+            gvn.as_ptr().add(1).cast::<()>(),
+        ));
+        let mut gdst = [0u8; 4];
+        ptr::copy_nonoverlapping(gvn.as_ptr().cast::<u8>(), gdst.as_mut_ptr(), 4);
+        print_bool(gdst == [0x02, 0x01, 0x04, 0x03]);
+        ptr::write_bytes(gvn.as_mut_ptr().cast::<u8>(), 0x5a, 4);
+        print_u32(u32::from(gvn[0]));
+        print_u32(u32::from(gvn[1]));
+    }
+
+    // 6. Erased pointer cast: p.cast::<()>().cast::<u8>() and .cast::<i8>().
+    let er: Vec<u16> = black_box(vec![0xfe22, 0x3344]);
+    unsafe {
+        let pv = er.as_ptr().cast::<()>();
+        let pu = pv.cast::<u8>();
+        let pi = pv.cast::<i8>();
+        print_i32(i32::from(*pu));
+        print_i32(i32::from(*pu.add(1)));
+        print_i32(i32::from(*pi.add(1)));
+        print_bool(slice::from_raw_parts(pu, 4) == &[0x22, 0xfe, 0x44, 0x33]);
+    }
+
+    // 7. Zero-offset prefix scalar cast: (&PrefixWrap).cast::<u32>().cast::<u8>().
+    let pw_val = black_box(PrefixWrap {
+        a: 0x1122_3344,
+        b: 0x5566_7788,
+    });
+    unsafe {
+        let pw: *const PrefixWrap = &pw_val;
+        let pa: *const u32 = black_box(pw.cast::<u32>());
+        let pb: *const u8 = pa.cast::<u8>();
+        print_bool(slice::from_raw_parts(pb, 4) == &[0x44, 0x33, 0x22, 0x11]);
+        print_i32(i32::from(*pb));
+        print_i32(i32::from(*pb.add(3)));
+        print_bool(pb.addr() == pa.addr());
+        print_bool(pb.add(3).addr() == pa.addr() + 3);
+        print_bool(pb.addr() == (pw as usize));
+        print_bool(ptr::eq(pb.cast::<()>(), pa.cast::<()>()));
     }
 }

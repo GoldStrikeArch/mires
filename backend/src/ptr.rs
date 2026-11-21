@@ -640,9 +640,15 @@ fn cast_pointer_at<'tcx>(
             _ => reference,
         }
     } else if is_zst(tcx, from) {
-        // An erased pointer can still be a scaled byte view. Restore the target units.
+        // An erased pointer can still be a scaled byte view or carry an element size (`es`).
         match size_of(tcx, to) {
-            Some(size) => jsast::rt_call("thin", vec![value, jsast::num(size as f64)]),
+            Some(size) => {
+                let mut args = vec![value, jsast::num(size as f64)];
+                if matches!(to.kind(), ty::Int(ty::IntTy::I8)) {
+                    args.push(Expr::Bool(true));
+                }
+                jsast::rt_call("thin", args)
+            }
             None => ref_to_raw(fx, to, value),
         }
     } else {
@@ -776,6 +782,15 @@ fn cast_pointer_sized<'tcx>(
     if from_size == 1 && to_size == 1 && !is_indirect(tcx, from) && !is_indirect(tcx, to) {
         if let Some(zero) = crate::alloc_support::non_byte_zero_factory(fx.cgu, to_pointee) {
             return jsast::rt_call("retype", vec![value, jsast::num(1), zero]);
+        }
+        match (from.kind(), to.kind()) {
+            (ty::Uint(ty::UintTy::U8), ty::Int(ty::IntTy::I8)) => {
+                return jsast::rt_call("byte_sign", vec![value, Expr::Bool(true)]);
+            }
+            (ty::Int(ty::IntTy::I8), ty::Uint(ty::UintTy::U8)) => {
+                return jsast::rt_call("byte_sign", vec![value, Expr::Bool(false)]);
+            }
+            _ => {}
         }
     }
     // The same number of bytes held in the same shape of JavaScript value: the record already
@@ -1174,7 +1189,14 @@ pub(crate) fn build_fat<'tcx>(
         // says which, so `__rt.thin` asks the record, the same way `__rt.unwindow` does.
         _ if pointee.is_sized(fx.tcx, typing_env()) => {
             let size = size_of(fx.tcx, pointee).unwrap_or(0);
-            jsast::rt_call("thin", vec![data, jsast::num(size as f64)])
+            let mut args = vec![data, jsast::num(size as f64)];
+            if matches!(
+                peel_pattern(peel_transparent(fx.tcx, pointee)).kind(),
+                ty::Int(ty::IntTy::I8)
+            ) {
+                args.push(Expr::Bool(true));
+            }
+            jsast::rt_call("thin", args)
         }
         // A struct with an unsized tail, rebuilt from the fresh `*mut u8` its block was allocated
         // as. `with_metadata_of` is the spelling -- `allocate_for_ptr_in` hands the raw block and

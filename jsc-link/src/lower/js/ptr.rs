@@ -326,7 +326,17 @@ impl<'a> JsCx<'a> {
             }
             _ if table.get(pointee).is_some_and(|d| d.layout.sized) => {
                 let size = size_of(table, pointee).unwrap_or(0);
-                Ok(jsast::rt_call("thin", vec![data, jsast::num(size as f64)]))
+                let mut args = vec![data, jsast::num(size as f64)];
+                if matches!(
+                    value::kind(table, table.peeled(pointee)),
+                    Some(TypeKind::Integer {
+                        signed: true,
+                        bits: 8
+                    })
+                ) {
+                    args.push(Expr::Bool(true));
+                }
+                Ok(jsast::rt_call("thin", args))
             }
             _ => {
                 let element = table.unsized_tail(pointee).and_then(|tail| {
@@ -570,10 +580,22 @@ impl<'a> JsCx<'a> {
             });
         }
         if table.is_zst(from) {
-            // Erasure can carry a scaled byte view through `*const ()`. Restore its units
-            // just as a sized `aggregate_raw_ptr` does, rather than treating it as a reference.
+            // Erasure can carry a scaled byte view or element size (`es`) through `*const ()`.
+            // Restore its units just as a sized `aggregate_raw_ptr` does, rather than treating it as a reference.
             return Ok(match size_of(table, to) {
-                Some(size) => jsast::rt_call("thin", vec![value, jsast::num(size as f64)]),
+                Some(size) => {
+                    let mut args = vec![value, jsast::num(size as f64)];
+                    if matches!(
+                        value::kind(table, to),
+                        Some(TypeKind::Integer {
+                            signed: true,
+                            bits: 8
+                        })
+                    ) {
+                        args.push(Expr::Bool(true));
+                    }
+                    jsast::rt_call("thin", args)
+                }
                 None => self.ref_to_raw(to, value),
             });
         }
@@ -669,6 +691,33 @@ impl<'a> JsCx<'a> {
         if from_size == 1 && to_size == 1 && !table.is_indirect(from) && !table.is_indirect(to) {
             if let Some(zero) = self.non_byte_zero_factory(to_pointee) {
                 return Ok(jsast::rt_call("retype", vec![value, jsast::num(1), zero]));
+            }
+            match (value::kind(table, from), value::kind(table, to)) {
+                (
+                    Some(TypeKind::Integer {
+                        signed: false,
+                        bits: 8,
+                    }),
+                    Some(TypeKind::Integer {
+                        signed: true,
+                        bits: 8,
+                    }),
+                ) => {
+                    return Ok(jsast::rt_call("byte_sign", vec![value, Expr::Bool(true)]));
+                }
+                (
+                    Some(TypeKind::Integer {
+                        signed: true,
+                        bits: 8,
+                    }),
+                    Some(TypeKind::Integer {
+                        signed: false,
+                        bits: 8,
+                    }),
+                ) => {
+                    return Ok(jsast::rt_call("byte_sign", vec![value, Expr::Bool(false)]));
+                }
+                _ => {}
             }
         }
         if from_size == to_size && table.is_indirect(from) == table.is_indirect(to) {

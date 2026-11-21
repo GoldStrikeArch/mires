@@ -2163,7 +2163,9 @@ for (const f of [before, after]) {
           assert.equal(owned.text, dropped ? '' : mutated ? text + '\ud83d\ude00\ud83d\ude00' : text);
           assert.equal(owned.len, __rt.str_len(owned.text));
         } else {
-          assert.deepEqual(ptr.buf.slice(ptr.off, ptr.off + vec.len), [1, 2, 77, 77]);
+          const typed = __rt.unscale_scalar(ptr, 4, () => 0, 'u32');
+          assert.deepEqual(typed.buf.slice(typed.off, typed.off + vec.len), [1, 2, 77, 77]);
+          assert.deepEqual(Array.prototype.slice.call(ptr.buf, ptr.off, ptr.off + 4), [1, 0, 0, 0]);
           assert.equal(owned.len, dropped ? 0 : mutated ? 4 : 2);
           assert.equal(owned.buf.length, dropped ? 0 : mutated ? expectedCapacity : capacity);
           if (rounds !== 0) assert.deepEqual(owned.buf.slice(0, 2), [1, 2]);

@@ -282,23 +282,101 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
   const typed = rt.unscale_scalar(allocPtr, 2, () => 0, "u16");
   typed.buf[0] = 0x0102;
   typed.buf[1] = 0x0304;
+  // Direct GVN-folded byte reads/writes, offset slice, copy, write_bytes, realloc.
+  assert.deepEqual([allocPtr.buf[0], allocPtr.buf[1], allocPtr.buf[2], allocPtr.buf[3]], [0x02, 0x01, 0x04, 0x03]);
   const gvnSlice = rt.slice_from_parts(allocPtr, 4, 1);
   assert.deepEqual(Array.prototype.slice.call(gvnSlice.buf, 0, 4), [0x02, 0x01, 0x04, 0x03]);
+  const gvnOffSlice = rt.slice_from_parts({ buf: allocPtr.buf, off: 1 }, 2, 1);
+  assert.deepEqual([gvnOffSlice.buf[gvnOffSlice.off], gvnOffSlice.buf[gvnOffSlice.off + 1]], [0x01, 0x04]);
+  assert.equal(rt.ptr_eq({ buf: allocPtr.buf, off: 2 }, { buf: typed.buf, off: 1 }), true);
+  assert.equal(rt.ptr_eq({ buf: allocPtr.buf, off: 1 }, { buf: typed.buf, off: 1 }), false);
+  const grown = rt.realloc(allocPtr, 4, 2, 8);
+  assert.equal(grown.buf, allocPtr.buf);
+  typed.buf[2] = 0x0506;
+  assert.deepEqual([grown.buf[4], grown.buf[5]], [0x06, 0x05]);
+  rt.write_bytes(grown, 0x5a, 4);
+  assert.deepEqual([typed.buf[0], typed.buf[1]], [0x5a5a, 0x5a5a]);
   const sv = rt.convert_block_sv(rt.scale_scalar(typed, 2, "u16"), 2);
   assert.equal(sv.buf, typed.buf);
   assert.equal(sv.off, 0);
   assert.equal(sv.len, 2);
-  rt.dealloc(rt.scale_scalar(typed, 2, "u16"), 4, 2);
+  rt.dealloc(rt.scale_scalar(typed, 2, "u16"), 8, 2);
 
-  // Non-scalar aggregate storage fails closed loudly with a registered abort.
+  // Erased pointer round-trip through thin(p, 1, signed?).
+  const erWords = [0xfe02, 0x7f01];
+  const erased = rt.erase({ buf: erWords, off: 0 }, 2, "u16");
+  const thinU8 = rt.thin(erased, 1);
+  const thinI8 = rt.thin(erased, 1, true);
+  assert.deepEqual([thinU8.buf[0], thinU8.buf[1]], [2, 254]);
+  assert.deepEqual([thinI8.buf[0], thinI8.buf[1]], [2, -2]);
+
+  // Layered _scalar_view over _byte_view preserves addr() and ptr_eq().
+  const layeredWords = [0x0102, 0x0304, 0x0506, 0x0708];
+  const lp = { buf: layeredWords, off: 0 };
+  const lbp = rt.scale_scalar(lp, 2, "u16");
+  const unal = rt.unscale_scalar({ buf: lbp.buf, off: 1 }, 2, () => 0, "u16");
+  assert.equal(unal.buf[unal.off], 0x0401);
+  assert.equal(rt.addr(unal, 2), rt.addr(lp, 2) + 1);
+  assert.equal(rt.ptr_eq(unal, { buf: lbp.buf, off: 1 }), true);
+  const cross32 = rt.unscale_scalar(lbp, 4, () => 0, "u32");
+  assert.equal(rt.addr(cross32, 4), rt.addr(lp, 2));
+  assert.equal(rt.ptr_eq(cross32, lp), true);
+  const signedView = rt.unscale_scalar(lbp, 2, () => 0, "i16");
+  assert.equal(rt.addr(signedView, 2), rt.addr(lp, 2));
+
+  // Out-of-bounds byte slice / index on scalar storage fails closed (e.g. nested [[u16; 2]; 2]).
+  const inner = [0x0102, 0x0304];
+  const innerBv = rt.scale_scalar({ buf: inner, off: 0 }, 2, "u16");
+  assert.throws(
+    () => rt.slice_from_parts(innerBv, 8, 1),
+    (err) => rt.is_abort(err) && /exceeds 4-byte/.test(err.message),
+  );
+  assert.throws(
+    () => innerBv.buf[4],
+    (err) => rt.is_abort(err) && /out of bounds/.test(err.message),
+  );
+  assert.throws(
+    () => {
+      innerBv.buf[4] = 1;
+    },
+    (err) => rt.is_abort(err) && /out of bounds/.test(err.message),
+  );
+
+  // Prefix scalar cast preserves aliasing byte view, addr, ptr_eq, and unproject round-trip.
+  const wrap = { a: 0x11223344, b: 0x55667788 };
+  const pw = rt.box(wrap);
+  const pa = rt.prefix(pw, "a", 8);
+  const pb = rt.scale_scalar(pa, 4, "u32");
+  assert.deepEqual([pb.buf[0], pb.buf[1], pb.buf[2], pb.buf[3]], [0x44, 0x33, 0x22, 0x11]);
+  assert.equal(rt.addr(pb, 1), rt.addr(pw, 8));
+  assert.equal(rt.addr({ buf: pb.buf, off: 3 }, 1), rt.addr(pw, 8) + 3);
+  assert.equal(rt.ptr_eq(pb, pw), true);
+  assert.throws(
+    () => pb.buf[4],
+    (err) => rt.is_abort(err) && /out of bounds/.test(err.message),
+  );
+  assert.equal(rt.unproject(rt.unscale_scalar(pb, 4, () => 0, "u32"), "a"), pw);
+
+  // Non-scalar aggregate storage fails closed loudly on both slice and single-byte deref.
   const pairs = [{ a: 1, b: 2 }];
   const scaledPair = rt.scale({ buf: pairs, off: 0 }, 8);
+  assert.throws(
+    () => scaledPair.buf[0],
+    (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
+  );
+  assert.throws(
+    () => {
+      scaledPair.buf[0] = 1;
+    },
+    (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
+  );
+  assert.equal(rt.unscale(scaledPair, 8).buf, pairs);
   assert.throws(
     () => rt.slice_from_parts(scaledPair, 8, 1),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
   const pairHeap = rt.alloc(8, 4);
-  rt.unscale(pairHeap, 8, () => ({ a: 0, b: 0 }));
+  const pairTyped = rt.unscale(pairHeap, 8, () => ({ a: 0, b: 0 }));
   const rawPairSlice = rt.slice_from_parts(pairHeap, 8, 1);
   assert.throws(
     () => rt.byte_slice_ref(rawPairSlice),
@@ -314,6 +392,6 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
     },
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
-  assert.equal(rt.unscale(rawPairSlice, 8, () => ({ a: 0, b: 0 })).buf, pairHeap.buf);
+  assert.equal(rt.unscale(rawPairSlice, 8, () => ({ a: 0, b: 0 })).buf, pairTyped.buf);
   rt.dealloc(rawPairSlice, 8, 4);
 });

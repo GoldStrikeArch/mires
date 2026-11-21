@@ -1519,6 +1519,8 @@ fn witness_sysroot_shim_is_non_throwing(sym: &str) -> bool {
             | "box"
             | "unscale"
             | "scale"
+            | "scale_scalar"
+            | "byte_sign"
             | "retype"
             | "retype_rc"
             | "offset"

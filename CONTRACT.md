@@ -863,8 +863,8 @@ One function owns the matrix, `ptr::cast_pointer`, and every pointer to pointer 
 | aggregate to its single non zero sized field | reproject: `{ buf: p.buf[p.off], off: "<field>" }` |
 | larger aggregate to a matching non zero sized field at layout offset zero | `__rt.prefix`, which retains the containing slot and therefore the shared address |
 | that zero-offset field back to its containing aggregate | `__rt.unproject`, which accepts only the prefix slot made by the forward cast |
-| integer, float or `char` of size N to `u8` or `i8` | `__rt.scale_scalar`: an aliasing little-endian byte view (`Proxy`) over the wider scalar storage, an unwrapped byte pointer when scaling a scalar view back, or an address unchanged |
-| any other size N to size 1 | `__rt.scale`: a scaled slot over the same buffer, and an address unchanged |
+| integer, float or `char` of size N to `u8` or `i8` | `__rt.scale_scalar`: an aliasing little-endian byte view (`Proxy`) over the wider scalar storage (including zero-offset prefix scalar fields), an unwrapped byte pointer when scaling a scalar view back, or an address unchanged |
+| any other size N to size 1 | `__rt.scale`: a scaled slot over a fail-closed non-scalar byte proxy (refusing byte reads/writes/slices while keeping aligned byte arithmetic, whole-element memops, and `unscale`), and an address unchanged |
 | size 1 to an integer, float or `char` of size N | `__rt.unscale_scalar`: allocation retyping for a fresh heap block, scale recovery for a scaled slot, or an aliasing little-endian scalar view over byte storage |
 | size 1 through a transparent union to size N | `__rt.unscale_uninit`: `unscale` plus one-time retyping of array-backed uninitialized stack storage |
 | any other size 1 to size N | `__rt.unscale`, which retypes a fresh heap block or throws |
@@ -902,20 +902,25 @@ original buffer, at the view's phase plus its offset in scalars. Width alone is 
 reconstruct a pointer, enum or aggregate, so those types keep the refusing `unscale` path.
 
 The reverse direction — viewing a wider integer, `f32`, `f64` or `char` buffer through a `u8` or
-`i8` pointer or slice (`scale_scalar` and `slice_from_parts(..., 1|-1)`) — gets a cached aliasing
-`Proxy` byte view (`_byte_view`) that reads and writes exact little-endian bytes of the underlying
-elements. That covers `core::hash::Hash::hash_slice` on `[u16]`..`[i128]`/`[usize]`/`[isize]`,
+`i8` pointer or slice (`scale_scalar`, `thin(..., 1, signed?)`, and `slice_from_parts(..., 1|-1)`)
+— gets a cached aliasing `Proxy` byte view (`_byte_view`, or `_alloc_byte_proxy` for `align > 1`
+heap allocations) that reads and writes exact little-endian bytes of the underlying elements. That
+covers `core::hash::Hash::hash_slice` on `[u16]`..`[i128]`/`[usize]`/`[isize]`,
 `slice::from_raw_parts`/`from_raw_parts_mut`, `align_to::<u8>()`/`align_to_mut::<u8>()`,
-single-byte raw pointer dereferences `*(p.cast::<u8>().add(k))`, `compare_bytes`,
-`copy`/`copy_nonoverlapping`, and `write_bytes` across heap blocks (including retyped `RawVecInner`
-allocations whose `*mut u8 -> *const T -> *const u8` round-trip was folded by GVN), stack arrays,
-single locals and scalar struct fields (`examples/core-tests/365_hash_primitive_slices.rs`,
+single-byte raw pointer dereferences `*(p.cast::<u8>().add(k))`, erased-pointer round-trips
+`p.cast::<()>().cast::<u8>()`, zero-offset prefix scalar casts `(&Wrap).cast::<u32>().cast::<u8>()`,
+`compare_bytes`, `copy`/`copy_nonoverlapping`, and `write_bytes` across heap blocks (including
+retyped `RawVecInner` allocations whose `*mut u8 -> *const T -> *const u8` round-trip was folded by
+GVN, and `NativeVec` blocks converted back to baseline `Vec`), stack arrays, single locals and
+scalar struct fields (`examples/core-tests/365_hash_primitive_slices.rs`,
 `366_byte_views_wider_scalars.rs`). Casting back to the matching scalar type (`unscale_scalar`,
-`thin`), taking `addr`, comparing with `ptr_eq`, reallocating or freeing the heap block, and
-converting between `NativeVec`/`SliceView` and baseline `Vec` all unwrap `_byte_view_of` back to the
-underlying buffer. Non-primitive aggregate storage (such as `#[repr(C)] struct Pair { a: u32, b: u32 }`)
-has no flat byte representation, so forming a non-empty byte slice over it fails closed with a
-registered abort (`examples/core-tests/367_byte_view_non_scalar_abort.rs`).
+`thin`), taking `addr` or comparing with `ptr_eq` across arbitrarily layered scalar/byte views,
+reallocating or freeing the heap block, and converting between `NativeVec`/`SliceView` and baseline
+`Vec` all unwrap view layers back to the underlying buffer. Out-of-bounds byte slices or byte
+accesses past a flat scalar buffer (including nested arrays such as `[[u16; 2]; 2]`, whose rows are
+separate JavaScript arrays) and any byte read, byte write, or non-empty byte slice over
+non-primitive aggregate storage (such as `#[repr(C)] struct Pair { a: u32, b: u32 }`) fail closed
+with a registered abort (`examples/core-tests/367_byte_view_non_scalar_abort.rs`).
 Building a raw slice through `slice_from_parts` normalizes a dangling data address. The data half
 is asked by its value, never by its type: `with_metadata_of`, which is how `Box::clone_from_ref`
 (`Box<[T]>::from(&[T])`) rebuilds its fat pointer, hands `from_raw_parts` the data pointer as

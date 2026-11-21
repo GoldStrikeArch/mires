@@ -61,6 +61,8 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "box"
             | "unscale"
             | "scale"
+            | "scale_scalar"
+            | "byte_sign"
             | "retype"
             | "retype_rc"
             | "offset"
