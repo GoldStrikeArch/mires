@@ -51,10 +51,11 @@ This is a hand-written port of workbox-precaching 7.4.1 and the workbox-core, wo
 
 ## B9 fix
 
-- **Cleanup when a host call throws** (`src/scenario.rs:391`). `Scenario::run` keeps the outcome of `report()`, which covers every step and the final dump. It then deletes the scenario's `<prefix>-*` caches on every path, as the reference's `finally` does, and only then returns the outcome.
+- **Cleanup when a host call throws** (`src/scenario.rs:391`, `src/host.rs:31`). `Scenario::run` keeps the outcome of `report()`, which covers every step and the final dump. It then deletes the scenario's `<prefix>-*` caches on every path, as the reference's `finally` does, and only then returns the outcome.
+  - Every throwing host constructor (`Request`, `Response`, `Headers`, `URL`, `RegExp`) is bound with `#[js(fallible)]`. `Response::new` passes `status` as a raw `JsValue` so WebIDL `unsigned short` conversion (modulo-65536 wrap) and `RangeError`/`TypeError` match the browser and propagate through `Task<Response>` into route/global catch handlers and `delete_caches()` cleanup.
   - A failing step is recorded and the script goes on.
   - A failure in the dump itself still reaches the cleanup.
-  - In 17 cases, among them `error-after-install` (B9's failing input) and `error-sequence`, a step fails after caches were opened. `verify.mjs` checks the CacheStorage inventory around every call.
+  - In 20 cases, among them `error-after-install` (B9's failing input), `error-sequence`, `route-respond-invalid`, `route-respond-invalid-catch` and `error-credentialed-url`, a step fails after caches were opened. `verify.mjs` checks the CacheStorage inventory around every call.
 
 ## Size
 

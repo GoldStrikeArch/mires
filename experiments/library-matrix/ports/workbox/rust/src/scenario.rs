@@ -175,7 +175,7 @@ impl Plugin for Network {
     fn fetch_did_succeed<'a>(&'a self, _: Cx<'a>, _: Request, response: Response) -> Hook<'a, Response> {
         Box::pin(async move {
             if self.0.source_is("missing") {
-                return Ok(Response::new(text("missing"), 404));
+                return Response::new(text("missing"), JsValue::erase(404.0));
             }
             Ok(if self.0.source_is("redirected") { redirected(response) } else { response })
         })
@@ -645,8 +645,7 @@ impl Scenario {
             return Ok(Rc::new(self.controller(spec, "controller").create_handler_bound_to_url(&url)?));
         }
         let (body, status) = (get(spec, "respond"), get(spec, "status"));
-        let status = if status.is_number() { status.read::<f64>() as u16 } else { 200 };
-        Ok(Rc::new(Handler::Callback(Box::new(move |_| Task::spawn(async move { Ok(Response::new(body, status)) })))))
+        Ok(Rc::new(Handler::Callback(Box::new(move |_| Task::spawn(async move { Response::new(body, status) })))))
     }
 
     fn route_options(&self, options: JsValue) -> Result<PrecacheRouteOptions, Error> {

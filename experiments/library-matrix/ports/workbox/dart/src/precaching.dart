@@ -128,7 +128,8 @@ class PrecacheController {
           final (url, cacheKey) = (entry.key, entry.value);
           final integrity = _cacheKeysToIntegrities[cacheKey];
           final cacheMode = _urlsToCacheModes[url];
-          final request = Request(url.toJS, requestInit(integrity: integrity, cache: cacheMode, credentials: 'same-origin'));
+          final request = await hostCall(
+              () => Request(url.toJS, requestInit(integrity: integrity, cache: cacheMode, credentials: 'same-origin')));
           final (responseDone, handlerDone) = strategy.handleAll(HandlerCallbackOptions(request, event, Params(cacheKey: cacheKey)));
           await Future.wait([responseDone, handlerDone], eagerError: true);
         }
@@ -172,10 +173,11 @@ class PrecacheController {
   /// `createHandlerBoundToURL(url)`: a handler that answers any request with this precached URL.
   RouteHandler createHandlerBoundToURL(String url) {
     final cacheKey = getCacheKeyForURL(url) ?? (throw WorkboxError('non-precached-url', JSObject()..['url'] = url.toJS));
-    return CallbackHandler((options) {
+    return CallbackHandler((options) async {
       // `{cacheKey, ...options.params}`.
       final params = Params(cacheKey: options.params?.cacheKey ?? cacheKey, integrity: options.params?.integrity);
-      return strategy.handle(HandlerCallbackOptions(Request(url.toJS), options.event, params));
+      final request = await hostCall(() => Request(url.toJS));
+      return strategy.handle(HandlerCallbackOptions(request, options.event, params));
     });
   }
 }
@@ -232,7 +234,8 @@ class PrecacheStrategy extends Strategy {
     final noIntegrityConflict = integrityInRequest.isEmpty || integrityInRequest == integrityInManifest;
     final cors = request.mode != 'no-cors';
     final integrity = cors ? (integrityInRequest.isNotEmpty ? integrityInRequest : integrityInManifest) : null;
-    final response = await handler.fetch(Request(request, requestInit(integrity: integrity)));
+    final fetched = await hostCall(() => Request(request, requestInit(integrity: integrity)));
+    final response = await handler.fetch(fetched);
     if (integrityInManifest != null && integrityInManifest.isNotEmpty && noIntegrityConflict && cors) {
       _useDefaultCacheabilityPluginIfNeeded();
       await handler.cachePut(request, response.copy());
@@ -298,7 +301,9 @@ class PrecacheCacheKeyPlugin extends WorkboxPlugin {
         final cacheKey = routeCacheKey != null && routeCacheKey.isNotEmpty
             ? routeCacheKey
             : _precacheController.getCacheKeyForURL(param.request.url);
-        return cacheKey != null ? Request(cacheKey.toJS, requestInit(headers: param.request.headers)) : param.request;
+        return cacheKey != null
+            ? hostCall(() => Request(cacheKey.toJS, requestInit(headers: param.request.headers)))
+            : param.request;
       };
 }
 

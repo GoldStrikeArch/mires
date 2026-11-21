@@ -103,7 +103,9 @@ let run input =
     in
     let fetch_did_succeed _ ~request:_ ~response =
       match !source with
-      | "missing" -> return (Host.response (text "missing") ~status:(Host.of_int 404))
+      | "missing" ->
+          let*! response = thrown (Host.response (text "missing") ~status:(Host.of_int 404)) in
+          return response
       | "redirected" -> return (Host.mark_redirected response)
       | _ -> return response
     in
@@ -257,7 +259,7 @@ let run input =
             Precache_controller.create_handler_bound_to_url controller url)
     | None, None, None ->
         let body = Host.get spec "respond" and status = Host.get spec "status" in
-        Ok (Routing.Callback (fun _ -> return (Host.response body ~status)))
+        Ok (Routing.Callback (fun _ -> Host.resolve (thrown (Host.response body ~status))))
   in
   let route_with_options options controller =
     match options with

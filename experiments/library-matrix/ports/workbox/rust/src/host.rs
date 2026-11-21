@@ -28,8 +28,8 @@ js_bindings! {
     #[js(new = "Error")] fn new_error(message: JsValue) -> JsValue;
     #[js(new = "TypeError")] fn new_type_error(message: JsValue) -> JsValue;
     #[js(new = "Request", fallible)] fn new_request(input: JsValue, init: JsValue) -> Result<JsValue, JsValue>;
-    #[js(new = "Response")] fn new_response(body: JsValue, init: JsValue) -> JsValue;
-    #[js(new = "Headers")] fn new_headers(init: JsValue) -> JsValue;
+    #[js(new = "Response", fallible)] fn new_response(body: JsValue, init: JsValue) -> Result<JsValue, JsValue>;
+    #[js(new = "Headers", fallible)] fn new_headers(init: JsValue) -> Result<JsValue, JsValue>;
     #[js(new = "URL", fallible)] fn new_url(input: JsValue, base: JsValue) -> Result<JsValue, JsValue>;
     #[js(new = "URL", fallible)] fn new_absolute_url(input: JsValue) -> Result<JsValue, JsValue>;
     #[js(new = "RegExp", fallible)] fn new_regexp(source: JsValue) -> Result<JsValue, JsValue>;
@@ -239,19 +239,19 @@ impl Response {
     }
 
     /// `new Response(body, {status})`.
-    pub fn new(body: JsValue, status: u16) -> Self {
+    pub fn new(body: JsValue, status: JsValue) -> Result<Self, Error> {
         let init = object();
-        set(init, "status", JsValue::erase(f64::from(status)));
-        Response(new_response(body, init))
+        set(init, "status", status);
+        new_response(body, init).map(Response).map_err(Error::Host)
     }
 
     /// `new Response(body, {headers: new Headers(headers), status, statusText})`.
-    pub fn with_parts(body: JsValue, headers: JsValue, status: u16, status_text: JsValue) -> Self {
+    pub fn with_parts(body: JsValue, headers: JsValue, status: u16, status_text: JsValue) -> Result<Self, Error> {
         let init = object();
-        set(init, "headers", new_headers(headers));
+        set(init, "headers", new_headers(headers).map_err(Error::Host)?);
         set(init, "status", JsValue::erase(f64::from(status)));
         set(init, "statusText", status_text);
-        Response(new_response(body, init))
+        new_response(body, init).map(Response).map_err(Error::Host)
     }
 
     pub fn value(self) -> JsValue {

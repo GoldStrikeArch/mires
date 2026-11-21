@@ -32,7 +32,7 @@ The corpus input is the JS object itself, seen through `dart:js_interop` extensi
 
 - **TypeErrors.** dart2js turns a JS TypeError caught by `catch` into a Dart error that has lost its name. Workbox and the adapter report the name, so:
   - `URL.from` parses with `URL.parse` and throws the host's own TypeError (`new TypeError(…)`) where `new URL` would throw one. The parser is the same.
-  - The adapter constructs its Requests (the `fetch` and `matchPrecache` steps) and the `respond` handler's Response inside a JS Promise executor (`hostCall`), whose rejection keeps the thrown TypeError or RangeError. No Request or Response Workbox constructs throws within the domain.
+  - Every `Request`, `Response` and `Headers` construction in both the adapter and Workbox (`install`, `createHandlerBoundToURL`, `_handleFetch`, `PrecacheCacheKeyPlugin`, `copyResponse`) runs inside a JS Promise executor (`hostCall`), whose rejection keeps the thrown `TypeError` or `RangeError` name (e.g., for credentialed URLs passed to `new Request` or invalid `{respond}` statuses).
 - **Non-nullable externals.** dart2js checks the type of an external getter's value, so the optional step members are nullable.
 - **Microtasks in a service worker.** dart2js schedules its microtasks with a MutationObserver, which a page has. A service worker has no `document`, so dart2js falls back to `setTimeout`. `verify-worker.mjs` compares the reports, responses and cache state only, and those match.
 - **Unhandled failures.** A `Future` that fails with no listener yet is reported to the zone as uncaught, as a JS promise is reported as an unhandled rejection. Nothing reads either.

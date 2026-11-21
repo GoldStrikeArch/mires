@@ -409,12 +409,12 @@ class _NetworkPlugin extends WorkboxPlugin {
         final source = _scenario._source;
         if (source == 'offline') throw HostTypeError('offline');
         final target = URL.from('$_fixture${source == 'beta' ? 'beta' : 'alpha'}.mjs', location.href).href;
-        return Request(target.toJS, requestInit(integrity: source == 'broken' ? _wrongIntegrity : param.request.integrity));
+        return hostCall(() => Request(target.toJS, requestInit(integrity: source == 'broken' ? _wrongIntegrity : param.request.integrity)));
       };
 
   @override
   Callback<FetchDidSucceedParam, Response> get fetchDidSucceed => (param) async => switch (_scenario._source) {
-        'missing' => Response('missing'.toJS, JSObject()..['status'] = 404.toJS),
+        'missing' => await hostCall(() => Response('missing'.toJS, JSObject()..['status'] = 404.toJS)),
         'redirected' => _redirected(param.response),
         _ => param.response,
       };
@@ -531,7 +531,7 @@ class _FailPlugin extends WorkboxPlugin {
   final JSAny? _value;
 
   Callback<P, R>? _failing<P, R>(String name) =>
-      name != _on ? null : (_) async => throw (_value.isUndefined ? HostError('fail') : _value as Object);
+      name != _on ? null : (_) async => throw (_value.isUndefined ? HostError('fail') : (_value ?? const ThrownNull()));
 
   @override
   Callback<HandlerWillStartParam, void>? get handlerWillStart => _failing('handlerWillStart');

@@ -28,7 +28,7 @@ This port is written by hand. It replaces the earlier port of the flattened scen
 - **The subclasses' `_handle`** is a function field of the strategy record, which receives the strategy as `this`. `Precache_strategy.make` closes it over `fallbackToNetwork`.
 - **Maps** are association lists. `set_entry` replaces a known key in place and appends a new one, as a JS `Map` keeps insertion order. `install` walks the manifest by index, live, as `for…of` walks the `Map`.
 - **`generateURLVariations`** is a `Seq.t` with the options' defaults as optional arguments, as the generator destructures them. The route takes the first variation in the manifest with `Seq.find_map`, so the later ones (and `urlManipulation`) are not computed.
-- **Melange interop.** `Js.Promise`, `Js.Re` and externals with `mel.send`, `mel.get`, `mel.new` and `mel.scope`. OCaml strings are JS strings here. `Host.attempt` makes a host promise's rejection, or a synchronous throw, a value.
+- **Melange interop.** `Js.Promise`, `Js.Re` and externals with `mel.send`, `mel.get`, `mel.new` and `mel.scope`. OCaml strings are JS strings here. `Host.catching` wraps every throwing host constructor (`URL`, `RegExp`, `Request`, `Response`) and `Routing.handle` (converting synchronous handler throws into rejected outcomes per `CONTRACT.md`), and `Host.attempt` makes a host promise's rejection, or a synchronous throw, a value.
 
 ## Deviations from the npm source
 

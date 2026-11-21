@@ -53,12 +53,13 @@ Future<Response> copyResponse(Response response) async {
     throw WorkboxError('cross-origin-copy-response', JSObject()..['origin'] = origin?.toJS);
   }
   final clonedResponse = response.copy();
+  final headers = await hostCall(() => Headers(clonedResponse.headers));
   final responseInit = JSObject()
-    ..['headers'] = Headers(clonedResponse.headers)
+    ..['headers'] = headers
     ..['status'] = clonedResponse.status.toJS
     ..['statusText'] = clonedResponse.statusText.toJS;
   final body = await clonedResponse.blob().toDart;
-  return Response(body, responseInit);
+  return hostCall(() => Response(body, responseInit));
 }
 
 String _stripParams(String fullURL, List<String> ignoreParams) {

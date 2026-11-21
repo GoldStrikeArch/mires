@@ -76,6 +76,14 @@ func (r *Router) findMatchingRoute(options MatchOptions) (*Route, *Params, error
 	return nil, nil, nil
 }
 
+// invokeHandler runs handler.Handle and turns a synchronous JS throw into a failed Task.
+func invokeHandler(handler Handler, options HandlerOptions) (task *Task[Response]) {
+	if err := catch(func() { task = handler.Handle(options) }); err != nil {
+		return failed[Response](err)
+	}
+	return task
+}
+
 // HandleRequest is handleRequest({request, event}): nil when the request is not http(s) or nothing
 // handles it, else the response, behind the catch handlers when there are any. A synchronous throw
 // (a match callback's) is the error.
@@ -101,7 +109,7 @@ func (r *Router) HandleRequest(request Request, event ExtendableEvent) (*Task[Re
 	if handler == nil {
 		return nil, nil
 	}
-	response := handler.Handle(HandlerOptions{Request: request, Event: event, Params: params})
+	response := invokeHandler(handler, HandlerOptions{Request: request, Event: event, Params: params})
 	var catchHandler Handler
 	if route != nil {
 		catchHandler = route.catchHandler
@@ -115,7 +123,7 @@ func (r *Router) HandleRequest(request Request, event ExtendableEvent) (*Task[Re
 			settle(Response{}, err)
 			return
 		}
-		r.catchHandler.Handle(HandlerOptions{Request: request, Event: event}).then(settle)
+		invokeHandler(r.catchHandler, HandlerOptions{Request: request, Event: event}).then(settle)
 	}
 	return start(func(settle func(Response, error)) {
 		response.then(func(value Response, err error) {
@@ -125,7 +133,7 @@ func (r *Router) HandleRequest(request Request, event ExtendableEvent) (*Task[Re
 			case catchHandler == nil:
 				fallBack(err, settle)
 			default:
-				catchHandler.Handle(HandlerOptions{Request: request, Event: event, Params: params}).then(func(value Response, catchErr error) {
+				invokeHandler(catchHandler, HandlerOptions{Request: request, Event: event, Params: params}).then(func(value Response, catchErr error) {
 					switch {
 					case catchErr == nil:
 						settle(value, nil)

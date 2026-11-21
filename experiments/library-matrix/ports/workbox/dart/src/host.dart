@@ -145,12 +145,20 @@ Future<T> hostCall<T extends JSAny?>(T Function() operation) async =>
     }).toJS)
         .toDart as T;
 
+/// Wrapper for a thrown JS `null`, since Dart's `throw` requires a non-null `Object`.
+final class ThrownNull {
+  const ThrownNull();
+
+  @override
+  String toString() => 'null';
+}
+
 /// `error instanceof Error`, the guard Workbox applies before it keeps or reports a caught value.
 /// A thrown JS value is an Error when it is an instance of the page's Error; a JS primitive is not;
 /// the port's own errors (WorkboxError) are.
 bool isError(Object error) => switch (error) {
       final JSObject value => value.instanceOfString('Error'),
-      String() || num() || bool() => false,
+      String() || num() || bool() || ThrownNull() => false,
       _ => true,
     };
 

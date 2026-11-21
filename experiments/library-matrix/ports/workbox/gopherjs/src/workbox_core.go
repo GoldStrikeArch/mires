@@ -113,7 +113,8 @@ func copyResponse(response Response) *Task[Response] {
 				settle(Response{}, err)
 				return
 			}
-			settle(copiedResponse(body, headers, status, statusText), nil)
+			copied, err := copiedResponse(body, headers, status, statusText)
+			settle(copied, err)
 		})
 	})
 }

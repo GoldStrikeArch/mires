@@ -255,7 +255,11 @@ func (s *scenario) networkPlugin() *Plugin {
 		FetchDidSucceed: func(_ Cx, _ Request, response Response) *Task[Response] {
 			switch s.source {
 			case "missing":
-				return resolved(newResponse("missing", 404))
+				missing, err := newResponse("missing", 404)
+				if err != nil {
+					return failed[Response](err)
+				}
+				return resolved(missing)
 			case "redirected":
 				return resolved(markRedirected(response))
 			}
@@ -451,7 +455,13 @@ func (s *scenario) handler(spec *js.Object) (Handler, error) {
 		return controller.CreateHandlerBoundToURL(*url)
 	}
 	body, statusCode := spec.Get("respond"), spec.Get("status")
-	return HandlerFunc(func(HandlerOptions) *Task[Response] { return resolved(newResponse(body, statusCode)) }), nil
+	return HandlerFunc(func(HandlerOptions) *Task[Response] {
+		response, err := newResponse(body, statusCode)
+		if err != nil {
+			return failed[Response](err)
+		}
+		return resolved(response)
+	}), nil
 }
 
 // routeOptions applies the given PrecacheRoute options over the defaults: an absent member keeps

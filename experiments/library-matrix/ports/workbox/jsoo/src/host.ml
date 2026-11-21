@@ -165,12 +165,13 @@ let of_request value = value
 type response = value
 type blob = value
 
-let response body ~status = construct "Response" [| body; obj [ ("status", status) ] |]
+let response body ~status = catching (fun () -> construct "Response" [| body; obj [ ("status", status) ] |])
 let copy_headers headers = construct "Headers" [| headers |]
 
 let copied_response body ~headers ~status ~status_text =
-  let init = obj [ ("headers", headers); ("status", of_int status); ("statusText", of_string status_text) ] in
-  construct "Response" [| body; init |]
+  catching (fun () ->
+      let init = obj [ ("headers", headers); ("status", of_int status); ("statusText", of_string status_text) ] in
+      construct "Response" [| body; init |])
 
 let clone_response response = call response "clone" [||]
 let status response : int = Js.Unsafe.get response (Js.string "status")

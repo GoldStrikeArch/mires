@@ -192,14 +192,15 @@ type blob
 
 external new_response : value -> value -> response = "Response" [@@mel.new]
 
-let response body ~status = new_response body (obj [ ("status", status) ])
+let response body ~status = catching (fun () -> new_response body (obj [ ("status", status) ]))
 
 external copy_headers : headers -> headers = "Headers" [@@mel.new]
 external new_copied_response : blob -> value -> response = "Response" [@@mel.new]
 
 let copied_response body ~headers ~status ~status_text =
-  let init = obj [ ("headers", cast headers); ("status", of_int status); ("statusText", of_string status_text) ] in
-  new_copied_response body init
+  catching (fun () ->
+      let init = obj [ ("headers", cast headers); ("status", of_int status); ("statusText", of_string status_text) ] in
+      new_copied_response body init)
 
 external clone_response : response -> response = "clone" [@@mel.send]
 external status : response -> int = "status" [@@mel.get]

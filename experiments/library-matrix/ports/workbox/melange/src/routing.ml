@@ -9,7 +9,12 @@ open Strategies
 type handler = Strategy of strategy | Callback of (handler_options -> Host.response outcome)
 
 let handle handler options =
-  match handler with Strategy strategy -> Strategy.handle strategy options | Callback callback -> callback options
+  match
+    Host.catching (fun () ->
+        match handler with Strategy strategy -> Strategy.handle strategy options | Callback callback -> callback options)
+  with
+  | Ok promise -> promise
+  | Error error -> fail (Thrown error)
 
 (* What a match callback receives. No matcher in the subset reads the event Workbox also passes. *)
 type match_options = { url : Host.url; same_origin : bool; request : Host.request }

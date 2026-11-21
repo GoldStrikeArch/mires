@@ -56,6 +56,9 @@ val stringify : value -> string
 val is_error : value -> bool
 (** [value instanceof Error]. *)
 
+val catching : (unit -> 'a) -> ('a, value) result
+(** Runs a synchronous call, returning a thrown JS exception as [Error]. *)
+
 val error_name : value -> string
 val error_message : value -> value
 val new_error : string -> value
@@ -170,13 +173,13 @@ val of_request : value -> request
 type response
 type blob
 
-val response : value -> status:value -> response
-(** [new Response(body, {status})]. *)
+val response : value -> status:value -> (response, value) result
+(** [new Response(body, {status})], or the RangeError/TypeError it throws. *)
 
 val copy_headers : headers -> headers
 (** [new Headers(headers)]. *)
 
-val copied_response : blob -> headers:headers -> status:int -> status_text:string -> response
+val copied_response : blob -> headers:headers -> status:int -> status_text:string -> (response, value) result
 (** [new Response(blob, {headers, status, statusText})]. *)
 
 val clone_response : response -> response

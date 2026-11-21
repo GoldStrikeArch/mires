@@ -74,7 +74,8 @@ let copy_response response =
     let status = Host.status cloned_response in
     let status_text = Host.status_text cloned_response in
     let*? body = host (Host.blob cloned_response) in
-    return (Host.copied_response body ~headers ~status ~status_text)
+    let*! copied = thrown (Host.copied_response body ~headers ~status ~status_text) in
+    return copied
 
 let strip_params full_url ignore_params =
   Host.url full_url ~base:None

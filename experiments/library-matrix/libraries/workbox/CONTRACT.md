@@ -9,7 +9,7 @@
 | Output form | `json`, async; key order is significant |
 | Normalisation | none. The output is location-independent by construction ("Output"). |
 | Parity environments | chrome, firefox, safari. Safari is unavailable on this machine, so `expected.json` was captured in Chrome and confirmed identical in Firefox; Safari was never captured. |
-| Corpus | `corpus.json`, 58 cases, written by `generate-corpus.mjs` |
+| Corpus | `corpus.json`, 61 cases, written by `generate-corpus.mjs` |
 | Bench cases | `bench-cache`, baseIterations 1, variant `bench-variant.mjs` ("Bench") |
 | Caching | Nothing persists across calls. Workbox memoises `canConstructResponseFromBodyStream` (always false in 7.4.1) at module level; ports may hard-code false. Each call creates its caches under a fresh prefix and deletes them before it settles. |
 | Files | none. The two network fixtures are fetched at run time from the test origin. |
@@ -186,7 +186,7 @@ The adapter builds the following arguments:
   - `{strategy: 'CacheFirst'|'CacheOnly'|'NetworkFirst'|'NetworkOnly', cacheName, plugins?}` creates that strategy with `plugins: [network, ...plugins]`. A NetworkFirst without a cacheWillUpdate plugin then unshifts its own.
   - `{precache: id}` is that controller's `strategy`.
   - `{bound: url, controller: id}` is `controller.createHandlerBoundToURL(url)`. It can throw, which makes the step an error.
-  - `{respond: body, status}` is `async () => new Response(body, {status})`.
+  - `{respond: body, status}` is `async () => new Response(body, {status})`. Both `respond` and `status` are required members; omitting `status` is out of the parity domain.
 - **`options`** for `PrecacheRoute`:
   - `directoryIndex` and `cleanURLs` are passed as given. `null` disables them, and an absent member keeps the default.
   - `ignoreURLParametersMatching` is a list of RegExp sources, compiled with `new RegExp(source)` (JavaScript semantics, no flags).
@@ -290,6 +290,7 @@ The worker runs native install, activate and fetch events. The page checks:
 Inputs outside the domain are these:
 
 - Steps that name unknown ids, or that omit `cacheName`. The default cache names are out of the subset.
+- `{respond}` handlers that omit `status`.
 - Manifest `url` values that are not strings.
 - Revisions that are booleans or objects. The domain revision is a string, a JSON number or `null`.
 - `fail` on `handlerDidComplete`. `destroy()` would never run, so the event's lifetime would never settle.
@@ -400,6 +401,9 @@ Nothing else is allowed in the host: no Workbox logic, no URL variation or cache
 | `redirected-runtime` | runtime strategies cache a redirected response as it is; only the precache copies it |
 | `error-after-install` | an invalid URL after a successful install throws, and the scenario still reports and deletes its caches (B9) |
 | `error-sequence` | every step fails in turn after caches were opened; later steps still run |
+| `route-respond-invalid` | invalid `{respond}` statuses (99, 600, -1, 65736 unsigned-short wrap to 200, 204 with non-empty vs empty/null body) reject per step with cache cleanup |
+| `route-respond-invalid-catch` | invalid `{respond}` triggers route/global catch handlers, and an invalid `{respond}` inside a route or global catch handler propagates without hanging and cleans up caches |
+| `error-credentialed-url` | a valid credentialed URL passes `new URL` in `addToCacheList` then rejects `new Request` with `TypeError` in `install`, `matchPrecache`, `createHandlerBoundToURL` and `fetch` |
 | `bench-cache` | benchmark: install and activate 12 entries, then 24 fetches through precache, CacheFirst and NetworkOnly routes |
 
 ## Bench

@@ -228,6 +228,21 @@ add_case('error-after-install', 'an invalid URL after a successful install throw
 add_case('error-sequence', 'every step fails in turn after caches were opened; later steps still run',
   app(site), install(), network('missing'), get('first/a'), add([null]), network('offline'), get('only/a'), get('network/a'),
   add([{url: 'guide.html', revision: 'other'}]), add([{url: 'new.html', revision: '1'}]), install(), activate())
+add_case('route-respond-invalid', 'invalid {respond} statuses (99, 600, -1, 65736 unsigned-short wrap to 200, 204 with non-empty vs empty/null body) reject per step with cache cleanup',
+  controller(), add(['a.html']), install(), router(),
+  route('low/', respond('x', 99)), route('high/', respond('x', 600)), route('neg/', respond('x', -1)),
+  route('wrap/', respond('x', 65736)), route('n204bad/', respond('x', 204)), route('n204ok/', respond('', 204)), route('n204null/', respond(null, 204)),
+  get('low/1'), get('high/1'), get('neg/1'), get('wrap/1'), get('n204bad/1'), get('n204ok/1'), get('n204null/1'))
+add_case('route-respond-invalid-catch', 'invalid {respond} triggers route/global catch handlers, and an invalid {respond} inside a route or global catch handler propagates without hanging and cleans up caches',
+  controller(), add(['a.html']), install(), router(),
+  route('rc/', respond('x', 99), {id: 'rc'}), catchHandler(respond('route-caught', 200), {route: 'rc'}), get('rc/1'),
+  route('gc/', respond('x', 204)), catchHandler(respond('global-caught', 200)), get('gc/1'),
+  route('badrc/', strategy('CacheOnly'), {id: 'badrc'}), catchHandler(respond('x', 99), {route: 'badrc'}), get('badrc/1'),
+  router('r2'), route('badgc/', strategy('CacheOnly'), {router: 'r2'}), catchHandler(respond('x', 99), {router: 'r2'}), get('badgc/1', {router: 'r2'}))
+add_case('error-credentialed-url', 'a valid credentialed URL passes new URL in addToCacheList then rejects new Request with TypeError in install, matchPrecache, createHandlerBoundToURL and fetch',
+  controller(), add(['a.html']), install(), add(['http://user:pass@example.com/secret']), install(),
+  matchPrecache('http://user:pass@example.com/secret'), matchPrecache('http://user:pass@example.com/secret', {request: true}),
+  router(), route('bound/', {bound: 'http://user:pass@example.com/secret', controller: 'sw'}), get('bound/1'), get('http://user:pass@example.com/secret'))
 
 // The benchmark: a 12-entry precache installed and activated, then 24 fetches across the routes.
 const benchManifest = Array.from({length: 12}, (_, i) => ({url: 'bench/' + (i % 3 ? 'page-' + i + '.html' : 'dir-' + i + '/index.html'), revision: 'r' + i}))

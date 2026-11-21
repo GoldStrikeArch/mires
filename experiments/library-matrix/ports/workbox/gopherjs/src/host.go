@@ -284,14 +284,18 @@ func asRequest(value *js.Object) (Request, bool) {
 // Response is a host Response.
 type Response struct{ object *js.Object }
 
-// newResponse is new Response(body, {status}).
-func newResponse(body, status any) Response {
-	return Response{js.Global.Get("Response").New(body, newObject("status", status))}
+// newResponse is new Response(body, {status}), or the RangeError/TypeError it throws.
+func newResponse(body, status any) (response Response, err error) {
+	err = catch(func() { response = Response{js.Global.Get("Response").New(body, newObject("status", status))} })
+	return response, err
 }
 
 // copiedResponse is new Response(blob, {headers: new Headers(headers), status, statusText}).
-func copiedResponse(blob, headers *js.Object, status int, statusText string) Response {
-	return Response{js.Global.Get("Response").New(blob, newObject("headers", headers, "status", status, "statusText", statusText))}
+func copiedResponse(blob, headers *js.Object, status int, statusText string) (response Response, err error) {
+	err = catch(func() {
+		response = Response{js.Global.Get("Response").New(blob, newObject("headers", headers, "status", status, "statusText", statusText))}
+	})
+	return response, err
 }
 
 func (r Response) Clone() Response     { return Response{r.object.Call("clone")} }

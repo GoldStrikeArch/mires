@@ -152,7 +152,7 @@ pub async fn copy_response(response: Response) -> Result<Response, Error> {
     }
     let cloned = response.duplicate();
     let body = cloned.blob().await?;
-    Ok(Response::with_parts(body, cloned.headers(), cloned.status(), cloned.status_text()))
+    Response::with_parts(body, cloned.headers(), cloned.status(), cloned.status_text())
 }
 
 fn strip_params(url: &str, ignore: &[&str]) -> Result<String, Error> {
