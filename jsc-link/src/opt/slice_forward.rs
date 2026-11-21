@@ -8,7 +8,8 @@
 use std::collections::BTreeMap;
 
 use crate::jir::repr::{Dominators, Func, Op, OpKind, Proj, Root, ValueDef, ValueId};
-use crate::jir::semantic::BinaryOp;
+use crate::jir::semantic::{BinaryOp, TypeId};
+use crate::jir::types::{PointerForm, TypeKind};
 use crate::jir::TypeTable;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,9 +67,10 @@ pub fn run(func: &mut Func, table: &TypeTable) -> u32 {
                 };
                 let view = match &op.kind {
                     OpKind::SliceView { ptr, len }
-                        if !super::range::is_slice_pointer(
+                        if slice_view_ptr_matches_element(
                             table,
                             func.values[ptr.0 as usize].ty,
+                            func.values[result.0 as usize].ty,
                         ) =>
                     {
                         Some(View {
@@ -154,6 +156,40 @@ pub fn run(func: &mut Func, table: &TypeTable) -> u32 {
         func.blocks[block_index].ops = rewritten;
     }
     changed
+}
+
+/// Whether `ptr_ty` is already a slot-form element pointer matching `result_ty`'s slice element.
+///
+/// `SliceView` can carry a pointer whose pointee differs from the slice element (for example
+/// `*mut MaybeUninit<[T; N]>` folded by rustc into `from_raw_parts_mut` for `[MaybeUninit<T>]`,
+/// or `*const ()` / `*const u8`). Forwarding an indexed read directly to `Offset(ptr, i)` would
+/// bypass the pointee conversion `build_fat` performs.
+fn slice_view_ptr_matches_element(table: &TypeTable, ptr_ty: TypeId, result_ty: TypeId) -> bool {
+    if super::range::is_slice_pointer(table, ptr_ty)
+        || table.pointer_form(ptr_ty) != Some(PointerForm::Slot)
+    {
+        return false;
+    }
+    let Some(ptr_pointee) = pointee_of(table, ptr_ty) else {
+        return false;
+    };
+    let Some(result_pointee) = pointee_of(table, result_ty) else {
+        return false;
+    };
+    let Some(TypeKind::Slice(element)) = table.get(table.peeled(result_pointee)).map(|d| &d.kind)
+    else {
+        return false;
+    };
+    !table.is_zst(*element) && table.peeled(ptr_pointee) == table.peeled(*element)
+}
+
+fn pointee_of(table: &TypeTable, ty: TypeId) -> Option<TypeId> {
+    match table.get(table.peeled(ty)).map(|d| &d.kind) {
+        Some(TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. }) => {
+            Some(*pointee)
+        }
+        _ => None,
+    }
 }
 
 fn incoming(func: &Func) -> Vec<Vec<Vec<ValueId>>> {
@@ -329,5 +365,99 @@ mod tests {
         )));
         func.verify_carriers(&table(), CarrierPolicy::BASELINE)
             .unwrap();
+    }
+
+    #[test]
+    fn array_pointer_slice_view_is_not_forwarded() {
+        let mut t = table();
+        const ARR_U8: TypeId = TypeId(7);
+        const RAW_ARR_U8: TypeId = TypeId(8);
+        let mut arr_facts = js(ARR_U8);
+        arr_facts.is_indirect = true;
+        t.insert(TypeDescriptor {
+            id: ARR_U8,
+            name: None,
+            kind: TypeKind::Array {
+                element: U8,
+                length: 16,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(16),
+                align: Some(1),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: arr_facts,
+        });
+        let mut raw_arr_facts = js(RAW_ARR_U8);
+        raw_arr_facts.pointer_form = Some(PointerForm::Slot);
+        t.insert(TypeDescriptor {
+            id: RAW_ARR_U8,
+            name: None,
+            kind: TypeKind::RawPointer {
+                pointee: ARR_U8,
+                mutable: false,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                align: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: raw_arr_facts,
+        });
+
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 0,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                abi: AbiSignature {
+                    parameters: 2,
+                    ..AbiSignature::default()
+                },
+                arguments: vec![RAW_ARR_U8, U32],
+                result: U8,
+            },
+        );
+        let entry = FuncBuilder::ENTRY;
+        let ptr = b.param(RAW_ARR_U8, O);
+        let index = b.param(U32, O);
+        let len = b.op(
+            entry,
+            OpKind::Const(ConstTree::Scalar { bits: 16, bytes: 4 }),
+            U32,
+            O,
+        );
+        let view = b.op(entry, OpKind::SliceView { ptr, len }, REF_SLICE, O);
+        let borrowed = b.op(
+            entry,
+            OpKind::BorrowView {
+                root: Root::Value(view),
+                path: vec![Proj::Deref, Proj::Index(index)],
+                mutable: false,
+            },
+            REF_U8,
+            O,
+        );
+        let read = b.op(entry, OpKind::Deref(borrowed), U8, O);
+        b.terminate(entry, RTerm::Return(Some(read)));
+        let mut func = b.finish();
+
+        assert_eq!(run(&mut func, &t), 0);
+        assert!(func.blocks[0].ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::BorrowView {
+                root: Root::Value(v),
+                path,
+                mutable: false,
+            } if *v == view && path.as_slice() == [Proj::Deref, Proj::Index(index)]
+        )));
     }
 }

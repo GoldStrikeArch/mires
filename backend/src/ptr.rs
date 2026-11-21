@@ -1124,6 +1124,40 @@ pub(crate) fn raw_to_ref<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, raw: Expr
 ///
 /// A **sized** pointee is not a rebuild at all: its metadata is `()`, and the result is the data
 /// pointer, keyed back out of whatever erased form it arrived in.
+/// Converts the thin data operand of a `[element]` fat-pointer build from `from_pointee` to
+/// `element`. Mirrors JIR's `JsCx::cast_slice_data`: a 1-byte source pointer (`*mut u8` from
+/// `Global::allocate` / `Rc::allocate_for_slice` or a folded byte offset) uses `__rt.thin` rather
+/// than `__rt.unscale*` so a fresh heap block is not prematurely retyped before `__rt.retype_rc`.
+fn cast_slice_data<'tcx>(
+    fx: &FnCx<'_, 'tcx>,
+    from_pointee: Ty<'tcx>,
+    element: Ty<'tcx>,
+    data: Expr,
+) -> Expr {
+    let tcx = fx.tcx;
+    let mut from = peel_pattern(peel_transparent(tcx, from_pointee));
+    let mut depth = 0;
+    while let ty::Slice(inner) = from.kind() {
+        from = peel_pattern(peel_transparent(tcx, *inner));
+        depth += 1;
+        if depth >= CAST_DEPTH {
+            break;
+        }
+    }
+    let to = peel_pattern(peel_transparent(tcx, element));
+    if from == to {
+        return data;
+    }
+    if size_of(tcx, from) == Some(1) && !is_indirect(tcx, from) {
+        if let Some(size) = size_of(tcx, to) {
+            if size > 1 {
+                return jsast::rt_call("thin", vec![data, jsast::num(size as f64)]);
+            }
+        }
+    }
+    cast_pointer(fx, from_pointee, element, data)
+}
+
 pub(crate) fn build_fat<'tcx>(
     fx: &FnCx<'_, 'tcx>,
     pointee: Ty<'tcx>,
@@ -1131,13 +1165,45 @@ pub(crate) fn build_fat<'tcx>(
     data: Expr,
     meta: Expr,
 ) -> Expr {
+    let from_pointee = data_ty.and_then(|ty| ty.builtin_deref(true));
+    let raw_data = |data: Expr| -> Expr {
+        if let (Some(dt), Some(fp)) = (data_ty, from_pointee) {
+            if matches!(dt.kind(), ty::Ref(..))
+                && !matches!(
+                    peel_pattern(peel_transparent(fx.tcx, fp)).kind(),
+                    ty::Array(..) | ty::Slice(_) | ty::Str
+                )
+            {
+                return ref_to_raw(fx, fp, data);
+            }
+        }
+        data
+    };
     match pointee.kind() {
         ty::Dynamic(..) => fat_dyn(data, meta),
         ty::Slice(element) if is_zst(fx.tcx, *element) => fat_slice(data, jsast::num(0), meta),
-        ty::Slice(element) if matches!(element.kind(), ty::Array(..)) => {
-            let width = match element.kind() {
+        ty::Slice(element)
+            if matches!(
+                peel_pattern(peel_transparent(fx.tcx, *element)).kind(),
+                ty::Array(..)
+            ) =>
+        {
+            let peeled_element = peel_pattern(peel_transparent(fx.tcx, *element));
+            let width = match peeled_element.kind() {
                 ty::Array(_, count) => count.try_to_target_usize(fx.tcx).unwrap_or(0),
                 _ => 0,
+            };
+            let data = match from_pointee {
+                Some(fp)
+                    if peel_pattern(peel_transparent(fx.tcx, fp)) != peeled_element
+                        && matches!(
+                            peel_pattern(peel_transparent(fx.tcx, fp)).kind(),
+                            ty::Array(..)
+                        ) =>
+                {
+                    cast_pointer(fx, fp, *element, data)
+                }
+                _ => data,
             };
             jsast::rt_call("chunk_slice", vec![data, meta, jsast::num(width as f64)])
         }
@@ -1148,19 +1214,9 @@ pub(crate) fn build_fat<'tcx>(
                 ty::Int(ty::IntTy::I8) => Some(-1.0),
                 _ => None,
             };
-            let data = if byte_tag.is_some() {
-                if let Some(from_pointee) = data_ty.and_then(|ty| ty.builtin_deref(true)) {
-                    let from_peeled = peel_pattern(peel_transparent(fx.tcx, from_pointee));
-                    if !is_zst(fx.tcx, from_peeled) && size_of(fx.tcx, from_peeled) != Some(1) {
-                        cast_pointer(fx, from_pointee, *element, data)
-                    } else {
-                        data
-                    }
-                } else {
-                    data
-                }
-            } else {
-                data
+            let data = match from_pointee {
+                Some(fp) => cast_slice_data(fx, fp, *element, raw_data(data)),
+                None => data,
             };
             let mut arguments = vec![data, meta];
             if let Some(tag) = byte_tag {
@@ -1171,6 +1227,10 @@ pub(crate) fn build_fat<'tcx>(
         // `str::from_raw_parts(p, n)`: the `n` bytes at `p`, decoded back into the JavaScript
         // string a `&str` is.
         ty::Str => {
+            let data = match from_pointee {
+                Some(fp) => cast_pointer(fx, fp, fx.tcx.types.u8, raw_data(data)),
+                None => data,
+            };
             let (setup, data) = reread(fx, data, &[BUF, OFF]);
             let decoded = jsast::rt_call(
                 "bytes_str",
@@ -1181,23 +1241,23 @@ pub(crate) fn build_fat<'tcx>(
         // A **sized** pointee has `()` for its metadata, so nothing is being rebuilt: a thin
         // pointer is its data pointer, and the metadata operand is `undefined`.
         //
-        // The work is in the erasure the data pointer arrived through. `from_raw_parts` takes a
-        // `*const impl Thin`, and `with_metadata_of` -- which is how `byte_offset`, `byte_add` and
-        // `byte_sub` are all written -- passes `self as *const ()`. For a `*const i32` that value
-        // is the scaled byte slot `cast::<u8>()` produced, and keying it back into `i32`s is the
-        // whole of the round trip; for a `*const u8` it is already the slot. Nothing in the type
-        // says which, so `__rt.thin` asks the record, the same way `__rt.unwindow` does.
-        _ if pointee.is_sized(fx.tcx, typing_env()) => {
-            let size = size_of(fx.tcx, pointee).unwrap_or(0);
-            let mut args = vec![data, jsast::num(size as f64)];
-            if matches!(
-                peel_pattern(peel_transparent(fx.tcx, pointee)).kind(),
-                ty::Int(ty::IntTy::I8)
-            ) {
-                args.push(Expr::Bool(true));
+        // The work is in converting `data` from whatever thin pointer type rustc left on it
+        // (`*const ()` from `with_metadata_of`, `*mut MaybeUninit<[T; N]>` after MIR cast folding,
+        // `*const u8` from byte offsets, etc.) to a raw pointer to `pointee`.
+        _ if pointee.is_sized(fx.tcx, typing_env()) => match from_pointee {
+            Some(fp) => cast_pointer(fx, fp, pointee, raw_data(data)),
+            None => {
+                let size = size_of(fx.tcx, pointee).unwrap_or(0);
+                let mut args = vec![data, jsast::num(size as f64)];
+                if matches!(
+                    peel_pattern(peel_transparent(fx.tcx, pointee)).kind(),
+                    ty::Int(ty::IntTy::I8)
+                ) {
+                    args.push(Expr::Bool(true));
+                }
+                jsast::rt_call("thin", args)
             }
-            jsast::rt_call("thin", args)
-        }
+        },
         // A struct with an unsized tail, rebuilt from the fresh `*mut u8` its block was allocated
         // as. `with_metadata_of` is the spelling -- `allocate_for_ptr_in` hands the raw block and
         // the metadata of the value being copied into it -- and the reshape is the same one the

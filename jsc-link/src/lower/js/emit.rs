@@ -1791,9 +1791,9 @@ impl<'a> JsCx<'a> {
         };
 
         let expr = match &op.kind {
-            OpKind::Cast { v, .. }
-            | OpKind::Copy(v)
-            | OpKind::Move(v) => self.byte_view_cast_or_alias(*v, res_bv, result)?,
+            OpKind::Cast { v, .. } | OpKind::Copy(v) | OpKind::Move(v) => {
+                self.byte_view_cast_or_alias(*v, res_bv, result)?
+            }
             OpKind::Intrinsic { name, args, .. }
                 if matches!(
                     self.interns.str(*name).unwrap_or(""),
@@ -1817,7 +1817,9 @@ impl<'a> JsCx<'a> {
                     let base_off = self.byte_view_off_expr(*v)?;
                     Self::unsigned_add(base_off, self.expr_of(*idx)?)
                 }
-                [Proj::Deref, Proj::ConstantIndex { offset, from_end, .. }] => {
+                [Proj::Deref, Proj::ConstantIndex {
+                    offset, from_end, ..
+                }] => {
                     let base_off = self.byte_view_off_expr(*v)?;
                     let idx = if *from_end {
                         Self::unsigned_sub(self.byte_view_len_expr(*v)?, jsast::num(*offset as f64))
@@ -1861,7 +1863,11 @@ impl<'a> JsCx<'a> {
                     base
                 } else if self.inlined_vec_cluster_of(result).is_some() {
                     let len_expr = jsast::member(base.clone(), "length");
-                    jsast::object_of(vec![("buf", base), ("off", jsast::num(0)), ("len", len_expr)])
+                    jsast::object_of(vec![
+                        ("buf", base),
+                        ("off", jsast::num(0)),
+                        ("len", len_expr),
+                    ])
                 } else {
                     let off = self.byte_view_off_expr(*ptr)?;
                     let len_expr = self.expr_of(*len)?;
@@ -2034,8 +2040,7 @@ impl<'a> JsCx<'a> {
                 (args[0], args[1], false)
             }
             rcgjs_object::jir::semantic::CallSemantic::Ordinary => {
-                let rcgjs_object::jir::semantic::Callee::Direct { item, link_name } = callee
-                else {
+                let rcgjs_object::jir::semantic::Callee::Direct { item, link_name } = callee else {
                     return Ok(None);
                 };
                 if args.len() != 4
@@ -2088,7 +2093,9 @@ impl<'a> JsCx<'a> {
             sb_init,
             sb_id,
             "",
-            |len_expr| jsast::assign_stmt(req_target, jsast::binary(BinOp::Add, len_expr, add_expr)),
+            |len_expr| {
+                jsast::assign_stmt(req_target, jsast::binary(BinOp::Add, len_expr, add_expr))
+            },
             req_id,
             max,
             &mut helpers,
@@ -2181,11 +2188,11 @@ impl<'a> JsCx<'a> {
                 active_field,
                 fields,
             } => {
+                let data_ty = fields.first().map(|field| self.ty_of(*field)).transpose()?;
                 let values = fields
                     .iter()
                     .map(|field| self.expr_of(*field))
                     .collect::<Res<Vec<_>>>()?;
-                let data_ty = fields.first().and_then(|field| self.ty_of(*field).ok());
                 self.aggregate(*ty, *variant, *active_field, values, data_ty)
             }
             OpKind::Repeat { v, count } => {
@@ -2232,17 +2239,27 @@ impl<'a> JsCx<'a> {
                 let Some(pointee) = value::pointee_of(table, result_ty) else {
                     return Err(decline(OpClass::Rvalue, "SliceView at a non-pointer type"));
                 };
-                // A reference to an array: the array object is the buffer. The test is on the
-                // pointee as well as the form, because a thin form says only that the pointer is
-                // its pointee's reference form. `from_raw_parts` takes its data half as
-                // `ptr as *const ()`, whose form is thin too and whose value is whatever the
-                // erased pointer was (a slot, a byte view, an address); `build_fat` asks that
-                // value, as v1's `aggregate_raw_ptr` does.
+                // A reference to an array: the array object is the buffer when the slice's
+                // element type matches the array's element type. The test is on the pointee as
+                // well as the form, because a thin form says only that the pointer is its
+                // pointee's reference form. `from_raw_parts` takes its data half as any thin
+                // pointer (`*const ()`, `*mut MaybeUninit<[T; N]>`, etc.); `build_fat` converts
+                // it from `pointer_ty` to the slice element pointer, as v1's `aggregate_raw_ptr`
+                // does.
                 let array_reference = table.pointer_form(pointer_ty) == Some(PointerForm::Thin)
                     && matches!(
-                        value::pointee_of(table, pointer_ty)
-                            .and_then(|pointee| value::kind(table, pointee)),
-                        Some(TypeKind::Array { .. })
+                        (
+                            value::pointee_of(table, pointer_ty)
+                                .and_then(|pointee| value::kind(table, pointee)),
+                            value::kind(table, pointee),
+                        ),
+                        (
+                            Some(TypeKind::Array {
+                                element: arr_element,
+                                ..
+                            }),
+                            Some(TypeKind::Slice(slice_element)),
+                        ) if table.peeled(*arr_element) == table.peeled(*slice_element)
                     );
                 if array_reference {
                     Ok(ptr::fat_slice(data, jsast::num(0), len))

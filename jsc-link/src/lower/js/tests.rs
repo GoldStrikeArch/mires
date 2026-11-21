@@ -7829,4 +7829,207 @@ fn transmute_to_array_ref_uses_array_ref_and_hoists_non_duplicable_raw_to_ref() 
     assert!(js2.contains("$t0.buf[$t0.off]"), "{js2}");
 }
 
+#[test]
+fn slice_view_unwindows_raw_array_pointer_for_slice_and_str() {
+    let mut interns = world();
+    let arr_i32 = TypeId(91);
+    let raw_arr_i32 = TypeId(92);
+    let slice_i32 = TypeId(93);
+    let raw_slice_i32 = TypeId(94);
+    let arr_u8 = TypeId(95);
+    let raw_arr_u8 = TypeId(96);
+    let str_ty = TypeId(97);
+    let raw_str = TypeId(98);
+
+    let mut arr_i32_desc = descriptor(
+        arr_i32,
+        TypeKind::Array {
+            element: I32,
+            length: 4,
+        },
+        16,
+    );
+    arr_i32_desc.js.is_indirect = true;
+    interns.types.insert(arr_i32_desc);
+    let mut raw_arr_i32_desc = descriptor(
+        raw_arr_i32,
+        TypeKind::RawPointer {
+            pointee: arr_i32,
+            mutable: true,
+        },
+        4,
+    );
+    raw_arr_i32_desc.js.pointer_form = Some(PointerForm::Slot);
+    interns.types.insert(raw_arr_i32_desc);
+    interns
+        .types
+        .insert(descriptor(slice_i32, TypeKind::Slice(I32), 0));
+    let mut raw_slice_i32_desc = descriptor(
+        raw_slice_i32,
+        TypeKind::RawPointer {
+            pointee: slice_i32,
+            mutable: true,
+        },
+        8,
+    );
+    raw_slice_i32_desc.js.pointer_form = Some(PointerForm::FatSlice);
+    interns.types.insert(raw_slice_i32_desc);
+
+    let mut arr_u8_desc = descriptor(
+        arr_u8,
+        TypeKind::Array {
+            element: U8,
+            length: 4,
+        },
+        4,
+    );
+    arr_u8_desc.js.is_indirect = true;
+    interns.types.insert(arr_u8_desc);
+    let mut raw_arr_u8_desc = descriptor(
+        raw_arr_u8,
+        TypeKind::RawPointer {
+            pointee: arr_u8,
+            mutable: false,
+        },
+        4,
+    );
+    raw_arr_u8_desc.js.pointer_form = Some(PointerForm::Slot);
+    interns.types.insert(raw_arr_u8_desc);
+    interns.types.insert(descriptor(str_ty, TypeKind::Str, 0));
+    let mut raw_str_desc = descriptor(
+        raw_str,
+        TypeKind::RawPointer {
+            pointee: str_ty,
+            mutable: false,
+        },
+        8,
+    );
+    raw_str_desc.js.pointer_form = Some(PointerForm::Thin);
+    interns.types.insert(raw_str_desc);
+
+    // 1. `*mut [i32; 4]` -> `*mut [i32]` via `SliceView` must unwindow before `slice_from_parts`.
+    let mut b = FuncBuilder::new(item(1), signature(vec![raw_arr_i32], raw_slice_i32));
+    let p = b.param(raw_arr_i32, NO_ORIGIN);
+    let e = FuncBuilder::ENTRY;
+    let len = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 4, bytes: 4 }),
+        USIZE,
+        NO_ORIGIN,
+    );
+    let s = b.op(
+        e,
+        OpKind::SliceView { ptr: p, len },
+        raw_slice_i32,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(s)));
+    let func = b.finish();
+    let plan = super::super::fuse::plan(&func, None, &interns.types, &interns, &Opts::default());
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let js = lower_with(
+        &interns,
+        "f_slice",
+        &body,
+        &func,
+        &plan,
+        straight(&func),
+        super::host::EMPTY_ITEMS,
+        &super::unsize::EMPTY_VTABLES,
+    );
+    assert!(
+        js.contains("__rt.slice_from_parts(__rt.unwindow("),
+        "expected raw array pointer to unwindow before slice_from_parts:\n{js}"
+    );
+
+    // 2. `*const [u8; 4]` -> `*const str` via `SliceView` must unwindow once and hoist via reread.
+    let mut b2 = FuncBuilder::new(item(2), signature(vec![raw_arr_u8], raw_str));
+    let p2 = b2.param(raw_arr_u8, NO_ORIGIN);
+    let e2 = FuncBuilder::ENTRY;
+    let len2 = b2.op(
+        e2,
+        OpKind::Const(ConstTree::Scalar { bits: 4, bytes: 4 }),
+        USIZE,
+        NO_ORIGIN,
+    );
+    let s2 = b2.op(
+        e2,
+        OpKind::SliceView { ptr: p2, len: len2 },
+        raw_str,
+        NO_ORIGIN,
+    );
+    b2.terminate(e2, RTerm::Return(Some(s2)));
+    let func2 = b2.finish();
+    let plan2 = super::super::fuse::plan(&func2, None, &interns.types, &interns, &Opts::default());
+    let body2 = body_of(BodyKind::Function, func2.sig.clone());
+    let js2 = lower_with(
+        &interns,
+        "f_str",
+        &body2,
+        &func2,
+        &plan2,
+        straight(&func2),
+        super::host::EMPTY_ITEMS,
+        &super::unsize::EMPTY_VTABLES,
+    );
+    assert_eq!(
+        js2.matches("__rt.unwindow(").count(),
+        1,
+        "expected exactly one __rt.unwindow call (hoisted via reread) for str SliceView:\n{js2}"
+    );
+    assert!(
+        js2.contains("__rt.bytes_str("),
+        "expected bytes_str reconstruction:\n{js2}"
+    );
+
+    // 3. `*mut u8` -> `*mut [i32]` via `SliceView` (e.g. `Rc::allocate_for_slice`) must use
+    // `__rt.thin` rather than `__rt.unscale_scalar` so fresh heap blocks are not prematurely
+    // retyped before `__rt.retype_rc`.
+    let raw_u8 = TypeId(99);
+    let mut raw_u8_desc = descriptor(
+        raw_u8,
+        TypeKind::RawPointer {
+            pointee: U8,
+            mutable: true,
+        },
+        4,
+    );
+    raw_u8_desc.js.pointer_form = Some(PointerForm::Slot);
+    interns.types.insert(raw_u8_desc);
+    let mut b3 = FuncBuilder::new(item(3), signature(vec![raw_u8], raw_slice_i32));
+    let p3 = b3.param(raw_u8, NO_ORIGIN);
+    let e3 = FuncBuilder::ENTRY;
+    let len3 = b3.op(
+        e3,
+        OpKind::Const(ConstTree::Scalar { bits: 4, bytes: 4 }),
+        USIZE,
+        NO_ORIGIN,
+    );
+    let s3 = b3.op(
+        e3,
+        OpKind::SliceView { ptr: p3, len: len3 },
+        raw_slice_i32,
+        NO_ORIGIN,
+    );
+    b3.terminate(e3, RTerm::Return(Some(s3)));
+    let func3 = b3.finish();
+    let plan3 = super::super::fuse::plan(&func3, None, &interns.types, &interns, &Opts::default());
+    let body3 = body_of(BodyKind::Function, func3.sig.clone());
+    let js3 = lower_with(
+        &interns,
+        "f_rc_slice",
+        &body3,
+        &func3,
+        &plan3,
+        straight(&func3),
+        super::host::EMPTY_ITEMS,
+        &super::unsize::EMPTY_VTABLES,
+    );
+    assert!(
+        js3.contains("__rt.slice_from_parts(__rt.thin(") && !js3.contains("unscale"),
+        "expected *mut u8 -> *mut [i32] SliceView to use __rt.thin without premature unscale:\n{js3}"
+    );
+}
+
+
 mod invoke;

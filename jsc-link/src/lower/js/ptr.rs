@@ -261,6 +261,12 @@ impl<'a> JsCx<'a> {
     }
 
     /// A fat pointer built from its two halves (`ptr.rs::build_fat`).
+    ///
+    /// `AggregateKind::RawPtr` accepts any thin pointer as its data operand, so rustc's MIR
+    /// optimizer routinely folds away intermediate `PtrToPtr` casts such as
+    /// `*mut MaybeUninit<[T; N]> -> *mut MaybeUninit<T>` before building `*mut [MaybeUninit<T>]`.
+    /// When `data_ty` is known, convert `data` from its actual pointee to the target data pointer's
+    /// pointee through [`Self::cast_pointer`] before wrapping it in a slice, `str`, or thin result.
     pub fn build_fat(
         &self,
         pointee: TypeId,
@@ -269,6 +275,20 @@ impl<'a> JsCx<'a> {
         meta: Expr,
     ) -> Res<Expr> {
         let table = self.table;
+        let from_pointee = data_ty.and_then(|ty| value::pointee_of(table, ty));
+        let raw_data = |data: Expr| -> Expr {
+            if let (Some(dt), Some(fp)) = (data_ty, from_pointee) {
+                if matches!(value::kind(table, dt), Some(TypeKind::Reference { .. }))
+                    && !matches!(
+                        value::kind(table, fp),
+                        Some(TypeKind::Array { .. } | TypeKind::Slice(_) | TypeKind::Str)
+                    )
+                {
+                    return self.ref_to_raw(fp, data);
+                }
+            }
+            data
+        };
         match value::kind(table, pointee) {
             Some(TypeKind::Dynamic { .. }) => Ok(ptr::fat_dyn(data, meta)),
             Some(TypeKind::Slice(element)) => match value::kind(table, *element) {
@@ -276,10 +296,24 @@ impl<'a> JsCx<'a> {
                 // itself as its `buf`: what `as_ptr` and every element pointer answer, exactly as
                 // a `SliceView` over a thin pointer spells it. Nothing is normalized or asked.
                 _ if table.is_zst(*element) => Ok(ptr::fat_slice(data, jsast::num(0), meta)),
-                Some(TypeKind::Array { length, .. }) => Ok(jsast::rt_call(
-                    "chunk_slice",
-                    vec![data, meta, jsast::num(*length as f64)],
-                )),
+                Some(TypeKind::Array { length, .. }) => {
+                    let data = match from_pointee {
+                        Some(fp)
+                            if table.peeled(fp) != table.peeled(*element)
+                                && matches!(
+                                    value::kind(table, fp),
+                                    Some(TypeKind::Array { .. })
+                                ) =>
+                        {
+                            self.cast_pointer(fp, *element, data)?
+                        }
+                        _ => data,
+                    };
+                    Ok(jsast::rt_call(
+                        "chunk_slice",
+                        vec![data, meta, jsast::num(*length as f64)],
+                    ))
+                }
                 _ => {
                     let byte_tag = match value::kind(table, *element) {
                         Some(TypeKind::Integer {
@@ -292,22 +326,9 @@ impl<'a> JsCx<'a> {
                         }) => Some(-1.0),
                         _ => None,
                     };
-                    let data = if byte_tag.is_some() {
-                        if let Some(from_pointee) =
-                            data_ty.and_then(|ty| value::pointee_of(table, ty))
-                        {
-                            let from_peeled = table.peeled(from_pointee);
-                            if !table.is_zst(from_peeled) && size_of(table, from_peeled) != Some(1)
-                            {
-                                self.cast_pointer(from_pointee, *element, data)?
-                            } else {
-                                data
-                            }
-                        } else {
-                            data
-                        }
-                    } else {
-                        data
+                    let data = match from_pointee {
+                        Some(fp) => self.cast_slice_data(fp, *element, raw_data(data))?,
+                        None => data,
                     };
                     let mut arguments = vec![data, meta];
                     if let Some(tag) = byte_tag {
@@ -317,6 +338,10 @@ impl<'a> JsCx<'a> {
                 }
             },
             Some(TypeKind::Str) => {
+                let data = match from_pointee {
+                    Some(fp) => self.cast_to_byte_ptr(fp, raw_data(data), 0)?,
+                    None => data,
+                };
                 let (setup, data) = self.reread(data, &[BUF, OFF]);
                 let decoded = jsast::rt_call(
                     "bytes_str",
@@ -324,20 +349,23 @@ impl<'a> JsCx<'a> {
                 );
                 Ok(sequenced(setup, decoded))
             }
-            _ if table.get(pointee).is_some_and(|d| d.layout.sized) => {
-                let size = size_of(table, pointee).unwrap_or(0);
-                let mut args = vec![data, jsast::num(size as f64)];
-                if matches!(
-                    value::kind(table, table.peeled(pointee)),
-                    Some(TypeKind::Integer {
-                        signed: true,
-                        bits: 8
-                    })
-                ) {
-                    args.push(Expr::Bool(true));
+            _ if table.get(pointee).is_some_and(|d| d.layout.sized) => match from_pointee {
+                Some(fp) => self.cast_pointer(fp, pointee, raw_data(data)),
+                None => {
+                    let size = size_of(table, pointee).unwrap_or(0);
+                    let mut args = vec![data, jsast::num(size as f64)];
+                    if matches!(
+                        value::kind(table, table.peeled(pointee)),
+                        Some(TypeKind::Integer {
+                            signed: true,
+                            bits: 8
+                        })
+                    ) {
+                        args.push(Expr::Bool(true));
+                    }
+                    Ok(jsast::rt_call("thin", args))
                 }
-                Ok(jsast::rt_call("thin", args))
-            }
+            },
             _ => {
                 let element = table.unsized_tail(pointee).and_then(|tail| {
                     match value::kind(table, tail.ty) {
@@ -360,6 +388,84 @@ impl<'a> JsCx<'a> {
                         "a fat pointer to a struct without a slice tail cannot be rebuilt from a thin data pointer",
                     )),
                 }
+            }
+        }
+    }
+
+    /// Converts the thin data operand of a `Slice(element)` fat-pointer build from `from_pointee`
+    /// to `element`.
+    ///
+    /// A 1-byte source pointer (`*mut u8` from `Global::allocate` / `Rc::allocate_for_slice` or a
+    /// folded byte offset) uses `__rt.thin` rather than `__rt.unscale*` so a fresh heap block is
+    /// not prematurely retyped or zero-filled before a subsequent `__rt.retype_rc` reshapes it,
+    /// while scaled byte views (`p.sc !== undefined`) are still unscaled to element units.
+    fn cast_slice_data(&self, from_pointee: TypeId, element: TypeId, data: Expr) -> Res<Expr> {
+        let table = self.table;
+        let mut from = table.peeled(from_pointee);
+        let mut depth = 0;
+        while let Some(TypeKind::Slice(inner)) = value::kind(table, from) {
+            from = table.peeled(*inner);
+            depth += 1;
+            if depth >= CAST_DEPTH {
+                break;
+            }
+        }
+        let to = table.peeled(element);
+        if from == to {
+            return Ok(data);
+        }
+        if size_of(table, from) == Some(1) && !table.is_indirect(from) {
+            if let Some(size) = size_of(table, to) {
+                if size > 1 {
+                    return Ok(jsast::rt_call("thin", vec![data, jsast::num(size as f64)]));
+                }
+            }
+        }
+        self.cast_pointer(from_pointee, element, data)
+    }
+
+    /// Converts a raw pointer with pointee `from_pointee` into a byte-element pointer for `str`
+    /// reconstruction (`build_fat` on `TypeKind::Str`), without needing a standalone `u8`
+    /// [`TypeId`] in the type table.
+    fn cast_to_byte_ptr(&self, from_pointee: TypeId, value: Expr, depth: u32) -> Res<Expr> {
+        let table = self.table;
+        if depth >= CAST_DEPTH {
+            return Err(decline(
+                OpClass::Cast,
+                format!(
+                    "a pointer cast from pointee {:032x} to `u8` exceeded cast depth",
+                    from_pointee.0
+                ),
+            ));
+        }
+        let from = table.peeled(from_pointee);
+        if table.byte_element(from) {
+            return Ok(value);
+        }
+        if table.is_zst(from) {
+            return Ok(jsast::rt_call("thin", vec![value, jsast::num(1.0)]));
+        }
+        match value::kind(table, from) {
+            Some(TypeKind::Str) => Ok(self.str_to_byte_ptr(value)),
+            Some(TypeKind::Slice(element)) => self.cast_to_byte_ptr(*element, value, depth + 1),
+            Some(TypeKind::Array { element, .. }) => {
+                let unwindowed = jsast::rt_call("unwindow", vec![value]);
+                self.cast_to_byte_ptr(*element, unwindowed, depth + 1)
+            }
+            _ => {
+                if let Some((field_ty, key)) = self.sole_field(from) {
+                    let projected = self.project_field(value, key);
+                    return self.cast_to_byte_ptr(field_ty, projected, depth + 1);
+                }
+                if let Some(size) = size_of(table, from) {
+                    if size > 1 {
+                        return Ok(jsast::rt_call(
+                            "scale",
+                            vec![value, jsast::num(size as f64)],
+                        ));
+                    }
+                }
+                Ok(value)
             }
         }
     }

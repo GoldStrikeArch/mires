@@ -96,7 +96,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
             }
             Rvalue::Aggregate(kind, operands) => {
                 let ty = self.monomorphize(rvalue.ty(&self.mir.local_decls, self.tcx));
-                let data_ty = operands.iter().next().map(|op| self.operand_ty(op));
+                let data_ty = operands.raw.first().map(|op| self.operand_ty(op));
                 let values = operands
                     .iter()
                     .map(|op| self.codegen_operand(op))
