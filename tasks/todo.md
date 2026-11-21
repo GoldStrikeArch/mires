@@ -1521,3 +1521,270 @@ Running at the pause, allowed to finish: A3 implementer (MIRES-018), A4 verifier
 - the jmespath harness `category()` bug;
 - the quiet re-time;
 - the matrix merge, then the correctness-batch merge (user OK each).
+
+### RESUME — user, 2026-11-21: "let's finish the matrix rewrite first, go ahead"
+The matrix workstream resumes, still with up to 5 concurrent agents; the compiler workstream (A3 verifier onward) stays paused. Nothing is merged into `main` yet; the user decides after the matrix is finished.
+- [~] Wave 1: R-d3, R-uplot, R-ky, R-idb phase 1 (contract + Rust), R-workbox phase 1 (contract + Rust).
+- [ ] Then: R-idb and R-workbox phase 2 (8 ports each, 2 batches), long-fix, docs-fix, Explorer re-lock and rebuild, the jmespath harness `category()` fix.
+- [ ] Then: fresh re-reviews of every changed library (marked, fflate, jmespath, big-js, diff, noble, d3, uplot, ky, idb, workbox, long, explorer).
+- [ ] Then: a quiet window (no agents) to re-time all changed cells, regenerate sizes and MATRIX.md, and check that no receipt is stale.
+- [x] R-idb phase 1 (contract + reference + corpus + Rust), uncommitted in the main checkout.
+  - The new subset is idb's own layers: wrap/promisify, `tx.done`, `tx.store`, store and index methods, cursor moves, `openDB`/`deleteDB` with upgrade/blocked/blocking, shortcuts, and `iterate`.
+  - The corpus goes from 15 to 67 cases, 8 of them error-path cases that exercise cleanup. Chrome and Firefox give identical reference output.
+  - The Rust port is rewritten (277 → 1,597 lines; min 158.6 KB) and passes 67/67 in chrome and firefox, readable and min. Its cleanup is fixed.
+  - The Elm primitive list is in `CONTRACT.md`.
+  - The coordinator added the `matrix.json` `libraries.idb.normalisation` entry `plain-object-realm`, the same rule as jmespath: Firefox hands IndexedDB values across a realm.
+  - Explorer is now broken: its reference passes the old idb input. The impact list is in the phase-1 report, and the drivers in all 9 languages need the new step-0 script.
+  - One mutation is uncaught: shortcut writes not awaiting `done`, which is unobservable. CONTRACT notes it.
+- [x] Contract review idb: `phase2Ready: false`. Evidence `contract-idb/`.
+  - Rust idb: ACCEPT-WITH-NOTES.
+  - The subset, reference, corpus determinism, cleanup cases and normalisation all check out.
+  - Blocking:
+    - C1: the Elm boundary has no synchronous `value {id}` acknowledgement for issued calls;
+    - C2: failure scoping (a `tx` step with `catch:true` absorbs inner failures);
+    - C3: dump order after delete and reopen.
+  - Notes:
+    - C7: an absent arg must never be passed as `null` (a trap for Kotlin, Dart, Scala.js, Go);
+    - C8: allowed microtask techniques per family (GopherJS yields to setTimeout after ~4 ms);
+    - C9: an Elm `fail` primitive.
+- [~] R-idb phase 1 send-back (C1–C3 required, C4–C10 contract text, Rust notes): resumed the phase-1 implementer.
+- [x] R-uplot: committed `9ec56a4`.
+  - Kotlin, Scala.js, Dart and GopherJS rewritten by hand; all 9 fixed.
+  - incrRound with fixFloat/roundDec; the `off` term kept, so -0 matches; GopherJS Math.round; the Elm host only applies settings; the Rust canvas is removed on panic.
+  - **New:** every port's DPR shortcut was wrong at DPR 1.75 and 2.625. All 9 now apply DPR as uPlot does, verified by a DPR sweep in both browsers.
+  - The corpus goes from 19 to 39 cases. 36/36 receipts pass (Safari unavailable). The OCaml boundary still uses `Js.Unsafe` (a note).
+- [~] Cleanup A: running.
+- [x] R-workbox phase 1 (contract + reference + corpus + Rust), uncommitted.
+  - The subset is the PrecacheController → PrecacheStrategy → Strategy/StrategyHandler → plugins chain, behind Router/Route, plus the workbox-core pieces it uses.
+  - Excluded: NetworkFirst/SWR (races), cleanupOutdatedCaches, default-controller globals, timeouts and fetch/match options, navigation preload.
+  - The corpus goes from 14 to 56 cases, with 15 error-after-open cases. `expected.json` is per browser, because Firefox realm errors bypass `instanceof Error` in 4 cases.
+  - The Rust port is rewritten (276 → 2,607 lines; min 375 KB, up from ~42 KB, mostly mires async state machines) and passes 56/56 in chrome and firefox.
+  - Fuzz over 320 scripts: 0 mismatches, leaks or hangs. The Elm primitive list is in `CONTRACT.md`.
+- [~] Contract review workbox.
+- [x] R-d3: committed `40aa1a4`.
+  - Rewritten by hand on d3's node graph, TreeNode and front chain: GopherJS, Dart, Kotlin, Scala.js, jsoo/Melange (5 shared files), ReScript. Rust and Elm fixed.
+  - Fixes: Math.round, iterative `hierarchy()` (depth 10,000 everywhere), Elm JS NaN compares and `jsMax`/`jsMin`, JS truthiness in all 9.
+  - Domain: UTF-16 ids, pack values ≤ 1e300 (npm itself loops above), binary tiler ≤ 1,000 children.
+  - The corpus goes from 99 to 203 cases (4.7 MB). 54/54 receipts pass.
+  - Rust and Elm keep `-1`/`usize::MAX` arena sentinels, declared (a re-review note).
+- [ ] **Harness fix H1**: `tools/lib/cells.mjs:53` passes corpus inputs to Node cells via `JSON.stringify`, which writes -0 as 0. So no library's Node cells test -0 inputs (browsers parse the corpus and keep -0). Fix the transport (e.g. a reviver/marker as noble and uplot generators do, or structured transfer), then re-check every library in node.
+- [ ] Harness/docs H2: README's Rust note that BTreeMap is refused at link time is stale.
+- [ ] Harness H3: jmespath `category()` maps stack overflow to "syntax" (in cleanup A).
+- [~] Cleanup B: running.
+- [x] R-idb phase 1 send-back: C1–C3 and C4–C11 fixed. The corpus goes from 67 to 78 cases, each new case pinned by a mutant. Rust passes 78/78 in chrome and firefox.
+  - Correction to the reviewer's example: `continue(null)` behaves as `continue()`.
+  - The reviewer's recheck: `phase2Ready: true`.
+  - **Committed `0f2324f`** (contract, reference, corpus, Rust, registry normalisation). The other 8 idb ports fail the new corpus until phase 2.
+- [~] R-idb phase 2 batch X (rescript, melange, jsoo, gopherjs): running. Batch Y (scalajs, kotlin, dart, elm) goes in the next free slot.
+- [x] Contract review workbox: `phase2Ready: false`. Rust ACCEPT-WITH-NOTES; the subset is coherent and faithful.
+  - **Blocking:** the per-browser expected outputs record a harness artifact. The checker loads the module from a WebDriver script, which in Firefox is a sandbox realm (`globalThis !== window`). In the page realm, Firefox reference output = Chrome. GopherJS (`$global = window`) would diverge. The `instanceof Error` guards are never tested with a non-Error.
+  - Notes:
+    - the NetworkFirst exclusion reason is wrong;
+    - `matchOptions`, `fetchOptions`, RegExpRoute, `precache()` and `getCachedURLs()` have no reason given;
+    - three plugin-lifecycle wording points;
+    - an Elm no-timer note;
+    - Safari;
+    - Rust `routing.rs:89` and the realm comment.
+- [~] **H4 harness fix: page-realm browser cells** (`briefs/h4-page-realm.md`). This was already queued pre-L4 as the Marionette sandbox realm, CCW Uint8Array. Implemented in worktree `.claude/worktrees/h4-harness` on `fix/h4-page-realm`, and applied by the coordinator at a quiet point. It invalidates every browser receipt; the final re-check phase re-runs them all anyway.
+- [ ] Workbox phase 1 send-back, after H4:
+  - a single expected section;
+  - a non-Error `fail` fixture variant;
+  - the exclusion reasons;
+  - the wording;
+  - the Elm timer note;
+  - the Rust notes.
+
+  Then workbox phase 2.
+- [x] Cleanup A: committed `85aa438`.
+  - minisearch Rust:
+    - the MIRES-002/003 workarounds were removed (natural Rust, +3 KB);
+    - the MIRES-004 stable sort is kept as a declared size choice (the natural form costs +13 KB);
+    - rebuilt on the current compiler: 322,184 / 74,845 gz.
+  - The minisearch CONTRACT Rust and GopherJS guidance is fixed. There is no per-port note field in `matrix.mjs`, so the GopherJS tuned-rewrite note is in the CONTRACT.
+  - marked: the nesting bound is 100 (lists and blockquotes), 111 → 113 cases. PERF-005 is in MIRES-BUGS.md.
+  - jmespath: stack exhaustion propagates in the reference and all 9 ports, including the Elm `decodeString` twin. 28 hidden overflows are now 0.
+  - 54/54 cells pass for each of the three libraries.
+- [ ] Follow-up C2 (coordinator decisions):
+  - jmespath Rust: its catch-all turns a port panic into "syntax"; a panic must propagate;
+  - marked: extend the 100-level bound to inline (emphasis) nesting, with a corpus case. Elm diverges from ~484 levels, Rust ~968, marked 2,421;
+  - refresh the minisearch "~18 KB per sort" note (13–15 KB measured).
+- [~] R-idb phase 2 batch Y (scalajs, kotlin, dart, elm): running.
+- [x] Cleanup B: committed `68f0618`.
+  - long: GopherJS and Scala.js read n and r as doubles. GopherJS avoids its 32-bit `math.Trunc`, a bug the existing corpus caught. The domain allows ≤1,000 hyphens and excludes null or non-integer n and r. 82 → 85 cases.
+  - earcut: strictly increasing holes, the full module-state list, and 2 ToInt32-pinning z-order cases (90 → 92). Rust has PERF-004 site tags.
+  - lz-string: NOTES.md for all 9.
+  - 54/54 cells pass for each library.
+- [~] Follow-up C2 (`briefs/followup-c2.md`): running. It covers:
+  - jmespath panic propagation;
+  - the marked inline nesting bound;
+  - the minisearch sort-size note;
+  - lz-string null data;
+  - earcut NOTES for 7 ports;
+  - README GopherJS `Trunc` and Rust BTreeMap notes.
+- [~] H4 implemented: `8fb1285` on `fix/h4-page-realm` (worktree `h4-harness`).
+  - Design: a page-realm bootstrap (`tools/lib/page.mjs`) with a per-load token result event. Check protocol /6, bench /5.
+  - Realm workarounds removed from `canonical.mjs` and `check-runner.mjs`. Selftest 20/20, including a realm test that fails on the old harness. All negative controls hold.
+  - Effects:
+    - the workbox reference in Firefox now equals the Chrome section;
+    - the fflate Firefox reference bench is 14 → 1.2 ms (the CCW slowdown is gone);
+    - the idb and jmespath normalisations are no longer needed;
+    - it also fixes WebDriver key-sorting of bench inputs.
+  - **Verification running** (`briefs/h4-verify.md`). Apply to the main checkout after a PASS: cherry-pick, then tell the running agents.
+- [ ] Follow-up C3, after H4 is applied. Remove the realm workarounds made obsolete:
+  - the idb and jmespath `normalise.mjs` files and their registry entries (coordinator decision: remove, since they are no longer needed);
+  - the ky `reference.mjs:48-50` header copy;
+  - fflate gopherjs `boundary.go:21`;
+  - workbox rust `workbox_core.rs:55-56`;
+  - the stale realm notes in the fflate, minisearch-Dart, idb and jmespath CONTRACT/NOTES files.
+
+  The workbox items go into its phase-1 send-back.
+- [x] R-ky: committed.
+  - Rust, ReScript, Melange/jsoo (shared core), Scala.js, Kotlin, GopherJS and Dart rewritten by hand. Elm runs all of Ky through an `Io` free monad, with the host reduced to 18 primitives.
+  - All divergences fixed in all 9: retry headers, HTTP-date, 413, charset, option validation order, JS trim, Infinity defaults, Rust error names.
+  - The corpus goes from 18 groups / 67 requests to 33 / 263. 54/54 cells pass; fuzz of 63,360 comparisons shows 0 differences.
+  - `timeout-zero` (a Dart setImmediate race) is out of the domain.
+  - Firefox cross-realm workarounds were added (Scala.js `isArray`, Kotlin/jsoo `hostCall`). They become unnecessary after H4 and are reviewed in C3.
+  - Confirms **MIRES-025** (`to_ascii_lowercase`/`uppercase` unchanged): add it to MIRES-BUGS.md.
+  - The README "Elm drives … Ky retry decisions" sentence is stale (C3).
+- [x] **H4 verified: PASS-WITH-NOTES.**
+  - Its own controls, realm probes and fflate old/new digests are identical. Workbox Firefox = Chrome. Bench A/A is in range.
+  - **Applied to the main checkout: `e9a9f70`** (cherry-pick). Selftest 20/20 in main.
+  - Running agents were told, and all pre-`e9a9f70` receipts are stale.
+- [ ] H4b hardening, from the verifier's note:
+  - a port that patches `JSON.stringify` (or `CustomEvent`/`dispatchEvent`, or `JSON.parse` in Chrome's listener) at import time can forge the result event. This was already possible before H4;
+  - capture those builtins at the top of `page.mjs` and of the WebDriver script, and soften the README "only the bootstrap holds" wording;
+  - the eval-import control hard-codes its folder depth;
+  - one README line is not rewrapped.
+- [~] Workbox phase 1 send-back (resumed the phase-1 implementer):
+  - a single expected section under H4;
+  - a non-Error `fail` fixture plus cases;
+  - NetworkFirst and the other exclusion reasons;
+  - the wording and Elm timer note;
+  - the Rust `routing.rs:89` and realm workaround.
+- [x] Workbox phase 1 send-back:
+  - one expected section under H4;
+  - a non-Error `fail` fixture and case `fail-non-error`;
+  - NetworkFirst and `getCachedURLs` in the subset; all exclusions reasoned;
+  - the wording, the Elm timer note, and the Rust catch-handler timing.
+  - A new exclusion from fuzz: a throwing `handlerDidRespond` on CacheFirst/NetworkFirst leaves a host-timed background `cachePut`. npm itself disagrees between browsers there.
+  - 56 → 58 cases. Rust 58/58 in chrome and firefox (min 396,770 B).
+  - The reviewer's recheck: `phase2Ready: true`.
+  - **Committed `5b4713a`.** The other 8 workbox ports fail the new corpus until phase 2.
+- [~] R-workbox phase 2 batch X (rescript, melange, jsoo, gopherjs): running. Batch Y (scalajs, kotlin, dart, elm) goes in the next free slot.
+- [x] R-idb phase 2 batch X: committed `ebb99c7`.
+  - ReScript, Melange/jsoo (4 shared OCaml files) and GopherJS (CPS on host promises, no goroutines) are hand-written over idb's layers.
+  - 78/78 in chrome and firefox on the new harness; `verify.mjs` inventories are clean.
+  - 1,000-script fuzz: 0 divergences, leaks or hangs. The Firefox unhandled-rejection flips also occur in reference against reference.
+  - Rust idb leaks databases on 2 out-of-contract inputs (declared). The new ports clean up.
+- [~] R-workbox phase 2 batch Y (scalajs, kotlin, dart, elm): running.
+- [x] Follow-up C2: committed `4125e13`.
+  - The jmespath catch-alls are removed in 8 ports; only JMESPath errors and JSON.parse SyntaxError become categories. This exposed a hidden OCaml missing-node bug, now fixed.
+  - marked: an inline nesting bound of 100 (113 → 115 cases).
+  - minisearch: the sort is re-measured at 14.9 KB.
+  - lz-string: null roundtrip excluded.
+  - earcut: 7 NOTES, and Kotlin `flatten` made explicit.
+  - README: the Rust BTreeMap and GopherJS `Trunc` notes.
+  - 270/270 cells pass.
+- [~] Cleanup C3 (`briefs/cleanup-c3.md`):
+  - realm-workaround removal in jmespath (normalisation), ky, fflate and minisearch;
+  - the earcut precedence fix and the `exception Touch` removal;
+  - MIRES-022..025 rows with repros; refreshing the stale 18 KB figures.
+- [x] Re-review big.js (`re-big-js/`).
+  - All 4 earlier blocking findings are fixed: sqrt dp validation, hand-written ports, exponent parse, no sqrt shortcut. Nulls changed as decided.
+  - **New, blocking:**
+    1. The sqrt re-estimate exponent wraps at int32 in 7 ports (npm subtracts in doubles). `sqrt 4e-4294967298` hangs; npm answers "0".
+    2. Rust and Elm division past 2^53 under rm 3: the eager leading-zero decrement rounds differently ("10" vs npm "0.01").
+  - Dart: ACCEPT-WITH-NOTES. 54/54 cells pass on the new harness.
+- [~] R-big-js send-back (items 1–2 plus corpus; notes: the null n/mode boundary wording and the `toFixed` -Infinity loop): resumed the rewriter.
+- [x] R-idb phase 2 batch Y: committed `f5ea4fe`.
+  - Scala.js (futures on the queue EC), Kotlin (stdlib coroutines), Dart (sync host calls, moveNext iterator) and Elm (free-monad `Io`, all logic in Elm) are hand-written.
+  - 78/78 in chrome and firefox. **All 9 idb ports are done.**
+  - The coordinator amended the CONTRACT: Elm `close { id, db }` answers `value` (reverse `Cmd.batch` order), and the host `start` message is documented.
+- [x] idb normalisation removed, committed `174279a`: all 9 ports pass 78/78 in chrome and firefox, on both artifacts, without it. That commit also carries C3's jmespath registry edit, an accidental sweep that was amended into the message; H4 had already shown jmespath 247/247 in firefox without it, and C3 still verifies it.
+- [~] Re-review diff: running.
+- [x] Re-review diff (`re-diff/`). D1–D7 and the ReScript idiom are fixed; the 4 rewrites are hand-written.
+  - **New, blocking:**
+    - N1: `stripTrailingCr` + `newlineIsToken` order (5 ports);
+    - N2: `context*2` int32 overflow (6 ports);
+    - N3: a truthy `toJSON` member (all 9).
+  - Notes, all decided as "match npm":
+    - the NaN hunk start in `applyPatch`;
+    - `diffArrays` ignoreCase for string arrays;
+    - Elm `isGit` truthiness;
+    - the quadratic Melange `parsePatch`;
+    - GopherJS builtin `min`/`max`.
+- [~] R-diff send-back: resumed the rewriter.
+- [x] Cleanup C3: committed `882ff07`.
+  - Realm workarounds removed: jmespath `normalise.mjs`, the ky reference header copy, Kotlin/jsoo host-error wrappers, fflate GopherJS's Go UTF-8 encoder (it now uses the host TextEncoder), and the realm and timing notes. Dart `hostCall` kept, for dart2js error names.
+  - earcut precedence fix, and an option search instead of `exception Touch`.
+  - MIRES-022..025 repros all reproduce. Corrections:
+    - MIRES-022 triggers at **21** elements;
+    - **MIRES-023 also hits the matrix profile** (inline off: `const` NaN payloads are emitted as `NaN`; no port affected);
+    - MIRES-024: on `f525806` every `F: Fn` generic called with a fn item is refused (the unpromoted forms hit MIRES-020);
+    - MIRES-025 is tagged in ky Rust.
+  - 5 libraries × 54 cells pass.
+- [x] R-big-js send-back: committed `ac59402`.
+  - The sqrt re-estimate subtracts in doubles (7 ports). Rust/Elm division follows upstream when `p < 1`.
+  - Extra: the Elm guard survives Terser's `unsafe_comps` NaN rewrite.
+  - 28 → 30 cases. 54/54 pass. The reviewer's probes and the new fuzz: 0 divergences.
+- [x] R-workbox phase 2 batch X: committed `9d7a9c9`.
+  - ReScript (native async, raw throws), Melange/jsoo (6 shared files) and GopherJS (`Task[T]` on host promises).
+  - 58/58 in chrome and firefox. `verify` and `verify-worker` pass; fuzz 580 scripts with 0 mismatches.
+- [~] Explorer update (`briefs/explorer-update.md`): running.
+- [~] Re-reviews running: noble-hashes, d3-hierarchy.
+- [ ] Re-reviews queued:
+  - uplot, ky, marked, fflate, jmespath, idb, workbox (after batch Y), explorer (after update);
+  - "small" (earcut + lz-string + long + minisearch);
+  - second-round checks of big-js and diff on their send-back reasons.
+- [x] R-diff round 2: committed `4b4590a`.
+  - N1–N3 and all decided notes fixed in 9 ports: NaN apply start (now `false`, as npm), ignoreCase for string arrays, Elm truthiness, GopherJS builtin min/max.
+  - Melange slicing goes through the host: a 200k-line patch went from 150 s to 0.66 s.
+  - 411 → 449 cases. 54/54 cells pass; the reviewer's scripts show 0 divergences.
+- [ ] **Perf investigation P-diffwords:** Rust diff `diffWords` takes 21 s on 20k words vs npm 33 ms; every other port is < 0.2 s, and it predates the rewrite. Determine whether it is port code or a mires cliff (PERF-006 if the compiler).
+- [~] Re-review uplot: running.
+- [x] **Re-review noble-hashes: all 9 ACCEPT-WITH-NOTES, no blocking** (`re-noble-hashes/`).
+  - Evidence: 54/54 cells, 1,506 + 6,490 fuzz cases, 400–520 MiB bit-length streams, and 1M-update stress.
+  - Notes (non-blocking): a shared comment set across the imperative ports (one author, adapted code); a bit-length high-word case is impossible in the corpus (could go in `verify.mjs`); Elm keccakP has named lanes (declared).
+- [~] Re-review ky: running.
+- [x] Explorer update: committed `f7b753e`.
+  - The reference and 9 drivers use the new idb script. All 9 locks are re-locked, and the builds reproduce.
+  - 36/36 cells pass. The reference digests are identical to the Nov-20 receipts (432 case-cells). `verify.mjs` and 87-input probes show 0 divergences.
+  - Elm host `reply` check fixed; `Array.from` boundary documented.
+  - **Environment note for the quiet re-time:** the Firefox WebDriver session gets `<sqrx-host>` elements injected mid-session (a browser extension?). Use a clean Firefox profile, and check for it.
+  - Explorer ports still have no NOTES.md (a re-review note).
+- [~] Re-review marked: running.
+- [x] Re-review d3-hierarchy (`re-d3-hierarchy/`).
+  - Earlier: 10 fixed, 2 now domain bounds. 203/203 pass everywhere; ~30k differential cases.
+  - **Blocking:**
+    - ReScript `pushMany` spread throws above ~125k children;
+    - the contract's NaN-sort bound is too loose (one NaN among ≥3 siblings already makes npm engine-dependent; Rust panics).
+  - Coordinator decision: accept null fields exactly where d3 does (`parentId: null` is d3's root marker).
+  - Notes: the GopherJS math.Max NOTES sentence; the Elm compare/`dir`; Rust NONE as "ambiguous" → an enum.
+- [~] R-d3 send-back: resumed the rewriter.
+- [x] Re-review uplot (`re-uplot/`).
+  - All earlier findings fixed. 39/39 pass; DPR sweeps cover 10 values in Chrome and 5 in Firefox.
+  - **Blocking:**
+    - the dense-loop reuse test `xv >= limit` vs uPlot's `!(xv < limit)` (NaN limit from overflowing bounds), in Rust, ReScript, Melange and jsoo;
+    - the Elm gap scan `>=` on NaN;
+    - uPlot setScale's <1e-16 range guard (coordinator decision: implement it in all 9, do not exclude).
+  - Note: the GopherJS "x − floor(x) exact" claim.
+- [~] R-uplot send-back: resumed the rewriter.
+- [x] R-workbox phase 2 batch Y: committed (`2fdbd68`).
+  - Kotlin (stdlib coroutines, live sequences), Scala.js (queue-EC futures), Dart (one library with parts) and Elm (free monad + World heap + simulated microtasks; all logic in Elm).
+  - **All 9 workbox ports are done:** 58/58 in chrome and firefox; `verify` and `verify-worker` pass; fuzz 0/0/0.
+  - **Every rewrite in the matrix is now done.**
+- [~] Re-review idb: running.
+
+### RESUME — user, 2026-11-21 (session 2): finish Workstream B first, then full Workstream A
+User decisions:
+- Stay strictly on Workstream B first (up to 5 concurrent agents) until the matrix merges.
+- `R-d3` send-back picks up and audits the 18 uncommitted files in place rather than starting over.
+- Include **H1** (Node `-0` transport) and **H4b** (page-realm builtin capture) before the final full re-check and quiet re-time.
+- Workstream A (Phase 5) covers the full queue: A3 verifier + A5–A9 + A10–A15 (`MIRES-011`, `022..025`, inline-on triage) + `check.sh` fmt/clippy cleanup.
+- Execution models: **Gemini 4 Neon (High)** (`gemini-4-neon-high`) for implementers/coders; **Gemini 4 Neon (XHigh)** (`gemini-4-neon-xhigh`) for verifiers and reviewers.
+
+- [~] Phase 1 (recover 5 interrupted Workstream B slots): `R-d3` send-back, `R-uplot` send-back, `re-marked`, `re-ky`, `re-idb`.
+- [ ] Phase 2: remaining re-reviews (`workbox`, `fflate`, `jmespath`, small bundle `minisearch`/`earcut`/`long`/`lz-string`), narrow 2nd-round re-checks (`big-js`, `diff`, `d3-hierarchy`, `uplot`), plus any send-backs from Phase 1–2.
+- [ ] Phase 3: H1 + H4b harness fixes, Explorer final component re-lock + `re-explorer`, optional `P-diffwords` triage.
+- [ ] Phase 4: quiet window (`B-time`) — full 3-env checks, 24-sample timing (clean Firefox profile), regenerate `sizes.json` + `MATRIX.md`, zero stale receipts, user OK → fast-forward `main`.
+- [ ] Phase 5: Workstream A full correctness batch → integrated gate → user OK → merge to `main` → update `MIRES-BUGS.md`.
