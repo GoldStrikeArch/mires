@@ -26,7 +26,7 @@ object Main:
     case "squarify" => treemapSquarify
     case _ => throw IllegalArgumentException("unknown tile") // `.tile(undefined)` throws
 
-  /** The reference's `n.id ?? n.data.id`. */
+  /** The reference's `n.id ?? n.data.id`: the datum's id as the input has it, null or undefined included. */
   private def id(node: Node): js.UndefOr[String] = node.id match
     case Some(id) => id
     case None => node.data.get.id
@@ -37,7 +37,7 @@ object Main:
       case "id" => stratify(input.rows)
       case "path" => stratify(input.rows, Some(_.id.get))
       case _ => hierarchy(input.data)
-    root.sum(_.flatMap(_.value.toOption).getOrElse(0.0))
+    root.sum(_.flatMap(d => present(d.value)).getOrElse(0.0))
     if input.sort then root.sort((a, b) => b.value - a.value)
     val w = input.width
     val h = input.height

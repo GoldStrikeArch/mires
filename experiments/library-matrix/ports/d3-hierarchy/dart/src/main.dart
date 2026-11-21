@@ -33,8 +33,9 @@ Tile _tile(String name) => switch (name) {
       _ => throw ArgumentError('unknown tile'), // `.tile(undefined)` throws
     };
 
-/// The reference's `n.id ?? n.data.id`.
-String? _id(Node node) => node.id ?? node.data!.id;
+/// The reference's `n.id ?? n.data.id`: the datum's id as the input has it, null or undefined
+/// included.
+JSAny? _id(Node node) => node.id?.toJS ?? node.data!.idValue;
 
 JSArray<JSArray<JSAny?>> run(Input input) {
   final root = switch (input.source) {
@@ -65,8 +66,8 @@ JSArray<JSArray<JSAny?>> run(Input input) {
   void visit(Node n) {
     final parent = n.parent;
     final record = <JSAny?>[
-      _id(n)?.toJS,
-      parent == null ? null : _id(parent)?.toJS,
+      _id(n),
+      parent == null ? null : _id(parent),
       n.depth.toJS,
       n.height.toJS,
       n.value.toJS,

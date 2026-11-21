@@ -14,11 +14,14 @@ handling of NaN and -0 inexact; both were fixed on 2026-11-21.
 
 ## Boundary
 
-The input is a `JsValue`, read field by field with `Reflect.get`. Ids are read into Rust strings
-(`read::<&str>()`, UTF-8), so a lone surrogate becomes U+FFFD; that is outside the domain
-(CONTRACT.md, "Domain"). The result is a `JsArray` of rows of host strings, `null` and numbers.
-`#[js_export] fn matrix_run` is re-exported as `run`; a panic throws through
-`mires_js::throw_value`.
+The input is a `JsValue`, read field by field with `Reflect.get`. Both `null` and `undefined`
+mean absent for `id`, `parentId`, `value` and `children`, matching d3's `!= null` and `??`.
+Stratify reads ids into Rust strings (`read::<&str>()`, UTF-8), so a lone surrogate becomes
+U+FFFD; that is outside the domain (CONTRACT.md, "Domain"). Each node keeps its `JsValue` datum
+(`JsValue::null()` for an imputed ancestor) so output ids match `n.id ?? n.data.id`, returning
+`undefined` or `null` when absent. The result is a `JsArray` of rows of host strings, `null`,
+`undefined` and numbers. `#[js_export] fn matrix_run` is re-exported as `run`; a panic throws
+through `mires_js::throw_value`.
 
 ## Numeric semantics
 
@@ -35,12 +38,14 @@ The input is a `JsValue`, read field by field with `Reflect.get`. Ids are read i
 - **LCG.** `u32` wrapping arithmetic, which equals d3's `(1664525 * s + 1013904223) % 2^32` on
   doubles: the double product is exact below 2^53.
 - **Sort.** `sort_by` is stable, with `partial_cmp` of the two values; a NaN pair is `Equal`, as
-  Array.prototype.sort counts d3's NaN difference as 0.
+  Array.prototype.sort counts d3's NaN difference as 0. When a node has a NaN child aggregate, a
+  stable insertion sort runs instead so core's `sort_by` cannot panic on the inconsistent
+  comparator (three or more siblings with a NaN child is out of domain: CONTRACT.md).
 
 ## Deviations from the npm source
 
 - Nodes live in a `Vec` and refer to each other by index; `NONE` (`usize::MAX`) is the absent
-  parent or thread, and marks an ambiguous id in stratify's map.
+  parent or thread. Stratify's id map stores `enum Key { Unique(usize), Ambiguous }`.
 - Only the contract's options exist (default accessors, the default separation, a constant
   padding, the three tilers, no `pack.radius`).
 - One post-order pass computes each node's aggregate and its height (one more than its tallest

@@ -30,9 +30,13 @@ to the caller.
   squarify's `!sumValue`, pack's `if (d2)`, `parent.value && …` in dice and slice, and the `|| 0`
   coercions in `sum`, `radiusLeaf` and `packChildrenRandom`. `truthy` is ToBoolean of a number,
   false for 0, -0 and NaN.
-- **Math.max, Math.min, Math.sqrt.** Go's `math.Max` and `math.Min` return NaN for a NaN operand
-  and order -0 below +0, as JavaScript's do. Squarify keeps d3's explicit comparisons for its
-  running minimum and maximum.
+- **Math.max, Math.min, Math.sqrt.** Go's `math.Max` and `math.Min` order -0 below +0 and return
+  NaN for a finite/NaN pair, but GopherJS compiles Go's stdlib checks verbatim (`IsInf` before
+  `IsNaN`), so `math.Max(+Inf, NaN) == +Inf` and `math.Min(-Inf, NaN) == -Inf` where JavaScript's
+  `Math.max` and `Math.min` return `NaN`. In d3's uses (`enclosesWeak`, `place`, pack sizes,
+  squarify ratios), such an infinity/NaN pair cannot change a result (`enclosesWeak`'s `dr` is
+  already NaN, and squarify cannot reach it after a finite `minRatio`). Squarify keeps d3's
+  explicit comparisons for its running minimum and maximum.
 - **Math.round.** `roundNode` calls the host's `Math.round` through `js.Global`: it rounds halves
   up and returns -0 for [-0.5, 0), which `math.Round` (halves away from zero) does not.
 - **Integers.** GopherJS's `int` is 32-bit; depths, heights and indices fit. binary.js's

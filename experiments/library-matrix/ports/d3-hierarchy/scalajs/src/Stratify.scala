@@ -28,8 +28,8 @@ def stratify(data: js.Array[Datum], path: Option[Datum => String] = None): Node 
           rows += None
       (i, p)
     case None =>
-      (mutable.ArrayBuffer.from(data.iterator.map(_.id.getOrElse(""))),
-        mutable.ArrayBuffer.from(data.iterator.map(_.parentId.getOrElse(""))))
+      (mutable.ArrayBuffer.from(data.iterator.map(d => present(d.id).getOrElse(""))),
+        mutable.ArrayBuffer.from(data.iterator.map(d => present(d.parentId).getOrElse(""))))
 
   var n = rows.size
   val ambiguous = Node(None)

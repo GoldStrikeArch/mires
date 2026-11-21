@@ -24,9 +24,11 @@ and `program.ml` are byte-identical in `ports/d3-hierarchy/jsoo/src` and
 
 `Host` reads the corpus object in place through class types (`input_js`, and `datum_js` for nested
 data and stratify rows). Strings cross as OCaml UTF-8 byte strings (`Js.to_string`, and
-`Js.string` back), numbers as floats; an undefined string field reads as `""`. A node keeps its
-datum, as d3's `node.data`, and the output reads the id the way the reference does,
-`n.id ?? n.data.id`. The result is a JS array of rows of strings, `null` and numbers.
+`Js.string` back), numbers as floats; both `undefined` and `null` count as absent (matching d3's
+`!= null` and `??`), with an absent string field reading as `""`. A node keeps its datum, as d3's
+`node.data`, and the output reads the id through `Host.id_value` the way the reference does,
+`n.id ?? n.data.id` (including `null` or `undefined`). The result is a JS array of rows of strings,
+`null`, `undefined` and numbers.
 
 ## Numeric and string semantics
 

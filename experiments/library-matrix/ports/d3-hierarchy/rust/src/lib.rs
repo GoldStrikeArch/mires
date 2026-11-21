@@ -35,6 +35,7 @@ js_bindings! {
 fn get(v: JsValue, k: &str) -> JsValue {
     prop(v, JsValue::erase(k))
 }
+// d3 reads every field of a datum with `!= null` or `??`: undefined and null both mean absent.
 fn text(v: JsValue, k: &str) -> String {
     let p = get(v, k);
     if p.is_null() || p.is_undefined() {
@@ -45,7 +46,7 @@ fn text(v: JsValue, k: &str) -> String {
 }
 fn num(v: JsValue, k: &str) -> f64 {
     let p = get(v, k);
-    if p.is_undefined() {
+    if p.is_null() || p.is_undefined() {
         0.
     } else {
         p.read::<f64>()
@@ -97,7 +98,10 @@ pub(crate) fn js_min(a: f64, b: f64) -> f64 {
 }
 
 struct Node {
+    /// The id stratify gave the node, empty where d3 leaves `node.id` undefined.
     id: String,
+    /// The datum (`node.data`): a nested record, a stratify row, or null for an imputed ancestor.
+    data: JsValue,
     parent: usize,
     children: Vec<usize>,
     depth: usize,
@@ -112,9 +116,10 @@ struct Node {
     y1: f64,
 }
 impl Node {
-    fn new(id: String, value: f64, parent: usize) -> Self {
+    fn new(id: String, data: JsValue, value: f64, parent: usize) -> Self {
         Self {
             id,
+            data,
             parent,
             children: Vec::new(),
             depth: 0,
@@ -135,7 +140,7 @@ fn nested(data: JsValue) -> (Vec<Node>, usize) {
     let mut todo = vec![(data, NONE)];
     while let Some((d, parent)) = todo.pop() {
         let pos = nodes.len();
-        nodes.push(Node::new(text(d, "id"), num(d, "value"), parent));
+        nodes.push(Node::new(String::new(), d, num(d, "value"), parent));
         if parent != NONE {
             nodes[parent].children.push(pos);
         }
@@ -181,6 +186,11 @@ fn parent_path(s: &str) -> String {
     }
     s[..i].to_string()
 }
+/// An entry of stratify's id map: the one node with that id, or d3's `ambiguous`.
+enum Key {
+    Unique(usize),
+    Ambiguous,
+}
 fn stratify(rows: JsValue, paths: bool) -> (Vec<Node>, usize) {
     let count = len(rows);
     let mut nodes = Vec::new();
@@ -196,11 +206,15 @@ fn stratify(rows: JsValue, paths: bool) -> (Vec<Node>, usize) {
             text(row, "parentId")
         };
         if !id.is_empty() {
-            let target = if map.contains_key(&id) { NONE } else { i };
-            map.insert(id.clone(), target);
+            let key = if map.contains_key(&id) {
+                Key::Ambiguous
+            } else {
+                Key::Unique(i)
+            };
+            map.insert(id.clone(), key);
         }
         parents.push(parent);
-        nodes.push(Node::new(id, num(row, "value"), NONE));
+        nodes.push(Node::new(id, row, num(row, "value"), NONE));
     }
     if paths {
         let mut i = 0;
@@ -209,8 +223,8 @@ fn stratify(rows: JsValue, paths: bool) -> (Vec<Node>, usize) {
             if !p.is_empty() && !map.contains_key(p) {
                 let id = p.clone();
                 let parent = parent_path(&id);
-                map.insert(id.clone(), nodes.len());
-                nodes.push(Node::new(id, 0., NONE));
+                map.insert(id.clone(), Key::Unique(nodes.len()));
+                nodes.push(Node::new(id, JsValue::null(), 0., NONE));
                 parents.push(parent);
             }
             i += 1;
@@ -224,10 +238,10 @@ fn stratify(rows: JsValue, paths: bool) -> (Vec<Node>, usize) {
             }
             root = i;
         } else {
-            let p = *map.get(&parents[i]).unwrap_or(&NONE);
-            if p == NONE {
-                fail();
-            }
+            let p = match map.get(&parents[i]) {
+                Some(&Key::Unique(p)) => p,
+                _ => fail(),
+            };
             nodes[i].parent = p;
             nodes[p].children.push(i);
         }
@@ -285,12 +299,29 @@ fn prepare(nodes: &mut [Node], root: usize, sort: bool) {
         nodes[v].value = val;
         if sort {
             let mut children = core::mem::take(&mut nodes[v].children);
-            children.sort_by(|a, b| {
+            // d3's comparator `b.value - a.value`; Array.prototype.sort counts a NaN result as 0.
+            let order = |a: &usize, b: &usize| {
                 nodes[*b]
                     .value
                     .partial_cmp(&nodes[*a].value)
                     .unwrap_or(core::cmp::Ordering::Equal)
-            });
+            };
+            if children.iter().any(|&c| nodes[c].value.is_nan()) {
+                // A NaN aggregate makes that comparator inconsistent, which `sort_by` may answer
+                // with a panic. A stable insertion sort moves a child only past ones it orders
+                // before (outside the domain beyond two siblings: CONTRACT.md).
+                for i in 1..children.len() {
+                    let mut j = i;
+                    while j > 0
+                        && order(&children[j - 1], &children[j]) == core::cmp::Ordering::Greater
+                    {
+                        children.swap(j - 1, j);
+                        j -= 1;
+                    }
+                }
+            } else {
+                children.sort_by(order);
+            }
             nodes[v].children = children;
         }
     }
@@ -392,15 +423,24 @@ pub fn matrix_run(input: JsValue) -> JsValue {
     } else {
         walk(&nodes, root, false)
     };
+    // The reference's `n.id ?? n.data.id`: the datum's id as the input has it, null or
+    // undefined included.
+    let label = |n: &Node| {
+        if n.id.is_empty() {
+            get(n.data, "id")
+        } else {
+            JsValue::erase(n.id.as_str())
+        }
+    };
     let mut output = JsArray::new();
     for i in order {
         let n = &nodes[i];
         let mut row = JsArray::new();
-        row.push(JsValue::erase(n.id.as_str()));
+        row.push(label(n));
         row.push(if n.parent == NONE {
             JsValue::null()
         } else {
-            JsValue::erase(nodes[n.parent].id.as_str())
+            label(&nodes[n.parent])
         });
         row.push(JsValue::erase(n.depth as f64));
         row.push(JsValue::erase(n.height as f64));

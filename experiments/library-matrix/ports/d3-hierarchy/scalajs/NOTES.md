@@ -17,10 +17,11 @@ geometry module that a Python generator had emitted from a shared model (2026-11
 ## Boundary
 
 `run(input)` reads the corpus object in place through `@js.native` facades (`Input`, and `Datum`
-for nested data and stratify rows): strings are JS strings, numbers are `Double`s, absent fields
-are `js.UndefOr`. A node keeps its datum, as d3's `node.data`, and the output reads the id the way
-the reference does, `n.id ?? n.data.id`. The result is a `js.Array` of rows of strings, `null` and
-numbers, exported with `@JSExportTopLevel("run")`.
+for nested data and stratify rows): strings are JS strings, numbers are `Double`s, and `present`
+treats both `undefined` and `null` as absent (matching d3's `!= null` and `??`). A node keeps its
+datum, as d3's `node.data`, and the output reads the id the way the reference does,
+`n.id ?? n.data.id` (including `null` or `undefined`). The result is a `js.Array` of rows of
+strings, `null`, `undefined` and numbers, exported with `@JSExportTopLevel("run")`.
 
 ## Numeric and string semantics
 
@@ -50,7 +51,7 @@ numbers, exported with `@JSExportTopLevel("run")`.
 - Stratify marks an imputed path ancestor with `None` data from the start; d3 marks it with its
   `imputed` object and replaces that by null before returning. Every row has data, so the test
   `root.data === imputed` is the same. `ambiguous` is a node created per call. An id that is
-  undefined or empty reads as `""`, which names nothing, as d3's `id != null && (id += "")` does.
+  undefined, null or empty reads as `""`, which names nothing, as d3's `id != null && (id += "")` does.
 - d3 parents the root to `preroot` (depth -1) while it sets depths; here the root has no parent
   and gets depth 0, the same values.
 - tree.js's extra parent of the root wraps `null`; here it wraps the root, which it never reads.

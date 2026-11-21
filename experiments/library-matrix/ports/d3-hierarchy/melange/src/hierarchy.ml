@@ -57,7 +57,12 @@ let breadth_first root =
     | [] -> List.rev order
     | current ->
         let order = List.rev_append current order in
-        level order (List.concat_map (fun node -> Array.to_list node.children) current)
+        let next =
+          List.fold_left
+            (fun acc node -> Array.fold_left (fun acc c -> c :: acc) acc node.children)
+            [] current
+        in
+        level order (List.rev next)
   in
   level [] [ root ]
 

@@ -24,9 +24,11 @@ The OCaml core is shared with the js_of_ocaml port: `hierarchy.ml`, `tree.ml`, `
 
 `Host` reads the corpus object in place through `Js.t` object types (`input`, and `datum` for
 nested data and stratify rows). Strings are JS strings and numbers are floats, with no conversion;
-an undefined string field reads as `""`. A node keeps its
-datum, as d3's `node.data`, and the output reads the id the way the reference does,
-`n.id ?? n.data.id`. The result is a JS array of rows of strings, `null` and numbers.
+both `undefined` and `null` count as absent (`Js.Nullable.t`, matching d3's `!= null` and `??`),
+with an absent string field reading as `""`. A node keeps its datum, as d3's `node.data`, and the
+output reads the id through `Host.id_value` the way the reference does, `n.id ?? n.data.id`
+(including `null` or `undefined`). The result is a JS array of rows of strings, `null`, `undefined`
+and numbers.
 
 ## Numeric and string semantics
 

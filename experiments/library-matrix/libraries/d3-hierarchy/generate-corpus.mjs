@@ -154,5 +154,30 @@ add('wide-sort-10000','treemap',{sort:true,tile:'sliceDice',data:leaves(Array.fr
 // binary.js recurses once per split: zero weights split one child off at a time.
 add('wide-binary-zeros-1000','treemap',{tile:'binary',data:leaves(Array.from({length:1000},()=>0))})
 
+// null where d3 reads the field with `!= null` or `??` means absent: parentId null marks a root,
+// children null a leaf, value null weighs 0, and a missing or null id comes back as the reference's
+// `n.data.id`, undefined or null.
+const nullRows = [{id:'a',parentId:null,value:1},{id:'b',parentId:'a',value:null},{id:'c',parentId:'a',value:2,children:null}]
+add('null-parentId','stratify',{source:'id',rows:nullRows})
+add('null-parentId-treemap','treemap',{source:'id',rows:nullRows})
+add('null-parentId-roots','stratify',{source:'id',rows:[{id:'a',parentId:null},{id:'b',parentId:null}]})
+const nullData = {id:'r',value:null,children:[{id:'a',value:1,children:null},{id:'b',value:2,children:[]},
+  {id:'c',value:null,children:[{id:'c0',value:3,children:null},{id:'c1',value:null}]}]}
+for (const op of ['hierarchy','treemap','pack','tree','partition']) add('null-fields-'+op,op,{data:nullData})
+const nullIds = {id:null,children:[{id:'a',value:1},{value:2},{id:null,value:3,children:[{value:4},{id:'',value:5}]}]}
+for (const op of ['hierarchy','iterator','cluster']) add('null-ids-'+op,op,{data:nullIds})
+const nullIdRows = [{id:'r'},{id:null,parentId:'r',value:1},{parentId:'r',value:2},{id:'',parentId:'r',value:3},{id:'x',parentId:'r'}]
+for (const op of ['stratify','iterator','treemap']) add('null-ids-rows-'+op,op,{source:'id',rows:nullIdRows})
+
+// sort with a NaN aggregate among two siblings: d3's comparator returns NaN, counted as 0, so the
+// two keep their order (among three or more the order is the engine's: CONTRACT.md).
+const infinite = (id, sign) => ({id, children:[{id:id+'0',value:sign*1e308},{id:id+'1',value:sign*1e308}]})
+const nanNode = id => ({id, children:[infinite(id+'p',1), infinite(id+'n',-1)]})
+for (const op of ['hierarchy','treemap','tree','partition']) {
+  add('nan-sort-two-'+op,op,{sort:true,data:{id:'r',children:[nanNode('a'),{id:'b',value:3}]}})
+}
+add('nan-sort-two-reversed','hierarchy',{sort:true,data:{id:'r',children:[{id:'b',value:3},nanNode('a')]}})
+add('nan-sort-two-both','treemap',{sort:true,data:{id:'r',children:[nanNode('a'),nanNode('c')]}})
+
 for(const op of ['treemap','pack'])add('bench-'+op,op,{data:generated(10000,6),sort:true,padding:.15})
 writeFileSync(new URL('corpus.json',import.meta.url),JSON.stringify({schema:1,library:'d3-hierarchy',cases}, (_key,value) => Object.is(value,-0) ? JSON.rawJSON('-0') : value)+'\n')

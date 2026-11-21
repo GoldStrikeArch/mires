@@ -302,8 +302,8 @@ siblings list seed =
         stage =
             circles |> Array.set 0 a0 |> Array.set 1 a1 |> Array.set 2 (place a1 a0 (at circles 2))
 
-        linked dir a b c =
-            Array.repeat n 0 |> Array.set dir a |> Array.set (modBy 3 (dir + 1)) b |> Array.set (modBy 3 (dir + 2)) c
+        linked a b c =
+            Array.repeat n 0 |> Array.set 0 a |> Array.set 1 b |> Array.set 2 c
 
         insert arr prev next a b i =
             if i == n then
@@ -400,7 +400,7 @@ siblings list seed =
         Ok ( stage, first.r + second.r, seed )
 
     else
-        insert stage (linked 0 2 0 1) (linked 0 1 2 0) 0 1 3
+        insert stage (linked 2 0 1) (linked 1 2 0) 0 1 3
 
 
 layout pre post root w h padding ns =

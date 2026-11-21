@@ -18,12 +18,15 @@ its nested-data decoder recursive; all three were fixed on 2026-11-21.
 
 ## Boundary
 
-The host passes the input object through a port. `Json.Decode` reads the options and the stratify
-rows; nested `data` stays a raw `Json.Decode.Value`, and `nested` decodes one node at a time
-(its id, value and raw children) while it builds the arena on an explicit stack, as d3's
-`hierarchy()` does. No decoder recurses through the nesting, so depth is bounded by memory, not by
-the JS stack. The result is encoded with `Json.Encode` and returned by the host; an `Err` becomes
-a thrown `Error`. Strings are JS strings (UTF-16).
+The host passes `{ input, undefined }` through a port (carrying JavaScript's `undefined`, which
+Elm cannot construct, so a datum with a missing `id` is emitted as `undefined`, matching
+`n.id ?? n.data.id`). `Json.Decode` reads the options and the stratify rows, treating both `null`
+and missing fields as absent as d3 does (`!= null`, `??`); nested `data` stays a raw
+`Json.Decode.Value`, and `nested` decodes one node at a time (its raw id, value and raw children)
+while it builds the arena on an explicit stack, as d3's `hierarchy()` does. No decoder recurses
+through the nesting, so depth is bounded by memory, not by the JS stack. The result is encoded
+with `Json.Encode` and returned by the host; an `Err` becomes a thrown `Error`. Strings are JS
+strings (UTF-16).
 
 ## Numeric semantics
 
@@ -44,8 +47,10 @@ a thrown `Error`. Strings are JS strings (UTF-16).
   number, false for 0, -0 and NaN.
 - **Rounding and the LCG.** `round` is `Math.round`. The LCG is in Floats, as in d3, with `floor`
   for the modulus.
-- **Sort.** `List.sortWith` sorts with the host's stable Array.prototype.sort; `compare` of the
-  two values orders equal infinities as ties, as d3's NaN difference does.
+- **Sort.** `List.sortWith` sorts with the host's stable Array.prototype.sort; the comparator
+  computes `difference = b.value - a.value` and returns `LT` for `difference < 0`, `GT` for
+  `0 < difference`, and `EQ` otherwise — counting a NaN difference as `EQ` (matching d3's
+  `Array.prototype.sort`, whereas Elm's `compare` returns `GT` for NaN).
 
 ## Deviations from the npm source
 

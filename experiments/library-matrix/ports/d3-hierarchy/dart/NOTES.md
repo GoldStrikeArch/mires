@@ -17,11 +17,12 @@ that a Python generator had emitted from a shared model (2026-11-21).
 ## Boundary
 
 `run(input)` reads the corpus object in place through `dart:js_interop` extension types (`Input`,
-and `Datum` for nested data and stratify rows): strings are JS strings, numbers are `double`s and
-an absent field is `null`. A node keeps its datum, as d3's `node.data`, and the output reads the
-id the way the reference does, `n.id ?? n.data.id`. The result is a `JSArray` of rows of strings,
-`null` and numbers. dart2js cannot emit ES modules, so `main()` publishes `run` on
-`globalThis.__matrixExports` for the builder's facade.
+and `Datum` for nested data and stratify rows): strings are JS strings, numbers are `double`s, and
+both `undefined` and `null` read as `null` (matching d3's `!= null` and `??`). A node keeps its
+datum, as d3's `node.data`, and the output reads the id through `Datum.idValue` (`JSAny?`) so it
+matches the reference's `n.id ?? n.data.id`, `null` and `undefined` included. The result is a
+`JSArray` of rows of strings, `null`, `undefined` and numbers. dart2js cannot emit ES modules, so
+`main()` publishes `run` on `globalThis.__matrixExports` for the builder's facade.
 
 ## Numeric and string semantics
 

@@ -5,7 +5,10 @@ package hierarchy
 import scala.collection.mutable
 import scala.scalajs.js
 
-/** A record of the input: a nested datum or a stratify row, read in place. */
+/**
+ * A record of the input: a nested datum or a stratify row, read in place. d3 reads every field
+ * with `!= null` or `??`, so read them through [[present]].
+ */
 @js.native trait Datum extends js.Object:
   val id: js.UndefOr[String] = js.native
   val parentId: js.UndefOr[String] = js.native
@@ -98,6 +101,10 @@ final class Node(var data: Option[Datum]) extends Parent[Node], Circle:
     for children <- node.children do children.sortInPlaceWith((a, b) => compare(a, b) < 0)
   }
 
+/** A field d3 reads with `!= null` or `??`: undefined and null both mean absent. */
+def present[A](field: js.UndefOr[A]): Option[A] =
+  if field.asInstanceOf[AnyRef] eq null then None else field.toOption
+
 /** JavaScript's ToBoolean of a number: false for 0, -0 and NaN. d3 tests numbers this way. */
 def truthy(x: Double): Boolean = !(x == 0.0 || x.isNaN)
 
@@ -109,7 +116,7 @@ def hierarchy(data: Datum): Node =
     val node = nodes.remove(nodes.size - 1)
     for
       datum <- node.data
-      childs <- datum.children.toOption
+      childs <- present(datum.children)
       if childs.length > 0
     do
       val children = mutable.ArrayBuffer.from(childs.iterator.map(child => Node(Some(child))))

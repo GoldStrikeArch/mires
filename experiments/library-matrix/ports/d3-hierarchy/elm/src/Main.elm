@@ -18,10 +18,11 @@ port request : (D.Value -> msg) -> Sub msg
 port response : E.Value -> Cmd msg
 
 
-{-| A stratify row.
+{-| A stratify row. d3 reads every field with `!= null` or `??`, so a null field is absent too;
+`label` is the row's id as the input has it.
 -}
 type alias Row =
-    { id : String, parentId : String, value : Float }
+    { id : String, parentId : String, value : Float, label : D.Value }
 
 
 type alias Input =
@@ -32,18 +33,32 @@ opt k fieldDecoder fallback =
     D.oneOf [ D.field k fieldDecoder, D.succeed fallback ]
 
 
-rowDecoder : D.Decoder Row
-rowDecoder =
-    D.map3 Row
+{-| The id field as the input has it: a string, null, or `absent` (the host's `undefined`).
+-}
+rawId : D.Value -> D.Decoder D.Value
+rawId absent =
+    D.oneOf [ D.field "id" D.value, D.succeed absent ]
+
+
+rowDecoder : D.Value -> D.Decoder Row
+rowDecoder absent =
+    D.map4 Row
         (opt "id" D.string "")
         (opt "parentId" D.string "")
         (opt "value" D.float 0)
+        (rawId absent)
 
 
-{-| The nested data stays a raw value: `nested` reads it one node at a time, so no decoder
-recurses through the nesting.
+{-| The request: the input, and JavaScript's `undefined` from the host. The nested data stays a raw
+value: `nested` reads it one node at a time, so no decoder recurses through the nesting.
 -}
-decoder =
+requestDecoder : D.Decoder ( Input, D.Value )
+requestDecoder =
+    D.field "undefined" D.value
+        |> D.andThen (\absent -> D.map (\input -> ( input, absent )) (D.field "input" (decoder absent)))
+
+
+decoder absent =
     D.map2
         (\( op, source, dataRows ) cfg ->
             let
@@ -56,7 +71,7 @@ decoder =
             (D.field "op" D.string)
             (D.field "source" D.string)
             (D.maybe (D.field "data" D.value))
-            (opt "rows" (D.list rowDecoder) [])
+            (opt "rows" (D.list (rowDecoder absent)) [])
         )
         (D.map7 (\w h p sort fixed round tile -> { w = w, h = h, p = p, sort = sort, fixed = fixed, round = round, tile = tile })
             (D.field "width" D.float)
@@ -69,12 +84,13 @@ decoder =
         )
 
 
-{-| One node of the nested data: its id, its value and its children, still raw.
+{-| One node of the nested data: its id as the input has it, its value and its children, still
+raw.
 -}
-datum : D.Decoder ( String, Float, List D.Value )
-datum =
-    D.map3 (\id weight kids -> ( id, weight, kids ))
-        (opt "id" D.string "")
+datum : D.Value -> D.Decoder ( D.Value, Float, List D.Value )
+datum absent =
+    D.map3 (\label weight kids -> ( label, weight, kids ))
+        (rawId absent)
         (opt "value" D.float 0)
         (opt "children" (D.list D.value) [])
 
@@ -82,8 +98,8 @@ datum =
 {-| `hierarchy(data)`, built on an explicit stack as d3 builds it: the arena holds the nodes in
 pre-order, each with its children in order.
 -}
-nested : D.Value -> Result String ( Arena, Int )
-nested data =
+nested : D.Value -> D.Value -> Result String ( Arena, Int )
+nested absent data =
     let
         build pending arena =
             case pending of
@@ -91,17 +107,17 @@ nested data =
                     Ok ( Array.map (\n -> { n | kids = List.reverse n.kids }) arena, 0 )
 
                 ( value, parent ) :: rest ->
-                    case D.decodeValue datum value of
+                    case D.decodeValue (datum absent) value of
                         Err err ->
                             Err (D.errorToString err)
 
-                        Ok ( id, weight, kids ) ->
+                        Ok ( label, weight, kids ) ->
                             let
                                 i =
                                     Array.length arena
 
                                 added =
-                                    Array.push { blank | id = id, parent = parent, value = weight } arena
+                                    Array.push { blank | label = label, parent = parent, value = weight } arena
                             in
                             build (List.map (\k -> ( k, i )) kids ++ rest)
                                 (if parent < 0 then
@@ -199,7 +215,7 @@ stratify paths rows =
                             )
                             byId
             in
-            ( Array.push { blank | id = id, value = r.value } ns, ids, Array.push p pids )
+            ( Array.push { blank | id = id, label = r.label, value = r.value } ns, ids, Array.push p pids )
 
         ( given, map0, pids0 ) =
             List.foldl make ( Array.empty, Dict.empty, Array.empty ) rows
@@ -308,8 +324,21 @@ layout input ( initial, root ) =
                         )
                         n.kids
 
+                -- d3's comparator `b.value - a.value`: a NaN difference is a tie, as
+                -- Array.prototype.sort counts it as 0 (`compare` would answer GT).
                 order a b =
-                    compare (get b ns).value (get a ns).value
+                    let
+                        difference =
+                            (get b ns).value - (get a ns).value
+                    in
+                    if difference < 0 then
+                        LT
+
+                    else if 0 < difference then
+                        GT
+
+                    else
+                        EQ
 
                 kids =
                     if input.sort then
@@ -380,6 +409,14 @@ layout input ( initial, root ) =
 
         emit ns =
             let
+                -- The reference's `n.id ?? n.data.id`.
+                name n =
+                    if n.id == "" then
+                        n.label
+
+                    else
+                        E.string n.id
+
                 breadth current acc =
                     if List.isEmpty current then
                         List.reverse acc
@@ -404,7 +441,7 @@ layout input ( initial, root ) =
                                 E.null
 
                             else
-                                E.string (get n.parent ns).id
+                                name (get n.parent ns)
 
                         coords =
                             case input.op of
@@ -426,7 +463,7 @@ layout input ( initial, root ) =
                                 _ ->
                                     []
                     in
-                    E.list identity ([ E.string n.id, p, E.int n.depth, E.int n.height, E.float n.value ] ++ List.map E.float coords)
+                    E.list identity ([ name n, p, E.int n.depth, E.int n.height, E.float n.value ] ++ List.map E.float coords)
             in
             E.list row order
     in
@@ -435,19 +472,19 @@ layout input ( initial, root ) =
 
 handle value =
     let
-        run input =
+        run ( input, absent ) =
             let
                 tree =
                     case input.data of
                         Just data ->
-                            nested data
+                            nested absent data
 
                         Nothing ->
                             stratify (input.source == "path") input.rows
             in
             Result.andThen (layout input) tree
     in
-    case D.decodeValue decoder value |> Result.mapError D.errorToString |> Result.andThen run of
+    case D.decodeValue requestDecoder value |> Result.mapError D.errorToString |> Result.andThen run of
         Ok output ->
             E.object [ ( "ok", output ) ]
 

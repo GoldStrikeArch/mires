@@ -30,20 +30,20 @@ let tile = name =>
   | _ => JsError.throwWithMessage("unknown tile") // `.tile(undefined)` throws
   }
 
-/** The reference's `n.id ?? n.data.id`. */
+/** The reference's `n.id ?? n.data.id`: the datum's id as the input has it, null or undefined included. */
 let id = node =>
   switch node.id {
-  | Some(id) => Some(id)
-  | None => (node.data->Option.getOrThrow).id
+  | Some(id) => cell(id)
+  | None => cell((node.data->Option.getOrThrow).id)
   }
 
 let run = (input: input) => {
   let root = switch input.source {
   | "id" => stratify(input.rows->Option.getOrThrow)
-  | "path" => stratify(~path=d => d.id->Option.getOrThrow, input.rows->Option.getOrThrow)
+  | "path" => stratify(~path=d => d.id->Nullable.getOrThrow, input.rows->Option.getOrThrow)
   | _ => hierarchy(input.data->Option.getOrThrow)
   }
-  root->sum(data => data->Option.flatMap(d => d.value)->Option.getOr(0.))->ignore
+  root->sum(data => data->Option.flatMap(d => d.value->Nullable.toOption)->Option.getOr(0.))->ignore
   if input.sort {
     root->sort((a, b) => b.value -. a.value)->ignore
   }
@@ -66,9 +66,9 @@ let run = (input: input) => {
     }
   let record = node =>
     [
-      cell(id(node)),
+      id(node),
       switch node.parent {
-      | Some(parent) => cell(id(parent))
+      | Some(parent) => id(parent)
       | None => cell(Null.null)
       },
       cell(node.depth),

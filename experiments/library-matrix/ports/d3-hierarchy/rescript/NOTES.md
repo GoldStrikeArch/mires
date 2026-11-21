@@ -16,10 +16,11 @@ Python generator had emitted from a shared model (2026-11-21).
 ## Boundary
 
 The input record (`input`, and `datum` for nested data and stratify rows) is the corpus object
-itself, with optional fields for what may be absent: no conversion. Strings are JS strings and
-numbers are floats. A node keeps its datum, as d3's `node.data`, and the output reads the id the
-way the reference does, `n.id ?? n.data.id`. The result is a JS array of rows of strings, `null`
-and numbers (`cell` is an identity cast).
+itself, with `Nullable.t` fields for what may be absent or `null` (matching d3's `!= null` and
+`??`): no conversion. Strings are JS strings and numbers are floats. A node keeps its datum, as
+d3's `node.data`, and the output reads the id the way the reference does, `n.id ?? n.data.id`
+(including `null` or `undefined`). The result is a JS array of rows of strings, `null`,
+`undefined` and numbers (`cell` is an identity cast).
 
 ## Numeric and string semantics
 
@@ -50,8 +51,8 @@ and numbers (`cell` is an identity cast).
 - Stratify marks an imputed path ancestor with `None` data from the start; d3 marks it with its
   `imputed` object and replaces that by null before returning. Every row has data, so the test
   `root.data === imputed` is the same. `nodeByKey` maps to `Unique(node) | Ambiguous`, for d3's
-  node or its `ambiguous` object. An undefined or empty id reads as `""`, which names nothing, as
-  d3's `id != null && (id += "")` does.
+  node or its `ambiguous` object. An undefined, null or empty id reads as `""`, which names
+  nothing, as d3's `id != null && (id += "")` does.
 - d3 parents the root to `preroot` (depth -1) while it sets depths; here the root has no parent
   and gets depth 0, the same values.
 - tree.js's extra parent of the root wraps `null`; here it wraps the root, which it never reads.

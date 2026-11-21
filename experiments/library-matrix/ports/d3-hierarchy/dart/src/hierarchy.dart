@@ -3,9 +3,14 @@
 
 import 'dart:js_interop';
 
-/// A record of the input: a nested datum or a stratify row, read in place.
+/// A record of the input: a nested datum or a stratify row, read in place. Dart reads undefined
+/// and null alike as `null`, which is how d3 reads every field (`!= null`, `??`).
 extension type Datum._(JSObject _) implements JSObject {
   external String? get id;
+
+  /// The id as the input has it, undefined included: Dart would turn undefined into null.
+  @JS('id')
+  external JSAny? get idValue;
   external String? get parentId;
   external double? get value;
   external JSArray<Datum>? get children;

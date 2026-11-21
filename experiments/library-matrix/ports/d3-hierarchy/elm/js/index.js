@@ -1,7 +1,8 @@
 // JS host of the Elm port: the only Elm/JS boundary is the `request` / `response` port pair of
 // src/Main.elm. `elm-program` is the compiled Elm module, which the builder supplies. The
 // builder's packaging makes outgoing port delivery synchronous (see languages/elm/build.mjs), so
-// `run` returns the response of the request it sent.
+// `run` returns the response of the request it sent. The request also carries JavaScript's
+// `undefined`, which Elm cannot construct: d3 returns it as the id of a datum that has none.
 import Elm from 'elm-program'
 
 let app
@@ -19,7 +20,7 @@ function instance() {
 
 export function run(input) {
   response = undefined
-  instance().ports.request.send(input)
+  instance().ports.request.send({ input, undefined })
   if (response === undefined) throw new Error('the Elm port did not respond synchronously')
   if ('error' in response) throw new Error(response.error)
   return response.ok

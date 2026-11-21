@@ -1,10 +1,15 @@
 module Arena exposing (Arena, Node, alter, blank, get, walk)
 
 import Array exposing (Array)
+import Json.Encode as E
 
 
+{-| `id` is the id stratify gave the node, "" where d3 leaves `node.id` undefined; `label` is the
+datum's id as the input has it (a string, null or undefined), which the output shows then.
+-}
 type alias Node =
     { id : String
+    , label : E.Value
     , parent : Int
     , kids : List Int
     , depth : Int
@@ -35,6 +40,7 @@ type alias Arena =
 blank : Node
 blank =
     { id = ""
+    , label = E.null
     , parent = -1
     , kids = []
     , depth = 0

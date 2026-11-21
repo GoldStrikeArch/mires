@@ -9,8 +9,9 @@ let tile = function
   | "squarify" -> Treemap.squarify
   | _ -> invalid_arg "unknown tile" (* [.tile(undefined)] throws *)
 
-(* The reference's [n.id ?? n.data.id]. *)
-let id node = match node.id with Some id -> id | None -> Host.id (Option.get node.data)
+(* The reference's [n.id ?? n.data.id]: the datum's id as the input has it, null or undefined
+   included. *)
+let id node = match node.id with Some id -> Host.string id | None -> Host.id_value (Option.get node.data)
 
 let run input =
   let root =
@@ -39,10 +40,10 @@ let run input =
     | _ -> []
   in
   let record node =
-    let parent = match node.parent with Some parent -> Host.string (id parent) | None -> Host.null in
+    let parent = match node.parent with Some parent -> id parent | None -> Host.null in
     Host.array
       (Array.of_list
-         (Host.string (id node) :: parent
+         (id node :: parent
          :: Host.number (float_of_int node.depth)
          :: Host.number (float_of_int node.height)
          :: Host.number node.value

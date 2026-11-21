@@ -2,8 +2,16 @@
 // (`hierarchy`, `computeHeight`), eachBefore.js, eachAfter.js, iterator.js, sum.js, sort.js, and
 // stratify.js with the default id and parentId accessors.
 
-/** A record of the input, which is the JS object itself: a nested datum or a stratify row. */
-type rec datum = {id?: string, parentId?: string, value?: float, children?: array<datum>}
+/**
+ * A record of the input, which is the JS object itself: a nested datum or a stratify row. d3 reads
+ * every field with `!= null` or `??`, so null and undefined both mean absent.
+ */
+type rec datum = {
+  id: Nullable.t<string>,
+  parentId: Nullable.t<string>,
+  value: Nullable.t<float>,
+  children: Nullable.t<array<datum>>,
+}
 
 /**
  * `Node` of hierarchy/index.js. `data` is None for an ancestor that stratify imputed from a
@@ -74,7 +82,8 @@ let eachAfterBy = (root, children, callback) => {
     | None => ()
     | Some(node) =>
       next->Array.push(node)
-      nodes->Array.pushMany(children(node))
+      // One push per child, as d3 does: spreading a wide node's children as arguments overflows.
+      children(node)->Array.forEach(child => nodes->Array.push(child))
       walk()
     }
   walk()
@@ -95,7 +104,7 @@ let breadthFirst = root => {
       let next = []
       current->Array.forEach(node => {
         order->Array.push(node)
-        next->Array.pushMany(node.children)
+        node.children->Array.forEach(child => next->Array.push(child))
       })
       level(next)
     }
@@ -123,7 +132,7 @@ let hierarchy = data => {
     switch nodes->Array.pop {
     | None => ()
     | Some(node) =>
-      switch node.data->Option.flatMap(d => d.children) {
+      switch node.data->Option.flatMap(d => d.children->Nullable.toOption) {
       | Some(childs) if Array.length(childs) > 0 =>
         let children = childs->Array.map(d => make(Some(d)))
         node.children = children
@@ -190,8 +199,8 @@ let stratify = (~path=?, data: array<datum>) => {
   let rows = data->Array.map(d => Some(d))
   let (ids, parentIds) = switch path {
   | None => (
-      data->Array.map(d => d.id->Option.getOr("")),
-      data->Array.map(d => d.parentId->Option.getOr("")),
+      data->Array.map(d => d.id->Nullable.toOption->Option.getOr("")),
+      data->Array.map(d => d.parentId->Nullable.toOption->Option.getOr("")),
     )
   | Some(path) =>
     let i = data->Array.map(d => normalize(path(d)))
