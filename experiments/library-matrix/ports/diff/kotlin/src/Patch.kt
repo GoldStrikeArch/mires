@@ -42,8 +42,9 @@ class FilePatch(val hunks: MutableList<Hunk> = ArrayList()) {
 
 fun structuredPatch(
     oldFileName: String?, newFileName: String?, oldStr: String, newStr: String,
-    oldHeader: String?, newHeader: String?, context: Int,
+    oldHeader: String?, newHeader: String?, context: Double,
 ): FilePatch {
+    // context is a JavaScript number, compared and sliced as npm does it.
     class Entry(val added: Boolean, val removed: Boolean, val lines: List<String>)
     // Step 1: hunks of lines that keep their newlines; an empty entry at the end closes the last one.
     val diff = LineDiff.diff(oldStr, newStr, DiffOptions()).map { Entry(it.added, it.removed, splitLines(it.value)) } +
@@ -63,7 +64,11 @@ fun structuredPatch(
                 oldRangeStart = oldLine
                 newRangeStart = newLine
                 if (prev != null) {
-                    curRange = if (context > 0) prev.lines.takeLast(context).mapTo(ArrayList()) { " $it" } else ArrayList()
+                    curRange = if (context > 0) {
+                        prev.lines.takeLast(minOf(context, prev.lines.size.toDouble()).toInt()).mapTo(ArrayList()) { " $it" }
+                    } else {
+                        ArrayList()
+                    }
                     oldRangeStart -= curRange.size
                     newRangeStart -= curRange.size
                 }
@@ -76,7 +81,7 @@ fun structuredPatch(
                     // Overlapping: the context joins the next change.
                     for (line in lines) curRange.add(" $line")
                 } else {
-                    val contextSize = minOf(lines.size, context)
+                    val contextSize = minOf(lines.size.toDouble(), context).toInt()
                     for (line in lines.take(contextSize)) curRange.add(" $line")
                     hunks.add(
                         Hunk(
@@ -472,14 +477,17 @@ private fun unixToWin(hunks: List<Hunk>) = hunks.mapLines { lines, i ->
 
 private fun winToUnix(hunks: List<Hunk>) = hunks.mapLines { lines, i -> lines[i].removeSuffix("\r") }
 
-/** distance-iterator.js: positions after [start], alternating forward and backward, within the limits. */
-private class DistanceIterator(private val start: Int, private val minLine: Int, private val maxLine: Int) {
+/**
+ * distance-iterator.js: positions after [start], alternating forward and backward, within the
+ * limits. Positions are JavaScript numbers, so a NaN start yields nothing, as in npm.
+ */
+private class DistanceIterator(private val start: Double, private val minLine: Double, private val maxLine: Double) {
     private var wantForward = true
     private var backwardExhausted = false
     private var forwardExhausted = false
-    private var localOffset = 1
+    private var localOffset = 1.0
 
-    fun next(): Int? {
+    fun next(): Double? {
         if (wantForward && !forwardExhausted) {
             if (backwardExhausted) localOffset++ else wantForward = false
             // Fit after the offset location, unless that is beyond the text.
@@ -497,7 +505,10 @@ private class DistanceIterator(private val start: Int, private val minLine: Int,
     }
 }
 
-private class HunkResult(val patchedLines: List<String>, val oldLineLastI: Int)
+private class HunkResult(val patchedLines: List<String>, val oldLineLastI: Double)
+
+/** `lines[i]`, where a position outside the source, or NaN, reads as undefined. */
+private fun List<String>.at(i: Double): String? = if (i >= 0 && i < size) this[i.toInt()] else null
 
 private fun applyStructuredPatch(source: String, patchHunks: List<Hunk>): String? {
     val hunks = when {
@@ -534,7 +545,7 @@ private fun applyStructuredPatch(source: String, patchHunks: List<Hunk>): String
      * applyHunk with no errors allowed: every removed and context line must equal the source line at
      * its position. Trailing context is given back, so the next hunk may start inside it.
      */
-    fun applyHunk(hunkLines: List<String>, position: Int): HunkResult? {
+    fun applyHunk(hunkLines: List<String>, position: Double): HunkResult? {
         var toPos = position
         val patchedLines = ArrayList<String>()
         var nConsecutiveOldContextLines = 0
@@ -543,7 +554,7 @@ private fun applyStructuredPatch(source: String, patchHunks: List<Hunk>): String
             val content = if (hunkLine.isNotEmpty()) hunkLine.substring(1) else hunkLine
             when (operation) {
                 '-' -> {
-                    if (lines.getOrNull(toPos) != content) return null
+                    if (lines.at(toPos) != content) return null
                     toPos++
                     nConsecutiveOldContextLines = 0
                 }
@@ -553,7 +564,7 @@ private fun applyStructuredPatch(source: String, patchHunks: List<Hunk>): String
                 }
                 ' ' -> {
                     nConsecutiveOldContextLines++
-                    if (lines.getOrNull(toPos) != content) return null
+                    if (lines.at(toPos) != content) return null
                     patchedLines.add(content)
                     toPos++
                 }
@@ -563,28 +574,33 @@ private fun applyStructuredPatch(source: String, patchHunks: List<Hunk>): String
         return HunkResult(patchedLines, toPos - nConsecutiveOldContextLines - 1)
     }
 
+    // Positions are JavaScript numbers: a NaN start fits only a hunk with no removed or context
+    // line, and then every later position is NaN too. A position outside the source reads as
+    // undefined, which joins as an empty line.
     val resultLines = ArrayList<String>()
-    var minLine = 0
-    var prevHunkOffset = 0
+    fun copy(from: Double, until: Double) {
+        var i = from
+        while (i < until) resultLines.add(lines.at(i++) ?: "")
+    }
+    var minLine = 0.0
+    var prevHunkOffset = 0.0
     for (hunk in hunks) {
-        val oldStart = hunk.oldStart.toInt()
-        val maxLine = lines.size - hunk.oldLines.toInt()
+        val maxLine = lines.size - hunk.oldLines
         // The declared position first, then the positions around it.
-        var toPos = oldStart + prevHunkOffset - 1
+        var toPos = hunk.oldStart + prevHunkOffset - 1
         val iterator = DistanceIterator(toPos, minLine, maxLine)
         var hunkResult = applyHunk(hunk.lines, toPos)
         while (hunkResult == null) {
             toPos = iterator.next() ?: return null
             hunkResult = applyHunk(hunk.lines, toPos)
         }
-        // A position outside the source reads as undefined, which joins as an empty line.
-        for (i in minLine until toPos) resultLines.add(lines.getOrElse(i) { "" })
+        copy(minLine, toPos)
         resultLines.addAll(hunkResult.patchedLines)
         // Later hunks may not fit over text this one patched.
         minLine = hunkResult.oldLineLastI + 1
-        prevHunkOffset = toPos + 1 - oldStart
+        prevHunkOffset = toPos + 1 - hunk.oldStart
     }
-    for (i in minLine until lines.size) resultLines.add(lines.getOrElse(i) { "" })
+    copy(minLine, lines.size.toDouble())
     return resultLines.joinToString("\n")
 }
 
@@ -595,8 +611,6 @@ private external object JsReflect {
     fun deleteProperty(target: Any, key: String): Boolean
 }
 
-@JsName("Boolean")
-private external fun truthy(value: Any?): Boolean
 
 private fun swapPrefix(fileName: Any?): Any? {
     if (fileName === undefined || fileName == "/dev/null") return fileName

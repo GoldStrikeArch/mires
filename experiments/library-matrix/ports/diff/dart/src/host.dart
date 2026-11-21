@@ -16,6 +16,10 @@ external String jsonStringify(JSAny? value, JSAny? replacer, String space);
 @JS('undefined')
 external JSAny? get jsUndefined;
 
+/// JavaScript truthiness: `Boolean(value)`.
+@JS('Boolean')
+external bool truthy(JSAny? value);
+
 extension type TextDecoder._(JSObject _) implements JSObject {
   external TextDecoder();
   external String decode(JSUint8Array bytes);

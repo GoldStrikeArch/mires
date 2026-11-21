@@ -3,7 +3,9 @@ open Host
 open Differ
 
 (* jsdiff's canonicalize: arrays in order, object keys sorted and assigned to
-   a plain object (so a "__proto__" key sets the prototype and is dropped). *)
+   a plain object (so a "__proto__" key sets the prototype and is dropped). An
+   object with a truthy toJSON member has it called, and JSON cannot make it
+   callable, so that throws, as in npm. *)
 let rec canonical v =
   if is_array v then begin
     let a = array (length v) in
@@ -13,6 +15,7 @@ let rec canonical v =
     a
   end
   else if object_value v then begin
+    if truth (get v "toJSON") then invalid_arg "obj.toJSON is not a function";
     let o = obj () and ks = sorted (keys v) in
     for i = 0 to length ks - 1 do
       let k = at ks i in
@@ -32,9 +35,13 @@ let write_change span value =
   set o "value" value;
   o
 
-let array_diff a b individual =
-  let values v = Patch.array_of_js (fun x -> read (json x)) v in
-  let spans = Array.of_list (myers (values a) (values b) individual) in
+(* Elements compare by their JSON text, which is === for JSON scalars. With
+   ignoreCase, strings also compare lowercased (the JSON text of a lowercased
+   string is the lowercased JSON text). *)
+let array_diff a b o =
+  let key x = if o.ignore_case then lower (read (json x)) else read (json x) in
+  let values v = Patch.array_of_js key v in
+  let spans = Array.of_list (myers (values a) (values b) o.individual) in
   let old = ref 0 and newer = ref 0 in
   Patch.array_to_js
     (fun span ->
@@ -65,12 +72,12 @@ let run input =
     }
   in
   match op with
-  | "diffArrays" -> array_diff a b o.individual
+  | "diffArrays" -> array_diff a b o
   | "diffChars" | "diffWords" | "diffLines" | "diffJson" ->
       let tokens v = tokenize op (document op v) o in
       Patch.array_to_js (fun c -> write_change c.span (str c.value)) (changes op (tokens a) (tokens b) o)
   | "structuredPatch" | "createTwoFilesPatch" ->
-      let context = if absent opts || absent (get opts "context") then 4 else integer (get opts "context") in
+      let context = if absent opts || absent (get opts "context") then 4. else float_value (get opts "context") in
       let p = Patch.create input context in
       if op = "structuredPatch" then Patch.write p else str (Patch.format p)
   | "parsePatch" -> Patch.array_to_js Patch.write (Patch.parse (read patch))

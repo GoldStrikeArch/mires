@@ -30,12 +30,12 @@ ReScript's standard library binds the host directly, so the port uses it for:
 
 ## Deviations from the npm source
 
-- Only the contract's options exist (CONTRACT.md, "Options"): no callbacks, `maxEditLength`, timeouts, comparators or segmenters. `applyHunk` allows no errors: npm's `maxErrors` is 0 when `fuzzFactor` is 0, which removes its recursion. `canonicalize` has no cycle stack, `toJSON` call or replacer, which JSON documents never need.
+- Only the contract's options exist (CONTRACT.md, "Options"): no callbacks, `maxEditLength`, timeouts, comparators or segmenters. `applyHunk` allows no errors: npm's `maxErrors` is 0 when `fuzzFactor` is 0, which removes its recursion. `canonicalize` has no cycle stack or replacer: JSON documents have no cycles, and the default replacer keeps every value. For a truthy `toJSON` member, which npm calls and JSON cannot make callable, it throws.
 - npm's diff classes become one `diff` function and a `policy` record: token equality, `join`, and diffJson's longest-token rule.
 - The Myers search keeps the best path for each diagonal in an array offset by `maxEditLength + 1`, not in a sparse JS array with negative indices. Its diagonal limits start at `±maxEditLength`, beyond which no diagonal lies, in place of `±Infinity`.
 - Loops that npm leaves early with `return` or `break` are self-recursive functions, which ReScript compiles to `while` loops.
-- `diffArrays` compares with `===` and has no `ignoreCase` (CONTRACT.md).
-- Parsed hunk ranges are floats. Positions in `applyPatch` are ints, within the bound in CONTRACT.md, "Domain bounds".
+- `diffArrays` compares with `===`, and under `ignoreCase` also by `toLowerCase()`, which the contract applies to string elements only.
+- Hunk ranges and the positions `applyPatch` computes from them are floats, JavaScript numbers, so a NaN start fits nowhere, as in npm. So is patch creation's `context`, which npm compares and slices as a double.
 
 ## Module state
 

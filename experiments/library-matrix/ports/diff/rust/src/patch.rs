@@ -708,18 +708,19 @@ fn win_to_unix(p: &mut Patch) {
     }
 }
 /// `distanceIterator`: the positions after `start`, alternating forward and
-/// backward by increasing distance, within `[min, max]`.
+/// backward by increasing distance, within `[min, max]`. Positions are
+/// JavaScript numbers, so a NaN start yields nothing, as in npm.
 struct Distance {
-    start: isize,
-    min: isize,
-    max: isize,
+    start: f64,
+    min: f64,
+    max: f64,
     want_forward: bool,
     backward_exhausted: bool,
     forward_exhausted: bool,
-    offset: isize,
+    offset: f64,
 }
 impl Distance {
-    fn new(start: isize, min: isize, max: isize) -> Self {
+    fn new(start: f64, min: f64, max: f64) -> Self {
         Distance {
             start,
             min,
@@ -727,16 +728,16 @@ impl Distance {
             want_forward: true,
             backward_exhausted: false,
             forward_exhausted: false,
-            offset: 1,
+            offset: 1.0,
         }
     }
 }
 impl Iterator for Distance {
-    type Item = isize;
-    fn next(&mut self) -> Option<isize> {
+    type Item = f64;
+    fn next(&mut self) -> Option<f64> {
         if self.want_forward && !self.forward_exhausted {
             if self.backward_exhausted {
-                self.offset += 1
+                self.offset += 1.0
             } else {
                 self.want_forward = false
             }
@@ -751,7 +752,7 @@ impl Iterator for Distance {
             }
             if self.min <= self.start - self.offset {
                 let position = self.start - self.offset;
-                self.offset += 1;
+                self.offset += 1.0;
                 return Some(position);
             }
             self.backward_exhausted = true;
@@ -760,17 +761,30 @@ impl Iterator for Distance {
         None
     }
 }
-/// `lines[i]`, where a position outside the array reads as undefined.
-fn source_line<'a>(lines: &[&'a str], i: isize) -> Option<&'a str> {
-    usize::try_from(i).ok().and_then(|i| lines.get(i).copied())
+/// `lines[i]`, where a position outside the array (or NaN) reads as undefined.
+fn source_line<'a>(lines: &[&'a str], i: f64) -> Option<&'a str> {
+    if i >= 0.0 && i < lines.len() as f64 {
+        lines.get(i as usize).copied()
+    } else {
+        None
+    }
+}
+/// The source lines from `from` while below `until`; a position outside the
+/// source reads as undefined, which joins as an empty line.
+fn copy_lines<'a>(result: &mut Vec<&'a str>, lines: &[&'a str], from: f64, until: f64) {
+    let mut i = from;
+    while i < until {
+        result.push(source_line(lines, i).unwrap_or(""));
+        i += 1.0
+    }
 }
 struct Fitted<'a> {
     patched: Vec<&'a str>,
-    last_old_line: isize,
+    last_old_line: f64,
 }
 /// `applyHunk` with no errors allowed: every removed and context line must
 /// equal the source line at its position. Trailing context is given back.
-fn fit<'a>(hunk: &'a [String], lines: &[&'a str], mut to_pos: isize) -> Option<Fitted<'a>> {
+fn fit<'a>(hunk: &'a [String], lines: &[&'a str], mut to_pos: f64) -> Option<Fitted<'a>> {
     let mut patched = Vec::new();
     let mut context = 0;
     for l in hunk {
@@ -783,7 +797,7 @@ fn fit<'a>(hunk: &'a [String], lines: &[&'a str], mut to_pos: isize) -> Option<F
                 if source_line(lines, to_pos) != Some(content) {
                     return None;
                 }
-                to_pos += 1;
+                to_pos += 1.0;
                 context = 0
             }
             '+' => {
@@ -794,7 +808,7 @@ fn fit<'a>(hunk: &'a [String], lines: &[&'a str], mut to_pos: isize) -> Option<F
                 context += 1;
                 let line = source_line(lines, to_pos).filter(|&line| line == content)?;
                 patched.push(line);
-                to_pos += 1
+                to_pos += 1.0
             }
             _ => (),
         }
@@ -802,7 +816,7 @@ fn fit<'a>(hunk: &'a [String], lines: &[&'a str], mut to_pos: isize) -> Option<F
     patched.truncate(patched.len() - context);
     Some(Fitted {
         patched,
-        last_old_line: to_pos - context as isize - 1,
+        last_old_line: to_pos - context as f64 - 1.0,
     })
 }
 pub fn apply(source: &str, mut p: Patch) -> Option<String> {
@@ -847,13 +861,14 @@ pub fn apply(source: &str, mut p: Patch) -> Option<String> {
         lines.push("")
     }
     let mut result: Vec<&str> = Vec::new();
-    let mut min_line: isize = 0;
-    let mut offset: isize = 0;
+    // Positions are JavaScript numbers: a NaN start fits only a hunk with no
+    // removed or context line, and then every later position is NaN too.
+    let mut min_line = 0.0;
+    let mut offset = 0.0;
     for h in &p.hunks {
-        let old_start = h.old_start as isize;
-        let max_line = lines.len() as isize - h.old_lines as isize;
+        let max_line = lines.len() as f64 - h.old_lines;
         // The declared position first, then the distance iterator around it.
-        let mut to_pos = old_start + offset - 1;
+        let mut to_pos = h.old_start + offset - 1.0;
         let mut candidates = Distance::new(to_pos, min_line, max_line);
         let fitted = loop {
             if let Some(fitted) = fit(&h.lines, &lines, to_pos) {
@@ -861,15 +876,11 @@ pub fn apply(source: &str, mut p: Patch) -> Option<String> {
             }
             to_pos = candidates.next()?
         };
-        for i in min_line..to_pos {
-            result.push(source_line(&lines, i).unwrap_or(""))
-        }
+        copy_lines(&mut result, &lines, min_line, to_pos);
         result.extend(fitted.patched);
-        min_line = fitted.last_old_line + 1;
-        offset = to_pos + 1 - old_start
+        min_line = fitted.last_old_line + 1.0;
+        offset = to_pos + 1.0 - h.old_start
     }
-    for i in min_line..lines.len() as isize {
-        result.push(source_line(&lines, i).unwrap_or(""))
-    }
+    copy_lines(&mut result, &lines, min_line, lines.len() as f64);
     Some(result.join("\n"))
 }

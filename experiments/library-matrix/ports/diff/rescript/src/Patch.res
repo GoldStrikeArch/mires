@@ -37,7 +37,8 @@ let splitLines = text => {
   result
 }
 
-let structuredPatch = (~oldFileName, ~newFileName, oldStr, newStr, ~oldHeader, ~newHeader, ~context) => {
+// context is a JavaScript number, compared and sliced as npm does it.
+let structuredPatch = (~oldFileName, ~newFileName, oldStr, newStr, ~oldHeader, ~newHeader, ~context: float) => {
   // Step 1: hunks of lines that keep their newlines; an empty entry at the end closes the last one.
   let diff =
     Diff.lines(oldStr, newStr, Diff.defaults)->Array.map(change => (
@@ -60,7 +61,12 @@ let structuredPatch = (~oldFileName, ~newFileName, oldStr, newStr, ~oldHeader, ~
         newRangeStart := newLine.contents
         switch diff[i - 1] {
         | Some((_, _, previous)) =>
-          curRange := (context > 0 ? previous->Array.slice(~start=-context)->Array.map(line => " " ++ line) : [])
+          let count = Math.min(context, previous->Array.length->Int.toFloat)->Float.toInt
+          curRange := (
+              context > 0.
+                ? previous->Array.slice(~start=previous->Array.length - count)->Array.map(line => " " ++ line)
+                : []
+            )
           oldRangeStart := oldRangeStart.contents - curRange.contents->Array.length
           newRangeStart := newRangeStart.contents - curRange.contents->Array.length
         | None => ()
@@ -74,11 +80,11 @@ let structuredPatch = (~oldFileName, ~newFileName, oldStr, newStr, ~oldHeader, ~
       }
     } else {
       if oldRangeStart.contents != 0 {
-        if lines->Array.length <= context * 2 && i < diff->Array.length - 2 {
+        if lines->Array.length->Int.toFloat <= context *. 2. && i < diff->Array.length - 2 {
           // Overlapping: the context joins the next change.
           lines->Array.forEach(line => curRange.contents->Array.push(" " ++ line))
         } else {
-          let contextSize = Math.Int.min(lines->Array.length, context)
+          let contextSize = Math.min(lines->Array.length->Int.toFloat, context)->Float.toInt
           lines
           ->Array.slice(~start=0, ~end=contextSize)
           ->Array.forEach(line => curRange.contents->Array.push(" " ++ line))
@@ -571,22 +577,22 @@ let winToUnix = hunks =>
   })
 
 /** distance-iterator.js: positions after `start`, alternating forward and backward, within the
- limits. */
-let distanceIterator = (start, minLine, maxLine) => {
+ limits. Positions are JavaScript numbers, so a NaN start yields nothing, as in npm. */
+let distanceIterator = (start: float, minLine: float, maxLine: float) => {
   let wantForward = ref(true)
   let backwardExhausted = ref(false)
   let forwardExhausted = ref(false)
-  let localOffset = ref(1)
+  let localOffset = ref(1.)
   let rec next = () => {
     let forward = if wantForward.contents && !forwardExhausted.contents {
       if backwardExhausted.contents {
-        localOffset := localOffset.contents + 1
+        localOffset := localOffset.contents +. 1.
       } else {
         wantForward := false
       }
       // Fit after the offset location, unless that is beyond the text.
-      if start + localOffset.contents <= maxLine {
-        Some(start + localOffset.contents)
+      if start +. localOffset.contents <= maxLine {
+        Some(start +. localOffset.contents)
       } else {
         forwardExhausted := true
         None
@@ -601,9 +607,9 @@ let distanceIterator = (start, minLine, maxLine) => {
         wantForward := true
       }
       // Fit before the offset location, unless that is before the text.
-      if minLine <= start - localOffset.contents {
-        let position = start - localOffset.contents
-        localOffset := localOffset.contents + 1
+      if minLine <= start -. localOffset.contents {
+        let position = start -. localOffset.contents
+        localOffset := localOffset.contents +. 1.
         Some(position)
       } else {
         backwardExhausted := true
@@ -616,8 +622,8 @@ let distanceIterator = (start, minLine, maxLine) => {
 }
 
 let applyHunks = (lines, hunks) => {
-  // lines[i], where a position outside the source reads as undefined.
-  let lineAt = i => i >= 0 && i < lines->Array.length ? Some(lines->Array.getUnsafe(i)) : None
+  // lines[i], where a position outside the source, or NaN, reads as undefined.
+  let lineAt = i => i >= 0. && i < lines->Array.length->Int.toFloat ? Some(lines->Array.getUnsafe(i->Float.toInt)) : None
   // applyHunk with no errors allowed: every removed and context line must equal the source line at
   // its position. Trailing context is given back, so the next hunk may start inside it.
   let applyHunk = (hunkLines, position) => {
@@ -625,19 +631,19 @@ let applyHunks = (lines, hunks) => {
     let rec step = (k, toPos, nConsecutiveOldContextLines) =>
       if k == hunkLines->Array.length {
         let kept = patchedLines->Array.length - nConsecutiveOldContextLines
-        Some((patchedLines->Array.slice(~start=0, ~end=kept), toPos - nConsecutiveOldContextLines - 1))
+        Some((patchedLines->Array.slice(~start=0, ~end=kept), toPos -. nConsecutiveOldContextLines->Int.toFloat -. 1.))
       } else {
         let hunkLine = hunkLines->Array.getUnsafe(k)
         let content = hunkLine->String.slice(~start=1)
         switch hunkLine == "" ? " " : hunkLine->String.charAt(0) {
-        | "-" => lineAt(toPos) == Some(content) ? step(k + 1, toPos + 1, 0) : None
+        | "-" => lineAt(toPos) == Some(content) ? step(k + 1, toPos +. 1., 0) : None
         | "+" =>
           patchedLines->Array.push(content)
           step(k + 1, toPos, 0)
         | " " =>
           if lineAt(toPos) == Some(content) {
             patchedLines->Array.push(content)
-            step(k + 1, toPos + 1, nConsecutiveOldContextLines + 1)
+            step(k + 1, toPos +. 1., nConsecutiveOldContextLines + 1)
           } else {
             None
           }
@@ -647,21 +653,23 @@ let applyHunks = (lines, hunks) => {
     step(0, position, 0)
   }
   let resultLines = []
-  // A position outside the source reads as undefined, which joins as an empty line.
-  let copy = (from, until) =>
-    for i in from to until - 1 {
-      resultLines->Array.push(lineAt(i)->Option.getOr(""))
+  // Positions are JavaScript numbers: a NaN start fits only a hunk with no removed or context
+  // line, and then every later position is NaN too. A position outside the source reads as
+  // undefined, which joins as an empty line.
+  let rec copy = (from, until) =>
+    if from < until {
+      resultLines->Array.push(lineAt(from)->Option.getOr(""))
+      copy(from +. 1., until)
     }
   let rec fit = (k, minLine, prevHunkOffset) =>
     if k == hunks->Array.length {
-      copy(minLine, lines->Array.length)
+      copy(minLine, lines->Array.length->Int.toFloat)
       Some(resultLines->Array.join("\n"))
     } else {
       let hunk = hunks->Array.getUnsafe(k)
-      let oldStart = hunk.oldStart->Float.toInt
-      let maxLine = lines->Array.length - hunk.oldLines->Float.toInt
+      let maxLine = lines->Array.length->Int.toFloat -. hunk.oldLines
       // The declared position first, then the positions around it.
-      let toPos = oldStart + prevHunkOffset - 1
+      let toPos = hunk.oldStart +. prevHunkOffset -. 1.
       let candidates = distanceIterator(toPos, minLine, maxLine)
       let rec search = toPos =>
         switch applyHunk(hunk.lines, toPos) {
@@ -678,10 +686,10 @@ let applyHunks = (lines, hunks) => {
         copy(minLine, toPos)
         patchedLines->Array.forEach(line => resultLines->Array.push(line))
         // Later hunks may not fit over text this one patched.
-        fit(k + 1, oldLineLastI + 1, toPos + 1 - oldStart)
+        fit(k + 1, oldLineLastI +. 1., toPos +. 1. -. hunk.oldStart)
       }
     }
-  fit(0, 0, 0)
+  fit(0, 0., 0.)
 }
 
 let applyStructuredPatch = (source, patchHunks) => {

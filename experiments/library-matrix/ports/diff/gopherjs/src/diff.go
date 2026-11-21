@@ -14,18 +14,6 @@ const (
 type span struct{ kind, count, previous int }
 type path struct{ old, last int }
 
-func smaller(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-func larger(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
 
 func myers(old, new []string, separate bool) []span {
 	limit := len(old) + len(new)
@@ -82,7 +70,7 @@ func myers(old, new []string, separate bool) []span {
 	best[base] = p
 	low, high := -limit, limit
 	for d := 1; d <= limit; d++ {
-		first, last := larger(low, -d), smaller(high, d)
+		first, last := max(low, -d), min(high, d)
 		for k := first; k <= last; k += 2 {
 			i := base + k
 			r, a := best[i-1], best[i+1]
@@ -107,10 +95,10 @@ func myers(old, new []string, separate bool) []span {
 			}
 			best[i] = p
 			if p.old+1 == len(old) {
-				high = smaller(high, k-1)
+				high = min(high, k-1)
 			}
 			if n+1 == len(new) {
-				low = larger(low, k+1)
+				low = max(low, k+1)
 			}
 		}
 	}
@@ -170,7 +158,12 @@ func words(s string) []string {
 
 type options struct{ ignoreCase, individual, stripCR, ignoreWS, newlineToken, ignoreEOF bool }
 
+// lines is line.js's tokenize. stripTrailingCr first replaces every \r\n with \n, as npm
+// does, so in \r\r\n the first \r and the new \n make one separator.
 func lines(s string, o options) []string {
+	if o.stripCR {
+		s = strings.ReplaceAll(s, "\r\n", "\n")
+	}
 	var out []string
 	start := 0
 	for i := 0; i < len(s); i++ {
@@ -185,13 +178,7 @@ func lines(s string, o options) []string {
 			if end > start {
 				out = append(out, s[start:end])
 			}
-			if o.stripCR {
-				out = append(out, "\n")
-			} else {
-				out = append(out, s[end:i+1])
-			}
-		} else if o.stripCR && end < i {
-			out = append(out, s[start:end]+"\n")
+			out = append(out, s[end:i+1])
 		} else {
 			out = append(out, s[start:i+1])
 		}

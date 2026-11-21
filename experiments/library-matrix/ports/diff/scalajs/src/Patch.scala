@@ -42,8 +42,9 @@ def structuredPatch(
     newStr: String,
     oldHeader: js.UndefOr[String],
     newHeader: js.UndefOr[String],
-    context: Int
+    context: Double
 ): FilePatch =
+  // context is a JavaScript number, compared and sliced as npm does it.
   final case class Entry(added: Boolean, removed: Boolean, lines: IndexedSeq[String])
   // Step 1: hunks of lines that keep their newlines; an empty entry at the end closes the last one.
   val diff = LineDiff.diff(oldStr, newStr, DiffOptions()).map(c => Entry(c.added, c.removed, splitLines(c.value))) :+
@@ -62,7 +63,9 @@ def structuredPatch(
         oldRangeStart = oldLine
         newRangeStart = newLine
         if i > 0 then
-          curRange = if context > 0 then diff(i - 1).lines.takeRight(context).map(" " + _).to(ArrayBuffer) else ArrayBuffer.empty
+          curRange =
+            if context > 0 then diff(i - 1).lines.takeRight(math.min(context, diff(i - 1).lines.length).toInt).map(" " + _).to(ArrayBuffer)
+            else ArrayBuffer.empty
           oldRangeStart -= curRange.length
           newRangeStart -= curRange.length
       curRange ++= lines.map((if current.added then "+" else "-") + _)
@@ -73,7 +76,7 @@ def structuredPatch(
           // Overlapping: the context joins the next change.
           curRange ++= lines.map(" " + _)
         else
-          val contextSize = math.min(lines.length, context)
+          val contextSize = math.min(lines.length, context).toInt
           curRange ++= lines.take(contextSize).map(" " + _)
           hunks += Hunk(
             oldRangeStart.toDouble,
@@ -429,14 +432,16 @@ private def unixToWin(hunks: IndexedSeq[Hunk]) = mapLines(hunks): (lines, i) =>
 
 private def winToUnix(hunks: IndexedSeq[Hunk]) = mapLines(hunks)((lines, i) => lines(i).stripSuffix("\r"))
 
-/** distance-iterator.js: positions after `start`, alternating forward and backward, within the limits. */
-private final class DistanceIterator(start: Int, minLine: Int, maxLine: Int):
+/** distance-iterator.js: positions after `start`, alternating forward and backward, within the
+  * limits. Positions are JavaScript numbers, so a NaN start yields nothing, as in npm.
+  */
+private final class DistanceIterator(start: Double, minLine: Double, maxLine: Double):
   private var wantForward = true
   private var backwardExhausted = false
   private var forwardExhausted = false
-  private var localOffset = 1
+  private var localOffset = 1.0
 
-  @tailrec def next(): Option[Int] =
+  @tailrec def next(): Option[Double] =
     val forward =
       if wantForward && !forwardExhausted then
         if backwardExhausted then localOffset += 1 else wantForward = false
@@ -459,7 +464,11 @@ private final class DistanceIterator(start: Int, minLine: Int, maxLine: Int):
         backwardExhausted = true
         next()
 
-private final case class HunkResult(patchedLines: IndexedSeq[String], oldLineLastI: Int)
+private final case class HunkResult(patchedLines: IndexedSeq[String], oldLineLastI: Double)
+
+/** `lines[i]`, where a position outside the source, or NaN, reads as undefined. */
+private def lineAt(lines: IndexedSeq[String], i: Double): Option[String] =
+  if i >= 0 && i < lines.length then Some(lines(i.toInt)) else None
 
 private def applyStructuredPatch(source: String, patchHunks: IndexedSeq[Hunk]): Option[String] =
   val hunks =
@@ -489,7 +498,7 @@ private def applyStructuredPatch(source: String, patchHunks: IndexedSeq[Hunk]): 
 /** applyHunk with no errors allowed: every removed and context line must equal the source line at
   * its position. Trailing context is given back, so the next hunk may start inside it.
   */
-private def applyHunk(lines: IndexedSeq[String], hunkLines: collection.IndexedSeq[String], position: Int): Option[HunkResult] =
+private def applyHunk(lines: IndexedSeq[String], hunkLines: collection.IndexedSeq[String], position: Double): Option[HunkResult] =
   var toPos = position
   val patchedLines = ArrayBuffer.empty[String]
   var nConsecutiveOldContextLines = 0
@@ -500,7 +509,7 @@ private def applyHunk(lines: IndexedSeq[String], hunkLines: collection.IndexedSe
     val content = hunkLine.drop(1)
     operation match
       case '-' =>
-        if !lines.lift(toPos).contains(content) then return None
+        if !lineAt(lines, toPos).contains(content) then return None
         toPos += 1
         nConsecutiveOldContextLines = 0
       case '+' =>
@@ -508,7 +517,7 @@ private def applyHunk(lines: IndexedSeq[String], hunkLines: collection.IndexedSe
         nConsecutiveOldContextLines = 0
       case ' ' =>
         nConsecutiveOldContextLines += 1
-        if !lines.lift(toPos).contains(content) then return None
+        if !lineAt(lines, toPos).contains(content) then return None
         patchedLines += content
         toPos += 1
       case _ => ()
@@ -517,17 +526,22 @@ private def applyHunk(lines: IndexedSeq[String], hunkLines: collection.IndexedSe
 
 private def applyHunks(lines: IndexedSeq[String], hunks: IndexedSeq[Hunk]): Option[String] =
   val resultLines = ArrayBuffer.empty[String]
-  // A position outside the source reads as undefined, which joins as an empty line.
-  def copy(from: Int, until: Int) = for i <- from until until do resultLines += lines.lift(i).getOrElse("")
-  var minLine = 0
-  var prevHunkOffset = 0
+  // Positions are JavaScript numbers: a NaN start fits only a hunk with no removed or context
+  // line, and then every later position is NaN too. A position outside the source reads as
+  // undefined, which joins as an empty line.
+  def copy(from: Double, until: Double) =
+    var i = from
+    while i < until do
+      resultLines += lineAt(lines, i).getOrElse("")
+      i += 1
+  var minLine = 0.0
+  var prevHunkOffset = 0.0
   var k = 0
   while k < hunks.length do
     val hunk = hunks(k)
-    val oldStart = hunk.oldStart.toInt
-    val maxLine = lines.length - hunk.oldLines.toInt
+    val maxLine = lines.length - hunk.oldLines
     // The declared position first, then the positions around it.
-    var toPos = oldStart + prevHunkOffset - 1
+    var toPos = hunk.oldStart + prevHunkOffset - 1
     val iterator = DistanceIterator(toPos, minLine, maxLine)
     var hunkResult = applyHunk(lines, hunk.lines, toPos)
     while hunkResult.isEmpty do
@@ -540,9 +554,9 @@ private def applyHunks(lines: IndexedSeq[String], hunks: IndexedSeq[Hunk]): Opti
     resultLines ++= hunkResult.get.patchedLines
     // Later hunks may not fit over text this one patched.
     minLine = hunkResult.get.oldLineLastI + 1
-    prevHunkOffset = toPos + 1 - oldStart
+    prevHunkOffset = toPos + 1 - hunk.oldStart
     k += 1
-  copy(minLine, lines.length)
+  copy(minLine, lines.length.toDouble)
   Some(resultLines.mkString("\n"))
 
 // ---- reversePatch, over the structured patch's own JSON values ----

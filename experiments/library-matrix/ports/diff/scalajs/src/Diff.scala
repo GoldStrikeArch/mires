@@ -216,8 +216,9 @@ object JsonDiff extends TextDiff:
     if oldToken.length > newToken.length then oldToken else newToken
 
 /** `canonicalize` for JSON documents: arrays in order, object keys sorted and assigned to a plain
-  * object, so a "__proto__" key sets the prototype and is not serialized. JSON input has no cycles
-  * and no `toJSON`, and the default replacer keeps every value. Arrays are recognised with
+  * object, so a "__proto__" key sets the prototype and is not serialized. An object with a truthy
+  * `toJSON` member has it called, which throws, since JSON cannot make it callable. JSON input has
+  * no cycles, and the default replacer keeps every value. Arrays are recognised with
   * `Array.isArray`, which does not depend on the value's realm, as npm's `[object Array]` test does
   * not; and as in npm each level recurses from a loop, so a nesting level costs one stack frame.
   */
@@ -231,8 +232,10 @@ def canonicalize(value: Any): Any =
       i += 1
     canonical
   else if js.typeOf(value) == "object" && value != null then
-    val canonical = js.Dynamic.literal()
     val dynamic = value.asInstanceOf[js.Dynamic]
+    if js.DynamicImplicits.truthValue(dynamic.toJSON) then
+      throw js.JavaScriptException(js.TypeError("obj.toJSON is not a function"))
+    val canonical = js.Dynamic.literal()
     val keys = js.Object.keys(value.asInstanceOf[js.Object]).sorted
     var i = 0
     while i < keys.length do
@@ -241,9 +244,12 @@ def canonicalize(value: Any): Any =
     canonical
   else value
 
-/** array.js: tokens are the JSON values themselves, compared with `===`. */
+/** array.js: tokens are the JSON values themselves, compared with `===`, and with ignoreCase also
+  * by `toLowerCase()`, which the contract applies to strings only.
+  */
 object ArrayDiff extends Diff[Any, js.Array[Any]]:
   override protected def tokensEqual(left: Any, right: Any, options: DiffOptions): Boolean =
-    js.special.strictEquals(left, right)
+    def lower(value: Any) = value.asInstanceOf[js.Dynamic].toLowerCase().asInstanceOf[String]
+    js.special.strictEquals(left, right) || (options.ignoreCase && lower(left) == lower(right))
 
   protected def join(tokens: IndexedSeq[Any]): js.Array[Any] = js.Array(tokens*)

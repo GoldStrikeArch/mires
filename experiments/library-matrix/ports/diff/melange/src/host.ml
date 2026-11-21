@@ -80,6 +80,13 @@ external byte_array : int -> value = "Uint8Array" [@@mel.new]
 external decoder : unit -> value = "TextDecoder" [@@mel.new]
 external decode_bytes : value -> value -> value = "decode" [@@mel.send]
 let scalar_text s = read (to_well_formed (str s))
+
+(* Melange's String.sub converts the whole string to bytes on every call; the host's slice and
+   split are linear. *)
+external js_slice : string -> int -> int -> string = "slice" [@@mel.send]
+external js_split : string -> string -> string array = "split" [@@mel.send]
+let slice s i j = js_slice s i j
+let split_lines s = js_split s "\n"
 let decode_octets s =
   let bytes = byte_array (String.length s) in
   String.iteri (fun i c -> put bytes i (number (Char.code c))) s;

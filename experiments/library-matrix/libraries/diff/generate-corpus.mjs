@@ -219,6 +219,34 @@ for (const w of ['\u001c', '\u0085', '\u180e', '\u1680', '\u2028', '\ufeff', '\u
   add('whitespace-'+id+'-lines', {op:'diffLines', before:'a'+w+'\nb\n', after:'a\nb\n', options:{ignoreWhitespace:true}})
   add('whitespace-'+id+'-file-header', {op:'parsePatch', patch:'--- a'+w+'\t'+w+'h'+w+'\n+++ b'+w+'\n'})
 }
+// Cases from the 2026-11-21 re-review. stripTrailingCr rewrites the text before the split, so in
+// \r\r\n the first \r and the new \n make one separator.
+for (const [id, before, after] of [['double-cr', 'x\r\r\ny', 'x\r\ny'], ['triple-cr', 'a\r\r\r\nb\r\n', 'a\r\nb\n'], ['cr-only', 'a\rb\r\r\n', 'a\rb\n']])
+  for (const [j, options] of [{stripTrailingCr:true, newlineIsToken:true}, {stripTrailingCr:true}, {stripTrailingCr:true, ignoreWhitespace:true, newlineIsToken:true}].entries())
+    texts('strip-cr-'+id+'-'+j, 'diffLines', before, after, options)
+// context is a JavaScript number: values past int32, and whole-file context, keep one hunk.
+const contextRows = 'a\nb\nc\nd\ne\nf\ng\nh\n'
+for (const [id, context] of [['2-30', 2**30], ['2-31', 2**31], ['max-safe', Number.MAX_SAFE_INTEGER], ['1e300', 1e300]])
+  for (const op of ['structuredPatch', 'createTwoFilesPatch'])
+    add('context-'+id+'-'+op, {op, before:contextRows, after:contextRows.replace('b', 'B').replace('g', 'G'), oldFileName:'x', newFileName:'x', options:{context}})
+// canonicalize calls a truthy toJSON member; JSON cannot make one callable, so npm throws.
+for (const [id, before] of [['number', {toJSON:1}], ['nested', {a:{toJSON:'x'}}], ['in-array', [1, {toJSON:{}}]],
+  ['empty-array', {toJSON:[]}], ['under-proto-key', JSON.parse('{"__proto__":{"toJSON":true}}')],
+  ['false', {toJSON:false}], ['zero', {toJSON:0}], ['null', {toJSON:null}], ['empty-string', {toJSON:''}]])
+  add('json-tojson-'+id, {op:'diffJson', before, after:{a:1}})
+add('json-tojson-after', {op:'diffJson', before:{a:1}, after:{b:{toJSON:2}}})
+// A hunk whose header the range pattern does not match starts at NaN, and so fits nowhere.
+for (const [id, before, patch] of [['remove', 'a\nb\n', '@@ x @@\n-a\n+z\n'], ['context', 'a\n', '@@ x @@\n a\n'],
+  ['second-hunk', 'a\nb\n', '@@ -1 +1 @@\n-a\n+A\n@@ x @@\n-b\n+B\n']])
+  add('apply-nan-start-'+id, {op:'applyPatch', before, patch})
+// diffArrays with ignoreCase compares strings by toLowerCase().
+for (const [i, options] of [{ignoreCase:true}, {ignoreCase:true, oneChangePerToken:true}].entries()) {
+  texts('arrays-ignore-case-'+i, 'diffArrays', ['A', 'b', 'C', 'İ', 'Σ'], ['a', 'B', 'd', 'i\u0307', 'σ'], options)
+  texts('arrays-ignore-case-equal-'+i, 'diffArrays', ['A'], ['a'], options)
+}
+// reversePatch tests isGit and isCopy for truthiness.
+for (const [id, flags] of [['git-number', {isGit:1}], ['git-string', {isGit:'yes'}], ['git-zero', {isGit:0}], ['copy-number', {isGit:true, isCopy:1}]])
+  add('reverse-truthy-'+id, {op:'reversePatch', patch:{oldFileName:'a/x', newFileName:'b/y', ...flags, isCreate:true, hunks:[{oldStart:1, oldLines:1, newStart:1, newLines:1, lines:['-a', '+b']}]}})
 // Depth and width. The nesting bound is in CONTRACT.md.
 const nested = (depth, wrap) => { let v = 0; for (let i = 0; i < depth; i++) v = wrap(v); return v }
 add('json-depth-arrays', {op:'diffJson', before:nested(1000, v => [v]), after:nested(999, v => [v])})

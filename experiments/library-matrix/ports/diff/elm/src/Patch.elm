@@ -1,4 +1,4 @@
-module Patch exposing (Patch, absent, apply, create, field, fields, format, parse, read, reverse, string, write)
+module Patch exposing (Patch, absent, apply, create, field, fields, format, parse, read, reverse, string, truthyField, write)
 
 {-| Unified patches after jsdiff 9.0.0 patch/create.js, parse.js, apply.js and
 reverse.js.
@@ -61,9 +61,28 @@ string v =
     D.decodeValue D.string v |> Result.withDefault ""
 
 
-flag : String -> D.Value -> Bool
-flag k v =
-    D.decodeValue (D.field k D.bool) v |> Result.withDefault False
+{-| JavaScript truthiness of a JSON value: false, 0, "", null and NaN are falsy.
+-}
+truthy : D.Value -> Bool
+truthy v =
+    D.decodeValue
+        (D.oneOf
+            [ D.bool
+            , D.map (\n -> n /= 0 && n == n) D.float
+            , D.map ((/=) "") D.string
+            , D.null False
+            , D.succeed True
+            ]
+        )
+        v
+        |> Result.withDefault False
+
+
+{-| The truthiness of a member, `false` when it is missing (undefined).
+-}
+truthyField : String -> D.Value -> Bool
+truthyField k v =
+    D.decodeValue (D.field k D.value) v |> Result.map truthy |> Result.withDefault False
 
 
 {-| Assigns a property: an existing key keeps its position.
@@ -1197,7 +1216,7 @@ reverse v =
                 value =
                     field k v
             in
-            if flag "isGit" v then
+            if truthyField "isGit" v then
                 case D.decodeValue (D.field k D.string) v of
                     Ok name ->
                         if String.startsWith "a/" name then
@@ -1246,7 +1265,7 @@ reverse v =
                 |> put "isDelete" (field "isCreate" v)
                 |> put "hunks" (E.list hunk (D.decodeValue (D.field "hunks" (D.list D.value)) v |> Result.withDefault []))
     in
-    if flag "isCopy" v then
+    if truthyField "isCopy" v then
         -- Reversing a copy deletes the copy destination.
         swapped
             |> put "newFileName" (E.string "/dev/null")
@@ -1337,18 +1356,19 @@ winToUnix =
 
 
 {-| distanceIterator: the positions after `start`, alternating forward and
-backward by increasing distance, within `[min, max]`.
+backward by increasing distance, within `[min, max]`. Positions are JavaScript
+numbers, so a NaN start yields nothing, as in npm.
 -}
 type alias Distance =
-    { start : Int, min : Int, max : Int, wantForward : Bool, backwardExhausted : Bool, forwardExhausted : Bool, offset : Int }
+    { start : Float, min : Float, max : Float, wantForward : Bool, backwardExhausted : Bool, forwardExhausted : Bool, offset : Float }
 
 
-distance : Int -> Int -> Int -> Distance
+distance : Float -> Float -> Float -> Distance
 distance start low high =
     Distance start low high True False False 1
 
 
-step : Distance -> Maybe ( Int, Distance )
+step : Distance -> Maybe ( Float, Distance )
 step d =
     let
         forward =
@@ -1394,17 +1414,28 @@ step d =
                 Nothing
 
 
+{-| `lines[i]`, where a position outside the source, or NaN, reads as undefined.
+-}
+lineAt : Array String -> Float -> Maybe String
+lineAt data i =
+    if i >= 0 && i < toFloat (Array.length data) then
+        Array.get (truncate i) data
+
+    else
+        Nothing
+
+
 {-| applyHunk with no errors allowed: every removed and context line equals
 the source line at its position. Trailing context is given back. The result
 is the patched lines and the last old line consumed.
 -}
-fit : Array String -> List String -> Int -> Maybe ( List String, Int )
+fit : Array String -> List String -> Float -> Maybe ( List String, Float )
 fit data hunkLines start =
     let
         go lines toPos patched context =
             case lines of
                 [] ->
-                    Just ( List.reverse (List.drop context patched), toPos - context - 1 )
+                    Just ( List.reverse (List.drop context patched), toPos - toFloat context - 1 )
 
                 line :: rest ->
                     let
@@ -1419,7 +1450,7 @@ fit data hunkLines start =
                             String.left 1 line
                     of
                         "-" ->
-                            if Array.get toPos data == Just content then
+                            if lineAt data toPos == Just content then
                                 go rest (toPos + 1) patched 0
 
                             else
@@ -1429,7 +1460,7 @@ fit data hunkLines start =
                             go rest toPos (content :: patched) 0
 
                         " " ->
-                            if Array.get toPos data == Just content then
+                            if lineAt data toPos == Just content then
                                 go rest (toPos + 1) (content :: patched) (context + 1)
 
                             else
@@ -1507,19 +1538,19 @@ apply source p =
         Maybe.andThen (\data -> applyHunks data hs 0 0 []) lines
 
 
-{-| Lines from `i` up to `stop`, latest first; a position outside the source
-reads as undefined, which joins as an empty line.
+{-| Lines from `i` while below `stop`, latest first; a position outside the
+source reads as undefined, which joins as an empty line.
 -}
-copy : Array String -> Int -> Int -> List String -> List String
+copy : Array String -> Float -> Float -> List String -> List String
 copy data i stop acc =
-    if i >= stop then
-        acc
+    if i < stop then
+        copy data (i + 1) stop ((lineAt data i |> Maybe.withDefault "") :: acc)
 
     else
-        copy data (i + 1) stop ((Array.get i data |> Maybe.withDefault "") :: acc)
+        acc
 
 
-search : Array String -> Hunk -> Int -> Distance -> Maybe ( Int, ( List String, Int ) )
+search : Array String -> Hunk -> Float -> Distance -> Maybe ( Float, ( List String, Float ) )
 search data hunk toPos candidates =
     case fit data hunk.lines toPos of
         Just fitted ->
@@ -1534,24 +1565,24 @@ search data hunk toPos candidates =
                     Nothing
 
 
-applyHunks : Array String -> List Hunk -> Int -> Int -> List String -> Maybe String
+{-| Positions are JavaScript numbers: a NaN start fits only a hunk with no
+removed or context line, and then every later position is NaN too.
+-}
+applyHunks : Array String -> List Hunk -> Float -> Float -> List String -> Maybe String
 applyHunks data remaining minLine offset result =
     case remaining of
         [] ->
-            Just (String.join "\n" (List.reverse (copy data minLine (Array.length data) result)))
+            Just (String.join "\n" (List.reverse (copy data minLine (toFloat (Array.length data)) result)))
 
         hunk :: rest ->
             let
-                oldStart =
-                    truncate hunk.oldStart
-
                 -- The declared position first, then the distance iterator around it.
                 toPos =
-                    oldStart + offset - 1
+                    hunk.oldStart + offset - 1
             in
-            case search data hunk toPos (distance toPos minLine (Array.length data - truncate hunk.oldLines)) of
+            case search data hunk toPos (distance toPos minLine (toFloat (Array.length data) - hunk.oldLines)) of
                 Nothing ->
                     Nothing
 
                 Just ( at, ( patched, lastOldLine ) ) ->
-                    applyHunks data rest (lastOldLine + 1) (at + 1 - oldStart) (List.foldl (::) (copy data minLine at result) patched)
+                    applyHunks data rest (lastOldLine + 1) (at + 1 - hunk.oldStart) (List.foldl (::) (copy data minLine at result) patched)

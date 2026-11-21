@@ -15,6 +15,10 @@ private external object JsArrayStatic {
 
 fun Any?.isJsArray(): Boolean = JsArrayStatic.isArray(this)
 
+/** JavaScript truthiness: `Boolean(value)`. */
+@JsName("Boolean")
+external fun truthy(value: Any?): Boolean
+
 /** `String.prototype.trim`, which removes ECMAScript white space and line terminators. */
 fun String.jsTrim(): String = asDynamic().trim().unsafeCast<String>()
 

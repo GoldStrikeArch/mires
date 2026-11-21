@@ -12,7 +12,7 @@ type options = {
   ignoreWhitespace?: bool,
   newlineIsToken?: bool,
   ignoreNewlineAtEof?: bool,
-  context?: int,
+  context?: float,
 }
 
 type input = {
@@ -65,7 +65,7 @@ let structuredPatch = input =>
     text(input.after),
     ~oldHeader=input.oldHeader,
     ~newHeader=input.newHeader,
-    ~context=input.options->Option.flatMap(o => o.context)->Option.getOr(4),
+    ~context=input.options->Option.flatMap(o => o.context)->Option.getOr(4.),
   )
 
 let run = (input: input): unknown =>

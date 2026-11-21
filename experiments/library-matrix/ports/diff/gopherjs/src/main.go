@@ -30,6 +30,10 @@ func canonical(v *js.Object) *js.Object {
 	if js.Global.Get("Object").Get("prototype").Get("toString").Call("call", v).String() != "[object Object]" {
 		return v
 	}
+	// canonicalize() calls a truthy toJSON member, which JSON cannot make callable.
+	if v.Get("toJSON").Bool() {
+		panic(js.Global.Get("TypeError").New("obj.toJSON is not a function"))
+	}
 	// canonicalize() assigns the sorted keys to a plain object, so a
 	// "__proto__" key sets its prototype and is not serialized.
 	a := object()
@@ -58,10 +62,17 @@ func writeChange(kind, count int, v interface{}) *js.Object {
 	x.Set("value", v)
 	return x
 }
-func arrayKeys(v *js.Object) []string {
+// arrayKeys are the elements' JSON texts, which compare as === does for JSON scalars. With
+// ignoreCase, strings also compare lowercased (the JSON text of a lowercased string is the
+// lowercased JSON text).
+func arrayKeys(v *js.Object, ignoreCase bool) []string {
 	out := make([]string, v.Length())
 	for i := range out {
-		out[i] = js.Global.Get("JSON").Call("stringify", v.Index(i)).String()
+		key := js.Global.Get("JSON").Call("stringify", v.Index(i))
+		if ignoreCase {
+			key = key.Call("toLowerCase")
+		}
+		out[i] = key.String()
 	}
 	return out
 }
@@ -73,7 +84,7 @@ func run(input *js.Object) interface{} {
 	o := readOpts(opts)
 	switch op {
 	case "diffArrays":
-		spans := myers(arrayKeys(a), arrayKeys(b), o.individual)
+		spans := myers(arrayKeys(a, o.ignoreCase), arrayKeys(b, o.ignoreCase), o.individual)
 		all := arr(len(spans))
 		old, new := 0, 0
 		for i, r := range spans {
@@ -102,9 +113,9 @@ func run(input *js.Object) interface{} {
 		}
 		return all
 	case "createTwoFilesPatch", "structuredPatch":
-		ctx := 4
+		ctx := 4.0
 		if opts != js.Undefined && opts.Get("context") != js.Undefined {
-			ctx = opts.Get("context").Int()
+			ctx = opts.Get("context").Float()
 		}
 		p := create(input, ctx)
 		if op == "structuredPatch" {

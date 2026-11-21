@@ -73,6 +73,9 @@ let key_get o k=Js.Unsafe.get o k
 let key_set o k v=Js.Unsafe.set o k v
 
 let scalar_text s = read (call (str s) "toWellFormed" [||])
+
+let slice s i j = String.sub s i (j - i)
+let split_lines s = Array.of_list (String.split_on_char '\n' s)
 let decode_octets s =
   let bytes = box (Js.Unsafe.new_obj (global "Uint8Array") [|box (String.length s)|]) in
   String.iteri (fun i c -> put bytes i (box (Char.code c))) s;

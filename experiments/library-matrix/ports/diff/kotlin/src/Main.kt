@@ -42,7 +42,7 @@ external interface OptionsJson {
     val ignoreWhitespace: Boolean?
     val newlineIsToken: Boolean?
     val ignoreNewlineAtEof: Boolean?
-    val context: Int?
+    val context: Double?
 }
 
 private fun options(json: OptionsJson?) = DiffOptions(
@@ -62,7 +62,7 @@ private fun textDiff(diff: TextDiff, input: Input) = changes(diff.diff(input.bef
 
 private fun patch(input: Input) = structuredPatch(
     input.oldFileName, input.newFileName, input.before.unsafeCast<String>(), input.after.unsafeCast<String>(),
-    input.oldHeader, input.newHeader, input.options?.context ?: 4,
+    input.oldHeader, input.newHeader, input.options?.context ?: 4.0,
 )
 
 @OptIn(ExperimentalJsExport::class)

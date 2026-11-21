@@ -238,12 +238,15 @@ object JsonDiff : TextDiff() {
 
 /**
  * `canonicalize` for JSON documents: arrays in order, object keys sorted and assigned to a plain
- * object, so a "__proto__" key sets the prototype and is not serialized. JSON input has no cycles
- * and no `toJSON`, and the default replacer keeps every value.
+ * object, so a "__proto__" key sets the prototype and is not serialized. An object with a truthy
+ * `toJSON` member has it called, which throws, since JSON cannot make it callable. JSON input has
+ * no cycles, and the default replacer keeps every value.
  */
 fun canonicalize(value: Any?): Any? = when {
     value.isJsArray() -> value.unsafeCast<Array<Any?>>().map(::canonicalize).toTypedArray()
     jsTypeOf(value) == "object" && value != null -> {
+        // A truthy toJSON member is called, and JSON cannot make it callable.
+        if (truthy(value.asDynamic().toJSON)) throw IllegalArgumentException("obj.toJSON is not a function")
         val canonical = kotlin.js.json()
         for (key in JsObject.keys(value).sorted()) canonical[key] = canonicalize(value.asDynamic()[key])
         canonical
@@ -251,9 +254,13 @@ fun canonicalize(value: Any?): Any? = when {
     else -> value
 }
 
-/** array.js: tokens are the JSON values themselves, compared with `===`. */
+/**
+ * array.js: tokens are the JSON values themselves, compared with `===`, and with ignoreCase also
+ * by `toLowerCase()`, which the contract applies to strings only.
+ */
 object ArrayDiff : Diff<Any?, Array<Any?>>() {
-    override fun tokensEqual(left: Any?, right: Any?, options: DiffOptions) = left === right
+    override fun tokensEqual(left: Any?, right: Any?, options: DiffOptions) = left === right ||
+        (options.ignoreCase && left.asDynamic().toLowerCase().unsafeCast<String>() == right.asDynamic().toLowerCase().unsafeCast<String>())
 
     override fun join(tokens: List<Any?>): Array<Any?> = tokens.toTypedArray()
 }

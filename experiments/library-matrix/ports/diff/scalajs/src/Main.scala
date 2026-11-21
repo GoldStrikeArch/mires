@@ -29,7 +29,7 @@ trait OptionsJson extends js.Object:
   val ignoreWhitespace: js.UndefOr[Boolean] = js.native
   val newlineIsToken: js.UndefOr[Boolean] = js.native
   val ignoreNewlineAtEof: js.UndefOr[Boolean] = js.native
-  val context: js.UndefOr[Int] = js.native
+  val context: js.UndefOr[Double] = js.native
 
 private def diffOptions(input: Input): DiffOptions =
   def enabled(read: OptionsJson => js.UndefOr[Boolean]) = input.options.exists(read(_).contains(true))
@@ -54,7 +54,7 @@ private def patch(input: Input) = structuredPatch(
   input.after.asInstanceOf[String],
   input.oldHeader,
   input.newHeader,
-  input.options.flatMap(_.context).getOrElse(4)
+  input.options.flatMap(_.context).getOrElse(4.0)
 )
 
 @JSExportTopLevel("run")

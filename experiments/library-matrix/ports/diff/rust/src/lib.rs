@@ -8,10 +8,7 @@ mod patch;
 mod utf16;
 mod words;
 
-use alloc::{
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{string::String, vec::Vec};
 use diff::{Options, ADD, CHARS, JSON, LINES, REMOVE, WORDS};
 use mires_js::{js_bindings, js_export, throw_value, JsValue};
 use patch::{Hunk, Patch};
@@ -22,6 +19,9 @@ fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
 }
 fn fail() -> ! {
     throw_value(JsValue::erase("invalid diff operation or patch"))
+}
+fn type_error(message: &str) -> ! {
+    throw_value(JsValue::erase(message))
 }
 js_bindings! {
     #[js(call="Reflect.get")] fn get(o:JsValue,k:JsValue)->JsValue;
@@ -98,6 +98,10 @@ fn canonical(v: JsValue) -> JsValue {
     if !v.is_object() {
         return v;
     }
+    // canonicalize() calls a truthy toJSON member, which JSON cannot make callable.
+    if field(v, "toJSON").is_truthy() {
+        type_error("obj.toJSON is not a function")
+    }
     // canonicalize() assigns the sorted keys to a plain object, so a
     // "__proto__" key sets its prototype and is not serialized.
     let names = sort_keys(keys(v));
@@ -124,13 +128,17 @@ fn write_change(kind: u8, count: usize, value: JsValue) -> JsValue {
     o
 }
 fn array_diff(a: JsValue, b: JsValue, o: &Options) -> JsValue {
-    fn values(v: JsValue) -> Vec<String> {
+    // Elements compare by their JSON text, which is `===` for JSON scalars. With ignoreCase,
+    // strings also compare lowercased (the JSON text of a lowercased string is the lowercased
+    // JSON text).
+    let values = |v: JsValue| {
         let mut out = Vec::new();
         for i in 0..len(v) {
-            out.push(text(json(at(v, i))))
+            let key = text(json(at(v, i)));
+            out.push(if o.ignore_case { key.to_lowercase() } else { key })
         }
         out
-    }
+    };
     let changes = diff::myers(&values(a), &values(b), o.separate);
     let out = array(changes.len());
     let mut old = 0;

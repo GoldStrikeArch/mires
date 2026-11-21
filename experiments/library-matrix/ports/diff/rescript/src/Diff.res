@@ -270,9 +270,10 @@ let lines = (before, after, options) =>
   )
 
 /** `canonicalize` for JSON documents: arrays in order, object keys sorted and assigned to a plain
- object, so a "__proto__" key sets the prototype and is not serialized. JSON input has no cycles
- and no `toJSON`, and the default replacer keeps every value. As in npm, each level recurses from a
- `for` loop, so a nesting level costs one stack frame. */
+ object, so a "__proto__" key sets the prototype and is not serialized. An object with a truthy
+ `toJSON` member has it called, which throws, since JSON cannot make it callable. JSON input has no
+ cycles, and the default replacer keeps every value. As in npm, each level recurses from a `for`
+ loop, so a nesting level costs one stack frame. */
 let rec canonicalize = (value: JSON.t): JSON.t =>
   switch value {
   | Array(items) =>
@@ -282,6 +283,9 @@ let rec canonicalize = (value: JSON.t): JSON.t =>
     }
     Array(canonical)
   | Object(object) =>
+    if object->Dict.get("toJSON")->Option.mapOr(false, Host.truthy) {
+      JsError.TypeError.throwWithMessage("obj.toJSON is not a function")
+    }
     let canonical = Dict.make()
     let keys = object->Dict.keysToArray->Array.toSorted(String.compare)
     for i in 0 to keys->Array.length - 1 {
@@ -316,6 +320,18 @@ let json = (before, after, options) => {
   )
 }
 
-/** array.js: tokens are the JSON values themselves, compared with `===`. */
-let arrays = (before: array<JSON.t>, after: array<JSON.t>, options) =>
-  diff(before, after, {equals: (left, right) => left === right, join: tokens => tokens, longest: None}, options)
+/** array.js: tokens are the JSON values themselves, compared with `===`, and with ignoreCase also by
+ `toLowerCase()`, which the contract applies to strings only. */
+let arrays = (before: array<JSON.t>, after: array<JSON.t>, options) => {
+  let lower = (value: JSON.t) => (Host.fromJson(value): string)->String.toLowerCase
+  diff(
+    before,
+    after,
+    {
+      equals: (left, right) => left === right || (options.ignoreCase && lower(left) == lower(right)),
+      join: tokens => tokens,
+      longest: None,
+    },
+    options,
+  )
+}

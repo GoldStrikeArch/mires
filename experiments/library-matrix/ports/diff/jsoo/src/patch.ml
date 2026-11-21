@@ -18,7 +18,7 @@ type patch = { meta : Host.value; hunks : hunk array }
 
 let starts s prefix = String.starts_with ~prefix s
 let ends s suffix = String.ends_with ~suffix s
-let drop s n = String.sub s n (String.length s - n)
+let drop s n = sub s n (String.length s)
 let array_of_js f v = Array.init (length v) (fun i -> f (at v i))
 
 let array_to_js f a =
@@ -42,7 +42,7 @@ let replace_all s pattern replacement =
   let rec go i =
     match find s pattern i with
     | Some j ->
-        Buffer.add_string b (String.sub s i (j - i));
+        Buffer.add_string b (sub s i j);
         Buffer.add_string b replacement;
         go (j + String.length pattern)
     | None -> Buffer.add_string b (drop s i)
@@ -55,6 +55,10 @@ let replace_all s pattern replacement =
 let create input context =
   let before = line_tokens (read (get input "before")) defaults
   and after = line_tokens (read (get input "after")) defaults in
+  (* context is a JavaScript number, used only through min, slice and <=; any value from the
+     line count up acts as the line count does, so it is clamped there. *)
+  let lines = Array.length before + Array.length after in
+  let context = if context >= float_of_int lines then lines else int_of_float context in
   let spans = Array.of_list (myers before after false) in
   let hunks = ref [] and output = ref [] and active = ref false in
   let old_start = ref 0 and new_start = ref 0 and old_lines = ref 0 and new_lines = ref 0 in
@@ -62,7 +66,7 @@ let create input context =
     let mark = match kind with Keep -> " " | Add -> "+" | Remove -> "-" in
     for i = first to first + count - 1 do
       let s = source.(i) in
-      if ends s "\n" then output := (mark ^ String.sub s 0 (String.length s - 1)) :: !output
+      if ends s "\n" then output := (mark ^ sub s 0 (String.length s - 1)) :: !output
       else output := "\\ No newline at end of file" :: (mark ^ s) :: !output
     done;
     if kind <> Add then old_lines := !old_lines + count;
@@ -228,14 +232,14 @@ let rest_of_line s =
     then i
     else stop (i + 1)
   in
-  String.sub s 0 (stop 0)
+  sub s 0 (stop 0)
 
 let digit_at s i = i < String.length s && s.[i] >= '0' && s.[i] <= '9'
 
 (* The capture of (\d+), ASCII digits only. *)
 let mode s =
   let rec stop i = if digit_at s i then stop (i + 1) else i in
-  match stop 0 with 0 -> None | n -> Some (String.sub s 0 n)
+  match stop 0 with 0 -> None | n -> Some (sub s 0 n)
 
 let octal_at s i = i < String.length s && s.[i] >= '0' && s.[i] <= '7'
 
@@ -316,7 +320,7 @@ let drop_last_unit s =
   if s = "" then ""
   else
     let start = last 0 0 in
-    let head = String.sub s 0 start in
+    let head = sub s 0 start in
     let c, _ = cp s start in
     if c > 0xffff then head ^ surrogate (0xd800 lor ((c - 0x10000) lsr 10)) else head
 
@@ -331,7 +335,7 @@ let git_names rest =
           let after = drop_first_unit (drop rest length) in
           if starts after "\"" then Option.map (fun (name, _) -> (old_name, name)) (quoted after)
           else Some (old_name, after))
-  | Some at -> Option.map (fun (name, _) -> (drop_last_unit (String.sub rest 0 at), name)) (quoted (drop rest at))
+  | Some at -> Option.map (fun (name, _) -> (drop_last_unit (sub rest 0 at), name)) (quoted (drop rest at))
   | None when starts rest "a/" -> (
       (* Split on the middle " b/", which is right when both names agree. *)
       let rec splits from found =
@@ -341,7 +345,7 @@ let git_names rest =
       | [] -> None
       | found ->
           let mid = List.nth found (List.length found / 2) in
-          Some (String.sub rest 0 mid, drop rest (mid + 1)))
+          Some (sub rest 0 mid, drop rest (mid + 1)))
   | None -> None
 
 (* One Git extended header line; at most one of parse.js's regexes matches. *)
@@ -390,7 +394,7 @@ let parse_file_header lines i meta =
 let digits s i =
   let rec stop j = if digit_at s j then stop (j + 1) else j in
   let j = stop i in
-  if j > i then Some (float_of_string (String.sub s i (j - i)), j) else None
+  if j > i then Some (float_of_string (sub s i j), j) else None
 
 (* The captures of /@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/ from [at],
    just after its leading "@@ -". *)
@@ -514,7 +518,7 @@ let parse_index lines i =
   { meta; hunks = Array.of_list (List.rev !hunks) }
 
 let parse text =
-  let lines = Array.of_list (String.split_on_char '\n' text) in
+  let lines = split_lines text in
   let i = ref 0 in
   let rec files found = if !i < Array.length lines then files (parse_index lines i :: found) else List.rev found in
   Array.of_list (files [])
@@ -622,18 +626,19 @@ let map_lines f p = { p with hunks = Array.map (fun h -> { h with lines = Array.
 let unix_to_win =
   map_lines (fun lines i l -> if starts l "\\" || ends l "\r" || before_marker lines i then l else l ^ "\r")
 
-let win_to_unix = map_lines (fun _ _ l -> if ends l "\r" then String.sub l 0 (String.length l - 1) else l)
+let win_to_unix = map_lines (fun _ _ l -> if ends l "\r" then sub l 0 (String.length l - 1) else l)
 
 (* distanceIterator: positions after [start], alternating forward and
-   backward by increasing distance, within [min_line, max_line]. *)
+   backward by increasing distance, within [min_line, max_line]. Positions are
+   JavaScript numbers, so a NaN start yields nothing, as in npm. *)
 let distance_iterator start min_line max_line =
   let want_forward = ref true and backward_exhausted = ref false and forward_exhausted = ref false in
-  let offset = ref 1 in
+  let offset = ref 1. in
   let rec next () =
     let forward =
       if !want_forward && not !forward_exhausted then begin
-        if !backward_exhausted then incr offset else want_forward := false;
-        if start + !offset <= max_line then Some (start + !offset)
+        if !backward_exhausted then offset := !offset +. 1. else want_forward := false;
+        if start +. !offset <= max_line then Some (start +. !offset)
         else begin
           forward_exhausted := true;
           None
@@ -645,9 +650,9 @@ let distance_iterator start min_line max_line =
     | Some _ -> forward
     | None when not !backward_exhausted ->
         if not !forward_exhausted then want_forward := true;
-        if min_line <= start - !offset then begin
-          let position = start - !offset in
-          incr offset;
+        if min_line <= start -. !offset then begin
+          let position = start -. !offset in
+          offset := !offset +. 1.;
           Some position
         end
         else begin
@@ -658,25 +663,29 @@ let distance_iterator start min_line max_line =
   in
   next
 
-type fitted = { patched : string list; last_old_line : int }
+type fitted = { patched : string list; last_old_line : float }
 
 let rec drop_first n l = match l with _ :: rest when n > 0 -> drop_first (n - 1) rest | _ -> l
+
+(* lines.(i), where a position outside the source, or NaN, reads as undefined. *)
+let line_at lines i = if i >= 0. && i < float_of_int (Array.length lines) then Some lines.(int_of_float i) else None
 
 (* applyHunk with no errors allowed: every removed and context line equals
    the source line at its position. Trailing context is given back. *)
 let fit lines hunk to_pos =
-  let source i = if i >= 0 && i < Array.length lines then Some lines.(i) else None in
   let rec go k to_pos patched context =
     if k = Array.length hunk then
-      Some { patched = List.rev (drop_first context patched); last_old_line = to_pos - context - 1 }
+      Some { patched = List.rev (drop_first context patched); last_old_line = to_pos -. float_of_int context -. 1. }
     else
       let line = hunk.(k) in
       let operation = if line = "" then ' ' else line.[0] in
       let content = if line = "" then "" else drop line 1 in
       match operation with
-      | '-' -> if source to_pos = Some content then go (k + 1) (to_pos + 1) patched 0 else None
+      | '-' -> if line_at lines to_pos = Some content then go (k + 1) (to_pos +. 1.) patched 0 else None
       | '+' -> go (k + 1) to_pos (content :: patched) 0
-      | ' ' -> if source to_pos = Some content then go (k + 1) (to_pos + 1) (content :: patched) (context + 1) else None
+      | ' ' ->
+          if line_at lines to_pos = Some content then go (k + 1) (to_pos +. 1.) (content :: patched) (context + 1)
+          else None
       | _ -> go (k + 1) to_pos patched context
   in
   go 0 to_pos [] 0
@@ -687,7 +696,7 @@ let apply source p =
     else if only_unix_line_endings source && is_win p then win_to_unix p
     else p
   in
-  let lines = Array.of_list (String.split_on_char '\n' source) in
+  let lines = split_lines source in
   let count = Array.length p.hunks in
   if count = 0 then Some source
   else
@@ -709,17 +718,20 @@ let apply source p =
     match lines with
     | None -> None
     | Some lines ->
-        let line_at i = if i >= 0 && i < Array.length lines then lines.(i) else "" in
-        let rec copy i stop result = if i >= stop then result else copy (i + 1) stop (line_at i :: result) in
+        (* Positions are JavaScript numbers: a NaN start fits only a hunk with no removed or
+           context line, and then every later position is NaN too. A position outside the source
+           reads as undefined, which joins as an empty line. *)
+        let rec copy i stop result =
+          if i < stop then copy (i +. 1.) stop (Option.value (line_at lines i) ~default:"" :: result) else result
+        in
+        let length = float_of_int (Array.length lines) in
         let rec hunks k min_line offset result =
-          if k = count then Some (String.concat "\n" (List.rev (copy min_line (Array.length lines) result)))
+          if k = count then Some (String.concat "\n" (List.rev (copy min_line length result)))
           else
             let h = p.hunks.(k) in
-            let old_start = int_of_float h.old_start in
-            let max_line = Array.length lines - int_of_float h.old_lines in
             (* The declared position first, then the distance iterator around it. *)
-            let to_pos = old_start + offset - 1 in
-            let next = distance_iterator to_pos min_line max_line in
+            let to_pos = h.old_start +. offset -. 1. in
+            let next = distance_iterator to_pos min_line (length -. h.old_lines) in
             let rec search to_pos =
               match fit lines h.lines to_pos with
               | Some fitted -> Some (to_pos, fitted)
@@ -729,6 +741,6 @@ let apply source p =
             | None -> None
             | Some (to_pos, fitted) ->
                 let result = List.rev_append fitted.patched (copy min_line to_pos result) in
-                hunks (k + 1) (fitted.last_old_line + 1) (to_pos + 1 - old_start) result
+                hunks (k + 1) (fitted.last_old_line +. 1.) (to_pos +. 1. -. h.old_start) result
         in
-        hunks 0 0 0 []
+        hunks 0 0. 0. []

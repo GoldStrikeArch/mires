@@ -79,7 +79,7 @@ let myers old newer individual =
     rounds 1
   end
 
-let sub s i j=String.sub s i (j-i)
+let sub s i j=Host.slice s i j
 let len=String.length
 let cp = Host.cp
 let space c = (9<=c&&c<=13)||c=32||c=160||c=0x1680||(0x2000<=c&&c<=0x200a)||c=0x2028||c=0x2029||c=0x202f||c=0x205f||c=0x3000||c=0xfeff
@@ -107,13 +107,30 @@ let words s =
   end else begin
     (match !out with [h] when !prev<>"" && h= !prev -> out:=[h^part]|_ -> out:=(!prev^part)::!out);prev:=""
   end)(List.rev !parts); Array.of_list(List.rev !out)
+(* stripTrailingCr's replace(/\r\n/g, '\n'): each \r right before a \n is dropped. *)
+let strip_crlf s =
+  let b = Buffer.create (len s) in
+  String.iteri (fun i c -> if not (c = '\r' && i + 1 < len s && s.[i + 1] = '\n') then Buffer.add_char b c) s;
+  Buffer.contents b
+
+(* line.js tokenize: stripTrailingCr first rewrites the text, as npm does, then the text is split
+   on \n and \r\n, so in \r\r\n the first \r and the new \n make one separator. *)
 let line_tokens s o =
-  let out=ref [] and start=ref 0 in
-  for i=0 to len s-1 do if s.[i]='\n' then begin let e=if i> !start&&s.[i-1]='\r' then i-1 else i in
-    if o.newline_token then begin if e> !start then out:=sub s !start e::!out;out:=(if o.strip_cr then "\n" else sub s e (i+1))::!out end
-    else out:=(if o.strip_cr && e<i then sub s !start e^"\n" else sub s !start (i+1))::!out;
-    start:=i+1
-  end done;if !start<len s then out:=cut_l s !start::!out;Array.of_list(List.rev !out)
+  let s = if o.strip_cr then strip_crlf s else s in
+  let out = ref [] and start = ref 0 in
+  for i = 0 to len s - 1 do
+    if s.[i] = '\n' then begin
+      let e = if i > !start && s.[i - 1] = '\r' then i - 1 else i in
+      if o.newline_token then begin
+        if e > !start then out := sub s !start e :: !out;
+        out := sub s e (i + 1) :: !out
+      end
+      else out := sub s !start (i + 1) :: !out;
+      start := i + 1
+    end
+  done;
+  if !start < len s then out := cut_l s !start :: !out;
+  Array.of_list (List.rev !out)
 let tokenize op s o=
   if op="diffWords" then words s else if op="diffLines" || op="diffJson" then line_tokens s o
   else let out=ref [] and i=ref 0 in while !i<len s do let _,n=cp s !i in out:=sub s !i (!i+n)::!out;i:= !i+n done;Array.of_list(List.rev !out)

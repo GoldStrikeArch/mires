@@ -237,7 +237,7 @@ lineTokens o s =
                                 x
 
                         delimiter =
-                            if cr && not o.stripCr then
+                            if cr then
                                 "\u{000D}\n"
 
                             else
@@ -268,7 +268,18 @@ lineTokens o s =
                 [] ->
                     List.reverse out
     in
-    group (String.split "\n" s) []
+    -- stripTrailingCr first replaces every \r\n with \n, as npm does, so in \r\r\n the first \r
+    -- and the new \n make one separator.
+    group
+        (String.split "\n"
+            (if o.stripCr then
+                String.replace "\u{000D}\n" "\n" s
+
+             else
+                s
+            )
+        )
+        []
 
 
 tokenize op o s =

@@ -275,14 +275,16 @@ final class JsonDiff extends TextDiff {
 }
 
 /// `canonicalize` for JSON documents: arrays in order, object keys sorted and assigned to a plain
-/// object, so a "__proto__" key sets the prototype and is not serialized. JSON input has no cycles
-/// and no `toJSON`, and the default replacer keeps every value.
+/// object, so a "__proto__" key sets the prototype and is not serialized. An object with a truthy
+/// `toJSON` member has it called, which throws, since JSON cannot make it callable. JSON input has
+/// no cycles, and the default replacer keeps every value.
 JSAny? canonicalize(JSAny? value) {
   if (value.isA<JSArray>()) {
     return [for (final element in (value as JSArray<JSAny?>).toDart) canonicalize(element)].toJS;
   }
   if (value != null && value.typeofEquals('object')) {
     final object = value as JSObject;
+    if (truthy(object['toJSON'])) throw ArgumentError('obj.toJSON is not a function');
     final keys = [for (final key in objectKeys(object).toDart) key.toDart]..sort();
     final canonical = JSObject();
     for (final key in keys) {
@@ -293,10 +295,13 @@ JSAny? canonicalize(JSAny? value) {
   return value;
 }
 
-/// array.js: tokens are the JSON values themselves, compared with `===`.
+/// array.js: tokens are the JSON values themselves, compared with `===`, and with ignoreCase also by
+/// `toLowerCase()`, which the contract applies to strings only.
 final class ArrayDiff extends Diff<JSAny?, JSArray<JSAny?>> {
   @override
-  bool tokensEqual(JSAny? left, JSAny? right, DiffOptions options) => left.strictEquals(right).toDart;
+  bool tokensEqual(JSAny? left, JSAny? right, DiffOptions options) =>
+      left.strictEquals(right).toDart ||
+      (options.ignoreCase && (left as JSString).toDart.toLowerCase() == (right as JSString).toDart.toLowerCase());
 
   @override
   JSArray<JSAny?> join(List<JSAny?> tokens) => tokens.toJS;

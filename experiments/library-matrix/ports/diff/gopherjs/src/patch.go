@@ -44,7 +44,7 @@ func (h *hunk) emit(kind int, lines []string) {
 		}
 	}
 }
-func create(input *js.Object, ctx int) patch {
+func create(input *js.Object, context float64) patch {
 	meta := object()
 	for _, k := range []string{"oldFileName", "newFileName", "oldHeader", "newHeader"} {
 		meta.Set(k, input.Get(k))
@@ -52,6 +52,12 @@ func create(input *js.Object, ctx int) patch {
 	p := patch{meta: meta}
 	before := lines(readText(input.Get("before")), options{})
 	after := lines(readText(input.Get("after")), options{})
+	// context is a JavaScript number, used only through min, slice and <=; any value from the
+	// line count up acts as the line count does, so it is clamped there.
+	ctx := len(before) + len(after)
+	if context < float64(ctx) {
+		ctx = int(context)
+	}
 	spans := myers(before, after, false)
 	old, new, lastKeep := 0, 0, 0
 	h := hunk{}
@@ -62,7 +68,7 @@ func create(input *js.Object, ctx int) patch {
 				close := i+1 == len(spans) || r.count > 2*ctx
 				count := r.count
 				if close {
-					count = smaller(ctx, count)
+					count = min(ctx, count)
 				}
 				h.emit(keep, after[new:new+count])
 				if close {
@@ -74,7 +80,7 @@ func create(input *js.Object, ctx int) patch {
 			lastKeep = r.count
 		} else {
 			if !active {
-				k := smaller(ctx, lastKeep)
+				k := min(ctx, lastKeep)
 				h.oldStart = float64(old + 1 - k)
 				h.newStart = float64(new + 1 - k)
 				h.emit(keep, after[new-k:new])
@@ -794,14 +800,15 @@ func winToUnix(p patch) patch {
 }
 
 // distance is distanceIterator: the positions after start, alternating
-// forward and backward by increasing distance, within [min, max].
+// forward and backward by increasing distance, within [min, max]. Positions
+// are JavaScript numbers, so a NaN start yields nothing, as in npm.
 type distance struct {
-	start, min, max                                 int
+	start, min, max                                 float64
 	wantForward, backwardExhausted, forwardExhausted bool
-	offset                                          int
+	offset                                          float64
 }
 
-func (d *distance) next() (int, bool) {
+func (d *distance) next() (float64, bool) {
 	if d.wantForward && !d.forwardExhausted {
 		if d.backwardExhausted {
 			d.offset++
@@ -828,17 +835,17 @@ func (d *distance) next() (int, bool) {
 	return 0, false
 }
 
-// sourceLine is lines[i], where a position outside the array is undefined.
-func sourceLine(lines []string, i int) (string, bool) {
-	if i < 0 || i >= len(lines) {
-		return "", false
+// sourceLine is lines[i], where a position outside the array, or NaN, is undefined.
+func sourceLine(lines []string, i float64) (string, bool) {
+	if i >= 0 && i < float64(len(lines)) {
+		return lines[int(i)], true
 	}
-	return lines[i], true
+	return "", false
 }
 
 // fit is applyHunk with no errors allowed: every removed and context line
 // equals the source line at its position. Trailing context is given back.
-func fit(hunk []string, lines []string, toPos int) ([]string, int, bool) {
+func fit(hunk []string, lines []string, toPos float64) ([]string, float64, bool) {
 	var patched []string
 	context := 0
 	for _, l := range hunk {
@@ -865,7 +872,17 @@ func fit(hunk []string, lines []string, toPos int) ([]string, int, bool) {
 			toPos++
 		}
 	}
-	return patched[:len(patched)-context], toPos - context - 1, true
+	return patched[:len(patched)-context], toPos - float64(context) - 1, true
+}
+
+// copyLines appends the source lines from `from` while below `until`; a
+// position outside the source reads as undefined, which joins as an empty line.
+func copyLines(result []string, lines []string, from, until float64) []string {
+	for i := from; i < until; i++ {
+		line, _ := sourceLine(lines, i)
+		result = append(result, line)
+	}
+	return result
 }
 func apply(source string, p patch) interface{} {
 	if onlyWinLineEndings(source) && isUnix(p) {
@@ -906,13 +923,14 @@ func apply(source string, p patch) interface{} {
 		}
 		lines = append(lines, "")
 	}
+	// Positions are JavaScript numbers: a NaN start fits only a hunk with no
+	// removed or context line, and then every later position is NaN too.
 	var result []string
-	minLine, offset := 0, 0
+	minLine, offset := 0.0, 0.0
 	for _, h := range p.hunks {
-		oldStart := int(h.oldStart)
 		// The declared position first, then the distance iterator around it.
-		toPos := oldStart + offset - 1
-		candidates := distance{start: toPos, min: minLine, max: len(lines) - int(h.oldLines), wantForward: true, offset: 1}
+		toPos := h.oldStart + offset - 1
+		candidates := distance{start: toPos, min: minLine, max: float64(len(lines)) - h.oldLines, wantForward: true, offset: 1}
 		patched, last, ok := fit(h.lines, lines, toPos)
 		for !ok {
 			if toPos, ok = candidates.next(); !ok {
@@ -920,17 +938,9 @@ func apply(source string, p patch) interface{} {
 			}
 			patched, last, ok = fit(h.lines, lines, toPos)
 		}
-		for i := minLine; i < toPos; i++ {
-			line, _ := sourceLine(lines, i)
-			result = append(result, line)
-		}
-		result = append(result, patched...)
+		result = append(copyLines(result, lines, minLine, toPos), patched...)
 		minLine = last + 1
-		offset = toPos + 1 - oldStart
+		offset = toPos + 1 - h.oldStart
 	}
-	for i := minLine; i < len(lines); i++ {
-		line, _ := sourceLine(lines, i)
-		result = append(result, line)
-	}
-	return writeText(strings.Join(result, "\n"))
+	return writeText(strings.Join(copyLines(result, lines, minLine, float64(len(lines))), "\n"))
 }

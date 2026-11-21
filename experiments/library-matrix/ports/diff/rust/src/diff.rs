@@ -210,7 +210,16 @@ fn word_tokens(s: &str) -> Vec<String> {
     out
 }
 
+/// line.js `tokenize`. stripTrailingCr first replaces every `\r\n` with `\n`, as npm does, so
+/// in `\r\r\n` the first `\r` and the new `\n` make one separator.
 pub fn line_tokens(s: &str, o: &Options) -> Vec<String> {
+    let stripped;
+    let s = if o.strip_cr {
+        stripped = s.replace("\r\n", "\n");
+        stripped.as_str()
+    } else {
+        s
+    };
     let bytes = s.as_bytes();
     let mut out = Vec::new();
     let mut start = 0;
@@ -227,11 +236,7 @@ pub fn line_tokens(s: &str, o: &Options) -> Vec<String> {
             if start < end {
                 out.push(s[start..end].to_string())
             }
-            out.push(if o.strip_cr { "\n" } else { &s[end..i + 1] }.to_string());
-        } else if o.strip_cr && end < i {
-            let mut line = s[start..end].to_string();
-            line.push('\n');
-            out.push(line);
+            out.push(s[end..i + 1].to_string())
         } else {
             out.push(s[start..i + 1].to_string())
         }

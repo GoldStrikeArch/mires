@@ -49,19 +49,26 @@ type alias Container =
     { key : String, isArray : Bool, pending : List ( String, D.Value ), done : List ( String, E.Value ) }
 
 
-container : String -> D.Value -> Maybe Container
+{-| The container a JSON value opens, if it is an array or an object. canonicalize calls an
+object's truthy `toJSON` member, which JSON cannot make callable, so that fails as npm throws.
+-}
+container : String -> D.Value -> Result String (Maybe Container)
 container key v =
     case D.decodeValue (D.list D.value) v of
         Ok items ->
-            Just (Container key True (List.map (Tuple.pair "") items) [])
+            Ok (Just (Container key True (List.map (Tuple.pair "") items) []))
 
         Err _ ->
             case D.decodeValue (D.keyValuePairs D.value) v of
                 Ok fields ->
-                    Just (Container key False (List.sortBy Tuple.first fields) [])
+                    if Patch.truthyField "toJSON" v then
+                        Err "obj.toJSON is not a function"
+
+                    else
+                        Ok (Just (Container key False (List.sortBy Tuple.first fields) []))
 
                 Err _ ->
-                    Nothing
+                    Ok Nothing
 
 
 {-| jsdiff's canonicalize for JSON documents: arrays in order, object keys sorted and assigned to
@@ -69,21 +76,24 @@ a plain object (so a `__proto__` key sets the prototype and is not serialized). 
 once per nesting level; this visits the document with a stack of open containers in a loop, so
 nesting costs heap, not call stack.
 -}
-canonical : D.Value -> E.Value
+canonical : D.Value -> Result String E.Value
 canonical root =
     case container "" root of
-        Just open ->
+        Ok (Just open) ->
             canonicalize [ open ]
 
-        Nothing ->
-            root
+        Ok Nothing ->
+            Ok root
+
+        Err e ->
+            Err e
 
 
-canonicalize : List Container -> E.Value
+canonicalize : List Container -> Result String E.Value
 canonicalize stack =
     case stack of
         [] ->
-            E.null
+            Ok E.null
 
         open :: below ->
             case open.pending of
@@ -93,11 +103,14 @@ canonicalize stack =
                             { open | pending = rest }
                     in
                     case container key member of
-                        Just inner ->
+                        Ok (Just inner) ->
                             canonicalize (inner :: visited :: below)
 
-                        Nothing ->
+                        Ok Nothing ->
                             canonicalize ({ visited | done = ( key, member ) :: visited.done } :: below)
+
+                        Err e ->
+                            Err e
 
                 [] ->
                     let
@@ -110,7 +123,7 @@ canonicalize stack =
                     in
                     case below of
                         [] ->
-                            value
+                            Ok value
 
                         parent :: rest ->
                             canonicalize ({ parent | done = ( open.key, value ) :: parent.done } :: rest)
@@ -139,15 +152,17 @@ run input =
         o =
             Differ.Options (flag "ignoreCase") (flag "oneChangePerToken") (flag "stripTrailingCr") (flag "ignoreWhitespace") (flag "newlineIsToken") (flag "ignoreNewlineAtEof")
 
-        doc v =
-            if op == "diffJson" then
-                D.decodeValue D.string v |> Result.withDefault (E.encode 2 (canonical v))
-
-            else
-                string v
-
         tokens v =
-            Differ.tokenize op o (doc v)
+            Differ.tokenize op o (string v)
+
+        -- json.js castInput: a string as it is, any other document pretty-printed canonically.
+        jsonTokens v =
+            case D.decodeValue D.string v of
+                Ok text ->
+                    Ok (Differ.tokenize op o text)
+
+                Err _ ->
+                    canonical v |> Result.map (E.encode 2 >> Differ.tokenize op o)
 
         output r =
             change r.kind r.count (E.string r.value)
@@ -177,7 +192,7 @@ run input =
             Ok (E.list output (Differ.changes op o (tokens a) (tokens b)))
 
         "diffJson" ->
-            Ok (E.list output (Differ.changes op o (tokens a) (tokens b)))
+            Result.map2 (\old new -> E.list output (Differ.changes op o old new)) (jsonTokens a) (jsonTokens b)
 
         "diffArrays" ->
             let
@@ -188,7 +203,17 @@ run input =
                     Array.fromList (array b)
 
                 rows =
-                    Differ.myers (Array.map (E.encode 0) old) (Array.map (E.encode 0) new) o.individual
+                    Differ.myers (Array.map key old) (Array.map key new) o.individual
+
+                -- Elements compare by their JSON text, which is === for JSON scalars. With
+                -- ignoreCase, strings also compare lowercased (the JSON text of a lowercased
+                -- string is the lowercased JSON text).
+                key v =
+                    if o.ignoreCase then
+                        String.toLower (E.encode 0 v)
+
+                    else
+                        E.encode 0 v
 
                 build spans i j rev =
                     case spans of

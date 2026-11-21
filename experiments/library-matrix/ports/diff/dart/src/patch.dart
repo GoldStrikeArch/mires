@@ -518,19 +518,20 @@ List<Hunk> _unixToWin(List<Hunk> hunks) => _mapLines(hunks, (lines, i) {
 List<Hunk> _winToUnix(List<Hunk> hunks) =>
     _mapLines(hunks, (lines, i) => lines[i].endsWith('\r') ? lines[i].substring(0, lines[i].length - 1) : lines[i]);
 
-/// distance-iterator.js: positions after [_start], alternating forward and backward, within the limits.
+/// distance-iterator.js: positions after [_start], alternating forward and backward, within the
+/// limits. Positions are JavaScript numbers, so a NaN start yields nothing, as in npm.
 final class _DistanceIterator {
   _DistanceIterator(this._start, this._minLine, this._maxLine);
 
-  final int _start;
-  final int _minLine;
-  final int _maxLine;
+  final double _start;
+  final double _minLine;
+  final double _maxLine;
   var _wantForward = true;
   var _backwardExhausted = false;
   var _forwardExhausted = false;
-  var _localOffset = 1;
+  double _localOffset = 1;
 
-  int? next() {
+  double? next() {
     if (_wantForward && !_forwardExhausted) {
       if (_backwardExhausted) {
         _localOffset++;
@@ -591,12 +592,12 @@ String? _applyStructuredPatch(String source, List<Hunk> patchHunks) {
     }
   }
 
-  /// `lines[i]`, where a position outside the source reads as undefined.
-  String? lineAt(int i) => i >= 0 && i < lines.length ? lines[i] : null;
+  /// `lines[i]`, where a position outside the source, or NaN, reads as undefined.
+  String? lineAt(double i) => i >= 0 && i < lines.length ? lines[i.toInt()] : null;
 
   /// applyHunk with no errors allowed: every removed and context line must equal the source line
   /// at its position. Trailing context is given back, so the next hunk may start inside it.
-  ({List<String> patchedLines, int oldLineLastI})? applyHunk(List<String> hunkLines, int position) {
+  ({List<String> patchedLines, double oldLineLastI})? applyHunk(List<String> hunkLines, double position) {
     var toPos = position;
     final patchedLines = <String>[];
     var nConsecutiveOldContextLines = 0;
@@ -622,14 +623,22 @@ String? _applyStructuredPatch(String source, List<Hunk> patchHunks) {
     return (patchedLines: patchedLines, oldLineLastI: toPos - nConsecutiveOldContextLines - 1);
   }
 
+  // Positions are JavaScript numbers: a NaN start fits only a hunk with no removed or context
+  // line, and then every later position is NaN too. A position outside the source reads as
+  // undefined, which joins as an empty line.
   final resultLines = <String>[];
-  var minLine = 0;
-  var prevHunkOffset = 0;
+  void copy(double from, double until) {
+    for (var i = from; i < until; i++) {
+      resultLines.add(lineAt(i) ?? '');
+    }
+  }
+
+  var minLine = 0.0;
+  var prevHunkOffset = 0.0;
   for (final hunk in hunks) {
-    final oldStart = hunk.oldStart.toInt();
-    final maxLine = lines.length - hunk.oldLines.toInt();
+    final maxLine = lines.length - hunk.oldLines;
     // The declared position first, then the positions around it.
-    var toPos = oldStart + prevHunkOffset - 1;
+    var toPos = hunk.oldStart + prevHunkOffset - 1;
     final iterator = _DistanceIterator(toPos, minLine, maxLine);
     var hunkResult = applyHunk(hunk.lines, toPos);
     while (hunkResult == null) {
@@ -638,25 +647,17 @@ String? _applyStructuredPatch(String source, List<Hunk> patchHunks) {
       toPos = next;
       hunkResult = applyHunk(hunk.lines, toPos);
     }
-    // A position outside the source reads as undefined, which joins as an empty line.
-    for (var i = minLine; i < toPos; i++) {
-      resultLines.add(lineAt(i) ?? '');
-    }
+    copy(minLine, toPos);
     resultLines.addAll(hunkResult.patchedLines);
     // Later hunks may not fit over text this one patched.
     minLine = hunkResult.oldLineLastI + 1;
-    prevHunkOffset = toPos + 1 - oldStart;
+    prevHunkOffset = toPos + 1 - hunk.oldStart;
   }
-  for (var i = minLine; i < lines.length; i++) {
-    resultLines.add(lineAt(i) ?? '');
-  }
+  copy(minLine, lines.length.toDouble());
   return resultLines.join('\n');
 }
 
 // ---- reversePatch, over the structured patch's own JSON values ----
-
-@JS('Boolean')
-external bool _truthy(JSAny? value);
 
 @JS('Reflect.deleteProperty')
 external bool _deleteProperty(JSObject target, String key);
@@ -681,7 +682,7 @@ JSAny reversePatch(JSAny structuredPatch) {
     return [for (final patch in (structuredPatch as JSArray<JSAny>).toDart.reversed) reversePatch(patch)].toJS;
   }
   final patch = structuredPatch as JSObject;
-  final isGit = _truthy(patch['isGit']);
+  final isGit = truthy(patch['isGit']);
   JSAny? name(String key) => isGit ? _swapPrefix(patch[key]) : patch[key];
   // Object.assign({}, patch, {...}): the patch's own keys first, then the new ones.
   final reversed = JSObject();
@@ -708,7 +709,7 @@ JSAny reversePatch(JSAny structuredPatch) {
             for (final line in (hunk['lines'] as JSArray<JSString>).toDart) _reverseLine(line.toDart).toJS,
           ].toJS,
     ].toJS;
-  if (_truthy(patch['isCopy'])) {
+  if (truthy(patch['isCopy'])) {
     // Reversing a copy deletes the copy destination; the hunks cannot be reversed into a deletion.
     reversed
       ..['newFileName'] = '/dev/null'.toJS
