@@ -35,12 +35,40 @@ benchmark variants.
 - **No `core::slice::sort` and no `core::fmt`.** `stable_sort_holes` uses a compact stable
   insertion + bottom-up merge sort (avoiding ~18 KB per `core::slice::sort` instantiation under
   `mires`), and panics/errors use static strings.
-- **Hot-loop slice borrowing and zero-based sentinels (`PERF-004`).** Because the matrix builds
-  Rust with `JSC_RUST_MIR_INLINE=off` and `Vec` indexing invokes `$rt_unscale` + `$rt__blk_get`
-  on every access, hot loops (`earcut_linked`, `find_hole_bridge`, `index_curve`, `refine`) bind
-  `&[Node]` / `&mut [Node]` / `&[f64]` slices once outside the loop, and `refine` uses zero-based
-  sentinels (`0` = boundary/empty, `1` = consumed, `e + 1`/`e + 2` for live indices) so `vec![0u32; ...]`
-  avoids the non-zero `alloc::vec::from_elem` per-element `{ buf, off }` object-allocating fill loop.
+- **Steiner flag.** npm keeps single-vertex holes in a module-level `Set` named `steiners`; the
+  port uses the per-node `steiner` flag that `libraries/earcut/CONTRACT.md` describes and shows
+  equivalent ("Vertex `Node`").
+- **Out of domain: an empty hole slice** (`holeIndices: [4, 4, 7]`). `linked_list` returns `NONE`
+  and `eliminate_holes` skips the hole, where npm throws a `TypeError`. The contract's
+  strictly-increasing rule for `holeIndices` excludes this input.
+
+## Performance accommodations (PERF-004)
+
+The matrix builds client crates with `JSC_RUST_MIR_INLINE=off`, and under mires every `Vec` index
+runs `$rt_unscale` and `$rt__blk_get`, whose one-entry block cache thrashes when a loop alternates
+between two `Vec`s (`MIRES-BUGS.md`, `PERF-004`). Four shapes in the source follow from this. Each
+site carries a `// PERF-004:` comment that points here, so the accommodation can be removed when
+the cliff is fixed.
+
+- **Hoisted slice borrows.** Hot loops (`earcut_linked`, `find_hole_bridge`, `index_curve`,
+  `refine`) bind `&[Node]` / `&mut [Node]` / `&[f64]` slices once, outside the loop.
+- **Two copies of `removeNode` and `filterPoints`.** npm has one `removeNode`, which calls
+  `growBlock` when `indexActive` is set, and one `filterPoints`. The port has `remove_node_sl` and
+  `filter_points_sl`, free functions over the borrowed node slice that never touch the block index,
+  and `EarcutState::remove_node_indexed` and `filter_points_indexed`, which also grow the block
+  bbox. `eliminate_hole`, the only code that runs while `index_active` is true, calls the
+  `_indexed` pair. Every other caller runs while npm's flag is false and calls the `_sl` pair. The
+  split therefore matches npm's flag test. It lets the hot callers work on one borrowed slice
+  instead of alternating between `nodes` and `block_bbox`.
+- **Macros for the predicates.** `min3`, `max3`, `point_in_triangle`, `area_sl` and
+  `z_order_inline` in `earcut.rs`, and `next_he` in `refine.rs`, are `macro_rules!` rather than
+  functions. With MIR inlining off, `#[inline]` does not guarantee that a call disappears; the
+  macros expand inside the loops and read the slice those loops already hold.
+- **Offset sentinels in `refine`.** npm's `he` uses -1 for a boundary edge and `hTable` uses -1 for
+  a consumed slot (and `hStamp`/`gen` for empty slots). The port stores `he[e] = s + 1` for twin
+  `s` (0 for boundary) and `h_table[h] = s + 2` for live edge `s` (1 for consumed, 0 for empty),
+  so every buffer starts as `vec![0u32; n]`. A non-zero `vec![value; n]` goes through
+  `alloc::vec::from_elem`, whose fill loop allocates a `{ buf, off }` object per element under mires.
 
 ## mires bugs and performance cliffs
 
@@ -62,7 +90,8 @@ benchmark variants.
 
 ## Size
 
-`dist/index.min.js` is 67,056 B raw / 20,871 B gzip-9 / 17,574 B brotli-11 (exact figures in
+`dist/index.min.js` is 67,060 B raw / 20,870 B gzip-9 / 17,568 B brotli-11 (exact figures in
 `sizes.json` and `MATRIX.md`), with `0` embedded JS, `0` eval refs, `0` host JS, and `0` module
-state. By Rollup attribution (`dist/meta.json`): `64,518 B` program (`matrix_earcut` + `alloc`/`core`
-helpers) and `24,059 B` minimal `runtime/shim.js` before Terser.
+state. By Rollup attribution (`dist/meta.json`): `64,522 B` program (`matrix_earcut` + `alloc`/`core`
+helpers) and `24,059 B` minimal `runtime/shim.js` before Terser. The `// PERF-004:` comments added
+on 2026-11-21 moved source lines, and with them the panic locations in the output, by 4 B.

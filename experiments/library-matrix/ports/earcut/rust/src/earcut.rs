@@ -41,6 +41,9 @@ struct Node {
     steiner: bool,
 }
 
+// PERF-004: `min3`, `max3`, `point_in_triangle`, `area_sl` and `z_order_inline` are macros so
+// they expand inside the hot loops and read the slice those loops already borrow. See NOTES.md,
+// "Performance accommodations (PERF-004)".
 macro_rules! min3 {
     ($a:expr, $b:expr, $c:expr) => {{
         let m = if $a < $b { $a } else { $b };
@@ -120,6 +123,10 @@ fn equals_sl(nodes: &[Node], p1: u32, p2: u32) -> bool {
     a.x == b.x && a.y == b.y
 }
 
+// PERF-004: npm's removeNode is split in two. This one takes the borrowed node slice and skips
+// growBlock; it serves every call made while npm's `indexActive` is false.
+// `EarcutState::remove_node_indexed` serves the merge loop. See NOTES.md,
+// "Performance accommodations (PERF-004)".
 #[inline]
 fn remove_node_sl(nodes: &mut [Node], p: u32) {
     let (prev, next, prev_z, next_z) = {
@@ -192,6 +199,9 @@ fn intersects_sl(nodes: &[Node], p1: u32, q1: u32, p2: u32, q2: u32, include_bou
     false
 }
 
+// PERF-004: npm's filterPoints, on the borrowed node slice, for calls made while `indexActive` is
+// false. `EarcutState::filter_points_indexed` is the merge-loop copy. See NOTES.md,
+// "Performance accommodations (PERF-004)".
 fn filter_points_sl(nodes: &mut [Node], start: u32, mut end: u32, filtered_out: &mut bool) -> u32 {
     let full = end == start;
     let mut p = start;
@@ -449,6 +459,8 @@ impl EarcutState {
         p
     }
 
+    // PERF-004: the merge-loop copy of `remove_node_sl`, which also grows the block bbox while
+    // `index_active` (npm's growBlock). See NOTES.md, "Performance accommodations (PERF-004)".
     #[inline]
     fn remove_node_indexed(&mut self, p: u32) {
         let nodes = self.nodes.as_mut_slice();
@@ -522,6 +534,9 @@ impl EarcutState {
         last
     }
 
+    // PERF-004: the merge-loop copy of `filter_points_sl`; it removes through
+    // `remove_node_indexed`. `eliminate_hole` is its only caller. See NOTES.md,
+    // "Performance accommodations (PERF-004)".
     fn filter_points_indexed(&mut self, start: u32, mut end: u32) -> u32 {
         let full = end == start;
         let mut p = start;

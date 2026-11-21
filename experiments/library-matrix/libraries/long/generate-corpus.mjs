@@ -34,6 +34,29 @@ for (let radix=2;radix<=36;radix++){
 add('parsing-errors','empty input, signs, special values, parseInt prefixes and chunk boundaries',
   ['', '-', '--1', '---123','1-2','NaN','Infinity','-Infinity','+Infinity','  +42','0x101b','+0x1','1z234567888','x123456700000001','1234 5678','ZzZ','\t80','   5'].flatMap(s =>
     [0,1,10,16,36,37].map(n=>cmd('fromString',{s,n,r:16}))).concat([cmd('toString',{r:1}),cmd('toString',{r:37}),cmd('unknown')]))
+// long.js reads n and r as JavaScript numbers. Counts keep the low six bits of ToInt32: past 2^53
+// a double's low bits can still be set (2^53 + 2 counts as 2), and 1e21 or more counts as 0.
+// For +-(2^53 + 2^31 + 2), ToInt32 has the opposite sign, so |ToInt32(n)| has the wrong low bits.
+add('huge-shift-counts','Shift and rotation counts past 2^53, up to the largest double, keep the low six bits of ToInt32',
+  ['shiftLeft','shiftRight','shiftRightUnsigned','rotl'].flatMap(op =>
+    [2**53, 2**53+2, -(2**53+2), 2**53+2**31+2, -(2**53+2**31+2), 2**54+4, 2**57+32, 4294967296*7+5, 2**63, 2**64, 1e21, -1e21, 3.3e21, 1e300, Number.MAX_VALUE, -Number.MAX_VALUE]
+      .flatMap(n => [[1,0],[1234,-14]].map(a => cmd(op,{a,n,u:op==='shiftRight'?false:true,r:16})))))
+add('huge-radices','Radices past 2^31, 2^32 and 1e21 throw RangeError; fromString tests its radix after the empty and NaN checks',
+  [2**31+10, 2**32+10, 2**32+16, -(2**32)+10, 4294967296*3+36, 1e21, -1e21, 1.6e22, 3.6e22, Number.MAX_VALUE].flatMap(r => [
+    cmd('toString',{a:[123456,7],r}),
+    cmd('fromString',{s:'12345abc',n:r,r:16}),
+    cmd('fromString',{s:'NaN',n:r,r:16}),
+    cmd('fromString',{s:'',n:r,r:16}),
+    cmd('mix',{a:[5,6],b:[7,8],n:3,r}),
+  ]))
+// fromString recurses once per leading hyphen; CONTRACT.md bounds the count at 1,000.
+add('hyphen-depth','1,000 and 999 leading hyphens, the contract bound for fromString recursion',
+  [1000, 999].flatMap(k => [
+    cmd('fromString',{s:'-'.repeat(k)+'5'}),
+    cmd('fromString',{s:'-'.repeat(k)+'ff',n:16,u:true,r:16}),
+    cmd('fromString',{s:'-'.repeat(k)}),
+    cmd('fromString',{s:'-'.repeat(k)+'NaN'}),
+  ]))
 add('wasm-divide-guard','the pinned default returns the original dividend when high is MIN_INT32 and divisor is -1',
   [0,1,42,-1].map(lo=>cmd('divide',{a:[lo,-2147483648],b:[-1,-1],r:16})))
 let seed=0x4c4f4e47

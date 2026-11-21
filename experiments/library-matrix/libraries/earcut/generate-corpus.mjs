@@ -607,6 +607,30 @@ function buildCases() {
     })
   }
 
+  // A tiny outer square sets the z-order scale, and an 88-vertex spiky hole far to its right
+  // supplies the vertices. The hole's leftmost vertex sits inside the square's y-range so it
+  // bridges. Its other vertices straddle y = minY, so a saturating ToInt32 in zOrder drops
+  // reflex vertices from isEarHashed's z-range walk and changes the triangles.
+  const tinyBoxWithSpikyHole = (seed, s, cx, r) => {
+    const rnd = mulberry32(seed)
+    const cy = Math.round((rnd() - 0.5) * r)
+    const angles = Array.from({ length: 88 }, () => rnd() * 2 * Math.PI).sort((a, b) => a - b)
+    const hole = []
+    let left = 0
+    for (let j = 0; j < angles.length; j++) {
+      const radius = r * (0.1 + 0.9 * rnd())
+      hole.push(Math.round(cx + radius * Math.cos(angles[j])), Math.round(cy + radius * Math.sin(angles[j])))
+      if (hole[2 * j] < hole[2 * left]) left = j
+    }
+    hole[2 * left] = cx - 2 * r
+    hole[2 * left + 1] = s / 2
+    return { op: 'earcut', data: [0, 0, s, 0, s, s, 0, s, ...hole], holeIndices: [4] }
+  }
+  add('earcut-zorder-infinite-scale', 'subnormal 1e-310 outer box: invSize = 32767 / 1e-310 is Infinity, every Morton argument is +-Infinity or NaN, and ToInt32 maps each to 0',
+    tinyBoxWithSpikyHole(8, 1e-310, 1000, 400))
+  add('earcut-zorder-beyond-2-64', '1e-6 outer box and a hole near x = 4e9: Morton arguments of magnitude 2^64 to 2^68 wrap modulo 2^32 exactly',
+    tinyBoxWithSpikyHole(7, 1e-6, 4e9, 1.5e9))
+
   // === 5. Holes, compareXYSlope, block-bbox index (K=16), Steiner points ===
   add('earcut-single-hole', 'README square with single hole', {
     op: 'earcut',

@@ -6,6 +6,8 @@
 
 use alloc::vec;
 
+// PERF-004: a macro so it expands inside the edge loops. See NOTES.md,
+// "Performance accommodations (PERF-004)".
 macro_rules! next_he {
     ($e:expr) => {{
         let e = $e;
@@ -25,11 +27,14 @@ pub fn refine(triangles: &mut [u32], coords: &[f64], dim: usize) {
     }
     let h_mask = size - 1;
 
+    // PERF-004: offset sentinels keep these buffers zero-filled. See NOTES.md,
+    // "Performance accommodations (PERF-004)".
     // `he[e] == 0` means boundary (-1); `he[e] == s + 1` means twin half-edge `s`.
     let mut he = vec![0u32; n];
     let mut edge_stack = vec![0usize; n];
     let mut edge_stamp = vec![0u8; n];
-    // `h_table[h] == 0` means empty; `1` means consumed (-1); `s + 2` means live half-edge `s`.
+    // PERF-004 offset sentinel, as for `he`: `h_table[h] == 0` means empty; `1` means consumed
+    // (-1); `s + 2` means live half-edge `s`.
     let mut h_table = vec![0u32; size];
 
     let he_sl = he.as_mut_slice();

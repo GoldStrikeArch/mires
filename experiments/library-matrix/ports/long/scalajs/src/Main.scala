@@ -8,8 +8,10 @@ import java.lang.{Long as JLong}
 trait Command extends js.Object:
   val op: String = js.native
   val s: String = js.native
-  val n: Int = js.native
-  val r: Int = js.native
+  // JS numbers, as long.js reads them. An Int facade would wrap them with `| 0`, so a radix of
+  // 2^32 + 10 would read as 10.
+  val n: Double = js.native
+  val r: Double = js.native
   val a: js.Array[Int] = js.native
   val b: js.Array[Int] = js.native
   val u: Boolean = js.native
@@ -20,16 +22,21 @@ trait Input extends js.Object:
   val cases: js.Array[Command] = js.native
 
 object Main:
-  private def radix(r: Int): Int =
-    if r == 0 then 10
+  // long.js's radix rules on a JS number: `radix || 10`, then a RangeError outside 2..36.
+  private def radix(r: Double): Int =
+    if r == 0 || r.isNaN then 10
     else if r < 2 || r > 36 then throw new IllegalArgumentException("radix")
-    else r
+    else r.toInt
 
-  private def parse(text: String, base: Int): Long =
+  // long.js's `numBits &= 63` on a JS number: the low six bits of ToInt32(n), which are those of
+  // trunc(n) modulo 64. `%` is exact, and `toInt` maps the NaN of an infinite or NaN count to 0.
+  private def shiftCount(n: Double): Int = (n % 64).toInt & 63
+
+  private def parse(text: String, base: Double): Long =
     if text.isEmpty then throw new IllegalArgumentException("empty string")
     if text == "NaN" || text == "Infinity" || text == "+Infinity" || text == "-Infinity" then return 0L
     val r = radix(base)
-    if text.head == '-' then return -parse(text.tail, r)
+    if text.head == '-' then return -parse(text.tail, r.toDouble)
     if text.contains('-') then throw new IllegalArgumentException("interior hyphen")
     var result = 0L
     var start = 0
@@ -51,7 +58,7 @@ object Main:
       start = end
     result
 
-  private def format(a: Long, unsigned: Boolean, r: Int): String =
+  private def format(a: Long, unsigned: Boolean, r: Double): String =
     if unsigned then JLong.toUnsignedString(a, radix(r)) else JLong.toString(a, radix(r))
 
   private def divide(a: Long, b: Long, unsigned: Boolean): Long =
@@ -83,10 +90,10 @@ object Main:
       case "and" => a & b
       case "or" => a | b
       case "xor" => a ^ b
-      case "shiftLeft" => a << n
-      case "shiftRight" => a >> n
-      case "shiftRightUnsigned" => a >>> n
-      case "rotl" => JLong.rotateLeft(a,n)
+      case "shiftLeft" => a << shiftCount(n)
+      case "shiftRight" => a >> shiftCount(n)
+      case "shiftRightUnsigned" => a >>> shiftCount(n)
+      case "rotl" => JLong.rotateLeft(a,shiftCount(n))
       case "clz" => return JLong.numberOfLeadingZeros(a).toString
       case "ctz" => return JLong.numberOfTrailingZeros(a).toString
       case "compare" => return compare(a,b,c.u,c.v).toString

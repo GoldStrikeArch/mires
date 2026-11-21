@@ -2,23 +2,39 @@ package main
 
 import (
 	"github.com/gopherjs/gopherjs/js"
+	"math"
 	"math/bits"
 	"strconv"
 	"strings"
 )
 
-func base(r int) int {
-	if r == 0 {
-		return 10
+// radix applies long.js's radix rules to a JS number: `radix || 10`, then a
+// RangeError outside 2..36.
+func radix(r float64) (int, bool) {
+	if r == 0 || math.IsNaN(r) {
+		return 10, true
 	}
 	if r < 2 || r > 36 {
-		return -1
+		return 0, false
 	}
-	return r
+	return int(r), true
 }
 
-func parse(s string, r int) (uint64, bool) {
+// shiftCount is long.js's `numBits &= 63` on a JS number: the low six bits of
+// ToInt32(n), which are those of trunc(n) modulo 64. math.Mod is exact and
+// keeps n's sign, and the conversion truncates toward zero, as ToInt32 does.
+// (GopherJS's math.Trunc goes through a 32-bit int, so it is not used.) NaN
+// and the infinities give 0.
+func shiftCount(n float64) uint {
+	if math.IsNaN(n) || math.IsInf(n, 0) {
+		return 0
+	}
+	return uint(int64(math.Mod(n, 64)) & 63)
+}
+
+func parse(s string, base float64) (uint64, bool) {
 	neg := false
+	var r int
 	for {
 		if s == "" {
 			return 0, false
@@ -27,8 +43,8 @@ func parse(s string, r int) (uint64, bool) {
 		case "NaN", "Infinity", "+Infinity", "-Infinity":
 			return 0, true
 		}
-		r = base(r)
-		if r < 0 {
+		var ok bool
+		if r, ok = radix(base); !ok {
 			return 0, false
 		}
 		if s[0] != '-' {
@@ -77,9 +93,9 @@ func asciiLower(c byte) byte {
 	return c
 }
 
-func format(a uint64, u bool, r int) string {
-	r = base(r)
-	if r < 0 {
+func format(a uint64, u bool, base float64) string {
+	r, ok := radix(base)
+	if !ok {
 		return "!"
 	}
 	if u {
@@ -118,7 +134,9 @@ func words(c *js.Object, key string) uint64 {
 }
 func command(c *js.Object) string {
 	a, b := words(c, "a"), words(c, "b")
-	n, r := c.Get("n").Int(), c.Get("r").Int()
+	// n and r stay JS numbers, as long.js reads them: Int() would parse the
+	// number's decimal text, so 1e21 would read as 1.
+	n, r := c.Get("n").Float(), c.Get("r").Float()
 	u, v := c.Get("u").Bool(), c.Get("v").Bool()
 	switch c.Get("op").String() {
 	case "fromBits", "toString":
@@ -155,13 +173,13 @@ func command(c *js.Object) string {
 	case "xor":
 		a ^= b
 	case "shiftLeft":
-		a <<= uint(n & 63)
+		a <<= shiftCount(n)
 	case "shiftRight":
-		a = uint64(int64(a) >> uint(n&63))
+		a = uint64(int64(a) >> shiftCount(n))
 	case "shiftRightUnsigned":
-		a >>= uint(n & 63)
+		a >>= shiftCount(n)
 	case "rotl":
-		a = bits.RotateLeft64(a, n)
+		a = bits.RotateLeft64(a, int(shiftCount(n)))
 	case "clz":
 		return strconv.Itoa(bits.LeadingZeros64(a))
 	case "ctz":
@@ -169,11 +187,11 @@ func command(c *js.Object) string {
 	case "compare":
 		return strconv.Itoa(compare(a, b, u, v))
 	case "mix":
-		if base(r) < 0 {
+		if _, ok := radix(r); !ok {
 			return "!"
 		}
 		var checksum int32
-		for i := 0; i < n; i++ {
+		for i := 0; float64(i) < n; i++ {
 			a = bits.RotateLeft64(a*(b|1)+uint64(i+1), 11) ^ b
 			a += divide(a, uint64(3+(i&255)), u)
 			if i&7 == 0 {

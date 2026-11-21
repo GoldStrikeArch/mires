@@ -19,9 +19,9 @@ index sequences and exact IEEE-754 `f64` values) on every corpus case.
 | Output form | `json` (strict JSON: exact integer arrays, exact IEEE-754 `f64` including `Infinity`/`-0`, plain objects with exact key order), synchronous |
 | Normalisation | none |
 | Parity environments | node, chrome, firefox, safari (unavailable on this machine) |
-| Corpus | `corpus.json`, 90 cases, written deterministically by `generate-corpus.mjs` (`--verify` validates all invariants, mutant killers, and bench variants) |
+| Corpus | `corpus.json`, 92 cases, written deterministically by `generate-corpus.mjs` (`--verify` validates all invariants, mutant killers, and bench variants) |
 | Bench cases | `bench-earcut`, `bench-refine`; `baseIterations` 1; variant `bench-variant.mjs` (per-polygon exact D4 isometry + non-zero integer translation + cyclic ring rotation + hole-order permutation) |
-| Caching | `earcut.js` reuses module-level scratch buffers (`blockBBox`, `sortArr`, `zArr`, `edgeStack`, `he`, `hTable`, `hStamp`, `edgeStamp`) purely to avoid GC churn, resetting them on every call; no cross-call memoisation. Ports allocate per call with zero module-level mutable state. |
+| Caching | `earcut.js` keeps all of its working state in module-level variables: `steiners` (a `Set` of single-vertex hole nodes, cleared at the start of each `earcut` call), the flags `filteredOut` and `indexActive`, the hole-bridge block index `blockBBox`, `numBlocks`, `blockHead` and `blockStop` (rebuilt by `buildBlockIndex` in each `eliminateHoles`), the `sortNodes` scratch `sortArr`, `sortBuf`, `zArr`, `zBuf` and `counts`, and the `refine` scratch `edgeStack`, `he`, `hTable`, `hStamp`, `edgeStamp`, `hMask` and `gen`. Buffers grow on demand. A call writes each one before reading it, except two that carry over in a neutral state: incrementing `gen` makes every older `hStamp` entry read as an empty hash slot, and balanced pushes and pops leave `edgeStamp` all zero. The buffers only avoid GC churn: no result depends on an earlier call. `K = 16` is the only module-level constant. Ports allocate this state per call and keep none between calls; the Elm host keeps only its worker instance, whose model is `()`. |
 | Files | none: neither the adapter nor a port reads files at run time |
 
 ## Input
@@ -103,6 +103,14 @@ preserve the **exact parenthesisation** below and must not introduce fused multi
 Each vertex node holds:
 `{ i: int, x: f64, y: f64, prev: Node, next: Node, z: i32, prevZ: Node?, nextZ: Node?, steiner: bool }`.
 
+npm's `Node` has no `steiner` field. `earcut.js` keeps the Steiner nodes in the module-level
+`Set` named `steiners`: `earcut` clears it on entry, `eliminateHoles` adds a single-vertex hole's
+node, and `filterPoints` tests `steiners.size === 0 || !steiners.has(p)`. This contract, and every
+port, uses a per-node `steiner` flag instead, set at the same point. The two are equivalent: the
+set only ever holds nodes created in the current call, a node enters it at that one point and never
+leaves it during the call, and membership is by node identity, so `steiners.has(p)` is
+`p.steiner` for every node `filterPoints` sees.
+
 - **`insertNode(i, x, y, last)`**: creates node `p` (`z = 0`, `prevZ = nextZ = null`, `steiner = false`).
   If `last == null`: `p.prev = p; p.next = p`. Else inserts `p` immediately after `last` (`p.next = last.next; p.prev = last; last.next.prev = p; last.next = p`). Returns `p`.
 - **`removeNode(p)`**: unlinks `p` from both the ring (`p.next.prev = p.prev; p.prev.next = p.next`)
@@ -162,7 +170,7 @@ return end
 1. For each hole `i = 0..holeIndices.length - 1`:
    - `start = holeIndices[i] * dim`, `end = (i < len - 1) ? holeIndices[i + 1] * dim : data.length`.
    - `list = linkedList(data, start, end, dim, false)`.
-   - If `list === list.next`: mark `list.steiner = true` (preserved through `filterPoints`).
+   - If `list === list.next`: mark `list.steiner = true` (npm: `steiners.add(list)`), which preserves it through `filterPoints`.
    - Push `getLeftmost(list)` to `queue` (`p.x < leftmost.x || (p.x === leftmost.x && p.y < leftmost.y)`, starting at `list`).
 2. **Stable sort** `queue` with `compareXYSlope(a, b)`:
    ```text
@@ -330,7 +338,8 @@ return end
 
 - All coordinates are finite JSON numbers (`-1e12 <= c <= 1e12`).
 - `dim` is an integer `>= 2`, and `data.length % dim === 0` (and `coords.length % dim === 0`).
-- `holeIndices`, when non-null and non-empty, contains valid non-decreasing vertex indices in `[0, data.length / dim)` with `holeIndices[0] > 0` and each hole slice having at least 1 vertex.
+- `holeIndices`, when non-null and non-empty, is a **strictly increasing** list of integer vertex indices with `0 < holeIndices[0]` and every entry `< data.length / dim`. The outer ring and every hole slice therefore have at least one vertex.
+- **Out of domain: empty hole slices.** Two equal entries (`holeIndices: [4, 4, 7]`), or a last entry equal to `data.length / dim` (`[4, 7, 10]` on 10 vertices), give a hole slice with no vertices. npm's `linkedList` returns `undefined` for it, and `eliminateHoles` throws a `TypeError` reading `list.next`. Ports differ: ReScript, Melange, js_of_ocaml and GopherJS throw, Scala.js, Kotlin and Dart put their sentinel `-1` vertex index into the triangles, Rust skips the hole, and Elm does not terminate. The rule above excludes both shapes.
 - `compareXYSlope` never receives a hole triple sharing the same leftmost `(x, y)` where one has `0/0 = NaN` slope and another has a finite slope (which is not a strict weak order in JS).
 - `triangles` passed to `deviation` and `refine` have length divisible by 3 and indices in `[0, coords.length / dim)`.
 
@@ -347,7 +356,7 @@ return end
   - **OCaml (`melange`, `jsoo`), ReScript:** OCaml `int` on JS is 32-bit signed (`lsr` is `>>>`),
     `Int32.mul` or `Math.imul` gives exact wrapping 32-bit multiply.
   - **Rust (`mires`), Scala.js, Kotlin/JS, Go (GopherJS):** native `i32`/`u32` wrapping arithmetic
-    (`wrapping_mul`, `>>` on `u32`). For Morton coordinates outside the signed 32-bit range, truncate toward zero before reducing modulo 2³². Saturating casts change the triangle order in `earcut-zorder-negative-wrap`.
+    (`wrapping_mul`, `>>` on `u32`). For Morton coordinates outside the signed 32-bit range, truncate toward zero before reducing modulo 2³², and map NaN and ±Infinity to 0, as ToInt32 does. Flooring instead of truncating changes the triangles in `earcut-zorder-negative-wrap`. A cast that saturates, at 32 bits or at 64 bits before wrapping, changes them in `earcut-zorder-infinite-scale` (a subnormal outer box makes `invSize` Infinity) and `earcut-zorder-beyond-2-64` (Morton arguments of magnitude 2^64 to 2^68).
 - **Arena-based circular doubly-linked lists (Rust, Elm):** Store `Node`s in a flat append-only
   array/vector (`Vec<Node>` in Rust, `Array Node` in Elm) indexed by `u32`/`Int`, with `NONE = u32::MAX`
   (or `-1`) for `prevZ`/`nextZ`. Never recycle removed node indices during an `earcut` call so dead
@@ -383,7 +392,7 @@ exact triangle counts and work equivalence (`51/51` distinct inputs and outputs 
 
 ## Corpus
 
-90 deterministic cases generated by `generate-corpus.mjs` (covering **44/44** functions in
+92 deterministic cases generated by `generate-corpus.mjs` (covering **44/44** functions in
 `earcut@3.2.4`):
 
 | Group | Cases | What they exercise |
@@ -391,7 +400,7 @@ exact triangle counts and work equivalence (`51/51` distinct inputs and outputs 
 | Empty, tiny & degenerate (`12`) | `earcut-empty`, `earcut-1-vertex`, `earcut-2-vertices`, `earcut-closed-2-vertices`, `earcut-triangle-ccw`, `earcut-triangle-cw`, `earcut-convex-quad`, `earcut-closed-ring`, `earcut-collinear-zero-area`, `earcut-duplicate-consecutive`, `earcut-collinear-edges`, `earcut-zero-bbox-degenerate` | `< 3` vertices early exits, CW/CCW `linkedList` winding normalization, closing-vertex removal, collinear/duplicate healing via `filterPoints`, `filteredOut` stall re-slice, zero-bbox collapse |
 | Concave & unhashed (`5`) | `earcut-concave-lshape`, `earcut-star-10`, `earcut-comb`, `earcut-spiral-small`, `earcut-pinched-outer` | `isEar` unhashed reflex checks, narrow fingers, `pointInTriangle`, pinched shared vertex |
 | Higher dimensions (`2`) | `earcut-dim-3`, `earcut-dim-4-large` | `dim = 3` and `dim = 4` strides (including `data.length > 80 * dim` threshold and holes) |
-| Large & z-order (`9`) | `earcut-threshold-80-unhashed`, `earcut-threshold-81-hashed`, `earcut-large-zero-bbox`, `earcut-large-hilbert`, `earcut-large-spiral-150`, `earcut-zorder-insertion-sort`, `earcut-zorder-negative-wrap`, `earcut-large-coords`, `earcut-tiny-scale` | Exact `80 * dim` vs `81 * dim` threshold, `invSize === 0` fallback, `zOrder`, `sortNodes` both `n > 32` 4-pass LSD radix sort and `n <= 32` insertion sort, `isEarHashed` `prevZ`/`nextZ`, `1e6` and `1e-9` coordinate scales, negative Morton overflow |
+| Large & z-order (`11`) | `earcut-threshold-80-unhashed`, `earcut-threshold-81-hashed`, `earcut-large-zero-bbox`, `earcut-large-hilbert`, `earcut-large-spiral-150`, `earcut-zorder-insertion-sort`, `earcut-zorder-negative-wrap`, `earcut-large-coords`, `earcut-tiny-scale`, `earcut-zorder-infinite-scale`, `earcut-zorder-beyond-2-64` | Exact `80 * dim` vs `81 * dim` threshold, `invSize === 0` fallback, `zOrder`, `sortNodes` both `n > 32` 4-pass LSD radix sort and `n <= 32` insertion sort, `isEarHashed` `prevZ`/`nextZ`, `1e6` and `1e-9` coordinate scales, negative Morton overflow, ToInt32 of an Infinity scale and of Morton arguments past 2^64 (a saturating conversion at 32 or 64 bits fails both) |
 | Holes, block-bbox & Steiner (`19`) | `earcut-hole-leftmost-y-tie`, `earcut-single-hole`, `earcut-empty-hole-indices`, `earcut-null-hole-indices`, `earcut-hole-windings`, `earcut-multiple-holes-unsorted`, `earcut-holes-same-x-diff-y`, `earcut-holes-shared-leftmost-slope`, `earcut-holes-vertical-edge-slope`, `earcut-hole-touches-outer-vertex`, `earcut-hole-touches-outer-edge`, `earcut-hole-t-junction-horizontal`, `earcut-hole-sector-contains`, `earcut-hole-reflex-bridge-angle`, `earcut-hole-steiner-single`, `earcut-hole-steiner-multiple`, `earcut-hole-collinear-growblock`, `earcut-many-holes-block-index`, `earcut-hole-outside-left` | `compareXYSlope` (`x`, `y`, finite slope, `±Infinity` vertical slope), `findHoleBridge` (`equals`, `x === hx`, horizontal reflex T-junction, Eberly triangle `tanMin`/`p.x`/`sectorContainsSector` returning `true`), `steiners` preservation, `K = 16` block-bbox index, `indexActive` + `growBlock` all 4 bounds + `liveBlockHead`/`liveBlockStop`, `null` bridge fallback |
 | Recovery stages (`9`) | `earcut-cure-local-hourglass`, `earcut-cure-local-intersection`, `earcut-cure-local-ribbon`, `earcut-self-intersecting-pentagram`, `earcut-self-intersecting-local-loop`, `earcut-split-earcut-twisted`, `earcut-split-earcut-pinched`, `earcut-split-earcut-hashed`, `earcut-split-earcut-zerolen-collinear` | `cureLocalIntersections` (`cured = true`, `filterPoints(p)`), `splitEarcut`, `isValidDiagonal`, `intersects` (both crossing and `onSegment` collinear), `intersectsPolygon`, `middleInside`, `splitPolygon`, recursive hashed `earcutLinked` |
 | `deviation` (`9`) | `deviation-exact-zero`, `deviation-with-holes`, `deviation-dim-3`, `deviation-missing-triangle`, `deviation-extra-overlap`, `deviation-empty-degenerate`, `deviation-empty-nonzero`, `deviation-roundoff-zero-area`, `deviation-zero-polygon-nonzero-tris` | Exact `0`, multi-hole `holeIndices[i + 1]`, `dim = 3`, fractional & overlapping areas, empty-triangles `EPSILON` threshold (`0` vs `1`), zero-area polygon → `Infinity` |
