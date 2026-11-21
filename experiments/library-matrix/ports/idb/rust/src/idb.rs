@@ -7,6 +7,7 @@
 //! settled by idb's own listener logic (`wrap`, `cache_done`).
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::future::{Future, IntoFuture};
 use core::marker::PhantomData;
 use core::pin::Pin;
@@ -84,6 +85,10 @@ impl<T> Request<T> {
     /// Handles a rejection nobody awaits, as `promise.catch(() => {})` does.
     pub fn ignore(self) {
         host::ignore_rejection(self.promise);
+    }
+
+    pub(crate) fn promise(&self) -> JsValue {
+        self.promise
     }
 }
 
@@ -196,40 +201,30 @@ impl Method {
         }
     }
 
-    /// Calls the host method, unwrapped; `undefined` arguments count as absent.
-    pub fn call(self, source: JsValue, first: JsValue, second: JsValue) -> Result<JsValue, JsValue> {
-        match self {
-            Method::Get => host::get(source, first),
-            Method::GetKey => host::get_key(source, first),
-            Method::GetAll => host::get_all(source, first, second),
-            Method::GetAllKeys => host::get_all_keys(source, first, second),
-            Method::Count => host::count(source, first),
-            Method::Put => host::put(source, first, second),
-            Method::Add => host::add(source, first, second),
-            Method::Delete => host::delete(source, first),
-            Method::Clear => host::clear(source),
-        }
+    /// Calls the host method, unwrapped, forwarding the exact positional arguments given.
+    pub fn call(self, source: JsValue, args: &[JsValue]) -> Result<JsValue, JsValue> {
+        host::call_method(source, self.name(), args)
     }
 }
 
 /// Methods an object store and an index share.
 pub trait Source: Wrapped {
     /// A wrapped request method: issued now, settled later.
-    fn request<T: FromResult>(&self, method: Method, first: JsValue, second: JsValue) -> Result<Request<T>, DomError> {
-        Ok(wrap(fallible(method.call(self.raw(), first, second))?))
+    fn request<T: FromResult>(&self, method: Method, args: &[JsValue]) -> Result<Request<T>, DomError> {
+        Ok(wrap(fallible(method.call(self.raw(), args))?))
     }
 
-    fn open_cursor(&self, query: JsValue, direction: JsValue) -> Result<Request<Option<Cursor>>, DomError> {
-        Ok(wrap(fallible(host::open_cursor(self.raw(), query, direction))?))
+    fn open_cursor(&self, args: &[JsValue]) -> Result<Request<Option<Cursor>>, DomError> {
+        Ok(wrap(fallible(host::call_method(self.raw(), "openCursor", args))?))
     }
 
-    fn open_key_cursor(&self, query: JsValue, direction: JsValue) -> Result<Request<Option<Cursor>>, DomError> {
-        Ok(wrap(fallible(host::open_key_cursor(self.raw(), query, direction))?))
+    fn open_key_cursor(&self, args: &[JsValue]) -> Result<Request<Option<Cursor>>, DomError> {
+        Ok(wrap(fallible(host::call_method(self.raw(), "openKeyCursor", args))?))
     }
 
-    /// idb's async iterator over `openCursor(query, direction)`.
-    fn iterate(&self, query: JsValue, direction: JsValue) -> Iterate {
-        Iterate { source: self.raw(), query, direction, state: IterState::Unopened, advanced: None }
+    /// idb's async iterator over `openCursor(...args)`.
+    fn iterate(&self, args: Vec<JsValue>) -> Iterate {
+        Iterate { source: self.raw(), args, state: IterState::Unopened, advanced: None }
     }
 
     fn name(&self) -> JsString {
@@ -281,14 +276,14 @@ impl Database {
     /// `Promise.all([request, isWrite && tx.done])`, so a write resolves only after `done`, the
     /// request's error comes first, and both promises are handled. Everything up to the request is
     /// done now; a synchronous failure rejects the call.
-    pub fn shortcut(&self, method: Method, store: &str, index: Option<&str>, first: JsValue, second: JsValue)
+    pub fn shortcut(&self, method: Method, store: &str, index: Option<&str>, args: &[JsValue])
         -> impl Future<Output = Result<Option<JsValue>, DomError>> {
         let issued = (|| {
             let tx = self.transaction(JsValue::erase(store), JsValue::erase(if method.is_write() { "readwrite" } else { "readonly" }))?;
             let target = tx.store()?.expect("a one-store transaction has a store");
             let request: Request<JsValue> = match index {
-                Some(index) => target.index(index)?.request(method, first, second)?,
-                None => target.request(method, first, second)?,
+                Some(index) => target.index(index)?.request(method, args)?,
+                None => target.request(method, args)?,
             };
             let done = if method.is_write() { tx.done } else { JsValue::erase(false) };
             Ok(Request::<JsValue>::new(host::promise_all(host::list(&[request.promise, done]))))
@@ -454,8 +449,7 @@ enum IterState {
 /// `continue()` when the body made none.
 pub struct Iterate {
     source: JsValue,
-    query: JsValue,
-    direction: JsValue,
+    args: Vec<JsValue>,
     state: IterState,
     advanced: Option<Request<Option<Cursor>>>,
 }
@@ -464,7 +458,7 @@ impl Iterate {
     pub async fn next(&mut self) -> Result<Option<IterCursor<'_>>, DomError> {
         let state = core::mem::replace(&mut self.state, IterState::Finished);
         let next = match state {
-            IterState::Unopened => wrap(fallible(host::open_cursor(self.source, self.query, self.direction))?).await?,
+            IterState::Unopened => wrap(fallible(host::call_method(self.source, "openCursor", &self.args))?).await?,
             IterState::At(cursor) => match self.advanced.take() {
                 Some(moved) => moved.await?,
                 None => cursor.continue_to(JsValue::undefined())?.await?,

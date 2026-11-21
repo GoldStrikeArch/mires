@@ -19,7 +19,7 @@ Hand-written port of idb 8.0.4 (`build/index.js`) to the contract in `libraries/
 
 ## Boundary
 
-The input is decoded once into enums and structs: steps, upgrade calls, cursor actions, targets and key-range descriptors. Store, index, connection and database names become Rust `String`s. Keys, values, versions, counts, directions, modes and IndexedDB options stay `JsValue` and reach IndexedDB unchanged. So `null` stays distinct from an absent field, numbers past 2^32 are not narrowed, and a deep value is never walked. The log is a host array that the open callbacks append to. The result is a plain object, `{ log, databases }`.
+The input is decoded once into enums and structs: steps, upgrade calls, cursor actions, targets and key-range descriptors. Store, index, connection and database names become Rust `String`s. Keys, values, versions, counts, directions, modes and IndexedDB options stay `JsValue` and reach IndexedDB unchanged. So `null` stays distinct from an absent field, numbers past 2^32 are not narrowed, and a deep value is never walked. Request and cursor methods forward their exact positional argument list through `Reflect.apply` (`host::call_method`) without padding omitted arguments with `undefined`, so missing required arguments throw `TypeError` as in idb. Only the query-first methods (`get`, `getKey`, `getAll`, `getAllKeys`, `count`, `delete`, `openCursor`, `openKeyCursor`, `iterate`) decode an object first argument as a key range; `put`, `add` and `clear` pass plain values. The log is a host array that the open callbacks append to. The result is a plain object, `{ log, databases }`.
 
 ## Errors and cleanup
 
@@ -38,7 +38,7 @@ A host exception never unwinds the future. A throwing host call returns `Err(Dom
 
 `Database::shortcut` follows `getMethod` literally. It takes `tx.store`, then the index for the `FromIndex` forms, and awaits the host `Promise.all([request, isWrite && tx.done])`. So `done`'s rejection is handled when the request fails first.
 
-An upgrade write is issued and not awaited. Its promise is marked handled with `Request::ignore`, as the reference's `.catch(() => {})` does. A transaction whose `done` nobody awaits leaves that promise unhandled, as idb does.
+An upgrade write is issued and not awaited. Its promise is marked handled with `Request::ignore`, as the reference's `.catch(() => {})` does. `batch` passes every issued request promise (plus `tx.done` when `done: true`) to host `Promise.allSettled` synchronously before awaiting, matching `reference.mjs` so no promise rejects unhandled before its turn in the log. A transaction whose `done` nobody awaits leaves that promise unhandled, as idb does.
 
 ## Inputs outside the contract
 
@@ -48,4 +48,4 @@ The difference is cleanup. A decoding panic happens before any database is opene
 
 ## Size
 
-The bundle is 158 KB after Terser. It is a script interpreter over the full contract subset, plus an async state machine per step kind. No performance accommodations.
+The bundle is 166 KB after Terser. It is a script interpreter over the full contract subset, plus an async state machine per step kind. No performance accommodations.

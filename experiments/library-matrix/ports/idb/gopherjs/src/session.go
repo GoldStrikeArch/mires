@@ -171,18 +171,43 @@ func issue(tx *Transaction, r RequestStep) (Promise, error) {
 
 // --- Steps ---
 
+// performAll runs steps in order without growing the JS call stack on synchronous steps (close,
+// store, abort, or caught synchronous host errors): in Firefox SpiderMonkey caps Error().stack at
+// 128 frames, which breaks GopherJS's $recover() check in catch() if synchronous steps recurse.
 func (s *session) performAll(steps []Step, tx *Transaction, done func(error)) {
-	if len(steps) == 0 {
-		done(nil)
-		return
-	}
-	s.perform(steps[0], tx, func(err error) {
-		if err != nil {
-			done(err)
-			return
+	index := 0
+	var advance func()
+	advance = func() {
+		for index < len(steps) {
+			current := steps[index]
+			index++
+			sync := true
+			settled := false
+			var syncErr error
+			s.perform(current, tx, func(err error) {
+				if sync {
+					settled = true
+					syncErr = err
+					return
+				}
+				if err != nil {
+					done(err)
+					return
+				}
+				advance()
+			})
+			sync = false
+			if !settled {
+				return
+			}
+			if syncErr != nil {
+				done(syncErr)
+				return
+			}
 		}
-		s.performAll(steps[1:], tx, done)
-	})
+		done(nil)
+	}
+	advance()
 }
 
 func (s *session) perform(step Step, tx *Transaction, done func(error)) {

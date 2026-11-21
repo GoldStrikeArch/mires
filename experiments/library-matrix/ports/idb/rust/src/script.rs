@@ -114,13 +114,8 @@ pub enum Action {
     Break,
 }
 
-/// A call's arguments; an absent one is `undefined`. A query method's first argument is a key
-/// or a key range.
-#[derive(Clone)]
-pub struct Args {
-    pub first: Option<Argument>,
-    pub second: JsValue,
-}
+/// A call's positional arguments; a query method's first argument is a key or a key range.
+pub type Args = Vec<Argument>;
 
 #[derive(Clone)]
 pub enum Argument {
@@ -233,10 +228,9 @@ fn upgrade(value: JsValue) -> Upgrade {
         "createIndex" => Upgrade::CreateIndex { store: store(), name: name(), key_path: field(value, "keyPath"), options: field(value, "options") },
         "deleteIndex" => Upgrade::DeleteIndex { store: store(), name: name() },
         "abort" => Upgrade::Abort,
-        write => {
-            let method = method(write);
-            Upgrade::Write { method, store: store(), args: args(method, field(value, "args")) }
-        }
+        "put" => Upgrade::Write { method: Method::Put, store: store(), args: plain_args(field(value, "args")) },
+        "add" => Upgrade::Write { method: Method::Add, store: store(), args: plain_args(field(value, "args")) },
+        _ => panic!("not an upgrade step"),
     }
 }
 
@@ -285,16 +279,25 @@ fn action(value: JsValue) -> Action {
     }
 }
 
-/// Put and add take a value and a key; every other method takes a query first.
+/// Put, add and clear take plain arguments; every other request method takes a query first.
 fn args(method: Method, list: JsValue) -> Args {
     match method {
-        Method::Put | Method::Add => Args { first: (length(list) > 0).then(|| Argument::Value(at(list, 0))), second: at(list, 1) },
+        Method::Put | Method::Add | Method::Clear => plain_args(list),
         _ => query_args(list),
     }
 }
 
+fn plain_args(list: JsValue) -> Args {
+    items(list, Argument::Value)
+}
+
 fn query_args(list: JsValue) -> Args {
-    Args { first: (length(list) > 0).then(|| query(at(list, 0))), second: at(list, 1) }
+    (0..length(list))
+        .map(|i| {
+            let value = at(list, i);
+            if i == 0 { query(value) } else { Argument::Value(value) }
+        })
+        .collect()
 }
 
 /// A key is passed as it is (null included); an object is a key range.

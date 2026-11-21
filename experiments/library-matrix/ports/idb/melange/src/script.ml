@@ -134,13 +134,13 @@ let query key =
         | None, None, upper -> Upper_bound (upper, flag "upperOpen")))
   | Null | Bool _ | Number _ | String _ | Array _ -> Value key
 
-(* The first argument of a query method is a query; [put] and [add] take a value and a key. *)
+(* The first argument of a query method is a query; [put], [add] and [clear] take plain arguments. *)
 let query_args = function first :: rest -> query first :: List.map (fun arg -> Value arg) rest | [] -> []
 
 let args (meth : Idb.meth) values =
   match meth with
-  | Put | Add -> List.map (fun value -> Value value) values
-  | Get | Get_key | Get_all | Get_all_keys | Count | Delete | Clear -> query_args values
+  | Put | Add | Clear -> List.map (fun value -> Value value) values
+  | Get | Get_key | Get_all | Get_all_keys | Count | Delete -> query_args values
 
 let target json = { store = name_or_null json "store"; index = name_or_null json "index" }
 let request json meth = { meth; target = target json; args = args meth (items json "args") }

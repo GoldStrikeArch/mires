@@ -81,28 +81,8 @@ js_bindings! {
     pub fn create_index(store: JsValue, name: &str, key_path: JsValue, options: JsValue) -> Result<JsValue, JsValue>;
     #[js(method = "deleteIndex", fallible)]
     pub fn delete_index(store: JsValue, name: &str) -> Result<JsValue, JsValue>;
-    #[js(method = "get", fallible)]
-    pub fn get(source: JsValue, query: JsValue) -> Result<JsValue, JsValue>;
-    #[js(method = "getKey", fallible)]
-    pub fn get_key(source: JsValue, query: JsValue) -> Result<JsValue, JsValue>;
-    #[js(method = "getAll", fallible)]
-    pub fn get_all(source: JsValue, query: JsValue, count: JsValue) -> Result<JsValue, JsValue>;
-    #[js(method = "getAllKeys", fallible)]
-    pub fn get_all_keys(source: JsValue, query: JsValue, count: JsValue) -> Result<JsValue, JsValue>;
-    #[js(method = "count", fallible)]
-    pub fn count(source: JsValue, query: JsValue) -> Result<JsValue, JsValue>;
-    #[js(method = "put", fallible)]
-    pub fn put(store: JsValue, value: JsValue, key: JsValue) -> Result<JsValue, JsValue>;
-    #[js(method = "add", fallible)]
-    pub fn add(store: JsValue, value: JsValue, key: JsValue) -> Result<JsValue, JsValue>;
-    #[js(method = "delete", fallible)]
-    pub fn delete(store: JsValue, query: JsValue) -> Result<JsValue, JsValue>;
-    #[js(method = "clear", fallible)]
-    pub fn clear(store: JsValue) -> Result<JsValue, JsValue>;
-    #[js(method = "openCursor", fallible)]
-    pub fn open_cursor(source: JsValue, query: JsValue, direction: JsValue) -> Result<JsValue, JsValue>;
-    #[js(method = "openKeyCursor", fallible)]
-    pub fn open_key_cursor(source: JsValue, query: JsValue, direction: JsValue) -> Result<JsValue, JsValue>;
+    #[js(call = "Reflect.apply", fallible)]
+    fn reflect_apply(target: JsValue, this_arg: JsValue, args: JsValue) -> Result<JsValue, JsValue>;
 
     // IDBCursor and IDBCursorWithValue.
     #[js(get = "key")]
@@ -143,6 +123,8 @@ js_bindings! {
     pub fn promise(executor: JsValue) -> JsValue;
     #[js(call = "Promise.all")]
     pub fn promise_all(promises: JsValue) -> JsValue;
+    #[js(call = "Promise.allSettled")]
+    pub fn promise_all_settled(promises: JsValue) -> JsValue;
     #[js(method = "catch")]
     fn catch(promise: JsValue, handler: JsValue) -> JsValue;
     #[js(new = "DOMException")]
@@ -161,6 +143,11 @@ js_bindings! {
     pub fn is_array(value: JsValue) -> bool;
     #[js(index_set)]
     fn set_field(object: JsValue, key: &str, value: JsValue);
+}
+
+/// Calls `target[method](...args)` with the exact positional argument count given.
+pub fn call_method(target: JsValue, method: &str, args: &[JsValue]) -> Result<JsValue, JsValue> {
+    reflect_apply(field(target, method), target, list(args))
 }
 
 /// Calls a Promise executor's `resolve` or `reject`.

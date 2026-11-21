@@ -9,7 +9,7 @@
 | Output form | `json`, async: `{ log: Entry[], databases: Dump[] }` ("Output"); key order significant |
 | Normalisation | none (see "Normalisation") |
 | Parity environments | chrome, firefox, safari (IndexedDB; Node has none). Safari has not been run: no WebDriver session was available, so WebKit's error names for the edge cases are unverified |
-| Corpus | `corpus.json`, 78 cases |
+| Corpus | `corpus.json`, 83 cases |
 | Bench cases | `bench-transactions`, baseIterations 1, variant `bench-variant.mjs` |
 | Caching | idb keeps module-level WeakMaps keyed by IDB objects (wrappers, `done` promises, iterator cursors). A port may cache by host object the same way, never by input |
 | Files | none |
@@ -150,13 +150,15 @@ They run synchronously inside the upgrade callback, in order. A failure is logge
 
 The other arguments are passed as they are: `put(value, key?)`, a `getAll` count, a cursor direction, a transaction mode. Numbers are never narrowed, so `getAll(null, 2 ** 32)` throws TypeError where a port that wraps to 32 bits would return everything.
 
-An absent argument is omitted or passed as `undefined`, never as `null`, because WebIDL treats only `undefined` as missing (`null-arguments`):
+On *optional* WebIDL parameters, an absent argument is omitted or passed as `undefined`, never as `null`, because WebIDL treats only `undefined` as missing (`null-arguments`):
 
 - `put(value, null)` throws DataError;
 - `openCursor(query, null)` and `transaction(stores, null)` throw TypeError;
 - Chrome and Firefox both treat `continue(null)` as `continue()`.
 
-A port whose "nothing" becomes JS `null` must pass `undefined` instead: Kotlin/JS `null`, Dart `JSAny?` `null`, Scala.js `null` rather than `js.undefined`, GopherJS `nil`. The same holds for an absent `version`, `options` or `key`.
+On *required* WebIDL parameters (`get`, `getKey`, `delete`, `put`, `add`, `advance`, `continuePrimaryKey`, `update`), passing `undefined` is **not** equivalent to omitting the argument: omitting throws `TypeError`, whereas passing `undefined` supplies the value `undefined` (for example, `put(undefined)` succeeds and stores `undefined` on an `autoIncrement` store, and `get(undefined)` throws `DataError`). Ports must therefore forward the exact positional argument list without padding omitted arguments with `undefined` (`arity-get-put-delete-wrap`). `clear` is excluded from the query-first list above, so an object argument is passed through unchanged rather than parsed as a key range (`clear-with-object-arg`).
+
+For optional parameters, a port whose "nothing" becomes JS `null` must pass `undefined` instead: Kotlin/JS `null`, Dart `JSAny?` `null`, Scala.js `null` rather than `js.undefined`, GopherJS `nil`. The same holds for an absent `version`, `options` or `key`.
 
 ### Cursor walks
 
@@ -303,7 +305,7 @@ The host passes the corpus input and the database-name prefix (from `crypto.rand
 Case classes:
 
 - lifecycle and versioning, 19 cases: upgrades, version errors, versions past 2^32, upgrade aborts, `blocking` and `blocked`, `deleteDB`, the dump order;
-- transactions and requests, 24 cases: the store and index methods, null and key-range queries, null arguments, batches with ConstraintError, abort and synchronous failures, `tx.store`, `done`, nested transactions, failure scoping, error order;
+- transactions and requests, 29 cases: the store and index methods, null and key-range queries, null arguments, exact positional arity, `clear` non-query arguments, batches with ConstraintError, abort and synchronous failures, `tx.store`, `done`, nested transactions, failure scoping, error order, and long synchronous step/error runs;
 - cursors, 15 cases;
 - the async iterator, 7 cases;
 - database shortcuts, 5 cases;
@@ -356,6 +358,11 @@ Error paths that fail after databases were opened, uncaught so the script ends a
 - `nested-readonly`: Two readonly transactions run together; the inner one reads while the outer is still active.
 - `abort-then-use`: Explicit abort after an awaited put: done rejects, a second abort throws InvalidStateError.
 - `done-rejects-uncaught`: An uncaught tx.done rejection ends the script after the abort.
+- `arity-get-put-delete-wrap`: Missing required positional arguments are omitted, never padded with undefined: put, add, get, getKey, delete, wrap, shortcuts and upgrade put throw TypeError.
+- `clear-with-object-arg`: clear is not a query-first method: passing an object argument clears the store instead of building a key range.
+- `err-20`: 25 consecutive caught synchronous host errors in one transaction do not overflow the stack or break exception recovery.
+- `stress-sync-500`: 500 synchronous store reads and 100 caught synchronous errors in one transaction run without stack overflow.
+- `batch-sync-and-async-mixed`: A batch mixing synchronous throws, async rejections, abort and done logs every outcome in issue order with no unhandled rejections.
 - `cursor-store`: Store cursor with continue, ascending and descending.
 - `cursor-index`: Index cursor: key, primary key and value; unique directions skip duplicates.
 - `cursor-advance`: advance(2), advance(1.5) which IndexedDB truncates to 1, and advance past the end.

@@ -7,11 +7,11 @@ use alloc::vec::Vec;
 use core::future::Future;
 use core::pin::Pin;
 
-use mires_js::{JsArray, JsValue};
+use mires_js::{await_promise, JsArray, JsValue};
 
 use crate::host::{self, list};
-use crate::idb::{self, settle, Cursor, Database, DomError, Index, Method, ObjectStore, OpenCallbacks, Request, Source, Transaction, Wrapped};
-use crate::script::{self, Action, Argument, Args, Blocked, Blocking, Op, OpenDb, Query, Step, Target, Upgrade, Walk, WalkKind};
+use crate::idb::{self, settle, Cursor, Database, DomError, FromResult, Index, Method, ObjectStore, OpenCallbacks, Request, Source, Transaction, Wrapped};
+use crate::script::{self, Action, Argument, Blocked, Blocking, Op, OpenDb, Query, Step, Target, Upgrade, Walk, WalkKind};
 
 fn s(text: &str) -> JsValue {
     JsValue::erase(text)
@@ -99,26 +99,26 @@ fn key_range(query: &Query) -> Result<JsValue, DomError> {
     .map_err(DomError)
 }
 
-fn arguments(args: &Args) -> Result<(JsValue, JsValue), DomError> {
-    let first = match &args.first {
-        None => JsValue::undefined(),
-        Some(Argument::Value(value)) => *value,
-        Some(Argument::Query(query)) => key_range(query)?,
-    };
-    Ok((first, args.second))
+fn arguments(args: &[Argument]) -> Result<Vec<JsValue>, DomError> {
+    args.iter()
+        .map(|arg| match arg {
+            Argument::Value(value) => Ok(*value),
+            Argument::Query(query) => key_range(query),
+        })
+        .collect()
 }
 
-fn request(tx: Transaction, method: Method, target: &Target, args: &Args) -> Result<Request<Option<JsValue>>, DomError> {
+fn request(tx: Transaction, method: Method, target: &Target, args: &[Argument]) -> Result<Request<Option<JsValue>>, DomError> {
     let source = endpoint(tx, target)?;
-    let (first, second) = arguments(args)?;
-    source.request(method, first, second)
+    let args = arguments(args)?;
+    source.request(method, &args)
 }
 
 /// `wrap(unwrap(source)[method](...))`: a raw IndexedDB request, promisified.
 fn raw_request(tx: Transaction, step: &script::Request) -> Result<Request<Option<JsValue>>, DomError> {
     let raw = idb::unwrap(&endpoint(tx, &step.target)?);
-    let (first, second) = arguments(&step.args)?;
-    Ok(idb::wrap(step.method.call(raw, first, second).map_err(DomError)?))
+    let args = arguments(&step.args)?;
+    Ok(idb::wrap(step.method.call(raw, &args).map_err(DomError)?))
 }
 
 fn remember(names: &mut Vec<String>, name: &str) {
@@ -196,7 +196,7 @@ impl Session {
             }
             Op::Shortcut { conn, label, method, store, index, args } => {
                 let outcome = match arguments(args) {
-                    Ok((first, second)) => self.connection(conn).shortcut(*method, store, index.as_deref(), first, second).await,
+                    Ok(args) => self.connection(conn).shortcut(*method, store, index.as_deref(), &args).await,
                     Err(error) => Err(error),
                 };
                 log.outcome(label, outcome)
@@ -319,8 +319,8 @@ fn upgrade(log: Log, op: &Upgrade, db: Database, tx: Transaction) {
         Upgrade::Write { method, store, args } => {
             // Issued and not awaited: only a synchronous failure is logged.
             let issued = tx.object_store(store).and_then(|store| {
-                let (first, second) = arguments(args)?;
-                store.request::<()>(*method, first, second)
+                let args = arguments(args)?;
+                store.request::<()>(*method, &args)
             });
             match issued {
                 Ok(request) => request.ignore(),
@@ -334,19 +334,39 @@ fn upgrade(log: Log, op: &Upgrade, db: Database, tx: Transaction) {
 
 /// Issues every request before awaiting any, then logs each outcome in issue order. Never fails.
 async fn batch(log: Log, tx: Transaction, requests: &[script::Request], abort: bool, done: bool) {
-    let issued: Vec<_> = requests.iter().map(|step| (step.method.name(), request(tx, step.method, &step.target, &step.args))).collect();
+    let mut issued = Vec::with_capacity(requests.len() + usize::from(done));
+    let mut promises = JsArray::new();
+    for step in requests {
+        let outcome = request(tx, step.method, &step.target, &step.args).map(|req| {
+            promises.push(req.promise());
+        });
+        issued.push((step.method.name(), outcome));
+    }
     if abort {
         let _ = log.outcome("abort", tx.abort().map(|()| None));
     }
-    for (label, request) in issued {
-        let outcome = match request {
-            Ok(request) => request.await,
+    if done {
+        promises.push(tx.done().promise());
+        issued.push(("done", Ok(())));
+    }
+    let Ok(outcomes) = await_promise(host::promise_all_settled(promises.as_value())).await else {
+        unreachable!("Promise.allSettled never rejects");
+    };
+    let mut index = 0;
+    for (label, outcome) in issued {
+        let settled = match outcome {
+            Ok(()) => {
+                let entry = host::at(outcomes, index);
+                index += 1;
+                if host::field(entry, "status").read::<&str>() == "rejected" {
+                    Err(DomError(host::field(entry, "reason")))
+                } else {
+                    Ok(Option::<JsValue>::from_result(host::field(entry, "value")))
+                }
+            }
             Err(error) => Err(error),
         };
-        let _ = log.outcome(label, outcome);
-    }
-    if done {
-        let _ = log.outcome("done", tx.done().await.map(|()| None));
+        let _ = log.outcome(label, settled);
     }
 }
 
@@ -370,10 +390,10 @@ async fn write(log: Log, cursor: Cursor, action: &Action) -> Result<(), Failed> 
 async fn cursor_walk(log: Log, tx: Transaction, walk: &Walk) -> Result<(), Failed> {
     let label = walk.label();
     let opened = endpoint(tx, &walk.target).and_then(|source| {
-        let (query, direction) = arguments(&walk.args)?;
+        let args = arguments(&walk.args)?;
         match walk.kind {
-            WalkKind::KeyCursor => source.open_key_cursor(query, direction),
-            _ => source.open_cursor(query, direction),
+            WalkKind::KeyCursor => source.open_key_cursor(&args),
+            _ => source.open_cursor(&args),
         }
     });
     let mut cursor = log.check(label, settle(opened).await)?;
@@ -406,8 +426,8 @@ async fn cursor_walk(log: Log, tx: Transaction, walk: &Walk) -> Result<(), Faile
 /// The async iterator: a move only records the next step, and a position without one continues.
 async fn iterate(log: Log, tx: Transaction, walk: &Walk) -> Result<(), Failed> {
     let made = endpoint(tx, &walk.target).and_then(|source| {
-        let (query, direction) = arguments(&walk.args)?;
-        Ok(source.iterate(query, direction))
+        let args = arguments(&walk.args)?;
+        Ok(source.iterate(args))
     });
     let mut iterator = log.check("iterate", made)?;
     let mut at = 0;
@@ -451,8 +471,8 @@ async fn stores(db: Database) -> Result<JsValue, DomError> {
             let index = store.index(index_names.get(j).read::<&str>())?;
             indexes.push(list(&[index_names.get(j), index.key_path(), JsValue::erase(index.unique()), JsValue::erase(index.multi_entry())]));
         }
-        let keys = store.request::<JsValue>(Method::GetAllKeys, JsValue::undefined(), JsValue::undefined())?.await?;
-        let values = store.request::<JsValue>(Method::GetAll, JsValue::undefined(), JsValue::undefined())?.await?;
+        let keys = store.request::<JsValue>(Method::GetAllKeys, &[])?.await?;
+        let values = store.request::<JsValue>(Method::GetAll, &[])?.await?;
         let mut records = JsArray::new();
         for k in 0..host::length(keys) {
             records.push(list(&[host::at(keys, k), host::at(values, k)]));

@@ -17,7 +17,7 @@ The interpreter calls only `Idb`, except for the raw request of the `wrap` step 
 
 ## Boundary
 
-`Script.decode` reads the input once, through `Host.classify` and `Host.member`, into variants and records: steps, upgrade steps, cursor actions, targets and key-range descriptors. It rejects anything outside the schema (an unknown step, request method, upgrade step or cursor action, a `FromIndex` form of a write method, a field of the wrong type) with a TypeError, before any database is opened. Names become OCaml strings. Keys, values, versions, counts, directions, modes and options stay `Host.value`s and reach IndexedDB as they are, so `null` stays a value and numbers are never narrowed. The log is built as a list of JS arrays, and the result is the plain object `{log, databases}`.
+`Script.decode` reads the input once, through `Host.classify` and `Host.member`, into variants and records: steps, upgrade steps, cursor actions, targets and key-range descriptors. Only the query-first methods (`get`, `getKey`, `getAll`, `getAllKeys`, `count`, `delete`, `openCursor`, `openKeyCursor`, `iterate`) decode an object first argument as a key range; `put`, `add` and `clear` pass plain values. It rejects anything outside the schema (an unknown step, request method, upgrade step or cursor action, a `FromIndex` form of a write method, a field of the wrong type) with a TypeError, before any database is opened. Names become OCaml strings. Keys, values, versions, counts, directions, modes and options stay `Host.value`s and reach IndexedDB as they are, so `null` stays a value and numbers are never narrowed. The log is built as a list of JS arrays, and the result is the plain object `{log, databases}`.
 
 ## Promises and failures
 

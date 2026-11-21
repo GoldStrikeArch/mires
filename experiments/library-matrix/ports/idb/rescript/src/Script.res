@@ -157,12 +157,12 @@ let query = (key: JSON.t) =>
   | _ => Value(key)
   }
 
-/** The first argument of a query method is a query; `put` and `add` take a value and a key. */
+/** The first argument of a query method is a query; `put`, `add` and `clear` take plain arguments. */
 let queryArgs = args => args->Array.mapWithIndex((arg, i) => i == 0 ? query(arg) : Value(arg))
 let args = (method: Idb.method, args) =>
   switch method {
-  | Put | Add => args->Array.map(arg => Value(arg))
-  | Get | GetKey | GetAll | GetAllKeys | Count | Delete | Clear => queryArgs(args)
+  | Put | Add | Clear => args->Array.map(arg => Value(arg))
+  | Get | GetKey | GetAll | GetAllKeys | Count | Delete => queryArgs(args)
   }
 
 let target = fields => {store: fields->nameOrNull("store"), index: fields->nameOrNull("index")}

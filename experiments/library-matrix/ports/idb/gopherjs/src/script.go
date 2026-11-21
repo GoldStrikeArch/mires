@@ -290,10 +290,10 @@ func queryArgs(values []*js.Object) []any {
 	return args
 }
 
-// args reads a request's arguments: put and add take a value and a key, every other method a
+// args reads a request's arguments: put, add and clear take plain arguments, every other method a
 // query first.
 func args(m Method, values []*js.Object) []any {
-	if m == Put || m == Add {
+	if m == Put || m == Add || m == Clear {
 		return plain(values)
 	}
 	return queryArgs(values)

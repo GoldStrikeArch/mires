@@ -238,6 +238,41 @@ add('abort-then-use', 'Explicit abort after an awaited put: done rejects, a seco
 add('done-rejects-uncaught', 'An uncaught tx.done rejection ends the script after the abort.', [
   main(), write([put(null, row(1, 'a', 'one')), simple('abort'), simple('done'), put(null, row(2, 'a', 'never'))]),
 ])
+add('arity-get-put-delete-wrap', 'Missing required positional arguments are omitted, never padded with undefined: put, add, get, getKey, delete, wrap, shortcuts and upgrade put throw TypeError.', [
+  main(), fill(),
+  read([caught(request('get', null, [])), caught(request('getKey', null, [])), caught(request('delete', null, [])),
+    request('count', null, []), caught(raw(null, 'get', []))]),
+  open('auto', 1, [createStore('free', { autoIncrement: true })]),
+  tx('auto', 'free', 'readwrite', [caught(request('put', null, [])), caught(request('add', null, [])), request('count', null, [])]),
+  call('main', 'get', 'rows', null, [], { catch: true }),
+  call('main', 'getFromIndex', 'rows', 'byGroup', [], { catch: true }),
+  call('main', 'delete', 'rows', null, [], { catch: true }),
+  call('auto', 'put', 'free', null, [], { catch: true }),
+  call('auto', 'count', 'free', null, []),
+  open('up', 1, [createStore('free', { autoIncrement: true }), upgradeWrite('put', 'free')], { catch: true }),
+  call('up', 'count', 'free', null, []),
+])
+add('clear-with-object-arg', 'clear is not a query-first method: passing an object argument clears the store instead of building a key range.', [
+  main(), fill(),
+  write([caught(request('clear', null, [{ only: null }])), request('count', null, []), simple('done')]),
+  fill(),
+  call('main', 'clear', 'rows', null, [{ only: null }], { catch: true }),
+  call('main', 'count', 'rows', null, []),
+])
+add('err-20', '25 consecutive caught synchronous host errors in one transaction do not overflow the stack or break exception recovery.', [
+  main(), read([...Array.from({ length: 25 }, () => caught(get(null, null))), request('count', null, [])]),
+])
+add('stress-sync-500', '500 synchronous store reads and 100 caught synchronous errors in one transaction run without stack overflow.', [
+  main(), fill(),
+  read([...Array.from({ length: 500 }, () => simple('store')), ...Array.from({ length: 100 }, () => caught(get(null, null))),
+    request('count', null, [])]),
+])
+add('batch-sync-and-async-mixed', 'A batch mixing synchronous throws, async rejections, abort and done logs every outcome in issue order with no unhandled rejections.', [
+  main(), fill(),
+  write([batch([put(null, row(10, 'z', 'ten')), put(null, { group: 'no-id' }), addRow(null, rows[0]),
+    put(null, row(11, 'z', 'eleven'))], { done: true })]),
+  write([batch([put(null, { group: 'no-id' }), put(null, row(12, 'z', 'twelve'))], { abort: true, done: true })]),
+])
 
 // --- Cursors ---
 
