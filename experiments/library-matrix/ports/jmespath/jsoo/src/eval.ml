@@ -82,7 +82,8 @@ let rec eval n v=
   |"NotExpression"->bool(falsy(arg 0))
   |"MultiSelectHash"|"MultiSelectList"->if strict v nil then nil else let hash=k="MultiSelectHash"in let out=if hash then obj()else array()in
     let cs=get n "children"in for i=0 to length cs-1 do let c=at cs i in if hash then put out(get c "name")(eval(get c "value")v)else push out(eval c v)done;out
-  |"ExpressionReference"->let c=child n 0 in set c "jmespathType"(str "Expref");c
+  |"ExpressionReference"->let c=child n 0 in
+    if strict c nil || strict c und then syntax();set c "jmespathType"(str "Expref");c
   |"Function"->let args=array()and cs=get n "children"in
     for i=0 to length cs-1 do push args(eval(at cs i)v)done;let name=get n "name"in if typeof name<>"string"then raise(Error "unknown-function");call (text name) args
   |_->syntax()

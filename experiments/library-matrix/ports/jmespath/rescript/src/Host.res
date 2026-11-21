@@ -70,15 +70,6 @@ let elementAt = (array: array<value>, index: float) =>
 @val external parseJson: string => value = "JSON.parse"
 @val external stringify: value => value = "JSON.stringify"
 
-// Stack exhaustion, which the reference adapter lets propagate rather than file as "syntax": the
-// engine's RangeError "Maximum call stack size exceeded" (V8, JavaScriptCore) or InternalError
-// "too much recursion" (SpiderMonkey).
-let stackExhausted = (error: JsExn.t) =>
-  switch (JsExn.name(error), JsExn.message(error)) {
-  | (Some("RangeError"), Some(message)) => message->String.includes("call stack")
-  | (Some("InternalError"), Some(message)) => message->String.includes("too much recursion")
-  | _ => false
-  }
 @val external parseInt: string => float = "parseInt"
 
 // `Number(value)`: the unary `+` that `to_number` applies to strings.

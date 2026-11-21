@@ -45,7 +45,5 @@ let math_max (a:float) (b:float):float=Js.float_of_number(Js.Unsafe.coerce(scope
 let math_min (a:float) (b:float):float=Js.float_of_number(Js.Unsafe.coerce(scoped "Math" "min" [|num a;num b|]))
 (* Array.prototype.sort with an OCaml comparator, in place *)
 let sort_with a compare=ignore(meth a "sort" [|box(Js.wrap_callback(fun x y->Js.number_of_float(compare x y)))|])
-(* Stack exhaustion, which the reference adapter lets propagate rather than file as "syntax".
-   js_of_ocaml raises Stack_overflow for the engine's RangeError "Maximum call stack size exceeded"
-   (V8, JavaScriptCore) and InternalError "too much recursion" (SpiderMonkey). *)
-let stack_exhausted=function Stack_overflow->true|_->false
+(* JSON.parse's SyntaxError, which js_of_ocaml hands over as Js_error.Exn *)
+let syntax_error=function Js.Js_error.Exn e->Js.Js_error.name e="SyntaxError"|_->false

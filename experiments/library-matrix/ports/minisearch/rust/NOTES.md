@@ -79,14 +79,17 @@ MIRES-003 workarounds adds 2,978 more. The figures the matrix reports are in
 `build/library-matrix/sizes.json` and `MATRIX.md`. By the optimizer report (about 352 KB of
 program, in Rollup bytes before Terser), about 21 KB is Unicode lower-casing (core's conversion
 tables, `Cased`/`Case_Ignorable` for Final_Sigma, `to_lowercase`). The single stable-sort
-instantiation is 14.7 KB. `core::fmt` reached from panic paths is 6.6 KB: `Vec::remove`'s
+instantiation is 14.9 KB: `alloc::slice::sort_by`, its closure and the 23 `core::slice::sort`
+items. `core::fmt` reached from panic paths is 6.6 KB: `Vec::remove`'s
 `assert_failed` formats its indices, and `Rc<[T]>`'s layout calls `unwrap`. The rest is the port
 and its generic instantiations (`Vec`, iterator adapters, `Option`, drop glue, the host-map
 wrappers).
 
-Every sort goes through one `sort_by` on positions (`index.rs` `stable_order`): under mires each
-instantiation of core's driftsort is about 18 KB of JavaScript, and five element types (hits,
-suggestions, `match` entries, tokens, serialized fields) cost 89.5 KB before this was shared.
+Every sort goes through one `sort_by` on positions (`index.rs` `stable_order`). Under mires each
+instantiation of core's driftsort is 13–15 KB of JavaScript. The optimizer report of the
+2026-11-21 build gives 14.9 KB here and 13.8 KB in d3-hierarchy's Rust port. Five element types
+(hits, suggestions, `match` entries, tokens, serialized fields) cost 89.5 KB before this was
+shared, on the compiler of the time.
 
 ## Performance
 

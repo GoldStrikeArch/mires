@@ -14,7 +14,9 @@ This port is written by hand. The earlier port was a Go transliteration of the s
 
 ## Boundary
 
-The input is a `*js.Object` read in place. The document stays the JS value it is, because jmespath returns parts of it and compares them by identity. Each expression stays a JS string. Each result is a plain object: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give. Stack exhaustion is not a category: it propagates out of `run`, as it does out of the reference adapter (`stackExhausted` in `host.go` recognises the engine's RangeError or InternalError in the recovered `*js.Error`, and `query` and `parseJSON` panic with it again).
+The input is a `*js.Object` read in place. The document stays the JS value it is, because jmespath returns parts of it and compares them by identity. Each expression stays a JS string. Each result is a plain object: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give.
+
+Only jmespath's own errors become categories: the `*Error` values, among them `JSON.parse`'s SyntaxError, which `parseJSON` recovers into a syntax error. Nothing else is recovered. A panic propagates out of `run` and fails the check, as anything thrown does out of the reference adapter. That includes stack exhaustion (GopherJS re-throws the original JS exception), a JS exception from another host call, and a fault in the port. A port fault therefore cannot pass for a syntax error.
 
 ## Interop decisions
 
@@ -44,7 +46,7 @@ The input is a `*js.Object` read in place. The document stays the JS value it is
 
 None changes a result in the parity domain.
 
-- **jmespath's engine TypeErrors are explicit errors here.** jmespath reaches a TypeError, which its adapter files as "syntax", when it visits a missing node, reads `left.name` of a missing node, or sets `jmespathType` on one. The port returns a syntax error at those points. A panic out of a host call is recovered in `query` as "syntax", as `category()` does.
+- **jmespath's engine TypeErrors are explicit errors here.** jmespath reaches a TypeError, which its adapter files as "syntax", when it visits a missing node, reads `left.name` of a missing node, or sets `jmespathType` on one. The port returns a syntax error at those points.
 - **A lone `=` fails in the lexer.** jmespath pushes `undefined` as a token there and fails when the parser reaches it. The category is the same.
 - **Error messages differ.** They are not compared.
 - **`reverse` of a string is `split("").reverse().join("")`.** jmespath concatenates code units in a loop; the result is the same string.

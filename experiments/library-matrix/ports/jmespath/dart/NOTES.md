@@ -14,7 +14,9 @@ This port is written by hand. It replaces the earlier port that `build/library-m
 
 ## Boundary
 
-The input is the JS object itself, seen through `dart:js_interop` extension types, with no copy. The document stays the JS value it is (`JSAny?`), because jmespath returns parts of it and compares them by identity. Each expression is a Dart string, which on the web is the same JS string. Each result is a plain `JSObject`: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give. Stack exhaustion is not a category: it propagates out of `run`, as it does out of the reference adapter (dart2js catches it as a `StackOverflowError`, which `_query` rethrows).
+The input is the JS object itself, seen through `dart:js_interop` extension types, with no copy. The document stays the JS value it is (`JSAny?`), because jmespath returns parts of it and compares them by identity. Each expression is a Dart string, which on the web is the same JS string. Each result is a plain `JSObject`: `{ value }`, or `{ error }` with the category that `reference.mjs`'s `category()` would give.
+
+Only jmespath's own errors become categories: `JmesPathException`, among them `JSON.parse`'s SyntaxError, which the lexer's `_parseJson` turns into a syntax error. There is no catch-all. Anything else thrown inside a query propagates out of `run` and fails the check, as it does out of the reference adapter. That includes stack exhaustion, which dart2js sees as a `StackOverflowError`, and a fault in the port, so a port fault cannot pass for a syntax error.
 
 ## Interop decisions
 
@@ -46,7 +48,7 @@ The input is the JS object itself, seen through `dart:js_interop` extension type
 
 None changes a result in the parity domain.
 
-- **jmespath's engine TypeErrors are explicit errors here.** jmespath reaches a TypeError, which its adapter files as "syntax", when it visits a missing node, reads `left.name` of a missing node, or sets `jmespathType` on one. The port raises a syntax `JmesPathException` at those points. `run` still files every other exception as "syntax", as `category()` does.
+- **jmespath's engine TypeErrors are explicit errors here.** jmespath reaches a TypeError, which its adapter files as "syntax", when it visits a missing node, reads `left.name` of a missing node, or sets `jmespathType` on one. The port raises a syntax `JmesPathException` at those points.
 - **A lone `=` fails in the lexer.** jmespath pushes `undefined` as a token there and fails when the parser reaches it. The category is the same.
 - **Error messages differ.** They are not compared.
 - **`merge`'s `for (key in current)` is written per type.** A string gives its indices and code units, an object or array gives `Object.keys` and values, and anything else gives nothing. dart2js would reject reading a property of a JS primitive through `JSObject`.

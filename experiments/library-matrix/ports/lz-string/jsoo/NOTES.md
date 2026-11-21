@@ -71,7 +71,7 @@ single units. The corpus cases `keys-*` and `decode-keys-*` exercise it.
   compares only that both threw.
 - **`roundtrip` with null data.** The reference adapter throws, because it reads `.length` of the
   decoder's `null`. The port returns an empty array, as it does for null data in every operation.
-  `roundtrip` is the benchmark operation, and the corpus never passes it null.
+  `roundtrip` is the benchmark operation, and CONTRACT.md excludes null data from it.
 
 ## Module state
 

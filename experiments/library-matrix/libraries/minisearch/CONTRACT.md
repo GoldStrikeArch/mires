@@ -631,7 +631,9 @@ is a worked example of every point.
 `Box<[T]>::from(&[T])` are `MIRES-001` to `MIRES-004` in `MIRES-BUGS.md`, with repros under
 `mires-bugs/MIRES-00N-*/`. Write the natural Rust for them. A new bug gets the next `MIRES-NNN`, a
 repro and a `// WORKAROUND(MIRES-NNN)` tag (`MIRES-BUGS.md`, "Policy"). `u128`/`u64` are BigInts;
-`Range::contains` allocates; each `sort_by` instantiation is about 18 KB.
+`Range::contains` allocates; each `sort_by` instantiation (core's driftsort) is 13–15 KB of
+unminified JavaScript (14.9 KB in the minisearch port and 13.8 KB in d3-hierarchy's, by the
+optimizer report of 2026-11-21).
 
 **ReScript / Melange.** JS strings are UTF-16 natively: `String.length`, `charCodeAt`, `slice`.
 The host `RegExp` with the `u` flag (`%re("/[\\n\\r\\p{Z}\\p{P}]+/u")` / `Js.Re.fromStringWithFlags`)

@@ -38,19 +38,14 @@ JSArray<JSObject> run(Input input) => [
       for (final query in input.queries.toDart) _query(query, input.data),
     ].toJS;
 
+/// One query, as the reference adapter runs it. Only jmespath's errors become categories: anything
+/// else thrown (stack exhaustion, a fault in the port) propagates out of [run], as it does out of
+/// the reference adapter.
 JSObject _query(Query query, JSAny? data) {
   try {
     return _result('value', query.op == 'compile' ? compile(query.expression) : search(data, query.expression));
   } on JmesPathException catch (e) {
     return _result('error', e.category.label.toJS);
-  } on StackOverflowError {
-    // An exhausted stack propagates, as it does from the reference adapter. dart2js catches the
-    // engine's RangeError "Maximum call stack size exceeded" (V8, JavaScriptCore) and InternalError
-    // "too much recursion" (SpiderMonkey) as a StackOverflowError.
-    rethrow;
-  } catch (_) {
-    // The reference's category() default: JSON.parse's SyntaxError and engine errors.
-    return _result('error', ErrorCategory.syntax.label.toJS);
   }
 }
 

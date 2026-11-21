@@ -989,6 +989,22 @@
       }
     },
     {
+      "id": "regress-depth-inline-100",
+      "note": "100 nested inline containers, the parity domain's inline nesting bound: link text around em, strong and del, one recursive inlineTokens and parseInline per level",
+      "input": {
+        "op": "parse",
+        "markdown": "[*a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a x b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b*](https://example.com/u)\n"
+      }
+    },
+    {
+      "id": "regress-depth-list-100-inline-100",
+      "note": "100 nested inline containers in the innermost of 100 nested lists: the block and inline bounds hold separately, and the renderer stacks the two recursions",
+      "input": {
+        "op": "parse",
+        "markdown": "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a *a **a ~~a _a __a x b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b* b__ b_ b~~ b** b*\n"
+      }
+    },
+    {
       "id": "bench-parse",
       "note": "Mixed CommonMark+GFM technical handbook (~52 KB) under default options",
       "input": {

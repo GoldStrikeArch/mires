@@ -137,7 +137,7 @@ internal class Lexer {
         current++
         skipQuoted(stream, '"')
         current++
-        return parseJson(stream.substring(start, minOf(current, stream.length)))
+        return parseJsonToken(stream.substring(start, minOf(current, stream.length)))
     }
 
     /** An unterminated raw string runs to the end of the expression, as in jmespath. */
@@ -196,9 +196,19 @@ internal class Lexer {
         val start = current
         skipQuoted(stream, '`')
         val literalString = stream.substring(start, current).trimStart(::isJsWhiteSpace).replaceFirst("\\`", "`")
-        val literal = if (looksLikeJson(literalString)) parseJson(literalString) else parseJson("\"$literalString\"")
+        val literal = if (looksLikeJson(literalString)) parseJsonToken(literalString) else parseJsonToken("\"$literalString\"")
         current++
         return literal
+    }
+
+    /**
+     * `JSON.parse`, whose SyntaxError `category()` files as "syntax". Anything else it throws, such
+     * as stack exhaustion on a deep literal, propagates.
+     */
+    private fun parseJsonToken(text: String): Any? = try {
+        parseJson(text)
+    } catch (e: Throwable) {
+        throw if (e.isSyntaxError()) syntaxError("Invalid JSON: $text") else e
     }
 
     private fun looksLikeJson(literalString: String): Boolean = when {

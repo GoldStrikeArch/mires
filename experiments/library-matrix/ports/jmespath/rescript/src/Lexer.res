@@ -100,6 +100,14 @@ let trimLeft = text => {
   text->String.slice(~start=start.contents)
 }
 
+// `JSON.parse`, whose SyntaxError `category()` files as "syntax". Anything else it throws, such as
+// stack exhaustion on a deep literal, propagates.
+let parseJsonToken = text =>
+  try parseJson(text) catch {
+  | JsExn(error) if JsExn.name(error) == Some("SyntaxError") =>
+    throw(Errors.syntaxError("Invalid JSON: " ++ text))
+  }
+
 let looksLikeJson = literalString =>
   if literalString == "" {
     false
@@ -147,7 +155,7 @@ let tokenize = (stream: string): array<token> => {
     current := current.contents + 1
     skipQuoted("\"")
     current := current.contents + 1
-    parseJson(stream->String.slice(~start, ~end=current.contents))
+    parseJsonToken(stream->String.slice(~start, ~end=current.contents))
   }
 
   // An unterminated raw string runs to the end of the expression, as in jmespath.
@@ -212,8 +220,8 @@ let tokenize = (stream: string): array<token> => {
     let literalString =
       stream->String.slice(~start, ~end=current.contents)->trimLeft->String.replace("\\`", "`")
     let literal = looksLikeJson(literalString)
-      ? parseJson(literalString)
-      : parseJson("\"" ++ literalString ++ "\"")
+      ? parseJsonToken(literalString)
+      : parseJsonToken("\"" ++ literalString ++ "\"")
     current := current.contents + 1
     literal
   }

@@ -10,11 +10,7 @@
 
 package main
 
-import (
-	"strings"
-
-	"github.com/gopherjs/gopherjs/js"
-)
+import "github.com/gopherjs/gopherjs/js"
 
 var (
 	jsObject       = js.Global.Get("Object")
@@ -89,37 +85,21 @@ func parseInt(text *js.Object) *js.Object { return js.Global.Call("parseInt", te
 
 func stringify(v *js.Object) *js.Object { return jsJSON.Call("stringify", v) }
 
-// parseJSON is JSON.parse, whose SyntaxError is a jmespath syntax error.
+// parseJSON is JSON.parse, whose SyntaxError is a jmespath syntax error, as category() files it.
+// Anything else it throws (stack exhaustion on a deep literal) propagates: GopherJS recovers a JS
+// exception as a *js.Error, and a re-panic with it that no one recovers throws the original
+// exception out to JS.
 func parseJSON(text *js.Object) (value *js.Object, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			if stackExhausted(r) {
-				panic(r)
+			if e, ok := r.(*js.Error); ok && e.Get("name").String() == "SyntaxError" {
+				value, err = nil, syntaxError("invalid JSON")
+				return
 			}
-			value, err = nil, syntaxError("invalid JSON")
+			panic(r)
 		}
 	}()
 	return jsJSON.Call("parse", text), nil
-}
-
-// stackExhausted reports whether a recovered panic is the engine's stack exhaustion, which the
-// reference adapter lets propagate rather than file as "syntax": a RangeError "Maximum call stack
-// size exceeded" (V8, JavaScriptCore) or an InternalError "too much recursion" (SpiderMonkey).
-// GopherJS recovers a JS exception as a *js.Error, and a re-panic with it that no one recovers
-// throws the original exception out to JS.
-func stackExhausted(r any) bool {
-	err, ok := r.(*js.Error)
-	if !ok {
-		return false
-	}
-	message := err.Get("message").String()
-	switch err.Get("name").String() {
-	case "RangeError":
-		return strings.Contains(message, "call stack")
-	case "InternalError":
-		return strings.Contains(message, "too much recursion")
-	}
-	return false
 }
 
 // compareCodeUnits orders two JS strings as JS's < does: by UTF-16 code unit.

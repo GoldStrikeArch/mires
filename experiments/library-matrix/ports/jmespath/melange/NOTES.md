@@ -2,7 +2,7 @@
 
 A port of `jmespath.js` 0.16.0 (the subset in `libraries/jmespath/CONTRACT.md`) to OCaml 5.3, compiled by Melange 7.0.1. It is not a rewrite: the pre-merge review's findings were fixed in place.
 
-**Shared source.** `src/parser.ml` and `src/eval.ml` are byte-identical in the Melange and js_of_ocaml ports (README "Per-language notes"). Only `src/host.ml` differs, as the per-compiler interop module. See `ports/jmespath/jsoo/NOTES.md` for the other side.
+**Shared source.** `src/parser.ml`, `src/eval.ml` and `src/program.ml` are byte-identical in the Melange and js_of_ocaml ports (README "Per-language notes"). Only `src/host.ml` differs, as the per-compiler interop module. See `ports/jmespath/jsoo/NOTES.md` for the other side.
 
 | File | What it is |
 | --- | --- |
@@ -13,7 +13,9 @@ A port of `jmespath.js` 0.16.0 (the subset in `libraries/jmespath/CONTRACT.md`) 
 
 ## Boundary
 
-Native Pratt parsing, projection evaluation and typed built-ins operate on host JSON values. They keep UTF-16 string semantics and JavaScript object semantics. Each result is `{ value }`, or `{ error }` with the reference adapter's category. Any other exception inside a query becomes "syntax", as `category()` does. Stack exhaustion is the exception: `Host.stack_exhausted` recognises the engine's RangeError or InternalError, which Melange hands over as `Js.Exn.Error`, and `run` and `json_value` raise it again, as the reference adapter lets it propagate.
+Native Pratt parsing, projection evaluation and typed built-ins operate on host JSON values. They keep UTF-16 string semantics and JavaScript object semantics. Each result is `{ value }`, or `{ error }` with the reference adapter's category.
+
+Only jmespath's own errors become categories: `Parser.Error`, raised by the parser and interpreter, and `JSON.parse`'s SyntaxError, which Melange hands over as `Js.Exn.Error` and `json_value` turns into a syntax error (`Host.syntax_error`). There is no catch-all. Any other exception inside a query propagates out of `run` and fails the check, as it does out of the reference adapter. That includes stack exhaustion and a fault in the port, so a port fault cannot pass for a syntax error.
 
 ## Review fixes (2026-11-20)
 

@@ -155,7 +155,7 @@ class Lexer {
     _current++;
     _skipQuoted(stream, '"');
     _current++;
-    return parseJson(stream.substring(start, _current < stream.length ? _current : stream.length));
+    return _parseJson(stream.substring(start, _current < stream.length ? _current : stream.length));
   }
 
   /// An unterminated raw string runs to the end of the expression, as in jmespath.
@@ -213,9 +213,20 @@ class Lexer {
     final start = _current;
     _skipQuoted(stream, '`');
     final literalString = _trimLeft(stream.substring(start, _current)).replaceFirst(r'\`', '`');
-    final literal = _looksLikeJson(literalString) ? parseJson(literalString) : parseJson('"$literalString"');
+    final literal = _looksLikeJson(literalString) ? _parseJson(literalString) : _parseJson('"$literalString"');
     _current++;
     return literal;
+  }
+
+  /// `JSON.parse`, whose SyntaxError `category()` files as "syntax". Anything else it throws, such
+  /// as stack exhaustion on a deep literal, propagates.
+  JSAny? _parseJson(String text) {
+    try {
+      return parseJson(text);
+    } on JSObject catch (error) {
+      if (error.instanceOfString('SyntaxError')) throw syntaxError('Invalid JSON: $text');
+      rethrow;
+    }
   }
 
   bool _looksLikeJson(String literalString) {

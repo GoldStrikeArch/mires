@@ -11,7 +11,8 @@ let list xs=let a=array()in List.iter(fun v->push a v)xs;a
 let children t xs=let n=node t in set n "children"(list xs);n
 let is_alpha c=(c>=65&&c<=90)||(c>=97&&c<=122)||c=95
 let digit c=c>=48&&c<=57
-let json_value v=try parse v with e when stack_exhausted e->raise e|_->syntax()
+(* JSON.parse, whose SyntaxError category() files as "syntax"; anything else it raises propagates *)
+let json_value v=try parse v with e when syntax_error e->syntax()
 let lex source=
   let n=length source and i=ref 0 and tokens=ref []in
   let add k v=tokens:={kind=k;value=v}::!tokens in

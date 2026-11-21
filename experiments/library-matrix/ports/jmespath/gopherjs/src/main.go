@@ -25,20 +25,10 @@ func search(data, expression *js.Object) (*js.Object, error) {
 	return visit(ast, data)
 }
 
-// query runs one query as reference.mjs does. A panic is an engine error inside a host call (a
-// TypeError on a malformed node), which the reference's category() files as syntax, unless it is
-// stack exhaustion, which propagates as it does from the reference.
-func query(q, data *js.Object) (result *js.Object) {
-	result = newObject()
-	defer func() {
-		if r := recover(); r != nil {
-			if stackExhausted(r) {
-				panic(r)
-			}
-			result = newObject()
-			result.Set("error", categorySyntax)
-		}
-	}()
+// query runs one query as reference.mjs does. Only jmespath's errors become categories. Nothing
+// recovers a panic (stack exhaustion, an exception from a host call, a fault in the port): it
+// propagates out of run, as anything else thrown does out of the reference adapter.
+func query(q, data *js.Object) *js.Object {
 	var value *js.Object
 	var err error
 	if q.Get("op").String() == "compile" {
@@ -46,14 +36,14 @@ func query(q, data *js.Object) (result *js.Object) {
 	} else {
 		value, err = search(data, q.Get("expression"))
 	}
-	if err != nil {
-		category := categorySyntax
-		if e, ok := err.(*Error); ok {
-			category = e.Category
-		}
-		result.Set("error", category)
-	} else {
+	result := newObject()
+	switch e := err.(type) {
+	case nil:
 		result.Set("value", value)
+	case *Error:
+		result.Set("error", e.Category)
+	default:
+		panic(err)
 	}
 	return result
 }

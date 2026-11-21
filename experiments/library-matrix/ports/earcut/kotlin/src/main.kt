@@ -25,13 +25,14 @@ private fun triangulate(polygon: Polygon, refine: Boolean): Array<Int> {
 private external class PlainObject()
 
 private fun flatten(rings: Array<Array<Array<Double>>>): dynamic {
-    val dimensions = rings[0][0].size
-    val vertices = mutableListOf<Double>()
+    val dimensions = rings.first().first().size
+    val vertices = mutableListOf<Double?>()
     val holes = mutableListOf<Int>()
     var previousLength = 0
     var offset = 0
     for (ring in rings) {
-        for (point in ring) for (d in 0 until dimensions) vertices.add(point[d])
+        // npm pushes `p[d]`: a point shorter than the first contributes undefined for each missing component.
+        for (point in ring) for (d in 0 until dimensions) vertices.add(if (d < point.size) point[d] else undefined)
         if (previousLength > 0) {
             offset += previousLength
             holes.add(offset)

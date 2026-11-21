@@ -27,15 +27,13 @@ object Main:
   /** jmespath's `search`: a fresh parser and interpreter per call. */
   def search(data: js.Any, expression: String): js.Any = TreeInterpreter().search(Parser().parse(expression), data)
 
+  /** The reference adapter's `run`. Only jmespath's errors become categories: anything else thrown
+    * (stack exhaustion, a fault in the port) propagates, as it does out of the reference adapter.
+    */
   @JSExportTopLevel("run")
   def run(input: Input): js.Array[js.Dictionary[js.Any]] = input.queries.map { query =>
     try
       val value: js.Any = if query.op == "compile" then compile(query.expression).asInstanceOf[js.Any] else search(input.data, query.expression)
       js.Dictionary("value" -> value)
-    catch
-      case e: JmesPathException => js.Dictionary[js.Any]("error" -> e.category.label)
-      // An exhausted stack propagates, as it does from the reference adapter.
-      case e: Throwable if Host.isStackExhaustion(e) => throw e
-      // The reference's category() default: JSON.parse's SyntaxError and engine errors.
-      case _: Throwable => js.Dictionary[js.Any]("error" -> ErrorCategory.Syntax.label)
+    catch case e: JmesPathException => js.Dictionary[js.Any]("error" -> e.category.label)
   }

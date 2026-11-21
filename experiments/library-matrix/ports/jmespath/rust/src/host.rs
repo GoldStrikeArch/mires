@@ -52,19 +52,9 @@ pub fn children(t: &str, a: &[V]) -> V {
 pub fn child(n: V, i: usize) -> V {
     at(field(n, "children"), i)
 }
-/// Stack exhaustion, which the reference adapter lets propagate rather than file as "syntax": a
-/// RangeError "Maximum call stack size exceeded" (V8, JavaScriptCore) or an InternalError "too much
-/// recursion" (SpiderMonkey).
-pub fn stack_exhausted(error: V) -> bool {
-    if !error.is_error() {
-        return false;
-    }
-    let message = text(string(field(error, "message")));
-    match text(string(field(error, "name"))) {
-        "RangeError" => message.contains("call stack"),
-        "InternalError" => message.contains("too much recursion"),
-        _ => false,
-    }
+/// The SyntaxError of `JSON.parse`.
+pub fn is_syntax_error(error: V) -> bool {
+    error.is_error() && field(error, "name").strictly_equals(s("SyntaxError"))
 }
 
 js_bindings! {

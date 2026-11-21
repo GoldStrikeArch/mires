@@ -15,11 +15,13 @@ fn is_alpha(c: u32) -> bool {
 fn digit(c: u32) -> bool {
     (48..=57).contains(&c)
 }
+/// `JSON.parse`, whose SyntaxError `category()` files as "syntax". Anything else it throws, such as
+/// stack exhaustion on a deep literal, propagates.
 fn json(v: V) -> Answer {
     match try_host(|| parse_json(v)) {
         Ok(value) => Ok(value),
-        Err(error) if stack_exhausted(error) => throw_value(error),
-        Err(_) => Err("syntax"),
+        Err(error) if is_syntax_error(error) => Err("syntax"),
+        Err(error) => throw_value(error),
     }
 }
 

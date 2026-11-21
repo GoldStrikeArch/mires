@@ -33,8 +33,9 @@ benchmark variants.
 - **Zero cross-call mutable state.** Unlike `earcut.js` (which reuses module-level scratch arrays),
   this port allocates per call with zero `static` mutable state (`0` module-state lint findings).
 - **No `core::slice::sort` and no `core::fmt`.** `stable_sort_holes` uses a compact stable
-  insertion + bottom-up merge sort (avoiding ~18 KB per `core::slice::sort` instantiation under
-  `mires`), and panics/errors use static strings.
+  insertion + bottom-up merge sort, and panics/errors use static strings. Under mires one
+  `core::slice::sort` instantiation is 13–15 KB of JavaScript: 14.9 KB in the minisearch Rust port
+  and 13.8 KB in d3-hierarchy's, by the optimizer report of 2026-11-21.
 - **Steiner flag.** npm keeps single-vertex holes in a module-level `Set` named `steiners`; the
   port uses the per-node `steiner` flag that `libraries/earcut/CONTRACT.md` describes and shows
   equivalent ("Vertex `Node`").

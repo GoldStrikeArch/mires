@@ -1225,6 +1225,25 @@ add('regress-depth-blockquote-100', '100 nested blockquotes, the parity domain\'
   op: 'parse',
   markdown: `${'>'.repeat(100)} a\n`,
 })
+// `levels` inline containers around `core`, cycling the delimiters whose content marked lexes and
+// renders recursively: *em*, **strong**, ~~del~~, _em_ and __strong__.
+function nestedInline(levels, core) {
+  const delimiters = ['*', '**', '~~', '_', '__']
+  let text = core
+  for (let level = levels - 1; level >= 0; level--) {
+    const d = delimiters[level % delimiters.length]
+    text = `${d}a ${text} b${d}`
+  }
+  return text
+}
+add('regress-depth-inline-100', '100 nested inline containers, the parity domain\'s inline nesting bound: link text around em, strong and del, one recursive inlineTokens and parseInline per level', {
+  op: 'parse',
+  markdown: `[${nestedInline(99, 'x')}](https://example.com/u)\n`,
+})
+add('regress-depth-list-100-inline-100', '100 nested inline containers in the innermost of 100 nested lists: the block and inline bounds hold separately, and the renderer stacks the two recursions', {
+  op: 'parse',
+  markdown: `${'- '.repeat(100)}${nestedInline(100, 'x')}\n`,
+})
 
 // 14. Bench cases (2)
 const benchParseMd = makeBenchParse(0x18112026, 32)
@@ -1340,6 +1359,10 @@ if (process.argv.includes('--verify')) {
   assert(outputs.get('regress-size-emphasis').split('<em>').length === 5001, 'size case must render 5,000 emphasis runs')
   assert(outputs.get('regress-depth-list-100').split('<ul>').length === 101, 'depth case must render 100 nested lists')
   assert(outputs.get('regress-depth-blockquote-100').split('<blockquote>').length === 101, 'depth case must render 100 nested blockquotes')
+  const inlineLevels = (html) => ['<em>', '<strong>', '<del>', '<a '].reduce((sum, tag) => sum + html.split(tag).length - 1, 0)
+  assert(inlineLevels(outputs.get('regress-depth-inline-100')) === 100, 'depth case must render 100 nested inline containers')
+  assert(outputs.get('regress-depth-list-100-inline-100').split('<ul>').length === 101, 'depth case must render 100 nested lists')
+  assert(inlineLevels(outputs.get('regress-depth-list-100-inline-100')) === 100, 'depth case must render 100 nested inline containers')
   assert(outputs.get('images-text-renderer').includes('alt="bold em code del lnk sub &lt;b&gt;h&lt;/b&gt; ab * &amp; A &quot;q&quot;"'), `unexpected TextRenderer alt: ${outputs.get('images-text-renderer')}`)
 
   // Verify bench-variant for k = 1..50 on both bench cases

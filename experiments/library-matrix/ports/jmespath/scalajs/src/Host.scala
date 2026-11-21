@@ -65,18 +65,6 @@ private[jmespath] object Host:
 
   def parseJson(text: String): js.Any = js.JSON.parse(text)
 
-  /** Stack exhaustion, which the reference adapter lets propagate rather than file as "syntax": the
-    * engine's RangeError "Maximum call stack size exceeded" (V8, JavaScriptCore) or InternalError
-    * "too much recursion" (SpiderMonkey), which Scala.js catches wrapped in a `js.JavaScriptException`.
-    */
-  def isStackExhaustion(e: Throwable): Boolean = e match
-    case js.JavaScriptException(error: js.Error) =>
-      error.name match
-        case "RangeError"    => error.message.contains("call stack")
-        case "InternalError" => error.message.contains("too much recursion")
-        case _               => false
-    case _ => false
-
   def strictEquals(a: js.Any, b: js.Any): Boolean = js.special.strictEquals(a, b)
 
   /** The relational operators of jmespath's comparators, `max_by` and `sort_by`, with JS coercion. */

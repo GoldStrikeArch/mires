@@ -602,8 +602,9 @@ Found while writing the pilot; each one decides whether a library port reproduce
 - **Rust (mires).** The runtime shim keeps a content-keyed memo of host-string conversions
   (`__rt._str_memo`, 4 MB budget), so a fixed bench input can reuse a conversion across calls; a
   bench variant removes that advantage (on the pilot the difference was within noise). `no_std` + `alloc`; `std::collections::HashMap` is unavailable (hashbrown cannot
-  be compiled by this backend) and `BTreeMap` is refused at link time (browser-workloads' admission
-  fixture), so maps are `mires_js::collections::HashMap` (a host `Map`, insertion-ordered). Strings
+  be compiled by this backend). `alloc::collections::BTreeMap` compiles and links (d3-hierarchy's
+  `stratify` keys its nodes by id in one), but it iterates in key order, so where JS relies on
+  insertion order maps are `mires_js::collections::HashMap` (a host `Map`, insertion-ordered). Strings
   cross as host strings read into Rust UTF-8 (`read::<&str>()`). `core::fmt` float formatting
   (`{:.3}`) pulls in `flt2dec` (Grisu with the Dragon fallback: 24 KB of the pilot's 98 KB
   program, per the optimizer report) and rounds exact ties to even (`{:.2}` of 0.125 is `0.12`;
@@ -646,8 +647,12 @@ Found while writing the pilot; each one decides whether a library port reproduce
 - **GopherJS.** Strings are UTF-8; JS strings convert at the boundary (a lone high surrogate
   swallows the next code unit, a known GopherJS defect, `docs/COMPARATORS.md`), so corpora must be
   well-formed UTF-16. `int` is 32-bit and `int64`/`uint64` are emulated (two 32-bit halves, slow).
-  `strconv.FormatFloat` rounds ties to even (0.125 at two digits is `0.12`); `math.Trunc` is wrong
-  above 2^31 (comparator finding).
+  `strconv.FormatFloat` rounds ties to even (0.125 at two digits is `0.12`). A float converted to
+  `int` or `int32` lowers to `x >> 0`, ECMAScript ToInt32 (wrapping modulo 2^32, NaN to 0), and
+  GopherJS's `math.Trunc` is `Copysign(float64(int(x)), x)`, so it is wrong for |x| ≥ 2^31 (a
+  comparator finding, met again in long). Truncate with `math.Floor` or `math.Ceil` by sign, which
+  call JS `Math.floor`/`Math.ceil`, and reduce with `math.Mod` (JS `%`, exact) before converting to
+  an integer.
   `sort.SliceStable` needs reflection (the pilot uses it), and `fmt` is large (the pilot uses `strconv` instead). `hash/fnv` is
   available. Goroutines map to GopherJS's scheduler; the comparator ports avoid them for host async.
 

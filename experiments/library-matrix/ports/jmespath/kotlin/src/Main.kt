@@ -5,11 +5,9 @@
 // string, and each result is a plain object `{ value }` or `{ error }` with the reference's error
 // category. `run` is a native ES module export through @JsExport.
 
-import jmespath.ErrorCategory
 import jmespath.JmesPathException
 import jmespath.Parser
 import jmespath.TreeInterpreter
-import jmespath.isStackExhaustion
 import kotlin.js.Json
 import kotlin.js.json
 
@@ -29,6 +27,10 @@ private fun compile(expression: String): Any? = Parser().parse(expression)
 /** jmespath's `search`: a fresh parser and interpreter per call. */
 private fun search(data: Any?, expression: String): Any? = TreeInterpreter().search(Parser().parse(expression), data)
 
+/**
+ * The reference adapter's `run`. Only jmespath's errors become categories: anything else thrown
+ * (stack exhaustion, a fault in the port) propagates, as it does out of the reference adapter.
+ */
 @OptIn(ExperimentalJsExport::class)
 @JsExport
 fun run(input: Input): Array<Json> = input.queries.map { query ->
@@ -36,10 +38,5 @@ fun run(input: Input): Array<Json> = input.queries.map { query ->
         json("value" to if (query.op == "compile") compile(query.expression) else search(input.data, query.expression))
     } catch (e: JmesPathException) {
         json("error" to e.category.label)
-    } catch (e: Throwable) {
-        // An exhausted stack propagates, as it does from the reference adapter.
-        if (e.isStackExhaustion()) throw e
-        // The reference's category() default: JSON.parse's SyntaxError and engine errors.
-        json("error" to ErrorCategory.Syntax.label)
     }
 }.toTypedArray()
