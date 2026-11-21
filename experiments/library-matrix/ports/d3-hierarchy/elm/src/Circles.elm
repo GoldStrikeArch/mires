@@ -2,6 +2,7 @@ module Circles exposing (layout)
 
 import Arena exposing (alter, get)
 import Array
+import JsMath exposing (jsMax, jsMin, truthy)
 
 
 type alias Circle =
@@ -19,7 +20,7 @@ circle n =
 weak a b =
     let
         dr =
-            a.r - b.r + max (max a.r b.r) 1 * 1.0e-9
+            a.r - b.r + jsMax (jsMax a.r b.r) 1 * 1.0e-9
 
         dx =
             b.x - a.x
@@ -27,7 +28,7 @@ weak a b =
         dy =
             b.y - a.y
     in
-    dr > 0 && dr * dr > dx * dx + dy * dy
+    dr > 0 && dx * dx + dy * dy < dr * dr
 
 
 outside a b =
@@ -220,16 +221,16 @@ place b a c =
         b2 =
             (b.r + c.r) * (b.r + c.r)
     in
-    if d2 == 0 then
+    if not (truthy d2) then
         { c | x = a.x + c.r, y = a.y }
 
-    else if a2 > b2 then
+    else if b2 < a2 then
         let
             x =
                 (d2 + b2 - a2) / (2 * d2)
 
             y =
-                sqrt (max 0 (b2 / d2 - x * x))
+                sqrt (jsMax 0 (b2 / d2 - x * x))
         in
         { c | x = b.x - x * dx - y * dy, y = b.y - x * dy + y * dx }
 
@@ -239,7 +240,7 @@ place b a c =
                 (d2 + a2 - b2) / (2 * d2)
 
             y =
-                sqrt (max 0 (a2 / d2 - x * x))
+                sqrt (jsMax 0 (a2 / d2 - x * x))
         in
         { c | x = a.x + x * dx - y * dy, y = a.y + x * dy + y * dx }
 
@@ -255,7 +256,7 @@ intersects a b =
         dy =
             b.y - a.y
     in
-    dr > 0 && dr * dr > dx * dx + dy * dy
+    dr > 0 && dx * dx + dy * dy < dr * dr
 
 
 score a b =
@@ -418,11 +419,13 @@ layout pre post root w h padding ns =
                     (\a ->
                         { a
                             | r =
-                                if isNaN r then
-                                    0
+                                jsMax 0
+                                    (if truthy r then
+                                        r
 
-                                else
-                                    max 0 r
+                                     else
+                                        0
+                                    )
                         }
                     )
                     old
@@ -439,18 +442,18 @@ layout pre post root w h padding ns =
                     (get i old).kids
 
                 p =
-                    if isNaN pad then
-                        0
+                    if truthy pad then
+                        pad
 
                     else
-                        pad
+                        0
 
                 child k =
                     let
                         n =
                             circle (get k old)
                     in
-                    if p /= 0 then
+                    if truthy p then
                         { n | r = n.r + p }
 
                     else
@@ -465,7 +468,7 @@ layout pre post root w h padding ns =
                                         | x = c.x
                                         , y = c.y
                                         , r =
-                                            if p /= 0 then
+                                            if truthy p then
                                                 c.r - p
 
                                             else
@@ -490,7 +493,7 @@ layout pre post root w h padding ns =
         translate ( old, _ ) =
             let
                 k =
-                    min w h / (2 * (get root old).r)
+                    jsMin w h / (2 * (get root old).r)
 
                 apply i arr =
                     let
@@ -522,4 +525,4 @@ layout pre post root w h padding ns =
             in
             List.foldl apply old pre
     in
-    pass 0 ( initial, 1 ) |> Result.andThen (\( stage, s ) -> pass (padding * ((get root stage).r / min w h)) ( stage, s )) |> Result.map translate
+    pass 0 ( initial, 1 ) |> Result.andThen (\( stage, s ) -> pass (padding * ((get root stage).r / jsMin w h)) ( stage, s )) |> Result.map translate

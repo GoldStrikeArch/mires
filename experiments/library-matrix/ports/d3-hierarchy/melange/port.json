@@ -3,5 +3,5 @@
   "library": "d3-hierarchy",
   "language": "melange",
   "entry": "src/index.ml",
-  "boundary": "Reads nested records or flat stratification rows. The port language constructs the tree, applies a layout, and returns node fields and exact coordinates as arrays."
+  "boundary": "A shared OCaml core reads the input through Host, whose Js.t object types read it in place with no conversion (JS strings, floats); the result is a JS array of rows."
 }

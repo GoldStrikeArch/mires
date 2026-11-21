@@ -3,5 +3,5 @@
   "library": "d3-hierarchy",
   "language": "rescript",
   "entry": "src/Index.res",
-  "boundary": "Reads nested records or flat stratification rows. The port language constructs the tree, applies a layout, and returns node fields and exact coordinates as arrays."
+  "boundary": "The input record is the corpus object itself (no conversion): strings are JS strings and numbers floats; the result is a JS array of rows of strings, null and numbers."
 }

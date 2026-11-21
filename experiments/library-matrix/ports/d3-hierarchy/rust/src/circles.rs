@@ -1,5 +1,5 @@
 // Front-chain circle packing and randomized enclosing basis from d3-hierarchy.
-use super::{fail, sqrt, walk, Node};
+use super::{fail, js_max, js_min, sqrt, truthy, walk, Node};
 use alloc::{vec, vec::Vec};
 #[derive(Copy, Clone)]
 struct Circle {
@@ -8,7 +8,7 @@ struct Circle {
     r: f64,
 }
 fn weak(a: Circle, b: Circle) -> bool {
-    let dr = a.r - b.r + a.r.max(b.r).max(1.) * 1e-9;
+    let dr = a.r - b.r + js_max(js_max(a.r, b.r), 1.) * 1e-9;
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     dr > 0. && dr * dr > dx * dx + dy * dy
@@ -123,17 +123,17 @@ fn place(b: Circle, a: Circle, mut c: Circle) -> Circle {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
     let d2 = dx * dx + dy * dy;
-    if d2 != 0. {
+    if truthy(d2) {
         let a2 = (a.r + c.r) * (a.r + c.r);
         let b2 = (b.r + c.r) * (b.r + c.r);
         if a2 > b2 {
             let x = (d2 + b2 - a2) / (2. * d2);
-            let y = sqrt(0.0f64.max(b2 / d2 - x * x));
+            let y = sqrt(js_max(0., b2 / d2 - x * x));
             c.x = b.x - x * dx - y * dy;
             c.y = b.y - x * dy + y * dx;
         } else {
             let x = (d2 + a2 - b2) / (2. * d2);
-            let y = sqrt(0.0f64.max(a2 / d2 - x * x));
+            let y = sqrt(js_max(0., a2 / d2 - x * x));
             c.x = a.x + x * dx - y * dy;
             c.y = a.y + x * dy + y * dx;
         }
@@ -239,8 +239,8 @@ fn siblings(c: &mut [Circle], seed: &mut u32) -> f64 {
     e.r
 }
 fn pack_children(nodes: &mut [Node], order: &[usize], p: f64, k: f64, seed: &mut u32) {
-    let pad = p * k;
-    let pad = if pad.is_nan() { 0. } else { pad };
+    // `padding(node) * k || 0`
+    let pad = if truthy(p * k) { p * k } else { 0. };
     for &v in order {
         if nodes[v].children.is_empty() {
             continue;
@@ -249,7 +249,7 @@ fn pack_children(nodes: &mut [Node], order: &[usize], p: f64, k: f64, seed: &mut
         let mut circles = Vec::with_capacity(kids.len());
         for &id in &kids {
             let mut r = nodes[id].r;
-            if pad != 0. {
+            if truthy(pad) {
                 r += pad;
             }
             circles.push(Circle {
@@ -263,7 +263,7 @@ fn pack_children(nodes: &mut [Node], order: &[usize], p: f64, k: f64, seed: &mut
             let c = circles[j];
             nodes[id].x = c.x;
             nodes[id].y = c.y;
-            if pad != 0. {
+            if truthy(pad) {
                 nodes[id].r = c.r - pad;
             }
         }
@@ -279,14 +279,15 @@ pub(super) fn layout(nodes: &mut [Node], root: usize, w: f64, h: f64, p: f64) {
     nodes[root].y = h / 2.;
     for &v in &pre {
         if nodes[v].children.is_empty() {
+            // `Math.max(0, +radius(node) || 0)`
             let r = sqrt(nodes[v].value);
-            nodes[v].r = if r.is_nan() { 0. } else { r.max(0.) };
+            nodes[v].r = js_max(0., if truthy(r) { r } else { 0. });
         }
     }
     pack_children(nodes, &post, 0., 1., &mut seed);
-    let k = nodes[root].r / w.min(h);
+    let k = nodes[root].r / js_min(w, h);
     pack_children(nodes, &post, p, k, &mut seed);
-    let k = w.min(h) / (2. * nodes[root].r);
+    let k = js_min(w, h) / (2. * nodes[root].r);
     for v in pre {
         nodes[v].r *= k;
         if v != root {

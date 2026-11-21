@@ -2,5 +2,5 @@
   "schema": 1,
   "library": "d3-hierarchy",
   "language": "kotlin",
-  "boundary": "Reads nested records or flat stratification rows. The port language constructs the tree, applies a layout, and returns node fields and exact coordinates as arrays."
+  "boundary": "The input is read in place through external interfaces (JS strings, Doubles); nodes keep their datum, and the result is an Array<Array<Any?>>, a JS array of rows of strings, null and numbers."
 }

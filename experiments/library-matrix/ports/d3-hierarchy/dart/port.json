@@ -3,5 +3,5 @@
   "library": "d3-hierarchy",
   "language": "dart",
   "entry": "src/main.dart",
-  "boundary": "Reads nested records or flat stratification rows. The port language constructs the tree, applies a layout, and returns node fields and exact coordinates as arrays."
+  "boundary": "The input is read in place through dart:js_interop extension types (JS strings, doubles); nodes keep their datum, and the result is a JSArray of rows of strings, null and numbers."
 }

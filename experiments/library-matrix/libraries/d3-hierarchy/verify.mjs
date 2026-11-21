@@ -31,6 +31,22 @@ for (const {id,input} of corpus.filter(c => c.id.startsWith('negative-zero-'))) 
     for (const row of impl(input)) assert.ok(Object.is(row[4],0),id)
   }
 }
+// The Node checker hands its cells the corpus through JSON.stringify, which writes -0 as 0, so in
+// Node the sizes of -0 are checked here, on the file's own values.
+function hasNegativeZero(value) {
+  const pending = [value]
+  while (pending.length) {
+    const v = pending.pop()
+    if (Object.is(v,-0)) return true
+    if (v && typeof v === 'object') pending.push(...Object.values(v))
+  }
+  return false
+}
+let negativeZeroCases = 0
+for (const {id,input} of corpus.filter(c => !c.id.startsWith('bench-') && hasNegativeZero(c.input))) {
+  assert.deepStrictEqual(Array.from(run(input), row => Array.from(row)),reference(input),id)
+  negativeZeroCases++
+}
 for (const {input} of corpus.filter(c => c.id.startsWith('bench-'))) {
   const first = variant(input,1), later = variant(input,806)
   function compareNodes(original,a,b) {
@@ -61,8 +77,24 @@ for (let k=1;k<=64;k++) {
     ['treemap','squarify'],['treemap','binary'],['treemap','sliceDice']]) {
     const input={...base,op,data:nodes[0],tile:tile??'squarify',width:100+k/3,height:200-k/5,
       sort:k%2===0,nodeSize:k%3===0,round:k%4===0,padding:(k%5)/2}
-    assert.deepEqual(Array.from(run(input), row => Array.from(row)),reference(input),op+' '+tile+' on tree '+k)
+    // deepStrictEqual compares numbers with Object.is: -0 differs from 0, and NaN equals NaN.
+    assert.deepStrictEqual(Array.from(run(input), row => Array.from(row)),reference(input),op+' '+tile+' on tree '+k)
     checks++
   }
 }
-console.log(language+' passed the 252-node upstream pack fixture and '+checks+' exact layout comparisons')
+// d3 builds hierarchy() and walks every tree on explicit stacks. A single-child chain 10,000
+// levels deep is nested beyond what the checker's structuredClone carries (about 1,500 levels),
+// so it is checked here, on one input object per layout that neither side may change.
+function chain(depth) {
+  let node = {id:'n'+depth, value:1}
+  for (let i = depth - 1; i >= 0; i--) node = {id:'n'+i, value:i % 3, children:[node]}
+  return node
+}
+const deep = chain(10000)
+let deepChecks = 0
+for (const [op,tile] of [['hierarchy'],['iterator'],['tree'],['cluster'],['partition'],['pack'],['treemap','squarify'],['treemap','binary']]) {
+  const input = {...base,op,data:deep,tile:tile??'squarify',width:640,height:480,padding:1,sort:true}
+  assert.deepStrictEqual(Array.from(run(input), row => Array.from(row)),reference(input),op+' '+(tile??'')+' on a 10,000-level chain')
+  deepChecks++
+}
+console.log(language+' passed the 252-node upstream pack fixture, '+checks+' exact layout comparisons, '+negativeZeroCases+' corpus cases with -0 inputs and '+deepChecks+' layouts of a 10,000-level chain')

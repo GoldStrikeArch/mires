@@ -1,5 +1,5 @@
 // Partition, alternating slice-and-dice, binary and squarified treemap tilers.
-use super::{round, sqrt, walk, Node};
+use super::{js_max, round, sqrt, truthy, walk, Node};
 use alloc::vec::Vec;
 #[derive(Clone, Copy)]
 struct Rect {
@@ -37,7 +37,8 @@ impl Rect {
     }
 }
 fn slice(nodes: &mut [Node], ids: &[usize], mut rect: Rect, total: f64, dice: bool) {
-    let k = if total == 0. {
+    // `parent.value && (x1 - x0) / parent.value`
+    let k = if !truthy(total) {
         total
     } else if dice {
         (rect.x1 - rect.x) / total
@@ -89,7 +90,7 @@ fn binary(
     let mut a = rect;
     let mut b = rect;
     if rect.x1 - rect.x > rect.y1 - rect.y {
-        let x = if total != 0. {
+        let x = if truthy(total) {
             (rect.x * right + rect.x1 * left) / total
         } else {
             rect.x1
@@ -97,7 +98,7 @@ fn binary(
         a.x1 = x;
         b.x = x;
     } else {
-        let y = if total != 0. {
+        let y = if truthy(total) {
             (rect.y * right + rect.y1 * left) / total
         } else {
             rect.y1
@@ -107,13 +108,6 @@ fn binary(
     }
     binary(nodes, ids, sums, i, k, left, a);
     binary(nodes, ids, sums, k, j, right, b);
-}
-fn larger(a: f64, b: f64) -> f64 {
-    if a.is_nan() || b.is_nan() {
-        f64::NAN
-    } else {
-        a.max(b)
-    }
 }
 fn squarify(nodes: &mut [Node], ids: &[usize], mut total: f64, mut rect: Rect) {
     let ratio = (1. + sqrt(5.)) / 2.;
@@ -126,22 +120,27 @@ fn squarify(nodes: &mut [Node], ids: &[usize], mut total: f64, mut rect: Rect) {
         loop {
             sum = nodes[ids[j]].value;
             j += 1;
-            if sum != 0. || j == ids.len() {
+            // `while (!sumValue && i1 < n)`
+            if truthy(sum) || j == ids.len() {
                 break;
             }
         }
         let mut min = sum;
         let mut max = sum;
-        let alpha = larger(dy / dx, dx / dy) / (total * ratio);
+        let alpha = js_max(dy / dx, dx / dy) / (total * ratio);
         let beta = sum * sum * alpha;
-        let mut best = larger(max / beta, beta / min);
+        let mut best = js_max(max / beta, beta / min);
         while j < ids.len() {
             let v = nodes[ids[j]].value;
             sum += v;
-            min = min.min(v);
-            max = max.max(v);
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
             let beta = sum * sum * alpha;
-            let next = larger(max / beta, beta / min);
+            let next = js_max(max / beta, beta / min);
             if next > best {
                 sum -= v;
                 break;
@@ -152,11 +151,11 @@ fn squarify(nodes: &mut [Node], ids: &[usize], mut total: f64, mut rect: Rect) {
         let mut row = rect;
         let dice = dx < dy;
         if dice {
-            if total != 0. {
+            if truthy(total) {
                 rect.y += dy * sum / total;
                 row.y1 = rect.y;
             }
-        } else if total != 0. {
+        } else if truthy(total) {
             rect.x += dx * sum / total;
             row.x1 = rect.x;
         }

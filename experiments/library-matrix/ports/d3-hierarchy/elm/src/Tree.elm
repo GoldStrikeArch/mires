@@ -1,6 +1,7 @@
 module Tree exposing (cluster, tidy)
 
 import Arena exposing (alter, get)
+import JsMath exposing (truthy)
 
 
 head xs =
@@ -72,7 +73,7 @@ cluster pre post w h fixed ns =
                     | x = (n.x - x0) / (x1 - x0) * w
                     , y =
                         (1
-                            - (if root.y /= 0 then
+                            - (if truthy root.y then
                                 n.y / root.y
 
                                else
@@ -310,7 +311,7 @@ tidy pre post w h fixed ns =
 
               else
                 lo
-            , if n.x > (get hi stage2).x then
+            , if (get hi stage2).x < n.x then
                 v
 
               else

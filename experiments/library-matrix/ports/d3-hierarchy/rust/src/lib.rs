@@ -55,6 +55,47 @@ fn flag(v: JsValue, k: &str) -> bool {
     get(v, k).is_truthy()
 }
 
+/// JavaScript's ToBoolean of a number: false for 0, -0 and NaN. d3 tests numbers this way
+/// (`value ? … : …`, `if (d2)`, `+x || 0`).
+pub(crate) fn truthy(x: f64) -> bool {
+    !(x == 0. || x.is_nan())
+}
+
+/// `Math.max(a, b)`: NaN if either is NaN, and +0 above -0. `f64::max` returns the other operand
+/// for a NaN and either zero for a pair of zeros.
+pub(crate) fn js_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            b
+        } else {
+            a
+        }
+    } else if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// `Math.min(a, b)`: NaN if either is NaN, and -0 below +0.
+pub(crate) fn js_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if a == b {
+        if a.is_sign_negative() {
+            a
+        } else {
+            b
+        }
+    } else if a < b {
+        a
+    } else {
+        b
+    }
+}
+
 struct Node {
     id: String,
     parent: usize,
@@ -230,7 +271,12 @@ fn walk(nodes: &[Node], root: usize, post: bool) -> Vec<usize> {
 fn prepare(nodes: &mut [Node], root: usize, sort: bool) {
     for v in walk(nodes, root, true) {
         let mut height = 0;
-        let mut val = if nodes[v].value == 0.0 { 0.0 } else { nodes[v].value };
+        // `+value(node.data) || 0`
+        let mut val = if truthy(nodes[v].value) {
+            nodes[v].value
+        } else {
+            0.0
+        };
         for &c in nodes[v].children.iter().rev() {
             val += nodes[c].value;
             height = height.max(nodes[c].height + 1);
@@ -279,7 +325,7 @@ fn cluster(nodes: &mut [Node], root: usize, w: f64, h: f64, fixed: bool) {
             let mut y = 0.0f64;
             for &c in &nodes[v].children {
                 sum += nodes[c].x;
-                y = y.max(nodes[c].y);
+                y = js_max(y, nodes[c].y);
             }
             nodes[v].x = sum / nodes[v].children.len() as f64;
             nodes[v].y = 1. + y;
@@ -297,7 +343,7 @@ fn cluster(nodes: &mut [Node], root: usize, w: f64, h: f64, fixed: bool) {
             nodes[v].y = (ry - nodes[v].y) * h;
         } else {
             nodes[v].x = (nodes[v].x - x0) / (x1 - x0) * w;
-            nodes[v].y = (1. - if ry != 0. { nodes[v].y / ry } else { 1. }) * h;
+            nodes[v].y = (1. - if truthy(ry) { nodes[v].y / ry } else { 1. }) * h;
         }
     }
 }

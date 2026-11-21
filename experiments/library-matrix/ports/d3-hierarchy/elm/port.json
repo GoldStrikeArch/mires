@@ -4,5 +4,5 @@
   "language": "elm",
   "main": "src/Main.elm",
   "host": "js/index.js",
-  "boundary": "Reads nested records or flat stratification rows. The port language constructs the tree, applies a layout, and returns node fields and exact coordinates as arrays."
+  "boundary": "The JS host sends the input through a port; Json.Decode reads the options and rows and the nested data one node at a time, and the result is a port message of encoded rows that the host returns."
 }

@@ -2,6 +2,7 @@ module Rectangles exposing (layout)
 
 import Arena exposing (alter, get)
 import Array
+import JsMath exposing (jsMax, truthy)
 
 
 type alias Rect =
@@ -39,7 +40,7 @@ getAt i a =
 slice kids total r dice ns =
     let
         scale =
-            if total == 0 then
+            if not (truthy total) then
                 total
 
             else if dice then
@@ -125,10 +126,10 @@ binary kids value frame ns =
                     right =
                         total - left
                 in
-                if r.xx - r.x > r.yy - r.y then
+                if r.yy - r.y < r.xx - r.x then
                     let
                         x =
-                            if total /= 0 then
+                            if truthy total then
                                 (r.x * right + r.xx * left) / total
 
                             else
@@ -139,7 +140,7 @@ binary kids value frame ns =
                 else
                     let
                         y =
-                            if total /= 0 then
+                            if truthy total then
                                 (r.y * right + r.yy * left) / total
 
                             else
@@ -148,14 +149,6 @@ binary kids value frame ns =
                     split k j right { r | y = y } (split i k left { r | yy = y } old)
     in
     split 0 (Array.length ids) value frame ns
-
-
-maxf a b =
-    if isNaN a || isNaN b then
-        0 / 0
-
-    else
-        max a b
 
 
 squarify kids total frame ns =
@@ -169,7 +162,7 @@ squarify kids total frame ns =
                     ( [], acc, 0 )
 
                 i :: rest ->
-                    if (get i ns).value /= 0 || List.isEmpty rest then
+                    if truthy (get i ns).value || List.isEmpty rest then
                         ( rest, i :: acc, (get i ns).value )
 
                     else
@@ -191,7 +184,7 @@ squarify kids total frame ns =
                         nextNonZero remaining []
 
                     alpha =
-                        maxf (dy / dx) (dx / dy) / (value * ratio)
+                        jsMax (dy / dx) (dx / dy) / (value * ratio)
 
                     beta =
                         first * first * alpha
@@ -210,30 +203,38 @@ squarify kids total frame ns =
                                         sumValue + v
 
                                     lower =
-                                        min lo v
+                                        if v < lo then
+                                            v
+
+                                        else
+                                            lo
 
                                     upper =
-                                        max hi v
+                                        if hi < v then
+                                            v
+
+                                        else
+                                            hi
 
                                     b =
                                         candidateSum * candidateSum * alpha
 
                                     candidate =
-                                        maxf (upper / b) (b / lower)
+                                        jsMax (upper / b) (b / lower)
                                 in
-                                if candidate > best then
+                                if best < candidate then
                                     ( left, List.reverse built, candidateSum - v )
 
                                 else
                                     collect tail (i :: built) candidateSum lower upper candidate
 
                     ( pending, row, sum ) =
-                        collect rest initial first first first (maxf (first / beta) (beta / first))
+                        collect rest initial first first first (jsMax (first / beta) (beta / first))
                 in
                 if dx < dy then
                     let
                         bottom =
-                            if value /= 0 then
+                            if truthy value then
                                 r.y + dy * sum / value
 
                             else
@@ -241,7 +242,7 @@ squarify kids total frame ns =
                     in
                     rows pending
                         (value - sum)
-                        (if value /= 0 then
+                        (if truthy value then
                             { r | y = bottom }
 
                          else
@@ -252,7 +253,7 @@ squarify kids total frame ns =
                 else
                     let
                         right =
-                            if value /= 0 then
+                            if truthy value then
                                 r.x + dx * sum / value
 
                             else
@@ -260,7 +261,7 @@ squarify kids total frame ns =
                     in
                     rows pending
                         (value - sum)
-                        (if value /= 0 then
+                        (if truthy value then
                             { r | x = right }
 
                          else

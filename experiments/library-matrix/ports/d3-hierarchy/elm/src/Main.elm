@@ -6,6 +6,7 @@ import Circles
 import Dict
 import Json.Decode as D
 import Json.Encode as E
+import JsMath exposing (truthy)
 import Platform
 import Rectangles
 import Tree
@@ -17,27 +18,31 @@ port request : (D.Value -> msg) -> Sub msg
 port response : E.Value -> Cmd msg
 
 
-type Datum
-    = Datum String String Float (List Datum)
+{-| A stratify row.
+-}
+type alias Row =
+    { id : String, parentId : String, value : Float }
 
 
 type alias Input =
-    { op : String, source : String, data : Maybe Datum, rows : List Datum, w : Float, h : Float, p : Float, sort : Bool, nodeSize : Bool, round : Bool, tile : String }
+    { op : String, source : String, data : Maybe D.Value, rows : List Row, w : Float, h : Float, p : Float, sort : Bool, nodeSize : Bool, round : Bool, tile : String }
 
 
 opt k fieldDecoder fallback =
     D.oneOf [ D.field k fieldDecoder, D.succeed fallback ]
 
 
-datum : D.Decoder Datum
-datum =
-    D.map4 Datum
+rowDecoder : D.Decoder Row
+rowDecoder =
+    D.map3 Row
         (opt "id" D.string "")
         (opt "parentId" D.string "")
         (opt "value" D.float 0)
-        (opt "children" (D.list (D.lazy (\_ -> datum))) [])
 
 
+{-| The nested data stays a raw value: `nested` reads it one node at a time, so no decoder
+recurses through the nesting.
+-}
 decoder =
     D.map2
         (\( op, source, dataRows ) cfg ->
@@ -50,8 +55,8 @@ decoder =
         (D.map4 (\op src d rows -> ( op, src, ( d, rows ) ))
             (D.field "op" D.string)
             (D.field "source" D.string)
-            (D.maybe (D.field "data" datum))
-            (opt "rows" (D.list datum) [])
+            (D.maybe (D.field "data" D.value))
+            (opt "rows" (D.list rowDecoder) [])
         )
         (D.map7 (\w h p sort fixed round tile -> { w = w, h = h, p = p, sort = sort, fixed = fixed, round = round, tile = tile })
             (D.field "width" D.float)
@@ -64,29 +69,49 @@ decoder =
         )
 
 
+{-| One node of the nested data: its id, its value and its children, still raw.
+-}
+datum : D.Decoder ( String, Float, List D.Value )
+datum =
+    D.map3 (\id weight kids -> ( id, weight, kids ))
+        (opt "id" D.string "")
+        (opt "value" D.float 0)
+        (opt "children" (D.list D.value) [])
+
+
+{-| `hierarchy(data)`, built on an explicit stack as d3 builds it: the arena holds the nodes in
+pre-order, each with its children in order.
+-}
+nested : D.Value -> Result String ( Arena, Int )
 nested data =
     let
-        add parent (Datum id _ weight kids) old =
-            let
-                i =
-                    Array.length old
+        build pending arena =
+            case pending of
+                [] ->
+                    Ok ( Array.map (\n -> { n | kids = List.reverse n.kids }) arena, 0 )
 
-                ns =
-                    Array.push { blank | id = id, parent = parent, value = weight } old
+                ( value, parent ) :: rest ->
+                    case D.decodeValue datum value of
+                        Err err ->
+                            Err (D.errorToString err)
 
-                child k ( arr, acc ) =
-                    let
-                        ( new, j ) =
-                            add i k arr
-                    in
-                    ( new, j :: acc )
+                        Ok ( id, weight, kids ) ->
+                            let
+                                i =
+                                    Array.length arena
 
-                ( result, ids ) =
-                    List.foldl child ( ns, [] ) kids
-            in
-            ( alter i (\n -> { n | kids = List.reverse ids }) result, i )
+                                added =
+                                    Array.push { blank | id = id, parent = parent, value = weight } arena
+                            in
+                            build (List.map (\k -> ( k, i )) kids ++ rest)
+                                (if parent < 0 then
+                                    added
+
+                                 else
+                                    alter parent (\n -> { n | kids = i :: n.kids }) added
+                                )
     in
-    add -1 data Array.empty
+    build [ ( data, -1 ) ] Array.empty
 
 
 slash path i =
@@ -141,24 +166,24 @@ parentPath path =
 
 stratify paths rows =
     let
-        make (Datum name parent weight _) ( ns, byId, pids ) =
+        make r ( ns, byId, pids ) =
             let
                 i =
                     Array.length ns
 
                 id =
                     if paths then
-                        normalize name
+                        normalize r.id
 
                     else
-                        name
+                        r.id
 
                 p =
                     if paths then
                         parentPath id
 
                     else
-                        parent
+                        r.parentId
 
                 ids =
                     if id == "" then
@@ -174,7 +199,7 @@ stratify paths rows =
                             )
                             byId
             in
-            ( Array.push { blank | id = id, value = weight } ns, ids, Array.push p pids )
+            ( Array.push { blank | id = id, value = r.value } ns, ids, Array.push p pids )
 
         ( given, map0, pids0 ) =
             List.foldl make ( Array.empty, Dict.empty, Array.empty ) rows
@@ -272,7 +297,16 @@ layout input ( initial, root ) =
                     ( total + child.value, max high (child.height + 1) )
 
                 ( value, height ) =
-                    List.foldr add ( n.value + 0, 0 ) n.kids
+                    -- `+value(node.data) || 0`, then the children's values, the last child first
+                    List.foldr add
+                        ( if truthy n.value then
+                            n.value
+
+                          else
+                            0
+                        , 0
+                        )
+                        n.kids
 
                 order a b =
                     compare (get b ns).value (get a ns).value
@@ -406,7 +440,7 @@ handle value =
                 tree =
                     case input.data of
                         Just data ->
-                            Ok (nested data)
+                            nested data
 
                         Nothing ->
                             stratify (input.source == "path") input.rows

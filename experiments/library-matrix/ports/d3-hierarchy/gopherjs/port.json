@@ -3,5 +3,5 @@
   "library": "d3-hierarchy",
   "language": "gopherjs",
   "package": "./src",
-  "boundary": "Reads nested records or flat stratification rows. The port language constructs the tree, applies a layout, and returns node fields and exact coordinates as arrays."
+  "boundary": "The input is read through *js.Object; stratify ids become Go UTF-8 strings, nested ids are returned as host strings, and the result is a slice of rows that GopherJS converts to JS arrays."
 }
