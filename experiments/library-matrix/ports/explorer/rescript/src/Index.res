@@ -11,6 +11,7 @@ external box: 'a => value = "%identity"
 @scope("JSON") @val external stringify: value => value = "stringify"
 @scope("JSON") @val external parse: value => value = "parse"
 @send external join: (value, string) => value = "join"
+@send external filter: (value, value => bool) => value = "filter"
 
 let object = fields => {
   let out = obj()
@@ -24,7 +25,61 @@ let map = (values, f) => {
   }
   out
 }
-let stored = h => map(at(at(h, 0), 3), row => at(row, 2))
+// A transaction step on the Explorer store.
+let transaction = (mode, step) =>
+  object([
+    ("op", box("tx")),
+    ("conn", box("explorer")),
+    ("stores", box("rows")),
+    ("mode", box(mode)),
+    ("steps", box([step])),
+    ("catch", box(false)),
+  ])
+// One idb script (idb CONTRACT.md, "Input"): create the store, put every row in one readwrite
+// transaction, then walk the store with a cursor in primary-key order.
+let persist = rows => {
+  let schema = [
+    object([("op", box("createStore")), ("name", box("rows")), ("options", object([("keyPath", box("id"))]))]),
+    object([("op", box("createIndex")), ("store", box("rows")), ("name", box("byGroup")), ("keyPath", box("group"))]),
+  ]
+  let openDb = object([
+    ("op", box("openDB")),
+    ("db", box("explorer")),
+    ("conn", box("explorer")),
+    ("version", box(1)),
+    ("upgrade", box(schema)),
+    ("catch", box(false)),
+  ])
+  let put = row =>
+    object([
+      ("op", box("put")),
+      ("store", box(Nullable.null)),
+      ("index", box(Nullable.null)),
+      ("args", box([row])),
+      ("catch", box(false)),
+    ])
+  let write = object([
+    ("op", box("batch")),
+    ("requests", map(rows, put)),
+    ("abort", box(false)),
+    ("done", box(true)),
+  ])
+  let walk = object([
+    ("op", box("openCursor")),
+    ("store", box(Nullable.null)),
+    ("index", box(Nullable.null)),
+    ("args", array()),
+    ("positions", array()),
+    ("rest", box([["continue"]])),
+    ("catch", box(false)),
+  ])
+  object([("steps", box([openDb, transaction("readwrite", write), transaction("readonly", walk)]))])
+}
+// The stored rows' `value` texts, from the cursor entries of the idb log.
+let stored = h =>
+  get(at(h, 0), "log")
+  ->filter(entry => at(entry, 0) === box("cursor"))
+  ->map(entry => get(at(entry, 3), "value"))
 let hits = h => get(at(get(at(h, 1), "results"), 1), "hits")
 let cmd = (name, argument) => box([box(name), argument])
 let run = packet => {
@@ -35,15 +90,7 @@ let run = packet => {
     let rows = map(get(input, "records"), doc =>
       object([("id", get(doc, "id")), ("group", box("documents")), ("value", stringify(doc))])
     )
-    cmd(
-      "idb",
-      object([
-        ("batches", box([object([("rows", rows)])])),
-        ("keys", array()),
-        ("groups", array()),
-        ("step", box(1)),
-      ]),
-    )
+    cmd("idb", persist(rows))
   | 1 =>
     let options = object([("fields", box(["title", "body"])), ("storeFields", box(["body"]))])
     let add = object([("op", box("addAll")), ("documents", map(stored(h), parse))])

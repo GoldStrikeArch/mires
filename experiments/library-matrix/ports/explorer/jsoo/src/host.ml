@@ -16,3 +16,5 @@ let json v=scoped "JSON" "stringify" [|v|]
 let parse v=scoped "JSON" "parse" [|v|]
 let join v x=meth v "join" [|x|]
 let int n=box (Js.number_of_float (float_of_int n))
+let bool b=box (Js.bool b)
+let text v:string=Js.to_string v

@@ -1,8 +1,36 @@
+import kotlin.js.Json
 import kotlin.js.json
 
-private fun stored(history: dynamic): Array<String> {
-    val cursor = history[0][3]
-    return Array(cursor.length as Int) { index -> cursor[index][2] as String }
+// One idb script (idb CONTRACT.md, "Input"): create the store, put every row in one readwrite
+// transaction, then walk the store with a cursor in primary-key order.
+private fun persist(rows: Array<Json>): Json {
+    fun transaction(mode: String, step: Json) = json(
+        "op" to "tx", "conn" to "explorer", "stores" to "rows", "mode" to mode,
+        "steps" to arrayOf(step), "catch" to false
+    )
+    val schema = arrayOf(
+        json("op" to "createStore", "name" to "rows", "options" to json("keyPath" to "id")),
+        json("op" to "createIndex", "store" to "rows", "name" to "byGroup", "keyPath" to "group")
+    )
+    val openDb = json(
+        "op" to "openDB", "db" to "explorer", "conn" to "explorer", "version" to 1,
+        "upgrade" to schema, "catch" to false
+    )
+    val puts = rows.map { row ->
+        json("op" to "put", "store" to null, "index" to null, "args" to arrayOf(row), "catch" to false)
+    }.toTypedArray()
+    val write = json("op" to "batch", "requests" to puts, "abort" to false, "done" to true)
+    val walk = json(
+        "op" to "openCursor", "store" to null, "index" to null, "args" to emptyArray<Any>(),
+        "positions" to emptyArray<Any>(), "rest" to arrayOf(arrayOf("continue")), "catch" to false
+    )
+    return json("steps" to arrayOf(openDb, transaction("readwrite", write), transaction("readonly", walk)))
+}
+
+// The stored rows' `value` texts, from the cursor entries of the idb log.
+private fun stored(history: dynamic): List<String> {
+    val log: Array<dynamic> = history[0].log
+    return log.filter { entry -> entry[0] as String == "cursor" }.map { entry -> entry[3].value as String }
 }
 
 private fun command(component: String?, value: dynamic) = arrayOf<dynamic>(component, value)
@@ -18,10 +46,7 @@ fun run(packet: dynamic): dynamic {
                 val document = documents[i]
                 json("id" to document.id, "group" to "documents", "value" to JSON.stringify(document))
             }
-            command("idb", json(
-                "batches" to arrayOf(json("rows" to rows)), "keys" to emptyArray<String>(),
-                "groups" to emptyArray<String>(), "step" to 1
-            ))
+            command("idb", persist(rows))
         }
         1 -> {
             val options = json("fields" to arrayOf("title", "body"), "storeFields" to arrayOf("body"))

@@ -34,8 +34,43 @@ cmd name arg =
     values [ E.string name, arg ]
 
 
+{-| One idb script (idb CONTRACT.md, "Input"): create the store, put every row in one readwrite
+transaction, then walk the store with a cursor in primary-key order.
+-}
+persist : List E.Value -> E.Value
+persist rows =
+    let
+        transaction mode step =
+            E.object [ ( "op", E.string "tx" ), ( "conn", E.string "explorer" ), ( "stores", E.string "rows" ), ( "mode", E.string mode ), ( "steps", values [ step ] ), ( "catch", E.bool False ) ]
+
+        schema =
+            values
+                [ E.object [ ( "op", E.string "createStore" ), ( "name", E.string "rows" ), ( "options", E.object [ ( "keyPath", E.string "id" ) ] ) ]
+                , E.object [ ( "op", E.string "createIndex" ), ( "store", E.string "rows" ), ( "name", E.string "byGroup" ), ( "keyPath", E.string "group" ) ]
+                ]
+
+        openDb =
+            E.object [ ( "op", E.string "openDB" ), ( "db", E.string "explorer" ), ( "conn", E.string "explorer" ), ( "version", E.int 1 ), ( "upgrade", schema ), ( "catch", E.bool False ) ]
+
+        put row =
+            E.object [ ( "op", E.string "put" ), ( "store", E.null ), ( "index", E.null ), ( "args", values [ row ] ), ( "catch", E.bool False ) ]
+
+        write =
+            E.object [ ( "op", E.string "batch" ), ( "requests", E.list put rows ), ( "abort", E.bool False ), ( "done", E.bool True ) ]
+
+        walk =
+            E.object [ ( "op", E.string "openCursor" ), ( "store", E.null ), ( "index", E.null ), ( "args", values [] ), ( "positions", values [] ), ( "rest", values [ values [ E.string "continue" ] ] ), ( "catch", E.bool False ) ]
+    in
+    E.object [ ( "steps", values [ openDb, transaction "readwrite" write, transaction "readonly" walk ] ) ]
+
+
+{-| The stored rows' `value` texts, from the cursor entries of the idb log.
+-}
 stored history =
-    at 3 (at 0 history) |> items |> List.map (at 2)
+    field "log" (at 0 history)
+        |> items
+        |> List.filter (\entry -> text (at 0 entry) == "cursor")
+        |> List.map (at 3 >> field "value")
 
 
 hits history =
@@ -55,11 +90,8 @@ drive packet =
             let
                 row doc =
                     E.object [ ( "id", field "id" doc ), ( "group", E.string "documents" ), ( "value", E.string (E.encode 0 doc) ) ]
-
-                batch =
-                    E.object [ ( "rows", E.list row (items (field "records" input)) ) ]
             in
-            cmd "idb" (E.object [ ( "batches", values [ batch ] ), ( "keys", values [] ), ( "groups", values [] ), ( "step", E.int 1 ) ])
+            cmd "idb" (persist (List.map row (items (field "records" input))))
 
         1 ->
             let

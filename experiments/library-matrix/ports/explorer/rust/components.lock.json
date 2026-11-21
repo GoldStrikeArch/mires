@@ -6,11 +6,11 @@
     "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
   },
   "sources": {
-    "idb": "11d6161cfdbaaccc27f8d6b1703defd5187a4ec429b80f8056fb5c6764928575",
-    "minisearch": "2ff36ad540323bdefd5e18e5d226b541caaa956f20f91c60a8376194bbff4f2a",
-    "marked": "be54bf0afd6e51fca1dcc8f3df2784363a59e1e1a7d685c4f78a938544e9e85f",
-    "fflate": "ffe22a052184148d3987d72a195eb33e8953af4ecb4b39ec284cda9b904c2c24",
-    "uplot": "0fb191d09e07f07fa8af4f3463228f54789e1ad4bf5be0a69fe4f388f9435342"
+    "idb": "3cce8bc66182d2eb222cf987a73fe1b7610e9a90ad5953d7ba3a802b9d6738da",
+    "minisearch": "4a7a5a77ca1d6956555e77698de818d9450ba2b879800db04279fe4e0be07c30",
+    "marked": "4061fe019129c5eaa62eb1153d2b0cd2195fd3b79a6b09904fe8b0e53a51309b",
+    "fflate": "6158b9e1cb7ed0ec30b1d8ad4597f383b41fc2efe5f181d1cc0c669940318177",
+    "uplot": "1ae0d0ba8b8ac58c5499c879dd7da83733e6da9e98245f574c77745122c8894c"
   },
   "toolchain": {
     "compiler": "mires (rustc_codegen_mires + jsc-link)",
@@ -23,24 +23,24 @@
   },
   "artifacts": {
     "idb": {
-      "readable": "36ca19ea7cfec89ae87b0cc97e1c2d464d1e65604c8f1fc8fbe65c9e59ecd482",
-      "production": "833afeef829b2a9c879d5394b6769703a65680912b41cb1baa500a2c59441a62"
+      "readable": "a873ba05c47a6ca14145c3ced55219742074d1cfa66b45f3583507bc8981f6ea",
+      "production": "6417a972e4acdfcb9e1cb1cfb0609238ab539c44e8d6de414c699ee36b81e37c"
     },
     "minisearch": {
-      "readable": "14acc86b5d3c35fa804d72de057dc608658aebdc06814ecd0064a72c24038c96",
-      "production": "aaf68eb5df731177f720ca336fbdbbb1a8762ef6cfcad7af7c9258ea573d603e"
+      "readable": "2a5ba9747ef5de60c6945db1e5f0b112f965aada9a42905595e6e3968c74f3e3",
+      "production": "31978b5ed6de32a60a0a3331d7011ebb72abbf2fc744632b08de6f39c29c240a"
     },
     "marked": {
-      "readable": "4f619cdc73e448f2e23517153bb7321228f5a4de54bc52c615b40563558a91f5",
-      "production": "5d8e9ade33e664191d93c18cd2ff8f8f3d8831cf294a67387f396c19e5ba7f79"
+      "readable": "6df2cd9ec1933a75925379be4a5ef09d64722fabc15ff04dbf4eb2ccbef2b295",
+      "production": "b773c9a7e537af140aca87f3e8012c830d415b54c6a0b0d7cc29d13b0d45ceae"
     },
     "fflate": {
-      "readable": "da48c1fa5e514dad545565409e96596405f18c3e4e79ccc43fb9d43a21da71c1",
-      "production": "bc3aaa2b6a1f1347e6f4980fe99198124bd79d17558bf018b58cc4000053c589"
+      "readable": "a3df6ce0d0a8c3285efc51d4afa2b33da4ace4157498b94d4328c9bb828176a9",
+      "production": "b9369c68dfd45fa6c55b19cdba2af478c70bd564f58089e14b21d6646e1ea076"
     },
     "uplot": {
-      "readable": "971f039cb4469c49396c90f33dae811c99332ce0f095d8e1110eab0a333238d6",
-      "production": "8bb46c2ca33cb62d6bcfe0c7f5b85df0a7ec06a9d9f68c01ccab2f7ae6f97b0f"
+      "readable": "bf91a0b27abc18ff27320b584ca2f1f902bffe60b7419929101e453e1faaeb16",
+      "production": "77279c663d906eeed007946175b0b8b1b17665389935489c6c90f301bcdbad32"
     }
   }
 }

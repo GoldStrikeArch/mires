@@ -6,11 +6,11 @@
     "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
   },
   "sources": {
-    "idb": "f2a485964c307f9e7aecce485ecb0f5a44357fba9bbd6c5f9c0334f86092519a",
+    "idb": "415ba7f13c1671ede17d9cb77fdf3d19a6d20a3e5de3c595c24c40313e71947d",
     "minisearch": "a8f028f92ecbef8a2f099f7b1c9eecc7ccfd861af296d74d83866aa4604f88cb",
     "marked": "8ef18e751c9fdfe0ee932373e0166329adb7b978e733b5d36c328e2b262dac1b",
-    "fflate": "2e6643f20045405f8905bcc949ac539752c8a7266727585f2740615ef67516b8",
-    "uplot": "913275c94ed1fbff30671b02d7fc27e85e0f2171a5fa5b31424c4ae554c7b322"
+    "fflate": "c46c83851678f33c4a3a3dbb521ed80ea11f004ce2b55d1cbc53455a5b35a475",
+    "uplot": "02caf33ea1ecfa5acb3ca5a8408299b4b3123bf0e738caa94700e057e7a0c1b1"
   },
   "toolchain": {
     "scalaCli": "Scala CLI version: 1.19.0 | Scala version (default): 3.10.1",
@@ -20,8 +20,8 @@
   },
   "artifacts": {
     "idb": {
-      "readable": "2332ac82c4db91e6acaa5475e1275fa30d41143be31aa6bc05851df4b6742b74",
-      "production": "56708c1deee39bd5898129766b1ef4cb3618a6e8667e353c776c1a1f21699996"
+      "readable": "3e5486eb7fa172a8ade30e16b62a7b3701cf3938b8244a75d5bbde62c8f05a12",
+      "production": "e329d7f29e1c43898eaae8a8c5adbbf5948bce429677d8d53b55bd9c98dbc25e"
     },
     "minisearch": {
       "readable": "7dfb050ad7c917cb40186a74a12d5212beb814ff0e15751d2be1130037843b21",
@@ -36,8 +36,8 @@
       "production": "1de10a3e7ec936a3c4e16f1bae02c5126379c7c45d8946a8e83558d9365b1698"
     },
     "uplot": {
-      "readable": "f5ad1265dbd4d3a3fa35e9b4d4824e5f0a08a6cf25d68e6fc97b86d45177f0ea",
-      "production": "18d8e5e5c50c3d07d88f38cb2e6dafb46cedf95cf7d19758e58b11daafa61bb4"
+      "readable": "7dd55af988d8ea5d9ea90c40e0128e0480b6f7d255cb55175067143256a5acd9",
+      "production": "5920fd82b0cabbd15c01354e37bf42ba8145b09ec1c8c39bb926407b818187c7"
     }
   }
 }

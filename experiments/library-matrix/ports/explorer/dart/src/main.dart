@@ -31,9 +31,81 @@ JSObject record(Map<String, Value> fields) {
 }
 
 Value field(Value value, String key) => (value as JSObject)[key];
+// One idb script (idb CONTRACT.md, "Input"): create the store, put every row in
+// one readwrite transaction, then walk the store with a cursor in primary-key
+// order.
+JSObject persist(Iterable<JSObject> rows) {
+  JSObject transaction(String mode, JSObject step) => record({
+    'op': 'tx'.toJS,
+    'conn': 'explorer'.toJS,
+    'stores': 'rows'.toJS,
+    'mode': mode.toJS,
+    'steps': [step].asArray,
+    'catch': false.toJS,
+  });
+  final schema = [
+    record({
+      'op': 'createStore'.toJS,
+      'name': 'rows'.toJS,
+      'options': record({'keyPath': 'id'.toJS}),
+    }),
+    record({
+      'op': 'createIndex'.toJS,
+      'store': 'rows'.toJS,
+      'name': 'byGroup'.toJS,
+      'keyPath': 'group'.toJS,
+    }),
+  ].asArray;
+  final openDb = record({
+    'op': 'openDB'.toJS,
+    'db': 'explorer'.toJS,
+    'conn': 'explorer'.toJS,
+    'version': 1.toJS,
+    'upgrade': schema,
+    'catch': false.toJS,
+  });
+  final puts = rows
+      .map(
+        (row) => record({
+          'op': 'put'.toJS,
+          'store': null,
+          'index': null,
+          'args': [row].asArray,
+          'catch': false.toJS,
+        }),
+      )
+      .asArray;
+  final write = record({
+    'op': 'batch'.toJS,
+    'requests': puts,
+    'abort': false.toJS,
+    'done': true.toJS,
+  });
+  final walk = record({
+    'op': 'openCursor'.toJS,
+    'store': null,
+    'index': null,
+    'args': <Value>[].asArray,
+    'positions': <Value>[].asArray,
+    'rest': [
+      ['continue'.toJS].asArray,
+    ].asArray,
+    'catch': false.toJS,
+  });
+  return record({
+    'steps': [
+      openDb,
+      transaction('readwrite', write),
+      transaction('readonly', walk),
+    ].asArray,
+  });
+}
+
+// The stored rows' `value` texts, from the cursor entries of the idb log.
 List<String> stored(List<Value> history) =>
-    items(items(history[0])[3])
-        .map((row) => (items(row)[2] as JSString).toDart)
+    items(field(history[0], 'log'))
+        .where((entry) => (items(entry)[0] as JSString).toDart == 'cursor')
+        .map((entry) => (field(items(entry)[3], 'value') as JSString).toDart)
         .toList();
 List<Value> hits(List<Value> history) =>
     items(field(items(field(history[1], 'results'))[1], 'hits'));
@@ -45,26 +117,14 @@ JSArray<Value> run(JSArray<Value> packet) {
   final history = items(items(packet)[1]);
   switch (history.length) {
     case 0:
-      final rows = items(field(input, 'records'))
-          .map(
-            (doc) => record({
-              'id': field(doc, 'id'),
-              'group': 'documents'.toJS,
-              'value': stringify(doc as JSObject).toJS,
-            }),
-          )
-          .asArray;
-      return command(
-        'idb',
-        record({
-          'batches': [
-            record({'rows': rows}),
-          ].asArray,
-          'keys': <Value>[].asArray,
-          'groups': <Value>[].asArray,
-          'step': 1.toJS,
+      final rows = items(field(input, 'records')).map(
+        (doc) => record({
+          'id': field(doc, 'id'),
+          'group': 'documents'.toJS,
+          'value': stringify(doc as JSObject).toJS,
         }),
       );
+      return command('idb', persist(rows));
     case 1:
       final options = record({
         'fields': ['title'.toJS, 'body'.toJS].asArray,

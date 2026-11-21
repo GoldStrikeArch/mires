@@ -6,11 +6,11 @@
     "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
   },
   "sources": {
-    "idb": "0573c897eb91823ec47091f7a609faee0bf32c46cfa228389167788f09285f62",
+    "idb": "97190495df3070e0b9b2d013d66df9fcec63612a8871b27ffd2aea40226bd78f",
     "minisearch": "eeae4c498a3a39ecae27beff4efb0c276375dfcb0aa38d444f89f661bf3041c4",
-    "marked": "bbceada0f5e3f1ed4164abe5c1489419a764e740e00f389602f19a9740ffd927",
-    "fflate": "ac1ab7173e0ff5ef4526602e2946e2acb17437edec15b81218d039543857f162",
-    "uplot": "83bbab02c5f83e8dd42efc3b6b947d021cea5d5e66cf9a245aa4a0625a8a3969"
+    "marked": "c8963a70db7ad01742022cff28333766acb4818460394b550f2e4a2fa911d763",
+    "fflate": "71871bea0e98037d8637f33e35386219503d4675522cd68aaca14b78853821d0",
+    "uplot": "3d75603cc6ec62fe94e4a28fc6e81da0341259718fb11b7eacb66669700d5d53"
   },
   "toolchain": {
     "elm": "0.19.2",
@@ -19,24 +19,24 @@
   },
   "artifacts": {
     "idb": {
-      "readable": "1a842f78006e5e87501659ed4f9ee4062996a8e8e93ac11374ef377243098eea",
-      "production": "e7dbc8d2406e8df0e04c847fc4bd6f355312ec85c43df6227cab4abd07541c5a"
+      "readable": "4454383c8c114789a9d7731a7ca447969cf1e4c59df61c45e73e939f49938d93",
+      "production": "cdc38a42a3da29ae3d3a080488972b4f91427170647a10ebf721e9a4a3fe3553"
     },
     "minisearch": {
       "readable": "5ec235b4108a8f15244f1c15b20340a0b49ebd89d0e477083eba6cdb0a6bc180",
       "production": "21b7ae5f8e79d476138d89f530ebb99fe78c2b98352c3e389b12a55851f44431"
     },
     "marked": {
-      "readable": "ceb785d21574c83b8551b0c2e93d53b53299e79c97740096c8ab03225b87dcf9",
-      "production": "7203a1744f3687ff3b7083884e9bc5d52e3129e167a95b10dbf6860c9294d589"
+      "readable": "31a67b800977e794572d9b00cfc103b7f2dbadf723c054c36a3c0dcad44f8a4b",
+      "production": "17a14f1680a07a973562360d3cae86d4d144a02f38c681bacb222cb3dcf76694"
     },
     "fflate": {
-      "readable": "4a001e7ff9f5cf203ad53605538f0ef15e607df22885f6c388d7cfa61010c650",
-      "production": "574d227d50a24df05343614cf248aa27ad37d669e12f201d76bf2067a1b790e0"
+      "readable": "66dc6d3e47e52babddd0ead0b531b28468d7f2654d6b6402da401514052b07e0",
+      "production": "fdd4ff14b24243cdfdaa264c7e19144be7429f3237c2c7468508a252e6042c40"
     },
     "uplot": {
-      "readable": "430885f41014294780471c7b9293e397334ae2edd896b908d218e8e25b1b7cc7",
-      "production": "db5a2343457c614772d060d91eff45dcb45e54c02c49fdd5c5364932f21d054e"
+      "readable": "459fcfabcf6f18a87ed02341b3078878ba02067190307e3cc17d3c2008f4beff",
+      "production": "dd2c97b5b50a143c3d152777dd1876473d5af9173bd8ff2bf56797f0c29065a0"
     }
   }
 }

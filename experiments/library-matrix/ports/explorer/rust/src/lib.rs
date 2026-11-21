@@ -41,12 +41,86 @@ fn list(items: &[JsValue]) -> JsValue {
     }
     a
 }
+/// One idb script (idb CONTRACT.md, "Input"): create the store, put every row in one
+/// readwrite transaction, then walk the store with a cursor in primary-key order.
+fn persist(rows: JsValue) -> JsValue {
+    let schema = list(&[
+        obj(&[
+            ("op", s("createStore")),
+            ("name", s("rows")),
+            ("options", obj(&[("keyPath", s("id"))])),
+        ]),
+        obj(&[
+            ("op", s("createIndex")),
+            ("store", s("rows")),
+            ("name", s("byGroup")),
+            ("keyPath", s("group")),
+        ]),
+    ]);
+    let open = obj(&[
+        ("op", s("openDB")),
+        ("db", s("explorer")),
+        ("conn", s("explorer")),
+        ("version", JsValue::erase(1)),
+        ("upgrade", schema),
+        ("catch", JsValue::erase(false)),
+    ]);
+    let puts = array();
+    for i in 0..len(rows) {
+        push(
+            puts,
+            obj(&[
+                ("op", s("put")),
+                ("store", JsValue::null()),
+                ("index", JsValue::null()),
+                ("args", list(&[at(rows, i)])),
+                ("catch", JsValue::erase(false)),
+            ]),
+        );
+    }
+    let write = obj(&[
+        ("op", s("batch")),
+        ("requests", puts),
+        ("abort", JsValue::erase(false)),
+        ("done", JsValue::erase(true)),
+    ]);
+    let walk = obj(&[
+        ("op", s("openCursor")),
+        ("store", JsValue::null()),
+        ("index", JsValue::null()),
+        ("args", array()),
+        ("positions", array()),
+        ("rest", list(&[list(&[s("continue")])])),
+        ("catch", JsValue::erase(false)),
+    ]);
+    let steps = list(&[
+        open,
+        transaction("readwrite", write),
+        transaction("readonly", walk),
+    ]);
+    obj(&[("steps", steps)])
+}
+/// A transaction step on the Explorer store.
+fn transaction(mode: &str, step: JsValue) -> JsValue {
+    obj(&[
+        ("op", s("tx")),
+        ("conn", s("explorer")),
+        ("stores", s("rows")),
+        ("mode", s(mode)),
+        ("steps", list(&[step])),
+        ("catch", JsValue::erase(false)),
+    ])
+}
+/// The stored rows' `value` texts, from the cursor entries of the idb log.
 fn stored(history: JsValue, decode: bool) -> JsValue {
-    let cursor = at(at(history, 0), 3);
+    let log = get(at(history, 0), "log");
     let values = array();
-    for i in 0..len(cursor) {
-        let text = at(at(cursor, i), 2);
-        push(values, if decode { parse(text) } else { text });
+    for i in 0..len(log) {
+        let entry = at(log, i);
+        if at(entry, 0).strictly_equals(s("cursor")) {
+            let text = get(at(entry, 3), "value");
+            push(values, if decode { parse(text) } else { text });
+        }
     }
     values
 }
@@ -74,16 +148,7 @@ pub fn matrix_run(packet: JsValue) -> JsValue {
                     ]),
                 );
             }
-            let batch = obj(&[("rows", rows)]);
-            (
-                s("idb"),
-                obj(&[
-                    ("batches", list(&[batch])),
-                    ("keys", array()),
-                    ("groups", array()),
-                    ("step", JsValue::erase(1)),
-                ]),
-            )
+            (s("idb"), persist(rows))
         }
         1 => {
             let options = obj(&[

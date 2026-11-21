@@ -15,9 +15,42 @@ let map f values =
   for i = 0 to length values - 1 do push output (f (at values i)) done;
   output
 
+(* One idb script (idb CONTRACT.md, "Input"): create the store, put every row in one readwrite
+   transaction, then walk the store with a cursor in primary-key order. *)
+let persist rows =
+  let schema =
+    list
+      [ object_ ["op", str "createStore"; "name", str "rows"; "options", object_ ["keyPath", str "id"]];
+        object_ ["op", str "createIndex"; "store", str "rows"; "name", str "byGroup"; "keyPath", str "group"] ]
+  in
+  let open_db =
+    object_
+      [ "op", str "openDB"; "db", str "explorer"; "conn", str "explorer"; "version", int 1;
+        "upgrade", schema; "catch", bool false ]
+  in
+  let put row =
+    object_ ["op", str "put"; "store", nil; "index", nil; "args", list [row]; "catch", bool false]
+  in
+  let write = object_ ["op", str "batch"; "requests", map put rows; "abort", bool false; "done", bool true] in
+  let walk =
+    object_
+      [ "op", str "openCursor"; "store", nil; "index", nil; "args", array (); "positions", array ();
+        "rest", list [list [str "continue"]]; "catch", bool false ]
+  in
+  let transaction mode step =
+    object_
+      [ "op", str "tx"; "conn", str "explorer"; "stores", str "rows"; "mode", str mode;
+        "steps", list [step]; "catch", bool false ]
+  in
+  object_ ["steps", list [open_db; transaction "readwrite" write; transaction "readonly" walk]]
+
+(* The stored rows' [value] texts, from the cursor entries of the idb log. *)
 let stored history =
-  let cursor = at (at history 0) 3 in
-  map (fun row -> at row 2) cursor
+  let log = get (at history 0) "log" in
+  List.init (length log) (at log)
+  |> List.filter (fun entry -> text (at entry 0) = "cursor")
+  |> List.map (fun entry -> get (at entry 3) "value")
+  |> list
 
 let hits history = get (at (get (at history 1) "results") 1) "hits"
 let command name argument = list [str name; argument]
@@ -27,8 +60,7 @@ let run packet =
   match length history with
   | 0 ->
       let row doc = object_ ["id", get doc "id"; "group", str "documents"; "value", json doc] in
-      let batch = object_ ["rows", map row (get input "records")] in
-      command "idb" (object_ ["batches", list [batch]; "keys", array (); "groups", array (); "step", int 1])
+      command "idb" (persist (map row (get input "records")))
   | 1 ->
       let options = object_ ["fields", list [str "title"; str "body"]; "storeFields", list [str "body"]] in
       let add = object_ ["op", str "addAll"; "documents", map parse (stored history)] in

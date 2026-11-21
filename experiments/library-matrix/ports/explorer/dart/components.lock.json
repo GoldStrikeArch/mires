@@ -6,20 +6,20 @@
     "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
   },
   "sources": {
-    "idb": "2778069266d0616aa51ef72805b617d93ea9b82344abdbfc634781d3e8895b26",
-    "minisearch": "635d1b68193cf7d1919ce464c5941ff2c294dc23bff032ec3e110d7db1c1fe22",
+    "idb": "89bb7c8e30d664e0a0cfd935079c3a69882ce5e760f96eb000d39ef13caa64a6",
+    "minisearch": "260860846b1fc0bd45e3364f7ec7a6be8a106ed32a05c897da04697589c48a50",
     "marked": "da604e75a9d8954cc75db79f4c2af206f5a07a796bf828e680c13e054fc84787",
-    "fflate": "d65ad087104d21aa8abce556e735afb9e7c732f993ea06eae1f6d3fdc6d4d980",
-    "uplot": "d2d757d23036294e9a6a576013447ef5af82736aa9dc15885f46ab6703fd15d1"
+    "fflate": "04a8cfff7df23a50668df79ac431bcf86f164bf4100f7a5d971397a2da8c84a8",
+    "uplot": "35c523bddd93e63854e779f46a4a41a04eb40520e885c2412bbc99963bf2eb86"
   },
   "toolchain": {
-    "dart": "Dart SDK version: 3.14.0 (stable) (Wed Nov 4 16:28:39 2026 -0800) on \"macos_arm64\"",
+    "dart": "Dart SDK version: 3.14.1 (stable) (Tue Nov 17 00:01:24 2026 -0800) on \"macos_arm64\"",
     "terser": "5.31.6"
   },
   "artifacts": {
     "idb": {
-      "readable": "1d6143c94605948b49c8d1379305045f2193e4534dcc4c7967fee202bf0fdc22",
-      "production": "696519dc0dd75f348f752d94b6a7c027d5bcafb1aa0c5ae69f4d8047f9779cf9"
+      "readable": "a814b8dbb2cb4f0fae4630a5a4f821feb435062876e19736e56f1aa184adeec1",
+      "production": "a2d07e747f7d796d41159b2e5c9c2be9b4316c9cf9fdc6145002c565e4d3a1b3"
     },
     "minisearch": {
       "readable": "2feae12a9fce82476aacca8705637373c171069d02b2491bb172a916fd292ad3",
@@ -34,8 +34,8 @@
       "production": "0de698926b91daa5bc06f8f16b7ff3fae149f1bcc44647212b493cf85e9bbbad"
     },
     "uplot": {
-      "readable": "ef0e733c15280835f9e0a71faef1672a6e8d41476d50889133fdf1c7f78b0ec0",
-      "production": "0c31929a9b46005bba1da8c587ef269bc2a71efc267235423477800b84abe983"
+      "readable": "28fed7a6aab28e66f42306768bd9e5504d8facb7415eb9ff005f4aa0f63f13a7",
+      "production": "d1ef21ec5fe682dfe919d65ec51874da83e3b55f0194189d354d19582710d56f"
     }
   }
 }
