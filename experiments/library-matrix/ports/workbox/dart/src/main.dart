@@ -1,409 +1,569 @@
+// Entry of the Dart port: what libraries/workbox/reference.mjs does, on the port's Workbox. One call
+// runs one script of Workbox API calls (CONTRACT.md "Steps") with the fixture plugins, builds the
+// canonical output, and deletes the script's caches on every path.
+//
+// The boundary: the corpus input is the JS object itself, seen through dart:js_interop extension
+// types (no copy); manifest entries become `PrecacheEntry` values, with each revision kept as the
+// caller's JS value. The output is built from JS objects and arrays in the contract's key order.
+//
+// dart2js cannot emit ES module exports, so main() publishes `run` on globalThis.__matrixExports,
+// which the builder's facade reads once and deletes.
+
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
 
-typedef J = JSAny?;
-typedef StepFn = J Function(J);
-@JS('undefined')
-external J get undefinedValue;
-@JS('Boolean')
-external bool truth(J x);
-@JS('Reflect.construct')
-external JSObject construct(JSObject ctor, JSArray<J> args);
-@JS('skipWaiting')
-external J skipWaiting();
-@JS('fetch')
-external J fetchRequest(J req);
-@JS('Array.from')
-external J collect(J iterator);
-@JS('Object.is')
-external bool same(J a, J b);
-@JS('crypto.randomUUID')
-external String uuid();
-J uniqueName() => ('mires-workbox-' + uuid()).toJS;
-J globalValue(String k) => globalContext[k];
-J makeHost(String k, List<J> args) =>
-    construct(globalValue(k) as JSObject, args.toJS);
-J get(J x, String k) => (x as JSObject).getProperty(k.toJS);
-void setProp(J x, String k, J v) {
-  (x as JSObject)[k] = v;
+import 'host.dart';
+import 'workbox.dart';
+
+const _fixture = 'experiments/library-matrix/libraries/workbox/';
+
+/// Well-formed SRI metadata that matches no fixture, so the fetch fails integrity.
+const _wrongIntegrity = 'sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=';
+
+extension type NativeEvent._(JSObject _) implements JSObject {
+  external String get type;
+  external void waitUntil(JSPromise<JSAny?> promise);
 }
 
-J at(J x, int i) => (x as JSArray<J>).toDart[i];
-J strVal(String s) => s.toJS;
-J boolean(bool b) => b.toJS;
-J nil() => null;
-J undef() => undefinedValue;
-J objectValue() => JSObject();
-J pack(List<J> xs) => xs.toJS;
-void push(J a, J v) {
-  (a as JSArray<J>).toDart.add(v);
+extension type PluginSpec._(JSObject _) implements JSObject {
+  external String get kind;
+  external String get label;
+  external String get on;
+  external JSAny? get value;
+  external String get url;
+  external String get controller;
 }
 
-J call(J x, String k, List<J> args) =>
-    (x as JSObject).callMethodVarArgs(k.toJS, args);
-bool missing(J x) => x.isUndefined;
-bool nullish(J x) => x == null;
-bool equalText(J x, String s) => x != null && (x as JSString).toDart == s;
-bool equalNum(J x, int i) => x != null && (x as JSNumber).toDartDouble == i;
-J chain(J p, StepFn f) => call(p, 'then', [f.toJS]);
-J recoverPromise(J p, StepFn f) => call(p, 'catch', [f.toJS]);
-J always(J p, StepFn f) => call(p, 'finally', [(() => f(undef())).toJS]);
-J ok(J v) => call(globalValue('Promise'), 'resolve', [v]);
-J bad(J v) => call(globalValue('Promise'), 'reject', [v]);
-void mapValues(J xs, StepFn f) {
-  for (final v in (xs as JSArray<J>).toDart) {
-    f(v);
-  }
+extension type HandlerSpec._(JSObject _) implements JSObject {
+  external String? get strategy;
+  external String get cacheName;
+  external JSArray<PluginSpec>? get plugins;
+  external String? get precache;
+  external String? get bound;
+  external String get controller;
+  external JSAny? get respond;
+  external JSAny? get status;
 }
 
-J sequence(J xs, StepFn f) {
-  var p = ok(undef());
-  for (final v in (xs as JSArray<J>).toDart) {
-    p = chain(p, (_) => f(v));
-  }
-  return p;
+extension type RouteOptionsSpec._(JSObject _) implements JSObject {
+  external JSAny? get directoryIndex;
+  external JSAny? get cleanURLs;
+  external JSArray<JSString>? get ignoreURLParametersMatching;
+  external JSArray<JSString>? get urlManipulation;
 }
 
-J suffix(J a, String tail) => ((a as JSString).toDart + tail).toJS;
-bool starts(J a, String prefix) => (a as JSString).toDart.startsWith(prefix);
-bool ends(J a, String tail) => (a as JSString).toDart.endsWith(tail);
-J relative(J path, J base) =>
-    (path as JSString).toDart.substring((base as JSString).toDart.length).toJS;
-bool badStatus(J status) => (status as JSNumber).toDartInt >= 400;
-J defaulted(J a, J b) => missing(a) ? b : a;
-
-J absolute(J path, J base) {
-  return get(makeHost("URL", <J>[path, base]), "href");
+extension type Step._(JSObject _) implements JSObject {
+  external String get op;
+  external String? get id;
+  external String get source;
+  external String get cacheName;
+  external JSArray<PluginSpec>? get plugins;
+  external JSAny? get fallbackToNetwork;
+  external String get controller;
+  external JSArray<JSAny?> get entries;
+  external String get router;
+  external String? get route;
+  external RouteOptionsSpec? get options;
+  external String? get prefix;
+  external bool? get crossOrigin;
+  external HandlerSpec get handler;
+  external String? get method;
+  external String? get url;
+  external String? get mode;
+  external String? get integrity;
+  external JSAny? get request;
 }
 
-J network(J source, J base) {
-  if (equalText(source, "offline")) {
-    return bad(strVal("offline"));
-  } else {
-    final req = makeHost("Request", <J>[
-      absolute(suffix(source, ".mjs"), base),
-    ]);
-    return fetchRequest(req);
-  }
+extension type Input._(JSObject _) implements JSObject {
+  external JSArray<Step> get steps;
+  external String? get cachePrefix;
+  external NativeEvent? get event;
+  external Request? get request;
 }
 
-J precacheKey(J entries, J path, J base) {
-  final url = makeHost("URL", <J>[path, base]);
-  setProp(url, "hash", strVal(""));
-  final exact = call(entries, "get", <J>[get(url, "href")]);
-  if (!missing(exact)) {
-    return exact;
-  } else {
-    final params = get(url, "searchParams");
-    final keys = collect(call(params, "keys", <J>[]));
-    J ignore(J key) {
-      if ((equalText(key, "fbclid") || starts(key, "utm_"))) {
-        call(params, "delete", <J>[key]);
-      }
-      return undef();
-    }
+/// One handler's trace: the trace plugin's label, the request and the records of its callbacks.
+class _HandlerTrace {
+  _HandlerTrace(this.label, this.url);
 
-    mapValues(keys, ignore);
-    final stripped = call(entries, "get", <J>[get(url, "href")]);
-    if (!missing(stripped)) {
-      return stripped;
-    } else {
-      final original = get(url, "pathname");
-      setProp(url, "pathname", suffix(original, "index.html"));
-      final index = (ends(original, "/")
-          ? call(entries, "get", <J>[get(url, "href")])
-          : undef());
-      if (!missing(index)) {
-        return index;
-      } else {
-        setProp(url, "pathname", suffix(original, ".html"));
-        return call(entries, "get", <J>[get(url, "href")]);
-      }
-    }
-  }
+  final String label;
+  final String url;
+  final log = <JSArray<JSAny?>>[];
 }
 
-J install(J entries, J cache, J source, J base) {
-  final updated = pack(<J>[]);
-  final unchanged = pack(<J>[]);
-  J check(J entry) {
-    final original = at(entry, 0);
-    final key = at(entry, 1);
-    J found(J hit) {
-      if (!missing(hit)) {
-        push(unchanged, relative(original, base));
-        return undef();
-      } else {
-        J received(J res) {
-          if (badStatus(get(res, "status"))) {
-            return bad(strVal("bad-precaching-response"));
-          } else {
-            J stored(J unused) {
-              push(updated, relative(original, base));
-              return undef();
-            }
+/// The stand-in ExtendableEvent of one event-driven step: it collects its lifetime promises.
+class _StandInEvent implements ExtendableEvent {
+  _StandInEvent(this.type);
 
-            return chain(
-              call(cache, "put", <J>[key, call(res, "clone", <J>[])]),
-              stored,
-            );
-          }
+  @override
+  final String type;
+  final pending = <Future<Object?>>[];
+
+  @override
+  void waitUntil(Future<Object?> promise) => pending.add(promise);
+}
+
+/// A native event the caller supplied (service-worker mode).
+class _HostEvent implements ExtendableEvent {
+  _HostEvent(this._event);
+
+  final NativeEvent _event;
+
+  @override
+  String get type => _event.type;
+
+  @override
+  void waitUntil(Future<Object?> promise) => _event.waitUntil(promise.then((_) => null).toJS);
+}
+
+/// A response as a followed redirect leaves it: it and every clone of it report redirected.
+Response _redirected(Response response) {
+  final clone = (response['clone'] as JSFunction).callMethod<JSFunction>('bind'.toJS, response);
+  defineProperty(response, 'redirected', JSObject()..['value'] = true.toJS);
+  defineProperty(response, 'clone', JSObject()..['value'] = (() => _redirected(clone.callAsFunction() as Response)).toJS);
+  return response;
+}
+
+JSNumber? _status(Response? response) => response?.status.toJS;
+
+/// The adapter's urlManipulation variant: `new URL(url.href)` with `pathname += suffix`.
+URL _withSuffix(URL url, String suffix) {
+  final variant = URL.from(url.href);
+  variant.pathname = variant.pathname + suffix;
+  return variant;
+}
+
+/// An Error's name; a thrown non-Error (the fail fixture's `value`) prints as its string.
+String _nameOf(Object error) => switch (error) {
+      WorkboxError(:final name) => name,
+      final JSObject value when isError(value) => hostErrorName(value),
+      // A thrown string prints as itself, as `String(value)` prints it.
+      _ => error.toString(),
+    };
+
+/// A manifest entry from the corpus: falsy, a string, or a `PrecacheEntry` object.
+PrecacheEntry _precacheEntry(JSAny? value) {
+  if (!isTruthy(value)) return FalsyEntry(value);
+  if (value.isA<JSString>()) return UrlEntry((value as JSString).toDart);
+  final entry = value as JSObject;
+  String? text(String name) => (entry[name] as JSString?)?.toDart;
+  return ObjectEntry(text('url'), entry['revision'], text('integrity'), entry);
+}
+
+class _Scenario {
+  _Scenario(this._input)
+      : _base = URL.from('./', location.href).href,
+        _prefix = _input.cachePrefix ?? 'mires-workbox-${crypto.randomUUID()}',
+        _owned = _input.cachePrefix == null;
+
+  final Input _input;
+  final String _base;
+  final String _prefix;
+  final bool _owned;
+  var _source = 'alpha';
+  final _controllers = <String, PrecacheController>{};
+  final _routers = <String, Router>{};
+  final _routes = <String, Route>{};
+  final _results = <JSAny?>[];
+  final _events = <JSAny?>[];
+  final _handlers = <_HandlerTrace>[];
+
+  String _relative(String url) => url.startsWith(_base) ? url.substring(_base.length) : url;
+
+  String _cacheName(String name) => '$_prefix-$name';
+
+  String _cacheLabel(String name) => name.startsWith('$_prefix-') ? name.substring(_prefix.length + 1) : name;
+
+  /// Runs every step, reports, and deletes the scenario's caches whatever happened.
+  Future<JSObject> run() async {
+    try {
+      for (final step in _input.steps.toDart) {
+        JSAny? result;
+        try {
+          result = await _step(step);
+        } catch (error) {
+          result = _failure(error);
         }
-
-        return chain(network(source, base), received);
+        _results.add(result);
       }
-    }
-
-    return chain(call(cache, "match", <J>[key]), found);
-  }
-
-  J complete(J unused) {
-    return pack(<J>[updated, unchanged]);
-  }
-
-  return chain(
-    sequence(collect(call(entries, "entries", <J>[])), check),
-    complete,
-  );
-}
-
-J activate(J entries, J cache, J base) {
-  final active = collect(call(entries, "values", <J>[]));
-  final removed = pack(<J>[]);
-  J listKeys(J keys) {
-    J remove(J req) {
-      final path = get(req, "url");
-      if (truth(call(active, "includes", <J>[path]))) {
-        return undef();
-      } else {
-        J deleted(J unused) {
-          push(removed, relative(path, base));
-          return undef();
+      final caches = await _dump();
+      final traces = [for (final trace in _handlers) [trace.label.toJS, trace.url.toJS, trace.log.toJS].toJS];
+      return JSObject()
+        ..['results'] = _results.toJS
+        ..['events'] = _events.toJS
+        ..['handlers'] = traces.toJS
+        ..['caches'] = caches;
+    } finally {
+      if (_owned) {
+        for (final name in (await caches.keys().toDart).toDart) {
+          if (name.toDart.startsWith('$_prefix-')) await caches.delete(name.toDart).toDart;
         }
-
-        return chain(call(cache, "delete", <J>[path]), deleted);
-      }
-    }
-
-    J complete(J unused) {
-      return call(removed, "sort", <J>[]);
-    }
-
-    return chain(sequence(keys, remove), complete);
-  }
-
-  return chain(call(cache, "keys", <J>[]), listKeys);
-}
-
-J strategy(J entries, J cache, J name, J path, J source, J base) {
-  final key = precacheKey(entries, path, base);
-  final route = relative(path, base);
-  if (!missing(key)) {
-    J precached(J hit) {
-      return (missing(hit) ? network(source, base) : hit);
-    }
-
-    return chain(call(cache, "match", <J>[key]), precached);
-  } else {
-    if (starts(route, "network/")) {
-      return network(source, base);
-    } else {
-      if ((starts(route, "first/") || starts(route, "only/"))) {
-        J opened(J runtime) {
-          J matched(J hit) {
-            if (!missing(hit)) {
-              return hit;
-            } else {
-              if (starts(route, "only/")) {
-                return bad(strVal("no-response"));
-              } else {
-                J fetched(J response) {
-                  if (equalNum(get(response, "status"), 200)) {
-                    J stored(J unused) {
-                      return response;
-                    }
-
-                    return chain(
-                      call(runtime, "put", <J>[
-                        path,
-                        call(response, "clone", <J>[]),
-                      ]),
-                      stored,
-                    );
-                  } else {
-                    return response;
-                  }
-                }
-
-                return chain(network(source, base), fetched);
-              }
-            }
-          }
-
-          return chain(call(runtime, "match", <J>[path]), matched);
-        }
-
-        return chain(
-          call(globalValue("caches"), "open", <J>[suffix(name, "-runtime")]),
-          opened,
-        );
-      } else {
-        return ok(nil());
       }
     }
   }
-}
 
-J fetchRequestForStep(J step, J base) {
-  final request = get(step, "request");
-  if (truth(request)) return request;
-  final init = objectValue();
-  final method = get(step, "method");
-  if (truth(method)) setProp(init, "method", method);
-  return makeHost("Request", <J>[absolute(get(step, "path"), base), init]);
-}
-
-J phase(J step, J name, J items, J base) {
-  final entries = makeHost("Map", <J>[]);
-  final state = objectValue();
-  J add(J item) {
-    final url = makeHost("URL", <J>[get(item, "path"), base]);
-    final original = get(url, "href");
-    final revision = get(item, "revision");
-    if (truth(revision)) {
-      call(get(url, "searchParams"), "set", <J>[
-        strVal("__WB_REVISION__"),
-        revision,
-      ]);
-    }
-    final key = get(url, "href");
-    final previous = call(entries, "get", <J>[original]);
-    if ((!missing(previous) && !same(previous, key))) {
-      setProp(state, "conflict", boolean(true));
-    }
-    call(entries, "set", <J>[original, key]);
-    return undef();
-  }
-
-  mapValues(items, add);
-  if (truth(get(state, "conflict"))) {
-    return bad(strVal("conflicting revisions"));
-  } else {
-    final op = get(step, "phase");
-    final source = defaulted(get(step, "source"), strVal("alpha"));
-    J opened(J cache) {
-      if (equalText(op, "install")) {
-        return install(entries, cache, source, base);
-      } else {
-        if (equalText(op, "activate")) {
-          return activate(entries, cache, base);
+  Future<JSAny?> _step(Step step) async {
+    switch (step.op) {
+      case 'network':
+        _source = step.source;
+        return null;
+      case 'controller':
+        final fallbackToNetwork = step.fallbackToNetwork.dartify() != false;
+        _controllers[step.id!] = PrecacheController(_cacheName(step.cacheName), plugins: _plugins(step.plugins), fallbackToNetwork: fallbackToNetwork);
+        return null;
+      case 'addToCacheList':
+        _controller(step.controller).addToCacheList([for (final entry in step.entries.toDart) _precacheEntry(entry)]);
+        return null;
+      case 'addPlugins':
+        _controller(step.controller).strategy.plugins.addAll([for (final spec in step.plugins?.toDart ?? <PluginSpec>[]) _plugin(spec)]);
+        return null;
+      case 'install':
+        final result = await _lifetime('install', (event) => _controller(step.controller).install(event));
+        return JSObject()
+          ..['updatedURLs'] = _urls(result.updatedURLs)
+          ..['notUpdatedURLs'] = _urls(result.notUpdatedURLs);
+      case 'activate':
+        final result = await _lifetime('activate', (event) => _controller(step.controller).activate(event));
+        return JSObject()..['deletedURLs'] = _urls(result.deletedURLs);
+      case 'getCachedURLs':
+        return _urls(_controller(step.controller).getCachedURLs());
+      case 'getURLsToCacheKeys':
+        return [
+          for (final entry in _controller(step.controller).getURLsToCacheKeys().entries)
+            [_relative(entry.key).toJS, _relative(entry.value).toJS].toJS,
+        ].toJS;
+      case 'getCacheKeyForURL':
+        final key = _controller(step.controller).getCacheKeyForURL(step.url!);
+        return key == null ? null : _relative(key).toJS;
+      case 'matchPrecache':
+        final url = step.url!;
+        final Object request = isTruthy(step.request) ? await hostCall(() => Request(url.toJS)) : url;
+        final response = await _controller(step.controller).matchPrecache(request);
+        return response == null ? null : _record(response);
+      case 'router':
+        _routers[step.id!] = Router();
+        return null;
+      case 'precacheRoute':
+        return _register(step, PrecacheRoute(_controller(step.controller), _routeOptions(step.options)));
+      case 'route':
+        final prefix = step.prefix;
+        final bool Function(MatchCallbackOptions) match =
+            step.crossOrigin == true ? (options) => !options.sameOrigin : (options) => _relative(options.url.href).startsWith(prefix!);
+        return _register(step, Route(match, _handler(step.handler), step.method ?? 'GET'));
+      case 'defaultHandler':
+        _router(step.router).setDefaultHandler(_handler(step.handler), step.method ?? 'GET');
+        return null;
+      case 'catchHandler':
+        final route = step.route;
+        if (route == null) {
+          _router(step.router).setCatchHandler(_handler(step.handler));
         } else {
-          if (equalText(op, "message")) {
-            if (equalText(get(step, "message"), "SKIP_WAITING")) {
-              J skipped(J unused) {
-                return boolean(true);
-              }
-
-              return chain(skipWaiting(), skipped);
-            } else {
-              return boolean(false);
-            }
-          } else {
-            final req = fetchRequestForStep(step, base);
-            final method = get(req, "method");
-            if (!equalText(method, "GET")) {
-              return nil();
-            } else {
-              final path = get(req, "url");
-              J received(J response) {
-                if (nullish(response)) {
-                  return nil();
-                } else {
-                  J body(J text) {
-                    return pack(<J>[get(response, "status"), text]);
-                  }
-
-                  return chain(call(response, "text", <J>[]), body);
-                }
-              }
-
-              J failed(J unused) {
-                return pack(<J>[strVal("no-response")]);
-              }
-
-              return recoverPromise(
-                chain(
-                  strategy(entries, cache, name, path, source, base),
-                  received,
-                ),
-                failed,
-              );
-            }
-          }
+          _routes[route]!.setCatchHandler(_handler(step.handler));
         }
-      }
+        return null;
+      case 'unregisterRoute':
+        _router(step.router).unregisterRoute(_routes[step.route!]!);
+        return null;
+      case 'fetch':
+        final url = step.url;
+        final request = url == null
+            ? _input.request!
+            : await hostCall(() => Request(url.toJS, requestInit(method: step.method, mode: step.mode, integrity: step.integrity)));
+        final response = await _lifetime('fetch', (event) async {
+          final responsePromise = _router(step.router).handleRequest(request, event);
+          return responsePromise == null ? null : await responsePromise;
+        });
+        return response == null ? null : _record(response);
+      case 'caches':
+        return _dump();
     }
+    throw HostTypeError('unknown step ${step.op}');
+  }
 
-    return chain(call(globalValue("caches"), "open", <J>[name]), opened);
+  PrecacheController _controller(String id) => _controllers[id]!;
+
+  Router _router(String id) => _routers[id]!;
+
+  JSAny? _register(Step step, Route route) {
+    final id = step.id;
+    if (id != null) _routes[id] = route;
+    _router(step.router).registerRoute(route);
+    return null;
+  }
+
+  JSArray<JSString> _urls(List<String> urls) => [for (final url in urls) _relative(url).toJS].toJS;
+
+  /// The network fixture, then the plugins the script names.
+  List<WorkboxPlugin> _plugins(JSArray<PluginSpec>? specs) => [_NetworkPlugin(this), for (final spec in specs?.toDart ?? <PluginSpec>[]) _plugin(spec)];
+
+  WorkboxPlugin _plugin(PluginSpec spec) => switch (spec.kind) {
+        'trace' => _TracePlugin(this, spec.label),
+        'keep' => _CacheabilityPlugin(keep: true),
+        'drop' => _CacheabilityPlugin(keep: false),
+        'fail' => _FailPlugin(spec.on, spec.value),
+        'fallback' => PrecacheFallbackPlugin(fallbackURL: spec.url, precacheController: _controller(spec.controller)),
+        final kind => throw HostTypeError('unknown plugin $kind'),
+      };
+
+  /// A route handler: a strategy, a controller's precache strategy, a handler bound to a precached
+  /// URL, or an async function answering a fixed response.
+  RouteHandler _handler(HandlerSpec spec) {
+    final strategy = spec.strategy;
+    if (strategy != null) {
+      final cacheName = _cacheName(spec.cacheName);
+      final plugins = _plugins(spec.plugins);
+      return switch (strategy) {
+        'CacheFirst' => CacheFirst(cacheName, plugins),
+        'CacheOnly' => CacheOnly(cacheName, plugins),
+        'NetworkFirst' => NetworkFirst(cacheName, plugins),
+        'NetworkOnly' => NetworkOnly(cacheName, plugins),
+        _ => throw HostTypeError('unknown strategy $strategy'),
+      };
+    }
+    final precache = spec.precache;
+    if (precache != null) return _controller(precache).strategy;
+    final bound = spec.bound;
+    if (bound != null) return _controller(spec.controller).createHandlerBoundToURL(bound);
+    return CallbackHandler((_) => hostCall(() => Response(spec.respond, JSObject()..['status'] = spec.status)));
+  }
+
+  /// PrecacheRoute options as given: an absent member keeps the default, `null` disables
+  /// `directoryIndex` and `cleanURLs`.
+  PrecacheRouteOptions? _routeOptions(RouteOptionsSpec? options) {
+    if (options == null) return null;
+    final defaults = PrecacheRouteOptions();
+    final suffixes = options.urlManipulation?.toDart.map((suffix) => suffix.toDart).toList();
+    return PrecacheRouteOptions(
+      directoryIndex: options.directoryIndex.isUndefined ? defaults.directoryIndex : (options.directoryIndex as JSString?)?.toDart,
+      ignoreURLParametersMatching: options.ignoreURLParametersMatching?.toDart.map((source) => HostRegExp(source.toDart)).toList(),
+      cleanURLs: options.cleanURLs.isUndefined ? defaults.cleanURLs : isTruthy(options.cleanURLs),
+      urlManipulation: suffixes == null ? null : (url) => [for (final suffix in suffixes) _withSuffix(url, suffix)],
+    );
+  }
+
+  /// Runs one event-driven step under a fresh stand-in event and waits for every lifetime it was
+  /// given, in rounds, or, in service-worker mode, under the caller's native event.
+  Future<T> _lifetime<T>(String type, Future<T> Function(ExtendableEvent event) action) async {
+    final native = _input.event;
+    if (native != null) return action(_HostEvent(native));
+    final event = _StandInEvent(type);
+    var count = 0;
+    try {
+      return await action(event);
+    } finally {
+      while (event.pending.isNotEmpty) {
+        final batch = [...event.pending];
+        event.pending.clear();
+        count += batch.length;
+        await Future.wait([for (final promise in batch) promise.then((_) => null, onError: (Object _) => null)]);
+      }
+      _events.add([type.toJS, count.toJS].toJS);
+    }
+  }
+
+  /// `{status, url, body}` of a response, reading its body.
+  Future<JSObject> _record(Response response) async {
+    final status = response.status;
+    final url = _relative(response.url);
+    final body = await response.text().toDart;
+    return JSObject()
+      ..['status'] = status.toJS
+      ..['url'] = url.toJS
+      ..['body'] = body;
+  }
+
+  /// `{error, message}` for a WorkboxError, `{error}` for another Error, `{thrown}` for a thrown
+  /// non-Error.
+  JSObject _failure(Object error) => switch (error) {
+        WorkboxError(:final name, :final message) => JSObject()
+          ..['error'] = name.toJS
+          ..['message'] = message.split(_base).join().split('$_prefix-').join().toJS,
+        _ when isError(error) => JSObject()..['error'] = _nameOf(error).toJS,
+        _ => JSObject()..['thrown'] = _nameOf(error).toJS,
+      };
+
+  /// Every cache of the scenario, in CacheStorage order, with each entry's response record.
+  Future<JSArray<JSAny?>> _dump() async {
+    final out = <JSAny?>[];
+    for (final name in (await caches.keys().toDart).toDart) {
+      if (!name.toDart.startsWith('$_prefix-')) continue;
+      final cache = await caches.open(name.toDart).toDart;
+      final entries = <JSAny?>[];
+      for (final request in (await cache.keys().toDart).toDart) {
+        final response = await cache.matching(request).toDart;
+        entries.add([_relative(request.url).toJS, await _record(response!)].toJS);
+      }
+      out.add([_cacheLabel(name.toDart).toJS, entries.toJS].toJS);
+    }
+    return out.toJS;
   }
 }
 
-J run(J input) {
-  final base = absolute(
-    strVal("experiments/library-matrix/libraries/workbox/"),
-    get(globalValue("location"), "href"),
-  );
-  if (!missing(get(input, "phase"))) {
-    final task = phase(
-      input,
-      get(input, "name"),
-      defaulted(get(input, "manifest"), pack(<J>[])),
-      base,
-    );
-    final event = get(input, "event");
-    if (truth(event)) {
-      call(event, "waitUntil", <J>[task]);
-    }
-    return task;
-  } else {
-    final name = uniqueName();
-    final state = objectValue();
-    setProp(state, "manifest", pack(<J>[]));
-    final results = pack(<J>[]);
-    J execute(J step) {
-      final items = defaulted(get(step, "manifest"), get(state, "manifest"));
-      setProp(state, "manifest", items);
-      J collectResult(J result) {
-        push(results, result);
-        return undef();
-      }
+/// The network fixture: every fetch goes to one of the two fixture files, or fails.
+class _NetworkPlugin extends WorkboxPlugin {
+  _NetworkPlugin(this._scenario);
 
-      return chain(phase(step, name, items, base), collectResult);
-    }
+  final _Scenario _scenario;
 
-    J complete(J unused) {
-      return results;
-    }
+  @override
+  Callback<RequestWillFetchParam, Request> get requestWillFetch => (param) async {
+        final source = _scenario._source;
+        if (source == 'offline') throw HostTypeError('offline');
+        final target = URL.from('$_fixture${source == 'beta' ? 'beta' : 'alpha'}.mjs', location.href).href;
+        return Request(target.toJS, requestInit(integrity: source == 'broken' ? _wrongIntegrity : param.request.integrity));
+      };
 
-    J cleanup(J unused) {
-      final caches = globalValue("caches");
-      return call(globalValue("Promise"), "all", <J>[
-        pack(<J>[
-          call(caches, "delete", <J>[name]),
-          call(caches, "delete", <J>[suffix(name, "-runtime")]),
-        ]),
-      ]);
-    }
-
-    return always(
-      chain(sequence(get(input, "steps"), execute), complete),
-      cleanup,
-    );
-  }
+  @override
+  Callback<FetchDidSucceedParam, Response> get fetchDidSucceed => (param) async => switch (_scenario._source) {
+        'missing' => Response('missing'.toJS, JSObject()..['status'] = 404.toJS),
+        'redirected' => _redirected(param.response),
+        _ => param.response,
+      };
 }
+
+/// The trace plugin: every lifecycle callback but cacheWillUpdate, recorded per handler. A callback
+/// records only into a log its own handlerWillStart created: a plugin before it can fail that
+/// callback.
+class _TracePlugin extends WorkboxPlugin {
+  _TracePlugin(this._scenario, this._label);
+
+  final _Scenario _scenario;
+  final String _label;
+
+  String _url(Request request) => _scenario._relative(request.url);
+
+  void _record(PluginState? state, List<JSAny?> entry) {
+    final trace = state?['log'];
+    if (trace is _HandlerTrace) trace.log.add(entry.toJS);
+  }
+
+  @override
+  Callback<HandlerWillStartParam, void> get handlerWillStart => (param) async {
+        final trace = _HandlerTrace(_label, _url(param.request));
+        param.state?['log'] = trace;
+        _scenario._handlers.add(trace);
+      };
+
+  @override
+  Callback<CacheKeyWillBeUsedParam, Request> get cacheKeyWillBeUsed => (param) async {
+        _record(param.state, ['cacheKeyWillBeUsed'.toJS, param.mode.toJS, _url(param.request).toJS]);
+        return param.request;
+      };
+
+  @override
+  Callback<CachedResponseWillBeUsedParam, Response?> get cachedResponseWillBeUsed => (param) async {
+        _record(param.state, [
+          'cachedResponseWillBeUsed'.toJS,
+          _scenario._cacheLabel(param.cacheName).toJS,
+          _url(param.request).toJS,
+          _status(param.cachedResponse),
+        ]);
+        return param.cachedResponse;
+      };
+
+  @override
+  Callback<RequestWillFetchParam, Request> get requestWillFetch => (param) async {
+        _record(param.state, ['requestWillFetch'.toJS, _url(param.request).toJS]);
+        return param.request;
+      };
+
+  @override
+  Callback<FetchDidSucceedParam, Response> get fetchDidSucceed => (param) async {
+        _record(param.state, ['fetchDidSucceed'.toJS, _url(param.request).toJS, param.response.status.toJS]);
+        return param.response;
+      };
+
+  @override
+  Callback<FetchDidFailParam, void> get fetchDidFail => (param) async {
+        _record(param.state, ['fetchDidFail'.toJS, _url(param.originalRequest).toJS, _url(param.request).toJS, _nameOf(param.error).toJS]);
+      };
+
+  @override
+  Callback<CacheDidUpdateParam, void> get cacheDidUpdate => (param) async {
+        _record(param.state, [
+          'cacheDidUpdate'.toJS,
+          _scenario._cacheLabel(param.cacheName).toJS,
+          _url(param.request).toJS,
+          _status(param.oldResponse),
+          param.newResponse.status.toJS,
+        ]);
+      };
+
+  @override
+  Callback<HandlerWillRespondParam, Response> get handlerWillRespond => (param) async {
+        _record(param.state, ['handlerWillRespond'.toJS, param.response.status.toJS]);
+        return param.response;
+      };
+
+  @override
+  Callback<HandlerDidRespondParam, void> get handlerDidRespond => (param) async {
+        _record(param.state, ['handlerDidRespond'.toJS, _status(param.response)]);
+      };
+
+  @override
+  Callback<HandlerDidCompleteParam, void> get handlerDidComplete => (param) async {
+        final error = param.error;
+        _record(param.state, ['handlerDidComplete'.toJS, _status(param.response), error == null ? null : _nameOf(error).toJS]);
+      };
+
+  @override
+  Callback<HandlerDidErrorParam, Response?> get handlerDidError => (param) async {
+        _record(param.state, ['handlerDidError'.toJS, _nameOf(param.error).toJS]);
+        return null;
+      };
+}
+
+/// A cacheWillUpdate that accepts every response (`keep`) or none (`drop`).
+class _CacheabilityPlugin extends WorkboxPlugin {
+  _CacheabilityPlugin({required this.keep});
+
+  final bool keep;
+
+  @override
+  Callback<CacheWillUpdateParam, Response?> get cacheWillUpdate => (param) async => keep ? param.response : null;
+}
+
+/// A plugin whose one callback, the one named [_on], throws `new Error('fail')`, or, with a value,
+/// that value itself (a non-Error).
+class _FailPlugin extends WorkboxPlugin {
+  _FailPlugin(this._on, this._value);
+
+  final String _on;
+  final JSAny? _value;
+
+  Callback<P, R>? _failing<P, R>(String name) =>
+      name != _on ? null : (_) async => throw (_value.isUndefined ? HostError('fail') : _value as Object);
+
+  @override
+  Callback<HandlerWillStartParam, void>? get handlerWillStart => _failing('handlerWillStart');
+  @override
+  Callback<CacheKeyWillBeUsedParam, Request>? get cacheKeyWillBeUsed => _failing('cacheKeyWillBeUsed');
+  @override
+  Callback<CachedResponseWillBeUsedParam, Response?>? get cachedResponseWillBeUsed => _failing('cachedResponseWillBeUsed');
+  @override
+  Callback<CacheWillUpdateParam, Response?>? get cacheWillUpdate => _failing('cacheWillUpdate');
+  @override
+  Callback<CacheDidUpdateParam, void>? get cacheDidUpdate => _failing('cacheDidUpdate');
+  @override
+  Callback<RequestWillFetchParam, Request>? get requestWillFetch => _failing('requestWillFetch');
+  @override
+  Callback<FetchDidSucceedParam, Response>? get fetchDidSucceed => _failing('fetchDidSucceed');
+  @override
+  Callback<FetchDidFailParam, void>? get fetchDidFail => _failing('fetchDidFail');
+  @override
+  Callback<HandlerWillRespondParam, Response>? get handlerWillRespond => _failing('handlerWillRespond');
+  @override
+  Callback<HandlerDidRespondParam, void>? get handlerDidRespond => _failing('handlerDidRespond');
+  @override
+  Callback<HandlerDidCompleteParam, void>? get handlerDidComplete => _failing('handlerDidComplete');
+  @override
+  Callback<HandlerDidErrorParam, Response?>? get handlerDidError => _failing('handlerDidError');
+}
+
+/// Runs one corpus script and resolves with its output.
+JSPromise<JSObject> run(Input input) => _Scenario(input).run().toJS;
 
 void main() {
   final exports = JSObject();
-  exports["run"] = run.toJS;
-  globalContext["__matrixExports"] = exports;
+  exports['run'] = run.toJS;
+  globalContext['__matrixExports'] = exports;
 }

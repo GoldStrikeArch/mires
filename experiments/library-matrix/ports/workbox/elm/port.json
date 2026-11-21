@@ -4,5 +4,5 @@
   "language": "elm",
   "main": "src/Main.elm",
   "host": "js/index.js",
-  "boundary": "Browser CacheStorage, Fetch and service-worker events are used for revisioned precaching, routing and runtime strategies."
+  "boundary": "The JS host sends the input through receive; Elm reads each step with elm/json and runs Workbox's controller, router, strategies, handler and plugins, and the adapter, as Io fibers over a world of ids, asking the host through command for each CacheStorage, Cache, Fetch, Request, Response, URL, RegExp and event primitive and getting each answer, or the settled outcome of a host promise, through receive; the output goes back through command as exit. The host performs primitives only; host objects stay behind handles."
 }

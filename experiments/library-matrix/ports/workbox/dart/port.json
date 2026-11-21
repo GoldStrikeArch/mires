@@ -2,6 +2,6 @@
   "schema": 1,
   "library": "workbox",
   "language": "dart",
-  "boundary": "Browser CacheStorage, Fetch and service-worker events are used for revisioned precaching, routing and runtime strategies.",
+  "boundary": "run(input) reads the script in place through dart:js_interop extension types and turns manifest entries into PrecacheEntry values (each revision stays the caller's JSAny?); Workbox's controller, router, strategies, handler and plugins run as Dart classes and async functions over extension types of CacheStorage, Fetch, Request, Response, URL and RegExp, with Workbox's eager promises as Futures; the output is built as JS objects and arrays, from an async function as a JSPromise; main() publishes run on globalThis.__matrixExports for the generated facade.",
   "entry": "src/main.dart"
 }

@@ -2,5 +2,5 @@
   "schema": 1,
   "library": "workbox",
   "language": "scalajs",
-  "boundary": "Browser CacheStorage, Fetch and service-worker events are used for revisioned precaching, routing and runtime strategies."
+  "boundary": "run(input) reads the script in place through @js.native facade traits and turns manifest entries into PrecacheEntry values (each revision stays the caller's JS value); Workbox's controller, router, strategies, handler and plugins run as Scala classes over facades of CacheStorage, Fetch, Request, Response, URL and RegExp, with Workbox's eager promises as Futures on the promise-job queue; the output is built as JS objects and arrays, from a Future converted to a js.Promise."
 }
