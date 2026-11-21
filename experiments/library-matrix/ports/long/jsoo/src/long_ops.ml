@@ -76,14 +76,15 @@ let command op left right u v n r s =
   | "ctz" -> string_of_int (count_zero a false)
   | "mix" ->
     let acc = ref a and checksum = ref 0l and k = I.logor b 1L in
-    for i = 0 to n-1 do
-      acc := I.logxor b (rotl (I.add (I.mul !acc k) (I.of_int (i+1))) 11);
-      acc := I.add !acc (divide !acc (I.of_int (3+(i land 255))) u);
-      if i land 7 = 0 then begin
-        let text = format !acc u r in
-        checksum := Int32.add (Int32.mul !checksum 33l) (Int32.of_int (String.length text + Char.code text.[0]))
-      end
-    done;
+    if n > 0 then
+      for i = 0 to n-1 do
+        acc := I.logxor b (rotl (I.add (I.mul !acc k) (I.of_int (i+1))) 11);
+        acc := I.add !acc (divide !acc (I.of_int (3+(i land 255))) u);
+        if i land 7 = 0 then begin
+          let text = format !acc u r in
+          checksum := Int32.add (Int32.mul !checksum 33l) (Int32.of_int (String.length text + Char.code text.[0]))
+        end
+      done;
     format !acc u r ^ ":" ^ Int32.to_string !checksum
   | _ ->
     let value = match op with

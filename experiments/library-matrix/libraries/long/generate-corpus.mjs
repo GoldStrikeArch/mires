@@ -57,6 +57,14 @@ add('hyphen-depth','1,000 and 999 leading hyphens, the contract bound for fromSt
     cmd('fromString',{s:'-'.repeat(k)}),
     cmd('fromString',{s:'-'.repeat(k)+'NaN'}),
   ]))
+// Non-positive mix round counts (including -2^31, -2^32+5, -2^53) must run zero iterations
+// without 32-bit wrap while still validating the output radix.
+add('negative-mix-counts','Zero and negative mix round counts down to -MAX_VALUE execute zero iterations and still check radix',
+  [0, -1, -5, -(2**31), -(2**32)+5, -(2**32)+1, -(2**32), -(2**53), -1e21, -Number.MAX_VALUE].flatMap(n => [
+    cmd('mix',{a:[5,6],b:[7,8],u:false,v:false,n,r:10}),
+    cmd('mix',{a:[5,6],b:[7,8],u:true,v:true,n,r:16}),
+    cmd('mix',{a:[5,6],b:[7,8],u:false,v:false,n,r:37}),
+  ]))
 add('wasm-divide-guard','the pinned default returns the original dividend when high is MIN_INT32 and divisor is -1',
   [0,1,42,-1].map(lo=>cmd('divide',{a:[lo,-2147483648],b:[-1,-1],r:16})))
 let seed=0x4c4f4e47
