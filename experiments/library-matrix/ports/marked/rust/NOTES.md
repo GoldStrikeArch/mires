@@ -5,13 +5,14 @@ A port of the `marked@18.1.1` synchronous Markdown-to-HTML subset defined in
 `TextRenderer`, helpers, and CommonMark / GFM / pedantic rule precedence of
 `node_modules/marked/lib/marked.esm.js` (and its embedded TypeScript sources), in safe `no_std`
 Rust (`#![deny(unsafe_code)]`, zero `js!{}`, zero host `RegExp`). It matches `marked@18.1.1`
-character for character on all 111 corpus cases in Node, Chrome, and Firefox (both minified and
+character for character on all 126 corpus cases in Node, Chrome, and Firefox (both minified and
 readable artifacts). The 2026-11-20 pre-merge review found four classes of divergence in the
-hand-written matchers (regex `.` line terminators, UTF-16 counts, and two backtracking cases); they
-are fixed. Re-run on the fixed build, the review's differential fuzzers (B1's 194,000 and B2's
-1.09 million inputs) and a targeted fuzzer for the fixed classes (400,000 inputs with `\r`, U+2028,
-U+2029, astral text, lone pipes and pedantic links, across all 8 `(gfm, breaks, pedantic)`
-combinations and both operations) find no divergence except the nesting-depth limit below.
+hand-written matchers (regex `.` line terminators, UTF-16 counts, and two backtracking cases), and
+the 2026-11-21 re-review found three more (pedantic `<href>` UTF-16 `slice(1, -1)` and `cleanUrl`
+lone-surrogate fallback, optional-escape backtracking in `block.def`/`inline.link` titles, and
+multi-candidate `` ``+(?=\]) `` backtracking in `_inlineLabel`, plus bare `href` alternative order
+before `(?=\))`); all are fixed. Re-run on the fixed build, the review's differential probes,
+targeted backtracking suites, and fuzzers find no divergence except the nesting-depth limit below.
 
 | File | What it is |
 | --- | --- |
@@ -33,7 +34,9 @@ combinations and both operations) find no divergence except the nesting-depth li
   match. They are not a mechanical translation: a matcher scans forward and has to reproduce the
   regex's backtracking by reasoning about where it can succeed (for example the optional leading
   `|` of `lheadingGfm`'s table lookahead, `pedanticHrefTitle`'s `[^'"]*`, the pedantic `def`'s `<?`,
-  and `reflinkSearch`'s `nolink(?!\()`, each commented at the matcher). Equivalence rests on the
+  `reflinkSearch`'s `nolink(?!\()`, optional delimiter escapes `\\"?`/`\\'?`/`\\\)?` in
+  `block.def`/`inline.link` titles, LIFO multi-candidate `` ``+(?=\]) `` in `_inlineLabel`, and
+  `inline.link` bare `href` precedence over `(?=\))`, each commented at the matcher). Equivalence rests on the
   corpus and on differential testing against marked, not on construction. Unicode character
   classes (`\p{P}`/`\p{S}`, `[\p{Pi}\p{Ps}"']`, BMP alphanumeric, JS `\s`) use immutable sorted
   tables in `src/unicode.rs` generated from `libraries/marked/unicode-classes.json` so behavior is
@@ -50,7 +53,9 @@ combinations and both operations) find no divergence except the nesting-depth li
   an offset into the same string. Where a count is compared with a bound or carried to another
   string it is converted to UTF-16 code units, as JS counts: the `_boundedBlockLabel` `{1,999}`
   bound (`match_block_label`: an astral character is two items), `Tokenizer.list`'s
-  `line.slice(indent)` (`slice_utf16_from`) and the `linkLen` truncation (`utf16_len`). Only
+  `line.slice(indent)` (`slice_utf16_from`), the `linkLen` truncation (`utf16_len`), and
+  `Tokenizer.ts:809`'s pedantic `<href>` `href.slice(1, -1)` (BMP trailing scalar dropped in full;
+  astral trailing scalar sets `href: None` so `Renderer` applies `cleanUrl`'s `null` fallback). Only
   marked's `[...str]` spreads (`emStrong`/`del` delimiter lengths) and `expandTabs` count code
   points, and the port counts scalar values there.
 - **Recursion depth (declared deviation).** Like marked, nested blocks recurse (`block_tokens` ->

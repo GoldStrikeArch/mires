@@ -314,64 +314,73 @@ renderInlineAcc tokens acc =
                             "</del>" :: renderInlineAcc d.tokens ("<del>" :: acc)
 
                         Link l ->
-                            let
-                                clean =
-                                    cleanUrl l.href
-
-                                a1 =
-                                    "\"" :: pushEscapedHtml l.autolink clean ("<a href=\"" :: acc)
-
-                                a2 =
-                                    case l.title of
-                                        Just t ->
-                                            if String.isEmpty t then
-                                                a1
-
-                                            else
-                                                "\"" :: pushEscapedHtml False t (" title=\"" :: a1)
-
-                                        Nothing ->
-                                            a1
-
-                                a3 =
-                                    ">" :: a2
-
-                                a4 =
+                            case Maybe.andThen cleanUrl l.href of
+                                Nothing ->
                                     if l.autolink then
-                                        pushEscapedHtml True l.text a3
+                                        pushEscapedHtml True l.text acc
 
                                     else
-                                        renderInlineAcc l.tokens a3
-                            in
-                            "</a>" :: a4
+                                        renderInlineAcc l.tokens acc
+
+                                Just clean ->
+                                    let
+                                        a1 =
+                                            "\"" :: pushEscapedHtml l.autolink clean ("<a href=\"" :: acc)
+
+                                        a2 =
+                                            case l.title of
+                                                Just t ->
+                                                    if String.isEmpty t then
+                                                        a1
+
+                                                    else
+                                                        "\"" :: pushEscapedHtml False t (" title=\"" :: a1)
+
+                                                Nothing ->
+                                                    a1
+
+                                        a3 =
+                                            ">" :: a2
+
+                                        a4 =
+                                            if l.autolink then
+                                                pushEscapedHtml True l.text a3
+
+                                            else
+                                                renderInlineAcc l.tokens a3
+                                    in
+                                    "</a>" :: a4
 
                         Image img ->
                             let
                                 alt =
                                     renderTextInline img.tokens
-
-                                clean =
-                                    cleanUrl img.href
-
-                                a1 =
-                                    "\" alt=\"" :: pushEscapedHtml False clean ("<img src=\"" :: acc)
-
-                                a2 =
-                                    "\"" :: pushEscapedHtml False alt a1
-
-                                a3 =
-                                    case img.title of
-                                        Just t ->
-                                            if String.isEmpty t then
-                                                a2
-
-                                            else
-                                                "\"" :: pushEscapedHtml False t (" title=\"" :: a2)
-
-                                        Nothing ->
-                                            a2
                             in
-                            ">" :: a3
+                            case Maybe.andThen cleanUrl img.href of
+                                Nothing ->
+                                    pushEscapedHtml False alt acc
+
+                                Just clean ->
+                                    let
+                                        a1 =
+                                            "\" alt=\"" :: pushEscapedHtml False clean ("<img src=\"" :: acc)
+
+                                        a2 =
+                                            "\"" :: pushEscapedHtml False alt a1
+
+                                        a3 =
+                                            case img.title of
+                                                Just t ->
+                                                    if String.isEmpty t then
+                                                        a2
+
+                                                    else
+                                                        "\"" :: pushEscapedHtml False t (" title=\"" :: a2)
+
+                                                Nothing ->
+                                                    a2
+                                    in
+                                    ">" :: a3
 
                         InlineText t ->
                             if t.escaped then

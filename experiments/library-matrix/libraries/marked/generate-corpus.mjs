@@ -1245,6 +1245,56 @@ add('regress-depth-list-100-inline-100', '100 nested inline containers in the in
   markdown: `${'- '.repeat(100)}${nestedInline(100, 'x')}\n`,
 })
 
+// 13b. Regressions from the 2026-11-21 re-review (11): pedantic `<href>` UTF-16 `slice(1,-1)`
+// and `cleanUrl` lone-surrogate fallback, optional-escape backtracking in `def`/`link` titles,
+// multi-candidate `` ``] `` backtracking in `_inlineLabel`, and `href` alternative order.
+add('regress-pedantic-angle-href-bmp', 'pedantic `<href>` ending in BMP non-ASCII: `Tokenizer.ts:809` `href.slice(1, -1)` slices by UTF-16 code units, not UTF-8 bytes', {
+  op: 'parse',
+  markdown: '[a](<é "t">)\n\n[a](<aé "t">)\n\n[a](<中 "t">)\n\n![a](<é "t">)',
+  options: P,
+})
+add('regress-pedantic-angle-href-astral', 'pedantic `<href>` ending in an astral char splits its UTF-16 surrogate pair in `slice(1, -1)`, so `cleanUrl` returns null and renders plain/escaped text', {
+  op: 'parse',
+  markdown: '[a](<😀 "t">)\n\n[a](<a😀 "t">)\n\n[a](<😀a "t">)\n\n![a & <b>](<😀 "t">)',
+  options: P,
+})
+add('regress-def-title-escape-backtrack', 'block.def title `"(?:\\\\"?|[^"\\\\])*"`: `\\\\"?` backtracks to `\\\\` so a trailing backslash closes the title', {
+  op: 'parse',
+  markdown: '[a]: /u "t\\"\n[b]: /u "t\\\\"\n[c]: /u "t\\\\\\"\n[d]: /u "a\\"  \n"b"\n\n[a] [b] [c] [d]',
+})
+add('regress-link-title-escape-double', 'inline.link double-quoted title `"(?:\\\\"?|[^"\\\\])*"` optional-escape backtracking', {
+  op: 'parse',
+  markdown: '[a](b "t\\")\n\n[a](b "t\\\\")\n\n[a](b "t\\") "u")\n\n[a](b "t\\" ")\n\n![a](b "t\\")',
+})
+add('regress-link-title-escape-single', "inline.link single-quoted title `'(?:\\\\'?|[^'\\\\])*'` optional-escape backtracking", {
+  op: 'parse',
+  markdown: "[a](b 't\\')\n\n[a](b 't\\\\')\n\n[a](b 't\\') 'u')",
+})
+add('regress-link-title-escape-paren', 'inline.link paren title `\\((?:\\\\\\)?|[^)\\\\])*\\)` optional-escape backtracking', {
+  op: 'parse',
+  markdown: '[a](b (t\\))\n\n[a](b (t\\\\))\n\n[a](b (t\\)))',
+})
+add('regress-inline-label-multi-backtick-1', '`_inlineLabel` must keep all `` ``+(?=\\]) `` candidates when an earlier `` ``] `` pairs across `]`', {
+  op: 'parse',
+  markdown: '[``]a`b``](x)',
+})
+add('regress-inline-label-multi-backtick-2', '`_inlineLabel` LIFO backtracking prefers the later `` ``] `` candidate over an earlier matchable `` ``] ``', {
+  op: 'parse',
+  markdown: '[``](y) ` ``](x)',
+})
+add('regress-inline-label-multi-backtick-3', '`_inlineLabel` tries multiple `` ``] `` candidates in LIFO order when trailing backticks pair past them', {
+  op: 'parse',
+  markdown: '[``] ` ``](x) `\n\n[``] ` ``] ` ``](x) ` `',
+})
+add('regress-inline-label-multi-backtick-ref', '`_inlineLabel` multi-candidate `` ``] `` backtracking in reflinks', {
+  op: 'parse',
+  markdown: '[``] ` ``][r] `\n\n[r]: /u',
+})
+add('regress-link-href-rparen-alt', 'inline.link `href` tries bare `[^ \\t\\n\\x00-\\x1f]+` before `(?=\\))`, so `[a]( )<)` truncates via `findClosingBracket`', {
+  op: 'parse',
+  markdown: '[a]( )<)\n\n[a]( ) "t")',
+})
+
 // 14. Bench cases (2)
 const benchParseMd = makeBenchParse(0x18112026, 32)
 const benchGfmMd = makeBenchGfm(0x7f4a7c15, 44)
@@ -1363,6 +1413,17 @@ if (process.argv.includes('--verify')) {
   assert(inlineLevels(outputs.get('regress-depth-inline-100')) === 100, 'depth case must render 100 nested inline containers')
   assert(outputs.get('regress-depth-list-100-inline-100').split('<ul>').length === 101, 'depth case must render 100 nested lists')
   assert(inlineLevels(outputs.get('regress-depth-list-100-inline-100')) === 100, 'depth case must render 100 nested inline containers')
+  assert(outputs.get('regress-pedantic-angle-href-bmp').includes('<a href="" title="t">a</a>') && outputs.get('regress-pedantic-angle-href-bmp').includes('<a href="a" title="t">a</a>'), 'pedantic <href> BMP slice(1,-1) must drop the last UTF-16 unit')
+  assert(outputs.get('regress-pedantic-angle-href-astral').startsWith('<p>a</p>\n<p>a</p>\n<p><a href="%F0%9F%98%80" title="t">a</a></p>\n<p>a &amp; &lt;b&gt;</p>\n'), 'pedantic <href> astral slice(1,-1) must trigger cleanUrl null fallback')
+  assert(outputs.get('regress-def-title-escape-backtrack').includes('title="t\\"') && outputs.get('regress-def-title-escape-backtrack').includes('title="a\\"'), 'def title must backtrack optional \\"? escape')
+  assert(outputs.get('regress-link-title-escape-double').includes('title="t\\"') && outputs.get('regress-link-title-escape-double').includes('title="t&quot; "'), 'link double-quoted title must backtrack optional \\"? escape')
+  assert(outputs.get('regress-link-title-escape-single').includes('title="t\\"'), 'link single-quoted title must backtrack optional \\\'? escape')
+  assert(outputs.get('regress-link-title-escape-paren').includes('title="t\\"') && outputs.get('regress-link-title-escape-paren').includes('title="t)"'), 'link paren title must backtrack optional \\)? escape')
+  assert(outputs.get('regress-inline-label-multi-backtick-1') === '<p><a href="x"><code>]a`b</code></a></p>\n', '_inlineLabel must find later ``] candidate')
+  assert(outputs.get('regress-inline-label-multi-backtick-2') === '<p><a href="x"><code>](y) ` </code></a></p>\n', '_inlineLabel must backtrack ``] candidates in LIFO order')
+  assert(outputs.get('regress-inline-label-multi-backtick-3').includes('<a href="x">'), '_inlineLabel must keep all ``] candidates')
+  assert(outputs.get('regress-inline-label-multi-backtick-ref').includes('<a href="/u">'), 'reflink _inlineLabel must keep all ``] candidates')
+  assert(outputs.get('regress-link-href-rparen-alt') === '<p><a href="">a</a> )&lt;)</p>\n<p><a href="">a</a> ) &quot;t&quot;)</p>\n', 'inline.link bare href must precede (?=\\))')
   assert(outputs.get('images-text-renderer').includes('alt="bold em code del lnk sub &lt;b&gt;h&lt;/b&gt; ab * &amp; A &quot;q&quot;"'), `unexpected TextRenderer alt: ${outputs.get('images-text-renderer')}`)
 
   // Verify bench-variant for k = 1..50 on both bench cases

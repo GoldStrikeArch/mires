@@ -1005,6 +1005,100 @@
       }
     },
     {
+      "id": "regress-pedantic-angle-href-bmp",
+      "note": "pedantic `<href>` ending in BMP non-ASCII: `Tokenizer.ts:809` `href.slice(1, -1)` slices by UTF-16 code units, not UTF-8 bytes",
+      "input": {
+        "op": "parse",
+        "markdown": "[a](<é \"t\">)\n\n[a](<aé \"t\">)\n\n[a](<中 \"t\">)\n\n![a](<é \"t\">)",
+        "options": {
+          "pedantic": true
+        }
+      }
+    },
+    {
+      "id": "regress-pedantic-angle-href-astral",
+      "note": "pedantic `<href>` ending in an astral char splits its UTF-16 surrogate pair in `slice(1, -1)`, so `cleanUrl` returns null and renders plain/escaped text",
+      "input": {
+        "op": "parse",
+        "markdown": "[a](<😀 \"t\">)\n\n[a](<a😀 \"t\">)\n\n[a](<😀a \"t\">)\n\n![a & <b>](<😀 \"t\">)",
+        "options": {
+          "pedantic": true
+        }
+      }
+    },
+    {
+      "id": "regress-def-title-escape-backtrack",
+      "note": "block.def title `\"(?:\\\\\"?|[^\"\\\\])*\"`: `\\\\\"?` backtracks to `\\\\` so a trailing backslash closes the title",
+      "input": {
+        "op": "parse",
+        "markdown": "[a]: /u \"t\\\"\n[b]: /u \"t\\\\\"\n[c]: /u \"t\\\\\\\"\n[d]: /u \"a\\\"  \n\"b\"\n\n[a] [b] [c] [d]"
+      }
+    },
+    {
+      "id": "regress-link-title-escape-double",
+      "note": "inline.link double-quoted title `\"(?:\\\\\"?|[^\"\\\\])*\"` optional-escape backtracking",
+      "input": {
+        "op": "parse",
+        "markdown": "[a](b \"t\\\")\n\n[a](b \"t\\\\\")\n\n[a](b \"t\\\") \"u\")\n\n[a](b \"t\\\" \")\n\n![a](b \"t\\\")"
+      }
+    },
+    {
+      "id": "regress-link-title-escape-single",
+      "note": "inline.link single-quoted title `'(?:\\\\'?|[^'\\\\])*'` optional-escape backtracking",
+      "input": {
+        "op": "parse",
+        "markdown": "[a](b 't\\')\n\n[a](b 't\\\\')\n\n[a](b 't\\') 'u')"
+      }
+    },
+    {
+      "id": "regress-link-title-escape-paren",
+      "note": "inline.link paren title `\\((?:\\\\\\)?|[^)\\\\])*\\)` optional-escape backtracking",
+      "input": {
+        "op": "parse",
+        "markdown": "[a](b (t\\))\n\n[a](b (t\\\\))\n\n[a](b (t\\)))"
+      }
+    },
+    {
+      "id": "regress-inline-label-multi-backtick-1",
+      "note": "`_inlineLabel` must keep all `` ``+(?=\\]) `` candidates when an earlier `` ``] `` pairs across `]`",
+      "input": {
+        "op": "parse",
+        "markdown": "[``]a`b``](x)"
+      }
+    },
+    {
+      "id": "regress-inline-label-multi-backtick-2",
+      "note": "`_inlineLabel` LIFO backtracking prefers the later `` ``] `` candidate over an earlier matchable `` ``] ``",
+      "input": {
+        "op": "parse",
+        "markdown": "[``](y) ` ``](x)"
+      }
+    },
+    {
+      "id": "regress-inline-label-multi-backtick-3",
+      "note": "`_inlineLabel` tries multiple `` ``] `` candidates in LIFO order when trailing backticks pair past them",
+      "input": {
+        "op": "parse",
+        "markdown": "[``] ` ``](x) `\n\n[``] ` ``] ` ``](x) ` `"
+      }
+    },
+    {
+      "id": "regress-inline-label-multi-backtick-ref",
+      "note": "`_inlineLabel` multi-candidate `` ``] `` backtracking in reflinks",
+      "input": {
+        "op": "parse",
+        "markdown": "[``] ` ``][r] `\n\n[r]: /u"
+      }
+    },
+    {
+      "id": "regress-link-href-rparen-alt",
+      "note": "inline.link `href` tries bare `[^ \\t\\n\\x00-\\x1f]+` before `(?=\\))`, so `[a]( )<)` truncates via `findClosingBracket`",
+      "input": {
+        "op": "parse",
+        "markdown": "[a]( )<)\n\n[a]( ) \"t\")"
+      }
+    },
+    {
       "id": "bench-parse",
       "note": "Mixed CommonMark+GFM technical handbook (~52 KB) under default options",
       "input": {

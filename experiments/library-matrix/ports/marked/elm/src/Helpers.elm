@@ -393,14 +393,15 @@ decodeNcrLoop src last i acc =
             decodeNcrLoop src last (i + charWidth c) acc
 
 
-{-| Exact port of `cleanUrl` (`encodeURI(href).replace(/%25/g, '%')`).
+{-| Exact port of `cleanUrl` (`encodeURI(href).replace(/%25/g, '%')`, returning `Nothing` on
+`URIError` from lone UTF-16 surrogates).
 Keeps ASCII bytes in `encodeURI`'s unescaped set plus `%` verbatim and percent-encodes
 all other UTF-8 bytes as uppercase `%XX`.
 -}
-cleanUrl : String -> String
+cleanUrl : String -> Maybe String
 cleanUrl href =
     let
-        step ch ( lastIdx, curIdx, acc ) =
+        step ch st =
             let
                 cp =
                     Char.toCode ch
@@ -408,42 +409,48 @@ cleanUrl href =
                 w =
                     charWidth cp
             in
-            if isCleanUrlKeep cp then
-                ( lastIdx, curIdx + 1, acc )
+            if st.invalid || (cp >= 0xD800 && cp <= 0xDFFF) || cp > 0x0010FFFF then
+                { lastIdx = st.lastIdx, curIdx = st.curIdx + w, acc = st.acc, invalid = True }
+
+            else if isCleanUrlKeep cp then
+                { lastIdx = st.lastIdx, curIdx = st.curIdx + 1, acc = st.acc, invalid = False }
 
             else
                 let
                     acc1 =
-                        if curIdx - lastIdx > 0 then
-                            String.slice lastIdx curIdx href :: acc
+                        if st.curIdx - st.lastIdx > 0 then
+                            String.slice st.lastIdx st.curIdx href :: st.acc
 
                         else
-                            acc
+                            st.acc
 
                     acc2 =
                         pushPercentEncodedCp cp acc1
 
                     nextIdx =
-                        curIdx + w
+                        st.curIdx + w
                 in
-                ( nextIdx, nextIdx, acc2 )
+                { lastIdx = nextIdx, curIdx = nextIdx, acc = acc2, invalid = False }
 
-        ( finalLast, finalCur, finalAcc ) =
-            String.foldl step ( 0, 0, [] ) href
+        final =
+            String.foldl step { lastIdx = 0, curIdx = 0, acc = [], invalid = False } href
     in
-    if finalLast == 0 && List.isEmpty finalAcc then
-        href
+    if final.invalid || final.curIdx - String.length href /= 0 then
+        Nothing
+
+    else if final.lastIdx == 0 && List.isEmpty final.acc then
+        Just href
 
     else
         let
             completed =
-                if finalCur - finalLast > 0 then
-                    String.slice finalLast finalCur href :: finalAcc
+                if final.curIdx - final.lastIdx > 0 then
+                    String.slice final.lastIdx final.curIdx href :: final.acc
 
                 else
-                    finalAcc
+                    final.acc
         in
-        String.concat (List.reverse completed)
+        Just (String.concat (List.reverse completed))
 
 
 isCleanUrlKeep : Int -> Bool

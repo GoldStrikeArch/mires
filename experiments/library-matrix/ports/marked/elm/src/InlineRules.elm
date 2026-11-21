@@ -844,22 +844,21 @@ skipOuterBracketsLoop codes i end =
             skipOuterBracketsLoop codes (i + 1) end
 
 
-{-| Returns candidate closing `]` indices for `_inlineLabel` (0, 1, or 2 candidates).
+{-| Returns candidate closing `]` indices for `_inlineLabel` / `_boundedInlineLabel` (`rules.ts:465,498`).
+
+The greedy `` `+(?!`)[^`]*?`+(?!`) `` alternative precedes `` ``+(?=\]) ``, so a direct `]`
+reached after pairing backticks is returned first, followed by every `` ``] `` fallback along
+the path in LIFO order (latest/rightmost first).
 -}
 findInlineLabelEnds : Array Int -> Int -> Int -> Int -> List Int
 findInlineLabelEnds codes start end maxSpecials =
-    findInlineLabelEndsLoop codes end maxSpecials start 0 Nothing
+    findInlineLabelEndsLoop codes end maxSpecials start 0 []
 
 
-findInlineLabelEndsLoop : Array Int -> Int -> Int -> Int -> Int -> Maybe Int -> List Int
-findInlineLabelEndsLoop codes end maxSpecials i specials altEnd =
+findInlineLabelEndsLoop : Array Int -> Int -> Int -> Int -> Int -> List Int -> List Int
+findInlineLabelEndsLoop codes end maxSpecials i specials altEnds =
     if i - end >= 0 then
-        case altEnd of
-            Just ae ->
-                [ ae ]
-
-            Nothing ->
-                []
+        altEnds
 
     else
         let
@@ -867,42 +866,33 @@ findInlineLabelEndsLoop codes end maxSpecials i specials altEnd =
                 at i codes
         in
         if b == 93 then
-            case altEnd of
-                Just ae ->
-                    if ae - i == 0 then
-                        [ i ]
-
-                    else
-                        [ i, ae ]
-
-                Nothing ->
-                    [ i ]
+            i :: altEnds
 
         else if b == 91 then
             if maxSpecials >= 0 && specials - maxSpecials >= 0 then
-                maybeToList altEnd
+                altEnds
 
             else
                 case skipOuterBrackets codes i end of
                     Just nextI ->
-                        findInlineLabelEndsLoop codes end maxSpecials nextI (specials + 1) altEnd
+                        findInlineLabelEndsLoop codes end maxSpecials nextI (specials + 1) altEnds
 
                     Nothing ->
-                        maybeToList altEnd
+                        altEnds
 
         else if b == 92 then
             if maxSpecials >= 0 && specials - maxSpecials >= 0 then
-                maybeToList altEnd
+                altEnds
 
             else if i + 1 - end >= 0 then
-                maybeToList altEnd
+                altEnds
 
             else
-                findInlineLabelEndsLoop codes end maxSpecials (i + 1 + charWidth (at (i + 1) codes)) (specials + 1) altEnd
+                findInlineLabelEndsLoop codes end maxSpecials (i + 1 + charWidth (at (i + 1) codes)) (specials + 1) altEnds
 
         else if b == 96 then
             if maxSpecials >= 0 && specials - maxSpecials >= 0 then
-                maybeToList altEnd
+                altEnds
 
             else
                 let
@@ -912,17 +902,12 @@ findInlineLabelEndsLoop codes end maxSpecials i specials altEnd =
                     run =
                         afterRun - i
 
-                    nextAlt =
-                        case altEnd of
-                            Just _ ->
-                                altEnd
+                    nextAlts =
+                        if run >= 2 && afterRun - end < 0 && at afterRun codes == 93 then
+                            afterRun :: altEnds
 
-                            Nothing ->
-                                if run >= 2 && afterRun - end < 0 && at afterRun codes == 93 then
-                                    Just afterRun
-
-                                else
-                                    Nothing
+                        else
+                            altEnds
 
                     j =
                         scanUntilChar codes afterRun end 96
@@ -932,23 +917,13 @@ findInlineLabelEndsLoop codes end maxSpecials i specials altEnd =
                         afterClose =
                             skipSameChar codes j end 96
                     in
-                    findInlineLabelEndsLoop codes end maxSpecials afterClose (specials + 1) nextAlt
+                    findInlineLabelEndsLoop codes end maxSpecials afterClose (specials + 1) nextAlts
 
                 else
-                    maybeToList nextAlt
+                    nextAlts
 
         else
-            findInlineLabelEndsLoop codes end maxSpecials (i + 1) specials altEnd
-
-
-maybeToList : Maybe a -> List a
-maybeToList m =
-    case m of
-        Just x ->
-            [ x ]
-
-        Nothing ->
-            []
+            findInlineLabelEndsLoop codes end maxSpecials (i + 1) specials altEnds
 
 
 {-| Exact port of `isLabelEndInsideToken` (`Tokenizer.ts`).
@@ -1036,8 +1011,27 @@ isLabelEndInsideTokenLoop codes totalLen labelStart labelEnd i =
 -- 6. INLINE LINK
 
 
-matchInlineLinkTitle : Array Int -> Int -> Int -> Maybe Int
-matchInlineLinkTitle codes pos end =
+matchLinkCloseParen : Array Int -> Int -> Int -> Maybe Int
+matchLinkCloseParen codes pos end =
+    let
+        j =
+            skipSpaceTabNl codes pos end
+    in
+    if j - end < 0 && at j codes == 41 then
+        Just (j + 1)
+
+    else
+        Nothing
+
+
+{-| Matches `inline.link`'s title (`rules.ts:472`: `"(?:\\"?|[^"\\])*"`, `'(?:\\'?|[^'\\])*'`,
+`\((?:\\\)?|[^)\\])*\)`) followed by `[ \t\n]*\)`, returning `Just ( titleEnd, rawEnd )`.
+
+The optional delimiter escape (`\\"?`, `\\'?`, `\\\)?`) greedily consumes `\` + `delim` first,
+then backtracks to `\` so `delim` closes the title; rightmost matching candidate wins.
+-}
+matchInlineLinkTitleAndEnd : Array Int -> Int -> Int -> Maybe ( Int, Int )
+matchInlineLinkTitleAndEnd codes pos end =
     if pos - end >= 0 then
         Nothing
 
@@ -1047,22 +1041,22 @@ matchInlineLinkTitle codes pos end =
                 at pos codes
         in
         if b == 34 then
-            scanEscapedDelim codes (pos + 1) end 34
+            scanEscapedDelimAndEnd codes (pos + 1) end 34 Nothing
 
         else if b == 39 then
-            scanEscapedDelim codes (pos + 1) end 39
+            scanEscapedDelimAndEnd codes (pos + 1) end 39 Nothing
 
         else if b == 40 then
-            scanEscapedDelim codes (pos + 1) end 41
+            scanEscapedDelimAndEnd codes (pos + 1) end 41 Nothing
 
         else
             Nothing
 
 
-scanEscapedDelim : Array Int -> Int -> Int -> Int -> Maybe Int
-scanEscapedDelim codes i end delim =
+scanEscapedDelimAndEnd : Array Int -> Int -> Int -> Int -> Maybe ( Int, Int ) -> Maybe ( Int, Int )
+scanEscapedDelimAndEnd codes i end delim best =
     if i - end >= 0 then
-        Nothing
+        best
 
     else
         let
@@ -1071,16 +1065,30 @@ scanEscapedDelim codes i end delim =
         in
         if b == 92 then
             if i + 1 - end < 0 && at (i + 1) codes - delim == 0 then
-                scanEscapedDelim codes (i + 2) end delim
+                let
+                    nextBest =
+                        case matchLinkCloseParen codes (i + 2) end of
+                            Just rawEnd ->
+                                Just ( i + 2, rawEnd )
+
+                            Nothing ->
+                                best
+                in
+                scanEscapedDelimAndEnd codes (i + 2) end delim nextBest
 
             else
-                scanEscapedDelim codes (i + 1) end delim
+                scanEscapedDelimAndEnd codes (i + 1) end delim best
 
         else if b - delim == 0 then
-            Just (i + 1)
+            case matchLinkCloseParen codes (i + 1) end of
+                Just rawEnd ->
+                    Just ( i + 1, rawEnd )
+
+                Nothing ->
+                    best
 
         else
-            scanEscapedDelim codes (i + 1) end delim
+            scanEscapedDelimAndEnd codes (i + 1) end delim best
 
 
 skipSpaceTabNl : Array Int -> Int -> Int -> Int
@@ -1135,17 +1143,9 @@ matchLinkTail codes pos end =
 
         withTitle =
             if hasSpace || hasNl then
-                case matchInlineLinkTitle codes i1 end of
-                    Just titleEnd ->
-                        let
-                            j =
-                                skipSpaceTabNl codes titleEnd end
-                        in
-                        if j - end < 0 && at j codes == 41 then
-                            Just ( j + 1, Just ( i1, titleEnd ) )
-
-                        else
-                            Nothing
+                case matchInlineLinkTitleAndEnd codes i1 end of
+                    Just ( titleEnd, rawEnd ) ->
+                        Just ( rawEnd, Just ( i1, titleEnd ) )
 
                     Nothing ->
                         Nothing
@@ -1158,15 +1158,7 @@ matchLinkTail codes pos end =
             Just res
 
         Nothing ->
-            let
-                j =
-                    skipSpaceTabNl codes pos end
-            in
-            if j - end < 0 && at j codes == 41 then
-                Just ( j + 1, Nothing )
-
-            else
-                Nothing
+            Maybe.map (\rawEnd -> ( rawEnd, Nothing )) (matchLinkCloseParen codes pos end)
 
 
 type alias LinkSpan =
@@ -1287,17 +1279,6 @@ matchNormalLinkDest codes end isImage labelStart closeBracket parenOpen =
     if i - end >= 0 then
         Nothing
 
-    else if at i codes == 41 then
-        Just
-            { rawEnd = i + 1
-            , isImage = isImage
-            , labelStart = labelStart
-            , labelEnd = closeBracket
-            , hrefStart = i
-            , hrefEnd = i
-            , title = Nothing
-            }
-
     else
         let
             angleAttempt =
@@ -1328,34 +1309,55 @@ matchNormalLinkDest codes end isImage labelStart closeBracket parenOpen =
 
                 else
                     Nothing
+
+            bareAttempt =
+                case angleAttempt of
+                    Just span ->
+                        Just span
+
+                    Nothing ->
+                        let
+                            runEnd =
+                                scanBareLinkHref codes i end
+                        in
+                        if runEnd - i <= 0 then
+                            Nothing
+
+                        else
+                            case matchLinkTail codes runEnd end of
+                                Just ( rawEnd, title ) ->
+                                    Just
+                                        { rawEnd = rawEnd
+                                        , isImage = isImage
+                                        , labelStart = labelStart
+                                        , labelEnd = closeBracket
+                                        , hrefStart = i
+                                        , hrefEnd = runEnd
+                                        , title = title
+                                        }
+
+                                Nothing ->
+                                    backtrackBareHrefRparen codes isImage labelStart closeBracket i runEnd
         in
-        case angleAttempt of
+        case bareAttempt of
             Just span ->
                 Just span
 
             Nothing ->
-                let
-                    runEnd =
-                        scanBareLinkHref codes i end
-                in
-                if runEnd - i <= 0 then
-                    Nothing
+                -- Third `href` alternative `(?=\))` (`rules.ts:471`): only tried after bare href fails.
+                if at i codes == 41 then
+                    Just
+                        { rawEnd = i + 1
+                        , isImage = isImage
+                        , labelStart = labelStart
+                        , labelEnd = closeBracket
+                        , hrefStart = i
+                        , hrefEnd = i
+                        , title = Nothing
+                        }
 
                 else
-                    case matchLinkTail codes runEnd end of
-                        Just ( rawEnd, title ) ->
-                            Just
-                                { rawEnd = rawEnd
-                                , isImage = isImage
-                                , labelStart = labelStart
-                                , labelEnd = closeBracket
-                                , hrefStart = i
-                                , hrefEnd = runEnd
-                                , title = title
-                                }
-
-                        Nothing ->
-                            backtrackBareHrefRparen codes isImage labelStart closeBracket i runEnd
+                    Nothing
 
 
 scanLinkAngleHref : Array Int -> Int -> Int -> Maybe Int

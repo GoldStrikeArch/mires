@@ -1780,7 +1780,7 @@ stepInlineAfterDel src pos b0 prevChar maskedCache revTokens lexer =
                             inner
 
                     tok =
-                        Link { href = href, title = Nothing, text = inner, autolink = True, tokens = [] }
+                        Link { href = Just href, title = Nothing, text = inner, autolink = True, tokens = [] }
                 in
                 InlineAdvance endIdx prevChar False maskedCache (tok :: revTokens) lexer
 
@@ -1819,7 +1819,7 @@ stepInlineAfterAutolink src pos prevChar maskedCache revTokens lexer =
                         raw
 
                 tok =
-                    Link { href = href, title = Nothing, text = raw, autolink = True, tokens = [] }
+                    Link { href = Just href, title = Nothing, text = raw, autolink = True, tokens = [] }
             in
             InlineAdvance m.rawEnd prevChar False maskedCache (tok :: revTokens) lexer
 
@@ -1869,7 +1869,7 @@ stepInlineAfterAutolink src pos prevChar maskedCache revTokens lexer =
 -- INLINE TOKENIZERS
 
 
-outputLink : Bool -> String -> String -> Maybe String -> Lexer -> Maybe ( InlineToken, Lexer )
+outputLink : Bool -> String -> Maybe String -> Maybe String -> Lexer -> Maybe ( InlineToken, Lexer )
 outputLink isImage rawLabel href maybeTitle lexer =
     let
         text =
@@ -2037,23 +2037,38 @@ tokLink src pos lexer =
                             href2 =
                                 if String.startsWith "<" href1 then
                                     if lexer.options.pedantic && not (String.endsWith ">" trimmedUrl) then
-                                        String.dropLeft 1 href1
+                                        Just (String.dropLeft 1 href1)
 
                                     else if String.length href1 >= 2 then
-                                        String.slice 1 (String.length href1 - 1) href1
+                                        -- Match `Tokenizer.ts:809` `href.slice(1, -1)` in UTF-16 code units:
+                                        -- if the last scalar is astral (> 0xFFFF, 2 UTF-16 units), slicing
+                                        -- splits the surrogate pair and `cleanUrl` returns `Nothing`.
+                                        let
+                                            lastCp =
+                                                String.foldl (\ch _ -> Char.toCode ch) 0 href1
+                                        in
+                                        if lastCp > 0xFFFF then
+                                            Nothing
+
+                                        else
+                                            Just (String.slice 1 (String.length href1 - 1) href1)
 
                                     else
-                                        ""
+                                        Just ""
 
                                 else
-                                    href1
+                                    Just href1
 
                             finalHref =
-                                if String.isEmpty href2 then
-                                    ""
+                                Maybe.map
+                                    (\s ->
+                                        if String.isEmpty s then
+                                            ""
 
-                                else
-                                    unescapeAnyPunctuation href2
+                                        else
+                                            unescapeAnyPunctuation s
+                                    )
+                                    href2
 
                             finalTitle =
                                 if String.isEmpty title0 then
@@ -2108,7 +2123,7 @@ tokReflink src pos lexer =
                             )
 
                     Just def ->
-                        case outputLink m.isImage labelStr def.href def.title lexer of
+                        case outputLink m.isImage labelStr (Just def.href) def.title lexer of
                             Just ( tok, lexer1 ) ->
                                 Just ( tok, m.rawEnd, lexer1 )
 

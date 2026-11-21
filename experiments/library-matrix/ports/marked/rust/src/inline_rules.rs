@@ -527,24 +527,27 @@ fn skip_outer_brackets(bytes: &[u8], pos: usize) -> Option<usize> {
     None
 }
 
-/// Returns up to 2 candidate closing `]` indices for `_inlineLabel` without heap allocation.
+/// Returns candidate closing `]` indices for `_inlineLabel` / `_boundedInlineLabel` (`rules.ts:465,498`).
+///
+/// The greedy ` `+(?!`)[^`]*?`+(?!`) ` alternative precedes ` ``+(?=\]) `, so a direct `]` reached
+/// after pairing backticks is tried first (`direct_end`), followed by every ` ``] ` fallback along
+/// the path in LIFO order (`alt_ends` iterated in reverse). `alt_ends` stays unallocated when no
+/// ` ``] ` appears.
 fn find_inline_label_ends(
     bytes: &[u8],
     start: usize,
     max_specials: Option<usize>,
-) -> ([usize; 2], usize) {
+) -> (Option<usize>, Vec<usize>) {
     let n = bytes.len();
-    let mut out = [0usize; 2];
-    let mut out_len = 0usize;
-    let mut alt_end: Option<usize> = None;
+    let mut direct_end: Option<usize> = None;
+    let mut alt_ends: Vec<usize> = Vec::new();
     let mut i = start;
     let mut specials = 0usize;
 
     while i < n {
         let b = bytes[i];
         if b == b']' {
-            out[out_len] = i;
-            out_len += 1;
+            direct_end = Some(i);
             break;
         }
         if b == b'[' {
@@ -581,8 +584,8 @@ fn find_inline_label_ends(
                 run += 1;
             }
             let after_run = i + run;
-            if run >= 2 && after_run < n && bytes[after_run] == b']' && alt_end.is_none() {
-                alt_end = Some(after_run);
+            if run >= 2 && after_run < n && bytes[after_run] == b']' {
+                alt_ends.push(after_run);
             }
             let mut j = after_run;
             while j < n && bytes[j] != b'`' {
@@ -601,13 +604,7 @@ fn find_inline_label_ends(
             i += 1;
         }
     }
-    if let Some(ae) = alt_end {
-        if out_len == 0 || out[0] != ae {
-            out[out_len] = ae;
-            out_len += 1;
-        }
-    }
-    (out, out_len)
+    (direct_end, alt_ends)
 }
 
 /// Exact port of `isLabelEndInsideToken` (`Tokenizer.ts` lines 81-116).
@@ -653,60 +650,58 @@ pub fn is_label_end_inside_token(bytes: &[u8], label_start: usize, label_end: us
     false
 }
 
-fn match_inline_link_title(bytes: &[u8], pos: usize) -> Option<usize> {
+fn match_link_close_paren(bytes: &[u8], pos: usize) -> Option<usize> {
     let n = bytes.len();
-    if pos >= n {
+    let mut j = pos;
+    while j < n && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n') {
+        j += 1;
+    }
+    if j < n && bytes[j] == b')' {
+        Some(j + 1)
+    } else {
+        None
+    }
+}
+
+/// Matches `inline.link`'s title (`rules.ts:472`: `"(?:\\"?|[^"\\])*"`, `'(?:\\'?|[^'\\])*'`,
+/// `\((?:\\\)?|[^)\\])*\)`) followed by `[ \t\n]*\)`, returning `(title_end, raw_end)`.
+///
+/// The optional escaped delimiter (`\\"?`, `\\'?`, `\\\)?`) greedily consumes `\` + `delim` first,
+/// then backtracks to `\` so `delim` closes the title; rightmost matching candidate wins.
+fn scan_inline_link_title_and_end(bytes: &[u8], start: usize, delim: u8) -> Option<(usize, usize)> {
+    let n = bytes.len();
+    let mut i = start;
+    let mut best: Option<(usize, usize)> = None;
+    while i < n {
+        if bytes[i] == b'\\' {
+            if i + 1 < n && bytes[i + 1] == delim {
+                if let Some(raw_end) = match_link_close_paren(bytes, i + 2) {
+                    best = Some((i + 2, raw_end));
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if bytes[i] == delim {
+            if let Some(raw_end) = match_link_close_paren(bytes, i + 1) {
+                return Some((i + 1, raw_end));
+            }
+            return best;
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+fn match_inline_link_title_and_end(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
+    if pos >= bytes.len() {
         return None;
     }
     match bytes[pos] {
-        b'"' => {
-            let mut i = pos + 1;
-            while i < n {
-                if bytes[i] == b'\\' {
-                    i += 1;
-                    if i < n && bytes[i] == b'"' {
-                        i += 1;
-                    }
-                } else if bytes[i] == b'"' {
-                    return Some(i + 1);
-                } else {
-                    i += 1;
-                }
-            }
-            None
-        }
-        b'\'' => {
-            let mut i = pos + 1;
-            while i < n {
-                if bytes[i] == b'\\' {
-                    i += 1;
-                    if i < n && bytes[i] == b'\'' {
-                        i += 1;
-                    }
-                } else if bytes[i] == b'\'' {
-                    return Some(i + 1);
-                } else {
-                    i += 1;
-                }
-            }
-            None
-        }
-        b'(' => {
-            let mut i = pos + 1;
-            while i < n {
-                if bytes[i] == b'\\' {
-                    i += 1;
-                    if i < n && bytes[i] == b')' {
-                        i += 1;
-                    }
-                } else if bytes[i] == b')' {
-                    return Some(i + 1);
-                } else {
-                    i += 1;
-                }
-            }
-            None
-        }
+        b'"' => scan_inline_link_title_and_end(bytes, pos + 1, b'"'),
+        b'\'' => scan_inline_link_title_and_end(bytes, pos + 1, b'\''),
+        b'(' => scan_inline_link_title_and_end(bytes, pos + 1, b')'),
         _ => None,
     }
 }
@@ -728,24 +723,11 @@ fn match_link_tail(bytes: &[u8], pos: usize) -> Option<(usize, Option<(usize, us
         }
     }
     if has_space || has_nl {
-        if let Some(title_end) = match_inline_link_title(bytes, i) {
-            let mut j = title_end;
-            while j < n && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n') {
-                j += 1;
-            }
-            if j < n && bytes[j] == b')' {
-                return Some((j + 1, Some((i, title_end))));
-            }
+        if let Some((title_end, raw_end)) = match_inline_link_title_and_end(bytes, i) {
+            return Some((raw_end, Some((i, title_end))));
         }
     }
-    let mut j = pos;
-    while j < n && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n') {
-        j += 1;
-    }
-    if j < n && bytes[j] == b')' {
-        return Some((j + 1, None));
-    }
-    None
+    match_link_close_paren(bytes, pos).map(|raw_end| (raw_end, None))
 }
 
 pub struct LinkSpan {
@@ -769,11 +751,19 @@ pub fn match_inline_link(bytes: &[u8], pos: usize, pedantic: bool) -> Option<Lin
         return None;
     };
     let label_start = open_bracket + 1;
-    let (ends, ends_len) = find_inline_label_ends(bytes, label_start, None);
-    let mut ei = 0;
-    while ei < ends_len {
-        let close_bracket = ends[ei];
-        ei += 1;
+    let (direct_end, alt_ends) = find_inline_label_ends(bytes, label_start, None);
+    let mut alt_idx = alt_ends.len();
+    let mut tried_direct = direct_end.is_none();
+    loop {
+        let close_bracket = if !tried_direct {
+            tried_direct = true;
+            direct_end.unwrap()
+        } else if alt_idx > 0 {
+            alt_idx -= 1;
+            alt_ends[alt_idx]
+        } else {
+            break;
+        };
         if close_bracket + 1 >= n || bytes[close_bracket + 1] != b'(' {
             continue;
         }
@@ -805,17 +795,6 @@ pub fn match_inline_link(bytes: &[u8], pos: usize, pedantic: bool) -> Option<Lin
         }
         if i >= n {
             continue;
-        }
-        if bytes[i] == b')' {
-            return Some(LinkSpan {
-                raw_end: i + 1,
-                is_image,
-                label_start,
-                label_end: close_bracket,
-                href_start: i,
-                href_end: i,
-                title: None,
-            });
         }
         if bytes[i] == b'<' {
             let mut j = i + 1;
@@ -889,6 +868,18 @@ pub fn match_inline_link(bytes: &[u8], pos: usize, pedantic: bool) -> Option<Lin
                 }
             }
         }
+        // Third `href` alternative `(?=\))` (`rules.ts:471`): only tried after bare href fails.
+        if bytes[i] == b')' {
+            return Some(LinkSpan {
+                raw_end: i + 1,
+                is_image,
+                label_start,
+                label_end: close_bracket,
+                href_start: i,
+                href_end: i,
+                title: None,
+            });
+        }
     }
     None
 }
@@ -957,11 +948,19 @@ pub fn match_reflink_at(
     let label_start = open_bracket + 1;
     let max_sp = if bounded { Some(999) } else { None };
 
-    let (ends, ends_len) = find_inline_label_ends(bytes, label_start, max_sp);
-    let mut ei = 0;
-    while ei < ends_len {
-        let close_bracket = ends[ei];
-        ei += 1;
+    let (direct_end, alt_ends) = find_inline_label_ends(bytes, label_start, max_sp);
+    let mut alt_idx = alt_ends.len();
+    let mut tried_direct = direct_end.is_none();
+    loop {
+        let close_bracket = if !tried_direct {
+            tried_direct = true;
+            direct_end.unwrap()
+        } else if alt_idx > 0 {
+            alt_idx -= 1;
+            alt_ends[alt_idx]
+        } else {
+            break;
+        };
         let mut r_open = close_bracket + 1;
         if pedantic && !bounded {
             while r_open < n {

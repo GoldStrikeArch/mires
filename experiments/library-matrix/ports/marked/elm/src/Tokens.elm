@@ -232,8 +232,8 @@ appendNewlineToBlockRaw token =
 type InlineToken
     = Escape { text : String }
     | InlineHtml { text : String }
-    | Link { href : String, title : Maybe String, text : String, autolink : Bool, tokens : List InlineToken }
-    | Image { href : String, title : Maybe String, text : String, tokens : List InlineToken }
+    | Link { href : Maybe String, title : Maybe String, text : String, autolink : Bool, tokens : List InlineToken }
+    | Image { href : Maybe String, title : Maybe String, text : String, tokens : List InlineToken }
     | InlineCheckbox { raw : String, checked : Bool }
     | Strong { text : String, tokens : List InlineToken }
     | Em { text : String, tokens : List InlineToken }

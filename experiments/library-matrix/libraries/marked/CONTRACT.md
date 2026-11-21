@@ -17,7 +17,7 @@
 | Output form | `string` (raw rendered HTML directly, zero framing), synchronous |
 | Normalisation | none |
 | Parity environments | node, chrome, firefox, safari (unavailable on this machine) |
-| Corpus | `corpus.json`, 115 cases, written deterministically by `generate-corpus.mjs` (`--verify` validates all invariants, option mutant-killers and regression expectations) |
+| Corpus | `corpus.json`, 126 cases, written deterministically by `generate-corpus.mjs` (`--verify` validates all invariants, option mutant-killers and regression expectations) |
 | Bench cases | `bench-parse`, `bench-gfm`; `baseIterations` 1; variant `bench-variant.mjs` (k-seeded case-preserving ASCII letter bijection preserving `<...>`, `&...;`, `[x]`/`[X]`, and autolink scheme prefixes) |
 | Shared data | `unicode-classes.json`: inclusive code-point ranges read off host `RegExp` for `/[\p{P}\p{S}]/u`, `/[\p{Pi}\p{Ps}"']/u`, `/[\p{L}\p{N}]/u`, and `/\s/u` |
 | Caching | Grammar rules compiled at module load, except the six indent-dependent `other.*Regex(indent)` rules (`nextBulletRegex`, `hrRegex`, `fencesBeginRegex`, `headingBeginRegex`, `htmlBeginRegex`, `blockquoteBeginRegex`), which `rules.ts` builds on first use and keeps in a module-level 4-entry cache (`cachedIndentRegex`, indent clamped to 0..3); ports may build those 4 entries eagerly, and may hold immutable character-class tables. No other cross-call state or input memoisation |
@@ -102,15 +102,24 @@ easily misses:
 - **UTF-16 counts.** Every rule outside the `u`-flag list above counts quantifier bounds in UTF-16
   code units: `_boundedBlockLabel`'s `(?:\\[\s\S]|[^\[\]\\]){1,999}` takes
   an astral character, escaped or not, as two items. Every JS `length`, index and `slice` count is
-  in code units too, notably `Tokenizer#list`'s `line.slice(indent)` and the `linkLen` truncation;
+  in code units too, notably `Tokenizer#list`'s `line.slice(indent)`, the `linkLen` truncation, and
+  `Tokenizer.ts:809`'s pedantic `<href>` `href.slice(1, -1)` (which drops one UTF-16 code unit from
+  each end, splitting a trailing astral surrogate pair so `cleanUrl` returns `null`);
   only `[...str]` spreads (`emStrong` and `del` delimiter lengths) and `expandTabs` count code
   points.
 - **Backtracking.** A scanner must find what the backtracking regex finds, not only the greedy
   first try. Cases the corpus pins: `lheadingGfm`'s table lookahead
   ` {0,3}\|?(?:[:\- ]*\|)+[\:\- ]*\n` (the optional `|` backtracks, so a lone `|` or `|-` line
   interrupts), `other.pedanticHrefTitle` (`[^'"]*` backtracks, so the href may end in a quote),
-  the pedantic `def`'s `<?([^\s>]+)` (`[a]: <>` has href `<`), and `reflinkSearch`'s
-  `nolink(?!\()` (`(?:\[\])?` backtracks when `(` follows).
+  the pedantic `def`'s `<?([^\s>]+)` (`[a]: <>` has href `<`), `reflinkSearch`'s
+  `nolink(?!\()` (`(?:\[\])?` backtracks when `(` follows), optional delimiter escapes in
+  `block.def` and `inline.link` titles (`rules.ts:144,472`: `"(?:\\"?|[^"\\])*"`, `'(?:\\'?|[^'\\])*'`,
+  `\((?:\\\)?|[^)\\])*\)`, where `\\"?` etc. backtracks to `\` so a trailing backslash closes the
+  title), multiple `` ``+(?=\]) `` candidates in `_inlineLabel` / `_boundedInlineLabel`
+  (`rules.ts:465,498`: must backtrack across all `` ``] `` candidates in LIFO order when an earlier
+  `` ``] `` pairs across `]`), and `inline.link`'s `href` alternative order (`rules.ts:471`: bare
+  `[^ \t\n\x00-\x1f]+` precedes `(?=\))`, so `[a]( )<)` matches bare href `)<` and truncates via
+  `findClosingBracket`).
 
 Both styles must implement `marked@18.1.1`'s actual Lexer/Tokenizer/Parser/Renderer/TextRenderer
 architecture and match `marked@18.1.1` character-for-character on every input in the parity domain.
@@ -165,8 +174,9 @@ and are disabled only when `gfm: false`.
      - Numeric ref with `code === 0 || code > 0x10FFFF || (0xD800 <= code <= 0xDFFF)` → `U+FFFD`.
      - Numeric ref with `code === 38` → `&amp;`.
      - Otherwise → Unicode character `String.fromCodePoint(code)`.
-4. **`cleanUrl(href)`**: `encodeURI(href).replace(/%25/g, '%')`. For well-formed UTF-8/UTF-16
-   strings this keeps ASCII bytes in `!#$%&'()*+,-./0123456789:;=?@ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~`
+4. **`cleanUrl(href)`**: `encodeURI(href).replace(/%25/g, '%')`, catching `URIError` (e.g. on a
+   lone UTF-16 surrogate produced by `Tokenizer.ts:809`) and returning `null`. For well-formed
+   UTF-8/UTF-16 strings this keeps ASCII bytes in `!#$%&'()*+,-./0123456789:;=?@ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz~`
    verbatim and percent-encodes every other UTF-8 byte as uppercase `%XX`.
 5. **`splitCells(tableRow, count?)`**: inserts `' '` before every unescaped `|` (even number of
    preceding `\`), splits on `' |'`, drops an empty/whitespace-only leading or trailing cell,
@@ -288,22 +298,27 @@ Each `inlineTokens(src, tokens)` call:
 - `strong`, `em`, `del`: `<strong>`, `<em>`, `<del>`. `codespan`: `<code>${escapeHtmlEntities(text, true)}</code>`.
 - `br`: `<br>`. `html`: raw `text` passthrough. `space`, `def`: `""`.
 - `link`: `parsedText = autolink ? escapeHtmlEntities(text, true) : parseInline(tokens)`;
-  `cleanHref = cleanUrl(href)`; `<a href="${escapeHtmlEntities(cleanHref, autolink)}"[ title="${escapeHtmlEntities(title)}"]>${parsedText}</a>` (the `title` attribute is omitted when `title` is absent or empty `""`).
-- `image`: flattens `tokens` through `TextRenderer` (which returns raw `.text` for `strong`/`em`/`codespan`/`del`/`html`/`text`/`link`/`image`, `""` for `br`, `.raw` for `checkbox`), then emits
-  `<img src="${escapeHtmlEntities(cleanUrl(href))}" alt="${escapeHtmlEntities(alt)}"[ title="${escapeHtmlEntities(title)}"]>` (likewise omitting `title="..."` when `title` is absent or empty `""`).
+  `cleanHref = cleanUrl(href)`; if `cleanHref === null`, returns `parsedText`; otherwise emits
+  `<a href="${escapeHtmlEntities(cleanHref, autolink)}"[ title="${escapeHtmlEntities(title)}"]>${parsedText}</a>` (the `title` attribute is omitted when `title` is absent or empty `""`).
+- `image`: flattens `tokens` through `TextRenderer` (which returns raw `.text` for `strong`/`em`/`codespan`/`del`/`html`/`text`/`link`/`image`, `""` for `br`, `.raw` for `checkbox`), computes `cleanHref = cleanUrl(href)`; if `cleanHref === null`, returns `escapeHtmlEntities(alt)`; otherwise emits
+  `<img src="${escapeHtmlEntities(cleanHref)}" alt="${escapeHtmlEntities(alt)}"[ title="${escapeHtmlEntities(title)}"]>` (likewise omitting `title="..."` when `title` is absent or empty `""`).
 - `text`: if `tokens` present, `parseInline(tokens)`; else if `escaped`, raw `text`; else `escapeHtmlEntities(text, false)`.
 
 ## Parity domain
 
 The following inputs are excluded from the contract (no corpus case or bench variant produces them):
 
-- **Lone UTF-16 surrogates** (including upstream `marked` extra-`)` link truncation splitting an
+- **Lone UTF-16 surrogates in inputs or output HTML** (including upstream `marked` extra-`)` link truncation splitting an
   astral surrogate pair, e.g. `[x](  🚀))`, where `Tokenizer.ts:785`'s UTF-16
   `cap[0].substring(0, linkLen)` (`linkLen` from line 783) slices between high and low surrogates and leaves a lone surrogate in the remainder): all corpus
   `markdown` strings are well-formed UTF-16 and stay well-formed UTF-16 across UTF-16 `linkLen`
-  truncation (BMP non-ASCII cases like `[x](  é))` and `[x](    日本語))` ARE in the parity domain),
-  so UTF-8-native languages (Rust, Go/GopherJS, Elm) decode identical text and `cleanUrl` never
-  encounters a `URIError`.
+  truncation (BMP non-ASCII cases like `[x](  é))` and `[x](    日本語))` ARE in the parity domain).
+  By contrast, `Tokenizer.ts:809`'s pedantic `<href>` `href.slice(1, -1)` on well-formed UTF-16
+  input ending in an astral scalar (e.g. `[a](<😀 "t">)` or `![a](<😀 "t">)` with `pedantic: true`)
+  splits the surrogate pair internally, causing `cleanUrl(href)` to catch `URIError` and return
+  `null`, so `Renderer.link`/`Renderer.image` emit plain/escaped text (`<p>a</p>\n`) with no lone
+  surrogate in the output; those inputs ARE in the parity domain and ports must reproduce
+  `Tokenizer.ts:809`'s UTF-16 `slice(1, -1)` and `cleanUrl`'s `null` fallback.
 - **Unicode 16.0 / 17.0-only punctuation/symbol/letter code points**: no corpus case uses code
   points whose `\p{P}`, `\p{S}`, `\p{Pi}`, `\p{Ps}`, `\p{L}`, `\p{N}`, or case-folding properties
   changed after Unicode 15.0, so Unicode 15.0–17.0 engines and native tables agree identically.
@@ -353,7 +368,7 @@ window modified.
 
 ## Corpus
 
-115 deterministic cases generated by `generate-corpus.mjs`:
+126 deterministic cases generated by `generate-corpus.mjs`:
 
 | Group | Cases | What they exercise |
 | --- | --- | --- |
@@ -373,4 +388,5 @@ window modified.
 | Review regressions: UTF-16 counts (5) | `regress-utf16-list-lazy-astral`, `regress-utf16-list-lazy-astral-tab`, `regress-utf16-list-lazy-heading`, `regress-utf16-bounded-label`, `regress-utf16-bounded-label-edge` | `Tokenizer#list`'s `line.slice(indent)` in code units after an astral character; `_boundedBlockLabel` `{1,999}` counting an astral character as two units (1,202 and 1,000 units: unmasked) |
 | Review regressions: backtracking and rule sources (10) | `regress-lheading-table-pipe-dash`, `regress-lheading-table-lone-pipe`, `regress-lheading-table-lone-pipe-hr`, `regress-pedantic-href-title-backtrack`, `regress-pedantic-inline-href-title-backtrack`, `regress-pedantic-href-title-mirror`, `regress-pedantic-def-empty-angle`, `regress-pedantic-def-angle-title`, `regress-nolink-empty-ref-paren`, `regress-html-begin-ul` | lheadingGfm's optional `\|` backtracking, `pedanticHrefTitle` and pedantic `def` `<?` backtracking, `reflinkSearch` `nolink(?!\()` backtracking `[]`, and `htmlBeginRegex`'s last `_tag` entry (`ul`) ending a list item |
 | Review regressions: stack depth (6) | `regress-size-atx-headings`, `regress-size-emphasis`, `regress-depth-list-100`, `regress-depth-blockquote-100`, `regress-depth-inline-100`, `regress-depth-list-100-inline-100` | 5,000 headings and 5,000 emphasis runs (20 KB each): block and inline loops in constant stack; 100 nested lists, 100 nested blockquotes and 100 nested inline containers (link text around em, strong and del), the parity domain's nesting bounds; 100 inline levels inside 100 lists, the two bounds stacked in the renderer |
+| Review regressions: pedantic `<href>`, title escapes, label & href backtracking (11) | `regress-pedantic-angle-href-bmp`, `regress-pedantic-angle-href-astral`, `regress-def-title-escape-backtrack`, `regress-link-title-escape-double`, `regress-link-title-escape-single`, `regress-link-title-escape-paren`, `regress-inline-label-multi-backtick-1`, `regress-inline-label-multi-backtick-2`, `regress-inline-label-multi-backtick-3`, `regress-inline-label-multi-backtick-ref`, `regress-link-href-rparen-alt` | pedantic `<href>` UTF-16 `slice(1,-1)` on BMP non-ASCII and astral surrogate-splitting (`cleanUrl` null fallback), optional-escape backtracking in `block.def` and `inline.link` titles, LIFO multi-candidate `` ``] `` backtracking in `_inlineLabel`, and `inline.link` bare `href` priority before `(?=\))` |
 | Bench (2) | `bench-parse`, `bench-gfm` | 52 KB mixed handbook (default options) and 46 KB GFM tracker (`breaks: true`) |

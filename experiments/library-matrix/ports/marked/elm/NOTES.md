@@ -6,11 +6,14 @@ A port of the `marked@18.1.1` synchronous Markdown-to-HTML subset defined in
 `node_modules/marked/lib/marked.esm.js` (and its embedded TypeScript sources). No kernel code, no
 `Debug`, no packages beyond the default `elm/core 1.0.5` and `elm/json 1.1.3`, zero embedded JS,
 zero `RegExp`, and a minimal 27-line I/O-only JS host (`js/index.js`, `mostlyJs: false`, 1.1%
-comparator share). The port matches `marked@18.1.1` character for character on all 111 corpus
+comparator share). The port matches `marked@18.1.1` character for character on all 126 corpus
 cases in Node, Chrome, and Firefox (both minified and readable bundles). The 2026-11-20 pre-merge
 review found divergences in the hand-written scanners (regex `.` line terminators, the `{1,999}`
-label bound counted in code points, and backtracking in four rules); they are fixed, and the
-review's differential fuzzers plus a targeted line-terminator fuzzer find no divergence.
+label bound counted in code points, and backtracking in four rules), and the 2026-11-21 re-review
+found three more (optional-escape backtracking in `block.def`/`inline.link` titles, multi-candidate
+`` ``+(?=\]) `` backtracking in `_inlineLabel`, and pedantic `<href>` astral `slice(1, -1)`
+`cleanUrl` `Nothing` fallback, plus bare `href` alternative order before `(?=\))`); all are fixed,
+and the review's probes, targeted suites, and differential fuzzers find no divergence.
 
 | File | What it is |
 | --- | --- |
@@ -41,8 +44,10 @@ review's differential fuzzers plus a targeted line-terminator fuzzer find no div
   pedantic grammars are implemented natively as hand-written cursor scanners. A scanner moves
   forward and must reproduce the regex's backtracking by reasoning about where the regex can
   succeed (the optional `|` of `lheadingGfm`'s table lookahead, `pedanticHrefTitle`'s `[^'"]*`, the
-  pedantic `def`'s `<?`, and `reflinkSearch`'s `nolink(?!\()`, each commented at the scanner), so
-  equivalence rests on the corpus and on differential testing, not on construction. Unicode classes (`\p{P}\p{S}`,
+  pedantic `def`'s `<?`, `reflinkSearch`'s `nolink(?!\()`, optional delimiter escapes
+  `\\"?`/`\\'?`/`\\\)?` in `block.def`/`inline.link` titles, LIFO multi-candidate `` ``+(?=\]) ``
+  in `_inlineLabel`, and `inline.link` bare `href` precedence over `(?=\))`, each commented at the
+  scanner), so equivalence rests on the corpus and on differential testing, not on construction. Unicode classes (`\p{P}\p{S}`,
   `[\p{Pi}\p{Ps}"']`, BMP `[\p{L}\p{N}]`, and ECMA-262 `\s`) use ASCII bitmasks plus binary search
   over sorted `Array Int` tables generated from `libraries/marked/unicode-classes.json`. HTML tag
   tables (`HTML_BLOCK_TAGS`, `HTML_TYPE1_TAGS`, `PEDANTIC_INLINE_TAGS`) are written as `case`
@@ -63,9 +68,11 @@ review's differential fuzzers plus a targeted line-terminator fuzzer find no div
   and list HTML breaks are case-insensitive; `Dict String LinkDef` handles prototype keys
   (`__proto__`, `constructor`, `toString`, `hasOwnProperty`) cleanly; `normalizeLabel` uses Elm's
   `String.trim`, `String.toLower`, and `String.toUpper` (compiled directly to the host's native
-  Unicode case-folding methods); `cleanUrl` percent-encodes UTF-8 bytes of non-`encodeURI` scalars
-  (keeping `%` verbatim); and `tokList` searches `inlineSlots` backwards when stripping task
-  checkbox prefixes.
+  Unicode case-folding methods); `cleanUrl` returns `Maybe String`, percent-encoding UTF-8 bytes of
+  non-`encodeURI` scalars (keeping `%` verbatim) and returning `Nothing` on lone UTF-16 surrogates
+  (including `Tokenizer.ts:809`'s pedantic `<href>` `slice(1, -1)` splitting a trailing astral
+  character, so `Renderer` emits plain/escaped text); and `tokList` searches `inlineSlots` backwards
+  when stripping task checkbox prefixes.
 - **Stack-safe tail recursion and O(1) hot-path design.** Elm 0.19.2 applies tail-call optimization
   only to direct self-recursion (not mutual recursion). Both `blockTokensLoop` and
   `inlineTokensLoop` delegate single-token rule dispatch to non-recursive `stepBlockToken` /
@@ -102,6 +109,11 @@ review's differential fuzzers plus a targeted line-terminator fuzzer find no div
   - `bench-gfm` (45.7 KB GFM tracker, `breaks: true`): `9.09 ms` vs JS `2.30 ms` (`port/js` `3.95×`, `A/A` `0.983`)
 
 ## Verification beyond the corpus
+
+After the 2026-11-21 re-review fixes: `126/126` corpus parity in Node, Chrome, and Firefox (both
+`index.min.js` and `index.js`), byte-for-byte clean rebuild reproducibility, plus 0 divergences on
+`re-marked` probes (`probe-audit.mjs`, `probe-audit-2.mjs`, `targeted.mjs` / `targeted-cases.mjs`,
+`earlier.mjs`), `fuzz-re.mjs`, and 30,000 targeted differential fuzz inputs.
 
 After the 2026-11-20 review fixes: `111/111` corpus parity in Node, Chrome, and Firefox (both
 artifacts); B1's differential fuzzers (194,000 inputs), B2's (1.09 million inputs: random fuzz plus

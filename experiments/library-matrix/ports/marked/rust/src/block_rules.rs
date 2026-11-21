@@ -1390,7 +1390,12 @@ pub fn match_block_label(bytes: &[u8], pos: usize, max_items: Option<usize>) -> 
     }
 }
 
-fn match_def_title(bytes: &[u8], pos: usize) -> Option<usize> {
+/// Matches `block.def`'s title (`rules.ts:144`) followed by ` *(?:\n+|$)` (`match_def_end`),
+/// returning `(title_end, raw_end)`.
+///
+/// For double-quoted titles `"(?:\\"?|[^"\\])*"`, `\\"?` greedily consumes `\"` first, then
+/// backtracks to `\` so the following `"` closes the title (rightmost matching candidate wins).
+fn match_def_title_and_end(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
     let n = bytes.len();
     if pos >= n {
         return None;
@@ -1398,19 +1403,28 @@ fn match_def_title(bytes: &[u8], pos: usize) -> Option<usize> {
     match bytes[pos] {
         b'"' => {
             let mut i = pos + 1;
+            let mut best: Option<(usize, usize)> = None;
             while i < n {
                 if bytes[i] == b'\\' {
-                    i += 1;
-                    if i < n && bytes[i] == b'"' {
+                    if i + 1 < n && bytes[i + 1] == b'"' {
+                        // Backtrack point: `\\"?` matches just `\`, and `"` closes the title.
+                        if let Some(raw_end) = match_def_end(bytes, i + 2) {
+                            best = Some((i + 2, raw_end));
+                        }
+                        i += 2;
+                    } else {
                         i += 1;
                     }
                 } else if bytes[i] == b'"' {
-                    return Some(i + 1);
+                    if let Some(raw_end) = match_def_end(bytes, i + 1) {
+                        return Some((i + 1, raw_end));
+                    }
+                    return best;
                 } else {
                     i += 1;
                 }
             }
-            None
+            best
         }
         b'\'' => {
             let mut i = pos + 1;
@@ -1420,7 +1434,8 @@ fn match_def_title(bytes: &[u8], pos: usize) -> Option<usize> {
             while i < n && bytes[i] == b'\n' {
                 let after_nl = i + 1;
                 if after_nl < n && bytes[after_nl] == b'\'' {
-                    return Some(after_nl + 1);
+                    let raw_end = match_def_end(bytes, after_nl + 1)?;
+                    return Some((after_nl + 1, raw_end));
                 }
                 let mut j = after_nl;
                 while j < n && bytes[j] != b'\'' && bytes[j] != b'\n' {
@@ -1432,7 +1447,8 @@ fn match_def_title(bytes: &[u8], pos: usize) -> Option<usize> {
                 i = j;
             }
             if i < n && bytes[i] == b'\'' {
-                Some(i + 1)
+                let raw_end = match_def_end(bytes, i + 1)?;
+                Some((i + 1, raw_end))
             } else {
                 None
             }
@@ -1444,7 +1460,8 @@ fn match_def_title(bytes: &[u8], pos: usize) -> Option<usize> {
                     return None;
                 }
                 if bytes[i] == b')' {
-                    return Some(i + 1);
+                    let raw_end = match_def_end(bytes, i + 1)?;
+                    return Some((i + 1, raw_end));
                 }
                 i += 1;
             }
@@ -1624,17 +1641,15 @@ fn match_def_tail(
         }
     }
     if has_space || has_nl {
-        if let Some(title_end) = match_def_title(bytes, t) {
-            if let Some(raw_end) = match_def_end(bytes, title_end) {
-                return Some(DefSpan {
-                    raw_end,
-                    label_start,
-                    label_end,
-                    href_start,
-                    href_end,
-                    title: Some((t, title_end)),
-                });
-            }
+        if let Some((title_end, raw_end)) = match_def_title_and_end(bytes, t) {
+            return Some(DefSpan {
+                raw_end,
+                label_start,
+                label_end,
+                href_start,
+                href_end,
+                title: Some((t, title_end)),
+            });
         }
     }
 

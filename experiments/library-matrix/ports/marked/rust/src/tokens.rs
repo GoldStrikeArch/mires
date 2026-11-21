@@ -197,14 +197,14 @@ pub enum InlineToken {
         text: String,
     },
     Link {
-        href: String,
+        href: Option<String>,
         title: Option<String>,
         text: String,
         autolink: bool,
         tokens: Vec<InlineToken>,
     },
     Image {
-        href: String,
+        href: Option<String>,
         title: Option<String>,
         text: String,
         tokens: Vec<InlineToken>,

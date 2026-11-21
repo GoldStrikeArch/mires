@@ -1147,7 +1147,7 @@ impl Lexer {
                     };
                     pos = end;
                     tokens.push(InlineToken::Link {
-                        href,
+                        href: Some(href),
                         title: None,
                         text,
                         autolink: true,
@@ -1177,7 +1177,7 @@ impl Lexer {
                     };
                     pos = m.raw_end;
                     tokens.push(InlineToken::Link {
-                        href,
+                        href: Some(href),
                         title: None,
                         text,
                         autolink: true,
@@ -1226,7 +1226,7 @@ impl Lexer {
         &mut self,
         is_image: bool,
         raw_label: &str,
-        href: String,
+        href: Option<String>,
         title: Option<String>,
     ) -> Option<InlineToken> {
         let text = unescape_link_brackets(raw_label);
@@ -1328,21 +1328,36 @@ impl Lexer {
         }
 
         href_s = trim_js(href_s);
-        if href_s.starts_with('<') {
+        let sliced_href: Option<&str> = if href_s.starts_with('<') {
             if self.options.pedantic && !trimmed_url.ends_with('>') {
-                href_s = &href_s[1..];
-            } else if href_s.len() >= 2 {
-                href_s = &href_s[1..href_s.len() - 1];
+                Some(&href_s[1..])
+            } else if href_s.len() <= 1 {
+                Some("")
             } else {
-                href_s = "";
+                // Match `Tokenizer.ts:809` `href.slice(1, -1)` in UTF-16 code units:
+                // drop the leading `<` (1 unit) and the trailing code unit. A trailing BMP
+                // scalar is 1 code unit (`len` 1..=3 bytes); a trailing astral scalar (`len == 4`)
+                // is 2 code units, so slicing leaves a lone high surrogate and `cleanUrl` returns
+                // `null`.
+                let (_, last_len) =
+                    crate::unicode::decode_utf8_rev(href_s.as_bytes(), href_s.len());
+                if last_len == 4 {
+                    None
+                } else {
+                    Some(&href_s[1..href_s.len() - last_len])
+                }
             }
-        }
-
-        let final_href = if href_s.is_empty() {
-            String::new()
         } else {
-            unescape_any_punctuation(href_s)
+            Some(href_s)
         };
+
+        let final_href = sliced_href.map(|s| {
+            if s.is_empty() {
+                String::new()
+            } else {
+                unescape_any_punctuation(s)
+            }
+        });
         let final_title = if title_s.is_empty() {
             None
         } else {
@@ -1383,7 +1398,7 @@ impl Lexer {
                 ))
             }
             Some(def) => {
-                let tok = self.output_link(m.is_image, label_str, def.href, def.title)?;
+                let tok = self.output_link(m.is_image, label_str, Some(def.href), def.title)?;
                 Some((tok, m.raw_end))
             }
         }

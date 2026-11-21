@@ -2374,8 +2374,14 @@ matchBlockLabelLoop codes end limit i items =
                 matchBlockLabelLoop codes end limit (chStart + width) (items + width)
 
 
-matchDefTitle : Array Int -> Int -> Int -> Maybe Int
-matchDefTitle codes pos end =
+{-| Matches `block.def`'s title (`rules.ts:144`) followed by ` *(?:\n+|$)` (`matchDefEnd`),
+returning `Just ( titleEnd, rawEnd )`.
+
+For double-quoted titles `"(?:\\"?|[^"\\])*"`, `\\"?` greedily consumes `\"` first, then
+backtracks to `\` so `"` closes the title; rightmost matching candidate wins.
+-}
+matchDefTitleAndEnd : Array Int -> Int -> Int -> Maybe ( Int, Int )
+matchDefTitleAndEnd codes pos end =
     if pos - end >= 0 then
         Nothing
 
@@ -2385,22 +2391,32 @@ matchDefTitle codes pos end =
                 at pos codes
         in
         if b == 34 then
-            scanDefTitleDouble codes (pos + 1) end
+            scanDefTitleDouble codes (pos + 1) end Nothing
 
         else if b == 39 then
-            scanDefTitleSingle codes (pos + 1) end
+            case scanDefTitleSingle codes (pos + 1) end of
+                Just titleEnd ->
+                    Maybe.map (\rawEnd -> ( titleEnd, rawEnd )) (matchDefEnd codes titleEnd end)
+
+                Nothing ->
+                    Nothing
 
         else if b == 40 then
-            scanDefTitleParen codes (pos + 1) end
+            case scanDefTitleParen codes (pos + 1) end of
+                Just titleEnd ->
+                    Maybe.map (\rawEnd -> ( titleEnd, rawEnd )) (matchDefEnd codes titleEnd end)
+
+                Nothing ->
+                    Nothing
 
         else
             Nothing
 
 
-scanDefTitleDouble : Array Int -> Int -> Int -> Maybe Int
-scanDefTitleDouble codes i end =
+scanDefTitleDouble : Array Int -> Int -> Int -> Maybe ( Int, Int ) -> Maybe ( Int, Int )
+scanDefTitleDouble codes i end best =
     if i - end >= 0 then
-        Nothing
+        best
 
     else
         let
@@ -2409,16 +2425,30 @@ scanDefTitleDouble codes i end =
         in
         if b == 92 then
             if i + 1 - end < 0 && at (i + 1) codes == 34 then
-                scanDefTitleDouble codes (i + 2) end
+                let
+                    nextBest =
+                        case matchDefEnd codes (i + 2) end of
+                            Just rawEnd ->
+                                Just ( i + 2, rawEnd )
+
+                            Nothing ->
+                                best
+                in
+                scanDefTitleDouble codes (i + 2) end nextBest
 
             else
-                scanDefTitleDouble codes (i + 1) end
+                scanDefTitleDouble codes (i + 1) end best
 
         else if b == 34 then
-            Just (i + 1)
+            case matchDefEnd codes (i + 1) end of
+                Just rawEnd ->
+                    Just ( i + 1, rawEnd )
+
+                Nothing ->
+                    best
 
         else
-            scanDefTitleDouble codes (i + 1) end
+            scanDefTitleDouble codes (i + 1) end best
 
 
 scanDefTitleSingle : Array Int -> Int -> Int -> Maybe Int
@@ -2613,21 +2643,16 @@ matchDefTail codes n labelStart labelEnd hrefStart hrefEnd =
 
         withTitle =
             if hasSpace || hasNl then
-                case matchDefTitle codes t1 n of
-                    Just titleEnd ->
-                        case matchDefEnd codes titleEnd n of
-                            Just rawEnd ->
-                                Just
-                                    { rawEnd = rawEnd
-                                    , labelStart = labelStart
-                                    , labelEnd = labelEnd
-                                    , hrefStart = hrefStart
-                                    , hrefEnd = hrefEnd
-                                    , title = Just ( t1, titleEnd )
-                                    }
-
-                            Nothing ->
-                                Nothing
+                case matchDefTitleAndEnd codes t1 n of
+                    Just ( titleEnd, rawEnd ) ->
+                        Just
+                            { rawEnd = rawEnd
+                            , labelStart = labelStart
+                            , labelEnd = labelEnd
+                            , hrefStart = hrefStart
+                            , hrefEnd = hrefEnd
+                            , title = Just ( t1, titleEnd )
+                            }
 
                     Nothing ->
                         Nothing

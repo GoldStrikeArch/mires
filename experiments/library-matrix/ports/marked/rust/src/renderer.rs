@@ -194,7 +194,16 @@ pub fn render_inline(tokens: &[InlineToken], out: &mut String) {
                 autolink,
                 tokens: inner,
             } => {
-                let clean = clean_url(href);
+                let Some(href_str) = href.as_deref() else {
+                    if *autolink {
+                        push_escaped_html(out, text, true);
+                    } else {
+                        render_inline(inner, out);
+                    }
+                    i += 1;
+                    continue;
+                };
+                let clean = clean_url(href_str);
                 out.push_str("<a href=\"");
                 push_escaped_html(out, &clean, *autolink);
                 out.push('"');
@@ -221,7 +230,12 @@ pub fn render_inline(tokens: &[InlineToken], out: &mut String) {
             } => {
                 let mut alt = String::new();
                 render_text_inline(inner, &mut alt);
-                let clean = clean_url(href);
+                let Some(href_str) = href.as_deref() else {
+                    push_escaped_html(out, &alt, false);
+                    i += 1;
+                    continue;
+                };
+                let clean = clean_url(href_str);
                 out.push_str("<img src=\"");
                 push_escaped_html(out, &clean, false);
                 out.push_str("\" alt=\"");
