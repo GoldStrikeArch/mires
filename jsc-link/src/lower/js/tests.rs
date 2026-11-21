@@ -8032,4 +8032,292 @@ fn slice_view_unwindows_raw_array_pointer_for_slice_and_str() {
 }
 
 
+#[test]
+fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
+    const RAW_ARR: TypeId = TypeId(415);
+    const ARRAY_2: TypeId = TypeId(416);
+    const REF_ARRAY_2: TypeId = TypeId(417);
+    let mut interns = world();
+    interns.intern_type(pointer(RAW_ARR, ARRAY, PointerForm::Slot, true));
+    let mut arr2 = descriptor(
+        ARRAY_2,
+        TypeKind::Array {
+            element: I32,
+            length: 2,
+        },
+        8,
+    );
+    arr2.js.is_indirect = true;
+    arr2.js.needs_clone = true;
+    interns.intern_type(arr2);
+    interns.intern_type(pointer(REF_ARRAY_2, ARRAY_2, PointerForm::Thin, false));
+
+    let e = FuncBuilder::ENTRY;
+
+    // 1. Dynamic Index write `(*p)[i] = v` through a raw array slot pointer.
+    let mut b1 = FuncBuilder::new(item(1), signature(vec![RAW_ARR, USIZE, I32], UNIT));
+    let p = b1.param(RAW_ARR, NO_ORIGIN);
+    let i = b1.param(USIZE, NO_ORIGIN);
+    let v = b1.param(I32, NO_ORIGIN);
+    let elem = b1.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(p),
+            path: vec![Proj::Deref, Proj::Index(i)],
+            mutable: true,
+        },
+        REF_I32,
+        NO_ORIGIN,
+    );
+    b1.effect(e, OpKind::StoreThrough { ptr: elem, v }, NO_ORIGIN);
+    b1.terminate(e, RTerm::Return(None));
+    let f1 = b1.finish();
+    let p1 = plan_of(&f1, &[(0, "p"), (1, "i"), (2, "v")]);
+    let js1 = lower(
+        &interns,
+        "write_idx",
+        &[],
+        &body_of(BodyKind::Function, f1.sig.clone()),
+        &f1,
+        &p1,
+        straight(&f1),
+    );
+    assert_eq!(js1.matches("__rt.unwindow(").count(), 1, "{js1}");
+    assert!(
+        js1.contains("($t0 = __rt.unwindow(p), $t0.buf)[$t0.off + i] = v;"),
+        "{js1}"
+    );
+
+    // 2. ConstantIndex with from_end: true (`(*p)[-1 of 4]`) uses array length 4, not buf.length.
+    let mut b2 = FuncBuilder::new(item(2), signature(vec![RAW_ARR], I32));
+    let p = b2.param(RAW_ARR, NO_ORIGIN);
+    let last_ref = b2.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(p),
+            path: vec![
+                Proj::Deref,
+                Proj::ConstantIndex {
+                    offset: 1,
+                    min_length: 1,
+                    from_end: true,
+                },
+            ],
+            mutable: false,
+        },
+        REF_I32,
+        NO_ORIGIN,
+    );
+    let last_val = b2.op(e, OpKind::Deref(last_ref), I32, NO_ORIGIN);
+    b2.terminate(e, RTerm::Return(Some(last_val)));
+    let f2 = b2.finish();
+    let p2 = plan_of(&f2, &[(0, "p")]);
+    let js2 = lower(
+        &interns,
+        "read_last",
+        &[],
+        &body_of(BodyKind::Function, f2.sig.clone()),
+        &f2,
+        &p2,
+        straight(&f2),
+    );
+    assert_eq!(js2.matches("__rt.unwindow(").count(), 1, "{js2}");
+    assert!(
+        js2.contains("($t0 = __rt.unwindow(p), $t0.buf)[$t0.off + 3]"),
+        "{js2}"
+    );
+
+    // 3. Raw borrow `&raw mut (*p)[i]` preserves backing buffer + shifted offset.
+    let mut b3 = FuncBuilder::new(item(3), signature(vec![RAW_ARR, USIZE], RAW_I32));
+    let p = b3.param(RAW_ARR, NO_ORIGIN);
+    let i = b3.param(USIZE, NO_ORIGIN);
+    let raw_elem = b3.op(
+        e,
+        OpKind::RawView {
+            root: Root::Value(p),
+            path: vec![Proj::Deref, Proj::Index(i)],
+            mutable: true,
+        },
+        RAW_I32,
+        NO_ORIGIN,
+    );
+    b3.terminate(e, RTerm::Return(Some(raw_elem)));
+    let f3 = b3.finish();
+    let p3 = plan_of(&f3, &[(0, "p"), (1, "i")]);
+    let js3 = lower(
+        &interns,
+        "raw_elem",
+        &[],
+        &body_of(BodyKind::Function, f3.sig.clone()),
+        &f3,
+        &p3,
+        straight(&f3),
+    );
+    assert_eq!(js3.matches("__rt.unwindow(").count(), 1, "{js3}");
+    assert!(
+        js3.contains("{ buf: ($t0 = __rt.unwindow(p), $t0.buf), off: $t0.off + i }"),
+        "{js3}"
+    );
+
+    // 4. Subslice borrow `&mut (*p)[1..3]` (from_end: false and from_end: true) builds an aliasing
+    // window via `__rt.array_ref` rather than copying with `.slice(...)`.
+    for (idx, (to, from_end)) in [(3u64, false), (1u64, true)].into_iter().enumerate() {
+        let mut b4 = FuncBuilder::new(item(4 + idx as u64), signature(vec![RAW_ARR], REF_ARRAY_2));
+        let p = b4.param(RAW_ARR, NO_ORIGIN);
+        let sub_ref = b4.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Value(p),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Subslice {
+                        from: 1,
+                        to,
+                        from_end,
+                    },
+                ],
+                mutable: true,
+            },
+            REF_ARRAY_2,
+            NO_ORIGIN,
+        );
+        b4.terminate(e, RTerm::Return(Some(sub_ref)));
+        let f4 = b4.finish();
+        let p4 = plan_of(&f4, &[(0, "p")]);
+        let js4 = lower(
+            &interns,
+            "sub_ref",
+            &[],
+            &body_of(BodyKind::Function, f4.sig.clone()),
+            &f4,
+            &p4,
+            straight(&f4),
+        );
+        assert_eq!(js4.matches("__rt.unwindow(").count(), 1, "{js4}");
+        assert!(
+            js4.contains(
+                "__rt.array_ref(($t0 = __rt.unwindow(p), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2)"
+            ),
+            "{js4}"
+        );
+    }
+
+    // 5. Hot-path check: a plain `&[i32; 4]` (non-slot array ref) still indexes directly without
+    // `__rt.unwindow`.
+    let mut b5 = FuncBuilder::new(item(6), signature(vec![REF_ARRAY, USIZE], I32));
+    let a = b5.param(REF_ARRAY, NO_ORIGIN);
+    let i = b5.param(USIZE, NO_ORIGIN);
+    let elem = b5.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(a),
+            path: vec![Proj::Deref, Proj::Index(i)],
+            mutable: false,
+        },
+        REF_I32,
+        NO_ORIGIN,
+    );
+    let val = b5.op(e, OpKind::Deref(elem), I32, NO_ORIGIN);
+    b5.terminate(e, RTerm::Return(Some(val)));
+    let f5 = b5.finish();
+    let p5 = plan_of(&f5, &[(0, "a"), (1, "i")]);
+    let js5 = lower(
+        &interns,
+        "read_ref_idx",
+        &[],
+        &body_of(BodyKind::Function, f5.sig.clone()),
+        &f5,
+        &p5,
+        straight(&f5),
+    );
+    assert!(!js5.contains("unwindow"), "{js5}");
+    assert!(js5.contains("return a[i];"), "{js5}");
+
+    // 6. Borrow of `*p` where `p: *mut MaybeUninit<[i32; 4]>` (transparent union: `is_indirect`
+    // is false, so `&mut MaybeUninit<[i32; 4]>` is a slot!) must return `p` directly without
+    // `__rt.array_ref`, whereas borrowing the peeled `[i32; 4]` field calls `__rt.array_ref(p, 4)`.
+    const MU_ARR: TypeId = TypeId(418);
+    const RAW_MU_ARR: TypeId = TypeId(419);
+    const REF_MU_ARR: TypeId = TypeId(420);
+    let mu_name = interns.intern_str("MaybeUninit");
+    let mut mu_arr = descriptor(
+        MU_ARR,
+        TypeKind::Adt {
+            def: def(418),
+            args: Vec::new(),
+            form: NominalForm::Union,
+            variants: vec![variant(
+                mu_name,
+                vec![field(FieldKey::Transparent, ARRAY)],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        16,
+    );
+    mu_arr.js.is_indirect = false;
+    mu_arr.js.crosses_transparent_union = true;
+    mu_arr.js.peeled = ARRAY;
+    interns.intern_type(mu_arr);
+    interns.intern_type(pointer(RAW_MU_ARR, MU_ARR, PointerForm::Slot, true));
+    interns.intern_type(pointer(REF_MU_ARR, MU_ARR, PointerForm::Slot, false));
+
+    let mut b6 = FuncBuilder::new(item(7), signature(vec![RAW_MU_ARR], REF_MU_ARR));
+    let mp = b6.param(RAW_MU_ARR, NO_ORIGIN);
+    let mu_ref = b6.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(mp),
+            path: vec![Proj::Deref],
+            mutable: true,
+        },
+        REF_MU_ARR,
+        NO_ORIGIN,
+    );
+    b6.terminate(e, RTerm::Return(Some(mu_ref)));
+    let f6 = b6.finish();
+    let p6 = plan_of(&f6, &[(0, "p")]);
+    let js6 = lower(
+        &interns,
+        "borrow_mu_arr",
+        &[],
+        &body_of(BodyKind::Function, f6.sig.clone()),
+        &f6,
+        &p6,
+        straight(&f6),
+    );
+    assert_eq!(js6, "function borrow_mu_arr(p) {\n  return p;\n}\n");
+
+    let mut b7 = FuncBuilder::new(item(8), signature(vec![RAW_MU_ARR], REF_ARRAY));
+    let mp = b7.param(RAW_MU_ARR, NO_ORIGIN);
+    let inner_ref = b7.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(mp),
+            path: vec![Proj::Deref, Proj::Field { field: 0, ty: ARRAY }],
+            mutable: true,
+        },
+        REF_ARRAY,
+        NO_ORIGIN,
+    );
+    b7.terminate(e, RTerm::Return(Some(inner_ref)));
+    let f7 = b7.finish();
+    let p7 = plan_of(&f7, &[(0, "p")]);
+    let js7 = lower(
+        &interns,
+        "borrow_mu_inner",
+        &[],
+        &body_of(BodyKind::Function, f7.sig.clone()),
+        &f7,
+        &p7,
+        straight(&f7),
+    );
+    assert_eq!(
+        js7,
+        "function borrow_mu_inner(p) {\n  return __rt.array_ref(p, 4);\n}\n"
+    );
+}
+
+
 mod invoke;

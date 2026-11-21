@@ -105,9 +105,6 @@ impl<'a> JsCx<'a> {
         let mut object = matches!(root, Root::Value(_)) && is_object(table, ty);
 
         for (step, proj) in path.iter().enumerate() {
-            let settles = path[step + 1..]
-                .iter()
-                .all(|proj| matches!(proj, Proj::Field { .. } | Proj::Downcast { .. }));
             identity = None;
             let carried_tail = tail.take();
             // A downcast and a transparent field are the same place; every other step leaves it.
@@ -152,13 +149,23 @@ impl<'a> JsCx<'a> {
                             tail = Some(jsast::member(value.clone(), META));
                             JsPlace::Deref(jsast::member(value, PTR))
                         }
-                        Some(TypeKind::Array { length, .. }) if settles && is_slot(table, ty) => {
+                        Some(TypeKind::Array { length, .. }) if is_slot(table, ty) => {
                             JsPlace::Array(value, *length)
                         }
                         _ if is_slot(table, ty) && table.is_indirect(pointee) => {
-                            JsPlace::Deref(ptr::slot_element(value))
+                            let (setup, slot) = self.reread(value, &[BUF, OFF]);
+                            JsPlace::Deref(jsast::index(
+                                super::ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
+                                ptr::slot_off(slot),
+                            ))
                         }
-                        _ if is_slot(table, ty) => JsPlace::Var(ptr::slot_element(value)),
+                        _ if is_slot(table, ty) => {
+                            let (setup, slot) = self.reread(value, &[BUF, OFF]);
+                            JsPlace::Var(jsast::index(
+                                super::ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
+                                ptr::slot_off(slot),
+                            ))
+                        }
                         // A reference to an aggregate: the pointee is the reference value.
                         _ => {
                             object = is_object(table, pointee);
@@ -204,9 +211,16 @@ impl<'a> JsCx<'a> {
                         // ([`reaches_unit`]): it was evaluated where it was defined.
                         current = JsPlace::Unit(address);
                     } else {
-                        let base = self.read_place(&current);
                         let index = self.expr_of(*index)?;
-                        current = JsPlace::Var(self.element_expr(ty, base, index));
+                        current = match current {
+                            JsPlace::Array(pointer, _) => {
+                                JsPlace::Var(self.unwindow_element(pointer, index))
+                            }
+                            _ => {
+                                let base = self.read_place(&current);
+                                JsPlace::Var(self.element_expr(ty, base, index))
+                            }
+                        };
                     }
                     ty = element;
                     variant = None;
@@ -218,9 +232,24 @@ impl<'a> JsCx<'a> {
                     if let Some(address) = self.unit_element(&current, ty, element) {
                         current = JsPlace::Unit(address);
                     } else {
-                        let base = self.read_place(&current);
-                        let index = self.constant_index(ty, base.clone(), *offset, *from_end);
-                        current = JsPlace::Var(self.element_expr(ty, base, index));
+                        current = match current {
+                            JsPlace::Array(pointer, length) => {
+                                let index = if *from_end {
+                                    length.saturating_sub(*offset)
+                                } else {
+                                    *offset
+                                };
+                                JsPlace::Var(
+                                    self.unwindow_element(pointer, jsast::num(index as f64)),
+                                )
+                            }
+                            _ => {
+                                let base = self.read_place(&current);
+                                let index =
+                                    self.constant_index(ty, base.clone(), *offset, *from_end);
+                                JsPlace::Var(self.element_expr(ty, base, index))
+                            }
+                        };
                     }
                     ty = element;
                     variant = None;
@@ -236,13 +265,33 @@ impl<'a> JsCx<'a> {
                     }
                     variant = None;
                 }
-                Proj::Subslice { from, to, from_end } => {
-                    let base = self.read_place(&current);
-                    let (value, subslice_ty) = self.subslice(ty, base, *from, *to, *from_end)?;
-                    current = JsPlace::Deref(value);
-                    ty = subslice_ty;
-                    variant = None;
-                }
+                Proj::Subslice { from, to, from_end } => match current {
+                    JsPlace::Array(pointer, length) => {
+                        let end = if *from_end {
+                            length.saturating_sub(*to)
+                        } else {
+                            *to
+                        };
+                        let sub_len = end.saturating_sub(*from);
+                        let (setup, slot) =
+                            self.reread(jsast::rt_call("unwindow", vec![pointer]), &[BUF, OFF]);
+                        let window = ptr::window_slot(
+                            ptr::slot_buf(slot.clone()),
+                            offset(ptr::slot_off(slot), jsast::num(*from as f64)),
+                            sub_len,
+                        );
+                        current = JsPlace::Array(super::ptr::sequenced(setup, window), sub_len);
+                        variant = None;
+                    }
+                    _ => {
+                        let base = self.read_place(&current);
+                        let (value, subslice_ty) =
+                            self.subslice(ty, base, *from, *to, *from_end)?;
+                        current = JsPlace::Deref(value);
+                        ty = subslice_ty;
+                        variant = None;
+                    }
+                },
                 Proj::Downcast { variant: index } => {
                     variant = Some(*index);
                     tail = carried_tail;
@@ -304,6 +353,17 @@ impl<'a> JsCx<'a> {
             Some(TypeKind::Slice(_)) => ptr::slot_buf(base),
             _ => base,
         })
+    }
+
+    /// One element of a slot-pointed `[E; N]` (plain slot or window slot), normalized once
+    /// through `__rt.unwindow` into a hoisted temporary so `buf` and `off` come from the same
+    /// record without double evaluation.
+    fn unwindow_element(&self, pointer: Expr, index: Expr) -> Expr {
+        let (setup, slot) = self.reread(jsast::rt_call("unwindow", vec![pointer]), &[BUF, OFF]);
+        jsast::index(
+            super::ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
+            offset(ptr::slot_off(slot), index),
+        )
     }
 
     /// One element of an array or a slice: `base[i]` or `base.buf[base.off + i]`.
@@ -439,10 +499,13 @@ impl<'a> JsCx<'a> {
             return Ok(identity);
         }
         if let JsPlace::Array(pointer, width) = &walk.place {
-            return Ok(jsast::rt_call(
-                "array_ref",
-                vec![pointer.clone(), jsast::num(*width as f64)],
-            ));
+            if self.table.is_indirect(walk.ty) {
+                return Ok(jsast::rt_call(
+                    "array_ref",
+                    vec![pointer.clone(), jsast::num(*width as f64)],
+                ));
+            }
+            return Ok(pointer.clone());
         }
         if let JsPlace::Unit(address) = walk.place {
             return Ok(address);

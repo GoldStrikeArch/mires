@@ -1023,7 +1023,7 @@ fn field_key_expr(key: crate::value::FieldKey) -> Expr {
 }
 
 /// `value`, preceded by the assignment [`reread`] asked for, if it asked for one.
-fn sequenced(setup: Option<Expr>, value: Expr) -> Expr {
+pub(crate) fn sequenced(setup: Option<Expr>, value: Expr) -> Expr {
     match setup {
         Some(setup) => jsast::seq(vec![setup, value]),
         None => value,
@@ -1510,7 +1510,11 @@ impl ByteElement {
 /// unchanged. Anything else is evaluated once into a hoisted temporary, and the caller writes the
 /// returned assignment before its own expression in a sequence: a place has no statement channel to
 /// put it in, and `FnCx::temp` declares the name in the prelude either way.
-fn reread<'tcx>(fx: &FnCx<'_, 'tcx>, value: Expr, reads: &[&str]) -> (Option<Expr>, Expr) {
+pub(crate) fn reread<'tcx>(
+    fx: &FnCx<'_, 'tcx>,
+    value: Expr,
+    reads: &[&str],
+) -> (Option<Expr>, Expr) {
     if duplicable(&value, reads) {
         return (None, value);
     }

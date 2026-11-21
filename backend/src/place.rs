@@ -104,21 +104,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
         let mut tail: Option<Expr> = None;
 
         let projection = place.projection;
-        for (step, elem) in projection.iter().enumerate() {
-            // Whether the place is settled here: nothing left in the projection produces any
-            // JavaScript of its own. A field of a transparent wrapper is the wrapper (`value.rs`)
-            // and a downcast is a no-op, so a `Deref` followed only by those still names what the
-            // `Deref` named -- which is what makes `(*b).value = v` on a `Box<[E; N]>` reach the
-            // array store rather than an assignment to one place.
-            let settles = projection[step + 1..].iter().all(|elem| {
-                matches!(
-                    elem,
-                    PlaceElem::Field(..)
-                        | PlaceElem::Downcast(..)
-                        | PlaceElem::OpaqueCast(_)
-                        | PlaceElem::UnwrapUnsafeBinder(_)
-                )
-            });
+        for elem in projection.iter() {
             // Only a `Deref` of an unsized pointee sets this; every other projection clears it.
             identity = None;
             let carried_tail = tail.take();
@@ -174,13 +160,13 @@ impl<'tcx> FnCx<'_, 'tcx> {
                             tail = Some(jsast::member(value.clone(), ptr::META));
                             JsPlace::Deref(jsast::member(value, ptr::PTR))
                         }
-                        // A pointer to an array, dereferenced as a whole: the elements it names
-                        // are `p.buf[p.off]` for a plain slot and `buf[off .. off + w]` for the
-                        // window slot an `as *const [E; N]` cast produced, and the two are told
-                        // apart at run time by `__rt.read_array`/`__rt.write_array`. A projection
-                        // *out of* the array keeps the plain slot form below: a pointer that
-                        // reaches an element was never a window.
-                        ty::Array(_, count) if settles && ptr::is_slot(self.tcx, ty) => {
+                        // A slot pointer to an array (plain slot or window slot): which elements
+                        // it names is a property of the runtime record (`p.buf[p.off]` for a plain
+                        // slot, `p.buf[p.off .. p.off + w]` for a window slot). Keep it as
+                        // `JsPlace::Array` even when element or subslice projections follow, so
+                        // `Index`/`ConstantIndex`/`Subslice` normalize through `__rt.unwindow`
+                        // rather than indexing `p.buf[p.off]` (which is element 0 on a window).
+                        ty::Array(_, count) if ptr::is_slot(self.tcx, ty) => {
                             let width = count.try_to_target_usize(self.tcx).unwrap_or(0);
                             JsPlace::Array(value, width)
                         }
@@ -193,12 +179,22 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         // projections that follow are unaffected: reading a `Deref` is the object,
                         // exactly as reading a `Var` was.
                         _ if ptr::is_slot(self.tcx, ty) && is_indirect(self.tcx, pointee) => {
-                            JsPlace::Deref(ptr::slot_element(value))
+                            let (setup, slot) = ptr::reread(self, value, &[ptr::BUF, ptr::OFF]);
+                            JsPlace::Deref(jsast::index(
+                                ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
+                                ptr::slot_off(slot),
+                            ))
                         }
                         // A slot to a primitive: `p.buf[p.off]` is the place, and it is assignable,
                         // so the projections that follow and a write both work without a special
                         // case.
-                        _ if ptr::is_slot(self.tcx, ty) => JsPlace::Var(ptr::slot_element(value)),
+                        _ if ptr::is_slot(self.tcx, ty) => {
+                            let (setup, slot) = ptr::reread(self, value, &[ptr::BUF, ptr::OFF]);
+                            JsPlace::Var(jsast::index(
+                                ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
+                                ptr::slot_off(slot),
+                            ))
+                        }
                         // A reference to an aggregate, which is the aggregate's own object.
                         _ => JsPlace::Deref(value),
                     };
@@ -239,9 +235,16 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     if let Some(address) = self.unit_element(&current, ty, element) {
                         current = JsPlace::Unit(address);
                     } else {
-                        let base = self.read(&current);
                         let index = self.local_expr(index);
-                        current = JsPlace::Var(self.element_expr(ty, base, index));
+                        current = match current {
+                            JsPlace::Array(pointer, _) => {
+                                JsPlace::Var(self.unwindow_element(pointer, index))
+                            }
+                            _ => {
+                                let base = self.read(&current);
+                                JsPlace::Var(self.element_expr(ty, base, index))
+                            }
+                        };
                     }
                     ty = element;
                     variant = None;
@@ -255,11 +258,25 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     if let Some(address) = self.unit_element(&current, ty, element) {
                         current = JsPlace::Unit(address);
                     } else {
-                        let base = self.read(&current);
-                        let index = self.constant_index(ty, base.clone(), offset, from_end);
-                        // Constant either way, so nothing to hoist: `len` cannot change under a
-                        // reference that borrows the slice it was read from.
-                        current = JsPlace::Var(self.element_expr(ty, base, index));
+                        current = match current {
+                            JsPlace::Array(pointer, length) => {
+                                let index = if from_end {
+                                    length.saturating_sub(offset)
+                                } else {
+                                    offset
+                                };
+                                JsPlace::Var(
+                                    self.unwindow_element(pointer, jsast::num(index as f64)),
+                                )
+                            }
+                            _ => {
+                                let base = self.read(&current);
+                                let index = self.constant_index(ty, base.clone(), offset, from_end);
+                                // Constant either way, so nothing to hoist: `len` cannot change
+                                // under a reference that borrows the slice it was read from.
+                                JsPlace::Var(self.element_expr(ty, base, index))
+                            }
+                        };
                     }
                     ty = element;
                     variant = None;
@@ -280,13 +297,37 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     ty = subslice_ty;
                     variant = None;
                 }
-                PlaceElem::Subslice { from, to, from_end } => {
-                    let base = self.read(&current);
-                    let (value, subslice_ty) = self.subslice(ty, base, from, to, from_end);
-                    current = JsPlace::Deref(value);
-                    ty = subslice_ty;
-                    variant = None;
-                }
+                PlaceElem::Subslice { from, to, from_end } => match current {
+                    JsPlace::Array(pointer, length) => {
+                        let end = if from_end {
+                            length.saturating_sub(to)
+                        } else {
+                            to
+                        };
+                        let sub_len = end.saturating_sub(from);
+                        let element = self.element_ty(ty);
+                        let (setup, slot) = ptr::reread(
+                            self,
+                            jsast::rt_call("unwindow", vec![pointer]),
+                            &[ptr::BUF, ptr::OFF],
+                        );
+                        let window = ptr::window_slot(
+                            ptr::slot_buf(slot.clone()),
+                            offset(ptr::slot_off(slot), jsast::num(from as f64)),
+                            sub_len,
+                        );
+                        current = JsPlace::Array(ptr::sequenced(setup, window), sub_len);
+                        ty = Ty::new_array(self.tcx, element, sub_len);
+                        variant = None;
+                    }
+                    _ => {
+                        let base = self.read(&current);
+                        let (value, subslice_ty) = self.subslice(ty, base, from, to, from_end);
+                        current = JsPlace::Deref(value);
+                        ty = subslice_ty;
+                        variant = None;
+                    }
+                },
                 // Neither produces JavaScript of its own, so the place -- and the metadata of the
                 // fat pointer it came through -- is exactly what it was.
                 PlaceElem::Downcast(_, index) => {
@@ -376,6 +417,21 @@ impl<'tcx> FnCx<'_, 'tcx> {
             ty::Slice(_) => ptr::slot_buf(base),
             _ => base,
         })
+    }
+
+    /// One element of a slot-pointed `[E; N]` (plain slot or window slot), normalized once
+    /// through `__rt.unwindow` into a hoisted temporary so `buf` and `off` come from the same
+    /// record without double evaluation.
+    fn unwindow_element(&self, pointer: Expr, index: Expr) -> Expr {
+        let (setup, slot) = ptr::reread(
+            self,
+            jsast::rt_call("unwindow", vec![pointer]),
+            &[ptr::BUF, ptr::OFF],
+        );
+        jsast::index(
+            ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
+            offset(ptr::slot_off(slot), index),
+        )
     }
 
     /// One element of an array or a slice: `base[i]` or `base.buf[base.off + i]`.
@@ -535,10 +591,13 @@ impl<'tcx> FnCx<'_, 'tcx> {
         // `<&mut [T] as TryInto<&mut [T; N]>>` and every `as *mut [E; N]` cast at a non zero
         // offset need and what silently read one element instead.
         if let JsPlace::Array(pointer, width) = &walk.place {
-            return jsast::rt_call(
-                "array_ref",
-                vec![pointer.clone(), jsast::num(*width as f64)],
-            );
+            if is_indirect(self.tcx, walk.ty) {
+                return jsast::rt_call(
+                    "array_ref",
+                    vec![pointer.clone(), jsast::num(*width as f64)],
+                );
+            }
+            return pointer.clone();
         }
         if let JsPlace::Unit(address) = walk.place {
             return address;
