@@ -205,10 +205,49 @@ impl JsCx<'_> {
                 bit_cast(int_array(a), float_array(bits), value)
             }
             // Two pointers: the same question `CastKind::PtrToPtr` asks, and the same answer.
+            // Crossing between a reference and a raw pointer (including pattern-wrapped raw
+            // pointers like `NonNull<T>`) converts aggregate references with `ref_to_raw` /
+            // `raw_to_ref`, while keeping bare array references (`&[E; N] -> NonNull<E>`) directly
+            // on `__rt.unwindow` and aggregate references erased to `*const ()` / `NonNull<()>` in
+            // their reference form.
             (ReprClass::Pointer(_), ReprClass::Pointer(_)) => {
                 match (value::pointee_of(table, from), value::pointee_of(table, to)) {
                     (Some(from_pointee), Some(to_pointee)) => {
-                        self.cast_pointer(from_pointee, to_pointee, value)?
+                        let from_is_ref = !value::is_raw(table, from);
+                        let to_is_ref = !value::is_raw(table, to);
+                        let from_shape = table.peeled(from_pointee);
+                        let to_shape = table.peeled(to_pointee);
+                        let preserve_ref = from_is_ref
+                            && ((to_is_ref && from_shape == to_shape)
+                                || (!to_is_ref
+                                    && table.is_zst(to_pointee)
+                                    && value::is_slot_pointee(table, from_pointee)
+                                    && table.is_indirect(from_pointee)));
+                        if preserve_ref {
+                            value
+                        } else {
+                            let unwindowing_array_ref = from_is_ref
+                                && matches!(
+                                    value::kind(table, from_shape),
+                                    Some(TypeKind::Array { .. })
+                                )
+                                && !matches!(
+                                    value::kind(table, to_shape),
+                                    Some(TypeKind::Array { .. })
+                                )
+                                && !table.is_zst(to_pointee);
+                            let raw_in = if from_is_ref && !unwindowing_array_ref {
+                                self.ref_value_to_raw(from_pointee, value)
+                            } else {
+                                value
+                            };
+                            let raw_out = self.cast_pointer(from_pointee, to_pointee, raw_in)?;
+                            if to_is_ref {
+                                self.raw_to_ref(to_pointee, raw_out)
+                            } else {
+                                raw_out
+                            }
+                        }
                     }
                     _ => value,
                 }
@@ -216,12 +255,28 @@ impl JsCx<'_> {
             // A thin pointer and a pointer sized integer.
             (ReprClass::Pointer(true), ReprClass::Int(b)) if b.bits == POINTER_BITS => {
                 let address = match value::pointee_of(table, from) {
-                    Some(pointee) => self.ptr_addr(pointee, value),
+                    Some(pointee) => {
+                        let raw = if !value::is_raw(table, from) {
+                            self.ref_value_to_raw(pointee, value)
+                        } else {
+                            value
+                        };
+                        self.ptr_addr(pointee, raw)
+                    }
+                    None if matches!(value::kind(table, from), Some(TypeKind::FnPtr { .. })) => {
+                        jsast::rt_call("addr", vec![value, jsast::num(1.0)])
+                    }
                     None => value,
                 };
                 value::mask(b.repr, b.signed, b.bits, address)
             }
-            (ReprClass::Int(a), ReprClass::Pointer(true)) if a.bits == POINTER_BITS => value,
+            (ReprClass::Int(a), ReprClass::Pointer(true)) if a.bits == POINTER_BITS => {
+                if a.signed {
+                    value::mask(a.repr, false, a.bits, value)
+                } else {
+                    value
+                }
+            }
             // `[u8; N]` and `uN`, little endian.
             (ReprClass::Other, ReprClass::Int(b))
                 if matches!(b.bits, 16 | 32 | 64)
@@ -276,6 +331,19 @@ impl JsCx<'_> {
                 },
             },
         })
+    }
+
+    /// Converts a reference value (rather than a place expression) to a raw pointer.
+    /// Unlike `ptr::ref_to_raw`, this never treats an enclosing `Expr::Member` or `Expr::Index`
+    /// (such as `$n._0` from `niche_to_scalar` or a wrapper field) as the pointee's container.
+    fn ref_value_to_raw(&self, pointee: TypeId, reference: Expr) -> Expr {
+        if self.table.unsized_tail(pointee).is_some() {
+            return jsast::rt_call("tail_raw", vec![reference]);
+        }
+        if !value::is_slot_pointee(self.table, pointee) || !self.table.is_indirect(pointee) {
+            return reference;
+        }
+        jsast::rt_call("box", vec![reference])
     }
 
     /// Strips every single-non-ZST-field wrapper off a value.

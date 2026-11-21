@@ -823,6 +823,9 @@ impl<'a> JsCx<'a> {
                 ..
             } => &variants.first()?.fields,
             TypeKind::Tuple(_) | TypeKind::Closure { .. } => &descriptor.js.fields,
+            TypeKind::Array { element, length: 1 } if !table.is_zst(*element) => {
+                return Some((*element, FieldKey::Index(0)));
+            }
             _ => return None,
         };
         let mut live = fields.iter().filter(|field| !table.is_zst(field.ty));

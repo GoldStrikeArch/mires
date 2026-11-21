@@ -1321,7 +1321,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
     /// is the data pointer itself.
     fn aggregate_raw_ptr(&self) -> Outcome {
         let pointer_ty = self.ret_ty();
-        let Some(pointee) = pointer_ty.builtin_deref(true) else {
+        let Some(pointee) = value::peel_pattern(pointer_ty).builtin_deref(true) else {
             return self.unsupported(format!("`{pointer_ty}` is not a pointer"));
         };
         Outcome::Value(ptr::build_fat(self.fx, pointee, self.arg(0), self.arg(1)))
@@ -1330,7 +1330,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
     /// `slice_get_unchecked(slice, index)`: a pointer to one element of a slice.
     fn slice_get_unchecked(&self) -> Outcome {
         let slice_ty = self.arg_ty(0);
-        let Some(pointee) = slice_ty.builtin_deref(true) else {
+        let Some(pointee) = value::peel_pattern(slice_ty).builtin_deref(true) else {
             return self.unsupported(format!("`{slice_ty}` is not a pointer"));
         };
         let ty::Slice(element_ty) = pointee.kind() else {
@@ -1500,7 +1500,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
     /// not agree on what their parameters are: `offset` is generic over the *pointer* type
     /// (`offset<Ptr: BuiltinDeref, Delta>`) while `copy` is generic over the pointee.
     fn pointee_of(&self, index: usize) -> Option<Ty<'tcx>> {
-        self.arg_ty(index).builtin_deref(true)
+        value::peel_pattern(self.arg_ty(index)).builtin_deref(true)
     }
 
     /// The zombie a pointer intrinsic records when the argument it was handed is not a pointer —
@@ -1875,13 +1875,50 @@ fn transmute_scalar<'tcx>(
         // is the same function — `ptr::cast_pointer` owns the whole matrix. A fn pointer has no
         // pointee to ask about and is a JavaScript function whichever pointer type it is spelled
         // as, so it is carried across as it is.
+        //
+        // Crossing between a reference and a raw pointer (including pattern-wrapped raw pointers
+        // like `NonNull<T>`) converts aggregate references with `ref_to_raw` / `raw_to_ref`, while
+        // keeping bare array references (`&[E; N] -> NonNull<E>`) directly on `__rt.unwindow` and
+        // aggregate references erased to `*const ()` / `NonNull<()>` in their reference form.
         (ReprClass::Pointer(_), ReprClass::Pointer(_)) => {
+            let from_peeled = value::peel_pattern(inner_from);
+            let to_peeled = value::peel_pattern(inner_to);
             match (
-                value::peel_pattern(inner_from).builtin_deref(true),
-                value::peel_pattern(inner_to).builtin_deref(true),
+                from_peeled.builtin_deref(true),
+                to_peeled.builtin_deref(true),
             ) {
                 (Some(from_pointee), Some(to_pointee)) => {
-                    crate::ptr::cast_pointer(fx, from_pointee, to_pointee, value)
+                    let from_is_ref = matches!(from_peeled.kind(), ty::Ref(..));
+                    let to_is_ref = matches!(to_peeled.kind(), ty::Ref(..));
+                    let from_shape =
+                        value::peel_pattern(value::peel_transparent(tcx, from_pointee));
+                    let to_shape = value::peel_pattern(value::peel_transparent(tcx, to_pointee));
+                    let preserve_ref = from_is_ref
+                        && ((to_is_ref && from_shape == to_shape)
+                            || (!to_is_ref
+                                && is_zst(tcx, to_pointee)
+                                && crate::ptr::is_slot_pointee(tcx, from_pointee)
+                                && value::is_indirect(tcx, from_pointee)));
+                    if preserve_ref {
+                        value
+                    } else {
+                        let unwindowing_array_ref = from_is_ref
+                            && matches!(from_shape.kind(), ty::Array(..))
+                            && !matches!(to_shape.kind(), ty::Array(..))
+                            && !is_zst(tcx, to_pointee);
+                        let raw_in = if from_is_ref && !unwindowing_array_ref {
+                            crate::ptr::ref_to_raw(fx, from_pointee, value)
+                        } else {
+                            value
+                        };
+                        let raw_out =
+                            crate::ptr::cast_pointer(fx, from_pointee, to_pointee, raw_in);
+                        if to_is_ref {
+                            crate::ptr::raw_to_ref(fx, to_pointee, raw_out)
+                        } else {
+                            raw_out
+                        }
+                    }
                 }
                 _ => value,
             }
@@ -1895,13 +1932,30 @@ fn transmute_scalar<'tcx>(
         // base per buffer (see `ptr::addr`'s guarantees), so `is_null()` is false for it and
         // alignment predicates answer correctly.
         (ReprClass::Pointer(true), ReprClass::Int(to)) if to.bits == pointer_bits(tcx) => {
-            let address = match inner_from.builtin_deref(true) {
-                Some(pointee) => crate::ptr::addr(fx, pointee, value),
+            let from_peeled = value::peel_pattern(inner_from);
+            let address = match from_peeled.builtin_deref(true) {
+                Some(pointee) => {
+                    let raw = if matches!(from_peeled.kind(), ty::Ref(..)) {
+                        crate::ptr::ref_to_raw(fx, pointee, value)
+                    } else {
+                        value
+                    };
+                    crate::ptr::addr(fx, pointee, raw)
+                }
+                None if matches!(from_peeled.kind(), ty::FnPtr(..)) => {
+                    jsast::rt_call("addr", vec![value, jsast::num(1.0)])
+                }
                 None => value,
             };
             mask(to.repr, to.signed, to.bits, address)
         }
-        (ReprClass::Int(from), ReprClass::Pointer(true)) if from.bits == pointer_bits(tcx) => value,
+        (ReprClass::Int(from), ReprClass::Pointer(true)) if from.bits == pointer_bits(tcx) => {
+            if from.signed {
+                mask(from.repr, false, from.bits, value)
+            } else {
+                value
+            }
+        }
         // `[u8; N]` and `uN`, little endian: `u32::from_le_bytes` and `u16::to_le_bytes` are
         // written as exactly this transmute, and `core::fmt`'s integer formatting reads its digit
         // buffer through `cast_array().read()` on the way to one. Nothing else in this backend can
@@ -2098,9 +2152,11 @@ fn niche_from_scalar<'tcx>(
     use rustc_middle::ty::layout::LayoutCx;
 
     let tcx = fx.tcx;
-    let (_, bits) = int_info(tcx, from_ty)?;
+    let from_scalar = value::peel_pattern(from_ty);
+    let (_, bits) = int_info(tcx, from_scalar)?;
 
-    let ty::Adt(def, args) = to_ty.kind() else {
+    let to_peeled = value::peel_pattern(to_ty);
+    let ty::Adt(def, args) = to_peeled.kind() else {
         return None;
     };
     if !def.is_enum() {
@@ -2144,7 +2200,7 @@ fn niche_from_scalar<'tcx>(
         }
         let offset = (raw_idx - niche_variants.start.index()) as u128;
         let raw_bits = tag_size.truncate(niche_start.wrapping_add(offset));
-        let niche_lit = value::int_literal(tcx, from_ty, raw_bits)?;
+        let niche_lit = value::int_literal(tcx, from_scalar, raw_bits)?;
         let empty_value = value::enum_value(tcx, to_ty, variant_idx, Vec::new())?;
         niche_cases.push((niche_lit, empty_value));
     }
@@ -2207,9 +2263,11 @@ fn niche_to_scalar<'tcx>(
     use rustc_middle::ty::layout::LayoutCx;
 
     let tcx = fx.tcx;
-    let (_, bits) = int_info(tcx, to_ty)?;
+    let to_scalar = value::peel_pattern(to_ty);
+    let (_, bits) = int_info(tcx, to_scalar)?;
 
-    let ty::Adt(def, args) = from_ty.kind() else {
+    let from_peeled = value::peel_pattern(from_ty);
+    let ty::Adt(def, args) = from_peeled.kind() else {
         return None;
     };
     if !def.is_enum() {
@@ -2254,7 +2312,7 @@ fn niche_to_scalar<'tcx>(
         }
         let offset = (raw_idx - niche_variants.start.index()) as u128;
         let raw_bits = tag_size.truncate(niche_start.wrapping_add(offset));
-        let niche_lit = value::int_literal(tcx, to_ty, raw_bits)?;
+        let niche_lit = value::int_literal(tcx, to_scalar, raw_bits)?;
         let tag_lit = value::variant_tag(tcx, from_ty, variant_idx)?;
         niche_cases.push((tag_lit, niche_lit));
     }
@@ -2272,7 +2330,7 @@ fn niche_to_scalar<'tcx>(
         return None;
     }
     let field_ty = normalize(field.ty(tcx, args));
-    let key = value::field_key(tcx, from_ty, Some(*untagged_variant), field_index)?;
+    let key = value::field_key(tcx, from_peeled, Some(*untagged_variant), field_index)?;
 
     let bound = jsast::id(NICHE_PARAM);
     let payload_bits =
@@ -2436,6 +2494,7 @@ pub(crate) fn sole_field<'tcx>(
     if let Some(field_ty) = value::transparent_field(tcx, ty) {
         return Some((field_ty, value::FieldKey::Transparent));
     }
+    let ty = value::peel_pattern(ty);
     match ty.kind() {
         ty::Adt(def, args) if def.is_struct() || def.is_union() => {
             let variant = def.non_enum_variant();

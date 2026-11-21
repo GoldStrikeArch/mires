@@ -125,7 +125,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
 
             match elem {
                 PlaceElem::Deref => {
-                    let Some(pointee) = ty.builtin_deref(true) else {
+                    let Some(pointee) = crate::value::peel_pattern(ty).builtin_deref(true) else {
                         return Walk {
                             place: JsPlace::Var(self.zombie(format!("cannot deref `{ty}`"))),
                             ty,
@@ -674,7 +674,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// `MIR`'s `PtrMetadata` unary operator and the `ptr_metadata` intrinsic (which the
     /// `LowerIntrinsics` pass rewrites into that operator) both land here.
     pub(crate) fn ptr_metadata(&self, pointer_ty: Ty<'tcx>, value: Expr) -> Expr {
-        let Some(pointee) = pointer_ty.builtin_deref(true) else {
+        let Some(pointee) = crate::value::peel_pattern(pointer_ty).builtin_deref(true) else {
             return self.zombie(format!("`{pointer_ty}` has no pointer metadata"));
         };
         match pointee.kind() {

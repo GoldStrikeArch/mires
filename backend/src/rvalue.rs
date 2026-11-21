@@ -585,13 +585,16 @@ impl<'tcx> FnCx<'_, 'tcx> {
             // pointer cast to a pointer — has no row: a JavaScript function is the same value
             // whichever pointer type names it.
             CastKind::PtrToPtr | CastKind::FnPtrToPtr => {
-                let (Some(from_pointee), Some(to_pointee)) =
-                    (from_ty.builtin_deref(true), to_ty.builtin_deref(true))
-                else {
+                let peeled_from = value::peel_pattern(from_ty);
+                let peeled_to = value::peel_pattern(to_ty);
+                let (Some(from_pointee), Some(to_pointee)) = (
+                    peeled_from.builtin_deref(true),
+                    peeled_to.builtin_deref(true),
+                ) else {
                     return value;
                 };
-                let value = if matches!(from_ty.kind(), ty::Ref(..))
-                    && matches!(to_ty.kind(), ty::RawPtr(..))
+                let value = if matches!(peeled_from.kind(), ty::Ref(..))
+                    && matches!(peeled_to.kind(), ty::RawPtr(..))
                 {
                     crate::ptr::ref_to_raw(self, from_pointee, value)
                 } else {
@@ -610,8 +613,12 @@ impl<'tcx> FnCx<'_, 'tcx> {
             // address comes from `__rt.addr` (see `ptr::addr`), an integer-born one passes
             // through.
             CastKind::PointerExposeProvenance => {
-                let address = match from_ty.builtin_deref(true) {
+                let peeled_from = value::peel_pattern(from_ty);
+                let address = match peeled_from.builtin_deref(true) {
                     Some(pointee) => crate::ptr::addr(self, pointee, value),
+                    None if matches!(peeled_from.kind(), ty::FnPtr(..)) => {
+                        jsast::rt_call("addr", vec![value, jsast::num(1.0)])
+                    }
                     None => value,
                 };
                 mask_ty(self.tcx, to_ty, address)

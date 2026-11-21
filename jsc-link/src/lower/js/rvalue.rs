@@ -722,6 +722,9 @@ impl<'a> JsCx<'a> {
             CastKind::PointerExposeProvenance => {
                 let address = match value::pointee_of(table, from_ty) {
                     Some(pointee) => self.ptr_addr(pointee, value),
+                    None if matches!(value::kind(table, from_ty), Some(TypeKind::FnPtr { .. })) => {
+                        jsast::rt_call("addr", vec![value, jsast::num(1.0)])
+                    }
                     None => value,
                 };
                 Ok(mask_ty(table, to_ty, address))

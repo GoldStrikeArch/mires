@@ -304,7 +304,7 @@ pub(crate) fn offset_from<'tcx>(
 ///
 /// Wide pointers compare both their data pointer and metadata.
 pub(crate) fn eq<'tcx>(fx: &FnCx<'_, 'tcx>, pointer_ty: Ty<'tcx>, lhs: Expr, rhs: Expr) -> Expr {
-    let helper = match pointer_ty.builtin_deref(true) {
+    let helper = match peel_pattern(pointer_ty).builtin_deref(true) {
         Some(pointee) if matches!(pointee.kind(), ty::Slice(_)) => "slice_ptr_eq",
         Some(pointee)
             if matches!(pointee.kind(), ty::Dynamic(..))
@@ -334,7 +334,7 @@ pub(crate) fn cmp<'tcx>(
     lhs: Expr,
     rhs: Expr,
 ) -> Expr {
-    let size = pointer_ty
+    let size = peel_pattern(pointer_ty)
         .builtin_deref(true)
         .and_then(|pointee| size_of(fx.tcx, pointee))
         .unwrap_or(1);
