@@ -38,6 +38,7 @@ pub fn scalar(bits: u128, ty: TypeId, table: &TypeTable) -> Result<Value, Trap> 
         }
         TypeKind::Float { bits: 64 } => Ok(Value::float(f64::from_bits(bits as u64), 64)),
         TypeKind::Float { .. } => Err(Trap::Unsupported("f16/f128 constant")),
+        TypeKind::Pattern(base) => scalar(bits, *base, table),
         TypeKind::Adt { variants, .. } => {
             if let Some(inner) = descriptor.js.transparent {
                 let field = scalar(bits, inner.ty, table)?;

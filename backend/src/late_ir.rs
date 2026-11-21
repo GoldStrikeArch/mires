@@ -1144,10 +1144,29 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             .map_err(|_| format!("could not evaluate constant of type `{ty}`"))?;
         match value {
             mir::ConstValue::ZeroSized => Ok(Constant::ZeroSized),
-            mir::ConstValue::Scalar(Scalar::Int(value)) => Ok(Constant::Scalar {
-                bits: value.to_uint(value.size()),
-                bytes: value.size().bytes() as u8,
-            }),
+            mir::ConstValue::Scalar(Scalar::Int(value))
+                if crate::constant::raw::is_primitive(ty)
+                    || crate::constant::raw::is_pointer(ty) =>
+            {
+                Ok(Constant::Scalar {
+                    bits: value.to_uint(value.size()),
+                    bytes: value.size().bytes() as u8,
+                })
+            }
+            // A non-primitive scalar constant (`Option<NonZero<T>>`, `Option<bool>`,
+            // `Option<Ordering>`, `None::<&T>`, transparent wrappers, single-field structs,
+            // single-scalar tuples/arrays/closures, fieldless enums) decodes from a scratch
+            // allocation laid out for `ty`, matching `constant.rs::scalar_to_expr` (MIRES-006).
+            mir::ConstValue::Scalar(Scalar::Int(value)) => {
+                let scratch = crate::constant::raw::scratch_alloc(tcx, value, ty)
+                    .ok_or_else(|| format!("no layout for `{ty}` in a constant"))?;
+                Ok(Constant::Memory(self.const_tree(
+                    &scratch,
+                    rustc_abi::Size::ZERO,
+                    ty,
+                    0,
+                )?))
+            }
             // A pointer that is the one scalar of a type around it (`Option<&T>`,
             // `Option<NonNull<T>>`, `Option<fn()>`) decodes from a scratch allocation holding it,
             // provenance included, as that type stored in memory does.
@@ -1448,6 +1467,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             ty::Ref(..) | ty::RawPtr(..) | ty::FnPtr(..) => {
                 self.const_pointer_field(allocation, offset, ty, depth)
             }
+            ty::FnDef(..) => Ok(ConstTree::Unit),
             _ => Err(format!(
                 "constants of type `{ty}` cannot be encoded from an allocation"
             )),

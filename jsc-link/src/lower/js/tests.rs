@@ -3224,6 +3224,183 @@ fn niche_scalar_constants_name_the_niche_variant() {
 }
 
 #[test]
+fn niche_scalar_constants_peel_transparent_and_pattern_fields() {
+    // Models `Option<NonZero<u32>>` where `NonZero<u32>` is a transparent wrapper over
+    // `NonZeroU32Inner` over `Pattern(u32)`, plus `niche_width` walking `[0, 0, 0]`.
+    let mut interns = world();
+    let pat_u32 = TypeId(100);
+    let nz_inner = TypeId(101);
+    let nz_u32 = TypeId(102);
+    let opt_nz = TypeId(103);
+    let wrap_nz = TypeId(104);
+    let tup_nz = TypeId(105);
+    let arr_nz = TypeId(106);
+
+    let none = interns.intern_str("None");
+    let some = interns.intern_str("Some");
+    let f0 = interns.intern_str("_0");
+    let inner_name = interns.intern_str("NonZeroU32Inner");
+    let nz_name = interns.intern_str("NonZero");
+    let wrap_name = interns.intern_str("Wrap");
+
+    let mut pat = descriptor(pat_u32, TypeKind::Pattern(U32), 4);
+    pat.js.int = Some(IntFacts {
+        signed: false,
+        bits: 32,
+        repr: IntRepr::Number,
+    });
+    pat.js.peeled = U32;
+    interns.intern_type(pat);
+
+    let mut inner = descriptor(
+        nz_inner,
+        TypeKind::Adt {
+            def: def(101),
+            args: Vec::new(),
+            form: NominalForm::Struct,
+            variants: vec![variant(
+                inner_name,
+                vec![field(FieldKey::Transparent, pat_u32)],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        4,
+    );
+    inner.js.int = Some(IntFacts {
+        signed: false,
+        bits: 32,
+        repr: IntRepr::Number,
+    });
+    inner.js.transparent = Some(rcgjs_object::jir::types::TransparentField {
+        field: 0,
+        ty: pat_u32,
+    });
+    inner.js.peeled = U32;
+    interns.intern_type(inner);
+
+    let mut nz = descriptor(
+        nz_u32,
+        TypeKind::Adt {
+            def: def(102),
+            args: vec![U32],
+            form: NominalForm::Struct,
+            variants: vec![variant(
+                nz_name,
+                vec![field(FieldKey::Transparent, nz_inner)],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        4,
+    );
+    nz.js.int = Some(IntFacts {
+        signed: false,
+        bits: 32,
+        repr: IntRepr::Number,
+    });
+    nz.js.transparent = Some(rcgjs_object::jir::types::TransparentField {
+        field: 0,
+        ty: nz_inner,
+    });
+    nz.js.peeled = U32;
+    interns.intern_type(nz);
+
+    let opt_niche = rcgjs_object::jir::types::Niche {
+        untagged_variant: 1,
+        niche_field: vec![0, 0, 0],
+        niche_start: 0,
+        valid_range: (0, u32::MAX as u128),
+    };
+    let mut opt = descriptor(
+        opt_nz,
+        TypeKind::Adt {
+            def: def(103),
+            args: vec![nz_u32],
+            form: NominalForm::Enum,
+            variants: vec![
+                variant(none, Vec::new(), 0, None),
+                variant(some, vec![field(FieldKey::Name(f0), nz_u32)], 1, None),
+            ],
+            niche: Some(opt_niche.clone()),
+        },
+        4,
+    );
+    opt.js.is_indirect = true;
+    opt.js.needs_clone = true;
+    opt.js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+    interns.intern_type(opt);
+
+    let mut wrap = descriptor(
+        wrap_nz,
+        TypeKind::Adt {
+            def: def(104),
+            args: Vec::new(),
+            form: NominalForm::Struct,
+            variants: vec![variant(
+                wrap_name,
+                vec![field(FieldKey::Name(f0), nz_u32)],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        4,
+    );
+    wrap.js.is_indirect = true;
+    wrap.js.needs_clone = true;
+    interns.intern_type(wrap);
+
+    let mut tup = descriptor(tup_nz, TypeKind::Tuple(vec![nz_u32]), 4);
+    tup.js.is_indirect = true;
+    tup.js.needs_clone = true;
+    interns.intern_type(tup);
+
+    let mut arr = descriptor(
+        arr_nz,
+        TypeKind::Array {
+            element: nz_u32,
+            length: 1,
+        },
+        4,
+    );
+    arr.js.is_indirect = true;
+    arr.js.needs_clone = true;
+    interns.intern_type(arr);
+
+    // `niche_width` walks through unpeeled transparent wrappers (`[0, 0, 0]`) to `u32`.
+    assert_eq!(
+        super::value::niche_width(&interns.types, interns.types.variants(opt_nz), &opt_niche),
+        Some(32)
+    );
+
+    let check = |ty: TypeId, bits: u128, expected: &str| {
+        let mut b = FuncBuilder::new(item(1), signature(vec![], ty));
+        let e = FuncBuilder::ENTRY;
+        let v = b.op(
+            e,
+            OpKind::Const(ConstTree::Scalar { bits, bytes: 4 }),
+            ty,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(v)));
+        let func = b.finish();
+        let plan = plan_of(&func, &[]);
+        let body = body_of(BodyKind::Function, func.sig.clone());
+        let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+        assert_eq!(js, format!("function f() {{\n  return {expected};\n}}\n"));
+    };
+
+    check(opt_nz, 5, "{ TAG: \"Some\", _0: 5 }");
+    check(opt_nz, 0, "{ TAG: \"None\" }");
+    check(wrap_nz, 7, "{ _0: 7 }");
+    check(tup_nz, 9, "[9]");
+    check(arr_nz, 11, "[11]");
+}
+
+#[test]
 fn asserts_call_the_panic_lang_item_with_a_location() {
     let mut interns = world();
     let file = interns.intern_str("examples/emit/14_pointers.rs");

@@ -140,6 +140,9 @@ impl<'a> JsCx<'a> {
                 };
                 let mut entries = Vec::with_capacity(fields.len());
                 for (field, tree) in descriptor.fields.iter().zip(fields) {
+                    if matches!(field.key, FieldKey::Transparent) {
+                        continue;
+                    }
                     let key = self.field_key_name(field.key)?;
                     entries.push((key, self.const_expr_at(tree, field.ty, depth + 1)?));
                 }
@@ -186,6 +189,16 @@ impl<'a> JsCx<'a> {
     /// `Scalar { bits }` at `ty` (`constant.rs::scalar_to_expr`): the primitives directly, and
     /// the register-sized aggregates by reading the bits at their type.
     fn scalar_expr(&self, bits: u128, ty: TypeId) -> Res<Expr> {
+        self.scalar_expr_at(bits, ty, 0)
+    }
+
+    fn scalar_expr_at(&self, bits: u128, ty: TypeId, depth: u32) -> Res<Expr> {
+        if depth > 64 {
+            return Err(decline(
+                OpClass::Constant,
+                "scalar constant type deeper than 64 levels",
+            ));
+        }
         let table = self.table;
         let Some(descriptor) = table.get(ty) else {
             return Err(decline(
@@ -193,6 +206,16 @@ impl<'a> JsCx<'a> {
                 "scalar constant at an unknown type",
             ));
         };
+        // A transparent wrapper *is* its one non-ZST field, and a pattern type *is* its base
+        // type. Peel both on every recursive step so a `NonZero<T>` or custom `repr(transparent)`
+        // wrapper inside an enum, struct, tuple or array decodes to its inner scalar instead of
+        // an empty object (MIRES-006).
+        if let Some(inner) = descriptor.js.transparent {
+            return self.scalar_expr_at(bits, inner.ty, depth + 1);
+        }
+        if let TypeKind::Pattern(base) = descriptor.kind {
+            return self.scalar_expr_at(bits, base, depth + 1);
+        }
         match &descriptor.kind {
             TypeKind::Bool => Ok(jsast::boolean(bits != 0)),
             TypeKind::Char => Ok(jsast::num(bits as f64)),
@@ -250,25 +273,33 @@ impl<'a> JsCx<'a> {
                     return value::enum_value(table, self.interns, ty, index as u32, Vec::new())
                         .ok_or_else(|| decline(OpClass::Constant, "scalar enum constant"));
                 }
-                // A niche: the bit pattern names a niche variant or the untagged one, whose one
-                // non-zero-sized field holds the bits.
-                let Some(niche) = niche else {
+                // A niche or a single-variant enum: either the bit pattern selects a niche
+                // variant / the untagged variant, or the enum has only one variant carrying the
+                // scalar payload.
+                let (index, carries_payload) = if let Some(niche) = niche {
+                    let index = value::niche_variant(table, variants, niche, bits);
+                    (index, index == niche.untagged_variant)
+                } else if variants.len() == 1 {
+                    (0, true)
+                } else {
                     return Err(decline(
                         OpClass::Constant,
                         "scalar constant of an enum with neither a direct tag nor a niche",
                     ));
                 };
-                let index = value::niche_variant(table, variants, niche, bits);
                 let Some(variant) = variants.get(index as usize) else {
                     return Err(decline(OpClass::Constant, "niche names a missing variant"));
                 };
                 let mut entries = Vec::new();
                 let mut carried = false;
                 for field in &variant.fields {
+                    if matches!(field.key, FieldKey::Transparent) {
+                        continue;
+                    }
                     let key = self.field_key_name(field.key)?;
                     if table.is_zst(field.ty) {
                         entries.push((key, jsast::undefined()));
-                    } else if index != niche.untagged_variant {
+                    } else if !carries_payload {
                         return Err(decline(
                             OpClass::Constant,
                             "scalar constant of a niche variant with a payload",
@@ -280,7 +311,7 @@ impl<'a> JsCx<'a> {
                         ));
                     } else {
                         carried = true;
-                        entries.push((key, self.scalar_expr(bits, field.ty)?));
+                        entries.push((key, self.scalar_expr_at(bits, field.ty, depth + 1)?));
                     }
                 }
                 value::enum_value(table, self.interns, ty, index, entries)
@@ -313,7 +344,7 @@ impl<'a> JsCx<'a> {
                         ));
                     } else {
                         carried = true;
-                        entries.push((key, self.scalar_expr(bits, field.ty)?));
+                        entries.push((key, self.scalar_expr_at(bits, field.ty, depth + 1)?));
                     }
                 }
                 Ok(jsast::object(entries))
@@ -337,10 +368,30 @@ impl<'a> JsCx<'a> {
                         ));
                     } else {
                         carried = true;
-                        items.push(self.scalar_expr(bits, *element)?);
+                        items.push(self.scalar_expr_at(bits, *element, depth + 1)?);
                     }
                 }
                 Ok(jsast::array(items))
+            }
+            TypeKind::Array { element, length } => {
+                let len = *length as usize;
+                if len == 0 {
+                    return Ok(jsast::array(Vec::new()));
+                }
+                if table.is_zst(*element) {
+                    return Ok(jsast::array(vec![jsast::undefined(); len]));
+                }
+                if len == 1 {
+                    return Ok(jsast::array(vec![self.scalar_expr_at(
+                        bits,
+                        *element,
+                        depth + 1,
+                    )?]));
+                }
+                Err(decline(
+                    OpClass::Constant,
+                    "scalar constant of a multi-element array",
+                ))
             }
             other => Err(decline(
                 OpClass::Constant,

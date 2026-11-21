@@ -915,10 +915,27 @@ pub fn niche_width(
     let mut fields: &[rcgjs_object::jir::types::FieldDescriptor] =
         &variants.get(niche.untagged_variant as usize)?.fields;
     let mut ty = None;
+    let mut in_array = false;
     for step in &niche.niche_field {
-        let field = fields.get(*step as usize)?;
+        let field = if in_array {
+            fields.first()?
+        } else {
+            fields.get(*step as usize)?
+        };
         ty = Some(field.ty);
-        let descriptor = table.get(table.peeled(field.ty))?;
+        // Walk unpeeled ADT/tuple/array fields: `niche.niche_field` records layout steps through
+        // transparent wrappers like `NonZero<T>` -> `NonZeroInner` -> `Pattern(T)`. Peeling
+        // transparent wrappers here would discard their field list before the remaining path steps
+        // are consumed.
+        let mut cur_ty = field.ty;
+        for _ in 0..16 {
+            match table.get(cur_ty).map(|d| &d.kind) {
+                Some(TypeKind::Pattern(base)) => cur_ty = *base,
+                _ => break,
+            }
+        }
+        let descriptor = table.get(cur_ty)?;
+        in_array = matches!(descriptor.kind, TypeKind::Array { .. });
         fields = match &descriptor.kind {
             TypeKind::Adt { variants, .. } => &variants.first()?.fields,
             _ => &descriptor.js.fields,

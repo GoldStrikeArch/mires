@@ -315,6 +315,8 @@ fn read_alloc<'tcx>(
         ty::Ref(..) | ty::RawPtr(..) | ty::FnPtr(..) => {
             read_pointer(cgu, log, alloc, offset, ty, span)
         }
+        // A zero-sized function item field inside a struct, tuple, or enum constant.
+        ty::FnDef(..) => jsast::undefined(),
         _ => zombie(
             cgu,
             log,

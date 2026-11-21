@@ -59,6 +59,14 @@ pub(crate) fn scratch_alloc<'tcx>(
     Some(Allocation::from_bytes_byte_aligned_immutable(bytes, ()))
 }
 
+/// Whether a value of `ty` is a primitive scalar (`bool`, `char`, integer, or float).
+pub(crate) fn is_primitive(ty: Ty<'_>) -> bool {
+    matches!(
+        ty.kind(),
+        ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_)
+    )
+}
+
 /// Whether a value of `ty` is a pointer the readers decode by its provenance, rather than by the
 /// fields of a type wrapped around one.
 pub(crate) fn is_pointer(ty: Ty<'_>) -> bool {
