@@ -219,7 +219,7 @@
       "contract": "libraries/jmespath/CONTRACT.md",
       "corpus": "libraries/jmespath/corpus.json",
       "output": { "form": "json", "async": false },
-      "normalisation": { "name": "plain-object-realm", "module": "libraries/jmespath/normalise.mjs", "description": "Copy cross-realm plain records into the checking realm while preserving values and enumeration order." },
+      "normalisation": null,
       "environments": ["node", "chrome", "firefox", "safari"],
       "bench": { "cases": ["bench-search"], "baseIterations": 1, "variant": "libraries/jmespath/bench-variant.mjs" }
     },
@@ -230,7 +230,7 @@
       "contract": "libraries/idb/CONTRACT.md",
       "corpus": "libraries/idb/corpus.json",
       "output": { "form": "json", "async": true },
-      "normalisation": { "name": "plain-object-realm", "module": "libraries/idb/normalise.mjs", "description": "Copy cross-realm plain records (IndexedDB values read in a Firefox WebDriver-imported module) into the checking realm, preserving values and key order." },
+      "normalisation": null,
       "environments": ["chrome", "firefox", "safari"],
       "bench": { "cases": ["bench-transactions"], "baseIterations": 1, "variant": "libraries/idb/bench-variant.mjs" }
     },

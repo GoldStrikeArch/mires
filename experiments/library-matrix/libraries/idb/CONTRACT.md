@@ -7,7 +7,7 @@
 | API subset | see "The idb subset", which also lists what is left out and why |
 | Input | `{ steps: Step[] }`, a script of idb calls ("Input") |
 | Output form | `json`, async: `{ log: Entry[], databases: Dump[] }` ("Output"); key order significant |
-| Normalisation | `plain-object-realm` (`normalise.mjs`, see "Normalisation") |
+| Normalisation | none (see "Normalisation") |
 | Parity environments | chrome, firefox, safari (IndexedDB; Node has none). Safari has not been run: no WebDriver session was available, so WebKit's error names for the edge cases are unverified |
 | Corpus | `corpus.json`, 78 cases |
 | Bench cases | `bench-transactions`, baseIterations 1, variant `bench-variant.mjs` |
@@ -231,15 +231,7 @@ The corpus stays inside this domain; inputs outside it are out of contract.
 
 ## Normalisation
 
-`normalise.mjs` (`plain-object-realm`) copies plain records into the checking realm. Values, key order, `undefined` and -0 are kept. It is the jmespath rule.
-
-Firefox gives a module imported from a WebDriver script the records it reads from IndexedDB, and `structuredClone`'s results, as objects of another realm. The json form's prototype check rejects those objects. So without the rule, the npm reference fails its own output check in Firefox on 67 of the 78 cases (`reference-error`). Chrome and an ordinary page are unaffected. The rule is applied to both sides.
-
-The registry declares it as `matrix.json` `libraries.idb.normalisation`:
-
-```json
-{ "name": "plain-object-realm", "module": "libraries/idb/normalise.mjs", "description": "Copy cross-realm plain records (IndexedDB values read in a Firefox WebDriver-imported module) into the checking realm, preserving values and key order." }
-```
+None. The harness runs browser cells in the page realm (harness commit `e9a9f70`), so the records IndexedDB returns and `structuredClone`'s results are ordinary objects of the checking realm in every browser. An earlier version of this contract needed a `plain-object-realm` copy, because the WebDriver-imported module ran in Firefox's sandbox realm; with the page-realm harness all 9 ports and the reference pass 78/78 in Chrome and Firefox without it.
 
 ## Per-language guidance
 
