@@ -3,5 +3,5 @@
   "library": "idb",
   "language": "rescript",
   "entry": "src/Index.res",
-  "boundary": "Wraps browser IndexedDB requests and transaction completion events and resolves JSON arrays of their outcomes."
+  "boundary": "ReScript decodes the script into variants by pattern matching on JSON values; keys, values and options stay JSON.t, idb's requests are host Promises awaited with native async/await, and the result is the record {log, databases} of JSON entries and dumps."
 }

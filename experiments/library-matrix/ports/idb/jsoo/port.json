@@ -3,5 +3,5 @@
   "library": "idb",
   "language": "jsoo",
   "entry": "src/main.ml",
-  "boundary": "Wraps browser IndexedDB requests and transaction completion events and resolves JSON arrays of their outcomes."
+  "boundary": "OCaml decodes the script into variants through Host.classify; keys, values and options stay JS values, idb's requests are host Promises chained with then callbacks, and the result is a plain {log, databases} object of JS arrays."
 }

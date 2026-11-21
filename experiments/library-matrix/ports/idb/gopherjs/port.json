@@ -3,5 +3,5 @@
   "library": "idb",
   "language": "gopherjs",
   "package": "./src",
-  "boundary": "Wraps browser IndexedDB requests and transaction completion events and resolves JSON arrays of their outcomes."
+  "boundary": "Go decodes the script into step structs; keys, values and options stay *js.Object (null is nil, absent is js.Undefined), idb's requests are host Promises followed by continuation-passing callbacks, and run returns a host Promise of {log, databases}."
 }
