@@ -46,7 +46,7 @@ async function exercise(cacheName,done) {
       return [response.status,await response.text()]
     }
     const result=[]
-    result.push(await message({report:true}),await message({type:'SKIP_WAITING'}),await message({type:'OTHER'}))
+    result.push(await message({report:true}))
     result.push(await fetchPair('guide?utm_source=client'))
     await message({source:'beta'})
     result.push(await fetchPair('first/item'))
@@ -54,6 +54,7 @@ async function exercise(cacheName,done) {
     for(let i=0;i<100 && !(await cache.match(base+'first/item'));i++) await new Promise(resolve=>setTimeout(resolve,10))
     await message({source:'offline'})
     result.push(await fetchPair('first/item'),await fetchPair('network/item'),await fetchPair('unmatched'))
+    result.push(await message({caches:true}))
     done({result})
   } catch(error){done({error:String(error)})}
 }
@@ -72,7 +73,13 @@ try {
       const response=await session.driver.executeAsyncScript(exercise,name)
       if(response.error) throw Error(language+' '+response.error)
       const alpha=assets.get(prefix+'alpha.mjs'), beta=assets.get(prefix+'beta.mjs')
-      assert.deepEqual(response.result,[[[['guide.html'],[]],[]],true,false,[200,alpha],[200,beta],[200,beta],[503,'offline'],[404,'no route']],language)
+      const path=prefix.slice(1)
+      assert.deepEqual(response.result,[
+        [{updatedURLs:[path+'guide.html'],notUpdatedURLs:[]},{deletedURLs:[]}],
+        [200,alpha],[200,beta],[200,beta],[503,'no-response'],[404,'no route'],
+        [['precache',[[path+'guide.html?__WB_REVISION__=release-1',{status:200,url:path+'alpha.mjs',body:alpha}]]],
+          ['runtime',[[path+'first/item',{status:200,url:path+'beta.mjs',body:beta}]]]],
+      ],language)
     } finally {
       await session.driver.executeAsyncScript(function(name,done){
         Promise.all([navigator.serviceWorker.getRegistrations().then(rows=>Promise.all(rows.map(r=>r.unregister()))),
@@ -80,6 +87,6 @@ try {
       },name)
       await session.driver.get('about:blank')
     }
-    console.log(browser+' '+language+' passed install, activate, message and controlled offline fetch')
+    console.log(browser+' '+language+' passed native install, activate and fetch events, offline fetches and the cache state')
   }
 } finally {await session?.driver?.quit();await new Promise(resolve=>server.close(resolve))}

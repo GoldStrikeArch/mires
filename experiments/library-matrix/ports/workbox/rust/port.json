@@ -4,5 +4,5 @@
   "language": "rust",
   "entry": "src/lib.rs",
   "crateName": "matrix_workbox",
-  "boundary": "Rust futures drive real browser Fetch and CacheStorage and return the Workbox response and lifecycle reports."
+  "boundary": "The adapter reads the script's host objects into Rust types; Workbox's controller, router, strategies and plugins run as Rust futures over typed handles to the host's CacheStorage, Fetch, Request, Response and URL, and the output is built as host JSON."
 }
