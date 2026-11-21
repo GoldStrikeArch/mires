@@ -6,11 +6,11 @@
     "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
   },
   "sources": {
-    "idb": "d4cbd5c98743518dfadaa31ebb198ee0882ec09d36db34ae16544bc6ded32588",
+    "idb": "e0bb6bebbbc8b40f92439af304698f0b15f21266a8c6a91dc8e412c53717c72c",
     "minisearch": "8744c19fa867df54cd95b36aaee1f7f8bc9d30ca0e53c44baa5d719a32fc2145",
     "marked": "c68ebbe7ee7023e6387a7559d71c01fb928e3849491a6b5d0d2995b2ed303ff7",
-    "fflate": "47ca5839e038bf8ef526b8ac6bed0c2781b369932827fb8d1f92643bfb6dabd4",
-    "uplot": "29f2dfc2d581d36ab03e18f0de8234f0b3113a24999da05768520801da8e7fbd"
+    "fflate": "0c6b68681ce75c9d3f474d51940592927793b945afa033a72d2f8cde0a04fe88",
+    "uplot": "863b03a279211ca722ce7b7364057f6c817c9e7d5d5c5f041812634b91517138"
   },
   "toolchain": {
     "gopherjs": "GopherJS 1.21.0+go1.21.13",
@@ -18,8 +18,8 @@
   },
   "artifacts": {
     "idb": {
-      "readable": "3437ee2ec6deccec2e08e51fbbbbf844be803ac9de062b2e429d56d7bcd55e69",
-      "production": "e95769b69786b17e2f0a203f925dcea8693843dfc18be4230d5041252b9c6f9a"
+      "readable": "d19cf6df8fff3fbbb485aafdadc1dbdc4cd5f1aff9c4f811ed6495a67fc58c15",
+      "production": "fd950df8f9967ee803bce40e99b8e6dd8ea55278ea71af38915a48b159aa93f6"
     },
     "minisearch": {
       "readable": "07785ad5c20fe7952b557b71f2ac24fed87541c22904fd31ecaeafb6ebc6fc01",
@@ -30,12 +30,12 @@
       "production": "ad7b278938bf6b88095273494730beb52dabdcba4c3c359269bb96531d4f79b8"
     },
     "fflate": {
-      "readable": "6369b7beb49eff74aaf83790b141a3c8793fe9ee16a5c85c48d1f4d851587bdc",
-      "production": "e67f1765c55e092f6b7b44e94dee4eff56e946af0f981205bdfbc71171d0a76e"
+      "readable": "96b5749f302734620cc7c32c47918fcd2ccbe2a2907d147f11102ac5cd80e6ce",
+      "production": "736f00d23487eba4515e319e0955dc29b45db778516ecc06554d32472d3729c0"
     },
     "uplot": {
-      "readable": "2e812a0c754983ffcebabf2fea55dba170abcbfcf5dddd55e5dab77ec958246f",
-      "production": "5c911d896fe236c593294dd1f578993861e068a9bc6a751395b1ee5bc7f5aae7"
+      "readable": "5201348b8be876d9988281a13bbab4a0b00d2f72cc7d024335771267fc3dc632",
+      "production": "72850189e912afeb7456880dff5a3d23a0f45ee653d7078eb10dbd3ccf859e7c"
     }
   }
 }

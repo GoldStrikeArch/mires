@@ -6,11 +6,11 @@
     "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
   },
   "sources": {
-    "idb": "259457b24d82e382d38d50523879cd2bad2ea00618db6a3c7735606e5a09e9f8",
+    "idb": "1d8c79995fe0915bcf738f3ab8431940504c25d6dd01ff991d1c6252cffe8cbb",
     "minisearch": "532bae4f676cd31544ed7f669943bd264a805d32ce3a92f8fc9b113f90845e18",
     "marked": "1ff844e963b575349a4eaf819b13306ac24f50fc48bcad482950849c38d7fd7e",
     "fflate": "165c65015cb7c84a291191fae1c858b184467f2578891790cb72938c6d603148",
-    "uplot": "338d9667aec564aef9d947489156a46f86788e8e27166cb83b650f9d8f6bddd2"
+    "uplot": "69476deb35ce2a39e941ee84d61b8b514694635cd799d90136e31c2da1060928"
   },
   "toolchain": {
     "jsOfOcaml": "6.4.1+6.4.1",
@@ -21,8 +21,8 @@
   },
   "artifacts": {
     "idb": {
-      "readable": "8ea7e41573dc8a205efa1f62bbb5488fe17392f4056a982e9e03cecc905c899d",
-      "production": "84423cc593aeb1d878b6db2ad40e56fdfac1481151f2224ebf89eb7fbc9d0482"
+      "readable": "af92531bf35f69a221776ddb3aaf5d71e47544b74888f5df82aa94e1277a3924",
+      "production": "492d81d723284156602d8bd1d938e027e77d84d35cd0bbc7c002e591bc07ebc3"
     },
     "minisearch": {
       "readable": "e7b83ed51e185d59bc019d7d7235d8e5b0d9af5d29ba4abd8dd89960fa738800",
@@ -37,8 +37,8 @@
       "production": "0b5ef081b03b593ba12bad2b4ddfbac09be155b560bfc91aa01d3b9b6a683cf8"
     },
     "uplot": {
-      "readable": "97071f32bbd1972dc28092f68b0ee73a6d88243f58833e69e87925304a11e0ae",
-      "production": "a07f33e5da9b1090fb505e8e619f8c96af72124e1503b8903ce7f39c2ad53565"
+      "readable": "7ae44e1e85f8df61fa693a53fdd33486d389c44f88a40e968b387ffcbccaf95d",
+      "production": "4b5d9e80bcdd6c8527695f61a030d9b8c0c2df045ca70fa8d46fee2779511fb4"
     }
   }
 }

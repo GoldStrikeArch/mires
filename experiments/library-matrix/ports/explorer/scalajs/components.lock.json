@@ -10,7 +10,7 @@
     "minisearch": "a8f028f92ecbef8a2f099f7b1c9eecc7ccfd861af296d74d83866aa4604f88cb",
     "marked": "8ef18e751c9fdfe0ee932373e0166329adb7b978e733b5d36c328e2b262dac1b",
     "fflate": "c46c83851678f33c4a3a3dbb521ed80ea11f004ce2b55d1cbc53455a5b35a475",
-    "uplot": "02caf33ea1ecfa5acb3ca5a8408299b4b3123bf0e738caa94700e057e7a0c1b1"
+    "uplot": "5b3530ce9b70c42a150de33637c92572a880864e0165884fb5e1eb363c3562bc"
   },
   "toolchain": {
     "scalaCli": "Scala CLI version: 1.19.0 | Scala version (default): 3.10.1",
@@ -36,8 +36,8 @@
       "production": "1de10a3e7ec936a3c4e16f1bae02c5126379c7c45d8946a8e83558d9365b1698"
     },
     "uplot": {
-      "readable": "7dd55af988d8ea5d9ea90c40e0128e0480b6f7d255cb55175067143256a5acd9",
-      "production": "5920fd82b0cabbd15c01354e37bf42ba8145b09ec1c8c39bb926407b818187c7"
+      "readable": "dc3d3177713f648a04256fb81c983a4abb888702a127c74bc0a134c01750c74d",
+      "production": "46691a6d7a28e128adf572aaf0e16b196c4bbb206d2503b54d99d5dc975357df"
     }
   }
 }

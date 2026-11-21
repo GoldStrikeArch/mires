@@ -6,11 +6,11 @@
     "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
   },
   "sources": {
-    "idb": "83b79ee9bd32d384367c9876432b1b1b0506d098440dbacb327487c00c4c13ec",
+    "idb": "f7d07591c1c646097c10934112a481486a0285453bf0c2cede0973753e4bebbc",
     "minisearch": "6d671661bc1e5d6239fcac108cd98e95ad4e0acf9110d118e5fa971a3841bc6a",
     "marked": "d128752fb2d63febe1e1fececd6c2c5515400706f6a6e323b7215c26991b6def",
     "fflate": "5980222eb7530620a4b83744997c75f8dcdc41dceeafaab679ea5554b5877ae9",
-    "uplot": "0ed75d7acf2385b23307e2a195bb19f7352fabf9f43c73b8a4b4d85a30411e6f"
+    "uplot": "79bf8b979ecdb0a5502ad73c80c14d981800ffe5d4dc868a36bae5ca4e9d8f0d"
   },
   "toolchain": {
     "compiler": "rescript 12.3.0",
@@ -20,8 +20,8 @@
   },
   "artifacts": {
     "idb": {
-      "readable": "247e5a5e793f5a236fa207b5cba09ad278d6cf498253afa171e975f60478e575",
-      "production": "fb72b65243681ad9e6c05a44871528c91224ac83cb923442d5a98ded39caa2b5"
+      "readable": "2b3ad9102b5c51abc75a5570fe9412c5a49cdac524ca4f6a83c35101facfb4d1",
+      "production": "9ece8a57cea531c43142bc51b691af1c83885e73bb50695ed25b8278f0bee939"
     },
     "minisearch": {
       "readable": "d5d8deab506a7fbf85ffc28d3e6ae88f06bc7c269130ce7e99091c7f852eb12c",
@@ -36,8 +36,8 @@
       "production": "f3dc9c9524a9ccba7097f875177cdda42e9ca35f1590ca46997fac34c9a26656"
     },
     "uplot": {
-      "readable": "421af90d36076a9de781f6654a048c999dafde49539e65edbe0236b6e05c2553",
-      "production": "3c1380df3cb3f183833d8eec127189238da743298b5ac71db6cd4740598f0a11"
+      "readable": "8f4773a65f7f051bd0dfb916e7821c386e63445cae739f7afa3626caf8ce2c26",
+      "production": "6854527c78626cf5887f067747959f0a43af3d83e5b6a3e5c036a0c280bfb980"
     }
   }
 }

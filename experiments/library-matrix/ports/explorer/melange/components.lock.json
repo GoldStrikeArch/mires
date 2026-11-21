@@ -6,11 +6,11 @@
     "experiments/library-matrix/tools/lib/composite.mjs": "70eeef486c1ea013dff81b7bb3cbd8f833864c47b25133a7f7a397f18c19b991"
   },
   "sources": {
-    "idb": "8d3010453bfc5ae77a1c9b6714ece7b7eb22d22c8e71e338af3ab6c6250dbfcf",
+    "idb": "0636360e89c7845041dac2b9d972ff3e0a1d2fc96382e590ab979ad7b1679b84",
     "minisearch": "430c9d56369ef472303f34cbd04eac07e700b8d034ccdf74be86ee101cacca51",
     "marked": "5f6236b34760e875a34e4f0ae39b6919710cf3b0b3baef7c668fcee39bc75af1",
     "fflate": "845bfad8e05d00e647b9e31fe7d5f491749664831359eb5ef11f0e35d97b1d73",
-    "uplot": "8e52ae471beb78f936cd0e19edfb56a0ccf0fa22e89bcd391585406a15084dc7"
+    "uplot": "1aeceac3efc4544e8d17143c5a3e755c152fee6b1d220320f4117c6b09add371"
   },
   "toolchain": {
     "melange": "Melange 7.0.1-53 (Using OCaml:5.3.0+Melange)",
@@ -23,8 +23,8 @@
   },
   "artifacts": {
     "idb": {
-      "readable": "55e2f30768db4516f12bca84c3a4d59a0d269b6502abed5de7c6ffb9a3a2acde",
-      "production": "0249f5f7c49bdb4a46db3e0346cb427fee7e3ff5ff308a55750f2618de6d965b"
+      "readable": "9221133976cf4f5c95ca069731418e753ecedced4092eb8da4f69a226640802c",
+      "production": "e2d0e416025b877f126bcaeed2649221dfd01cc74613022e6dc4cb5187532b13"
     },
     "minisearch": {
       "readable": "7af8b7978e95a01965fc71ba82c99b202e3f1686ad396d92661ce172d421dd3f",
@@ -39,8 +39,8 @@
       "production": "653358f5b6fd7e2fc5d819847a89790426eeeba1d374f19f129d767ceb662f87"
     },
     "uplot": {
-      "readable": "923eda5cd69c480fe9395b068954266e5a448074a948406beb0b179c66482b65",
-      "production": "8421b186bb2768d65982ab7a05964b9d02e8240c8127a31bc973eef272c95df1"
+      "readable": "323b54effcd2d157afdd4e34cc866ff4292a71d61b560156902f39bb224bbfc0",
+      "production": "8140c79837e4e80e0165706cc505773735dabdfc3999c0f76e991a0962af90f8"
     }
   }
 }

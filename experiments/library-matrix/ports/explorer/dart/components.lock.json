@@ -10,7 +10,7 @@
     "minisearch": "260860846b1fc0bd45e3364f7ec7a6be8a106ed32a05c897da04697589c48a50",
     "marked": "da604e75a9d8954cc75db79f4c2af206f5a07a796bf828e680c13e054fc84787",
     "fflate": "04a8cfff7df23a50668df79ac431bcf86f164bf4100f7a5d971397a2da8c84a8",
-    "uplot": "35c523bddd93e63854e779f46a4a41a04eb40520e885c2412bbc99963bf2eb86"
+    "uplot": "ac38fd858f4f5ff4dfa36344dc8b01cd3f8265e8a7f592751f6a9b3dc3ac8ad6"
   },
   "toolchain": {
     "dart": "Dart SDK version: 3.14.1 (stable) (Tue Nov 17 00:01:24 2026 -0800) on \"macos_arm64\"",
@@ -34,8 +34,8 @@
       "production": "0de698926b91daa5bc06f8f16b7ff3fae149f1bcc44647212b493cf85e9bbbad"
     },
     "uplot": {
-      "readable": "28fed7a6aab28e66f42306768bd9e5504d8facb7415eb9ff005f4aa0f63f13a7",
-      "production": "d1ef21ec5fe682dfe919d65ec51874da83e3b55f0194189d354d19582710d56f"
+      "readable": "87369f03d83d552c6ed25fa3b4c27e2b77aafd162c026e899dbe1f05b8b6b754",
+      "production": "4639be56547588990f1598b1e62105b45dbe55a2ec3e6ffa27a2ae37d4245d82"
     }
   }
 }
