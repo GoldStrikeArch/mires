@@ -42,18 +42,21 @@ upstream's do. The places where that matters:
 - **Infinity and NaN exponents.**
   - Zeros are prepended only when the exponent difference is JS-truthy (neither 0 nor NaN).
   - `stringify` keeps upstream's chain `e < 0`, `e > 0`, `n > 1`, which a NaN exponent fails.
-  - A division whose precision is NaN stops after one digit, as upstream's `k--` does.
   - Fixed-notation padding with a NaN width pads nothing.
   - Elm compiles a comparison of two non-literal numbers to `_Utils_cmp`, which orders NaN above
     everything, and `== 0` to a falsiness test, which NaN passes. Where a value can be NaN, the
     code tests `isNaN` first.
+  - The builder's Terser pass runs with `unsafe_comps`, which assumes no NaN and rewrites
+    `!(p >= 1)` as `p < 1`, so the code never negates a comparison that may see NaN.
 
 ## Square root
 
 `sqrt` runs upstream's iteration exactly (review b8):
 
 - the binary64 estimate, with the underflow/overflow re-estimate and upstream's exponent
-  `((e + 1) / 2 | 0) - (e < 0 || e & 1)` (Elm's `truncate` is `| 0` and `Bitwise.and` is `&`);
+  `((e + 1) / 2 | 0) - (e < 0 || e & 1)`:
+  - Elm's `truncate` is `| 0` and `Bitwise.and` is `&`;
+  - the subtraction is on JS numbers, so it reaches −2^31 − 1 where upstream does;
 - `Big.DP += 4`, passed to the division, which validates it, so `dp` ≤ −5 or a non-integer `dp`
   gives `Invalid decimal places`;
 - the stop test on the first `r.e + DP + 4` digits of successive estimates.
@@ -70,9 +73,18 @@ round-trip digits of the same double.
 
 ## Deviations from upstream
 
-- **Division.** The decimal long division is restructured over lists: it drops the leading zero
-  eagerly and stops once it has one digit past the precision. On the corpus and the review's random
-  cases it produces upstream's digits, termination and rounding.
+- **Division.** The decimal long division is restructured over lists: it drops a leading zero
+  eagerly (exponent − 1) and stops once it has one digit past the precision. That matches
+  upstream's digit count and rounding when the precision `p = dp + q.e + 1` is at least 1.
+
+  When `p` is below 1 or NaN, upstream's `k--` stops after the first digit, and the port follows
+  upstream's order exactly:
+  - it keeps that digit even when it is zero, at the undecremented `q.e`;
+  - it rounds it to `p`, or for a NaN `p` (an Infinity − Infinity exponent) not at all.
+
+  Past 2^53 the exponent sums round, so dropping the zero first gave a different power of ten under
+  rounding mode 3. Re-review re-big-js found 12 such quotients in 4,000, for example
+  `771e-9007199254740991 / 9717e2` at `dp` 1; the corpus case `div-precision-below-one` holds them.
 - **Addition.** Addition aligns both coefficients at the larger exponent and combines them in one
   right-to-left fold.
 - **Out of domain.** JSON `null` for `n` or `mode` is outside the domain (CONTRACT.md); this port

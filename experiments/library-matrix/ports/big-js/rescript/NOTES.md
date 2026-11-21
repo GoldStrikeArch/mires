@@ -55,7 +55,9 @@ generator had emitted from a shared core.
 
 `sqrt` runs upstream's iteration exactly:
 
-- the host's binary64 estimate, with its underflow/overflow re-estimate and ToInt32 exponent;
+- the host's binary64 estimate, with its underflow/overflow re-estimate. The exponent is ToInt32 of
+  `(e + 1) / 2`, then a subtraction in doubles, as upstream's `((e + 1) / 2 | 0) - (e < 0 || e & 1)`
+  is, so it reaches −2^31 − 1 at x.e = −4294967297 and −4294967298 (re-review re-big-js);
 - `Big.DP += 4`, passed to `div`, which validates it, so `dp` ≤ −5 or a non-integer `dp` throws
   `Invalid decimal places`;
 - the stop test on the first `r.e + DP + 4` digits of successive estimates.

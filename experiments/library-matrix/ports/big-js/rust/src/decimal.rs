@@ -304,9 +304,7 @@ impl Decimal {
             pos += 1;
         }
         let mut exponent = self.exponent - y.exponent;
-        // Upstream's precision dp + q.e + 1. When it is NaN (an Infinity - Infinity exponent),
-        // upstream's `k--` stops after the first digit, which it keeps even when it is zero, and
-        // `qi > p` never rounds.
+        // Upstream's precision p = dp + q.e + 1.
         let precision = dp + exponent + 1.0;
         let mut digits = Vec::new();
         loop {
@@ -333,20 +331,27 @@ impl Decimal {
                 }
                 q += 1;
             }
+            // When p is below 1 (or NaN, from an Infinity - Infinity exponent), upstream's `k--`
+            // stops after this first digit. It keeps the digit even when it is zero, at the
+            // undecremented exponent, and `qi > p` rounds it to p (never for NaN). Past 2^53 the
+            // exponent sums round, so only upstream's order gives upstream's result.
+            if digits.is_empty() && !(precision >= 1.0) {
+                let more = !rest.is_empty() || pos < self.digits.len();
+                let value = Self {
+                    sign,
+                    exponent,
+                    digits: vec![q],
+                };
+                return if precision.is_nan() {
+                    Ok(value)
+                } else {
+                    value.rounded(precision, mode, more)
+                };
+            }
             if q == 0 && digits.is_empty() {
                 exponent -= 1.0;
             } else {
                 digits.push(q);
-            }
-            if precision.is_nan() {
-                if digits.is_empty() {
-                    digits.push(0);
-                }
-                return Ok(Self {
-                    sign,
-                    exponent,
-                    digits,
-                });
             }
             let more = !rest.is_empty() || pos < self.digits.len();
             if !digits.is_empty() && (!more || digits.len() as f64 > dp + exponent + 1.0) {
@@ -417,7 +422,9 @@ impl Decimal {
                 coefficient.push('0');
             }
             estimate = crate::root_estimate(&coefficient);
-            let exponent = to_int32((e + 1.0) / 2.0) - i32::from(e < 0.0 || to_int32(e) & 1 != 0);
+            // `| 0` gives an int32, but the subtraction is a double one: it can reach -2^31 - 1.
+            let odd = e < 0.0 || to_int32(e) & 1 != 0;
+            let exponent = f64::from(to_int32((e + 1.0) / 2.0)) - if odd { 1.0 } else { 0.0 };
             // Upstream parses the digits of toExponential() before its `e`: the shortest digits
             // of the estimate, the ones String() prints, placed at this exponent.
             let mut r = if estimate == f64::INFINITY {
@@ -425,7 +432,7 @@ impl Decimal {
             } else {
                 Self::parse(crate::number_text(estimate))?
             };
-            r.exponent = f64::from(exponent);
+            r.exponent = exponent;
             r
         } else {
             // A NaN estimate prints as "NaN", which upstream rejects as an invalid number.

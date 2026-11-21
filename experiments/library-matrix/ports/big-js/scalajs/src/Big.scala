@@ -316,7 +316,8 @@ final class Big(var s: Int, var e: Double, var c: Digits):
         var digits = c.mkString
         if (toInt32(digits.length + e) & 1) == 0 then digits += "0"
         estimate = math.sqrt(jsNumber(digits))
-        val exponent = toInt32((e + 1) / 2) - (if e < 0 || (toInt32(e) & 1) != 0 then 1 else 0)
+        // `| 0` gives an int32, but the subtraction is a double one: it can reach -2^31 - 1.
+        val exponent = toInt32((e + 1) / 2).toDouble - (if e < 0 || (toInt32(e) & 1) != 0 then 1 else 0)
         if estimate == Double.PositiveInfinity then Big.parse(s"5e$exponent")
         else
           val text = estimate.toExponential()

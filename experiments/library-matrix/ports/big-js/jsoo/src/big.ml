@@ -476,11 +476,13 @@ let sqrt x dp rm =
         let c = digits x.c in
         let c = if to_int32 (float_of_int (String.length c) +. e) land 1 = 0 then c ^ "0" else c in
         let estimate = Float.sqrt (Host.number c) in
+        (* [| 0] gives an int32, but the subtraction is a double one: it can reach -2^31 - 1. *)
         let exponent =
-          to_int32 ((e +. 1.) /. 2.) - if e < 0. || to_int32 e land 1 <> 0 then 1 else 0
+          float_of_int (to_int32 ((e +. 1.) /. 2.))
+          -. if e < 0. || to_int32 e land 1 <> 0 then 1. else 0.
         in
         let prefix = if estimate = Float.infinity then "5e" else mantissa estimate in
-        parse (prefix ^ string_of_int exponent)
+        parse (prefix ^ Host.string_of_number exponent)
       end
       else parse (Host.string_of_number estimate)
     in

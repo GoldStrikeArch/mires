@@ -8,12 +8,15 @@ const decimal = (len,seed) => {
   return s
 }
 // Upstream P.sqrt step for step (estimate, DP + 4, the joined-prefix stop test), with an iteration
-// cap: a square root is in the domain only if this loop stops (CONTRACT.md). Callers keep exponents
-// moderate, because a single division at DP + 4 places costs O(x.e) digits.
+// cap: a square root is in the domain only if this loop stops with a value or a big.js error
+// (CONTRACT.md). A host error, such as the RangeError of an array past the length limit, is not an
+// answer. Callers keep exponents moderate, because a single division at DP + 4 places costs O(x.e)
+// digits.
+const bigError = e => String(e && e.message).startsWith('[big.js] ')
 const sqrtTerminates = ({x:n, dp=20, rm=1}, cap=200) => {
   const D = Big(); D.DP = dp + 4; D.RM = rm
   let x, r
-  try { x = new D(n) } catch { return true }
+  try { x = new D(n) } catch (e) { return bigError(e) }
   if (!x.c[0] || x.s < 0) return true
   let s = Math.sqrt(+x.toExponential()), e = x.e
   if (s === 0 || s === 1/0) {
@@ -23,12 +26,12 @@ const sqrtTerminates = ({x:n, dp=20, rm=1}, cap=200) => {
     e = ((e + 1) / 2 | 0) - (e < 0 || e & 1)
     r = new D((s == 1/0 ? '5e' : (s = s.toExponential()).slice(0, s.indexOf('e') + 1)) + e)
   } else {
-    try { r = new D(s + '') } catch { return true }
+    try { r = new D(s + '') } catch (e) { return bigError(e) }
   }
   const k = r.e + D.DP
   for (let i=0;i<cap;i++) {
     const t = r
-    try { r = new D('0.5').times(t.plus(x.div(t))) } catch { return true }
+    try { r = new D('0.5').times(t.plus(x.div(t))) } catch (e) { return bigError(e) }
     if (t.c.slice(0,k).join('') === r.c.slice(0,k).join('')) return true
   }
   return false
@@ -110,6 +113,22 @@ add('exponents-past-2^53','Sums, differences, products, rounding and exact quoti
     {op:'round',x:'9.99e'+E,n:-Number(E),mode:1},{op:'toPrecision',x:'9.99e'+E,n:2},{op:'toExponential',x:'9.99e'+E,n:1},{op:'round',x:'9.99e'+E},
     {op:'div',x:'6e'+E,y:'2'},{op:'div',x:'1e-'+E,y:'7'},{op:'div',x:'1e-'+E,y:'7',rm:3},{op:'cmp',x:'1e'+E,y:'1.0e'+E},
     {op:'pow',x:'2e'+E,n:2},{op:'pow',x:'1e-'+E,n:-1}]))
+// sqrt's re-estimate exponent ((e + 1) / 2 | 0) - (e < 0 || e & 1): the | 0 gives an int32, but the
+// subtraction is a double one, so at x.e = -4294967297 and -4294967298 (and every 2^33 below) it
+// is -2^31 - 1 rather than a wrapped int32 (re-review re-big-js). Upstream answers at once.
+add('sqrt-int32-reestimate','Square roots whose re-estimate exponent is -2^31 - 1, all rounding modes',
+  ['4e-4294967298','9e-4294967297','2e-4294967297','16e-4294967299','4e-12884901890','25e-12884901891','1e-4294967296','4e-4294967296']
+    .flatMap(x=>[0,3,5].flatMap(dp=>[0,1,2,3].map(rm=>({op:'sqrt',x,dp,rm})))).filter(c=>sqrtTerminates(c)))
+// A quotient precision p = dp + q.e + 1 below 1 stops upstream's division after one digit, kept even
+// when it is zero at the undecremented q.e, and rounds it to p. Past 2^53 the exponent sums round,
+// so dropping the zero first (q.e - 1) gives a different power of ten under rounding mode 3
+// (re-review re-big-js: these twelve distinguish the two orders).
+add('div-precision-below-one','One-digit quotients past 2^53 rounded to a precision below 1, every rounding mode',
+  [['771e-9007199254740991','9717e2',1],['240e-9007199254740996','8368e-1',1],['22444e-9007199254740992','0.5e9007199254740992',0],
+    ['10375e-9007199254740994','5e4294967296',0],['3627e-2147483647','0.5e9007199254740991',1],['18e-9007199254740992','1873e0',2],
+    ['368e-18014398509481982','4417e-1',2],['231.29e-9007199254740992','9235e1',0],['70287e-2147483651','8e9007199254740991',1],
+    ['-415.96e-18014398509481982','9728e-1',0],['-461.26e-18014398509481984','8550e-1',5],['-176e-9007199254740996','4834e3',2]]
+    .flatMap(([x,y,dp])=>[3,0,1,2].map(rm=>({op:'div',x,y,dp,rm}))))
 // Exponents of Infinity and NaN (Infinity - Infinity) keep big.js's comparison chains: NaN fails
 // every test, so stringify prints the bare coefficient and cmp falls through to the sign. Sums with
 // an infinite exponent difference, toFixed of an infinite positive exponent and inexact quotients

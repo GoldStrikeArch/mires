@@ -607,10 +607,12 @@ let sqrt = (x, dp, rm) => {
         let c = digits(x.c)
         let c = Int.bitwiseAnd(toInt32(Int.toFloat(c->String.length) +. e), 1) == 0 ? c ++ "0" : c
         let estimate = Math.sqrt(number(c))
+        // `| 0` gives an int32, but the subtraction is a double one: it can reach -2^31 - 1.
         let exponent =
-          toInt32((e +. 1.) /. 2.) - (e < 0. || Int.bitwiseAnd(toInt32(e), 1) != 0 ? 1 : 0)
+          Int.toFloat(toInt32((e +. 1.) /. 2.)) -.
+          (e < 0. || Int.bitwiseAnd(toInt32(e), 1) != 0 ? 1. : 0.)
         let prefix = estimate == Float.Constants.positiveInfinity ? "5e" : mantissa(estimate)
-        parse(prefix ++ Int.toString(exponent))
+        parse(prefix ++ Float.toString(exponent))
       } else {
         parse(Float.toString(estimate))
       },

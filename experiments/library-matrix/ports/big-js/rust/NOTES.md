@@ -35,7 +35,10 @@ promoted `Some(&b'-')` compares incorrectly in generated JavaScript.
 `sqrt` runs upstream's iteration exactly (review b8):
 
 - the host's binary64 estimate (`Math.sqrt(Number(...))`), with the underflow/overflow re-estimate
-  and upstream's ToInt32 exponent `((e + 1) / 2 | 0) - (e < 0 || e & 1)`;
+  and upstream's exponent `((e + 1) / 2 | 0) - (e < 0 || e & 1)`. That is the ToInt32 of
+  `(e + 1) / 2` followed by a subtraction in doubles, so it can reach −2^31 − 1, at x.e =
+  −4294967297 and −4294967298 (re-review re-big-js: an `i32` subtraction wrapped there, and the
+  loop never settled);
 - `Big.DP += 4`, passed to `div`, which validates it, so `dp` ≤ −5 or a non-integer `dp` throws
   `Invalid decimal places`;
 - the stop test on the first `r.e + DP + 4` digits of successive estimates.
@@ -52,11 +55,18 @@ print the shortest round-trip digits of the same double.
 
 ## Deviations from upstream
 
-- **Division.** The decimal long division is restructured: it drops the leading zero eagerly and
-  stops once it has one digit past the precision. On the corpus and on the review's 6,000 random
-  cases it produces upstream's digits, termination and rounding. Upstream's NaN precision (an
-  Infinity − Infinity quotient exponent) stops after one digit, keeps it even when it is zero, and
-  never rounds; the port does the same.
+- **Division.** The decimal long division is restructured: it drops a leading zero eagerly
+  (exponent − 1) and stops once it has one digit past the precision. That matches upstream's digit
+  count and rounding when the precision `p = dp + q.e + 1` is at least 1.
+
+  When `p` is below 1 or NaN, upstream's `k--` stops after the first digit, and the port follows
+  upstream's order exactly:
+  - it keeps that digit even when it is zero, at the undecremented `q.e`;
+  - it rounds it to `p`, or for a NaN `p` (an Infinity − Infinity exponent) not at all.
+
+  Past 2^53 the exponent sums round, so dropping the zero first gave a different power of ten under
+  rounding mode 3. Re-review re-big-js found 12 such quotients in 4,000, for example
+  `771e-9007199254740991 / 9717e2` at `dp` 1; the corpus case `div-precision-below-one` holds them.
 - **Addition.** Addition aligns both coefficients at the larger exponent. The leading zeros of a
   difference decrement the exponent one at a time, as upstream's `--ye` does: past 2^53 a run of
   decrements is not one subtraction.

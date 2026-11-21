@@ -658,7 +658,8 @@ func (x *Big) sqrt(dp, rm float64) (*Big, error) {
 			c += "0"
 		}
 		s = math.Sqrt(jsNumber(c))
-		exponent := toInt32((e + 1) / 2)
+		// `| 0` gives an int32, but the subtraction is a double one: it can reach -2^31 - 1.
+		exponent := float64(toInt32((e + 1) / 2))
 		if e < 0 || toInt32(e)&1 != 0 {
 			exponent--
 		}
@@ -667,7 +668,7 @@ func (x *Big) sqrt(dp, rm float64) (*Big, error) {
 			mantissa = toExponential(s)
 			mantissa = mantissa[:strings.IndexByte(mantissa, 'e')+1]
 		}
-		text = mantissa + jsString(float64(exponent))
+		text = mantissa + jsString(exponent)
 	} else {
 		text = jsString(s)
 	}

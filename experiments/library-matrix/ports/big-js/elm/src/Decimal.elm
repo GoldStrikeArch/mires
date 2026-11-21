@@ -212,11 +212,23 @@ divide x y dp mode =
     case intIn 0 1000000 dp of
         Nothing -> Err "[big.js] Invalid decimal places"
         Just places ->
+            let
+                p = places + (x.e-y.e) + 1
+            in
             if first y.c==0 then Err "[big.js] Division by zero"
             else if first x.c==0 then Ok (single sign 0 0)
-            -- A NaN precision (an Infinity - Infinity exponent): upstream's `k--` stops after the
-            -- first digit, which it keeps even when it is zero, and it never rounds.
-            else if isNaN (toFloat (places + (x.e-y.e) + 1)) then Ok (Decimal sign (x.e-y.e) [Tuple.second (subtract start 0)])
+            -- When p = dp + q.e + 1 is below 1 (or NaN, from an Infinity - Infinity exponent),
+            -- upstream's `k--` stops after the first digit. It keeps the digit even when it is zero,
+            -- at the undecremented exponent, and rounds it to p (never for NaN). Past 2^53 the
+            -- exponent sums round, so only upstream's order gives upstream's result. (NaN is tested
+            -- by name: the builder's Terser `unsafe_comps` would turn `not (p >= 1)` into `p < 1`.)
+            else if isNaN (toFloat p) || p < 1 then
+                let
+                    (left,q) = subtract start 0
+                    answer = Decimal sign (x.e-y.e) [q]
+                    more = not (List.isEmpty left && List.isEmpty (List.drop divisorLen x.c))
+                in
+                if isNaN (toFloat p) then Ok answer else rounded answer p mode more
             else loop places start (List.drop divisorLen x.c) (x.e-y.e) [] 0
 
 

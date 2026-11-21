@@ -325,7 +325,8 @@ class Big(var s: Int, var e: Double, var c: MutableList<Int>) {
             var digits = c.joinToString("")
             if (toInt32(digits.length + e) and 1 == 0) digits += "0"
             estimate = sqrt(jsNumber(digits))
-            val exponent = toInt32((e + 1) / 2) - (if (e < 0 || toInt32(e) and 1 != 0) 1 else 0)
+            // `| 0` gives an int32, but the subtraction is a double one: it can reach -2^31 - 1.
+            val exponent = toInt32((e + 1) / 2).toDouble() - (if (e < 0 || toInt32(e) and 1 != 0) 1 else 0)
             parse((if (estimate == Double.POSITIVE_INFINITY) "5" else mantissa(estimate)) + "e" + exponent)
         } else {
             parse(estimate.toString())
