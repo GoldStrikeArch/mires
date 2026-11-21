@@ -24,7 +24,7 @@ with its Rust port and check it against the pinned npm package before completing
 ports. Record each mires compiler defect and its workaround in [`MIRES-BUGS.md`](MIRES-BUGS.md).
 Runnable examples live in [`mires-bugs/`](mires-bugs/).
 
-The browser workloads use real host APIs. In the Elm rows, JavaScript drives IndexedDB events, Fetch, the service worker and the Canvas context. Elm drives the transaction sequence, Ky retry decisions and chart geometry. The source and bundle figures in the report include the JavaScript host. Each workload's `CONTRACT.md` describes its API coverage and additional verifiers. [IndexedDB](libraries/idb/CONTRACT.md) · [Ky](libraries/ky/CONTRACT.md) · [uPlot](libraries/uplot/CONTRACT.md) · [Workbox](libraries/workbox/CONTRACT.md) · [Explorer](libraries/explorer/CONTRACT.md)
+The browser workloads use real host APIs. In the Elm rows, Elm implements the library logic for `idb`, `ky`, `uplot`, `workbox` and `explorer`, while each port's `js/index.js` executes only the documented I/O primitives (IndexedDB events, Fetch, service-worker caches and the Canvas context). The source and bundle figures in the report include the JavaScript host. Each workload's `CONTRACT.md` describes its API coverage and additional verifiers. [IndexedDB](libraries/idb/CONTRACT.md) · [Ky](libraries/ky/CONTRACT.md) · [uPlot](libraries/uplot/CONTRACT.md) · [Workbox](libraries/workbox/CONTRACT.md) · [Explorer](libraries/explorer/CONTRACT.md)
 
 ## Commands
 
@@ -339,9 +339,12 @@ script. In Firefox that realm is Marionette's sandbox: a module imported from it
 `Error`, `Object` and `Uint8Array`, so host errors (`fetch`, `URL`, `Cache.put`) fail
 `instanceof Error`, IndexedDB values and `structuredClone` results are objects of another realm, and
 `TextEncoder` output is a cross-compartment `Uint8Array`, an order of magnitude slower to index.
-The cell's request and its result cross WebDriver as JSON text (WebDriver argument objects lose
-their key order); the result event carries a per-load token that only the bootstrap holds.
-`tools/selftest.mjs` checks the realm in Chrome and Firefox, for check and bench cells.
+The cell's request and its result cross WebDriver as JSON text preserving `-0` (WebDriver argument
+objects lose their key order); the bootstrap removes the request and its per-load token from the DOM
+before importing the runner, and both the bootstrap and the WebDriver listener capture the reporting
+builtins beforehand, so later code cannot read the token from the DOM or break reporting by patching
+them. `tools/selftest.mjs` checks the realm, `-0` transport and builtin-patching controls in Chrome
+and Firefox.
 
 Each case runs as a **call sequence on one input object**, identically on both sides: `first` (a
 fresh `structuredClone` of the case input), `repeat` (the same object again), and `rewritten` (the
@@ -591,9 +594,11 @@ Reproduce with temporary copies of a port, a temporary registry naming them
 
 Writing such controls: the ReScript builder refuses a direct `eval` (Rollup's EVAL warning fails the
 build), and Terser removes a call to a side-effect-free infinite loop, so a hang control's loop
-must write somewhere (to a float: an int32 counter wraps negative within seconds and ends the loop). `tools/selftest.mjs` covers identity and content caches, argument mutation,
-hot-path divergence, output-form loopholes, the network guard, literal and computed dynamic imports
-and the source statistics on synthetic modules, and the page realm of browser cells.
+must write somewhere (to a float: an int32 counter wraps negative within seconds and ends the loop).
+`tools/selftest.mjs` covers identity and content caches, argument mutation, hot-path divergence,
+output-form loopholes, the network and eval-import guards, literal and computed dynamic imports,
+source statistics on synthetic modules, `-0` cell transport, and the page realm and builtin-patching
+controls of browser cells.
 
 ## Per-language notes for faithful ports
 

@@ -40,8 +40,9 @@ import {
 // 3: realm-independent inputs. 4: uncanonicalisable outputs are not "throwing"; runtime guard.
 // 5: globalThis diff, reference-phase guard, per-load request attribution, CSP.
 // 6: browser cells run in the page realm (tools/lib/page.mjs), not in Firefox's WebDriver sandbox.
+// 7: -0-preserving cell transport and pre-import builtin capture in page.mjs / browser.mjs.
 // The version string is for people: receipts are bound to this code's digest (registry.mjs).
-export const CHECK_PROTOCOL = 'library-matrix-check/6'
+export const CHECK_PROTOCOL = 'library-matrix-check/7'
 
 async function evaluate(run, object, output, normalise) {
   let result

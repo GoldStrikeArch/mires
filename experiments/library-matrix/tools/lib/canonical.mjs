@@ -116,7 +116,24 @@ export function inputText(value) {
   if (value && typeof value === 'object') {
     return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${inputText(value[key])}`).join(',')}}`
   }
-  return JSON.stringify(value)
+  return Object.is(value, -0) ? '-0' : JSON.stringify(value)
+}
+
+// JSON.stringify preserving negative zero (-0), which plain JSON.stringify writes as 0. Used
+// whenever corpus or bench inputs cross a process or browser boundary.
+const rawNegZero = typeof JSON.rawJSON === 'function' ? JSON.rawJSON('-0') : null
+export function stringifyPreservingNegZero(value) {
+  if (rawNegZero) return JSON.stringify(value, (_key, item) => (Object.is(item, -0) ? rawNegZero : item))
+  if (Object.is(value, -0)) return '-0'
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (typeof value.toJSON === 'function') return stringifyPreservingNegZero(value.toJSON())
+  if (Array.isArray(value)) return `[${value.map((item) => stringifyPreservingNegZero(item) ?? 'null').join(',')}]`
+  const parts = []
+  for (const key of Object.keys(value)) {
+    const encoded = stringifyPreservingNegZero(value[key])
+    if (encoded !== undefined) parts.push(`${JSON.stringify(key)}:${encoded}`)
+  }
+  return `{${parts.join(',')}}`
 }
 
 // Whether `target` (an input object a call has seen) can take `source`'s contents in place: both

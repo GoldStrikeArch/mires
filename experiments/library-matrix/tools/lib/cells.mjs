@@ -5,6 +5,8 @@
 
 import { spawn } from 'node:child_process'
 
+import { stringifyPreservingNegZero } from './canonical.mjs'
+
 export function runNodeCell(script, config, { cwd, callTimeoutMs, totalTimeoutMs = 3_600_000 }) {
   return new Promise((resolvePromise) => {
     const child = spawn(process.execPath, [script], { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
@@ -50,6 +52,6 @@ export function runNodeCell(script, config, { cwd, callTimeoutMs, totalTimeoutMs
         resolvePromise({ status: 'error', error: { message: `cell exited ${code}${signal ? ` (${signal})` : ''}`, stderr: stderr.slice(-4_000) } })
       }
     })
-    child.stdin.end(JSON.stringify(config))
+    child.stdin.end(stringifyPreservingNegZero(config))
   })
 }

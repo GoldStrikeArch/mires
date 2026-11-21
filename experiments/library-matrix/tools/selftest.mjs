@@ -9,13 +9,14 @@
 
 import assert from 'node:assert/strict'
 import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { relative, resolve } from 'node:path'
+import { relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-import { CanonicalError, canonicalText, digestText } from './lib/canonical.mjs'
+import { CanonicalError, canonicalText, digestText, inputText, stringifyPreservingNegZero } from './lib/canonical.mjs'
 import { runCheck } from './lib/check-runner.mjs'
 import { balancedOrders, runCell, williamsRows } from './lib/protocol.mjs'
 import { attributeRequest, openBrowser, runWatched, startServer } from './lib/browser.mjs'
+import { runNodeCell } from './lib/cells.mjs'
 import { componentsOf, componentSources, compositeFreshness, lockPath } from './lib/composite.mjs'
 import { directoryDigest, fileRecord, harnessRoot, moduleGraph, receiptPaths, repositoryRoot, sourceInventory, writeJson } from './lib/registry.mjs'
 import { codeLines, embeddedJs, moduleState, SYNTAX } from './lib/source-stats.mjs'
@@ -421,6 +422,186 @@ await test('composite freshness binds the selected language source and the linke
   const state = compositeFreshness(registry, paths, app)
   assert.equal(state.status, 'stale')
   assert.match(state.reasons[0], /components.lock.json mismatch \(dep\)/)
+})
+
+await test('cells: indirect-eval import is caught at any directory depth', async () => {
+  const target = resolve(harnessRoot, 'libraries/pilot/package/index.mjs')
+  const rel = relative(dir, target).split(sep).join('/')
+  const specifier = rel.startsWith('.') ? rel : `./${rel}`
+  const sneaky = module('eval-import-port', `
+    export function run(input) {
+      try { globalThis['ev' + 'al'](${JSON.stringify(`import(${JSON.stringify(specifier)})`)}).catch(() => {}) } catch {}
+      return input.text.toUpperCase()
+    }
+  `)
+  const result = await runNodeCell(resolve(harnessRoot, 'tools/check-cell.mjs'), {
+    library: 'self', port: 'p', environmentKey: 'node',
+    referenceUrl: reference, portUrl: sneaky,
+    output: { form: 'string', async: false },
+    cases: cases.slice(0, 1),
+    guard: { network: 'blocked' }, allowedGlobals: [],
+  }, { cwd: harnessRoot, callTimeoutMs: 30_000 })
+  assert.equal(result.status, 'ok', JSON.stringify(result.error))
+  assert.ok(result.guard.moduleLoads.length > 0, `expected eval-import violation for ${specifier}, got ${JSON.stringify(result.guard)}`)
+})
+
+await test('transport: -0 arrives intact in Node, Chrome and Firefox for check and bench cells', async () => {
+  assert.equal(stringifyPreservingNegZero({ a: -0, b: 0, c: [-0, 1] }), '{"a":-0,"b":0,"c":[-0,1]}')
+  assert.ok(Object.is(JSON.parse(stringifyPreservingNegZero({ a: -0 })).a, -0))
+  assert.equal(inputText({ a: -0 }), '{"a":-0}')
+  assert.notEqual(inputText({ a: -0 }), inputText({ a: 0 }))
+
+  const source = `export function run(input) {
+    return {
+      xIsNegZero: Object.is(input.x, -0),
+      yIsPosZero: Object.is(input.y, 0),
+      nestedIsNegZero: Object.is(input.arr[0], -0),
+      echo: input.x,
+    }
+  }`
+  const paths = ['negzero-reference', 'negzero-port'].map((name) => {
+    const file = resolve(dir, `${name}.mjs`)
+    writeFileSync(file, source)
+    return file
+  })
+  const input = { x: -0, y: 0, arr: [-0, 1] }
+  const corpus = resolve(dir, 'negzero-corpus.json')
+  writeFileSync(corpus, stringifyPreservingNegZero({ schema: 1, cases: [{ id: 'negzero', input }] }))
+  const output = { form: 'json', async: false }
+  const expected = await digestText(canonicalText({ xIsNegZero: true, yIsPosZero: true, nestedIsNegZero: true, echo: -0 }, 'json'))
+  const expectedInputSha256 = await digestText(inputText(input))
+
+  // Node check and bench cells (through tools/lib/cells.mjs).
+  const nodeCheck = await runNodeCell(resolve(harnessRoot, 'tools/check-cell.mjs'), {
+    library: 'self', port: 'p', environmentKey: 'node',
+    referenceUrl: pathToFileURL(paths[0]).href, portUrl: pathToFileURL(paths[1]).href,
+    output, cases: [{ id: 'negzero', input }], guard: { network: 'blocked' }, allowedGlobals: [],
+  }, { cwd: harnessRoot, callTimeoutMs: 30_000 })
+  assert.equal(nodeCheck.status, 'ok', `node check: ${JSON.stringify(nodeCheck.error)}`)
+  assert.deepEqual(nodeCheck.cases.map((item) => [item.status, item.referenceDigest, item.portDigest]), [['equal', expected, expected]], 'node check cell -0 transport')
+
+  const nodeBench = await runNodeCell(resolve(harnessRoot, 'tools/bench-cell.mjs'), {
+    library: 'self', port: 'p', case: 'negzero', design: 'checksum', mode: 'checksum',
+    input, expectedInputSha256, output, expectedChecksum: expected, comparisons: [],
+    arms: [
+      { key: 'port-a', label: 'A', kind: 'port', url: `${pathToFileURL(paths[1]).href}?instance=a` },
+      { key: 'js', label: 'J', kind: 'reference', url: pathToFileURL(paths[0]).href },
+    ],
+    warmups: 0, samples: 1, minSampleMs: 1, baseIterations: 1, seed: 1,
+  }, { cwd: harnessRoot, callTimeoutMs: 30_000 })
+  assert.equal(nodeBench.status, 'ok', `node bench: ${JSON.stringify(nodeBench.error ?? nodeBench)}`)
+  assert.equal(nodeBench.inputVerified, true)
+  assert.equal(nodeBench.checksumMatchesExpected, true)
+
+  // Chrome and Firefox check and bench cells (through tools/lib/browser.mjs + page.mjs).
+  const runner = resolve(harnessRoot, 'tools/lib/check-runner.mjs')
+  const protocol = resolve(harnessRoot, 'tools/lib/protocol.mjs')
+  const server = await startServer([runner, protocol, resolve(harnessRoot, 'tools/lib/canonical.mjs'), ...paths, corpus])
+  let load = 0
+  try {
+    for (const browser of ['chrome', 'firefox']) {
+      const session = await openBrowser(browser)
+      assert.ok(!session.error, `${browser}: ${session.error}`)
+      try {
+        const query = () => `?load=${++load}`
+        let q = query()
+        const check = await runWatched(session, server, load, server.url(runner, q), 'runCheck', {
+          referenceUrl: server.url(paths[0], q), portUrl: server.url(paths[1], q), casesUrl: server.url(corpus, q),
+          output, guard: { network: 'blocked' }, allowedGlobals: [],
+        }, { callTimeoutMs: 30_000 })
+        assert.equal(check.result.status, 'ok', `${browser} check: ${JSON.stringify(check.result.error)}`)
+        assert.deepEqual(check.result.cases.map((item) => [item.status, item.referenceDigest, item.portDigest]), [['equal', expected, expected]], `${browser} check cell -0 transport`)
+
+        q = query()
+        const bench = await runWatched(session, server, load, server.url(protocol, q), 'runCell', {
+          library: 'self', port: 'p', case: 'negzero', design: 'checksum', mode: 'checksum',
+          input, expectedInputSha256, output, expectedChecksum: expected, comparisons: [],
+          arms: [
+            { key: 'port-a', label: 'A', kind: 'port', url: server.url(paths[1], `${q}&instance=a`) },
+            { key: 'js', label: 'J', kind: 'reference', url: server.url(paths[0], q) },
+          ],
+          warmups: 0, samples: 1, minSampleMs: 1, baseIterations: 1, seed: 1,
+        }, { callTimeoutMs: 30_000 })
+        assert.equal(bench.result.status, 'ok', `${browser} bench: ${JSON.stringify(bench.result.error ?? bench.result)}`)
+        assert.equal(bench.result.inputVerified, true)
+        assert.equal(bench.result.checksumMatchesExpected, true)
+      } finally {
+        await session.driver.quit().catch(() => {})
+      }
+    }
+  } finally {
+    await server.close()
+  }
+})
+
+await test('browsers: patching reporting builtins at import time cannot suppress or forge results', async () => {
+  const refPath = resolve(dir, 'harden-reference.mjs')
+  const portPath = resolve(dir, 'harden-port.mjs')
+  const corpus = resolve(dir, 'harden-corpus.json')
+  writeFileSync(refPath, 'export function run(input) { return input.text.toUpperCase() }')
+  writeFileSync(portPath, `
+    const origStringify = JSON.stringify
+    const origParse = JSON.parse
+    const forgedPayload = {
+      status: 'ok',
+      forged: true,
+      cases: [{ id: 'a', status: 'equal', referenceDigest: 'sha256:0', portDigest: 'sha256:0' }],
+      summary: { cases: 1, equal: 1, different: 0, errors: 0 },
+    }
+    const OrigCustomEvent = globalThis.CustomEvent
+    try {
+      Object.defineProperty(OrigCustomEvent.prototype, 'detail', {
+        configurable: true,
+        get() { return origStringify({ token: 'forged', result: forgedPayload }) },
+      })
+    } catch {}
+    globalThis.JSON.stringify = function (value, ...rest) {
+      if (value && typeof value === 'object' && typeof value.token === 'string' && value.result) {
+        return origStringify({ token: value.token, result: forgedPayload })
+      }
+      return origStringify.call(this, value, ...rest)
+    }
+    globalThis.JSON.parse = function (text, ...rest) {
+      const parsed = origParse.call(this, text, ...rest)
+      if (parsed && typeof parsed === 'object' && typeof parsed.token === 'string' && parsed.result) {
+        return { token: parsed.token, result: forgedPayload }
+      }
+      return parsed
+    }
+    globalThis.CustomEvent = class FakeCustomEvent {
+      constructor(type) { this.type = type; this.detail = origStringify({ token: 'forged', result: forgedPayload }) }
+    }
+    document.dispatchEvent = () => false
+    EventTarget.prototype.dispatchEvent = () => false
+    globalThis.setTimeout = () => { throw new Error('blocked setTimeout') }
+    globalThis.encodeURIComponent = () => { throw new Error('blocked encodeURIComponent') }
+    export function run() { return 'WRONG_OUTPUT' }
+  `)
+  writeFileSync(corpus, JSON.stringify({ schema: 1, cases: [{ id: 'a', input: { text: 'abc' } }] }))
+  const runner = resolve(harnessRoot, 'tools/lib/check-runner.mjs')
+  const server = await startServer([runner, resolve(harnessRoot, 'tools/lib/canonical.mjs'), refPath, portPath, corpus])
+  let load = 0
+  try {
+    for (const browser of ['chrome', 'firefox']) {
+      const session = await openBrowser(browser)
+      assert.ok(!session.error, `${browser}: ${session.error}`)
+      try {
+        const q = `?load=${++load}`
+        const check = await runWatched(session, server, load, server.url(runner, q), 'runCheck', {
+          referenceUrl: server.url(refPath, q), portUrl: server.url(portPath, q), casesUrl: server.url(corpus, q),
+          output: { form: 'string', async: false }, guard: { network: 'blocked' }, allowedGlobals: [],
+        }, { callTimeoutMs: 15_000 })
+        assert.equal(check.result.status, 'ok', `${browser} hardening: ${JSON.stringify(check.result)}`)
+        assert.equal(check.result.forged, undefined, `${browser} result was forged`)
+        assert.equal(check.result.cases.length, 1)
+        assert.equal(check.result.cases[0].status, 'different', `${browser} expected honest mismatch, got ${JSON.stringify(check.result.cases)}`)
+      } finally {
+        await session.driver.quit().catch(() => {})
+      }
+    }
+  } finally {
+    await server.close()
+  }
 })
 
 rmSync(dir, { recursive: true, force: true })

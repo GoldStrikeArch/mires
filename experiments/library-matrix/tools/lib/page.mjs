@@ -8,30 +8,38 @@
 // WebDriver script does not in Firefox, where Marionette evaluates the script in a sandbox whose
 // global is not the window.
 //
-// This module has no imports, so its body runs before any other module of the cell: the heartbeat
-// binds the page's own navigator.sendBeacon before the port can replace it, and the request, with
-// the result token, leaves the DOM before the runner is imported, so nothing loaded later can read
-// the token or report a result in the runner's place.
+// This module has no imports, so its body runs before any other module of the cell: it removes the
+// request attribute (with the per-load token) from the DOM and captures the reporting builtins
+// (navigator.sendBeacon, JSON.stringify, CustomEvent, EventTarget.prototype.dispatchEvent,
+// encodeURIComponent, String) before the runner and port are imported, so later code cannot read
+// the token from the DOM or break/intercept reporting by patching those builtins.
+
+const stringify = JSON.stringify
+const EventCtor = CustomEvent
+const dispatch = EventTarget.prototype.dispatchEvent.bind(document)
+const encode = encodeURIComponent
+const toString = String
+const slice = String.prototype.slice
+const beacon = navigator.sendBeacon.bind(navigator)
 
 const element = document.querySelector('script[data-library-matrix]')
 const { moduleUrl, exportName, config, heartbeatUrl, token } = JSON.parse(element.dataset.libraryMatrix)
 element.removeAttribute('data-library-matrix')
 
-const beacon = navigator.sendBeacon.bind(navigator)
 const heartbeat = (label) => {
   try {
-    beacon(`${heartbeatUrl}&label=${encodeURIComponent(String(label).slice(0, 200))}`)
+    beacon(`${heartbeatUrl}&label=${encode(slice.call(toString(label), 0, 200))}`)
   } catch {
     // A lost heartbeat only brings the watchdog closer.
   }
 }
 
 // The result travels as JSON text, so the WebDriver side never holds an object of the page.
-const report = (result) => document.dispatchEvent(new CustomEvent('library-matrix-result', { detail: JSON.stringify({ token, result }) }))
+const report = (result) => dispatch(new EventCtor('library-matrix-result', { detail: stringify({ token, result }) }))
 
 try {
   const runner = await import(moduleUrl)
   report(await runner[exportName](config, { heartbeat }))
 } catch (error) {
-  report({ status: 'error', error: { name: String(error?.name), message: String(error?.message || error), stack: String(error?.stack) } })
+  report({ status: 'error', error: { name: toString(error?.name), message: toString(error?.message || error), stack: toString(error?.stack) } })
 }

@@ -30,6 +30,7 @@ import { readFile } from 'node:fs/promises'
 import { extname, relative, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import { stringifyPreservingNegZero } from './canonical.mjs'
 import { harnessRoot, repositoryRoot } from './registry.mjs'
 
 // The page-realm bootstrap every server serves and runInPage inserts.
@@ -165,18 +166,26 @@ export async function openBrowser(name, { scriptTimeoutMs = 600_000 } = {}) {
 // `moduleUrl` and calls its `exportName(config, { heartbeat })`; resolves with the result (a
 // JSON-compatible record). The heartbeat posts a beacon to the server through the page's original
 // navigator.sendBeacon, which the bootstrap binds before the module can replace it. `config` must
-// be JSON-compatible: it reaches the page as JSON text, in its key order. The result event carries
-// a per-load random token that only the bootstrap holds, so no other script can report a result.
+// be JSON-compatible: it reaches the page as JSON text preserving `-0`, in its key order. The
+// bootstrap removes the request and its per-load token from the DOM before importing the runner,
+// and both the bootstrap and the WebDriver listener capture the reporting builtins beforehand.
 export async function runInPage(driver, origin, load, moduleUrl, exportName, config) {
   await driver.get(`${origin}/__load/${load}${PAGE}?load=${load}`)
   const token = randomUUID()
-  const request = JSON.stringify({ moduleUrl, exportName, config, heartbeatUrl: `${origin}${HEARTBEAT}?load=${load}`, token })
+  const request = stringifyPreservingNegZero({ moduleUrl, exportName, config, heartbeatUrl: `${origin}${HEARTBEAT}?load=${load}`, token })
   const text = await driver.executeAsyncScript(`
     const done = arguments[arguments.length - 1]
     const [bootstrapUrl, request, token] = arguments
+    const parse = JSON.parse
+    const stringify = JSON.stringify
+    const toString = String
+    const slice = String.prototype.slice
+    const push = Array.prototype.push
+    const delay = (typeof window !== 'undefined' && typeof window.setTimeout === 'function' ? window.setTimeout.bind(window) : setTimeout.bind(globalThis))
+    const detailGetter = Object.getOwnPropertyDescriptor(CustomEvent.prototype, 'detail')?.get
     const cspViolations = []
     document.addEventListener('securitypolicyviolation', (event) => {
-      cspViolations.push({ directive: event.effectiveDirective || event.violatedDirective, blocked: String(event.blockedURI).slice(0, 120) })
+      push.call(cspViolations, { directive: event.effectiveDirective || event.violatedDirective, blocked: slice.call(toString(event.blockedURI), 0, 120) })
     })
     // Violation events are dispatched asynchronously (Chrome after a module load fails), so the
     // page waits briefly for them before reporting.
@@ -184,14 +193,17 @@ export async function runInPage(driver, origin, load, moduleUrl, exportName, con
     const finish = (result) => {
       if (finished) return
       finished = true
-      setTimeout(() => {
+      delay(() => {
         if (result && typeof result === 'object') result.cspViolations = cspViolations
-        done(JSON.stringify(result))
+        done(stringify(result))
       }, 250)
     }
     document.addEventListener('library-matrix-result', (event) => {
       let message = null
-      try { message = JSON.parse(String(event.detail)) } catch {}
+      try {
+        const raw = detailGetter ? detailGetter.call(event) : event.detail
+        message = parse(toString(raw))
+      } catch {}
       if (message && message.token === token) finish(message.result)
     })
     const script = document.createElement('script')
