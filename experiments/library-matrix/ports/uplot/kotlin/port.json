@@ -2,5 +2,5 @@
   "schema": 1,
   "library": "uplot",
   "language": "kotlin",
-  "boundary": "Aligned arrays in, chart geometries and probes out. The port computes paths, extrema, gap rectangles, and scale transforms and renders the paths through the browser canvas."
+  "boundary": "External interfaces view the JS input with no copy; the chart draws on a real canvas through external DOM declarations, and the frames return as Kotlin arrays, which are JS arrays."
 }

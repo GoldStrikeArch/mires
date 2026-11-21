@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 #![deny(unsafe_code)]
-use mires_js::{JsValue as V, js_bindings, js_export, throw_value};
+use mires_js::{JsValue as V, js_bindings, js_export, throw_value, try_host};
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
     throw_value(s("chart panicked"))
@@ -13,6 +13,9 @@ js_bindings! {
     #[js(call="Reflect.get")] fn prop(v:V,k:V)->V;
     #[js(call="Reflect.set")] fn put(v:V,k:V,x:V)->bool;
     #[js(call="Math.round")] fn round(x:f64)->f64;
+    #[js(call="Math.pow")] fn pow(x:f64,y:f64)->f64;
+    #[js(call="Number.isInteger")] fn is_int(x:f64)->bool;
+    #[js(call="String")] fn string(x:f64)->V;
     #[js(index)] fn at(v:V,i:usize)->V;
     #[js(index)] fn num(v:V,i:usize)->f64;
     #[js(get="length")] fn len(v:V)->usize;
@@ -46,30 +49,70 @@ fn pair(x: V, y: V) -> V {
 fn coords(x: f64, y: f64) -> V {
     pair(V::erase(x), V::erase(y))
 }
+// uPlot's roundDec: rounds half away from zero at `dec` decimals.
+fn round_dec(v: f64, dec: i32) -> f64 {
+    if is_int(v) {
+        return v;
+    }
+    let p = pow(10.0, dec as f64);
+    round(v * p * (1.0 + f64::EPSILON)) / p
+}
+// uPlot's regex6, /\.\d*?(?=9{6,}|0{6,})/: the number of digits between the point and the first
+// run of six or more 9s or 0s, if there is one.
+fn decimals_before_run(text: &str) -> Option<usize> {
+    let digits = &text[text.find('.')? + 1..];
+    let digits = &digits[..digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len())];
+    (0..digits.len()).find(|&k| digits[k..].starts_with("999999") || digits[k..].starts_with("000000"))
+}
+// uPlot's fixFloat: snaps a value whose JS string has a run of six or more 9s or 0s after the
+// point to the decimals before the run. uPlot first returns members of its fixedDec map
+// unchanged; the string path returns every member unchanged too. Its branch for strings with
+// "e-" (values below 1e-6) is not reached by plot sizes of 1 px or more.
+fn fix_float(v: f64) -> f64 {
+    if is_int(v) {
+        return v;
+    }
+    match decimals_before_run(string(v).read::<&str>()) {
+        Some(dec) => round_dec(v, dec as i32),
+        None => v,
+    }
+}
+fn incr_round(v: f64, incr: f64) -> f64 {
+    fix_float(round_dec(fix_float(v / incr), 0) * incr)
+}
+// One axis of the plot: the scale range, calcSize's offset and size in canvas pixels, and the
+// CSS size uPlot was given (the adapter divides the physical size by pxRatio).
 struct Scale {
     min: f64,
     max: f64,
+    off: f64,
     dim: f64,
-    requested: f64,
+    css: f64,
+    ratio: f64,
     vertical: bool,
 }
 impl Scale {
+    // getHPos / getVPos (dir 1) in canvas pixels, keeping uPlot's `off +`, which turns -0 into 0.
     fn pixel(&self, v: f64) -> f64 {
         let pct = (v - self.min) / (self.max - self.min);
-        self.dim * (if self.vertical { 1.0 - pct } else { pct })
+        self.off + self.dim * (if self.vertical { 1.0 - pct } else { pct })
     }
+    // posToVal(p, key, true): the CSS position (the plot's CSS offset is 0), from the bottom for y.
     fn value(&self, p: f64) -> f64 {
-        let q = if self.vertical { self.requested - p } else { p };
-        self.min + (self.max - self.min) * (q / self.requested)
+        let pos = p / self.ratio;
+        let q = if self.vertical { self.css - pos } else { pos };
+        self.min + (self.max - self.min) * (q / self.css)
     }
 }
-fn axis(frame: V, key: &str, dim: f64, vertical: bool) -> Scale {
+fn axis(frame: V, key: &str, css: f64, ratio: f64, vertical: bool) -> Scale {
     let range = field(frame, key);
     Scale {
         min: num(range, 0),
         max: num(range, 1),
-        dim: round(dim * 2.0) / 2.0,
-        requested: dim,
+        off: incr_round(0.0 * ratio, 0.5),
+        dim: incr_round(css * ratio, 0.5),
+        css,
+        ratio,
         vertical,
     }
 }
@@ -204,62 +247,83 @@ fn render(ctx: V, x: &Scale, y: &Scale, xs: V, ys: V, span: bool) -> V {
             }
         }
     }
-    let width = round(ratio() * 1000.0) / 1000.0;
+    // drawPath: the series width 1 in canvas pixels, the half-pixel translate, the bounds clip
+    // and clipGaps' mask.
+    let width = round_dec(x.ratio, 3);
     let offset = (width % 2.0) / 2.0;
-    save(ctx);
-    put(ctx, s("lineWidth"), V::erase(width));
-    put(ctx, s("lineJoin"), s("round"));
-    translate(ctx, offset, offset);
+    if offset > 0.0 {
+        translate(ctx, offset, offset);
+    }
     let bounds = path();
     rect(
         bounds,
-        -width / 2.0,
-        -width / 2.0,
+        x.off - width / 2.0,
+        y.off - width / 2.0,
         x.dim + width,
         y.dim + width,
     );
+    put(ctx, s("strokeStyle"), s("#172839"));
+    put(ctx, s("lineWidth"), V::erase(width));
+    put(ctx, s("lineJoin"), s("round"));
+    put(ctx, s("lineCap"), s("butt"));
+    save(ctx);
     clip(ctx, bounds);
     if len(gaps) > 0 {
         let mask = path();
-        let mut end = 0.0;
+        let mut end = x.off;
         for i in 0..len(gaps) {
             let interval = at(gaps, i);
             let a = num(interval, 0);
             let b = num(interval, 1);
             if b > a {
-                if a > end {
-                    rect(mask, end, 0.0, a - end, y.dim);
+                if a - end > 0.0 {
+                    rect(mask, end, y.off, a - end, y.off + y.dim);
                 }
                 end = b;
             }
         }
-        if x.dim > end {
-            rect(mask, end, -5.0, x.dim - end, y.dim + 10.0);
+        let rest = x.off + x.dim - end;
+        if rest > 0.0 {
+            rect(mask, end, y.off - 5.0, rest, y.off + y.dim + 10.0);
         }
         clip(ctx, mask);
     }
-    stroke(ctx, p.stroke);
+    if width > 0.0 {
+        stroke(ctx, p.stroke);
+    }
     restore(ctx);
+    if offset > 0.0 {
+        translate(ctx, -offset, -offset);
+    }
     pair(p.points, if span { V::null() } else { gaps })
 }
+// The adapter's precise(): Math.round(x * 1e6) || 0, which maps -0 and NaN to 0.
 fn precise(v: f64) -> V {
     let n = round(v * 1e6);
-    V::erase(if n == 0.0 { 0.0 } else { n })
+    V::erase(if n == 0.0 || n.is_nan() { 0.0 } else { n })
 }
-fn frame(canvas: V, ctx: V, f: V, span: bool) -> V {
+fn frame(canvas: V, ctx: V, f: V, span: bool, ratio: f64) -> V {
+    // The adapter passes CSS sizes; uPlot multiplies them back by pxRatio.
     let size = field(f, "size");
-    let width = num(size, 0);
-    let height = num(size, 1);
-    put(canvas, s("width"), V::erase(round(width)));
-    put(canvas, s("height"), V::erase(round(height)));
-    put(ctx, s("strokeStyle"), s("#172839"));
-    let x = axis(f, "xRange", width, false);
-    let y = axis(f, "yRange", height, true);
+    let width = num(size, 0) / ratio;
+    let height = num(size, 1) / ratio;
+    put(canvas, s("width"), V::erase(round(width * ratio)));
+    put(canvas, s("height"), V::erase(round(height * ratio)));
+    let x = axis(f, "xRange", width, ratio, false);
+    let y = axis(f, "yRange", height, ratio, true);
     let data = field(f, "data");
     let xs = at(data, 0);
     let paths = array();
     for i in 1..len(data) {
-        push(paths, render(ctx, &x, &y, xs, at(data, i), span));
+        // drawSeries runs only with data; the adapter then reports an empty trace.
+        push(
+            paths,
+            if len(xs) > 0 {
+                render(ctx, &x, &y, xs, at(data, i), span)
+            } else {
+                pair(array(), if span { V::null() } else { array() })
+            },
+        );
     }
     let last = len(xs) as isize - 1;
     let mut lo = nearest(xs, x.min, 0, last);
@@ -292,25 +356,25 @@ fn frame(canvas: V, ctx: V, f: V, span: bool) -> V {
     push(out, answers);
     out
 }
+fn frames(input: V, canvas: V) -> V {
+    let ctx = context(canvas, s("2d"));
+    let ratio = ratio();
+    let span = field(input, "spanGaps").is_truthy();
+    let frames = field(input, "frames");
+    let result = array();
+    for i in 0..len(frames) {
+        push(result, frame(canvas, ctx, at(frames, i), span, ratio));
+    }
+    result
+}
 #[js_export]
 pub fn matrix_run(input: V) -> V {
     let doc = document();
     let canvas = element(doc, s("canvas"));
     append(field(doc, "body"), canvas);
-    let ctx = context(canvas, s("2d"));
-    let frames = field(input, "frames");
-    let result = array();
-    for i in 0..len(frames) {
-        push(
-            result,
-            frame(
-                canvas,
-                ctx,
-                at(frames, i),
-                field(input, "spanGaps").is_truthy(),
-            ),
-        );
-    }
+    // The reference removes its host in `finally`. try_host catches a throw, including a panic
+    // (the panic handler throws), so the canvas leaves the page before the exception does.
+    let result = try_host(|| frames(input, canvas));
     remove(canvas);
-    result
+    result.unwrap_or_else(|error| throw_value(error))
 }

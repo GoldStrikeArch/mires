@@ -4,5 +4,5 @@
   "language": "rust",
   "entry": "src/lib.rs",
   "crateName": "matrix_uplot",
-  "boundary": "Rust draws the aligned series on Canvas 2D and returns its geometry and coordinate queries."
+  "boundary": "Host bindings read the JS input in place; Rust draws the aligned series on Canvas 2D and builds the geometry and probe arrays through the host."
 }

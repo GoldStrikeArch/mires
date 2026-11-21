@@ -3,5 +3,5 @@
   "library": "uplot",
   "language": "jsoo",
   "entry": "src/main.ml",
-  "boundary": "Aligned arrays in, chart geometries and probes out. The port computes paths, extrema, gap rectangles, and scale transforms and renders the paths through the browser canvas."
+  "boundary": "The input is read in place through Js.Unsafe; the shared OCaml chart draws on a real canvas through Js.Unsafe calls and builds JS arrays."
 }

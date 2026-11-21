@@ -3,5 +3,5 @@
   "library": "uplot",
   "language": "rescript",
   "entry": "src/Index.res",
-  "boundary": "Aligned arrays in, chart geometries and probes out. The port computes paths, extrema, gap rectangles, and scale transforms and renders the paths through the browser canvas."
+  "boundary": "Record types are the JS input itself, with Nullable series values; the chart draws on a real canvas through externals and returns JS arrays."
 }

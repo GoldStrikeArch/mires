@@ -4,5 +4,5 @@
   "language": "elm",
   "main": "src/Main.elm",
   "host": "js/index.js",
-  "boundary": "Aligned arrays in, chart geometries and probes out. The port computes paths, extrema, gap rectangles, and scale transforms and renders the paths through the browser canvas."
+  "boundary": "The JS host sends the input and devicePixelRatio through a port and Json.Decode reads them; Elm returns the geometry, probes and canvas settings, which the host applies to a real canvas."
 }

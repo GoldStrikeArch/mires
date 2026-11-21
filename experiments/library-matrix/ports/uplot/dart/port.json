@@ -3,5 +3,5 @@
   "library": "uplot",
   "language": "dart",
   "entry": "src/main.dart",
-  "boundary": "Aligned arrays in, chart geometries and probes out. The port computes paths, extrema, gap rectangles, and scale transforms and renders the paths through the browser canvas."
+  "boundary": "dart:js_interop extension types view the JS input, whose arrays become Dart lists; the chart draws on a real canvas through extension types, and the frames return through toJS."
 }

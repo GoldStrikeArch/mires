@@ -27,6 +27,8 @@ type element
 @send external clip: (ctx, path) => unit = "clip"
 @send external stroke: (ctx, path) => unit = "stroke"
 @val external round: float => float = "Math.round"
+@val external pow: (float, float) => float = "Math.pow"
+@val external isInteger: float => bool = "Number.isInteger"
 type value
 external cast: 'a => value = "%identity"
 type frame = {
@@ -37,16 +39,60 @@ type frame = {
   probes: array<array<float>>,
 }
 type input = {spanGaps: bool, frames: array<frame>}
-type scale = {low: float, high: float, dim: float, requested: float, vertical: bool}
+// uPlot's roundDec: rounds half away from zero at `dec` decimals.
+let roundDec = (v, ~dec=0) =>
+  if isInteger(v) {
+    v
+  } else {
+    let p = pow(10., Int.toFloat(dec))
+    round(v *. p *. (1. +. Float.Constants.epsilon)) /. p
+  }
+// uPlot's fixFloat: snaps a value whose JS string has a run of six or more 9s or 0s after the
+// point to the decimals before the run. uPlot first returns members of its fixedDec map unchanged;
+// the string path returns every member unchanged too. Its branch for strings with "e-" (values
+// below 1e-6) is not reached by plot sizes of 1 px or more.
+let regex6 = %re("/\.\d*?(?=9{6,}|0{6,})/")
+let fixFloat = v =>
+  if isInteger(v) {
+    v
+  } else {
+    switch regex6->RegExp.exec(Float.toString(v)) {
+    | Some(m) => roundDec(v, ~dec=String.length(RegExp.Result.fullMatch(m)) - 1)
+    | None => v
+    }
+  }
+let incrRound = (v, incr) => fixFloat(roundDec(fixFloat(v /. incr)) *. incr)
+// One axis of the plot: the scale range, calcSize's offset and size in canvas pixels, and the CSS
+// size uPlot was given (the adapter divides the physical size by pxRatio).
+type scale = {
+  low: float,
+  high: float,
+  off: float,
+  dim: float,
+  css: float,
+  ratio: float,
+  vertical: bool,
+}
 let elt = Array.getUnsafe
-let scale = (range, dim, vertical) => {low: elt(range, 0), high: elt(range, 1), dim: round(dim *. 2.) /. 2., requested: dim, vertical}
+let scale = (range, css, ratio, vertical) => {
+  low: elt(range, 0),
+  high: elt(range, 1),
+  off: incrRound(0. *. ratio, 0.5),
+  dim: incrRound(css *. ratio, 0.5),
+  css,
+  ratio,
+  vertical,
+}
+// getHPos / getVPos (dir 1) in canvas pixels, keeping uPlot's `off +`, which turns -0 into 0.
 let pixel = (s, v) => {
   let pct = (v -. s.low) /. (s.high -. s.low)
-  s.dim *. (s.vertical ? 1. -. pct : pct)
+  s.off +. s.dim *. (s.vertical ? 1. -. pct : pct)
 }
+// posToVal(p, key, true): the CSS position (the plot's CSS offset is 0), from the bottom for y.
 let valueAt = (s, p) => {
-  let q = s.vertical ? s.requested -. p : p
-  s.low +. (s.high -. s.low) *. (q /. s.requested)
+  let pos = p /. s.ratio
+  let q = s.vertical ? s.css -. pos : pos
+  s.low +. (s.high -. s.low) *. (q /. s.css)
 }
 let number = (xs, i) => elt(xs, i)->Nullable.getOr(0.)
 let nearest = (xs, v, lo, hi) => {
@@ -59,9 +105,10 @@ let nearest = (xs, v, lo, hi) => {
     }
   Array.length(xs) == 0 ? -1 : find(lo, hi == 0 ? Array.length(xs) - 1 : hi)
 }
+// The adapter's precise(): Math.round(x * 1e6) || 0, which maps -0 and NaN to 0.
 let precise = v => {
   let x = round(v *. 1000000.)
-  x == 0. ? 0. : x
+  x == 0. || Float.isNaN(x) ? 0. : x
 }
 type bucket = {first: float, mutable last: float, mutable low: float, mutable high: float}
 let render = (ctx, x, y, xs, ys, span) => {
@@ -154,55 +201,63 @@ let render = (ctx, x, y, xs, ys, span) => {
       }
     }
   }
-  save(ctx)
-  try {
-    let width = round(pixelRatio *. 1000.) /. 1000.
-    let offset = Float.mod(width, 2.) /. 2.
-    lineWidth(ctx, width)
-    lineJoin(ctx, "round")
-    lineCap(ctx, "butt")
+  // drawPath: the series width 1 in canvas pixels, the half-pixel translate, the bounds clip and
+  // clipGaps' mask.
+  let width = roundDec(x.ratio, ~dec=3)
+  let offset = Float.mod(width, 2.) /. 2.
+  if offset > 0. {
     translate(ctx, offset, offset)
-    let bounds = newPath()
-    rect(bounds, 0. -. width /. 2., 0. -. width /. 2., x.dim +. width, y.dim +. width)
-    clip(ctx, bounds)
-    if Array.length(gaps) > 0 {
-      let mask = newPath()
-      let last = ref(0.)
-      Array.forEach(gaps, g => {
-        let a = elt(g, 0)
-        let b = elt(g, 1)
-        if b > a {
-          if a > last.contents {
-            rect(mask, last.contents, 0., a -. last.contents, y.dim)
-          }
-          last := b
+  }
+  let bounds = newPath()
+  rect(bounds, x.off -. width /. 2., y.off -. width /. 2., x.dim +. width, y.dim +. width)
+  setColor(ctx, "#172839")
+  lineWidth(ctx, width)
+  lineJoin(ctx, "round")
+  lineCap(ctx, "butt")
+  save(ctx)
+  clip(ctx, bounds)
+  if Array.length(gaps) > 0 {
+    let mask = newPath()
+    let last = ref(x.off)
+    Array.forEach(gaps, g => {
+      let a = elt(g, 0)
+      let b = elt(g, 1)
+      if b > a {
+        if a -. last.contents > 0. {
+          rect(mask, last.contents, y.off, a -. last.contents, y.off +. y.dim)
         }
-      })
-      if x.dim > last.contents {
-        rect(mask, last.contents, -5., x.dim -. last.contents, y.dim +. 10.)
+        last := b
       }
-      clip(ctx, mask)
+    })
+    let rest = x.off +. x.dim -. last.contents
+    if rest > 0. {
+      rect(mask, last.contents, y.off -. 5., rest, y.off +. y.dim +. 10.)
     }
+    clip(ctx, mask)
+  }
+  if width > 0. {
     stroke(ctx, path)
-  } catch {
-  | e =>
-    restore(ctx)
-    throw(e)
   }
   restore(ctx)
+  if offset > 0. {
+    translate(ctx, -.offset, -.offset)
+  }
   [cast(points), span ? cast(Nullable.null) : cast(gaps)]
 }
-let drawFrame = (canvas, ctx, f, span) => {
-  let w = elt(f.size, 0)
-  let h = elt(f.size, 1)
-  width(canvas, round(w))
-  height(canvas, round(h))
-  setColor(ctx, "#172839")
-  let x = scale(f.xRange, w, false)
-  let y = scale(f.yRange, h, true)
+let drawFrame = (canvas, ctx, f, span, ratio) => {
+  // The adapter passes CSS sizes; uPlot multiplies them back by pxRatio.
+  let w = elt(f.size, 0) /. ratio
+  let h = elt(f.size, 1) /. ratio
+  width(canvas, round(w *. ratio))
+  height(canvas, round(h *. ratio))
+  let x = scale(f.xRange, w, ratio, false)
+  let y = scale(f.yRange, h, ratio, true)
   let xs = elt(f.data, 0)
+  // drawSeries runs only with data; the adapter then reports an empty trace for each series.
   let paths = Array.fromInitializer(~length=Array.length(f.data) - 1, i =>
-    render(ctx, x, y, xs, elt(f.data, i + 1), span)
+    Array.length(xs) > 0
+      ? render(ctx, x, y, xs, elt(f.data, i + 1), span)
+      : [cast([]), span ? cast(Nullable.null) : cast([])]
   )
   let endIndex = Array.length(xs) - 1
   let lo = ref(nearest(xs, x.low, 0, endIndex))
@@ -234,7 +289,8 @@ let run = (input: input) => {
   appendChild(body(doc), canvas)
   let result = try {
     let ctx = context(canvas, "2d")
-    input.frames->Array.map(f => drawFrame(canvas, ctx, f, input.spanGaps))
+    let ratio = pixelRatio
+    input.frames->Array.map(f => drawFrame(canvas, ctx, f, input.spanGaps, ratio))
   } catch {
   | e =>
     remove(canvas)
