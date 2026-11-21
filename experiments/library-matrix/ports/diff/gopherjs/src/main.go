@@ -63,16 +63,15 @@ func writeChange(kind, count int, v interface{}) *js.Object {
 	return x
 }
 // arrayKeys are the elements' JSON texts, which compare as === does for JSON scalars. With
-// ignoreCase, strings also compare lowercased (the JSON text of a lowercased string is the
-// lowercased JSON text).
+// ignoreCase, elements are strings (CONTRACT.md) and compare by JS toLowerCase().
 func arrayKeys(v *js.Object, ignoreCase bool) []string {
 	out := make([]string, v.Length())
 	for i := range out {
-		key := js.Global.Get("JSON").Call("stringify", v.Index(i))
 		if ignoreCase {
-			key = key.Call("toLowerCase")
+			out[i] = readText(v.Index(i).Call("toLowerCase"))
+		} else {
+			out[i] = js.Global.Get("JSON").Call("stringify", v.Index(i)).String()
 		}
-		out[i] = key.String()
 	}
 	return out
 }

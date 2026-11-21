@@ -655,12 +655,15 @@ let applyHunks = (lines, hunks) => {
   let resultLines = []
   // Positions are JavaScript numbers: a NaN start fits only a hunk with no removed or context
   // line, and then every later position is NaN too. A position outside the source reads as
-  // undefined, which joins as an empty line.
-  let rec copy = (from, until) =>
-    if from < until {
-      resultLines->Array.push(lineAt(from)->Option.getOr(""))
-      copy(from +. 1., until)
+  // undefined, which joins as an empty line. An imperative loop keeps the `i < until` test
+  // intact in JS (a tail-recursive `if from < until` compiles to `if (from >= until) return`).
+  let copy = (from, until) => {
+    let i = ref(from)
+    while i.contents < until {
+      resultLines->Array.push(lineAt(i.contents)->Option.getOr(""))
+      i := i.contents +. 1.
     }
+  }
   let rec fit = (k, minLine, prevHunkOffset) =>
     if k == hunks->Array.length {
       copy(minLine, lines->Array.length->Int.toFloat)

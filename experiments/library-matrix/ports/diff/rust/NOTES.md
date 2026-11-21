@@ -15,14 +15,14 @@ The port has no regex engine. A function named after each of parse.js's patterns
 - `hg_prefix` and `index_header` reproduce the greedy repetition of `/^diff(?: -r \w+)+\s/` and `/^(?:Index:|diff(?: -r \w+)+)\s+/`, and its backtracking.
 - `hunk_range` finds the leftmost match of the range pattern anywhere in the `@@` line. A line it does not match gives NaN starts.
 
-Hunk ranges, and the positions `apply` computes from them, are `f64`s, JavaScript numbers, so a NaN start fits nowhere, as in npm.
+Hunk ranges, and the positions `apply` computes from them, are `f64`s, JavaScript numbers, so a NaN start fits only insert-only hunks (and copies no source lines), while any hunk with a removed or context line returns `false`, as in npm.
 
 ## Deviations from the npm source
 
 - **Strings.** Text is Rust UTF-8, with an escape for isolated UTF-16 surrogates: U+E800 and a private-use payload (`utf16.rs`). Where jsdiff counts UTF-16 units, so does the port: `units` for diffJson's longest-token rule, and `drop_first_unit` and `drop_last_unit` for the one unit that parseGitDiffHeader skips beside a quoted name.
 - **Runs instead of change objects.** The Myers search, the tokenizers and patch creation restate base.js, word.js, line.js and create.js over runs (a kind and a count). The inner loop's diagonal bound is computed once per edit length. The diagonals that this adds after a path reaches the right edge can neither finish nor reach an edge, so the result is npm's.
 - **diffJson's dangling commas.** The rule removes `,\r` and `,\n` in two passes, which equals the single regex replacement.
-- **Options.** Only the contract's options exist (CONTRACT.md, "Options"). `fit` allows no errors (fuzz 0). diffArrays compares the elements' JSON text, which for JSON scalars is `===`; under `ignoreCase` the text is lowercased, which for strings is `toLowerCase()` (the JSON text of a lowercased string is the lowercased JSON text).
+- **Options.** Only the contract's options exist (CONTRACT.md, "Options"). `fit` allows no errors (fuzz 0). diffArrays compares the elements' JSON text, which for JSON scalars is `===`; under `ignoreCase`, elements are strings (CONTRACT.md) and compare by the host's `toLowerCase()`.
 - **reversePatch** copies the patch's own JS values, as `Object.assign` does, so missing hunk fields stay `undefined`.
 - **canonicalize** assigns keys to a plain object, so a `"__proto__"` key is dropped, as in npm. It throws for a truthy `toJSON` member, which npm calls and JSON cannot make callable.
 

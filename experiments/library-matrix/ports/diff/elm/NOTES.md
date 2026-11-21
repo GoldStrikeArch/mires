@@ -12,7 +12,7 @@ Elm has no regex in `elm/core`. A function named after each of parse.js's patter
 - `hgPrefix` and `indexHeader` reproduce the greedy repetition of the Mercurial and `Index:` patterns, and its backtracking.
 - `hunkRange` finds the leftmost match of the range pattern anywhere in the `@@` line. A line it does not match gives NaN starts (`0 / 0`).
 
-Hunk ranges are `Float`s, JavaScript numbers (`String.toFloat`), and so are the positions `apply` computes from them, so a NaN start fits nowhere, as in npm.
+Hunk ranges are `Float`s, JavaScript numbers (`String.toFloat`), and so are the positions `apply` computes from them, so a NaN start fits only insert-only hunks (and copies no source lines), while any hunk with a removed or context line returns `false`, as in npm.
 
 ## Stack safety
 
@@ -26,7 +26,7 @@ Every loop over lines, hunks, files and octal bytes is a self tail call, which E
 - **Runs instead of change objects.** `Differ.elm` and `Patch.create` restate base.js, word.js, line.js and create.js over runs (a kind and a count), in immutable lists and arrays.
 - **Metadata.** A parsed patch's metadata is a list of fields in the order jsdiff first assigns them; `put` replaces a field in place, as assignment does.
 - **UTF-8.** `decodeUtf8` is TextDecoder written out: each maximal ill-formed subpart becomes U+FFFD and a leading BOM is consumed. Elm has no host TextDecoder without a port round trip.
-- **Options.** Only the contract's options exist (CONTRACT.md, "Options"). `fit` allows no errors (fuzz 0). diffArrays compares the elements' JSON text, which for JSON scalars is `===`; under `ignoreCase` the text is lowercased, which for strings is `toLowerCase()` (the JSON text of a lowercased string is the lowercased JSON text).
+- **Options.** Only the contract's options exist (CONTRACT.md, "Options"). `fit` allows no errors (fuzz 0). diffArrays compares the elements' JSON text, which for JSON scalars is `===`; under `ignoreCase`, elements are strings (CONTRACT.md) and compare by `String.toLower` (JS `toLowerCase()`).
 - **reversePatch** copies the patch's own JSON fields, as `Object.assign` does, so missing hunk fields stay `undefined`. It tests `isGit` and `isCopy` for JavaScript truthiness (`truthy`), as npm does.
 
 ## Module state

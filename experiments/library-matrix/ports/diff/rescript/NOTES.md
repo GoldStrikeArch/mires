@@ -35,7 +35,7 @@ ReScript's standard library binds the host directly, so the port uses it for:
 - The Myers search keeps the best path for each diagonal in an array offset by `maxEditLength + 1`, not in a sparse JS array with negative indices. Its diagonal limits start at `±maxEditLength`, beyond which no diagonal lies, in place of `±Infinity`.
 - Loops that npm leaves early with `return` or `break` are self-recursive functions, which ReScript compiles to `while` loops.
 - `diffArrays` compares with `===`, and under `ignoreCase` also by `toLowerCase()`, which the contract applies to string elements only.
-- Hunk ranges and the positions `applyPatch` computes from them are floats, JavaScript numbers, so a NaN start fits nowhere, as in npm. So is patch creation's `context`, which npm compares and slices as a double.
+- Hunk ranges and the positions `applyPatch` computes from them are floats, JavaScript numbers, so a NaN start fits only insert-only hunks (and `copy` uses an imperative `while` loop so ReScript keeps `i < until` intact rather than inverting it to `>=` in tail-call lowering), while any hunk with a removed or context line returns `false`, as in npm. So is patch creation's `context`, which npm compares and slices as a double.
 
 ## Module state
 

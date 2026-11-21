@@ -36,10 +36,10 @@ let write_change span value =
   o
 
 (* Elements compare by their JSON text, which is === for JSON scalars. With
-   ignoreCase, strings also compare lowercased (the JSON text of a lowercased
-   string is the lowercased JSON text). *)
+   ignoreCase, elements are strings (CONTRACT.md) and compare by JS
+   toLowerCase(). *)
 let array_diff a b o =
-  let key x = if o.ignore_case then lower (read (json x)) else read (json x) in
+  let key x = if o.ignore_case then lower (read x) else read (json x) in
   let values v = Patch.array_of_js key v in
   let spans = Array.of_list (myers (values a) (values b) o.individual) in
   let old = ref 0 and newer = ref 0 in

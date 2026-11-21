@@ -720,9 +720,15 @@ let apply source p =
     | Some lines ->
         (* Positions are JavaScript numbers: a NaN start fits only a hunk with no removed or
            context line, and then every later position is NaN too. A position outside the source
-           reads as undefined, which joins as an empty line. *)
-        let rec copy i stop result =
-          if i < stop then copy (i +. 1.) stop (Option.value (line_at lines i) ~default:"" :: result) else result
+           reads as undefined, which joins as an empty line. An imperative loop keeps the `i < stop`
+           test intact in JS (Melange lowers tail-recursive `if i < stop` to `if (i >= stop)`). *)
+        let copy from stop result =
+          let i = ref from and acc = ref result in
+          while !i < stop do
+            acc := Option.value (line_at lines !i) ~default:"" :: !acc;
+            i := !i +. 1.
+          done;
+          !acc
         in
         let length = float_of_int (Array.length lines) in
         let rec hunks k min_line offset result =

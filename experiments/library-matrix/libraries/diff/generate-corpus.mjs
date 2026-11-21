@@ -235,15 +235,36 @@ for (const [id, before] of [['number', {toJSON:1}], ['nested', {a:{toJSON:'x'}}]
   ['false', {toJSON:false}], ['zero', {toJSON:0}], ['null', {toJSON:null}], ['empty-string', {toJSON:''}]])
   add('json-tojson-'+id, {op:'diffJson', before, after:{a:1}})
 add('json-tojson-after', {op:'diffJson', before:{a:1}, after:{b:{toJSON:2}}})
-// A hunk whose header the range pattern does not match starts at NaN, and so fits nowhere.
-for (const [id, before, patch] of [['remove', 'a\nb\n', '@@ x @@\n-a\n+z\n'], ['context', 'a\n', '@@ x @@\n a\n'],
-  ['second-hunk', 'a\nb\n', '@@ -1 +1 @@\n-a\n+A\n@@ x @@\n-b\n+B\n']])
+// A hunk whose header the range pattern does not match starts at NaN: context/'-' hunks fit
+// nowhere and return false; insert-only hunks fit at NaN and return the inserted lines.
+for (const [id, before, patch] of [
+  ['remove', 'a\nb\n', '@@ x @@\n-a\n+z\n'],
+  ['context', 'a\n', '@@ x @@\n a\n'],
+  ['second-hunk', 'a\nb\n', '@@ -1 +1 @@\n-a\n+A\n@@ x @@\n-b\n+B\n'],
+  ['insert', 'a\nb\n', '@@ x @@\n+z'],
+  ['insert-no-src-nl', 'a\nb', '@@ x @@\n+z'],
+  ['insert-trailing-nl', 'a\nb\n', '@@ x @@\n+z\n'],
+  ['insert-eof-marker', 'a\nb\n', '@@ x @@\n+z\n\\ No newline at end of file'],
+  ['insert-multi-text', 'a\nb\n', '@@ x @@\n+z1\n+z2'],
+  ['insert-second-hunk', 'a\nb\n', '@@ -1 +1 @@\n-a\n+A\n@@ x @@\n+z'],
+  ['insert-multi-struct', 'a\nb\n', {hunks:[{oldLines:0, newStart:1, newLines:2, lines:['+z1', '+z2']}]}],
+  ['insert-multi-trailing-nl-struct', 'a\nb\n', {hunks:[{oldLines:0, newStart:1, newLines:3, lines:['+z1', '+z2', '+']}]}],
+])
   add('apply-nan-start-'+id, {op:'applyPatch', before, patch})
-// diffArrays with ignoreCase compares strings by toLowerCase().
+// diffArrays with ignoreCase compares strings by toLowerCase() directly (not JSON-escaped text,
+// where escapes like \n, \t, \u001a or \ud80a before Σ would falsely trigger Final_Sigma).
 for (const [i, options] of [{ignoreCase:true}, {ignoreCase:true, oneChangePerToken:true}].entries()) {
   texts('arrays-ignore-case-'+i, 'diffArrays', ['A', 'b', 'C', 'İ', 'Σ'], ['a', 'B', 'd', 'i\u0307', 'σ'], options)
   texts('arrays-ignore-case-equal-'+i, 'diffArrays', ['A'], ['a'], options)
 }
+for (const [id, before, after] of [
+  ['nl-sigma-eq', ['\nΣ'], ['\nσ']],
+  ['nl-sigma-neq', ['\nΣ'], ['\nς']],
+  ['tab-sigma-eq', ['\tΣ'], ['\tσ']],
+  ['u001a-sigma-eq', ['\u001aΣ'], ['\u001aσ']],
+  ['surr-sigma-eq', ['\ud80aΣ'], ['\ud80aσ']],
+])
+  texts('arrays-ignore-case-'+id, 'diffArrays', before, after, {ignoreCase:true})
 // reversePatch tests isGit and isCopy for truthiness.
 for (const [id, flags] of [['git-number', {isGit:1}], ['git-string', {isGit:'yes'}], ['git-zero', {isGit:0}], ['copy-number', {isGit:true, isCopy:1}]])
   add('reverse-truthy-'+id, {op:'reversePatch', patch:{oldFileName:'a/x', newFileName:'b/y', ...flags, isCreate:true, hunks:[{oldStart:1, oldLines:1, newStart:1, newLines:1, lines:['-a', '+b']}]}})

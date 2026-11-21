@@ -35,6 +35,7 @@ js_bindings! {
     #[js(call="Object.keys")] fn keys(o:JsValue)->JsValue;
     #[js(method="sort")] fn sort_keys(v:JsValue)->JsValue;
     #[js(call="Array.isArray")] fn is_array(o:JsValue)->bool;
+    #[js(method="toLowerCase")] fn to_lower_case(v:JsValue)->JsValue;
     #[js(call="JSON.stringify")] fn json(v:JsValue)->JsValue;
     #[js(call="JSON.stringify")] fn pretty(v:JsValue,replacer:JsValue,space:u32)->JsValue;
 }
@@ -129,13 +130,16 @@ fn write_change(kind: u8, count: usize, value: JsValue) -> JsValue {
 }
 fn array_diff(a: JsValue, b: JsValue, o: &Options) -> JsValue {
     // Elements compare by their JSON text, which is `===` for JSON scalars. With ignoreCase,
-    // strings also compare lowercased (the JSON text of a lowercased string is the lowercased
-    // JSON text).
+    // elements are strings (CONTRACT.md) and compare by JS `toLowerCase()`.
     let values = |v: JsValue| {
         let mut out = Vec::new();
         for i in 0..len(v) {
-            let key = text(json(at(v, i)));
-            out.push(if o.ignore_case { key.to_lowercase() } else { key })
+            let item = at(v, i);
+            out.push(if o.ignore_case {
+                text(to_lower_case(item))
+            } else {
+                text(json(item))
+            })
         }
         out
     };

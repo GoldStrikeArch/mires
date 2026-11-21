@@ -206,11 +206,10 @@ run input =
                     Differ.myers (Array.map key old) (Array.map key new) o.individual
 
                 -- Elements compare by their JSON text, which is === for JSON scalars. With
-                -- ignoreCase, strings also compare lowercased (the JSON text of a lowercased
-                -- string is the lowercased JSON text).
+                -- ignoreCase, elements are strings (CONTRACT.md) and compare by String.toLower.
                 key v =
                     if o.ignoreCase then
-                        String.toLower (E.encode 0 v)
+                        D.decodeValue D.string v |> Result.map String.toLower |> Result.withDefault (E.encode 0 v)
 
                     else
                         E.encode 0 v
