@@ -2026,7 +2026,7 @@ impl Planner<'_> {
                         !descriptor.layout.has_own_drop
                     }
                 }),
-            BodySemantic::Ordinary => false,
+            BodySemantic::Ordinary | BodySemantic::PanicImpl => false,
         }
     }
 

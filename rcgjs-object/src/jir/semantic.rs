@@ -139,6 +139,8 @@ pub enum BodySemantic {
     Ordinary,
     Standard(StandardOperation),
     DropGlue(TypeId),
+    /// The crate graph's `#[panic_handler]` (`LangItem::PanicImpl`).
+    PanicImpl,
 }
 
 /// Standard-library operation families eligible for native representation analysis.

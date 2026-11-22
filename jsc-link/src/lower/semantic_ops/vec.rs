@@ -512,7 +512,9 @@ pub(super) fn vec_element<'a>(cx: &LowerCx<'a>) -> Result<&'a TypeDescriptor, Se
         BodySemantic::Standard(operation) => {
             return Err(SemanticDecline::UnsupportedOperation(operation));
         }
-        BodySemantic::Ordinary => return Err(SemanticDecline::NotAStandardOperation),
+        BodySemantic::Ordinary | BodySemantic::PanicImpl => {
+            return Err(SemanticDecline::NotAStandardOperation)
+        }
     };
     element_of_vec_type(cx, vector_ty)
 }

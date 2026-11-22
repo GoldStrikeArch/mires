@@ -46,6 +46,12 @@ function verify(rt) {
   assert.equal(rt.abort_error(trap), trap);
   assert.deepEqual(Object.getOwnPropertyDescriptors(trap), descriptors);
   assert.equal(rt.is_abort(trap), true);
+  for (const prim of ['boom', null, undefined, 42, false, Symbol('s')]) {
+    const wrapped = rt.abort_error(prim);
+    assert.ok(wrapped instanceof Error || Object.getPrototypeOf(wrapped).constructor.name === 'Error');
+    assert.equal(wrapped.message, String(prim));
+    assert.equal(rt.is_abort(wrapped), true);
+  }
   for (const run of [() => rt.prefix(null, 0, 0),
     () => rt.native_str_truncate({text: '\u03b1'}, 1),
     () => rt.native_vec_set_capacity({len: 2}, 1),

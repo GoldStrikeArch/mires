@@ -35,6 +35,9 @@ globalThis.__rt._abort_errors = () => {
 };
 
 globalThis.__rt.abort_error = (error) => {
+  if (error === null || (typeof error !== "object" && typeof error !== "function")) {
+    error = new Error(String(error));
+  }
   __rt._abort_errors().add(error);
   return error;
 };

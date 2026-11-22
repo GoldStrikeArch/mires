@@ -62,7 +62,13 @@ pub(crate) fn codegen_fn<'tcx>(cgu: &CguCx<'tcx>, instance: Instance<'tcx>) -> J
     let fx = FnCx::new(cgu, instance, mir);
     let name = cgu.namer.fn_name(instance);
 
-    let body = fx.codegen_body();
+    let mut body = fx.codegen_body();
+    if matches!(
+        instance.def,
+        ty::InstanceKind::Item(def_id) if tcx.lang_items().panic_impl() == Some(def_id)
+    ) {
+        body = jsast::wrap_panic_impl_body(body);
+    }
     let params = fx.params();
     // Only an entry point is described: a `.d.ts` is about the module's interface, and an internal
     // item is renamed by the minifier and exported by nothing.

@@ -30,6 +30,8 @@ pub enum HostOperation {
     /// `JsUint8Array::copy_to_slice`: a `Uint8Array`'s bytes copied into a Rust byte slice of
     /// the same length by one runtime call (`__rt.u8array_into_bytes`).
     Uint8ArrayIntoBytes,
+    /// `mires_js::abort`: terminates execution with a registered compiler abort (`__rt.js_abort`).
+    Abort,
 }
 
 impl HostOperation {
@@ -56,6 +58,7 @@ impl HostOperation {
             "u8arrayfrombytes" => Self::Uint8ArrayFromBytes,
             "u8arraylength" => Self::Uint8ArrayLength,
             "u8arrayintobytes" => Self::Uint8ArrayIntoBytes,
+            "abort" => Self::Abort,
             _ => return None,
         })
     }
@@ -112,6 +115,7 @@ impl HostOperation {
                 | Self::IsInteger
                 | Self::Erase
                 | Self::Uint8ArrayFromBytes
+                | Self::Abort
         )
     }
 
@@ -184,6 +188,21 @@ impl HostOperation {
             Self::Uint8ArrayFromBytes => jsast::rt_call("u8array_from_bytes", vec![one()]),
             Self::Uint8ArrayLength => jsast::rt_call("u8array_length", vec![one()]),
             Self::Uint8ArrayIntoBytes => jsast::rt_call("u8array_into_bytes", values.to_vec()),
+            Self::Abort => {
+                let message = match one() {
+                    literal @ Expr::Str(_) => literal,
+                    value => jsast::cond(
+                        jsast::binary(
+                            BinOp::StrictEq,
+                            jsast::unary(UnOp::TypeOf, value.clone()),
+                            jsast::string("string"),
+                        ),
+                        value,
+                        jsast::string(""),
+                    ),
+                };
+                jsast::rt_call("js_abort", vec![message])
+            }
             Self::Invoke | Self::Construct => {
                 let arguments = values.last().unwrap();
                 let array = if array {
@@ -343,6 +362,7 @@ assert.deepEqual(trace, [0, 1, 'construct']);
             "u8arrayfrombytes",
             "u8arraylength",
             "u8arrayintobytes",
+            "abort",
         ] {
             let operation = HostOperation::from_marker(marker).unwrap();
             assert!(operation
@@ -390,8 +410,21 @@ assert.deepEqual(trace, [0, 1, 'construct']);
             "stricteq",
             "isstring",
             "erase",
+            "abort",
         ] {
             assert!(!HostOperation::from_marker(marker).unwrap().may_throw());
         }
+        assert_eq!(
+            jsast::expr_to_string(
+                &HostOperation::Abort
+                    .lower(vec![jsast::string("boom")])
+                    .unwrap()
+            ),
+            "__rt.js_abort(\"boom\")"
+        );
+        assert_eq!(
+            spelled(HostOperation::Abort),
+            "__rt.js_abort(typeof a0 === \"string\" ? a0 : \"\")"
+        );
     }
 }

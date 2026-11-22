@@ -344,6 +344,16 @@ pub fn throw_value(value: JsValue) -> ! {
     host_throw(value)
 }
 
+/// Aborts the Rust program with `message` via `__rt.js_abort`, without running `Drop` handlers.
+///
+/// Unlike [`throw_value`], the thrown error is registered as a compiler abort (`__rt.abort_error`),
+/// so every unwind frame rethrows it immediately without running cleanup.
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.host.abort")]
+#[inline(never)]
+pub fn abort(message: &str) -> ! {
+    host_abort(message)
+}
+
 macro_rules! marker {
     ($name:ident($($arg:ident: $ty:ty),* $(,)?) -> $result:ty, $section:literal, $body:block) => {
         #[cfg_attr(target_arch = "wasm32", link_section = $section)]
@@ -614,6 +624,11 @@ where
 
 marker!(host_throw(value: JsValue) -> !, "rcgjs.host.throw", {
     let _ = value;
+    unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
+});
+
+marker!(host_abort(message: &str) -> !, "rcgjs.host.abort", {
+    let _ = message;
     unreachable!("mires-js host markers are only meaningful to rustc_codegen_js")
 });
 

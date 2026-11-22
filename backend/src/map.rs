@@ -46,13 +46,16 @@ pub(crate) fn map_section(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
 ///
 /// `get` and `getmut` are one member: the two differ in the Rust type they hand back and not in
 /// what the host does, and a `Map` has one read.
-fn rt_member(marker: &str) -> Option<&'static str> {
+fn rt_member(marker: &str) -> Option<(&'static str, usize)> {
     Some(match marker {
-        "has" => "map_has",
-        "set" => "map_set",
-        "get" | "getmut" => "map_get",
-        "del" => "map_del",
-        "keys" => "map_keys",
+        "new" => ("map_new", 0),
+        "len" => ("map_len", 1),
+        "clear" => ("map_clear", 1),
+        "has" => ("map_has", 2),
+        "set" => ("map_set", 3),
+        "get" | "getmut" => ("map_get", 2),
+        "del" => ("map_del", 2),
+        "keys" => ("map_keys", 1),
         _ => return None,
     })
 }
@@ -99,11 +102,17 @@ impl<'tcx> FnCx<'_, 'tcx> {
         args: &[Spanned<mir::Operand<'tcx>>],
         destination: mir::Place<'tcx>,
     ) -> Vec<Stmt> {
-        let Some(member) = rt_member(marker) else {
+        let Some((member, arity)) = rt_member(marker) else {
             return vec![jsast::expr_stmt(self.zombie(format!(
                 "`{MAP_PREFIX}{marker}` is not a `mires-js` collection marker this backend knows"
             )))];
         };
+        if args.len() != arity {
+            return vec![jsast::expr_stmt(self.zombie(format!(
+                "`{MAP_PREFIX}{marker}` expects {arity} arguments, got {}",
+                args.len()
+            )))];
+        }
         let key = key_argument(marker);
 
         let mut lowered: Vec<Expr> = Vec::with_capacity(args.len());

@@ -26,8 +26,8 @@ use crate::jir::interns::{Interns, StrId};
 use crate::jir::interp::{self, Hooks, Trap, Value};
 use crate::jir::repr::{Dominators, Func, FuncBuilder, Op, OpKind, RBlockId, RTerm, ValueId};
 use crate::jir::semantic::{
-    AbiSignature, BinaryOp, BodyKind, CallSemantic, Callee, ConstTree, DefinitionId, DirectItemRef,
-    DropGlue, HostPayload, ItemId, Signature, TypeId, VtableEntry,
+    AbiSignature, BinaryOp, BodyKind, BodySemantic, CallSemantic, Callee, ConstTree, DefinitionId,
+    DirectItemRef, DropGlue, HostPayload, ItemId, Signature, TypeId, VtableEntry,
 };
 use crate::jir::types::{IteratorIdentity, TypeKind};
 use crate::jir::{OriginId, TypeTable};
@@ -1145,6 +1145,18 @@ fn drain_callee_queue(
     queue: &mut VecDeque<JsName>,
 ) -> Result<(), String> {
     while let Some(callee_name) = queue.pop_front() {
+        // `LangItem::PanicImpl` bodies are wrapped in `try { ... } catch ($e) { throw
+        // __rt.abort_error($e); }` at emission time (unless already an unconditional literal
+        // abort), so they can never propagate a catchable host exception.
+        if cx
+            .table
+            .get(&callee_name)
+            .filter(|item| item.kind == ItemKind::Fn)
+            .and_then(|item| item.jir.body.as_ref())
+            .is_some_and(|body| body.semantic == BodySemantic::PanicImpl)
+        {
+            continue;
+        }
         if let Some(Ok(callee_func)) = cx.pre_funcs.get(&callee_name) {
             let callee_interns = cx
                 .table
@@ -1465,6 +1477,15 @@ fn check_op_no_throw(
 }
 
 fn verify_host_payload_no_throw(payload: &HostPayload, interns: &Interns) -> Result<(), String> {
+    if let HostPayload::Map { marker } = payload {
+        let op = interns
+            .str(*marker)
+            .ok_or_else(|| "unresolvable map marker payload".to_owned())?;
+        return match op {
+            "new" | "len" | "clear" | "has" | "set" | "get" | "getmut" | "del" | "keys" => Ok(()),
+            other => Err(format!("unrecognized map marker `{other}` may throw")),
+        };
+    }
     let HostPayload::Marker {
         section,
         template: None,
@@ -1514,10 +1535,17 @@ fn witness_sysroot_shim_is_non_throwing(sym: &str) -> bool {
             | "copy"
             | "copy_nonoverlapping"
             | "write_bytes"
+            | "compare_bytes"
             | "overwrite"
             | "_put"
             | "box"
+            | "prefix"
+            | "unproject"
+            | "erase"
+            | "unref"
             | "unscale"
+            | "unscale_scalar"
+            | "unscale_uninit"
             | "scale"
             | "scale_scalar"
             | "byte_sign"
@@ -1537,14 +1565,54 @@ fn witness_sysroot_shim_is_non_throwing(sym: &str) -> bool {
             | "thin"
             | "tail_raw"
             | "tail_ref"
+            | "tail_slice"
             | "read_array"
+            | "array_ref"
             | "write_array"
+            | "unwindow"
+            | "unwindow_slice"
             | "byte_slice_ref"
             | "str_bytes"
             | "str_bytes_mut"
+            | "detach_str_memo"
             | "bytes_str"
             | "str_len"
+            | "bstr_in"
+            | "bstr_out"
+            | "bstr_char"
+            | "bstr_bytes"
+            | "bstr_bytes_mut"
+            | "bstr_of"
+            | "bstr_boundary"
+            | "bstr_get"
+            | "bstr_get_from"
+            | "bstr_get_to"
+            | "bytes_is_ascii"
+            | "bstr_trim"
+            | "bstr_trim_start"
+            | "bstr_trim_end"
+            | "bstr_push"
+            | "bstr_pop"
+            | "bstr_truncate"
+            | "bstr_host_sb"
+            | "bstr_block"
+            | "bstr_sb_block"
+            | "bstr_sb_check"
+            | "sb_new"
+            | "sb_push"
+            | "sb_push_char"
+            | "sb_take"
+            | "map_new"
+            | "map_len"
+            | "map_clear"
+            | "map_has"
+            | "map_set"
+            | "map_get"
+            | "map_del"
+            | "map_keys"
             | "f2i"
+            | "f2i_big"
+            | "i2f32_big"
             | "fmod"
             | "fmodf"
             | "clone"

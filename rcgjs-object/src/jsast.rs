@@ -2554,6 +2554,58 @@ pub fn throw_abort(message: impl Into<String>) -> Stmt {
     ))
 }
 
+/// Wraps a `#[panic_handler]` (`LangItem::PanicImpl`) body so any exception escaping it is
+/// registered via `__rt.abort_error` and rethrown as a non-unwinding compiler abort
+/// (`CONTRACT.md`: "A Rust panic is still an abort").
+///
+/// Bodies whose statements are already unconditional literal aborts (`__rt.js_abort("...")` or
+/// `throw __rt.abort_error(new Error("..."))`) are left unwrapped.
+pub fn wrap_panic_impl_body(body: Vec<Stmt>) -> Vec<Stmt> {
+    fn is_unconditional_abort(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::ExprStmt(Expr::Call(callee, args)) => {
+                matches!(
+                    callee.as_ref(),
+                    Expr::Member(object, field)
+                        if matches!(object.as_ref(), Expr::Ident(ns) if ns == "__rt")
+                            && field == "js_abort"
+                ) && args.len() == 1
+                    && matches!(args[0], Expr::Str(_))
+            }
+            Stmt::Throw(Expr::Call(callee, args)) => {
+                matches!(
+                    callee.as_ref(),
+                    Expr::Member(object, field)
+                        if matches!(object.as_ref(), Expr::Ident(ns) if ns == "__rt")
+                            && field == "abort_error"
+                ) && args.len() == 1
+                    && matches!(
+                        &args[0],
+                        Expr::New(callee, args)
+                            if matches!(callee.as_ref(), Expr::Ident(name) if name == "Error")
+                                && args.len() == 1
+                                && matches!(args[0], Expr::Str(_))
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    let meaningful: Vec<&Stmt> = body
+        .iter()
+        .filter(|stmt| !matches!(stmt, Stmt::Loc(_) | Stmt::Comment(_)))
+        .collect();
+    if !meaningful.is_empty() && meaningful.iter().all(|stmt| is_unconditional_abort(stmt)) {
+        return body;
+    }
+
+    vec![Stmt::TryCatch {
+        body,
+        binding: "$e".to_owned(),
+        handler: vec![throw(rt_call("abort_error", vec![id("$e")]))],
+    }]
+}
+
 /// A top level function declaration.
 pub fn function(name: impl Into<String>, params: Vec<String>, body: Vec<Stmt>) -> Stmt {
     Stmt::FunctionDecl {

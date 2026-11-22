@@ -123,7 +123,9 @@ fn box_pointee<'a>(cx: &LowerCx<'a>) -> Result<&'a TypeDescriptor, SemanticDecli
         BodySemantic::Standard(operation) => {
             return Err(SemanticDecline::UnsupportedOperation(operation));
         }
-        BodySemantic::Ordinary => return Err(SemanticDecline::NotAStandardOperation),
+        BodySemantic::Ordinary | BodySemantic::PanicImpl => {
+            return Err(SemanticDecline::NotAStandardOperation)
+        }
     };
     let descriptor = type_get(cx.table, dropped)?;
     if descriptor.meta.candidate != RepresentationCandidate::Box

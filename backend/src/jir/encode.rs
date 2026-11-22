@@ -344,13 +344,13 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         let inline_never = matches!(
             self.instance().def,
             ty::InstanceKind::Item(def_id)
-                if matches!(
+                if (matches!(
                     self.tcx().def_kind(def_id),
                     rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
                 ) && matches!(
                     self.tcx().codegen_fn_attrs(def_id).inline,
                     rustc_hir::attrs::InlineAttr::Never
-                )
+                )) || self.tcx().lang_items().panic_impl() == Some(def_id)
         );
         let parameters = mir
             .arg_count
@@ -370,6 +370,13 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
     fn body_semantic(&mut self) -> Result<BodySemantic, EncodeDecline> {
         if let ty::InstanceKind::Shim(ty::ShimKind::DropGlue(_, Some(ty))) = self.instance().def {
             return Ok(BodySemantic::DropGlue(self.type_id(ty)?));
+        }
+        if matches!(
+            self.instance().def,
+            ty::InstanceKind::Item(def_id)
+                if self.tcx().lang_items().panic_impl() == Some(def_id)
+        ) {
+            return Ok(BodySemantic::PanicImpl);
         }
         Ok(crate::late_ir::standard_operation(
             self.tcx(),

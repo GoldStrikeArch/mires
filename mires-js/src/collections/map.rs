@@ -25,7 +25,7 @@ impl<K: MapKey, V> HashMap<K, V> {
     #[must_use]
     pub fn new() -> HashMap<K, V> {
         HashMap {
-            raw: unsafe { raw::map_new() },
+            raw: raw::map_new(),
             marker: PhantomData,
         }
     }
@@ -33,7 +33,7 @@ impl<K: MapKey, V> HashMap<K, V> {
     /// How many entries the map holds.
     #[must_use]
     pub fn len(&self) -> usize {
-        unsafe { raw::map_len(self.raw) }
+        raw::map_len(self.raw)
     }
 
     /// Whether the map holds nothing.
@@ -44,7 +44,7 @@ impl<K: MapKey, V> HashMap<K, V> {
 
     /// Removes every entry.
     pub fn clear(&mut self) {
-        unsafe { raw::map_clear(self.raw) }
+        raw::map_clear(self.raw)
     }
 
     /// Inserts a value, returning the one the key held before.

@@ -16,7 +16,7 @@ use crate::jir::decline::Decline;
 use crate::jir::interns::{Interns, StrId};
 use crate::jir::repr::{Func, Op, OpKind, RBlockId, RTerm, ValueId};
 use crate::jir::semantic::{
-    BodyKind, CallSemantic, Callee, DropGlue, HostPayload, ItemId, VtableEntry,
+    BodyKind, BodySemantic, CallSemantic, Callee, DropGlue, HostPayload, ItemId, VtableEntry,
 };
 use crate::jir::types::{TypeId, TypeKind, TypeTable};
 use crate::late_ir::AllocatorProvider;
@@ -34,6 +34,11 @@ pub(crate) struct PruneInvokeStats {
 /// Any panic/abort helper here throws an `AbortError`, which every `TryCatch` handler
 /// immediately rethrows (`if (__rt.is_abort($caught)) throw $caught;`) without running `Drop`s.
 /// Consulted ONLY for `Callee::Runtime { sysroot: true, .. }`.
+///
+/// Deliberately excluded after line-by-line audit of `runtime/shim.js`:
+/// - `bstr_utf8_bytes`, `bstr_str_in`: throw bare `TypeError` on non-string values.
+/// - `bstr_ref`, `bstr_ref_in`: construct Proxy membranes / call `bstr_str_in` / `Reflect.*`.
+/// - `bstr_sub`, `bstr_sub_from`, `bstr_sub_to`: invoke caller-supplied `fail` callback argument.
 pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
     matches!(
         sym,
@@ -56,10 +61,17 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "copy"
             | "copy_nonoverlapping"
             | "write_bytes"
+            | "compare_bytes"
             | "overwrite"
             | "_put"
             | "box"
+            | "prefix"
+            | "unproject"
+            | "erase"
+            | "unref"
             | "unscale"
+            | "unscale_scalar"
+            | "unscale_uninit"
             | "scale"
             | "scale_scalar"
             | "byte_sign"
@@ -79,14 +91,54 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "thin"
             | "tail_raw"
             | "tail_ref"
+            | "tail_slice"
             | "read_array"
+            | "array_ref"
             | "write_array"
+            | "unwindow"
+            | "unwindow_slice"
             | "byte_slice_ref"
             | "str_bytes"
             | "str_bytes_mut"
+            | "detach_str_memo"
             | "bytes_str"
             | "str_len"
+            | "bstr_in"
+            | "bstr_out"
+            | "bstr_char"
+            | "bstr_bytes"
+            | "bstr_bytes_mut"
+            | "bstr_of"
+            | "bstr_boundary"
+            | "bstr_get"
+            | "bstr_get_from"
+            | "bstr_get_to"
+            | "bytes_is_ascii"
+            | "bstr_trim"
+            | "bstr_trim_start"
+            | "bstr_trim_end"
+            | "bstr_push"
+            | "bstr_pop"
+            | "bstr_truncate"
+            | "bstr_host_sb"
+            | "bstr_block"
+            | "bstr_sb_block"
+            | "bstr_sb_check"
+            | "sb_new"
+            | "sb_push"
+            | "sb_push_char"
+            | "sb_take"
+            | "map_new"
+            | "map_len"
+            | "map_clear"
+            | "map_has"
+            | "map_set"
+            | "map_get"
+            | "map_del"
+            | "map_keys"
             | "f2i"
+            | "f2i_big"
+            | "i2f32_big"
             | "fmod"
             | "fmodf"
             | "clone"
@@ -140,24 +192,45 @@ fn type_contains_fn_ptr(ty: TypeId, types: &TypeTable, seen: &mut BTreeSet<TypeI
     }
 }
 
+/// Whether `name` is the crate graph's `#[panic_handler]` (`LangItem::PanicImpl`), established
+/// strictly from the rustc semantic tag (`BodySemantic::PanicImpl`), never from symbol names.
+///
+/// Both the JIR and baseline emitters wrap `PanicImpl` bodies in `try { ... } catch ($e) { throw
+/// __rt.abort_error($e); }` (unless already an unconditional literal abort), so calling one can
+/// only diverge or raise a registered abort — never a catchable host exception.
+fn is_panic_impl_item(table: &BTreeMap<JsName, LinkItem>, name: &JsName) -> bool {
+    table
+        .get(name)
+        .filter(|item| item.kind == ItemKind::Fn)
+        .and_then(|item| item.jir.body.as_ref())
+        .is_some_and(|body| body.semantic == BodySemantic::PanicImpl)
+}
+
 fn host_payload_cannot_throw(payload: &HostPayload, interns: &Interns) -> bool {
-    let HostPayload::Marker {
-        section,
-        template: None,
-        helpers,
-        ..
-    } = payload
-    else {
-        return false;
-    };
-    if !helpers.is_empty() {
-        return false;
+    match payload {
+        HostPayload::Map { marker } => interns.str(*marker).is_some_and(|m| {
+            matches!(
+                m,
+                "new" | "len" | "clear" | "has" | "set" | "get" | "getmut" | "del" | "keys"
+            )
+        }),
+        HostPayload::Marker {
+            section,
+            template: None,
+            helpers,
+            ..
+        } => {
+            if !helpers.is_empty() {
+                return false;
+            }
+            interns
+                .str(*section)
+                .and_then(|s| s.strip_prefix("rcgjs.host."))
+                .and_then(rcgjs_object::host::HostOperation::from_marker)
+                .is_some_and(|op| !op.may_throw())
+        }
+        _ => false,
     }
-    interns
-        .str(*section)
-        .and_then(|s| s.strip_prefix("rcgjs.host."))
-        .and_then(rcgjs_object::host::HostOperation::from_marker)
-        .is_some_and(|op| !op.may_throw())
 }
 
 /// Prunes `RTerm::Invoke` terminators whose protected operation cannot throw a catchable host
@@ -327,6 +400,9 @@ pub(crate) fn run_checked(
     }
 
     let target_name_throws = |target: &JsName, may_throw: &BTreeSet<JsName>| -> bool {
+        if is_panic_impl_item(table, target) {
+            return false;
+        }
         if ok_funcs.contains(target) {
             return may_throw.contains(target);
         }
@@ -499,7 +575,7 @@ pub(crate) fn run_checked(
     loop {
         let mut changed = false;
         for (name, res) in funcs.iter() {
-            if may_throw_host.contains(name) {
+            if may_throw_host.contains(name) || is_panic_impl_item(table, name) {
                 continue;
             }
             let Ok(func) = res else { continue };
@@ -3390,6 +3466,349 @@ mod tests {
                         "forged ProtectedOpCannotThrow with {provider:?} must fail witness check"
                     );
                 }
+            }
+        }
+    }
+
+    fn semantic_body(item: ItemId, unit: TypeId, semantic: BodySemantic) -> crate::jir::Body {
+        crate::jir::Body {
+            item,
+            kind: BodyKind::Function,
+            semantic,
+            signature: Signature {
+                arguments: Vec::new(),
+                result: unit,
+                abi: AbiSignature::default(),
+            },
+            locals: Vec::new(),
+            blocks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prunes_invoke_calling_semantic_panic_impl_even_when_it_throws_host_value() {
+        // Real `#[panic_handler]` tagged with `BodySemantic::PanicImpl` calling a host throw:
+        // emission wraps it in `try { ... } catch ($e) { throw __rt.abort_error($e); }`, so both
+        // `prune_invoke` and the independent witness treat callers as non-host-throwing.
+        let mut panic_interns = Interns::new();
+        let unit_p = unit_types(&mut panic_interns);
+        let host_throw = panic_interns.intern_str("rcgjs.host.throw");
+        let mut pb = FuncBuilder::new(
+            item_id(200),
+            Signature {
+                arguments: Vec::new(),
+                result: unit_p,
+                abi: AbiSignature::default(),
+            },
+        );
+        pb.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item_id(201),
+                    link_name: host_throw,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Host,
+                host: Some(HostPayload::Marker {
+                    section: host_throw,
+                    def: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 201,
+                    },
+                    template: None,
+                    helpers: Vec::new(),
+                }),
+            },
+            O,
+        );
+        pb.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let panic_fn = pb.finish();
+
+        let mut drop_interns = Interns::new();
+        let unit_d = unit_types(&mut drop_interns);
+        let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+        let mut caller_interns = Interns::new();
+        let unit_c = unit_types(&mut caller_interns);
+        let panic_sym = caller_interns.intern_str("custom_panic_handler_symbol");
+        let caller = build_caller_with_cleanup_drop(
+            &mut caller_interns,
+            unit_c,
+            Callee::Foreign {
+                definition: DefinitionId {
+                    crate_id: 0,
+                    local_hash: 200,
+                },
+                symbol: panic_sym,
+            },
+            "real_drop",
+        );
+
+        let mut panic_item = test_item("custom_panic_handler_symbol", panic_interns);
+        panic_item.jir.body = Some(semantic_body(item_id(200), unit_p, BodySemantic::PanicImpl));
+
+        let mut table = BTreeMap::new();
+        table.insert(
+            JsName::new("custom_panic_handler_symbol".to_owned()),
+            panic_item,
+        );
+        table.insert(
+            JsName::new("real_drop".to_owned()),
+            test_item("real_drop", drop_interns),
+        );
+        table.insert(
+            JsName::new("caller".to_owned()),
+            test_item("caller", caller_interns),
+        );
+
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            JsName::new("custom_panic_handler_symbol".to_owned()),
+            Ok(panic_fn),
+        );
+        funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+        funcs.insert(JsName::new("caller".to_owned()), Ok(caller));
+
+        let live: BTreeSet<JsName> = table.keys().cloned().collect();
+        let stats = run_checked(&table, &mut funcs, &live);
+        assert_eq!(stats.modified, 1);
+        assert_eq!(stats.witnesses_recorded, 1);
+        assert_eq!(stats.witnesses_failed, 0);
+        assert!(!funcs[&JsName::new("caller".to_owned())]
+            .as_ref()
+            .unwrap()
+            .has_invoke());
+    }
+
+    #[test]
+    fn prunes_map_markers_and_abort_host_op_and_rejects_unknown_map_marker() {
+        for (marker, should_prune) in [
+            ("new", true),
+            ("len", true),
+            ("clear", true),
+            ("has", true),
+            ("set", true),
+            ("get", true),
+            ("getmut", true),
+            ("del", true),
+            ("keys", true),
+            ("evil_unknown", false),
+        ] {
+            let mut drop_interns = Interns::new();
+            let unit_d = unit_types(&mut drop_interns);
+            let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+            let mut caller_interns = Interns::new();
+            let unit_c = unit_types(&mut caller_interns);
+            let marker_str = caller_interns.intern_str(marker);
+            let drop_str = caller_interns.intern_str("real_drop");
+            let mut cb = FuncBuilder::new(
+                item_id(210),
+                Signature {
+                    arguments: Vec::new(),
+                    result: unit_c,
+                    abi: AbiSignature::default(),
+                },
+            );
+            let entry = FuncBuilder::ENTRY;
+            let normal = cb.block();
+            let unwind = cb.block();
+            cb.effect(
+                entry,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: item_id(211),
+                        link_name: marker_str,
+                    },
+                    function: None,
+                    args: Vec::new(),
+                    track_caller: None,
+                    semantic: CallSemantic::Host,
+                    host: Some(HostPayload::Map { marker: marker_str }),
+                },
+                O,
+            );
+            cb.terminate(
+                entry,
+                RTerm::Invoke {
+                    normal: (normal, Vec::new()),
+                    unwind: (unwind, Vec::new()),
+                },
+            );
+            cb.terminate(normal, RTerm::Return(None));
+            let val = cb.op(
+                unwind,
+                OpKind::Const(crate::jir::semantic::ConstTree::Aggregate(Vec::new())),
+                unit_c,
+                O,
+            );
+            cb.effect(
+                unwind,
+                OpKind::Drop {
+                    root: crate::jir::repr::Root::Value(val),
+                    path: Vec::new(),
+                    glue: DropGlue::Direct {
+                        item: item_id(212),
+                        link_name: drop_str,
+                    },
+                },
+                O,
+            );
+            cb.terminate(unwind, RTerm::Throw(None));
+            let caller = cb.finish();
+
+            let mut table = BTreeMap::new();
+            table.insert(
+                JsName::new("real_drop".to_owned()),
+                test_item("real_drop", drop_interns),
+            );
+            let caller_item = test_item("caller", caller_interns);
+            let caller_interns_ref = caller_item.jir.interns().unwrap().clone();
+            table.insert(JsName::new("caller".to_owned()), caller_item);
+
+            let mut funcs = BTreeMap::new();
+            funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+            funcs.insert(JsName::new("caller".to_owned()), Ok(caller.clone()));
+
+            let live: BTreeSet<JsName> = table.keys().cloned().collect();
+            let stats = run_checked(&table, &mut funcs, &live);
+            let updated = funcs[&JsName::new("caller".to_owned())].as_ref().unwrap();
+            if should_prune {
+                assert_eq!(stats.modified, 1, "map marker `{marker}` must prune");
+                assert_eq!(stats.witnesses_failed, 0);
+                assert!(!updated.has_invoke());
+            } else {
+                assert_eq!(
+                    stats.modified, 0,
+                    "unknown map marker `{marker}` must NOT prune"
+                );
+                assert!(updated.has_invoke());
+                let forged = [InvokePrunedSite {
+                    block: FuncBuilder::ENTRY,
+                    reason: InvokePruneReason::ProtectedOpCannotThrow,
+                }];
+                assert!(witness::check_invoke_pruning(
+                    &caller,
+                    &caller_interns_ref,
+                    &forged,
+                    &table,
+                    &funcs,
+                    &live,
+                )
+                .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn audited_sysroot_bstr_and_ptr_helpers_prune_while_throwing_bstr_helpers_stay_preserved() {
+        let safe_helpers = [
+            "bstr_bytes",
+            "bstr_of",
+            "bstr_in",
+            "bstr_out",
+            "bstr_boundary",
+            "bstr_get",
+            "bstr_get_from",
+            "bstr_get_to",
+            "bytes_is_ascii",
+            "bstr_trim",
+            "bstr_trim_start",
+            "bstr_trim_end",
+            "unscale_scalar",
+            "unscale_uninit",
+            "compare_bytes",
+            "tail_slice",
+            "unwindow",
+            "unwindow_slice",
+            "array_ref",
+            "map_new",
+            "map_has",
+            "map_get",
+            "map_set",
+            "map_del",
+            "map_len",
+            "map_clear",
+            "map_keys",
+        ];
+        let unsafe_helpers = [
+            "bstr_utf8_bytes",
+            "bstr_str_in",
+            "bstr_ref",
+            "bstr_ref_in",
+            "bstr_sub",
+            "bstr_sub_from",
+            "bstr_sub_to",
+            "u8array_length",
+            "u8array_into_bytes",
+        ];
+        for (sym, should_prune) in safe_helpers
+            .iter()
+            .map(|&s| (s, true))
+            .chain(unsafe_helpers.iter().map(|&s| (s, false)))
+        {
+            let mut drop_interns = Interns::new();
+            let unit_d = unit_types(&mut drop_interns);
+            let real_drop = build_non_empty_drop(&mut drop_interns, unit_d);
+
+            let mut caller_interns = Interns::new();
+            let unit_c = unit_types(&mut caller_interns);
+            let sym_id = caller_interns.intern_str(sym);
+            let caller = build_caller_with_cleanup_drop(
+                &mut caller_interns,
+                unit_c,
+                Callee::Runtime {
+                    member: sym_id,
+                    sysroot: true,
+                },
+                "real_drop",
+            );
+
+            let mut table = BTreeMap::new();
+            table.insert(
+                JsName::new("real_drop".to_owned()),
+                test_item("real_drop", drop_interns),
+            );
+            let caller_item = test_item("caller", caller_interns);
+            let caller_interns_ref = caller_item.jir.interns().unwrap().clone();
+            table.insert(JsName::new("caller".to_owned()), caller_item);
+
+            let mut funcs = BTreeMap::new();
+            funcs.insert(JsName::new("real_drop".to_owned()), Ok(real_drop));
+            funcs.insert(JsName::new("caller".to_owned()), Ok(caller.clone()));
+
+            let live: BTreeSet<JsName> = table.keys().cloned().collect();
+            let stats = run_checked(&table, &mut funcs, &live);
+            let updated = funcs[&JsName::new("caller".to_owned())].as_ref().unwrap();
+            if should_prune {
+                assert_eq!(
+                    stats.modified, 1,
+                    "audited sysroot helper `{sym}` must prune"
+                );
+                assert_eq!(stats.witnesses_failed, 0);
+                assert!(!updated.has_invoke());
+            } else {
+                assert_eq!(
+                    stats.modified, 0,
+                    "throwing/callback sysroot helper `{sym}` must NOT prune"
+                );
+                assert!(updated.has_invoke());
+                let forged = [InvokePrunedSite {
+                    block: FuncBuilder::ENTRY,
+                    reason: InvokePruneReason::ProtectedOpCannotThrow,
+                }];
+                assert!(witness::check_invoke_pruning(
+                    &caller,
+                    &caller_interns_ref,
+                    &forged,
+                    &table,
+                    &funcs,
+                    &live,
+                )
+                .is_err());
             }
         }
     }

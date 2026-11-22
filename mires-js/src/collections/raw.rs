@@ -41,15 +41,27 @@ pub(crate) struct RawMap {
     handle: u32,
 }
 
-unsafe extern "C-unwind" {
-    /// `new Map()`.
-    pub(crate) fn map_new() -> RawMap;
+/// `new Map()`.
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.new")]
+#[inline(never)]
+pub(crate) fn map_new() -> RawMap {
+    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
+}
 
-    /// `map.size`.
-    pub(crate) fn map_len(map: RawMap) -> usize;
+/// `map.size`.
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.len")]
+#[inline(never)]
+pub(crate) fn map_len(map: RawMap) -> usize {
+    let _ = map;
+    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
+}
 
-    /// `map.clear()`.
-    pub(crate) fn map_clear(map: RawMap);
+/// `map.clear()`.
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.clear")]
+#[inline(never)]
+pub(crate) fn map_clear(map: RawMap) {
+    let _ = map;
+    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }
 
 /// `map.has(key)`.

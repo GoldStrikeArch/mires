@@ -563,7 +563,9 @@ pub fn support_of(
                 RepresentationCandidate::None => Err(SemanticDecline::NotAStandardOperation),
             }
         }
-        BodySemantic::Ordinary => Err(SemanticDecline::NotAStandardOperation),
+        BodySemantic::Ordinary | BodySemantic::PanicImpl => {
+            Err(SemanticDecline::NotAStandardOperation)
+        }
     }
 }
 

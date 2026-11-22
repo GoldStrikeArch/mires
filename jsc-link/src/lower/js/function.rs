@@ -6,7 +6,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use rcgjs_object::item::JsName;
 use rcgjs_object::jir::decline::{Decline, OpClass};
 use rcgjs_object::jir::repr::Func;
-use rcgjs_object::jir::semantic::{BodyKind, VtableEntry};
+use rcgjs_object::jir::semantic::{BodyKind, BodySemantic, VtableEntry};
 use rcgjs_object::jsast::{self, ArrowBody, Expr, Stmt};
 use rcgjs_object::ptr;
 use structurizer::Region;
@@ -320,6 +320,10 @@ pub fn lower_with_ascii(
         out.push(jsast::lets(declarations));
     }
     out.extend(body);
+
+    if input.body.semantic == BodySemantic::PanicImpl {
+        out = jsast::wrap_panic_impl_body(out);
+    }
 
     let decl = jsast::function(input.name.as_str(), params, out);
     let allocation_origins = cx
