@@ -1760,9 +1760,11 @@ impl<'a> Collector<'a> {
                             let callee_sem = callee_item
                                 .and_then(|item| item.jir.body.as_ref())
                                 .map(|body| body.semantic);
-                            if let (Some(callee_item), Some(sem), Some(callee_interns)) =
-                                (callee_item, callee_sem, self.interns.get(callee_name).copied())
-                            {
+                            if let (Some(callee_item), Some(sem), Some(callee_interns)) = (
+                                callee_item,
+                                callee_sem,
+                                self.interns.get(callee_name).copied(),
+                            ) {
                                 let (crate_name, item_path) =
                                     item_origin_info(callee_item, callee_interns);
                                 let lowered_map = &self.lowered;

@@ -980,10 +980,7 @@ fn collect_sites(
                             | crate::jir::semantic::StandardOperation::FormatArgsNew
                             | crate::jir::semantic::StandardOperation::FormatArgsToString
                     ) && !(crate::lower::bstr::enabled()
-                        && matches!(
-                            std_op,
-                            crate::jir::semantic::StandardOperation::StringAsStr
-                        ))
+                        && matches!(std_op, crate::jir::semantic::StandardOperation::StringAsStr))
                 }
                 _ => false,
             };

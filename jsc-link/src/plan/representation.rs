@@ -3034,12 +3034,9 @@ impl Planner<'_> {
                                                 let Some(arg) = args.get(index) else {
                                                     continue;
                                                 };
-                                                let near = label(
-                                                    name,
-                                                    Site::Value(*arg),
-                                                    &[Step::Deref],
-                                                )
-                                                .unwrap_or(Carrier::Baseline);
+                                                let near =
+                                                    label(name, Site::Value(*arg), &[Step::Deref])
+                                                        .unwrap_or(Carrier::Baseline);
                                                 let far = callee_func
                                                     .params
                                                     .get(index)

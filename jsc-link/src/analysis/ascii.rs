@@ -181,15 +181,8 @@ where
     let mut open_items = scan.ineligible();
 
     // Locate authentic `core::str::slice_error_fail` if live and keeping its standard 4-arg ABI.
-    let slice_error_fail = find_slice_error_fail(
-        funcs,
-        table,
-        &get_interns,
-        repr,
-        abi,
-        defined,
-        live,
-    );
+    let slice_error_fail =
+        find_slice_error_fail(funcs, table, &get_interns, repr, abi, defined, live);
     if let Some(fail_name) = &slice_error_fail {
         // Outlined `StrIndex` jumps directly to `slice_error_fail` without modifying JIR calls.
         open_names.insert(fail_name.clone());
@@ -294,8 +287,7 @@ where
                     {
                         if let Some(&callee_idx) = name_to_idx.get(&target_name) {
                             let callee = funcs[&target_name];
-                            let expected =
-                                args.len() + usize::from(callee.sig.abi.caller_location);
+                            let expected = args.len() + usize::from(callee.sig.abi.caller_location);
                             if callee.params.len() == expected {
                                 for (i, &arg) in args.iter().enumerate() {
                                     incoming_calls[callee_idx][i].push((caller_idx, arg));
@@ -435,10 +427,9 @@ where
             if callers.is_empty() {
                 continue;
             }
-            if callers
-                .iter()
-                .all(|&(c_idx, arg)| states_pre_match(&names, funcs, c_idx, arg, val_ty, &get_interns))
-            {
+            if callers.iter().all(|&(c_idx, arg)| {
+                states_pre_match(&names, funcs, c_idx, arg, val_ty, &get_interns)
+            }) {
                 state.rules[v_idx] = Rule::FuncParam(callers);
             }
         }
@@ -462,7 +453,9 @@ where
                     Rule::Single(src) => states[idx].ascii[src.0 as usize],
                     Rule::BlockParam(incoming) => {
                         !incoming.is_empty()
-                            && incoming.iter().all(|&src| states[idx].ascii[src.0 as usize])
+                            && incoming
+                                .iter()
+                                .all(|&src| states[idx].ascii[src.0 as usize])
                     }
                     Rule::FuncParam(callers) => {
                         !states[idx].is_open
@@ -1614,11 +1607,18 @@ mod tests {
         let fail_path = StrId(interns.strings.len() as u32);
         interns.strings.push("str::slice_error_fail".to_owned());
         let core_fail_path = StrId(interns.strings.len() as u32);
-        interns.strings.push("core::str::slice_error_fail".to_owned());
+        interns
+            .strings
+            .push("core::str::slice_error_fail".to_owned());
         let o = OriginId(0);
 
         let mut caller_b = FuncBuilder::new(item_id(5), sig(vec![], STR_REF, false));
-        let lit = caller_b.op(FuncBuilder::ENTRY, OpKind::Const(ConstTree::Str(ascii_id)), STR_REF, o);
+        let lit = caller_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Str(ascii_id)),
+            STR_REF,
+            o,
+        );
         let idx = caller_b.op(
             FuncBuilder::ENTRY,
             OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
@@ -1690,7 +1690,12 @@ mod tests {
         );
         table.insert(
             lex_spoof_name.clone(),
-            make_fail_item(lex_spoof_name.as_str(), "aaa_audit", "str::slice_error_fail", fail_path),
+            make_fail_item(
+                lex_spoof_name.as_str(),
+                "aaa_audit",
+                "str::slice_error_fail",
+                fail_path,
+            ),
         );
         table.insert(
             crate_spoof_name.clone(),
@@ -1710,7 +1715,12 @@ mod tests {
         funcs.insert(real_name.clone(), make_fail_fn(CORE_CRATE_ID, 3, NEVER_TY));
         table.insert(
             real_name.clone(),
-            make_fail_item(real_name.as_str(), "core", "str::slice_error_fail", fail_path),
+            make_fail_item(
+                real_name.as_str(),
+                "core",
+                "str::slice_error_fail",
+                fail_path,
+            ),
         );
         assert_eq!(
             run(&funcs, &table, &interns, &roots).slice_error_fail,
@@ -1722,7 +1732,12 @@ mod tests {
         funcs.insert(dup_name.clone(), make_fail_fn(CORE_CRATE_ID, 4, NEVER_TY));
         table.insert(
             dup_name.clone(),
-            make_fail_item(dup_name.as_str(), "core", "str::slice_error_fail", fail_path),
+            make_fail_item(
+                dup_name.as_str(),
+                "core",
+                "str::slice_error_fail",
+                fail_path,
+            ),
         );
         assert_eq!(run(&funcs, &table, &interns, &roots).slice_error_fail, None);
     }

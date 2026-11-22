@@ -1365,7 +1365,9 @@ mod tests {
             assert!(collected.errors.borrow().is_empty(), "{profile}");
             assert_eq!(no_jir.str_repr, StrRepr::Utf16, "{profile}");
 
-            let (_, explicit_err) = parse_line(&format!("js-profile={profile} js-str=bytes js-lane=baseline"));
+            let (_, explicit_err) = parse_line(&format!(
+                "js-profile={profile} js-str=bytes js-lane=baseline"
+            ));
             assert_eq!(explicit_err.errors.borrow().len(), 1, "{profile}");
         }
 
@@ -1373,8 +1375,14 @@ mod tests {
         assert_eq!(collected.errors.borrow().len(), 1);
 
         // `js-str` is link-only and never joins normalized emit args or sysroot keys.
-        let with_bytes = ["js-profile=release-size".to_owned(), "js-str=bytes".to_owned()];
-        let with_utf16 = ["js-profile=release-size".to_owned(), "js-str=utf16".to_owned()];
+        let with_bytes = [
+            "js-profile=release-size".to_owned(),
+            "js-str=bytes".to_owned(),
+        ];
+        let with_utf16 = [
+            "js-profile=release-size".to_owned(),
+            "js-str=utf16".to_owned(),
+        ];
         assert_eq!(
             crate::item::normalized_emit_args(&with_bytes),
             crate::item::normalized_emit_args(&with_utf16)
