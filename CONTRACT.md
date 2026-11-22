@@ -922,27 +922,32 @@ Byte arithmetic on a retyped heap allocation pointer (`a.add(k)` after `let p = 
 works in bytes for wider scalars (aligned/unaligned casts, single-byte reads/writes,
 `compare_bytes`, `copy`/`copy_nonoverlapping`, `write_bytes`, `slice::from_raw_parts`, `ptr::eq`,
 `addr`, `realloc`) and in aligned whole elements for non-scalar aggregates (`a.add(k * size_of::<T>())`
-casts, aligned `copy`/`copy_nonoverlapping` preserving owned aggregate independence and `&T`
-reference identity, `ptr::eq`, `addr`, `realloc`; `examples/core-tests/368_retyped_alloc_byte_arith.rs`,
-`369_retyped_alloc_non_scalar.rs`). Out-of-bounds byte slices or byte
+casts, aligned whole-element `copy`/`copy_nonoverlapping` using the compiler's typed clone policy
+from `scale`/`unscale`/`convert_nv_block` so owned aggregates clone deeply while `&T`/`*const T`/`Box<T>`
+elements rebind directly without overwriting referents, `ptr::eq`, `addr`, `byte_offset_from`,
+`realloc`; `examples/core-tests/368_retyped_alloc_byte_arith.rs`,
+`369_retyped_alloc_non_scalar_and_prefix.rs`). Out-of-bounds byte slices or byte
 accesses past a flat scalar buffer (including nested arrays such as `[[u16; 2]; 2]`, whose rows are
 separate JavaScript arrays), re-casting a raw retyped allocation pointer to a different element
-width at any offset (`guard_heap_retype`), misaligned non-scalar casts or copies, and any byte
-read, byte write, `write_bytes` (including zero fill), or non-empty byte slice over
-non-primitive aggregate storage (such as `#[repr(C)] struct Pair { a: u32, b: u32 }`) fail closed
-with a registered abort (`examples/core-tests/367_byte_view_non_scalar_abort.rs`,
-`370_retyped_alloc_refusals.rs`).
+width at any offset (`guard_heap_retype`, including through `*const ()`), misaligned or partial
+non-scalar casts or copies, and any byte read, byte write, `write_bytes` (including zero fill),
+or non-empty byte slice over non-primitive aggregate storage (such as
+`#[repr(C)] struct Pair { a: u32, b: u32 }`) fail closed with a registered abort
+(`examples/core-tests/367_byte_view_non_scalar_abort.rs`,
+`370_retyped_alloc_write_bytes_abort.rs`).
 
 Two unsafe-only boundaries remain on this path and are documented rather than hidden:
 - `align == 1` heap allocations (`Layout::from_size_align(n, 1)`, including `#[repr(packed)]`
   aggregates) deliberately omit `_alloc_byte_proxy` so `Vec<u8>` and `String` stay proxy-free.
-  After such a block is retyped to `es > 1`, `unscale`/`unscale_scalar`/`thin`,
+  After such a block is retyped to `es > 1`, `unscale`/`unscale_scalar`/`thin` (including
+  non-fresh width checks at offset 0), `ptr::eq` on erased `*const ()` pointers,
   `slice_from_parts`, `compare_bytes`, and `write_bytes` still interpret the raw `*mut u8`
   pointer's offset in bytes (or fail closed for non-scalars), whereas inline bare byte dereferences
   `*(a.add(k))` (including MIR-GVN-folded `*(v.as_ptr().cast::<u8>())` on `Vec<Packed>` under
-  `inline+Oz`) and direct `copy`/`copy_nonoverlapping` on the raw `*mut u8` pointer cannot
-  distinguish byte offsets from element offsets without a proxy (derive the byte pointer via
-  `p.cast::<u8>()` instead).
+  `inline+Oz`), direct raw `*mut u8` `copy`/`copy_nonoverlapping`, and un-erased
+  `ptr::eq(a.add(k), p.add(i).cast::<u8>())` cannot distinguish byte offsets from element offsets
+  without a proxy (derive the byte pointer via `p.cast::<u8>()` or erase via `cast::<()>()`
+  instead).
 - Under `JSC_RUST_MIR_INLINE=on` with `-Oz`, rustc's MIR optimizer can collapse chained casts such
   as `(&Wrap).cast::<u32>().cast::<u8>()` directly to `(&Wrap).cast::<u8>()` (which aborts as a
   non-scalar byte view) and can fold `v.as_ptr().cast::<u8>()` back to `RawVecInner`'s allocation

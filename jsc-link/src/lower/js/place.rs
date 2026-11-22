@@ -492,10 +492,15 @@ impl<'a> JsCx<'a> {
                     Ok(vec![jsast::assign_stmt(target, value)])
                 }
             }
-            JsPlace::Array(pointer, _) => Ok(vec![jsast::expr_stmt(jsast::rt_call(
-                "write_array",
-                vec![pointer, value],
-            ))]),
+            JsPlace::Array(pointer, _) => {
+                let mut args = vec![pointer, value];
+                if let Some(TypeKind::Array { element, .. }) = value::kind(self.table, ty) {
+                    if self.table.is_indirect(*element) {
+                        args.push(Expr::Bool(true));
+                    }
+                }
+                Ok(vec![jsast::expr_stmt(jsast::rt_call("write_array", args))])
+            }
             // Nothing to store. A value with effects of its own is still evaluated.
             JsPlace::Unit(_) => Ok(match value {
                 Expr::Undefined => Vec::new(),

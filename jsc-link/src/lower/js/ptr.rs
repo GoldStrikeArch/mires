@@ -45,11 +45,12 @@ impl<'a> JsCx<'a> {
         if !is_slot_pointee(table, pointee) {
             return self.write_indirect(pointee, pointer, value);
         }
-        if matches!(value::kind(table, pointee), Some(TypeKind::Array { .. })) {
-            return Ok(vec![jsast::expr_stmt(jsast::rt_call(
-                "write_array",
-                vec![pointer, value],
-            ))]);
+        if let Some(TypeKind::Array { element, .. }) = value::kind(table, pointee) {
+            let mut args = vec![pointer, value];
+            if table.is_indirect(*element) {
+                args.push(Expr::Bool(true));
+            }
+            return Ok(vec![jsast::expr_stmt(jsast::rt_call("write_array", args))]);
         }
         let element = ptr::slot_element(pointer);
         if table.is_indirect(pointee) {
@@ -768,11 +769,17 @@ impl<'a> JsCx<'a> {
                     self.zero_factory(element),
                 ];
                 let member = if table.crosses_transparent_union(from_pointee) {
+                    if let Some(clone) = self.non_scalar_clone_arg(to_element) {
+                        arguments.push(clone);
+                    }
                     "unscale_uninit"
                 } else if let Some(kind) = self.scalar_view_kind(element) {
                     arguments.push(kind);
                     "unscale_scalar"
                 } else {
+                    if let Some(clone) = self.non_scalar_clone_arg(to_element) {
+                        arguments.push(clone);
+                    }
                     "unscale"
                 };
                 Some(jsast::rt_call(member, arguments))
@@ -858,10 +865,11 @@ impl<'a> JsCx<'a> {
                     return Ok(jsast::rt_call("scale_scalar", arguments));
                 }
             }
-            return Ok(jsast::rt_call(
-                "scale",
-                vec![value, jsast::num(from_size as f64)],
-            ));
+            let mut arguments = vec![value, jsast::num(from_size as f64)];
+            if let Some(clone) = self.non_scalar_clone_arg(from_pointee) {
+                arguments.push(clone);
+            }
+            return Ok(jsast::rt_call("scale", arguments));
         }
         if from_size == 1 && !table.is_indirect(from) {
             let mut arguments = vec![
@@ -870,16 +878,37 @@ impl<'a> JsCx<'a> {
                 self.zero_factory(to_pointee),
             ];
             let member = if table.crosses_transparent_union(from_pointee) {
+                if let Some(clone) = self.non_scalar_clone_arg(to_pointee) {
+                    arguments.push(clone);
+                }
                 "unscale_uninit"
             } else if let Some(kind) = self.scalar_view_kind(to_pointee) {
                 arguments.push(kind);
                 "unscale_scalar"
             } else {
+                if let Some(clone) = self.non_scalar_clone_arg(to_pointee) {
+                    arguments.push(clone);
+                }
                 "unscale"
             };
             return Ok(jsast::rt_call(member, arguments));
         }
         unsupported()
+    }
+
+    /// The optional clone argument handed to `__rt.scale` / `__rt.unscale` / `__rt.unscale_uninit`
+    /// for non-scalar element types (`ptr.rs::non_scalar_clone_arg`).
+    fn non_scalar_clone_arg(&self, pointee: TypeId) -> Option<Expr> {
+        if self.table.needs_clone(pointee) {
+            Some(jsast::arrow(
+                vec![CLONE_PARAM.to_string()],
+                value::clone_expr(self.table, self.interns, pointee, jsast::id(CLONE_PARAM)),
+            ))
+        } else if self.table.is_indirect(pointee) {
+            Some(Expr::Bool(true))
+        } else {
+            None
+        }
     }
 
     /// A zero factory for a type whose zero is not the byte zero

@@ -127,14 +127,12 @@ pub(crate) fn deref_write<'tcx>(
         return write_indirect(fx, pointee, pointer, value);
     }
     // The write half of the array question above.
-    if matches!(
-        peel_pattern(peel_transparent(fx.tcx, pointee)).kind(),
-        ty::Array(..)
-    ) {
-        return vec![jsast::expr_stmt(jsast::rt_call(
-            "write_array",
-            vec![pointer, value],
-        ))];
+    if let ty::Array(element, _) = peel_pattern(peel_transparent(fx.tcx, pointee)).kind() {
+        let mut args = vec![pointer, value];
+        if is_indirect(fx.tcx, *element) {
+            args.push(Expr::Bool(true));
+        }
+        return vec![jsast::expr_stmt(jsast::rt_call("write_array", args))];
     }
     let element = slot_element(pointer);
     if is_indirect(fx.tcx, pointee) {
@@ -747,11 +745,17 @@ fn cast_pointer_sized<'tcx>(
                 crate::alloc_support::zero_factory(fx.cgu, element),
             ];
             let member = if crate::value::crosses_transparent_union(tcx, from_pointee) {
+                if let Some(clone) = non_scalar_clone_arg(tcx, to_element) {
+                    arguments.push(clone);
+                }
                 "unscale_uninit"
             } else if let Some(kind) = scalar_view_kind(tcx, element) {
                 arguments.push(kind);
                 "unscale_scalar"
             } else {
+                if let Some(clone) = non_scalar_clone_arg(tcx, to_element) {
+                    arguments.push(clone);
+                }
                 "unscale"
             };
             Some(jsast::rt_call(member, arguments))
@@ -835,7 +839,11 @@ fn cast_pointer_sized<'tcx>(
                 return jsast::rt_call("scale_scalar", arguments);
             }
         }
-        return jsast::rt_call("scale", vec![value, jsast::num(from_size as f64)]);
+        let mut arguments = vec![value, jsast::num(from_size as f64)];
+        if let Some(clone) = non_scalar_clone_arg(tcx, from_pointee) {
+            arguments.push(clone);
+        }
+        return jsast::rt_call("scale", arguments);
     }
     // The way back. `__rt.unscale` answers for a scaled slot of exactly this element size whose
     // byte offset lands on an element, for a **fresh heap block**, which it retypes to this element
@@ -852,17 +860,40 @@ fn cast_pointer_sized<'tcx>(
             crate::alloc_support::zero_factory(fx.cgu, to_pointee),
         ];
         let member = if crate::value::crosses_transparent_union(tcx, from_pointee) {
+            if let Some(clone) = non_scalar_clone_arg(tcx, to_pointee) {
+                arguments.push(clone);
+            }
             "unscale_uninit"
         } else if let Some(kind) = scalar_view_kind(tcx, to_pointee) {
             arguments.push(kind);
             "unscale_scalar"
         } else {
+            if let Some(clone) = non_scalar_clone_arg(tcx, to_pointee) {
+                arguments.push(clone);
+            }
             "unscale"
         };
         return jsast::rt_call(member, arguments);
     }
 
     unsupported()
+}
+
+/// The optional clone argument handed to `__rt.scale` / `__rt.unscale` / `__rt.unscale_uninit`
+/// for non-scalar element types: a clone arrow for owned aggregates (`needs_clone`), `true` for
+/// write-through indirect values without a clone expression, and `None` for non-indirect elements
+/// (`&T`, `*const T`, `Box<T>`, scalars) whose raw byte copies rebind slots directly.
+fn non_scalar_clone_arg<'tcx>(tcx: TyCtxt<'tcx>, pointee: Ty<'tcx>) -> Option<Expr> {
+    if crate::value::needs_clone(tcx, pointee) {
+        Some(jsast::arrow(
+            vec![CLONE_PARAM.to_string()],
+            crate::value::clone_expr(tcx, pointee, jsast::id(CLONE_PARAM)),
+        ))
+    } else if is_indirect(tcx, pointee) {
+        Some(Expr::Bool(true))
+    } else {
+        None
+    }
 }
 
 /// The exact scalar representation an aliasing byte-storage view may decode.

@@ -173,7 +173,7 @@ fn native_vec_to_baseline(
     ty: TypeId,
 ) -> Res<Expr> {
     let layout = VecLayout::of(table, interns, ty)?;
-    let (size, scalar_kind) = element_info(table, ty)?;
+    let (size, scalar_kind, element) = element_info(table, ty)?;
     let (value, wrap) = once(value);
     // A registered, element-typed heap block: baseline reads reach the buffer through
     // `unscale`'s block registry, so a bare `{ buf, off }` record would refuse the very first
@@ -181,6 +181,18 @@ fn native_vec_to_baseline(
     let mut args = vec![value.clone(), jsast::raw_num(size.to_string())];
     if let Some(kind) = scalar_kind {
         args.push(jsast::string(kind));
+    } else if table.needs_clone(element) {
+        args.push(jsast::arrow(
+            vec![super::value::CLONE_PARAM.to_string()],
+            super::value::clone_expr(
+                table,
+                interns,
+                element,
+                jsast::id(super::value::CLONE_PARAM),
+            ),
+        ));
+    } else if table.is_indirect(element) {
+        args.push(Expr::Bool(true));
     }
     let pointer = jsast::rt_call("convert_nv_block", args);
     let length = jsast::member(value.clone(), "len");
@@ -243,8 +255,9 @@ fn wrap_paths(
     build(table, interns, ty, &mut at, cap, pointer, length, capacity)
 }
 
-/// The element's byte size and optional wider-scalar view kind, from the vec's first type argument.
-fn element_info(table: &TypeTable, ty: TypeId) -> Res<(u64, Option<String>)> {
+/// The element's byte size, optional wider-scalar view kind, and element `TypeId`, from the
+/// vec's first type argument.
+fn element_info(table: &TypeTable, ty: TypeId) -> Res<(u64, Option<String>, TypeId)> {
     let no = |detail: &str| decline(OpClass::Rvalue, format!("vec Convert adapter: {detail}"));
     let descriptor = table
         .get(ty)
@@ -270,7 +283,7 @@ fn element_info(table: &TypeTable, ty: TypeId) -> Res<(u64, Option<String>)> {
         Some(TypeKind::Char) => Some("u32".to_owned()),
         _ => None,
     };
-    Ok((size, scalar_kind))
+    Ok((size, scalar_kind, element))
 }
 
 /// `__rt.convert_block_nv(<ptr>.buf, <ptr>.off, <len>, <cap>)`: a capacity-length native buffer
@@ -307,7 +320,7 @@ fn baseline_vec_to_slice_view(
     ty: TypeId,
 ) -> Res<Expr> {
     let layout = VecLayout::of(table, interns, ty)?;
-    let (size, _) = element_info(table, ty)?;
+    let (size, _, _) = element_info(table, ty)?;
     let (value, wrap) = once(value);
     let pointer = layout.member(value.clone(), &layout.ptr);
     if size > 1 {

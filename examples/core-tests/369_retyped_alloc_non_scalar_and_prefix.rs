@@ -1,10 +1,13 @@
 //! Byte arithmetic on retyped non-scalar allocations + nested prefix & byte-view polish (MIRES-008).
 //!
 //! Covers:
-//! - Aligned whole-element byte-offset casts, `copy_nonoverlapping`, overlapping `copy`,
-//!   `ptr::eq`, `addr`, `byte_offset_from`, and `realloc` on retyped `Pair`, nested
-//!   `OuterPair`, `String`, `Vec<&Pair>`, and `#[repr(packed)] Packed4` allocations.
-//! - Multi-level nested zero-offset prefix `_unwrap_view` & `ptr_cmp`.
+//! - Aligned whole-element byte-offset casts, `copy`/`copy_nonoverlapping` (deep-cloning owned
+//!   aggregates including nested structs, `Holder { r: &Pair }`, and `BufNamed` while rebinding
+//!   `&Pair`/`&u32` slots directly without mutating referents or poisoning `_boxes`), `ptr::eq`,
+//!   `addr`, `byte_offset_from`, and `realloc` on retyped `Pair`, `vec![Pair]`, `String`,
+//!   and `#[repr(packed)] Packed4` allocations.
+//! - Multi-level nested zero-offset prefix `_unwrap_view` & `ptr_cmp` (2-level stack and
+//!   3-level heap).
 //! - Prefix vs direct field `_byte_view` cache isolation (`scale_scalar` and `byte_sign`).
 //! - `ptr::eq` on shared `_non_scalar_byte_view` (`sc === undefined` vs `sc === 8`).
 
@@ -39,6 +42,20 @@ struct OuterPair {
     tag: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Holder<'a> {
+    r: &'a Pair,
+    tag: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BufNamed {
+    buf: u32,
+    len: u32,
+}
+
 #[repr(packed)]
 #[derive(Clone, Copy)]
 struct Packed4 {
@@ -58,9 +75,15 @@ struct Outer {
     z: u64,
 }
 
+#[repr(C)]
+struct TopOuter {
+    outer: Outer,
+    top: u64,
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_entry() {
-    // 1. alloc_zeroed + alloc Pair: byte-offset reads/writes, ptr::eq, addr, byte_offset_from, copy, realloc.
+    // 1. alloc_zeroed + alloc Pair: byte-offset reads/writes, ptr::eq, addr, byte_offset_from, realloc.
     unsafe {
         let layout = Layout::array::<Pair>(4).unwrap();
         let a = alloc_zeroed(layout);
@@ -88,7 +111,7 @@ pub extern "C" fn rust_entry() {
         print_i32(a.add(8).byte_offset_from(p.cast::<u8>()) as i32);
         print_i32(p.add(1).cast::<u8>().byte_offset_from(a) as i32);
 
-        // Copy into uninitialized alloc + mutate destination: source must remain independent.
+        // Aligned whole-element `*mut u8` copy/copy_nonoverlapping on Pair preserves independence.
         let b = alloc(layout);
         let pb = b as *mut Pair;
         ptr::copy_nonoverlapping(a.add(8), b.add(16), 8);
@@ -97,78 +120,113 @@ pub extern "C" fn rust_entry() {
         print_u32((*pb.add(2)).a);
         print_u32((*pb.add(2)).b);
         print_bool(ptr::eq(b.add(16).cast::<()>(), pb.add(2).cast::<()>()));
-
-        // Overlapping copy forward & backward within Pair allocation + mutation independence.
         ptr::copy(a.add(8), a.add(16), 16);
         (*p.add(2)).a = 888;
         print_u32((*p.add(1)).a);
         print_u32((*p.add(2)).a);
         print_u32((*p.add(3)).a);
 
-        ptr::copy(a.add(16), a.add(8), 16);
-        (*p.add(1)).a = 777;
-        print_u32((*p.add(1)).a);
-        print_u32((*p.add(2)).a);
-
-        // Cross-pointer copy between raw alloc pointer and scaled element pointer.
-        ptr::copy_nonoverlapping(a.add(0), pb.cast::<u8>().add(8), 8);
-        print_u32((*pb.add(1)).a);
-        print_u32((*pb.add(1)).b);
-
         // realloc grow & shrink on Pair allocation.
         let a_grown = realloc(a, layout, 64);
         let p_grown = a_grown as *mut Pair;
         ptr::write(p_grown.add(7), Pair { a: 70, b: 71 });
         print_u32((*(a_grown.add(56) as *const Pair)).a);
+        print_bool(ptr::eq(
+            a_grown.add(56).cast::<()>(),
+            p_grown.add(7).cast::<()>(),
+        ));
         let a_shrunk = realloc(a_grown, Layout::array::<Pair>(8).unwrap(), 16);
         print_u32((*(a_shrunk.add(8) as *const Pair)).a);
         dealloc(a_shrunk, Layout::array::<Pair>(2).unwrap());
         dealloc(b, layout);
 
-        // Nested struct deep clone independence on byte copy.
-        let lo = Layout::array::<OuterPair>(2).unwrap();
-        let ao = alloc(lo);
-        let po = ao as *mut OuterPair;
-        ptr::write(
-            po.add(0),
-            OuterPair {
-                p: Pair { a: 5, b: 6 },
-                tag: 1,
-            },
-        );
-        let bo = alloc(lo);
-        let pbo = bo as *mut OuterPair;
-        let sz = core::mem::size_of::<OuterPair>();
-        ptr::copy_nonoverlapping(ao, bo.add(sz), sz);
-        (*pbo.add(1)).p.a = 555;
-        print_u32((*po.add(0)).p.a);
-        print_u32((*pbo.add(1)).p.a);
-        dealloc(ao, lo);
-        dealloc(bo, lo);
+        // vec![Pair { ... }] registers owned elements in _boxes (write_array / convert_nv_block),
+        // while vec![&local] does NOT poison _boxes with borrowed referents.
+        let vp_vec: Vec<Pair> = black_box(vec![Pair { a: 1, b: 2 }, Pair { a: 3, b: 4 }]);
+        let vp = vp_vec.as_ptr();
+        let vb = vp.cast::<u8>();
+        print_bool(ptr::eq(vb.add(8).cast::<()>(), vp.add(1).cast::<()>()));
+        print_bool(vb.add(8).addr() == vp.add(1).cast::<()>().addr());
 
-        // Vec<&Pair> copy via *mut u8 preserves &Pair identity without overwriting borrowed targets.
-        let local_pair = black_box(Pair { a: 42, b: 43 });
-        let dummy_pair = black_box(Pair { a: 0, b: 0 });
-        let mut vref: Vec<&Pair> = Vec::with_capacity(2);
-        vref.push(&local_pair);
-        vref.push(&local_pair);
+        let local_p = black_box(Pair { a: 42, b: 43 });
+        let dummy_p = black_box(Pair { a: 7, b: 8 });
+        let vref: Vec<&Pair> = black_box(vec![&local_p, &local_p]);
         let mut dst_ref: Vec<&Pair> = Vec::with_capacity(2);
-        dst_ref.push(&dummy_pair);
-        dst_ref.push(&dummy_pair);
         ptr::copy_nonoverlapping(
             vref.as_ptr().cast::<u8>(),
             dst_ref.as_mut_ptr().cast::<u8>(),
             core::mem::size_of::<&Pair>() * 2,
         );
-        print_bool(ptr::eq(
-            dst_ref[0] as *const Pair,
-            &local_pair as *const Pair,
+        dst_ref.set_len(2);
+        print_bool(ptr::eq(dst_ref[0] as *const Pair, &local_p as *const Pair));
+        print_bool(!ptr::eq(
+            (&local_p as *const Pair).cast::<()>(),
+            dst_ref.as_ptr().cast::<()>(),
         ));
-        print_bool(ptr::eq(
-            dst_ref[1] as *const Pair,
-            &local_pair as *const Pair,
-        ));
-        print_u32(dummy_pair.a);
+        let mut arr_ref: [&Pair; 2] = black_box([&dummy_p, &dummy_p]);
+        ptr::copy_nonoverlapping(
+            vref.as_ptr().cast::<u8>(),
+            arr_ref.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of::<&Pair>() * 2,
+        );
+        print_bool(ptr::eq(arr_ref[0] as *const Pair, &local_p as *const Pair));
+        print_u32(dummy_p.a);
+
+        // Vec<OuterPair>, Holder { r: &Pair }, and BufNamed byte copies preserve exact clone semantics.
+        let vo1: Vec<OuterPair> = black_box(vec![
+            OuterPair {
+                p: Pair { a: 11, b: 12 },
+                tag: 1,
+            },
+            OuterPair {
+                p: Pair { a: 21, b: 22 },
+                tag: 2,
+            },
+        ]);
+        let mut vo2: Vec<OuterPair> = Vec::with_capacity(2);
+        ptr::copy_nonoverlapping(
+            vo1.as_ptr().cast::<u8>(),
+            vo2.as_mut_ptr().cast::<u8>(),
+            core::mem::size_of::<OuterPair>() * 2,
+        );
+        vo2.set_len(2);
+        vo2[0].p.a = 999;
+        print_u32(vo1[0].p.a);
+        print_u32(vo2[0].p.a);
+
+        let lh = Layout::array::<Holder>(1).unwrap();
+        let ah = alloc(lh);
+        let ph = ah as *mut Holder;
+        ptr::write(
+            ph,
+            Holder {
+                r: &local_p,
+                tag: 5,
+            },
+        );
+        let bh = alloc(lh);
+        let pbh = bh as *mut Holder;
+        ptr::copy_nonoverlapping(ah, bh, core::mem::size_of::<Holder>());
+        (*pbh).tag = 99;
+        print_bool(ptr::eq((*pbh).r as *const Pair, &local_p as *const Pair));
+        print_u32((*ph).tag);
+        print_u32((*pbh).tag);
+        dealloc(ah, lh);
+        dealloc(bh, lh);
+
+        let lbn = Layout::array::<BufNamed>(2).unwrap();
+        let abn = alloc(lbn);
+        let pbn = abn as *mut BufNamed;
+        ptr::write(pbn.add(0), BufNamed { buf: 10, len: 20 });
+        ptr::copy(
+            abn.add(0),
+            abn.add(core::mem::size_of::<BufNamed>()),
+            core::mem::size_of::<BufNamed>(),
+        );
+        (*pbn.add(1)).buf = 777;
+        print_u32((*pbn.add(0)).buf);
+        print_u32((*pbn.add(1)).buf);
+        dealloc(abn, lbn);
 
         // String allocation (non-Copy owned aggregate).
         let ls = Layout::array::<String>(2).unwrap();
@@ -190,10 +248,51 @@ pub extern "C" fn rust_entry() {
         *pp.add(1) = Packed4 { a: 3, b: 4 };
         let v = *(ap.add(4) as *const Packed4);
         let va = v.a;
-        let vb = v.b;
+        let vb_p = v.b;
         print_u32(u32::from(va));
-        print_u32(u32::from(vb));
+        print_u32(u32::from(vb_p));
+        print_bool((ap.add(4) as usize) == (pp.add(1) as usize));
+        print_bool(ptr::eq(ap.add(4).cast::<()>(), pp.add(1).cast::<()>()));
         dealloc(ap, lp);
+
+        // 3-level nested prefix on heap allocation TopOuter -> Outer -> Inner -> u32 -> u8.
+        let lt = Layout::array::<TopOuter>(2).unwrap();
+        let at = alloc(lt);
+        let pt = at as *mut TopOuter;
+        ptr::write(
+            pt.add(0),
+            TopOuter {
+                outer: Outer {
+                    inner: Inner { x: 1, y: 2 },
+                    z: 3,
+                },
+                top: 4,
+            },
+        );
+        ptr::write(
+            pt.add(1),
+            TopOuter {
+                outer: Outer {
+                    inner: Inner {
+                        x: 0x1122_3344,
+                        y: 5,
+                    },
+                    z: 6,
+                },
+                top: 7,
+            },
+        );
+        let pt1 = pt.add(1);
+        let px3 =
+            black_box(black_box(black_box(pt1.cast::<Outer>()).cast::<Inner>()).cast::<u32>());
+        let pb3 = px3.cast::<u8>();
+        print_bool(ptr::eq(pb3.cast::<()>(), pt1.cast::<()>()));
+        print_bool(ptr::eq(
+            pb3.cast::<()>(),
+            at.add(core::mem::size_of::<TopOuter>()).cast::<()>(),
+        ));
+        print_bool(pb3.addr() == pt1.cast::<()>().addr());
+        dealloc(at, lt);
     }
 
     // 2. A7 polish #1: 2-level nested prefix Outer(16) -> Inner(8) -> u32 -> u8.
@@ -252,13 +351,11 @@ pub extern "C" fn rust_entry() {
         a: 0x0102_0304,
         b: 0x0506_0708,
     });
-    unsafe {
-        let pp = black_box((&w2 as *const Pair).cast::<u32>()).cast::<u8>();
-        let pref_addr = pp.addr();
-        let pf = (&w2.a as *const u32).cast::<u8>();
-        print_bool(pf.addr() == (&w2.a as *const u32).addr());
-        print_bool(pp.addr() == pref_addr);
-    }
+    let pp2 = black_box((&w2 as *const Pair).cast::<u32>()).cast::<u8>();
+    let pref_addr = pp2.addr();
+    let pf2 = (&w2.a as *const u32).cast::<u8>();
+    print_bool(pf2.addr() == (&w2.a as *const u32).addr());
+    print_bool(pp2.addr() == pref_addr);
 
     // 4. A7 polish #3: ptr::eq on shared _non_scalar_byte_view (sc === undefined vs sc === 8).
     let v: Vec<Pair> = black_box(vec![Pair { a: 1, b: 2 }, Pair { a: 3, b: 4 }]);

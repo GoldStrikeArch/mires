@@ -229,6 +229,8 @@ pub extern "C" fn rust_entry() {
         print_u32(u32::from(*(a.add(2) as *const u16)));
         print_u32(u32::from(ptr::read_unaligned(a.add(1) as *const u16)));
         print_bool(slice::from_raw_parts(a.add(2), 4) == &[22, 0, 33, 0]);
+        print_bool((a.add(2) as usize) == (p.add(1) as usize));
+        print_bool(ptr::eq(a.add(2).cast::<()>(), p.add(1).cast::<()>()));
         ptr::write_bytes(a.add(2), 0xab, 4);
         print_u32(u32::from(*p.add(1)));
         print_u32(u32::from(*p.add(2)));

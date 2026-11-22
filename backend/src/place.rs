@@ -556,10 +556,15 @@ impl<'tcx> FnCx<'_, 'tcx> {
             // Element by element for a window, an in place overwrite for a plain slot: never a
             // rebind, because the elements live in a buffer other pointers share.
             JsPlace::Array(pointer, _) => {
-                vec![jsast::expr_stmt(jsast::rt_call(
-                    "write_array",
-                    vec![pointer, value],
-                ))]
+                let mut args = vec![pointer, value];
+                if let ty::Array(element, _) =
+                    crate::value::peel_pattern(crate::value::peel_transparent(self.tcx, ty)).kind()
+                {
+                    if crate::value::is_indirect(self.tcx, *element) {
+                        args.push(Expr::Bool(true));
+                    }
+                }
+                vec![jsast::expr_stmt(jsast::rt_call("write_array", args))]
             }
             // Nothing to store. A value with effects of its own is still evaluated.
             JsPlace::Unit(_) => match value {

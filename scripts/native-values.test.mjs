@@ -396,37 +396,85 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
   rt.dealloc(rawPairSlice, 8, 4);
 });
 
-test("retyped alloc byte arithmetic, non-scalar copy/write_bytes, and prefix polish (MIRES-008)", () => {
-  // 1. Non-scalar retyped allocation: aligned unscale, deep-cloning copy, ptr_eq/addr with bare
-  //    heap aggregate, and fail-closed write_bytes (including byte == 0) and misaligned unscale.
+test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and prefix polish (MIRES-008)", () => {
+  // 1. Non-scalar retyped allocation: aligned unscale, ptr_eq/addr with bare heap aggregate,
+  //    compiler-typed clone on copy/copy_nonoverlapping (owned deep clone vs &T direct rebind),
+  //    and fail-closed misaligned/partial copy & write_bytes.
+  const clonePair = ($e) => ({ a: $e.a, b: $e.b });
   const a = rt.alloc(32, 4);
-  const p = rt.unscale(a, 8, () => ({ a: 0, b: 0 }));
+  const p = rt.unscale(a, 8, () => ({ a: 0, b: 0 }), clonePair);
   rt._put(p.buf, 0, { a: 10, b: 11 }, true);
   rt._put(p.buf, 1, { a: 20, b: 21 }, true);
   rt._put(p.buf, 2, { a: 30, b: 31 }, true);
   const a1 = { buf: a.buf, off: 8 };
-  const p1 = rt.unscale(a1, 8, () => ({ a: 0, b: 0 }));
+  const p1 = rt.unscale(a1, 8, () => ({ a: 0, b: 0 }), clonePair);
   assert.equal(p1.buf, p.buf);
   assert.equal(p1.off, 1);
   assert.equal(rt.ptr_eq(a1, p.buf[1]), true);
   assert.equal(rt.addr(p.buf[1], 1), rt.addr(a1, 1));
   assert.throws(
-    () => rt.unscale({ buf: a.buf, off: 4 }, 8, () => ({ a: 0, b: 0 })),
+    () => rt.unscale({ buf: a.buf, off: 4 }, 8, () => ({ a: 0, b: 0 }), clonePair),
     (err) => rt.is_abort(err) && /not a multiple of 8/.test(err.message),
   );
 
+  // Aligned whole-element byte copy clones owned aggregates independently (including fresh dst
+  // retype for MIR-GVN-folded Vec::with_capacity) and aborts on misaligned/partial copies.
   const b = rt.alloc(32, 4);
-  const pb = rt.unscale(b, 8, () => ({ a: 0, b: 0 }));
   rt.copy_nonoverlapping({ buf: b.buf, off: 16 }, a1, 8);
+  const pb = rt.unscale(b, 8, () => ({ a: 0, b: 0 }), clonePair);
   assert.deepEqual(pb.buf[2], { a: 20, b: 21 });
   pb.buf[2].a = 999;
   assert.equal(p.buf[1].a, 20);
-  assert.equal(rt.ptr_eq({ buf: b.buf, off: 16 }, pb.buf[2]), true);
-
-  // Overlapping copy on non-scalar alloc preserves element independence.
-  rt.copy({ buf: a.buf, off: 16 }, { buf: a.buf, off: 8 }, 16);
+  rt.copy({ buf: a.buf, off: 16 }, a1, 16);
   p.buf[2].a = 888;
   assert.equal(p.buf[1].a, 20);
+  assert.throws(
+    () => rt.copy_nonoverlapping({ buf: b.buf, off: 4 }, a1, 8),
+    (err) => rt.is_abort(err),
+  );
+  assert.throws(
+    () => rt.copy_nonoverlapping({ buf: b.buf, off: 0 }, a1, 4),
+    (err) => rt.is_abort(err),
+  );
+
+  // Non-indirect (&Pair / &u32) byte copies (cl omitted) rebind slots directly without
+  // mutating borrowed referents or poisoning _boxes.
+  const localP = { a: 42, b: 43 };
+  const dummyP = { a: 7, b: 8 };
+  const rSrc = rt.alloc(8, 4);
+  const rSrcP = rt.unscale(rSrc, 4, null);
+  rSrcP.buf[0] = localP;
+  rSrcP.buf[1] = localP;
+  const rDst = rt.alloc(8, 4);
+  rt.copy_nonoverlapping(rDst, rSrc, 8);
+  const rDstP = rt.unscale(rDst, 4, null);
+  assert.equal(rDstP.buf[0], localP);
+  assert.equal(rt.ptr_eq(localP, rDst), false);
+  const stackRefs = [dummyP, dummyP];
+  rt.copy_nonoverlapping(rt.scale({ buf: stackRefs, off: 0 }, 4), rSrc, 8);
+  assert.equal(stackRefs[0], localP);
+  assert.equal(dummyP.a, 7);
+  rt.dealloc(rSrc, 8, 4);
+  rt.dealloc(rDst, 8, 4);
+
+  // write_array(..., true) and convert_nv_block(..., clonePair) register owned aggregates in _boxes,
+  // while non-indirect write_array (e.g. Vec<&Pair>) never registers borrowed referents.
+  const wa = rt.alloc(16, 4);
+  const wp = rt.unscale(wa, 8, () => ({ a: 0, b: 0 }), clonePair);
+  rt.write_array({ buf: wp.buf, off: 0, w: 2 }, [{ a: 1, b: 2 }, { a: 3, b: 4 }], true);
+  assert.equal(rt.ptr_eq({ buf: wa.buf, off: 8 }, wp.buf[1]), true);
+  assert.equal(rt.addr(wp.buf[1], 1), rt.addr({ buf: wa.buf, off: 8 }, 1));
+  const borrowed = { a: 42, b: 43 };
+  const ra = rt.alloc(8, 4);
+  const rp = rt.unscale(ra, 4, () => 0);
+  rt.write_array({ buf: rp.buf, off: 0, w: 2 }, [borrowed, borrowed]);
+  assert.equal(rt.ptr_eq(borrowed, rp), false);
+  const nvBlock = rt.convert_nv_block({ buf: [{ a: 5, b: 6 }, { a: 7, b: 8 }], len: 2, cap: 2 }, 8, clonePair);
+  const nvTyped = rt.unscale(nvBlock, 8, () => ({ a: 0, b: 0 }), clonePair);
+  assert.equal(rt.ptr_eq({ buf: nvBlock.buf, off: 8 }, nvTyped.buf[1]), true);
+  rt.dealloc(wa, 16, 4);
+  rt.dealloc(ra, 8, 4);
+  rt.dealloc(nvBlock, 16, 4);
 
   // write_bytes(0) fails closed on both raw non-scalar alloc proxy and scaled non-scalar pointer.
   assert.throws(
@@ -434,7 +482,7 @@ test("retyped alloc byte arithmetic, non-scalar copy/write_bytes, and prefix pol
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
   assert.throws(
-    () => rt.write_bytes({ buf: rt.scale(p, 8).buf, off: 8, sc: 8 }, 0, 8),
+    () => rt.write_bytes({ buf: rt.scale(p, 8, clonePair).buf, off: 8, sc: 8 }, 0, 8),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
   rt.dealloc(a, 32, 4);
@@ -456,13 +504,18 @@ test("retyped alloc byte arithmetic, non-scalar copy/write_bytes, and prefix pol
   );
   rt.dealloc(sa, 8, 2);
 
-  // 3. align == 1 retyped allocations interpret raw byte offsets cleanly.
+  // 3. align == 1 retyped allocations: byte offsets, ptr_eq on erased pointers, and thin offset-0 guard.
   const a1u16 = rt.alloc(8, 1);
   const p1u16 = rt.unscale_scalar(a1u16, 2, () => 0, "u16");
   p1u16.buf[0] = 11;
   p1u16.buf[1] = 22;
   p1u16.buf[2] = 33;
   assert.equal(rt.unscale_scalar({ buf: a1u16.buf, off: 2 }, 2, () => 0, "u16").off, 1);
+  assert.equal(rt.ptr_eq({ buf: a1u16.buf, off: 2 }, rt.erase({ buf: p1u16.buf, off: 1 }, 2, "u16")), true);
+  assert.throws(
+    () => rt.thin({ buf: a1u16.buf, off: 0 }, 4),
+    (err) => rt.is_abort(err) && /already holds 2-byte/.test(err.message),
+  );
   const s1u16 = rt.slice_from_parts({ buf: a1u16.buf, off: 2 }, 4, 1);
   assert.deepEqual([s1u16.buf[2], s1u16.buf[3], s1u16.buf[4], s1u16.buf[5]], [22, 0, 33, 0]);
   rt.write_bytes({ buf: a1u16.buf, off: 2 }, 0xab, 2);
