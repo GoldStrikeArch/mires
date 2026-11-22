@@ -46,6 +46,8 @@ pub(crate) fn is_format_machinery(operation: StandardOperation) -> bool {
         operation,
         StandardOperation::FormatArgsNew
             | StandardOperation::FormatArgumentNewDisplay
+            | StandardOperation::FormatArgumentNewLowerHex
+            | StandardOperation::FormatArgumentNewUpperHex
             | StandardOperation::FormatArgsToString
             | StandardOperation::StringFmtWriteFmt
     )
@@ -59,30 +61,129 @@ fn declines_item(operation: StandardOperation) -> bool {
         operation,
         StandardOperation::FormatArgsNew
             | StandardOperation::FormatArgumentNewDisplay
+            | StandardOperation::FormatArgumentNewLowerHex
+            | StandardOperation::FormatArgumentNewUpperHex
             | StandardOperation::FormatArgsToString
     )
 }
 
-/// The default-Display argument shapes the pipeline recognizes (v1 `FormatDisplayKind`).
+/// Which `core::fmt::rt::Argument::new_*` constructor built a placeholder argument.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ArgFormat {
+    Display,
+    LowerHex,
+    UpperHex,
+}
+
+/// Decoded static formatting options of one template placeholder (`core/src/fmt/mod.rs`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PlaceholderSpec {
+    pub sign_plus: bool,
+    pub alternate: bool,
+    pub zero_pad: bool,
+    pub width: Option<u16>,
+    pub precision: Option<u16>,
+}
+
+impl PlaceholderSpec {
+    pub(crate) fn is_default(self) -> bool {
+        !self.sign_plus
+            && !self.alternate
+            && !self.zero_pad
+            && self.width.is_none()
+            && self.precision.is_none()
+    }
+}
+
+/// The proven argument value shapes the pipeline recognizes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DisplayKind {
-    Integer,
+    Integer { signed: bool, bits: u32 },
     Bool,
     Char,
     Str,
     F64,
+    F32,
     String,
 }
 
-/// One display argument of a site.
+/// One formatted argument of a site.
 #[derive(Clone, Debug)]
 pub(crate) struct DisplayArg {
     pub kind: DisplayKind,
-    /// The `Argument::new_display` call's result: the site's text binding.
+    pub format: ArgFormat,
+    pub spec: PlaceholderSpec,
+    /// The `Argument::new_*` call's result: the site's text binding.
     pub value: ValueId,
-    /// The place the display value is loaded from, all further derefs appended.
+    /// The place the formatted value is loaded from, all further derefs appended.
     pub root: Root,
     pub path: Vec<Proj>,
+}
+
+impl DisplayArg {
+    /// The `__rt.*` member required to format this argument, if any.
+    pub(crate) fn required_helper(&self) -> Option<&'static str> {
+        required_runtime_helper(self.format, self.kind, self.spec)
+    }
+}
+
+fn supported_arg_spec(format: ArgFormat, kind: DisplayKind, spec: PlaceholderSpec) -> bool {
+    match format {
+        ArgFormat::Display => {
+            if spec.is_default() {
+                true
+            } else if matches!(kind, DisplayKind::F64 | DisplayKind::F32) {
+                !spec.alternate
+                    && !spec.zero_pad
+                    && spec.width.is_none()
+                    && spec.precision.is_some()
+            } else if matches!(kind, DisplayKind::Integer { .. }) {
+                !spec.alternate && spec.precision.is_none()
+            } else {
+                false
+            }
+        }
+        ArgFormat::LowerHex | ArgFormat::UpperHex => {
+            matches!(kind, DisplayKind::Integer { .. })
+                && !spec.sign_plus
+                && spec.precision.is_none()
+        }
+    }
+}
+
+fn can_inline_unsigned_hex(signed: bool, bits: u32, spec: PlaceholderSpec) -> bool {
+    !signed && bits <= 32 && !spec.alternate && (spec.width.is_none() || spec.zero_pad)
+}
+
+fn required_runtime_helper(
+    format: ArgFormat,
+    kind: DisplayKind,
+    spec: PlaceholderSpec,
+) -> Option<&'static str> {
+    match (format, kind) {
+        (ArgFormat::Display, DisplayKind::F64) => Some(if spec.precision.is_some() {
+            "fmt_float_fixed"
+        } else {
+            "native_f64_to_string"
+        }),
+        (ArgFormat::Display, DisplayKind::F32) => Some(if spec.precision.is_some() {
+            "fmt_float_fixed"
+        } else {
+            "native_f32_to_string"
+        }),
+        (ArgFormat::Display, DisplayKind::Integer { .. }) if !spec.is_default() => {
+            Some("fmt_int_dec")
+        }
+        (ArgFormat::Display, DisplayKind::Str) => Some("native_str_wf"),
+        (ArgFormat::LowerHex | ArgFormat::UpperHex, DisplayKind::Integer { signed, bits }) => {
+            if can_inline_unsigned_hex(signed, bits, spec) {
+                None
+            } else {
+                Some("fmt_int_hex")
+            }
+        }
+        _ => None,
+    }
 }
 
 /// What the consumer call is, and the value its native labeling is judged by.
@@ -304,14 +405,22 @@ impl<'a> View<'a> {
             let descriptor = self.table.get(ty)?;
             match &descriptor.kind {
                 TypeKind::Integer {
-                    bits: 8 | 16 | 32 | 64 | 128,
-                    ..
+                    signed,
+                    bits: bits @ (8 | 16 | 32 | 64 | 128),
                 } => {
-                    return Some((root, path, DisplayKind::Integer));
+                    return Some((
+                        root,
+                        path,
+                        DisplayKind::Integer {
+                            signed: *signed,
+                            bits: *bits,
+                        },
+                    ));
                 }
                 TypeKind::Bool => return Some((root, path, DisplayKind::Bool)),
                 TypeKind::Char => return Some((root, path, DisplayKind::Char)),
                 TypeKind::Float { bits: 64 } => return Some((root, path, DisplayKind::F64)),
+                TypeKind::Float { bits: 32 } => return Some((root, path, DisplayKind::F32)),
                 // The place holds the `str` (or the `&str` one deref up): reading it is the host
                 // string when reached through a shared `&str`, NOT when dereferencing a `FatSlice`
                 // `str` pointer (`&mut str`, `*const str`, `*mut str`, `NonNull<str>`, `Box<str>`).
@@ -407,18 +516,36 @@ fn tree_bytes(tree: &ConstTree, interns: &Interns) -> Option<Vec<u8>> {
     }
 }
 
-/// The default (`{}`/`{name}`) `format_args!` template byte encoding: literal runs
-/// length-prefixed (`0x80` for a two-byte length), `0xC0` a placeholder for the next argument in
-/// order, `0x00` the terminator. Anything else — width, precision, `{0}` reuse, `Debug` — is not
-/// a default template and declines (v1 `decode_default_format_template`, byte for byte).
-pub(crate) fn decode_template(bytes: &[u8]) -> Option<Vec<String>> {
+/// `FormattingOptions::flags` bit layout (`core/src/fmt/mod.rs:318-345`).
+const FILL_MASK: u32 = 0x1f_ffff;
+const DEFAULT_FILL: u32 = ' ' as u32;
+const SIGN_PLUS_FLAG: u32 = 1 << 21;
+const SIGN_MINUS_FLAG: u32 = 1 << 22;
+const ALTERNATE_FLAG: u32 = 1 << 23;
+const SIGN_AWARE_ZERO_PAD_FLAG: u32 = 1 << 24;
+const DEBUG_LOWER_HEX_FLAG: u32 = 1 << 25;
+const DEBUG_UPPER_HEX_FLAG: u32 = 1 << 26;
+const WIDTH_FLAG: u32 = 1 << 27;
+const PRECISION_FLAG: u32 = 1 << 28;
+const ALIGN_BITS: u32 = 0b11 << 29;
+const ALIGN_UNKNOWN: u32 = 3 << 29;
+const DEFAULT_FLAGS: u32 = DEFAULT_FILL | ALIGN_UNKNOWN;
+const UNSUPPORTED_FLAGS_MASK: u32 =
+    (1 << 31) | SIGN_MINUS_FLAG | DEBUG_LOWER_HEX_FLAG | DEBUG_UPPER_HEX_FLAG;
+
+/// Decodes a Rust 1.99 `format_args!` template byte sequence (`core/src/fmt/mod.rs:662-702`):
+/// literal runs length-prefixed (`0x80` for a two-byte length), `0xC0..=0xFF` placeholders,
+/// `0x00` terminator. Fails closed (`None`) on any indirect width/precision, explicit `arg_index`,
+/// custom fill character, explicit alignment (`<`/`>`/`^`), `-` flag, or debug hex flag.
+pub(crate) fn decode_template(bytes: &[u8]) -> Option<(Vec<String>, Vec<PlaceholderSpec>)> {
     let mut pieces = vec![String::new()];
+    let mut specs = Vec::new();
     let mut cursor = 0;
     loop {
         let header = *bytes.get(cursor)?;
         cursor += 1;
         match header {
-            0 => return (cursor == bytes.len()).then_some(pieces),
+            0 => return (cursor == bytes.len()).then_some((pieces, specs)),
             1..=0x7f => {
                 let end = cursor
                     .checked_add(usize::from(header))
@@ -445,7 +572,53 @@ pub(crate) fn decode_template(bytes: &[u8]) -> Option<Vec<String>> {
                     .push_str(text);
                 cursor = end;
             }
-            0xc0 => pieces.push(String::new()),
+            0xc0 => {
+                specs.push(PlaceholderSpec::default());
+                pieces.push(String::new());
+            }
+            0xc1..=0xff => {
+                // Decline explicit `arg_index` (bit 3), indirect width (bit 4), indirect precision (bit 5).
+                if header & 0x38 != 0 {
+                    return None;
+                }
+                let flags = if header & 1 != 0 {
+                    let raw = bytes.get(cursor..cursor + 4)?;
+                    cursor += 4;
+                    u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])
+                } else {
+                    DEFAULT_FLAGS
+                };
+                let width = if header & 2 != 0 {
+                    let raw = bytes.get(cursor..cursor + 2)?;
+                    cursor += 2;
+                    Some(u16::from_le_bytes([raw[0], raw[1]]))
+                } else {
+                    None
+                };
+                let precision = if header & 4 != 0 {
+                    let raw = bytes.get(cursor..cursor + 2)?;
+                    cursor += 2;
+                    Some(u16::from_le_bytes([raw[0], raw[1]]))
+                } else {
+                    None
+                };
+                if (flags & FILL_MASK) != DEFAULT_FILL
+                    || (flags & ALIGN_BITS) != ALIGN_UNKNOWN
+                    || (flags & UNSUPPORTED_FLAGS_MASK) != 0
+                    || ((flags & WIDTH_FLAG) != 0) != width.is_some()
+                    || ((flags & PRECISION_FLAG) != 0) != precision.is_some()
+                {
+                    return None;
+                }
+                specs.push(PlaceholderSpec {
+                    sign_plus: (flags & SIGN_PLUS_FLAG) != 0,
+                    alternate: (flags & ALTERNATE_FLAG) != 0,
+                    zero_pad: (flags & SIGN_AWARE_ZERO_PAD_FLAG) != 0,
+                    width,
+                    precision,
+                });
+                pieces.push(String::new());
+            }
             _ => return None,
         }
     }
@@ -655,15 +828,18 @@ fn prove_site(
         return None;
     };
 
-    let pieces = decode_template(&view.const_bytes(*template)?)?;
+    let (pieces, specs) = decode_template(&view.const_bytes(*template)?)?;
     let (elements, list_spine) = view.list_elements(*list)?;
     spine.extend(list_spine);
+    if specs.len() != elements.len() || pieces.len() != elements.len() + 1 {
+        return None;
+    }
 
     let mut args = Vec::with_capacity(elements.len());
     let mut display_calls = Vec::with_capacity(elements.len());
     let mut callees: BTreeSet<ItemId> = BTreeSet::new();
     callees.insert(new_item);
-    for element in &elements {
+    for (element, &spec) in elements.iter().zip(&specs) {
         let mut at = *element;
         spine.push(at);
         let mut chain = Vec::new();
@@ -680,10 +856,12 @@ fn prove_site(
         };
         renames.extend(chain.into_iter().map(|rename| (rename, value)));
         let display_call = view.def_at(value)?;
-        let (StandardOperation::FormatArgumentNewDisplay, display_item) =
-            *machinery.get(&display_call)?
-        else {
-            return None;
+        let (arg_op, display_item) = *machinery.get(&display_call)?;
+        let format = match arg_op {
+            StandardOperation::FormatArgumentNewDisplay => ArgFormat::Display,
+            StandardOperation::FormatArgumentNewLowerHex => ArgFormat::LowerHex,
+            StandardOperation::FormatArgumentNewUpperHex => ArgFormat::UpperHex,
+            _ => return None,
         };
         let OpKind::Call {
             args: display_args, ..
@@ -695,17 +873,19 @@ fn prove_site(
             return None;
         };
         let (root, path, kind) = view.display_source(*reference)?;
+        if !supported_arg_spec(format, kind, spec) {
+            return None;
+        }
         args.push(DisplayArg {
             kind,
+            format,
+            spec,
             value,
             root,
             path,
         });
         display_calls.push(display_call);
         callees.insert(display_item);
-    }
-    if pieces.len() != args.len() + 1 {
-        return None;
     }
     // Every spine value carries a native text after the commit, so anything else reading one
     // would read the wrong shape: each must be used exactly once, along the spine.
@@ -778,21 +958,41 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
     let marked = |v: ValueId| cx.func.values[v.0 as usize].carrier != Carrier::Baseline;
     let view = View::new(cx.func, cx.table, cx.interns);
     match operation {
-        StandardOperation::FormatArgumentNewDisplay => {
+        StandardOperation::FormatArgumentNewDisplay
+        | StandardOperation::FormatArgumentNewLowerHex
+        | StandardOperation::FormatArgumentNewUpperHex => {
             let Some(result) = op.result.filter(|result| marked(*result)) else {
                 return Ok(None);
             };
             let [reference] = args.as_slice() else {
-                return Err(kernel_decline("marked new_display arity"));
+                return Err(kernel_decline("marked new_argument arity"));
             };
             let Some((root, path, kind)) = view.display_source(*reference) else {
-                return Err(kernel_decline("marked new_display has no proven source"));
+                return Err(kernel_decline("marked new_argument has no proven source"));
             };
-            let text = display_text(
+            let format = match operation {
+                StandardOperation::FormatArgumentNewDisplay => ArgFormat::Display,
+                StandardOperation::FormatArgumentNewLowerHex => ArgFormat::LowerHex,
+                StandardOperation::FormatArgumentNewUpperHex => ArgFormat::UpperHex,
+                _ => unreachable!(),
+            };
+            let Some(spec) = find_placeholder_spec(&view, cx.items, result) else {
+                return Err(kernel_decline(
+                    "marked new_argument has no unique Arguments::new consumer",
+                ));
+            };
+            if !supported_arg_spec(format, kind, spec) {
+                return Err(kernel_decline(
+                    "marked new_argument placeholder spec unsupported",
+                ));
+            }
+            let text = format_text(
                 cx,
                 root,
                 &path,
                 kind,
+                format,
+                spec,
                 cx.func.values[result.0 as usize].carrier,
             )?;
             Ok(Some(Lowered::value(text)))
@@ -805,7 +1005,7 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
             let [template, list] = args.as_slice() else {
                 return Err(kernel_decline("marked Arguments::new arity"));
             };
-            let pieces = view
+            let (pieces, _) = view
                 .const_bytes(*template)
                 .as_deref()
                 .and_then(decode_template)
@@ -924,8 +1124,65 @@ fn kernel_decline(detail: &str) -> crate::jir::decline::Decline {
     decline(OpClass::Call, format!("format kernel: {detail}"))
 }
 
-/// The host text of one display argument (v1 `display_text_from_ref`): the place read, wrapped
-/// by its proven kind. `mark` is the committed carrier of the `new_display` result, which for a
+/// Finds the unique `Arguments::new` call whose element array consumes `arg_result` and returns
+/// its decoded [`PlaceholderSpec`] at that element's index. Fails closed (`None`) unless
+/// `arg_result` appears in exactly one element of one marked `Arguments::new` call.
+fn find_placeholder_spec(
+    view: &View<'_>,
+    items: &crate::lower::js::host::ItemIndex,
+    arg_result: ValueId,
+) -> Option<PlaceholderSpec> {
+    let mut found: Option<PlaceholderSpec> = None;
+    for block in &view.func.blocks {
+        for op in &block.ops {
+            let OpKind::Call {
+                callee: Callee::Direct { item, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if items.get(item).and_then(|e| e.standard) != Some(StandardOperation::FormatArgsNew) {
+                continue;
+            }
+            let Some(res) = op.result else {
+                continue;
+            };
+            if view.func.values[res.0 as usize].carrier == Carrier::Baseline {
+                continue;
+            }
+            let [template, list] = args.as_slice() else {
+                continue;
+            };
+            let Some((elements, _)) = view.list_elements(*list) else {
+                continue;
+            };
+            let Some((_, specs)) = view
+                .const_bytes(*template)
+                .as_deref()
+                .and_then(decode_template)
+            else {
+                continue;
+            };
+            if specs.len() != elements.len() {
+                continue;
+            }
+            for (elem, &spec) in elements.iter().zip(&specs) {
+                if view.chase_copies(*elem) == arg_result {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(spec);
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The host text of one formatted argument: the place read, wrapped by its proven kind, format,
+/// and placeholder options. `mark` is the committed carrier of the `new_*` result, which for a
 /// `String` source records the source's own carrier.
 ///
 /// Every piece a site concatenates is well formed on its own, so the concatenation is exactly
@@ -933,54 +1190,226 @@ fn kernel_decline(detail: &str) -> crate::jir::decline::Decline {
 /// into a scalar the baseline never held. A host `&str` is the one piece that may hold a lone
 /// surrogate, so it is taken as Rust holds it (`__rt.native_str_wf`: U+FFFD) where it is read.
 /// Everything else is well formed by construction: the template's literal pieces are decoded
-/// UTF-8 (`decode_template`), the integer, `bool` and `f64` texts are ASCII, a `char` is one
-/// scalar, and a native `String` source's text is itself only ever built from such pieces.
-fn display_text(
+/// UTF-8 (`decode_template`), the integer, `bool`, `f64`, and `f32` texts are ASCII, a `char` is
+/// one scalar, and a native `String` source's text is itself only ever built from such pieces.
+fn format_text(
     cx: &JsCx<'_>,
     root: Root,
     path: &[Proj],
     kind: DisplayKind,
+    format: ArgFormat,
+    spec: PlaceholderSpec,
     mark: Carrier,
 ) -> Res<Expr> {
     let walk = cx.walk_place(&root, path)?;
     let loaded = cx.read_place(&walk.place);
-    Ok(match kind {
-        DisplayKind::Integer => jsast::call(jsast::id("String"), vec![loaded]),
-        DisplayKind::Bool => jsast::cond(loaded, jsast::string("true"), jsast::string("false")),
-        DisplayKind::Char => crate::lower::bstr::char_text(loaded),
-        // The planner accounts the members a site reaches (`representation`): the set is a sink.
-        DisplayKind::Str => super::string::well_formed(loaded, &mut BTreeSet::new()),
-        DisplayKind::F64 => {
-            jsast::member(jsast::rt_call("native_f64_to_string", vec![loaded]), "text")
+    Ok(match (format, kind) {
+        (ArgFormat::Display, DisplayKind::Integer { .. }) => {
+            if spec.is_default() {
+                jsast::call(jsast::id("String"), vec![loaded])
+            } else {
+                jsast::rt_call(
+                    "fmt_int_dec",
+                    vec![
+                        loaded,
+                        jsast::num(f64::from(spec.width.unwrap_or(0))),
+                        jsast::boolean(spec.zero_pad),
+                        jsast::boolean(spec.sign_plus),
+                    ],
+                )
+            }
         }
-        DisplayKind::String => match mark {
+        (ArgFormat::LowerHex | ArgFormat::UpperHex, DisplayKind::Integer { signed, bits }) => {
+            let upper = format == ArgFormat::UpperHex;
+            if can_inline_unsigned_hex(signed, bits, spec) {
+                let mut expr = jsast::method_call(loaded, "toString", vec![jsast::num(16)]);
+                if upper {
+                    expr = jsast::method_call(expr, "toUpperCase", Vec::new());
+                }
+                if let Some(width) = spec.width.filter(|w| *w > 0) {
+                    expr = jsast::method_call(
+                        expr,
+                        "padStart",
+                        vec![jsast::num(f64::from(width)), jsast::string("0")],
+                    );
+                }
+                expr
+            } else {
+                jsast::rt_call(
+                    "fmt_int_hex",
+                    vec![
+                        loaded,
+                        jsast::num(f64::from(bits)),
+                        jsast::boolean(upper),
+                        jsast::num(f64::from(spec.width.unwrap_or(0))),
+                        jsast::boolean(spec.zero_pad),
+                        jsast::boolean(spec.alternate),
+                    ],
+                )
+            }
+        }
+        (ArgFormat::Display, DisplayKind::Bool) => {
+            jsast::cond(loaded, jsast::string("true"), jsast::string("false"))
+        }
+        (ArgFormat::Display, DisplayKind::Char) => crate::lower::bstr::char_text(loaded),
+        // The planner accounts the members a site reaches (`representation`): the set is a sink.
+        (ArgFormat::Display, DisplayKind::Str) => {
+            super::string::well_formed(loaded, &mut BTreeSet::new())
+        }
+        (ArgFormat::Display, DisplayKind::F64) => match spec.precision {
+            Some(prec) => jsast::rt_call(
+                "fmt_float_fixed",
+                vec![
+                    loaded,
+                    jsast::num(f64::from(prec)),
+                    jsast::boolean(spec.sign_plus),
+                ],
+            ),
+            None => jsast::member(jsast::rt_call("native_f64_to_string", vec![loaded]), "text"),
+        },
+        (ArgFormat::Display, DisplayKind::F32) => match spec.precision {
+            Some(prec) => jsast::rt_call(
+                "fmt_float_fixed",
+                vec![
+                    loaded,
+                    jsast::num(f64::from(prec)),
+                    jsast::boolean(spec.sign_plus),
+                ],
+            ),
+            None => jsast::member(jsast::rt_call("native_f32_to_string", vec![loaded]), "text"),
+        },
+        (ArgFormat::Display, DisplayKind::String) => match mark {
             Carrier::StringBuilder => jsast::member(loaded, "text"),
             _ => loaded,
         },
+        _ => return Err(kernel_decline("unsupported format/kind combination")),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::decode_template;
+    use super::{
+        decode_template, PlaceholderSpec, ALIGN_UNKNOWN, ALTERNATE_FLAG, DEFAULT_FILL,
+        PRECISION_FLAG, SIGN_AWARE_ZERO_PAD_FLAG, SIGN_PLUS_FLAG, WIDTH_FLAG,
+    };
 
     #[test]
     fn the_default_template_encoding_decodes_to_v1_pieces() {
         assert_eq!(
             decode_template(b"\x02x=\xc0\0").unwrap(),
-            vec!["x=".to_owned(), String::new()]
+            (
+                vec!["x=".to_owned(), String::new()],
+                vec![PlaceholderSpec::default()]
+            )
         );
         assert_eq!(
             decode_template(b"\xc0\x02px\0").unwrap(),
-            vec![String::new(), "px".to_owned()]
+            (
+                vec![String::new(), "px".to_owned()],
+                vec![PlaceholderSpec::default()]
+            )
         );
         assert_eq!(
             decode_template(b"\x05item:\xc0\x01:\xc0\0").unwrap(),
-            vec!["item:".to_owned(), ":".to_owned(), String::new()]
+            (
+                vec!["item:".to_owned(), ":".to_owned(), String::new()],
+                vec![PlaceholderSpec::default(), PlaceholderSpec::default()]
+            )
         );
-        assert_eq!(decode_template(&[0]).unwrap(), vec![String::new()]);
-        // A non-default placeholder (width, `{0}` reuse, Debug) is not a template this decodes.
+        assert_eq!(
+            decode_template(&[0]).unwrap(),
+            (vec![String::new()], Vec::new())
+        );
+        // Truncated or malformed templates decline.
         assert!(decode_template(&[0xc1, 0]).is_none());
         assert!(decode_template(b"\x02x=").is_none());
+    }
+
+    #[test]
+    fn extended_template_decodes_precision_hex_zero_pad_and_declines_unsupported() {
+        // `{:.3}`: header = 0xC0 | 1 (flags) | 4 (precision) = 0xC5
+        let mut prec3 = vec![0xc5];
+        prec3.extend_from_slice(&(DEFAULT_FILL | ALIGN_UNKNOWN | PRECISION_FLAG).to_le_bytes());
+        prec3.extend_from_slice(&3u16.to_le_bytes());
+        prec3.push(0);
+        assert_eq!(
+            decode_template(&prec3).unwrap(),
+            (
+                vec![String::new(), String::new()],
+                vec![PlaceholderSpec {
+                    precision: Some(3),
+                    ..PlaceholderSpec::default()
+                }]
+            )
+        );
+
+        // `{:#08x}`: header = 0xC0 | 1 (flags) | 2 (width) = 0xC3
+        let mut hex08 = vec![0xc3];
+        hex08.extend_from_slice(
+            &(DEFAULT_FILL
+                | ALIGN_UNKNOWN
+                | ALTERNATE_FLAG
+                | SIGN_AWARE_ZERO_PAD_FLAG
+                | WIDTH_FLAG)
+                .to_le_bytes(),
+        );
+        hex08.extend_from_slice(&8u16.to_le_bytes());
+        hex08.push(0);
+        assert_eq!(
+            decode_template(&hex08).unwrap(),
+            (
+                vec![String::new(), String::new()],
+                vec![PlaceholderSpec {
+                    alternate: true,
+                    zero_pad: true,
+                    width: Some(8),
+                    ..PlaceholderSpec::default()
+                }]
+            )
+        );
+
+        // `{:+05}`: sign_plus + zero_pad + width
+        let mut dec_plus = vec![0xc3];
+        dec_plus.extend_from_slice(
+            &(DEFAULT_FILL
+                | ALIGN_UNKNOWN
+                | SIGN_PLUS_FLAG
+                | SIGN_AWARE_ZERO_PAD_FLAG
+                | WIDTH_FLAG)
+                .to_le_bytes(),
+        );
+        dec_plus.extend_from_slice(&5u16.to_le_bytes());
+        dec_plus.push(0);
+        assert_eq!(
+            decode_template(&dec_plus).unwrap(),
+            (
+                vec![String::new(), String::new()],
+                vec![PlaceholderSpec {
+                    sign_plus: true,
+                    zero_pad: true,
+                    width: Some(5),
+                    ..PlaceholderSpec::default()
+                }]
+            )
+        );
+
+        // Explicit arg_index (bit 3 = 0x08), indirect width (0x10), indirect precision (0x20) decline.
+        assert!(decode_template(&[0xc8, 0, 0, 0]).is_none());
+        assert!(decode_template(&[0xd2, 0, 0, 0]).is_none());
+        assert!(decode_template(&[0xe4, 0, 0, 0]).is_none());
+
+        // Custom fill char declines.
+        let mut custom_fill = vec![0xc3];
+        custom_fill.extend_from_slice(&('*' as u32 | ALIGN_UNKNOWN | WIDTH_FLAG).to_le_bytes());
+        custom_fill.extend_from_slice(&4u16.to_le_bytes());
+        custom_fill.push(0);
+        assert!(decode_template(&custom_fill).is_none());
+
+        // Explicit alignment (ALIGN_LEFT = 0 << 29) declines.
+        let mut explicit_align = vec![0xc3];
+        explicit_align.extend_from_slice(&(DEFAULT_FILL | WIDTH_FLAG).to_le_bytes());
+        explicit_align.extend_from_slice(&4u16.to_le_bytes());
+        explicit_align.push(0);
+        assert!(decode_template(&explicit_align).is_none());
     }
 }

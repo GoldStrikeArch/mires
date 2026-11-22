@@ -49,6 +49,16 @@ struct ScalarOrigin {
     size: u64,
 }
 
+/// Whether `item` is replaced whole during lowering by a pure host-delegated body with no
+/// outgoing Rust calls or byte views (`lower/semantic_ops/num.rs`).
+fn is_host_delegated_body(item: &LinkItem) -> bool {
+    matches!(
+        item.jir.body.as_ref().map(|b| b.semantic),
+        Some(rcgjs_object::jir::semantic::BodySemantic::Standard(op))
+            if crate::lower::semantic_ops::num::is_float_from_str(op)
+    )
+}
+
 /// Computes the conservative whole-program [`ByteViewPlan`] over items reachable from program roots.
 pub fn analyze_reachable(
     table: &BTreeMap<JsName, LinkItem>,
@@ -64,6 +74,9 @@ pub fn analyze_reachable(
 
     for name in &reachable_items {
         if native_bodies.contains_key(name) {
+            continue;
+        }
+        if table.get(name).is_some_and(is_host_delegated_body) {
             continue;
         }
         let Some(entry) = funcs.get(name) else {
@@ -259,6 +272,9 @@ fn collect_reachable_items(
         let Some(item) = table.get(&name) else {
             continue;
         };
+        if is_host_delegated_body(item) {
+            continue;
+        }
         if let (Some(Ok(func)), Some(interns)) = (funcs.get(&name), item.jir.interns()) {
             let reached = reachable_blocks(func, &interns.types);
             let mut reachable_refs = BTreeSet::new();

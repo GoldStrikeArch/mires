@@ -472,7 +472,9 @@ fn signature_of(operation: StandardOperation) -> Signature {
         StandardOperation::IntToString => sig(vec![I32_REF], STRING),
         StandardOperation::BoolToString => sig(vec![BOOL_REF], STRING),
         StandardOperation::CharToString => sig(vec![CHAR_REF], STRING),
-        StandardOperation::FormatArgumentNewDisplay => sig(vec![I32_REF], ARGUMENT),
+        StandardOperation::FormatArgumentNewDisplay
+        | StandardOperation::FormatArgumentNewLowerHex
+        | StandardOperation::FormatArgumentNewUpperHex => sig(vec![I32_REF], ARGUMENT),
         StandardOperation::FormatArgsNew => sig(vec![PIECES_REF, ARGS_REF], ARGUMENTS),
         StandardOperation::FormatArgsToString => sig(vec![ARGUMENTS], STRING),
         StandardOperation::VecNew => sig(vec![], VEC_U32),
@@ -753,6 +755,20 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
 }"#,
     ),
     (
+        StandardOperation::FormatArgumentNewLowerHex,
+        None,
+        r#"function f($native0) {
+  return __rt.fmt_int_hex($native0.buf[$native0.off], 32, false, 0, false, false);
+}"#,
+    ),
+    (
+        StandardOperation::FormatArgumentNewUpperHex,
+        None,
+        r#"function f($native0) {
+  return __rt.fmt_int_hex($native0.buf[$native0.off], 32, true, 0, false, false);
+}"#,
+    ),
+    (
         StandardOperation::FormatArgsNew,
         None,
         r#"function f($native0, $native1) {
@@ -959,6 +975,8 @@ const SUPPORTED: &[(StandardOperation, &[Option<Carrier>])] = &[
     (StandardOperation::BoolToString, &[HOST, BUILDER]),
     (StandardOperation::CharToString, &[HOST, BUILDER]),
     (StandardOperation::FormatArgumentNewDisplay, &[None]),
+    (StandardOperation::FormatArgumentNewLowerHex, &[None]),
+    (StandardOperation::FormatArgumentNewUpperHex, &[None]),
     (StandardOperation::FormatArgsNew, &[None]),
     (StandardOperation::FormatArgsToString, &[HOST, BUILDER]),
     (StandardOperation::VecNew, &[NATIVE]),
@@ -1001,6 +1019,8 @@ fn registry_covers_exactly_the_34_supported_operations() {
         BoolToString,
         CharToString,
         FormatArgumentNewDisplay,
+        FormatArgumentNewLowerHex,
+        FormatArgumentNewUpperHex,
         FormatArgsNew,
         FormatArgsToString,
         VecNew,
@@ -1026,8 +1046,10 @@ fn registry_covers_exactly_the_34_supported_operations() {
         VecSwap,
         StringFmtWriteFmt,
         StringFmtSpecWriteFmt,
+        F64FromStr,
+        F32FromStr,
     ];
-    assert_eq!(lowered.len() + declined.len(), 39);
+    assert_eq!(lowered.len() + declined.len(), 43);
     for operation in lowered {
         let op = registry(operation)
             .unwrap_or_else(|| panic!("{operation:?} must have a registry entry"));
@@ -2745,7 +2767,11 @@ fn kernel_site_table(variable: &str, prefix: &str) -> String {
                 SiteArg::F64 => "'F64'",
             })
             .collect();
-        let literals: Vec<String> = literals.iter().map(|piece| format!("{piece:?}")).collect();
+        let literals: Vec<String> = literals
+            .0
+            .iter()
+            .map(|piece| format!("{piece:?}"))
+            .collect();
         sites.push_str(&format!(
             "  {{ name: '{prefix}_{name}', fn: {prefix}_{name}, kinds: [{}], literals: [{}] }},\n",
             kinds.join(", "),

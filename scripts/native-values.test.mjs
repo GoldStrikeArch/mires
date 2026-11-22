@@ -185,6 +185,59 @@ test("native f64 strings match Rust default Display", () => {
   }
 });
 
+test("host dec2flt (parse_f64 and parse_f32) matches Rust grammar and double-rounding rules", () => {
+  for (const bad of ["", " ", "+", "-", ".", "1e", "1e+", "0x10", "1_0", " 1.0", "1.0 ", "infin", "nana"]) {
+    assert.equal(rt.parse_f64(bad), undefined);
+    assert.equal(rt.parse_f32(bad), undefined);
+  }
+  assert.equal(Object.is(rt.parse_f64("-0.0"), -0), true);
+  assert.equal(Object.is(rt.parse_f32("-0.0"), -0), true);
+  assert.equal(rt.parse_f64("+Infinity"), Infinity);
+  assert.equal(rt.parse_f64("-inf"), -Infinity);
+  assert.equal(Number.isNaN(rt.parse_f64("NaN")), true);
+  assert.equal(Number.isNaN(rt.parse_f64("-nan")), true);
+  const dv = new DataView(new ArrayBuffer(8));
+  dv.setFloat64(0, rt.parse_f64("-nan"), false);
+  assert.equal(dv.getUint32(0, false) >>> 31, 1);
+
+  // Known f32 double-rounding traps
+  const f32Bits = (v) => {
+    dv.setFloat32(0, v, false);
+    return dv.getUint32(0, false);
+  };
+  assert.equal(f32Bits(rt.parse_f32("7.038531e-26")), 0x15ae43fd);
+  assert.equal(f32Bits(rt.parse_f32("1.000000059604644775390625")), 0x3f800000);
+  assert.equal(f32Bits(rt.parse_f32("1.00000005960464477539062500000000000000000000001")), 0x3f800001);
+  assert.equal(f32Bits(rt.parse_f32("1.000000178813934326171875")), 0x3f800002);
+  assert.equal(f32Bits(rt.parse_f32("1.00000017881393432617187499999999999999999999999")), 0x3f800001);
+  assert.equal(f32Bits(rt.parse_f32("3.40282356779733661637539395458142568447999999e38")), 0x7f7fffff);
+  assert.equal(f32Bits(rt.parse_f32("3.40282356779733661637539395458142568448000001e38")), 0x7f800000);
+  assert.equal(f32Bits(rt.parse_f32("7.006492321624085354618647916449580656401309709382578858785341419448955413429303007433190941810607910156249e-46")), 0x00000000);
+  assert.equal(f32Bits(rt.parse_f32("7.006492321624085354618647916449580656401309709382578858785341419448955413429303007433190941810607910156251e-46")), 0x00000001);
+});
+
+test("host float fixed/f32-shortest and integer hex/dec formatters match Rust", () => {
+  assert.equal(rt.fmt_float_fixed(0.5, 0, false), "0");
+  assert.equal(rt.fmt_float_fixed(1.5, 0, false), "2");
+  assert.equal(rt.fmt_float_fixed(2.5, 0, false), "2");
+  assert.equal(rt.fmt_float_fixed(3.5, 0, false), "4");
+  assert.equal(rt.fmt_float_fixed(-0.0, 3, false), "-0.000");
+  assert.equal(rt.fmt_float_fixed(NaN, 2, true), "NaN");
+  assert.equal(rt.fmt_float_fixed(Infinity, 2, true), "+inf");
+  assert.equal(rt.fmt_float_fixed(1.005, 2, false), "1.00");
+  assert.equal(rt.fmt_float_fixed(1e25, 0, false), "10000000000000000905969664");
+  assert.equal(rt.native_f32_to_string(Math.fround(0.1)).text, "0.1");
+  assert.equal(rt.native_f32_to_string(Math.fround(1 / 3)).text, "0.33333334");
+  assert.equal(rt.fmt_int_hex(-1, 8, false, 0, false, false), "ff");
+  assert.equal(rt.fmt_int_hex(-1, 32, false, 0, false, false), "ffffffff");
+  assert.equal(rt.fmt_int_hex(10, 8, true, 6, false, true), "   0xA");
+  assert.equal(rt.fmt_int_hex(10, 8, false, 6, true, true), "0x000a");
+  assert.equal(rt.fmt_int_hex(BigInt("-1"), 64, false, 0, false, false), "ffffffffffffffff");
+  assert.equal(rt.fmt_int_dec(-42, 5, true, false), "-0042");
+  assert.equal(rt.fmt_int_dec(42, 5, true, true), "+0042");
+  assert.equal(rt.fmt_int_dec(0, 0, false, true), "+0");
+});
+
 test("native vectors retain capacity and clear removed slots", () => {
   const value = rt.native_vec_new(4);
   assert.equal(value.buf.length, 4);

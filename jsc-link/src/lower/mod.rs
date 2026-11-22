@@ -310,6 +310,18 @@ pub fn lower_func_with_ascii(
     if let Some(forced) = forced_semantic_rewrite(input) {
         return forced;
     }
+    if let crate::jir::semantic::BodySemantic::Standard(
+        op @ (crate::jir::semantic::StandardOperation::F64FromStr
+        | crate::jir::semantic::StandardOperation::F32FromStr),
+    ) = input.body.semantic
+    {
+        if let Some(lowered) = semantic_ops::num::lower_float_from_str(
+            input,
+            op == crate::jir::semantic::StandardOperation::F32FromStr,
+        ) {
+            return lowered;
+        }
+    }
     let plan = fuse::plan(func, input.origins, input.table, input.interns, input.opts);
     let force_dispatch = matches!(input.opts.structure, crate::opts::Structure::Trampoline);
     let structured = structure::structure(func, &plan, input.table, force_dispatch)?;

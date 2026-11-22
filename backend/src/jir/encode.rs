@@ -2404,10 +2404,15 @@ fn str_operation<'tcx>(
 fn call_semantic_for_operation(operation: StandardOperation) -> CallSemantic {
     // Proven format sinks are inlined by the language kernel; keeping those calls Ordinary lets a
     // user function join a native String region without staging `format` itself (v1 rule).
+    // Float `FromStr` bodies are replaced whole during lowering, not representation-planned.
     match operation {
         StandardOperation::FormatArgsToString
         | StandardOperation::FormatArgsNew
-        | StandardOperation::FormatArgumentNewDisplay => CallSemantic::Ordinary,
+        | StandardOperation::FormatArgumentNewDisplay
+        | StandardOperation::FormatArgumentNewLowerHex
+        | StandardOperation::FormatArgumentNewUpperHex
+        | StandardOperation::F64FromStr
+        | StandardOperation::F32FromStr => CallSemantic::Ordinary,
         other => CallSemantic::Standard(other),
     }
 }
@@ -2454,6 +2459,10 @@ fn standard_operation_v2(operation: crate::late_ir::StandardOperation) -> Standa
         V1::FormatArgumentNewDisplay => StandardOperation::FormatArgumentNewDisplay,
         V1::FormatArgsNew => StandardOperation::FormatArgsNew,
         V1::FormatArgsToString => StandardOperation::FormatArgsToString,
+        V1::FormatArgumentNewLowerHex => StandardOperation::FormatArgumentNewLowerHex,
+        V1::FormatArgumentNewUpperHex => StandardOperation::FormatArgumentNewUpperHex,
+        V1::F64FromStr => StandardOperation::F64FromStr,
+        V1::F32FromStr => StandardOperation::F32FromStr,
     }
 }
 

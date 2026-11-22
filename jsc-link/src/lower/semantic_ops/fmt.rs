@@ -87,6 +87,35 @@ pub(super) fn format_argument_new_display(
     Ok(vec![jsast::ret(format_display_text(cx, helpers)?)])
 }
 
+/// `Argument::new_lower_hex` / `Argument::new_upper_hex` for a proven integer value: the
+/// argument's host hex text. Call-site kernel inlining supplies the placeholder flags/width;
+/// this body exists so a DCE'd constructor stays a proven standard operation.
+pub(super) fn format_argument_new_hex(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    let upper = matches!(
+        cx.semantic,
+        crate::jir::semantic::BodySemantic::Standard(StandardOperation::FormatArgumentNewUpperHex)
+    );
+    let argument = slot_type(cx.sig, SignatureSlot::Argument(0))?;
+    let bits = format_hex_bits(cx, argument)?;
+    helpers.insert("fmt_int_hex");
+    Ok(vec![jsast::ret(jsast::rt_call(
+        "fmt_int_hex",
+        vec![
+            super::slot_load(receiver()),
+            jsast::num(f64::from(bits)),
+            jsast::boolean(upper),
+            jsast::num(0),
+            jsast::boolean(false),
+            jsast::boolean(false),
+        ],
+    ))])
+}
+
 /// Native `Arguments` is the concatenated host string. Call-site kernel inlining supplies the
 /// static pieces; this body exists so a DCE'd `Arguments::new` stays a proven standard operation.
 pub(super) fn format_args_new(
@@ -147,6 +176,7 @@ enum FormatDisplayKind {
     Str,
     String,
     F64,
+    F32,
 }
 
 fn format_display_kind(
@@ -174,11 +204,35 @@ fn format_display_kind(
             TypeKind::Char if saw_reference => return Ok(FormatDisplayKind::Char),
             TypeKind::Str if saw_reference => return Ok(FormatDisplayKind::Str),
             TypeKind::Float { bits: 64 } if saw_reference => return Ok(FormatDisplayKind::F64),
+            TypeKind::Float { bits: 32 } if saw_reference => return Ok(FormatDisplayKind::F32),
             TypeKind::Adt { .. }
                 if saw_reference
                     && descriptor.meta.candidate == RepresentationCandidate::String =>
             {
                 return Ok(FormatDisplayKind::String);
+            }
+            _ => return Err(SemanticDecline::WrongArgumentType(0)),
+        }
+    }
+}
+
+fn format_hex_bits(cx: &LowerCx<'_>, argument: TypeId) -> Result<u32, SemanticDecline> {
+    let mut ty = argument;
+    let mut saw_reference = false;
+    loop {
+        let descriptor = type_get(cx.table, ty)?;
+        match &descriptor.kind {
+            TypeKind::Reference {
+                pointee,
+                mutable: false,
+            } => {
+                saw_reference = true;
+                ty = *pointee;
+            }
+            TypeKind::Integer { bits, .. }
+                if saw_reference && matches!(bits, 8 | 16 | 32 | 64 | 128) =>
+            {
+                return Ok(*bits);
             }
             _ => return Err(SemanticDecline::WrongArgumentType(0)),
         }
@@ -216,6 +270,10 @@ fn format_display_text(
         FormatDisplayKind::F64 => {
             helpers.insert("native_f64_to_string");
             jsast::member(jsast::rt_call("native_f64_to_string", vec![loaded]), "text")
+        }
+        FormatDisplayKind::F32 => {
+            helpers.insert("native_f32_to_string");
+            jsast::member(jsast::rt_call("native_f32_to_string", vec![loaded]), "text")
         }
     })
 }
@@ -378,6 +436,16 @@ pub(super) fn legality_char_to_string(cx: &LowerCx<'_>) -> Result<(), SemanticDe
 pub(super) fn legality_argument_new_display(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
     let argument = slot_type(cx.sig, SignatureSlot::Argument(0))?;
     format_display_kind(cx, argument)?;
+    let result = type_get(cx.table, cx.sig.result)?;
+    if !result.layout.sized || result.layout.zst {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    Ok(())
+}
+
+pub(super) fn legality_argument_new_hex(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    let argument = slot_type(cx.sig, SignatureSlot::Argument(0))?;
+    format_hex_bits(cx, argument)?;
     let result = type_get(cx.table, cx.sig.result)?;
     if !result.layout.sized || result.layout.zst {
         return Err(SemanticDecline::WrongReturnType);

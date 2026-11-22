@@ -233,6 +233,14 @@ pub enum StandardOperation {
     /// `<[u8]>::is_ascii`, the byte-slice method `str::is_ascii` is written with. It is a `str`
     /// call-site identity for the one reason the others are: only `js-str=bytes` lowers it.
     SliceIsAscii,
+    /// `Argument::new_lower_hex` for a proven integer type.
+    FormatArgumentNewLowerHex,
+    /// `Argument::new_upper_hex` for a proven integer type.
+    FormatArgumentNewUpperHex,
+    /// `<f64 as core::str::FromStr>::from_str`.
+    F64FromStr,
+    /// `<f32 as core::str::FromStr>::from_str`.
+    F32FromStr,
 }
 
 impl StandardOperation {

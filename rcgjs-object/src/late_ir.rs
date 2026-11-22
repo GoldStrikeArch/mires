@@ -658,6 +658,14 @@ pub enum StandardOperation {
     FormatArgsNew,
     /// The exact `fn(Arguments) -> String` that owns a formatted result.
     FormatArgsToString,
+    /// `Argument::new_lower_hex` for a proven integer type.
+    FormatArgumentNewLowerHex,
+    /// `Argument::new_upper_hex` for a proven integer type.
+    FormatArgumentNewUpperHex,
+    /// `<f64 as core::str::FromStr>::from_str`.
+    F64FromStr,
+    /// `<f32 as core::str::FromStr>::from_str`.
+    F32FromStr,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

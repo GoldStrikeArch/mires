@@ -1815,6 +1815,7 @@ fn canonical_clone_allowed(
             semantic,
             Some(BodySemantic::Standard(operation))
                 if crate::lower::semantic_ops::fmt_kernel::is_format_machinery(operation)
+                    || crate::lower::semantic_ops::num::is_float_from_str(operation)
         )
 }
 
@@ -1844,10 +1845,12 @@ fn refuses(
     // Format machinery keeps the exact call shape the call-site format kernel recognizes
     // (`lower/semantic_ops/fmt_kernel.rs`): a flattened `Arguments::new` caller would no longer
     // match a proven site, and the items are about to be dropped wherever the kernel commits.
+    // Host-delegated float `FromStr` bodies return a canonical `Result` directly from JS.
     if matches!(
         semantic,
         Some(BodySemantic::Standard(operation))
             if crate::lower::semantic_ops::fmt_kernel::is_format_machinery(operation)
+                || crate::lower::semantic_ops::num::is_float_from_str(operation)
     ) {
         return Some(BoundaryDecline::NonCallReference);
     }

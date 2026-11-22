@@ -977,8 +977,12 @@ fn collect_sites(
                     !matches!(
                         std_op,
                         crate::jir::semantic::StandardOperation::FormatArgumentNewDisplay
+                            | crate::jir::semantic::StandardOperation::FormatArgumentNewLowerHex
+                            | crate::jir::semantic::StandardOperation::FormatArgumentNewUpperHex
                             | crate::jir::semantic::StandardOperation::FormatArgsNew
                             | crate::jir::semantic::StandardOperation::FormatArgsToString
+                            | crate::jir::semantic::StandardOperation::F64FromStr
+                            | crate::jir::semantic::StandardOperation::F32FromStr
                     ) && !(crate::lower::bstr::enabled()
                         && matches!(std_op, crate::jir::semantic::StandardOperation::StringAsStr))
                 }
@@ -1016,6 +1020,17 @@ fn collect_sites(
             };
             if callee_func.sig.abi.inline_never {
                 stats.decline("inline.never");
+                continue;
+            }
+            if items
+                .get(&callee_func.item)
+                .and_then(|entry| entry.standard)
+                .is_some_and(|op| {
+                    crate::lower::semantic_ops::fmt_kernel::is_format_machinery(op)
+                        || crate::lower::semantic_ops::num::is_float_from_str(op)
+                })
+            {
+                stats.decline("inline.semantic-boundary");
                 continue;
             }
             let is_sole_caller = sole_referrer(&callee, caller);

@@ -2884,6 +2884,9 @@ impl Planner<'_> {
                 }
                 out.values[site.args_value.0 as usize].carrier = Carrier::HostString;
                 for arg in &site.args {
+                    if let Some(helper) = arg.required_helper() {
+                        members.insert(helper.to_owned());
+                    }
                     out.values[arg.value.0 as usize].carrier = match arg.kind {
                         // The mark records the source's own committed carrier, so the emission
                         // reads `.text` exactly when the source is a builder.
@@ -2892,10 +2895,6 @@ impl Planner<'_> {
                             .find(|(value, _)| *value == arg.value)
                             .and_then(|(_, label)| *label)
                             .unwrap_or(Carrier::HostString),
-                        DisplayKind::F64 => {
-                            members.insert("native_f64_to_string".to_owned());
-                            Carrier::HostString
-                        }
                         _ => Carrier::HostString,
                     };
                 }
@@ -2909,10 +2908,6 @@ impl Planner<'_> {
                     || dest == Some(Carrier::StringBuilder)
                 {
                     members.insert("str_len".to_owned());
-                }
-                // A host `&str` argument is displayed as Rust holds it (`fmt_kernel::display_text`).
-                if site.args.iter().any(|arg| arg.kind == DisplayKind::Str) {
-                    members.insert("native_str_wf".to_owned());
                 }
                 fmt_elide.insert(site.consumer);
                 fmt_elide.insert(site.new_call);
@@ -3907,6 +3902,8 @@ fn solver_blocked(operation: StandardOperation) -> bool {
         operation,
         StandardOperation::FormatArgsNew
             | StandardOperation::FormatArgumentNewDisplay
+            | StandardOperation::FormatArgumentNewLowerHex
+            | StandardOperation::FormatArgumentNewUpperHex
             | StandardOperation::FormatArgsToString
     )
 }

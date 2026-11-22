@@ -3782,6 +3782,146 @@ globalThis.__rt.native_str_byte_index = (text, utf16Index) => {
 globalThis.__rt.native_str_is_char_boundary = (text, byteIndex) =>
   globalThis.__rt.native_str_utf16_index(text, byteIndex) !== -1;
 
+globalThis.__rt._num_dv = new DataView(new ArrayBuffer(8));
+
+globalThis.__rt._f64_decomp = (mag) => {
+  const dv = globalThis.__rt._num_dv;
+  dv.setFloat64(0, mag, false);
+  const hi = dv.getUint32(0, false);
+  const lo = dv.getUint32(4, false);
+  const expBits = (hi >>> 20) & 0x7ff;
+  const frac = (BigInt(hi & 0xfffff) << BigInt("32")) | BigInt(lo);
+  if (expBits === 0) return [frac, -1074];
+  return [(BigInt("1") << BigInt("52")) | frac, expBits - 1075];
+};
+
+globalThis.__rt._f64_shortest_dk = (magnitude) => {
+  const rendered = String(magnitude).toLowerCase();
+  const exponentAt = rendered.indexOf("e");
+  const mantissa = exponentAt < 0 ? rendered : rendered.slice(0, exponentAt);
+  const exponent = exponentAt < 0 ? 0 : Number(rendered.slice(exponentAt + 1));
+  const point = mantissa.indexOf(".");
+  const fractionDigits = point < 0 ? 0 : mantissa.length - point - 1;
+  let digits = point < 0 ? mantissa : mantissa.slice(0, point) + mantissa.slice(point + 1);
+  let power = exponent - fractionDigits;
+  while (digits.length > 1 && digits.endsWith("0")) {
+    digits = digits.slice(0, -1);
+    power += 1;
+  }
+  let significand = BigInt(digits);
+  if ((significand & BigInt("1")) === BigInt("0") && magnitude !== 0) {
+    const parts = globalThis.__rt._f64_decomp(magnitude);
+    const mantissaBits = parts[0];
+    const binaryPower = parts[1];
+    let binaryNumerator;
+    let binaryDenominator;
+    if (binaryPower >= 0) {
+      binaryNumerator = mantissaBits << BigInt(binaryPower);
+      binaryDenominator = BigInt("1");
+    } else {
+      binaryNumerator = mantissaBits;
+      binaryDenominator = BigInt("1") << BigInt(-binaryPower);
+    }
+    const decimalScale = BigInt("10") ** BigInt(Math.abs(power));
+    const decimalNumerator = power >= 0 ? significand * decimalScale : significand;
+    const decimalDenominator = power >= 0 ? BigInt("1") : decimalScale;
+    const midpointNumerator = power >= 0
+      ? (BigInt("2") * significand + BigInt("1")) * decimalScale
+      : BigInt("2") * significand + BigInt("1");
+    const midpointDenominator = power >= 0 ? BigInt("2") : BigInt("2") * decimalScale;
+    const exactMidpoint =
+      binaryNumerator * midpointDenominator ===
+      midpointNumerator * binaryDenominator;
+    const belowValue =
+      decimalNumerator * binaryDenominator <
+      binaryNumerator * decimalDenominator;
+    if (exactMidpoint && belowValue) significand += BigInt("1");
+  }
+  digits = significand.toString();
+  return [digits, digits.length + power];
+};
+
+globalThis.__rt._f32_shortest_dk = (mag) => {
+  const dv = globalThis.__rt._num_dv;
+  dv.setFloat32(0, mag, false);
+  const bits = dv.getUint32(0, false);
+  const expBits = (bits >>> 23) & 0xff;
+  const frac = bits & 0x7fffff;
+  const ONE = BigInt("1");
+  const TWO = BigInt("2");
+  const TEN = BigInt("10");
+  let m;
+  let e;
+  let lowerHalf;
+  if (expBits === 0) {
+    m = BigInt(frac);
+    e = -149;
+    lowerHalf = false;
+  } else {
+    m = BigInt(0x800000 | frac);
+    e = expBits - 150;
+    lowerHalf = frac === 0 && expBits > 1;
+  }
+  const acceptBounds = (m & ONE) === BigInt("0");
+  let r = m << ONE;
+  let s = TWO;
+  let mPlus = ONE;
+  let mMinus = ONE;
+  if (lowerHalf) {
+    r <<= ONE;
+    s <<= ONE;
+    mPlus <<= ONE;
+  }
+  if (e >= 0) {
+    const eb = BigInt(e);
+    r <<= eb;
+    mPlus <<= eb;
+    mMinus <<= eb;
+  } else {
+    s <<= BigInt(-e);
+  }
+  let k = Math.ceil(Math.log10(mag));
+  if (k > 0) s *= TEN ** BigInt(k);
+  else if (k < 0) {
+    const p = TEN ** BigInt(-k);
+    r *= p;
+    mPlus *= p;
+    mMinus *= p;
+  }
+  while (acceptBounds ? (r + mPlus >= s) : (r + mPlus > s)) {
+    s *= TEN;
+    k += 1;
+  }
+  while (acceptBounds ? ((r + mPlus) * TEN < s) : ((r + mPlus) * TEN <= s)) {
+    r *= TEN;
+    mPlus *= TEN;
+    mMinus *= TEN;
+    k -= 1;
+  }
+  let digits = "";
+  for (;;) {
+    r *= TEN;
+    mPlus *= TEN;
+    mMinus *= TEN;
+    const d = r / s;
+    r = r % s;
+    const low = acceptBounds ? (r <= mMinus) : (r < mMinus);
+    const high = acceptBounds ? (r + mPlus >= s) : (r + mPlus > s);
+    if (!low && !high) digits += d.toString();
+    else if (low && !high) {
+      digits += d.toString();
+      break;
+    } else if (high && !low) {
+      digits += (d + ONE).toString();
+      break;
+    } else {
+      digits += (r * TWO < s ? d : d + ONE).toString();
+      break;
+    }
+  }
+  return [digits, k];
+};
+
 // Rust's default f64 Display uses the shortest round-tripping decimal in fixed
 // notation. JavaScript supplies the same shortest digits, but uses exponent
 // notation at its own thresholds and resolves an exact decimal midpoint toward
@@ -3794,65 +3934,12 @@ globalThis.__rt.native_f64_to_string = (value) => {
   else if (value === Infinity) text = "inf";
   else if (value === -Infinity) text = "-inf";
   else if (Object.is(value, -0)) text = "-0";
+  else if (value === 0) text = "0";
   else {
     const negative = value < 0;
-    const magnitude = negative ? -value : value;
-    const rendered = String(magnitude).toLowerCase();
-    const exponentAt = rendered.indexOf("e");
-    const mantissa = exponentAt < 0 ? rendered : rendered.slice(0, exponentAt);
-    const exponent = exponentAt < 0 ? 0 : Number(rendered.slice(exponentAt + 1));
-    const point = mantissa.indexOf(".");
-    const fractionDigits = point < 0 ? 0 : mantissa.length - point - 1;
-    let digits = point < 0 ? mantissa : mantissa.slice(0, point) + mantissa.slice(point + 1);
-    let power = exponent - fractionDigits;
-    while (digits.length > 1 && digits.endsWith("0")) {
-      digits = digits.slice(0, -1);
-      power += 1;
-    }
-
-    let significand = BigInt(digits);
-    if ((significand & BigInt("1")) === BigInt("0") && magnitude !== 0) {
-      const bits = new DataView(new ArrayBuffer(8));
-      bits.setFloat64(0, magnitude, false);
-      const high = bits.getUint32(0, false);
-      const low = bits.getUint32(4, false);
-      const exponentBits = (high >>> 20) & 0x7ff;
-      const fraction = (BigInt(high & 0xfffff) << BigInt("32")) | BigInt(low);
-      let binaryNumerator;
-      let binaryDenominator;
-      if (exponentBits === 0) {
-        binaryNumerator = fraction;
-        binaryDenominator = BigInt("1") << BigInt("1074");
-      } else {
-        const mantissaBits = (BigInt("1") << BigInt("52")) | fraction;
-        const binaryPower = exponentBits - 1075;
-        if (binaryPower >= 0) {
-          binaryNumerator = mantissaBits << BigInt(binaryPower);
-          binaryDenominator = BigInt("1");
-        } else {
-          binaryNumerator = mantissaBits;
-          binaryDenominator = BigInt("1") << BigInt(-binaryPower);
-        }
-      }
-
-      const decimalScale = BigInt("10") ** BigInt(Math.abs(power));
-      const decimalNumerator = power >= 0 ? significand * decimalScale : significand;
-      const decimalDenominator = power >= 0 ? BigInt("1") : decimalScale;
-      const midpointNumerator = power >= 0
-        ? (BigInt("2") * significand + BigInt("1")) * decimalScale
-        : BigInt("2") * significand + BigInt("1");
-      const midpointDenominator = power >= 0 ? BigInt("2") : BigInt("2") * decimalScale;
-      const exactMidpoint =
-        binaryNumerator * midpointDenominator ===
-        midpointNumerator * binaryDenominator;
-      const belowValue =
-        decimalNumerator * binaryDenominator <
-        binaryNumerator * decimalDenominator;
-      if (exactMidpoint && belowValue) significand += BigInt("1");
-    }
-
-    digits = significand.toString();
-    const decimalAt = digits.length + power;
+    const dk = globalThis.__rt._f64_shortest_dk(negative ? -value : value);
+    const digits = dk[0];
+    const decimalAt = dk[1];
     if (decimalAt <= 0) text = "0." + "0".repeat(-decimalAt) + digits;
     else if (decimalAt >= digits.length) text = digits + "0".repeat(decimalAt - digits.length);
     else text = digits.slice(0, decimalAt) + "." + digits.slice(decimalAt);
@@ -3861,6 +3948,438 @@ globalThis.__rt.native_f64_to_string = (value) => {
   // Every character of the rendering is ASCII: its UTF-16 length is its UTF-8
   // length, and an owned `String` built from it is exact-fit.
   return { text: text, cap: text.length, len: text.length };
+};
+
+// Rust's default f32 Display: exact shortest round-tripping binary32 decimal in
+// fixed notation (matching core::num::imp::flt2dec).
+globalThis.__rt.native_f32_to_string = (value) => {
+  let text;
+  if (Number.isNaN(value)) text = "NaN";
+  else if (value === Infinity) text = "inf";
+  else if (value === -Infinity) text = "-inf";
+  else if (Object.is(value, -0)) text = "-0";
+  else if (value === 0) text = "0";
+  else {
+    const negative = value < 0;
+    const dk = globalThis.__rt._f32_shortest_dk(negative ? -value : value);
+    const digits = dk[0];
+    const decimalAt = dk[1];
+    if (decimalAt <= 0) text = "0." + "0".repeat(-decimalAt) + digits;
+    else if (decimalAt >= digits.length) text = digits + "0".repeat(decimalAt - digits.length);
+    else text = digits.slice(0, decimalAt) + "." + digits.slice(decimalAt);
+    if (negative) text = "-" + text;
+  }
+  return { text: text, cap: text.length, len: text.length };
+};
+
+// Exact IEEE-754 round-half-to-even fixed-precision float formatter for both f64
+// and f32 (every finite f32 has the exact same rational value in binary64).
+globalThis.__rt.fmt_float_fixed = (val, prec, signPlus) => {
+  if (Number.isNaN(val)) return "NaN";
+  if (val === Infinity) return signPlus ? "+inf" : "inf";
+  if (val === -Infinity) return "-inf";
+  const neg = val < 0 || Object.is(val, -0);
+  const sign = neg ? "-" : (signPlus ? "+" : "");
+  const mag = neg ? -val : val;
+  if (mag === 0) return prec === 0 ? sign + "0" : sign + "0." + "0".repeat(prec);
+  const parts = globalThis.__rt._f64_decomp(mag);
+  const mant = parts[0];
+  const exp2 = parts[1];
+  if (exp2 >= 0) {
+    const intStr = (mant << BigInt(exp2)).toString();
+    return prec === 0 ? sign + intStr : sign + intStr + "." + "0".repeat(prec);
+  }
+  const shift = -exp2;
+  const FIVE = BigInt("5");
+  const ONE = BigInt("1");
+  const ZERO = BigInt("0");
+  if (prec >= shift) {
+    const exact = (mant * (FIVE ** BigInt(shift))).toString();
+    const trail = "0".repeat(prec - shift);
+    if (exact.length <= shift) {
+      return sign + "0." + "0".repeat(shift - exact.length) + exact + trail;
+    }
+    const split = exact.length - shift;
+    return sign + exact.slice(0, split) + "." + exact.slice(split) + trail;
+  }
+  const k = shift - prec;
+  const num = mant * (FIVE ** BigInt(prec));
+  const kb = BigInt(k);
+  let q = num >> kb;
+  const rem = num & ((ONE << kb) - ONE);
+  const half = ONE << BigInt(k - 1);
+  if (rem > half || (rem === half && (q & ONE) !== ZERO)) q += ONE;
+  const s = q.toString();
+  if (prec === 0) return sign + s;
+  if (s.length <= prec) return sign + "0." + "0".repeat(prec - s.length) + s;
+  const split = s.length - prec;
+  return sign + s.slice(0, split) + "." + s.slice(split);
+};
+
+// Integer hex formatting matching Rust `{:x}`/`{:X}`/`{:0Wx}`/`{:#0Wx}` for all
+// signed and unsigned integer widths (8..=128 bits). Note Rust `{:#X}` uses
+// lowercase `0x` prefix with uppercase hex digits.
+globalThis.__rt.fmt_int_hex = (val, bits, upper, width, zeroPad, alt) => {
+  let u;
+  if (bits <= 32) {
+    u = bits === 32 ? (val >>> 0) : (val & ((1 << bits) - 1));
+  } else {
+    u = BigInt.asUintN(bits, val);
+  }
+  let digits = u.toString(16);
+  if (upper) digits = digits.toUpperCase();
+  const prefix = alt ? "0x" : "";
+  if (width > 0) {
+    if (zeroPad) {
+      const pad = width - prefix.length;
+      return prefix + (pad > digits.length ? digits.padStart(pad, "0") : digits);
+    }
+    const full = prefix + digits;
+    return full.length < width ? full.padStart(width, " ") : full;
+  }
+  return prefix + digits;
+};
+
+// Integer decimal formatting matching Rust `{:0W}`/`{:+0W}`/`{:W}`/`{:+}` for all
+// signed and unsigned integer widths (8..=128 bits).
+globalThis.__rt.fmt_int_dec = (val, width, zeroPad, signPlus) => {
+  const neg = val < 0;
+  const sign = neg ? "-" : (signPlus ? "+" : "");
+  const digits = neg ? String(-val) : String(val);
+  if (width > 0) {
+    if (zeroPad) {
+      const pad = width - sign.length;
+      return sign + (pad > digits.length ? digits.padStart(pad, "0") : digits);
+    }
+    const full = sign + digits;
+    return full.length < width ? full.padStart(width, " ") : full;
+  }
+  return sign + digits;
+};
+
+// Host-delegated core::fmt::float parts builder for Formatter::pad_formatted_parts.
+// Modes: 0=fixed(prec), 1=shortest(minPrec), 2=exp_exact_lo(prec), 3=exp_exact_hi(prec),
+// 4=exp_short_lo, 5=exp_short_hi. Writes ASCII bytes into outPtr (len >= 800) and part
+// descriptors into metaPtr (len >= 10). Never throws.
+globalThis.__rt.rcgjs_fmt_float_parts = (val, isF32, mode, param, forceSign, outPtr, metaPtr) => {
+  const obuf = outPtr.buf;
+  const ooff = outPtr.off;
+  const mbuf = metaPtr.buf;
+  const moff = metaPtr.off;
+  let pos = 0;
+  let np = 0;
+  const pushCopy = (str) => {
+    const start = pos;
+    for (let i = 0; i < str.length; i++) obuf[ooff + pos++] = str.charCodeAt(i);
+    mbuf[moff + 2 + np * 2] = 0;
+    mbuf[moff + 3 + np * 2] = (start << 16) | str.length;
+    np += 1;
+  };
+  const pushZero = (count) => {
+    if (count <= 0) return;
+    mbuf[moff + 2 + np * 2] = 1;
+    mbuf[moff + 3 + np * 2] = count;
+    np += 1;
+  };
+  if (Number.isNaN(val)) {
+    mbuf[moff] = 0;
+    pushCopy("NaN");
+    mbuf[moff + 1] = np;
+    return;
+  }
+  if (val === Infinity) {
+    mbuf[moff] = forceSign ? 2 : 0;
+    pushCopy("inf");
+    mbuf[moff + 1] = np;
+    return;
+  }
+  if (val === -Infinity) {
+    mbuf[moff] = 1;
+    pushCopy("inf");
+    mbuf[moff + 1] = np;
+    return;
+  }
+  const neg = val < 0 || Object.is(val, -0);
+  mbuf[moff] = neg ? 1 : (forceSign ? 2 : 0);
+  const mag = neg ? -val : val;
+  const ONE = BigInt("1");
+  const TWO = BigInt("2");
+  const FIVE = BigInt("5");
+  const TEN = BigInt("10");
+  const ZERO = BigInt("0");
+  if (mode === 0) {
+    const prec = param;
+    if (mag === 0) {
+      if (prec === 0) pushCopy("0");
+      else {
+        pushCopy("0.");
+        pushZero(prec);
+      }
+    } else {
+      const decomp = globalThis.__rt._f64_decomp(mag);
+      const mant = decomp[0];
+      const exp2 = decomp[1];
+      if (exp2 >= 0) {
+        const intStr = (mant << BigInt(exp2)).toString();
+        if (prec === 0) pushCopy(intStr);
+        else {
+          pushCopy(intStr + ".");
+          pushZero(prec);
+        }
+      } else {
+        const shift = -exp2;
+        if (prec >= shift) {
+          const exact = (mant * (FIVE ** BigInt(shift))).toString();
+          if (exact.length <= shift) {
+            pushCopy("0.");
+            pushZero(shift - exact.length);
+            pushCopy(exact);
+            pushZero(prec - shift);
+          } else {
+            const split = exact.length - shift;
+            pushCopy(exact.slice(0, split) + "." + exact.slice(split));
+            pushZero(prec - shift);
+          }
+        } else {
+          const k = shift - prec;
+          const num = mant * (FIVE ** BigInt(prec));
+          const kb = BigInt(k);
+          let q = num >> kb;
+          const rem = num & ((ONE << kb) - ONE);
+          const half = ONE << BigInt(k - 1);
+          if (rem > half || (rem === half && (q & ONE) !== ZERO)) q += ONE;
+          const s = q.toString();
+          if (prec === 0) pushCopy(s);
+          else if (s.length <= prec) {
+            pushCopy("0.");
+            pushZero(prec - s.length);
+            pushCopy(s);
+          } else {
+            const split = s.length - prec;
+            pushCopy(s.slice(0, split) + "." + s.slice(split));
+          }
+        }
+      }
+    }
+  } else if (mode === 1) {
+    const minPrec = param;
+    const dk = mag === 0
+      ? ["0", 1]
+      : (isF32 ? globalThis.__rt._f32_shortest_dk(mag) : globalThis.__rt._f64_shortest_dk(mag));
+    const digits = dk[0];
+    const k = dk[1];
+    if (k <= 0) {
+      pushCopy("0.");
+      pushZero(-k);
+      pushCopy(digits);
+    } else if (k >= digits.length) {
+      pushCopy(digits);
+      pushZero(k - digits.length);
+      if (minPrec > 0) {
+        pushCopy(".");
+        pushZero(minPrec);
+      }
+    } else {
+      pushCopy(digits.slice(0, k) + "." + digits.slice(k));
+    }
+  } else if (mode === 4 || mode === 5) {
+    const eChar = mode === 5 ? "E" : "e";
+    const dk = mag === 0
+      ? ["0", 1]
+      : (isF32 ? globalThis.__rt._f32_shortest_dk(mag) : globalThis.__rt._f64_shortest_dk(mag));
+    const digits = dk[0];
+    const k = dk[1];
+    const mantStr = digits.length === 1 ? digits : digits[0] + "." + digits.slice(1);
+    pushCopy(mantStr + eChar + (k - 1));
+  } else {
+    const eChar = mode === 3 ? "E" : "e";
+    const prec = param;
+    if (mag === 0) {
+      if (prec === 0) pushCopy("0" + eChar + "0");
+      else {
+        pushCopy("0.");
+        pushZero(prec);
+        pushCopy(eChar + "0");
+      }
+    } else {
+      const decomp = globalThis.__rt._f64_decomp(mag);
+      const mant = decomp[0];
+      const exp2 = decomp[1];
+      let e10 = Math.floor(Math.log10(mag));
+      const cmpPow10 = (p) => {
+        let lhs = mant;
+        let rhs = ONE;
+        if (exp2 >= 0) lhs <<= BigInt(exp2);
+        else rhs <<= BigInt(-exp2);
+        if (p >= 0) rhs *= TEN ** BigInt(p);
+        else lhs *= TEN ** BigInt(-p);
+        return lhs < rhs ? -1 : (lhs > rhs ? 1 : 0);
+      };
+      while (cmpPow10(e10) < 0) e10 -= 1;
+      while (cmpPow10(e10 + 1) >= 0) e10 += 1;
+      const p = prec - e10;
+      const shift = exp2 < 0 ? -exp2 : 0;
+      let extraZeros = 0;
+      let effP = p;
+      if (effP > shift) {
+        extraZeros = effP - shift;
+        effP = shift;
+      }
+      let num = mant;
+      let den = ONE;
+      if (effP >= 0) num *= TEN ** BigInt(effP);
+      else den *= TEN ** BigInt(-effP);
+      if (exp2 >= 0) num <<= BigInt(exp2);
+      else den <<= BigInt(-exp2);
+      let q = num / den;
+      const rem = num % den;
+      const cmp = rem * TWO;
+      if (cmp > den || (cmp === den && (q & ONE) !== ZERO)) q += ONE;
+      let s = q.toString();
+      if (s.length + extraZeros > prec + 1) {
+        e10 += 1;
+        if (extraZeros > 0) extraZeros -= 1;
+        else s = s.slice(0, -1);
+      }
+      if (prec === 0) {
+        pushCopy(s + eChar + e10);
+      } else {
+        pushCopy(s.length === 1 ? s + "." : s[0] + "." + s.slice(1));
+        pushZero(extraZeros);
+        pushCopy(eChar + e10);
+      }
+    }
+  }
+  mbuf[moff + 1] = np;
+};
+
+// Host-delegated Rust dec2flt (`<f64 as FromStr>::from_str` & `<f32 as FromStr>::from_str`).
+// Strict Rust Float EBNF grammar (ASCII-only, no whitespace, no underscores, no 0x).
+// Returns `undefined` on invalid/empty input; otherwise the exact IEEE-754 float.
+globalThis.__rt._flt_re = /^[+-]?(?:(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|[iI][nN][fF](?:[iI][nN][iI][tT][yY])?|[nN][aA][nN])$/;
+
+globalThis.__rt._parse_flt_special = (s) => {
+  let i = 0;
+  let neg = false;
+  const c0 = s.charCodeAt(0);
+  if (c0 === 45) {
+    neg = true;
+    i = 1;
+  } else if (c0 === 43) {
+    i = 1;
+  }
+  const c = s.charCodeAt(i);
+  if (c === 105 || c === 73) return neg ? -Infinity : Infinity;
+  if (c === 110 || c === 78) {
+    const dv = globalThis.__rt._num_dv;
+    dv.setUint32(0, neg ? 0xfff80000 : 0x7ff80000, false);
+    dv.setUint32(4, 0, false);
+    return dv.getFloat64(0, false);
+  }
+  return null;
+};
+
+globalThis.__rt.parse_f64 = (s) => {
+  if (!globalThis.__rt._flt_re.test(s)) return undefined;
+  const sp = globalThis.__rt._parse_flt_special(s);
+  if (sp !== null) return sp;
+  return Number(s);
+};
+
+globalThis.__rt._cmp_dec_to_pow2 = (s, mant, exp2) => {
+  const TEN = BigInt("10");
+  let i = 0;
+  const n = s.length;
+  if (s.charCodeAt(0) === 43 || s.charCodeAt(0) === 45) i = 1;
+  let expAt = s.indexOf("e", i);
+  if (expAt < 0) expAt = s.indexOf("E", i);
+  let exp10 = 0;
+  if (expAt >= 0) {
+    const parsedExp = Number(s.slice(expAt + 1));
+    if (!Number.isFinite(parsedExp) || parsedExp > 1000000) exp10 = 1000000;
+    else if (parsedExp < -1000000) exp10 = -1000000;
+    else exp10 = parsedExp;
+  } else {
+    expAt = n;
+  }
+  let sig = "";
+  let seenDot = false;
+  let fracCount = 0;
+  let droppedRight = 0;
+  let sticky = false;
+  for (let j = i; j < expAt; j++) {
+    const ch = s.charCodeAt(j);
+    if (ch === 46) {
+      seenDot = true;
+      continue;
+    }
+    if (sig.length === 0 && ch === 48) {
+      if (seenDot) fracCount += 1;
+      continue;
+    }
+    if (sig.length < 200) {
+      sig += s[j];
+      if (seenDot) fracCount += 1;
+    } else {
+      if (!seenDot) droppedRight += 1;
+      if (ch !== 48) sticky = true;
+    }
+  }
+  if (sig.length === 0) return -1;
+  let p10 = exp10 - fracCount + droppedRight;
+  while (sig.length > 1 && sig.charCodeAt(sig.length - 1) === 48) {
+    sig = sig.slice(0, -1);
+    p10 += 1;
+  }
+  const mag10 = sig.length + p10;
+  if (mag10 > 50) return 1;
+  if (mag10 < -60) return -1;
+  let lhs = BigInt(sig);
+  let rhs = mant;
+  if (p10 >= 0) lhs *= TEN ** BigInt(p10);
+  else rhs *= TEN ** BigInt(-p10);
+  if (exp2 >= 0) rhs <<= BigInt(exp2);
+  else lhs <<= BigInt(-exp2);
+  if (lhs < rhs) return -1;
+  if (lhs > rhs) return 1;
+  return sticky ? 1 : 0;
+};
+
+globalThis.__rt.parse_f32 = (s) => {
+  if (!globalThis.__rt._flt_re.test(s)) return undefined;
+  const sp = globalThis.__rt._parse_flt_special(s);
+  if (sp !== null) return sp;
+  const d = Number(s);
+  const f = Math.fround(d);
+  if (d === 0 || !Number.isFinite(d)) return f;
+  const neg = d < 0;
+  const mag = neg ? -d : d;
+  const dv = globalThis.__rt._num_dv;
+  dv.setFloat64(0, mag, false);
+  const hi = dv.getUint32(0, false);
+  const lo = dv.getUint32(4, false);
+  const exp64 = (hi >>> 20) & 0x7ff;
+  if (exp64 < 873 || exp64 > 1150) return f;
+  let mant;
+  if (exp64 >= 897) {
+    if ((lo & 0x1fffffff) !== 0x10000000) return f;
+    mant = (BigInt(0x100000 | (hi & 0xfffff)) << BigInt("32")) | BigInt(lo);
+  } else {
+    const bit = 925 - exp64;
+    const ONE = BigInt("1");
+    mant = (BigInt(0x100000 | (hi & 0xfffff)) << BigInt("32")) | BigInt(lo);
+    if ((mant & ((ONE << BigInt(bit + 1)) - ONE)) !== (ONE << BigInt(bit))) return f;
+  }
+  const cmp = globalThis.__rt._cmp_dec_to_pow2(s, mant, exp64 - 1075);
+  if (cmp === 0) return f;
+  const fmag = neg ? -f : f;
+  if (cmp < 0 && fmag <= mag) return f;
+  if (cmp > 0 && fmag >= mag) return f;
+  dv.setFloat32(0, fmag, false);
+  const u32 = dv.getUint32(0, false);
+  dv.setUint32(0, cmp < 0 ? u32 - 1 : u32 + 1, false);
+  const adj = dv.getFloat32(0, false);
+  return neg ? -adj : adj;
 };
 
 // A mutable native String is `{ text, cap, len }`: well-formed text (see

@@ -2023,6 +2023,30 @@ pub(crate) fn standard_operation<'tcx>(
         });
         let fmt_write = trait_id
             .is_some_and(|trait_id| tcx.is_diagnostic_item(Symbol::intern("FmtWrite"), trait_id));
+        let exact_from_str = trait_id.is_some_and(|trait_id| {
+            tcx.is_diagnostic_item(Symbol::intern("rcgjs_from_str"), trait_id)
+        }) && name == "from_str";
+        if exact_from_str
+            && matches!(associated.container, ty::AssocContainer::TraitImpl(_))
+            && matches!(
+                signature.inputs(),
+                [input] if matches!(
+                    input.kind(),
+                    ty::Ref(_, pointee, rustc_hir::Mutability::Not) if pointee.is_str()
+                )
+            )
+        {
+            let self_ty = tcx.normalize_erasing_regions(
+                typing_env(),
+                tcx.type_of(tcx.parent(definition))
+                    .instantiate(tcx, arguments),
+            );
+            match self_ty.kind() {
+                ty::Float(ty::FloatTy::F64) => return Some(StandardOperation::F64FromStr),
+                ty::Float(ty::FloatTy::F32) => return Some(StandardOperation::F32FromStr),
+                _ => {}
+            }
+        }
         let inherent = matches!(associated.container, ty::AssocContainer::InherentImpl);
         // An unrelated impl can accept a standard value or return String. Only the
         // owning standard impl gives these method names their semantic identity.
@@ -2201,10 +2225,15 @@ fn primitive_to_string_operation(
 fn call_semantic_for_operation(operation: StandardOperation) -> CallSemantic {
     // Proven format sinks are inlined by the language kernel. Keeping those calls Ordinary
     // lets a user function join a native String region without staging `format` itself.
+    // Float `FromStr` bodies are replaced whole during lowering, not representation-planned.
     match operation {
         StandardOperation::FormatArgsToString
         | StandardOperation::FormatArgsNew
-        | StandardOperation::FormatArgumentNewDisplay => CallSemantic::Ordinary,
+        | StandardOperation::FormatArgumentNewDisplay
+        | StandardOperation::FormatArgumentNewLowerHex
+        | StandardOperation::FormatArgumentNewUpperHex
+        | StandardOperation::F64FromStr
+        | StandardOperation::F32FromStr => CallSemantic::Ordinary,
         other => CallSemantic::Standard(other),
     }
 }
@@ -2263,7 +2292,7 @@ fn format_args_associated_operation<'tcx>(
     {
         return Some(StandardOperation::FormatArgsNew);
     }
-    if name != "new_display" {
+    if name != "new_display" && name != "new_lower_hex" && name != "new_upper_hex" {
         return None;
     }
     let signature = tcx
@@ -2281,7 +2310,18 @@ fn format_args_associated_operation<'tcx>(
     let [input] = signature.inputs() else {
         return None;
     };
-    proven_display_ty(tcx, *input).then_some(StandardOperation::FormatArgumentNewDisplay)
+    match name {
+        "new_display" => {
+            proven_display_ty(tcx, *input).then_some(StandardOperation::FormatArgumentNewDisplay)
+        }
+        "new_lower_hex" => {
+            proven_int_ty(*input).then_some(StandardOperation::FormatArgumentNewLowerHex)
+        }
+        "new_upper_hex" => {
+            proven_int_ty(*input).then_some(StandardOperation::FormatArgumentNewUpperHex)
+        }
+        _ => None,
+    }
 }
 
 /// Default `Display` types whose text this backend already spells exactly.
@@ -2291,10 +2331,18 @@ fn proven_display_ty<'tcx>(tcx: TyCtxt<'tcx>, mut ty: Ty<'tcx>) -> bool {
     }
     match ty.kind() {
         ty::Str | ty::Char | ty::Bool | ty::Int(_) | ty::Uint(_) => true,
-        ty::Float(ty::FloatTy::F64) => true,
+        ty::Float(ty::FloatTy::F32 | ty::FloatTy::F64) => true,
         ty::Adt(definition, _) => tcx.lang_items().string() == Some(definition.did()),
         _ => false,
     }
+}
+
+/// Integer types whose `LowerHex`/`UpperHex` text this backend spells directly.
+fn proven_int_ty<'tcx>(mut ty: Ty<'tcx>) -> bool {
+    while let ty::Ref(_, pointee, _) = *ty.kind() {
+        ty = pointee;
+    }
+    matches!(ty.kind(), ty::Int(_) | ty::Uint(_))
 }
 fn standard_owner(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Option<RepresentationCandidate> {
     let ty::Adt(definition, _) = ty.kind() else {

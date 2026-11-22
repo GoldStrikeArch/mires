@@ -1,0 +1,227 @@
+rustc_codegen_js: mark FromStr for host dec2flt and delegate f32/f64 Formatter float formatting.
+
+Mark `core::str::FromStr` with a private compiler-owned diagnostic item so the
+backend recognizes `<f64 as FromStr>::from_str` and `<f32 as FromStr>::from_str`
+by exact rustc identity (never by path/symbol substrings), allowing `jsc-link`
+to replace their bodies with host-delegated IEEE-754 parsing and drop `dec2flt`.
+
+Delegate `f32` and `f64` `Display`/`Debug`/`LowerExp`/`UpperExp` formatting in
+`core::fmt::float` to `rcgjs_fmt_float_parts` feeding `Formatter::pad_formatted_parts`,
+preserving 100% of `Formatter` width/alignment/fill/zero-pad/error semantics
+while dropping `core::num::imp::flt2dec` (Grisu/Dragon4/BigNum).
+
+--- a/library/core/src/str/traits.rs
++++ b/library/core/src/str/traits.rs
+@@ -865,6 +865,7 @@
+ /// ```
+ #[stable(feature = "rust1", since = "1.0.0")]
+ #[rustc_const_unstable(feature = "const_convert", issue = "143773")]
++#[rustc_diagnostic_item = "rcgjs_from_str"]
+ pub const trait FromStr: Sized {
+     /// The associated error which can be returned from parsing.
+     #[stable(feature = "rust1", since = "1.0.0")]
+--- a/library/core/src/fmt/float.rs
++++ b/library/core/src/fmt/float.rs
+@@ -1,6 +1,9 @@
+ use crate::fmt::{Debug, Display, Formatter, LowerExp, Result, UpperExp};
++#[cfg(target_has_reliable_f16)]
+ use crate::mem::MaybeUninit;
+-use crate::num::imp::{flt2dec, fmt as numfmt};
++#[cfg(target_has_reliable_f16)]
++use crate::num::imp::flt2dec;
++use crate::num::imp::fmt as numfmt;
+ 
+ #[doc(hidden)]
+ trait GeneralFormat: PartialOrd {
+@@ -32,6 +35,7 @@
+ 
+ // Don't inline this so callers don't use the stack space this function
+ // requires unless they have to.
++#[cfg(target_has_reliable_f16)]
+ #[inline(never)]
+ fn float_to_decimal_common_exact<T>(
+     fmt: &mut Formatter<'_>,
+@@ -58,6 +62,7 @@
+ 
+ // Don't inline this so callers that call both this and the above won't wind
+ // up using the combined stack space of both functions in some cases.
++#[cfg(target_has_reliable_f16)]
+ #[inline(never)]
+ fn float_to_decimal_common_shortest<T>(
+     fmt: &mut Formatter<'_>,
+@@ -84,6 +89,7 @@
+     unsafe { fmt.pad_formatted_parts(&formatted) }
+ }
+ 
++#[cfg(target_has_reliable_f16)]
+ fn float_to_decimal_display<T>(fmt: &mut Formatter<'_>, num: &T) -> Result
+ where
+     T: flt2dec::DecodableFloat,
+@@ -104,6 +110,7 @@
+ 
+ // Don't inline this so callers don't use the stack space this function
+ // requires unless they have to.
++#[cfg(target_has_reliable_f16)]
+ #[inline(never)]
+ fn float_to_exponential_common_exact<T>(
+     fmt: &mut Formatter<'_>,
+@@ -132,6 +139,7 @@
+ 
+ // Don't inline this so callers that call both this and the above won't wind
+ // up using the combined stack space of both functions in some cases.
++#[cfg(target_has_reliable_f16)]
+ #[inline(never)]
+ fn float_to_exponential_common_shortest<T>(
+     fmt: &mut Formatter<'_>,
+@@ -160,6 +168,7 @@
+ }
+ 
+ // Common code of floating point LowerExp and UpperExp.
++#[cfg(target_has_reliable_f16)]
+ fn float_to_exponential_common<T>(fmt: &mut Formatter<'_>, num: &T, upper: bool) -> Result
+ where
+     T: flt2dec::DecodableFloat,
+@@ -177,6 +186,7 @@
+     }
+ }
+ 
++#[cfg(target_has_reliable_f16)]
+ fn float_to_general_debug<T>(fmt: &mut Formatter<'_>, num: &T) -> Result
+ where
+     T: flt2dec::DecodableFloat + GeneralFormat,
+@@ -198,10 +208,126 @@
+         } else {
+             let min_precision = 1;
+             float_to_decimal_common_shortest(fmt, num, sign, min_precision)
++        }
++    }
++}
++
++#[inline(never)]
++fn rcgjs_pad_float(
++    fmt: &mut Formatter<'_>,
++    val: f64,
++    is_f32: u8,
++    mode: u8,
++    param: u16,
++) -> Result {
++    unsafe extern "C" {
++        fn rcgjs_fmt_float_parts(
++            val: f64,
++            is_f32: u8,
++            mode: u8,
++            param: u16,
++            force_sign: u8,
++            out: *mut u8,
++            meta: *mut usize,
++        );
++    }
++    let mut buf = [0u8; 800];
++    let mut meta = [0usize; 10];
++    let force_sign = if fmt.sign_plus() { 1u8 } else { 0u8 };
++    // SAFETY: `rcgjs_fmt_float_parts` writes valid ASCII into `buf[..800]` and at most 4 parts into `meta[..10]`.
++    unsafe {
++        rcgjs_fmt_float_parts(
++            val,
++            is_f32,
++            mode,
++            param,
++            force_sign,
++            buf.as_mut_ptr(),
++            meta.as_mut_ptr(),
++        );
++    }
++    let sign = match meta[0] {
++        1 => "-",
++        2 => "+",
++        _ => "",
++    };
++    let nparts = meta[1];
++    let mut parts = [numfmt::Part::Zero(0); 4];
++    let mut i = 0;
++    while i < nparts && i < 4 {
++        let kind = meta[2 + 2 * i];
++        let arg = meta[3 + 2 * i];
++        // SAFETY: `rcgjs_fmt_float_parts` guarantees `start + len <= buf.len()` and `i < 4`.
++        unsafe {
++            *parts.get_unchecked_mut(i) = if kind == 0 {
++                let start = arg >> 16;
++                let len = arg & 0xffff;
++                numfmt::Part::Copy(buf.get_unchecked(start..start + len))
++            } else {
++                numfmt::Part::Zero(arg)
++            };
+         }
++        i += 1;
+     }
++    let count = if nparts <= 4 { nparts } else { 4 };
++    let formatted = numfmt::Formatted { sign, parts: unsafe { parts.get_unchecked(..count) } };
++    // SAFETY: `rcgjs_fmt_float_parts` writes only ASCII bytes into `buf`.
++    unsafe { fmt.pad_formatted_parts(&formatted) }
+ }
+ 
++macro_rules! floating_js {
++    ($(($ty:ident, $is_f32:expr))*) => {
++        $(
++            #[stable(feature = "rust1", since = "1.0.0")]
++            impl Debug for $ty {
++                fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
++                    if let Some(precision) = fmt.options.get_precision() {
++                        rcgjs_pad_float(fmt, *self as f64, $is_f32, 0, precision)
++                    } else if self.already_rounded_value_should_use_exponential() {
++                        rcgjs_pad_float(fmt, *self as f64, $is_f32, 4, 0)
++                    } else {
++                        rcgjs_pad_float(fmt, *self as f64, $is_f32, 1, 1)
++                    }
++                }
++            }
++
++            #[stable(feature = "rust1", since = "1.0.0")]
++            impl Display for $ty {
++                fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
++                    if let Some(precision) = fmt.options.get_precision() {
++                        rcgjs_pad_float(fmt, *self as f64, $is_f32, 0, precision)
++                    } else {
++                        rcgjs_pad_float(fmt, *self as f64, $is_f32, 1, 0)
++                    }
++                }
++            }
++
++            #[stable(feature = "rust1", since = "1.0.0")]
++            impl LowerExp for $ty {
++                fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
++                    if let Some(precision) = fmt.options.get_precision() {
++                        rcgjs_pad_float(fmt, *self as f64, $is_f32, 2, precision)
++                    } else {
++                        rcgjs_pad_float(fmt, *self as f64, $is_f32, 4, 0)
++                    }
++                }
++            }
++
++            #[stable(feature = "rust1", since = "1.0.0")]
++            impl UpperExp for $ty {
++                fn fmt(&self, fmt: &mut Formatter<'_>) -> Result {
++                    if let Some(precision) = fmt.options.get_precision() {
++                        rcgjs_pad_float(fmt, *self as f64, $is_f32, 3, precision)
++                    } else {
++                        rcgjs_pad_float(fmt, *self as f64, $is_f32, 5, 0)
++                    }
++                }
++            }
++        )*
++    };
++}
++
++#[cfg(target_has_reliable_f16)]
+ macro_rules! floating {
+     ($($ty:ident)*) => {
+         $(
+@@ -236,7 +362,7 @@
+     };
+ }
+ 
+-floating! { f32 f64 }
++floating_js! { (f32, 1u8) (f64, 0u8) }
+ 
+ #[cfg(target_has_reliable_f16)]
+ floating! { f16 }
