@@ -983,6 +983,8 @@ fn collect_sites(
                             | crate::jir::semantic::StandardOperation::FormatArgsToString
                             | crate::jir::semantic::StandardOperation::F64FromStr
                             | crate::jir::semantic::StandardOperation::F32FromStr
+                            | crate::jir::semantic::StandardOperation::SliceSort
+                            | crate::jir::semantic::StandardOperation::SliceSortCmp
                     ) && !(crate::lower::bstr::enabled()
                         && matches!(std_op, crate::jir::semantic::StandardOperation::StringAsStr))
                 }
@@ -1028,6 +1030,11 @@ fn collect_sites(
                 .is_some_and(|op| {
                     crate::lower::semantic_ops::fmt_kernel::is_format_machinery(op)
                         || crate::lower::semantic_ops::num::is_float_from_str(op)
+                        || matches!(
+                            op,
+                            crate::jir::semantic::StandardOperation::SliceSort
+                                | crate::jir::semantic::StandardOperation::SliceSortCmp
+                        )
                 })
             {
                 stats.decline("inline.semantic-boundary");
