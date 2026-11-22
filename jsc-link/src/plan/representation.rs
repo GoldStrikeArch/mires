@@ -81,6 +81,7 @@ pub(crate) struct ReprCx<'a> {
     pub items: &'a crate::lower::js::host::ItemIndex,
     pub drop_glue: &'a crate::lower::js::host::DropGlueIndex,
     pub vtables: &'a crate::lower::js::unsize::VtableIndex,
+    pub byte_views: crate::analysis::byte_views::ByteViewPlan,
 }
 
 /// Why one function's commit refused: the problem nodes whose regions must roll back beside the
@@ -1394,6 +1395,7 @@ impl Planner<'_> {
             physical: None,
             call_retargets,
             bigints: None,
+            byte_views: self.cx.byte_views,
         })
     }
 
@@ -1841,7 +1843,10 @@ impl Planner<'_> {
             program = crate::minify::apply_renames(&program, &renames);
         }
         let bytes = program.len() as u64;
-        let direct_helpers = cost::runtime_members(&program);
+        let mut direct_helpers = cost::runtime_members(&program);
+        if self.cx.byte_views.raw_byte_derefs && !direct_helpers.is_empty() {
+            direct_helpers.insert("_bv_enable".to_owned());
+        }
         let helper_program = cost::helper_program(&direct_helpers);
         let helper_bytes = helper_program.len() as u64;
         program.push_str(&helper_program);
@@ -1914,7 +1919,10 @@ impl Planner<'_> {
             .collect();
         let (mut program, _) = write_program(&prologue("representation-cost"), &items);
         let bytes = program.len() as u64;
-        let direct_helpers = cost::runtime_members(&program);
+        let mut direct_helpers = cost::runtime_members(&program);
+        if self.cx.byte_views.raw_byte_derefs && !direct_helpers.is_empty() {
+            direct_helpers.insert("_bv_enable".to_owned());
+        }
         let helper_program = cost::helper_program(&direct_helpers);
         let helper_bytes = helper_program.len() as u64;
         program.push_str(&helper_program);
@@ -3981,6 +3989,7 @@ mod tests {
             items: &items,
             drop_glue: &drop_glue,
             vtables: &vtables,
+            byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
         };
         let interns_map: BTreeMap<JsName, &crate::jir::Interns> = prog
             .table

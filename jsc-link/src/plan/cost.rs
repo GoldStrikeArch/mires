@@ -832,4 +832,60 @@ globalThis.__rt.root = () => globalThis.__rt.middle();
                 .collect::<BTreeMap<_, _>>()
         );
     }
+
+    #[test]
+    fn plain_vec_closure_excludes_byte_view_machinery() {
+        let bytes = helper_bytes();
+        assert!(
+            !bytes.contains_key("_alloc_byte_proxy"),
+            "eager proxy helper must stay deleted from runtime/shim.js"
+        );
+        let vec_direct: BTreeSet<String> = [
+            "alloc",
+            "alloc_zeroed",
+            "realloc",
+            "dealloc",
+            "unscale",
+            "unscale_scalar",
+            "unscale_uninit",
+            "retype",
+            "scale",
+            "slice_from_parts",
+            "byte_slice_ref",
+            "copy",
+            "copy_nonoverlapping",
+            "write_bytes",
+            "ptr_eq",
+            "ptr_cmp",
+            "addr",
+            "offset",
+            "thin",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let closure = helper_closure(&vec_direct);
+        for forbidden in [
+            "_bv_enable",
+            "_byte_view",
+            "_byte_load",
+            "_byte_store",
+            "_prep_copy",
+            "_unwrap_view",
+            "_alloc_byte_proxy",
+        ] {
+            assert!(
+                !closure.contains(forbidden),
+                "plain Vec/Box helper set unexpectedly pulled `{forbidden}`: {closure:?}"
+            );
+        }
+        for trigger in ["scale_scalar", "byte_sign", "read_byte", "write_byte"] {
+            let direct: BTreeSet<String> = [trigger.to_owned()].into_iter().collect();
+            let trigger_closure = helper_closure(&direct);
+            assert!(
+                trigger_closure.contains("_bv_enable"),
+                "`{trigger}` must pull `_bv_enable`: {trigger_closure:?}"
+            );
+        }
+    }
 }

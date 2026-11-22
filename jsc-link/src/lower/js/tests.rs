@@ -578,6 +578,7 @@ fn lower_retargeted(
         physical: None,
         call_retargets,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     match function::lower(&input, func, plan, region) {
         Ok(item) => jsast::stmt_to_string(&item.decl),
@@ -1819,6 +1820,7 @@ fn a_hoisting_lowering_names_its_bigint_constants_and_widens_constant_shift_amou
             physical: None,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints,
+            byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
         };
         match function::lower(&input, &func, &plan, straight(&func)) {
             Ok(item) => item,
@@ -2271,6 +2273,7 @@ fn if_and_while_regions_spell_tests_and_loops() {
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let lowered = function::lower(&input, &func, &plan, region()).expect("lowers with maps");
     let (mapped, mappings) =
@@ -2553,6 +2556,7 @@ fn cells_slots_and_direct_calls_match_the_14_pointers_entry() {
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let err = function::lower(&input, &func, &plan, straight(&func))
         .err()
@@ -3509,6 +3513,7 @@ fn asserts_call_the_panic_lang_item_with_a_location() {
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
     assert_eq!(
@@ -3549,6 +3554,7 @@ fn statics_and_vtables() {
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let lowered = super::super::lower_item(&input).expect("static lowers");
     assert_eq!(jsast::stmt_to_string(&lowered.decl), "let S = [5];\n");
@@ -3594,6 +3600,7 @@ fn statics_and_vtables() {
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let lowered = super::super::lower_item(&input).expect("vtable lowers");
     assert_eq!(
@@ -3642,6 +3649,7 @@ fn a_dyn_drop_calls_vtable_slot_zero_when_it_is_not_null() {
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
     assert_eq!(
@@ -3681,6 +3689,7 @@ fn unsupported_ops_decline_with_a_class() {
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let err = function::lower(&input, &func, &plan, straight(&func))
         .err()
@@ -3739,6 +3748,7 @@ fn lower_with(
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     match function::lower(&input, func, plan, region) {
         Ok(item) => jsast::stmt_to_string(&item.decl),
@@ -4069,6 +4079,7 @@ fn a_static_keyed_list_lowers_after_its_dedicated_contract_is_proven() {
             physical: None,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints: None,
+            byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
         };
         function::lower(&input, &func, &plan, straight(&func))
             .map(|lowered| jsast::stmt_to_string(&lowered.decl))
@@ -5684,6 +5695,7 @@ fn flat_abi_i64_pair_param_with_param_cell_declares_box_instead_of_rebinding_mis
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
     let js = jsast::stmt_to_string(&lowered.decl);
@@ -6178,6 +6190,7 @@ fn fuse_local_bytes_str_eliminates_roundtrip_local() {
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
     let js = jsast::stmt_to_string(&lowered.decl);
@@ -6610,6 +6623,7 @@ fn host_string_inline_call_drop_preserves_call_and_non_adjacent_baseline_dealloc
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let js1 = jsast::stmt_to_string(
         &function::lower(&input1, &func1, &plan1, straight(&func1))
@@ -6700,6 +6714,7 @@ fn host_string_inline_call_drop_preserves_call_and_non_adjacent_baseline_dealloc
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let js2 = jsast::stmt_to_string(
         &function::lower(&input2, &func2, &plan2, straight(&func2))
@@ -6849,6 +6864,7 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let js1 = jsast::stmt_to_string(
         &function::lower(&input1, &f1, &p1, straight(&f1))
@@ -6996,6 +7012,7 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let js3 = jsast::stmt_to_string(
         &function::lower(&input3, &f3, &p3, straight(&f3))
@@ -8792,6 +8809,7 @@ fn float_nan_payload_constants_preserve_bits_and_keep_canonical_nan_compact() {
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let res = function::lower(&input, &f, &p, straight(&f));
     assert!(res.is_err(), "expected f16 constant lowering to decline");

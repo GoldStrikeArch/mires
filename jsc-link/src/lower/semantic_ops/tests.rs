@@ -2094,6 +2094,7 @@ fn assert_carrier_composition(with_slice_view: bool, owned_carrier: Option<Carri
             physical: None,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints: None,
+            byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
         };
         program.push_str(&jsast::stmt_to_string(
             &lower_func(&input, func).unwrap().decl,
@@ -2165,7 +2166,8 @@ for (const f of [before, after]) {
         } else {
           const typed = __rt.unscale_scalar(ptr, 4, () => 0, 'u32');
           assert.deepEqual(typed.buf.slice(typed.off, typed.off + vec.len), [1, 2, 77, 77]);
-          assert.deepEqual(Array.prototype.slice.call(ptr.buf, ptr.off, ptr.off + 4), [1, 0, 0, 0]);
+          const bytes = __rt.byte_slice_ref(__rt.slice_from_parts(ptr, 4, 1));
+          assert.deepEqual(Array.prototype.slice.call(bytes.buf, bytes.off, bytes.off + 4), [1, 0, 0, 0]);
           assert.equal(owned.len, dropped ? 0 : mutated ? 4 : 2);
           assert.equal(owned.buf.length, dropped ? 0 : mutated ? expectedCapacity : capacity);
           if (rounds !== 0) assert.deepEqual(owned.buf.slice(0, 2), [1, 2]);
@@ -2612,6 +2614,7 @@ fn format_site_js_in(
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     let lowered = lower_func(&input, &func)
         .unwrap_or_else(|decline| panic!("the format kernel declined `{name}`: {decline}"));

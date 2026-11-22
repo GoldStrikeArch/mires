@@ -559,8 +559,9 @@ fn resolve(
         exports: BTreeSet::new(),
         entry: None,
     };
+    let wide_byte_views = lane_run.as_ref().is_some_and(|run| run.wide_byte_views());
     let mut printed = crate::profile::time("link.print", || {
-        print_units(dcx, sources, std::slice::from_ref(&unit))
+        print_units(dcx, sources, std::slice::from_ref(&unit), wide_byte_views)
     });
     let mut deployment = ArtifactManifest {
         schema: ARTIFACT_SCHEMA,
@@ -644,7 +645,9 @@ fn resolve(
 
     if split {
         match path {
-            Some(path) => write_chunks(dcx, sources, &table, path, &mut deployment),
+            Some(path) => {
+                write_chunks(dcx, sources, &table, path, &mut deployment, wide_byte_views)
+            }
             None => {
                 dcx.err(
                     "`-Cllvm-args=js-chunk` needs an output path to write the chunk files beside",
@@ -1185,6 +1188,7 @@ fn print_units(
     dcx: &Sink,
     sources: &BTreeMap<String, String>,
     units: &[Unit<'_>],
+    wide_byte_views: bool,
 ) -> Vec<PrintedUnit> {
     let opts = crate::opts::get();
     let bodies: Vec<String> = units
@@ -1222,6 +1226,14 @@ fn print_units(
             .collect();
         let renamed_refs: Vec<&LinkItem> = renamed.iter().collect();
         let (mut text, starts) = write_program(&prologue(&unit.label), &renamed_refs);
+        if wide_byte_views {
+            let direct = crate::plan::cost::runtime_members(&text);
+            if !direct.is_empty()
+                && !crate::plan::cost::helper_closure(&direct).contains("_bv_enable")
+            {
+                text.push_str("__rt._bv_enable;\n");
+            }
+        }
         // After the rename, so that the clause is written once, out of the names that survived it,
         // and never scanned as if it were an item's code.
         text.push_str(&export_clause(unit, &renames));
@@ -2089,6 +2101,7 @@ fn write_chunks(
     table: &BTreeMap<JsName, LinkItem>,
     path: &Path,
     deployment: &mut ArtifactManifest,
+    wide_byte_views: bool,
 ) {
     let opts = crate::opts::get();
 
@@ -2247,7 +2260,10 @@ fn write_chunks(
         });
     }
 
-    for (unit, printed) in units.iter().zip(print_units(dcx, sources, &units)) {
+    for (unit, printed) in units
+        .iter()
+        .zip(print_units(dcx, sources, &units, wide_byte_views))
+    {
         let Some(path) = &unit.path else { continue };
         if let Err(err) = fs::write(path, printed.text.as_bytes()) {
             dcx.err(format!("error writing `{}`: {err}", path.display()));

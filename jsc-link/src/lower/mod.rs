@@ -125,6 +125,8 @@ pub struct LowerInput<'a> {
     /// (`JsCx::to_bigint`); a `static` or vtable keeps its inline constants. `None` everywhere
     /// else, the whole-program cost trials included: they price the inline spelling.
     pub bigints: Option<&'a bigint::BigIntNames>,
+    /// Whole-program lazy byte-view lowering policy (`analysis::byte_views`).
+    pub byte_views: crate::analysis::byte_views::ByteViewPlan,
 }
 
 /// One lowered item, as an AST plus what the printer needs around it.

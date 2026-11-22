@@ -371,6 +371,8 @@ pub(crate) struct LaneRun {
     /// Whether the lane added items to the table (the `$rN` spill registers), which is what makes
     /// the link step walk reachability again.
     added_items: bool,
+    /// Whole-program lazy byte-view policy.
+    byte_views: crate::analysis::byte_views::ByteViewPlan,
 }
 
 impl LaneRun {
@@ -415,6 +417,11 @@ impl LaneRun {
     /// Whether the lane added items to the program, so the link step re-walks reachability.
     pub(crate) fn added_items(&self) -> bool {
         self.added_items
+    }
+
+    /// Whether the program may alias wide allocations through byte pointers/views.
+    pub(crate) fn wide_byte_views(&self) -> bool {
+        self.byte_views.raw_byte_derefs
     }
 
     /// Whether any item the lane printed reaches something other than what its baseline reached.
@@ -644,15 +651,24 @@ fn run_with_opts(
             items: &items,
             drop_glue: &drop_glue,
             vtables: &vtables,
+            byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
         };
         build_funcs(table, &original_names, &ctx)
     };
+    let empty_native_bodies = BTreeMap::new();
+    let mut byte_views = crate::analysis::byte_views::analyze_reachable(
+        table,
+        &pristine_funcs,
+        &empty_native_bodies,
+        &opts.roots,
+    );
     record_keyed_purity(table, &pristine_funcs, &mut items);
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         opts,
         items: &items,
         drop_glue: &drop_glue,
         vtables: &vtables,
+        byte_views,
     };
     // Effects-summary coverage (phase 5, W5b): analysis only, stderr only, computed on demand.
     // The O group (W5e) is what will consume the summaries in the pipeline.
@@ -664,16 +680,25 @@ fn run_with_opts(
     // emitted map remains pristine.
     let run_o = |table: &mut BTreeMap<JsName, LinkItem>,
                  funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
-                 live: &BTreeSet<JsName>| {
+                 live: &BTreeSet<JsName>,
+                 ctx: &Ctx<'_>| {
         if opts.analyzes(OptimizerPass::AstDce) {
-            o_group(table, funcs, &ctx, live)
+            o_group(table, funcs, ctx, live)
         } else {
             OGroup::default()
         }
     };
     let pristine_table = table.clone();
     let mut planned_funcs = pristine_funcs.clone();
-    let mut o_stats = crate::profile::time("lane.O", || run_o(table, &mut planned_funcs, &live));
+    let mut o_stats =
+        crate::profile::time("lane.O", || run_o(table, &mut planned_funcs, &live, &ctx));
+    byte_views = crate::analysis::byte_views::analyze_reachable(
+        table,
+        &planned_funcs,
+        &empty_native_bodies,
+        &opts.roots,
+    );
+    ctx.byte_views = byte_views;
 
     // Phase B1: solve and commit on the planned map in both `report` and `on`. Report mode keeps
     // only the accounting; on mode prints the committed map. D9 can therefore measure the exact
@@ -685,6 +710,7 @@ fn run_with_opts(
             items: &items,
             drop_glue: &drop_glue,
             vtables: &vtables,
+            byte_views,
         };
         crate::profile::time("lane.B1.representation", || {
             crate::plan::representation::plan_and_commit(
@@ -758,6 +784,13 @@ fn run_with_opts(
     } else {
         table.clone()
     };
+    byte_views = crate::analysis::byte_views::analyze_reachable(
+        &work_table,
+        &funcs,
+        &repr.bodies,
+        &opts.roots,
+    );
+    ctx.byte_views = byte_views;
 
     // B2 plans against the same post-O, post-representation map D9 measured. Report mode records
     // that plan and empties it before emission.
@@ -956,12 +989,19 @@ fn run_with_opts(
             // The O group re-runs on the pristine table and Funcs (both `run_o` and `post_o`,
             // matching a plan-less run), so the retried program is byte-identical to
             // `js-jir-flat-abi=off`.
-            o_stats = run_o(table, &mut funcs, &live);
+            o_stats = run_o(table, &mut funcs, &live, &ctx);
             work_table = table.clone();
             if emitting_plans && opts.analyzes(OptimizerPass::AstDce) {
                 let post_o = o_group_with_mode(&mut work_table, &mut funcs, &ctx, &live, true);
                 merge_o_stats(&mut o_stats, post_o);
             }
+            byte_views = crate::analysis::byte_views::analyze_reachable(
+                &work_table,
+                &funcs,
+                &repr.bodies,
+                &opts.roots,
+            );
+            ctx.byte_views = byte_views;
             continue;
         }
         break (lowered, async_plan);
@@ -1201,6 +1241,7 @@ fn run_with_opts(
         repr: repr_ran.then(|| repr.block.clone()),
         plan_retries,
         added_items,
+        byte_views,
     }
 }
 
@@ -1210,6 +1251,7 @@ struct Ctx<'a> {
     items: &'a ItemIndex,
     drop_glue: &'a DropGlueIndex,
     vtables: &'a VtableIndex,
+    byte_views: crate::analysis::byte_views::ByteViewPlan,
 }
 
 /// The names the lane offers to the lowerer, sorted and deduplicated.
@@ -1293,6 +1335,7 @@ fn lower_input_with_retargets<'a>(
         physical: None,
         call_retargets,
         bigints: None,
+        byte_views: ctx.byte_views,
     })
 }
 
@@ -1319,6 +1362,7 @@ fn physical_program_metrics(
         items: ctx.items,
         drop_glue: ctx.drop_glue,
         vtables: ctx.vtables,
+        byte_views: ctx.byte_views,
     };
     let mut table = source_table.clone();
     let mut funcs = source_funcs.clone();
@@ -1396,7 +1440,10 @@ fn physical_program_metrics(
     let (program, _) = write_program(&prologue("physical-cost"), &items);
     let renames = crate::minify::item_renames(&program, &items);
     let mut program = crate::minify::apply_renames(&program, &renames);
-    let direct = crate::plan::cost::runtime_members(&program);
+    let mut direct = crate::plan::cost::runtime_members(&program);
+    if ctx.byte_views.raw_byte_derefs && !direct.is_empty() {
+        direct.insert("_bv_enable".to_owned());
+    }
     program.push_str(&crate::plan::cost::helper_program(&direct));
 
     // An allocation in a directly called callee is still loop-carried when the final JavaScript
@@ -4507,6 +4554,7 @@ mod tests {
             items: &items,
             drop_glue: &drop_glue,
             vtables: &vtables,
+            byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
         };
         let names = vec![
             JsName::new("caller$h1".to_owned()),

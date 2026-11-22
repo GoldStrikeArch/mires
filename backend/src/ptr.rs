@@ -96,7 +96,11 @@ pub(crate) fn deref_read<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, pointer: 
         }
     }
     if is_slot_pointee(fx.tcx, pointee) {
-        slot_element(pointer)
+        match peel_pattern(peel_transparent(fx.tcx, pointee)).kind() {
+            ty::Uint(ty::UintTy::U8) => jsast::rt_call("read_byte", vec![pointer]),
+            ty::Int(ty::IntTy::I8) => jsast::rt_call("read_byte", vec![pointer, Expr::Bool(true)]),
+            _ => slot_element(pointer),
+        }
     } else {
         pointer
     }
@@ -133,6 +137,15 @@ pub(crate) fn deref_write<'tcx>(
             args.push(Expr::Bool(true));
         }
         return vec![jsast::expr_stmt(jsast::rt_call("write_array", args))];
+    }
+    if matches!(
+        peel_pattern(peel_transparent(fx.tcx, pointee)).kind(),
+        ty::Uint(ty::UintTy::U8) | ty::Int(ty::IntTy::I8)
+    ) {
+        return vec![jsast::expr_stmt(jsast::rt_call(
+            "write_byte",
+            vec![pointer, value],
+        ))];
     }
     let element = slot_element(pointer);
     if is_indirect(fx.tcx, pointee) {

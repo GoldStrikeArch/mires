@@ -6,6 +6,7 @@
 
 pub mod alloc_sites;
 pub mod ascii;
+pub mod byte_views;
 pub mod callgraph;
 pub mod effects;
 pub mod host_contract;

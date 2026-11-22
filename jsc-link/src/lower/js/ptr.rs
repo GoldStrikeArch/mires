@@ -38,6 +38,17 @@ impl<'a> JsCx<'a> {
             }
         }
         if is_slot_pointee(table, pointee) {
+            if self.byte_views.raw_byte_derefs {
+                if let Some(TypeKind::Integer { signed, bits: 8 }) =
+                    value::kind(table, table.peeled(pointee))
+                {
+                    let mut args = vec![pointer];
+                    if *signed {
+                        args.push(Expr::Bool(true));
+                    }
+                    return jsast::rt_call("read_byte", args);
+                }
+            }
             ptr::slot_element(pointer)
         } else {
             pointer
@@ -60,6 +71,17 @@ impl<'a> JsCx<'a> {
                 args.push(Expr::Bool(true));
             }
             return Ok(vec![jsast::expr_stmt(jsast::rt_call("write_array", args))]);
+        }
+        if self.byte_views.raw_byte_derefs
+            && matches!(
+                value::kind(table, table.peeled(pointee)),
+                Some(TypeKind::Integer { bits: 8, .. })
+            )
+        {
+            return Ok(vec![jsast::expr_stmt(jsast::rt_call(
+                "write_byte",
+                vec![pointer, value],
+            ))]);
         }
         let element = ptr::slot_element(pointer);
         if table.is_indirect(pointee) {
@@ -1000,13 +1022,15 @@ impl<'a> JsCx<'a> {
             ));
         }
         if to_size == 1 && !table.is_indirect(to) {
-            if let Some(TypeKind::Integer { signed, bits: 8 }) = value::kind(table, to) {
-                if let Some(kind) = self.scalar_view_kind(from_pointee) {
-                    let mut arguments = vec![value, jsast::num(from_size as f64), kind];
-                    if *signed {
-                        arguments.push(Expr::Bool(true));
+            if !self.byte_views.elide_scale_scalar {
+                if let Some(TypeKind::Integer { signed, bits: 8 }) = value::kind(table, to) {
+                    if let Some(kind) = self.scalar_view_kind(from_pointee) {
+                        let mut arguments = vec![value, jsast::num(from_size as f64), kind];
+                        if *signed {
+                            arguments.push(Expr::Bool(true));
+                        }
+                        return Ok(jsast::rt_call("scale_scalar", arguments));
                     }
-                    return Ok(jsast::rt_call("scale_scalar", arguments));
                 }
             }
             let mut arguments = vec![value, jsast::num(from_size as f64)];

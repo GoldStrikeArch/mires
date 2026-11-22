@@ -58,7 +58,13 @@ pub(crate) enum JsPlace {
     /// projection actually dereferences it, so `&*p` / `&raw *p` / `addr_of!((*p).0)` return `p`
     /// intact without allocating a temp or stripping metadata, while actual reads/writes hoist
     /// non-duplicable `pointer` expressions once via `reread`.
-    Slot { pointer: Expr, indirect: bool },
+    Slot {
+        pointer: Expr,
+        indirect: bool,
+        byte_signed: Option<bool>,
+    },
+    /// One byte element of a raw `*const [u8]` / `*mut [u8]` / `*const [i8]` / `*mut [i8]` slice.
+    ByteAt { buf: Expr, off: Expr, signed: bool },
     /// The `N` elements a pointer to `[E; N]` names, reached through `__rt.read_array` and
     /// `__rt.write_array`. The expression is the *pointer*, not the place, because which elements
     /// it names is a question only the record can answer: a plain slot holds the whole array at
@@ -111,6 +117,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
         let mut identity = None;
         let mut str_mutable = false;
         let mut str_from_mut = false;
+        let mut raw_byte_slice: Option<bool> = None;
         // Where the tail of the struct a `Deref` of a `{ ptr, meta }` named actually lives. Only
         // the projection that reads that tail needs it, and the steps that may sit in between -- a
         // transparent field, a downcast, a cast that changes nothing -- leave the place alone and
@@ -124,6 +131,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
             let carried_tail = tail.take();
             let carried_str_mutable = std::mem::take(&mut str_mutable);
             let carried_str_from_mut = std::mem::take(&mut str_from_mut);
+            let carried_raw_byte_slice = raw_byte_slice.take();
 
             match elem {
                 PlaceElem::Deref => {
@@ -161,7 +169,14 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         }
                         // A slice: the place *is* the fat pointer, because the projections that
                         // follow need all three of `buf`, `off` and `len`.
-                        ty::Slice(_) => {
+                        ty::Slice(element) => {
+                            if ptr::is_raw(self.tcx, ty) {
+                                raw_byte_slice = match element.kind() {
+                                    ty::Uint(ty::UintTy::U8) => Some(false),
+                                    ty::Int(ty::IntTy::I8) => Some(true),
+                                    _ => None,
+                                };
+                            }
                             identity = Some(value.clone());
                             JsPlace::Deref(value)
                         }
@@ -208,6 +223,11 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         _ if ptr::is_slot(self.tcx, ty) => JsPlace::Slot {
                             pointer: value,
                             indirect: is_indirect(self.tcx, pointee),
+                            byte_signed: match shape.kind() {
+                                ty::Uint(ty::UintTy::U8) => Some(false),
+                                ty::Int(ty::IntTy::I8) => Some(true),
+                                _ => None,
+                            },
                         },
                         // A reference to an aggregate, which is the aggregate's own object.
                         _ => JsPlace::Deref(value),
@@ -258,7 +278,17 @@ impl<'tcx> FnCx<'_, 'tcx> {
                             }
                             _ => {
                                 let base = self.read(&current);
-                                JsPlace::Var(self.element_expr(ty, base, index))
+                                if let Some(signed) = carried_raw_byte_slice {
+                                    let (setup, slot) =
+                                        ptr::reread(self, base, &[ptr::BUF, ptr::OFF]);
+                                    JsPlace::ByteAt {
+                                        buf: ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
+                                        off: offset(ptr::slot_off(slot), index),
+                                        signed,
+                                    }
+                                } else {
+                                    JsPlace::Var(self.element_expr(ty, base, index))
+                                }
                             }
                         };
                     }
@@ -266,7 +296,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     variant = None;
                 }
                 PlaceElem::ConstantIndex {
-                    offset,
+                    offset: idx_offset,
                     min_length: _,
                     from_end,
                 } => {
@@ -277,9 +307,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         current = match current {
                             JsPlace::Array(pointer, length) => {
                                 let index = if from_end {
-                                    length.saturating_sub(offset)
+                                    length.saturating_sub(idx_offset)
                                 } else {
-                                    offset
+                                    idx_offset
                                 };
                                 JsPlace::Var(
                                     self.unwindow_element(pointer, jsast::num(index as f64)),
@@ -287,10 +317,21 @@ impl<'tcx> FnCx<'_, 'tcx> {
                             }
                             _ => {
                                 let base = self.read(&current);
-                                let index = self.constant_index(ty, base.clone(), offset, from_end);
-                                // Constant either way, so nothing to hoist: `len` cannot change
-                                // under a reference that borrows the slice it was read from.
-                                JsPlace::Var(self.element_expr(ty, base, index))
+                                let index =
+                                    self.constant_index(ty, base.clone(), idx_offset, from_end);
+                                if let Some(signed) = carried_raw_byte_slice {
+                                    let (setup, slot) =
+                                        ptr::reread(self, base, &[ptr::BUF, ptr::OFF]);
+                                    JsPlace::ByteAt {
+                                        buf: ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
+                                        off: offset(ptr::slot_off(slot), index),
+                                        signed,
+                                    }
+                                } else {
+                                    // Constant either way, so nothing to hoist: `len` cannot change
+                                    // under a reference that borrows the slice it was read from.
+                                    JsPlace::Var(self.element_expr(ty, base, index))
+                                }
                             }
                         };
                     }
@@ -555,7 +596,25 @@ impl<'tcx> FnCx<'_, 'tcx> {
     pub(crate) fn read(&self, place: &JsPlace) -> Expr {
         match place {
             JsPlace::Var(expr) | JsPlace::Deref(expr) => expr.clone(),
+            JsPlace::Slot {
+                pointer,
+                byte_signed: Some(signed),
+                ..
+            } => {
+                let mut args = vec![pointer.clone()];
+                if *signed {
+                    args.push(Expr::Bool(true));
+                }
+                jsast::rt_call("read_byte", args)
+            }
             JsPlace::Slot { pointer, .. } => self.slot_element(pointer.clone()),
+            JsPlace::ByteAt { buf, off, signed } => {
+                let mut args = vec![buf.clone(), off.clone()];
+                if *signed {
+                    args.push(Expr::Bool(true));
+                }
+                jsast::rt_call("read_byte_at", args)
+            }
             // A copy of the elements: a plain slot hands back the array it holds, a window slot
             // the `n` elements it spans.
             JsPlace::Array(pointer, width) => jsast::rt_call(
@@ -576,7 +635,17 @@ impl<'tcx> FnCx<'_, 'tcx> {
         match target {
             JsPlace::Var(target) => vec![jsast::assign_stmt(target, value)],
             JsPlace::Deref(target) => ptr::write_indirect(self, ty, target, value),
-            JsPlace::Slot { pointer, indirect } => {
+            JsPlace::Slot {
+                pointer,
+                byte_signed: Some(_),
+                ..
+            } => vec![jsast::expr_stmt(jsast::rt_call(
+                "write_byte",
+                vec![pointer, value],
+            ))],
+            JsPlace::Slot {
+                pointer, indirect, ..
+            } => {
                 let target = self.slot_element(pointer);
                 if indirect {
                     ptr::write_indirect(self, ty, target, value)
@@ -584,6 +653,10 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     vec![jsast::assign_stmt(target, value)]
                 }
             }
+            JsPlace::ByteAt { buf, off, .. } => vec![jsast::expr_stmt(jsast::rt_call(
+                "write_byte_at",
+                vec![buf, off, value],
+            ))],
             // Element by element for a window, an in place overwrite for a plain slot: never a
             // rebind, because the elements live in a buffer other pointers share.
             JsPlace::Array(pointer, _) => {
@@ -634,11 +707,14 @@ impl<'tcx> FnCx<'_, 'tcx> {
         // pointee, so there is nothing to rebuild.
         if let Some(identity) = walk.identity {
             if let ty::Slice(element) = walk.ty.kind() {
-                if matches!(
-                    element.kind(),
-                    ty::Int(ty::IntTy::I8) | ty::Uint(ty::UintTy::U8)
-                ) {
-                    return jsast::rt_call("byte_slice_ref", vec![identity]);
+                match element.kind() {
+                    ty::Uint(ty::UintTy::U8) => {
+                        return jsast::rt_call("byte_slice_ref", vec![identity]);
+                    }
+                    ty::Int(ty::IntTy::I8) => {
+                        return jsast::rt_call("byte_slice_ref", vec![identity, Expr::Bool(true)]);
+                    }
+                    _ => {}
                 }
             }
             return identity;
@@ -725,6 +801,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
             // The pointer a slot or `__rt.read_array` place came from already names it: `&*p` /
             // `&raw (*p)` is `p`, scale/window/address and all.
             JsPlace::Slot { pointer, .. } | JsPlace::Array(pointer, _) => pointer,
+            JsPlace::ByteAt { buf, off, .. } => ptr::slot(buf, off),
             // No storage, so no slot either: the pointer is the address the run shares.
             JsPlace::Unit(address) => address,
             JsPlace::Deref(value) | JsPlace::Var(value) => {

@@ -142,11 +142,13 @@ export function minimalShim(programs, shimSource, { module = false, direct: decl
   // Lexical ESM mode avoids mutating a global `__rt` object so bundlers/minifiers can
   // mangle, inline, and dead-strip helpers. Keep `names` unchanged for manifest checks.
   const elideBoxes = !needed.has("box") && !needed.has("tail_ref") && !needed.has("tail_slice");
+  const elideByteViews = !needed.has("_bv_enable");
   const errPrefixPattern = /new Error\((\s*)"rustc_codegen_js: /g;
   const rtRefPattern =
     /'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|(?:globalThis\.)?__rt\.([A-Za-z_$][A-Za-z0-9_$]*)/g;
   const statements = names.map((name) => {
     if (elideBoxes && name === "_boxes") return "let $rt__boxes = null;";
+    if (elideByteViews && name === "_bv") return "const $rt__bv = null;";
     let stmt = members.get(name);
     if (elideBoxes && name === "_put") {
       stmt = stmt.replace(

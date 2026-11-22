@@ -30,7 +30,14 @@ pub enum JsPlace {
     /// projection actually dereferences it, so `&*p` / `&raw *p` / `addr_of!((*p).0)` return `p`
     /// intact without allocating a temp or stripping metadata, while actual reads/writes hoist
     /// non-duplicable `pointer` expressions once via `reread`.
-    Slot { pointer: Expr, indirect: bool },
+    Slot {
+        pointer: Expr,
+        indirect: bool,
+        byte_signed: Option<bool>,
+    },
+    /// One byte element indexed out of a raw `*const [u8]` / `*mut [u8]` / `*const [i8]` /
+    /// `*mut [i8]` slice when whole-program analysis sees potential wide-to-byte aliasing.
+    ByteAt { buf: Expr, off: Expr, signed: bool },
     /// The `N` elements a pointer to `[E; N]` names, reached through `__rt.read_array` and
     /// `__rt.write_array`. The expression is the pointer.
     Array(Expr, u64),
@@ -117,6 +124,7 @@ impl<'a> JsCx<'a> {
         let mut tail: Option<Expr> = None;
         let mut str_mutable = false;
         let mut str_from_mut = false;
+        let mut raw_byte_slice: Option<bool> = None;
         // An SSA value has no storage of its own: an aggregate one is held as the object.
         let mut object = matches!(root, Root::Value(_)) && is_object(table, ty);
 
@@ -125,6 +133,7 @@ impl<'a> JsCx<'a> {
             let carried_tail = tail.take();
             let carried_str_mutable = std::mem::take(&mut str_mutable);
             let carried_str_from_mut = std::mem::take(&mut str_from_mut);
+            let carried_raw_byte_slice = raw_byte_slice.take();
             // A downcast and a transparent field are the same place; every other step leaves it.
             object &= matches!(proj, Proj::Downcast { .. } | Proj::Field { .. });
 
@@ -153,7 +162,13 @@ impl<'a> JsCx<'a> {
                             identity = Some(value.clone());
                             JsPlace::Deref(jsast::member(value, PTR))
                         }
-                        Some(TypeKind::Slice(_)) => {
+                        Some(TypeKind::Slice(element)) => {
+                            if self.byte_views.raw_byte_derefs && value::is_raw(table, ty) {
+                                raw_byte_slice = match value::kind(table, *element) {
+                                    Some(TypeKind::Integer { bits: 8, signed }) => Some(*signed),
+                                    _ => None,
+                                };
+                            }
                             identity = Some(value.clone());
                             JsPlace::Deref(value)
                         }
@@ -179,6 +194,14 @@ impl<'a> JsCx<'a> {
                         _ if is_slot(table, ty) => JsPlace::Slot {
                             pointer: value,
                             indirect: table.is_indirect(pointee),
+                            byte_signed: if self.byte_views.raw_byte_derefs {
+                                match value::kind(table, shape) {
+                                    Some(TypeKind::Integer { bits: 8, signed }) => Some(*signed),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            },
                         },
                         // A reference to an aggregate: the pointee is the reference value.
                         _ => {
@@ -210,6 +233,7 @@ impl<'a> JsCx<'a> {
                         tail = carried_tail;
                         str_mutable = carried_str_mutable;
                         str_from_mut = carried_str_from_mut;
+                        raw_byte_slice = carried_raw_byte_slice;
                     } else if !table.get(field_ty).is_some_and(|d| d.layout.sized) {
                         let base = self.read_place(&current);
                         current = self.tail_place(base, key, field_ty, carried_tail)?;
@@ -234,7 +258,19 @@ impl<'a> JsCx<'a> {
                             }
                             _ => {
                                 let base = self.read_place(&current);
-                                JsPlace::Var(self.element_expr(ty, base, index))
+                                if let Some(signed) = carried_raw_byte_slice {
+                                    let (setup, slot) = self.reread(base, &[BUF, OFF]);
+                                    JsPlace::ByteAt {
+                                        buf: super::ptr::sequenced(
+                                            setup,
+                                            ptr::slot_buf(slot.clone()),
+                                        ),
+                                        off: offset(ptr::slot_off(slot), index),
+                                        signed,
+                                    }
+                                } else {
+                                    JsPlace::Var(self.element_expr(ty, base, index))
+                                }
                             }
                         };
                     }
@@ -242,7 +278,9 @@ impl<'a> JsCx<'a> {
                     variant = None;
                 }
                 Proj::ConstantIndex {
-                    offset, from_end, ..
+                    offset: idx_offset,
+                    from_end,
+                    ..
                 } => {
                     let element = self.element_ty(ty)?;
                     if let Some(address) = self.unit_element(&current, ty, element) {
@@ -251,9 +289,9 @@ impl<'a> JsCx<'a> {
                         current = match current {
                             JsPlace::Array(pointer, length) => {
                                 let index = if *from_end {
-                                    length.saturating_sub(*offset)
+                                    length.saturating_sub(*idx_offset)
                                 } else {
-                                    *offset
+                                    *idx_offset
                                 };
                                 JsPlace::Var(
                                     self.unwindow_element(pointer, jsast::num(index as f64)),
@@ -262,8 +300,20 @@ impl<'a> JsCx<'a> {
                             _ => {
                                 let base = self.read_place(&current);
                                 let index =
-                                    self.constant_index(ty, base.clone(), *offset, *from_end);
-                                JsPlace::Var(self.element_expr(ty, base, index))
+                                    self.constant_index(ty, base.clone(), *idx_offset, *from_end);
+                                if let Some(signed) = carried_raw_byte_slice {
+                                    let (setup, slot) = self.reread(base, &[BUF, OFF]);
+                                    JsPlace::ByteAt {
+                                        buf: super::ptr::sequenced(
+                                            setup,
+                                            ptr::slot_buf(slot.clone()),
+                                        ),
+                                        off: offset(ptr::slot_off(slot), index),
+                                        signed,
+                                    }
+                                } else {
+                                    JsPlace::Var(self.element_expr(ty, base, index))
+                                }
                             }
                         };
                     }
@@ -312,6 +362,8 @@ impl<'a> JsCx<'a> {
                     variant = Some(*index);
                     tail = carried_tail;
                     str_mutable = carried_str_mutable;
+                    str_from_mut = carried_str_from_mut;
+                    raw_byte_slice = carried_raw_byte_slice;
                 }
             }
         }
@@ -479,7 +531,25 @@ impl<'a> JsCx<'a> {
     pub fn read_place(&self, place: &JsPlace) -> Expr {
         match place {
             JsPlace::Var(expr) | JsPlace::Deref(expr) => expr.clone(),
+            JsPlace::Slot {
+                pointer,
+                byte_signed: Some(signed),
+                ..
+            } => {
+                let mut args = vec![pointer.clone()];
+                if *signed {
+                    args.push(Expr::Bool(true));
+                }
+                jsast::rt_call("read_byte", args)
+            }
             JsPlace::Slot { pointer, .. } => self.slot_element(pointer.clone()),
+            JsPlace::ByteAt { buf, off, signed } => {
+                let mut args = vec![buf.clone(), off.clone()];
+                if *signed {
+                    args.push(Expr::Bool(true));
+                }
+                jsast::rt_call("read_byte_at", args)
+            }
             JsPlace::Array(pointer, width) => jsast::rt_call(
                 "read_array",
                 vec![pointer.clone(), jsast::num(*width as f64)],
@@ -501,7 +571,17 @@ impl<'a> JsCx<'a> {
                 Ok(vec![jsast::assign_stmt(target, value)])
             }
             JsPlace::Deref(target) => self.write_indirect(ty, target, value),
-            JsPlace::Slot { pointer, indirect } => {
+            JsPlace::Slot {
+                pointer,
+                byte_signed: Some(_),
+                ..
+            } => Ok(vec![jsast::expr_stmt(jsast::rt_call(
+                "write_byte",
+                vec![pointer, value],
+            ))]),
+            JsPlace::Slot {
+                pointer, indirect, ..
+            } => {
                 let target = self.slot_element(pointer);
                 if indirect {
                     self.write_indirect(ty, target, value)
@@ -515,6 +595,10 @@ impl<'a> JsCx<'a> {
                     Ok(vec![jsast::assign_stmt(target, value)])
                 }
             }
+            JsPlace::ByteAt { buf, off, .. } => Ok(vec![jsast::expr_stmt(jsast::rt_call(
+                "write_byte_at",
+                vec![buf, off, value],
+            ))]),
             JsPlace::Array(pointer, _) => {
                 let mut args = vec![pointer, value];
                 if let Some(TypeKind::Array { element, .. }) = value::kind(self.table, ty) {
@@ -555,11 +639,14 @@ impl<'a> JsCx<'a> {
         }
         if let Some(identity) = walk.identity {
             if let Some(TypeKind::Slice(element)) = value::kind(self.table, walk.ty) {
-                if matches!(
-                    value::kind(self.table, *element),
-                    Some(TypeKind::Integer { bits: 8, .. })
-                ) {
-                    return Ok(jsast::rt_call("byte_slice_ref", vec![identity]));
+                if let Some(TypeKind::Integer { bits: 8, signed }) =
+                    value::kind(self.table, *element)
+                {
+                    let mut args = vec![identity];
+                    if *signed {
+                        args.push(Expr::Bool(true));
+                    }
+                    return Ok(jsast::rt_call("byte_slice_ref", args));
                 }
             }
             return Ok(identity);
@@ -625,6 +712,7 @@ impl<'a> JsCx<'a> {
             JsPlace::Var(Expr::Index(base, key)) => Ok(ptr::slot(*base, *key)),
             JsPlace::Var(Expr::Member(base, name)) => Ok(ptr::slot(*base, jsast::string(name))),
             JsPlace::Slot { pointer, .. } | JsPlace::Array(pointer, _) => Ok(pointer),
+            JsPlace::ByteAt { buf, off, .. } => Ok(ptr::slot(buf, off)),
             // No storage, so no slot either: the pointer is the address the run shares.
             JsPlace::Unit(address) => Ok(address),
             JsPlace::Deref(value) | JsPlace::Var(value) => {

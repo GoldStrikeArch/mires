@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { types } from "node:util";
+import { readFileSync } from "node:fs";
 
 import "../runtime/shim.js";
+import { minimalShim } from "./minimal-shim.mjs";
 
 const rt = globalThis.__rt;
 
@@ -277,23 +280,35 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
   fb.buf[7] |= 0x80;
   assert.equal(flt[0], -1.5);
 
-  // Heap block retyped via unscale_scalar records kind for GVN-folded raw pointers.
+  // Heap block retyped via unscale_scalar records kind for GVN-folded raw pointers without eager Proxy.
   const allocPtr = rt.alloc(4, 2);
+  assert.equal(types.isProxy(allocPtr.buf), false);
   const typed = rt.unscale_scalar(allocPtr, 2, () => 0, "u16");
+  assert.equal(types.isProxy(allocPtr.buf), false);
+  assert.equal(types.isProxy(typed.buf), false);
+  assert.notEqual(allocPtr.buf, typed.buf);
+  assert.equal(allocPtr.buf.length, 0);
   typed.buf[0] = 0x0102;
   typed.buf[1] = 0x0304;
   // Direct GVN-folded byte reads/writes, offset slice, copy, write_bytes, realloc.
-  assert.deepEqual([allocPtr.buf[0], allocPtr.buf[1], allocPtr.buf[2], allocPtr.buf[3]], [0x02, 0x01, 0x04, 0x03]);
-  const gvnSlice = rt.slice_from_parts(allocPtr, 4, 1);
+  assert.deepEqual(
+    [0, 1, 2, 3].map((k) => rt.read_byte({ buf: allocPtr.buf, off: k })),
+    [0x02, 0x01, 0x04, 0x03],
+  );
+  const gvnSlice = rt.byte_slice_ref(rt.slice_from_parts(allocPtr, 4, 1));
   assert.deepEqual(Array.prototype.slice.call(gvnSlice.buf, 0, 4), [0x02, 0x01, 0x04, 0x03]);
-  const gvnOffSlice = rt.slice_from_parts({ buf: allocPtr.buf, off: 1 }, 2, 1);
+  const gvnOffSlice = rt.byte_slice_ref(rt.slice_from_parts({ buf: allocPtr.buf, off: 1 }, 2, 1));
   assert.deepEqual([gvnOffSlice.buf[gvnOffSlice.off], gvnOffSlice.buf[gvnOffSlice.off + 1]], [0x01, 0x04]);
   assert.equal(rt.ptr_eq({ buf: allocPtr.buf, off: 2 }, { buf: typed.buf, off: 1 }), true);
   assert.equal(rt.ptr_eq({ buf: allocPtr.buf, off: 1 }, { buf: typed.buf, off: 1 }), false);
   const grown = rt.realloc(allocPtr, 4, 2, 8);
   assert.equal(grown.buf, allocPtr.buf);
+  assert.equal(types.isProxy(grown.buf), false);
   typed.buf[2] = 0x0506;
-  assert.deepEqual([grown.buf[4], grown.buf[5]], [0x06, 0x05]);
+  assert.deepEqual(
+    [rt.read_byte({ buf: grown.buf, off: 4 }), rt.read_byte({ buf: grown.buf, off: 5 })],
+    [0x06, 0x05],
+  );
   rt.write_bytes(grown, 0x5a, 4);
   assert.deepEqual([typed.buf[0], typed.buf[1]], [0x5a5a, 0x5a5a]);
   const sv = rt.convert_block_sv(rt.scale_scalar(typed, 2, "u16"), 2);
@@ -357,17 +372,16 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
   );
   assert.equal(rt.unproject(rt.unscale_scalar(pb, 4, () => 0, "u32"), "a"), pw);
 
-  // Non-scalar aggregate storage fails closed loudly on both slice and single-byte deref.
+  // Non-scalar aggregate storage fails closed loudly on both slice and single-byte deref without Proxy.
   const pairs = [{ a: 1, b: 2 }];
   const scaledPair = rt.scale({ buf: pairs, off: 0 }, 8);
+  assert.equal(types.isProxy(scaledPair.buf), false);
   assert.throws(
-    () => scaledPair.buf[0],
+    () => rt.read_byte(scaledPair),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
   assert.throws(
-    () => {
-      scaledPair.buf[0] = 1;
-    },
+    () => rt.write_byte(scaledPair, 1),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
   assert.equal(rt.unscale(scaledPair, 8).buf, pairs);
@@ -378,18 +392,17 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
   const pairHeap = rt.alloc(8, 4);
   const pairTyped = rt.unscale(pairHeap, 8, () => ({ a: 0, b: 0 }));
   const rawPairSlice = rt.slice_from_parts(pairHeap, 8, 1);
+  assert.equal(types.isProxy(rawPairSlice.buf), false);
   assert.throws(
     () => rt.byte_slice_ref(rawPairSlice),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
   assert.throws(
-    () => rawPairSlice.buf[0],
+    () => rt.read_byte(rawPairSlice),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
   assert.throws(
-    () => {
-      rawPairSlice.buf[0] = 1;
-    },
+    () => rt.write_byte(rawPairSlice, 1),
     (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
   );
   assert.equal(rt.unscale(rawPairSlice, 8, () => ({ a: 0, b: 0 })).buf, pairTyped.buf);
@@ -516,7 +529,7 @@ test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and p
     () => rt.thin({ buf: a1u16.buf, off: 0 }, 4),
     (err) => rt.is_abort(err) && /already holds 2-byte/.test(err.message),
   );
-  const s1u16 = rt.slice_from_parts({ buf: a1u16.buf, off: 2 }, 4, 1);
+  const s1u16 = rt.byte_slice_ref(rt.slice_from_parts({ buf: a1u16.buf, off: 2 }, 4, 1));
   assert.deepEqual([s1u16.buf[2], s1u16.buf[3], s1u16.buf[4], s1u16.buf[5]], [22, 0, 33, 0]);
   rt.write_bytes({ buf: a1u16.buf, off: 2 }, 0xab, 2);
   assert.equal(p1u16.buf[1], 0xabab);
@@ -542,11 +555,12 @@ test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and p
   assert.equal(rt.addr(pp, 1), rt.addr(rt.box(w), 8));
   assert.notEqual(pf.buf, pp.buf);
 
-  // 6. ptr_eq on shared _non_scalar_byte_view (sc === undefined vs sc === 8).
+  // 6. ptr_eq on empty slice built from scaled non-scalar pointer preserves sc and equality.
   const nsBuf = [{ a: 1, b: 2 }, { a: 3, b: 4 }];
   const nsScaled = rt.scale({ buf: nsBuf, off: 1 }, 8);
-  const nsNoSc = { buf: nsScaled.buf, off: 8 };
-  assert.equal(rt.ptr_eq(nsScaled, nsNoSc), true);
+  const nsSlice = rt.slice_from_parts(nsScaled, 0, 1);
+  assert.equal(rt.ptr_eq(nsScaled, nsSlice), true);
+  assert.equal(rt.ptr_eq(nsScaled, { buf: nsBuf, off: 1 }), true);
 
   // 7. ptr_eq + thin roundtrip for wider scalars (stack, heap align > 1, heap align == 1).
   const stk32 = [10, 20, 30, 40];
@@ -753,4 +767,65 @@ test("slice_ptr_cmp and fat_ptr_cmp order by data address first and tie-break by
   assert.equal(rt.fat_ptr_cmp(tail1, tail3, 1), -1);
   assert.equal(rt.fat_ptr_cmp(tail3, tail1, 1), 1);
   assert.equal(rt.fat_ptr_cmp(tail1, { ptr: slot, meta: 1 }, 1), 0);
+});
+
+test("ordinary Vec/Box allocs stay Proxy-free and minimal-shim excludes byte-view machinery", () => {
+  // 1. Runtime: alloc, alloc_zeroed, unscale, unscale_scalar, realloc, slice_from_parts,
+  //    convert_nv_block, and dealloc never allocate a Proxy.
+  for (const [size, align, es, kind] of [
+    [16, 4, 4, "u32"],
+    [32, 8, 8, null],
+    [8, 1, 2, "u16"],
+  ]) {
+    const a = rt.alloc(size, align);
+    assert.equal(types.isProxy(a.buf), false);
+    const addrBefore = rt.addr(a, 1);
+    const sRaw = rt.slice_from_parts(a, size, 1);
+    assert.equal(types.isProxy(sRaw.buf), false);
+    const p = kind ? rt.unscale_scalar(a, es, () => 0, kind) : rt.unscale(a, es, () => ({ x: 0 }));
+    assert.equal(types.isProxy(p.buf), false);
+    assert.equal(rt.addr(p, es), addrBefore);
+    assert.equal(rt.addr(a, 1), addrBefore);
+    assert.equal(rt.ptr_eq(a, p), true);
+    const g = rt.realloc(a, size, align, size * 2);
+    assert.equal(types.isProxy(g.buf), false);
+    const gRaw = rt.slice_from_parts(g, size * 2, 1);
+    assert.equal(types.isProxy(gRaw.buf), false);
+    assert.equal(rt._byte_view_of.has(a.buf), false);
+    assert.equal(rt._byte_view_of.has(p.buf), false);
+    rt.dealloc(g, size * 2, align);
+    assert.throws(() => rt.read_byte(a), (err) => rt.is_abort(err) && /freed/.test(err.message));
+  }
+  const nv = rt.convert_nv_block({ buf: [1, 2, 3], len: 3, cap: 4 }, 4, "u32");
+  assert.equal(types.isProxy(nv.buf), false);
+  const nvTyped = rt.unscale_scalar(nv, 4, () => 0, "u32");
+  assert.equal(types.isProxy(nvTyped.buf), false);
+  assert.deepEqual(nvTyped.buf.slice(0, 3), [1, 2, 3]);
+  rt.dealloc(nv, 16, 4);
+
+  // 2. Static minimal-shim extraction: plain Vec<u8>/Vec<u32>/Vec<Struct> programs exclude
+  //    all byte-view helpers and constant-fold `$rt__bv = null` in module mode.
+  const shimSource = readFileSync(new URL("../runtime/shim.js", import.meta.url), "utf8");
+  const plainDirect = [
+    "alloc", "alloc_zeroed", "realloc", "dealloc", "unscale", "unscale_scalar",
+    "slice_from_parts", "byte_slice_ref", "copy", "copy_nonoverlapping",
+    "write_bytes", "compare_bytes", "ptr_eq", "ptr_is_null", "addr", "scale",
+  ];
+  const plain = minimalShim([], shimSource, { module: true, direct: plainDirect });
+  for (const forbidden of [
+    "_bv_enable", "_byte_view", "_byte_load", "_byte_store",
+    "_byte_views", "_prefix_byte_views", "_byte_view_of",
+    "_prep_copy", "_unwrap_view", "_alloc_byte_proxy", "_non_scalar_byte_view",
+  ]) {
+    assert.equal(plain.names.includes(forbidden), false, `plain shim must not include ${forbidden}`);
+  }
+  assert.match(plain.source, /const \$rt__bv = null;/);
+
+  // Programs that reach wide byte views pull `_bv_enable` and the lazy byte-view helpers.
+  for (const trigger of ["scale_scalar", "byte_sign", "read_byte", "write_byte"]) {
+    const withBv = minimalShim([], shimSource, { module: true, direct: ["alloc", trigger] });
+    assert.equal(withBv.names.includes("_bv_enable"), true, `${trigger} must pull _bv_enable`);
+    assert.equal(withBv.names.includes("_byte_view"), true, `${trigger} must pull _byte_view`);
+    assert.match(withBv.source, /let \$rt__bv = null;/);
+  }
 });

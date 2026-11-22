@@ -100,6 +100,9 @@ pub struct JsCx<'a> {
     /// Whether this lowering hoists BigInt constants (`crate::lower::LowerInput::bigints`), and
     /// so widens an integer literal at compile time ([`JsCx::to_bigint`]).
     hoists_bigints: bool,
+    /// Whether whole-program analysis determined that wide (`size > 1`) storage may be observed
+    /// through 1-byte pointers/slices (`MIRES-008` lazy-proxy path).
+    pub byte_views: crate::analysis::byte_views::ByteViewPlan,
     /// Whole-program ASCII provenance facts for this function (`js-str=bytes`).
     ascii: Option<crate::analysis::ascii::FuncAsciiFacts<'a>>,
     /// What one `view!` template instantiated in this body knows, by the value the
@@ -184,6 +187,7 @@ impl<'a> JsCx<'a> {
             target_abi: None,
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             hoists_bigints: false,
+            byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
             ascii: None,
             instantiations: RefCell::new(BTreeMap::new()),
             exprs: RefCell::new(BTreeMap::new()),
@@ -242,6 +246,15 @@ impl<'a> JsCx<'a> {
         physical: Option<&'a crate::plan::physical::PhysicalPlan>,
     ) -> Self {
         self.physical = physical.map(|physical| (item, physical));
+        self
+    }
+
+    /// The same context, carrying whether wide byte views are reachable in the program.
+    pub fn with_byte_views(
+        mut self,
+        byte_views: crate::analysis::byte_views::ByteViewPlan,
+    ) -> Self {
+        self.byte_views = byte_views;
         self
     }
 

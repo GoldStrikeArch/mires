@@ -1,0 +1,1 @@
+the program must abort: raw byte read over a non-scalar retyped allocation cannot inspect aggregate bytes
