@@ -99,8 +99,109 @@ fn test_erased_roundtrip_and_try_into() {
     print_u32(bytes[5] as u32);
 }
 
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct Byte(u8);
+
+#[derive(Copy, Clone)]
+struct Pair {
+    a: i32,
+    b: i32,
+}
+
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct PairWrap(Pair);
+
+#[inline(never)]
+fn get_null_byte() -> *const Byte {
+    black_box(ptr::null())
+}
+
+#[inline(never)]
+fn get_dangling_byte() -> *const Byte {
+    black_box(0x1000usize as *const Byte)
+}
+
+#[inline(never)]
+fn test_reborrows_and_transparent_addr_of() {
+    // Scaled byte pointer reborrow preserves `.sc` (regression check for JsPlace::Slot).
+    let mut arr = [10u32, 20, 30, 40];
+    unsafe {
+        let r: &u8 = &*(addr_of!(arr[0]) as *const u8);
+        let p_next: *const u32 = (r as *const u8).add(4) as *const u32;
+        print_u32(*p_next);
+        print_bool(ptr::eq(p_next, addr_of!(arr[1])));
+
+        let p: *const u8 = addr_of!((*(addr_of!(arr[0]) as *const Byte)).0);
+        let p_next2: *const u32 = p.add(4) as *const u32;
+        print_u32(*p_next2);
+        print_bool(ptr::eq(p_next2, addr_of!(arr[1])));
+
+        // Reborrow through a window of scaled byte pointers (`&mut *(*win)[i]`).
+        let mut ptrs: [*mut u8; 4] = [
+            arr.as_mut_ptr() as *mut u8,
+            arr.as_mut_ptr() as *mut u8,
+            arr.as_mut_ptr() as *mut u8,
+            arr.as_mut_ptr() as *mut u8,
+        ];
+        let win: *mut [*mut u8; 2] = addr_of_mut!(ptrs[1]) as *mut [*mut u8; 2];
+        let i = black_box(1usize);
+        let rw: &mut u8 = &mut *(*win)[i];
+        let p_next3: *mut u32 = (rw as *mut u8).add(12) as *mut u32;
+        print_u32(*p_next3);
+        print_bool(ptr::eq(p_next3, addr_of!(arr[3])));
+    }
+
+    // Transparent-field `addr_of!` on null and dangling addresses (direct and through a window).
+    unsafe {
+        let pn: *const u8 = addr_of!((*get_null_byte()).0);
+        print_bool(pn.is_null());
+        let pd: *const u8 = addr_of!((*get_dangling_byte()).0);
+        print_usize(pd as usize);
+
+        let mut bptrs: [*const Byte; 4] = [
+            ptr::null(),
+            0x1000usize as *const Byte,
+            ptr::null(),
+            0x2000usize as *const Byte,
+        ];
+        let bwin: *mut [*const Byte; 2] = addr_of_mut!(bptrs[1]) as *mut [*const Byte; 2];
+        let i0 = black_box(0usize);
+        let i1 = black_box(1usize);
+        let w_dang: *const u8 = addr_of!((*(*bwin)[i0]).0);
+        print_usize(w_dang as usize);
+        let w_null: *const u8 = addr_of!((*(*bwin)[i1]).0);
+        print_bool(w_null.is_null());
+    }
+
+    // Transparent-field `addr_of_mut!` on an indirect wrapper stored behind a window of pointers.
+    let mut pairs = [
+        PairWrap(Pair { a: 1, b: 2 }),
+        PairWrap(Pair { a: 3, b: 4 }),
+        PairWrap(Pair { a: 5, b: 6 }),
+        PairWrap(Pair { a: 7, b: 8 }),
+    ];
+    unsafe {
+        let mut pptrs: [*mut PairWrap; 4] = [
+            addr_of_mut!(pairs[0]),
+            addr_of_mut!(pairs[1]),
+            addr_of_mut!(pairs[2]),
+            addr_of_mut!(pairs[3]),
+        ];
+        let pwin: *mut [*mut PairWrap; 2] = addr_of_mut!(pptrs[1]) as *mut [*mut PairWrap; 2];
+        let i = black_box(0usize);
+        let q: *mut Pair = addr_of_mut!((*(*pwin)[i]).0);
+        print_bool(ptr::eq(q, addr_of!(pairs[1].0)));
+        print_i32((*q).a);
+        print_i32((*q).b);
+        print_i32((*q.add(1)).a);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub fn rust_entry() {
     test_single_eval();
     test_erased_roundtrip_and_try_into();
+    test_reborrows_and_transparent_addr_of();
 }

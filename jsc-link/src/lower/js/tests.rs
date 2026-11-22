@@ -5280,7 +5280,7 @@ fn a_reference_read_out_of_a_place_is_a_raw_pointer_to_its_pointee() {
     );
     assert_eq!(
         js,
-        "function f($v0, $v1, $v2, $v3) {\n  let $cell = [];\n  same(__rt.box($v0.r), __rt.box($v1));\n  same(__rt.box($v2[1]), { buf: $v0, off: \"r\" });\n  $cell[0] = $v1;\n  same(__rt.box($cell[0]), { buf: $v3.buf, off: $v3.off });\n}\n"
+        "function f($v0, $v1, $v2, $v3) {\n  let $cell = [];\n  same(__rt.box($v0.r), __rt.box($v1));\n  same(__rt.box($v2[1]), { buf: $v0, off: \"r\" });\n  $cell[0] = $v1;\n  same(__rt.box($cell[0]), $v3);\n}\n"
     );
 }
 
@@ -8295,7 +8295,13 @@ fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
         e,
         OpKind::BorrowView {
             root: Root::Value(mp),
-            path: vec![Proj::Deref, Proj::Field { field: 0, ty: ARRAY }],
+            path: vec![
+                Proj::Deref,
+                Proj::Field {
+                    field: 0,
+                    ty: ARRAY,
+                },
+            ],
             mutable: true,
         },
         REF_ARRAY,
@@ -8317,7 +8323,127 @@ fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
         js7,
         "function borrow_mu_inner(p) {\n  return __rt.array_ref(p, 4);\n}\n"
     );
-}
 
+    // 7. Reborrowing a non-duplicable slot (`&mut *(*win)[i]` or `addr_of!((*(*win)[i]).0)` on
+    // a transparent wrapper, or `&*(p as *const u8)` scaled byte pointer) must keep the slot
+    // intact (`JsPlace::Slot`) without stripping `.sc`/`.w`/`.es`, dereferencing null/dangling
+    // addresses, or allocating an unused `$t` temporary.
+    const BYTE_WRAP: TypeId = TypeId(421);
+    const RAW_BYTE_WRAP: TypeId = TypeId(422);
+    const ARR_PTR_BW: TypeId = TypeId(423);
+    const RAW_ARR_PTR_BW: TypeId = TypeId(424);
+    const RAW_U8: TypeId = TypeId(425);
+    const REF_U8: TypeId = TypeId(426);
+    let bw_name = interns.intern_str("Byte");
+    let mut bw = descriptor(
+        BYTE_WRAP,
+        TypeKind::Adt {
+            def: def(421),
+            args: Vec::new(),
+            form: NominalForm::Struct,
+            variants: vec![variant(
+                bw_name,
+                vec![field(FieldKey::Transparent, U8)],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        1,
+    );
+    bw.js.is_indirect = false;
+    bw.js.peeled = U8;
+    interns.intern_type(bw);
+    interns.intern_type(pointer(RAW_BYTE_WRAP, BYTE_WRAP, PointerForm::Slot, true));
+    let mut arr_ptr_bw = descriptor(
+        ARR_PTR_BW,
+        TypeKind::Array {
+            element: RAW_BYTE_WRAP,
+            length: 4,
+        },
+        16,
+    );
+    arr_ptr_bw.js.is_indirect = true;
+    arr_ptr_bw.js.needs_clone = true;
+    interns.intern_type(arr_ptr_bw);
+    interns.intern_type(pointer(RAW_ARR_PTR_BW, ARR_PTR_BW, PointerForm::Slot, true));
+    interns.intern_type(pointer(RAW_U8, U8, PointerForm::Slot, true));
+    interns.intern_type(pointer(REF_U8, U8, PointerForm::Slot, false));
+
+    let mut b8 = FuncBuilder::new(item(9), signature(vec![RAW_ARR_PTR_BW, USIZE], RAW_U8));
+    let win = b8.param(RAW_ARR_PTR_BW, NO_ORIGIN);
+    let idx = b8.param(USIZE, NO_ORIGIN);
+    let raw_field = b8.op(
+        e,
+        OpKind::RawView {
+            root: Root::Value(win),
+            path: vec![
+                Proj::Deref,
+                Proj::Index(idx),
+                Proj::Deref,
+                Proj::Field { field: 0, ty: U8 },
+            ],
+            mutable: false,
+        },
+        RAW_U8,
+        NO_ORIGIN,
+    );
+    b8.terminate(e, RTerm::Return(Some(raw_field)));
+    let f8 = b8.finish();
+    let p8 = plan_of(&f8, &[(0, "win"), (1, "i")]);
+    let js8 = lower(
+        &interns,
+        "addr_of_transparent_through_window",
+        &[],
+        &body_of(BodyKind::Function, f8.sig.clone()),
+        &f8,
+        &p8,
+        straight(&f8),
+    );
+    assert_eq!(
+        js8,
+        "function addr_of_transparent_through_window(win, i) {\n  let $t0;\n  return ($t0 = __rt.unwindow(win), $t0.buf)[$t0.off + i];\n}\n"
+    );
+
+    let mut b9 = FuncBuilder::new(item(10), signature(vec![RAW_I32], REF_U8));
+    let pi = b9.param(RAW_I32, NO_ORIGIN);
+    let scaled = b9.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PtrToPtr,
+            v: pi,
+            from: RAW_I32,
+            to: RAW_U8,
+        },
+        RAW_U8,
+        NO_ORIGIN,
+    );
+    let reborrowed = b9.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(scaled),
+            path: vec![Proj::Deref],
+            mutable: false,
+        },
+        REF_U8,
+        NO_ORIGIN,
+    );
+    b9.terminate(e, RTerm::Return(Some(reborrowed)));
+    let f9 = b9.finish();
+    let p9 = plan_of(&f9, &[(0, "p")]);
+    let js9 = lower(
+        &interns,
+        "reborrow_scaled_byte_ptr",
+        &[],
+        &body_of(BodyKind::Function, f9.sig.clone()),
+        &f9,
+        &p9,
+        straight(&f9),
+    );
+    assert_eq!(
+        js9,
+        "function reborrow_scaled_byte_ptr(p) {\n  return __rt.scale_scalar(p, 4, \"i32\");\n}\n"
+    );
+}
 
 mod invoke;

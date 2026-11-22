@@ -53,6 +53,12 @@ pub(crate) enum JsPlace {
     /// The pointee of a reference to an aggregate. Reading is the value itself; writing has to
     /// overwrite in place, because rebinding the JS variable would break the aliasing.
     Deref(Expr),
+    /// The pointee of a slot pointer (`{ buf, off }`, optionally carrying `.sc`/`.w`/`.es` or a
+    /// null/dangling address). Kept as the pointer expression until a read, write, or non-transparent
+    /// projection actually dereferences it, so `&*p` / `&raw *p` / `addr_of!((*p).0)` return `p`
+    /// intact without allocating a temp or stripping metadata, while actual reads/writes hoist
+    /// non-duplicable `pointer` expressions once via `reread`.
+    Slot { pointer: Expr, indirect: bool },
     /// The `N` elements a pointer to `[E; N]` names, reached through `__rt.read_array` and
     /// `__rt.write_array`. The expression is the *pointer*, not the place, because which elements
     /// it names is a question only the record can answer: a plain slot holds the whole array at
@@ -170,31 +176,14 @@ impl<'tcx> FnCx<'_, 'tcx> {
                             let width = count.try_to_target_usize(self.tcx).unwrap_or(0);
                             JsPlace::Array(value, width)
                         }
-                        // A slot whose pointee is an aggregate: the place is the object at
-                        // `p.buf[p.off]`, and it is a `Deref` rather than a `Var` because a write
-                        // of the *whole* pointee has to overwrite that object in place. Assigning
-                        // `p.buf[p.off]` would rebind the one container the pointer came from —
-                        // for a raw pointer taken from a local, the `__rt.box` array that nothing
-                        // else reads — and the local it aliases would keep its old value. The
-                        // projections that follow are unaffected: reading a `Deref` is the object,
-                        // exactly as reading a `Var` was.
-                        _ if ptr::is_slot(self.tcx, ty) && is_indirect(self.tcx, pointee) => {
-                            let (setup, slot) = ptr::reread(self, value, &[ptr::BUF, ptr::OFF]);
-                            JsPlace::Deref(jsast::index(
-                                ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
-                                ptr::slot_off(slot),
-                            ))
-                        }
-                        // A slot to a primitive: `p.buf[p.off]` is the place, and it is assignable,
-                        // so the projections that follow and a write both work without a special
-                        // case.
-                        _ if ptr::is_slot(self.tcx, ty) => {
-                            let (setup, slot) = ptr::reread(self, value, &[ptr::BUF, ptr::OFF]);
-                            JsPlace::Var(jsast::index(
-                                ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
-                                ptr::slot_off(slot),
-                            ))
-                        }
+                        // A slot pointer to a non-array pointee: keep the pointer record intact
+                        // until a read, write, or non-transparent projection needs `p.buf[p.off]`,
+                        // so reborrows and transparent-field `addr_of!` preserve `.sc`/`.w`/`.es`
+                        // and null/dangling addresses without allocating a temp.
+                        _ if ptr::is_slot(self.tcx, ty) => JsPlace::Slot {
+                            pointer: value,
+                            indirect: is_indirect(self.tcx, pointee),
+                        },
                         // A reference to an aggregate, which is the aggregate's own object.
                         _ => JsPlace::Deref(value),
                     };
@@ -419,6 +408,15 @@ impl<'tcx> FnCx<'_, 'tcx> {
         })
     }
 
+    /// `pointer.buf[pointer.off]`, hoisting non-duplicable `pointer` expressions once via `reread`.
+    fn slot_element(&self, pointer: Expr) -> Expr {
+        let (setup, slot) = ptr::reread(self, pointer, &[ptr::BUF, ptr::OFF]);
+        jsast::index(
+            ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
+            ptr::slot_off(slot),
+        )
+    }
+
     /// One element of a slot-pointed `[E; N]` (plain slot or window slot), normalized once
     /// through `__rt.unwindow` into a hoisted temporary so `buf` and `off` come from the same
     /// record without double evaluation.
@@ -526,6 +524,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
     pub(crate) fn read(&self, place: &JsPlace) -> Expr {
         match place {
             JsPlace::Var(expr) | JsPlace::Deref(expr) => expr.clone(),
+            JsPlace::Slot { pointer, .. } => self.slot_element(pointer.clone()),
             // A copy of the elements: a plain slot hands back the array it holds, a window slot
             // the `n` elements it spans.
             JsPlace::Array(pointer, width) => jsast::rt_call(
@@ -546,6 +545,14 @@ impl<'tcx> FnCx<'_, 'tcx> {
         match target {
             JsPlace::Var(target) => vec![jsast::assign_stmt(target, value)],
             JsPlace::Deref(target) => ptr::write_indirect(self, ty, target, value),
+            JsPlace::Slot { pointer, indirect } => {
+                let target = self.slot_element(pointer);
+                if indirect {
+                    ptr::write_indirect(self, ty, target, value)
+                } else {
+                    vec![jsast::assign_stmt(target, value)]
+                }
+            }
             // Element by element for a window, an in place overwrite for a plain slot: never a
             // rebind, because the elements live in a buffer other pointers share.
             JsPlace::Array(pointer, _) => {
@@ -648,9 +655,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
             }
             JsPlace::Var(Expr::Index(base, key)) => ptr::slot(*base, *key),
             JsPlace::Var(Expr::Member(base, name)) => ptr::slot(*base, jsast::string(name)),
-            // The pointer a `__rt.read_array` place came from already names it: `&raw (*p)` is
-            // `p`, window and all.
-            JsPlace::Array(pointer, _) => pointer,
+            // The pointer a slot or `__rt.read_array` place came from already names it: `&*p` /
+            // `&raw (*p)` is `p`, scale/window/address and all.
+            JsPlace::Slot { pointer, .. } | JsPlace::Array(pointer, _) => pointer,
             // No storage, so no slot either: the pointer is the address the run shares.
             JsPlace::Unit(address) => address,
             JsPlace::Deref(value) | JsPlace::Var(value) => {

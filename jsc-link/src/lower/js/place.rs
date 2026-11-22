@@ -25,6 +25,12 @@ pub enum JsPlace {
     /// The pointee of a reference to an aggregate: reading is the value itself, writing overwrites
     /// in place.
     Deref(Expr),
+    /// The pointee of a slot pointer (`{ buf, off }`, optionally carrying `.sc`/`.w`/`.es` or a
+    /// null/dangling address). Kept as the pointer expression until a read, write, or non-transparent
+    /// projection actually dereferences it, so `&*p` / `&raw *p` / `addr_of!((*p).0)` return `p`
+    /// intact without allocating a temp or stripping metadata, while actual reads/writes hoist
+    /// non-duplicable `pointer` expressions once via `reread`.
+    Slot { pointer: Expr, indirect: bool },
     /// The `N` elements a pointer to `[E; N]` names, reached through `__rt.read_array` and
     /// `__rt.write_array`. The expression is the pointer.
     Array(Expr, u64),
@@ -152,20 +158,10 @@ impl<'a> JsCx<'a> {
                         Some(TypeKind::Array { length, .. }) if is_slot(table, ty) => {
                             JsPlace::Array(value, *length)
                         }
-                        _ if is_slot(table, ty) && table.is_indirect(pointee) => {
-                            let (setup, slot) = self.reread(value, &[BUF, OFF]);
-                            JsPlace::Deref(jsast::index(
-                                super::ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
-                                ptr::slot_off(slot),
-                            ))
-                        }
-                        _ if is_slot(table, ty) => {
-                            let (setup, slot) = self.reread(value, &[BUF, OFF]);
-                            JsPlace::Var(jsast::index(
-                                super::ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
-                                ptr::slot_off(slot),
-                            ))
-                        }
+                        _ if is_slot(table, ty) => JsPlace::Slot {
+                            pointer: value,
+                            indirect: table.is_indirect(pointee),
+                        },
                         // A reference to an aggregate: the pointee is the reference value.
                         _ => {
                             object = is_object(table, pointee);
@@ -355,6 +351,15 @@ impl<'a> JsCx<'a> {
         })
     }
 
+    /// `pointer.buf[pointer.off]`, hoisting non-duplicable `pointer` expressions once via `reread`.
+    fn slot_element(&self, pointer: Expr) -> Expr {
+        let (setup, slot) = self.reread(pointer, &[BUF, OFF]);
+        jsast::index(
+            super::ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
+            ptr::slot_off(slot),
+        )
+    }
+
     /// One element of a slot-pointed `[E; N]` (plain slot or window slot), normalized once
     /// through `__rt.unwindow` into a hoisted temporary so `buf` and `off` come from the same
     /// record without double evaluation.
@@ -451,6 +456,7 @@ impl<'a> JsCx<'a> {
     pub fn read_place(&self, place: &JsPlace) -> Expr {
         match place {
             JsPlace::Var(expr) | JsPlace::Deref(expr) => expr.clone(),
+            JsPlace::Slot { pointer, .. } => self.slot_element(pointer.clone()),
             JsPlace::Array(pointer, width) => jsast::rt_call(
                 "read_array",
                 vec![pointer.clone(), jsast::num(*width as f64)],
@@ -472,6 +478,20 @@ impl<'a> JsCx<'a> {
                 Ok(vec![jsast::assign_stmt(target, value)])
             }
             JsPlace::Deref(target) => self.write_indirect(ty, target, value),
+            JsPlace::Slot { pointer, indirect } => {
+                let target = self.slot_element(pointer);
+                if indirect {
+                    self.write_indirect(ty, target, value)
+                } else {
+                    if !is_lvalue(&target) {
+                        return Err(decline(
+                            OpClass::Place,
+                            "a write to a place whose expression is not assignable (an inlined value used as storage)",
+                        ));
+                    }
+                    Ok(vec![jsast::assign_stmt(target, value)])
+                }
+            }
             JsPlace::Array(pointer, _) => Ok(vec![jsast::expr_stmt(jsast::rt_call(
                 "write_array",
                 vec![pointer, value],
@@ -545,7 +565,7 @@ impl<'a> JsCx<'a> {
             }
             JsPlace::Var(Expr::Index(base, key)) => Ok(ptr::slot(*base, *key)),
             JsPlace::Var(Expr::Member(base, name)) => Ok(ptr::slot(*base, jsast::string(name))),
-            JsPlace::Array(pointer, _) => Ok(pointer),
+            JsPlace::Slot { pointer, .. } | JsPlace::Array(pointer, _) => Ok(pointer),
             // No storage, so no slot either: the pointer is the address the run shares.
             JsPlace::Unit(address) => Ok(address),
             JsPlace::Deref(value) | JsPlace::Var(value) => {
