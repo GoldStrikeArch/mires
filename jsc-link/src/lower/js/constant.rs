@@ -226,8 +226,12 @@ impl<'a> JsCx<'a> {
             TypeKind::Char => Ok(jsast::num(bits as f64)),
             TypeKind::Integer { .. } => value::int_literal(table, ty, bits)
                 .ok_or_else(|| decline(OpClass::Constant, "integer literal at a non-integer type")),
-            TypeKind::Float { bits: 32 } => Ok(jsast::num(f32::from_bits(bits as u32) as f64)),
-            TypeKind::Float { .. } => Ok(jsast::num(f64::from_bits(bits as u64))),
+            TypeKind::Float { bits: 32 } => Ok(jsast::f32_from_bits(bits as u32)),
+            TypeKind::Float { bits: 64 } => Ok(jsast::f64_from_bits(bits as u64)),
+            TypeKind::Float { bits } => Err(decline(
+                OpClass::Constant,
+                format!("f{bits} constants are not supported"),
+            )),
             // A pointer in a register with no provenance is an address (`constant.rs:400`).
             TypeKind::RawPointer { .. } | TypeKind::Reference { .. } | TypeKind::FnPtr { .. } => {
                 Ok(jsast::num(bits as f64))

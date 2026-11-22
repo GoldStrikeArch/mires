@@ -2420,14 +2420,18 @@ fn int_array(int: Int) -> &'static str {
     }
 }
 
-/// `new To(new From([value]).buffer)[0]`: the bits of `value`, read back as another type.
+/// `new To(From.of(value).buffer)[0]`: the bits of `value`, read back as another type.
+///
+/// Uses `From.of(value)` rather than `new From([value])` so no intermediate JS `Array` literal is
+/// constructed: in V8, transitioning a `[value]` array literal to `PACKED_DOUBLE_ELEMENTS` on
+/// feedback-vector allocation canonicalizes `NaN` payloads on the 10th call (MIRES-023).
 ///
 /// One scratch buffer per call is wasteful, and deliberately so for now — a shared buffer would
 /// have to live in `runtime/shim.js`, which several workstreams append to at once. The obvious
 /// follow up is a pair of `__rt.f32_bits`/`__rt.bits_f32` helpers over one module level
 /// `DataView`.
 fn bit_cast(from: &str, to: &str, value: Expr) -> Expr {
-    let source = jsast::new(jsast::id(from), vec![jsast::array(vec![value])]);
+    let source = jsast::method_call(jsast::id(from), "of", vec![value]);
     let view = jsast::new(jsast::id(to), vec![jsast::member(source, "buffer")]);
     jsast::index(view, jsast::num(0))
 }

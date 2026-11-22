@@ -190,8 +190,8 @@ fn scalar_to_expr<'tcx>(
             Some(literal) => literal,
             None => zombie(cgu, log, span, format!("`{ty}` is not an integer type")),
         },
-        ty::Float(ty::FloatTy::F32) => jsast::num(f32::from_bits(int.to_uint(size) as u32) as f64),
-        ty::Float(ty::FloatTy::F64) => jsast::num(f64::from_bits(int.to_uint(size) as u64)),
+        ty::Float(ty::FloatTy::F32) => jsast::f32_from_bits(int.to_uint(size) as u32),
+        ty::Float(ty::FloatTy::F64) => jsast::f64_from_bits(int.to_uint(size) as u64),
         // Not a primitive, but small enough that const evaluation kept it in a register rather
         // than an allocation: `None::<&mut i32>`, a one-field newtype, a fieldless enum. The bits
         // are laid out exactly as they would be in memory, so they are decoded by putting them

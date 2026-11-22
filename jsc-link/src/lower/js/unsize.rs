@@ -570,9 +570,13 @@ fn byte_array_len(table: &rcgjs_object::jir::types::TypeTable, ty: TypeId) -> Op
     value::is_u8(table, table.peeled(*element)).then_some(*length)
 }
 
-/// `new To(new From([value]).buffer)[0]`: the bits of `value`, read back as another type.
+/// `new To(From.of(value).buffer)[0]`: the bits of `value`, read back as another type.
+///
+/// Uses `From.of(value)` rather than `new From([value])` so no intermediate JS `Array` literal is
+/// constructed: in V8, transitioning a `[value]` array literal to `PACKED_DOUBLE_ELEMENTS` on
+/// feedback-vector allocation canonicalizes `NaN` payloads on the 10th call (MIRES-023).
 fn bit_cast(from: &str, to: &str, value: Expr) -> Expr {
-    let source = jsast::new(jsast::id(from), vec![jsast::array(vec![value])]);
+    let source = jsast::method_call(jsast::id(from), "of", vec![value]);
     let view = jsast::new(jsast::id(to), vec![jsast::member(source, "buffer")]);
     jsast::index(view, jsast::num(0))
 }

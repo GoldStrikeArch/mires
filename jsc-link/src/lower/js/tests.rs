@@ -8591,4 +8591,100 @@ fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
     );
 }
 
+#[test]
+fn float_nan_payload_constants_preserve_bits_and_keep_canonical_nan_compact() {
+    const F64: TypeId = TypeId(420);
+    const F16: TypeId = TypeId(421);
+    let mut interns = world();
+    interns.intern_type(descriptor(F64, TypeKind::Float { bits: 64 }, 8));
+    interns.intern_type(descriptor(F16, TypeKind::Float { bits: 16 }, 2));
+
+    let emit_const = |name: &str, ty: TypeId, bits: u128, bytes: u8| -> String {
+        let e = FuncBuilder::ENTRY;
+        let mut b = FuncBuilder::new(item(1), signature(Vec::new(), ty));
+        let v = b.op(
+            e,
+            OpKind::Const(ConstTree::Scalar { bits, bytes }),
+            ty,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(v)));
+        let f = b.finish();
+        let p = plan_of(&f, &[]);
+        lower(
+            &interns,
+            name,
+            &[],
+            &body_of(BodyKind::Function, f.sig.clone()),
+            &f,
+            &p,
+            straight(&f),
+        )
+    };
+
+    // Canonical quiet NaNs stay compact `NaN`.
+    assert_eq!(
+        emit_const("f32_canon", F32, u128::from(f32::NAN.to_bits()), 4),
+        "function f32_canon() {\n  return NaN;\n}\n"
+    );
+    assert_eq!(
+        emit_const("f64_canon", F64, u128::from(f64::NAN.to_bits()), 8),
+        "function f64_canon() {\n  return NaN;\n}\n"
+    );
+
+    // Non-canonical quiet NaN payloads and negative NaNs preserve their exact bits.
+    assert_eq!(
+        emit_const("f32_payload", F32, 0x7fc0_0001, 4),
+        "function f32_payload() {\n  return new Float32Array(Uint32Array.of(2143289345).buffer)[0];\n}\n"
+    );
+    assert_eq!(
+        emit_const("f32_neg", F32, 0xffc0_0000, 4),
+        "function f32_neg() {\n  return new Float32Array(Uint32Array.of(4290772992).buffer)[0];\n}\n"
+    );
+    assert_eq!(
+        emit_const("f64_payload", F64, 0x7ff8_0000_0000_0001, 8),
+        "function f64_payload() {\n  return new Float64Array(Uint32Array.of(1, 2146959360).buffer)[0];\n}\n"
+    );
+    assert_eq!(
+        emit_const("f64_neg", F64, 0xfff8_0000_0000_0000, 8),
+        "function f64_neg() {\n  return new Float64Array(Uint32Array.of(0, 4294443008).buffer)[0];\n}\n"
+    );
+
+    // Unsupported float widths decline cleanly rather than decoding as f64.
+    let e = FuncBuilder::ENTRY;
+    let mut b = FuncBuilder::new(item(1), signature(Vec::new(), F16));
+    let v = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 2 }),
+        F16,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(v)));
+    let f = b.finish();
+    let p = plan_of(&f, &[]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    let summary = summary(&[]);
+    let opts = Opts::default();
+    let name = JsName::new("f16_const".to_owned());
+    let input = LowerInput {
+        name: &name,
+        summary: &summary,
+        body: &body,
+        origins: None,
+        interns: &interns,
+        table: &interns.types,
+        opts: &opts,
+        items: super::host::EMPTY_ITEMS,
+        drop_glue: super::host::EMPTY_DROP_GLUE,
+        vtables: &super::unsize::EMPTY_VTABLES,
+        spills: &[],
+        abi: None,
+        physical: None,
+        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
+    };
+    let res = function::lower(&input, &f, &p, straight(&f));
+    assert!(res.is_err(), "expected f16 constant lowering to decline");
+}
+
 mod invoke;

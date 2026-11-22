@@ -1965,6 +1965,46 @@ pub fn num(value: impl Into<f64>) -> Expr {
     Expr::Num(value.into())
 }
 
+/// An `f32` constant from its raw IEEE 754 bits.
+///
+/// Finite values, infinities, signed zeroes, and the canonical quiet `NaN` (`0x7fc0_0000`) spell
+/// as ordinary JavaScript number literals. Any other `NaN` (non-zero payload, negative sign bit,
+/// or signaling `NaN`) is constructed through a typed-array bit-cast so its payload and sign bit
+/// survive into JavaScript without touching `BigInt` (MIRES-023).
+pub fn f32_from_bits(bits: u32) -> Expr {
+    const CANONICAL_QNAN: u32 = 0x7fc0_0000;
+    let value = f32::from_bits(bits);
+    if value.is_nan() && bits != CANONICAL_QNAN {
+        let source = method_call(id("Uint32Array"), "of", vec![num(f64::from(bits))]);
+        let view = new(id("Float32Array"), vec![member(source, "buffer")]);
+        return index(view, num(0));
+    }
+    num(f64::from(value))
+}
+
+/// An `f64` constant from its raw IEEE 754 bits.
+///
+/// Finite values, infinities, signed zeroes, and the canonical quiet `NaN`
+/// (`0x7ff8_0000_0000_0000`) spell as ordinary JavaScript number literals. Any other `NaN` is
+/// constructed through a little-endian `Uint32Array` → `Float64Array` bit-cast so its payload and
+/// sign bit survive without requiring `BigInt` or `BigUint64Array` (ES2018-safe, MIRES-023).
+pub fn f64_from_bits(bits: u64) -> Expr {
+    const CANONICAL_QNAN: u64 = 0x7ff8_0000_0000_0000;
+    let value = f64::from_bits(bits);
+    if value.is_nan() && bits != CANONICAL_QNAN {
+        let lo = (bits & 0xffff_ffff) as u32;
+        let hi = (bits >> 32) as u32;
+        let source = method_call(
+            id("Uint32Array"),
+            "of",
+            vec![num(f64::from(lo)), num(f64::from(hi))],
+        );
+        let view = new(id("Float64Array"), vec![member(source, "buffer")]);
+        return index(view, num(0));
+    }
+    num(value)
+}
+
 /// A number literal spelled exactly as given.
 pub fn raw_num(text: impl Into<String>) -> Expr {
     Expr::RawNum(text.into())
@@ -2594,6 +2634,49 @@ mod tests {
         assert_eq!(p(num(f64::NEG_INFINITY)), "-Infinity");
         assert_eq!(p(num(-0.0)), "-0");
         assert_eq!(p(raw_num("0x7fffffff")), "0x7fffffff");
+    }
+
+    #[test]
+    fn float_bits_preserve_non_canonical_nan_payloads_and_signs() {
+        // Canonical quiet NaNs stay compact `NaN`.
+        assert_eq!(p(f32_from_bits(f32::NAN.to_bits())), "NaN");
+        assert_eq!(p(f64_from_bits(f64::NAN.to_bits())), "NaN");
+
+        // Non-NaN edge values stay plain numeric literals.
+        assert_eq!(p(f32_from_bits((-0.0f32).to_bits())), "-0");
+        assert_eq!(p(f64_from_bits((-0.0f64).to_bits())), "-0");
+        assert_eq!(p(f32_from_bits(f32::INFINITY.to_bits())), "Infinity");
+        assert_eq!(p(f64_from_bits(f64::NEG_INFINITY.to_bits())), "-Infinity");
+
+        // Non-canonical f32 NaNs (payload or negative sign) bit-cast via Uint32Array.of -> Float32Array.
+        assert_eq!(
+            p(f32_from_bits(0x7fc0_0001)),
+            "new Float32Array(Uint32Array.of(2143289345).buffer)[0]"
+        );
+        assert_eq!(
+            p(f32_from_bits((-f32::NAN).to_bits())),
+            "new Float32Array(Uint32Array.of(4290772992).buffer)[0]"
+        );
+
+        // Non-canonical f64 NaNs use little-endian [lo, hi] u32 halves (ES2018-safe, no BigInt).
+        assert_eq!(
+            p(f64_from_bits(0x7ff8_0000_0000_0001)),
+            "new Float64Array(Uint32Array.of(1, 2146959360).buffer)[0]"
+        );
+        assert_eq!(
+            p(f64_from_bits((-f64::NAN).to_bits())),
+            "new Float64Array(Uint32Array.of(0, 4294443008).buffer)[0]"
+        );
+        let es2018 = expr_to_string_styled_for_target(
+            &f64_from_bits(0x7ff8_1234_5678_9abc),
+            Style::Compact,
+            EcmaTarget::Es2018,
+        );
+        assert_eq!(
+            es2018,
+            "new Float64Array(Uint32Array.of(1450744508,2146964020).buffer)[0]"
+        );
+        assert!(!es2018.contains("BigInt"));
     }
 
     #[test]
