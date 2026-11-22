@@ -540,17 +540,17 @@ globalThis.__rt.offset_from = (a, b) => {
   if (a === null || b === null) return 0;
   if (a.buf === b.buf && a.w === undefined && b.w === undefined) return a.off - b.off;
   const unwrap = (p) => {
-    if (p.w !== undefined) return { buf: p.buf, off: p.off, w: p.w };
+    const w = p.w !== undefined ? p.w : 1;
     if (p.buf !== null && typeof p.buf === "object") {
       const ev = globalThis.__rt._element_view_of.get(p.buf);
       if (ev !== undefined) {
         return {
           buf: ev.buf,
           off: p.sc !== undefined ? ev.off * p.sc + p.off : ev.off + p.off,
-          w: 1,
+          w,
         };
       }
-      if (globalThis.__rt._boxed.has(p.buf)) {
+      if (p.w === undefined && globalThis.__rt._boxed.has(p.buf)) {
         const held = p.buf[0];
         if (held !== null && typeof held === "object") {
           const bev = globalThis.__rt._element_view_of.get(held);
@@ -560,15 +560,15 @@ globalThis.__rt.offset_from = (a, b) => {
         }
       }
     }
-    return { buf: p.buf, off: p.off, w: 1 };
+    return { buf: p.buf, off: p.off, w };
   };
   let ua = unwrap(a);
   let ub = unwrap(b);
   if (ua.buf !== ub.buf) {
-    if (globalThis.__rt._boxed.has(a.buf) && a.buf[0] === ub.buf && Array.isArray(ub.buf)) {
-      ua = { buf: ub.buf, off: a.off * ub.buf.length, w: ub.buf.length };
-    } else if (globalThis.__rt._boxed.has(b.buf) && b.buf[0] === ua.buf && Array.isArray(ua.buf)) {
-      ub = { buf: ua.buf, off: b.off * ua.buf.length, w: ua.buf.length };
+    if (a.w === undefined && globalThis.__rt._boxed.has(a.buf) && a.buf[0] === ub.buf && Array.isArray(ub.buf)) {
+      ua = { buf: ub.buf, off: a.off * ub.buf.length, w: ub.w };
+    } else if (b.w === undefined && globalThis.__rt._boxed.has(b.buf) && b.buf[0] === ua.buf && Array.isArray(ua.buf)) {
+      ub = { buf: ua.buf, off: b.off * ua.buf.length, w: ua.w };
     }
   }
   if (ua.buf === ub.buf) {
@@ -579,10 +579,10 @@ globalThis.__rt.offset_from = (a, b) => {
     if (!globalThis.__rt._boxed.has(p.buf) || !Array.isArray(other.buf)) return -1;
     return other.buf.indexOf(p.buf[p.off]);
   };
-  const inb = home(a, b);
-  if (inb >= 0) return inb - b.off;
-  const ina = home(b, a);
-  if (ina >= 0) return a.off - ina;
+  const inb = home(ua, ub);
+  if (inb >= 0) return inb - ub.off;
+  const ina = home(ub, ua);
+  if (ina >= 0) return ua.off - ina;
   if (!globalThis.__rt._boxed.has(a.buf) && !globalThis.__rt._boxed.has(b.buf)) {
     return a.off - b.off;
   }

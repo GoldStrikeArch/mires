@@ -252,14 +252,26 @@ fn test_shared_identity_empty_and_zst() {
         );
     }
 
-    // AS-VERIFY-2: offset_from on *const [u32; 2] subslice pointers (boxed _element_view)
+    // AS-VERIFY-2 & AS-VERIFY-R2-1: offset_from on *const [u32; 2] subslice & window-slot pointers
+    #[inline(never)]
+    fn opaque_win_offset(a: *const [u32; 2], b: *const [u32; 2]) -> isize {
+        unsafe { a.offset_from(b) }
+    }
     {
         let [left @ .., _, _, _, _] = &arr;
+        let [_, mid2 @ .., _, _, _] = &arr;
         let [_, _, right @ .., _, _] = &arr;
-        unsafe {
-            print_i32((right as *const [u32; 2]).offset_from(left as *const [u32; 2]) as i32);
-            print_i32((left as *const [u32; 2]).offset_from(right as *const [u32; 2]) as i32);
-        }
+        let w_from_mid: *const [u32; 2] = (&mid[0] as *const u32) as *const [u32; 2];
+        let w_from_arr: *const [u32; 2] = (&arr[3] as *const u32) as *const [u32; 2];
+        let arr_as_w: *const [u32; 2] = (&arr as *const [u32; 6]) as *const [u32; 2];
+        print_i32(opaque_win_offset(right, left) as i32);
+        print_i32(opaque_win_offset(left, right) as i32);
+        print_i32(opaque_win_offset(w_from_arr, w_from_mid) as i32);
+        print_i32(opaque_win_offset(w_from_mid, w_from_arr) as i32);
+        print_i32(opaque_win_offset(mid2, w_from_mid) as i32);
+        print_i32(opaque_win_offset(w_from_mid, mid2) as i32);
+        print_i32(opaque_win_offset(arr_as_w, right) as i32);
+        print_i32(opaque_win_offset(right, arr_as_w) as i32);
     }
 
     // AS-VERIFY-3: .addr() and ptr_cmp on *const [T; N], *const [T; 0], *const () (stack & Box & u8)
