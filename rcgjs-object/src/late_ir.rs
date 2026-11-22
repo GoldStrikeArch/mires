@@ -1215,6 +1215,11 @@ pub enum ConstTree {
         offset: u64,
     },
     Address(u64),
+    Dyn {
+        data: Box<ConstTree>,
+        concrete: TypeId,
+        vtable: String,
+    },
 }
 
 impl ConstTree {
@@ -1224,6 +1229,17 @@ impl ConstTree {
                 fields.iter().try_for_each(|field| field.validate(context))
             }
             Self::Reference(value) => value.validate(context),
+            Self::Dyn {
+                data,
+                concrete,
+                vtable,
+            } => {
+                if vtable.is_empty() {
+                    return Err("late-IR dyn constant has an empty vtable name".to_owned());
+                }
+                data.validate(context)?;
+                context.ty(*concrete)
+            }
             Self::Global {
                 target: GlobalReference::Type(ty),
                 ..

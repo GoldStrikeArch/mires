@@ -238,6 +238,7 @@ pub fn const_tree(
             ..
         } => Ok(Value::Fn(*link_name)),
         ConstTree::Reference(_)
+        | ConstTree::Dyn { .. }
         | ConstTree::Slice(_)
         | ConstTree::Global { .. }
         | ConstTree::Address(_) => Err(Trap::Unsupported("constant memory reference")),

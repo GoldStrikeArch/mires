@@ -1467,6 +1467,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             ty::Ref(..) | ty::RawPtr(..) | ty::FnPtr(..) => {
                 self.const_pointer_field(allocation, offset, ty, depth)
             }
+            ty::Adt(def, _) if def.is_union() && layout.is_zst() => Ok(ConstTree::Unit),
             ty::FnDef(..) => Ok(ConstTree::Unit),
             _ => Err(format!(
                 "constants of type `{ty}` cannot be encoded from an allocation"
@@ -1484,8 +1485,16 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
     ) -> Result<ConstTree, String> {
         let tcx = self.cgu.tcx;
         let pointee = ty.builtin_deref(true);
-        let wide = pointee.is_some_and(crate::constant::raw::is_wide_pointee);
+        let wide =
+            pointee.is_some_and(|pointee| crate::constant::raw::is_wide_pointee(tcx, pointee));
         let pointer = crate::constant::raw::read_pointer(tcx, allocation, offset, wide);
+        if let Some(pointee) = pointee {
+            let peeled_pointee =
+                crate::value::peel_pattern(crate::value::peel_transparent(tcx, pointee));
+            if matches!(peeled_pointee.kind(), ty::Dynamic(..)) {
+                return self.const_dyn_pointer_field(&pointer, ty, depth);
+            }
+        }
         let Some(alloc_id) = pointer.alloc_id() else {
             if wide {
                 return Err(format!(
@@ -1516,6 +1525,59 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 offset: pointer.offset.bytes(),
             }),
         }
+    }
+
+    fn const_dyn_pointer_field(
+        &mut self,
+        pointer: &crate::constant::raw::Pointer,
+        ty: Ty<'tcx>,
+        depth: u32,
+    ) -> Result<ConstTree, String> {
+        let tcx = self.cgu.tcx;
+        let Some((concrete_ty, principal)) = crate::constant::raw::read_vtable(tcx, pointer) else {
+            return Err("pointer to a vtable constant is not encoded".to_owned());
+        };
+        let _ = crate::vtable::vtable_expr(self.cgu, concrete_ty, principal);
+        let vtable = self
+            .cgu
+            .namer
+            .vtable_name(concrete_ty, principal)
+            .into_string();
+        let concrete = self.type_id(concrete_ty)?;
+        let data = match pointer.alloc_id() {
+            None => {
+                if !pointer.readable {
+                    return Err(format!("a `{ty}` in a constant is uninitialized"));
+                }
+                ConstTree::Address(pointer.offset.bytes())
+            }
+            Some(alloc_id) => match tcx.global_alloc(alloc_id) {
+                GlobalAlloc::Memory(target) => {
+                    let target = target.inner();
+                    self.check_const_memory(target)?;
+                    ConstTree::Reference(Box::new(self.const_tree(
+                        target,
+                        pointer.offset,
+                        concrete_ty,
+                        depth,
+                    )?))
+                }
+                GlobalAlloc::Static(_) => ConstTree::Global {
+                    target: self.global_reference(alloc_id)?,
+                    offset: pointer.offset.bytes(),
+                },
+                _ => {
+                    return Err(format!(
+                        "a wide `{ty}` to a named global is not encoded in a constant"
+                    ));
+                }
+            },
+        };
+        Ok(ConstTree::Dyn {
+            data: Box::new(data),
+            concrete,
+            vtable,
+        })
     }
 
     fn global_reference(

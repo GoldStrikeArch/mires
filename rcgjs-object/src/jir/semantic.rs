@@ -531,6 +531,13 @@ pub enum ConstTree {
         offset: u64,
     },
     Address(u64),
+    /// A fat trait-object pointer (`&dyn Trait` / `*const dyn Trait`): its data pointer decoded at
+    /// `concrete` paired with the link name of the interned vtable item.
+    Dyn {
+        data: Box<ConstTree>,
+        concrete: TypeId,
+        vtable: StrId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

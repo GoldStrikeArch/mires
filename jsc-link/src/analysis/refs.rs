@@ -144,7 +144,7 @@ pub fn scan_tree(tree: &ConstTree, named: &mut BTreeSet<ItemId>) {
                 scan_tree(field, named);
             }
         }
-        ConstTree::Reference(inner) => scan_tree(inner, named),
+        ConstTree::Reference(inner) | ConstTree::Dyn { data: inner, .. } => scan_tree(inner, named),
         _ => {}
     }
 }

@@ -8031,6 +8031,151 @@ fn slice_view_unwindows_raw_array_pointer_for_slice_and_str() {
     );
 }
 
+#[test]
+fn dyn_const_lowers_promoted_fndef_direct_static_and_address() {
+    use crate::jir::semantic::GlobalReference;
+
+    let mut interns = world();
+    let dyn_ty = TypeId(110);
+    let ref_dyn = TypeId(111);
+    let fn_def_ty = TypeId(112);
+    let pair_ty = TypeId(113);
+
+    interns.intern_type(descriptor(
+        dyn_ty,
+        TypeKind::Dynamic {
+            principal: Some(def(200)),
+            auto: Vec::new(),
+        },
+        0,
+    ));
+    let mut ref_dyn_desc = descriptor(
+        ref_dyn,
+        TypeKind::Reference {
+            pointee: dyn_ty,
+            mutable: false,
+        },
+        8,
+    );
+    ref_dyn_desc.js.pointer_form = Some(PointerForm::FatDyn);
+    interns.intern_type(ref_dyn_desc);
+
+    let fn_sig = interns.intern_sig(rcgjs_object::jir::types::SigDescriptor {
+        inputs: vec![U32],
+        output: U32,
+        abi: rcgjs_object::jir::types::SigAbi::Rust,
+        spread_arity: None,
+        track_caller: false,
+        unwind: false,
+    });
+    let mut fn_desc = descriptor(
+        fn_def_ty,
+        TypeKind::FnDef {
+            def: def(201),
+            sig: fn_sig,
+            instance: None,
+        },
+        0,
+    );
+    fn_desc.layout.zst = true;
+    fn_desc.js.is_indirect = true;
+    interns.intern_type(fn_desc);
+
+    let f0 = interns.intern_str("x");
+    let struct_name = interns.intern_str("S");
+    let mut pair_desc = descriptor(
+        pair_ty,
+        TypeKind::Adt {
+            def: def(202),
+            args: Vec::new(),
+            form: NominalForm::Struct,
+            variants: vec![variant(
+                struct_name,
+                vec![field(FieldKey::Name(f0), U32)],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        4,
+    );
+    pair_desc.js.is_indirect = true;
+    interns.intern_type(pair_desc);
+
+    let vt_fn = interns.intern_str("vt_fn");
+    let vt_u32 = interns.intern_str("vt_u32");
+    let vt_pair = interns.intern_str("vt_pair");
+    let stat_u32 = interns.intern_str("S_U32");
+    let stat_pair = interns.intern_str("S_PAIR");
+
+    let check = |tree: ConstTree, expected: &str| {
+        let mut b = FuncBuilder::new(item(1), signature(vec![], ref_dyn));
+        let e = FuncBuilder::ENTRY;
+        let v = b.op(e, OpKind::Const(tree), ref_dyn, NO_ORIGIN);
+        b.terminate(e, RTerm::Return(Some(v)));
+        let func = b.finish();
+        let plan = plan_of(&func, &[]);
+        let body = body_of(BodyKind::Function, func.sig.clone());
+        let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+        assert_eq!(js, format!("function f() {{\n  return {expected};\n}}\n"));
+    };
+
+    check(
+        ConstTree::Dyn {
+            data: Box::new(ConstTree::Reference(Box::new(ConstTree::Unit))),
+            concrete: fn_def_ty,
+            vtable: vt_fn,
+        },
+        "{ ptr: undefined, meta: vt_fn }",
+    );
+    check(
+        ConstTree::Dyn {
+            data: Box::new(ConstTree::Reference(Box::new(ConstTree::Scalar {
+                bits: 4,
+                bytes: 4,
+            }))),
+            concrete: U32,
+            vtable: vt_u32,
+        },
+        "{ ptr: { buf: [4], off: 0 }, meta: vt_u32 }",
+    );
+    check(
+        ConstTree::Dyn {
+            data: Box::new(ConstTree::Global {
+                target: GlobalReference::Static {
+                    definition: def(203),
+                    link_name: stat_u32,
+                },
+                offset: 0,
+            }),
+            concrete: U32,
+            vtable: vt_u32,
+        },
+        "{ ptr: { buf: S_U32, off: 0 }, meta: vt_u32 }",
+    );
+    check(
+        ConstTree::Dyn {
+            data: Box::new(ConstTree::Global {
+                target: GlobalReference::Static {
+                    definition: def(204),
+                    link_name: stat_pair,
+                },
+                offset: 0,
+            }),
+            concrete: pair_ty,
+            vtable: vt_pair,
+        },
+        "{ ptr: S_PAIR, meta: vt_pair }",
+    );
+    check(
+        ConstTree::Dyn {
+            data: Box::new(ConstTree::Address(1)),
+            concrete: fn_def_ty,
+            vtable: vt_fn,
+        },
+        "{ ptr: 1, meta: vt_fn }",
+    );
+}
 
 #[test]
 fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {

@@ -315,6 +315,9 @@ fn read_alloc<'tcx>(
         ty::Ref(..) | ty::RawPtr(..) | ty::FnPtr(..) => {
             read_pointer(cgu, log, alloc, offset, ty, span)
         }
+        // A zero-sized union (`MaybeUninit<()>`, `MaybeUninit<fn_item>`): no non-ZST field exists
+        // for `transparent_field_indexed` to peel, and zero-sized values are `undefined`.
+        ty::Adt(def, _) if def.is_union() && layout.is_zst() => jsast::undefined(),
         // A zero-sized function item field inside a struct, tuple, or enum constant.
         ty::FnDef(..) => jsast::undefined(),
         _ => zombie(
@@ -409,8 +412,16 @@ fn read_pointer<'tcx>(
     span: Span,
 ) -> Expr {
     let tcx = cgu.tcx;
-    let wide = ty.builtin_deref(true).is_some_and(raw::is_wide_pointee);
+    let pointee = ty.builtin_deref(true);
+    let wide = pointee.is_some_and(|pointee| raw::is_wide_pointee(tcx, pointee));
     let pointer = raw::read_pointer(tcx, alloc, offset, wide);
+
+    if let Some(pointee) = pointee {
+        let peeled_pointee = value::peel_pattern(value::peel_transparent(tcx, pointee));
+        if matches!(peeled_pointee.kind(), ty::Dynamic(..)) {
+            return read_dyn_pointer(cgu, log, &pointer, ty, span);
+        }
+    }
 
     let Some(alloc_id) = pointer.alloc_id() else {
         // No provenance: the bytes are an address and nothing else, which is exactly the address
@@ -442,6 +453,86 @@ fn read_pointer<'tcx>(
     };
 
     pointer_expr(cgu, log, alloc_id, pointer.offset, ty, pointer.meta, span)
+}
+
+/// Reads a fat trait-object pointer (`&dyn Trait` / `*const dyn Trait`) out of an allocation.
+///
+/// The metadata slot names a `GlobalAlloc::VTable` for the concrete pointee type, which interns
+/// the vtable item. The data half is decoded at that concrete type in its **reference** form (even
+/// when `ty` is a raw pointer), matching `unsize::fatten`.
+fn read_dyn_pointer<'tcx>(
+    cgu: &CguCx<'tcx>,
+    log: &ZombieLog,
+    pointer: &raw::Pointer,
+    ty: Ty<'tcx>,
+    span: Span,
+) -> Expr {
+    let tcx = cgu.tcx;
+    let Some((concrete_ty, principal)) = raw::read_vtable(tcx, pointer) else {
+        return zombie(
+            cgu,
+            log,
+            span,
+            format!("a `{ty}` constant has no vtable metadata"),
+        );
+    };
+    let meta = crate::vtable::vtable_expr(cgu, concrete_ty, principal);
+    let data = match pointer.alloc_id() {
+        None => {
+            if !pointer.readable {
+                return zombie(
+                    cgu,
+                    log,
+                    span,
+                    format!(
+                        "a `{ty}` in a constant is uninitialized, which rustc_codegen_js cannot \
+                         read"
+                    ),
+                );
+            }
+            jsast::num(pointer.offset.bytes() as f64)
+        }
+        Some(alloc_id) => match tcx.global_alloc(alloc_id) {
+            GlobalAlloc::Memory(target) => {
+                let value = read_alloc(cgu, log, target.inner(), pointer.offset, concrete_ty, span);
+                if is_indirect(tcx, concrete_ty) {
+                    value
+                } else {
+                    crate::ptr::slot(jsast::array(vec![value]), jsast::num(0))
+                }
+            }
+            GlobalAlloc::Static(def_id) => {
+                if pointer.offset != Size::ZERO {
+                    return zombie(
+                        cgu,
+                        log,
+                        span,
+                        format!(
+                            "a pointer into the middle of a `static` is not supported by \
+                             rustc_codegen_js (type `{ty}`)"
+                        ),
+                    );
+                }
+                let binding = jsast::id(cgu.namer.static_name(def_id).into_string());
+                if is_indirect(tcx, concrete_ty) {
+                    binding
+                } else {
+                    crate::ptr::slot(binding, jsast::num(0))
+                }
+            }
+            _ => {
+                return zombie(
+                    cgu,
+                    log,
+                    span,
+                    format!(
+                        "pointer constants are not supported by rustc_codegen_js (type `{ty}`)"
+                    ),
+                );
+            }
+        },
+    };
+    crate::ptr::fat_dyn(data, meta)
 }
 
 /// The JavaScript value standing in for a pointer of type `ty` into allocation `alloc_id`.

@@ -154,6 +154,10 @@ impl Dependencies {
                 | ConstTree::Variant { fields, .. }
                 | ConstTree::Slice(fields) => work.extend(fields),
                 ConstTree::Reference(value) => work.push(value),
+                ConstTree::Dyn { data, vtable, .. } => {
+                    self.names.insert(*vtable);
+                    work.push(data);
+                }
                 ConstTree::Unit
                 | ConstTree::Scalar { .. }
                 | ConstTree::Str(_)
@@ -405,6 +409,23 @@ mod tests {
         assert_eq!(
             body.link_dependencies(),
             names(&[6, 7, 8, 9, 12, 20, 21, 22, 23, 24, 25])
+        );
+    }
+
+    #[test]
+    fn dyn_const_records_vtable_and_nested_data_dependencies() {
+        let init = ConstTree::Dyn {
+            data: Box::new(global(41)),
+            concrete: TypeId(1),
+            vtable: StrId(42),
+        };
+        assert_eq!(
+            body(BodyKind::Static {
+                init,
+                mutable: false,
+            })
+            .link_dependencies(),
+            names(&[41, 42])
         );
     }
 }

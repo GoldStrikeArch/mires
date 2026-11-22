@@ -1270,6 +1270,15 @@ impl<'a> Normalizer<'a> {
                 fields: fields.iter().map(|field| self.const_tree(field)).collect(),
             },
             ConstTree::Reference(inner) => ConstTree::Reference(Box::new(self.const_tree(inner))),
+            ConstTree::Dyn {
+                data,
+                concrete,
+                vtable,
+            } => ConstTree::Dyn {
+                data: Box::new(self.const_tree(data)),
+                concrete: *concrete,
+                vtable: self.string(*vtable),
+            },
             ConstTree::Slice(elements) => ConstTree::Slice(
                 elements
                     .iter()

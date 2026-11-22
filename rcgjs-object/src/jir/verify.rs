@@ -401,6 +401,15 @@ fn verify_const_tree(tree: &ConstTree, context: &Context<'_>) -> Result<(), Veri
             .iter()
             .try_for_each(|field| verify_const_tree(field, context)),
         ConstTree::Reference(value) => verify_const_tree(value, context),
+        ConstTree::Dyn {
+            data,
+            concrete,
+            vtable,
+        } => {
+            verify_const_tree(data, context)?;
+            context.ty(*concrete)?;
+            context.str(*vtable)
+        }
         ConstTree::Global { target, .. } => verify_global(target, context),
         ConstTree::Str(text) => context.str(*text),
         ConstTree::Unit | ConstTree::Scalar { .. } | ConstTree::Address(_) => Ok(()),

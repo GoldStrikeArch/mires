@@ -178,6 +178,15 @@ impl Remap<'_> {
                 }
             }
             ConstTree::Reference(inner) => self.constant(inner)?,
+            ConstTree::Dyn {
+                data,
+                concrete,
+                vtable,
+            } => {
+                self.constant(data)?;
+                self.need(*concrete);
+                *vtable = self.string(*vtable)?;
+            }
             ConstTree::Global { target, .. } => self.global(target)?,
             ConstTree::Unit | ConstTree::Scalar { .. } | ConstTree::Address(_) => {}
         }

@@ -721,7 +721,7 @@ fn const_has_fn_ptr(tree: &ConstTree) -> bool {
         ConstTree::Aggregate(fields)
         | ConstTree::Slice(fields)
         | ConstTree::Variant { fields, .. } => fields.iter().any(const_has_fn_ptr),
-        ConstTree::Reference(inner) => const_has_fn_ptr(inner),
+        ConstTree::Reference(inner) | ConstTree::Dyn { data: inner, .. } => const_has_fn_ptr(inner),
         _ => false,
     }
 }
@@ -735,7 +735,9 @@ fn const_has_static_global(tree: &ConstTree) -> bool {
         ConstTree::Aggregate(fields)
         | ConstTree::Slice(fields)
         | ConstTree::Variant { fields, .. } => fields.iter().any(const_has_static_global),
-        ConstTree::Reference(inner) => const_has_static_global(inner),
+        ConstTree::Reference(inner) | ConstTree::Dyn { data: inner, .. } => {
+            const_has_static_global(inner)
+        }
         _ => false,
     }
 }

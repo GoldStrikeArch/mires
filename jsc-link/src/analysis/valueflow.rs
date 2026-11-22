@@ -3008,7 +3008,9 @@ fn collect_static_refs(tree: &ConstTree, out: &mut Vec<DefinitionId>) {
                 collect_static_refs(field, out);
             }
         }
-        ConstTree::Reference(inner) => collect_static_refs(inner, out),
+        ConstTree::Reference(inner) | ConstTree::Dyn { data: inner, .. } => {
+            collect_static_refs(inner, out)
+        }
         _ => {}
     }
 }

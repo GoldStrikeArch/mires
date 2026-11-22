@@ -1141,6 +1141,10 @@ fn const_item_refs(tree: &ConstTree, interns: &Interns, target: &str) -> usize {
             .map(|field| const_item_refs(field, interns, target))
             .sum(),
         ConstTree::Reference(inner) => const_item_refs(inner, interns, target),
+        ConstTree::Dyn { data, vtable, .. } => {
+            const_item_refs(data, interns, target)
+                + usize::from(interns.str(*vtable) == Some(target))
+        }
         ConstTree::Global {
             target:
                 GlobalReference::Function { link_name, .. } | GlobalReference::Static { link_name, .. },

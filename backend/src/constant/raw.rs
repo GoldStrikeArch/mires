@@ -229,8 +229,11 @@ fn may_be_null(tcx: TyCtxt<'_>, alloc_id: AllocId, offset: Size) -> bool {
 }
 
 /// Whether a pointer to this type carries metadata, and so occupies two pointer sized slots.
-pub(crate) fn is_wide_pointee(pointee: Ty<'_>) -> bool {
-    matches!(pointee.kind(), ty::Str | ty::Slice(_))
+pub(crate) fn is_wide_pointee<'tcx>(tcx: TyCtxt<'tcx>, pointee: Ty<'tcx>) -> bool {
+    matches!(
+        crate::value::peel_pattern(crate::value::peel_transparent(tcx, pointee)).kind(),
+        ty::Str | ty::Slice(_) | ty::Dynamic(..)
+    )
 }
 
 /// A pointer read out of an allocation: which allocation it names, where into it, and how long the
@@ -244,8 +247,10 @@ pub(crate) struct Pointer {
     pub(crate) provenance: Option<CtfeProvenance>,
     /// The offset into the pointed-at allocation, or the bare address when there is no provenance.
     pub(crate) offset: Size,
-    /// The length of the pointee, for a wide pointer.
+    /// The length of the pointee (or offset into a vtable), for a wide pointer.
     pub(crate) meta: Option<u64>,
+    /// The provenance of the metadata slot, for a wide pointer whose metadata is a vtable pointer.
+    pub(crate) meta_provenance: Option<CtfeProvenance>,
     /// Whether the pointer's own bytes could be read at all.
     pub(crate) readable: bool,
 }
@@ -255,9 +260,14 @@ impl Pointer {
     pub(crate) fn alloc_id(&self) -> Option<AllocId> {
         self.provenance.map(|provenance| provenance.alloc_id())
     }
+
+    /// The allocation the metadata slot names, if it names one (a vtable for `dyn Trait`).
+    pub(crate) fn meta_alloc_id(&self) -> Option<AllocId> {
+        self.meta_provenance.map(|provenance| provenance.alloc_id())
+    }
 }
 
-/// Reads the pointer stored at `offset`, taking its length from the next slot when `wide`.
+/// Reads the pointer stored at `offset`, taking its metadata from the next slot when `wide`.
 pub(crate) fn read_pointer(
     tcx: TyCtxt<'_>,
     alloc: &Allocation,
@@ -266,10 +276,17 @@ pub(crate) fn read_pointer(
 ) -> Pointer {
     let pointer_size = tcx.data_layout.pointer_size();
     let bits = read_scalar(tcx, alloc, offset, pointer_size);
-    let meta = match wide {
-        true => read_scalar(tcx, alloc, offset + pointer_size, pointer_size)
-            .map(|int| int.to_uint(pointer_size) as u64),
-        false => None,
+    let (meta, meta_provenance) = match wide {
+        true => (
+            read_scalar(tcx, alloc, offset + pointer_size, pointer_size)
+                .map(|int| int.to_uint(pointer_size) as u64),
+            alloc
+                .provenance()
+                .ptrs()
+                .get(&(offset + pointer_size))
+                .copied(),
+        ),
+        false => (None, None),
     };
     Pointer {
         provenance: alloc.provenance().ptrs().get(&offset).copied(),
@@ -277,8 +294,29 @@ pub(crate) fn read_pointer(
             Size::from_bytes(int.to_uint(pointer_size) as u64)
         }),
         meta,
+        meta_provenance,
         readable: bits.is_some(),
     }
+}
+
+/// The concrete type and principal trait named by a wide trait-object pointer's vtable metadata.
+///
+/// `None` unless the metadata slot points at offset zero of a `GlobalAlloc::VTable`.
+pub(crate) fn read_vtable<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    pointer: &Pointer,
+) -> Option<(Ty<'tcx>, Option<ty::ExistentialTraitRef<'tcx>>)> {
+    if pointer.meta != Some(0) {
+        return None;
+    }
+    let vtable_id = pointer.meta_alloc_id()?;
+    let GlobalAlloc::VTable(concrete_ty, dyn_existential) = tcx.global_alloc(vtable_id) else {
+        return None;
+    };
+    let principal = dyn_existential
+        .principal()
+        .map(|principal| tcx.instantiate_bound_regions_with_erased(principal));
+    Some((concrete_ty, principal))
 }
 
 /// Why the bytes of a `&str` could not be turned into one.

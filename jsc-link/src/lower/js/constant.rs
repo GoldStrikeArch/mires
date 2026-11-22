@@ -162,6 +162,11 @@ impl<'a> JsCx<'a> {
                 };
                 self.reference_expr(inner, ty, pointee, depth)
             }
+            ConstTree::Dyn {
+                data,
+                concrete,
+                vtable,
+            } => self.dyn_const_expr(data, *concrete, *vtable, depth),
             ConstTree::Slice(elements) => {
                 let Some(pointee) = value::pointee_of(table, ty) else {
                     return Err(decline(
@@ -512,6 +517,64 @@ impl<'a> JsCx<'a> {
             return jsast::rt_call("box", vec![value]);
         }
         value
+    }
+
+    /// A fat trait-object pointer (`&dyn Trait` / `*const dyn Trait`) decoded from constant memory
+    /// (`constant.rs::read_dyn_pointer`).
+    ///
+    /// The data half is always lowered in its reference form (even when the outer pointer type is
+    /// raw), matching `unsize.rs::fatten`: vtable entries receive `&self`, and a virtual call has
+    /// no concrete pointee type left to adapt a raw slot.
+    fn dyn_const_expr(
+        &self,
+        data: &ConstTree,
+        concrete: TypeId,
+        vtable: rcgjs_object::jir::StrId,
+        depth: u32,
+    ) -> Res<Expr> {
+        let ptr_expr = match data {
+            ConstTree::Reference(inner) => {
+                let value = self.const_expr_at(inner, concrete, depth + 1)?;
+                if self.table.is_indirect(concrete) {
+                    value
+                } else {
+                    ptr::slot(jsast::array(vec![value]), jsast::num(0))
+                }
+            }
+            ConstTree::Global {
+                target: GlobalReference::Static { link_name, .. },
+                offset,
+            } => {
+                if *offset != 0 {
+                    return Err(decline(
+                        OpClass::Constant,
+                        "a pointer into the middle of a `static` is not supported by \
+                         rustc_codegen_js",
+                    ));
+                }
+                let binding = jsast::id(self.interns.str(*link_name).unwrap_or("").to_owned());
+                if self.table.is_indirect(concrete) {
+                    binding
+                } else {
+                    ptr::slot(binding, jsast::num(0))
+                }
+            }
+            ConstTree::Address(address) => jsast::num(*address as f64),
+            _ => {
+                return Err(decline(
+                    OpClass::Constant,
+                    "unsupported data pointer inside a `dyn` constant",
+                ));
+            }
+        };
+        let meta_name = self.interns.str(vtable).unwrap_or("").to_owned();
+        if meta_name.is_empty() {
+            return Err(decline(
+                OpClass::Constant,
+                "a `dyn` constant has an empty vtable name",
+            ));
+        }
+        Ok(ptr::fat_dyn(ptr_expr, jsast::id(meta_name)))
     }
 
     /// `{ buf: [..], off: 0, len }` over the decoded elements (`constant.rs::slice_expr`).

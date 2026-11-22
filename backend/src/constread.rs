@@ -270,7 +270,7 @@ fn read_reference<'tcx>(
     let pointee = ty
         .builtin_deref(true)
         .ok_or_else(|| format!("`{ty}` is a reference with no pointee"))?;
-    let pointer = raw::read_pointer(tcx, alloc, offset, raw::is_wide_pointee(pointee));
+    let pointer = raw::read_pointer(tcx, alloc, offset, raw::is_wide_pointee(tcx, pointee));
     let alloc_id = pointer
         .alloc_id()
         .ok_or_else(|| format!("a `{ty}` has no provenance, so it points at nothing"))?;
