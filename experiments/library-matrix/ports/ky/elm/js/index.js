@@ -9,13 +9,8 @@
 // `timer` answers when it fires, `onAbort` when its signal aborts, and `{ clear }` cancels a
 // timer. The program ends a call with `{ done }` or, on a host answer it cannot read, `{ failed }`.
 //
-// Module state, as in the other Elm hosts: `worker` is the one Platform.worker instance, whose
-// model is reset by every `start`, and `current` is the call in progress; an answer from an
-// earlier call is dropped.
+// Each call has its own Elm program instance and handle table; the module keeps no state.
 import Elm from 'elm-program'
-
-let worker
-let current
 
 /** A thrown value, as Ky reads one. */
 const describe = (error) => ({
@@ -100,40 +95,46 @@ const operations = {
     return Date.now()
   },
   timer({ milliseconds }, store, id) {
-    return new Promise((resolve) => store.timers.set(id, setTimeout(() => resolve(null), milliseconds)))
+    return new Promise((resolve) => store.timers.set(id, setTimeout(() => {
+      store.timers.delete(id)
+      resolve(null)
+    }, milliseconds)))
   },
 }
 
 export function run(input) {
-  if (!worker) {
-    worker = Elm.Main.init()
-    worker.ports.command.subscribe((message) => current?.receive(message))
-  }
   return new Promise((resolve, reject) => {
+    const worker = Elm.Main.init()
     const handles = []
     const store = { put: (value) => handles.push(value) - 1, get: (handle) => handles[handle], timers: new Map() }
-    const call = {
-      receive(message) {
-        if ('done' in message) {
-          current = undefined
-          resolve(message.done)
-        } else if ('failed' in message) {
-          current = undefined
-          reject(new Error(message.failed))
-        } else if ('clear' in message) {
-          clearTimeout(store.timers.get(message.clear))
-        } else {
-          const { id, op, ...argumentsOf } = message
-          const answer = (outcome) => {
-            if (current === call) worker.ports.reply.send({ id, ...outcome })
-          }
-          Promise.resolve()
-            .then(() => operations[op](argumentsOf, store, id))
-            .then((ok) => answer({ ok }), (error) => answer({ error: describe(error) }))
-        }
-      },
+    let active = true
+    const cleanup = () => {
+      active = false
+      worker.ports.command.unsubscribe(receive)
+      for (const timer of store.timers.values()) clearTimeout(timer)
+      store.timers.clear()
     }
-    current = call
+    function receive(message) {
+      if ('done' in message) {
+        cleanup()
+        resolve(message.done)
+      } else if ('failed' in message) {
+        cleanup()
+        reject(new Error(message.failed))
+      } else if ('clear' in message) {
+        clearTimeout(store.timers.get(message.clear))
+        store.timers.delete(message.clear)
+      } else {
+        const { id, op, ...argumentsOf } = message
+        const answer = (outcome) => {
+          if (active) worker.ports.reply.send({ id, ...outcome })
+        }
+        Promise.resolve()
+          .then(() => operations[op](argumentsOf, store, id))
+          .then((ok) => answer({ ok }), (error) => answer({ error: describe(error) }))
+      }
+    }
+    worker.ports.command.subscribe(receive)
     worker.ports.start.send(input)
   })
 }

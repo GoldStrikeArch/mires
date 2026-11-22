@@ -20,6 +20,23 @@ for (const i of bench.cases.keys()) {
 const expected=new URL('expected.json',import.meta.url)
 const outputs={}
 for(const c of cases) outputs[c.id]=await run(c.input)
+const overlapIds = ['get-json', 'text']
+const overlapCases = overlapIds.map(id => {
+  const entry = cases.find(c => c.id === id)
+  assert.ok(entry, `missing overlap corpus case ${id}`)
+  return entry
+})
+const overlapTimeout = Symbol('overlap-timeout')
+let overlapTimer
+const overlapOutputs = await Promise.race([
+  Promise.all(overlapCases.map(c => run(structuredClone(c.input)))),
+  new Promise(resolve => { overlapTimer = setTimeout(() => resolve(overlapTimeout), 2000) }),
+])
+clearTimeout(overlapTimer)
+assert.notEqual(overlapOutputs, overlapTimeout, `${language}: concurrent run(${overlapIds.join(', ')}) hung past timeout`)
+for (const [i, c] of overlapCases.entries()) {
+  assert.deepEqual(overlapOutputs[i], outputs[c.id], `${language}: concurrent overlap mismatch on ${c.id}`)
+}
 if(flag==='--capture') writeFileSync(expected,JSON.stringify(outputs,null,2)+'\n')
 else assert.deepEqual(outputs,JSON.parse(readFileSync(expected)))
-console.log(`${language}: ${cases.length} captured call groups matched`)
+console.log(`${language}: ${cases.length} captured call groups matched (plus concurrent overlap)`)

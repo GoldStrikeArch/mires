@@ -16695,6 +16695,37 @@
       ]
     ]
   ],
+  "url-surrogate-followed-by-ascii": [
+    [
+      [
+        [
+          "init"
+        ],
+        [
+          "beforeRequest",
+          0
+        ],
+        [
+          "fetch",
+          "GET",
+          "https://matrix.invalid/%EF%BF%BDx",
+          "text/*",
+          null,
+          "initial",
+          ""
+        ],
+        [
+          "afterResponse",
+          0,
+          200
+        ]
+      ],
+      [
+        "ok",
+        "雪"
+      ]
+    ]
+  ],
   "bench-requests": [
     [
       [

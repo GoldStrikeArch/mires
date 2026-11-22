@@ -25,14 +25,6 @@ func cancel(controller AbortController) {
 	controller.AbortWith(reason)
 }
 
-// nullable is the header value, or null when absent.
-func nullable(value string, ok bool) interface{} {
-	if !ok {
-		return nil
-	}
-	return value
-}
-
 func requestCase(c *js.Object) *js.Object {
 	trace := jsArray.New()
 	record := func(entry ...interface{}) { trace.Call("push", newArray(entry...)) }
@@ -50,11 +42,8 @@ func requestCase(c *js.Object) *js.Object {
 			return Response{}, err
 		}
 		headers := request.Headers()
-		accept, hasAccept := headers.Get("accept")
-		contentType, hasContentType := headers.Get("content-type")
-		matrix, hasMatrix := headers.Get("x-matrix")
-		record("fetch", request.Method(), request.URL(), nullable(accept, hasAccept),
-			nullable(contentType, hasContentType), nullable(matrix, hasMatrix), body)
+		record("fetch", request.Method(), request.URL(), headers.GetRaw("accept"),
+			headers.GetRaw("content-type"), headers.GetRaw("x-matrix"), body)
 		if abort == "fetch" {
 			cancel(controller)
 		}
@@ -99,14 +88,9 @@ func requestCase(c *js.Object) *js.Object {
 			record("beforeError", retryCount, errorName(err))
 		}},
 	}
-	var method *string
-	if value := c.Get("method"); !isUndefined(value) {
-		text := value.String()
-		method = &text
-	}
 	signal := controller.Signal()
 	options := Options{
-		Method:  method,
+		Method:  c.Get("method"),
 		Headers: c.Get("headers"),
 		JSON:    c.Get("json"),
 		Retry: RetryOptions{
@@ -129,7 +113,7 @@ func requestCase(c *js.Object) *js.Object {
 		shortcut = JSONShortcut
 	}
 	var outcome *js.Object
-	switch result, err := send(c.Get("url").String(), options, shortcut); err := err.(type) {
+	switch result, err := send(c.Get("url"), options, shortcut); err := err.(type) {
 	case nil:
 		outcome = newArray("ok", result)
 	case *HTTPError:

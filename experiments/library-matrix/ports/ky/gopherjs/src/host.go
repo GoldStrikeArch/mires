@@ -12,6 +12,9 @@ var (
 	jsArray        = js.Global.Get("Array")
 	jsObject       = js.Global.Get("Object")
 	jsNumber       = js.Global.Get("Number")
+	jsMap          = js.Global.Get("Map")
+	jsSet          = js.Global.Get("Set")
+	jsReflect      = js.Global.Get("Reflect")
 	objectToString = jsObject.Get("prototype").Get("toString")
 )
 
@@ -43,9 +46,14 @@ func elements(array *js.Object) []*js.Object {
 	return items
 }
 
-// jsLowerCase is String.prototype.toLowerCase, whose Unicode mappings Go's strings.ToLower does
-// not all share (U+0130 becomes two code units in JS, one in Go).
-func jsLowerCase(text string) string { return js.Global.Call("String", text).Call("toLowerCase").String() }
+// jsSetOf builds a JS Set containing the given strings.
+func jsSetOf(values ...string) *js.Object {
+	set := jsSet.New()
+	for _, value := range values {
+		set.Call("add", value)
+	}
+	return set
+}
 
 // toNumber is Number(text).
 func toNumber(text string) float64 { return jsNumber.Invoke(text).Float() }
@@ -143,8 +151,13 @@ func newHeaders() Headers { return Headers{js.Global.Get("Headers").New()} }
 
 // Set validates the name and the value (a TypeError) and stores the value's ByteString
 // conversion, so any JSON value is accepted as JS accepts it.
-func (h Headers) Set(name string, value interface{}) error {
+func (h Headers) Set(name, value interface{}) error {
 	return catch(func() { h.object.Call("set", name, value) })
+}
+
+// GetRaw returns the header value as its raw JS string (*js.Object), or nil (JS null) when absent.
+func (h Headers) GetRaw(name string) *js.Object {
+	return h.object.Call("get", name)
 }
 
 func (h Headers) Get(name string) (string, bool) {
@@ -158,12 +171,14 @@ func (h Headers) Get(name string) (string, bool) {
 type Request struct{ object *js.Object }
 
 // newRequest is new Request(input, {method, headers, body, signal}), or the TypeError it throws.
-func newRequest(input, method string, headers Headers, body *string, signal AbortSignal) (Request, error) {
+// input, method and body stay raw *js.Object JS strings so GopherJS's UTF-16->UTF-8 .String()
+// never mangles lone surrogates before Fetch's WebIDL USVString/ByteString handling.
+func newRequest(input, method *js.Object, headers Headers, body *js.Object, signal AbortSignal) (Request, error) {
 	init := jsObject.New()
 	init.Set("method", method)
 	init.Set("headers", headers.object)
 	if body != nil {
-		init.Set("body", *body)
+		init.Set("body", body)
 	}
 	init.Set("signal", signal.object)
 	var request Request
@@ -186,17 +201,13 @@ func (r Request) Clone() (Request, error) {
 	return clone, err
 }
 
-func (r Request) Method() string       { return r.object.Get("method").String() }
-func (r Request) URL() string          { return r.object.Get("url").String() }
-func (r Request) Headers() Headers     { return Headers{r.object.Get("headers")} }
-func (r Request) Signal() AbortSignal  { return AbortSignal{r.object.Get("signal")} }
+func (r Request) Method() *js.Object  { return r.object.Get("method") }
+func (r Request) URL() *js.Object     { return r.object.Get("url") }
+func (r Request) Headers() Headers    { return Headers{r.object.Get("headers")} }
+func (r Request) Signal() AbortSignal { return AbortSignal{r.object.Get("signal")} }
 
-func (r Request) Text() (string, error) {
-	text, err := await(r.object.Call("text"))
-	if err != nil {
-		return "", err
-	}
-	return text.String(), nil
+func (r Request) Text() (*js.Object, error) {
+	return await(r.object.Call("text"))
 }
 
 type Response struct{ object *js.Object }
@@ -216,12 +227,8 @@ func (r Response) OK() bool          { return r.object.Get("ok").Bool() }
 func (r Response) Headers() Headers  { return Headers{r.object.Get("headers")} }
 func (r Response) HasBody() bool     { return r.object.Get("body") != nil }
 
-func (r Response) Text() (string, error) {
-	text, err := await(r.object.Call("text"))
-	if err != nil {
-		return "", err
-	}
-	return text.String(), nil
+func (r Response) Text() (*js.Object, error) {
+	return await(r.object.Call("text"))
 }
 
 // Bytes is the whole body, as an ArrayBuffer and its length.
@@ -244,4 +251,4 @@ func newTextDecoder(label string) (TextDecoder, error) {
 	return decoder, err
 }
 
-func (d TextDecoder) Decode(bytes *js.Object) string { return d.object.Call("decode", bytes).String() }
+func (d TextDecoder) Decode(bytes *js.Object) *js.Object { return d.object.Call("decode", bytes) }

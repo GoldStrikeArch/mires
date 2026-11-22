@@ -28,12 +28,12 @@ type NetworkError struct {
 
 type TimeoutError struct{ Request Request }
 
-func (e *HTTPError) Error() string    { return "Request failed with status code " + e.Request.Method() }
+func (e *HTTPError) Error() string    { return "Request failed with status code" }
 func (e *NetworkError) Error() string { return "Request failed due to a network error" }
 func (e *TimeoutError) Error() string { return "Request timed out" }
 
 // errorName is error.name, as the hooks and the caller read it.
-func errorName(err error) string {
+func errorName(err error) interface{} {
 	switch err := err.(type) {
 	case *HTTPError:
 		return "HTTPError"
@@ -42,7 +42,7 @@ func errorName(err error) string {
 	case *TimeoutError:
 		return "TimeoutError"
 	case *js.Error:
-		return err.Get("name").String()
+		return err.Get("name")
 	}
 	return "Error"
 }
@@ -63,7 +63,8 @@ type RetryOptions struct {
 }
 
 type Options struct {
-	Method *string
+	// Method is a JS string or js.Undefined.
+	Method *js.Object
 	// Headers is a plain object of header names to values, or js.Undefined.
 	Headers         *js.Object
 	JSON            *js.Object
@@ -85,7 +86,7 @@ const (
 
 type retry struct {
 	limit            float64
-	methods          []string
+	methods          *js.Object
 	statusCodes      []float64
 	afterStatusCodes []float64
 	maxRetryAfter    float64
@@ -96,12 +97,12 @@ type retry struct {
 
 var (
 	// core/constants.js and utils/normalize.js
-	requestMethods         = []string{"get", "post", "put", "patch", "head", "delete", "query"}
-	caseInsensitiveMethods = append(append([]string{}, requestMethods...), "options", "trace")
+	requestMethods         = jsSetOf("get", "post", "put", "patch", "head", "delete", "query")
+	caseInsensitiveMethods = jsSetOf("get", "post", "put", "patch", "head", "delete", "query", "options", "trace")
 	retryMethods           = []string{"get", "put", "head", "delete", "options", "trace", "query"}
 	retryStatusCodes       = []float64{408, 413, 429, 500, 502, 503, 504}
 	retryAfterStatusCodes  = []float64{413, 429, 503}
-	networkErrorMessages   = []string{
+	networkErrorMessages   = jsSetOf(
 		"network error",
 		"NetworkError when attempting to fetch resource.",
 		"The Internet connection appears to be offline.",
@@ -110,7 +111,7 @@ var (
 		"terminated",
 		" A network error occurred.",
 		"Network connection lost",
-	}
+	)
 )
 
 const (
@@ -128,21 +129,20 @@ func contains[T comparable](values []T, value T) bool {
 	return false
 }
 
-// normalizeRequestMethod is Ky's. Uses jsLowerCase so Unicode case folding matches JS's
-// toLowerCase; every name in requestMethods is pure ASCII, so strings.ToUpper agrees with JS
-// once matched.
-func normalizeRequestMethod(input string) string {
-	if contains(requestMethods, jsLowerCase(input)) {
-		return strings.ToUpper(input)
+// normalizeRequestMethod is Ky's, keeping the method as a raw JS string (*js.Object) so Unicode
+// case folding and lone surrogates match JS without Go UTF-8 conversion.
+func normalizeRequestMethod(input *js.Object) *js.Object {
+	if requestMethods.Call("has", input.Call("toLowerCase")).Bool() {
+		return input.Call("toUpperCase")
 	}
 	return input
 }
 
 // normalizeRetryMethod: common methods for retry matching are case-insensitive, custom ones keep
-// their case. Uses jsLowerCase because caseInsensitiveMethods contains "options" (Go's
-// strings.ToLower folds U+0130 'İ' to ASCII 'i', whereas JS yields two code units).
-func normalizeRetryMethod(method string) string {
-	if lowercase := jsLowerCase(method); contains(caseInsensitiveMethods, lowercase) {
+// their case. Uses JS String.prototype.toLowerCase directly on *js.Object (Go's strings.ToLower
+// folds U+0130 'İ' to ASCII 'i', whereas JS yields two code units).
+func normalizeRetryMethod(method *js.Object) *js.Object {
+	if lowercase := method.Call("toLowerCase"); caseInsensitiveMethods.Call("has", lowercase).Bool() {
 		return lowercase
 	}
 	return method
@@ -201,16 +201,15 @@ func normalizeRetryOptions(options RetryOptions) (retry, error) {
 			return retry{}, newError("TypeError", "`retry.statusCodes` must only contain numbers")
 		}
 	}
-	methodNames := retryMethods
-	if methods != nil {
-		methodNames = make([]string, len(methods))
-		for i, method := range methods {
-			methodNames[i] = method.String()
+	normalized.methods = jsSet.New()
+	if methods == nil {
+		for _, method := range retryMethods {
+			normalized.methods.Call("add", method)
 		}
-	}
-	normalized.methods = make([]string, len(methodNames))
-	for i, method := range methodNames {
-		normalized.methods[i] = normalizeRetryMethod(method)
+	} else {
+		for _, method := range methods {
+			normalized.methods.Call("add", normalizeRetryMethod(method))
+		}
 	}
 	if statusCodes != nil {
 		normalized.statusCodes = make([]float64, len(statusCodes))
@@ -259,7 +258,7 @@ func validateTimeoutOption(value *js.Object) (milliseconds float64, ok bool, err
 }
 
 type header struct {
-	name  string
+	name  *js.Object
 	value *js.Object
 }
 
@@ -267,14 +266,15 @@ type header struct {
 // their lowercased name, the last spelling of a name winning at the place of its first.
 func lowercaseHeaders(headers *js.Object) []header {
 	var merged []header
-	positions := map[string]int{}
+	positions := jsMap.New()
 	for _, key := range elements(jsObject.Call("keys", headers)) {
-		name, value := jsLowerCase(key.String()), headers.Get(key.String())
-		if position, ok := positions[name]; ok {
-			merged[position].value = value
+		name := key.Call("toLowerCase")
+		value := jsReflect.Call("get", headers, key)
+		if positions.Call("has", name).Bool() {
+			merged[positions.Call("get", name).Int()].value = value
 			continue
 		}
-		positions[name] = len(merged)
+		positions.Call("set", name, len(merged))
 		merged = append(merged, header{name, value})
 	}
 	return merged
@@ -294,20 +294,23 @@ func mergeHeaders(headers []header) (Headers, error) {
 // isRawNetworkError is utils/is-network-error.js, inlined by Ky from is-network-error 1.3.2.
 func isRawNetworkError(err error) bool {
 	thrown, ok := err.(*js.Error)
-	if !ok || !isError(thrown.Object) || thrown.Get("name").String() != "TypeError" {
+	if !ok || !isError(thrown.Object) || !jsObject.Call("is", thrown.Get("name"), "TypeError").Bool() {
 		return false
 	}
-	if typeTag(thrown.Get("message")) != "[object String]" {
+	message := thrown.Get("message")
+	if typeTag(message) != "[object String]" {
 		return false
 	}
-	message := thrown.Get("message").String()
-	wrapped := func(prefix string) bool { return strings.HasPrefix(message, prefix) && strings.HasSuffix(message, ")") }
-	if message == "Load failed" || wrapped("Load failed (") {
+	wrapped := func(prefix string) bool {
+		return message.Call("startsWith", prefix).Bool() && message.Call("endsWith", ")").Bool()
+	}
+	if jsObject.Call("is", message, "Load failed").Bool() || wrapped("Load failed (") {
 		// Safari 17+ has generic message but no stack for network errors
-		return isUndefined(thrown.Get("stack")) || js.Global.Get("Reflect").Call("has", thrown.Object, "__sentry_captured__").Bool()
+		return isUndefined(thrown.Get("stack")) || jsReflect.Call("has", thrown.Object, "__sentry_captured__").Bool()
 	}
-	return strings.HasPrefix(message, "error sending request for url") || message == "Failed to fetch" ||
-		wrapped("Failed to fetch (") || contains(networkErrorMessages, message)
+	return message.Call("startsWith", "error sending request for url").Bool() ||
+		jsObject.Call("is", message, "Failed to fetch").Bool() ||
+		wrapped("Failed to fetch (") || networkErrorMessages.Call("has", message).Bool()
 }
 
 // isError is Ky's: an Error of this realm, or one of another realm by its internal brand.
@@ -404,7 +407,7 @@ func createTextDecoder(contentType string) TextDecoder {
 
 // readResponseText reads an error body as text, or ok false when it cannot be read or is larger
 // than maxErrorResponseBodySize. JSON uses UTF-8 regardless of the charset parameter (RFC 8259).
-func readResponseText(response Response) (string, bool) {
+func readResponseText(response Response) (*js.Object, bool) {
 	if !response.HasBody() {
 		text, err := response.Text()
 		return text, err == nil
@@ -416,7 +419,7 @@ func readResponseText(response Response) (string, bool) {
 	}
 	bytes, length, err := response.Bytes()
 	if err != nil || length > maxErrorResponseBodySize {
-		return "", false
+		return nil, false
 	}
 	return decoder.Decode(bytes), true
 }
@@ -425,11 +428,11 @@ func readResponseText(response Response) (string, bool) {
 // it is empty, unreadable or unparsable.
 func getResponseData(response Response) *js.Object {
 	text, ok := readResponseText(response)
-	if !ok || text == "" {
+	if !ok || text.Length() == 0 {
 		return nil
 	}
 	if contentType, _ := response.Headers().Get("content-type"); !isJSONContentType(contentType) {
-		return js.Global.Call("String", text)
+		return text
 	}
 	var data *js.Object
 	if catch(func() { data = js.Global.Get("JSON").Call("parse", text) }) != nil {
@@ -461,7 +464,7 @@ func createManagedSignal(user *AbortSignal, controller AbortController) AbortSig
 	return anySignal(*user, controller.Signal())
 }
 
-func newKy(input string, options Options) (*Ky, error) {
+func newKy(input *js.Object, options Options) (*Ky, error) {
 	var headers []header
 	if !isUndefined(options.Headers) {
 		headers = lowercaseHeaders(options.Headers)
@@ -470,9 +473,9 @@ func newKy(input string, options Options) (*Ky, error) {
 	if err != nil {
 		return nil, err
 	}
-	method := "GET"
-	if options.Method != nil {
-		method = *options.Method
+	method := js.Global.Call("String", "GET")
+	if !isUndefined(options.Method) && options.Method != nil {
+		method = options.Method
 	}
 	method = normalizeRequestMethod(method)
 	retry, err := normalizeRetryOptions(options.Retry)
@@ -504,12 +507,14 @@ func newKy(input string, options Options) (*Ky, error) {
 	// A content-type from options.headers counts as user-provided.
 	userProvidedContentType := false
 	for _, header := range headers {
-		userProvidedContentType = userProvidedContentType || header.name == "content-type"
+		if jsObject.Call("is", header.name, "content-type").Bool() {
+			userProvidedContentType = true
+			break
+		}
 	}
-	var body *string
+	var body *js.Object
 	if !isUndefined(options.JSON) {
-		text := js.Global.Get("JSON").Call("stringify", options.JSON).String()
-		body = &text
+		body = js.Global.Get("JSON").Call("stringify", options.JSON)
 		if !userProvidedContentType {
 			if err := requestHeaders.Set("content-type", "application/json"); err != nil {
 				return nil, err
@@ -536,7 +541,7 @@ func newKy(input string, options Options) (*Ky, error) {
 // send is ky(input, options)[shortcut](): the init hooks, the request, the run and the body read.
 // A construction error fails without running the beforeError hooks, and so does a body that is
 // not JSON.
-func send(input string, options Options, shortcut Shortcut) (*js.Object, error) {
+func send(input *js.Object, options Options, shortcut Shortcut) (*js.Object, error) {
 	for _, hook := range options.Hooks.Init {
 		hook()
 	}
@@ -546,7 +551,7 @@ func send(input string, options Options, shortcut Shortcut) (*js.Object, error) 
 	}
 	// Before dispatch, ky.request is the request that will be sent.
 	headers := ky.request.Headers()
-	if accept, _ := headers.Get("accept"); accept != "" {
+	if accept := headers.GetRaw("accept"); accept != nil && accept.Length() > 0 {
 		headers.Set("accept", accept)
 	} else {
 		headers.Set("accept", string(shortcut))
@@ -560,7 +565,7 @@ func send(input string, options Options, shortcut Shortcut) (*js.Object, error) 
 		return nil, err
 	}
 	if shortcut == TextShortcut {
-		return js.Global.Call("String", text), nil
+		return text, nil
 	}
 	var result *js.Object
 	err = catch(func() { result = js.Global.Get("JSON").Call("parse", text) })
@@ -743,7 +748,7 @@ func (k *Ky) calculateRetryDelay(err error) (float64, error) {
 	if float64(k.retryCount) >= k.retry.limit {
 		return 0, err
 	}
-	if !contains(k.retry.methods, normalizeRetryMethod(k.request.Method())) {
+	if !k.retry.methods.Call("has", normalizeRetryMethod(k.request.Method())).Bool() {
 		return 0, err
 	}
 	switch cause := err.(type) {
