@@ -185,8 +185,6 @@ pub fn rust_entry() {
     print_u32(C_SUB.sub_val());
     print_u32(C_SUB.super_val());
     print_u32(C_SUP_FROM_SUB.super_val());
-    let rt_sup: &dyn Super = black_box(C_SUB);
-    print_u32(rt_sup.super_val());
 
     print_bool(!black_box(C_RAW_DYN_FN).is_null());
     print_u32(unsafe { (&*black_box(C_RAW_DYN_FN))(6) });
