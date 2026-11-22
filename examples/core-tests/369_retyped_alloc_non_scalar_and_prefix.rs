@@ -357,7 +357,8 @@ pub extern "C" fn rust_entry() {
     print_bool(pf2.addr() == (&w2.a as *const u32).addr());
     print_bool(pp2.addr() == pref_addr);
 
-    // 4. A7 polish #3: ptr::eq on shared _non_scalar_byte_view (sc === undefined vs sc === 8).
+    // 4. A7 polish #3: ptr::eq on shared _non_scalar_byte_view (sc === undefined vs sc === 8)
+    //    and erased roundtrip ptr::eq(p.add(1), p.add(1).cast::<()>().cast::<T>()).
     let v: Vec<Pair> = black_box(vec![Pair { a: 1, b: 2 }, Pair { a: 3, b: 4 }]);
     let p_scaled = v.as_ptr().cast::<u8>();
     let p_from_slice = unsafe { slice::from_raw_parts(v.as_ptr().cast::<u8>(), 0) }.as_ptr();
@@ -365,4 +366,21 @@ pub extern "C" fn rust_entry() {
     let p_scaled_1 = unsafe { v.as_ptr().add(1) }.cast::<u8>();
     let p_slice_1 = unsafe { slice::from_raw_parts(v.as_ptr().add(1).cast::<u8>(), 0) }.as_ptr();
     print_bool(ptr::eq(p_scaled_1, p_slice_1));
+
+    unsafe {
+        let arr32 = black_box([10u32, 20, 30, 40]);
+        let s1 = arr32.as_ptr().add(1);
+        print_bool(ptr::eq(s1, black_box(s1.cast::<()>()).cast::<u32>()));
+        let v16 = black_box(vec![11u16, 22, 33]);
+        let h1 = v16.as_ptr().add(1);
+        print_bool(ptr::eq(h1, black_box(h1.cast::<()>()).cast::<u16>()));
+        let la1 = Layout::from_size_align(8, 1).unwrap();
+        let aa1 = alloc(la1);
+        let pa1 = aa1 as *mut u16;
+        *pa1.add(1) = 44;
+        let q1 = pa1.add(1);
+        print_bool(ptr::eq(q1, black_box(q1.cast::<()>()).cast::<u16>()));
+        print_bool(ptr::eq(aa1.add(2).cast::<()>(), q1.cast::<()>()));
+        dealloc(aa1, la1);
+    }
 }

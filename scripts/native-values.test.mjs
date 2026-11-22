@@ -547,4 +547,46 @@ test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and p
   const nsScaled = rt.scale({ buf: nsBuf, off: 1 }, 8);
   const nsNoSc = { buf: nsScaled.buf, off: 8 };
   assert.equal(rt.ptr_eq(nsScaled, nsNoSc), true);
+
+  // 7. ptr_eq + thin roundtrip for wider scalars (stack, heap align > 1, heap align == 1).
+  const stk32 = [10, 20, 30, 40];
+  const sp1 = { buf: stk32, off: 1 };
+  const sp1Rt = rt.thin(rt.erase(sp1, 4, "u32"), 4);
+  assert.equal(sp1Rt.es, undefined);
+  assert.equal(rt.ptr_eq(sp1, sp1Rt), true);
+  assert.equal(rt.ptr_eq(sp1, rt.erase(sp1, 4, "u32")), true);
+  const hp16 = rt.alloc(8, 2);
+  const hp16T = rt.unscale_scalar(hp16, 2, () => 0, "u16");
+  const hp16One = { buf: hp16T.buf, off: 1 };
+  assert.equal(rt.ptr_eq(hp16One, rt.thin(rt.erase(hp16One, 2, "u16"), 2)), true);
+  assert.equal(rt.ptr_eq(hp16One, rt.erase(hp16One, 2, "u16")), true);
+  rt.dealloc(hp16, 8, 2);
+  const hp16A1 = rt.alloc(8, 1);
+  const hp16A1T = rt.unscale_scalar(hp16A1, 2, () => 0, "u16");
+  const hp16A1One = { buf: hp16A1T.buf, off: 1 };
+  assert.equal(rt.ptr_eq(hp16A1One, rt.thin(rt.erase(hp16A1One, 2, "u16"), 2)), true);
+  rt.dealloc(hp16A1, 8, 1);
+
+  // 8. Prefix byte-copy fails closed both directly (pv present) and after .add(0) (pv dropped).
+  const prefScaled = rt.scale(rt.prefix({ buf: arr, off: 0 }, "inner", 16), 8, clonePair);
+  const prefDropPv = { buf: prefScaled.buf, off: 0, sc: prefScaled.sc };
+  const dstInner = rt.scale({ buf: [{ x: 0, y: 0 }], off: 0 }, 8, clonePair);
+  assert.throws(
+    () => rt.copy_nonoverlapping(dstInner, prefScaled, 8),
+    (err) => rt.is_abort(err) && /prefix/.test(err.message),
+  );
+  assert.throws(
+    () => rt.copy_nonoverlapping(dstInner, prefDropPv, 8),
+    (err) => rt.is_abort(err) && /prefix/.test(err.message),
+  );
+
+  // 9. _uninit_blocks source (GVN-folded unscale_uninit) copies cleanly into non-scalar byte view.
+  const rawMu = new Array(16);
+  const pMu = rt.unscale_uninit({ buf: rawMu, off: 0 }, 8, () => ({ a: 0, b: 0 }), clonePair);
+  pMu.buf[0] = { a: 31, b: 32 };
+  const dstMuArr = [undefined, undefined];
+  rt.copy_nonoverlapping(rt.scale({ buf: dstMuArr, off: 0 }, 8, clonePair), { buf: rawMu, off: 0 }, 16);
+  dstMuArr[0].a = 666;
+  assert.equal(pMu.buf[0].a, 31);
+  assert.equal(dstMuArr[1], undefined);
 });

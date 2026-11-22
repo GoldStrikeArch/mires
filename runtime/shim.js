@@ -636,18 +636,26 @@ globalThis.__rt.ptr_eq = (a, b) => {
   const right = b.pr === undefined ? b : b.pr;
   if (
     left.buf === right.buf && left.pr === undefined && right.pr === undefined &&
-    left.es === right.es &&
     !(_has_byte_views && globalThis.__rt._byte_view_of.has(left.buf))
   ) {
-    return left.off === right.off && a.sc === b.sc;
+    if (left.es === right.es) {
+      return left.off === right.off && a.sc === b.sc;
+    }
+    const blk = globalThis.__rt._blk_get(left.buf);
+    if (!(blk !== undefined && blk.es > 1 && blk.proxy === undefined && blk.hdr === undefined)) {
+      return left.off === right.off && a.sc === b.sc;
+    }
   }
   const lu = globalThis.__rt._unwrap_view(a);
   const ru = globalThis.__rt._unwrap_view(b);
   if (lu.buf !== ru.buf || lu.key !== ru.key) return false;
   if (lu.inBytes === ru.inBytes) {
     if (!lu.inBytes && lu.es !== ru.es) {
-      return lu.off * (lu.es !== undefined ? lu.es : 1) ===
-        ru.off * (ru.es !== undefined ? ru.es : 1);
+      const blk = globalThis.__rt._blk_get(lu.buf);
+      if (blk !== undefined && blk.es > 1 && blk.proxy === undefined && blk.hdr === undefined) {
+        return lu.off * (lu.es !== undefined ? lu.es : 1) ===
+          ru.off * (ru.es !== undefined ? ru.es : 1);
+      }
     }
     return lu.off === ru.off;
   }
@@ -795,7 +803,7 @@ globalThis.__rt._prep_copy = (p, otherSc, otherCl, count) => {
   if (bv !== undefined) {
     if (bv.buf.length === 0) globalThis.__rt._heap_block(bv.buf);
     if (!bv.alloc && !bv.hdr && bv.kind === null) {
-      if (p.pv !== undefined) {
+      if (p.pv !== undefined || (p.sc !== undefined && p.sc !== bv.size)) {
         throw __rt.abort_error(new Error(
           "rustc_codegen_js: cannot byte-copy through a zero-offset aggregate prefix pointer",
         ));
@@ -828,6 +836,11 @@ globalThis.__rt._prep_copy = (p, otherSc, otherCl, count) => {
         return { p: { buf: bv.buf, off: p.off, sc: otherSc }, cl: otherCl, ns: true };
       }
     }
+  } else if (otherSc !== undefined && p.sc === undefined && p.buf !== undefined && p.buf !== null) {
+    const ub = globalThis.__rt._uninit_blocks.get(p.buf);
+    if (ub !== undefined && !ub.fresh && ub.es === otherSc && ub.sk === undefined) {
+      return { p: { buf: p.buf, off: p.off, sc: ub.es }, cl: ub.cl, ns: true };
+    }
   }
   return { p, cl: undefined, ns: false };
 };
@@ -847,8 +860,9 @@ globalThis.__rt.copy = (dst, src, count, clone) => {
   let effCl = clone;
   let fromNs = false;
   if (clone === undefined && _has_byte_views) {
-    const sp = globalThis.__rt._prep_copy(src, undefined, undefined, count);
+    let sp = globalThis.__rt._prep_copy(src, undefined, undefined, count);
     const dp = globalThis.__rt._prep_copy(dst, sp.ns ? sp.p.sc : undefined, sp.cl, count);
+    if (!sp.ns && dp.ns) sp = globalThis.__rt._prep_copy(src, dp.p.sc, dp.cl, count);
     src = sp.p;
     dst = dp.p;
     fromNs = sp.ns || dp.ns;
@@ -880,7 +894,7 @@ globalThis.__rt.copy = (dst, src, count, clone) => {
     return;
   }
   const each = typeof effCl === "function"
-    ? (fromNs ? (v) => (v === undefined ? undefined : effCl(v)) : effCl)
+    ? (fromNs ? (v) => (v === null || typeof v !== "object" ? v : effCl(v)) : effCl)
     : (v) => v;
   const put = globalThis.__rt._put;
   const dIsHeap = globalThis.__rt._blk_get(d.buf) !== undefined;
@@ -964,8 +978,9 @@ globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone) => {
   let effCl = clone;
   let fromNs = false;
   if (clone === undefined && _has_byte_views) {
-    const sp = globalThis.__rt._prep_copy(src, undefined, undefined, count);
+    let sp = globalThis.__rt._prep_copy(src, undefined, undefined, count);
     const dp = globalThis.__rt._prep_copy(dst, sp.ns ? sp.p.sc : undefined, sp.cl, count);
+    if (!sp.ns && dp.ns) sp = globalThis.__rt._prep_copy(src, dp.p.sc, dp.cl, count);
     src = sp.p;
     dst = dp.p;
     fromNs = sp.ns || dp.ns;
@@ -979,7 +994,7 @@ globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone) => {
     return;
   }
   const each = typeof effCl === "function"
-    ? (fromNs ? (v) => (v === undefined ? undefined : effCl(v)) : effCl)
+    ? (fromNs ? (v) => (v === null || typeof v !== "object" ? v : effCl(v)) : effCl)
     : (v) => v;
   const put = globalThis.__rt._put;
   const dIsHeap = globalThis.__rt._blk_get(d.buf) !== undefined;
@@ -2000,6 +2015,9 @@ globalThis.__rt.thin = (p, size, signed) => {
   // Already a slot -- including the provenance-less record `_named` reports on,
   // which stays as it is so that the operation that cannot answer says so.
   if ("buf" in p) {
+    if (p.es !== undefined && size > 1 && p.es === size && p.pr === undefined && p.pv === undefined) {
+      return p.w !== undefined ? { buf: p.buf, off: p.off, w: p.w } : { buf: p.buf, off: p.off };
+    }
     if (bv === undefined && p.buf !== undefined && p.buf !== null) {
       const block = globalThis.__rt._blk_get(p.buf);
       if (block !== undefined && block.es > 1 && block.hdr === undefined) {
