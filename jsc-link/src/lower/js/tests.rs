@@ -8212,6 +8212,81 @@ fn dyn_const_lowers_promoted_fndef_direct_static_and_address() {
 }
 
 #[test]
+fn const_slice_address_lowers_zst_dangling_and_bare_slices() {
+    const SLICE_Z: TypeId = TypeId(430);
+    const RAW_SLICE_Z: TypeId = TypeId(431);
+    const SLICE_U32: TypeId = TypeId(432);
+    const RAW_SLICE_U32: TypeId = TypeId(433);
+    const WRAP_U32_SLICE: TypeId = TypeId(434);
+    const RAW_WRAP_U32_SLICE: TypeId = TypeId(435);
+
+    let mut interns = world();
+    interns.intern_type(descriptor(SLICE_Z, TypeKind::Slice(UNIT), 0));
+    interns.intern_type(pointer(RAW_SLICE_Z, SLICE_Z, PointerForm::FatSlice, true));
+    interns.intern_type(descriptor(SLICE_U32, TypeKind::Slice(U32), 0));
+    interns.intern_type(pointer(
+        RAW_SLICE_U32,
+        SLICE_U32,
+        PointerForm::FatSlice,
+        true,
+    ));
+    let wrap_name = interns.intern_str("U32Slice");
+    let mut wrap = descriptor(
+        WRAP_U32_SLICE,
+        TypeKind::Adt {
+            def: def(210),
+            form: NominalForm::Struct,
+            args: Vec::new(),
+            variants: vec![variant(
+                wrap_name,
+                vec![field(FieldKey::Index(0), SLICE_U32)],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        0,
+    );
+    wrap.layout.sized = false;
+    wrap.js.peeled = SLICE_U32;
+    wrap.js.transparent = Some(rcgjs_object::jir::types::TransparentField {
+        field: 0,
+        ty: SLICE_U32,
+    });
+    interns.intern_type(wrap);
+    interns.intern_type(pointer(
+        RAW_WRAP_U32_SLICE,
+        WRAP_U32_SLICE,
+        PointerForm::FatSlice,
+        true,
+    ));
+
+    let check = |ty: TypeId, address: u64, length: u64, expected: &str| {
+        let mut b = FuncBuilder::new(item(1), signature(Vec::new(), ty));
+        let e = FuncBuilder::ENTRY;
+        let v = b.op(
+            e,
+            OpKind::Const(ConstTree::SliceAddress { address, length }),
+            ty,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(v)));
+        let func = b.finish();
+        let plan = plan_of(&func, &[]);
+        let body = body_of(BodyKind::Function, func.sig.clone());
+        let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+        assert_eq!(js, format!("function f() {{\n  return {expected};\n}}\n"));
+    };
+
+    check(RAW_SLICE_Z, 1, 3, "{ buf: 1, off: 0, len: 3 }");
+    check(RAW_SLICE_Z, 0x1000, 100, "{ buf: 4096, off: 0, len: 100 }");
+    check(RAW_SLICE_U32, 4, 0, "__rt.slice_from_parts(4, 0)");
+    check(RAW_SLICE_U32, 0x1000, 5, "{ buf: 4096, off: 0, len: 5 }");
+    check(RAW_SLICE_U32, 0, 0, "{ buf: 0, off: 0, len: 0 }");
+    check(RAW_WRAP_U32_SLICE, 4, 0, "__rt.slice_from_parts(4, 0)");
+}
+
+#[test]
 fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
     const RAW_ARR: TypeId = TypeId(415);
     const ARRAY_2: TypeId = TypeId(416);

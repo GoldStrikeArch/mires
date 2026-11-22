@@ -1154,6 +1154,7 @@ fn const_item_refs(tree: &ConstTree, interns: &Interns, target: &str) -> usize {
         | ConstTree::Scalar { .. }
         | ConstTree::Str(_)
         | ConstTree::Address(_)
+        | ConstTree::SliceAddress { .. }
         | ConstTree::Global {
             target: GlobalReference::Type(_),
             ..

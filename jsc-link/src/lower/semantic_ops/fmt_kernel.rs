@@ -259,11 +259,15 @@ impl<'a> View<'a> {
                         ConstTree::Aggregate(elements) | ConstTree::Slice(elements) => {
                             elements.is_empty()
                         }
+                        ConstTree::SliceAddress { length: 0, .. } => true,
                         ConstTree::Reference(inner) => {
                             matches!(
                                 inner.as_ref(),
                                 ConstTree::Aggregate(e) | ConstTree::Slice(e) if e.is_empty()
-                            ) || matches!(inner.as_ref(), ConstTree::Unit)
+                            ) || matches!(
+                                inner.as_ref(),
+                                ConstTree::Unit | ConstTree::SliceAddress { length: 0, .. }
+                            )
                         }
                         ConstTree::Unit => true,
                         _ => false,

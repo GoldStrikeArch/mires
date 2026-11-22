@@ -242,7 +242,10 @@ globalThis.__rt._dangling = (align) => {
 // Raw slice metadata can describe an allocator's uninitialized byte block, or a
 // byte slice over wider storage (`byte` is 1 for u8, -1 for i8).
 globalThis.__rt.slice_from_parts = (p, len, byte) => {
-  if (typeof p === "number" && p > 0 && p < 4096) p = globalThis.__rt._dangling(p);
+  if (typeof p === "number") {
+    if (p > 0 && p < 4096) p = globalThis.__rt._dangling(p);
+    else return { buf: p, off: 0, len };
+  }
   if (p.sc !== undefined) {
     if (len > 0) {
       throw __rt.abort_error(new Error(
@@ -436,8 +439,11 @@ globalThis.__rt.addr = (p, size) => {
   }
   globalThis.__rt._named(p, "addr");
   const u = globalThis.__rt._unwrap_view(p);
-  const key = typeof u.buf === "object" && u.buf !== null ? u.buf : p;
   const step = u.es !== undefined ? u.es : size;
+  if (typeof u.buf === "number") {
+    return u.buf + (u.inBytes ? u.off : u.off * step);
+  }
+  const key = typeof u.buf === "object" && u.buf !== null ? u.buf : p;
   // A dangling pointer keeps the alignment it was born as, which is the
   // guarantee this whole scheme is built on: it is below 4096, so it never
   // collides with a base. The buffer is recognised rather than a field on the
@@ -614,6 +620,16 @@ globalThis.__rt.offset_from = (a, b) => {
 // the reference form of the source.
 globalThis.__rt.ptr_eq = (a, b) => {
   if (a === b) return true;
+  if (typeof a === "number") {
+    if (b === null || typeof b !== "object") return false;
+    globalThis.__rt._named(b, "ptr_eq");
+    return b.pr === undefined && b.off === 0 && (b.buf === a || globalThis.__rt._dangling_of.get(b.buf) === a);
+  }
+  if (typeof b === "number") {
+    if (a === null || typeof a !== "object") return false;
+    globalThis.__rt._named(a, "ptr_eq");
+    return a.pr === undefined && a.off === 0 && (a.buf === b || globalThis.__rt._dangling_of.get(a.buf) === b);
+  }
   if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
   globalThis.__rt._named(a, "ptr_eq");
   globalThis.__rt._named(b, "ptr_eq");
@@ -1250,6 +1266,7 @@ globalThis.__rt.unref = (p) => {
 // array as its one element, a window slot already spans them, and a `Box<[E; N]>`
 // is a heap block keyed to `E`, which is the second shape.
 globalThis.__rt.unwindow_slice = (p, len) => {
+  if (typeof p === "number") return globalThis.__rt.slice_from_parts(p, len);
   const q = globalThis.__rt.unwindow(p);
   return { buf: q.buf, off: q.off, len };
 };
@@ -1657,6 +1674,7 @@ globalThis.__rt._alloc_byte_proxy = (raw, meta) => {
 globalThis.__rt.scale_scalar = (p, size, kind, signed) => {
   if (typeof p === "number") return p;
   if (p === null || p === undefined) return 0;
+  if (typeof p.buf === "number") return { buf: p.buf, off: p.off * size, sc: size };
   if (p.pr !== undefined) {
     const view = globalThis.__rt._byte_view(p.buf, size, kind, !!signed, p.off, p.pr, p.ps);
     return { buf: view, off: 0, pv: p, po: 0 };

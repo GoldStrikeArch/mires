@@ -1220,6 +1220,10 @@ pub enum ConstTree {
         concrete: TypeId,
         vtable: String,
     },
+    SliceAddress {
+        address: u64,
+        length: u64,
+    },
 }
 
 impl ConstTree {

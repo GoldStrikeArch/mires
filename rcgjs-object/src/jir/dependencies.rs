@@ -161,7 +161,8 @@ impl Dependencies {
                 ConstTree::Unit
                 | ConstTree::Scalar { .. }
                 | ConstTree::Str(_)
-                | ConstTree::Address(_) => {}
+                | ConstTree::Address(_)
+                | ConstTree::SliceAddress { .. } => {}
             }
         }
     }

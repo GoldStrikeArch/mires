@@ -1496,26 +1496,31 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             }
         }
         let Some(alloc_id) = pointer.alloc_id() else {
+            if !pointer.readable {
+                return Err(format!("a `{ty}` in a constant is uninitialized"));
+            }
             if wide {
-                if pointer.readable
-                    && pointer.offset.bytes() != 0
-                    && pointer.meta == Some(0)
-                    && pointee.is_some_and(|p| {
-                        matches!(
-                            crate::value::peel_pattern(crate::value::peel_transparent(tcx, p))
-                                .kind(),
-                            ty::Str
-                        )
-                    })
-                {
-                    return Ok(ConstTree::Str(String::new()));
+                if let Some(pointee) = pointee {
+                    let peeled =
+                        crate::value::peel_pattern(crate::value::peel_transparent(tcx, pointee));
+                    if pointer.meta_alloc_id().is_none() {
+                        if let Some(length) = pointer.meta {
+                            let address = pointer.offset.bytes();
+                            match peeled.kind() {
+                                ty::Slice(_) => {
+                                    return Ok(ConstTree::SliceAddress { address, length });
+                                }
+                                ty::Str if length == 0 && address != 0 => {
+                                    return Ok(ConstTree::Str(String::new()));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
                 return Err(format!(
                     "a `{ty}` in a constant is an address with no provenance"
                 ));
-            }
-            if !pointer.readable {
-                return Err(format!("a `{ty}` in a constant is uninitialized"));
             }
             return Ok(ConstTree::Address(pointer.offset.bytes()));
         };

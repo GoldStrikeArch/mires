@@ -590,3 +590,55 @@ test("retyped alloc byte arithmetic, compiler-typed non-scalar copy/abort, and p
   assert.equal(pMu.buf[0].a, 31);
   assert.equal(dstMuArr[1], undefined);
 });
+
+test("provenance-free slice addresses preserve addr, ptr_is_null, and ptr_eq", () => {
+  const dangling = rt.slice_from_parts(4, 0);
+  assert.equal(rt.addr(dangling, 4), 4);
+  assert.equal(rt.ptr_is_null(dangling, 4), false);
+  assert.equal(rt.ptr_eq(dangling, 4), true);
+  assert.equal(rt.ptr_eq(4, dangling), true);
+  assert.equal(rt.ptr_eq(dangling, 8), false);
+
+  const custom = rt.slice_from_parts(4096, 5);
+  assert.deepEqual(custom, { buf: 4096, off: 0, len: 5 });
+  assert.equal(rt.addr(custom, 4), 4096);
+  assert.equal(rt.addr(rt.offset(custom, 2, 4), 4), 4104);
+  assert.equal(rt.ptr_is_null(custom, 4), false);
+  assert.equal(rt.ptr_eq(custom, 4096), true);
+  assert.equal(rt.ptr_eq(4096, custom), true);
+  assert.equal(rt.ptr_eq(custom, 8192), false);
+
+  const nul = rt.slice_from_parts(0, 0);
+  assert.deepEqual(nul, { buf: 0, off: 0, len: 0 });
+  assert.equal(rt.addr(nul, 4), 0);
+  assert.equal(rt.ptr_is_null(nul, 4), true);
+  assert.equal(rt.ptr_eq(nul, 0), true);
+  assert.equal(rt.ptr_eq(0, nul), true);
+
+  // `unwindow_slice` on bare dangling/custom addresses (`Box::<[T]>::default()` unsizing).
+  const unwDangling = rt.unwindow_slice(4, 0);
+  assert.equal(unwDangling.len, 0);
+  assert.equal(rt.addr(unwDangling, 4), 4);
+  assert.equal(rt.ptr_eq(unwDangling, dangling), true);
+  assert.equal(rt.ptr_eq(unwDangling, 4), true);
+  const unwCustom = rt.unwindow_slice(4096, 0);
+  assert.deepEqual(unwCustom, { buf: 4096, off: 0, len: 0 });
+
+  // `scale_scalar` on bare-address slices keeps the address intact for `is_null` / `addr`.
+  const scaledCustom = rt.scale_scalar(custom, 4, "u32", false);
+  assert.equal(rt.addr(scaledCustom, 1), 4096);
+  assert.equal(rt.ptr_is_null(scaledCustom, 1), false);
+  const scaledNull = rt.scale_scalar(nul, 4, "u32", false);
+  assert.equal(rt.addr(scaledNull, 1), 0);
+  assert.equal(rt.ptr_is_null(scaledNull, 1), true);
+
+  // Poisoned offset-from-address records still throw in ptr_eq even when compared to a number.
+  assert.throws(
+    () => rt.ptr_eq({ buf: undefined, off: NaN }, 4),
+    (err) => rt.is_abort(err),
+  );
+  assert.throws(
+    () => rt.ptr_eq(4, { buf: undefined, off: NaN }),
+    (err) => rt.is_abort(err),
+  );
+});

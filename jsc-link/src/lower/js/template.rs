@@ -185,6 +185,7 @@ fn as_str<'a>(interns: &'a Interns, tree: &ConstTree, what: &str) -> Result<&'a 
 fn as_seq<'a>(tree: &'a ConstTree, what: &str) -> Result<&'a [ConstTree], String> {
     match tree {
         ConstTree::Slice(elements) | ConstTree::Aggregate(elements) => Ok(elements),
+        ConstTree::SliceAddress { length: 0, .. } => Ok(&[]),
         _ => Err(format!("`{what}` is not a sequence")),
     }
 }

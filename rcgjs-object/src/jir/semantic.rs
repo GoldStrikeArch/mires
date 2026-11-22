@@ -538,6 +538,12 @@ pub enum ConstTree {
         concrete: TypeId,
         vtable: StrId,
     },
+    /// A provenance-free wide slice pointer (`*const [T]` / `*mut [T]` / `&[T]` / `&mut [T]` /
+    /// `NonNull<[T]>` / `Box<[T]>`): a bare address paired with its element-count metadata.
+    SliceAddress {
+        address: u64,
+        length: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

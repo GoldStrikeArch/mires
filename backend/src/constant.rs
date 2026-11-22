@@ -434,24 +434,54 @@ fn read_pointer<'tcx>(
     let Some(alloc_id) = pointer.alloc_id() else {
         // No provenance: the bytes are an address and nothing else, which is exactly the address
         // form of the pointer model — `ptr::null()`, `without_provenance`, an integer cast to a
-        // pointer. A thin one is that number. A wide one is not: `{ buf, off, len }` needs a
-        // buffer, and there is none to name.
+        // pointer. A thin one is that number. A wide slice pointer carries an address and length
+        // (and an empty non-null `str` is `""`); every other provenance-free wide pointer fails
+        // closed.
+        if !pointer.readable {
+            return zombie(
+                cgu,
+                log,
+                span,
+                format!(
+                    "a `{ty}` in a constant is uninitialized, which rustc_codegen_js cannot read"
+                ),
+            );
+        }
         if wide {
-            if pointer.readable
-                && pointer.offset.bytes() != 0
-                && pointer.meta == Some(0)
-                && pointee.is_some_and(|p| {
-                    matches!(
-                        value::peel_pattern(value::peel_transparent(tcx, p)).kind(),
-                        ty::Str
-                    )
-                })
-            {
-                return if crate::ptr::is_mut_str_ptr(tcx, ty) {
-                    crate::ptr::fat_slice(jsast::array(Vec::new()), jsast::num(0), jsast::num(0))
-                } else {
-                    jsast::string("")
-                };
+            if let Some(pointee) = pointee {
+                let peeled = value::peel_pattern(value::peel_transparent(tcx, pointee));
+                if pointer.meta_alloc_id().is_none() {
+                    if let Some(length) = pointer.meta {
+                        let address = pointer.offset.bytes();
+                        match peeled.kind() {
+                            ty::Slice(element) => {
+                                if !value::is_zst(tcx, *element) && address > 0 && address < 4096 {
+                                    return jsast::rt_call(
+                                        "slice_from_parts",
+                                        vec![jsast::num(address as f64), jsast::num(length as f64)],
+                                    );
+                                }
+                                return crate::ptr::fat_slice(
+                                    jsast::num(address as f64),
+                                    jsast::num(0),
+                                    jsast::num(length as f64),
+                                );
+                            }
+                            ty::Str if length == 0 && address != 0 => {
+                                return if crate::ptr::is_mut_str_ptr(tcx, ty) {
+                                    crate::ptr::fat_slice(
+                                        jsast::array(Vec::new()),
+                                        jsast::num(0),
+                                        jsast::num(0),
+                                    )
+                                } else {
+                                    jsast::string("")
+                                };
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             return zombie(
                 cgu,
@@ -463,17 +493,7 @@ fn read_pointer<'tcx>(
                 ),
             );
         }
-        return match pointer.readable {
-            true => jsast::num(pointer.offset.bytes() as f64),
-            false => zombie(
-                cgu,
-                log,
-                span,
-                format!(
-                    "a `{ty}` in a constant is uninitialized, which rustc_codegen_js cannot read"
-                ),
-            ),
-        };
+        return jsast::num(pointer.offset.bytes() as f64);
     };
 
     pointer_expr(cgu, log, alloc_id, pointer.offset, ty, pointer.meta, span)

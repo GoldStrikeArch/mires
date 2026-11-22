@@ -241,7 +241,8 @@ pub fn const_tree(
         | ConstTree::Dyn { .. }
         | ConstTree::Slice(_)
         | ConstTree::Global { .. }
-        | ConstTree::Address(_) => Err(Trap::Unsupported("constant memory reference")),
+        | ConstTree::Address(_)
+        | ConstTree::SliceAddress { .. } => Err(Trap::Unsupported("constant memory reference")),
     }
 }
 

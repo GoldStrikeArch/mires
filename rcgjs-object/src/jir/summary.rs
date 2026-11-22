@@ -1295,6 +1295,10 @@ impl<'a> Normalizer<'a> {
                 bytes: *bytes,
             },
             ConstTree::Address(address) => ConstTree::Address(*address),
+            ConstTree::SliceAddress { address, length } => ConstTree::SliceAddress {
+                address: *address,
+                length: *length,
+            },
         }
     }
 

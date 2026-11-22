@@ -160,7 +160,7 @@ fn fatten<'tcx>(
     let tcx = fx.tcx;
     match (source.kind(), target.kind()) {
         // `&[T; N] -> &[T]`: the array is the buffer, the length is static.
-        (ty::Array(_, len), ty::Slice(_)) => {
+        (ty::Array(element, len), ty::Slice(_)) => {
             let len = match len.try_to_target_usize(tcx) {
                 Some(len) => len,
                 None => {
@@ -170,7 +170,7 @@ fn fatten<'tcx>(
                     0
                 }
             };
-            if !raw {
+            if !raw || crate::value::is_zst(tcx, *element) {
                 return crate::ptr::fat_slice(value, jsast::num(0), jsast::num(len as f64));
             }
             // From a raw pointer the array is not in hand, and where its elements live is a

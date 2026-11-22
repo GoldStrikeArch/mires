@@ -1023,9 +1023,9 @@ impl<'a> JsCx<'a> {
     fn fatten(&self, value: Expr, source: TypeId, target: TypeId, raw: bool) -> Res<Expr> {
         let table = self.table;
         match (value::kind(table, source), value::kind(table, target)) {
-            (Some(TypeKind::Array { length, .. }), Some(TypeKind::Slice(_))) => {
+            (Some(TypeKind::Array { element, length }), Some(TypeKind::Slice(_))) => {
                 let len = *length;
-                if !raw {
+                if !raw || table.is_zst(*element) {
                     return Ok(ptr::fat_slice(value, jsast::num(0), jsast::num(len as f64)));
                 }
                 Ok(jsast::rt_call(

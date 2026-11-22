@@ -412,7 +412,10 @@ fn verify_const_tree(tree: &ConstTree, context: &Context<'_>) -> Result<(), Veri
         }
         ConstTree::Global { target, .. } => verify_global(target, context),
         ConstTree::Str(text) => context.str(*text),
-        ConstTree::Unit | ConstTree::Scalar { .. } | ConstTree::Address(_) => Ok(()),
+        ConstTree::Unit
+        | ConstTree::Scalar { .. }
+        | ConstTree::Address(_)
+        | ConstTree::SliceAddress { .. } => Ok(()),
     }
 }
 

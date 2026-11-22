@@ -191,6 +191,15 @@ impl<'a> JsCx<'a> {
                 };
                 self.slice_expr(elements, pointee, depth)
             }
+            ConstTree::SliceAddress { address, length } => {
+                let Some(pointee) = value::pointee_of(table, ty) else {
+                    return Err(decline(
+                        OpClass::Constant,
+                        "a provenance-free slice constant at a type that is not a pointer",
+                    ));
+                };
+                self.slice_address_expr(*address, *length, pointee)
+            }
         }
     }
 
@@ -627,6 +636,33 @@ impl<'a> JsCx<'a> {
         let length = items.len();
         Ok(ptr::fat_slice(
             jsast::array(items),
+            jsast::num(0),
+            jsast::num(length as f64),
+        ))
+    }
+
+    /// A provenance-free wide slice pointer (`*const [T]`, `&[T]`, `Box<[T]>`, etc.):
+    ///
+    /// - Zero-sized elements (`[Z]`) keep the bare address as `buf`, matching `build_fat`.
+    /// - Non-ZST dangling addresses (`0 < address < 4096`) normalize through
+    ///   `__rt.slice_from_parts(address, length)` so they share the frozen `_dangling(align)`
+    ///   buffer with runtime `Vec::new()` and `slice::from_raw_parts`.
+    /// - Other non-ZST bare addresses (`0`, `>= 4096`) keep `{ buf: address, off: 0, len }`.
+    fn slice_address_expr(&self, address: u64, length: u64, pointee: TypeId) -> Res<Expr> {
+        let Some(TypeKind::Slice(element)) = value::kind(self.table, pointee) else {
+            return Err(decline(
+                OpClass::Constant,
+                "a provenance-free slice constant whose pointee is not a slice",
+            ));
+        };
+        if !self.table.is_zst(*element) && address > 0 && address < 4096 {
+            return Ok(jsast::rt_call(
+                "slice_from_parts",
+                vec![jsast::num(address as f64), jsast::num(length as f64)],
+            ));
+        }
+        Ok(ptr::fat_slice(
+            jsast::num(address as f64),
             jsast::num(0),
             jsast::num(length as f64),
         ))

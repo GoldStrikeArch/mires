@@ -233,7 +233,7 @@ pub(crate) fn is_wide_pointee<'tcx>(tcx: TyCtxt<'tcx>, pointee: Ty<'tcx>) -> boo
     matches!(
         crate::value::peel_pattern(crate::value::peel_transparent(tcx, pointee)).kind(),
         ty::Str | ty::Slice(_) | ty::Dynamic(..)
-    )
+    ) || crate::value::unsized_tail(tcx, pointee).is_some()
 }
 
 /// A pointer read out of an allocation: which allocation it names, where into it, and how long the
