@@ -9933,4 +9933,311 @@ fn transmute_rebuild_preserves_zst_padded_tuple_arity_and_index() {
     }
 }
 
+#[test]
+fn array_ref_and_local_subslice_build_aliasing_window_slots() {
+    let mut interns = world();
+    const MUT_REF_ARRAY: TypeId = TypeId(720);
+    const ARRAY_2: TypeId = TypeId(721);
+    const MUT_REF_ARRAY_2: TypeId = TypeId(722);
+    const RAW_MUT_ARRAY_2: TypeId = TypeId(723);
+    const ARRAY_0: TypeId = TypeId(724);
+    const REF_ARRAY_0: TypeId = TypeId(725);
+    const RAW_ARRAY_0: TypeId = TypeId(726);
+
+    let mut mut_ref_arr = descriptor(
+        MUT_REF_ARRAY,
+        TypeKind::Reference {
+            pointee: ARRAY,
+            mutable: true,
+        },
+        4,
+    );
+    mut_ref_arr.js.pointer_form = Some(PointerForm::Thin);
+    interns.intern_type(mut_ref_arr);
+
+    let mut arr2 = descriptor(
+        ARRAY_2,
+        TypeKind::Array {
+            element: I32,
+            length: 2,
+        },
+        8,
+    );
+    arr2.js.is_indirect = true;
+    arr2.js.needs_clone = true;
+    interns.intern_type(arr2);
+
+    let mut mut_ref_arr2 = descriptor(
+        MUT_REF_ARRAY_2,
+        TypeKind::Reference {
+            pointee: ARRAY_2,
+            mutable: true,
+        },
+        4,
+    );
+    mut_ref_arr2.js.pointer_form = Some(PointerForm::Thin);
+    interns.intern_type(mut_ref_arr2);
+
+    let mut raw_mut_arr2 = descriptor(
+        RAW_MUT_ARRAY_2,
+        TypeKind::RawPointer {
+            pointee: ARRAY_2,
+            mutable: true,
+        },
+        4,
+    );
+    raw_mut_arr2.js.pointer_form = Some(PointerForm::Slot);
+    interns.intern_type(raw_mut_arr2);
+
+    let mut arr0 = descriptor(
+        ARRAY_0,
+        TypeKind::Array {
+            element: I32,
+            length: 0,
+        },
+        0,
+    );
+    arr0.layout.zst = true;
+    arr0.js.is_indirect = true;
+    interns.intern_type(arr0);
+
+    let mut ref_arr0 = descriptor(
+        REF_ARRAY_0,
+        TypeKind::Reference {
+            pointee: ARRAY_0,
+            mutable: false,
+        },
+        4,
+    );
+    ref_arr0.js.pointer_form = Some(PointerForm::Thin);
+    interns.intern_type(ref_arr0);
+
+    let mut raw_arr0 = descriptor(
+        RAW_ARRAY_0,
+        TypeKind::RawPointer {
+            pointee: ARRAY_0,
+            mutable: false,
+        },
+        4,
+    );
+    raw_arr0.js.pointer_form = Some(PointerForm::Thin);
+    interns.intern_type(raw_arr0);
+
+    let e = FuncBuilder::ENTRY;
+
+    // 1. Mutable subslice `&mut (*a)[1..3]` from `&mut [i32; 4]` (both `from_end` modes).
+    for (idx, (to, from_end)) in [(3u64, false), (1u64, true)].into_iter().enumerate() {
+        let mut b = FuncBuilder::new(
+            item(1 + idx as u64),
+            signature(vec![MUT_REF_ARRAY], MUT_REF_ARRAY_2),
+        );
+        let a = b.param(MUT_REF_ARRAY, NO_ORIGIN);
+        let mid = b.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Value(a),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Subslice {
+                        from: 1,
+                        to,
+                        from_end,
+                    },
+                ],
+                mutable: true,
+            },
+            MUT_REF_ARRAY_2,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(mid)));
+        let f = b.finish();
+        let pl = plan_of(&f, &[(0, "a")]);
+        let js = lower(
+            &interns,
+            "mut_mid",
+            &[],
+            &body_of(BodyKind::Function, f.sig.clone()),
+            &f,
+            &pl,
+            straight(&f),
+        );
+        assert!(
+            js.contains(
+                "__rt.array_ref(($t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2)"
+            ),
+            "{js}"
+        );
+        assert!(!js.contains(".slice("), "{js}");
+    }
+
+    // 2. Mutable subslice directly on a local `[i32; 4]` value.
+    let mut b2 = FuncBuilder::new(item(3), signature(vec![ARRAY], MUT_REF_ARRAY_2));
+    let local = b2.param(ARRAY, NO_ORIGIN);
+    let local_mid = b2.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(local),
+            path: vec![Proj::Subslice {
+                from: 1,
+                to: 1,
+                from_end: true,
+            }],
+            mutable: true,
+        },
+        MUT_REF_ARRAY_2,
+        NO_ORIGIN,
+    );
+    b2.terminate(e, RTerm::Return(Some(local_mid)));
+    let f2 = b2.finish();
+    let pl2 = plan_of(&f2, &[(0, "arr")]);
+    let js2 = lower(
+        &interns,
+        "local_mid",
+        &[],
+        &body_of(BodyKind::Function, f2.sig.clone()),
+        &f2,
+        &pl2,
+        straight(&f2),
+    );
+    assert!(
+        js2.contains(
+            "__rt.array_ref(($t0 = __rt.unwindow(arr), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2)"
+        ),
+        "{js2}"
+    );
+    assert!(!js2.contains(".slice("), "{js2}");
+
+    // 3. Raw pointer `&raw mut (*a)[1..3]` returns the window slot directly (not `__rt.box(.slice)`).
+    let mut b3 = FuncBuilder::new(item(4), signature(vec![MUT_REF_ARRAY], RAW_MUT_ARRAY_2));
+    let a3 = b3.param(MUT_REF_ARRAY, NO_ORIGIN);
+    let raw_mid = b3.op(
+        e,
+        OpKind::RawView {
+            root: Root::Value(a3),
+            path: vec![
+                Proj::Deref,
+                Proj::Subslice {
+                    from: 1,
+                    to: 1,
+                    from_end: true,
+                },
+            ],
+            mutable: true,
+        },
+        RAW_MUT_ARRAY_2,
+        NO_ORIGIN,
+    );
+    b3.terminate(e, RTerm::Return(Some(raw_mid)));
+    let f3 = b3.finish();
+    let pl3 = plan_of(&f3, &[(0, "a")]);
+    let js3 = lower(
+        &interns,
+        "raw_mid",
+        &[],
+        &body_of(BodyKind::Function, f3.sig.clone()),
+        &f3,
+        &pl3,
+        straight(&f3),
+    );
+    assert!(
+        js3.contains("return $t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 1, w: 2 };"),
+        "{js3}"
+    );
+    assert!(!js3.contains("__rt.box("), "{js3}");
+
+    // 4. Empty subslice `&(*a)[2..2]` and `&raw const (*a)[2..2]` emit zero-width `array_ref`.
+    for (idx, is_raw) in [(5u64, false), (6u64, true)] {
+        let ret_ty = if is_raw { RAW_ARRAY_0 } else { REF_ARRAY_0 };
+        let mut b4 = FuncBuilder::new(item(idx), signature(vec![REF_ARRAY], ret_ty));
+        let a4 = b4.param(REF_ARRAY, NO_ORIGIN);
+        let kind = if is_raw {
+            OpKind::RawView {
+                root: Root::Value(a4),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Subslice {
+                        from: 2,
+                        to: 2,
+                        from_end: true,
+                    },
+                ],
+                mutable: false,
+            }
+        } else {
+            OpKind::BorrowView {
+                root: Root::Value(a4),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Subslice {
+                        from: 2,
+                        to: 2,
+                        from_end: true,
+                    },
+                ],
+                mutable: false,
+            }
+        };
+        let empty = b4.op(e, kind, ret_ty, NO_ORIGIN);
+        b4.terminate(e, RTerm::Return(Some(empty)));
+        let f4 = b4.finish();
+        let pl4 = plan_of(&f4, &[(0, "a")]);
+        let js4 = lower(
+            &interns,
+            "empty_sub",
+            &[],
+            &body_of(BodyKind::Function, f4.sig.clone()),
+            &f4,
+            &pl4,
+            straight(&f4),
+        );
+        assert!(
+            js4.contains(
+                "__rt.array_ref(($t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 2, w: 0 }), 0)"
+            ),
+            "{js4}"
+        );
+    }
+
+    // 5. By-value read `(*a)[1..3]` uses `__rt.read_array` to produce a detached array copy.
+    let mut b5 = FuncBuilder::new(item(7), signature(vec![REF_ARRAY], ARRAY_2));
+    let a5 = b5.param(REF_ARRAY, NO_ORIGIN);
+    let view5 = b5.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(a5),
+            path: vec![
+                Proj::Deref,
+                Proj::Subslice {
+                    from: 1,
+                    to: 1,
+                    from_end: true,
+                },
+            ],
+            mutable: false,
+        },
+        MUT_REF_ARRAY_2,
+        NO_ORIGIN,
+    );
+    let val5 = b5.op(e, OpKind::Deref(view5), ARRAY_2, NO_ORIGIN);
+    let copy5 = b5.op(e, OpKind::Copy(val5), ARRAY_2, NO_ORIGIN);
+    b5.terminate(e, RTerm::Return(Some(copy5)));
+    let f5 = b5.finish();
+    let pl5 = plan_of(&f5, &[(0, "a")]);
+    let js5 = lower(
+        &interns,
+        "copy_mid",
+        &[],
+        &body_of(BodyKind::Function, f5.sig.clone()),
+        &f5,
+        &pl5,
+        straight(&f5),
+    );
+    assert!(
+        js5.contains(
+            "__rt.read_array(($t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2).slice()"
+        ),
+        "{js5}"
+    );
+}
+
 mod invoke;

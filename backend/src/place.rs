@@ -354,37 +354,51 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     ty = subslice_ty;
                     variant = None;
                 }
-                PlaceElem::Subslice { from, to, from_end } => match current {
-                    JsPlace::Array(pointer, length) => {
-                        let end = if from_end {
-                            length.saturating_sub(to)
-                        } else {
-                            to
-                        };
-                        let sub_len = end.saturating_sub(from);
-                        let element = self.element_ty(ty);
-                        let (setup, slot) = ptr::reread(
-                            self,
-                            jsast::rt_call("unwindow", vec![pointer]),
-                            &[ptr::BUF, ptr::OFF],
-                        );
-                        let window = ptr::window_slot(
-                            ptr::slot_buf(slot.clone()),
-                            offset(ptr::slot_off(slot), jsast::num(from as f64)),
-                            sub_len,
-                        );
-                        current = JsPlace::Array(ptr::sequenced(setup, window), sub_len);
-                        ty = Ty::new_array(self.tcx, element, sub_len);
-                        variant = None;
+                PlaceElem::Subslice { from, to, from_end } => {
+                    let array_source = match current {
+                        JsPlace::Array(pointer, length) => {
+                            Ok((pointer, length, self.element_ty(ty)))
+                        }
+                        other => match ty.kind() {
+                            ty::Array(element, size) => Ok((
+                                self.read(&other),
+                                size.try_to_target_usize(self.tcx).unwrap_or(0),
+                                self.monomorphize(*element),
+                            )),
+                            _ => Err(other),
+                        },
+                    };
+                    match array_source {
+                        Ok((source, length, element)) => {
+                            let end = if from_end {
+                                length.saturating_sub(to)
+                            } else {
+                                to
+                            };
+                            let sub_len = end.saturating_sub(from);
+                            let (setup, slot) = ptr::reread(
+                                self,
+                                jsast::rt_call("unwindow", vec![source]),
+                                &[ptr::BUF, ptr::OFF],
+                            );
+                            let window = ptr::window_slot(
+                                ptr::slot_buf(slot.clone()),
+                                offset(ptr::slot_off(slot), jsast::num(from as f64)),
+                                sub_len,
+                            );
+                            current = JsPlace::Array(ptr::sequenced(setup, window), sub_len);
+                            ty = Ty::new_array(self.tcx, element, sub_len);
+                            variant = None;
+                        }
+                        Err(other) => {
+                            let base = self.read(&other);
+                            let (value, subslice_ty) = self.subslice(ty, base, from, to, from_end);
+                            current = JsPlace::Deref(value);
+                            ty = subslice_ty;
+                            variant = None;
+                        }
                     }
-                    _ => {
-                        let base = self.read(&current);
-                        let (value, subslice_ty) = self.subslice(ty, base, from, to, from_end);
-                        current = JsPlace::Deref(value);
-                        ty = subslice_ty;
-                        variant = None;
-                    }
-                },
+                }
                 // Neither produces JavaScript of its own, so the place -- and the metadata of the
                 // fat pointer it came through -- is exactly what it was.
                 PlaceElem::Downcast(_, index) => {
@@ -785,6 +799,12 @@ impl<'tcx> FnCx<'_, 'tcx> {
         }
         if let JsPlace::Unit(address) = walk.place {
             return address;
+        }
+        // An empty subslice of a non-ZST array (`[T; 0]`) still carries its parent buffer and
+        // offset as a zero-width element view so `as_ptr` / `ptr::eq` / `*const T` casts keep the
+        // element's identity.
+        if let JsPlace::Array(pointer, 0) = walk.place {
+            return jsast::rt_call("array_ref", vec![pointer, jsast::num(0)]);
         }
         // `str`, a zero sized pointee: no slot form to build.
         if !ptr::is_slot_pointee(self.tcx, walk.ty) {

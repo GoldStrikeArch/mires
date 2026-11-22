@@ -1356,6 +1356,16 @@ impl<'a> Collector<'a> {
                             None,
                             InfReason::UnsupportedOperation,
                         );
+                        if let Some(result) = result {
+                            self.mark(
+                                name,
+                                Site::Value(result),
+                                cx.ty(result),
+                                types,
+                                None,
+                                InfReason::UnsupportedOperation,
+                            );
+                        }
                         if *mutable {
                             self.mark_mut(name, site, root_ty, types, None);
                         }
@@ -4810,5 +4820,56 @@ mod tests {
         let graph = prog.collect();
         assert!(reasons_of(&graph, &value_node("f", Site::Value(view), &[]))
             .contains(&InfReason::RawProvenance));
+    }
+
+    #[test]
+    fn borrow_view_indexed_or_subslice_marks_result_unsupported() {
+        use crate::jir::types::TypeMeta;
+        let mut prog = Prog::new();
+        const ARR_STRING: TypeId = TypeId(40);
+        const REF_STRING: TypeId = TypeId(41);
+        assert!(prog.interns.types.insert(descriptor(
+            ARR_STRING,
+            TypeKind::Array {
+                element: STRING,
+                length: 3,
+            },
+            TypeMeta::default(),
+            sized(),
+        )));
+        assert!(prog.interns.types.insert(descriptor(
+            REF_STRING,
+            TypeKind::Reference {
+                pointee: STRING,
+                mutable: false,
+            },
+            TypeMeta::default(),
+            sized(),
+        )));
+        let mut b = FuncBuilder::new(item(1), sig(vec![ARR_STRING], STRING));
+        let arr = b.param(ARR_STRING, NO_ORIGIN);
+        let entry = FuncBuilder::ENTRY;
+        let view = b.op(
+            entry,
+            OpKind::BorrowView {
+                root: Root::Value(arr),
+                path: vec![Proj::ConstantIndex {
+                    offset: 0,
+                    min_length: 3,
+                    from_end: false,
+                }],
+                mutable: false,
+            },
+            REF_STRING,
+            NO_ORIGIN,
+        );
+        let elem = b.op(entry, OpKind::Deref(view), STRING, NO_ORIGIN);
+        b.terminate(entry, RTerm::Return(Some(elem)));
+        prog.add("f", b.finish());
+        let graph = prog.collect();
+        let view_node = value_node("f", Site::Value(view), &[Step::Deref]);
+        let elem_node = value_node("f", Site::Value(elem), &[]);
+        assert!(reasons_of(&graph, &view_node).contains(&InfReason::UnsupportedOperation));
+        assert!(graph.unions.contains(&(view_node, elem_node)));
     }
 }
