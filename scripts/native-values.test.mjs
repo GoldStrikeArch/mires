@@ -685,3 +685,72 @@ test("provenance-free slice addresses preserve addr, ptr_is_null, and ptr_eq", (
     (err) => rt.is_abort(err),
   );
 });
+
+test("slice_ptr_cmp and fat_ptr_cmp order by data address first and tie-break by metadata", () => {
+  // 1. Dangling ZST slices with equal address and unequal length (`slice_order.rs`).
+  const zstShort = rt.slice_from_parts(1, 1);
+  const zstLong = rt.slice_from_parts(1, 2);
+  assert.equal(rt.slice_ptr_eq(zstShort, zstLong), false);
+  assert.equal(rt.slice_ptr_cmp(zstShort, zstLong, 0), -1);
+  assert.equal(rt.slice_ptr_cmp(zstLong, zstShort, 0), 1);
+  assert.equal(rt.slice_ptr_cmp(zstShort, rt.slice_from_parts(1, 1), 0), 0);
+
+  // 2. Non-ZST slices: equal addr + unequal len, unequal addr + reversed len.
+  const arr = [10, 20, 30, 40];
+  const s01 = { buf: arr, off: 0, len: 1 };
+  const s02 = { buf: arr, off: 0, len: 2 };
+  const s11 = { buf: arr, off: 1, len: 1 };
+  const s03 = { buf: arr, off: 0, len: 3 };
+  assert.equal(rt.slice_ptr_cmp(s01, s02, 4), -1);
+  assert.equal(rt.slice_ptr_cmp(s02, s01, 4), 1);
+  assert.equal(rt.slice_ptr_cmp(s11, s03, 4), 1);
+  assert.equal(rt.slice_ptr_cmp(s03, s11, 4), -1);
+  // Bare-address slice matching s11's synthetic address tie-breaks by length using elem size 4.
+  const s11Addr = rt.addr(s11, 4);
+  const s11BareLong = rt.slice_from_parts(s11Addr, 5);
+  assert.equal(rt.slice_ptr_cmp(s11, s11BareLong, 4), -1);
+  assert.equal(rt.slice_ptr_cmp(s11BareLong, s11, 4), 1);
+
+  // 3. `*const str` / `*mut str` byte slices (elem size 1).
+  const bytes = new Uint8Array([104, 101, 108, 108, 111]);
+  const strShort = { buf: bytes, off: 0, len: 2 };
+  const strLong = { buf: bytes, off: 0, len: 4 };
+  const strTail = { buf: bytes, off: 1, len: 1 };
+  assert.equal(rt.slice_ptr_cmp(strShort, strLong, 1), -1);
+  assert.equal(rt.slice_ptr_cmp(strLong, strShort, 1), 1);
+  assert.equal(rt.slice_ptr_cmp(strTail, strLong, 1), 1);
+  assert.equal(rt.slice_ptr_cmp(strLong, strTail, 1), -1);
+
+  // 4. `*const dyn Trait`: equal data ptr with same & distinct vtables, antisymmetry & total order.
+  const objA = { x: 1 };
+  const objB = { x: 2 };
+  const vtable1 = [() => {}, 4, 4, () => 1];
+  const vtable2 = [() => {}, 4, 4, () => 2];
+  const dynList = [
+    { ptr: objA, meta: vtable1 },
+    { ptr: objA, meta: vtable2 },
+    { ptr: objB, meta: vtable1 },
+    { ptr: objB, meta: vtable2 },
+    { ptr: undefined, meta: vtable1 },
+    { ptr: undefined, meta: vtable2 },
+  ];
+  for (let i = 0; i < dynList.length; i++) {
+    assert.equal(rt.fat_ptr_cmp(dynList[i], dynList[i], 1), 0);
+    for (let j = 0; j < dynList.length; j++) {
+      const ab = rt.fat_ptr_cmp(dynList[i], dynList[j], 1);
+      const ba = rt.fat_ptr_cmp(dynList[j], dynList[i], 1);
+      const eq = rt.fat_ptr_eq(dynList[i], dynList[j]);
+      assert.equal(ab, ba === 0 ? 0 : -ba);
+      assert.equal(eq, ab === 0);
+      assert.equal(ab === 0, i === j);
+    }
+  }
+
+  // 5. Unsized struct tail `{ ptr, meta: len }`.
+  const slot = { buf: [{ hdr: 1 }], off: 0 };
+  const tail1 = { ptr: slot, meta: 1 };
+  const tail3 = { ptr: slot, meta: 3 };
+  assert.equal(rt.fat_ptr_cmp(tail1, tail3, 1), -1);
+  assert.equal(rt.fat_ptr_cmp(tail3, tail1, 1), 1);
+  assert.equal(rt.fat_ptr_cmp(tail1, { ptr: slot, meta: 1 }, 1), 0);
+});

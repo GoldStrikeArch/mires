@@ -9362,4 +9362,316 @@ fn nonnull_unique_box_str_preserve_live_fat_slice_across_transmute_deref_and_loc
     );
 }
 
+#[test]
+fn wide_ptr_ordering_dispatches_slice_ptr_cmp_and_fat_ptr_cmp() {
+    use rcgjs_object::jir::types::TransparentField;
+
+    let mut interns = world();
+
+    const RAW_SLICE_UNIT: TypeId = TypeId(720);
+    const SLICE_UNIT: TypeId = TypeId(721);
+    const RAW_SLICE_U32: TypeId = TypeId(722);
+    const SLICE_U32: TypeId = TypeId(723);
+    const RAW_CONST_STR: TypeId = TypeId(724);
+    const RAW_MUT_STR: TypeId = TypeId(725);
+    const RAW_DYN: TypeId = TypeId(726);
+    const TAIL_STRUCT: TypeId = TypeId(727);
+    const RAW_TAIL: TypeId = TypeId(728);
+
+    let mut slice_unit = descriptor(SLICE_UNIT, TypeKind::Slice(UNIT), 0);
+    slice_unit.layout.sized = false;
+    slice_unit.layout.size = None;
+    slice_unit.js.is_indirect = true;
+    interns.intern_type(slice_unit);
+    let mut raw_slice_unit = descriptor(
+        RAW_SLICE_UNIT,
+        TypeKind::RawPointer {
+            pointee: SLICE_UNIT,
+            mutable: false,
+        },
+        8,
+    );
+    raw_slice_unit.js.pointer_form = Some(PointerForm::FatSlice);
+    interns.intern_type(raw_slice_unit);
+
+    let mut slice_u32 = descriptor(SLICE_U32, TypeKind::Slice(U32), 0);
+    slice_u32.layout.sized = false;
+    slice_u32.layout.size = None;
+    slice_u32.js.is_indirect = true;
+    interns.intern_type(slice_u32);
+    let mut raw_slice_u32 = descriptor(
+        RAW_SLICE_U32,
+        TypeKind::RawPointer {
+            pointee: SLICE_U32,
+            mutable: false,
+        },
+        8,
+    );
+    raw_slice_u32.js.pointer_form = Some(PointerForm::FatSlice);
+    interns.intern_type(raw_slice_u32);
+
+    let mut raw_const_str = descriptor(
+        RAW_CONST_STR,
+        TypeKind::RawPointer {
+            pointee: STR,
+            mutable: false,
+        },
+        8,
+    );
+    raw_const_str.js.pointer_form = Some(PointerForm::FatSlice);
+    interns.intern_type(raw_const_str);
+
+    let mut raw_mut_str = descriptor(
+        RAW_MUT_STR,
+        TypeKind::RawPointer {
+            pointee: STR,
+            mutable: true,
+        },
+        8,
+    );
+    raw_mut_str.js.pointer_form = Some(PointerForm::FatSlice);
+    interns.intern_type(raw_mut_str);
+
+    let mut raw_dyn = descriptor(
+        RAW_DYN,
+        TypeKind::RawPointer {
+            pointee: DYNAMIC,
+            mutable: false,
+        },
+        8,
+    );
+    raw_dyn.js.pointer_form = Some(PointerForm::FatDyn);
+    interns.intern_type(raw_dyn);
+
+    let hdr_key = FieldKey::Name(interns.intern_str("hdr"));
+    let tail_key = FieldKey::Name(interns.intern_str("tail"));
+    let mut tail_struct = descriptor(
+        TAIL_STRUCT,
+        TypeKind::Adt {
+            def: def(727),
+            args: Vec::new(),
+            form: NominalForm::Struct,
+            variants: vec![VariantDescriptor {
+                name: interns.intern_str("MySlice"),
+                fields: vec![
+                    FieldDescriptor {
+                        key: hdr_key,
+                        ty: U32,
+                        offset: 0,
+                    },
+                    FieldDescriptor {
+                        key: tail_key,
+                        ty: SLICE_U32,
+                        offset: 4,
+                    },
+                ],
+                logical_discr: 0,
+                physical_tag: None,
+                result_ok: false,
+                saved_local_keys: Vec::new(),
+            }],
+            niche: None,
+        },
+        0,
+    );
+    tail_struct.layout.sized = false;
+    tail_struct.layout.size = None;
+    tail_struct.js.is_indirect = true;
+    tail_struct.js.unsized_tail = Some(TransparentField {
+        field: 1,
+        ty: SLICE_U32,
+    });
+    interns.intern_type(tail_struct);
+    let mut raw_tail = descriptor(
+        RAW_TAIL,
+        TypeKind::RawPointer {
+            pointee: TAIL_STRUCT,
+            mutable: false,
+        },
+        8,
+    );
+    raw_tail.js.pointer_form = Some(PointerForm::FatTail);
+    interns.intern_type(raw_tail);
+
+    let cases = [
+        (
+            1,
+            "zst_slice_lt",
+            RAW_SLICE_UNIT,
+            BinaryOp::Lt,
+            "__rt.slice_ptr_cmp(a, b, 0) < 0",
+        ),
+        (
+            2,
+            "u32_slice_gt",
+            RAW_SLICE_U32,
+            BinaryOp::Gt,
+            "__rt.slice_ptr_cmp(a, b, 4) > 0",
+        ),
+        (
+            3,
+            "const_str_le",
+            RAW_CONST_STR,
+            BinaryOp::Le,
+            "__rt.slice_ptr_cmp(a, b, 1) <= 0",
+        ),
+        (
+            4,
+            "mut_str_ge",
+            RAW_MUT_STR,
+            BinaryOp::Ge,
+            "__rt.slice_ptr_cmp(a, b, 1) >= 0",
+        ),
+        (
+            5,
+            "dyn_lt",
+            RAW_DYN,
+            BinaryOp::Lt,
+            "__rt.fat_ptr_cmp(a, b, 1) < 0",
+        ),
+        (
+            6,
+            "tail_lt",
+            RAW_TAIL,
+            BinaryOp::Lt,
+            "__rt.fat_ptr_cmp(a, b, 1) < 0",
+        ),
+    ];
+
+    for (idx, name, ptr_ty, op, expected_expr) in cases {
+        let mut b = FuncBuilder::new(item(idx), signature(vec![ptr_ty, ptr_ty], BOOL));
+        let a = b.param(ptr_ty, NO_ORIGIN);
+        let c = b.param(ptr_ty, NO_ORIGIN);
+        let e = FuncBuilder::ENTRY;
+        let out = b.op(
+            e,
+            OpKind::Binary {
+                op,
+                l: a,
+                r: c,
+                ty: ptr_ty,
+            },
+            BOOL,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let f = b.finish();
+        let p = plan_of(&f, &[(0, "a"), (1, "b")]);
+        let body = body_of(BodyKind::Function, f.sig.clone());
+        assert_eq!(
+            lower(&interns, name, &[], &body, &f, &p, straight(&f)),
+            format!("function {name}(a, b) {{\n  return {expected_expr};\n}}\n")
+        );
+    }
+}
+
+#[test]
+fn transmute_rebuild_preserves_zst_padded_tuple_arity_and_index() {
+    let mut interns = world();
+
+    const PADDED_TUPLE: TypeId = TypeId(740);
+    const NESTED_TUPLE: TypeId = TypeId(741);
+    const ARRAY_ONE_U32: TypeId = TypeId(742);
+    const PADDED_ARRAY_TUPLE: TypeId = TypeId(743);
+
+    // `((), u32, ())`
+    let mut padded = descriptor(PADDED_TUPLE, TypeKind::Tuple(vec![UNIT, U32, UNIT]), 4);
+    padded.js.is_indirect = true;
+    padded.js.fields = vec![
+        field(FieldKey::Index(0), UNIT),
+        field(FieldKey::Index(1), U32),
+        field(FieldKey::Index(2), UNIT),
+    ];
+    interns.intern_type(padded);
+
+    // `((), (), ((), u32, ()))`
+    let mut nested = descriptor(
+        NESTED_TUPLE,
+        TypeKind::Tuple(vec![UNIT, UNIT, PADDED_TUPLE]),
+        4,
+    );
+    nested.js.is_indirect = true;
+    nested.js.fields = vec![
+        field(FieldKey::Index(0), UNIT),
+        field(FieldKey::Index(1), UNIT),
+        field(FieldKey::Index(2), PADDED_TUPLE),
+    ];
+    interns.intern_type(nested);
+
+    // `[u32; 1]` and `((), [u32; 1], ())`
+    let mut arr1 = descriptor(
+        ARRAY_ONE_U32,
+        TypeKind::Array {
+            element: U32,
+            length: 1,
+        },
+        4,
+    );
+    arr1.js.is_indirect = true;
+    arr1.js.fields = vec![field(FieldKey::Index(0), U32)];
+    interns.intern_type(arr1);
+
+    let mut padded_arr = descriptor(
+        PADDED_ARRAY_TUPLE,
+        TypeKind::Tuple(vec![UNIT, ARRAY_ONE_U32, UNIT]),
+        4,
+    );
+    padded_arr.js.is_indirect = true;
+    padded_arr.js.fields = vec![
+        field(FieldKey::Index(0), UNIT),
+        field(FieldKey::Index(1), ARRAY_ONE_U32),
+        field(FieldKey::Index(2), UNIT),
+    ];
+    interns.intern_type(padded_arr);
+
+    let cases = [
+        (
+            1,
+            "decode_padded",
+            U32,
+            PADDED_TUPLE,
+            "[undefined, x, undefined]",
+        ),
+        (
+            2,
+            "decode_nested",
+            U32,
+            NESTED_TUPLE,
+            "[undefined, undefined, [undefined, x, undefined]]",
+        ),
+        (
+            3,
+            "decode_padded_arr",
+            U32,
+            PADDED_ARRAY_TUPLE,
+            "[undefined, [x], undefined]",
+        ),
+    ];
+
+    for (idx, name, from_ty, to_ty, expected) in cases {
+        let mut b = FuncBuilder::new(item(idx), signature(vec![from_ty], to_ty));
+        let x = b.param(from_ty, NO_ORIGIN);
+        let e = FuncBuilder::ENTRY;
+        let out = b.op(
+            e,
+            OpKind::Cast {
+                kind: CastKind::Transmute,
+                v: x,
+                from: from_ty,
+                to: to_ty,
+            },
+            to_ty,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(out)));
+        let f = b.finish();
+        let p = plan_of(&f, &[(0, "x")]);
+        let body = body_of(BodyKind::Function, f.sig.clone());
+        assert_eq!(
+            lower(&interns, name, &[], &body, &f, &p, straight(&f)),
+            format!("function {name}(x) {{\n  return {expected};\n}}\n")
+        );
+    }
+}
+
 mod invoke;

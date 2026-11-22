@@ -2472,19 +2472,31 @@ fn target_wrappers<'tcx>(
 ) -> (Ty<'tcx>, impl Fn(Expr) -> Expr) {
     let mut wrappers = Vec::new();
     for _ in 0..16 {
-        let Some((inner_ty, key)) = sole_field(fx, ty) else {
+        let Some((inner_ty, key, arity)) = sole_field_with_arity(fx, ty) else {
             break;
         };
-        wrappers.push(key);
+        wrappers.push((key, arity));
         ty = inner_ty;
     }
     let rebuild = move |mut value: Expr| {
-        for key in wrappers.iter().rev() {
+        for (key, arity) in wrappers.iter().rev() {
             value = match key {
                 // A struct is an object keyed by field name; the zero sized fields that were
                 // skipped are `undefined`, which is what reading a missing key gives anyway.
                 value::FieldKey::Name(name) => jsast::object(vec![(name.clone(), value)]),
-                value::FieldKey::Index(_) => jsast::array(vec![value]),
+                value::FieldKey::Index(idx) => {
+                    let len = (*arity).max(*idx + 1);
+                    let mut elems = Vec::with_capacity(len);
+                    let mut val = Some(value);
+                    for i in 0..len {
+                        elems.push(if i == *idx {
+                            val.take().expect("idx < len")
+                        } else {
+                            jsast::undefined()
+                        });
+                    }
+                    jsast::array(elems)
+                }
                 // A transparent union is its field: there is no wrapper to put back.
                 value::FieldKey::Transparent => value,
             };
@@ -2505,6 +2517,16 @@ pub(crate) fn sole_field<'tcx>(
     fx: &FnCx<'_, 'tcx>,
     ty: Ty<'tcx>,
 ) -> Option<(Ty<'tcx>, value::FieldKey)> {
+    sole_field_with_arity(fx, ty).map(|(field_ty, key, _)| (field_ty, key))
+}
+
+/// Like [`sole_field`], also returning the total field count (arity) of the wrapper aggregate so
+/// indexed containers (tuples and 1-element arrays) preserve their exact length and slot position
+/// when rebuilt.
+fn sole_field_with_arity<'tcx>(
+    fx: &FnCx<'_, 'tcx>,
+    ty: Ty<'tcx>,
+) -> Option<(Ty<'tcx>, value::FieldKey, usize)> {
     let tcx = fx.tcx;
     if is_zst(tcx, ty) {
         return None;
@@ -2512,7 +2534,7 @@ pub(crate) fn sole_field<'tcx>(
     // A transparent union is represented as its field, so the field is reached by doing nothing:
     // peeling it off a value is the identity, and putting it back around one is too.
     if let Some(field_ty) = value::transparent_field(tcx, ty) {
-        return Some((field_ty, value::FieldKey::Transparent));
+        return Some((field_ty, value::FieldKey::Transparent, 1));
     }
     let ty = value::peel_pattern(ty);
     match ty.kind() {
@@ -2532,6 +2554,7 @@ pub(crate) fn sole_field<'tcx>(
             Some((
                 field_ty,
                 value::FieldKey::Name(Namer::field_name(variant, index)),
+                variant.fields.len(),
             ))
         }
         ty::Tuple(element_tys) => {
@@ -2543,10 +2566,13 @@ pub(crate) fn sole_field<'tcx>(
             if live.next().is_some() {
                 return None;
             }
-            Some((element_ty, value::FieldKey::Index(index)))
+            Some((element_ty, value::FieldKey::Index(index), element_tys.len()))
         }
-        ty::Array(element_ty, count) => (count.try_to_target_usize(tcx) == Some(1))
-            .then_some((*element_ty, value::FieldKey::Index(0))),
+        ty::Array(element_ty, count) => (count.try_to_target_usize(tcx) == Some(1)).then_some((
+            *element_ty,
+            value::FieldKey::Index(0),
+            1,
+        )),
         _ => None,
     }
 }

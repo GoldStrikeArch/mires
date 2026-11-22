@@ -718,6 +718,10 @@ globalThis.__rt.fat_ptr_eq = (a, b) =>
 // one buffer compare by offset, which is exact. Anything else falls back to the
 // synthetic addresses, which orders by buffer first and by offset within it.
 globalThis.__rt.ptr_cmp = (a, b, size) => {
+  if (a === b) {
+    globalThis.__rt._named(a, "ptr_cmp");
+    return 0;
+  }
   let aSize = size;
   let bSize = size;
   while (a !== null && typeof a === "object" && a.pr !== undefined) {
@@ -730,7 +734,8 @@ globalThis.__rt.ptr_cmp = (a, b, size) => {
   }
   if (
     a !== null && b !== null && typeof a === "object" && typeof b === "object" &&
-    a.buf === b.buf && typeof a.buf !== "number" && a.sc === b.sc && a.es === b.es &&
+    a.buf !== undefined && a.buf === b.buf && typeof a.buf !== "number" &&
+    a.sc === b.sc && a.es === b.es &&
     !(_has_byte_views && globalThis.__rt._byte_view_of.has(a.buf))
   ) {
     globalThis.__rt._named(a, "ptr_cmp");
@@ -738,6 +743,22 @@ globalThis.__rt.ptr_cmp = (a, b, size) => {
   }
   const x = globalThis.__rt.addr(a, aSize);
   const y = globalThis.__rt.addr(b, bSize);
+  return x < y ? -1 : x > y ? 1 : 0;
+};
+
+// Metadata participates in ordering of two pointers to the same unsized type:
+// data addresses compare first, and equal data addresses tie-break by metadata
+// (`len` for slices/str, vtable or tail metadata for dyn/unsized-tail pointers).
+globalThis.__rt.slice_ptr_cmp = (a, b, size) => {
+  const d = globalThis.__rt.ptr_cmp(a, b, size);
+  return d !== 0 ? d : a.len < b.len ? -1 : a.len > b.len ? 1 : 0;
+};
+globalThis.__rt.fat_ptr_cmp = (a, b, size) => {
+  const d = globalThis.__rt.ptr_cmp(a.ptr, b.ptr, size);
+  if (d !== 0) return d;
+  if (a.meta === b.meta) return 0;
+  const x = globalThis.__rt.addr(a.meta, 1);
+  const y = globalThis.__rt.addr(b.meta, 1);
   return x < y ? -1 : x > y ? 1 : 0;
 };
 

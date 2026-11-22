@@ -302,7 +302,10 @@ pub(crate) fn offset_from<'tcx>(
 ///
 /// Wide pointers compare both their data pointer and metadata.
 pub(crate) fn eq<'tcx>(fx: &FnCx<'_, 'tcx>, pointer_ty: Ty<'tcx>, lhs: Expr, rhs: Expr) -> Expr {
-    let helper = match peel_pattern(peel_transparent(fx.tcx, pointer_ty)).builtin_deref(true) {
+    let pointee = peel_pattern(peel_transparent(fx.tcx, pointer_ty))
+        .builtin_deref(true)
+        .map(|p| peel_pattern(peel_transparent(fx.tcx, p)));
+    let helper = match pointee {
         Some(pointee)
             if matches!(pointee.kind(), ty::Slice(_)) || is_mut_str_ptr(fx.tcx, pointer_ty) =>
         {
@@ -328,7 +331,8 @@ pub(crate) fn ne<'tcx>(fx: &FnCx<'_, 'tcx>, pointer_ty: Ty<'tcx>, lhs: Expr, rhs
 /// [`JsBinOp::Lt`], [`JsBinOp::Le`], [`JsBinOp::Gt`] or [`JsBinOp::Ge`].
 ///
 /// `__rt.ptr_cmp(a, b, size)` compares `off` when both sides share a buffer and their [`addr`]
-/// otherwise, returns -1, 0 or 1, and is compared against zero with `op`.
+/// otherwise, returns -1, 0 or 1, and is compared against zero with `op`. Wide pointers dispatch
+/// to `__rt.slice_ptr_cmp` or `__rt.fat_ptr_cmp` so equal data pointers tie-break on metadata.
 pub(crate) fn cmp<'tcx>(
     fx: &FnCx<'_, 'tcx>,
     pointer_ty: Ty<'tcx>,
@@ -336,13 +340,31 @@ pub(crate) fn cmp<'tcx>(
     lhs: Expr,
     rhs: Expr,
 ) -> Expr {
-    let size = peel_pattern(pointer_ty)
+    let pointee = peel_pattern(peel_transparent(fx.tcx, pointer_ty))
         .builtin_deref(true)
-        .and_then(|pointee| size_of(fx.tcx, pointee))
-        .unwrap_or(1);
+        .map(|p| peel_pattern(peel_transparent(fx.tcx, p)));
+    let (helper, size) = match pointee {
+        Some(pointee)
+            if matches!(pointee.kind(), ty::Slice(_)) || is_mut_str_ptr(fx.tcx, pointer_ty) =>
+        {
+            let elem_size = match pointee.kind() {
+                ty::Slice(elem) => size_of(fx.tcx, *elem).unwrap_or(1),
+                _ => 1,
+            };
+            ("slice_ptr_cmp", elem_size)
+        }
+        Some(pointee)
+            if matches!(pointee.kind(), ty::Dynamic(..))
+                || crate::value::unsized_tail(fx.tcx, pointee).is_some() =>
+        {
+            ("fat_ptr_cmp", 1)
+        }
+        Some(pointee) => ("ptr_cmp", size_of(fx.tcx, pointee).unwrap_or(1)),
+        None => ("ptr_cmp", 1),
+    };
     jsast::binary(
         op,
-        jsast::rt_call("ptr_cmp", vec![lhs, rhs, jsast::num(size as f64)]),
+        jsast::rt_call(helper, vec![lhs, rhs, jsast::num(size as f64)]),
         jsast::num(0),
     )
 }

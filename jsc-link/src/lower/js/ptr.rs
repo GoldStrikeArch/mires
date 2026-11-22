@@ -161,12 +161,31 @@ impl<'a> JsCx<'a> {
 
     /// `lhs < rhs` and its siblings on two pointers (`ptr.rs::cmp`).
     pub fn ptr_cmp(&self, pointer_ty: TypeId, op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
-        let size = value::pointee_of(self.table, pointer_ty)
-            .and_then(|pointee| size_of(self.table, pointee))
-            .unwrap_or(1);
+        let (helper, size) = match value::pointee_of(self.table, pointer_ty) {
+            Some(pointee)
+                if matches!(value::kind(self.table, pointee), Some(TypeKind::Slice(_)))
+                    || value::is_mut_str_ptr(self.table, pointer_ty) =>
+            {
+                let elem_size = match value::kind(self.table, pointee) {
+                    Some(TypeKind::Slice(elem)) => size_of(self.table, *elem).unwrap_or(1),
+                    _ => 1,
+                };
+                ("slice_ptr_cmp", elem_size)
+            }
+            Some(pointee)
+                if matches!(
+                    value::kind(self.table, pointee),
+                    Some(TypeKind::Dynamic { .. })
+                ) || self.table.unsized_tail(pointee).is_some() =>
+            {
+                ("fat_ptr_cmp", 1)
+            }
+            Some(pointee) => ("ptr_cmp", size_of(self.table, pointee).unwrap_or(1)),
+            None => ("ptr_cmp", 1),
+        };
         jsast::binary(
             op,
-            jsast::rt_call("ptr_cmp", vec![lhs, rhs, jsast::num(size as f64)]),
+            jsast::rt_call(helper, vec![lhs, rhs, jsast::num(size as f64)]),
             jsast::num(0),
         )
     }
@@ -1173,29 +1192,47 @@ impl<'a> JsCx<'a> {
         }
     }
 
-    /// The one non-zero-sized field of an aggregate with exactly one, with its key
-    /// (`intrinsics.rs::sole_field`).
-    pub fn sole_field(&self, ty: TypeId) -> Option<(TypeId, FieldKey)> {
+    /// Like [`Self::sole_field`], also returning the total field count (arity) of the wrapper
+    /// aggregate so indexed containers (tuples, 1-element arrays, closures) preserve their exact
+    /// length and slot position when rebuilt.
+    pub fn sole_field_with_arity(&self, ty: TypeId) -> Option<(TypeId, FieldKey, usize)> {
         let table = self.table;
         let descriptor = table.get(table.peeled(ty))?;
-        let fields: &[rcgjs_object::jir::types::FieldDescriptor] = match &descriptor.kind {
-            TypeKind::Adt {
-                form: rcgjs_object::jir::types::NominalForm::Struct,
-                variants,
-                ..
-            } => &variants.first()?.fields,
-            TypeKind::Tuple(_) | TypeKind::Closure { .. } => &descriptor.js.fields,
-            TypeKind::Array { element, length: 1 } if !table.is_zst(*element) => {
-                return Some((*element, FieldKey::Index(0)));
-            }
-            _ => return None,
-        };
+        let (fields, arity): (&[rcgjs_object::jir::types::FieldDescriptor], usize) =
+            match &descriptor.kind {
+                TypeKind::Adt {
+                    form: rcgjs_object::jir::types::NominalForm::Struct,
+                    variants,
+                    ..
+                } => {
+                    let fields = &variants.first()?.fields;
+                    (fields, fields.len())
+                }
+                TypeKind::Tuple(elems) => (
+                    &descriptor.js.fields,
+                    elems.len().max(descriptor.js.fields.len()),
+                ),
+                TypeKind::Closure { upvars, .. } => (
+                    &descriptor.js.fields,
+                    upvars.len().max(descriptor.js.fields.len()),
+                ),
+                TypeKind::Array { element, length: 1 } if !table.is_zst(*element) => {
+                    return Some((*element, FieldKey::Index(0), 1));
+                }
+                _ => return None,
+            };
         let mut live = fields.iter().filter(|field| !table.is_zst(field.ty));
         let field = live.next()?;
         if live.next().is_some() {
             return None;
         }
-        Some((field.ty, field.key))
+        Some((field.ty, field.key, arity))
+    }
+
+    /// The one non-zero-sized field of an aggregate with exactly one, with its key
+    /// (`intrinsics.rs::sole_field`).
+    pub fn sole_field(&self, ty: TypeId) -> Option<(TypeId, FieldKey)> {
+        self.sole_field_with_arity(ty).map(|(ty, key, _)| (ty, key))
     }
 
     /// An expression the caller reads `reads` off once each, and the assignment that makes that

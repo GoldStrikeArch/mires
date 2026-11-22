@@ -359,33 +359,46 @@ impl JsCx<'_> {
         (ty, value)
     }
 
-    /// The destination's wrappers: the innermost type, and the keys to put back around a value of
-    /// it, outermost first.
-    fn target_wrappers(&self, ty: TypeId) -> (TypeId, Vec<FieldKey>) {
+    /// The destination's wrappers: the innermost type, and the `(key, arity)` entries to put back
+    /// around a value of it, outermost first.
+    fn target_wrappers(&self, ty: TypeId) -> (TypeId, Vec<(FieldKey, usize)>) {
         let mut ty = ty;
         let mut wrappers = Vec::new();
         for _ in 0..16 {
-            let Some((inner, key)) = self.sole_field(ty) else {
+            let Some((inner, key, arity)) = self.sole_field_with_arity(ty) else {
                 break;
             };
-            wrappers.push(key);
+            wrappers.push((key, arity));
             ty = inner;
         }
         (ty, wrappers)
     }
 
     /// Puts the destination's wrappers back around a transmuted value.
-    fn rebuild(&self, wrappers: &[FieldKey], value: Expr) -> Expr {
+    fn rebuild(&self, wrappers: &[(FieldKey, usize)], value: Expr) -> Expr {
         let mut value = value;
-        for key in wrappers.iter().rev() {
+        for &(key, arity) in wrappers.iter().rev() {
             value = match key {
                 // A struct is an object keyed by field name; the zero sized fields that were
                 // skipped are `undefined`, which is what reading a missing key gives anyway.
-                FieldKey::Name(_) => match value::key_name(self.interns, *key) {
+                FieldKey::Name(_) => match value::key_name(self.interns, key) {
                     Some(name) => jsast::object(vec![(name, value)]),
                     None => value,
                 },
-                FieldKey::Index(_) => jsast::array(vec![value]),
+                FieldKey::Index(idx) => {
+                    let idx = idx as usize;
+                    let len = arity.max(idx + 1);
+                    let mut elems = Vec::with_capacity(len);
+                    let mut val = Some(value);
+                    for i in 0..len {
+                        elems.push(if i == idx {
+                            val.take().expect("idx < len")
+                        } else {
+                            jsast::undefined()
+                        });
+                    }
+                    jsast::array(elems)
+                }
                 // A transparent union is its field: there is no wrapper to put back.
                 FieldKey::Transparent => value,
             };

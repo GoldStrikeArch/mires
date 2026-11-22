@@ -399,7 +399,8 @@ impl Queuer<'_> {
                 // statement may write, so they may not be carried across a write.
                 (
                     Expr::Ident(name),
-                    "box" | "addr" | "ptr_eq" | "ptr_cmp" | "compare_bytes" | "offset" | "unscale"
+                    "box" | "addr" | "ptr_eq" | "slice_ptr_eq" | "fat_ptr_eq" | "ptr_cmp"
+                    | "slice_ptr_cmp" | "fat_ptr_cmp" | "compare_bytes" | "offset" | "unscale"
                     | "unwindow" | "thin" | "read_array" | "array_ref",
                 ) if name == "__rt" => Purity::Read,
                 // Everything else in the shim writes: `copy`, `copy_nonoverlapping`,

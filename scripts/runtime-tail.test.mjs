@@ -6,7 +6,7 @@ import { parse } from 'acorn';
 import { minimalShim } from './minimal-shim.mjs';
 
 const source = readFileSync(new URL('../runtime/shim.js', import.meta.url), 'utf8');
-const direct = ['alloc', 'retype_rc', 'tail_ref', 'tail_raw', 'tail_slice', 'addr', 'ptr_eq', 'dealloc', 'copy', 'copy_nonoverlapping', 'write_bytes', 'compare_bytes', 'unscale', 'alloc_zeroed', 'slice_ptr_eq', 'fat_ptr_eq'];
+const direct = ['alloc', 'retype_rc', 'tail_ref', 'tail_raw', 'tail_slice', 'addr', 'ptr_eq', 'dealloc', 'copy', 'copy_nonoverlapping', 'write_bytes', 'compare_bytes', 'unscale', 'alloc_zeroed', 'slice_ptr_eq', 'fat_ptr_eq', 'slice_ptr_cmp', 'fat_ptr_cmp'];
 const extracted = minimalShim([], source, { direct }).source;
 function verify(rt) {
   // Zero-sized accesses may use aligned dangling pointers and consume no storage.
@@ -35,10 +35,17 @@ function verify(rt) {
   const small = {buf: data, off: 0, len: 1}, large = {...small, len: 2};
   assert.equal(rt.slice_ptr_eq(small, {...small}), true);
   assert.equal(rt.slice_ptr_eq(small, large), false);
+  assert.equal(rt.slice_ptr_cmp(small, {...small}, 4), 0);
+  assert.equal(rt.slice_ptr_cmp(small, large, 4), -1);
+  assert.equal(rt.slice_ptr_cmp(large, small, 4), 1);
   const fat = {ptr: {buf: data, off: 0}, meta: 1};
   assert.equal(rt.fat_ptr_eq(fat, {ptr: {...fat.ptr}, meta: 1}), true);
   assert.equal(rt.fat_ptr_eq(fat, {...fat, meta: 2}), false);
   assert.equal(rt.fat_ptr_eq(fat, {ptr: {buf: data, off: 1}, meta: 1}), false);
+  assert.equal(rt.fat_ptr_cmp(fat, {ptr: {...fat.ptr}, meta: 1}, 1), 0);
+  assert.equal(rt.fat_ptr_cmp(fat, {...fat, meta: 2}, 1), -1);
+  assert.equal(rt.fat_ptr_cmp({...fat, meta: 2}, fat, 1), 1);
+  assert.equal(rt.fat_ptr_cmp(fat, {ptr: {buf: data, off: 1}, meta: 0}, 1), -1);
   for (const len of [0, 1, 4, 17]) {
     for (const size of [1, 4, 8]) {
       const allocated = rt.alloc(8 + len * size, 4);
@@ -96,11 +103,17 @@ test('the raw/reference identity mismatch is detected', () => {
   assert.throws(() => verify(context.__rt), assert.AssertionError);
 });
 
-test('wide-pointer equality checks detect dropped metadata', () => {
+test('wide-pointer equality and ordering checks detect dropped metadata', () => {
   for (const helper of ['slice_ptr_eq', 'fat_ptr_eq']) {
     const context = vm.createContext({TextEncoder, TextDecoder});
     vm.runInContext(source, context);
     context.__rt[helper] = () => true;
+    assert.throws(() => verify(context.__rt), assert.AssertionError);
+  }
+  for (const helper of ['slice_ptr_cmp', 'fat_ptr_cmp']) {
+    const context = vm.createContext({TextEncoder, TextDecoder});
+    vm.runInContext(source, context);
+    context.__rt[helper] = () => 0;
     assert.throws(() => verify(context.__rt), assert.AssertionError);
   }
 });
