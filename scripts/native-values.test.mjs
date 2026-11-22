@@ -395,3 +395,103 @@ test("wider scalar byte views alias little-endian bytes and non-scalar storage r
   assert.equal(rt.unscale(rawPairSlice, 8, () => ({ a: 0, b: 0 })).buf, pairTyped.buf);
   rt.dealloc(rawPairSlice, 8, 4);
 });
+
+test("retyped alloc byte arithmetic, non-scalar copy/write_bytes, and prefix polish (MIRES-008)", () => {
+  // 1. Non-scalar retyped allocation: aligned unscale, deep-cloning copy, ptr_eq/addr with bare
+  //    heap aggregate, and fail-closed write_bytes (including byte == 0) and misaligned unscale.
+  const a = rt.alloc(32, 4);
+  const p = rt.unscale(a, 8, () => ({ a: 0, b: 0 }));
+  rt._put(p.buf, 0, { a: 10, b: 11 }, true);
+  rt._put(p.buf, 1, { a: 20, b: 21 }, true);
+  rt._put(p.buf, 2, { a: 30, b: 31 }, true);
+  const a1 = { buf: a.buf, off: 8 };
+  const p1 = rt.unscale(a1, 8, () => ({ a: 0, b: 0 }));
+  assert.equal(p1.buf, p.buf);
+  assert.equal(p1.off, 1);
+  assert.equal(rt.ptr_eq(a1, p.buf[1]), true);
+  assert.equal(rt.addr(p.buf[1], 1), rt.addr(a1, 1));
+  assert.throws(
+    () => rt.unscale({ buf: a.buf, off: 4 }, 8, () => ({ a: 0, b: 0 })),
+    (err) => rt.is_abort(err) && /not a multiple of 8/.test(err.message),
+  );
+
+  const b = rt.alloc(32, 4);
+  const pb = rt.unscale(b, 8, () => ({ a: 0, b: 0 }));
+  rt.copy_nonoverlapping({ buf: b.buf, off: 16 }, a1, 8);
+  assert.deepEqual(pb.buf[2], { a: 20, b: 21 });
+  pb.buf[2].a = 999;
+  assert.equal(p.buf[1].a, 20);
+  assert.equal(rt.ptr_eq({ buf: b.buf, off: 16 }, pb.buf[2]), true);
+
+  // Overlapping copy on non-scalar alloc preserves element independence.
+  rt.copy({ buf: a.buf, off: 16 }, { buf: a.buf, off: 8 }, 16);
+  p.buf[2].a = 888;
+  assert.equal(p.buf[1].a, 20);
+
+  // write_bytes(0) fails closed on both raw non-scalar alloc proxy and scaled non-scalar pointer.
+  assert.throws(
+    () => rt.write_bytes(a1, 0, 8),
+    (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
+  );
+  assert.throws(
+    () => rt.write_bytes({ buf: rt.scale(p, 8).buf, off: 8, sc: 8 }, 0, 8),
+    (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
+  );
+  rt.dealloc(a, 32, 4);
+  rt.dealloc(b, 32, 4);
+
+  // 2. Non-fresh scalar retype guard fires at both offset 0 and non-zero offsets on fromAlloc.
+  const sa = rt.alloc(8, 2);
+  const sp = rt.unscale_scalar(sa, 2, () => 0, "u16");
+  sp.buf[0] = 11;
+  sp.buf[1] = 22;
+  assert.equal(rt.unscale_scalar({ buf: sa.buf, off: 2 }, 2, () => 0, "u16").off, 1);
+  assert.throws(
+    () => rt.unscale_scalar({ buf: sa.buf, off: 0 }, 4, () => 0, "u32"),
+    (err) => rt.is_abort(err) && /already holds 2-byte/.test(err.message),
+  );
+  assert.throws(
+    () => rt.unscale_scalar({ buf: sa.buf, off: 2 }, 4, () => 0, "u32"),
+    (err) => rt.is_abort(err) && /already holds 2-byte/.test(err.message),
+  );
+  rt.dealloc(sa, 8, 2);
+
+  // 3. align == 1 retyped allocations interpret raw byte offsets cleanly.
+  const a1u16 = rt.alloc(8, 1);
+  const p1u16 = rt.unscale_scalar(a1u16, 2, () => 0, "u16");
+  p1u16.buf[0] = 11;
+  p1u16.buf[1] = 22;
+  p1u16.buf[2] = 33;
+  assert.equal(rt.unscale_scalar({ buf: a1u16.buf, off: 2 }, 2, () => 0, "u16").off, 1);
+  const s1u16 = rt.slice_from_parts({ buf: a1u16.buf, off: 2 }, 4, 1);
+  assert.deepEqual([s1u16.buf[2], s1u16.buf[3], s1u16.buf[4], s1u16.buf[5]], [22, 0, 33, 0]);
+  rt.write_bytes({ buf: a1u16.buf, off: 2 }, 0xab, 2);
+  assert.equal(p1u16.buf[1], 0xabab);
+  rt.dealloc(a1u16, 8, 1);
+
+  // 4. Nested prefix retains outermost stride in _unwrap_view & ptr_cmp.
+  const arr = [{ inner: { x: 1, y: 2 }, z: 3n }, { inner: { x: 0x11223344, y: 5 }, z: 9n }];
+  const po = { buf: arr, off: 1 };
+  const pi = rt.prefix(po, "inner", 16);
+  const px = rt.prefix(pi, "x", 8);
+  const pbx = rt.scale_scalar(px, 4, "u32");
+  assert.equal(rt.addr(pbx, 1), rt.addr(po, 16));
+  assert.equal(rt.addr(pbx, 1), rt.addr(px, 4));
+  assert.equal(rt.ptr_eq(pbx, px), true);
+  assert.equal(rt.ptr_cmp(rt.prefix(rt.prefix({ buf: arr, off: 0 }, "inner", 16), "x", 8), px, 4), -1);
+
+  // 5. Prefix byte view cache does not mutate direct field byte view entry.
+  const w = { a: 0xdeadbeef, b: 0x12345678 };
+  const pf = rt.scale_scalar({ buf: w, off: "a" }, 4, "u32");
+  const addrBefore = rt.addr(pf, 1);
+  const pp = rt.scale_scalar(rt.prefix(rt.box(w), "a", 8), 4, "u32");
+  assert.equal(rt.addr(pf, 1), addrBefore);
+  assert.equal(rt.addr(pp, 1), rt.addr(rt.box(w), 8));
+  assert.notEqual(pf.buf, pp.buf);
+
+  // 6. ptr_eq on shared _non_scalar_byte_view (sc === undefined vs sc === 8).
+  const nsBuf = [{ a: 1, b: 2 }, { a: 3, b: 4 }];
+  const nsScaled = rt.scale({ buf: nsBuf, off: 1 }, 8);
+  const nsNoSc = { buf: nsScaled.buf, off: 8 };
+  assert.equal(rt.ptr_eq(nsScaled, nsNoSc), true);
+});

@@ -267,14 +267,7 @@ globalThis.__rt.slice_from_parts = (p, len, byte) => {
       }
       let buf = p.buf;
       if (bv.signed !== signed) {
-        buf = globalThis.__rt._byte_view(bv.buf, bv.size, bv.kind, signed, bv.key);
-        if (bv.pr !== undefined) {
-          const nbv = globalThis.__rt._byte_view_of.get(buf);
-          if (nbv !== undefined && nbv.pr === undefined) {
-            nbv.pr = bv.pr;
-            nbv.ps = bv.ps;
-          }
-        }
+        buf = globalThis.__rt._byte_view(bv.buf, bv.size, bv.kind, signed, bv.key, bv.pr, bv.ps);
       }
       return { buf, off: p.off, len };
     }
@@ -298,14 +291,15 @@ globalThis.__rt.slice_from_parts = (p, len, byte) => {
           ));
         }
       }
-      const view = globalThis.__rt._byte_view(p.buf, p.es, p.sk, signed, single ? p.off : undefined);
-      if (p.pr !== undefined) {
-        const nbv = globalThis.__rt._byte_view_of.get(view);
-        if (nbv !== undefined && nbv.pr === undefined) {
-          nbv.pr = p.pr;
-          nbv.ps = p.ps;
-        }
-      }
+      const view = globalThis.__rt._byte_view(
+        p.buf,
+        p.es,
+        p.sk,
+        signed,
+        single ? p.off : undefined,
+        p.pr,
+        p.ps,
+      );
       return { buf: view, off: boff, len };
     }
     const block = globalThis.__rt._blk_get(p.buf);
@@ -313,11 +307,11 @@ globalThis.__rt.slice_from_parts = (p, len, byte) => {
       if (block.sk === undefined) {
         return {
           buf: globalThis.__rt._non_scalar_byte_view(p.buf, block.es),
-          off: p.off * block.es,
+          off: p.off,
           len,
         };
       }
-      const boff = p.off * block.es;
+      const boff = p.off;
       if (len > 0) {
         const cap = p.buf.length * block.es;
         if (boff < 0 || boff + len > cap) {
@@ -380,12 +374,16 @@ globalThis.__rt._zst_addr = 536870912;
 // Unwraps arbitrary layers of prefix (`pr`), scalar views (`_scalar_view_of`),
 // and byte views (`_byte_view_of`) down to the underlying backing buffer.
 globalThis.__rt._unwrap_view = (p) => {
-  while (p.pr !== undefined) p = p.pr;
+  let outerPs;
+  while (p.pr !== undefined) {
+    outerPs = p.ps;
+    p = p.pr;
+  }
   let buf = p.buf;
   let off = typeof p.off === "number" ? p.off : 0;
   let key = typeof p.off === "number" ? undefined : p.off;
   let inBytes = p.sc !== undefined;
-  let es = p.sc !== undefined ? p.sc : p.es;
+  let es = p.sc !== undefined ? p.sc : (p.es !== undefined ? p.es : outerPs);
   while (typeof buf === "object" && buf !== null) {
     const scalar = globalThis.__rt._scalar_view_of.get(buf);
     if (scalar !== undefined) {
@@ -429,6 +427,13 @@ globalThis.__rt.addr = (p, size) => {
   if (p === null) return 0;
   if (p === undefined) return globalThis.__rt._zst_addr;
   if (p.pr !== undefined) return globalThis.__rt.addr(p.pr, p.ps);
+  if (typeof p === "object" && !("buf" in p)) {
+    const slot = globalThis.__rt._boxes.get(p);
+    if (slot !== undefined && slot.buf[slot.off] === p) {
+      const block = globalThis.__rt._blk_get(slot.buf);
+      if (block !== undefined) return globalThis.__rt.addr(slot, block.es);
+    }
+  }
   globalThis.__rt._named(p, "addr");
   const u = globalThis.__rt._unwrap_view(p);
   const key = typeof u.buf === "object" && u.buf !== null ? u.buf : p;
@@ -612,10 +617,25 @@ globalThis.__rt.ptr_eq = (a, b) => {
   if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
   globalThis.__rt._named(a, "ptr_eq");
   globalThis.__rt._named(b, "ptr_eq");
-  if (!("buf" in a) || !("buf" in b)) return false;
+  const aSlot = "buf" in a;
+  const bSlot = "buf" in b;
+  if (!aSlot && !bSlot) return false;
+  if (!aSlot) {
+    const slot = globalThis.__rt._boxes.get(a);
+    if (slot === undefined || slot.buf[slot.off] !== a) return false;
+    a = slot;
+  }
+  if (!bSlot) {
+    const slot = globalThis.__rt._boxes.get(b);
+    if (slot === undefined || slot.buf[slot.off] !== b) return false;
+    b = slot;
+  }
   const left = a.pr === undefined ? a : a.pr;
   const right = b.pr === undefined ? b : b.pr;
-  if (left.buf === right.buf && left.pr === undefined && right.pr === undefined) {
+  if (
+    left.buf === right.buf && left.pr === undefined && right.pr === undefined &&
+    !(_has_byte_views && globalThis.__rt._byte_view_of.has(left.buf))
+  ) {
     return left.off === right.off && a.sc === b.sc;
   }
   const lu = globalThis.__rt._unwrap_view(a);
@@ -641,15 +661,23 @@ globalThis.__rt.fat_ptr_eq = (a, b) =>
 // one buffer compare by offset, which is exact. Anything else falls back to the
 // synthetic addresses, which orders by buffer first and by offset within it.
 globalThis.__rt.ptr_cmp = (a, b, size) => {
-  if (a !== null && typeof a === "object" && a.pr !== undefined) a = a.pr;
-  if (b !== null && typeof b === "object" && b.pr !== undefined) b = b.pr;
+  let aSize = size;
+  let bSize = size;
+  while (a !== null && typeof a === "object" && a.pr !== undefined) {
+    aSize = a.ps;
+    a = a.pr;
+  }
+  while (b !== null && typeof b === "object" && b.pr !== undefined) {
+    bSize = b.ps;
+    b = b.pr;
+  }
   if (a !== null && b !== null && typeof a === "object" && typeof b === "object"
-      && a.buf === b.buf) {
+      && a.buf === b.buf && !(_has_byte_views && globalThis.__rt._byte_view_of.has(a.buf))) {
     globalThis.__rt._named(a, "ptr_cmp");
     return a.off < b.off ? -1 : a.off > b.off ? 1 : 0;
   }
-  const x = globalThis.__rt.addr(a, size);
-  const y = globalThis.__rt.addr(b, size);
+  const x = globalThis.__rt.addr(a, aSize);
+  const y = globalThis.__rt.addr(b, bSize);
   return x < y ? -1 : x > y ? 1 : 0;
 };
 
@@ -747,6 +775,62 @@ globalThis.__rt._scales = (a, b, op) => {
   }
 };
 
+// Normalizes a non-scalar byte proxy (retyped `_alloc_byte_proxy` or
+// `_non_scalar_byte_view` without `sc`) into a scaled slot over its backing array.
+globalThis.__rt._ns_slot = (p) => {
+  if (_has_byte_views && p !== null && typeof p === "object" && p.sc === undefined) {
+    const bv = globalThis.__rt._byte_view_of.get(p.buf);
+    if (bv !== undefined && !bv.alloc && !bv.hdr && bv.kind === null) {
+      if (bv.buf.length === 0) globalThis.__rt._heap_block(bv.buf);
+      return { buf: bv.buf, off: p.off, sc: bv.size };
+    }
+  }
+  return p;
+};
+
+// Deep-clones an owned aggregate copied through a scaled `*mut u8` byte view
+// (where the compiler cannot emit a typed `clone` callback) while keeping
+// pointer/slot records and heap/host objects intact.
+globalThis.__rt._clone_owned = (v) => {
+  if (v === null || typeof v !== "object") return v;
+  if ("buf" in v || "ptr" in v) return v;
+  if (
+    globalThis.__rt._blk_get(v) !== undefined ||
+    (_has_byte_views && globalThis.__rt._byte_view_of.has(v)) ||
+    globalThis.__rt._scalar_view_of.has(v) ||
+    globalThis.__rt._dangling_of.has(v) ||
+    ArrayBuffer.isView(v) ||
+    v instanceof Map ||
+    v instanceof Set
+  ) {
+    return v;
+  }
+  if (Array.isArray(v)) return v.map(globalThis.__rt._clone_owned);
+  const out = {};
+  for (const key in v) out[key] = globalThis.__rt._clone_owned(v[key]);
+  return out;
+};
+
+globalThis.__rt._put_scaled = (dBuf, dOff, sBuf, sOff, dIsHeap) => {
+  let v = sBuf[sOff];
+  if (v !== null && typeof v === "object") {
+    const sbox = globalThis.__rt._boxes.get(v);
+    if (sbox !== undefined && sbox.buf === sBuf && sbox.off === sOff) {
+      v = globalThis.__rt._clone_owned(v);
+    } else if (dIsHeap) {
+      const old = dBuf[dOff];
+      if (old !== null && typeof old === "object") {
+        const dbox = globalThis.__rt._boxes.get(old);
+        if (dbox === undefined || dbox.buf !== dBuf || dbox.off !== dOff) {
+          dBuf[dOff] = v;
+          return;
+        }
+      }
+    }
+  }
+  globalThis.__rt._put(dBuf, dOff, v, dIsHeap);
+};
+
 // copy(dst, src, count): moves `count` elements, correct when the two ranges
 // overlap, which is `ptr::copy` and `slice::copy_within`. `clone` is present
 // when an element is an aggregate held by value: a byte for byte copy produces
@@ -759,10 +843,12 @@ globalThis.__rt._scales = (a, b, op) => {
 // is above. Which store each element gets is `_rebinds`.
 globalThis.__rt.copy = (dst, src, count, clone) => {
   if (count === 0) return;
+  dst = globalThis.__rt._ns_slot(dst);
+  src = globalThis.__rt._ns_slot(src);
   globalThis.__rt._scales(dst, src, "copy");
   const d = globalThis.__rt._run(dst, count, "copy");
   const s = globalThis.__rt._run(src, count, "copy");
-  if (clone === undefined && d.buf === s.buf && Array.isArray(d.buf)
+  if (clone === undefined && dst.sc === undefined && d.buf === s.buf && Array.isArray(d.buf)
       && !(_has_byte_views && globalThis.__rt._byte_view_of.has(d.buf))) {
     d.buf.copyWithin(d.off, s.off, s.off + s.n);
     return;
@@ -784,9 +870,18 @@ globalThis.__rt.copy = (dst, src, count, clone) => {
     }
     return;
   }
+  const dIsHeap = globalThis.__rt._blk_get(d.buf) !== undefined;
+  if (clone === undefined && dst.sc !== undefined) {
+    const putS = globalThis.__rt._put_scaled;
+    if (down) {
+      for (let i = s.n - 1; i >= 0; i--) putS(d.buf, d.off + i, s.buf, s.off + i, dIsHeap);
+    } else {
+      for (let i = 0; i < s.n; i++) putS(d.buf, d.off + i, s.buf, s.off + i, dIsHeap);
+    }
+    return;
+  }
   const each = clone === undefined ? (v) => v : clone;
   const put = globalThis.__rt._put;
-  const dIsHeap = globalThis.__rt._blk_get(d.buf) !== undefined;
   if (down) {
     for (let i = s.n - 1; i >= 0; i--) put(d.buf, d.off + i, each(s.buf[s.off + i]), dIsHeap);
   } else {
@@ -864,6 +959,8 @@ globalThis.__rt._put = (buf, off, value, heap) => {
 // the direction never matters.
 globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone) => {
   if (count === 0) return;
+  dst = globalThis.__rt._ns_slot(dst);
+  src = globalThis.__rt._ns_slot(src);
   globalThis.__rt._scales(dst, src, "copy_nonoverlapping");
   const d = globalThis.__rt._run(dst, count, "copy_nonoverlapping");
   const s = globalThis.__rt._run(src, count, "copy_nonoverlapping");
@@ -871,9 +968,14 @@ globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone) => {
     for (let i = 0; i < s.n; i++) d.buf[d.off + i] = s.buf[s.off + i];
     return;
   }
+  const dIsHeap = globalThis.__rt._blk_get(d.buf) !== undefined;
+  if (clone === undefined && dst.sc !== undefined) {
+    const putS = globalThis.__rt._put_scaled;
+    for (let i = 0; i < s.n; i++) putS(d.buf, d.off + i, s.buf, s.off + i, dIsHeap);
+    return;
+  }
   const each = clone === undefined ? (v) => v : clone;
   const put = globalThis.__rt._put;
-  const dIsHeap = globalThis.__rt._blk_get(d.buf) !== undefined;
   for (let i = 0; i < s.n; i++) put(d.buf, d.off + i, each(s.buf[s.off + i]), dIsHeap);
 };
 
@@ -897,11 +999,35 @@ globalThis.__rt.write_bytes = (dst, byte, count, zero) => {
       ));
     }
     value = zero;
-  } else if (dst !== null && typeof dst === "object" && dst.sc !== undefined && byte !== 0) {
-    throw __rt.abort_error(new Error(
-      "rustc_codegen_js: `write_bytes` of the byte " + byte + " over the byte view of " +
-        dst.sc + "-byte elements",
-    ));
+  } else if (dst !== null && typeof dst === "object") {
+    if (dst.sc !== undefined) {
+      throw __rt.abort_error(new Error(
+        "rustc_codegen_js: `write_bytes` of the byte " + byte + " over the byte view of " +
+          dst.sc + "-byte non-scalar elements",
+      ));
+    }
+    const bv = _has_byte_views ? globalThis.__rt._byte_view_of.get(dst.buf) : undefined;
+    if (bv !== undefined && !bv.alloc && !bv.hdr && bv.kind === null) {
+      throw __rt.abort_error(new Error(
+        "rustc_codegen_js: `write_bytes` of the byte " + byte + " over the byte view of " +
+          bv.size + "-byte non-scalar elements",
+      ));
+    }
+    if (bv === undefined && dst.buf !== undefined && dst.buf !== null) {
+      const block = globalThis.__rt._heap_block(dst.buf);
+      if (block !== undefined && block.es > 1 && block.hdr === undefined) {
+        if (block.sk === undefined) {
+          throw __rt.abort_error(new Error(
+            "rustc_codegen_js: `write_bytes` of the byte " + byte + " over the byte view of " +
+              block.es + "-byte non-scalar elements",
+          ));
+        }
+        dst = {
+          buf: globalThis.__rt._byte_view(dst.buf, block.es, block.sk, false),
+          off: dst.off,
+        };
+      }
+    }
   }
   const d = globalThis.__rt._run(dst, count, "write_bytes");
   if (Array.isArray(d.buf)) {
@@ -934,10 +1060,10 @@ globalThis.__rt._bytes = (p) => {
   if (block.sk !== undefined) {
     return {
       buf: globalThis.__rt._byte_view(p.buf, block.es, block.sk, false),
-      off: p.off * block.es,
+      off: p.off,
     };
   }
-  return { buf: p.buf, off: p.off * block.es, sc: block.es };
+  return { buf: p.buf, off: p.off, sc: block.es };
 };
 
 // compare_bytes(a, b, count): the lexicographic comparison of `count` bytes, as
@@ -1197,6 +1323,7 @@ globalThis.__rt.scale = (p, size) => {
 
 // Aliasing byte views over wider scalar buffers (`u16/i16/u32/i32/u64/i64/u128/i128/f32/f64/char`).
 globalThis.__rt._byte_views = new WeakMap();
+globalThis.__rt._prefix_byte_views = new WeakMap();
 globalThis.__rt._byte_view_of = new WeakMap();
 let _has_byte_views = false;
 
@@ -1250,7 +1377,7 @@ globalThis.__rt._byte_store = (buf, elem, lane, parts, byte) => {
   buf[elem] = parts.kind === "i" ? BigInt.asIntN(parts.bits, next) : BigInt.asUintN(parts.bits, next);
 };
 
-globalThis.__rt._byte_view = (buf, size, kind, signed, key) => {
+globalThis.__rt._byte_view = (buf, size, kind, signed, key, pr, ps) => {
   if (_has_byte_views && buf !== null && typeof buf === "object") {
     const inner = globalThis.__rt._byte_view_of.get(buf);
     if (inner !== undefined) buf = inner.buf;
@@ -1261,13 +1388,32 @@ globalThis.__rt._byte_view = (buf, size, kind, signed, key) => {
       "rustc_codegen_js: cannot form a byte view of " + kind + " storage",
     ));
   }
-  let views = globalThis.__rt._byte_views.get(buf);
-  if (views === undefined) {
-    views = new Map();
-    globalThis.__rt._byte_views.set(buf, views);
-  }
   const tag = (signed ? "i:" : "u:") + kind + (key === undefined ? "" : ":k:" + key);
-  let view = views.get(tag);
+  let views;
+  let cacheKey = tag;
+  if (pr === undefined) {
+    views = globalThis.__rt._byte_views.get(buf);
+    if (views === undefined) {
+      views = new Map();
+      globalThis.__rt._byte_views.set(buf, views);
+    }
+  } else {
+    let pmap = globalThis.__rt._prefix_byte_views.get(buf);
+    if (pmap === undefined) {
+      pmap = new WeakMap();
+      globalThis.__rt._prefix_byte_views.set(buf, pmap);
+    }
+    let top = pr;
+    while (top.pr !== undefined) top = top.pr;
+    const anchor = typeof top.buf === "object" && top.buf !== null ? top.buf : top;
+    views = pmap.get(anchor);
+    if (views === undefined) {
+      views = new Map();
+      pmap.set(anchor, views);
+    }
+    cacheKey = tag + ":p:" + top.off + ":" + ps;
+  }
+  let view = views.get(cacheKey);
   if (view !== undefined) return view;
   const load = globalThis.__rt._byte_load;
   const store = globalThis.__rt._byte_store;
@@ -1322,8 +1468,11 @@ globalThis.__rt._byte_view = (buf, size, kind, signed, key) => {
       return Reflect.has(target, prop);
     },
   });
-  views.set(tag, view);
-  globalThis.__rt._byte_view_of.set(view, { buf, size, kind, signed, key });
+  views.set(cacheKey, view);
+  const info = pr === undefined
+    ? { buf, size, kind, signed, key }
+    : { buf, size, kind, signed, key, pr, ps };
+  globalThis.__rt._byte_view_of.set(view, info);
   _has_byte_views = true;
   return view;
 };
@@ -1470,12 +1619,7 @@ globalThis.__rt.scale_scalar = (p, size, kind, signed) => {
   if (typeof p === "number") return p;
   if (p === null || p === undefined) return 0;
   if (p.pr !== undefined) {
-    const view = globalThis.__rt._byte_view(p.buf, size, kind, !!signed, p.off);
-    const bv = globalThis.__rt._byte_view_of.get(view);
-    if (bv !== undefined && bv.pr === undefined) {
-      bv.pr = p.pr;
-      bv.ps = p.ps;
-    }
+    const view = globalThis.__rt._byte_view(p.buf, size, kind, !!signed, p.off, p.pr, p.ps);
     return { buf: view, off: 0, pv: p, po: 0 };
   }
   const scalar = globalThis.__rt._scalar_view_of.get(p.buf);
@@ -1500,14 +1644,7 @@ globalThis.__rt.byte_sign = (p, signed) => {
   if (_has_byte_views && p !== null && typeof p === "object") {
     const bv = globalThis.__rt._byte_view_of.get(p.buf);
     if (bv !== undefined && !bv.alloc && !bv.hdr && bv.kind !== null && bv.signed !== signed) {
-      const view = globalThis.__rt._byte_view(bv.buf, bv.size, bv.kind, signed, bv.key);
-      if (bv.pr !== undefined) {
-        const nbv = globalThis.__rt._byte_view_of.get(view);
-        if (nbv !== undefined && nbv.pr === undefined) {
-          nbv.pr = bv.pr;
-          nbv.ps = bv.ps;
-        }
-      }
+      const view = globalThis.__rt._byte_view(bv.buf, bv.size, bv.kind, signed, bv.key, bv.pr, bv.ps);
       return p.pv !== undefined ? { buf: view, off: p.off, pv: p.pv, po: p.po } : { buf: view, off: p.off };
     }
   }
@@ -1672,22 +1809,9 @@ globalThis.__rt.unscale = (p, size, mk) => {
     return { buf: sbv === undefined ? p.buf : sbv.buf, off: p.off / size };
   }
   const bv = _has_byte_views ? globalThis.__rt._byte_view_of.get(p.buf) : undefined;
-  if (bv !== undefined) {
-    if (bv.alloc || bv.hdr) {
-      const block = globalThis.__rt._heap_block(bv.buf);
-      if (block !== undefined) return globalThis.__rt._retype(p, block, size, mk);
-    } else if (bv.kind === null) {
-      const block = globalThis.__rt._heap_block(bv.buf);
-      if (block !== undefined) {
-        if (p.off % bv.size !== 0) {
-          throw __rt.abort_error(new Error(
-            "rustc_codegen_js: byte offset " + p.off + " is not a multiple of " +
-              bv.size + ", so it does not name an element",
-          ));
-        }
-        return globalThis.__rt._retype({ buf: bv.buf, off: p.off / bv.size }, block, size, mk);
-      }
-    }
+  if (bv !== undefined && (bv.alloc || bv.hdr || bv.kind === null)) {
+    const block = globalThis.__rt._heap_block(bv.buf);
+    if (block !== undefined) return globalThis.__rt._retype(p, block, size, mk);
   }
   const block = globalThis.__rt._heap_block(p.buf);
   if (block !== undefined) return globalThis.__rt._retype(p, block, size, mk);
@@ -1711,7 +1835,7 @@ globalThis.__rt.unscale_scalar = (p, size, mk, kind) => {
         ));
       }
       if (bv.buf.length === 0) globalThis.__rt._heap_block(bv.buf);
-      if (bv.fromAlloc && bv.size !== size && p.off === 0) {
+      if (bv.fromAlloc && bv.size !== size) {
         const block = globalThis.__rt._heap_block(bv.buf);
         if (block !== undefined) return globalThis.__rt._retype(p, block, size, mk, kind);
       }
@@ -1737,6 +1861,20 @@ globalThis.__rt.unscale_scalar = (p, size, mk, kind) => {
     const block = globalThis.__rt._heap_block(rawBuf);
     if (block === undefined || (block.es === 1 && !block.fresh)) {
       return globalThis.__rt._scalar_view(bv !== undefined ? { buf: rawBuf, off: p.off } : p, size, kind);
+    }
+    if (bv === undefined && block.es === size && !block.fresh && block.hdr === undefined) {
+      if (block.sk === undefined) {
+        throw __rt.abort_error(new Error(
+          "rustc_codegen_js: cannot view " + block.es + "-byte non-scalar elements as " + kind,
+        ));
+      }
+      if (block.sk !== kind || p.off % size !== 0) {
+        return globalThis.__rt._scalar_view(
+          { buf: globalThis.__rt._byte_view(rawBuf, block.es, block.sk, false), off: p.off },
+          size,
+          kind,
+        );
+      }
     }
     return globalThis.__rt._retype(p, block, size, mk, kind);
   }
@@ -1765,18 +1903,12 @@ globalThis.__rt.thin = (p, size, signed) => {
   if (bv !== undefined && !bv.alloc && !bv.hdr) {
     if (size === 1) {
       if (bv.kind !== null && bv.signed !== !!signed) {
-        const view = globalThis.__rt._byte_view(bv.buf, bv.size, bv.kind, !!signed, bv.key);
-        if (bv.pr !== undefined) {
-          const nbv = globalThis.__rt._byte_view_of.get(view);
-          if (nbv !== undefined && nbv.pr === undefined) {
-            nbv.pr = bv.pr;
-            nbv.ps = bv.ps;
-          }
-        }
+        const view = globalThis.__rt._byte_view(bv.buf, bv.size, bv.kind, !!signed, bv.key, bv.pr, bv.ps);
         return p.pv !== undefined ? { buf: view, off: p.off, pv: p.pv, po: p.po } : { buf: view, off: p.off };
       }
       return p;
     }
+    if (bv.buf.length === 0) globalThis.__rt._heap_block(bv.buf);
     if (bv.size !== size) {
       throw __rt.abort_error(new Error(
         "rustc_codegen_js: this pointer is a byte view of " + bv.size +
@@ -1815,19 +1947,22 @@ globalThis.__rt.thin = (p, size, signed) => {
       const off = p.off * scalar.size + scalar.phase;
       const ibv = _has_byte_views ? globalThis.__rt._byte_view_of.get(scalar.buf) : undefined;
       if (ibv !== undefined && !ibv.alloc && !ibv.hdr && ibv.kind !== null && ibv.signed !== !!signed) {
-        return { buf: globalThis.__rt._byte_view(ibv.buf, ibv.size, ibv.kind, !!signed, ibv.key), off };
+        return { buf: globalThis.__rt._byte_view(ibv.buf, ibv.size, ibv.kind, !!signed, ibv.key, ibv.pr, ibv.ps), off };
       }
       return { buf: scalar.buf, off };
     }
     if (p.sk !== undefined) {
       const single = typeof p.off !== "number" || p.pr !== undefined;
-      const view = globalThis.__rt._byte_view(p.buf, p.es, p.sk, !!signed, single ? p.off : undefined);
+      const view = globalThis.__rt._byte_view(
+        p.buf,
+        p.es,
+        p.sk,
+        !!signed,
+        single ? p.off : undefined,
+        p.pr,
+        p.ps,
+      );
       if (p.pr !== undefined) {
-        const nbv = globalThis.__rt._byte_view_of.get(view);
-        if (nbv !== undefined && nbv.pr === undefined) {
-          nbv.pr = p.pr;
-          nbv.ps = p.ps;
-        }
         return { buf: view, off: 0, pv: p, po: 0 };
       }
       return { buf: view, off: single ? 0 : p.off * p.es };
@@ -1841,20 +1976,37 @@ globalThis.__rt.thin = (p, size, signed) => {
   // Already a slot -- including the provenance-less record `_named` reports on,
   // which stays as it is so that the operation that cannot answer says so.
   if ("buf" in p) {
-    if (size === 1 && bv === undefined && p.buf !== undefined && p.buf !== null) {
+    if (bv === undefined && p.buf !== undefined && p.buf !== null) {
       const block = globalThis.__rt._blk_get(p.buf);
       if (block !== undefined && block.es > 1 && block.hdr === undefined) {
-        if (block.sk !== undefined) {
+        if (size === 1) {
+          if (block.sk !== undefined) {
+            return {
+              buf: globalThis.__rt._byte_view(p.buf, block.es, block.sk, !!signed),
+              off: p.off,
+            };
+          }
           return {
-            buf: globalThis.__rt._byte_view(p.buf, block.es, block.sk, !!signed),
-            off: p.off * block.es,
+            buf: globalThis.__rt._non_scalar_byte_view(p.buf, block.es),
+            off: p.off,
+            sc: block.es,
           };
         }
-        return {
-          buf: globalThis.__rt._non_scalar_byte_view(p.buf, block.es),
-          off: p.off * block.es,
-          sc: block.es,
-        };
+        if (p.es === undefined && p.off !== 0) {
+          if (block.es !== size) {
+            throw __rt.abort_error(new Error(
+              "rustc_codegen_js: this heap block already holds " + block.es +
+                "-byte elements, so it cannot be read as " + size + "-byte ones",
+            ));
+          }
+          if (p.off % size !== 0) {
+            throw __rt.abort_error(new Error(
+              "rustc_codegen_js: byte offset " + p.off + " is not a multiple of " +
+                size + ", so it does not name an element",
+            ));
+          }
+          return { buf: p.buf, off: p.off / size };
+        }
       }
     }
     return p;
@@ -3623,7 +3775,7 @@ globalThis.__rt._retype = (p, block, size, mk, kind) => {
   // The common case by far: `RawVecInner` stores its buffer as a `*mut u8` and
   // casts it back on every single access.
   if (same && !(block.fresh && block.zeroed)) {
-    if (bv !== undefined && !bv.alloc && !bv.hdr) {
+    if (size > 1 && p.off !== 0 && (bv === undefined || (!bv.alloc && !bv.hdr))) {
       if (p.off % size !== 0) {
         throw __rt.abort_error(new Error(
           "rustc_codegen_js: byte offset " + p.off + " is not a multiple of " +
@@ -3689,7 +3841,11 @@ globalThis.__rt._retype = (p, block, size, mk, kind) => {
           "-byte elements, because this backend cannot spell a zero one",
       ));
     }
-    for (let i = 0; i < length; i++) raw[i] = mk();
+    for (let i = 0; i < length; i++) {
+      const v = mk();
+      raw[i] = v;
+      if (v !== null && typeof v === "object") globalThis.__rt._boxes.set(v, { buf: raw, off: i });
+    }
   }
   return same && bv === undefined ? p : { buf: raw, off: byte_off / size };
 };

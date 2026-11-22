@@ -914,13 +914,40 @@ retyped `RawVecInner` allocations whose `*mut u8 -> *const T -> *const u8` round
 GVN, and `NativeVec` blocks converted back to baseline `Vec`), stack arrays, single locals and
 scalar struct fields (`examples/core-tests/365_hash_primitive_slices.rs`,
 `366_byte_views_wider_scalars.rs`). Casting back to the matching scalar type (`unscale_scalar`,
-`thin`), taking `addr` or comparing with `ptr_eq` across arbitrarily layered scalar/byte views,
-reallocating or freeing the heap block, and converting between `NativeVec`/`SliceView` and baseline
-`Vec` all unwrap view layers back to the underlying buffer. Out-of-bounds byte slices or byte
+`thin`), taking `addr` or comparing with `ptr_eq` across arbitrarily layered scalar/byte views
+(including multi-level zero-offset prefix chains, whose byte views are cached separately from
+direct field views), reallocating or freeing the heap block, and converting between
+`NativeVec`/`SliceView` and baseline `Vec` all unwrap view layers back to the underlying buffer.
+Byte arithmetic on a retyped heap allocation pointer (`a.add(k)` after `let p = a as *mut T`)
+works in bytes for wider scalars (aligned/unaligned casts, single-byte reads/writes,
+`compare_bytes`, `copy`/`copy_nonoverlapping`, `write_bytes`, `slice::from_raw_parts`, `ptr::eq`,
+`addr`, `realloc`) and in aligned whole elements for non-scalar aggregates (`a.add(k * size_of::<T>())`
+casts, aligned `copy`/`copy_nonoverlapping` preserving owned aggregate independence and `&T`
+reference identity, `ptr::eq`, `addr`, `realloc`; `examples/core-tests/368_retyped_alloc_byte_arith.rs`,
+`369_retyped_alloc_non_scalar.rs`). Out-of-bounds byte slices or byte
 accesses past a flat scalar buffer (including nested arrays such as `[[u16; 2]; 2]`, whose rows are
-separate JavaScript arrays) and any byte read, byte write, or non-empty byte slice over
+separate JavaScript arrays), re-casting a raw retyped allocation pointer to a different element
+width at any offset (`guard_heap_retype`), misaligned non-scalar casts or copies, and any byte
+read, byte write, `write_bytes` (including zero fill), or non-empty byte slice over
 non-primitive aggregate storage (such as `#[repr(C)] struct Pair { a: u32, b: u32 }`) fail closed
-with a registered abort (`examples/core-tests/367_byte_view_non_scalar_abort.rs`).
+with a registered abort (`examples/core-tests/367_byte_view_non_scalar_abort.rs`,
+`370_retyped_alloc_refusals.rs`).
+
+Two unsafe-only boundaries remain on this path and are documented rather than hidden:
+- `align == 1` heap allocations (`Layout::from_size_align(n, 1)`, including `#[repr(packed)]`
+  aggregates) deliberately omit `_alloc_byte_proxy` so `Vec<u8>` and `String` stay proxy-free.
+  After such a block is retyped to `es > 1`, `unscale`/`unscale_scalar`/`thin`,
+  `slice_from_parts`, `compare_bytes`, and `write_bytes` still interpret the raw `*mut u8`
+  pointer's offset in bytes (or fail closed for non-scalars), whereas inline bare byte dereferences
+  `*(a.add(k))` (including MIR-GVN-folded `*(v.as_ptr().cast::<u8>())` on `Vec<Packed>` under
+  `inline+Oz`) and direct `copy`/`copy_nonoverlapping` on the raw `*mut u8` pointer cannot
+  distinguish byte offsets from element offsets without a proxy (derive the byte pointer via
+  `p.cast::<u8>()` instead).
+- Under `JSC_RUST_MIR_INLINE=on` with `-Oz`, rustc's MIR optimizer can collapse chained casts such
+  as `(&Wrap).cast::<u32>().cast::<u8>()` directly to `(&Wrap).cast::<u8>()` (which aborts as a
+  non-scalar byte view) and can fold `v.as_ptr().cast::<u8>()` back to `RawVecInner`'s allocation
+  pointer, routing a subsequent cast to a different scalar width through the fail-closed
+  non-fresh retype guard.
 Building a raw slice through `slice_from_parts` normalizes a dangling data address. The data half
 is asked by its value, never by its type: `with_metadata_of`, which is how `Box::clone_from_ref`
 (`Box<[T]>::from(&[T])`) rebuilds its fat pointer, hands `from_raw_parts` the data pointer as
