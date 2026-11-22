@@ -88,9 +88,12 @@ struct Walk<'tcx> {
     ty: Ty<'tcx>,
     /// The reference to an unsized pointee, including its metadata.
     identity: Option<Expr>,
-    /// Whether a `str` place was reached by dereferencing a mutable `&mut str` / `*mut str`
-    /// (represented as a live `{ buf, off, len }` byte slice rather than a JavaScript string).
+    /// Whether a `str` place was reached by dereferencing a `FatSlice` `str` pointer (`&mut str`,
+    /// `*const str`, `*mut str`, `NonNull<str>`, `Unique<str>`, `Box<str>`).
     str_mutable: bool,
+    /// Whether that `str` pointer was specifically mutable (`&mut str` / `*mut str`), so it
+    /// cannot alias a memoized `__rt.str_bytes` / `__rt.bstr_bytes` view.
+    str_from_mut: bool,
 }
 
 impl<'tcx> FnCx<'_, 'tcx> {
@@ -107,6 +110,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
         let mut variant: Option<VariantIdx> = None;
         let mut identity = None;
         let mut str_mutable = false;
+        let mut str_from_mut = false;
         // Where the tail of the struct a `Deref` of a `{ ptr, meta }` named actually lives. Only
         // the projection that reads that tail needs it, and the steps that may sit in between -- a
         // transparent field, a downcast, a cast that changes nothing -- leave the place alone and
@@ -119,6 +123,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
             identity = None;
             let carried_tail = tail.take();
             let carried_str_mutable = std::mem::take(&mut str_mutable);
+            let carried_str_from_mut = std::mem::take(&mut str_from_mut);
 
             match elem {
                 PlaceElem::Deref => {
@@ -128,6 +133,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                             ty,
                             identity: None,
                             str_mutable: false,
+                            str_from_mut: false,
                         };
                     };
                     // Nothing inside a place with no storage has storage either, and a pointer
@@ -165,6 +171,10 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         // convert when crossing to/from `&str`.
                         ty::Str => {
                             str_mutable = ptr::is_mut_str_ptr(self.tcx, ty);
+                            str_from_mut = crate::value::peel_pattern(
+                                crate::value::peel_transparent(self.tcx, ty),
+                            )
+                            .is_mutable_ptr();
                             identity = Some(value.clone());
                             JsPlace::Deref(value)
                         }
@@ -222,6 +232,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                     } else if matches!(key, FieldKey::Transparent) {
                         tail = carried_tail;
                         str_mutable = carried_str_mutable;
+                        str_from_mut = carried_str_from_mut;
                     } else if !field_ty.is_sized(self.tcx, crate::value::typing_env()) {
                         // The unsized tail of the record a `Deref` of a `{ ptr, meta }` named.
                         // Rebuilding the fat pointer the tail's type is needs the metadata and
@@ -353,6 +364,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
             ty,
             identity,
             str_mutable,
+            str_from_mut,
         }
     }
 
@@ -605,7 +617,14 @@ impl<'tcx> FnCx<'_, 'tcx> {
         if matches!(walk_shape.kind(), ty::Str) {
             let value = walk.identity.unwrap_or_else(|| self.read(&walk.place));
             return match (walk.str_mutable, mutable) {
-                (true, true) => jsast::rt_call("byte_slice_ref", vec![value]),
+                (true, true) => {
+                    let live = if walk.str_from_mut {
+                        value
+                    } else {
+                        jsast::rt_call("detach_str_memo", vec![value])
+                    };
+                    jsast::rt_call("byte_slice_ref", vec![live])
+                }
                 (true, false) => ptr::bytes_to_str(self, ptr::ByteElement, value),
                 (false, false) => value,
                 (false, true) => ptr::str_to_bytes_mut(value),
@@ -663,6 +682,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
         if matches!(walk_shape.kind(), ty::Str) {
             let value = walk.identity.unwrap_or_else(|| self.read(&walk.place));
             return match (walk.str_mutable, mutable) {
+                (true, true) if !walk.str_from_mut => {
+                    jsast::rt_call("detach_str_memo", vec![value])
+                }
                 (true, _) => value,
                 (false, true) => ptr::str_to_bytes_mut(value),
                 (false, false) => ptr::str_to_bytes(value),

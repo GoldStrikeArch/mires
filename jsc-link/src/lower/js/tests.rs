@@ -8823,7 +8823,7 @@ fn mut_str_lowering_preserves_live_slice_and_converts_on_const_boundary() {
         },
         4,
     );
-    raw_const_str.js.pointer_form = Some(PointerForm::Str);
+    raw_const_str.js.pointer_form = Some(PointerForm::FatSlice);
     interns.intern_type(raw_const_str);
     interns.intern_type(pointer(
         MUT_SLICE_U8,
@@ -9197,7 +9197,7 @@ fn nonnull_unique_box_str_preserve_live_fat_slice_across_transmute_deref_and_loc
     let body = body_of(BodyKind::Function, f.sig.clone());
     assert_eq!(
         lower(&interns, "box_deref_mut", &[], &body, &f, &pl, straight(&f)),
-        "function box_deref_mut(b) {\n  return __rt.byte_slice_ref(b);\n}\n"
+        "function box_deref_mut(b) {\n  return __rt.byte_slice_ref(__rt.detach_str_memo(b));\n}\n"
     );
 
     let mut b = FuncBuilder::new(item(4), signature(vec![BOX_STR], STR_REF));
@@ -9221,7 +9221,8 @@ fn nonnull_unique_box_str_preserve_live_fat_slice_across_transmute_deref_and_loc
         "function box_deref(b) {\n  return __rt.bytes_str(b.buf, b.off, b.len);\n}\n"
     );
 
-    // 4. NonNull<str> -> *mut u8 cast projects live { buf, off } for dealloc.
+    // 4. NonNull<str> -> *mut u8 cast detaches memoized `&str` views while preserving live heap
+    //    `{ buf, off }` for dealloc.
     let mut b = FuncBuilder::new(item(5), signature(vec![NONNULL_STR], RAW_MUT_U8));
     let nn = b.param(NONNULL_STR, NO_ORIGIN);
     let out = b.op(
@@ -9241,10 +9242,11 @@ fn nonnull_unique_box_str_preserve_live_fat_slice_across_transmute_deref_and_loc
     let body = body_of(BodyKind::Function, f.sig.clone());
     assert_eq!(
         lower(&interns, "nn_to_u8", &[], &body, &f, &pl, straight(&f)),
-        "function nn_to_u8(nn) {\n  return { buf: nn.buf, off: nn.off };\n}\n"
+        "function nn_to_u8(nn) {\n  let $t0;\n  return $t0 = __rt.detach_str_memo(nn), { buf: $t0.buf, off: $t0.off };\n}\n"
     );
 
-    // 5. Elaborated Box<str> `&raw mut (*p)` on `p: *const str` preserves live FatSlice (identity).
+    // 5. Elaborated Box<str> `&raw mut (*p)` on `p: *const str` guards against memoized `&str`
+    //    views via `__rt.detach_str_memo` while passing live heap/stack `FatSlice` through.
     let mut b = FuncBuilder::new(item(6), signature(vec![RAW_CONST_STR], RAW_MUT_STR));
     let p = b.param(RAW_CONST_STR, NO_ORIGIN);
     let out = b.op(
@@ -9271,7 +9273,92 @@ fn nonnull_unique_box_str_preserve_live_fat_slice_across_transmute_deref_and_loc
             &pl,
             straight(&f)
         ),
-        "function raw_mut_from_const_str(p) {\n  return p;\n}\n"
+        "function raw_mut_from_const_str(p) {\n  return __rt.detach_str_memo(p);\n}\n"
+    );
+
+    // 6. `*const str as *mut str` calls `__rt.detach_str_memo`, while `*mut str -> *const str`
+    //    and `*mut str -> *mut str` stay identity.
+    let mut b = FuncBuilder::new(item(7), signature(vec![RAW_CONST_STR], RAW_MUT_STR));
+    let p = b.param(RAW_CONST_STR, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PtrToPtr,
+            v: p,
+            from: RAW_CONST_STR,
+            to: RAW_MUT_STR,
+        },
+        RAW_MUT_STR,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let pl = plan_of(&f, &[(0, "p")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(
+            &interns,
+            "const_str_to_mut_str",
+            &[],
+            &body,
+            &f,
+            &pl,
+            straight(&f)
+        ),
+        "function const_str_to_mut_str(p) {\n  return __rt.detach_str_memo(p);\n}\n"
+    );
+
+    // 7. Inlined `<Box<str> as Deref>::deref` + `str::as_bytes` (`bytes_str` -> `str_to_bytes`)
+    //    must wrap the folded byte slice in `__rt.byte_slice_ref(...)` so a fresh 1-byte heap
+    //    block commits `block.fresh = false` before any downstream `unscale_scalar` (`is_ascii`).
+    const SLICE_U8: TypeId = TypeId(710);
+    const REF_SLICE_U8: TypeId = TypeId(711);
+    let mut slice_u8 = descriptor(SLICE_U8, TypeKind::Slice(U8), 0);
+    slice_u8.layout.sized = false;
+    slice_u8.layout.size = None;
+    slice_u8.js.is_indirect = true;
+    interns.intern_type(slice_u8);
+    let mut ref_slice_u8 = descriptor(
+        REF_SLICE_U8,
+        TypeKind::Reference {
+            pointee: SLICE_U8,
+            mutable: false,
+        },
+        8,
+    );
+    ref_slice_u8.js.pointer_form = Some(PointerForm::FatSlice);
+    interns.intern_type(ref_slice_u8);
+
+    let mut b = FuncBuilder::new(item(8), signature(vec![BOX_STR], REF_SLICE_U8));
+    let bx = b.param(BOX_STR, NO_ORIGIN);
+    let deref_str = b.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(bx),
+            path: vec![Proj::Deref],
+            mutable: false,
+        },
+        STR_REF,
+        NO_ORIGIN,
+    );
+    let bytes = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: deref_str,
+            from: STR_REF,
+            to: REF_SLICE_U8,
+        },
+        REF_SLICE_U8,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(bytes)));
+    let f = b.finish();
+    let pl = plan_of(&f, &[(0, "b")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(&interns, "box_as_bytes", &[], &body, &f, &pl, straight(&f)),
+        "function box_as_bytes(b) {\n  return __rt.byte_slice_ref({ buf: b.buf, off: b.off, len: b.len });\n}\n"
     );
 }
 

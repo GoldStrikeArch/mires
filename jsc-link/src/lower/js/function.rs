@@ -583,9 +583,10 @@ fn count_reads_in_expr(expr: &Expr, target: &str, policy: &LocalFusePolicy) -> u
             .iter()
             .map(|(_, v)| count_reads_in_expr(v, target, policy))
             .sum(),
-        Expr::Array(items) | Expr::Seq(items) => {
-            items.iter().map(|x| count_reads_in_expr(x, target, policy)).sum()
-        }
+        Expr::Array(items) | Expr::Seq(items) => items
+            .iter()
+            .map(|x| count_reads_in_expr(x, target, policy))
+            .sum(),
         _ => 0,
     }
 }
@@ -630,8 +631,8 @@ fn count_reads_in_stmts(stmts: &[Stmt], target: &str, policy: &LocalFusePolicy) 
                 total += count_reads_in_stmts(b, target, policy);
             }
             Stmt::While(t, b) => {
-                total +=
-                    count_reads_in_expr(t, target, policy) + count_reads_in_stmts(b, target, policy);
+                total += count_reads_in_expr(t, target, policy)
+                    + count_reads_in_stmts(b, target, policy);
             }
             Stmt::TryCatch { body, handler, .. } => {
                 total += count_reads_in_stmts(body, target, policy)
@@ -861,15 +862,18 @@ fn write_dominates_and_safe(
             ));
         }
         let nested = match stmt {
-            Stmt::If(_, a, b) => {
-                write_dominates_and_safe(a, target, total_reads, str_bytes_reads, policy).or_else(
-                    || {
-                        b.as_deref().and_then(|s| {
-                            write_dominates_and_safe(s, target, total_reads, str_bytes_reads, policy)
-                        })
-                    },
-                )
-            }
+            Stmt::If(_, a, b) => write_dominates_and_safe(
+                a,
+                target,
+                total_reads,
+                str_bytes_reads,
+                policy,
+            )
+            .or_else(|| {
+                b.as_deref().and_then(|s| {
+                    write_dominates_and_safe(s, target, total_reads, str_bytes_reads, policy)
+                })
+            }),
             Stmt::Switch(_, cases) => cases.iter().find_map(|c| {
                 write_dominates_and_safe(&c.body, target, total_reads, str_bytes_reads, policy)
             }),
@@ -1145,7 +1149,8 @@ pub(super) fn fuse_local_bytes_str(body: &mut [Stmt], locals: &HashSet<String>) 
                 if let (Some(method), Expr::Ident(arg)) = (method, &args[0]) {
                     if eligible.contains(arg) {
                         if method == "str_bytes" {
-                            *expr = Expr::Ident(arg.clone());
+                            *expr =
+                                jsast::rt_call("byte_slice_ref", vec![Expr::Ident(arg.clone())]);
                             return;
                         }
                         if method == "str_len" {
@@ -1302,7 +1307,10 @@ pub(crate) fn fold_bstr_in_bytes_stmts(stmts: &mut [Stmt]) {
     fn visit_expr(expr: &mut Expr) {
         match expr {
             Expr::Member(obj, _) | Expr::Unary(_, obj) => visit_expr(obj),
-            Expr::Index(obj, idx) | Expr::Binary(_, obj, idx) | Expr::Assign(obj, idx) | Expr::CompoundAssign(_, obj, idx) => {
+            Expr::Index(obj, idx)
+            | Expr::Binary(_, obj, idx)
+            | Expr::Assign(obj, idx)
+            | Expr::CompoundAssign(_, obj, idx) => {
                 visit_expr(obj);
                 visit_expr(idx);
             }
@@ -1509,8 +1517,7 @@ fn fuse_local_bstr_in_bytes(body: &mut [Stmt], locals: &HashSet<String>) {
     fn scan_stmts(stmts: &[Stmt], locals: &HashSet<String>, usage: &mut HashMap<String, Usage>) {
         for stmt in stmts {
             match stmt {
-                Stmt::ExprStmt(Expr::Assign(lhs, rhs))
-                    if matches!(lhs.as_ref(), Expr::Ident(n) if locals.contains(n)) =>
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) if matches!(lhs.as_ref(), Expr::Ident(n) if locals.contains(n)) =>
                 {
                     let Expr::Ident(name) = lhs.as_ref() else {
                         unreachable!()
@@ -1647,7 +1654,10 @@ fn fuse_local_bstr_in_bytes(body: &mut [Stmt], locals: &HashSet<String>) {
         }
         match expr {
             Expr::Member(obj, _) | Expr::Unary(_, obj) => rewrite_expr(obj, eligible),
-            Expr::Index(obj, idx) | Expr::Binary(_, obj, idx) | Expr::Assign(obj, idx) | Expr::CompoundAssign(_, obj, idx) => {
+            Expr::Index(obj, idx)
+            | Expr::Binary(_, obj, idx)
+            | Expr::Assign(obj, idx)
+            | Expr::CompoundAssign(_, obj, idx) => {
                 rewrite_expr(obj, eligible);
                 rewrite_expr(idx, eligible);
             }
@@ -1679,8 +1689,7 @@ fn fuse_local_bstr_in_bytes(body: &mut [Stmt], locals: &HashSet<String>) {
     fn rewrite_stmts(stmts: &mut [Stmt], eligible: &HashSet<String>) {
         for stmt in stmts {
             match stmt {
-                Stmt::ExprStmt(Expr::Assign(lhs, rhs))
-                    if matches!(lhs.as_ref(), Expr::Ident(n) if eligible.contains(n)) =>
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) if matches!(lhs.as_ref(), Expr::Ident(n) if eligible.contains(n)) =>
                 {
                     unwrap_bstr_in_rhs(rhs);
                     rewrite_expr(rhs, eligible);
@@ -1945,7 +1954,10 @@ mod tests {
         fuse_local_bstr_in_bytes(&mut impure_body, &locals);
         let printed_impure = jsast::stmt_to_string(&Stmt::Block(impure_body));
         assert!(printed_impure.contains("bstr_in"), "{printed_impure}");
-        assert!(!printed_impure.contains("bstr_utf8_bytes"), "{printed_impure}");
+        assert!(
+            !printed_impure.contains("bstr_utf8_bytes"),
+            "{printed_impure}"
+        );
 
         // Early return / conditional read / short-circuit logical op blocks fusion.
         let mut early_ret = vec![

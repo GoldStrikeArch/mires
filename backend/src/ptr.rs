@@ -1440,34 +1440,69 @@ fn str_bytes_operand(expr: Expr) -> Result<Expr, Expr> {
 /// `u8`, and `core` needs it to be: `char`'s `Debug` escapes through a buffer of `AsciiChar`, whose
 /// `as_str` is this cast. Every panic that names a `char` is downstream of that, which is
 /// `&s[a..b]` on a `str`, `contains`, `find` with a `&str` pattern, and the float formatter.
+/// Representation and mutability flags for [`cast_str_as`].
+#[derive(Clone, Copy)]
+struct StrCastMode {
+    from_fat: bool,
+    from_mut: bool,
+    to_fat: bool,
+    to_mut: bool,
+}
+
 pub(crate) fn cast_str<'tcx>(
     fx: &FnCx<'_, 'tcx>,
     from_pointee: Ty<'tcx>,
     to_pointee: Ty<'tcx>,
     value: Expr,
 ) -> Option<Expr> {
-    cast_str_as(fx, from_pointee, to_pointee, value, false, false, false)
+    cast_str_as(
+        fx,
+        from_pointee,
+        to_pointee,
+        value,
+        StrCastMode {
+            from_fat: false,
+            from_mut: false,
+            to_fat: false,
+            to_mut: false,
+        },
+    )
 }
 
 /// [`cast_str`], told the representation and mutability of both pointer types:
 /// - `&str` (`from_fat = false`) is a JavaScript string;
 /// - `&mut str`, `*const str`, `*mut str`, `NonNull<str>`, `Unique<str>`, `Box<str>`
 ///   (`from_fat = true`) are live `{ buf, off, len }` UTF-8 byte slices.
+///
+/// Crossing from an immutable `FatSlice` (`*const str` / `NonNull<str>` / `Box<str>`) to a mutable
+/// target routes through `__rt.detach_str_memo` so live heap/stack buffers pass through unchanged
+/// while memoized `&str` views detach before writes.
 fn cast_str_as<'tcx>(
     fx: &FnCx<'_, 'tcx>,
     from_pointee: Ty<'tcx>,
     to_pointee: Ty<'tcx>,
     value: Expr,
-    from_fat: bool,
-    to_fat: bool,
-    to_mut: bool,
+    mode: StrCastMode,
 ) -> Option<Expr> {
+    let StrCastMode {
+        from_fat,
+        from_mut,
+        to_fat,
+        to_mut,
+    } = mode;
     let from = peel_pattern(peel_transparent(fx.tcx, from_pointee));
     let to = peel_pattern(peel_transparent(fx.tcx, to_pointee));
     let (from_str, to_str) = (matches!(from.kind(), ty::Str), matches!(to.kind(), ty::Str));
     if !from_str && !to_str {
         return None;
     }
+    let detach_if_const_to_mut = |v: Expr| {
+        if !from_mut && to_mut {
+            jsast::rt_call("detach_str_memo", vec![v])
+        } else {
+            v
+        }
+    };
     let unsupported = || {
         fx.zombie(format!(
             "rustc_codegen_js cannot cast a pointer to `{from_pointee}` into a pointer to \
@@ -1477,7 +1512,8 @@ fn cast_str_as<'tcx>(
     };
     Some(match (from_str, to_str) {
         (true, true) => match (from_fat, to_fat) {
-            (false, false) | (true, true) => value,
+            (false, false) => value,
+            (true, true) => detach_if_const_to_mut(value),
             (true, false) => bytes_to_str(fx, ByteElement, value),
             (false, true) => {
                 if to_mut {
@@ -1488,9 +1524,9 @@ fn cast_str_as<'tcx>(
             }
         },
         (true, false) if from_fat => match to.kind() {
-            ty::Slice(element) if is_u8(fx.tcx, *element) => value,
+            ty::Slice(element) if is_u8(fx.tcx, *element) => detach_if_const_to_mut(value),
             _ if is_u8(fx.tcx, to) || is_zst(fx.tcx, to) => {
-                let (setup, s) = reread(fx, value, &[BUF, OFF]);
+                let (setup, s) = reread(fx, detach_if_const_to_mut(value), &[BUF, OFF]);
                 sequenced(setup, slot(slot_buf(s.clone()), slot_off(s)))
             }
             _ => unsupported(),
@@ -1507,7 +1543,7 @@ fn cast_str_as<'tcx>(
         },
         (false, true) => match from.kind() {
             ty::Slice(element) => match ByteElement::of(fx.tcx, *element) {
-                Some(_) if to_fat => value,
+                Some(_) if to_fat => detach_if_const_to_mut(value),
                 Some(form) => bytes_to_str(fx, form, value),
                 None => unsupported(),
             },
@@ -1532,17 +1568,21 @@ pub(crate) fn cast_str_ptr<'tcx>(
     let to_peeled = peel_pattern(peel_transparent(fx.tcx, to_ty));
     let from_pointee = from_peeled.builtin_deref(true)?;
     let to_pointee = to_peeled.builtin_deref(true)?;
-    let from_fat = matches!(from_peeled.kind(), ty::RawPtr(..)) || from_peeled.is_mutable_ptr();
-    let to_fat = matches!(to_peeled.kind(), ty::RawPtr(..)) || to_peeled.is_mutable_ptr();
+    let from_mut = from_peeled.is_mutable_ptr();
     let to_mut = to_peeled.is_mutable_ptr();
+    let from_fat = matches!(from_peeled.kind(), ty::RawPtr(..)) || from_mut;
+    let to_fat = matches!(to_peeled.kind(), ty::RawPtr(..)) || to_mut;
     cast_str_as(
         fx,
         from_pointee,
         to_pointee,
         value,
-        from_fat,
-        to_fat,
-        to_mut,
+        StrCastMode {
+            from_fat,
+            from_mut,
+            to_fat,
+            to_mut,
+        },
     )
 }
 

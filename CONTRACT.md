@@ -1191,8 +1191,11 @@ not become initialized values.
   - Casting an immutable `&str` to `*const str` (including `NonNull::from(&str)`) encodes via
     `__rt.str_bytes(s)` (`__rt.bstr_bytes(s)` under `js-str=bytes`), preserving pointer identity
     with `as_bytes().as_ptr()`; casting `&str` directly to a **mutable** `str` or byte pointer
-    allocates a fresh unmemoized `__rt.str_bytes_mut(s)` (`__rt.bstr_bytes_mut(s)`) record for
-    containment so a write through a cast-away-const pointer never mutates a memoized `&str` view.
+    allocates a fresh unmemoized `__rt.str_bytes_mut(s)` (`__rt.bstr_bytes_mut(s)`) record, and
+    crossing from an immutable `FatSlice` (`*const str`, `NonNull<str>`, `Box<str>`) to a mutable
+    target (`*mut str`, `&mut str`, `*mut [u8]`, `&mut [u8]`, `*mut u8`) passes through
+    `__rt.detach_str_memo`: live heap/stack buffers pass through unchanged while memoized `&str`
+    views detach into a fresh copy so writes never corrupt `_str_memo` / `_bstr_memo`.
 
 `ptr::cast_str` owns the whole matrix — `str` to `[u8]`, `str` to `u8`, a slice of one byte elements
 to `str`, `str` to `str`, and a zombie for anything else with a `str` on one side — and every

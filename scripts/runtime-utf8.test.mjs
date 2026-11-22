@@ -399,3 +399,39 @@ test('ASCII source tracking and 4-slot subslice ring make bytes_str -> str_bytes
   const bigRec = rt.str_bytes(bigAscii)
   assert.equal(rt.bytes_str(bigRec.buf, 100, 5000), bigAscii.slice(100, 5100))
 })
+
+test('detach_str_memo detaches memoized str_bytes/bstr_bytes views and preserves live heap/stack buffers', () => {
+  const rt = runtime(source)
+  // 1. Short UTF-16 memoized view + subslice
+  const rec = rt.str_bytes('immutable-target')
+  const detached = rt.detach_str_memo(rec)
+  assert.notEqual(detached.buf, rec.buf)
+  detached.buf[0] = 0x58 // 'X'
+  assert.equal(rt.str_bytes('immutable-target').buf[0], 0x69) // 'i'
+  assert.equal(rt.bytes_str(rec.buf, rec.off, rec.len), 'immutable-target')
+
+  const sub = { buf: rec.buf, off: 2, len: 5 }
+  const subDet = rt.detach_str_memo(sub)
+  assert.notEqual(subDet.buf, rec.buf)
+  assert.equal(subDet.off, 0)
+  assert.equal(subDet.len, 5)
+  subDet.buf[0] = 0x59
+  assert.equal(rec.buf[2], 0x6d) // 'm'
+
+  // 2. Long (>64B) js-str=bytes memoized view
+  const longBstr = 'a'.repeat(80)
+  const brec = rt.bstr_bytes(longBstr)
+  const bdet = rt.detach_str_memo(brec)
+  assert.notEqual(bdet.buf, brec.buf)
+  bdet.buf[0] = 0x5a // 'Z'
+  assert.equal(rt.bstr_bytes(longBstr).buf[0], 0x61) // 'a'
+
+  // 3. Live heap block (`Box<str>`) and plain stack buffer pass through unchanged (`===`).
+  const heap = rt.alloc(4, 1)
+  const heapSlice = rt.slice_from_parts(heap, 4, 1)
+  assert.equal(rt.detach_str_memo(heapSlice), heapSlice)
+  rt.dealloc(heap, 4, 1)
+
+  const stackSlice = { buf: [97, 98, 99], off: 0, len: 3 }
+  assert.equal(rt.detach_str_memo(stackSlice), stackSlice)
+})

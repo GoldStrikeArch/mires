@@ -313,8 +313,8 @@ impl<'a> View<'a> {
                 TypeKind::Char => return Some((root, path, DisplayKind::Char)),
                 TypeKind::Float { bits: 64 } => return Some((root, path, DisplayKind::F64)),
                 // The place holds the `str` (or the `&str` one deref up): reading it is the host
-                // string when reached through an immutable `&str` / `*const str`, NOT when
-                // dereferencing a mutable `&mut str` / `*mut str` (`{ buf, off, len }`).
+                // string when reached through a shared `&str`, NOT when dereferencing a `FatSlice`
+                // `str` pointer (`&mut str`, `*const str`, `*mut str`, `NonNull<str>`, `Box<str>`).
                 TypeKind::Str => {
                     if self.derefs_mut_str(root, &path) {
                         return None;
@@ -341,8 +341,8 @@ impl<'a> View<'a> {
         }
     }
 
-    /// Whether walking `(root, path)` reaches `str` by dereferencing a mutable `&mut str` /
-    /// `*mut str` (which is a `{ buf, off, len }` byte slice rather than a host string).
+    /// Whether walking `(root, path)` reaches `str` by dereferencing a `FatSlice` `str` pointer
+    /// (`&mut str` or any raw `str` pointer `*const str` / `*mut str` / `NonNull<str>` / `Box<str>`).
     fn derefs_mut_str(&self, root: Root, path: &[Proj]) -> bool {
         let mut ty = match root {
             Root::Value(v) => match self.ty(v) {
@@ -357,11 +357,14 @@ impl<'a> View<'a> {
         for proj in path {
             match proj {
                 Proj::Deref => match self.kind_of(ty) {
-                    Some(
-                        TypeKind::Reference { pointee, mutable }
-                        | TypeKind::RawPointer { pointee, mutable },
-                    ) => {
+                    Some(TypeKind::Reference { pointee, mutable }) => {
                         if *mutable && matches!(self.kind_of(*pointee), Some(TypeKind::Str)) {
+                            return true;
+                        }
+                        ty = *pointee;
+                    }
+                    Some(TypeKind::RawPointer { pointee, .. }) => {
+                        if matches!(self.kind_of(*pointee), Some(TypeKind::Str)) {
                             return true;
                         }
                         ty = *pointee;

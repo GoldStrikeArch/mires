@@ -157,4 +157,28 @@ pub fn rust_entry() {
         let formatted = format!("{}|{:?}", a, b);
         print_str(formatted.as_str());
     }
+
+    // 9. Safe read-only `is_ascii()` on fresh `Box<str>` and `&mut str` must commit
+    //    `block.fresh = false` via `byte_slice_ref` and never corrupt the live buffer
+    //    under MIR inlining (`unscale_scalar` u32 scan).
+    {
+        let b1: Box<str> = Box::from(black_box("abcdé"));
+        print_bool(b1.is_ascii());
+        print_str(&b1);
+        print_bool(&*b1 == "abcdé");
+
+        let b2: Box<str> = Box::from(black_box("abcd"));
+        print_bool(b2.is_ascii());
+        print_str(&b2);
+        print_bool(&*b2 == "abcd");
+
+        let b3: Box<str> = Box::from(black_box("héllo world!"));
+        print_bool(b3.is_ascii());
+        print_str(&b3);
+        print_bool(&*b3 == "héllo world!");
+
+        let mut s = String::from(black_box("pqrsé"));
+        print_bool(s.as_mut_str().is_ascii());
+        print_str(s.as_str());
+    }
 }

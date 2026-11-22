@@ -55,9 +55,12 @@ pub struct Walk {
     /// object's `__rt.box` ([`JsCx::raw_view`]), never the slot of that expression, which would
     /// be the address of the storage *holding* the reference.
     pub object: bool,
-    /// Whether a `str` place was reached by dereferencing a mutable `&mut str` / `*mut str`
-    /// (represented as a live `{ buf, off, len }` byte slice rather than a JavaScript string).
+    /// Whether a `str` place was reached by dereferencing a `FatSlice` `str` pointer (`&mut str`,
+    /// `*const str`, `*mut str`, `NonNull<str>`, `Unique<str>`, `Box<str>`).
     pub str_mutable: bool,
+    /// Whether that `str` pointer was specifically mutable (`&mut str` / `*mut str`), so it
+    /// cannot alias a memoized `__rt.str_bytes` / `__rt.bstr_bytes` view.
+    pub str_from_mut: bool,
 }
 
 impl<'a> JsCx<'a> {
@@ -104,6 +107,7 @@ impl<'a> JsCx<'a> {
                     identity: None,
                     object: false,
                     str_mutable: false,
+                    str_from_mut: false,
                 });
             }
         }
@@ -112,6 +116,7 @@ impl<'a> JsCx<'a> {
         let mut identity = None;
         let mut tail: Option<Expr> = None;
         let mut str_mutable = false;
+        let mut str_from_mut = false;
         // An SSA value has no storage of its own: an aggregate one is held as the object.
         let mut object = matches!(root, Root::Value(_)) && is_object(table, ty);
 
@@ -119,6 +124,7 @@ impl<'a> JsCx<'a> {
             identity = None;
             let carried_tail = tail.take();
             let carried_str_mutable = std::mem::take(&mut str_mutable);
+            let carried_str_from_mut = std::mem::take(&mut str_from_mut);
             // A downcast and a transparent field are the same place; every other step leaves it.
             object &= matches!(proj, Proj::Downcast { .. } | Proj::Field { .. });
 
@@ -153,6 +159,7 @@ impl<'a> JsCx<'a> {
                         }
                         Some(TypeKind::Str) => {
                             str_mutable = value::is_mut_str_ptr(table, ty);
+                            str_from_mut = value::is_mutable_ptr(table, ty);
                             identity = Some(value.clone());
                             JsPlace::Deref(value)
                         }
@@ -202,6 +209,7 @@ impl<'a> JsCx<'a> {
                     } else if matches!(key, FieldKey::Transparent) {
                         tail = carried_tail;
                         str_mutable = carried_str_mutable;
+                        str_from_mut = carried_str_from_mut;
                     } else if !table.get(field_ty).is_some_and(|d| d.layout.sized) {
                         let base = self.read_place(&current);
                         current = self.tail_place(base, key, field_ty, carried_tail)?;
@@ -313,6 +321,7 @@ impl<'a> JsCx<'a> {
             identity,
             object,
             str_mutable,
+            str_from_mut,
         })
     }
 
@@ -531,7 +540,14 @@ impl<'a> JsCx<'a> {
                 .identity
                 .unwrap_or_else(|| self.read_place(&walk.place));
             return Ok(match (walk.str_mutable, mutable) {
-                (true, true) => jsast::rt_call("byte_slice_ref", vec![value]),
+                (true, true) => {
+                    let live = if walk.str_from_mut {
+                        value
+                    } else {
+                        jsast::rt_call("detach_str_memo", vec![value])
+                    };
+                    jsast::rt_call("byte_slice_ref", vec![live])
+                }
                 (true, false) => self.bytes_to_str(value),
                 (false, false) => value,
                 (false, true) => self.str_to_bytes_mut(value),
@@ -574,6 +590,9 @@ impl<'a> JsCx<'a> {
                 .identity
                 .unwrap_or_else(|| self.read_place(&walk.place));
             return Ok(match (walk.str_mutable, mutable) {
+                (true, true) if !walk.str_from_mut => {
+                    jsast::rt_call("detach_str_memo", vec![value])
+                }
                 (true, _) => value,
                 (false, true) => self.str_to_bytes_mut(value),
                 (false, false) => self.str_to_bytes(value),

@@ -13,6 +13,15 @@ use super::{decline, JsCx, Res};
 /// The depth at which a cast stops peeling and reports (`ptr.rs::CAST_DEPTH`).
 const CAST_DEPTH: u32 = 16;
 
+/// Representation and mutability flags for [`JsCx::cast_str_as`].
+#[derive(Clone, Copy)]
+struct StrCastMode {
+    from_fat: bool,
+    from_mut: bool,
+    to_fat: bool,
+    to_mut: bool,
+}
+
 // The read/write/offset/copy helpers below are the seams W8's intrinsics (`read_via_copy`,
 // `offset`, `arith_offset`, `ptr_offset_from`, `copy_nonoverlapping`) lower through.
 #[allow(dead_code)]
@@ -353,6 +362,20 @@ impl<'a> JsCx<'a> {
                     };
                     let data = match from_pointee {
                         Some(fp) => self.cast_slice_data(fp, *element, raw_data(data))?,
+                        None if data_is_mut_str => {
+                            let size = size_of(table, *element).unwrap_or(1);
+                            let mut thin_args = vec![data, jsast::num(size as f64)];
+                            if matches!(
+                                value::kind(table, table.peeled(*element)),
+                                Some(TypeKind::Integer {
+                                    signed: true,
+                                    bits: 8
+                                })
+                            ) {
+                                thin_args.push(jsast::boolean(true));
+                            }
+                            jsast::rt_call("thin", thin_args)
+                        }
                         None => data,
                     };
                     let mut arguments = vec![data, meta];
@@ -503,10 +526,17 @@ impl<'a> JsCx<'a> {
     }
 
     /// `s.as_bytes()` (`ptr.rs::str_to_bytes`).
+    ///
+    /// When folding `__rt.bytes_str(buf, off, len)` straight back into a byte slice, wrap it in
+    /// `__rt.byte_slice_ref(...)` so a fresh 1-byte heap allocation (`Box::<str>::from`) commits
+    /// `block.fresh = false` before any downstream `__rt.unscale_scalar` (e.g. `is_ascii::runtime`).
     pub fn str_to_bytes(&self, string: Expr) -> Expr {
         let (pre, tail) = peel_seq(string);
         match bytes_str_args(tail) {
-            Ok((buf, off, len)) => sequenced_vec(pre, ptr::fat_slice(buf, off, len)),
+            Ok((buf, off, len)) => sequenced_vec(
+                pre,
+                jsast::rt_call("byte_slice_ref", vec![ptr::fat_slice(buf, off, len)]),
+            ),
             Err(tail) => jsast::rt_call("str_bytes", vec![sequenced_vec(pre, tail)]),
         }
     }
@@ -586,23 +616,42 @@ impl<'a> JsCx<'a> {
         to_pointee: TypeId,
         value: Expr,
     ) -> Option<Res<Expr>> {
-        self.cast_str_as(from_pointee, to_pointee, value, false, false, false)
+        self.cast_str_as(
+            from_pointee,
+            to_pointee,
+            value,
+            StrCastMode {
+                from_fat: false,
+                from_mut: false,
+                to_fat: false,
+                to_mut: false,
+            },
+        )
     }
 
     /// [`Self::cast_str`], told the representation and mutability of both pointer types:
     /// - `&str` (`from_fat = false`) is a JavaScript string;
     /// - `&mut str`, `*const str`, `*mut str`, `NonNull<str>`, `Unique<str>`, `Box<str>`
     ///   (`from_fat = true`) are live `{ buf, off, len }` UTF-8 byte slices.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// Crossing from an immutable `FatSlice` (`*const str` / `NonNull<str>` / `Box<str>`) to a
+    /// mutable target (`*mut str` / `&mut str` / `*mut [u8]` / `&mut [u8]` / `*mut u8`) routes
+    /// through `__rt.detach_str_memo`: live heap/stack buffers pass through unchanged, while
+    /// memoized views from `__rt.str_bytes`/`__rt.bstr_bytes` detach so writes cannot corrupt the
+    /// global memo for unrelated string uses.
     fn cast_str_as(
         &self,
         from_pointee: TypeId,
         to_pointee: TypeId,
         value: Expr,
-        from_fat: bool,
-        to_fat: bool,
-        to_mut: bool,
+        mode: StrCastMode,
     ) -> Option<Res<Expr>> {
+        let StrCastMode {
+            from_fat,
+            from_mut,
+            to_fat,
+            to_mut,
+        } = mode;
         let table = self.table;
         let (from_str, to_str) = (
             value::is_str(table, from_pointee),
@@ -611,6 +660,13 @@ impl<'a> JsCx<'a> {
         if !from_str && !to_str {
             return None;
         }
+        let detach_if_const_to_mut = |v: Expr| {
+            if !from_mut && to_mut {
+                jsast::rt_call("detach_str_memo", vec![v])
+            } else {
+                v
+            }
+        };
         let unsupported = || {
             Err(decline(
                 OpClass::Cast,
@@ -619,7 +675,8 @@ impl<'a> JsCx<'a> {
         };
         Some(match (from_str, to_str) {
             (true, true) => Ok(match (from_fat, to_fat) {
-                (false, false) | (true, true) => value,
+                (false, false) => value,
+                (true, true) => detach_if_const_to_mut(value),
                 (true, false) => self.bytes_to_str(value),
                 (false, true) => {
                     if to_mut {
@@ -630,9 +687,11 @@ impl<'a> JsCx<'a> {
                 }
             }),
             (true, false) if from_fat => match value::kind(table, to_pointee) {
-                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => Ok(value),
+                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => {
+                    Ok(detach_if_const_to_mut(value))
+                }
                 _ if value::is_u8(table, to_pointee) || table.is_zst(to_pointee) => {
-                    let (setup, sb) = self.reread(value, &[BUF, OFF]);
+                    let (setup, sb) = self.reread(detach_if_const_to_mut(value), &[BUF, OFF]);
                     Ok(sequenced(
                         setup,
                         ptr::slot(ptr::slot_buf(sb.clone()), ptr::slot_off(sb)),
@@ -660,7 +719,7 @@ impl<'a> JsCx<'a> {
             },
             (false, true) => match value::kind(table, from_pointee) {
                 Some(TypeKind::Slice(element)) if table.byte_element(*element) => Ok(if to_fat {
-                    value
+                    detach_if_const_to_mut(value)
                 } else {
                     self.bytes_to_str(value)
                 }),
@@ -674,11 +733,21 @@ impl<'a> JsCx<'a> {
     pub fn cast_str_ptr(&self, from_ty: TypeId, to_ty: TypeId, value: Expr) -> Option<Res<Expr>> {
         let from_pointee = value::pointee_of(self.table, from_ty)?;
         let to_pointee = value::pointee_of(self.table, to_ty)?;
-        let from_fat =
-            value::is_raw(self.table, from_ty) || value::is_mutable_ptr(self.table, from_ty);
-        let to_fat = value::is_raw(self.table, to_ty) || value::is_mutable_ptr(self.table, to_ty);
+        let from_mut = value::is_mutable_ptr(self.table, from_ty);
         let to_mut = value::is_mutable_ptr(self.table, to_ty);
-        self.cast_str_as(from_pointee, to_pointee, value, from_fat, to_fat, to_mut)
+        let from_fat = value::is_raw(self.table, from_ty) || from_mut;
+        let to_fat = value::is_raw(self.table, to_ty) || to_mut;
+        self.cast_str_as(
+            from_pointee,
+            to_pointee,
+            value,
+            StrCastMode {
+                from_fat,
+                from_mut,
+                to_fat,
+                to_mut,
+            },
+        )
     }
 
     /// `value as *const to_pointee` (`ptr.rs::cast_pointer`).

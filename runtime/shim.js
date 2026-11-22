@@ -2353,6 +2353,7 @@ globalThis.__rt.str_bytes = (s) => {
   if (record !== undefined) return record;
   const bytes = globalThis.__rt._utf8(s);
   record = { buf: bytes, off: 0, len: bytes.length };
+  (_str_memo_bufs || (_str_memo_bufs = new WeakSet())).add(bytes);
   if (bytes.length === s.length) {
     (_ascii_src || (_ascii_src = new WeakMap())).set(bytes, s);
   }
@@ -2386,6 +2387,31 @@ globalThis.__rt.str_bytes = (s) => {
 globalThis.__rt.str_bytes_mut = (s) => {
   const bytes = globalThis.__rt._utf8(s);
   return { buf: bytes, off: 0, len: bytes.length };
+};
+
+let _str_memo_bufs;
+
+// detach_str_memo(p): when a `*const str` backed by a memoized `&str` byte view
+// (`str_bytes`, `bstr_bytes`, `bstr_utf8_bytes`) crosses a const->mut boundary
+// (`*const str as *mut str`, `&mut *p_const`, `NonNull::from(&str).as_mut()`),
+// detach a fresh copy so writes cannot corrupt `_str_memo` / `_bstr_memo` for
+// unrelated uses of the same string. Live heap blocks (`Box<str>`, `String`),
+// stack arrays, and already-detached buffers are never in `_str_memo_bufs` and
+// pass through unchanged.
+globalThis.__rt.detach_str_memo = (p) => {
+  if (
+    _str_memo_bufs !== undefined &&
+    typeof p === "object" &&
+    p !== null &&
+    _str_memo_bufs.has(p.buf)
+  ) {
+    return {
+      buf: p.buf.slice(p.off, p.off + p.len),
+      off: 0,
+      len: p.len,
+    };
+  }
+  return p;
 };
 
 // str_len(s): the UTF-8 byte length of a JavaScript string, which is the
@@ -2721,6 +2747,7 @@ globalThis.__rt.bstr_bytes = (s) => {
   const bytes = new Array(n);
   for (let i = 0; i < n; i++) bytes[i] = s.charCodeAt(i);
   record = { buf: bytes, off: 0, len: n };
+  (_str_memo_bufs || (_str_memo_bufs = new WeakSet())).add(bytes);
   (_bstr_src || (_bstr_src = new WeakMap())).set(bytes, s);
   _bstr_memo_put(memo.map, s, record, n);
   return record;
@@ -2767,6 +2794,7 @@ globalThis.__rt.bstr_utf8_bytes = (s) => {
     bytes[i] = code;
   }
   record = { buf: bytes, off: 0, len: bytes.length };
+  (_str_memo_bufs || (_str_memo_bufs = new WeakSet())).add(bytes);
   if (ascii) (_bstr_src || (_bstr_src = new WeakMap())).set(bytes, s);
   _bstr_memo_put(memo.utf8, s, record, bytes.length);
   return record;
