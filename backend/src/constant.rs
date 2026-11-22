@@ -171,6 +171,9 @@ pub(crate) fn codegen_const_value<'tcx>(
             }
         }
         ConstValue::Slice { alloc_id, meta } => {
+            if matches!(tcx.global_alloc(alloc_id), GlobalAlloc::Static(_)) {
+                return pointer_expr(cgu, log, alloc_id, Size::ZERO, ty, Some(meta), span);
+            }
             let GlobalAlloc::Memory(alloc) = tcx.global_alloc(alloc_id) else {
                 return zombie(
                     cgu,
@@ -609,7 +612,8 @@ fn read_dyn_pointer<'tcx>(
                 }
             }
             GlobalAlloc::Static(def_id) => {
-                if !raw::static_matches_pointee(tcx, def_id, pointer.offset, concrete_ty) {
+                let Some(path) = raw::resolve_static_path(tcx, def_id, pointer.offset, concrete_ty)
+                else {
                     return zombie(
                         cgu,
                         log,
@@ -619,13 +623,8 @@ fn read_dyn_pointer<'tcx>(
                              rustc_codegen_js (type `{ty}`)"
                         ),
                     );
-                }
-                let binding = jsast::id(cgu.namer.static_name(def_id).into_string());
-                if is_indirect(tcx, concrete_ty) {
-                    binding
-                } else {
-                    crate::ptr::slot(binding, jsast::num(0))
-                }
+                };
+                static_pointer_expr(cgu, def_id, &path, ty, concrete_ty, false)
             }
             _ => {
                 return zombie(
@@ -682,23 +681,44 @@ fn pointer_expr<'tcx>(
                 Ok(pointee) => pointee,
                 Err(poison) => return poison,
             };
-            if offset != Size::ZERO {
+            let peeled_pointee = value::peel_pattern(value::peel_transparent(tcx, pointee));
+            if let (Some(length), ty::Slice(element_ty)) = (meta, peeled_pointee.kind()) {
+                let Some((path, start)) =
+                    raw::resolve_static_slice(tcx, def_id, offset, *element_ty, length)
+                else {
+                    return zombie(
+                        cgu,
+                        log,
+                        span,
+                        format!(
+                            "a pointer into part of a `static` is not supported by \
+                             rustc_codegen_js (type `{ty}`)"
+                        ),
+                    );
+                };
+                let mut buf = jsast::id(cgu.namer.static_name(def_id).into_string());
+                for step in &path {
+                    buf = apply_static_step(buf, step);
+                }
+                return crate::ptr::fat_slice(
+                    buf,
+                    jsast::num(f64::from(start)),
+                    jsast::num(length as f64),
+                );
+            }
+            let Some(path) = raw::resolve_static_path(tcx, def_id, offset, pointee) else {
                 return zombie(
                     cgu,
                     log,
                     span,
                     format!(
-                        "a pointer into the middle of a `static` is not supported by \
+                        "a pointer into part of a `static` is not supported by \
                          rustc_codegen_js (type `{ty}`)"
                     ),
                 );
-            }
-            let binding = jsast::id(cgu.namer.static_name(def_id).into_string());
-            if is_indirect(cgu.tcx, pointee) {
-                boxed_if_raw(cgu, ty, pointee, binding)
-            } else {
-                crate::ptr::slot(binding, jsast::num(0))
-            }
+            };
+            let raw = matches!(value::peel_pattern(ty).kind(), ty::RawPtr(..));
+            static_pointer_expr(cgu, def_id, &path, ty, pointee, raw)
         }
         // A reference to a promoted value: `&Point { x: 1, y: 2 }`, `&true`, `"text"`. The pointee
         // is rebuilt from the allocation's bytes, because the JS side has no memory to point into.
@@ -753,6 +773,53 @@ fn boxed_if_raw<'tcx>(cgu: &CguCx<'tcx>, ty: Ty<'tcx>, pointee: Ty<'tcx>, value:
         return jsast::rt_call("box", vec![value]);
     }
     value
+}
+
+/// Lowers a resolved pointer into `static` `def_id` along `path` to its JS representation.
+///
+/// - Empty `path` names the whole static binding (unchanged: `binding`, `__rt.box(binding)`, or
+///   `{ buf: binding, off: 0 }`).
+/// - Non-empty `path` walks `path[..len-1]` to the parent container and either projects the last
+///   step directly (for indirect references) or builds `{ buf: parent, off: key }` (for direct
+///   pointees and raw pointers to slot pointees, matching `place.rs::slot_of`).
+fn static_pointer_expr<'tcx>(
+    cgu: &CguCx<'tcx>,
+    def_id: DefId,
+    path: &[raw::StaticPathStep],
+    ty: Ty<'tcx>,
+    pointee: Ty<'tcx>,
+    is_raw: bool,
+) -> Expr {
+    let binding = jsast::id(cgu.namer.static_name(def_id).into_string());
+    let Some((last, prefix)) = path.split_last() else {
+        if is_indirect(cgu.tcx, pointee) {
+            return if is_raw {
+                boxed_if_raw(cgu, ty, pointee, binding)
+            } else {
+                binding
+            };
+        }
+        return crate::ptr::slot(binding, jsast::num(0));
+    };
+    let mut parent = binding;
+    for step in prefix {
+        parent = apply_static_step(parent, step);
+    }
+    if !is_indirect(cgu.tcx, pointee) || (is_raw && crate::ptr::is_slot_pointee(cgu.tcx, pointee)) {
+        let key = match last {
+            raw::StaticPathStep::Field(name) => jsast::string(name),
+            raw::StaticPathStep::Index(idx) => jsast::num(f64::from(*idx)),
+        };
+        return crate::ptr::slot(parent, key);
+    }
+    apply_static_step(parent, last)
+}
+
+fn apply_static_step(base: Expr, step: &raw::StaticPathStep) -> Expr {
+    match step {
+        raw::StaticPathStep::Field(name) => jsast::member(base, name.clone()),
+        raw::StaticPathStep::Index(idx) => jsast::index(base, jsast::num(f64::from(*idx))),
+    }
 }
 
 /// The `&[T]` whose `meta` elements start at `offset` in `alloc`.

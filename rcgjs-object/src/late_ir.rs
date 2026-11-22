@@ -1232,6 +1232,23 @@ pub enum ConstTree {
         address: u64,
         length: u64,
     },
+    StaticField {
+        target: GlobalReference,
+        path: Vec<StaticStep>,
+    },
+    StaticSlice {
+        target: GlobalReference,
+        path: Vec<StaticStep>,
+        start: u32,
+        length: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum StaticStep {
+    /// Append-only: postcard serializes this enum by index.
+    Field(String),
+    Index(u32),
 }
 
 impl ConstTree {
@@ -1256,6 +1273,39 @@ impl ConstTree {
                 target: GlobalReference::Type(ty),
                 ..
             } => context.ty(*ty),
+            Self::StaticField { target, path } => {
+                if !matches!(target, GlobalReference::Static(_)) || path.is_empty() {
+                    return Err(
+                        "late-IR static field constant must name a static with a non-empty path"
+                            .to_owned(),
+                    );
+                }
+                for step in path {
+                    if let StaticStep::Field(name) = step {
+                        if name.is_empty() {
+                            return Err(
+                                "late-IR static field constant has an empty field name".to_owned()
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Self::StaticSlice { target, path, .. } => {
+                if !matches!(target, GlobalReference::Static(_)) {
+                    return Err("late-IR static slice constant must name a static".to_owned());
+                }
+                for step in path {
+                    if let StaticStep::Field(name) = step {
+                        if name.is_empty() {
+                            return Err(
+                                "late-IR static slice constant has an empty field name".to_owned()
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }

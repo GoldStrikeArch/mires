@@ -7,7 +7,7 @@ use crate::jir::interns::{BytesId, Interns, SigId, StrId};
 use crate::jir::origin::{Origin, OriginId, OriginKind, OriginTable, SourceFactId};
 use crate::jir::repr::{Func, OpKind, Proj, RTerm};
 use crate::jir::semantic::{
-    Callee, ConstTree, DirectItemRef, DropGlue, GlobalReference, HostPayload,
+    Callee, ConstTree, DirectItemRef, DropGlue, GlobalReference, HostPayload, StaticStep,
 };
 use crate::jir::types::{FieldDescriptor, FieldKey, SigAbi, TypeId, TypeKind, VariantDescriptor};
 use rcgjs_object::object::Header;
@@ -188,6 +188,15 @@ impl Remap<'_> {
                 *vtable = self.string(*vtable)?;
             }
             ConstTree::Global { target, .. } => self.global(target)?,
+            ConstTree::StaticField { target, path }
+            | ConstTree::StaticSlice { target, path, .. } => {
+                self.global(target)?;
+                for step in path {
+                    if let StaticStep::Field(name) = step {
+                        *name = self.string(*name)?;
+                    }
+                }
+            }
             ConstTree::Unit
             | ConstTree::Scalar { .. }
             | ConstTree::Address(_)

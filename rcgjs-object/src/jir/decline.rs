@@ -1132,6 +1132,9 @@ pub enum EncodeDecline {
     /// driver must switch to `Disabled` when it reads the flag, so that a coverage report can tell
     /// "the lane is off" from "this item has no typed MIR body".
     Disabled,
+    StaticSubPointerConstant {
+        ty: String,
+    },
 }
 
 impl EncodeDecline {
@@ -1179,6 +1182,7 @@ impl EncodeDecline {
             Self::ArrayLength { .. } => "encode.array-length",
             Self::VariantDiscriminant { .. } => "encode.variant-discriminant",
             Self::EnumTagWidth { .. } => "encode.enum-tag-width",
+            Self::StaticSubPointerConstant { .. } => "encode.static-sub-pointer-constant",
         }
     }
 
@@ -1246,6 +1250,7 @@ impl EncodeDecline {
             },
             EncodeDecline::EnumTagWidth { ty: ty() },
             EncodeDecline::Disabled,
+            EncodeDecline::StaticSubPointerConstant { ty: ty() },
         ]
     }
 }
@@ -1363,6 +1368,10 @@ impl fmt::Display for EncodeDecline {
             Self::EnumTagWidth { ty } => {
                 write!(f, "physical enum tag for `{ty}` has an unsupported width")
             }
+            Self::StaticSubPointerConstant { ty } => write!(
+                f,
+                "a pointer into part of a `static` is not encoded in a constant (type `{ty}`)"
+            ),
         }
     }
 }

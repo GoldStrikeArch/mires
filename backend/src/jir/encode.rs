@@ -34,8 +34,8 @@ use rcgjs_object::jir::semantic::{
     CoroutineDesugaring, CoroutineKind, CoroutineSource, DefinitionId, DirectItemRef, DropGlue,
     GlobalReference, HostPayload, ItemId, KeyedListCallable, KeyedListPayload, Local, LocalId,
     LocalRole, Operand, OperandKind, Place, Projection, RawPointerKind, Rvalue, Signature,
-    SpreadArgument, StandardOperation, Statement, StatementKind, TerminateReason, Terminator,
-    TypeId, UnaryOp, Unwind, VtableEntry, KEYED_LIST_FORMAT_V1,
+    SpreadArgument, StandardOperation, Statement, StatementKind, StaticStep, TerminateReason,
+    Terminator, TypeId, UnaryOp, Unwind, VtableEntry, KEYED_LIST_FORMAT_V1,
 };
 
 use super::types::{definition_id, type_name, TypeCx};
@@ -1435,20 +1435,39 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             }
             mir::ConstValue::Scalar(Scalar::Ptr(pointer, _)) => {
                 let (provenance, offset) = pointer.prov_and_relative_offset();
-                if let GlobalAlloc::Memory(allocation) = tcx.global_alloc(provenance.alloc_id()) {
-                    let pointee = ty.builtin_deref(true).ok_or_else(|| {
-                        EncodeDecline::PointerConstantNotReference { ty: type_name(ty) }
-                    })?;
-                    let allocation = allocation.inner();
-                    check_const_memory(allocation)?;
-                    return Ok(Constant::Memory(
-                        self.const_memory_pointer(allocation, offset, pointee, None, 0)?,
-                    ));
+                match tcx.global_alloc(provenance.alloc_id()) {
+                    GlobalAlloc::Memory(allocation) => {
+                        let pointee = ty.builtin_deref(true).ok_or_else(|| {
+                            EncodeDecline::PointerConstantNotReference { ty: type_name(ty) }
+                        })?;
+                        let allocation = allocation.inner();
+                        check_const_memory(allocation)?;
+                        Ok(Constant::Memory(self.const_memory_pointer(
+                            allocation, offset, pointee, None, 0,
+                        )?))
+                    }
+                    GlobalAlloc::Static(def_id) => {
+                        let pointee = ty.builtin_deref(true).ok_or_else(|| {
+                            EncodeDecline::PointerConstantNotReference { ty: type_name(ty) }
+                        })?;
+                        match self.static_pointer_const_tree(
+                            provenance.alloc_id(),
+                            def_id,
+                            offset,
+                            pointee,
+                            ty,
+                        )? {
+                            ConstTree::Global { target, offset } => {
+                                Ok(Constant::Pointer { target, offset })
+                            }
+                            other => Ok(Constant::Memory(other)),
+                        }
+                    }
+                    _ => Ok(Constant::Pointer {
+                        target: self.global_reference(provenance.alloc_id())?,
+                        offset: offset.bytes(),
+                    }),
                 }
-                Ok(Constant::Pointer {
-                    target: self.global_reference(provenance.alloc_id())?,
-                    offset: offset.bytes(),
-                })
             }
             mir::ConstValue::Slice { alloc_id, meta }
                 if crate::value::peel_pattern(crate::value::peel_transparent(tcx, ty))
@@ -1463,6 +1482,16 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 Ok(Constant::String(self.types.str(text)))
             }
             mir::ConstValue::Slice { alloc_id, meta } => {
+                if let GlobalAlloc::Static(def_id) = tcx.global_alloc(alloc_id) {
+                    let pointee = ty.peel_refs();
+                    let (peeled, offset) = self.peel_transparent_at(pointee);
+                    if let ty::Slice(element) = peeled.kind() {
+                        return Ok(Constant::Memory(self.static_slice_const_tree(
+                            alloc_id, def_id, offset, *element, meta, ty,
+                        )?));
+                    }
+                    return Err(EncodeDecline::WideGlobalPointerConstant { ty: type_name(ty) });
+                }
                 let GlobalAlloc::Memory(allocation) = tcx.global_alloc(alloc_id) else {
                     return Err(EncodeDecline::SliceConstantNoMemory);
                 };
@@ -1854,7 +1883,31 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 self.const_memory_pointer(target, pointer.offset, pointee, pointer.meta, depth)
             }
             GlobalAlloc::VTable(..) => Err(EncodeDecline::VtablePointerConstant),
+            GlobalAlloc::Static(def_id) if wide => {
+                let pointee = pointee.ok_or_else(|| {
+                    EncodeDecline::PointerConstantNotReference { ty: type_name(ty) }
+                })?;
+                let peeled =
+                    crate::value::peel_pattern(crate::value::peel_transparent(tcx, pointee));
+                if let (Some(length), ty::Slice(element)) = (pointer.meta, peeled.kind()) {
+                    return self.static_slice_const_tree(
+                        alloc_id,
+                        def_id,
+                        pointer.offset,
+                        *element,
+                        length,
+                        ty,
+                    );
+                }
+                Err(EncodeDecline::WideGlobalPointerConstant { ty: type_name(ty) })
+            }
             _ if wide => Err(EncodeDecline::WideGlobalPointerConstant { ty: type_name(ty) }),
+            GlobalAlloc::Static(def_id) => {
+                let pointee = pointee.ok_or_else(|| {
+                    EncodeDecline::PointerConstantNotReference { ty: type_name(ty) }
+                })?;
+                self.static_pointer_const_tree(alloc_id, def_id, pointer.offset, pointee, ty)
+            }
             _ => Ok(ConstTree::Global {
                 target: self.global_reference(alloc_id)?,
                 offset: pointer.offset.bytes(),
@@ -1896,20 +1949,13 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                         depth,
                     )?))
                 }
-                GlobalAlloc::Static(def_id) => {
-                    if !crate::constant::raw::static_matches_pointee(
-                        tcx,
-                        def_id,
-                        pointer.offset,
-                        concrete_ty,
-                    ) {
-                        return Err(EncodeDecline::WideGlobalPointerConstant { ty: type_name(ty) });
-                    }
-                    ConstTree::Global {
-                        target: self.global_reference(alloc_id)?,
-                        offset: pointer.offset.bytes(),
-                    }
-                }
+                GlobalAlloc::Static(def_id) => self.static_pointer_const_tree(
+                    alloc_id,
+                    def_id,
+                    pointer.offset,
+                    concrete_ty,
+                    ty,
+                )?,
                 _ => {
                     return Err(EncodeDecline::WideGlobalPointerConstant { ty: type_name(ty) });
                 }
@@ -1919,6 +1965,76 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             data: Box::new(data),
             concrete,
             vtable,
+        })
+    }
+
+    /// Resolves a pointer constant into `static` `def_id` at `offset` for target type `pointee`,
+    /// returning `ConstTree::Global` for the whole static, `ConstTree::StaticField` for a valid
+    /// struct/tuple/array projection, or declining fail-closed otherwise.
+    fn static_pointer_const_tree(
+        &mut self,
+        alloc_id: mir::interpret::AllocId,
+        def_id: DefId,
+        offset: Size,
+        pointee: Ty<'tcx>,
+        outer_ty: Ty<'tcx>,
+    ) -> Result<ConstTree, EncodeDecline> {
+        let tcx = self.tcx();
+        let Some(steps) = crate::constant::raw::resolve_static_path(tcx, def_id, offset, pointee)
+        else {
+            return Err(EncodeDecline::StaticSubPointerConstant {
+                ty: type_name(outer_ty),
+            });
+        };
+        let target = self.global_reference(alloc_id)?;
+        if steps.is_empty() {
+            Ok(ConstTree::Global { target, offset: 0 })
+        } else {
+            let path = steps
+                .into_iter()
+                .map(|step| match step {
+                    crate::constant::raw::StaticPathStep::Field(name) => {
+                        StaticStep::Field(self.types.str(&name))
+                    }
+                    crate::constant::raw::StaticPathStep::Index(idx) => StaticStep::Index(idx),
+                })
+                .collect();
+            Ok(ConstTree::StaticField { target, path })
+        }
+    }
+
+    fn static_slice_const_tree(
+        &mut self,
+        alloc_id: mir::interpret::AllocId,
+        def_id: DefId,
+        offset: Size,
+        element_ty: Ty<'tcx>,
+        length: u64,
+        outer_ty: Ty<'tcx>,
+    ) -> Result<ConstTree, EncodeDecline> {
+        let tcx = self.tcx();
+        let Some((steps, start)) =
+            crate::constant::raw::resolve_static_slice(tcx, def_id, offset, element_ty, length)
+        else {
+            return Err(EncodeDecline::StaticSubPointerConstant {
+                ty: type_name(outer_ty),
+            });
+        };
+        let target = self.global_reference(alloc_id)?;
+        let path = steps
+            .into_iter()
+            .map(|step| match step {
+                crate::constant::raw::StaticPathStep::Field(name) => {
+                    StaticStep::Field(self.types.str(&name))
+                }
+                crate::constant::raw::StaticPathStep::Index(idx) => StaticStep::Index(idx),
+            })
+            .collect();
+        Ok(ConstTree::StaticSlice {
+            target,
+            path,
+            start,
+            length,
         })
     }
 

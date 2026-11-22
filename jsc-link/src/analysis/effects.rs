@@ -731,6 +731,14 @@ fn const_has_static_global(tree: &ConstTree) -> bool {
         ConstTree::Global {
             target: GlobalReference::Static { .. },
             ..
+        }
+        | ConstTree::StaticField {
+            target: GlobalReference::Static { .. },
+            ..
+        }
+        | ConstTree::StaticSlice {
+            target: GlobalReference::Static { .. },
+            ..
         } => true,
         ConstTree::Aggregate(fields)
         | ConstTree::Slice(fields)

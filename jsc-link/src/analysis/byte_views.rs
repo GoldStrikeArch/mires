@@ -204,7 +204,9 @@ fn collect_std_crate_ids(table: &BTreeMap<JsName, LinkItem>) -> BTreeSet<u64> {
 
 fn collect_const_refs(c: &ConstTree, interns: &Interns, out: &mut BTreeSet<JsName>) {
     match c {
-        ConstTree::Global { target, .. } => match target {
+        ConstTree::Global { target, .. }
+        | ConstTree::StaticField { target, .. }
+        | ConstTree::StaticSlice { target, .. } => match target {
             GlobalReference::Function { link_name, .. }
             | GlobalReference::Static { link_name, .. } => {
                 if let Some(s) = interns.str(*link_name) {

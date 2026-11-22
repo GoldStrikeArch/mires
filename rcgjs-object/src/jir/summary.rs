@@ -26,7 +26,7 @@ use super::semantic::{
     Call, CallSemantic, Callee, CastKind, ConstTree, Constant, DirectItemRef, DropGlue,
     GlobalReference, HostPayload, ItemId, KeyedListCallable, KeyedListPayload, Local, LocalId,
     LocalRole, Operand, OperandKind, Place, Projection, Rvalue, Signature, SpreadArgument,
-    Statement, StatementKind, Terminator, TypeId, Unwind, VtableEntry,
+    Statement, StatementKind, StaticStep, Terminator, TypeId, Unwind, VtableEntry,
 };
 use super::types::{TypeKind, TypeTable};
 use super::JIR_SCHEMA;
@@ -1288,6 +1288,33 @@ impl<'a> Normalizer<'a> {
             ConstTree::Global { target, offset } => ConstTree::Global {
                 target: self.global(*target),
                 offset: *offset,
+            },
+            ConstTree::StaticField { target, path } => ConstTree::StaticField {
+                target: self.global(*target),
+                path: path
+                    .iter()
+                    .map(|step| match step {
+                        StaticStep::Field(name) => StaticStep::Field(self.string(*name)),
+                        StaticStep::Index(index) => StaticStep::Index(*index),
+                    })
+                    .collect(),
+            },
+            ConstTree::StaticSlice {
+                target,
+                path,
+                start,
+                length,
+            } => ConstTree::StaticSlice {
+                target: self.global(*target),
+                path: path
+                    .iter()
+                    .map(|step| match step {
+                        StaticStep::Field(name) => StaticStep::Field(self.string(*name)),
+                        StaticStep::Index(index) => StaticStep::Index(*index),
+                    })
+                    .collect(),
+                start: *start,
+                length: *length,
             },
             ConstTree::Unit => ConstTree::Unit,
             ConstTree::Scalar { bits, bytes } => ConstTree::Scalar {

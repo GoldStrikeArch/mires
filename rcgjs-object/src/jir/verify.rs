@@ -16,8 +16,8 @@ use super::origin::{OriginTable, SourceFactId};
 use super::semantic::{
     AggregateKind, AssertMessage, BasicBlock, BlockId, Body, BodyKind, BodySemantic, Call, Callee,
     ConstTree, Constant, DirectItemRef, DropGlue, GlobalReference, HostPayload, KeyedListCallable,
-    LocalId, LocalRole, Operand, OperandKind, Place, Projection, Rvalue, StatementKind, Terminator,
-    TypeId, Unwind, VtableEntry,
+    LocalId, LocalRole, Operand, OperandKind, Place, Projection, Rvalue, StatementKind, StaticStep,
+    Terminator, TypeId, Unwind, VtableEntry,
 };
 use super::types::{TypeKind, TypeTable};
 
@@ -411,6 +411,34 @@ fn verify_const_tree(tree: &ConstTree, context: &Context<'_>) -> Result<(), Veri
             context.str(*vtable)
         }
         ConstTree::Global { target, .. } => verify_global(target, context),
+        ConstTree::StaticField { target, path } => {
+            if !matches!(target, GlobalReference::Static { .. }) || path.is_empty() {
+                return Err(VerifyError::new(
+                    "late-IR static field constant must name a static with a non-empty path",
+                ));
+            }
+            verify_global(target, context)?;
+            for step in path {
+                if let StaticStep::Field(name) = step {
+                    context.str(*name)?;
+                }
+            }
+            Ok(())
+        }
+        ConstTree::StaticSlice { target, path, .. } => {
+            if !matches!(target, GlobalReference::Static { .. }) {
+                return Err(VerifyError::new(
+                    "late-IR static slice constant must name a static",
+                ));
+            }
+            verify_global(target, context)?;
+            for step in path {
+                if let StaticStep::Field(name) = step {
+                    context.str(*name)?;
+                }
+            }
+            Ok(())
+        }
         ConstTree::Str(text) => context.str(*text),
         ConstTree::Unit
         | ConstTree::Scalar { .. }

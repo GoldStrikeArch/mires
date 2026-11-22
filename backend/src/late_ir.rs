@@ -1184,20 +1184,39 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             }
             mir::ConstValue::Scalar(Scalar::Ptr(pointer, _)) => {
                 let (provenance, offset) = pointer.prov_and_relative_offset();
-                if let GlobalAlloc::Memory(allocation) = tcx.global_alloc(provenance.alloc_id()) {
-                    let pointee = ty
-                        .builtin_deref(true)
-                        .ok_or_else(|| format!("the pointer constant `{ty}` is not a reference"))?;
-                    let allocation = allocation.inner();
-                    self.check_const_memory(allocation)?;
-                    return Ok(Constant::Memory(
-                        self.const_memory_pointer(allocation, offset, pointee, None, 0)?,
-                    ));
+                match tcx.global_alloc(provenance.alloc_id()) {
+                    GlobalAlloc::Memory(allocation) => {
+                        let pointee = ty.builtin_deref(true).ok_or_else(|| {
+                            format!("the pointer constant `{ty}` is not a reference")
+                        })?;
+                        let allocation = allocation.inner();
+                        self.check_const_memory(allocation)?;
+                        Ok(Constant::Memory(self.const_memory_pointer(
+                            allocation, offset, pointee, None, 0,
+                        )?))
+                    }
+                    GlobalAlloc::Static(def_id) => {
+                        let pointee = ty.builtin_deref(true).ok_or_else(|| {
+                            format!("the pointer constant `{ty}` is not a reference")
+                        })?;
+                        match self.static_pointer_const_tree(
+                            provenance.alloc_id(),
+                            def_id,
+                            offset,
+                            pointee,
+                            ty,
+                        )? {
+                            ConstTree::Global { target, offset } => {
+                                Ok(Constant::Pointer { target, offset })
+                            }
+                            other => Ok(Constant::Memory(other)),
+                        }
+                    }
+                    _ => Ok(Constant::Pointer {
+                        target: self.global_reference(provenance.alloc_id())?,
+                        offset: offset.bytes(),
+                    }),
                 }
-                Ok(Constant::Pointer {
-                    target: self.global_reference(provenance.alloc_id())?,
-                    offset: offset.bytes(),
-                })
             }
             mir::ConstValue::Slice { alloc_id, meta }
                 if crate::value::peel_pattern(crate::value::peel_transparent(tcx, ty))
@@ -1215,6 +1234,25 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 Ok(Constant::String(text.to_owned()))
             }
             mir::ConstValue::Slice { alloc_id, meta } => {
+                if let GlobalAlloc::Static(def_id) = tcx.global_alloc(alloc_id) {
+                    let pointee = crate::value::peel_pattern(crate::value::peel_transparent(
+                        tcx,
+                        ty.peel_refs(),
+                    ));
+                    if let ty::Slice(element) = pointee.kind() {
+                        return Ok(Constant::Memory(self.static_slice_const_tree(
+                            alloc_id,
+                            def_id,
+                            rustc_abi::Size::ZERO,
+                            *element,
+                            meta,
+                            ty,
+                        )?));
+                    }
+                    return Err(format!(
+                        "a wide `{ty}` to a named global is not encoded in a constant"
+                    ));
+                }
                 let GlobalAlloc::Memory(allocation) = tcx.global_alloc(alloc_id) else {
                     return Err("slice constant is not backed by memory".to_owned());
                 };
@@ -1539,9 +1577,33 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             GlobalAlloc::VTable(..) => {
                 Err("pointer to a vtable constant is not encoded".to_owned())
             }
+            GlobalAlloc::Static(def_id) if wide => {
+                let pointee = pointee
+                    .ok_or_else(|| format!("the pointer constant `{ty}` is not a reference"))?;
+                let peeled =
+                    crate::value::peel_pattern(crate::value::peel_transparent(tcx, pointee));
+                if let (Some(length), ty::Slice(element)) = (pointer.meta, peeled.kind()) {
+                    return self.static_slice_const_tree(
+                        alloc_id,
+                        def_id,
+                        pointer.offset,
+                        *element,
+                        length,
+                        ty,
+                    );
+                }
+                Err(format!(
+                    "a wide `{ty}` to a named global is not encoded in a constant"
+                ))
+            }
             _ if wide => Err(format!(
                 "a wide `{ty}` to a named global is not encoded in a constant"
             )),
+            GlobalAlloc::Static(def_id) => {
+                let pointee = pointee
+                    .ok_or_else(|| format!("the pointer constant `{ty}` is not a reference"))?;
+                self.static_pointer_const_tree(alloc_id, def_id, pointer.offset, pointee, ty)
+            }
             _ => Ok(ConstTree::Global {
                 target: self.global_reference(alloc_id)?,
                 offset: pointer.offset.bytes(),
@@ -1584,23 +1646,13 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                         depth,
                     )?))
                 }
-                GlobalAlloc::Static(def_id) => {
-                    if !crate::constant::raw::static_matches_pointee(
-                        tcx,
-                        def_id,
-                        pointer.offset,
-                        concrete_ty,
-                    ) {
-                        return Err(format!(
-                            "a pointer into part of a `static` is not encoded in a constant \
-                             (type `{ty}`)"
-                        ));
-                    }
-                    ConstTree::Global {
-                        target: self.global_reference(alloc_id)?,
-                        offset: pointer.offset.bytes(),
-                    }
-                }
+                GlobalAlloc::Static(def_id) => self.static_pointer_const_tree(
+                    alloc_id,
+                    def_id,
+                    pointer.offset,
+                    concrete_ty,
+                    ty,
+                )?,
                 _ => {
                     return Err(format!(
                         "a wide `{ty}` to a named global is not encoded in a constant"
@@ -1612,6 +1664,69 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             data: Box::new(data),
             concrete,
             vtable,
+        })
+    }
+
+    fn static_pointer_const_tree(
+        &mut self,
+        alloc_id: mir::interpret::AllocId,
+        def_id: DefId,
+        offset: Size,
+        pointee: Ty<'tcx>,
+        outer_ty: Ty<'tcx>,
+    ) -> Result<ConstTree, String> {
+        let tcx = self.cgu.tcx;
+        let Some(steps) = crate::constant::raw::resolve_static_path(tcx, def_id, offset, pointee)
+        else {
+            return Err(format!(
+                "a pointer into part of a `static` is not encoded in a constant (type `{outer_ty}`)"
+            ));
+        };
+        let target = self.global_reference(alloc_id)?;
+        if steps.is_empty() {
+            Ok(ConstTree::Global { target, offset: 0 })
+        } else {
+            let path = steps
+                .into_iter()
+                .map(|step| match step {
+                    crate::constant::raw::StaticPathStep::Field(name) => StaticStep::Field(name),
+                    crate::constant::raw::StaticPathStep::Index(idx) => StaticStep::Index(idx),
+                })
+                .collect();
+            Ok(ConstTree::StaticField { target, path })
+        }
+    }
+
+    fn static_slice_const_tree(
+        &mut self,
+        alloc_id: mir::interpret::AllocId,
+        def_id: DefId,
+        offset: Size,
+        element_ty: Ty<'tcx>,
+        length: u64,
+        outer_ty: Ty<'tcx>,
+    ) -> Result<ConstTree, String> {
+        let tcx = self.cgu.tcx;
+        let Some((steps, start)) =
+            crate::constant::raw::resolve_static_slice(tcx, def_id, offset, element_ty, length)
+        else {
+            return Err(format!(
+                "a pointer into part of a `static` is not encoded in a constant (type `{outer_ty}`)"
+            ));
+        };
+        let target = self.global_reference(alloc_id)?;
+        let path = steps
+            .into_iter()
+            .map(|step| match step {
+                crate::constant::raw::StaticPathStep::Field(name) => StaticStep::Field(name),
+                crate::constant::raw::StaticPathStep::Index(idx) => StaticStep::Index(idx),
+            })
+            .collect();
+        Ok(ConstTree::StaticSlice {
+            target,
+            path,
+            start,
+            length,
         })
     }
 

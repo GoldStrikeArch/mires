@@ -3005,6 +3005,14 @@ fn collect_static_refs(tree: &ConstTree, out: &mut Vec<DefinitionId>) {
         ConstTree::Global {
             target: GlobalReference::Static { definition, .. },
             ..
+        }
+        | ConstTree::StaticField {
+            target: GlobalReference::Static { definition, .. },
+            ..
+        }
+        | ConstTree::StaticSlice {
+            target: GlobalReference::Static { definition, .. },
+            ..
         } => out.push(*definition),
         ConstTree::Aggregate(fields)
         | ConstTree::Slice(fields)

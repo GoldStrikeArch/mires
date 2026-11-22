@@ -568,6 +568,34 @@ pub enum ConstTree {
         address: u64,
         length: u64,
     },
+    /// A pointer into a field or element of a `static` binding (`target`, always
+    /// `GlobalReference::Static`), walked step-by-step from the static root.
+    ///
+    /// Non-empty `path`: whole-static pointers keep [`ConstTree::Global`] unchanged.
+    StaticField {
+        target: GlobalReference,
+        path: Vec<StaticStep>,
+    },
+    /// A wide slice pointer (`&[T]` / `*const [T]`) into a `static` array (or a nested array
+    /// field/element along `path`), starting at element `start` with `length` elements.
+    StaticSlice {
+        target: GlobalReference,
+        path: Vec<StaticStep>,
+        start: u32,
+        length: u64,
+    },
+}
+
+/// One JavaScript projection step from a `static` binding down to a nested field or element.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum StaticStep {
+    /// Append-only: postcard serializes this enum by index.
+    ///
+    /// An object property (`base.name` / `{ buf: base, off: "name" }`), already escaped by
+    /// `Namer::field_name` (named structs and tuple structs `_0`, `_1`, ...).
+    Field(StrId),
+    /// A JS array element (`base[index]` / `{ buf: base, off: index }`), for tuples and arrays.
+    Index(u32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -1168,6 +1168,14 @@ fn const_item_refs(tree: &ConstTree, interns: &Interns, target: &str) -> usize {
             target:
                 GlobalReference::Function { link_name, .. } | GlobalReference::Static { link_name, .. },
             ..
+        }
+        | ConstTree::StaticField {
+            target: GlobalReference::Static { link_name, .. },
+            ..
+        }
+        | ConstTree::StaticSlice {
+            target: GlobalReference::Static { link_name, .. },
+            ..
         } => usize::from(interns.str(*link_name) == Some(target)),
         ConstTree::Unit
         | ConstTree::Scalar { .. }
@@ -1177,7 +1185,9 @@ fn const_item_refs(tree: &ConstTree, interns: &Interns, target: &str) -> usize {
         | ConstTree::Global {
             target: GlobalReference::Type(_),
             ..
-        } => 0,
+        }
+        | ConstTree::StaticField { .. }
+        | ConstTree::StaticSlice { .. } => 0,
     }
 }
 

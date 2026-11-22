@@ -149,7 +149,9 @@ impl Dependencies {
         let mut work = vec![tree];
         while let Some(tree) = work.pop() {
             match tree {
-                ConstTree::Global { target, .. } => self.global(*target),
+                ConstTree::Global { target, .. }
+                | ConstTree::StaticField { target, .. }
+                | ConstTree::StaticSlice { target, .. } => self.global(*target),
                 ConstTree::Aggregate(fields)
                 | ConstTree::Variant { fields, .. }
                 | ConstTree::Slice(fields) => work.extend(fields),
@@ -427,6 +429,30 @@ mod tests {
             })
             .link_dependencies(),
             names(&[41, 42])
+        );
+    }
+
+    #[test]
+    fn static_field_const_records_static_dependency() {
+        use super::super::semantic::StaticStep;
+        let init = ConstTree::Dyn {
+            data: Box::new(ConstTree::StaticField {
+                target: GlobalReference::Static {
+                    definition: item(0).item.definition,
+                    link_name: StrId(51),
+                },
+                path: vec![StaticStep::Field(StrId(52)), StaticStep::Index(1)],
+            }),
+            concrete: TypeId(1),
+            vtable: StrId(53),
+        };
+        assert_eq!(
+            body(BodyKind::Static {
+                init,
+                mutable: false,
+            })
+            .link_dependencies(),
+            names(&[51, 53])
         );
     }
 }

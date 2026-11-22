@@ -8305,6 +8305,247 @@ fn const_slice_address_lowers_zst_dangling_and_bare_slices() {
 }
 
 #[test]
+fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
+    use rcgjs_object::jir::semantic::{GlobalReference, StaticStep};
+
+    const PAIR_TY: TypeId = TypeId(440);
+    const REF_U32: TypeId = TypeId(441);
+    const RAW_U32: TypeId = TypeId(442);
+    const REF_PAIR: TypeId = TypeId(443);
+    const RAW_PAIR: TypeId = TypeId(444);
+    const DYN_TY: TypeId = TypeId(445);
+    const REF_DYN: TypeId = TypeId(446);
+
+    let mut interns = world();
+    let mut pair = descriptor(
+        PAIR_TY,
+        TypeKind::Adt {
+            def: def(220),
+            form: NominalForm::Struct,
+            args: Vec::new(),
+            variants: Vec::new(),
+            niche: None,
+        },
+        8,
+    );
+    pair.js.is_indirect = true;
+    interns.intern_type(pair);
+    interns.intern_type(pointer(REF_U32, U32, PointerForm::Slot, false));
+    interns.intern_type(pointer(RAW_U32, U32, PointerForm::Slot, true));
+    interns.intern_type(pointer(REF_PAIR, PAIR_TY, PointerForm::Thin, false));
+    interns.intern_type(pointer(RAW_PAIR, PAIR_TY, PointerForm::Slot, true));
+    let mut dyn_desc = descriptor(
+        DYN_TY,
+        TypeKind::Dynamic {
+            principal: None,
+            auto: Vec::new(),
+        },
+        0,
+    );
+    dyn_desc.layout.sized = false;
+    dyn_desc.js.is_indirect = true;
+    interns.intern_type(dyn_desc);
+    interns.intern_type(pointer(REF_DYN, DYN_TY, PointerForm::FatDyn, false));
+
+    let stat_p = interns.intern_str("P");
+    let stat_outer = interns.intern_str("OUTER");
+    let f_first = interns.intern_str("first_word");
+    let f_inner = interns.intern_str("inner");
+    let f_arr = interns.intern_str("arr");
+    let f_non_ident = interns.intern_str("a-b");
+    let vt_u32 = interns.intern_str("vt_u32");
+    let vt_pair = interns.intern_str("vt_pair");
+
+    let target_p = GlobalReference::Static {
+        definition: def(221),
+        link_name: stat_p,
+    };
+    let target_outer = GlobalReference::Static {
+        definition: def(222),
+        link_name: stat_outer,
+    };
+
+    let check = |ty: TypeId, tree: ConstTree, expected: &str| {
+        let mut b = FuncBuilder::new(item(1), signature(Vec::new(), ty));
+        let e = FuncBuilder::ENTRY;
+        let v = b.op(e, OpKind::Const(tree), ty, NO_ORIGIN);
+        b.terminate(e, RTerm::Return(Some(v)));
+        let func = b.finish();
+        let plan = plan_of(&func, &[]);
+        let body = body_of(BodyKind::Function, func.sig.clone());
+        let js = lower(&interns, "f", &[], &body, &func, &plan, straight(&func));
+        assert_eq!(js, format!("function f() {{\n  return {expected};\n}}\n"));
+    };
+
+    // Direct primitive field: `&P.first_word` and `*const u32` -> `{ buf: P, off: "first_word" }`
+    check(
+        REF_U32,
+        ConstTree::StaticField {
+            target: target_p,
+            path: vec![StaticStep::Field(f_first)],
+        },
+        "{ buf: P, off: \"first_word\" }",
+    );
+    check(
+        RAW_U32,
+        ConstTree::StaticField {
+            target: target_p,
+            path: vec![StaticStep::Field(f_first)],
+        },
+        "{ buf: P, off: \"first_word\" }",
+    );
+
+    // Nested direct field: `&OUTER.arr[1].first_word`
+    check(
+        REF_U32,
+        ConstTree::StaticField {
+            target: target_outer,
+            path: vec![
+                StaticStep::Field(f_arr),
+                StaticStep::Index(1),
+                StaticStep::Field(f_first),
+            ],
+        },
+        "{ buf: OUTER.arr[1], off: \"first_word\" }",
+    );
+
+    // Indirect aggregate field: `&OUTER.inner` -> `OUTER.inner`, `*const Pair` -> `{ buf: OUTER, off: "inner" }`
+    check(
+        REF_PAIR,
+        ConstTree::StaticField {
+            target: target_outer,
+            path: vec![StaticStep::Field(f_inner)],
+        },
+        "OUTER.inner",
+    );
+    check(
+        RAW_PAIR,
+        ConstTree::StaticField {
+            target: target_outer,
+            path: vec![StaticStep::Field(f_inner)],
+        },
+        "{ buf: OUTER, off: \"inner\" }",
+    );
+
+    // Nested indirect array element: `&OUTER.arr[1]` vs `*const Pair`
+    check(
+        REF_PAIR,
+        ConstTree::StaticField {
+            target: target_outer,
+            path: vec![StaticStep::Field(f_arr), StaticStep::Index(1)],
+        },
+        "OUTER.arr[1]",
+    );
+    check(
+        RAW_PAIR,
+        ConstTree::StaticField {
+            target: target_outer,
+            path: vec![StaticStep::Field(f_arr), StaticStep::Index(1)],
+        },
+        "{ buf: OUTER.arr, off: 1 }",
+    );
+
+    // Non-identifier field name uses safe bracket indexing via jsast::member
+    check(
+        REF_PAIR,
+        ConstTree::StaticField {
+            target: target_outer,
+            path: vec![StaticStep::Field(f_non_ident)],
+        },
+        "OUTER[\"a-b\"]",
+    );
+
+    // `&dyn Trait` pointing at both direct and indirect static sub-fields
+    check(
+        REF_DYN,
+        ConstTree::Dyn {
+            data: Box::new(ConstTree::StaticField {
+                target: target_p,
+                path: vec![StaticStep::Field(f_first)],
+            }),
+            concrete: U32,
+            vtable: vt_u32,
+        },
+        "{ ptr: { buf: P, off: \"first_word\" }, meta: vt_u32 }",
+    );
+    check(
+        REF_DYN,
+        ConstTree::Dyn {
+            data: Box::new(ConstTree::StaticField {
+                target: target_outer,
+                path: vec![StaticStep::Field(f_inner)],
+            }),
+            concrete: PAIR_TY,
+            vtable: vt_pair,
+        },
+        "{ ptr: OUTER.inner, meta: vt_pair }",
+    );
+
+    // Wide slice pointers into root static array and nested static array field
+    check(
+        REF_PAIR,
+        ConstTree::StaticSlice {
+            target: target_p,
+            path: Vec::new(),
+            start: 1,
+            length: 2,
+        },
+        "{ buf: P, off: 1, len: 2 }",
+    );
+    check(
+        REF_PAIR,
+        ConstTree::StaticSlice {
+            target: target_outer,
+            path: vec![StaticStep::Field(f_arr)],
+            start: 0,
+            length: 4,
+        },
+        "{ buf: OUTER.arr, off: 0, len: 4 }",
+    );
+
+    // Empty path declines cleanly instead of mislowering
+    let mut bad = FuncBuilder::new(item(2), signature(Vec::new(), REF_U32));
+    let e = FuncBuilder::ENTRY;
+    let v = bad.op(
+        e,
+        OpKind::Const(ConstTree::StaticField {
+            target: target_p,
+            path: Vec::new(),
+        }),
+        REF_U32,
+        NO_ORIGIN,
+    );
+    bad.terminate(e, RTerm::Return(Some(v)));
+    let func = bad.finish();
+    let plan = plan_of(&func, &[]);
+    let body = body_of(BodyKind::Function, func.sig.clone());
+    let opts = Opts::default();
+    let bad_name = JsName::new("bad".to_owned());
+    let bad_summary = summary(&[]);
+    let bad_input = LowerInput {
+        name: &bad_name,
+        summary: &bad_summary,
+        body: &body,
+        origins: None,
+        interns: &interns,
+        table: &interns.types,
+        opts: &opts,
+        items: super::host::EMPTY_ITEMS,
+        drop_glue: super::host::EMPTY_DROP_GLUE,
+        vtables: &super::unsize::EMPTY_VTABLES,
+        spills: &[],
+        abi: None,
+        physical: None,
+        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
+    };
+    assert!(
+        function::lower(&bad_input, &func, &plan, straight(&func)).is_err(),
+        "empty StaticField path must decline"
+    );
+}
+
+#[test]
 fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
     const RAW_ARR: TypeId = TypeId(415);
     const ARRAY_2: TypeId = TypeId(416);

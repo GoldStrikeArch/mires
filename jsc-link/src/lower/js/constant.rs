@@ -6,7 +6,9 @@ use std::collections::BTreeSet;
 
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::origin::SourceFact;
-use rcgjs_object::jir::semantic::{CallSemantic, Callee, ConstTree, DefinitionId, GlobalReference};
+use rcgjs_object::jir::semantic::{
+    CallSemantic, Callee, ConstTree, DefinitionId, GlobalReference, StaticStep,
+};
 use rcgjs_object::jir::types::{
     EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind, TypeTable,
 };
@@ -141,6 +143,13 @@ impl<'a> JsCx<'a> {
             }
             ConstTree::Address(address) => Ok(jsast::num(*address as f64)),
             ConstTree::Global { target, offset } => self.global_expr(target, *offset, ty),
+            ConstTree::StaticField { target, path } => self.static_field_expr(target, path, ty),
+            ConstTree::StaticSlice {
+                target,
+                path,
+                start,
+                length,
+            } => self.static_slice_expr(target, path, *start, *length),
             ConstTree::Aggregate(fields) => self.aggregate_expr(fields, ty, depth),
             ConstTree::Variant { variant, fields } => {
                 let variants = table.variants(ty);
@@ -601,6 +610,10 @@ impl<'a> JsCx<'a> {
                     ptr::slot(binding, jsast::num(0))
                 }
             }
+            ConstTree::StaticField {
+                target: GlobalReference::Static { link_name, .. },
+                path,
+            } => self.static_field_ptr_expr(*link_name, path, concrete, false)?,
             ConstTree::Address(address) => jsast::num(*address as f64),
             _ => {
                 return Err(decline(
@@ -706,6 +719,109 @@ impl<'a> JsCx<'a> {
                 OpClass::Constant,
                 format!("a pointer to a type allocation at type {:032x}", ty.0),
             )),
+        }
+    }
+
+    /// A pointer into a sub-field or element of a `static` (`constant.rs::static_pointer_expr`).
+    fn static_field_expr(
+        &self,
+        target: &GlobalReference,
+        path: &[StaticStep],
+        ty: TypeId,
+    ) -> Res<Expr> {
+        let GlobalReference::Static { link_name, .. } = target else {
+            return Err(decline(
+                OpClass::Constant,
+                "a `static` field pointer constant does not name a `static`",
+            ));
+        };
+        let Some(pointee) = value::pointee_of(self.table, ty) else {
+            return Err(decline(
+                OpClass::Constant,
+                "a `static` field pointer constant at a type that is not a pointer",
+            ));
+        };
+        let is_raw = value::is_raw(self.table, ty);
+        self.static_field_ptr_expr(*link_name, path, pointee, is_raw)
+    }
+
+    fn static_slice_expr(
+        &self,
+        target: &GlobalReference,
+        path: &[StaticStep],
+        start: u32,
+        length: u64,
+    ) -> Res<Expr> {
+        let GlobalReference::Static { link_name, .. } = target else {
+            return Err(decline(
+                OpClass::Constant,
+                "a `static` slice pointer constant does not name a `static`",
+            ));
+        };
+        let mut buf = jsast::id(self.interns.str(*link_name).unwrap_or("").to_owned());
+        for step in path {
+            buf = self.apply_static_step(buf, *step)?;
+        }
+        Ok(ptr::fat_slice(
+            buf,
+            jsast::num(f64::from(start)),
+            jsast::num(length as f64),
+        ))
+    }
+
+    fn static_field_ptr_expr(
+        &self,
+        link_name: rcgjs_object::jir::StrId,
+        path: &[StaticStep],
+        pointee: TypeId,
+        is_raw: bool,
+    ) -> Res<Expr> {
+        let Some((last, prefix)) = path.split_last() else {
+            return Err(decline(
+                OpClass::Constant,
+                "a `static` field pointer constant has an empty projection path",
+            ));
+        };
+        let mut parent = jsast::id(self.interns.str(link_name).unwrap_or("").to_owned());
+        for step in prefix {
+            parent = self.apply_static_step(parent, *step)?;
+        }
+        if !self.table.is_indirect(pointee)
+            || (is_raw && value::is_slot_pointee(self.table, pointee))
+        {
+            let key = self.static_step_key(*last)?;
+            return Ok(ptr::slot(parent, key));
+        }
+        self.apply_static_step(parent, *last)
+    }
+
+    fn apply_static_step(&self, base: Expr, step: StaticStep) -> Res<Expr> {
+        match step {
+            StaticStep::Field(name) => {
+                let name = self.interns.str(name).ok_or_else(|| {
+                    decline(
+                        OpClass::Constant,
+                        "a `static` field pointer names an uninterned field",
+                    )
+                })?;
+                Ok(jsast::member(base, name.to_owned()))
+            }
+            StaticStep::Index(index) => Ok(jsast::index(base, jsast::num(f64::from(index)))),
+        }
+    }
+
+    fn static_step_key(&self, step: StaticStep) -> Res<Expr> {
+        match step {
+            StaticStep::Field(name) => {
+                let name = self.interns.str(name).ok_or_else(|| {
+                    decline(
+                        OpClass::Constant,
+                        "a `static` field pointer names an uninterned field",
+                    )
+                })?;
+                Ok(jsast::string(name))
+            }
+            StaticStep::Index(index) => Ok(jsast::num(f64::from(index))),
         }
     }
 

@@ -319,31 +319,429 @@ pub(crate) fn read_vtable<'tcx>(
     Some((concrete_ty, principal))
 }
 
-/// Whether a pointer at `offset` into `static` `def_id` names the whole static binding with the
-/// same JS value shape and boxing as `pointee`.
-///
-/// Struct field 0, array element 0, tuple field 0, niche enum payloads, and `MaybeUninit<T>` inner
-/// values all sit at byte offset zero while having a different JS shape or boxing than the
-/// enclosing `static` binding (`peel_transparent` / `is_indirect`).
-pub(crate) fn static_matches_pointee<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: rustc_hir::def_id::DefId,
-    offset: Size,
-    pointee: Ty<'tcx>,
-) -> bool {
-    if offset != Size::ZERO {
-        return false;
-    }
-    let static_ty =
-        tcx.normalize_erasing_regions(typing_env(), tcx.type_of(def_id).instantiate_identity());
-    let static_peeled = tcx.erase_and_anonymize_regions(crate::value::peel_pattern(
-        crate::value::peel_transparent(tcx, static_ty),
+/// Maximum nesting depth when resolving a constant pointer into fields/elements of a `static`.
+const MAX_STATIC_PATH_DEPTH: u32 = 32;
+
+/// One JavaScript projection step from a `static` binding down to a nested field or element.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum StaticPathStep {
+    /// A struct field (named or tuple-struct), already escaped via [`crate::naming::Namer::field_name`].
+    Field(String),
+    /// A tuple or array element at numeric index `index`.
+    Index(u32),
+}
+
+/// Whether `cur_ty` and `pointee` have the same JS value shape and boxing (`peel_transparent` /
+/// `peel_pattern` / `is_indirect`).
+fn static_types_match<'tcx>(tcx: TyCtxt<'tcx>, cur_ty: Ty<'tcx>, pointee: Ty<'tcx>) -> bool {
+    let cur_peeled = tcx.erase_and_anonymize_regions(crate::value::peel_pattern(
+        crate::value::peel_transparent(tcx, cur_ty),
     ));
     let pointee_peeled = tcx.erase_and_anonymize_regions(crate::value::peel_pattern(
         crate::value::peel_transparent(tcx, pointee),
     ));
-    static_peeled == pointee_peeled
-        && crate::value::is_indirect(tcx, static_ty) == crate::value::is_indirect(tcx, pointee)
+    cur_peeled == pointee_peeled
+        && crate::value::is_indirect(tcx, cur_ty) == crate::value::is_indirect(tcx, pointee)
+}
+
+/// Resolves a constant pointer at byte `offset` into `static` `def_id` with target type `pointee`
+/// to a sequence of JavaScript projection steps from the static root binding.
+///
+/// - `Some(vec![])` means the pointer names the whole `static` binding (offset 0 with matching
+///   JS shape and boxing), keeping `ConstTree::Global` unchanged.
+/// - `Some(steps)` (non-empty) names a concrete sub-field/element reachable through structs,
+///   tuples, arrays, and non-union transparent wrappers.
+/// - `None` fails closed for unions, enums, unsized pointees (slices/`str`/unsized tails),
+///   type-punned pointers, ambiguous ZST fields, or out-of-bounds/misaligned offsets.
+pub(crate) fn resolve_static_path<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: rustc_hir::def_id::DefId,
+    offset: Size,
+    pointee: Ty<'tcx>,
+) -> Option<Vec<StaticPathStep>> {
+    let static_ty =
+        tcx.normalize_erasing_regions(typing_env(), tcx.type_of(def_id).instantiate_identity());
+    if !static_ty.is_sized(tcx, typing_env()) || !pointee.is_sized(tcx, typing_env()) {
+        return None;
+    }
+    let pointee_layout = tcx.layout_of(typing_env().as_query_input(pointee)).ok()?;
+    resolve_static_path_inner(tcx, static_ty, offset, pointee, pointee_layout.size, 0)
+}
+
+fn checked_sub_size(lhs: Size, rhs: Size) -> Option<Size> {
+    lhs.bytes().checked_sub(rhs.bytes()).map(Size::from_bytes)
+}
+
+fn resolve_static_path_inner<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    cur_ty: Ty<'tcx>,
+    rem_offset: Size,
+    pointee: Ty<'tcx>,
+    pointee_size: Size,
+    depth: u32,
+) -> Option<Vec<StaticPathStep>> {
+    if rem_offset == Size::ZERO && static_types_match(tcx, cur_ty, pointee) {
+        return Some(Vec::new());
+    }
+    if depth >= MAX_STATIC_PATH_DEPTH {
+        return None;
+    }
+    // Never descend into a non-indirect value (primitives, fieldless enums, transparent unions, or
+    // boxed direct statics) or a zero-sized container (which has no JS object/array storage to
+    // index into safely).
+    if !crate::value::is_indirect(tcx, cur_ty) {
+        return None;
+    }
+    let cur_layout = tcx.layout_of(typing_env().as_query_input(cur_ty)).ok()?;
+    if cur_layout.is_zst() {
+        return None;
+    }
+
+    // Peel patterns and non-union transparent wrappers (e.g. `UnsafeCell`, `Cell`, `ManuallyDrop`,
+    // `#[repr(transparent)]` structs) whose JS representation IS the inner aggregate.
+    let mut ty = crate::value::peel_pattern(cur_ty);
+    let mut rem = rem_offset;
+    for _ in 0..16 {
+        if matches!(ty.kind(), ty::Adt(def, _) if def.is_union()) {
+            return None;
+        }
+        let Some((idx, field_ty)) = crate::value::transparent_field_indexed(tcx, ty) else {
+            break;
+        };
+        let layout = tcx.layout_of(typing_env().as_query_input(ty)).ok()?;
+        rem = checked_sub_size(rem, layout.fields.offset(idx.as_usize()))?;
+        ty = crate::value::peel_pattern(field_ty);
+    }
+
+    let layout = tcx.layout_of(typing_env().as_query_input(ty)).ok()?;
+    if layout.is_zst() {
+        return None;
+    }
+
+    match ty.kind() {
+        ty::Adt(def, args) if def.is_struct() => {
+            let variant = def.non_enum_variant();
+            let mut matched: Option<Vec<StaticPathStep>> = None;
+            for (idx, field) in variant.fields.iter_enumerated() {
+                let field_offset = layout.fields.offset(idx.as_usize());
+                let Some(sub_offset) = checked_sub_size(rem, field_offset) else {
+                    continue;
+                };
+                let field_ty = tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args));
+                let Ok(field_layout) = tcx.layout_of(typing_env().as_query_input(field_ty)) else {
+                    continue;
+                };
+                if sub_offset
+                    .bytes()
+                    .checked_add(pointee_size.bytes())
+                    .is_none_or(|end| end > field_layout.size.bytes())
+                {
+                    continue;
+                }
+                if let Some(mut tail) = resolve_static_path_inner(
+                    tcx,
+                    field_ty,
+                    sub_offset,
+                    pointee,
+                    pointee_size,
+                    depth + 1,
+                ) {
+                    if matched.is_some() {
+                        // Ambiguous match (e.g. two ZST fields of the same type at the same offset).
+                        return None;
+                    }
+                    let mut path = Vec::with_capacity(1 + tail.len());
+                    path.push(StaticPathStep::Field(crate::naming::Namer::field_name(
+                        variant, idx,
+                    )));
+                    path.append(&mut tail);
+                    matched = Some(path);
+                }
+            }
+            matched
+        }
+        ty::Tuple(elems) => {
+            let mut matched: Option<Vec<StaticPathStep>> = None;
+            for (idx, elem_ty) in elems.iter().enumerate() {
+                let field_offset = layout.fields.offset(idx);
+                let Some(sub_offset) = checked_sub_size(rem, field_offset) else {
+                    continue;
+                };
+                let Ok(elem_layout) = tcx.layout_of(typing_env().as_query_input(elem_ty)) else {
+                    continue;
+                };
+                if sub_offset
+                    .bytes()
+                    .checked_add(pointee_size.bytes())
+                    .is_none_or(|end| end > elem_layout.size.bytes())
+                {
+                    continue;
+                }
+                if let Some(mut tail) = resolve_static_path_inner(
+                    tcx,
+                    elem_ty,
+                    sub_offset,
+                    pointee,
+                    pointee_size,
+                    depth + 1,
+                ) {
+                    if matched.is_some() {
+                        return None;
+                    }
+                    let idx_u32 = u32::try_from(idx).ok()?;
+                    let mut path = Vec::with_capacity(1 + tail.len());
+                    path.push(StaticPathStep::Index(idx_u32));
+                    path.append(&mut tail);
+                    matched = Some(path);
+                }
+            }
+            matched
+        }
+        ty::Array(elem, len) => {
+            let count = len.try_to_target_usize(tcx)?;
+            let elem_ty = *elem;
+            let elem_layout = tcx.layout_of(typing_env().as_query_input(elem_ty)).ok()?;
+            let stride = elem_layout.size.bytes();
+            if stride == 0 {
+                return None;
+            }
+            let idx = rem.bytes() / stride;
+            if idx >= count {
+                return None;
+            }
+            let idx_u32 = u32::try_from(idx).ok()?;
+            let sub_offset = Size::from_bytes(rem.bytes() % stride);
+            if sub_offset
+                .bytes()
+                .checked_add(pointee_size.bytes())
+                .is_none_or(|end| end > stride)
+            {
+                return None;
+            }
+            let mut tail = resolve_static_path_inner(
+                tcx,
+                elem_ty,
+                sub_offset,
+                pointee,
+                pointee_size,
+                depth + 1,
+            )?;
+            let mut path = Vec::with_capacity(1 + tail.len());
+            path.push(StaticPathStep::Index(idx_u32));
+            path.append(&mut tail);
+            Some(path)
+        }
+        _ => None,
+    }
+}
+
+/// Resolves a wide slice constant (`&[E]` / `*const [E]`) of `length` elements at byte `offset`
+/// into `static` `def_id` to `(path_to_array, start_index)`.
+///
+/// Matches a `static` array `[E; N]` (or a nested array field/element inside structs/tuples/arrays)
+/// whose element type matches `element_ty` and where `start_index + length <= N`. Fails closed
+/// (`None`) on ZST elements, type-punned slices, unions, enums, misaligned offsets, or
+/// out-of-bounds lengths.
+pub(crate) fn resolve_static_slice<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: rustc_hir::def_id::DefId,
+    offset: Size,
+    element_ty: Ty<'tcx>,
+    length: u64,
+) -> Option<(Vec<StaticPathStep>, u32)> {
+    let static_ty =
+        tcx.normalize_erasing_regions(typing_env(), tcx.type_of(def_id).instantiate_identity());
+    if !static_ty.is_sized(tcx, typing_env()) || !element_ty.is_sized(tcx, typing_env()) {
+        return None;
+    }
+    let elem_layout = tcx
+        .layout_of(typing_env().as_query_input(element_ty))
+        .ok()?;
+    let stride = elem_layout.size.bytes();
+    if stride == 0 {
+        return None;
+    }
+    let slice_bytes = length.checked_mul(stride)?;
+    resolve_static_slice_inner(
+        tcx,
+        static_ty,
+        offset,
+        element_ty,
+        stride,
+        length,
+        slice_bytes,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_static_slice_inner<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    cur_ty: Ty<'tcx>,
+    rem_offset: Size,
+    element_ty: Ty<'tcx>,
+    stride: u64,
+    length: u64,
+    slice_bytes: u64,
+    depth: u32,
+) -> Option<(Vec<StaticPathStep>, u32)> {
+    if depth >= MAX_STATIC_PATH_DEPTH || !crate::value::is_indirect(tcx, cur_ty) {
+        return None;
+    }
+    let cur_layout = tcx.layout_of(typing_env().as_query_input(cur_ty)).ok()?;
+    if cur_layout.is_zst() {
+        return None;
+    }
+
+    let mut ty = crate::value::peel_pattern(cur_ty);
+    let mut rem = rem_offset;
+    for _ in 0..16 {
+        if matches!(ty.kind(), ty::Adt(def, _) if def.is_union()) {
+            return None;
+        }
+        let Some((idx, field_ty)) = crate::value::transparent_field_indexed(tcx, ty) else {
+            break;
+        };
+        let layout = tcx.layout_of(typing_env().as_query_input(ty)).ok()?;
+        rem = checked_sub_size(rem, layout.fields.offset(idx.as_usize()))?;
+        ty = crate::value::peel_pattern(field_ty);
+    }
+
+    let layout = tcx.layout_of(typing_env().as_query_input(ty)).ok()?;
+    if layout.is_zst() {
+        return None;
+    }
+
+    match ty.kind() {
+        ty::Array(arr_elem, count) => {
+            let count = count.try_to_target_usize(tcx)?;
+            if static_types_match(tcx, *arr_elem, element_ty) {
+                if !rem.bytes().is_multiple_of(stride) {
+                    return None;
+                }
+                let start = rem.bytes() / stride;
+                if start.checked_add(length).is_none_or(|end| end > count) {
+                    return None;
+                }
+                let start_u32 = u32::try_from(start).ok()?;
+                return Some((Vec::new(), start_u32));
+            }
+            let outer_layout = tcx.layout_of(typing_env().as_query_input(*arr_elem)).ok()?;
+            let outer_stride = outer_layout.size.bytes();
+            if outer_stride == 0 {
+                return None;
+            }
+            let idx = rem.bytes() / outer_stride;
+            if idx >= count {
+                return None;
+            }
+            let idx_u32 = u32::try_from(idx).ok()?;
+            let sub_offset = Size::from_bytes(rem.bytes() % outer_stride);
+            if sub_offset
+                .bytes()
+                .checked_add(slice_bytes)
+                .is_none_or(|end| end > outer_stride)
+            {
+                return None;
+            }
+            let (mut tail, start) = resolve_static_slice_inner(
+                tcx,
+                *arr_elem,
+                sub_offset,
+                element_ty,
+                stride,
+                length,
+                slice_bytes,
+                depth + 1,
+            )?;
+            let mut path = Vec::with_capacity(1 + tail.len());
+            path.push(StaticPathStep::Index(idx_u32));
+            path.append(&mut tail);
+            Some((path, start))
+        }
+        ty::Adt(def, args) if def.is_struct() => {
+            let variant = def.non_enum_variant();
+            let mut matched: Option<(Vec<StaticPathStep>, u32)> = None;
+            for (idx, field) in variant.fields.iter_enumerated() {
+                let field_offset = layout.fields.offset(idx.as_usize());
+                let Some(sub_offset) = checked_sub_size(rem, field_offset) else {
+                    continue;
+                };
+                let field_ty = tcx.normalize_erasing_regions(typing_env(), field.ty(tcx, args));
+                let Ok(field_layout) = tcx.layout_of(typing_env().as_query_input(field_ty)) else {
+                    continue;
+                };
+                if sub_offset
+                    .bytes()
+                    .checked_add(slice_bytes)
+                    .is_none_or(|end| end > field_layout.size.bytes())
+                {
+                    continue;
+                }
+                if let Some((mut tail, start)) = resolve_static_slice_inner(
+                    tcx,
+                    field_ty,
+                    sub_offset,
+                    element_ty,
+                    stride,
+                    length,
+                    slice_bytes,
+                    depth + 1,
+                ) {
+                    if matched.is_some() {
+                        return None;
+                    }
+                    let mut path = Vec::with_capacity(1 + tail.len());
+                    path.push(StaticPathStep::Field(crate::naming::Namer::field_name(
+                        variant, idx,
+                    )));
+                    path.append(&mut tail);
+                    matched = Some((path, start));
+                }
+            }
+            matched
+        }
+        ty::Tuple(elems) => {
+            let mut matched: Option<(Vec<StaticPathStep>, u32)> = None;
+            for (idx, elem_ty) in elems.iter().enumerate() {
+                let field_offset = layout.fields.offset(idx);
+                let Some(sub_offset) = checked_sub_size(rem, field_offset) else {
+                    continue;
+                };
+                let Ok(elem_layout) = tcx.layout_of(typing_env().as_query_input(elem_ty)) else {
+                    continue;
+                };
+                if sub_offset
+                    .bytes()
+                    .checked_add(slice_bytes)
+                    .is_none_or(|end| end > elem_layout.size.bytes())
+                {
+                    continue;
+                }
+                if let Some((mut tail, start)) = resolve_static_slice_inner(
+                    tcx,
+                    elem_ty,
+                    sub_offset,
+                    element_ty,
+                    stride,
+                    length,
+                    slice_bytes,
+                    depth + 1,
+                ) {
+                    if matched.is_some() {
+                        return None;
+                    }
+                    let idx_u32 = u32::try_from(idx).ok()?;
+                    let mut path = Vec::with_capacity(1 + tail.len());
+                    path.push(StaticPathStep::Index(idx_u32));
+                    path.append(&mut tail);
+                    matched = Some((path, start));
+                }
+            }
+            matched
+        }
+        _ => None,
+    }
 }
 
 /// Why the bytes of a `&str` could not be turned into one.
