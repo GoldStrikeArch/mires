@@ -271,29 +271,34 @@ fn collect_reachable_items(
                 }
                 for op in &block.ops {
                     match &op.kind {
-                        OpKind::Call { callee, .. } => match callee {
-                            Callee::Direct { link_name, .. } => {
-                                if let Some(s) = interns.str(*link_name) {
-                                    reachable_refs.insert(JsName::new(s.to_owned()));
-                                }
+                        OpKind::Call { callee, host, .. } => {
+                            if host.is_some() {
+                                has_host = true;
                             }
-                            Callee::Foreign { symbol, .. } => {
-                                if let Some(s) = interns.str(*symbol) {
-                                    reachable_refs.insert(JsName::new(s.to_owned()));
-                                }
-                            }
-                            Callee::Intrinsic {
-                                fallback: Some(d), ..
-                            } => {
-                                if let Some(s) = interns.str(d.link_name) {
-                                    let jn = JsName::new(s.to_owned());
-                                    if item.refs.contains(&jn) {
-                                        reachable_refs.insert(jn);
+                            match callee {
+                                Callee::Direct { link_name, .. } => {
+                                    if let Some(s) = interns.str(*link_name) {
+                                        reachable_refs.insert(JsName::new(s.to_owned()));
                                     }
                                 }
+                                Callee::Foreign { symbol, .. } => {
+                                    if let Some(s) = interns.str(*symbol) {
+                                        reachable_refs.insert(JsName::new(s.to_owned()));
+                                    }
+                                }
+                                Callee::Intrinsic {
+                                    fallback: Some(d), ..
+                                } => {
+                                    if let Some(s) = interns.str(d.link_name) {
+                                        let jn = JsName::new(s.to_owned());
+                                        if item.refs.contains(&jn) {
+                                            reachable_refs.insert(jn);
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
-                        },
+                        }
                         OpKind::Intrinsic {
                             name,
                             fallback,

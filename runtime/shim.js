@@ -4316,13 +4316,6 @@ globalThis.__rt.realloc = (p, size, align, new_size) => {
   }
   const active = block.typed !== undefined ? block.typed : buf;
   block.bytes = new_size;
-  if (block.typed !== undefined) {
-    const tb = globalThis.__rt._blk_get(block.typed);
-    if (tb !== undefined) tb.bytes = new_size;
-  } else if (block.raw !== undefined) {
-    const rb = globalThis.__rt._blk_get(block.raw);
-    if (rb !== undefined) rb.bytes = new_size;
-  }
   active.length = new_size / block.es;
   globalThis.__rt._addr_release(active, new_size);
   if (p.sc !== undefined) {
@@ -4330,10 +4323,8 @@ globalThis.__rt.realloc = (p, size, align, new_size) => {
     if (raw === undefined) {
       raw = [];
       block.raw = raw;
-      globalThis.__rt._blocks.set(raw, {
-        bytes: new_size, es: block.es, sk: block.sk, cl: block.cl,
-        fresh: false, zeroed: block.zeroed, typed: active,
-      });
+      block.typed = active;
+      globalThis.__rt._blocks.set(raw, block);
     }
     return { buf: raw, off: p.off };
   }
