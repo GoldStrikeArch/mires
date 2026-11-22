@@ -1,6 +1,6 @@
 # Elm diff port
 
-Elm with a JS host (`js/index.js`). The host only relays the request and the response through ports, and turns the encoder's `$diffUndefined` marker back into `undefined`. Strings are JS strings, and Elm's `String` functions count UTF-16 units, as jsdiff does. `Utf16.toList` splits a string at code-unit boundaries where an isolated surrogate would confuse Elm's character folds.
+Elm with a JS host (`js/index.js`). The host only relays `{ input, undefined }` and the response through ports, passing JavaScript's real `undefined` as an opaque value so Elm emits optional patch fields directly without a sentinel or post-pass walk. Strings are JS strings, and Elm's `String` functions count UTF-16 units, as jsdiff does. `Utf16.toList` splits a string at code-unit boundaries where an isolated surrogate would confuse Elm's character folds.
 
 - `Differ.elm`: the Myers search, the token policies and word.js's whitespace cleanup.
 - `Patch.elm`: create.js, parse.js, apply.js, reverse.js and line-endings.js. Since the 2026-11-20 review it follows parse.js and apply.js step by step: `parseIndex`, `metadata` (with its early return at a second diff header), `gitNames` (parseGitDiffHeader), `quoted` (parseQuotedFileName), `fileHeader`, `parseHunk`, `apply` (applyStructuredPatch), `fit` (applyHunk) and `step` (distanceIterator).

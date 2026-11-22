@@ -75,6 +75,14 @@
       }
     },
     {
+      "id": "wide-top",
+      "note": "top at 2^32 exceeds 32-bit integer range",
+      "input": {
+        "text": "a b c",
+        "top": 4294967296
+      }
+    },
+    {
       "id": "bench",
       "note": "deterministic 160-phrase mix (LCG seed 7) of the other cases; also the timing input",
       "input": {

@@ -2,5 +2,5 @@
   "schema": 1,
   "library": "pilot",
   "language": "scalajs",
-  "boundary": "run(input: Input) with a @js.native facade trait: `text` is the JS string itself, `top` a JS number read as Int; the String result is a JS string. Exported with @JSExportTopLevel as a native ES module export."
+  "boundary": "run(input: Input) with a @js.native facade trait: `text` is the JS string itself, `top` a JS number read as Double (saturated to Int.MaxValue); the String result is a JS string. Exported with @JSExportTopLevel as a native ES module export."
 }

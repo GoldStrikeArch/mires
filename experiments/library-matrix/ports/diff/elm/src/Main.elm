@@ -18,10 +18,19 @@ main =
     Platform.worker
         { init = \_ -> ( (), Cmd.none )
         , update =
-            \input _ ->
+            \envelope _ ->
+                let
+                    res =
+                        case D.decodeValue (D.map2 Tuple.pair (D.field "input" D.value) (D.field "undefined" D.value)) envelope of
+                            Ok ( input, absent ) ->
+                                run absent input
+
+                            Err _ ->
+                                Err "missing diff request"
+                in
                 ( ()
                 , response
-                    (case run input of
+                    (case res of
                         Ok v ->
                             E.object [ ( "ok", v ) ]
 
@@ -129,25 +138,28 @@ canonicalize stack =
                             canonicalize ({ parent | done = ( open.key, value ) :: parent.done } :: rest)
 
 
-run input =
+run absent input =
     let
+        get k v =
+            field absent k v
+
         op =
-            string (field "op" input)
+            string (get "op" input)
 
         a =
-            field "before" input
+            get "before" input
 
         b =
-            field "after" input
+            get "after" input
 
         arg =
-            field "patch" input
+            get "patch" input
 
         opts =
-            field "options" input
+            get "options" input
 
         flag k =
-            D.decodeValue D.bool (field k opts) |> Result.withDefault False
+            D.decodeValue D.bool (get k opts) |> Result.withDefault False
 
         o =
             Differ.Options (flag "ignoreCase") (flag "oneChangePerToken") (flag "stripTrailingCr") (flag "ignoreWhitespace") (flag "newlineIsToken") (flag "ignoreNewlineAtEof")
@@ -168,7 +180,7 @@ run input =
             change r.kind r.count (E.string r.value)
 
         patch () =
-            Patch.create input (D.decodeValue D.int (field "context" opts) |> Result.withDefault 4)
+            Patch.create absent input (D.decodeValue D.int (get "context" opts) |> Result.withDefault 4)
 
         readParsed ps =
             case ps of
@@ -179,7 +191,7 @@ run input =
                     Err "multiple file patches"
 
         reverse =
-            Patch.reverse
+            Patch.reverse absent
     in
     case op of
         "diffChars" ->

@@ -3,5 +3,5 @@
   "library": "pilot",
   "language": "gopherjs",
   "package": "./src",
-  "boundary": "run(input *js.Object): Get(\"text\").String() converts the JS string to a Go UTF-8 string, Get(\"top\").Int() reads the number; the Go string result is converted back to a JS string. Published on js.Module.exports."
+  "boundary": "run(input *js.Object): Get(\"text\").String() converts the JS string to a Go UTF-8 string, Get(\"top\").Float() reads the number (saturated to math.MaxInt32); the Go string result is converted back to a JS string. Published on js.Module.exports."
 }

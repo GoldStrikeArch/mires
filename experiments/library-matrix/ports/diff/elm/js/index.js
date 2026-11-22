@@ -1,14 +1,10 @@
+// JS host of the Elm port: the only Elm/JS boundary is the `request` / `response` port pair of
+// src/Main.elm. The request also carries JavaScript's `undefined`, which Elm cannot construct,
+// so optional patch fields come back as exact `undefined` without a sentinel or post-pass walk.
 import Elm from 'elm-program'
+
 let app
 let reply
-
-// JSON ports cannot carry undefined. The patch encoder marks its optional fields.
-function restore(value) {
-  if (value === null || typeof value !== 'object') return value
-  if (value.$diffUndefined === true) return undefined
-  for (const key of Object.keys(value)) value[key] = restore(value[key])
-  return value
-}
 
 export function run(input) {
   if (!app) {
@@ -16,7 +12,7 @@ export function run(input) {
     app.ports.response.subscribe(value => { reply = value })
   }
   reply = undefined
-  app.ports.request.send(input)
+  app.ports.request.send({ input, undefined })
   if (!reply || reply.error) throw new TypeError(reply?.error || 'missing diff response')
-  return restore(reply.ok)
+  return reply.ok
 }

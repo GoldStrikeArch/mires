@@ -1,4 +1,4 @@
-module Patch exposing (Patch, absent, apply, create, field, fields, format, parse, read, reverse, string, truthyField, write)
+module Patch exposing (Patch, apply, create, field, fields, format, parse, read, reverse, string, truthyField, write)
 
 {-| Unified patches after jsdiff 9.0.0 patch/create.js, parse.js, apply.js and
 reverse.js.
@@ -29,26 +29,14 @@ type alias Patch =
     { meta : Fields, hunks : List Hunk }
 
 
-{-| JSON ports cannot carry undefined; the host turns this marker back into it.
--}
-absent : E.Value
-absent =
-    E.object [ ( "$diffUndefined", E.bool True ) ]
-
-
-field : String -> D.Value -> E.Value
-field k v =
+field : E.Value -> String -> D.Value -> E.Value
+field absent k v =
     D.decodeValue (D.field k D.value) v |> Result.withDefault absent
 
 
 fields : D.Value -> Fields
 fields v =
     D.decodeValue (D.keyValuePairs D.value) v |> Result.withDefault []
-
-
-val : String -> Fields -> E.Value
-val k meta =
-    List.filter (Tuple.first >> (==) k) meta |> List.head |> Maybe.map Tuple.second |> Maybe.withDefault absent
 
 
 has : String -> Fields -> Bool
@@ -181,17 +169,17 @@ emit kind source start count h =
     }
 
 
-create : D.Value -> Int -> Patch
-create input ctx =
+create : E.Value -> D.Value -> Int -> Patch
+create absent input ctx =
     let
         before =
-            Array.fromList (Differ.lineTokens Differ.defaults (string (field "before" input)))
+            Array.fromList (Differ.lineTokens Differ.defaults (string (field absent "before" input)))
 
         after =
-            Array.fromList (Differ.lineTokens Differ.defaults (string (field "after" input)))
+            Array.fromList (Differ.lineTokens Differ.defaults (string (field absent "after" input)))
 
         meta =
-            List.map (\k -> ( k, field k input )) [ "oldFileName", "newFileName", "oldHeader", "newHeader" ]
+            List.map (\k -> ( k, field absent k input )) [ "oldFileName", "newFileName", "oldHeader", "newHeader" ]
 
         fresh =
             Hunk 0 0 0 0 []
@@ -315,22 +303,27 @@ quote name =
 format : Patch -> String
 format p =
     let
+        maybeString k =
+            List.filter (Tuple.first >> (==) k) p.meta
+                |> List.head
+                |> Maybe.andThen (Tuple.second >> D.decodeValue D.string >> Result.toMaybe)
+
         old =
-            val "oldFileName" p.meta
+            maybeString "oldFileName"
 
         new =
-            val "newFileName" p.meta
-
-        text v =
-            string v
+            maybeString "newFileName"
 
         header prefix side =
             let
                 h =
-                    text (val (side ++ "Header") p.meta)
+                    maybeString (side ++ "Header") |> Maybe.withDefault ""
+
+                name =
+                    maybeString (side ++ "FileName") |> Maybe.withDefault ""
             in
             prefix
-                ++ quote (text (val (side ++ "FileName") p.meta))
+                ++ quote name
                 ++ (if h == "" then
                         ""
 
@@ -354,18 +347,24 @@ format p =
         hunk h =
             "@@ -" ++ range h.oldStart h.oldLines ++ " +" ++ range h.newStart h.newLines ++ " @@\n" ++ String.concat (List.map (\l -> l ++ "\n") h.lines)
     in
-    (if old /= absent && old == new then
-        "Index: " ++ text old ++ "\n"
-
-     else
-        ""
-    )
-        ++ "===================================================================\n"
-        ++ (if old /= absent && new /= absent then
-                header "--- " "old" ++ header "+++ " "new"
+    (case ( old, new ) of
+        ( Just o, Just n ) ->
+            if o == n then
+                "Index: " ++ o ++ "\n"
 
             else
                 ""
+
+        _ ->
+            ""
+    )
+        ++ "===================================================================\n"
+        ++ (case ( old, new ) of
+                ( Just _, Just _ ) ->
+                    header "--- " "old" ++ header "+++ " "new"
+
+                _ ->
+                    ""
            )
         ++ String.concat (List.map hunk p.hunks)
 
@@ -1166,7 +1165,7 @@ parseIndex : List String -> Result String ( Patch, List String )
 parseIndex lines =
     let
         ( meta, afterMeta, endedEarly ) =
-            metadata lines False [ ( "hunks", absent ) ]
+            metadata lines False [ ( "hunks", E.null ) ]
 
         ( withOld, afterOld ) =
             fileHeader afterMeta meta
@@ -1208,13 +1207,16 @@ parse text =
 -- Over the JSON values, as Object.assign copies them.
 
 
-reverse : D.Value -> E.Value
-reverse v =
+reverse : E.Value -> D.Value -> E.Value
+reverse absent v =
     let
+        get k obj =
+            field absent k obj
+
         swapPrefix k =
             let
                 value =
-                    field k v
+                    get k v
             in
             if truthyField "isGit" v then
                 case D.decodeValue (D.field k D.string) v of
@@ -1246,23 +1248,23 @@ reverse v =
 
         hunk h =
             E.object
-                [ ( "oldLines", field "newLines" h )
-                , ( "oldStart", field "newStart" h )
-                , ( "newLines", field "oldLines" h )
-                , ( "newStart", field "oldStart" h )
+                [ ( "oldLines", get "newLines" h )
+                , ( "oldStart", get "newStart" h )
+                , ( "newLines", get "oldLines" h )
+                , ( "newStart", get "oldStart" h )
                 , ( "lines", E.list (line >> E.string) (D.decodeValue (D.field "lines" (D.list D.string)) h |> Result.withDefault []) )
                 ]
 
         swapped =
             fields v
                 |> put "oldFileName" (swapPrefix "newFileName")
-                |> put "oldHeader" (field "newHeader" v)
+                |> put "oldHeader" (get "newHeader" v)
                 |> put "newFileName" (swapPrefix "oldFileName")
-                |> put "newHeader" (field "oldHeader" v)
-                |> put "oldMode" (field "newMode" v)
-                |> put "newMode" (field "oldMode" v)
-                |> put "isCreate" (field "isDelete" v)
-                |> put "isDelete" (field "isCreate" v)
+                |> put "newHeader" (get "oldHeader" v)
+                |> put "oldMode" (get "newMode" v)
+                |> put "newMode" (get "oldMode" v)
+                |> put "isCreate" (get "isDelete" v)
+                |> put "isDelete" (get "isCreate" v)
                 |> put "hunks" (E.list hunk (D.decodeValue (D.field "hunks" (D.list D.value)) v |> Result.withDefault []))
     in
     if truthyField "isCopy" v then

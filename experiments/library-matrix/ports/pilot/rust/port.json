@@ -4,5 +4,5 @@
   "language": "rust",
   "entry": "src/lib.rs",
   "crateName": "matrix_pilot",
-  "boundary": "run(input: JsValue): Reflect.get reads `text` as &str (host string to Rust UTF-8) and `top` as usize; the String result is erased back to a host string."
+  "boundary": "run(input: JsValue): Reflect.get reads `text` as &str (host string to Rust UTF-8) and `top` as f64 (saturated to usize); the String result is erased back to a host string."
 }
