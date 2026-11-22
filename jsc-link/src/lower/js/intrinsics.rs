@@ -318,9 +318,15 @@ impl Intrinsic<'_, '_> {
                     stride => jsast::binary(BinOp::Mul, len, jsast::num(stride as f64)),
                 }))
             }
-            // A `&str` is a JavaScript string, whose size is the number of bytes it encodes to.
+            // A `&str` / `*const str` is a JavaScript string whose size is its UTF-8 byte length;
+            // a mutable `&mut str` / `*mut str` is a `{ buf, off, len }` byte slice whose size is
+            // `.len`.
             Some(TypeKind::Str) => Ok(Outcome::Value(if size {
-                self.cx.str_len(self.arg(0)?)
+                if value::is_mutable_ptr(table, self.arg_ty(0)?) {
+                    self.cx.slice_len(self.arg(0)?)
+                } else {
+                    self.cx.str_len(self.arg(0)?)
+                }
             } else {
                 self.usize_literal(1)?
             })),
@@ -1494,6 +1500,7 @@ impl Intrinsic<'_, '_> {
         };
         Ok(Outcome::Value(self.cx.build_fat(
             pointee,
+            value::is_mutable_ptr(self.cx.table, pointer_ty),
             Some(self.arg_ty(0)?),
             self.arg(0)?,
             self.arg(1)?,

@@ -256,11 +256,15 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
                     stride => jsast::binary(JsBinOp::Mul, len, jsast::num(stride as f64)),
                 })
             }
-            // A `&str` is a JavaScript string, whose size is the number of bytes it encodes to
-            // rather than the number of UTF-16 code units it is stored as — the two agree only for
-            // ASCII. `__rt.str_len` is the same answer `PtrMetadata` gives (`place.rs`).
+            // A `&str` / `*const str` is a JavaScript string whose size is its UTF-8 byte length;
+            // a mutable `&mut str` / `*mut str` is a `{ buf, off, len }` byte slice whose size is
+            // `.len`.
             ty::Str => Outcome::Value(if size {
-                crate::ptr::str_len(self.arg(0))
+                if crate::ptr::is_mut_str_ptr(tcx, self.arg_ty(0)) {
+                    crate::ptr::slice_len(self.arg(0))
+                } else {
+                    crate::ptr::str_len(self.arg(0))
+                }
             } else {
                 self.usize_literal(1)
             }),
@@ -1327,6 +1331,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         Outcome::Value(ptr::build_fat(
             self.fx,
             pointee,
+            ptr::is_mutable_ptr(self.fx.tcx, pointer_ty),
             Some(self.arg_ty(0)),
             self.arg(0),
             self.arg(1),

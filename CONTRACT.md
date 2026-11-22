@@ -1169,12 +1169,21 @@ not become initialized values.
   is the Rust-visible capacity in the same bytes, never below `len`: it starts at the requested
   capacity (zero, or the exact length for a builder made from text) and grows exact-fit, to the
   new length, when an append exceeds it — not by `RawVec`'s amortized doubling.
-- Writing through a `&mut str` stays a zombie: the `&mut str` a `String` derefs to is a decoded
-  JavaScript string, so a write through `as_bytes_mut` (`make_ascii_uppercase`,
-  `to_ascii_lowercase`) does not reach the `String`'s storage and is lost. It is contained: a cast
-  from `str` to a **mutable** byte pointer is `__rt.str_bytes_mut(s)`, a fresh record that is never
-  memoized, so the lost write never surfaces in the view another `as_bytes` of an equal string
-  reads.
+- Mutable `&mut str` and `*mut str` are live `{ buf, off, len }` UTF-8 byte slices
+  (`PointerForm::FatSlice`) aliasing their backing `String`/`Vec<u8>`/`[u8]` buffer, identical at
+  run time to `&mut [u8]` / `*mut [u8]` in both `utf16` and `js-str=bytes` modes:
+  - `String::as_mut_str`, `<String as DerefMut>::deref_mut`, `str::from_utf8_unchecked_mut`,
+    `str::from_utf8_mut`, and `ptr::from_raw_parts_mut::<str>` keep `{ buf, off, len }` live with
+    no copy; `str::as_bytes_mut` is the identity and `str::as_mut_ptr` projects `{ buf, off }`, so
+    writes through `&mut str` (`make_ascii_lowercase`, `make_ascii_uppercase`,
+    `to_ascii_lowercase`, `to_ascii_uppercase`, `split_at_mut`, `get_mut`, `&mut s[a..b]`,
+    `as_bytes_mut`) mutate the backing storage in place.
+  - Reborrowing or coercing `&mut str` / `*mut str` to `&str` / `*const str` decodes
+    `{ buf, off, len }` to a JavaScript string (`__rt.bytes_str` in `utf16` mode, `__rt.bstr_of`
+    in `js-str=bytes` mode).
+  - Casting an immutable `&str` / `*const str` to a **mutable** `str` or byte pointer still
+    allocates a fresh unmemoized `__rt.str_bytes_mut(s)` (or `__rt.bstr_bytes_mut(s)`) record for
+    containment so a write through a cast-away-const pointer never mutates a memoized `&str` view.
 
 `ptr::cast_str` owns the whole matrix — `str` to `[u8]`, `str` to `u8`, a slice of one byte elements
 to `str`, `str` to `str`, and a zombie for anything else with a `str` on one side — and every

@@ -824,9 +824,10 @@ impl JsCx<'_> {
                 };
                 jsast::rt_call(helper, vec![string(*s, &mut prelude, &mut hold)?])
             }
-            (StandardOperation::StrStripPrefix | StandardOperation::StrStripSuffix, [s, pattern])
-                if is_str(*s)? && (is_str(*pattern)? || is_char(*pattern)?) =>
-            {
+            (
+                StandardOperation::StrStripPrefix | StandardOperation::StrStripSuffix,
+                [s, pattern],
+            ) if is_str(*s)? && (is_str(*pattern)? || is_char(*pattern)?) => {
                 let Some((none, some)) = self.option_variants(result)? else {
                     return Ok(None);
                 };
@@ -850,7 +851,10 @@ impl JsCx<'_> {
                         jsast::member(s.clone(), "length"),
                         jsast::member(pattern.clone(), "length"),
                     );
-                    ("endsWith", jsast::method_call(s.clone(), "slice", vec![jsast::num(0), end]))
+                    (
+                        "endsWith",
+                        jsast::method_call(s.clone(), "slice", vec![jsast::num(0), end]),
+                    )
                 };
                 let (Some(none), Some(some)) = (
                     value::enum_value(table, self.interns, ty, none, Vec::new()),
@@ -951,7 +955,12 @@ impl JsCx<'_> {
     }
 
     /// Three-way `Ordering` result expression `a < b ? Less : a === b ? Equal : Greater`.
-    fn str_cmp_expr(&self, ordering_ty: rcgjs_object::jir::types::TypeId, a: Expr, b: Expr) -> Option<Expr> {
+    fn str_cmp_expr(
+        &self,
+        ordering_ty: rcgjs_object::jir::types::TypeId,
+        a: Expr,
+        b: Expr,
+    ) -> Option<Expr> {
         let table = self.table;
         let variant = |name: &str| -> Option<Expr> {
             let index = table
@@ -1137,7 +1146,7 @@ impl JsCx<'_> {
             // Empty glue is not emitted as an item, so naming it would dangle.
             DropGlue::None => Ok(Lowered::Done(Vec::new())),
             DropGlue::Direct { item, link_name } => {
-                let argument = self.borrow_view(root, path)?;
+                let argument = self.borrow_view(root, path, true)?;
                 let target = self
                     .call_retargets
                     .get(&item)
@@ -1152,7 +1161,7 @@ impl JsCx<'_> {
             // A trait object's glue is slot 0 of the receiver's vtable, called with the data
             // pointer and skipped when the slot is null (`abi.rs::codegen_dyn_drop`).
             DropGlue::Dynamic => {
-                let value = self.borrow_view(root, path)?;
+                let value = self.borrow_view(root, path, true)?;
                 let (setup, receiver) = self.reread(value, &["meta", "ptr"]);
                 let slot = vtable_slot(receiver.clone(), VTABLE_DROP_SLOT);
                 let mut out: Vec<Stmt> = setup.map(jsast::expr_stmt).into_iter().collect();

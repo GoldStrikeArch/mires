@@ -145,7 +145,15 @@ pub(crate) fn codegen_const_value<'tcx>(
             };
             let pointee = ty.peel_refs();
             if pointee.is_str() {
-                return str_expr(cgu, log, alloc.inner(), Size::ZERO, Some(meta), span);
+                return str_expr(
+                    cgu,
+                    log,
+                    alloc.inner(),
+                    Size::ZERO,
+                    Some(meta),
+                    crate::ptr::is_mut_str_ptr(tcx, ty),
+                    span,
+                );
             }
             slice_expr(
                 cgu,
@@ -429,6 +437,22 @@ fn read_pointer<'tcx>(
         // pointer. A thin one is that number. A wide one is not: `{ buf, off, len }` needs a
         // buffer, and there is none to name.
         if wide {
+            if pointer.readable
+                && pointer.offset.bytes() != 0
+                && pointer.meta == Some(0)
+                && pointee.is_some_and(|p| {
+                    matches!(
+                        value::peel_pattern(value::peel_transparent(tcx, p)).kind(),
+                        ty::Str
+                    )
+                })
+            {
+                return if crate::ptr::is_mut_str_ptr(tcx, ty) {
+                    crate::ptr::fat_slice(jsast::array(Vec::new()), jsast::num(0), jsast::num(0))
+                } else {
+                    jsast::string("")
+                };
+            }
             return zombie(
                 cgu,
                 log,
@@ -601,7 +625,15 @@ fn pointer_expr<'tcx>(
                 Err(poison) => return poison,
             };
             if pointee.is_str() {
-                return str_expr(cgu, log, alloc.inner(), offset, meta, span);
+                return str_expr(
+                    cgu,
+                    log,
+                    alloc.inner(),
+                    offset,
+                    meta,
+                    crate::ptr::is_mut_str_ptr(cgu.tcx, ty),
+                    span,
+                );
             }
             if matches!(pointee.kind(), ty::Slice(_)) {
                 return slice_expr(cgu, log, alloc.inner(), offset, pointee, meta, span);
@@ -702,13 +734,15 @@ fn slice_expr<'tcx>(
     )
 }
 
-/// The `&str` whose bytes start at `offset` in `alloc` and run for `meta` bytes.
+/// The `&str` (or mutable `&mut str` / `*mut str` byte slice) whose bytes start at `offset` in
+/// `alloc` and run for `meta` bytes.
 fn str_expr<'tcx>(
     cgu: &CguCx<'tcx>,
     log: &ZombieLog,
     alloc: &Allocation,
     offset: Size,
     meta: Option<u64>,
+    mutable: bool,
     span: Span,
 ) -> Expr {
     let Some(length) = meta else {
@@ -720,6 +754,18 @@ fn str_expr<'tcx>(
         );
     };
     match raw::read_str(alloc, offset, length) {
+        Ok(text) if mutable => {
+            let bytes = text
+                .as_bytes()
+                .iter()
+                .map(|&b| jsast::num(b as f64))
+                .collect();
+            crate::ptr::fat_slice(
+                jsast::array(bytes),
+                jsast::num(0),
+                jsast::num(text.len() as f64),
+            )
+        }
         Ok(text) if text.len() >= HOIST_STRING_BYTES => {
             // The text is its own interning key: two crates that lower the same literal name the
             // same constant, and a JavaScript string is a value, so sharing one can never be

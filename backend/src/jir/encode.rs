@@ -1801,6 +1801,19 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         }
         let Some(alloc_id) = pointer.alloc_id() else {
             if wide {
+                if pointer.readable
+                    && pointer.offset.bytes() != 0
+                    && pointer.meta == Some(0)
+                    && pointee.is_some_and(|p| {
+                        matches!(
+                            crate::value::peel_pattern(crate::value::peel_transparent(tcx, p))
+                                .kind(),
+                            ty::Str
+                        )
+                    })
+                {
+                    return Ok(ConstTree::Str(self.types.str("")));
+                }
                 return Err(EncodeDecline::ConstantAddressNoProvenance { ty: type_name(ty) });
             }
             if !pointer.readable {
@@ -2337,12 +2350,7 @@ fn str_operation<'tcx>(
         (None, "is_ascii", []) => Some(StandardOperation::StrIsAscii),
         (
             None,
-            "starts_with"
-            | "ends_with"
-            | "find"
-            | "rfind"
-            | "contains"
-            | "strip_prefix"
+            "starts_with" | "ends_with" | "find" | "rfind" | "contains" | "strip_prefix"
             | "strip_suffix",
             [pattern],
         ) if str_ref(*pattern) || matches!(pattern.kind(), ty::Char) => Some(match name {

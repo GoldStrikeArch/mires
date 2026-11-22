@@ -519,8 +519,8 @@ impl<'a, 'tcx> TypeCx<'a, 'tcx> {
             value::EnumRepr::State => EnumRepr::State,
         });
         let pointer_form = match ty.kind() {
-            ty::Ref(_, pointee, _) => Some(self.pointer_form(*pointee, false)),
-            ty::RawPtr(pointee, _) => Some(self.pointer_form(*pointee, true)),
+            ty::Ref(_, pointee, mutbl) => Some(self.pointer_form(*pointee, false, mutbl.is_mut())),
+            ty::RawPtr(pointee, mutbl) => Some(self.pointer_form(*pointee, true, mutbl.is_mut())),
             _ => None,
         };
         let fields = self.aggregate_fields(ty, kind)?;
@@ -541,12 +541,22 @@ impl<'a, 'tcx> TypeCx<'a, 'tcx> {
     }
 
     /// The JavaScript shape of a pointer to `pointee` (`ptr.rs`).
-    fn pointer_form(&self, pointee: Ty<'tcx>, raw: bool) -> PointerForm {
+    ///
+    /// Immutable `&str` / `*const str` are JavaScript strings (`PointerForm::Str`), while mutable
+    /// `&mut str` / `*mut str` are live `{ buf, off, len }` UTF-8 byte slices
+    /// (`PointerForm::FatSlice`) aliasing their backing buffer.
+    fn pointer_form(&self, pointee: Ty<'tcx>, raw: bool, mutable: bool) -> PointerForm {
         let tcx = self.tcx;
         // A transparent wrapper over an unsized type (`CStr` over `[c_char]`) is that type.
         let peeled = value::peel_pattern(value::peel_transparent(tcx, pointee));
         match peeled.kind() {
-            ty::Str => return PointerForm::Str,
+            ty::Str => {
+                return if mutable {
+                    PointerForm::FatSlice
+                } else {
+                    PointerForm::Str
+                };
+            }
             ty::Slice(_) => return PointerForm::FatSlice,
             ty::Dynamic(..) => return PointerForm::FatDyn,
             _ => {}

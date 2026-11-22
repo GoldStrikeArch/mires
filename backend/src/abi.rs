@@ -436,7 +436,10 @@ fn text_conversion<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, value: Expr) -> Option
         // A `str` is already a JavaScript string. `alloc`'s `String` is NOT: it is a `Vec` of
         // bytes in the value model, so it is an `Adt` here and takes the `Display` path below.
         ty::Str => Some(value),
-        ty::Ref(_, pointee, _) => {
+        ty::Ref(_, pointee, mutbl) => {
+            if mutbl.is_mut() && matches!(pointee.kind(), ty::Str) {
+                return None;
+            }
             // Reading through the reference is the conversion, and which spelling that takes is
             // `ptr.rs`'s to answer: a reference to a value the model keeps in a slot is the slot
             // record, and a reference to anything else already IS the value. This is what retires

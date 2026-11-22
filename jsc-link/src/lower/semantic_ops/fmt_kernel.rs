@@ -309,8 +309,14 @@ impl<'a> View<'a> {
                 TypeKind::Char => return Some((root, path, DisplayKind::Char)),
                 TypeKind::Float { bits: 64 } => return Some((root, path, DisplayKind::F64)),
                 // The place holds the `str` (or the `&str` one deref up): reading it is the host
-                // string either way, so the walk stops without the last deref.
-                TypeKind::Str => return Some((root, path, DisplayKind::Str)),
+                // string when reached through an immutable `&str` / `*const str`, NOT when
+                // dereferencing a mutable `&mut str` / `*mut str` (`{ buf, off, len }`).
+                TypeKind::Str => {
+                    if self.derefs_mut_str(root, &path) {
+                        return None;
+                    }
+                    return Some((root, path, DisplayKind::Str));
+                }
                 TypeKind::Reference {
                     pointee: inner,
                     mutable: false,
@@ -329,6 +335,41 @@ impl<'a> View<'a> {
                 _ => return None,
             }
         }
+    }
+
+    /// Whether walking `(root, path)` reaches `str` by dereferencing a mutable `&mut str` /
+    /// `*mut str` (which is a `{ buf, off, len }` byte slice rather than a host string).
+    fn derefs_mut_str(&self, root: Root, path: &[Proj]) -> bool {
+        let mut ty = match root {
+            Root::Value(v) => match self.ty(v) {
+                Some(ty) => ty,
+                None => return true,
+            },
+            Root::Cell(cell) => match self.func.cells.get(cell.0 as usize) {
+                Some(c) => c.ty,
+                None => return true,
+            },
+        };
+        for proj in path {
+            match proj {
+                Proj::Deref => match self.kind_of(ty) {
+                    Some(
+                        TypeKind::Reference { pointee, mutable }
+                        | TypeKind::RawPointer { pointee, mutable },
+                    ) => {
+                        if *mutable && matches!(self.kind_of(*pointee), Some(TypeKind::Str)) {
+                            return true;
+                        }
+                        ty = *pointee;
+                    }
+                    _ => return true,
+                },
+                Proj::Field { ty: field_ty, .. } => ty = *field_ty,
+                Proj::Downcast { .. } => {}
+                _ => return false,
+            }
+        }
+        false
     }
 }
 

@@ -105,12 +105,17 @@ fn ts_type<'tcx>(
         ty::Int(_) | ty::Uint(_) | ty::Float(_) => "number".to_owned(),
         ty::Str => "string".to_owned(),
         ty::Never => "never".to_owned(),
-        ty::Ref(_, pointee, _) => match crate::ptr::is_slot(tcx, ty) {
-            // A reference the model keeps in a slot record is a pointer into a buffer, which has
-            // no useful TypeScript type: it is the model's own bookkeeping.
-            true => "unknown".to_owned(),
-            false => ts_type(tcx, *pointee, types, depth + 1),
-        },
+        ty::Ref(_, pointee, mutbl) => {
+            match crate::ptr::is_slot(tcx, ty)
+                || (mutbl.is_mut() && matches!(pointee.kind(), ty::Str))
+            {
+                // A reference the model keeps in a slot record (or a mutable `str` byte slice) is
+                // a pointer into a buffer, which has no useful TypeScript type: it is the model's
+                // own bookkeeping.
+                true => "unknown".to_owned(),
+                false => ts_type(tcx, *pointee, types, depth + 1),
+            }
+        }
         ty::Tuple(fields) if fields.is_empty() => "undefined".to_owned(),
         ty::Tuple(fields) => {
             let members: Vec<String> = fields

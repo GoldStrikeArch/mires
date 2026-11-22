@@ -7,7 +7,9 @@ use std::collections::BTreeSet;
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::origin::SourceFact;
 use rcgjs_object::jir::semantic::{CallSemantic, Callee, ConstTree, DefinitionId, GlobalReference};
-use rcgjs_object::jir::types::{EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind, TypeTable};
+use rcgjs_object::jir::types::{
+    EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind, TypeTable,
+};
 use rcgjs_object::jir::Interns;
 use rcgjs_object::jsast::{self, Expr};
 use rcgjs_object::ptr;
@@ -122,7 +124,20 @@ impl<'a> JsCx<'a> {
             ConstTree::Scalar { bits, .. } => self.scalar_expr(*bits, ty),
             ConstTree::Str(id) => {
                 let text = interns.str(*id).unwrap_or("");
-                Ok(self.string_literal(text))
+                if value::is_mutable_ptr(table, ty) {
+                    let bytes = text
+                        .as_bytes()
+                        .iter()
+                        .map(|&b| jsast::num(b as f64))
+                        .collect();
+                    Ok(ptr::fat_slice(
+                        jsast::array(bytes),
+                        jsast::num(0),
+                        jsast::num(text.len() as f64),
+                    ))
+                } else {
+                    Ok(self.string_literal(text))
+                }
             }
             ConstTree::Address(address) => Ok(jsast::num(*address as f64)),
             ConstTree::Global { target, offset } => self.global_expr(target, *offset, ty),
@@ -499,7 +514,21 @@ impl<'a> JsCx<'a> {
         let table = self.table;
         match inner {
             ConstTree::Str(id) if value::is_str(table, pointee) => {
-                Ok(self.string_literal(self.interns.str(*id).unwrap_or("")))
+                let text = self.interns.str(*id).unwrap_or("");
+                if value::is_mutable_ptr(table, ty) {
+                    let bytes = text
+                        .as_bytes()
+                        .iter()
+                        .map(|&b| jsast::num(b as f64))
+                        .collect();
+                    Ok(ptr::fat_slice(
+                        jsast::array(bytes),
+                        jsast::num(0),
+                        jsast::num(text.len() as f64),
+                    ))
+                } else {
+                    Ok(self.string_literal(text))
+                }
             }
             ConstTree::Slice(elements) => self.slice_expr(elements, pointee, depth),
             _ => {

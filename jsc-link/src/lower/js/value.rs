@@ -680,6 +680,50 @@ pub fn is_str(table: &TypeTable, ty: TypeId) -> bool {
     matches!(kind(table, ty), Some(TypeKind::Str))
 }
 
+/// Whether the peeled type is a mutable reference or mutable raw pointer (`&mut T` / `*mut T`).
+pub fn is_mutable_ptr(table: &TypeTable, ty: TypeId) -> bool {
+    matches!(
+        kind(table, ty),
+        Some(
+            TypeKind::Reference { mutable: true, .. } | TypeKind::RawPointer { mutable: true, .. }
+        )
+    )
+}
+
+/// Whether the peeled type is a mutable pointer to `str` (`&mut str` / `*mut str`), represented
+/// as a live `{ buf, off, len }` UTF-8 byte slice rather than an immutable JavaScript string.
+pub fn is_mut_str_ptr(table: &TypeTable, ty: TypeId) -> bool {
+    matches!(
+        kind(table, ty),
+        Some(
+            TypeKind::Reference {
+                pointee,
+                mutable: true,
+            } | TypeKind::RawPointer {
+                pointee,
+                mutable: true,
+            }
+        ) if is_str(table, *pointee)
+    )
+}
+
+/// Whether the peeled type is an immutable pointer to `str` (`&str` / `*const str`), represented
+/// as a JavaScript string.
+pub fn is_const_str_ptr(table: &TypeTable, ty: TypeId) -> bool {
+    matches!(
+        kind(table, ty),
+        Some(
+            TypeKind::Reference {
+                pointee,
+                mutable: false,
+            } | TypeKind::RawPointer {
+                pointee,
+                mutable: false,
+            }
+        ) if is_str(table, *pointee)
+    )
+}
+
 /// Whether the type is `bool` after peeling.
 pub fn is_bool(table: &TypeTable, ty: TypeId) -> bool {
     matches!(kind(table, ty), Some(TypeKind::Bool))

@@ -12,7 +12,7 @@
 //! `<< n >> n` for numbers and `BigInt.asIntN`/`asUintN` for `BigInt`s.
 
 use rustc_abi::VariantIdx;
-use rustc_middle::mir::{AggregateKind, CastKind, Local, Operand, Rvalue};
+use rustc_middle::mir::{AggregateKind, BorrowKind, CastKind, Local, Operand, RawPtrKind, Rvalue};
 use rustc_middle::mir::{BinOp as MirBinOp, UnOp as MirUnOp};
 use rustc_middle::ty::{self, CoroutineArgsExt, Instance, Ty, TyCtxt};
 
@@ -39,12 +39,18 @@ impl<'tcx> FnCx<'_, 'tcx> {
             }
             // The two part ways for an aggregate pointee: a reference to one is the object
             // itself, a raw pointer to one is a slot. See `ptr.rs`.
-            Rvalue::Ref(_, _, place) => self.codegen_ref(*place),
-            Rvalue::RawPtr(_, place) => self.codegen_raw_ptr(*place),
+            Rvalue::Ref(_, kind, place) => {
+                self.codegen_ref(*place, matches!(kind, BorrowKind::Mut { .. }))
+            }
+            Rvalue::RawPtr(kind, place) => {
+                self.codegen_raw_ptr(*place, matches!(kind, RawPtrKind::Mut))
+            }
             Rvalue::Reborrow(_, _, place) => {
-                // The place already holds a reference; a reborrow copies it.
-                let (source, _) = self.codegen_place(*place);
-                self.read(&source)
+                // The place already holds a reference; a reborrow copies it, decoding `&mut str`
+                // to `&str` when mutability drops.
+                let (source, src_ty) = self.codegen_place(*place);
+                let value = self.read(&source);
+                crate::ptr::cast_str_ptr(self, src_ty, ty, value.clone()).unwrap_or(value)
             }
             Rvalue::BinaryOp(op, operands) => {
                 // The two operands do not always have the same type: a shift takes its amount at
@@ -276,7 +282,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 jsast::object(entries)
             }
             // `from_raw_parts`: a fat pointer built from a thin data pointer and its metadata.
-            AggregateKind::RawPtr(pointee, _) => {
+            AggregateKind::RawPtr(pointee, mutbl) => {
                 let pointee = self.monomorphize(*pointee);
                 let mut values = values.into_iter();
                 let (Some(data), Some(meta)) = (values.next(), values.next()) else {
@@ -284,7 +290,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         "`*const {pointee}` needs both a data pointer and its metadata"
                     ));
                 };
-                crate::ptr::build_fat(self, pointee, data_ty, data, meta)
+                crate::ptr::build_fat(self, pointee, mutbl.is_mut(), data_ty, data, meta)
             }
             _ => self.zombie(format!(
                 "`{kind:?}` aggregates are not supported by rustc_codegen_js"
@@ -680,8 +686,12 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         }
                         _ => self.zombie(format!("cannot coerce `{from_ty}` to a fn pointer")),
                     },
-                    // `*mut T` and `*const T` are the same record.
-                    PointerCoercion::MutToConstPointer => value,
+                    // `*mut T` and `*const T` are the same record except for `str`, where
+                    // `*mut str` is a live byte slice and `*const str` is a JavaScript string.
+                    PointerCoercion::MutToConstPointer => {
+                        crate::ptr::cast_str_ptr(self, from_ty, to_ty, value.clone())
+                            .unwrap_or(value)
+                    }
                     // `*const [T; N]` to `*const T`: a slot naming the array becomes a slot
                     // naming its first element, which is a reprojection *into* the array the
                     // outer slot points at rather than a change of representation.

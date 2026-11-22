@@ -132,7 +132,8 @@ impl<'a> JsCx<'a> {
     pub fn ptr_eq(&self, pointer_ty: TypeId, lhs: Expr, rhs: Expr) -> Expr {
         let helper = match value::pointee_of(self.table, pointer_ty) {
             Some(pointee)
-                if matches!(value::kind(self.table, pointee), Some(TypeKind::Slice(_))) =>
+                if matches!(value::kind(self.table, pointee), Some(TypeKind::Slice(_)))
+                    || value::is_mut_str_ptr(self.table, pointer_ty) =>
             {
                 "slice_ptr_eq"
             }
@@ -271,12 +272,22 @@ impl<'a> JsCx<'a> {
     pub fn build_fat(
         &self,
         pointee: TypeId,
+        mutable: bool,
         data_ty: Option<TypeId>,
         data: Expr,
         meta: Expr,
     ) -> Res<Expr> {
         let table = self.table;
-        let from_pointee = data_ty.and_then(|ty| value::pointee_of(table, ty));
+        let data_is_mut_str = data_ty.is_some_and(|dt| value::is_mut_str_ptr(table, dt));
+        let (from_pointee, data) = if data_is_mut_str {
+            let (setup, s) = self.reread(data, &[BUF, OFF]);
+            (
+                None,
+                sequenced(setup, ptr::slot(ptr::slot_buf(s.clone()), ptr::slot_off(s))),
+            )
+        } else {
+            (data_ty.and_then(|ty| value::pointee_of(table, ty)), data)
+        };
         let raw_data = |data: Expr| -> Expr {
             if let (Some(dt), Some(fp)) = (data_ty, from_pointee) {
                 if matches!(value::kind(table, dt), Some(TypeKind::Reference { .. }))
@@ -343,12 +354,19 @@ impl<'a> JsCx<'a> {
                     Some(fp) => self.cast_to_byte_ptr(fp, raw_data(data), 0)?,
                     None => data,
                 };
-                let (setup, data) = self.reread(data, &[BUF, OFF]);
-                let decoded = jsast::rt_call(
-                    "bytes_str",
-                    vec![ptr::slot_buf(data.clone()), ptr::slot_off(data), meta],
-                );
-                Ok(sequenced(setup, decoded))
+                if mutable {
+                    Ok(jsast::rt_call(
+                        "slice_from_parts",
+                        vec![data, meta, jsast::num(1.0)],
+                    ))
+                } else {
+                    let (setup, data) = self.reread(data, &[BUF, OFF]);
+                    let decoded = jsast::rt_call(
+                        "bytes_str",
+                        vec![ptr::slot_buf(data.clone()), ptr::slot_off(data), meta],
+                    );
+                    Ok(sequenced(setup, decoded))
+                }
             }
             _ if table.get(pointee).is_some_and(|d| d.layout.sized) => match from_pointee {
                 Some(fp) => self.cast_pointer(fp, pointee, raw_data(data)),
@@ -555,17 +573,19 @@ impl<'a> JsCx<'a> {
         to_pointee: TypeId,
         value: Expr,
     ) -> Option<Res<Expr>> {
-        self.cast_str_as(from_pointee, to_pointee, value, false)
+        self.cast_str_as(from_pointee, to_pointee, value, false, false)
     }
 
-    /// [`Self::cast_str`], told whether the target pointer is mutable: a `str` cast to a mutable
-    /// byte pointer gets its own byte view (`ptr.rs::cast_str`).
+    /// [`Self::cast_str`], told the mutability of both pointer types:
+    /// - `&str` / `*const str` is a JavaScript string;
+    /// - `&mut str` / `*mut str` is a live `{ buf, off, len }` UTF-8 byte slice.
     fn cast_str_as(
         &self,
         from_pointee: TypeId,
         to_pointee: TypeId,
         value: Expr,
-        mutable: bool,
+        from_mut: bool,
+        to_mut: bool,
     ) -> Option<Res<Expr>> {
         let table = self.table;
         let (from_str, to_str) = (
@@ -582,14 +602,29 @@ impl<'a> JsCx<'a> {
             ))
         };
         Some(match (from_str, to_str) {
-            (true, true) => Ok(value),
+            (true, true) => Ok(match (from_mut, to_mut) {
+                (false, false) | (true, true) => value,
+                (true, false) => self.bytes_to_str(value),
+                (false, true) => self.str_to_bytes_mut(value),
+            }),
+            (true, false) if from_mut => match value::kind(table, to_pointee) {
+                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => Ok(value),
+                _ if value::is_u8(table, to_pointee) || table.is_zst(to_pointee) => {
+                    let (setup, sb) = self.reread(value, &[BUF, OFF]);
+                    Ok(sequenced(
+                        setup,
+                        ptr::slot(ptr::slot_buf(sb.clone()), ptr::slot_off(sb)),
+                    ))
+                }
+                _ => unsupported(),
+            },
             (true, false) => match value::kind(table, to_pointee) {
-                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => Ok(if mutable {
+                Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => Ok(if to_mut {
                     self.str_to_bytes_mut(value)
                 } else {
                     self.str_to_bytes(value)
                 }),
-                _ if value::is_u8(table, to_pointee) => Ok(if mutable {
+                _ if value::is_u8(table, to_pointee) => Ok(if to_mut {
                     let bytes = self.str_to_bytes_mut(value);
                     let (setup, sb) = self.reread(bytes, &[BUF, OFF]);
                     sequenced(
@@ -602,9 +637,11 @@ impl<'a> JsCx<'a> {
                 _ => unsupported(),
             },
             (false, true) => match value::kind(table, from_pointee) {
-                Some(TypeKind::Slice(element)) if table.byte_element(*element) => {
-                    Ok(self.bytes_to_str(value))
-                }
+                Some(TypeKind::Slice(element)) if table.byte_element(*element) => Ok(if to_mut {
+                    value
+                } else {
+                    self.bytes_to_str(value)
+                }),
                 _ => unsupported(),
             },
             (false, false) => Ok(value),
@@ -615,14 +652,9 @@ impl<'a> JsCx<'a> {
     pub fn cast_str_ptr(&self, from_ty: TypeId, to_ty: TypeId, value: Expr) -> Option<Res<Expr>> {
         let from_pointee = value::pointee_of(self.table, from_ty)?;
         let to_pointee = value::pointee_of(self.table, to_ty)?;
-        let mutable = matches!(
-            value::kind(self.table, to_ty),
-            Some(
-                TypeKind::Reference { mutable: true, .. }
-                    | TypeKind::RawPointer { mutable: true, .. }
-            )
-        );
-        self.cast_str_as(from_pointee, to_pointee, value, mutable)
+        let from_mut = value::is_mutable_ptr(self.table, from_ty);
+        let to_mut = value::is_mutable_ptr(self.table, to_ty);
+        self.cast_str_as(from_pointee, to_pointee, value, from_mut, to_mut)
     }
 
     /// `value as *const to_pointee` (`ptr.rs::cast_pointer`).

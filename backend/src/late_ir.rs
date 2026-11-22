@@ -1497,6 +1497,19 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         }
         let Some(alloc_id) = pointer.alloc_id() else {
             if wide {
+                if pointer.readable
+                    && pointer.offset.bytes() != 0
+                    && pointer.meta == Some(0)
+                    && pointee.is_some_and(|p| {
+                        matches!(
+                            crate::value::peel_pattern(crate::value::peel_transparent(tcx, p))
+                                .kind(),
+                            ty::Str
+                        )
+                    })
+                {
+                    return Ok(ConstTree::Str(String::new()));
+                }
                 return Err(format!(
                     "a `{ty}` in a constant is an address with no provenance"
                 ));

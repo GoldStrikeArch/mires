@@ -881,10 +881,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             // A trait object's glue is slot 0 of the receiver's vtable, called with the data
             // pointer and skipped when the slot is null. `&*place` on an unsized pointee is the
             // fat pointer itself, metadata included.
-            return self.codegen_dyn_drop(self.codegen_ref(place));
+            return self.codegen_dyn_drop(self.codegen_ref(place, true));
         }
 
-        let argument = self.codegen_ref(place);
+        let argument = self.codegen_ref(place, true);
         let glue_name = self.cgu.namer.fn_name(glue).into_string();
         vec![jsast::expr_stmt(jsast::call(
             jsast::id(glue_name),

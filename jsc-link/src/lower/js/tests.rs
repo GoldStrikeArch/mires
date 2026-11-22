@@ -249,7 +249,16 @@ fn world() -> Interns {
     interns.intern_type(pointer(REF_I32, I32, PointerForm::Slot, false));
     interns.intern_type(pointer(REF_SLICE, SLICE, PointerForm::FatSlice, false));
     interns.intern_type(pointer(REF_ARRAY, ARRAY, PointerForm::Thin, false));
-    interns.intern_type(pointer(STR_REF, STR, PointerForm::Str, false));
+    let mut str_ref = descriptor(
+        STR_REF,
+        TypeKind::Reference {
+            pointee: STR,
+            mutable: false,
+        },
+        4,
+    );
+    str_ref.js.pointer_form = Some(PointerForm::Str);
+    interns.intern_type(str_ref);
     interns.intern_type(pointer(RAW_I32, I32, PointerForm::Slot, true));
     interns.intern_type(pointer(RAW_POINT, POINT, PointerForm::Slot, true));
 
@@ -6743,7 +6752,12 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
     user_loc.js.is_indirect = true;
     user_loc.js.needs_clone = true;
     interns.intern_type(user_loc);
-    interns.intern_type(pointer(user_loc_ref_ty, user_loc_ty, PointerForm::Thin, false));
+    interns.intern_type(pointer(
+        user_loc_ref_ty,
+        user_loc_ty,
+        PointerForm::Thin,
+        false,
+    ));
 
     // Re-register `LOCATION` under a distinct crate id (`99`) so both `Intrinsic("caller_location")`
     // and non-intrinsic `track_caller` calls resolve `core`'s `(file, line, column)`.
@@ -6842,7 +6856,10 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
             .decl,
     );
     assert!(
-        js1.contains("file:") && js1.contains("line:") && js1.contains("column:") && !js1.contains("name:"),
+        js1.contains("file:")
+            && js1.contains("line:")
+            && js1.contains("column:")
+            && !js1.contains("name:"),
         "{js1}"
     );
 
@@ -6898,7 +6915,10 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
             .decl,
     );
     assert!(
-        js2.contains("file:") && js2.contains("line:") && js2.contains("column:") && !js2.contains("name:"),
+        js2.contains("file:")
+            && js2.contains("line:")
+            && js2.contains("column:")
+            && !js2.contains("name:"),
         "{js2}"
     );
 
@@ -6983,7 +7003,10 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
             .decl,
     );
     assert!(
-        js3.contains("file:") && js3.contains("line:") && js3.contains("column:") && !js3.contains("name:"),
+        js3.contains("file:")
+            && js3.contains("line:")
+            && js3.contains("column:")
+            && !js3.contains("name:"),
         "{js3}"
     );
 }
@@ -7798,7 +7821,10 @@ fn transmute_to_array_ref_uses_array_ref_and_hoists_non_duplicable_raw_to_ref() 
     let p1 = plan_of(&f1, &[(0, "p")]);
     let body1 = body_of(BodyKind::Function, f1.sig.clone());
     let js1 = lower(&interns, "arr_ref", &[], &body1, &f1, &p1, straight(&f1));
-    assert_eq!(js1, "function arr_ref(p) {\n  return __rt.array_ref(p, 4);\n}\n");
+    assert_eq!(
+        js1,
+        "function arr_ref(p) {\n  return __rt.array_ref(p, 4);\n}\n"
+    );
 
     // BUG-2: `raw_to_ref` over a non-duplicable `cast_pointer` call (`__rt.thin`) must hoist
     // into a temporary so `__rt.thin` is evaluated once instead of twice.
@@ -7819,7 +7845,15 @@ fn transmute_to_array_ref_uses_array_ref_and_hoists_non_duplicable_raw_to_ref() 
     let f2 = b2.finish();
     let p2 = plan_of(&f2, &[(0, "p")]);
     let body2 = body_of(BodyKind::Function, f2.sig.clone());
-    let js2 = lower(&interns, "unbox_erased", &[], &body2, &f2, &p2, straight(&f2));
+    let js2 = lower(
+        &interns,
+        "unbox_erased",
+        &[],
+        &body2,
+        &f2,
+        &p2,
+        straight(&f2),
+    );
     assert_eq!(
         js2.matches("__rt.thin(").count(),
         1,
@@ -8685,6 +8719,205 @@ fn float_nan_payload_constants_preserve_bits_and_keep_canonical_nan_compact() {
     };
     let res = function::lower(&input, &f, &p, straight(&f));
     assert!(res.is_err(), "expected f16 constant lowering to decline");
+}
+
+#[test]
+fn mut_str_lowering_preserves_live_slice_and_converts_on_const_boundary() {
+    const MUT_STR: TypeId = TypeId(430);
+    const RAW_MUT_STR: TypeId = TypeId(431);
+    const RAW_CONST_STR: TypeId = TypeId(432);
+    const SLICE_U8: TypeId = TypeId(433);
+    const MUT_SLICE_U8: TypeId = TypeId(434);
+    const RAW_MUT_U8: TypeId = TypeId(435);
+
+    let mut interns = world();
+    let mut slice_u8 = descriptor(SLICE_U8, TypeKind::Slice(U8), 0);
+    slice_u8.layout.sized = false;
+    slice_u8.layout.size = None;
+    slice_u8.layout.zst = false;
+    slice_u8.js.is_indirect = true;
+    interns.intern_type(slice_u8);
+    interns.intern_type(pointer(MUT_STR, STR, PointerForm::FatSlice, false));
+    interns.intern_type(pointer(RAW_MUT_STR, STR, PointerForm::FatSlice, true));
+    let mut raw_const_str = descriptor(
+        RAW_CONST_STR,
+        TypeKind::RawPointer {
+            pointee: STR,
+            mutable: false,
+        },
+        4,
+    );
+    raw_const_str.js.pointer_form = Some(PointerForm::Str);
+    interns.intern_type(raw_const_str);
+    interns.intern_type(pointer(
+        MUT_SLICE_U8,
+        SLICE_U8,
+        PointerForm::FatSlice,
+        false,
+    ));
+    interns.intern_type(pointer(RAW_MUT_U8, U8, PointerForm::Slot, true));
+
+    let e = FuncBuilder::ENTRY;
+
+    // 1. &mut [u8] -> &mut str (from_utf8_unchecked_mut) is identity.
+    let mut b = FuncBuilder::new(item(1), signature(vec![MUT_SLICE_U8], MUT_STR));
+    let s = b.param(MUT_SLICE_U8, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PtrToPtr,
+            v: s,
+            from: MUT_SLICE_U8,
+            to: MUT_STR,
+        },
+        MUT_STR,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let p = plan_of(&f, &[(0, "s")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(&interns, "to_mut_str", &[], &body, &f, &p, straight(&f)),
+        "function to_mut_str(s) {\n  return s;\n}\n"
+    );
+
+    // 2. &mut str -> &mut [u8] (as_bytes_mut) is identity.
+    let mut b = FuncBuilder::new(item(2), signature(vec![MUT_STR], MUT_SLICE_U8));
+    let s = b.param(MUT_STR, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PtrToPtr,
+            v: s,
+            from: MUT_STR,
+            to: MUT_SLICE_U8,
+        },
+        MUT_SLICE_U8,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let p = plan_of(&f, &[(0, "s")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(&interns, "as_bytes_mut", &[], &body, &f, &p, straight(&f)),
+        "function as_bytes_mut(s) {\n  return s;\n}\n"
+    );
+
+    // 3. &mut str -> *mut u8 (as_mut_ptr) projects live { buf, off }.
+    let mut b = FuncBuilder::new(item(3), signature(vec![MUT_STR], RAW_MUT_U8));
+    let s = b.param(MUT_STR, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PtrToPtr,
+            v: s,
+            from: MUT_STR,
+            to: RAW_MUT_U8,
+        },
+        RAW_MUT_U8,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let p = plan_of(&f, &[(0, "s")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(&interns, "as_mut_ptr", &[], &body, &f, &p, straight(&f)),
+        "function as_mut_ptr(s) {\n  return { buf: s.buf, off: s.off };\n}\n"
+    );
+
+    // 4. Reborrow &*s on s: &mut str decodes via __rt.bytes_str.
+    let mut b = FuncBuilder::new(item(4), signature(vec![MUT_STR], STR_REF));
+    let s = b.param(MUT_STR, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(s),
+            path: vec![Proj::Deref],
+            mutable: false,
+        },
+        STR_REF,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let p = plan_of(&f, &[(0, "s")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(&interns, "reborrow_const", &[], &body, &f, &p, straight(&f)),
+        "function reborrow_const(s) {\n  return __rt.bytes_str(s.buf, s.off, s.len);\n}\n"
+    );
+
+    // 5. PtrMetadata(*mut str) reads .len directly.
+    let mut b = FuncBuilder::new(item(5), signature(vec![RAW_MUT_STR], USIZE));
+    let s = b.param(RAW_MUT_STR, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Unary {
+            op: UnaryOp::PtrMetadata,
+            v: s,
+            ty: RAW_MUT_STR,
+        },
+        USIZE,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let p = plan_of(&f, &[(0, "s")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(&interns, "mut_str_len", &[], &body, &f, &p, straight(&f)),
+        "function mut_str_len(s) {\n  return s.len;\n}\n"
+    );
+
+    // 6. *mut str == *mut str uses __rt.slice_ptr_eq.
+    let mut b = FuncBuilder::new(item(6), signature(vec![RAW_MUT_STR, RAW_MUT_STR], BOOL));
+    let a = b.param(RAW_MUT_STR, NO_ORIGIN);
+    let c = b.param(RAW_MUT_STR, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Eq,
+            l: a,
+            r: c,
+            ty: RAW_MUT_STR,
+        },
+        BOOL,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let p = plan_of(&f, &[(0, "a"), (1, "b")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(&interns, "mut_str_eq", &[], &body, &f, &p, straight(&f)),
+        "function mut_str_eq(a, b) {\n  return __rt.slice_ptr_eq(a, b);\n}\n"
+    );
+
+    // 7. PointerCoercion (*mut str -> *const str) decodes via __rt.bytes_str.
+    let mut b = FuncBuilder::new(item(7), signature(vec![RAW_MUT_STR], RAW_CONST_STR));
+    let s = b.param(RAW_MUT_STR, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PointerCoercion,
+            v: s,
+            from: RAW_MUT_STR,
+            to: RAW_CONST_STR,
+        },
+        RAW_CONST_STR,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let p = plan_of(&f, &[(0, "s")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(&interns, "mut_to_const", &[], &body, &f, &p, straight(&f)),
+        "function mut_to_const(s) {\n  return __rt.bytes_str(s.buf, s.off, s.len);\n}\n"
+    );
 }
 
 mod invoke;

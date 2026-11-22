@@ -543,9 +543,8 @@ pub(crate) fn is_stdlib_string_op_path(crate_name: &str, item_path: &str) -> Opt
         ("alloc", "string::String::reserve") | (_, "alloc::string::String::reserve") => {
             Some(BstrStringOp::Reserve)
         }
-        ("alloc", "string::String::reserve_exact") | (_, "alloc::string::String::reserve_exact") => {
-            Some(BstrStringOp::ReserveExact)
-        }
+        ("alloc", "string::String::reserve_exact")
+        | (_, "alloc::string::String::reserve_exact") => Some(BstrStringOp::ReserveExact),
         ("alloc", "string::String::as_bytes") | (_, "alloc::string::String::as_bytes") => {
             Some(BstrStringOp::AsBytes)
         }
@@ -776,7 +775,10 @@ pub(crate) fn reserve_builder_stmts_with(
                 jsast::member(sb_id.clone(), "cap"),
                 req_id.clone(),
             ),
-            vec![jsast::assign_stmt(jsast::member(sb_id.clone(), "cap"), req_id)],
+            vec![jsast::assign_stmt(
+                jsast::member(sb_id.clone(), "cap"),
+                req_id,
+            )],
         ),
     ];
     statements.extend(builder_checked(sb_id, helpers));
@@ -793,7 +795,12 @@ pub(crate) fn reserve_builder_stmts(
         jsast::const_("$nativeSb", sb_expr),
         jsast::id("$nativeSb"),
         "$nativeRequired",
-        |len_expr| jsast::const_("$nativeRequired", jsast::binary(BinOp::Add, len_expr, additional)),
+        |len_expr| {
+            jsast::const_(
+                "$nativeRequired",
+                jsast::binary(BinOp::Add, len_expr, additional),
+            )
+        },
         jsast::id("$nativeRequired"),
         maximum,
         helpers,
@@ -1213,14 +1220,9 @@ fn classify_as_bytes_body(
             } => {
                 if slice_vals.contains(src) && path.as_slice() == [Proj::Deref] {
                     slice_vals.insert(res);
-                } else if let Some(kind) = classify_vec_proj_from_value(
-                    src,
-                    path,
-                    parts,
-                    &str_refs,
-                    &vec_vals,
-                    &buf_chain,
-                ) {
+                } else if let Some(kind) =
+                    classify_vec_proj_from_value(src, path, parts, &str_refs, &vec_vals, &buf_chain)
+                {
                     match kind {
                         VecProjKind::Str => str_refs.insert(res),
                         VecProjKind::Vec => vec_vals.insert(res),
@@ -1721,24 +1723,25 @@ where
                 }
             }
 
-            let mut propagate_edge = |target: crate::jir::repr::RBlockId, args: &[ValueId], changed: &mut bool| {
-                let Some(&bi) = block_map.get(&target) else {
-                    return;
+            let mut propagate_edge =
+                |target: crate::jir::repr::RBlockId, args: &[ValueId], changed: &mut bool| {
+                    let Some(&bi) = block_map.get(&target) else {
+                        return;
+                    };
+                    let params = &func.blocks[bi].params;
+                    for (&arg, &param) in args.iter().zip(params.iter()) {
+                        *changed |= prop(&mut recv_refs, arg, param);
+                        *changed |= prop(&mut recv_vals, arg, param);
+                        *changed |= prop(&mut vec_refs, arg, param);
+                        *changed |= prop(&mut vec_vals, arg, param);
+                        *changed |= prop(&mut len_refs, arg, param);
+                        *changed |= prop(&mut len_vals, arg, param);
+                        *changed |= prop(&mut buf_refs, arg, param);
+                        *changed |= prop(&mut buf_vals, arg, param);
+                        *changed |= prop(&mut cap_vals, arg, param);
+                        *changed |= prop(&mut add_vals, arg, param);
+                    }
                 };
-                let params = &func.blocks[bi].params;
-                for (&arg, &param) in args.iter().zip(params.iter()) {
-                    *changed |= prop(&mut recv_refs, arg, param);
-                    *changed |= prop(&mut recv_vals, arg, param);
-                    *changed |= prop(&mut vec_refs, arg, param);
-                    *changed |= prop(&mut vec_vals, arg, param);
-                    *changed |= prop(&mut len_refs, arg, param);
-                    *changed |= prop(&mut len_vals, arg, param);
-                    *changed |= prop(&mut buf_refs, arg, param);
-                    *changed |= prop(&mut buf_vals, arg, param);
-                    *changed |= prop(&mut cap_vals, arg, param);
-                    *changed |= prop(&mut add_vals, arg, param);
-                }
-            };
             match &block.term {
                 RTerm::Goto(target, args) => propagate_edge(*target, args, &mut changed),
                 RTerm::Switch { cases, default, .. } => {
@@ -1801,10 +1804,7 @@ where
                     }
                 }
                 OpKind::Binary {
-                    op: bin_op,
-                    l,
-                    r,
-                    ..
+                    op: bin_op, l, r, ..
                 } => {
                     if protected(l) || protected(r) {
                         return false;
@@ -1848,7 +1848,10 @@ where
                     host: None,
                     ..
                 } => {
-                    if !matches!(semantic, CallSemantic::Ordinary | CallSemantic::GlobalAllocator) {
+                    if !matches!(
+                        semantic,
+                        CallSemantic::Ordinary | CallSemantic::GlobalAllocator
+                    ) {
                         return false;
                     }
                     if args.iter().any(protected) {
@@ -1860,7 +1863,10 @@ where
                     if !is_stdlib_alloc_helper_path(c, p) {
                         return false;
                     }
-                    if args.iter().any(|a| buf_refs.contains(a) || buf_vals.contains(a)) {
+                    if args
+                        .iter()
+                        .any(|a| buf_refs.contains(a) || buf_vals.contains(a))
+                    {
                         saw_raw_grow_call = true;
                     }
                 }
@@ -1870,11 +1876,15 @@ where
         match &block.term {
             RTerm::Goto(_, _) | RTerm::Switch { .. } | RTerm::Unreachable => {}
             RTerm::Return(None) => {}
-            RTerm::Return(Some(v)) if !protected(v) && !buf_refs.contains(v) && !buf_vals.contains(v) => {
+            RTerm::Return(Some(v))
+                if !protected(v) && !buf_refs.contains(v) && !buf_vals.contains(v) =>
+            {
                 let is_unit = func
                     .ty(*v)
                     .and_then(|t| table.get(table.peeled(t)))
-                    .is_some_and(|d| d.layout.zst && matches!(&d.kind, TypeKind::Tuple(f) if f.is_empty()));
+                    .is_some_and(|d| {
+                        d.layout.zst && matches!(&d.kind, TypeKind::Tuple(f) if f.is_empty())
+                    });
                 if !is_unit {
                     return false;
                 }
@@ -1981,11 +1991,7 @@ fn is_byte_layout_const(tree: &ConstTree) -> bool {
     }
 }
 
-fn is_byte_layout_operand(
-    func: &Func,
-    op_of_res: &[Option<(usize, usize)>],
-    v: ValueId,
-) -> bool {
+fn is_byte_layout_operand(func: &Func, op_of_res: &[Option<(usize, usize)>], v: ValueId) -> bool {
     let mut cur = v;
     for _ in 0..16 {
         let Some(&(bi, oi)) = op_of_res.get(cur.0 as usize).and_then(|x| x.as_ref()) else {
@@ -2139,8 +2145,16 @@ where
                     continue;
                 }
                 match &op.kind {
-                    OpKind::BorrowView { root, path, mutable }
-                    | OpKind::RawView { root, path, mutable } => {
+                    OpKind::BorrowView {
+                        root,
+                        path,
+                        mutable,
+                    }
+                    | OpKind::RawView {
+                        root,
+                        path,
+                        mutable,
+                    } => {
                         if let Some((s_root, is_ref, str_ty)) =
                             canonical_string_root(func, table, *root)
                         {
@@ -2198,15 +2212,16 @@ where
                                         [Proj::Field { field: f, .. }, tail @ ..]
                                         | [Proj::Deref, Proj::Field { field: f, .. }, tail @ ..],
                                     ) if *f == parts.buf_field
-                                        && tail
-                                            .iter()
-                                            .all(|p| matches!(p, Proj::Field { .. } | Proj::Deref)) =>
+                                        && tail.iter().all(|p| {
+                                            matches!(p, Proj::Field { .. } | Proj::Deref)
+                                        }) =>
                                     {
                                         Some(InlNodeKind::BufChain)
                                     }
                                     (InlNodeKind::BufChain, p)
-                                        if p.iter()
-                                            .all(|p| matches!(p, Proj::Field { .. } | Proj::Deref)) =>
+                                        if p.iter().all(|p| {
+                                            matches!(p, Proj::Field { .. } | Proj::Deref)
+                                        }) =>
                                     {
                                         Some(InlNodeKind::BufChain)
                                     }
@@ -2220,7 +2235,7 @@ where
                                     node_kind[r] = Some(nk);
                                     node_root[r] = node_root[s];
                                     valid_def[r] = true;
-                                    if *mutable {
+                                    if *mutable || is_mut_node[s] {
                                         is_mut_node[r] = true;
                                     }
                                     changed = true;
@@ -2251,6 +2266,9 @@ where
                                 node_kind[r] = Some(nk);
                                 node_root[r] = node_root[s];
                                 valid_def[r] = true;
+                                if is_mut_node[s] {
+                                    is_mut_node[r] = true;
+                                }
                                 changed = true;
                                 continue;
                             }
@@ -2300,6 +2318,9 @@ where
                                 node_kind[r] = Some(nk);
                                 node_root[r] = node_root[s];
                                 valid_def[r] = true;
+                                if is_mut_node[s] {
+                                    is_mut_node[r] = true;
+                                }
                                 changed = true;
                             }
                         } else if root_is_direct_ref(func, table, Root::Value(*ptr)) {
@@ -2321,6 +2342,9 @@ where
                                 node_kind[r] = Some(src_k);
                                 node_root[r] = node_root[s];
                                 valid_def[r] = true;
+                                if is_mut_node[s] {
+                                    is_mut_node[r] = true;
+                                }
                                 changed = true;
                             }
                         }
@@ -2353,6 +2377,9 @@ where
                             node_kind[r] = Some(nk);
                             node_root[r] = node_root[s];
                             valid_def[r] = true;
+                            if is_mut_node[s] {
+                                is_mut_node[r] = true;
+                            }
                             changed = true;
                         }
                     }
@@ -2386,16 +2413,31 @@ where
                             node_kind[r] = Some(nk);
                             node_root[r] = node_root[s];
                             valid_def[r] = true;
+                            if is_mut_node[s] {
+                                is_mut_node[r] = true;
+                            }
                             changed = true;
                         }
                     }
                     OpKind::SliceView { ptr, len } => {
                         let p = ptr.0 as usize;
                         let l = len.0 as usize;
-                        if matches!(
-                            node_kind[p],
-                            Some(InlNodeKind::DataPtr | InlNodeKind::BufChain)
-                        ) && node_kind[l] == Some(InlNodeKind::LenVal)
+                        let is_immut_slice = func.ty(res).is_some_and(|ty| {
+                            matches!(
+                                table.get(table.peeled(ty)).map(|d| &d.kind),
+                                Some(
+                                    TypeKind::Reference { mutable: false, .. }
+                                        | TypeKind::RawPointer { mutable: false, .. }
+                                )
+                            )
+                        });
+                        if is_immut_slice
+                            && !is_mut_node[p]
+                            && matches!(
+                                node_kind[p],
+                                Some(InlNodeKind::DataPtr | InlNodeKind::BufChain)
+                            )
+                            && node_kind[l] == Some(InlNodeKind::LenVal)
                             && node_root[p].map(|x| x.0) == node_root[l].map(|x| x.0)
                         {
                             uf.union(p, r);
@@ -2776,22 +2818,60 @@ mod bstr_tests {
         };
         let _ = put;
 
-        add(&mut table, &mut interns, desc(UNIT, TypeKind::Tuple(Vec::new()), 0));
+        add(
+            &mut table,
+            &mut interns,
+            desc(UNIT, TypeKind::Tuple(Vec::new()), 0),
+        );
         add(&mut table, &mut interns, desc(BOOL, TypeKind::Bool, 1));
         add(&mut table, &mut interns, int_desc(U8, false, 8));
         add(&mut table, &mut interns, int_desc(USIZE, false, 32));
         add(&mut table, &mut interns, desc(STR, TypeKind::Str, 0));
-        add(&mut table, &mut interns, ref_desc(STR_REF, STR, false, PointerForm::Str));
-        add(&mut table, &mut interns, desc(SLICE_U8, TypeKind::Slice(U8), 0));
-        add(&mut table, &mut interns, ref_desc(REF_SLICE_U8, SLICE_U8, false, PointerForm::FatSlice));
-        let mut raw_ptr = desc(RAW_U8, TypeKind::RawPointer { pointee: U8, mutable: false }, 4);
+        add(
+            &mut table,
+            &mut interns,
+            ref_desc(STR_REF, STR, false, PointerForm::Str),
+        );
+        add(
+            &mut table,
+            &mut interns,
+            desc(SLICE_U8, TypeKind::Slice(U8), 0),
+        );
+        add(
+            &mut table,
+            &mut interns,
+            ref_desc(REF_SLICE_U8, SLICE_U8, false, PointerForm::FatSlice),
+        );
+        let mut raw_ptr = desc(
+            RAW_U8,
+            TypeKind::RawPointer {
+                pointee: U8,
+                mutable: false,
+            },
+            4,
+        );
         raw_ptr.js.pointer_form = Some(PointerForm::Slot);
         add(&mut table, &mut interns, raw_ptr);
-        let mut ptr_u8 = desc(PTR_U8, TypeKind::RawPointer { pointee: U8, mutable: false }, 4);
+        let mut ptr_u8 = desc(
+            PTR_U8,
+            TypeKind::RawPointer {
+                pointee: U8,
+                mutable: false,
+            },
+            4,
+        );
         ptr_u8.js.pointer_form = Some(PointerForm::Slot);
         add(&mut table, &mut interns, ptr_u8);
-        add(&mut table, &mut interns, ref_desc(LEN_REF, USIZE, false, PointerForm::Slot));
-        add(&mut table, &mut interns, ref_desc(PTR_U8_REF, U8, false, PointerForm::Slot));
+        add(
+            &mut table,
+            &mut interns,
+            ref_desc(LEN_REF, USIZE, false, PointerForm::Slot),
+        );
+        add(
+            &mut table,
+            &mut interns,
+            ref_desc(PTR_U8_REF, U8, false, PointerForm::Slot),
+        );
 
         let mut unique = strukt(&mut interns, UNIQUE_U8, "Unique", Vec::new(), Vec::new(), 4);
         unique.js.peeled = RAW_U8;
@@ -2801,7 +2881,14 @@ mod bstr_tests {
         add(&mut table, &mut interns, cap);
         let d = strukt(&mut interns, ALLOC_ZST, "Global", Vec::new(), Vec::new(), 0);
         add(&mut table, &mut interns, d);
-        let d = strukt(&mut interns, MARKER_ZST, "PhantomData", Vec::new(), Vec::new(), 0);
+        let d = strukt(
+            &mut interns,
+            MARKER_ZST,
+            "PhantomData",
+            Vec::new(),
+            Vec::new(),
+            0,
+        );
         add(&mut table, &mut interns, d);
 
         let inner_fields = vec![
@@ -2809,7 +2896,14 @@ mod bstr_tests {
             field(&mut interns, "cap", CAP),
             field(&mut interns, "alloc", ALLOC_ZST),
         ];
-        let d = strukt(&mut interns, RAW_VEC_INNER, "RawVecInner", inner_fields, Vec::new(), 8);
+        let d = strukt(
+            &mut interns,
+            RAW_VEC_INNER,
+            "RawVecInner",
+            inner_fields,
+            Vec::new(),
+            8,
+        );
         add(&mut table, &mut interns, d);
         let raw_fields = vec![
             field(&mut interns, "inner", RAW_VEC_INNER),
@@ -2817,26 +2911,53 @@ mod bstr_tests {
         ];
         let d = strukt(&mut interns, RAW_VEC, "RawVec", raw_fields, Vec::new(), 8);
         add(&mut table, &mut interns, d);
-        add(&mut table, &mut interns, ref_desc(BUF_REF, RAW_VEC, true, PointerForm::Slot));
+        add(
+            &mut table,
+            &mut interns,
+            ref_desc(BUF_REF, RAW_VEC, true, PointerForm::Slot),
+        );
 
         let vec_fields = vec![
             field(&mut interns, "buf", RAW_VEC),
             field(&mut interns, "len", USIZE),
         ];
-        let mut vec_u8 = strukt(&mut interns, VEC_U8, "Vec", vec_fields, vec![U8, ALLOC_ZST], 12);
+        let mut vec_u8 = strukt(
+            &mut interns,
+            VEC_U8,
+            "Vec",
+            vec_fields,
+            vec![U8, ALLOC_ZST],
+            12,
+        );
         vec_u8.meta.candidate = RepresentationCandidate::Vec;
         vec_u8.meta.allocator = AllocatorIdentity::Global;
         add(&mut table, &mut interns, vec_u8);
-        add(&mut table, &mut interns, ref_desc(VEC_U8_REF, VEC_U8, false, PointerForm::Slot));
-        add(&mut table, &mut interns, ref_desc(VEC_U8_MUT, VEC_U8, true, PointerForm::Slot));
+        add(
+            &mut table,
+            &mut interns,
+            ref_desc(VEC_U8_REF, VEC_U8, false, PointerForm::Slot),
+        );
+        add(
+            &mut table,
+            &mut interns,
+            ref_desc(VEC_U8_MUT, VEC_U8, true, PointerForm::Slot),
+        );
 
         let str_fields = vec![field(&mut interns, "vec", VEC_U8)];
         let mut string = strukt(&mut interns, STRING, "String", str_fields, Vec::new(), 12);
         string.meta.candidate = RepresentationCandidate::String;
         string.meta.allocator = AllocatorIdentity::Global;
         add(&mut table, &mut interns, string);
-        add(&mut table, &mut interns, ref_desc(STRING_REF, STRING, false, PointerForm::Slot));
-        add(&mut table, &mut interns, ref_desc(STRING_MUT, STRING, true, PointerForm::Slot));
+        add(
+            &mut table,
+            &mut interns,
+            ref_desc(STRING_REF, STRING, false, PointerForm::Slot),
+        );
+        add(
+            &mut table,
+            &mut interns,
+            ref_desc(STRING_MUT, STRING, true, PointerForm::Slot),
+        );
 
         (table, interns)
     }
@@ -2854,11 +2975,7 @@ mod bstr_tests {
         }
     }
 
-    fn bstr_cx<'a>(
-        sig: &'a Signature,
-        table: &'a TypeTable,
-        interns: &'a Interns,
-    ) -> LowerCx<'a> {
+    fn bstr_cx<'a>(sig: &'a Signature, table: &'a TypeTable, interns: &'a Interns) -> LowerCx<'a> {
         LowerCx {
             semantic: BodySemantic::Ordinary,
             sig,
@@ -3032,11 +3149,8 @@ mod bstr_tests {
             let mut refs = BTreeSet::new();
             let stmts = string_is_empty(&cx, Some(carrier), &mut helpers, &mut refs)
                 .expect("is_empty lowers");
-            let printed = jsast::stmt_to_string(&jsast::function(
-                "f",
-                vec!["$native0".to_owned()],
-                stmts,
-            ));
+            let printed =
+                jsast::stmt_to_string(&jsast::function("f", vec!["$native0".to_owned()], stmts));
             assert!(printed.contains(expected_substr), "{printed}");
             assert!(helpers.is_empty(), "{helpers:?}");
         }
@@ -3171,15 +3285,12 @@ mod bstr_tests {
         ba.terminate(ea, RTerm::Return(None));
         let fa = ba.finish();
         assert_eq!(
-            classify_reserve_body(
-                &fa,
-                &table,
-                &interns,
-                &parts,
-                &mut |_| None,
-                &mut |id| (id == item(900))
-                    .then_some(("alloc", "alloc::raw_vec::RawVecInner::<Global>::finish_grow")),
-            ),
+            classify_reserve_body(&fa, &table, &interns, &parts, &mut |_| None, &mut |id| (id
+                == item(900))
+            .then_some((
+                "alloc",
+                "alloc::raw_vec::RawVecInner::<Global>::finish_grow"
+            )),),
             Some(BstrStringOp::ReserveExact)
         );
 
@@ -3296,7 +3407,10 @@ mod bstr_tests {
                 &mut |id| (id == item(21)).then_some(&f_inner),
                 &mut |id| match id.definition.local_hash {
                     21 => Some(("alloc", "alloc::vec::Vec::<u8>::reserve_exact")),
-                    901 => Some(("alloc", "alloc::raw_vec::RawVecInner::<Global>::finish_grow")),
+                    901 => Some((
+                        "alloc",
+                        "alloc::raw_vec::RawVecInner::<Global>::finish_grow"
+                    )),
                     _ => None,
                 },
             ),
@@ -3362,11 +3476,19 @@ mod bstr_tests {
             vec!["$native0".to_owned(), "$native1".to_owned()],
             stmts,
         ));
-        let range_pos = printed.find("RangeError").expect("overflow throws RangeError");
+        let range_pos = printed
+            .find("RangeError")
+            .expect("overflow throws RangeError");
         let cap_pos = printed.find(".cap =").expect("updates .cap");
-        assert!(range_pos < cap_pos, "overflow guard must precede .cap write:\n{printed}");
+        assert!(
+            range_pos < cap_pos,
+            "overflow guard must precede .cap write:\n{printed}"
+        );
         assert!(printed.contains("2147483647"), "{printed}");
-        assert!(printed.contains("$nativeSb.cap < $nativeRequired"), "{printed}");
+        assert!(
+            printed.contains("$nativeSb.cap < $nativeRequired"),
+            "{printed}"
+        );
     }
 
     #[test]
@@ -3444,11 +3566,8 @@ mod bstr_tests {
             let mut refs = BTreeSet::new();
             let stmts = string_as_bytes(&cx, Some(carrier), &mut helpers, &mut refs)
                 .expect("as_bytes lowers");
-            let printed = jsast::stmt_to_string(&jsast::function(
-                "f",
-                vec!["$native0".to_owned()],
-                stmts,
-            ));
+            let printed =
+                jsast::stmt_to_string(&jsast::function("f", vec!["$native0".to_owned()], stmts));
             assert!(printed.contains(expected_substr), "{printed}");
             assert!(helpers.contains("bstr_bytes"), "{helpers:?}");
         }
@@ -3472,8 +3591,14 @@ mod bstr_tests {
             is_stdlib_string_op_path("alloc", "string::String::reserve"),
             Some(BstrStringOp::Reserve)
         );
-        assert!(!is_stdlib_str_as_bytes_path("my_crate", "my_crate::as_bytes"));
-        assert!(is_stdlib_str_as_bytes_path("core", "str::<impl str>::as_bytes"));
+        assert!(!is_stdlib_str_as_bytes_path(
+            "my_crate",
+            "my_crate::as_bytes"
+        ));
+        assert!(is_stdlib_str_as_bytes_path(
+            "core",
+            "str::<impl str>::as_bytes"
+        ));
         assert!(is_stdlib_str_as_bytes_path(
             "my_crate",
             "core::str::<impl str>::as_bytes"
@@ -3548,14 +3673,9 @@ mod bstr_tests {
         b.terminate(e, RTerm::Return(None));
         let func = b.finish();
         assert_eq!(
-            classify_reserve_body(
-                &func,
-                &table,
-                &interns,
-                &parts,
-                &mut |_| None,
-                &mut |id| (id == item(902)).then_some(("my_crate", "my_crate::tick")),
-            ),
+            classify_reserve_body(&func, &table, &interns, &parts, &mut |_| None, &mut |id| {
+                (id == item(902)).then_some(("my_crate", "my_crate::tick"))
+            },),
             None
         );
     }
@@ -3676,15 +3796,12 @@ mod bstr_tests {
 
         let func = b.finish();
         assert_eq!(
-            classify_reserve_body(
-                &func,
-                &table,
-                &interns,
-                &parts,
-                &mut |_| None,
-                &mut |id| (id == item(903))
-                    .then_some(("alloc", "alloc::raw_vec::RawVecInner::<Global>::finish_grow")),
-            ),
+            classify_reserve_body(&func, &table, &interns, &parts, &mut |_| None, &mut |id| {
+                (id == item(903)).then_some((
+                    "alloc",
+                    "alloc::raw_vec::RawVecInner::<Global>::finish_grow",
+                ))
+            },),
             Some(BstrStringOp::ReserveExact)
         );
     }
@@ -3792,5 +3909,87 @@ mod bstr_tests {
         assert!(c.internal_values.contains(&buf_ref));
         assert!(c.internal_values.contains(&str_val));
         assert_eq!(c.reserve_calls.get(&(0, 6)), Some(&add));
+    }
+
+    #[test]
+    fn inlined_string_vec_rejects_mutable_slice_view() {
+        let (mut table, interns) = build_table();
+        let mut_slice_u8 = TypeId(99);
+        table.insert(ref_desc(
+            mut_slice_u8,
+            SLICE_U8,
+            true,
+            PointerForm::FatSlice,
+        ));
+        let parts = string_parts(&table, &interns, STRING).expect("parts");
+
+        let mut b = FuncBuilder::new(item(34), sig(vec![STRING_MUT], mut_slice_u8));
+        let s_mut = b.param(STRING_MUT, NO_ORIGIN);
+        let e = FuncBuilder::ENTRY;
+        let vec_mut = b.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Value(s_mut),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.vec_field,
+                        ty: VEC_U8,
+                    },
+                ],
+                mutable: true,
+            },
+            VEC_U8_MUT,
+            NO_ORIGIN,
+        );
+        let len_ref = b.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Value(vec_mut),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.len_field,
+                        ty: USIZE,
+                    },
+                ],
+                mutable: false,
+            },
+            LEN_REF,
+            NO_ORIGIN,
+        );
+        let len_val = b.op(e, OpKind::Deref(len_ref), USIZE, NO_ORIGIN);
+        let buf_ref = b.op(
+            e,
+            OpKind::BorrowView {
+                root: Root::Value(vec_mut),
+                path: vec![
+                    Proj::Deref,
+                    Proj::Field {
+                        field: parts.buf_field,
+                        ty: RAW_VEC,
+                    },
+                ],
+                mutable: true,
+            },
+            BUF_REF,
+            NO_ORIGIN,
+        );
+        let slice = b.op(
+            e,
+            OpKind::SliceView {
+                ptr: buf_ref,
+                len: len_val,
+            },
+            mut_slice_u8,
+            NO_ORIGIN,
+        );
+        b.terminate(e, RTerm::Return(Some(slice)));
+
+        let func = b.finish();
+        assert!(
+            analyze_inlined_string_vec_inner(&func, &table, &interns, |_, _| false).is_none(),
+            "inlined mutable SliceView on String.vec must disqualify StringBuilder/HostString"
+        );
     }
 }

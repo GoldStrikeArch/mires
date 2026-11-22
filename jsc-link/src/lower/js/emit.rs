@@ -2230,8 +2230,16 @@ impl<'a> JsCx<'a> {
                 self.discriminant(base_ty, self.expr_of(*base)?, result_ty, as_tag)
             }
             OpKind::CellLoad(cell) => self.cell_expr(*cell),
-            OpKind::BorrowView { root, path, .. } => self.borrow_view(root, path),
-            OpKind::RawView { root, path, .. } => self.raw_view(root, path),
+            OpKind::BorrowView {
+                root,
+                path,
+                mutable,
+            } => self.borrow_view(root, path, *mutable),
+            OpKind::RawView {
+                root,
+                path,
+                mutable,
+            } => self.raw_view(root, path, *mutable),
             OpKind::SliceView { ptr: pointer, len } => {
                 let pointer_ty = self.ty_of(*pointer)?;
                 let data = self.expr_of(*pointer)?;
@@ -2264,7 +2272,13 @@ impl<'a> JsCx<'a> {
                 if array_reference {
                     Ok(ptr::fat_slice(data, jsast::num(0), len))
                 } else {
-                    self.build_fat(pointee, Some(pointer_ty), data, len)
+                    self.build_fat(
+                        pointee,
+                        value::is_mutable_ptr(table, result_ty),
+                        Some(pointer_ty),
+                        data,
+                        len,
+                    )
                 }
             }
             OpKind::Deref(pointer) => {

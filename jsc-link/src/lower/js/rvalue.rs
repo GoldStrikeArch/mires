@@ -803,7 +803,12 @@ impl<'a> JsCx<'a> {
                     pointee: to_pointee,
                     ..
                 }),
-            ) if from_pointee == to_pointee => Ok(value),
+            ) if from_pointee == to_pointee => {
+                if let Some(converted) = self.cast_str_ptr(from_ty, to_ty, value.clone()) {
+                    return converted;
+                }
+                Ok(value)
+            }
             (
                 Some(TypeKind::RawPointer {
                     pointee: from_pointee,
@@ -1299,7 +1304,7 @@ impl<'a> JsCx<'a> {
                 }
                 Ok(jsast::object(entries))
             }
-            TypeKind::RawPointer { pointee, .. } => {
+            TypeKind::RawPointer { pointee, mutable } => {
                 let mut values = values.into_iter();
                 let (Some(data), Some(meta)) = (values.next(), values.next()) else {
                     return Err(decline(
@@ -1307,7 +1312,7 @@ impl<'a> JsCx<'a> {
                         "a raw pointer aggregate needs a data pointer and its metadata",
                     ));
                 };
-                self.build_fat(*pointee, data_ty, data, meta)
+                self.build_fat(*pointee, *mutable, data_ty, data, meta)
             }
             other => Err(decline(
                 OpClass::Rvalue,

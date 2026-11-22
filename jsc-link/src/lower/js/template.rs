@@ -1509,12 +1509,8 @@ fn lower_fill(cx: &JsCx<'_>, marker: &str, args: &[ValueId], tracked: bool) -> R
             } else {
                 (true, false)
             };
-            let (setup, accessor, call) = super::host::closure_thunk_with(
-                cx,
-                *value,
-                convert_params_in,
-                convert_result_out,
-            )?;
+            let (setup, accessor, call) =
+                super::host::closure_thunk_with(cx, *value, convert_params_in, convert_result_out)?;
             let fill = match tracked {
                 true => Fill::Tracked {
                     accessor,
@@ -1879,12 +1875,7 @@ fn text_value(cx: &JsCx<'_>, op: &Op, value: ValueId) -> Res<Expr> {
 
 /// How a `view_abi::text` value of type `ty` becomes a JavaScript string, or `None` for a type
 /// that needs its own `Display` (v1 `abi.rs::text_conversion`).
-fn text_conversion(
-    cx: &JsCx<'_>,
-    ty: TypeId,
-    value: Expr,
-    elide_bstr_out: bool,
-) -> Option<Expr> {
+fn text_conversion(cx: &JsCx<'_>, ty: TypeId, value: Expr, elide_bstr_out: bool) -> Option<Expr> {
     let peeled = cx.table.peeled(ty);
     match value::kind(cx.table, peeled)? {
         TypeKind::Str => Some(if crate::lower::bstr::enabled() && !elide_bstr_out {
@@ -1892,7 +1883,10 @@ fn text_conversion(
         } else {
             value
         }),
-        TypeKind::Reference { pointee, .. } => {
+        TypeKind::Reference { pointee, mutable } => {
+            if *mutable && value::is_str(cx.table, *pointee) {
+                return None;
+            }
             let pointee = *pointee;
             let read = match value::is_slot(cx.table, peeled) {
                 true => ptr::slot_element(value),
@@ -1983,7 +1977,11 @@ fn lower_push_keyed(cx: &JsCx<'_>, op: &Op, args: &[ValueId]) -> Res<Expr> {
     // recompilation and unique for the same reason: a `for` has exactly one `push_keyed` in it.
     let site = jsast::string(format!("{}#{}", cx.summary.key.link_name, op.origin.0));
     let cached = jsast::rt_call("keyed_row", vec![site, key, row]);
-    Ok(jsast::method_call(list_expr(cx, *list)?, "push", vec![cached]))
+    Ok(jsast::method_call(
+        list_expr(cx, *list)?,
+        "push",
+        vec![cached],
+    ))
 }
 
 /// `micro(f)`: `__rt.microtask(() => f())`.
@@ -2058,9 +2056,12 @@ fn lower_host_value(cx: &JsCx<'_>, op: &Op, args: &[ValueId]) -> Res<Expr> {
     };
     let expr = cx.expr_of(*value)?;
     match op.result {
-        Some(result) if crate::lower::bstr::enabled() => {
-            super::host::crossing(cx, cx.ty_of(result)?, expr, crate::lower::bstr::Crossing::In)
-        }
+        Some(result) if crate::lower::bstr::enabled() => super::host::crossing(
+            cx,
+            cx.ty_of(result)?,
+            expr,
+            crate::lower::bstr::Crossing::In,
+        ),
         _ => Ok(expr),
     }
 }

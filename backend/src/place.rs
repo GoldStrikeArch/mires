@@ -88,6 +88,9 @@ struct Walk<'tcx> {
     ty: Ty<'tcx>,
     /// The reference to an unsized pointee, including its metadata.
     identity: Option<Expr>,
+    /// Whether a `str` place was reached by dereferencing a mutable `&mut str` / `*mut str`
+    /// (represented as a live `{ buf, off, len }` byte slice rather than a JavaScript string).
+    str_mutable: bool,
 }
 
 impl<'tcx> FnCx<'_, 'tcx> {
@@ -103,6 +106,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
         let mut ty = self.monomorphize(self.mir.local_decls[place.local].ty);
         let mut variant: Option<VariantIdx> = None;
         let mut identity = None;
+        let mut str_mutable = false;
         // Where the tail of the struct a `Deref` of a `{ ptr, meta }` named actually lives. Only
         // the projection that reads that tail needs it, and the steps that may sit in between -- a
         // transparent field, a downcast, a cast that changes nothing -- leave the place alone and
@@ -114,6 +118,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
             // Only a `Deref` of an unsized pointee sets this; every other projection clears it.
             identity = None;
             let carried_tail = tail.take();
+            let carried_str_mutable = std::mem::take(&mut str_mutable);
 
             match elem {
                 PlaceElem::Deref => {
@@ -122,6 +127,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                             place: JsPlace::Var(self.zombie(format!("cannot deref `{ty}`"))),
                             ty,
                             identity: None,
+                            str_mutable: false,
                         };
                     };
                     // Nothing inside a place with no storage has storage either, and a pointer
@@ -150,6 +156,14 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         // A slice: the place *is* the fat pointer, because the projections that
                         // follow need all three of `buf`, `off` and `len`.
                         ty::Slice(_) => {
+                            identity = Some(value.clone());
+                            JsPlace::Deref(value)
+                        }
+                        // A `str`: immutable pointers are JavaScript strings, mutable pointers are
+                        // live `{ buf, off, len }` byte slices. Record which form this deref came
+                        // from so reborrows convert when mutability changes.
+                        ty::Str => {
+                            str_mutable = ptr::is_mutable_ptr(self.tcx, ty);
                             identity = Some(value.clone());
                             JsPlace::Deref(value)
                         }
@@ -206,6 +220,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         // Still no storage, and still the same address.
                     } else if matches!(key, FieldKey::Transparent) {
                         tail = carried_tail;
+                        str_mutable = carried_str_mutable;
                     } else if !field_ty.is_sized(self.tcx, crate::value::typing_env()) {
                         // The unsized tail of the record a `Deref` of a `{ ptr, meta }` named.
                         // Rebuilding the fat pointer the tail's type is needs the metadata and
@@ -322,10 +337,12 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 PlaceElem::Downcast(_, index) => {
                     variant = Some(index);
                     tail = carried_tail;
+                    str_mutable = carried_str_mutable;
                 }
                 PlaceElem::OpaqueCast(cast_ty) | PlaceElem::UnwrapUnsafeBinder(cast_ty) => {
                     ty = self.monomorphize(cast_ty);
                     tail = carried_tail;
+                    str_mutable = carried_str_mutable;
                 }
             }
         }
@@ -334,6 +351,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
             place: current,
             ty,
             identity,
+            str_mutable,
         }
     }
 
@@ -579,8 +597,19 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// A reference to an aggregate is the aggregate's own JavaScript object, which is what keeps
     /// the emitted code readable and what makes a `Deref` of it free. A reference to anything
     /// else is a slot naming the place the walk arrived at.
-    pub(crate) fn codegen_ref(&self, place: Place<'tcx>) -> Expr {
+    pub(crate) fn codegen_ref(&self, place: Place<'tcx>, mutable: bool) -> Expr {
         let walk = self.walk_place(place);
+        let walk_shape =
+            crate::value::peel_pattern(crate::value::peel_transparent(self.tcx, walk.ty));
+        if matches!(walk_shape.kind(), ty::Str) {
+            let value = walk.identity.unwrap_or_else(|| self.read(&walk.place));
+            return match (walk.str_mutable, mutable) {
+                (true, true) => jsast::rt_call("byte_slice_ref", vec![value]),
+                (true, false) => ptr::bytes_to_str(self, ptr::ByteElement, value),
+                (false, false) => value,
+                (false, true) => ptr::str_to_bytes_mut(value),
+            };
+        }
         // `&*p` where `*p` is unsized is `p`: the metadata belongs to the reference, not to the
         // pointee, so there is nothing to rebuild.
         if let Some(identity) = walk.identity {
@@ -626,8 +655,18 @@ impl<'tcx> FnCx<'_, 'tcx> {
     /// aggregate: a raw pointer to one is a slot too, because a raw pointer is a thing programs
     /// offset and compare and a bare object is neither. A place inside a container decomposes into
     /// a slot naming it; a bare object with no container goes through `__rt.box`.
-    pub(crate) fn codegen_raw_ptr(&self, place: Place<'tcx>) -> Expr {
+    pub(crate) fn codegen_raw_ptr(&self, place: Place<'tcx>, mutable: bool) -> Expr {
         let walk = self.walk_place(place);
+        let walk_shape =
+            crate::value::peel_pattern(crate::value::peel_transparent(self.tcx, walk.ty));
+        if matches!(walk_shape.kind(), ty::Str) {
+            let value = walk.identity.unwrap_or_else(|| self.read(&walk.place));
+            return match (walk.str_mutable, mutable) {
+                (true, true) | (false, false) => value,
+                (true, false) => ptr::bytes_to_str(self, ptr::ByteElement, value),
+                (false, true) => ptr::str_to_bytes_mut(value),
+            };
+        }
         if let Some(identity) = walk.identity {
             return ptr::ref_to_raw(self, walk.ty, identity);
         }
@@ -751,9 +790,16 @@ impl<'tcx> FnCx<'_, 'tcx> {
         match pointee.kind() {
             ty::Slice(_) => ptr::slice_len(value),
             ty::Dynamic(..) => jsast::member(value, ptr::META),
-            // A `&str` is a JavaScript string, whose metadata is the length of the bytes it would
-            // encode to rather than a field of a record.
-            ty::Str => ptr::str_len(value),
+            // A `&str` / `*const str` is a JavaScript string whose metadata is its UTF-8 byte
+            // length; a `&mut str` / `*mut str` is a live `{ buf, off, len }` byte slice whose
+            // metadata is `.len`.
+            ty::Str => {
+                if ptr::is_mut_str_ptr(self.tcx, pointer_ty) {
+                    ptr::slice_len(value)
+                } else {
+                    ptr::str_len(value)
+                }
+            }
             // A thin pointer's metadata is `()`.
             _ if pointee.is_sized(self.tcx, crate::value::typing_env()) => jsast::undefined(),
             // A struct with an unsized tail carries the tail's metadata beside the record, the

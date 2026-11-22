@@ -55,6 +55,9 @@ pub struct Walk {
     /// object's `__rt.box` ([`JsCx::raw_view`]), never the slot of that expression, which would
     /// be the address of the storage *holding* the reference.
     pub object: bool,
+    /// Whether a `str` place was reached by dereferencing a mutable `&mut str` / `*mut str`
+    /// (represented as a live `{ buf, off, len }` byte slice rather than a JavaScript string).
+    pub str_mutable: bool,
 }
 
 impl<'a> JsCx<'a> {
@@ -100,6 +103,7 @@ impl<'a> JsCx<'a> {
                     ty: element,
                     identity: None,
                     object: false,
+                    str_mutable: false,
                 });
             }
         }
@@ -107,12 +111,14 @@ impl<'a> JsCx<'a> {
         let mut variant: Option<u32> = None;
         let mut identity = None;
         let mut tail: Option<Expr> = None;
+        let mut str_mutable = false;
         // An SSA value has no storage of its own: an aggregate one is held as the object.
         let mut object = matches!(root, Root::Value(_)) && is_object(table, ty);
 
         for (step, proj) in path.iter().enumerate() {
             identity = None;
             let carried_tail = tail.take();
+            let carried_str_mutable = std::mem::take(&mut str_mutable);
             // A downcast and a transparent field are the same place; every other step leaves it.
             object &= matches!(proj, Proj::Downcast { .. } | Proj::Field { .. });
 
@@ -142,6 +148,11 @@ impl<'a> JsCx<'a> {
                             JsPlace::Deref(jsast::member(value, PTR))
                         }
                         Some(TypeKind::Slice(_)) => {
+                            identity = Some(value.clone());
+                            JsPlace::Deref(value)
+                        }
+                        Some(TypeKind::Str) => {
+                            str_mutable = value::is_mutable_ptr(table, ty);
                             identity = Some(value.clone());
                             JsPlace::Deref(value)
                         }
@@ -190,6 +201,7 @@ impl<'a> JsCx<'a> {
                         // Still no storage, and still the same address.
                     } else if matches!(key, FieldKey::Transparent) {
                         tail = carried_tail;
+                        str_mutable = carried_str_mutable;
                     } else if !table.get(field_ty).is_some_and(|d| d.layout.sized) {
                         let base = self.read_place(&current);
                         current = self.tail_place(base, key, field_ty, carried_tail)?;
@@ -291,6 +303,7 @@ impl<'a> JsCx<'a> {
                 Proj::Downcast { variant: index } => {
                     variant = Some(*index);
                     tail = carried_tail;
+                    str_mutable = carried_str_mutable;
                 }
             }
         }
@@ -299,6 +312,7 @@ impl<'a> JsCx<'a> {
             ty,
             identity,
             object,
+            str_mutable,
         })
     }
 
@@ -509,9 +523,20 @@ impl<'a> JsCx<'a> {
         }
     }
 
-    /// `&place` (`place.rs::codegen_ref`).
-    pub fn borrow_view(&self, root: &Root, path: &[Proj]) -> Res<Expr> {
+    /// `&place` / `&mut place` (`place.rs::codegen_ref`).
+    pub fn borrow_view(&self, root: &Root, path: &[Proj], mutable: bool) -> Res<Expr> {
         let walk = self.walk_place(root, path)?;
+        if value::is_str(self.table, walk.ty) {
+            let value = walk
+                .identity
+                .unwrap_or_else(|| self.read_place(&walk.place));
+            return Ok(match (walk.str_mutable, mutable) {
+                (true, true) => jsast::rt_call("byte_slice_ref", vec![value]),
+                (true, false) => self.bytes_to_str(value),
+                (false, false) => value,
+                (false, true) => self.str_to_bytes_mut(value),
+            });
+        }
         if let Some(identity) = walk.identity {
             if let Some(TypeKind::Slice(element)) = value::kind(self.table, walk.ty) {
                 if matches!(
@@ -541,9 +566,19 @@ impl<'a> JsCx<'a> {
         self.slot_of(walk.place, walk.ty)
     }
 
-    /// `&raw const place` (`place.rs::codegen_raw_ptr`).
-    pub fn raw_view(&self, root: &Root, path: &[Proj]) -> Res<Expr> {
+    /// `&raw const place` / `&raw mut place` (`place.rs::codegen_raw_ptr`).
+    pub fn raw_view(&self, root: &Root, path: &[Proj], mutable: bool) -> Res<Expr> {
         let walk = self.walk_place(root, path)?;
+        if value::is_str(self.table, walk.ty) {
+            let value = walk
+                .identity
+                .unwrap_or_else(|| self.read_place(&walk.place));
+            return Ok(match (walk.str_mutable, mutable) {
+                (true, true) | (false, false) => value,
+                (true, false) => self.bytes_to_str(value),
+                (false, true) => self.str_to_bytes_mut(value),
+            });
+        }
         if let Some(identity) = walk.identity {
             return Ok(self.ref_to_raw(walk.ty, identity));
         }
@@ -595,7 +630,11 @@ impl<'a> JsCx<'a> {
         match value::kind(table, pointee) {
             Some(TypeKind::Slice(_)) => Ok(self.slice_len(value)),
             Some(TypeKind::Dynamic { .. }) => Ok(jsast::member(value, META)),
-            Some(TypeKind::Str) => Ok(self.str_len(value)),
+            Some(TypeKind::Str) => Ok(if value::is_mutable_ptr(table, pointer_ty) {
+                self.slice_len(value)
+            } else {
+                self.str_len(value)
+            }),
             _ if table.get(pointee).is_some_and(|d| d.layout.sized) => Ok(jsast::undefined()),
             _ if table.unsized_tail(pointee).is_some() => Ok(jsast::member(value, META)),
             _ => Err(decline(
