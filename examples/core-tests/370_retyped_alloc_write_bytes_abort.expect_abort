@@ -1,0 +1,1 @@
+the program must abort: write_bytes over a non-scalar byte view cannot synthesize aggregate values
