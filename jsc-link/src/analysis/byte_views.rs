@@ -1263,7 +1263,23 @@ fn scale_value_escapes(
                     OpKind::Intrinsic { .. } => return Some("intrinsic"),
                     OpKind::SetField { .. } => return Some("set_field"),
                     OpKind::StoreThrough { .. } => return Some("store_through"),
-                    OpKind::BorrowView { .. } | OpKind::RawView { .. } => return Some("view"),
+                    OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. } => {
+                        // Taking a whole-container reference/pointer (`&Vec<T>`, `&mut Vec<T>`,
+                        // `&RawVec<T>`) does not expose its internal raw byte pointer directly;
+                        // any consumer that unpacks the buffer pointer is guarded by Rule 5.
+                        if path.is_empty()
+                            && matches!(root, Root::Value(rv) if *rv == v)
+                            && wide_vec_or_rawvec_elem_size(
+                                table,
+                                interns,
+                                func.values[v.0 as usize].ty,
+                            )
+                            .is_some()
+                        {
+                            continue;
+                        }
+                        return Some("view");
+                    }
                     _ => return Some("other_op"),
                 },
             }
