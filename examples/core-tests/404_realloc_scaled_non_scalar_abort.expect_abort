@@ -1,0 +1,1 @@
+the program must abort: realloc on a scaled non-scalar pointer must preserve non-scalar refusal

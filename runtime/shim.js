@@ -312,6 +312,13 @@ globalThis.__rt.addr = (p, size) => {
     if (typeof u === "number") return u;
     buf = u.buf; off = u.off; inBytes = u.inBytes; step = u.es !== undefined ? u.es : size;
   } else {
+    if (typeof p === "object" && !("buf" in p) && globalThis.__rt._boxes !== null) {
+      const slot = globalThis.__rt._boxes.get(p);
+      if (slot !== undefined && slot.buf[slot.off] === p) {
+        const block = globalThis.__rt._blk_get(slot.buf);
+        return globalThis.__rt.addr(slot, block !== undefined ? block.es : size);
+      }
+    }
     globalThis.__rt._named(p, "addr");
     buf = p.buf;
     off = typeof p.off === "number" ? p.off : 0;
@@ -506,26 +513,55 @@ globalThis.__rt.ptr_eq = (a, b) => {
     let p = aNum ? b : a;
     if (!("buf" in p)) return false;
     while (p.pr !== undefined) p = p.pr;
-    const base = typeof p.buf === "number" ? p.buf : globalThis.__rt._dangling_of.get(p.buf);
+    let pb = p.buf, po = typeof p.off === "number" ? p.off : 0;
+    let ps = p.sc !== undefined ? 1 : p.es !== undefined ? p.es : 1;
+    const psv = typeof pb === "object" && pb !== null ? globalThis.__rt._scalar_view_of.get(pb) : undefined;
+    if (psv !== undefined) { po = po * psv.size + psv.phase; ps = 1; pb = psv.buf; }
+    const base = typeof pb === "number" ? pb : globalThis.__rt._dangling_of.get(pb);
     if (base === undefined) return false;
-    const s = p.sc !== undefined ? 1 : p.es !== undefined ? p.es : 1;
-    return ((base + (typeof p.off === "number" ? p.off * s : 0)) >>> 0) === ((aNum ? a : b) >>> 0);
+    return ((base + po * ps) >>> 0) === ((aNum ? a : b) >>> 0);
   }
-  if (!("buf" in a) || !("buf" in b)) return false;
   let l = a, r = b;
+  if (!("buf" in l) && globalThis.__rt._boxes !== null) {
+    const slot = globalThis.__rt._boxes.get(l);
+    if (slot !== undefined && slot.buf[slot.off] === l) l = slot;
+  }
+  if (!("buf" in r) && globalThis.__rt._boxes !== null) {
+    const slot = globalThis.__rt._boxes.get(r);
+    if (slot !== undefined && slot.buf[slot.off] === r) r = slot;
+  }
+  if (!("buf" in l) || !("buf" in r)) return false;
   while (l.pr !== undefined) l = l.pr;
   while (r.pr !== undefined) r = r.pr;
-  if (l.buf === r.buf && typeof l.buf !== "number") {
-    if (a.sc === b.sc) return l.off === r.off;
-    const es = a.sc !== undefined ? a.sc : b.sc;
-    return (a.sc !== undefined ? l.off : l.off * es) === (b.sc !== undefined ? r.off : r.off * es);
+  let lb = l.buf, lo = l.off, lInB = l.sc !== undefined, lEs = l.sc !== undefined ? l.sc : l.es;
+  let rb = r.buf, ro = r.off, rInB = r.sc !== undefined, rEs = r.sc !== undefined ? r.sc : r.es;
+  if (typeof lb === "object" && lb !== null) {
+    const sv = globalThis.__rt._scalar_view_of.get(lb);
+    if (sv !== undefined) { lo = lo * sv.size + sv.phase; lInB = true; lEs = 1; lb = sv.buf; }
+    const blk = typeof lb === "object" && lb !== null ? globalThis.__rt._blk_get(lb) : undefined;
+    if (blk !== undefined && blk.typed !== undefined && lb !== blk.typed && blk.hdr === undefined) {
+      lInB = true; lEs = blk.es; lb = blk.typed;
+    }
   }
-  if (typeof l.buf === "number" || typeof r.buf === "number") {
-    const la = typeof l.buf === "number" ? l.buf : globalThis.__rt._dangling_of.get(l.buf);
-    const ra = typeof r.buf === "number" ? r.buf : globalThis.__rt._dangling_of.get(r.buf);
+  if (typeof rb === "object" && rb !== null) {
+    const sv = globalThis.__rt._scalar_view_of.get(rb);
+    if (sv !== undefined) { ro = ro * sv.size + sv.phase; rInB = true; rEs = 1; rb = sv.buf; }
+    const blk = typeof rb === "object" && rb !== null ? globalThis.__rt._blk_get(rb) : undefined;
+    if (blk !== undefined && blk.typed !== undefined && rb !== blk.typed && blk.hdr === undefined) {
+      rInB = true; rEs = blk.es; rb = blk.typed;
+    }
+  }
+  if (lb === rb && typeof lb !== "number") {
+    if (lInB === rInB) return lo === ro;
+    const es = lEs !== undefined && lEs > 1 ? lEs : (rEs !== undefined && rEs > 1 ? rEs : 1);
+    return (lInB ? lo : lo * es) === (rInB ? ro : ro * es);
+  }
+  if (typeof lb === "number" || typeof rb === "number") {
+    const la = typeof lb === "number" ? lb : globalThis.__rt._dangling_of.get(lb);
+    const ra = typeof rb === "number" ? rb : globalThis.__rt._dangling_of.get(rb);
     if (la !== undefined && ra !== undefined) {
-      return ((la + l.off * (l.sc !== undefined ? 1 : l.es || 1)) >>> 0) ===
-        ((ra + r.off * (r.sc !== undefined ? 1 : r.es || 1)) >>> 0);
+      return ((la + lo * (lInB ? 1 : lEs || 1)) >>> 0) ===
+        ((ra + ro * (rInB ? 1 : rEs || 1)) >>> 0);
     }
   }
   return false;
@@ -1633,11 +1669,11 @@ globalThis.__rt._bv_enable = (() => {
       return p;
     },
     addr_unwrap(p, size) {
-      if (typeof p === "object" && !("buf" in p)) {
+      if (typeof p === "object" && !("buf" in p) && globalThis.__rt._boxes !== null) {
         const slot = globalThis.__rt._boxes.get(p);
         if (slot !== undefined && slot.buf[slot.off] === p) {
           const block = globalThis.__rt._blk_get(slot.buf);
-          if (block !== undefined) return globalThis.__rt.addr(slot, block.es);
+          return globalThis.__rt.addr(slot, block !== undefined ? block.es : size);
         }
       }
       globalThis.__rt._named(p, "addr");
@@ -4280,8 +4316,27 @@ globalThis.__rt.realloc = (p, size, align, new_size) => {
   }
   const active = block.typed !== undefined ? block.typed : buf;
   block.bytes = new_size;
+  if (block.typed !== undefined) {
+    const tb = globalThis.__rt._blk_get(block.typed);
+    if (tb !== undefined) tb.bytes = new_size;
+  } else if (block.raw !== undefined) {
+    const rb = globalThis.__rt._blk_get(block.raw);
+    if (rb !== undefined) rb.bytes = new_size;
+  }
   active.length = new_size / block.es;
   globalThis.__rt._addr_release(active, new_size);
+  if (p.sc !== undefined) {
+    let raw = block.raw;
+    if (raw === undefined) {
+      raw = [];
+      block.raw = raw;
+      globalThis.__rt._blocks.set(raw, {
+        bytes: new_size, es: block.es, sk: block.sk, cl: block.cl,
+        fresh: false, zeroed: block.zeroed, typed: active,
+      });
+    }
+    return { buf: raw, off: p.off };
+  }
   return { buf: p.buf, off: p.off };
 };
 

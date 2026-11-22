@@ -664,7 +664,21 @@ impl<'a> JsCx<'a> {
             return Ok(address);
         }
         if self.table.is_indirect(walk.ty) {
-            return Ok(self.read_place(&walk.place));
+            let value = self.read_place(&walk.place);
+            if let Some(TypeKind::Slice(element)) =
+                value::kind(self.table, self.table.peeled(walk.ty))
+            {
+                if let Some(TypeKind::Integer { bits: 8, signed }) =
+                    value::kind(self.table, self.table.peeled(*element))
+                {
+                    let mut args = vec![value];
+                    if *signed {
+                        args.push(Expr::Bool(true));
+                    }
+                    return Ok(jsast::rt_call("byte_slice_ref", args));
+                }
+            }
+            return Ok(value);
         }
         self.slot_of(walk.place, walk.ty)
     }

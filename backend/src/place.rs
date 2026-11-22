@@ -740,7 +740,21 @@ impl<'tcx> FnCx<'_, 'tcx> {
             return address;
         }
         if is_indirect(self.tcx, walk.ty) {
-            return self.read(&walk.place);
+            let value = self.read(&walk.place);
+            if let ty::Slice(element) = walk_shape.kind() {
+                match crate::value::peel_pattern(crate::value::peel_transparent(self.tcx, *element))
+                    .kind()
+                {
+                    ty::Uint(ty::UintTy::U8) => {
+                        return jsast::rt_call("byte_slice_ref", vec![value]);
+                    }
+                    ty::Int(ty::IntTy::I8) => {
+                        return jsast::rt_call("byte_slice_ref", vec![value, Expr::Bool(true)]);
+                    }
+                    _ => {}
+                }
+            }
+            return value;
         }
         self.slot_of(walk.place, walk.ty)
     }

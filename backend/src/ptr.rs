@@ -1152,6 +1152,15 @@ pub(crate) fn raw_to_ref<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, raw: Expr
     if crate::value::unsized_tail(fx.tcx, pointee).is_some() {
         return jsast::rt_call("tail_ref", vec![raw]);
     }
+    if let ty::Slice(element) = peel_pattern(peel_transparent(fx.tcx, pointee)).kind() {
+        match peel_pattern(peel_transparent(fx.tcx, *element)).kind() {
+            ty::Uint(ty::UintTy::U8) => return jsast::rt_call("byte_slice_ref", vec![raw]),
+            ty::Int(ty::IntTy::I8) => {
+                return jsast::rt_call("byte_slice_ref", vec![raw, Expr::Bool(true)]);
+            }
+            _ => {}
+        }
+    }
     if !is_slot_pointee(fx.tcx, pointee) || !is_indirect(fx.tcx, pointee) {
         return raw;
     }

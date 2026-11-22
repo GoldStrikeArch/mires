@@ -265,6 +265,18 @@ impl<'a> JsCx<'a> {
         if self.table.unsized_tail(pointee).is_some() {
             return jsast::rt_call("tail_ref", vec![raw]);
         }
+        if let Some(TypeKind::Slice(element)) = value::kind(self.table, self.table.peeled(pointee))
+        {
+            if let Some(TypeKind::Integer { bits: 8, signed }) =
+                value::kind(self.table, self.table.peeled(*element))
+            {
+                let mut args = vec![raw];
+                if *signed {
+                    args.push(Expr::Bool(true));
+                }
+                return jsast::rt_call("byte_slice_ref", args);
+            }
+        }
         if !is_slot_pointee(self.table, pointee) || !self.table.is_indirect(pointee) {
             return raw;
         }

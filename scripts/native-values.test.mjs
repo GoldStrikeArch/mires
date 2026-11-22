@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { types } from "node:util";
 import { readFileSync } from "node:fs";
+import vm from "node:vm";
 
 import "../runtime/shim.js";
 import { minimalShim } from "./minimal-shim.mjs";
@@ -828,4 +829,82 @@ test("ordinary Vec/Box allocs stay Proxy-free and minimal-shim excludes byte-vie
     assert.equal(withBv.names.includes("_byte_view"), true, `${trigger} must pull _byte_view`);
     assert.match(withBv.source, /let \$rt__bv = null;/);
   }
+});
+
+test("minimal-shim ptr_eq/addr (_bv === null), scaled realloc non-scalar abort, and post-retype byte_slice_ref", () => {
+  const shimSource = readFileSync(new URL("../runtime/shim.js", import.meta.url), "utf8");
+
+  // 1. Minimal shim with _bv === null: ptr_eq and addr unwrap _boxes, _scalar_view_of,
+  //    and two-array raw vs typed blocks without pulling _bv_enable or _byte_view.
+  const minDirect = [
+    "alloc", "dealloc", "unscale", "unscale_scalar", "box",
+    "ptr_eq", "addr", "slice_from_parts", "byte_slice_ref",
+  ];
+  const min = minimalShim([], shimSource, { direct: minDirect });
+  assert.equal(min.names.includes("_bv_enable"), false, "minimal shim must exclude _bv_enable");
+  assert.equal(min.names.includes("_byte_view"), false, "minimal shim must exclude _byte_view");
+  const ctx = { console };
+  vm.runInNewContext(min.source, ctx);
+  const mrt = ctx.__rt;
+  assert.equal(mrt._bv, null);
+
+  // _boxes: raw slot vs bare object reference (Box<Pair> -> Box<dyn Trait>)
+  const pair = { a: 1, b: 2 };
+  const boxed = mrt.box(pair);
+  assert.equal(mrt.ptr_eq(boxed, pair), true);
+  assert.equal(mrt.ptr_eq(pair, boxed), true);
+  assert.equal(mrt.addr(boxed, 8), mrt.addr(pair, 8));
+
+  // _scalar_view_of: [u8]::align_to::<u32>() scalar view vs underlying byte buffer
+  const bytes = [1, 2, 3, 4, 5, 6, 7, 8];
+  const sv = mrt.unscale_scalar({ buf: bytes, off: 0 }, 4, () => 0, "u32");
+  assert.equal(mrt.ptr_eq({ buf: bytes, off: 0 }, sv), true);
+  assert.equal(mrt.ptr_eq({ buf: bytes, off: 4 }, { buf: sv.buf, off: 1 }), true);
+  assert.equal(mrt.ptr_eq({ buf: bytes, off: 1 }, sv), false);
+
+  // Two-array raw vs typed block
+  const raw = mrt.alloc(16, 4);
+  const typed = mrt.unscale_scalar(raw, 4, () => 0, "u32");
+  assert.equal(mrt.ptr_eq(raw, typed), true);
+  assert.equal(mrt.ptr_eq({ buf: raw.buf, off: 4 }, { buf: typed.buf, off: 1 }), true);
+  assert.equal(mrt.ptr_eq({ buf: raw.buf, off: 2 }, typed), false);
+  mrt.dealloc(raw, 16, 4);
+
+  // 2. Full shim: realloc on a scaled non-scalar pointer MUST preserve `.sc` so reading/slicing
+  //    or writing bytes through the grown pointer still aborts fail-closed.
+  const nsRaw = rt.alloc(8, 4);
+  const nsTyped = rt.unscale(nsRaw, 8, () => ({ a: 0, b: 0 }));
+  nsTyped.buf[0] = { a: 11, b: 22 };
+  const scaled = rt.scale(nsTyped, 8);
+  assert.equal(scaled.sc, 8);
+  const grown = rt.realloc(scaled, 8, 4, 16);
+  assert.equal(rt.ptr_eq(grown, nsTyped), true);
+  assert.equal(types.isProxy(rt.slice_from_parts(grown, 16, 1).buf), false);
+  assert.throws(
+    () => rt.read_byte(grown),
+    (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
+  );
+  assert.throws(
+    () => rt.byte_slice_ref(rt.slice_from_parts(grown, 8, 1)),
+    (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
+  );
+  assert.throws(
+    () => rt.write_bytes(grown, 0xaa, 4),
+    (err) => rt.is_abort(err) && /non-scalar/.test(err.message),
+  );
+  rt.dealloc(grown, 16, 4);
+
+  // 3. Full shim: slice_from_parts on post-retype scalar raw stays Proxy-free, while
+  //    byte_slice_ref materializes the aliasing byte view (and aborts on non-scalar raw).
+  const scRaw = rt.alloc(8, 4);
+  const scTyped = rt.unscale_scalar(scRaw, 4, () => 0, "u32");
+  scTyped.buf[0] = 0x11223344;
+  const rawSlice = rt.slice_from_parts(scRaw, 4, 1);
+  assert.equal(types.isProxy(rawSlice.buf), false);
+  const refSlice = rt.byte_slice_ref(rawSlice);
+  assert.equal(refSlice.buf[refSlice.off], 0x44);
+  assert.equal(refSlice.buf[refSlice.off + 1], 0x33);
+  refSlice.buf[refSlice.off + 1] = 0x99;
+  assert.equal(scTyped.buf[0], 0x11229944);
+  rt.dealloc(scRaw, 8, 4);
 });
