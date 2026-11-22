@@ -624,13 +624,56 @@ test("provenance-free slice addresses preserve addr, ptr_is_null, and ptr_eq", (
   const unwCustom = rt.unwindow_slice(4096, 0);
   assert.deepEqual(unwCustom, { buf: 4096, off: 0, len: 0 });
 
-  // `scale_scalar` on bare-address slices keeps the address intact for `is_null` / `addr`.
+  // `scale_scalar` / `scale` / `thin` / `offset` / `unscale` / `slice_from_parts` on bare-address
+  // and dangling slices return bare numeric addresses and agree across `ptr_eq`, `ptr_cmp`, `addr`.
   const scaledCustom = rt.scale_scalar(custom, 4, "u32", false);
+  assert.equal(scaledCustom, 4096);
   assert.equal(rt.addr(scaledCustom, 1), 4096);
   assert.equal(rt.ptr_is_null(scaledCustom, 1), false);
+  assert.equal(rt.ptr_eq(scaledCustom, custom), true);
+  assert.deepEqual(rt.slice_from_parts(scaledCustom, 5, 1), { buf: 4096, off: 0, len: 5 });
+  assert.equal(rt.unscale(scaledCustom, 4, null), 4096);
+  assert.equal(rt.unscale_scalar(scaledCustom, 4, null, "u32"), 4096);
+  assert.equal(rt.unscale_scalar(custom, 4, null, "u32"), 4096);
   const scaledNull = rt.scale_scalar(nul, 4, "u32", false);
+  assert.equal(scaledNull, 0);
   assert.equal(rt.addr(scaledNull, 1), 0);
   assert.equal(rt.ptr_is_null(scaledNull, 1), true);
+  assert.equal(rt.scale(custom, 8), 4096);
+  assert.equal(rt.scale(nul, 8), 0);
+  assert.equal(rt.thin(rt.erase(custom, 4, "u32"), 1, false), 4096);
+  assert.equal(rt.thin(rt.erase(custom, 8), 1, false), 4096);
+  assert.deepEqual(rt.slice_from_parts(rt.erase(custom, 4, "u32"), 0, 1), {
+    buf: 4096,
+    off: 0,
+    len: 0,
+  });
+
+  // Dangling byte views (`scale_scalar` / `scale` over `_dangling`) compare equal to bare numbers
+  // and bare ZST slice objects `{ buf: 4, off: 0, len: 0 }`.
+  const danglingU8 = rt.scale_scalar(dangling, 4, "u32", false);
+  assert.equal(rt.addr(danglingU8, 1), 4);
+  assert.equal(rt.ptr_eq(danglingU8, 4), true);
+  assert.equal(rt.ptr_eq(4, danglingU8), true);
+  assert.equal(rt.ptr_eq(danglingU8, dangling), true);
+  assert.equal(rt.ptr_eq({ buf: 4, off: 0, len: 0 }, dangling), true);
+  assert.equal(rt.ptr_eq({ buf: 4, off: 0, len: 0 }, danglingU8), true);
+  assert.equal(rt.ptr_eq(rt.scale(dangling, 8), 4), true);
+
+  // Offset bare-address slices preserve exact 32-bit addresses, `ptr_eq`, and `ptr_cmp` ordering.
+  const customOff2 = rt.offset(custom, 2, 4);
+  assert.equal(customOff2, 4104);
+  assert.equal(rt.ptr_eq(customOff2, 4104), true);
+  assert.equal(rt.ptr_eq(customOff2, rt.slice_from_parts(4104, 3)), true);
+  assert.equal(rt.ptr_cmp(rt.offset(custom, 1, 4), rt.offset(scaledCustom, 2, 1), 1), 1);
+  assert.equal(rt.ptr_cmp({ buf: 4096, off: 1, es: 4 }, { buf: 4096, off: 2, sc: 4 }, 1), 1);
+  const huge = rt.slice_from_parts(0xfffffff0, 0);
+  assert.equal(rt.addr(huge, 1), 0xfffffff0);
+  assert.equal(rt.ptr_cmp(huge, 4096, 1), 1);
+  const hugeOff16 = rt.offset(huge, 16, 1);
+  assert.equal(hugeOff16, 0);
+  assert.equal(rt.addr(hugeOff16, 1), 0);
+  assert.equal(rt.ptr_is_null(hugeOff16, 1), true);
 
   // Poisoned offset-from-address records still throw in ptr_eq even when compared to a number.
   assert.throws(

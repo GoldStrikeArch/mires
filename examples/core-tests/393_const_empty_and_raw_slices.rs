@@ -17,6 +17,9 @@ use core::ptr::{self, NonNull};
 #[repr(transparent)]
 struct U32Slice([u32]);
 
+#[repr(C)]
+struct Pair(u32, u32);
+
 struct SliceHolder {
     empty_u32: *const [u32],
     raw_5: *const [u32],
@@ -44,6 +47,13 @@ const CUSTOM_U32_5: *const [u32] = ptr::slice_from_raw_parts(0x1000 as *const u3
 const CUSTOM_U32_5_MUT: *mut [u32] = ptr::slice_from_raw_parts_mut(0x1000 as *mut u32, 5);
 const CUSTOM_UNALIGNED: *const [u32] = ptr::slice_from_raw_parts(0x1002 as *const u32, 3);
 const CUSTOM_U8_7: *const [u8] = ptr::slice_from_raw_parts(0x2000 as *const u8, 7);
+const CUSTOM_U8_4096: *const [u8] = ptr::slice_from_raw_parts(0x1000 as *const u8, 0);
+const CUSTOM_U16_4096: *const [u16] = ptr::slice_from_raw_parts(0x1000 as *const u16, 0);
+const CUSTOM_PAIR_5: *const [Pair] = ptr::slice_from_raw_parts(0x1000 as *const Pair, 5);
+const NULL_PAIR_0: *const [Pair] = ptr::slice_from_raw_parts(ptr::null::<Pair>(), 0);
+const DANGLING_PAIR_0: *const [Pair] =
+    ptr::slice_from_raw_parts(NonNull::<Pair>::dangling().as_ptr(), 0);
+const HUGE_U8_0: *const [u8] = ptr::slice_from_raw_parts(0xffff_fff0usize as *const u8, 0);
 const NULL_U32_0: *const [u32] = ptr::slice_from_raw_parts(ptr::null::<u32>(), 0);
 const NULL_U32_5: *const [u32] = ptr::slice_from_raw_parts(ptr::null::<u32>(), 5);
 
@@ -199,4 +209,59 @@ pub fn rust_entry() {
     print_usize(black_box(S_EMPTY_REF).len());
     print_usize(black_box(S_OPT_NN.0).unwrap().len());
     print_usize(black_box(S_HOLDER.raw_5).len());
+
+    // Non-scalar bare-address/dangling slices (`scale`, `thin`, `is_null`, `cast::<u8>()`)
+    let cp = black_box(CUSTOM_PAIR_5);
+    print_usize(cp.len());
+    print_bool(cp.cast::<Pair>().is_null());
+    print_usize(cp.cast::<u8>() as usize);
+    print_bool(ptr::eq(cp.cast::<u8>(), 0x1000 as *const u8));
+    print_bool(ptr::eq(cp.cast::<()>().cast::<u8>(), 0x1000 as *const u8));
+    print_bool(ptr::eq(c5.cast::<()>().cast::<u8>(), 0x1000 as *const u8));
+    print_usize(cu8.cast::<u32>() as usize);
+
+    let np = black_box(NULL_PAIR_0);
+    print_bool(np.cast::<Pair>().is_null());
+    print_bool(np.cast::<u8>().is_null());
+
+    let dp = black_box(DANGLING_PAIR_0);
+    print_usize(dp.cast::<Pair>() as usize);
+    print_bool(ptr::eq(
+        dp.cast::<u8>(),
+        NonNull::<Pair>::dangling().as_ptr().cast::<u8>(),
+    ));
+
+    // Cross-width `cast::<u8>()`, offset `wrapping_add` equality & ordering, huge addresses
+    let s1 = black_box(CUSTOM_U8_4096);
+    let s2 = black_box(CUSTOM_U16_4096);
+    print_bool(ptr::eq(s1.cast::<u8>(), s2.cast::<u8>()));
+    print_bool(ptr::addr_eq(s2, s2.cast::<u8>()));
+    print_bool(ptr::eq(
+        c5.cast::<u32>().wrapping_add(2),
+        0x1008 as *const u32,
+    ));
+    print_bool(ptr::eq(
+        c5.cast::<u32>().wrapping_add(2),
+        ptr::slice_from_raw_parts(0x1008 as *const u32, 3).cast::<u32>(),
+    ));
+    print_bool(ptr::eq(
+        c5.cast::<u8>().wrapping_add(8),
+        0x1008 as *const u8,
+    ));
+    print_bool(ptr::addr_eq(
+        c5.cast::<u32>().wrapping_add(2),
+        c5.cast::<u8>().wrapping_add(8),
+    ));
+    print_ordering(
+        c5.cast::<u32>()
+            .wrapping_add(1)
+            .cast::<()>()
+            .cmp(&c5.cast::<u8>().wrapping_add(2).cast::<()>()),
+    );
+    let huge = black_box(HUGE_U8_0);
+    print_usize(huge.cast::<u8>() as usize);
+    print_bool(ptr::eq(
+        huge.cast::<u8>().wrapping_add(8),
+        0xffff_fff8usize as *const u8,
+    ));
 }

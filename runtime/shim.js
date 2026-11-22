@@ -246,6 +246,15 @@ globalThis.__rt.slice_from_parts = (p, len, byte) => {
     if (p > 0 && p < 4096) p = globalThis.__rt._dangling(p);
     else return { buf: p, off: 0, len };
   }
+  if (p !== null && typeof p === "object" && typeof p.buf === "number" && p.pr === undefined) {
+    const step = p.sc !== undefined ? 1 : p.es !== undefined ? p.es : 1;
+    const addr = (p.buf + (typeof p.off === "number" ? p.off * step : 0)) >>> 0;
+    if (addr > 0 && addr < 4096) {
+      p = globalThis.__rt._dangling(addr);
+      return { buf: p.buf, off: p.off, len };
+    }
+    return { buf: addr, off: 0, len };
+  }
   if (p.sc !== undefined) {
     if (len > 0) {
       throw __rt.abort_error(new Error(
@@ -441,7 +450,7 @@ globalThis.__rt.addr = (p, size) => {
   const u = globalThis.__rt._unwrap_view(p);
   const step = u.es !== undefined ? u.es : size;
   if (typeof u.buf === "number") {
-    return u.buf + (u.inBytes ? u.off : u.off * step);
+    return (u.buf + (u.inBytes ? u.off : u.off * step)) >>> 0;
   }
   const key = typeof u.buf === "object" && u.buf !== null ? u.buf : p;
   // A dangling pointer keeps the alignment it was born as, which is the
@@ -620,19 +629,28 @@ globalThis.__rt.offset_from = (a, b) => {
 // the reference form of the source.
 globalThis.__rt.ptr_eq = (a, b) => {
   if (a === b) return true;
-  if (typeof a === "number") {
-    if (b === null || typeof b !== "object") return false;
-    globalThis.__rt._named(b, "ptr_eq");
-    return b.pr === undefined && b.off === 0 && (b.buf === a || globalThis.__rt._dangling_of.get(b.buf) === a);
+  if (a === null || b === null || a === undefined || b === undefined) return false;
+  const aNum = typeof a === "number";
+  const bNum = typeof b === "number";
+  if ((aNum && bNum) || (!aNum && typeof a !== "object") || (!bNum && typeof b !== "object")) {
+    return false;
   }
-  if (typeof b === "number") {
-    if (a === null || typeof a !== "object") return false;
-    globalThis.__rt._named(a, "ptr_eq");
-    return a.pr === undefined && a.off === 0 && (a.buf === b || globalThis.__rt._dangling_of.get(a.buf) === b);
+  if (!aNum) globalThis.__rt._named(a, "ptr_eq");
+  if (!bNum) globalThis.__rt._named(b, "ptr_eq");
+  const bareAddr = (u) => {
+    const base = typeof u.buf === "number" ? u.buf : globalThis.__rt._dangling_of.get(u.buf);
+    if (base === undefined) return undefined;
+    if (u.off === 0) return base >>> 0;
+    if (u.inBytes) return (base + u.off) >>> 0;
+    if (u.es !== undefined) return (base + u.off * u.es) >>> 0;
+    return undefined;
+  };
+  if (aNum || bNum) {
+    const num = (aNum ? a : b) >>> 0;
+    const obj = aNum ? b : a;
+    if (!("buf" in obj)) return false;
+    return bareAddr(globalThis.__rt._unwrap_view(obj)) === num;
   }
-  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
-  globalThis.__rt._named(a, "ptr_eq");
-  globalThis.__rt._named(b, "ptr_eq");
   const aSlot = "buf" in a;
   const bSlot = "buf" in b;
   if (!aSlot && !bSlot) return false;
@@ -651,7 +669,10 @@ globalThis.__rt.ptr_eq = (a, b) => {
   const left = a.pr === undefined ? a : a.pr;
   const right = b.pr === undefined ? b : b.pr;
   if (
-    left.buf === right.buf && left.pr === undefined && right.pr === undefined &&
+    left.buf === right.buf &&
+    left.pr === undefined &&
+    right.pr === undefined &&
+    typeof left.buf !== "number" &&
     !(_has_byte_views && globalThis.__rt._byte_view_of.has(left.buf))
   ) {
     if (left.es === right.es) {
@@ -664,6 +685,9 @@ globalThis.__rt.ptr_eq = (a, b) => {
   }
   const lu = globalThis.__rt._unwrap_view(a);
   const ru = globalThis.__rt._unwrap_view(b);
+  const la = bareAddr(lu);
+  const ra = bareAddr(ru);
+  if (la !== undefined && ra !== undefined) return la === ra;
   if (lu.buf !== ru.buf || lu.key !== ru.key) return false;
   if (lu.inBytes === ru.inBytes) {
     if (!lu.inBytes && lu.es !== ru.es) {
@@ -704,8 +728,11 @@ globalThis.__rt.ptr_cmp = (a, b, size) => {
     bSize = b.ps;
     b = b.pr;
   }
-  if (a !== null && b !== null && typeof a === "object" && typeof b === "object"
-      && a.buf === b.buf && !(_has_byte_views && globalThis.__rt._byte_view_of.has(a.buf))) {
+  if (
+    a !== null && b !== null && typeof a === "object" && typeof b === "object" &&
+    a.buf === b.buf && typeof a.buf !== "number" && a.sc === b.sc && a.es === b.es &&
+    !(_has_byte_views && globalThis.__rt._byte_view_of.has(a.buf))
+  ) {
     globalThis.__rt._named(a, "ptr_cmp");
     return a.off < b.off ? -1 : a.off > b.off ? 1 : 0;
   }
@@ -732,6 +759,10 @@ globalThis.__rt.offset = (p, count, size) => {
   // that address.
   if (p === undefined) {
     return count === 0 || size === 0 ? p : globalThis.__rt._zst_addr + count * size;
+  }
+  if (p !== null && typeof p === "object" && typeof p.buf === "number" && p.pr === undefined) {
+    const base = p.sc !== undefined ? p.buf + p.off : p.buf + p.off * (p.es !== undefined ? p.es : size);
+    return (base + count * (p.sc !== undefined ? 1 : size)) >>> 0;
   }
   if (p.pr !== undefined) {
     if (count === 0) return p;
@@ -1334,6 +1365,7 @@ globalThis.__rt.erase = (p, size, kind) => {
 globalThis.__rt.scale = (p, size, cl) => {
   if (typeof p === "number") return p;
   if (p === null || p === undefined) return 0;
+  if (typeof p.buf === "number") return (p.buf + (p.sc !== undefined ? p.off : p.off * size)) >>> 0;
   if (p.pr !== undefined) {
     if (typeof p.pr.off !== "number") {
       throw __rt.abort_error(new Error(
@@ -1674,7 +1706,7 @@ globalThis.__rt._alloc_byte_proxy = (raw, meta) => {
 globalThis.__rt.scale_scalar = (p, size, kind, signed) => {
   if (typeof p === "number") return p;
   if (p === null || p === undefined) return 0;
-  if (typeof p.buf === "number") return { buf: p.buf, off: p.off * size, sc: size };
+  if (typeof p.buf === "number") return (p.buf + (p.sc !== undefined ? p.off : p.off * size)) >>> 0;
   if (p.pr !== undefined) {
     const view = globalThis.__rt._byte_view(p.buf, size, kind, !!signed, p.off, p.pr, p.ps);
     return { buf: view, off: 0, pv: p, po: 0 };
@@ -1835,6 +1867,10 @@ globalThis.__rt.unscale = (p, size, mk, cl) => {
   if (typeof p === "number") {
     return p > 0 && p < 4096 ? globalThis.__rt._dangling(p) : p;
   }
+  if (p !== null && typeof p === "object" && typeof p.buf === "number" && p.pr === undefined) {
+    const addr = (p.buf + (typeof p.off === "number" ? p.off : 0)) >>> 0;
+    return addr > 0 && addr < 4096 ? globalThis.__rt._dangling(addr) : addr;
+  }
   if (p === null || typeof p !== "object") {
     throw __rt.abort_error(new Error(
       "rustc_codegen_js: this pointer is not a byte view of " + size +
@@ -1883,7 +1919,7 @@ globalThis.__rt.unscale = (p, size, mk, cl) => {
 // minimal shim. Fresh heap blocks retain allocation retyping; initialized byte storage gets
 // an aliasing view, including when its capacity is not a multiple of the word size.
 globalThis.__rt.unscale_scalar = (p, size, mk, kind) => {
-  if (p !== null && typeof p === "object" && p.sc === undefined) {
+  if (p !== null && typeof p === "object" && p.sc === undefined && typeof p.buf !== "number") {
     const bv = _has_byte_views ? globalThis.__rt._byte_view_of.get(p.buf) : undefined;
     if (bv !== undefined && !bv.alloc && !bv.hdr) {
       if (bv.kind === null) {
@@ -1952,6 +1988,10 @@ globalThis.__rt.unscale_scalar = (p, size, mk, kind) => {
 // the same way `unwindow` is.
 globalThis.__rt.thin = (p, size, signed) => {
   if (p === null || typeof p !== "object") return p;
+  if (typeof p.buf === "number" && p.pr === undefined) {
+    const step = p.sc !== undefined ? 1 : p.es !== undefined ? p.es : size;
+    return (p.buf + (typeof p.off === "number" ? p.off * step : 0)) >>> 0;
+  }
   // A byte view: key it back, which throws unless the offset lands on an element.
   // No zero factory: a byte view is never a fresh block, so no retype can happen
   // here and there is nothing to fill.

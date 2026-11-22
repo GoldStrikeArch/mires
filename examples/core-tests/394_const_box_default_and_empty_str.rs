@@ -12,6 +12,7 @@ mod prelude;
 use prelude::*;
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::hint::black_box;
 use core::ptr::{self, NonNull};
@@ -25,9 +26,18 @@ impl Drop for Z {
     }
 }
 
+#[repr(align(4))]
+struct Align4;
+
 #[repr(align(8))]
 #[derive(Clone, Copy)]
 struct Align8;
+
+#[repr(C)]
+struct Pair(u32, u32);
+
+const Z4_SLICE: *const [Align4] =
+    ptr::slice_from_raw_parts(NonNull::<Align4>::dangling().as_ptr(), 0);
 
 struct SyncStrPtr(*const str);
 unsafe impl Sync for SyncStrPtr {}
@@ -71,6 +81,14 @@ pub fn rust_entry() {
     print_usize(bu32.len());
     print_usize(bu32.as_ptr() as usize);
     print_bool(ptr::eq(bu32.as_ptr(), NonNull::<u32>::dangling().as_ptr()));
+    print_bool(ptr::eq(
+        bu32.as_ptr().cast::<u8>(),
+        NonNull::<u32>::dangling().as_ptr().cast::<u8>(),
+    ));
+    print_bool(ptr::eq(
+        black_box(Z4_SLICE).cast::<u8>(),
+        bu32.as_ptr().cast::<u8>(),
+    ));
     print_bool(ptr::eq(bu32.as_ptr(), vu32.as_ptr()));
     let mut sum = 0u32;
     for &x in &*bu32 {
@@ -94,6 +112,21 @@ pub fn rust_entry() {
     print_usize(bchunk.len());
     print_usize(bchunk.as_ptr() as usize);
     drop(bchunk);
+
+    let bpair: Box<[Pair]> = Box::default();
+    print_usize(bpair.len());
+    print_usize(bpair.as_ptr() as usize);
+    drop(bpair);
+
+    let bstrings: Box<[String]> = Box::default();
+    print_usize(bstrings.len());
+    print_bool(bstrings.as_ptr().is_aligned());
+    drop(bstrings);
+
+    let bboxed: Box<[Box<u32>]> = Box::default();
+    print_usize(bboxed.len());
+    print_bool(bboxed.as_ptr().is_aligned());
+    drop(bboxed);
 
     // Safe Box<str>::default() + Option<Box<[u32]>> + Option<Box<str>>
     let bstr: Box<str> = Box::default();
