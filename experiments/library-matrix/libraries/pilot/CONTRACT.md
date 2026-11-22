@@ -15,7 +15,7 @@ unsigned integer arithmetic, and fixed-decimal float formatting.
 | Output form | `string`, synchronous |
 | Normalisation | none |
 | Parity environments | node, chrome, firefox, safari |
-| Corpus | `corpus.json`, 10 cases |
+| Corpus | `corpus.json`, 11 cases |
 | Bench case | `bench` (3,577 UTF-16 units, 782 tokens) |
 | Bench variant | `bench-variant.mjs`: the k-th variant rotates the words by k and replaces a k-chosen word with `v<k in base 36>`, so every prefix and suffix changes with k (779 to 783 tokens, inside the parity domain) |
 | Caching | none: the package keeps no state between calls, so ports may not either |
@@ -72,6 +72,7 @@ reaches ties must put tie cases in its corpus, and its ports must then reproduce
 | `whitespace` | ASCII whitespace separates; U+00A0 and U+3000 join a token |
 | `top-zero` | header lines only |
 | `top-large` | `top` above the number of distinct tokens |
+| `wide-top` | `top` past 32-bit range (`4294967296`), valid non-negative integer |
 | `bench` | 160 phrases drawn from the others by a seeded LCG; also the timing input |
 
 ## Ports
