@@ -695,7 +695,7 @@ fn analyze_func(
         }
     }
 
-    let scalar_origins = propagate_scalar_origins(ty_table, &uses, &cell_reads, &scalar_scales);
+    let scalar_origins = propagate_scalar_origins(func, &reached, ty_table, &scalar_scales);
 
     for val in non_scalar_scales {
         if let Some(why) = scale_value_escapes(
@@ -1413,88 +1413,245 @@ fn collect_value_uses<'a>(
     (map, cell_reads)
 }
 
-/// Propagates `ScalarOrigin` across simple value copies, block-param edges, cell stores/loads,
-/// and same-sign byte pointer casts. Conflicting origins collapse to `None` (Top / unknown).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OriginLattice {
+    Bottom,
+    Exact(ScalarOrigin),
+    Top,
+}
+
+impl OriginLattice {
+    fn meet(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Bottom, x) | (x, Self::Bottom) => x,
+            (Self::Top, _) | (_, Self::Top) => Self::Top,
+            (Self::Exact(a), Self::Exact(b)) if a == b => Self::Exact(a),
+            (Self::Exact(_), Self::Exact(_)) => Self::Top,
+        }
+    }
+}
+
+/// Must-dataflow propagation of `ScalarOrigin` across simple value copies, block-param phis,
+/// private cell stores/loads, and same-sign byte pointer casts.
+///
+/// Every non-derived value (function params, calls, ordinary `&[u8]` pointers, etc.) starts at
+/// `Top`, and every block-param phi or cell takes the must-intersection (`meet`) over ALL
+/// reachable incoming edges or stores. Any unknown or conflicting incoming path collapses the
+/// target to `Top` (`None`).
 fn propagate_scalar_origins(
+    func: &Func,
+    reached: &BTreeSet<RBlockId>,
     table: &TypeTable,
-    uses: &BTreeMap<ValueId, Vec<UseSite<'_>>>,
-    cell_reads: &BTreeMap<CellId, Vec<ValueId>>,
     scalar_scales: &[(ValueId, Option<ScalarOrigin>)],
 ) -> BTreeMap<ValueId, Option<ScalarOrigin>> {
-    let mut origins: BTreeMap<ValueId, Option<ScalarOrigin>> = BTreeMap::new();
-    let mut cell_origins: BTreeMap<CellId, Option<ScalarOrigin>> = BTreeMap::new();
-    let mut queue = VecDeque::new();
+    if func.blocks.is_empty() {
+        return BTreeMap::new();
+    }
 
-    let merge = |map: &mut BTreeMap<ValueId, Option<ScalarOrigin>>,
-                 queue: &mut VecDeque<ValueId>,
-                 dst: ValueId,
-                 val: Option<ScalarOrigin>| {
-        match map.get(&dst) {
-            None => {
-                map.insert(dst, val);
-                queue.push_back(dst);
-            }
-            Some(existing) if *existing == val => {}
-            Some(None) => {}
-            Some(Some(_)) => {
-                map.insert(dst, None);
-                queue.push_back(dst);
-            }
-        }
-    };
+    let entry_id = func.blocks[0].id;
+    let block_params: BTreeMap<RBlockId, &[ValueId]> = func
+        .blocks
+        .iter()
+        .map(|b| (b.id, b.params.as_slice()))
+        .collect();
 
+    let mut scale_map: BTreeMap<ValueId, OriginLattice> = BTreeMap::new();
     for &(val, origin) in scalar_scales {
-        merge(&mut origins, &mut queue, val, origin);
+        let lat = origin.map_or(OriginLattice::Top, OriginLattice::Exact);
+        scale_map
+            .entry(val)
+            .and_modify(|cur| *cur = cur.meet(lat))
+            .or_insert(lat);
     }
 
-    while let Some(v) = queue.pop_front() {
-        let cur = origins.get(&v).copied().flatten();
-        let Some(sites) = uses.get(&v) else {
+    // Collect all reachable incoming edges per block parameter, reachable cell allocations/stores,
+    // and cells whose address is taken mutably or raw (which may be written indirectly).
+    let mut incoming: BTreeMap<ValueId, Vec<ValueId>> = BTreeMap::new();
+    let mut alloc_cells: BTreeSet<CellId> = BTreeSet::new();
+    let mut escaped_cells: BTreeSet<CellId> = BTreeSet::new();
+    let mut cell_stores: BTreeMap<CellId, Vec<ValueId>> = BTreeMap::new();
+
+    #[derive(Clone, Copy)]
+    enum DerivedOp {
+        CopyOf(ValueId),
+        CellLoad(CellId),
+    }
+    let mut derived_ops: Vec<(ValueId, DerivedOp)> = Vec::new();
+
+    for block in &func.blocks {
+        if !reached.contains(&block.id) {
             continue;
-        };
-        for site in sites {
-            match site {
-                UseSite::EdgeArg(param) => merge(&mut origins, &mut queue, *param, cur),
-                UseSite::Op(op) => match &op.kind {
-                    OpKind::Copy(_) | OpKind::Move(_) => {
-                        if let Some(res) = op.result {
-                            merge(&mut origins, &mut queue, res, cur);
+        }
+        for op in &block.ops {
+            match &op.kind {
+                OpKind::CellAlloc(cell) => {
+                    alloc_cells.insert(*cell);
+                }
+                OpKind::CellStore { cell, v } => {
+                    cell_stores.entry(*cell).or_default().push(*v);
+                }
+                OpKind::BorrowView {
+                    root: Root::Cell(cell),
+                    mutable: true,
+                    ..
+                }
+                | OpKind::RawView {
+                    root: Root::Cell(cell),
+                    ..
+                } => {
+                    escaped_cells.insert(*cell);
+                }
+                OpKind::Copy(src) | OpKind::Move(src) => {
+                    if let Some(res) = op.result {
+                        if !scale_map.contains_key(&res) {
+                            derived_ops.push((res, DerivedOp::CopyOf(*src)));
                         }
                     }
-                    OpKind::Cast { from, to, .. } if same_byte_ptr_sign(table, *from, *to) => {
-                        if let Some(res) = op.result {
-                            merge(&mut origins, &mut queue, res, cur);
+                }
+                OpKind::Cast { v, from, to, .. } if same_byte_ptr_sign(table, *from, *to) => {
+                    if let Some(res) = op.result {
+                        if !scale_map.contains_key(&res) {
+                            derived_ops.push((res, DerivedOp::CopyOf(*v)));
                         }
                     }
-                    OpKind::CellStore { cell, .. } => {
-                        let changed = match cell_origins.get(cell) {
-                            None => {
-                                cell_origins.insert(*cell, cur);
-                                true
-                            }
-                            Some(existing) if *existing == cur => false,
-                            Some(None) => false,
-                            Some(Some(_)) => {
-                                cell_origins.insert(*cell, None);
-                                true
-                            }
-                        };
-                        if changed {
-                            let cell_val = cell_origins.get(cell).copied().flatten();
-                            if let Some(reads) = cell_reads.get(cell) {
-                                for &r in reads {
-                                    merge(&mut origins, &mut queue, r, cell_val);
-                                }
-                            }
+                }
+                OpKind::CellLoad(cell) => {
+                    if let Some(res) = op.result {
+                        if !scale_map.contains_key(&res) {
+                            derived_ops.push((res, DerivedOp::CellLoad(*cell)));
                         }
                     }
-                    _ => {}
-                },
-                UseSite::Return | UseSite::OtherTerm => {}
+                }
+                _ => {}
+            }
+        }
+        for (target, args) in block.term.edges() {
+            if !reached.contains(&target) {
+                continue;
+            }
+            let params = block_params.get(&target).copied().unwrap_or(&[]);
+            for (idx, &param) in params.iter().enumerate() {
+                if let Some(&arg) = args.get(idx) {
+                    incoming.entry(param).or_default().push(arg);
+                }
             }
         }
     }
 
+    let mut val_state = vec![OriginLattice::Top; func.values.len()];
+    for (&v, &lat) in &scale_map {
+        if let Some(slot) = val_state.get_mut(v.0 as usize) {
+            *slot = lat;
+        }
+    }
+    for &(res, _) in &derived_ops {
+        if let Some(slot) = val_state.get_mut(res.0 as usize) {
+            *slot = OriginLattice::Bottom;
+        }
+    }
+    let mut phi_params: Vec<ValueId> = Vec::new();
+    for block in &func.blocks {
+        if !reached.contains(&block.id) || block.id == entry_id {
+            continue;
+        }
+        for &param in &block.params {
+            if !scale_map.contains_key(&param)
+                && incoming.get(&param).is_some_and(|edges| !edges.is_empty())
+            {
+                if let Some(slot) = val_state.get_mut(param.0 as usize) {
+                    *slot = OriginLattice::Bottom;
+                    phi_params.push(param);
+                }
+            }
+        }
+    }
+
+    let mut cell_state = vec![OriginLattice::Top; func.cells.len()];
+    let mut tracked_cells: Vec<CellId> = Vec::new();
+    for &cell in &alloc_cells {
+        if !escaped_cells.contains(&cell) && cell_stores.get(&cell).is_some_and(|s| !s.is_empty()) {
+            if let Some(slot) = cell_state.get_mut(cell.0 as usize) {
+                *slot = OriginLattice::Bottom;
+                tracked_cells.push(cell);
+            }
+        }
+    }
+
+    loop {
+        let mut changed = false;
+
+        for &param in &phi_params {
+            let mut joined = OriginLattice::Bottom;
+            if let Some(edges) = incoming.get(&param) {
+                for &arg in edges {
+                    let arg_lat = val_state
+                        .get(arg.0 as usize)
+                        .copied()
+                        .unwrap_or(OriginLattice::Top);
+                    joined = joined.meet(arg_lat);
+                }
+            } else {
+                joined = OriginLattice::Top;
+            }
+            let slot = &mut val_state[param.0 as usize];
+            let next = slot.meet(joined);
+            if next != *slot {
+                *slot = next;
+                changed = true;
+            }
+        }
+
+        for &cell in &tracked_cells {
+            let mut joined = OriginLattice::Bottom;
+            if let Some(stores) = cell_stores.get(&cell) {
+                for &src in stores {
+                    let src_lat = val_state
+                        .get(src.0 as usize)
+                        .copied()
+                        .unwrap_or(OriginLattice::Top);
+                    joined = joined.meet(src_lat);
+                }
+            } else {
+                joined = OriginLattice::Top;
+            }
+            let slot = &mut cell_state[cell.0 as usize];
+            let next = slot.meet(joined);
+            if next != *slot {
+                *slot = next;
+                changed = true;
+            }
+        }
+
+        for &(res, dop) in &derived_ops {
+            let src_lat = match dop {
+                DerivedOp::CopyOf(src) => val_state
+                    .get(src.0 as usize)
+                    .copied()
+                    .unwrap_or(OriginLattice::Top),
+                DerivedOp::CellLoad(cell) => cell_state
+                    .get(cell.0 as usize)
+                    .copied()
+                    .unwrap_or(OriginLattice::Top),
+            };
+            let slot = &mut val_state[res.0 as usize];
+            let next = slot.meet(src_lat);
+            if next != *slot {
+                *slot = next;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    let mut origins = BTreeMap::new();
+    for (idx, &lat) in val_state.iter().enumerate() {
+        if let OriginLattice::Exact(o) = lat {
+            origins.insert(ValueId(idx as u32), Some(o));
+        }
+    }
     origins
 }
 
@@ -1696,6 +1853,7 @@ fn classify_stdlib_ptr_call(
     std_crate_ids: &BTreeSet<u64>,
     result: Option<ValueId>,
     elem_size: Option<u64>,
+    expected_origin: Option<ScalarOrigin>,
     debug: bool,
 ) -> CallEffect {
     match callee {
@@ -1774,7 +1932,13 @@ fn classify_stdlib_ptr_call(
                     return CallEffect::PropagateToResult;
                 }
                 if dp.ends_with("::cast") || dp.contains("::cast::<") {
-                    return classify_wrapper_cast_result(func, table, result, elem_size);
+                    return classify_wrapper_cast_result(
+                        func,
+                        table,
+                        result,
+                        elem_size,
+                        expected_origin,
+                    );
                 }
                 if debug {
                     eprintln!("[bv]   escape NonNull callee: {dp}");
@@ -1793,7 +1957,13 @@ fn classify_stdlib_ptr_call(
                     return CallEffect::PropagateToResult;
                 }
                 if dp.ends_with("::cast") || dp.contains("::cast::<") {
-                    return classify_wrapper_cast_result(func, table, result, elem_size);
+                    return classify_wrapper_cast_result(
+                        func,
+                        table,
+                        result,
+                        elem_size,
+                        expected_origin,
+                    );
                 }
                 if debug {
                     eprintln!("[bv]   escape Unique callee: {dp}");
@@ -1809,14 +1979,15 @@ fn classify_stdlib_ptr_call(
                     if is_pure_metadata_ret(table, res_ty) {
                         return CallEffect::Sink;
                     }
-                    // If `RawVec::ptr` / `non_null` casts back to the exact `T` element size,
+                    // If `RawVec::ptr` / `non_null` casts back to the exact `T` element type/size,
                     // it is equivalent to `unscale` back to `*mut T`.
-                    if let Some(sz) = elem_size {
-                        if let Some(p) = value::pointee_of(table, table.peeled(res_ty)) {
-                            if value::size_of(table, p) == Some(sz) {
-                                return CallEffect::Sink;
-                            }
-                        }
+                    if matches_unscale_target(
+                        table,
+                        table.peeled(res_ty),
+                        elem_size,
+                        expected_origin,
+                    ) {
+                        return CallEffect::Sink;
                     }
                     return CallEffect::PropagateToResult;
                 }
@@ -1831,11 +2002,27 @@ fn classify_stdlib_ptr_call(
     }
 }
 
+fn matches_unscale_target(
+    table: &TypeTable,
+    res_ty: TypeId,
+    elem_size: Option<u64>,
+    expected_origin: Option<ScalarOrigin>,
+) -> bool {
+    let Some(p) = value::pointee_of(table, res_ty) else {
+        return false;
+    };
+    if let Some(orig) = expected_origin {
+        return scalar_view_origin(table, p) == Some(Some(orig));
+    }
+    elem_size.is_some_and(|sz| value::size_of(table, p) == Some(sz))
+}
+
 fn classify_wrapper_cast_result(
     func: &Func,
     table: &TypeTable,
     result: Option<ValueId>,
     elem_size: Option<u64>,
+    expected_origin: Option<ScalarOrigin>,
 ) -> CallEffect {
     let Some(res) = result else {
         return CallEffect::Sink;
@@ -1844,12 +2031,8 @@ fn classify_wrapper_cast_result(
     if is_byte_ptr(table, res_ty) {
         return CallEffect::PropagateToResult;
     }
-    if let Some(sz) = elem_size {
-        if let Some(p) = value::pointee_of(table, res_ty) {
-            if value::size_of(table, p) == Some(sz) {
-                return CallEffect::Sink;
-            }
-        }
+    if matches_unscale_target(table, res_ty, elem_size, expected_origin) {
+        return CallEffect::Sink;
     }
     CallEffect::Escape
 }
@@ -2060,6 +2243,7 @@ fn scale_value_escapes(
                             std_crate_ids,
                             op.result,
                             origin.map(|o| o.size),
+                            origin,
                             debug,
                         ) {
                             CallEffect::Sink => {}
@@ -2263,6 +2447,7 @@ fn rawvec_byte_ptr_escapes(
                             std_crate_ids,
                             op.result,
                             Some(elem_size),
+                            None,
                             debug,
                         ) {
                             CallEffect::Sink => {}
@@ -2642,6 +2827,132 @@ mod tests {
             &interns,
             TypeId(1),
             &std_crates
+        ));
+    }
+
+    #[test]
+    fn propagate_scalar_origins_intersects_phi_and_cell_paths() {
+        let mut table = TypeTable::new();
+        let t_u8 = TypeId(0);
+        let t_u8_ptr = TypeId(1);
+        let t_bool = TypeId(2);
+        let t_u32 = TypeId(3);
+        let t_f32 = TypeId(4);
+        let t_f32_ptr = TypeId(5);
+        table.insert(make_desc(
+            0,
+            TypeKind::Integer {
+                signed: false,
+                bits: 8,
+            },
+            1,
+            None,
+        ));
+        table.insert(make_desc(
+            1,
+            TypeKind::RawPointer {
+                pointee: t_u8,
+                mutable: false,
+            },
+            8,
+            None,
+        ));
+        table.insert(make_desc(2, TypeKind::Bool, 1, None));
+        table.insert(make_desc(
+            3,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            4,
+            None,
+        ));
+        table.insert(make_desc(4, TypeKind::Float { bits: 32 }, 4, None));
+        table.insert(make_desc(
+            5,
+            TypeKind::RawPointer {
+                pointee: t_f32,
+                mutable: false,
+            },
+            8,
+            None,
+        ));
+
+        let u32_origin = ScalarOrigin {
+            bits: 32,
+            signed: false,
+            is_char: false,
+            size: 4,
+        };
+
+        // bb0 switches to bb1 (passing v1 = scalar_scale(u32)) or bb2 (passing v2 = non-scale ptr)
+        // both jumping to bb3(v3: *const u8). Must-intersection collapses v3 to unknown (absent).
+        let f_phi = make_func(
+            vec![t_bool, t_u8_ptr, t_u8_ptr, t_u8_ptr],
+            vec![
+                RBlock {
+                    id: RBlockId(0),
+                    params: vec![ValueId(0), ValueId(1), ValueId(2)],
+                    ops: vec![],
+                    term: RTerm::Switch {
+                        scrut: ValueId(0),
+                        scrut_ty: t_bool,
+                        cases: vec![(0, RBlockId(2), vec![])],
+                        default: (RBlockId(1), vec![]),
+                    },
+                },
+                RBlock {
+                    id: RBlockId(1),
+                    params: vec![],
+                    ops: vec![],
+                    term: RTerm::Goto(RBlockId(3), vec![ValueId(1)]),
+                },
+                RBlock {
+                    id: RBlockId(2),
+                    params: vec![],
+                    ops: vec![],
+                    term: RTerm::Goto(RBlockId(3), vec![ValueId(2)]),
+                },
+                RBlock {
+                    id: RBlockId(3),
+                    params: vec![ValueId(3)],
+                    ops: vec![],
+                    term: RTerm::Return(None),
+                },
+            ],
+        );
+        let reached = reachable_blocks(&f_phi, &table);
+        let origins =
+            propagate_scalar_origins(&f_phi, &reached, &table, &[(ValueId(1), Some(u32_origin))]);
+        assert_eq!(origins.get(&ValueId(1)), Some(&Some(u32_origin)));
+        assert_eq!(
+            origins.get(&ValueId(3)),
+            None,
+            "phi joining u32-scaled ptr with unknown ptr must collapse to Top"
+        );
+
+        // Hardening check: casting a u32-scaled pointer to *const f32 must NOT match u32 origin.
+        assert!(!matches_unscale_target(
+            &table,
+            t_f32_ptr,
+            Some(4),
+            Some(u32_origin)
+        ));
+        let t_u32_ptr = TypeId(6);
+        table.insert(make_desc(
+            6,
+            TypeKind::RawPointer {
+                pointee: t_u32,
+                mutable: false,
+            },
+            8,
+            None,
+        ));
+        assert!(matches_unscale_target(
+            &table,
+            t_u32_ptr,
+            Some(4),
+            Some(u32_origin)
         ));
     }
 }
