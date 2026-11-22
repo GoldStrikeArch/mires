@@ -153,10 +153,7 @@ impl<'a> JsCx<'a> {
         if size_of(self.table, pointee) == Some(0) {
             return jsast::binary(BinOp::Sub, lhs, rhs);
         }
-        if self.table.is_indirect(pointee) {
-            return jsast::rt_call("offset_from", vec![lhs, rhs]);
-        }
-        jsast::binary(BinOp::Sub, ptr::slot_off(lhs), ptr::slot_off(rhs))
+        jsast::rt_call("offset_from", vec![lhs, rhs])
     }
 
     /// `lhs == rhs` on two pointers (`ptr.rs::eq`).
@@ -280,8 +277,12 @@ impl<'a> JsCx<'a> {
         if !is_slot_pointee(self.table, pointee) || !self.table.is_indirect(pointee) {
             return raw;
         }
-        if let Some(TypeKind::Array { length, .. }) = value::kind(self.table, pointee) {
-            return jsast::rt_call("array_ref", vec![raw, jsast::num(*length as f64)]);
+        if let Some(TypeKind::Array { element, length }) = value::kind(self.table, pointee) {
+            let mut args = vec![raw, jsast::num(*length as f64)];
+            if let Some(elem_size) = size_of(self.table, *element).filter(|&s| s > 0) {
+                args.push(jsast::num(elem_size as f64));
+            }
+            return jsast::rt_call("array_ref", args);
         }
         let (setup, raw) = self.reread(raw, &[BUF, OFF]);
         sequenced(setup, ptr::slot_element(raw))

@@ -664,10 +664,18 @@ impl<'a> JsCx<'a> {
         }
         if let JsPlace::Array(pointer, width) = &walk.place {
             if self.table.is_indirect(walk.ty) {
-                return Ok(jsast::rt_call(
-                    "array_ref",
-                    vec![pointer.clone(), jsast::num(*width as f64)],
-                ));
+                let mut args = vec![pointer.clone(), jsast::num(*width as f64)];
+                if let Some(TypeKind::Array { element, .. }) = value::kind(self.table, walk.ty) {
+                    if let Some(elem_size) = self
+                        .table
+                        .get(*element)
+                        .and_then(|d| d.layout.size)
+                        .filter(|&s| s > 0)
+                    {
+                        args.push(jsast::num(elem_size as f64));
+                    }
+                }
+                return Ok(jsast::rt_call("array_ref", args));
             }
             return Ok(pointer.clone());
         }
@@ -717,7 +725,18 @@ impl<'a> JsCx<'a> {
             return Ok(address);
         }
         if let JsPlace::Array(pointer, 0) = walk.place {
-            return Ok(jsast::rt_call("array_ref", vec![pointer, jsast::num(0)]));
+            let mut args = vec![pointer, jsast::num(0)];
+            if let Some(TypeKind::Array { element, .. }) = value::kind(self.table, walk.ty) {
+                if let Some(elem_size) = self
+                    .table
+                    .get(*element)
+                    .and_then(|d| d.layout.size)
+                    .filter(|&s| s > 0)
+                {
+                    args.push(jsast::num(elem_size as f64));
+                }
+            }
+            return Ok(jsast::rt_call("array_ref", args));
         }
         if !is_slot_pointee(self.table, walk.ty) {
             return Ok(self.read_place(&walk.place));

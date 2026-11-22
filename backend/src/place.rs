@@ -743,10 +743,13 @@ impl<'tcx> FnCx<'_, 'tcx> {
         // offset need and what silently read one element instead.
         if let JsPlace::Array(pointer, width) = &walk.place {
             if is_indirect(self.tcx, walk.ty) {
-                return jsast::rt_call(
-                    "array_ref",
-                    vec![pointer.clone(), jsast::num(*width as f64)],
-                );
+                let mut args = vec![pointer.clone(), jsast::num(*width as f64)];
+                if let ty::Array(element, _) = walk_shape.kind() {
+                    if let Some(elem_size) = ptr::size_of(self.tcx, *element).filter(|&s| s > 0) {
+                        args.push(jsast::num(elem_size as f64));
+                    }
+                }
+                return jsast::rt_call("array_ref", args);
             }
             return pointer.clone();
         }
@@ -804,7 +807,13 @@ impl<'tcx> FnCx<'_, 'tcx> {
         // offset as a zero-width element view so `as_ptr` / `ptr::eq` / `*const T` casts keep the
         // element's identity.
         if let JsPlace::Array(pointer, 0) = walk.place {
-            return jsast::rt_call("array_ref", vec![pointer, jsast::num(0)]);
+            let mut args = vec![pointer, jsast::num(0)];
+            if let ty::Array(element, _) = walk_shape.kind() {
+                if let Some(elem_size) = ptr::size_of(self.tcx, *element).filter(|&s| s > 0) {
+                    args.push(jsast::num(elem_size as f64));
+                }
+            }
+            return jsast::rt_call("array_ref", args);
         }
         // `str`, a zero sized pointee: no slot form to build.
         if !ptr::is_slot_pointee(self.tcx, walk.ty) {

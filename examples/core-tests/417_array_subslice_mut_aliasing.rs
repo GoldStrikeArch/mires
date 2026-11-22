@@ -241,9 +241,62 @@ fn test_shared_identity_empty_and_zst() {
     print_bool(mid.as_ptr() < (&arr[2] as *const u32));
     print_bool((&arr[0] as *const u32) < mid.as_ptr());
 
-    // 13. Empty array subslice `[u32; 0]`
+    // AS-VERIFY-1: scalar offset_from / byte_offset_from on non-empty subslice
+    unsafe {
+        print_i32(mid.as_ptr().offset_from(arr.as_ptr()) as i32);
+        print_i32((&mid[1] as *const u32).offset_from(&arr[0] as *const u32) as i32);
+        print_i32(
+            mid.as_ptr()
+                .cast::<u8>()
+                .byte_offset_from(arr.as_ptr().cast::<u8>()) as i32,
+        );
+    }
+
+    // AS-VERIFY-2: offset_from on *const [u32; 2] subslice pointers (boxed _element_view)
+    {
+        let [left @ .., _, _, _, _] = &arr;
+        let [_, _, right @ .., _, _] = &arr;
+        unsafe {
+            print_i32((right as *const [u32; 2]).offset_from(left as *const [u32; 2]) as i32);
+            print_i32((left as *const [u32; 2]).offset_from(right as *const [u32; 2]) as i32);
+        }
+    }
+
+    // AS-VERIFY-3: .addr() and ptr_cmp on *const [T; N], *const [T; 0], *const () (stack & Box & u8)
+    let base_addr = arr.as_ptr().addr();
+    print_usize((mid as *const [u32; 4]).addr() - base_addr);
+    print_usize((mid as *const [u32; 4] as *const ()).addr() - base_addr);
+    print_usize((mid as *const [u32; 4] as usize) - base_addr);
+    print_usize((inner as *const [u32; 2]).addr() - base_addr);
+    print_bool((mid as *const [u32; 4] as *const ()) < (inner as *const [u32; 2] as *const ()));
+    print_bool((mid as *const [u32; 4] as *const ()) == (&arr[1] as *const u32 as *const ()));
+
+    let boxed6 = Box::new(black_box([10u32, 20, 30, 40, 50, 60]));
+    {
+        let [_, bmid @ .., _] = &*boxed6;
+        let bbase = boxed6.as_ptr().addr();
+        print_usize((bmid as *const [u32; 4]).addr() - bbase);
+        print_usize((bmid as *const [u32; 4] as *const ()).addr() - bbase);
+        print_bool(ptr::eq(
+            bmid as *const [u32; 4] as *const (),
+            &boxed6[1] as *const u32 as *const (),
+        ));
+    }
+
+    let bytes6 = black_box([1u8, 2, 3, 4, 5, 6]);
+    {
+        let [_, bm @ .., _] = &bytes6;
+        let bb = bytes6.as_ptr().addr();
+        print_usize((bm as *const [u8; 4]).addr() - bb);
+        print_usize((bm as *const [u8; 4] as *const ()).addr() - bb);
+    }
+
+    // 13. Empty array subslice `[u32; 0]` (incl. offset_from & .addr())
     let mut arr3 = black_box([7u32, 8, 9]);
     {
+        let base3 = arr3.as_ptr().addr();
+        let arr3_p0 = &raw const arr3[0];
+        let arr3_p2 = &raw const arr3[2];
         let [a, b, mid0 @ .., c] = &mut arr3;
         print_u32(*a);
         print_u32(*b);
@@ -251,7 +304,14 @@ fn test_shared_identity_empty_and_zst() {
         print_usize(mid0.len());
         print_usize(mid0.as_slice().len());
         *mid0 = [];
-        print_bool(ptr::eq(mid0.as_ptr(), &arr3[2]));
+        print_bool(ptr::eq(mid0.as_ptr(), arr3_p2));
+        unsafe {
+            print_i32(mid0.as_ptr().offset_from(arr3_p0) as i32);
+            print_i32(arr3_p2.offset_from(mid0.as_ptr()) as i32);
+        }
+        print_usize((mid0 as *const [u32; 0]).addr() - base3);
+        print_usize((mid0 as *const [u32; 0] as *const ()).addr() - base3);
+        print_usize(mid0.as_ptr().addr() - base3);
     }
     {
         let [head0 @ .., _, _, _] = &arr3;

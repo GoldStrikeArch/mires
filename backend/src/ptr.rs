@@ -298,17 +298,7 @@ pub(crate) fn offset_from<'tcx>(
     if size_of(fx.tcx, pointee) == Some(0) {
         return jsast::binary(JsBinOp::Sub, lhs, rhs);
     }
-    // An **aggregate** pointee goes through the helper, because one of the two records may not
-    // know where it is. A reference to an aggregate is the object itself, so a raw pointer taken
-    // from one that arrived as a value — a function parameter, the result of a call — is
-    // `__rt.box`, a buffer of one, and subtracting its offset from a buffer offset answers
-    // nonsense. `core`'s `choose_pivot` is written exactly that way: `median3` *returns* one of
-    // three `&T`s and the caller asks which index it was, so every sort of a struct depends on it.
-    // The helper finds the object in the buffer the other pointer names.
-    if is_indirect(fx.tcx, pointee) {
-        return jsast::rt_call("offset_from", vec![lhs, rhs]);
-    }
-    jsast::binary(JsBinOp::Sub, slot_off(lhs), slot_off(rhs))
+    jsast::rt_call("offset_from", vec![lhs, rhs])
 }
 
 /// `lhs == rhs` on two pointers of type `pointer_ty`.
@@ -1164,9 +1154,13 @@ pub(crate) fn raw_to_ref<'tcx>(fx: &FnCx<'_, 'tcx>, pointee: Ty<'tcx>, raw: Expr
     if !is_slot_pointee(fx.tcx, pointee) || !is_indirect(fx.tcx, pointee) {
         return raw;
     }
-    if let ty::Array(_, count) = peel_pattern(peel_transparent(fx.tcx, pointee)).kind() {
+    if let ty::Array(element, count) = peel_pattern(peel_transparent(fx.tcx, pointee)).kind() {
         if let Some(len) = count.try_to_target_usize(fx.tcx) {
-            return jsast::rt_call("array_ref", vec![raw, jsast::num(len as f64)]);
+            let mut args = vec![raw, jsast::num(len as f64)];
+            if let Some(elem_size) = size_of(fx.tcx, *element).filter(|&s| s > 0) {
+                args.push(jsast::num(elem_size as f64));
+            }
+            return jsast::rt_call("array_ref", args);
         }
     }
     let (setup, raw) = reread(fx, raw, &[BUF, OFF]);

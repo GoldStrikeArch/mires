@@ -7840,7 +7840,7 @@ fn transmute_to_array_ref_uses_array_ref_and_hoists_non_duplicable_raw_to_ref() 
     let js1 = lower(&interns, "arr_ref", &[], &body1, &f1, &p1, straight(&f1));
     assert_eq!(
         js1,
-        "function arr_ref(p) {\n  return __rt.array_ref(p, 4);\n}\n"
+        "function arr_ref(p) {\n  return __rt.array_ref(p, 4, 4);\n}\n"
     );
 
     // BUG-2: `raw_to_ref` over a non-duplicable `cast_pointer` call (`__rt.thin`) must hoist
@@ -8709,7 +8709,7 @@ fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
         assert_eq!(js4.matches("__rt.unwindow(").count(), 1, "{js4}");
         assert!(
             js4.contains(
-                "__rt.array_ref(($t0 = __rt.unwindow(p), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2)"
+                "__rt.array_ref(($t0 = __rt.unwindow(p), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2, 4)"
             ),
             "{js4}"
         );
@@ -8834,7 +8834,7 @@ fn slot_array_deref_projections_unwindow_once_and_keep_array_ref_direct() {
     );
     assert_eq!(
         js7,
-        "function borrow_mu_inner(p) {\n  return __rt.array_ref(p, 4);\n}\n"
+        "function borrow_mu_inner(p) {\n  return __rt.array_ref(p, 4, 4);\n}\n"
     );
 
     // 7. Reborrowing a non-duplicable slot (`&mut *(*win)[i]` or `addr_of!((*(*win)[i]).0)` on
@@ -10063,7 +10063,7 @@ fn array_ref_and_local_subslice_build_aliasing_window_slots() {
         );
         assert!(
             js.contains(
-                "__rt.array_ref(($t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2)"
+                "__rt.array_ref(($t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2, 4)"
             ),
             "{js}"
         );
@@ -10101,7 +10101,7 @@ fn array_ref_and_local_subslice_build_aliasing_window_slots() {
     );
     assert!(
         js2.contains(
-            "__rt.array_ref(($t0 = __rt.unwindow(arr), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2)"
+            "__rt.array_ref(($t0 = __rt.unwindow(arr), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2, 4)"
         ),
         "{js2}"
     );
@@ -10192,7 +10192,7 @@ fn array_ref_and_local_subslice_build_aliasing_window_slots() {
         );
         assert!(
             js4.contains(
-                "__rt.array_ref(($t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 2, w: 0 }), 0)"
+                "__rt.array_ref(($t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 2, w: 0 }), 0, 4)"
             ),
             "{js4}"
         );
