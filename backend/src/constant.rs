@@ -502,13 +502,13 @@ fn read_dyn_pointer<'tcx>(
                 }
             }
             GlobalAlloc::Static(def_id) => {
-                if pointer.offset != Size::ZERO {
+                if !raw::static_matches_pointee(tcx, def_id, pointer.offset, concrete_ty) {
                     return zombie(
                         cgu,
                         log,
                         span,
                         format!(
-                            "a pointer into the middle of a `static` is not supported by \
+                            "a pointer into part of a `static` is not supported by \
                              rustc_codegen_js (type `{ty}`)"
                         ),
                     );

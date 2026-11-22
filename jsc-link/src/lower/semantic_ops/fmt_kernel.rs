@@ -533,7 +533,9 @@ fn named_outside_calls(func: &Func, machinery: &BTreeSet<ItemId>) -> BTreeSet<It
             } if machinery.contains(item) => {
                 out.insert(*item);
             }
-            ConstTree::Reference(inner) => tree(out, machinery, inner),
+            ConstTree::Reference(inner) | ConstTree::Dyn { data: inner, .. } => {
+                tree(out, machinery, inner)
+            }
             ConstTree::Aggregate(elements) | ConstTree::Slice(elements) => {
                 for element in elements {
                     tree(out, machinery, element);

@@ -1860,10 +1860,20 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                         depth,
                     )?))
                 }
-                GlobalAlloc::Static(_) => ConstTree::Global {
-                    target: self.global_reference(alloc_id)?,
-                    offset: pointer.offset.bytes(),
-                },
+                GlobalAlloc::Static(def_id) => {
+                    if !crate::constant::raw::static_matches_pointee(
+                        tcx,
+                        def_id,
+                        pointer.offset,
+                        concrete_ty,
+                    ) {
+                        return Err(EncodeDecline::WideGlobalPointerConstant { ty: type_name(ty) });
+                    }
+                    ConstTree::Global {
+                        target: self.global_reference(alloc_id)?,
+                        offset: pointer.offset.bytes(),
+                    }
+                }
                 _ => {
                     return Err(EncodeDecline::WideGlobalPointerConstant { ty: type_name(ty) });
                 }

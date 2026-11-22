@@ -319,6 +319,33 @@ pub(crate) fn read_vtable<'tcx>(
     Some((concrete_ty, principal))
 }
 
+/// Whether a pointer at `offset` into `static` `def_id` names the whole static binding with the
+/// same JS value shape and boxing as `pointee`.
+///
+/// Struct field 0, array element 0, tuple field 0, niche enum payloads, and `MaybeUninit<T>` inner
+/// values all sit at byte offset zero while having a different JS shape or boxing than the
+/// enclosing `static` binding (`peel_transparent` / `is_indirect`).
+pub(crate) fn static_matches_pointee<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    def_id: rustc_hir::def_id::DefId,
+    offset: Size,
+    pointee: Ty<'tcx>,
+) -> bool {
+    if offset != Size::ZERO {
+        return false;
+    }
+    let static_ty =
+        tcx.normalize_erasing_regions(typing_env(), tcx.type_of(def_id).instantiate_identity());
+    let static_peeled = tcx.erase_and_anonymize_regions(crate::value::peel_pattern(
+        crate::value::peel_transparent(tcx, static_ty),
+    ));
+    let pointee_peeled = tcx.erase_and_anonymize_regions(crate::value::peel_pattern(
+        crate::value::peel_transparent(tcx, pointee),
+    ));
+    static_peeled == pointee_peeled
+        && crate::value::is_indirect(tcx, static_ty) == crate::value::is_indirect(tcx, pointee)
+}
+
 /// Why the bytes of a `&str` could not be turned into one.
 pub(crate) enum StrError {
     /// The text runs past the end of the allocation holding it.

@@ -1562,10 +1562,23 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                         depth,
                     )?))
                 }
-                GlobalAlloc::Static(_) => ConstTree::Global {
-                    target: self.global_reference(alloc_id)?,
-                    offset: pointer.offset.bytes(),
-                },
+                GlobalAlloc::Static(def_id) => {
+                    if !crate::constant::raw::static_matches_pointee(
+                        tcx,
+                        def_id,
+                        pointer.offset,
+                        concrete_ty,
+                    ) {
+                        return Err(format!(
+                            "a pointer into part of a `static` is not encoded in a constant \
+                             (type `{ty}`)"
+                        ));
+                    }
+                    ConstTree::Global {
+                        target: self.global_reference(alloc_id)?,
+                        offset: pointer.offset.bytes(),
+                    }
+                }
                 _ => {
                     return Err(format!(
                         "a wide `{ty}` to a named global is not encoded in a constant"
