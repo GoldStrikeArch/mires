@@ -1061,7 +1061,7 @@ impl<'a> Collector<'a> {
         let inlined_string_vec = if crate::lower::bstr::enabled() {
             self.interns.get(name).copied().and_then(|interns| {
                 analyze_inlined_string_vec(func, types, interns, |item, _| {
-                    is_raw_vec_reserve_in_table(self.table, &self.interns, &self.lowered, item)
+                    is_raw_vec_reserve_in_table(self.table, self.interns, &self.lowered, item)
                 })
             })
         } else {

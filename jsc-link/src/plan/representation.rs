@@ -1197,7 +1197,7 @@ impl Planner<'_> {
                 continue;
             }
             let inlined_elide =
-                inlined_vec_elide_set(self.table, &self.interns, &self.lowered, name, func);
+                inlined_vec_elide_set(self.table, self.interns, &self.lowered, name, func);
             for (bi, block) in func.blocks.iter().enumerate() {
                 for (oi, op) in block.ops.iter().enumerate() {
                     if inlined_elide.contains(&(bi, oi)) {
@@ -2526,7 +2526,7 @@ impl Planner<'_> {
             }
             let inlined_elide = inlined_vec_elide_set(
                 self.table,
-                &self.interns,
+                self.interns,
                 &self.lowered,
                 caller_name,
                 caller_func,
@@ -2920,7 +2920,7 @@ impl Planner<'_> {
         let mut inlined_vec_elide: BTreeSet<(usize, usize)> = BTreeSet::new();
         if crate::lower::bstr::enabled() {
             if let Some(analysis) = analyze_inlined_string_vec(&out, types, interns, |item, _| {
-                is_raw_vec_reserve_in_table(self.table, &self.interns, &self.lowered, item)
+                is_raw_vec_reserve_in_table(self.table, self.interns, &self.lowered, item)
             }) {
                 for (cid, cluster) in analysis.clusters.iter().enumerate() {
                     let root_carrier = match cluster.root {

@@ -1847,6 +1847,7 @@ fn prepare_opt_func(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // One call site; the arguments are the driver's phase outputs.
 fn lower_all(
     table: &BTreeMap<JsName, LinkItem>,
     names: &[JsName],

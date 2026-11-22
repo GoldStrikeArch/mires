@@ -958,9 +958,10 @@ mod byte_view_analysis {
             .enumerate()
             .map(|(idx, block)| (block.id, idx))
             .collect();
+        type ByteViewRoot = (BaseKey, bool, Option<ValueId>, ByteKind);
         let mut uf = UnionFind::new(n);
         let mut slice_uf = UnionFind::new(n);
-        let mut roots: Vec<Option<(BaseKey, bool, Option<ValueId>, ByteKind)>> = vec![None; n];
+        let mut roots: Vec<Option<ByteViewRoot>> = vec![None; n];
         let mut valid_op_def = vec![false; n];
         let mut poisoned = vec![false; n];
         let mut var_slice_seed = vec![false; n];
@@ -1034,15 +1035,12 @@ mod byte_view_analysis {
                 if !handled {
                     match &op.kind {
                         OpKind::Cast {
-                            kind,
+                            kind:
+                                CastKind::Transmute | CastKind::PtrToPtr | CastKind::PointerCoercion,
                             v: src,
                             from,
                             to,
-                        } if matches!(
-                            kind,
-                            CastKind::Transmute | CastKind::PtrToPtr | CastKind::PointerCoercion
-                        ) =>
-                        {
+                        } => {
                             if is_immutable_str_ref(table, *from) {
                                 if let Some(k) = classify_ty(table, *to) {
                                     roots[r] = Some((BaseKey::Value(*src), false, None, k));
@@ -1413,8 +1411,8 @@ mod byte_view_analysis {
         }
 
         let mut comps: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        for i in 0..n {
-            if roots[i].is_some() {
+        for (i, root) in roots.iter().enumerate() {
+            if root.is_some() {
                 comps.entry(uf.find(i)).or_default();
             }
         }
@@ -1429,8 +1427,8 @@ mod byte_view_analysis {
         }
 
         let mut var_slice_roots = BTreeSet::new();
-        for i in 0..n {
-            if var_slice_seed[i] {
+        for (i, &is_seed) in var_slice_seed.iter().enumerate() {
+            if is_seed {
                 var_slice_roots.insert(slice_uf.find(i));
             }
         }

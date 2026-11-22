@@ -523,6 +523,8 @@ fn function_has_cycle(cx: &JsCx<'_>) -> bool {
     false
 }
 
+type ClosureItem = (String, usize, Vec<TypeId>, Option<TypeId>, bool);
+
 /// The JavaScript name, the splatted arity and whether it takes an environment, of the body a
 /// closure or function-item value calls.
 fn closure_item(
@@ -530,7 +532,7 @@ fn closure_item(
     ty: TypeId,
     convert_params_in: bool,
     convert_result_out: bool,
-) -> Res<(String, usize, Vec<TypeId>, Option<TypeId>, bool)> {
+) -> Res<ClosureItem> {
     let peeled = cx.table.peeled(ty);
     let (definition, sig_id, has_environment) = match value::kind(cx.table, peeled) {
         Some(TypeKind::Closure { def, .. }) => (*def, None, true),

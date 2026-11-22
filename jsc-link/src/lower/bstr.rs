@@ -1014,6 +1014,7 @@ fn hash_target(
     res
 }
 
+#[allow(clippy::too_many_arguments)] // Recursive helper mirroring `hash_target` with `(ty, mode)` unpacked.
 fn hash_field_child(
     table: &TypeTable,
     interns: &Interns,

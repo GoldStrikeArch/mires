@@ -922,6 +922,7 @@ pub(crate) fn lower_bstr_op(
 /// Structurally classifies a stdlib `alloc::string::String` `BodySemantic::Ordinary` function into
 /// [`BstrStringOp`]. Restricted strictly to canonical `alloc::string::String::*` item paths and
 /// returns `None` whenever `bstr` is disabled.
+#[allow(clippy::too_many_arguments)] // Classifier entry taking IR context, item path, and resolver closures.
 pub(crate) fn classify_bstr_op<'a, F, P>(
     semantic: BodySemantic,
     func: &Func,
@@ -1236,9 +1237,9 @@ fn classify_as_bytes_body(
             OpKind::Field { base: v, field, .. } => {
                 if vec_vals.contains(v) && *field == parts.len_field {
                     len_vals.insert(res);
-                } else if vec_vals.contains(v) && *field == parts.buf_field {
-                    buf_chain.insert(res);
-                } else if buf_chain.contains(v) {
+                } else if (vec_vals.contains(v) && *field == parts.buf_field)
+                    || buf_chain.contains(v)
+                {
                     buf_chain.insert(res);
                 } else if str_refs.contains(v) && *field == parts.vec_field {
                     vec_vals.insert(res);
@@ -1817,10 +1818,10 @@ where
                                 saw_add_or_sub = true;
                             }
                         }
-                        BinaryOp::Sub | BinaryOp::SubWithOverflow | BinaryOp::SubUnchecked => {
-                            if cap_vals.contains(l) && len_vals.contains(r) {
-                                saw_add_or_sub = true;
-                            }
+                        BinaryOp::Sub | BinaryOp::SubWithOverflow | BinaryOp::SubUnchecked
+                            if cap_vals.contains(l) && len_vals.contains(r) =>
+                        {
+                            saw_add_or_sub = true;
                         }
                         _ => {}
                     }
