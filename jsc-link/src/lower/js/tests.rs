@@ -8538,6 +8538,7 @@ fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
         physical: None,
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
     };
     assert!(
         function::lower(&bad_input, &func, &plan, straight(&func)).is_err(),
