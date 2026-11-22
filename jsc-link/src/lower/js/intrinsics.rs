@@ -322,7 +322,7 @@ impl Intrinsic<'_, '_> {
             // a mutable `&mut str` / `*mut str` is a `{ buf, off, len }` byte slice whose size is
             // `.len`.
             Some(TypeKind::Str) => Ok(Outcome::Value(if size {
-                if value::is_mutable_ptr(table, self.arg_ty(0)?) {
+                if value::is_mut_str_ptr(table, self.arg_ty(0)?) {
                     self.cx.slice_len(self.arg(0)?)
                 } else {
                     self.cx.str_len(self.arg(0)?)
@@ -1500,7 +1500,7 @@ impl Intrinsic<'_, '_> {
         };
         Ok(Outcome::Value(self.cx.build_fat(
             pointee,
-            value::is_mutable_ptr(self.cx.table, pointer_ty),
+            value::is_mut_str_ptr(self.cx.table, pointer_ty),
             Some(self.arg_ty(0)?),
             self.arg(0)?,
             self.arg(1)?,

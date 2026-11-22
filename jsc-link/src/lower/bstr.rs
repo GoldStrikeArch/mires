@@ -76,10 +76,10 @@ pub fn char_text(point: Expr) -> Expr {
     }
 }
 
-/// Whether `ty` is an immutable pointer to `str` (`&str`, `*const str`): a value the run time
-/// holds as the JavaScript string itself. Mutable `&mut str` / `*mut str` are live
-/// `{ buf, off, len }` UTF-8 byte slices (`PointerForm::FatSlice`), identical in `utf16` and
-/// `bytes` modes.
+/// Whether `ty` is a shared `&str` reference: a value the run time holds as the JavaScript string
+/// itself. Mutable `&mut str` and raw `str` pointers (`*const str`, `*mut str`, `NonNull<str>`,
+/// `Unique<str>`, `Box<str>`) are live `{ buf, off, len }` UTF-8 byte slices
+/// (`PointerForm::FatSlice`), identical in `utf16` and `bytes` modes.
 pub fn is_str_pointer(table: &TypeTable, ty: TypeId) -> bool {
     value::is_const_str_ptr(table, ty)
 }
@@ -97,9 +97,15 @@ pub fn reaches_str(table: &TypeTable, ty: TypeId) -> bool {
         };
         match &descriptor.kind {
             TypeKind::Str => true,
-            TypeKind::Reference { pointee, mutable }
-            | TypeKind::RawPointer { pointee, mutable } => {
+            TypeKind::Reference { pointee, mutable } => {
                 if *mutable && value::is_str(table, *pointee) {
+                    false
+                } else {
+                    walk(table, *pointee, seen)
+                }
+            }
+            TypeKind::RawPointer { pointee, .. } => {
+                if value::is_str(table, *pointee) {
                     false
                 } else {
                     walk(table, *pointee, seen)
@@ -2495,7 +2501,7 @@ mod tests {
             },
             false,
         );
-        const_ptr.js.pointer_form = Some(PointerForm::Str);
+        const_ptr.js.pointer_form = Some(PointerForm::FatSlice);
 
         let mut mut_ptr = make_desc(
             mut_ptr_id.0,
@@ -2508,6 +2514,25 @@ mod tests {
         mut_ptr.js.pointer_form = Some(PointerForm::FatSlice);
 
         let tuple_mut = make_desc(tuple_mut_id.0, TypeKind::Tuple(vec![mut_str_id]), false);
+        let box_str_id = TypeId(7);
+        let mut box_str = make_desc(
+            box_str_id.0,
+            TypeKind::Adt {
+                def: crate::jir::DefinitionId {
+                    crate_id: 1,
+                    local_hash: 7,
+                },
+                args: vec![str_id],
+                form: NominalForm::Struct,
+                variants: Vec::new(),
+                niche: None,
+            },
+            false,
+        );
+        box_str.meta.candidate = RepresentationCandidate::Box;
+        box_str.js.peeled = const_ptr_id;
+        let tuple_box_id = TypeId(8);
+        let tuple_box = make_desc(tuple_box_id.0, TypeKind::Tuple(vec![box_str_id]), false);
 
         let table = TypeTable::from(vec![
             make_desc(str_id.0, TypeKind::Str, false),
@@ -2516,17 +2541,22 @@ mod tests {
             const_ptr,
             mut_ptr,
             tuple_mut,
+            box_str,
+            tuple_box,
         ]);
 
         assert!(is_str_pointer(&table, ref_str_id));
-        assert!(is_str_pointer(&table, const_ptr_id));
+        assert!(!is_str_pointer(&table, const_ptr_id));
         assert!(!is_str_pointer(&table, mut_str_id));
         assert!(!is_str_pointer(&table, mut_ptr_id));
+        assert!(!is_str_pointer(&table, box_str_id));
 
         assert!(reaches_str(&table, ref_str_id));
-        assert!(reaches_str(&table, const_ptr_id));
+        assert!(!reaches_str(&table, const_ptr_id));
         assert!(!reaches_str(&table, mut_str_id));
         assert!(!reaches_str(&table, mut_ptr_id));
         assert!(!reaches_str(&table, tuple_mut_id));
+        assert!(!reaches_str(&table, box_str_id));
+        assert!(!reaches_str(&table, tuple_box_id));
     }
 }

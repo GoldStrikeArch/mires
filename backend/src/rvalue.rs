@@ -282,7 +282,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 jsast::object(entries)
             }
             // `from_raw_parts`: a fat pointer built from a thin data pointer and its metadata.
-            AggregateKind::RawPtr(pointee, mutbl) => {
+            AggregateKind::RawPtr(pointee, _) => {
                 let pointee = self.monomorphize(*pointee);
                 let mut values = values.into_iter();
                 let (Some(data), Some(meta)) = (values.next(), values.next()) else {
@@ -290,7 +290,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
                         "`*const {pointee}` needs both a data pointer and its metadata"
                     ));
                 };
-                crate::ptr::build_fat(self, pointee, mutbl.is_mut(), data_ty, data, meta)
+                crate::ptr::build_fat(self, pointee, true, data_ty, data, meta)
             }
             _ => self.zombie(format!(
                 "`{kind:?}` aggregates are not supported by rustc_codegen_js"

@@ -690,8 +690,9 @@ pub fn is_mutable_ptr(table: &TypeTable, ty: TypeId) -> bool {
     )
 }
 
-/// Whether the peeled type is a mutable pointer to `str` (`&mut str` / `*mut str`), represented
-/// as a live `{ buf, off, len }` UTF-8 byte slice rather than an immutable JavaScript string.
+/// Whether the peeled type is a `str` pointer represented as a live `{ buf, off, len }` UTF-8 byte
+/// slice (`&mut str`, `*const str`, `*mut str`, and transparent wrappers such as `NonNull<str>`,
+/// `Unique<str>`, `Box<str>`) rather than an immutable JavaScript string (`&str`).
 pub fn is_mut_str_ptr(table: &TypeTable, ty: TypeId) -> bool {
     matches!(
         kind(table, ty),
@@ -699,28 +700,20 @@ pub fn is_mut_str_ptr(table: &TypeTable, ty: TypeId) -> bool {
             TypeKind::Reference {
                 pointee,
                 mutable: true,
-            } | TypeKind::RawPointer {
-                pointee,
-                mutable: true,
-            }
+            } | TypeKind::RawPointer { pointee, .. }
         ) if is_str(table, *pointee)
     )
 }
 
-/// Whether the peeled type is an immutable pointer to `str` (`&str` / `*const str`), represented
-/// as a JavaScript string.
+/// Whether the peeled type is an immutable shared `&str` reference, represented as a JavaScript
+/// string (`PointerForm::Str`).
 pub fn is_const_str_ptr(table: &TypeTable, ty: TypeId) -> bool {
     matches!(
         kind(table, ty),
-        Some(
-            TypeKind::Reference {
-                pointee,
-                mutable: false,
-            } | TypeKind::RawPointer {
-                pointee,
-                mutable: false,
-            }
-        ) if is_str(table, *pointee)
+        Some(TypeKind::Reference {
+            pointee,
+            mutable: false,
+        }) if is_str(table, *pointee)
     )
 }
 

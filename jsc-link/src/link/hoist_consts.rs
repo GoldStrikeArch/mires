@@ -93,6 +93,21 @@ fn is_scalar_array_lit(expr: &Expr, min_len: usize, allow_bigint: bool) -> bool 
             .all(|elem| is_pure_scalar_lit(elem, allow_bigint))
 }
 
+fn is_location_filename_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Str(_) => true,
+        Expr::Call(callee, args) if args.len() == 1 && matches!(&args[0], Expr::Str(_)) => {
+            matches!(
+                callee.as_ref(),
+                Expr::Member(ns, method)
+                    if matches!(ns.as_ref(), Expr::Ident(id) if id == "__rt")
+                        && matches!(method.as_str(), "str_bytes" | "bstr_bytes")
+            )
+        }
+        _ => false,
+    }
+}
+
 fn is_location_object(expr: &Expr) -> bool {
     let Expr::Object(entries) = expr else {
         return false;
@@ -103,10 +118,10 @@ fn is_location_object(expr: &Expr) -> bool {
     matches!(
         (&entries[0], &entries[1], &entries[2]),
         (
-            (k0, Expr::Str(_)),
+            (k0, file_expr),
             (k1, Expr::Num(_) | Expr::RawNum(_)),
             (k2, Expr::Num(_) | Expr::RawNum(_)),
-        ) if k0 == "filename" && k1 == "line" && k2 == "col"
+        ) if k0 == "filename" && k1 == "line" && k2 == "col" && is_location_filename_expr(file_expr)
     )
 }
 
@@ -1084,10 +1099,14 @@ fn run_with_opts(
             let new_name = fresh_item_name("$hc", &mut counter, table, defined);
             defined.insert(new_name.clone());
             live.insert(new_name.clone());
+            let mut decl = jsast::const_(new_name.as_str(), expr.clone());
+            if bstr_strings {
+                crate::lower::bstr::rewrite(&mut decl);
+            }
             let item = build_synthesized_link_item(
                 new_name.clone(),
                 ItemKind::Const,
-                jsast::const_(new_name.as_str(), expr.clone()),
+                decl,
                 "hoisted constant",
             );
             synthesized.push(item);
@@ -1194,6 +1213,47 @@ pub(super) fn synthesize_bstr_const_item(s_name: &str, js: &str) -> Option<LinkI
             decode_js_escape(rhs, &mut i, &mut text);
         } else {
             let ch = rhs[i..].chars().next()?;
+            text.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    None
+}
+
+/// Rewrites a producer-hoisted `const loc$h... = { filename: __rt.str_bytes("..."), ... };`
+/// item into its `js-str=bytes` twin (`__rt.bstr_bytes("<byte_string>")`).
+pub(super) fn rewrite_bstr_location_const_item(js: &str) -> Option<String> {
+    const NEEDLE: &str = "__rt.str_bytes(";
+    let call_start = js.find(NEEDLE)?;
+    let arg_start = call_start + NEEDLE.len();
+    let rest = &js[arg_start..];
+    let quote = rest.as_bytes().first().copied()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut i = 1usize;
+    let mut text = String::new();
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == quote {
+            let after_quote = &rest[i + 1..];
+            if !after_quote.starts_with(')') {
+                return None;
+            }
+            let encoded = crate::lower::bstr::byte_string(&text);
+            let encoded_lit = jsast::expr_to_string(&jsast::string(encoded));
+            let mut out = String::with_capacity(js.len() + encoded_lit.len());
+            out.push_str(&js[..call_start]);
+            out.push_str("__rt.bstr_bytes(");
+            out.push_str(&encoded_lit);
+            out.push_str(after_quote);
+            return Some(out);
+        } else if b == b'\\' {
+            i += 1;
+            decode_js_escape(rest, &mut i, &mut text);
+        } else {
+            let ch = rest[i..].chars().next()?;
             text.push(ch);
             i += ch.len_utf8();
         }

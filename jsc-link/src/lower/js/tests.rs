@@ -7938,7 +7938,7 @@ fn slice_view_unwindows_raw_array_pointer_for_slice_and_str() {
         },
         8,
     );
-    raw_str_desc.js.pointer_form = Some(PointerForm::Thin);
+    raw_str_desc.js.pointer_form = Some(PointerForm::FatSlice);
     interns.types.insert(raw_str_desc);
 
     // 1. `*mut [i32; 4]` -> `*mut [i32]` via `SliceView` must unwindow before `slice_from_parts`.
@@ -7976,7 +7976,8 @@ fn slice_view_unwindows_raw_array_pointer_for_slice_and_str() {
         "expected raw array pointer to unwindow before slice_from_parts:\n{js}"
     );
 
-    // 2. `*const [u8; 4]` -> `*const str` via `SliceView` must unwindow once and hoist via reread.
+    // 2. `*const [u8; 4]` -> `*const str` via `SliceView` must unwindow once and build a live
+    // `FatSlice` (MIRES-011: raw `str` pointers stay `FatSlice`).
     let mut b2 = FuncBuilder::new(item(2), signature(vec![raw_arr_u8], raw_str));
     let p2 = b2.param(raw_arr_u8, NO_ORIGIN);
     let e2 = FuncBuilder::ENTRY;
@@ -8009,11 +8010,11 @@ fn slice_view_unwindows_raw_array_pointer_for_slice_and_str() {
     assert_eq!(
         js2.matches("__rt.unwindow(").count(),
         1,
-        "expected exactly one __rt.unwindow call (hoisted via reread) for str SliceView:\n{js2}"
+        "expected exactly one __rt.unwindow call for *const str SliceView:\n{js2}"
     );
     assert!(
-        js2.contains("__rt.bytes_str("),
-        "expected bytes_str reconstruction:\n{js2}"
+        js2.contains("__rt.slice_from_parts(__rt.unwindow("),
+        "expected FatSlice slice_from_parts reconstruction for *const str:\n{js2}"
     );
 
     // 3. `*mut u8` -> `*mut [i32]` via `SliceView` (e.g. `Rc::allocate_for_slice`) must use
@@ -8971,7 +8972,7 @@ fn mut_str_lowering_preserves_live_slice_and_converts_on_const_boundary() {
         "function mut_str_eq(a, b) {\n  return __rt.slice_ptr_eq(a, b);\n}\n"
     );
 
-    // 7. PointerCoercion (*mut str -> *const str) decodes via __rt.bytes_str.
+    // 7. PointerCoercion (*mut str -> *const str) preserves live FatSlice (identity).
     let mut b = FuncBuilder::new(item(7), signature(vec![RAW_MUT_STR], RAW_CONST_STR));
     let s = b.param(RAW_MUT_STR, NO_ORIGIN);
     let out = b.op(
@@ -8991,7 +8992,286 @@ fn mut_str_lowering_preserves_live_slice_and_converts_on_const_boundary() {
     let body = body_of(BodyKind::Function, f.sig.clone());
     assert_eq!(
         lower(&interns, "mut_to_const", &[], &body, &f, &p, straight(&f)),
-        "function mut_to_const(s) {\n  return __rt.bytes_str(s.buf, s.off, s.len);\n}\n"
+        "function mut_to_const(s) {\n  return s;\n}\n"
+    );
+}
+
+#[test]
+fn nonnull_unique_box_str_preserve_live_fat_slice_across_transmute_deref_and_location() {
+    use rcgjs_object::jir::types::TransparentField;
+
+    const RAW_MUT_STR: TypeId = TypeId(440);
+    const RAW_CONST_STR: TypeId = TypeId(441);
+    const PAT_CONST_STR: TypeId = TypeId(442);
+    const NONNULL_STR: TypeId = TypeId(443);
+    const UNIQUE_STR: TypeId = TypeId(444);
+    const BOX_STR: TypeId = TypeId(445);
+    const MUT_STR: TypeId = TypeId(446);
+    const RAW_MUT_U8: TypeId = TypeId(447);
+
+    let mut interns = world();
+    interns.intern_type(pointer(RAW_MUT_STR, STR, PointerForm::FatSlice, true));
+    interns.intern_type(pointer(MUT_STR, STR, PointerForm::FatSlice, false));
+    interns.intern_type(pointer(RAW_MUT_U8, U8, PointerForm::Slot, true));
+
+    let mut raw_const_str = descriptor(
+        RAW_CONST_STR,
+        TypeKind::RawPointer {
+            pointee: STR,
+            mutable: false,
+        },
+        8,
+    );
+    raw_const_str.js.pointer_form = Some(PointerForm::FatSlice);
+    interns.intern_type(raw_const_str);
+
+    let mut pat_const_str = descriptor(PAT_CONST_STR, TypeKind::Pattern(RAW_CONST_STR), 8);
+    pat_const_str.js.peeled = RAW_CONST_STR;
+    interns.intern_type(pat_const_str);
+
+    // NonNull<str> declares `pointer: pat!(*const str is !null)` and peels naturally to
+    // `*const str` (`PointerForm::FatSlice`).
+    let nonnull_name = interns.intern_str("NonNull");
+    let mut nonnull_str = descriptor(
+        NONNULL_STR,
+        TypeKind::Adt {
+            def: def(443),
+            args: vec![STR],
+            form: NominalForm::Struct,
+            variants: vec![VariantDescriptor {
+                name: nonnull_name,
+                fields: vec![FieldDescriptor {
+                    key: FieldKey::Transparent,
+                    ty: PAT_CONST_STR,
+                    offset: 0,
+                }],
+                logical_discr: 0,
+                physical_tag: None,
+                result_ok: false,
+                saved_local_keys: Vec::new(),
+            }],
+            niche: None,
+        },
+        8,
+    );
+    nonnull_str.js.transparent = Some(TransparentField {
+        field: 0,
+        ty: PAT_CONST_STR,
+    });
+    nonnull_str.js.peeled = RAW_CONST_STR;
+    interns.intern_type(nonnull_str);
+
+    let unique_name = interns.intern_str("Unique");
+    let mut unique_str = descriptor(
+        UNIQUE_STR,
+        TypeKind::Adt {
+            def: def(444),
+            args: vec![STR],
+            form: NominalForm::Struct,
+            variants: vec![VariantDescriptor {
+                name: unique_name,
+                fields: vec![FieldDescriptor {
+                    key: FieldKey::Transparent,
+                    ty: NONNULL_STR,
+                    offset: 0,
+                }],
+                logical_discr: 0,
+                physical_tag: None,
+                result_ok: false,
+                saved_local_keys: Vec::new(),
+            }],
+            niche: None,
+        },
+        8,
+    );
+    unique_str.js.transparent = Some(TransparentField {
+        field: 0,
+        ty: NONNULL_STR,
+    });
+    unique_str.js.peeled = RAW_CONST_STR;
+    interns.intern_type(unique_str);
+
+    let box_name = interns.intern_str("Box");
+    let mut box_str = descriptor(
+        BOX_STR,
+        TypeKind::Adt {
+            def: def(445),
+            args: vec![STR],
+            form: NominalForm::Struct,
+            variants: vec![VariantDescriptor {
+                name: box_name,
+                fields: vec![FieldDescriptor {
+                    key: FieldKey::Transparent,
+                    ty: UNIQUE_STR,
+                    offset: 0,
+                }],
+                logical_discr: 0,
+                physical_tag: None,
+                result_ok: false,
+                saved_local_keys: Vec::new(),
+            }],
+            niche: None,
+        },
+        8,
+    );
+    box_str.js.transparent = Some(TransparentField {
+        field: 0,
+        ty: UNIQUE_STR,
+    });
+    box_str.js.peeled = RAW_CONST_STR;
+    interns.intern_type(box_str);
+
+    let e = FuncBuilder::ENTRY;
+
+    // 1. transmute::<*mut str, NonNull<str>> (NonNull::new_unchecked) is identity.
+    let mut b = FuncBuilder::new(item(1), signature(vec![RAW_MUT_STR], NONNULL_STR));
+    let p = b.param(RAW_MUT_STR, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::Transmute,
+            v: p,
+            from: RAW_MUT_STR,
+            to: NONNULL_STR,
+        },
+        NONNULL_STR,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let pl = plan_of(&f, &[(0, "p")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(&interns, "nn_new", &[], &body, &f, &pl, straight(&f)),
+        "function nn_new(p) {\n  return p;\n}\n"
+    );
+
+    // 2. &str -> *const str (`NonNull::from_ref`) converts Str -> FatSlice via __rt.str_bytes.
+    let mut b = FuncBuilder::new(item(2), signature(vec![STR_REF], RAW_CONST_STR));
+    let s = b.param(STR_REF, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PtrToPtr,
+            v: s,
+            from: STR_REF,
+            to: RAW_CONST_STR,
+        },
+        RAW_CONST_STR,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let pl = plan_of(&f, &[(0, "s")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(
+            &interns,
+            "str_to_const_ptr",
+            &[],
+            &body,
+            &f,
+            &pl,
+            straight(&f)
+        ),
+        "function str_to_const_ptr(s) {\n  return __rt.str_bytes(s);\n}\n"
+    );
+
+    // 3. &mut *b on Box<str> (and ElaborateBoxDerefs `*const str`) preserves live FatSlice;
+    //    &*b decodes via __rt.bytes_str.
+    let mut b = FuncBuilder::new(item(3), signature(vec![RAW_CONST_STR], MUT_STR));
+    let bx = b.param(RAW_CONST_STR, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(bx),
+            path: vec![Proj::Deref],
+            mutable: true,
+        },
+        MUT_STR,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let pl = plan_of(&f, &[(0, "b")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(&interns, "box_deref_mut", &[], &body, &f, &pl, straight(&f)),
+        "function box_deref_mut(b) {\n  return __rt.byte_slice_ref(b);\n}\n"
+    );
+
+    let mut b = FuncBuilder::new(item(4), signature(vec![BOX_STR], STR_REF));
+    let bx = b.param(BOX_STR, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::BorrowView {
+            root: Root::Value(bx),
+            path: vec![Proj::Deref],
+            mutable: false,
+        },
+        STR_REF,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let pl = plan_of(&f, &[(0, "b")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(&interns, "box_deref", &[], &body, &f, &pl, straight(&f)),
+        "function box_deref(b) {\n  return __rt.bytes_str(b.buf, b.off, b.len);\n}\n"
+    );
+
+    // 4. NonNull<str> -> *mut u8 cast projects live { buf, off } for dealloc.
+    let mut b = FuncBuilder::new(item(5), signature(vec![NONNULL_STR], RAW_MUT_U8));
+    let nn = b.param(NONNULL_STR, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::PtrToPtr,
+            v: nn,
+            from: NONNULL_STR,
+            to: RAW_MUT_U8,
+        },
+        RAW_MUT_U8,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let pl = plan_of(&f, &[(0, "nn")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(&interns, "nn_to_u8", &[], &body, &f, &pl, straight(&f)),
+        "function nn_to_u8(nn) {\n  return { buf: nn.buf, off: nn.off };\n}\n"
+    );
+
+    // 5. Elaborated Box<str> `&raw mut (*p)` on `p: *const str` preserves live FatSlice (identity).
+    let mut b = FuncBuilder::new(item(6), signature(vec![RAW_CONST_STR], RAW_MUT_STR));
+    let p = b.param(RAW_CONST_STR, NO_ORIGIN);
+    let out = b.op(
+        e,
+        OpKind::RawView {
+            root: Root::Value(p),
+            path: vec![Proj::Deref],
+            mutable: true,
+        },
+        RAW_MUT_STR,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(out)));
+    let f = b.finish();
+    let pl = plan_of(&f, &[(0, "p")]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    assert_eq!(
+        lower(
+            &interns,
+            "raw_mut_from_const_str",
+            &[],
+            &body,
+            &f,
+            &pl,
+            straight(&f)
+        ),
+        "function raw_mut_from_const_str(p) {\n  return p;\n}\n"
     );
 }
 

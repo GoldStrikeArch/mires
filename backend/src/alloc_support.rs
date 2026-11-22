@@ -28,15 +28,12 @@
 //! the cast carries a **zero element factory** to `__rt.unscale`, and [`zero_factory`] is what
 //! builds it.
 
-use rustc_abi::Size;
 use rustc_ast::expand::allocator::{
     default_fn_name, global_fn_name, AllocatorKind, AllocatorMethod, AllocatorMethodInput,
     AllocatorTy, SpecialAllocatorMethod, ALLOC_ERROR_HANDLER, NO_ALLOC_SHIM_IS_UNSTABLE,
 };
 use rustc_middle::mir::interpret::Allocation;
-use rustc_middle::mir::ConstValue;
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_span::DUMMY_SP;
 use rustc_symbol_mangling::mangle_internal_symbol;
 
 use crate::cgu::CguCx;
@@ -286,18 +283,8 @@ fn zero_value<'tcx>(cgu: &CguCx<'tcx>, ty: Ty<'tcx>) -> Option<Expr> {
     }
     let alloc =
         Allocation::from_bytes_byte_aligned_immutable(vec![0u8; layout.size.bytes_usize()], ());
-    let alloc_id = tcx.reserve_and_set_memory_alloc(tcx.mk_const_alloc(alloc));
     let probe = ZombieLog::default();
-    let value = crate::constant::codegen_const_value(
-        cgu,
-        &probe,
-        ConstValue::Indirect {
-            alloc_id,
-            offset: Size::ZERO,
-        },
-        ty,
-        DUMMY_SP,
-    );
+    let value = crate::constant::codegen_zero_value(cgu, &probe, &alloc, ty);
     probe.take().is_empty().then_some(value)
 }
 

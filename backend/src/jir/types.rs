@@ -542,16 +542,17 @@ impl<'a, 'tcx> TypeCx<'a, 'tcx> {
 
     /// The JavaScript shape of a pointer to `pointee` (`ptr.rs`).
     ///
-    /// Immutable `&str` / `*const str` are JavaScript strings (`PointerForm::Str`), while mutable
-    /// `&mut str` / `*mut str` are live `{ buf, off, len }` UTF-8 byte slices
-    /// (`PointerForm::FatSlice`) aliasing their backing buffer.
+    /// Shared references `&str` are JavaScript strings (`PointerForm::Str`), while `&mut str` and
+    /// every raw `str` pointer (`*const str`, `*mut str`, and transparent wrappers over them such
+    /// as `NonNull<str>`, `Unique<str>`, `Box<str>`) are live `{ buf, off, len }` UTF-8 byte
+    /// slices (`PointerForm::FatSlice`) aliasing their backing buffer.
     fn pointer_form(&self, pointee: Ty<'tcx>, raw: bool, mutable: bool) -> PointerForm {
         let tcx = self.tcx;
         // A transparent wrapper over an unsized type (`CStr` over `[c_char]`) is that type.
         let peeled = value::peel_pattern(value::peel_transparent(tcx, pointee));
         match peeled.kind() {
             ty::Str => {
-                return if mutable {
+                return if raw || mutable {
                     PointerForm::FatSlice
                 } else {
                     PointerForm::Str

@@ -1199,7 +1199,11 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                     offset: offset.bytes(),
                 })
             }
-            mir::ConstValue::Slice { alloc_id, meta } if ty.peel_refs().is_str() => {
+            mir::ConstValue::Slice { alloc_id, meta }
+                if crate::value::peel_pattern(crate::value::peel_transparent(tcx, ty))
+                    .builtin_deref(true)
+                    .is_some_and(|p| p.is_str()) =>
+            {
                 let GlobalAlloc::Memory(allocation) = tcx.global_alloc(alloc_id) else {
                     return Err("string constant is not backed by memory".to_owned());
                 };

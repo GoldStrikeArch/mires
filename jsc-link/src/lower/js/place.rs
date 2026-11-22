@@ -152,7 +152,7 @@ impl<'a> JsCx<'a> {
                             JsPlace::Deref(value)
                         }
                         Some(TypeKind::Str) => {
-                            str_mutable = value::is_mutable_ptr(table, ty);
+                            str_mutable = value::is_mut_str_ptr(table, ty);
                             identity = Some(value.clone());
                             JsPlace::Deref(value)
                         }
@@ -574,9 +574,9 @@ impl<'a> JsCx<'a> {
                 .identity
                 .unwrap_or_else(|| self.read_place(&walk.place));
             return Ok(match (walk.str_mutable, mutable) {
-                (true, true) | (false, false) => value,
-                (true, false) => self.bytes_to_str(value),
+                (true, _) => value,
                 (false, true) => self.str_to_bytes_mut(value),
+                (false, false) => self.str_to_bytes(value),
             });
         }
         if let Some(identity) = walk.identity {
@@ -630,7 +630,7 @@ impl<'a> JsCx<'a> {
         match value::kind(table, pointee) {
             Some(TypeKind::Slice(_)) => Ok(self.slice_len(value)),
             Some(TypeKind::Dynamic { .. }) => Ok(jsast::member(value, META)),
-            Some(TypeKind::Str) => Ok(if value::is_mutable_ptr(table, pointer_ty) {
+            Some(TypeKind::Str) => Ok(if value::is_mut_str_ptr(table, pointer_ty) {
                 self.slice_len(value)
             } else {
                 self.str_len(value)

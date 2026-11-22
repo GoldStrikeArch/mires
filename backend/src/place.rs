@@ -159,11 +159,12 @@ impl<'tcx> FnCx<'_, 'tcx> {
                             identity = Some(value.clone());
                             JsPlace::Deref(value)
                         }
-                        // A `str`: immutable pointers are JavaScript strings, mutable pointers are
-                        // live `{ buf, off, len }` byte slices. Record which form this deref came
-                        // from so reborrows convert when mutability changes.
+                        // A `str`: `&str` is a JavaScript string; `&mut str` and raw `str`
+                        // pointers (`*const str`, `*mut str`, `Box<str>`) are live `{ buf, off,
+                        // len }` byte slices. Record which form this deref came from so reborrows
+                        // convert when crossing to/from `&str`.
                         ty::Str => {
-                            str_mutable = ptr::is_mutable_ptr(self.tcx, ty);
+                            str_mutable = ptr::is_mut_str_ptr(self.tcx, ty);
                             identity = Some(value.clone());
                             JsPlace::Deref(value)
                         }
@@ -662,9 +663,9 @@ impl<'tcx> FnCx<'_, 'tcx> {
         if matches!(walk_shape.kind(), ty::Str) {
             let value = walk.identity.unwrap_or_else(|| self.read(&walk.place));
             return match (walk.str_mutable, mutable) {
-                (true, true) | (false, false) => value,
-                (true, false) => ptr::bytes_to_str(self, ptr::ByteElement, value),
+                (true, _) => value,
                 (false, true) => ptr::str_to_bytes_mut(value),
+                (false, false) => ptr::str_to_bytes(value),
             };
         }
         if let Some(identity) = walk.identity {

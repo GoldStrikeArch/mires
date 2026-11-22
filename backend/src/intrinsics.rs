@@ -1331,7 +1331,7 @@ impl<'tcx> Intrinsic<'_, 'tcx> {
         Outcome::Value(ptr::build_fat(
             self.fx,
             pointee,
-            ptr::is_mutable_ptr(self.fx.tcx, pointer_ty),
+            ptr::is_mut_str_ptr(self.fx.tcx, pointer_ty),
             Some(self.arg_ty(0)),
             self.arg(0),
             self.arg(1),
@@ -1707,12 +1707,12 @@ pub(crate) fn caller_location_value<'tcx>(fx: &FnCx<'_, 'tcx>, span: Span) -> Ex
     }
 
     // The file name field is a *pointer to* `str`, but not always a plain `&'static str`: real
-    // `core` stores a `NonNull<str>` so that `Location::file_as_c_str` can read one byte past the
-    // end, and `mini_core` stores the reference directly. Both are the same JavaScript string
-    // behind zero or more single-field wrappers, so the wrappers are put back the same way a
-    // `transmute` into the field's type would put them back.
+    // `core` stores a `NonNull<str>` (which uses the live `{ buf, off, len }` UTF-8 byte slice
+    // representation), and `mini_core` stores `&'static str` (a JS string). Match `file_ty`'s
+    // representation so `Location::file()` (`self.filename.as_ref()`) always decodes cleanly.
     let file_ty =
         tcx.normalize_erasing_regions(typing_env(), variant.fields[FieldIdx::ZERO].ty(tcx, args));
+    let file_is_mut_str = crate::ptr::is_mut_str_ptr(tcx, file_ty);
     let (inner_file_ty, wrap_file) = target_wrappers(fx, file_ty);
     let points_at_str = value::peel_pattern(inner_file_ty)
         .builtin_deref(true)
@@ -1750,10 +1750,15 @@ pub(crate) fn caller_location_value<'tcx>(fx: &FnCx<'_, 'tcx>, span: Span) -> Ex
         &format!("loc\u{1}{file}\u{1}{line}\u{1}{column}"),
         format!("caller location {file}:{line}:{column}"),
         || {
+            let file_expr = if file_is_mut_str {
+                crate::ptr::str_to_bytes(jsast::string(file.clone()))
+            } else {
+                jsast::string(file.clone())
+            };
             jsast::object(vec![
                 (
                     Namer::field_name(variant, FieldIdx::ZERO),
-                    wrap_file(jsast::string(file.clone())),
+                    wrap_file(file_expr),
                 ),
                 (
                     Namer::field_name(variant, FieldIdx::from_u32(1)),

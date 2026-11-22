@@ -1304,7 +1304,7 @@ impl<'a> JsCx<'a> {
                 }
                 Ok(jsast::object(entries))
             }
-            TypeKind::RawPointer { pointee, mutable } => {
+            TypeKind::RawPointer { pointee, .. } => {
                 let mut values = values.into_iter();
                 let (Some(data), Some(meta)) = (values.next(), values.next()) else {
                     return Err(decline(
@@ -1312,7 +1312,7 @@ impl<'a> JsCx<'a> {
                         "a raw pointer aggregate needs a data pointer and its metadata",
                     ));
                 };
-                self.build_fat(*pointee, *mutable, data_ty, data, meta)
+                self.build_fat(*pointee, true, data_ty, data, meta)
             }
             other => Err(decline(
                 OpClass::Rvalue,

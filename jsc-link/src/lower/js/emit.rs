@@ -2274,7 +2274,7 @@ impl<'a> JsCx<'a> {
                 } else {
                     self.build_fat(
                         pointee,
-                        value::is_mutable_ptr(table, result_ty),
+                        value::is_mut_str_ptr(table, result_ty),
                         Some(pointer_ty),
                         data,
                         len,

@@ -1363,9 +1363,9 @@ pub(crate) fn str_to_byte_ptr<'tcx>(fx: &FnCx<'_, 'tcx>, string: Expr) -> Expr {
     sequenced(setup, slot(slot_buf(b.clone()), slot_off(b)))
 }
 
-/// `s.as_bytes_mut()`: a fresh byte view no other `as_bytes` shares, so a write through it — lost,
-/// since a `&mut str` has no mutable JavaScript form — cannot surface in the memoized view of an
-/// equal string.
+/// Fresh unmemoized byte view for casting an immutable `&str` / `*const str` into a mutable
+/// byte or `str` pointer, so any write through the detached copy cannot surface in the memoized
+/// view of an equal string.
 pub(crate) fn str_to_bytes_mut(string: Expr) -> Expr {
     jsast::rt_call("str_bytes_mut", vec![string])
 }
@@ -1446,18 +1446,20 @@ pub(crate) fn cast_str<'tcx>(
     to_pointee: Ty<'tcx>,
     value: Expr,
 ) -> Option<Expr> {
-    cast_str_as(fx, from_pointee, to_pointee, value, false, false)
+    cast_str_as(fx, from_pointee, to_pointee, value, false, false, false)
 }
 
-/// [`cast_str`], told the mutability of both pointer types:
-/// - `&str` / `*const str` is a JavaScript string;
-/// - `&mut str` / `*mut str` is a live `{ buf, off, len }` UTF-8 byte slice.
+/// [`cast_str`], told the representation and mutability of both pointer types:
+/// - `&str` (`from_fat = false`) is a JavaScript string;
+/// - `&mut str`, `*const str`, `*mut str`, `NonNull<str>`, `Unique<str>`, `Box<str>`
+///   (`from_fat = true`) are live `{ buf, off, len }` UTF-8 byte slices.
 fn cast_str_as<'tcx>(
     fx: &FnCx<'_, 'tcx>,
     from_pointee: Ty<'tcx>,
     to_pointee: Ty<'tcx>,
     value: Expr,
-    from_mut: bool,
+    from_fat: bool,
+    to_fat: bool,
     to_mut: bool,
 ) -> Option<Expr> {
     let from = peel_pattern(peel_transparent(fx.tcx, from_pointee));
@@ -1474,12 +1476,18 @@ fn cast_str_as<'tcx>(
         ))
     };
     Some(match (from_str, to_str) {
-        (true, true) => match (from_mut, to_mut) {
+        (true, true) => match (from_fat, to_fat) {
             (false, false) | (true, true) => value,
             (true, false) => bytes_to_str(fx, ByteElement, value),
-            (false, true) => str_to_bytes_mut(value),
+            (false, true) => {
+                if to_mut {
+                    str_to_bytes_mut(value)
+                } else {
+                    str_to_bytes(value)
+                }
+            }
         },
-        (true, false) if from_mut => match to.kind() {
+        (true, false) if from_fat => match to.kind() {
             ty::Slice(element) if is_u8(fx.tcx, *element) => value,
             _ if is_u8(fx.tcx, to) || is_zst(fx.tcx, to) => {
                 let (setup, s) = reread(fx, value, &[BUF, OFF]);
@@ -1499,7 +1507,7 @@ fn cast_str_as<'tcx>(
         },
         (false, true) => match from.kind() {
             ty::Slice(element) => match ByteElement::of(fx.tcx, *element) {
-                Some(_) if to_mut => value,
+                Some(_) if to_fat => value,
                 Some(form) => bytes_to_str(fx, form, value),
                 None => unsupported(),
             },
@@ -1524,9 +1532,18 @@ pub(crate) fn cast_str_ptr<'tcx>(
     let to_peeled = peel_pattern(peel_transparent(fx.tcx, to_ty));
     let from_pointee = from_peeled.builtin_deref(true)?;
     let to_pointee = to_peeled.builtin_deref(true)?;
-    let from_mut = from_peeled.is_mutable_ptr();
+    let from_fat = matches!(from_peeled.kind(), ty::RawPtr(..)) || from_peeled.is_mutable_ptr();
+    let to_fat = matches!(to_peeled.kind(), ty::RawPtr(..)) || to_peeled.is_mutable_ptr();
     let to_mut = to_peeled.is_mutable_ptr();
-    cast_str_as(fx, from_pointee, to_pointee, value, from_mut, to_mut)
+    cast_str_as(
+        fx,
+        from_pointee,
+        to_pointee,
+        value,
+        from_fat,
+        to_fat,
+        to_mut,
+    )
 }
 
 /// Whether `ty` is `u8` (after peeling transparent wrappers like `MaybeUninit<u8>`), the element
@@ -1655,11 +1672,12 @@ pub(crate) fn is_mutable_ptr<'tcx>(tcx: TyCtxt<'tcx>, pointer_ty: Ty<'tcx>) -> b
     peel_pattern(crate::value::peel_transparent(tcx, pointer_ty)).is_mutable_ptr()
 }
 
-/// Whether `pointer_ty` is a mutable `str` pointer (`&mut str` / `*mut str`) — represented as a
-/// live `{ buf, off, len }` UTF-8 byte slice rather than an immutable JavaScript string.
+/// Whether `pointer_ty` is a `str` pointer represented as a live `{ buf, off, len }` UTF-8 byte
+/// slice (`&mut str`, `*const str`, `*mut str`, and transparent wrappers such as `NonNull<str>`,
+/// `Unique<str>`, `Box<str>`) rather than an immutable JavaScript string (`&str`).
 pub(crate) fn is_mut_str_ptr<'tcx>(tcx: TyCtxt<'tcx>, pointer_ty: Ty<'tcx>) -> bool {
     let peeled = peel_pattern(crate::value::peel_transparent(tcx, pointer_ty));
-    peeled.is_mutable_ptr()
+    (matches!(peeled.kind(), ty::RawPtr(..)) || peeled.is_mutable_ptr())
         && peeled.builtin_deref(true).is_some_and(|pointee| {
             matches!(
                 peel_pattern(crate::value::peel_transparent(tcx, pointee)).kind(),

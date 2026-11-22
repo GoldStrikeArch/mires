@@ -124,7 +124,7 @@ impl<'a> JsCx<'a> {
             ConstTree::Scalar { bits, .. } => self.scalar_expr(*bits, ty),
             ConstTree::Str(id) => {
                 let text = interns.str(*id).unwrap_or("");
-                if value::is_mutable_ptr(table, ty) {
+                if value::is_mut_str_ptr(table, ty) {
                     let bytes = text
                         .as_bytes()
                         .iter()
@@ -524,7 +524,7 @@ impl<'a> JsCx<'a> {
         match inner {
             ConstTree::Str(id) if value::is_str(table, pointee) => {
                 let text = self.interns.str(*id).unwrap_or("");
-                if value::is_mutable_ptr(table, ty) {
+                if value::is_mut_str_ptr(table, ty) {
                     let bytes = text
                         .as_bytes()
                         .iter()
@@ -717,10 +717,14 @@ impl<'a> JsCx<'a> {
         let line = fact.line;
         let column = fact.col + 1;
         let hoisted = hoisted_name("loc", &format!("loc\u{1}{file}\u{1}{line}\u{1}{column}"));
-        // `Location::file` is a Rust `str`: a byte string under `js-str=bytes`, which the
-        // producer's hoisted constant is only when the path is ASCII.
+        // `Location::file` is a Rust `str`: under `js-str=bytes`, a `NonNull<str>` `loc$h..` is
+        // rewritten to `__rt.bstr_bytes(...)` in `lane.rs`, whereas a plain `&str` `loc$h..`
+        // (`mini_core`) holds UTF-16 text and only matches when ASCII.
         let bytes = crate::lower::bstr::enabled();
-        if (!bytes || file.is_ascii()) && self.summary.deps.iter().any(|dep| dep == &hoisted) {
+        let (file_key, file_is_mut_str, line_key, col_key) = self.location_field_keys()?;
+        if (!bytes || file_is_mut_str || file.is_ascii())
+            && self.summary.deps.iter().any(|dep| dep == &hoisted)
+        {
             return Ok(jsast::id(hoisted));
         }
         let file = if bytes {
@@ -728,18 +732,24 @@ impl<'a> JsCx<'a> {
         } else {
             file
         };
-        let (file_key, line_key, col_key) = self.location_field_keys()?;
+        let file_expr = if file_is_mut_str {
+            self.str_to_bytes(jsast::string(file))
+        } else {
+            jsast::string(file)
+        };
         Ok(jsast::object(vec![
-            (file_key, jsast::string(file)),
+            (file_key, file_expr),
             (line_key, jsast::num(line as f64)),
             (col_key, jsast::num(column as f64)),
         ]))
     }
 
-    /// The field keys of the `panic_location` lang item's struct: prefer the exact result type of
-    /// any `caller_location` intrinsic in this body, then `core::panic::Location`'s qualified path
-    /// or authentic `core` crate provenance, then an unambiguous `Location` struct.
-    fn location_field_keys(&self) -> Res<(String, String, String)> {
+    /// The field keys of the `panic_location` lang item's struct (plus whether the `file` field
+    /// uses the mutable `FatSlice` representation, i.e. real `core`'s `NonNull<str>`): prefer the
+    /// exact result type of any `caller_location` intrinsic in this body, then
+    /// `core::panic::Location`'s qualified path or authentic `core` crate provenance, then an
+    /// unambiguous `Location` struct.
+    fn location_field_keys(&self) -> Res<(String, bool, String, String)> {
         let mut exact_tys = BTreeSet::new();
         let mut global_loc_defs = BTreeSet::new();
         let mut std_core_crates = BTreeSet::new();
@@ -819,7 +829,7 @@ impl<'a> JsCx<'a> {
 }
 
 pub(crate) enum LocationKeysOutcome {
-    Found((String, String, String)),
+    Found((String, bool, String, String)),
     Missing,
     Ambiguous,
 }
@@ -829,7 +839,7 @@ struct LocationCandidate<'a> {
     def: DefinitionId,
     desc_name: Option<&'a str>,
     variant_name: &'a str,
-    keys: (String, String, String),
+    keys: (String, bool, String, String),
 }
 
 pub(crate) fn resolve_location_field_keys(
@@ -888,6 +898,7 @@ pub(crate) fn resolve_location_field_keys(
         if !file_points_at_str || !ints {
             continue;
         }
+        let file_is_mut_str = value::is_mut_str_ptr(types, variant.fields[0].ty);
         if let (Some(k0), Some(k1), Some(k2)) = (
             key_name(variant.fields[0].key)?,
             key_name(variant.fields[1].key)?,
@@ -898,7 +909,7 @@ pub(crate) fn resolve_location_field_keys(
                 def: *def,
                 desc_name: descriptor.name.and_then(|id| interns.str(id)),
                 variant_name: interns.str(variant.name).unwrap_or(""),
-                keys: (k0, k1, k2),
+                keys: (k0, file_is_mut_str, k1, k2),
             });
         }
     }
@@ -907,7 +918,7 @@ pub(crate) fn resolve_location_field_keys(
         return Ok(LocationKeysOutcome::Missing);
     }
 
-    let unanimous = |mut iter: Box<dyn Iterator<Item = &LocationCandidate<'_>> + '_>| -> Option<(String, String, String)> {
+    let unanimous = |mut iter: Box<dyn Iterator<Item = &LocationCandidate<'_>> + '_>| -> Option<(String, bool, String, String)> {
         let first = iter.next()?;
         if iter.all(|other| other.keys == first.keys) {
             Some(first.keys.clone())

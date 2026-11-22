@@ -498,6 +498,19 @@ fn resolve(
         let references_changed = added_bstr || dedup.references_changed();
         (dedup, references_changed)
     } else {
+        let pre_changed = baseline_count != reachable.len()
+            || lane_run
+                .as_ref()
+                .is_some_and(|run| run.added_items() || run.references_changed());
+        if pre_changed {
+            (reachable, parents) = reach(dcx, &table);
+        }
+        let facades = track_caller_location_facades(&mut table, &mut reachable);
+        for (name, body) in &facades {
+            if let Some(run) = &mut lane_run {
+                run.rename(name, body);
+            }
+        }
         let dedup = crate::profile::time("link.dedup", || {
             crate::link_dedup::merge_duplicates(
                 &mut table,
@@ -506,14 +519,7 @@ fn resolve(
                 &mut conflicts,
             )
         });
-        let references_changed = baseline_count != reachable.len() || dedup.references_changed()
-            // The flat-call ABI adds the spill registers to the table, and an item nothing has walked
-            // to yet is an item `order` will not place and `print_units` will not print. A lowering
-            // the lane accepted may also reach *fewer* items than the baseline did — a folded branch
-            // is the ordinary case — and what nothing reaches any more must stop being printed.
-            || lane_run
-                .as_ref()
-                .is_some_and(|run| run.added_items() || run.references_changed());
+        let references_changed = pre_changed || !facades.is_empty() || dedup.references_changed();
         (dedup, references_changed)
     };
     if references_changed {
@@ -809,7 +815,7 @@ fn panic_location_field_keys(
     body: Option<&crate::jir::Body>,
     global_loc_defs: &BTreeSet<crate::jir::DefinitionId>,
     core_crate_ids: &BTreeSet<u64>,
-) -> (String, String, String) {
+) -> (String, bool, String, String) {
     use crate::jir::semantic::{Callee, Terminator};
     use crate::lower::js::constant::{resolve_location_field_keys, LocationKeysOutcome};
     use crate::lower::js::value;
@@ -840,7 +846,12 @@ fn panic_location_field_keys(
         false,
     ) {
         Ok(LocationKeysOutcome::Found(keys)) => keys,
-        _ => ("filename".to_owned(), "line".to_owned(), "col".to_owned()),
+        _ => (
+            "filename".to_owned(),
+            false,
+            "line".to_owned(),
+            "col".to_owned(),
+        ),
     }
 }
 
@@ -914,24 +925,50 @@ fn byte_string_facades(
         };
         if signature.abi.caller_location {
             let loc_param = "a_loc".to_owned();
-            let (file_key, line_key, col_key) = panic_location_field_keys(
+            let (file_key, file_is_mut_str, line_key, col_key) = panic_location_field_keys(
                 types,
                 interns,
                 Some(body),
                 &global_loc_defs,
                 &core_crate_ids,
             );
+            let default_file = if file_is_mut_str {
+                jsast::rt_call("bstr_bytes", vec![bstr::literal("<host>")])
+            } else {
+                bstr::literal("<host>")
+            };
             let default_loc = jsast::object(vec![
-                (file_key.clone(), bstr::literal("<host>")),
-                (line_key, jsast::num(0)),
-                (col_key, jsast::num(1)),
+                (file_key.clone(), default_file),
+                (line_key.clone(), jsast::num(0)),
+                (col_key.clone(), jsast::num(1)),
             ]);
-            let loc_spec = jsast::object_of(vec![
-                ("k", jsast::string("o")),
-                ("f", jsast::object(vec![(file_key, jsast::string("s"))])),
-            ]);
-            let wrapped_loc =
-                jsast::rt_call("bstr_ref_in", vec![jsast::id(loc_param.clone()), loc_spec]);
+            let wrapped_loc = if file_is_mut_str {
+                let loc_id = jsast::id(loc_param.clone());
+                let file_member = jsast::member(loc_id.clone(), file_key.clone());
+                let converted_file = jsast::rt_call(
+                    "bstr_bytes",
+                    vec![jsast::rt_call("bstr_in", vec![file_member.clone()])],
+                );
+                jsast::cond(
+                    jsast::binary(
+                        jsast::BinOp::StrictEq,
+                        jsast::unary(jsast::UnOp::TypeOf, file_member),
+                        jsast::string("string"),
+                    ),
+                    jsast::object(vec![
+                        (file_key, converted_file),
+                        (line_key.clone(), jsast::member(loc_id.clone(), line_key)),
+                        (col_key.clone(), jsast::member(loc_id.clone(), col_key)),
+                    ]),
+                    loc_id,
+                )
+            } else {
+                let loc_spec = jsast::object_of(vec![
+                    ("k", jsast::string("o")),
+                    ("f", jsast::object(vec![(file_key, jsast::string("s"))])),
+                ]);
+                jsast::rt_call("bstr_ref_in", vec![jsast::id(loc_param.clone()), loc_spec])
+            };
             let loc_expr = jsast::cond(
                 jsast::binary(
                     jsast::BinOp::Eq,
@@ -956,6 +993,103 @@ fn byte_string_facades(
         let decl = jsast::function(name.as_str().to_owned(), params, vec![jsast::ret(result)]);
         facades.push((name.clone(), inner, decl));
     }
+    install_export_facades(table, reachable, facades, "js-str=bytes facade")
+}
+
+/// Under default UTF-16 `str` mode, exported `#[track_caller]` functions whose `Location` stores
+/// `filename: NonNull<str>` (real `core`) accept either a Rust `Location` (already carrying a
+/// `FatSlice` `filename`) or a host-constructed `{ filename: "...", line, col }` object (or
+/// omitted/`null` location). Wrap only those exported `#[track_caller]` entries so Rust-to-Rust
+/// calls stay zero-overhead and JS hosts keep passing plain string filenames.
+fn track_caller_location_facades(
+    table: &mut BTreeMap<JsName, LinkItem>,
+    reachable: &mut Vec<JsName>,
+) -> Vec<(JsName, JsName)> {
+    let (global_loc_defs, core_crate_ids) = collect_panic_location_context(table);
+    let mut facades = Vec::new();
+    for name in reachable.iter() {
+        let Some(item) = table.get(name) else {
+            continue;
+        };
+        if !item.linkage.exported {
+            continue;
+        }
+        let s = name.as_str();
+        if s == "rust_begin_unwind" || s.ends_with("17rust_begin_unwind") {
+            continue;
+        }
+        let (Some(body), Some(interns)) = (item.jir.body.as_ref(), item.jir.interns()) else {
+            continue;
+        };
+        let signature = &body.signature;
+        if !signature.abi.caller_location
+            || signature.abi.spread.is_some()
+            || usize::from(signature.abi.parameters) != signature.arguments.len() + 1
+        {
+            continue;
+        }
+        let (file_key, file_is_mut_str, line_key, col_key) = panic_location_field_keys(
+            &interns.types,
+            interns,
+            Some(body),
+            &global_loc_defs,
+            &core_crate_ids,
+        );
+        if !file_is_mut_str {
+            continue;
+        }
+        let inner = JsName::new(format!("{}$loc", name.as_str()));
+        if table.contains_key(&inner) {
+            continue;
+        }
+        let mut params: Vec<String> = (0..signature.arguments.len())
+            .map(|i| format!("a{i}"))
+            .collect();
+        let mut arguments: Vec<jsast::Expr> = params.iter().cloned().map(jsast::id).collect();
+        let loc_param = "a_loc".to_owned();
+        let loc_id = jsast::id(loc_param.clone());
+        let file_member = jsast::member(loc_id.clone(), file_key.clone());
+        let default_loc = jsast::object(vec![
+            (
+                file_key.clone(),
+                jsast::rt_call("str_bytes", vec![jsast::string("<host>")]),
+            ),
+            (line_key.clone(), jsast::num(0)),
+            (col_key.clone(), jsast::num(1)),
+        ]);
+        let wrapped_loc = jsast::cond(
+            jsast::binary(
+                jsast::BinOp::StrictEq,
+                jsast::unary(jsast::UnOp::TypeOf, file_member.clone()),
+                jsast::string("string"),
+            ),
+            jsast::object(vec![
+                (file_key, jsast::rt_call("str_bytes", vec![file_member])),
+                (line_key.clone(), jsast::member(loc_id.clone(), line_key)),
+                (col_key.clone(), jsast::member(loc_id.clone(), col_key)),
+            ]),
+            loc_id.clone(),
+        );
+        let loc_expr = jsast::cond(
+            jsast::binary(jsast::BinOp::Eq, loc_id, jsast::null()),
+            default_loc,
+            wrapped_loc,
+        );
+        params.push(loc_param);
+        arguments.push(loc_expr);
+        let call = jsast::call(jsast::id(inner.as_str().to_owned()), arguments);
+        let decl = jsast::function(name.as_str().to_owned(), params, vec![jsast::ret(call)]);
+        facades.push((name.clone(), inner, decl));
+    }
+    install_export_facades(table, reachable, facades, "track_caller facade")
+}
+
+fn install_export_facades(
+    table: &mut BTreeMap<JsName, LinkItem>,
+    reachable: &mut Vec<JsName>,
+    facades: Vec<(JsName, JsName, jsast::Stmt)>,
+    label: &str,
+) -> Vec<(JsName, JsName)> {
     if facades.is_empty() {
         return Vec::new();
     }
@@ -1011,7 +1145,7 @@ fn byte_string_facades(
             refs,
             zombies: Vec::new(),
             linkage: body.linkage.clone(),
-            debug_path: format!("{} (js-str=bytes facade)", body.debug_path),
+            debug_path: format!("{} ({label})", body.debug_path),
             crate_name: body.crate_name.clone(),
             order: None,
             map: ItemMap::default(),

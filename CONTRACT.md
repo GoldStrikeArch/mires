@@ -1169,20 +1169,29 @@ not become initialized values.
   is the Rust-visible capacity in the same bytes, never below `len`: it starts at the requested
   capacity (zero, or the exact length for a builder made from text) and grows exact-fit, to the
   new length, when an append exceeds it — not by `RawVec`'s amortized doubling.
-- Mutable `&mut str` and `*mut str` are live `{ buf, off, len }` UTF-8 byte slices
-  (`PointerForm::FatSlice`) aliasing their backing `String`/`Vec<u8>`/`[u8]` buffer, identical at
-  run time to `&mut [u8]` / `*mut [u8]` in both `utf16` and `js-str=bytes` modes:
+- Mutable and raw `str` pointers — `&mut str`, `*const str`, `*mut str`, `NonNull<str>`,
+  `Unique<str>`, and `Box<str>` — are live `{ buf, off, len }` UTF-8 byte slices
+  (`PointerForm::FatSlice`) aliasing their backing `String`/`Vec<u8>`/`[u8]`/heap buffer,
+  identical at run time to `&mut [u8]` / `*[u8]` / `Box<[u8]>` in both `utf16` and `js-str=bytes`
+  modes, while shared `&str` stays a JavaScript string (`PointerForm::Str`):
   - `String::as_mut_str`, `<String as DerefMut>::deref_mut`, `str::from_utf8_unchecked_mut`,
-    `str::from_utf8_mut`, and `ptr::from_raw_parts_mut::<str>` keep `{ buf, off, len }` live with
-    no copy; `str::as_bytes_mut` is the identity and `str::as_mut_ptr` projects `{ buf, off }`, so
-    writes through `&mut str` (`make_ascii_lowercase`, `make_ascii_uppercase`,
-    `to_ascii_lowercase`, `to_ascii_uppercase`, `split_at_mut`, `get_mut`, `&mut s[a..b]`,
-    `as_bytes_mut`) mutate the backing storage in place.
-  - Reborrowing or coercing `&mut str` / `*mut str` to `&str` / `*const str` decodes
-    `{ buf, off, len }` to a JavaScript string (`__rt.bytes_str` in `utf16` mode, `__rt.bstr_of`
-    in `js-str=bytes` mode).
-  - Casting an immutable `&str` / `*const str` to a **mutable** `str` or byte pointer still
-    allocates a fresh unmemoized `__rt.str_bytes_mut(s)` (or `__rt.bstr_bytes_mut(s)`) record for
+    `str::from_utf8_mut`, `ptr::from_raw_parts::<str>`, `ptr::from_raw_parts_mut::<str>`,
+    `NonNull::<str>::new`, `NonNull::<str>::as_ptr`, `NonNull::<str>::as_mut`, `Box::<str>::from`,
+    `String::into_boxed_str` (including with spare capacity), `Box::<str>::default`,
+    `Box::<str>::clone`, `Box::<str>::into_string`, `Box::<str>::into_boxed_bytes`,
+    `Box::from_raw` / `Box::into_raw`, and `Drop for Box<str>` keep `{ buf, off, len }` live
+    with no copy; `str::as_bytes_mut` is the identity, `str::as_mut_ptr` projects `{ buf, off }`,
+    writes through `&mut str`, `Box<str>`, and `NonNull<str>` (`make_ascii_lowercase`,
+    `make_ascii_uppercase`, `to_ascii_lowercase`, `to_ascii_uppercase`, `split_at_mut`, `get_mut`,
+    `&mut s[a..b]`, `as_bytes_mut`) mutate the backing storage in place, and dropping `Box<str>`
+    deallocates the live heap block directly.
+  - Reborrowing or dereferencing `&mut str`, `*const str`, `*mut str`, `NonNull<str>`,
+    `Unique<str>`, or `Box<str>` to `&str` decodes `{ buf, off, len }` to a JavaScript string
+    (`__rt.bytes_str` in `utf16` mode, `__rt.bstr_of` in `js-str=bytes` mode).
+  - Casting an immutable `&str` to `*const str` (including `NonNull::from(&str)`) encodes via
+    `__rt.str_bytes(s)` (`__rt.bstr_bytes(s)` under `js-str=bytes`), preserving pointer identity
+    with `as_bytes().as_ptr()`; casting `&str` directly to a **mutable** `str` or byte pointer
+    allocates a fresh unmemoized `__rt.str_bytes_mut(s)` (`__rt.bstr_bytes_mut(s)`) record for
     containment so a write through a cast-away-const pointer never mutates a memoized `&str` view.
 
 `ptr::cast_str` owns the whole matrix — `str` to `[u8]`, `str` to `u8`, a slice of one byte elements

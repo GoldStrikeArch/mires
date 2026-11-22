@@ -848,6 +848,18 @@ fn run_with_opts(
     }
     let mut bstr_const_items = Vec::new();
     if crate::lower::bstr::enabled() {
+        for (name, item) in table.iter_mut() {
+            if item.kind == rcgjs_object::object::ItemKind::Const
+                && name.as_str().starts_with("loc$h")
+                && live.contains(name)
+            {
+                if let Some(rewritten) =
+                    super::hoist_consts::rewrite_bstr_location_const_item(&item.js)
+                {
+                    item.js = rewritten;
+                }
+            }
+        }
         for (name, item) in table.iter() {
             if item.kind == rcgjs_object::object::ItemKind::Const
                 && name.as_str().starts_with("s$h")
@@ -1022,7 +1034,8 @@ fn run_with_opts(
     }
     let mut added_bstr_consts = false;
     for bs_item in bstr_const_items {
-        if let std::collections::btree_map::Entry::Vacant(slot) = table.entry(bs_item.name.clone()) {
+        if let std::collections::btree_map::Entry::Vacant(slot) = table.entry(bs_item.name.clone())
+        {
             slot.insert(bs_item);
             added_bstr_consts = true;
         }
@@ -1869,14 +1882,7 @@ fn lower_all(
             let Ok(func) = entry else {
                 continue;
             };
-            match prepare_opt_func(
-                name,
-                func,
-                &interns.types,
-                interns,
-                ctx.opts,
-                report_probe,
-            ) {
+            match prepare_opt_func(name, func, &interns.types, interns, ctx.opts, report_probe) {
                 Ok(meta) => {
                     prepared_meta.insert(name.clone(), meta);
                 }

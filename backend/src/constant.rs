@@ -102,6 +102,42 @@ pub(crate) fn codegen_static_initializer<'tcx>(
     }
 }
 
+#[derive(Clone, Copy)]
+struct AllocReadCx<'a, 'tcx> {
+    cgu: &'a CguCx<'tcx>,
+    log: &'a ZombieLog,
+    alloc: &'a Allocation,
+    span: Span,
+    allow_null_wide_ptr: bool,
+}
+
+/// Decodes an all-zero allocation into the JS zero value used by `__rt.unscale`'s element
+/// factory (`alloc_support::zero_value`).
+///
+/// Mirrors JIR's `value::zero_value`: inside a zero-element template (such as a `BTreeMap`
+/// `LeafNode<Box<str>, V>` whose `keys: [MaybeUninit<Box<str>>; B]` hold all-zero bytes before
+/// insertion), an all-zero raw/wide pointer with no provenance decodes to `0` rather than a
+/// constant-reader zombie. Real user constants still reject provenance-less wide pointers via
+/// [`codegen_const_value`].
+pub(crate) fn codegen_zero_value<'tcx>(
+    cgu: &CguCx<'tcx>,
+    log: &ZombieLog,
+    alloc: &Allocation,
+    ty: Ty<'tcx>,
+) -> Expr {
+    read_alloc_inner(
+        AllocReadCx {
+            cgu,
+            log,
+            alloc,
+            span: Span::default(),
+            allow_null_wide_ptr: true,
+        },
+        Size::ZERO,
+        ty,
+    )
+}
+
 /// Lowers an already evaluated constant.
 pub(crate) fn codegen_const_value<'tcx>(
     cgu: &CguCx<'tcx>,
@@ -143,7 +179,9 @@ pub(crate) fn codegen_const_value<'tcx>(
                     format!("the slice constant of type `{ty}` is not backed by an allocation"),
                 );
             };
-            let pointee = ty.peel_refs();
+            let pointee = value::peel_pattern(value::peel_transparent(tcx, ty))
+                .builtin_deref(true)
+                .unwrap_or_else(|| ty.peel_refs());
             if pointee.is_str() {
                 return str_expr(
                     cgu,
@@ -230,6 +268,27 @@ fn read_alloc<'tcx>(
     ty: Ty<'tcx>,
     span: Span,
 ) -> Expr {
+    read_alloc_inner(
+        AllocReadCx {
+            cgu,
+            log,
+            alloc,
+            span,
+            allow_null_wide_ptr: false,
+        },
+        offset,
+        ty,
+    )
+}
+
+fn read_alloc_inner<'tcx>(cx: AllocReadCx<'_, 'tcx>, offset: Size, ty: Ty<'tcx>) -> Expr {
+    let AllocReadCx {
+        cgu,
+        log,
+        alloc,
+        span,
+        ..
+    } = cx;
     let tcx = cgu.tcx;
     let Ok(layout) = tcx.layout_of(typing_env().as_query_input(ty)) else {
         return zombie(
@@ -241,14 +300,7 @@ fn read_alloc<'tcx>(
     };
 
     let field = |index: usize, field_ty: Ty<'tcx>| {
-        read_alloc(
-            cgu,
-            log,
-            alloc,
-            offset + layout.fields.offset(index),
-            field_ty,
-            span,
-        )
+        read_alloc_inner(cx, offset + layout.fields.offset(index), field_ty)
     };
 
     // A transparent wrapper *is* its one non-1-ZST field (`value.rs`), so its bytes are that
@@ -272,8 +324,8 @@ fn read_alloc<'tcx>(
             }
         }
         // A pattern only restricts which values inhabit the type; the bytes are the base type's.
-        ty::Pat(base, _) => read_alloc(cgu, log, alloc, offset, *base, span),
-        ty::Adt(def, _) if def.is_enum() => read_enum(cgu, log, alloc, offset, ty, layout, span),
+        ty::Pat(base, _) => read_alloc_inner(cx, offset, *base),
+        ty::Adt(def, _) if def.is_enum() => read_enum(cx, offset, ty, layout),
         ty::Adt(def, args) if def.is_struct() => {
             let variant = def.non_enum_variant();
             let entries = variant
@@ -320,9 +372,7 @@ fn read_alloc<'tcx>(
                 .collect(),
         ),
         // A pointer stored *inside* an allocation: `static S: &str`, `static P: &Point`.
-        ty::Ref(..) | ty::RawPtr(..) | ty::FnPtr(..) => {
-            read_pointer(cgu, log, alloc, offset, ty, span)
-        }
+        ty::Ref(..) | ty::RawPtr(..) | ty::FnPtr(..) => read_pointer(cx, offset, ty),
         // A zero-sized union (`MaybeUninit<()>`, `MaybeUninit<fn_item>`): no non-ZST field exists
         // for `transparent_field_indexed` to peel, and zero-sized values are `undefined`.
         ty::Adt(def, _) if def.is_union() && layout.is_zst() => jsast::undefined(),
@@ -346,14 +396,18 @@ fn read_alloc<'tcx>(
 /// and the value comes out shaped exactly like the one `rvalue.rs` builds for `Rvalue::Aggregate`,
 /// through the same `value.rs` entry point.
 fn read_enum<'tcx>(
-    cgu: &CguCx<'tcx>,
-    log: &ZombieLog,
-    alloc: &Allocation,
+    cx: AllocReadCx<'_, 'tcx>,
     offset: Size,
     ty: Ty<'tcx>,
     layout: TyAndLayout<'tcx>,
-    span: Span,
 ) -> Expr {
+    let AllocReadCx {
+        cgu,
+        log,
+        alloc,
+        span,
+        ..
+    } = cx;
     let tcx = cgu.tcx;
     let ty::Adt(def, args) = ty.kind() else {
         return zombie(cgu, log, span, format!("`{ty}` is not an enum"));
@@ -399,7 +453,7 @@ fn read_enum<'tcx>(
         let field_offset = offset + variant_layout.fields.offset(index.as_usize());
         entries.push((
             Namer::field_name(variant, index),
-            read_alloc(cgu, log, alloc, field_offset, field_ty, span),
+            read_alloc_inner(cx, field_offset, field_ty),
         ));
     }
     value::enum_value(tcx, ty, variant_index, entries)
@@ -411,18 +465,27 @@ fn read_enum<'tcx>(
 /// The bytes at `offset` are only half the pointer: they hold the offset *within* the allocation
 /// it points at, and the allocation itself comes from the provenance recorded beside them. A wide
 /// pointer's length follows in the next pointer sized slot.
-fn read_pointer<'tcx>(
-    cgu: &CguCx<'tcx>,
-    log: &ZombieLog,
-    alloc: &Allocation,
-    offset: Size,
-    ty: Ty<'tcx>,
-    span: Span,
-) -> Expr {
+fn read_pointer<'tcx>(cx: AllocReadCx<'_, 'tcx>, offset: Size, ty: Ty<'tcx>) -> Expr {
+    let AllocReadCx {
+        cgu,
+        log,
+        alloc,
+        span,
+        allow_null_wide_ptr,
+    } = cx;
     let tcx = cgu.tcx;
     let pointee = ty.builtin_deref(true);
     let wide = pointee.is_some_and(|pointee| raw::is_wide_pointee(tcx, pointee));
     let pointer = raw::read_pointer(tcx, alloc, offset, wide);
+
+    if allow_null_wide_ptr
+        && pointer.alloc_id().is_none()
+        && pointer.readable
+        && pointer.offset == Size::ZERO
+        && (!wide || pointer.meta == Some(0))
+    {
+        return jsast::num(0);
+    }
 
     if let Some(pointee) = pointee {
         let peeled_pointee = value::peel_pattern(value::peel_transparent(tcx, pointee));

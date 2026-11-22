@@ -281,8 +281,21 @@ impl<'a> JsCx<'a> {
         let data_is_mut_str = data_ty.is_some_and(|dt| value::is_mut_str_ptr(table, dt));
         let (from_pointee, data) = if data_is_mut_str {
             let (setup, s) = self.reread(data, &[BUF, OFF]);
+            let u8_ty = table
+                .descriptors()
+                .iter()
+                .find(|d| {
+                    matches!(
+                        d.kind,
+                        TypeKind::Integer {
+                            signed: false,
+                            bits: 8
+                        }
+                    )
+                })
+                .map(|d| d.id);
             (
-                None,
+                u8_ty,
                 sequenced(setup, ptr::slot(ptr::slot_buf(s.clone()), ptr::slot_off(s))),
             )
         } else {
@@ -508,8 +521,8 @@ impl<'a> JsCx<'a> {
         )
     }
 
-    /// `s.as_bytes_mut()` (`ptr.rs::str_to_bytes_mut`): a fresh byte view no other `as_bytes`
-    /// shares, so a write through it — lost, since a `&mut str` has no mutable JavaScript form —
+    /// Fresh unmemoized byte view (`ptr.rs::str_to_bytes_mut`) for casting an immutable `&str` /
+    /// `*const str` into a mutable byte or `str` pointer, so any write through the detached copy
     /// cannot surface in the memoized view of an equal string.
     pub fn str_to_bytes_mut(&self, string: Expr) -> Expr {
         jsast::rt_call("str_bytes_mut", vec![string])
@@ -573,18 +586,21 @@ impl<'a> JsCx<'a> {
         to_pointee: TypeId,
         value: Expr,
     ) -> Option<Res<Expr>> {
-        self.cast_str_as(from_pointee, to_pointee, value, false, false)
+        self.cast_str_as(from_pointee, to_pointee, value, false, false, false)
     }
 
-    /// [`Self::cast_str`], told the mutability of both pointer types:
-    /// - `&str` / `*const str` is a JavaScript string;
-    /// - `&mut str` / `*mut str` is a live `{ buf, off, len }` UTF-8 byte slice.
+    /// [`Self::cast_str`], told the representation and mutability of both pointer types:
+    /// - `&str` (`from_fat = false`) is a JavaScript string;
+    /// - `&mut str`, `*const str`, `*mut str`, `NonNull<str>`, `Unique<str>`, `Box<str>`
+    ///   (`from_fat = true`) are live `{ buf, off, len }` UTF-8 byte slices.
+    #[allow(clippy::too_many_arguments)]
     fn cast_str_as(
         &self,
         from_pointee: TypeId,
         to_pointee: TypeId,
         value: Expr,
-        from_mut: bool,
+        from_fat: bool,
+        to_fat: bool,
         to_mut: bool,
     ) -> Option<Res<Expr>> {
         let table = self.table;
@@ -602,12 +618,18 @@ impl<'a> JsCx<'a> {
             ))
         };
         Some(match (from_str, to_str) {
-            (true, true) => Ok(match (from_mut, to_mut) {
+            (true, true) => Ok(match (from_fat, to_fat) {
                 (false, false) | (true, true) => value,
                 (true, false) => self.bytes_to_str(value),
-                (false, true) => self.str_to_bytes_mut(value),
+                (false, true) => {
+                    if to_mut {
+                        self.str_to_bytes_mut(value)
+                    } else {
+                        self.str_to_bytes(value)
+                    }
+                }
             }),
-            (true, false) if from_mut => match value::kind(table, to_pointee) {
+            (true, false) if from_fat => match value::kind(table, to_pointee) {
                 Some(TypeKind::Slice(element)) if value::is_u8(table, *element) => Ok(value),
                 _ if value::is_u8(table, to_pointee) || table.is_zst(to_pointee) => {
                     let (setup, sb) = self.reread(value, &[BUF, OFF]);
@@ -637,7 +659,7 @@ impl<'a> JsCx<'a> {
                 _ => unsupported(),
             },
             (false, true) => match value::kind(table, from_pointee) {
-                Some(TypeKind::Slice(element)) if table.byte_element(*element) => Ok(if to_mut {
+                Some(TypeKind::Slice(element)) if table.byte_element(*element) => Ok(if to_fat {
                     value
                 } else {
                     self.bytes_to_str(value)
@@ -652,9 +674,11 @@ impl<'a> JsCx<'a> {
     pub fn cast_str_ptr(&self, from_ty: TypeId, to_ty: TypeId, value: Expr) -> Option<Res<Expr>> {
         let from_pointee = value::pointee_of(self.table, from_ty)?;
         let to_pointee = value::pointee_of(self.table, to_ty)?;
-        let from_mut = value::is_mutable_ptr(self.table, from_ty);
+        let from_fat =
+            value::is_raw(self.table, from_ty) || value::is_mutable_ptr(self.table, from_ty);
+        let to_fat = value::is_raw(self.table, to_ty) || value::is_mutable_ptr(self.table, to_ty);
         let to_mut = value::is_mutable_ptr(self.table, to_ty);
-        self.cast_str_as(from_pointee, to_pointee, value, from_mut, to_mut)
+        self.cast_str_as(from_pointee, to_pointee, value, from_fat, to_fat, to_mut)
     }
 
     /// `value as *const to_pointee` (`ptr.rs::cast_pointer`).
