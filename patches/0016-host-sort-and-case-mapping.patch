@@ -1,0 +1,802 @@
+rustc_codegen_js: host-delegated slice::sort, str case mapping, and charCodeAt str cursors.
+
+1. `core::slice::sort::{stable,unstable}::sort`: replace `#[inline(always)]` with
+   `#[inline(never)]` + `rcgjs_slice_{stable,unstable}_sort` diagnostic items and a
+   tiny insertion-sort fallback calling `rcgjs_sort_cmp` so driftsort/ipnsort and
+   the 4 KiB stack scratch buffer never reach MIR, while `jsc-link` lowers both
+   entry points directly to `__rt.slice_sort` (spec-stable ES2018 index merge sort).
+2. `alloc::str::{to_lowercase,to_uppercase}`: tag with `rcgjs_str_to_{lowercase,uppercase}`
+   and delegate to `__rt.host_str_to_{lowercase,uppercase}` (native String regions
+   lower directly to `str_to_{lowercase,uppercase}` / `bstr_to_{lowercase,uppercase}`),
+   eliminating `core::unicode::unicode_data::conversions` tables.
+3. `core::str::iter::{Chars,Bytes}`: replace `slice::Iter<u8>` backing with
+   `{ s: &str, start: usize, end: usize }` cursors reading bytes via
+   `rcgjs_str_byte_at` (`s.charCodeAt(i)` under `js-str=bytes`) and slicing via
+   `rcgjs_str_slice_unchecked` (`s.slice(start, end)` under `js-str=bytes`).
+
+diff -ru a/library/alloc/src/str.rs b/library/alloc/src/str.rs
+--- a/library/alloc/src/str.rs	2026-11-22 22:01:59
++++ b/library/alloc/src/str.rs	2026-11-22 22:01:59
+@@ -210,6 +210,7 @@
+ 
+ /// Helper for final sigma lowercase
+ #[cfg(not(no_global_oom_handling))]
++#[allow(dead_code)]
+ fn map_uppercase_sigma(from: &str, i: usize) -> char {
+     fn case_ignorable_then_cased<I: Iterator<Item = char>>(iter: I) -> bool {
+         match iter.skip_while(|&c| c.is_case_ignorable()).next() {
+@@ -430,38 +431,15 @@
+     #[must_use = "this returns the lowercase string as a new String, \
+                   without modifying the original"]
+     #[stable(feature = "unicode_case_mapping", since = "1.2.0")]
++    #[rustc_diagnostic_item = "rcgjs_str_to_lowercase"]
+     pub fn to_lowercase(&self) -> String {
+-        // SAFETY: `to_ascii_lowercase` preserves ASCII bytes, so the converted
+-        // prefix remains valid UTF-8.
+-        let (mut s, rest) = unsafe { convert_while_ascii(self, u8::to_ascii_lowercase) };
+-
+-        let prefix_len = s.len();
+-
+-        for (i, c) in rest.char_indices() {
+-            if c == 'Σ' {
+-                // Σ maps to σ, except at the end of a word where it maps to ς.
+-                // This is the only conditional (contextual) but language-independent mapping
+-                // in `SpecialCasing.txt`,
+-                // so hard-code it rather than have a generic "condition" mechanism.
+-                // See https://github.com/rust-lang/rust/issues/26035
+-                let sigma_lowercase = map_uppercase_sigma(self, prefix_len + i);
+-                s.push(sigma_lowercase);
+-            } else {
+-                match conversions::to_lower(c) {
+-                    [a, '\0', _] => s.push(a),
+-                    [a, b, '\0'] => {
+-                        s.push(a);
+-                        s.push(b);
+-                    }
+-                    [a, b, c] => {
+-                        s.push(a);
+-                        s.push(b);
+-                        s.push(c);
+-                    }
+-                }
+-            }
++        unsafe extern "C" {
++            #[allow(improper_ctypes)]
++            fn host_str_to_lowercase(s: &str) -> &str;
+         }
+-        return s;
++        // SAFETY: `__rt.host_str_to_lowercase` returns a valid string slice with
++        // Unicode default lowercase mapping matching Rust; `String::from` copies it.
++        String::from(unsafe { host_str_to_lowercase(self) })
+     }
+ 
+     /// Returns the titlecase equivalent of this string slice,
+@@ -645,26 +623,15 @@
+     #[must_use = "this returns the uppercase string as a new String, \
+                   without modifying the original"]
+     #[stable(feature = "unicode_case_mapping", since = "1.2.0")]
++    #[rustc_diagnostic_item = "rcgjs_str_to_uppercase"]
+     pub fn to_uppercase(&self) -> String {
+-        // SAFETY: `to_ascii_uppercase` preserves ASCII bytes, so the converted
+-        // prefix remains valid UTF-8.
+-        let (mut s, rest) = unsafe { convert_while_ascii(self, u8::to_ascii_uppercase) };
+-
+-        for c in rest.chars() {
+-            match conversions::to_upper(c) {
+-                [a, '\0', _] => s.push(a),
+-                [a, b, '\0'] => {
+-                    s.push(a);
+-                    s.push(b);
+-                }
+-                [a, b, c] => {
+-                    s.push(a);
+-                    s.push(b);
+-                    s.push(c);
+-                }
+-            }
++        unsafe extern "C" {
++            #[allow(improper_ctypes)]
++            fn host_str_to_uppercase(s: &str) -> &str;
+         }
+-        s
++        // SAFETY: `__rt.host_str_to_uppercase` returns a valid string slice with
++        // Unicode default uppercase mapping matching Rust; `String::from` copies it.
++        String::from(unsafe { host_str_to_uppercase(self) })
+     }
+ 
+     /// Returns the case-folded equivalent of this string slice, as a new [`String`].
+diff -ru a/library/core/src/slice/sort/shared/mod.rs b/library/core/src/slice/sort/shared/mod.rs
+--- a/library/core/src/slice/sort/shared/mod.rs	2026-11-22 22:01:59
++++ b/library/core/src/slice/sort/shared/mod.rs	2026-11-22 22:01:59
+@@ -45,3 +45,16 @@
+         (run_len, strictly_descending)
+     }
+ }
++
++/// Monomorphic comparator trampoline referenced by `stable::sort` and `unstable::sort`
++/// so JIR lowering can pass a plain 3-argument JS function to `__rt.slice_sort`
++/// without `RustCall` tuple spreading or MIR inlining removing the callee.
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_slice_sort_cmp"]
++pub(crate) fn rcgjs_sort_cmp<T, F: FnMut(&T, &T) -> bool>(
++    is_less: &mut F,
++    a: &T,
++    b: &T,
++) -> bool {
++    is_less(a, b)
++}
+diff -ru a/library/core/src/slice/sort/stable/mod.rs b/library/core/src/slice/sort/stable/mod.rs
+--- a/library/core/src/slice/sort/stable/mod.rs	2026-11-22 22:01:59
++++ b/library/core/src/slice/sort/stable/mod.rs	2026-11-22 22:01:59
+@@ -1,3 +1,4 @@
++#![allow(dead_code, unused_imports)]
+ //! This module contains the entry points for `slice::sort`.
+ 
+ #[cfg(not(any(feature = "optimize_for_size", target_pointer_width = "16")))]
+@@ -25,63 +26,29 @@
+ ///
+ /// Upholds all safety properties outlined here:
+ /// <https://github.com/Voultapher/sort-research-rs/blob/main/writeup/sort_safety/text.md>
+-#[inline(always)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_slice_stable_sort"]
+ pub fn sort<T, F: FnMut(&T, &T) -> bool, BufT: BufGuard<T>>(v: &mut [T], is_less: &mut F) {
+-    // Arrays of zero-sized types are always all-equal, and thus sorted.
+-    if T::IS_ZST {
++    if T::IS_ZST || v.len() < 2 {
+         return;
+     }
+-
+-    // Instrumenting the standard library showed that 90+% of the calls to sort
+-    // by rustc are either of size 0 or 1.
+-    let len = v.len();
+-    if intrinsics::likely(len < 2) {
+-        return;
+-    }
+-
+-    cfg_select! {
+-        any(feature = "optimize_for_size", target_pointer_width = "16") => {
+-            // Unlike driftsort, mergesort only requires len / 2,
+-            // not len - len / 2.
+-            let alloc_len = len / 2;
+-
+-            cfg_select! {
+-                target_pointer_width = "16" => {
+-                    let mut heap_buf = BufT::with_capacity(alloc_len);
+-                    let scratch = heap_buf.as_uninit_slice_mut();
+-                }
+-                _ => {
+-                    // For small inputs 4KiB of stack storage suffices, which allows us to avoid
+-                    // calling the (de-)allocator. Benchmarks showed this was quite beneficial.
+-                    let mut stack_buf = AlignedStorage::<T, 4096>::new();
+-                    let stack_scratch = stack_buf.as_uninit_slice_mut();
+-                    let mut heap_buf;
+-                    let scratch = if stack_scratch.len() >= alloc_len {
+-                        stack_scratch
+-                    } else {
+-                        heap_buf = BufT::with_capacity(alloc_len);
+-                        heap_buf.as_uninit_slice_mut()
+-                    };
+-                }
+-            }
+-
+-            tiny::mergesort(v, scratch, is_less);
++    // Fallback for non-JIR lowering; JIR replaces this body with `__rt.slice_sort`
++    // using the monomorphized `rcgjs_sort_cmp::<T, F>` referenced below.
++    let mut i = 1;
++    while i < v.len() {
++        let mut j = i;
++        while j > 0
++            && crate::slice::sort::shared::rcgjs_sort_cmp(
++                is_less,
++                // SAFETY: `0 < j < v.len()`.
++                unsafe { v.get_unchecked(j) },
++                unsafe { v.get_unchecked(j - 1) },
++            )
++        {
++            v.swap(j, j - 1);
++            j -= 1;
+         }
+-        _ => {
+-            // More advanced sorting methods than insertion sort are faster if called in
+-            // a hot loop for small inputs, but for general-purpose code the small
+-            // binary size of insertion sort is more important. The instruction cache in
+-            // modern processors is very valuable, and for a single sort call in general
+-            // purpose code any gains from an advanced method are cancelled by i-cache
+-            // misses during the sort, and thrashing the i-cache for surrounding code.
+-            const MAX_LEN_ALWAYS_INSERTION_SORT: usize = 20;
+-            if intrinsics::likely(len <= MAX_LEN_ALWAYS_INSERTION_SORT) {
+-                insertion_sort_shift_left(v, 1, is_less);
+-                return;
+-            }
+-
+-            driftsort_main::<T, F, BufT>(v, is_less);
+-        }
++        i += 1;
+     }
+ }
+ 
+diff -ru a/library/core/src/slice/sort/unstable/mod.rs b/library/core/src/slice/sort/unstable/mod.rs
+--- a/library/core/src/slice/sort/unstable/mod.rs	2026-11-22 22:01:59
++++ b/library/core/src/slice/sort/unstable/mod.rs	2026-11-22 22:01:59
+@@ -1,3 +1,4 @@
++#![allow(dead_code, unused_imports)]
+ //! This module contains the entry points for `slice::sort_unstable`.
+ 
+ use crate::mem::SizedTypeProperties;
+@@ -18,42 +19,32 @@
+ ///
+ /// Upholds all safety properties outlined here:
+ /// <https://github.com/Voultapher/sort-research-rs/blob/main/writeup/sort_safety/text.md>
+-#[inline(always)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_slice_unstable_sort"]
+ pub fn sort<T, F>(v: &mut [T], is_less: &mut F)
+ where
+     F: FnMut(&T, &T) -> bool,
+ {
+-    // Arrays of zero-sized types are always all-equal, and thus sorted.
+-    if T::IS_ZST {
++    if T::IS_ZST || v.len() < 2 {
+         return;
+     }
+-
+-    // Instrumenting the standard library showed that 90+% of the calls to sort
+-    // by rustc are either of size 0 or 1.
+-    let len = v.len();
+-    if intrinsics::likely(len < 2) {
+-        return;
+-    }
+-
+-    cfg_select! {
+-        any(feature = "optimize_for_size", target_pointer_width = "16") => {
+-            heapsort::heapsort(v, is_less);
++    // Fallback for non-JIR lowering; JIR replaces this body with `__rt.slice_sort`
++    // using the monomorphized `rcgjs_sort_cmp::<T, F>` referenced below.
++    let mut i = 1;
++    while i < v.len() {
++        let mut j = i;
++        while j > 0
++            && crate::slice::sort::shared::rcgjs_sort_cmp(
++                is_less,
++                // SAFETY: `0 < j < v.len()`.
++                unsafe { v.get_unchecked(j) },
++                unsafe { v.get_unchecked(j - 1) },
++            )
++        {
++            v.swap(j, j - 1);
++            j -= 1;
+         }
+-        _ => {
+-            // More advanced sorting methods than insertion sort are faster if called in
+-            // a hot loop for small inputs, but for general-purpose code the small
+-            // binary size of insertion sort is more important. The instruction cache in
+-            // modern processors is very valuable, and for a single sort call in general
+-            // purpose code any gains from an advanced method are cancelled by i-cache
+-            // misses during the sort, and thrashing the i-cache for surrounding code.
+-            const MAX_LEN_ALWAYS_INSERTION_SORT: usize = 20;
+-            if intrinsics::likely(len <= MAX_LEN_ALWAYS_INSERTION_SORT) {
+-                insertion_sort_shift_left(v, 1, is_less);
+-                return;
+-            }
+-
+-            ipnsort(v, is_less);
+-        }
++        i += 1;
+     }
+ }
+ 
+diff -ru a/library/core/src/str/iter.rs b/library/core/src/str/iter.rs
+--- a/library/core/src/str/iter.rs	2026-11-22 22:01:59
++++ b/library/core/src/str/iter.rs	2026-11-22 22:07:50
+@@ -1,6 +1,7 @@
+ //! Iterators for `str` methods.
+ 
+ use super::pattern::{DoubleEndedSearcher, Pattern, ReverseSearcher, Searcher};
++#[allow(unused_imports)]
+ use super::validations::{next_code_point, next_code_point_reverse};
+ use super::{
+     BytesIsNotEmpty, CharEscapeDebugContinue, CharEscapeDefault, CharEscapeUnicode,
+@@ -8,12 +9,12 @@
+ };
+ use crate::fmt::{self, Write};
+ use crate::iter::{
+-    Chain, Copied, Filter, FlatMap, Flatten, FusedIterator, Map, TrustedLen, TrustedRandomAccess,
++    Chain, Filter, FlatMap, Flatten, FusedIterator, Map, TrustedLen, TrustedRandomAccess,
+     TrustedRandomAccessNoCoerce,
+ };
+ use crate::num::NonZero;
+ use crate::ops::Try;
+-use crate::slice::{self, Split as SliceSplit};
++use crate::slice::Split as SliceSplit;
+ use crate::{char as char_mod, option};
+ 
+ /// An iterator over the [`char`]s of a string slice.
+@@ -24,11 +25,76 @@
+ ///
+ /// [`char`]: prim@char
+ /// [`chars`]: str::chars
++/// Reads byte `i` of `s` without bounds checks. Under `js-str=bytes`, `jsc-link`
++/// lowers calls to this diagnostic item directly to `s.charCodeAt(i)`.
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_str_byte_at"]
++pub(crate) fn rcgjs_str_byte_at(s: &str, i: usize) -> u8 {
++    // SAFETY: callers only pass indices `< s.len()`.
++    unsafe { *s.as_bytes().get_unchecked(i) }
++}
++
++/// Slices `s[start..end]` without char-boundary or bounds checks. Under `js-str=bytes`,
++/// `jsc-link` lowers calls to this diagnostic item directly to `s.slice(start, end)`.
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_str_slice_unchecked"]
++pub(crate) fn rcgjs_str_slice_unchecked(s: &str, start: usize, end: usize) -> &str {
++    // SAFETY: callers maintain UTF-8 char-boundary invariants `0 <= start <= end <= s.len()`.
++    unsafe { from_utf8_unchecked(s.as_bytes().get_unchecked(start..end)) }
++}
++
++#[inline(never)]
++fn next_non_ascii_code_point(s: &str, start: &mut usize, b0: u8) -> char {
++    let i = *start;
++    let b1 = (rcgjs_str_byte_at(s, i + 1) & 0x3f) as u32;
++    if b0 < 0xe0 {
++        *start = i + 2;
++        // SAFETY: `s` is valid UTF-8.
++        return unsafe { char::from_u32_unchecked((((b0 & 0x1f) as u32) << 6) | b1) };
++    }
++    let b2 = (rcgjs_str_byte_at(s, i + 2) & 0x3f) as u32;
++    if b0 < 0xf0 {
++        *start = i + 3;
++        return unsafe { char::from_u32_unchecked((((b0 & 0x0f) as u32) << 12) | (b1 << 6) | b2) };
++    }
++    let b3 = (rcgjs_str_byte_at(s, i + 3) & 0x3f) as u32;
++    *start = i + 4;
++    unsafe {
++        char::from_u32_unchecked((((b0 & 0x07) as u32) << 18) | (b1 << 12) | (b2 << 6) | b3)
++    }
++}
++
++#[inline(never)]
++fn prev_non_ascii_code_point(s: &str, end: &mut usize, last: u8) -> char {
++    let mut cp = (last & 0x3f) as u32;
++    let mut shift = 6u32;
++    loop {
++        *end -= 1;
++        let b = rcgjs_str_byte_at(s, *end);
++        if (b & 0xc0) != 0x80 {
++            let mask = if shift == 6 {
++                0x1f
++            } else if shift == 12 {
++                0x0f
++            } else {
++                0x07
++            };
++            cp |= ((b & mask) as u32) << shift;
++            // SAFETY: `s` is valid UTF-8.
++            return unsafe { char::from_u32_unchecked(cp) };
++        }
++        cp |= ((b & 0x3f) as u32) << shift;
++        shift += 6;
++    }
++}
++
+ #[derive(Clone)]
+ #[must_use = "iterators are lazy and do nothing unless consumed"]
+ #[stable(feature = "rust1", since = "1.0.0")]
+ pub struct Chars<'a> {
+-    pub(super) iter: slice::Iter<'a, u8>,
++    pub(super) s: &'a str,
++    pub(super) start: usize,
++    pub(super) end: usize,
+ }
+ 
+ #[stable(feature = "rust1", since = "1.0.0")]
+@@ -37,74 +103,48 @@
+ 
+     #[inline]
+     fn next(&mut self) -> Option<char> {
+-        // SAFETY: `str` invariant says `self.iter` is a valid UTF-8 string and
+-        // the resulting `ch` is a valid Unicode Scalar Value.
+-        unsafe { next_code_point(&mut self.iter).map(|ch| char::from_u32_unchecked(ch)) }
++        if self.start >= self.end {
++            return None;
++        }
++        let b0 = rcgjs_str_byte_at(self.s, self.start);
++        if b0 < 0x80 {
++            self.start += 1;
++            return Some(b0 as char);
++        }
++        Some(next_non_ascii_code_point(self.s, &mut self.start, b0))
+     }
+ 
+     #[inline]
+     fn count(self) -> usize {
+-        super::count::count_chars(self.as_str())
++        let mut n = 0;
++        let mut i = self.start;
++        while i < self.end {
++            if (rcgjs_str_byte_at(self.s, i) & 0xc0) != 0x80 {
++                n += 1;
++            }
++            i += 1;
++        }
++        n
+     }
+ 
+     #[inline]
+     fn advance_by(&mut self, mut remainder: usize) -> Result<(), NonZero<usize>> {
+-        const CHUNK_SIZE: usize = 32;
+-
+-        if remainder >= CHUNK_SIZE {
+-            let mut chunks = self.iter.as_slice().as_chunks::<CHUNK_SIZE>().0.iter();
+-            let mut bytes_skipped: usize = 0;
+-
+-            while remainder > CHUNK_SIZE
+-                && let Some(chunk) = chunks.next()
+-            {
+-                bytes_skipped += CHUNK_SIZE;
+-
+-                let mut start_bytes = [false; CHUNK_SIZE];
+-
+-                for i in 0..CHUNK_SIZE {
+-                    start_bytes[i] = !super::validations::utf8_is_cont_byte(chunk[i]);
+-                }
+-
+-                remainder -= start_bytes.into_iter().map(|i| i as u8).sum::<u8>() as usize;
+-            }
+-
+-            // SAFETY: The amount of bytes exists since we just iterated over them,
+-            // so advance_by will succeed.
+-            unsafe { self.iter.advance_by(bytes_skipped).unwrap_unchecked() };
+-
+-            // skip trailing continuation bytes
+-            while self.iter.len() > 0 {
+-                let b = self.iter.as_slice()[0];
+-                if !super::validations::utf8_is_cont_byte(b) {
+-                    break;
+-                }
+-                // SAFETY: We just peeked at the byte, therefore it exists
+-                unsafe { self.iter.advance_by(1).unwrap_unchecked() };
+-            }
+-        }
+-
+-        while (remainder > 0) && (self.iter.len() > 0) {
++        while remainder > 0 && self.start < self.end {
++            let b = rcgjs_str_byte_at(self.s, self.start);
++            self.start += super::validations::utf8_char_width(b);
+             remainder -= 1;
+-            let b = self.iter.as_slice()[0];
+-            let slurp = super::validations::utf8_char_width(b);
+-            // SAFETY: utf8 validity requires that the string must contain
+-            // the continuation bytes (if any)
+-            unsafe { self.iter.advance_by(slurp).unwrap_unchecked() };
+         }
+-
+         NonZero::new(remainder).map_or(Ok(()), Err)
+     }
+ 
+     #[inline]
+     fn size_hint(&self) -> (usize, Option<usize>) {
+-        let len = self.iter.len();
++        let len = self.end - self.start;
+         (len.div_ceil(4), Some(len))
+     }
+ 
+     #[inline]
+     fn last(mut self) -> Option<char> {
+-        // No need to go through the entire string.
+         self.next_back()
+     }
+ }
+@@ -123,9 +163,15 @@
+ impl<'a> DoubleEndedIterator for Chars<'a> {
+     #[inline]
+     fn next_back(&mut self) -> Option<char> {
+-        // SAFETY: `str` invariant says `self.iter` is a valid UTF-8 string and
+-        // the resulting `ch` is a valid Unicode Scalar Value.
+-        unsafe { next_code_point_reverse(&mut self.iter).map(|ch| char::from_u32_unchecked(ch)) }
++        if self.start >= self.end {
++            return None;
++        }
++        self.end -= 1;
++        let b = rcgjs_str_byte_at(self.s, self.end);
++        if b < 0x80 {
++            return Some(b as char);
++        }
++        Some(prev_non_ascii_code_point(self.s, &mut self.end, b))
+     }
+ }
+ 
+@@ -133,29 +179,11 @@
+ impl FusedIterator for Chars<'_> {}
+ 
+ impl<'a> Chars<'a> {
+-    /// Views the underlying data as a subslice of the original data.
+-    ///
+-    /// This has the same lifetime as the original slice, and so the
+-    /// iterator can continue to be used while this exists.
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```
+-    /// let mut chars = "abc".chars();
+-    ///
+-    /// assert_eq!(chars.as_str(), "abc");
+-    /// chars.next();
+-    /// assert_eq!(chars.as_str(), "bc");
+-    /// chars.next();
+-    /// chars.next();
+-    /// assert_eq!(chars.as_str(), "");
+-    /// ```
+     #[stable(feature = "iter_to_slice", since = "1.4.0")]
+     #[must_use]
+     #[inline]
+     pub fn as_str(&self) -> &'a str {
+-        // SAFETY: `Chars` is only made from a str, which guarantees the iter is valid UTF-8.
+-        unsafe { from_utf8_unchecked(self.iter.as_slice()) }
++        rcgjs_str_slice_unchecked(self.s, self.start, self.end)
+     }
+ }
+ 
+@@ -180,12 +208,12 @@
+ 
+     #[inline]
+     fn next(&mut self) -> Option<(usize, char)> {
+-        let pre_len = self.iter.iter.len();
++        let pre_len = self.iter.end - self.iter.start;
+         match self.iter.next() {
+             None => None,
+             Some(ch) => {
+                 let index = self.front_offset;
+-                let len = self.iter.iter.len();
++                let len = self.iter.end - self.iter.start;
+                 self.front_offset += pre_len - len;
+                 Some((index, ch))
+             }
+@@ -214,7 +242,7 @@
+     #[inline]
+     fn next_back(&mut self) -> Option<(usize, char)> {
+         self.iter.next_back().map(|ch| {
+-            let index = self.front_offset + self.iter.iter.len();
++            let index = self.front_offset + (self.iter.end - self.iter.start);
+             (index, ch)
+         })
+     }
+@@ -281,7 +309,11 @@
+ #[must_use = "iterators are lazy and do nothing unless consumed"]
+ #[stable(feature = "rust1", since = "1.0.0")]
+ #[derive(Clone, Debug)]
+-pub struct Bytes<'a>(pub(super) Copied<slice::Iter<'a, u8>>);
++pub struct Bytes<'a> {
++    pub(super) s: &'a str,
++    pub(super) start: usize,
++    pub(super) end: usize,
++}
+ 
+ #[stable(feature = "rust1", since = "1.0.0")]
+ impl Iterator for Bytes<'_> {
+@@ -289,74 +321,44 @@
+ 
+     #[inline]
+     fn next(&mut self) -> Option<u8> {
+-        self.0.next()
++        if self.start >= self.end {
++            return None;
++        }
++        let b = rcgjs_str_byte_at(self.s, self.start);
++        self.start += 1;
++        Some(b)
+     }
+ 
+     #[inline]
+     fn size_hint(&self) -> (usize, Option<usize>) {
+-        self.0.size_hint()
++        let len = self.end - self.start;
++        (len, Some(len))
+     }
+ 
+     #[inline]
+     fn count(self) -> usize {
+-        self.0.count()
++        self.end - self.start
+     }
+ 
+     #[inline]
+-    fn last(self) -> Option<Self::Item> {
+-        self.0.last()
++    fn last(mut self) -> Option<Self::Item> {
++        self.next_back()
+     }
+ 
+     #[inline]
+     fn nth(&mut self, n: usize) -> Option<Self::Item> {
+-        self.0.nth(n)
++        if n >= self.end - self.start {
++            self.start = self.end;
++            return None;
++        }
++        let i = self.start + n;
++        self.start = i + 1;
++        Some(rcgjs_str_byte_at(self.s, i))
+     }
+ 
+     #[inline]
+-    fn all<F>(&mut self, f: F) -> bool
+-    where
+-        F: FnMut(Self::Item) -> bool,
+-    {
+-        self.0.all(f)
+-    }
+-
+-    #[inline]
+-    fn any<F>(&mut self, f: F) -> bool
+-    where
+-        F: FnMut(Self::Item) -> bool,
+-    {
+-        self.0.any(f)
+-    }
+-
+-    #[inline]
+-    fn find<P>(&mut self, predicate: P) -> Option<Self::Item>
+-    where
+-        P: FnMut(&Self::Item) -> bool,
+-    {
+-        self.0.find(predicate)
+-    }
+-
+-    #[inline]
+-    fn position<P>(&mut self, predicate: P) -> Option<usize>
+-    where
+-        P: FnMut(Self::Item) -> bool,
+-    {
+-        self.0.position(predicate)
+-    }
+-
+-    #[inline]
+-    fn rposition<P>(&mut self, predicate: P) -> Option<usize>
+-    where
+-        P: FnMut(Self::Item) -> bool,
+-    {
+-        self.0.rposition(predicate)
+-    }
+-
+-    #[inline]
+     unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> u8 {
+-        // SAFETY: the caller must uphold the safety contract
+-        // for `Iterator::__iterator_get_unchecked`.
+-        unsafe { self.0.__iterator_get_unchecked(idx) }
++        rcgjs_str_byte_at(self.s, self.start + idx)
+     }
+ }
+ 
+@@ -364,33 +366,34 @@
+ impl DoubleEndedIterator for Bytes<'_> {
+     #[inline]
+     fn next_back(&mut self) -> Option<u8> {
+-        self.0.next_back()
++        if self.start >= self.end {
++            return None;
++        }
++        self.end -= 1;
++        Some(rcgjs_str_byte_at(self.s, self.end))
+     }
+ 
+     #[inline]
+     fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+-        self.0.nth_back(n)
++        if n >= self.end - self.start {
++            self.end = self.start;
++            return None;
++        }
++        self.end -= n + 1;
++        Some(rcgjs_str_byte_at(self.s, self.end))
+     }
+-
+-    #[inline]
+-    fn rfind<P>(&mut self, predicate: P) -> Option<Self::Item>
+-    where
+-        P: FnMut(&Self::Item) -> bool,
+-    {
+-        self.0.rfind(predicate)
+-    }
+ }
+ 
+ #[stable(feature = "rust1", since = "1.0.0")]
+ impl ExactSizeIterator for Bytes<'_> {
+     #[inline]
+     fn len(&self) -> usize {
+-        self.0.len()
++        self.end - self.start
+     }
+ 
+     #[inline]
+     fn is_empty(&self) -> bool {
+-        self.0.is_empty()
++        self.start >= self.end
+     }
+ }
+ 
+@@ -1519,7 +1522,7 @@
+ 
+     #[inline]
+     fn size_hint(&self) -> (usize, Option<usize>) {
+-        let len = self.chars.iter.len();
++        let len = self.chars.end - self.chars.start;
+         // The highest bytes:code units ratio occurs for 3-byte sequences,
+         // since a 4-byte sequence results in 2 code units. The lower bound
+         // is therefore determined by assuming the remaining bytes contain as
+diff -ru a/library/core/src/str/mod.rs b/library/core/src/str/mod.rs
+--- a/library/core/src/str/mod.rs	2026-11-22 22:01:59
++++ b/library/core/src/str/mod.rs	2026-11-22 22:01:59
+@@ -1076,7 +1076,7 @@
+     #[inline]
+     #[rustc_diagnostic_item = "str_chars"]
+     pub fn chars(&self) -> Chars<'_> {
+-        Chars { iter: self.as_bytes().iter() }
++        Chars { s: self, start: 0, end: self.len() }
+     }
+ 
+     /// Returns an iterator over the [`char`]s of a string slice, and their
+@@ -1156,7 +1156,7 @@
+     #[stable(feature = "rust1", since = "1.0.0")]
+     #[inline]
+     pub fn bytes(&self) -> Bytes<'_> {
+-        Bytes(self.as_bytes().iter().copied())
++        Bytes { s: self, start: 0, end: self.len() }
+     }
+ 
+     /// Splits a string slice by whitespace.
+diff -ru a/library/core/src/str/pattern.rs b/library/core/src/str/pattern.rs
+--- a/library/core/src/str/pattern.rs	2026-11-22 22:07:50
++++ b/library/core/src/str/pattern.rs	2026-11-22 22:07:50
+@@ -415,11 +415,11 @@
+         //    starts at the end and only decreases
+         let slice = unsafe { self.haystack.get_unchecked(old_finger..self.finger_back) };
+         let mut iter = slice.chars();
+-        let old_len = iter.iter.len();
++        let old_len = (iter.end - iter.start);
+         if let Some(ch) = iter.next() {
+             // add byte offset of current character
+             // without re-encoding as utf-8
+-            self.finger += old_len - iter.iter.len();
++            self.finger += old_len - (iter.end - iter.start);
+             if ch == self.needle {
+                 SearchStep::Match(old_finger, self.finger)
+             } else {
+@@ -497,11 +497,11 @@
+         // SAFETY: see the comment for next() above
+         let slice = unsafe { self.haystack.get_unchecked(self.finger..old_finger) };
+         let mut iter = slice.chars();
+-        let old_len = iter.iter.len();
++        let old_len = (iter.end - iter.start);
+         if let Some(ch) = iter.next_back() {
+             // subtract byte offset of current character
+             // without re-encoding as utf-8
+-            self.finger_back -= old_len - iter.iter.len();
++            self.finger_back -= old_len - (iter.end - iter.start);
+             if ch == self.needle {
+                 SearchStep::Match(self.finger_back, old_finger)
+             } else {
+@@ -715,9 +715,9 @@
+         let s = &mut self.char_indices;
+         // Compare lengths of the internal byte slice iterator
+         // to find length of current char
+-        let pre_len = s.iter.iter.len();
++        let pre_len = (s.iter.end - s.iter.start);
+         if let Some((i, c)) = s.next() {
+-            let len = s.iter.iter.len();
++            let len = (s.iter.end - s.iter.start);
+             let char_len = pre_len - len;
+             if self.char_eq.matches(c) {
+                 return SearchStep::Match(i, i + char_len);
+@@ -735,9 +735,9 @@
+         let s = &mut self.char_indices;
+         // Compare lengths of the internal byte slice iterator
+         // to find length of current char
+-        let pre_len = s.iter.iter.len();
++        let pre_len = (s.iter.end - s.iter.start);
+         if let Some((i, c)) = s.next_back() {
+-            let len = s.iter.iter.len();
++            let len = (s.iter.end - s.iter.start);
+             let char_len = pre_len - len;
+             if self.char_eq.matches(c) {
+                 return SearchStep::Match(i, i + char_len);

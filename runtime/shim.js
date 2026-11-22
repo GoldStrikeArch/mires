@@ -2876,6 +2876,7 @@ globalThis.__rt.bstr_bytes = (s) => {
     for (let i = 0; i < n; i++) bytes[i] = s.charCodeAt(i);
     return { buf: bytes, off: 0, len: n };
   }
+  if (globalThis.__rt._bsub_prop === null) globalThis.__rt._bsub_prop = _bstr_sub_propagate;
   if (s === _bsub_k0) return _bsub_v0;
   if (s === _bsub_k1) return _bsub_v1;
   if (s === _bsub_k2) return _bsub_v2;
@@ -2891,6 +2892,33 @@ globalThis.__rt.bstr_bytes = (s) => {
   _bstr_memo_put(memo.map, s, record, n);
   return record;
 };
+
+function _bstr_sub_propagate(s, start, sub) {
+  let parent;
+  if (s === _bsub_k0) parent = _bsub_v0;
+  else if (s === _bsub_k1) parent = _bsub_v1;
+  else if (s === _bsub_k2) parent = _bsub_v2;
+  else if (s === _bsub_k3) parent = _bsub_v3;
+  else parent = globalThis.__rt._bstr_memo.map.get(s);
+  if (parent === undefined) return;
+  if (_bsub_arm !== undefined) _bsub_arm();
+  if (_bsub_clear === undefined) _bsub_clear = globalThis.__rt._bstr_sub_reset;
+  const slot = { buf: parent.buf, off: parent.off + start, len: sub.length };
+  if (_bsub_i === 0) {
+    _bsub_k0 = sub;
+    _bsub_v0 = slot;
+  } else if (_bsub_i === 1) {
+    _bsub_k1 = sub;
+    _bsub_v1 = slot;
+  } else if (_bsub_i === 2) {
+    _bsub_k2 = sub;
+    _bsub_v2 = slot;
+  } else {
+    _bsub_k3 = sub;
+    _bsub_v3 = slot;
+  }
+  _bsub_i = (_bsub_i + 1) & 3;
+}
 
 // bstr_utf8_bytes(s): `{ buf, off, len }` of host UTF-16 string `s` encoded as
 // UTF-8 in a single pass, fusing `bstr_bytes(bstr_in(s))`. ASCII fills a plain
@@ -2988,6 +3016,10 @@ globalThis.__rt.bstr_boundary = (text, index) =>
   Number.isInteger(index) && index >= 0 && index <= text.length &&
   (index === text.length || (text.charCodeAt(index) & 0xc0) !== 0x80);
 
+// Set lazily by `bstr_bytes` so `bstr_get*` does not pull `_bstr_memo` or
+// `_bstr_sub_propagate` when a bundle never calls `bstr_bytes`.
+globalThis.__rt._bsub_prop = null;
+
 // bstr_get*, shared `str::get` / `&s[a..b]` slice-and-boundary helpers: return
 // the substring when valid, or `undefined` otherwise.
 globalThis.__rt.bstr_get = (s, start, end) => {
@@ -2999,7 +3031,9 @@ globalThis.__rt.bstr_get = (s, start, end) => {
     (start === len || (s.charCodeAt(start) & 0xc0) !== 0x80) &&
     (end === len || (s.charCodeAt(end) & 0xc0) !== 0x80)
   ) {
-    return s.slice(start, end);
+    const sub = s.slice(start, end);
+    if (globalThis.__rt._bsub_prop !== null && sub.length > 64) globalThis.__rt._bsub_prop(s, start, sub);
+    return sub;
   }
   return undefined;
 };
@@ -3007,7 +3041,9 @@ globalThis.__rt.bstr_get = (s, start, end) => {
 globalThis.__rt.bstr_get_from = (s, start) => {
   const len = s.length;
   if (start >= 0 && start <= len && (start === len || (s.charCodeAt(start) & 0xc0) !== 0x80)) {
-    return s.slice(start);
+    const sub = s.slice(start);
+    if (globalThis.__rt._bsub_prop !== null && sub.length > 64) globalThis.__rt._bsub_prop(s, start, sub);
+    return sub;
   }
   return undefined;
 };
@@ -3015,7 +3051,9 @@ globalThis.__rt.bstr_get_from = (s, start) => {
 globalThis.__rt.bstr_get_to = (s, end) => {
   const len = s.length;
   if (end >= 0 && end <= len && (end === len || (s.charCodeAt(end) & 0xc0) !== 0x80)) {
-    return s.slice(0, end);
+    const sub = s.slice(0, end);
+    if (globalThis.__rt._bsub_prop !== null && sub.length > 64) globalThis.__rt._bsub_prop(s, 0, sub);
+    return sub;
   }
   return undefined;
 };
@@ -6602,3 +6640,66 @@ globalThis.__rt.i2f32_big = (x) => {
   const scaled = Number(q | sticky) * Math.pow(2, bits - 53);
   return Math.fround(neg ? -scaled : scaled);
 };
+
+// slice_sort(buf, off, len, isLess, cmpFn, isIndirect): host-delegated
+// `slice::sort*` and `slice::sort_unstable*`. Uses a spec-stable iterative
+// bottom-up merge sort over an index array so ES2018 stability is guaranteed
+// and no element moves until every comparison returns (exact 1x drop &
+// interior-mutability preservation if `cmpFn` throws/panics, and always a valid
+// permutation even for inconsistent/NaN comparators).
+globalThis.__rt.slice_sort = (buf, off, len, isLess, cmpFn, isIndirect) => {
+  if (len < 2) return;
+  let a = new Array(len);
+  let b = new Array(len);
+  for (let i = 0; i < len; i++) a[i] = i;
+  const ref = isIndirect
+    ? (i) => buf[off + i]
+    : (i) => ({ buf: buf, off: off + i });
+  for (let w = 1; w < len; w *= 2) {
+    for (let lo = 0; lo < len; lo += 2 * w) {
+      const mid = lo + w < len ? lo + w : len;
+      const hi = lo + 2 * w < len ? lo + 2 * w : len;
+      let i = lo;
+      let j = mid;
+      let k = lo;
+      if (mid < hi && cmpFn(isLess, ref(a[mid]), ref(a[mid - 1]))) {
+        while (i < mid && j < hi) {
+          b[k++] = cmpFn(isLess, ref(a[j]), ref(a[i])) ? a[j++] : a[i++];
+        }
+      }
+      while (i < mid) b[k++] = a[i++];
+      while (j < hi) b[k++] = a[j++];
+    }
+    const t = a;
+    a = b;
+    b = t;
+  }
+  const tmp = new Array(len);
+  for (let i = 0; i < len; i++) tmp[i] = buf[off + i];
+  const boxes = globalThis.__rt._boxes;
+  const track = boxes !== null && isIndirect && globalThis.__rt._blk_get(buf) !== undefined;
+  for (let i = 0; i < len; i++) {
+    const val = tmp[a[i]];
+    buf[off + i] = val;
+    if (track && val !== null && typeof val === "object") {
+      boxes.set(val, { buf: buf, off: off + i });
+    }
+  }
+};
+
+// Host-delegated Unicode case mapping for `alloc::str::{to_lowercase,to_uppercase}`.
+// `host_str_to_*` is called via `extern "C"` from `alloc/src/str.rs` (arguments and
+// returns already cross `bstr_out`/`bstr_in` under `js-str=bytes`); `str_to_*` /
+// `bstr_to_*` are used directly by native String lowering with an ASCII fast path.
+globalThis.__rt.host_str_to_lowercase = (s) => s.toLowerCase();
+globalThis.__rt.host_str_to_uppercase = (s) => s.toUpperCase();
+globalThis.__rt.str_to_lowercase = (s) => globalThis.__rt.native_str_wf(s).toLowerCase();
+globalThis.__rt.str_to_uppercase = (s) => globalThis.__rt.native_str_wf(s).toUpperCase();
+globalThis.__rt.bstr_to_lowercase = (s) =>
+  globalThis.__rt._bstr_is_ascii(s)
+    ? s.toLowerCase()
+    : globalThis.__rt.bstr_in(globalThis.__rt.bstr_out(s).toLowerCase());
+globalThis.__rt.bstr_to_uppercase = (s) =>
+  globalThis.__rt._bstr_is_ascii(s)
+    ? s.toUpperCase()
+    : globalThis.__rt.bstr_in(globalThis.__rt.bstr_out(s).toUpperCase());

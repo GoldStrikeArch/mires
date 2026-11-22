@@ -2014,6 +2014,9 @@ impl Planner<'_> {
             return false;
         };
         match body.semantic {
+            BodySemantic::Standard(
+                StandardOperation::SliceSort | StandardOperation::SliceSortCmp,
+            ) => false,
             BodySemantic::Standard(_) => true,
             BodySemantic::DropGlue(ty) => item
                 .jir

@@ -395,6 +395,12 @@ mod ops {
         fmt::legality_bool_to_string, fmt::primitive_to_string, &[], 70, FIXTURE_72);
     op!(CHAR_TO_STRING, CharToString, 1, RESULT_STRING, HOST_OR_BUILDER, PURE,
         fmt::legality_char_to_string, fmt::primitive_to_string, &["str_len"], 80, FIXTURE_72);
+    op!(STR_TO_LOWERCASE, StrToLowercase, 1, RESULT_STRING, HOST_OR_BUILDER, PURE,
+        fmt::legality_str_case, fmt::str_case_to_string,
+        &["str_to_lowercase", "str_len"], 80, FIXTURE_72);
+    op!(STR_TO_UPPERCASE, StrToUppercase, 1, RESULT_STRING, HOST_OR_BUILDER, PURE,
+        fmt::legality_str_case, fmt::str_case_to_string,
+        &["str_to_uppercase", "str_len"], 80, FIXTURE_72);
     op!(FORMAT_ARGUMENT_NEW_DISPLAY, FormatArgumentNewDisplay, 1, NO_SLOTS, HOST_OR_BUILDER, PURE,
         fmt::legality_argument_new_display, fmt::format_argument_new_display,
         &["native_f64_to_string", "native_f32_to_string", "fmt_float_fixed", "fmt_int_dec", "native_str_wf"], 70, FIXTURE_72);
@@ -490,6 +496,8 @@ pub fn registry(operation: StandardOperation) -> Option<&'static SemanticOp> {
         StandardOperation::IntToString => &INT_TO_STRING,
         StandardOperation::BoolToString => &BOOL_TO_STRING,
         StandardOperation::CharToString => &CHAR_TO_STRING,
+        StandardOperation::StrToLowercase => &STR_TO_LOWERCASE,
+        StandardOperation::StrToUppercase => &STR_TO_UPPERCASE,
         StandardOperation::FormatArgumentNewDisplay => &FORMAT_ARGUMENT_NEW_DISPLAY,
         StandardOperation::FormatArgumentNewLowerHex => &FORMAT_ARGUMENT_NEW_LOWER_HEX,
         StandardOperation::FormatArgumentNewUpperHex => &FORMAT_ARGUMENT_NEW_UPPER_HEX,

@@ -39,6 +39,13 @@ pub fn lower_with_ascii(
     let physical = input
         .abi
         .and_then(|abi| abi.target_signature(input.name, func.item));
+    if input.body.semantic
+        == BodySemantic::Standard(rcgjs_object::jir::semantic::StandardOperation::SliceSort)
+    {
+        if let Some(lowered) = try_lower_slice_sort(input, func, physical)? {
+            return Ok(lowered);
+        }
+    }
     let cx = JsCx::new(
         func,
         plan,
@@ -341,6 +348,108 @@ pub fn lower_with_ascii(
         allocation_origins,
         input.bigints,
     )
+}
+
+/// Host-delegated lowering for `core::slice::sort::{stable,unstable}::sort`
+/// (`StandardOperation::SliceSort`). Replaces the fallback insertion-sort body with a direct call
+/// to `__rt.slice_sort(v.buf, v.off, v.len, is_less, cmp_fn, is_indirect)` (or a bare `return;`
+/// for ZST element types), keeping `cmp_fn` as the sole item reference.
+fn try_lower_slice_sort(
+    input: &LowerInput<'_>,
+    func: &Func,
+    physical: Option<&crate::plan::abi_flat::FlatSig>,
+) -> Result<Option<LoweredItem>, Decline> {
+    use rcgjs_object::jir::repr::OpKind;
+    use rcgjs_object::jir::semantic::{CallSemantic, Callee, StandardOperation};
+    use rcgjs_object::jir::types::TypeKind;
+
+    if physical.is_some()
+        || func.params.len() != 2
+        || func.sig.abi.caller_location
+        || func.sig.abi.spread.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(&slice_ref_ty) = func.sig.arguments.first() else {
+        return Ok(None);
+    };
+    let Some(TypeKind::Reference {
+        pointee,
+        mutable: true,
+    }) = input.table.get(slice_ref_ty).map(|d| &d.kind)
+    else {
+        return Ok(None);
+    };
+    let Some(TypeKind::Slice(elem_ty)) = input.table.get(*pointee).map(|d| &d.kind) else {
+        return Ok(None);
+    };
+    let Some(elem_desc) = input.table.get(*elem_ty) else {
+        return Ok(None);
+    };
+    if !elem_desc.layout.sized {
+        return Ok(None);
+    }
+    let params = vec!["_v".to_owned(), "_is_less".to_owned()];
+    if elem_desc.layout.zst {
+        let decl = jsast::function(input.name.as_str(), params, vec![jsast::ret_void()]);
+        return finish(
+            input,
+            decl,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            input.bigints,
+        )
+        .map(Some);
+    }
+    let mut cmp_target = None;
+    'search: for block in &func.blocks {
+        for op in &block.ops {
+            if let OpKind::Call {
+                callee: Callee::Direct { item, link_name },
+                semantic: CallSemantic::Standard(StandardOperation::SliceSortCmp),
+                ..
+            } = &op.kind
+            {
+                cmp_target = Some((*item, *link_name));
+                break 'search;
+            }
+        }
+    }
+    let Some((cmp_item, cmp_link_name)) = cmp_target else {
+        return Ok(None);
+    };
+    let cmp_name = match input.call_retargets.get(&cmp_item) {
+        Some(name) => name.as_str().to_owned(),
+        None => {
+            let Some(name) = input.interns.str(cmp_link_name) else {
+                return Ok(None);
+            };
+            name.to_owned()
+        }
+    };
+    let is_indirect = input.table.is_indirect(*elem_ty);
+    let call = jsast::rt_call(
+        "slice_sort",
+        vec![
+            jsast::member(jsast::id("_v"), "buf"),
+            jsast::member(jsast::id("_v"), "off"),
+            jsast::member(jsast::id("_v"), "len"),
+            jsast::id("_is_less"),
+            jsast::id(cmp_name),
+            jsast::boolean(is_indirect),
+        ],
+    );
+    let decl = jsast::function(input.name.as_str(), params, vec![jsast::expr_stmt(call)]);
+    finish(
+        input,
+        decl,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        input.bigints,
+    )
+    .map(Some)
 }
 
 /// A `static`: `let NAME = <value>`, boxed as `[value]` when the type is direct

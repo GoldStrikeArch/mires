@@ -384,6 +384,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             self.instance().args,
         )
         .map(standard_operation_v2)
+        .or_else(|| jir_standard_operation(self.tcx(), self.instance().def_id()))
         .map_or(BodySemantic::Ordinary, BodySemantic::Standard))
     }
 
@@ -970,6 +971,9 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             {
                 return call_semantic_for_operation(standard_operation_v2(operation));
             }
+            if let Some(operation) = jir_standard_operation(tcx, instance.def_id()) {
+                return CallSemantic::Standard(operation);
+            }
             if matches!(instance.def, ty::InstanceKind::Item(_)) {
                 if let Some(operation) = str_operation(tcx, instance.def_id(), instance.args) {
                     return CallSemantic::Standard(operation);
@@ -978,6 +982,9 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         }
         if let Some(operation) = crate::late_ir::standard_operation(tcx, definition, arguments) {
             return call_semantic_for_operation(standard_operation_v2(operation));
+        }
+        if let Some(operation) = jir_standard_operation(tcx, definition) {
+            return CallSemantic::Standard(operation);
         }
         if crate::js_extern::extern_section(tcx, definition).is_some() {
             return CallSemantic::Host;
@@ -2296,11 +2303,41 @@ pub(crate) fn item_id<'tcx>(cgu: &CguCx<'tcx>, instance: Instance<'tcx>) -> Item
 /// `core::ops` shapes). Anything else, a user method of the same name included, is untagged.
 /// One method of `impl [u8]` joins them, `is_ascii` (`&[u8] -> bool`), which `str::is_ascii` is
 /// written with: an inherent impl of a primitive type is one only `core` can write.
+/// JIR-only standard-library operations identified strictly by rustc diagnostic items
+/// (`patches/0016-host-sort-and-case-mapping.patch`).
+fn jir_standard_operation(tcx: TyCtxt<'_>, definition: DefId) -> Option<StandardOperation> {
+    use rustc_span::Symbol;
+    if tcx.is_diagnostic_item(Symbol::intern("rcgjs_slice_stable_sort"), definition)
+        || tcx.is_diagnostic_item(Symbol::intern("rcgjs_slice_unstable_sort"), definition)
+    {
+        return Some(StandardOperation::SliceSort);
+    }
+    if tcx.is_diagnostic_item(Symbol::intern("rcgjs_slice_sort_cmp"), definition) {
+        return Some(StandardOperation::SliceSortCmp);
+    }
+    if tcx.is_diagnostic_item(Symbol::intern("rcgjs_str_to_lowercase"), definition) {
+        return Some(StandardOperation::StrToLowercase);
+    }
+    if tcx.is_diagnostic_item(Symbol::intern("rcgjs_str_to_uppercase"), definition) {
+        return Some(StandardOperation::StrToUppercase);
+    }
+    None
+}
+
 fn str_operation<'tcx>(
     tcx: TyCtxt<'tcx>,
     definition: DefId,
     arguments: ty::GenericArgsRef<'tcx>,
 ) -> Option<StandardOperation> {
+    if tcx.is_diagnostic_item(rustc_span::Symbol::intern("rcgjs_str_byte_at"), definition) {
+        return Some(StandardOperation::StrByteAt);
+    }
+    if tcx.is_diagnostic_item(
+        rustc_span::Symbol::intern("rcgjs_str_slice_unchecked"),
+        definition,
+    ) {
+        return Some(StandardOperation::StrSliceUnchecked);
+    }
     let associated = tcx.opt_associated_item(definition)?;
     let trait_id = match associated.container {
         ty::AssocContainer::InherentImpl => None,

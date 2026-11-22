@@ -603,10 +603,21 @@ fn classify_call_result(
             {
                 return Rule::Root;
             }
+            StandardOperation::StrToLowercase | StandardOperation::StrToUppercase
+                if r_ty == AsciiType::HostString =>
+            {
+                if let Some(&recv) = args.first() {
+                    if val_types[recv.0 as usize] == AsciiType::SharedStr {
+                        return Rule::Single(recv);
+                    }
+                }
+                return Rule::Never;
+            }
             StandardOperation::StrIndex
             | StandardOperation::StrTrim
             | StandardOperation::StrTrimStart
             | StandardOperation::StrTrimEnd
+            | StandardOperation::StrSliceUnchecked
                 if r_ty == AsciiType::SharedStr =>
             {
                 if let Some(&recv) = args.first() {

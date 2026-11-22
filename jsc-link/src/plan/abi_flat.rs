@@ -1816,6 +1816,11 @@ fn canonical_clone_allowed(
             Some(BodySemantic::Standard(operation))
                 if crate::lower::semantic_ops::fmt_kernel::is_format_machinery(operation)
                     || crate::lower::semantic_ops::num::is_float_from_str(operation)
+                    || matches!(
+                        operation,
+                        crate::jir::semantic::StandardOperation::SliceSort
+                            | crate::jir::semantic::StandardOperation::SliceSortCmp
+                    )
         )
 }
 
@@ -1846,11 +1851,18 @@ fn refuses(
     // (`lower/semantic_ops/fmt_kernel.rs`): a flattened `Arguments::new` caller would no longer
     // match a proven site, and the items are about to be dropped wherever the kernel commits.
     // Host-delegated float `FromStr` bodies return a canonical `Result` directly from JS.
+    // `SliceSort` / `SliceSortCmp` keep their exact 2-arg / 3-arg JS signatures so `SliceSort`
+    // can pass `SliceSortCmp` directly as a callback to `__rt.slice_sort`.
     if matches!(
         semantic,
         Some(BodySemantic::Standard(operation))
             if crate::lower::semantic_ops::fmt_kernel::is_format_machinery(operation)
                 || crate::lower::semantic_ops::num::is_float_from_str(operation)
+                || matches!(
+                    operation,
+                    crate::jir::semantic::StandardOperation::SliceSort
+                        | crate::jir::semantic::StandardOperation::SliceSortCmp
+                )
     ) {
         return Some(BoundaryDecline::NonCallReference);
     }

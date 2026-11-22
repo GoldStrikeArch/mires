@@ -1649,6 +1649,8 @@ fn witness_sysroot_shim_is_non_throwing(sym: &str) -> bool {
             | "convert_block_sv"
             | "convert_sv_nv"
             | "ptr_is_null"
+            | "host_str_to_lowercase"
+            | "host_str_to_uppercase"
     )
 }
 

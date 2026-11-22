@@ -953,6 +953,9 @@ impl<'a> Collector<'a> {
             .and_then(|item| item.jir.body.as_ref())
             .map(|body| body.semantic);
         match semantic {
+            Some(BodySemantic::Standard(
+                StandardOperation::SliceSort | StandardOperation::SliceSortCmp,
+            )) => {}
             Some(BodySemantic::Standard(operation)) => {
                 self.summarize_standard(name, func, types, operation);
                 return;

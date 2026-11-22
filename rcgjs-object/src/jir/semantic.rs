@@ -241,6 +241,18 @@ pub enum StandardOperation {
     F64FromStr,
     /// `<f32 as core::str::FromStr>::from_str`.
     F32FromStr,
+    /// `core::slice::sort::{stable,unstable}::sort` (`rcgjs_slice_{stable,unstable}_sort`).
+    SliceSort,
+    /// `core::slice::sort::shared::rcgjs_sort_cmp` (`rcgjs_slice_sort_cmp`).
+    SliceSortCmp,
+    /// `alloc::str::to_lowercase` (`rcgjs_str_to_lowercase`).
+    StrToLowercase,
+    /// `alloc::str::to_uppercase` (`rcgjs_str_to_uppercase`).
+    StrToUppercase,
+    /// `core::str::iter::rcgjs_str_byte_at` (`js-str=bytes` direct `charCodeAt` read).
+    StrByteAt,
+    /// `core::str::iter::rcgjs_str_slice_unchecked` (`js-str=bytes` direct `slice` subslice).
+    StrSliceUnchecked,
 }
 
 impl StandardOperation {
@@ -267,6 +279,8 @@ impl StandardOperation {
                 | Self::StrPartialCmp
                 | Self::StrIsAscii
                 | Self::SliceIsAscii
+                | Self::StrByteAt
+                | Self::StrSliceUnchecked
         )
     }
 }

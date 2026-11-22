@@ -961,3 +961,85 @@ test("minimal-shim ptr_eq/addr (_bv === null), scaled realloc non-scalar abort, 
   assert.equal(scTyped.buf[0], 0x11229944);
   rt.dealloc(scRaw, 8, 4);
 });
+
+test("slice_sort is spec-stable, updates _boxes on heap blocks, preserves buf on throw, and handles _bsub_* propagation + bstr case mapping", () => {
+  // 1. Stability & subslice offset on direct elements
+  const direct = [99, 3, 1, 2, 1, 0, -5];
+  rt.slice_sort(direct, 1, 5, undefined, (_ctx, a, b) => a.buf[a.off] < b.buf[b.off], false);
+  assert.deepEqual(direct, [99, 0, 1, 1, 2, 3, -5]);
+
+  // 2. Stability & _boxes tracking on indirect heap block objects
+  const raw = rt.alloc(32, 8);
+  const typed = rt.unscale(raw, 8, () => ({ k: 0, id: 0 }));
+  const objs = [
+    { k: 2, id: 1 },
+    { k: 1, id: 2 },
+    { k: 2, id: 3 },
+    { k: 0, id: 4 },
+  ];
+  for (let i = 0; i < 4; i++) {
+    typed.buf[i] = objs[i];
+    rt._boxes.set(objs[i], { buf: typed.buf, off: i });
+  }
+  rt.slice_sort(typed.buf, 0, 4, undefined, (_ctx, a, b) => a.k < b.k, true);
+  assert.deepEqual(typed.buf.map((o) => o.id), [4, 2, 1, 3]);
+  for (let i = 0; i < 4; i++) {
+    const slot = rt._boxes.get(typed.buf[i]);
+    assert.equal(slot.buf, typed.buf);
+    assert.equal(slot.off, i);
+  }
+  rt.dealloc(raw, 32, 8);
+
+  // 3. Throwing comparator leaves buf completely untouched with interior mutations preserved
+  const items = [{ k: 3, seen: 0 }, { k: 1, seen: 0 }, { k: 2, seen: 0 }];
+  let calls = 0;
+  assert.throws(() => {
+    rt.slice_sort(
+      items,
+      0,
+      3,
+      undefined,
+      (_ctx, a, b) => {
+        a.seen += 1;
+        b.seen += 1;
+        calls += 1;
+        if (calls === 2) throw new Error("cmp-throw");
+        return a.k < b.k;
+      },
+      true,
+    );
+  }, /cmp-throw/);
+  assert.deepEqual(items.map((x) => x.k), [3, 1, 2]);
+  assert.equal(items.reduce((acc, x) => acc + x.seen, 0), 4);
+
+  // 4. _bsub_* parent-slice propagation in bstr_get / bstr_get_from / bstr_get_to
+  const base = "abcdefghij".repeat(20); // 200 bytes > 64
+  const baseView = rt.bstr_bytes(base);
+  const tail1 = rt.bstr_get_from(base, 17);
+  const view1 = rt.bstr_bytes(tail1);
+  assert.equal(view1.buf, baseView.buf);
+  assert.equal(view1.off, 17);
+  assert.equal(view1.len, 183);
+  const mid = rt.bstr_get(tail1, 10, 120);
+  const view2 = rt.bstr_bytes(mid);
+  assert.equal(view2.buf, baseView.buf);
+  assert.equal(view2.off, 27);
+  assert.equal(view2.len, 110);
+  const head = rt.bstr_get_to(mid, 90);
+  const view3 = rt.bstr_bytes(head);
+  assert.equal(view3.buf, baseView.buf);
+  assert.equal(view3.off, 27);
+  assert.equal(view3.len, 90);
+
+  // 5. minimal-shim tree-shaking: bstr_get alone does NOT pull _bstr_memo
+  const shimSrc = readFileSync(new URL("../runtime/shim.js", import.meta.url), "utf8");
+  const getOnly = minimalShim([], shimSrc, { direct: ["bstr_get_from", "bstr_get", "bstr_get_to"] });
+  assert.equal(getOnly.source.includes("_bstr_memo"), false);
+  assert.equal(getOnly.source.includes("_bstr_sub_propagate"), false);
+
+  // 6. bstr_to_lowercase / bstr_to_uppercase (ASCII fast path + Greek Final Sigma)
+  assert.equal(rt.bstr_to_lowercase("Hello WORLD 123"), "hello world 123");
+  assert.equal(rt.bstr_to_uppercase("Hello world 123"), "HELLO WORLD 123");
+  assert.equal(rt.bstr_out(rt.bstr_to_lowercase(rt.bstr_in("ΟΣ ΟΣΑ Σ"))), "ος οσα σ");
+  assert.equal(rt.bstr_out(rt.bstr_to_uppercase(rt.bstr_in("tschüß"))), "TSCHÜSS");
+});

@@ -701,6 +701,17 @@ impl JsCx<'_> {
             (StandardOperation::StrLen, [s]) if is_str(*s)? => {
                 jsast::member(string(*s, &mut prelude, &mut hold)?, "length")
             }
+            (StandardOperation::StrByteAt, [s, index]) if is_str(*s)? => {
+                let s = string(*s, &mut prelude, &mut hold)?;
+                let index = hold(self.expr_of(*index)?, &mut prelude);
+                jsast::method_call(s, "charCodeAt", vec![index])
+            }
+            (StandardOperation::StrSliceUnchecked, [s, start, end]) if is_str(*s)? => {
+                let s = string(*s, &mut prelude, &mut hold)?;
+                let start = hold(self.expr_of(*start)?, &mut prelude);
+                let end = hold(self.expr_of(*end)?, &mut prelude);
+                jsast::method_call(s, "slice", vec![start, end])
+            }
             // A byte string is ASCII when every code unit is; `core`'s word-at-a-time scan would
             // first build the string's byte array and then read it through scalar views.
             (StandardOperation::StrIsAscii, [s]) if is_str(*s)? => {

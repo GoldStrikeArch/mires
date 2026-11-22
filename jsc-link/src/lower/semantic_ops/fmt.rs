@@ -77,6 +77,28 @@ pub(super) fn primitive_to_string(
     }
 }
 
+/// `str::to_lowercase` / `str::to_uppercase`: host Unicode case mapping, returning `HostString`
+/// or exact-fit `StringBuilder`. `bstr::rewrite` swaps `str_to_*` -> `bstr_to_*` under
+/// `js-str=bytes`.
+pub(super) fn str_case_to_string(
+    cx: &LowerCx<'_>,
+    carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    let helper = match cx.semantic {
+        crate::jir::semantic::BodySemantic::Standard(StandardOperation::StrToLowercase) => {
+            "str_to_lowercase"
+        }
+        crate::jir::semantic::BodySemantic::Standard(StandardOperation::StrToUppercase) => {
+            "str_to_uppercase"
+        }
+        _ => return Err(SemanticDecline::NotAStandardOperation),
+    };
+    helpers.insert(helper);
+    owned_native_string(jsast::rt_call(helper, vec![receiver()]), carrier, helpers)
+}
+
 /// `Argument::new_display` for a proven default-Display value: the argument's host text.
 pub(super) fn format_argument_new_display(
     cx: &LowerCx<'_>,
@@ -430,6 +452,11 @@ pub(super) fn legality_bool_to_string(cx: &LowerCx<'_>) -> Result<(), SemanticDe
 
 pub(super) fn legality_char_to_string(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
     shared_pointee_matches(cx, |kind| matches!(kind, TypeKind::Char))?;
+    legality_string_return(cx)
+}
+
+pub(super) fn legality_str_case(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    shared_pointee_matches(cx, |kind| matches!(kind, TypeKind::Str))?;
     legality_string_return(cx)
 }
 

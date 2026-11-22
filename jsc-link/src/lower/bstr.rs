@@ -1850,6 +1850,8 @@ fn twin(member: &str) -> Option<&'static str> {
         "convert_str_block" => "bstr_block",
         "convert_sb_block" => "bstr_sb_block",
         "_sb_check" => "bstr_sb_check",
+        "str_to_lowercase" => "bstr_to_lowercase",
+        "str_to_uppercase" => "bstr_to_uppercase",
         _ => return None,
     })
 }
@@ -1871,6 +1873,8 @@ const HYBRID_HELPERS: &[&str] = &[
     "convert_str_block",
     "convert_sb_block",
     "_sb_check",
+    "str_to_lowercase",
+    "str_to_uppercase",
 ];
 
 /// The first hybrid helper `js` still names, if any.
@@ -2559,5 +2563,27 @@ mod tests {
         assert!(!reaches_str(&table, tuple_mut_id));
         assert!(!reaches_str(&table, box_str_id));
         assert!(!reaches_str(&table, tuple_box_id));
+    }
+
+    #[test]
+    fn rewrites_str_case_helpers_and_catches_leftovers() {
+        let mut stmt = jsast::ret(jsast::binary(
+            jsast::BinOp::Add,
+            rt("str_to_lowercase", vec![jsast::id("a")]),
+            rt("str_to_uppercase", vec![jsast::id("b")]),
+        ));
+        rewrite(&mut stmt);
+        let printed = jsast::program_to_string(std::slice::from_ref(&stmt));
+        assert!(printed.contains("__rt.bstr_to_lowercase(a)"), "{printed}");
+        assert!(printed.contains("__rt.bstr_to_uppercase(b)"), "{printed}");
+        assert_eq!(leftover_helper(&printed), None, "{printed}");
+        assert_eq!(
+            leftover_helper("__rt.str_to_lowercase(s)"),
+            Some("str_to_lowercase")
+        );
+        assert_eq!(
+            leftover_helper("__rt.str_to_uppercase(s)"),
+            Some("str_to_uppercase")
+        );
     }
 }

@@ -175,6 +175,8 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "convert_block_sv"
             | "convert_sv_nv"
             | "ptr_is_null"
+            | "host_str_to_lowercase"
+            | "host_str_to_uppercase"
     )
 }
 
