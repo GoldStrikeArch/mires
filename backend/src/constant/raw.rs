@@ -331,15 +331,29 @@ pub(crate) enum StaticPathStep {
     Index(u32),
 }
 
+/// Peels patterns and ONLY non-union transparent wrappers (`#[repr(transparent)]` structs,
+/// `UnsafeCell`, `Cell`, `ManuallyDrop`, `NonNull`, `Box`, packed single-field newtypes), stopping
+/// at any `union` (`MaybeUninit<T>`, user 1-live-field unions) so a static pointer never silently
+/// crosses a union boundary.
+fn peel_non_union_transparent<'tcx>(tcx: TyCtxt<'tcx>, mut ty: Ty<'tcx>) -> Ty<'tcx> {
+    ty = crate::value::peel_pattern(ty);
+    for _ in 0..16 {
+        if matches!(ty.kind(), ty::Adt(def, _) if def.is_union()) {
+            break;
+        }
+        let Some((_, field_ty)) = crate::value::transparent_field_indexed(tcx, ty) else {
+            break;
+        };
+        ty = crate::value::peel_pattern(field_ty);
+    }
+    ty
+}
+
 /// Whether `cur_ty` and `pointee` have the same JS value shape and boxing (`peel_transparent` /
-/// `peel_pattern` / `is_indirect`).
+/// `peel_pattern` / `is_indirect`) without crossing any union (`MaybeUninit` / `union`) boundary.
 fn static_types_match<'tcx>(tcx: TyCtxt<'tcx>, cur_ty: Ty<'tcx>, pointee: Ty<'tcx>) -> bool {
-    let cur_peeled = tcx.erase_and_anonymize_regions(crate::value::peel_pattern(
-        crate::value::peel_transparent(tcx, cur_ty),
-    ));
-    let pointee_peeled = tcx.erase_and_anonymize_regions(crate::value::peel_pattern(
-        crate::value::peel_transparent(tcx, pointee),
-    ));
+    let cur_peeled = tcx.erase_and_anonymize_regions(peel_non_union_transparent(tcx, cur_ty));
+    let pointee_peeled = tcx.erase_and_anonymize_regions(peel_non_union_transparent(tcx, pointee));
     cur_peeled == pointee_peeled
         && crate::value::is_indirect(tcx, cur_ty) == crate::value::is_indirect(tcx, pointee)
 }

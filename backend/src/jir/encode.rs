@@ -1483,7 +1483,10 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             }
             mir::ConstValue::Slice { alloc_id, meta } => {
                 if let GlobalAlloc::Static(def_id) = tcx.global_alloc(alloc_id) {
-                    let pointee = ty.peel_refs();
+                    let pointee =
+                        crate::value::peel_pattern(crate::value::peel_transparent(tcx, ty))
+                            .builtin_deref(true)
+                            .unwrap_or_else(|| ty.peel_refs());
                     let (peeled, offset) = self.peel_transparent_at(pointee);
                     if let ty::Slice(element) = peeled.kind() {
                         return Ok(Constant::Memory(self.static_slice_const_tree(

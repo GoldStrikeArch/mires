@@ -10,6 +10,7 @@ mod prelude;
 
 use core::cell::Cell;
 use core::hint::black_box;
+use core::mem::MaybeUninit;
 use core::ptr;
 
 #[repr(C)]
@@ -92,6 +93,30 @@ const C_B: &SyncCell<u32> = &COUNTERS.b;
 
 static LINKED_REF: &u32 = &P.second_word;
 static LINKED_OPT: Option<&u32> = Some(&P.first_word);
+
+struct PrimCycle {
+    x: u32,
+    other: &'static u32,
+}
+static CYCLE_A: PrimCycle = PrimCycle {
+    x: 11,
+    other: &CYCLE_B.x,
+};
+static CYCLE_B: PrimCycle = PrimCycle {
+    x: 22,
+    other: &CYCLE_A.x,
+};
+
+struct MuHolder {
+    mu: MaybeUninit<u32>,
+    y: u32,
+}
+static MU_HOLDER: MuHolder = MuHolder {
+    mu: MaybeUninit::new(64),
+    y: 128,
+};
+const MU_SELF_REF: Option<&MaybeUninit<u32>> = Some(&MU_HOLDER.mu);
+const MU_Y_REF: &u32 = &MU_HOLDER.y;
 
 #[inline(never)]
 fn bump(x: Option<&u32>) -> u32 {
@@ -183,9 +208,14 @@ pub fn rust_entry() {
     black_box(C_B).0.set(155);
     out_u32(COUNTERS.b.0.get());
 
-    // Static-to-static field references (dependency ordering)
+    // Static-to-static field references (dependency ordering) and 1-step primitive field cycle
     out_u32(*black_box(LINKED_REF));
     out_u32(bump(black_box(LINKED_OPT)));
+    out_u32(*black_box(CYCLE_A.other) + *black_box(CYCLE_B.other));
+
+    // Non-crossing MaybeUninit<u32> field reference and sibling field
+    out_u32(unsafe { *black_box(MU_SELF_REF).unwrap().assume_init_ref() });
+    out_u32(*black_box(MU_Y_REF));
 
     // Raw pointers + ptr::eq + array pointer arithmetic
     let p1 = black_box(FIRST_PTR);

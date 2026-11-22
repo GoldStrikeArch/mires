@@ -275,10 +275,27 @@ pub(crate) fn print_order<'a>(
 /// A member this module cannot split (see the module docs) is reported, and the cycle is returned
 /// as it was, which the reported error keeps from ever being written.
 fn initialize(dcx: &Sink, members: &[&LinkItem]) -> Vec<LinkItem> {
+    let cycle_names: HashSet<&str> = members.iter().map(|member| member.name.as_str()).collect();
     let mut split = Vec::with_capacity(members.len());
     for member in members {
         match Declaration::of(member) {
-            Ok(declaration) => split.push(declaration),
+            Ok(declaration) => {
+                if reads_cycle_member_property(declaration.literal, &cycle_names) {
+                    let names: Vec<&str> = members
+                        .iter()
+                        .map(|member| member.debug_path.as_str())
+                        .collect();
+                    dcx.err(format!(
+                        "rustc_codegen_js: the statics `{}` refer to each other, and `{}` reads a \
+                         sub-field or element of a cycle member during initialization, so the \
+                         cycle cannot be initialized in two steps",
+                        names.join("`, `"),
+                        member.debug_path,
+                    ));
+                    return members.iter().map(|member| (*member).clone()).collect();
+                }
+                split.push(declaration);
+            }
             Err(reason) => {
                 let names: Vec<&str> = members
                     .iter()
@@ -514,6 +531,71 @@ fn has_proto_key(text: &str) -> bool {
                 }
                 let read = start > 0 && bytes[start - 1] == b'.';
                 if &text[start..at] == "__proto__" && !read && is_key(previous, at) {
+                    return true;
+                }
+                previous = bytes[at - 1];
+            }
+            byte if byte.is_ascii_whitespace() => at += 1,
+            byte => {
+                previous = byte;
+                at += 1;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `text`, a literal [`literal_len`] accepted, reads a property or element (`.` or `[`)
+/// off any identifier in `cycle_names`.
+///
+/// During two-step cycle initialization (`let A = {}; let B = {}; Object.assign(A, <litA>);`),
+/// every cycle member starts as an empty object or array. Capturing a cycle member by reference
+/// (`next: B`, `{ buf: B, off: "x" }`, `{ buf: B, off: 0, len: 3 }`) is sound because no property
+/// of `B` is read yet; reading a nested property or element (`B.inner`, `S.inner`, `S.arr`,
+/// `B[0]`) would evaluate to `undefined` before `B`/`S` is populated.
+fn reads_cycle_member_property(text: &str, cycle_names: &HashSet<&str>) -> bool {
+    let bytes = text.as_bytes();
+    let next_significant = |mut at: usize| {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        bytes.get(at).copied()
+    };
+    let mut previous = 0u8;
+    let mut at = 0;
+    while at < bytes.len() {
+        let start = at;
+        match bytes[at] {
+            b'"' => {
+                at += 1;
+                while at < bytes.len() {
+                    match bytes[at] {
+                        b'\\' => at += 2,
+                        b'"' => {
+                            at += 1;
+                            break;
+                        }
+                        _ => at += 1,
+                    }
+                }
+                at = at.min(bytes.len());
+                previous = b'"';
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$' => {
+                while at < bytes.len()
+                    && (bytes[at].is_ascii_alphanumeric() || matches!(bytes[at], b'_' | b'$'))
+                {
+                    at += 1;
+                }
+                let ident = &text[start..at];
+                let after_dot = previous == b'.';
+                let next = next_significant(at);
+                let is_key = matches!(previous, b'{' | b',') && next == Some(b':');
+                if !after_dot
+                    && !is_key
+                    && cycle_names.contains(ident)
+                    && matches!(next, Some(b'.' | b'['))
+                {
                     return true;
                 }
                 previous = bytes[at - 1];
@@ -1114,5 +1196,94 @@ mod tests {
         let names = vec![&only_a];
         let steps = layout(&table, &members, &names);
         assert!(matches!(steps.as_slice(), [Placed::Item(item)] if item.name.as_str() == "a"));
+    }
+
+    /// A cycle whose initializer reads a property or element off any cycle member is refused,
+    /// while 1-step primitive slots (`{ buf: b, off: "x" }`) and non-member property accesses
+    /// stay allowed.
+    #[test]
+    fn a_cycle_reading_member_subfields_is_refused_while_slot_refs_succeed() {
+        let check_errors = |items: Vec<LinkItem>| -> u32 {
+            let table = table(items);
+            let names: Vec<&JsName> = table.keys().collect();
+            let members: HashSet<&JsName> = names.iter().copied().collect();
+            let placed = layout(&table, &members, &names);
+            let dcx = Sink::new();
+            let _ = initialize_cycles(&dcx, &placed);
+            dcx.errors()
+        };
+
+        // Allowed: 1-step primitive field cycle (`{ buf: b, off: "x" }`), string/key/non-cycle dot.
+        assert_eq!(
+            check_errors(vec![
+                binding(
+                    "a",
+                    "let a = { x: 11, next: { buf: b, off: \"x\" }, b: 1, tag: \"b.inner\", ext: x.b.val };\n",
+                    &["b"],
+                ),
+                binding(
+                    "b",
+                    "let b = { x: 22, next: { buf: a, off: \"x\" } };\n",
+                    &["a"],
+                ),
+            ]),
+            0
+        );
+
+        // Refused: mutual aggregate sub-field cycle (`other: b.inner`).
+        assert_eq!(
+            check_errors(vec![
+                binding(
+                    "a",
+                    "let a = { inner: { v: 1 }, other: b.inner };\n",
+                    &["b"]
+                ),
+                binding(
+                    "b",
+                    "let b = { inner: { v: 2 }, other: a.inner };\n",
+                    &["a"]
+                ),
+            ]),
+            1
+        );
+
+        // Refused: self-referential aggregate sub-field (`ptr: s.inner`).
+        assert_eq!(
+            check_errors(vec![binding(
+                "s",
+                "let s = { inner: { v: 42 }, ptr: s.inner };\n",
+                &[],
+            )]),
+            1
+        );
+
+        // Refused: self-referential nested primitive slot (`{ buf: s.inner, off: "val" }`).
+        assert_eq!(
+            check_errors(vec![binding(
+                "s",
+                "let s = { inner: { val: 42 }, ptr: { buf: s.inner, off: \"val\" } };\n",
+                &[],
+            )]),
+            1
+        );
+
+        // Refused: self-referential nested slice (`{ buf: s.arr, off: 0, len: 3 }`).
+        assert_eq!(
+            check_errors(vec![binding(
+                "s",
+                "let s = { arr: [10, 20, 30], sl: { buf: s.arr, off: 0, len: 3 } };\n",
+                &[],
+            )]),
+            1
+        );
+
+        // Refused: bracket element read (`other: b[0]`).
+        assert_eq!(
+            check_errors(vec![
+                binding("a", "let a = [{ v: 1 }, b[0]];\n", &["b"]),
+                binding("b", "let b = [{ v: 2 }, a[0]];\n", &["a"]),
+            ]),
+            1
+        );
     }
 }
