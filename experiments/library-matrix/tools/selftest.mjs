@@ -8,7 +8,8 @@
 //                                                 serves its scratch modules from there)
 
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
@@ -18,7 +19,7 @@ import { balancedOrders, runCell, williamsRows } from './lib/protocol.mjs'
 import { attributeRequest, openBrowser, runWatched, startServer } from './lib/browser.mjs'
 import { runNodeCell } from './lib/cells.mjs'
 import { componentsOf, componentSources, compositeFreshness, lockPath } from './lib/composite.mjs'
-import { directoryDigest, fileRecord, harnessRoot, moduleGraph, receiptPaths, repositoryRoot, sourceInventory, writeJson } from './lib/registry.mjs'
+import { currentBinding, directoryDigest, fileRecord, harnessIdentity, harnessRoot, loadRegistry, moduleGraph, readJson, receiptPaths, repositoryRoot, sourceInventory, writeJson } from './lib/registry.mjs'
 import { codeLines, embeddedJs, moduleState, SYNTAX } from './lib/source-stats.mjs'
 
 let passed = 0
@@ -602,6 +603,213 @@ await test('browsers: patching reporting builtins at import time cannot suppress
   } finally {
     await server.close()
   }
+})
+
+async function setupMatrixFixture(name, { libraryId, environments, benchCases }) {
+  const root = resolve(dir, `matrix-${name}`)
+  const builderDir = resolve(root, 'lang')
+  const builderPath = resolve(builderDir, 'build.mjs')
+  const refPath = resolve(root, 'reference.mjs')
+  const corpusPath = resolve(root, 'corpus.json')
+  const portDir = resolve(root, 'ports', libraryId, 'synth')
+  const distFile = resolve(portDir, 'dist', 'index.min.js')
+  const registryPath = resolve(root, 'matrix.json')
+  const receiptsDir = resolve(root, 'receipts')
+  const outputDir = resolve(root, 'out')
+
+  mkdirSync(builderDir, { recursive: true })
+  mkdirSync(resolve(portDir, 'dist'), { recursive: true })
+  writeFileSync(builderPath, 'export default {}\n')
+  writeFileSync(refPath, 'export function run(input) { return input.text.toUpperCase() }\n')
+  writeJson(corpusPath, {
+    schema: 1,
+    cases: benchCases.map((id) => ({ id, input: { text: id } })),
+  })
+  writeFileSync(resolve(portDir, 'src.txt'), 'synth source\n')
+  writeFileSync(distFile, 'export function run(input) { return input.text.toUpperCase() }\n')
+
+  writeJson(registryPath, {
+    schema: 1,
+    environments: {
+      node: { kind: 'node' },
+      chrome: { kind: 'browser', webdriver: 'chrome', headless: true },
+      firefox: { kind: 'browser', webdriver: 'firefox', headless: true },
+      safari: { kind: 'browser', webdriver: 'safari', headless: false },
+    },
+    languages: {
+      synth: {
+        label: 'Synthetic',
+        builder: builderPath,
+        production: 'synthetic production',
+        sources: { extensions: ['.txt'] },
+      },
+    },
+    libraries: {
+      [libraryId]: {
+        label: `Synthetic ${libraryId}`,
+        npm: null,
+        package: { name: libraryId, version: '1.0.0', standIn: 'synthetic fixture for selftest' },
+        reference: refPath,
+        corpus: corpusPath,
+        output: { form: 'string', async: false },
+        normalisation: null,
+        environments,
+        bench: { cases: benchCases, baseIterations: 1 },
+      },
+    },
+    ports: {
+      [libraryId]: [{ id: 'synth', language: 'synth', dir: portDir }],
+    },
+  })
+
+  const registry = loadRegistry(registryPath)
+  const paths = receiptPaths(receiptsDir)
+  const port = registry.ports[0]
+  const artifact = fileRecord(distFile)
+  writeJson(resolve(paths.builds, `${port.key}.json`), {
+    built: true,
+    seconds: 0.1,
+    reproducibility: { identical: true },
+    artifacts: [artifact],
+    sourceAfter: sourceInventory(registry, port),
+  })
+  const { binding } = await currentBinding(registry.libraries[libraryId])
+  const checkHarness = harnessIdentity('check')
+  const benchHarness = harnessIdentity('bench')
+
+  const writeCheck = (environment, environmentIdentity) => {
+    writeJson(resolve(paths.checks, `${port.key}--${environment}.json`), {
+      schema: 1,
+      status: 'pass',
+      artifact,
+      binding,
+      harness: checkHarness,
+      environmentIdentity,
+      summary: { cases: benchCases.length, equal: benchCases.length, different: 0, errors: 0 },
+      guard: { violations: [], moduleLoads: [], unexpectedRequests: [] },
+      checkedAt: '2026-01-01T00:00:00.000Z',
+    })
+  }
+
+  const writeBench = (environment, environmentIdentity, caseId, overrides = {}) => {
+    writeJson(resolve(paths.bench, libraryId, `${port.key}--${environment}--${caseId}--triplet.json`), {
+      schema: 1,
+      benchProtocol: 2,
+      harness: benchHarness,
+      binding,
+      artifact,
+      library: libraryId,
+      port: port.id,
+      language: port.language,
+      environment,
+      environmentIdentity,
+      case: caseId,
+      design: 'triplet',
+      measuredAt: '2026-01-01T00:01:00.000Z',
+      status: 'ok',
+      reason: null,
+      loadAverage: { start: [1.0, 1.0, 1.0], end: [1.2, 1.0, 1.0] },
+      result: {
+        comparisons: [
+          { name: 'port/js', p50: 1.25, paired: { p50: 1.24 } },
+          { name: 'A/A', p50: 1.01 },
+        ],
+      },
+      ...overrides,
+    })
+  }
+
+  const runMatrix = () => {
+    execFileSync(process.execPath, [
+      resolve(harnessRoot, 'tools/matrix.mjs'),
+      '--matrix', registryPath,
+      '--receipts', receiptsDir,
+      '--output', outputDir,
+    ], { cwd: harnessRoot, stdio: 'pipe' })
+    return {
+      results: readJson(resolve(outputDir, 'matrix-results.json')),
+      markdown: readFileSync(resolve(outputDir, 'MATRIX.md'), 'utf8'),
+    }
+  }
+
+  return { paths, port, artifact, writeCheck, writeBench, runMatrix }
+}
+
+await test('matrix report: missing or stale bench-case receipt marks timing incomplete, never ok', async () => {
+  const fixture = await setupMatrixFixture('missing-case', {
+    libraryId: 'two-case',
+    environments: ['node'],
+    benchCases: ['case-a', 'case-b'],
+  })
+  const nodeEnv = { name: 'node', version: process.version, label: `node ${process.version}` }
+  fixture.writeCheck('node', nodeEnv)
+  fixture.writeBench('node', nodeEnv, 'case-a')
+
+  // Case B receipt is missing: aggregate must be 'incomplete' (never 'ok') and case-b 'not-run'.
+  const missing = fixture.runMatrix()
+  const missingRow = missing.results.rows[0]
+  assert.equal(missingRow.timing.node.status, 'incomplete')
+  assert.equal(missingRow.timing.node.cases['case-a'].status, 'ok')
+  assert.equal(missingRow.timing.node.cases['case-b'].status, 'not-run')
+  const missingDataLine = missing.markdown.split('\n').find((line) => line.startsWith('| Synthetic |'))
+  assert.ok(missingDataLine, 'expected Synthetic data row in MATRIX.md')
+  assert.match(missingDataLine, /1\.25 \(A\/A 1\.01\) \| not-run \|$/)
+
+  // Case B receipt is stale (measured on another artifact): aggregate must be 'incomplete' and case-b 'stale'.
+  fixture.writeBench('node', nodeEnv, 'case-b', {
+    artifact: { ...fixture.artifact, sha256: '0'.repeat(64) },
+  })
+  const stale = fixture.runMatrix()
+  const staleRow = stale.results.rows[0]
+  assert.equal(staleRow.timing.node.status, 'incomplete')
+  assert.equal(staleRow.timing.node.cases['case-a'].status, 'ok')
+  assert.equal(staleRow.timing.node.cases['case-b'].status, 'stale')
+  assert.match(staleRow.timing.node.cases['case-b'].reason, /another artifact/)
+  const staleDataLine = stale.markdown.split('\n').find((line) => line.startsWith('| Synthetic |'))
+  assert.match(staleDataLine, /1\.25 \(A\/A 1\.01\) \| stale \|$/)
+
+  // Case B fails (aa-out-of-range) while case A is removed: failure takes precedence over incomplete.
+  rmSync(resolve(fixture.paths.bench, 'two-case', `${fixture.port.key}--node--case-a--triplet.json`))
+  fixture.writeBench('node', nodeEnv, 'case-b', { status: 'aa-out-of-range', result: null })
+  const failed = fixture.runMatrix()
+  const failedRow = failed.results.rows[0]
+  assert.equal(failedRow.timing.node.status, 'failed')
+  assert.equal(failedRow.timing.node.cases['case-a'].status, 'not-run')
+  assert.equal(failedRow.timing.node.cases['case-b'].status, 'aa-out-of-range')
+  const failedDataLine = failed.markdown.split('\n').find((line) => line.startsWith('| Synthetic |'))
+  assert.match(failedDataLine, /not-run \| aa-out-of-range \|$/)
+
+  // Both cases present and ok: aggregate is 'ok'.
+  fixture.writeBench('node', nodeEnv, 'case-a')
+  fixture.writeBench('node', nodeEnv, 'case-b')
+  const complete = fixture.runMatrix()
+  assert.equal(complete.results.rows[0].timing.node.status, 'ok')
+})
+
+await test('matrix report: browser-only library omits node from timing JSON and Markdown', async () => {
+  const fixture = await setupMatrixFixture('browser-only', {
+    libraryId: 'browser-lib',
+    environments: ['chrome', 'firefox', 'safari'],
+    benchCases: ['case-a'],
+  })
+  const chromeEnv = { name: 'chrome', version: '130.0.0', label: 'chrome 130.0.0' }
+  fixture.writeCheck('chrome', chromeEnv)
+  fixture.writeBench('chrome', chromeEnv, 'case-a')
+
+  const { results, markdown } = fixture.runMatrix()
+  const row = results.rows[0]
+  assert.equal('node' in row.timing, false)
+  assert.deepEqual(Object.keys(row.timing), ['chrome', 'firefox', 'safari'])
+  assert.equal(row.timing.chrome.status, 'ok')
+  assert.equal(row.timing.firefox.status, 'not-run')
+  assert.equal(row.timing.safari.status, 'not-run')
+  const headerLine = markdown.split('\n').find((line) => line.startsWith('| Language | Build |'))
+  assert.ok(headerLine, 'expected table header in MATRIX.md')
+  assert.equal(headerLine.includes('node port/js'), false)
+  assert.equal(headerLine.includes('Parity node'), false)
+  assert.ok(headerLine.includes('chrome port/js (A/A)'))
+  assert.ok(headerLine.includes('firefox port/js (A/A)'))
+  assert.ok(headerLine.includes('safari port/js (A/A)'))
 })
 
 rmSync(dir, { recursive: true, force: true })
