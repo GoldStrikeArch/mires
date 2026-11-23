@@ -91,6 +91,7 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "fat_ptr_cmp"
             | "addr"
             | "slice_from_parts"
+            | "sfp"
             | "chunk_slice"
             | "thin"
             | "tail_raw"

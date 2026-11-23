@@ -1848,6 +1848,29 @@ fn vec_iter_and_iter_mut_require_distinct_iterator_identities() {
     );
 }
 
+#[test]
+fn vec_iter_lowers_indexed_four_field_slice_iter_layout() {
+    let (mut table, mut interns) = table();
+    let indexed_iter = TypeId(220);
+    let indexed_fields = vec![
+        field(&mut interns, "ptr", RAW_U32_CONST),
+        field(&mut interns, "pos", USIZE),
+        field(&mut interns, "end", USIZE),
+        field(&mut interns, "_marker", MARKER_ZST),
+    ];
+    let mut iter_desc = strukt(&mut interns, indexed_iter, "Iter", indexed_fields, 12);
+    iter_desc.meta.iterator = crate::jir::types::IteratorIdentity::Slice;
+    table.insert(iter_desc);
+
+    let iter_sig = sig(vec![VEC_U32_REF], indexed_iter);
+    let cx = lower_cx(StandardOperation::VecIter, &iter_sig, &table, &interns);
+    let rw = rewrite(&cx, &[Carrier::NativeVec]).expect("4-field indexed slice::Iter lowers");
+    let printed = jsast::stmt_to_string(&jsast::function("f", rw.parameters, rw.statements));
+    assert!(printed.contains("pos: 0"), "{printed}");
+    assert!(printed.contains("end: $native0.len"), "{printed}");
+    assert!(!printed.contains("end_or_len"), "{printed}");
+}
+
 mod structural {
     //! The structural drop chain: needy fields in declaration order, plain shapes only.
 

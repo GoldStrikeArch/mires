@@ -112,8 +112,10 @@ globalThis.__rt.overwrite = (target, value) => {
         return target;
       }
     }
-    target.length = 0;
-    return Object.assign(target, value);
+    const n = value.length;
+    target.length = n;
+    for (let i = 0; i < n; i++) target[i] = value[i];
+    return target;
   }
   for (const key in target) {
     if (!(key in value)) delete target[key];
@@ -238,16 +240,16 @@ globalThis.__rt._named = (p, op) => {
 // `Vec` that has never allocated, which is ordinary code.
 //
 // `0` is not converted: that is `null()`, and `is_null()` is `addr(p) === 0`.
-globalThis.__rt._dangling_bufs = new Map();
+globalThis.__rt._dangling_bufs = [];
 // buffer -> the alignment it is the dangling pointer for, so `addr` can answer
 // with the alignment the model promises rather than a synthetic base.
 globalThis.__rt._dangling_of = new WeakMap();
 
 globalThis.__rt._dangling = (align) => {
-  let buf = globalThis.__rt._dangling_bufs.get(align);
+  let buf = globalThis.__rt._dangling_bufs[align];
   if (buf === undefined) {
     buf = Object.freeze([]);
-    globalThis.__rt._dangling_bufs.set(align, buf);
+    globalThis.__rt._dangling_bufs[align] = buf;
     globalThis.__rt._dangling_of.set(buf, align);
   }
   return { buf, off: 0 };
@@ -261,9 +263,27 @@ globalThis.__rt._bv = null;
 // Raw slice metadata can describe an allocator's uninitialized byte block, or a
 // byte slice over wider storage (`byte` is 1 for u8, -1 for i8).
 globalThis.__rt.slice_from_parts = (p, len, byte) => {
+  if (typeof p === "object" && p !== null && typeof p.buf === "object" && p.buf !== null) {
+    if (p.sc !== undefined) {
+      if (len > 0) throw __rt.abort_error(new Error("rustc_codegen_js: cannot view " + p.sc + "-byte non-scalar elements as a byte slice"));
+      return { buf: p.buf, off: p.off, len: 0, sc: p.sc };
+    }
+    if (byte !== undefined && globalThis.__rt._bv !== null) return globalThis.__rt._bv.slice(p, len, byte);
+    return { buf: p.buf, off: p.off, len };
+  }
   if (typeof p === "number") {
-    if (p > 0 && p < 4096) p = globalThis.__rt._dangling(p);
-    else return { buf: p, off: 0, len };
+    if (p > 0 && p < 4096) {
+      if (byte === undefined || globalThis.__rt._bv === null) {
+        let buf = globalThis.__rt._dangling_bufs[p];
+        if (buf === undefined) {
+          buf = Object.freeze([]);
+          globalThis.__rt._dangling_bufs[p] = buf;
+          globalThis.__rt._dangling_of.set(buf, p);
+        }
+        return { buf, off: 0, len };
+      }
+      p = globalThis.__rt._dangling(p);
+    } else return { buf: p, off: 0, len };
   } else if (p !== null && typeof p === "object" && typeof p.buf === "number" && p.pr === undefined) {
     const a = (p.buf + (typeof p.off === "number" ? p.off * (p.sc !== undefined ? 1 : p.es || 1) : 0)) >>> 0;
     if (a > 0 && a < 4096) p = globalThis.__rt._dangling(a);
@@ -276,6 +296,13 @@ globalThis.__rt.slice_from_parts = (p, len, byte) => {
   if (byte !== undefined && globalThis.__rt._bv !== null) return globalThis.__rt._bv.slice(p, len, byte);
   return { buf: p.buf, off: p.off, len };
 };
+
+// Tiny V8-inlinable fast path for `slice_from_parts` when wide byte views and scaled pointers are
+// statically absent: TurboFan inlines this and can escape-analyze the returned slice record.
+globalThis.__rt.sfp = (p, len) =>
+  p && typeof p.buf === "object" && p.buf !== null
+    ? { buf: p.buf, off: p.off, len }
+    : globalThis.__rt.slice_from_parts(p, len);
 
 // A u8/i8 slice reference establishes initialized byte storage. Word reads must
 // alias these bytes. Raw slices and MaybeUninit slices do not establish this fact.
@@ -963,7 +990,7 @@ globalThis.__rt._scales = (a, b, op) => {
 // and handles the overlap itself. Otherwise the loop runs away from the
 // overlap: upwards when the destination is below the source, downwards when it
 // is above. Which store each element gets is `_rebinds`.
-globalThis.__rt.copy = (dst, src, count, clone) => {
+globalThis.__rt.copy = (dst, src, count, clone, plain) => {
   if (count === 0) return;
   let effCl = clone, fromNs = false;
   if (clone === undefined && globalThis.__rt._bv !== null) {
@@ -991,8 +1018,13 @@ globalThis.__rt.copy = (dst, src, count, clone) => {
     return;
   }
   const each = typeof effCl === "function" ? (fromNs ? (v) => (v === null || typeof v !== "object" ? v : effCl(v)) : effCl) : (v) => v;
+  if (plain || globalThis.__rt._boxes === null) {
+    if (down) { for (let i = s.n - 1; i >= 0; i--) d.buf[d.off + i] = each(s.buf[s.off + i]); }
+    else { for (let i = 0; i < s.n; i++) d.buf[d.off + i] = each(s.buf[s.off + i]); }
+    return;
+  }
   const put = globalThis.__rt._put;
-  const dIsHeap = globalThis.__rt._boxes !== null && globalThis.__rt._blk_get(d.buf) !== undefined;
+  const dIsHeap = globalThis.__rt._blk_get(d.buf) !== undefined;
   if (down) { for (let i = s.n - 1; i >= 0; i--) put(d.buf, d.off + i, each(s.buf[s.off + i]), dIsHeap); }
   else { for (let i = 0; i < s.n; i++) put(d.buf, d.off + i, each(s.buf[s.off + i]), dIsHeap); }
 };
@@ -1113,8 +1145,7 @@ globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone, plain) => {
   }
   const each = typeof effCl === "function" ? (fromNs ? (v) => (v === null || typeof v !== "object" ? v : effCl(v)) : effCl) : (v) => v;
   if (plain || globalThis.__rt._boxes === null) {
-    const put = globalThis.__rt._put_plain;
-    for (let i = 0; i < s.n; i++) put(d.buf, d.off + i, each(s.buf[s.off + i]));
+    for (let i = 0; i < s.n; i++) d.buf[d.off + i] = each(s.buf[s.off + i]);
     return;
   }
   const put = globalThis.__rt._put;
@@ -1329,19 +1360,35 @@ globalThis.__rt._element_view = (buf, off, n, es) => {
 // write_array(p, values): stores `values` element by element at `p`, the write
 // half of read_array. Element by element, never a rebind: the elements live in
 // somebody else's buffer and every alias of it has to see the new contents.
-globalThis.__rt.write_array = (p, values, indirect) => {
+globalThis.__rt.write_array = (p, values, indirect, plain) => {
   if (p === null || typeof p !== "object") {
     throw __rt.abort_error(new Error("rustc_codegen_js: cannot write through this pointer"));
   }
   if (p.w === undefined) {
-    // `_put` rather than `overwrite`: the one place a plain slot names may hold
-    // no array yet, which is what a fresh heap block is (`Box::new([1, 2, 3])`).
-    globalThis.__rt._put(p.buf, p.off, values);
+    const old = p.buf[p.off];
+    if (ArrayBuffer.isView(old)) {
+      old.set(values);
+      return;
+    }
+    if (Array.isArray(old)) {
+      if (globalThis.__rt._element_view_of !== null) {
+        const ev = globalThis.__rt._element_view_of.get(old);
+        if (ev !== undefined) {
+          for (let i = 0; i < ev.n; i++) ev.buf[ev.off + i] = values[i];
+          return;
+        }
+      }
+      const n = values.length;
+      old.length = n;
+      for (let i = 0; i < n; i++) old[i] = values[i];
+      return;
+    }
+    p.buf[p.off] = values;
     return;
   }
   if (p.w === 0 || values === undefined) return;
   const buf = globalThis.__rt._bv !== null ? globalThis.__rt._bv.raw_buf(p.buf) : p.buf;
-  if (indirect) {
+  if (indirect && !plain) {
     const put = globalThis.__rt._put;
     const heap = globalThis.__rt._boxes !== null && globalThis.__rt._blk_get(buf) !== undefined;
     for (let i = 0; i < values.length; i++) put(buf, p.off + i, values[i], heap);

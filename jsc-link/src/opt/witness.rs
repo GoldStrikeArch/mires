@@ -1568,6 +1568,7 @@ fn witness_sysroot_shim_is_non_throwing(sym: &str) -> bool {
             | "fat_ptr_cmp"
             | "addr"
             | "slice_from_parts"
+            | "sfp"
             | "chunk_slice"
             | "thin"
             | "tail_raw"

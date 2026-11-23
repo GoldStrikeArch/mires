@@ -79,7 +79,7 @@ const BUDGET_FLOOR: u64 = 384;
 /// Speed-first (`js-profile=release-speed`) post-representation inlining thresholds tuned for V8
 /// TurboFan (inline small hot helpers without creating >12 KB mega-functions that bail out of JIT).
 const SPEED_SHARED_CALLEE_FOOTPRINT: u64 = 220;
-const SPEED_TRACK_CALLER_SHARED_FOOTPRINT: u64 = 160;
+const SPEED_TRACK_CALLER_SHARED_FOOTPRINT: u64 = 220;
 const SPEED_LOOP_CALLEE_FOOTPRINT: u64 = 384;
 const SPEED_INLINE_HINT_FOOTPRINT: u64 = 384;
 const SPEED_INLINE_ALWAYS_FOOTPRINT: u64 = 640;
@@ -436,15 +436,17 @@ pub(crate) fn run_with_profile(
             // Restrict to call-free leaves `<= 192` B and still charge `growth` so non-loop
             // callers (like top-level dispatchers) cannot consume freed budget and bloat.
             let callee_is_leaf = callee_func.blocks.iter().all(|b| {
-                b.ops
-                    .iter()
-                    .all(|op| !matches!(op.kind, OpKind::Call { .. }))
+                let cold_diverging = matches!(b.term, RTerm::Unreachable);
+                (cold_diverging
+                    || b.ops
+                        .iter()
+                        .all(|op| !matches!(op.kind, OpKind::Call { .. })))
                     && !matches!(b.term, RTerm::Invoke { .. })
             });
             let speed_hot_loop = speed
                 && looping.contains(&(site.block as u32))
                 && callee_is_leaf
-                && callee_bytes <= 192;
+                && callee_bytes <= 220;
             let size_limit = if is_sole && net <= 0 {
                 limit.max(16_384)
             } else {
@@ -750,10 +752,55 @@ fn is_optional_assert(kind: &OpKind) -> bool {
     )
 }
 
+/// Merges the panic lang-item dependency required by a callee `Assert` into the caller's
+/// `ItemSummary::deps` when both sides have summaries and the lang item resolves unambiguously.
+fn try_import_assert_panic_dep(
+    imported: &mut Metadata<'_>,
+    provider: &Metadata<'_>,
+    msg: &RAssertMessage,
+) -> bool {
+    let lang_fn = crate::lower::js::emit::panic_function(msg);
+    let (Some(provider_summary), Some(caller_summary)) =
+        (provider.summary.as_deref(), imported.summary.as_deref())
+    else {
+        return false;
+    };
+    let mut provider_matches = provider_summary
+        .deps
+        .iter()
+        .filter(|dep| crate::lower::js::emit::names_lang_fn(dep, lang_fn));
+    let (Some(provider_dep), None) = (provider_matches.next(), provider_matches.next()) else {
+        return false;
+    };
+    let caller_matches: Vec<&String> = caller_summary
+        .deps
+        .iter()
+        .filter(|dep| crate::lower::js::emit::names_lang_fn(dep, lang_fn))
+        .collect();
+    match caller_matches.as_slice() {
+        [existing] => *existing == provider_dep,
+        [] => {
+            let dep = provider_dep.clone();
+            let deps = &mut imported
+                .summary
+                .as_mut()
+                .expect("checked Some")
+                .to_mut()
+                .deps;
+            if !deps.contains(&dep) {
+                deps.push(dep);
+                deps.sort();
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Prepares an imported callee for splicing at a call site, resolving any `#[track_caller]`
-/// location substitution and tagging non-optional callee `Assert` ops with a sentinel origin so
-/// any assert surviving DCE rejects inlining (because `lower::js::emit` resolves panic lang items
-/// from the caller's `summary.deps` and would otherwise fall back to `js_abort`).
+/// location substitution, importing panic lang-item dependencies for non-optional `Assert` ops
+/// into the caller's summary when unambiguous, and tagging any still-unresolved callee `Assert`
+/// ops with a sentinel origin so any assert surviving DCE rejects inlining.
 #[allow(clippy::too_many_arguments)]
 fn prepare_callee_for_site<'a>(
     current_metadata: &Metadata<'a>,
@@ -765,14 +812,19 @@ fn prepare_callee_for_site<'a>(
     site_track_caller: Option<SourceFactId>,
     items: &ItemIndex,
 ) -> Result<(Func, Metadata<'a>, Option<OriginId>), &'static str> {
-    let (mut callee_func, imported) = current_metadata.import(provider, callee_func, origin)?;
+    let (mut callee_func, mut imported) = current_metadata.import(provider, callee_func, origin)?;
     let mut sentinel_assert_origin = None;
     if callee_func.sig.abi.caller_location && callee_func.params.len() == site_args_len + 1 {
         for block in &mut callee_func.blocks {
             for op in &mut block.ops {
-                if matches!(op.kind, OpKind::Assert { .. }) && !is_optional_assert(&op.kind) {
-                    op.origin = SENTINEL_ASSERT_ORIGIN;
-                    sentinel_assert_origin = Some(SENTINEL_ASSERT_ORIGIN);
+                if let OpKind::Assert { msg, .. } = &op.kind {
+                    if is_optional_assert(&op.kind) {
+                        continue;
+                    }
+                    if !try_import_assert_panic_dep(&mut imported, provider, msg) {
+                        op.origin = SENTINEL_ASSERT_ORIGIN;
+                        sentinel_assert_origin = Some(SENTINEL_ASSERT_ORIGIN);
+                    }
                 }
             }
         }
@@ -783,6 +835,16 @@ fn prepare_callee_for_site<'a>(
             }
         }
         strip_unused_last_param(&mut callee_func);
+    } else {
+        for block in &callee_func.blocks {
+            for op in &block.ops {
+                if let OpKind::Assert { msg, .. } = &op.kind {
+                    if !is_optional_assert(&op.kind) {
+                        let _ = try_import_assert_panic_dep(&mut imported, provider, msg);
+                    }
+                }
+            }
+        }
     }
     Ok((callee_func, imported, sentinel_assert_origin))
 }
@@ -2056,6 +2118,7 @@ mod tests {
                             interns: std::borrow::Cow::Borrowed(interns),
                             origins: None,
                             header: None,
+                            summary: None,
                         },
                     )
                 })
@@ -2548,6 +2611,7 @@ mod tests {
                         interns: Cow::Borrowed(&caller.interns),
                         origins: Some(Cow::Borrowed(&caller_origins)),
                         header: Some(&header),
+                        summary: None,
                     },
                 ),
                 (
@@ -2557,6 +2621,7 @@ mod tests {
                         interns: Cow::Borrowed(&provider.interns),
                         origins: Some(Cow::Borrowed(&provider_origins)),
                         header: Some(&provider_header),
+                        summary: None,
                     },
                 ),
             ]);
@@ -2773,6 +2838,7 @@ mod tests {
                     interns: Cow::Borrowed(&caller_interns),
                     origins: Some(Cow::Borrowed(&caller_origins)),
                     header: Some(&provider_header),
+                    summary: None,
                 },
             ),
             (
@@ -2782,6 +2848,7 @@ mod tests {
                     interns: Cow::Borrowed(&provider),
                     origins: Some(Cow::Borrowed(&provider_origins)),
                     header: Some(&provider_header),
+                    summary: None,
                 },
             ),
         ]);
@@ -3198,6 +3265,7 @@ mod tests {
                         interns: std::borrow::Cow::Borrowed(interns),
                         origins: None,
                         header: None,
+                        summary: None,
                     },
                 )
             })
@@ -3495,6 +3563,7 @@ mod tests {
                         interns: std::borrow::Cow::Borrowed(interns),
                         origins: None,
                         header: None,
+                        summary: None,
                     },
                 )
             })
@@ -3752,6 +3821,7 @@ mod tests {
                         interns: std::borrow::Cow::Borrowed(interns),
                         origins: None,
                         header: None,
+                        summary: None,
                     },
                 )
             })
@@ -3857,6 +3927,7 @@ mod tests {
                         interns: std::borrow::Cow::Borrowed(interns),
                         origins: None,
                         header: None,
+                        summary: None,
                     },
                 )
             })
@@ -4313,6 +4384,7 @@ mod tests {
                         interns: Cow::Borrowed(interns),
                         origins: Some(Cow::Owned(build_origins(site_fact))),
                         header: None,
+                        summary: None,
                     },
                 ),
                 (
@@ -4322,6 +4394,7 @@ mod tests {
                         interns: Cow::Borrowed(interns),
                         origins: Some(Cow::Owned(build_origins(core_fact))),
                         header: None,
+                        summary: None,
                     },
                 ),
             ]);
@@ -4408,6 +4481,7 @@ mod tests {
                         interns: Cow::Borrowed(interns),
                         origins: Some(Cow::Owned(build_origins(site_fact))),
                         header: None,
+                        summary: None,
                     },
                 ),
                 (
@@ -4417,6 +4491,7 @@ mod tests {
                         interns: Cow::Borrowed(interns),
                         origins: Some(Cow::Owned(build_origins(site_fact))),
                         header: None,
+                        summary: None,
                     },
                 ),
             ]);
@@ -4449,6 +4524,7 @@ mod tests {
             interns: std::borrow::Cow::Borrowed(interns),
             origins: None,
             header: None,
+            summary: None,
         }
     }
 
@@ -4477,6 +4553,7 @@ mod tests {
                         interns: std::borrow::Cow::Borrowed(interns),
                         origins: None,
                         header: None,
+                        summary: None,
                     },
                 )
             })
@@ -4567,6 +4644,7 @@ mod tests {
                         interns: std::borrow::Cow::Borrowed(interns),
                         origins: None,
                         header: None,
+                        summary: None,
                     },
                 )
             })
@@ -4611,5 +4689,188 @@ mod tests {
             "all 3 sole-caller sites should batch-inline"
         );
         assert_eq!(prog.calls_in("f"), 0);
+    }
+
+    #[test]
+    fn track_caller_live_assert_inlines_and_imports_panic_dep_from_summary() {
+        use crate::jir::origin::{Origin, OriginKind, OriginTable, SourceFact};
+        use crate::jir::summary::{Availability, ItemClass, ItemSummary, SemanticKey};
+        use rcgjs_object::item::{ItemKind, Linkage};
+        use rcgjs_object::object::BlobRef;
+        use std::borrow::Cow;
+
+        let make_summary = |deps: Vec<&str>| ItemSummary {
+            key: SemanticKey {
+                link_name: "f".to_owned(),
+                item: None,
+            },
+            body_hash: None,
+            semantic_hash: None,
+            availability: Availability::Available,
+            deps: deps.into_iter().map(str::to_owned).collect(),
+            abi: None,
+            physical: None,
+            kind: ItemKind::Fn,
+            linkage: Linkage::internal(),
+            order: None,
+            dts: false,
+            fallback: BlobRef {
+                offset: 0,
+                clen: 0,
+                ulen: 0,
+            },
+            body: None,
+            origin: None,
+            estimated_bytes: 0,
+            class: ItemClass::empty(),
+        };
+        let build_origins = |fact| OriginTable {
+            origins: vec![Origin {
+                source: Some(fact),
+                local_name: None,
+                kind: OriginKind::Statement,
+                inline_stack: Vec::new(),
+            }],
+            statements: Vec::new(),
+            terminators: Vec::new(),
+            locals: Vec::new(),
+            item_path: StrId(0),
+            root: None,
+        };
+
+        let mut prog = Prog::new();
+        let caller_file = prog.strid("caller.rs");
+        let core_file = prog.strid("core/slice.rs");
+        let site_fact = prog.interns.intern_source_fact(SourceFact {
+            file: caller_file,
+            line: 55,
+            col: 12,
+        });
+        let core_fact = prog.interns.intern_source_fact(SourceFact {
+            file: core_file,
+            line: 999,
+            col: 1,
+        });
+        let g_str = prog.strid("g_bounds");
+
+        let mut g_sig = sig(2);
+        g_sig.abi.caller_location = true;
+        let mut g_b = FuncBuilder::new(item(2), g_sig);
+        let idx = g_b.param(I32, OriginId(0));
+        let _loc = g_b.param(I32, OriginId(0));
+        let len = g_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 4, bytes: 4 }),
+            I32,
+            OriginId(0),
+        );
+        let cmp = g_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Binary {
+                op: BinaryOp::Lt,
+                l: idx,
+                r: len,
+                ty: I32,
+            },
+            I32,
+            OriginId(0),
+        );
+        g_b.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Assert {
+                cond: cmp,
+                expected: true,
+                msg: RAssertMessage::BoundsCheck {
+                    length: len,
+                    index: idx,
+                },
+                track_caller: None,
+            },
+            OriginId(0),
+        );
+        g_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(idx)));
+        let g = g_b.finish();
+
+        let mut f_b = FuncBuilder::new(item(1), sig(1));
+        let p = f_b.param(I32, OriginId(0));
+        let call = f_b.op(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(2),
+                    link_name: g_str,
+                },
+                function: None,
+                args: vec![p],
+                track_caller: Some(site_fact),
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            I32,
+            OriginId(0),
+        );
+        f_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(call)));
+        let f = f_b.finish();
+
+        prog.add("g_bounds", g);
+        prog.add("f", f);
+
+        let panic_dep = "core$panicking$panic_bounds_check$ha80078aa06207de3";
+        let interns = &prog.interns;
+        let funcs = &mut prog.funcs;
+        let interns_map: BTreeMap<JsName, &Interns> =
+            funcs.keys().map(|name| (name.clone(), interns)).collect();
+        let graph = callgraph::build(funcs, &interns_map);
+        let f_name = JsName::new("f".to_owned());
+        let g_name = JsName::new("g_bounds".to_owned());
+        let mut metadata = BTreeMap::from([
+            (
+                f_name.clone(),
+                Metadata {
+                    universe: interns,
+                    interns: Cow::Borrowed(interns),
+                    origins: Some(Cow::Owned(build_origins(site_fact))),
+                    header: None,
+                    summary: Some(Cow::Owned(make_summary(vec![]))),
+                },
+            ),
+            (
+                g_name.clone(),
+                Metadata {
+                    universe: interns,
+                    interns: Cow::Borrowed(interns),
+                    origins: Some(Cow::Owned(build_origins(core_fact))),
+                    header: None,
+                    summary: Some(Cow::Owned(make_summary(vec![panic_dep]))),
+                },
+            ),
+        ]);
+        let sizes = BTreeMap::from([(f_name.clone(), 200), (g_name.clone(), 120)]);
+        let stats = run_with_mode(
+            funcs,
+            &mut metadata,
+            &graph,
+            &ItemIndex::new(),
+            &|_, func, _| Some(measurement(func, &metadata_dummy_refs(func, interns))),
+            &|_, _| true,
+            &|_| true,
+            100_000,
+            &sizes,
+            false,
+        );
+        assert_eq!(
+            stats.applied, 1,
+            "live Assert in #[track_caller] callee should inline when panic dep resolves from summary"
+        );
+        assert_eq!(prog.calls_in("f"), 0);
+        let f_deps = &metadata
+            .get(&f_name)
+            .and_then(|m| m.summary.as_deref())
+            .expect("caller summary preserved")
+            .deps;
+        assert!(
+            f_deps.iter().any(|d| d == panic_dep),
+            "panic lang dep should be imported into caller summary: {f_deps:?}"
+        );
     }
 }

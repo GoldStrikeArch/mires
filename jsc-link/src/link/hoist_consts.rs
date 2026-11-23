@@ -1699,7 +1699,11 @@ fn run_with_opts(
     // `BigInt("...")` bindings.
     let exclusions = collect_program_exclusions(table, lowered, live);
     split_bigint_props(lowered, &exclusions);
-    encode_internal_tags(lowered, &exclusions);
+    encode_internal_tags(
+        lowered,
+        &exclusions,
+        opts.profile == Some(crate::opts::Profile::ReleaseSpeed),
+    );
 
     // Pass 2: Expression constants (`Location` objects, inline `[...][i]`, capture-free
     // `() => <const>`) and shared unreachable-abort outlining. ES2018 BigInt constants are hoisted
@@ -4075,13 +4079,21 @@ impl TagRewriter<'_> {
     }
 }
 
-fn encode_internal_tags(lowered: &mut [LoweredRow], exclusions: &ProgramExclusions) {
+fn encode_internal_tags(
+    lowered: &mut [LoweredRow],
+    exclusions: &ProgramExclusions,
+    encode_option_tags: bool,
+) {
     let mut scanner = TagScanner {
         candidates: BTreeSet::new(),
         bad: BTreeSet::new(),
     };
-    for s in ["Ok", "Err", "Some", "None", "Ready", "Pending", ""] {
+    for s in ["Ok", "Err", "Ready", "Pending", ""] {
         scanner.bad.insert(s.to_owned());
+    }
+    if !encode_option_tags {
+        scanner.bad.insert("Some".to_owned());
+        scanner.bad.insert("None".to_owned());
     }
     scanner.bad.extend(exclusions.raw_tokens.iter().cloned());
     scanner.bad.extend(exclusions.raw_strings.iter().cloned());
@@ -4619,10 +4631,22 @@ mod tests {
             optimizer: OptimizerMode::Report,
             ..Opts::default()
         };
-        let (_, report_lowered, _, _, _) = test_run(report_opts, vec![("use_internal", fn_a)]);
+        let (_, report_lowered, _, _, _) =
+            test_run(report_opts, vec![("use_internal", fn_a.clone())]);
         let report_js = jsast::stmt_to_string(&report_lowered[0].1.as_ref().unwrap().decl);
         assert!(report_js.contains("\"Alpha\""), "{report_js}");
         assert!(report_js.contains("\"Beta\""), "{report_js}");
+
+        // Under ReleaseSpeed, internal `"Some"`/`"None"` tags are integer-encoded too unless excluded.
+        let speed_opts = Opts {
+            optimizer: OptimizerMode::On,
+            profile: Some(crate::opts::Profile::ReleaseSpeed),
+            ..Opts::default()
+        };
+        let (_, speed_lowered, _, _, _) = test_run(speed_opts, vec![("use_internal", fn_a)]);
+        let speed_js = jsast::stmt_to_string(&speed_lowered[0].1.as_ref().unwrap().decl);
+        assert!(!speed_js.contains("\"Some\""), "{speed_js}");
+        assert!(speed_js.contains("s.TAG ==="), "{speed_js}");
     }
 
     #[test]

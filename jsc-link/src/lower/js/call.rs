@@ -1061,7 +1061,7 @@ impl JsCx<'_> {
                         let buf = jsast::new(jsast::id("Array"), vec![cap]);
                         return Ok(Some(Lowered::value(ptr::slot(buf, jsast::num(0)))));
                     }
-                    let shell_expr = value::zero_value(table, self.interns, elem);
+                    let shell_expr = uninit_shell(table, self.interns, elem, 0);
                     if const_u128(*cap_v) == Some(1) {
                         if let Some(shell) = shell_expr {
                             let slot = if tracked {
@@ -1404,4 +1404,92 @@ impl JsCx<'_> {
 /// `receiver.meta[slot]`: one entry of the vtable a fat pointer carries (`abi.rs::vtable_slot`).
 pub fn vtable_slot(receiver: Expr, slot: f64) -> Expr {
     jsast::index(super::ptr::meta(receiver), jsast::num(slot))
+}
+
+/// Lightweight uninitialized container shell for `Box::<T>::new_uninit()` (`TypedAlloc` with
+/// `zeroed == 0`). Provides arrays for fixed-array fields (so `BTreeMap` `LeafNode` / `vec![...]`
+/// element writes have a target container) without deep zero-initializing element structs.
+fn uninit_shell(
+    table: &rcgjs_object::jir::types::TypeTable,
+    interns: &rcgjs_object::jir::interns::Interns,
+    ty: rcgjs_object::jir::types::TypeId,
+    depth: u32,
+) -> Option<Expr> {
+    use rcgjs_object::jir::types::{NominalForm, TypeKind};
+    if depth > 4 {
+        return None;
+    }
+    let peeled = table.peeled(ty);
+    let desc = table.get(peeled)?;
+    if desc.layout.zst {
+        return Some(jsast::undefined());
+    }
+    match &desc.kind {
+        TypeKind::Array { length, .. } => {
+            if *length <= 4 {
+                Some(jsast::array(
+                    (0..*length).map(|_| jsast::undefined()).collect(),
+                ))
+            } else {
+                Some(jsast::new(
+                    jsast::id("Array"),
+                    vec![jsast::num(*length as f64)],
+                ))
+            }
+        }
+        TypeKind::Tuple(elems) => {
+            if elems.len() <= 4 {
+                Some(jsast::array(
+                    elems
+                        .iter()
+                        .map(|e| uninit_field_shell(table, interns, *e, depth + 1))
+                        .collect(),
+                ))
+            } else {
+                Some(jsast::new(
+                    jsast::id("Array"),
+                    vec![jsast::num(elems.len() as f64)],
+                ))
+            }
+        }
+        TypeKind::Adt {
+            form: NominalForm::Struct,
+            variants,
+            ..
+        } => {
+            let variant = variants.first()?;
+            let mut entries = Vec::with_capacity(variant.fields.len());
+            for field in &variant.fields {
+                let key = value::key_name(interns, field.key)?;
+                entries.push((key, uninit_field_shell(table, interns, field.ty, depth + 1)));
+            }
+            Some(jsast::object(entries))
+        }
+        TypeKind::Adt {
+            form: NominalForm::Enum | NominalForm::Union,
+            ..
+        } => Some(jsast::object(Vec::new())),
+        _ => None,
+    }
+}
+
+fn uninit_field_shell(
+    table: &rcgjs_object::jir::types::TypeTable,
+    interns: &rcgjs_object::jir::interns::Interns,
+    ty: rcgjs_object::jir::types::TypeId,
+    depth: u32,
+) -> Expr {
+    use rcgjs_object::jir::types::{NominalForm, TypeKind};
+    let peeled = table.peeled(ty);
+    match table.get(peeled).map(|d| &d.kind) {
+        Some(
+            TypeKind::Array { .. }
+            | TypeKind::Tuple(_)
+            | TypeKind::Adt {
+                form: NominalForm::Struct,
+                ..
+            },
+        ) => uninit_shell(table, interns, peeled, depth).unwrap_or_else(jsast::undefined),
+        _ => jsast::undefined(),
+    }
 }

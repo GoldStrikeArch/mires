@@ -1721,6 +1721,7 @@ fn o_group_with_mode(
                         interns: std::borrow::Cow::Borrowed(interns),
                         origins: item.jir.origins.as_ref().map(std::borrow::Cow::Borrowed),
                         header: item.jir.header(),
+                        summary: item.jir.summary.as_ref().map(std::borrow::Cow::Borrowed),
                     },
                 ))
             })
@@ -1732,6 +1733,9 @@ fn o_group_with_mode(
                 input.interns = &metadata.interns;
                 input.table = &metadata.interns.types;
                 input.origins = metadata.origins.as_deref();
+                if let Some(summary) = metadata.summary.as_deref() {
+                    input.summary = summary;
+                }
                 crate::plan::cost::measure_inline_item(&input, func, &inline_renames)
             };
         group.inline = crate::opt::inline::run_with_profile(
@@ -1749,22 +1753,32 @@ fn o_group_with_mode(
         );
         let updates: Vec<_> = metadata
             .into_iter()
-            .filter_map(|(name, metadata)| match metadata.interns {
-                std::borrow::Cow::Owned(interns) => Some((
+            .filter_map(|(name, metadata)| {
+                let interns_owned = matches!(metadata.interns, std::borrow::Cow::Owned(_));
+                let summary_owned = matches!(metadata.summary, Some(std::borrow::Cow::Owned(_)));
+                if !interns_owned && !summary_owned {
+                    return None;
+                }
+                Some((
                     name,
-                    interns,
-                    metadata.origins.map(|origins| origins.into_owned()),
-                )),
-                std::borrow::Cow::Borrowed(_) => None,
+                    interns_owned.then(|| metadata.interns.into_owned()),
+                    interns_owned.then(|| metadata.origins.map(|o| o.into_owned())),
+                    summary_owned.then(|| metadata.summary.map(|s| s.into_owned())),
+                ))
             })
             .collect();
         drop(interns_map);
-        for (name, interns, origins) in updates {
+        for (name, interns, origins, summary) in updates {
             let item = table
                 .get_mut(&name)
                 .expect("inlined caller remains in the item table");
-            item.jir.use_interns(interns);
-            item.jir.origins = origins;
+            if let Some(interns) = interns {
+                item.jir.use_interns(interns);
+                item.jir.origins = origins.flatten();
+            }
+            if let Some(Some(summary)) = summary {
+                item.jir.summary = Some(summary);
+            }
         }
     }
     let pruned_post_inline = if run_dce && group.inline.applied > 0 {

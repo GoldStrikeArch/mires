@@ -2721,7 +2721,7 @@ impl<'a> JsCx<'a> {
 }
 
 /// Whether an emitted item name is `<path>$<lang_fn>$h<hash>`.
-fn names_lang_fn(name: &str, lang_fn: &str) -> bool {
+pub(crate) fn names_lang_fn(name: &str, lang_fn: &str) -> bool {
     let Some((stem, hash)) = name.rsplit_once("$h") else {
         return false;
     };
@@ -2732,7 +2732,7 @@ fn names_lang_fn(name: &str, lang_fn: &str) -> bool {
 }
 
 /// The lang item function name of an `AssertKind` (`AssertKind::panic_function`).
-fn panic_function(msg: &RAssertMessage) -> &'static str {
+pub(crate) fn panic_function(msg: &RAssertMessage) -> &'static str {
     match msg {
         RAssertMessage::Overflow { op, .. } => match op {
             BinaryOp::Add => "panic_const_add_overflow",

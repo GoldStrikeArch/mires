@@ -9,6 +9,7 @@ use crate::jir::repr::{Func, OpKind, Proj, RTerm};
 use crate::jir::semantic::{
     Callee, ConstTree, DirectItemRef, DropGlue, GlobalReference, HostPayload, StaticStep,
 };
+use crate::jir::summary::ItemSummary;
 use crate::jir::types::{FieldDescriptor, FieldKey, SigAbi, TypeId, TypeKind, VariantDescriptor};
 use rcgjs_object::object::Header;
 
@@ -20,6 +21,7 @@ pub(crate) struct Metadata<'a> {
     pub interns: Cow<'a, Interns>,
     pub origins: Option<Cow<'a, OriginTable>>,
     pub header: Option<&'a Header>,
+    pub summary: Option<Cow<'a, ItemSummary>>,
 }
 
 impl Metadata<'_> {

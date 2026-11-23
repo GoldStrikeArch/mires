@@ -611,6 +611,13 @@ impl<'a> JsCx<'a> {
                 if let Some(TypeKind::Array { element, .. }) = value::kind(self.table, ty) {
                     if self.table.is_indirect(*element) {
                         args.push(Expr::Bool(true));
+                        let heap = self.heap();
+                        if heap.typed_heap_enabled
+                            && !heap.non_rc_raw_alloc_reachable
+                            && !heap.needs_box_tracking(self.table, *element)
+                        {
+                            args.push(Expr::Bool(true));
+                        }
                     }
                 }
                 Ok(vec![jsast::expr_stmt(jsast::rt_call("write_array", args))])
@@ -637,7 +644,11 @@ impl<'a> JsCx<'a> {
                     } else {
                         jsast::rt_call("detach_str_memo", vec![value])
                     };
-                    jsast::rt_call("byte_slice_ref", vec![live])
+                    if self.needs_byte_slice_ref() {
+                        jsast::rt_call("byte_slice_ref", vec![live])
+                    } else {
+                        live
+                    }
                 }
                 (true, false) => self.bytes_to_str(value),
                 (false, false) => value,
@@ -645,15 +656,17 @@ impl<'a> JsCx<'a> {
             });
         }
         if let Some(identity) = walk.identity {
-            if let Some(TypeKind::Slice(element)) = value::kind(self.table, walk.ty) {
-                if let Some(TypeKind::Integer { bits: 8, signed }) =
-                    value::kind(self.table, *element)
-                {
-                    let mut args = vec![identity];
-                    if *signed {
-                        args.push(Expr::Bool(true));
+            if self.needs_byte_slice_ref() {
+                if let Some(TypeKind::Slice(element)) = value::kind(self.table, walk.ty) {
+                    if let Some(TypeKind::Integer { bits: 8, signed }) =
+                        value::kind(self.table, *element)
+                    {
+                        let mut args = vec![identity];
+                        if *signed {
+                            args.push(Expr::Bool(true));
+                        }
+                        return Ok(jsast::rt_call("byte_slice_ref", args));
                     }
-                    return Ok(jsast::rt_call("byte_slice_ref", args));
                 }
             }
             return Ok(identity);
@@ -680,17 +693,19 @@ impl<'a> JsCx<'a> {
         }
         if self.table.is_indirect(walk.ty) {
             let value = self.read_place(&walk.place);
-            if let Some(TypeKind::Slice(element)) =
-                value::kind(self.table, self.table.peeled(walk.ty))
-            {
-                if let Some(TypeKind::Integer { bits: 8, signed }) =
-                    value::kind(self.table, self.table.peeled(*element))
+            if self.needs_byte_slice_ref() {
+                if let Some(TypeKind::Slice(element)) =
+                    value::kind(self.table, self.table.peeled(walk.ty))
                 {
-                    let mut args = vec![value];
-                    if *signed {
-                        args.push(Expr::Bool(true));
+                    if let Some(TypeKind::Integer { bits: 8, signed }) =
+                        value::kind(self.table, self.table.peeled(*element))
+                    {
+                        let mut args = vec![value];
+                        if *signed {
+                            args.push(Expr::Bool(true));
+                        }
+                        return Ok(jsast::rt_call("byte_slice_ref", args));
                     }
-                    return Ok(jsast::rt_call("byte_slice_ref", args));
                 }
             }
             return Ok(value);

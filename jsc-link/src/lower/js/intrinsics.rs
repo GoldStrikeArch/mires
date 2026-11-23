@@ -1558,12 +1558,21 @@ impl Intrinsic<'_, '_> {
             return Ok(self.not_a_pointer(name));
         };
         let (dst, src) = (self.arg(target)?, self.arg(source)?);
+        let count_is_one = self.args.get(2).is_some_and(|v| {
+            self.cx.def_of(*v).is_some_and(|op| {
+                matches!(
+                    op.kind,
+                    OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Scalar { bits: 1, .. })
+                )
+            })
+        });
         Ok(Outcome::Done(self.cx.ptr_copy(
             pointee,
             dst,
             src,
             self.arg(2)?,
             overlapping,
+            count_is_one,
         )))
     }
 

@@ -10837,13 +10837,266 @@ fn phase3_typed_heap_lowers_hooks_plain_put_and_zero_offset_guard() {
     let pl2 = plan_of(&f2, &[(0, "p"), (1, "n"), (2, "v")]);
     let js2 = lower_with("put_and_offset", &f2, &pl2, straight(&f2), &tier_a);
     assert!(
-        js2.contains("__rt._put_plain(p.buf, p.off + n, v)"),
-        "write through dynamic offset must fold to _put_plain without slot allocation:\n{js2}"
+        js2.contains("p.buf[p.off + n] = v;"),
+        "write through dynamic offset on untracked ADT must fold to direct store without slot allocation:\n{js2}"
     );
     assert!(
         js2.contains("n === 0 ? p : { buf: p.buf, off: p.off + n }"),
         "returned dynamic offset must guard zero count for dangling pointers:\n{js2}"
     );
+}
+
+#[test]
+fn phase4_inline_overwrite_copy_one_and_sfp_len() {
+    let mut interns = world();
+    let copy_nonoverlapping = interns.intern_str("copy_nonoverlapping");
+
+    let pair_adt = TypeId(560);
+    let mut_ref_pair = TypeId(561);
+    let opt_adt = TypeId(562);
+    let mut_ref_opt = TypeId(563);
+    let ptr_u32 = TypeId(564);
+    let slice_u32 = TypeId(565);
+    let ref_slice_u32 = TypeId(566);
+
+    let fx = interns.intern_str("x");
+    let fy = interns.intern_str("y");
+    let f0 = interns.intern_str("_0");
+    let v_none = interns.intern_str("None");
+    let v_some = interns.intern_str("Some");
+
+    let mut pair_desc = descriptor(
+        pair_adt,
+        TypeKind::Adt {
+            def: DefinitionId {
+                crate_id: 9,
+                local_hash: 10,
+            },
+            form: NominalForm::Struct,
+            args: Vec::new(),
+            variants: vec![variant(
+                fx,
+                vec![
+                    field(FieldKey::Name(fx), U32),
+                    field(FieldKey::Name(fy), U32),
+                ],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        8,
+    );
+    pair_desc.js.is_indirect = true;
+    pair_desc.js.needs_clone = false;
+    interns.types.insert(pair_desc);
+    interns
+        .types
+        .insert(pointer(mut_ref_pair, pair_adt, PointerForm::Thin, false));
+
+    let mut opt_desc = descriptor(
+        opt_adt,
+        TypeKind::Adt {
+            def: DefinitionId {
+                crate_id: 9,
+                local_hash: 11,
+            },
+            form: NominalForm::Enum,
+            args: Vec::new(),
+            variants: vec![
+                variant(v_none, Vec::new(), 0, Some(0)),
+                variant(v_some, vec![field(FieldKey::Name(f0), U32)], 1, Some(1)),
+            ],
+            niche: None,
+        },
+        8,
+    );
+    opt_desc.js.is_indirect = true;
+    opt_desc.js.needs_clone = false;
+    opt_desc.js.enum_repr = Some(EnumRepr::Tag { fieldless: false });
+    interns.types.insert(opt_desc);
+    interns
+        .types
+        .insert(pointer(mut_ref_opt, opt_adt, PointerForm::Thin, false));
+    interns
+        .types
+        .insert(pointer(ptr_u32, U32, PointerForm::Slot, true));
+    interns
+        .types
+        .insert(descriptor(slice_u32, TypeKind::Slice(U32), 0));
+    interns.types.insert(pointer(
+        ref_slice_u32,
+        slice_u32,
+        PointerForm::FatSlice,
+        true,
+    ));
+
+    let tier_a = crate::analysis::heap::HeapPlan {
+        typed_heap_enabled: true,
+        raw_alloc_reachable: false,
+        non_rc_raw_alloc_reachable: false,
+        any_boxed: false,
+        boxed_defs: BTreeSet::new(),
+        boxed_non_adt: false,
+        all_adts_boxed: false,
+    };
+    let speed_opts = Opts {
+        profile: Some(crate::opts::Profile::ReleaseSpeed),
+        ..Opts::default()
+    };
+    let items = super::host::ItemIndex::new();
+    let vtables = super::unsize::VtableIndex::new();
+    let lower_tier_a = |name: &str, func: &Func, plan: &Plan, region| {
+        let sum = summary(&[]);
+        let body = body_of(BodyKind::Function, func.sig.clone());
+        let js_name = JsName::new(name.to_owned());
+        let input = LowerInput {
+            name: &js_name,
+            summary: &sum,
+            body: &body,
+            origins: None,
+            interns: &interns,
+            table: &interns.types,
+            opts: &speed_opts,
+            items: &items,
+            drop_glue: super::host::EMPTY_DROP_GLUE,
+            vtables: &vtables,
+            spills: &[],
+            abi: None,
+            physical: None,
+            call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            bigints: None,
+            byte_views: crate::analysis::byte_views::ByteViewPlan {
+                raw_byte_derefs: false,
+                elide_scale_scalar: true,
+            },
+            heap: Some(&tier_a),
+            nested_clone: crate::lower::NestedClone::default(),
+        };
+        jsast::stmt_to_string(
+            &function::lower(&input, func, plan, region)
+                .expect("lower")
+                .decl,
+        )
+    };
+
+    // 1. Bare `&mut Struct` and `&mut Option<u32>` overwrites inline field assignments without `__rt.overwrite` or `delete`.
+    let e = RBlockId(0);
+    let mut b1 = FuncBuilder::new(
+        item(100),
+        signature(vec![mut_ref_pair, mut_ref_opt, U32], UNIT),
+    );
+    let dst_pair = b1.param(mut_ref_pair, NO_ORIGIN);
+    let dst_opt = b1.param(mut_ref_opt, NO_ORIGIN);
+    let val = b1.param(U32, NO_ORIGIN);
+    let pair_val = b1.op(
+        e,
+        OpKind::Aggregate {
+            ty: pair_adt,
+            variant: 0,
+            active_field: None,
+            fields: vec![val, val],
+        },
+        pair_adt,
+        NO_ORIGIN,
+    );
+    b1.effect(
+        e,
+        OpKind::StoreThrough {
+            ptr: dst_pair,
+            v: pair_val,
+        },
+        NO_ORIGIN,
+    );
+    let none_val = b1.op(
+        e,
+        OpKind::Aggregate {
+            ty: opt_adt,
+            variant: 0,
+            active_field: None,
+            fields: Vec::new(),
+        },
+        opt_adt,
+        NO_ORIGIN,
+    );
+    b1.effect(
+        e,
+        OpKind::StoreThrough {
+            ptr: dst_opt,
+            v: none_val,
+        },
+        NO_ORIGIN,
+    );
+    b1.terminate(e, RTerm::Return(None));
+    let f1 = b1.finish();
+    let pl1 = plan_of(&f1, &[(0, "dp"), (1, "do"), (2, "v")]);
+    let js1 = lower_tier_a("inline_overwrites", &f1, &pl1, straight(&f1));
+    assert!(!js1.contains("__rt.overwrite"), "{js1}");
+    assert!(!js1.contains("delete "), "{js1}");
+    assert!(js1.contains("dp.x = v;"), "{js1}");
+    assert!(js1.contains("dp.y = v;"), "{js1}");
+    assert!(js1.contains("do.TAG = \"None\";"), "{js1}");
+    assert!(js1.contains("do._0 = undefined;"), "{js1}");
+
+    // 2. `copy_nonoverlapping` with constant count 1 inlines directly to element copy without runtime call.
+    let mut b2 = FuncBuilder::new(item(101), signature(vec![ptr_u32, ptr_u32], UNIT));
+    let src = b2.param(ptr_u32, NO_ORIGIN);
+    let dst = b2.param(ptr_u32, NO_ORIGIN);
+    let one = b2.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+        USIZE,
+        NO_ORIGIN,
+    );
+    b2.effect(
+        e,
+        OpKind::Intrinsic {
+            name: copy_nonoverlapping,
+            types: vec![U32],
+            fallback: None,
+            args: vec![src, dst, one],
+            track_caller: None,
+        },
+        NO_ORIGIN,
+    );
+    b2.terminate(e, RTerm::Return(None));
+    let f2 = b2.finish();
+    let pl2 = plan_of(&f2, &[(0, "s"), (1, "d")]);
+    let js2 = lower_tier_a("copy_one", &f2, &pl2, straight(&f2));
+    assert!(!js2.contains("copy_nonoverlapping"), "{js2}");
+    assert!(js2.contains("d.buf[d.off] = s.buf[s.off];"), "{js2}");
+
+    // 3. Tier A `Aggregate(RawPtr)` slice construction uses `__rt.sfp` and `PtrMetadata` folds to `len`.
+    let mut b3 = FuncBuilder::new(item(102), signature(vec![ptr_u32, USIZE], USIZE));
+    let sp = b3.param(ptr_u32, NO_ORIGIN);
+    let slen = b3.param(USIZE, NO_ORIGIN);
+    let slice = b3.op(
+        e,
+        OpKind::Aggregate {
+            ty: ref_slice_u32,
+            variant: 0,
+            active_field: None,
+            fields: vec![sp, slen],
+        },
+        ref_slice_u32,
+        NO_ORIGIN,
+    );
+    let out_len = b3.op(
+        e,
+        OpKind::Unary {
+            op: UnaryOp::PtrMetadata,
+            v: slice,
+            ty: ref_slice_u32,
+        },
+        USIZE,
+        NO_ORIGIN,
+    );
+    b3.terminate(e, RTerm::Return(Some(out_len)));
+    let f3 = b3.finish();
+    let pl3 = plan_of(&f3, &[(0, "p"), (1, "n")]);
+    let js3 = lower_tier_a("sfp_len_fold", &f3, &pl3, straight(&f3));
+    assert!(js3.contains("return n;"), "{js3}");
+    assert!(!js3.contains("slice_from_parts"), "{js3}");
 }
 
 mod invoke;

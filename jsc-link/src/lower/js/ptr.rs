@@ -3,7 +3,9 @@
 //! the record shape itself is `rcgjs_object::ptr`).
 
 use rcgjs_object::jir::decline::OpClass;
-use rcgjs_object::jir::types::{FieldKey, TypeId, TypeKind};
+use rcgjs_object::jir::types::{
+    EnumRepr, FieldKey, NominalForm, RepresentationCandidate, TypeId, TypeKind,
+};
 use rcgjs_object::jsast::{self, BinOp, Expr, Stmt};
 use rcgjs_object::ptr::{self, BUF, LEN, META, OFF, PTR};
 
@@ -69,6 +71,13 @@ impl<'a> JsCx<'a> {
             let mut args = vec![pointer, value];
             if table.is_indirect(*element) {
                 args.push(Expr::Bool(true));
+                let heap = self.heap();
+                if heap.typed_heap_enabled
+                    && !heap.non_rc_raw_alloc_reachable
+                    && !heap.needs_box_tracking(table, *element)
+                {
+                    args.push(Expr::Bool(true));
+                }
             }
             return Ok(vec![jsast::expr_stmt(jsast::rt_call("write_array", args))]);
         }
@@ -103,23 +112,264 @@ impl<'a> JsCx<'a> {
             ))]);
         }
         let heap = self.heap();
+        let direct_plain_store = heap.typed_heap_enabled
+            && !heap.non_rc_raw_alloc_reachable
+            && !heap.needs_box_tracking(table, pointee);
         let put_helper = if heap.typed_heap_enabled && !heap.non_rc_raw_alloc_reachable {
-            if heap.needs_box_tracking(table, pointee) {
-                "_put_tracked"
-            } else {
-                "_put_plain"
-            }
+            "_put_tracked"
         } else {
             "_put"
         };
         let call = match target {
-            Expr::Index(base, key) => jsast::rt_call(put_helper, vec![*base, *key, value]),
+            Expr::Index(base, key) => {
+                if direct_plain_store {
+                    return Ok(vec![jsast::assign_stmt(Expr::Index(base, key), value)]);
+                }
+                jsast::rt_call(put_helper, vec![*base, *key, value])
+            }
             Expr::Member(base, name) => {
+                if direct_plain_store {
+                    return Ok(vec![jsast::assign_stmt(Expr::Member(base, name), value)]);
+                }
                 jsast::rt_call(put_helper, vec![*base, jsast::string(name), value])
             }
-            target => jsast::rt_call("overwrite", vec![target, value]),
+            target => {
+                if heap.typed_heap_enabled {
+                    match self.try_inline_overwrite(pointee, target, value) {
+                        Ok(stmts) => return Ok(stmts),
+                        Err((target, value)) => jsast::rt_call("overwrite", vec![target, value]),
+                    }
+                } else {
+                    jsast::rt_call("overwrite", vec![target, value])
+                }
+            }
         };
         Ok(vec![jsast::expr_stmt(call)])
+    }
+
+    /// Lowers `*target = value` on a bare indirect reference (`&mut T`) to direct field/element
+    /// assignments without calling `__rt.overwrite` (avoiding `for..in`, `delete`, V8 dictionary
+    /// mode transitions, and temporary object literal allocations).
+    fn try_inline_overwrite(
+        &self,
+        pointee: TypeId,
+        target: Expr,
+        value: Expr,
+    ) -> Result<Vec<Stmt>, (Expr, Expr)> {
+        let table = self.table;
+        let peeled = table.peeled(pointee);
+        let Some(desc) = table.get(peeled) else {
+            return Err((target, value));
+        };
+        let is_simple_atom = |e: &Expr| {
+            matches!(
+                e,
+                Expr::Ident(_)
+                    | Expr::Num(_)
+                    | Expr::RawNum(_)
+                    | Expr::Bool(_)
+                    | Expr::Str(_)
+                    | Expr::Undefined
+                    | Expr::Null
+                    | Expr::BigInt(_)
+            )
+        };
+        let mut stmts = Vec::new();
+        let bind_target = |target: Expr, stmts: &mut Vec<Stmt>| -> Expr {
+            if matches!(target, Expr::Ident(_)) {
+                target
+            } else {
+                let (bind, id) = self.temp(target);
+                stmts.push(bind);
+                id
+            }
+        };
+        match &desc.kind {
+            TypeKind::Adt {
+                form: NominalForm::Struct,
+                variants,
+                ..
+            } => {
+                let candidate_safe = match desc.meta.candidate {
+                    RepresentationCandidate::None => true,
+                    RepresentationCandidate::Vec => {
+                        !self.nested_clone.vec && self.all_baseline_carriers()
+                    }
+                    RepresentationCandidate::String => {
+                        !self.nested_clone.string && self.all_baseline_carriers()
+                    }
+                    RepresentationCandidate::BTreeMap => {
+                        !self.nested_clone.map && self.all_baseline_carriers()
+                    }
+                    RepresentationCandidate::Box => self.all_baseline_carriers(),
+                };
+                let [variant] = variants.as_slice() else {
+                    return Err((target, value));
+                };
+                if !candidate_safe || variant.fields.is_empty() || variant.fields.len() > 12 {
+                    return Err((target, value));
+                }
+                let mut keys = Vec::with_capacity(variant.fields.len());
+                for field in &variant.fields {
+                    let Some(k) = value::key_name(self.interns, field.key) else {
+                        return Err((target, value));
+                    };
+                    keys.push(k);
+                }
+                if let Expr::Object(ref entries) = value {
+                    let mut unique = std::collections::HashSet::with_capacity(entries.len());
+                    let matches_exact = entries.len() == keys.len()
+                        && entries
+                            .iter()
+                            .all(|(k, _)| keys.contains(k) && unique.insert(k.as_str()));
+                    if matches_exact {
+                        let Expr::Object(entries) = value else {
+                            unreachable!()
+                        };
+                        let t = bind_target(target, &mut stmts);
+                        let mut evaluated = Vec::with_capacity(entries.len());
+                        for (k, v) in entries {
+                            let val = if is_simple_atom(&v) {
+                                v
+                            } else {
+                                let (bind, id) = self.temp(v);
+                                stmts.push(bind);
+                                id
+                            };
+                            evaluated.push((k, val));
+                        }
+                        for (k, v) in evaluated {
+                            stmts.push(jsast::assign_stmt(jsast::member(t.clone(), k), v));
+                        }
+                        return Ok(stmts);
+                    }
+                }
+                let t = bind_target(target, &mut stmts);
+                let v = if matches!(value, Expr::Ident(_)) {
+                    value
+                } else {
+                    let (bind, id) = self.temp(value);
+                    stmts.push(bind);
+                    id
+                };
+                for k in keys {
+                    stmts.push(jsast::assign_stmt(
+                        jsast::member(t.clone(), k.clone()),
+                        jsast::member(v.clone(), k),
+                    ));
+                }
+                Ok(stmts)
+            }
+            TypeKind::Adt {
+                form: NominalForm::Enum,
+                variants,
+                ..
+            } if table.enum_repr(peeled) == Some(EnumRepr::Tag { fieldless: false }) => {
+                let mut keys: Vec<String> = vec![value::TAG.to_owned()];
+                for variant in variants {
+                    for field in &variant.fields {
+                        let Some(k) = value::key_name(self.interns, field.key) else {
+                            return Err((target, value));
+                        };
+                        if !keys.contains(&k) {
+                            keys.push(k);
+                        }
+                    }
+                }
+                if keys.len() <= 1 || keys.len() > 12 {
+                    return Err((target, value));
+                }
+                if let Expr::Object(ref entries) = value {
+                    let mut unique = std::collections::HashSet::with_capacity(entries.len());
+                    let all_known = entries
+                        .iter()
+                        .all(|(k, _)| keys.contains(k) && unique.insert(k.as_str()));
+                    if all_known {
+                        let Expr::Object(entries) = value else {
+                            unreachable!()
+                        };
+                        let t = bind_target(target, &mut stmts);
+                        let mut by_key = std::collections::HashMap::with_capacity(entries.len());
+                        for (k, v) in entries {
+                            let val = if is_simple_atom(&v) {
+                                v
+                            } else {
+                                let (bind, id) = self.temp(v);
+                                stmts.push(bind);
+                                id
+                            };
+                            by_key.insert(k, val);
+                        }
+                        for k in keys {
+                            let rhs = by_key.remove(&k).unwrap_or_else(jsast::undefined);
+                            stmts.push(jsast::assign_stmt(jsast::member(t.clone(), k), rhs));
+                        }
+                        return Ok(stmts);
+                    }
+                }
+                let t = bind_target(target, &mut stmts);
+                let v = if matches!(value, Expr::Ident(_)) {
+                    value
+                } else {
+                    let (bind, id) = self.temp(value);
+                    stmts.push(bind);
+                    id
+                };
+                for k in keys {
+                    stmts.push(jsast::assign_stmt(
+                        jsast::member(t.clone(), k.clone()),
+                        jsast::member(v.clone(), k),
+                    ));
+                }
+                Ok(stmts)
+            }
+            TypeKind::Tuple(elems) if !elems.is_empty() && elems.len() <= 8 => {
+                let len = elems.len();
+                if let Expr::Array(ref items) = value {
+                    if items.len() == len {
+                        let Expr::Array(items) = value else {
+                            unreachable!()
+                        };
+                        let t = bind_target(target, &mut stmts);
+                        let mut evaluated = Vec::with_capacity(len);
+                        for item in items {
+                            let val = if is_simple_atom(&item) {
+                                item
+                            } else {
+                                let (bind, id) = self.temp(item);
+                                stmts.push(bind);
+                                id
+                            };
+                            evaluated.push(val);
+                        }
+                        for (i, val) in evaluated.into_iter().enumerate() {
+                            stmts.push(jsast::assign_stmt(
+                                jsast::index(t.clone(), jsast::num(i as f64)),
+                                val,
+                            ));
+                        }
+                        return Ok(stmts);
+                    }
+                }
+                let t = bind_target(target, &mut stmts);
+                let v = if matches!(value, Expr::Ident(_)) {
+                    value
+                } else {
+                    let (bind, id) = self.temp(value);
+                    stmts.push(bind);
+                    id
+                };
+                for i in 0..len {
+                    let idx = jsast::num(i as f64);
+                    stmts.push(jsast::assign_stmt(
+                        jsast::index(t.clone(), idx.clone()),
+                        jsast::index(v.clone(), idx),
+                    ));
+                }
+                Ok(stmts)
+            }
+            _ => Err((target, value)),
+        }
     }
 
     /// `pointer.add(count)` (`ptr.rs::add`).
@@ -252,6 +502,22 @@ impl<'a> JsCx<'a> {
         jsast::rt_call("addr", vec![pointer, jsast::num(size as f64)])
     }
 
+    /// Whether a single-element `copy`/`copy_nonoverlapping` for `pointee` can lower directly to
+    /// an inline slot load/store (zero shim calls, zero slot-record allocations).
+    pub(super) fn can_inline_copy_one(&self, pointee: TypeId) -> bool {
+        let heap = self.heap();
+        heap.typed_heap_enabled
+            && !heap.non_rc_raw_alloc_reachable
+            && !self.byte_views.raw_byte_derefs
+            && self.byte_views.elide_scale_scalar
+            && !heap.needs_box_tracking(self.table, pointee)
+            && is_slot_pointee(self.table, pointee)
+            && !matches!(
+                value::kind(self.table, pointee),
+                Some(TypeKind::Array { .. })
+            )
+    }
+
     /// `ptr::copy`/`copy_nonoverlapping` as a statement (`ptr.rs::copy`).
     pub fn ptr_copy(
         &self,
@@ -260,9 +526,26 @@ impl<'a> JsCx<'a> {
         src: Expr,
         count: Expr,
         overlapping: bool,
+        count_is_one: bool,
     ) -> Vec<Stmt> {
         if self.table.is_zst(pointee) {
             return Vec::new();
+        }
+        if (count_is_one || count == jsast::num(1)) && self.can_inline_copy_one(pointee) {
+            let src_elem = slot_element_unwrapped(self, src);
+            let dst_elem = slot_element_unwrapped(self, dst);
+            if self.table.needs_clone(pointee) {
+                let (bind, val) = self.temp(src_elem);
+                let cloned = value::clone_expr_with(
+                    self.table,
+                    self.interns,
+                    pointee,
+                    val,
+                    self.nested_clone,
+                );
+                return vec![bind, jsast::assign_stmt(dst_elem, cloned)];
+            }
+            return vec![jsast::assign_stmt(dst_elem, src_elem)];
         }
         let name = if overlapping {
             "copy"
@@ -276,8 +559,7 @@ impl<'a> JsCx<'a> {
                 value::clone_expr(self.table, self.interns, pointee, jsast::id(CLONE_PARAM)),
             ));
             let heap = self.heap();
-            if !overlapping
-                && heap.typed_heap_enabled
+            if heap.typed_heap_enabled
                 && !heap.non_rc_raw_alloc_reachable
                 && !heap.needs_box_tracking(self.table, pointee)
             {
@@ -307,16 +589,19 @@ impl<'a> JsCx<'a> {
         if self.table.unsized_tail(pointee).is_some() {
             return jsast::rt_call("tail_ref", vec![raw]);
         }
-        if let Some(TypeKind::Slice(element)) = value::kind(self.table, self.table.peeled(pointee))
-        {
-            if let Some(TypeKind::Integer { bits: 8, signed }) =
-                value::kind(self.table, self.table.peeled(*element))
+        if self.needs_byte_slice_ref() {
+            if let Some(TypeKind::Slice(element)) =
+                value::kind(self.table, self.table.peeled(pointee))
             {
-                let mut args = vec![raw];
-                if *signed {
-                    args.push(Expr::Bool(true));
+                if let Some(TypeKind::Integer { bits: 8, signed }) =
+                    value::kind(self.table, self.table.peeled(*element))
+                {
+                    let mut args = vec![raw];
+                    if *signed {
+                        args.push(Expr::Bool(true));
+                    }
+                    return jsast::rt_call("byte_slice_ref", args);
                 }
-                return jsast::rt_call("byte_slice_ref", args);
             }
         }
         if !is_slot_pointee(self.table, pointee) || !self.table.is_indirect(pointee) {
@@ -329,8 +614,7 @@ impl<'a> JsCx<'a> {
             }
             return jsast::rt_call("array_ref", args);
         }
-        let (setup, raw) = self.reread(raw, &[BUF, OFF]);
-        sequenced(setup, ptr::slot_element(raw))
+        slot_element_unwrapped(self, raw)
     }
 
     /// The zero element factory `__rt.unscale`/`retype` take (`alloc_support.rs::zero_factory`).
@@ -477,11 +761,18 @@ impl<'a> JsCx<'a> {
                         }
                         None => data,
                     };
-                    let mut arguments = vec![data, meta];
-                    if let Some(tag) = byte_tag {
-                        arguments.push(jsast::num(tag));
+                    let use_sfp = self.heap().typed_heap_enabled
+                        && self.byte_views.elide_scale_scalar
+                        && !self.byte_views.raw_byte_derefs;
+                    if use_sfp {
+                        Ok(jsast::rt_call("sfp", vec![data, meta]))
+                    } else {
+                        let mut arguments = vec![data, meta];
+                        if let Some(tag) = byte_tag {
+                            arguments.push(jsast::num(tag));
+                        }
+                        Ok(jsast::rt_call("slice_from_parts", arguments))
                     }
-                    Ok(jsast::rt_call("slice_from_parts", arguments))
                 }
             },
             Some(TypeKind::Str) => {
@@ -490,10 +781,17 @@ impl<'a> JsCx<'a> {
                     None => data,
                 };
                 if mutable {
-                    Ok(jsast::rt_call(
-                        "slice_from_parts",
-                        vec![data, meta, jsast::num(1.0)],
-                    ))
+                    let use_sfp = self.heap().typed_heap_enabled
+                        && self.byte_views.elide_scale_scalar
+                        && !self.byte_views.raw_byte_derefs;
+                    if use_sfp {
+                        Ok(jsast::rt_call("sfp", vec![data, meta]))
+                    } else {
+                        Ok(jsast::rt_call(
+                            "slice_from_parts",
+                            vec![data, meta, jsast::num(1.0)],
+                        ))
+                    }
                 } else {
                     let (setup, data) = self.reread(data, &[BUF, OFF]);
                     let decoded = jsast::rt_call(
@@ -632,10 +930,15 @@ impl<'a> JsCx<'a> {
     pub fn str_to_bytes(&self, string: Expr) -> Expr {
         let (pre, tail) = peel_seq(string);
         match bytes_str_args(tail) {
-            Ok((buf, off, len)) => sequenced_vec(
-                pre,
-                jsast::rt_call("byte_slice_ref", vec![ptr::fat_slice(buf, off, len)]),
-            ),
+            Ok((buf, off, len)) => {
+                let slice = ptr::fat_slice(buf, off, len);
+                let slice = if self.needs_byte_slice_ref() {
+                    jsast::rt_call("byte_slice_ref", vec![slice])
+                } else {
+                    slice
+                };
+                sequenced_vec(pre, slice)
+            }
             Err(tail) => jsast::rt_call("str_bytes", vec![sequenced_vec(pre, tail)]),
         }
     }
@@ -698,6 +1001,18 @@ impl<'a> JsCx<'a> {
     /// `self.as_bytes().len()`, and a length needs no bytes.
     pub fn slice_len(&self, slice: Expr) -> Expr {
         let (pre, tail) = peel_seq(slice);
+        if !self.byte_views.raw_byte_derefs {
+            if let Expr::Call(ref callee, ref args) = tail {
+                if (is_rt_call(callee, "sfp") || is_rt_call(callee, "slice_from_parts"))
+                    && (args.len() == 2 || args.len() == 3)
+                    && jsast::is_droppable(&args[0])
+                    && args.get(2).is_none_or(jsast::is_droppable)
+                {
+                    let len = args[1].clone();
+                    return sequenced_vec(pre, len);
+                }
+            }
+        }
         match str_bytes_operand(tail) {
             Ok(string) => self.str_len(sequenced_vec(pre, string)),
             Err(Expr::Object(entries)) if jsast::folds_property(&entries, LEN) => {
@@ -1390,10 +1705,7 @@ pub(super) fn slot_element_unwrapped(cx: &JsCx<'_>, pointer: Expr) -> Expr {
         jsast::seq(prefix)
     };
     let (setup, slot) = cx.reread(rebuilt, &[BUF, OFF]);
-    jsast::index(
-        sequenced(setup, ptr::slot_buf(slot.clone())),
-        ptr::slot_off(slot),
-    )
+    sequenced(setup, ptr::slot_element(slot))
 }
 
 fn peel_seq(expr: Expr) -> (Vec<Expr>, Expr) {

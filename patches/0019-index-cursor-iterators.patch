@@ -1,0 +1,1109 @@
+--- a/library/alloc/src/vec/in_place_collect.rs	2026-11-23 21:55:42
++++ b/library/alloc/src/vec/in_place_collect.rs	2026-11-23 21:58:18
+@@ -283,14 +283,14 @@
+     I: Iterator<Item = T> + InPlaceCollect,
+     <I as SourceIter>::Source: AsVecIntoIter,
+ {
+-    let (src_buf, src_ptr, src_cap, mut dst_buf, dst_end, dst_cap) = unsafe {
++    let (src_buf, src_pos, src_cap, mut dst_buf, dst_end, dst_cap) = unsafe {
+         let inner = iterator.as_inner().as_into_iter();
+         (
+             inner.buf,
+-            inner.ptr,
++            inner.pos,
+             inner.cap,
+             inner.buf.cast::<T>(),
+-            inner.end as *const T,
++            inner.end_ptr() as *const T,
+             // SAFETY: the multiplication can not overflow, since `inner.cap * size_of::<I::SRC>()` is the size of the allocation.
+             inner.cap.unchecked_mul(size_of::<I::Src>()) / size_of::<T>(),
+         )
+@@ -308,9 +308,9 @@
+     // check InPlaceIterable contract. This is only possible if the iterator advanced the
+     // source pointer at all. If it uses unchecked access via TrustedRandomAccess
+     // then the source pointer will stay in its initial position and we can't use it as reference
+-    if src.ptr != src_ptr {
++    if src.pos != src_pos {
+         debug_assert!(
+-            unsafe { dst_buf.add(len).cast() } <= src.ptr,
++            unsafe { dst_buf.add(len).cast() } <= src.cur_ptr(),
+             "InPlaceIterable contract violation, write pointer advanced beyond read pointer"
+         );
+     }
+--- a/library/alloc/src/vec/into_iter.rs	2026-11-23 21:55:42
++++ b/library/alloc/src/vec/into_iter.rs	2026-11-23 21:59:28
+@@ -18,17 +18,6 @@
+ use crate::collections::VecDeque;
+ use crate::raw_vec::RawVec;
+ 
+-macro non_null {
+-    (mut $place:expr, $t:ident) => {{
+-        #![allow(unused_unsafe)] // we're sometimes used within an unsafe block
+-        unsafe { &mut *((&raw mut $place) as *mut NonNull<$t>) }
+-    }},
+-    ($place:expr, $t:ident) => {{
+-        #![allow(unused_unsafe)] // we're sometimes used within an unsafe block
+-        unsafe { *((&raw const $place) as *const NonNull<$t>) }
+-    }},
+-}
+-
+ /// An iterator that moves out of a vector.
+ ///
+ /// This `struct` is created by the `into_iter` method on [`Vec`](super::Vec)
+@@ -52,12 +41,10 @@
+     // the drop impl reconstructs a RawVec from buf, cap and alloc
+     // to avoid dropping the allocator twice we need to wrap it into ManuallyDrop
+     pub(super) alloc: ManuallyDrop<A>,
+-    pub(super) ptr: NonNull<T>,
+-    /// If T is a ZST, this is actually ptr+len. This encoding is picked so that
+-    /// ptr == end is a quick test for the Iterator being empty, that works
+-    /// for both ZST and non-ZST.
+-    /// For non-ZSTs the pointer is treated as `NonNull<T>`
+-    pub(super) end: *const T,
++    /// Index of the next element to yield from the front (`0 <= pos <= end <= cap`).
++    pub(super) pos: usize,
++    /// One-past-the-end index of the remaining elements.
++    pub(super) end: usize,
+ }
+ 
+ // Manually mirroring what `Vec` has,
+@@ -73,6 +60,24 @@
+ }
+ 
+ impl<T, A: Allocator> IntoIter<T, A> {
++    #[inline]
++    pub(super) fn cur_ptr(&self) -> NonNull<T> {
++        if T::IS_ZST {
++            self.buf
++        } else {
++            unsafe { self.buf.add(self.pos) }
++        }
++    }
++
++    #[inline]
++    pub(super) fn end_ptr(&self) -> *const T {
++        if T::IS_ZST {
++            self.buf.as_ptr().wrapping_byte_add(self.end)
++        } else {
++            unsafe { self.buf.as_ptr().add(self.end) }
++        }
++    }
++
+     /// Returns the remaining items of this iterator as a slice.
+     ///
+     /// # Examples
+@@ -86,7 +91,7 @@
+     /// ```
+     #[stable(feature = "vec_into_iter_as_slice", since = "1.15.0")]
+     pub fn as_slice(&self) -> &[T] {
+-        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len()) }
++        unsafe { slice::from_raw_parts(self.cur_ptr().as_ptr(), self.len()) }
+     }
+ 
+     /// Returns the remaining items of this iterator as a mutable slice.
+@@ -115,7 +120,7 @@
+     }
+ 
+     fn as_raw_mut_slice(&mut self) -> *mut [T] {
+-        self.ptr.as_ptr().cast_slice(self.len())
++        self.cur_ptr().as_ptr().cast_slice(self.len())
+     }
+ 
+     /// Drops remaining elements and relinquishes the backing allocation.
+@@ -148,8 +153,8 @@
+         // this creates less assembly
+         self.cap = 0;
+         self.buf = RawVec::new().non_null();
+-        self.ptr = self.buf;
+-        self.end = self.buf.as_ptr();
++        self.pos = 0;
++        self.end = 0;
+ 
+         // Dropping the remaining elements can panic, so this needs to be
+         // done only after updating the other fields.
+@@ -164,9 +169,7 @@
+     /// If consuming `self` is possible, consider calling
+     /// [`Self::forget_remaining_elements_and_dealloc()`] instead.
+     pub(crate) fn forget_remaining_elements(&mut self) {
+-        // For the ZST case, it is crucial that we mutate `end` here, not `ptr`.
+-        // `ptr` must stay aligned, while `end` may be unaligned.
+-        self.end = self.ptr.as_ptr();
++        self.end = self.pos;
+     }
+ 
+     /// Forgets to Drop the remaining elements and frees the backing allocation.
+@@ -223,7 +226,7 @@
+                 // say that they're all at the beginning of the "allocation".
+                 0..this.len()
+             } else {
+-                this.ptr.offset_from_unsigned(this.buf)..this.end.offset_from_unsigned(buf)
++                this.pos..this.end
+             };
+             let cap = this.cap;
+             let alloc = ManuallyDrop::take(&mut this.alloc);
+@@ -250,46 +253,29 @@
+ 
+     #[inline]
+     fn next(&mut self) -> Option<T> {
+-        let ptr = if T::IS_ZST {
+-            if self.ptr.as_ptr() == self.end as *mut T {
+-                return None;
+-            }
+-            // `ptr` has to stay where it is to remain aligned, so we reduce the length by 1 by
+-            // reducing the `end`.
+-            self.end = self.end.wrapping_byte_sub(1);
+-            self.ptr
+-        } else {
+-            if self.ptr == non_null!(self.end, T) {
+-                return None;
+-            }
+-            let old = self.ptr;
+-            self.ptr = unsafe { old.add(1) };
+-            old
+-        };
+-        Some(unsafe { ptr.read() })
++        let pos = self.pos;
++        if pos == self.end {
++            return None;
++        }
++        // SAFETY: `pos < self.end <= cap`, so `pos + 1` cannot overflow and `buf.add(pos)` is in bounds.
++        self.pos = unsafe { pos.unchecked_add(1) };
++        Some(unsafe {
++            if T::IS_ZST { self.buf.read() } else { self.buf.add(pos).read() }
++        })
+     }
+ 
+     #[inline]
+     fn size_hint(&self) -> (usize, Option<usize>) {
+-        let exact = if T::IS_ZST {
+-            self.end.addr().wrapping_sub(self.ptr.as_ptr().addr())
+-        } else {
+-            unsafe { non_null!(self.end, T).offset_from_unsigned(self.ptr) }
+-        };
++        let exact = unsafe { self.end.unchecked_sub(self.pos) };
+         (exact, Some(exact))
+     }
+ 
+     #[inline]
+     fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+         let step_size = self.len().min(n);
+-        let to_drop = self.ptr.as_ptr().cast_slice(step_size);
+-        if T::IS_ZST {
+-            // See `next` for why we sub `end` here.
+-            self.end = self.end.wrapping_byte_sub(step_size);
+-        } else {
+-            // SAFETY: the min() above ensures that step_size is in bounds
+-            self.ptr = unsafe { self.ptr.add(step_size) };
+-        }
++        let to_drop = self.cur_ptr().as_ptr().cast_slice(step_size);
++        // SAFETY: `step_size <= self.end - self.pos`
++        self.pos = unsafe { self.pos.unchecked_add(step_size) };
+         // SAFETY: the min() above ensures that step_size is in bounds
+         unsafe {
+             ptr::drop_in_place(to_drop);
+@@ -320,7 +306,7 @@
+                 return Err(unsafe { array::IntoIter::new_unchecked(raw_ary, 0..len) });
+             }
+ 
+-            self.end = self.end.wrapping_byte_sub(N);
++            self.pos = unsafe { self.pos.unchecked_add(N) };
+             // Safety: ditto
+             return Ok(unsafe { raw_ary.transpose().assume_init() });
+         }
+@@ -329,7 +315,7 @@
+             // Safety: `len` indicates that this many elements are available and we just checked that
+             // it fits into the array.
+             unsafe {
+-                ptr::copy_nonoverlapping(self.ptr.as_ptr(), raw_ary.as_mut_ptr() as *mut T, len);
++                ptr::copy_nonoverlapping(self.cur_ptr().as_ptr(), raw_ary.as_mut_ptr() as *mut T, len);
+                 self.forget_remaining_elements();
+                 return Err(array::IntoIter::new_unchecked(raw_ary, 0..len));
+             }
+@@ -338,8 +324,8 @@
+         // Safety: `len` is larger than the array size. Copy a fixed amount here to fully initialize
+         // the array.
+         unsafe {
+-            ptr::copy_nonoverlapping(self.ptr.as_ptr(), raw_ary.as_mut_ptr() as *mut T, N);
+-            self.ptr = self.ptr.add(N);
++            ptr::copy_nonoverlapping(self.cur_ptr().as_ptr(), raw_ary.as_mut_ptr() as *mut T, N);
++            self.pos = self.pos.unchecked_add(N);
+             Ok(raw_ary.transpose().assume_init())
+         }
+     }
+@@ -348,24 +334,14 @@
+     where
+         F: FnMut(B, Self::Item) -> B,
+     {
+-        if T::IS_ZST {
+-            while self.ptr.as_ptr() != self.end.cast_mut() {
+-                // SAFETY: we just checked that `self.ptr` is in bounds.
+-                let tmp = unsafe { self.ptr.read() };
+-                // See `next` for why we subtract from `end` here.
+-                self.end = self.end.wrapping_byte_sub(1);
+-                accum = f(accum, tmp);
+-            }
+-        } else {
+-            // SAFETY: `self.end` can only be null if `T` is a ZST.
+-            while self.ptr != non_null!(self.end, T) {
+-                // SAFETY: we just checked that `self.ptr` is in bounds.
+-                let tmp = unsafe { self.ptr.read() };
+-                // SAFETY: the maximum this can be is `self.end`.
+-                // Increment `self.ptr` first to avoid double dropping in the event of a panic.
+-                self.ptr = unsafe { self.ptr.add(1) };
+-                accum = f(accum, tmp);
+-            }
++        while self.pos != self.end {
++            let pos = self.pos;
++            // SAFETY: `pos < self.end`; increment `self.pos` first to avoid double drop on panic.
++            self.pos = unsafe { pos.unchecked_add(1) };
++            let tmp = unsafe {
++                if T::IS_ZST { self.buf.read() } else { self.buf.add(pos).read() }
++            };
++            accum = f(accum, tmp);
+         }
+ 
+         // There are in fact no remaining elements to forget, but by doing this we can avoid
+@@ -382,24 +358,14 @@
+         F: FnMut(B, Self::Item) -> R,
+         R: core::ops::Try<Output = B>,
+     {
+-        if T::IS_ZST {
+-            while self.ptr.as_ptr() != self.end.cast_mut() {
+-                // SAFETY: we just checked that `self.ptr` is in bounds.
+-                let tmp = unsafe { self.ptr.read() };
+-                // See `next` for why we subtract from `end` here.
+-                self.end = self.end.wrapping_byte_sub(1);
+-                accum = f(accum, tmp)?;
+-            }
+-        } else {
+-            // SAFETY: `self.end` can only be null if `T` is a ZST.
+-            while self.ptr != non_null!(self.end, T) {
+-                // SAFETY: we just checked that `self.ptr` is in bounds.
+-                let tmp = unsafe { self.ptr.read() };
+-                // SAFETY: the maximum this can be is `self.end`.
+-                // Increment `self.ptr` first to avoid double dropping in the event of a panic.
+-                self.ptr = unsafe { self.ptr.add(1) };
+-                accum = f(accum, tmp)?;
+-            }
++        while self.pos != self.end {
++            let pos = self.pos;
++            // SAFETY: `pos < self.end`; increment `self.pos` first to avoid double drop on panic.
++            self.pos = unsafe { pos.unchecked_add(1) };
++            let tmp = unsafe {
++                if T::IS_ZST { self.buf.read() } else { self.buf.add(pos).read() }
++            };
++            accum = f(accum, tmp)?;
+         }
+         R::from_output(accum)
+     }
+@@ -408,15 +374,13 @@
+     where
+         Self: TrustedRandomAccessNoCoerce,
+     {
+-        // SAFETY: the caller must guarantee that `i` is in bounds of the
+-        // `Vec<T>`, so `i` cannot overflow an `isize`, and the `self.ptr.add(i)`
+-        // is guaranteed to pointer to an element of the `Vec<T>` and
+-        // thus guaranteed to be valid to dereference.
+-        //
+-        // Also note the implementation of `Self: TrustedRandomAccess` requires
+-        // that `T: Copy` so reading elements from the buffer doesn't invalidate
+-        // them for `Drop`.
+-        unsafe { self.ptr.add(i).read() }
++        unsafe {
++            if T::IS_ZST {
++                self.buf.read()
++            } else {
++                self.buf.add(self.pos.unchecked_add(i)).read()
++            }
++        }
+     }
+ }
+ 
+@@ -424,25 +388,14 @@
+ impl<T, A: Allocator> DoubleEndedIterator for IntoIter<T, A> {
+     #[inline]
+     fn next_back(&mut self) -> Option<T> {
+-        if T::IS_ZST {
+-            if self.ptr.as_ptr() == self.end as *mut _ {
+-                return None;
+-            }
+-            // See above for why 'ptr.offset' isn't used
+-            self.end = self.end.wrapping_byte_sub(1);
+-            // Note that even though this is next_back() we're reading from `self.ptr`, not
+-            // `self.end`. We track our length using the byte offset from `self.ptr` to `self.end`,
+-            // so the end pointer may not be suitably aligned for T.
+-            Some(unsafe { ptr::read(self.ptr.as_ptr()) })
+-        } else {
+-            if self.ptr == non_null!(self.end, T) {
+-                return None;
+-            }
+-            unsafe {
+-                self.end = self.end.sub(1);
+-                Some(ptr::read(self.end))
+-            }
++        if self.pos == self.end {
++            return None;
+         }
++        let new_end = unsafe { self.end.unchecked_sub(1) };
++        self.end = new_end;
++        Some(unsafe {
++            if T::IS_ZST { self.buf.read() } else { self.buf.add(new_end).read() }
++        })
+     }
+ 
+     #[inline]
+@@ -458,7 +411,7 @@
+                 return Err(unsafe { array::IntoIter::new_unchecked(raw_ary, N - len..N) });
+             }
+ 
+-            self.end = self.end.wrapping_byte_sub(N);
++            self.end = unsafe { self.end.unchecked_sub(N) };
+             // Safety: ditto
+             return Ok(unsafe { MaybeUninit::array_assume_init(raw_ary) });
+         }
+@@ -467,7 +420,7 @@
+             // Safety: `len` indicates that this many elements are available and we just checked that
+             // it fits into the array.
+             unsafe {
+-                ptr::copy_nonoverlapping(self.ptr.as_ptr(), raw_ary.as_mut_ptr() as *mut T, len);
++                ptr::copy_nonoverlapping(self.cur_ptr().as_ptr(), raw_ary.as_mut_ptr() as *mut T, len);
+                 self.forget_remaining_elements();
+                 return Err(array::IntoIter::new_unchecked(raw_ary, 0..len));
+             }
+@@ -476,12 +429,13 @@
+         // Safety: `len` is larger than the array size. Copy a fixed amount here to fully initialize
+         // the array.
+         unsafe {
++            let new_end = self.end.unchecked_sub(N);
+             ptr::copy_nonoverlapping(
+-                self.ptr.add(len - N).as_ptr(),
++                self.buf.add(new_end).as_ptr(),
+                 raw_ary.as_mut_ptr() as *mut T,
+                 N,
+             );
+-            self.end = self.end.sub(N);
++            self.end = new_end;
+             Ok(MaybeUninit::array_assume_init(raw_ary))
+         }
+     }
+@@ -489,18 +443,12 @@
+     #[inline]
+     fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+         let step_size = self.len().min(n);
+-        if T::IS_ZST {
+-            // SAFETY: same as for advance_by()
+-            self.end = self.end.wrapping_byte_sub(step_size);
+-        } else {
+-            // SAFETY: same as for advance_by()
+-            self.end = unsafe { self.end.sub(step_size) };
+-        }
++        let new_end = unsafe { self.end.unchecked_sub(step_size) };
++        self.end = new_end;
+         let to_drop = if T::IS_ZST {
+-            // ZST may cause unalignment
+             ptr::NonNull::<T>::dangling().as_ptr().cast_slice(step_size)
+         } else {
+-            self.end.cast::<T>().cast_mut().cast_slice(step_size)
++            unsafe { self.buf.add(new_end).as_ptr().cast_slice(step_size) }
+         };
+         // SAFETY: same as for advance_by()
+         unsafe {
+@@ -512,12 +460,9 @@
+ 
+ #[stable(feature = "rust1", since = "1.0.0")]
+ impl<T, A: Allocator> ExactSizeIterator for IntoIter<T, A> {
++    #[inline]
+     fn is_empty(&self) -> bool {
+-        if T::IS_ZST {
+-            self.ptr.as_ptr() == self.end as *mut _
+-        } else {
+-            self.ptr == non_null!(self.end, T)
+-        }
++        self.pos == self.end
+     }
+ }
+ 
+--- a/library/alloc/src/vec/mod.rs	2026-11-23 21:55:42
++++ b/library/alloc/src/vec/mod.rs	2026-11-23 21:58:15
+@@ -4032,14 +4032,9 @@
+             let me = ManuallyDrop::new(self);
+             let alloc = ManuallyDrop::new(ptr::read(me.allocator()));
+             let buf = me.buf.non_null();
+-            let begin = buf.as_ptr();
+-            let end = if T::IS_ZST {
+-                begin.wrapping_byte_add(me.len())
+-            } else {
+-                begin.add(me.len()) as *const T
+-            };
++            let end = me.len();
+             let cap = me.buf.capacity();
+-            IntoIter { buf, phantom: PhantomData, cap, alloc, ptr: buf, end }
++            IntoIter { buf, phantom: PhantomData, cap, alloc, pos: 0, end }
+         }
+     }
+ }
+--- a/library/alloc/src/vec/spec_from_iter.rs	2026-11-23 22:01:40
++++ b/library/alloc/src/vec/spec_from_iter.rs	2026-11-23 22:01:49
+@@ -44,12 +44,12 @@
+         // than creating it through the generic FromIterator implementation would. That limitation
+         // is not strictly necessary as Vec's allocation behavior is intentionally unspecified.
+         // But it is a conservative choice.
+-        let has_advanced = iterator.buf != iterator.ptr;
++        let has_advanced = iterator.pos != 0;
+         if !has_advanced || iterator.len() >= iterator.cap / 2 {
+             unsafe {
+                 let it = ManuallyDrop::new(iterator);
+                 if has_advanced {
+-                    ptr::copy(it.ptr.as_ptr(), it.buf.as_ptr(), it.len());
++                    ptr::copy(it.cur_ptr().as_ptr(), it.buf.as_ptr(), it.len());
+                 }
+                 return Vec::from_parts(it.buf, it.len(), it.cap);
+             }
+--- a/library/core/src/array/iter/iter_inner.rs	2026-11-23 21:55:42
++++ b/library/core/src/array/iter/iter_inner.rs	2026-11-23 21:58:13
+@@ -95,6 +95,99 @@
+     pub(super) const unsafe fn new_unchecked(alive: IndexRange, data: [MaybeUninit<T>; N]) -> Self {
+         Self { alive, data }
+     }
++
++    #[inline]
++    pub(super) fn as_slice_sized(&self) -> &[T] {
++        unsafe {
++            let slice = self.data.get_unchecked(self.alive.clone());
++            slice.assume_init_ref()
++        }
++    }
++
++    #[inline]
++    #[rustc_const_unstable(feature = "const_iter", issue = "92476")]
++    pub(super) const fn as_mut_slice_sized(&mut self) -> &mut [T] {
++        unsafe {
++            let slice = self.data.get_unchecked_mut(self.alive.clone());
++            slice.assume_init_mut()
++        }
++    }
++
++    #[inline]
++    pub(super) fn next_sized(&mut self) -> Option<T> {
++        self.alive.next().map(|idx| unsafe { self.data.get_unchecked(idx).assume_init_read() })
++    }
++
++    #[inline]
++    pub(super) fn next_back_sized(&mut self) -> Option<T> {
++        self.alive
++            .next_back()
++            .map(|idx| unsafe { self.data.get_unchecked(idx).assume_init_read() })
++    }
++
++    #[inline]
++    pub(super) fn size_hint_sized(&self) -> (usize, Option<usize>) {
++        let len = self.len();
++        (len, Some(len))
++    }
++
++    #[inline]
++    pub(super) fn advance_by_sized(&mut self, n: usize) -> Result<(), NonZero<usize>> {
++        let range_to_drop = self.alive.take_prefix(n);
++        let remaining = n - range_to_drop.len();
++        unsafe {
++            let slice = self.data.get_unchecked_mut(range_to_drop);
++            slice.assume_init_drop();
++        }
++        NonZero::new(remaining).map_or(Ok(()), Err)
++    }
++
++    #[inline]
++    pub(super) fn advance_back_by_sized(&mut self, n: usize) -> Result<(), NonZero<usize>> {
++        let range_to_drop = self.alive.take_suffix(n);
++        let remaining = n - range_to_drop.len();
++        unsafe {
++            let slice = self.data.get_unchecked_mut(range_to_drop);
++            slice.assume_init_drop();
++        }
++        NonZero::new(remaining).map_or(Ok(()), Err)
++    }
++
++    #[inline]
++    pub(super) fn fold_sized<B>(&mut self, init: B, f: impl FnMut(B, T) -> B) -> B {
++        self.try_fold_sized(init, NeverShortCircuit::wrap_mut_2(f)).0
++    }
++
++    #[inline]
++    pub(super) fn try_fold_sized<B, F, R>(&mut self, init: B, mut f: F) -> R
++    where
++        F: FnMut(B, T) -> R,
++        R: Try<Output = B>,
++    {
++        let data = &mut self.data;
++        self.alive.try_fold(init, move |accum, idx| {
++            let elem = unsafe { data.get_unchecked(idx).assume_init_read() };
++            f(accum, elem)
++        })
++    }
++
++    #[inline]
++    pub(super) fn rfold_sized<B>(&mut self, init: B, f: impl FnMut(B, T) -> B) -> B {
++        self.try_rfold_sized(init, NeverShortCircuit::wrap_mut_2(f)).0
++    }
++
++    #[inline]
++    pub(super) fn try_rfold_sized<B, F, R>(&mut self, init: B, mut f: F) -> R
++    where
++        F: FnMut(B, T) -> R,
++        R: Try<Output = B>,
++    {
++        let data = &mut self.data;
++        self.alive.try_rfold(init, move |accum, idx| {
++            let elem = unsafe { data.get_unchecked(idx).assume_init_read() };
++            f(accum, elem)
++        })
++    }
+ }
+ 
+ impl<T: Clone, const N: usize> Clone for PolymorphicIter<[MaybeUninit<T>; N]> {
+@@ -167,6 +260,7 @@
+     }
+ }
+ 
++#[allow(dead_code)]
+ impl<T> PolymorphicIter<[MaybeUninit<T>]> {
+     #[inline]
+     pub(super) fn as_slice(&self) -> &[T] {
+@@ -201,6 +295,7 @@
+ ///
+ /// We don't implement the actual iterator traits because we want to implement
+ /// things like `try_fold` that require `Self: Sized` (which we're not).
++#[allow(dead_code)]
+ impl<T> PolymorphicIter<[MaybeUninit<T>]> {
+     #[inline]
+     pub(super) fn next(&mut self) -> Option<T> {
+--- a/library/core/src/array/iter.rs	2026-11-23 21:55:42
++++ b/library/core/src/array/iter.rs	2026-11-23 21:58:10
+@@ -28,6 +28,7 @@
+         self.inner.deref()
+     }
+     #[inline]
++    #[allow(dead_code)]
+     #[rustc_const_unstable(feature = "const_iter", issue = "92476")]
+     const fn unsize_mut(&mut self) -> &mut InnerUnsized<T> {
+         self.inner.deref_mut()
+@@ -218,7 +219,7 @@
+     #[stable(feature = "array_value_iter", since = "1.51.0")]
+     #[inline]
+     pub fn as_slice(&self) -> &[T] {
+-        self.unsize().as_slice()
++        self.inner.as_slice_sized()
+     }
+ 
+     /// Returns a mutable slice of all elements that have not been yielded yet.
+@@ -226,7 +227,7 @@
+     #[inline]
+     #[rustc_const_unstable(feature = "const_iter", issue = "92476")]
+     pub const fn as_mut_slice(&mut self) -> &mut [T] {
+-        self.unsize_mut().as_mut_slice()
++        self.inner.as_mut_slice_sized()
+     }
+ }
+ 
+@@ -243,12 +244,12 @@
+ 
+     #[inline]
+     fn next(&mut self) -> Option<Self::Item> {
+-        self.unsize_mut().next()
++        self.inner.next_sized()
+     }
+ 
+     #[inline]
+     fn size_hint(&self) -> (usize, Option<usize>) {
+-        self.unsize().size_hint()
++        self.inner.size_hint_sized()
+     }
+ 
+     #[inline]
+@@ -256,7 +257,7 @@
+     where
+         Fold: FnMut(Acc, Self::Item) -> Acc,
+     {
+-        self.unsize_mut().fold(init, fold)
++        self.inner.fold_sized(init, fold)
+     }
+ 
+     #[inline]
+@@ -266,7 +267,7 @@
+         F: FnMut(B, Self::Item) -> R,
+         R: Try<Output = B>,
+     {
+-        self.unsize_mut().try_fold(init, f)
++        self.inner.try_fold_sized(init, f)
+     }
+ 
+     #[inline]
+@@ -281,7 +282,7 @@
+ 
+     #[inline]
+     fn advance_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+-        self.unsize_mut().advance_by(n)
++        self.inner.advance_by_sized(n)
+     }
+ 
+     #[inline]
+@@ -298,7 +299,7 @@
+ impl<T, const N: usize> DoubleEndedIterator for IntoIter<T, N> {
+     #[inline]
+     fn next_back(&mut self) -> Option<Self::Item> {
+-        self.unsize_mut().next_back()
++        self.inner.next_back_sized()
+     }
+ 
+     #[inline]
+@@ -306,7 +307,7 @@
+     where
+         Fold: FnMut(Acc, Self::Item) -> Acc,
+     {
+-        self.unsize_mut().rfold(init, rfold)
++        self.inner.rfold_sized(init, rfold)
+     }
+ 
+     #[inline]
+@@ -316,12 +317,12 @@
+         F: FnMut(B, Self::Item) -> R,
+         R: Try<Output = B>,
+     {
+-        self.unsize_mut().try_rfold(init, f)
++        self.inner.try_rfold_sized(init, f)
+     }
+ 
+     #[inline]
+     fn advance_back_by(&mut self, n: usize) -> Result<(), NonZero<usize>> {
+-        self.unsize_mut().advance_back_by(n)
++        self.inner.advance_back_by_sized(n)
+     }
+ }
+ 
+--- a/library/core/src/slice/iter/macros.rs	2026-11-23 21:55:42
++++ b/library/core/src/slice/iter/macros.rs	2026-11-23 22:01:03
+@@ -1,62 +1,17 @@
+ //! Macros used by iterators of slice.
+ 
+-/// Convenience & performance macro for consuming the `end_or_len` field, by
+-/// giving a `(&mut) usize` or `(&mut) NonNull<T>` depending whether `T` is
+-/// or is not a ZST respectively.
+-///
+-/// Internally, this reads the `end` through a pointer-to-`NonNull` so that
+-/// it'll get the appropriate non-null metadata in the backend without needing
+-/// to call `assume` manually.
+-macro_rules! if_zst {
+-    (mut $this:ident, $len:ident => $zst_body:expr, $end:ident => $other_body:expr,) => {{
+-        #![allow(unused_unsafe)] // we're sometimes used within an unsafe block
+-
+-        if T::IS_ZST {
+-            // SAFETY: for ZSTs, the pointer is storing a provenance-free length,
+-            // so consuming and updating it as a `usize` is fine.
+-            let $len = unsafe { &mut *(&raw mut $this.end_or_len).cast::<usize>() };
+-            $zst_body
+-        } else {
+-            // SAFETY: for non-ZSTs, the type invariant ensures it cannot be null
+-            let $end = unsafe { &mut *(&raw mut $this.end_or_len).cast::<NonNull<T>>() };
+-            $other_body
+-        }
+-    }};
+-    ($this:ident, $len:ident => $zst_body:expr, $end:ident => $other_body:expr,) => {{
+-        #![allow(unused_unsafe)] // we're sometimes used within an unsafe block
+-
+-        if T::IS_ZST {
+-            let $len = $this.end_or_len.addr();
+-            $zst_body
+-        } else {
+-            // SAFETY: for non-ZSTs, the type invariant ensures it cannot be null
+-            let $end = unsafe { mem::transmute::<*const T, NonNull<T>>($this.end_or_len) };
+-            $other_body
+-        }
+-    }};
+-}
+-
+ // Inlining is_empty and len makes a huge performance difference
+ macro_rules! is_empty {
+     ($self: ident) => {
+-        if_zst!($self,
+-            len => len == 0,
+-            end => $self.ptr == end,
+-        )
++        $self.pos == $self.end
+     };
+ }
+ 
+ macro_rules! len {
+     ($self: ident) => {{
+-        if_zst!($self,
+-            len => len,
+-            end => {
+-                // To get rid of some bounds checks (see `position`), we use ptr_sub instead of
+-                // offset_from (Tested by `codegen/slice-position-bounds-check`.)
+-                // SAFETY: by the type invariant pointers are aligned and `start <= end`
+-                unsafe { end.offset_from_unsigned($self.ptr) }
+-            },
+-        )
++        #![allow(unused_unsafe)]
++        // SAFETY: by type invariant `self.pos <= self.end`
++        unsafe { crate::intrinsics::unchecked_sub($self.end, $self.pos) }
+     }};
+ }
+ 
+@@ -88,9 +43,11 @@
+             #[inline(always)]
+             fn make_slice(&self) -> &'a [T] {
+                 // SAFETY: the iterator was created from a slice with pointer
+-                // `self.ptr` and length `len!(self)`. This guarantees that all
+-                // the prerequisites for `from_raw_parts` are fulfilled.
+-                unsafe { from_raw_parts(self.ptr.as_ptr(), len!(self)) }
++                // `self.ptr` and remaining range `self.pos..self.end`.
++                unsafe {
++                    let ptr = if T::IS_ZST { self.ptr } else { self.ptr.add(self.pos) };
++                    from_raw_parts(ptr.as_ptr(), len!(self))
++                }
+             }
+ 
+             // Helper function for moving the start of the iterator forwards by `offset` elements,
+@@ -98,18 +55,11 @@
+             // Unsafe because the offset must not exceed `self.len()`.
+             #[inline(always)]
+             unsafe fn post_inc_start(&mut self, offset: usize) -> NonNull<T> {
+-                let old = self.ptr;
+-
+-                // SAFETY: the caller guarantees that `offset` doesn't exceed `self.len()`,
+-                // so this new pointer is inside `self` and thus guaranteed to be non-null.
++                let old = self.pos;
+                 unsafe {
+-                    if_zst!(mut self,
+-                        // Using the intrinsic directly avoids emitting a UbCheck
+-                        len => *len = crate::intrinsics::unchecked_sub(*len, offset),
+-                        _end => self.ptr = self.ptr.add(offset),
+-                    );
++                    self.pos = crate::intrinsics::unchecked_add(old, offset);
++                    if T::IS_ZST { self.ptr } else { self.ptr.add(old) }
+                 }
+-                old
+             }
+ 
+             // Helper function for moving the end of the iterator backwards by `offset` elements,
+@@ -117,22 +67,11 @@
+             // Unsafe because the offset must not exceed `self.len()`.
+             #[inline(always)]
+             unsafe fn pre_dec_end(&mut self, offset: usize) -> NonNull<T> {
+-                if_zst!(mut self,
+-                    // SAFETY: By our precondition, `offset` can be at most the
+-                    // current length, so the subtraction can never overflow.
+-                    len => unsafe {
+-                        // Using the intrinsic directly avoids emitting a UbCheck
+-                        *len = crate::intrinsics::unchecked_sub(*len, offset);
+-                        self.ptr
+-                    },
+-                    // SAFETY: the caller guarantees that `offset` doesn't exceed `self.len()`,
+-                    // which is guaranteed to not overflow an `isize`. Also, the resulting pointer
+-                    // is in bounds of `slice`, which fulfills the other requirements for `offset`.
+-                    end => unsafe {
+-                        *end = end.sub(offset);
+-                        *end
+-                    },
+-                )
++                unsafe {
++                    let new_end = crate::intrinsics::unchecked_sub(self.end, offset);
++                    self.end = new_end;
++                    if T::IS_ZST { self.ptr } else { self.ptr.add(new_end) }
++                }
+             }
+         }
+ 
+@@ -155,39 +94,14 @@
+ 
+             #[inline]
+             fn next(&mut self) -> Option<$elem> {
+-                // intentionally not using the helpers because this is
+-                // one of the most mono'd things in the library.
+-
+-                let ptr = self.ptr;
+-                let end_or_len = self.end_or_len;
+-                // SAFETY: See inner comments. (For some reason having multiple
+-                // block breaks inlining this -- if you can fix that please do!)
++                let pos = self.pos;
++                if pos == self.end {
++                    return None;
++                }
+                 unsafe {
+-                    if T::IS_ZST {
+-                        let len = end_or_len.addr();
+-                        if len == 0 {
+-                            return None;
+-                        }
+-                        // SAFETY: just checked that it's not zero, so subtracting one
+-                        // cannot wrap.  (Ideally this would be `checked_sub`, which
+-                        // does the same thing internally, but as of 2025-02 that
+-                        // doesn't optimize quite as small in MIR.)
+-                        self.end_or_len = without_provenance_mut(len.unchecked_sub(1));
+-                    } else {
+-                        // SAFETY: by type invariant, the `end_or_len` field is always
+-                        // non-null for a non-ZST pointee.  (This transmute ensures we
+-                        // get `!nonnull` metadata on the load of the field.)
+-                        if ptr == crate::intrinsics::transmute::<$ptr, NonNull<T>>(end_or_len) {
+-                            return None;
+-                        }
+-                        // SAFETY: since it's not empty, per the check above, moving
+-                        // forward one keeps us inside the slice, and this is valid.
+-                        self.ptr = ptr.add(1);
+-                    }
+-                    // SAFETY: Now that we know it wasn't empty and we've moved past
+-                    // the first one (to avoid giving a duplicate `&mut` next time),
+-                    // we can give out a reference to it.
+-                    Some({ptr}.$into_ref())
++                    self.pos = crate::intrinsics::unchecked_add(pos, 1);
++                    let ptr = if T::IS_ZST { self.ptr } else { self.ptr.add(pos) };
++                    Some({ ptr }.$into_ref())
+                 }
+             }
+ 
+@@ -228,17 +142,15 @@
+             #[inline]
+             fn nth(&mut self, n: usize) -> Option<$elem> {
+                 if n >= len!(self) {
+-                    // This iterator is now empty.
+-                    if_zst!(mut self,
+-                        len => *len = 0,
+-                        end => self.ptr = *end,
+-                    );
++                    self.pos = self.end;
+                     return None;
+                 }
+                 // SAFETY: We are in bounds. `post_inc_start` does the right thing even for ZSTs.
+                 unsafe {
+-                    self.post_inc_start(n);
+-                    Some(self.post_inc_start(1).$into_ref())
++                    let idx = crate::intrinsics::unchecked_add(self.pos, n);
++                    self.pos = crate::intrinsics::unchecked_add(idx, 1);
++                    let ptr = if T::IS_ZST { self.ptr } else { self.ptr.add(idx) };
++                    Some({ ptr }.$into_ref())
+                 }
+             }
+ 
+@@ -260,30 +172,15 @@
+                 where
+                     F: FnMut(B, Self::Item) -> B,
+             {
+-                // this implementation consists of the following optimizations compared to the
+-                // default implementation:
+-                // - do-while loop, as is llvm's preferred loop shape,
+-                //   see https://releases.llvm.org/16.0.0/docs/LoopTerminology.html#more-canonical-loops
+-                // - bumps an index instead of a pointer since the latter case inhibits
+-                //   some optimizations, see #111603
+-                // - avoids Option wrapping/matching
+-                if is_empty!(self) {
+-                    return init;
+-                }
+                 let mut acc = init;
+-                let mut i = 0;
+-                let len = len!(self);
+-                loop {
+-                    // SAFETY: the loop iterates `i in 0..len`, which always is in bounds of
+-                    // the slice allocation
+-                    acc = f(acc, unsafe { & $( $mut_ )? *self.ptr.add(i).as_ptr() });
+-                    // SAFETY: `i` can't overflow since it'll only reach usize::MAX if the
+-                    // slice had that length, in which case we'll break out of the loop
+-                    // after the increment
++                let mut i = self.pos;
++                let end = self.end;
++                while i != end {
++                    acc = f(acc, unsafe {
++                        let p = if T::IS_ZST { self.ptr } else { self.ptr.add(i) };
++                        & $( $mut_ )? *p.as_ptr()
++                    });
+                     i = unsafe { i.unchecked_add(1) };
+-                    if i == len {
+-                        break;
+-                    }
+                 }
+                 acc
+             }
+@@ -416,17 +313,11 @@
+ 
+             #[inline]
+             unsafe fn __iterator_get_unchecked(&mut self, idx: usize) -> Self::Item {
+-                // SAFETY: the caller must guarantee that `i` is in bounds of
+-                // the underlying slice, so `i` cannot overflow an `isize`, and
+-                // the returned references is guaranteed to refer to an element
+-                // of the slice and thus guaranteed to be valid.
+-                //
+-                // Also note that the caller also guarantees that we're never
+-                // called with the same index again, and that no other methods
+-                // that will access this subslice are called, so it is valid
+-                // for the returned reference to be mutable in the case of
+-                // `IterMut`
+-                unsafe { & $( $mut_ )? * self.ptr.as_ptr().add(idx) }
++                unsafe {
++                    let off = self.pos.unchecked_add(idx);
++                    let p = if T::IS_ZST { self.ptr } else { self.ptr.add(off) };
++                    & $( $mut_ )? *p.as_ptr()
++                }
+             }
+ 
+             $($extra)*
+@@ -452,17 +343,16 @@
+             #[inline]
+             fn nth_back(&mut self, n: usize) -> Option<$elem> {
+                 if n >= len!(self) {
+-                    // This iterator is now empty.
+-                    if_zst!(mut self,
+-                        len => *len = 0,
+-                        end => *end = self.ptr,
+-                    );
++                    self.end = self.pos;
+                     return None;
+                 }
+-                // SAFETY: We are in bounds. `pre_dec_end` does the right thing even for ZSTs.
++                // SAFETY: We are in bounds.
+                 unsafe {
+-                    self.pre_dec_end(n);
+-                    Some(self.next_back_unchecked())
++                    let step = crate::intrinsics::unchecked_add(n, 1);
++                    let new_end = crate::intrinsics::unchecked_sub(self.end, step);
++                    self.end = new_end;
++                    let p = if T::IS_ZST { self.ptr } else { self.ptr.add(new_end) };
++                    Some({ p }.$into_ref())
+                 }
+             }
+ 
+--- a/library/core/src/slice/iter.rs	2026-11-23 21:55:42
++++ b/library/core/src/slice/iter.rs	2026-11-23 21:56:33
+@@ -9,7 +9,7 @@
+ use crate::marker::PhantomData;
+ use crate::mem::{self, SizedTypeProperties};
+ use crate::num::NonZero;
+-use crate::ptr::{NonNull, without_provenance, without_provenance_mut};
++use crate::ptr::NonNull;
+ use crate::{cmp, fmt};
+ 
+ #[stable(feature = "boxed_slice_into_iter", since = "1.80.0")]
+@@ -65,15 +65,12 @@
+ #[must_use = "iterators are lazy and do nothing unless consumed"]
+ #[rustc_diagnostic_item = "SliceIter"]
+ pub struct Iter<'a, T: 'a> {
+-    /// The pointer to the next element to return, or the past-the-end location
+-    /// if the iterator is empty.
+-    ///
+-    /// This address will be used for all ZST elements, never changed.
++    /// Base pointer to the start of the original slice. Never mutated during iteration.
+     ptr: NonNull<T>,
+-    /// For non-ZSTs, the non-null pointer to the past-the-end element.
+-    ///
+-    /// For ZSTs, this is `ptr::without_provenance_mut(len)`.
+-    end_or_len: *const T,
++    /// Index of the next element to yield from the front.
++    pos: usize,
++    /// One-past-the-end index of the remaining slice (`pos <= end`).
++    end: usize,
+     _marker: PhantomData<&'a T>,
+ }
+ 
+@@ -94,13 +91,7 @@
+     pub(super) const fn new(slice: &'a [T]) -> Self {
+         let len = slice.len();
+         let ptr: NonNull<T> = NonNull::from_ref(slice).cast();
+-        // SAFETY: Similar to `IterMut::new`.
+-        unsafe {
+-            let end_or_len =
+-                if T::IS_ZST { without_provenance(len) } else { ptr.as_ptr().add(len) };
+-
+-            Self { ptr, end_or_len, _marker: PhantomData }
+-        }
++        Self { ptr, pos: 0, end: len, _marker: PhantomData }
+     }
+ 
+     /// Views the underlying data as a subslice of the original data.
+@@ -151,7 +142,7 @@
+ impl<T> Clone for Iter<'_, T> {
+     #[inline]
+     fn clone(&self) -> Self {
+-        Iter { ptr: self.ptr, end_or_len: self.end_or_len, _marker: self._marker }
++        Iter { ptr: self.ptr, pos: self.pos, end: self.end, _marker: self._marker }
+     }
+ }
+ 
+@@ -190,15 +181,12 @@
+ #[stable(feature = "rust1", since = "1.0.0")]
+ #[must_use = "iterators are lazy and do nothing unless consumed"]
+ pub struct IterMut<'a, T: 'a> {
+-    /// The pointer to the next element to return, or the past-the-end location
+-    /// if the iterator is empty.
+-    ///
+-    /// This address will be used for all ZST elements, never changed.
++    /// Base pointer to the start of the original slice. Never mutated during iteration.
+     ptr: NonNull<T>,
+-    /// For non-ZSTs, the non-null pointer to the past-the-end element.
+-    ///
+-    /// For ZSTs, this is `ptr::without_provenance_mut(len)`.
+-    end_or_len: *mut T,
++    /// Index of the next element to yield from the front.
++    pos: usize,
++    /// One-past-the-end index of the remaining slice (`pos <= end`).
++    end: usize,
+     _marker: PhantomData<&'a mut T>,
+ }
+ 
+@@ -219,28 +207,7 @@
+     pub(super) const fn new(slice: &'a mut [T]) -> Self {
+         let len = slice.len();
+         let ptr: NonNull<T> = NonNull::from_mut(slice).cast();
+-        // SAFETY: There are several things here:
+-        //
+-        // `ptr` has been obtained by `slice.as_ptr()` where `slice` is a valid
+-        // reference thus it is non-NUL and safe to use and pass to
+-        // `NonNull::new_unchecked` .
+-        //
+-        // Adding `slice.len()` to the starting pointer gives a pointer
+-        // at the end of `slice`. `end` will never be dereferenced, only checked
+-        // for direct pointer equality with `ptr` to check if the iterator is
+-        // done.
+-        //
+-        // In the case of a ZST, the end pointer is just the length.  It's never
+-        // used as a pointer at all, and thus it's fine to have no provenance.
+-        //
+-        // See the `next_unchecked!` and `is_empty!` macros as well as the
+-        // `post_inc_start` method for more information.
+-        unsafe {
+-            let end_or_len =
+-                if T::IS_ZST { without_provenance_mut(len) } else { ptr.as_ptr().add(len) };
+-
+-            Self { ptr, end_or_len, _marker: PhantomData }
+-        }
++        Self { ptr, pos: 0, end: len, _marker: PhantomData }
+     }
+ 
+     /// Views the underlying data as a subslice of the original data.
+@@ -273,9 +240,11 @@
+     #[stable(feature = "iter_to_slice", since = "1.4.0")]
+     pub fn into_slice(self) -> &'a mut [T] {
+         // SAFETY: the iterator was created from a mutable slice with pointer
+-        // `self.ptr` and length `len!(self)`. This guarantees that all the prerequisites
+-        // for `from_raw_parts_mut` are fulfilled.
+-        unsafe { from_raw_parts_mut(self.ptr.as_ptr(), len!(self)) }
++        // `self.ptr` and remaining range `self.pos..self.end`.
++        unsafe {
++            let ptr = if T::IS_ZST { self.ptr } else { self.ptr.add(self.pos) };
++            from_raw_parts_mut(ptr.as_ptr(), len!(self))
++        }
+     }
+ 
+     /// Views the underlying data as a subslice of the original data.
+@@ -345,9 +314,11 @@
+     #[unstable(feature = "slice_iter_mut_as_mut_slice", issue = "93079")]
+     pub fn as_mut_slice(&mut self) -> &mut [T] {
+         // SAFETY: the iterator was created from a mutable slice with pointer
+-        // `self.ptr` and length `len!(self)`. This guarantees that all the prerequisites
+-        // for `from_raw_parts_mut` are fulfilled.
+-        unsafe { from_raw_parts_mut(self.ptr.as_ptr(), len!(self)) }
++        // `self.ptr` and remaining range `self.pos..self.end`.
++        unsafe {
++            let ptr = if T::IS_ZST { self.ptr } else { self.ptr.add(self.pos) };
++            from_raw_parts_mut(ptr.as_ptr(), len!(self))
++        }
+     }
+ }
+ 

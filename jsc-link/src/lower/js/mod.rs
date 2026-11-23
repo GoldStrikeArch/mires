@@ -226,6 +226,27 @@ impl<'a> JsCx<'a> {
         self.int32_only.contains(&value)
     }
 
+    /// Whether byte-slice references need the `__rt.byte_slice_ref` runtime barrier.
+    ///
+    /// Under Tier A (`typed_heap_enabled`) with no non-RC raw heap allocations and no wide-to-byte
+    /// aliasing (`!raw_byte_derefs`), `_bv` is `null` and no fresh 1-byte raw `_blocks` entry can
+    /// ever be retyped, making `byte_slice_ref(p)` an identity no-op.
+    pub(super) fn needs_byte_slice_ref(&self) -> bool {
+        let heap = self.heap();
+        !(heap.typed_heap_enabled
+            && !heap.non_rc_raw_alloc_reachable
+            && !self.byte_views.raw_byte_derefs)
+    }
+
+    /// Whether every value in this function uses the baseline carrier (no `NativeVec`,
+    /// `SliceView`, `HostString`, `StringBuilder`, or `NativeMap` carriers).
+    pub(super) fn all_baseline_carriers(&self) -> bool {
+        self.func
+            .values
+            .iter()
+            .all(|v| v.carrier == rcgjs_object::jir::repr::Carrier::Baseline)
+    }
+
     /// The same context, resolving closure bodies through the program's item index.
     pub fn with_items(mut self, items: &'a host::ItemIndex) -> Self {
         self.items = items;

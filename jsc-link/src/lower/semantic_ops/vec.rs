@@ -656,12 +656,29 @@ pub(super) fn vec_iter(
     _helpers: &mut BTreeSet<&'static str>,
     _refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
-    let (ptr_key, end_key, marker_key) = slice_iter_layout(cx)?;
-    Ok(vec![jsast::ret(jsast::object(vec![
-        (ptr_key, ptr::slot(member("buf"), jsast::num(0))),
-        (end_key, ptr::slot(member("buf"), member("len"))),
-        (marker_key, jsast::undefined()),
-    ]))])
+    let fields = match slice_iter_layout(cx)? {
+        SliceIterLayout::Legacy {
+            ptr_key,
+            end_key,
+            marker_key,
+        } => vec![
+            (ptr_key, ptr::slot(member("buf"), jsast::num(0))),
+            (end_key, ptr::slot(member("buf"), member("len"))),
+            (marker_key, jsast::undefined()),
+        ],
+        SliceIterLayout::Indexed {
+            ptr_key,
+            pos_key,
+            end_key,
+            marker_key,
+        } => vec![
+            (ptr_key, ptr::slot(member("buf"), jsast::num(0))),
+            (pos_key, jsast::num(0)),
+            (end_key, member("len")),
+            (marker_key, jsast::undefined()),
+        ],
+    };
+    Ok(vec![jsast::ret(jsast::object(fields))])
 }
 
 /// `core::mem::replace(&mut Vec<T>, Vec<T>) -> Vec<T>`.
@@ -1279,7 +1296,21 @@ fn box_array_len(cx: &LowerCx<'_>) -> Result<u64, SemanticDecline> {
     Ok(length)
 }
 
-fn slice_iter_layout(cx: &LowerCx<'_>) -> Result<(String, String, String), SemanticDecline> {
+enum SliceIterLayout {
+    Legacy {
+        ptr_key: String,
+        end_key: String,
+        marker_key: String,
+    },
+    Indexed {
+        ptr_key: String,
+        pos_key: String,
+        end_key: String,
+        marker_key: String,
+    },
+}
+
+fn slice_iter_layout(cx: &LowerCx<'_>) -> Result<SliceIterLayout, SemanticDecline> {
     let element = vec_element(cx)?;
     if !element.layout.sized || element.layout.zst {
         return Err(SemanticDecline::ZeroSizedElement);
@@ -1308,27 +1339,6 @@ fn slice_iter_layout(cx: &LowerCx<'_>) -> Result<(String, String, String), Seman
     let [variant] = variants.as_slice() else {
         return Err(SemanticDecline::WrongReturnType);
     };
-    let [f0, f1, f2] = variant.fields.as_slice() else {
-        return Err(SemanticDecline::WrongReturnType);
-    };
-    let p0 = type_get(cx.table, cx.table.peeled(f0.ty))?;
-    let p1 = type_get(cx.table, cx.table.peeled(f1.ty))?;
-    let p2 = type_get(cx.table, f2.ty)?;
-    if !matches!(p0.kind, TypeKind::RawPointer { pointee, .. } if pointee == element.id) {
-        return Err(SemanticDecline::WrongReturnType);
-    }
-    if !matches!(
-        p1.kind,
-        TypeKind::RawPointer {
-            pointee,
-            mutable: end_mut,
-        } if pointee == element.id && end_mut == mutable
-    ) {
-        return Err(SemanticDecline::WrongReturnType);
-    }
-    if !p2.layout.zst {
-        return Err(SemanticDecline::WrongReturnType);
-    }
     let key_str = |key: FieldKey| match key {
         FieldKey::Name(id) => cx
             .interns
@@ -1337,7 +1347,61 @@ fn slice_iter_layout(cx: &LowerCx<'_>) -> Result<(String, String, String), Seman
             .ok_or(SemanticDecline::WrongReturnType),
         _ => Err(SemanticDecline::WrongReturnType),
     };
-    Ok((key_str(f0.key)?, key_str(f1.key)?, key_str(f2.key)?))
+    match variant.fields.as_slice() {
+        [f0, f1, f2] => {
+            let p0 = type_get(cx.table, cx.table.peeled(f0.ty))?;
+            let p1 = type_get(cx.table, cx.table.peeled(f1.ty))?;
+            let p2 = type_get(cx.table, f2.ty)?;
+            if !matches!(p0.kind, TypeKind::RawPointer { pointee, .. } if pointee == element.id) {
+                return Err(SemanticDecline::WrongReturnType);
+            }
+            if !matches!(
+                p1.kind,
+                TypeKind::RawPointer {
+                    pointee,
+                    mutable: end_mut,
+                } if pointee == element.id && end_mut == mutable
+            ) {
+                return Err(SemanticDecline::WrongReturnType);
+            }
+            if !p2.layout.zst {
+                return Err(SemanticDecline::WrongReturnType);
+            }
+            Ok(SliceIterLayout::Legacy {
+                ptr_key: key_str(f0.key)?,
+                end_key: key_str(f1.key)?,
+                marker_key: key_str(f2.key)?,
+            })
+        }
+        [f0, f1, f2, f3] => {
+            let p0 = type_get(cx.table, cx.table.peeled(f0.ty))?;
+            let p1 = type_get(cx.table, cx.table.peeled(f1.ty))?;
+            let p2 = type_get(cx.table, cx.table.peeled(f2.ty))?;
+            let p3 = type_get(cx.table, f3.ty)?;
+            if !matches!(p0.kind, TypeKind::RawPointer { pointee, .. } if pointee == element.id) {
+                return Err(SemanticDecline::WrongReturnType);
+            }
+            let is_usize = |k: &TypeKind| {
+                matches!(
+                    k,
+                    TypeKind::Integer {
+                        signed: false,
+                        bits: 32,
+                    }
+                )
+            };
+            if !is_usize(&p1.kind) || !is_usize(&p2.kind) || !p3.layout.zst {
+                return Err(SemanticDecline::WrongReturnType);
+            }
+            Ok(SliceIterLayout::Indexed {
+                ptr_key: key_str(f0.key)?,
+                pos_key: key_str(f1.key)?,
+                end_key: key_str(f2.key)?,
+                marker_key: key_str(f3.key)?,
+            })
+        }
+        _ => Err(SemanticDecline::WrongReturnType),
+    }
 }
 
 fn range_shape(cx: &LowerCx<'_>) -> Result<RangeShape, SemanticDecline> {
