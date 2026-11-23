@@ -469,6 +469,7 @@ impl<'a> ReprInterpreter<'a> {
                 cond,
                 expected,
                 msg,
+                ..
             } => {
                 let cond = self
                     .read(*cond)?

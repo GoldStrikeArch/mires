@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rcgjs_object::item::JsName;
 use rcgjs_object::jir::decline::OpClass;
+use rcgjs_object::jir::origin::SourceFactId;
 use rcgjs_object::jir::repr::{
     Carrier, CellId, Op, OpKind, RAssertMessage, RBlockId, RTerm, Root, ValueId,
 };
@@ -2417,7 +2418,8 @@ impl<'a> JsCx<'a> {
                 cond,
                 expected,
                 msg,
-            } => self.assert_stmts(*cond, *expected, msg),
+                track_caller,
+            } => self.assert_stmts(*cond, *expected, msg, *track_caller),
             OpKind::Zombie(message) => {
                 let message = self.interns.str(*message).unwrap_or("").to_owned();
                 Ok(vec![jsast::expr_stmt(self.zombie(message))])
@@ -2603,7 +2605,13 @@ impl<'a> JsCx<'a> {
     }
 
     /// An `Assert` (`base.rs:707-723`, `857-901`): `if (!cond) { <panic> }`.
-    fn assert_stmts(&self, cond: ValueId, expected: bool, msg: &RAssertMessage) -> Res<Vec<Stmt>> {
+    fn assert_stmts(
+        &self,
+        cond: ValueId,
+        expected: bool,
+        msg: &RAssertMessage,
+        track_caller: Option<SourceFactId>,
+    ) -> Res<Vec<Stmt>> {
         // `is_optional_overflow_check`: the arithmetic overflow checks rustc emits regardless of
         // `-Coverflow-checks`, which v1 drops when the session has them off. The link step does
         // not know the session flag; the suite compiles with them off.
@@ -2622,11 +2630,18 @@ impl<'a> JsCx<'a> {
         } else {
             condition
         };
-        Ok(vec![jsast::if_(failed, self.assert_failure(msg)?)])
+        Ok(vec![jsast::if_(
+            failed,
+            self.assert_failure(msg, track_caller)?,
+        )])
     }
 
     /// The body of the `if` an `Assert` guards (`base.rs::codegen_assert_failure`).
-    fn assert_failure(&self, msg: &RAssertMessage) -> Res<Vec<Stmt>> {
+    fn assert_failure(
+        &self,
+        msg: &RAssertMessage,
+        track_caller: Option<SourceFactId>,
+    ) -> Res<Vec<Stmt>> {
         let (lang_fn, args): (&str, Vec<ValueId>) = match msg {
             RAssertMessage::BoundsCheck { length, index } => {
                 ("panic_bounds_check", vec![*index, *length])
@@ -2654,9 +2669,19 @@ impl<'a> JsCx<'a> {
                     .iter()
                     .map(|arg| self.expr_of(*arg))
                     .collect::<Res<Vec<_>>>()?;
-                // The panic lang items are `#[track_caller]`: the location of the expression that
-                // failed, or the enclosing `$loc` in a `#[track_caller]` body.
-                if self.func.sig.abi.caller_location {
+                // The panic lang items are `#[track_caller]`: prefer the MIR-resolved
+                // `track_caller` fact (which handles MIR-inlined `#[track_caller]` frames as
+                // well as non-`#[track_caller]` helpers inlined into a `#[track_caller]` body),
+                // then `$loc` inside a `#[track_caller]` body, and finally the assert's origin.
+                if let Some(fact_id) = track_caller {
+                    let Some(fact) = self.interns.source_fact(fact_id) else {
+                        return Err(decline(
+                            OpClass::Terminator,
+                            "an assert whose track_caller source fact is missing",
+                        ));
+                    };
+                    arguments.push(self.caller_location_value(fact)?);
+                } else if self.func.sig.abi.caller_location {
                     arguments.push(jsast::id(CALLER_LOCATION_PARAM));
                 } else {
                     let origin = self.origin.get();

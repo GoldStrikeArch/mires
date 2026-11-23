@@ -76,6 +76,16 @@ const TRACK_CALLER_SHARED_FOOTPRINT: u64 = 84;
 const MIN_SITE_CHARGE: i64 = 24;
 const BUDGET_FLOOR: u64 = 384;
 
+/// Speed-first (`js-profile=release-speed`) post-representation inlining thresholds tuned for V8
+/// TurboFan (inline small hot helpers without creating >12 KB mega-functions that bail out of JIT).
+const SPEED_SHARED_CALLEE_FOOTPRINT: u64 = 220;
+const SPEED_TRACK_CALLER_SHARED_FOOTPRINT: u64 = 160;
+const SPEED_LOOP_CALLEE_FOOTPRINT: u64 = 384;
+const SPEED_INLINE_HINT_FOOTPRINT: u64 = 384;
+const SPEED_INLINE_ALWAYS_FOOTPRINT: u64 = 640;
+const SPEED_CALLER_CAP: u64 = 10_240;
+const SPEED_BUDGET_FLOOR: u64 = 8_192;
+
 /// What the pass did, for the sidecar's `inline` block and the driver's accounting.
 #[derive(Clone, Debug, Default)]
 pub struct InlineStats {
@@ -149,7 +159,7 @@ pub(crate) fn run(
     program_bytes: u64,
     sizes: &BTreeMap<JsName, u64>,
 ) -> InlineStats {
-    run_with_mode(
+    run_with_profile(
         funcs,
         metadata,
         graph,
@@ -160,11 +170,13 @@ pub(crate) fn run(
         program_bytes,
         sizes,
         false,
+        None,
     )
 }
 
 /// Runs the inliner, optionally admitting non-specialized `CallSemantic::Standard` calls after
 /// representation specialization (`allow_std_post_repr`).
+#[allow(dead_code)] // Called by inline unit tests; `lane.rs` calls `run_with_profile`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_with_mode(
     funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
@@ -178,9 +190,47 @@ pub(crate) fn run_with_mode(
     sizes: &BTreeMap<JsName, u64>,
     allow_std_post_repr: bool,
 ) -> InlineStats {
+    run_with_profile(
+        funcs,
+        metadata,
+        graph,
+        items,
+        measure,
+        sole_referrer,
+        zombie_free,
+        program_bytes,
+        sizes,
+        allow_std_post_repr,
+        None,
+    )
+}
+
+/// Runs the inliner under `profile` (`ReleaseSpeed` widens budgets and honors `#[inline]` hints).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with_profile(
+    funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
+    metadata: &mut BTreeMap<JsName, Metadata<'_>>,
+    graph: &Callgraph,
+    items: &ItemIndex,
+    measure: &dyn Fn(&JsName, &Func, &Metadata<'_>) -> Option<Measurement>,
+    sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
+    zombie_free: &dyn Fn(&JsName) -> bool,
+    program_bytes: u64,
+    sizes: &BTreeMap<JsName, u64>,
+    allow_std_post_repr: bool,
+    profile: Option<crate::opts::Profile>,
+) -> InlineStats {
     let mut stats = InlineStats::default();
     let mut sizes = sizes.clone();
-    let budget = (program_bytes / PROGRAM_BUDGET_DENOMINATOR).max(BUDGET_FLOOR);
+    // Run aggressive speed-first inlining only in the post-representation O pass so pre-repr
+    // carrier analysis (`NativeVec`/`NativeMap`/`HostString`) always sees clean, un-poisoned
+    // standard-library boundaries.
+    let speed = allow_std_post_repr && matches!(profile, Some(crate::opts::Profile::ReleaseSpeed));
+    let budget = if speed {
+        (program_bytes / 4).max(SPEED_BUDGET_FLOOR)
+    } else {
+        (program_bytes / PROGRAM_BUDGET_DENOMINATOR).max(BUDGET_FLOOR)
+    };
     // Growth spent so far, signed: a site that shrinks its caller gives headroom back.
     let mut growth: i64 = 0;
     let order: Vec<JsName> = graph.sccs.iter().flatten().cloned().collect();
@@ -202,6 +252,7 @@ pub(crate) fn run_with_mode(
             sole_referrer,
             zombie_free,
             allow_std_post_repr,
+            speed,
             &mut stats,
         );
         if sites.is_empty() {
@@ -214,7 +265,14 @@ pub(crate) fn run_with_mode(
                 None => continue,
             },
         };
-        let limit = entry_bytes.saturating_mul(2);
+        let limit = if speed {
+            entry_bytes
+                .saturating_mul(2)
+                .max(2_048)
+                .min(entry_bytes.max(SPEED_CALLER_CAP))
+        } else {
+            entry_bytes.saturating_mul(2)
+        };
         let mut current = funcs
             .get(caller)
             .and_then(|f| f.as_ref().ok())
@@ -236,6 +294,7 @@ pub(crate) fn run_with_mode(
                 sole_referrer,
                 &current_metadata.interns.types,
                 &looping,
+                speed,
             ) else {
                 stats.decline("inline.cost-no-opportunity");
                 continue;
@@ -340,7 +399,9 @@ pub(crate) fn run_with_mode(
             } else {
                 0
             };
-            let charge = if net <= 0 || trivial_leaf_slack > 0 {
+            let charge = if speed {
+                net.max(0)
+            } else if net <= 0 || trivial_leaf_slack > 0 {
                 0
             } else if tiny_accessor_slack > 0 {
                 tiny_accessor_slack
@@ -356,9 +417,10 @@ pub(crate) fn run_with_mode(
                 );
             }
             // Only loop virtualization (or <=2B tiny accessors, or <=16B trivial pure leaves) may spend
-            // temporary net growth. Other sites must repay their caller growth through local cleanup or
-            // sole-callee removal.
-            let growth_allowed = matches!(criterion, Criterion::LoopVirtualizable)
+            // temporary net growth under size/balanced profiles. Speed-first mode permits bounded
+            // growth for every qualifying criterion.
+            let growth_allowed = speed
+                || matches!(criterion, Criterion::LoopVirtualizable)
                 || tiny_accessor_slack > 0
                 || trivial_leaf_slack > 0;
             // A small loop helper may expose enough scalar replacement to repay a modest
@@ -437,6 +499,7 @@ pub(crate) fn run_with_mode(
                     sole_referrer,
                     zombie_free,
                     allow_std_post_repr,
+                    speed,
                     &mut throwaway_stats,
                 )
                 .into_iter()
@@ -865,6 +928,7 @@ enum Criterion {
     SmallCallee,
     SoleCaller,
     LoopVirtualizable,
+    InlineHint,
 }
 
 /// The criterion one located site meets, if any (the checks that need the graph and interns
@@ -881,9 +945,23 @@ fn qualifies(
     sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
     table: &crate::jir::TypeTable,
     looping: &BTreeSet<u32>,
+    speed: bool,
 ) -> Option<Criterion> {
     if site.host_boundary {
         return sole_referrer(callee, caller).then_some(Criterion::SoleCaller);
+    }
+    let callee_bytes = sizes.get(callee).copied().unwrap_or(u64::MAX);
+    if speed {
+        if let Some(Ok(callee_func)) = funcs.get(callee) {
+            if (callee_func.sig.abi.inline_always && callee_bytes <= SPEED_INLINE_ALWAYS_FOOTPRINT)
+                || (callee_func.sig.abi.inline_hint && callee_bytes <= SPEED_INLINE_HINT_FOOTPRINT)
+            {
+                return Some(Criterion::InlineHint);
+            }
+        }
+        if looping.contains(&(site.block as u32)) && callee_bytes <= SPEED_LOOP_CALLEE_FOOTPRINT {
+            return Some(Criterion::LoopVirtualizable);
+        }
     }
     let loop_shape = || -> bool {
         if !looping.contains(&(site.block as u32)) {
@@ -917,14 +995,13 @@ fn qualifies(
     // where accepting these sites cost ~500 brotli bytes while the minified count fell. So the
     // small-callee criterion only stands where the duplication is degenerate: a body at or
     // under the call's own post-minify footprint, or a trivial 1..=3 op pure scalar wrapper.
-    let footprint_limit = if site.has_track_caller {
-        TRACK_CALLER_SHARED_FOOTPRINT
-    } else {
-        SHARED_CALLEE_FOOTPRINT
+    let footprint_limit = match (speed, site.has_track_caller) {
+        (true, true) => SPEED_TRACK_CALLER_SHARED_FOOTPRINT,
+        (true, false) => SPEED_SHARED_CALLEE_FOOTPRINT,
+        (false, true) => TRACK_CALLER_SHARED_FOOTPRINT,
+        (false, false) => SHARED_CALLEE_FOOTPRINT,
     };
-    if sizes
-        .get(callee)
-        .is_some_and(|bytes| *bytes <= footprint_limit)
+    if callee_bytes <= footprint_limit
         || funcs
             .get(callee)
             .and_then(|res| res.as_ref().ok())
@@ -948,6 +1025,7 @@ fn collect_sites(
     sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
     zombie_free: &dyn Fn(&JsName) -> bool,
     allow_std_post_repr: bool,
+    speed: bool,
     stats: &mut InlineStats,
 ) -> Vec<Site> {
     let mut sites = Vec::new();
@@ -1052,6 +1130,7 @@ fn collect_sites(
                 *track_caller,
                 items,
                 allow_host_boundary,
+                speed,
             ) {
                 stats.decline(reason);
                 continue;
@@ -1077,7 +1156,11 @@ fn collect_sites(
                 callee,
                 has_track_caller: track_caller.is_some()
                     || (callee_func.sig.abi.caller_location && unused_caller_location(callee_func)),
-                host_boundary: callee_has_host_boundary(callee_func, &callee_metadata.interns),
+                host_boundary: callee_has_host_boundary(
+                    callee_func,
+                    &callee_metadata.interns,
+                    speed,
+                ),
             });
         }
     }
@@ -1133,19 +1216,28 @@ fn strip_unused_last_param(callee: &mut Func) {
     }
 }
 
-/// Rewrites implicit `#[track_caller]` forwarding calls in `callee` to the call-site `SourceFactId`.
+/// Rewrites implicit `#[track_caller]` forwarding ops in `callee` to the call-site
+/// `SourceFactId`.
 fn rewrite_forwarded_track_caller(callee: &mut Func, site_fact: SourceFactId, items: &ItemIndex) {
     for block in &mut callee.blocks {
         for op in &mut block.ops {
-            if let OpKind::Call {
-                callee: Callee::Direct { item, .. },
-                track_caller: tc @ None,
-                ..
-            } = &mut op.kind
-            {
-                if items.get(item).is_some_and(|entry| entry.caller_location) {
+            match &mut op.kind {
+                OpKind::Call {
+                    callee: Callee::Direct { item, .. },
+                    track_caller: tc @ None,
+                    ..
+                } => {
+                    if items.get(item).is_some_and(|entry| entry.caller_location) {
+                        *tc = Some(site_fact);
+                    }
+                }
+                OpKind::Assert {
+                    track_caller: tc @ None,
+                    ..
+                } => {
                     *tc = Some(site_fact);
                 }
+                _ => {}
             }
         }
     }
@@ -1218,13 +1310,13 @@ fn count_item_refs(func: &Func, interns: &Interns, target: &str) -> usize {
         .sum()
 }
 
-fn is_host_boundary_op(kind: &OpKind, interns: &Interns) -> bool {
+fn is_host_boundary_op(kind: &OpKind, interns: &Interns, speed: bool) -> bool {
     match kind {
-        OpKind::Host { payload, .. } => !independent_host(payload, interns),
+        OpKind::Host { payload, .. } => !independent_host(payload, interns, speed),
         OpKind::Call { host, semantic, .. } => {
             !host
                 .as_ref()
-                .is_some_and(|payload| independent_host(payload, interns))
+                .is_some_and(|payload| independent_host(payload, interns, speed))
                 && (host.is_some()
                     || matches!(
                         semantic,
@@ -1235,12 +1327,12 @@ fn is_host_boundary_op(kind: &OpKind, interns: &Interns) -> bool {
     }
 }
 
-fn callee_has_host_boundary(callee: &Func, interns: &Interns) -> bool {
+fn callee_has_host_boundary(callee: &Func, interns: &Interns, speed: bool) -> bool {
     callee
         .blocks
         .iter()
         .flat_map(|block| &block.ops)
-        .any(|op| is_host_boundary_op(&op.kind, interns))
+        .any(|op| is_host_boundary_op(&op.kind, interns, speed))
 }
 
 /// The semantic boundary preventing a callee body from being spliced at this site.
@@ -1254,6 +1346,7 @@ fn body_decline(
     site_track_caller: Option<SourceFactId>,
     items: &ItemIndex,
     allow_host_boundary: bool,
+    speed: bool,
 ) -> Option<&'static str> {
     if callee.has_invoke() {
         return Some("inline.exceptional-control-flow");
@@ -1317,8 +1410,18 @@ fn body_decline(
                     Some("inline.track-caller-unavailable")
                 }
                 // Host and template lowering may own item-local bindings and observable ordering.
-                _ if !allow_host_boundary && is_host_boundary_op(&op.kind, interns) => {
+                _ if !allow_host_boundary && is_host_boundary_op(&op.kind, interns, speed) => {
                     Some("inline.host-boundary")
+                }
+                // Do not inline bodies that call the raw global allocator directly: splicing a
+                // stdlib allocator call into a non-stdlib user function triggers `byte_views`'s
+                // conservative `direct_alloc` fallback and forces the ES6 Proxy byte-view shim
+                // across the whole program.
+                OpKind::Call {
+                    callee: inner_callee,
+                    ..
+                } if is_direct_alloc_call(inner_callee, interns) => {
+                    Some("inline.semantic-boundary")
                 }
                 OpKind::Call {
                     callee: inner_callee,
@@ -1351,23 +1454,72 @@ fn body_decline(
         })
 }
 
+/// Whether `callee` invokes the raw allocator directly (`__rust_alloc`/`__rust_realloc`,
+/// `__rt.{alloc,alloc_zeroed,realloc}`, or `alloc::alloc::{alloc,alloc_zeroed,realloc,Global::*}`).
+fn is_direct_alloc_call(callee: &Callee, interns: &Interns) -> bool {
+    match callee {
+        Callee::Runtime { member, .. } => matches!(
+            interns.str(*member).unwrap_or(""),
+            "alloc" | "alloc_zeroed" | "realloc"
+        ),
+        Callee::Foreign { symbol, .. } => {
+            let sym = interns.str(*symbol).unwrap_or("");
+            (sym.contains("__rust_alloc") && !sym.contains("__rust_alloc_error_handler"))
+                || sym.contains("__rust_realloc")
+        }
+        Callee::Direct { link_name, .. } => {
+            let name = interns.str(*link_name).unwrap_or("");
+            (name.contains("__rust_alloc") && !name.contains("__rust_alloc_error_handler"))
+                || name.contains("__rust_realloc")
+                || name.starts_with("alloc$alloc$alloc$")
+                || name.starts_with("alloc$alloc$alloc_zeroed$")
+                || name.starts_with("alloc$alloc$realloc$")
+                || (name.starts_with("alloc$alloc$")
+                    && (name.contains("alloc_impl")
+                        || name.contains("grow_impl")
+                        || name.contains("_allocate$")
+                        || name.contains("_grow$")))
+        }
+        _ => false,
+    }
+}
+
 /// These dynamic markers have no item-owned template, helper bindings, or scheduling state.
-fn independent_host(payload: &HostPayload, interns: &Interns) -> bool {
-    let HostPayload::Marker {
-        section,
-        template: None,
-        helpers,
-        ..
-    } = payload
-    else {
-        return false;
-    };
-    helpers.is_empty()
-        && interns
-            .str(*section)
-            .and_then(|section| section.strip_prefix("rcgjs.host."))
-            .and_then(rcgjs_object::host::HostOperation::from_marker)
-            .is_some()
+fn independent_host(payload: &HostPayload, interns: &Interns, speed: bool) -> bool {
+    match payload {
+        HostPayload::Marker {
+            section,
+            template: None,
+            helpers,
+            ..
+        } if helpers.is_empty() => {
+            let Some(marker) = interns
+                .str(*section)
+                .and_then(|section| section.strip_prefix("rcgjs.host."))
+            else {
+                return false;
+            };
+            rcgjs_object::host::HostOperation::from_marker(marker).is_some()
+                || (speed
+                    && matches!(
+                        marker,
+                        "read"
+                            | "iserror"
+                            | "throw"
+                            | "badread"
+                            | "base64url"
+                            | "base64urlnative"
+                            | "base64urlsupported"
+                    ))
+        }
+        HostPayload::Block(_) | HostPayload::Map { .. } if speed => true,
+        HostPayload::Extern(bytes_id) if speed => interns
+            .bytes(*bytes_id)
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|text| crate::descriptor::Descriptor::decode(text).ok())
+            .is_some_and(|desc| desc.root() != crate::descriptor::Root::Module),
+        _ => false,
+    }
 }
 
 /// Whether a value of `ty` is something the escape analysis could scalarize at some variant —
@@ -2182,6 +2334,7 @@ mod tests {
                 msg: RAssertMessage::ResumedAfterReturn(
                     crate::jir::semantic::CoroutineKind::Coroutine { movable: false },
                 ),
+                track_caller: None,
             },
             O,
         );
@@ -2242,12 +2395,12 @@ mod tests {
                 template: None,
                 helpers: Vec::new(),
             };
-            assert_eq!(independent_host(&payload, &interns), supported);
+            assert_eq!(independent_host(&payload, &interns, false), supported);
             let HostPayload::Marker { template, .. } = &mut payload else {
                 unreachable!()
             };
             *template = Some(ConstTree::Unit);
-            assert!(!independent_host(&payload, &interns));
+            assert!(!independent_host(&payload, &interns, false));
         }
     }
 
@@ -2328,6 +2481,7 @@ mod tests {
                     types: vec![I32],
                     fallback: None,
                     args: vec![field],
+                    track_caller: None,
                 },
                 I32,
                 O,
@@ -2832,6 +2986,7 @@ mod tests {
                 types: Vec::new(),
                 args: Vec::new(),
                 fallback: None,
+                track_caller: None,
             },
             I32,
             O,
@@ -2934,6 +3089,7 @@ mod tests {
                     length: x,
                     index: x,
                 },
+                track_caller: None,
             },
             O,
         );
@@ -4064,6 +4220,7 @@ mod tests {
                     cond: cmp,
                     expected: false,
                     msg: RAssertMessage::RemainderByZero(x),
+                    track_caller: None,
                 },
                 OriginId(0),
             );

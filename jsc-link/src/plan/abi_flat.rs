@@ -1393,11 +1393,16 @@ pub fn plan_excluding(
                 .all(|block| block.ops.iter().all(|op| scalar_leaf_op(types, func, op)));
         // A `&mut T` the body never writes needs no copy-back and no spill register.
         for (shape, use_) in shapes.iter_mut().zip(&uses) {
-            // Tagged parameters are rebound as scalar expressions in phase C, not as an
-            // addressable enum object. Field-only reads and whole-value forwards are safe;
-            // in-place mutation keeps the canonical ABI until a storage plan can represent it
-            // without changing aliasing.
-            if shape.as_ref().is_some_and(|shape| shape.tagged.is_some()) && use_.mutated {
+            // Tagged and recursive by-value parameters are rebound as scalar expressions in phase
+            // C (`cx.bind_expr`), not as an addressable object. Field-only reads and whole-value
+            // forwards are safe; in-place mutation (including mutable-view forwards) would
+            // reconstruct a fresh object on every use and lose mutations, so keep the canonical
+            // ABI until a storage plan can represent in-place updates without changing aliasing.
+            if shape
+                .as_ref()
+                .is_some_and(|shape| shape.tagged.is_some() || shape.recursive.is_some())
+                && use_.mutated
+            {
                 *shape = None;
                 continue;
             }
@@ -4199,6 +4204,8 @@ mod tests {
                 spread: None,
                 caller_location: false,
                 inline_never: false,
+                inline_hint: false,
+                inline_always: false,
             },
         }
     }
@@ -4715,6 +4722,7 @@ mod tests {
                     link_name: StrId(0),
                 }),
                 args: Vec::new(),
+                track_caller: None,
             }),
             BTreeSet::from([item(9)])
         );
@@ -5946,6 +5954,389 @@ mod tests {
                 .any(|block| matches!(block.term, RTerm::Return(Some(v)) if v == p_i)),
             "Return block after mut_enum split must keep Return(Some(p_i)): {:#?}",
             func.blocks
+        );
+    }
+
+    #[test]
+    fn mutated_recursive_by_value_param_is_not_flattened() {
+        let mut interns = interns();
+        let u32_ty = TypeId(400);
+        let inner_ty = TypeId(401);
+        let outer_ty = TypeId(402);
+        let mut_ref_outer_ty = TypeId(403);
+
+        let mut u32_desc = descriptor(
+            u32_ty,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+        );
+        u32_desc.js.int = Some(crate::jir::types::IntFacts {
+            signed: false,
+            bits: 32,
+            repr: crate::jir::types::IntRepr::Number,
+        });
+        interns.types.insert(u32_desc);
+
+        let mut push_str = |s: &str| {
+            let id = StrId(interns.strings.len() as u32);
+            interns.strings.push(s.to_owned());
+            id
+        };
+        let a_name = push_str("a");
+        let b_name = push_str("b");
+        let inner_name = push_str("inner");
+        let extra_name = push_str("extra");
+        let inner_v = push_str("Inner");
+        let outer_v = push_str("Outer");
+        let mutate_direct_link = push_str("mutate_outer_direct");
+        let mutate_borrow_link = push_str("mutate_outer_borrow");
+        let read_only_link = push_str("read_outer_only");
+        let touch_ref_link = push_str("touch_outer_ref");
+
+        let inner_fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Name(a_name),
+                ty: u32_ty,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Name(b_name),
+                ty: u32_ty,
+                offset: 4,
+            },
+        ];
+        let mut inner_desc = descriptor(
+            inner_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 401,
+                },
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![crate::jir::types::VariantDescriptor {
+                    name: inner_v,
+                    fields: inner_fields.clone(),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+        );
+        inner_desc.layout.size = Some(8);
+        inner_desc.js.is_indirect = true;
+        inner_desc.js.needs_clone = true;
+        inner_desc.js.fields = inner_fields;
+        interns.types.insert(inner_desc);
+
+        let outer_fields = vec![
+            FieldDescriptor {
+                key: FieldKey::Name(inner_name),
+                ty: inner_ty,
+                offset: 0,
+            },
+            FieldDescriptor {
+                key: FieldKey::Name(extra_name),
+                ty: u32_ty,
+                offset: 8,
+            },
+        ];
+        let mut outer_desc = descriptor(
+            outer_ty,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 402,
+                },
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![crate::jir::types::VariantDescriptor {
+                    name: outer_v,
+                    fields: outer_fields.clone(),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+        );
+        outer_desc.layout.size = Some(12);
+        outer_desc.js.is_indirect = true;
+        outer_desc.js.needs_clone = true;
+        outer_desc.js.fields = outer_fields;
+        interns.types.insert(outer_desc);
+
+        interns.types.insert(descriptor(
+            mut_ref_outer_ty,
+            TypeKind::Reference {
+                pointee: outer_ty,
+                mutable: true,
+            },
+        ));
+
+        // Confirm `Outer` has a `RecursiveShape`.
+        let shape = recursive_shape(&interns.types, outer_ty).expect("nested struct is recursive");
+        assert_eq!(shape.fields(), 3);
+
+        // 1. Callee mutates `outer.extra = 0` directly via `SetField`.
+        let mut cb = FuncBuilder::new(item(20), signature(vec![outer_ty], u32_ty));
+        let p_outer = cb.param(outer_ty, NO_ORIGIN);
+        let zero = cb.op(
+            FuncBuilder::ENTRY,
+            OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+            u32_ty,
+            NO_ORIGIN,
+        );
+        cb.effect(
+            FuncBuilder::ENTRY,
+            OpKind::SetField {
+                base: p_outer,
+                variant: None,
+                field: 1,
+                v: zero,
+            },
+            NO_ORIGIN,
+        );
+        let read = cb.op(
+            FuncBuilder::ENTRY,
+            OpKind::Field {
+                base: p_outer,
+                variant: None,
+                field: 1,
+            },
+            u32_ty,
+            NO_ORIGIN,
+        );
+        cb.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(read)));
+        let mutate_direct_func = cb.finish();
+
+        // 2. Callee borrows `&mut outer` and forwards it to a helper call.
+        let mut bb = FuncBuilder::new(item(22), signature(vec![outer_ty], u32_ty));
+        let p_outer_b = bb.param(outer_ty, NO_ORIGIN);
+        let mut_view = bb.op(
+            FuncBuilder::ENTRY,
+            OpKind::BorrowView {
+                root: Root::Value(p_outer_b),
+                path: Vec::new(),
+                mutable: true,
+            },
+            mut_ref_outer_ty,
+            NO_ORIGIN,
+        );
+        bb.effect(
+            FuncBuilder::ENTRY,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: item(24),
+                    link_name: touch_ref_link,
+                },
+                function: None,
+                args: vec![mut_view],
+                track_caller: None,
+                semantic: crate::jir::semantic::CallSemantic::Ordinary,
+                host: None,
+            },
+            NO_ORIGIN,
+        );
+        let read_b = bb.op(
+            FuncBuilder::ENTRY,
+            OpKind::Field {
+                base: p_outer_b,
+                variant: None,
+                field: 1,
+            },
+            u32_ty,
+            NO_ORIGIN,
+        );
+        bb.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(read_b)));
+        let mutate_borrow_func = bb.finish();
+
+        // 3. Control: read-only recursive by-value callee (should flatten!).
+        let mut rb = FuncBuilder::new(item(23), signature(vec![outer_ty], u32_ty));
+        let p_outer_r = rb.param(outer_ty, NO_ORIGIN);
+        let read_r = rb.op(
+            FuncBuilder::ENTRY,
+            OpKind::Field {
+                base: p_outer_r,
+                variant: None,
+                field: 1,
+            },
+            u32_ty,
+            NO_ORIGIN,
+        );
+        rb.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(read_r)));
+        let read_only_func = rb.finish();
+
+        // Helper taking `&mut Outer`.
+        let mut tb = FuncBuilder::new(item(24), signature(vec![mut_ref_outer_ty], UNIT));
+        let _p_ref = tb.param(mut_ref_outer_ty, NO_ORIGIN);
+        tb.terminate(FuncBuilder::ENTRY, RTerm::Return(None));
+        let touch_ref_func = tb.finish();
+
+        // Caller constructs `Outer` and calls all three callees.
+        let mut kb = FuncBuilder::new(item(21), signature(vec![u32_ty], u32_ty));
+        let p_x = kb.param(u32_ty, NO_ORIGIN);
+        let mut call_with_outer = |callee_item: ItemId, link_name: StrId| {
+            let inner_v_id = kb.op(
+                FuncBuilder::ENTRY,
+                OpKind::Aggregate {
+                    ty: inner_ty,
+                    variant: 0,
+                    active_field: None,
+                    fields: vec![p_x, p_x],
+                },
+                inner_ty,
+                NO_ORIGIN,
+            );
+            let outer_v_id = kb.op(
+                FuncBuilder::ENTRY,
+                OpKind::Aggregate {
+                    ty: outer_ty,
+                    variant: 0,
+                    active_field: None,
+                    fields: vec![inner_v_id, p_x],
+                },
+                outer_ty,
+                NO_ORIGIN,
+            );
+            kb.op(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: callee_item,
+                        link_name,
+                    },
+                    function: None,
+                    args: vec![outer_v_id],
+                    track_caller: None,
+                    semantic: crate::jir::semantic::CallSemantic::Ordinary,
+                    host: None,
+                },
+                u32_ty,
+                NO_ORIGIN,
+            )
+        };
+        let _r1 = call_with_outer(item(20), mutate_direct_link);
+        let _r2 = call_with_outer(item(22), mutate_borrow_link);
+        let r3 = call_with_outer(item(23), read_only_link);
+        kb.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(r3)));
+        let caller_func = kb.finish();
+
+        let make_item = |name: &str, func: &Func, refs: &[&str]| {
+            let mut it = link_item(name, refs);
+            let body = crate::jir::semantic::Body {
+                item: func.item,
+                kind: crate::jir::semantic::BodyKind::Function,
+                semantic: crate::jir::semantic::BodySemantic::Ordinary,
+                signature: func.sig.clone(),
+                locals: Vec::new(),
+                blocks: Vec::new(),
+            };
+            let hash = crate::jir::summary::semantic_hash(&body, &interns);
+            let physical = crate::jir::summary::PhysicalSummary::of(&body, &interns.types, hash);
+            it.jir.summary = Some(crate::jir::summary::ItemSummary {
+                key: crate::jir::summary::SemanticKey {
+                    link_name: name.to_owned(),
+                    item: Some(func.item),
+                },
+                body_hash: None,
+                semantic_hash: Some(hash),
+                availability: crate::jir::summary::Availability::Available,
+                deps: refs.iter().map(|r| (*r).to_owned()).collect(),
+                abi: None,
+                physical,
+                kind: ItemKind::Fn,
+                linkage: Linkage::internal(),
+                order: None,
+                dts: false,
+                fallback: rcgjs_object::object::BlobRef {
+                    offset: 0,
+                    clen: 0,
+                    ulen: 0,
+                },
+                body: None,
+                origin: None,
+                estimated_bytes: 0,
+                class: ItemClass::AGGREGATE,
+            });
+            it.jir.body = Some(body);
+            it.jir.use_interns(interns.clone());
+            it
+        };
+        let mut table = BTreeMap::new();
+        table.insert(
+            JsName::new("mutate_outer_direct".to_owned()),
+            make_item("mutate_outer_direct", &mutate_direct_func, &[]),
+        );
+        table.insert(
+            JsName::new("mutate_outer_borrow".to_owned()),
+            make_item(
+                "mutate_outer_borrow",
+                &mutate_borrow_func,
+                &["touch_outer_ref"],
+            ),
+        );
+        table.insert(
+            JsName::new("read_outer_only".to_owned()),
+            make_item("read_outer_only", &read_only_func, &[]),
+        );
+        table.insert(
+            JsName::new("touch_outer_ref".to_owned()),
+            make_item("touch_outer_ref", &touch_ref_func, &[]),
+        );
+        table.insert(
+            JsName::new("entry".to_owned()),
+            make_item(
+                "entry",
+                &caller_func,
+                &[
+                    "mutate_outer_direct",
+                    "mutate_outer_borrow",
+                    "read_outer_only",
+                ],
+            ),
+        );
+        let mut funcs = BTreeMap::new();
+        funcs.insert(
+            JsName::new("mutate_outer_direct".to_owned()),
+            Ok(mutate_direct_func),
+        );
+        funcs.insert(
+            JsName::new("mutate_outer_borrow".to_owned()),
+            Ok(mutate_borrow_func),
+        );
+        funcs.insert(
+            JsName::new("read_outer_only".to_owned()),
+            Ok(read_only_func),
+        );
+        funcs.insert(
+            JsName::new("touch_outer_ref".to_owned()),
+            Ok(touch_ref_func),
+        );
+        funcs.insert(JsName::new("entry".to_owned()), Ok(caller_func));
+
+        let opts = crate::opts::Opts {
+            optimizer: crate::opts::OptimizerMode::On,
+            flat_abi: true,
+            ..crate::opts::Opts::default()
+        };
+        let plan = plan_excluding(&table, &funcs, &opts, &BTreeSet::new());
+        assert!(
+            plan.flat.contains_key(&item(23)),
+            "control: read-only recursive by-value parameter should flatten"
+        );
+        assert!(
+            !plan.flat.contains_key(&item(20)),
+            "SetField-mutated recursive by-value parameter must not flatten"
+        );
+        assert!(
+            !plan.flat.contains_key(&item(22)),
+            "mutably-borrowed recursive by-value parameter must not flatten"
         );
     }
 }

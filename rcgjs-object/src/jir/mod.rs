@@ -34,7 +34,8 @@ mod tests;
 /// | 10 | Source coroutine suspension facts in the object intern table. |
 /// | 16 | `AbiSignature::inline_never` preserves `#[inline(never)]` across JIR. |
 /// | 17 | `Callee::Runtime { member, sysroot }` records rustc sysroot provenance for foreign runtime shims. |
-pub const JIR_SCHEMA: u16 = 17;
+/// | 18 | `AbiSignature::{inline_hint, inline_always}` preserves `#[inline]` hints and `Terminator::Assert::track_caller` records resolved MIR-inlined `#[track_caller]` locations. |
+pub const JIR_SCHEMA: u16 = 18;
 
 use serde::{Deserialize, Serialize};
 

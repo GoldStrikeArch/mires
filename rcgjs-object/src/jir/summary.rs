@@ -1046,6 +1046,8 @@ impl<'a> Normalizer<'a> {
                 }),
                 caller_location: body.signature.abi.caller_location,
                 inline_never: body.signature.abi.inline_never,
+                inline_hint: body.signature.abi.inline_hint,
+                inline_always: body.signature.abi.inline_always,
             },
         };
         let kind = self.body_kind(&body.kind);
@@ -1447,12 +1449,14 @@ impl<'a> Normalizer<'a> {
                 message,
                 target,
                 unwind,
+                track_caller,
             } => Terminator::Assert {
                 condition: self.operand(condition),
                 expected: *expected,
                 message: self.assert_message(message),
                 target: self.block(*target),
                 unwind: self.unwind(*unwind),
+                track_caller: track_caller.map(|fact| self.source_fact(fact)),
             },
             Terminator::UnwindResume => Terminator::UnwindResume,
             Terminator::UnwindTerminate(reason) => Terminator::UnwindTerminate(*reason),
@@ -2003,6 +2007,7 @@ mod identity_tests {
                     spread: None,
                     caller_location: false,
                     inline_never: false,
+                    ..AbiSignature::default()
                 },
             },
             locals: locals(),

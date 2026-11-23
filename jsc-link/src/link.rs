@@ -3189,6 +3189,8 @@ mod tests {
                     spread: None,
                     caller_location: true,
                     inline_never: false,
+                    inline_hint: false,
+                    inline_always: false,
                 },
             },
             locals: Vec::new(),
@@ -3395,6 +3397,8 @@ mod tests {
                     spread: None,
                     caller_location: true,
                     inline_never: false,
+                    inline_hint: false,
+                    inline_always: false,
                 },
             },
             locals: vec![

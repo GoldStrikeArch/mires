@@ -2292,6 +2292,8 @@ mod tests {
                     spread: None,
                     caller_location: false,
                     inline_never: false,
+                    inline_hint: false,
+                    inline_always: false,
                 },
                 arguments: Vec::new(),
                 result: I32,
@@ -2515,6 +2517,7 @@ mod tests {
             cond,
             expected,
             msg: RAssertMessage::NullPointer,
+            track_caller: None,
         };
         b.effect(entry, assert(truth, true), NO_ORIGIN); // settled: goes
         b.effect(entry, assert(falsity, false), NO_ORIGIN); // settled: goes
@@ -3986,6 +3989,7 @@ mod tests {
                         left: x,
                         right: step_val,
                     },
+                    track_caller: None,
                 },
                 NO_ORIGIN,
             );

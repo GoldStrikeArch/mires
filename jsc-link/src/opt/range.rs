@@ -157,6 +157,7 @@ fn run_impl(
                 cond,
                 expected: true,
                 msg: RAssertMessage::BoundsCheck { length, index: idx },
+                ..
             } = &func.blocks[b].ops[index].kind
             else {
                 continue;
@@ -1692,6 +1693,8 @@ mod tests {
                     spread: None,
                     caller_location: false,
                     inline_never: false,
+                    inline_hint: false,
+                    inline_always: false,
                 },
                 arguments: Vec::new(),
                 result: U32,
@@ -1749,6 +1752,7 @@ mod tests {
                 cond,
                 expected: true,
                 msg: RAssertMessage::BoundsCheck { length, index },
+                track_caller: None,
             },
             NO_ORIGIN,
         );

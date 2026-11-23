@@ -124,6 +124,10 @@ pub struct AbiSignature {
     pub caller_location: bool,
     /// Whether Rust marked the item `#[inline(never)]`.
     pub inline_never: bool,
+    /// Whether Rust marked the item `#[inline]`.
+    pub inline_hint: bool,
+    /// Whether Rust marked the item `#[inline(always)]` (or `#[rustc_force_inline]`).
+    pub inline_always: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -733,6 +737,10 @@ pub enum Terminator {
         message: AssertMessage,
         target: BlockId,
         unwind: Unwind,
+        /// Resolved caller location when this assert came from a MIR-inlined `#[track_caller]`
+        /// body or sits inside a non-`#[track_caller]` body; `None` forwards the enclosing `$loc`
+        /// parameter (or falls back to the terminator origin for legacy/synthetic bodies).
+        track_caller: Option<SourceFactId>,
     },
     UnwindResume,
     UnwindTerminate(TerminateReason),

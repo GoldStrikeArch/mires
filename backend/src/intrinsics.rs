@@ -1664,11 +1664,56 @@ fn compares_by_value(ty: Ty<'_>) -> bool {
 /// A `#[track_caller]` function passes its *own* `$loc` straight through, which is what makes a
 /// location propagate down a chain of them — `panic_bounds_check` reports the indexing expression
 /// rather than its own body.
-pub(crate) fn caller_location_argument<'tcx>(fx: &FnCx<'_, 'tcx>, span: Span) -> Expr {
-    if fx.instance.def.requires_caller_location(fx.tcx) {
-        return jsast::id(CALLER_LOCATION_PARAM);
+/// Resolves the `#[track_caller]` location for `source_info` inside `mir`.
+///
+/// Walks `mir.source_scopes` upward across MIR-inlined frames as long as each inlined callee
+/// requires a caller location (`#[track_caller]`). If a non-`#[track_caller]` inlined frame is
+/// reached, or if `outer_instance` itself is not `#[track_caller]`, returns `Some(span)` for the
+/// concrete call site to materialize as a `Location`. Returns `None` only when every enclosing
+/// frame (including `outer_instance`) is `#[track_caller]`, meaning the body forwards its hidden
+/// `$loc` parameter.
+pub(crate) fn resolve_caller_location_span<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mir: &rustc_middle::mir::Body<'tcx>,
+    outer_instance: Instance<'tcx>,
+    source_info: rustc_middle::mir::SourceInfo,
+) -> Option<Span> {
+    let mut span = source_info.span;
+    let mut scope = source_info.scope;
+    for _ in 0..mir.source_scopes.len() {
+        let data = &mir.source_scopes[scope];
+        if let Some((inlined_instance, call_span)) = data.inlined {
+            if !inlined_instance.def.requires_caller_location(tcx) {
+                return Some(span);
+            }
+            span = call_span;
+            match data.inlined_parent_scope {
+                Some(parent) => scope = parent,
+                None => break,
+            }
+        } else {
+            match data.parent_scope {
+                Some(parent) => scope = parent,
+                None => break,
+            }
+        }
     }
-    caller_location_value(fx, span)
+    if outer_instance.def.requires_caller_location(tcx) {
+        None
+    } else {
+        Some(span)
+    }
+}
+
+pub(crate) fn caller_location_argument<'tcx>(fx: &FnCx<'_, 'tcx>, span: Span) -> Expr {
+    let source_info = rustc_middle::mir::SourceInfo {
+        span,
+        scope: fx.scope.get(),
+    };
+    match resolve_caller_location_span(fx.tcx, fx.mir, fx.instance, source_info) {
+        None => jsast::id(CALLER_LOCATION_PARAM),
+        Some(resolved) => caller_location_value(fx, resolved),
+    }
 }
 
 /// The `Location` of `span`, as a JavaScript value.
@@ -1972,22 +2017,23 @@ fn transmute_scalar<'tcx>(
                 value
             }
         }
-        // `[u8; N]` and `uN`, little endian: `u32::from_le_bytes` and `u16::to_le_bytes` are
-        // written as exactly this transmute, and `core::fmt`'s integer formatting reads its digit
-        // buffer through `cast_array().read()` on the way to one. Nothing else in this backend can
-        // do it: a byte buffer has no place holding the integer its bytes spell, which is why the
-        // pointer matrix in `ptr.rs` sends the question here instead of answering it.
+        // `[E; N]` and `uN`/`iN`, little endian: covers `u32::from_le_bytes` / `u16::to_le_bytes`
+        // as well as MIR `InstSimplify` lowerings of `raw_eq::<[T; N]>` (e.g. `[i32; 4]` -> `u128`).
         (ReprClass::Other, ReprClass::Int(to))
-            if matches!(to.bits, 16 | 32 | 64)
-                && byte_array_len(tcx, inner_from) == Some(u64::from(to.bits / 8)) =>
+            if matches!(to.bits, 16 | 32 | 64 | 128)
+                && scalar_array_info(tcx, inner_from)
+                    .is_some_and(|info| info.matches_int_bits(to.bits)) =>
         {
-            bytes_to_int(to, value)
+            let info = scalar_array_info(tcx, inner_from).unwrap();
+            array_to_int(info, to, value)
         }
         (ReprClass::Int(from), ReprClass::Other)
-            if matches!(from.bits, 16 | 32 | 64)
-                && byte_array_len(tcx, inner_to) == Some(u64::from(from.bits / 8)) =>
+            if matches!(from.bits, 16 | 32 | 64 | 128)
+                && scalar_array_info(tcx, inner_to)
+                    .is_some_and(|info| info.matches_int_bits(from.bits)) =>
         {
-            int_to_bytes(from, value)
+            let info = scalar_array_info(tcx, inner_to).unwrap();
+            int_to_array(from, info, value)
         }
         // A **fieldless enum with an integer `repr`** and an integer of its own width. Such a
         // value *is* its discriminant, in this model as on a real machine (`value::EnumRepr`), so
@@ -2047,37 +2093,96 @@ fn transmute_scalar<'tcx>(
 /// The parameter the byte conversions bind their operand to, so that it is evaluated once.
 const BYTES_PARAM: &str = "$b";
 
-/// The length of `ty` if it is an array of bytes, and `None` otherwise.
-///
-/// A transparent union element counts: `[MaybeUninit<u8>; N]` holds the same JavaScript numbers
-/// `[u8; N]` does (`value.rs`).
-fn byte_array_len<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<u64> {
+#[derive(Clone, Copy)]
+struct ScalarArrayInfo {
+    count: u32,
+    elem_bits: u32,
+    elem_signed: bool,
+    elem_bool: bool,
+}
+
+impl ScalarArrayInfo {
+    fn matches_int_bits(self, int_bits: u32) -> bool {
+        self.elem_bits < int_bits && self.count.saturating_mul(self.elem_bits) == int_bits
+    }
+}
+
+/// Element width, signedness, and length of `[E; N]` when `E` is a plain scalar integer, `bool`,
+/// `char`, or fieldless integer-`repr` enum (including transparent/pattern wrappers like
+/// `MaybeUninit<u8>` or `NonZero<u32>`).
+fn scalar_array_info<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<ScalarArrayInfo> {
     let ty::Array(element, count) = value::peel_pattern(ty).kind() else {
         return None;
     };
+    let count = u32::try_from(count.try_to_target_usize(tcx)?).ok()?;
+    if count == 0 {
+        return None;
+    }
     let element = value::peel_pattern(value::peel_transparent(tcx, *element));
-    matches!(element.kind(), ty::Uint(ty::UintTy::U8)).then(|| count.try_to_target_usize(tcx))?
+    if let Some((signed, bits)) = int_info(tcx, element) {
+        if matches!(bits, 8 | 16 | 32 | 64) {
+            return Some(ScalarArrayInfo {
+                count,
+                elem_bits: bits,
+                elem_signed: signed,
+                elem_bool: false,
+            });
+        }
+        return None;
+    }
+    match element.kind() {
+        ty::Bool => Some(ScalarArrayInfo {
+            count,
+            elem_bits: 8,
+            elem_signed: false,
+            elem_bool: true,
+        }),
+        ty::Char => Some(ScalarArrayInfo {
+            count,
+            elem_bits: 32,
+            elem_signed: false,
+            elem_bool: false,
+        }),
+        _ => value::direct_tag(tcx, element).and_then(|(bits, signed)| {
+            let bits = u32::try_from(bits).ok()?;
+            matches!(bits, 8 | 16 | 32 | 64).then_some(ScalarArrayInfo {
+                count,
+                elem_bits: bits,
+                elem_signed: signed,
+                elem_bool: false,
+            })
+        }),
+    }
 }
 
-/// `[u8; N]` to the integer those bytes spell, little endian: `b[0] | b[1] << 8 | ...`.
-///
-/// The shifted bytes are combined with `|`, which is an int32 operation, and the destination's
-/// mask then reads the result at its own width and signedness — so `u32` comes out `>>> 0` and
-/// `i32` comes out `| 0`.
-///
-/// A **64 bit** destination is a `BigInt` (`value.rs`), and the int32 operators would silently
-/// throw the top four bytes away, so each byte is widened first and the shifts are `BigInt` ones.
-/// That is what `str::parse::<f64>()` reaches: `dec2flt` reads its digits eight at a time through
-/// `ByteSlice::read_u64`, which is exactly this transmute.
-fn bytes_to_int(int: Int, value: Expr) -> Expr {
-    let bytes = jsast::id(BYTES_PARAM);
+/// `[E; N]` to the integer those elements spell, little endian.
+fn array_to_int(arr: ScalarArrayInfo, int: Int, value: Expr) -> Expr {
+    let bound = jsast::id(BYTES_PARAM);
     let big = int.repr == crate::value::IntRepr::BigInt;
-    let byte = |index: u32| {
-        let read = jsast::index(bytes.clone(), jsast::num(index));
-        if big {
-            jsast::call(jsast::id("BigInt"), vec![read])
+    let lane = |index: u32| {
+        let read = jsast::index(bound.clone(), jsast::num(index));
+        let unsigned = if arr.elem_bool {
+            jsast::cond(read, jsast::num(1), jsast::num(0))
+        } else if arr.elem_bits == 64 {
+            // 64-bit elements inside an array are stored as BigInt.
+            return jsast::call(
+                jsast::member(jsast::id("BigInt"), "asUintN"),
+                vec![jsast::num(64), read],
+            );
+        } else if arr.elem_signed {
+            match arr.elem_bits {
+                8 => jsast::binary(JsBinOp::BitAnd, read, jsast::num(255)),
+                16 => jsast::binary(JsBinOp::BitAnd, read, jsast::num(65535)),
+                32 => jsast::u32_wrap(read),
+                _ => unreachable!(),
+            }
         } else {
             read
+        };
+        if big {
+            jsast::call(jsast::id("BigInt"), vec![unsigned])
+        } else {
+            unsigned
         }
     };
     let shift = |amount: u32| {
@@ -2087,9 +2192,9 @@ fn bytes_to_int(int: Int, value: Expr) -> Expr {
             jsast::num(amount)
         }
     };
-    let mut combined = byte(0);
-    for index in 1..int.bits / 8 {
-        let shifted = jsast::binary(JsBinOp::Shl, byte(index), shift(index * 8));
+    let mut combined = lane(0);
+    for index in 1..arr.count {
+        let shifted = jsast::binary(JsBinOp::Shl, lane(index), shift(index * arr.elem_bits));
         combined = jsast::binary(JsBinOp::BitOr, combined, shifted);
     }
     let combined = mask(int.repr, int.signed, int.bits, combined);
@@ -2099,42 +2204,56 @@ fn bytes_to_int(int: Int, value: Expr) -> Expr {
     )
 }
 
-/// The other direction: the `N` bytes of an integer, least significant first.
-///
-/// `>>>` reads its operand as a `u32` first, so a negative source needs no separate arm — the
-/// shift already sees the bit pattern, and `& 255` takes the byte out of it.
-///
-/// A `BigInt` source shifts with `>>`, which is the only shift `BigInt` has and is arithmetic; that
-/// is the same answer, because a `BigInt` behaves as an infinitely sign extended two's complement
-/// number and `& 255n` reads the byte out of it either way. Each byte then comes back through
-/// `Number`, because the elements of a `[u8; N]` are JavaScript numbers.
-fn int_to_bytes(int: Int, value: Expr) -> Expr {
+/// The other direction: an integer unpacked into `[E; N]`, least significant first.
+fn int_to_array(int: Int, arr: ScalarArrayInfo, value: Expr) -> Expr {
     let bound = jsast::id(BYTES_PARAM);
     let big = int.repr == crate::value::IntRepr::BigInt;
-    let bytes = (0..int.bits / 8)
+    let elems = (0..arr.count)
         .map(|index| {
             let shifted = if index == 0 {
                 bound.clone()
             } else if big {
-                jsast::binary(JsBinOp::Shr, bound.clone(), jsast::bigint(index * 8))
+                jsast::binary(
+                    JsBinOp::Shr,
+                    bound.clone(),
+                    jsast::bigint(index * arr.elem_bits),
+                )
             } else {
-                jsast::binary(JsBinOp::UShr, bound.clone(), jsast::num(index * 8))
+                jsast::binary(
+                    JsBinOp::UShr,
+                    bound.clone(),
+                    jsast::num(index * arr.elem_bits),
+                )
             };
-            let mask = if big {
-                jsast::bigint(255u32)
+            if arr.elem_bits == 64 {
+                return mask(crate::value::IntRepr::BigInt, arr.elem_signed, 64, shifted);
+            }
+            let raw = if big {
+                let masked = jsast::call(
+                    jsast::member(jsast::id("BigInt"), "asUintN"),
+                    vec![jsast::num(arr.elem_bits), shifted],
+                );
+                jsast::call(jsast::id("Number"), vec![masked])
+            } else if arr.elem_bits < 32 {
+                let bit_mask = (1u32 << arr.elem_bits) - 1;
+                jsast::binary(JsBinOp::BitAnd, shifted, jsast::num(bit_mask))
             } else {
-                jsast::num(255)
+                shifted
             };
-            let byte = jsast::binary(JsBinOp::BitAnd, shifted, mask);
-            if big {
-                jsast::call(jsast::id("Number"), vec![byte])
+            if arr.elem_bool {
+                jsast::binary(JsBinOp::StrictNe, raw, jsast::num(0))
             } else {
-                byte
+                mask(
+                    crate::value::IntRepr::Number,
+                    arr.elem_signed,
+                    arr.elem_bits,
+                    raw,
+                )
             }
         })
         .collect();
     jsast::call(
-        jsast::arrow(vec![BYTES_PARAM.to_string()], jsast::array(bytes)),
+        jsast::arrow(vec![BYTES_PARAM.to_string()], jsast::array(elems)),
         vec![value],
     )
 }

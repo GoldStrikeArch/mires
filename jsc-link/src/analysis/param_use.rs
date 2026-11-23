@@ -194,6 +194,9 @@ fn summarize_one(
                     }
                     Verdict::Forward(item, positions) => {
                         use_.written = true;
+                        if kind == ParamKind::ByValue && role == TrackedRole::View {
+                            use_.mutated = true;
+                        }
                         use_.forwards
                             .extend(positions.into_iter().map(|position| (item, position)));
                     }

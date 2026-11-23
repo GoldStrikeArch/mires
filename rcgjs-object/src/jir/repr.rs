@@ -307,6 +307,7 @@ pub enum OpKind {
         types: Vec<TypeId>,
         fallback: Option<DirectItemRef>,
         args: Vec<ValueId>,
+        track_caller: Option<SourceFactId>,
     },
     /// A host operation with no Rust callee. Invoke/construct markers consume a proven private
     /// fixed array as their last argument, rather than the Rust slice a `Call` consumes.
@@ -326,6 +327,7 @@ pub enum OpKind {
         cond: ValueId,
         expected: bool,
         msg: RAssertMessage,
+        track_caller: Option<SourceFactId>,
     },
     /// Turns a virtual value into a stored one. Reserved for the representation phases; the
     /// result has the same type as `v`.

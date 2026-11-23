@@ -3143,6 +3143,7 @@ mod tests {
                     types: Vec::new(),
                     fallback: None,
                     args: vec![unit_val, unit_val],
+                    track_caller: None,
                 },
                 O,
             );
@@ -3160,6 +3161,7 @@ mod tests {
                     types: Vec::new(),
                     fallback: None,
                     args: vec![unit_val, fn_val, fn_val],
+                    track_caller: None,
                 },
                 O,
             );

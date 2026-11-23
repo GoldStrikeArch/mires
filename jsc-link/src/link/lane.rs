@@ -1697,7 +1697,7 @@ fn o_group_with_mode(
                 input.origins = metadata.origins.as_deref();
                 crate::plan::cost::measure_inline_item(&input, func, &inline_renames)
             };
-        group.inline = crate::opt::inline::run_with_mode(
+        group.inline = crate::opt::inline::run_with_profile(
             funcs,
             &mut metadata,
             &graph,
@@ -1708,6 +1708,7 @@ fn o_group_with_mode(
             program,
             &sizes,
             allow_std_post_repr,
+            ctx.opts.profile,
         );
         let updates: Vec<_> = metadata
             .into_iter()
@@ -3770,6 +3771,8 @@ mod tests {
                     spread: None,
                     caller_location: false,
                     inline_never: false,
+                    inline_hint: false,
+                    inline_always: false,
                 },
             },
             locals: vec![
@@ -3861,6 +3864,8 @@ mod tests {
                     spread: None,
                     caller_location: false,
                     inline_never: false,
+                    inline_hint: false,
+                    inline_always: false,
                 },
             },
             locals: vec![
@@ -4043,6 +4048,8 @@ mod tests {
                         spread: None,
                         caller_location: false,
                         inline_never: false,
+                        inline_hint: false,
+                        inline_always: false,
                     },
                 },
                 locals,

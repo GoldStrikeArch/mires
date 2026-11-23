@@ -508,12 +508,17 @@ fn verify_terminator(terminator: &Terminator, context: &Context<'_>) -> Result<(
             message,
             target,
             unwind,
+            track_caller,
             ..
         } => {
             verify_operand(condition, context)?;
             verify_assert_message(message, context)?;
             context.block(*target)?;
-            verify_unwind(*unwind, context)
+            verify_unwind(*unwind, context)?;
+            if let Some(fact) = track_caller {
+                context.source_fact(*fact)?;
+            }
+            Ok(())
         }
         Terminator::FalseEdge { real, imaginary } => {
             context.block(*real)?;

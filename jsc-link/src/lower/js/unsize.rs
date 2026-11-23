@@ -112,6 +112,25 @@ impl JsCx<'_> {
             let arr = self.expr_of(operand)?;
             return Ok(super::i64_pair::bytes_expr_to_i64_pair(self, stmts, arr));
         }
+        if scalar_array_info(table, from_ty)
+            .is_some_and(|info| info.count == 2 && info.elem_bits == 32)
+        {
+            if self.is_inline(operand) {
+                if let Some(op) = self.def_of(operand) {
+                    if let OpKind::Aggregate { fields, .. } = &op.kind {
+                        if fields.len() == 2 {
+                            let lo = jsast::i32_wrap(self.expr_of(fields[0])?);
+                            let hi = jsast::i32_wrap(self.expr_of(fields[1])?);
+                            return Ok((lo, hi));
+                        }
+                    }
+                }
+            }
+            let arr = super::i64_pair::materialize(self, stmts, self.expr_of(operand)?);
+            let lo = jsast::i32_wrap(jsast::index(arr.clone(), jsast::num(0)));
+            let hi = jsast::i32_wrap(jsast::index(arr, jsast::num(1)));
+            return Ok((lo, hi));
+        }
         if value::float_bits(table, table.peeled(from_ty)) == Some(64) {
             let val = self.expr_of(operand)?;
             return Ok(super::i64_pair::f64_to_bits_pair(self, stmts, val));
@@ -134,6 +153,17 @@ impl JsCx<'_> {
         if byte_array_len(table, to_ty) == Some(8) {
             let pair = self.pair_of(operand)?;
             return Ok(super::i64_pair::i64_pair_to_bytes_expr(self, stmts, pair));
+        }
+        if let Some(info) = scalar_array_info(table, to_ty) {
+            if info.count == 2 && info.elem_bits == 32 {
+                let (lo, hi) = self.pair_of(operand)?;
+                let elems = if info.elem_signed {
+                    vec![lo, hi]
+                } else {
+                    vec![jsast::u32_wrap(lo), jsast::u32_wrap(hi)]
+                };
+                return Ok(jsast::array(elems));
+            }
         }
         if value::float_bits(table, table.peeled(to_ty)) == Some(64) {
             let pair = self.pair_of(operand)?;
@@ -277,18 +307,24 @@ impl JsCx<'_> {
                     value
                 }
             }
-            // `[u8; N]` and `uN`, little endian.
+            // `[E; N]` and `uN`/`iN`, little endian (e.g. `[u8; 8] <-> u64`, `[i32; 4] <-> u128`).
             (ReprClass::Other, ReprClass::Int(b))
-                if matches!(b.bits, 16 | 32 | 64)
-                    && byte_array_len(table, from) == Some(u64::from(b.bits / 8)) =>
+                if matches!(b.bits, 16 | 32 | 64 | 128)
+                    && scalar_array_info(table, from).is_some_and(|info| {
+                        info.count.checked_mul(info.elem_bits) == Some(b.bits)
+                    }) =>
             {
-                bytes_to_int(b, value)
+                let info = scalar_array_info(table, from).unwrap();
+                array_to_int(info, b, value)
             }
             (ReprClass::Int(a), ReprClass::Other)
-                if matches!(a.bits, 16 | 32 | 64)
-                    && byte_array_len(table, to) == Some(u64::from(a.bits / 8)) =>
+                if matches!(a.bits, 16 | 32 | 64 | 128)
+                    && scalar_array_info(table, to).is_some_and(|info| {
+                        info.count.checked_mul(info.elem_bits) == Some(a.bits)
+                    }) =>
             {
-                int_to_bytes(a, value)
+                let info = scalar_array_info(table, to).unwrap();
+                int_to_array(a, info, value)
             }
             // A fieldless enum with an integer `repr` and an integer of its own width: such a
             // value *is* its discriminant, so moving between the two moves nothing at all when the
@@ -575,12 +611,67 @@ fn direct_tag(table: &rcgjs_object::jir::types::TypeTable, ty: TypeId) -> Option
     }
 }
 
+/// Element width, signedness, and length of `[E; N]` when `E` is a plain scalar integer, `bool`,
+/// `char`, or fieldless integer-`repr` enum.
+#[derive(Clone, Copy)]
+struct ScalarArrayInfo {
+    count: u32,
+    elem_bits: u32,
+    elem_signed: bool,
+    elem_bool: bool,
+}
+
 /// The length of `ty` if it is an array of bytes, and `None` otherwise.
 fn byte_array_len(table: &rcgjs_object::jir::types::TypeTable, ty: TypeId) -> Option<u64> {
     let TypeKind::Array { element, length } = value::kind(table, table.peeled(ty))? else {
         return None;
     };
     value::is_u8(table, table.peeled(*element)).then_some(*length)
+}
+
+/// Element layout of `[E; N]` for scalar array <-> integer transmutations.
+fn scalar_array_info(
+    table: &rcgjs_object::jir::types::TypeTable,
+    ty: TypeId,
+) -> Option<ScalarArrayInfo> {
+    let TypeKind::Array { element, length } = value::kind(table, table.peeled(ty))? else {
+        return None;
+    };
+    let count = u32::try_from(*length).ok()?;
+    if count == 0 {
+        return None;
+    }
+    let elem = table.peeled(*element);
+    if let Some((signed, bits)) = table.int_info(elem) {
+        return matches!(bits, 8 | 16 | 32 | 64).then_some(ScalarArrayInfo {
+            count,
+            elem_bits: bits,
+            elem_signed: signed,
+            elem_bool: false,
+        });
+    }
+    match value::kind(table, elem)? {
+        TypeKind::Bool => Some(ScalarArrayInfo {
+            count,
+            elem_bits: 8,
+            elem_signed: false,
+            elem_bool: true,
+        }),
+        TypeKind::Char => Some(ScalarArrayInfo {
+            count,
+            elem_bits: 32,
+            elem_signed: false,
+            elem_bool: false,
+        }),
+        _ => direct_tag(table, elem).and_then(|(bits, signed)| {
+            matches!(bits, 8 | 16 | 32 | 64).then_some(ScalarArrayInfo {
+                count,
+                elem_bits: bits,
+                elem_signed: signed,
+                elem_bool: false,
+            })
+        }),
+    }
 }
 
 /// `new To(From.of(value).buffer)[0]`: the bits of `value`, read back as another type.
@@ -613,16 +704,33 @@ fn int_array(int: Repr) -> &'static str {
     }
 }
 
-/// `[u8; N]` to the integer those bytes spell, little endian.
-fn bytes_to_int(int: Repr, value: Expr) -> Expr {
-    let bytes = jsast::id(BYTES_PARAM);
+/// `[E; N]` to the integer those elements spell, little endian.
+fn array_to_int(arr: ScalarArrayInfo, int: Repr, value: Expr) -> Expr {
+    let bound = jsast::id(BYTES_PARAM);
     let big = int.repr == IntRepr::BigInt;
-    let byte = |index: u32| {
-        let read = jsast::index(bytes.clone(), jsast::num(index));
-        if big {
-            jsast::call(jsast::id("BigInt"), vec![read])
+    let lane = |index: u32| {
+        let read = jsast::index(bound.clone(), jsast::num(index));
+        let unsigned = if arr.elem_bool {
+            jsast::cond(read, jsast::num(1), jsast::num(0))
+        } else if arr.elem_bits == 64 {
+            return jsast::call(
+                jsast::member(jsast::id("BigInt"), "asUintN"),
+                vec![jsast::num(64), read],
+            );
+        } else if arr.elem_signed {
+            match arr.elem_bits {
+                8 => jsast::binary(BinOp::BitAnd, read, jsast::num(255)),
+                16 => jsast::binary(BinOp::BitAnd, read, jsast::num(65535)),
+                32 => jsast::u32_wrap(read),
+                _ => unreachable!(),
+            }
         } else {
             read
+        };
+        if big {
+            jsast::call(jsast::id("BigInt"), vec![unsigned])
+        } else {
+            unsigned
         }
     };
     let shift = |amount: u32| {
@@ -632,9 +740,9 @@ fn bytes_to_int(int: Repr, value: Expr) -> Expr {
             jsast::num(amount)
         }
     };
-    let mut combined = byte(0);
-    for index in 1..int.bits / 8 {
-        let shifted = jsast::binary(BinOp::Shl, byte(index), shift(index * 8));
+    let mut combined = lane(0);
+    for index in 1..arr.count {
+        let shifted = jsast::binary(BinOp::Shl, lane(index), shift(index * arr.elem_bits));
         combined = jsast::binary(BinOp::BitOr, combined, shifted);
     }
     let combined = value::mask(int.repr, int.signed, int.bits, combined);
@@ -644,34 +752,53 @@ fn bytes_to_int(int: Repr, value: Expr) -> Expr {
     )
 }
 
-/// The other direction: the `N` bytes of an integer, least significant first.
-fn int_to_bytes(int: Repr, value: Expr) -> Expr {
+/// The other direction: an integer unpacked into `[E; N]`, least significant first.
+fn int_to_array(int: Repr, arr: ScalarArrayInfo, value: Expr) -> Expr {
     let bound = jsast::id(BYTES_PARAM);
     let big = int.repr == IntRepr::BigInt;
-    let bytes = (0..int.bits / 8)
+    let elems = (0..arr.count)
         .map(|index| {
             let shifted = if index == 0 {
                 bound.clone()
             } else if big {
-                jsast::binary(BinOp::Shr, bound.clone(), jsast::bigint(index * 8))
+                jsast::binary(
+                    BinOp::Shr,
+                    bound.clone(),
+                    jsast::bigint(index * arr.elem_bits),
+                )
             } else {
-                jsast::binary(BinOp::UShr, bound.clone(), jsast::num(index * 8))
+                jsast::binary(
+                    BinOp::UShr,
+                    bound.clone(),
+                    jsast::num(index * arr.elem_bits),
+                )
             };
-            let mask = if big {
-                jsast::bigint(255u32)
+            if arr.elem_bits == 64 {
+                return value::mask(IntRepr::BigInt, arr.elem_signed, 64, shifted);
+            }
+            let raw = if big {
+                let masked = jsast::call(
+                    jsast::member(jsast::id("BigInt"), "asUintN"),
+                    vec![jsast::num(arr.elem_bits), shifted],
+                );
+                jsast::call(jsast::id("Number"), vec![masked])
+            } else if arr.elem_bits < 32 {
+                let bit_mask = (1u32 << arr.elem_bits) - 1;
+                jsast::binary(BinOp::BitAnd, shifted, jsast::num(bit_mask))
             } else {
-                jsast::num(255)
+                shifted
             };
-            let byte = jsast::binary(BinOp::BitAnd, shifted, mask);
-            if big {
-                jsast::call(jsast::id("Number"), vec![byte])
+            if arr.elem_bool {
+                jsast::binary(BinOp::StrictNe, raw, jsast::num(0))
+            } else if big && !arr.elem_signed {
+                raw
             } else {
-                byte
+                value::mask(IntRepr::Number, arr.elem_signed, arr.elem_bits, raw)
             }
         })
         .collect();
     jsast::call(
-        jsast::arrow(vec![BYTES_PARAM.to_owned()], jsast::array(bytes)),
+        jsast::arrow(vec![BYTES_PARAM.to_owned()], jsast::array(elems)),
         vec![value],
     )
 }

@@ -1717,6 +1717,8 @@ mod tests {
                     spread: None,
                     caller_location: false,
                     inline_never: false,
+                    inline_hint: false,
+                    inline_always: false,
                 },
                 arguments: Vec::new(),
                 result: TypeId(1),

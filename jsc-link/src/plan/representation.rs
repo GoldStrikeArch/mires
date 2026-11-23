@@ -519,9 +519,10 @@ impl CarrierEconomics {
     }
 
     fn accepts(self, before: ProgramCost, after: ProgramCost) -> bool {
-        if after.emitted_bytes() > before.emitted_bytes()
-            || after.gzip > before.gzip
-            || after.brotli > before.brotli
+        if !matches!(self, Self::Speed)
+            && (after.emitted_bytes() > before.emitted_bytes()
+                || after.gzip > before.gzip
+                || after.brotli > before.brotli)
         {
             return false;
         }
@@ -538,10 +539,14 @@ impl CarrierEconomics {
                     && after.total() < before.total()
             }
             Self::Speed => {
-                after.allocations <= before.allocations
-                    && after.loop_allocations <= before.loop_allocations
-                    && (after.emitted_bytes() < before.emitted_bytes()
-                        || after.loop_allocations < before.loop_allocations)
+                // Under speed-first mode, accept legal native carriers (NativeVec, NativeMap,
+                // HostString, StringBuilder, NativeBox) whenever they do not regress loop
+                // allocations and stay within bounded code growth. Non-loop allocation counts can
+                // rise by 1-2 from one-time runtime helper tables (e.g. `_tv_ctors`), which must
+                // not block TypedArray/NativeVec wins.
+                let bounded = after.emitted_bytes() <= before.emitted_bytes().saturating_mul(3) / 2
+                    || after.emitted_bytes() <= before.emitted_bytes().saturating_add(4_096);
+                bounded && after.loop_allocations <= before.loop_allocations
             }
         }
     }
@@ -4377,12 +4382,17 @@ mod tests {
         let straight_allocation_win = artifact_cost(1_000, 500, 400, 3, 2, 144);
         assert!(CarrierEconomics::Balanced.accepts(before, straight_allocation_win));
         assert!(!CarrierEconomics::Size.accepts(before, straight_allocation_win));
-        assert!(!CarrierEconomics::Speed.accepts(before, straight_allocation_win));
+        assert!(CarrierEconomics::Speed.accepts(before, straight_allocation_win));
 
         let loop_allocation_win = artifact_cost(1_000, 500, 400, 3, 1, 96);
         assert!(CarrierEconomics::Speed.accepts(before, loop_allocation_win));
         assert!(!CarrierEconomics::Speed.accepts(before, artifact_cost(999, 499, 399, 4, 3, 192),));
-        assert!(!CarrierEconomics::Speed.accepts(before, artifact_cost(1_001, 500, 400, 3, 1, 96),));
+        // Speed mode allows bounded code growth for native carriers / allocation wins, while still
+        // rejecting excessive bloat (>50% and >4096 B).
+        assert!(CarrierEconomics::Speed.accepts(before, artifact_cost(1_001, 500, 400, 3, 1, 96),));
+        assert!(
+            !CarrierEconomics::Speed.accepts(before, artifact_cost(6_000, 3_000, 2_500, 3, 1, 96),)
+        );
     }
 
     #[test]

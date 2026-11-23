@@ -1097,6 +1097,8 @@ mod tests {
                 spread: None,
                 caller_location,
                 inline_never: false,
+                inline_hint: false,
+                inline_always: false,
             },
             arguments: args,
             result,

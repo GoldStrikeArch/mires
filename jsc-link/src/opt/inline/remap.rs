@@ -288,6 +288,7 @@ impl Remap<'_> {
                         name,
                         types,
                         fallback,
+                        track_caller,
                         ..
                     } => {
                         *name = self.string(*name)?;
@@ -297,6 +298,10 @@ impl Remap<'_> {
                         if let Some(item) = fallback {
                             self.direct(item)?;
                         }
+                        *track_caller = track_caller.map(|id| self.fact(id)).transpose()?;
+                    }
+                    OpKind::Assert { track_caller, .. } => {
+                        *track_caller = track_caller.map(|id| self.fact(id)).transpose()?;
                     }
                     OpKind::Zombie(_) => return Err("inline.zombie"),
                     OpKind::Host { payload, .. } => self.host(payload)?,
@@ -316,7 +321,6 @@ impl Remap<'_> {
                     | OpKind::SliceView { .. }
                     | OpKind::Deref(_)
                     | OpKind::StoreThrough { .. }
-                    | OpKind::Assert { .. }
                     | OpKind::Materialize(_) => {}
                 }
             }

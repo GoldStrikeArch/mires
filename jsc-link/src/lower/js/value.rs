@@ -922,7 +922,22 @@ fn zero_value_at(table: &TypeTable, interns: &Interns, ty: TypeId, depth: u32) -
         return Some(jsast::undefined());
     }
     if let Some(inner) = descriptor.js.transparent {
-        return zero_value_at(table, interns, inner.ty, depth + 1);
+        if let Some(value) = zero_value_at(table, interns, inner.ty, depth + 1) {
+            return Some(value);
+        }
+        // A transparent union (such as `MaybeUninit<&str>` inside `BTreeMap` `LeafNode::keys`)
+        // is valid for all-zero / uninitialized storage even when its active payload type has no
+        // zero value of its own.
+        if matches!(
+            descriptor.kind,
+            TypeKind::Adt {
+                form: NominalForm::Union,
+                ..
+            }
+        ) {
+            return Some(jsast::undefined());
+        }
+        return None;
     }
     match &descriptor.kind {
         TypeKind::Bool => Some(jsast::boolean(false)),

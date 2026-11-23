@@ -311,6 +311,19 @@ fn read_alloc_inner<'tcx>(cx: AllocReadCx<'_, 'tcx>, offset: Size, ty: Ty<'tcx>)
     // the pointer inside it, and a `MaybeUninit<u8>` as the byte. This arm comes first because it
     // covers unions, which have no shape of their own here at all.
     if let Some((index, field_ty)) = value::transparent_field_indexed(tcx, ty) {
+        if cx.allow_null_wide_ptr && matches!(ty.kind(), ty::Adt(def, _) if def.is_union()) {
+            let probe = ZombieLog::default();
+            let probe_cx = AllocReadCx { log: &probe, ..cx };
+            let decoded = read_alloc_inner(
+                probe_cx,
+                offset + layout.fields.offset(index.as_usize()),
+                field_ty,
+            );
+            if probe.take().is_empty() {
+                return decoded;
+            }
+            return jsast::undefined();
+        }
         return field(index.as_usize(), field_ty);
     }
 

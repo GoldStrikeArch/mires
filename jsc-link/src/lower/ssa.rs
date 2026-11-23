@@ -1828,6 +1828,7 @@ impl<'a> Builder<'a> {
                     types: vec![pointee],
                     fallback: None,
                     args: vec![src, dst, count],
+                    track_caller: None,
                 });
                 Ok(())
             }
@@ -2019,6 +2020,7 @@ impl<'a> Builder<'a> {
                 expected,
                 message,
                 target,
+                track_caller,
                 ..
             } => {
                 let cond = self.operand(condition)?;
@@ -2027,6 +2029,7 @@ impl<'a> Builder<'a> {
                     cond,
                     expected: *expected,
                     msg,
+                    track_caller: *track_caller,
                 });
                 TermShape::Goto(target.0)
             }
@@ -2099,6 +2102,7 @@ impl<'a> Builder<'a> {
                 types: types.clone(),
                 fallback: *fallback,
                 args,
+                track_caller: call.track_caller,
             },
             callee => OpKind::Call {
                 callee: callee.clone(),
@@ -3356,6 +3360,8 @@ mod tests {
                 spread: None,
                 caller_location: false,
                 inline_never: false,
+                inline_hint: false,
+                inline_always: false,
             },
             arguments,
             result,
@@ -3905,6 +3911,7 @@ mod tests {
                 },
                 target: BlockId(1),
                 unwind: Unwind::Continue,
+                track_caller: None,
             },
         );
         let read = block(

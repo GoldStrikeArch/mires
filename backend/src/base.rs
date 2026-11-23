@@ -152,6 +152,9 @@ pub(crate) struct FnCx<'a, 'tcx> {
     pub(crate) names: LocalNames,
     /// The span lowering is currently at. See the module docs.
     span: Cell<Span>,
+    /// The MIR source scope lowering is currently at, used to resolve `#[track_caller]` locations
+    /// across MIR-inlined frames.
+    pub(crate) scope: Cell<rustc_middle::mir::SourceScope>,
     /// The block lowering is currently at, for the lowerings that need to know whether the code
     /// they emit runs more than once. See [`FnCx::in_cycle`].
     block: Cell<BasicBlock>,
@@ -198,6 +201,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 crate::js_extern::global_names(cgu.tcx, instance, mir),
             ),
             span: Cell::new(mir.span),
+            scope: Cell::new(rustc_middle::mir::OUTERMOST_SOURCE_SCOPE),
             block: Cell::new(START_BLOCK),
             cyclic: cyclic_blocks(mir),
             temps: RefCell::new(Vec::new()),
@@ -675,6 +679,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
 
     fn codegen_statement(&self, statement: &Statement<'tcx>) -> Vec<Stmt> {
         self.span.set(statement.source_info.span);
+        self.scope.set(statement.source_info.scope);
         match &statement.kind {
             StatementKind::Assign(assignment) => {
                 // An argument on its way to a marker that reads it at codegen time. Emitting it
@@ -738,6 +743,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     /// branches on is lowered by [`FnCx::terminator_term`], as part of the edge it belongs to.
     fn terminator_stmts(&self, terminator: &Terminator<'tcx>) -> Vec<Stmt> {
         self.span.set(terminator.source_info.span);
+        self.scope.set(terminator.source_info.scope);
         match &terminator.kind {
             TerminatorKind::Goto { .. }
             | TerminatorKind::SwitchInt { .. }
@@ -793,6 +799,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         blocks: &Blocks,
     ) -> Term<Scrutinee<'tcx>> {
         self.span.set(terminator.source_info.span);
+        self.scope.set(terminator.source_info.scope);
         let goto = |target: BasicBlock| match blocks.id(target) {
             Some(id) => Term::Goto(id),
             None => Term::Throw,

@@ -3676,6 +3676,8 @@ mod corpus {
                 spread: None,
                 caller_location: false,
                 inline_never: false,
+                inline_hint: false,
+                inline_always: false,
             },
         };
         let item = |local_hash| ItemId {
@@ -3829,6 +3831,7 @@ mod corpus {
                             cond: callee.params[1],
                             expected: false,
                             msg: RAssertMessage::NullPointer,
+                            track_caller: None,
                         },
                     });
                 } else if exit == "unsupported" {

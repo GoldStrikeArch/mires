@@ -1884,6 +1884,7 @@ mod tests {
                         spread: None,
                         caller_location: false,
                         inline_never: false,
+                        ..AbiSignature::default()
                     },
                 },
                 locals: vec![

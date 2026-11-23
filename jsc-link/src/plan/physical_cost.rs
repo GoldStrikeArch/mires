@@ -19,8 +19,9 @@ use crate::opts::{Opts, Profile};
 use crate::plan::abi_flat::AbiPlan;
 
 const COMPRESSED_GROWTH_BPS: u64 = 50;
-const SPEED_GROWTH_BPS: u64 = 500;
+const SPEED_GROWTH_BPS: u64 = 5_000;
 const HOT_ALLOC_SMALL_PROGRAM_SLACK_BYTES: u64 = 256;
+const SPEED_SMALL_PROGRAM_SLACK_BYTES: u64 = 4_096;
 
 /// Exact metrics of one fully lowered, deduplicated, renamed program and its helper closure.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -480,8 +481,9 @@ fn decide(
         }
         Profile::ReleaseSpeed => {
             let hot = after.loop_allocations < before.loop_allocations;
+            let alloc_win = after.allocations < before.allocations;
             let bounded = speed_within_budget(before, after);
-            let reason = if !hot {
+            let reason = if !hot && !alloc_win {
                 Some("cost.hotness-evidence-missing".to_owned())
             } else if !bounded {
                 Some("cost.speed-growth-budget".to_owned())
@@ -491,7 +493,8 @@ fn decide(
             (
                 reason.is_none(),
                 reason,
-                hot.then_some("final-js-loop-allocation"),
+                hot.then_some("final-js-loop-allocation")
+                    .or_else(|| alloc_win.then_some("final-js-allocation")),
                 budget,
             )
         }
@@ -529,17 +532,17 @@ fn speed_within_budget(before: ProgramMetrics, after: ProgramMetrics) -> bool {
         after.min,
         before.min,
         SPEED_GROWTH_BPS,
-        HOT_ALLOC_SMALL_PROGRAM_SLACK_BYTES,
+        SPEED_SMALL_PROGRAM_SLACK_BYTES,
     ) && within_growth_or_bytes(
         after.gzip,
         before.gzip,
         SPEED_GROWTH_BPS,
-        HOT_ALLOC_SMALL_PROGRAM_SLACK_BYTES,
+        SPEED_SMALL_PROGRAM_SLACK_BYTES,
     ) && within_growth_or_bytes(
         after.brotli,
         before.brotli,
         SPEED_GROWTH_BPS,
-        HOT_ALLOC_SMALL_PROGRAM_SLACK_BYTES,
+        SPEED_SMALL_PROGRAM_SLACK_BYTES,
     )
 }
 

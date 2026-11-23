@@ -341,17 +341,28 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             None => None,
         };
         let caller_location = self.instance().def.requires_caller_location(self.tcx());
-        let inline_never = matches!(
-            self.instance().def,
-            ty::InstanceKind::Item(def_id)
-                if (matches!(
+        let (inline_never, inline_hint, inline_always) = match self.instance().def {
+            ty::InstanceKind::Item(def_id) => {
+                let is_panic = self.tcx().lang_items().panic_impl() == Some(def_id);
+                let is_fn = matches!(
                     self.tcx().def_kind(def_id),
                     rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
-                ) && matches!(
-                    self.tcx().codegen_fn_attrs(def_id).inline,
-                    rustc_hir::attrs::InlineAttr::Never
-                )) || self.tcx().lang_items().panic_impl() == Some(def_id)
-        );
+                );
+                let attr = is_fn.then(|| self.tcx().codegen_fn_attrs(def_id).inline);
+                let never = is_panic || matches!(attr, Some(rustc_hir::attrs::InlineAttr::Never));
+                let hint = !never && matches!(attr, Some(rustc_hir::attrs::InlineAttr::Hint));
+                let always = !never
+                    && matches!(
+                        attr,
+                        Some(
+                            rustc_hir::attrs::InlineAttr::Always
+                                | rustc_hir::attrs::InlineAttr::Force { .. }
+                        )
+                    );
+                (never, hint, always)
+            }
+            _ => (false, false, false),
+        };
         let parameters = mir
             .arg_count
             .checked_sub(usize::from(spread.is_some()))
@@ -364,6 +375,8 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
             spread,
             caller_location,
             inline_never,
+            inline_hint,
+            inline_always,
         })
     }
 
@@ -410,12 +423,12 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         let terminator = data.terminator();
         let origin = self.origin(OriginKind::Terminator, terminator.source_info, None);
         self.terminator_origins.push(origin);
-        let terminator =
-            self.terminator(&terminator.kind)
-                .map_err(|reason| EncodeDecline::AtTerminator {
-                    block: id.0,
-                    reason: Box::new(reason),
-                })?;
+        let terminator = self
+            .terminator(terminator.source_info, &terminator.kind)
+            .map_err(|reason| EncodeDecline::AtTerminator {
+                block: id.0,
+                reason: Box::new(reason),
+            })?;
         Ok(BasicBlock {
             id,
             cleanup: data.is_cleanup,
@@ -558,6 +571,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
 
     fn terminator(
         &mut self,
+        source_info: mir::SourceInfo,
         terminator: &mir::TerminatorKind<'tcx>,
     ) -> Result<Terminator, EncodeDecline> {
         Ok(match terminator {
@@ -581,7 +595,18 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 fn_span,
                 ..
             } => {
-                Terminator::Call(self.call(func, args, *destination, *target, *unwind, *fn_span)?)
+                let call_source_info = mir::SourceInfo {
+                    span: *fn_span,
+                    scope: source_info.scope,
+                };
+                Terminator::Call(self.call(
+                    func,
+                    args,
+                    *destination,
+                    *target,
+                    *unwind,
+                    call_source_info,
+                )?)
             }
             mir::TerminatorKind::Drop {
                 place,
@@ -608,12 +633,21 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 // The Location type is otherwise absent from a producer rlib whose only bounds
                 // checks live in that producer, so preserve its descriptor with the assertion.
                 self.describe_caller_location_type()?;
+                let track_caller = crate::intrinsics::resolve_caller_location_span(
+                    self.tcx(),
+                    self.mir(),
+                    self.instance(),
+                    source_info,
+                )
+                .map(|span| self.caller_location_fact(span))
+                .transpose()?;
                 Terminator::Assert {
                     condition: self.operand(cond)?,
                     expected: *expected,
                     message: self.assert_message(msg)?,
                     target: block_id(*target),
                     unwind: unwind_action(*unwind),
+                    track_caller,
                 }
             }
             mir::TerminatorKind::UnwindResume => Terminator::UnwindResume,
@@ -697,19 +731,28 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
         destination: mir::Place<'tcx>,
         target: Option<mir::BasicBlock>,
         unwind: mir::UnwindAction,
-        fn_span: Span,
+        source_info: mir::SourceInfo,
     ) -> Result<Call, EncodeDecline> {
         let tcx = self.tcx();
         let function_ty = self.monomorphize(func.ty(&self.mir().local_decls, tcx));
         let function = self.operand(func)?;
         let (callee, tracks_caller) = self.callee(function_ty)?;
         let semantic = self.call_semantic(function_ty);
-        let host = self.host_payload(function_ty, args, fn_span)?;
+        let host = self.host_payload(function_ty, args, source_info.span)?;
         let arguments = self.call_arguments(function_ty, args)?;
-        // A `#[track_caller]` body forwards its own location parameter; anything else spells the
-        // call site (`intrinsics::caller_location_argument`).
-        let track_caller = if tracks_caller && !self.instance().def.requires_caller_location(tcx) {
-            Some(self.caller_location_fact(fn_span)?)
+        // Resolve the caller location across any MIR-inlined `#[track_caller]` frames:
+        // `None` forwards the outermost body's `$loc` parameter; `Some(span)` materializes that
+        // concrete call site (including when a non-`#[track_caller]` helper was MIR-inlined into
+        // a `#[track_caller]` body).
+        let track_caller = if tracks_caller {
+            crate::intrinsics::resolve_caller_location_span(
+                tcx,
+                self.mir(),
+                self.instance(),
+                source_info,
+            )
+            .map(|span| self.caller_location_fact(span))
+            .transpose()?
         } else {
             None
         };
@@ -893,7 +936,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 ));
             }
         };
-        let tracks_caller = instance.def.requires_caller_location(tcx);
+        let mut tracks_caller = instance.def.requires_caller_location(tcx);
         let callee = match instance.def {
             ty::InstanceKind::Intrinsic(def_id) => {
                 let must_override = tcx
@@ -917,6 +960,7 @@ impl<'a, 'tcx> Encoder<'a, 'tcx> {
                 let name = tcx.item_name(def_id);
                 if name.as_str() == "caller_location" {
                     self.describe_caller_location_type()?;
+                    tracks_caller = true;
                 }
                 // `type_name`'s *value* is a type's printed path, which no other lowering reads;
                 // the descriptor carries one only where a body asks for it.

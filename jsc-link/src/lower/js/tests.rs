@@ -445,6 +445,8 @@ fn signature(arguments: Vec<TypeId>, result: TypeId) -> Signature {
             spread: None,
             caller_location: false,
             inline_never: false,
+            inline_hint: false,
+            inline_always: false,
         },
         arguments,
         result,
@@ -2516,6 +2518,7 @@ fn cells_slots_and_direct_calls_match_the_14_pointers_entry() {
                 length: four,
                 index: i,
             },
+            track_caller: None,
         },
         NO_ORIGIN,
     );
@@ -3469,6 +3472,7 @@ fn asserts_call_the_panic_lang_item_with_a_location() {
                 length: four,
                 index: i,
             },
+            track_caller: None,
         },
         origin,
     );
@@ -4430,6 +4434,7 @@ fn branching_intrinsics_capture_effectful_arguments_before_emission() {
                 types: Vec::new(),
                 fallback: None,
                 args: arguments.to_vec(),
+                track_caller: None,
             },
             F32,
             NO_ORIGIN,
@@ -4872,6 +4877,7 @@ fn an_intrinsic_with_a_prelude_emits_its_statements_before_the_binding() {
             types: vec![U8],
             fallback: None,
             args: vec![x, y],
+            track_caller: None,
         },
         U8,
         NO_ORIGIN,
@@ -4905,6 +4911,7 @@ fn the_mul_with_overflow_intrinsic_wraps_a_32_bit_product_through_imul() {
             types: vec![U32],
             fallback: None,
             args: vec![x, y],
+            track_caller: None,
         },
         OVERFLOW,
         NO_ORIGIN,
@@ -4941,6 +4948,7 @@ fn an_unknown_intrinsic_falls_back_to_the_body_the_collector_emitted() {
                 link_name: link,
             }),
             args: vec![x],
+            track_caller: None,
         },
         I32,
         NO_ORIGIN,
@@ -5817,6 +5825,7 @@ fn i64_pair_fast_ops_mul_rotate_and_div_u32_fast_path() {
             types: vec![u64_ty],
             fallback: None,
             args: vec![m8, c31],
+            track_caller: None,
         },
         u64_ty,
         NO_ORIGIN,
@@ -5828,6 +5837,7 @@ fn i64_pair_fast_ops_mul_rotate_and_div_u32_fast_path() {
             types: vec![u64_ty],
             fallback: None,
             args: vec![rl, c33],
+            track_caller: None,
         },
         u64_ty,
         NO_ORIGIN,
@@ -6855,6 +6865,7 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
             types: Vec::new(),
             fallback: None,
             args: Vec::new(),
+            track_caller: None,
         },
         REF_LOCATION,
         OriginId(0),
@@ -10257,6 +10268,52 @@ fn array_ref_and_local_subslice_build_aliasing_window_slots() {
             "__rt.read_array(($t0 = __rt.unwindow(a), { buf: $t0.buf, off: $t0.off + 1, w: 2 }), 2).slice()"
         ),
         "{js5}"
+    );
+}
+
+#[test]
+fn zero_value_handles_transparent_union_over_reference() {
+    let mut interns = world();
+    let maybe_uninit_ty = TypeId(990);
+    let val_name = StrId(interns.strings.len() as u32);
+    interns.strings.push("value".to_owned());
+    let variant_name = StrId(interns.strings.len() as u32);
+    interns.strings.push("MaybeUninit".to_owned());
+
+    let mut desc = descriptor(
+        maybe_uninit_ty,
+        TypeKind::Adt {
+            def: DefinitionId {
+                crate_id: 0,
+                local_hash: 990,
+            },
+            form: NominalForm::Union,
+            args: vec![STR_REF],
+            variants: vec![variant(
+                variant_name,
+                vec![field(FieldKey::Name(val_name), STR_REF)],
+                0,
+                None,
+            )],
+            niche: None,
+        },
+        8,
+    );
+    desc.js.peeled = STR_REF;
+    desc.js.transparent = Some(rcgjs_object::jir::types::TransparentField {
+        field: 0,
+        ty: STR_REF,
+    });
+    interns.types.insert(desc);
+
+    assert!(
+        super::value::zero_value(&interns.types, &interns, STR_REF).is_none(),
+        "bare `&str` must not have a zero value"
+    );
+    assert_eq!(
+        super::value::zero_value(&interns.types, &interns, maybe_uninit_ty),
+        Some(jsast::undefined()),
+        "transparent union `MaybeUninit<&str>` must decode to `undefined`"
     );
 }
 

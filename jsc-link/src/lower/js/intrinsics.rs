@@ -26,6 +26,7 @@ use std::cell::RefCell;
 use rcgjs_object::evaluation::OperandEvaluation;
 use rcgjs_object::jir::decline::OpClass;
 use rcgjs_object::jir::interns::StrId;
+use rcgjs_object::jir::origin::SourceFactId;
 use rcgjs_object::jir::repr::{Op, OpKind, ValueId};
 use rcgjs_object::jir::semantic::{BinaryOp, ConstTree, DirectItemRef};
 use rcgjs_object::jir::types::{IntRepr, NominalForm, TypeId, TypeKind};
@@ -64,6 +65,7 @@ pub fn lower(
     types: &[TypeId],
     fallback: Option<DirectItemRef>,
     args: &[ValueId],
+    track_caller: Option<SourceFactId>,
 ) -> Res<Lowered> {
     let Some(name) = cx.interns.str(name) else {
         return Err(decline(
@@ -77,6 +79,7 @@ pub fn lower(
         types,
         args,
         result_ty,
+        track_caller,
         captured: None,
         prelude: RefCell::new(Vec::new()),
     };
@@ -139,6 +142,7 @@ struct Intrinsic<'a, 'b> {
     types: &'a [TypeId],
     args: &'a [ValueId],
     result_ty: Option<TypeId>,
+    track_caller: Option<SourceFactId>,
     captured: Option<Vec<Expr>>,
     prelude: RefCell<Vec<Stmt>>,
 }
@@ -528,9 +532,19 @@ impl Intrinsic<'_, '_> {
         Ok(Outcome::Value(jsast::call(jsast::id(name), arguments)))
     }
 
-    /// The caller's `Location`: this body's own `$loc` inside a `#[track_caller]` function, the
-    /// location of this very call anywhere else.
+    /// The caller's `Location`: a concrete MIR-resolved call site when `track_caller` is `Some`,
+    /// this body's own `$loc` inside a `#[track_caller]` function otherwise, or the call's own
+    /// origin source fact as fallback.
     fn caller_location(&self) -> Res<Expr> {
+        if let Some(fact_id) = self.track_caller {
+            let Some(fact) = self.cx.interns.source_fact(fact_id) else {
+                return Err(decline(
+                    OpClass::Intrinsic,
+                    "`caller_location` carries a source fact missing from interns",
+                ));
+            };
+            return self.cx.caller_location_value(fact);
+        }
         if self.cx.func.sig.abi.caller_location {
             return Ok(jsast::id(super::CALLER_LOCATION_PARAM));
         }

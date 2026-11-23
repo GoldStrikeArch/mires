@@ -2029,6 +2029,7 @@ fn match_scalarized_enumerate_counter(
                     left,
                     right,
                 },
+            ..
         } = &op.kind
         {
             if is_scalar(func, defs, single_edge, *right, 1)
@@ -2520,6 +2521,7 @@ fn borrowed_count_prefix(
                 left,
                 right,
             },
+            ..
         } if *cond == checked && *left == assert_left && *right == assert_one)
         || ops[11].result.is_some()
     {
@@ -2579,6 +2581,7 @@ fn count_update(func: &Func, ops: &[Op], outer: ValueId, usize_ty: TypeId) -> Op
                 left,
                 right,
             },
+            ..
         } if *cond == checked && *left == assert_left && *right == assert_one)
         || ops[8].result.is_some()
     {
@@ -4484,6 +4487,7 @@ mod tests {
                     left: assert_left,
                     right: assert_one,
                 },
+                track_caller: None,
             },
             O,
         );
@@ -5086,6 +5090,7 @@ mod tests {
                         left: idx_p,
                         right: idx_one,
                     },
+                    track_caller: None,
                 },
                 O,
             );
@@ -5552,6 +5557,7 @@ mod tests {
                     required: ptr_param,
                     found: end,
                 },
+                track_caller: None,
             },
             O,
         );
@@ -7403,6 +7409,7 @@ mod tests {
                     left: assert_left,
                     right: assert_one,
                 },
+                track_caller: None,
             },
             O,
         );

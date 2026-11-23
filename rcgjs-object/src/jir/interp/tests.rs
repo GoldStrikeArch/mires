@@ -266,6 +266,7 @@ fn signature(arguments: Vec<TypeId>, result: TypeId) -> Signature {
             spread: None,
             caller_location: false,
             inline_never: false,
+            ..AbiSignature::default()
         },
         arguments,
         result,
@@ -410,6 +411,7 @@ fn arith_body() -> Body {
             },
             target: BlockId(1),
             unwind: Unwind::Continue,
+            track_caller: None,
         },
     );
     let rest = block(
@@ -796,6 +798,7 @@ fn slice_body() -> Body {
             },
             target: BlockId(1),
             unwind: Unwind::Continue,
+            track_caller: None,
         },
     );
     let read = block(
@@ -1218,6 +1221,7 @@ fn arith_func() -> Func {
                 left: a,
                 right: bb,
             },
+            track_caller: None,
         },
         ORIGIN,
     );
@@ -1551,6 +1555,7 @@ fn repr_slice_view_and_moves() {
                 length: len,
                 index: i,
             },
+            track_caller: None,
         },
         ORIGIN,
     );
