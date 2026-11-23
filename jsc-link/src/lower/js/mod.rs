@@ -151,6 +151,10 @@ pub struct JsCx<'a> {
     /// Overflow pairs that are never built, and how each is spelled
     /// (`rvalue::carried_overflow_pairs`).
     carried_pairs: BTreeMap<ValueId, rvalue::CarriedPair>,
+    /// Unsigned 32-bit (`u32`/`usize`) SSA values whose uses all depend only on their low 32 bits
+    /// (bitwise, shifts, 32-bit wrapping arithmetic, narrow casts), so they may stay in signed
+    /// `Int32` without a trailing `>>> 0`.
+    int32_only: std::collections::BTreeSet<ValueId>,
 }
 
 impl<'a> JsCx<'a> {
@@ -171,6 +175,8 @@ impl<'a> JsCx<'a> {
                 }
             }
         }
+        let carried_pairs = rvalue::carried_overflow_pairs(func, table);
+        let int32_only = rvalue::int32_only_values(func, table, interns, &carried_pairs);
         let inlined_string_vec = std::cell::OnceCell::new();
         JsCx {
             func,
@@ -207,8 +213,14 @@ impl<'a> JsCx<'a> {
             pending_return: RefCell::new(None),
             pending_return_pair: RefCell::new(None),
             defs,
-            carried_pairs: rvalue::carried_overflow_pairs(func, table),
+            carried_pairs,
+            int32_only,
         }
+    }
+
+    /// Whether `value` is a 32-bit unsigned SSA value whose consumers all accept signed `Int32`.
+    pub(super) fn is_int32_only(&self, value: ValueId) -> bool {
+        self.int32_only.contains(&value)
     }
 
     /// The same context, resolving closure bodies through the program's item index.

@@ -2300,11 +2300,20 @@ impl<'a> JsCx<'a> {
                     result_ty,
                     self.expr_of(*l)?,
                     self.expr_of(*r)?,
+                    self.is_int32_only(result),
                 )
             }
             // `js-str=bytes`: closed byte-string views are handled by `byte_view_op_expr` above.
-            OpKind::Unary { op: un, v, ty } => self.unary(*un, *ty, self.expr_of(*v)?),
-            OpKind::Cast { kind, v, from, to } => self.cast(*kind, *from, *to, self.expr_of(*v)?),
+            OpKind::Unary { op: un, v, ty } => {
+                self.unary(*un, *ty, self.expr_of(*v)?, self.is_int32_only(result))
+            }
+            OpKind::Cast { kind, v, from, to } => self.cast_with_int32_only(
+                *kind,
+                *from,
+                *to,
+                self.expr_of(*v)?,
+                self.is_int32_only(result),
+            ),
             OpKind::Call { .. } | OpKind::Intrinsic { .. } | OpKind::Host { .. } => {
                 self.call_expr(op)
             }

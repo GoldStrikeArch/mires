@@ -100,6 +100,10 @@ globalThis.__rt.f2i_big = (x, bits, signed) => {
 // the old keys go first. An array (a tuple, an array, a closure environment)
 // truncates instead, since `delete` cannot remove its `length`.
 globalThis.__rt.overwrite = (target, value) => {
+  if (ArrayBuffer.isView(target)) {
+    target.set(value);
+    return target;
+  }
   if (Array.isArray(target)) {
     if (globalThis.__rt._element_view_of !== null) {
       const ev = globalThis.__rt._element_view_of.get(target);
@@ -1221,7 +1225,7 @@ globalThis.__rt.array_ref = (p, n, es) => {
   }
   if (p.w === undefined) {
     const held = p.buf === undefined ? undefined : p.buf[p.off];
-    if (held === undefined || (Array.isArray(held) && held.length === n)) {
+    if (held === undefined || ((Array.isArray(held) || ArrayBuffer.isView(held)) && held.length === n)) {
       if (es !== undefined && globalThis.__rt._element_view_of !== null && held !== null && typeof held === "object") {
         const ev = globalThis.__rt._element_view_of.get(held);
         if (ev !== undefined && ev.es === undefined) ev.es = es;
@@ -1252,7 +1256,7 @@ globalThis.__rt._element_view = (buf, off, n, es) => {
   }
   // The buffer already is that array, which is the common case: a window over the
   // whole of what it was cast from.
-  if (off === 0 && buf.length === n && Array.isArray(buf)) return buf;
+  if (off === 0 && buf.length === n && (Array.isArray(buf) || ArrayBuffer.isView(buf))) return buf;
 
   let views = globalThis.__rt._views.get(buf);
   if (views === undefined) {
@@ -1350,7 +1354,7 @@ globalThis.__rt.chunk_slice = (p, len, width) => {
   if (p === null || typeof p !== "object" || p.buf === undefined) {
     throw __rt.abort_error(new Error("rustc_codegen_js: `as_chunks` through a pointer that names no buffer"));
   }
-  if (p.w === undefined && (len === 0 || Array.isArray(p.buf[p.off]))) {
+  if (p.w === undefined && (len === 0 || Array.isArray(p.buf[p.off]) || ArrayBuffer.isView(p.buf[p.off]))) {
     return { buf: p.buf, off: p.off, len };
   }
   throw __rt.abort_error(new Error(
@@ -2638,7 +2642,7 @@ globalThis.__rt.unwindow = (p) => {
   // A bare array is the *reference* form of `&[E; N]` being reinterpreted as a thin
   // pointer (`Arguments::new`'s `&[u8; N] -> NonNull<u8>` transmute): the pointer to
   // its first element is the array itself with index zero.
-  if (Array.isArray(p)) {
+  if (Array.isArray(p) || ArrayBuffer.isView(p)) {
     if (globalThis.__rt._element_view_of !== null) {
       const ev = globalThis.__rt._element_view_of.get(p);
       if (ev !== undefined) return { buf: ev.buf, off: ev.off };

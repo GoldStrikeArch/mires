@@ -157,7 +157,7 @@ pub fn evaluate_groups(
         let plan = candidate.subset(&items);
         let after = measure_cached(&mut cache, program, &plan, &mut measure);
         let (accepted, reason, hotness_source, budget_consumed_bps) =
-            decide(profile, before, after);
+            decide_for_plan(profile, &plan, before, after);
         trials.push(Trial {
             items,
             after,
@@ -190,7 +190,7 @@ pub fn evaluate_groups(
         .then(|| measure_cached(&mut cache, program, &combined, &mut measure));
     let combined_accepted = combined_metrics
         .flatten()
-        .is_some_and(|after| decide(profile, before, Some(after)).0);
+        .is_some_and(|after| decide_for_plan(profile, &combined, before, Some(after)).0);
 
     if combined_accepted {
         selected = individually_selected;
@@ -217,9 +217,10 @@ pub fn evaluate_groups(
                 let mut proposed = selected.clone();
                 proposed.extend(&trial.items);
                 let proposed_plan = candidate.subset(&proposed);
+                let step_plan = candidate.subset(&trial.items);
                 let next = measure_cached(&mut cache, program, &proposed_plan, &mut measure);
                 let (accepted, reason, hotness_source, budget_consumed_bps) =
-                    decide_incremental(profile, before, current, next);
+                    decide_incremental(profile, &step_plan, before, current, next);
                 (accepted, reason, hotness_source, budget_consumed_bps, next)
             } else {
                 (
@@ -256,7 +257,8 @@ pub fn evaluate_groups(
     debug_assert_eq!(replay, current);
     current = replay;
     let selected_plan = candidate.with_economic_selection(&selected, &reasons);
-    let (all_accepted, all_reason, all_hotness, all_budget) = decide(profile, before, full_after);
+    let (all_accepted, all_reason, all_hotness, all_budget) =
+        decide_for_plan(profile, candidate, before, full_after);
     let final_metrics = if applied { current } else { before };
     (
         selected_plan,
@@ -346,13 +348,45 @@ fn policy_benefit(
     }
 }
 
+fn decide_for_plan(
+    profile: Profile,
+    plan: &AbiPlan,
+    before: Option<ProgramMetrics>,
+    after: Option<ProgramMetrics>,
+) -> (bool, Option<String>, Option<&'static str>, u64) {
+    let (mut accepted, mut reason, mut hotness_source, budget_consumed_bps) =
+        decide(profile, before, after);
+    // Under ReleaseSpeed, scalarizing a slice parameter (`{buf, off, len}` -> `(buf, off, len)`)
+    // removes property loads (`s.buf[s.off + i]`) inside tight loops even when the caller did
+    // not allocate a fresh slice wrapper on every call. Accept it whenever it does not regress
+    // allocations and stays within the speed size budget.
+    if !accepted
+        && profile == Profile::ReleaseSpeed
+        && plan.has_slice_param()
+        && reason.as_deref() == Some("cost.hotness-evidence-missing")
+    {
+        if let (Some(b), Some(a)) = (before, after) {
+            if a.loop_allocations <= b.loop_allocations
+                && a.allocations <= b.allocations
+                && speed_within_budget(b, a)
+            {
+                accepted = true;
+                reason = None;
+                hotness_source = Some("slice-param-scalarization");
+            }
+        }
+    }
+    (accepted, reason, hotness_source, budget_consumed_bps)
+}
+
 fn decide_incremental(
     profile: Profile,
+    step_plan: &AbiPlan,
     baseline: Option<ProgramMetrics>,
     current: Option<ProgramMetrics>,
     after: Option<ProgramMetrics>,
 ) -> (bool, Option<String>, Option<&'static str>, u64) {
-    let decision = decide(profile, current, after);
+    let decision = decide_for_plan(profile, step_plan, current, after);
     if !decision.0 {
         return decision;
     }

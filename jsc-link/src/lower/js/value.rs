@@ -22,16 +22,98 @@ pub const TAG: &str = "TAG";
 /// (`value.rs:592`).
 const MAX_CLONED_VARIANTS: usize = 8;
 
+/// Strips redundant `>>> 0` and `| 0` wrappers from an integer `Number` expression that is about
+/// to be consumed by a JavaScript 32-bit bitwise operator (`&`, `|`, `^`, `~`, `<<`, `>>`, `>>>`,
+/// `Math.imul`). Under ECMAScript `ToInt32` / `ToUint32`, `ToInt32(x >>> 0) === ToInt32(x)` and
+/// `ToInt32(x | 0) === ToInt32(x)` for every JavaScript number `x`.
+pub fn strip_32bit_wrap(expr: Expr) -> Expr {
+    let mut cur = expr;
+    loop {
+        cur = match cur {
+            Expr::Binary(BinOp::UShr | BinOp::BitOr, lhs, rhs) if is_zero_num(&rhs) => *lhs,
+            other => return other,
+        };
+    }
+}
+
+fn is_zero_num(expr: &Expr) -> bool {
+    matches!(expr, Expr::Num(n) if *n == 0.0) || matches!(expr, Expr::RawNum(s) if s == "0")
+}
+
+fn const_nonneg_i31(expr: &Expr) -> Option<u32> {
+    match expr {
+        Expr::Num(n) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 2147483647.0 => {
+            Some(*n as u32)
+        }
+        Expr::RawNum(s) => s.parse::<u32>().ok().filter(|&v| v <= 0x7fff_ffff),
+        _ => None,
+    }
+}
+
+/// Simplifies `value >>> 0` when `value` is already provably an unsigned 32-bit integer `[0, 2^32 - 1]`.
+pub fn simplify_u32_wrap(value: Expr) -> Expr {
+    match &value {
+        // `a >>> b` always returns an unsigned 32-bit integer in ECMAScript.
+        Expr::Binary(BinOp::UShr, _, _) => value,
+        // `a & c` with `0 <= c <= 0x7fffffff` has bit 31 cleared, so signed == unsigned.
+        Expr::Binary(BinOp::BitAnd, l, r)
+            if const_nonneg_i31(l).is_some() || const_nonneg_i31(r).is_some() =>
+        {
+            value
+        }
+        Expr::Num(n) if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 4294967295.0 => {
+            if *n == 0.0 {
+                jsast::num(0.0)
+            } else {
+                value
+            }
+        }
+        _ => jsast::u32_wrap(strip_32bit_wrap(value)),
+    }
+}
+
+/// Simplifies `value | 0` when `value` is already provably a signed 32-bit integer `[-2^31, 2^31 - 1]`.
+pub fn simplify_i32_wrap(value: Expr) -> Expr {
+    match &value {
+        Expr::Binary(
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr,
+            _,
+            _,
+        )
+        | Expr::Unary(UnOp::BitNot, _) => value,
+        Expr::Call(callee, _)
+            if matches!(
+                callee.as_ref(),
+                Expr::Member(obj, prop)
+                    if matches!(obj.as_ref(), Expr::Ident(id) if id == "Math")
+                        && matches!(prop.as_str(), "imul" | "clz32")
+            ) =>
+        {
+            value
+        }
+        Expr::Num(n)
+            if n.is_finite() && n.fract() == 0.0 && *n >= -2147483648.0 && *n <= 2147483647.0 =>
+        {
+            if *n == 0.0 {
+                jsast::num(0.0)
+            } else {
+                value
+            }
+        }
+        _ => jsast::i32_wrap(strip_32bit_wrap(value)),
+    }
+}
+
 /// Truncates `value` to an integer of the given width and signedness (`value.rs:902-916`).
 pub fn mask(repr: IntRepr, signed: bool, bits: u32, value: Expr) -> Expr {
     match repr {
         IntRepr::BigInt => jsast::bigint_mask(signed, bits, value),
         IntRepr::Number => match (signed, bits) {
             (_, 33..) => value,
-            (true, 32) => jsast::i32_wrap(value),
-            (true, _) => jsast::sign_extend(bits, value),
-            (false, 32) => jsast::u32_wrap(value),
-            (false, _) => jsast::zero_extend(bits, value),
+            (true, 32) => simplify_i32_wrap(value),
+            (true, _) => jsast::sign_extend(bits, strip_32bit_wrap(value)),
+            (false, 32) => simplify_u32_wrap(value),
+            (false, _) => jsast::zero_extend(bits, strip_32bit_wrap(value)),
         },
     }
 }

@@ -431,6 +431,20 @@ pub(crate) fn run_with_profile(
                 && iterator_step
                 && callee_bytes <= 560
                 && after <= bytes.saturating_add(360);
+            // Under speed-first mode, never let earlier cold callees starve tiny leaf helpers
+            // called inside loops (e.g., `Word::add` inside SHA-512's 80-round compression loop).
+            // Restrict to call-free leaves `<= 192` B and still charge `growth` so non-loop
+            // callers (like top-level dispatchers) cannot consume freed budget and bloat.
+            let callee_is_leaf = callee_func.blocks.iter().all(|b| {
+                b.ops
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::Call { .. }))
+                    && !matches!(b.term, RTerm::Invoke { .. })
+            });
+            let speed_hot_loop = speed
+                && looping.contains(&(site.block as u32))
+                && callee_is_leaf
+                && callee_bytes <= 192;
             let size_limit = if is_sole && net <= 0 {
                 limit.max(16_384)
             } else {
@@ -438,7 +452,9 @@ pub(crate) fn run_with_profile(
             };
             if after > size_limit
                 || after > bytes.saturating_add(callee_bytes)
-                || (!bounded_loop_virtualization && growth + charge > budget as i64)
+                || (!bounded_loop_virtualization
+                    && !speed_hot_loop
+                    && growth + charge > budget as i64)
                 || (!growth_allowed && net > 0)
             {
                 // `cost.budget`: the whole site is reverted, never a partial inline.
@@ -460,7 +476,9 @@ pub(crate) fn run_with_profile(
                 stats.decline("inline.witness-invalid");
                 continue;
             }
-            growth += charge;
+            if !bounded_loop_virtualization {
+                growth += charge;
+            }
             bytes = after;
             applied_here += 1;
             stats.cross_object_applied +=

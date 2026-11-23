@@ -1592,12 +1592,93 @@ pub fn needed_helper_items(
                        {HELPER_HI} = 0;\n    \
                        return rem ? (u % v) | 0 : ((u / v) >>> 0) | 0;\n  \
                      }}\n  \
-                     const s32 = BigInt(\"32\");\n  \
-                     const a = (BigInt(signed ? ah : (ah >>> 0)) << s32) | BigInt(al >>> 0);\n  \
-                     const b = (BigInt(signed ? bh : (bh >>> 0)) << s32) | BigInt(bl >>> 0);\n  \
-                     const q = rem ? a % b : (signed ? BigInt.asIntN(64, a / b) : a / b);\n  \
-                     {HELPER_HI} = Number(BigInt.asIntN(32, q >> s32)) | 0;\n  \
-                     return Number(BigInt.asIntN(32, q)) | 0;\n\
+                     let negA = false, negB = false;\n  \
+                     if (signed) {{\n    \
+                       if (ah < 0) {{ negA = true; al = (-al) | 0; ah = (~ah + (al === 0 ? 1 : 0)) | 0; }}\n    \
+                       if (bh < 0) {{ negB = true; bl = (-bl) | 0; bh = (~bh + (bl === 0 ? 1 : 0)) | 0; }}\n  \
+                     }}\n  \
+                     const ual = al >>> 0, uah = ah >>> 0, ubl = bl >>> 0, ubh = bh >>> 0;\n  \
+                     let ql = 0, qh = 0, rl = 0, rh = 0;\n  \
+                     if (ubh === 0) {{\n    \
+                       if (uah === 0) {{\n      \
+                         if (rem) rl = ual % ubl; else ql = (ual / ubl) >>> 0;\n    \
+                       }} else if (ubl <= 2097152) {{\n      \
+                         qh = (uah / ubl) >>> 0;\n      \
+                         const mid = (uah - qh * ubl) * 4294967296 + ual;\n      \
+                         ql = (mid / ubl) >>> 0;\n      \
+                         if (rem) rl = (mid - ql * ubl) >>> 0;\n    \
+                       }} else {{\n      \
+                         qh = (uah / ubl) >>> 0;\n      \
+                         const r0 = uah - qh * ubl;\n      \
+                         let est = Math.floor((r0 * 4294967296 + ual) / ubl);\n      \
+                         if (est > 4294967295) est = 4294967295;\n      \
+                         const t0 = est * (ubl & 65535);\n      \
+                         const t1 = est * (ubl >>> 16) + Math.floor(t0 / 65536);\n      \
+                         let plo = ((t1 & 65535) * 65536 + (t0 & 65535)) >>> 0;\n      \
+                         let phi = Math.floor(t1 / 65536);\n      \
+                         while (phi > r0 || (phi === r0 && plo > ual)) {{\n        \
+                           est--;\n        \
+                           if (plo < ubl) phi--;\n        \
+                           plo = (plo - ubl) >>> 0;\n      \
+                         }}\n      \
+                         let rlo = (ual - plo) >>> 0;\n      \
+                         let rhi = r0 - phi - (ual < plo ? 1 : 0);\n      \
+                         while (rhi > 0 || rlo >= ubl) {{\n        \
+                           est++;\n        \
+                           if (rlo < ubl) rhi--;\n        \
+                           rlo = (rlo - ubl) >>> 0;\n      \
+                         }}\n      \
+                         ql = est >>> 0;\n      \
+                         rl = rlo;\n    \
+                       }}\n  \
+                     }} else if (ubh > uah || (ubh === uah && ubl > ual)) {{\n    \
+                       rl = ual; rh = uah;\n  \
+                     }} else if (uah < 2097152 && ubh < 2097152) {{\n    \
+                       const fa = uah * 4294967296 + ual;\n    \
+                       const fb = ubh * 4294967296 + ubl;\n    \
+                       const q = Math.floor(fa / fb);\n    \
+                       if (rem) {{\n      \
+                         const r = fa - q * fb;\n      \
+                         rh = Math.floor(r / 4294967296) >>> 0;\n      \
+                         rl = (r - rh * 4294967296) >>> 0;\n    \
+                       }} else {{\n      \
+                         ql = q >>> 0;\n    \
+                       }}\n  \
+                     }} else {{\n    \
+                       const fa = uah * 4294967296 + ual;\n    \
+                       const fb = ubh * 4294967296 + ubl;\n    \
+                       let est = Math.floor(fa / fb);\n    \
+                       if (est > 4294967295) est = 4294967295;\n    \
+                       const t0 = est * (ubl & 65535);\n    \
+                       const t1 = est * (ubl >>> 16) + Math.floor(t0 / 65536);\n    \
+                       let plo = ((t1 & 65535) * 65536 + (t0 & 65535)) >>> 0;\n    \
+                       let phi = est * ubh + Math.floor(t1 / 65536);\n    \
+                       while (phi > uah || (phi === uah && plo > ual)) {{\n      \
+                         est--;\n      \
+                         const b = plo < ubl ? 1 : 0;\n      \
+                         plo = (plo - ubl) >>> 0;\n      \
+                         phi -= ubh + b;\n    \
+                       }}\n    \
+                       let rlo = (ual - plo) >>> 0;\n    \
+                       let rhi = uah - phi - (ual < plo ? 1 : 0);\n    \
+                       while (rhi > ubh || (rhi === ubh && rlo >= ubl)) {{\n      \
+                         est++;\n      \
+                         const b = rlo < ubl ? 1 : 0;\n      \
+                         rlo = (rlo - ubl) >>> 0;\n      \
+                         rhi -= ubh + b;\n    \
+                       }}\n    \
+                       ql = est >>> 0;\n    \
+                       rl = rlo;\n    \
+                       rh = rhi >>> 0;\n  \
+                     }}\n  \
+                     let lo = (rem ? rl : ql) | 0;\n  \
+                     let hi = (rem ? rh : qh) | 0;\n  \
+                     if (signed && (rem ? negA : negA !== negB)) {{\n    \
+                       lo = (-lo) | 0;\n    \
+                       hi = (~hi + (lo === 0 ? 1 : 0)) | 0;\n  \
+                     }}\n  \
+                     {HELPER_HI} = hi;\n  \
+                     return lo;\n\
                      }}\n"
                 ),
             ),

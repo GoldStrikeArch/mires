@@ -162,7 +162,8 @@ fn run_impl(
             else {
                 continue;
             };
-            let Some(fact) = analysis.prove(func, table, *cond, block, index, &deleted) else {
+            let Some(fact) = analysis.prove(func, table, interns, *cond, block, index, &deleted)
+            else {
                 continue;
             };
             witnesses.push(Witness::BoundsRemoved {
@@ -759,8 +760,8 @@ impl Analysis {
     /// loops from crawling one trip at a time, and a failure to stabilize falls back to full
     /// ranges for every parameter, which one more transfer pass makes consistent.
     fn compute_intervals(&mut self, func: &Func, table: &TypeTable, interns: Option<&Interns>) {
-        const WIDEN: usize = 4;
-        const CAP: usize = 8;
+        const WIDEN: usize = 3;
+        const CAP: usize = 24;
 
         for &param in &func.blocks[0].params {
             if let Some(bits) = self.widths[param.0 as usize] {
@@ -791,7 +792,7 @@ impl Analysis {
                             continue;
                         };
                         let Some((contribution, cap)) =
-                            self.refine(*arg, &term_facts[block.0 as usize])
+                            self.refine(func, table, *arg, &term_facts[block.0 as usize])
                         else {
                             continue;
                         };
@@ -813,11 +814,16 @@ impl Analysis {
                 };
                 // The widening round: a parameter still growing jumps to the tightest fact cap
                 // among its edges, or its full type range when no fact bounds it, so a counted
-                // loop converges instead of crawling one trip per round.
-                if round == WIDEN && slot.is_some_and(|old| old.hi < next.hi) {
+                // loop converges instead of crawling one trip per round. Preserve `lo` for upward
+                // loops (e.g. `16..64`) so non-wrapping subtractions (`p - 16`) remain provable.
+                if round >= WIDEN {
                     let bits = self.widths[param.0 as usize].expect("joined params are unsigned");
-                    next.lo = 0;
-                    next.hi = cap.unwrap_or(width_max(bits)).max(next.hi);
+                    if slot.is_some_and(|old| old.hi < next.hi) {
+                        next.hi = cap.unwrap_or(width_max(bits)).max(next.hi);
+                    }
+                    if slot.is_some_and(|old| next.lo < old.lo) {
+                        next.lo = 0;
+                    }
                 }
                 if *slot != Some(next) {
                     *slot = Some(next);
@@ -834,7 +840,7 @@ impl Analysis {
                     let Some(bits) = self.widths[result.0 as usize] else {
                         continue;
                     };
-                    let next = self.transfer(func, table, interns, &op.kind, bits);
+                    let next = self.transfer(func, table, interns, block, &op.kind, bits);
                     let slot = &mut self.intervals[result.0 as usize];
                     if *slot != next {
                         *slot = next;
@@ -868,16 +874,74 @@ impl Analysis {
                         continue;
                     };
                     self.intervals[result.0 as usize] =
-                        self.transfer(func, table, interns, &op.kind, bits);
+                        self.transfer(func, table, interns, block, &op.kind, bits);
                 }
             }
         }
     }
 
+    /// Refines `v`'s interval against `facts` (both upper and lower bounds).
+    fn interval_under(&self, v: ValueId, facts: &[usize]) -> Option<Iv> {
+        let mut iv = self.interval(v)?;
+        let canon = self.canon(v);
+        for &index in facts {
+            let fact = &self.facts[index];
+            if matches!(fact.x, Bound::Value(x) if self.canon(x) == canon) {
+                let bound_hi = match fact.y {
+                    Bound::Value(y) => self.interval(y).map(|b| b.hi),
+                    Bound::Const(c) => Some(c),
+                };
+                if let Some(bound_hi) = bound_hi {
+                    if fact.rel == Rel::Lt && bound_hi == 0 {
+                        continue;
+                    }
+                    let cap = match fact.rel {
+                        Rel::Le => bound_hi,
+                        Rel::Lt => bound_hi - 1,
+                    };
+                    if cap < iv.hi {
+                        iv.hi = cap;
+                        iv.lo = iv.lo.min(iv.hi);
+                    }
+                }
+            }
+            if matches!(fact.y, Bound::Value(y) if self.canon(y) == canon) {
+                let bound_lo = match fact.x {
+                    Bound::Value(x) => self.interval(x).map(|b| b.lo),
+                    Bound::Const(c) => Some(c),
+                };
+                if let Some(bound_lo) = bound_lo {
+                    let floor = match fact.rel {
+                        Rel::Le => Some(bound_lo),
+                        Rel::Lt => bound_lo.checked_add(1),
+                    };
+                    if let Some(floor) = floor {
+                        if floor > iv.lo && floor <= iv.hi {
+                            iv.lo = floor;
+                        }
+                    }
+                }
+            }
+        }
+        Some(iv)
+    }
+
+    /// Interval of `v` refined by the facts that hold on entry to `block`.
+    fn interval_in(&self, v: ValueId, block: RBlockId) -> Option<Iv> {
+        self.interval_under(v, &self.entry_facts[block.0 as usize])
+    }
+
     /// The contribution of `arg` over an edge whose source block's terminator sees `facts`:
-    /// the argument's interval, clamped by any fact bounding it from above. The clamp is also
-    /// returned, as the widening bound for the parameter it feeds.
-    fn refine(&self, arg: ValueId, facts: &[usize]) -> Option<(Iv, Option<u128>)> {
+    /// the argument's interval, clamped by any fact bounding it from above (including stepped
+    /// induction back-edges `base + k` where a fact bounds `base`). The clamp is also returned as
+    /// the widening bound for the parameter it feeds.
+    fn refine(
+        &self,
+        func: &Func,
+        table: &TypeTable,
+        arg: ValueId,
+        facts: &[usize],
+    ) -> Option<(Iv, Option<u128>)> {
         let mut iv = self.interval(arg)?;
         let mut cap: Option<u128> = None;
         for &index in facts {
@@ -897,11 +961,72 @@ impl Analysis {
                 }
                 Bound::Const(c) => c,
             };
+            if fact.rel == Rel::Lt && bound_hi == 0 {
+                continue;
+            }
             let bound = match fact.rel {
                 Rel::Le => bound_hi,
-                Rel::Lt => bound_hi.saturating_sub(1),
+                Rel::Lt => bound_hi - 1,
             };
             cap = Some(cap.map_or(bound, |current| current.min(bound)));
+        }
+        // Stepped loop back-edge: `arg = base + k` where `facts` caps `base <= B`, so `arg <= B + k`.
+        if let Some(OpKind::Binary {
+            op: BinaryOp::Add | BinaryOp::AddUnchecked,
+            l,
+            r,
+            ty,
+        }) = self.def_kind(func, self.canon(arg))
+        {
+            if let Some((false, bits)) = table.int_info(*ty) {
+                let max = width_max(bits);
+                let const_of = |side: ValueId| match self.def_kind(func, self.canon(side)) {
+                    Some(OpKind::Const(ConstTree::Scalar { bits: v, bytes })) => {
+                        Some(mask(*v, *bytes).min(max))
+                    }
+                    _ => None,
+                };
+                if let Some((base, k)) = match (const_of(*l), const_of(*r)) {
+                    (None, Some(k)) => Some((*l, k)),
+                    (Some(k), None) => Some((*r, k)),
+                    _ => None,
+                } {
+                    let base_canon = self.canon(base);
+                    let mut base_cap: Option<u128> = None;
+                    for &index in facts {
+                        let fact = &self.facts[index];
+                        let Bound::Value(x) = fact.x else { continue };
+                        if self.canon(x) != base_canon {
+                            continue;
+                        }
+                        let bound_hi = match fact.y {
+                            Bound::Value(y) => self.interval(y).map(|b| b.hi),
+                            Bound::Const(c) => Some(c),
+                        };
+                        let Some(bound_hi) = bound_hi else { continue };
+                        if fact.rel == Rel::Lt && bound_hi == 0 {
+                            continue;
+                        }
+                        let b = match fact.rel {
+                            Rel::Le => bound_hi,
+                            Rel::Lt => bound_hi - 1,
+                        };
+                        base_cap = Some(base_cap.map_or(b, |c| c.min(b)));
+                    }
+                    if let Some(b_hi) = base_cap {
+                        if let Some(stepped_cap) = b_hi.checked_add(k).filter(|&s| s <= max) {
+                            cap = Some(cap.map_or(stepped_cap, |c| c.min(stepped_cap)));
+                        }
+                    }
+                    if let Some(base_iv) = self.interval_under(base, facts) {
+                        if let Some(sum_hi) = base_iv.hi.checked_add(k).filter(|&s| s <= max) {
+                            let sum_lo = base_iv.lo + k;
+                            iv.hi = iv.hi.min(sum_hi);
+                            iv.lo = iv.lo.max(sum_lo).min(iv.hi);
+                        }
+                    }
+                }
+            }
         }
         if let Some(cap) = cap {
             iv.hi = iv.hi.min(cap);
@@ -917,6 +1042,7 @@ impl Analysis {
         func: &Func,
         table: &TypeTable,
         interns: Option<&Interns>,
+        block: RBlockId,
         kind: &OpKind,
         bits: u32,
     ) -> Option<Iv> {
@@ -927,7 +1053,7 @@ impl Analysis {
                 Some(Iv::point(mask(*value, *bytes).min(max)))
             }
             OpKind::Copy(v) | OpKind::Move(v) => match self.widths[v.0 as usize] {
-                Some(w) if w == bits => self.interval(*v),
+                Some(w) if w == bits => self.interval_in(*v, block),
                 _ => top,
             },
             OpKind::Unary {
@@ -943,9 +1069,13 @@ impl Analysis {
                 // unsigned integers `x & m <= m`. This matters for shifts whose dynamic amount
                 // the interval domain cannot model, followed by a constant array-index mask.
                 if *op == BinaryOp::BitAnd {
-                    return Some(bitand_transfer(self.interval(*l), self.interval(*r), max));
+                    return Some(bitand_transfer(
+                        self.interval_in(*l, block),
+                        self.interval_in(*r, block),
+                        max,
+                    ));
                 }
-                let (l, r) = (self.interval(*l)?, self.interval(*r)?);
+                let (l, r) = (self.interval_in(*l, block)?, self.interval_in(*r, block)?);
                 Some(binary_transfer(*op, l, r, max))
             }
             OpKind::Cast {
@@ -955,7 +1085,7 @@ impl Analysis {
                 ..
             } => match table.int_info(*from) {
                 Some((false, _)) => {
-                    let iv = self.interval(*v)?;
+                    let iv = self.interval_in(*v, block)?;
                     if iv.hi <= max {
                         Some(iv)
                     } else {
@@ -1207,19 +1337,14 @@ impl Analysis {
         interval
     }
 
-    /// Peels a chain of `+ constant` off `v` where the intervals certify no step can wrap:
-    /// the result is `(base, k)` with `v == base + k` as mathematical integers.
-    fn peel(&self, func: &Func, table: &TypeTable, v: ValueId) -> (ValueId, u128) {
+    /// Peels a chain of `+ constant` / `- constant` off `v` where the intervals at `block` certify
+    /// no step can wrap: the result is `(base, offset)` with `v == base + offset` as mathematical
+    /// integers.
+    fn peel(&self, func: &Func, table: &TypeTable, block: RBlockId, v: ValueId) -> (ValueId, i128) {
         let mut at = self.canon(v);
-        let mut offset = 0u128;
+        let mut offset = 0i128;
         for _ in 0..8 {
-            let Some(OpKind::Binary {
-                op: BinaryOp::Add | BinaryOp::AddUnchecked,
-                l,
-                r,
-                ty,
-            }) = self.def_kind(func, at)
-            else {
+            let Some(OpKind::Binary { op, l, r, ty }) = self.def_kind(func, at) else {
                 break;
             };
             let Some((false, bits)) = table.int_info(*ty) else {
@@ -1232,37 +1357,61 @@ impl Analysis {
                 }
                 _ => None,
             };
-            let (base, k) = match (constant(*l), constant(*r)) {
-                (None, Some(k)) => (*l, k),
-                (Some(k), None) => (*r, k),
+            match op {
+                BinaryOp::Add | BinaryOp::AddUnchecked => {
+                    let (base, k) = match (constant(*l), constant(*r)) {
+                        (None, Some(k)) => (*l, k),
+                        (Some(k), None) => (*r, k),
+                        _ => break,
+                    };
+                    let Some(iv) = self.interval_in(self.canon(base), block) else {
+                        break;
+                    };
+                    let Some(sum) = iv.hi.checked_add(k) else {
+                        break;
+                    };
+                    if sum > max {
+                        break;
+                    }
+                    let Ok(k_i) = i128::try_from(k) else { break };
+                    let Some(total) = offset.checked_add(k_i) else {
+                        break;
+                    };
+                    offset = total;
+                    at = self.canon(base);
+                }
+                BinaryOp::Sub | BinaryOp::SubUnchecked => {
+                    let Some(k) = constant(*r) else { break };
+                    if constant(*l).is_some() {
+                        break;
+                    }
+                    let Some(iv) = self.interval_in(self.canon(*l), block) else {
+                        break;
+                    };
+                    if iv.lo < k {
+                        break;
+                    }
+                    let Ok(k_i) = i128::try_from(k) else { break };
+                    let Some(total) = offset.checked_sub(k_i) else {
+                        break;
+                    };
+                    offset = total;
+                    at = self.canon(*l);
+                }
                 _ => break,
-            };
-            // The no-wrap certificate: the dynamic operand's upper bound plus the constant
-            // stays inside the type.
-            let Some(iv) = self.interval(self.canon(base)) else {
-                break;
-            };
-            let Some(sum) = iv.hi.checked_add(k) else {
-                break;
-            };
-            if sum > max {
-                break;
             }
-            let Some(total) = offset.checked_add(k) else {
-                break;
-            };
-            offset = total;
-            at = self.canon(base);
         }
         (at, offset)
     }
 
     /// Tries to prove the assert at `(block, index)` with condition `cond`; `deleted` names the
     /// asserts already removed, whose fact sites are no longer usable evidence.
+    #[allow(clippy::too_many_arguments)]
     fn prove(
         &self,
         func: &Func,
         table: &TypeTable,
+        interns: Option<&Interns>,
         cond: ValueId,
         block: RBlockId,
         index: usize,
@@ -1281,8 +1430,40 @@ impl Analysis {
             return None;
         }
 
-        // Numeric: the intervals alone imply it, over pure ssa derivations.
-        if let (Some(iv_idx), Some(iv_len)) = (self.interval(*idx), self.interval(*len)) {
+        let b = block.0 as usize;
+        let local: Vec<usize> = self
+            .facts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, fact)| {
+                matches!(
+                    fact.site,
+                    Site::Assert { block: fb, index: fi, .. }
+                        if fb == block && fi < index && !deleted.contains(&(fb.0, fi))
+                )
+                .then_some(i)
+            })
+            .collect();
+        let active_facts: Vec<usize> = self.entry_facts[b]
+            .iter()
+            .copied()
+            .filter(|&i| match self.facts[i].site {
+                Site::Assert {
+                    block: fb,
+                    index: fi,
+                    ..
+                } => !deleted.contains(&(fb.0, fi)),
+                Site::Edge { .. } => true,
+            })
+            .chain(local.iter().copied())
+            .collect();
+
+        // Numeric: the intervals (refined by dominating entry facts and earlier non-deleted
+        // asserts in this block) alone imply it.
+        if let (Some(iv_idx), Some(iv_len)) = (
+            self.interval_under(*idx, &active_facts),
+            self.interval_under(*len, &active_facts),
+        ) {
             if iv_idx.hi < iv_len.lo {
                 return Some(BoundsFact::Numeric {
                     index_hi: iv_idx.hi,
@@ -1292,17 +1473,9 @@ impl Analysis {
         }
 
         // Symbolic: a dominating fact over the same base against the same length term.
-        let (base, k_index) = self.peel(func, table, *idx);
+        let (base, k_index) = self.peel(func, table, block, *idx);
         let length_term = self.canon(*len);
-        let b = block.0 as usize;
-        let local = self.facts.iter().enumerate().filter_map(|(i, fact)| {
-            matches!(
-                fact.site,
-                Site::Assert { block: fb, index: fi, .. } if fb == block && fi < index
-            )
-            .then_some(i)
-        });
-        for fact_index in self.entry_facts[b].iter().copied().chain(local) {
+        for fact_index in active_facts {
             let fact = &self.facts[fact_index];
             if let Site::Assert {
                 block: fb,
@@ -1322,15 +1495,26 @@ impl Analysis {
             }
             let offsets = match fact.x {
                 Bound::Value(vx) => {
-                    let (fact_base, k_fact) = self.peel(func, table, vx);
+                    let (fact_base, k_fact) = self.peel(func, table, block, vx);
                     if fact_base == base {
                         let implied = match fact.rel {
                             Rel::Lt => k_index <= k_fact,
                             Rel::Le => k_index < k_fact,
                         };
-                        implied.then_some((k_index, k_fact))
+                        if implied {
+                            let shift = k_index.min(k_fact);
+                            let oi = k_index
+                                .checked_sub(shift)
+                                .and_then(|v| u128::try_from(v).ok());
+                            let of = k_fact
+                                .checked_sub(shift)
+                                .and_then(|v| u128::try_from(v).ok());
+                            oi.zip(of)
+                        } else {
+                            None
+                        }
                     } else if let (Some(iv_idx), Some(iv_fact)) =
-                        (self.interval(*idx), self.interval(vx))
+                        (self.interval_in(*idx, block), self.interval_in(vx, block))
                     {
                         let implied = match fact.rel {
                             Rel::Lt => iv_idx.hi <= iv_fact.lo,
@@ -1341,7 +1525,7 @@ impl Analysis {
                         None
                     }
                 }
-                Bound::Const(c_fact) => self.interval(*idx).and_then(|iv_idx| {
+                Bound::Const(c_fact) => self.interval_in(*idx, block).and_then(|iv_idx| {
                     let implied = match fact.rel {
                         Rel::Lt => iv_idx.hi <= c_fact,
                         Rel::Le => iv_idx.hi < c_fact,
@@ -1352,7 +1536,7 @@ impl Analysis {
             let Some((offset_index, offset_fact)) = offsets else {
                 continue;
             };
-            if self.effect_between(func, fact.site, block, index) {
+            if self.effect_between(func, interns, fact.site, block, index) {
                 continue;
             }
             let (fact_block, fact_cond) = match fact.site {
@@ -1377,15 +1561,48 @@ impl Analysis {
     /// one incoming edge, which decides it); an assert fact at its own op. Either way,
     /// re-entering the establishment block re-establishes the fact, so the paths that matter
     /// never traverse it and the flood fills below simply refuse to.
-    fn effect_between(&self, func: &Func, site: Site, block: RBlockId, index: usize) -> bool {
+    fn effect_between(
+        &self,
+        func: &Func,
+        interns: Option<&Interns>,
+        site: Site,
+        block: RBlockId,
+        index: usize,
+    ) -> bool {
         let (start, from) = match site {
             Site::Edge { target, .. } => (target, 0usize),
             Site::Assert {
                 block, index: at, ..
             } => (block, at + 1),
         };
+        let is_pure_intrinsic = |kind: &OpKind| match kind {
+            OpKind::Intrinsic { name, .. } => interns.and_then(|i| i.str(*name)).is_some_and(|n| {
+                matches!(
+                    n,
+                    "rotate_left"
+                        | "rotate_right"
+                        | "wrapping_add"
+                        | "wrapping_sub"
+                        | "wrapping_mul"
+                        | "saturating_add"
+                        | "saturating_sub"
+                        | "disjoint_bitor"
+                        | "add_with_overflow"
+                        | "sub_with_overflow"
+                        | "mul_with_overflow"
+                        | "ctlz"
+                        | "cttz"
+                        | "ctpop"
+                        | "bswap"
+                        | "bitreverse"
+                )
+            }),
+            _ => false,
+        };
         let effectful = |op: &Op| {
-            op_purity(&op.kind) == Purity::Effect && !matches!(op.kind, OpKind::Assert { .. })
+            op_purity(&op.kind) == Purity::Effect
+                && !matches!(op.kind, OpKind::Assert { .. })
+                && !is_pure_intrinsic(&op.kind)
         };
         let start_ops = &func.blocks[start.0 as usize].ops;
         if start == block {
@@ -2691,6 +2908,166 @@ mod tests {
                 res.asserts_removed, 0,
                 "{label} must not peel slice_from_parts"
             );
+        }
+    }
+
+    #[test]
+    fn loop_induction_signed_peel_and_local_assert_eliminate_bounds_checks() {
+        let tbl = table();
+        let interns = Interns::default();
+
+        // 1. Stepped loop `for i in 0..10 { assert(i + 40 < 50); assert(i + 40 < 50); }`
+        //    proves `i in [0, 9]` via stepped back-edge refinement and eliminates both asserts
+        //    (including when a duplicate local assert follows in the same block).
+        {
+            let mut b = builder();
+            let entry = FuncBuilder::ENTRY;
+            let header = b.block();
+            let body = b.block();
+            let exit = b.block();
+            let zero = constant(&mut b, entry, 0);
+            let one = constant(&mut b, entry, 1);
+            let ten = constant(&mut b, entry, 10);
+            let forty = constant(&mut b, entry, 40);
+            let fifty = constant(&mut b, entry, 50);
+            b.terminate(entry, RTerm::Goto(header, vec![zero]));
+            let i = b.block_param(header, U32, NO_ORIGIN);
+            let cond = compare(&mut b, header, BinaryOp::Lt, i, ten);
+            b.terminate(
+                header,
+                RTerm::Switch {
+                    scrut: cond,
+                    scrut_ty: U32,
+                    cases: vec![(0, exit, Vec::new())],
+                    default: (body, Vec::new()),
+                },
+            );
+            let idx = b.op(
+                body,
+                OpKind::Binary {
+                    op: BinaryOp::Add,
+                    l: i,
+                    r: forty,
+                    ty: U32,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            bounds_assert(&mut b, body, idx, fifty);
+            bounds_assert(&mut b, body, idx, fifty);
+            let next = b.op(
+                body,
+                OpKind::Binary {
+                    op: BinaryOp::Add,
+                    l: i,
+                    r: one,
+                    ty: U32,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            b.terminate(body, RTerm::Goto(header, vec![next]));
+            let ret = constant(&mut b, exit, 0);
+            b.terminate(exit, RTerm::Return(Some(ret)));
+
+            let mut func = finished(b);
+            let mut witnesses = Vec::new();
+            let res = run_with_interns(&mut func, &tbl, &interns, &mut witnesses);
+            assert_eq!(
+                res.asserts_removed, 2,
+                "both i + 40 < 50 asserts should fold"
+            );
+            assert_eq!(asserts(&func), 0);
+            super::super::witness::check_all(&witnesses, &func, &tbl).expect("witness checks");
+        }
+
+        // 2. Signed peel across loop `16..64`: `assert(p - 2 < len)` dominates `assert(p - 7 < len)`
+        //    and `assert(p - 16 < len)` because widening preserves `lo = 16`, guaranteeing no underflow.
+        {
+            let mut b = builder();
+            let entry = FuncBuilder::ENTRY;
+            let header = b.block();
+            let body = b.block();
+            let exit = b.block();
+            let slice = b.param(REF_SLICE, NO_ORIGIN);
+            let len = metadata(&mut b, entry, slice);
+            let c1 = constant(&mut b, entry, 1);
+            let c2 = constant(&mut b, entry, 2);
+            let c7 = constant(&mut b, entry, 7);
+            let c16 = constant(&mut b, entry, 16);
+            let c64 = constant(&mut b, entry, 64);
+            b.terminate(entry, RTerm::Goto(header, vec![c16]));
+            let p = b.block_param(header, U32, NO_ORIGIN);
+            let cond = compare(&mut b, header, BinaryOp::Lt, p, c64);
+            b.terminate(
+                header,
+                RTerm::Switch {
+                    scrut: cond,
+                    scrut_ty: U32,
+                    cases: vec![(0, exit, Vec::new())],
+                    default: (body, Vec::new()),
+                },
+            );
+            let pm2 = b.op(
+                body,
+                OpKind::Binary {
+                    op: BinaryOp::Sub,
+                    l: p,
+                    r: c2,
+                    ty: U32,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            let pm7 = b.op(
+                body,
+                OpKind::Binary {
+                    op: BinaryOp::Sub,
+                    l: p,
+                    r: c7,
+                    ty: U32,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            let pm16 = b.op(
+                body,
+                OpKind::Binary {
+                    op: BinaryOp::Sub,
+                    l: p,
+                    r: c16,
+                    ty: U32,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            bounds_assert(&mut b, body, pm2, len);
+            bounds_assert(&mut b, body, pm7, len);
+            bounds_assert(&mut b, body, pm16, len);
+            let next = b.op(
+                body,
+                OpKind::Binary {
+                    op: BinaryOp::Add,
+                    l: p,
+                    r: c1,
+                    ty: U32,
+                },
+                U32,
+                NO_ORIGIN,
+            );
+            b.terminate(body, RTerm::Goto(header, vec![next]));
+            let ret = constant(&mut b, exit, 0);
+            b.terminate(exit, RTerm::Return(Some(ret)));
+
+            let mut func = finished(b);
+            let mut witnesses = Vec::new();
+            let res = run_with_interns(&mut func, &tbl, &interns, &mut witnesses);
+            assert_eq!(
+                res.asserts_removed, 2,
+                "p - 7 < len and p - 16 < len must be eliminated from p - 2 < len"
+            );
+            assert_eq!(asserts(&func), 1);
+            super::super::witness::check_all(&witnesses, &func, &tbl).expect("witness checks");
         }
     }
 }

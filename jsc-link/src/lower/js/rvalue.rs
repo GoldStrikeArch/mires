@@ -163,8 +163,225 @@ pub(super) fn carried_overflow_pairs(
         .collect()
 }
 
+/// Unsigned 32-bit (`u32`/`usize`) SSA values whose consumers all depend only on their low 32
+/// bits, so they may stay in signed `Int32` instead of emitting a trailing `>>> 0`.
+pub(super) fn int32_only_values(
+    func: &Func,
+    table: &TypeTable,
+    interns: &rcgjs_object::jir::interns::Interns,
+    carried_pairs: &BTreeMap<ValueId, CarriedPair>,
+) -> BTreeSet<ValueId> {
+    let is_u32_num = |ty: TypeId| {
+        table.int_repr(ty) == IntRepr::Number && table.int_info(ty) == Some((false, 32))
+    };
+    let is_32_num = |ty: TypeId| {
+        table.int_repr(ty) == IntRepr::Number
+            && table.int_info(ty).is_some_and(|(_, bits)| bits == 32)
+    };
+
+    let mut set = BTreeSet::new();
+    for block in &func.blocks {
+        // Non-entry block parameters of type `u32`/`usize` can also be `int32_only` when every
+        // consumer only reads their low 32 bits; incoming edges may supply either signed `Int32`
+        // or unsigned `Uint32` since all bit-rep-only consumers agree on both.
+        if block.id.0 > 0 {
+            for &param in &block.params {
+                if !carried_pairs.contains_key(&param)
+                    && is_u32_num(func.values[param.0 as usize].ty)
+                {
+                    set.insert(param);
+                }
+            }
+        }
+        for op in &block.ops {
+            let Some(result) = op.result else { continue };
+            if carried_pairs.contains_key(&result) {
+                continue;
+            }
+            let result_ty = func.values[result.0 as usize].ty;
+            if !is_u32_num(result_ty) {
+                continue;
+            }
+            let eligible = match &op.kind {
+                OpKind::Binary { op, .. } => matches!(
+                    op,
+                    BinaryOp::BitAnd
+                        | BinaryOp::BitOr
+                        | BinaryOp::BitXor
+                        | BinaryOp::Shl
+                        | BinaryOp::ShlUnchecked
+                        | BinaryOp::Shr
+                        | BinaryOp::ShrUnchecked
+                        | BinaryOp::Add
+                        | BinaryOp::AddUnchecked
+                        | BinaryOp::Sub
+                        | BinaryOp::SubUnchecked
+                        | BinaryOp::Mul
+                        | BinaryOp::MulUnchecked
+                ),
+                OpKind::Unary {
+                    op: UnaryOp::Not | UnaryOp::Neg,
+                    ..
+                } => true,
+                OpKind::Intrinsic { name, .. } => interns.str(*name).is_some_and(|iname| {
+                    matches!(
+                        iname,
+                        "wrapping_add"
+                            | "wrapping_sub"
+                            | "wrapping_mul"
+                            | "unchecked_add"
+                            | "unchecked_sub"
+                            | "unchecked_mul"
+                            | "unchecked_shl"
+                            | "unchecked_shr"
+                            | "disjoint_bitor"
+                            | "rotate_left"
+                            | "rotate_right"
+                    )
+                }),
+                OpKind::Copy(_) | OpKind::Move(_) => true,
+                OpKind::Cast {
+                    kind: CastKind::IntToInt,
+                    ..
+                } => true,
+                _ => false,
+            };
+            if eligible {
+                set.insert(result);
+            }
+        }
+    }
+    if set.is_empty() {
+        return set;
+    }
+
+    // Values returned, thrown, or switched on escape to non-bit-rep-only consumers.
+    for block in &func.blocks {
+        match &block.term {
+            rcgjs_object::jir::repr::RTerm::Return(Some(v))
+            | rcgjs_object::jir::repr::RTerm::Throw(Some(v)) => {
+                set.remove(v);
+            }
+            rcgjs_object::jir::repr::RTerm::Switch { scrut, .. } => {
+                set.remove(scrut);
+            }
+            _ => {}
+        }
+    }
+
+    loop {
+        let mut removed = false;
+        for block in &func.blocks {
+            // An edge argument can stay `int32_only` iff its destination block parameter is in `set`.
+            for (target, args) in block.term.edges() {
+                let params = &func.blocks[target.0 as usize].params;
+                for (pos, arg) in args.iter().enumerate() {
+                    if !set.contains(arg) {
+                        continue;
+                    }
+                    let param_ok = params.get(pos).is_some_and(|param| set.contains(param));
+                    if !param_ok {
+                        set.remove(arg);
+                        removed = true;
+                    }
+                }
+            }
+            for op in &block.ops {
+                let uses = op.kind.uses();
+                if uses.is_empty() {
+                    continue;
+                }
+                for &u in &uses {
+                    if !set.contains(&u) {
+                        continue;
+                    }
+                    let ok = match &op.kind {
+                        OpKind::Binary { op: bin, l, r, ty } => match bin {
+                            BinaryOp::BitAnd
+                            | BinaryOp::BitOr
+                            | BinaryOp::BitXor
+                            | BinaryOp::Add
+                            | BinaryOp::AddUnchecked
+                            | BinaryOp::Sub
+                            | BinaryOp::SubUnchecked
+                            | BinaryOp::Mul
+                            | BinaryOp::MulUnchecked => is_32_num(*ty),
+                            BinaryOp::Shl
+                            | BinaryOp::ShlUnchecked
+                            | BinaryOp::Shr
+                            | BinaryOp::ShrUnchecked => {
+                                (u != *l || is_32_num(*ty))
+                                    && (u != *r || table.int_repr(*ty) == IntRepr::Number)
+                            }
+                            _ => false,
+                        },
+                        OpKind::Unary {
+                            op: UnaryOp::Not | UnaryOp::Neg,
+                            ty,
+                            ..
+                        } => is_32_num(*ty),
+                        OpKind::Cast {
+                            kind: CastKind::IntToInt,
+                            to,
+                            ..
+                        } => {
+                            if table.int_repr(*to) != IntRepr::Number {
+                                false
+                            } else if table
+                                .int_info(*to)
+                                .is_some_and(|(s, bits)| (s && bits <= 32) || (!s && bits < 32))
+                            {
+                                true
+                            } else if table.int_info(*to) == Some((false, 32)) {
+                                op.result.is_some_and(|res| set.contains(&res))
+                            } else {
+                                false
+                            }
+                        }
+                        OpKind::Copy(_) | OpKind::Move(_) => {
+                            op.result.is_some_and(|res| set.contains(&res))
+                        }
+                        OpKind::Intrinsic { name, args, .. } => {
+                            interns.str(*name).is_some_and(|iname| {
+                                let arg0_ty = args.first().map(|a| func.values[a.0 as usize].ty);
+                                match iname {
+                                    "wrapping_add" | "wrapping_sub" | "wrapping_mul"
+                                    | "unchecked_add" | "unchecked_sub" | "unchecked_mul"
+                                    | "disjoint_bitor" | "rotate_left" | "rotate_right" => {
+                                        arg0_ty.is_some_and(is_32_num)
+                                    }
+                                    "unchecked_shl" | "unchecked_shr" => {
+                                        let lhs_ok = args.first() != Some(&u)
+                                            || arg0_ty.is_some_and(is_32_num);
+                                        let rhs_ok = args.get(1) != Some(&u)
+                                            || arg0_ty.is_some_and(|t| {
+                                                table.int_repr(t) == IntRepr::Number
+                                            });
+                                        lhs_ok && rhs_ok
+                                    }
+                                    _ => false,
+                                }
+                            })
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        set.remove(&u);
+                        removed = true;
+                    }
+                }
+            }
+        }
+        if !removed {
+            break;
+        }
+    }
+    set
+}
+
 impl<'a> JsCx<'a> {
     /// `l op r` at operand type `ty` (`rvalue.rs::codegen_rvalue`, `BinaryOp` arm).
+    #[allow(clippy::too_many_arguments)]
     pub fn binary(
         &self,
         op: BinaryOp,
@@ -173,13 +390,14 @@ impl<'a> JsCx<'a> {
         result_ty: TypeId,
         lhs: Expr,
         rhs: Expr,
+        int32_only: bool,
     ) -> Res<Expr> {
         match op {
             BinaryOp::Cmp => self.three_way(ty, result_ty, lhs, rhs),
             BinaryOp::AddWithOverflow | BinaryOp::SubWithOverflow | BinaryOp::MulWithOverflow => {
                 self.with_overflow(op, ty, lhs, rhs)
             }
-            _ => self.binop(op, ty, rhs_ty, lhs, rhs),
+            _ => self.binop(op, ty, rhs_ty, lhs, rhs, int32_only),
         }
     }
 
@@ -515,7 +733,15 @@ impl<'a> JsCx<'a> {
     }
 
     /// Every other binary operator (`rvalue.rs::codegen_binop`).
-    fn binop(&self, op: BinaryOp, ty: TypeId, rhs_ty: TypeId, lhs: Expr, rhs: Expr) -> Res<Expr> {
+    fn binop(
+        &self,
+        op: BinaryOp,
+        ty: TypeId,
+        rhs_ty: TypeId,
+        lhs: Expr,
+        rhs: Expr,
+        int32_only: bool,
+    ) -> Res<Expr> {
         let table = self.table;
         let compare = |js_op: JsBinOp| jsast::binary(js_op, lhs.clone(), rhs.clone());
 
@@ -605,7 +831,19 @@ impl<'a> JsCx<'a> {
             ));
         };
         let repr = table.int_repr(ty);
-        let mask = |value: Expr| mask(repr, signed, bits, value);
+        let mask_signed = if int32_only && repr == IntRepr::Number && !signed && bits == 32 {
+            true
+        } else {
+            signed
+        };
+        let mask = |value: Expr| mask(repr, mask_signed, bits, value);
+        let strip32 = |e: Expr| {
+            if repr == IntRepr::Number && bits <= 32 {
+                value::strip_32bit_wrap(e)
+            } else {
+                e
+            }
+        };
         let shift_amount = |rhs: Expr| {
             let amount = match (repr, table.int_repr(rhs_ty)) {
                 (IntRepr::BigInt, IntRepr::Number) => self.to_bigint(rhs),
@@ -616,10 +854,12 @@ impl<'a> JsCx<'a> {
             };
             match repr {
                 IntRepr::BigInt => jsast::binary(JsBinOp::BitAnd, amount, jsast::bigint(bits - 1)),
-                IntRepr::Number if bits == 32 => amount,
-                IntRepr::Number => {
-                    jsast::binary(JsBinOp::BitAnd, amount, jsast::num((bits - 1) as f64))
-                }
+                IntRepr::Number if bits == 32 => value::strip_32bit_wrap(amount),
+                IntRepr::Number => jsast::binary(
+                    JsBinOp::BitAnd,
+                    value::strip_32bit_wrap(amount),
+                    jsast::num((bits - 1) as f64),
+                ),
             }
         };
 
@@ -628,7 +868,7 @@ impl<'a> JsCx<'a> {
             BinaryOp::Sub | BinaryOp::SubUnchecked => mask(jsast::binary(JsBinOp::Sub, lhs, rhs)),
             BinaryOp::Mul | BinaryOp::MulUnchecked => {
                 let product = if repr == IntRepr::Number && bits == 32 {
-                    jsast::imul(lhs, rhs)
+                    jsast::imul(strip32(lhs), strip32(rhs))
                 } else {
                     jsast::binary(JsBinOp::Mul, lhs, rhs)
                 };
@@ -636,17 +876,22 @@ impl<'a> JsCx<'a> {
             }
             BinaryOp::Div => mask(jsast::binary(JsBinOp::Div, lhs, rhs)),
             BinaryOp::Rem => mask(jsast::binary(JsBinOp::Rem, lhs, rhs)),
-            BinaryOp::BitAnd => mask(jsast::binary(JsBinOp::BitAnd, lhs, rhs)),
-            BinaryOp::BitOr => mask(jsast::binary(JsBinOp::BitOr, lhs, rhs)),
-            BinaryOp::BitXor => mask(jsast::binary(JsBinOp::BitXor, lhs, rhs)),
+            BinaryOp::BitAnd => mask(jsast::binary(JsBinOp::BitAnd, strip32(lhs), strip32(rhs))),
+            BinaryOp::BitOr => mask(jsast::binary(JsBinOp::BitOr, strip32(lhs), strip32(rhs))),
+            BinaryOp::BitXor => mask(jsast::binary(JsBinOp::BitXor, strip32(lhs), strip32(rhs))),
             BinaryOp::Shl | BinaryOp::ShlUnchecked => {
-                mask(jsast::binary(JsBinOp::Shl, lhs, shift_amount(rhs)))
+                mask(jsast::binary(JsBinOp::Shl, strip32(lhs), shift_amount(rhs)))
             }
             BinaryOp::Shr | BinaryOp::ShrUnchecked => {
                 let js_op = if signed || repr == IntRepr::BigInt {
                     JsBinOp::Shr
                 } else {
                     JsBinOp::UShr
+                };
+                let lhs = if repr == IntRepr::Number && bits == 32 {
+                    value::strip_32bit_wrap(lhs)
+                } else {
+                    lhs
                 };
                 mask(jsast::binary(js_op, lhs, shift_amount(rhs)))
             }
@@ -660,21 +905,36 @@ impl<'a> JsCx<'a> {
     }
 
     /// `op v` (`rvalue.rs::codegen_unop`).
-    pub fn unary(&self, op: UnaryOp, ty: TypeId, value: Expr) -> Res<Expr> {
+    pub fn unary(&self, op: UnaryOp, ty: TypeId, value: Expr, int32_only: bool) -> Res<Expr> {
         let table = self.table;
+        let apply_mask = |expr: Expr| {
+            if int32_only
+                && table.int_repr(ty) == IntRepr::Number
+                && table.int_info(ty) == Some((false, 32))
+            {
+                value::simplify_i32_wrap(expr)
+            } else {
+                mask_ty(table, ty, expr)
+            }
+        };
         Ok(match op {
             UnaryOp::Not => {
                 if value::is_bool(table, ty) {
                     jsast::not(value)
                 } else {
-                    mask_ty(table, ty, jsast::bit_not(value))
+                    let inner = if table.int_repr(ty) == IntRepr::Number {
+                        value::strip_32bit_wrap(value)
+                    } else {
+                        value
+                    };
+                    apply_mask(jsast::bit_not(inner))
                 }
             }
             UnaryOp::Neg => {
                 if value::float_bits(table, ty).is_some() {
                     jsast::neg(value)
                 } else {
-                    mask_ty(table, ty, jsast::neg(value))
+                    apply_mask(jsast::neg(value))
                 }
             }
             UnaryOp::PtrMetadata => self.ptr_metadata(ty, value)?,
@@ -683,9 +943,20 @@ impl<'a> JsCx<'a> {
 
     /// `v as to` (`rvalue.rs::codegen_cast`).
     pub fn cast(&self, kind: CastKind, from_ty: TypeId, to_ty: TypeId, value: Expr) -> Res<Expr> {
+        self.cast_with_int32_only(kind, from_ty, to_ty, value, false)
+    }
+
+    pub fn cast_with_int32_only(
+        &self,
+        kind: CastKind,
+        from_ty: TypeId,
+        to_ty: TypeId,
+        value: Expr,
+        int32_only: bool,
+    ) -> Res<Expr> {
         let table = self.table;
         match kind {
-            CastKind::IntToInt => self.int_to_int(from_ty, to_ty, value),
+            CastKind::IntToInt => self.int_to_int(from_ty, to_ty, value, int32_only),
             CastKind::FloatToInt => self.float_to_int(to_ty, value),
             CastKind::IntToFloat => {
                 if table.int_repr(from_ty) == IntRepr::BigInt
@@ -1067,7 +1338,13 @@ impl<'a> JsCx<'a> {
     }
 
     /// `as` between two integer types (`rvalue.rs::codegen_int_to_int`).
-    fn int_to_int(&self, from_ty: TypeId, to_ty: TypeId, value: Expr) -> Res<Expr> {
+    fn int_to_int(
+        &self,
+        from_ty: TypeId,
+        to_ty: TypeId,
+        value: Expr,
+        int32_only: bool,
+    ) -> Res<Expr> {
         let table = self.table;
         if value::is_char(table, to_ty) {
             return Ok(value);
@@ -1083,7 +1360,30 @@ impl<'a> JsCx<'a> {
             });
         }
         Ok(match (table.int_repr(from_ty), to_repr) {
-            (IntRepr::Number, IntRepr::Number) => mask_ty(table, to_ty, value),
+            (IntRepr::Number, IntRepr::Number) => {
+                if let Some((from_signed, from_bits)) = table.int_info(from_ty) {
+                    // Narrower unsigned types (`u8`, `u16`) and all signed `<= 32`-bit types are
+                    // already V8 Smi / Int32 values, so lossless casts need no mask. Keep `>>> 0`
+                    // on non-`int32_only` 32-bit unsigned-to-unsigned casts (`u32 as usize`) so
+                    // V8 TurboFan narrows `Double`-represented `u32` object fields (e.g. fields
+                    // storing `u32::MAX`) back to `Word32` before array indexing; `simplify_u32_wrap`
+                    // still drops it when the operand already produces a `Uint32`.
+                    let lossless = (!from_signed
+                        && !signed
+                        && (from_bits < bits || (from_bits == 32 && int32_only)))
+                        || (from_signed && signed && from_bits <= bits)
+                        || (!from_signed && signed && from_bits < bits)
+                        || (int32_only && from_signed && !signed && from_bits == 32 && bits == 32);
+                    if lossless {
+                        return Ok(value);
+                    }
+                }
+                if int32_only && !signed && bits == 32 {
+                    value::simplify_i32_wrap(value)
+                } else {
+                    mask_ty(table, to_ty, value)
+                }
+            }
             (IntRepr::Number, IntRepr::BigInt) => {
                 jsast::bigint_mask(signed, bits, jsast::to_bigint(value))
             }
@@ -1113,7 +1413,46 @@ impl<'a> JsCx<'a> {
                 } else {
                     (0.0, 2f64.powi(bits as i32) - 1.0)
                 };
-                jsast::rt_call("f2i", vec![value, jsast::num(min), jsast::num(max)])
+                if self.opts.profile == Some(crate::opts::Profile::ReleaseSpeed) {
+                    let (setup, x) =
+                        if matches!(value, Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_)) {
+                            (Vec::new(), value)
+                        } else {
+                            let (bind, tmp) = self.temp(value);
+                            (vec![bind], tmp)
+                        };
+                    let inline = if signed {
+                        jsast::cond(
+                            jsast::binary(JsBinOp::Le, x.clone(), jsast::num(min)),
+                            jsast::num(min),
+                            jsast::cond(
+                                jsast::binary(JsBinOp::Ge, x.clone(), jsast::num(max)),
+                                jsast::num(max),
+                                jsast::i32_wrap(x),
+                            ),
+                        )
+                    } else {
+                        let trunc = if bits == 32 {
+                            jsast::u32_wrap(x.clone())
+                        } else {
+                            jsast::i32_wrap(x.clone())
+                        };
+                        jsast::cond(
+                            jsast::binary(JsBinOp::Ge, x.clone(), jsast::num(max)),
+                            jsast::num(max),
+                            jsast::cond(
+                                jsast::binary(JsBinOp::Gt, x, jsast::num(0.0)),
+                                trunc,
+                                jsast::num(0.0),
+                            ),
+                        )
+                    };
+                    Lowered::Value(setup, inline)
+                        .into_expr()
+                        .expect("operand captures are assignments")
+                } else {
+                    jsast::rt_call("f2i", vec![value, jsast::num(min), jsast::num(max)])
+                }
             }
         })
     }
@@ -1336,6 +1675,57 @@ impl<'a> JsCx<'a> {
     /// clone; `is_constant` says whether it builds a fresh value at every evaluation.
     pub fn repeat(&self, element_ty: TypeId, element: Expr, count: u64, is_constant: bool) -> Expr {
         if !self.table.needs_clone(element_ty) {
+            if self.opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
+                && (8..=0x7fff_ffff).contains(&count)
+                && !self
+                    .table
+                    .get(element_ty)
+                    .is_some_and(|d| d.js.crosses_transparent_union)
+            {
+                let typed_ctor = match self
+                    .table
+                    .get(self.table.peeled(element_ty))
+                    .map(|d| &d.kind)
+                {
+                    Some(TypeKind::Integer {
+                        signed: false,
+                        bits: 8,
+                    }) => Some("Uint8Array"),
+                    Some(TypeKind::Integer {
+                        signed: true,
+                        bits: 8,
+                    }) => Some("Int8Array"),
+                    Some(TypeKind::Integer {
+                        signed: false,
+                        bits: 16,
+                    }) => Some("Uint16Array"),
+                    Some(TypeKind::Integer {
+                        signed: true,
+                        bits: 16,
+                    }) => Some("Int16Array"),
+                    Some(TypeKind::Integer {
+                        signed: false,
+                        bits: 32,
+                    }) => Some("Uint32Array"),
+                    Some(TypeKind::Integer {
+                        signed: true,
+                        bits: 32,
+                    }) => Some("Int32Array"),
+                    Some(TypeKind::Float { bits: 32 }) => Some("Float32Array"),
+                    Some(TypeKind::Float { bits: 64 }) => Some("Float64Array"),
+                    _ => None,
+                };
+                if let Some(ctor) = typed_ctor {
+                    let alloc = jsast::new(jsast::id(ctor), vec![jsast::num(count as f64)]);
+                    let is_pos_zero = matches!(&element, Expr::Num(n) if *n == 0.0 && n.is_sign_positive())
+                        || matches!(&element, Expr::RawNum(s) if s == "0");
+                    return if is_pos_zero {
+                        alloc
+                    } else {
+                        jsast::method_call(alloc, "fill", vec![element])
+                    };
+                }
+            }
             return jsast::method_call(
                 jsast::new(jsast::id("Array"), vec![jsast::num(count as f64)]),
                 "fill",

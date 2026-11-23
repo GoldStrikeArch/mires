@@ -518,6 +518,13 @@ impl AbiPlan {
         self.flat.is_empty()
     }
 
+    /// Whether any flattened signature in this plan scalarizes a slice parameter (`buf`, `off`, `len`).
+    pub(crate) fn has_slice_param(&self) -> bool {
+        self.flat
+            .values()
+            .any(|sig| sig.params.iter().flatten().any(|p| p.slice))
+    }
+
     /// The plan a retry falls back to: no callee flattened, nothing touched, but the refusals
     /// still recorded, so the sidecar says what was considered even on a run that kept none of it.
     pub fn emptied(&self) -> AbiPlan {

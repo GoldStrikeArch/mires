@@ -663,7 +663,7 @@ fn arith_mix_matches_the_01_arith_golden() {
     let js = lower(&interns, "mix", &[], &body, &func, &plan, straight(&func));
     assert_eq!(
         js,
-        "function mix(a, b) {\n  return ((Math.imul(a + b | 0, 3) | 0) << 2 | 0) ^ a | 0;\n}\n"
+        "function mix(a, b) {\n  return Math.imul(a + b, 3) << 2 ^ a;\n}\n"
     );
 }
 
@@ -1097,15 +1097,15 @@ fn a_32_bit_product_read_through_one_half_is_that_half_alone() {
     };
     assert_eq!(
         spell(0, &[(0, "a"), (1, "b")]),
-        "function f(a, b) {\n  return Math.imul(a, b) | 0;\n}\n"
+        "function f(a, b) {\n  return Math.imul(a, b);\n}\n"
     );
     assert_eq!(
         spell(1, &[(0, "a"), (1, "b")]),
-        "function f(a, b) {\n  return (Math.imul(a, b) | 0) !== a * b;\n}\n"
+        "function f(a, b) {\n  return Math.imul(a, b) !== a * b;\n}\n"
     );
     assert_eq!(
         spell(1, &[(0, "a"), (1, "b"), (2, "p")]),
-        "function f(a, b) {\n  let p;\n  p = (Math.imul(a, b) | 0) !== a * b;\n  return p;\n}\n"
+        "function f(a, b) {\n  let p;\n  p = Math.imul(a, b) !== a * b;\n  return p;\n}\n"
     );
 }
 
@@ -2018,7 +2018,7 @@ fn enum_switch_matches_the_18_enum_shapes_golden() {
     let js = lower(&interns, "area", &[], &body, &func, &plan, region);
     assert_eq!(
         js,
-        "function area(s) {\n  let _0;\n  switch (s.TAG) {\n    case \"Nothing\":\n      _0 = 0;\n      break;\n    case \"Num\":\n      _0 = s._0;\n      break;\n    case \"Pair\":\n      _0 = s._0 + s._1 | 0;\n      break;\n    case \"Named\":\n      _0 = Math.imul(s.w, s.h) | 0;\n      break;\n    default:\n      throw __rt.abort_error(new Error(\"rustc_codegen_js: entered unreachable code\"));\n  }\n  return _0;\n}\n"
+        "function area(s) {\n  let _0;\n  switch (s.TAG) {\n    case \"Nothing\":\n      _0 = 0;\n      break;\n    case \"Num\":\n      _0 = s._0;\n      break;\n    case \"Pair\":\n      _0 = s._0 + s._1 | 0;\n      break;\n    case \"Named\":\n      _0 = Math.imul(s.w, s.h);\n      break;\n    default:\n      throw __rt.abort_error(new Error(\"rustc_codegen_js: entered unreachable code\"));\n  }\n  return _0;\n}\n"
     );
 }
 
@@ -2129,7 +2129,7 @@ fn fieldless_tag_and_number_enums_switch_on_the_value() {
     let plan = plan_of(&func, &[(0, "l")]);
     let body = body_of(BodyKind::Function, func.sig.clone());
     let js = lower(&interns, "num", &[], &body, &func, &plan, straight(&func));
-    assert_eq!(js, "function num(l) {\n  return l | 0;\n}\n");
+    assert_eq!(js, "function num(l) {\n  return l;\n}\n");
 }
 
 #[test]
@@ -10314,6 +10314,233 @@ fn zero_value_handles_transparent_union_over_reference() {
         super::value::zero_value(&interns.types, &interns, maybe_uninit_ty),
         Some(jsast::undefined()),
         "transparent union `MaybeUninit<&str>` must decode to `undefined`"
+    );
+}
+
+#[test]
+fn i64_div_helper_is_bigint_free_and_exact_on_edge_cases() {
+    let referenced = BTreeSet::from([JsName::new(super::i64_pair::HELPER_DIV.to_owned())]);
+    let existing = BTreeSet::new();
+    let preamble: String = super::i64_pair::needed_helper_items(&referenced, &existing)
+        .into_iter()
+        .map(|item| item.js)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !preamble.contains("BigInt"),
+        "64-bit division helper must not allocate BigInt:\n{preamble}"
+    );
+    let check_js = format!(
+        r#"{preamble}
+const cases = [
+  // [signed, a, b]
+  [false, 0n, 1n],
+  [false, 42n, 10n],
+  [false, 18446744073709551615n, 10n],
+  [false, 18446744073709551615n, 2097152n],
+  [false, 18446744073709551615n, 2097153n],
+  [false, 18446744073709551615n, 4294967296n],
+  [false, 18446744073709551615n, 9223372036854775809n],
+  [false, 9007199254740991n, 1234567n],
+  [false, 0x8000000000000000n, 0x4000000000000001n],
+  [true, -9223372036854775808n, 10n],
+  [true, -9223372036854775808n, -10n],
+  [true, -9223372036854775808n, 1n],
+  [true, -9223372036854775808n, 9223372036854775807n],
+  [true, 9223372036854775807n, -9223372036854775808n],
+  [true, -1234567890123456789n, 987654321098765n],
+  [true, 1234567890123456789n, -987654321098765n],
+];
+for (const [signed, a, b] of cases) {{
+  for (const rem of [false, true]) {{
+    const al = Number(BigInt.asIntN(32, a));
+    const ah = Number(BigInt.asIntN(32, a >> 32n));
+    const bl = Number(BigInt.asIntN(32, b));
+    const bh = Number(BigInt.asIntN(32, b >> 32n));
+    const lo = $__mires_i64_div(al, ah, bl, bh, signed, rem);
+    const hi = $__mires_i64_hi;
+    const got = signed
+      ? (BigInt(hi) << 32n) | BigInt(lo >>> 0)
+      : (BigInt(hi >>> 0) << 32n) | BigInt(lo >>> 0);
+    const exp = rem ? a % b : a / b;
+    if (got !== exp) {{
+      throw new Error(`mismatch signed=${{signed}} rem=${{rem}} a=${{a}} b=${{b}} got=${{got}} exp=${{exp}}`);
+    }}
+  }}
+}}
+"#
+    );
+    let out = std::process::Command::new("node")
+        .arg("-e")
+        .arg(&check_js)
+        .output()
+        .expect("node must run i64 div oracle");
+    assert!(
+        out.status.success(),
+        "i64 div oracle failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn release_speed_inlines_f2i_strips_int32_only_wraps_and_uses_typed_array_repeat() {
+    let mut interns = world();
+    let f64_ty = TypeId(990);
+    interns
+        .types
+        .insert(descriptor(f64_ty, TypeKind::Float { bits: 64 }, 8));
+    let rot_name = interns.intern_str("rotate_right");
+    let arr16_u32 = TypeId(991);
+    interns.types.insert(descriptor(
+        arr16_u32,
+        TypeKind::Array {
+            element: U32,
+            length: 16,
+        },
+        64,
+    ));
+
+    // 1. Inline saturating float-to-int under ReleaseSpeed.
+    let e = FuncBuilder::ENTRY;
+    let mut b = FuncBuilder::new(item(10), signature(vec![f64_ty], I32));
+    let x = b.param(f64_ty, NO_ORIGIN);
+    let cast = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::FloatToInt,
+            v: x,
+            from: f64_ty,
+            to: I32,
+        },
+        I32,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(cast)));
+    let f = b.finish();
+    let pl = plan_of(&f, &[(0, "x")]);
+    let speed_opts = Opts {
+        profile: Some(crate::opts::Profile::ReleaseSpeed),
+        ..Opts::default()
+    };
+    let lower_speed = |name: &str, func: &Func, plan: &Plan, region| {
+        let js_name = JsName::new(name.to_owned());
+        let summary = summary(&[]);
+        let body = body_of(BodyKind::Function, func.sig.clone());
+        let items = super::host::ItemIndex::new();
+        let vtables = super::unsize::VtableIndex::new();
+        let input = LowerInput {
+            name: &js_name,
+            summary: &summary,
+            body: &body,
+            origins: None,
+            interns: &interns,
+            table: &interns.types,
+            opts: &speed_opts,
+            items: &items,
+            drop_glue: super::host::EMPTY_DROP_GLUE,
+            vtables: &vtables,
+            spills: &[],
+            abi: None,
+            physical: None,
+            call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+            bigints: None,
+            byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            nested_clone: crate::lower::NestedClone::default(),
+        };
+        jsast::stmt_to_string(
+            &function::lower(&input, func, plan, region)
+                .expect("lower")
+                .decl,
+        )
+    };
+    let js_f2i = lower_speed("f2i_speed", &f, &pl, straight(&f));
+    assert!(
+        !js_f2i.contains("__rt.f2i") && js_f2i.contains("-2147483648") && js_f2i.contains("x | 0"),
+        "ReleaseSpeed should inline saturating f2i:\n{js_f2i}"
+    );
+
+    // 2. `int32_only` strips redundant `>>> 0` on bitwise/rotate_right chains crossing a block param.
+    let mut b2 = FuncBuilder::new(item(11), signature(vec![U32, U32], I32));
+    let a = b2.param(U32, NO_ORIGIN);
+    let c = b2.param(U32, NO_ORIGIN);
+    let seven = b2.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 7, bytes: 4 }),
+        U32,
+        NO_ORIGIN,
+    );
+    let ror = b2.op(
+        e,
+        OpKind::Intrinsic {
+            name: rot_name,
+            args: vec![a, seven],
+            types: vec![U32],
+            fallback: None,
+            track_caller: None,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    let xor = b2.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::BitXor,
+            l: ror,
+            r: c,
+            ty: U32,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    let cont = b2.block();
+    let bp = b2.block_param(cont, U32, NO_ORIGIN);
+    b2.terminate(e, RTerm::Goto(cont, vec![xor]));
+    let as_i32 = b2.op(
+        cont,
+        OpKind::Cast {
+            kind: CastKind::IntToInt,
+            v: bp,
+            from: U32,
+            to: I32,
+        },
+        I32,
+        NO_ORIGIN,
+    );
+    b2.terminate(cont, RTerm::Return(Some(as_i32)));
+    let f2 = b2.finish();
+    let pl2 = plan_of(&f2, &[(0, "a"), (1, "c"), (bp.0, "bp")]);
+    let reg2 = Region::Seq(vec![
+        Region::Block(payload(&f2, 0, Some((0, 1)))),
+        Region::Block(payload(&f2, 1, None)),
+        Region::Return,
+    ]);
+    let js_i32 = lower_speed("ror_xor", &f2, &pl2, reg2);
+    assert!(
+        !js_i32.contains(">>> 0"),
+        "int32_only chain across rotate_right + block param must emit zero `>>> 0`:\n{js_i32}"
+    );
+
+    // 3. `Repeat` on `[0u32; 16]` emits `new Uint32Array(16)` under ReleaseSpeed.
+    let mut b3 = FuncBuilder::new(item(12), signature(vec![], arr16_u32));
+    let zero = b3.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+        U32,
+        NO_ORIGIN,
+    );
+    let arr = b3.op(
+        e,
+        OpKind::Repeat { v: zero, count: 16 },
+        arr16_u32,
+        NO_ORIGIN,
+    );
+    b3.terminate(e, RTerm::Return(Some(arr)));
+    let f3 = b3.finish();
+    let pl3 = plan_of(&f3, &[]);
+    let js_arr = lower_speed("mk_arr", &f3, &pl3, straight(&f3));
+    assert!(
+        js_arr.contains("new Uint32Array(16)"),
+        "ReleaseSpeed numeric repeat >= 8 should emit TypedArray:\n{js_arr}"
     );
 }
 

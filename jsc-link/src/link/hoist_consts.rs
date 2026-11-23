@@ -93,6 +93,65 @@ fn is_scalar_array_lit(expr: &Expr, min_len: usize, allow_bigint: bool) -> bool 
             .all(|elem| is_pure_scalar_lit(elem, allow_bigint))
 }
 
+fn is_flat_scalar_aggregate(expr: &Expr, allow_bigint: bool) -> bool {
+    match expr {
+        Expr::Array(elems) => {
+            !elems.is_empty()
+                && elems.len() <= 16
+                && elems
+                    .iter()
+                    .all(|elem| is_pure_scalar_lit(elem, allow_bigint))
+        }
+        Expr::Object(entries) => {
+            !entries.is_empty()
+                && entries.len() <= 16
+                && entries
+                    .iter()
+                    .all(|(_, v)| is_pure_scalar_lit(v, allow_bigint))
+        }
+        _ => false,
+    }
+}
+
+/// Matches a constant slice literal `{ buf: [...], off: 0, len: N }` (`N >= 4`) whose backing
+/// array holds either pure scalars or flat pure-scalar tuples/objects (e.g. Keccak's `IOTA`).
+fn is_pure_const_slice_lit(expr: &Expr, allow_bigint: bool) -> Option<bool> {
+    let Expr::Object(entries) = expr else {
+        return None;
+    };
+    if entries.len() != 3 {
+        return None;
+    }
+    let ((k0, buf), (k1, off), (k2, len)) = (&entries[0], &entries[1], &entries[2]);
+    if k0 != "buf" || k1 != "off" || k2 != "len" {
+        return None;
+    }
+    if !matches!(off, Expr::Num(_) | Expr::RawNum(_))
+        || !matches!(len, Expr::Num(_) | Expr::RawNum(_))
+    {
+        return None;
+    }
+    let Expr::Array(elems) = buf else {
+        return None;
+    };
+    if elems.len() < 4 {
+        return None;
+    }
+    if elems
+        .iter()
+        .all(|elem| is_pure_scalar_lit(elem, allow_bigint))
+    {
+        Some(false)
+    } else if elems
+        .iter()
+        .all(|elem| is_flat_scalar_aggregate(elem, allow_bigint))
+    {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 fn is_location_filename_expr(expr: &Expr) -> bool {
     match expr {
         Expr::Str(_) => true,
@@ -597,13 +656,590 @@ fn find_read_only_table_init(body: &[Stmt], local: &str, allow_bigint: bool) -> 
     }
 }
 
+/// Checks whether `local` is initialized once to a pure constant slice literal
+/// `{ buf: [...], off: 0, len: N }` and every alias derived from it (via slice copies,
+/// `{ buf: alias.buf, off: ... }` cursor steps, `__rt.ptr_eq` comparisons, and element reads)
+/// is strictly read-only and never escapes or mutates the buffer or its elements.
+fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: bool) -> Option<Expr> {
+    fn is_ptr_eq_callee(expr: &Expr) -> bool {
+        match expr {
+            Expr::Member(ns, method) => {
+                matches!(ns.as_ref(), Expr::Ident(id) if id == "__rt") && method == "ptr_eq"
+            }
+            Expr::Ident(id) => id == "$rt_ptr_eq",
+            _ => false,
+        }
+    }
+
+    fn is_derived_slice_expr(expr: &Expr, slice_aliases: &BTreeSet<String>) -> bool {
+        match expr {
+            Expr::Ident(name) => slice_aliases.contains(name),
+            Expr::Object(entries) if entries.len() == 2 || entries.len() == 3 => {
+                let has_buf = entries.iter().any(|(k, v)| {
+                    k == "buf"
+                        && matches!(
+                            v,
+                            Expr::Member(base, prop)
+                                if prop == "buf"
+                                    && matches!(base.as_ref(), Expr::Ident(n) if slice_aliases.contains(n))
+                        )
+                });
+                let keys_ok = entries
+                    .iter()
+                    .all(|(k, _)| matches!(k.as_str(), "buf" | "off" | "len"));
+                has_buf && keys_ok
+            }
+            _ => false,
+        }
+    }
+
+    fn is_elem_read_expr(expr: &Expr, slice_aliases: &BTreeSet<String>) -> bool {
+        matches!(
+            expr,
+            Expr::Index(obj, _)
+                if matches!(
+                    obj.as_ref(),
+                    Expr::Member(base, prop)
+                        if prop == "buf"
+                            && matches!(base.as_ref(), Expr::Ident(n) if slice_aliases.contains(n))
+                )
+        )
+    }
+
+    // Pass A: Find the single init of `local` and verify `local` is declared once.
+    struct FindInit<'a> {
+        local: &'a str,
+        allow_bigint: bool,
+        decl_count: usize,
+        found_init: Option<(Expr, bool)>,
+        bad: bool,
+    }
+    impl FindInit<'_> {
+        fn stmt(&mut self, s: &Stmt) {
+            if self.bad {
+                return;
+            }
+            match s {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) if matches!(lhs.as_ref(), Expr::Ident(n) if n == self.local) =>
+                {
+                    if self.found_init.is_some() {
+                        self.bad = true;
+                        return;
+                    }
+                    if let Some(nested) = is_pure_const_slice_lit(rhs, self.allow_bigint) {
+                        self.found_init = Some(((**rhs).clone(), nested));
+                    } else {
+                        self.bad = true;
+                    }
+                }
+                Stmt::Let(n, init) if n == self.local => {
+                    self.decl_count += 1;
+                    if self.decl_count > 1 {
+                        self.bad = true;
+                        return;
+                    }
+                    if let Some(rhs) = init {
+                        if self.found_init.is_some() {
+                            self.bad = true;
+                            return;
+                        }
+                        if let Some(nested) = is_pure_const_slice_lit(rhs, self.allow_bigint) {
+                            self.found_init = Some((rhs.clone(), nested));
+                        } else {
+                            self.bad = true;
+                        }
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if n == self.local {
+                            self.decl_count += 1;
+                            if self.decl_count > 1 {
+                                self.bad = true;
+                                return;
+                            }
+                            if let Some(rhs) = init {
+                                if self.found_init.is_some() {
+                                    self.bad = true;
+                                    return;
+                                }
+                                if let Some(nested) =
+                                    is_pure_const_slice_lit(rhs, self.allow_bigint)
+                                {
+                                    self.found_init = Some((rhs.clone(), nested));
+                                } else {
+                                    self.bad = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                Stmt::Const(n, _) if n == self.local => self.bad = true,
+                Stmt::If(_, a, b) => {
+                    a.iter().for_each(|x| self.stmt(x));
+                    if let Some(b) = b {
+                        b.iter().for_each(|x| self.stmt(x));
+                    }
+                }
+                Stmt::Switch(_, cases) => {
+                    for c in cases {
+                        c.body.iter().for_each(|x| self.stmt(x));
+                    }
+                }
+                Stmt::Labeled(_, inner) => self.stmt(inner),
+                Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
+                    b.iter().for_each(|x| self.stmt(x));
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    if binding == self.local {
+                        self.bad = true;
+                        return;
+                    }
+                    body.iter().for_each(|x| self.stmt(x));
+                    handler.iter().for_each(|x| self.stmt(x));
+                }
+                Stmt::FunctionDecl { name, params, body } => {
+                    if name == self.local || params.iter().any(|p| p == self.local) {
+                        self.bad = true;
+                        return;
+                    }
+                    body.iter().for_each(|x| self.stmt(x));
+                }
+                Stmt::Raw(_) => self.bad = true,
+                _ => {}
+            }
+        }
+    }
+    let mut fi = FindInit {
+        local,
+        allow_bigint,
+        decl_count: 0,
+        found_init: None,
+        bad: false,
+    };
+    body.iter().for_each(|s| fi.stmt(s));
+    if fi.bad || fi.decl_count != 1 {
+        return None;
+    }
+    let (init_expr, nested_elems) = fi.found_init?;
+
+    // Pass B: Collect slice aliases and (for nested elements) element aliases to a fixpoint.
+    let mut slice_aliases = BTreeSet::from([local.to_owned()]);
+    let mut elem_aliases = BTreeSet::new();
+    fn collect_aliases(
+        stmts: &[Stmt],
+        slice_aliases: &mut BTreeSet<String>,
+        elem_aliases: &mut BTreeSet<String>,
+        nested_elems: bool,
+        changed: &mut bool,
+    ) {
+        for s in stmts {
+            match s {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+                    if let Expr::Ident(dst) = lhs.as_ref() {
+                        if (is_derived_slice_expr(rhs, slice_aliases)
+                            && slice_aliases.insert(dst.clone()))
+                            || (nested_elems
+                                && is_elem_read_expr(rhs, slice_aliases)
+                                && elem_aliases.insert(dst.clone()))
+                        {
+                            *changed = true;
+                        }
+                    }
+                }
+                Stmt::Let(dst, Some(rhs)) => {
+                    if (is_derived_slice_expr(rhs, slice_aliases)
+                        && slice_aliases.insert(dst.clone()))
+                        || (nested_elems
+                            && is_elem_read_expr(rhs, slice_aliases)
+                            && elem_aliases.insert(dst.clone()))
+                    {
+                        *changed = true;
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (dst, init) in decls {
+                        if let Some(rhs) = init {
+                            if (is_derived_slice_expr(rhs, slice_aliases)
+                                && slice_aliases.insert(dst.clone()))
+                                || (nested_elems
+                                    && is_elem_read_expr(rhs, slice_aliases)
+                                    && elem_aliases.insert(dst.clone()))
+                            {
+                                *changed = true;
+                            }
+                        }
+                    }
+                }
+                Stmt::If(_, a, b) => {
+                    collect_aliases(a, slice_aliases, elem_aliases, nested_elems, changed);
+                    if let Some(b) = b {
+                        collect_aliases(b, slice_aliases, elem_aliases, nested_elems, changed);
+                    }
+                }
+                Stmt::Switch(_, cases) => {
+                    for c in cases {
+                        collect_aliases(
+                            &c.body,
+                            slice_aliases,
+                            elem_aliases,
+                            nested_elems,
+                            changed,
+                        );
+                    }
+                }
+                Stmt::Labeled(_, inner) => collect_aliases(
+                    std::slice::from_ref(inner.as_ref()),
+                    slice_aliases,
+                    elem_aliases,
+                    nested_elems,
+                    changed,
+                ),
+                Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
+                    collect_aliases(b, slice_aliases, elem_aliases, nested_elems, changed);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    collect_aliases(body, slice_aliases, elem_aliases, nested_elems, changed);
+                    collect_aliases(handler, slice_aliases, elem_aliases, nested_elems, changed);
+                }
+                _ => {}
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        collect_aliases(
+            body,
+            &mut slice_aliases,
+            &mut elem_aliases,
+            nested_elems,
+            &mut changed,
+        );
+        if !changed {
+            break;
+        }
+    }
+
+    // Pass C: Verify every use of every slice alias and element alias is strictly read-only.
+    struct Verify<'a> {
+        local: &'a str,
+        slice_aliases: &'a BTreeSet<String>,
+        elem_aliases: &'a BTreeSet<String>,
+        nested_elems: bool,
+        reads: usize,
+        bad: bool,
+    }
+    impl Verify<'_> {
+        fn stmt(&mut self, s: &Stmt) {
+            if self.bad {
+                return;
+            }
+            match s {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+                    if let Expr::Ident(dst) = lhs.as_ref() {
+                        if dst == self.local {
+                            // Single init of `local` already checked in Pass A.
+                            return;
+                        }
+                        if self.slice_aliases.contains(dst) {
+                            if is_derived_slice_expr(rhs, self.slice_aliases) {
+                                self.check_derived_slice(rhs);
+                                return;
+                            }
+                            self.bad = true;
+                            return;
+                        }
+                        if self.elem_aliases.contains(dst) {
+                            if is_elem_read_expr(rhs, self.slice_aliases) {
+                                if let Expr::Index(_, idx) = rhs.as_ref() {
+                                    self.reads += 1;
+                                    self.expr(idx, false);
+                                }
+                                return;
+                            }
+                            self.bad = true;
+                            return;
+                        }
+                    }
+                    self.expr(lhs, true);
+                    self.expr(rhs, false);
+                }
+                Stmt::ExprStmt(e) | Stmt::Throw(e) => self.expr(e, false),
+                Stmt::Let(n, Some(rhs)) => {
+                    if n == self.local {
+                        return;
+                    }
+                    if self.slice_aliases.contains(n) {
+                        if is_derived_slice_expr(rhs, self.slice_aliases) {
+                            self.check_derived_slice(rhs);
+                            return;
+                        }
+                        self.bad = true;
+                        return;
+                    }
+                    if self.elem_aliases.contains(n) {
+                        if is_elem_read_expr(rhs, self.slice_aliases) {
+                            if let Expr::Index(_, idx) = rhs {
+                                self.reads += 1;
+                                self.expr(idx, false);
+                            }
+                            return;
+                        }
+                        self.bad = true;
+                        return;
+                    }
+                    self.expr(rhs, false);
+                }
+                Stmt::Let(_, None) => {}
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if let Some(rhs) = init {
+                            if n == self.local {
+                                continue;
+                            }
+                            if self.slice_aliases.contains(n) {
+                                if is_derived_slice_expr(rhs, self.slice_aliases) {
+                                    self.check_derived_slice(rhs);
+                                    continue;
+                                }
+                                self.bad = true;
+                                return;
+                            }
+                            if self.elem_aliases.contains(n) {
+                                if is_elem_read_expr(rhs, self.slice_aliases) {
+                                    if let Expr::Index(_, idx) = rhs {
+                                        self.reads += 1;
+                                        self.expr(idx, false);
+                                    }
+                                    continue;
+                                }
+                                self.bad = true;
+                                return;
+                            }
+                            self.expr(rhs, false);
+                        }
+                    }
+                }
+                Stmt::Const(n, e) => {
+                    if self.slice_aliases.contains(n) || self.elem_aliases.contains(n) {
+                        self.bad = true;
+                        return;
+                    }
+                    self.expr(e, false);
+                }
+                Stmt::Return(Some(e)) => self.expr(e, false),
+                Stmt::Return(None) => {}
+                Stmt::If(t, a, b) => {
+                    self.expr(t, false);
+                    a.iter().for_each(|x| self.stmt(x));
+                    if let Some(b) = b {
+                        b.iter().for_each(|x| self.stmt(x));
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    self.expr(d, false);
+                    for c in cases {
+                        c.tests.iter().for_each(|t| self.expr(t, false));
+                        c.body.iter().for_each(|x| self.stmt(x));
+                    }
+                }
+                Stmt::Labeled(_, inner) => self.stmt(inner),
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => b.iter().for_each(|x| self.stmt(x)),
+                Stmt::While(t, b) => {
+                    self.expr(t, false);
+                    b.iter().for_each(|x| self.stmt(x));
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    if self.slice_aliases.contains(binding) || self.elem_aliases.contains(binding) {
+                        self.bad = true;
+                        return;
+                    }
+                    body.iter().for_each(|x| self.stmt(x));
+                    handler.iter().for_each(|x| self.stmt(x));
+                }
+                Stmt::FunctionDecl { name, params, body } => {
+                    if self.slice_aliases.contains(name)
+                        || self.elem_aliases.contains(name)
+                        || params.iter().any(|p| {
+                            self.slice_aliases.contains(p) || self.elem_aliases.contains(p)
+                        })
+                    {
+                        self.bad = true;
+                        return;
+                    }
+                    body.iter().for_each(|x| self.stmt(x));
+                }
+                Stmt::Raw(_) => self.bad = true,
+                _ => {}
+            }
+        }
+
+        fn check_derived_slice(&mut self, expr: &Expr) {
+            if let Expr::Object(entries) = expr {
+                for (k, v) in entries {
+                    if k == "buf" {
+                        self.reads += 1;
+                    } else {
+                        self.expr(v, false);
+                    }
+                }
+            } else {
+                self.reads += 1;
+            }
+        }
+
+        fn expr(&mut self, e: &Expr, is_lhs: bool) {
+            if self.bad {
+                return;
+            }
+            match e {
+                Expr::Ident(name) => {
+                    if self.slice_aliases.contains(name) || self.elem_aliases.contains(name) {
+                        self.bad = true;
+                    }
+                }
+                Expr::Member(obj, prop) => {
+                    if let Expr::Ident(name) = obj.as_ref() {
+                        if self.slice_aliases.contains(name) {
+                            if !is_lhs && matches!(prop.as_str(), "off" | "len") {
+                                self.reads += 1;
+                                return;
+                            }
+                            self.bad = true;
+                            return;
+                        }
+                        if self.elem_aliases.contains(name) {
+                            if !is_lhs {
+                                self.reads += 1;
+                                return;
+                            }
+                            self.bad = true;
+                            return;
+                        }
+                    }
+                    self.expr(obj, false);
+                }
+                Expr::Index(obj, idx) => {
+                    // `alias.buf[idx]` for scalar slices (nested element slices must assign to an
+                    // element alias or immediately project a scalar field/index).
+                    if is_elem_read_expr(e, self.slice_aliases) {
+                        if is_lhs || self.nested_elems {
+                            self.bad = true;
+                            return;
+                        }
+                        self.reads += 1;
+                        self.expr(idx, false);
+                        return;
+                    }
+                    // `elem_alias[idx]` or `alias.buf[idx][k]` (read-only scalar read of nested element).
+                    if let Expr::Ident(name) = obj.as_ref() {
+                        if self.elem_aliases.contains(name) {
+                            if is_lhs {
+                                self.bad = true;
+                                return;
+                            }
+                            self.reads += 1;
+                            self.expr(idx, false);
+                            return;
+                        }
+                    }
+                    if is_elem_read_expr(obj, self.slice_aliases) {
+                        if is_lhs {
+                            self.bad = true;
+                            return;
+                        }
+                        if let Expr::Index(_, outer_idx) = obj.as_ref() {
+                            self.reads += 1;
+                            self.expr(outer_idx, false);
+                            self.expr(idx, false);
+                            return;
+                        }
+                    }
+                    self.expr(obj, false);
+                    self.expr(idx, false);
+                }
+                Expr::Call(callee, args) if is_ptr_eq_callee(callee) && args.len() == 2 => {
+                    for a in args {
+                        if matches!(a, Expr::Ident(n) if self.slice_aliases.contains(n)) {
+                            self.reads += 1;
+                        } else {
+                            self.expr(a, false);
+                        }
+                    }
+                }
+                Expr::Call(c, args) | Expr::New(c, args) => {
+                    self.expr(c, false);
+                    args.iter().for_each(|a| self.expr(a, false));
+                }
+                Expr::Unary(_, inner) => self.expr(inner, false),
+                Expr::Binary(_, l, r) => {
+                    self.expr(l, false);
+                    self.expr(r, false);
+                }
+                Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
+                    self.expr(l, true);
+                    self.expr(r, false);
+                }
+                Expr::Cond(t, c, a) => {
+                    self.expr(t, false);
+                    self.expr(c, false);
+                    self.expr(a, false);
+                }
+                Expr::Object(entries) => entries.iter().for_each(|(_, v)| self.expr(v, false)),
+                Expr::Array(items) | Expr::Seq(items) => {
+                    items.iter().for_each(|x| self.expr(x, false));
+                }
+                Expr::Arrow(params, body) => {
+                    if params
+                        .iter()
+                        .any(|p| self.slice_aliases.contains(p) || self.elem_aliases.contains(p))
+                    {
+                        self.bad = true;
+                        return;
+                    }
+                    match body {
+                        ArrowBody::Expr(b) => self.expr(b, false),
+                        ArrowBody::Block(stmts) => stmts.iter().for_each(|s| self.stmt(s)),
+                    }
+                }
+                Expr::Raw(_) => self.bad = true,
+                _ => {}
+            }
+        }
+    }
+
+    let mut verify = Verify {
+        local,
+        slice_aliases: &slice_aliases,
+        elem_aliases: &elem_aliases,
+        nested_elems,
+        reads: 0,
+        bad: false,
+    };
+    body.iter().for_each(|s| verify.stmt(s));
+    if !verify.bad && verify.reads >= 1 {
+        Some(init_expr)
+    } else {
+        None
+    }
+}
+
 fn strip_hoisted_table_stmts(stmts: &mut Vec<Stmt>, hoisted: &BTreeSet<String>) {
     let mut out = Vec::with_capacity(stmts.len());
     for mut s in std::mem::take(stmts) {
         match &mut s {
             Stmt::ExprStmt(Expr::Assign(lhs, rhs))
                 if matches!(lhs.as_ref(), Expr::Ident(n) if hoisted.contains(n))
-                    && is_scalar_array_lit(rhs, 8, true) =>
+                    && (is_scalar_array_lit(rhs, 8, true)
+                        || is_pure_const_slice_lit(rhs, true).is_some()) =>
             {
                 continue;
             }
@@ -1017,6 +1653,10 @@ fn run_with_opts(
         for local in &declared_locals {
             if let Some(arr_expr) = find_read_only_table_init(body, local, allow_bigint) {
                 candidates.push((local.clone(), arr_expr));
+            } else if let Some(slice_expr) =
+                find_read_only_const_slice_init(body, local, allow_bigint)
+            {
+                candidates.push((local.clone(), slice_expr));
             }
         }
 
@@ -4500,6 +5140,104 @@ mod tests {
         assert!(
             cap_js.contains("let $t0;") && !cap_js.contains("$t0$lo"),
             "captured temp inside arrow must stay declared as $t0:\n{cap_js}"
+        );
+    }
+
+    #[test]
+    fn read_only_nested_const_slice_hoists_and_mutated_slice_does_not() {
+        let make_slice = || {
+            Expr::Object(vec![
+                (
+                    "buf".to_owned(),
+                    Expr::Array(
+                        (0..4)
+                            .map(|i| {
+                                Expr::Array(vec![Expr::Num(i as f64), Expr::Num((i * 10) as f64)])
+                            })
+                            .collect(),
+                    ),
+                ),
+                ("off".to_owned(), Expr::Num(0.0)),
+                ("len".to_owned(), Expr::Num(4.0)),
+            ])
+        };
+
+        // Positive: `s = { buf: [[0,0], ...], off: 0, len: 4 }; return s.buf[s.off + i][0];`
+        let fn_ro = jsast::function(
+            "read_iota",
+            vec!["i".to_owned()],
+            vec![
+                Stmt::Lets(vec![("s".to_owned(), None)]),
+                Stmt::ExprStmt(Expr::Assign(
+                    Box::new(Expr::Ident("s".to_owned())),
+                    Box::new(make_slice()),
+                )),
+                Stmt::Return(Some(Expr::Index(
+                    Box::new(Expr::Index(
+                        Box::new(Expr::Member(
+                            Box::new(Expr::Ident("s".to_owned())),
+                            "buf".to_owned(),
+                        )),
+                        Box::new(Expr::Binary(
+                            BinOp::Add,
+                            Box::new(Expr::Member(
+                                Box::new(Expr::Ident("s".to_owned())),
+                                "off".to_owned(),
+                            )),
+                            Box::new(Expr::Ident("i".to_owned())),
+                        )),
+                    )),
+                    Box::new(Expr::Num(0.0)),
+                ))),
+            ],
+        );
+
+        // Negative: mutates `s.buf[0][0] = 99` -> MUST NOT hoist!
+        let fn_mut = jsast::function(
+            "write_iota",
+            vec![],
+            vec![
+                Stmt::Lets(vec![("s".to_owned(), None)]),
+                Stmt::ExprStmt(Expr::Assign(
+                    Box::new(Expr::Ident("s".to_owned())),
+                    Box::new(make_slice()),
+                )),
+                Stmt::ExprStmt(Expr::Assign(
+                    Box::new(Expr::Index(
+                        Box::new(Expr::Index(
+                            Box::new(Expr::Member(
+                                Box::new(Expr::Ident("s".to_owned())),
+                                "buf".to_owned(),
+                            )),
+                            Box::new(Expr::Num(0.0)),
+                        )),
+                        Box::new(Expr::Num(0.0)),
+                    )),
+                    Box::new(Expr::Num(99.0)),
+                )),
+                Stmt::Return(Some(Expr::Member(
+                    Box::new(Expr::Ident("s".to_owned())),
+                    "len".to_owned(),
+                ))),
+            ],
+        );
+
+        let (consts, lowered, _, _, _) = test_run(
+            Opts {
+                optimizer: OptimizerMode::On,
+                ..Opts::default()
+            },
+            vec![("read_iota", fn_ro), ("write_iota", fn_mut)],
+        );
+        let ro_js = jsast::stmt_to_string(&lowered[0].1.as_ref().unwrap().decl);
+        let mut_js = jsast::stmt_to_string(&lowered[1].1.as_ref().unwrap().decl);
+        assert!(
+            !consts.is_empty() && ro_js.contains("$hc_"),
+            "read-only nested const slice should hoist:\nconsts={consts:?}\nro={ro_js}"
+        );
+        assert!(
+            !mut_js.contains("$hc_") && mut_js.contains("buf:"),
+            "mutated nested slice must NOT hoist:\nmut={mut_js}"
         );
     }
 }

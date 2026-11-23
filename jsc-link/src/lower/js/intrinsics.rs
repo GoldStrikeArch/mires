@@ -74,11 +74,13 @@ pub fn lower(
         ));
     };
     let result_ty = op.result.map(|result| cx.ty_of(result)).transpose()?;
+    let int32_only = op.result.is_some_and(|result| cx.is_int32_only(result));
     let mut intrinsic = Intrinsic {
         cx,
         types,
         args,
         result_ty,
+        int32_only,
         track_caller,
         captured: None,
         prelude: RefCell::new(Vec::new()),
@@ -142,6 +144,7 @@ struct Intrinsic<'a, 'b> {
     types: &'a [TypeId],
     args: &'a [ValueId],
     result_ty: Option<TypeId>,
+    int32_only: bool,
     track_caller: Option<SourceFactId>,
     captured: Option<Vec<Expr>>,
     prelude: RefCell<Vec<Stmt>>,
@@ -788,7 +791,22 @@ impl Intrinsic<'_, '_> {
     fn arithmetic(&self, name: &str, int: Int) -> Res<Outcome> {
         let lhs = self.arg(0)?;
         let rhs = self.arg(1)?;
-        let truncate = |value: Expr| value::mask(int.repr, int.signed, int.bits, value);
+        let int32_only =
+            self.int32_only && int.repr == IntRepr::Number && !int.signed && int.bits == 32;
+        let truncate = |value: Expr| {
+            if int32_only {
+                value::simplify_i32_wrap(value)
+            } else {
+                value::mask(int.repr, int.signed, int.bits, value)
+            }
+        };
+        let strip32 = |e: Expr| {
+            if int.repr == IntRepr::Number && int.bits == 32 {
+                value::strip_32bit_wrap(e)
+            } else {
+                e
+            }
+        };
         Ok(match name {
             "wrapping_add" | "unchecked_add" => {
                 Outcome::Value(truncate(jsast::binary(BinOp::Add, lhs, rhs)))
@@ -796,19 +814,29 @@ impl Intrinsic<'_, '_> {
             "wrapping_sub" | "unchecked_sub" => {
                 Outcome::Value(truncate(jsast::binary(BinOp::Sub, lhs, rhs)))
             }
-            "wrapping_mul" | "unchecked_mul" => Outcome::Value(truncate(int.multiply(lhs, rhs))),
+            "wrapping_mul" | "unchecked_mul" => {
+                Outcome::Value(truncate(int.multiply(strip32(lhs), strip32(rhs))))
+            }
             "unchecked_div" | "exact_div" => {
                 Outcome::Value(truncate(jsast::binary(BinOp::Div, lhs, rhs)))
             }
             "unchecked_rem" => Outcome::Value(truncate(jsast::binary(BinOp::Rem, lhs, rhs))),
-            "disjoint_bitor" => Outcome::Value(truncate(jsast::binary(BinOp::BitOr, lhs, rhs))),
+            "disjoint_bitor" => Outcome::Value(truncate(jsast::binary(
+                BinOp::BitOr,
+                strip32(lhs),
+                strip32(rhs),
+            ))),
             "unchecked_shl" => {
                 let amount = self.shift_amount(int, rhs)?;
-                Outcome::Value(truncate(jsast::binary(BinOp::Shl, lhs, amount)))
+                Outcome::Value(truncate(jsast::binary(
+                    BinOp::Shl,
+                    strip32(lhs),
+                    strip32(amount),
+                )))
             }
             "unchecked_shr" => {
                 let amount = self.shift_amount(int, rhs)?;
-                Outcome::Value(truncate(int.shift_right(lhs, amount)))
+                Outcome::Value(truncate(int.shift_right(strip32(lhs), strip32(amount))))
             }
             "saturating_add" | "saturating_sub" => {
                 self.saturating(name == "saturating_add", int)?
@@ -866,6 +894,56 @@ impl Intrinsic<'_, '_> {
     /// constants: `amount & (bits - 1)` is then a number literal, which needs no temporary and
     /// widens to a BigInt constant (`JsCx::to_bigint`) rather than a `BigInt(..)` call per use.
     fn rotate(&self, left: bool, int: Int) -> Res<Outcome> {
+        let int32_only =
+            self.int32_only && int.repr == IntRepr::Number && !int.signed && int.bits == 32;
+        if int.repr == IntRepr::Number && int.bits == 32 {
+            let raw = value::strip_32bit_wrap(self.arg(0)?);
+            let value = if matches!(raw, Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_)) {
+                raw
+            } else {
+                self.temp(raw)
+            };
+            let expr = if let Some(shift) = self.constant_u32(1) {
+                let k = shift & 31;
+                if k == 0 {
+                    value
+                } else {
+                    let (up, down) = if left { (k, 32 - k) } else { (32 - k, k) };
+                    jsast::binary(
+                        BinOp::BitOr,
+                        jsast::binary(BinOp::Shl, value.clone(), jsast::num(up)),
+                        jsast::binary(BinOp::UShr, value, jsast::num(down)),
+                    )
+                }
+            } else {
+                let amount = self.temp(jsast::binary(
+                    BinOp::BitAnd,
+                    value::strip_32bit_wrap(self.arg(1)?),
+                    jsast::num(31.0),
+                ));
+                let (up, down) = if left {
+                    (
+                        amount.clone(),
+                        jsast::binary(BinOp::Sub, jsast::num(32.0), amount),
+                    )
+                } else {
+                    (
+                        jsast::binary(BinOp::Sub, jsast::num(32.0), amount.clone()),
+                        amount,
+                    )
+                };
+                jsast::binary(
+                    BinOp::BitOr,
+                    jsast::binary(BinOp::Shl, value.clone(), up),
+                    jsast::binary(BinOp::UShr, value, down),
+                )
+            };
+            return Ok(Outcome::Value(if int32_only {
+                value::simplify_i32_wrap(expr)
+            } else {
+                value::mask(int.repr, int.signed, int.bits, expr)
+            }));
+        }
         let value = self.temp(int.zero_extend(self.arg(0)?));
         let constant = match int.repr {
             IntRepr::BigInt if self.cx.hoists_bigints() => self.constant_u32(1),
@@ -1686,11 +1764,18 @@ impl Intrinsic<'_, '_> {
     /// materializing intrinsic, a constant included (`fuse.rs`), so the value is read off the
     /// operand's own definition rather than off its spelling.
     fn constant_u32(&self, index: usize) -> Option<u32> {
-        let op = self.cx.def_of(*self.args.get(index)?)?;
-        match &op.kind {
-            OpKind::Const(ConstTree::Scalar { bits, bytes: 4 }) => u32::try_from(*bits).ok(),
-            _ => None,
+        let mut cur = *self.args.get(index)?;
+        for _ in 0..8 {
+            let op = self.cx.def_of(cur)?;
+            match &op.kind {
+                OpKind::Const(ConstTree::Scalar { bits, bytes: 4 }) => {
+                    return u32::try_from(*bits).ok();
+                }
+                OpKind::Copy(src) | OpKind::Move(src) => cur = *src,
+                _ => return None,
+            }
         }
+        None
     }
 
     /// The type of one argument.
