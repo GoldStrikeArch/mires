@@ -1109,10 +1109,13 @@ globalThis.__rt._bytes = (p) => {
   if (p === null || typeof p !== "object" || p.sc !== undefined) return p;
   if (globalThis.__rt._bv !== null) return globalThis.__rt._bv.bytes(p);
   const block = globalThis.__rt._heap_block(p.buf);
-  if (block === undefined || block.typed === undefined || p.buf === block.typed || block.hdr !== undefined) {
-    return p;
+  if (block === undefined || block.hdr !== undefined) return p;
+  if (block.typed !== undefined) {
+    if (p.buf === block.typed) return p;
+    return { buf: block.typed, off: p.off, sc: block.es };
   }
-  return { buf: block.typed, off: p.off, sc: block.es };
+  if (block.es === 1) return p;
+  return { buf: p.buf, off: p.off * block.es, sc: block.es };
 };
 
 // compare_bytes(a, b, count): the lexicographic comparison of `count` bytes, as
@@ -2495,9 +2498,19 @@ globalThis.__rt.unscale = (p, size, mk, cl) => {
     const buf = globalThis.__rt._bv !== null ? globalThis.__rt._bv.unwrap_buf(p.buf) : p.buf;
     return { buf, off: p.off / size };
   }
-  const rawBuf = globalThis.__rt._bv !== null ? globalThis.__rt._bv.unwrap_buf(p.buf) : p.buf;
-  const block = globalThis.__rt._heap_block(rawBuf);
-  if (block !== undefined) return globalThis.__rt._retype(p, block, size, mk, undefined, cl);
+  if (globalThis.__rt._bv === null) {
+    const block = globalThis.__rt._heap_block(p.buf);
+    if (block !== undefined) {
+      if (block.es === size && !block.fresh && block.typed === undefined && p.off === 0 && (cl === undefined || block.cl !== undefined)) {
+        return p;
+      }
+      return globalThis.__rt._retype(p, block, size, mk, undefined, cl);
+    }
+  } else {
+    const rawBuf = globalThis.__rt._bv.unwrap_buf(p.buf);
+    const block = globalThis.__rt._heap_block(rawBuf);
+    if (block !== undefined) return globalThis.__rt._retype(p, block, size, mk, undefined, cl);
+  }
   throw __rt.abort_error(new Error(
     "rustc_codegen_js: this pointer is not a byte view of " + size +
       "-byte elements, so it cannot be cast back to one",
@@ -2517,6 +2530,9 @@ globalThis.__rt.unscale_scalar = (p, size, mk, kind) => {
     const block = globalThis.__rt._heap_block(p.buf);
     if (block === undefined || (block.es === 1 && !block.fresh)) {
       return globalThis.__rt._scalar_view(p, size, kind);
+    }
+    if (globalThis.__rt._bv === null && block.es === size && !block.fresh && block.typed === undefined && p.off === 0) {
+      return p;
     }
     return globalThis.__rt._retype(p, block, size, mk, kind);
   }
@@ -4919,14 +4935,15 @@ globalThis.__rt._heap_block = (buf) => {
 // outside the complete-element view; the allocation retains its full byte size.
 // Zeroed partial elements stay unsupported because their byte values need storage.
 globalThis.__rt._retype = (p, block, size, mk, kind, cl) => {
-  const raw = globalThis.__rt._bv !== null ? globalThis.__rt._bv.unwrap_buf(p.buf) : p.buf;
+  const bv = globalThis.__rt._bv;
+  const raw = bv !== null ? bv.unwrap_buf(p.buf) : p.buf;
   const fromBv = raw !== p.buf;
   const isRaw = block.typed !== undefined && raw !== block.typed;
   const active = block.typed !== undefined ? block.typed : raw;
   const same = block.es === size;
   if (same && !(block.fresh && block.zeroed)) {
     if (cl !== undefined && block.cl === undefined) block.cl = cl;
-    if (isRaw || fromBv) {
+    if (isRaw || fromBv || (bv === null && size > 1 && p.off !== 0)) {
       if (size > 1 && p.off !== 0) {
         if (p.off % size !== 0) throw __rt.abort_error(new Error("rustc_codegen_js: byte offset " + p.off + " is not a multiple of " + size + ", so it does not name an element"));
         return { buf: active, off: p.off / size };
@@ -4944,29 +4961,41 @@ globalThis.__rt._retype = (p, block, size, mk, kind, cl) => {
   const length = Math.floor(block.bytes / size);
   let target = active;
   if (!same) {
-    const typed = new Array(length);
-    raw.length = 0;
-    block.raw = raw; block.typed = typed; block.es = size;
-    if (kind !== undefined) block.sk = kind;
-    if (cl !== undefined) block.cl = cl;
-    if (block.uninit) {
-      globalThis.__rt._uninit_blocks.set(typed, block);
+    if (bv === null) {
+      raw.length = length;
+      block.es = size;
+      if (kind !== undefined) block.sk = kind;
+      if (cl !== undefined) block.cl = cl;
+      target = raw;
+      if (!block.zeroed && block.bytes === size && typeof mk === "function") {
+        const shell = mk();
+        if (shell !== null && typeof shell === "object") globalThis.__rt._put(raw, 0, shell);
+      }
     } else {
-      globalThis.__rt._blocks.set(typed, block);
-      _blkK = typed; _blkV = block;
-      if (_has_minted_addrs) {
-        const base = globalThis.__rt._addrs.get(raw);
-        if (base !== undefined) {
-          globalThis.__rt._addrs.set(typed, base);
-          const k = globalThis.__rt._addrHeap.get(raw);
-          if (k !== undefined) { globalThis.__rt._addrHeap.set(typed, k); globalThis.__rt._addrHeap.delete(raw); }
+      const typed = new Array(length);
+      raw.length = 0;
+      block.raw = raw; block.typed = typed; block.es = size;
+      if (kind !== undefined) block.sk = kind;
+      if (cl !== undefined) block.cl = cl;
+      if (block.uninit) {
+        globalThis.__rt._uninit_blocks.set(typed, block);
+      } else {
+        globalThis.__rt._blocks.set(typed, block);
+        _blkK = typed; _blkV = block;
+        if (_has_minted_addrs) {
+          const base = globalThis.__rt._addrs.get(raw);
+          if (base !== undefined) {
+            globalThis.__rt._addrs.set(typed, base);
+            const k = globalThis.__rt._addrHeap.get(raw);
+            if (k !== undefined) { globalThis.__rt._addrHeap.set(typed, k); globalThis.__rt._addrHeap.delete(raw); }
+          }
         }
       }
-    }
-    target = typed;
-    if (!block.zeroed && block.bytes === size && typeof mk === "function") {
-      const shell = mk();
-      if (shell !== null && typeof shell === "object") globalThis.__rt._put(typed, 0, shell);
+      target = typed;
+      if (!block.zeroed && block.bytes === size && typeof mk === "function") {
+        const shell = mk();
+        if (shell !== null && typeof shell === "object") globalThis.__rt._put(typed, 0, shell);
+      }
     }
   } else if (cl !== undefined && block.cl === undefined) block.cl = cl;
   block.fresh = false;
@@ -4978,7 +5007,7 @@ globalThis.__rt._retype = (p, block, size, mk, kind, cl) => {
       if (v !== null && typeof v === "object" && !block.uninit && globalThis.__rt._boxes !== null) globalThis.__rt._boxes.set(v, { buf: target, off: i });
     }
   }
-  return same && !fromBv && !isRaw ? p : { buf: target, off: byte_off / size };
+  return !fromBv && !isRaw && (same || (bv === null && byte_off === 0)) ? p : { buf: target, off: byte_off / size };
 };
 
 // unscale_uninit(p, size, mk): the `MaybeUninit<u8>` storage form of
@@ -5210,6 +5239,7 @@ globalThis.__rt.realloc = (p, size, align, new_size) => {
   active.length = new_size / block.es;
   globalThis.__rt._addr_release(active, new_size);
   if (p.sc !== undefined) {
+    if (globalThis.__rt._bv === null && p.off === 0) return { buf: active, off: 0 };
     let raw = block.raw;
     if (raw === undefined) {
       raw = [];
@@ -6809,7 +6839,7 @@ globalThis.__rt.convert_nv_block = (nv, size, kind) => {
     }
   }
   block.fresh = false;
-  if (size > 1) {
+  if (size > 1 && globalThis.__rt._bv !== null) {
     const raw = [];
     block.raw = raw;
     block.typed = copy;
@@ -6983,31 +7013,74 @@ globalThis.__rt.i2f32_big = (x) => {
 // permutation even for inconsistent/NaN comparators).
 globalThis.__rt.slice_sort = (buf, off, len, isLess, cmpFn, isIndirect) => {
   if (len < 2) return;
-  let a = new Array(len);
-  let b = new Array(len);
-  for (let i = 0; i < len; i++) a[i] = i;
-  const ref = isIndirect
-    ? (i) => buf[off + i]
-    : (i) => ({ buf: buf, off: off + i });
-  for (let w = 1; w < len; w *= 2) {
-    for (let lo = 0; lo < len; lo += 2 * w) {
-      const mid = lo + w < len ? lo + w : len;
-      const hi = lo + 2 * w < len ? lo + 2 * w : len;
-      let i = lo;
-      let j = mid;
-      let k = lo;
-      if (mid < hi && cmpFn(isLess, ref(a[mid]), ref(a[mid - 1]))) {
-        while (i < mid && j < hi) {
-          b[k++] = cmpFn(isLess, ref(a[j]), ref(a[i])) ? a[j++] : a[i++];
-        }
+  if (len === 2) {
+    const r0 = isIndirect ? buf[off] : { buf: buf, off: off };
+    const r1 = isIndirect ? buf[off + 1] : { buf: buf, off: off + 1 };
+    if (cmpFn(isLess, r1, r0)) {
+      const v0 = buf[off];
+      const v1 = buf[off + 1];
+      buf[off] = v1;
+      buf[off + 1] = v0;
+      const boxes = globalThis.__rt._boxes;
+      if (boxes !== null && isIndirect && globalThis.__rt._blk_get(buf) !== undefined) {
+        if (v1 !== null && typeof v1 === "object") boxes.set(v1, { buf: buf, off: off });
+        if (v0 !== null && typeof v0 === "object") boxes.set(v0, { buf: buf, off: off + 1 });
       }
-      while (i < mid) b[k++] = a[i++];
-      while (j < hi) b[k++] = a[j++];
     }
-    const t = a;
-    a = b;
-    b = t;
+    return;
   }
+  const refs = new Array(len);
+  let a = new Array(len);
+  if (isIndirect) {
+    for (let i = 0; i < len; i++) { a[i] = i; refs[i] = buf[off + i]; }
+  } else {
+    for (let i = 0; i < len; i++) { a[i] = i; refs[i] = { buf: buf, off: off + i }; }
+  }
+  const RUN = 16;
+  for (let start = 0; start < len; start += RUN) {
+    const end = start + RUN < len ? start + RUN : len;
+    for (let i = start + 1; i < end; i++) {
+      const idx = a[i];
+      const ri = refs[idx];
+      let j = i - 1;
+      if (cmpFn(isLess, ri, refs[a[j]])) {
+        a[j + 1] = a[j];
+        j--;
+        while (j >= start && cmpFn(isLess, ri, refs[a[j]])) {
+          a[j + 1] = a[j];
+          j--;
+        }
+        a[j + 1] = idx;
+      }
+    }
+  }
+  if (len > RUN) {
+    let b = new Array(len);
+    for (let w = RUN; w < len; w *= 2) {
+      for (let lo = 0; lo < len; lo += 2 * w) {
+        const mid = lo + w < len ? lo + w : len;
+        const hi = lo + 2 * w < len ? lo + 2 * w : len;
+        let i = lo;
+        let j = mid;
+        let k = lo;
+        if (mid < hi && cmpFn(isLess, refs[a[mid]], refs[a[mid - 1]])) {
+          while (i < mid && j < hi) {
+            b[k++] = cmpFn(isLess, refs[a[j]], refs[a[i]]) ? a[j++] : a[i++];
+          }
+        }
+        while (i < mid) b[k++] = a[i++];
+        while (j < hi) b[k++] = a[j++];
+      }
+      const t = a;
+      a = b;
+      b = t;
+    }
+  }
+  let changed = false;
+  for (let i = 0; i < len; i++) {
+    if (a[i] !== i) { changed = true; break; }
+  }
+  if (!changed) return;
   const tmp = new Array(len);
   for (let i = 0; i < len; i++) tmp[i] = buf[off + i];
   const boxes = globalThis.__rt._boxes;

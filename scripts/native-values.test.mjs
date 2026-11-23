@@ -887,11 +887,13 @@ test("ordinary Vec/Box allocs stay Proxy-free and minimal-shim excludes byte-vie
 test("minimal-shim ptr_eq/addr (_bv === null), scaled realloc non-scalar abort, and post-retype byte_slice_ref", () => {
   const shimSource = readFileSync(new URL("../runtime/shim.js", import.meta.url), "utf8");
 
-  // 1. Minimal shim with _bv === null: ptr_eq and addr unwrap _boxes, _scalar_view_of,
-  //    and two-array raw vs typed blocks without pulling _bv_enable or _byte_view.
+  // 1. Minimal shim with _bv === null: ptr_eq and addr unwrap _boxes and _scalar_view_of,
+  //    and wide heap blocks retype in-place (zero-allocation unscale, single array) without
+  //    pulling _bv_enable or _byte_view.
   const minDirect = [
-    "alloc", "dealloc", "unscale", "unscale_scalar", "box",
-    "ptr_eq", "addr", "slice_from_parts", "byte_slice_ref",
+    "alloc", "realloc", "dealloc", "scale", "unscale", "unscale_scalar", "box",
+    "ptr_eq", "addr", "slice_from_parts", "byte_slice_ref", "compare_bytes",
+    "convert_nv_block", "slice_sort", "is_abort",
   ];
   const min = minimalShim([], shimSource, { direct: minDirect });
   assert.equal(min.names.includes("_bv_enable"), false, "minimal shim must exclude _bv_enable");
@@ -915,13 +917,54 @@ test("minimal-shim ptr_eq/addr (_bv === null), scaled realloc non-scalar abort, 
   assert.equal(mrt.ptr_eq({ buf: bytes, off: 4 }, { buf: sv.buf, off: 1 }), true);
   assert.equal(mrt.ptr_eq({ buf: bytes, off: 1 }, sv), false);
 
-  // Two-array raw vs typed block
+  // In-place retype when _bv === null: zero-allocation unscale + _bytes compare_bytes + realloc + dealloc
   const raw = mrt.alloc(16, 4);
   const typed = mrt.unscale_scalar(raw, 4, () => 0, "u32");
+  assert.equal(typed, raw, "in-place retype when _bv === null must return the same slot");
+  assert.equal(mrt.unscale(raw, 4), raw, "subsequent unscale when _bv === null must not allocate");
+  assert.equal(typed.buf.length, 4);
+  typed.buf[0] = 10; typed.buf[1] = 20; typed.buf[2] = 30; typed.buf[3] = 40;
   assert.equal(mrt.ptr_eq(raw, typed), true);
-  assert.equal(mrt.ptr_eq({ buf: raw.buf, off: 4 }, { buf: typed.buf, off: 1 }), true);
-  assert.equal(mrt.ptr_eq({ buf: raw.buf, off: 2 }, typed), false);
-  mrt.dealloc(raw, 16, 4);
+  assert.equal(mrt.ptr_eq({ buf: typed.buf, off: 4, sc: 4 }, { buf: typed.buf, off: 1 }), true);
+  assert.equal(mrt.ptr_eq({ buf: typed.buf, off: 2, sc: 4 }, typed), false);
+  // GVN-folded RawVecInner pointer (`raw`, no `.sc`) compared against a scaled slice of u32s
+  const scaledOther = mrt.scale({ buf: [10, 20, 30, 40], off: 0 }, 4);
+  assert.equal(mrt.compare_bytes(raw, scaledOther, 16), 0);
+  const scaledDiff = mrt.scale({ buf: [10, 20, 99, 40], off: 0 }, 4);
+  assert.notEqual(mrt.compare_bytes(raw, scaledDiff, 16), 0);
+  // Scaled realloc under _bv === null keeps single in-place array
+  const grownMin = mrt.realloc(mrt.scale(typed, 4), 16, 4, 32);
+  assert.equal(grownMin.buf, typed.buf);
+  assert.equal(grownMin.buf.length, 8);
+  assert.equal(mrt.unscale(grownMin, 4), grownMin);
+  mrt.dealloc(grownMin, 32, 4);
+  assert.throws(() => mrt.unscale(grownMin, 4), (err) => mrt.is_abort(err));
+  // convert_nv_block under _bv === null skips raw/typed split
+  const nvPtr = mrt.convert_nv_block({ buf: [7, 8, 9], len: 3, cap: 4 }, 4, "u32");
+  assert.equal(mrt.unscale(nvPtr, 4), nvPtr);
+  assert.equal(nvPtr.buf[2], 9);
+  mrt.dealloc(nvPtr, 16, 4);
+  // slice_sort fast paths: len=2, len=16, len=40 (stability + panic safety)
+  const s2 = [9, 2];
+  mrt.slice_sort(s2, 0, 2, null, (_c, a, b) => a.buf[a.off] < b.buf[b.off], false);
+  assert.deepEqual(s2, [2, 9]);
+  const s40 = Array.from({ length: 40 }, (_, i) => ({ k: (40 - i) % 7, id: i }));
+  mrt.slice_sort(s40, 0, 40, null, (_c, a, b) => a.k < b.k, true);
+  for (let i = 1; i < 40; i++) {
+    assert.ok(s40[i - 1].k < s40[i].k || (s40[i - 1].k === s40[i].k && s40[i - 1].id < s40[i].id));
+  }
+  const sThrow = [3, 1, 2];
+  assert.throws(() => mrt.slice_sort(sThrow, 0, 3, null, () => { throw new Error("boom"); }, false));
+  assert.deepEqual(sThrow, [3, 1, 2]);
+
+  // 1b. Full shim (_bv !== null): two-array raw vs typed block ptr_eq
+  const fullRaw = rt.alloc(16, 4);
+  const fullTyped = rt.unscale_scalar(fullRaw, 4, () => 0, "u32");
+  assert.notEqual(fullRaw.buf, fullTyped.buf);
+  assert.equal(rt.ptr_eq(fullRaw, fullTyped), true);
+  assert.equal(rt.ptr_eq({ buf: fullRaw.buf, off: 4 }, { buf: fullTyped.buf, off: 1 }), true);
+  assert.equal(rt.ptr_eq({ buf: fullRaw.buf, off: 2 }, fullTyped), false);
+  rt.dealloc(fullRaw, 16, 4);
 
   // 2. Full shim: realloc on a scaled non-scalar pointer MUST preserve `.sc` so reading/slicing
   //    or writing bytes through the grown pointer still aborts fail-closed.

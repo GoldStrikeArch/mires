@@ -565,8 +565,8 @@ fn analyze_func(
     let mut scalar_bv = false;
     let mut unscale_uninit_casts: Vec<(ValueId, Option<ValueId>)> = Vec::new(); // (src, res)
     let mut wide_rawvec_byte_ptrs: Vec<(ValueId, u64)> = Vec::new();
-    let mut non_scalar_scales: Vec<ValueId> = Vec::new();
-    let mut scalar_scales: Vec<(ValueId, Option<ScalarOrigin>)> = Vec::new();
+    let mut non_scalar_scales: Vec<(ValueId, u64, TypeId)> = Vec::new();
+    let mut scalar_scales: Vec<(ValueId, u64, TypeId, Option<ScalarOrigin>)> = Vec::new();
 
     for block in &func.blocks {
         if !reached.contains(&block.id) {
@@ -713,15 +713,20 @@ fn analyze_func(
         }
     }
 
-    let scalar_origins = propagate_scalar_origins(func, &reached, ty_table, &scalar_scales);
+    let scalar_scale_origins: Vec<(ValueId, Option<ScalarOrigin>)> = scalar_scales
+        .iter()
+        .map(|&(val, _, _, origin)| (val, origin))
+        .collect();
+    let scalar_origins = propagate_scalar_origins(func, &reached, ty_table, &scalar_scale_origins);
 
-    for val in non_scalar_scales {
+    for (val, elem_size, eff_from) in non_scalar_scales {
         if let Some(why) = scale_value_escapes(
             func,
             ty_table,
             interns,
             items,
             std_crate_ids,
+            in_stdlib_alloc,
             &def_map,
             &uses,
             &cell_reads,
@@ -729,6 +734,8 @@ fn analyze_func(
             &u_consts,
             &scalar_origins,
             val,
+            elem_size,
+            eff_from,
             None,
             debug,
         ) {
@@ -743,13 +750,14 @@ fn analyze_func(
         }
     }
 
-    for (val, origin) in scalar_scales {
+    for (val, elem_size, eff_from, origin) in scalar_scales {
         if let Some(why) = scale_value_escapes(
             func,
             ty_table,
             interns,
             items,
             std_crate_ids,
+            in_stdlib_alloc,
             &def_map,
             &uses,
             &cell_reads,
@@ -757,6 +765,8 @@ fn analyze_func(
             &u_consts,
             &scalar_origins,
             val,
+            elem_size,
+            eff_from,
             origin,
             debug,
         ) {
@@ -935,12 +945,31 @@ fn is_stdlib_alloc_wrapper(item: &LinkItem, std_crate_ids: &BTreeSet<u64>) -> bo
         || path.starts_with("<alloc::Global as ")
         || path.starts_with("<alloc::alloc::Global as ")
         || path.starts_with("alloc::raw_vec::")
-        || path.starts_with("raw_vec::RawVecInner")
+        || path.starts_with("raw_vec::")
         || path.starts_with("alloc::boxed::")
+        || path.starts_with("<alloc::boxed::")
+        || path.starts_with("boxed::")
+        || path.starts_with("<boxed::")
         || path.starts_with("alloc::rc::")
         || path.starts_with("<alloc::rc::")
+        || path.starts_with("rc::")
+        || path.starts_with("<rc::")
         || path.starts_with("alloc::sync::")
         || path.starts_with("<alloc::sync::")
+        || path.starts_with("sync::")
+        || path.starts_with("<sync::")
+        || path.starts_with("alloc::vec::")
+        || path.starts_with("<alloc::vec::")
+        || path.starts_with("vec::")
+        || path.starts_with("<vec::")
+        || path.starts_with("alloc::string::")
+        || path.starts_with("<alloc::string::")
+        || path.starts_with("string::")
+        || path.starts_with("<string::")
+        || path.starts_with("alloc::slice::")
+        || path.starts_with("slice::")
+        || path.contains(" as alloc::slice::")
+        || path.contains(" as slice::")
 }
 
 fn is_direct_alloc_callee(
@@ -1060,8 +1089,8 @@ fn classify_cast(
     from: TypeId,
     to: TypeId,
     result: Option<ValueId>,
-    non_scalar_scales: &mut Vec<ValueId>,
-    scalar_scales: &mut Vec<(ValueId, Option<ScalarOrigin>)>,
+    non_scalar_scales: &mut Vec<(ValueId, u64, TypeId)>,
+    scalar_scales: &mut Vec<(ValueId, u64, TypeId, Option<ScalarOrigin>)>,
     unscale_uninit_casts: &mut Vec<(ValueId, Option<ValueId>)>,
 ) -> Option<(bool, &'static str)> {
     let (Some(fp), Some(tp)) = (value::pointee_of(table, from), value::pointee_of(table, to))
@@ -1115,20 +1144,22 @@ fn classify_cast(
     };
     let eff_from_size = value::size_of(table, eff_from);
 
-    if to_size == Some(1) && !table.is_indirect(to_p) && eff_from_size.is_some_and(|s| s > 1) {
-        if is_byte_int(table, to_p) {
-            if let Some(origin) = scalar_view_origin(table, eff_from) {
-                if let Some(res) = result {
-                    scalar_scales.push((res, origin));
-                    return None;
+    if to_size == Some(1) && !table.is_indirect(to_p) {
+        if let Some(es) = eff_from_size.filter(|&s| s > 1) {
+            if is_byte_int(table, to_p) {
+                if let Some(origin) = scalar_view_origin(table, eff_from) {
+                    if let Some(res) = result {
+                        scalar_scales.push((res, es, eff_from, origin));
+                        return None;
+                    }
+                    return Some((false, "scale_scalar_no_result"));
                 }
-                return Some((false, "scale_scalar_no_result"));
             }
-        }
-        if let Some(res) = result {
-            non_scalar_scales.push(res);
-        } else {
-            return Some((true, "scale_no_result"));
+            if let Some(res) = result {
+                non_scalar_scales.push((res, es, eff_from));
+            } else {
+                return Some((true, "scale_no_result"));
+            }
         }
     }
 
@@ -2179,6 +2210,54 @@ fn only_used_for_zero_equality(
     true
 }
 
+/// True if `ty` is a wide stdlib `Vec<T>` or `RawVec<T>` whose element type matches
+/// `(elem_size, eff_from, expected_origin)`. Sealing a scaled byte pointer into such a container
+/// outside `in_stdlib_alloc` is safe because Rule 5 (`wide_rawvec_byte_ptrs`) guards any
+/// later extraction of its internal `RawVecInner` byte pointer, and `classify_cast` guards any
+/// later `*const T -> *const u8` cast.
+fn is_sealed_wide_vec_container(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+    std_crate_ids: &BTreeSet<u64>,
+    elem_size: u64,
+    eff_from: TypeId,
+    expected_origin: Option<ScalarOrigin>,
+) -> bool {
+    if elem_size <= 1 {
+        return false;
+    }
+    let mut cur = table.peeled(ty);
+    if let Some(p) = value::pointee_of(table, cur) {
+        cur = table.peeled(p);
+    }
+    let Some(desc) = table.get(cur) else {
+        return false;
+    };
+    let TypeKind::Adt { args, .. } = &desc.kind else {
+        return false;
+    };
+    let is_vec_or_rawvec = matches!(desc.meta.candidate, RepresentationCandidate::Vec)
+        || (is_std_adt(table, cur, std_crate_ids)
+            && matches!(adt_short_name(table, interns, cur), "Vec" | "RawVec"));
+    if !is_vec_or_rawvec {
+        return false;
+    }
+    let Some(&elem) = args.first() else {
+        return false;
+    };
+    if let Some(orig) = expected_origin {
+        return scalar_view_origin(table, elem) == Some(Some(orig));
+    }
+    if let Some(TypeKind::Float { bits }) = value::kind(table, eff_from) {
+        return matches!(
+            value::kind(table, table.peeled(elem)),
+            Some(TypeKind::Float { bits: eb }) if eb == bits
+        );
+    }
+    scalar_view_origin(table, elem).is_none() && value::size_of(table, elem) == Some(elem_size)
+}
+
 /// Checks whether a `scale` / `scale_scalar` result escapes outside wide stdlib container
 /// plumbing (`RawVec`/`Vec`/`Box`/`IntoIter`/`dealloc`/`realloc`), or (when `origin` is
 /// `Some(ScalarOrigin)`) same-type whole-element `compare_bytes(a, b, n) == 0 / != 0`.
@@ -2190,6 +2269,7 @@ fn scale_value_escapes(
     interns: &Interns,
     items: &BTreeMap<JsName, LinkItem>,
     std_crate_ids: &BTreeSet<u64>,
+    in_stdlib_alloc: bool,
     def_map: &BTreeMap<ValueId, &Op>,
     uses: &BTreeMap<ValueId, Vec<UseSite<'_>>>,
     cell_reads: &BTreeMap<CellId, Vec<ValueId>>,
@@ -2197,6 +2277,8 @@ fn scale_value_escapes(
     u_consts: &BTreeMap<ValueId, u128>,
     scalar_origins: &BTreeMap<ValueId, Option<ScalarOrigin>>,
     start: ValueId,
+    elem_size: u64,
+    eff_from: TypeId,
     origin: Option<ScalarOrigin>,
     debug: bool,
 ) -> Option<&'static str> {
@@ -2235,6 +2317,21 @@ fn scale_value_escapes(
                         if let Some(res) = op.result {
                             queue.push(res);
                         }
+                    }
+                    OpKind::Aggregate { ty, .. }
+                        if !in_stdlib_alloc
+                            && is_sealed_wide_vec_container(
+                                table,
+                                interns,
+                                *ty,
+                                std_crate_ids,
+                                elem_size,
+                                eff_from,
+                                origin,
+                            ) =>
+                    {
+                        // Sealed inside a matching wide `Vec<T>` / `RawVec<T>`; Rule 5 guards
+                        // any subsequent extraction of its internal `RawVecInner` byte pointer.
                     }
                     OpKind::Aggregate { ty, .. }
                         if is_wrapper_aggregate(table, interns, *ty, std_crate_ids) =>
@@ -2971,6 +3068,226 @@ mod tests {
             t_u32_ptr,
             Some(4),
             Some(u32_origin)
+        ));
+    }
+
+    #[test]
+    fn sealed_wide_vec_container_enforces_std_identity_and_element_match() {
+        let mut interns = Interns::default();
+        let s_vec = interns.intern_str("Vec");
+        let mut table = TypeTable::new();
+        let std_crate = 100u64;
+        let user_crate = 999u64;
+        let std_crates = BTreeSet::from([std_crate]);
+
+        let t_u8 = TypeId(0);
+        let t_u16 = TypeId(1);
+        let t_i16 = TypeId(2);
+        let t_u32 = TypeId(3);
+        let t_f32 = TypeId(4);
+        let t_f64 = TypeId(5);
+        let t_rc_like = TypeId(6);
+        table.insert(make_desc(
+            0,
+            TypeKind::Integer {
+                signed: false,
+                bits: 8,
+            },
+            1,
+            Some((false, 8)),
+        ));
+        table.insert(make_desc(
+            1,
+            TypeKind::Integer {
+                signed: false,
+                bits: 16,
+            },
+            2,
+            Some((false, 16)),
+        ));
+        table.insert(make_desc(
+            2,
+            TypeKind::Integer {
+                signed: true,
+                bits: 16,
+            },
+            2,
+            Some((true, 16)),
+        ));
+        table.insert(make_desc(
+            3,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            4,
+            Some((false, 32)),
+        ));
+        table.insert(make_desc(4, TypeKind::Float { bits: 32 }, 4, None));
+        table.insert(make_desc(5, TypeKind::Float { bits: 64 }, 8, None));
+        table.insert(make_desc(
+            6,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: std_crate,
+                    local_hash: 77,
+                },
+                args: vec![],
+                form: NominalForm::Struct,
+                variants: vec![],
+                niche: None,
+            },
+            4,
+            None,
+        ));
+
+        let make_vec = |id: u128, crate_id: u64, elem: TypeId| {
+            make_desc(
+                id,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id,
+                        local_hash: 10,
+                    },
+                    args: vec![elem],
+                    form: NominalForm::Struct,
+                    variants: vec![VariantDescriptor {
+                        name: s_vec,
+                        fields: vec![],
+                        logical_discr: 0,
+                        physical_tag: None,
+                        result_ok: false,
+                        saved_local_keys: vec![],
+                    }],
+                    niche: None,
+                },
+                24,
+                None,
+            )
+        };
+        let v_u8 = TypeId(10);
+        let v_u16 = TypeId(11);
+        let v_i16 = TypeId(12);
+        let v_u32 = TypeId(13);
+        let v_f32 = TypeId(14);
+        let v_rc = TypeId(15);
+        let v_user_u16 = TypeId(16);
+        table.insert(make_vec(10, std_crate, t_u8));
+        table.insert(make_vec(11, std_crate, t_u16));
+        table.insert(make_vec(12, std_crate, t_i16));
+        table.insert(make_vec(13, std_crate, t_u32));
+        table.insert(make_vec(14, std_crate, t_f32));
+        table.insert(make_vec(15, std_crate, t_rc_like));
+        table.insert(make_vec(16, user_crate, t_u16));
+
+        let u16_origin = ScalarOrigin {
+            bits: 16,
+            signed: false,
+            is_char: false,
+            size: 2,
+        };
+        // Scalar u16 origin only seals into std Vec<u16>.
+        assert!(is_sealed_wide_vec_container(
+            &table,
+            &interns,
+            v_u16,
+            &std_crates,
+            2,
+            t_u16,
+            Some(u16_origin)
+        ));
+        assert!(!is_sealed_wide_vec_container(
+            &table,
+            &interns,
+            v_i16,
+            &std_crates,
+            2,
+            t_u16,
+            Some(u16_origin)
+        ));
+        assert!(!is_sealed_wide_vec_container(
+            &table,
+            &interns,
+            v_u8,
+            &std_crates,
+            2,
+            t_u16,
+            Some(u16_origin)
+        ));
+        assert!(!is_sealed_wide_vec_container(
+            &table,
+            &interns,
+            v_user_u16,
+            &std_crates,
+            2,
+            t_u16,
+            Some(u16_origin)
+        ));
+        // Float f32 only seals into std Vec<f32>, never Vec<u32> or Vec<RcLike>.
+        assert!(is_sealed_wide_vec_container(
+            &table,
+            &interns,
+            v_f32,
+            &std_crates,
+            4,
+            t_f32,
+            None
+        ));
+        assert!(!is_sealed_wide_vec_container(
+            &table,
+            &interns,
+            v_u32,
+            &std_crates,
+            4,
+            t_f32,
+            None
+        ));
+        assert!(!is_sealed_wide_vec_container(
+            &table,
+            &interns,
+            v_rc,
+            &std_crates,
+            4,
+            t_f32,
+            None
+        ));
+        // Non-scalar 4-byte Rc-like seals into std Vec<RcLike>, never Vec<u32> or Vec<f32>.
+        assert!(is_sealed_wide_vec_container(
+            &table,
+            &interns,
+            v_rc,
+            &std_crates,
+            4,
+            t_rc_like,
+            None
+        ));
+        assert!(!is_sealed_wide_vec_container(
+            &table,
+            &interns,
+            v_u32,
+            &std_crates,
+            4,
+            t_rc_like,
+            None
+        ));
+        assert!(!is_sealed_wide_vec_container(
+            &table,
+            &interns,
+            v_f32,
+            &std_crates,
+            4,
+            t_rc_like,
+            None
+        ));
+        // 8-byte float mismatch rejected.
+        assert!(!is_sealed_wide_vec_container(
+            &table,
+            &interns,
+            v_f32,
+            &std_crates,
+            8,
+            t_f64,
+            None
         ));
     }
 }
