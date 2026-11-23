@@ -8,9 +8,10 @@
 
 use rcgjs_object::jir::interns::Interns;
 use rcgjs_object::jir::types::{
-    EnumRepr, FieldKey, IntRepr, NominalForm, TypeId, TypeKind, TypeTable, VariantDescriptor,
+    EnumRepr, FieldKey, IntRepr, NominalForm, RepresentationCandidate, TypeId, TypeKind, TypeTable,
+    VariantDescriptor,
 };
-use rcgjs_object::jsast::{self, BinOp, Expr};
+use rcgjs_object::jsast::{self, BinOp, Expr, UnOp};
 
 use crate::plan::abi_flat::{LaneComponent, ProductNode, RecursiveShape, TaggedShape};
 
@@ -463,12 +464,31 @@ fn shallow_clone(value: Expr) -> Expr {
 
 /// A copy of an aggregate value that shares nothing with the original (`value.rs:603-689`).
 pub fn clone_expr(table: &TypeTable, interns: &Interns, ty: TypeId, value: Expr) -> Expr {
+    clone_expr_with(
+        table,
+        interns,
+        ty,
+        value,
+        crate::lower::NestedClone::default(),
+    )
+}
+
+/// Like [`clone_expr`], guarding `Vec`/`String` struct fields against native carriers when
+/// `nested_clone` indicates this function may hold nested `NativeVec`/`SliceView` or native
+/// `String` carriers inside an aggregate.
+pub fn clone_expr_with(
+    table: &TypeTable,
+    interns: &Interns,
+    ty: TypeId,
+    value: Expr,
+    nested_clone: crate::lower::NestedClone,
+) -> Expr {
     let peeled = table.peeled(ty);
     if peeled != ty {
         if !table.needs_clone(peeled) {
             return value;
         }
-        let copy = clone_expr(table, interns, peeled, value.clone());
+        let copy = clone_expr_with(table, interns, peeled, value.clone(), nested_clone);
         if !table.crosses_transparent_union(ty) {
             return copy;
         }
@@ -480,7 +500,7 @@ pub fn clone_expr(table: &TypeTable, interns: &Interns, ty: TypeId, value: Expr)
     }
     let clone_field = |field_ty: TypeId, read: Expr| {
         if table.needs_clone(field_ty) {
-            clone_expr(table, interns, field_ty, read)
+            clone_expr_with(table, interns, field_ty, read, nested_clone)
         } else {
             read
         }
@@ -497,22 +517,86 @@ pub fn clone_expr(table: &TypeTable, interns: &Interns, ty: TypeId, value: Expr)
             let Some(variant) = variants.first() else {
                 return shallow_clone(value);
             };
-            let entries = variant
-                .fields
-                .iter()
-                .map(|field| {
-                    let key = key_name(interns, field.key).unwrap_or_default();
-                    let read = clone_field(field.ty, jsast::member(value.clone(), key.clone()));
-                    (key, read)
-                })
-                .collect();
-            jsast::object(entries)
+            let struct_clone = |src: Expr| {
+                let entries = variant
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        let key = key_name(interns, field.key).unwrap_or_default();
+                        let read = clone_field(field.ty, jsast::member(src.clone(), key.clone()));
+                        (key, read)
+                    })
+                    .collect();
+                jsast::object(entries)
+            };
+            // A struct/enum containing a Vec or String field may carry a native carrier
+            // (`NativeVec`, `SliceView`, `HostString`, `StringBuilder`) at runtime when cloned
+            // via `OpKind::Copy` (e.g. `Result::branch`, `Option::take`, `mem::replace`). Only
+            // emit the native-shape guard in functions that actually carry nested native carriers.
+            match descriptor.meta.candidate {
+                RepresentationCandidate::Vec if nested_clone.vec => clone_once(value, "$cv", |v| {
+                    let nv = jsast::object_of(vec![
+                        ("buf", jsast::member(v.clone(), "buf")),
+                        ("len", jsast::member(v.clone(), "len")),
+                        ("cap", jsast::member(v.clone(), "cap")),
+                    ]);
+                    let sv = jsast::object_of(vec![
+                        ("buf", jsast::member(v.clone(), "buf")),
+                        ("off", jsast::member(v.clone(), "off")),
+                        ("len", jsast::member(v.clone(), "len")),
+                    ]);
+                    jsast::cond(
+                        jsast::binary(
+                            BinOp::StrictNe,
+                            jsast::member(v.clone(), "cap"),
+                            jsast::undefined(),
+                        ),
+                        nv,
+                        jsast::cond(
+                            jsast::binary(
+                                BinOp::StrictNe,
+                                jsast::member(v.clone(), "off"),
+                                jsast::undefined(),
+                            ),
+                            sv,
+                            struct_clone(v),
+                        ),
+                    )
+                }),
+                RepresentationCandidate::String if nested_clone.string => {
+                    clone_once(value, "$cs", |v| {
+                        let sb = jsast::object_of(vec![
+                            ("text", jsast::member(v.clone(), "text")),
+                            ("cap", jsast::member(v.clone(), "cap")),
+                            ("len", jsast::member(v.clone(), "len")),
+                        ]);
+                        jsast::cond(
+                            jsast::binary(
+                                BinOp::StrictEq,
+                                jsast::unary(UnOp::TypeOf, v.clone()),
+                                jsast::string("string"),
+                            ),
+                            v.clone(),
+                            jsast::cond(
+                                jsast::binary(
+                                    BinOp::StrictNe,
+                                    jsast::member(v.clone(), "text"),
+                                    jsast::undefined(),
+                                ),
+                                sb,
+                                struct_clone(v),
+                            ),
+                        )
+                    })
+                }
+                _ => struct_clone(value),
+            }
         }
         TypeKind::Adt {
             form: NominalForm::Enum,
             variants,
             ..
-        } => clone_enum(table, interns, variants, value),
+        } => clone_enum(table, interns, variants, value, nested_clone),
         TypeKind::Tuple(_) | TypeKind::Closure { .. } => jsast::array(
             descriptor
                 .js
@@ -529,11 +613,29 @@ pub fn clone_expr(table: &TypeTable, interns: &Interns, ty: TypeId, value: Expr)
             "map",
             vec![jsast::arrow(
                 vec![CLONE_PARAM.to_string()],
-                clone_expr(table, interns, *element, jsast::id(CLONE_PARAM)),
+                clone_expr_with(
+                    table,
+                    interns,
+                    *element,
+                    jsast::id(CLONE_PARAM),
+                    nested_clone,
+                ),
             )],
         ),
         TypeKind::Array { .. } => jsast::method_call(value, "slice", vec![]),
         _ => shallow_clone(value),
+    }
+}
+
+/// Evaluates `value` once when `build` references it multiple times.
+fn clone_once(value: Expr, param: &str, build: impl FnOnce(Expr) -> Expr) -> Expr {
+    if matches!(&value, Expr::Ident(_)) {
+        build(value)
+    } else {
+        jsast::call(
+            jsast::arrow(vec![param.to_owned()], build(jsast::id(param))),
+            vec![value],
+        )
     }
 }
 
@@ -547,6 +649,7 @@ fn clone_enum(
     interns: &Interns,
     variants: &[VariantDescriptor],
     value: Expr,
+    nested_clone: crate::lower::NestedClone,
 ) -> Expr {
     let payload_needs_clone = variants.iter().any(|variant| {
         variant
@@ -563,7 +666,7 @@ fn clone_enum(
             let key = key_name(interns, field.key).unwrap_or_default();
             let read = jsast::member(value.clone(), key.clone());
             let read = if table.needs_clone(field.ty) {
-                clone_expr(table, interns, field.ty, read)
+                clone_expr_with(table, interns, field.ty, read, nested_clone)
             } else {
                 read
             };

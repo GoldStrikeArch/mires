@@ -70,6 +70,14 @@ const BOX_OWN_DROP: TypeId = TypeId(52);
 const BOX_OWN_DROP_MUT: TypeId = TypeId(53);
 const VEC_DROPPY_REF: TypeId = TypeId(54);
 const DROPPY_REF: TypeId = TypeId(55);
+const OPTION_U32: TypeId = TypeId(90);
+const RANGE_USIZE: TypeId = TypeId(91);
+const ARR_U32_3: TypeId = TypeId(92);
+const BOX_ARR_U32_3: TypeId = TypeId(93);
+const RAW_U32_CONST: TypeId = TypeId(94);
+const RAW_U32_MUT: TypeId = TypeId(95);
+const SLICE_ITER_U32: TypeId = TypeId(96);
+const SLICE_ITER_MUT_U32: TypeId = TypeId(97);
 
 fn descriptor(id: TypeId, kind: TypeKind, size: u64) -> TypeDescriptor {
     TypeDescriptor {
@@ -418,6 +426,108 @@ fn table() -> (TypeTable, Interns) {
     holder.layout.needs_drop = true;
     put(holder, &mut table);
 
+    let none_name = interns.intern_str("None");
+    let some_name = interns.intern_str("Some");
+    let mut opt_u32 = descriptor(
+        OPTION_U32,
+        TypeKind::Adt {
+            def: crate::jir::semantic::DefinitionId {
+                crate_id: 1,
+                local_hash: OPTION_U32.0 as u64,
+            },
+            args: vec![U32],
+            form: NominalForm::Enum,
+            variants: vec![
+                VariantDescriptor {
+                    name: none_name,
+                    fields: Vec::new(),
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                },
+                VariantDescriptor {
+                    name: some_name,
+                    fields: vec![field(&mut interns, "_0", U32)],
+                    logical_discr: 1,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                },
+            ],
+            niche: None,
+        },
+        8,
+    );
+    opt_u32.js.enum_repr = Some(crate::jir::types::EnumRepr::Tag { fieldless: false });
+    put(opt_u32, &mut table);
+
+    let range_fields = vec![
+        field(&mut interns, "start", USIZE),
+        field(&mut interns, "end", USIZE),
+    ];
+    put(
+        strukt(&mut interns, RANGE_USIZE, "Range", range_fields, 8),
+        &mut table,
+    );
+
+    put(
+        descriptor(
+            ARR_U32_3,
+            TypeKind::Array {
+                element: U32,
+                length: 3,
+            },
+            12,
+        ),
+        &mut table,
+    );
+    put(box_of(&mut interns, BOX_ARR_U32_3, ARR_U32_3), &mut table);
+    put(
+        descriptor(
+            RAW_U32_CONST,
+            TypeKind::RawPointer {
+                pointee: U32,
+                mutable: false,
+            },
+            4,
+        ),
+        &mut table,
+    );
+    put(
+        descriptor(
+            RAW_U32_MUT,
+            TypeKind::RawPointer {
+                pointee: U32,
+                mutable: true,
+            },
+            4,
+        ),
+        &mut table,
+    );
+    let iter_fields = vec![
+        field(&mut interns, "ptr", RAW_U32_CONST),
+        field(&mut interns, "end_or_len", RAW_U32_CONST),
+        field(&mut interns, "_marker", MARKER_ZST),
+    ];
+    let mut iter_desc = strukt(&mut interns, SLICE_ITER_U32, "Iter", iter_fields, 8);
+    iter_desc.meta.iterator = crate::jir::types::IteratorIdentity::Slice;
+    put(iter_desc, &mut table);
+    let iter_mut_fields = vec![
+        field(&mut interns, "ptr", RAW_U32_CONST),
+        field(&mut interns, "end_or_len", RAW_U32_MUT),
+        field(&mut interns, "_marker", MARKER_ZST),
+    ];
+    let mut iter_mut_desc = strukt(
+        &mut interns,
+        SLICE_ITER_MUT_U32,
+        "IterMut",
+        iter_mut_fields,
+        8,
+    );
+    iter_mut_desc.meta.iterator = crate::jir::types::IteratorIdentity::Slice;
+    put(iter_mut_desc, &mut table);
+
     (table, interns)
 }
 
@@ -482,13 +592,37 @@ fn signature_of(operation: StandardOperation) -> Signature {
         StandardOperation::VecLen | StandardOperation::VecCapacity => sig(vec![VEC_U32_REF], USIZE),
         StandardOperation::VecIsEmpty => sig(vec![VEC_U32_REF], BOOL),
         StandardOperation::VecPush => sig(vec![VEC_U32_MUT, U32], UNIT),
+        StandardOperation::VecPushMut => sig(vec![VEC_U32_MUT, U32], U32_MUT),
+        StandardOperation::VecInsert => sig_tracked(vec![VEC_U32_MUT, USIZE, U32], UNIT),
+        StandardOperation::VecInsertMut => sig_tracked(vec![VEC_U32_MUT, USIZE, U32], U32_MUT),
+        StandardOperation::VecReserve | StandardOperation::VecReserveExact => {
+            sig(vec![VEC_U32_MUT, USIZE], UNIT)
+        }
+        StandardOperation::VecShrinkToFit => sig(vec![VEC_U32_MUT], UNIT),
+        StandardOperation::VecTruncate => sig(vec![VEC_U32_MUT, USIZE], UNIT),
+        StandardOperation::VecPop => sig(vec![VEC_U32_MUT], OPTION_U32),
+        StandardOperation::VecResize => sig(vec![VEC_U32_MUT, USIZE, U32], UNIT),
+        StandardOperation::VecFromElem => sig(vec![U32, USIZE], VEC_U32),
+        StandardOperation::VecFromBoxArray => sig(vec![BOX_ARR_U32_3], VEC_U32),
         StandardOperation::VecClear | StandardOperation::VecDrop => sig(vec![VEC_U32_MUT], UNIT),
         StandardOperation::VecAsSlice => sig(vec![VEC_U32_REF], SLICE_REF),
         StandardOperation::VecAsMutSlice => sig(vec![VEC_U32_MUT], SLICE_MUT),
+        StandardOperation::VecIter => sig(vec![VEC_U32_REF], SLICE_ITER_U32),
+        StandardOperation::VecIterMut => sig(vec![VEC_U32_MUT], SLICE_ITER_MUT_U32),
+        StandardOperation::VecReplace => sig(vec![VEC_U32_MUT, VEC_U32], VEC_U32),
+        StandardOperation::VecMemSwap => sig(vec![VEC_U32_MUT, VEC_U32_MUT], UNIT),
         StandardOperation::VecIndex => sig_tracked(vec![VEC_U32_REF, USIZE], U32_REF),
         StandardOperation::VecIndexMut => sig_tracked(vec![VEC_U32_MUT, USIZE], U32_MUT),
+        StandardOperation::VecRangeIndex => sig_tracked(vec![VEC_U32_REF, RANGE_USIZE], SLICE_REF),
+        StandardOperation::VecRangeIndexMut => {
+            sig_tracked(vec![VEC_U32_MUT, RANGE_USIZE], SLICE_MUT)
+        }
         StandardOperation::VecRemove => sig_tracked(vec![VEC_U32_MUT, USIZE], U32),
+        StandardOperation::VecSwapRemove => sig(vec![VEC_U32_MUT, USIZE], U32),
         StandardOperation::VecExtend => sig(vec![VEC_U32_MUT, VEC_U32], UNIT),
+        StandardOperation::VecExtendFromSlice => sig(vec![VEC_U32_MUT, SLICE_REF], UNIT),
+        StandardOperation::VecClone => sig(vec![VEC_U32_REF], VEC_U32),
+        StandardOperation::SliceToVec => sig(vec![SLICE_REF], VEC_U32),
         StandardOperation::SliceSwap => sig_tracked(vec![SLICE_MUT, USIZE, USIZE], UNIT),
         _ => panic!("not a supported operation: {operation:?}"),
     }
@@ -795,17 +929,14 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::VecNew,
         NATIVE,
         r#"function f() {
-  return __rt.native_vec_new(0);
+  return __rt.tv_new(4);
 }"#,
     ),
     (
         StandardOperation::VecWithCapacity,
         NATIVE,
         r#"function f($native0) {
-  if ($native0 > 536870911) {
-    throw new RangeError("rustc_codegen_js: native Vec capacity overflow");
-  }
-  return __rt.native_vec_new($native0);
+  return __rt.nv_cap($native0, 536870911, 4);
 }"#,
     ),
     (
@@ -833,23 +964,108 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::VecPush,
         NATIVE,
         r#"function f($native0, $native1) {
-  const $nativeRequired = $native0.len + 1;
-  if ($nativeRequired > 536870911) {
-    throw new RangeError("rustc_codegen_js: native Vec capacity overflow");
-  }
-  if ($native0.len === $native0.cap) {
-    __rt.native_vec_set_capacity($native0, $nativeRequired);
-  }
-  $native0.buf[$native0.len] = $native1;
-  $native0.len += 1;
+  __rt.nv_push($native0, $native1, 536870911);
   return;
+}"#,
+    ),
+    (
+        StandardOperation::VecPushMut,
+        NATIVE,
+        r#"function f($native0, $native1) {
+  const $nativeIdx = $native0.len;
+  __rt.nv_push($native0, $native1, 536870911);
+  return { buf: $native0.buf, off: $nativeIdx };
+}"#,
+    ),
+    (
+        StandardOperation::VecInsert,
+        NATIVE,
+        r#"function f($native0, $native1, $native2, $native3) {
+  __rt.nv_insert($native0, $native1, $native2, 536870911);
+  return;
+}"#,
+    ),
+    (
+        StandardOperation::VecInsertMut,
+        NATIVE,
+        r#"function f($native0, $native1, $native2, $native3) {
+  __rt.nv_insert($native0, $native1, $native2, 536870911);
+  return { buf: $native0.buf, off: $native1 };
+}"#,
+    ),
+    (
+        StandardOperation::VecReserve,
+        NATIVE,
+        r#"function f($native0, $native1) {
+  __rt.nv_reserve($native0, $native1, 536870911, false);
+  return;
+}"#,
+    ),
+    (
+        StandardOperation::VecReserveExact,
+        NATIVE,
+        r#"function f($native0, $native1) {
+  __rt.nv_reserve($native0, $native1, 536870911, true);
+  return;
+}"#,
+    ),
+    (
+        StandardOperation::VecShrinkToFit,
+        NATIVE,
+        r#"function f($native0) {
+  __rt.nv_shrink($native0);
+  return;
+}"#,
+    ),
+    (
+        StandardOperation::VecTruncate,
+        NATIVE,
+        r#"function f($native0, $native1) {
+  if ($native1 < $native0.len) {
+    $native0.len = $native1;
+  }
+  return;
+}"#,
+    ),
+    (
+        StandardOperation::VecPop,
+        NATIVE,
+        r#"function f($native0) {
+  if ($native0.len === 0) {
+    return { TAG: "None" };
+  }
+  const $nativeIdx = $native0.len - 1;
+  $native0.len = $nativeIdx;
+  return { TAG: "Some", _0: $native0.buf[$nativeIdx] };
+}"#,
+    ),
+    (
+        StandardOperation::VecResize,
+        NATIVE,
+        r#"function f($native0, $native1, $native2) {
+  __rt.nv_resize($native0, $native1, $native2, 536870911);
+  return;
+}"#,
+    ),
+    (
+        StandardOperation::VecFromElem,
+        NATIVE,
+        r#"function f($native0, $native1) {
+  return __rt.nv_from_elem($native0, $native1, 536870911, 4);
+}"#,
+    ),
+    (
+        StandardOperation::VecFromBoxArray,
+        NATIVE,
+        r#"function f($native0) {
+  return __rt.nv_from_box($native0, 3, 4);
 }"#,
     ),
     (
         StandardOperation::VecClear,
         NATIVE,
         r#"function f($native0) {
-  __rt.native_vec_set_len($native0, 0);
+  $native0.len = 0;
   return;
 }"#,
     ),
@@ -868,69 +1084,125 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
 }"#,
     ),
     (
+        StandardOperation::VecIter,
+        NATIVE,
+        r#"function f($native0) {
+  return { ptr: { buf: $native0.buf, off: 0 }, end_or_len: { buf: $native0.buf, off: $native0.len }, _marker: undefined };
+}"#,
+    ),
+    (
+        StandardOperation::VecIterMut,
+        NATIVE,
+        r#"function f($native0) {
+  return { ptr: { buf: $native0.buf, off: 0 }, end_or_len: { buf: $native0.buf, off: $native0.len }, _marker: undefined };
+}"#,
+    ),
+    (
+        StandardOperation::VecReplace,
+        NATIVE,
+        r#"function f($native0, $native1) {
+  const $nativeOld = { buf: $native0.buf, len: $native0.len, cap: $native0.cap };
+  $native0.buf = $native1.buf;
+  $native0.len = $native1.len;
+  $native0.cap = $native1.cap;
+  return $nativeOld;
+}"#,
+    ),
+    (
+        StandardOperation::VecMemSwap,
+        NATIVE,
+        r#"function f($native0, $native1) {
+  const $nativeBuf = $native0.buf;
+  const $nativeLen = $native0.len;
+  const $nativeCap = $native0.cap;
+  $native0.buf = $native1.buf;
+  $native0.len = $native1.len;
+  $native0.cap = $native1.cap;
+  $native1.buf = $nativeBuf;
+  $native1.len = $nativeLen;
+  $native1.cap = $nativeCap;
+  return;
+}"#,
+    ),
+    (
         StandardOperation::VecIndex,
         NATIVE,
         r#"function f($native0, $native1, $native2) {
-  if ($native1 >= $native0.len) {
-    throw new RangeError("rustc_codegen_js: native Vec index out of bounds");
-  }
-  return { buf: $native0.buf, off: $native1 };
+  return __rt.nv_idx($native0, $native1, false);
 }"#,
     ),
     (
         StandardOperation::VecIndexMut,
         NATIVE,
         r#"function f($native0, $native1, $native2) {
-  if ($native1 >= $native0.len) {
-    throw new RangeError("rustc_codegen_js: native Vec index out of bounds");
-  }
-  return { buf: $native0.buf, off: $native1 };
+  return __rt.nv_idx($native0, $native1, false);
+}"#,
+    ),
+    (
+        StandardOperation::VecRangeIndex,
+        NATIVE,
+        r#"function f($native0, $native1, $native2) {
+  return __rt.nv_range($native0, $native1.start, $native1.end);
+}"#,
+    ),
+    (
+        StandardOperation::VecRangeIndexMut,
+        NATIVE,
+        r#"function f($native0, $native1, $native2) {
+  return __rt.nv_range($native0, $native1.start, $native1.end);
 }"#,
     ),
     (
         StandardOperation::VecRemove,
         NATIVE,
         r#"function f($native0, $native1, $native2) {
-  if ($native1 >= $native0.len) {
-    throw new RangeError("rustc_codegen_js: native Vec remove index out of bounds");
-  }
-  const $nativeRemoved = $native0.buf.splice($native1, 1)[0];
-  $native0.buf.length = $native0.cap;
-  $native0.len -= 1;
-  return $nativeRemoved;
+  return __rt.nv_remove($native0, $native1);
+}"#,
+    ),
+    (
+        StandardOperation::VecSwapRemove,
+        NATIVE,
+        r#"function f($native0, $native1) {
+  return __rt.nv_swap_remove($native0, $native1);
 }"#,
     ),
     (
         StandardOperation::VecExtend,
         NATIVE,
         r#"function f($native0, $native1) {
-  const $nativeTargetLen = $native0.len;
-  const $nativeSourceLen = $native1.len;
-  const $nativeRequired = $nativeTargetLen + $nativeSourceLen;
-  if ($nativeRequired > 536870911) {
-    throw new RangeError("rustc_codegen_js: native Vec capacity overflow");
-  }
-  if ($native0.cap < $nativeRequired) {
-    __rt.native_vec_set_capacity($native0, $nativeRequired);
-  }
-  $native1.len = 0;
-  let $nativeIndex = 0;
-  while ($nativeIndex < $nativeSourceLen) {
-    $native0.buf[$nativeTargetLen + $nativeIndex] = $native1.buf[$nativeIndex];
-    $native1.buf[$nativeIndex] = undefined;
-    $nativeIndex += 1;
-  }
-  $native0.len = $nativeRequired;
-  __rt.native_vec_set_capacity($native1, 0);
+  __rt.nv_extend($native0, $native1, 536870911);
   return;
+}"#,
+    ),
+    (
+        StandardOperation::VecExtendFromSlice,
+        NATIVE,
+        r#"function f($native0, $native1) {
+  __rt.nv_extend_slice($native0, $native1, 536870911);
+  return;
+}"#,
+    ),
+    (
+        StandardOperation::VecClone,
+        NATIVE,
+        r#"function f($native0) {
+  return __rt.nv_clone($native0);
+}"#,
+    ),
+    (
+        StandardOperation::SliceToVec,
+        NATIVE,
+        r#"function f($native0) {
+  return __rt.nv_from_slice($native0, 4);
 }"#,
     ),
     (
         StandardOperation::VecDrop,
         NATIVE,
         r#"function f($native0) {
-  __rt.native_vec_set_len($native0, 0);
-  __rt.native_vec_set_capacity($native0, 0);
+  $native0.buf = null;
+  $native0.len = 0;
+  $native0.cap = 0;
   return;
 }"#,
     ),
@@ -985,20 +1257,40 @@ const SUPPORTED: &[(StandardOperation, &[Option<Carrier>])] = &[
     (StandardOperation::VecCapacity, &[NATIVE]),
     (StandardOperation::VecIsEmpty, &[NATIVE]),
     (StandardOperation::VecPush, &[NATIVE]),
+    (StandardOperation::VecPushMut, &[NATIVE]),
+    (StandardOperation::VecInsert, &[NATIVE]),
+    (StandardOperation::VecInsertMut, &[NATIVE]),
+    (StandardOperation::VecReserve, &[NATIVE]),
+    (StandardOperation::VecReserveExact, &[NATIVE]),
+    (StandardOperation::VecShrinkToFit, &[NATIVE]),
+    (StandardOperation::VecTruncate, &[NATIVE]),
+    (StandardOperation::VecPop, &[NATIVE]),
+    (StandardOperation::VecResize, &[NATIVE]),
+    (StandardOperation::VecFromElem, &[NATIVE]),
+    (StandardOperation::VecFromBoxArray, &[NATIVE]),
     (StandardOperation::VecClear, &[NATIVE]),
     (StandardOperation::VecAsSlice, &[NATIVE]),
     (StandardOperation::VecAsMutSlice, &[NATIVE]),
+    (StandardOperation::VecIter, &[NATIVE]),
+    (StandardOperation::VecIterMut, &[NATIVE]),
+    (StandardOperation::VecReplace, &[NATIVE]),
+    (StandardOperation::VecMemSwap, &[NATIVE]),
     (StandardOperation::VecIndex, &[NATIVE]),
     (StandardOperation::VecIndexMut, &[NATIVE]),
+    (StandardOperation::VecRangeIndex, &[NATIVE]),
+    (StandardOperation::VecRangeIndexMut, &[NATIVE]),
     (StandardOperation::VecRemove, &[NATIVE]),
+    (StandardOperation::VecSwapRemove, &[NATIVE]),
     (StandardOperation::VecExtend, &[NATIVE]),
+    (StandardOperation::VecExtendFromSlice, &[NATIVE]),
+    (StandardOperation::VecClone, &[NATIVE]),
+    (StandardOperation::SliceToVec, &[NATIVE]),
     (StandardOperation::VecDrop, &[NATIVE]),
     (StandardOperation::SliceSwap, &[None]),
 ];
 
-/// Registry <-> `StandardOperation` is 1:1: the 33 v1-supported ops and v2's Box drop lower, while
-/// the 5 operations v1 never supported remain exact declines. Every variant is spelled out so a
-/// producer-side addition fails this test until the registry answers for it.
+/// Registry <-> `StandardOperation` is 1:1. Every variant is spelled out so a producer-side
+/// addition fails this test until the registry answers for it.
 #[test]
 fn registry_covers_exactly_the_34_supported_operations() {
     use StandardOperation::*;
@@ -1029,27 +1321,46 @@ fn registry_covers_exactly_the_34_supported_operations() {
         VecCapacity,
         VecIsEmpty,
         VecPush,
+        VecPushMut,
+        VecInsert,
+        VecInsertMut,
+        VecReserve,
+        VecReserveExact,
+        VecShrinkToFit,
+        VecTruncate,
+        VecPop,
+        VecResize,
+        VecFromElem,
+        VecFromBoxArray,
         VecClear,
         VecAsSlice,
         VecAsMutSlice,
+        VecIter,
+        VecIterMut,
+        VecReplace,
+        VecMemSwap,
         VecIndex,
         VecIndexMut,
+        VecRangeIndex,
+        VecRangeIndexMut,
         VecRemove,
+        VecSwapRemove,
         VecExtend,
+        VecExtendFromSlice,
+        VecClone,
+        SliceToVec,
         VecDrop,
         BoxDrop,
         SliceSwap,
     ];
     let declined = [
-        VecPop,
-        VecReserve,
         VecSwap,
         StringFmtWriteFmt,
         StringFmtSpecWriteFmt,
         F64FromStr,
         F32FromStr,
     ];
-    assert_eq!(lowered.len() + declined.len(), 43);
+    assert_eq!(lowered.len() + declined.len(), 62);
     for operation in lowered {
         let op = registry(operation)
             .unwrap_or_else(|| panic!("{operation:?} must have a registry entry"));
@@ -1265,8 +1576,9 @@ fn dropful_clear_and_drop_call_the_glue_in_order() {
     $native0.buf[$nativeIndex] = undefined;
     $nativeIndex += 1;
   }
+  $native0.buf.length = 0;
   $native0.len = 0;
-  __rt.native_vec_set_capacity($native0, 0);
+  $native0.cap = 0;
   return;
 }"#,
         ),
@@ -1364,10 +1676,7 @@ fn vec_index_returns_the_element_reference_form() {
         ))
         .trim_end(),
         r#"function f($native0, $native1, $native2) {
-  if ($native1 >= $native0.len) {
-    throw new RangeError("rustc_codegen_js: native Vec index out of bounds");
-  }
-  return $native0.buf[$native1];
+  return __rt.nv_idx($native0, $native1, true);
 }"#
     );
 }
@@ -1555,7 +1864,7 @@ mod adapters {
                 Carrier::NativeVec
             ),
             "__rt.convert_block_nv(v.buf.inner.ptr.buf, v.buf.inner.ptr.off, v.len, \
-             v.buf.inner.cap)"
+             v.buf.inner.cap, 4)"
         );
     }
 
@@ -2117,6 +2426,7 @@ fn assert_carrier_composition(with_slice_view: bool, owned_carrier: Option<Carri
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints: None,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            nested_clone: crate::lower::NestedClone::default(),
         };
         program.push_str(&jsast::stmt_to_string(
             &lower_func(&input, func).unwrap().decl,
@@ -2152,8 +2462,7 @@ for (const f of [before, after]) {
       const buffer = [10, 20, 30, 40];
       const view = { buf: buffer, off: 1, len: 2 };
       const capacity = (ownedKind === 'builder' ? __rt.str_len(text) : 2) + reserve;
-      const owned = ownedKind === 'builder' ? { text, cap: capacity, len: __rt.str_len(text) } : ownedKind === 'vec' ? { buf: [1, 2], len: 2, cap: capacity } : undefined;
-      if (ownedKind === 'vec') owned.buf.length = capacity;
+      const owned = ownedKind === 'builder' ? { text, cap: capacity, len: __rt.str_len(text) } : ownedKind === 'vec' ? (() => { const b = new Uint32Array(capacity); b[0] = 1; b[1] = 2; return { buf: b, len: 2, cap: capacity }; })() : undefined;
       throwAtObserve = shouldThrow;
       if (shouldThrow) assert.throws(() => f(text, caller, rounds, view, owned), error => error === thrown);
       else assert.equal(f(text, caller, rounds, view, owned), text);
@@ -2180,7 +2489,9 @@ for (const f of [before, after]) {
         const ptr = vec.buf.inner.ptr;
         const dropped = rounds === 0 && !shouldThrow;
         const mutated = rounds === 0 && shouldThrow;
-        const expectedCapacity = Math.max(capacity, ownedKind === 'builder' ? __rt.str_len(text) + 8 : 4);
+        const expectedCapacity = ownedKind === 'builder'
+          ? Math.max(capacity, __rt.str_len(text) + 8)
+          : (capacity >= 4 ? capacity : 16);
         if (ownedKind === 'builder') {
           assert.equal(__rt.bytes_str(ptr.buf, ptr.off, vec.len), text + '\ud83d\ude00\ud83d\ude00');
           assert.equal(owned.text, dropped ? '' : mutated ? text + '\ud83d\ude00\ud83d\ude00' : text);
@@ -2191,8 +2502,8 @@ for (const f of [before, after]) {
           const bytes = __rt.byte_slice_ref(__rt.slice_from_parts(ptr, 4, 1));
           assert.deepEqual(Array.prototype.slice.call(bytes.buf, bytes.off, bytes.off + 4), [1, 0, 0, 0]);
           assert.equal(owned.len, dropped ? 0 : mutated ? 4 : 2);
-          assert.equal(owned.buf.length, dropped ? 0 : mutated ? expectedCapacity : capacity);
-          if (rounds !== 0) assert.deepEqual(owned.buf.slice(0, 2), [1, 2]);
+          assert.equal(dropped ? owned.buf : owned.buf.length, dropped ? null : mutated ? expectedCapacity : capacity);
+          if (rounds !== 0) assert.deepEqual(Array.from(owned.buf.subarray(0, 2)), [1, 2]);
         }
         assert.equal(vec.buf.inner.cap, expectedCapacity);
         assert.equal(owned.cap, dropped ? 0 : mutated ? expectedCapacity : capacity);
@@ -2637,6 +2948,7 @@ fn format_site_js_in(
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        nested_clone: crate::lower::NestedClone::default(),
     };
     let lowered = lower_func(&input, &func)
         .unwrap_or_else(|decline| panic!("the format kernel declined `{name}`: {decline}"));

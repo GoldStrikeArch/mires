@@ -249,18 +249,18 @@ mod tests {
         write_registry(&mut registry);
         let registry: serde_json::Value = serde_json::from_str(&registry).unwrap();
         let rows = registry.as_array().unwrap();
-        assert_eq!(rows.len(), 47);
+        assert_eq!(rows.len(), 66);
         assert_eq!(
             rows.iter()
                 .filter(|row| row["native_lowering"] == true)
                 .count(),
-            38
+            59
         );
         for (semantic, decline) in [
             (BodySemantic::Ordinary, "NotAStandardOperation"),
             (
-                BodySemantic::Standard(StandardOperation::VecReserve),
-                "UnsupportedOperation(VecReserve)",
+                BodySemantic::Standard(StandardOperation::VecSwap),
+                "UnsupportedOperation(VecSwap)",
             ),
             (
                 BodySemantic::Standard(StandardOperation::StringNew),

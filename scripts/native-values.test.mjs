@@ -1086,3 +1086,132 @@ test("slice_sort is spec-stable, updates _boxes on heap blocks, preserves buf on
   assert.equal(rt.bstr_out(rt.bstr_to_lowercase(rt.bstr_in("ΟΣ ΟΣΑ Σ"))), "ος οσα σ");
   assert.equal(rt.bstr_out(rt.bstr_to_uppercase(rt.bstr_in("tschüß"))), "TSCHÜSS");
 });
+
+test("TypedArray/NativeVec helpers, _element_view_of elision, ptr_eq same-buf fast path, and 2-slot _blk_get", async () => {
+  // 1. minimal-shim elides _element_view_of when _element_view is unreachable
+  const shimSrc = readFileSync(new URL("../runtime/shim.js", import.meta.url), "utf8");
+  const minNoEv = minimalShim([], shimSrc, {
+    module: true,
+    direct: ["alloc", "dealloc", "ptr_eq", "addr", "offset_from", "overwrite", "unscale_scalar"],
+  });
+  assert.equal(minNoEv.source.includes("const $rt__element_view_of = null;"), true);
+  assert.equal(minNoEv.source.includes("_tv_ctors"), false);
+  const mrt = await import(`data:text/javascript;base64,${Buffer.from(minNoEv.source).toString("base64")}`);
+  const a = mrt.alloc(16, 4);
+  const b = mrt.alloc(16, 4);
+  mrt.unscale_scalar(a, 4, () => 0, "u32");
+  mrt.unscale_scalar(b, 4, () => 0, "u32");
+  assert.equal(mrt.ptr_eq({ buf: a.buf, off: 1 }, { buf: a.buf, off: 1 }), true);
+  assert.equal(mrt.ptr_eq({ buf: a.buf, off: 1 }, { buf: a.buf, off: 2 }), false);
+  assert.equal(mrt.ptr_eq({ buf: a.buf, off: 0 }, { buf: b.buf, off: 0 }), false);
+  // Alternating lookups hit 2-slot _blk_get cache without corruption
+  assert.equal(mrt.offset_from({ buf: a.buf, off: 3 }, { buf: a.buf, off: 1 }, 4), 2);
+  assert.equal(mrt.offset_from({ buf: b.buf, off: 2 }, { buf: b.buf, off: 0 }, 4), 2);
+  mrt.dealloc(a, 16, 4);
+  mrt.dealloc(b, 16, 4);
+
+  // 2. Unified growable TypedArray & Array NativeVec helpers (kinds 0..=7)
+  const v = rt.tv_new(4); // u32
+  assert.equal(v.buf instanceof Uint32Array, true);
+  assert.throws(() => rt.nv_cap(101, 100, 4), RangeError);
+  assert.throws(() => rt.nv_cap(101, 100), RangeError);
+  rt.nv_push(v, 10, 100);
+  rt.nv_push(v, 25, 100);
+  assert.equal(v.len, 2);
+  assert.equal(v.buf[1], 25);
+  rt.nv_insert(v, 1, 15, 100);
+  rt.nv_insert(v, 2, 19, 100);
+  assert.deepEqual(Array.from(v.buf.subarray(0, v.len)), [10, 15, 19, 25]);
+  assert.throws(() => rt.nv_insert(v, 5, 1, 100), RangeError);
+  rt.nv_reserve(v, 10, 100, true);
+  assert.equal(v.cap >= 14, true);
+  rt.nv_resize(v, 5, 7, 100);
+  assert.deepEqual(Array.from(v.buf.subarray(0, v.len)), [10, 15, 19, 25, 7]);
+  assert.equal(rt.nv_remove(v, 1), 15);
+  assert.equal(rt.nv_swap_remove(v, 0), 10);
+  assert.deepEqual(Array.from(v.buf.subarray(0, v.len)), [7, 19, 25]);
+  rt.nv_shrink(v);
+  assert.equal(v.cap, 3);
+  assert.throws(() => rt.nv_remove(v, 3), RangeError);
+  assert.throws(() => rt.nv_swap_remove(v, 3), RangeError);
+  assert.throws(() => rt.nv_push(v, 1, 3), RangeError);
+  assert.equal(v.len, 3);
+
+  // -0.0 preservation in Float64Array / Float32Array nv_from_elem
+  const fz = rt.nv_from_elem(-0.0, 4, 100, 7);
+  assert.equal(fz.buf instanceof Float64Array, true);
+  assert.equal(Object.is(fz.buf[0], -0.0), true);
+  assert.equal(Object.is(fz.buf[3], -0.0), true);
+
+  // nv_extend, nv_extend_slice (same TypedArray, plain Array, Proxy-wrapped TypedArray), nv_clone, nv_from_slice
+  const dst = rt.nv_from_elem(1, 2, 100, 0);
+  const src = rt.nv_from_elem(2, 3, 100, 0);
+  rt.nv_extend(dst, src, 100);
+  assert.deepEqual(Array.from(dst.buf.subarray(0, dst.len)), [1, 1, 2, 2, 2]);
+  assert.equal(src.len, 0);
+  assert.equal(src.cap, 0);
+  rt.nv_extend_slice(dst, { buf: [9, 8], off: 0, len: 2 }, 100);
+  const proxied = new Proxy(new Uint8Array([4, 5, 6]), {});
+  rt.nv_extend_slice(dst, { buf: proxied, off: 1, len: 2 }, 100);
+  assert.deepEqual(Array.from(dst.buf.subarray(0, dst.len)), [1, 1, 2, 2, 2, 9, 8, 5, 6]);
+  const cloned = rt.nv_clone(dst);
+  assert.equal(cloned.buf instanceof Uint8Array, true);
+  cloned.buf[0] = 99;
+  assert.equal(dst.buf[0], 1);
+  const fromEmpty = rt.nv_from_slice({ buf: 1, off: 0, len: 0 }, 0);
+  assert.equal(fromEmpty.len, 0);
+  assert.equal(fromEmpty.buf instanceof Uint8Array, true);
+  const fromProxy = rt.nv_from_slice({ buf: proxied, off: 0, len: 3 }, 0);
+  assert.deepEqual(Array.from(fromProxy.buf), [4, 5, 6]);
+  // nv_from_box: plain slot, window slot, bare array, and empty dangling box; zero unwindow/_element_view_of deps
+  const boxPlain = rt.nv_from_box({ buf: [[10, 20, 30]], off: 0 }, 3, 4);
+  assert.equal(boxPlain.buf instanceof Uint32Array, true);
+  assert.deepEqual(Array.from(boxPlain.buf), [10, 20, 30]);
+  const boxWin = rt.nv_from_box({ buf: [99, 1, 2, 3, 99], off: 1, w: 3 }, 3, 0);
+  assert.equal(boxWin.buf instanceof Uint8Array, true);
+  assert.deepEqual(Array.from(boxWin.buf), [1, 2, 3]);
+  const boxBare = rt.nv_from_box(["x", "y"], 2);
+  assert.deepEqual(boxBare, { buf: ["x", "y"], len: 2, cap: 2 });
+  const boxEmpty = rt.nv_from_box(4, 0, 4);
+  assert.equal(boxEmpty.buf instanceof Uint32Array, true);
+  assert.equal(boxEmpty.len, 0);
+  const boxMin = minimalShim([], shimSrc, { module: true, direct: ["nv_from_box"] });
+  assert.equal(boxMin.names.includes("unwindow"), false);
+  assert.equal(boxMin.names.includes("_element_view_of"), false);
+
+  // 3. Plain-Array NativeVec helpers (nv_*) + dangling empty slice safety
+  const nv = rt.native_vec_new(0);
+  rt.nv_push(nv, "a", 100);
+  const obj = { x: 1 };
+  rt.nv_push(nv, obj, 100);
+  obj.x = 42;
+  assert.equal(nv.buf[1].x, 42);
+  rt.nv_reserve(nv, 10, 100, false);
+  assert.equal(nv.cap >= 12, true);
+  rt.nv_shrink(nv);
+  assert.equal(nv.cap, 2);
+  const nvEmpty = rt.nv_from_slice({ buf: 4, off: 0, len: 0 });
+  assert.deepEqual(nvEmpty, { buf: [], len: 0, cap: 0 });
+  const rng = rt.nv_range(nv, 0, 2);
+  assert.equal(rng.len, 2);
+  assert.throws(() => rt.nv_range(nv, 2, 1), RangeError);
+  assert.throws(() => rt.nv_range(nv, 0, 3), RangeError);
+  assert.throws(() => rt.nv_idx(nv, 2, false), RangeError);
+
+  // 4. TypedArray <-> baseline block adapters + offset_from/copy on TypedArray buffers
+  const blkPtr = rt.convert_nv_block(dst, 1);
+  assert.equal(blkPtr.buf[0], 1);
+  assert.equal(blkPtr.buf[8], 6);
+  const backTv = rt.convert_block_nv(blkPtr.buf, blkPtr.off, dst.len, dst.cap, 0);
+  assert.equal(backTv.buf instanceof Uint8Array, true);
+  assert.deepEqual(Array.from(backTv.buf.subarray(0, backTv.len)), [1, 1, 2, 2, 2, 9, 8, 5, 6]);
+  rt.dealloc(blkPtr, dst.cap, 1);
+  assert.equal(rt.offset_from({ buf: dst.buf, off: 5 }, { buf: dst.buf, off: 2 }, 1), 3);
+  const dst2 = new Uint8Array(4);
+  rt.copy({ buf: dst2, off: 0 }, { buf: dst.buf, off: 5 }, 4);
+  assert.deepEqual(Array.from(dst2), [9, 8, 5, 6]);
+  rt.copy({ buf: dst2, off: 1 }, { buf: dst2, off: 0 }, 3);
+  assert.deepEqual(Array.from(dst2), [9, 9, 8, 5]);
+  rt.write_bytes({ buf: dst2, off: 1 }, 0xab, 2);
+  assert.deepEqual(Array.from(dst2), [9, 0xab, 0xab, 5]);
+});

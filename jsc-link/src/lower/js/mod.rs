@@ -103,6 +103,8 @@ pub struct JsCx<'a> {
     /// Whether whole-program analysis determined that wide (`size > 1`) storage may be observed
     /// through 1-byte pointers/slices (`MIRES-008` lazy-proxy path).
     pub byte_views: crate::analysis::byte_views::ByteViewPlan,
+    /// Whether this function carries nested native Vec/String fields needing carrier-safe clone.
+    pub nested_clone: crate::lower::NestedClone,
     /// Whole-program ASCII provenance facts for this function (`js-str=bytes`).
     ascii: Option<crate::analysis::ascii::FuncAsciiFacts<'a>>,
     /// What one `view!` template instantiated in this body knows, by the value the
@@ -188,6 +190,7 @@ impl<'a> JsCx<'a> {
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             hoists_bigints: false,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            nested_clone: crate::lower::NestedClone::default(),
             ascii: None,
             instantiations: RefCell::new(BTreeMap::new()),
             exprs: RefCell::new(BTreeMap::new()),
@@ -303,6 +306,12 @@ impl<'a> JsCx<'a> {
     /// Whether this lowering hoists BigInt constants.
     pub fn hoists_bigints(&self) -> bool {
         self.hoists_bigints
+    }
+
+    /// The same context, carrying per-function nested native carrier clone policy.
+    pub fn with_nested_clone(mut self, nested_clone: crate::lower::NestedClone) -> Self {
+        self.nested_clone = nested_clone;
+        self
     }
 
     /// The same context, carrying whole-program ASCII facts (`js-str=bytes`).

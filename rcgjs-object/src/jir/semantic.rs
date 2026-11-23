@@ -253,6 +253,44 @@ pub enum StandardOperation {
     StrByteAt,
     /// `core::str::iter::rcgjs_str_slice_unchecked` (`js-str=bytes` direct `slice` subslice).
     StrSliceUnchecked,
+    /// `Vec::push_mut(&mut self, value: T) -> &mut T`.
+    VecPushMut,
+    /// `Vec::reserve_exact(&mut self, additional: usize)`.
+    VecReserveExact,
+    /// `Vec::shrink_to_fit(&mut self)`.
+    VecShrinkToFit,
+    /// `Vec::truncate(&mut self, len: usize)`.
+    VecTruncate,
+    /// `Vec::resize(&mut self, new_len: usize, value: T)`.
+    VecResize,
+    /// `Vec::swap_remove(&mut self, index: usize) -> T`.
+    VecSwapRemove,
+    /// `alloc::vec::from_elem(elem: T, n: usize) -> Vec<T>`.
+    VecFromElem,
+    /// `Vec::extend_from_slice(&mut self, other: &[T])`.
+    VecExtendFromSlice,
+    /// `<Vec<T> as Clone>::clone(&self) -> Vec<T>`.
+    VecClone,
+    /// `<[T]>::to_vec(&self) -> Vec<T>`.
+    SliceToVec,
+    /// `<Vec<T> as Index<R>>::index(&self, range: R) -> &[T]` for `Range`/`RangeFrom`/`RangeTo`/`RangeFull` of `usize`.
+    VecRangeIndex,
+    /// `<Vec<T> as IndexMut<R>>::index_mut(&mut self, range: R) -> &mut [T]` for `Range`/`RangeFrom`/`RangeTo`/`RangeFull` of `usize`.
+    VecRangeIndexMut,
+    /// `alloc::boxed::box_assume_init_into_vec_unsafe(b: Box<MaybeUninit<[T; N]>>) -> Vec<T>`.
+    VecFromBoxArray,
+    /// `<&Vec<T> as IntoIterator>::into_iter(&self) -> core::slice::Iter<T>`.
+    VecIter,
+    /// `<&mut Vec<T> as IntoIterator>::into_iter(&mut self) -> core::slice::IterMut<T>`.
+    VecIterMut,
+    /// `core::mem::replace(&mut Vec<T>, Vec<T>) -> Vec<T>`.
+    VecReplace,
+    /// `core::mem::swap(&mut Vec<T>, &mut Vec<T>)`.
+    VecMemSwap,
+    /// `Vec::insert(&mut self, index: usize, element: T)`.
+    VecInsert,
+    /// `Vec::insert_mut(&mut self, index: usize, element: T) -> &mut T`.
+    VecInsertMut,
 }
 
 impl StandardOperation {

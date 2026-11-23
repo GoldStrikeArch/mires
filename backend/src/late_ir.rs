@@ -2103,6 +2103,11 @@ pub(crate) fn standard_operation<'tcx>(
         ("vec_as_mut_slice", StandardOperation::VecAsMutSlice),
         ("vec_pop", StandardOperation::VecPop),
         ("vec_is_empty", StandardOperation::VecIsEmpty),
+        ("vec_from_elem", StandardOperation::VecFromElem),
+        (
+            "box_assume_init_into_vec_unsafe",
+            StandardOperation::VecFromBoxArray,
+        ),
         ("string_new", StandardOperation::StringNew),
         ("string_as_str", StandardOperation::StringAsStr),
         ("string_push_str", StandardOperation::StringPushStr),
@@ -2113,6 +2118,34 @@ pub(crate) fn standard_operation<'tcx>(
     })
     .or_else(|| format_to_string_operation(tcx, definition, arguments))
     .or_else(|| format_args_item_operation(tcx, definition, arguments))
+    .or_else(|| {
+        if tcx.get_diagnostic_item(Symbol::intern("mem_replace")) == Some(definition) {
+            let sig = tcx
+                .fn_sig(definition)
+                .instantiate(tcx, arguments)
+                .skip_binder();
+            if sig.inputs().len() == 2
+                && matches!(sig.inputs()[0].kind(), ty::Ref(_, p, rustc_hir::Mutability::Mut) if standard_owner(tcx, *p) == Some(RepresentationCandidate::Vec))
+                && standard_owner(tcx, sig.inputs()[1]) == Some(RepresentationCandidate::Vec)
+                && standard_owner(tcx, sig.output()) == Some(RepresentationCandidate::Vec)
+            {
+                return Some(StandardOperation::VecReplace);
+            }
+        }
+        if tcx.get_diagnostic_item(Symbol::intern("mem_swap")) == Some(definition) {
+            let sig = tcx
+                .fn_sig(definition)
+                .instantiate(tcx, arguments)
+                .skip_binder();
+            if sig.inputs().len() == 2
+                && matches!(sig.inputs()[0].kind(), ty::Ref(_, p, rustc_hir::Mutability::Mut) if standard_owner(tcx, *p) == Some(RepresentationCandidate::Vec))
+                && matches!(sig.inputs()[1].kind(), ty::Ref(_, p, rustc_hir::Mutability::Mut) if standard_owner(tcx, *p) == Some(RepresentationCandidate::Vec))
+            {
+                return Some(StandardOperation::VecMemSwap);
+            }
+        }
+        None
+    })
     .or_else(|| {
         let associated = tcx.opt_associated_item(definition)?;
         let signature = tcx
@@ -2202,10 +2235,17 @@ pub(crate) fn standard_operation<'tcx>(
             return exact_primitive_to_string;
         }
         if owner.is_some_and(|owner| matches!(owner.kind(), ty::Slice(_)))
-            && name == "swap"
             && receiver.is_some_and(|receiver| matches!(receiver.kind(), ty::Slice(_)))
         {
-            return Some(StandardOperation::SliceSwap);
+            if name == "swap" {
+                return Some(StandardOperation::SliceSwap);
+            }
+            if name == "to_vec"
+                && signature.inputs().len() == 1
+                && standard_owner(tcx, result) == Some(RepresentationCandidate::Vec)
+            {
+                return Some(StandardOperation::SliceToVec);
+            }
         }
         let receiver = receiver.and_then(|ty| standard_owner(tcx, ty));
         if let Some(operation) =
@@ -2216,39 +2256,107 @@ pub(crate) fn standard_operation<'tcx>(
         if let Some(operation) = fmt_write_operation(receiver, fmt_write, name) {
             return Some(operation);
         }
+        let lang = tcx.lang_items();
+        let is_usize_range_index = |index: Ty<'tcx>| {
+            let ty::Adt(range, range_args) = index.kind() else {
+                return false;
+            };
+            let usize_or_none = range_args
+                .types()
+                .all(|ty| matches!(ty.kind(), ty::Uint(ty::UintTy::Usize)));
+            let shapes = [
+                lang.range_struct(),
+                lang.range_from_struct(),
+                lang.range_to_struct(),
+                lang.range_full_struct(),
+            ];
+            usize_or_none && shapes.contains(&Some(range.did()))
+        };
+        let is_clone_trait = trait_id
+            .is_some_and(|id| tcx.is_diagnostic_item(Symbol::intern("Clone"), id));
+        let is_default_trait = trait_id
+            .is_some_and(|id| tcx.is_diagnostic_item(Symbol::intern("Default"), id));
+        let is_into_iter_trait = trait_id
+            .is_some_and(|id| tcx.is_diagnostic_item(Symbol::intern("IntoIterator"), id));
         match receiver {
             Some(RepresentationCandidate::Vec)
                 if standard_impl == Some(RepresentationCandidate::Vec) => match name {
                 "len" => Some(StandardOperation::VecLen),
                 "capacity" => Some(StandardOperation::VecCapacity),
                 "push" => Some(StandardOperation::VecPush),
+                "push_mut" => Some(StandardOperation::VecPushMut),
+                "insert" => Some(StandardOperation::VecInsert),
+                "insert_mut" => Some(StandardOperation::VecInsertMut),
                 "clear" => Some(StandardOperation::VecClear),
+                "reserve_exact" => Some(StandardOperation::VecReserveExact),
+                "shrink_to_fit" => Some(StandardOperation::VecShrinkToFit),
+                "truncate" => Some(StandardOperation::VecTruncate),
+                "resize" => Some(StandardOperation::VecResize),
                 "remove" => Some(StandardOperation::VecRemove),
+                "swap_remove" => Some(StandardOperation::VecSwapRemove),
+                "extend_from_slice" => Some(StandardOperation::VecExtendFromSlice),
                 "swap" => Some(StandardOperation::VecSwap),
                 _ => None,
             },
             Some(RepresentationCandidate::Vec)
-                if trait_id == tcx.lang_items().index_trait() && name == "index" =>
+                if is_into_iter_trait
+                    && name == "into_iter"
+                    && signature.inputs().len() == 1 =>
             {
-                Some(StandardOperation::VecIndex)
+                match signature.inputs()[0].kind() {
+                    ty::Ref(_, _, rustc_hir::Mutability::Not) => Some(StandardOperation::VecIter),
+                    ty::Ref(_, _, rustc_hir::Mutability::Mut) => {
+                        Some(StandardOperation::VecIterMut)
+                    }
+                    _ => None,
+                }
             }
             Some(RepresentationCandidate::Vec)
-                if trait_id == tcx.lang_items().index_mut_trait() && name == "index_mut" =>
+                if lang.index_trait() == trait_id && name == "index" =>
             {
-                Some(StandardOperation::VecIndexMut)
+                if signature
+                    .inputs()
+                    .get(1)
+                    .is_some_and(|ty| is_usize_range_index(*ty))
+                {
+                    Some(StandardOperation::VecRangeIndex)
+                } else {
+                    Some(StandardOperation::VecIndex)
+                }
             }
             Some(RepresentationCandidate::Vec)
-                if trait_id == tcx.lang_items().deref_trait() && name == "deref" =>
+                if lang.index_mut_trait() == trait_id && name == "index_mut" =>
+            {
+                if signature
+                    .inputs()
+                    .get(1)
+                    .is_some_and(|ty| is_usize_range_index(*ty))
+                {
+                    Some(StandardOperation::VecRangeIndexMut)
+                } else {
+                    Some(StandardOperation::VecIndexMut)
+                }
+            }
+            Some(RepresentationCandidate::Vec)
+                if is_clone_trait
+                    && name == "clone"
+                    && signature.inputs().len() == 1
+                    && standard_owner(tcx, result) == Some(RepresentationCandidate::Vec) =>
+            {
+                Some(StandardOperation::VecClone)
+            }
+            Some(RepresentationCandidate::Vec)
+                if lang.deref_trait() == trait_id && name == "deref" =>
             {
                 Some(StandardOperation::VecAsSlice)
             }
             Some(RepresentationCandidate::Vec)
-                if trait_id == tcx.lang_items().deref_mut_trait() && name == "deref_mut" =>
+                if lang.deref_mut_trait() == trait_id && name == "deref_mut" =>
             {
                 Some(StandardOperation::VecAsMutSlice)
             }
             Some(RepresentationCandidate::Vec)
-                if trait_id == tcx.lang_items().drop_trait() && name == "drop" =>
+                if lang.drop_trait() == trait_id && name == "drop" =>
             {
                 Some(StandardOperation::VecDrop)
             }
@@ -2266,12 +2374,12 @@ pub(crate) fn standard_operation<'tcx>(
                 _ => None,
             },
             Some(RepresentationCandidate::String)
-                if trait_id == tcx.lang_items().deref_trait() && name == "deref" =>
+                if lang.deref_trait() == trait_id && name == "deref" =>
             {
                 Some(StandardOperation::StringAsStr)
             }
             Some(RepresentationCandidate::String)
-                if trait_id == tcx.lang_items().drop_trait() && name == "drop" =>
+                if lang.drop_trait() == trait_id && name == "drop" =>
             {
                 Some(StandardOperation::StringDrop)
             }
@@ -2280,6 +2388,13 @@ pub(crate) fn standard_operation<'tcx>(
                     if standard_impl == Some(RepresentationCandidate::String)
                         && name == "with_capacity" => {
                     Some(StandardOperation::StringWithCapacity)
+                }
+                Some(RepresentationCandidate::Vec)
+                    if is_default_trait
+                        && name == "default"
+                        && signature.inputs().is_empty() =>
+                {
+                    Some(StandardOperation::VecNew)
                 }
                 _ => None,
             },

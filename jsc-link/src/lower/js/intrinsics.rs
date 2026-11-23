@@ -1380,7 +1380,7 @@ impl Intrinsic<'_, '_> {
         let pointee = self.type_at(0)?;
         let read = cx.deref_read(pointee, self.arg(0)?);
         Ok(if cx.table.needs_clone(pointee) {
-            value::clone_expr(cx.table, cx.interns, pointee, read)
+            value::clone_expr_with(cx.table, cx.interns, pointee, read, cx.nested_clone)
         } else {
             read
         })
@@ -1393,7 +1393,7 @@ impl Intrinsic<'_, '_> {
         let (x, y) = (self.arg(0)?, self.arg(1)?);
         let read = cx.deref_read(pointee, x.clone());
         let copy = if cx.table.needs_clone(pointee) {
-            value::clone_expr(cx.table, cx.interns, pointee, read)
+            value::clone_expr_with(cx.table, cx.interns, pointee, read, cx.nested_clone)
         } else {
             read
         };

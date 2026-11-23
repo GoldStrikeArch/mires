@@ -1690,7 +1690,10 @@ fn registry_drop_may_unwind(
 ) -> bool {
     if !matches!(
         operation,
-        StandardOperation::VecClear | StandardOperation::VecDrop | StandardOperation::BoxDrop
+        StandardOperation::VecClear
+            | StandardOperation::VecTruncate
+            | StandardOperation::VecDrop
+            | StandardOperation::BoxDrop
     ) {
         return false;
     }

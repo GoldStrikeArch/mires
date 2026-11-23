@@ -280,6 +280,19 @@ const MUT_RECEIVER_AND_VALUE_VEC: &[SlotRequirement] = &[
     SlotRequirement::argument(0, ReferenceRequirement::Mutable, NATIVE_VEC),
     SlotRequirement::argument(1, ReferenceRequirement::Value, NATIVE_VEC),
 ];
+const RECEIVER_AND_RESULT_VEC: &[SlotRequirement] = &[
+    SlotRequirement::argument(0, ReferenceRequirement::Shared, NATIVE_VEC),
+    SlotRequirement::result(NATIVE_VEC),
+];
+const MUT_RECEIVER_VALUE_AND_RESULT_VEC: &[SlotRequirement] = &[
+    SlotRequirement::argument(0, ReferenceRequirement::Mutable, NATIVE_VEC),
+    SlotRequirement::argument(1, ReferenceRequirement::Value, NATIVE_VEC),
+    SlotRequirement::result(NATIVE_VEC),
+];
+const TWO_MUT_VEC: &[SlotRequirement] = &[
+    SlotRequirement::argument(0, ReferenceRequirement::Mutable, NATIVE_VEC),
+    SlotRequirement::argument(1, ReferenceRequirement::Mutable, NATIVE_VEC),
+];
 const VALUE_RECEIVER_VEC: &[SlotRequirement] = &[SlotRequirement::argument(
     0,
     ReferenceRequirement::Value,
@@ -416,9 +429,9 @@ mod ops {
         fmt::legality_string_return, fmt::format_args_to_string, &["str_len"], 60, FIXTURE_72);
 
     op!(VEC_NEW, VecNew, 0, RESULT_VEC, NATIVE_VEC, PURE,
-        legality_none, vec::vec_new, &["native_vec_new"], 30, FIXTURE_75);
+        legality_none, vec::vec_new, &["tv_new"], 24, FIXTURE_75);
     op!(VEC_WITH_CAPACITY, VecWithCapacity, 1, RESULT_VEC, NATIVE_VEC, THROWS,
-        vec::legality_with_capacity, vec::vec_with_capacity, &["native_vec_new"], 100, FIXTURE_75);
+        vec::legality_with_capacity, vec::vec_with_capacity, &["nv_cap"], 34, FIXTURE_75);
     op!(VEC_LEN, VecLen, 1, RECEIVER_VEC, NATIVE_VEC, PURE,
         vec::legality_unsigned_return, vec::vec_len, &[], 24, FIXTURE_75);
     op!(VEC_CAPACITY, VecCapacity, 1, RECEIVER_VEC, NATIVE_VEC, PURE,
@@ -427,26 +440,81 @@ mod ops {
         vec::legality_bool_return, vec::vec_is_empty, &[], 28, FIXTURE_75);
     op!(VEC_PUSH, VecPush, 2, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS_AND_MUTATES,
         vec::legality_push, vec::vec_push,
-        &["native_vec_set_capacity"], 220, FIXTURE_75, Deps::ElementDropGlue);
+        &["nv_push"], 34, FIXTURE_75, Deps::ElementDropGlue);
+    op!(VEC_PUSH_MUT, VecPushMut, 2, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS_AND_MUTATES,
+        vec::legality_push_mut, vec::vec_push_mut,
+        &["nv_push"], 54, FIXTURE_75, Deps::ElementDropGlue);
+    op!(VEC_INSERT, VecInsert, 4, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS_AND_MUTATES,
+        vec::legality_insert, vec::vec_insert,
+        &["nv_insert"], 40, FIXTURE_75, Deps::ElementDropGlue);
+    op!(VEC_INSERT_MUT, VecInsertMut, 4, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS_AND_MUTATES,
+        vec::legality_insert_mut, vec::vec_insert_mut,
+        &["nv_insert"], 56, FIXTURE_75, Deps::ElementDropGlue);
+    op!(VEC_RESERVE, VecReserve, 2, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS_AND_MUTATES,
+        vec::legality_reserve, vec::vec_reserve,
+        &["nv_reserve"], 38, FIXTURE_75);
+    op!(VEC_RESERVE_EXACT, VecReserveExact, 2, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS_AND_MUTATES,
+        vec::legality_reserve, vec::vec_reserve,
+        &["nv_reserve"], 38, FIXTURE_75);
+    op!(VEC_SHRINK_TO_FIT, VecShrinkToFit, 1, MUT_RECEIVER_VEC, NATIVE_VEC, MUTATES,
+        vec::legality_unit_return, vec::vec_shrink_to_fit,
+        &["nv_shrink"], 28, FIXTURE_75);
+    op!(VEC_TRUNCATE, VecTruncate, 2, MUT_RECEIVER_VEC, NATIVE_VEC, MUTATES,
+        vec::legality_truncate, vec::vec_truncate,
+        &[], 40, FIXTURE_76, Deps::ElementDropGlue);
+    op!(VEC_POP, VecPop, 1, MUT_RECEIVER_VEC, NATIVE_VEC, MUTATES,
+        vec::legality_pop, vec::vec_pop, &[], 70, FIXTURE_75);
+    op!(VEC_RESIZE, VecResize, 3, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS_AND_MUTATES,
+        vec::legality_resize, vec::vec_resize,
+        &["nv_resize"], 40, FIXTURE_75);
+    op!(VEC_FROM_ELEM, VecFromElem, 2, RESULT_VEC, NATIVE_VEC, THROWS,
+        vec::legality_from_elem, vec::vec_from_elem,
+        &["nv_from_elem"], 40, FIXTURE_75);
+    op!(VEC_FROM_BOX_ARRAY, VecFromBoxArray, 1, RESULT_VEC, NATIVE_VEC, PURE,
+        vec::legality_from_box_array, vec::vec_from_box_array,
+        &["nv_from_box"], 32, FIXTURE_75, Deps::ElementDropGlue);
     op!(VEC_CLEAR, VecClear, 1, MUT_RECEIVER_VEC, NATIVE_VEC, MUTATES,
         vec::legality_unit_return, vec::vec_clear,
-        &["native_vec_set_len"], 40, FIXTURE_76, Deps::ElementDropGlue);
+        &[], 30, FIXTURE_76, Deps::ElementDropGlue);
     op!(VEC_AS_SLICE, VecAsSlice, 1, RECEIVER_VEC, NATIVE_VEC, PURE,
         vec::legality_as_slice, vec::vec_as_slice, &[], 40, FIXTURE_75);
     op!(VEC_AS_MUT_SLICE, VecAsMutSlice, 1, MUT_RECEIVER_VEC, NATIVE_VEC, PURE,
         vec::legality_as_slice, vec::vec_as_slice, &[], 40, FIXTURE_75);
+    op!(VEC_ITER, VecIter, 1, RECEIVER_VEC, NATIVE_VEC, PURE,
+        vec::legality_iter, vec::vec_iter, &[], 56, FIXTURE_75);
+    op!(VEC_ITER_MUT, VecIterMut, 1, MUT_RECEIVER_VEC, NATIVE_VEC, PURE,
+        vec::legality_iter, vec::vec_iter, &[], 56, FIXTURE_75);
+    op!(VEC_REPLACE, VecReplace, 2, MUT_RECEIVER_VALUE_AND_RESULT_VEC, NATIVE_VEC, MUTATES,
+        vec::legality_replace, vec::vec_replace, &[], 80, FIXTURE_75);
+    op!(VEC_MEM_SWAP, VecMemSwap, 2, TWO_MUT_VEC, NATIVE_VEC, MUTATES,
+        vec::legality_mem_swap, vec::vec_mem_swap, &[], 110, FIXTURE_75);
     op!(VEC_INDEX, VecIndex, 3, RECEIVER_VEC, NATIVE_VEC, THROWS,
-        vec::legality_index, vec::vec_index, &[], 120, FIXTURE_75);
+        vec::legality_index, vec::vec_index, &["nv_idx"], 34, FIXTURE_75);
     op!(VEC_INDEX_MUT, VecIndexMut, 3, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS,
-        vec::legality_index, vec::vec_index, &[], 120, FIXTURE_75);
+        vec::legality_index, vec::vec_index, &["nv_idx"], 34, FIXTURE_75);
+    op!(VEC_RANGE_INDEX, VecRangeIndex, 3, RECEIVER_VEC, NATIVE_VEC, THROWS,
+        vec::legality_range_index, vec::vec_range_index, &["nv_range"], 40, FIXTURE_75);
+    op!(VEC_RANGE_INDEX_MUT, VecRangeIndexMut, 3, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS,
+        vec::legality_range_index, vec::vec_range_index, &["nv_range"], 40, FIXTURE_75);
     op!(VEC_REMOVE, VecRemove, 3, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS_AND_MUTATES,
-        vec::legality_remove, vec::vec_remove, &[], 190, FIXTURE_75);
+        vec::legality_remove, vec::vec_remove, &["nv_remove"], 34, FIXTURE_75);
+    op!(VEC_SWAP_REMOVE, VecSwapRemove, 2, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS_AND_MUTATES,
+        vec::legality_remove, vec::vec_swap_remove, &["nv_swap_remove"], 34, FIXTURE_75);
     op!(VEC_EXTEND, VecExtend, 2, MUT_RECEIVER_AND_VALUE_VEC, NATIVE_VEC, THROWS_AND_MUTATES,
         vec::legality_extend, vec::vec_extend,
-        &["native_vec_set_capacity"], 380, FIXTURE_75);
+        &["nv_extend"], 38, FIXTURE_75);
+    op!(VEC_EXTEND_FROM_SLICE, VecExtendFromSlice, 2, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS_AND_MUTATES,
+        vec::legality_extend_from_slice, vec::vec_extend_from_slice,
+        &["nv_extend_slice"], 38, FIXTURE_75);
+    op!(VEC_CLONE, VecClone, 1, RECEIVER_AND_RESULT_VEC, NATIVE_VEC, PURE,
+        vec::legality_clone, vec::vec_clone,
+        &["nv_clone"], 28, FIXTURE_75);
+    op!(SLICE_TO_VEC, SliceToVec, 1, RESULT_VEC, NATIVE_VEC, PURE,
+        vec::legality_slice_to_vec, vec::slice_to_vec,
+        &["nv_from_slice"], 32, FIXTURE_75);
     op!(VEC_DROP, VecDrop, 1, MUT_RECEIVER_VEC, NATIVE_VEC, MUTATES,
         vec::legality_unit_return, vec::vec_drop,
-        &["native_vec_set_capacity", "native_vec_set_len"], 70, FIXTURE_76,
+        &[], 40, FIXTURE_76,
         Deps::ElementDropGlue);
     op!(BOX_DROP, BoxDrop, 1, MUT_RECEIVER_BOX, NATIVE_BOX, MUTATES,
         drop::legality_box_drop, drop::box_drop, &[], 45, FIXTURE_89,
@@ -471,13 +539,34 @@ pub fn registry(operation: StandardOperation) -> Option<&'static SemanticOp> {
         StandardOperation::VecCapacity => &VEC_CAPACITY,
         StandardOperation::VecIsEmpty => &VEC_IS_EMPTY,
         StandardOperation::VecPush => &VEC_PUSH,
+        StandardOperation::VecPushMut => &VEC_PUSH_MUT,
+        StandardOperation::VecInsert => &VEC_INSERT,
+        StandardOperation::VecInsertMut => &VEC_INSERT_MUT,
+        StandardOperation::VecReserve => &VEC_RESERVE,
+        StandardOperation::VecReserveExact => &VEC_RESERVE_EXACT,
+        StandardOperation::VecShrinkToFit => &VEC_SHRINK_TO_FIT,
+        StandardOperation::VecTruncate => &VEC_TRUNCATE,
+        StandardOperation::VecPop => &VEC_POP,
+        StandardOperation::VecResize => &VEC_RESIZE,
+        StandardOperation::VecFromElem => &VEC_FROM_ELEM,
+        StandardOperation::VecFromBoxArray => &VEC_FROM_BOX_ARRAY,
         StandardOperation::VecClear => &VEC_CLEAR,
         StandardOperation::VecAsSlice => &VEC_AS_SLICE,
         StandardOperation::VecAsMutSlice => &VEC_AS_MUT_SLICE,
+        StandardOperation::VecIter => &VEC_ITER,
+        StandardOperation::VecIterMut => &VEC_ITER_MUT,
+        StandardOperation::VecReplace => &VEC_REPLACE,
+        StandardOperation::VecMemSwap => &VEC_MEM_SWAP,
         StandardOperation::VecIndex => &VEC_INDEX,
         StandardOperation::VecIndexMut => &VEC_INDEX_MUT,
+        StandardOperation::VecRangeIndex => &VEC_RANGE_INDEX,
+        StandardOperation::VecRangeIndexMut => &VEC_RANGE_INDEX_MUT,
         StandardOperation::VecRemove => &VEC_REMOVE,
+        StandardOperation::VecSwapRemove => &VEC_SWAP_REMOVE,
         StandardOperation::VecExtend => &VEC_EXTEND,
+        StandardOperation::VecExtendFromSlice => &VEC_EXTEND_FROM_SLICE,
+        StandardOperation::VecClone => &VEC_CLONE,
+        StandardOperation::SliceToVec => &SLICE_TO_VEC,
         StandardOperation::VecDrop => &VEC_DROP,
         StandardOperation::BoxDrop => &BOX_DROP,
         StandardOperation::SliceSwap => &SLICE_SWAP,
@@ -676,7 +765,11 @@ fn validate_abi(cx: &LowerCx<'_>, op: &SemanticOp) -> Result<(), SemanticDecline
         op.id,
         StandardOperation::VecIndex
             | StandardOperation::VecIndexMut
+            | StandardOperation::VecRangeIndex
+            | StandardOperation::VecRangeIndexMut
             | StandardOperation::VecRemove
+            | StandardOperation::VecInsert
+            | StandardOperation::VecInsertMut
             | StandardOperation::SliceSwap
     );
     if abi.caller_location != accepts_caller_location {

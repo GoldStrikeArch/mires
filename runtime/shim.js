@@ -101,10 +101,12 @@ globalThis.__rt.f2i_big = (x, bits, signed) => {
 // truncates instead, since `delete` cannot remove its `length`.
 globalThis.__rt.overwrite = (target, value) => {
   if (Array.isArray(target)) {
-    const ev = globalThis.__rt._element_view_of.get(target);
-    if (ev !== undefined) {
-      for (let i = 0; i < ev.n; i++) ev.buf[ev.off + i] = value[i];
-      return target;
+    if (globalThis.__rt._element_view_of !== null) {
+      const ev = globalThis.__rt._element_view_of.get(target);
+      if (ev !== undefined) {
+        for (let i = 0; i < ev.n; i++) ev.buf[ev.off + i] = value[i];
+        return target;
+      }
     }
     target.length = 0;
     return Object.assign(target, value);
@@ -325,10 +327,12 @@ globalThis.__rt.addr = (p, size) => {
       : (u.w !== undefined && u.w > 0 ? size / u.w : size);
   } else {
     if (typeof p === "object" && !("buf" in p)) {
-      const ev = globalThis.__rt._element_view_of.get(p);
-      if (ev !== undefined) {
-        const elemSize = ev.es !== undefined ? ev.es : (ev.n > 0 ? size / ev.n : size);
-        return globalThis.__rt.addr({ buf: ev.buf, off: ev.off }, elemSize);
+      if (globalThis.__rt._element_view_of !== null) {
+        const ev = globalThis.__rt._element_view_of.get(p);
+        if (ev !== undefined) {
+          const elemSize = ev.es !== undefined ? ev.es : (ev.n > 0 ? size / ev.n : size);
+          return globalThis.__rt.addr({ buf: ev.buf, off: ev.off }, elemSize);
+        }
       }
       if (globalThis.__rt._boxes !== null) {
         const slot = globalThis.__rt._boxes.get(p);
@@ -347,31 +351,33 @@ globalThis.__rt.addr = (p, size) => {
     let w = p.w;
     let evEs;
     while (typeof buf === "object" && buf !== null) {
-      const ev = globalThis.__rt._element_view_of.get(buf);
-      if (ev !== undefined) {
-        const elemEs = ev.es !== undefined ? ev.es : es;
-        off = inBytes && elemEs !== undefined ? off + ev.off * elemEs : off + ev.off;
-        if (ev.es !== undefined) evEs = ev.es;
-        buf = ev.buf;
-        continue;
-      }
-      if (key === undefined && globalThis.__rt._boxed.has(buf)) {
-        const held = buf[0];
-        const bev = held !== null && typeof held === "object"
-          ? globalThis.__rt._element_view_of.get(held)
-          : undefined;
-        if (bev !== undefined) {
-          const elemEs = bev.es !== undefined
-            ? bev.es
-            : (es !== undefined && bev.n > 0 ? es / bev.n : es);
-          off = inBytes && elemEs !== undefined ? off + bev.off * elemEs : bev.off + off * bev.n;
-          if (elemEs !== undefined) {
-            evEs = elemEs;
-            if (!inBytes) es = elemEs;
-          }
-          w = bev.n;
-          buf = bev.buf;
+      if (globalThis.__rt._element_view_of !== null) {
+        const ev = globalThis.__rt._element_view_of.get(buf);
+        if (ev !== undefined) {
+          const elemEs = ev.es !== undefined ? ev.es : es;
+          off = inBytes && elemEs !== undefined ? off + ev.off * elemEs : off + ev.off;
+          if (ev.es !== undefined) evEs = ev.es;
+          buf = ev.buf;
           continue;
+        }
+        if (key === undefined && globalThis.__rt._boxed.has(buf)) {
+          const held = buf[0];
+          const bev = held !== null && typeof held === "object"
+            ? globalThis.__rt._element_view_of.get(held)
+            : undefined;
+          if (bev !== undefined) {
+            const elemEs = bev.es !== undefined
+              ? bev.es
+              : (es !== undefined && bev.n > 0 ? es / bev.n : es);
+            off = inBytes && elemEs !== undefined ? off + bev.off * elemEs : bev.off + off * bev.n;
+            if (elemEs !== undefined) {
+              evEs = elemEs;
+              if (!inBytes) es = elemEs;
+            }
+            w = bev.n;
+            buf = bev.buf;
+            continue;
+          }
         }
       }
       const scalar = globalThis.__rt._scalar_view_of.get(buf);
@@ -541,7 +547,7 @@ globalThis.__rt.offset_from = (a, b) => {
   if (a.buf === b.buf && a.w === undefined && b.w === undefined) return a.off - b.off;
   const unwrap = (p) => {
     const w = p.w !== undefined ? p.w : 1;
-    if (p.buf !== null && typeof p.buf === "object") {
+    if (globalThis.__rt._element_view_of !== null && p.buf !== null && typeof p.buf === "object") {
       const ev = globalThis.__rt._element_view_of.get(p.buf);
       if (ev !== undefined) {
         return {
@@ -565,9 +571,9 @@ globalThis.__rt.offset_from = (a, b) => {
   let ua = unwrap(a);
   let ub = unwrap(b);
   if (ua.buf !== ub.buf) {
-    if (a.w === undefined && globalThis.__rt._boxed.has(a.buf) && a.buf[0] === ub.buf && Array.isArray(ub.buf)) {
+    if (a.w === undefined && globalThis.__rt._boxed.has(a.buf) && a.buf[0] === ub.buf && (Array.isArray(ub.buf) || ArrayBuffer.isView(ub.buf))) {
       ua = { buf: ub.buf, off: a.off * ub.buf.length, w: ub.w };
-    } else if (b.w === undefined && globalThis.__rt._boxed.has(b.buf) && b.buf[0] === ua.buf && Array.isArray(ua.buf)) {
+    } else if (b.w === undefined && globalThis.__rt._boxed.has(b.buf) && b.buf[0] === ua.buf && (Array.isArray(ua.buf) || ArrayBuffer.isView(ua.buf))) {
       ub = { buf: ua.buf, off: b.off * ua.buf.length, w: ua.w };
     }
   }
@@ -576,7 +582,7 @@ globalThis.__rt.offset_from = (a, b) => {
     return w > 1 ? Math.trunc((ua.off - ub.off) / w) : ua.off - ub.off;
   }
   const home = (p, other) => {
-    if (!globalThis.__rt._boxed.has(p.buf) || !Array.isArray(other.buf)) return -1;
+    if (!globalThis.__rt._boxed.has(p.buf) || !(Array.isArray(other.buf) || ArrayBuffer.isView(other.buf))) return -1;
     return other.buf.indexOf(p.buf[p.off]);
   };
   const inb = home(ua, ub);
@@ -608,6 +614,13 @@ globalThis.__rt.offset_from = (a, b) => {
 globalThis.__rt.ptr_eq = (a, b) => {
   if (a === b) return true;
   if (a == null || b == null) return false;
+  if (typeof a === "object" && typeof b === "object" &&
+      a.n === undefined && b.n === undefined &&
+      a.buf === b.buf && typeof a.buf === "object" && a.buf !== null &&
+      a.pr === undefined && b.pr === undefined &&
+      a.sc === b.sc && a.w === b.w && a.es === b.es) {
+    return a.off === b.off;
+  }
   const aNum = typeof a === "number";
   const bNum = typeof b === "number";
   if ((aNum && bNum) || (!aNum && typeof a !== "object") || (!bNum && typeof b !== "object")) return false;
@@ -630,6 +643,7 @@ globalThis.__rt.ptr_eq = (a, b) => {
   const aSlot = "buf" in l;
   const bSlot = "buf" in r;
   if (!aSlot && !bSlot) {
+    if (globalThis.__rt._element_view_of === null) return false;
     const aEv = globalThis.__rt._element_view_of.get(l);
     const bEv = globalThis.__rt._element_view_of.get(r);
     if (aEv === undefined && bEv === undefined) return false;
@@ -641,7 +655,7 @@ globalThis.__rt.ptr_eq = (a, b) => {
     return ev.buf === other && ev.off === 0;
   }
   if (!aSlot) {
-    const ev = globalThis.__rt._element_view_of.get(l);
+    const ev = globalThis.__rt._element_view_of !== null ? globalThis.__rt._element_view_of.get(l) : undefined;
     if (ev !== undefined) {
       l = ev.es !== undefined && ev.es > 1
         ? { buf: ev.buf, off: ev.off, es: ev.es }
@@ -655,7 +669,7 @@ globalThis.__rt.ptr_eq = (a, b) => {
     }
   }
   if (!bSlot) {
-    const ev = globalThis.__rt._element_view_of.get(r);
+    const ev = globalThis.__rt._element_view_of !== null ? globalThis.__rt._element_view_of.get(r) : undefined;
     if (ev !== undefined) {
       r = ev.es !== undefined && ev.es > 1
         ? { buf: ev.buf, off: ev.off, es: ev.es }
@@ -676,27 +690,29 @@ globalThis.__rt.ptr_eq = (a, b) => {
   let rb = r.buf, ro = typeof r.off === "number" ? r.off : 0, rKey = typeof r.off === "number" ? undefined : r.off;
   let rInB = r.sc !== undefined, rEs = r.sc !== undefined ? r.sc : r.es;
   while (typeof lb === "object" && lb !== null) {
-    const ev = globalThis.__rt._element_view_of.get(lb);
-    if (ev !== undefined) {
-      const elemEs = ev.es !== undefined ? ev.es : lEs;
-      lo = lInB && elemEs !== undefined ? lo + ev.off * elemEs : lo + ev.off;
-      if (!lInB && ev.es !== undefined && lEs === undefined) lEs = ev.es;
-      lb = ev.buf;
-      continue;
-    }
-    if (lKey === undefined && globalThis.__rt._boxed.has(lb)) {
-      const held = lb[0];
-      const bev = held !== null && typeof held === "object"
-        ? globalThis.__rt._element_view_of.get(held)
-        : undefined;
-      if (bev !== undefined) {
-        const elemEs = bev.es !== undefined
-          ? bev.es
-          : (lEs !== undefined && bev.n > 0 ? lEs / bev.n : lEs);
-        lo = lInB && elemEs !== undefined ? lo + bev.off * elemEs : bev.off + lo * bev.n;
-        if (!lInB && elemEs !== undefined) lEs = elemEs;
-        lb = bev.buf;
+    if (globalThis.__rt._element_view_of !== null) {
+      const ev = globalThis.__rt._element_view_of.get(lb);
+      if (ev !== undefined) {
+        const elemEs = ev.es !== undefined ? ev.es : lEs;
+        lo = lInB && elemEs !== undefined ? lo + ev.off * elemEs : lo + ev.off;
+        if (!lInB && ev.es !== undefined && lEs === undefined) lEs = ev.es;
+        lb = ev.buf;
         continue;
+      }
+      if (lKey === undefined && globalThis.__rt._boxed.has(lb)) {
+        const held = lb[0];
+        const bev = held !== null && typeof held === "object"
+          ? globalThis.__rt._element_view_of.get(held)
+          : undefined;
+        if (bev !== undefined) {
+          const elemEs = bev.es !== undefined
+            ? bev.es
+            : (lEs !== undefined && bev.n > 0 ? lEs / bev.n : lEs);
+          lo = lInB && elemEs !== undefined ? lo + bev.off * elemEs : bev.off + lo * bev.n;
+          if (!lInB && elemEs !== undefined) lEs = elemEs;
+          lb = bev.buf;
+          continue;
+        }
       }
     }
     const sv = globalThis.__rt._scalar_view_of.get(lb);
@@ -717,27 +733,29 @@ globalThis.__rt.ptr_eq = (a, b) => {
     break;
   }
   while (typeof rb === "object" && rb !== null) {
-    const ev = globalThis.__rt._element_view_of.get(rb);
-    if (ev !== undefined) {
-      const elemEs = ev.es !== undefined ? ev.es : rEs;
-      ro = rInB && elemEs !== undefined ? ro + ev.off * elemEs : ro + ev.off;
-      if (!rInB && ev.es !== undefined && rEs === undefined) rEs = ev.es;
-      rb = ev.buf;
-      continue;
-    }
-    if (rKey === undefined && globalThis.__rt._boxed.has(rb)) {
-      const held = rb[0];
-      const bev = held !== null && typeof held === "object"
-        ? globalThis.__rt._element_view_of.get(held)
-        : undefined;
-      if (bev !== undefined) {
-        const elemEs = bev.es !== undefined
-          ? bev.es
-          : (rEs !== undefined && bev.n > 0 ? rEs / bev.n : rEs);
-        ro = rInB && elemEs !== undefined ? ro + bev.off * elemEs : bev.off + ro * bev.n;
-        if (!rInB && elemEs !== undefined) rEs = elemEs;
-        rb = bev.buf;
+    if (globalThis.__rt._element_view_of !== null) {
+      const ev = globalThis.__rt._element_view_of.get(rb);
+      if (ev !== undefined) {
+        const elemEs = ev.es !== undefined ? ev.es : rEs;
+        ro = rInB && elemEs !== undefined ? ro + ev.off * elemEs : ro + ev.off;
+        if (!rInB && ev.es !== undefined && rEs === undefined) rEs = ev.es;
+        rb = ev.buf;
         continue;
+      }
+      if (rKey === undefined && globalThis.__rt._boxed.has(rb)) {
+        const held = rb[0];
+        const bev = held !== null && typeof held === "object"
+          ? globalThis.__rt._element_view_of.get(held)
+          : undefined;
+        if (bev !== undefined) {
+          const elemEs = bev.es !== undefined
+            ? bev.es
+            : (rEs !== undefined && bev.n > 0 ? rEs / bev.n : rEs);
+          ro = rInB && elemEs !== undefined ? ro + bev.off * elemEs : bev.off + ro * bev.n;
+          if (!rInB && elemEs !== undefined) rEs = elemEs;
+          rb = bev.buf;
+          continue;
+        }
       }
     }
     const sv = globalThis.__rt._scalar_view_of.get(rb);
@@ -900,14 +918,14 @@ globalThis.__rt._run = (p, count, op) => {
       buf = globalThis.__rt._bv.unwrap_buf(buf);
     }
   }
-  if (typeof buf === "object" && buf !== null) {
+  if (globalThis.__rt._element_view_of !== null && typeof buf === "object" && buf !== null) {
     const ev = globalThis.__rt._element_view_of.get(buf);
     if (ev !== undefined) {
       buf = ev.buf;
       off += ev.off;
     }
   }
-  if (Array.isArray(buf) && off + n > buf.length) {
+  if ((Array.isArray(buf) || ArrayBuffer.isView(buf)) && off + n > buf.length) {
     throw __rt.abort_error(new Error(
       "rustc_codegen_js: `" + op + "` over " + n + " elements at " + off +
         " reaches past the end of a buffer of " + buf.length,
@@ -951,9 +969,14 @@ globalThis.__rt.copy = (dst, src, count, clone) => {
   globalThis.__rt._scales(dst, src, "copy");
   const d = globalThis.__rt._run(dst, count, "copy");
   const s = globalThis.__rt._run(src, count, "copy");
-  if (effCl === undefined && d.buf === s.buf && Array.isArray(d.buf)
+  if (effCl === undefined && d.buf === s.buf && (Array.isArray(d.buf) || ArrayBuffer.isView(d.buf))
       && (globalThis.__rt._bv === null || !globalThis.__rt._bv.is_bv(d.buf))) {
     d.buf.copyWithin(d.off, s.off, s.off + s.n);
+    return;
+  }
+  if (effCl === undefined && ArrayBuffer.isView(d.buf) && ArrayBuffer.isView(s.buf)
+      && d.buf.constructor === s.buf.constructor) {
+    d.buf.set(s.buf.subarray(s.off, s.off + s.n), d.off);
     return;
   }
   const bv = globalThis.__rt._bv;
@@ -1090,7 +1113,7 @@ globalThis.__rt.write_bytes = (dst, byte, count, zero) => {
     }
   }
   const d = globalThis.__rt._run(dst, count, "write_bytes");
-  if (Array.isArray(d.buf)) {
+  if (Array.isArray(d.buf) || ArrayBuffer.isView(d.buf)) {
     d.buf.fill(value, d.off, d.off + d.n);
     return;
   }
@@ -1163,7 +1186,7 @@ globalThis.__rt.read_array = (p, n) => {
   }
   if (p.w === undefined) {
     const held = p.buf[p.off];
-    if (held !== null && typeof held === "object") {
+    if (globalThis.__rt._element_view_of !== null && held !== null && typeof held === "object") {
       const ev = globalThis.__rt._element_view_of.get(held);
       if (ev !== undefined) return Array.prototype.slice.call(ev.buf, ev.off, ev.off + n);
     }
@@ -1199,7 +1222,7 @@ globalThis.__rt.array_ref = (p, n, es) => {
   if (p.w === undefined) {
     const held = p.buf === undefined ? undefined : p.buf[p.off];
     if (held === undefined || (Array.isArray(held) && held.length === n)) {
-      if (es !== undefined && held !== null && typeof held === "object") {
+      if (es !== undefined && globalThis.__rt._element_view_of !== null && held !== null && typeof held === "object") {
         const ev = globalThis.__rt._element_view_of.get(held);
         if (ev !== undefined && ev.es === undefined) ev.es = es;
       }
@@ -1229,7 +1252,7 @@ globalThis.__rt._element_view = (buf, off, n, es) => {
   }
   // The buffer already is that array, which is the common case: a window over the
   // whole of what it was cast from.
-  if (off === 0 && buf.length === n) return buf;
+  if (off === 0 && buf.length === n && Array.isArray(buf)) return buf;
 
   let views = globalThis.__rt._views.get(buf);
   if (views === undefined) {
@@ -1378,7 +1401,7 @@ globalThis.__rt.scale = (p, size, cl) => {
   if (typeof p === "number") return p;
   if (p === null || p === undefined) return 0;
   if (typeof p.buf === "number") return (p.buf + (p.sc !== undefined ? p.off : p.off * size)) >>> 0;
-  if (p.buf !== null && typeof p.buf === "object" && typeof p.off === "number" && p.pr === undefined) {
+  if (globalThis.__rt._element_view_of !== null && p.buf !== null && typeof p.buf === "object" && typeof p.off === "number" && p.pr === undefined) {
     const ev = globalThis.__rt._element_view_of.get(p.buf);
     if (ev !== undefined) p = { buf: ev.buf, off: ev.off + p.off };
   }
@@ -1593,31 +1616,33 @@ globalThis.__rt._unwrap_view = (p) => {
   let w = p.w;
   let evEs;
   while (typeof buf === "object" && buf !== null) {
-    const ev = globalThis.__rt._element_view_of.get(buf);
-    if (ev !== undefined) {
-      const elemEs = ev.es !== undefined ? ev.es : es;
-      off = inBytes && elemEs !== undefined ? off + ev.off * elemEs : off + ev.off;
-      if (ev.es !== undefined) evEs = ev.es;
-      buf = ev.buf;
-      continue;
-    }
-    if (key === undefined && globalThis.__rt._boxed.has(buf)) {
-      const held = buf[0];
-      const bev = held !== null && typeof held === "object"
-        ? globalThis.__rt._element_view_of.get(held)
-        : undefined;
-      if (bev !== undefined) {
-        const elemEs = bev.es !== undefined
-          ? bev.es
-          : (es !== undefined && bev.n > 0 ? es / bev.n : es);
-        off = inBytes && elemEs !== undefined ? off + bev.off * elemEs : bev.off + off * bev.n;
-        if (elemEs !== undefined) {
-          evEs = elemEs;
-          if (!inBytes) es = elemEs;
-        }
-        w = bev.n;
-        buf = bev.buf;
+    if (globalThis.__rt._element_view_of !== null) {
+      const ev = globalThis.__rt._element_view_of.get(buf);
+      if (ev !== undefined) {
+        const elemEs = ev.es !== undefined ? ev.es : es;
+        off = inBytes && elemEs !== undefined ? off + ev.off * elemEs : off + ev.off;
+        if (ev.es !== undefined) evEs = ev.es;
+        buf = ev.buf;
         continue;
+      }
+      if (key === undefined && globalThis.__rt._boxed.has(buf)) {
+        const held = buf[0];
+        const bev = held !== null && typeof held === "object"
+          ? globalThis.__rt._element_view_of.get(held)
+          : undefined;
+        if (bev !== undefined) {
+          const elemEs = bev.es !== undefined
+            ? bev.es
+            : (es !== undefined && bev.n > 0 ? es / bev.n : es);
+          off = inBytes && elemEs !== undefined ? off + bev.off * elemEs : bev.off + off * bev.n;
+          if (elemEs !== undefined) {
+            evEs = elemEs;
+            if (!inBytes) es = elemEs;
+          }
+          w = bev.n;
+          buf = bev.buf;
+          continue;
+        }
       }
     }
     const scalar = globalThis.__rt._scalar_view_of.get(buf);
@@ -1858,7 +1883,7 @@ globalThis.__rt._bv_enable = (() => {
         return { buf, off: p.off, len };
       }
       if (p.es !== undefined && p.es > 1) {
-        if (p.buf !== null && typeof p.buf === "object" && typeof p.off === "number" && p.pr === undefined) {
+        if (globalThis.__rt._element_view_of !== null && p.buf !== null && typeof p.buf === "object" && typeof p.off === "number" && p.pr === undefined) {
           const ev = globalThis.__rt._element_view_of.get(p.buf);
           if (ev !== undefined) {
             p = p.sk !== undefined
@@ -1953,10 +1978,12 @@ globalThis.__rt._bv_enable = (() => {
     },
     addr_unwrap(p, size) {
       if (typeof p === "object" && !("buf" in p)) {
-        const ev = globalThis.__rt._element_view_of.get(p);
-        if (ev !== undefined) {
-          const elemSize = ev.es !== undefined ? ev.es : (ev.n > 0 ? size / ev.n : size);
-          return globalThis.__rt.addr({ buf: ev.buf, off: ev.off }, elemSize);
+        if (globalThis.__rt._element_view_of !== null) {
+          const ev = globalThis.__rt._element_view_of.get(p);
+          if (ev !== undefined) {
+            const elemSize = ev.es !== undefined ? ev.es : (ev.n > 0 ? size / ev.n : size);
+            return globalThis.__rt.addr({ buf: ev.buf, off: ev.off }, elemSize);
+          }
         }
         if (globalThis.__rt._boxes !== null) {
           const slot = globalThis.__rt._boxes.get(p);
@@ -1995,6 +2022,7 @@ globalThis.__rt._bv_enable = (() => {
       const aSlot = "buf" in a;
       const bSlot = "buf" in b;
       if (!aSlot && !bSlot) {
+        if (globalThis.__rt._element_view_of === null) return false;
         const aEv = globalThis.__rt._element_view_of.get(a);
         const bEv = globalThis.__rt._element_view_of.get(b);
         if (aEv === undefined && bEv === undefined) return false;
@@ -2006,7 +2034,7 @@ globalThis.__rt._bv_enable = (() => {
         return ev.buf === other && ev.off === 0;
       }
       if (!aSlot) {
-        const ev = globalThis.__rt._element_view_of.get(a);
+        const ev = globalThis.__rt._element_view_of !== null ? globalThis.__rt._element_view_of.get(a) : undefined;
         if (ev !== undefined) {
           a = ev.es !== undefined && ev.es > 1
             ? { buf: ev.buf, off: ev.off, es: ev.es }
@@ -2019,7 +2047,7 @@ globalThis.__rt._bv_enable = (() => {
         }
       }
       if (!bSlot) {
-        const ev = globalThis.__rt._element_view_of.get(b);
+        const ev = globalThis.__rt._element_view_of !== null ? globalThis.__rt._element_view_of.get(b) : undefined;
         if (ev !== undefined) {
           b = ev.es !== undefined && ev.es > 1
             ? { buf: ev.buf, off: ev.off, es: ev.es }
@@ -2194,7 +2222,7 @@ globalThis.__rt._bv_enable = (() => {
         return { buf: bv.buf, off: p.off / size };
       }
       if (size === 1 && p.es !== undefined && p.es > 1) {
-        if (p.buf !== null && typeof p.buf === "object" && typeof p.off === "number" && p.pr === undefined) {
+        if (globalThis.__rt._element_view_of !== null && p.buf !== null && typeof p.buf === "object" && typeof p.off === "number" && p.pr === undefined) {
           const ev = globalThis.__rt._element_view_of.get(p.buf);
           if (ev !== undefined) {
             p = p.sk !== undefined
@@ -2293,7 +2321,7 @@ globalThis.__rt.scale_scalar = (p, size, kind, signed) => {
   if (typeof p === "number") return p;
   if (p === null || p === undefined) return 0;
   if (typeof p.buf === "number") return (p.buf + (p.sc !== undefined ? p.off : p.off * size)) >>> 0;
-  if (p.buf !== null && typeof p.buf === "object" && typeof p.off === "number" && p.pr === undefined) {
+  if (globalThis.__rt._element_view_of !== null && p.buf !== null && typeof p.buf === "object" && typeof p.off === "number" && p.pr === undefined) {
     const ev = globalThis.__rt._element_view_of.get(p.buf);
     if (ev !== undefined) p = { buf: ev.buf, off: ev.off + p.off };
   }
@@ -2611,13 +2639,15 @@ globalThis.__rt.unwindow = (p) => {
   // pointer (`Arguments::new`'s `&[u8; N] -> NonNull<u8>` transmute): the pointer to
   // its first element is the array itself with index zero.
   if (Array.isArray(p)) {
-    const ev = globalThis.__rt._element_view_of.get(p);
-    if (ev !== undefined) return { buf: ev.buf, off: ev.off };
+    if (globalThis.__rt._element_view_of !== null) {
+      const ev = globalThis.__rt._element_view_of.get(p);
+      if (ev !== undefined) return { buf: ev.buf, off: ev.off };
+    }
     return { buf: p, off: 0 };
   }
   if (p.w === undefined) {
     const held = p.buf[p.off];
-    if (held !== null && typeof held === "object") {
+    if (globalThis.__rt._element_view_of !== null && held !== null && typeof held === "object") {
       const ev = globalThis.__rt._element_view_of.get(held);
       if (ev !== undefined) return { buf: ev.buf, off: ev.off };
     }
@@ -4869,6 +4899,30 @@ globalThis.__rt.native_vec_set_len = (value, length) => {
   value.len = length;
 };
 
+// Compact unified NativeVec helpers (shared by both growable ES2018 TypedArrays
+// and plain JS Arrays). Kind tags 0..=7 index _tv_ctors: u8, i8, u16, i16, u32,
+// i32, f32, f64. Hot paths (nv_push, nv_push_mut, nv_idx, nv_clone) avoid any
+// ArrayBuffer.isView check; growth/shrink/remove branch once on isView.
+globalThis.__rt._tv_ctors = [Uint8Array,Int8Array,Uint16Array,Int16Array,Uint32Array,Int32Array,Float32Array,Float64Array];
+globalThis.__rt.tv_new = (k) => ({buf:new __rt._tv_ctors[k](0),len:0,cap:0});
+globalThis.__rt.nv_cap = (c, m, k) => { if (c > m) throw new RangeError("cap"); return {buf:k!==void 0?new __rt._tv_ctors[k](c):new Array(c),len:0,cap:c}; };
+globalThis.__rt._nv_grow = (v, r, m, e) => { if (r > m) throw new RangeError("cap"); const b = v.buf, t = ArrayBuffer.isView(b), s = t ? 16 : 8; let n = e ? r : v.cap < s ? s : v.cap * 2; if (n < r) n = r; if (n > m) n = m; if (t) { const c = new b.constructor(n); if (v.len) c.set(b.subarray(0, v.len)); v.buf = c; } else b.length = n; v.cap = n; };
+globalThis.__rt.nv_push = (v, x, m) => { const l = v.len; if (l === v.cap) __rt._nv_grow(v, l + 1, m, 0); v.buf[l] = x; v.len = l + 1; };
+globalThis.__rt.nv_insert = (v, i, x, m) => { const l = v.len; if (i > l) throw new RangeError("oob"); if (l === v.cap) __rt._nv_grow(v, l + 1, m, 0); const b = v.buf; if (i < l) b.copyWithin(i + 1, i, l); b[i] = x; v.len = l + 1; };
+globalThis.__rt.nv_reserve = (v, a, m, e) => { const r = v.len + a; if (r > v.cap) __rt._nv_grow(v, r, m, e); };
+globalThis.__rt.nv_shrink = (v) => { const l = v.len; if (v.cap > l) { const b = v.buf; if (ArrayBuffer.isView(b)) { const c = new b.constructor(l); if (l) c.set(b.subarray(0, l)); v.buf = c; } else b.length = l; v.cap = l; } };
+globalThis.__rt.nv_from_elem = (x, n, m, k) => { if (n > m) throw new RangeError("cap"); const b = k !== void 0 ? new __rt._tv_ctors[k](n) : new Array(n); if (k === void 0 || x !== 0 || 1 / x < 0) b.fill(x); return {buf:b,len:n,cap:n}; };
+globalThis.__rt.nv_resize = (v, n, x, m) => { const l = v.len; if (n > l) { if (n > v.cap) __rt._nv_grow(v, n, m, 0); v.buf.fill(x, l, n); } else if (n < l && !ArrayBuffer.isView(v.buf)) v.buf.fill(void 0, n, l); v.len = n; };
+globalThis.__rt.nv_extend = (v, s, m) => { const tl = v.len, sl = s.len, r = tl + sl; if (r > v.cap) __rt._nv_grow(v, r, m, 0); s.len = 0; const db = v.buf, sb = s.buf; if (ArrayBuffer.isView(db)) { if (sl) db.set(sb.subarray(0, sl), tl); s.buf = new sb.constructor(0); } else { for (let i = 0; i < sl; i++) { db[tl + i] = sb[i]; sb[i] = void 0; } sb.length = 0; } v.len = r; s.cap = 0; };
+globalThis.__rt.nv_extend_slice = (v, s, m) => { const sl = s.len; if (!sl) return; const tl = v.len, r = tl + sl; if (r > v.cap) __rt._nv_grow(v, r, m, 0); const db = v.buf, sb = s.buf, so = s.off; if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor) db.set(sb.subarray(so, so + sl), tl); else for (let i = 0; i < sl; i++) db[tl + i] = sb[so + i]; v.len = r; };
+globalThis.__rt.nv_clone = (v) => ({buf:v.buf.slice(0,v.len),len:v.len,cap:v.len});
+globalThis.__rt.nv_from_slice = (s, k) => { const l = s.len, sb = s.buf, so = s.off; let b; if (k !== void 0) { const C = __rt._tv_ctors[k]; b = new C(l); if (l) { if (ArrayBuffer.isView(sb) && sb.constructor === C) b.set(sb.subarray(so, so + l)); else for (let i = 0; i < l; i++) b[i] = sb[so + i]; } } else if (!l) b = []; else if (Array.isArray(sb)) b = sb.slice(so, so + l); else { b = new Array(l); for (let i = 0; i < l; i++) b[i] = sb[so + i]; } return {buf:b,len:l,cap:l}; };
+globalThis.__rt.nv_from_box = (p, n, k) => { const a = !n ? [] : (Array.isArray(p) ? p : p.w !== void 0 ? p.buf.slice(p.off, p.off + n) : p.buf[p.off]).slice(0, n); return {buf:k!==void 0?new __rt._tv_ctors[k](a):a,len:n,cap:n}; };
+globalThis.__rt.nv_remove = (v, i) => { const l = v.len; if (i >= l) throw new RangeError("oob"); const b = v.buf, o = b[i]; if (i + 1 < l) b.copyWithin(i, i + 1, l); if (!ArrayBuffer.isView(b)) b[l - 1] = void 0; v.len = l - 1; return o; };
+globalThis.__rt.nv_swap_remove = (v, i) => { const l = v.len; if (i >= l) throw new RangeError("oob"); const b = v.buf, e = l - 1, o = b[i]; if (i !== e) b[i] = b[e]; if (!ArrayBuffer.isView(b)) b[e] = void 0; v.len = e; return o; };
+globalThis.__rt.nv_idx = (v, i, d) => { if (i >= v.len) throw new RangeError("oob"); return d ? v.buf[i] : {buf:v.buf,off:i}; };
+globalThis.__rt.nv_range = (v, a, b) => { if (a > b || b > v.len) throw new RangeError("oob"); return {buf:v.buf,off:a,len:b-a}; };
+
 // ---------------------------------------------------------------------------
 // The heap
 // ---------------------------------------------------------------------------
@@ -4895,6 +4949,8 @@ globalThis.__rt.native_vec_set_len = (value, length) => {
 globalThis.__rt._blocks = new WeakMap();
 let _blkK = null;
 let _blkV;
+let _blkK2 = null;
+let _blkV2;
 globalThis.__rt._freed = Symbol("rustc_codegen_js.freed");
 // Stack arrays reached through `MaybeUninit<u8>` need the same one-time scale
 // bookkeeping without becoming heap blocks. In particular, `_put` must not
@@ -4903,8 +4959,11 @@ globalThis.__rt._uninit_blocks = new WeakMap();
 
 globalThis.__rt._blk_get = (buf) => {
   if (buf === _blkK) return _blkV;
+  if (buf === _blkK2) return _blkV2;
   const meta = globalThis.__rt._blocks.get(buf);
   if (meta !== undefined) {
+    _blkK2 = _blkK;
+    _blkV2 = _blkV;
     _blkK = buf;
     _blkV = meta;
   }
@@ -5177,6 +5236,8 @@ globalThis.__rt.tail_slice = (record, key, len) => {
 globalThis.__rt._register = (buf, bytes, zeroed) => {
   const meta = { bytes, es: 1, fresh: true, zeroed };
   globalThis.__rt._blocks.set(buf, meta);
+  _blkK2 = _blkK;
+  _blkV2 = _blkV;
   _blkK = buf;
   _blkV = meta;
   return { buf, off: 0 };
@@ -5219,6 +5280,7 @@ globalThis.__rt.dealloc = (p, size, align) => {
   }
   if (block.typed !== undefined) globalThis.__rt._blocks.delete(block.typed);
   if (_blkK === buf || _blkK === block.raw || _blkK === block.typed) { _blkK = null; _blkV = undefined; }
+  if (_blkK2 === buf || _blkK2 === block.raw || _blkK2 === block.typed) { _blkK2 = null; _blkV2 = undefined; }
   if (_has_minted_addrs) globalThis.__rt._addr_release(active);
   active.length = 0;
   active[globalThis.__rt._freed] = true;
@@ -6818,88 +6880,10 @@ globalThis.__rt.convert_sb_block = (sb) => {
 // adapter, native Vec back to the baseline raw parts). The block keeps the
 // carrier's capacity and is already element-typed, exactly as an `alloc` +
 // first-cast retype would have left it.
-globalThis.__rt.convert_nv_block = (nv, size, kind) => {
-  const copy = nv.buf.slice(0, nv.len);
-  copy.length = Math.max(nv.cap, nv.len);
-  const p = globalThis.__rt._register(copy, copy.length * size, false);
-  const block = globalThis.__rt._blk_get(copy);
-  block.es = size;
-  const sk = typeof kind === "string" ? kind : undefined;
-  if (sk !== undefined) block.sk = sk;
-  const cl = typeof kind === "function" || kind === true ? kind : undefined;
-  if (cl !== undefined) {
-    block.cl = cl;
-    if (globalThis.__rt._boxes !== null) {
-      for (let i = 0; i < nv.len; i++) {
-        const v = copy[i];
-        if (v !== null && typeof v === "object" && !globalThis.__rt._boxes.has(v)) {
-          globalThis.__rt._boxes.set(v, { buf: copy, off: i });
-        }
-      }
-    }
-  }
-  block.fresh = false;
-  if (size > 1 && globalThis.__rt._bv !== null) {
-    const raw = [];
-    block.raw = raw;
-    block.typed = copy;
-    globalThis.__rt._blocks.set(raw, block);
-    return { buf: raw, off: 0 };
-  }
-  return p;
-};
-
-// convert_block_nv(buf, off, len, cap): a baseline Vec's raw parts entering the
-// native `{ buf, len, cap }` carrier (Phase 4 Convert adapter). The backing
-// array is capacity length with `[0, len)` initialized, exactly the carrier's
-// contract; the copy keeps the baseline block unshared.
-globalThis.__rt.convert_block_nv = (buf, off, len, cap) => {
-  if (globalThis.__rt._bv !== null) {
-    const u = globalThis.__rt._bv.unwrap_slot(buf, off);
-    buf = u.buf;
-    off = u.off;
-  }
-  const blk = globalThis.__rt._blk_get(buf);
-  if (blk !== undefined && blk.typed !== undefined && buf !== blk.typed) {
-    buf = blk.typed;
-    off /= blk.es;
-  }
-  const copy = new Array(cap);
-  for (let i = 0; i < len; i += 1) copy[i] = buf[off + i];
-  return { buf: copy, len, cap };
-};
-
-// convert_block_sv(p, len): a baseline Vec's raw pointer entering SliceView,
-// unwrapping any aliasing byte view or pre-retype raw array.
-globalThis.__rt.convert_block_sv = (p, len) => {
-  if (typeof p === "number" && p > 0 && p < 4096) p = globalThis.__rt._dangling(p);
-  let buf = p.buf;
-  let off = p.off;
-  if (p.sc !== undefined) {
-    off /= p.sc;
-  } else {
-    if (globalThis.__rt._bv !== null) {
-      const u = globalThis.__rt._bv.unwrap_slot(buf, off);
-      buf = u.buf;
-      off = u.off;
-    }
-    const blk = globalThis.__rt._blk_get(buf);
-    if (blk !== undefined && blk.typed !== undefined && buf !== blk.typed) {
-      buf = blk.typed;
-      off /= blk.es;
-    }
-  }
-  return { buf, off, len };
-};
-
-// convert_sv_nv(s): a `{ buf, off, len }` slice view entering the native Vec
-// carrier as an owned exact-fit value (Phase 4 Convert adapter; the planner
-// only converts a dead, unaliased source this way).
-globalThis.__rt.convert_sv_nv = (s) => ({
-  buf: s.buf.slice(s.off, s.off + s.len),
-  len: s.len,
-  cap: s.len,
-});
+globalThis.__rt.convert_nv_block = (nv, s, k) => { const b = nv.buf, l = nv.len, c = ArrayBuffer.isView(b) ? Array.from(b.subarray(0, l)) : b.slice(0, l); c.length = nv.cap > l ? nv.cap : l; const p = __rt._register(c, c.length * s, false), m = __rt._blk_get(c); m.es = s; if (typeof k === "string") m.sk = k; if (typeof k === "function" || k === true) { m.cl = k; if (__rt._boxes !== null) for (let i = 0; i < l; i++) { const v = c[i]; if (v !== null && typeof v === "object" && !__rt._boxes.has(v)) __rt._boxes.set(v, {buf:c,off:i}); } } m.fresh = false; if (s > 1 && __rt._bv !== null) { const r = []; m.raw = r; m.typed = c; __rt._blocks.set(r, m); return {buf:r,off:0}; } return p; };
+globalThis.__rt.convert_block_nv = (buf, off, len, cap, k) => { if (__rt._bv !== null) { const u = __rt._bv.unwrap_slot(buf, off); buf = u.buf; off = u.off; } const b = __rt._blk_get(buf); if (b !== void 0 && b.typed !== void 0 && buf !== b.typed) { buf = b.typed; off /= b.es; } const c = k !== void 0 ? new __rt._tv_ctors[k](cap) : new Array(cap); for (let i = 0; i < len; i++) c[i] = buf[off + i]; return {buf:c,len,cap}; };
+globalThis.__rt.convert_block_sv = (p, len) => { if (typeof p === "number" && p > 0 && p < 4096) p = __rt._dangling(p); let buf = p.buf, off = p.off; if (p.sc !== void 0) off /= p.sc; else { if (__rt._bv !== null) { const u = __rt._bv.unwrap_slot(buf, off); buf = u.buf; off = u.off; } const b = __rt._blk_get(buf); if (b !== void 0 && b.typed !== void 0 && buf !== b.typed) { buf = b.typed; off /= b.es; } } return {buf,off,len}; };
+globalThis.__rt.convert_sv_nv = (s, k) => __rt.nv_from_slice(s, k);
 
 // The `%TypedArray%.prototype` accessors, captured when the runtime loads. They
 // read a typed array's internal slots, so an own `length` or `subarray`

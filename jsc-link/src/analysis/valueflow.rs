@@ -2491,6 +2491,71 @@ impl<'a> Collector<'a> {
                 param_ty(0),
                 &[Step::Deref, Step::Element],
             ),
+            StandardOperation::VecPushMut => {
+                flow(
+                    self,
+                    param_ty(1),
+                    &[],
+                    param_ty(0),
+                    &[Step::Deref, Step::Element],
+                );
+                flow(
+                    self,
+                    param_ty(0),
+                    &[Step::Deref, Step::Element],
+                    ret,
+                    &[Step::Deref],
+                );
+            }
+            StandardOperation::VecInsert => flow(
+                self,
+                param_ty(2),
+                &[],
+                param_ty(0),
+                &[Step::Deref, Step::Element],
+            ),
+            StandardOperation::VecInsertMut => {
+                flow(
+                    self,
+                    param_ty(2),
+                    &[],
+                    param_ty(0),
+                    &[Step::Deref, Step::Element],
+                );
+                flow(
+                    self,
+                    param_ty(0),
+                    &[Step::Deref, Step::Element],
+                    ret,
+                    &[Step::Deref],
+                );
+            }
+            StandardOperation::VecReplace => {
+                flow(self, param_ty(0), &[Step::Deref], param_ty(1), &[]);
+                flow(self, param_ty(0), &[Step::Deref], ret, &[]);
+            }
+            StandardOperation::VecMemSwap => {
+                flow(
+                    self,
+                    param_ty(0),
+                    &[Step::Deref],
+                    param_ty(1),
+                    &[Step::Deref],
+                );
+            }
+            StandardOperation::VecPop => {
+                if let Some((_, ret_ty)) = ret {
+                    if let Some(some_idx) = option_some_variant(types, ret_ty) {
+                        flow(
+                            self,
+                            param_ty(0),
+                            &[Step::Deref, Step::Element],
+                            ret,
+                            &[Step::Variant(some_idx), Step::Field(0)],
+                        );
+                    }
+                }
+            }
             StandardOperation::VecIndex | StandardOperation::VecIndexMut => flow(
                 self,
                 param_ty(0),
@@ -2498,19 +2563,38 @@ impl<'a> Collector<'a> {
                 ret,
                 &[Step::Deref],
             ),
-            StandardOperation::VecAsSlice | StandardOperation::VecAsMutSlice => flow(
+            StandardOperation::VecAsSlice
+            | StandardOperation::VecAsMutSlice
+            | StandardOperation::VecRangeIndex
+            | StandardOperation::VecRangeIndexMut => flow(
                 self,
                 param_ty(0),
                 &[Step::Deref, Step::Element],
                 ret,
                 &[Step::Deref, Step::Element],
             ),
-            StandardOperation::VecRemove => {
+            StandardOperation::VecRemove | StandardOperation::VecSwapRemove => {
                 flow(self, param_ty(0), &[Step::Deref, Step::Element], ret, &[])
             }
             StandardOperation::VecExtend => {
                 flow(self, param_ty(1), &[], param_ty(0), &[Step::Deref])
             }
+            StandardOperation::VecExtendFromSlice => flow(
+                self,
+                param_ty(1),
+                &[Step::Deref, Step::Element],
+                param_ty(0),
+                &[Step::Deref, Step::Element],
+            ),
+            StandardOperation::VecFromElem => flow(self, param_ty(0), &[], ret, &[Step::Element]),
+            StandardOperation::VecClone => flow(self, param_ty(0), &[Step::Deref], ret, &[]),
+            StandardOperation::SliceToVec => flow(
+                self,
+                param_ty(0),
+                &[Step::Deref, Step::Element],
+                ret,
+                &[Step::Element],
+            ),
             _ => {}
         }
     }
@@ -3206,6 +3290,31 @@ fn walk_type(
         _ => {}
     }
     stack.remove(&ty);
+}
+
+/// Variant index of `Some(T)` in a 2-variant `Option<T>` enum (`None` + `Some(T)`).
+fn option_some_variant(types: &TypeTable, ty: TypeId) -> Option<u32> {
+    let TypeKind::Adt {
+        form: NominalForm::Enum,
+        variants,
+        ..
+    } = &types.get(types.peeled(ty))?.kind
+    else {
+        return None;
+    };
+    if variants.len() != 2 {
+        return None;
+    }
+    let mut empty = 0usize;
+    let mut some = None;
+    for (i, v) in variants.iter().enumerate() {
+        match v.fields.len() {
+            0 => empty += 1,
+            1 => some = Some(i as u32),
+            _ => return None,
+        }
+    }
+    (empty == 1).then_some(some).flatten()
 }
 
 /// The unary reasons a type's own facts imply (v1 `blockers_for_type`), and whether the type
@@ -3963,15 +4072,15 @@ mod tests {
     fn an_unsupported_standard_operation_pins_its_slots() {
         let mut prog = Prog::new();
         prog.add_semantic(
-            "pop",
+            "swap",
             identity_func(2, MUT_VEC, UNIT),
-            BodySemantic::Standard(StandardOperation::VecPop),
+            BodySemantic::Standard(StandardOperation::VecSwap),
         );
         let graph = prog.collect();
-        let Ok(func) = &prog.funcs[&JsName::new("pop".to_owned())] else {
+        let Ok(func) = &prog.funcs[&JsName::new("swap".to_owned())] else {
             unreachable!()
         };
-        let key = value_node("pop", Site::Value(func.params[0]), &[Step::Deref]);
+        let key = value_node("swap", Site::Value(func.params[0]), &[Step::Deref]);
         assert!(reasons_of(&graph, &key).contains(&InfReason::UnsupportedOperation));
     }
 
@@ -4405,7 +4514,7 @@ mod tests {
                 function: None,
                 args: vec![r],
                 track_caller: None,
-                semantic: CallSemantic::Standard(StandardOperation::VecPop),
+                semantic: CallSemantic::Standard(StandardOperation::VecSwap),
                 host: None,
             },
             NO_ORIGIN,

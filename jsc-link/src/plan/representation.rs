@@ -109,6 +109,8 @@ pub(crate) struct ReprOutcome {
     pub clones: BTreeMap<JsName, JsName>,
     /// Direct-call targets retargeted only in prepared JIR callers.
     pub call_retargets: BTreeMap<JsName, crate::lower::CallRetargets>,
+    /// Per-function nested native carrier clone guard (`value::clone_expr_with`).
+    pub nested_clone: BTreeMap<JsName, crate::lower::NestedClone>,
 }
 
 impl ReprOutcome {
@@ -124,6 +126,7 @@ impl ReprOutcome {
             bodies: BTreeMap::new(),
             clones: BTreeMap::new(),
             call_retargets: BTreeMap::new(),
+            nested_clone: BTreeMap::new(),
         }
     }
 
@@ -158,6 +161,7 @@ impl ReprOutcome {
             bodies: BTreeMap::new(),
             clones: BTreeMap::new(),
             call_retargets: BTreeMap::new(),
+            nested_clone: BTreeMap::new(),
         }
     }
 }
@@ -432,6 +436,8 @@ struct Commit {
     clones: BTreeMap<JsName, JsName>,
     /// Per emitted caller, the direct items whose private native versions it targets.
     call_retargets: BTreeMap<JsName, crate::lower::CallRetargets>,
+    /// Per emitted item carrying nested native Vec/String fields, its clone guard flags.
+    nested_clone: BTreeMap<JsName, crate::lower::NestedClone>,
     adapters: u32,
     /// Every shim member the committed bodies and adapters reach.
     members: BTreeSet<String>,
@@ -633,25 +639,48 @@ fn collect_bstr_ops(
     (out, as_bytes_items)
 }
 
-fn inlined_vec_elide_set(
+fn inlined_vec_elide_roots(
     table: &BTreeMap<JsName, LinkItem>,
     interns_map: &BTreeMap<JsName, &Interns>,
     lowered: &BTreeMap<ItemId, JsName>,
     name: &JsName,
     func: &Func,
-) -> BTreeSet<(usize, usize)> {
+) -> BTreeMap<(usize, usize), NodeKey> {
     if !crate::lower::bstr::enabled() {
-        return BTreeSet::new();
+        return BTreeMap::new();
     }
     let Some(interns) = interns_map.get(name).copied() else {
-        return BTreeSet::new();
+        return BTreeMap::new();
     };
     let Some(analysis) = analyze_inlined_string_vec(func, &interns.types, interns, |item, _| {
         is_raw_vec_reserve_in_table(table, interns_map, lowered, item)
     }) else {
-        return BTreeSet::new();
+        return BTreeMap::new();
     };
-    analysis.op_cluster.keys().copied().collect()
+    analysis
+        .op_cluster
+        .iter()
+        .map(|(&pos, &cid)| {
+            let cluster = &analysis.clusters[cid];
+            let key = match cluster.root {
+                StringRoot::Cell(c) => NodeKey::Value {
+                    item: name.clone(),
+                    site: Site::Cell(c),
+                    path: Vec::new(),
+                },
+                StringRoot::Value(v) => NodeKey::Value {
+                    item: name.clone(),
+                    site: Site::Value(v),
+                    path: if cluster.root_is_ref {
+                        vec![Step::Deref]
+                    } else {
+                        Vec::new()
+                    },
+                },
+            };
+            (pos, key)
+        })
+        .collect()
 }
 
 impl<'a> Planner<'a> {
@@ -682,7 +711,7 @@ impl Planner<'_> {
         apply: bool,
     ) -> (ReprOutcome, BTreeMap<JsName, Func>) {
         let ops = self.op_entries(problem);
-        let regions = regions(problem, terms);
+        let regions = regions_with(problem, terms, |a, b| self.adapter_site(a, b).is_none());
         anchor_guard(problem, &regions, &ops);
         let helper_nodes = self.helper_nodes(problem, &ops);
         let deps = self.dependency_nodes(problem, &ops);
@@ -822,7 +851,10 @@ impl Planner<'_> {
 
             let mut demote_now: BTreeMap<usize, String> = BTreeMap::new();
             let mut component_savings = Vec::new();
-            for component in &components {
+            let mut solo_winners: Vec<&BTreeSet<usize>> = Vec::new();
+            let mut solo_failed: Vec<(usize, &BTreeSet<usize>, Option<ProgramCost>, String)> =
+                Vec::new();
+            for (comp_idx, component) in components.iter().enumerate() {
                 let mut labels = vec![None; count];
                 for node in component {
                     labels[*node] = carriers[*node];
@@ -842,6 +874,7 @@ impl Planner<'_> {
                     );
                 }
                 if profitable {
+                    solo_winners.push(component);
                     component_savings.push((
                         component,
                         economics.benefit(baseline, cost.expect("checked")),
@@ -849,6 +882,94 @@ impl Planner<'_> {
                     continue;
                 }
                 let decline = exact_cost_decline(economics, baseline, cost);
+                solo_failed.push((comp_idx, component, cost, decline));
+            }
+            // Components that strictly shrink minified program code (`bytes < baseline.bytes`)
+            // can fail solo measurement solely due to the one-time fixed cost of shared runtime
+            // helpers (e.g. `_tv_ctors`/`_nv_grow`/`nv_push`). Test them jointly against the
+            // solo-winners baseline (or `baseline` when there are >= 2 and no solo winners) so
+            // shared helper costs amortize without ever weakening strict zero-growth or letting
+            // a code-bloating component piggyback on solo winners.
+            let mut rescued_indices: BTreeSet<usize> = BTreeSet::new();
+            let min_needed = if solo_winners.is_empty() { 2 } else { 1 };
+            let mut active: Vec<usize> = solo_failed
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (_, _, cost, _))| {
+                    cost.is_some_and(|c| c.bytes < baseline.bytes).then_some(i)
+                })
+                .collect();
+            if active.len() >= min_needed {
+                let mut ref_labels = vec![None; count];
+                for winner in &solo_winners {
+                    for node in *winner {
+                        ref_labels[*node] = carriers[*node];
+                    }
+                }
+                let ref_cost = if solo_winners.is_empty() {
+                    Some(baseline)
+                } else if let Some(cost) = measured.get(&ref_labels) {
+                    *cost
+                } else {
+                    let cost = measure_vector(&ref_labels);
+                    measured.insert(ref_labels.clone(), cost);
+                    cost
+                };
+                if let Some(ref_cost) = ref_cost {
+                    for _ in 0..3 {
+                        if active.len() < min_needed {
+                            break;
+                        }
+                        let mut trial_labels = ref_labels.clone();
+                        for &fi in &active {
+                            for node in solo_failed[fi].1 {
+                                trial_labels[*node] = carriers[*node];
+                            }
+                        }
+                        let trial_cost = if let Some(cost) = measured.get(&trial_labels) {
+                            *cost
+                        } else {
+                            let cost = measure_vector(&trial_labels);
+                            measured.insert(trial_labels, cost);
+                            cost
+                        };
+                        if std::env::var("RCGJS_REPR_DEBUG_COST").is_ok() {
+                            eprintln!(
+                                "repr-cost: joint({}): ref={ref_cost:?} after={trial_cost:?}",
+                                active.len()
+                            );
+                        }
+                        if trial_cost.is_some_and(|tc| economics.accepts(ref_cost, tc)) {
+                            let joint_benefit =
+                                economics.benefit(ref_cost, trial_cost.expect("checked"));
+                            for &fi in &active {
+                                rescued_indices.insert(fi);
+                                component_savings.push((solo_failed[fi].1, joint_benefit));
+                            }
+                            break;
+                        }
+                        if active.len() <= min_needed {
+                            break;
+                        }
+                        // Drop the component with the worst solo emitted cost (e.g. one pulling
+                        // an unshared rare helper) and re-test the remaining candidates.
+                        if let Some((drop_pos, _)) =
+                            active.iter().enumerate().max_by_key(|(_, &fi)| {
+                                let c = solo_failed[fi].2.expect("filtered Some");
+                                (c.emitted_bytes(), c.gzip, solo_failed[fi].0)
+                            })
+                        {
+                            active.remove(drop_pos);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            for (fi, (_, component, _, decline)) in solo_failed.into_iter().enumerate() {
+                if rescued_indices.contains(&fi) {
+                    continue;
+                }
                 for node in component {
                     if matches!(problem.nodes[*node].key, ProblemKey::Value(_)) {
                         demote_now.entry(*node).or_insert_with(|| decline.clone());
@@ -951,11 +1072,13 @@ impl Planner<'_> {
                 .funcs
                 .keys()
                 .chain(commit.bodies.keys())
+                .chain(commit.nested_clone.keys())
                 .cloned()
                 .collect(),
             bodies: commit.bodies,
             clones: commit.clones,
             call_retargets: commit.call_retargets,
+            nested_clone: commit.nested_clone,
         };
         let funcs = if apply { commit.funcs } else { BTreeMap::new() };
         (outcome, funcs)
@@ -1198,12 +1321,9 @@ impl Planner<'_> {
                 continue;
             }
             let inlined_elide =
-                inlined_vec_elide_set(self.table, self.interns, &self.lowered, name, func);
+                inlined_vec_elide_roots(self.table, self.interns, &self.lowered, name, func);
             for (bi, block) in func.blocks.iter().enumerate() {
                 for (oi, op) in block.ops.iter().enumerate() {
-                    if inlined_elide.contains(&(bi, oi)) {
-                        continue;
-                    }
                     let OpKind::Call {
                         callee: Callee::Direct { item, .. },
                         args,
@@ -1225,6 +1345,36 @@ impl Planner<'_> {
                         continue;
                     };
                     if !call_aligns(callee_func, args.len()) {
+                        continue;
+                    }
+                    // An inlined `String.vec` call is only elided when the cluster's `String`
+                    // root goes native (`HostString`/`StringBuilder`). While that `String` stays
+                    // baseline, the call still executes against the baseline `Vec`, so the
+                    // callee's primary body may go native only if the `String` root does.
+                    if let Some(root_key) = inlined_elide.get(&(bi, oi)) {
+                        let guard = problem
+                            .resolution
+                            .get(root_key)
+                            .copied()
+                            .unwrap_or(problem.baseline);
+                        for requirement in slots {
+                            if requirement.reference == ReferenceRequirement::Value {
+                                continue;
+                            }
+                            if let Some(callee) =
+                                self.slot_node(problem, callee_name, callee_func, requirement)
+                            {
+                                if callee != guard {
+                                    pairs.push(Pair {
+                                        a: callee,
+                                        b: guard,
+                                        ab: INF,
+                                        ba: 0,
+                                        native_equal: false,
+                                    });
+                                }
+                            }
+                        }
                         continue;
                     }
                     let cuttable = is_as_str || versionable.contains(callee_name);
@@ -1267,6 +1417,21 @@ impl Planner<'_> {
                             {
                                 pairs.push(Pair {
                                     a: caller,
+                                    b: problem.baseline,
+                                    ab: INF,
+                                    ba: 0,
+                                    native_equal: false,
+                                });
+                            }
+                            // A baseline-only caller (no resolved node at this reference slot,
+                            // e.g. `String::insert` calling `Vec::reserve(&mut self.vec)`) still
+                            // calls the uncloned baseline symbol, so the callee's primary body
+                            // must stay baseline; native callers instead reach a `$n1` clone.
+                            (None, Some(callee))
+                                if requirement.reference != ReferenceRequirement::Value =>
+                            {
+                                pairs.push(Pair {
+                                    a: callee,
                                     b: problem.baseline,
                                     ab: INF,
                                     ba: 0,
@@ -1396,6 +1561,7 @@ impl Planner<'_> {
             call_retargets,
             bigints: None,
             byte_views: self.cx.byte_views,
+            nested_clone: crate::lower::NestedClone::default(),
         })
     }
 
@@ -1770,11 +1936,13 @@ impl Planner<'_> {
                     .call_retargets
                     .get(name)
                     .unwrap_or(crate::lower::EMPTY_CALL_RETARGETS);
-                let input =
+                let mut input =
                     self.lower_input_with(name, item, &opts, abi.spill_names(), retargets)?;
+                input.nested_clone = commit.nested_clone.get(name).copied().unwrap_or_default();
                 let committed = commit.funcs.contains_key(name)
                     || commit.clones.contains_key(name)
-                    || !retargets.is_empty();
+                    || !retargets.is_empty()
+                    || commit.nested_clone.contains_key(name);
                 let describe = || {
                     let names = |names: Vec<&JsName>| {
                         names
@@ -2080,7 +2248,7 @@ impl Planner<'_> {
                         b: bi,
                         ab,
                         ba,
-                        native_equal: false,
+                        native_equal: ab == INF && ba == INF,
                     });
                 }
             }
@@ -2426,25 +2594,85 @@ impl Planner<'_> {
                     .map(|member| (*member).to_owned()),
             );
         }
+        let cloned_items: BTreeMap<ItemId, &JsName> = clone_names
+            .keys()
+            .filter_map(|source| {
+                let item = self.funcs.get(source)?.as_ref().ok()?.item;
+                Some((item, source))
+            })
+            .collect();
+        let mut nested_clones: BTreeMap<&JsName, crate::lower::NestedClone> = BTreeMap::new();
+        for (key, &index) in &problem.resolution {
+            if let NodeKey::Value { item, path, .. } = key {
+                if !path.is_empty() {
+                    match carriers[index] {
+                        Some(Carrier::NativeVec | Carrier::SliceView) => {
+                            nested_clones.entry(item).or_default().vec = true;
+                        }
+                        Some(Carrier::HostString | Carrier::StringBuilder) => {
+                            nested_clones.entry(item).or_default().string = true;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         for (name, func) in self.funcs {
             let Ok(func) = func else { continue };
             if ops.contains_key(name) {
                 continue;
             }
+            let nc = nested_clones.get(name).copied().unwrap_or_default();
+            let has_nested = nc != crate::lower::NestedClone::default();
             match self.commit_func(problem, name, func, carriers, &native_versions, fault) {
                 Ok(None) => {
-                    // A forwarding wrapper can have a native pointee boundary without carrying
-                    // a carrier on any root SSA value. When its baseline address escaped, the
-                    // private version is still real: it forwards to the native callee while the
-                    // retained source continues to forward to the baseline one.
+                    // A forwarding wrapper or structural drop glue can have a native pointee or
+                    // field boundary without carrying a carrier on any root SSA value. Retain it
+                    // in `commit.funcs` when it needs a private clone, must retarget a call/drop
+                    // to a cloned callee, or clones an aggregate carrying a nested native carrier.
+                    let needs_nested_relower = has_nested
+                        && func.blocks.iter().any(|block| {
+                            block.ops.iter().any(|op| {
+                                matches!(op.kind, OpKind::Copy(_) | OpKind::Intrinsic { .. })
+                            })
+                        });
                     if let Some(target) = clone_names.get(name) {
                         commit.funcs.insert(target.clone(), func.clone());
                         commit.clones.insert(target.clone(), name.clone());
+                        if has_nested {
+                            commit.nested_clone.insert(target.clone(), nc);
+                        }
                     } else if native_versions
                         .values()
                         .any(|need| need.callers.contains(name))
+                        || needs_nested_relower
+                        || (!self.nodes_of_item(problem, name, carriers).is_empty()
+                            && func.blocks.iter().any(|block| {
+                                block.ops.iter().any(|op| {
+                                    let item = match &op.kind {
+                                        OpKind::Call {
+                                            callee: Callee::Direct { item, .. },
+                                            host: None,
+                                            ..
+                                        }
+                                        | OpKind::Drop {
+                                            glue: DropGlue::Direct { item, .. },
+                                            ..
+                                        } => item,
+                                        _ => return false,
+                                    };
+                                    cloned_items.get(item).is_some_and(|source| {
+                                        native_versions
+                                            .get(*source)
+                                            .is_none_or(|need| need.callers.contains(name))
+                                    })
+                                })
+                            }))
                     {
                         commit.funcs.insert(name.clone(), func.clone());
+                        if has_nested {
+                            commit.nested_clone.insert(name.clone(), nc);
+                        }
                     }
                 }
                 Ok(Some((rewritten, adapters, members))) => {
@@ -2455,6 +2683,9 @@ impl Planner<'_> {
                         .cloned()
                         .unwrap_or_else(|| name.clone());
                     commit.funcs.insert(target.clone(), rewritten);
+                    if has_nested {
+                        commit.nested_clone.insert(target.clone(), nc);
+                    }
                     if target != *name {
                         commit.clones.insert(target, name.clone());
                     }
@@ -2535,7 +2766,7 @@ impl Planner<'_> {
             if self.is_candidate_glue_or_standard(caller_name) {
                 continue;
             }
-            let inlined_elide = inlined_vec_elide_set(
+            let inlined_elide = inlined_vec_elide_roots(
                 self.table,
                 self.interns,
                 &self.lowered,
@@ -2544,8 +2775,17 @@ impl Planner<'_> {
             );
             for (bi, block) in caller_func.blocks.iter().enumerate() {
                 for (oi, op) in block.ops.iter().enumerate() {
-                    if inlined_elide.contains(&(bi, oi)) {
-                        continue;
+                    if let Some(root_key) = inlined_elide.get(&(bi, oi)) {
+                        let elided = problem
+                            .resolution
+                            .get(root_key)
+                            .and_then(|&node| carriers[node])
+                            .is_some_and(|c| {
+                                matches!(c, Carrier::HostString | Carrier::StringBuilder)
+                            });
+                        if elided {
+                            continue;
+                        }
                     }
                     let OpKind::Call {
                         callee: Callee::Direct { item, .. },
@@ -3668,16 +3908,24 @@ fn exact_cost_decline(
 /// The must-equal-connected components of the problem's candidate value nodes, the anchor and
 /// the facility nodes excluded: the D12 region a decision row is written about. A host pin does
 /// not merge its endpoint into the anchor — it forces the label; the row stays the value's own.
+#[cfg(test)]
 fn regions(problem: &Problem, terms: &[Term]) -> Vec<BTreeSet<usize>> {
+    regions_with(problem, terms, |_, _| false)
+}
+
+fn regions_with(
+    problem: &Problem,
+    terms: &[Term],
+    is_must_equal_adapter: impl Fn(&NodeKey, &NodeKey) -> bool,
+) -> Vec<BTreeSet<usize>> {
     let count = problem.nodes.len();
     let mut unions = UnionFind::new(count);
     for term in terms {
-        let Term::MustEqual { a, b, reason } = term else {
-            continue;
+        let (a, b) = match term {
+            Term::MustEqual { a, b, reason } if *reason != EqualReason::HostPin => (a, b),
+            Term::Adapter { a, b, .. } if is_must_equal_adapter(a, b) => (a, b),
+            _ => continue,
         };
-        if *reason == EqualReason::HostPin {
-            continue;
-        }
         let (Some(a), Some(b)) = (
             problem.resolution.get(a).copied(),
             problem.resolution.get(b).copied(),
@@ -4039,6 +4287,7 @@ mod tests {
                     bodies: BTreeMap::new(),
                     clones: BTreeMap::new(),
                     call_retargets: BTreeMap::new(),
+                    nested_clone: BTreeMap::new(),
                 }
             }
         })
@@ -4113,6 +4362,7 @@ mod tests {
             bodies: BTreeMap::new(),
             clones: BTreeMap::new(),
             call_retargets: BTreeMap::new(),
+            nested_clone: BTreeMap::new(),
         };
         let emptied = outcome.emptied();
         assert_eq!(emptied.block.committed, 0);

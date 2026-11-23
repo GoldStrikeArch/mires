@@ -1,39 +1,107 @@
-//! The `Vec` family emitters: construction, length, growth, indexing, removal, extend, drop.
+//! The `Vec` family emitters: construction, length, growth, indexing, insertion, removal, extend,
+//! clone, truncate, resize, pop, slice-iter, replace, swap, box-array, and drop.
 //!
-//! Ports of v1 `native_std_lower.rs`'s vec arms, spelling for spelling. The carrier is D5's
-//! [`Carrier::NativeVec`]: `{ buf, len, cap }` with `buf` a plain JavaScript array of
-//! **capacity** length, elements initialized in `[0, len)` and released slots cleared. Capacity
-//! grows only as much as an operation requires — Rust does not promise an allocation growth
-//! policy — and every capacity or bounds throw precedes every mutation. Operations that destroy
-//! elements go through `drop.rs`'s element-glue discipline.
+//! The carrier is D5's [`Carrier::NativeVec`]: `{ buf, len, cap }`. Primitive numeric elements
+//! (`u8`, `i8`, `u16`, `i16`, `u32`/`usize`, `i32`/`isize`, `f32`, `f64`) back `buf` with an
+//! ES2018 growable `TypedArray` (kind tags `0..=7`); all other elements back `buf` with a
+//! capacity-length plain JavaScript `Array` with elements initialized in `[0, len)` and released
+//! slots cleared. Both storage forms share unified `__rt.nv_*` runtime helpers to minimize shim
+//! footprint while keeping hot paths free of `ArrayBuffer.isView` checks.
 
 use std::collections::BTreeSet;
 
 use crate::item::JsName;
 use crate::jir::repr::Carrier;
 use crate::jir::semantic::{BodySemantic, StandardOperation};
-use crate::jir::types::{TypeDescriptor, TypeId, TypeKind};
-use crate::jsast::{self, BinOp, Stmt};
+use crate::jir::types::{
+    AllocatorIdentity, EnumRepr, FieldKey, IteratorIdentity, NominalForm, RepresentationCandidate,
+    TypeDescriptor, TypeId, TypeKind,
+};
+use crate::jsast::{self, BinOp, Expr, Stmt};
 use crate::ptr;
 
 use super::drop::require_element_glue;
 use super::string::{member, receiver};
 use super::{
-    capacity_guard, pointer_limit, slot_type, type_get, unsigned_bits, LowerCx, SemanticDecline,
-    SignatureSlot,
+    pointer_limit, slot_type, type_get, unsigned_bits, LowerCx, SemanticDecline, SignatureSlot,
 };
 
+/// ES2018 TypedArray constructor kind tag (`__rt._tv_ctors[k]`) for built-in primitive numeric
+/// elements. 64/128-bit integers (`BigInt64Array`/`BigUint64Array`) are ES2020 and stay plain
+/// `Array`; `bool` and `char` also stay plain `Array`.
+pub(crate) fn typed_array_kind(element: &TypeDescriptor) -> Option<u8> {
+    match element.kind {
+        TypeKind::Integer {
+            signed: false,
+            bits: 8,
+        } => Some(0),
+        TypeKind::Integer {
+            signed: true,
+            bits: 8,
+        } => Some(1),
+        TypeKind::Integer {
+            signed: false,
+            bits: 16,
+        } => Some(2),
+        TypeKind::Integer {
+            signed: true,
+            bits: 16,
+        } => Some(3),
+        TypeKind::Integer {
+            signed: false,
+            bits: 32,
+        } => Some(4),
+        TypeKind::Integer {
+            signed: true,
+            bits: 32,
+        } => Some(5),
+        TypeKind::Float { bits: 32 } => Some(6),
+        TypeKind::Float { bits: 64 } => Some(7),
+        _ => None,
+    }
+}
+
+/// Built-in primitive types whose `Clone` impl is guaranteed by the orphan rule to be a pure,
+/// non-panicking, drop-free bitwise copy.
+fn is_trivial_clone_primitive(element: &TypeDescriptor) -> bool {
+    matches!(
+        element.kind,
+        TypeKind::Bool | TypeKind::Char | TypeKind::Integer { .. } | TypeKind::Float { .. }
+    ) && !element.layout.needs_drop
+        && !element.layout.zst
+        && element.layout.sized
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RangeShape {
+    Full,
+    Bounds,
+    From,
+    To,
+}
+
+fn vec_tv_kind(cx: &LowerCx<'_>) -> Result<Option<u8>, SemanticDecline> {
+    Ok(typed_array_kind(vec_element(cx)?))
+}
+
 pub(super) fn vec_new(
-    _cx: &LowerCx<'_>,
+    cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
     _refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
-    helpers.insert("native_vec_new");
-    Ok(vec![jsast::ret(jsast::rt_call(
-        "native_vec_new",
-        vec![jsast::num(0)],
-    ))])
+    if let Some(kind) = vec_tv_kind(cx)? {
+        helpers.insert("tv_new");
+        return Ok(vec![jsast::ret(jsast::rt_call(
+            "tv_new",
+            vec![jsast::num(f64::from(kind))],
+        ))]);
+    }
+    Ok(vec![jsast::ret(jsast::object_of(vec![
+        ("buf", jsast::array(vec![])),
+        ("len", jsast::num(0)),
+        ("cap", jsast::num(0)),
+    ]))])
 }
 
 pub(super) fn vec_with_capacity(
@@ -43,11 +111,12 @@ pub(super) fn vec_with_capacity(
     _refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let maximum = vec_capacity_limit(cx)?;
-    helpers.insert("native_vec_new");
-    Ok(vec![
-        capacity_guard(receiver(), maximum, "Vec"),
-        jsast::ret(jsast::rt_call("native_vec_new", vec![receiver()])),
-    ])
+    helpers.insert("nv_cap");
+    let mut args = vec![receiver(), jsast::raw_num(maximum.to_string())];
+    if let Some(kind) = vec_tv_kind(cx)? {
+        args.push(jsast::num(f64::from(kind)));
+    }
+    Ok(vec![jsast::ret(jsast::rt_call("nv_cap", args))])
 }
 
 pub(super) fn vec_len(
@@ -96,76 +165,100 @@ pub(super) fn vec_as_slice(
     ))])
 }
 
-/// `Index`/`IndexMut`: bounds throw before anything else, then the element's reference form.
-/// Primitive elements use a `{ buf, off }` slot; an indirect aggregate is its own reference.
+/// `Index<usize>` / `IndexMut<usize>`: compact shared bounds check + element reference.
 pub(super) fn vec_index(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
-    _helpers: &mut BTreeSet<&'static str>,
+    helpers: &mut BTreeSet<&'static str>,
     _refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
-    let index = jsast::id("$native1");
-    let element = if vec_element(cx)?.js.is_indirect {
-        jsast::index(member("buf"), index.clone())
-    } else {
-        ptr::slot(member("buf"), index.clone())
-    };
-    Ok(vec![
-        jsast::if_(
-            jsast::binary(BinOp::Ge, index, member("len")),
-            vec![jsast::throw(jsast::new(
-                jsast::id("RangeError"),
-                vec![jsast::string(
-                    "rustc_codegen_js: native Vec index out of bounds",
-                )],
-            ))],
-        ),
-        jsast::ret(element),
-    ])
+    let indirect = vec_element(cx)?.js.is_indirect;
+    helpers.insert("nv_idx");
+    Ok(vec![jsast::ret(jsast::rt_call(
+        "nv_idx",
+        vec![receiver(), jsast::id("$native1"), Expr::Bool(indirect)],
+    ))])
 }
 
-/// `Vec::remove`: bounds throw, one-element `splice`, the backing array restored to capacity
-/// length (the removed slot's release IS the splice).
+/// `Index<Range*<usize>>` / `IndexMut<Range*<usize>>`: subslice sharing the native buffer.
+pub(super) fn vec_range_index(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    let shape = range_shape(cx)?;
+    match shape {
+        RangeShape::Full => Ok(vec![jsast::ret(ptr::fat_slice(
+            member("buf"),
+            jsast::num(0),
+            member("len"),
+        ))]),
+        RangeShape::Bounds => {
+            helpers.insert("nv_range");
+            Ok(vec![jsast::ret(jsast::rt_call(
+                "nv_range",
+                vec![
+                    receiver(),
+                    jsast::member(jsast::id("$native1"), "start"),
+                    jsast::member(jsast::id("$native1"), "end"),
+                ],
+            ))])
+        }
+        RangeShape::From => {
+            helpers.insert("nv_range");
+            Ok(vec![jsast::ret(jsast::rt_call(
+                "nv_range",
+                vec![
+                    receiver(),
+                    jsast::member(jsast::id("$native1"), "start"),
+                    member("len"),
+                ],
+            ))])
+        }
+        RangeShape::To => {
+            helpers.insert("nv_range");
+            Ok(vec![jsast::ret(jsast::rt_call(
+                "nv_range",
+                vec![
+                    receiver(),
+                    jsast::num(0),
+                    jsast::member(jsast::id("$native1"), "end"),
+                ],
+            ))])
+        }
+    }
+}
+
+/// `Vec::remove`: bounds throw before mutation, then shift left and return the removed element.
 pub(super) fn vec_remove(
     _cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
-    _helpers: &mut BTreeSet<&'static str>,
+    helpers: &mut BTreeSet<&'static str>,
     _refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
-    Ok(vec![
-        jsast::if_(
-            jsast::binary(BinOp::Ge, jsast::id("$native1"), member("len")),
-            vec![jsast::throw(jsast::new(
-                jsast::id("RangeError"),
-                vec![jsast::string(
-                    "rustc_codegen_js: native Vec remove index out of bounds",
-                )],
-            ))],
-        ),
-        jsast::const_(
-            "$nativeRemoved",
-            jsast::index(
-                jsast::method_call(
-                    member("buf"),
-                    "splice",
-                    vec![jsast::id("$native1"), jsast::num(1)],
-                ),
-                jsast::num(0),
-            ),
-        ),
-        jsast::assign_stmt(jsast::member(member("buf"), "length"), member("cap")),
-        jsast::expr_stmt(jsast::compound_assign(
-            BinOp::Sub,
-            member("len"),
-            jsast::num(1),
-        )),
-        jsast::ret(jsast::id("$nativeRemoved")),
-    ])
+    helpers.insert("nv_remove");
+    Ok(vec![jsast::ret(jsast::rt_call(
+        "nv_remove",
+        vec![receiver(), jsast::id("$native1")],
+    ))])
 }
 
-/// `Vec::push`: minimal growth, capacity throw before any mutation. The element-glue proof is
-/// required even though push destroys nothing — the pushed element's eventual drop must be
-/// executable for the vector to be native at all (v1 discipline).
+/// `Vec::swap_remove`: O(1) swap with last element and return the removed element.
+pub(super) fn vec_swap_remove(
+    _cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    helpers.insert("nv_swap_remove");
+    Ok(vec![jsast::ret(jsast::rt_call(
+        "nv_swap_remove",
+        vec![receiver(), jsast::id("$native1")],
+    ))])
+}
+
+/// `Vec::push`: exponential growth via shared runtime helper, capacity throw before mutation.
 pub(super) fn vec_push(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
@@ -174,36 +267,350 @@ pub(super) fn vec_push(
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     require_element_glue(cx)?;
     let maximum = vec_capacity_limit(cx)?;
-    helpers.insert("native_vec_set_capacity");
+    helpers.insert("nv_push");
     Ok(vec![
-        jsast::const_(
-            "$nativeRequired",
-            jsast::binary(BinOp::Add, member("len"), jsast::num(1)),
-        ),
-        capacity_guard(jsast::id("$nativeRequired"), maximum, "Vec"),
-        jsast::if_(
-            jsast::binary(BinOp::StrictEq, member("len"), member("cap")),
-            vec![jsast::expr_stmt(jsast::rt_call(
-                "native_vec_set_capacity",
-                vec![receiver(), jsast::id("$nativeRequired")],
-            ))],
-        ),
-        jsast::assign_stmt(
-            jsast::index(member("buf"), member("len")),
-            jsast::id("$native1"),
-        ),
-        jsast::expr_stmt(jsast::compound_assign(
-            BinOp::Add,
-            member("len"),
-            jsast::num(1),
+        jsast::expr_stmt(jsast::rt_call(
+            "nv_push",
+            vec![
+                receiver(),
+                jsast::id("$native1"),
+                jsast::raw_num(maximum.to_string()),
+            ],
         )),
         jsast::ret_void(),
     ])
 }
 
-/// `Extend<Vec<T>>` of an owned source vector: all throwing work first, then the source is
-/// emptied *before* its elements move, so its eventual drop cannot destroy values whose
-/// ownership transferred; the moved-out slots are cleared and the source's capacity released.
+/// `Vec::push_mut(&mut self, value: T) -> &mut T`.
+pub(super) fn vec_push_mut(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    require_element_glue(cx)?;
+    let maximum = vec_capacity_limit(cx)?;
+    let indirect = vec_element(cx)?.js.is_indirect;
+    helpers.insert("nv_push");
+    let push = jsast::expr_stmt(jsast::rt_call(
+        "nv_push",
+        vec![
+            receiver(),
+            jsast::id("$native1"),
+            jsast::raw_num(maximum.to_string()),
+        ],
+    ));
+    if indirect {
+        Ok(vec![push, jsast::ret(jsast::id("$native1"))])
+    } else {
+        Ok(vec![
+            jsast::const_("$nativeIdx", member("len")),
+            push,
+            jsast::ret(ptr::slot(member("buf"), jsast::id("$nativeIdx"))),
+        ])
+    }
+}
+
+/// `Vec::insert(&mut self, index: usize, element: T)`.
+pub(super) fn vec_insert(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    require_element_glue(cx)?;
+    let maximum = vec_capacity_limit(cx)?;
+    helpers.insert("nv_insert");
+    Ok(vec![
+        jsast::expr_stmt(jsast::rt_call(
+            "nv_insert",
+            vec![
+                receiver(),
+                jsast::id("$native1"),
+                jsast::id("$native2"),
+                jsast::raw_num(maximum.to_string()),
+            ],
+        )),
+        jsast::ret_void(),
+    ])
+}
+
+/// `Vec::insert_mut(&mut self, index: usize, element: T) -> &mut T`.
+pub(super) fn vec_insert_mut(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    require_element_glue(cx)?;
+    let maximum = vec_capacity_limit(cx)?;
+    let indirect = vec_element(cx)?.js.is_indirect;
+    helpers.insert("nv_insert");
+    let insert = jsast::expr_stmt(jsast::rt_call(
+        "nv_insert",
+        vec![
+            receiver(),
+            jsast::id("$native1"),
+            jsast::id("$native2"),
+            jsast::raw_num(maximum.to_string()),
+        ],
+    ));
+    let out = if indirect {
+        jsast::id("$native2")
+    } else {
+        ptr::slot(member("buf"), jsast::id("$native1"))
+    };
+    Ok(vec![insert, jsast::ret(out)])
+}
+
+/// `Vec::reserve` / `Vec::reserve_exact`.
+pub(super) fn vec_reserve(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    let maximum = vec_capacity_limit(cx)?;
+    let exact = matches!(
+        cx.semantic,
+        BodySemantic::Standard(StandardOperation::VecReserveExact)
+    );
+    helpers.insert("nv_reserve");
+    Ok(vec![
+        jsast::expr_stmt(jsast::rt_call(
+            "nv_reserve",
+            vec![
+                receiver(),
+                jsast::id("$native1"),
+                jsast::raw_num(maximum.to_string()),
+                Expr::Bool(exact),
+            ],
+        )),
+        jsast::ret_void(),
+    ])
+}
+
+/// `Vec::shrink_to_fit`.
+pub(super) fn vec_shrink_to_fit(
+    _cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    helpers.insert("nv_shrink");
+    Ok(vec![
+        jsast::expr_stmt(jsast::rt_call("nv_shrink", vec![receiver()])),
+        jsast::ret_void(),
+    ])
+}
+
+/// `Vec::pop(&mut self) -> Option<T>`: constructs the `Option<T>` enum literal directly in the
+/// JS AST so dense-int enum tag encoding (`hoist_consts.rs`) sees the variant tags transparently.
+pub(super) fn vec_pop(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    _helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    let (none_tag, some_tag, some_field) = option_layout(cx)?;
+    let is_tv = vec_tv_kind(cx)?.is_some();
+    let mut stmts = vec![
+        jsast::if_(
+            jsast::binary(BinOp::StrictEq, member("len"), jsast::num(0)),
+            vec![jsast::ret(jsast::object_of(vec![(
+                "TAG",
+                jsast::string(none_tag),
+            )]))],
+        ),
+        jsast::const_(
+            "$nativeIdx",
+            jsast::binary(BinOp::Sub, member("len"), jsast::num(1)),
+        ),
+        jsast::assign_stmt(member("len"), jsast::id("$nativeIdx")),
+    ];
+    if is_tv {
+        stmts.push(jsast::ret(jsast::object(vec![
+            ("TAG".to_owned(), jsast::string(some_tag)),
+            (
+                some_field,
+                jsast::index(member("buf"), jsast::id("$nativeIdx")),
+            ),
+        ])));
+    } else {
+        stmts.push(jsast::const_(
+            "$nativeVal",
+            jsast::index(member("buf"), jsast::id("$nativeIdx")),
+        ));
+        stmts.push(jsast::assign_stmt(
+            jsast::index(member("buf"), jsast::id("$nativeIdx")),
+            jsast::undefined(),
+        ));
+        stmts.push(jsast::ret(jsast::object(vec![
+            ("TAG".to_owned(), jsast::string(some_tag)),
+            (some_field, jsast::id("$nativeVal")),
+        ])));
+    }
+    Ok(stmts)
+}
+
+/// `Vec::truncate(&mut self, len: usize)`.
+pub(super) fn vec_truncate(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    _helpers: &mut BTreeSet<&'static str>,
+    refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    if let Some(glue) = require_element_glue(cx)? {
+        refs.insert(glue.clone());
+        return Ok(super::drop::dropful_vec_truncate(glue));
+    }
+    if vec_tv_kind(cx)?.is_some() {
+        return Ok(vec![
+            jsast::if_(
+                jsast::binary(BinOp::Lt, jsast::id("$native1"), member("len")),
+                vec![jsast::assign_stmt(member("len"), jsast::id("$native1"))],
+            ),
+            jsast::ret_void(),
+        ]);
+    }
+    Ok(vec![
+        jsast::if_(
+            jsast::binary(BinOp::Lt, jsast::id("$native1"), member("len")),
+            vec![
+                jsast::expr_stmt(jsast::method_call(
+                    member("buf"),
+                    "fill",
+                    vec![jsast::undefined(), jsast::id("$native1"), member("len")],
+                )),
+                jsast::assign_stmt(member("len"), jsast::id("$native1")),
+            ],
+        ),
+        jsast::ret_void(),
+    ])
+}
+
+/// `Vec::resize(&mut self, new_len: usize, value: T)` for trivial-`Clone` primitive elements.
+pub(super) fn vec_resize(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    let maximum = vec_capacity_limit(cx)?;
+    helpers.insert("nv_resize");
+    Ok(vec![
+        jsast::expr_stmt(jsast::rt_call(
+            "nv_resize",
+            vec![
+                receiver(),
+                jsast::id("$native1"),
+                jsast::id("$native2"),
+                jsast::raw_num(maximum.to_string()),
+            ],
+        )),
+        jsast::ret_void(),
+    ])
+}
+
+/// `alloc::vec::from_elem(elem: T, n: usize) -> Vec<T>` for trivial-`Clone` primitive elements.
+pub(super) fn vec_from_elem(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    let maximum = vec_capacity_limit(cx)?;
+    helpers.insert("nv_from_elem");
+    let mut args = vec![
+        receiver(),
+        jsast::id("$native1"),
+        jsast::raw_num(maximum.to_string()),
+    ];
+    if let Some(kind) = vec_tv_kind(cx)? {
+        args.push(jsast::num(f64::from(kind)));
+    }
+    Ok(vec![jsast::ret(jsast::rt_call("nv_from_elem", args))])
+}
+
+/// `alloc::boxed::box_assume_init_into_vec_unsafe(b: Box<MaybeUninit<[T; N]>>) -> Vec<T>` (`vec![...]`).
+pub(super) fn vec_from_box_array(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    require_element_glue(cx)?;
+    let len = box_array_len(cx)?;
+    helpers.insert("nv_from_box");
+    let mut args = vec![receiver(), jsast::raw_num(len.to_string())];
+    if let Some(kind) = vec_tv_kind(cx)? {
+        args.push(jsast::num(f64::from(kind)));
+    }
+    Ok(vec![jsast::ret(jsast::rt_call("nv_from_box", args))])
+}
+
+/// `<&Vec<T> as IntoIterator>::into_iter` / `<&mut Vec<T> as IntoIterator>::into_iter`.
+pub(super) fn vec_iter(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    _helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    let (ptr_key, end_key, marker_key) = slice_iter_layout(cx)?;
+    Ok(vec![jsast::ret(jsast::object(vec![
+        (ptr_key, ptr::slot(member("buf"), jsast::num(0))),
+        (end_key, ptr::slot(member("buf"), member("len"))),
+        (marker_key, jsast::undefined()),
+    ]))])
+}
+
+/// `core::mem::replace(&mut Vec<T>, Vec<T>) -> Vec<T>`.
+pub(super) fn vec_replace(
+    _cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    _helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    let src = jsast::id("$native1");
+    Ok(vec![
+        jsast::const_(
+            "$nativeOld",
+            jsast::object_of(vec![
+                ("buf", member("buf")),
+                ("len", member("len")),
+                ("cap", member("cap")),
+            ]),
+        ),
+        jsast::assign_stmt(member("buf"), jsast::member(src.clone(), "buf")),
+        jsast::assign_stmt(member("len"), jsast::member(src.clone(), "len")),
+        jsast::assign_stmt(member("cap"), jsast::member(src, "cap")),
+        jsast::ret(jsast::id("$nativeOld")),
+    ])
+}
+
+/// `core::mem::swap(&mut Vec<T>, &mut Vec<T>)`.
+pub(super) fn vec_mem_swap(
+    _cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    _helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    let other = jsast::id("$native1");
+    Ok(vec![
+        jsast::const_("$nativeBuf", member("buf")),
+        jsast::const_("$nativeLen", member("len")),
+        jsast::const_("$nativeCap", member("cap")),
+        jsast::assign_stmt(member("buf"), jsast::member(other.clone(), "buf")),
+        jsast::assign_stmt(member("len"), jsast::member(other.clone(), "len")),
+        jsast::assign_stmt(member("cap"), jsast::member(other.clone(), "cap")),
+        jsast::assign_stmt(jsast::member(other.clone(), "buf"), jsast::id("$nativeBuf")),
+        jsast::assign_stmt(jsast::member(other.clone(), "len"), jsast::id("$nativeLen")),
+        jsast::assign_stmt(jsast::member(other, "cap"), jsast::id("$nativeCap")),
+        jsast::ret_void(),
+    ])
+}
+
+/// `Extend<Vec<T>>` of an owned source vector.
 pub(super) fn vec_extend(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
@@ -211,129 +618,128 @@ pub(super) fn vec_extend(
     _refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let maximum = vec_capacity_limit(cx)?;
-    helpers.insert("native_vec_set_capacity");
+    helpers.insert("nv_extend");
     Ok(vec![
-        jsast::const_("$nativeTargetLen", member("len")),
-        jsast::const_(
-            "$nativeSourceLen",
-            jsast::member(jsast::id("$native1"), "len"),
-        ),
-        jsast::const_(
-            "$nativeRequired",
-            jsast::binary(
-                BinOp::Add,
-                jsast::id("$nativeTargetLen"),
-                jsast::id("$nativeSourceLen"),
-            ),
-        ),
-        capacity_guard(jsast::id("$nativeRequired"), maximum, "Vec"),
-        jsast::if_(
-            jsast::binary(BinOp::Lt, member("cap"), jsast::id("$nativeRequired")),
-            vec![jsast::expr_stmt(jsast::rt_call(
-                "native_vec_set_capacity",
-                vec![receiver(), jsast::id("$nativeRequired")],
-            ))],
-        ),
-        // All potentially throwing work is complete. Emptying the source first makes its
-        // eventual drop unable to destroy elements whose ownership moves to the target.
-        jsast::assign_stmt(jsast::member(jsast::id("$native1"), "len"), jsast::num(0)),
-        jsast::let_("$nativeIndex", jsast::num(0)),
-        jsast::while_(
-            jsast::binary(
-                BinOp::Lt,
-                jsast::id("$nativeIndex"),
-                jsast::id("$nativeSourceLen"),
-            ),
-            vec![
-                jsast::assign_stmt(
-                    jsast::index(
-                        member("buf"),
-                        jsast::binary(
-                            BinOp::Add,
-                            jsast::id("$nativeTargetLen"),
-                            jsast::id("$nativeIndex"),
-                        ),
-                    ),
-                    jsast::index(
-                        jsast::member(jsast::id("$native1"), "buf"),
-                        jsast::id("$nativeIndex"),
-                    ),
-                ),
-                jsast::assign_stmt(
-                    jsast::index(
-                        jsast::member(jsast::id("$native1"), "buf"),
-                        jsast::id("$nativeIndex"),
-                    ),
-                    jsast::undefined(),
-                ),
-                jsast::expr_stmt(jsast::compound_assign(
-                    BinOp::Add,
-                    jsast::id("$nativeIndex"),
-                    jsast::num(1),
-                )),
-            ],
-        ),
-        jsast::assign_stmt(member("len"), jsast::id("$nativeRequired")),
         jsast::expr_stmt(jsast::rt_call(
-            "native_vec_set_capacity",
-            vec![jsast::id("$native1"), jsast::num(0)],
+            "nv_extend",
+            vec![
+                receiver(),
+                jsast::id("$native1"),
+                jsast::raw_num(maximum.to_string()),
+            ],
         )),
         jsast::ret_void(),
     ])
 }
 
-/// `Vec::clear`: the ordered element-drop body when the element needs drop, else the length
-/// release helper.
-pub(super) fn vec_clear(
+/// `Vec::extend_from_slice(&mut self, other: &[T])` for trivial-`Clone` primitive elements.
+pub(super) fn vec_extend_from_slice(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    let maximum = vec_capacity_limit(cx)?;
+    helpers.insert("nv_extend_slice");
+    Ok(vec![
+        jsast::expr_stmt(jsast::rt_call(
+            "nv_extend_slice",
+            vec![
+                receiver(),
+                jsast::id("$native1"),
+                jsast::raw_num(maximum.to_string()),
+            ],
+        )),
+        jsast::ret_void(),
+    ])
+}
+
+/// `<Vec<T> as Clone>::clone(&self) -> Vec<T>` for trivial-`Clone` primitive elements.
+pub(super) fn vec_clone(
+    _cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    helpers.insert("nv_clone");
+    Ok(vec![jsast::ret(jsast::rt_call(
+        "nv_clone",
+        vec![receiver()],
+    ))])
+}
+
+/// `<[T]>::to_vec(&self) -> Vec<T>` for trivial-`Clone` primitive elements.
+pub(super) fn slice_to_vec(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    helpers: &mut BTreeSet<&'static str>,
+    _refs: &mut BTreeSet<JsName>,
+) -> Result<Vec<Stmt>, SemanticDecline> {
+    helpers.insert("nv_from_slice");
+    let mut args = vec![receiver()];
+    if let Some(kind) = vec_tv_kind(cx)? {
+        args.push(jsast::num(f64::from(kind)));
+    }
+    Ok(vec![jsast::ret(jsast::rt_call("nv_from_slice", args))])
+}
+
+/// `Vec::clear`: the ordered element-drop body when the element needs drop, zero-helper reset
+/// on TypedArray, else the length release helper.
+pub(super) fn vec_clear(
+    cx: &LowerCx<'_>,
+    _carrier: Option<Carrier>,
+    _helpers: &mut BTreeSet<&'static str>,
     refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     if let Some(glue) = require_element_glue(cx)? {
         refs.insert(glue.clone());
         Ok(super::drop::dropful_vec_clear(glue))
-    } else {
-        helpers.insert("native_vec_set_len");
+    } else if vec_tv_kind(cx)?.is_some() {
         Ok(vec![
-            jsast::expr_stmt(jsast::rt_call(
-                "native_vec_set_len",
-                vec![receiver(), jsast::num(0)],
+            jsast::assign_stmt(member("len"), jsast::num(0)),
+            jsast::ret_void(),
+        ])
+    } else {
+        Ok(vec![
+            jsast::expr_stmt(jsast::method_call(
+                member("buf"),
+                "fill",
+                vec![jsast::undefined(), jsast::num(0), member("len")],
             )),
+            jsast::assign_stmt(member("len"), jsast::num(0)),
             jsast::ret_void(),
         ])
     }
 }
 
-/// `Vec`'s own drop: ordered element drops when required, then everything released.
+/// `Vec`'s own drop: ordered element drops when required, zero-helper detach/clear.
 pub(super) fn vec_drop(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
-    helpers: &mut BTreeSet<&'static str>,
+    _helpers: &mut BTreeSet<&'static str>,
     refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     if let Some(glue) = require_element_glue(cx)? {
         refs.insert(glue.clone());
-        helpers.insert("native_vec_set_capacity");
         Ok(super::drop::dropful_vec_drop(glue))
-    } else {
-        helpers.insert("native_vec_set_capacity");
-        helpers.insert("native_vec_set_len");
+    } else if vec_tv_kind(cx)?.is_some() {
         Ok(vec![
-            jsast::expr_stmt(jsast::rt_call(
-                "native_vec_set_len",
-                vec![receiver(), jsast::num(0)],
-            )),
-            jsast::expr_stmt(jsast::rt_call(
-                "native_vec_set_capacity",
-                vec![receiver(), jsast::num(0)],
-            )),
+            jsast::assign_stmt(member("buf"), jsast::null()),
+            jsast::assign_stmt(member("len"), jsast::num(0)),
+            jsast::assign_stmt(member("cap"), jsast::num(0)),
+            jsast::ret_void(),
+        ])
+    } else {
+        Ok(vec![
+            jsast::assign_stmt(jsast::member(member("buf"), "length"), jsast::num(0)),
+            jsast::assign_stmt(member("len"), jsast::num(0)),
+            jsast::assign_stmt(member("cap"), jsast::num(0)),
             jsast::ret_void(),
         ])
     }
 }
 
-// The operation-specific legality arms (v1 `validate_argument_types` + `validate_return`).
+// Operation-specific legality arms.
 
 pub(super) fn legality_with_capacity(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
     let argument = slot_type(cx.sig, SignatureSlot::Argument(0))?;
@@ -378,15 +784,163 @@ pub(super) fn legality_unit_return(cx: &LowerCx<'_>) -> Result<(), SemanticDecli
 
 /// `push`'s value argument is exactly the vector's element type.
 pub(super) fn legality_push(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    let element = vec_element(cx)?;
+    if element.id != slot_type(cx.sig, SignatureSlot::Argument(1))? {
+        return Err(SemanticDecline::WrongArgumentType(1));
+    }
+    vec_capacity_limit(cx)?;
+    legality_unit_return(cx)
+}
+
+/// `push_mut` takes `T` and returns `&mut T`.
+pub(super) fn legality_push_mut(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    let element = vec_element(cx)?;
+    if element.id != slot_type(cx.sig, SignatureSlot::Argument(1))? {
+        return Err(SemanticDecline::WrongArgumentType(1));
+    }
+    vec_capacity_limit(cx)?;
+    let result = type_get(cx.table, cx.sig.result)?;
+    if !matches!(
+        result.kind,
+        TypeKind::Reference {
+            pointee,
+            mutable: true,
+        } if pointee == element.id
+    ) {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    Ok(())
+}
+
+/// `insert(&mut self, index: usize, element: T) -> ()`.
+pub(super) fn legality_insert(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    legality_usize_argument_1(cx)?;
+    let element = vec_element(cx)?;
+    if element.id != slot_type(cx.sig, SignatureSlot::Argument(2))? {
+        return Err(SemanticDecline::WrongArgumentType(2));
+    }
+    vec_capacity_limit(cx)?;
+    legality_unit_return(cx)
+}
+
+/// `insert_mut(&mut self, index: usize, element: T) -> &mut T`.
+pub(super) fn legality_insert_mut(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    legality_usize_argument_1(cx)?;
+    let element = vec_element(cx)?;
+    if element.id != slot_type(cx.sig, SignatureSlot::Argument(2))? {
+        return Err(SemanticDecline::WrongArgumentType(2));
+    }
+    vec_capacity_limit(cx)?;
+    let result = type_get(cx.table, cx.sig.result)?;
+    if !matches!(
+        result.kind,
+        TypeKind::Reference {
+            pointee,
+            mutable: true,
+        } if pointee == element.id
+    ) {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    Ok(())
+}
+
+/// `reserve` / `reserve_exact` take `usize` and return `()`.
+pub(super) fn legality_reserve(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    legality_usize_argument_1(cx)?;
+    vec_capacity_limit(cx)?;
+    legality_unit_return(cx)
+}
+
+/// `truncate` takes `usize` and returns `()`.
+pub(super) fn legality_truncate(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    legality_usize_argument_1(cx)?;
+    legality_unit_return(cx)
+}
+
+/// `pop` returns a 2-variant tagged `Option<T>` enum (`None` + `Some(T)`).
+pub(super) fn legality_pop(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    option_layout(cx)?;
+    Ok(())
+}
+
+/// `resize(&mut self, new_len: usize, value: T)` for trivial-`Clone` primitive elements.
+pub(super) fn legality_resize(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    legality_usize_argument_1(cx)?;
+    let element = vec_element(cx)?;
+    if !is_trivial_clone_primitive(element) {
+        return Err(SemanticDecline::WrongArgumentType(2));
+    }
+    if element.id != slot_type(cx.sig, SignatureSlot::Argument(2))? {
+        return Err(SemanticDecline::WrongArgumentType(2));
+    }
+    vec_capacity_limit(cx)?;
+    legality_unit_return(cx)
+}
+
+/// `from_elem(elem: T, n: usize) -> Vec<T>` for trivial-`Clone` primitive elements.
+pub(super) fn legality_from_elem(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    let element = vec_element(cx)?;
+    if !is_trivial_clone_primitive(element) {
+        return Err(SemanticDecline::WrongArgumentType(0));
+    }
+    if element.id != slot_type(cx.sig, SignatureSlot::Argument(0))? {
+        return Err(SemanticDecline::WrongArgumentType(0));
+    }
+    legality_usize_argument_1(cx)?;
+    vec_capacity_limit(cx)?;
+    Ok(())
+}
+
+/// `box_assume_init_into_vec_unsafe(Box<MaybeUninit<[T; N]>>) -> Vec<T>`.
+pub(super) fn legality_from_box_array(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    box_array_len(cx)?;
+    Ok(())
+}
+
+/// `<&Vec<T> as IntoIterator>::into_iter` / `<&mut Vec<T> as IntoIterator>::into_iter`.
+pub(super) fn legality_iter(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    slice_iter_layout(cx)?;
+    Ok(())
+}
+
+/// `core::mem::replace(&mut Vec<T>, Vec<T>) -> Vec<T>`: all three slots are the exact same `Vec<T>`.
+pub(super) fn legality_replace(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
     let receiver = slot_type(cx.sig, SignatureSlot::Argument(0))?;
-    let TypeKind::Reference { pointee, .. } = type_get(cx.table, receiver)?.kind else {
+    let TypeKind::Reference {
+        pointee,
+        mutable: true,
+    } = type_get(cx.table, receiver)?.kind
+    else {
         return Err(SemanticDecline::WrongArgumentType(0));
     };
-    let vector = type_get(cx.table, pointee)?;
-    let TypeKind::Adt { args, .. } = &vector.kind else {
+    if pointee != slot_type(cx.sig, SignatureSlot::Argument(1))? {
+        return Err(SemanticDecline::WrongArgumentType(1));
+    }
+    if pointee != cx.sig.result {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    Ok(())
+}
+
+/// `core::mem::swap(&mut Vec<T>, &mut Vec<T>)`: both arguments are `&mut` to the exact same `Vec<T>`.
+pub(super) fn legality_mem_swap(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    let lhs = slot_type(cx.sig, SignatureSlot::Argument(0))?;
+    let rhs = slot_type(cx.sig, SignatureSlot::Argument(1))?;
+    let TypeKind::Reference {
+        pointee: lhs_ty,
+        mutable: true,
+    } = type_get(cx.table, lhs)?.kind
+    else {
         return Err(SemanticDecline::WrongArgumentType(0));
     };
-    if args.first().copied() != Some(slot_type(cx.sig, SignatureSlot::Argument(1))?) {
+    let TypeKind::Reference {
+        pointee: rhs_ty,
+        mutable: true,
+    } = type_get(cx.table, rhs)?.kind
+    else {
+        return Err(SemanticDecline::WrongArgumentType(1));
+    };
+    if lhs_ty != rhs_ty {
         return Err(SemanticDecline::WrongArgumentType(1));
     }
     legality_unit_return(cx)
@@ -403,6 +957,67 @@ pub(super) fn legality_extend(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
     }
     vec_capacity_limit(cx)?;
     legality_unit_return(cx)
+}
+
+/// `extend_from_slice(&mut self, other: &[T])` for trivial-`Clone` primitive elements.
+pub(super) fn legality_extend_from_slice(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    let element = vec_element(cx)?;
+    if !is_trivial_clone_primitive(element) {
+        return Err(SemanticDecline::WrongArgumentType(1));
+    }
+    let slice_ref = type_get(cx.table, slot_type(cx.sig, SignatureSlot::Argument(1))?)?;
+    let correct = matches!(
+        slice_ref.kind,
+        TypeKind::Reference {
+            pointee,
+            mutable: false,
+        } if type_get(cx.table, pointee).is_ok_and(|p| matches!(p.kind, TypeKind::Slice(el) if el == element.id))
+    );
+    if !correct {
+        return Err(SemanticDecline::WrongArgumentType(1));
+    }
+    vec_capacity_limit(cx)?;
+    legality_unit_return(cx)
+}
+
+/// `<Vec<T> as Clone>::clone(&self) -> Vec<T>` for trivial-`Clone` primitive elements.
+pub(super) fn legality_clone(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    let receiver = slot_type(cx.sig, SignatureSlot::Argument(0))?;
+    let TypeKind::Reference {
+        pointee,
+        mutable: false,
+    } = type_get(cx.table, receiver)?.kind
+    else {
+        return Err(SemanticDecline::WrongArgumentType(0));
+    };
+    if pointee != cx.sig.result {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    let element = vec_element(cx)?;
+    if !is_trivial_clone_primitive(element) {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    Ok(())
+}
+
+/// `<[T]>::to_vec(&self) -> Vec<T>` for trivial-`Clone` primitive elements.
+pub(super) fn legality_slice_to_vec(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    let element = vec_element(cx)?;
+    if !is_trivial_clone_primitive(element) {
+        return Err(SemanticDecline::WrongArgumentType(0));
+    }
+    let slice_ref = type_get(cx.table, slot_type(cx.sig, SignatureSlot::Argument(0))?)?;
+    let correct = matches!(
+        slice_ref.kind,
+        TypeKind::Reference {
+            pointee,
+            mutable: false,
+        } if type_get(cx.table, pointee).is_ok_and(|p| matches!(p.kind, TypeKind::Slice(el) if el == element.id))
+    );
+    if !correct {
+        return Err(SemanticDecline::WrongArgumentType(0));
+    }
+    Ok(())
 }
 
 /// `as_slice`/`as_mut_slice` return a slice reference over the exact element, at the operation's
@@ -433,8 +1048,8 @@ pub(super) fn legality_as_slice(cx: &LowerCx<'_>) -> Result<(), SemanticDecline>
     Ok(())
 }
 
-/// `Index`/`IndexMut` take a `usize` and return an element reference at the operation's
-/// mutability.
+/// `Index<usize>`/`IndexMut<usize>` take a `usize` and return an element reference at the
+/// operation's mutability.
 pub(super) fn legality_index(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
     legality_usize_argument_1(cx)?;
     let mutable = matches!(
@@ -456,7 +1071,36 @@ pub(super) fn legality_index(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
     Ok(())
 }
 
-/// `remove` takes a `usize` and returns the element by value.
+/// `Index<Range*<usize>>`/`IndexMut<Range*<usize>>` take a verified range struct and return a
+/// slice reference over the vector's element type.
+pub(super) fn legality_range_index(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
+    range_shape(cx)?;
+    let mutable = matches!(
+        cx.semantic,
+        BodySemantic::Standard(StandardOperation::VecRangeIndexMut)
+    );
+    let result = type_get(cx.table, cx.sig.result)?;
+    let correct = matches!(
+        result.kind,
+        TypeKind::Reference {
+            pointee,
+            mutable: result_mutable,
+        } if result_mutable == mutable
+            && type_get(cx.table, pointee).is_ok_and(|pointee| {
+                matches!(
+                    pointee.kind,
+                    TypeKind::Slice(element)
+                        if vec_element(cx).is_ok_and(|expected| expected.id == element)
+                )
+            })
+    );
+    if !correct {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    Ok(())
+}
+
+/// `remove`/`swap_remove` take a `usize` and return the element by value.
 pub(super) fn legality_remove(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
     legality_usize_argument_1(cx)?;
     let correct = vec_element(cx).is_ok_and(|element| {
@@ -482,26 +1126,235 @@ fn legality_usize_argument_1(cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
     Ok(())
 }
 
+fn box_array_len(cx: &LowerCx<'_>) -> Result<u64, SemanticDecline> {
+    let element = vec_element(cx)?;
+    if !element.layout.sized || element.layout.zst {
+        return Err(SemanticDecline::ZeroSizedElement);
+    }
+    let box_ty = slot_type(cx.sig, SignatureSlot::Argument(0))?;
+    let box_desc = type_get(cx.table, box_ty)?;
+    if box_desc.meta.candidate != RepresentationCandidate::Box
+        || box_desc.meta.allocator != AllocatorIdentity::Global
+    {
+        return Err(SemanticDecline::WrongArgumentType(0));
+    }
+    let TypeKind::Adt { args: box_args, .. } = &box_desc.kind else {
+        return Err(SemanticDecline::WrongArgumentType(0));
+    };
+    let inner = *box_args
+        .first()
+        .ok_or(SemanticDecline::WrongArgumentType(0))?;
+    let array_ty = match &type_get(cx.table, cx.table.peeled(inner))?.kind {
+        TypeKind::Array { .. } => cx.table.peeled(inner),
+        TypeKind::Adt {
+            form: NominalForm::Union,
+            args,
+            ..
+        } => {
+            let arg0 = *args.first().ok_or(SemanticDecline::WrongArgumentType(0))?;
+            cx.table.peeled(arg0)
+        }
+        _ => return Err(SemanticDecline::WrongArgumentType(0)),
+    };
+    let TypeKind::Array {
+        element: arr_elem,
+        length,
+    } = type_get(cx.table, array_ty)?.kind
+    else {
+        return Err(SemanticDecline::WrongArgumentType(0));
+    };
+    if arr_elem != element.id {
+        return Err(SemanticDecline::WrongArgumentType(0));
+    }
+    Ok(length)
+}
+
+fn slice_iter_layout(cx: &LowerCx<'_>) -> Result<(String, String, String), SemanticDecline> {
+    let element = vec_element(cx)?;
+    if !element.layout.sized || element.layout.zst {
+        return Err(SemanticDecline::ZeroSizedElement);
+    }
+    let mutable = matches!(
+        cx.semantic,
+        BodySemantic::Standard(StandardOperation::VecIterMut)
+    );
+    let result = type_get(cx.table, cx.sig.result)?;
+    if result.meta.iterator != IteratorIdentity::Slice {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    let TypeKind::Adt {
+        form: NominalForm::Struct,
+        variants,
+        ..
+    } = &result.kind
+    else {
+        return Err(SemanticDecline::WrongReturnType);
+    };
+    let [variant] = variants.as_slice() else {
+        return Err(SemanticDecline::WrongReturnType);
+    };
+    let [f0, f1, f2] = variant.fields.as_slice() else {
+        return Err(SemanticDecline::WrongReturnType);
+    };
+    let p0 = type_get(cx.table, cx.table.peeled(f0.ty))?;
+    let p1 = type_get(cx.table, cx.table.peeled(f1.ty))?;
+    let p2 = type_get(cx.table, f2.ty)?;
+    if !matches!(p0.kind, TypeKind::RawPointer { pointee, .. } if pointee == element.id) {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    if !matches!(
+        p1.kind,
+        TypeKind::RawPointer {
+            pointee,
+            mutable: end_mut,
+        } if pointee == element.id && end_mut == mutable
+    ) {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    if !p2.layout.zst {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    let key_str = |key: FieldKey| match key {
+        FieldKey::Name(id) => cx
+            .interns
+            .str(id)
+            .map(str::to_owned)
+            .ok_or(SemanticDecline::WrongReturnType),
+        _ => Err(SemanticDecline::WrongReturnType),
+    };
+    Ok((key_str(f0.key)?, key_str(f1.key)?, key_str(f2.key)?))
+}
+
+fn range_shape(cx: &LowerCx<'_>) -> Result<RangeShape, SemanticDecline> {
+    let arg = slot_type(cx.sig, SignatureSlot::Argument(1))?;
+    let desc = type_get(cx.table, arg)?;
+    let TypeKind::Adt {
+        form: NominalForm::Struct,
+        variants,
+        ..
+    } = &desc.kind
+    else {
+        return Err(SemanticDecline::WrongArgumentType(1));
+    };
+    let [variant] = variants.as_slice() else {
+        return Err(SemanticDecline::WrongArgumentType(1));
+    };
+    let mut keys: Vec<&str> = Vec::with_capacity(variant.fields.len());
+    for field in &variant.fields {
+        if !matches!(
+            type_get(cx.table, field.ty)?.kind,
+            TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            }
+        ) {
+            return Err(SemanticDecline::WrongArgumentType(1));
+        }
+        let FieldKey::Name(id) = field.key else {
+            return Err(SemanticDecline::WrongArgumentType(1));
+        };
+        let Some(name) = cx.interns.str(id) else {
+            return Err(SemanticDecline::WrongArgumentType(1));
+        };
+        keys.push(name);
+    }
+    match keys.as_slice() {
+        [] => Ok(RangeShape::Full),
+        ["start", "end"] => Ok(RangeShape::Bounds),
+        ["start"] => Ok(RangeShape::From),
+        ["end"] => Ok(RangeShape::To),
+        _ => Err(SemanticDecline::WrongArgumentType(1)),
+    }
+}
+
+fn option_layout(cx: &LowerCx<'_>) -> Result<(String, String, String), SemanticDecline> {
+    let element = vec_element(cx)?;
+    if !element.layout.sized || element.layout.zst {
+        return Err(SemanticDecline::ZeroSizedElement);
+    }
+    let result = type_get(cx.table, cx.sig.result)?;
+    if result.js.enum_repr != Some(EnumRepr::Tag { fieldless: false }) {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    let TypeKind::Adt {
+        form: NominalForm::Enum,
+        variants,
+        ..
+    } = &result.kind
+    else {
+        return Err(SemanticDecline::WrongReturnType);
+    };
+    if variants.len() != 2 {
+        return Err(SemanticDecline::WrongReturnType);
+    }
+    let mut none_tag = None;
+    let mut some_info = None;
+    for variant in variants {
+        let Some(tag) = cx.interns.str(variant.name) else {
+            return Err(SemanticDecline::WrongReturnType);
+        };
+        match variant.fields.as_slice() {
+            [] if none_tag.is_none() => none_tag = Some(tag.to_owned()),
+            [field] if some_info.is_none() && field.ty == element.id => {
+                let FieldKey::Name(key_id) = field.key else {
+                    return Err(SemanticDecline::WrongReturnType);
+                };
+                let Some(field_name) = cx.interns.str(key_id) else {
+                    return Err(SemanticDecline::WrongReturnType);
+                };
+                some_info = Some((tag.to_owned(), field_name.to_owned()));
+            }
+            _ => return Err(SemanticDecline::WrongReturnType),
+        }
+    }
+    let (Some(none_tag), Some((some_tag, some_field))) = (none_tag, some_info) else {
+        return Err(SemanticDecline::WrongReturnType);
+    };
+    Ok((none_tag, some_tag, some_field))
+}
+
 /// The element type of the operation's canonical `Vec<T>` — the monomorphic type argument, never
 /// a name inference (v1 `vec_element`).
 pub(super) fn vec_element<'a>(cx: &LowerCx<'a>) -> Result<&'a TypeDescriptor, SemanticDecline> {
     let vector_ty = match cx.semantic {
         BodySemantic::DropGlue(dropped) => dropped,
-        BodySemantic::Standard(StandardOperation::VecNew | StandardOperation::VecWithCapacity) => {
-            cx.sig.result
-        }
+        BodySemantic::Standard(
+            StandardOperation::VecNew
+            | StandardOperation::VecWithCapacity
+            | StandardOperation::VecFromElem
+            | StandardOperation::VecFromBoxArray
+            | StandardOperation::SliceToVec,
+        ) => cx.sig.result,
         BodySemantic::Standard(
             StandardOperation::VecLen
             | StandardOperation::VecCapacity
             | StandardOperation::VecPush
+            | StandardOperation::VecPushMut
+            | StandardOperation::VecInsert
+            | StandardOperation::VecInsertMut
             | StandardOperation::VecClear
+            | StandardOperation::VecReserve
+            | StandardOperation::VecReserveExact
+            | StandardOperation::VecShrinkToFit
+            | StandardOperation::VecTruncate
+            | StandardOperation::VecPop
+            | StandardOperation::VecResize
             | StandardOperation::VecAsSlice
             | StandardOperation::VecAsMutSlice
+            | StandardOperation::VecIter
+            | StandardOperation::VecIterMut
+            | StandardOperation::VecReplace
+            | StandardOperation::VecMemSwap
             | StandardOperation::VecIsEmpty
             | StandardOperation::VecIndex
             | StandardOperation::VecIndexMut
+            | StandardOperation::VecRangeIndex
+            | StandardOperation::VecRangeIndexMut
             | StandardOperation::VecRemove
+            | StandardOperation::VecSwapRemove
             | StandardOperation::VecExtend
+            | StandardOperation::VecExtendFromSlice
+            | StandardOperation::VecClone
             | StandardOperation::VecDrop,
         ) => cx
             .sig
@@ -556,14 +1409,22 @@ pub(super) fn vec_capacity_limit(cx: &LowerCx<'_>) -> Result<u64, SemanticDeclin
     if size == 0 || align == 0 {
         return Err(SemanticDecline::UnknownElementLayout);
     }
+    let arg_index = if matches!(
+        cx.semantic,
+        BodySemantic::Standard(StandardOperation::VecFromElem)
+    ) {
+        1
+    } else {
+        0
+    };
     let argument = cx
         .sig
         .arguments
-        .first()
+        .get(arg_index)
         .copied()
         .map(|ty| type_get(cx.table, ty))
         .transpose()?
-        .ok_or(SemanticDecline::WrongArgumentType(0))?;
+        .ok_or(SemanticDecline::WrongArgumentType(arg_index as u16))?;
     let bits = match argument.kind {
         TypeKind::Reference { .. } => argument
             .layout
@@ -571,7 +1432,8 @@ pub(super) fn vec_capacity_limit(cx: &LowerCx<'_>) -> Result<u64, SemanticDeclin
             .and_then(|bytes| bytes.checked_mul(8))
             .and_then(|bits| u32::try_from(bits).ok())
             .ok_or(SemanticDecline::UnknownElementLayout)?,
-        _ => unsigned_bits(argument).map_err(|_| SemanticDecline::WrongArgumentType(0))?,
+        _ => unsigned_bits(argument)
+            .map_err(|_| SemanticDecline::WrongArgumentType(arg_index as u16))?,
     };
     let bytes = pointer_limit(bits)?
         .checked_add(1)

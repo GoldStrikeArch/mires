@@ -37,7 +37,20 @@ use super::{slot_type, type_get, LowerCx, SemanticDecline, SignatureSlot};
 pub fn required_element_drop(cx: &LowerCx<'_>) -> Result<Option<TypeId>, SemanticDecline> {
     let element = vec_element(cx)?;
     if element.layout.has_own_drop {
-        return Err(SemanticDecline::ElementHasOwnDrop);
+        // Canonical global `Vec<T>` has stdlib `impl Drop for Vec` (not a user destructor);
+        // allow nested `Vec<Vec<T>>` when `T` itself has no custom destructor.
+        let allowed_std_vec = element.meta.candidate == RepresentationCandidate::Vec
+            && element.meta.allocator == AllocatorIdentity::Global
+            && match &element.kind {
+                TypeKind::Adt { args, .. } => args
+                    .first()
+                    .and_then(|inner| cx.table.get(*inner))
+                    .is_some_and(|inner| !inner.layout.has_own_drop),
+                _ => false,
+            };
+        if !allowed_std_vec {
+            return Err(SemanticDecline::ElementHasOwnDrop);
+        }
     }
     Ok(element.layout.needs_drop.then_some(element.id))
 }
@@ -193,6 +206,54 @@ pub(super) fn dropful_vec_clear(element_glue: &JsName) -> Vec<Stmt> {
     ]
 }
 
+/// `Vec::truncate` over a needy element: shortens `len` BEFORE running destructors on
+/// `[new_len..old_len)` in ascending order, clearing each slot as it drops.
+pub(super) fn dropful_vec_truncate(element_glue: &JsName) -> Vec<Stmt> {
+    let receiver = || jsast::id("$native0");
+    let buffer = || jsast::member(receiver(), "buf");
+    vec![
+        jsast::if_(
+            jsast::binary(
+                BinOp::Lt,
+                jsast::id("$native1"),
+                jsast::member(receiver(), "len"),
+            ),
+            vec![
+                jsast::const_("$nativeOldLen", jsast::member(receiver(), "len")),
+                jsast::assign_stmt(jsast::member(receiver(), "len"), jsast::id("$native1")),
+                jsast::let_("$nativeIndex", jsast::id("$native1")),
+                jsast::while_(
+                    jsast::binary(
+                        BinOp::Lt,
+                        jsast::id("$nativeIndex"),
+                        jsast::id("$nativeOldLen"),
+                    ),
+                    vec![
+                        jsast::const_(
+                            "$nativeElement",
+                            jsast::index(buffer(), jsast::id("$nativeIndex")),
+                        ),
+                        jsast::expr_stmt(jsast::call(
+                            jsast::id(element_glue.as_str()),
+                            vec![jsast::id("$nativeElement")],
+                        )),
+                        jsast::assign_stmt(
+                            jsast::index(buffer(), jsast::id("$nativeIndex")),
+                            jsast::undefined(),
+                        ),
+                        jsast::expr_stmt(jsast::compound_assign(
+                            BinOp::Add,
+                            jsast::id("$nativeIndex"),
+                            jsast::num(1),
+                        )),
+                    ],
+                ),
+            ],
+        ),
+        jsast::ret_void(),
+    ]
+}
+
 /// `Vec`'s drop over a needy element: ascending element drops with slot clearing, then the
 /// length and capacity released.
 pub(super) fn dropful_vec_drop(element_glue: &JsName) -> Vec<Stmt> {
@@ -227,11 +288,9 @@ pub(super) fn dropful_vec_drop(element_glue: &JsName) -> Vec<Stmt> {
                 )),
             ],
         ),
+        jsast::assign_stmt(jsast::member(buffer(), "length"), jsast::num(0)),
         jsast::assign_stmt(jsast::member(receiver(), "len"), jsast::num(0)),
-        jsast::expr_stmt(jsast::rt_call(
-            "native_vec_set_capacity",
-            vec![receiver(), jsast::num(0)],
-        )),
+        jsast::assign_stmt(jsast::member(receiver(), "cap"), jsast::num(0)),
         jsast::ret_void(),
     ]
 }

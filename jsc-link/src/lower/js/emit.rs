@@ -2175,7 +2175,7 @@ impl<'a> JsCx<'a> {
                         Ok(record_clone(value, &["buf", "off", "len"], &[]))
                     }
                     _ => Ok(if table.needs_clone(ty) {
-                        value::clone_expr(table, self.interns, ty, value)
+                        value::clone_expr_with(table, self.interns, ty, value, self.nested_clone)
                     } else {
                         value
                     }),

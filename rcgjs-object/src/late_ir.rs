@@ -666,6 +666,25 @@ pub enum StandardOperation {
     F64FromStr,
     /// `<f32 as core::str::FromStr>::from_str`.
     F32FromStr,
+    VecPushMut,
+    VecReserveExact,
+    VecShrinkToFit,
+    VecTruncate,
+    VecResize,
+    VecSwapRemove,
+    VecFromElem,
+    VecExtendFromSlice,
+    VecClone,
+    SliceToVec,
+    VecRangeIndex,
+    VecRangeIndexMut,
+    VecFromBoxArray,
+    VecIter,
+    VecIterMut,
+    VecReplace,
+    VecMemSwap,
+    VecInsert,
+    VecInsertMut,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

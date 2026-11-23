@@ -66,6 +66,14 @@ use crate::jir::{Body, Interns, ItemId, OriginTable, TypeTable};
 use crate::jsast;
 use crate::opts::Opts;
 
+/// Whether a function carries a nested native Vec/SliceView or String carrier inside an
+/// aggregate, requiring `clone_expr` to handle both native and baseline shapes at `OpKind::Copy`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NestedClone {
+    pub vec: bool,
+    pub string: bool,
+}
+
 /// Link-time call-target overrides for one native-version caller.
 pub type CallRetargets = BTreeMap<ItemId, JsName>;
 
@@ -127,6 +135,8 @@ pub struct LowerInput<'a> {
     pub bigints: Option<&'a bigint::BigIntNames>,
     /// Whole-program lazy byte-view lowering policy (`analysis::byte_views`).
     pub byte_views: crate::analysis::byte_views::ByteViewPlan,
+    /// Per-function nested native carrier clone guard (`value::clone_expr_with`).
+    pub nested_clone: NestedClone,
 }
 
 /// One lowered item, as an AST plus what the printer needs around it.

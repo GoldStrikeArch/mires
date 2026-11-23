@@ -915,9 +915,9 @@ mod tests {
     fn legality_unsupported_operation_is_unary() {
         let mut prog = Prog::new();
         prog.add_semantic(
-            "pop",
+            "swap",
             identity_func(1, MUT_VEC, UNIT),
-            BodySemantic::Standard(StandardOperation::VecPop),
+            BodySemantic::Standard(StandardOperation::VecSwap),
         );
         let graph = prog.collect();
         let terms = terms(&graph);

@@ -86,7 +86,11 @@ pub fn convert(
             ])))
         }
         (Carrier::SliceView, Carrier::NativeVec) => {
-            Ok(jsast::rt_call("convert_sv_nv", vec![value]))
+            let mut args = vec![value];
+            if let Some(kind) = vec_tv_kind(table, ty) {
+                args.push(jsast::num(f64::from(kind)));
+            }
+            Ok(jsast::rt_call("convert_sv_nv", args))
         }
         (Carrier::SliceView, Carrier::Baseline) => {
             // The baseline fat slice is the same `{ buf, off, len }` record; re-record so the
@@ -184,11 +188,15 @@ fn native_vec_to_baseline(
     } else if table.needs_clone(element) {
         args.push(jsast::arrow(
             vec![super::value::CLONE_PARAM.to_string()],
-            super::value::clone_expr(
+            super::value::clone_expr_with(
                 table,
                 interns,
                 element,
                 jsast::id(super::value::CLONE_PARAM),
+                crate::lower::NestedClone {
+                    vec: true,
+                    string: true,
+                },
             ),
         ));
     } else if table.is_indirect(element) {
@@ -286,8 +294,16 @@ fn element_info(table: &TypeTable, ty: TypeId) -> Res<(u64, Option<String>, Type
     Ok((size, scalar_kind, element))
 }
 
-/// `__rt.convert_block_nv(<ptr>.buf, <ptr>.off, <len>, <cap>)`: a capacity-length native buffer
-/// copied out of the baseline block, Rust-visible length and capacity preserved. Legal only
+fn vec_tv_kind(table: &TypeTable, ty: TypeId) -> Option<u8> {
+    let TypeKind::Adt { args, .. } = &table.get(ty)?.kind else {
+        return None;
+    };
+    let element = table.get(*args.first()?)?;
+    crate::lower::semantic_ops::vec::typed_array_kind(element)
+}
+
+/// `__rt.convert_block_nv(<ptr>.buf, <ptr>.off, <len>, <cap>[, tvKind])`: a capacity-length native
+/// buffer copied out of the baseline block, Rust-visible length and capacity preserved. Legal only
 /// under D2's dead-source rule, which the planner enforces.
 fn baseline_to_native_vec(
     table: &TypeTable,
@@ -298,15 +314,16 @@ fn baseline_to_native_vec(
     let layout = VecLayout::of(table, interns, ty)?;
     let (value, wrap) = once(value);
     let pointer = layout.member(value.clone(), &layout.ptr);
-    let call = jsast::rt_call(
-        "convert_block_nv",
-        vec![
-            jsast::member(pointer.clone(), "buf"),
-            jsast::member(pointer, "off"),
-            layout.member(value.clone(), &layout.len),
-            layout.member(value, &layout.cap),
-        ],
-    );
+    let mut args = vec![
+        jsast::member(pointer.clone(), "buf"),
+        jsast::member(pointer, "off"),
+        layout.member(value.clone(), &layout.len),
+        layout.member(value, &layout.cap),
+    ];
+    if let Some(kind) = vec_tv_kind(table, ty) {
+        args.push(jsast::num(f64::from(kind)));
+    }
+    let call = jsast::rt_call("convert_block_nv", args);
     Ok(wrap(call))
 }
 

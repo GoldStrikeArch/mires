@@ -725,6 +725,8 @@ fn run_with_opts(
         crate::plan::representation::ReprOutcome::default()
     };
     let planned_clones = planned_repr.clones.clone();
+    let planned_body_names: Vec<JsName> = planned_repr.bodies.keys().cloned().collect();
+    let planned_nested_clone = planned_repr.nested_clone.clone();
     let mut planning_table = table.clone();
     for (clone, source) in &planned_clones {
         let Some(source) = planning_table.get(source).cloned() else {
@@ -742,6 +744,7 @@ fn run_with_opts(
             .bodies
             .keys()
             .chain(planned_repr.call_retargets.keys())
+            .chain(planned_repr.nested_clone.keys())
         {
             if let Some(entry) = planned_funcs.remove(name) {
                 excluded.insert(name.clone(), entry);
@@ -798,8 +801,9 @@ fn run_with_opts(
     for clone in planned_clones.keys() {
         abi_funcs.remove(clone);
     }
-    let clone_sources: BTreeSet<crate::jir::semantic::ItemId> = planned_clones
+    let abi_excluded: BTreeSet<crate::jir::semantic::ItemId> = planned_clones
         .values()
+        .chain(planned_body_names.iter())
         .filter_map(|source| {
             pristine_funcs
                 .get(source)?
@@ -809,7 +813,7 @@ fn run_with_opts(
         })
         .collect();
     let mut plan = crate::profile::time("lane.B2.abi_flat", || {
-        crate::plan::abi_flat::plan_excluding(&planning_table, &abi_funcs, opts, &clone_sources)
+        crate::plan::abi_flat::plan_excluding(&planning_table, &abi_funcs, opts, &abi_excluded)
     });
     let abi_applied = opts.applies(OptimizerPass::Sroa);
     let mut economics = None;
@@ -828,6 +832,7 @@ fn run_with_opts(
                     &planned_funcs,
                     candidate,
                     &ctx,
+                    &planned_nested_clone,
                     &mut reuse,
                 )
             },
@@ -1336,6 +1341,7 @@ fn lower_input_with_retargets<'a>(
         call_retargets,
         bigints: None,
         byte_views: ctx.byte_views,
+        nested_clone: crate::lower::NestedClone::default(),
     })
 }
 
@@ -1349,6 +1355,7 @@ fn physical_program_metrics(
     source_funcs: &BTreeMap<JsName, Result<Func, Decline>>,
     abi: &AbiPlan,
     ctx: &Ctx<'_>,
+    nested_clone: &BTreeMap<JsName, crate::lower::NestedClone>,
     reuse: &mut crate::plan::lowering_reuse::Reuse,
 ) -> Option<crate::plan::physical_cost::ProgramMetrics> {
     crate::profile::bump(crate::profile::Counter::TrialPhysical);
@@ -1393,6 +1400,11 @@ fn physical_program_metrics(
         // ABI, just as the final phase-C pass does, or those candidates price as byte-identical
         // to the baseline and can never be selected.
         input.abi = Some(abi);
+        input.nested_clone = nested_clone
+            .get(name)
+            .or_else(|| abi.clones().get(name).and_then(|s| nested_clone.get(s)))
+            .copied()
+            .unwrap_or_default();
         match reuse.lower_physical(abi, name, &input, func) {
             Ok(lowering) => {
                 allocation_terms.insert(name.clone(), lowering.alloc);
@@ -1976,6 +1988,11 @@ fn lower_all(
         let repr_retargets = repr
             .call_retargets
             .get(name)
+            .or_else(|| {
+                plan.clones()
+                    .get(name)
+                    .and_then(|s| repr.call_retargets.get(s))
+            })
             .unwrap_or(crate::lower::EMPTY_CALL_RETARGETS);
         let abi_retargets = plan.call_retargets(name);
         let mut merged_retargets = crate::lower::CallRetargets::new();
@@ -1999,6 +2016,16 @@ fn lower_all(
         input.abi = Some(plan);
         input.physical = Some(physical);
         input.bigints = bigints;
+        input.nested_clone = repr
+            .nested_clone
+            .get(name)
+            .or_else(|| {
+                plan.clones()
+                    .get(name)
+                    .and_then(|s| repr.nested_clone.get(s))
+            })
+            .copied()
+            .unwrap_or_default();
         crate::profile::bump(crate::profile::Counter::LowerFinal);
         let mut stats = OptStats::default();
         let mut alloc = None;
