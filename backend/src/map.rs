@@ -25,13 +25,14 @@
 //!   would otherwise have: a host `Map` compares with SameValueZero, which is object identity for
 //!   anything that is not a number, a string, a boolean or a BigInt.
 
+use rustc_abi::VariantIdx;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_span::Spanned;
 
 use crate::base::FnCx;
-use crate::jsast::{self, Expr, Stmt};
+use crate::jsast::{self, BinOp, Expr, Stmt};
 
 /// The `link_section` prefix every `mires-js` collection marker carries.
 pub(crate) const MAP_PREFIX: &str = "rcgjs.map.";
@@ -42,20 +43,13 @@ pub(crate) fn map_section(tcx: TyCtxt<'_>, def_id: DefId) -> Option<String> {
     section.as_str().strip_prefix(MAP_PREFIX).map(str::to_owned)
 }
 
-/// The `__rt` member a marker becomes.
-///
-/// `get` and `getmut` are one member: the two differ in the Rust type they hand back and not in
-/// what the host does, and a `Map` has one read.
-fn rt_member(marker: &str) -> Option<(&'static str, usize)> {
+/// Expected arity of each `mires-js` collection marker.
+fn marker_arity(marker: &str) -> Option<usize> {
     Some(match marker {
-        "new" => ("map_new", 0),
-        "len" => ("map_len", 1),
-        "clear" => ("map_clear", 1),
-        "has" => ("map_has", 2),
-        "set" => ("map_set", 3),
-        "get" | "getmut" => ("map_get", 2),
-        "del" => ("map_del", 2),
-        "keys" => ("map_keys", 1),
+        "new" => 0,
+        "len" | "clear" | "keys" | "values" => 1,
+        "has" | "get" | "getmut" | "try_get" | "try_getmut" | "del" => 2,
+        "set" => 3,
         _ => return None,
     })
 }
@@ -63,7 +57,7 @@ fn rt_member(marker: &str) -> Option<(&'static str, usize)> {
 /// Which argument of a marker is the key, for the markers that take one.
 fn key_argument(marker: &str) -> Option<usize> {
     match marker {
-        "has" | "set" | "get" | "getmut" | "del" => Some(1),
+        "has" | "set" | "get" | "getmut" | "try_get" | "try_getmut" | "del" => Some(1),
         _ => None,
     }
 }
@@ -102,7 +96,7 @@ impl<'tcx> FnCx<'_, 'tcx> {
         args: &[Spanned<mir::Operand<'tcx>>],
         destination: mir::Place<'tcx>,
     ) -> Vec<Stmt> {
-        let Some((member, arity)) = rt_member(marker) else {
+        let Some(arity) = marker_arity(marker) else {
             return vec![jsast::expr_stmt(self.zombie(format!(
                 "`{MAP_PREFIX}{marker}` is not a `mires-js` collection marker this backend knows"
             )))];
@@ -135,13 +129,104 @@ impl<'tcx> FnCx<'_, 'tcx> {
             });
         }
 
-        let call = jsast::rt_call(member, lowered);
+        let (_, ty) = self.codegen_place(destination);
+        let mut iter = lowered.into_iter();
+        let mut stmts = Vec::new();
+        let expr = match marker {
+            "new" => jsast::new(jsast::id("Map"), Vec::new()),
+            "len" => jsast::member(iter.next().unwrap(), "size"),
+            "clear" => jsast::call(jsast::member(iter.next().unwrap(), "clear"), Vec::new()),
+            "has" => {
+                let map = iter.next().unwrap();
+                let k = iter.next().unwrap();
+                jsast::call(jsast::member(map, "has"), vec![k])
+            }
+            "get" | "getmut" => {
+                let map = iter.next().unwrap();
+                let k = iter.next().unwrap();
+                jsast::call(jsast::member(map, "get"), vec![k])
+            }
+            "set" => {
+                let map = iter.next().unwrap();
+                let k = iter.next().unwrap();
+                let v = iter.next().unwrap();
+                jsast::call(jsast::member(map, "set"), vec![k, v])
+            }
+            "del" => {
+                let map = iter.next().unwrap();
+                let k = iter.next().unwrap();
+                jsast::call(jsast::member(map, "delete"), vec![k])
+            }
+            "keys" => jsast::rt_call("map_keys", vec![iter.next().unwrap()]),
+            "values" => jsast::rt_call("map_values", vec![iter.next().unwrap()]),
+            "try_get" | "try_getmut" => {
+                let map = iter.next().unwrap();
+                let k = iter.next().unwrap();
+                let get_call = jsast::call(jsast::member(map, "get"), vec![k]);
+                let peeled =
+                    crate::value::peel_pattern(crate::value::peel_transparent(self.tcx, ty));
+                let (none_idx, some_idx, some_field) = match peeled.kind() {
+                    ty::Adt(def, _) if def.is_enum() && def.variants().len() == 2 => {
+                        let v0 = VariantIdx::from_u32(0);
+                        let v1 = VariantIdx::from_u32(1);
+                        if def.variant(v0).fields.is_empty() && def.variant(v1).fields.len() == 1 {
+                            (
+                                v0,
+                                v1,
+                                crate::naming::Namer::field_name(def.variant(v1), 0u32.into()),
+                            )
+                        } else if def.variant(v1).fields.is_empty()
+                            && def.variant(v0).fields.len() == 1
+                        {
+                            (
+                                v1,
+                                v0,
+                                crate::naming::Namer::field_name(def.variant(v0), 0u32.into()),
+                            )
+                        } else {
+                            return vec![jsast::expr_stmt(self.zombie(format!(
+                                "`{MAP_PREFIX}{marker}` must return an `Option`-shaped enum, got `{ty}`"
+                            )))];
+                        }
+                    }
+                    _ => {
+                        return vec![jsast::expr_stmt(self.zombie(format!(
+                            "`{MAP_PREFIX}{marker}` must return an `Option`-shaped enum, got `{ty}`"
+                        )))];
+                    }
+                };
+                let (assign, tmp) = self.temp(get_call);
+                stmts.push(assign);
+                let Some(none_expr) = crate::value::enum_value(self.tcx, ty, none_idx, Vec::new())
+                else {
+                    return vec![jsast::expr_stmt(self.zombie(format!(
+                        "`{MAP_PREFIX}{marker}` could not build `None` for `{ty}`"
+                    )))];
+                };
+                let Some(some_expr) = crate::value::enum_value(
+                    self.tcx,
+                    ty,
+                    some_idx,
+                    vec![(some_field, tmp.clone())],
+                ) else {
+                    return vec![jsast::expr_stmt(self.zombie(format!(
+                        "`{MAP_PREFIX}{marker}` could not build `Some` for `{ty}`"
+                    )))];
+                };
+                jsast::cond(
+                    jsast::binary(BinOp::StrictEq, tmp, Expr::Undefined),
+                    none_expr,
+                    some_expr,
+                )
+            }
+            _ => unreachable!(),
+        };
         // A marker that answers nothing is a statement. Writing it to the destination would be a
         // store to a local of unit type, which is a value the model does not have.
-        let (_, ty) = self.codegen_place(destination);
         match crate::value::is_zst(self.tcx, ty) {
-            true => vec![jsast::expr_stmt(call)],
-            false => self.write_place(destination, call),
+            true => stmts.push(jsast::expr_stmt(expr)),
+            false => stmts.extend(self.write_place(destination, expr)),
         }
+        stmts
     }
 }

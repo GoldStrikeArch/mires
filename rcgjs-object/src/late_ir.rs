@@ -685,6 +685,16 @@ pub enum StandardOperation {
     VecMemSwap,
     VecInsert,
     VecInsertMut,
+    BTreeMapNew,
+    BTreeMapLen,
+    BTreeMapIsEmpty,
+    BTreeMapClear,
+    BTreeMapContainsKey,
+    BTreeMapGet,
+    BTreeMapGetMut,
+    BTreeMapInsert,
+    BTreeMapRemove,
+    BTreeMapDrop,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -730,6 +740,7 @@ pub enum RepresentationCandidate {
     Box,
     Vec,
     String,
+    BTreeMap,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

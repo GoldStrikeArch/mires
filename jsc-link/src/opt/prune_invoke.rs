@@ -140,6 +140,7 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "map_get"
             | "map_del"
             | "map_keys"
+            | "map_values"
             | "f2i"
             | "f2i_big"
             | "i2f32_big"
@@ -229,7 +230,18 @@ fn host_payload_cannot_throw(payload: &HostPayload, interns: &Interns) -> bool {
         HostPayload::Map { marker } => interns.str(*marker).is_some_and(|m| {
             matches!(
                 m,
-                "new" | "len" | "clear" | "has" | "set" | "get" | "getmut" | "del" | "keys"
+                "new"
+                    | "len"
+                    | "clear"
+                    | "has"
+                    | "set"
+                    | "get"
+                    | "getmut"
+                    | "try_get"
+                    | "try_getmut"
+                    | "del"
+                    | "keys"
+                    | "values"
             )
         }),
         HostPayload::Marker {
@@ -3751,6 +3763,7 @@ mod tests {
             "map_len",
             "map_clear",
             "map_keys",
+            "map_values",
         ];
         let unsafe_helpers = [
             "bstr_utf8_bytes",

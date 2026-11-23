@@ -1408,7 +1408,9 @@ fn storage_plan(types: &TypeTable, ty: TypeId, carrier: Carrier) -> StoragePlan 
         Carrier::Virtual => StoragePlan::Virtual,
         Carrier::Flat | Carrier::HostString | Carrier::Opaque => StoragePlan::ScalarLocals,
         Carrier::NativeVec => StoragePlan::JsArray,
-        Carrier::StringBuilder | Carrier::SliceView | Carrier::NativeBox => StoragePlan::JsObject,
+        Carrier::StringBuilder | Carrier::SliceView | Carrier::NativeBox | Carrier::NativeMap => {
+            StoragePlan::JsObject
+        }
         Carrier::Baseline if scalar_kind(types, ty).is_some() || types.is_zst(ty) => {
             StoragePlan::ScalarLocals
         }
@@ -1422,7 +1424,10 @@ fn drop_plan(types: &TypeTable, ty: TypeId, carrier: Carrier) -> DropPlan {
         .is_some_and(|descriptor| descriptor.layout.needs_drop)
     {
         DropPlan::Elided
-    } else if matches!(carrier, Carrier::NativeVec | Carrier::NativeBox) {
+    } else if matches!(
+        carrier,
+        Carrier::NativeVec | Carrier::NativeBox | Carrier::NativeMap
+    ) {
         DropPlan::Direct
     } else {
         DropPlan::Baseline
@@ -1433,6 +1438,7 @@ fn drop_reason(plan: DropPlan, carrier: Carrier) -> &'static str {
     match (plan, carrier) {
         (DropPlan::Direct, Carrier::NativeVec) => "registry.native-vec-drop",
         (DropPlan::Direct, Carrier::NativeBox) => "registry.native-box-drop",
+        (DropPlan::Direct, Carrier::NativeMap) => "registry.native-map-drop",
         (DropPlan::Baseline, _) => "cleanup.control-flow-proof-unavailable",
         (DropPlan::Elided, _) => "cleanup.not-required",
         _ => "cleanup.capability-not-selected",
@@ -1508,6 +1514,7 @@ fn carrier_name(carrier: Carrier) -> &'static str {
         Carrier::SliceView => "slice-view",
         Carrier::Opaque => "opaque",
         Carrier::NativeBox => "native-box",
+        Carrier::NativeMap => "native-map",
     }
 }
 

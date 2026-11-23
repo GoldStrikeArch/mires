@@ -196,6 +196,7 @@ fn native_vec_to_baseline(
                 crate::lower::NestedClone {
                     vec: true,
                     string: true,
+                    map: true,
                 },
             ),
         ));
@@ -369,13 +370,13 @@ fn once(value: Expr) -> (Expr, Box<dyn FnOnce(Expr) -> Expr>) {
 }
 
 /// The recorded member paths from a baseline `String` value to its raw parts.
-pub(super) struct StringLayout {
+pub(crate) struct StringLayout {
     /// To the `{ buf, off }` data-pointer slot.
-    pub(super) ptr: Vec<String>,
+    pub(crate) ptr: Vec<String>,
     /// To the length in bytes.
-    pub(super) len: Vec<String>,
+    pub(crate) len: Vec<String>,
     /// To the capacity in bytes, inside the raw-parts aggregate.
-    pub(super) cap: Vec<String>,
+    pub(crate) cap: Vec<String>,
 }
 
 /// The recorded member paths from a baseline `Vec` value to its raw parts.
@@ -438,7 +439,7 @@ enum Leaf {
 
 impl StringLayout {
     /// Resolves the canonical `String { vec: Vec<u8> }` structure, or declines.
-    pub(super) fn of(table: &TypeTable, interns: &Interns, ty: TypeId) -> Res<Self> {
+    pub(crate) fn of(table: &TypeTable, interns: &Interns, ty: TypeId) -> Res<Self> {
         let no =
             |detail: &str| decline(OpClass::Rvalue, format!("string Convert adapter: {detail}"));
         let descriptor = table
@@ -492,7 +493,7 @@ impl StringLayout {
         }
     }
 
-    pub(super) fn member(&self, base: Expr, path: &[String]) -> Expr {
+    pub(crate) fn member(&self, base: Expr, path: &[String]) -> Expr {
         member_path(base, path)
     }
 }

@@ -227,6 +227,7 @@ pub fn terms(graph: &ValueGraph) -> Vec<Term> {
             Some(CandidateKind::String) => &[Carrier::HostString, Carrier::StringBuilder],
             Some(CandidateKind::Vec) => &[Carrier::NativeVec],
             Some(CandidateKind::Box) => &[Carrier::NativeBox],
+            Some(CandidateKind::BTreeMap) => &[Carrier::NativeMap],
             None => continue,
         };
         let allowed: Vec<Carrier> = solvable
@@ -299,6 +300,7 @@ fn host_sink_term(
         Some(CandidateKind::String) => &[Carrier::HostString, Carrier::StringBuilder],
         Some(CandidateKind::Vec) => &[Carrier::NativeVec],
         Some(CandidateKind::Box) => &[Carrier::NativeBox],
+        Some(CandidateKind::BTreeMap) => &[Carrier::NativeMap],
         // A kindless node has nothing to fix.
         None => return None,
     };

@@ -27,6 +27,7 @@
 pub mod drop;
 pub mod fmt;
 pub mod fmt_kernel;
+pub mod map;
 pub mod num;
 pub mod slice;
 pub mod string;
@@ -60,6 +61,9 @@ pub struct LowerCx<'a> {
     pub element_glue_nonthrowing: bool,
     /// The program's `#[panic_handler]` (`BodySemantic::PanicImpl`), when resolved by the linker.
     pub panic_impl: Option<&'a JsName>,
+    /// Whether `panic_impl` reads its `&PanicInfo` parameter. When `false`, native `Vec` panics
+    /// invoke `panic_impl` directly without pulling in the `_nv_pinfo` `PanicInfo` builder.
+    pub panic_reads_info: bool,
 }
 
 /// One registry entry: the complete contract and lowering of one standard operation.
@@ -269,7 +273,24 @@ const NO_SLOTS: &[SlotRequirement] = &[];
 
 const NATIVE_VEC: &[Carrier] = &[Carrier::NativeVec];
 const NATIVE_BOX: &[Carrier] = &[Carrier::NativeBox];
+const NATIVE_MAP: &[Carrier] = &[Carrier::NativeMap];
 const SLICE_VIEW: &[Carrier] = &[Carrier::SliceView];
+const RESULT_MAP: &[SlotRequirement] = &[SlotRequirement::result(NATIVE_MAP)];
+const RECEIVER_MAP: &[SlotRequirement] = &[SlotRequirement::argument(
+    0,
+    ReferenceRequirement::Shared,
+    NATIVE_MAP,
+)];
+const MUT_RECEIVER_MAP: &[SlotRequirement] = &[SlotRequirement::argument(
+    0,
+    ReferenceRequirement::Mutable,
+    NATIVE_MAP,
+)];
+const VALUE_RECEIVER_MAP: &[SlotRequirement] = &[SlotRequirement::argument(
+    0,
+    ReferenceRequirement::Value,
+    NATIVE_MAP,
+)];
 const RESULT_VEC: &[SlotRequirement] = &[SlotRequirement::result(NATIVE_VEC)];
 const RECEIVER_VEC: &[SlotRequirement] = &[SlotRequirement::argument(
     0,
@@ -494,9 +515,9 @@ mod ops {
     op!(VEC_MEM_SWAP, VecMemSwap, 2, TWO_MUT_VEC, NATIVE_VEC, MUTATES,
         vec::legality_mem_swap, vec::vec_mem_swap, &[], 110, FIXTURE_75);
     op!(VEC_INDEX, VecIndex, 3, RECEIVER_VEC, NATIVE_VEC, THROWS,
-        vec::legality_index, vec::vec_index, &["nv_idx"], 34, FIXTURE_75);
+        vec::legality_index, vec::vec_index, &["_nv_fail"], 56, FIXTURE_75);
     op!(VEC_INDEX_MUT, VecIndexMut, 3, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS,
-        vec::legality_index, vec::vec_index, &["nv_idx"], 34, FIXTURE_75);
+        vec::legality_index, vec::vec_index, &["_nv_fail"], 56, FIXTURE_75);
     op!(VEC_RANGE_INDEX, VecRangeIndex, 3, RECEIVER_VEC, NATIVE_VEC, THROWS,
         vec::legality_range_index, vec::vec_range_index, &["nv_range"], 40, FIXTURE_75);
     op!(VEC_RANGE_INDEX_MUT, VecRangeIndexMut, 3, MUT_RECEIVER_VEC, NATIVE_VEC, THROWS,
@@ -526,6 +547,26 @@ mod ops {
         Deps::BoxPointeeDropGlue);
     op!(SLICE_SWAP, SliceSwap, 4, NO_SLOTS, SLICE_VIEW, THROWS_AND_MUTATES,
         slice::legality_swap, slice::slice_swap, &[], 220, FIXTURE_75);
+    op!(BTREE_MAP_NEW, BTreeMapNew, 0, RESULT_MAP, NATIVE_MAP, PURE,
+        map::legality_new, map::btree_map_new, &[], 18, FIXTURE_75);
+    op!(BTREE_MAP_LEN, BTreeMapLen, 1, RECEIVER_MAP, NATIVE_MAP, PURE,
+        map::legality_len, map::btree_map_len, &[], 18, FIXTURE_75);
+    op!(BTREE_MAP_IS_EMPTY, BTreeMapIsEmpty, 1, RECEIVER_MAP, NATIVE_MAP, PURE,
+        map::legality_is_empty, map::btree_map_is_empty, &[], 22, FIXTURE_75);
+    op!(BTREE_MAP_CLEAR, BTreeMapClear, 1, MUT_RECEIVER_MAP, NATIVE_MAP, MUTATES,
+        map::legality_unit, map::btree_map_clear, &[], 20, FIXTURE_75);
+    op!(BTREE_MAP_CONTAINS_KEY, BTreeMapContainsKey, 2, RECEIVER_MAP, NATIVE_MAP, PURE,
+        map::legality_contains_key, map::btree_map_contains_key, &[], 24, FIXTURE_75);
+    op!(BTREE_MAP_GET, BTreeMapGet, 2, RECEIVER_MAP, NATIVE_MAP, PURE,
+        map::legality_get, map::btree_map_get, &[], 48, FIXTURE_75);
+    op!(BTREE_MAP_GET_MUT, BTreeMapGetMut, 2, MUT_RECEIVER_MAP, NATIVE_MAP, MUTATES,
+        map::legality_get_mut, map::btree_map_get, &[], 48, FIXTURE_75);
+    op!(BTREE_MAP_INSERT, BTreeMapInsert, 3, MUT_RECEIVER_MAP, NATIVE_MAP, MUTATES,
+        map::legality_insert, map::btree_map_insert, &[], 64, FIXTURE_75);
+    op!(BTREE_MAP_REMOVE, BTreeMapRemove, 2, MUT_RECEIVER_MAP, NATIVE_MAP, MUTATES,
+        map::legality_remove, map::btree_map_remove, &[], 64, FIXTURE_75);
+    op!(BTREE_MAP_DROP, BTreeMapDrop, 1, MUT_RECEIVER_MAP, NATIVE_MAP, MUTATES,
+        map::legality_unit, map::btree_map_clear, &[], 20, FIXTURE_75);
 }
 
 fn legality_none(_cx: &LowerCx<'_>) -> Result<(), SemanticDecline> {
@@ -574,6 +615,16 @@ pub fn registry(operation: StandardOperation) -> Option<&'static SemanticOp> {
         StandardOperation::SliceToVec => &SLICE_TO_VEC,
         StandardOperation::VecDrop => &VEC_DROP,
         StandardOperation::BoxDrop => &BOX_DROP,
+        StandardOperation::BTreeMapNew => &BTREE_MAP_NEW,
+        StandardOperation::BTreeMapLen => &BTREE_MAP_LEN,
+        StandardOperation::BTreeMapIsEmpty => &BTREE_MAP_IS_EMPTY,
+        StandardOperation::BTreeMapClear => &BTREE_MAP_CLEAR,
+        StandardOperation::BTreeMapContainsKey => &BTREE_MAP_CONTAINS_KEY,
+        StandardOperation::BTreeMapGet => &BTREE_MAP_GET,
+        StandardOperation::BTreeMapGetMut => &BTREE_MAP_GET_MUT,
+        StandardOperation::BTreeMapInsert => &BTREE_MAP_INSERT,
+        StandardOperation::BTreeMapRemove => &BTREE_MAP_REMOVE,
+        StandardOperation::BTreeMapDrop => &BTREE_MAP_DROP,
         StandardOperation::SliceSwap => &SLICE_SWAP,
         StandardOperation::StringNew => &STRING_NEW,
         StandardOperation::StringWithCapacity => &STRING_WITH_CAPACITY,
@@ -725,6 +776,18 @@ pub fn support_of(
                         },
                     ))
                 }
+                RepresentationCandidate::BTreeMap => {
+                    let op = registry(StandardOperation::BTreeMapDrop)
+                        .ok_or(SemanticDecline::NotAStandardOperation)?;
+                    Ok((
+                        op,
+                        if by_value {
+                            VALUE_RECEIVER_MAP
+                        } else {
+                            MUT_RECEIVER_MAP
+                        },
+                    ))
+                }
                 RepresentationCandidate::None => Err(SemanticDecline::NotAStandardOperation),
             }
         }
@@ -755,6 +818,7 @@ pub fn validate(cx: &LowerCx<'_>) -> Result<&'static SemanticOp, SemanticDecline
         element_glue: cx.element_glue.or(Some(&proof_glue)),
         element_glue_nonthrowing: cx.element_glue_nonthrowing,
         panic_impl: cx.panic_impl,
+        panic_reads_info: cx.panic_reads_info,
     };
     match slots.first() {
         None => {
@@ -895,6 +959,8 @@ fn require_native_type(
         RepresentationCandidate::Vec
     } else if requirement.carriers.contains(&Carrier::NativeBox) {
         RepresentationCandidate::Box
+    } else if requirement.carriers.contains(&Carrier::NativeMap) {
+        RepresentationCandidate::BTreeMap
     } else {
         RepresentationCandidate::String
     };

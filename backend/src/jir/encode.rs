@@ -2638,6 +2638,16 @@ fn standard_operation_v2(operation: crate::late_ir::StandardOperation) -> Standa
         V1::VecMemSwap => StandardOperation::VecMemSwap,
         V1::VecInsert => StandardOperation::VecInsert,
         V1::VecInsertMut => StandardOperation::VecInsertMut,
+        V1::BTreeMapNew => StandardOperation::BTreeMapNew,
+        V1::BTreeMapLen => StandardOperation::BTreeMapLen,
+        V1::BTreeMapIsEmpty => StandardOperation::BTreeMapIsEmpty,
+        V1::BTreeMapClear => StandardOperation::BTreeMapClear,
+        V1::BTreeMapContainsKey => StandardOperation::BTreeMapContainsKey,
+        V1::BTreeMapGet => StandardOperation::BTreeMapGet,
+        V1::BTreeMapGetMut => StandardOperation::BTreeMapGetMut,
+        V1::BTreeMapInsert => StandardOperation::BTreeMapInsert,
+        V1::BTreeMapRemove => StandardOperation::BTreeMapRemove,
+        V1::BTreeMapDrop => StandardOperation::BTreeMapDrop,
     }
 }
 

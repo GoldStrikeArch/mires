@@ -216,6 +216,7 @@ fn run(
                 | crate::jir::repr::Carrier::StringBuilder
                 | crate::jir::repr::Carrier::NativeVec
                 | crate::jir::repr::Carrier::NativeBox
+                | crate::jir::repr::Carrier::NativeMap
         )
     });
     let runs_pea = opts.analyzes(OptimizerPass::Sroa) && passes.pea && pea_carriers;

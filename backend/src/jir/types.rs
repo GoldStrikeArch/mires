@@ -762,6 +762,7 @@ pub(crate) fn type_meta<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> TypeMeta {
             crate::late_ir::RepresentationCandidate::Box => RepresentationCandidate::Box,
             crate::late_ir::RepresentationCandidate::Vec => RepresentationCandidate::Vec,
             crate::late_ir::RepresentationCandidate::String => RepresentationCandidate::String,
+            crate::late_ir::RepresentationCandidate::BTreeMap => RepresentationCandidate::BTreeMap,
         },
         abi: match old.abi {
             crate::late_ir::NominalAbi::Rust => NominalAbi::Rust,

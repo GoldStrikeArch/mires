@@ -680,7 +680,7 @@ fn future_driver(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<
             return Err(decline(
                 OpClass::Host,
                 format!("`{HOST_PREFIX}{marker}` takes one future"),
-            ))
+            ));
         }
         (true, _) => {
             return Err(decline(
@@ -1130,17 +1130,13 @@ pub fn extern_import(module: &str, name: &str) -> String {
 // `rcgjs.map.*`
 // ---------------------------------------------------------------------------------------------
 
-/// The `__rt` member and arity a collection marker becomes (v1 `map.rs::rt_member`).
-fn map_member(marker: &str) -> Option<(&'static str, usize)> {
+/// Expected arity of each `mires-js` collection marker (v1 `map.rs::marker_arity`).
+fn map_arity(marker: &str) -> Option<usize> {
     Some(match marker {
-        "new" => ("map_new", 0),
-        "len" => ("map_len", 1),
-        "clear" => ("map_clear", 1),
-        "has" => ("map_has", 2),
-        "set" => ("map_set", 3),
-        "get" | "getmut" => ("map_get", 2),
-        "del" => ("map_del", 2),
-        "keys" => ("map_keys", 1),
+        "new" => 0,
+        "len" | "clear" | "keys" | "values" => 1,
+        "has" | "get" | "getmut" | "try_get" | "try_getmut" | "del" => 2,
+        "set" => 3,
         _ => return None,
     })
 }
@@ -1148,14 +1144,14 @@ fn map_member(marker: &str) -> Option<(&'static str, usize)> {
 /// Which argument of a marker is the key (v1 `map.rs::key_argument`).
 fn map_key_argument(marker: &str) -> Option<usize> {
     match marker {
-        "has" | "set" | "get" | "getmut" | "del" => Some(1),
+        "has" | "set" | "get" | "getmut" | "try_get" | "try_getmut" | "del" => Some(1),
         _ => None,
     }
 }
 
 /// Lowers a call to one of the `mires-js` collection markers (v1 `map.rs::codegen_map_marker`).
-fn map_marker(cx: &JsCx<'_>, _op: &Op, marker: &str, args: &[ValueId]) -> Res<Expr> {
-    let Some((member, arity)) = map_member(marker) else {
+fn map_marker(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<Expr> {
+    let Some(arity) = map_arity(marker) else {
         return Err(decline(
             OpClass::Host,
             format!(
@@ -1187,7 +1183,101 @@ fn map_marker(cx: &JsCx<'_>, _op: &Op, marker: &str, args: &[ValueId]) -> Res<Ex
             false => value,
         });
     }
-    Ok(jsast::rt_call(member, lowered))
+    let mut iter = lowered.into_iter();
+    Ok(match marker {
+        "new" => jsast::new(jsast::id("Map"), Vec::new()),
+        "len" => jsast::member(iter.next().unwrap(), "size"),
+        "clear" => jsast::call(jsast::member(iter.next().unwrap(), "clear"), Vec::new()),
+        "has" => {
+            let map = iter.next().unwrap();
+            let k = iter.next().unwrap();
+            jsast::call(jsast::member(map, "has"), vec![k])
+        }
+        "get" | "getmut" => {
+            let map = iter.next().unwrap();
+            let k = iter.next().unwrap();
+            jsast::call(jsast::member(map, "get"), vec![k])
+        }
+        "set" => {
+            let map = iter.next().unwrap();
+            let k = iter.next().unwrap();
+            let v = iter.next().unwrap();
+            jsast::call(jsast::member(map, "set"), vec![k, v])
+        }
+        "del" => {
+            let map = iter.next().unwrap();
+            let k = iter.next().unwrap();
+            jsast::call(jsast::member(map, "delete"), vec![k])
+        }
+        "keys" => jsast::rt_call("map_keys", vec![iter.next().unwrap()]),
+        "values" => jsast::rt_call("map_values", vec![iter.next().unwrap()]),
+        "try_get" | "try_getmut" => {
+            let map = iter.next().unwrap();
+            let k = iter.next().unwrap();
+            let res_id = op.result.ok_or_else(|| {
+                decline(
+                    OpClass::Host,
+                    format!("`{MAP_PREFIX}{marker}` requires an `Option` result"),
+                )
+            })?;
+            let res_ty = cx.ty_of(res_id)?;
+            let peeled = cx.table.peeled(res_ty);
+            let variants = cx.table.variants(peeled);
+            if variants.len() != 2 {
+                return Err(decline(
+                    OpClass::Host,
+                    format!("`{MAP_PREFIX}{marker}` result must be an `Option`-shaped enum"),
+                ));
+            }
+            let (none_idx, some_idx, some_field) =
+                if variants[0].fields.is_empty() && variants[1].fields.len() == 1 {
+                    let field = match variants[1].fields[0].key {
+                        rcgjs_object::jir::types::FieldKey::Name(id) => {
+                            cx.interns.str(id).unwrap_or("_0").to_owned()
+                        }
+                        _ => "_0".to_owned(),
+                    };
+                    (0u32, 1u32, field)
+                } else if variants[1].fields.is_empty() && variants[0].fields.len() == 1 {
+                    let field = match variants[0].fields[0].key {
+                        rcgjs_object::jir::types::FieldKey::Name(id) => {
+                            cx.interns.str(id).unwrap_or("_0").to_owned()
+                        }
+                        _ => "_0".to_owned(),
+                    };
+                    (1u32, 0u32, field)
+                } else {
+                    return Err(decline(
+                        OpClass::Host,
+                        format!("`{MAP_PREFIX}{marker}` result must be an `Option`-shaped enum"),
+                    ));
+                };
+            let none_tag =
+                value::variant_tag(cx.table, cx.interns, res_ty, none_idx).ok_or_else(|| {
+                    decline(OpClass::Host, "missing `None` tag for `rcgjs.map.try_get`")
+                })?;
+            let some_tag =
+                value::variant_tag(cx.table, cx.interns, res_ty, some_idx).ok_or_else(|| {
+                    decline(OpClass::Host, "missing `Some` tag for `rcgjs.map.try_get`")
+                })?;
+            let (_, tmp) = cx.temp(Expr::Undefined);
+            let get_call = jsast::call(jsast::member(map, "get"), vec![k]);
+            let none_obj = jsast::object(vec![(value::TAG.to_owned(), none_tag)]);
+            let some_obj = jsast::object(vec![
+                (value::TAG.to_owned(), some_tag),
+                (some_field, tmp.clone()),
+            ]);
+            jsast::seq(vec![
+                jsast::assign(tmp.clone(), get_call),
+                jsast::cond(
+                    jsast::binary(BinOp::StrictEq, tmp, Expr::Undefined),
+                    none_obj,
+                    some_obj,
+                ),
+            ])
+        }
+        _ => unreachable!(),
+    })
 }
 
 /// Checks that a marker's key argument is a reference to a class a host `Map` compares by value

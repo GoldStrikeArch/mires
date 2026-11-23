@@ -84,6 +84,7 @@ fn element_drop_is_trivially_nonthrowing_inner(
             RepresentationCandidate::Vec
                 | RepresentationCandidate::String
                 | RepresentationCandidate::Box
+                | RepresentationCandidate::BTreeMap
         ) && desc.meta.allocator == AllocatorIdentity::Global;
         if !std_container {
             return false;
@@ -96,7 +97,14 @@ fn element_drop_is_trivially_nonthrowing_inner(
                         element_drop_is_trivially_nonthrowing_inner(table, *inner, visited)
                     })
                 }
-                RepresentationCandidate::None => false,
+                RepresentationCandidate::BTreeMap => {
+                    args.first().is_some_and(|k| {
+                        element_drop_is_trivially_nonthrowing_inner(table, *k, visited)
+                    }) && args.get(1).is_some_and(|v| {
+                        element_drop_is_trivially_nonthrowing_inner(table, *v, visited)
+                    })
+                }
+                _ => false,
             },
             _ => false,
         };
@@ -204,7 +212,7 @@ fn box_pointee<'a>(cx: &LowerCx<'a>) -> Result<&'a TypeDescriptor, SemanticDecli
             return Err(SemanticDecline::UnsupportedOperation(operation));
         }
         BodySemantic::Ordinary | BodySemantic::PanicImpl => {
-            return Err(SemanticDecline::NotAStandardOperation)
+            return Err(SemanticDecline::NotAStandardOperation);
         }
     };
     let descriptor = type_get(cx.table, dropped)?;

@@ -92,17 +92,44 @@ fn vec_min_cap(cx: &LowerCx<'_>) -> Result<u64, SemanticDecline> {
     })
 }
 
+fn panic_handler_expr(
+    cx: &LowerCx<'_>,
+    panic_impl: &JsName,
+    helpers: &mut BTreeSet<&'static str>,
+    refs: &mut BTreeSet<JsName>,
+) -> Expr {
+    refs.insert(panic_impl.clone());
+    if cx.panic_reads_info {
+        helpers.insert("_nv_pinfo");
+        jsast::arrow(
+            vec!["$m".to_owned(), "$l".to_owned()],
+            jsast::rt_call(
+                "_nv_pinfo",
+                vec![
+                    jsast::id("$m"),
+                    jsast::id(panic_impl.as_str()),
+                    jsast::id("$l"),
+                ],
+            ),
+        )
+    } else {
+        jsast::id(panic_impl.as_str())
+    }
+}
+
 fn push_panic_arg(
     cx: &LowerCx<'_>,
     args: &mut Vec<Expr>,
+    helpers: &mut BTreeSet<&'static str>,
     refs: &mut BTreeSet<JsName>,
     loc_param: Option<&str>,
 ) {
     if let Some(panic_impl) = cx.panic_impl {
-        refs.insert(panic_impl.clone());
-        args.push(jsast::id(panic_impl.as_str()));
-        if let Some(loc) = loc_param {
-            args.push(jsast::id(loc));
+        args.push(panic_handler_expr(cx, panic_impl, helpers, refs));
+        if cx.panic_reads_info {
+            if let Some(loc) = loc_param {
+                args.push(jsast::id(loc));
+            }
         }
     }
 }
@@ -150,17 +177,15 @@ pub(super) fn vec_with_capacity(
     let mut args = vec![receiver(), jsast::raw_num(maximum.to_string())];
     match (vec_tv_kind(cx)?, cx.panic_impl) {
         (Some(kind), Some(panic_impl)) => {
-            refs.insert(panic_impl.clone());
             args.push(jsast::num(f64::from(kind)));
-            args.push(jsast::id(panic_impl.as_str()));
+            args.push(panic_handler_expr(cx, panic_impl, helpers, refs));
         }
         (Some(kind), None) => {
             args.push(jsast::num(f64::from(kind)));
         }
         (None, Some(panic_impl)) => {
-            refs.insert(panic_impl.clone());
             args.push(jsast::undefined());
-            args.push(jsast::id(panic_impl.as_str()));
+            args.push(panic_handler_expr(cx, panic_impl, helpers, refs));
         }
         (None, None) => {}
     }
@@ -213,7 +238,8 @@ pub(super) fn vec_as_slice(
     ))])
 }
 
-/// `Index<usize>` / `IndexMut<usize>`: compact shared bounds check + element reference.
+/// `Index<usize>` / `IndexMut<usize>`: inline bounds check + element reference so V8 keeps the
+/// failure branch out-of-line (`throw`) and eliminates the `direct ? ... : ...` check on hot loops.
 pub(super) fn vec_index(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
@@ -221,10 +247,21 @@ pub(super) fn vec_index(
     refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let indirect = vec_element(cx)?.js.is_indirect;
-    helpers.insert("nv_idx");
-    let mut args = vec![receiver(), jsast::id("$native1"), Expr::Bool(indirect)];
-    push_panic_arg(cx, &mut args, refs, Some("$native2"));
-    Ok(vec![jsast::ret(jsast::rt_call("nv_idx", args))])
+    helpers.insert("_nv_fail");
+    let mut fail_args = vec![Expr::Str("oob".to_owned())];
+    push_panic_arg(cx, &mut fail_args, helpers, refs, Some("$native2"));
+    let value = if indirect {
+        jsast::index(member("buf"), jsast::id("$native1"))
+    } else {
+        ptr::slot(member("buf"), jsast::id("$native1"))
+    };
+    Ok(vec![
+        jsast::if_(
+            jsast::binary(BinOp::Ge, jsast::id("$native1"), member("len")),
+            vec![jsast::throw(jsast::rt_call("_nv_fail", fail_args))],
+        ),
+        jsast::ret(value),
+    ])
 }
 
 /// `Index<Range*<usize>>` / `IndexMut<Range*<usize>>`: subslice sharing the native buffer.
@@ -248,7 +285,7 @@ pub(super) fn vec_range_index(
                 jsast::member(jsast::id("$native1"), "start"),
                 jsast::member(jsast::id("$native1"), "end"),
             ];
-            push_panic_arg(cx, &mut args, refs, Some("$native2"));
+            push_panic_arg(cx, &mut args, helpers, refs, Some("$native2"));
             Ok(vec![jsast::ret(jsast::rt_call("nv_range", args))])
         }
         RangeShape::From => {
@@ -258,7 +295,7 @@ pub(super) fn vec_range_index(
                 jsast::member(jsast::id("$native1"), "start"),
                 member("len"),
             ];
-            push_panic_arg(cx, &mut args, refs, Some("$native2"));
+            push_panic_arg(cx, &mut args, helpers, refs, Some("$native2"));
             Ok(vec![jsast::ret(jsast::rt_call("nv_range", args))])
         }
         RangeShape::To => {
@@ -268,7 +305,7 @@ pub(super) fn vec_range_index(
                 jsast::num(0),
                 jsast::member(jsast::id("$native1"), "end"),
             ];
-            push_panic_arg(cx, &mut args, refs, Some("$native2"));
+            push_panic_arg(cx, &mut args, helpers, refs, Some("$native2"));
             Ok(vec![jsast::ret(jsast::rt_call("nv_range", args))])
         }
     }
@@ -283,7 +320,7 @@ pub(super) fn vec_remove(
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     helpers.insert("nv_remove");
     let mut args = vec![receiver(), jsast::id("$native1")];
-    push_panic_arg(cx, &mut args, refs, Some("$native2"));
+    push_panic_arg(cx, &mut args, helpers, refs, Some("$native2"));
     Ok(vec![jsast::ret(jsast::rt_call("nv_remove", args))])
 }
 
@@ -296,7 +333,7 @@ pub(super) fn vec_swap_remove(
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     helpers.insert("nv_swap_remove");
     let mut args = vec![receiver(), jsast::id("$native1")];
-    push_panic_arg(cx, &mut args, refs, None);
+    push_panic_arg(cx, &mut args, helpers, refs, None);
     Ok(vec![jsast::ret(jsast::rt_call("nv_swap_remove", args))])
 }
 
@@ -317,7 +354,7 @@ pub(super) fn vec_push(
         jsast::raw_num(maximum.to_string()),
         jsast::raw_num(min_cap.to_string()),
     ];
-    push_panic_arg(cx, &mut args, refs, None);
+    push_panic_arg(cx, &mut args, helpers, refs, None);
     Ok(vec![
         jsast::expr_stmt(jsast::rt_call("nv_push", args)),
         jsast::ret_void(),
@@ -342,7 +379,7 @@ pub(super) fn vec_push_mut(
         jsast::raw_num(maximum.to_string()),
         jsast::raw_num(min_cap.to_string()),
     ];
-    push_panic_arg(cx, &mut args, refs, None);
+    push_panic_arg(cx, &mut args, helpers, refs, None);
     let push = jsast::expr_stmt(jsast::rt_call("nv_push", args));
     if indirect {
         Ok(vec![push, jsast::ret(jsast::id("$native1"))])
@@ -373,7 +410,7 @@ pub(super) fn vec_insert(
         jsast::raw_num(maximum.to_string()),
         jsast::raw_num(min_cap.to_string()),
     ];
-    push_panic_arg(cx, &mut args, refs, Some("$native3"));
+    push_panic_arg(cx, &mut args, helpers, refs, Some("$native3"));
     Ok(vec![
         jsast::expr_stmt(jsast::rt_call("nv_insert", args)),
         jsast::ret_void(),
@@ -399,7 +436,7 @@ pub(super) fn vec_insert_mut(
         jsast::raw_num(maximum.to_string()),
         jsast::raw_num(min_cap.to_string()),
     ];
-    push_panic_arg(cx, &mut args, refs, Some("$native3"));
+    push_panic_arg(cx, &mut args, helpers, refs, Some("$native3"));
     let insert = jsast::expr_stmt(jsast::rt_call("nv_insert", args));
     let out = if indirect {
         jsast::id("$native2")
@@ -430,7 +467,7 @@ pub(super) fn vec_reserve(
         Expr::Bool(exact),
         jsast::raw_num(min_cap.to_string()),
     ];
-    push_panic_arg(cx, &mut args, refs, None);
+    push_panic_arg(cx, &mut args, helpers, refs, None);
     Ok(vec![
         jsast::expr_stmt(jsast::rt_call("nv_reserve", args)),
         jsast::ret_void(),
@@ -557,7 +594,7 @@ pub(super) fn vec_resize(
         jsast::raw_num(maximum.to_string()),
         jsast::raw_num(min_cap.to_string()),
     ];
-    push_panic_arg(cx, &mut args, refs, None);
+    push_panic_arg(cx, &mut args, helpers, refs, None);
     Ok(vec![
         jsast::expr_stmt(jsast::rt_call("nv_resize", args)),
         jsast::ret_void(),
@@ -580,17 +617,15 @@ pub(super) fn vec_from_elem(
     ];
     match (vec_tv_kind(cx)?, cx.panic_impl) {
         (Some(kind), Some(panic_impl)) => {
-            refs.insert(panic_impl.clone());
             args.push(jsast::num(f64::from(kind)));
-            args.push(jsast::id(panic_impl.as_str()));
+            args.push(panic_handler_expr(cx, panic_impl, helpers, refs));
         }
         (Some(kind), None) => {
             args.push(jsast::num(f64::from(kind)));
         }
         (None, Some(panic_impl)) => {
-            refs.insert(panic_impl.clone());
             args.push(jsast::undefined());
-            args.push(jsast::id(panic_impl.as_str()));
+            args.push(panic_handler_expr(cx, panic_impl, helpers, refs));
         }
         (None, None) => {}
     }
@@ -691,7 +726,7 @@ pub(super) fn vec_extend(
         jsast::raw_num(maximum.to_string()),
         jsast::raw_num(min_cap.to_string()),
     ];
-    push_panic_arg(cx, &mut args, refs, None);
+    push_panic_arg(cx, &mut args, helpers, refs, None);
     Ok(vec![
         jsast::expr_stmt(jsast::rt_call("nv_extend", args)),
         jsast::ret_void(),
@@ -714,7 +749,7 @@ pub(super) fn vec_extend_from_slice(
         jsast::raw_num(maximum.to_string()),
         jsast::raw_num(min_cap.to_string()),
     ];
-    push_panic_arg(cx, &mut args, refs, None);
+    push_panic_arg(cx, &mut args, helpers, refs, None);
     Ok(vec![
         jsast::expr_stmt(jsast::rt_call("nv_extend_slice", args)),
         jsast::ret_void(),
@@ -1446,7 +1481,7 @@ pub(super) fn vec_element<'a>(cx: &LowerCx<'a>) -> Result<&'a TypeDescriptor, Se
             return Err(SemanticDecline::UnsupportedOperation(operation));
         }
         BodySemantic::Ordinary | BodySemantic::PanicImpl => {
-            return Err(SemanticDecline::NotAStandardOperation)
+            return Err(SemanticDecline::NotAStandardOperation);
         }
     };
     element_of_vec_type(cx, vector_ty)

@@ -85,41 +85,26 @@ pub(crate) fn map_set<Q: ?Sized, V>(map: RawMap, key: &Q, value: V) {
     unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }
 
-/// `map.delete(key)`.
+/// `map.delete(key)`, answering whether the key was present.
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.del")]
 #[inline(never)]
-pub(crate) fn map_del<Q: ?Sized>(map: RawMap, key: &Q) {
+pub(crate) fn map_del<Q: ?Sized>(map: RawMap, key: &Q) -> bool {
     let _ = (map, key);
     unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }
 
-/// `map.get(key)`, as a shared reference to the stored value.
-///
-/// # Safety
-///
-/// The key has to be present. A host `Map` answers `undefined` for one that is not, and this hands
-/// that back as a `&V`: reading through it is a wrong value rather than a caught error. Call
-/// [`map_has`] first, which is what everything in `map.rs` does. The lifetime is the caller's to
-/// pick, for the reason [`map_get_mut`] gives.
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.get")]
+/// `map.get(key)`, as a shared reference to the stored value, or `None` if absent.
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.try_get")]
 #[inline(never)]
-pub(crate) unsafe fn map_get<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> &'a V {
+pub(crate) unsafe fn map_try_get<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> Option<&'a V> {
     let _ = (map, key);
     unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }
 
-/// `map.get(key)`, as a mutable reference to the stored value.
-///
-/// # Safety
-///
-/// The key has to be present, as on [`map_get`], and the reference has to be the only one alive.
-/// The lifetime is the caller's to pick, because the host object outlives every Rust borrow of it,
-/// so nothing here stops a second call handing out a second `&mut` to the same place. Every caller
-/// narrows it to a borrow of the map immediately, which is what makes the borrow checker the thing
-/// that enforces this.
-#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.getmut")]
+/// `map.get(key)`, as a mutable reference to the stored value, or `None` if absent.
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.try_getmut")]
 #[inline(never)]
-pub(crate) unsafe fn map_get_mut<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> &'a mut V {
+pub(crate) unsafe fn map_try_get_mut<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> Option<&'a mut V> {
     let _ = (map, key);
     unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }
@@ -133,6 +118,14 @@ pub(crate) unsafe fn map_get_mut<'a, Q: ?Sized, V>(map: RawMap, key: &Q) -> &'a 
 #[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.keys")]
 #[inline(never)]
 pub(crate) fn map_keys<'a, S>(map: RawMap) -> &'a [S] {
+    let _ = map;
+    unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
+}
+
+/// `[...map.values()]`, the stored entry references in the exact insertion order of [`map_keys`].
+#[cfg_attr(target_arch = "wasm32", link_section = "rcgjs.map.values")]
+#[inline(never)]
+pub(crate) unsafe fn map_values<'a, V>(map: RawMap) -> &'a [&'a V] {
     let _ = map;
     unreachable!("mires-js collection markers are only meaningful to rustc_codegen_js")
 }

@@ -126,7 +126,7 @@ test("module mode emits lexical ESM bindings, elides unused _boxes, and deduplic
   const classicWithoutBox = minimalShim(["__rt._put(b, 0, v); __rt.js_abort('x'); __rt.read_array(p, 1); __rt.array_ref(p, 1);"], fullShim);
   assert.deepEqual(withoutBox.names, classicWithoutBox.names);
   parse(withoutBox.source, { ecmaVersion: 2018, sourceType: "module" });
-  assert.match(withoutBox.source, /let \$rt__boxes = null;/);
+  assert.match(withoutBox.source, /const \$rt__boxes = null;/);
   assert.doesNotMatch(withoutBox.source, /\$rt__boxes\.(?:has|set)\(/);
   assert.match(withoutBox.source, /const \$rt_err = \(m\) => new Error\("rustc_codegen_js: " \+ m\);/);
   assert.match(withoutBox.source, /new Error\("rust abort: " \+ msg\)/);

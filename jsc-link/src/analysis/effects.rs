@@ -1709,6 +1709,8 @@ fn registry_drop_may_unwind(
             | StandardOperation::VecTruncate
             | StandardOperation::VecDrop
             | StandardOperation::BoxDrop
+            | StandardOperation::BTreeMapClear
+            | StandardOperation::BTreeMapDrop
     ) {
         return false;
     }
@@ -1729,7 +1731,16 @@ fn registry_drop_may_unwind(
         return true;
     };
     let inner_ty = match &desc.kind {
-        TypeKind::Adt { args, .. } => args.first().copied(),
+        TypeKind::Adt { args, .. } => {
+            if matches!(
+                operation,
+                StandardOperation::BTreeMapClear | StandardOperation::BTreeMapDrop
+            ) {
+                args.get(1).copied()
+            } else {
+                args.first().copied()
+            }
+        }
         _ => None,
     };
     inner_ty

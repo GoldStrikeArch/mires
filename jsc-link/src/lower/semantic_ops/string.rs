@@ -2985,6 +2985,7 @@ mod bstr_tests {
             element_glue: None,
             element_glue_nonthrowing: false,
             panic_impl: None,
+            panic_reads_info: false,
         }
     }
 

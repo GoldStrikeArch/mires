@@ -1089,13 +1089,31 @@ impl Planner<'_> {
 
     /// The committable standard-operation items and their measured bodies.
     fn op_entries(&self, problem: &Problem) -> BTreeMap<JsName, OpEntry> {
-        let panic_impl: Option<JsName> = self.table.iter().find_map(|(name, item)| {
-            item.jir
-                .body
-                .as_ref()
-                .is_some_and(|body| body.semantic == BodySemantic::PanicImpl)
-                .then(|| name.clone())
-        });
+        let (panic_impl, panic_reads_info) = self
+            .table
+            .iter()
+            .find_map(|(name, item)| {
+                item.jir
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| body.semantic == BodySemantic::PanicImpl)
+                    .then(|| {
+                        let reads_info = self
+                            .funcs
+                            .get(name)
+                            .and_then(|res| res.as_ref().ok())
+                            .is_none_or(|func| {
+                                func.params.first().is_some_and(|param| {
+                                    func.blocks.iter().any(|block| {
+                                        block.ops.iter().any(|op| op.kind.uses().contains(param))
+                                            || block.term.uses().contains(param)
+                                    })
+                                })
+                            });
+                        (name.clone(), reads_info)
+                    })
+            })
+            .map_or((None, false), |(name, reads)| (Some(name), reads));
         let has_custom_allocator = self.table.values().any(|item| {
             matches!(
                 item.late_ir.artifact_allocator_provider(),
@@ -1120,6 +1138,7 @@ impl Planner<'_> {
                 element_glue: None,
                 element_glue_nonthrowing: false,
                 panic_impl: panic_impl.as_ref(),
+                panic_reads_info,
             };
             let Ok((op, slots)) = semantic_ops::support_of(&probe) else {
                 if let Some(&bstr_op) = self.bstr_ops.get(name) {
@@ -1466,6 +1485,102 @@ impl Planner<'_> {
                             }
                             _ => {}
                         }
+                    }
+                    // A BTreeMap key (`String` or `&String`) may stay native only when the map
+                    // itself commits to `NativeMap` (whose rewritten body accepts all three
+                    // `String` carriers); a baseline `BTreeMap` calls `String::cmp` on the raw
+                    // baseline struct and must receive a baseline key.
+                    if matches!(
+                        semantic,
+                        CallSemantic::Standard(
+                            StandardOperation::BTreeMapContainsKey
+                                | StandardOperation::BTreeMapGet
+                                | StandardOperation::BTreeMapGetMut
+                                | StandardOperation::BTreeMapRemove
+                                | StandardOperation::BTreeMapInsert
+                        )
+                    ) {
+                        if let Some(req0) = slots.first() {
+                            let map_caller = site_slot_key(name, args, op.result, req0)
+                                .and_then(|key| problem.resolution.get(&key))
+                                .copied()
+                                .unwrap_or(problem.baseline);
+                            let map_callee = self
+                                .slot_node(problem, callee_name, callee_func, req0)
+                                .unwrap_or(problem.baseline);
+                            let key_paths: &[&[Step]] = &[&[], &[Step::Deref]];
+                            if let Some(&arg1) = args.get(1) {
+                                for &path in key_paths {
+                                    let key = NodeKey::Value {
+                                        item: name.clone(),
+                                        site: Site::Value(arg1),
+                                        path: path.to_vec(),
+                                    };
+                                    if let Some(&key_node) = problem.resolution.get(&key) {
+                                        if key_node != map_caller {
+                                            pairs.push(Pair {
+                                                a: key_node,
+                                                b: map_caller,
+                                                ab: INF,
+                                                ba: 0,
+                                                native_equal: false,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(&param1) = callee_func.params.get(1) {
+                                for &path in key_paths {
+                                    let key = NodeKey::Value {
+                                        item: callee_name.clone(),
+                                        site: Site::Value(param1),
+                                        path: path.to_vec(),
+                                    };
+                                    if let Some(&key_node) = problem.resolution.get(&key) {
+                                        if key_node != map_callee {
+                                            pairs.push(Pair {
+                                                a: key_node,
+                                                b: map_callee,
+                                                ab: INF,
+                                                ba: 0,
+                                                native_equal: false,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Any candidate nested inside a `BTreeMap<K, V>`'s value slot (`Step::Element`) may go
+        // native only when its enclosing map commits to `NativeMap`; a baseline `BTreeMap` drops
+        // its values through raw baseline glue.
+        for (key, &elem_node) in &problem.resolution {
+            let NodeKey::Value { item, site, path } = key else {
+                continue;
+            };
+            for (idx, step) in path.iter().enumerate() {
+                if *step != Step::Element {
+                    continue;
+                }
+                let prefix = NodeKey::Value {
+                    item: item.clone(),
+                    site: *site,
+                    path: path[..idx].to_vec(),
+                };
+                if let Some(&map_node) = problem.resolution.get(&prefix) {
+                    if problem.nodes[map_node].family == Some(CandidateKind::BTreeMap)
+                        && elem_node != map_node
+                    {
+                        pairs.push(Pair {
+                            a: elem_node,
+                            b: map_node,
+                            ab: INF,
+                            ba: 0,
+                            native_equal: false,
+                        });
                     }
                 }
             }
@@ -2008,6 +2123,22 @@ impl Planner<'_> {
             loop_calls.insert(name.clone(), lowering.loop_calls);
             lowered.push((name.clone(), lowering.js, lowering.refs));
         }
+        // Private `$n1` native clones of standard operations live in `commit.bodies` and
+        // `commit.clones`, not in `funcs`. Lower them here so `table[clone]` replaces the
+        // copied baseline body (and drops its `RawVec` / allocator references) during cost
+        // measurement, matching `lane.rs`.
+        for (name, body) in &commit.bodies {
+            if funcs.contains_key(name) {
+                continue;
+            }
+            let lowering = Lowering::new(native_lowered(name, body), |sites| {
+                cost::Cost::new(&opts).alloc_term(sites)
+            });
+            allocation_terms.insert(name.clone(), lowering.alloc);
+            direct_calls.insert(name.clone(), lowering.direct_calls);
+            loop_calls.insert(name.clone(), lowering.loop_calls);
+            lowered.push((name.clone(), lowering.js, lowering.refs));
+        }
 
         for (name, js, refs) in lowered {
             let item = table.get_mut(&name)?;
@@ -2219,7 +2350,7 @@ impl Planner<'_> {
                 .and_then(|interns| interns.types.get(ty))
                 .is_some_and(|descriptor| match descriptor.meta.candidate {
                     RepresentationCandidate::None => false,
-                    RepresentationCandidate::Box => true,
+                    RepresentationCandidate::Box | RepresentationCandidate::BTreeMap => true,
                     RepresentationCandidate::Vec | RepresentationCandidate::String => {
                         !descriptor.layout.has_own_drop
                     }
@@ -2330,6 +2461,7 @@ impl Planner<'_> {
             Some(CandidateKind::String) => &[Carrier::HostString, Carrier::StringBuilder],
             Some(CandidateKind::Vec) => &[Carrier::NativeVec],
             Some(CandidateKind::Box) => &[Carrier::NativeBox],
+            Some(CandidateKind::BTreeMap) => &[Carrier::NativeMap],
             _ => return INF,
         };
         native_carriers
@@ -2467,6 +2599,19 @@ impl Planner<'_> {
             families += 1;
             for node in &box_survivors {
                 carriers[*node] = Some(Carrier::NativeBox);
+            }
+        }
+
+        // Order-unobserved default-allocator BTreeMap values take native JS `Map`.
+        let map_survivors: Vec<usize> = (0..count)
+            .filter(|index| {
+                f1[*index] && problem.nodes[*index].family == Some(CandidateKind::BTreeMap)
+            })
+            .collect();
+        if !map_survivors.is_empty() {
+            families += 1;
+            for node in &map_survivors {
+                carriers[*node] = Some(Carrier::NativeMap);
             }
         }
 
@@ -2638,6 +2783,9 @@ impl Planner<'_> {
                         }
                         Some(Carrier::HostString | Carrier::StringBuilder) => {
                             nested_clones.entry(item).or_default().string = true;
+                        }
+                        Some(Carrier::NativeMap) => {
+                            nested_clones.entry(item).or_default().map = true;
                         }
                         _ => {}
                     }
@@ -3651,6 +3799,7 @@ impl Planner<'_> {
                 CandidateKind::String => &["host-string", "string-builder"],
                 CandidateKind::Vec => &["native-vec", "slice-view"],
                 CandidateKind::Box => &["native-box"],
+                CandidateKind::BTreeMap => &["native-map"],
             };
             let impossible = region.iter().any(|node| no_carrier.contains(node));
             let legal = !impossible && region.iter().any(|node| !forced[*node]);
@@ -3713,6 +3862,7 @@ impl Planner<'_> {
                     CandidateKind::String => "string",
                     CandidateKind::Vec => "vec",
                     CandidateKind::Box => "carrier",
+                    CandidateKind::BTreeMap => "map",
                 }
                 .to_owned();
                 decision.chosen = carrier_name(carrier).to_owned();
@@ -4039,6 +4189,7 @@ fn carrier_name(carrier: Carrier) -> &'static str {
         Carrier::SliceView => "slice-view",
         Carrier::Opaque => "opaque",
         Carrier::NativeBox => "native-box",
+        Carrier::NativeMap => "native-map",
     }
 }
 

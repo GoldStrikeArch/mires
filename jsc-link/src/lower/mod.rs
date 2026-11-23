@@ -72,6 +72,7 @@ use crate::opts::Opts;
 pub struct NestedClone {
     pub vec: bool,
     pub string: bool,
+    pub map: bool,
 }
 
 /// Link-time call-target overrides for one native-version caller.
@@ -199,6 +200,7 @@ fn forced_semantic_rewrite(input: &LowerInput<'_>) -> Option<Result<LoweredItem,
                 "string-builder" => Ok(Carrier::StringBuilder),
                 "native-vec" => Ok(Carrier::NativeVec),
                 "native-box" => Ok(Carrier::NativeBox),
+                "native-map" => Ok(Carrier::NativeMap),
                 "slice-view" => Ok(Carrier::SliceView),
                 other => Err(other.to_owned()),
             })
@@ -230,6 +232,7 @@ fn forced_semantic_rewrite(input: &LowerInput<'_>) -> Option<Result<LoweredItem,
         element_glue: None,
         element_glue_nonthrowing: false,
         panic_impl: None,
+        panic_reads_info: false,
     };
     let (op, slots) = match semantic_ops::support_of(&cx) {
         Ok(support) => support,

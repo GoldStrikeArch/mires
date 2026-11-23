@@ -2103,7 +2103,6 @@ pub(crate) fn standard_operation<'tcx>(
         ("vec_as_mut_slice", StandardOperation::VecAsMutSlice),
         ("vec_pop", StandardOperation::VecPop),
         ("vec_is_empty", StandardOperation::VecIsEmpty),
-        ("vec_from_elem", StandardOperation::VecFromElem),
         (
             "box_assume_init_into_vec_unsafe",
             StandardOperation::VecFromBoxArray,
@@ -2119,6 +2118,16 @@ pub(crate) fn standard_operation<'tcx>(
     .or_else(|| format_to_string_operation(tcx, definition, arguments))
     .or_else(|| format_args_item_operation(tcx, definition, arguments))
     .or_else(|| {
+        if tcx.get_diagnostic_item(Symbol::intern("vec_from_elem")) == Some(definition) {
+            let sig = tcx
+                .fn_sig(definition)
+                .instantiate(tcx, arguments)
+                .skip_binder();
+            if vec_elem_ty(tcx, sig.output()).is_some_and(is_trivial_clone_primitive_ty) {
+                return Some(StandardOperation::VecFromElem);
+            }
+            return None;
+        }
         if tcx.get_diagnostic_item(Symbol::intern("mem_replace")) == Some(definition) {
             let sig = tcx
                 .fn_sig(definition)
@@ -2242,7 +2251,7 @@ pub(crate) fn standard_operation<'tcx>(
             }
             if name == "to_vec"
                 && signature.inputs().len() == 1
-                && standard_owner(tcx, result) == Some(RepresentationCandidate::Vec)
+                && vec_elem_ty(tcx, result).is_some_and(is_trivial_clone_primitive_ty)
             {
                 return Some(StandardOperation::SliceToVec);
             }
@@ -2291,10 +2300,16 @@ pub(crate) fn standard_operation<'tcx>(
                 "reserve_exact" => Some(StandardOperation::VecReserveExact),
                 "shrink_to_fit" => Some(StandardOperation::VecShrinkToFit),
                 "truncate" => Some(StandardOperation::VecTruncate),
-                "resize" => Some(StandardOperation::VecResize),
+                "resize" => owner
+                    .and_then(|ty| vec_elem_ty(tcx, ty))
+                    .is_some_and(is_trivial_clone_primitive_ty)
+                    .then_some(StandardOperation::VecResize),
                 "remove" => Some(StandardOperation::VecRemove),
                 "swap_remove" => Some(StandardOperation::VecSwapRemove),
-                "extend_from_slice" => Some(StandardOperation::VecExtendFromSlice),
+                "extend_from_slice" => owner
+                    .and_then(|ty| vec_elem_ty(tcx, ty))
+                    .is_some_and(is_trivial_clone_primitive_ty)
+                    .then_some(StandardOperation::VecExtendFromSlice),
                 "swap" => Some(StandardOperation::VecSwap),
                 _ => None,
             },
@@ -2314,34 +2329,32 @@ pub(crate) fn standard_operation<'tcx>(
             Some(RepresentationCandidate::Vec)
                 if lang.index_trait() == trait_id && name == "index" =>
             {
-                if signature
-                    .inputs()
-                    .get(1)
-                    .is_some_and(|ty| is_usize_range_index(*ty))
-                {
-                    Some(StandardOperation::VecRangeIndex)
-                } else {
-                    Some(StandardOperation::VecIndex)
+                match signature.inputs().get(1) {
+                    Some(ty) if is_usize_range_index(*ty) => Some(StandardOperation::VecRangeIndex),
+                    Some(ty) if matches!(ty.kind(), ty::Uint(ty::UintTy::Usize)) => {
+                        Some(StandardOperation::VecIndex)
+                    }
+                    _ => None,
                 }
             }
             Some(RepresentationCandidate::Vec)
                 if lang.index_mut_trait() == trait_id && name == "index_mut" =>
             {
-                if signature
-                    .inputs()
-                    .get(1)
-                    .is_some_and(|ty| is_usize_range_index(*ty))
-                {
-                    Some(StandardOperation::VecRangeIndexMut)
-                } else {
-                    Some(StandardOperation::VecIndexMut)
+                match signature.inputs().get(1) {
+                    Some(ty) if is_usize_range_index(*ty) => {
+                        Some(StandardOperation::VecRangeIndexMut)
+                    }
+                    Some(ty) if matches!(ty.kind(), ty::Uint(ty::UintTy::Usize)) => {
+                        Some(StandardOperation::VecIndexMut)
+                    }
+                    _ => None,
                 }
             }
             Some(RepresentationCandidate::Vec)
                 if is_clone_trait
                     && name == "clone"
                     && signature.inputs().len() == 1
-                    && standard_owner(tcx, result) == Some(RepresentationCandidate::Vec) =>
+                    && vec_elem_ty(tcx, result).is_some_and(is_trivial_clone_primitive_ty) =>
             {
                 Some(StandardOperation::VecClone)
             }
@@ -2360,7 +2373,13 @@ pub(crate) fn standard_operation<'tcx>(
             {
                 Some(StandardOperation::VecDrop)
             }
-            Some(RepresentationCandidate::Vec) if exact_extend => {
+            Some(RepresentationCandidate::Vec)
+                if exact_extend
+                    && signature
+                        .inputs()
+                        .get(1)
+                        .is_some_and(|arg| standard_owner(tcx, *arg) == Some(RepresentationCandidate::Vec)) =>
+            {
                 Some(StandardOperation::VecExtend)
             }
             Some(RepresentationCandidate::String)
@@ -2383,6 +2402,52 @@ pub(crate) fn standard_operation<'tcx>(
             {
                 Some(StandardOperation::StringDrop)
             }
+            Some(RepresentationCandidate::BTreeMap)
+                if standard_impl == Some(RepresentationCandidate::BTreeMap) =>
+            {
+                let key_ty = owner.and_then(|ty| btree_map_key_ty(tcx, ty));
+                if !key_ty.is_some_and(|k| is_native_map_key_ty(tcx, k)) {
+                    None
+                } else {
+                    let key_ty = key_ty.unwrap();
+                    let valid_lookup = || {
+                        signature.inputs().len() == 2
+                            && is_native_map_lookup_key_ty(tcx, key_ty, signature.inputs()[1])
+                    };
+                    match name {
+                        "len" if signature.inputs().len() == 1 => {
+                            Some(StandardOperation::BTreeMapLen)
+                        }
+                        "is_empty" if signature.inputs().len() == 1 => {
+                            Some(StandardOperation::BTreeMapIsEmpty)
+                        }
+                        "clear" if signature.inputs().len() == 1 => {
+                            Some(StandardOperation::BTreeMapClear)
+                        }
+                        "contains_key" if valid_lookup() => {
+                            Some(StandardOperation::BTreeMapContainsKey)
+                        }
+                        "get" if valid_lookup() => Some(StandardOperation::BTreeMapGet),
+                        "get_mut" if valid_lookup() => Some(StandardOperation::BTreeMapGetMut),
+                        "insert" if signature.inputs().len() == 3 => {
+                            Some(StandardOperation::BTreeMapInsert)
+                        }
+                        "remove" if valid_lookup() => Some(StandardOperation::BTreeMapRemove),
+                        _ => None,
+                    }
+                }
+            }
+            Some(RepresentationCandidate::BTreeMap)
+                if lang.drop_trait() == trait_id && name == "drop" =>
+            {
+                signature
+                    .inputs()
+                    .first()
+                    .map(|ty| ty.peel_refs())
+                    .and_then(|ty| btree_map_key_ty(tcx, ty))
+                    .is_some_and(|k| is_native_map_key_ty(tcx, k))
+                    .then_some(StandardOperation::BTreeMapDrop)
+            }
             _ => match standard_owner(tcx, result) {
                 Some(RepresentationCandidate::String)
                     if standard_impl == Some(RepresentationCandidate::String)
@@ -2395,6 +2460,16 @@ pub(crate) fn standard_operation<'tcx>(
                         && signature.inputs().is_empty() =>
                 {
                     Some(StandardOperation::VecNew)
+                }
+                Some(RepresentationCandidate::BTreeMap)
+                    if signature.inputs().is_empty()
+                        && ((standard_impl == Some(RepresentationCandidate::BTreeMap)
+                            && name == "new")
+                            || (is_default_trait && name == "default"))
+                        && btree_map_key_ty(tcx, result)
+                            .is_some_and(|k| is_native_map_key_ty(tcx, k)) =>
+                {
+                    Some(StandardOperation::BTreeMapNew)
                 }
                 _ => None,
             },
@@ -2576,6 +2651,82 @@ fn proven_int_ty<'tcx>(mut ty: Ty<'tcx>) -> bool {
     }
     matches!(ty.kind(), ty::Int(_) | ty::Uint(_))
 }
+fn is_trivial_clone_primitive_ty(ty: Ty<'_>) -> bool {
+    matches!(
+        ty.kind(),
+        ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_)
+    )
+}
+
+fn vec_elem_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+    let ty::Adt(definition, args) = ty.kind() else {
+        return None;
+    };
+    if !tcx.is_diagnostic_item(sym::Vec, definition.did()) {
+        return None;
+    }
+    args.types().next()
+}
+
+fn btree_map_key_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<Ty<'tcx>> {
+    let ty::Adt(definition, args) = ty.kind() else {
+        return None;
+    };
+    if !tcx.is_diagnostic_item(Symbol::intern("BTreeMap"), definition.did()) {
+        return None;
+    }
+    args.types().next()
+}
+
+fn is_shared_str_ref(ty: Ty<'_>) -> bool {
+    matches!(
+        ty.kind(),
+        ty::Ref(_, pointee, rustc_hir::Mutability::Not) if pointee.is_str()
+    )
+}
+
+fn is_native_map_key_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    match ty.kind() {
+        ty::Bool | ty::Char => true,
+        ty::Int(int) => matches!(
+            int,
+            ty::IntTy::I8 | ty::IntTy::I16 | ty::IntTy::I32 | ty::IntTy::Isize | ty::IntTy::I64
+        ),
+        ty::Uint(uint) => matches!(
+            uint,
+            ty::UintTy::U8
+                | ty::UintTy::U16
+                | ty::UintTy::U32
+                | ty::UintTy::Usize
+                | ty::UintTy::U64
+        ),
+        ty::Ref(_, pointee, rustc_hir::Mutability::Not) if pointee.is_str() => true,
+        ty::Adt(definition, _) => tcx.lang_items().string() == Some(definition.did()),
+        _ => false,
+    }
+}
+
+fn is_native_map_lookup_key_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    key_ty: Ty<'tcx>,
+    arg_ty: Ty<'tcx>,
+) -> bool {
+    let ty::Ref(_, q_ty, rustc_hir::Mutability::Not) = *arg_ty.kind() else {
+        return false;
+    };
+    if q_ty == key_ty || (is_shared_str_ref(key_ty) && is_shared_str_ref(q_ty)) {
+        return true;
+    }
+    if q_ty.is_str() {
+        return is_shared_str_ref(key_ty)
+            || matches!(
+                key_ty.kind(),
+                ty::Adt(def, _) if tcx.lang_items().string() == Some(def.did())
+            );
+    }
+    false
+}
+
 fn standard_owner(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Option<RepresentationCandidate> {
     let ty::Adt(definition, _) = ty.kind() else {
         return None;
@@ -2584,6 +2735,8 @@ fn standard_owner(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Option<RepresentationCandidate
         Some(RepresentationCandidate::Vec)
     } else if tcx.lang_items().string() == Some(definition.did()) {
         Some(RepresentationCandidate::String)
+    } else if tcx.is_diagnostic_item(Symbol::intern("BTreeMap"), definition.did()) {
+        Some(RepresentationCandidate::BTreeMap)
     } else {
         None
     }
@@ -2598,6 +2751,8 @@ pub(crate) fn type_metadata<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> TypeMetada
                 RepresentationCandidate::String
             } else if tcx.is_diagnostic_item(sym::Vec, definition.did()) {
                 RepresentationCandidate::Vec
+            } else if tcx.is_diagnostic_item(Symbol::intern("BTreeMap"), definition.did()) {
+                RepresentationCandidate::BTreeMap
             } else {
                 RepresentationCandidate::None
             };
@@ -2614,7 +2769,14 @@ pub(crate) fn type_metadata<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> TypeMetada
                 "mires_js" => PinnedBoundary::Host,
                 _ => PinnedBoundary::None,
             };
-            let allocator = allocator_identity(candidate, allocator_matches_global(tcx, arguments));
+            let alloc_arg = match candidate {
+                RepresentationCandidate::BTreeMap => 2,
+                _ => 1,
+            };
+            let allocator = allocator_identity(
+                candidate,
+                allocator_matches_global(tcx, arguments, alloc_arg),
+            );
             (candidate, abi, boundary, allocator)
         }
         _ => (
@@ -2646,8 +2808,9 @@ pub(crate) fn type_metadata<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> TypeMetada
 fn allocator_matches_global<'tcx>(
     tcx: TyCtxt<'tcx>,
     arguments: ty::GenericArgsRef<'tcx>,
+    arg_index: usize,
 ) -> Option<bool> {
-    let allocator = arguments.types().nth(1)?;
+    let allocator = arguments.types().nth(arg_index)?;
     let global = tcx.lang_items().global_alloc_ty()?;
     Some(matches!(
         allocator.kind(),
@@ -2663,7 +2826,9 @@ fn allocator_identity(
     match candidate {
         RepresentationCandidate::None => AllocatorIdentity::NotApplicable,
         RepresentationCandidate::String => AllocatorIdentity::Global,
-        RepresentationCandidate::Box | RepresentationCandidate::Vec => match matches_global {
+        RepresentationCandidate::Box
+        | RepresentationCandidate::Vec
+        | RepresentationCandidate::BTreeMap => match matches_global {
             Some(true) => AllocatorIdentity::Global,
             Some(false) => AllocatorIdentity::Custom,
             None => AllocatorIdentity::Unknown,

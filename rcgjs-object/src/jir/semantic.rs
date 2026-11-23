@@ -291,6 +291,26 @@ pub enum StandardOperation {
     VecInsert,
     /// `Vec::insert_mut(&mut self, index: usize, element: T) -> &mut T`.
     VecInsertMut,
+    /// `BTreeMap::new() -> BTreeMap<K, V>` / `<BTreeMap<K, V> as Default>::default()`.
+    BTreeMapNew,
+    /// `BTreeMap::len(&self) -> usize`.
+    BTreeMapLen,
+    /// `BTreeMap::is_empty(&self) -> bool`.
+    BTreeMapIsEmpty,
+    /// `BTreeMap::clear(&mut self)`.
+    BTreeMapClear,
+    /// `BTreeMap::contains_key<Q>(&self, key: &Q) -> bool`.
+    BTreeMapContainsKey,
+    /// `BTreeMap::get<Q>(&self, key: &Q) -> Option<&V>`.
+    BTreeMapGet,
+    /// `BTreeMap::get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>`.
+    BTreeMapGetMut,
+    /// `BTreeMap::insert(&mut self, key: K, value: V) -> Option<V>`.
+    BTreeMapInsert,
+    /// `BTreeMap::remove<Q>(&mut self, key: &Q) -> Option<V>`.
+    BTreeMapRemove,
+    /// `<BTreeMap<K, V> as Drop>::drop(&mut self)`.
+    BTreeMapDrop,
 }
 
 impl StandardOperation {

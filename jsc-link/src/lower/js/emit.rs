@@ -1016,7 +1016,7 @@ impl<'a> JsCx<'a> {
         let args = match &op.kind {
             OpKind::Call { args, .. } | OpKind::Host { args, .. } => args.as_slice(),
             OpKind::Copy(value) | OpKind::Move(value) => {
-                return self.inlined_keyed_loc(*value, seen)
+                return self.inlined_keyed_loc(*value, seen);
             }
             _ => &[],
         };
@@ -1326,7 +1326,7 @@ impl<'a> JsCx<'a> {
                         return Err(decline(
                             OpClass::Call,
                             "an inlined call whose lowering produces no value",
-                        ))
+                        ));
                     }
                 };
                 if self.is_i64_ty(self.ty_of(result)?) {
@@ -2164,7 +2164,8 @@ impl<'a> JsCx<'a> {
                 // A committed carrier is cloned at its own shape: the baseline field-wise clone
                 // reads a structure the value no longer has (Phase 4).
                 match self.func.values[v.0 as usize].carrier {
-                    rcgjs_object::jir::repr::Carrier::HostString => Ok(value),
+                    rcgjs_object::jir::repr::Carrier::HostString
+                    | rcgjs_object::jir::repr::Carrier::NativeMap => Ok(value),
                     rcgjs_object::jir::repr::Carrier::StringBuilder => {
                         Ok(record_clone(value, &["text", "cap", "len"], &[]))
                     }

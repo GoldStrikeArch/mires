@@ -109,6 +109,7 @@ pub enum CandidateKind {
     Box,
     Vec,
     String,
+    BTreeMap,
 }
 
 /// Where a value node is anchored inside one item.
@@ -2587,6 +2588,13 @@ impl<'a> Collector<'a> {
                 &[Step::Deref, Step::Element],
             ),
             StandardOperation::VecFromElem => flow(self, param_ty(0), &[], ret, &[Step::Element]),
+            StandardOperation::VecResize => flow(
+                self,
+                param_ty(2),
+                &[],
+                param_ty(0),
+                &[Step::Deref, Step::Element],
+            ),
             StandardOperation::VecClone => flow(self, param_ty(0), &[Step::Deref], ret, &[]),
             StandardOperation::SliceToVec => flow(
                 self,
@@ -2595,6 +2603,52 @@ impl<'a> Collector<'a> {
                 ret,
                 &[Step::Element],
             ),
+            StandardOperation::BTreeMapInsert => {
+                flow(
+                    self,
+                    param_ty(2),
+                    &[],
+                    param_ty(0),
+                    &[Step::Deref, Step::Element],
+                );
+                if let Some((_, ret_ty)) = ret {
+                    if let Some(some_idx) = option_some_variant(types, ret_ty) {
+                        flow(
+                            self,
+                            param_ty(0),
+                            &[Step::Deref, Step::Element],
+                            ret,
+                            &[Step::Variant(some_idx), Step::Field(0)],
+                        );
+                    }
+                }
+            }
+            StandardOperation::BTreeMapGet | StandardOperation::BTreeMapGetMut => {
+                if let Some((_, ret_ty)) = ret {
+                    if let Some(some_idx) = option_some_variant(types, ret_ty) {
+                        flow(
+                            self,
+                            param_ty(0),
+                            &[Step::Deref, Step::Element],
+                            ret,
+                            &[Step::Variant(some_idx), Step::Field(0), Step::Deref],
+                        );
+                    }
+                }
+            }
+            StandardOperation::BTreeMapRemove => {
+                if let Some((_, ret_ty)) = ret {
+                    if let Some(some_idx) = option_some_variant(types, ret_ty) {
+                        flow(
+                            self,
+                            param_ty(0),
+                            &[Step::Deref, Step::Element],
+                            ret,
+                            &[Step::Variant(some_idx), Step::Field(0)],
+                        );
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2614,7 +2668,7 @@ impl<'a> Collector<'a> {
             use crate::jir::types::RepresentationCandidate;
             match descriptor.meta.candidate {
                 RepresentationCandidate::None => false,
-                RepresentationCandidate::Box => true,
+                RepresentationCandidate::Box | RepresentationCandidate::BTreeMap => true,
                 RepresentationCandidate::Vec | RepresentationCandidate::String => {
                     !descriptor.layout.has_own_drop
                 }
@@ -3157,6 +3211,7 @@ fn walk_type(
         crate::jir::types::RepresentationCandidate::Box => Some(CandidateKind::Box),
         crate::jir::types::RepresentationCandidate::Vec => Some(CandidateKind::Vec),
         crate::jir::types::RepresentationCandidate::String => Some(CandidateKind::String),
+        crate::jir::types::RepresentationCandidate::BTreeMap => Some(CandidateKind::BTreeMap),
         crate::jir::types::RepresentationCandidate::None => None,
     };
     if kind == Some(CandidateKind::Vec) {
@@ -3204,6 +3259,34 @@ fn walk_type(
             }
         }
     }
+    if kind == Some(CandidateKind::BTreeMap) {
+        let value = match &descriptor.kind {
+            TypeKind::Adt { args, .. } => args.get(1).copied(),
+            _ => None,
+        };
+        match value.and_then(|value| types.get(value)) {
+            Some(value) if !value.layout.sized => {
+                reasons.insert(InfReason::Unsized);
+            }
+            Some(value) if value.layout.zst => {
+                reasons.insert(InfReason::ZeroSized);
+            }
+            Some(value) if value.layout.size.is_none() || value.layout.align.is_none() => {
+                reasons.insert(InfReason::UnknownLayout);
+            }
+            Some(value)
+                if !crate::lower::semantic_ops::drop::element_drop_is_trivially_nonthrowing(
+                    types, value.id,
+                ) =>
+            {
+                reasons.insert(InfReason::UserDefinedDrop);
+            }
+            Some(_) => {}
+            None => {
+                reasons.insert(InfReason::UnknownLayout);
+            }
+        }
+    }
     if let Some(kind) = kind {
         out.push(PathInfo {
             path: path.clone(),
@@ -3212,9 +3295,9 @@ fn walk_type(
             reasons: reasons.clone(),
             host_pin: pin,
         });
-        // A native Vec owns ordinary Rust elements whose nested heap values need their own
-        // decisions; String and Box internals are representation boundaries.
-        if kind != CandidateKind::Vec {
+        // A native Vec or BTreeMap owns ordinary Rust values whose nested heap values need their
+        // own decisions; String and Box internals are representation boundaries.
+        if kind != CandidateKind::Vec && kind != CandidateKind::BTreeMap {
             return;
         }
     }
@@ -3245,6 +3328,17 @@ fn walk_type(
             if let Some(element) = args.first() {
                 path.push(Step::Element);
                 walk_type(*element, types, path, &reasons, pin, out, stack);
+                path.pop();
+            }
+        }
+        TypeKind::Adt {
+            args,
+            form: NominalForm::Struct,
+            ..
+        } if kind == Some(CandidateKind::BTreeMap) => {
+            if let Some(value) = args.get(1) {
+                path.push(Step::Element);
+                walk_type(*value, types, path, &reasons, pin, out, stack);
                 path.pop();
             }
         }
@@ -3334,6 +3428,7 @@ fn type_reasons(descriptor: &TypeDescriptor) -> (BTreeSet<InfReason>, bool) {
             RepresentationCandidate::Box
                 | RepresentationCandidate::Vec
                 | RepresentationCandidate::String
+                | RepresentationCandidate::BTreeMap
         )
     {
         reasons.insert(InfReason::UserDefinedDrop);

@@ -1482,7 +1482,8 @@ fn verify_host_payload_no_throw(payload: &HostPayload, interns: &Interns) -> Res
             .str(*marker)
             .ok_or_else(|| "unresolvable map marker payload".to_owned())?;
         return match op {
-            "new" | "len" | "clear" | "has" | "set" | "get" | "getmut" | "del" | "keys" => Ok(()),
+            "new" | "len" | "clear" | "has" | "set" | "get" | "getmut" | "try_get"
+            | "try_getmut" | "del" | "keys" | "values" => Ok(()),
             other => Err(format!("unrecognized map marker `{other}` may throw")),
         };
     }
@@ -1614,6 +1615,7 @@ fn witness_sysroot_shim_is_non_throwing(sym: &str) -> bool {
             | "map_get"
             | "map_del"
             | "map_keys"
+            | "map_values"
             | "f2i"
             | "f2i_big"
             | "i2f32_big"

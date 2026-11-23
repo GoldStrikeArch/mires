@@ -4907,25 +4907,26 @@ globalThis.__rt.native_vec_set_len = (value, length) => {
 // `#[panic_handler]` (with caller location when available) and always raising a
 // registered Rust abort (`__rt.is_abort`).
 globalThis.__rt._tv_ctors = [Uint8Array,Int8Array,Uint16Array,Int16Array,Uint32Array,Int32Array,Float32Array,Float64Array];
-globalThis.__rt._nv_fail = (m, p, l) => { if (p) { const b = []; for (let i = 0; i < m.length; i++) b.push(m.charCodeAt(i)); p({ message: { template: { buf: b, off: 0 }, args: ((b.length << 1) | 1) >>> 0 }, location: l || { filename: { buf: [], off: 0, len: 0 }, line: 0, col: 0 }, can_unwind: true, force_no_backtrace: false }); } throw __rt.abort_error(new RangeError(m)); };
+globalThis.__rt._nv_fail = (m, p, l) => { if (p) p(m, l); throw __rt.abort_error(new RangeError(m)); };
+globalThis.__rt._nv_pinfo = (m, p, l) => { const b = []; for (let i = 0; i < m.length; i++) b.push(m.charCodeAt(i)); p({ message: { template: { buf: b, off: 0 }, args: ((b.length << 1) | 1) >>> 0 }, location: l || { filename: { buf: [], off: 0, len: 0 }, line: 0, col: 0 }, can_unwind: true, force_no_backtrace: false }); };
 globalThis.__rt.tv_new = (k) => ({buf:new __rt._tv_ctors[k](0),len:0,cap:0});
-globalThis.__rt.nv_cap = (c, m, k, p) => { if (c > m) __rt._nv_fail("cap", p); return {buf:k!==void 0?new __rt._tv_ctors[k](c):new Array(c),len:0,cap:c}; };
-globalThis.__rt._nv_grow = (v, r, m, e, s, p) => { if (r > m) __rt._nv_fail("cap", p); const b = v.buf, t = ArrayBuffer.isView(b), mc = s || (t && b.BYTES_PER_ELEMENT === 1 ? 8 : 4); let n = e ? r : Math.max(mc, v.cap * 2, r); if (n > m) n = m; if (t) { const c = new b.constructor(n); if (v.len) c.set(b.subarray(0, v.len)); v.buf = c; } else b.length = n; v.cap = n; };
+globalThis.__rt.nv_cap = (c, m, k, p) => { if (c > m) throw __rt._nv_fail("cap", p); return {buf:k!==void 0?new __rt._tv_ctors[k](c):new Array(c),len:0,cap:c}; };
+globalThis.__rt._nv_grow = (v, r, m, e, s, p) => { if (r > m) throw __rt._nv_fail("cap", p); const b = v.buf, t = ArrayBuffer.isView(b), mc = s || (t && b.BYTES_PER_ELEMENT === 1 ? 8 : 4); let n = e ? r : Math.max(mc, v.cap * 2, r); if (n > m) n = m; if (t) { const c = new b.constructor(n); if (v.len) c.set(b.subarray(0, v.len)); v.buf = c; } else b.length = n; v.cap = n; };
 globalThis.__rt.nv_push = (v, x, m, s, p) => { const l = v.len; if (l === v.cap) __rt._nv_grow(v, l + 1, m, 0, s, p); v.buf[l] = x; v.len = l + 1; };
-globalThis.__rt.nv_insert = (v, i, x, m, s, p, loc) => { const l = v.len; if (i > l) __rt._nv_fail("oob", p, loc); if (l === v.cap) __rt._nv_grow(v, l + 1, m, 0, s, p); const b = v.buf; if (i < l) b.copyWithin(i + 1, i, l); b[i] = x; v.len = l + 1; };
+globalThis.__rt.nv_insert = (v, i, x, m, s, p, loc) => { const l = v.len; if (i > l) throw __rt._nv_fail("oob", p, loc); if (l === v.cap) __rt._nv_grow(v, l + 1, m, 0, s, p); const b = v.buf; if (i < l) b.copyWithin(i + 1, i, l); b[i] = x; v.len = l + 1; };
 globalThis.__rt.nv_reserve = (v, a, m, e, s, p) => { const r = v.len + a; if (r > v.cap) __rt._nv_grow(v, r, m, e, s, p); };
 globalThis.__rt.nv_shrink = (v) => { const l = v.len; if (v.cap > l) { const b = v.buf; if (ArrayBuffer.isView(b)) { const c = new b.constructor(l); if (l) c.set(b.subarray(0, l)); v.buf = c; } else b.length = l; v.cap = l; } };
-globalThis.__rt.nv_from_elem = (x, n, m, k, p) => { if (n > m) __rt._nv_fail("cap", p); const b = k !== void 0 ? new __rt._tv_ctors[k](n) : new Array(n); if (k === void 0 || x !== 0 || 1 / x < 0) b.fill(x); return {buf:b,len:n,cap:n}; };
+globalThis.__rt.nv_from_elem = (x, n, m, k, p) => { if (n > m) throw __rt._nv_fail("cap", p); const b = k !== void 0 ? new __rt._tv_ctors[k](n) : new Array(n); if (k === void 0 || x !== 0 || 1 / x < 0) b.fill(x); return {buf:b,len:n,cap:n}; };
 globalThis.__rt.nv_resize = (v, n, x, m, s, p) => { const l = v.len; if (n > l) { if (n > v.cap) __rt._nv_grow(v, n, m, 0, s, p); v.buf.fill(x, l, n); } else if (n < l && !ArrayBuffer.isView(v.buf)) v.buf.fill(void 0, n, l); v.len = n; };
 globalThis.__rt.nv_extend = (v, s, m, mc, p) => { const tl = v.len, sl = s.len, r = tl + sl; if (r > v.cap) __rt._nv_grow(v, r, m, 0, mc, p); s.len = 0; const db = v.buf, sb = s.buf; if (ArrayBuffer.isView(db)) { if (sl) db.set(sb.subarray(0, sl), tl); s.buf = new sb.constructor(0); } else { for (let i = 0; i < sl; i++) { db[tl + i] = sb[i]; sb[i] = void 0; } sb.length = 0; } v.len = r; s.cap = 0; };
 globalThis.__rt.nv_extend_slice = (v, s, m, mc, p) => { const sl = s.len; if (!sl) return; const tl = v.len, r = tl + sl; if (r > v.cap) __rt._nv_grow(v, r, m, 0, mc, p); const db = v.buf, sb = s.buf, so = s.off; if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor) db.set(sb.subarray(so, so + sl), tl); else for (let i = 0; i < sl; i++) db[tl + i] = sb[so + i]; v.len = r; };
 globalThis.__rt.nv_clone = (v) => ({buf:v.buf.slice(0,v.len),len:v.len,cap:v.len});
 globalThis.__rt.nv_from_slice = (s, k) => { const l = s.len, sb = s.buf, so = s.off; let b; if (k !== void 0) { const C = __rt._tv_ctors[k]; b = new C(l); if (l) { if (ArrayBuffer.isView(sb) && sb.constructor === C) b.set(sb.subarray(so, so + l)); else for (let i = 0; i < l; i++) b[i] = sb[so + i]; } } else if (!l) b = []; else if (Array.isArray(sb)) b = sb.slice(so, so + l); else { b = new Array(l); for (let i = 0; i < l; i++) b[i] = sb[so + i]; } return {buf:b,len:l,cap:l}; };
 globalThis.__rt.nv_from_box = (p, n, k) => { const a = !n ? [] : (Array.isArray(p) ? p : p.w !== void 0 ? p.buf.slice(p.off, p.off + n) : p.buf[p.off]).slice(0, n); return {buf:k!==void 0?new __rt._tv_ctors[k](a):a,len:n,cap:n}; };
-globalThis.__rt.nv_remove = (v, i, p, loc) => { const l = v.len; if (i >= l) __rt._nv_fail("oob", p, loc); const b = v.buf, o = b[i]; if (i + 1 < l) b.copyWithin(i, i + 1, l); if (!ArrayBuffer.isView(b)) b[l - 1] = void 0; v.len = l - 1; return o; };
-globalThis.__rt.nv_swap_remove = (v, i, p) => { const l = v.len; if (i >= l) __rt._nv_fail("oob", p); const b = v.buf, e = l - 1, o = b[i]; if (i !== e) b[i] = b[e]; if (!ArrayBuffer.isView(b)) b[e] = void 0; v.len = e; return o; };
-globalThis.__rt.nv_idx = (v, i, d, p, loc) => { if (i >= v.len) __rt._nv_fail("oob", p, loc); return d ? v.buf[i] : {buf:v.buf,off:i}; };
-globalThis.__rt.nv_range = (v, a, b, p, loc) => { if (a > b || b > v.len) __rt._nv_fail("oob", p, loc); return {buf:v.buf,off:a,len:b-a}; };
+globalThis.__rt.nv_remove = (v, i, p, loc) => { const l = v.len; if (i >= l) throw __rt._nv_fail("oob", p, loc); const b = v.buf, o = b[i]; if (i + 1 < l) b.copyWithin(i, i + 1, l); if (!ArrayBuffer.isView(b)) b[l - 1] = void 0; v.len = l - 1; return o; };
+globalThis.__rt.nv_swap_remove = (v, i, p) => { const l = v.len; if (i >= l) throw __rt._nv_fail("oob", p); const b = v.buf, e = l - 1, o = b[i]; if (i !== e) b[i] = b[e]; if (!ArrayBuffer.isView(b)) b[e] = void 0; v.len = e; return o; };
+globalThis.__rt.nv_idx = (v, i, d, p, loc) => { if (i >= v.len) throw __rt._nv_fail("oob", p, loc); return d ? v.buf[i] : {buf:v.buf,off:i}; };
+globalThis.__rt.nv_range = (v, a, b, p, loc) => { if (a > b || b > v.len) throw __rt._nv_fail("oob", p, loc); return {buf:v.buf,off:a,len:b-a}; };
 
 // ---------------------------------------------------------------------------
 // The heap
@@ -5417,6 +5418,14 @@ globalThis.__rt.map_del = (m, k) => {
 globalThis.__rt.map_keys = (m) => {
   const keys = Array.from(m.keys());
   return { buf: keys, off: 0, len: keys.length };
+};
+
+// map_values(m) -> `&[&Option<V>]`: a snapshot of the stored `Option<V>`
+// entries in the same insertion order as `map_keys`, eliminating per-entry
+// `Map.has`/`Map.get` lookups during `HashMap::iter`.
+globalThis.__rt.map_values = (m) => {
+  const vals = Array.from(m.values());
+  return { buf: vals, off: 0, len: vals.length };
 };
 
 // ---------------------------------------------------------------------------
@@ -6977,6 +6986,10 @@ globalThis.__rt.u8array_into_bytes = (src, dst) => {
   }
   const buf = dst.buf;
   const off = dst.off;
+  if (ArrayBuffer.isView(buf)) {
+    buf.set(src, off);
+    return;
+  }
   for (let i = 0; i < len; i += 1) buf[off + i] = src[i];
 };
 

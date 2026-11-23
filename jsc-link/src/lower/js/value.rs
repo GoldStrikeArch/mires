@@ -589,6 +589,19 @@ pub fn clone_expr_with(
                         )
                     })
                 }
+                RepresentationCandidate::BTreeMap if nested_clone.map => {
+                    clone_once(value, "$cm", |v| {
+                        jsast::cond(
+                            jsast::binary(
+                                BinOp::StrictNe,
+                                jsast::member(v.clone(), "size"),
+                                jsast::undefined(),
+                            ),
+                            v.clone(),
+                            struct_clone(v),
+                        )
+                    })
+                }
                 _ => struct_clone(value),
             }
         }

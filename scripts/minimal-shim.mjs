@@ -148,7 +148,7 @@ export function minimalShim(programs, shimSource, { module = false, direct: decl
   const rtRefPattern =
     /'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|(?:globalThis\.)?__rt\.([A-Za-z_$][A-Za-z0-9_$]*)/g;
   const statements = names.map((name) => {
-    if (elideBoxes && name === "_boxes") return "let $rt__boxes = null;";
+    if (elideBoxes && name === "_boxes") return "const $rt__boxes = null;";
     if (elideByteViews && name === "_bv") return "const $rt__bv = null;";
     if (elideElementViews && name === "_element_view_of") return "const $rt__element_view_of = null;";
     let stmt = members.get(name);

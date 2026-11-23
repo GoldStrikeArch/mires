@@ -643,6 +643,7 @@ fn lower_cx<'a>(
         element_glue: None,
         element_glue_nonthrowing: false,
         panic_impl: None,
+        panic_reads_info: false,
     }
 }
 
@@ -1130,14 +1131,20 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::VecIndex,
         NATIVE,
         r#"function f($native0, $native1, $native2) {
-  return __rt.nv_idx($native0, $native1, false);
+  if ($native1 >= $native0.len) {
+    throw __rt._nv_fail("oob");
+  }
+  return { buf: $native0.buf, off: $native1 };
 }"#,
     ),
     (
         StandardOperation::VecIndexMut,
         NATIVE,
         r#"function f($native0, $native1, $native2) {
-  return __rt.nv_idx($native0, $native1, false);
+  if ($native1 >= $native0.len) {
+    throw __rt._nv_fail("oob");
+  }
+  return { buf: $native0.buf, off: $native1 };
 }"#,
     ),
     (
@@ -1403,6 +1410,7 @@ fn drop_glue_resolves_through_the_candidate() {
         element_glue: None,
         element_glue_nonthrowing: false,
         panic_impl: None,
+        panic_reads_info: false,
     };
     let rewrite = rewrite(&cx, &[Carrier::StringBuilder]).expect("string drop glue lowers");
     assert_eq!(rewrite.operation, StandardOperation::StringDrop);
@@ -1416,6 +1424,7 @@ fn drop_glue_resolves_through_the_candidate() {
         element_glue: None,
         element_glue_nonthrowing: false,
         panic_impl: None,
+        panic_reads_info: false,
     };
     let vec_rewrite = super::rewrite(&cx, &[Carrier::NativeVec]).expect("vec drop glue lowers");
     assert_eq!(vec_rewrite.operation, StandardOperation::VecDrop);
@@ -1436,6 +1445,7 @@ fn box_drop_preserves_pointee_glue_without_allocator_machinery() {
         element_glue: None,
         element_glue_nonthrowing: false,
         panic_impl: None,
+        panic_reads_info: false,
     };
     let plain_rewrite = rewrite(&plain, &[Carrier::NativeBox]).expect("plain Box drop lowers");
     assert_eq!(plain_rewrite.operation, StandardOperation::BoxDrop);
@@ -1461,6 +1471,7 @@ fn box_drop_preserves_pointee_glue_without_allocator_machinery() {
         element_glue: Some(&glue),
         element_glue_nonthrowing: false,
         panic_impl: None,
+        panic_reads_info: false,
     };
     let rewrite = rewrite(&droppy, &[Carrier::NativeBox]).expect("structural Box drop lowers");
     assert_eq!(
@@ -1493,6 +1504,7 @@ fn box_drop_requires_proven_structural_pointee_glue() {
         element_glue: None,
         element_glue_nonthrowing: false,
         panic_impl: None,
+        panic_reads_info: false,
     };
     assert_eq!(
         rewrite(&droppy, &[Carrier::NativeBox]).err(),
@@ -1509,6 +1521,7 @@ fn box_drop_requires_proven_structural_pointee_glue() {
         element_glue: None,
         element_glue_nonthrowing: false,
         panic_impl: None,
+        panic_reads_info: false,
     };
     assert_eq!(
         rewrite(&own, &[Carrier::NativeBox]).err(),
@@ -1605,6 +1618,7 @@ fn dropful_clear_and_drop_call_the_glue_in_order() {
             element_glue: Some(&glue),
             element_glue_nonthrowing: true,
             panic_impl: None,
+            panic_reads_info: false,
         };
         let rewrite = rewrite(&cx, &[Carrier::NativeVec])
             .unwrap_or_else(|decline| panic!("{operation:?}: {}", decline.reason()));
@@ -1650,6 +1664,7 @@ fn own_drop_element_is_an_exact_decline() {
             element_glue,
             element_glue_nonthrowing: false,
             panic_impl: None,
+            panic_reads_info: false,
         };
         assert_eq!(
             rewrite(&cx, &[Carrier::NativeVec]).err(),
@@ -1694,7 +1709,10 @@ fn vec_index_returns_the_element_reference_form() {
         ))
         .trim_end(),
         r#"function f($native0, $native1, $native2) {
-  return __rt.nv_idx($native0, $native1, true);
+  if ($native1 >= $native0.len) {
+    throw __rt._nv_fail("oob");
+  }
+  return $native0.buf[$native1];
 }"#
     );
 }
@@ -1734,6 +1752,7 @@ fn dropful_vec_ops_emit_unwind_cleanup_when_not_proven_nonthrowing() {
             element_glue: Some(&glue),
             element_glue_nonthrowing: false,
             panic_impl: None,
+            panic_reads_info: false,
         };
         let rw = rewrite(&cx, &[Carrier::NativeVec]).expect("dropful op lowers with unwind guard");
         let printed = jsast::stmt_to_string(&jsast::function("f", rw.parameters, rw.statements));
@@ -1764,19 +1783,22 @@ fn native_vec_ops_route_failures_through_panic_impl() {
         element_glue: None,
         element_glue_nonthrowing: false,
         panic_impl: Some(&panic_fn),
+        panic_reads_info: true,
     };
     let rw = rewrite(&cx, &[Carrier::NativeVec]).expect("VecInsert lowers with panic_impl");
     let printed = jsast::stmt_to_string(&jsast::function("f", rw.parameters, rw.statements));
     assert_eq!(
         printed.trim_end(),
         r#"function f($native0, $native1, $native2, $native3) {
-  __rt.nv_insert($native0, $native1, $native2, 536870911, 4, rust_begin_unwind, $native3);
+  __rt.nv_insert($native0, $native1, $native2, 536870911, 4, ($m, $l) => __rt._nv_pinfo($m, rust_begin_unwind, $l), $native3);
   return;
 }"#
     );
     assert!(rw.item_references.contains(&panic_fn));
+    assert!(rw.runtime_helpers.contains("_nv_pinfo"));
 
-    // 1-byte Vec<u8> passes RawVec's min_non_zero_cap = 8 on reserve.
+    // 1-byte Vec<u8> passes RawVec's min_non_zero_cap = 8 on reserve; when panic_impl ignores
+    // PanicInfo (`panic_reads_info: false`), it is passed directly without `_nv_pinfo`.
     let reserve_u8_sig = sig(vec![vec_u8_mut, USIZE], UNIT);
     let cx_u8 = LowerCx {
         semantic: BodySemantic::Standard(StandardOperation::VecReserve),
@@ -1786,6 +1808,7 @@ fn native_vec_ops_route_failures_through_panic_impl() {
         element_glue: None,
         element_glue_nonthrowing: false,
         panic_impl: Some(&panic_fn),
+        panic_reads_info: false,
     };
     let rw_u8 = rewrite(&cx_u8, &[Carrier::NativeVec]).expect("VecReserve u8 lowers");
     let printed_u8 =
@@ -1798,6 +1821,7 @@ fn native_vec_ops_route_failures_through_panic_impl() {
 }"#
     );
     assert!(rw_u8.item_references.contains(&panic_fn));
+    assert!(!rw_u8.runtime_helpers.contains("_nv_pinfo"));
 }
 
 /// `VecIter` requires `IteratorIdentity::Slice` and `VecIterMut` requires

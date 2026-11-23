@@ -50,9 +50,8 @@ impl<K: MapKey, V> HashMap<K, V> {
     /// Inserts a value, returning the one the key held before.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let class = key.as_class();
-        if raw::map_has(self.raw, class) {
-            // Safe by the test above, and the borrow ends inside this arm.
-            let held: &mut Option<V> = unsafe { raw::map_get_mut(self.raw, class) };
+        if let Some(held) = unsafe { raw::map_try_get_mut::<K::Class, Option<V>>(self.raw, class) }
+        {
             return held.replace(value);
         }
         raw::map_set(self.raw, class, Some(value));
@@ -62,12 +61,7 @@ impl<K: MapKey, V> HashMap<K, V> {
     /// The value a key holds.
     #[must_use]
     pub fn get(&self, key: &K::Class) -> Option<&V> {
-        if !raw::map_has(self.raw, key) {
-            return None;
-        }
-        // Safe by the test above. The reference is taken at the lifetime of this borrow of the
-        // map, which is what keeps it from outliving a `clear` or a `remove`.
-        let held: &Option<V> = unsafe { raw::map_get(self.raw, key) };
+        let held: &Option<V> = unsafe { raw::map_try_get(self.raw, key) }?;
         held.as_ref()
     }
 
@@ -77,24 +71,15 @@ impl<K: MapKey, V> HashMap<K, V> {
     /// [`get`](HashMap::get) reads.
     #[must_use]
     pub fn get_mut(&mut self, key: &K::Class) -> Option<&mut V> {
-        if !raw::map_has(self.raw, key) {
-            return None;
-        }
-        // Safe by the test above, and unique because `&mut self` is.
-        let held: &mut Option<V> = unsafe { raw::map_get_mut(self.raw, key) };
+        let held: &mut Option<V> = unsafe { raw::map_try_get_mut(self.raw, key) }?;
         held.as_mut()
     }
 
     /// Removes a key, returning the value it held.
     pub fn remove(&mut self, key: &K::Class) -> Option<V> {
-        if !raw::map_has(self.raw, key) {
-            return None;
-        }
-        // Safe by the test above, and unique because `&mut self` is. The value is taken out before
-        // the entry goes, so nothing is left owning it twice.
-        let held: &mut Option<V> = unsafe { raw::map_get_mut(self.raw, key) };
+        let held: &mut Option<V> = unsafe { raw::map_try_get_mut(self.raw, key) }?;
         let taken = held.take();
-        raw::map_del(self.raw, key);
+        let _ = raw::map_del(self.raw, key);
         taken
     }
 
@@ -106,14 +91,15 @@ impl<K: MapKey, V> HashMap<K, V> {
 
     /// Every entry, in the host's insertion order.
     ///
-    /// The keys are snapshotted into a host array first, so this costs one array of `n` keys and
-    /// one lookup per key. The map cannot change while the iterator is alive.
+    /// Keys and stored entry references are snapshotted in matching insertion order so iteration
+    /// performs zero per-entry `Map` lookups. The map cannot change while the iterator is alive.
     #[must_use]
     pub fn iter(&self) -> Iter<'_, K, V> {
         Iter {
-            map: self,
             keys: raw::map_keys::<K::Snapshot>(self.raw),
+            vals: unsafe { raw::map_values::<Option<V>>(self.raw) },
             index: 0,
+            marker: PhantomData,
         }
     }
 }
@@ -133,27 +119,26 @@ impl<'a, K: MapKey, V> IntoIterator for &'a HashMap<K, V> {
     }
 }
 
-/// Every entry of a [`HashMap`], over a snapshot of its keys.
+/// Every entry of a [`HashMap`], over a snapshot of its keys and stored entries.
 ///
 /// A key is yielded as the [class](MapKey::Class) it compares in, which is `&str` for every string
 /// keyed map whatever the key type is written as.
 pub struct Iter<'a, K: MapKey, V> {
-    map: &'a HashMap<K, V>,
     keys: &'a [K::Snapshot],
+    vals: &'a [&'a Option<V>],
     index: usize,
+    marker: PhantomData<&'a K>,
 }
 
 impl<'a, K: MapKey, V> Iterator for Iter<'a, K, V> {
     type Item = (&'a K::Class, &'a V);
 
     fn next(&mut self) -> Option<(&'a K::Class, &'a V)> {
-        let keys = self.keys;
-        while self.index < keys.len() {
-            let snapshot: &'a K::Snapshot = &keys[self.index];
+        while self.index < self.keys.len() {
+            let i = self.index;
             self.index += 1;
-            let key = K::class_of(snapshot);
-            if let Some(value) = self.map.get(key) {
-                return Some((key, value));
+            if let Some(value) = self.vals[i].as_ref() {
+                return Some((K::class_of(&self.keys[i]), value));
             }
         }
         None

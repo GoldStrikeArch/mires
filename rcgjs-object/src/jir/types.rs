@@ -324,6 +324,7 @@ pub enum RepresentationCandidate {
     Box,
     Vec,
     String,
+    BTreeMap,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

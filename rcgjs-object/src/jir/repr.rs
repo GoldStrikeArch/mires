@@ -142,6 +142,8 @@ pub enum Carrier {
     /// A default-allocator `Box<T>` whose pointer shape stays canonical while compiler-owned
     /// drop glue releases it without observable allocator or address effects.
     NativeBox,
+    /// An order-unobserved default-allocator `BTreeMap<K, V>` backed by a native JavaScript `Map`.
+    NativeMap,
 }
 
 impl Carrier {

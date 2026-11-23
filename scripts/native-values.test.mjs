@@ -1129,7 +1129,7 @@ test("TypedArray/NativeVec helpers, _element_view_of elision, ptr_eq same-buf fa
   const fakeLoc = { filename: { buf: [97, 46, 114, 115], off: 0, len: 4 }, line: 42, col: 7 };
   const fakePanic = (pi) => { panicSeen = pi; throw rt.abort_error(new Error("rust panic")); };
   assert.throws(
-    () => rt.nv_insert(v, 9, 1, 100, 4, fakePanic, fakeLoc),
+    () => rt.nv_insert(v, 9, 1, 100, 4, (m, l) => rt._nv_pinfo(m, fakePanic, l), fakeLoc),
     (e) => e.message === "rust panic" && rt.is_abort(e),
   );
   assert.equal(panicSeen.location, fakeLoc);
@@ -1254,4 +1254,24 @@ test("TypedArray/NativeVec helpers, _element_view_of elision, ptr_eq same-buf fa
   assert.deepEqual(Array.from(dst2), [9, 9, 8, 5]);
   rt.write_bytes({ buf: dst2, off: 1 }, 0xab, 2);
   assert.deepEqual(Array.from(dst2), [9, 0xab, 0xab, 5]);
+
+  // 5. Wave 4 runtime helpers: map_values, _nv_fail/_nv_pinfo, u8array_into_bytes fast path
+  const m = new Map([["a", [10]], ["b", [20]]]);
+  assert.deepEqual(rt.map_values(m), { buf: [[10], [20]], off: 0, len: 2 });
+  let seenPinfo = null;
+  assert.throws(
+    () => rt._nv_fail("oob", (msg, loc) => rt._nv_pinfo(msg, (info) => { seenPinfo = info; }, loc), { filename: { buf: [], off: 0, len: 0 }, line: 7, col: 3 }),
+    (err) => err instanceof RangeError && rt.is_abort(err),
+  );
+  assert.equal(seenPinfo.location.line, 7);
+  assert.equal(seenPinfo.location.col, 3);
+  assert.deepEqual(seenPinfo.message.template.buf, [111, 111, 98]);
+  assert.throws(() => rt._nv_fail("cap"), (err) => err instanceof RangeError && rt.is_abort(err));
+  const sub = new Uint8Array([9, 1, 2, 3, 9]).subarray(1, 4);
+  const taDst = new Uint8Array([0, 0, 0, 0, 0]);
+  rt.u8array_into_bytes(sub, { buf: taDst, off: 1, len: 3 });
+  assert.deepEqual(Array.from(taDst), [0, 1, 2, 3, 0]);
+  const arrDst = [0, 0, 0, 0, 0];
+  rt.u8array_into_bytes(sub, { buf: arrDst, off: 1, len: 3 });
+  assert.deepEqual(arrDst, [0, 1, 2, 3, 0]);
 });
