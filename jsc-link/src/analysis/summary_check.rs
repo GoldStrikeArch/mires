@@ -221,7 +221,7 @@ fn recompute(
                 summaries,
                 &values,
                 &cells,
-                &op.kind,
+                op,
                 &mut out,
                 &mut escape,
                 &mut written,
@@ -363,7 +363,8 @@ fn reach_op(
                     ..
                 } => {
                     let (reach, exact) = call_result_reach(
-                        graph, interns, summaries, values, callee, semantic, host, args,
+                        func, graph, interns, summaries, values, op.result, callee, semantic, host,
+                        args,
                     );
                     (not_local(reach), exact)
                 }
@@ -418,10 +419,12 @@ fn reach_op(
 /// The reach of a call's result value.
 #[allow(clippy::too_many_arguments)]
 fn call_result_reach(
+    func: &Func,
     graph: &Callgraph,
     interns: Option<&Interns>,
     summaries: &Summaries,
     values: &[Reach],
+    result: Option<ValueId>,
     callee: &Callee,
     semantic: &CallSemantic,
     host: &Option<HostPayload>,
@@ -436,7 +439,8 @@ fn call_result_reach(
         (all, Some(None))
     };
     if let CallSemantic::Standard(operation) = semantic {
-        if semantic_ops::registry(*operation).is_some() {
+        let types = interns.map(|interns| &interns.types);
+        if semantic_ops::call_effects_entry(*operation, types, func, result, args).is_some() {
             let mut all = Reach::default();
             for arg in args {
                 all.grow(&values[arg.0 as usize]);
@@ -494,7 +498,7 @@ fn claim_op(
     summaries: &Summaries,
     values: &[Reach],
     cells: &[Reach],
-    kind: &OpKind,
+    op: &crate::jir::repr::Op,
     out: &mut Summary,
     escape: &mut impl FnMut(&mut Summary, &Reach, Escape),
     written: &mut impl FnMut(&mut Summary, &Reach),
@@ -545,7 +549,7 @@ fn claim_op(
             }
         }
     };
-    match kind {
+    match &op.kind {
         OpKind::Deref(ptr) => {
             if values[ptr.0 as usize].local != Some(true) {
                 purity(out, Purity::Read);
@@ -619,7 +623,10 @@ fn claim_op(
             ..
         } => {
             if let CallSemantic::Standard(operation) = semantic {
-                if let Some(entry) = semantic_ops::registry(*operation) {
+                let types = interns.map(|interns| &interns.types);
+                if let Some(entry) =
+                    semantic_ops::call_effects_entry(*operation, types, func, op.result, args)
+                {
                     purity(
                         out,
                         if entry.effects.mutates {

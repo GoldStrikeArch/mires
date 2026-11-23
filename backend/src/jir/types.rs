@@ -787,16 +787,25 @@ fn iterator_identity(tcx: TyCtxt<'_>, ty: Ty<'_>) -> IteratorIdentity {
     let ty::Adt(definition, _) = ty.kind() else {
         return IteratorIdentity::None;
     };
-    let Some(name) = tcx.get_diagnostic_name(definition.did()) else {
-        return IteratorIdentity::None;
-    };
-    match name.as_str() {
-        "SliceIter" => IteratorIdentity::Slice,
-        "Enumerate" => IteratorIdentity::Enumerate,
-        "Take" => IteratorIdentity::Take,
-        "Skip" => IteratorIdentity::Skip,
-        _ => IteratorIdentity::None,
+    if let Some(name) = tcx.get_diagnostic_name(definition.did()) {
+        return match name.as_str() {
+            "SliceIter" => IteratorIdentity::Slice,
+            "Enumerate" => IteratorIdentity::Enumerate,
+            "Take" => IteratorIdentity::Take,
+            "Skip" => IteratorIdentity::Skip,
+            _ => IteratorIdentity::None,
+        };
     }
+    // `core::slice::IterMut` has no `#[rustc_diagnostic_item]` on this toolchain,
+    // so identify it unforgeably as the `IterMut` sibling inside `SliceIter`'s `core` module.
+    if let Some(slice_iter) = tcx.get_diagnostic_item(rustc_span::Symbol::intern("SliceIter")) {
+        if tcx.parent(definition.did()) == tcx.parent(slice_iter)
+            && tcx.item_name(definition.did()).as_str() == "IterMut"
+        {
+            return IteratorIdentity::SliceMut;
+        }
+    }
+    IteratorIdentity::None
 }
 
 pub(crate) fn definition_id(tcx: TyCtxt<'_>, definition: DefId) -> DefinitionId {

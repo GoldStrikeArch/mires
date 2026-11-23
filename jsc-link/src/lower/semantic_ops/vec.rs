@@ -63,13 +63,48 @@ pub(crate) fn typed_array_kind(element: &TypeDescriptor) -> Option<u8> {
 
 /// Built-in primitive types whose `Clone` impl is guaranteed by the orphan rule to be a pure,
 /// non-panicking, drop-free bitwise copy.
-fn is_trivial_clone_primitive(element: &TypeDescriptor) -> bool {
+pub(super) fn is_trivial_clone_primitive(element: &TypeDescriptor) -> bool {
     matches!(
         element.kind,
         TypeKind::Bool | TypeKind::Char | TypeKind::Integer { .. } | TypeKind::Float { .. }
     ) && !element.layout.needs_drop
         && !element.layout.zst
         && element.layout.sized
+}
+
+/// `RawVec::min_non_zero_cap(size_of::<T>())` on this toolchain: 8 for 1-byte elements, 4 for
+/// 2..=1024-byte elements, 1 for larger elements.
+fn vec_min_cap(cx: &LowerCx<'_>) -> Result<u64, SemanticDecline> {
+    let element = vec_element(cx)?;
+    let size = element
+        .layout
+        .size
+        .ok_or(SemanticDecline::UnknownElementLayout)?;
+    if size == 0 {
+        return Err(SemanticDecline::ZeroSizedElement);
+    }
+    Ok(if size == 1 {
+        8
+    } else if size <= 1024 {
+        4
+    } else {
+        1
+    })
+}
+
+fn push_panic_arg(
+    cx: &LowerCx<'_>,
+    args: &mut Vec<Expr>,
+    refs: &mut BTreeSet<JsName>,
+    loc_param: Option<&str>,
+) {
+    if let Some(panic_impl) = cx.panic_impl {
+        refs.insert(panic_impl.clone());
+        args.push(jsast::id(panic_impl.as_str()));
+        if let Some(loc) = loc_param {
+            args.push(jsast::id(loc));
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,13 +143,26 @@ pub(super) fn vec_with_capacity(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let maximum = vec_capacity_limit(cx)?;
     helpers.insert("nv_cap");
     let mut args = vec![receiver(), jsast::raw_num(maximum.to_string())];
-    if let Some(kind) = vec_tv_kind(cx)? {
-        args.push(jsast::num(f64::from(kind)));
+    match (vec_tv_kind(cx)?, cx.panic_impl) {
+        (Some(kind), Some(panic_impl)) => {
+            refs.insert(panic_impl.clone());
+            args.push(jsast::num(f64::from(kind)));
+            args.push(jsast::id(panic_impl.as_str()));
+        }
+        (Some(kind), None) => {
+            args.push(jsast::num(f64::from(kind)));
+        }
+        (None, Some(panic_impl)) => {
+            refs.insert(panic_impl.clone());
+            args.push(jsast::undefined());
+            args.push(jsast::id(panic_impl.as_str()));
+        }
+        (None, None) => {}
     }
     Ok(vec![jsast::ret(jsast::rt_call("nv_cap", args))])
 }
@@ -170,14 +218,13 @@ pub(super) fn vec_index(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let indirect = vec_element(cx)?.js.is_indirect;
     helpers.insert("nv_idx");
-    Ok(vec![jsast::ret(jsast::rt_call(
-        "nv_idx",
-        vec![receiver(), jsast::id("$native1"), Expr::Bool(indirect)],
-    ))])
+    let mut args = vec![receiver(), jsast::id("$native1"), Expr::Bool(indirect)];
+    push_panic_arg(cx, &mut args, refs, Some("$native2"));
+    Ok(vec![jsast::ret(jsast::rt_call("nv_idx", args))])
 }
 
 /// `Index<Range*<usize>>` / `IndexMut<Range*<usize>>`: subslice sharing the native buffer.
@@ -185,7 +232,7 @@ pub(super) fn vec_range_index(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let shape = range_shape(cx)?;
     match shape {
@@ -196,66 +243,61 @@ pub(super) fn vec_range_index(
         ))]),
         RangeShape::Bounds => {
             helpers.insert("nv_range");
-            Ok(vec![jsast::ret(jsast::rt_call(
-                "nv_range",
-                vec![
-                    receiver(),
-                    jsast::member(jsast::id("$native1"), "start"),
-                    jsast::member(jsast::id("$native1"), "end"),
-                ],
-            ))])
+            let mut args = vec![
+                receiver(),
+                jsast::member(jsast::id("$native1"), "start"),
+                jsast::member(jsast::id("$native1"), "end"),
+            ];
+            push_panic_arg(cx, &mut args, refs, Some("$native2"));
+            Ok(vec![jsast::ret(jsast::rt_call("nv_range", args))])
         }
         RangeShape::From => {
             helpers.insert("nv_range");
-            Ok(vec![jsast::ret(jsast::rt_call(
-                "nv_range",
-                vec![
-                    receiver(),
-                    jsast::member(jsast::id("$native1"), "start"),
-                    member("len"),
-                ],
-            ))])
+            let mut args = vec![
+                receiver(),
+                jsast::member(jsast::id("$native1"), "start"),
+                member("len"),
+            ];
+            push_panic_arg(cx, &mut args, refs, Some("$native2"));
+            Ok(vec![jsast::ret(jsast::rt_call("nv_range", args))])
         }
         RangeShape::To => {
             helpers.insert("nv_range");
-            Ok(vec![jsast::ret(jsast::rt_call(
-                "nv_range",
-                vec![
-                    receiver(),
-                    jsast::num(0),
-                    jsast::member(jsast::id("$native1"), "end"),
-                ],
-            ))])
+            let mut args = vec![
+                receiver(),
+                jsast::num(0),
+                jsast::member(jsast::id("$native1"), "end"),
+            ];
+            push_panic_arg(cx, &mut args, refs, Some("$native2"));
+            Ok(vec![jsast::ret(jsast::rt_call("nv_range", args))])
         }
     }
 }
 
 /// `Vec::remove`: bounds throw before mutation, then shift left and return the removed element.
 pub(super) fn vec_remove(
-    _cx: &LowerCx<'_>,
+    cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     helpers.insert("nv_remove");
-    Ok(vec![jsast::ret(jsast::rt_call(
-        "nv_remove",
-        vec![receiver(), jsast::id("$native1")],
-    ))])
+    let mut args = vec![receiver(), jsast::id("$native1")];
+    push_panic_arg(cx, &mut args, refs, Some("$native2"));
+    Ok(vec![jsast::ret(jsast::rt_call("nv_remove", args))])
 }
 
 /// `Vec::swap_remove`: O(1) swap with last element and return the removed element.
 pub(super) fn vec_swap_remove(
-    _cx: &LowerCx<'_>,
+    cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     helpers.insert("nv_swap_remove");
-    Ok(vec![jsast::ret(jsast::rt_call(
-        "nv_swap_remove",
-        vec![receiver(), jsast::id("$native1")],
-    ))])
+    let mut args = vec![receiver(), jsast::id("$native1")];
+    push_panic_arg(cx, &mut args, refs, None);
+    Ok(vec![jsast::ret(jsast::rt_call("nv_swap_remove", args))])
 }
 
 /// `Vec::push`: exponential growth via shared runtime helper, capacity throw before mutation.
@@ -263,20 +305,21 @@ pub(super) fn vec_push(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     require_element_glue(cx)?;
     let maximum = vec_capacity_limit(cx)?;
+    let min_cap = vec_min_cap(cx)?;
     helpers.insert("nv_push");
+    let mut args = vec![
+        receiver(),
+        jsast::id("$native1"),
+        jsast::raw_num(maximum.to_string()),
+        jsast::raw_num(min_cap.to_string()),
+    ];
+    push_panic_arg(cx, &mut args, refs, None);
     Ok(vec![
-        jsast::expr_stmt(jsast::rt_call(
-            "nv_push",
-            vec![
-                receiver(),
-                jsast::id("$native1"),
-                jsast::raw_num(maximum.to_string()),
-            ],
-        )),
+        jsast::expr_stmt(jsast::rt_call("nv_push", args)),
         jsast::ret_void(),
     ])
 }
@@ -286,20 +329,21 @@ pub(super) fn vec_push_mut(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     require_element_glue(cx)?;
     let maximum = vec_capacity_limit(cx)?;
+    let min_cap = vec_min_cap(cx)?;
     let indirect = vec_element(cx)?.js.is_indirect;
     helpers.insert("nv_push");
-    let push = jsast::expr_stmt(jsast::rt_call(
-        "nv_push",
-        vec![
-            receiver(),
-            jsast::id("$native1"),
-            jsast::raw_num(maximum.to_string()),
-        ],
-    ));
+    let mut args = vec![
+        receiver(),
+        jsast::id("$native1"),
+        jsast::raw_num(maximum.to_string()),
+        jsast::raw_num(min_cap.to_string()),
+    ];
+    push_panic_arg(cx, &mut args, refs, None);
+    let push = jsast::expr_stmt(jsast::rt_call("nv_push", args));
     if indirect {
         Ok(vec![push, jsast::ret(jsast::id("$native1"))])
     } else {
@@ -316,21 +360,22 @@ pub(super) fn vec_insert(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     require_element_glue(cx)?;
     let maximum = vec_capacity_limit(cx)?;
+    let min_cap = vec_min_cap(cx)?;
     helpers.insert("nv_insert");
+    let mut args = vec![
+        receiver(),
+        jsast::id("$native1"),
+        jsast::id("$native2"),
+        jsast::raw_num(maximum.to_string()),
+        jsast::raw_num(min_cap.to_string()),
+    ];
+    push_panic_arg(cx, &mut args, refs, Some("$native3"));
     Ok(vec![
-        jsast::expr_stmt(jsast::rt_call(
-            "nv_insert",
-            vec![
-                receiver(),
-                jsast::id("$native1"),
-                jsast::id("$native2"),
-                jsast::raw_num(maximum.to_string()),
-            ],
-        )),
+        jsast::expr_stmt(jsast::rt_call("nv_insert", args)),
         jsast::ret_void(),
     ])
 }
@@ -340,21 +385,22 @@ pub(super) fn vec_insert_mut(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     require_element_glue(cx)?;
     let maximum = vec_capacity_limit(cx)?;
+    let min_cap = vec_min_cap(cx)?;
     let indirect = vec_element(cx)?.js.is_indirect;
     helpers.insert("nv_insert");
-    let insert = jsast::expr_stmt(jsast::rt_call(
-        "nv_insert",
-        vec![
-            receiver(),
-            jsast::id("$native1"),
-            jsast::id("$native2"),
-            jsast::raw_num(maximum.to_string()),
-        ],
-    ));
+    let mut args = vec![
+        receiver(),
+        jsast::id("$native1"),
+        jsast::id("$native2"),
+        jsast::raw_num(maximum.to_string()),
+        jsast::raw_num(min_cap.to_string()),
+    ];
+    push_panic_arg(cx, &mut args, refs, Some("$native3"));
+    let insert = jsast::expr_stmt(jsast::rt_call("nv_insert", args));
     let out = if indirect {
         jsast::id("$native2")
     } else {
@@ -368,24 +414,25 @@ pub(super) fn vec_reserve(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let maximum = vec_capacity_limit(cx)?;
+    let min_cap = vec_min_cap(cx)?;
     let exact = matches!(
         cx.semantic,
         BodySemantic::Standard(StandardOperation::VecReserveExact)
     );
     helpers.insert("nv_reserve");
+    let mut args = vec![
+        receiver(),
+        jsast::id("$native1"),
+        jsast::raw_num(maximum.to_string()),
+        Expr::Bool(exact),
+        jsast::raw_num(min_cap.to_string()),
+    ];
+    push_panic_arg(cx, &mut args, refs, None);
     Ok(vec![
-        jsast::expr_stmt(jsast::rt_call(
-            "nv_reserve",
-            vec![
-                receiver(),
-                jsast::id("$native1"),
-                jsast::raw_num(maximum.to_string()),
-                Expr::Bool(exact),
-            ],
-        )),
+        jsast::expr_stmt(jsast::rt_call("nv_reserve", args)),
         jsast::ret_void(),
     ])
 }
@@ -457,12 +504,16 @@ pub(super) fn vec_pop(
 pub(super) fn vec_truncate(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
-    _helpers: &mut BTreeSet<&'static str>,
+    helpers: &mut BTreeSet<&'static str>,
     refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     if let Some(glue) = require_element_glue(cx)? {
         refs.insert(glue.clone());
-        return Ok(super::drop::dropful_vec_truncate(glue));
+        return Ok(super::drop::dropful_vec_truncate(
+            glue,
+            cx.element_glue_nonthrowing,
+            helpers,
+        ));
     }
     if vec_tv_kind(cx)?.is_some() {
         return Ok(vec![
@@ -494,20 +545,21 @@ pub(super) fn vec_resize(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let maximum = vec_capacity_limit(cx)?;
+    let min_cap = vec_min_cap(cx)?;
     helpers.insert("nv_resize");
+    let mut args = vec![
+        receiver(),
+        jsast::id("$native1"),
+        jsast::id("$native2"),
+        jsast::raw_num(maximum.to_string()),
+        jsast::raw_num(min_cap.to_string()),
+    ];
+    push_panic_arg(cx, &mut args, refs, None);
     Ok(vec![
-        jsast::expr_stmt(jsast::rt_call(
-            "nv_resize",
-            vec![
-                receiver(),
-                jsast::id("$native1"),
-                jsast::id("$native2"),
-                jsast::raw_num(maximum.to_string()),
-            ],
-        )),
+        jsast::expr_stmt(jsast::rt_call("nv_resize", args)),
         jsast::ret_void(),
     ])
 }
@@ -517,7 +569,7 @@ pub(super) fn vec_from_elem(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let maximum = vec_capacity_limit(cx)?;
     helpers.insert("nv_from_elem");
@@ -526,8 +578,21 @@ pub(super) fn vec_from_elem(
         jsast::id("$native1"),
         jsast::raw_num(maximum.to_string()),
     ];
-    if let Some(kind) = vec_tv_kind(cx)? {
-        args.push(jsast::num(f64::from(kind)));
+    match (vec_tv_kind(cx)?, cx.panic_impl) {
+        (Some(kind), Some(panic_impl)) => {
+            refs.insert(panic_impl.clone());
+            args.push(jsast::num(f64::from(kind)));
+            args.push(jsast::id(panic_impl.as_str()));
+        }
+        (Some(kind), None) => {
+            args.push(jsast::num(f64::from(kind)));
+        }
+        (None, Some(panic_impl)) => {
+            refs.insert(panic_impl.clone());
+            args.push(jsast::undefined());
+            args.push(jsast::id(panic_impl.as_str()));
+        }
+        (None, None) => {}
     }
     Ok(vec![jsast::ret(jsast::rt_call("nv_from_elem", args))])
 }
@@ -615,19 +680,20 @@ pub(super) fn vec_extend(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let maximum = vec_capacity_limit(cx)?;
+    let min_cap = vec_min_cap(cx)?;
     helpers.insert("nv_extend");
+    let mut args = vec![
+        receiver(),
+        jsast::id("$native1"),
+        jsast::raw_num(maximum.to_string()),
+        jsast::raw_num(min_cap.to_string()),
+    ];
+    push_panic_arg(cx, &mut args, refs, None);
     Ok(vec![
-        jsast::expr_stmt(jsast::rt_call(
-            "nv_extend",
-            vec![
-                receiver(),
-                jsast::id("$native1"),
-                jsast::raw_num(maximum.to_string()),
-            ],
-        )),
+        jsast::expr_stmt(jsast::rt_call("nv_extend", args)),
         jsast::ret_void(),
     ])
 }
@@ -637,19 +703,20 @@ pub(super) fn vec_extend_from_slice(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
     helpers: &mut BTreeSet<&'static str>,
-    _refs: &mut BTreeSet<JsName>,
+    refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let maximum = vec_capacity_limit(cx)?;
+    let min_cap = vec_min_cap(cx)?;
     helpers.insert("nv_extend_slice");
+    let mut args = vec![
+        receiver(),
+        jsast::id("$native1"),
+        jsast::raw_num(maximum.to_string()),
+        jsast::raw_num(min_cap.to_string()),
+    ];
+    push_panic_arg(cx, &mut args, refs, None);
     Ok(vec![
-        jsast::expr_stmt(jsast::rt_call(
-            "nv_extend_slice",
-            vec![
-                receiver(),
-                jsast::id("$native1"),
-                jsast::raw_num(maximum.to_string()),
-            ],
-        )),
+        jsast::expr_stmt(jsast::rt_call("nv_extend_slice", args)),
         jsast::ret_void(),
     ])
 }
@@ -688,12 +755,16 @@ pub(super) fn slice_to_vec(
 pub(super) fn vec_clear(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
-    _helpers: &mut BTreeSet<&'static str>,
+    helpers: &mut BTreeSet<&'static str>,
     refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     if let Some(glue) = require_element_glue(cx)? {
         refs.insert(glue.clone());
-        Ok(super::drop::dropful_vec_clear(glue))
+        Ok(super::drop::dropful_vec_clear(
+            glue,
+            cx.element_glue_nonthrowing,
+            helpers,
+        ))
     } else if vec_tv_kind(cx)?.is_some() {
         Ok(vec![
             jsast::assign_stmt(member("len"), jsast::num(0)),
@@ -716,12 +787,16 @@ pub(super) fn vec_clear(
 pub(super) fn vec_drop(
     cx: &LowerCx<'_>,
     _carrier: Option<Carrier>,
-    _helpers: &mut BTreeSet<&'static str>,
+    helpers: &mut BTreeSet<&'static str>,
     refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     if let Some(glue) = require_element_glue(cx)? {
         refs.insert(glue.clone());
-        Ok(super::drop::dropful_vec_drop(glue))
+        Ok(super::drop::dropful_vec_drop(
+            glue,
+            cx.element_glue_nonthrowing,
+            helpers,
+        ))
     } else if vec_tv_kind(cx)?.is_some() {
         Ok(vec![
             jsast::assign_stmt(member("buf"), jsast::null()),
@@ -1179,7 +1254,12 @@ fn slice_iter_layout(cx: &LowerCx<'_>) -> Result<(String, String, String), Seman
         BodySemantic::Standard(StandardOperation::VecIterMut)
     );
     let result = type_get(cx.table, cx.sig.result)?;
-    if result.meta.iterator != IteratorIdentity::Slice {
+    let expected_iter = if mutable {
+        IteratorIdentity::SliceMut
+    } else {
+        IteratorIdentity::Slice
+    };
+    if result.meta.iterator != expected_iter {
         return Err(SemanticDecline::WrongReturnType);
     }
     let TypeKind::Adt {

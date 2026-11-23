@@ -55,6 +55,11 @@ pub struct LowerCx<'a> {
     /// The exact monomorphic child drop glue item for a vec element or boxed pointee. `None` when
     /// the child does not need drop, and in every caller that has not resolved glue.
     pub element_glue: Option<&'a JsName>,
+    /// True only when `element_glue` is proven unable to unwind. Fail-closed (`false`) emits
+    /// unwinding cleanup for remaining elements in `Vec::{clear,truncate,drop}`.
+    pub element_glue_nonthrowing: bool,
+    /// The program's `#[panic_handler]` (`BodySemantic::PanicImpl`), when resolved by the linker.
+    pub panic_impl: Option<&'a JsName>,
 }
 
 /// One registry entry: the complete contract and lowering of one standard operation.
@@ -596,6 +601,60 @@ pub fn registry(operation: StandardOperation) -> Option<&'static SemanticOp> {
     })
 }
 
+/// Returns the registry contract for a call site when that contract is sound for the call's
+/// monomorphized types.
+///
+/// Operations that invoke `Clone::clone` (`VecClone`, `SliceToVec`, `VecFromElem`, `VecResize`,
+/// `VecExtendFromSlice`) only satisfy the registry's effect summary when the element type is a
+/// built-in primitive whose `Clone` is guaranteed pure and non-unwinding. For any other element
+/// type, callers must consult the actual callee body so user-defined `Clone` side effects and
+/// unwinds are preserved.
+pub fn call_effects_entry(
+    operation: StandardOperation,
+    types: Option<&TypeTable>,
+    func: &crate::jir::repr::Func,
+    result: Option<crate::jir::repr::ValueId>,
+    args: &[crate::jir::repr::ValueId],
+) -> Option<&'static SemanticOp> {
+    let entry = registry(operation)?;
+    if !matches!(
+        operation,
+        StandardOperation::VecClone
+            | StandardOperation::SliceToVec
+            | StandardOperation::VecFromElem
+            | StandardOperation::VecResize
+            | StandardOperation::VecExtendFromSlice
+    ) {
+        return Some(entry);
+    }
+    let types = types?;
+    let vec_val = match operation {
+        StandardOperation::SliceToVec | StandardOperation::VecFromElem => result?,
+        StandardOperation::VecClone
+        | StandardOperation::VecResize
+        | StandardOperation::VecExtendFromSlice => *args.first()?,
+        _ => unreachable!(),
+    };
+    let mut vec_ty = types.peeled(func.ty(vec_val)?);
+    if let Some(TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. }) =
+        types.get(vec_ty).map(|descriptor| &descriptor.kind)
+    {
+        vec_ty = types.peeled(*pointee);
+    }
+    let vec_desc = types.get(vec_ty)?;
+    if vec_desc.meta.candidate != RepresentationCandidate::Vec
+        || vec_desc.meta.allocator != AllocatorIdentity::Global
+    {
+        return None;
+    }
+    let TypeKind::Adt { args: ty_args, .. } = &vec_desc.kind else {
+        return None;
+    };
+    let elem_ty = *ty_args.first()?;
+    let elem_desc = types.get(types.peeled(elem_ty))?;
+    vec::is_trivial_clone_primitive(elem_desc).then_some(entry)
+}
+
 /// The registry entry of a body, through its semantic identity.
 ///
 /// A compiler-generated drop glue shim for a canonical `String` is `StringDrop`, and one for a
@@ -694,6 +753,8 @@ pub fn validate(cx: &LowerCx<'_>) -> Result<&'static SemanticOp, SemanticDecline
         table: cx.table,
         interns: cx.interns,
         element_glue: cx.element_glue.or(Some(&proof_glue)),
+        element_glue_nonthrowing: cx.element_glue_nonthrowing,
+        panic_impl: cx.panic_impl,
     };
     match slots.first() {
         None => {

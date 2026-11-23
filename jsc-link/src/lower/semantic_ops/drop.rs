@@ -55,6 +55,73 @@ pub fn required_element_drop(cx: &LowerCx<'_>) -> Result<Option<TypeId>, Semanti
     Ok(element.layout.needs_drop.then_some(element.id))
 }
 
+/// True when `ty` transitively contains no user-defined `Drop` implementation under the global
+/// allocator: only drop-free scalars/aggregates and canonical global `Vec`/`String`/`Box`
+/// containers over recursively trivially-nonthrowing elements.
+pub fn element_drop_is_trivially_nonthrowing(table: &TypeTable, ty: TypeId) -> bool {
+    let mut visited = BTreeSet::new();
+    element_drop_is_trivially_nonthrowing_inner(table, ty, &mut visited)
+}
+
+fn element_drop_is_trivially_nonthrowing_inner(
+    table: &TypeTable,
+    ty: TypeId,
+    visited: &mut BTreeSet<TypeId>,
+) -> bool {
+    let ty = table.peeled(ty);
+    if !visited.insert(ty) {
+        return true;
+    }
+    let Some(desc) = table.get(ty) else {
+        return false;
+    };
+    if !desc.layout.needs_drop {
+        return true;
+    }
+    if desc.layout.has_own_drop {
+        let std_container = matches!(
+            desc.meta.candidate,
+            RepresentationCandidate::Vec
+                | RepresentationCandidate::String
+                | RepresentationCandidate::Box
+        ) && desc.meta.allocator == AllocatorIdentity::Global;
+        if !std_container {
+            return false;
+        }
+        return match &desc.kind {
+            TypeKind::Adt { args, .. } => match desc.meta.candidate {
+                RepresentationCandidate::String => true,
+                RepresentationCandidate::Vec | RepresentationCandidate::Box => {
+                    args.first().is_some_and(|inner| {
+                        element_drop_is_trivially_nonthrowing_inner(table, *inner, visited)
+                    })
+                }
+                RepresentationCandidate::None => false,
+            },
+            _ => false,
+        };
+    }
+    match &desc.kind {
+        TypeKind::Tuple(fields) => fields
+            .iter()
+            .all(|field| element_drop_is_trivially_nonthrowing_inner(table, *field, visited)),
+        TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
+            element_drop_is_trivially_nonthrowing_inner(table, *element, visited)
+        }
+        TypeKind::Adt {
+            form: NominalForm::Struct | NominalForm::Enum,
+            variants,
+            ..
+        } => variants.iter().all(|variant| {
+            variant
+                .fields
+                .iter()
+                .all(|field| element_drop_is_trivially_nonthrowing_inner(table, field.ty, visited))
+        }),
+        _ => false,
+    }
+}
+
 /// The glue the dropful bodies call: `None` for a drop-free element, the resolved glue when the
 /// element needs drop, and an exact decline when it is required but unresolved.
 pub(super) fn require_element_glue<'a>(
@@ -166,17 +233,23 @@ fn box_pointee<'a>(cx: &LowerCx<'a>) -> Result<&'a TypeDescriptor, SemanticDecli
     Ok(pointee)
 }
 
-/// `Vec::clear` over a needy element: the vector is emptied *before* the destructors run
-/// (`Vec::clear`'s order), then each element is dropped and its slot cleared, ascending. Under
-/// the target's panic=abort policy a throwing destructor does not unwind into Rust code.
-pub(super) fn dropful_vec_clear(element_glue: &JsName) -> Vec<Stmt> {
+fn dropful_loop(
+    element_glue: &JsName,
+    nonthrowing: bool,
+    helpers: &mut BTreeSet<&'static str>,
+    release_on_throw: bool,
+) -> Stmt {
     let receiver = || jsast::id("$native0");
     let buffer = || jsast::member(receiver(), "buf");
-    vec![
-        jsast::const_("$nativeOldLen", jsast::member(receiver(), "len")),
-        jsast::assign_stmt(jsast::member(receiver(), "len"), jsast::num(0)),
-        jsast::let_("$nativeIndex", jsast::num(0)),
-        jsast::while_(
+    let release_stmts = || {
+        vec![
+            jsast::assign_stmt(jsast::member(buffer(), "length"), jsast::num(0)),
+            jsast::assign_stmt(jsast::member(receiver(), "len"), jsast::num(0)),
+            jsast::assign_stmt(jsast::member(receiver(), "cap"), jsast::num(0)),
+        ]
+    };
+    if nonthrowing {
+        return jsast::while_(
             jsast::binary(
                 BinOp::Lt,
                 jsast::id("$nativeIndex"),
@@ -201,16 +274,113 @@ pub(super) fn dropful_vec_clear(element_glue: &JsName) -> Vec<Stmt> {
                     jsast::num(1),
                 )),
             ],
+        );
+    }
+    helpers.insert("is_abort");
+    let remaining_loop = jsast::while_(
+        jsast::binary(
+            BinOp::Lt,
+            jsast::id("$nativeIndex"),
+            jsast::id("$nativeOldLen"),
         ),
+        vec![
+            jsast::const_(
+                "$nativeRem",
+                jsast::index(buffer(), jsast::id("$nativeIndex")),
+            ),
+            jsast::assign_stmt(
+                jsast::index(buffer(), jsast::id("$nativeIndex")),
+                jsast::undefined(),
+            ),
+            jsast::expr_stmt(jsast::compound_assign(
+                BinOp::Add,
+                jsast::id("$nativeIndex"),
+                jsast::num(1),
+            )),
+            jsast::expr_stmt(jsast::call(
+                jsast::id(element_glue.as_str()),
+                vec![jsast::id("$nativeRem")],
+            )),
+        ],
+    );
+    let mut handler = vec![jsast::if_(
+        jsast::rt_call("is_abort", vec![jsast::id("$caught")]),
+        vec![jsast::throw(jsast::id("$caught"))],
+    )];
+    if release_on_throw {
+        let mut inner_handler = release_stmts();
+        inner_handler.push(jsast::throw(jsast::id("$caught2")));
+        handler.push(Stmt::TryCatch {
+            body: vec![remaining_loop],
+            binding: "$caught2".to_owned(),
+            handler: inner_handler,
+        });
+        handler.extend(release_stmts());
+    } else {
+        handler.push(remaining_loop);
+    }
+    handler.push(jsast::throw(jsast::id("$caught")));
+    jsast::while_(
+        jsast::binary(
+            BinOp::Lt,
+            jsast::id("$nativeIndex"),
+            jsast::id("$nativeOldLen"),
+        ),
+        vec![
+            jsast::const_(
+                "$nativeElement",
+                jsast::index(buffer(), jsast::id("$nativeIndex")),
+            ),
+            jsast::assign_stmt(
+                jsast::index(buffer(), jsast::id("$nativeIndex")),
+                jsast::undefined(),
+            ),
+            jsast::expr_stmt(jsast::compound_assign(
+                BinOp::Add,
+                jsast::id("$nativeIndex"),
+                jsast::num(1),
+            )),
+            Stmt::TryCatch {
+                body: vec![jsast::expr_stmt(jsast::call(
+                    jsast::id(element_glue.as_str()),
+                    vec![jsast::id("$nativeElement")],
+                ))],
+                binding: "$caught".to_owned(),
+                handler,
+            },
+        ],
+    )
+}
+
+/// `Vec::clear` over a needy element: the vector is emptied *before* the destructors run
+/// (`Vec::clear`'s order), then each element is dropped and its slot cleared, ascending.
+/// When `nonthrowing` is false, a host exception during one destructor still drops the remaining
+/// elements before rethrowing.
+pub(super) fn dropful_vec_clear(
+    element_glue: &JsName,
+    nonthrowing: bool,
+    helpers: &mut BTreeSet<&'static str>,
+) -> Vec<Stmt> {
+    let receiver = || jsast::id("$native0");
+    vec![
+        jsast::const_("$nativeOldLen", jsast::member(receiver(), "len")),
+        jsast::assign_stmt(jsast::member(receiver(), "len"), jsast::num(0)),
+        jsast::let_("$nativeIndex", jsast::num(0)),
+        dropful_loop(element_glue, nonthrowing, helpers, false),
         jsast::ret_void(),
     ]
 }
 
 /// `Vec::truncate` over a needy element: shortens `len` BEFORE running destructors on
 /// `[new_len..old_len)` in ascending order, clearing each slot as it drops.
-pub(super) fn dropful_vec_truncate(element_glue: &JsName) -> Vec<Stmt> {
+/// When `nonthrowing` is false, a host exception during one destructor still drops the remaining
+/// removed elements before rethrowing.
+pub(super) fn dropful_vec_truncate(
+    element_glue: &JsName,
+    nonthrowing: bool,
+    helpers: &mut BTreeSet<&'static str>,
+) -> Vec<Stmt> {
     let receiver = || jsast::id("$native0");
-    let buffer = || jsast::member(receiver(), "buf");
     vec![
         jsast::if_(
             jsast::binary(
@@ -222,32 +392,7 @@ pub(super) fn dropful_vec_truncate(element_glue: &JsName) -> Vec<Stmt> {
                 jsast::const_("$nativeOldLen", jsast::member(receiver(), "len")),
                 jsast::assign_stmt(jsast::member(receiver(), "len"), jsast::id("$native1")),
                 jsast::let_("$nativeIndex", jsast::id("$native1")),
-                jsast::while_(
-                    jsast::binary(
-                        BinOp::Lt,
-                        jsast::id("$nativeIndex"),
-                        jsast::id("$nativeOldLen"),
-                    ),
-                    vec![
-                        jsast::const_(
-                            "$nativeElement",
-                            jsast::index(buffer(), jsast::id("$nativeIndex")),
-                        ),
-                        jsast::expr_stmt(jsast::call(
-                            jsast::id(element_glue.as_str()),
-                            vec![jsast::id("$nativeElement")],
-                        )),
-                        jsast::assign_stmt(
-                            jsast::index(buffer(), jsast::id("$nativeIndex")),
-                            jsast::undefined(),
-                        ),
-                        jsast::expr_stmt(jsast::compound_assign(
-                            BinOp::Add,
-                            jsast::id("$nativeIndex"),
-                            jsast::num(1),
-                        )),
-                    ],
-                ),
+                dropful_loop(element_glue, nonthrowing, helpers, false),
             ],
         ),
         jsast::ret_void(),
@@ -255,39 +400,19 @@ pub(super) fn dropful_vec_truncate(element_glue: &JsName) -> Vec<Stmt> {
 }
 
 /// `Vec`'s drop over a needy element: ascending element drops with slot clearing, then the
-/// length and capacity released.
-pub(super) fn dropful_vec_drop(element_glue: &JsName) -> Vec<Stmt> {
+/// length and capacity released. When `nonthrowing` is false, a host exception during one
+/// destructor still drops the remaining elements and releases the buffer before rethrowing.
+pub(super) fn dropful_vec_drop(
+    element_glue: &JsName,
+    nonthrowing: bool,
+    helpers: &mut BTreeSet<&'static str>,
+) -> Vec<Stmt> {
     let receiver = || jsast::id("$native0");
     let buffer = || jsast::member(receiver(), "buf");
     vec![
         jsast::const_("$nativeOldLen", jsast::member(receiver(), "len")),
         jsast::let_("$nativeIndex", jsast::num(0)),
-        jsast::while_(
-            jsast::binary(
-                BinOp::Lt,
-                jsast::id("$nativeIndex"),
-                jsast::id("$nativeOldLen"),
-            ),
-            vec![
-                jsast::const_(
-                    "$nativeElement",
-                    jsast::index(buffer(), jsast::id("$nativeIndex")),
-                ),
-                jsast::expr_stmt(jsast::call(
-                    jsast::id(element_glue.as_str()),
-                    vec![jsast::id("$nativeElement")],
-                )),
-                jsast::assign_stmt(
-                    jsast::index(buffer(), jsast::id("$nativeIndex")),
-                    jsast::undefined(),
-                ),
-                jsast::expr_stmt(jsast::compound_assign(
-                    BinOp::Add,
-                    jsast::id("$nativeIndex"),
-                    jsast::num(1),
-                )),
-            ],
-        ),
+        dropful_loop(element_glue, nonthrowing, helpers, true),
         jsast::assign_stmt(jsast::member(buffer(), "length"), jsast::num(0)),
         jsast::assign_stmt(jsast::member(receiver(), "len"), jsast::num(0)),
         jsast::assign_stmt(jsast::member(receiver(), "cap"), jsast::num(0)),

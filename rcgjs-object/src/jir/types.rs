@@ -304,6 +304,7 @@ pub enum IteratorIdentity {
     Enumerate,
     Take,
     Skip,
+    SliceMut,
 }
 
 /// The allocator carried by a heap-owning standard-library type.

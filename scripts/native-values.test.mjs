@@ -1113,18 +1113,41 @@ test("TypedArray/NativeVec helpers, _element_view_of elision, ptr_eq same-buf fa
   // 2. Unified growable TypedArray & Array NativeVec helpers (kinds 0..=7)
   const v = rt.tv_new(4); // u32
   assert.equal(v.buf instanceof Uint32Array, true);
-  assert.throws(() => rt.nv_cap(101, 100, 4), RangeError);
-  assert.throws(() => rt.nv_cap(101, 100), RangeError);
+  assert.throws(() => rt.nv_cap(101, 100, 4), (e) => e instanceof RangeError && rt.is_abort(e));
+  assert.throws(() => rt.nv_cap(101, 100), (e) => e instanceof RangeError && rt.is_abort(e));
   rt.nv_push(v, 10, 100);
+  assert.equal(v.cap, 4); // RawVec min_non_zero_cap for 4-byte u32
   rt.nv_push(v, 25, 100);
   assert.equal(v.len, 2);
   assert.equal(v.buf[1], 25);
   rt.nv_insert(v, 1, 15, 100);
   rt.nv_insert(v, 2, 19, 100);
   assert.deepEqual(Array.from(v.buf.subarray(0, v.len)), [10, 15, 19, 25]);
-  assert.throws(() => rt.nv_insert(v, 5, 1, 100), RangeError);
+  assert.throws(() => rt.nv_insert(v, 5, 1, 100), (e) => e instanceof RangeError && rt.is_abort(e));
+  // Panic-handler routing preserves caller location and registered abort identity
+  let panicSeen = null;
+  const fakeLoc = { filename: { buf: [97, 46, 114, 115], off: 0, len: 4 }, line: 42, col: 7 };
+  const fakePanic = (pi) => { panicSeen = pi; throw rt.abort_error(new Error("rust panic")); };
+  assert.throws(
+    () => rt.nv_insert(v, 9, 1, 100, 4, fakePanic, fakeLoc),
+    (e) => e.message === "rust panic" && rt.is_abort(e),
+  );
+  assert.equal(panicSeen.location, fakeLoc);
+  // RawVec amortized growth formula: u32 min 4, u8 min 8, cap 9 -> 18, exact stays exact
+  const vu32 = rt.tv_new(4);
+  rt.nv_reserve(vu32, 1, 100, false, 4);
+  assert.equal(vu32.cap, 4);
+  const vu8 = rt.tv_new(0);
+  rt.nv_reserve(vu8, 1, 100, false, 8);
+  assert.equal(vu8.cap, 8);
+  const v9 = rt.nv_cap(9, 100, 4);
+  rt.nv_reserve(v9, 10, 100, false, 4);
+  assert.equal(v9.cap, 18);
+  const vLarge = rt.native_vec_new(0);
+  rt.nv_reserve(vLarge, 1, 100, false, 1);
+  assert.equal(vLarge.cap, 1);
   rt.nv_reserve(v, 10, 100, true);
-  assert.equal(v.cap >= 14, true);
+  assert.equal(v.cap, 14);
   rt.nv_resize(v, 5, 7, 100);
   assert.deepEqual(Array.from(v.buf.subarray(0, v.len)), [10, 15, 19, 25, 7]);
   assert.equal(rt.nv_remove(v, 1), 15);
@@ -1206,6 +1229,23 @@ test("TypedArray/NativeVec helpers, _element_view_of elision, ptr_eq same-buf fa
   assert.equal(backTv.buf instanceof Uint8Array, true);
   assert.deepEqual(Array.from(backTv.buf.subarray(0, backTv.len)), [1, 1, 2, 2, 2, 9, 8, 5, 6]);
   rt.dealloc(blkPtr, dst.cap, 1);
+  // Float NaN payload preservation across convert_nv_block (f32 and f64, repeated for V8 IC)
+  const f32Buf = new Float32Array(2);
+  new Uint32Array(f32Buf.buffer)[0] = 0x7fc00123;
+  f32Buf[1] = 1.5;
+  const f64Buf = new Float64Array(2);
+  new BigUint64Array(f64Buf.buffer)[0] = 0x7ff8000000000123n;
+  f64Buf[1] = 2.5;
+  for (let iter = 0; iter < 500; iter += 1) {
+    const p32 = rt.convert_nv_block({ buf: f32Buf, len: 2, cap: 4 }, 4, "f32");
+    const u32 = rt.unscale_scalar(p32, 4, () => 0, "f32");
+    assert.equal(new Uint32Array(Float32Array.of(u32.buf[u32.off]).buffer)[0], 0x7fc00123);
+    rt.dealloc(p32, 16, 4);
+    const p64 = rt.convert_nv_block({ buf: f64Buf, len: 2, cap: 4 }, 8, "f64");
+    const u64 = rt.unscale_scalar(p64, 8, () => 0, "f64");
+    assert.equal(new BigUint64Array(Float64Array.of(u64.buf[u64.off]).buffer)[0], 0x7ff8000000000123n);
+    rt.dealloc(p64, 32, 8);
+  }
   assert.equal(rt.offset_from({ buf: dst.buf, off: 5 }, { buf: dst.buf, off: 2 }, 1), 3);
   const dst2 = new Uint8Array(4);
   rt.copy({ buf: dst2, off: 0 }, { buf: dst.buf, off: 5 }, 4);

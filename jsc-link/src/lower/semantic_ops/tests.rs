@@ -525,7 +525,7 @@ fn table() -> (TypeTable, Interns) {
         iter_mut_fields,
         8,
     );
-    iter_mut_desc.meta.iterator = crate::jir::types::IteratorIdentity::Slice;
+    iter_mut_desc.meta.iterator = crate::jir::types::IteratorIdentity::SliceMut;
     put(iter_mut_desc, &mut table);
 
     (table, interns)
@@ -641,6 +641,8 @@ fn lower_cx<'a>(
         table,
         interns,
         element_glue: None,
+        element_glue_nonthrowing: false,
+        panic_impl: None,
     }
 }
 
@@ -964,7 +966,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::VecPush,
         NATIVE,
         r#"function f($native0, $native1) {
-  __rt.nv_push($native0, $native1, 536870911);
+  __rt.nv_push($native0, $native1, 536870911, 4);
   return;
 }"#,
     ),
@@ -973,7 +975,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         NATIVE,
         r#"function f($native0, $native1) {
   const $nativeIdx = $native0.len;
-  __rt.nv_push($native0, $native1, 536870911);
+  __rt.nv_push($native0, $native1, 536870911, 4);
   return { buf: $native0.buf, off: $nativeIdx };
 }"#,
     ),
@@ -981,7 +983,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::VecInsert,
         NATIVE,
         r#"function f($native0, $native1, $native2, $native3) {
-  __rt.nv_insert($native0, $native1, $native2, 536870911);
+  __rt.nv_insert($native0, $native1, $native2, 536870911, 4);
   return;
 }"#,
     ),
@@ -989,7 +991,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::VecInsertMut,
         NATIVE,
         r#"function f($native0, $native1, $native2, $native3) {
-  __rt.nv_insert($native0, $native1, $native2, 536870911);
+  __rt.nv_insert($native0, $native1, $native2, 536870911, 4);
   return { buf: $native0.buf, off: $native1 };
 }"#,
     ),
@@ -997,7 +999,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::VecReserve,
         NATIVE,
         r#"function f($native0, $native1) {
-  __rt.nv_reserve($native0, $native1, 536870911, false);
+  __rt.nv_reserve($native0, $native1, 536870911, false, 4);
   return;
 }"#,
     ),
@@ -1005,7 +1007,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::VecReserveExact,
         NATIVE,
         r#"function f($native0, $native1) {
-  __rt.nv_reserve($native0, $native1, 536870911, true);
+  __rt.nv_reserve($native0, $native1, 536870911, true, 4);
   return;
 }"#,
     ),
@@ -1043,7 +1045,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::VecResize,
         NATIVE,
         r#"function f($native0, $native1, $native2) {
-  __rt.nv_resize($native0, $native1, $native2, 536870911);
+  __rt.nv_resize($native0, $native1, $native2, 536870911, 4);
   return;
 }"#,
     ),
@@ -1170,7 +1172,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::VecExtend,
         NATIVE,
         r#"function f($native0, $native1) {
-  __rt.nv_extend($native0, $native1, 536870911);
+  __rt.nv_extend($native0, $native1, 536870911, 4);
   return;
 }"#,
     ),
@@ -1178,7 +1180,7 @@ const PINNED: &[(StandardOperation, Option<Carrier>, &str)] = &[
         StandardOperation::VecExtendFromSlice,
         NATIVE,
         r#"function f($native0, $native1) {
-  __rt.nv_extend_slice($native0, $native1, 536870911);
+  __rt.nv_extend_slice($native0, $native1, 536870911, 4);
   return;
 }"#,
     ),
@@ -1399,6 +1401,8 @@ fn drop_glue_resolves_through_the_candidate() {
         table: &table,
         interns: &interns,
         element_glue: None,
+        element_glue_nonthrowing: false,
+        panic_impl: None,
     };
     let rewrite = rewrite(&cx, &[Carrier::StringBuilder]).expect("string drop glue lowers");
     assert_eq!(rewrite.operation, StandardOperation::StringDrop);
@@ -1410,6 +1414,8 @@ fn drop_glue_resolves_through_the_candidate() {
         table: &table,
         interns: &interns,
         element_glue: None,
+        element_glue_nonthrowing: false,
+        panic_impl: None,
     };
     let vec_rewrite = super::rewrite(&cx, &[Carrier::NativeVec]).expect("vec drop glue lowers");
     assert_eq!(vec_rewrite.operation, StandardOperation::VecDrop);
@@ -1428,6 +1434,8 @@ fn box_drop_preserves_pointee_glue_without_allocator_machinery() {
         table: &table,
         interns: &interns,
         element_glue: None,
+        element_glue_nonthrowing: false,
+        panic_impl: None,
     };
     let plain_rewrite = rewrite(&plain, &[Carrier::NativeBox]).expect("plain Box drop lowers");
     assert_eq!(plain_rewrite.operation, StandardOperation::BoxDrop);
@@ -1451,6 +1459,8 @@ fn box_drop_preserves_pointee_glue_without_allocator_machinery() {
         table: &table,
         interns: &interns,
         element_glue: Some(&glue),
+        element_glue_nonthrowing: false,
+        panic_impl: None,
     };
     let rewrite = rewrite(&droppy, &[Carrier::NativeBox]).expect("structural Box drop lowers");
     assert_eq!(
@@ -1481,6 +1491,8 @@ fn box_drop_requires_proven_structural_pointee_glue() {
         table: &table,
         interns: &interns,
         element_glue: None,
+        element_glue_nonthrowing: false,
+        panic_impl: None,
     };
     assert_eq!(
         rewrite(&droppy, &[Carrier::NativeBox]).err(),
@@ -1495,6 +1507,8 @@ fn box_drop_requires_proven_structural_pointee_glue() {
         table: &table,
         interns: &interns,
         element_glue: None,
+        element_glue_nonthrowing: false,
+        panic_impl: None,
     };
     assert_eq!(
         rewrite(&own, &[Carrier::NativeBox]).err(),
@@ -1589,6 +1603,8 @@ fn dropful_clear_and_drop_call_the_glue_in_order() {
             table: &table,
             interns: &interns,
             element_glue: Some(&glue),
+            element_glue_nonthrowing: true,
+            panic_impl: None,
         };
         let rewrite = rewrite(&cx, &[Carrier::NativeVec])
             .unwrap_or_else(|decline| panic!("{operation:?}: {}", decline.reason()));
@@ -1632,6 +1648,8 @@ fn own_drop_element_is_an_exact_decline() {
             table: &table,
             interns: &interns,
             element_glue,
+            element_glue_nonthrowing: false,
+            panic_impl: None,
         };
         assert_eq!(
             rewrite(&cx, &[Carrier::NativeVec]).err(),
@@ -1693,6 +1711,113 @@ fn zero_sized_element_declines() {
         &interns,
     );
     assert_eq!(validate(&cx).err(), Some(SemanticDecline::ZeroSizedElement));
+}
+
+/// Without a non-unwinding drop proof, dropful `truncate`/`clear`/`drop` emit unwind cleanup so a
+/// host exception in one destructor still drops the remaining elements and rethrows aborts.
+#[test]
+fn dropful_vec_ops_emit_unwind_cleanup_when_not_proven_nonthrowing() {
+    let (table, interns) = table();
+    let glue = JsName::new("elem_drop".to_owned());
+    let trunc_sig = sig(vec![VEC_DROPPY_MUT, USIZE], UNIT);
+    let clear_sig = sig(vec![VEC_DROPPY_MUT], UNIT);
+    for (op, signature) in [
+        (StandardOperation::VecTruncate, &trunc_sig),
+        (StandardOperation::VecClear, &clear_sig),
+        (StandardOperation::VecDrop, &clear_sig),
+    ] {
+        let cx = LowerCx {
+            semantic: BodySemantic::Standard(op),
+            sig: signature,
+            table: &table,
+            interns: &interns,
+            element_glue: Some(&glue),
+            element_glue_nonthrowing: false,
+            panic_impl: None,
+        };
+        let rw = rewrite(&cx, &[Carrier::NativeVec]).expect("dropful op lowers with unwind guard");
+        let printed = jsast::stmt_to_string(&jsast::function("f", rw.parameters, rw.statements));
+        assert!(
+            printed.contains("try {") && printed.contains("__rt.is_abort($caught)"),
+            "{op:?} must emit unwind cleanup:\n{printed}"
+        );
+        assert!(rw.runtime_helpers.contains("is_abort"));
+        assert!(rw.item_references.contains(&glue));
+    }
+}
+
+/// When `panic_impl` is present, bounds/capacity operations route failures through the program's
+/// `#[panic_handler]` (preserving caller `$loc` on `#[track_caller]` ops) and retain a reference.
+#[test]
+fn native_vec_ops_route_failures_through_panic_impl() {
+    let (mut table, interns) = table();
+    let vec_u8_mut = TypeId(98);
+    table.insert(reference(vec_u8_mut, VEC_U8, true));
+    let panic_fn = JsName::new("rust_begin_unwind".to_owned());
+
+    let insert_sig = sig_tracked(vec![VEC_U32_MUT, USIZE, U32], UNIT);
+    let cx = LowerCx {
+        semantic: BodySemantic::Standard(StandardOperation::VecInsert),
+        sig: &insert_sig,
+        table: &table,
+        interns: &interns,
+        element_glue: None,
+        element_glue_nonthrowing: false,
+        panic_impl: Some(&panic_fn),
+    };
+    let rw = rewrite(&cx, &[Carrier::NativeVec]).expect("VecInsert lowers with panic_impl");
+    let printed = jsast::stmt_to_string(&jsast::function("f", rw.parameters, rw.statements));
+    assert_eq!(
+        printed.trim_end(),
+        r#"function f($native0, $native1, $native2, $native3) {
+  __rt.nv_insert($native0, $native1, $native2, 536870911, 4, rust_begin_unwind, $native3);
+  return;
+}"#
+    );
+    assert!(rw.item_references.contains(&panic_fn));
+
+    // 1-byte Vec<u8> passes RawVec's min_non_zero_cap = 8 on reserve.
+    let reserve_u8_sig = sig(vec![vec_u8_mut, USIZE], UNIT);
+    let cx_u8 = LowerCx {
+        semantic: BodySemantic::Standard(StandardOperation::VecReserve),
+        sig: &reserve_u8_sig,
+        table: &table,
+        interns: &interns,
+        element_glue: None,
+        element_glue_nonthrowing: false,
+        panic_impl: Some(&panic_fn),
+    };
+    let rw_u8 = rewrite(&cx_u8, &[Carrier::NativeVec]).expect("VecReserve u8 lowers");
+    let printed_u8 =
+        jsast::stmt_to_string(&jsast::function("f", rw_u8.parameters, rw_u8.statements));
+    assert_eq!(
+        printed_u8.trim_end(),
+        r#"function f($native0, $native1) {
+  __rt.nv_reserve($native0, $native1, 2147483647, false, 8, rust_begin_unwind);
+  return;
+}"#
+    );
+    assert!(rw_u8.item_references.contains(&panic_fn));
+}
+
+/// `VecIter` requires `IteratorIdentity::Slice` and `VecIterMut` requires
+/// `IteratorIdentity::SliceMut`; swapping either declines.
+#[test]
+fn vec_iter_and_iter_mut_require_distinct_iterator_identities() {
+    let (table, interns) = table();
+    let wrong_mut = sig(vec![VEC_U32_MUT], SLICE_ITER_U32);
+    let cx_mut = lower_cx(StandardOperation::VecIterMut, &wrong_mut, &table, &interns);
+    assert_eq!(
+        validate(&cx_mut).err(),
+        Some(SemanticDecline::WrongReturnType)
+    );
+
+    let wrong_ref = sig(vec![VEC_U32_REF], SLICE_ITER_MUT_U32);
+    let cx_ref = lower_cx(StandardOperation::VecIter, &wrong_ref, &table, &interns);
+    assert_eq!(
+        validate(&cx_ref).err(),
+        Some(SemanticDecline::WrongReturnType)
+    );
 }
 
 mod structural {
@@ -2491,7 +2616,7 @@ for (const f of [before, after]) {
         const mutated = rounds === 0 && shouldThrow;
         const expectedCapacity = ownedKind === 'builder'
           ? Math.max(capacity, __rt.str_len(text) + 8)
-          : (capacity >= 4 ? capacity : 16);
+          : Math.max(capacity, 4);
         if (ownedKind === 'builder') {
           assert.equal(__rt.bytes_str(ptr.buf, ptr.off, vec.len), text + '\ud83d\ude00\ud83d\ude00');
           assert.equal(owned.text, dropped ? '' : mutated ? text + '\ud83d\ude00\ud83d\ude00' : text);

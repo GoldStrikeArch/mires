@@ -103,7 +103,8 @@ pub fn build(
         for block in &func.blocks {
             for op in &block.ops {
                 edge_targets(
-                    &op.kind,
+                    func,
+                    op,
                     interns,
                     &graph.fn_pointer_targets,
                     &graph.by_item,
@@ -122,7 +123,8 @@ pub fn build(
 /// no edge, and the effects transfer then finds no summary at the site, which is the same
 /// conservative answer.
 fn edge_targets(
-    op: &OpKind,
+    func: &Func,
+    op: &crate::jir::repr::Op,
     interns: Option<&Interns>,
     fn_pointer_targets: &BTreeMap<TypeId, BTreeSet<ItemId>>,
     by_item: &BTreeMap<ItemId, BTreeSet<JsName>>,
@@ -133,15 +135,26 @@ fn edge_targets(
             .and_then(|interns| interns.str(*link_name))
             .map(|name| JsName::new(name.to_owned()))
     };
-    match op {
+    let types = interns.map(|interns| &interns.types);
+    match &op.kind {
         OpKind::Call {
-            callee, semantic, ..
+            callee,
+            semantic,
+            args,
+            ..
         } => match callee {
             Callee::Direct { link_name, .. } => {
                 let covered = matches!(
                     semantic,
                     CallSemantic::Standard(operation)
-                        if crate::lower::semantic_ops::registry(*operation).is_some()
+                        if crate::lower::semantic_ops::call_effects_entry(
+                            *operation,
+                            types,
+                            func,
+                            op.result,
+                            args,
+                        )
+                        .is_some()
                 );
                 if !covered {
                     out.extend(resolve(link_name));

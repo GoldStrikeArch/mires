@@ -179,6 +179,8 @@ pub(crate) struct OGroup {
     /// Witnesses the group's dce runs recorded and failed (inline/devirt carry their own).
     witnesses_recorded: u32,
     witnesses_failed: u32,
+    /// Items whose validated effects summary proved `!may_unwind`.
+    nonthrowing_items: BTreeSet<JsName>,
 }
 
 /// One region's row in the sidecar's `repr.decisions` list: what the solver chose for it.
@@ -711,6 +713,7 @@ fn run_with_opts(
             drop_glue: &drop_glue,
             vtables: &vtables,
             byte_views,
+            nonthrowing_glues: &o_stats.nonthrowing_items,
         };
         crate::profile::time("lane.B1.representation", || {
             crate::plan::representation::plan_and_commit(
@@ -1826,6 +1829,11 @@ fn o_group_with_mode(
             .saturating_sub(violations.len() as u32);
         group.summaries_top = summaries.iter().filter(|(_, s)| s.is_top()).count() as u32;
     }
+    group.nonthrowing_items = summaries
+        .iter()
+        .filter(|(_, s)| !s.may_unwind)
+        .map(|(name, _)| name.clone())
+        .collect();
     // The `RCGJS_REPR_DEBUG_FUNC` precedent, for the group's rewrites.
     if let Ok(filter) = std::env::var("RCGJS_O_DEBUG_FUNC") {
         for (name, func) in funcs.iter() {
@@ -2348,6 +2356,7 @@ fn record_keyed_row_capture(
                 callee,
                 host,
                 semantic,
+                args,
                 ..
             } = &op.kind
             else {
@@ -2363,7 +2372,14 @@ fn record_keyed_row_capture(
             if matches!(
                 semantic,
                 CallSemantic::Standard(operation)
-                    if crate::lower::semantic_ops::registry(*operation).is_some()
+                    if crate::lower::semantic_ops::call_effects_entry(
+                        *operation,
+                        Some(&item_interns.types),
+                        func,
+                        op.result,
+                        args,
+                    )
+                    .is_some()
             ) {
                 continue;
             }

@@ -101,6 +101,8 @@ pub(super) fn write_item(out: &mut String, jir: &LinkJir) {
         table: &interns.types,
         interns,
         element_glue: None,
+        element_glue_nonthrowing: false,
+        panic_impl: None,
     };
     match semantic_ops::validate(&cx) {
         Ok(op) => {

@@ -82,6 +82,7 @@ pub(crate) struct ReprCx<'a> {
     pub drop_glue: &'a crate::lower::js::host::DropGlueIndex,
     pub vtables: &'a crate::lower::js::unsize::VtableIndex,
     pub byte_views: crate::analysis::byte_views::ByteViewPlan,
+    pub nonthrowing_glues: &'a BTreeSet<JsName>,
 }
 
 /// Why one function's commit refused: the problem nodes whose regions must roll back beside the
@@ -1088,6 +1089,20 @@ impl Planner<'_> {
 
     /// The committable standard-operation items and their measured bodies.
     fn op_entries(&self, problem: &Problem) -> BTreeMap<JsName, OpEntry> {
+        let panic_impl: Option<JsName> = self.table.iter().find_map(|(name, item)| {
+            item.jir
+                .body
+                .as_ref()
+                .is_some_and(|body| body.semantic == BodySemantic::PanicImpl)
+                .then(|| name.clone())
+        });
+        let has_custom_allocator = self.table.values().any(|item| {
+            matches!(
+                item.late_ir.artifact_allocator_provider(),
+                crate::late_ir::AllocatorProvider::Custom
+                    | crate::late_ir::AllocatorProvider::Conflict
+            )
+        });
         let mut entries = BTreeMap::new();
         for (name, func) in self.funcs {
             let Ok(func) = func else { continue };
@@ -1103,6 +1118,8 @@ impl Planner<'_> {
                 table: &interns.types,
                 interns,
                 element_glue: None,
+                element_glue_nonthrowing: false,
+                panic_impl: panic_impl.as_ref(),
             };
             let Ok((op, slots)) = semantic_ops::support_of(&probe) else {
                 if let Some(&bstr_op) = self.bstr_ops.get(name) {
@@ -1171,13 +1188,22 @@ impl Planner<'_> {
                 }
                 semantic_ops::Deps::None => Ok(None),
             };
-            let glue_name: Option<JsName> = required_glue
-                .ok()
-                .flatten()
+            let elem_ty = required_glue.ok().flatten();
+            let glue_name: Option<JsName> = elem_ty
                 .and_then(|element| self.cx.drop_glue.get(&element))
                 .map(|glue| JsName::new(glue.clone()));
+            let element_glue_nonthrowing = match (elem_ty, glue_name.as_ref()) {
+                (Some(elem_ty), Some(glue)) if !has_custom_allocator => {
+                    semantic_ops::drop::element_drop_is_trivially_nonthrowing(
+                        &interns.types,
+                        elem_ty,
+                    ) || self.cx.nonthrowing_glues.contains(glue)
+                }
+                _ => false,
+            };
             let lcx = LowerCx {
                 element_glue: glue_name.as_ref(),
+                element_glue_nonthrowing,
                 ..probe
             };
             if solver_blocked(op.id) {
@@ -1907,12 +1933,13 @@ impl Planner<'_> {
         for clone in commit.clones.keys() {
             abi_funcs.remove(clone);
         }
-        let clone_sources: BTreeSet<ItemId> = commit
+        let abi_excluded: BTreeSet<ItemId> = commit
             .clones
             .values()
+            .chain(commit.bodies.keys())
             .filter_map(|source| self.funcs.get(source)?.as_ref().ok().map(|func| func.item))
             .collect();
-        let abi = crate::plan::abi_flat::plan_excluding(&table, &abi_funcs, &opts, &clone_sources);
+        let abi = crate::plan::abi_flat::plan_excluding(&table, &abi_funcs, &opts, &abi_excluded);
         abi.rewrite(&mut funcs, &table);
 
         let mut lowered = Vec::new();
@@ -4232,12 +4259,14 @@ mod tests {
         let drop_glue = crate::lower::js::host::DropGlueIndex::new();
         let vtables = crate::lower::js::unsize::VtableIndex::new();
         let opts = crate::opts::Opts::default();
+        let nonthrowing_glues = BTreeSet::new();
         let cx = ReprCx {
             opts: &opts,
             items: &items,
             drop_glue: &drop_glue,
             vtables: &vtables,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            nonthrowing_glues: &nonthrowing_glues,
         };
         let interns_map: BTreeMap<JsName, &crate::jir::Interns> = prog
             .table

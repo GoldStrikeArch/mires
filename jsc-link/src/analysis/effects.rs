@@ -783,15 +783,21 @@ enum CallKind<'a> {
     Opaque,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify<'a>(
     graph: &'a Callgraph,
     interns: Option<&Interns>,
+    func: &Func,
+    result: Option<ValueId>,
+    args: &[ValueId],
     callee: &Callee,
     semantic: &CallSemantic,
     host: &Option<HostPayload>,
 ) -> CallKind<'a> {
     if let CallSemantic::Standard(operation) = semantic {
-        if let Some(entry) = semantic_ops::registry(*operation) {
+        let types = interns.map(|interns| &interns.types);
+        if let Some(entry) = semantic_ops::call_effects_entry(*operation, types, func, result, args)
+        {
             return CallKind::Registry(entry);
         }
     }
@@ -950,7 +956,7 @@ impl Taints {
             let mut changed = false;
             for block in &func.blocks {
                 for op in &block.ops {
-                    changed |= taints.flow_op(cx, interns, op.result, &op.kind, current);
+                    changed |= taints.flow_op(cx, interns, func, op.result, &op.kind, current);
                 }
                 changed |= taints.flow_term(&block.term, func);
             }
@@ -1014,6 +1020,7 @@ impl Taints {
         &mut self,
         cx: &Cx<'_>,
         interns: Option<&Interns>,
+        func: &Func,
         result: Option<ValueId>,
         kind: &OpKind,
         current: &BTreeMap<JsName, Summary>,
@@ -1034,7 +1041,7 @@ impl Taints {
             }
             _ => {
                 let Some(result) = result else { return false };
-                let (flow, root) = self.derive(cx, interns, kind, current);
+                let (flow, root) = self.derive(cx, interns, func, Some(result), kind, current);
                 self.assign(result, flow, root)
             }
         }
@@ -1045,6 +1052,8 @@ impl Taints {
         &self,
         cx: &Cx<'_>,
         interns: Option<&Interns>,
+        func: &Func,
+        result: Option<ValueId>,
         kind: &OpKind,
         current: &BTreeMap<JsName, Summary>,
     ) -> (Flow, Option<StoreRoot>) {
@@ -1115,7 +1124,9 @@ impl Taints {
                 host,
                 args,
                 ..
-            } => match classify(cx.graph, interns, callee, semantic, host) {
+            } => match classify(
+                cx.graph, interns, func, result, args, callee, semantic, host,
+            ) {
                 CallKind::Nop | CallKind::GlobalAllocator => fresh(),
                 CallKind::Registry(_) => (Flow::new(self.union_of(args), Exact::Many, false), None),
                 CallKind::Direct(name) => match name.as_ref().and_then(|name| current.get(name)) {
@@ -1200,7 +1211,9 @@ fn read_origins_of(
                 host,
                 args,
                 ..
-            } => match classify(cx.graph, interns, callee, semantic, host) {
+            } => match classify(
+                cx.graph, interns, func, op.result, args, callee, semantic, host,
+            ) {
                 CallKind::Nop | CallKind::GlobalAllocator => {}
                 CallKind::Registry(entry) => {
                     if !entry.effects.mutates {
@@ -1317,7 +1330,7 @@ fn summarize(
     };
     for block in &func.blocks {
         for op in &block.ops {
-            facts.op(cx, interns, types, func, &taints, &op.kind, current);
+            facts.op(cx, interns, types, func, &taints, op, current);
         }
         facts.term(&block.term, &taints);
     }
@@ -1376,10 +1389,10 @@ impl Facts {
         types: Option<&TypeTable>,
         func: &Func,
         taints: &Taints,
-        kind: &OpKind,
+        op: &crate::jir::repr::Op,
         current: &BTreeMap<JsName, Summary>,
     ) {
-        match kind {
+        match &op.kind {
             OpKind::Deref(ptr) => {
                 // Only a proven frame-local pointer reads nothing the caller's world holds: a
                 // fresh-taint pointer can still be a global reference or a callee's handle.
@@ -1418,7 +1431,9 @@ impl Facts {
                 args,
                 ..
             } => {
-                let kind = classify(cx.graph, interns, callee, semantic, host);
+                let kind = classify(
+                    cx.graph, interns, func, op.result, args, callee, semantic, host,
+                );
                 self.call(
                     cx,
                     types,
@@ -2278,6 +2293,199 @@ mod tests {
             .and_then(|name| summaries.get(name))
             .expect("summarized");
         assert!(summary.may_unwind);
+    }
+
+    #[test]
+    fn clone_ops_use_callee_effects_for_non_primitive_elements() {
+        use crate::jir::types::{
+            AllocatorIdentity, JsFacts, LayoutFacts, NominalForm, RepresentationCandidate,
+            TypeDescriptor, TypeMeta,
+        };
+        let make_ty = |id: TypeId, kind: TypeKind, meta: TypeMeta| TypeDescriptor {
+            id,
+            name: None,
+            kind,
+            layout: LayoutFacts {
+                sized: true,
+                size: Some(4),
+                ..LayoutFacts::default()
+            },
+            meta,
+            js: JsFacts {
+                int: None,
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: id,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        };
+        let elem_u32 = TypeId(20);
+        let elem_spy = TypeId(21);
+        let vec_u32 = TypeId(22);
+        let vec_spy = TypeId(23);
+        let slice_u32 = TypeId(24);
+        let slice_spy = TypeId(25);
+        let ref_slice_u32 = TypeId(26);
+        let ref_slice_spy = TypeId(27);
+        let vec_meta = TypeMeta {
+            candidate: RepresentationCandidate::Vec,
+            allocator: AllocatorIdentity::Global,
+            ..TypeMeta::default()
+        };
+
+        let run = |op: StandardOperation, arg_ty: TypeId, ret_ty: TypeId| {
+            let mut prog = Prog::new();
+            prog.interns.types.insert(make_ty(
+                elem_u32,
+                TypeKind::Integer {
+                    signed: false,
+                    bits: 32,
+                },
+                TypeMeta::default(),
+            ));
+            prog.interns.types.insert(make_ty(
+                elem_spy,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 60,
+                    },
+                    args: Vec::new(),
+                    form: NominalForm::Struct,
+                    variants: Vec::new(),
+                    niche: None,
+                },
+                TypeMeta::default(),
+            ));
+            prog.interns.types.insert(make_ty(
+                vec_u32,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 61,
+                    },
+                    args: vec![elem_u32],
+                    form: NominalForm::Struct,
+                    variants: Vec::new(),
+                    niche: None,
+                },
+                vec_meta,
+            ));
+            prog.interns.types.insert(make_ty(
+                vec_spy,
+                TypeKind::Adt {
+                    def: DefinitionId {
+                        crate_id: 0,
+                        local_hash: 62,
+                    },
+                    args: vec![elem_spy],
+                    form: NominalForm::Struct,
+                    variants: Vec::new(),
+                    niche: None,
+                },
+                vec_meta,
+            ));
+            prog.interns.types.insert(make_ty(
+                slice_u32,
+                TypeKind::Slice(elem_u32),
+                TypeMeta::default(),
+            ));
+            prog.interns.types.insert(make_ty(
+                slice_spy,
+                TypeKind::Slice(elem_spy),
+                TypeMeta::default(),
+            ));
+            prog.interns.types.insert(make_ty(
+                ref_slice_u32,
+                TypeKind::Reference {
+                    pointee: slice_u32,
+                    mutable: false,
+                },
+                TypeMeta::default(),
+            ));
+            prog.interns.types.insert(make_ty(
+                ref_slice_spy,
+                TypeKind::Reference {
+                    pointee: slice_spy,
+                    mutable: false,
+                },
+                TypeMeta::default(),
+            ));
+
+            // Callee performs an observable host effect (simulating user `Clone::clone`).
+            let callee_name = prog.intern("to_vec_impl");
+            let mut callee_b = FuncBuilder::new(
+                id(2),
+                Signature {
+                    arguments: vec![arg_ty],
+                    result: ret_ty,
+                    abi: AbiSignature::default(),
+                },
+            );
+            let _c_arg = callee_b.param(arg_ty, O);
+            callee_b.effect(
+                FuncBuilder::ENTRY,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: id(3),
+                        link_name: callee_name,
+                    },
+                    function: None,
+                    args: Vec::new(),
+                    track_caller: None,
+                    semantic: CallSemantic::Host,
+                    host: None,
+                },
+                O,
+            );
+            let c_ret = callee_b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Const(ConstTree::Unit),
+                ret_ty,
+                O,
+            );
+            callee_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(c_ret)));
+            prog.add("to_vec_impl", callee_b.finish());
+
+            let mut caller_b = FuncBuilder::new(
+                id(1),
+                Signature {
+                    arguments: vec![arg_ty],
+                    result: ret_ty,
+                    abi: AbiSignature::default(),
+                },
+            );
+            let p0 = caller_b.param(arg_ty, O);
+            let res = caller_b.op(
+                FuncBuilder::ENTRY,
+                call(callee_name, CallSemantic::Standard(op), vec![p0]),
+                ret_ty,
+                O,
+            );
+            caller_b.terminate(FuncBuilder::ENTRY, RTerm::Return(Some(res)));
+            prog.add("caller", caller_b.finish());
+
+            let summaries = prog.compute();
+            summaries
+                .get(&JsName::new("caller".to_owned()))
+                .cloned()
+                .expect("caller summarized")
+        };
+
+        let prim = run(StandardOperation::SliceToVec, ref_slice_u32, vec_u32);
+        assert_eq!(prim.purity, Purity::Read);
+        assert!(!prim.may_unwind);
+
+        let user = run(StandardOperation::SliceToVec, ref_slice_spy, vec_spy);
+        assert_eq!(user.purity, Purity::Effect);
+        assert!(user.may_unwind);
     }
 
     #[test]

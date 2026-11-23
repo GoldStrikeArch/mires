@@ -228,6 +228,8 @@ fn forced_semantic_rewrite(input: &LowerInput<'_>) -> Option<Result<LoweredItem,
         table: input.table,
         interns: input.interns,
         element_glue: None,
+        element_glue_nonthrowing: false,
+        panic_impl: None,
     };
     let (op, slots) = match semantic_ops::support_of(&cx) {
         Ok(support) => support,
