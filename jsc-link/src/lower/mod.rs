@@ -136,6 +136,8 @@ pub struct LowerInput<'a> {
     pub bigints: Option<&'a bigint::BigIntNames>,
     /// Whole-program lazy byte-view lowering policy (`analysis::byte_views`).
     pub byte_views: crate::analysis::byte_views::ByteViewPlan,
+    /// Whole-program Tier A typed-heap and `_boxes` tracking plan (`analysis::heap`).
+    pub heap: Option<&'a crate::analysis::heap::HeapPlan>,
     /// Per-function nested native carrier clone guard (`value::clone_expr_with`).
     pub nested_clone: NestedClone,
 }

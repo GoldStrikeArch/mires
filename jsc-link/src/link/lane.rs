@@ -654,6 +654,7 @@ fn run_with_opts(
             drop_glue: &drop_glue,
             vtables: &vtables,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            heap: crate::analysis::heap::HeapPlan::default(),
         };
         build_funcs(table, &original_names, &ctx)
     };
@@ -664,6 +665,13 @@ fn run_with_opts(
         &empty_native_bodies,
         &opts.roots,
     );
+    let mut heap = crate::analysis::heap::analyze_reachable(
+        table,
+        &pristine_funcs,
+        &empty_native_bodies,
+        opts,
+        byte_views,
+    );
     record_keyed_purity(table, &pristine_funcs, &mut items);
     let mut ctx = Ctx {
         opts,
@@ -671,6 +679,7 @@ fn run_with_opts(
         drop_glue: &drop_glue,
         vtables: &vtables,
         byte_views,
+        heap,
     };
     // Effects-summary coverage (phase 5, W5b): analysis only, stderr only, computed on demand.
     // The O group (W5e) is what will consume the summaries in the pipeline.
@@ -700,7 +709,15 @@ fn run_with_opts(
         &empty_native_bodies,
         &opts.roots,
     );
+    heap = crate::analysis::heap::analyze_reachable(
+        table,
+        &planned_funcs,
+        &empty_native_bodies,
+        opts,
+        byte_views,
+    );
     ctx.byte_views = byte_views;
+    ctx.heap = heap;
 
     // Phase B1: solve and commit on the planned map in both `report` and `on`. Report mode keeps
     // only the accounting; on mode prints the committed map. D9 can therefore measure the exact
@@ -713,6 +730,7 @@ fn run_with_opts(
             drop_glue: &drop_glue,
             vtables: &vtables,
             byte_views,
+            heap: &ctx.heap,
             nonthrowing_glues: &o_stats.nonthrowing_items,
         };
         crate::profile::time("lane.B1.representation", || {
@@ -796,7 +814,15 @@ fn run_with_opts(
         &repr.bodies,
         &opts.roots,
     );
+    heap = crate::analysis::heap::analyze_reachable(
+        &work_table,
+        &funcs,
+        &repr.bodies,
+        opts,
+        byte_views,
+    );
     ctx.byte_views = byte_views;
+    ctx.heap = heap;
 
     // B2 plans against the same post-O, post-representation map D9 measured. Report mode records
     // that plan and empties it before emission.
@@ -1009,7 +1035,15 @@ fn run_with_opts(
                 &repr.bodies,
                 &opts.roots,
             );
+            heap = crate::analysis::heap::analyze_reachable(
+                &work_table,
+                &funcs,
+                &repr.bodies,
+                opts,
+                byte_views,
+            );
             ctx.byte_views = byte_views;
+            ctx.heap = heap;
             continue;
         }
         break (lowered, async_plan);
@@ -1260,6 +1294,7 @@ struct Ctx<'a> {
     drop_glue: &'a DropGlueIndex,
     vtables: &'a VtableIndex,
     byte_views: crate::analysis::byte_views::ByteViewPlan,
+    heap: crate::analysis::heap::HeapPlan,
 }
 
 /// The names the lane offers to the lowerer, sorted and deduplicated.
@@ -1313,7 +1348,7 @@ type Lowered = (
 fn lower_input<'a>(
     name: &'a JsName,
     item: &'a LinkItem,
-    ctx: &Ctx<'a>,
+    ctx: &'a Ctx<'a>,
     spills: &'a [JsName],
 ) -> Option<LowerInput<'a>> {
     lower_input_with_retargets(name, item, ctx, spills, crate::lower::EMPTY_CALL_RETARGETS)
@@ -1322,7 +1357,7 @@ fn lower_input<'a>(
 fn lower_input_with_retargets<'a>(
     name: &'a JsName,
     item: &'a LinkItem,
-    ctx: &Ctx<'a>,
+    ctx: &'a Ctx<'a>,
     spills: &'a [JsName],
     call_retargets: &'a crate::lower::CallRetargets,
 ) -> Option<LowerInput<'a>> {
@@ -1344,6 +1379,7 @@ fn lower_input_with_retargets<'a>(
         call_retargets,
         bigints: None,
         byte_views: ctx.byte_views,
+        heap: Some(&ctx.heap),
         nested_clone: crate::lower::NestedClone::default(),
     })
 }
@@ -1373,6 +1409,7 @@ fn physical_program_metrics(
         drop_glue: ctx.drop_glue,
         vtables: ctx.vtables,
         byte_views: ctx.byte_views,
+        heap: ctx.heap.clone(),
     };
     let mut table = source_table.clone();
     let mut funcs = source_funcs.clone();
@@ -4605,6 +4642,7 @@ mod tests {
             drop_glue: &drop_glue,
             vtables: &vtables,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            heap: crate::analysis::heap::HeapPlan::default(),
         };
         let names = vec![
             JsName::new("caller$h1".to_owned()),

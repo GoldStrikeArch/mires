@@ -347,6 +347,7 @@ fn check_emission(
                         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
                         bigints: None,
                         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+                        heap: None,
                         nested_clone: crate::lower::NestedClone::default(),
                     };
                     let lowered = function::lower(&input, func, &plan, structured.region).unwrap();

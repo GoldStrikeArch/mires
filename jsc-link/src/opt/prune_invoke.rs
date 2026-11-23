@@ -183,6 +183,19 @@ pub(crate) fn is_non_throwing_sysroot_shim_member(sym: &str) -> bool {
             | "ptr_is_null"
             | "host_str_to_lowercase"
             | "host_str_to_uppercase"
+            | "_put_plain"
+            | "_put_tracked"
+            | "t_box_new_tracked"
+            | "t_alloc_arr"
+            | "t_alloc_z"
+            | "t_realloc_ta"
+            | "t_realloc_ta_checked"
+            | "t_realloc_arr"
+            | "t_realloc_arr_checked"
+            | "t_dealloc_maybe"
+            | "convert_nv_typed"
+            | "bstr_block_typed"
+            | "bstr_sb_block_typed"
     )
 }
 

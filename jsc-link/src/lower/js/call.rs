@@ -232,6 +232,17 @@ impl JsCx<'_> {
             }
         }
 
+        // Tier A typed managed heap (`ReleaseSpeed && Default allocator && !byte_views`): lower
+        // `Global` `RawVec`/`Box`/`BTreeMap`/`Rc` allocation hooks directly to zero-WeakMap
+        // TypedArrays / plain Arrays and no-op deallocations.
+        if let CallSemantic::Standard(operation) = semantic {
+            if operation.is_typed_heap() && self.heap().typed_heap_enabled {
+                if let Some(lowered) = self.lower_typed_heap_call(op, *operation, args)? {
+                    return Ok(lowered);
+                }
+            }
+        }
+
         // `js-str=bytes`: a `str` method with a producer-tagged identity is the JavaScript string
         // operation it is on a byte string (`lower/bstr.rs`).
         if let CallSemantic::Standard(operation) = semantic {
@@ -966,6 +977,197 @@ impl JsCx<'_> {
         Ok(Some(Lowered::Value(prelude, value)))
     }
 
+    /// Lowers the five Phase 3 Tier A typed-heap `Global` hooks (`StandardOperation::is_typed_heap`)
+    /// directly at call sites when `self.heap().typed_heap_enabled` holds.
+    fn lower_typed_heap_call(
+        &self,
+        op: &Op,
+        operation: StandardOperation,
+        args: &[ValueId],
+    ) -> Res<Option<Lowered>> {
+        const TA_CTORS: [&str; 8] = [
+            "Uint8Array",
+            "Int8Array",
+            "Uint16Array",
+            "Int16Array",
+            "Uint32Array",
+            "Int32Array",
+            "Float32Array",
+            "Float64Array",
+        ];
+        let table = self.table;
+        let heap = self.heap();
+
+        let const_u128 = |v: ValueId| -> Option<u128> {
+            match self.def_of(v).map(|d| &d.kind) {
+                Some(OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Scalar {
+                    bits,
+                    ..
+                })) => Some(*bits),
+                _ => None,
+            }
+        };
+
+        let result_pointee = || -> Option<rcgjs_object::jir::types::TypeId> {
+            let res = op.result?;
+            let ty = self.ty_of(res).ok()?;
+            value::pointee_of(table, ty)
+        };
+
+        match operation {
+            StandardOperation::BoxNew => {
+                let [val] = args else {
+                    return Ok(None);
+                };
+                let Some(elem) = result_pointee() else {
+                    return Ok(None);
+                };
+                let peeled = table.peeled(elem);
+                let expr = self.expr_of(*val)?;
+                let tracked =
+                    heap.needs_box_tracking(table, elem) && value::is_slot_pointee(table, peeled);
+                let slot = if tracked && table.is_indirect(peeled) {
+                    jsast::rt_call("t_box_new_tracked", vec![expr])
+                } else {
+                    ptr::slot(jsast::array(vec![expr]), jsast::num(0))
+                };
+                Ok(Some(Lowered::value(slot)))
+            }
+            StandardOperation::TypedAlloc => {
+                let [cap_v, zeroed_v] = args else {
+                    return Ok(None);
+                };
+                let Some(elem) = result_pointee() else {
+                    return Ok(None);
+                };
+                let peeled = table.peeled(elem);
+                let cap = self.expr_of(*cap_v)?;
+                if let Some(k) = table
+                    .get(elem)
+                    .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
+                {
+                    let buf = jsast::new(jsast::id(TA_CTORS[k as usize]), vec![cap]);
+                    return Ok(Some(Lowered::value(ptr::slot(buf, jsast::num(0)))));
+                }
+                let tracked =
+                    heap.needs_box_tracking(table, elem) && value::is_slot_pointee(table, peeled);
+                let needs_shell = table.is_indirect(peeled)
+                    || matches!(
+                        value::kind(table, peeled),
+                        Some(rcgjs_object::jir::types::TypeKind::Array { .. })
+                    );
+                if const_u128(*zeroed_v) == Some(0) {
+                    if !needs_shell || const_u128(*cap_v).is_some_and(|n| n != 1) {
+                        let buf = jsast::new(jsast::id("Array"), vec![cap]);
+                        return Ok(Some(Lowered::value(ptr::slot(buf, jsast::num(0)))));
+                    }
+                    let shell_expr = value::zero_value(table, self.interns, elem);
+                    if const_u128(*cap_v) == Some(1) {
+                        if let Some(shell) = shell_expr {
+                            let slot = if tracked {
+                                jsast::rt_call("t_box_new_tracked", vec![shell])
+                            } else {
+                                ptr::slot(jsast::array(vec![shell]), jsast::num(0))
+                            };
+                            return Ok(Some(Lowered::value(slot)));
+                        }
+                        let buf = jsast::new(jsast::id("Array"), vec![jsast::num(1)]);
+                        return Ok(Some(Lowered::value(ptr::slot(buf, jsast::num(0)))));
+                    }
+                    if let Some(shell) = shell_expr {
+                        let mut call_args = vec![cap, jsast::arrow(Vec::new(), shell)];
+                        if tracked {
+                            call_args.push(Expr::Bool(true));
+                        }
+                        return Ok(Some(Lowered::value(jsast::rt_call(
+                            "t_alloc_arr",
+                            call_args,
+                        ))));
+                    }
+                    let buf = jsast::new(jsast::id("Array"), vec![cap]);
+                    return Ok(Some(Lowered::value(ptr::slot(buf, jsast::num(0)))));
+                }
+                let zeroed = self.expr_of(*zeroed_v)?;
+                let mk = self.zero_factory(elem);
+                let mut call_args = vec![cap, zeroed, mk];
+                if tracked {
+                    call_args.push(Expr::Bool(true));
+                }
+                Ok(Some(Lowered::value(jsast::rt_call("t_alloc_z", call_args))))
+            }
+            StandardOperation::TypedRealloc => {
+                let [ptr_v, old_cap_v, new_cap_v] = args else {
+                    return Ok(None);
+                };
+                let Some(elem) = result_pointee() else {
+                    return Ok(None);
+                };
+                let peeled = table.peeled(elem);
+                let p = self.expr_of(*ptr_v)?;
+                let old_cap = self.expr_of(*old_cap_v)?;
+                let new_cap = self.expr_of(*new_cap_v)?;
+                let checked = heap.non_rc_raw_alloc_reachable;
+                if let Some(k) = table
+                    .get(elem)
+                    .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
+                {
+                    let helper = if checked {
+                        "t_realloc_ta_checked"
+                    } else {
+                        "t_realloc_ta"
+                    };
+                    return Ok(Some(Lowered::value(jsast::rt_call(
+                        helper,
+                        vec![p, old_cap, new_cap, jsast::num(f64::from(k))],
+                    ))));
+                }
+                if !checked {
+                    Ok(Some(Lowered::value(jsast::rt_call(
+                        "t_realloc_arr",
+                        vec![p, new_cap],
+                    ))))
+                } else {
+                    let es = table
+                        .get(peeled)
+                        .and_then(|d| d.layout.size)
+                        .unwrap_or(1)
+                        .max(1);
+                    Ok(Some(Lowered::value(jsast::rt_call(
+                        "t_realloc_arr_checked",
+                        vec![p, old_cap, new_cap, jsast::num(es as f64)],
+                    ))))
+                }
+            }
+            StandardOperation::TypedDealloc => {
+                let Some(&ptr_v) = args.first() else {
+                    return Ok(None);
+                };
+                if !heap.non_rc_raw_alloc_reachable {
+                    return Ok(Some(Lowered::Done(Vec::new())));
+                }
+                let p = self.expr_of(ptr_v)?;
+                Ok(Some(Lowered::Done(vec![jsast::expr_stmt(jsast::rt_call(
+                    "t_dealloc_maybe",
+                    vec![p],
+                ))])))
+            }
+            StandardOperation::TypedDeallocRaw => {
+                let Some(&ptr_v) = args.first() else {
+                    return Ok(None);
+                };
+                if !heap.raw_alloc_reachable {
+                    return Ok(Some(Lowered::Done(Vec::new())));
+                }
+                let p = self.expr_of(ptr_v)?;
+                Ok(Some(Lowered::Done(vec![jsast::expr_stmt(jsast::rt_call(
+                    "t_dealloc_maybe",
+                    vec![p],
+                ))])))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Three-way `Ordering` result expression `a < b ? Less : a === b ? Equal : Greater`.
     fn str_cmp_expr(
         &self,
@@ -1130,6 +1332,13 @@ impl JsCx<'_> {
                     {
                         let src_expr = self.expr_of(src)?;
                         let mut stmts = Vec::new();
+                        let heap = self.heap();
+                        if heap.typed_heap_enabled && !heap.non_rc_raw_alloc_reachable {
+                            if !jsast::is_droppable(&src_expr) {
+                                stmts.push(jsast::expr_stmt(src_expr));
+                            }
+                            return Ok(Lowered::Done(stmts));
+                        }
                         let base = if matches!(src_expr, Expr::Ident(_)) {
                             src_expr
                         } else {
@@ -1140,12 +1349,14 @@ impl JsCx<'_> {
                         let cap = layout.member(base.clone(), &layout.cap);
                         let ptr = layout.member(base, &layout.ptr);
                         if cap != jsast::num(0) {
+                            let dealloc_call = if heap.typed_heap_enabled {
+                                jsast::rt_call("t_dealloc_maybe", vec![ptr])
+                            } else {
+                                jsast::rt_call("dealloc", vec![ptr, cap.clone(), jsast::num(1)])
+                            };
                             stmts.push(jsast::if_(
-                                jsast::binary(jsast::BinOp::StrictNe, cap.clone(), jsast::num(0)),
-                                vec![jsast::expr_stmt(jsast::rt_call(
-                                    "dealloc",
-                                    vec![ptr, cap, jsast::num(1)],
-                                ))],
+                                jsast::binary(jsast::BinOp::StrictNe, cap, jsast::num(0)),
+                                vec![jsast::expr_stmt(dealloc_call)],
                             ));
                         }
                         return Ok(Lowered::Done(stmts));

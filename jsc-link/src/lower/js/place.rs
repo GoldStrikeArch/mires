@@ -439,11 +439,7 @@ impl<'a> JsCx<'a> {
 
     /// `pointer.buf[pointer.off]`, hoisting non-duplicable `pointer` expressions once via `reread`.
     fn slot_element(&self, pointer: Expr) -> Expr {
-        let (setup, slot) = self.reread(pointer, &[BUF, OFF]);
-        jsast::index(
-            super::ptr::sequenced(setup, ptr::slot_buf(slot.clone())),
-            ptr::slot_off(slot),
-        )
+        super::ptr::slot_element_unwrapped(self, pointer)
     }
 
     /// One element of a slot-pointed `[E; N]` (plain slot or window slot), normalized once

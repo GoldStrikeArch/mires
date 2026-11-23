@@ -103,6 +103,8 @@ pub struct JsCx<'a> {
     /// Whether whole-program analysis determined that wide (`size > 1`) storage may be observed
     /// through 1-byte pointers/slices (`MIRES-008` lazy-proxy path).
     pub byte_views: crate::analysis::byte_views::ByteViewPlan,
+    /// Whole-program Tier A typed-heap and `_boxes` tracking plan (`analysis::heap`).
+    pub heap: Option<&'a crate::analysis::heap::HeapPlan>,
     /// Whether this function carries nested native Vec/String fields needing carrier-safe clone.
     pub nested_clone: crate::lower::NestedClone,
     /// Whole-program ASCII provenance facts for this function (`js-str=bytes`).
@@ -196,6 +198,7 @@ impl<'a> JsCx<'a> {
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             hoists_bigints: false,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            heap: None,
             nested_clone: crate::lower::NestedClone::default(),
             ascii: None,
             instantiations: RefCell::new(BTreeMap::new()),
@@ -271,6 +274,19 @@ impl<'a> JsCx<'a> {
     ) -> Self {
         self.byte_views = byte_views;
         self
+    }
+
+    /// The same context, carrying the whole-program Tier A typed-heap and `_boxes` plan.
+    pub fn with_heap(mut self, heap: Option<&'a crate::analysis::heap::HeapPlan>) -> Self {
+        self.heap = heap;
+        self
+    }
+
+    /// Returns the active whole-program [`crate::analysis::heap::HeapPlan`] (conservative default
+    /// when `None`).
+    pub fn heap(&self) -> &crate::analysis::heap::HeapPlan {
+        self.heap
+            .unwrap_or(&crate::analysis::heap::DEFAULT_HEAP_PLAN)
     }
 
     /// Exact numeric storage selected for one value in this declaration.

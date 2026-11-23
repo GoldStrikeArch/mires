@@ -82,6 +82,7 @@ pub(crate) struct ReprCx<'a> {
     pub drop_glue: &'a crate::lower::js::host::DropGlueIndex,
     pub vtables: &'a crate::lower::js::unsize::VtableIndex,
     pub byte_views: crate::analysis::byte_views::ByteViewPlan,
+    pub heap: &'a crate::analysis::heap::HeapPlan,
     pub nonthrowing_glues: &'a BTreeSet<JsName>,
 }
 
@@ -775,20 +776,21 @@ impl Planner<'_> {
         let baseline_labels = vec![None; count];
         let mut measured: BTreeMap<Vec<Option<Carrier>>, Option<ProgramCost>> =
             BTreeMap::from([(baseline_labels, Some(baseline))]);
-        let mut measure_vector = |labels: &[Option<Carrier>]| {
-            if !exact_available {
-                return None;
-            }
-            match self.build_commit(problem, labels, &ops, false) {
-                Ok(commit) => self.program_cost(&commit, &mut reuse),
-                Err((_, reason)) => {
-                    if std::env::var("RCGJS_REPR_DEBUG_COST").is_ok() {
-                        eprintln!("repr-cost: commit declined: {reason}");
-                    }
-                    None
+        let mut measure_vector_with_decline =
+            |labels: &[Option<Carrier>]| -> Result<Option<ProgramCost>, CommitDecline> {
+                if !exact_available {
+                    return Ok(None);
                 }
-            }
-        };
+                match self.build_commit(problem, labels, &ops, false) {
+                    Ok(commit) => Ok(self.program_cost(&commit, &mut reuse)),
+                    Err((failed, reason)) => {
+                        if std::env::var("RCGJS_REPR_DEBUG_COST").is_ok() {
+                            eprintln!("repr-cost: commit declined: {reason}");
+                        }
+                        Err((failed, reason))
+                    }
+                }
+            };
         let mut forced: BTreeSet<usize> = BTreeSet::new();
         let mut demoted: BTreeMap<usize, String> = BTreeMap::new();
         let mut rollbacks: BTreeMap<usize, String> = BTreeMap::new();
@@ -797,6 +799,7 @@ impl Planner<'_> {
         let mut carriers = vec![None; count];
         let mut families = 0;
         let mut economic_rounds = 0;
+        let mut rollback_rounds = 0;
         let fault = std::env::var("RCGJS_REPR_FAULT").is_ok_and(|value| value == "verify");
         let mut accepted = None;
 
@@ -860,6 +863,7 @@ impl Planner<'_> {
             let mut solo_winners: Vec<&BTreeSet<usize>> = Vec::new();
             let mut solo_failed: Vec<(usize, &BTreeSet<usize>, Option<ProgramCost>, String)> =
                 Vec::new();
+            let mut rollback_hit = false;
             for (comp_idx, component) in components.iter().enumerate() {
                 let mut labels = vec![None; count];
                 for node in component {
@@ -868,9 +872,41 @@ impl Planner<'_> {
                 let cost = if let Some(cost) = measured.get(&labels) {
                     *cost
                 } else {
-                    let cost = measure_vector(&labels);
-                    measured.insert(labels, cost);
-                    cost
+                    match measure_vector_with_decline(&labels) {
+                        Ok(cost) => {
+                            measured.insert(labels, cost);
+                            cost
+                        }
+                        Err((failed, reason)) => {
+                            if rollback_rounds < 8 {
+                                let decline = format!(
+                                    "{} {reason}",
+                                    Decline::Version(VersionDecline::CarrierCommitRollback {
+                                        reason: String::new(),
+                                    })
+                                    .code()
+                                );
+                                for region in &regions {
+                                    if region.iter().any(|node| failed.contains(node)) {
+                                        for node in region {
+                                            if carriers[*node].is_some() {
+                                                rollback_hit |= forced.insert(*node);
+                                                rollbacks
+                                                    .entry(*node)
+                                                    .or_insert_with(|| decline.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                                if rollback_hit {
+                                    rollback_rounds += 1;
+                                    break;
+                                }
+                            }
+                            measured.insert(labels, None);
+                            None
+                        }
+                    }
                 };
                 let profitable = cost.is_some_and(|cost| economics.accepts(baseline, cost));
                 if std::env::var("RCGJS_REPR_DEBUG_COST").is_ok() {
@@ -889,6 +925,9 @@ impl Planner<'_> {
                 }
                 let decline = exact_cost_decline(economics, baseline, cost);
                 solo_failed.push((comp_idx, component, cost, decline));
+            }
+            if rollback_hit {
+                continue;
             }
             // Components that strictly shrink minified program code (`bytes < baseline.bytes`)
             // can fail solo measurement solely due to the one-time fixed cost of shared runtime
@@ -917,7 +956,7 @@ impl Planner<'_> {
                 } else if let Some(cost) = measured.get(&ref_labels) {
                     *cost
                 } else {
-                    let cost = measure_vector(&ref_labels);
+                    let cost = measure_vector_with_decline(&ref_labels).ok().flatten();
                     measured.insert(ref_labels.clone(), cost);
                     cost
                 };
@@ -935,7 +974,7 @@ impl Planner<'_> {
                         let trial_cost = if let Some(cost) = measured.get(&trial_labels) {
                             *cost
                         } else {
-                            let cost = measure_vector(&trial_labels);
+                            let cost = measure_vector_with_decline(&trial_labels).ok().flatten();
                             measured.insert(trial_labels, cost);
                             cost
                         };
@@ -992,7 +1031,7 @@ impl Planner<'_> {
             let full_cost = if let Some(cost) = measured.get(&carriers) {
                 *cost
             } else {
-                let cost = measure_vector(&carriers);
+                let cost = measure_vector_with_decline(&carriers).ok().flatten();
                 measured.insert(carriers.clone(), cost);
                 cost
             };
@@ -1707,6 +1746,7 @@ impl Planner<'_> {
             call_retargets,
             bigints: None,
             byte_views: self.cx.byte_views,
+            heap: Some(self.cx.heap),
             nested_clone: crate::lower::NestedClone::default(),
         })
     }
@@ -4421,12 +4461,14 @@ mod tests {
         let vtables = crate::lower::js::unsize::VtableIndex::new();
         let opts = crate::opts::Opts::default();
         let nonthrowing_glues = BTreeSet::new();
+        let heap = crate::analysis::heap::HeapPlan::default();
         let cx = ReprCx {
             opts: &opts,
             items: &items,
             drop_glue: &drop_glue,
             vtables: &vtables,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            heap: &heap,
             nonthrowing_glues: &nonthrowing_glues,
         };
         let interns_map: BTreeMap<JsName, &crate::jir::Interns> = prog

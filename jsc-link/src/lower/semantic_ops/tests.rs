@@ -2579,6 +2579,7 @@ fn assert_carrier_composition(with_slice_view: bool, owned_carrier: Option<Carri
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints: None,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            heap: None,
             nested_clone: crate::lower::NestedClone::default(),
         };
         program.push_str(&jsast::stmt_to_string(
@@ -3101,6 +3102,7 @@ fn format_site_js_in(
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let lowered = lower_func(&input, &func)

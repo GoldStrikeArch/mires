@@ -44,29 +44,54 @@ pub fn convert(
     from: Carrier,
     to: Carrier,
 ) -> Res<Expr> {
+    convert_with_heap(
+        table,
+        interns,
+        value,
+        ty,
+        from,
+        to,
+        &crate::analysis::heap::DEFAULT_HEAP_PLAN,
+    )
+}
+
+pub fn convert_with_heap(
+    table: &TypeTable,
+    interns: &Interns,
+    value: Expr,
+    ty: TypeId,
+    from: Carrier,
+    to: Carrier,
+    heap: &crate::analysis::heap::HeapPlan,
+) -> Res<Expr> {
+    let typed_tier_a = heap.typed_heap_enabled && !heap.non_rc_raw_alloc_reachable;
     match (from, to) {
         (Carrier::StringBuilder, Carrier::HostString) => Ok(jsast::member(value, "text")),
         (Carrier::HostString, Carrier::StringBuilder) => {
             Ok(jsast::rt_call("convert_host_sb", vec![value]))
         }
         (Carrier::Baseline, Carrier::HostString) => baseline_to_host(table, interns, value, ty),
-        (Carrier::HostString, Carrier::Baseline) => block_to_baseline(
-            table,
-            interns,
-            ty,
-            jsast::rt_call("convert_str_block", vec![value]),
-        ),
+        (Carrier::HostString, Carrier::Baseline) => {
+            let helper = if typed_tier_a && crate::lower::bstr::enabled() {
+                "bstr_block_typed"
+            } else {
+                "convert_str_block"
+            };
+            block_to_baseline(table, interns, ty, jsast::rt_call(helper, vec![value]))
+        }
         (Carrier::Baseline, Carrier::StringBuilder) => {
             baseline_to_builder(table, interns, value, ty)
         }
-        (Carrier::StringBuilder, Carrier::Baseline) => block_to_baseline(
-            table,
-            interns,
-            ty,
-            jsast::rt_call("convert_sb_block", vec![value]),
-        ),
+        (Carrier::StringBuilder, Carrier::Baseline) => {
+            let helper = if typed_tier_a && crate::lower::bstr::enabled() {
+                "bstr_sb_block_typed"
+            } else {
+                "convert_sb_block"
+            };
+            block_to_baseline(table, interns, ty, jsast::rt_call(helper, vec![value]))
+        }
         (Carrier::NativeVec, Carrier::Baseline) => {
-            native_vec_to_baseline(table, interns, value, ty)
+            native_vec_to_baseline(table, interns, value, ty, heap)
         }
         (Carrier::Baseline, Carrier::NativeVec) => {
             baseline_to_native_vec(table, interns, value, ty)
@@ -175,35 +200,49 @@ fn native_vec_to_baseline(
     interns: &Interns,
     value: Expr,
     ty: TypeId,
+    heap: &crate::analysis::heap::HeapPlan,
 ) -> Res<Expr> {
     let layout = VecLayout::of(table, interns, ty)?;
     let (size, scalar_kind, element) = element_info(table, ty)?;
     let (value, wrap) = once(value);
-    // A registered, element-typed heap block: baseline reads reach the buffer through
-    // `unscale`'s block registry, so a bare `{ buf, off }` record would refuse the very first
-    // deref (`__rt.convert_nv_block` mirrors an `alloc` + first-cast retype).
-    let mut args = vec![value.clone(), jsast::raw_num(size.to_string())];
-    if let Some(kind) = scalar_kind {
-        args.push(jsast::string(kind));
-    } else if table.needs_clone(element) {
-        args.push(jsast::arrow(
-            vec![super::value::CLONE_PARAM.to_string()],
-            super::value::clone_expr_with(
-                table,
-                interns,
-                element,
-                jsast::id(super::value::CLONE_PARAM),
-                crate::lower::NestedClone {
-                    vec: true,
-                    string: true,
-                    map: true,
-                },
-            ),
-        ));
-    } else if table.is_indirect(element) {
-        args.push(Expr::Bool(true));
-    }
-    let pointer = jsast::rt_call("convert_nv_block", args);
+    let pointer = if heap.typed_heap_enabled && !heap.non_rc_raw_alloc_reachable {
+        let mut args = vec![value.clone()];
+        let tv_kind = vec_tv_kind(table, ty);
+        let tracked = heap.needs_box_tracking(table, element);
+        if let Some(k) = tv_kind {
+            args.push(jsast::num(f64::from(k)));
+        } else if tracked {
+            args.push(jsast::undefined());
+            args.push(Expr::Bool(true));
+        }
+        jsast::rt_call("convert_nv_typed", args)
+    } else {
+        // A registered, element-typed heap block: baseline reads reach the buffer through
+        // `unscale`'s block registry, so a bare `{ buf, off }` record would refuse the very first
+        // deref (`__rt.convert_nv_block` mirrors an `alloc` + first-cast retype).
+        let mut args = vec![value.clone(), jsast::raw_num(size.to_string())];
+        if let Some(kind) = scalar_kind {
+            args.push(jsast::string(kind));
+        } else if table.needs_clone(element) {
+            args.push(jsast::arrow(
+                vec![super::value::CLONE_PARAM.to_string()],
+                super::value::clone_expr_with(
+                    table,
+                    interns,
+                    element,
+                    jsast::id(super::value::CLONE_PARAM),
+                    crate::lower::NestedClone {
+                        vec: true,
+                        string: true,
+                        map: true,
+                    },
+                ),
+            ));
+        } else if table.is_indirect(element) {
+            args.push(Expr::Bool(true));
+        }
+        jsast::rt_call("convert_nv_block", args)
+    };
     let length = jsast::member(value.clone(), "len");
     let capacity = jsast::member(value, "cap");
     wrap_paths(

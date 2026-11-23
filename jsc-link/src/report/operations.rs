@@ -252,7 +252,7 @@ mod tests {
         write_registry(&mut registry);
         let registry: serde_json::Value = serde_json::from_str(&registry).unwrap();
         let rows = registry.as_array().unwrap();
-        assert_eq!(rows.len(), 76);
+        assert_eq!(rows.len(), 81);
         assert_eq!(
             rows.iter()
                 .filter(|row| row["native_lowering"] == true)

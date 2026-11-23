@@ -581,6 +581,7 @@ fn lower_retargeted(
         call_retargets,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     match function::lower(&input, func, plan, region) {
@@ -1824,6 +1825,7 @@ fn a_hoisting_lowering_names_its_bigint_constants_and_widens_constant_shift_amou
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            heap: None,
             nested_clone: crate::lower::NestedClone::default(),
         };
         match function::lower(&input, &func, &plan, straight(&func)) {
@@ -2278,6 +2280,7 @@ fn if_and_while_regions_spell_tests_and_loops() {
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let lowered = function::lower(&input, &func, &plan, region()).expect("lowers with maps");
@@ -2563,6 +2566,7 @@ fn cells_slots_and_direct_calls_match_the_14_pointers_entry() {
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let err = function::lower(&input, &func, &plan, straight(&func))
@@ -3522,6 +3526,7 @@ fn asserts_call_the_panic_lang_item_with_a_location() {
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
@@ -3564,6 +3569,7 @@ fn statics_and_vtables() {
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let lowered = super::super::lower_item(&input).expect("static lowers");
@@ -3611,6 +3617,7 @@ fn statics_and_vtables() {
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let lowered = super::super::lower_item(&input).expect("vtable lowers");
@@ -3661,6 +3668,7 @@ fn a_dyn_drop_calls_vtable_slot_zero_when_it_is_not_null() {
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
@@ -3702,6 +3710,7 @@ fn unsupported_ops_decline_with_a_class() {
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let err = function::lower(&input, &func, &plan, straight(&func))
@@ -3762,6 +3771,7 @@ fn lower_with(
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     match function::lower(&input, func, plan, region) {
@@ -4094,6 +4104,7 @@ fn a_static_keyed_list_lowers_after_its_dedicated_contract_is_proven() {
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints: None,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            heap: None,
             nested_clone: crate::lower::NestedClone::default(),
         };
         function::lower(&input, &func, &plan, straight(&func))
@@ -5715,6 +5726,7 @@ fn flat_abi_i64_pair_param_with_param_cell_declares_box_instead_of_rebinding_mis
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
@@ -6213,6 +6225,7 @@ fn fuse_local_bytes_str_eliminates_roundtrip_local() {
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let lowered = function::lower(&input, &func, &plan, straight(&func)).expect("lowers");
@@ -6647,6 +6660,7 @@ fn host_string_inline_call_drop_preserves_call_and_non_adjacent_baseline_dealloc
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let js1 = jsast::stmt_to_string(
@@ -6739,6 +6753,7 @@ fn host_string_inline_call_drop_preserves_call_and_non_adjacent_baseline_dealloc
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let js2 = jsast::stmt_to_string(
@@ -6891,6 +6906,7 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let js1 = jsast::stmt_to_string(
@@ -7040,6 +7056,7 @@ fn caller_location_value_disambiguates_core_location_from_user_location_struct()
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let js3 = jsast::stmt_to_string(
@@ -8567,6 +8584,7 @@ fn const_static_field_lowers_direct_indirect_raw_nested_and_dyn_projections() {
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     assert!(
@@ -9081,6 +9099,7 @@ fn float_nan_payload_constants_preserve_bits_and_keep_canonical_nan_compact() {
         call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
         bigints: None,
         byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: None,
         nested_clone: crate::lower::NestedClone::default(),
     };
     let res = function::lower(&input, &f, &p, straight(&f));
@@ -10445,6 +10464,7 @@ fn release_speed_inlines_f2i_strips_int32_only_wraps_and_uses_typed_array_repeat
             call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
             bigints: None,
             byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+            heap: None,
             nested_clone: crate::lower::NestedClone::default(),
         };
         jsast::stmt_to_string(
@@ -10541,6 +10561,288 @@ fn release_speed_inlines_f2i_strips_int32_only_wraps_and_uses_typed_array_repeat
     assert!(
         js_arr.contains("new Uint32Array(16)"),
         "ReleaseSpeed numeric repeat >= 8 should emit TypedArray:\n{js_arr}"
+    );
+}
+
+#[test]
+fn phase3_typed_heap_lowers_hooks_plain_put_and_zero_offset_guard() {
+    use rcgjs_object::jir::semantic::StandardOperation;
+
+    let mut interns = world();
+    let f_x = interns.intern_str("x");
+    let hook_alloc = interns.intern_str("rcgjs_typed_alloc");
+    let hook_dealloc = interns.intern_str("rcgjs_typed_dealloc");
+    let hook_box = interns.intern_str("rcgjs_box_new");
+    let write_via_move = interns.intern_str("write_via_move");
+
+    let ptr_u32 = TypeId(500);
+    let js_val_adt = TypeId(501);
+    let ptr_js_val = TypeId(502);
+    let pair_adt = TypeId(503);
+    let ptr_pair = TypeId(504);
+
+    let mk_raw = |id: TypeId, pointee: TypeId| {
+        let mut d = descriptor(
+            id,
+            TypeKind::RawPointer {
+                pointee,
+                mutable: true,
+            },
+            4,
+        );
+        d.js.pointer_form = Some(PointerForm::Slot);
+        d
+    };
+    let mk_struct = |id: TypeId, def_hash: u64, peeled: TypeId, indirect: bool| {
+        let mut d = descriptor(
+            id,
+            TypeKind::Adt {
+                def: DefinitionId {
+                    crate_id: 9,
+                    local_hash: def_hash,
+                },
+                form: NominalForm::Struct,
+                args: Vec::new(),
+                variants: vec![VariantDescriptor {
+                    name: f_x,
+                    fields: vec![FieldDescriptor {
+                        key: FieldKey::Name(f_x),
+                        ty: U32,
+                        offset: 0,
+                    }],
+                    logical_discr: 0,
+                    physical_tag: None,
+                    result_ok: false,
+                    saved_local_keys: Vec::new(),
+                }],
+                niche: None,
+            },
+            4,
+        );
+        d.js.peeled = peeled;
+        d.js.is_indirect = indirect;
+        d.js.needs_clone = indirect;
+        d
+    };
+
+    interns.types.insert(mk_raw(ptr_u32, U32));
+    // Transparent wrapper around `u32` (models `mires_js::JsValue`), must NOT pick `Uint32Array`.
+    interns.types.insert(mk_struct(js_val_adt, 1, U32, false));
+    interns.types.insert(mk_raw(ptr_js_val, js_val_adt));
+    interns.types.insert(mk_struct(pair_adt, 2, pair_adt, true));
+    interns.types.insert(mk_raw(ptr_pair, pair_adt));
+
+    let tier_a = crate::analysis::heap::HeapPlan {
+        typed_heap_enabled: true,
+        raw_alloc_reachable: false,
+        non_rc_raw_alloc_reachable: false,
+        any_boxed: false,
+        boxed_defs: BTreeSet::new(),
+        boxed_non_adt: false,
+        all_adts_boxed: false,
+    };
+    let speed_opts = Opts {
+        profile: Some(crate::opts::Profile::ReleaseSpeed),
+        ..Opts::default()
+    };
+    let items = super::host::ItemIndex::new();
+    let vtables = super::unsize::VtableIndex::new();
+    let lower_with =
+        |name: &str, func: &Func, plan: &Plan, region, heap: &crate::analysis::heap::HeapPlan| {
+            let sum = summary(&[]);
+            let body = body_of(BodyKind::Function, func.sig.clone());
+            let js_name = JsName::new(name.to_owned());
+            let input = LowerInput {
+                name: &js_name,
+                summary: &sum,
+                body: &body,
+                origins: None,
+                interns: &interns,
+                table: &interns.types,
+                opts: &speed_opts,
+                items: &items,
+                drop_glue: super::host::EMPTY_DROP_GLUE,
+                vtables: &vtables,
+                spills: &[],
+                abi: None,
+                physical: None,
+                call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+                bigints: None,
+                byte_views: crate::analysis::byte_views::ByteViewPlan {
+                    raw_byte_derefs: false,
+                    elide_scale_scalar: true,
+                },
+                heap: Some(heap),
+                nested_clone: crate::lower::NestedClone::default(),
+            };
+            jsast::stmt_to_string(
+                &function::lower(&input, func, plan, region)
+                    .expect("lower")
+                    .decl,
+            )
+        };
+
+    // 1. TypedAlloc<u32> -> Uint32Array, TypedAlloc<JsValue> -> Array, BoxNew + TypedDealloc -> no-op.
+    let e = RBlockId(0);
+    let mut b = FuncBuilder::new(item(90), signature(vec![USIZE], ptr_pair));
+    let cap = b.param(USIZE, NO_ORIGIN);
+    let f_bool = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 1 }),
+        BOOL,
+        NO_ORIGIN,
+    );
+    let p_u32 = b.op(
+        e,
+        OpKind::Call {
+            callee: Callee::Direct {
+                item: item(91),
+                link_name: hook_alloc,
+            },
+            function: None,
+            args: vec![cap, f_bool],
+            track_caller: None,
+            semantic: CallSemantic::Standard(StandardOperation::TypedAlloc),
+            host: None,
+        },
+        ptr_u32,
+        NO_ORIGIN,
+    );
+    let p_js = b.op(
+        e,
+        OpKind::Call {
+            callee: Callee::Direct {
+                item: item(92),
+                link_name: hook_alloc,
+            },
+            function: None,
+            args: vec![cap, f_bool],
+            track_caller: None,
+            semantic: CallSemantic::Standard(StandardOperation::TypedAlloc),
+            host: None,
+        },
+        ptr_js_val,
+        NO_ORIGIN,
+    );
+    b.effect(
+        e,
+        OpKind::Call {
+            callee: Callee::Direct {
+                item: item(93),
+                link_name: hook_dealloc,
+            },
+            function: None,
+            args: vec![p_u32, cap],
+            track_caller: None,
+            semantic: CallSemantic::Standard(StandardOperation::TypedDealloc),
+            host: None,
+        },
+        NO_ORIGIN,
+    );
+    b.effect(
+        e,
+        OpKind::Call {
+            callee: Callee::Direct {
+                item: item(94),
+                link_name: hook_dealloc,
+            },
+            function: None,
+            args: vec![p_js, cap],
+            track_caller: None,
+            semantic: CallSemantic::Standard(StandardOperation::TypedDealloc),
+            host: None,
+        },
+        NO_ORIGIN,
+    );
+    let pair_val = b.op(
+        e,
+        OpKind::Aggregate {
+            ty: pair_adt,
+            variant: 0,
+            active_field: None,
+            fields: vec![cap],
+        },
+        pair_adt,
+        NO_ORIGIN,
+    );
+    let boxed = b.op(
+        e,
+        OpKind::Call {
+            callee: Callee::Direct {
+                item: item(95),
+                link_name: hook_box,
+            },
+            function: None,
+            args: vec![pair_val],
+            track_caller: None,
+            semantic: CallSemantic::Standard(StandardOperation::BoxNew),
+            host: None,
+        },
+        ptr_pair,
+        NO_ORIGIN,
+    );
+    b.terminate(e, RTerm::Return(Some(boxed)));
+    let f = b.finish();
+    let pl = plan_of(&f, &[(0, "cap"), (p_u32.0, "pu"), (p_js.0, "pj")]);
+    let js = lower_with("tier_a_allocs", &f, &pl, straight(&f), &tier_a);
+    assert!(js.contains("new Uint32Array(cap)"), "{js}");
+    assert!(js.contains("new Array(cap)"), "{js}");
+    assert!(!js.contains("rcgjs_typed_"), "{js}");
+    assert!(!js.contains("t_dealloc"), "{js}");
+    assert!(js.contains("{ buf: [{ x: cap }], off: 0 }"), "{js}");
+
+    // 2. Dynamic `ptr_add` guards `n === 0` when returned, and folds directly to `_put_plain(p.buf, p.off + n, v)` on write.
+    let mut b2 = FuncBuilder::new(
+        item(96),
+        signature(vec![ptr_pair, USIZE, pair_adt], ptr_pair),
+    );
+    let p = b2.param(ptr_pair, NO_ORIGIN);
+    let n = b2.param(USIZE, NO_ORIGIN);
+    let v = b2.param(pair_adt, NO_ORIGIN);
+    let dst = b2.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Offset,
+            l: p,
+            r: n,
+            ty: ptr_pair,
+        },
+        ptr_pair,
+        NO_ORIGIN,
+    );
+    b2.effect(
+        e,
+        OpKind::Intrinsic {
+            name: write_via_move,
+            types: vec![pair_adt],
+            fallback: None,
+            args: vec![dst, v],
+            track_caller: None,
+        },
+        NO_ORIGIN,
+    );
+    let ret_p = b2.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Offset,
+            l: p,
+            r: n,
+            ty: ptr_pair,
+        },
+        ptr_pair,
+        NO_ORIGIN,
+    );
+    b2.terminate(e, RTerm::Return(Some(ret_p)));
+    let f2 = b2.finish();
+    let pl2 = plan_of(&f2, &[(0, "p"), (1, "n"), (2, "v")]);
+    let js2 = lower_with("put_and_offset", &f2, &pl2, straight(&f2), &tier_a);
+    assert!(
+        js2.contains("__rt._put_plain(p.buf, p.off + n, v)"),
+        "write through dynamic offset must fold to _put_plain without slot allocation:\n{js2}"
+    );
+    assert!(
+        js2.contains("n === 0 ? p : { buf: p.buf, off: p.off + n }"),
+        "returned dynamic offset must guard zero count for dangling pointers:\n{js2}"
     );
 }
 

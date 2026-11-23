@@ -49,7 +49,7 @@ impl<'a> JsCx<'a> {
                     return jsast::rt_call("read_byte", args);
                 }
             }
-            ptr::slot_element(pointer)
+            slot_element_unwrapped(self, pointer)
         } else {
             pointer
         }
@@ -83,7 +83,7 @@ impl<'a> JsCx<'a> {
                 vec![pointer, value],
             ))]);
         }
-        let element = ptr::slot_element(pointer);
+        let element = slot_element_unwrapped(self, pointer);
         if table.is_indirect(pointee) {
             return self.write_indirect(pointee, element, value);
         }
@@ -102,10 +102,20 @@ impl<'a> JsCx<'a> {
                 "mutating a `&mut str` is not supported by rustc_codegen_js".to_owned(),
             ))]);
         }
+        let heap = self.heap();
+        let put_helper = if heap.typed_heap_enabled && !heap.non_rc_raw_alloc_reachable {
+            if heap.needs_box_tracking(table, pointee) {
+                "_put_tracked"
+            } else {
+                "_put_plain"
+            }
+        } else {
+            "_put"
+        };
         let call = match target {
-            Expr::Index(base, key) => jsast::rt_call("_put", vec![*base, *key, value]),
+            Expr::Index(base, key) => jsast::rt_call(put_helper, vec![*base, *key, value]),
             Expr::Member(base, name) => {
-                jsast::rt_call("_put", vec![*base, jsast::string(name), value])
+                jsast::rt_call(put_helper, vec![*base, jsast::string(name), value])
             }
             target => jsast::rt_call("overwrite", vec![target, value]),
         };
@@ -121,22 +131,49 @@ impl<'a> JsCx<'a> {
         if size == Some(0) {
             return pointer;
         }
+        let count_nonzero_const = matches!(count, Expr::Num(n) if n != 0.0);
         let reads: &[&str] = if size == Some(1) {
             &[BUF, OFF, ptr::SCALE]
         } else {
             &[BUF, OFF]
         };
-        let (setup, pointer) = self.reread(pointer, reads);
-        let off = jsast::binary(BinOp::Add, ptr::slot_off(pointer.clone()), count);
+        let (p_setup, pointer) = self.reread(pointer, reads);
+        let (c_setup, count) = if count_nonzero_const {
+            (None, count)
+        } else {
+            self.reread(count, &[])
+        };
+        let off = jsast::binary(BinOp::Add, ptr::slot_off(pointer.clone()), count.clone());
         let slot = match size {
             Some(1) => jsast::object_of(vec![
                 (BUF, ptr::slot_buf(pointer.clone())),
                 (OFF, off),
-                (ptr::SCALE, ptr::slot_scale(pointer)),
+                (ptr::SCALE, ptr::slot_scale(pointer.clone())),
             ]),
-            _ => ptr::slot(ptr::slot_buf(pointer), off),
+            _ => ptr::slot(ptr::slot_buf(pointer.clone()), off),
         };
-        sequenced(setup, slot)
+        let result = if count_nonzero_const {
+            slot
+        } else {
+            jsast::cond(
+                jsast::binary(BinOp::StrictEq, count, jsast::num(0)),
+                pointer,
+                slot,
+            )
+        };
+        let mut seq = Vec::new();
+        if let Some(s) = p_setup {
+            seq.push(s);
+        }
+        if let Some(s) = c_setup {
+            seq.push(s);
+        }
+        if seq.is_empty() {
+            result
+        } else {
+            seq.push(result);
+            jsast::seq(seq)
+        }
     }
 
     /// `pointer.wrapping_add(count)` (`ptr.rs::wrapping_add`).
@@ -238,6 +275,14 @@ impl<'a> JsCx<'a> {
                 vec![CLONE_PARAM.to_string()],
                 value::clone_expr(self.table, self.interns, pointee, jsast::id(CLONE_PARAM)),
             ));
+            let heap = self.heap();
+            if !overlapping
+                && heap.typed_heap_enabled
+                && !heap.non_rc_raw_alloc_reachable
+                && !heap.needs_box_tracking(self.table, pointee)
+            {
+                args.push(Expr::Bool(true));
+            }
         }
         vec![jsast::expr_stmt(jsast::rt_call(name, args))]
     }
@@ -289,7 +334,7 @@ impl<'a> JsCx<'a> {
     }
 
     /// The zero element factory `__rt.unscale`/`retype` take (`alloc_support.rs::zero_factory`).
-    fn zero_factory(&self, ty: TypeId) -> Expr {
+    pub(super) fn zero_factory(&self, ty: TypeId) -> Expr {
         match value::zero_value(self.table, self.interns, ty) {
             Some(value) => jsast::arrow(Vec::new(), value),
             None => jsast::null(),
@@ -1289,6 +1334,66 @@ pub fn sequenced(setup: Option<Expr>, value: Expr) -> Expr {
         Some(setup) => jsast::seq(vec![setup, value]),
         None => value,
     }
+}
+
+/// Collapses a zero-offset guard `c === 0 ? p : { buf: p.buf, off: p.off + c }` emitted by
+/// [`JsCx::ptr_add`] when the pointer is immediately dereferenced (a dereferenced pointer cannot
+/// be dangling, so both arms evaluate to `p.buf[p.off + c]` with zero slot allocation).
+pub(super) fn unwrap_offset_cond(expr: Expr) -> Expr {
+    match expr {
+        Expr::Cond(cond, _then_expr, else_expr)
+            if matches!(
+                cond.as_ref(),
+                Expr::Binary(BinOp::StrictEq, _, zero) if **zero == jsast::num(0)
+            ) && matches!(else_expr.as_ref(), Expr::Object(_)) =>
+        {
+            *else_expr
+        }
+        Expr::Seq(mut items) if !items.is_empty() => {
+            let last = items.pop().expect("non-empty seq");
+            items.push(unwrap_offset_cond(last));
+            Expr::Seq(items)
+        }
+        other => other,
+    }
+}
+
+/// Lowers `pointer.buf[pointer.off]` for a dereferenced slot, collapsing any `ptr_add` zero-guard
+/// and folding `{ buf, off }` object literals (including after a `Seq` setup) directly to
+/// `buf[off]` without allocating a temporary slot object.
+pub(super) fn slot_element_unwrapped(cx: &JsCx<'_>, pointer: Expr) -> Expr {
+    let pointer = unwrap_offset_cond(pointer);
+    let (mut prefix, tail) = peel_seq(pointer);
+    if let Expr::Object(fields) = &tail {
+        let buf = fields
+            .iter()
+            .find(|(k, _)| k == BUF)
+            .map(|(_, v)| v.clone());
+        let off = fields
+            .iter()
+            .find(|(k, _)| k == OFF)
+            .map(|(_, v)| v.clone());
+        if let (Some(buf), Some(off)) = (buf, off) {
+            let buf_expr = if prefix.is_empty() {
+                buf
+            } else {
+                prefix.push(buf);
+                jsast::seq(prefix)
+            };
+            return jsast::index(buf_expr, off);
+        }
+    }
+    let rebuilt = if prefix.is_empty() {
+        tail
+    } else {
+        prefix.push(tail);
+        jsast::seq(prefix)
+    };
+    let (setup, slot) = cx.reread(rebuilt, &[BUF, OFF]);
+    jsast::index(
+        sequenced(setup, ptr::slot_buf(slot.clone())),
+        ptr::slot_off(slot),
+    )
 }
 
 fn peel_seq(expr: Expr) -> (Vec<Expr>, Expr) {

@@ -1,0 +1,820 @@
+diff -ruN a/library/alloc/src/alloc.rs b/library/alloc/src/alloc.rs
+--- a/library/alloc/src/alloc.rs	2026-11-23 20:06:40
++++ b/library/alloc/src/alloc.rs	2026-11-23 20:39:41
+@@ -662,3 +662,297 @@
+         )
+     }
+ }
++
++
++/// Compiler-recognized typed heap allocation for `Global` (`RawVec<T, Global>`, `Box<T, Global>`).
++/// Fallback body delegates to `Global` so custom `#[global_allocator]`, `byte_views`, and
++/// non-`ReleaseSpeed` profiles preserve exact standard semantics.
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_typed_alloc"]
++pub(crate) unsafe fn rcgjs_typed_alloc<T>(cap: usize, zeroed: bool) -> *mut T {
++    let Ok(layout) = Layout::array::<T>(cap) else {
++        return core::ptr::null_mut();
++    };
++    let res = if zeroed { Global.allocate_zeroed(layout) } else { Global.allocate(layout) };
++    match res {
++        Ok(ptr) => ptr.as_mut_ptr().cast::<T>(),
++        Err(_) => core::ptr::null_mut(),
++    }
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_typed_realloc"]
++pub(crate) unsafe fn rcgjs_typed_realloc<T>(
++    ptr: *mut T,
++    old_cap: usize,
++    new_cap: usize,
++) -> *mut T {
++    let Ok(old_layout) = Layout::array::<T>(old_cap) else {
++        return core::ptr::null_mut();
++    };
++    let Ok(new_layout) = Layout::array::<T>(new_cap) else {
++        return core::ptr::null_mut();
++    };
++    let Some(nn) = NonNull::new(ptr.cast::<u8>()) else {
++        return core::ptr::null_mut();
++    };
++    let res = unsafe {
++        if new_cap >= old_cap {
++            Global.grow(nn, old_layout, new_layout)
++        } else {
++            Global.shrink(nn, old_layout, new_layout)
++        }
++    };
++    match res {
++        Ok(p) => p.as_mut_ptr().cast::<T>(),
++        Err(_) => core::ptr::null_mut(),
++    }
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_typed_dealloc"]
++pub(crate) unsafe fn rcgjs_typed_dealloc<T>(ptr: *mut T, cap: usize) {
++    if cap == 0 || core::mem::size_of::<T>() == 0 {
++        return;
++    }
++    if let (Some(nn), Ok(layout)) = (NonNull::new(ptr.cast::<u8>()), Layout::array::<T>(cap)) {
++        unsafe { Global.deallocate(nn, layout) };
++    }
++}
++
++#[cfg(not(no_global_oom_handling))]
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_box_new"]
++pub(crate) unsafe fn rcgjs_box_new<T>(x: T) -> *mut T {
++    let layout = Layout::new::<T>();
++    let ptr = match Global.allocate(layout) {
++        Ok(ptr) => ptr.as_mut_ptr().cast::<T>(),
++        Err(_) => handle_alloc_error(layout),
++    };
++    unsafe { core::intrinsics::write_via_move(ptr, x) };
++    ptr
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_typed_dealloc_raw"]
++pub(crate) unsafe fn rcgjs_typed_dealloc_raw(ptr: *mut u8, layout: Layout) {
++    if layout.size() == 0 {
++        return;
++    }
++    if let Some(nn) = NonNull::new(ptr) {
++        unsafe { Global.deallocate(nn, layout) };
++    }
++}
++
++#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++pub(crate) const trait ManagedAlloc<T>: [const] Allocator {
++    fn alloc_elems(
++        &self,
++        cap: usize,
++        zeroed: bool,
++        layout: Layout,
++    ) -> Result<NonNull<T>, AllocError>;
++
++    unsafe fn realloc_elems(
++        &self,
++        ptr: NonNull<T>,
++        old_cap: usize,
++        new_cap: usize,
++        old_layout: Layout,
++        new_layout: Layout,
++    ) -> Result<NonNull<T>, AllocError>;
++
++    unsafe fn dealloc_elems(&self, ptr: NonNull<T>, cap: usize, layout: Layout);
++}
++
++#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++const impl<T, A: [const] Allocator> ManagedAlloc<T> for A {
++    #[inline]
++    default fn alloc_elems(
++        &self,
++        _cap: usize,
++        zeroed: bool,
++        layout: Layout,
++    ) -> Result<NonNull<T>, AllocError> {
++        let res = if zeroed { self.allocate_zeroed(layout) } else { self.allocate(layout) };
++        match res {
++            Ok(ptr) => Ok(ptr.cast()),
++            Err(e) => Err(e),
++        }
++    }
++
++    #[inline]
++    default unsafe fn realloc_elems(
++        &self,
++        ptr: NonNull<T>,
++        old_cap: usize,
++        new_cap: usize,
++        old_layout: Layout,
++        new_layout: Layout,
++    ) -> Result<NonNull<T>, AllocError> {
++        let res = unsafe {
++            if new_cap >= old_cap {
++                self.grow(ptr.cast(), old_layout, new_layout)
++            } else {
++                self.shrink(ptr.cast(), old_layout, new_layout)
++            }
++        };
++        match res {
++            Ok(p) => Ok(p.cast()),
++            Err(e) => Err(e),
++        }
++    }
++
++    #[inline]
++    default unsafe fn dealloc_elems(&self, ptr: NonNull<T>, _cap: usize, layout: Layout) {
++        unsafe { self.deallocate(ptr.cast(), layout) }
++    }
++}
++
++#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++const impl<T> ManagedAlloc<T> for Global {
++    #[inline]
++    fn alloc_elems(
++        &self,
++        cap: usize,
++        zeroed: bool,
++        layout: Layout,
++    ) -> Result<NonNull<T>, AllocError> {
++        #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++        const fn ct<T>(
++            _cap: usize,
++            zeroed: bool,
++            layout: Layout,
++        ) -> Result<NonNull<T>, AllocError> {
++            match Global::alloc_impl_const(layout, zeroed) {
++                Ok(p) => Ok(p.cast()),
++                Err(e) => Err(e),
++            }
++        }
++        #[inline]
++        fn rt<T>(cap: usize, zeroed: bool, _layout: Layout) -> Result<NonNull<T>, AllocError> {
++            let ptr = unsafe { rcgjs_typed_alloc::<T>(cap, zeroed) };
++            NonNull::new(ptr).ok_or(AllocError)
++        }
++        core::intrinsics::const_eval_select((cap, zeroed, layout), ct::<T>, rt::<T>)
++    }
++
++    #[inline]
++    unsafe fn realloc_elems(
++        &self,
++        ptr: NonNull<T>,
++        old_cap: usize,
++        new_cap: usize,
++        old_layout: Layout,
++        new_layout: Layout,
++    ) -> Result<NonNull<T>, AllocError> {
++        #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++        const fn ct<T>(
++            slf: &Global,
++            ptr: NonNull<T>,
++            _old_cap: usize,
++            _new_cap: usize,
++            old_layout: Layout,
++            new_layout: Layout,
++        ) -> Result<NonNull<T>, AllocError> {
++            match slf.grow_shrink_impl_const(ptr.cast(), old_layout, new_layout, false) {
++                Ok(p) => Ok(p.cast()),
++                Err(e) => Err(e),
++            }
++        }
++        #[inline]
++        fn rt<T>(
++            _slf: &Global,
++            ptr: NonNull<T>,
++            old_cap: usize,
++            new_cap: usize,
++            _old_layout: Layout,
++            _new_layout: Layout,
++        ) -> Result<NonNull<T>, AllocError> {
++            let next = unsafe { rcgjs_typed_realloc::<T>(ptr.as_ptr(), old_cap, new_cap) };
++            NonNull::new(next).ok_or(AllocError)
++        }
++        core::intrinsics::const_eval_select(
++            (self, ptr, old_cap, new_cap, old_layout, new_layout),
++            ct::<T>,
++            rt::<T>,
++        )
++    }
++
++    #[inline]
++    unsafe fn dealloc_elems(&self, ptr: NonNull<T>, cap: usize, layout: Layout) {
++        #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++        const fn ct<T>(ptr: NonNull<T>, _cap: usize, layout: Layout) {
++            Global::deallocate_impl_const(ptr.cast(), layout);
++        }
++        #[inline]
++        fn rt<T>(ptr: NonNull<T>, cap: usize, _layout: Layout) {
++            unsafe { rcgjs_typed_dealloc::<T>(ptr.as_ptr(), cap) }
++        }
++        core::intrinsics::const_eval_select((ptr, cap, layout), ct::<T>, rt::<T>)
++    }
++}
++
++#[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++const impl<T> ManagedAlloc<T> for &Global {
++    #[inline]
++    fn alloc_elems(
++        &self,
++        cap: usize,
++        zeroed: bool,
++        layout: Layout,
++    ) -> Result<NonNull<T>, AllocError> {
++        <Global as ManagedAlloc<T>>::alloc_elems(*self, cap, zeroed, layout)
++    }
++
++    #[inline]
++    unsafe fn realloc_elems(
++        &self,
++        ptr: NonNull<T>,
++        old_cap: usize,
++        new_cap: usize,
++        old_layout: Layout,
++        new_layout: Layout,
++    ) -> Result<NonNull<T>, AllocError> {
++        unsafe {
++            <Global as ManagedAlloc<T>>::realloc_elems(
++                *self, ptr, old_cap, new_cap, old_layout, new_layout,
++            )
++        }
++    }
++
++    #[inline]
++    unsafe fn dealloc_elems(&self, ptr: NonNull<T>, cap: usize, layout: Layout) {
++        unsafe { <Global as ManagedAlloc<T>>::dealloc_elems(*self, ptr, cap, layout) }
++    }
++}
++
++pub(crate) trait ManagedDealloc: Allocator {
++    unsafe fn deallocate_managed(&self, ptr: NonNull<u8>, layout: Layout);
++}
++
++impl<A: Allocator> ManagedDealloc for A {
++    #[inline]
++    default unsafe fn deallocate_managed(&self, ptr: NonNull<u8>, layout: Layout) {
++        unsafe { self.deallocate(ptr, layout) }
++    }
++}
++
++impl ManagedDealloc for Global {
++    #[inline]
++    unsafe fn deallocate_managed(&self, ptr: NonNull<u8>, layout: Layout) {
++        unsafe { rcgjs_typed_dealloc_raw(ptr.as_ptr(), layout) }
++    }
++}
++
++impl ManagedDealloc for &Global {
++    #[inline]
++    unsafe fn deallocate_managed(&self, ptr: NonNull<u8>, layout: Layout) {
++        unsafe { rcgjs_typed_dealloc_raw(ptr.as_ptr(), layout) }
++    }
++}
+diff -ruN a/library/alloc/src/boxed/convert.rs b/library/alloc/src/boxed/convert.rs
+--- a/library/alloc/src/boxed/convert.rs	2026-11-23 21:04:15
++++ b/library/alloc/src/boxed/convert.rs	2026-11-23 21:04:28
+@@ -74,7 +74,7 @@
+     /// ```
+     #[inline]
+     fn from(slice: &[T]) -> Box<[T]> {
+-        Box::clone_from_ref(slice)
++        Vec::from(slice).into_boxed_slice()
+     }
+ }
+ 
+@@ -135,7 +135,7 @@
+     /// ```
+     #[inline]
+     fn from(s: &str) -> Box<str> {
+-        Box::clone_from_ref(s)
++        String::from(s).into_boxed_str()
+     }
+ }
+ 
+diff -ruN a/library/alloc/src/boxed.rs b/library/alloc/src/boxed.rs
+--- a/library/alloc/src/boxed.rs	2026-11-23 20:06:40
++++ b/library/alloc/src/boxed.rs	2026-11-23 20:28:43
+@@ -286,12 +286,12 @@
+     #[rustc_diagnostic_item = "box_new"]
+     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+     pub fn new(x: T) -> Self {
+-        // This is `Box::new_uninit` but inlined to avoid build time regressions.
+-        let ptr = box_new_uninit(<T as SizedTypeProperties>::LAYOUT) as *mut T;
+-        // Nothing below can panic so we do not have to worry about deallocating `ptr`.
+-        // SAFETY: we just allocated the box to store `x`.
+-        unsafe { core::intrinsics::write_via_move(ptr, x) };
+-        // SAFETY: we just initialized `b`.
++        if T::IS_ZST {
++            let ptr = NonNull::<T>::dangling().as_ptr();
++            unsafe { core::intrinsics::write_via_move(ptr, x) };
++            return unsafe { mem::transmute(ptr) };
++        }
++        let ptr = unsafe { crate::alloc::rcgjs_box_new(x) };
+         unsafe { mem::transmute(ptr) }
+     }
+ 
+@@ -314,12 +314,24 @@
+     #[inline(always)]
+     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
+     pub const fn new_uninit() -> Box<mem::MaybeUninit<T>> {
+-        // This is the same as `Self::new_uninit_in(Global)`, but manually inlined (just like
+-        // `Box::new`).
+-
+-        // SAFETY:
+-        // - If `allocate` succeeds, the returned pointer exactly matches what `Box` needs.
+-        unsafe { mem::transmute(box_new_uninit(<T as SizedTypeProperties>::LAYOUT)) }
++        #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
++        const fn ct<T>() -> *mut mem::MaybeUninit<T> {
++            box_new_uninit(<T as SizedTypeProperties>::LAYOUT) as *mut mem::MaybeUninit<T>
++        }
++        #[inline]
++        fn rt<T>() -> *mut mem::MaybeUninit<T> {
++            if T::IS_ZST {
++                NonNull::<mem::MaybeUninit<T>>::dangling().as_ptr()
++            } else {
++                let ptr = unsafe { crate::alloc::rcgjs_typed_alloc::<mem::MaybeUninit<T>>(1, false) };
++                if ptr.is_null() {
++                    handle_alloc_error(<T as SizedTypeProperties>::LAYOUT);
++                }
++                ptr
++            }
++        }
++        let ptr = core::intrinsics::const_eval_select((), ct::<T>, rt::<T>);
++        unsafe { mem::transmute(ptr) }
+     }
+ 
+     /// Constructs a new `Box` with uninitialized contents, with the memory
+@@ -616,7 +628,9 @@
+             NonNull::dangling()
+         } else {
+             let layout = Layout::new::<mem::MaybeUninit<T>>();
+-            alloc.allocate(layout)?.cast()
++            <A as crate::alloc::ManagedAlloc<mem::MaybeUninit<T>>>::alloc_elems(
++                &alloc, 1, false, layout,
++            )?
+         };
+         unsafe { Ok(Box::from_raw_in(ptr.as_ptr(), alloc)) }
+     }
+@@ -688,7 +702,9 @@
+             NonNull::dangling()
+         } else {
+             let layout = Layout::new::<mem::MaybeUninit<T>>();
+-            alloc.allocate_zeroed(layout)?.cast()
++            <A as crate::alloc::ManagedAlloc<mem::MaybeUninit<T>>>::alloc_elems(
++                &alloc, 1, true, layout,
++            )?
+         };
+         unsafe { Ok(Box::from_raw_in(ptr.as_ptr(), alloc)) }
+     }
+@@ -973,7 +989,9 @@
+                 Ok(l) => l,
+                 Err(_) => return Err(AllocError),
+             };
+-            Global.allocate(layout)?.cast()
++            <Global as crate::alloc::ManagedAlloc<T>>::alloc_elems(
++                &Global, len, false, layout,
++            )?
+         };
+         unsafe { Ok(RawVec::from_raw_parts_in(ptr.as_ptr(), len, Global).into_box(len)) }
+     }
+@@ -1007,7 +1025,9 @@
+                 Ok(l) => l,
+                 Err(_) => return Err(AllocError),
+             };
+-            Global.allocate_zeroed(layout)?.cast()
++            <Global as crate::alloc::ManagedAlloc<T>>::alloc_elems(
++                &Global, len, true, layout,
++            )?
+         };
+         unsafe { Ok(RawVec::from_raw_parts_in(ptr.as_ptr(), len, Global).into_box(len)) }
+     }
+@@ -1099,7 +1119,9 @@
+                 Ok(l) => l,
+                 Err(_) => return Err(AllocError),
+             };
+-            alloc.allocate(layout)?.cast()
++            <A as crate::alloc::ManagedAlloc<T>>::alloc_elems(
++                &alloc, len, false, layout,
++            )?
+         };
+         unsafe { Ok(RawVec::from_raw_parts_in(ptr.as_ptr(), len, alloc).into_box(len)) }
+     }
+@@ -1138,7 +1160,9 @@
+                 Ok(l) => l,
+                 Err(_) => return Err(AllocError),
+             };
+-            alloc.allocate_zeroed(layout)?.cast()
++            <A as crate::alloc::ManagedAlloc<T>>::alloc_elems(
++                &alloc, len, true, layout,
++            )?
+         };
+         unsafe { Ok(RawVec::from_raw_parts_in(ptr.as_ptr(), len, alloc).into_box(len)) }
+     }
+@@ -2004,7 +2028,11 @@
+         unsafe {
+             let layout = Layout::for_value_raw(ptr.as_ptr());
+             if layout.size() != 0 {
+-                self.1.deallocate(From::from(ptr.cast()), layout);
++                crate::alloc::ManagedDealloc::deallocate_managed(
++                    &self.1,
++                    From::from(ptr.cast()),
++                    layout,
++                );
+             }
+         }
+     }
+diff -ruN a/library/alloc/src/collections/btree/node.rs b/library/alloc/src/collections/btree/node.rs
+--- a/library/alloc/src/collections/btree/node.rs	2026-11-23 20:06:40
++++ b/library/alloc/src/collections/btree/node.rs	2026-11-23 20:06:40
+@@ -409,7 +409,8 @@
+         let node = self.node;
+         let ret = self.ascend().ok();
+         unsafe {
+-            alloc.deallocate(
++            crate::alloc::ManagedDealloc::deallocate_managed(
++                &alloc,
+                 node.cast(),
+                 if height > 0 {
+                     Layout::new::<InternalNode<K, V>>()
+@@ -628,7 +629,11 @@
+         self.clear_parent_link();
+ 
+         unsafe {
+-            alloc.deallocate(top.cast(), Layout::new::<InternalNode<K, V>>());
++            crate::alloc::ManagedDealloc::deallocate_managed(
++                &alloc,
++                top.cast(),
++                Layout::new::<InternalNode<K, V>>(),
++            );
+         }
+     }
+ }
+@@ -1446,9 +1451,17 @@
+ 
+                 left_node.correct_childrens_parent_links(old_left_len + 1..new_left_len + 1);
+ 
+-                alloc.deallocate(right_node.node.cast(), Layout::new::<InternalNode<K, V>>());
++                crate::alloc::ManagedDealloc::deallocate_managed(
++                    &alloc,
++                    right_node.node.cast(),
++                    Layout::new::<InternalNode<K, V>>(),
++                );
+             } else {
+-                alloc.deallocate(right_node.node.cast(), Layout::new::<LeafNode<K, V>>());
++                crate::alloc::ManagedDealloc::deallocate_managed(
++                    &alloc,
++                    right_node.node.cast(),
++                    Layout::new::<LeafNode<K, V>>(),
++                );
+             }
+         }
+         result(parent_node, left_node)
+diff -ruN a/library/alloc/src/raw_vec/mod.rs b/library/alloc/src/raw_vec/mod.rs
+--- a/library/alloc/src/raw_vec/mod.rs	2026-11-23 20:06:40
++++ b/library/alloc/src/raw_vec/mod.rs	2026-11-23 20:28:35
+@@ -71,19 +71,15 @@
+ /// `Box<[T]>`, since `capacity()` won't yield the length.
+ #[allow(missing_debug_implementations)]
+ pub(crate) struct RawVec<T, A: Allocator = Global> {
+-    inner: RawVecInner<A>,
++    inner: RawVecInner<T, A>,
+     _marker: PhantomData<T>,
+ }
+ 
+-/// Like a `RawVec`, but only generic over the allocator, not the type.
+-///
+-/// As such, all the methods need the layout passed-in as a parameter.
+-///
+-/// Having this separation reduces the amount of code we need to monomorphize,
+-/// as most operations don't need the actual type, just its layout.
++/// Type-preserving `RawVecInner<T, A>` storing `Unique<T>` directly so `ptr()` never casts from
++/// `*mut u8` and `Global` allocations route through `ManagedAlloc<T>`.
+ #[allow(missing_debug_implementations)]
+-struct RawVecInner<A: Allocator = Global> {
+-    ptr: Unique<u8>,
++struct RawVecInner<T, A: Allocator = Global> {
++    ptr: Unique<T>,
+     /// Never used for ZSTs; it's `capacity()`'s responsibility to return usize::MAX in that case.
+     ///
+     /// # Safety
+@@ -138,7 +134,7 @@
+     }
+ }
+ 
+-impl RawVecInner<Global> {
++impl<T> RawVecInner<T, Global> {
+     #[cfg(not(any(no_global_oom_handling, test)))]
+     #[must_use]
+     #[inline]
+@@ -263,7 +259,6 @@
+     pub(crate) const unsafe fn from_raw_parts_in(ptr: *mut T, capacity: usize, alloc: A) -> Self {
+         // SAFETY: Precondition passed to the caller
+         unsafe {
+-            let ptr = ptr.cast();
+             let capacity = new_cap::<T>(capacity);
+             Self {
+                 inner: RawVecInner::from_raw_parts_in(ptr, capacity, alloc),
+@@ -282,7 +277,6 @@
+     pub(crate) const unsafe fn from_nonnull_in(ptr: NonNull<T>, capacity: usize, alloc: A) -> Self {
+         // SAFETY: Precondition passed to the caller
+         unsafe {
+-            let ptr = ptr.cast();
+             let capacity = new_cap::<T>(capacity);
+             Self { inner: RawVecInner::from_nonnull_in(ptr, capacity, alloc), _marker: PhantomData }
+         }
+@@ -428,7 +422,7 @@
+ 
+ #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+ #[rustfmt::skip] // FIXME(fee1-dead): temporary measure before rustfmt is bumped
+-const impl<A: [const] Allocator + [const] Destruct> RawVecInner<A> {
++const impl<T, A: [const] Allocator + [const] Destruct> RawVecInner<T, A> {
+     #[cfg(not(no_global_oom_handling))]
+     #[inline]
+     fn with_capacity_in(capacity: usize, alloc: A, elem_layout: Layout) -> Self {
+@@ -462,21 +456,20 @@
+             return Ok(Self::new_in(alloc, elem_layout.alignment()));
+         }
+ 
+-        let result = match init {
+-            AllocInit::Uninitialized => alloc.allocate(layout),
+-            #[cfg(not(no_global_oom_handling))]
+-            AllocInit::Zeroed => alloc.allocate_zeroed(layout),
+-        };
++        #[cfg(not(no_global_oom_handling))]
++        let zeroed = matches!(init, AllocInit::Zeroed);
++        #[cfg(no_global_oom_handling)]
++        let zeroed = false;
++        let result = <A as crate::alloc::ManagedAlloc<T>>::alloc_elems(
++            &alloc, capacity, zeroed, layout,
++        );
+         let ptr = match result {
+             Ok(ptr) => ptr,
+             Err(_) => return Err(AllocError { layout, non_exhaustive: () }.into()),
+         };
+ 
+-        // Allocators currently return a `NonNull<[u8]>` whose length
+-        // matches the size requested. If that ever changes, the capacity
+-        // here should change to `ptr.len() / size_of::<T>()`.
+         Ok(Self {
+-            ptr: Unique::from(ptr.cast()),
++            ptr: Unique::from(ptr),
+             cap: unsafe { Cap::new_unchecked(capacity) },
+             alloc,
+         })
+@@ -545,7 +538,7 @@
+         &self,
+         cap: usize,
+         elem_layout: Layout,
+-    ) -> Result<NonNull<[u8]>, TryReserveError> {
++    ) -> Result<NonNull<T>, TryReserveError> {
+         let new_layout = layout_array(cap, elem_layout)?;
+ 
+         let memory = if let Some((ptr, old_layout)) = unsafe { self.current_memory(elem_layout) } {
+@@ -554,10 +547,17 @@
+             unsafe {
+                 // The allocator checks for alignment equality
+                 hint::assert_unchecked(old_layout.align() == new_layout.align());
+-                self.alloc.grow(ptr, old_layout, new_layout)
++                <A as crate::alloc::ManagedAlloc<T>>::realloc_elems(
++                    &self.alloc,
++                    ptr,
++                    self.cap.as_inner(),
++                    cap,
++                    old_layout,
++                    new_layout,
++                )
+             }
+         } else {
+-            self.alloc.allocate(new_layout)
++            <A as crate::alloc::ManagedAlloc<T>>::alloc_elems(&self.alloc, cap, false, new_layout)
+         };
+ 
+         // FIXME(const-hack): switch back to `map_err`
+@@ -568,7 +568,7 @@
+     }
+ }
+ 
+-impl<A: Allocator> RawVecInner<A> {
++impl<T, A: Allocator> RawVecInner<T, A> {
+     #[inline]
+     const fn new_in(alloc: A, align: Alignment) -> Self {
+         let ptr = Unique::from_non_null(NonNull::without_provenance(align.as_nonzero_usize()));
+@@ -595,24 +595,24 @@
+     }
+ 
+     #[inline]
+-    const unsafe fn from_raw_parts_in(ptr: *mut u8, cap: Cap, alloc: A) -> Self {
++    const unsafe fn from_raw_parts_in(ptr: *mut T, cap: Cap, alloc: A) -> Self {
+         Self { ptr: unsafe { Unique::new_unchecked(ptr) }, cap, alloc }
+     }
+ 
+     #[inline]
+     #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+-    const unsafe fn from_nonnull_in(ptr: NonNull<u8>, cap: Cap, alloc: A) -> Self {
++    const unsafe fn from_nonnull_in(ptr: NonNull<T>, cap: Cap, alloc: A) -> Self {
+         Self { ptr: Unique::from(ptr), cap, alloc }
+     }
+ 
+     #[inline]
+-    const fn ptr<T>(&self) -> *mut T {
+-        self.non_null::<T>().as_ptr()
++    const fn ptr(&self) -> *mut T {
++        self.ptr.as_ptr()
+     }
+ 
+     #[inline]
+-    const fn non_null<T>(&self) -> NonNull<T> {
+-        self.ptr.cast().as_non_null_ptr()
++    const fn non_null(&self) -> NonNull<T> {
++        self.ptr.as_non_null_ptr()
+     }
+ 
+     #[inline]
+@@ -631,7 +631,7 @@
+     /// - `elem_layout`'s size must be a multiple of its alignment
+     #[inline]
+     #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+-    const unsafe fn current_memory(&self, elem_layout: Layout) -> Option<(NonNull<u8>, Layout)> {
++    const unsafe fn current_memory(&self, elem_layout: Layout) -> Option<(NonNull<T>, Layout)> {
+         if elem_layout.size() == 0 || self.cap.as_inner() == 0 {
+             None
+         } else {
+@@ -659,8 +659,8 @@
+         // handle_reserve behind a call, while making sure that this function is likely to be
+         // inlined as just a comparison and a call if the comparison fails.
+         #[cold]
+-        unsafe fn do_reserve_and_handle<A: Allocator>(
+-            slf: &mut RawVecInner<A>,
++        unsafe fn do_reserve_and_handle<T, A: Allocator>(
++            slf: &mut RawVecInner<T, A>,
+             len: usize,
+             additional: usize,
+             elem_layout: Layout,
+@@ -770,11 +770,8 @@
+ 
+     #[inline]
+     #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+-    const unsafe fn set_ptr_and_cap(&mut self, ptr: NonNull<[u8]>, cap: usize) {
+-        // Allocators currently return a `NonNull<[u8]>` whose length matches
+-        // the size requested. If that ever changes, the capacity here should
+-        // change to `ptr.len() / size_of::<T>()`.
+-        self.ptr = Unique::from(ptr.cast());
++    const unsafe fn set_ptr_and_cap(&mut self, ptr: NonNull<T>, cap: usize) {
++        self.ptr = Unique::from(ptr);
+         self.cap = unsafe { Cap::new_unchecked(cap) };
+     }
+ 
+@@ -841,7 +838,14 @@
+         // for the T::IS_ZST case since current_memory() will have returned
+         // None.
+         if cap == 0 {
+-            unsafe { self.alloc.deallocate(ptr, layout) };
++            unsafe {
++                <A as crate::alloc::ManagedAlloc<T>>::dealloc_elems(
++                    &self.alloc,
++                    ptr,
++                    self.cap.as_inner(),
++                    layout,
++                );
++            }
+             self.ptr =
+                 unsafe { Unique::new_unchecked(ptr::without_provenance_mut(elem_layout.align())) };
+             self.cap = ZERO_CAP;
+@@ -851,9 +855,15 @@
+                 // overflowed earlier when capacity was larger.
+                 let new_size = elem_layout.size().unchecked_mul(cap);
+                 let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
+-                self.alloc
+-                    .shrink(ptr, layout, new_layout)
+-                    .map_err(|_| AllocError { layout: new_layout, non_exhaustive: () })?
++                <A as crate::alloc::ManagedAlloc<T>>::realloc_elems(
++                    &self.alloc,
++                    ptr,
++                    self.cap.as_inner(),
++                    cap,
++                    layout,
++                    new_layout,
++                )
++                .map_err(|_| AllocError { layout: new_layout, non_exhaustive: () })?
+             };
+             // SAFETY: if the allocation is valid, then the capacity is too
+             unsafe {
+@@ -865,7 +875,7 @@
+ }
+ 
+ #[rustc_const_unstable(feature = "const_heap", issue = "79597")]
+-const impl<A: [const] Allocator> RawVecInner<A> {
++const impl<T, A: [const] Allocator> RawVecInner<T, A> {
+     /// # Safety
+     ///
+     /// This function deallocates the owned allocation, but does not update `ptr` or `cap` to
+@@ -877,7 +887,12 @@
+         // SAFETY: Precondition passed to caller
+         if let Some((ptr, layout)) = unsafe { self.current_memory(elem_layout) } {
+             unsafe {
+-                self.alloc.deallocate(ptr, layout);
++                <A as crate::alloc::ManagedAlloc<T>>::dealloc_elems(
++                    &self.alloc,
++                    ptr,
++                    self.cap.as_inner(),
++                    layout,
++                );
+             }
+         }
+     }
+diff -ruN a/library/alloc/src/rc.rs b/library/alloc/src/rc.rs
+--- a/library/alloc/src/rc.rs	2026-11-23 20:06:40
++++ b/library/alloc/src/rc.rs	2026-11-23 20:06:40
+@@ -3685,7 +3685,11 @@
+         // the strong pointers have disappeared.
+         if inner.weak() == 0 {
+             unsafe {
+-                self.alloc.deallocate(self.ptr.cast(), Layout::for_value_raw(self.ptr.as_ptr()));
++                crate::alloc::ManagedDealloc::deallocate_managed(
++                    &self.alloc,
++                    self.ptr.cast(),
++                    Layout::for_value_raw(self.ptr.as_ptr()),
++                );
+             }
+         }
+     }
+@@ -4469,7 +4473,11 @@
+             self.ptr.as_ref().dec_weak();
+ 
+             if self.ptr.as_ref().weak() == 0 {
+-                self.alloc.deallocate(self.ptr.cast(), Layout::for_value_raw(self.ptr.as_ptr()));
++                crate::alloc::ManagedDealloc::deallocate_managed(
++                    &self.alloc,
++                    self.ptr.cast(),
++                    Layout::for_value_raw(self.ptr.as_ptr()),
++                );
+             }
+         }
+     }
+@@ -4544,7 +4552,9 @@
+         // * new() produced a pointer safe to deallocate.
+         // * We own the pointer unless into_rc() was called, which forgets us.
+         unsafe {
+-            self.alloc.take().unwrap().deallocate(
++            let alloc = self.alloc.take().unwrap();
++            crate::alloc::ManagedDealloc::deallocate_managed(
++                &alloc,
+                 self.ptr.cast(),
+                 rc_inner_layout_for_value_layout(self.layout_for_value),
+             );
+diff -ruN a/library/alloc/src/sync.rs b/library/alloc/src/sync.rs
+--- a/library/alloc/src/sync.rs	2026-11-23 20:06:40
++++ b/library/alloc/src/sync.rs	2026-11-23 20:06:40
+@@ -3537,7 +3537,11 @@
+             );
+ 
+             unsafe {
+-                self.alloc.deallocate(self.ptr.cast(), Layout::for_value_raw(self.ptr.as_ptr()))
++                crate::alloc::ManagedDealloc::deallocate_managed(
++                    &self.alloc,
++                    self.ptr.cast(),
++                    Layout::for_value_raw(self.ptr.as_ptr()),
++                )
+             }
+         }
+     }
+@@ -4333,7 +4337,9 @@
+         // * new() produced a pointer safe to deallocate.
+         // * We own the pointer unless into_arc() was called, which forgets us.
+         unsafe {
+-            self.alloc.take().unwrap().deallocate(
++            let alloc = self.alloc.take().unwrap();
++            crate::alloc::ManagedDealloc::deallocate_managed(
++                &alloc,
+                 self.ptr.cast(),
+                 arcinner_layout_for_value_layout(self.layout_for_value),
+             );

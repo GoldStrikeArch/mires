@@ -2484,6 +2484,21 @@ fn jir_standard_operation(tcx: TyCtxt<'_>, definition: DefId) -> Option<Standard
     if tcx.is_diagnostic_item(Symbol::intern("rcgjs_str_to_uppercase"), definition) {
         return Some(StandardOperation::StrToUppercase);
     }
+    if tcx.is_diagnostic_item(Symbol::intern("rcgjs_typed_alloc"), definition) {
+        return Some(StandardOperation::TypedAlloc);
+    }
+    if tcx.is_diagnostic_item(Symbol::intern("rcgjs_typed_realloc"), definition) {
+        return Some(StandardOperation::TypedRealloc);
+    }
+    if tcx.is_diagnostic_item(Symbol::intern("rcgjs_typed_dealloc"), definition) {
+        return Some(StandardOperation::TypedDealloc);
+    }
+    if tcx.is_diagnostic_item(Symbol::intern("rcgjs_box_new"), definition) {
+        return Some(StandardOperation::BoxNew);
+    }
+    if tcx.is_diagnostic_item(Symbol::intern("rcgjs_typed_dealloc_raw"), definition) {
+        return Some(StandardOperation::TypedDeallocRaw);
+    }
     None
 }
 

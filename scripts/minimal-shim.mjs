@@ -141,9 +141,11 @@ export function minimalShim(programs, shimSource, { module = false, direct: decl
 
   // Lexical ESM mode avoids mutating a global `__rt` object so bundlers/minifiers can
   // mangle, inline, and dead-strip helpers. Keep `names` unchanged for manifest checks.
-  const elideBoxes = !needed.has("box") && !needed.has("tail_ref") && !needed.has("tail_slice");
+  const elideRc = !needed.has("retype_rc");
+  const elideBoxes = !needed.has("box") && !needed.has("tail_ref") && (!needed.has("tail_slice") || elideRc);
   const elideByteViews = !needed.has("_bv_enable");
   const elideElementViews = !needed.has("_element_view");
+  const elideBlocks = !needed.has("_register");
   const errPrefixPattern = /new Error\((\s*)"rustc_codegen_js: /g;
   const rtRefPattern =
     /'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|\/\/[^\r\n]*|\/\*[\s\S]*?\*\/|(?:globalThis\.)?__rt\.([A-Za-z_$][A-Za-z0-9_$]*)/g;
@@ -151,10 +153,15 @@ export function minimalShim(programs, shimSource, { module = false, direct: decl
     if (elideBoxes && name === "_boxes") return "const $rt__boxes = null;";
     if (elideByteViews && name === "_bv") return "const $rt__bv = null;";
     if (elideElementViews && name === "_element_view_of") return "const $rt__element_view_of = null;";
+    if (elideRc && name === "tail_slice") {
+      return "let $rt_tail_slice = (record, key, len) => ({ buf: record[key], off: 0, len });";
+    }
+    if (elideBlocks && name === "_blocks") return "const $rt__blocks = null;";
+    if (elideBlocks && name === "_blk_get") return "let $rt__blk_get = () => undefined;";
     let stmt = members.get(name);
     if (elideBoxes && name === "_put") {
       stmt = stmt.replace(
-        /\r?\n\s*if\s*\(\s*value\s*!==\s*null\s*&&\s*typeof value\s*===\s*"object"\s*&&[^;{}]*_boxes\.has\(value\)\s*\)\s*\{\s*[^}]*_boxes\.set\([^;]*\);\s*\}/,
+        /\r?\n\s*if\s*\(\s*value\s*!==\s*null\s*&&\s*typeof value\s*===\s*"object"\s*&&[\s\S]*?_boxes\.has\(value\)\s*\)\s*\{\s*[^}]*_boxes\.set\([^;]*\);\s*\}/,
         "",
       );
     }

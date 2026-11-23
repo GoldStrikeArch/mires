@@ -65,6 +65,7 @@ pub fn lower_with_ascii(
     .with_call_retargets(input.call_retargets)
     .with_bigint_hoist(input.bigints.is_some())
     .with_byte_views(input.byte_views)
+    .with_heap(input.heap)
     .with_nested_clone(input.nested_clone)
     .with_ascii(ascii);
 

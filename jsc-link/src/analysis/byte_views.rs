@@ -50,12 +50,14 @@ struct ScalarOrigin {
 }
 
 /// Whether `item` is replaced whole during lowering by a pure host-delegated body with no
-/// outgoing Rust calls or byte views (`lower/semantic_ops/num.rs`).
+/// outgoing Rust calls or byte views (`lower/semantic_ops/num.rs`), or is a Phase 3 typed-heap
+/// `Global` allocator hook whose fallback body only performs `Global` allocate/grow/shrink/deallocate
+/// without byte dereferences or escaping byte views.
 fn is_host_delegated_body(item: &LinkItem) -> bool {
     matches!(
         item.jir.body.as_ref().map(|b| b.semantic),
         Some(rcgjs_object::jir::semantic::BodySemantic::Standard(op))
-            if crate::lower::semantic_ops::num::is_float_from_str(op)
+            if crate::lower::semantic_ops::num::is_float_from_str(op) || op.is_typed_heap()
     )
 }
 
@@ -1228,16 +1230,41 @@ fn is_byte_ptr_or_rawvec_inner(
     if is_byte_ptr(table, cur) {
         return true;
     }
+    let has_byte_ptr_field = |adt_ty: TypeId| -> bool {
+        let Some(TypeKind::Adt { variants, .. }) = table.get(adt_ty).map(|d| &d.kind) else {
+            return false;
+        };
+        let Some(variant) = variants.first() else {
+            return false;
+        };
+        variant.fields.iter().any(|f| {
+            let fty = table.peeled(f.ty);
+            if is_byte_ptr(table, fty) {
+                return true;
+            }
+            if is_std_adt(table, fty, std_crate_ids)
+                && adt_short_name(table, interns, fty) == "RawVecInner"
+            {
+                if let Some(TypeKind::Adt { variants: ivs, .. }) = table.get(fty).map(|d| &d.kind) {
+                    return ivs.first().is_some_and(|v| {
+                        v.fields
+                            .iter()
+                            .any(|ff| is_byte_ptr(table, table.peeled(ff.ty)))
+                    });
+                }
+            }
+            false
+        })
+    };
     (is_std_adt(table, ty, std_crate_ids)
-        && matches!(
-            adt_short_name(table, interns, ty),
-            "RawVecInner" | "RawVec" | "Unique" | "NonNull"
-        ))
+        && matches!(adt_short_name(table, interns, ty), "RawVecInner" | "RawVec")
+        && has_byte_ptr_field(ty))
         || (is_std_adt(table, cur, std_crate_ids)
             && matches!(
                 adt_short_name(table, interns, cur),
                 "RawVecInner" | "RawVec"
-            ))
+            )
+            && has_byte_ptr_field(cur))
 }
 
 fn root_wide_vec_elem_size(
@@ -1961,12 +1988,35 @@ fn classify_stdlib_ptr_call(
                 || dp.starts_with("core::ptr::const_ptr::<impl *const T>::is_null")
                 || dp.starts_with("core::ptr::mut_ptr::<impl *mut T>::is_null")
                 || is_safe_std_drop_path(dp)
-                || (target_is_std && dp.ends_with("::deallocate"))
+                || (target_is_std
+                    && (dp.ends_with("::deallocate")
+                        || dp.ends_with("::deallocate_managed")
+                        || dp.ends_with("::dealloc_elems")
+                        || dp.contains("rcgjs_typed_dealloc")))
+                || matches!(
+                    target.jir.body.as_ref().map(|b| b.semantic),
+                    Some(rcgjs_object::jir::semantic::BodySemantic::Standard(
+                        rcgjs_object::jir::semantic::StandardOperation::TypedDealloc
+                            | rcgjs_object::jir::semantic::StandardOperation::TypedDeallocRaw
+                    ))
+                )
             {
                 return CallEffect::Sink;
             }
             // Realloc propagates the pointer (possibly scaled) to its result.
-            if dp.starts_with("alloc::alloc::realloc") {
+            if dp.starts_with("alloc::alloc::realloc")
+                || dp.starts_with("alloc::alloc::Global::grow_impl")
+                || dp.starts_with("alloc::Global::grow_impl")
+                || dp.starts_with("alloc::alloc::Global::shrink_impl")
+                || dp.starts_with("alloc::Global::shrink_impl")
+                || (target_is_std && dp.ends_with("::realloc_elems"))
+                || matches!(
+                    target.jir.body.as_ref().map(|b| b.semantic),
+                    Some(rcgjs_object::jir::semantic::BodySemantic::Standard(
+                        rcgjs_object::jir::semantic::StandardOperation::TypedRealloc
+                    ))
+                )
+            {
                 return CallEffect::PropagateToResult;
             }
             // NonNull / Unique constructors & pointer accessors ONLY (never read/write/as_ref!).

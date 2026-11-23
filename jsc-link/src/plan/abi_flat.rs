@@ -1833,6 +1833,7 @@ fn canonical_clone_allowed(
                         crate::jir::semantic::StandardOperation::SliceSort
                             | crate::jir::semantic::StandardOperation::SliceSortCmp
                     )
+                    || operation.is_typed_heap()
         )
 }
 
@@ -1875,6 +1876,7 @@ fn refuses(
                     crate::jir::semantic::StandardOperation::SliceSort
                         | crate::jir::semantic::StandardOperation::SliceSortCmp
                 )
+                || operation.is_typed_heap()
     ) {
         return Some(BoundaryDecline::NonCallReference);
     }

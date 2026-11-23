@@ -88,14 +88,70 @@ pub fn lower(
     let has_i64 = result_ty.is_some_and(|ty| cx.is_i64_ty(ty))
         || args.iter().any(|arg| cx.is_i64_value(*arg));
     if OperandEvaluation::intrinsic(name) == OperandEvaluation::Materialize && !has_i64 {
-        let arguments = args
+        let mut arguments = args
             .iter()
             .map(|arg| cx.expr_of(*arg))
-            .collect::<Res<_>>()?;
-        let (setup, arguments) =
-            OperandEvaluation::Materialize.capture(arguments, |value| cx.temp(value));
-        intrinsic.prelude.borrow_mut().extend(setup);
-        intrinsic.captured = Some(arguments);
+            .collect::<Res<Vec<_>>>()?;
+        let is_deref_intrinsic = matches!(
+            name,
+            "write_via_move"
+                | "volatile_store"
+                | "unaligned_volatile_store"
+                | "nontemporal_store"
+                | "read_via_copy"
+                | "volatile_load"
+                | "unaligned_volatile_load"
+        );
+        let unwrapped_slot = if is_deref_intrinsic && !arguments.is_empty() {
+            let candidate = super::ptr::unwrap_offset_cond(arguments[0].clone());
+            if let Expr::Object(ref fields) = candidate {
+                let buf = fields
+                    .iter()
+                    .find(|(k, _)| k == "buf")
+                    .map(|(_, v)| v.clone());
+                let off = fields
+                    .iter()
+                    .find(|(k, _)| k == "off")
+                    .map(|(_, v)| v.clone());
+                match (buf, off) {
+                    (Some(b), Some(o)) if fields.len() == 2 => Some((b, o)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((buf, off)) = unwrapped_slot {
+            let rest = arguments.split_off(1);
+            if rest.iter().all(jsast::is_droppable)
+                && jsast::is_droppable(&buf)
+                && jsast::is_droppable(&off)
+            {
+                let mut rebuilt = vec![ptr::slot(buf, off)];
+                rebuilt.extend(rest);
+                intrinsic.captured = Some(rebuilt);
+            } else {
+                let mut flat = Vec::with_capacity(2 + rest.len());
+                flat.push(buf);
+                flat.push(off);
+                flat.extend(rest);
+                let (setup, mut cap) =
+                    OperandEvaluation::Materialize.capture(flat, |value| cx.temp(value));
+                intrinsic.prelude.borrow_mut().extend(setup);
+                let cap_off = cap.remove(1);
+                let cap_buf = cap.remove(0);
+                let mut rebuilt = vec![ptr::slot(cap_buf, cap_off)];
+                rebuilt.extend(cap);
+                intrinsic.captured = Some(rebuilt);
+            }
+        } else {
+            let (setup, arguments) =
+                OperandEvaluation::Materialize.capture(arguments, |value| cx.temp(value));
+            intrinsic.prelude.borrow_mut().extend(setup);
+            intrinsic.captured = Some(arguments);
+        }
     }
     let outcome = match intrinsic.lower(name)? {
         Some(outcome) => outcome,

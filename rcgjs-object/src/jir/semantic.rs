@@ -315,9 +315,31 @@ pub enum StandardOperation {
     BTreeMapRemove,
     /// `<BTreeMap<K, V> as Drop>::drop(&mut self)`.
     BTreeMapDrop,
+    /// `alloc::alloc::rcgjs_typed_alloc<T>(cap: usize, zeroed: bool) -> *mut T`.
+    TypedAlloc,
+    /// `alloc::alloc::rcgjs_typed_realloc<T>(ptr: *mut T, old_cap: usize, new_cap: usize) -> *mut T`.
+    TypedRealloc,
+    /// `alloc::alloc::rcgjs_typed_dealloc<T>(ptr: *mut T, cap: usize)`.
+    TypedDealloc,
+    /// `alloc::alloc::rcgjs_box_new<T>(x: T) -> *mut T`.
+    BoxNew,
+    /// `alloc::alloc::rcgjs_typed_dealloc_raw(ptr: *mut u8, layout: Layout)`.
+    TypedDeallocRaw,
 }
 
 impl StandardOperation {
+    /// Whether this is one of the Phase 3 typed-heap `Global` allocation/deallocation hooks.
+    pub fn is_typed_heap(self) -> bool {
+        matches!(
+            self,
+            Self::TypedAlloc
+                | Self::TypedRealloc
+                | Self::TypedDealloc
+                | Self::BoxNew
+                | Self::TypedDeallocRaw
+        )
+    }
+
     /// Whether this is one of the `str` call-site identities (with `<[u8]>::is_ascii`).
     pub fn is_str(self) -> bool {
         matches!(

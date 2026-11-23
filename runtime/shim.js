@@ -148,7 +148,7 @@ globalThis.__rt._boxes = new WeakMap();
 globalThis.__rt._boxed = new WeakSet();
 globalThis.__rt.box = (value) => {
   let slot = globalThis.__rt._boxes.get(value);
-  if (slot === undefined) {
+  if (slot === undefined || slot.buf[slot.off] !== value) {
     slot = { buf: [value], off: 0 };
     globalThis.__rt._boxes.set(value, slot);
     globalThis.__rt._boxed.add(slot.buf);
@@ -992,7 +992,7 @@ globalThis.__rt.copy = (dst, src, count, clone) => {
   }
   const each = typeof effCl === "function" ? (fromNs ? (v) => (v === null || typeof v !== "object" ? v : effCl(v)) : effCl) : (v) => v;
   const put = globalThis.__rt._put;
-  const dIsHeap = globalThis.__rt._blk_get(d.buf) !== undefined;
+  const dIsHeap = globalThis.__rt._boxes !== null && globalThis.__rt._blk_get(d.buf) !== undefined;
   if (down) { for (let i = s.n - 1; i >= 0; i--) put(d.buf, d.off + i, each(s.buf[s.off + i]), dIsHeap); }
   else { for (let i = 0; i < s.n; i++) put(d.buf, d.off + i, each(s.buf[s.off + i]), dIsHeap); }
 };
@@ -1056,6 +1056,7 @@ globalThis.__rt._put = (buf, off, value, heap) => {
   // the place the object happens to sit in.
   if (
     value !== null && typeof value === "object" &&
+    globalThis.__rt._boxes !== null &&
     (heap !== undefined ? heap : globalThis.__rt._blk_get(buf) !== undefined) &&
     !globalThis.__rt._boxes.has(value)
   ) {
@@ -1063,9 +1064,35 @@ globalThis.__rt._put = (buf, off, value, heap) => {
   }
 };
 
+// _put_plain(buf, off, value): element store for aggregate types proven never to be
+// looked up in `_boxes` (never boxed, never unsized to `dyn Trait`, never passed as
+// a bare reference to pointer identity ops). Skips `_blk_get` and `_boxes` entirely.
+globalThis.__rt._put_plain = (buf, off, value) => {
+  const old = buf[off];
+  if (old !== null && typeof old === "object" && value !== null && typeof value === "object") {
+    globalThis.__rt.overwrite(old, value);
+    return;
+  }
+  buf[off] = value;
+};
+
+// _put_tracked(buf, off, value): element store for aggregate types that DO participate
+// in `_boxes` lookup, registering `{ buf, off }` directly without a `_blk_get` WeakMap lookup.
+globalThis.__rt._put_tracked = (buf, off, value) => {
+  const old = buf[off];
+  if (old !== null && typeof old === "object" && value !== null && typeof value === "object") {
+    globalThis.__rt.overwrite(old, value);
+    return;
+  }
+  buf[off] = value;
+  if (value !== null && typeof value === "object" && globalThis.__rt._boxes !== null && !globalThis.__rt._boxes.has(value)) {
+    globalThis.__rt._boxes.set(value, { buf, off });
+  }
+};
+
 // copy_nonoverlapping(dst, src, count): the same move, without the overlap, so
 // the direction never matters.
-globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone) => {
+globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone, plain) => {
   if (count === 0) return;
   let effCl = clone, fromNs = false;
   if (clone === undefined && globalThis.__rt._bv !== null) {
@@ -1075,11 +1102,21 @@ globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone) => {
   globalThis.__rt._scales(dst, src, "copy_nonoverlapping");
   const d = globalThis.__rt._run(dst, count, "copy_nonoverlapping");
   const s = globalThis.__rt._run(src, count, "copy_nonoverlapping");
+  if (effCl === undefined && ArrayBuffer.isView(d.buf) && ArrayBuffer.isView(s.buf)
+      && d.buf.constructor === s.buf.constructor) {
+    d.buf.set(s.buf.subarray(s.off, s.off + s.n), d.off);
+    return;
+  }
   if (effCl === undefined && (fromNs || globalThis.__rt._rebinds(dst, d.buf, s))) {
     for (let i = 0; i < s.n; i++) d.buf[d.off + i] = s.buf[s.off + i];
     return;
   }
   const each = typeof effCl === "function" ? (fromNs ? (v) => (v === null || typeof v !== "object" ? v : effCl(v)) : effCl) : (v) => v;
+  if (plain || globalThis.__rt._boxes === null) {
+    const put = globalThis.__rt._put_plain;
+    for (let i = 0; i < s.n; i++) put(d.buf, d.off + i, each(s.buf[s.off + i]));
+    return;
+  }
   const put = globalThis.__rt._put;
   const dIsHeap = globalThis.__rt._blk_get(d.buf) !== undefined;
   for (let i = 0; i < s.n; i++) put(d.buf, d.off + i, each(s.buf[s.off + i]), dIsHeap);
@@ -1306,7 +1343,7 @@ globalThis.__rt.write_array = (p, values, indirect) => {
   const buf = globalThis.__rt._bv !== null ? globalThis.__rt._bv.raw_buf(p.buf) : p.buf;
   if (indirect) {
     const put = globalThis.__rt._put;
-    const heap = globalThis.__rt._blk_get(buf) !== undefined;
+    const heap = globalThis.__rt._boxes !== null && globalThis.__rt._blk_get(buf) !== undefined;
     for (let i = 0; i < values.length; i++) put(buf, p.off + i, values[i], heap);
     return;
   }
@@ -3077,6 +3114,13 @@ globalThis.__rt.bytes_str = (buf, off, len) => {
 globalThis.__rt._bstr_units = (buf, off, len) => {
   if (len <= 0) return "";
   let out = "";
+  if (buf instanceof Uint8Array) {
+    for (let at = 0; at < len; at += 4096) {
+      const end = Math.min(len, at + 4096);
+      out += String.fromCharCode.apply(null, buf.subarray(off + at, off + end));
+    }
+    return out;
+  }
   for (let at = 0; at < len; at += 4096) {
     const end = Math.min(len, at + 4096);
     const codes = new Array(end - at);
@@ -3600,6 +3644,24 @@ globalThis.__rt.bstr_sb_block = (sb) => {
   const p = globalThis.__rt._register(copy, cap, false);
   globalThis.__rt._blk_get(copy).fresh = false;
   return { buf: p.buf, off: 0, len: n, cap };
+};
+
+// Tier A typed-heap variants of `bstr_block` / `bstr_sb_block`: allocate a
+// `Uint8Array` directly without `_register` / `_blocks`.
+globalThis.__rt.bstr_block_typed = (s) => {
+  const n = s.length;
+  const copy = new Uint8Array(n);
+  for (let i = 0; i < n; i++) copy[i] = s.charCodeAt(i);
+  return { buf: copy, off: 0, len: n, cap: n };
+};
+
+globalThis.__rt.bstr_sb_block_typed = (sb) => {
+  const text = sb.text;
+  const n = text.length;
+  const cap = Math.max(sb.cap, n);
+  const copy = new Uint8Array(cap);
+  for (let i = 0; i < n; i++) copy[i] = text.charCodeAt(i);
+  return { buf: copy, off: 0, len: n, cap };
 };
 
 // bstr_sb_check(value): `_sb_check` (`RCGJS_SB_VERIFY=1`) for a byte-string
@@ -4926,7 +4988,7 @@ globalThis.__rt.nv_extend = (v, s, m, mc, p) => { const tl = v.len, sl = s.len, 
 globalThis.__rt.nv_extend_slice = (v, s, m, mc, p) => { const sl = s.len; if (!sl) return; const tl = v.len, r = tl + sl; if (r > v.cap) __rt._nv_grow(v, r, m, 0, mc, p); const db = v.buf, sb = s.buf, so = s.off; if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor) db.set(sb.subarray(so, so + sl), tl); else for (let i = 0; i < sl; i++) db[tl + i] = sb[so + i]; v.len = r; };
 globalThis.__rt.nv_clone = (v) => ({buf:v.buf.slice(0,v.len),len:v.len,cap:v.len});
 globalThis.__rt.nv_from_slice = (s, k) => { const l = s.len, sb = s.buf, so = s.off; let b; if (k !== void 0) { const C = __rt._tv_ctors[k]; b = new C(l); if (l) { if (ArrayBuffer.isView(sb) && sb.constructor === C) b.set(sb.subarray(so, so + l)); else for (let i = 0; i < l; i++) b[i] = sb[so + i]; } } else if (!l) b = []; else if (Array.isArray(sb)) b = sb.slice(so, so + l); else { b = new Array(l); for (let i = 0; i < l; i++) b[i] = sb[so + i]; } return {buf:b,len:l,cap:l}; };
-globalThis.__rt.nv_from_box = (p, n, k) => { const a = !n ? [] : (Array.isArray(p) ? p : p.w !== void 0 ? p.buf.slice(p.off, p.off + n) : p.buf[p.off]).slice(0, n); return {buf:k!==void 0?new __rt._tv_ctors[k](a):a,len:n,cap:n}; };
+globalThis.__rt.nv_from_box = (p, n, k) => { const a = !n ? [] : (Array.isArray(p) || ArrayBuffer.isView(p) ? p : p.w !== void 0 ? p.buf.slice(p.off, p.off + n) : p.buf[p.off]).slice(0, n); return {buf:k!==void 0?new __rt._tv_ctors[k](a):a,len:n,cap:n}; };
 globalThis.__rt.nv_remove = (v, i, p, loc) => { const l = v.len; if (i >= l) throw __rt._nv_fail("oob", p, loc); const b = v.buf, o = b[i]; if (i + 1 < l) b.copyWithin(i, i + 1, l); if (!ArrayBuffer.isView(b)) b[l - 1] = void 0; v.len = l - 1; return o; };
 globalThis.__rt.nv_swap_remove = (v, i, p) => { const l = v.len; if (i >= l) throw __rt._nv_fail("oob", p); const b = v.buf, e = l - 1, o = b[i]; if (i !== e) b[i] = b[e]; if (!ArrayBuffer.isView(b)) b[e] = void 0; v.len = e; return o; };
 globalThis.__rt.nv_idx = (v, i, d, p, loc) => { if (i >= v.len) throw __rt._nv_fail("oob", p, loc); return d ? v.buf[i] : {buf:v.buf,off:i}; };
@@ -5092,7 +5154,7 @@ globalThis.__rt.unscale_uninit = (p, size, mk, cl) => {
     : p.buf;
   let block = globalThis.__rt._heap_block(raw);
   if (block === undefined) {
-    if (!Array.isArray(raw)) {
+    if (!Array.isArray(raw) && !ArrayBuffer.isView(raw)) {
       throw __rt.abort_error(new Error(
         "rustc_codegen_js: uninitialized storage does not have an array backing buffer",
       ));
@@ -5330,6 +5392,109 @@ globalThis.__rt.alloc_error = (size, align) => {
   throw __rt.abort_error(new Error(
     "rustc_codegen_js: memory allocation of " + size + " bytes failed",
   ));
+};
+
+// ---------------------------------------------------------------------------
+// Tier A typed managed heap (zero-WeakMap fast path for Global RawVec & Box)
+// ---------------------------------------------------------------------------
+globalThis.__rt.t_box_new_tracked = (x) => {
+  const s = { buf: [x], off: 0 };
+  if (x !== null && typeof x === "object" && globalThis.__rt._boxes !== null) {
+    globalThis.__rt._boxes.set(x, s);
+  }
+  return s;
+};
+
+globalThis.__rt.t_alloc_arr = (cap, mk, tracked) => {
+  const buf = new Array(cap);
+  if (cap === 1 && typeof mk === "function") {
+    const shell = mk();
+    if (shell !== null && typeof shell === "object") {
+      buf[0] = shell;
+      if (tracked && globalThis.__rt._boxes !== null) {
+        globalThis.__rt._boxes.set(shell, { buf, off: 0 });
+      }
+    }
+  }
+  return { buf, off: 0 };
+};
+
+globalThis.__rt.t_alloc_z = (cap, zeroed, mk, tracked) => {
+  const buf = new Array(cap);
+  if (zeroed) {
+    if (mk == null) {
+      throw __rt.abort_error(new Error(
+        "rustc_codegen_js: a zeroed heap block cannot be initialized for this element type",
+      ));
+    }
+    for (let i = 0; i < cap; i++) {
+      const v = mk();
+      buf[i] = v;
+      if (tracked && v !== null && typeof v === "object" && globalThis.__rt._boxes !== null) {
+        globalThis.__rt._boxes.set(v, { buf, off: i });
+      }
+    }
+  } else if (cap === 1 && typeof mk === "function") {
+    const shell = mk();
+    if (shell !== null && typeof shell === "object") {
+      buf[0] = shell;
+      if (tracked && globalThis.__rt._boxes !== null) {
+        globalThis.__rt._boxes.set(shell, { buf, off: 0 });
+      }
+    }
+  }
+  return { buf, off: 0 };
+};
+
+globalThis.__rt.t_realloc_ta = (p, old_cap, new_cap, k) => {
+  const b = p.buf;
+  const next = new globalThis.__rt._tv_ctors[k](new_cap);
+  if (ArrayBuffer.isView(b)) {
+    next.set(old_cap <= new_cap ? b : b.subarray(0, new_cap));
+  } else {
+    const n = old_cap < new_cap ? old_cap : new_cap;
+    for (let i = 0; i < n; i++) next[i] = b[p.off + i];
+  }
+  return { buf: next, off: 0 };
+};
+
+globalThis.__rt.t_realloc_ta_checked = (p, old_cap, new_cap, k) => {
+  const b = p.buf;
+  if (ArrayBuffer.isView(b)) {
+    const next = new globalThis.__rt._tv_ctors[k](new_cap);
+    next.set(old_cap <= new_cap ? b : b.subarray(0, new_cap));
+    return { buf: next, off: 0 };
+  }
+  const block = globalThis.__rt._blk_get(b);
+  if (block !== undefined) {
+    const es = globalThis.__rt._tv_ctors[k].BYTES_PER_ELEMENT;
+    return globalThis.__rt.realloc(p, old_cap * es, es, new_cap * es);
+  }
+  const next = new globalThis.__rt._tv_ctors[k](new_cap);
+  const n = old_cap < new_cap ? old_cap : new_cap;
+  for (let i = 0; i < n; i++) next[i] = b[p.off + i];
+  return { buf: next, off: 0 };
+};
+
+globalThis.__rt.t_realloc_arr = (p, new_cap) => {
+  p.buf.length = new_cap;
+  return { buf: p.buf, off: 0 };
+};
+
+globalThis.__rt.t_realloc_arr_checked = (p, old_cap, new_cap, es) => {
+  if (globalThis.__rt._blk_get(p.buf) !== undefined) {
+    return globalThis.__rt.realloc(p, old_cap * es, 1, new_cap * es);
+  }
+  p.buf.length = new_cap;
+  return { buf: p.buf, off: 0 };
+};
+
+globalThis.__rt.t_dealloc_maybe = (p) => {
+  if (p === null || typeof p !== "object") return;
+  const buf = p.buf;
+  if (buf != null && globalThis.__rt._blk_get(buf) !== undefined) {
+    globalThis.__rt.dealloc(p, 0, 1);
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -6900,7 +7065,8 @@ globalThis.__rt.convert_sb_block = (sb) => {
 // Array (`c[0] = null`) so V8 stays in `HOLEY_ELEMENTS` and preserves f32/f64
 // NaN bit payloads (MIRES-023).
 globalThis.__rt.convert_nv_block = (nv, s, k) => { const b = nv.buf, l = nv.len, n = nv.cap > l ? nv.cap : l; let c; if (ArrayBuffer.isView(b)) { c = new Array(n); if (l) { c[0] = null; for (let i = 0; i < l; i++) c[i] = b[i]; } } else { c = b.slice(0, l); c.length = n; } const p = __rt._register(c, c.length * s, false), m = __rt._blk_get(c); m.es = s; if (typeof k === "string") m.sk = k; if (typeof k === "function" || k === true) { m.cl = k; if (__rt._boxes !== null) for (let i = 0; i < l; i++) { const v = c[i]; if (v !== null && typeof v === "object" && !__rt._boxes.has(v)) __rt._boxes.set(v, {buf:c,off:i}); } } m.fresh = false; if (s > 1 && __rt._bv !== null) { const r = []; m.raw = r; m.typed = c; __rt._blocks.set(r, m); return {buf:r,off:0}; } return p; };
-globalThis.__rt.convert_block_nv = (buf, off, len, cap, k) => { if (__rt._bv !== null) { const u = __rt._bv.unwrap_slot(buf, off); buf = u.buf; off = u.off; } const b = __rt._blk_get(buf); if (b !== void 0 && b.typed !== void 0 && buf !== b.typed) { buf = b.typed; off /= b.es; } const c = k !== void 0 ? new __rt._tv_ctors[k](cap) : new Array(cap); for (let i = 0; i < len; i++) c[i] = buf[off + i]; return {buf:c,len,cap}; };
+globalThis.__rt.convert_nv_typed = (nv, k, tracked) => { const b = nv.buf, l = nv.len, n = nv.cap > l ? nv.cap : l; let c; if (k !== void 0) { c = new __rt._tv_ctors[k](n); if (l) { if (ArrayBuffer.isView(b) && b.constructor === c.constructor) c.set(l < b.length ? b.subarray(0, l) : b); else for (let i = 0; i < l; i++) c[i] = b[i]; } } else { c = b.slice(0, l); c.length = n; if (tracked && __rt._boxes !== null) { for (let i = 0; i < l; i++) { const v = c[i]; if (v !== null && typeof v === "object" && !__rt._boxes.has(v)) __rt._boxes.set(v, {buf:c,off:i}); } } } return {buf:c,off:0}; };
+globalThis.__rt.convert_block_nv = (buf, off, len, cap, k) => { if (__rt._bv !== null) { const u = __rt._bv.unwrap_slot(buf, off); buf = u.buf; off = u.off; } const b = __rt._blk_get(buf); if (b !== void 0 && b.typed !== void 0 && buf !== b.typed) { buf = b.typed; off /= b.es; } const c = k !== void 0 ? new __rt._tv_ctors[k](cap) : new Array(cap); if (k !== void 0 && ArrayBuffer.isView(buf) && buf.constructor === c.constructor) { if (len) c.set(buf.subarray(off, off + len)); } else { for (let i = 0; i < len; i++) c[i] = buf[off + i]; } return {buf:c,len,cap}; };
 globalThis.__rt.convert_block_sv = (p, len) => { if (typeof p === "number" && p > 0 && p < 4096) p = __rt._dangling(p); let buf = p.buf, off = p.off; if (p.sc !== void 0) off /= p.sc; else { if (__rt._bv !== null) { const u = __rt._bv.unwrap_slot(buf, off); buf = u.buf; off = u.off; } const b = __rt._blk_get(buf); if (b !== void 0 && b.typed !== void 0 && buf !== b.typed) { buf = b.typed; off /= b.es; } } return {buf,off,len}; };
 globalThis.__rt.convert_sv_nv = (s, k) => __rt.nv_from_slice(s, k);
 

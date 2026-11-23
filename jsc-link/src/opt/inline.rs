@@ -1068,7 +1068,9 @@ fn collect_sites(
                 CallSemantic::Ordinary => true,
                 // A `str` identity (`js-str=bytes` only) stays a call: `lower/js/call.rs` spells
                 // it as the string operation it is, which inlining its body would take away.
-                CallSemantic::Standard(std_op) if std_op.is_str() => false,
+                CallSemantic::Standard(std_op) if std_op.is_str() || std_op.is_typed_heap() => {
+                    false
+                }
                 CallSemantic::Standard(std_op) if allow_std_post_repr => {
                     !matches!(
                         std_op,
@@ -1131,6 +1133,7 @@ fn collect_sites(
                             crate::jir::semantic::StandardOperation::SliceSort
                                 | crate::jir::semantic::StandardOperation::SliceSortCmp
                         )
+                        || op.is_typed_heap()
                 })
             {
                 stats.decline("inline.semantic-boundary");

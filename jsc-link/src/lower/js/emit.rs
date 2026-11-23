@@ -2326,13 +2326,14 @@ impl<'a> JsCx<'a> {
             )),
             // A carrier conversion: the registry-owned adapter expression over the value
             // (`adapters.rs`). The value's Rust type is unchanged — `result_ty` is it.
-            OpKind::Convert { v, from, to } => super::adapters::convert(
+            OpKind::Convert { v, from, to } => super::adapters::convert_with_heap(
                 self.table,
                 self.interns,
                 self.expr_of(*v)?,
                 result_ty,
                 *from,
                 *to,
+                self.heap(),
             ),
             OpKind::SetField { .. }
             | OpKind::SetDiscriminant { .. }

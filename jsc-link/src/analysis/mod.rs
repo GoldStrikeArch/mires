@@ -9,6 +9,7 @@ pub mod ascii;
 pub mod byte_views;
 pub mod callgraph;
 pub mod effects;
+pub mod heap;
 pub mod host_contract;
 pub mod js_alloc;
 pub mod legality;
