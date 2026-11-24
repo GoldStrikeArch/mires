@@ -73,6 +73,7 @@ pub struct NestedClone {
     pub vec: bool,
     pub string: bool,
     pub map: bool,
+    pub native_string: bool,
 }
 
 /// Link-time call-target overrides for one native-version caller.
@@ -235,6 +236,7 @@ fn forced_semantic_rewrite(input: &LowerInput<'_>) -> Option<Result<LoweredItem,
         element_glue_nonthrowing: false,
         panic_impl: None,
         panic_reads_info: false,
+        native_string_enabled: input.heap.is_some_and(|h| h.native_string_enabled),
     };
     let (op, slots) = match semantic_ops::support_of(&cx) {
         Ok(support) => support,

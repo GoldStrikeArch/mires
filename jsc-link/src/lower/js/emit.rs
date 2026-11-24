@@ -2241,7 +2241,16 @@ impl<'a> JsCx<'a> {
                 root,
                 path,
                 mutable,
-            } => self.raw_view(root, path, *mutable),
+            } => {
+                if self.is_direct_ref_copy_cast(result) {
+                    if let (Root::Value(v), [rcgjs_object::jir::repr::Proj::Deref]) =
+                        (root, path.as_slice())
+                    {
+                        return self.expr_of(*v);
+                    }
+                }
+                self.raw_view(root, path, *mutable)
+            }
             OpKind::SliceView { ptr: pointer, len } => {
                 let pointer_ty = self.ty_of(*pointer)?;
                 let data = self.expr_of(*pointer)?;
@@ -2307,13 +2316,19 @@ impl<'a> JsCx<'a> {
             OpKind::Unary { op: un, v, ty } => {
                 self.unary(*un, *ty, self.expr_of(*v)?, self.is_int32_only(result))
             }
-            OpKind::Cast { kind, v, from, to } => self.cast_with_int32_only(
-                *kind,
-                *from,
-                *to,
-                self.expr_of(*v)?,
-                self.is_int32_only(result),
-            ),
+            OpKind::Cast { kind, v, from, to } => {
+                if self.is_direct_ref_copy_cast(result) {
+                    self.expr_of(*v)
+                } else {
+                    self.cast_with_int32_only(
+                        *kind,
+                        *from,
+                        *to,
+                        self.expr_of(*v)?,
+                        self.is_int32_only(result),
+                    )
+                }
+            }
             OpKind::Call { .. } | OpKind::Intrinsic { .. } | OpKind::Host { .. } => {
                 self.call_expr(op)
             }

@@ -71,7 +71,7 @@ test("manifest publication distinguishes application hooks from canonical helper
   const publish = (source, requirement, flags = []) => {
     writeFileSync(path.join(directory, "program.js"), source);
     writeFileSync(manifestPath, JSON.stringify({
-      schema: 2, object_format: 27, jir_schema: 19,
+      schema: 2, object_format: 27, jir_schema: 20,
       semantic_policy: "faithful", syntax_ceiling: "2018",
       entries: { program: { role: "main", program: "program.js", roots: { entry: "rust:entry" } } },
       artifacts: { "program.js": {

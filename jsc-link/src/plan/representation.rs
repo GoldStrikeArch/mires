@@ -230,6 +230,7 @@ pub(crate) fn plan_and_commit(
     }
     let lowered: BTreeMap<ItemId, JsName> = funcs
         .iter()
+        .filter(|(name, _)| live.contains(*name))
         .filter_map(|(name, func)| Some((func.as_ref().ok()?.item, name.clone())))
         .collect();
     // The call-site format kernel (W4g): the proven `format_args!` sites, recognized before the
@@ -850,9 +851,19 @@ impl Planner<'_> {
                 .filter(|component| component.iter().any(|node| carriers[*node].is_some()))
                 .collect();
             if components.is_empty() {
-                let commit = Commit {
-                    measured: Some((baseline, baseline)),
-                    ..Commit::default()
+                let commit = if self.cx.heap.native_string_enabled
+                    && self.fmt.values().any(|a| !a.sites.is_empty())
+                {
+                    let mut c = self
+                        .build_commit(problem, &vec![None; count], &ops, fault)
+                        .unwrap_or_default();
+                    c.measured = Some((baseline, baseline));
+                    c
+                } else {
+                    Commit {
+                        measured: Some((baseline, baseline)),
+                        ..Commit::default()
+                    }
                 };
                 accepted = Some(commit);
                 break;
@@ -1167,6 +1178,9 @@ impl Planner<'_> {
         });
         let mut entries = BTreeMap::new();
         for (name, func) in self.funcs {
+            if !self.live.contains(name) {
+                continue;
+            }
             let Ok(func) = func else { continue };
             let Some(item) = self.table.get(name) else {
                 continue;
@@ -1183,6 +1197,7 @@ impl Planner<'_> {
                 element_glue_nonthrowing: false,
                 panic_impl: panic_impl.as_ref(),
                 panic_reads_info,
+                native_string_enabled: self.cx.heap.native_string_enabled,
             };
             let Ok((op, slots)) = semantic_ops::support_of(&probe) else {
                 if let Some(&bstr_op) = self.bstr_ops.get(name) {
@@ -1328,6 +1343,9 @@ impl Planner<'_> {
     fn summarized_call_pairs(&self, problem: &mut Problem) -> Vec<Pair> {
         let mut pairs = Vec::new();
         for (name, func) in self.funcs {
+            if !self.live.contains(name) {
+                continue;
+            }
             let Ok(func) = func else { continue };
             if !self.is_candidate_glue_or_standard(name) {
                 continue;
@@ -1405,6 +1423,9 @@ impl Planner<'_> {
         let mut pairs = Vec::new();
         let mut reference_callers: BTreeMap<(JsName, usize), Vec<usize>> = BTreeMap::new();
         for (name, func) in self.funcs {
+            if !self.live.contains(name) {
+                continue;
+            }
             let Ok(func) = func else { continue };
             if self.is_candidate_glue_or_standard(name) {
                 continue;
@@ -2388,6 +2409,11 @@ impl Planner<'_> {
             BodySemantic::Standard(
                 StandardOperation::SliceSort | StandardOperation::SliceSortCmp,
             ) => false,
+            BodySemantic::Standard(op)
+                if op.is_typed_heap() || op.is_native_string() || op.is_fast_str_op() =>
+            {
+                false
+            }
             BodySemantic::Standard(_) => true,
             BodySemantic::DropGlue(ty) => item
                 .jir
@@ -2597,7 +2623,10 @@ impl Planner<'_> {
         let (baseline_costs, native_costs) = unaries;
         let mut cut = mincut::MinCut::new(count);
         for index in 0..count {
-            let native = if forced.contains(&index) {
+            let native = if forced.contains(&index)
+                || (self.cx.heap.native_string_enabled
+                    && problem.nodes[index].family == Some(CandidateKind::String))
+            {
                 INF
             } else {
                 native_costs[index]
@@ -3326,8 +3355,9 @@ impl Planner<'_> {
                     let steps: Vec<Step> = arg.path.iter().map(|_| Step::Deref).collect();
                     strings.push((arg.value, label(name, value_site, &steps)));
                 }
-                let all = native(dest) && strings.iter().all(|(_, l)| native(*l));
-                let any = native(dest) || strings.iter().any(|(_, l)| native(*l));
+                let native_str = self.cx.heap.native_string_enabled;
+                let all = native_str || (native(dest) && strings.iter().all(|(_, l)| native(*l)));
+                let any = native_str || native(dest) || strings.iter().any(|(_, l)| native(*l));
                 if !any {
                     continue;
                 }
@@ -3337,7 +3367,8 @@ impl Planner<'_> {
                         format!("`{}` format site solved to mixed carriers", name.as_str()),
                     ));
                 }
-                if matches!(site.kind, SiteKind::WriteFmt { .. })
+                if !native_str
+                    && matches!(site.kind, SiteKind::WriteFmt { .. })
                     && dest != Some(Carrier::StringBuilder)
                 {
                     return Err((
@@ -3352,7 +3383,8 @@ impl Planner<'_> {
                     }
                     out.values[arg.value.0 as usize].carrier = match arg.kind {
                         // The mark records the source's own committed carrier, so the emission
-                        // reads `.text` exactly when the source is a builder.
+                        // reads `.text` exactly when the source is a builder (or `.s` under
+                        // universal native `String`).
                         DisplayKind::String => strings
                             .iter()
                             .find(|(value, _)| *value == arg.value)
@@ -3367,8 +3399,9 @@ impl Planner<'_> {
                 for (rename, renamed) in &site.renames {
                     out.values[rename.0 as usize].carrier = out.values[renamed.0 as usize].carrier;
                 }
-                if matches!(site.kind, SiteKind::WriteFmt { .. })
-                    || dest == Some(Carrier::StringBuilder)
+                if !native_str
+                    && (matches!(site.kind, SiteKind::WriteFmt { .. })
+                        || dest == Some(Carrier::StringBuilder))
                 {
                     members.insert("str_len".to_owned());
                 }

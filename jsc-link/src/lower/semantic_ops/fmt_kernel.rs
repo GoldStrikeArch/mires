@@ -1057,6 +1057,16 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
                         super::string::exact_builder(name, length),
                     )))
                 }
+                Carrier::Baseline if cx.heap().native_string_enabled => {
+                    let (bind, name) = cx.temp(text);
+                    Ok(Some(Lowered::Value(
+                        vec![bind],
+                        jsast::object_of(vec![
+                            ("s", name.clone()),
+                            ("cap", jsast::member(name, "length")),
+                        ]),
+                    )))
+                }
                 _ => Err(kernel_decline("marked format! destination is not native")),
             }
         }
@@ -1067,13 +1077,19 @@ pub(crate) fn intercept(cx: &JsCx<'_>, op: &Op) -> Res<Option<Lowered>> {
             if !marked(view.chase_copies(*arguments)) {
                 return Ok(None);
             }
+            let walk = cx.pointee_place(*receiver)?;
+            let recv = cx.read_place(&walk.place);
+            if cx.heap().native_string_enabled {
+                let text = cx.expr_of(*arguments)?;
+                return Ok(Some(Lowered::Done(vec![jsast::expr_stmt(
+                    jsast::compound_assign(BinOp::Add, jsast::member(recv, "s"), text),
+                )])));
+            }
             // The receiver is a committed StringBuilder behind `&mut` (the plan's gate). The
             // append is `String::push_str`'s: the formatted text (well formed piece by piece, see
             // `display_text`), the required length is the cached length plus that text's (the
             // only text measured), the capacity grows to cover it, and the cached length advances
             // with the text.
-            let walk = cx.pointee_place(*receiver)?;
-            let recv = cx.read_place(&walk.place);
             // A format site's runtime members are the planner's to account (`representation`),
             // so the set is only a sink here.
             let mut helpers = BTreeSet::new();
@@ -1280,6 +1296,7 @@ fn format_text(
         },
         (ArgFormat::Display, DisplayKind::String) => match mark {
             Carrier::StringBuilder => jsast::member(loaded, "text"),
+            Carrier::HostString if cx.heap().native_string_enabled => jsast::member(loaded, "s"),
             _ => loaded,
         },
         _ => return Err(kernel_decline("unsupported format/kind combination")),

@@ -1738,7 +1738,13 @@ impl<'a> JsCx<'a> {
         let element = if is_constant {
             element
         } else {
-            value::clone_expr(self.table, self.interns, element_ty, element)
+            value::clone_expr_with(
+                self.table,
+                self.interns,
+                element_ty,
+                element,
+                self.nested_clone,
+            )
         };
         let repeated = jsast::call(
             jsast::member(jsast::id("Array"), "from"),

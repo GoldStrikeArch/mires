@@ -39,6 +39,27 @@ pub fn lower_with_ascii(
     let physical = input
         .abi
         .and_then(|abi| abi.target_signature(input.name, func.item));
+    if input.heap.is_some_and(|h| h.native_string_enabled) {
+        if let BodySemantic::DropGlue(ty) = input.body.semantic {
+            if input.table.get(ty).is_some_and(|d| {
+                d.meta.candidate == rcgjs_object::jir::types::RepresentationCandidate::String
+            }) {
+                let params: Vec<String> =
+                    (0..func.params.len()).map(|i| format!("$p{i}")).collect();
+                let decl = jsast::function(input.name.as_str(), params, Vec::new());
+                return Ok(LoweredItem {
+                    decl,
+                    refs: BTreeSet::new(),
+                    zombies: Vec::new(),
+                    loc: None,
+                    names: Vec::new(),
+                    dts: None,
+                    js_alloc_origins: Vec::new(),
+                    bigints: BTreeSet::new(),
+                });
+            }
+        }
+    }
     if input.body.semantic
         == BodySemantic::Standard(rcgjs_object::jir::semantic::StandardOperation::SliceSort)
     {
@@ -309,11 +330,19 @@ pub fn lower_with_ascii(
             .filter(|(_, init)| init.is_none())
             .map(|(name, _)| name.clone())
             .collect();
+        eliminate_dead_local_writes(&mut body, &local_names);
         fuse_local_bytes_str_with(&mut body, &uninit_locals, cx.needs_byte_slice_ref());
         fold_offset_slot_derefs(&mut body, &uninit_locals);
+        eliminate_dead_local_writes(&mut body, &local_names);
         fold_sfp_deref_only(&mut body, &uninit_locals);
         if crate::lower::bstr::enabled() {
             fuse_local_bstr_in_bytes(&mut body, &uninit_locals);
+        }
+        if input.opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
+            && !cx.byte_views.raw_byte_derefs
+            && cx.byte_views.elide_scale_scalar
+        {
+            cse_slice_loads(&mut body, &mut declarations, &mut local_names);
         }
         eliminate_dead_local_writes(&mut body, &local_names);
     }
@@ -1936,13 +1965,24 @@ fn eliminate_dead_local_writes(body: &mut Vec<Stmt>, locals: &HashSet<String>) {
 }
 
 fn count_simple_writes(body: &[Stmt], writes: &mut std::collections::HashMap<String, usize>) {
-    for stmt in body {
-        match stmt {
-            Stmt::ExprStmt(jsast::Expr::Assign(target, _)) => {
-                if let jsast::Expr::Ident(name) = target.as_ref() {
+    fn count_expr_writes(expr: &Expr, writes: &mut std::collections::HashMap<String, usize>) {
+        match expr {
+            Expr::Assign(target, _) => {
+                if let Expr::Ident(name) = target.as_ref() {
                     *writes.entry(name.clone()).or_default() += 1;
                 }
             }
+            Expr::Seq(items) => {
+                for item in items {
+                    count_expr_writes(item, writes);
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in body {
+        match stmt {
+            Stmt::ExprStmt(expr) => count_expr_writes(expr, writes),
             Stmt::If(_, then, els) => {
                 count_simple_writes(then, writes);
                 if let Some(els) = els {
@@ -1964,6 +2004,29 @@ fn count_simple_writes(body: &[Stmt], writes: &mut std::collections::HashMap<Str
 }
 
 fn remove_unread_writes(body: &mut Vec<Stmt>, unread: &HashSet<String>) -> bool {
+    fn strip_expr(expr: Expr, unread: &HashSet<String>, changed: &mut bool) -> Option<Expr> {
+        match expr {
+            Expr::Assign(target, value) if matches!(target.as_ref(), Expr::Ident(name) if unread.contains(name)) =>
+            {
+                *changed = true;
+                (!jsast::is_droppable(&value)).then_some(*value)
+            }
+            Expr::Seq(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    if let Some(kept) = strip_expr(item, unread, changed) {
+                        out.push(kept);
+                    }
+                }
+                match out.len() {
+                    0 => None,
+                    1 => out.pop(),
+                    _ => Some(Expr::Seq(out)),
+                }
+            }
+            other => Some(other),
+        }
+    }
     let mut changed = false;
     let mut kept = Vec::with_capacity(body.len());
     for mut stmt in std::mem::take(body) {
@@ -1990,11 +2053,7 @@ fn remove_unread_writes(body: &mut Vec<Stmt>, unread: &HashSet<String>) -> bool 
             _ => {}
         }
         let replacement = match stmt {
-            Stmt::ExprStmt(jsast::Expr::Assign(target, value)) if matches!(target.as_ref(), jsast::Expr::Ident(name) if unread.contains(name)) =>
-            {
-                changed = true;
-                (!jsast::is_droppable(&value)).then_some(Stmt::ExprStmt(*value))
-            }
+            Stmt::ExprStmt(expr) => strip_expr(expr, unread, &mut changed).map(Stmt::ExprStmt),
             other => Some(other),
         };
         if let Some(stmt) = replacement {
@@ -2758,7 +2817,7 @@ pub(super) fn fold_offset_slot_derefs(body: &mut Vec<Stmt>, locals: &HashSet<Str
 /// rewriting `v = __rt.sfp(ptr, len)` to `v = ptr` avoids both the `__rt.sfp` call and the
 /// `{ buf, off, len }` allocation — including on empty slices (`len == 0`) where `ptr` is a
 /// dangling integer that the loop never dereferences.
-pub(super) fn fold_sfp_deref_only(body: &mut [Stmt], locals: &HashSet<String>) {
+pub(super) fn fold_sfp_deref_only(body: &mut Vec<Stmt>, locals: &HashSet<String>) {
     #[derive(Default)]
     struct SfpUsage {
         writes: usize,
@@ -2999,19 +3058,27 @@ pub(super) fn fold_sfp_deref_only(body: &mut [Stmt], locals: &HashSet<String>) {
         }
     }
 
+    fn is_pure_len_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_) => true,
+            Expr::Member(obj, _) => is_pure_len_expr(obj),
+            _ => false,
+        }
+    }
+
     fn rewrite_stmts(stmts: &mut [Stmt], deref_only: &HashSet<String>) {
         for stmt in stmts {
             match stmt {
                 Stmt::ExprStmt(Expr::Assign(lhs, rhs)) if matches!(lhs.as_ref(), Expr::Ident(n) if deref_only.contains(n)) => {
                     if let Some((ptr_arg, len_arg)) = match_sfp_call(rhs) {
-                        if jsast::is_droppable(len_arg) {
+                        if jsast::is_droppable(len_arg) || is_pure_len_expr(len_arg) {
                             **rhs = ptr_arg.clone();
                         }
                     }
                 }
                 Stmt::Let(name, Some(init)) if deref_only.contains(name) => {
                     if let Some((ptr_arg, len_arg)) = match_sfp_call(init) {
-                        if jsast::is_droppable(len_arg) {
+                        if jsast::is_droppable(len_arg) || is_pure_len_expr(len_arg) {
                             *init = ptr_arg.clone();
                         }
                     }
@@ -3050,13 +3117,6 @@ pub(super) fn fold_sfp_deref_only(body: &mut [Stmt], locals: &HashSet<String>) {
         candidates: &HashSet<String>,
         folded_len_vars: &mut HashSet<String>,
     ) {
-        fn is_pure_len_expr(expr: &Expr) -> bool {
-            match expr {
-                Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_) => true,
-                Expr::Member(obj, _) => is_pure_len_expr(obj),
-                _ => false,
-            }
-        }
         fn collect_idents(expr: &Expr, out: &mut HashSet<String>) {
             match expr {
                 Expr::Ident(n) => {
@@ -3127,102 +3187,452 @@ pub(super) fn fold_sfp_deref_only(body: &mut [Stmt], locals: &HashSet<String>) {
                 _ => 0,
             }
         }
-        fn replace_v_len_in_stmt(stmt: &mut Stmt, var: &str, replacement: &Expr) -> usize {
-            match stmt {
-                Stmt::ExprStmt(e)
-                | Stmt::Throw(e)
-                | Stmt::Const(_, e)
-                | Stmt::Let(_, Some(e))
-                | Stmt::Return(Some(e)) => replace_v_len_in_expr(e, var, replacement),
-                Stmt::If(cond, _, _) => replace_v_len_in_expr(cond, var, replacement),
-                _ => 0,
+        fn fold_stmts_linear(
+            stmts: &mut [Stmt],
+            candidates: &HashSet<String>,
+            active: &mut HashMap<String, (Expr, HashSet<String>)>,
+            folded_len_vars: &mut HashSet<String>,
+        ) {
+            fn fold_one_expr(
+                expr: &mut Expr,
+                candidates: &HashSet<String>,
+                active: &mut HashMap<String, (Expr, HashSet<String>)>,
+                folded_len_vars: &mut HashSet<String>,
+            ) {
+                // Handle comma-separated `Seq` of pure assignments sequentially.
+                if let Expr::Seq(items) = expr {
+                    for item in items.iter_mut() {
+                        fold_one_expr(item, candidates, active, folded_len_vars);
+                    }
+                    return;
+                }
+                if let Expr::Assign(lhs, rhs) = expr {
+                    // Replace `v.len` in RHS first.
+                    for (var, (len_expr, _)) in active.iter() {
+                        if replace_v_len_in_expr(rhs, var, len_expr) > 0 {
+                            folded_len_vars.insert(var.clone());
+                        }
+                    }
+                    if let Expr::Ident(target) = lhs.as_ref() {
+                        // Invalidate any active entry depending on `target` or keyed by `target`.
+                        active.retain(|var, (_, deps)| var != target && !deps.contains(target));
+                        if candidates.contains(target) {
+                            if let Some((_, len_arg)) = match_sfp_call(rhs) {
+                                if is_pure_len_expr(len_arg) {
+                                    let mut deps = HashSet::new();
+                                    collect_idents(len_arg, &mut deps);
+                                    active.insert(target.clone(), (len_arg.clone(), deps));
+                                    return;
+                                }
+                            }
+                        }
+                        if !expr_is_side_effect_free(rhs) {
+                            // A call or arbitrary effect may mutate `.len` fields on heap objects.
+                            active.retain(|_, (le, _)| !matches!(le, Expr::Member(_, _)));
+                        }
+                        return;
+                    }
+                    // Property/index write: invalidate member-based lengths.
+                    active.retain(|_, (le, _)| !matches!(le, Expr::Member(_, _)));
+                    return;
+                }
+                for (var, (len_expr, _)) in active.iter() {
+                    if replace_v_len_in_expr(expr, var, len_expr) > 0 {
+                        folded_len_vars.insert(var.clone());
+                    }
+                }
+                if !expr_is_side_effect_free(expr) {
+                    active.clear();
+                }
+            }
+
+            for stmt in stmts.iter_mut() {
+                match stmt {
+                    Stmt::ExprStmt(e) => fold_one_expr(e, candidates, active, folded_len_vars),
+                    Stmt::Let(target, Some(init)) => {
+                        for (var, (len_expr, _)) in active.iter() {
+                            if replace_v_len_in_expr(init, var, len_expr) > 0 {
+                                folded_len_vars.insert(var.clone());
+                            }
+                        }
+                        active.retain(|var, (_, deps)| var != target && !deps.contains(target));
+                        if candidates.contains(target) {
+                            if let Some((_, len_arg)) = match_sfp_call(init) {
+                                if is_pure_len_expr(len_arg) {
+                                    let mut deps = HashSet::new();
+                                    collect_idents(len_arg, &mut deps);
+                                    active.insert(target.clone(), (len_arg.clone(), deps));
+                                    continue;
+                                }
+                            }
+                        }
+                        if !expr_is_side_effect_free(init) {
+                            active.retain(|_, (le, _)| !matches!(le, Expr::Member(_, _)));
+                        }
+                    }
+                    Stmt::Block(b) => fold_stmts_linear(b, candidates, active, folded_len_vars),
+                    Stmt::Labeled(_, inner) => {
+                        let mut sub = HashMap::new();
+                        fold_stmts_linear(
+                            std::slice::from_mut(inner.as_mut()),
+                            candidates,
+                            &mut sub,
+                            folded_len_vars,
+                        );
+                        active.clear();
+                    }
+                    Stmt::If(cond, a, b) => {
+                        for (var, (len_expr, _)) in active.iter() {
+                            if replace_v_len_in_expr(cond, var, len_expr) > 0 {
+                                folded_len_vars.insert(var.clone());
+                            }
+                        }
+                        let mut a_active = active.clone();
+                        fold_stmts_linear(a, candidates, &mut a_active, folded_len_vars);
+                        if let Some(b) = b {
+                            let mut b_active = active.clone();
+                            fold_stmts_linear(b, candidates, &mut b_active, folded_len_vars);
+                        }
+                        active.clear();
+                    }
+                    Stmt::Switch(disc, cases) => {
+                        for (var, (len_expr, _)) in active.iter() {
+                            if replace_v_len_in_expr(disc, var, len_expr) > 0 {
+                                folded_len_vars.insert(var.clone());
+                            }
+                        }
+                        for c in cases {
+                            let mut c_active = active.clone();
+                            fold_stmts_linear(
+                                &mut c.body,
+                                candidates,
+                                &mut c_active,
+                                folded_len_vars,
+                            );
+                        }
+                        active.clear();
+                    }
+                    Stmt::LoopForever(_, b) => {
+                        let mut sub = HashMap::new();
+                        fold_stmts_linear(b, candidates, &mut sub, folded_len_vars);
+                        active.clear();
+                    }
+                    Stmt::While(cond, b) => {
+                        let mut sub = HashMap::new();
+                        fold_stmts_linear(b, candidates, &mut sub, folded_len_vars);
+                        let _ = cond;
+                        active.clear();
+                    }
+                    Stmt::TryCatch { body, handler, .. } => {
+                        let mut sub = HashMap::new();
+                        fold_stmts_linear(body, candidates, &mut sub, folded_len_vars);
+                        let mut hsub = HashMap::new();
+                        fold_stmts_linear(handler, candidates, &mut hsub, folded_len_vars);
+                        active.clear();
+                    }
+                    Stmt::Return(Some(e)) | Stmt::Throw(e) => {
+                        for (var, (len_expr, _)) in active.iter() {
+                            if replace_v_len_in_expr(e, var, len_expr) > 0 {
+                                folded_len_vars.insert(var.clone());
+                            }
+                        }
+                        active.clear();
+                    }
+                    _ => active.clear(),
+                }
             }
         }
 
-        // First recurse into nested statement lists.
-        for stmt in stmts.iter_mut() {
-            match stmt {
-                Stmt::If(_, a, b) => {
-                    fold_immediate_sfp_len(a, candidates, folded_len_vars);
-                    if let Some(b) = b {
-                        fold_immediate_sfp_len(b, candidates, folded_len_vars);
+        let mut active = HashMap::new();
+        fold_stmts_linear(stmts, candidates, &mut active, folded_len_vars);
+    }
+
+    /// Propagates single-assignment aliases of `__rt.sfp` locals (`_3 = $v12`) inside straight-line
+    /// blocks when `_3` is never mentioned outside statements strictly following `_3 = $v12` (so
+    /// it cannot carry across a loop back-edge) and neither `_3` nor `$v12` is reassigned or
+    /// captured by a closure. This exposes `slice::Iter` (`_3 = $v12; _3$2 = $v12.len; ... _3.buf[...]`)
+    /// directly to `fold_immediate_sfp_len` and `rewrite_stmts`.
+    fn propagate_sfp_aliases(body: &mut Vec<Stmt>, locals: &HashSet<String>) {
+        fn count_ident_mentions(stmts: &[Stmt], target: &str) -> usize {
+            let mut n = 0usize;
+            for stmt in stmts {
+                jsast::visit_idents(stmt, &mut |id| {
+                    if id == target {
+                        n += 1;
+                    }
+                });
+            }
+            n
+        }
+
+        fn replace_ident_in_expr(expr: &mut Expr, from: &str, to: &str) {
+            match expr {
+                Expr::Ident(n) if n == from => *n = to.to_owned(),
+                Expr::Member(o, _) | Expr::Unary(_, o) => replace_ident_in_expr(o, from, to),
+                Expr::Index(a, b)
+                | Expr::Binary(_, a, b)
+                | Expr::Assign(a, b)
+                | Expr::CompoundAssign(_, a, b) => {
+                    replace_ident_in_expr(a, from, to);
+                    replace_ident_in_expr(b, from, to);
+                }
+                Expr::Call(c, args) | Expr::New(c, args) => {
+                    replace_ident_in_expr(c, from, to);
+                    for a in args {
+                        replace_ident_in_expr(a, from, to);
                     }
                 }
-                Stmt::Switch(_, cases) => {
-                    for c in cases {
-                        fold_immediate_sfp_len(&mut c.body, candidates, folded_len_vars);
+                Expr::Cond(c, t, e) => {
+                    replace_ident_in_expr(c, from, to);
+                    replace_ident_in_expr(t, from, to);
+                    replace_ident_in_expr(e, from, to);
+                }
+                Expr::Object(entries) => {
+                    for (_, v) in entries {
+                        replace_ident_in_expr(v, from, to);
                     }
                 }
-                Stmt::Labeled(_, inner) => {
-                    fold_immediate_sfp_len(
-                        std::slice::from_mut(inner.as_mut()),
-                        candidates,
-                        folded_len_vars,
-                    );
-                }
-                Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
-                    fold_immediate_sfp_len(b, candidates, folded_len_vars);
-                }
-                Stmt::TryCatch { body, handler, .. } => {
-                    fold_immediate_sfp_len(body, candidates, folded_len_vars);
-                    fold_immediate_sfp_len(handler, candidates, folded_len_vars);
+                Expr::Array(items) | Expr::Seq(items) => {
+                    for x in items {
+                        replace_ident_in_expr(x, from, to);
+                    }
                 }
                 _ => {}
             }
         }
 
-        let len = stmts.len();
-        for i in 0..len {
-            let sfp_def: Option<(String, Expr)> = match &stmts[i] {
-                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => match lhs.as_ref() {
-                    Expr::Ident(n) if candidates.contains(n) => {
-                        match_sfp_call(rhs).and_then(|(_, len_arg)| {
-                            is_pure_len_expr(len_arg).then(|| (n.clone(), len_arg.clone()))
-                        })
+        fn replace_ident_in_stmt(stmt: &mut Stmt, from: &str, to: &str) {
+            match stmt {
+                Stmt::ExprStmt(e)
+                | Stmt::Throw(e)
+                | Stmt::Const(_, e)
+                | Stmt::Let(_, Some(e))
+                | Stmt::Return(Some(e)) => replace_ident_in_expr(e, from, to),
+                Stmt::Lets(decls) => {
+                    for (_, init) in decls {
+                        if let Some(e) = init {
+                            replace_ident_in_expr(e, from, to);
+                        }
                     }
-                    _ => None,
-                },
-                Stmt::Let(n, Some(init)) if candidates.contains(n) => match_sfp_call(init)
-                    .and_then(|(_, len_arg)| {
-                        is_pure_len_expr(len_arg).then(|| (n.clone(), len_arg.clone()))
-                    }),
-                _ => None,
-            };
-            let Some((var, len_expr)) = sfp_def else {
-                continue;
-            };
-            let mut deps = HashSet::new();
-            collect_idents(&len_expr, &mut deps);
-            for next in &mut stmts[i + 1..] {
-                let replaced = replace_v_len_in_stmt(next, &var, &len_expr);
-                if replaced > 0 {
-                    folded_len_vars.insert(var.clone());
-                    break;
                 }
-                // Only skip past pure local-only assignments that do not mutate any dep of `len_expr`.
-                let safe_step = match next {
-                    Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
-                        matches!(lhs.as_ref(), Expr::Ident(target) if !deps.contains(target) && target != &var)
-                            && expr_is_side_effect_free(rhs)
+                Stmt::If(t, a, b) => {
+                    replace_ident_in_expr(t, from, to);
+                    for s in a {
+                        replace_ident_in_stmt(s, from, to);
                     }
-                    Stmt::Let(target, Some(init)) => {
-                        !deps.contains(target) && target != &var && expr_is_side_effect_free(init)
+                    if let Some(b) = b {
+                        for s in b {
+                            replace_ident_in_stmt(s, from, to);
+                        }
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    replace_ident_in_expr(d, from, to);
+                    for c in cases {
+                        for t in &mut c.tests {
+                            replace_ident_in_expr(t, from, to);
+                        }
+                        for s in &mut c.body {
+                            replace_ident_in_stmt(s, from, to);
+                        }
+                    }
+                }
+                Stmt::Labeled(_, inner) => replace_ident_in_stmt(inner, from, to),
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                    for s in b {
+                        replace_ident_in_stmt(s, from, to);
+                    }
+                }
+                Stmt::While(t, b) => {
+                    replace_ident_in_expr(t, from, to);
+                    for s in b {
+                        replace_ident_in_stmt(s, from, to);
+                    }
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    for s in body {
+                        replace_ident_in_stmt(s, from, to);
+                    }
+                    for s in handler {
+                        replace_ident_in_stmt(s, from, to);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn has_closure_use(stmts: &[Stmt], target: &str) -> bool {
+            fn in_expr(expr: &Expr, target: &str, in_fn: bool) -> bool {
+                match expr {
+                    Expr::Ident(n) => in_fn && n == target,
+                    Expr::Arrow(_, jsast::ArrowBody::Expr(b)) => in_expr(b, target, true),
+                    Expr::Arrow(_, jsast::ArrowBody::Block(s)) => in_stmts(s, target, true),
+                    Expr::Member(o, _) | Expr::Unary(_, o) => in_expr(o, target, in_fn),
+                    Expr::Index(a, b)
+                    | Expr::Binary(_, a, b)
+                    | Expr::Assign(a, b)
+                    | Expr::CompoundAssign(_, a, b) => {
+                        in_expr(a, target, in_fn) || in_expr(b, target, in_fn)
+                    }
+                    Expr::Call(c, args) | Expr::New(c, args) => {
+                        in_expr(c, target, in_fn) || args.iter().any(|a| in_expr(a, target, in_fn))
+                    }
+                    Expr::Cond(c, t, e) => {
+                        in_expr(c, target, in_fn)
+                            || in_expr(t, target, in_fn)
+                            || in_expr(e, target, in_fn)
+                    }
+                    Expr::Object(entries) => entries.iter().any(|(_, v)| in_expr(v, target, in_fn)),
+                    Expr::Array(items) | Expr::Seq(items) => {
+                        items.iter().any(|x| in_expr(x, target, in_fn))
                     }
                     _ => false,
-                };
-                if !safe_step {
-                    break;
+                }
+            }
+            fn in_stmts(stmts: &[Stmt], target: &str, in_fn: bool) -> bool {
+                stmts.iter().any(|s| match s {
+                    Stmt::ExprStmt(e)
+                    | Stmt::Throw(e)
+                    | Stmt::Const(_, e)
+                    | Stmt::Let(_, Some(e))
+                    | Stmt::Return(Some(e)) => in_expr(e, target, in_fn),
+                    Stmt::Lets(decls) => decls
+                        .iter()
+                        .filter_map(|(_, i)| i.as_ref())
+                        .any(|e| in_expr(e, target, in_fn)),
+                    Stmt::If(t, a, b) => {
+                        in_expr(t, target, in_fn)
+                            || in_stmts(a, target, in_fn)
+                            || b.as_ref().is_some_and(|b| in_stmts(b, target, in_fn))
+                    }
+                    Stmt::Switch(d, cases) => {
+                        in_expr(d, target, in_fn)
+                            || cases.iter().any(|c| {
+                                c.tests.iter().any(|t| in_expr(t, target, in_fn))
+                                    || in_stmts(&c.body, target, in_fn)
+                            })
+                    }
+                    Stmt::Labeled(_, inner) => in_stmts(std::slice::from_ref(inner), target, in_fn),
+                    Stmt::LoopForever(_, b) | Stmt::Block(b) => in_stmts(b, target, in_fn),
+                    Stmt::While(t, b) => in_expr(t, target, in_fn) || in_stmts(b, target, in_fn),
+                    Stmt::TryCatch { body, handler, .. } => {
+                        in_stmts(body, target, in_fn) || in_stmts(handler, target, in_fn)
+                    }
+                    Stmt::FunctionDecl { body, .. } => in_stmts(body, target, true),
+                    _ => false,
+                })
+            }
+            in_stmts(stmts, target, false)
+        }
+
+        fn process_block(
+            stmts: &mut Vec<Stmt>,
+            sfp_vars: &HashSet<String>,
+            single_write_aliases: &HashSet<String>,
+            total_mentions: &HashMap<String, usize>,
+        ) {
+            let mut active_sfp: HashSet<String> = HashSet::new();
+            let mut i = 0;
+            while i < stmts.len() {
+                if let Stmt::ExprStmt(Expr::Assign(lhs, rhs)) = &stmts[i] {
+                    if let Expr::Ident(target) = lhs.as_ref() {
+                        if sfp_vars.contains(target) && match_sfp_call(rhs).is_some() {
+                            active_sfp.insert(target.clone());
+                            i += 1;
+                            continue;
+                        }
+                        if let Expr::Ident(src) = rhs.as_ref() {
+                            if single_write_aliases.contains(target) && active_sfp.contains(src) {
+                                let after_mentions = count_ident_mentions(&stmts[i + 1..], target);
+                                if total_mentions.get(target).copied() == Some(after_mentions + 1) {
+                                    let from = target.clone();
+                                    let to = src.clone();
+                                    for s in &mut stmts[i + 1..] {
+                                        replace_ident_in_stmt(s, &from, &to);
+                                    }
+                                    stmts.remove(i);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                i += 1;
+            }
+            for stmt in stmts.iter_mut() {
+                match stmt {
+                    Stmt::If(_, a, b) => {
+                        process_block(a, sfp_vars, single_write_aliases, total_mentions);
+                        if let Some(b) = b {
+                            process_block(b, sfp_vars, single_write_aliases, total_mentions);
+                        }
+                    }
+                    Stmt::Switch(_, cases) => {
+                        for c in cases {
+                            process_block(
+                                &mut c.body,
+                                sfp_vars,
+                                single_write_aliases,
+                                total_mentions,
+                            );
+                        }
+                    }
+                    Stmt::Labeled(_, inner) => {
+                        if let Stmt::Block(b) = inner.as_mut() {
+                            process_block(b, sfp_vars, single_write_aliases, total_mentions);
+                        }
+                    }
+                    Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
+                        process_block(b, sfp_vars, single_write_aliases, total_mentions);
+                    }
+                    Stmt::TryCatch { body, handler, .. } => {
+                        process_block(body, sfp_vars, single_write_aliases, total_mentions);
+                        process_block(handler, sfp_vars, single_write_aliases, total_mentions);
+                    }
+                    _ => {}
                 }
             }
         }
+
+        let mut usage = HashMap::new();
+        scan_stmts(body, locals, false, &mut usage);
+        let sfp_vars: HashSet<String> = usage
+            .iter()
+            .filter(|(name, u)| u.writes == 1 && !has_closure_use(body, name))
+            .map(|(name, _)| name.clone())
+            .collect();
+        let single_write_aliases: HashSet<String> = usage
+            .iter()
+            .filter(|(name, u)| {
+                u.writes == 1
+                    && (u.index_uses > 0 || u.len_reads > 0)
+                    && u.other_uses == 0
+                    && !has_closure_use(body, name)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if single_write_aliases.is_empty() || sfp_vars.is_empty() {
+            return;
+        }
+        let mut total_mentions: HashMap<String, usize> = HashMap::new();
+        for stmt in body.iter() {
+            jsast::visit_idents(stmt, &mut |id| {
+                if single_write_aliases.contains(id) {
+                    *total_mentions.entry(id.to_owned()).or_default() += 1;
+                }
+            });
+        }
+        process_block(body, &sfp_vars, &single_write_aliases, &total_mentions);
     }
+
+    propagate_sfp_aliases(body, locals);
 
     let mut usage = HashMap::new();
     scan_stmts(body, locals, false, &mut usage);
     let len_candidates: HashSet<String> = usage
         .iter()
         .filter(|(_, u)| {
-            u.writes == 1 && u.index_uses >= 1 && u.len_reads == 1 && u.other_uses == 0
+            u.writes == 1 && u.index_uses >= 1 && u.len_reads >= 1 && u.other_uses == 0
         })
         .map(|(name, _)| name.clone())
         .collect();
@@ -3244,6 +3654,498 @@ pub(super) fn fold_sfp_deref_only(body: &mut [Stmt], locals: &HashSet<String>) {
     if !deref_only.is_empty() {
         rewrite_stmts(body, &deref_only);
     }
+}
+
+/// Common-subexpression elimination for repeated slice/array object-element reads such as
+/// `a[b + h].z`, `a[b + h].x`, `a[b + h].y`, `a[b + h].prev`, `a[b + h].next` (`ReleaseSpeed`,
+/// proxy-free arrays).
+///
+/// Whenever `arr[off + idx]` (or `arr[idx]`) is unconditionally evaluated as the receiver of a
+/// member access in statement `stmts[start]` and appears at least twice across a maximal
+/// contiguous read-only span `stmts[start..=end]` (no writes to `arr`/`off`/`idx`, no array
+/// element writes `_[_] = ...`, no non-pure/non-panic calls, no closures or `try/catch`), we bind
+/// `$slN = arr[off + idx]` right before `stmts[start]` and replace every `arr[off + idx].prop`
+/// base across `stmts[start..=end]` with `$slN`.
+pub(super) fn cse_slice_loads(
+    body: &mut Vec<Stmt>,
+    declarations: &mut Vec<(String, Option<Expr>)>,
+    local_names: &mut HashSet<String>,
+) {
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct SliceLoadKey {
+        arr: String,
+        off: Option<String>,
+        idx: String,
+    }
+
+    impl SliceLoadKey {
+        fn to_expr(&self) -> Expr {
+            let index = match &self.off {
+                Some(off) => Expr::Binary(
+                    jsast::BinOp::Add,
+                    Box::new(jsast::id(off.clone())),
+                    Box::new(jsast::id(self.idx.clone())),
+                ),
+                None => jsast::id(self.idx.clone()),
+            };
+            Expr::Index(Box::new(jsast::id(self.arr.clone())), Box::new(index))
+        }
+
+        fn mentions(&self, name: &str) -> bool {
+            self.arr == name || self.idx == name || self.off.as_deref() == Some(name)
+        }
+    }
+
+    fn match_slice_load(expr: &Expr) -> Option<SliceLoadKey> {
+        let Expr::Index(arr, index) = expr else {
+            return None;
+        };
+        let Expr::Ident(arr_name) = arr.as_ref() else {
+            return None;
+        };
+        match index.as_ref() {
+            Expr::Ident(idx_name) => Some(SliceLoadKey {
+                arr: arr_name.clone(),
+                off: None,
+                idx: idx_name.clone(),
+            }),
+            Expr::Binary(jsast::BinOp::Add, l, r) => match (l.as_ref(), r.as_ref()) {
+                (Expr::Ident(off_name), Expr::Ident(idx_name)) => Some(SliceLoadKey {
+                    arr: arr_name.clone(),
+                    off: Some(off_name.clone()),
+                    idx: idx_name.clone(),
+                }),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn is_non_mutating_call(callee: &Expr) -> bool {
+        match callee {
+            Expr::Member(obj, method) if matches!(obj.as_ref(), Expr::Ident(m) if m == "Math") => {
+                matches!(
+                    method.as_str(),
+                    "abs"
+                        | "imul"
+                        | "min"
+                        | "max"
+                        | "sqrt"
+                        | "floor"
+                        | "ceil"
+                        | "trunc"
+                        | "fround"
+                        | "round"
+                        | "clz32"
+                )
+            }
+            Expr::Member(obj, method) if matches!(obj.as_ref(), Expr::Ident(rt) if rt == "__rt") => {
+                matches!(method.as_str(), "bstr_bytes" | "str_bytes")
+            }
+            Expr::Ident(name) => {
+                name.contains("panic_bounds_check")
+                    || name.contains("panic_const_")
+                    || name.contains("slice_index_")
+                    || name.contains("panic_explicit")
+                    || name.contains("rust_begin_unwind")
+            }
+            _ => false,
+        }
+    }
+
+    fn expr_has_any_call(expr: &Expr) -> bool {
+        match expr {
+            Expr::Call(_, _) | Expr::New(_, _) => true,
+            Expr::Member(o, _) | Expr::Unary(_, o) => expr_has_any_call(o),
+            Expr::Index(a, b)
+            | Expr::Binary(_, a, b)
+            | Expr::Assign(a, b)
+            | Expr::CompoundAssign(_, a, b) => expr_has_any_call(a) || expr_has_any_call(b),
+            Expr::Cond(c, t, e) => {
+                expr_has_any_call(c) || expr_has_any_call(t) || expr_has_any_call(e)
+            }
+            Expr::Object(entries) => entries.iter().any(|(_, v)| expr_has_any_call(v)),
+            Expr::Array(items) | Expr::Seq(items) => items.iter().any(expr_has_any_call),
+            _ => false,
+        }
+    }
+
+    /// Collects `SliceLoadKey`s unconditionally evaluated as `arr[off + idx].prop` inside `expr`
+    /// without crossing short-circuit operators, conditional branches, or impure calls.
+    fn collect_unconditional_in_expr(expr: &Expr, out: &mut Vec<SliceLoadKey>) {
+        match expr {
+            Expr::Member(obj, _) => {
+                if let Some(key) = match_slice_load(obj) {
+                    if !out.contains(&key) {
+                        out.push(key);
+                    }
+                } else {
+                    collect_unconditional_in_expr(obj, out);
+                }
+            }
+            Expr::Unary(_, inner) => collect_unconditional_in_expr(inner, out),
+            Expr::Binary(op, l, r) => {
+                collect_unconditional_in_expr(l, out);
+                if !matches!(op, jsast::BinOp::And | jsast::BinOp::Or) && !expr_has_any_call(l) {
+                    collect_unconditional_in_expr(r, out);
+                }
+            }
+            Expr::Cond(c, _, _) => collect_unconditional_in_expr(c, out),
+            Expr::Index(o, i) => {
+                collect_unconditional_in_expr(o, out);
+                if !expr_has_any_call(o) {
+                    collect_unconditional_in_expr(i, out);
+                }
+            }
+            Expr::Assign(lhs, rhs) => {
+                if let Expr::Member(obj, _) = lhs.as_ref() {
+                    if let Some(key) = match_slice_load(obj) {
+                        if !out.contains(&key) {
+                            out.push(key);
+                        }
+                    }
+                }
+                collect_unconditional_in_expr(rhs, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_unconditional_in_stmt(stmt: &Stmt, out: &mut Vec<SliceLoadKey>) {
+        match stmt {
+            Stmt::ExprStmt(e) | Stmt::Let(_, Some(e)) | Stmt::Return(Some(e)) => {
+                collect_unconditional_in_expr(e, out);
+            }
+            Stmt::If(test, _, _) | Stmt::Switch(test, _) => {
+                collect_unconditional_in_expr(test, out);
+            }
+            _ => {}
+        }
+    }
+
+    fn expr_invalidates(expr: &Expr, key: &SliceLoadKey) -> bool {
+        match expr {
+            Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
+                let lhs_bad = match lhs.as_ref() {
+                    Expr::Ident(name) => key.mentions(name),
+                    Expr::Index(_, _) => true,
+                    _ => false,
+                };
+                lhs_bad || expr_invalidates(lhs, key) || expr_invalidates(rhs, key)
+            }
+            Expr::Call(callee, args) => {
+                !is_non_mutating_call(callee)
+                    || expr_invalidates(callee, key)
+                    || args.iter().any(|a| expr_invalidates(a, key))
+            }
+            Expr::New(_, _) | Expr::Arrow(_, _) => true,
+            Expr::Member(o, _) | Expr::Unary(_, o) => expr_invalidates(o, key),
+            Expr::Index(a, b) | Expr::Binary(_, a, b) => {
+                expr_invalidates(a, key) || expr_invalidates(b, key)
+            }
+            Expr::Cond(c, t, e) => {
+                expr_invalidates(c, key) || expr_invalidates(t, key) || expr_invalidates(e, key)
+            }
+            Expr::Object(entries) => entries.iter().any(|(_, v)| expr_invalidates(v, key)),
+            Expr::Array(items) | Expr::Seq(items) => items.iter().any(|x| expr_invalidates(x, key)),
+            _ => false,
+        }
+    }
+
+    fn stmt_invalidates(stmt: &Stmt, key: &SliceLoadKey) -> bool {
+        match stmt {
+            Stmt::Let(n, init) => {
+                key.mentions(n) || init.as_ref().is_some_and(|e| expr_invalidates(e, key))
+            }
+            Stmt::Const(n, e) => key.mentions(n) || expr_invalidates(e, key),
+            Stmt::Lets(decls) => decls.iter().any(|(n, init)| {
+                key.mentions(n) || init.as_ref().is_some_and(|e| expr_invalidates(e, key))
+            }),
+            Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => expr_invalidates(e, key),
+            Stmt::If(test, a, b) => {
+                expr_invalidates(test, key)
+                    || a.iter().any(|s| stmt_invalidates(s, key))
+                    || b.as_ref()
+                        .is_some_and(|b| b.iter().any(|s| stmt_invalidates(s, key)))
+            }
+            Stmt::Switch(disc, cases) => {
+                expr_invalidates(disc, key)
+                    || cases.iter().any(|c| {
+                        c.tests.iter().any(|t| expr_invalidates(t, key))
+                            || c.body.iter().any(|s| stmt_invalidates(s, key))
+                    })
+            }
+            Stmt::Labeled(_, inner) => stmt_invalidates(inner, key),
+            Stmt::LoopForever(_, b) | Stmt::Block(b) => b.iter().any(|s| stmt_invalidates(s, key)),
+            Stmt::While(test, b) => {
+                expr_invalidates(test, key) || b.iter().any(|s| stmt_invalidates(s, key))
+            }
+            Stmt::TryCatch { .. } | Stmt::FunctionDecl { .. } => true,
+            _ => false,
+        }
+    }
+
+    fn count_in_expr(expr: &Expr, key: &SliceLoadKey) -> usize {
+        match expr {
+            Expr::Member(obj, _) => {
+                if match_slice_load(obj).as_ref() == Some(key) {
+                    1
+                } else {
+                    count_in_expr(obj, key)
+                }
+            }
+            Expr::Unary(_, inner) => count_in_expr(inner, key),
+            Expr::Index(a, b)
+            | Expr::Binary(_, a, b)
+            | Expr::Assign(a, b)
+            | Expr::CompoundAssign(_, a, b) => count_in_expr(a, key) + count_in_expr(b, key),
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                count_in_expr(c, key) + args.iter().map(|a| count_in_expr(a, key)).sum::<usize>()
+            }
+            Expr::Cond(c, t, e) => {
+                count_in_expr(c, key) + count_in_expr(t, key) + count_in_expr(e, key)
+            }
+            Expr::Object(entries) => entries.iter().map(|(_, v)| count_in_expr(v, key)).sum(),
+            Expr::Array(items) | Expr::Seq(items) => {
+                items.iter().map(|x| count_in_expr(x, key)).sum()
+            }
+            _ => 0,
+        }
+    }
+
+    fn count_in_stmt(stmt: &Stmt, key: &SliceLoadKey) -> usize {
+        match stmt {
+            Stmt::ExprStmt(e)
+            | Stmt::Throw(e)
+            | Stmt::Const(_, e)
+            | Stmt::Let(_, Some(e))
+            | Stmt::Return(Some(e)) => count_in_expr(e, key),
+            Stmt::Lets(decls) => decls
+                .iter()
+                .filter_map(|(_, init)| init.as_ref())
+                .map(|e| count_in_expr(e, key))
+                .sum(),
+            Stmt::If(test, a, b) => {
+                count_in_expr(test, key)
+                    + a.iter().map(|s| count_in_stmt(s, key)).sum::<usize>()
+                    + b.as_ref()
+                        .map_or(0, |b| b.iter().map(|s| count_in_stmt(s, key)).sum())
+            }
+            Stmt::Switch(disc, cases) => {
+                count_in_expr(disc, key)
+                    + cases
+                        .iter()
+                        .map(|c| {
+                            c.tests.iter().map(|t| count_in_expr(t, key)).sum::<usize>()
+                                + c.body.iter().map(|s| count_in_stmt(s, key)).sum::<usize>()
+                        })
+                        .sum::<usize>()
+            }
+            Stmt::Labeled(_, inner) => count_in_stmt(inner, key),
+            Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                b.iter().map(|s| count_in_stmt(s, key)).sum()
+            }
+            Stmt::While(test, b) => {
+                count_in_expr(test, key) + b.iter().map(|s| count_in_stmt(s, key)).sum::<usize>()
+            }
+            _ => 0,
+        }
+    }
+
+    fn replace_in_expr(expr: &mut Expr, key: &SliceLoadKey, var: &str) {
+        match expr {
+            Expr::Member(obj, _) => {
+                if match_slice_load(obj).as_ref() == Some(key) {
+                    **obj = jsast::id(var.to_owned());
+                } else {
+                    replace_in_expr(obj, key, var);
+                }
+            }
+            Expr::Unary(_, inner) => replace_in_expr(inner, key, var),
+            Expr::Index(a, b)
+            | Expr::Binary(_, a, b)
+            | Expr::Assign(a, b)
+            | Expr::CompoundAssign(_, a, b) => {
+                replace_in_expr(a, key, var);
+                replace_in_expr(b, key, var);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                replace_in_expr(c, key, var);
+                for a in args {
+                    replace_in_expr(a, key, var);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                replace_in_expr(c, key, var);
+                replace_in_expr(t, key, var);
+                replace_in_expr(e, key, var);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    replace_in_expr(v, key, var);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for x in items {
+                    replace_in_expr(x, key, var);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn replace_in_stmt(stmt: &mut Stmt, key: &SliceLoadKey, var: &str) {
+        match stmt {
+            Stmt::ExprStmt(e)
+            | Stmt::Throw(e)
+            | Stmt::Const(_, e)
+            | Stmt::Let(_, Some(e))
+            | Stmt::Return(Some(e)) => replace_in_expr(e, key, var),
+            Stmt::Lets(decls) => {
+                for (_, init) in decls {
+                    if let Some(e) = init {
+                        replace_in_expr(e, key, var);
+                    }
+                }
+            }
+            Stmt::If(test, a, b) => {
+                replace_in_expr(test, key, var);
+                for s in a {
+                    replace_in_stmt(s, key, var);
+                }
+                if let Some(b) = b {
+                    for s in b {
+                        replace_in_stmt(s, key, var);
+                    }
+                }
+            }
+            Stmt::Switch(disc, cases) => {
+                replace_in_expr(disc, key, var);
+                for c in cases {
+                    for t in &mut c.tests {
+                        replace_in_expr(t, key, var);
+                    }
+                    for s in &mut c.body {
+                        replace_in_stmt(s, key, var);
+                    }
+                }
+            }
+            Stmt::Labeled(_, inner) => replace_in_stmt(inner, key, var),
+            Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                for s in b {
+                    replace_in_stmt(s, key, var);
+                }
+            }
+            Stmt::While(test, b) => {
+                replace_in_expr(test, key, var);
+                for s in b {
+                    replace_in_stmt(s, key, var);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn fresh_name(
+        counter: &mut usize,
+        declarations: &mut Vec<(String, Option<Expr>)>,
+        local_names: &mut HashSet<String>,
+    ) -> String {
+        loop {
+            let candidate = format!("$sl{}", *counter);
+            *counter += 1;
+            if local_names.insert(candidate.clone()) {
+                declarations.push((candidate.clone(), None));
+                return candidate;
+            }
+        }
+    }
+
+    fn process_block(
+        stmts: &mut Vec<Stmt>,
+        counter: &mut usize,
+        declarations: &mut Vec<(String, Option<Expr>)>,
+        local_names: &mut HashSet<String>,
+    ) {
+        let mut i = 0;
+        while i < stmts.len() {
+            let mut candidates = Vec::new();
+            collect_unconditional_in_stmt(&stmts[i], &mut candidates);
+            let mut hoisted_here = Vec::new();
+            for key in candidates {
+                // Find the maximal contiguous span `[i..=last_use]` with no invalidating statement.
+                let mut total_count = 0usize;
+                let mut last_use = i;
+                let mut valid_start = false;
+                for (j, s) in stmts.iter().enumerate().skip(i) {
+                    if stmt_invalidates(s, &key) {
+                        break;
+                    }
+                    if j == i {
+                        valid_start = true;
+                    }
+                    let c = count_in_stmt(s, &key);
+                    if c > 0 {
+                        total_count += c;
+                        last_use = j;
+                    }
+                }
+                if !valid_start || total_count < 2 {
+                    continue;
+                }
+                let var = fresh_name(counter, declarations, local_names);
+                for s in &mut stmts[i..=last_use] {
+                    replace_in_stmt(s, &key, &var);
+                }
+                hoisted_here.push(jsast::assign_stmt(jsast::id(var), key.to_expr()));
+            }
+            if !hoisted_here.is_empty() {
+                let inserted = hoisted_here.len();
+                for (offset, bind) in hoisted_here.into_iter().enumerate() {
+                    stmts.insert(i + offset, bind);
+                }
+                i += inserted + 1;
+            } else {
+                i += 1;
+            }
+        }
+        for stmt in stmts.iter_mut() {
+            process_children(stmt, counter, declarations, local_names);
+        }
+    }
+
+    fn process_children(
+        stmt: &mut Stmt,
+        counter: &mut usize,
+        declarations: &mut Vec<(String, Option<Expr>)>,
+        local_names: &mut HashSet<String>,
+    ) {
+        match stmt {
+            Stmt::If(_, a, b) => {
+                process_block(a, counter, declarations, local_names);
+                if let Some(b) = b {
+                    process_block(b, counter, declarations, local_names);
+                }
+            }
+            Stmt::Switch(_, cases) => {
+                for c in cases {
+                    process_block(&mut c.body, counter, declarations, local_names);
+                }
+            }
+            Stmt::Labeled(_, inner) => process_children(inner, counter, declarations, local_names),
+            Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
+                process_block(b, counter, declarations, local_names);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                process_block(body, counter, declarations, local_names);
+                process_block(handler, counter, declarations, local_names);
+            }
+            _ => {}
+        }
+    }
+
+    let mut counter = 0usize;
+    process_block(body, &mut counter, declarations, local_names);
 }
 
 #[cfg(test)]
@@ -3478,11 +4380,136 @@ mod tests {
 
         // Negative: escaped `s` must keep `__rt.sfp`.
         let mut escaped = vec![
-            jsast::assign_stmt(jsast::id("s"), sfp_rhs),
+            jsast::assign_stmt(jsast::id("s"), sfp_rhs.clone()),
             Stmt::Return(Some(jsast::id("s"))),
         ];
         fold_sfp_deref_only(&mut escaped, &locals);
         let printed_esc = jsast::stmt_to_string(&Stmt::Block(escaped));
         assert!(printed_esc.contains("__rt.sfp"), "{printed_esc}");
+
+        // Positive with single-assignment alias (`_3 = s; n = _3.len; out = _3.buf[_3.off + i]`).
+        let locals_alias: HashSet<String> = [
+            "s".to_owned(),
+            "_3".to_owned(),
+            "n".to_owned(),
+            "out".to_owned(),
+        ]
+        .into_iter()
+        .collect();
+        let mut aliased = vec![
+            jsast::assign_stmt(jsast::id("s"), sfp_rhs),
+            jsast::assign_stmt(jsast::id("_3"), jsast::id("s")),
+            jsast::assign_stmt(
+                jsast::id("n"),
+                Expr::Member(Box::new(jsast::id("_3")), "len".to_owned()),
+            ),
+            jsast::assign_stmt(
+                jsast::id("out"),
+                Expr::Index(
+                    Box::new(Expr::Member(Box::new(jsast::id("_3")), "buf".to_owned())),
+                    Box::new(Expr::Binary(
+                        jsast::BinOp::Add,
+                        Box::new(Expr::Member(Box::new(jsast::id("_3")), "off".to_owned())),
+                        Box::new(jsast::id("i")),
+                    )),
+                ),
+            ),
+            Stmt::Return(Some(jsast::id("out"))),
+        ];
+        fold_sfp_deref_only(&mut aliased, &locals_alias);
+        let printed_alias = jsast::stmt_to_string(&Stmt::Block(aliased));
+        assert!(!printed_alias.contains("__rt.sfp"), "{printed_alias}");
+        assert!(printed_alias.contains("n = v.len;"), "{printed_alias}");
+    }
+
+    #[test]
+    fn eliminate_dead_local_writes_strips_unread_seq_element() {
+        let mut body = vec![
+            Stmt::ExprStmt(Expr::Seq(vec![
+                Expr::Assign(Box::new(jsast::id("dead")), Box::new(jsast::num(1.0))),
+                Expr::Assign(Box::new(jsast::id("live")), Box::new(jsast::num(2.0))),
+            ])),
+            Stmt::Return(Some(jsast::id("live"))),
+        ];
+        let locals: HashSet<String> = ["dead".to_owned(), "live".to_owned()].into_iter().collect();
+        eliminate_dead_local_writes(&mut body, &locals);
+        let printed = jsast::stmt_to_string(&Stmt::Block(body));
+        assert!(!printed.contains("dead"), "{printed}");
+        assert!(printed.contains("live = 2;"), "{printed}");
+    }
+
+    #[test]
+    fn cse_slice_loads_hoists_across_panic_check_and_invalidates_on_mutation() {
+        let elem = || {
+            Expr::Index(
+                Box::new(jsast::id("a")),
+                Box::new(Expr::Binary(
+                    jsast::BinOp::Add,
+                    Box::new(jsast::id("b")),
+                    Box::new(jsast::id("i")),
+                )),
+            )
+        };
+        let panic_check = Stmt::If(
+            Expr::Unary(
+                jsast::UnOp::Not,
+                Box::new(Expr::Binary(
+                    jsast::BinOp::Lt,
+                    Box::new(jsast::id("i")),
+                    Box::new(jsast::id("len")),
+                )),
+            ),
+            vec![Stmt::ExprStmt(Expr::Call(
+                Box::new(jsast::id("core$panicking$panic_bounds_check$h1")),
+                vec![
+                    jsast::id("i"),
+                    jsast::id("len"),
+                    Expr::Object(vec![(
+                        "filename".to_owned(),
+                        jsast::rt_call("bstr_bytes", vec![jsast::string("a.rs")]),
+                    )]),
+                ],
+            ))],
+            None,
+        );
+        let mut body = vec![
+            jsast::assign_stmt(
+                jsast::id("x"),
+                Expr::Member(Box::new(elem()), "x".to_owned()),
+            ),
+            panic_check,
+            jsast::assign_stmt(
+                jsast::id("y"),
+                Expr::Member(Box::new(elem()), "y".to_owned()),
+            ),
+            // Mutating `a` must invalidate the cached load before reading `.z`.
+            jsast::assign_stmt(
+                Expr::Index(Box::new(jsast::id("a")), Box::new(jsast::num(0.0))),
+                jsast::id("other"),
+            ),
+            jsast::assign_stmt(
+                jsast::id("z"),
+                Expr::Member(Box::new(elem()), "z".to_owned()),
+            ),
+        ];
+        let mut declarations: Vec<(String, Option<Expr>)> = vec![
+            ("x".to_owned(), None),
+            ("y".to_owned(), None),
+            ("z".to_owned(), None),
+        ];
+        let mut local_names: HashSet<String> = ["x".to_owned(), "y".to_owned(), "z".to_owned()]
+            .into_iter()
+            .collect();
+        cse_slice_loads(&mut body, &mut declarations, &mut local_names);
+        let printed = jsast::stmt_to_string(&Stmt::Block(body));
+        assert_eq!(
+            printed.matches("a[b + i]").count(),
+            2,
+            "first two reads must share one hoisted temp, third read after store must reload:\n{printed}"
+        );
+        assert!(
+            declarations.iter().any(|(l, _)| l.starts_with("$sl")),
+            "expected hoisted slice temp in {declarations:?}"
+        );
     }
 }

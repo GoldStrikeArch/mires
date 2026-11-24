@@ -3344,11 +3344,24 @@ let _bsub_i = 0;
 // A string of at most 64 units is copied and never memoized: copying it costs
 // less than hashing it into the memo, and the memo exists for the long text a
 // parser re-reads per token, not for the short pieces it appends.
+const _bstr_buf_from =
+  typeof Buffer === "function" && typeof Buffer.from === "function"
+    ? (s) => {
+        const b = Buffer.from(s, "latin1");
+        return new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+      }
+    : null;
+
 globalThis.__rt.bstr_bytes = (s) => {
   const n = s.length;
   if (n <= 64) {
-    const bytes = new Array(n);
-    for (let i = 0; i < n; i++) bytes[i] = s.charCodeAt(i);
+    let bytes;
+    if (n >= 48 && _bstr_buf_from !== null) {
+      bytes = _bstr_buf_from(s);
+    } else {
+      bytes = new Uint8Array(n);
+      for (let i = 0; i < n; i++) bytes[i] = s.charCodeAt(i);
+    }
     return { buf: bytes, off: 0, len: n };
   }
   if (globalThis.__rt._bsub_prop === null) globalThis.__rt._bsub_prop = _bstr_sub_propagate;
@@ -3359,8 +3372,13 @@ globalThis.__rt.bstr_bytes = (s) => {
   const memo = globalThis.__rt._bstr_memo;
   let record = memo.map.get(s);
   if (record !== undefined) return record;
-  const bytes = new Array(n);
-  for (let i = 0; i < n; i++) bytes[i] = s.charCodeAt(i);
+  let bytes;
+  if (_bstr_buf_from !== null) {
+    bytes = _bstr_buf_from(s);
+  } else {
+    bytes = new Uint8Array(n);
+    for (let i = 0; i < n; i++) bytes[i] = s.charCodeAt(i);
+  }
   record = { buf: bytes, off: 0, len: n };
   (globalThis.__rt._str_memo_bufs || (globalThis.__rt._str_memo_bufs = new WeakSet())).add(bytes);
   (_bstr_src || (_bstr_src = new WeakMap())).set(bytes, s);
@@ -3406,14 +3424,12 @@ globalThis.__rt.bstr_utf8_bytes = (s) => {
   }
   const n = s.length;
   if (n <= 64) {
-    const bytes = new Array(n);
+    const bytes = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       const code = s.charCodeAt(i);
       if (code > 127) {
         const enc = globalThis.__rt._encoder.encode(s);
-        const arr = new Array(enc.length);
-        for (let j = 0; j < enc.length; j++) arr[j] = enc[j];
-        return { buf: arr, off: 0, len: arr.length };
+        return { buf: enc, off: 0, len: enc.length };
       }
       bytes[i] = code;
     }
@@ -3422,15 +3438,13 @@ globalThis.__rt.bstr_utf8_bytes = (s) => {
   const memo = globalThis.__rt._bstr_memo;
   let record = memo.utf8.get(s);
   if (record !== undefined) return record;
-  let bytes = new Array(n);
+  let bytes = new Uint8Array(n);
   let ascii = true;
   for (let i = 0; i < n; i++) {
     const code = s.charCodeAt(i);
     if (code > 127) {
       ascii = false;
-      const enc = globalThis.__rt._encoder.encode(s);
-      bytes = new Array(enc.length);
-      for (let j = 0; j < enc.length; j++) bytes[j] = enc[j];
+      bytes = globalThis.__rt._encoder.encode(s);
       break;
     }
     bytes[i] = code;
@@ -3446,7 +3460,7 @@ globalThis.__rt.bstr_utf8_bytes = (s) => {
 // unmemoized record, for the containment `str_bytes_mut` documents.
 globalThis.__rt.bstr_bytes_mut = (s) => {
   const n = s.length;
-  const bytes = new Array(n);
+  const bytes = new Uint8Array(n);
   for (let i = 0; i < n; i++) bytes[i] = s.charCodeAt(i);
   return { buf: bytes, off: 0, len: n };
 };
@@ -5348,6 +5362,18 @@ globalThis.__rt.tail_slice = (record, key, len) => {
     return { buf: slot.buf, off: slot.off + block.hdr, len };
   }
   return { buf: record[key], off: 0, len };
+};
+globalThis.__rt.tail_slice_raw = (p, key) => {
+  const slot = p.ptr;
+  let sbuf = slot.buf;
+  if (globalThis.__rt._bv !== null && sbuf !== undefined) {
+    sbuf = globalThis.__rt._bv.unwrap_buf(sbuf);
+  }
+  const block = sbuf === undefined ? undefined : globalThis.__rt._heap_block(sbuf);
+  if (block !== undefined && block.hdr !== undefined) {
+    return { buf: slot.buf, off: slot.off + block.hdr, len: p.meta };
+  }
+  return { buf: slot.buf[slot.off][key], off: 0, len: p.meta };
 };
 
 // _register(buf, bytes, zeroed): a new block, and the pointer to its start.
@@ -7330,3 +7356,121 @@ globalThis.__rt.bstr_to_uppercase = (s) =>
   globalThis.__rt._bstr_is_ascii(s)
     ? s.toUpperCase()
     : globalThis.__rt.bstr_in(globalThis.__rt.bstr_out(s).toUpperCase());
+
+// Phase 5 native `{ s, cap }` `String` helpers (`ReleaseSpeed` + `js-str=bytes`).
+globalThis.__rt.nstr_with_cap = (cap) => {
+  if (cap > 2147483647) globalThis.__rt.js_abort("capacity overflow");
+  return { s: "", cap: cap };
+};
+
+globalThis.__rt.nstr_reserve = (s, add) => {
+  const req = s.s.length + add;
+  if (req > 2147483647) globalThis.__rt.js_abort("capacity overflow");
+  if (req > s.cap) s.cap = req;
+};
+
+globalThis.__rt.nstr_into_vec = (s) => {
+  const str = s.s;
+  const len = str.length;
+  const cap = s.cap > len ? s.cap : len;
+  if (cap === 0) {
+    return {
+      buf: { inner: { ptr: 1, cap: 0, alloc: undefined }, _marker: undefined },
+      len: 0,
+    };
+  }
+  const buf = new Uint8Array(cap);
+  for (let i = 0; i < len; i++) buf[i] = str.charCodeAt(i);
+  return {
+    buf: {
+      inner: { ptr: { buf: buf, off: 0 }, cap: cap, alloc: undefined },
+      _marker: undefined,
+    },
+    len: len,
+  };
+};
+
+globalThis.__rt.nstr_ascii_lower = (s) => {
+  const n = s.length;
+  let i = 0;
+  for (; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 65 && c <= 90) break;
+  }
+  if (i === n) return { s: s, cap: n };
+  let out = s.slice(0, i);
+  let seg = i;
+  for (; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 65 && c <= 90) {
+      if (i > seg) out += s.slice(seg, i);
+      out += String.fromCharCode(c | 32);
+      seg = i + 1;
+    }
+  }
+  if (seg < n) out += s.slice(seg);
+  return { s: out, cap: n };
+};
+
+globalThis.__rt.nstr_ascii_upper = (s) => {
+  const n = s.length;
+  let i = 0;
+  for (; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 97 && c <= 122) break;
+  }
+  if (i === n) return { s: s, cap: n };
+  let out = s.slice(0, i);
+  let seg = i;
+  for (; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 97 && c <= 122) {
+      if (i > seg) out += s.slice(seg, i);
+      out += String.fromCharCode(c & ~32);
+      seg = i + 1;
+    }
+  }
+  if (seg < n) out += s.slice(seg);
+  return { s: out, cap: n };
+};
+
+globalThis.__rt.nstr_repeat = (s, n) => {
+  const len = s.length;
+  if (len > 0 && n > 0 && len * n > 2147483647) {
+    globalThis.__rt.js_abort("capacity overflow");
+  }
+  const r = s.repeat(n);
+  return { s: r, cap: r.length };
+};
+
+// Phase 5 fast core::str byte-string comparison & search helpers (js-str=bytes).
+// Every code unit is an unsigned UTF-8 byte (0..=255), so native JS lexicographic
+// comparison and String.prototype.{indexOf,lastIndexOf} are exact and zero-allocation.
+globalThis.__rt.bstr_cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+globalThis.__rt.bstr_find_char = (s, start, end, ch) => {
+  const p = ch < 128 ? String.fromCharCode(ch) : globalThis.__rt.bstr_char(ch);
+  const i = s.indexOf(p, start);
+  return i !== -1 && i + p.length <= end ? i : 4294967295;
+};
+
+globalThis.__rt.bstr_rfind_char = (s, start, end, ch) => {
+  const p = ch < 128 ? String.fromCharCode(ch) : globalThis.__rt.bstr_char(ch);
+  const lim = end - p.length;
+  if (lim < start) return 4294967295;
+  const i = s.lastIndexOf(p, lim);
+  return i >= start ? i : 4294967295;
+};
+
+globalThis.__rt.bstr_find_str = (s, start, end, p) => {
+  if (p.length === 0 || end - start < p.length) return 4294967295;
+  const i = s.indexOf(p, start);
+  return i !== -1 && i + p.length <= end ? i : 4294967295;
+};
+
+globalThis.__rt.bstr_rfind_str = (s, start, end, p) => {
+  const lim = end - p.length;
+  if (p.length === 0 || lim < start) return 4294967295;
+  const i = s.lastIndexOf(p, lim);
+  return i >= start ? i : 4294967295;
+};

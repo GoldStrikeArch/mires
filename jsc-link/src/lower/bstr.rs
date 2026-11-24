@@ -1931,8 +1931,13 @@ pub fn rewrite(stmt: &mut Stmt) {
             }
         }
         Stmt::Labeled(_, inner) => rewrite(inner),
-        Stmt::LoopForever(_, body) | Stmt::Block(body) | Stmt::FunctionDecl { body, .. } => {
-            rewrite_all(body)
+        Stmt::LoopForever(_, body) | Stmt::Block(body) => rewrite_all(body),
+        Stmt::FunctionDecl { body, .. } => {
+            rewrite_all(body);
+            if crate::opts::get().profile == Some(crate::opts::Profile::ReleaseSpeed) {
+                elide_readonly_bstr_bytes(body);
+                elide_ascii_only_bstr_in(body);
+            }
         }
         Stmt::While(test, body) => {
             rewrite_expr(test);
@@ -1994,27 +1999,1342 @@ fn rewrite_expr(expr: &mut Expr) {
         _ => {}
     }
     // Children first, so a helper's argument is already a byte-string expression.
-    let Expr::Call(callee, args) = expr else {
-        return;
-    };
-    let Some(member) = rt_member(callee) else {
-        return;
-    };
-    match (member, args.len()) {
-        ("str_len", 1) => {
-            let string = args.pop().expect("one argument");
-            *expr = match string {
-                Expr::Str(text) => jsast::num(text.chars().count() as f64),
-                string => jsast::member(string, "length"),
-            };
-        }
-        ("native_str_wf", 1) => *expr = args.pop().expect("one argument"),
-        (member, _) => {
-            if let Some(twin) = twin(member) {
-                **callee = jsast::member(jsast::id("__rt"), twin);
+    if let Expr::Call(callee, args) = expr {
+        if let Some(member) = rt_member(callee) {
+            match (member, args.len()) {
+                ("str_len", 1) => {
+                    let string = args.pop().expect("one argument");
+                    *expr = match string {
+                        Expr::Str(text) => jsast::num(text.chars().count() as f64),
+                        string => jsast::member(string, "length"),
+                    };
+                    return;
+                }
+                ("native_str_wf", 1) => {
+                    *expr = args.pop().expect("one argument");
+                    return;
+                }
+                (member, _) => {
+                    if let Some(twin) = twin(member) {
+                        **callee = jsast::member(jsast::id("__rt"), twin);
+                    }
+                }
             }
         }
     }
+    if let Some(folded) = try_fold_bstr_slice_roundtrip(expr) {
+        *expr = folded;
+        return;
+    }
+    if let Expr::Binary(op @ (jsast::BinOp::StrictEq | jsast::BinOp::StrictNe), l, r) = expr {
+        if is_ascii_str_lit(r) {
+            if let Some(arg) = unwrap_bstr_in_call(l) {
+                **l = arg;
+                return;
+            }
+        }
+        if is_ascii_str_lit(l) {
+            if let Some(arg) = unwrap_bstr_in_call(r) {
+                **r = arg;
+                return;
+            }
+        }
+        let _ = op;
+    }
+}
+
+fn is_ascii_str_lit(expr: &Expr) -> bool {
+    matches!(expr, Expr::Str(s) if s.bytes().all(|b| b < 128))
+}
+
+fn unwrap_bstr_in_call(expr: &Expr) -> Option<Expr> {
+    let Expr::Call(callee, args) = expr else {
+        return None;
+    };
+    if args.len() == 1 && rt_member(callee) == Some("bstr_in") {
+        Some(args[0].clone())
+    } else {
+        None
+    }
+}
+
+fn unwrap_bstr_bytes_call(expr: &Expr) -> Option<&Expr> {
+    let Expr::Call(callee, args) = expr else {
+        return None;
+    };
+    if args.len() == 1 && rt_member(callee) == Some("bstr_bytes") {
+        Some(&args[0])
+    } else {
+        None
+    }
+}
+
+fn collect_fn_locals(stmts: &[Stmt], out: &mut BTreeSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Let(n, _) | Stmt::Const(n, _) => {
+                out.insert(n.clone());
+            }
+            Stmt::Lets(decls) => {
+                for (n, _) in decls {
+                    out.insert(n.clone());
+                }
+            }
+            Stmt::If(_, a, b) => {
+                collect_fn_locals(a, out);
+                if let Some(b) = b {
+                    collect_fn_locals(b, out);
+                }
+            }
+            Stmt::Switch(_, cases) => {
+                for c in cases {
+                    collect_fn_locals(&c.body, out);
+                }
+            }
+            Stmt::Labeled(_, inner) => collect_fn_locals(std::slice::from_ref(inner.as_ref()), out),
+            Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
+                collect_fn_locals(b, out);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                collect_fn_locals(body, out);
+                collect_fn_locals(handler, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Elides `__rt.bstr_bytes(S)` for local variables whose every assignment is `__rt.bstr_bytes(...)`
+/// and whose every read is strictly `.len`, `.buf[v.off]`, or `.buf[v.off + idx]`: rewrites the
+/// assignment to `v = S` and reads to `v.length` / `v.charCodeAt(0)` / `v.charCodeAt(idx)`.
+fn elide_readonly_bstr_bytes(body: &mut [Stmt]) {
+    #[derive(Default)]
+    struct Usage {
+        bstr_writes: usize,
+        safe_reads: usize,
+        bad: bool,
+    }
+
+    fn is_var_member<'a>(expr: &'a Expr, prop: &str) -> Option<&'a str> {
+        match expr {
+            Expr::Member(obj, p) if p == prop => match obj.as_ref() {
+                Expr::Ident(n) => Some(n.as_str()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn match_var_index(expr: &Expr) -> Option<(&str, Option<&Expr>)> {
+        let Expr::Index(obj, idx) = expr else {
+            return None;
+        };
+        let name = is_var_member(obj, "buf")?;
+        if is_var_member(idx, "off") == Some(name) {
+            return Some((name, None));
+        }
+        if let Expr::Binary(jsast::BinOp::Add, l, r) = idx.as_ref() {
+            if is_var_member(l, "off") == Some(name) {
+                return Some((name, Some(r.as_ref())));
+            }
+            if is_var_member(r, "off") == Some(name) {
+                return Some((name, Some(l.as_ref())));
+            }
+        }
+        None
+    }
+
+    fn mark_all_bad(expr: &Expr, locals: &BTreeSet<String>, usage: &mut BTreeMap<String, Usage>) {
+        match expr {
+            Expr::Ident(n) => {
+                if locals.contains(n) {
+                    usage.entry(n.clone()).or_default().bad = true;
+                }
+            }
+            Expr::Member(o, _) | Expr::Unary(_, o) => mark_all_bad(o, locals, usage),
+            Expr::Index(o, i)
+            | Expr::Binary(_, o, i)
+            | Expr::Assign(o, i)
+            | Expr::CompoundAssign(_, o, i) => {
+                mark_all_bad(o, locals, usage);
+                mark_all_bad(i, locals, usage);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                mark_all_bad(c, locals, usage);
+                for a in args {
+                    mark_all_bad(a, locals, usage);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                mark_all_bad(c, locals, usage);
+                mark_all_bad(t, locals, usage);
+                mark_all_bad(e, locals, usage);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    mark_all_bad(v, locals, usage);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for x in items {
+                    mark_all_bad(x, locals, usage);
+                }
+            }
+            Expr::Arrow(_, ArrowBody::Expr(b)) => mark_all_bad(b, locals, usage),
+            Expr::Arrow(_, ArrowBody::Block(s)) => scan_stmts(s, locals, true, usage),
+            _ => {}
+        }
+    }
+
+    fn scan_expr(
+        expr: &Expr,
+        locals: &BTreeSet<String>,
+        in_closure: bool,
+        usage: &mut BTreeMap<String, Usage>,
+    ) {
+        if in_closure {
+            mark_all_bad(expr, locals, usage);
+            return;
+        }
+        if let Some((name, idx_opt)) = match_var_index(expr) {
+            if locals.contains(name) {
+                usage.entry(name.to_owned()).or_default().safe_reads += 1;
+                if let Some(idx) = idx_opt {
+                    scan_expr(idx, locals, false, usage);
+                }
+                return;
+            }
+        }
+        if let Some(name) = is_var_member(expr, "len") {
+            if locals.contains(name) {
+                usage.entry(name.to_owned()).or_default().safe_reads += 1;
+                return;
+            }
+        }
+        match expr {
+            Expr::Ident(n) => {
+                if locals.contains(n) {
+                    usage.entry(n.clone()).or_default().bad = true;
+                }
+            }
+            Expr::Assign(lhs, rhs) => {
+                if let Expr::Ident(n) = lhs.as_ref() {
+                    if locals.contains(n) {
+                        if let Some(arg) = unwrap_bstr_bytes_call(rhs) {
+                            usage.entry(n.clone()).or_default().bstr_writes += 1;
+                            scan_expr(arg, locals, false, usage);
+                            return;
+                        }
+                        usage.entry(n.clone()).or_default().bad = true;
+                        scan_expr(rhs, locals, false, usage);
+                        return;
+                    }
+                }
+                // Any write through `b.buf[...]` disqualifies `b`, while scanning indices in `lhs`
+                // for other read-only variables (`other.buf[other.off + i]` could only be on RHS).
+                mark_all_bad(lhs, locals, usage);
+                scan_expr(rhs, locals, false, usage);
+            }
+            Expr::CompoundAssign(_, lhs, rhs) => {
+                mark_all_bad(lhs, locals, usage);
+                scan_expr(rhs, locals, false, usage);
+            }
+            Expr::Member(o, _) | Expr::Unary(_, o) => scan_expr(o, locals, false, usage),
+            Expr::Index(o, i) | Expr::Binary(_, o, i) => {
+                scan_expr(o, locals, false, usage);
+                scan_expr(i, locals, false, usage);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                scan_expr(c, locals, false, usage);
+                for a in args {
+                    scan_expr(a, locals, false, usage);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                scan_expr(c, locals, false, usage);
+                scan_expr(t, locals, false, usage);
+                scan_expr(e, locals, false, usage);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    scan_expr(v, locals, false, usage);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for x in items {
+                    scan_expr(x, locals, false, usage);
+                }
+            }
+            Expr::Arrow(_, ArrowBody::Expr(b)) => mark_all_bad(b, locals, usage),
+            Expr::Arrow(_, ArrowBody::Block(s)) => scan_stmts(s, locals, true, usage),
+            _ => {}
+        }
+    }
+
+    fn scan_stmts(
+        stmts: &[Stmt],
+        locals: &BTreeSet<String>,
+        in_closure: bool,
+        usage: &mut BTreeMap<String, Usage>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let(n, Some(init)) | Stmt::Const(n, init)
+                    if !in_closure && locals.contains(n) =>
+                {
+                    if let Some(arg) = unwrap_bstr_bytes_call(init) {
+                        usage.entry(n.clone()).or_default().bstr_writes += 1;
+                        scan_expr(arg, locals, false, usage);
+                    } else {
+                        usage.entry(n.clone()).or_default().bad = true;
+                        scan_expr(init, locals, false, usage);
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if let Some(init) = init {
+                            if !in_closure && locals.contains(n) {
+                                if let Some(arg) = unwrap_bstr_bytes_call(init) {
+                                    usage.entry(n.clone()).or_default().bstr_writes += 1;
+                                    scan_expr(arg, locals, false, usage);
+                                    continue;
+                                }
+                                usage.entry(n.clone()).or_default().bad = true;
+                            }
+                            scan_expr(init, locals, in_closure, usage);
+                        }
+                    }
+                }
+                Stmt::ExprStmt(e)
+                | Stmt::Throw(e)
+                | Stmt::Const(_, e)
+                | Stmt::Let(_, Some(e))
+                | Stmt::Return(Some(e)) => scan_expr(e, locals, in_closure, usage),
+                Stmt::If(t, a, b) => {
+                    scan_expr(t, locals, in_closure, usage);
+                    scan_stmts(a, locals, in_closure, usage);
+                    if let Some(b) = b {
+                        scan_stmts(b, locals, in_closure, usage);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    scan_expr(d, locals, in_closure, usage);
+                    for c in cases {
+                        for t in &c.tests {
+                            scan_expr(t, locals, in_closure, usage);
+                        }
+                        scan_stmts(&c.body, locals, in_closure, usage);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    scan_stmts(
+                        std::slice::from_ref(inner.as_ref()),
+                        locals,
+                        in_closure,
+                        usage,
+                    );
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                    scan_stmts(b, locals, in_closure, usage);
+                }
+                Stmt::While(t, b) => {
+                    scan_expr(t, locals, in_closure, usage);
+                    scan_stmts(b, locals, in_closure, usage);
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    if locals.contains(binding) {
+                        usage.entry(binding.clone()).or_default().bad = true;
+                    }
+                    scan_stmts(body, locals, in_closure, usage);
+                    scan_stmts(handler, locals, in_closure, usage);
+                }
+                Stmt::FunctionDecl { body, .. } => scan_stmts(body, locals, true, usage),
+                _ => {}
+            }
+        }
+    }
+
+    fn rewrite_expr_elided(expr: &mut Expr, elided: &BTreeSet<String>) {
+        // Rewrite `v.buf[v.off]` -> `v.charCodeAt(0)` and `v.buf[v.off + idx]` -> `v.charCodeAt(idx)`.
+        if let Some((name, idx_opt)) = match_var_index(expr) {
+            if elided.contains(name) {
+                let name = name.to_owned();
+                let mut idx_expr = idx_opt.cloned().unwrap_or_else(|| jsast::num(0));
+                rewrite_expr_elided(&mut idx_expr, elided);
+                *expr = jsast::method_call(jsast::id(name), "charCodeAt", vec![idx_expr]);
+                return;
+            }
+        }
+        if let Some(name) = is_var_member(expr, "len") {
+            if elided.contains(name) {
+                *expr = jsast::member(jsast::id(name.to_owned()), "length");
+                return;
+            }
+        }
+        match expr {
+            Expr::Assign(lhs, rhs) => {
+                if let Expr::Ident(n) = lhs.as_ref() {
+                    if elided.contains(n) {
+                        if let Some(arg) = unwrap_bstr_bytes_call(rhs).cloned() {
+                            let mut arg = arg;
+                            rewrite_expr_elided(&mut arg, elided);
+                            **rhs = arg;
+                            return;
+                        }
+                    }
+                }
+                rewrite_expr_elided(lhs, elided);
+                rewrite_expr_elided(rhs, elided);
+            }
+            Expr::CompoundAssign(_, l, r) | Expr::Binary(_, l, r) | Expr::Index(l, r) => {
+                rewrite_expr_elided(l, elided);
+                rewrite_expr_elided(r, elided);
+            }
+            Expr::Member(o, _) | Expr::Unary(_, o) => rewrite_expr_elided(o, elided),
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                rewrite_expr_elided(c, elided);
+                for a in args {
+                    rewrite_expr_elided(a, elided);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                rewrite_expr_elided(c, elided);
+                rewrite_expr_elided(t, elided);
+                rewrite_expr_elided(e, elided);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    rewrite_expr_elided(v, elided);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for x in items {
+                    rewrite_expr_elided(x, elided);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn rewrite_stmts_elided(stmts: &mut [Stmt], elided: &BTreeSet<String>) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let(n, Some(init)) | Stmt::Const(n, init) if elided.contains(n) => {
+                    if let Some(arg) = unwrap_bstr_bytes_call(init).cloned() {
+                        let mut arg = arg;
+                        rewrite_expr_elided(&mut arg, elided);
+                        *init = arg;
+                        continue;
+                    }
+                    rewrite_expr_elided(init, elided);
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if let Some(init) = init {
+                            if elided.contains(n) {
+                                if let Some(arg) = unwrap_bstr_bytes_call(init).cloned() {
+                                    let mut arg = arg;
+                                    rewrite_expr_elided(&mut arg, elided);
+                                    *init = arg;
+                                    continue;
+                                }
+                            }
+                            rewrite_expr_elided(init, elided);
+                        }
+                    }
+                }
+                Stmt::ExprStmt(e)
+                | Stmt::Throw(e)
+                | Stmt::Const(_, e)
+                | Stmt::Let(_, Some(e))
+                | Stmt::Return(Some(e)) => rewrite_expr_elided(e, elided),
+                Stmt::If(t, a, b) => {
+                    rewrite_expr_elided(t, elided);
+                    rewrite_stmts_elided(a, elided);
+                    if let Some(b) = b {
+                        rewrite_stmts_elided(b, elided);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    rewrite_expr_elided(d, elided);
+                    for c in cases {
+                        for t in &mut c.tests {
+                            rewrite_expr_elided(t, elided);
+                        }
+                        rewrite_stmts_elided(&mut c.body, elided);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    rewrite_stmts_elided(std::slice::from_mut(inner.as_mut()), elided);
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => rewrite_stmts_elided(b, elided),
+                Stmt::While(t, b) => {
+                    rewrite_expr_elided(t, elided);
+                    rewrite_stmts_elided(b, elided);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    rewrite_stmts_elided(body, elided);
+                    rewrite_stmts_elided(handler, elided);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut locals = BTreeSet::new();
+    collect_fn_locals(body, &mut locals);
+    if locals.is_empty() {
+        return;
+    }
+    let mut usage = BTreeMap::new();
+    scan_stmts(body, &locals, false, &mut usage);
+    let elided: BTreeSet<String> = usage
+        .into_iter()
+        .filter(|(_, u)| !u.bad && u.bstr_writes >= 1 && u.safe_reads >= 1)
+        .map(|(n, _)| n)
+        .collect();
+    if !elided.is_empty() {
+        rewrite_stmts_elided(body, &elided);
+    }
+}
+
+/// Elides `__rt.bstr_in(X)` when the bound local (and any pure copy aliases of it) is ONLY
+/// compared via `===`/`!==`/`switch` against all-ASCII string literals (`c < 128`) or
+/// single-assignment const ASCII string locals (`F = "ASCII"` / `F = ["ASCII"][0]`).
+fn elide_ascii_only_bstr_in(body: &mut [Stmt]) {
+    fn is_const_ascii_init(expr: &Expr) -> bool {
+        if is_ascii_str_lit(expr) {
+            return true;
+        }
+        // Matches `["ASCII"][0]` (unboxed single-element `&str` slot constant).
+        if let Expr::Index(arr, idx) = expr {
+            if matches!(idx.as_ref(), Expr::Num(n) if *n == 0.0) {
+                if let Expr::Array(items) = arr.as_ref() {
+                    return items.len() == 1 && is_ascii_str_lit(&items[0]);
+                }
+            }
+        }
+        false
+    }
+
+    fn collect_const_ascii_locals(
+        stmts: &[Stmt],
+        locals: &BTreeSet<String>,
+        writes: &mut BTreeMap<String, (usize, bool)>,
+    ) {
+        fn scan_e(
+            e: &Expr,
+            locals: &BTreeSet<String>,
+            writes: &mut BTreeMap<String, (usize, bool)>,
+        ) {
+            match e {
+                Expr::Assign(lhs, rhs) => {
+                    if let Expr::Ident(n) = lhs.as_ref() {
+                        if locals.contains(n) {
+                            let entry = writes.entry(n.clone()).or_insert((0, true));
+                            entry.0 += 1;
+                            if !is_const_ascii_init(rhs) {
+                                entry.1 = false;
+                            }
+                            scan_e(rhs, locals, writes);
+                            return;
+                        }
+                    }
+                    scan_e(lhs, locals, writes);
+                    scan_e(rhs, locals, writes);
+                }
+                Expr::CompoundAssign(_, lhs, rhs) => {
+                    if let Expr::Ident(n) = lhs.as_ref() {
+                        if locals.contains(n) {
+                            let entry = writes.entry(n.clone()).or_insert((0, true));
+                            entry.0 += 1;
+                            entry.1 = false;
+                        }
+                    }
+                    scan_e(lhs, locals, writes);
+                    scan_e(rhs, locals, writes);
+                }
+                Expr::Member(o, _) | Expr::Unary(_, o) => scan_e(o, locals, writes),
+                Expr::Index(o, i) | Expr::Binary(_, o, i) => {
+                    scan_e(o, locals, writes);
+                    scan_e(i, locals, writes);
+                }
+                Expr::Call(c, args) | Expr::New(c, args) => {
+                    scan_e(c, locals, writes);
+                    for a in args {
+                        scan_e(a, locals, writes);
+                    }
+                }
+                Expr::Cond(c, t, f) => {
+                    scan_e(c, locals, writes);
+                    scan_e(t, locals, writes);
+                    scan_e(f, locals, writes);
+                }
+                Expr::Object(entries) => {
+                    for (_, v) in entries {
+                        scan_e(v, locals, writes);
+                    }
+                }
+                Expr::Array(items) | Expr::Seq(items) => {
+                    for x in items {
+                        scan_e(x, locals, writes);
+                    }
+                }
+                Expr::Arrow(_, ArrowBody::Expr(b)) => scan_e(b, locals, writes),
+                Expr::Arrow(_, ArrowBody::Block(s)) => {
+                    collect_const_ascii_locals(s, locals, writes)
+                }
+                _ => {}
+            }
+        }
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let(n, Some(init)) | Stmt::Const(n, init) => {
+                    if locals.contains(n) {
+                        let entry = writes.entry(n.clone()).or_insert((0, true));
+                        entry.0 += 1;
+                        if !is_const_ascii_init(init) {
+                            entry.1 = false;
+                        }
+                    }
+                    scan_e(init, locals, writes);
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if let Some(init) = init {
+                            if locals.contains(n) {
+                                let entry = writes.entry(n.clone()).or_insert((0, true));
+                                entry.0 += 1;
+                                if !is_const_ascii_init(init) {
+                                    entry.1 = false;
+                                }
+                            }
+                            scan_e(init, locals, writes);
+                        }
+                    }
+                }
+                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                    scan_e(e, locals, writes);
+                }
+                Stmt::If(t, a, b) => {
+                    scan_e(t, locals, writes);
+                    collect_const_ascii_locals(a, locals, writes);
+                    if let Some(b) = b {
+                        collect_const_ascii_locals(b, locals, writes);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    scan_e(d, locals, writes);
+                    for c in cases {
+                        for t in &c.tests {
+                            scan_e(t, locals, writes);
+                        }
+                        collect_const_ascii_locals(&c.body, locals, writes);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    collect_const_ascii_locals(
+                        std::slice::from_ref(inner.as_ref()),
+                        locals,
+                        writes,
+                    );
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::FunctionDecl { body: b, .. } => {
+                    collect_const_ascii_locals(b, locals, writes);
+                }
+                Stmt::While(t, b) => {
+                    scan_e(t, locals, writes);
+                    collect_const_ascii_locals(b, locals, writes);
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    if locals.contains(binding) {
+                        writes.insert(binding.clone(), (2, false));
+                    }
+                    collect_const_ascii_locals(body, locals, writes);
+                    collect_const_ascii_locals(handler, locals, writes);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn is_ascii_expr(expr: &Expr, const_ascii: &BTreeSet<String>) -> bool {
+        is_ascii_str_lit(expr) || matches!(expr, Expr::Ident(n) if const_ascii.contains(n))
+    }
+
+    #[derive(Default)]
+    struct Info {
+        bstr_in_writes: usize,
+        copy_from: Vec<String>,
+        bad: bool,
+    }
+
+    fn mark_all_bad(expr: &Expr, locals: &BTreeSet<String>, info: &mut BTreeMap<String, Info>) {
+        match expr {
+            Expr::Ident(n) => {
+                if locals.contains(n) {
+                    info.entry(n.clone()).or_default().bad = true;
+                }
+            }
+            Expr::Member(o, _) | Expr::Unary(_, o) => mark_all_bad(o, locals, info),
+            Expr::Index(o, i)
+            | Expr::Binary(_, o, i)
+            | Expr::Assign(o, i)
+            | Expr::CompoundAssign(_, o, i) => {
+                mark_all_bad(o, locals, info);
+                mark_all_bad(i, locals, info);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                mark_all_bad(c, locals, info);
+                for a in args {
+                    mark_all_bad(a, locals, info);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                mark_all_bad(c, locals, info);
+                mark_all_bad(t, locals, info);
+                mark_all_bad(e, locals, info);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    mark_all_bad(v, locals, info);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for x in items {
+                    mark_all_bad(x, locals, info);
+                }
+            }
+            Expr::Arrow(_, ArrowBody::Expr(b)) => mark_all_bad(b, locals, info),
+            Expr::Arrow(_, ArrowBody::Block(s)) => {
+                scan_stmts(s, locals, &BTreeSet::new(), true, info)
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_expr(
+        expr: &Expr,
+        locals: &BTreeSet<String>,
+        const_ascii: &BTreeSet<String>,
+        in_closure: bool,
+        info: &mut BTreeMap<String, Info>,
+    ) {
+        if in_closure {
+            mark_all_bad(expr, locals, info);
+            return;
+        }
+        if let Expr::Binary(jsast::BinOp::StrictEq | jsast::BinOp::StrictNe, l, r) = expr {
+            if let Expr::Ident(n) = l.as_ref() {
+                if locals.contains(n) && is_ascii_expr(r, const_ascii) {
+                    return;
+                }
+            }
+            if let Expr::Ident(n) = r.as_ref() {
+                if locals.contains(n) && is_ascii_expr(l, const_ascii) {
+                    return;
+                }
+            }
+        }
+        match expr {
+            Expr::Ident(n) => {
+                if locals.contains(n) {
+                    info.entry(n.clone()).or_default().bad = true;
+                }
+            }
+            Expr::Assign(lhs, rhs) => {
+                if let Expr::Ident(n) = lhs.as_ref() {
+                    if locals.contains(n) {
+                        if let Some(arg) = unwrap_bstr_in_call(rhs) {
+                            info.entry(n.clone()).or_default().bstr_in_writes += 1;
+                            scan_expr(&arg, locals, const_ascii, false, info);
+                            return;
+                        }
+                        if let Expr::Ident(src) = rhs.as_ref() {
+                            if locals.contains(src) {
+                                info.entry(n.clone())
+                                    .or_default()
+                                    .copy_from
+                                    .push(src.clone());
+                                return;
+                            }
+                        }
+                        info.entry(n.clone()).or_default().bad = true;
+                        scan_expr(rhs, locals, const_ascii, false, info);
+                        return;
+                    }
+                }
+                mark_all_bad(lhs, locals, info);
+                scan_expr(rhs, locals, const_ascii, false, info);
+            }
+            Expr::CompoundAssign(_, l, r) => {
+                mark_all_bad(l, locals, info);
+                scan_expr(r, locals, const_ascii, false, info);
+            }
+            Expr::Member(o, _) | Expr::Unary(_, o) => {
+                scan_expr(o, locals, const_ascii, false, info)
+            }
+            Expr::Index(o, i) | Expr::Binary(_, o, i) => {
+                scan_expr(o, locals, const_ascii, false, info);
+                scan_expr(i, locals, const_ascii, false, info);
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                scan_expr(c, locals, const_ascii, false, info);
+                for a in args {
+                    scan_expr(a, locals, const_ascii, false, info);
+                }
+            }
+            Expr::Cond(c, t, e) => {
+                scan_expr(c, locals, const_ascii, false, info);
+                scan_expr(t, locals, const_ascii, false, info);
+                scan_expr(e, locals, const_ascii, false, info);
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    scan_expr(v, locals, const_ascii, false, info);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for x in items {
+                    scan_expr(x, locals, const_ascii, false, info);
+                }
+            }
+            Expr::Arrow(_, ArrowBody::Expr(b)) => mark_all_bad(b, locals, info),
+            Expr::Arrow(_, ArrowBody::Block(s)) => scan_stmts(s, locals, const_ascii, true, info),
+            _ => {}
+        }
+    }
+
+    fn scan_stmts(
+        stmts: &[Stmt],
+        locals: &BTreeSet<String>,
+        const_ascii: &BTreeSet<String>,
+        in_closure: bool,
+        info: &mut BTreeMap<String, Info>,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let(n, Some(init)) | Stmt::Const(n, init)
+                    if !in_closure && locals.contains(n) =>
+                {
+                    if let Some(arg) = unwrap_bstr_in_call(init) {
+                        info.entry(n.clone()).or_default().bstr_in_writes += 1;
+                        scan_expr(&arg, locals, const_ascii, false, info);
+                    } else if let Expr::Ident(src) = init {
+                        if locals.contains(src) {
+                            info.entry(n.clone())
+                                .or_default()
+                                .copy_from
+                                .push(src.clone());
+                        } else {
+                            info.entry(n.clone()).or_default().bad = true;
+                        }
+                    } else {
+                        info.entry(n.clone()).or_default().bad = true;
+                        scan_expr(init, locals, const_ascii, false, info);
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if let Some(init) = init {
+                            if !in_closure && locals.contains(n) {
+                                if let Some(arg) = unwrap_bstr_in_call(init) {
+                                    info.entry(n.clone()).or_default().bstr_in_writes += 1;
+                                    scan_expr(&arg, locals, const_ascii, false, info);
+                                    continue;
+                                }
+                                if let Expr::Ident(src) = init {
+                                    if locals.contains(src) {
+                                        info.entry(n.clone())
+                                            .or_default()
+                                            .copy_from
+                                            .push(src.clone());
+                                        continue;
+                                    }
+                                }
+                                info.entry(n.clone()).or_default().bad = true;
+                            }
+                            scan_expr(init, locals, const_ascii, in_closure, info);
+                        }
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    let all_ascii_cases = cases
+                        .iter()
+                        .all(|c| c.tests.iter().all(|t| is_ascii_expr(t, const_ascii)));
+                    if !in_closure && all_ascii_cases {
+                        if let Expr::Ident(n) = d {
+                            if locals.contains(n) {
+                                for c in cases {
+                                    scan_stmts(&c.body, locals, const_ascii, false, info);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    scan_expr(d, locals, const_ascii, in_closure, info);
+                    for c in cases {
+                        for t in &c.tests {
+                            scan_expr(t, locals, const_ascii, in_closure, info);
+                        }
+                        scan_stmts(&c.body, locals, const_ascii, in_closure, info);
+                    }
+                }
+                Stmt::ExprStmt(e)
+                | Stmt::Throw(e)
+                | Stmt::Const(_, e)
+                | Stmt::Let(_, Some(e))
+                | Stmt::Return(Some(e)) => scan_expr(e, locals, const_ascii, in_closure, info),
+                Stmt::If(t, a, b) => {
+                    scan_expr(t, locals, const_ascii, in_closure, info);
+                    scan_stmts(a, locals, const_ascii, in_closure, info);
+                    if let Some(b) = b {
+                        scan_stmts(b, locals, const_ascii, in_closure, info);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    scan_stmts(
+                        std::slice::from_ref(inner.as_ref()),
+                        locals,
+                        const_ascii,
+                        in_closure,
+                        info,
+                    );
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                    scan_stmts(b, locals, const_ascii, in_closure, info);
+                }
+                Stmt::While(t, b) => {
+                    scan_expr(t, locals, const_ascii, in_closure, info);
+                    scan_stmts(b, locals, const_ascii, in_closure, info);
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    if locals.contains(binding) {
+                        info.entry(binding.clone()).or_default().bad = true;
+                    }
+                    scan_stmts(body, locals, const_ascii, in_closure, info);
+                    scan_stmts(handler, locals, const_ascii, in_closure, info);
+                }
+                Stmt::FunctionDecl { body, .. } => {
+                    scan_stmts(body, locals, const_ascii, true, info)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn rewrite_bstr_in_stmts(stmts: &mut [Stmt], elided: &BTreeSet<String>) {
+        fn rw_expr(e: &mut Expr, elided: &BTreeSet<String>) {
+            match e {
+                Expr::Assign(lhs, rhs) => {
+                    if let Expr::Ident(n) = lhs.as_ref() {
+                        if elided.contains(n) {
+                            if let Some(arg) = unwrap_bstr_in_call(rhs) {
+                                **rhs = arg;
+                                rw_expr(rhs, elided);
+                                return;
+                            }
+                        }
+                    }
+                    rw_expr(lhs, elided);
+                    rw_expr(rhs, elided);
+                }
+                Expr::CompoundAssign(_, l, r) | Expr::Binary(_, l, r) | Expr::Index(l, r) => {
+                    rw_expr(l, elided);
+                    rw_expr(r, elided);
+                }
+                Expr::Member(o, _) | Expr::Unary(_, o) => rw_expr(o, elided),
+                Expr::Call(c, args) | Expr::New(c, args) => {
+                    rw_expr(c, elided);
+                    for a in args {
+                        rw_expr(a, elided);
+                    }
+                }
+                Expr::Cond(c, t, e) => {
+                    rw_expr(c, elided);
+                    rw_expr(t, elided);
+                    rw_expr(e, elided);
+                }
+                Expr::Object(entries) => {
+                    for (_, v) in entries {
+                        rw_expr(v, elided);
+                    }
+                }
+                Expr::Array(items) | Expr::Seq(items) => {
+                    for x in items {
+                        rw_expr(x, elided);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for stmt in stmts {
+            match stmt {
+                Stmt::Let(n, Some(init)) | Stmt::Const(n, init) if elided.contains(n) => {
+                    if let Some(arg) = unwrap_bstr_in_call(init) {
+                        *init = arg;
+                    }
+                    rw_expr(init, elided);
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if let Some(init) = init {
+                            if elided.contains(n) {
+                                if let Some(arg) = unwrap_bstr_in_call(init) {
+                                    *init = arg;
+                                }
+                            }
+                            rw_expr(init, elided);
+                        }
+                    }
+                }
+                Stmt::ExprStmt(e)
+                | Stmt::Throw(e)
+                | Stmt::Const(_, e)
+                | Stmt::Let(_, Some(e))
+                | Stmt::Return(Some(e)) => rw_expr(e, elided),
+                Stmt::If(t, a, b) => {
+                    rw_expr(t, elided);
+                    rewrite_bstr_in_stmts(a, elided);
+                    if let Some(b) = b {
+                        rewrite_bstr_in_stmts(b, elided);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    rw_expr(d, elided);
+                    for c in cases {
+                        for t in &mut c.tests {
+                            rw_expr(t, elided);
+                        }
+                        rewrite_bstr_in_stmts(&mut c.body, elided);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    rewrite_bstr_in_stmts(std::slice::from_mut(inner.as_mut()), elided);
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => rewrite_bstr_in_stmts(b, elided),
+                Stmt::While(t, b) => {
+                    rw_expr(t, elided);
+                    rewrite_bstr_in_stmts(b, elided);
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    rewrite_bstr_in_stmts(body, elided);
+                    rewrite_bstr_in_stmts(handler, elided);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut locals = BTreeSet::new();
+    collect_fn_locals(body, &mut locals);
+    if locals.is_empty() {
+        return;
+    }
+    let mut ascii_writes = BTreeMap::new();
+    collect_const_ascii_locals(body, &locals, &mut ascii_writes);
+    let const_ascii: BTreeSet<String> = ascii_writes
+        .into_iter()
+        .filter(|(_, (count, ok))| *count == 1 && *ok)
+        .map(|(n, _)| n)
+        .collect();
+    let mut info = BTreeMap::new();
+    scan_stmts(body, &locals, &const_ascii, false, &mut info);
+    // Propagate `bad` backwards through `dst = src` copies.
+    loop {
+        let mut changed = false;
+        let bad_set: BTreeSet<String> = info
+            .iter()
+            .filter(|(_, v)| v.bad)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut to_mark = Vec::new();
+        for (dst, v) in &info {
+            if bad_set.contains(dst) {
+                for src in &v.copy_from {
+                    if !bad_set.contains(src) {
+                        to_mark.push(src.clone());
+                    }
+                }
+            }
+        }
+        for src in to_mark {
+            let entry = info.entry(src).or_default();
+            if !entry.bad {
+                entry.bad = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let elided: BTreeSet<String> = info
+        .into_iter()
+        .filter(|(_, v)| !v.bad && v.bstr_in_writes >= 1)
+        .map(|(k, _)| k)
+        .collect();
+    if !elided.is_empty() {
+        rewrite_bstr_in_stmts(body, &elided);
+    }
+}
+
+/// Folds `(h = __rt.{sfp,slice_from_parts}(offset(bstr_bytes(S), D), L), __rt.bstr_of(h.buf, h.off, h.len))`
+/// (produced by `core::str::traits::SliceIndex::get_unchecked`, `str::split`, `str::lines`, etc.)
+/// directly into `S.slice(D, E)` / `S.slice(D, D + L)` with zero byte-array allocation.
+fn try_fold_bstr_slice_roundtrip(expr: &Expr) -> Option<Expr> {
+    let Expr::Seq(items) = expr else {
+        return None;
+    };
+    if items.len() != 2 {
+        return None;
+    }
+    let Expr::Assign(h_lhs, sfp_rhs) = &items[0] else {
+        return None;
+    };
+    let Expr::Ident(h_name) = h_lhs.as_ref() else {
+        return None;
+    };
+    if !h_name.starts_with("$t") {
+        return None;
+    }
+    // Final expression: `__rt.bstr_of(h.buf, h.off, h.len)`
+    let Expr::Call(bstr_of_callee, bstr_of_args) = &items[1] else {
+        return None;
+    };
+    if rt_member(bstr_of_callee) != Some("bstr_of") || bstr_of_args.len() != 3 {
+        return None;
+    }
+    let is_h_member = |e: &Expr, prop: &str| matches!(e, Expr::Member(o, p) if p == prop && matches!(o.as_ref(), Expr::Ident(n) if n == h_name));
+    if !is_h_member(&bstr_of_args[0], "buf")
+        || !is_h_member(&bstr_of_args[1], "off")
+        || !is_h_member(&bstr_of_args[2], "len")
+    {
+        return None;
+    }
+    // `sfp_rhs`: `__rt.sfp(ptr_expr, len_expr)` or `__rt.slice_from_parts(ptr_expr, len_expr)`
+    let Expr::Call(sfp_callee, sfp_args) = sfp_rhs.as_ref() else {
+        return None;
+    };
+    if !matches!(rt_member(sfp_callee), Some("sfp" | "slice_from_parts")) || sfp_args.len() != 2 {
+        return None;
+    }
+    let (s_expr, j_temp, start_expr) = match_bstr_bytes_ptr(&sfp_args[0])?;
+    let len_expr = &sfp_args[1];
+
+    let is_simple_val = |e: &Expr| {
+        matches!(
+            e,
+            Expr::Ident(_) | Expr::Num(_) | Expr::RawNum(_) | Expr::Str(_)
+        )
+    };
+    let mut seq = Vec::new();
+    let recv = if is_simple_val(s_expr) {
+        s_expr.clone()
+    } else {
+        let j = j_temp?;
+        seq.push(jsast::assign(jsast::id(j), s_expr.clone()));
+        jsast::id(j)
+    };
+
+    let call = match start_expr {
+        None => jsast::method_call(recv, "slice", vec![jsast::num(0.0), len_expr.clone()]),
+        Some(start) => {
+            if let Some(end) = match_end_minus_start(len_expr, start) {
+                if is_simple_val(start) {
+                    jsast::method_call(recv, "slice", vec![start.clone(), end.clone()])
+                } else {
+                    seq.push(jsast::assign(jsast::id(h_name), start.clone()));
+                    jsast::method_call(recv, "slice", vec![jsast::id(h_name), end.clone()])
+                }
+            } else if is_simple_val(start) {
+                jsast::method_call(
+                    recv,
+                    "slice",
+                    vec![
+                        start.clone(),
+                        jsast::binary(jsast::BinOp::Add, start.clone(), len_expr.clone()),
+                    ],
+                )
+            } else {
+                seq.push(jsast::assign(jsast::id(h_name), start.clone()));
+                jsast::method_call(
+                    recv,
+                    "slice",
+                    vec![
+                        jsast::id(h_name),
+                        jsast::binary(jsast::BinOp::Add, jsast::id(h_name), len_expr.clone()),
+                    ],
+                )
+            }
+        }
+    };
+    if seq.is_empty() {
+        Some(call)
+    } else {
+        seq.push(call);
+        Some(Expr::Seq(seq))
+    }
+}
+
+/// Extracts `(s_expr, optional_temp_name, optional_offset)` from a pointer built over
+/// `__rt.bstr_bytes(s_expr)` (with or without a `+ start` offset).
+fn match_bstr_bytes_ptr(expr: &Expr) -> Option<(&Expr, Option<&str>, Option<&Expr>)> {
+    // Pattern A: `(g = base, D === 0 ? g : { buf: g.buf, off: g.off + D, ... })`
+    // or `(g = base, { buf: g.buf, off: g.off + D, ... })`
+    if let Expr::Seq(items) = expr {
+        if items.len() == 2 {
+            if let Expr::Assign(g_lhs, base_rhs) = &items[0] {
+                if let Expr::Ident(g_name) = g_lhs.as_ref() {
+                    if g_name.starts_with("$t") {
+                        // Direct `{ buf: j.buf, off: j.off }` over `j = __rt.bstr_bytes(S)`
+                        if let Some(s) = match_direct_bstr_bytes(base_rhs) {
+                            if is_buf_off_copy(&items[1], g_name) {
+                                return Some((s, Some(g_name), None));
+                            }
+                        }
+                        // Offset over `g = base`
+                        if let Some((s, j_temp)) = match_base_bstr_bytes(base_rhs) {
+                            if let Some(start) = match_offset_of(&items[1], g_name) {
+                                return Some((s, j_temp.or(Some(g_name)), Some(start)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some((s, j_temp)) = match_base_bstr_bytes(expr) {
+        return Some((s, j_temp, None));
+    }
+    None
+}
+
+fn match_direct_bstr_bytes(expr: &Expr) -> Option<&Expr> {
+    let Expr::Call(callee, args) = expr else {
+        return None;
+    };
+    if rt_member(callee) == Some("bstr_bytes") && args.len() == 1 {
+        Some(&args[0])
+    } else {
+        None
+    }
+}
+
+fn is_buf_off_copy(expr: &Expr, var: &str) -> bool {
+    let Expr::Object(entries) = expr else {
+        return false;
+    };
+    entries.len() == 2
+        && entries[0].0 == "buf"
+        && matches!(&entries[0].1, Expr::Member(o, p) if p == "buf" && matches!(o.as_ref(), Expr::Ident(n) if n == var))
+        && entries[1].0 == "off"
+        && matches!(&entries[1].1, Expr::Member(o, p) if p == "off" && matches!(o.as_ref(), Expr::Ident(n) if n == var))
+}
+
+fn match_base_bstr_bytes(expr: &Expr) -> Option<(&Expr, Option<&str>)> {
+    if let Some(s) = match_direct_bstr_bytes(expr) {
+        return Some((s, None));
+    }
+    let Expr::Seq(items) = expr else {
+        return None;
+    };
+    if items.len() != 2 {
+        return None;
+    }
+    let Expr::Assign(j_lhs, rhs) = &items[0] else {
+        return None;
+    };
+    let Expr::Ident(j_name) = j_lhs.as_ref() else {
+        return None;
+    };
+    if !j_name.starts_with("$t") {
+        return None;
+    }
+    let s = match_direct_bstr_bytes(rhs)?;
+    if is_buf_off_copy(&items[1], j_name) {
+        Some((s, Some(j_name)))
+    } else {
+        None
+    }
+}
+
+fn match_offset_of<'a>(expr: &'a Expr, base: &str) -> Option<&'a Expr> {
+    // Either `D === 0 ? base : { buf: base.buf, off: base.off + D, ... }`
+    // or `{ buf: base.buf, off: base.off + D, ... }`.
+    let obj = match expr {
+        Expr::Cond(cond, then_e, else_e) => {
+            if !matches!(then_e.as_ref(), Expr::Ident(n) if n == base) {
+                return None;
+            }
+            let Expr::Binary(jsast::BinOp::StrictEq, l, r) = cond.as_ref() else {
+                return None;
+            };
+            if !matches!(r.as_ref(), Expr::Num(n) if *n == 0.0) {
+                return None;
+            }
+            let obj_start = match_offset_obj(else_e, base)?;
+            return (l.as_ref() == obj_start).then_some(obj_start);
+        }
+        other => other,
+    };
+    match_offset_obj(obj, base)
+}
+
+fn match_offset_obj<'a>(expr: &'a Expr, base: &str) -> Option<&'a Expr> {
+    let Expr::Object(entries) = expr else {
+        return None;
+    };
+    if entries.len() < 2 || entries.len() > 3 {
+        return None;
+    }
+    if entries[0].0 != "buf"
+        || !matches!(&entries[0].1, Expr::Member(o, p) if p == "buf" && matches!(o.as_ref(), Expr::Ident(n) if n == base))
+    {
+        return None;
+    }
+    if entries[1].0 != "off" {
+        return None;
+    }
+    let Expr::Binary(jsast::BinOp::Add, l, r) = &entries[1].1 else {
+        return None;
+    };
+    if !matches!(l.as_ref(), Expr::Member(o, p) if p == "off" && matches!(o.as_ref(), Expr::Ident(n) if n == base))
+    {
+        return None;
+    }
+    if entries.len() == 3
+        && (entries[2].0 != "sc"
+            || !matches!(&entries[2].1, Expr::Member(o, p) if p == "sc" && matches!(o.as_ref(), Expr::Ident(n) if n == base)))
+    {
+        return None;
+    }
+    Some(r.as_ref())
+}
+
+fn match_end_minus_start<'a>(len_expr: &'a Expr, start: &Expr) -> Option<&'a Expr> {
+    let inner = match len_expr {
+        Expr::Binary(jsast::BinOp::UShr, l, r) if matches!(r.as_ref(), Expr::Num(n) if *n == 0.0) => {
+            l.as_ref()
+        }
+        other => other,
+    };
+    let Expr::Binary(jsast::BinOp::Sub, end, sub_rhs) = inner else {
+        return None;
+    };
+    (sub_rhs.as_ref() == start).then_some(end.as_ref())
 }
 
 #[cfg(test)]
@@ -2585,5 +3905,50 @@ mod tests {
             leftover_helper("__rt.str_to_uppercase(s)"),
             Some("str_to_uppercase")
         );
+    }
+
+    #[test]
+    fn folds_bstr_slice_roundtrip_and_elides_readonly_bstr_bytes() {
+        // 1. `($t0 = __rt.sfp(__rt.bstr_bytes(s), b), __rt.bstr_of($t0.buf, $t0.off, $t0.len))` -> `s.slice(0, b)`.
+        let mut roundtrip = jsast::ret(Expr::Seq(vec![
+            Expr::Assign(
+                Box::new(jsast::id("$t0")),
+                Box::new(rt(
+                    "sfp",
+                    vec![rt("str_bytes", vec![jsast::id("s")]), jsast::id("b")],
+                )),
+            ),
+            rt(
+                "bytes_str",
+                vec![
+                    Expr::Member(Box::new(jsast::id("$t0")), "buf".to_owned()),
+                    Expr::Member(Box::new(jsast::id("$t0")), "off".to_owned()),
+                    Expr::Member(Box::new(jsast::id("$t0")), "len".to_owned()),
+                ],
+            ),
+        ]));
+        rewrite(&mut roundtrip);
+        let printed = jsast::program_to_string(std::slice::from_ref(&roundtrip));
+        assert!(printed.contains("s.slice(0, b)"), "{printed}");
+        assert!(!printed.contains("bstr_bytes"), "{printed}");
+
+        // 2. Read-only `let bv; bv = __rt.bstr_bytes(s); return bv.buf[bv.off + i];` -> `bv = s; return bv.charCodeAt(i);`.
+        let mut body = vec![
+            Stmt::Let("bv".to_owned(), None),
+            jsast::assign_stmt(jsast::id("bv"), rt("bstr_bytes", vec![jsast::id("s")])),
+            Stmt::Return(Some(Expr::Index(
+                Box::new(Expr::Member(Box::new(jsast::id("bv")), "buf".to_owned())),
+                Box::new(Expr::Binary(
+                    jsast::BinOp::Add,
+                    Box::new(Expr::Member(Box::new(jsast::id("bv")), "off".to_owned())),
+                    Box::new(jsast::id("i")),
+                )),
+            ))),
+        ];
+        elide_readonly_bstr_bytes(&mut body);
+        let printed_ro = jsast::program_to_string(&body);
+        assert!(printed_ro.contains("bv = s;"), "{printed_ro}");
+        assert!(printed_ro.contains("bv.charCodeAt(i)"), "{printed_ro}");
+        assert!(!printed_ro.contains("bstr_bytes"), "{printed_ro}");
     }
 }

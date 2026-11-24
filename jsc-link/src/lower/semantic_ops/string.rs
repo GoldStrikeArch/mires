@@ -2988,6 +2988,7 @@ mod bstr_tests {
             element_glue_nonthrowing: false,
             panic_impl: None,
             panic_reads_info: false,
+            native_string_enabled: false,
         }
     }
 

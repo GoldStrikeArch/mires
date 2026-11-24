@@ -676,6 +676,8 @@ struct Analysis {
     view_of: BTreeMap<ValueId, View>,
     /// The node a node's field holds, for the fields that hold one.
     nested: BTreeMap<(NodeId, u32), NodeId>,
+    /// Nodes mutated via `SetField`/`SetDiscriminant` or `StoreThrough` through a tracked view.
+    mutated_nodes: BTreeSet<NodeId>,
     escaped: BTreeSet<NodeId>,
 }
 
@@ -686,12 +688,37 @@ impl Analysis {
             node_of: BTreeMap::new(),
             view_of: BTreeMap::new(),
             nested: BTreeMap::new(),
+            mutated_nodes: BTreeSet::new(),
             escaped: BTreeSet::new(),
         };
         let incoming = predecessors(func, doms);
         analysis.discover(func, table, &incoming);
         analysis.decide(func, table, &incoming, doms);
         analysis
+    }
+
+    /// Whether `node` is an immutable baseline single-variant aggregate of plain non-cloning
+    /// fields (`Copy` scalar struct/tuple like `{ hi: u32, lo: u32 }`) that can be materialized
+    /// lazily at an escaping `OpKind::Aggregate` or `RTerm::Return` without escaping its defining
+    /// loop. Read-only `BorrowView`s are allowed because they stay virtual and never mutate `node`.
+    fn can_late_materialize(&self, node: NodeId, table: &TypeTable) -> bool {
+        if self.mutated_nodes.contains(&node) {
+            return false;
+        }
+        let info = &self.nodes[node];
+        info.enum_info.is_none()
+            && info.shape.carrier == Carrier::Baseline
+            && !info.fields.is_empty()
+            && info
+                .fields
+                .iter()
+                .all(|f| f.carrier == Carrier::Baseline && !table.needs_clone(f.ty))
+            && candidates::field_reads_resolve(
+                table,
+                info.shape.ty,
+                info.variant,
+                info.fields.len(),
+            )
     }
 
     /// The node `v` is an alias of, if the fixpoint kept it virtual.
@@ -1120,6 +1147,23 @@ impl Analysis {
                 unpinned.insert((node, field));
             }
         }
+        for block in &func.blocks {
+            for op in &block.ops {
+                match &op.kind {
+                    OpKind::SetField { base, .. } | OpKind::SetDiscriminant { base, .. } => {
+                        if let Some(&node) = self.node_of.get(base) {
+                            self.mutated_nodes.insert(node);
+                        }
+                    }
+                    OpKind::StoreThrough { ptr, .. } => {
+                        if let Some(&(node, _)) = self.view_of.get(ptr) {
+                            self.mutated_nodes.insert(node);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         for block in &func.blocks {
             for op in &block.ops {
@@ -1158,12 +1202,26 @@ impl Analysis {
                     }
                 }
                 let mut allowed = self.allowed_uses(op, func, table);
+                if let OpKind::Aggregate { fields, .. } = &op.kind {
+                    if op.result.and_then(|r| self.node_of.get(&r)).is_none() {
+                        for v in fields {
+                            if let Some(&child) = self.node_of.get(v) {
+                                if self.can_late_materialize(child, table) {
+                                    unpinned
+                                        .extend((0..self.arity(child) as u32).map(|f| (child, f)));
+                                }
+                            }
+                        }
+                    }
+                }
                 for used in op.kind.uses() {
                     match allowed.iter().position(|value| *value == used) {
                         Some(position) => {
                             allowed.remove(position);
                         }
-                        None => self.seed(&mut seeds, used),
+                        None => {
+                            self.seed(&mut seeds, used);
+                        }
                     }
                 }
             }
@@ -1178,7 +1236,18 @@ impl Analysis {
             }
             match &block.term {
                 RTerm::Switch { scrut, .. } => self.seed(&mut seeds, *scrut),
-                RTerm::Return(Some(v)) | RTerm::Throw(Some(v)) => self.seed(&mut seeds, *v),
+                RTerm::Return(Some(v)) => {
+                    if let Some(&node) = self.node_of.get(v) {
+                        if self.can_late_materialize(node, table) {
+                            unpinned.extend((0..self.arity(node) as u32).map(|f| (node, f)));
+                        } else {
+                            self.seed(&mut seeds, *v);
+                        }
+                    } else {
+                        self.seed(&mut seeds, *v);
+                    }
+                }
+                RTerm::Throw(Some(v)) => self.seed(&mut seeds, *v),
                 _ => {}
             }
         }
@@ -1222,11 +1291,25 @@ impl Analysis {
             }
         }
 
-        // A node in another node's field lives exactly as long as the object holding it.
+        // A node in another node's field lives exactly as long as the object holding it — unless
+        // `child` is an immutable scalar `Copy` struct (`can_late_materialize`) that can be
+        // materialized right at an escaping outer `OpKind::Aggregate` (e.g. `[Word; 8]` after
+        // SHA-512's 80-round loop) without propagating escape back into the loop.
+        // Note: if `parent` itself ends up escaping (e.g. `c6 = [p, E, ...]` dominating a later
+        // loop), `unpinned` on `parent` is irrelevant because `ops()` materializes `child`
+        // directly into `parent`'s `Aggregate`. We only seed `child` for `unpinned` after the
+        // initial fixpoint if `parent` stayed virtual.
+        let mut deferred_unpinned: Vec<(NodeId, NodeId)> = Vec::new();
         for (&(parent, field), &child) in &self.nested {
-            implications.push((parent, child));
-            if unpinned.contains(&(parent, field)) {
-                seeds.insert(child);
+            if self.can_late_materialize(child, table) {
+                if unpinned.contains(&(parent, field)) {
+                    deferred_unpinned.push((parent, child));
+                }
+            } else {
+                implications.push((parent, child));
+                if unpinned.contains(&(parent, field)) {
+                    seeds.insert(child);
+                }
             }
         }
 
@@ -1307,11 +1390,114 @@ impl Analysis {
         }
 
         let mut edges: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
-        for (from, to) in implications {
+        for &(from, to) in &implications {
             edges.entry(from).or_default().push(to);
         }
         let mut worklist: Vec<NodeId> = seeds.iter().copied().collect();
         self.escaped = seeds;
+        while let Some(node) = worklist.pop() {
+            for next in edges.get(&node).into_iter().flatten() {
+                if self.escaped.insert(*next) {
+                    worklist.push(*next);
+                }
+            }
+        }
+        // If a virtual `parent` holding late-materializable children is itself a pure packaging
+        // `Aggregate` passed into an escaped/real block parameter (e.g. `[a, b, c, d, e, f, g, h]`
+        // handed to `IntoIter` right after SHA-512's 80-round loop), it is going to be
+        // materialized on that edge anyway. Escaping `parent` directly keeps all its
+        // `can_late_materialize` children virtual (materialized once at `parent`'s `Aggregate` in
+        // `ops()`) instead of escaping them back into their defining loop.
+        if !deferred_unpinned.is_empty() {
+            let mut candidate_parents: BTreeSet<NodeId> = deferred_unpinned
+                .iter()
+                .map(|&(parent, _)| parent)
+                .filter(|parent| !self.escaped.contains(parent))
+                .collect();
+            if !candidate_parents.is_empty() {
+                let mut aggregate_defined: BTreeSet<NodeId> = BTreeSet::new();
+                let mut has_virtual_access: BTreeSet<NodeId> = BTreeSet::new();
+                for block in &func.blocks {
+                    for op in &block.ops {
+                        if let (Some(res), OpKind::Aggregate { .. }) = (op.result, &op.kind) {
+                            if let Some(&node) = self.node_of.get(&res) {
+                                if candidate_parents.contains(&node) {
+                                    aggregate_defined.insert(node);
+                                }
+                            }
+                        }
+                        match &op.kind {
+                            OpKind::Field { base, .. }
+                            | OpKind::SetField { base, .. }
+                            | OpKind::Discriminant(base)
+                            | OpKind::SetDiscriminant { base, .. }
+                            | OpKind::Copy(base) => {
+                                if let Some(&node) = self.node_of.get(base) {
+                                    has_virtual_access.insert(node);
+                                }
+                            }
+                            OpKind::BorrowView {
+                                root: Root::Value(base),
+                                ..
+                            } => {
+                                if let Some(&node) = self.node_of.get(base) {
+                                    has_virtual_access.insert(node);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let mut edge_materialized: BTreeSet<NodeId> = BTreeSet::new();
+                for block in &func.blocks {
+                    for (target, args) in block.term.edges() {
+                        let target_params = &func.blocks[target.0 as usize].params;
+                        for (pos, arg) in args.iter().enumerate() {
+                            let Some(&arg_node) = self.node_of.get(arg) else {
+                                continue;
+                            };
+                            if !candidate_parents.contains(&arg_node) {
+                                continue;
+                            }
+                            let param_virtual_same = target_params
+                                .get(pos)
+                                .and_then(|p| self.node_of.get(p).copied())
+                                .is_some_and(|p| {
+                                    !self.escaped.contains(&p) && self.same_shape(arg_node, p)
+                                });
+                            if !param_virtual_same {
+                                edge_materialized.insert(arg_node);
+                            }
+                        }
+                    }
+                }
+                candidate_parents.retain(|node| {
+                    aggregate_defined.contains(node)
+                        && edge_materialized.contains(node)
+                        && !has_virtual_access.contains(node)
+                });
+                for parent in candidate_parents {
+                    if self.escaped.insert(parent) {
+                        worklist.push(parent);
+                    }
+                }
+                while let Some(node) = worklist.pop() {
+                    for next in edges.get(&node).into_iter().flatten() {
+                        if self.escaped.insert(*next) {
+                            worklist.push(*next);
+                        }
+                    }
+                }
+            }
+        }
+        // Any late-materializable child nested inside an unpinned field of a *virtual* parent must
+        // still escape so the parent's merge/loop-header state carries a plain value rather than
+        // `FieldVal::Node`. Escaped parents materialize the child directly in `ops()`.
+        for (parent, child) in deferred_unpinned {
+            if !self.escaped.contains(&parent) && self.escaped.insert(child) {
+                worklist.push(child);
+            }
+        }
         while let Some(node) = worklist.pop() {
             for next in edges.get(&node).into_iter().flatten() {
                 if self.escaped.insert(*next) {
@@ -1465,6 +1651,9 @@ impl Analysis {
                 }
             }
             // A node in another node's field: the outer object holding it is what decides.
+            // If the outer `Aggregate` is not a tracked node (e.g. a `[Word; 8]` array built
+            // after an 80-round loop), an immutable scalar `Copy` struct can be materialized
+            // right at this aggregate site without escaping its defining loop.
             OpKind::Aggregate { fields, .. } => {
                 match op.result.and_then(|r| self.node_of.get(&r)) {
                     Some(&parent) => fields
@@ -1480,7 +1669,15 @@ impl Analysis {
                         })
                         .map(|(_, v)| *v)
                         .collect(),
-                    None => Vec::new(),
+                    None => fields
+                        .iter()
+                        .copied()
+                        .filter(|v| {
+                            self.node_of
+                                .get(v)
+                                .is_some_and(|&child| self.can_late_materialize(child, table))
+                        })
+                        .collect(),
                 }
             }
             // `[u8; N]` to `uN`: the bytes are consumed one at a time, so the array never exists.
@@ -1874,7 +2071,18 @@ impl Rewriter<'_> {
                 continue;
             }
             let mut kind = op.kind.clone();
-            self.remap(&mut kind)?;
+            if let OpKind::Aggregate { fields, .. } = &mut kind {
+                for field in fields.iter_mut() {
+                    if let Some(new) = self.map.get(field).copied() {
+                        *field = new;
+                    } else {
+                        let child = self.analysis.live_node(*field)?;
+                        *field = self.materialize_at(id, child, state)?;
+                    }
+                }
+            } else {
+                self.remap(&mut kind)?;
+            }
             match op.result {
                 Some(result) => {
                     let ty = self.old.values[result.0 as usize].ty;
@@ -2327,7 +2535,15 @@ impl Rewriter<'_> {
                 default: (default.0, self.edge(id, default.0, &default.1)?),
             },
             RTerm::Invoke { .. } => return None,
-            RTerm::Return(v) => RTerm::Return(self.optional(v)?),
+            RTerm::Return(v) => RTerm::Return(match v {
+                Some(old) => Some(if let Some(new) = self.value(old) {
+                    new
+                } else {
+                    let node = self.analysis.live_node(old)?;
+                    self.materialize(id, node)?
+                }),
+                None => None,
+            }),
             RTerm::Throw(v) => RTerm::Throw(self.optional(v)?),
             RTerm::Unreachable => RTerm::Unreachable,
         })
@@ -2424,6 +2640,24 @@ impl Rewriter<'_> {
         let value = self.builder.op(from, kind, def.ty, def.origin);
         self.materialized.insert((from, node), value);
         Some(value)
+    }
+
+    /// Materializes a virtual single-variant baseline node from the current mid-block `state`
+    /// right before an escaping `OpKind::Aggregate`.
+    fn materialize_at(&mut self, block: RBlockId, node: NodeId, state: &State) -> Option<ValueId> {
+        let fields = self.field_values(node, state)?;
+        let info = &self.analysis.nodes[node];
+        if info.shape.carrier != Carrier::Baseline || info.enum_info.is_some() {
+            return None;
+        }
+        let kind = OpKind::Aggregate {
+            ty: info.shape.ty,
+            variant: info.variant,
+            active_field: None,
+            fields,
+        };
+        let def = self.old.values[info.def.0 as usize];
+        Some(self.builder.op(block, kind, def.ty, def.origin))
     }
 
     /// Rewrites every value an op reads to its new id. Mirrors `OpKind::for_each_use`.
@@ -5021,6 +5255,214 @@ mod tests {
                     "expected Move(param) guard before initial CellStore"
                 );
             }
+        }
+
+        #[test]
+        fn pure_packaging_exit_array_keeps_loop_carried_pair_virtual() {
+            const PAIR_ARR2: TypeId = TypeId(99);
+            let mut interns = world();
+            let sink_str = interns.intern_str("sink");
+            let elem_field = FieldDescriptor {
+                key: FieldKey::Index(0),
+                ty: PAIR,
+                offset: 0,
+            };
+            interns.types.insert(TypeDescriptor {
+                id: PAIR_ARR2,
+                name: None,
+                kind: TypeKind::Array {
+                    element: PAIR,
+                    length: 2,
+                },
+                layout: LayoutFacts {
+                    sized: true,
+                    ..LayoutFacts::default()
+                },
+                meta: TypeMeta::default(),
+                js: JsFacts {
+                    is_indirect: true,
+                    needs_clone: true,
+                    fields: vec![elem_field],
+                    ..js_facts(PAIR_ARR2)
+                },
+            });
+            let tbl = &interns.types;
+            let sig = Signature {
+                arguments: vec![I32],
+                result: PAIR_ARR2,
+                abi: AbiSignature {
+                    parameters: 1,
+                    ..AbiSignature::default()
+                },
+            };
+            let mut b = FuncBuilder::new(item(8), sig);
+            let n = b.param(I32, O);
+            let c0 = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+                I32,
+                O,
+            );
+            let c1 = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Const(ConstTree::Scalar { bits: 1, bytes: 4 }),
+                I32,
+                O,
+            );
+            let init_pair = b.op(
+                FuncBuilder::ENTRY,
+                OpKind::Aggregate {
+                    ty: PAIR,
+                    variant: 0,
+                    active_field: None,
+                    fields: vec![c0, c1],
+                },
+                PAIR,
+                O,
+            );
+
+            let header = b.block();
+            let body = b.block();
+            let exit_pack = b.block();
+            let sink = b.block();
+
+            b.terminate(FuncBuilder::ENTRY, RTerm::Goto(header, vec![c0, init_pair]));
+
+            let i_param = b.block_param(header, I32, O);
+            let p_param = b.block_param(header, PAIR, O);
+            let cmp = b.op(
+                header,
+                OpKind::Binary {
+                    op: BinaryOp::Lt,
+                    l: i_param,
+                    r: n,
+                    ty: I32,
+                },
+                I32,
+                O,
+            );
+            b.terminate(
+                header,
+                RTerm::Switch {
+                    scrut: cmp,
+                    scrut_ty: I32,
+                    cases: vec![(0, exit_pack, Vec::new())],
+                    default: (body, Vec::new()),
+                },
+            );
+
+            let f0 = b.op(
+                body,
+                OpKind::Field {
+                    base: p_param,
+                    variant: None,
+                    field: 0,
+                },
+                I32,
+                O,
+            );
+            let f1 = b.op(
+                body,
+                OpKind::Field {
+                    base: p_param,
+                    variant: None,
+                    field: 1,
+                },
+                I32,
+                O,
+            );
+            let next_f0 = b.op(
+                body,
+                OpKind::Binary {
+                    op: BinaryOp::Add,
+                    l: f0,
+                    r: f1,
+                    ty: I32,
+                },
+                I32,
+                O,
+            );
+            let next_i = b.op(
+                body,
+                OpKind::Binary {
+                    op: BinaryOp::Add,
+                    l: i_param,
+                    r: c1,
+                    ty: I32,
+                },
+                I32,
+                O,
+            );
+            let next_pair = b.op(
+                body,
+                OpKind::Aggregate {
+                    ty: PAIR,
+                    variant: 0,
+                    active_field: None,
+                    fields: vec![next_f0, f0],
+                },
+                PAIR,
+                O,
+            );
+            b.terminate(body, RTerm::Goto(header, vec![next_i, next_pair]));
+
+            // Post-loop pure packaging `[p_param, p_param]` passed to an escaped sink parameter.
+            let m0 = b.op(exit_pack, OpKind::Move(p_param), PAIR, O);
+            let m1 = b.op(exit_pack, OpKind::Move(p_param), PAIR, O);
+            let arr = b.op(
+                exit_pack,
+                OpKind::Aggregate {
+                    ty: PAIR_ARR2,
+                    variant: 0,
+                    active_field: None,
+                    fields: vec![m0, m1],
+                },
+                PAIR_ARR2,
+                O,
+            );
+            b.terminate(exit_pack, RTerm::Goto(sink, vec![arr]));
+
+            let sink_param = b.block_param(sink, PAIR_ARR2, O);
+            let _call = b.op(
+                sink,
+                OpKind::Call {
+                    callee: Callee::Direct {
+                        item: item(99),
+                        link_name: sink_str,
+                    },
+                    function: None,
+                    args: vec![sink_param],
+                    track_caller: None,
+                    semantic: CallSemantic::Ordinary,
+                    host: None,
+                },
+                I32,
+                O,
+            );
+            b.terminate(sink, RTerm::Return(Some(sink_param)));
+
+            let mut func = b.finish();
+            let stats = super::super::run(&mut func, tbl);
+            func.verify(tbl).expect("valid after PEA");
+            assert!(
+                stats.scalarized >= 3,
+                "expected init_pair, p_param, next_pair scalarized, got {stats:?}"
+            );
+            assert!(
+                func.blocks[body.0 as usize]
+                    .ops
+                    .iter()
+                    .all(|op| !matches!(op.kind, OpKind::Aggregate { .. })),
+                "loop body must not allocate Pair:\n{:#?}",
+                func.blocks[body.0 as usize].ops
+            );
+            assert!(
+                func.blocks[exit_pack.0 as usize]
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op.kind, OpKind::Aggregate { ty: PAIR_ARR2, .. })),
+                "exit block must lazily materialize Pair and [Pair; 2]"
+            );
         }
     }
 }

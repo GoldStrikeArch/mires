@@ -406,6 +406,7 @@ pub fn collect(
 ) -> ValueGraph {
     let lowered: BTreeMap<ItemId, JsName> = funcs
         .iter()
+        .filter(|(name, _)| live.contains(*name))
         .filter_map(|(name, func)| Some((func.as_ref().ok()?.item, name.clone())))
         .collect();
     let mut collector = Collector {
@@ -429,6 +430,9 @@ pub fn collect(
     // The non-call reference scan, shared with the flat-ABI plan.
     let mut scan = RefScan::default();
     for (name, func) in funcs {
+        if !live.contains(name) {
+            continue;
+        }
         let Ok(func) = func else { continue };
         let types = collector.types_of(name);
         for block in &func.blocks {
@@ -439,6 +443,9 @@ pub fn collect(
     }
 
     for (name, func) in funcs {
+        if !live.contains(name) {
+            continue;
+        }
         let Ok(func) = func else { continue };
         collector.walk_cache.clear();
         collector.collect_func(name, func);
@@ -2877,6 +2884,9 @@ impl<'a> Collector<'a> {
     fn exports(&mut self) {
         let mut components: BTreeMap<(TypeId, Vec<Step>), Vec<NodeKey>> = BTreeMap::new();
         for (name, func) in self.funcs {
+            if !self.live.contains(name) {
+                continue;
+            }
             let Ok(func) = func else { continue };
             let exported = self
                 .table
@@ -2978,6 +2988,9 @@ impl<'a> Collector<'a> {
             pinned.remove(target);
         }
         for name in self.funcs.keys() {
+            if !self.live.contains(name) {
+                continue;
+            }
             let internal = self.table.get(name).is_none_or(|item| {
                 item.linkage == crate::item::Linkage::internal() || item.linkage.exported
             });

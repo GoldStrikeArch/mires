@@ -325,6 +325,64 @@ pub enum StandardOperation {
     BoxNew,
     /// `alloc::alloc::rcgjs_typed_dealloc_raw(ptr: *mut u8, layout: Layout)`.
     TypedDeallocRaw,
+    /// `alloc::string::rcgjs_str_new() -> String`.
+    NativeStrNew,
+    /// `alloc::string::rcgjs_str_with_capacity(cap: usize) -> String`.
+    NativeStrWithCapacity,
+    /// `alloc::string::rcgjs_str_from_str(s: &str) -> String`.
+    NativeStrFromStr,
+    /// `alloc::string::rcgjs_str_as_str(s: &String) -> &str`.
+    NativeStrAsStr,
+    /// `alloc::string::rcgjs_str_len(s: &String) -> usize`.
+    NativeStrLen,
+    /// `alloc::string::rcgjs_str_capacity(s: &String) -> usize`.
+    NativeStrCapacity,
+    /// `alloc::string::rcgjs_str_push_str(s: &mut String, rhs: &str)`.
+    NativeStrPushStr,
+    /// `alloc::string::rcgjs_str_push(s: &mut String, ch: char)`.
+    NativeStrPush,
+    /// `alloc::string::rcgjs_str_clear(s: &mut String)`.
+    NativeStrClear,
+    /// `alloc::string::rcgjs_str_truncate_unchecked(s: &mut String, new_len: usize)`.
+    NativeStrTruncate,
+    /// `alloc::string::rcgjs_str_reserve(s: &mut String, additional: usize)`.
+    NativeStrReserve,
+    /// `alloc::string::rcgjs_str_shrink_to(s: &mut String, min_capacity: usize)`.
+    NativeStrShrinkTo,
+    /// `alloc::string::rcgjs_str_from_vec_unchecked(bytes: Vec<u8>) -> String`.
+    NativeStrFromVec,
+    /// `alloc::string::rcgjs_str_into_bytes(s: String) -> Vec<u8>`.
+    NativeStrIntoBytes,
+    /// `alloc::string::rcgjs_str_replace_slice(s: &mut String, start: usize, end: usize, rep: &str)`.
+    NativeStrReplaceSlice,
+    /// `alloc::string::rcgjs_str_extend_within(s: &mut String, start: usize, end: usize)`.
+    NativeStrExtendWithin,
+    /// `alloc::string::rcgjs_str_clone_from(dst: &mut String, src: &String)`.
+    NativeStrCloneFrom,
+    /// `alloc::string::rcgjs_str_to_ascii_lowercase(s: &str) -> String`.
+    NativeStrToAsciiLowercase,
+    /// `alloc::string::rcgjs_str_to_ascii_uppercase(s: &str) -> String`.
+    NativeStrToAsciiUppercase,
+    /// `alloc::string::rcgjs_str_repeat(s: &str, n: usize) -> String`.
+    NativeStrRepeat,
+    /// `core::str::traits::rcgjs_str_eq(a: &str, b: &str) -> bool`.
+    BstrEq,
+    /// `core::str::traits::rcgjs_str_cmp(a: &str, b: &str) -> Ordering`.
+    BstrCmp,
+    /// `core::str::pattern::rcgjs_str_starts_with(haystack: &str, needle: &str) -> bool`.
+    BstrStartsWith,
+    /// `core::str::pattern::rcgjs_str_ends_with(haystack: &str, needle: &str) -> bool`.
+    BstrEndsWith,
+    /// `core::str::pattern::rcgjs_str_contains(haystack: &str, needle: &str) -> bool`.
+    BstrContains,
+    /// `core::str::pattern::rcgjs_str_find_char(haystack: &str, start: usize, end: usize, needle: char) -> usize`.
+    BstrFindChar,
+    /// `core::str::pattern::rcgjs_str_rfind_char(haystack: &str, start: usize, end: usize, needle: char) -> usize`.
+    BstrRfindChar,
+    /// `core::str::pattern::rcgjs_str_find_str(haystack: &str, start: usize, end: usize, needle: &str) -> usize`.
+    BstrFindStr,
+    /// `core::str::pattern::rcgjs_str_rfind_str(haystack: &str, start: usize, end: usize, needle: &str) -> usize`.
+    BstrRfindStr,
 }
 
 impl StandardOperation {
@@ -337,6 +395,49 @@ impl StandardOperation {
                 | Self::TypedDealloc
                 | Self::BoxNew
                 | Self::TypedDeallocRaw
+        )
+    }
+
+    /// Whether this is one of the Phase 5 native `{ s, cap }` `String` hooks.
+    pub fn is_native_string(self) -> bool {
+        matches!(
+            self,
+            Self::NativeStrNew
+                | Self::NativeStrWithCapacity
+                | Self::NativeStrFromStr
+                | Self::NativeStrAsStr
+                | Self::NativeStrLen
+                | Self::NativeStrCapacity
+                | Self::NativeStrPushStr
+                | Self::NativeStrPush
+                | Self::NativeStrClear
+                | Self::NativeStrTruncate
+                | Self::NativeStrReserve
+                | Self::NativeStrShrinkTo
+                | Self::NativeStrFromVec
+                | Self::NativeStrIntoBytes
+                | Self::NativeStrReplaceSlice
+                | Self::NativeStrExtendWithin
+                | Self::NativeStrCloneFrom
+                | Self::NativeStrToAsciiLowercase
+                | Self::NativeStrToAsciiUppercase
+                | Self::NativeStrRepeat
+        )
+    }
+
+    /// Whether this is one of the Phase 5 `core::str` host-delegated comparison/search hooks.
+    pub fn is_fast_str_op(self) -> bool {
+        matches!(
+            self,
+            Self::BstrEq
+                | Self::BstrCmp
+                | Self::BstrStartsWith
+                | Self::BstrEndsWith
+                | Self::BstrContains
+                | Self::BstrFindChar
+                | Self::BstrRfindChar
+                | Self::BstrFindStr
+                | Self::BstrRfindStr
         )
     }
 

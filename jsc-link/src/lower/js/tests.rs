@@ -10634,11 +10634,13 @@ fn phase3_typed_heap_lowers_hooks_plain_put_and_zero_offset_guard() {
 
     let tier_a = crate::analysis::heap::HeapPlan {
         typed_heap_enabled: true,
+        native_string_enabled: false,
         raw_alloc_reachable: false,
         non_rc_raw_alloc_reachable: false,
         any_boxed: false,
         boxed_defs: BTreeSet::new(),
-        boxed_non_adt: false,
+        boxed_non_adt_keys: BTreeSet::new(),
+        all_non_adt_boxed: false,
         all_adts_boxed: false,
     };
     let speed_opts = Opts {
@@ -10933,11 +10935,13 @@ fn phase4_inline_overwrite_copy_one_and_sfp_len() {
 
     let tier_a = crate::analysis::heap::HeapPlan {
         typed_heap_enabled: true,
+        native_string_enabled: false,
         raw_alloc_reachable: false,
         non_rc_raw_alloc_reachable: false,
         any_boxed: false,
         boxed_defs: BTreeSet::new(),
-        boxed_non_adt: false,
+        boxed_non_adt_keys: BTreeSet::new(),
+        all_non_adt_boxed: false,
         all_adts_boxed: false,
     };
     let speed_opts = Opts {

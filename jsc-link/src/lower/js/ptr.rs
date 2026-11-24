@@ -190,6 +190,54 @@ impl<'a> JsCx<'a> {
                 variants,
                 ..
             } => {
+                if self.heap().native_string_enabled
+                    && desc.meta.candidate == RepresentationCandidate::String
+                {
+                    let keys = vec!["s".to_owned(), "cap".to_owned()];
+                    if let Expr::Object(ref entries) = value {
+                        let mut unique = std::collections::HashSet::with_capacity(entries.len());
+                        let matches_exact = entries.len() == keys.len()
+                            && entries
+                                .iter()
+                                .all(|(k, _)| keys.contains(k) && unique.insert(k.as_str()));
+                        if matches_exact {
+                            let Expr::Object(entries) = value else {
+                                unreachable!()
+                            };
+                            let t = bind_target(target, &mut stmts);
+                            let mut evaluated = Vec::with_capacity(entries.len());
+                            for (k, v) in entries {
+                                let val = if is_simple_atom(&v) {
+                                    v
+                                } else {
+                                    let (bind, id) = self.temp(v);
+                                    stmts.push(bind);
+                                    id
+                                };
+                                evaluated.push((k, val));
+                            }
+                            for (k, v) in evaluated {
+                                stmts.push(jsast::assign_stmt(jsast::member(t.clone(), k), v));
+                            }
+                            return Ok(stmts);
+                        }
+                    }
+                    let t = bind_target(target, &mut stmts);
+                    let v = if matches!(value, Expr::Ident(_)) {
+                        value
+                    } else {
+                        let (bind, id) = self.temp(value);
+                        stmts.push(bind);
+                        id
+                    };
+                    for k in keys {
+                        stmts.push(jsast::assign_stmt(
+                            jsast::member(t.clone(), k.clone()),
+                            jsast::member(v.clone(), k),
+                        ));
+                    }
+                    return Ok(stmts);
+                }
                 let candidate_safe = match desc.meta.candidate {
                     RepresentationCandidate::None => true,
                     RepresentationCandidate::Vec => {
@@ -518,6 +566,38 @@ impl<'a> JsCx<'a> {
             )
     }
 
+    /// Lowers a single-element `copy`/`copy_nonoverlapping` whose `src` is a bare indirect
+    /// reference (eliding `__rt.box`) directly into a clone + `deref_write` into `dst`.
+    pub fn ptr_copy_one_from_ref(
+        &self,
+        pointee: TypeId,
+        dst: Expr,
+        src_ref: Expr,
+    ) -> Res<Vec<Stmt>> {
+        if self.table.is_zst(pointee) {
+            return Ok(Vec::new());
+        }
+        let mut stmts = Vec::new();
+        let src_val = if self.table.needs_clone(pointee) {
+            let (bind, tmp) = self.temp(src_ref);
+            stmts.push(bind);
+            value::clone_expr_with(self.table, self.interns, pointee, tmp, self.nested_clone)
+        } else {
+            src_ref
+        };
+        let dst_expr = if matches!(dst, Expr::Ident(_))
+            || matches!(unwrap_offset_cond(dst.clone()), Expr::Object(_))
+        {
+            dst
+        } else {
+            let (bind, id) = self.temp(dst);
+            stmts.push(bind);
+            id
+        };
+        stmts.extend(self.deref_write(pointee, dst_expr, src_val)?);
+        Ok(stmts)
+    }
+
     /// `ptr::copy`/`copy_nonoverlapping` as a statement (`ptr.rs::copy`).
     pub fn ptr_copy(
         &self,
@@ -556,7 +636,13 @@ impl<'a> JsCx<'a> {
         if self.table.needs_clone(pointee) {
             args.push(jsast::arrow(
                 vec![CLONE_PARAM.to_string()],
-                value::clone_expr(self.table, self.interns, pointee, jsast::id(CLONE_PARAM)),
+                value::clone_expr_with(
+                    self.table,
+                    self.interns,
+                    pointee,
+                    jsast::id(CLONE_PARAM),
+                    self.nested_clone,
+                ),
             ));
             let heap = self.heap();
             if heap.typed_heap_enabled
@@ -619,7 +705,12 @@ impl<'a> JsCx<'a> {
 
     /// The zero element factory `__rt.unscale`/`retype` take (`alloc_support.rs::zero_factory`).
     pub(super) fn zero_factory(&self, ty: TypeId) -> Expr {
-        match value::zero_value(self.table, self.interns, ty) {
+        match value::zero_value_for_heap(
+            self.table,
+            self.interns,
+            ty,
+            self.heap().native_string_enabled,
+        ) {
             Some(value) => jsast::arrow(Vec::new(), value),
             None => jsast::null(),
         }
@@ -644,7 +735,12 @@ impl<'a> JsCx<'a> {
                 continue;
             }
             let (Some(zero), Some(key)) = (
-                value::zero_value(table, self.interns, field.ty),
+                value::zero_value_for_heap(
+                    table,
+                    self.interns,
+                    field.ty,
+                    self.heap().native_string_enabled,
+                ),
                 value::key_name(self.interns, field.key),
             ) else {
                 return jsast::null();
@@ -1443,7 +1539,13 @@ impl<'a> JsCx<'a> {
         if self.table.needs_clone(pointee) {
             Some(jsast::arrow(
                 vec![CLONE_PARAM.to_string()],
-                value::clone_expr(self.table, self.interns, pointee, jsast::id(CLONE_PARAM)),
+                value::clone_expr_with(
+                    self.table,
+                    self.interns,
+                    pointee,
+                    jsast::id(CLONE_PARAM),
+                    self.nested_clone,
+                ),
             ))
         } else if self.table.is_indirect(pointee) {
             Some(Expr::Bool(true))
@@ -1455,7 +1557,12 @@ impl<'a> JsCx<'a> {
     /// A zero factory for a type whose zero is not the byte zero
     /// (`alloc_support.rs::non_byte_zero_factory`).
     fn non_byte_zero_factory(&self, ty: TypeId) -> Option<Expr> {
-        let value = value::zero_value(self.table, self.interns, ty)?;
+        let value = value::zero_value_for_heap(
+            self.table,
+            self.interns,
+            ty,
+            self.heap().native_string_enabled,
+        )?;
         (jsast::expr_to_string(&value) != "0").then(|| jsast::arrow(Vec::new(), value))
     }
 

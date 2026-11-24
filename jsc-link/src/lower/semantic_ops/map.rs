@@ -45,6 +45,8 @@ enum KeyLowering {
     Direct,
     /// Argument is a `{ buf, off }` slot reference to a primitive or `&str` (`$native1.buf[$native1.off]`).
     SlotDeref,
+    /// Argument is a universal native `{ s, cap }` `String` or `&String` (`$native1.s`).
+    NativeString,
     /// Argument is a `String` or `&String` whose carrier may be `HostString`, `StringBuilder`, or `Baseline`.
     StringCoerce(StringLayout),
 }
@@ -151,9 +153,13 @@ fn owned_key_lowering(
     match classify_key(cx.table, k_desc) {
         Some(KeyKind::Primitive | KeyKind::StrRef) => Ok(KeyLowering::Direct),
         Some(KeyKind::OwnedString) => {
-            let layout = StringLayout::of(cx.table, cx.interns, k_desc.id)
-                .map_err(|_| SemanticDecline::UnknownLayout)?;
-            Ok(KeyLowering::StringCoerce(layout))
+            if cx.native_string_enabled {
+                Ok(KeyLowering::NativeString)
+            } else {
+                let layout = StringLayout::of(cx.table, cx.interns, k_desc.id)
+                    .map_err(|_| SemanticDecline::UnknownLayout)?;
+                Ok(KeyLowering::StringCoerce(layout))
+            }
         }
         None => Err(SemanticDecline::WrongArgumentType(1)),
     }
@@ -199,9 +205,13 @@ fn lookup_key_lowering(
             if q_desc.kind == TypeKind::Str {
                 Ok(KeyLowering::Direct)
             } else if q_ty == k_desc.id {
-                let layout = StringLayout::of(cx.table, cx.interns, k_desc.id)
-                    .map_err(|_| SemanticDecline::UnknownLayout)?;
-                Ok(KeyLowering::StringCoerce(layout))
+                if cx.native_string_enabled {
+                    Ok(KeyLowering::NativeString)
+                } else {
+                    let layout = StringLayout::of(cx.table, cx.interns, k_desc.id)
+                        .map_err(|_| SemanticDecline::UnknownLayout)?;
+                    Ok(KeyLowering::StringCoerce(layout))
+                }
             } else {
                 Err(SemanticDecline::WrongArgumentType(1))
             }
@@ -217,6 +227,7 @@ fn emit_key_expr(lowering: &KeyLowering, helpers: &mut BTreeSet<&'static str>) -
         KeyLowering::SlotDeref => {
             jsast::index(jsast::member(arg.clone(), "buf"), jsast::member(arg, "off"))
         }
+        KeyLowering::NativeString => jsast::member(arg, "s"),
         KeyLowering::StringCoerce(layout) => {
             helpers.insert("bytes_str");
             let ptr_expr = layout.member(arg.clone(), &layout.ptr);

@@ -582,7 +582,13 @@ impl Intrinsic<'_, '_> {
             .map(|(index, element)| {
                 let read = jsast::index(pack.clone(), jsast::num(index as f64));
                 if table.needs_clone(*element) {
-                    value::clone_expr(table, self.cx.interns, *element, read)
+                    value::clone_expr_with(
+                        table,
+                        self.cx.interns,
+                        *element,
+                        read,
+                        self.cx.nested_clone,
+                    )
                 } else {
                     read
                 }
@@ -1557,7 +1563,6 @@ impl Intrinsic<'_, '_> {
         let Some(pointee) = self.pointee_of(source)? else {
             return Ok(self.not_a_pointer(name));
         };
-        let (dst, src) = (self.arg(target)?, self.arg(source)?);
         let count_is_one = self.args.get(2).is_some_and(|v| {
             self.cx.def_of(*v).is_some_and(|op| {
                 matches!(
@@ -1566,6 +1571,20 @@ impl Intrinsic<'_, '_> {
                 )
             })
         });
+        if !volatile
+            && count_is_one
+            && self
+                .args
+                .get(source)
+                .is_some_and(|v| self.cx.is_direct_ref_copy_cast(*v))
+        {
+            let src_ref = self.arg(source)?;
+            let dst = self.arg(target)?;
+            return Ok(Outcome::Done(
+                self.cx.ptr_copy_one_from_ref(pointee, dst, src_ref)?,
+            ));
+        }
+        let (dst, src) = (self.arg(target)?, self.arg(source)?);
         Ok(Outcome::Done(self.cx.ptr_copy(
             pointee,
             dst,
@@ -1596,7 +1615,12 @@ impl Intrinsic<'_, '_> {
             };
             vec![dst, value, count]
         } else {
-            let Some(zero) = value::zero_value(table, self.cx.interns, peeled) else {
+            let Some(zero) = value::zero_value_for_heap(
+                table,
+                self.cx.interns,
+                peeled,
+                self.cx.heap().native_string_enabled,
+            ) else {
                 return vec![jsast::expr_stmt(self.cx.zombie(
                     "`write_bytes` is not supported by rustc_codegen_js for this pointee: a byte \
                      pattern names a value only for a one byte pointee, and zero for a scalar one"

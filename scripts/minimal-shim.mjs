@@ -156,6 +156,9 @@ export function minimalShim(programs, shimSource, { module = false, direct: decl
     if (elideRc && name === "tail_slice") {
       return "let $rt_tail_slice = (record, key, len) => ({ buf: record[key], off: 0, len });";
     }
+    if (elideRc && name === "tail_slice_raw") {
+      return "let $rt_tail_slice_raw = (p, key) => ({ buf: p.ptr.buf[p.ptr.off][key], off: 0, len: p.meta });";
+    }
     if (elideBlocks && name === "_blocks") return "const $rt__blocks = null;";
     if (elideBlocks && name === "_blk_get") return "let $rt__blk_get = () => undefined;";
     let stmt = members.get(name);

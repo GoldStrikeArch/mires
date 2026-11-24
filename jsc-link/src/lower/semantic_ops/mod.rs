@@ -64,6 +64,9 @@ pub struct LowerCx<'a> {
     /// Whether `panic_impl` reads its `&PanicInfo` parameter. When `false`, native `Vec` panics
     /// invoke `panic_impl` directly without pulling in the `_nv_pinfo` `PanicInfo` builder.
     pub panic_reads_info: bool,
+    /// Whether universal native `{ s, cap }` `String` representation (`HeapPlan::native_string_enabled`)
+    /// is active for this program.
+    pub native_string_enabled: bool,
 }
 
 /// One registry entry: the complete contract and lowering of one standard operation.
@@ -819,6 +822,7 @@ pub fn validate(cx: &LowerCx<'_>) -> Result<&'static SemanticOp, SemanticDecline
         element_glue_nonthrowing: cx.element_glue_nonthrowing,
         panic_impl: cx.panic_impl,
         panic_reads_info: cx.panic_reads_info,
+        native_string_enabled: cx.native_string_enabled,
     };
     match slots.first() {
         None => {

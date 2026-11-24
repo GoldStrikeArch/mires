@@ -157,6 +157,9 @@ pub struct JsCx<'a> {
     /// (bitwise, shifts, 32-bit wrapping arithmetic, narrow casts), so they may stay in signed
     /// `Int32` without a trailing `>>> 0`.
     int32_only: std::collections::BTreeSet<ValueId>,
+    /// Single-use `Cast(&T -> *const T)` values feeding a constant-1 `copy`/`copy_nonoverlapping`
+    /// under Tier A without raw allocs; lowered without `__rt.box` (computed lazily on first use).
+    direct_ref_copy_casts: std::cell::OnceCell<std::collections::BTreeSet<ValueId>>,
 }
 
 impl<'a> JsCx<'a> {
@@ -218,7 +221,31 @@ impl<'a> JsCx<'a> {
             defs,
             carried_pairs,
             int32_only,
+            direct_ref_copy_casts: std::cell::OnceCell::new(),
         }
+    }
+
+    /// Whether `value` is a single-use `Cast(&T -> *const T)` whose sole use is as `src` of a
+    /// constant-1 `copy`/`copy_nonoverlapping`, eligible to bypass `__rt.box` under Tier A without
+    /// non-RC raw allocations.
+    pub(super) fn is_direct_ref_copy_cast(&self, value: ValueId) -> bool {
+        let heap = self.heap();
+        if !heap.typed_heap_enabled
+            || heap.non_rc_raw_alloc_reachable
+            || self.byte_views.raw_byte_derefs
+            || !self.byte_views.elide_scale_scalar
+        {
+            return false;
+        }
+        self.direct_ref_copy_casts
+            .get_or_init(|| {
+                crate::analysis::heap::direct_ref_copy_one_casts(
+                    self.func,
+                    self.table,
+                    self.interns,
+                )
+            })
+            .contains(&value)
     }
 
     /// Whether `value` is a 32-bit unsigned SSA value whose consumers all accept signed `Int32`.
@@ -300,6 +327,9 @@ impl<'a> JsCx<'a> {
     /// The same context, carrying the whole-program Tier A typed-heap and `_boxes` plan.
     pub fn with_heap(mut self, heap: Option<&'a crate::analysis::heap::HeapPlan>) -> Self {
         self.heap = heap;
+        if self.heap().native_string_enabled {
+            self.nested_clone.native_string = true;
+        }
         self
     }
 
@@ -358,7 +388,10 @@ impl<'a> JsCx<'a> {
     }
 
     /// The same context, carrying per-function nested native carrier clone policy.
-    pub fn with_nested_clone(mut self, nested_clone: crate::lower::NestedClone) -> Self {
+    pub fn with_nested_clone(mut self, mut nested_clone: crate::lower::NestedClone) -> Self {
+        if self.heap().native_string_enabled {
+            nested_clone.native_string = true;
+        }
         self.nested_clone = nested_clone;
         self
     }

@@ -122,6 +122,7 @@ impl<'a> JsCx<'a> {
         let mut variant: Option<u32> = None;
         let mut identity = None;
         let mut tail: Option<Expr> = None;
+        let mut raw_tail: Option<Expr> = None;
         let mut str_mutable = false;
         let mut str_from_mut = false;
         let mut raw_byte_slice: Option<bool> = None;
@@ -131,6 +132,7 @@ impl<'a> JsCx<'a> {
         for (step, proj) in path.iter().enumerate() {
             identity = None;
             let carried_tail = tail.take();
+            let carried_raw_tail = raw_tail.take();
             let carried_str_mutable = std::mem::take(&mut str_mutable);
             let carried_str_from_mut = std::mem::take(&mut str_from_mut);
             let carried_raw_byte_slice = raw_byte_slice.take();
@@ -179,7 +181,9 @@ impl<'a> JsCx<'a> {
                             JsPlace::Deref(value)
                         }
                         _ if table.unsized_tail(shape).is_some() => {
-                            let value = if value::is_raw(table, ty) {
+                            let is_raw_tail = value::is_raw(table, ty);
+                            let value = if is_raw_tail {
+                                raw_tail = Some(value.clone());
                                 self.raw_to_ref(pointee, value)
                             } else {
                                 value
@@ -231,12 +235,14 @@ impl<'a> JsCx<'a> {
                         // Still no storage, and still the same address.
                     } else if matches!(key, FieldKey::Transparent) {
                         tail = carried_tail;
+                        raw_tail = carried_raw_tail;
                         str_mutable = carried_str_mutable;
                         str_from_mut = carried_str_from_mut;
                         raw_byte_slice = carried_raw_byte_slice;
                     } else if !table.get(field_ty).is_some_and(|d| d.layout.sized) {
                         let base = self.read_place(&current);
-                        current = self.tail_place(base, key, field_ty, carried_tail)?;
+                        current =
+                            self.tail_place(base, key, field_ty, carried_tail, carried_raw_tail)?;
                     } else {
                         let base = self.read_place(&current);
                         current = JsPlace::Var(field_expr(self.interns, base, key));
@@ -395,6 +401,7 @@ impl<'a> JsCx<'a> {
         key: FieldKey,
         tail_ty: TypeId,
         tail: Option<Expr>,
+        raw_tail: Option<Expr>,
     ) -> Res<JsPlace> {
         let Some(tail) = tail else {
             return Err(decline(
@@ -408,13 +415,16 @@ impl<'a> JsCx<'a> {
                 "a struct with a non-slice unsized tail",
             ));
         }
+        let key_str = jsast::string(value::key_name(self.interns, key).expect("tail field key"));
+        if let Some(raw_ptr) = raw_tail {
+            return Ok(JsPlace::Deref(jsast::rt_call(
+                "tail_slice_raw",
+                vec![raw_ptr, key_str],
+            )));
+        }
         Ok(JsPlace::Deref(jsast::rt_call(
             "tail_slice",
-            vec![
-                record,
-                jsast::string(value::key_name(self.interns, key).expect("tail field key")),
-                tail,
-            ],
+            vec![record, key_str, tail],
         )))
     }
 

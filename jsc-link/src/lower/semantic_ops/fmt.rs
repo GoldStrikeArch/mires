@@ -278,6 +278,7 @@ fn format_display_text(
         // The one display text a host may have made: taken as Rust holds it (lone surrogate to
         // U+FFFD), so the concatenated `Arguments` text is well formed piece by piece.
         FormatDisplayKind::Str => super::string::well_formed(receiver(), helpers),
+        FormatDisplayKind::String if cx.native_string_enabled => jsast::member(loaded, "s"),
         // A committed `String` argument may arrive as either string carrier; the typeof test
         // reads whichever it is without a plan-time distinction (v1's exact ternary).
         FormatDisplayKind::String => jsast::cond(

@@ -35,7 +35,9 @@ mod tests;
 /// | 16 | `AbiSignature::inline_never` preserves `#[inline(never)]` across JIR. |
 /// | 17 | `Callee::Runtime { member, sysroot }` records rustc sysroot provenance for foreign runtime shims. |
 /// | 18 | `AbiSignature::{inline_hint, inline_always}` preserves `#[inline]` hints and `Terminator::Assert::track_caller` records resolved MIR-inlined `#[track_caller]` locations. |
-pub const JIR_SCHEMA: u16 = 19;
+/// | 19 | Phase 3 typed native `RawVec`/`Box` allocation hooks (`TypedAlloc`, `TypedRealloc`, `TypedDealloc`, `BoxNew`, `TypedDeallocRaw`). |
+/// | 20 | Phase 5 native `{ s, cap }` `String` hooks (`NativeStr*`). |
+pub const JIR_SCHEMA: u16 = 20;
 
 use serde::{Deserialize, Serialize};
 

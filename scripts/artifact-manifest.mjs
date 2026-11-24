@@ -34,7 +34,7 @@ function artifactBytes(directory, name, artifact) {
 export function readArtifactManifest(file) {
   const manifest = JSON.parse(readFileSync(file, 'utf8'));
   fields(manifest, ['schema', 'object_format', 'jir_schema', 'semantic_policy', 'syntax_ceiling', 'entries', 'artifacts']);
-  if (manifest.schema !== 2 || manifest.object_format !== 27 || manifest.jir_schema !== 19
+  if (manifest.schema !== 2 || manifest.object_format !== 27 || manifest.jir_schema !== 20
     || manifest.semantic_policy !== 'faithful' || !['2018', 'latest'].includes(manifest.syntax_ceiling)) {
     throw new Error(`${file}: unsupported compiler artifact contract`);
   }

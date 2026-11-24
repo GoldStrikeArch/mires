@@ -78,8 +78,8 @@ const BUDGET_FLOOR: u64 = 384;
 
 /// Speed-first (`js-profile=release-speed`) post-representation inlining thresholds tuned for V8
 /// TurboFan (inline small hot helpers without creating >12 KB mega-functions that bail out of JIT).
-const SPEED_SHARED_CALLEE_FOOTPRINT: u64 = 220;
-const SPEED_TRACK_CALLER_SHARED_FOOTPRINT: u64 = 220;
+const SPEED_SHARED_CALLEE_FOOTPRINT: u64 = 256;
+const SPEED_TRACK_CALLER_SHARED_FOOTPRINT: u64 = 256;
 const SPEED_LOOP_CALLEE_FOOTPRINT: u64 = 384;
 const SPEED_INLINE_HINT_FOOTPRINT: u64 = 384;
 const SPEED_INLINE_ALWAYS_FOOTPRINT: u64 = 640;
@@ -282,8 +282,24 @@ pub(crate) fn run_with_profile(
         let mut bytes = entry_bytes;
         let mut applied_here = 0u32;
         let mut accepted = None;
-        // Back to front, so an earlier splice never moves a later site.
-        for site in sites.iter().rev() {
+        // Back to front within each block, so an earlier splice never moves a later site in the
+        // same block (splicing only splits `site.block` and appends new blocks). Under speed-first
+        // mode, prioritize sites inside loops before cold pre/post-loop sites so cold callees
+        // cannot consume the caller size cap before inner-loop leaf helpers (e.g. SHA-512's
+        // `Word::{ror,add}` inside the 80-round compression loop) get inlined for PEA.
+        let mut site_order: Vec<usize> = (0..sites.len()).rev().collect();
+        if speed {
+            site_order.sort_by_key(|&idx| {
+                let s = &sites[idx];
+                (
+                    !looping.contains(&(s.block as u32)),
+                    std::cmp::Reverse(s.block),
+                    std::cmp::Reverse(s.op),
+                )
+            });
+        }
+        for site_idx in site_order {
+            let site = &sites[site_idx];
             let Some(criterion) = qualifies(
                 caller,
                 &site.callee,
@@ -447,7 +463,10 @@ pub(crate) fn run_with_profile(
                 && looping.contains(&(site.block as u32))
                 && callee_is_leaf
                 && callee_bytes <= 220;
-            let size_limit = if is_sole && net <= 0 {
+            let size_limit = if (is_sole && net <= 0)
+                || speed_hot_loop
+                || (speed && is_sole && callee_bytes <= 512)
+            {
                 limit.max(16_384)
             } else {
                 limit
@@ -1130,7 +1149,12 @@ fn collect_sites(
                 CallSemantic::Ordinary => true,
                 // A `str` identity (`js-str=bytes` only) stays a call: `lower/js/call.rs` spells
                 // it as the string operation it is, which inlining its body would take away.
-                CallSemantic::Standard(std_op) if std_op.is_str() || std_op.is_typed_heap() => {
+                CallSemantic::Standard(std_op)
+                    if std_op.is_str()
+                        || std_op.is_typed_heap()
+                        || std_op.is_native_string()
+                        || std_op.is_fast_str_op() =>
+                {
                     false
                 }
                 CallSemantic::Standard(std_op) if allow_std_post_repr => {
@@ -1184,19 +1208,38 @@ fn collect_sites(
                 stats.decline("inline.never");
                 continue;
             }
-            if items
-                .get(&callee_func.item)
-                .and_then(|entry| entry.standard)
-                .is_some_and(|op| {
-                    crate::lower::semantic_ops::fmt_kernel::is_format_machinery(op)
-                        || crate::lower::semantic_ops::num::is_float_from_str(op)
-                        || matches!(
-                            op,
-                            crate::jir::semantic::StandardOperation::SliceSort
-                                | crate::jir::semantic::StandardOperation::SliceSortCmp
-                        )
-                        || op.is_typed_heap()
-                })
+            let is_string_drop_glue = speed
+                && crate::lower::bstr::enabled()
+                && callee.as_str().starts_with("core$ptr$drop_glue$")
+                && callee_func.sig.arguments.len() == 1
+                && callee_func
+                    .sig
+                    .arguments
+                    .first()
+                    .and_then(|&arg_ty| {
+                        crate::lower::js::value::pointee_of(&callee_metadata.interns.types, arg_ty)
+                    })
+                    .and_then(|pt| callee_metadata.interns.types.get(pt))
+                    .is_some_and(|d| {
+                        d.meta.candidate
+                            == rcgjs_object::jir::types::RepresentationCandidate::String
+                    });
+            if is_string_drop_glue
+                || items
+                    .get(&callee_func.item)
+                    .and_then(|entry| entry.standard)
+                    .is_some_and(|op| {
+                        crate::lower::semantic_ops::fmt_kernel::is_format_machinery(op)
+                            || crate::lower::semantic_ops::num::is_float_from_str(op)
+                            || matches!(
+                                op,
+                                crate::jir::semantic::StandardOperation::SliceSort
+                                    | crate::jir::semantic::StandardOperation::SliceSortCmp
+                            )
+                            || op.is_typed_heap()
+                            || op.is_native_string()
+                            || op.is_fast_str_op()
+                    })
             {
                 stats.decline("inline.semantic-boundary");
                 continue;

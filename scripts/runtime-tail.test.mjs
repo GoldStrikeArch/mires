@@ -6,7 +6,7 @@ import { parse } from 'acorn';
 import { minimalShim } from './minimal-shim.mjs';
 
 const source = readFileSync(new URL('../runtime/shim.js', import.meta.url), 'utf8');
-const direct = ['alloc', 'retype_rc', 'tail_ref', 'tail_raw', 'tail_slice', 'addr', 'ptr_eq', 'dealloc', 'copy', 'copy_nonoverlapping', 'write_bytes', 'compare_bytes', 'unscale', 'alloc_zeroed', 'slice_ptr_eq', 'fat_ptr_eq', 'slice_ptr_cmp', 'fat_ptr_cmp'];
+const direct = ['alloc', 'retype_rc', 'tail_ref', 'tail_raw', 'tail_slice', 'tail_slice_raw', 'addr', 'ptr_eq', 'dealloc', 'copy', 'copy_nonoverlapping', 'write_bytes', 'compare_bytes', 'unscale', 'alloc_zeroed', 'slice_ptr_eq', 'fat_ptr_eq', 'slice_ptr_cmp', 'fat_ptr_cmp'];
 const extracted = minimalShim([], source, { direct }).source;
 function verify(rt) {
   // Zero-sized accesses may use aligned dangling pointers and consume no storage.
@@ -55,6 +55,10 @@ function verify(rt) {
       reference.ptr.strong = 2;
       assert.equal(raw.ptr.buf[raw.ptr.off].strong, 2);
       const tail = rt.tail_slice(reference.ptr, 'value', len);
+      const rawTail = rt.tail_slice_raw(raw, 'value');
+      assert.equal(rawTail.buf, tail.buf);
+      assert.equal(rawTail.off, tail.off);
+      assert.equal(rawTail.len, tail.len);
       assert.equal(tail.buf, allocated.buf);
       assert.equal(tail.off, 1);
       assert.equal(tail.len, len);
@@ -76,6 +80,11 @@ function verify(rt) {
       const slot = heap ? rt.alloc(4 + len * 4, 4) : {buf: [null, record], off: 1};
       if (heap) slot.buf[0] = record;
       const raw = {ptr: slot, meta: len};
+      const rawTail = rt.tail_slice_raw(raw, 'data');
+      assert.equal(rawTail.buf, record.data);
+      assert.equal(rawTail.off, 0);
+      assert.equal(rawTail.len, len);
+      assert.equal(rt._boxes.has(record), false);
       const reference = rt.tail_ref(raw);
       const tail = rt.tail_slice(reference.ptr, 'data', len);
       assert.equal(tail.buf, record.data);

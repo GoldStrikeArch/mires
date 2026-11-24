@@ -219,6 +219,10 @@ impl JsCx<'_> {
             let [receiver] = args.as_slice() else {
                 return Err(decline(OpClass::Call, "String::deref with the wrong arity"));
             };
+            if self.heap().native_string_enabled {
+                let receiver = self.expr_of(*receiver)?;
+                return Ok(Lowered::value(jsast::member(receiver, "s")));
+            }
             if let Some(carrier) = self.borrowed_carrier(*receiver) {
                 let receiver = self.expr_of(*receiver)?;
                 return match carrier {
@@ -229,6 +233,32 @@ impl JsCx<'_> {
                         "String::deref marked with an unsupported carrier",
                     )),
                 };
+            }
+        }
+
+        // Phase 5 fast `core::str` comparison/search hooks (`ReleaseSpeed`).
+        if let CallSemantic::Standard(operation) = semantic {
+            if operation.is_fast_str_op()
+                && crate::opts::get().profile == Some(crate::opts::Profile::ReleaseSpeed)
+            {
+                if let Some(lowered) = self.lower_fast_str_call(op, *operation, args)? {
+                    return Ok(lowered);
+                }
+            }
+        }
+
+        // Phase 5 universal native `{ s, cap }` `String` hooks (`ReleaseSpeed` + `js-str=bytes`).
+        if let CallSemantic::Standard(operation) = semantic {
+            if self.heap().native_string_enabled
+                && (operation.is_native_string()
+                    || matches!(
+                        operation,
+                        StandardOperation::StrToLowercase | StandardOperation::StrToUppercase
+                    ))
+            {
+                if let Some(lowered) = self.lower_native_string_call(*operation, args)? {
+                    return Ok(lowered);
+                }
             }
         }
 
@@ -1061,7 +1091,8 @@ impl JsCx<'_> {
                         let buf = jsast::new(jsast::id("Array"), vec![cap]);
                         return Ok(Some(Lowered::value(ptr::slot(buf, jsast::num(0)))));
                     }
-                    let shell_expr = uninit_shell(table, self.interns, elem, 0);
+                    let shell_expr =
+                        uninit_shell(table, self.interns, elem, 0, heap.native_string_enabled);
                     if const_u128(*cap_v) == Some(1) {
                         if let Some(shell) = shell_expr {
                             let slot = if tracked {
@@ -1163,6 +1194,458 @@ impl JsCx<'_> {
                     "t_dealloc_maybe",
                     vec![p],
                 ))])))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Lowers Phase 5 `alloc::string::rcgjs_str_*` hooks and `str::to_{lower,upper}case` directly
+    /// against the universal `{ s: byteString, cap: number }` `String` representation.
+    fn lower_native_string_call(
+        &self,
+        operation: StandardOperation,
+        args: &[ValueId],
+    ) -> Res<Option<Lowered>> {
+        let const_u128 = |v: ValueId| -> Option<u128> {
+            match self.def_of(v).map(|def| &def.kind) {
+                Some(OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Scalar {
+                    bits,
+                    ..
+                })) => Some(*bits),
+                _ => None,
+            }
+        };
+        let bind_if_needed = |e: Expr, setup: &mut Vec<Stmt>| -> Expr {
+            if matches!(e, Expr::Ident(_) | Expr::Str(_) | Expr::Num(_)) {
+                e
+            } else {
+                let (stmt, id) = self.temp(e);
+                setup.push(stmt);
+                id
+            }
+        };
+        match operation {
+            StandardOperation::NativeStrNew => Ok(Some(Lowered::value(jsast::object_of(vec![
+                ("s", jsast::string("")),
+                ("cap", jsast::num(0)),
+            ])))),
+            StandardOperation::NativeStrWithCapacity => {
+                let [cap_v] = args else {
+                    return Ok(None);
+                };
+                if let Some(c) = const_u128(*cap_v) {
+                    if c <= 2_147_483_647 {
+                        return Ok(Some(Lowered::value(jsast::object_of(vec![
+                            ("s", jsast::string("")),
+                            ("cap", jsast::num(c as f64)),
+                        ]))));
+                    }
+                }
+                let cap = self.expr_of(*cap_v)?;
+                Ok(Some(Lowered::value(jsast::rt_call(
+                    "nstr_with_cap",
+                    vec![cap],
+                ))))
+            }
+            StandardOperation::NativeStrFromStr => {
+                let [s_v] = args else {
+                    return Ok(None);
+                };
+                let mut setup = Vec::new();
+                let s = bind_if_needed(self.expr_of(*s_v)?, &mut setup);
+                let obj =
+                    jsast::object_of(vec![("s", s.clone()), ("cap", jsast::member(s, "length"))]);
+                Ok(Some(Lowered::Value(setup, obj)))
+            }
+            StandardOperation::NativeStrAsStr => {
+                let [s_v] = args else {
+                    return Ok(None);
+                };
+                let s = self.expr_of(*s_v)?;
+                Ok(Some(Lowered::value(jsast::member(s, "s"))))
+            }
+            StandardOperation::NativeStrLen => {
+                let [s_v] = args else {
+                    return Ok(None);
+                };
+                let s = self.expr_of(*s_v)?;
+                Ok(Some(Lowered::value(jsast::member(
+                    jsast::member(s, "s"),
+                    "length",
+                ))))
+            }
+            StandardOperation::NativeStrCapacity => {
+                let [s_v] = args else {
+                    return Ok(None);
+                };
+                let mut setup = Vec::new();
+                let s = bind_if_needed(self.expr_of(*s_v)?, &mut setup);
+                let cap = jsast::member(s.clone(), "cap");
+                let len = jsast::member(jsast::member(s, "s"), "length");
+                let expr = jsast::cond(
+                    jsast::binary(jsast::BinOp::Gt, cap.clone(), len.clone()),
+                    cap,
+                    len,
+                );
+                Ok(Some(Lowered::Value(setup, expr)))
+            }
+            StandardOperation::NativeStrPushStr => {
+                let [s_v, rhs_v] = args else {
+                    return Ok(None);
+                };
+                let s = self.expr_of(*s_v)?;
+                let rhs = self.expr_of(*rhs_v)?;
+                Ok(Some(Lowered::Done(vec![jsast::expr_stmt(
+                    jsast::compound_assign(jsast::BinOp::Add, jsast::member(s, "s"), rhs),
+                )])))
+            }
+            StandardOperation::NativeStrPush => {
+                let [s_v, ch_v] = args else {
+                    return Ok(None);
+                };
+                let s = self.expr_of(*s_v)?;
+                if let Some(c) = const_u128(*ch_v) {
+                    if let Some(ch) = u32::try_from(c).ok().and_then(char::from_u32) {
+                        let mut buf = [0u8; 4];
+                        let piece = crate::lower::bstr::literal(ch.encode_utf8(&mut buf));
+                        return Ok(Some(Lowered::Done(vec![jsast::expr_stmt(
+                            jsast::compound_assign(jsast::BinOp::Add, jsast::member(s, "s"), piece),
+                        )])));
+                    }
+                }
+                let mut setup = Vec::new();
+                let s = bind_if_needed(s, &mut setup);
+                let ch = bind_if_needed(self.expr_of(*ch_v)?, &mut setup);
+                let piece = jsast::cond(
+                    jsast::binary(jsast::BinOp::Lt, ch.clone(), jsast::num(128)),
+                    jsast::method_call(jsast::id("String"), "fromCharCode", vec![ch.clone()]),
+                    jsast::rt_call("bstr_char", vec![ch]),
+                );
+                setup.push(jsast::expr_stmt(jsast::compound_assign(
+                    jsast::BinOp::Add,
+                    jsast::member(s, "s"),
+                    piece,
+                )));
+                Ok(Some(Lowered::Done(setup)))
+            }
+            StandardOperation::NativeStrClear => {
+                let [s_v] = args else {
+                    return Ok(None);
+                };
+                let s = self.expr_of(*s_v)?;
+                Ok(Some(Lowered::Done(vec![jsast::assign_stmt(
+                    jsast::member(s, "s"),
+                    jsast::string(""),
+                )])))
+            }
+            StandardOperation::NativeStrTruncate => {
+                let [s_v, len_v] = args else {
+                    return Ok(None);
+                };
+                let mut setup = Vec::new();
+                let s = bind_if_needed(self.expr_of(*s_v)?, &mut setup);
+                let new_len = bind_if_needed(self.expr_of(*len_v)?, &mut setup);
+                let field = jsast::member(s, "s");
+                setup.push(jsast::if_(
+                    jsast::binary(
+                        jsast::BinOp::Lt,
+                        new_len.clone(),
+                        jsast::member(field.clone(), "length"),
+                    ),
+                    vec![jsast::assign_stmt(
+                        field.clone(),
+                        jsast::method_call(field, "slice", vec![jsast::num(0), new_len]),
+                    )],
+                ));
+                Ok(Some(Lowered::Done(setup)))
+            }
+            StandardOperation::NativeStrReserve => {
+                let [s_v, add_v] = args else {
+                    return Ok(None);
+                };
+                let s = self.expr_of(*s_v)?;
+                let add = self.expr_of(*add_v)?;
+                Ok(Some(Lowered::Done(vec![jsast::expr_stmt(jsast::rt_call(
+                    "nstr_reserve",
+                    vec![s, add],
+                ))])))
+            }
+            StandardOperation::NativeStrShrinkTo => {
+                let [s_v, min_v] = args else {
+                    return Ok(None);
+                };
+                let mut setup = Vec::new();
+                let s = bind_if_needed(self.expr_of(*s_v)?, &mut setup);
+                let min_cap = bind_if_needed(self.expr_of(*min_v)?, &mut setup);
+                let (b_len, len) =
+                    self.temp(jsast::member(jsast::member(s.clone(), "s"), "length"));
+                setup.push(b_len);
+                let (b_t, target) = self.temp(jsast::cond(
+                    jsast::binary(jsast::BinOp::Gt, min_cap.clone(), len.clone()),
+                    min_cap,
+                    len,
+                ));
+                setup.push(b_t);
+                let cap_field = jsast::member(s, "cap");
+                setup.push(jsast::if_(
+                    jsast::binary(jsast::BinOp::Lt, target.clone(), cap_field.clone()),
+                    vec![jsast::assign_stmt(cap_field, target)],
+                ));
+                Ok(Some(Lowered::Done(setup)))
+            }
+            StandardOperation::NativeStrFromVec => {
+                let [vec_v] = args else {
+                    return Ok(None);
+                };
+                let mut setup = Vec::new();
+                let v = bind_if_needed(self.expr_of(*vec_v)?, &mut setup);
+                let inner = jsast::member(jsast::member(v.clone(), "buf"), "inner");
+                let ptr = jsast::member(inner.clone(), "ptr");
+                let len = jsast::member(v, "len");
+                let s_expr = jsast::cond(
+                    jsast::binary(jsast::BinOp::StrictEq, len.clone(), jsast::num(0)),
+                    jsast::string(""),
+                    jsast::rt_call(
+                        "bstr_of",
+                        vec![
+                            jsast::member(ptr.clone(), "buf"),
+                            jsast::member(ptr, "off"),
+                            len,
+                        ],
+                    ),
+                );
+                let obj =
+                    jsast::object_of(vec![("s", s_expr), ("cap", jsast::member(inner, "cap"))]);
+                Ok(Some(Lowered::Value(setup, obj)))
+            }
+            StandardOperation::NativeStrIntoBytes => {
+                let [s_v] = args else {
+                    return Ok(None);
+                };
+                let s = self.expr_of(*s_v)?;
+                Ok(Some(Lowered::value(jsast::rt_call(
+                    "nstr_into_vec",
+                    vec![s],
+                ))))
+            }
+            StandardOperation::NativeStrReplaceSlice => {
+                let [s_v, start_v, end_v, rep_v] = args else {
+                    return Ok(None);
+                };
+                let mut setup = Vec::new();
+                let s = bind_if_needed(self.expr_of(*s_v)?, &mut setup);
+                let start = bind_if_needed(self.expr_of(*start_v)?, &mut setup);
+                let end = bind_if_needed(self.expr_of(*end_v)?, &mut setup);
+                let rep = bind_if_needed(self.expr_of(*rep_v)?, &mut setup);
+                let field = jsast::member(s, "s");
+                let head = jsast::method_call(field.clone(), "slice", vec![jsast::num(0), start]);
+                let tail = jsast::method_call(field.clone(), "slice", vec![end]);
+                let concat = jsast::binary(
+                    jsast::BinOp::Add,
+                    jsast::binary(jsast::BinOp::Add, head, rep),
+                    tail,
+                );
+                setup.push(jsast::assign_stmt(field, concat));
+                Ok(Some(Lowered::Done(setup)))
+            }
+            StandardOperation::NativeStrExtendWithin => {
+                let [s_v, start_v, end_v] = args else {
+                    return Ok(None);
+                };
+                let mut setup = Vec::new();
+                let s = bind_if_needed(self.expr_of(*s_v)?, &mut setup);
+                let start = bind_if_needed(self.expr_of(*start_v)?, &mut setup);
+                let end = bind_if_needed(self.expr_of(*end_v)?, &mut setup);
+                let field = jsast::member(s, "s");
+                let sub = jsast::method_call(field.clone(), "slice", vec![start, end]);
+                setup.push(jsast::expr_stmt(jsast::compound_assign(
+                    jsast::BinOp::Add,
+                    field,
+                    sub,
+                )));
+                Ok(Some(Lowered::Done(setup)))
+            }
+            StandardOperation::NativeStrCloneFrom => {
+                let [dst_v, src_v] = args else {
+                    return Ok(None);
+                };
+                let mut setup = Vec::new();
+                let dst = bind_if_needed(self.expr_of(*dst_v)?, &mut setup);
+                let src = bind_if_needed(self.expr_of(*src_v)?, &mut setup);
+                let src_s = jsast::member(src, "s");
+                setup.push(jsast::assign_stmt(
+                    jsast::member(dst.clone(), "s"),
+                    src_s.clone(),
+                ));
+                let dst_cap = jsast::member(dst, "cap");
+                let src_len = jsast::member(src_s, "length");
+                setup.push(jsast::if_(
+                    jsast::binary(jsast::BinOp::Gt, src_len.clone(), dst_cap.clone()),
+                    vec![jsast::assign_stmt(dst_cap, src_len)],
+                ));
+                Ok(Some(Lowered::Done(setup)))
+            }
+            StandardOperation::NativeStrToAsciiLowercase => {
+                let [s_v] = args else {
+                    return Ok(None);
+                };
+                let s = self.expr_of(*s_v)?;
+                Ok(Some(Lowered::value(jsast::rt_call(
+                    "nstr_ascii_lower",
+                    vec![s],
+                ))))
+            }
+            StandardOperation::NativeStrToAsciiUppercase => {
+                let [s_v] = args else {
+                    return Ok(None);
+                };
+                let s = self.expr_of(*s_v)?;
+                Ok(Some(Lowered::value(jsast::rt_call(
+                    "nstr_ascii_upper",
+                    vec![s],
+                ))))
+            }
+            StandardOperation::NativeStrRepeat => {
+                let [s_v, n_v] = args else {
+                    return Ok(None);
+                };
+                let s = self.expr_of(*s_v)?;
+                let n = self.expr_of(*n_v)?;
+                Ok(Some(Lowered::value(jsast::rt_call(
+                    "nstr_repeat",
+                    vec![s, n],
+                ))))
+            }
+            StandardOperation::StrToLowercase | StandardOperation::StrToUppercase => {
+                let [s_v] = args else {
+                    return Ok(None);
+                };
+                let s = self.expr_of(*s_v)?;
+                let helper = if operation == StandardOperation::StrToLowercase {
+                    "bstr_to_lowercase"
+                } else {
+                    "bstr_to_uppercase"
+                };
+                let (bind, t) = self.temp(jsast::rt_call(helper, vec![s]));
+                let obj =
+                    jsast::object_of(vec![("s", t.clone()), ("cap", jsast::member(t, "length"))]);
+                Ok(Some(Lowered::Value(vec![bind], obj)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Lowers Phase 5 `core::str` fast comparison/search hooks (`patches/0021-bstr-str-ops.patch`).
+    fn lower_fast_str_call(
+        &self,
+        op: &Op,
+        operation: StandardOperation,
+        args: &[ValueId],
+    ) -> Res<Option<Lowered>> {
+        let is_bstr = crate::lower::bstr::enabled();
+        match operation {
+            StandardOperation::BstrEq => {
+                let [a_v, b_v] = args else {
+                    return Ok(None);
+                };
+                let a = self.expr_of(*a_v)?;
+                let b = self.expr_of(*b_v)?;
+                Ok(Some(Lowered::value(jsast::binary(
+                    jsast::BinOp::StrictEq,
+                    a,
+                    b,
+                ))))
+            }
+            StandardOperation::BstrCmp if is_bstr => {
+                let [a_v, b_v] = args else {
+                    return Ok(None);
+                };
+                let Some(res) = op.result else {
+                    return Ok(None);
+                };
+                let res_ty = self.ty_of(res)?;
+                let a_expr = self.expr_of(*a_v)?;
+                let b_expr = self.expr_of(*b_v)?;
+                let mut prelude = Vec::new();
+                let a = if matches!(a_expr, Expr::Ident(_) | Expr::Str(_)) {
+                    a_expr
+                } else {
+                    let (bind, id) = self.temp(a_expr);
+                    prelude.push(bind);
+                    id
+                };
+                let b = if matches!(b_expr, Expr::Ident(_) | Expr::Str(_)) {
+                    b_expr
+                } else {
+                    let (bind, id) = self.temp(b_expr);
+                    prelude.push(bind);
+                    id
+                };
+                let Some(cmp) = self.str_cmp_expr(res_ty, a, b) else {
+                    return Ok(None);
+                };
+                Ok(Some(Lowered::Value(prelude, cmp)))
+            }
+            StandardOperation::BstrStartsWith => {
+                let [h_v, n_v] = args else {
+                    return Ok(None);
+                };
+                let h = self.expr_of(*h_v)?;
+                let n = self.expr_of(*n_v)?;
+                Ok(Some(Lowered::value(jsast::method_call(
+                    h,
+                    "startsWith",
+                    vec![n],
+                ))))
+            }
+            StandardOperation::BstrEndsWith => {
+                let [h_v, n_v] = args else {
+                    return Ok(None);
+                };
+                let h = self.expr_of(*h_v)?;
+                let n = self.expr_of(*n_v)?;
+                Ok(Some(Lowered::value(jsast::method_call(
+                    h,
+                    "endsWith",
+                    vec![n],
+                ))))
+            }
+            StandardOperation::BstrContains => {
+                let [h_v, n_v] = args else {
+                    return Ok(None);
+                };
+                let h = self.expr_of(*h_v)?;
+                let n = self.expr_of(*n_v)?;
+                Ok(Some(Lowered::value(jsast::method_call(
+                    h,
+                    "includes",
+                    vec![n],
+                ))))
+            }
+            StandardOperation::BstrFindChar
+            | StandardOperation::BstrRfindChar
+            | StandardOperation::BstrFindStr
+            | StandardOperation::BstrRfindStr
+                if is_bstr =>
+            {
+                let [h_v, s_v, e_v, n_v] = args else {
+                    return Ok(None);
+                };
+                let h = self.expr_of(*h_v)?;
+                let s = self.expr_of(*s_v)?;
+                let e = self.expr_of(*e_v)?;
+                let n = self.expr_of(*n_v)?;
+                let helper = match operation {
+                    StandardOperation::BstrFindChar => "bstr_find_char",
+                    StandardOperation::BstrRfindChar => "bstr_rfind_char",
+                    StandardOperation::BstrFindStr => "bstr_find_str",
+                    StandardOperation::BstrRfindStr => "bstr_rfind_str",
+                    _ => unreachable!(),
+                };
+                Ok(Some(Lowered::value(jsast::rt_call(
+                    helper,
+                    vec![h, s, e, n],
+                ))))
             }
             _ => Ok(None),
         }
@@ -1300,6 +1783,22 @@ impl JsCx<'_> {
 
     /// A `Drop` op (`base.rs::codegen_drop`): the glue called with a reference to the place.
     fn lower_drop(&self, root: &Root, path: &[Proj], glue: DropGlue) -> Res<Lowered> {
+        if self.heap().native_string_enabled
+            && crate::analysis::heap::drop_targets_native_string(self.func, self.table, root, path)
+        {
+            let mut stmts = Vec::new();
+            if path.is_empty() {
+                if let Root::Value(v) = root {
+                    if self.is_inline(*v) {
+                        let expr = self.expr_of(*v)?;
+                        if !jsast::is_droppable(&expr) {
+                            stmts.push(jsast::expr_stmt(expr));
+                        }
+                    }
+                }
+            }
+            return Ok(Lowered::Done(stmts));
+        }
         if let Root::Value(value) = root {
             if path.is_empty() {
                 if self.typed_storage(*value).is_some() {
@@ -1414,6 +1913,7 @@ fn uninit_shell(
     interns: &rcgjs_object::jir::interns::Interns,
     ty: rcgjs_object::jir::types::TypeId,
     depth: u32,
+    native_string: bool,
 ) -> Option<Expr> {
     use rcgjs_object::jir::types::{NominalForm, TypeKind};
     if depth > 4 {
@@ -1424,8 +1924,37 @@ fn uninit_shell(
     if desc.layout.zst {
         return Some(jsast::undefined());
     }
+    if native_string
+        && desc.meta.candidate == rcgjs_object::jir::types::RepresentationCandidate::String
+    {
+        return Some(jsast::object_of(vec![
+            ("s", jsast::string("")),
+            ("cap", jsast::num(0)),
+        ]));
+    }
     match &desc.kind {
-        TypeKind::Array { length, .. } => {
+        TypeKind::Array { element, length } => {
+            if depth == 0 {
+                if let Some(k) = table
+                    .get(table.peeled(*element))
+                    .and_then(crate::lower::semantic_ops::vec::typed_array_kind)
+                {
+                    const TA_CTORS: [&str; 8] = [
+                        "Uint8Array",
+                        "Int8Array",
+                        "Uint16Array",
+                        "Int16Array",
+                        "Uint32Array",
+                        "Int32Array",
+                        "Float32Array",
+                        "Float64Array",
+                    ];
+                    return Some(jsast::new(
+                        jsast::id(TA_CTORS[k as usize]),
+                        vec![jsast::num(*length as f64)],
+                    ));
+                }
+            }
             if *length <= 4 {
                 Some(jsast::array(
                     (0..*length).map(|_| jsast::undefined()).collect(),
@@ -1442,7 +1971,7 @@ fn uninit_shell(
                 Some(jsast::array(
                     elems
                         .iter()
-                        .map(|e| uninit_field_shell(table, interns, *e, depth + 1))
+                        .map(|e| uninit_field_shell(table, interns, *e, depth + 1, native_string))
                         .collect(),
                 ))
             } else {
@@ -1461,7 +1990,10 @@ fn uninit_shell(
             let mut entries = Vec::with_capacity(variant.fields.len());
             for field in &variant.fields {
                 let key = value::key_name(interns, field.key)?;
-                entries.push((key, uninit_field_shell(table, interns, field.ty, depth + 1)));
+                entries.push((
+                    key,
+                    uninit_field_shell(table, interns, field.ty, depth + 1, native_string),
+                ));
             }
             Some(jsast::object(entries))
         }
@@ -1478,6 +2010,7 @@ fn uninit_field_shell(
     interns: &rcgjs_object::jir::interns::Interns,
     ty: rcgjs_object::jir::types::TypeId,
     depth: u32,
+    native_string: bool,
 ) -> Expr {
     use rcgjs_object::jir::types::{NominalForm, TypeKind};
     let peeled = table.peeled(ty);
@@ -1489,7 +2022,8 @@ fn uninit_field_shell(
                 form: NominalForm::Struct,
                 ..
             },
-        ) => uninit_shell(table, interns, peeled, depth).unwrap_or_else(jsast::undefined),
+        ) => uninit_shell(table, interns, peeled, depth, native_string)
+            .unwrap_or_else(jsast::undefined),
         _ => jsast::undefined(),
     }
 }

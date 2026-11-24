@@ -104,6 +104,7 @@ pub(super) fn write_item(out: &mut String, jir: &LinkJir) {
         element_glue_nonthrowing: false,
         panic_impl: None,
         panic_reads_info: false,
+        native_string_enabled: false,
     };
     match semantic_ops::validate(&cx) {
         Ok(op) => {
@@ -252,7 +253,7 @@ mod tests {
         write_registry(&mut registry);
         let registry: serde_json::Value = serde_json::from_str(&registry).unwrap();
         let rows = registry.as_array().unwrap();
-        assert_eq!(rows.len(), 81);
+        assert_eq!(rows.len(), 107);
         assert_eq!(
             rows.iter()
                 .filter(|row| row["native_lowering"] == true)

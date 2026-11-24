@@ -2499,6 +2499,69 @@ fn jir_standard_operation(tcx: TyCtxt<'_>, definition: DefId) -> Option<Standard
     if tcx.is_diagnostic_item(Symbol::intern("rcgjs_typed_dealloc_raw"), definition) {
         return Some(StandardOperation::TypedDeallocRaw);
     }
+    const NATIVE_STR_ITEMS: &[(&str, StandardOperation)] = &[
+        ("rcgjs_str_new", StandardOperation::NativeStrNew),
+        (
+            "rcgjs_str_with_capacity",
+            StandardOperation::NativeStrWithCapacity,
+        ),
+        ("rcgjs_str_from_str", StandardOperation::NativeStrFromStr),
+        ("rcgjs_str_as_str", StandardOperation::NativeStrAsStr),
+        ("rcgjs_str_len", StandardOperation::NativeStrLen),
+        ("rcgjs_str_capacity", StandardOperation::NativeStrCapacity),
+        ("rcgjs_str_push_str", StandardOperation::NativeStrPushStr),
+        ("rcgjs_str_push", StandardOperation::NativeStrPush),
+        ("rcgjs_str_clear", StandardOperation::NativeStrClear),
+        (
+            "rcgjs_str_truncate_unchecked",
+            StandardOperation::NativeStrTruncate,
+        ),
+        ("rcgjs_str_reserve", StandardOperation::NativeStrReserve),
+        ("rcgjs_str_shrink_to", StandardOperation::NativeStrShrinkTo),
+        (
+            "rcgjs_str_from_vec_unchecked",
+            StandardOperation::NativeStrFromVec,
+        ),
+        (
+            "rcgjs_str_into_bytes",
+            StandardOperation::NativeStrIntoBytes,
+        ),
+        (
+            "rcgjs_str_replace_slice",
+            StandardOperation::NativeStrReplaceSlice,
+        ),
+        (
+            "rcgjs_str_extend_within",
+            StandardOperation::NativeStrExtendWithin,
+        ),
+        (
+            "rcgjs_str_clone_from",
+            StandardOperation::NativeStrCloneFrom,
+        ),
+        (
+            "rcgjs_str_to_ascii_lowercase",
+            StandardOperation::NativeStrToAsciiLowercase,
+        ),
+        (
+            "rcgjs_str_to_ascii_uppercase",
+            StandardOperation::NativeStrToAsciiUppercase,
+        ),
+        ("rcgjs_str_repeat", StandardOperation::NativeStrRepeat),
+        ("rcgjs_str_eq", StandardOperation::BstrEq),
+        ("rcgjs_str_cmp", StandardOperation::BstrCmp),
+        ("rcgjs_str_starts_with", StandardOperation::BstrStartsWith),
+        ("rcgjs_str_ends_with", StandardOperation::BstrEndsWith),
+        ("rcgjs_str_contains", StandardOperation::BstrContains),
+        ("rcgjs_str_find_char", StandardOperation::BstrFindChar),
+        ("rcgjs_str_rfind_char", StandardOperation::BstrRfindChar),
+        ("rcgjs_str_find_str", StandardOperation::BstrFindStr),
+        ("rcgjs_str_rfind_str", StandardOperation::BstrRfindStr),
+    ];
+    for &(sym, op) in NATIVE_STR_ITEMS {
+        if tcx.is_diagnostic_item(Symbol::intern(sym), definition) {
+            return Some(op);
+        }
+    }
     None
 }
 

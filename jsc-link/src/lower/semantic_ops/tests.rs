@@ -648,6 +648,7 @@ fn lower_cx<'a>(
         element_glue_nonthrowing: false,
         panic_impl: None,
         panic_reads_info: false,
+        native_string_enabled: false,
     }
 }
 
@@ -1415,6 +1416,7 @@ fn drop_glue_resolves_through_the_candidate() {
         element_glue_nonthrowing: false,
         panic_impl: None,
         panic_reads_info: false,
+        native_string_enabled: false,
     };
     let rewrite = rewrite(&cx, &[Carrier::StringBuilder]).expect("string drop glue lowers");
     assert_eq!(rewrite.operation, StandardOperation::StringDrop);
@@ -1429,6 +1431,7 @@ fn drop_glue_resolves_through_the_candidate() {
         element_glue_nonthrowing: false,
         panic_impl: None,
         panic_reads_info: false,
+        native_string_enabled: false,
     };
     let vec_rewrite = super::rewrite(&cx, &[Carrier::NativeVec]).expect("vec drop glue lowers");
     assert_eq!(vec_rewrite.operation, StandardOperation::VecDrop);
@@ -1450,6 +1453,7 @@ fn box_drop_preserves_pointee_glue_without_allocator_machinery() {
         element_glue_nonthrowing: false,
         panic_impl: None,
         panic_reads_info: false,
+        native_string_enabled: false,
     };
     let plain_rewrite = rewrite(&plain, &[Carrier::NativeBox]).expect("plain Box drop lowers");
     assert_eq!(plain_rewrite.operation, StandardOperation::BoxDrop);
@@ -1476,6 +1480,7 @@ fn box_drop_preserves_pointee_glue_without_allocator_machinery() {
         element_glue_nonthrowing: false,
         panic_impl: None,
         panic_reads_info: false,
+        native_string_enabled: false,
     };
     let rewrite = rewrite(&droppy, &[Carrier::NativeBox]).expect("structural Box drop lowers");
     assert_eq!(
@@ -1509,6 +1514,7 @@ fn box_drop_requires_proven_structural_pointee_glue() {
         element_glue_nonthrowing: false,
         panic_impl: None,
         panic_reads_info: false,
+        native_string_enabled: false,
     };
     assert_eq!(
         rewrite(&droppy, &[Carrier::NativeBox]).err(),
@@ -1526,6 +1532,7 @@ fn box_drop_requires_proven_structural_pointee_glue() {
         element_glue_nonthrowing: false,
         panic_impl: None,
         panic_reads_info: false,
+        native_string_enabled: false,
     };
     assert_eq!(
         rewrite(&own, &[Carrier::NativeBox]).err(),
@@ -1623,6 +1630,7 @@ fn dropful_clear_and_drop_call_the_glue_in_order() {
             element_glue_nonthrowing: true,
             panic_impl: None,
             panic_reads_info: false,
+            native_string_enabled: false,
         };
         let rewrite = rewrite(&cx, &[Carrier::NativeVec])
             .unwrap_or_else(|decline| panic!("{operation:?}: {}", decline.reason()));
@@ -1669,6 +1677,7 @@ fn own_drop_element_is_an_exact_decline() {
             element_glue_nonthrowing: false,
             panic_impl: None,
             panic_reads_info: false,
+            native_string_enabled: false,
         };
         assert_eq!(
             rewrite(&cx, &[Carrier::NativeVec]).err(),
@@ -1757,6 +1766,7 @@ fn dropful_vec_ops_emit_unwind_cleanup_when_not_proven_nonthrowing() {
             element_glue_nonthrowing: false,
             panic_impl: None,
             panic_reads_info: false,
+            native_string_enabled: false,
         };
         let rw = rewrite(&cx, &[Carrier::NativeVec]).expect("dropful op lowers with unwind guard");
         let printed = jsast::stmt_to_string(&jsast::function("f", rw.parameters, rw.statements));
@@ -1788,6 +1798,7 @@ fn native_vec_ops_route_failures_through_panic_impl() {
         element_glue_nonthrowing: false,
         panic_impl: Some(&panic_fn),
         panic_reads_info: true,
+        native_string_enabled: false,
     };
     let rw = rewrite(&cx, &[Carrier::NativeVec]).expect("VecInsert lowers with panic_impl");
     let printed = jsast::stmt_to_string(&jsast::function("f", rw.parameters, rw.statements));
@@ -1813,6 +1824,7 @@ fn native_vec_ops_route_failures_through_panic_impl() {
         element_glue_nonthrowing: false,
         panic_impl: Some(&panic_fn),
         panic_reads_info: false,
+        native_string_enabled: false,
     };
     let rw_u8 = rewrite(&cx_u8, &[Carrier::NativeVec]).expect("VecReserve u8 lowers");
     let printed_u8 =

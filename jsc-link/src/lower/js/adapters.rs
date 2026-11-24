@@ -235,6 +235,7 @@ fn native_vec_to_baseline(
                         vec: true,
                         string: true,
                         map: true,
+                        native_string: heap.native_string_enabled,
                     },
                 ),
             ));

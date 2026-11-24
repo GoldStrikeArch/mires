@@ -460,6 +460,15 @@ impl<'a> JsCx<'a> {
                 "aggregate constant at an unknown type",
             ));
         };
+        if self.heap().native_string_enabled
+            && descriptor.meta.candidate
+                == rcgjs_object::jir::types::RepresentationCandidate::String
+        {
+            return Ok(jsast::object_of(vec![
+                ("s", jsast::string("")),
+                ("cap", jsast::num(0)),
+            ]));
+        }
         match &descriptor.kind {
             TypeKind::Adt {
                 form: NominalForm::Struct,

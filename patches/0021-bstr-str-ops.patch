@@ -1,0 +1,478 @@
+--- a/library/core/src/str/traits.rs	2026-11-23 23:53:26
++++ b/library/core/src/str/traits.rs	2026-11-23 23:59:25
+@@ -14,11 +14,26 @@
+ /// "alphabetical" order, which varies by language and locale. Sorting strings according to
+ /// culturally-accepted standards requires locale-specific data that is outside the scope of
+ /// the `str` type.
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_str_cmp"]
++fn rcgjs_str_cmp(a: &str, b: &str) -> Ordering {
++    a.as_bytes().cmp(b.as_bytes())
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_str_eq"]
++#[rustc_const_unstable(feature = "const_cmp", issue = "143800")]
++const fn rcgjs_str_eq(a: &str, b: &str) -> bool {
++    a.as_bytes() == b.as_bytes()
++}
++
+ #[stable(feature = "rust1", since = "1.0.0")]
+ impl Ord for str {
+     #[inline]
+     fn cmp(&self, other: &str) -> Ordering {
+-        self.as_bytes().cmp(other.as_bytes())
++        rcgjs_str_cmp(self, other)
+     }
+ }
+ 
+@@ -27,7 +42,7 @@
+ const impl PartialEq for str {
+     #[inline]
+     fn eq(&self, other: &str) -> bool {
+-        self.as_bytes() == other.as_bytes()
++        rcgjs_str_eq(self, other)
+     }
+ }
+ 
+--- a/library/core/src/str/pattern.rs	2026-11-23 23:53:26
++++ b/library/core/src/str/pattern.rs	2026-11-23 23:59:27
+@@ -38,7 +38,6 @@
+     issue = "27721"
+ )]
+ 
+-use crate::cmp::Ordering;
+ use crate::slice::memchr;
+ use crate::{cmp, fmt};
+ 
+@@ -397,6 +396,134 @@
+     }
+ }
+ 
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_str_find_char"]
++fn rcgjs_str_find_char(haystack: &str, mut start: usize, end: usize, needle: char) -> usize {
++    let mut utf8_encoded = [0u8; char::MAX_LEN_UTF8];
++    let utf8_size = needle.encode_utf8(&mut utf8_encoded).len();
++    let last_byte = utf8_encoded[utf8_size - 1];
++    let orig_start = start;
++    let hbytes = haystack.as_bytes();
++    loop {
++        let Some(bytes) = hbytes.get(start..end) else {
++            return usize::MAX;
++        };
++        let Some(index) = memchr::memchr(last_byte, bytes) else {
++            return usize::MAX;
++        };
++        start += index + 1;
++        if start >= orig_start + utf8_size {
++            let found_char = start - utf8_size;
++            let matched = match hbytes.get(found_char..start) {
++                Some([_]) => true,
++                Some([a, _]) => *a == utf8_encoded[0],
++                Some([a, b, _]) => *a == utf8_encoded[0] && *b == utf8_encoded[1],
++                Some([a, b, c, _]) => {
++                    *a == utf8_encoded[0] && *b == utf8_encoded[1] && *c == utf8_encoded[2]
++                }
++                _ => false,
++            };
++            if matched {
++                return found_char;
++            }
++        }
++    }
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_str_rfind_char"]
++fn rcgjs_str_rfind_char(haystack: &str, start: usize, mut end: usize, needle: char) -> usize {
++    let mut utf8_encoded = [0u8; char::MAX_LEN_UTF8];
++    let utf8_size = needle.encode_utf8(&mut utf8_encoded).len();
++    let last_byte = utf8_encoded[utf8_size - 1];
++    let shift = utf8_size - 1;
++    let hbytes = haystack.as_bytes();
++    loop {
++        let Some(bytes) = hbytes.get(start..end) else {
++            return usize::MAX;
++        };
++        let Some(index) = memchr::memrchr(last_byte, bytes) else {
++            return usize::MAX;
++        };
++        let abs = start + index;
++        if abs >= start + shift {
++            let found_char = abs - shift;
++            if let Some(slice) = hbytes.get(found_char..found_char + utf8_size) {
++                if slice == &utf8_encoded[..utf8_size] {
++                    return found_char;
++                }
++            }
++        }
++        end = abs;
++    }
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_str_starts_with"]
++fn rcgjs_str_starts_with(haystack: &str, needle: &str) -> bool {
++    haystack.as_bytes().starts_with(needle.as_bytes())
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_str_ends_with"]
++fn rcgjs_str_ends_with(haystack: &str, needle: &str) -> bool {
++    haystack.as_bytes().ends_with(needle.as_bytes())
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_str_contains"]
++fn rcgjs_str_contains(haystack: &str, needle: &str) -> bool {
++    if needle.is_empty() {
++        return true;
++    }
++    if needle.len() > haystack.len() {
++        return false;
++    }
++    if needle.len() == haystack.len() {
++        return needle == haystack;
++    }
++    rcgjs_str_find_str(haystack, 0, haystack.len(), needle) != usize::MAX
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_str_find_str"]
++fn rcgjs_str_find_str(haystack: &str, start: usize, end: usize, needle: &str) -> usize {
++    let nb = needle.as_bytes();
++    if nb.is_empty() || start > end || end > haystack.len() || end - start < nb.len() {
++        return usize::MAX;
++    }
++    let mut tw = TwoWaySearcher::new(nb, end);
++    tw.position = start;
++    let is_long = tw.memory == usize::MAX;
++    match tw.next::<MatchOnly>(haystack.as_bytes(), nb, is_long) {
++        Some((a, _)) => a,
++        None => usize::MAX,
++    }
++}
++
++#[doc(hidden)]
++#[inline(never)]
++#[rustc_diagnostic_item = "rcgjs_str_rfind_str"]
++fn rcgjs_str_rfind_str(haystack: &str, start: usize, end: usize, needle: &str) -> usize {
++    let nb = needle.as_bytes();
++    if nb.is_empty() || start > end || end > haystack.len() || end - start < nb.len() {
++        return usize::MAX;
++    }
++    let mut tw = TwoWaySearcher::new(nb, end);
++    tw.position = start;
++    let is_long = tw.memory == usize::MAX;
++    match tw.next_back::<MatchOnly>(haystack.as_bytes(), nb, is_long) {
++        Some((a, _)) => a,
++        None => usize::MAX,
++    }
++}
++
+ unsafe impl<'a> Searcher<'a> for CharSearcher<'a> {
+     #[inline]
+     fn haystack(&self) -> &'a str {
+@@ -431,59 +558,13 @@
+     }
+     #[inline]
+     fn next_match(&mut self) -> Option<(usize, usize)> {
+-        loop {
+-            // get the haystack after the last character found
+-            let bytes = self.haystack.as_bytes().get(self.finger..self.finger_back)?;
+-            // the last byte of the utf8 encoded needle
+-            // SAFETY: we have an invariant that `utf8_size < 5`
+-            let last_byte = unsafe { *self.utf8_encoded.get_unchecked(self.utf8_size() - 1) };
+-            if let Some(index) = memchr::memchr(last_byte, bytes) {
+-                // The new finger is the index of the byte we found,
+-                // plus one, since we memchr'd for the last byte of the character.
+-                //
+-                // Note that this doesn't always give us a finger on a UTF8 boundary.
+-                // If we *didn't* find our character
+-                // we may have indexed to the non-last byte of a 3-byte or 4-byte character.
+-                // We can't just skip to the next valid starting byte because a character like
+-                // ꁁ (U+A041 YI SYLLABLE PA), utf-8 `EA 81 81` will have us always find
+-                // the second byte when searching for the third.
+-                //
+-                // However, this is totally okay. While we have the invariant that
+-                // self.finger is on a UTF8 boundary, this invariant is not relied upon
+-                // within this method (it is relied upon in CharSearcher::next()).
+-                //
+-                // We only exit this method when we reach the end of the string, or if we
+-                // find something. When we find something the `finger` will be set
+-                // to a UTF8 boundary.
+-                self.finger += index + 1;
+-                if self.finger >= self.utf8_size() {
+-                    let found_char = self.finger - self.utf8_size();
+-                    let matched = match self
+-                        .haystack
+-                        .as_bytes()
+-                        .get(found_char..self.finger)
+-                    {
+-                        Some([_]) => true,
+-                        Some([a, _]) => *a == self.utf8_encoded[0],
+-                        Some([a, b, _]) => {
+-                            *a == self.utf8_encoded[0] && *b == self.utf8_encoded[1]
+-                        }
+-                        Some([a, b, c, _]) => {
+-                            *a == self.utf8_encoded[0]
+-                                && *b == self.utf8_encoded[1]
+-                                && *c == self.utf8_encoded[2]
+-                        }
+-                        _ => false,
+-                    };
+-                    if matched {
+-                        return Some((found_char, self.finger));
+-                    }
+-                }
+-            } else {
+-                // found nothing, exit
+-                self.finger = self.finger_back;
+-                return None;
+-            }
++        let idx = rcgjs_str_find_char(self.haystack, self.finger, self.finger_back, self.needle);
++        if idx != usize::MAX {
++            self.finger = idx + self.utf8_size();
++            Some((idx, self.finger))
++        } else {
++            self.finger = self.finger_back;
++            None
+         }
+     }
+ 
+@@ -513,51 +594,13 @@
+     }
+     #[inline]
+     fn next_match_back(&mut self) -> Option<(usize, usize)> {
+-        let haystack = self.haystack.as_bytes();
+-        loop {
+-            // get the haystack up to but not including the last character searched
+-            let bytes = haystack.get(self.finger..self.finger_back)?;
+-            // the last byte of the utf8 encoded needle
+-            // SAFETY: we have an invariant that `utf8_size < 5`
+-            let last_byte = unsafe { *self.utf8_encoded.get_unchecked(self.utf8_size() - 1) };
+-            if let Some(index) = memchr::memrchr(last_byte, bytes) {
+-                // we searched a slice that was offset by self.finger,
+-                // add self.finger to recoup the original index
+-                let index = self.finger + index;
+-                // memrchr will return the index of the byte we wish to
+-                // find. In case of an ASCII character, this is indeed
+-                // were we wish our new finger to be ("after" the found
+-                // char in the paradigm of reverse iteration). For
+-                // multibyte chars we need to skip down by the number of more
+-                // bytes they have than ASCII
+-                let shift = self.utf8_size() - 1;
+-                if index >= shift {
+-                    let found_char = index - shift;
+-                    if let Some(slice) = haystack.get(found_char..(found_char + self.utf8_size())) {
+-                        if slice == &self.utf8_encoded[0..self.utf8_size()] {
+-                            // move finger to before the character found (i.e., at its start index)
+-                            self.finger_back = found_char;
+-                            return Some((self.finger_back, self.finger_back + self.utf8_size()));
+-                        }
+-                    }
+-                }
+-                // We can't use finger_back = index - size + 1 here. If we found the last char
+-                // of a different-sized character (or the middle byte of a different character)
+-                // we need to bump the finger_back down to `index`. This similarly makes
+-                // `finger_back` have the potential to no longer be on a boundary,
+-                // but this is OK since we only exit this function on a boundary
+-                // or when the haystack has been searched completely.
+-                //
+-                // Unlike next_match this does not
+-                // have the problem of repeated bytes in utf-8 because
+-                // we're searching for the last byte, and we can only have
+-                // found the last byte when searching in reverse.
+-                self.finger_back = index;
+-            } else {
+-                self.finger_back = self.finger;
+-                // found nothing, exit
+-                return None;
+-            }
++        let idx = rcgjs_str_rfind_char(self.haystack, self.finger, self.finger_back, self.needle);
++        if idx != usize::MAX {
++            self.finger_back = idx;
++            Some((idx, idx + self.utf8_size()))
++        } else {
++            self.finger_back = self.finger;
++            None
+         }
+     }
+ 
+@@ -596,12 +639,7 @@
+ 
+     #[inline]
+     fn is_contained_in(self, haystack: &str) -> bool {
+-        if (self as u32) < 128 {
+-            haystack.as_bytes().contains(&(self as u8))
+-        } else {
+-            let mut buffer = [0u8; 4];
+-            self.encode_utf8(&mut buffer).is_contained_in(haystack)
+-        }
++        rcgjs_str_find_char(haystack, 0, haystack.len(), self) != usize::MAX
+     }
+ 
+     #[inline]
+@@ -628,13 +666,11 @@
+         Self::Searcher<'a>: ReverseSearcher<'a>,
+     {
+         let mut buffer = [0u8; 4];
+-        let encoded = self.encode_utf8(&mut buffer).as_bytes();
+-        if encoded.len() > haystack.len() {
+-            return None;
+-        }
+-        let start = haystack.len() - encoded.len();
+-        if haystack.as_bytes().get(start..) == Some(encoded) {
+-            haystack.get(..start)
++        let encoded = self.encode_utf8(&mut buffer);
++        if rcgjs_str_ends_with(haystack, encoded) {
++            let start = haystack.len() - encoded.len();
++            // SAFETY: suffix was just verified to exist at a char boundary.
++            unsafe { Some(haystack.get_unchecked(..start)) }
+         } else {
+             None
+         }
+@@ -1004,37 +1040,13 @@
+     /// Checks whether the pattern matches at the front of the haystack.
+     #[inline]
+     fn is_prefix_of(self, haystack: &str) -> bool {
+-        haystack.as_bytes().starts_with(self.as_bytes())
++        rcgjs_str_starts_with(haystack, self)
+     }
+ 
+     /// Checks whether the pattern matches anywhere in the haystack
+     #[inline]
+     fn is_contained_in(self, haystack: &str) -> bool {
+-        if self.len() == 0 {
+-            return true;
+-        }
+-
+-        match self.len().cmp(&haystack.len()) {
+-            Ordering::Less => {
+-                if self.len() == 1 {
+-                    return haystack.as_bytes().contains(&self.as_bytes()[0]);
+-                }
+-
+-                #[cfg(any(
+-                    all(target_arch = "x86_64", target_feature = "sse2"),
+-                    all(target_arch = "loongarch64", target_feature = "lsx"),
+-                    all(target_arch = "aarch64", target_feature = "neon")
+-                ))]
+-                if self.len() <= 32 {
+-                    if let Some(result) = simd_contains(self, haystack) {
+-                        return result;
+-                    }
+-                }
+-
+-                self.into_searcher(haystack).next_match().is_some()
+-            }
+-            _ => self == haystack,
+-        }
++        rcgjs_str_contains(haystack, self)
+     }
+ 
+     /// Removes the pattern from the front of haystack, if it matches.
+@@ -1042,7 +1054,7 @@
+     fn strip_prefix_of(self, haystack: &str) -> Option<&str> {
+         if self.is_prefix_of(haystack) {
+             // SAFETY: prefix was just verified to exist.
+-            unsafe { Some(haystack.get_unchecked(self.as_bytes().len()..)) }
++            unsafe { Some(haystack.get_unchecked(self.len()..)) }
+         } else {
+             None
+         }
+@@ -1054,7 +1066,7 @@
+     where
+         Self::Searcher<'a>: ReverseSearcher<'a>,
+     {
+-        haystack.as_bytes().ends_with(self.as_bytes())
++        rcgjs_str_ends_with(haystack, self)
+     }
+ 
+     /// Removes the pattern from the back of haystack, if it matches.
+@@ -1064,7 +1076,7 @@
+         Self::Searcher<'a>: ReverseSearcher<'a>,
+     {
+         if self.is_suffix_of(haystack) {
+-            let i = haystack.len() - self.as_bytes().len();
++            let i = haystack.len() - self.len();
+             // SAFETY: suffix was just verified to exist.
+             unsafe { Some(haystack.get_unchecked(..i)) }
+         } else {
+@@ -1203,21 +1215,18 @@
+                 }
+             },
+             StrSearcherImpl::TwoWay(ref mut searcher) => {
+-                let is_long = searcher.memory == usize::MAX;
+-                // write out `true` and `false` cases to encourage the compiler
+-                // to specialize the two cases separately.
+-                if is_long {
+-                    searcher.next::<MatchOnly>(
+-                        self.haystack.as_bytes(),
+-                        self.needle.as_bytes(),
+-                        true,
+-                    )
++                let idx =
++                    rcgjs_str_find_str(self.haystack, searcher.position, searcher.end, self.needle);
++                if idx != usize::MAX {
++                    let match_end = idx + self.needle.len();
++                    searcher.position = match_end;
++                    if searcher.memory != usize::MAX {
++                        searcher.memory = 0;
++                    }
++                    Some((idx, match_end))
+                 } else {
+-                    searcher.next::<MatchOnly>(
+-                        self.haystack.as_bytes(),
+-                        self.needle.as_bytes(),
+-                        false,
+-                    )
++                    searcher.position = searcher.end;
++                    None
+                 }
+             }
+         }
+@@ -1282,20 +1291,21 @@
+                 }
+             },
+             StrSearcherImpl::TwoWay(ref mut searcher) => {
+-                let is_long = searcher.memory == usize::MAX;
+-                // write out `true` and `false`, like `next_match`
+-                if is_long {
+-                    searcher.next_back::<MatchOnly>(
+-                        self.haystack.as_bytes(),
+-                        self.needle.as_bytes(),
+-                        true,
+-                    )
++                let idx = rcgjs_str_rfind_str(
++                    self.haystack,
++                    searcher.position,
++                    searcher.end,
++                    self.needle,
++                );
++                if idx != usize::MAX {
++                    searcher.end = idx;
++                    if searcher.memory_back != usize::MAX {
++                        searcher.memory_back = self.needle.len();
++                    }
++                    Some((idx, idx + self.needle.len()))
+                 } else {
+-                    searcher.next_back::<MatchOnly>(
+-                        self.haystack.as_bytes(),
+-                        self.needle.as_bytes(),
+-                        false,
+-                    )
++                    searcher.end = searcher.position;
++                    None
+                 }
+             }
+         }

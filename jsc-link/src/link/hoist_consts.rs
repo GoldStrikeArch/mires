@@ -448,6 +448,462 @@ fn collect_declared_locals(stmts: &[Stmt], params: &BTreeSet<String>, out: &mut 
 /// Checks whether `local` across the entire `body` (at any nesting depth, including inside loops)
 /// is declared once, initialized once to a pure scalar array literal (`len >= 8`), and only ever
 /// read as `local[index_expr]` in rvalue position (never mutated, shadowed, or escaped).
+fn is_nested_scalar_array_lit(expr: &Expr, min_len: usize, allow_bigint: bool) -> bool {
+    let Expr::Array(elems) = expr else {
+        return false;
+    };
+    elems.len() >= min_len
+        && elems
+            .iter()
+            .all(|elem| is_flat_scalar_aggregate(elem, allow_bigint))
+}
+
+/// Checks whether `local` across the entire `body` is declared once, initialized once (including
+/// inside a comma `Seq`) to a read-only array of flat pure-scalar tuples/objects (`len >= 8`,
+/// e.g. Keccak's `IOTA`), and every indexed element `local[i]` is only ever read as scalar fields
+/// or indices (directly or through read-only element aliases).
+fn find_read_only_nested_array_init(
+    body: &[Stmt],
+    local: &str,
+    allow_bigint: bool,
+) -> Option<Expr> {
+    fn collect_elem_aliases(
+        stmts: &[Stmt],
+        local: &str,
+        aliases: &mut BTreeSet<String>,
+        multi_or_bad: &mut BTreeSet<String>,
+    ) {
+        fn scan_e(
+            e: &Expr,
+            local: &str,
+            aliases: &mut BTreeSet<String>,
+            multi_or_bad: &mut BTreeSet<String>,
+        ) {
+            match e {
+                Expr::Assign(lhs, rhs) => {
+                    if let Expr::Ident(name) = lhs.as_ref() {
+                        if let Expr::Index(obj, _) = rhs.as_ref() {
+                            if matches!(obj.as_ref(), Expr::Ident(o) if o == local) {
+                                if !aliases.insert(name.clone()) {
+                                    // Re-assigned in a loop (`E = am[an + l]`): still a valid
+                                    // element alias if every assignment is `local[...]`.
+                                }
+                                scan_e(rhs, local, aliases, multi_or_bad);
+                                return;
+                            }
+                        }
+                        multi_or_bad.insert(name.clone());
+                    }
+                    scan_e(lhs, local, aliases, multi_or_bad);
+                    scan_e(rhs, local, aliases, multi_or_bad);
+                }
+                Expr::CompoundAssign(_, l, r) | Expr::Binary(_, l, r) | Expr::Index(l, r) => {
+                    scan_e(l, local, aliases, multi_or_bad);
+                    scan_e(r, local, aliases, multi_or_bad);
+                }
+                Expr::Member(o, _) | Expr::Unary(_, o) => scan_e(o, local, aliases, multi_or_bad),
+                Expr::Call(c, args) | Expr::New(c, args) => {
+                    scan_e(c, local, aliases, multi_or_bad);
+                    args.iter()
+                        .for_each(|a| scan_e(a, local, aliases, multi_or_bad));
+                }
+                Expr::Cond(c, t, f) => {
+                    scan_e(c, local, aliases, multi_or_bad);
+                    scan_e(t, local, aliases, multi_or_bad);
+                    scan_e(f, local, aliases, multi_or_bad);
+                }
+                Expr::Object(entries) => {
+                    entries
+                        .iter()
+                        .for_each(|(_, v)| scan_e(v, local, aliases, multi_or_bad));
+                }
+                Expr::Array(items) | Expr::Seq(items) => {
+                    items
+                        .iter()
+                        .for_each(|x| scan_e(x, local, aliases, multi_or_bad));
+                }
+                Expr::Arrow(_, ArrowBody::Expr(b)) => scan_e(b, local, aliases, multi_or_bad),
+                Expr::Arrow(_, ArrowBody::Block(s)) => {
+                    collect_elem_aliases(s, local, aliases, multi_or_bad);
+                }
+                _ => {}
+            }
+        }
+        for s in stmts {
+            match s {
+                Stmt::Let(n, Some(init)) | Stmt::Const(n, init) => {
+                    if let Expr::Index(obj, _) = init {
+                        if matches!(obj.as_ref(), Expr::Ident(o) if o == local) {
+                            aliases.insert(n.clone());
+                            scan_e(init, local, aliases, multi_or_bad);
+                            continue;
+                        }
+                    }
+                    multi_or_bad.insert(n.clone());
+                    scan_e(init, local, aliases, multi_or_bad);
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if let Some(init) = init {
+                            multi_or_bad.insert(n.clone());
+                            scan_e(init, local, aliases, multi_or_bad);
+                        }
+                    }
+                }
+                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                    scan_e(e, local, aliases, multi_or_bad);
+                }
+                Stmt::If(t, a, b) => {
+                    scan_e(t, local, aliases, multi_or_bad);
+                    collect_elem_aliases(a, local, aliases, multi_or_bad);
+                    if let Some(b) = b {
+                        collect_elem_aliases(b, local, aliases, multi_or_bad);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    scan_e(d, local, aliases, multi_or_bad);
+                    for c in cases {
+                        c.tests
+                            .iter()
+                            .for_each(|t| scan_e(t, local, aliases, multi_or_bad));
+                        collect_elem_aliases(&c.body, local, aliases, multi_or_bad);
+                    }
+                }
+                Stmt::Labeled(_, inner) => {
+                    collect_elem_aliases(
+                        std::slice::from_ref(inner.as_ref()),
+                        local,
+                        aliases,
+                        multi_or_bad,
+                    );
+                }
+                Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::FunctionDecl { body: b, .. } => {
+                    collect_elem_aliases(b, local, aliases, multi_or_bad);
+                }
+                Stmt::While(t, b) => {
+                    scan_e(t, local, aliases, multi_or_bad);
+                    collect_elem_aliases(b, local, aliases, multi_or_bad);
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    multi_or_bad.insert(binding.clone());
+                    collect_elem_aliases(body, local, aliases, multi_or_bad);
+                    collect_elem_aliases(handler, local, aliases, multi_or_bad);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut aliases = BTreeSet::new();
+    let mut bad_aliases = BTreeSet::new();
+    collect_elem_aliases(body, local, &mut aliases, &mut bad_aliases);
+    for b in &bad_aliases {
+        aliases.remove(b);
+    }
+    aliases.remove(local);
+
+    struct Check<'a> {
+        local: &'a str,
+        aliases: &'a BTreeSet<String>,
+        allow_bigint: bool,
+        decl_count: usize,
+        found_init: Option<Expr>,
+        reads: usize,
+        bad: bool,
+    }
+    impl Check<'_> {
+        fn check_assign(&mut self, lhs: &Expr, rhs: &Expr) {
+            if let Expr::Ident(n) = lhs {
+                if n == self.local {
+                    if self.found_init.is_some()
+                        || !is_nested_scalar_array_lit(rhs, 8, self.allow_bigint)
+                    {
+                        self.bad = true;
+                        return;
+                    }
+                    self.found_init = Some(rhs.clone());
+                    return;
+                }
+                if self.aliases.contains(n) {
+                    if let Expr::Index(obj, idx) = rhs {
+                        if matches!(obj.as_ref(), Expr::Ident(o) if o == self.local) {
+                            self.reads += 1;
+                            self.expr(idx, false);
+                            return;
+                        }
+                    }
+                    self.bad = true;
+                    return;
+                }
+            }
+            self.expr(lhs, true);
+            self.expr(rhs, false);
+        }
+
+        fn stmt(&mut self, s: &Stmt) {
+            if self.bad {
+                return;
+            }
+            match s {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => self.check_assign(lhs, rhs),
+                Stmt::ExprStmt(Expr::Seq(items)) => {
+                    for item in items {
+                        if let Expr::Assign(lhs, rhs) = item {
+                            self.check_assign(lhs, rhs);
+                        } else {
+                            self.expr(item, false);
+                        }
+                    }
+                }
+                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => self.expr(e, false),
+                Stmt::Let(n, init) => {
+                    if n == self.local {
+                        self.decl_count += 1;
+                        if self.decl_count > 1 {
+                            self.bad = true;
+                            return;
+                        }
+                        if let Some(rhs) = init {
+                            if self.found_init.is_some()
+                                || !is_nested_scalar_array_lit(rhs, 8, self.allow_bigint)
+                            {
+                                self.bad = true;
+                                return;
+                            }
+                            self.found_init = Some(rhs.clone());
+                        }
+                        return;
+                    }
+                    if let Some(e) = init {
+                        if self.aliases.contains(n) {
+                            if let Expr::Index(obj, idx) = e {
+                                if matches!(obj.as_ref(), Expr::Ident(o) if o == self.local) {
+                                    self.reads += 1;
+                                    self.expr(idx, false);
+                                    return;
+                                }
+                            }
+                            self.bad = true;
+                            return;
+                        }
+                        self.expr(e, false);
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if n == self.local {
+                            self.decl_count += 1;
+                            if self.decl_count > 1 {
+                                self.bad = true;
+                                return;
+                            }
+                            if let Some(rhs) = init {
+                                if self.found_init.is_some()
+                                    || !is_nested_scalar_array_lit(rhs, 8, self.allow_bigint)
+                                {
+                                    self.bad = true;
+                                    return;
+                                }
+                                self.found_init = Some(rhs.clone());
+                            }
+                            continue;
+                        }
+                        if let Some(e) = init {
+                            if self.aliases.contains(n) {
+                                self.bad = true;
+                                return;
+                            }
+                            self.expr(e, false);
+                        }
+                    }
+                }
+                Stmt::Const(n, e) => {
+                    if n == self.local || self.aliases.contains(n) {
+                        self.bad = true;
+                        return;
+                    }
+                    self.expr(e, false);
+                }
+                Stmt::If(t, a, b) => {
+                    self.expr(t, false);
+                    a.iter().for_each(|x| self.stmt(x));
+                    if let Some(b) = b {
+                        b.iter().for_each(|x| self.stmt(x));
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    self.expr(d, false);
+                    for c in cases {
+                        c.tests.iter().for_each(|t| self.expr(t, false));
+                        c.body.iter().for_each(|x| self.stmt(x));
+                    }
+                }
+                Stmt::Labeled(_, inner) => self.stmt(inner),
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => b.iter().for_each(|x| self.stmt(x)),
+                Stmt::While(t, b) => {
+                    self.expr(t, false);
+                    b.iter().for_each(|x| self.stmt(x));
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    if binding == self.local || self.aliases.contains(binding) {
+                        self.bad = true;
+                        return;
+                    }
+                    body.iter().for_each(|x| self.stmt(x));
+                    handler.iter().for_each(|x| self.stmt(x));
+                }
+                Stmt::FunctionDecl { name, params, body } => {
+                    if name == self.local
+                        || self.aliases.contains(name)
+                        || params
+                            .iter()
+                            .any(|p| p == self.local || self.aliases.contains(p))
+                    {
+                        self.bad = true;
+                        return;
+                    }
+                    body.iter().for_each(|x| self.stmt(x));
+                }
+                Stmt::Raw(_) => self.bad = true,
+                _ => {}
+            }
+        }
+
+        fn expr(&mut self, e: &Expr, is_lhs: bool) {
+            if self.bad {
+                return;
+            }
+            match e {
+                Expr::Ident(n) => {
+                    if n == self.local || self.aliases.contains(n) {
+                        self.bad = true;
+                    }
+                }
+                Expr::Index(obj, idx) => {
+                    if let Expr::Ident(n) = obj.as_ref() {
+                        if self.aliases.contains(n) {
+                            if is_lhs {
+                                self.bad = true;
+                                return;
+                            }
+                            self.reads += 1;
+                            self.expr(idx, false);
+                            return;
+                        }
+                    }
+                    if let Expr::Index(inner_obj, inner_idx) = obj.as_ref() {
+                        if matches!(inner_obj.as_ref(), Expr::Ident(o) if o == self.local) {
+                            if is_lhs {
+                                self.bad = true;
+                                return;
+                            }
+                            self.reads += 1;
+                            self.expr(inner_idx, false);
+                            self.expr(idx, false);
+                            return;
+                        }
+                    }
+                    self.expr(obj, false);
+                    self.expr(idx, false);
+                }
+                Expr::Member(obj, _) => {
+                    if let Expr::Ident(n) = obj.as_ref() {
+                        if self.aliases.contains(n) {
+                            if is_lhs {
+                                self.bad = true;
+                                return;
+                            }
+                            self.reads += 1;
+                            return;
+                        }
+                    }
+                    if let Expr::Index(inner_obj, inner_idx) = obj.as_ref() {
+                        if matches!(inner_obj.as_ref(), Expr::Ident(o) if o == self.local) {
+                            if is_lhs {
+                                self.bad = true;
+                                return;
+                            }
+                            self.reads += 1;
+                            self.expr(inner_idx, false);
+                            return;
+                        }
+                    }
+                    self.expr(obj, false);
+                }
+                Expr::Call(c, args) | Expr::New(c, args) => {
+                    self.expr(c, false);
+                    args.iter().for_each(|a| self.expr(a, false));
+                }
+                Expr::Unary(_, inner) => self.expr(inner, false),
+                Expr::Binary(_, l, r) => {
+                    self.expr(l, false);
+                    self.expr(r, false);
+                }
+                Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
+                    self.expr(l, true);
+                    self.expr(r, false);
+                }
+                Expr::Cond(c, t, f) => {
+                    self.expr(c, false);
+                    self.expr(t, false);
+                    self.expr(f, false);
+                }
+                Expr::Array(items) | Expr::Seq(items) => {
+                    items.iter().for_each(|x| self.expr(x, false));
+                }
+                Expr::Object(entries) => {
+                    entries.iter().for_each(|(_, v)| self.expr(v, false));
+                }
+                Expr::Arrow(params, ArrowBody::Expr(b)) => {
+                    if params
+                        .iter()
+                        .any(|p| p == self.local || self.aliases.contains(p))
+                    {
+                        self.bad = true;
+                        return;
+                    }
+                    self.expr(b, false);
+                }
+                Expr::Arrow(params, ArrowBody::Block(s)) => {
+                    if params
+                        .iter()
+                        .any(|p| p == self.local || self.aliases.contains(p))
+                    {
+                        self.bad = true;
+                        return;
+                    }
+                    s.iter().for_each(|x| self.stmt(x));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut check = Check {
+        local,
+        aliases: &aliases,
+        allow_bigint,
+        decl_count: 0,
+        found_init: None,
+        reads: 0,
+        bad: false,
+    };
+    body.iter().for_each(|s| check.stmt(s));
+    if !check.bad && check.decl_count == 1 && check.reads > 0 {
+        check.found_init
+    } else {
+        None
+    }
+}
+
 fn find_read_only_table_init(body: &[Stmt], local: &str, allow_bigint: bool) -> Option<Expr> {
     struct Check<'a> {
         local: &'a str,
@@ -1239,9 +1695,29 @@ fn strip_hoisted_table_stmts(stmts: &mut Vec<Stmt>, hoisted: &BTreeSet<String>) 
             Stmt::ExprStmt(Expr::Assign(lhs, rhs))
                 if matches!(lhs.as_ref(), Expr::Ident(n) if hoisted.contains(n))
                     && (is_scalar_array_lit(rhs, 8, true)
+                        || is_nested_scalar_array_lit(rhs, 8, true)
                         || is_pure_const_slice_lit(rhs, true).is_some()) =>
             {
                 continue;
+            }
+            Stmt::ExprStmt(Expr::Seq(items)) => {
+                items.retain(|item| {
+                    !matches!(
+                        item,
+                        Expr::Assign(lhs, rhs)
+                            if matches!(lhs.as_ref(), Expr::Ident(n) if hoisted.contains(n))
+                                && (is_scalar_array_lit(rhs, 8, true)
+                                    || is_nested_scalar_array_lit(rhs, 8, true)
+                                    || is_pure_const_slice_lit(rhs, true).is_some())
+                    )
+                });
+                if items.is_empty() {
+                    continue;
+                }
+                if items.len() == 1 {
+                    let single = items.pop().unwrap();
+                    s = Stmt::ExprStmt(single);
+                }
             }
             Stmt::Let(n, _) if hoisted.contains(n) => continue,
             Stmt::Lets(decls) => {
@@ -1653,6 +2129,10 @@ fn run_with_opts(
         for local in &declared_locals {
             if let Some(arr_expr) = find_read_only_table_init(body, local, allow_bigint) {
                 candidates.push((local.clone(), arr_expr));
+            } else if let Some(nested_expr) =
+                find_read_only_nested_array_init(body, local, allow_bigint)
+            {
+                candidates.push((local.clone(), nested_expr));
             } else if let Some(slice_expr) =
                 find_read_only_const_slice_init(body, local, allow_bigint)
             {
@@ -1721,9 +2201,12 @@ fn run_with_opts(
         }
     }
 
+    let speed_profile = opts.profile == Some(crate::opts::Profile::ReleaseSpeed);
     let mut const_map: BTreeMap<String, JsName> = BTreeMap::new();
     for (key, (expr, usage)) in &collector.counts {
-        let qualify = if key.starts_with("loc:") || key.starts_with("str:") {
+        let qualify = if key.starts_with("loc:") {
+            usage.in_loop || usage.count >= 2 || speed_profile
+        } else if key.starts_with("str:") {
             usage.in_loop || usage.count >= 2
         } else if key.starts_with("arr:") {
             let len = match expr {

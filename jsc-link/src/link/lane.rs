@@ -718,12 +718,20 @@ fn run_with_opts(
     );
     ctx.byte_views = byte_views;
     ctx.heap = heap;
+    let pre_repr_native_string = ctx.heap.native_string_enabled;
 
     // Phase B1: solve and commit on the planned map in both `report` and `on`. Report mode keeps
     // only the accounting; on mode prints the committed map. D9 can therefore measure the exact
     // post-O program in both modes and return identical decisions.
     let repr_ran = opts.analyzes(OptimizerPass::NativeRepresentations);
     let planned_repr = if repr_ran {
+        let repr_live = crate::analysis::heap::filter_live_for_repr(
+            table,
+            &planned_funcs,
+            &live,
+            opts,
+            &ctx.heap,
+        );
         let repr_cx = crate::plan::representation::ReprCx {
             opts,
             items: &items,
@@ -737,7 +745,7 @@ fn run_with_opts(
             crate::plan::representation::plan_and_commit(
                 table,
                 &mut planned_funcs,
-                &live,
+                &repr_live,
                 &repr_cx,
                 true,
             )
@@ -821,6 +829,12 @@ fn run_with_opts(
         opts,
         byte_views,
     );
+    if !repr.bodies.is_empty() {
+        // `repr.bodies` were emitted against `pre_repr_native_string`; keep the post-repr heap
+        // plan in lockstep so native bodies (e.g. `NativeMap<String, _>`) and lowered items
+        // agree on `String`'s layout.
+        heap.native_string_enabled &= pre_repr_native_string;
+    }
     ctx.byte_views = byte_views;
     ctx.heap = heap;
 
@@ -1042,6 +1056,9 @@ fn run_with_opts(
                 opts,
                 byte_views,
             );
+            if !repr.bodies.is_empty() {
+                heap.native_string_enabled &= pre_repr_native_string;
+            }
             ctx.byte_views = byte_views;
             ctx.heap = heap;
             continue;
