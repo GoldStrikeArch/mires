@@ -1464,7 +1464,12 @@ impl<'a> Planner<'a> {
                     continue;
                 };
                 let base_ty = self.func.values[base.0 as usize].ty;
-                if !matches!(self.table.enum_repr(base_ty), Some(EnumRepr::Tag { .. })) {
+                if !matches!(
+                    self.table.enum_repr(base_ty),
+                    Some(
+                        EnumRepr::Tag { .. } | EnumRepr::IntTag { .. } | EnumRepr::NullNiche { .. }
+                    )
+                ) {
                     continue;
                 }
                 if !has_multiple_variants(self.table, base_ty) {

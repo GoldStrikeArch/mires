@@ -333,8 +333,17 @@ pub(crate) fn write_ok_expr(
     result: TypeId,
 ) -> Result<Expr, SemanticDecline> {
     let (tag, key) = write_ok_variant(table, interns, result)?;
+    if let Some(expr) = crate::lower::js::value::enum_value(
+        table,
+        interns,
+        result,
+        0,
+        vec![(key.clone(), jsast::undefined())],
+    ) {
+        return Ok(expr);
+    }
     Ok(jsast::object(vec![
-        ("TAG".to_owned(), jsast::string(tag)),
+        ("TAG".to_owned(), jsast::string(&tag)),
         (key, jsast::undefined()),
     ]))
 }

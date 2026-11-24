@@ -270,9 +270,16 @@ enum ExpectedOptionPayload {
 fn option_layout(
     cx: &LowerCx<'_>,
     expected: ExpectedOptionPayload,
-) -> Result<(String, String, String), SemanticDecline> {
+) -> Result<(u32, u32, String), SemanticDecline> {
     let result = type_get(cx.table, cx.table.peeled(cx.sig.result))?;
-    if result.js.enum_repr != Some(EnumRepr::Tag { fieldless: false }) {
+    if !matches!(
+        result.js.enum_repr,
+        Some(
+            EnumRepr::Tag { fieldless: false }
+                | EnumRepr::IntTag { fieldless: false }
+                | EnumRepr::NullNiche { .. }
+        )
+    ) {
         return Err(SemanticDecline::WrongReturnType);
     }
     let TypeKind::Adt {
@@ -286,14 +293,11 @@ fn option_layout(
     if variants.len() != 2 {
         return Err(SemanticDecline::WrongReturnType);
     }
-    let mut none_tag = None;
+    let mut none_idx = None;
     let mut some_info = None;
-    for variant in variants {
-        let Some(tag) = cx.interns.str(variant.name) else {
-            return Err(SemanticDecline::WrongReturnType);
-        };
+    for (index, variant) in variants.iter().enumerate() {
         match variant.fields.as_slice() {
-            [] if none_tag.is_none() => none_tag = Some(tag.to_owned()),
+            [] if none_idx.is_none() => none_idx = Some(index as u32),
             [field] if some_info.is_none() => {
                 let field_ty = cx.table.peeled(field.ty);
                 let matches = match expected {
@@ -318,26 +322,36 @@ fn option_layout(
                 let Some(field_name) = cx.interns.str(key_id) else {
                     return Err(SemanticDecline::WrongReturnType);
                 };
-                some_info = Some((tag.to_owned(), field_name.to_owned()));
+                some_info = Some((index as u32, field_name.to_owned()));
             }
             _ => return Err(SemanticDecline::WrongReturnType),
         }
     }
-    let (Some(none_tag), Some((some_tag, some_field))) = (none_tag, some_info) else {
+    let (Some(none_idx), Some((some_idx, some_field))) = (none_idx, some_info) else {
         return Err(SemanticDecline::WrongReturnType);
     };
-    Ok((none_tag, some_tag, some_field))
+    Ok((none_idx, some_idx, some_field))
 }
 
-fn none_expr(none_tag: String) -> Expr {
-    jsast::object_of(vec![("TAG", jsast::string(none_tag))])
+fn none_expr(cx: &LowerCx<'_>, none_idx: u32) -> Result<Expr, SemanticDecline> {
+    crate::lower::js::value::enum_value(cx.table, cx.interns, cx.sig.result, none_idx, vec![])
+        .ok_or(SemanticDecline::WrongReturnType)
 }
 
-fn some_expr(some_tag: String, some_field: String, payload: Expr) -> Expr {
-    jsast::object(vec![
-        ("TAG".to_owned(), jsast::string(some_tag)),
-        (some_field, payload),
-    ])
+fn some_expr(
+    cx: &LowerCx<'_>,
+    some_idx: u32,
+    some_field: String,
+    payload: Expr,
+) -> Result<Expr, SemanticDecline> {
+    crate::lower::js::value::enum_value(
+        cx.table,
+        cx.interns,
+        cx.sig.result,
+        some_idx,
+        vec![(some_field, payload)],
+    )
+    .ok_or(SemanticDecline::WrongReturnType)
 }
 
 // -- Legality checks -------------------------------------------------------------------------
@@ -500,7 +514,7 @@ pub(super) fn btree_map_get(
         cx.semantic,
         BodySemantic::Standard(StandardOperation::BTreeMapGetMut)
     );
-    let (none_tag, some_tag, some_field) = option_layout(
+    let (none_idx, some_idx, some_field) = option_layout(
         cx,
         ExpectedOptionPayload::Ref {
             pointee: v_desc.id,
@@ -517,8 +531,8 @@ pub(super) fn btree_map_get(
         jsast::const_("$nmv", jsast::method_call(receiver(), "get", vec![key])),
         jsast::ret(jsast::cond(
             jsast::binary(BinOp::StrictEq, jsast::id("$nmv"), jsast::undefined()),
-            none_expr(none_tag),
-            some_expr(some_tag, some_field, payload),
+            none_expr(cx, none_idx)?,
+            some_expr(cx, some_idx, some_field, payload)?,
         )),
     ])
 }
@@ -530,7 +544,7 @@ pub(super) fn btree_map_insert(
     _refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let (k_desc, v_desc) = map_kv(cx)?;
-    let (none_tag, some_tag, some_field) =
+    let (none_idx, some_idx, some_field) =
         option_layout(cx, ExpectedOptionPayload::Value(v_desc.id))?;
     let key = emit_key_expr(&owned_key_lowering(cx, k_desc)?, helpers);
     if v_desc.js.is_indirect {
@@ -547,8 +561,8 @@ pub(super) fn btree_map_insert(
             )),
             jsast::ret(jsast::cond(
                 jsast::binary(BinOp::StrictEq, jsast::id("$nmp"), jsast::undefined()),
-                none_expr(none_tag),
-                some_expr(some_tag, some_field, jsast::id("$nmp")),
+                none_expr(cx, none_idx)?,
+                some_expr(cx, some_idx, some_field, jsast::id("$nmp"))?,
             )),
         ])
     } else {
@@ -566,7 +580,7 @@ pub(super) fn btree_map_insert(
                         "set",
                         vec![jsast::id("$nmk"), jsast::array(vec![jsast::id("$native2")])],
                     )),
-                    jsast::ret(none_expr(none_tag)),
+                    jsast::ret(none_expr(cx, none_idx)?),
                 ],
             ),
             jsast::const_("$nmo", jsast::index(jsast::id("$nmp"), jsast::num(0))),
@@ -574,7 +588,7 @@ pub(super) fn btree_map_insert(
                 jsast::index(jsast::id("$nmp"), jsast::num(0)),
                 jsast::id("$native2"),
             ),
-            jsast::ret(some_expr(some_tag, some_field, jsast::id("$nmo"))),
+            jsast::ret(some_expr(cx, some_idx, some_field, jsast::id("$nmo"))?),
         ])
     }
 }
@@ -586,7 +600,7 @@ pub(super) fn btree_map_remove(
     _refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
     let (k_desc, v_desc) = map_kv(cx)?;
-    let (none_tag, some_tag, some_field) =
+    let (none_idx, some_idx, some_field) =
         option_layout(cx, ExpectedOptionPayload::Value(v_desc.id))?;
     let key = emit_key_expr(&lookup_key_lowering(cx, k_desc)?, helpers);
     let payload = if v_desc.js.is_indirect {
@@ -602,13 +616,13 @@ pub(super) fn btree_map_remove(
         ),
         jsast::if_(
             jsast::binary(BinOp::StrictEq, jsast::id("$nmp"), jsast::undefined()),
-            vec![jsast::ret(none_expr(none_tag))],
+            vec![jsast::ret(none_expr(cx, none_idx)?)],
         ),
         jsast::expr_stmt(jsast::method_call(
             receiver(),
             "delete",
             vec![jsast::id("$nmk")],
         )),
-        jsast::ret(some_expr(some_tag, some_field, payload)),
+        jsast::ret(some_expr(cx, some_idx, some_field, payload)?),
     ])
 }

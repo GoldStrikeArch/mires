@@ -1252,27 +1252,34 @@ fn map_marker(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<Exp
                         format!("`{MAP_PREFIX}{marker}` result must be an `Option`-shaped enum"),
                     ));
                 };
-            let none_tag =
-                value::variant_tag(cx.table, cx.interns, res_ty, none_idx).ok_or_else(|| {
-                    decline(OpClass::Host, "missing `None` tag for `rcgjs.map.try_get`")
-                })?;
-            let some_tag =
-                value::variant_tag(cx.table, cx.interns, res_ty, some_idx).ok_or_else(|| {
-                    decline(OpClass::Host, "missing `Some` tag for `rcgjs.map.try_get`")
-                })?;
             let (_, tmp) = cx.temp(Expr::Undefined);
             let get_call = jsast::call(jsast::member(map, "get"), vec![k]);
-            let none_obj = jsast::object(vec![(value::TAG.to_owned(), none_tag)]);
-            let some_obj = jsast::object(vec![
-                (value::TAG.to_owned(), some_tag),
-                (some_field, tmp.clone()),
-            ]);
+            let none_val = value::enum_value(cx.table, cx.interns, res_ty, none_idx, Vec::new())
+                .ok_or_else(|| {
+                    decline(
+                        OpClass::Host,
+                        "missing `None` value for `rcgjs.map.try_get`",
+                    )
+                })?;
+            let some_val = value::enum_value(
+                cx.table,
+                cx.interns,
+                res_ty,
+                some_idx,
+                vec![(some_field, tmp.clone())],
+            )
+            .ok_or_else(|| {
+                decline(
+                    OpClass::Host,
+                    "missing `Some` value for `rcgjs.map.try_get`",
+                )
+            })?;
             jsast::seq(vec![
                 jsast::assign(tmp.clone(), get_call),
                 jsast::cond(
                     jsast::binary(BinOp::StrictEq, tmp, Expr::Undefined),
-                    none_obj,
-                    some_obj,
+                    none_val,
+                    some_val,
                 ),
             ])
         }

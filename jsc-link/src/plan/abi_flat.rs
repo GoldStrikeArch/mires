@@ -2207,7 +2207,11 @@ fn tagged_shape(table: &TypeTable, ty: TypeId) -> Option<TaggedShape> {
         || descriptor.js.unsized_tail.is_some()
         || !matches!(
             descriptor.js.enum_repr,
-            Some(EnumRepr::Tag { fieldless: false } | EnumRepr::State)
+            Some(
+                EnumRepr::Tag { fieldless: false }
+                    | EnumRepr::IntTag { fieldless: false }
+                    | EnumRepr::State
+            )
         )
     {
         return None;
@@ -2819,7 +2823,7 @@ fn is_mut_enum_ty(table: &TypeTable, ty: TypeId) -> bool {
                 variants,
                 ..
             },
-            Some(EnumRepr::Tag { fieldless: false })
+            Some(EnumRepr::Tag { fieldless: false } | EnumRepr::IntTag { fieldless: false })
         ) if (2..=4).contains(&variants.len())
     )
 }
@@ -2857,7 +2861,10 @@ fn mut_enum_shape(
         || descriptor.js.transparent.is_some()
         || descriptor.js.unsized_tail.is_some()
         || !table.is_indirect(ty)
-        || descriptor.js.enum_repr != Some(EnumRepr::Tag { fieldless: false })
+        || !matches!(
+            descriptor.js.enum_repr,
+            Some(EnumRepr::Tag { fieldless: false } | EnumRepr::IntTag { fieldless: false })
+        )
     {
         return None;
     }

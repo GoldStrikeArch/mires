@@ -316,15 +316,26 @@ fn names_the_local(place: &Place, body: &Body, table: &TypeTable) -> bool {
         return false;
     };
     let mut ty = local.ty;
+    let mut variant: Option<u32> = None;
     for projection in &place.projection {
         match projection {
-            Projection::Downcast { .. } => {}
-            Projection::OpaqueCast(next) | Projection::UnwrapUnsafeBinder(next) => ty = *next,
-            Projection::Field { ty: field_ty, .. } => {
-                if table.transparent_field(ty).is_none() && !table.is_zst(ty) {
+            Projection::Downcast { variant: v, .. } => variant = Some(*v),
+            Projection::OpaqueCast(next) | Projection::UnwrapUnsafeBinder(next) => {
+                ty = *next;
+                variant = None;
+            }
+            Projection::Field {
+                field,
+                ty: field_ty,
+            } => {
+                let transparent = table
+                    .field(ty, variant, *field)
+                    .is_some_and(|f| f.key == rcgjs_object::jir::types::FieldKey::Transparent);
+                if !transparent && table.transparent_field(ty).is_none() && !table.is_zst(ty) {
                     return false;
                 }
                 ty = *field_ty;
+                variant = None;
             }
             _ => return false,
         }
@@ -1842,8 +1853,32 @@ impl<'a> Builder<'a> {
                 "SetDiscriminant of a place that is not an enum",
             ));
         };
-        let object_form = matches!(repr, EnumRepr::Tag { fieldless: false } | EnumRepr::State)
-            && self.table.is_indirect(place.ty);
+        if let EnumRepr::NullNiche {
+            none_variant,
+            some_variant,
+        } = repr
+        {
+            if variant == some_variant {
+                // Writing `((opt as Some).0) = payload` already wrote the whole place.
+                return Ok(());
+            }
+            if variant == none_variant {
+                let tag = self.op(
+                    OpKind::Const(ConstTree::Variant {
+                        variant: none_variant,
+                        fields: Vec::new(),
+                    }),
+                    place.ty,
+                );
+                return self.write_place(place, tag);
+            }
+        }
+        let object_form = matches!(
+            repr,
+            EnumRepr::Tag { fieldless: false }
+                | EnumRepr::IntTag { fieldless: false }
+                | EnumRepr::State
+        ) && self.table.is_indirect(place.ty);
         if !object_form {
             // A primitive enum is its tag: the whole place is written.
             let tag = self.op(

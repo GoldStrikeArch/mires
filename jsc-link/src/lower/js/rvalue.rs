@@ -1860,23 +1860,45 @@ impl<'a> JsCx<'a> {
         variant: u32,
     ) -> Res<Vec<jsast::Stmt>> {
         let table = self.table;
-        let (Some(repr), Some(tag)) = (
-            table.enum_repr(table.peeled(ty)),
-            value::variant_tag(table, self.interns, ty, variant),
-        ) else {
+        let Some(repr) = table.enum_repr(table.peeled(ty)) else {
+            return Err(decline(
+                OpClass::Statement,
+                "SetDiscriminant of a type that is not an enum",
+            ));
+        };
+        if let EnumRepr::NullNiche {
+            none_variant,
+            some_variant,
+        } = repr
+        {
+            if variant == some_variant {
+                return Ok(Vec::new());
+            }
+            if variant == none_variant {
+                return self.write_place(place, ty, jsast::null());
+            }
+            return Err(decline(
+                OpClass::Statement,
+                "SetDiscriminant of an out-of-range NullNiche variant",
+            ));
+        }
+        let Some(tag) = value::variant_tag(table, self.interns, ty, variant) else {
             return Err(decline(
                 OpClass::Statement,
                 "SetDiscriminant of a type that is not an enum",
             ));
         };
         match repr {
-            EnumRepr::Tag { fieldless: false } | EnumRepr::State => Ok(vec![jsast::assign_stmt(
+            EnumRepr::Tag { fieldless: false }
+            | EnumRepr::IntTag { fieldless: false }
+            | EnumRepr::State => Ok(vec![jsast::assign_stmt(
                 jsast::member(self.read_place(&place), TAG),
                 tag,
             )]),
-            EnumRepr::Number { .. } | EnumRepr::Tag { fieldless: true } => {
-                self.write_place(place, ty, tag)
-            }
+            EnumRepr::Number { .. }
+            | EnumRepr::Tag { fieldless: true }
+            | EnumRepr::IntTag { fieldless: true } => self.write_place(place, ty, tag),
+            EnumRepr::NullNiche { .. } => unreachable!(),
         }
     }
 

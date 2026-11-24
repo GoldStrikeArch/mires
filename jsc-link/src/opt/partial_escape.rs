@@ -571,7 +571,11 @@ fn default_const_tree(table: &TypeTable, ty: TypeId) -> Option<ConstTree> {
             ..
         } if matches!(
             descriptor.js.enum_repr,
-            Some(EnumRepr::Number { .. } | EnumRepr::Tag { fieldless: true })
+            Some(
+                EnumRepr::Number { .. }
+                    | EnumRepr::Tag { fieldless: true }
+                    | EnumRepr::IntTag { fieldless: true }
+            )
         ) && !variants.is_empty() =>
         {
             let fields = variants
@@ -581,6 +585,25 @@ fn default_const_tree(table: &TypeTable, ty: TypeId) -> Option<ConstTree> {
                 .map(|field| default_const_tree(table, field.ty))
                 .collect::<Option<Vec<_>>>()?;
             Some(ConstTree::Variant { variant: 0, fields })
+        }
+        TypeKind::Adt {
+            form: NominalForm::Enum,
+            variants,
+            ..
+        } if matches!(descriptor.js.enum_repr, Some(EnumRepr::NullNiche { .. })) => {
+            let Some(EnumRepr::NullNiche { none_variant, .. }) = descriptor.js.enum_repr else {
+                unreachable!()
+            };
+            let fields = variants
+                .get(none_variant as usize)?
+                .fields
+                .iter()
+                .map(|field| default_const_tree(table, field.ty))
+                .collect::<Option<Vec<_>>>()?;
+            Some(ConstTree::Variant {
+                variant: none_variant,
+                fields,
+            })
         }
         _ => None,
     }

@@ -233,6 +233,16 @@ impl<'a> JsCx<'a> {
                     let field_ty = *field_ty;
                     if matches!(current, JsPlace::Unit(_)) {
                         // Still no storage, and still the same address.
+                    } else if table.is_zst(field_ty)
+                        && matches!(
+                            table.enum_repr(table.peeled(ty)),
+                            Some(
+                                rcgjs_object::jir::types::EnumRepr::IntTag { fieldless: true }
+                                    | rcgjs_object::jir::types::EnumRepr::NullNiche { .. }
+                            )
+                        )
+                    {
+                        current = JsPlace::Unit(jsast::undefined());
                     } else if matches!(key, FieldKey::Transparent) {
                         tail = carried_tail;
                         raw_tail = carried_raw_tail;

@@ -108,8 +108,10 @@ pub fn variant_shape(table: &TypeTable, ty: TypeId, variant: u32) -> Option<Vec<
             variants,
             ..
         } => {
-            if descriptor.js.enum_repr != Some(EnumRepr::Tag { fieldless: false })
-                || variants.iter().any(|v| v.fields.len() > MAX_FIELDS)
+            if !matches!(
+                descriptor.js.enum_repr,
+                Some(EnumRepr::Tag { fieldless: false } | EnumRepr::IntTag { fieldless: false })
+            ) || variants.iter().any(|v| v.fields.len() > MAX_FIELDS)
             {
                 return None;
             }
@@ -142,7 +144,10 @@ pub fn enum_shape(table: &TypeTable, ty: TypeId) -> Option<EnumShape> {
     if descriptor.js.transparent.is_some() || descriptor.js.unsized_tail.is_some() {
         return None;
     }
-    if descriptor.js.enum_repr != Some(EnumRepr::Tag { fieldless: false }) {
+    if !matches!(
+        descriptor.js.enum_repr,
+        Some(EnumRepr::Tag { fieldless: false } | EnumRepr::IntTag { fieldless: false })
+    ) {
         return None;
     }
     let TypeKind::Adt {

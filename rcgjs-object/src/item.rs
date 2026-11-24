@@ -685,6 +685,11 @@ impl LinkJir {
         self.linked_interns = Some(Arc::new(interns));
     }
 
+    /// Shares an already-built link-time interns table across multiple items from the same object.
+    pub fn use_shared_interns(&mut self, interns: Arc<Interns>) {
+        self.linked_interns = Some(interns);
+    }
+
     /// Inflates, decodes and verifies the body and origins. Returns whether a body was decoded:
     /// `Ok(false)` for an item that has none. Idempotent.
     pub fn decode(&mut self) -> Result<bool, String> {

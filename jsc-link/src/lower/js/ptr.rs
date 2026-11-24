@@ -320,7 +320,11 @@ impl<'a> JsCx<'a> {
                 form: NominalForm::Enum,
                 variants,
                 ..
-            } if table.enum_repr(peeled) == Some(EnumRepr::Tag { fieldless: false }) => {
+            } if matches!(
+                table.enum_repr(peeled),
+                Some(EnumRepr::Tag { fieldless: false } | EnumRepr::IntTag { fieldless: false })
+            ) =>
+            {
                 let mut keys: Vec<String> = vec![value::TAG.to_owned()];
                 for variant in variants {
                     for field in &variant.fields {

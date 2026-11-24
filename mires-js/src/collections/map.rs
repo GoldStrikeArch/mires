@@ -5,6 +5,12 @@ use core::marker::PhantomData;
 use super::key::MapKey;
 use super::raw::{self, RawMap};
 
+/// Non-transparent storage cell inside the host `Map` so `&MapEntry<V>` / `&mut MapEntry<V>`
+/// always stay indirect (`PointerForm::Thin`) even when `Option<V>` uses null-niche lowering.
+struct MapEntry<V> {
+    value: Option<V>,
+}
+
 /// A hash map that is a host `Map`.
 ///
 /// `repr(transparent)`, so the value the backend keeps in a local of this type is the `Map` object
@@ -50,19 +56,20 @@ impl<K: MapKey, V> HashMap<K, V> {
     /// Inserts a value, returning the one the key held before.
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let class = key.as_class();
-        if let Some(held) = unsafe { raw::map_try_get_mut::<K::Class, Option<V>>(self.raw, class) }
+        if let Some(held) =
+            unsafe { raw::map_try_get_mut::<K::Class, MapEntry<V>>(self.raw, class) }
         {
-            return held.replace(value);
+            return held.value.replace(value);
         }
-        raw::map_set(self.raw, class, Some(value));
+        raw::map_set(self.raw, class, MapEntry { value: Some(value) });
         None
     }
 
     /// The value a key holds.
     #[must_use]
     pub fn get(&self, key: &K::Class) -> Option<&V> {
-        let held: &Option<V> = unsafe { raw::map_try_get(self.raw, key) }?;
-        held.as_ref()
+        let held: &MapEntry<V> = unsafe { raw::map_try_get(self.raw, key) }?;
+        held.value.as_ref()
     }
 
     /// The value a key holds, to write through.
@@ -71,14 +78,14 @@ impl<K: MapKey, V> HashMap<K, V> {
     /// [`get`](HashMap::get) reads.
     #[must_use]
     pub fn get_mut(&mut self, key: &K::Class) -> Option<&mut V> {
-        let held: &mut Option<V> = unsafe { raw::map_try_get_mut(self.raw, key) }?;
-        held.as_mut()
+        let held: &mut MapEntry<V> = unsafe { raw::map_try_get_mut(self.raw, key) }?;
+        held.value.as_mut()
     }
 
     /// Removes a key, returning the value it held.
     pub fn remove(&mut self, key: &K::Class) -> Option<V> {
-        let held: &mut Option<V> = unsafe { raw::map_try_get_mut(self.raw, key) }?;
-        let taken = held.take();
+        let held: &mut MapEntry<V> = unsafe { raw::map_try_get_mut(self.raw, key) }?;
+        let taken = held.value.take();
         let _ = raw::map_del(self.raw, key);
         taken
     }
@@ -97,7 +104,7 @@ impl<K: MapKey, V> HashMap<K, V> {
     pub fn iter(&self) -> Iter<'_, K, V> {
         Iter {
             keys: raw::map_keys::<K::Snapshot>(self.raw),
-            vals: unsafe { raw::map_values::<Option<V>>(self.raw) },
+            vals: unsafe { raw::map_values::<MapEntry<V>>(self.raw) },
             index: 0,
             marker: PhantomData,
         }
@@ -125,7 +132,7 @@ impl<'a, K: MapKey, V> IntoIterator for &'a HashMap<K, V> {
 /// keyed map whatever the key type is written as.
 pub struct Iter<'a, K: MapKey, V> {
     keys: &'a [K::Snapshot],
-    vals: &'a [&'a Option<V>],
+    vals: &'a [&'a MapEntry<V>],
     index: usize,
     marker: PhantomData<&'a K>,
 }
@@ -137,7 +144,7 @@ impl<'a, K: MapKey, V> Iterator for Iter<'a, K, V> {
         while self.index < self.keys.len() {
             let i = self.index;
             self.index += 1;
-            if let Some(value) = self.vals[i].as_ref() {
+            if let Some(value) = self.vals[i].value.as_ref() {
                 return Some((K::class_of(&self.keys[i]), value));
             }
         }

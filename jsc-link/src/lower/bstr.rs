@@ -630,10 +630,11 @@ fn target_is_identity(
                     variants,
                     ..
                 } => match table.enum_repr(info.cur) {
-                    Some(EnumRepr::Number { .. }) | Some(EnumRepr::Tag { fieldless: true }) => {
-                        Ok(true)
-                    }
-                    Some(EnumRepr::Tag { fieldless: false }) => {
+                    Some(EnumRepr::Number { .. })
+                    | Some(EnumRepr::Tag { fieldless: true })
+                    | Some(EnumRepr::IntTag { fieldless: true }) => Ok(true),
+                    Some(EnumRepr::Tag { fieldless: false })
+                    | Some(EnumRepr::IntTag { fieldless: false }) => {
                         for variant in variants {
                             for f in &variant.fields {
                                 if !field_is_identity(table, interns, f.ty, mode, seen)? {
@@ -970,7 +971,10 @@ fn hash_target(
                     } => {
                         if !matches!(
                             table.enum_repr(info.cur),
-                            Some(EnumRepr::Tag { fieldless: false })
+                            Some(
+                                EnumRepr::Tag { fieldless: false }
+                                    | EnumRepr::IntTag { fieldless: false }
+                            )
                         ) {
                             return Err(
                                 "a `str` in an enum whose value is not a tagged object".to_owned()

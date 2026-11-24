@@ -3006,7 +3006,7 @@ fn uninit_shell(
         TypeKind::Adt {
             form: NominalForm::Enum | NominalForm::Union,
             ..
-        } => Some(jsast::object(Vec::new())),
+        } if desc.js.is_indirect => Some(jsast::object(Vec::new())),
         _ => None,
     }
 }

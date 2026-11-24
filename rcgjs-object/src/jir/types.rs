@@ -483,6 +483,18 @@ pub enum EnumRepr {
     /// the moment it is built, and it is only ever reached through a `&mut` (`Future::poll` takes
     /// `Pin<&mut Self>`), so a value with no identity to write through would be wrong.
     State,
+    /// Link-time specialized 2-variant null-niche representation (append-only, never serialized by
+    /// the backend): `none_variant` lowers directly to JS `null` and `some_variant` lowers
+    /// directly to its single non-ZST payload value whenever `null` is not a valid inhabitant of
+    /// that payload.
+    NullNiche {
+        none_variant: u32,
+        some_variant: u32,
+    },
+    /// Link-time specialized dense integer discriminant representation (append-only, never
+    /// serialized by the backend): variant `i` uses integer `i` (`0, 1, 2, ...`) directly when
+    /// `fieldless` is true or under `TAG` when `fieldless` is false.
+    IntTag { fieldless: bool },
 }
 
 /// The JavaScript shape of a reference or raw pointer, decided by its pointee (`ptr.rs`).
@@ -633,6 +645,11 @@ impl TypeTable {
         &self.descriptors
     }
 
+    /// Mutable access to descriptors for link-time representation specialization.
+    pub fn descriptors_mut(&mut self) -> &mut [TypeDescriptor] {
+        &mut self.descriptors
+    }
+
     pub fn ids(&self) -> impl Iterator<Item = TypeId> + '_ {
         self.descriptors.iter().map(|descriptor| descriptor.id)
     }
@@ -645,6 +662,12 @@ impl TypeTable {
         self.index
             .get(&id)
             .map(|position| &self.descriptors[*position as usize])
+    }
+
+    /// Mutable lookup by type id for link-time representation specialization.
+    pub fn get_mut(&mut self, id: TypeId) -> Option<&mut TypeDescriptor> {
+        let position = *self.index.get(&id)?;
+        Some(&mut self.descriptors[position as usize])
     }
 
     /// The descriptor of `id`, or a verify error naming `context`.
@@ -778,6 +801,16 @@ impl TypeTable {
                 } else {
                     0
                 };
+                if *form == NominalForm::Enum
+                    && matches!(
+                        descriptor.js.enum_repr,
+                        Some(EnumRepr::NullNiche { some_variant, .. }) if index == some_variant
+                    )
+                    && field == 0
+                {
+                    let ty = variants.get(index as usize)?.fields.first()?.ty;
+                    return transparent(ty);
+                }
                 variants
                     .get(index as usize)?
                     .fields
@@ -1007,7 +1040,11 @@ impl TypeTable {
         if descriptor.js.is_primitive_enum
             && !matches!(
                 descriptor.js.enum_repr,
-                Some(EnumRepr::Number { .. } | EnumRepr::Tag { fieldless: true })
+                Some(
+                    EnumRepr::Number { .. }
+                        | EnumRepr::Tag { fieldless: true }
+                        | EnumRepr::IntTag { fieldless: true }
+                )
             )
         {
             return Err(VerifyError::new(

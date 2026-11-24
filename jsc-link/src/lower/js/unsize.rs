@@ -581,11 +581,12 @@ impl JsCx<'_> {
             return Ok(None);
         }
         let bound = jsast::id(NICHE_PARAM);
-        let payload_bits = self.transmute(
-            field.ty,
-            to,
-            value::field_expr(self.interns, bound.clone(), field.key),
-        )?;
+        let payload_input = if matches!(repr, EnumRepr::NullNiche { .. }) {
+            bound.clone()
+        } else {
+            value::field_expr(self.interns, bound.clone(), field.key)
+        };
+        let payload_bits = self.transmute(field.ty, to, payload_input)?;
         let mut encoded = payload_bits;
         for (tag_lit, niche_lit) in niche_cases.into_iter().rev() {
             let is_variant = jsast::binary(

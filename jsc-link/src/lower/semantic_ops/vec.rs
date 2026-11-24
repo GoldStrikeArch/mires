@@ -496,15 +496,15 @@ pub(super) fn vec_pop(
     _helpers: &mut BTreeSet<&'static str>,
     _refs: &mut BTreeSet<JsName>,
 ) -> Result<Vec<Stmt>, SemanticDecline> {
-    let (none_tag, some_tag, some_field) = option_layout(cx)?;
+    let (none_idx, some_idx, some_field) = option_layout(cx)?;
+    let none_val =
+        crate::lower::js::value::enum_value(cx.table, cx.interns, cx.sig.result, none_idx, vec![])
+            .ok_or(SemanticDecline::WrongReturnType)?;
     let is_tv = vec_tv_kind(cx)?.is_some();
     let mut stmts = vec![
         jsast::if_(
             jsast::binary(BinOp::StrictEq, member("len"), jsast::num(0)),
-            vec![jsast::ret(jsast::object_of(vec![(
-                "TAG",
-                jsast::string(none_tag),
-            )]))],
+            vec![jsast::ret(none_val)],
         ),
         jsast::const_(
             "$nativeIdx",
@@ -513,14 +513,27 @@ pub(super) fn vec_pop(
         jsast::assign_stmt(member("len"), jsast::id("$nativeIdx")),
     ];
     if is_tv {
-        stmts.push(jsast::ret(jsast::object(vec![
-            ("TAG".to_owned(), jsast::string(some_tag)),
-            (
+        let some_val = crate::lower::js::value::enum_value(
+            cx.table,
+            cx.interns,
+            cx.sig.result,
+            some_idx,
+            vec![(
                 some_field,
                 jsast::index(member("buf"), jsast::id("$nativeIdx")),
-            ),
-        ])));
+            )],
+        )
+        .ok_or(SemanticDecline::WrongReturnType)?;
+        stmts.push(jsast::ret(some_val));
     } else {
+        let some_val = crate::lower::js::value::enum_value(
+            cx.table,
+            cx.interns,
+            cx.sig.result,
+            some_idx,
+            vec![(some_field, jsast::id("$nativeVal"))],
+        )
+        .ok_or(SemanticDecline::WrongReturnType)?;
         stmts.push(jsast::const_(
             "$nativeVal",
             jsast::index(member("buf"), jsast::id("$nativeIdx")),
@@ -529,10 +542,7 @@ pub(super) fn vec_pop(
             jsast::index(member("buf"), jsast::id("$nativeIdx")),
             jsast::undefined(),
         ));
-        stmts.push(jsast::ret(jsast::object(vec![
-            ("TAG".to_owned(), jsast::string(some_tag)),
-            (some_field, jsast::id("$nativeVal")),
-        ])));
+        stmts.push(jsast::ret(some_val));
     }
     Ok(stmts)
 }
@@ -1446,13 +1456,20 @@ fn range_shape(cx: &LowerCx<'_>) -> Result<RangeShape, SemanticDecline> {
     }
 }
 
-fn option_layout(cx: &LowerCx<'_>) -> Result<(String, String, String), SemanticDecline> {
+fn option_layout(cx: &LowerCx<'_>) -> Result<(u32, u32, String), SemanticDecline> {
     let element = vec_element(cx)?;
     if !element.layout.sized || element.layout.zst {
         return Err(SemanticDecline::ZeroSizedElement);
     }
     let result = type_get(cx.table, cx.sig.result)?;
-    if result.js.enum_repr != Some(EnumRepr::Tag { fieldless: false }) {
+    if !matches!(
+        result.js.enum_repr,
+        Some(
+            EnumRepr::Tag { fieldless: false }
+                | EnumRepr::IntTag { fieldless: false }
+                | EnumRepr::NullNiche { .. }
+        )
+    ) {
         return Err(SemanticDecline::WrongReturnType);
     }
     let TypeKind::Adt {
@@ -1466,14 +1483,11 @@ fn option_layout(cx: &LowerCx<'_>) -> Result<(String, String, String), SemanticD
     if variants.len() != 2 {
         return Err(SemanticDecline::WrongReturnType);
     }
-    let mut none_tag = None;
+    let mut none_idx = None;
     let mut some_info = None;
-    for variant in variants {
-        let Some(tag) = cx.interns.str(variant.name) else {
-            return Err(SemanticDecline::WrongReturnType);
-        };
+    for (index, variant) in variants.iter().enumerate() {
         match variant.fields.as_slice() {
-            [] if none_tag.is_none() => none_tag = Some(tag.to_owned()),
+            [] if none_idx.is_none() => none_idx = Some(index as u32),
             [field] if some_info.is_none() && field.ty == element.id => {
                 let FieldKey::Name(key_id) = field.key else {
                     return Err(SemanticDecline::WrongReturnType);
@@ -1481,15 +1495,15 @@ fn option_layout(cx: &LowerCx<'_>) -> Result<(String, String, String), SemanticD
                 let Some(field_name) = cx.interns.str(key_id) else {
                     return Err(SemanticDecline::WrongReturnType);
                 };
-                some_info = Some((tag.to_owned(), field_name.to_owned()));
+                some_info = Some((index as u32, field_name.to_owned()));
             }
             _ => return Err(SemanticDecline::WrongReturnType),
         }
     }
-    let (Some(none_tag), Some((some_tag, some_field))) = (none_tag, some_info) else {
+    let (Some(none_idx), Some((some_idx, some_field))) = (none_idx, some_info) else {
         return Err(SemanticDecline::WrongReturnType);
     };
-    Ok((none_tag, some_tag, some_field))
+    Ok((none_idx, some_idx, some_field))
 }
 
 /// The element type of the operation's canonical `Vec<T>` — the monomorphic type argument, never

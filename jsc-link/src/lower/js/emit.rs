@@ -429,6 +429,93 @@ impl Emitter<'_, '_> {
             Scrut::Payload(scrutinee) => self.cx.scrut_ty(scrutinee),
             Scrut::Tmp(tmp) => self.tmp_ty(*tmp),
         };
+        if let Some(enum_ty) = scrut_ty.tag_enum {
+            if let Some(EnumRepr::NullNiche {
+                none_variant,
+                some_variant,
+            }) = self.cx.table.enum_repr(self.cx.table.peeled(enum_ty))
+            {
+                let (value, _) = self.scrutinee(scrut)?;
+                let mut setup = Vec::new();
+                let variants = value::enum_variants(self.cx.table, enum_ty);
+                let (signed, bits) = self.cx.table.int_info(scrut_ty.ty).unwrap_or((false, 128));
+                let none_d = variants
+                    .get(none_variant as usize)
+                    .map(|v| resign(signed, bits, v.logical_discr as u128));
+                let some_d = variants
+                    .get(some_variant as usize)
+                    .map(|v| resign(signed, bits, v.logical_discr as u128));
+                let mut seen_none = false;
+                let mut seen_some = false;
+                let mut used_value = false;
+                let mut compiled_arms = Vec::with_capacity(arms.len());
+                let mut exhaustive_tail: Option<Vec<Stmt>> = None;
+                for (values, body) in arms {
+                    let mut has_none = false;
+                    let mut has_some = false;
+                    for v in values {
+                        let d = self.cx.case_value(scrut_ty.ty, v);
+                        if Some(d) == none_d {
+                            has_none = true;
+                        }
+                        if Some(d) == some_d {
+                            has_some = true;
+                        }
+                    }
+                    let eff_none = has_none && !seen_none;
+                    let eff_some = has_some && !seen_some;
+                    if !eff_none && !eff_some {
+                        continue;
+                    }
+                    let body = self.region(body)?;
+                    seen_none |= eff_none;
+                    seen_some |= eff_some;
+                    // `value === null` and `value !== null` partition every JS value, so once both
+                    // variants are covered this arm is unconditionally reached as the `else` tail
+                    // (eliminating redundant `else if (x !== null) ... else throw $ur()`).
+                    if seen_none && seen_some {
+                        exhaustive_tail = Some(body);
+                        break;
+                    }
+                    let op = if eff_none {
+                        BinOp::StrictEq
+                    } else {
+                        BinOp::StrictNe
+                    };
+                    used_value = true;
+                    compiled_arms.push((jsast::binary(op, value.clone(), jsast::null()), body));
+                }
+                if !used_value && !jsast::is_droppable(&value) {
+                    setup.push(jsast::expr_stmt(value));
+                }
+                let mut chain = match exhaustive_tail {
+                    Some(tail) => tail,
+                    None => self.region(default)?,
+                };
+                for (cond, body) in compiled_arms.into_iter().rev() {
+                    chain = if chain.is_empty() {
+                        vec![jsast::if_(cond, body)]
+                    } else {
+                        vec![jsast::if_else(cond, body, chain)]
+                    };
+                }
+                let (sw_label, needs_label) = match label {
+                    Some(label) => (label_name(label), true),
+                    None => {
+                        let id = self.next_switch_label;
+                        self.next_switch_label += 1;
+                        (format!("$sw{id}"), false)
+                    }
+                };
+                let rewrote = rewrite_unlabeled_breaks(&mut chain, &sw_label);
+                if needs_label || rewrote {
+                    setup.push(jsast::labeled(sw_label, Stmt::Block(chain)));
+                } else {
+                    setup.extend(chain);
+                }
+                return Ok(with_loc(loc, setup));
+            }
+        }
         let mut cases = Vec::with_capacity(arms.len() + 1);
         for (values, body) in arms {
             let body = self.region(body)?;
@@ -575,6 +662,55 @@ impl Emitter<'_, '_> {
     fn test(&self, value: Expr, scrut: ScrutTy, test: Test, negated: bool) -> Expr {
         let ty = scrut.ty;
         if let Some(enum_ty) = scrut.tag_enum {
+            if let Some(EnumRepr::NullNiche {
+                none_variant,
+                some_variant,
+            }) = self.cx.table.enum_repr(self.cx.table.peeled(enum_ty))
+            {
+                if !matches!(test, Test::IsTrue) {
+                    let variants = value::enum_variants(self.cx.table, enum_ty);
+                    let (signed, bits) = self.cx.table.int_info(ty).unwrap_or((false, 128));
+                    let none_d = variants
+                        .get(none_variant as usize)
+                        .map(|v| resign(signed, bits, v.logical_discr as u128));
+                    let some_d = variants
+                        .get(some_variant as usize)
+                        .map(|v| resign(signed, bits, v.logical_discr as u128));
+                    let bound = |v: u128| self.cx.case_value(ty, v);
+                    let matches_d = |d: Option<i128>| -> bool {
+                        let Some(d) = d else {
+                            return false;
+                        };
+                        match test {
+                            Test::Eq(v) => d == bound(v),
+                            Test::Lt(v) => d > bound(v),
+                            Test::Le(v) => d >= bound(v),
+                            Test::InRange { lo, len } => d >= bound(lo) && d <= bound(lo + len - 1),
+                            Test::IsTrue => false,
+                        }
+                    };
+                    let m_none = matches_d(none_d) ^ negated;
+                    let m_some = matches_d(some_d) ^ negated;
+                    return match (m_none, m_some) {
+                        (true, true) => {
+                            if jsast::is_droppable(&value) {
+                                jsast::boolean(true)
+                            } else {
+                                jsast::seq(vec![value, jsast::boolean(true)])
+                            }
+                        }
+                        (false, false) => {
+                            if jsast::is_droppable(&value) {
+                                jsast::boolean(false)
+                            } else {
+                                jsast::seq(vec![value, jsast::boolean(false)])
+                            }
+                        }
+                        (true, false) => jsast::binary(BinOp::StrictEq, value, jsast::null()),
+                        (false, true) => jsast::binary(BinOp::StrictNe, value, jsast::null()),
+                    };
+                }
+            }
             let bound = |v: u128| self.cx.case_value(ty, v);
             match test {
                 Test::Eq(_) | Test::IsTrue => {}
@@ -2214,6 +2350,14 @@ impl<'a> JsCx<'a> {
                     return self.carried_pair_field(pair, *base, *field);
                 }
                 let base_ty = self.ty_of(*base)?;
+                if table.is_zst(result_ty)
+                    && matches!(
+                        table.enum_repr(table.peeled(base_ty)),
+                        Some(EnumRepr::IntTag { fieldless: true } | EnumRepr::NullNiche { .. })
+                    )
+                {
+                    return Ok(jsast::undefined());
+                }
                 let Some(descriptor) = table.field(base_ty, *variant, *field) else {
                     return Err(decline(
                         OpClass::Place,
@@ -2391,6 +2535,19 @@ impl<'a> JsCx<'a> {
                         format!("field {field} of a type with no such field"),
                     ));
                 };
+                if table.is_zst(descriptor.ty)
+                    && matches!(
+                        table.enum_repr(table.peeled(base_ty)),
+                        Some(EnumRepr::IntTag { fieldless: true } | EnumRepr::NullNiche { .. })
+                    )
+                {
+                    let val = self.expr_of(*v)?;
+                    return Ok(if jsast::is_droppable(&val) {
+                        Vec::new()
+                    } else {
+                        vec![jsast::expr_stmt(val)]
+                    });
+                }
                 let value = self.expr_of(*v)?;
                 if table.is_zst(descriptor.ty) {
                     // Nothing to store; the value is a JS value with no effect to keep.

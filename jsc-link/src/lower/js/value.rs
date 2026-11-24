@@ -204,9 +204,16 @@ pub fn discriminant_literal(
 pub fn variant_tag(table: &TypeTable, interns: &Interns, ty: TypeId, variant: u32) -> Option<Expr> {
     let peeled = table.peeled(ty);
     Some(match table.enum_repr(peeled)? {
-        EnumRepr::State => jsast::num(variant as f64),
+        EnumRepr::State | EnumRepr::IntTag { .. } => jsast::num(variant as f64),
         EnumRepr::Number { .. } => discriminant_literal(table, peeled, variant, IntRepr::Number),
         EnumRepr::Tag { .. } => tag_literal(interns, table.variants(peeled).get(variant as usize)?),
+        EnumRepr::NullNiche { none_variant, .. } => {
+            if variant == none_variant {
+                jsast::null()
+            } else {
+                return None;
+            }
+        }
     })
 }
 
@@ -214,8 +221,13 @@ pub fn variant_tag(table: &TypeTable, interns: &Interns, ty: TypeId, variant: u3
 /// otherwise (`value.rs:406-411`).
 pub fn tag_expr(repr: EnumRepr, value: Expr) -> Expr {
     match repr {
-        EnumRepr::Number { .. } | EnumRepr::Tag { fieldless: true } => value,
-        EnumRepr::Tag { fieldless: false } | EnumRepr::State => jsast::member(value, TAG),
+        EnumRepr::Number { .. }
+        | EnumRepr::Tag { fieldless: true }
+        | EnumRepr::IntTag { fieldless: true }
+        | EnumRepr::NullNiche { .. } => value,
+        EnumRepr::Tag { fieldless: false }
+        | EnumRepr::IntTag { fieldless: false }
+        | EnumRepr::State => jsast::member(value, TAG),
     }
 }
 
@@ -474,17 +486,34 @@ pub fn discriminant_number(
     if repr == EnumRepr::State {
         return Some(tag_expr(repr, value));
     }
+    if let EnumRepr::NullNiche {
+        none_variant,
+        some_variant,
+    } = repr
+    {
+        return Some(jsast::cond(
+            jsast::binary(BinOp::StrictEq, value, jsast::null()),
+            discriminant_literal(table, peeled, none_variant, discr_repr),
+            discriminant_literal(table, peeled, some_variant, discr_repr),
+        ));
+    }
     let variants = table.variants(peeled);
     let tag = tag_expr(repr, value);
+    if matches!(repr, EnumRepr::IntTag { .. })
+        && discr_repr == IntRepr::Number
+        && variants
+            .iter()
+            .enumerate()
+            .all(|(i, v)| v.logical_discr == i as i128)
+    {
+        return Some(tag);
+    }
     let last = variants.len().checked_sub(1)?;
     let mut number = discriminant_literal(table, peeled, last as u32, discr_repr);
     for index in (0..last).rev() {
+        let vt = variant_tag(table, interns, peeled, index as u32)?;
         number = jsast::cond(
-            jsast::binary(
-                BinOp::StrictEq,
-                tag.clone(),
-                tag_literal(interns, &variants[index]),
-            ),
+            jsast::binary(BinOp::StrictEq, tag.clone(), vt),
             discriminant_literal(table, peeled, index as u32, discr_repr),
             number,
         );
@@ -503,10 +532,24 @@ pub fn enum_value(
 ) -> Option<Expr> {
     let peeled = table.peeled(ty);
     Some(match table.enum_repr(peeled)? {
-        EnumRepr::Number { .. } | EnumRepr::Tag { fieldless: true } => {
-            variant_tag(table, interns, peeled, variant)?
+        EnumRepr::NullNiche {
+            none_variant,
+            some_variant,
+        } => {
+            if variant == none_variant {
+                jsast::null()
+            } else if variant == some_variant {
+                fields.into_iter().next().map(|(_, v)| v)?
+            } else {
+                return None;
+            }
         }
-        EnumRepr::Tag { fieldless: false } | EnumRepr::State => {
+        EnumRepr::Number { .. }
+        | EnumRepr::Tag { fieldless: true }
+        | EnumRepr::IntTag { fieldless: true } => variant_tag(table, interns, peeled, variant)?,
+        EnumRepr::Tag { fieldless: false }
+        | EnumRepr::IntTag { fieldless: false }
+        | EnumRepr::State => {
             let mut entries = Vec::with_capacity(fields.len() + 1);
             entries.push((
                 TAG.to_string(),
@@ -723,7 +766,27 @@ pub fn clone_expr_with(
             form: NominalForm::Enum,
             variants,
             ..
-        } => clone_enum(table, interns, variants, value, nested_clone),
+        } => {
+            if let Some(EnumRepr::NullNiche { some_variant, .. }) = descriptor.js.enum_repr {
+                if let Some(payload_ty) = variants
+                    .get(some_variant as usize)
+                    .and_then(|v| v.fields.first())
+                    .map(|f| f.ty)
+                {
+                    if !table.needs_clone(payload_ty) {
+                        return value;
+                    }
+                    return clone_once(value, "$co", |v| {
+                        jsast::cond(
+                            jsast::binary(BinOp::StrictNe, v.clone(), jsast::null()),
+                            clone_expr_with(table, interns, payload_ty, v, nested_clone),
+                            jsast::null(),
+                        )
+                    });
+                }
+            }
+            clone_enum(table, interns, peeled, variants, value, nested_clone)
+        }
         TypeKind::Tuple(_) | TypeKind::Closure { .. } => jsast::array(
             descriptor
                 .js
@@ -774,6 +837,7 @@ pub const CLONE_PARAM: &str = "$e";
 fn clone_enum(
     table: &TypeTable,
     interns: &Interns,
+    ty: TypeId,
     variants: &[VariantDescriptor],
     value: Expr,
     nested_clone: crate::lower::NestedClone,
@@ -787,8 +851,10 @@ fn clone_enum(
     if !payload_needs_clone || variants.len() > MAX_CLONED_VARIANTS {
         return shallow_clone(value);
     }
-    let variant_copy = |variant: &VariantDescriptor| {
-        let mut entries = vec![(TAG.to_string(), tag_literal(interns, variant))];
+    let variant_copy = |index: usize, variant: &VariantDescriptor| {
+        let tag = variant_tag(table, interns, ty, index as u32)
+            .unwrap_or_else(|| tag_literal(interns, variant));
+        let mut entries = vec![(TAG.to_string(), tag.clone())];
         for field in &variant.fields {
             let key = key_name(interns, field.key).unwrap_or_default();
             let read = jsast::member(value.clone(), key.clone());
@@ -799,14 +865,14 @@ fn clone_enum(
             };
             entries.push((key, read));
         }
-        (tag_literal(interns, variant), jsast::object(entries))
+        (tag, jsast::object(entries))
     };
-    let Some(last) = variants.last() else {
+    let Some((last_idx, last)) = variants.iter().enumerate().next_back() else {
         return shallow_clone(value);
     };
-    let mut copy = variant_copy(last).1;
-    for variant in variants[..variants.len() - 1].iter().rev() {
-        let (tag, rebuilt) = variant_copy(variant);
+    let mut copy = variant_copy(last_idx, last).1;
+    for (index, variant) in variants[..variants.len() - 1].iter().enumerate().rev() {
+        let (tag, rebuilt) = variant_copy(index, variant);
         copy = jsast::cond(
             jsast::binary(BinOp::StrictEq, jsast::member(value.clone(), TAG), tag),
             rebuilt,
@@ -839,7 +905,7 @@ pub fn fresh_container(table: &TypeTable, ty: TypeId) -> Option<Expr> {
             ..
         } if matches!(
             table.enum_repr(table.peeled(ty)),
-            Some(EnumRepr::Tag { fieldless: false })
+            Some(EnumRepr::Tag { fieldless: false } | EnumRepr::IntTag { fieldless: false })
         ) =>
         {
             Some(jsast::object(Vec::new()))

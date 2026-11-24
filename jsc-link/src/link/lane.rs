@@ -658,9 +658,29 @@ fn run_with_opts(
     let original_names = offered(table, reachable, opts);
     let mut names = original_names.clone();
 
+    // Link-time whole-program enum specialization (`EnumRepr::NullNiche` and `EnumRepr::IntTag`)
+    // runs BEFORE Phase A `build_funcs` under `ReleaseSpeed` so SSA cell boxing, `SetDiscriminant`,
+    // `needs_clone`, `fresh_container`, and `PointerForm::Thin -> Slot` all observe one consistent
+    // `TypeTable`. Skipped completely under `Report` / `Off` / non-`ReleaseSpeed`.
+    let mut enum_excluded: BTreeSet<rcgjs_object::jir::semantic::TypeId> = BTreeSet::new();
+    let unspecialized_table = if opts.optimizer == crate::opts::OptimizerMode::On
+        && opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
+    {
+        Some(table.clone())
+    } else {
+        None
+    };
+    let mut enum_plan = crate::plan::enum_repr::specialize_table(
+        table,
+        reachable,
+        &original_names,
+        &enum_excluded,
+        opts,
+    );
+
     // Phase A, once: the plan is made over the same Funcs the first pass rewrites, and a retry
     // rebuilds them because the rewrite consumed them.
-    let pristine_funcs = {
+    let mut pristine_funcs = {
         let _scope = crate::profile::scope("lane.A.build_funcs");
         let ctx = Ctx {
             opts,
@@ -672,6 +692,41 @@ fn run_with_opts(
         };
         build_funcs(table, &original_names, &ctx)
     };
+    if !enum_plan.is_empty() {
+        let declined_a: Vec<JsName> = pristine_funcs
+            .iter()
+            .filter_map(|(n, res)| res.is_err().then_some(n.clone()))
+            .collect();
+        if !declined_a.is_empty() {
+            if let Some(raw_table) = &unspecialized_table {
+                let prev_len = enum_excluded.len();
+                crate::plan::enum_repr::collect_item_signature_types(
+                    raw_table,
+                    &declined_a,
+                    &mut enum_excluded,
+                );
+                if enum_excluded.len() > prev_len {
+                    *table = raw_table.clone();
+                    enum_plan = crate::plan::enum_repr::specialize_table(
+                        table,
+                        reachable,
+                        &original_names,
+                        &enum_excluded,
+                        opts,
+                    );
+                    let ctx = Ctx {
+                        opts,
+                        items: &items,
+                        drop_glue: &drop_glue,
+                        vtables: &vtables,
+                        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+                        heap: crate::analysis::heap::HeapPlan::default(),
+                    };
+                    pristine_funcs = build_funcs(table, &original_names, &ctx);
+                }
+            }
+        }
+    }
     let empty_native_bodies = BTreeMap::new();
     let mut byte_views = crate::analysis::byte_views::analyze_reachable(
         table,
@@ -984,6 +1039,7 @@ fn run_with_opts(
         None
     };
     let mut plan_retries = 0;
+    let mut enum_retries = 0u32;
     let mut ready_allowed = true;
     let mut physical = planned_physical;
     let (mut lowered, async_plan) = loop {
@@ -1027,8 +1083,36 @@ fn run_with_opts(
                 bigint_names.as_ref(),
             )
         });
-        if retry
-            && (!plan.is_empty() || !repr.touched.is_empty() || !physical.ready_futures.is_empty())
+        let enum_conflict_items: Vec<JsName> = if !enum_plan.is_empty() && enum_retries < 2 {
+            let declined_c: Vec<JsName> = lowered
+                .iter()
+                .filter_map(|(n, res, _, _)| res.is_err().then_some(n.clone()))
+                .collect();
+            if declined_c.is_empty() {
+                Vec::new()
+            } else if let Some(raw_table) = &unspecialized_table {
+                let mut sig_tys = BTreeSet::new();
+                crate::plan::enum_repr::collect_item_signature_types(
+                    raw_table,
+                    &declined_c,
+                    &mut sig_tys,
+                );
+                if sig_tys.iter().any(|t| enum_plan.decisions.contains_key(t)) {
+                    declined_c
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        if !enum_conflict_items.is_empty()
+            || (retry
+                && (!plan.is_empty()
+                    || !repr.touched.is_empty()
+                    || !physical.ready_futures.is_empty()))
         {
             let _scope = crate::profile::scope("lane.retry");
             ready_allowed = false;
@@ -1048,7 +1132,28 @@ fn run_with_opts(
                 live.remove(clone);
             }
             names.clone_from(&original_names);
-            *table = pristine_table.clone();
+            if !enum_conflict_items.is_empty() {
+                enum_retries += 1;
+                if let Some(raw_table) = &unspecialized_table {
+                    crate::plan::enum_repr::collect_item_signature_types(
+                        raw_table,
+                        &enum_conflict_items,
+                        &mut enum_excluded,
+                    );
+                    *table = raw_table.clone();
+                    enum_plan = crate::plan::enum_repr::specialize_table(
+                        table,
+                        reachable,
+                        &original_names,
+                        &enum_excluded,
+                        opts,
+                    );
+                } else {
+                    *table = pristine_table.clone();
+                }
+            } else {
+                *table = pristine_table.clone();
+            }
             funcs = build_funcs(table, &original_names, &ctx);
             // The O group re-runs on the pristine table and Funcs (both `run_o` and `post_o`,
             // matching a plan-less run), so the retried program is byte-identical to

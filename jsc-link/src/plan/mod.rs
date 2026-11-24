@@ -10,6 +10,7 @@ pub mod abi_flat;
 pub mod async_graph;
 pub(crate) mod async_ready;
 pub mod cost;
+pub mod enum_repr;
 pub mod graph;
 pub(crate) mod lowering_reuse;
 pub mod mincut;
