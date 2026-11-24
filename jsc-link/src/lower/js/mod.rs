@@ -27,6 +27,7 @@ pub mod host;
 pub mod i64_pair;
 pub mod intrinsics;
 pub mod place;
+pub mod post_opt;
 pub mod ptr;
 pub mod rvalue;
 pub mod template;

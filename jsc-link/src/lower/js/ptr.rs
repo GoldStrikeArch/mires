@@ -430,7 +430,8 @@ impl<'a> JsCx<'a> {
             return pointer;
         }
         let count_nonzero_const = matches!(count, Expr::Num(n) if n != 0.0);
-        let reads: &[&str] = if size == Some(1) {
+        let keep_scale = size == Some(1) && !self.byte_views.elide_scale_scalar;
+        let reads: &[&str] = if keep_scale {
             &[BUF, OFF, ptr::SCALE]
         } else {
             &[BUF, OFF]
@@ -442,13 +443,14 @@ impl<'a> JsCx<'a> {
             self.reread(count, &[])
         };
         let off = jsast::binary(BinOp::Add, ptr::slot_off(pointer.clone()), count.clone());
-        let slot = match size {
-            Some(1) => jsast::object_of(vec![
+        let slot = if keep_scale {
+            jsast::object_of(vec![
                 (BUF, ptr::slot_buf(pointer.clone())),
                 (OFF, off),
                 (ptr::SCALE, ptr::slot_scale(pointer.clone())),
-            ]),
-            _ => ptr::slot(ptr::slot_buf(pointer.clone()), off),
+            ])
+        } else {
+            ptr::slot(ptr::slot_buf(pointer.clone()), off)
         };
         let result = if count_nonzero_const {
             slot

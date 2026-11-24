@@ -582,6 +582,58 @@ fn finish(
     // can expose one last object literal that is only read field by field.
     let decl = rcgjs_object::sroa::analyze_jir(decl, input.opts.optimizer).decl;
     let mut decl = rcgjs_object::optimizer::analyze(decl, input.opts.optimizer).decl;
+    if input.opts.applies(OptimizerPass::AstDce) {
+        if let Stmt::FunctionDecl { params, body, .. } = &mut decl {
+            let mut local_names: HashSet<String> = params.iter().cloned().collect();
+            let mut uninit_locals: HashSet<String> = HashSet::new();
+            for stmt in body.iter() {
+                match stmt {
+                    Stmt::Let(n, init) => {
+                        local_names.insert(n.clone());
+                        if init.is_none() {
+                            uninit_locals.insert(n.clone());
+                        }
+                    }
+                    Stmt::Const(n, _) => {
+                        local_names.insert(n.clone());
+                    }
+                    Stmt::Lets(decls) => {
+                        for (n, init) in decls {
+                            local_names.insert(n.clone());
+                            if init.is_none() {
+                                uninit_locals.insert(n.clone());
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            fold_offset_slot_derefs(body, &uninit_locals);
+            eliminate_dead_local_writes(body, &local_names);
+            fold_sfp_deref_only(body, &uninit_locals);
+            eliminate_dead_local_writes(body, &local_names);
+        }
+        if input.opts.profile == Some(crate::opts::Profile::ReleaseSpeed) {
+            super::post_opt::run_speed_post_opts(&mut decl);
+            if let Stmt::FunctionDecl { params, body, .. } = &mut decl {
+                let mut local_names: HashSet<String> = params.iter().cloned().collect();
+                for stmt in body.iter() {
+                    match stmt {
+                        Stmt::Let(n, _) | Stmt::Const(n, _) => {
+                            local_names.insert(n.clone());
+                        }
+                        Stmt::Lets(decls) => {
+                            for (n, _) in decls {
+                                local_names.insert(n.clone());
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                eliminate_dead_local_writes(body, &local_names);
+            }
+        }
+    }
     // On the ES2018 target a BigInt constant is a call that parses its digits whenever it runs, so
     // a function's final lowering names a module-level binding instead (`lower/bigint.rs`). Last,
     // so the passes above see the constants the trials priced, and before the refs are taken, so
@@ -2084,6 +2136,8 @@ pub(super) fn fold_offset_slot_derefs(body: &mut Vec<Stmt>, locals: &HashSet<Str
     enum SimpleIdx {
         Ident(String),
         Num(f64),
+        RawNum(String),
+        Member(String, String),
     }
 
     impl SimpleIdx {
@@ -2091,55 +2145,107 @@ pub(super) fn fold_offset_slot_derefs(body: &mut Vec<Stmt>, locals: &HashSet<Str
             match self {
                 Self::Ident(s) => Expr::Ident(s.clone()),
                 Self::Num(n) => Expr::Num(*n),
+                Self::RawNum(s) => Expr::RawNum(s.clone()),
+                Self::Member(obj, prop) => jsast::member(Expr::Ident(obj.clone()), prop.clone()),
             }
         }
         fn eq_idx(&self, other: &Self) -> bool {
             match (self, other) {
                 (Self::Ident(a), Self::Ident(b)) => a == b,
                 (Self::Num(a), Self::Num(b)) => a.to_bits() == b.to_bits(),
+                (Self::RawNum(a), Self::RawNum(b)) => a == b,
+                (Self::Member(o1, p1), Self::Member(o2, p2)) => o1 == o2 && p1 == p2,
                 _ => false,
             }
         }
     }
 
+    #[derive(Clone, PartialEq, Eq)]
+    enum BaseRef {
+        Ident(String),
+        Member(String, String),
+    }
+
+    impl BaseRef {
+        fn to_expr(&self) -> Expr {
+            match self {
+                Self::Ident(s) => Expr::Ident(s.clone()),
+                Self::Member(obj, prop) => jsast::member(Expr::Ident(obj.clone()), prop.clone()),
+            }
+        }
+
+        fn root_ident(&self) -> &str {
+            match self {
+                Self::Ident(s) | Self::Member(s, _) => s.as_str(),
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    enum SlotDep {
+        Ident(String),
+        /// Member chain `obj.prop` (sensitive to `obj = ...`, `obj.prop = ...`, `obj.prop.{buf,off} = ...`,
+        /// but NOT to sibling writes like `obj.pos = ...` or `obj.end = ...`).
+        Member(String, String),
+    }
+
     #[derive(Clone)]
     enum SlotDef {
-        Offset { base: String, idx: SimpleIdx },
-        Direct { buf: String, off: SimpleIdx },
+        Offset {
+            base: BaseRef,
+            op: jsast::BinOp,
+            idx: SimpleIdx,
+        },
+        Direct {
+            buf: BaseRef,
+            off: SimpleIdx,
+        },
     }
 
     impl SlotDef {
         fn replacement(&self) -> Expr {
             match self {
-                Self::Offset { base, idx } => jsast::index(
-                    jsast::member(Expr::Ident(base.clone()), "buf"),
-                    jsast::binary(
-                        jsast::BinOp::Add,
-                        jsast::member(Expr::Ident(base.clone()), "off"),
-                        idx.to_expr(),
-                    ),
+                Self::Offset { base, op, idx } => jsast::index(
+                    jsast::member(base.to_expr(), "buf"),
+                    jsast::binary(*op, jsast::member(base.to_expr(), "off"), idx.to_expr()),
                 ),
-                Self::Direct { buf, off } => jsast::index(Expr::Ident(buf.clone()), off.to_expr()),
+                Self::Direct { buf, off } => jsast::index(buf.to_expr(), off.to_expr()),
             }
         }
 
-        fn deps(&self) -> Vec<&str> {
+        fn deps(&self) -> Vec<SlotDep> {
             let mut out = Vec::with_capacity(2);
+            let push_base = |out: &mut Vec<SlotDep>, b: &BaseRef| match b {
+                BaseRef::Ident(s) => out.push(SlotDep::Ident(s.clone())),
+                BaseRef::Member(o, p) => out.push(SlotDep::Member(o.clone(), p.clone())),
+            };
+            let push_idx = |out: &mut Vec<SlotDep>, idx: &SimpleIdx| match idx {
+                SimpleIdx::Ident(i) => out.push(SlotDep::Ident(i.clone())),
+                SimpleIdx::Member(o, p) => out.push(SlotDep::Member(o.clone(), p.clone())),
+                SimpleIdx::Num(_) | SimpleIdx::RawNum(_) => {}
+            };
             match self {
-                Self::Offset { base, idx } => {
-                    out.push(base.as_str());
-                    if let SimpleIdx::Ident(i) = idx {
-                        out.push(i.as_str());
-                    }
+                Self::Offset { base, idx, .. } => {
+                    push_base(&mut out, base);
+                    push_idx(&mut out, idx);
                 }
                 Self::Direct { buf, off } => {
-                    out.push(buf.as_str());
-                    if let SimpleIdx::Ident(i) = off {
-                        out.push(i.as_str());
-                    }
+                    push_base(&mut out, buf);
+                    push_idx(&mut out, off);
                 }
             }
             out
+        }
+
+        fn mentions_ident(&self, target: &str) -> bool {
+            let idx_mentions = |idx: &SimpleIdx| match idx {
+                SimpleIdx::Ident(s) | SimpleIdx::Member(s, _) => s == target,
+                _ => false,
+            };
+            match self {
+                Self::Offset { base, idx, .. } => base.root_ident() == target || idx_mentions(idx),
+                Self::Direct { buf, off } => buf.root_ident() == target || idx_mentions(off),
+            }
         }
 
         fn is_offset(&self) -> bool {
@@ -2147,10 +2253,26 @@ pub(super) fn fold_offset_slot_derefs(body: &mut Vec<Stmt>, locals: &HashSet<Str
         }
     }
 
+    fn match_base_ref(expr: &Expr) -> Option<BaseRef> {
+        match expr {
+            Expr::Ident(s) => Some(BaseRef::Ident(s.clone())),
+            Expr::Member(obj, prop) => match obj.as_ref() {
+                Expr::Ident(s) => Some(BaseRef::Member(s.clone(), prop.clone())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn match_simple_idx(expr: &Expr) -> Option<SimpleIdx> {
         match expr {
             Expr::Ident(s) => Some(SimpleIdx::Ident(s.clone())),
             Expr::Num(n) => Some(SimpleIdx::Num(*n)),
+            Expr::RawNum(s) => Some(SimpleIdx::RawNum(s.clone())),
+            Expr::Member(obj, prop) => match obj.as_ref() {
+                Expr::Ident(s) => Some(SimpleIdx::Member(s.clone(), prop.clone())),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -2173,7 +2295,7 @@ pub(super) fn fold_offset_slot_derefs(body: &mut Vec<Stmt>, locals: &HashSet<Str
         }
     }
 
-    fn match_offset_obj(expr: &Expr) -> Option<(String, SimpleIdx)> {
+    fn match_offset_obj(expr: &Expr) -> Option<(BaseRef, jsast::BinOp, SimpleIdx)> {
         let Expr::Object(entries) = expr else {
             return None;
         };
@@ -2183,57 +2305,61 @@ pub(super) fn fold_offset_slot_derefs(body: &mut Vec<Stmt>, locals: &HashSet<Str
         let Expr::Member(b1, bp) = &entries[0].1 else {
             return None;
         };
-        let Expr::Ident(base1) = b1.as_ref() else {
-            return None;
-        };
         if bp != "buf" {
             return None;
         }
-        let Expr::Binary(jsast::BinOp::Add, lhs, rhs) = &entries[1].1 else {
+        let base1 = match_base_ref(b1)?;
+        let Expr::Binary(op @ (jsast::BinOp::Add | jsast::BinOp::Sub), lhs, rhs) = &entries[1].1
+        else {
             return None;
         };
-        let Expr::Member(b2, op) = lhs.as_ref() else {
+        let Expr::Member(b2, op_prop) = lhs.as_ref() else {
             return None;
         };
-        let Expr::Ident(base2) = b2.as_ref() else {
+        if op_prop != "off" {
             return None;
-        };
-        if op != "off" || base1 != base2 {
+        }
+        let base2 = match_base_ref(b2)?;
+        if base1 != base2 {
             return None;
         }
         let idx = match_simple_idx(rhs)?;
-        Some((base1.clone(), idx))
+        Some((base1, *op, idx))
     }
 
     fn match_slot_def(target: &str, rhs: &Expr) -> Option<SlotDef> {
-        // Case 1: `idx === 0 ? base : { buf: base.buf, off: base.off + idx }`
+        // Case 1: `idx === 0 ? base : { buf: base.buf, off: base.off +/- idx }`
         if let Expr::Cond(cond, then_e, else_e) = rhs {
             if let (
                 Expr::Binary(jsast::BinOp::StrictEq, c_lhs, c_rhs),
-                Expr::Ident(then_base),
-                Some((else_base, else_idx)),
-            ) = (cond.as_ref(), then_e.as_ref(), match_offset_obj(else_e))
-            {
+                Some(then_base),
+                Some((else_base, op, else_idx)),
+            ) = (
+                cond.as_ref(),
+                match_base_ref(then_e),
+                match_offset_obj(else_e),
+            ) {
                 let c_zero = matches!(c_rhs.as_ref(), Expr::Num(n) if *n == 0.0);
                 if c_zero
-                    && then_base == &else_base
+                    && then_base == else_base
                     && match_simple_idx(c_lhs).is_some_and(|ci| ci.eq_idx(&else_idx))
                 {
                     let def = SlotDef::Offset {
                         base: else_base,
+                        op,
                         idx: else_idx,
                     };
-                    if !def.deps().contains(&target) {
+                    if !def.mentions_ident(target) {
                         return Some(def);
                     }
                 }
             }
             return None;
         }
-        // Case 2: `{ buf: base.buf, off: base.off + idx }`
-        if let Some((base, idx)) = match_offset_obj(rhs) {
-            let def = SlotDef::Offset { base, idx };
-            if !def.deps().contains(&target) {
+        // Case 2: `{ buf: base.buf, off: base.off +/- idx }`
+        if let Some((base, op, idx)) = match_offset_obj(rhs) {
+            let def = SlotDef::Offset { base, op, idx };
+            if !def.mentions_ident(target) {
                 return Some(def);
             }
             return None;
@@ -2241,14 +2367,12 @@ pub(super) fn fold_offset_slot_derefs(body: &mut Vec<Stmt>, locals: &HashSet<Str
         // Case 3: `{ buf: arr, off: k }`
         if let Expr::Object(entries) = rhs {
             if entries.len() == 2 && entries[0].0 == "buf" && entries[1].0 == "off" {
-                if let (Expr::Ident(buf), Some(off)) =
-                    (&entries[0].1, match_simple_idx(&entries[1].1))
-                {
-                    let def = SlotDef::Direct {
-                        buf: buf.clone(),
-                        off,
-                    };
-                    if !def.deps().contains(&target) {
+                if let (Some(buf), Some(off)) = (
+                    match_base_ref(&entries[0].1),
+                    match_simple_idx(&entries[1].1),
+                ) {
+                    let def = SlotDef::Direct { buf, off };
+                    if !def.mentions_ident(target) {
                         return Some(def);
                     }
                 }
@@ -2507,21 +2631,51 @@ pub(super) fn fold_offset_slot_derefs(body: &mut Vec<Stmt>, locals: &HashSet<Str
         }
     }
 
-    fn expr_mutates_deps_or_calls(expr: &Expr, deps: &[&str], forbid_calls: bool) -> bool {
+    fn dep_matches_ident(deps: &[SlotDep], name: &str) -> bool {
+        deps.iter().any(|d| match d {
+            SlotDep::Ident(s) | SlotDep::Member(s, _) => s == name,
+        })
+    }
+
+    fn lhs_writes_dep(lhs: &Expr, deps: &[SlotDep]) -> bool {
+        match lhs {
+            Expr::Ident(n) => dep_matches_ident(deps, n),
+            Expr::Member(obj, prop) => match obj.as_ref() {
+                Expr::Ident(n) => deps.iter().any(|d| match d {
+                    SlotDep::Ident(s) => s == n && (prop == "buf" || prop == "off"),
+                    SlotDep::Member(s, p) => s == n && p == prop,
+                }),
+                Expr::Member(inner, inner_prop) if prop == "buf" || prop == "off" => {
+                    matches!(inner.as_ref(), Expr::Ident(n) if deps.iter().any(|d| matches!(d, SlotDep::Member(s, p) if s == n && p == inner_prop)))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn expr_mutates_deps_or_calls(expr: &Expr, deps: &[SlotDep], forbid_calls: bool) -> bool {
         match expr {
             Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
-                let writes_dep = match lhs.as_ref() {
-                    Expr::Ident(n) => deps.contains(&n.as_str()),
-                    Expr::Member(obj, prop) if prop == "buf" || prop == "off" => {
-                        matches!(obj.as_ref(), Expr::Ident(n) if deps.contains(&n.as_str()))
-                    }
-                    _ => false,
-                };
-                writes_dep
+                lhs_writes_dep(lhs, deps)
                     || expr_mutates_deps_or_calls(lhs, deps, forbid_calls)
                     || expr_mutates_deps_or_calls(rhs, deps, forbid_calls)
             }
-            Expr::Call(c, args) | Expr::New(c, args) => {
+            Expr::Call(c, args) => {
+                let is_cold_panic =
+                    matches!(c.as_ref(), Expr::Ident(n) if n.starts_with("core$panicking$"));
+                if is_cold_panic {
+                    return args
+                        .iter()
+                        .any(|a| expr_mutates_deps_or_calls(a, deps, false));
+                }
+                forbid_calls
+                    || expr_mutates_deps_or_calls(c, deps, forbid_calls)
+                    || args
+                        .iter()
+                        .any(|a| expr_mutates_deps_or_calls(a, deps, forbid_calls))
+            }
+            Expr::New(c, args) => {
                 forbid_calls
                     || expr_mutates_deps_or_calls(c, deps, forbid_calls)
                     || args
@@ -2553,19 +2707,19 @@ pub(super) fn fold_offset_slot_derefs(body: &mut Vec<Stmt>, locals: &HashSet<Str
         }
     }
 
-    fn stmt_mutates_deps_or_calls(stmt: &Stmt, deps: &[&str], forbid_calls: bool) -> bool {
+    fn stmt_mutates_deps_or_calls(stmt: &Stmt, deps: &[SlotDep], forbid_calls: bool) -> bool {
         match stmt {
             Stmt::Let(n, init) => {
-                deps.contains(&n.as_str())
+                dep_matches_ident(deps, n)
                     || init
                         .as_ref()
                         .is_some_and(|e| expr_mutates_deps_or_calls(e, deps, forbid_calls))
             }
             Stmt::Const(n, e) => {
-                deps.contains(&n.as_str()) || expr_mutates_deps_or_calls(e, deps, forbid_calls)
+                dep_matches_ident(deps, n) || expr_mutates_deps_or_calls(e, deps, forbid_calls)
             }
             Stmt::Lets(decls) => decls.iter().any(|(n, init)| {
-                deps.contains(&n.as_str())
+                dep_matches_ident(deps, n)
                     || init
                         .as_ref()
                         .is_some_and(|e| expr_mutates_deps_or_calls(e, deps, forbid_calls))

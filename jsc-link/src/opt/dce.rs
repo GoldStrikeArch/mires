@@ -753,6 +753,24 @@ fn elide_redundant_copies(func: &mut Func, table: &TypeTable) -> bool {
                         fresh_owned[res.0 as usize] = true;
                     }
                 }
+                OpKind::Cast {
+                    kind: CastKind::Transmute,
+                    v: v1,
+                    ..
+                } => {
+                    if total_uses.get(v1.0 as usize).copied() == Some(1)
+                        && def_in_block.get(v1.0 as usize).copied().flatten() == Some(b_idx)
+                        && fresh_owned.get(v1.0 as usize).copied().unwrap_or(false)
+                    {
+                        fresh_owned[res.0 as usize] = true;
+                    }
+                }
+                OpKind::Repeat { v: elem, .. } => {
+                    let elem_ty = func.values[elem.0 as usize].ty;
+                    if !table.needs_clone(elem_ty) || table.is_zst(elem_ty) {
+                        fresh_owned[res.0 as usize] = true;
+                    }
+                }
                 OpKind::Aggregate {
                     active_field: None,
                     fields,
@@ -773,6 +791,81 @@ fn elide_redundant_copies(func: &mut Func, table: &TypeTable) -> bool {
                     }
                 }
                 _ => {}
+            }
+        }
+    }
+
+    // Second pass: read-only non-mutated same-block `Copy(src)` forwarding.
+    // When `res = Copy(src)` is only ever inspected inside the same block by `Discriminant(res)`
+    // and scalar/non-clone `Field(res)` reads before any `Effect` op can mutate `src` (and before
+    // `src` is moved), forward those reads directly to `src` so DCE deletes the redundant clone
+    // (`Object.assign({}, opt)`) without moving `src`.
+    for block in &mut func.blocks {
+        let len = block.ops.len();
+        for i in 0..len {
+            let (res, src) = match (block.ops[i].result, &block.ops[i].kind) {
+                (Some(res), OpKind::Copy(src)) => (res, *src),
+                _ => continue,
+            };
+            let res_def = func.values[res.0 as usize];
+            let src_def = func.values[src.0 as usize];
+            if res_def.carrier != Carrier::Baseline
+                || src_def.carrier != Carrier::Baseline
+                || res_def.ty != src_def.ty
+                || !table.needs_clone(res_def.ty)
+            {
+                continue;
+            }
+            let expected_uses = total_uses.get(res.0 as usize).copied().unwrap_or(0);
+            if expected_uses == 0 {
+                continue;
+            }
+            let mut local_safe_uses = 0usize;
+            let mut last_use_idx = i;
+            let mut unsafe_found = false;
+            for (offset, op) in block.ops[i + 1..].iter().enumerate() {
+                let uses_res = op.kind.uses().contains(&res);
+                if uses_res {
+                    let safe_read = match &op.kind {
+                        OpKind::Discriminant(v) if *v == res => true,
+                        OpKind::Field { base, .. } if *base == res => op
+                            .result
+                            .is_some_and(|r| !table.needs_clone(func.values[r.0 as usize].ty)),
+                        _ => false,
+                    };
+                    if !safe_read {
+                        unsafe_found = true;
+                        break;
+                    }
+                    local_safe_uses += 1;
+                    last_use_idx = i + 1 + offset;
+                    if local_safe_uses == expected_uses {
+                        break;
+                    }
+                }
+                if matches!(op.kind, OpKind::Move(v) if v == src) {
+                    unsafe_found = true;
+                    break;
+                }
+                if matches!(op_purity(&op.kind), Purity::Effect)
+                    && !matches!(op.kind, OpKind::Assert { .. })
+                {
+                    unsafe_found = true;
+                    break;
+                }
+            }
+            if !unsafe_found && local_safe_uses == expected_uses {
+                for op in &mut block.ops[i + 1..=last_use_idx] {
+                    match &mut op.kind {
+                        OpKind::Discriminant(v) if *v == res => *v = src,
+                        OpKind::Field { base, .. } if *base == res => *base = src,
+                        _ => {}
+                    }
+                }
+                total_uses[res.0 as usize] = 0;
+                total_uses[src.0 as usize] =
+                    total_uses[src.0 as usize].saturating_add(local_safe_uses);
+                changed = true;
             }
         }
     }

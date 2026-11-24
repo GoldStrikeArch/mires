@@ -525,6 +525,14 @@ impl AbiPlan {
             .any(|sig| sig.params.iter().flatten().any(|p| p.slice))
     }
 
+    /// Whether any flattened signature in this plan passes or returns a 64-bit integer as `(lo, hi)`.
+    pub(crate) fn has_i64_pair_abi(&self) -> bool {
+        self.flat.values().any(|sig| {
+            sig.params.iter().flatten().any(|p| p.i64_pair)
+                || sig.result.as_ref().is_some_and(|r| r.i64_pair)
+        })
+    }
+
     /// The plan a retry falls back to: no callee flattened, nothing touched, but the refusals
     /// still recorded, so the sidecar says what was considered even on a run that kept none of it.
     pub fn emptied(&self) -> AbiPlan {
@@ -1455,13 +1463,19 @@ pub fn plan_excluding(
     // proof that scalar lanes cross a boundary. This first tagged tranche ends at a leaf scalar
     // consumer; tag-to-tag and closure-taking transforms keep the canonical object until the
     // exact compiler-link artifact cost model can prove otherwise.
+    let speed_profile = matches!(opts.profile, Some(crate::opts::Profile::ReleaseSpeed));
     let tagged = tagged_chain_members(&candidates);
     for (item, candidate) in &mut candidates {
+        // Under ReleaseSpeed, also keep isolated `TaggedShape` result producers whose callers
+        // already destructure the result without escaping (`result_forwards.is_empty()`), saving
+        // one heap enum allocation per call (e.g. `Option<usize>` / `Option<&T>` / `Option<Circle>`).
+        let keep_speed_isolated_result = speed_profile && candidate.result_forwards.is_empty();
         if candidate
             .result
             .as_ref()
             .is_some_and(|result| result.tagged.is_some())
             && !tagged.results.contains(item)
+            && !keep_speed_isolated_result
         {
             candidate.result = None;
             candidate.result_forwards.clear();

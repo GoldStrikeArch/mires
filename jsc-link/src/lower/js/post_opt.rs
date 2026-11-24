@@ -1,0 +1,1842 @@
+//! Post-lowering JavaScript AST speed optimizations (`ReleaseSpeed`).
+//!
+//! Runs after `rcgjs_object::sroa::analyze_jir` and `rcgjs_object::optimizer::analyze` inside
+//! [`super::function::finish`] so passes see SROA-exposed patterns (`[1][0]`, single-assign
+//! literal temps like `k = "Some"` / `E = "children"` / `ah = 14`, `Reflect.get(a, "children")`,
+//! and adjacent `$__mires_i64_div` rem+div pairs).
+
+use std::collections::{HashMap, HashSet};
+
+use rcgjs_object::jsast::{self, ArrowBody, BinOp, Expr, Stmt, UnOp};
+
+use super::i64_pair;
+
+/// Entry point called from `function::finish` on a lowered `Stmt::FunctionDecl`.
+pub(super) fn run_speed_post_opts(decl: &mut Stmt) {
+    let Stmt::FunctionDecl { params, body, .. } = decl else {
+        return;
+    };
+    let mut local_names: HashSet<String> = params.iter().cloned().collect();
+    let mut uninit_locals: HashSet<String> = HashSet::new();
+    collect_top_locals(body, &mut local_names, &mut uninit_locals);
+
+    // 1. Fold constant expressions, constant array indexing (`[1][0]`), single-assign literal
+    //    propagation (`ah = 14`, `E = "children"`, `k = "Some"`), and constant switches.
+    fold_constants_and_switches(body, &uninit_locals);
+
+    // 2. Spec-identical `Reflect.get(o, k)` fast-path + dominated object-guard CSE.
+    let mut extra_decls: Vec<(String, Option<Expr>)> = Vec::new();
+    if !local_names.contains("Reflect") {
+        optimize_reflect_get(body);
+    }
+
+    // 3. Fuse adjacent `$__mires_i64_div(..., rem) + $__mires_i64_div(..., div)` pairs on
+    //    identical unchanged operands into a single `$__mires_i64_divrem` call.
+    fuse_i64_div_rem(body, &mut local_names, &mut extra_decls);
+
+    if !extra_decls.is_empty() {
+        prepend_decls(body, extra_decls);
+    }
+}
+
+fn collect_top_locals(
+    body: &[Stmt],
+    local_names: &mut HashSet<String>,
+    uninit_locals: &mut HashSet<String>,
+) {
+    for stmt in body {
+        match stmt {
+            Stmt::Let(n, init) => {
+                local_names.insert(n.clone());
+                if init.is_none() {
+                    uninit_locals.insert(n.clone());
+                }
+            }
+            Stmt::Const(n, _) => {
+                local_names.insert(n.clone());
+            }
+            Stmt::Lets(decls) => {
+                for (n, init) in decls {
+                    local_names.insert(n.clone());
+                    if init.is_none() {
+                        uninit_locals.insert(n.clone());
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
+fn prepend_decls(body: &mut Vec<Stmt>, extra: Vec<(String, Option<Expr>)>) {
+    if let Some(Stmt::Lets(existing)) = body.first_mut() {
+        existing.extend(extra);
+    } else {
+        body.insert(0, jsast::lets(extra));
+    }
+}
+
+fn alloc_fresh_local(
+    local_names: &mut HashSet<String>,
+    extra_decls: &mut Vec<(String, Option<Expr>)>,
+    prefix: &str,
+) -> String {
+    let mut n = 0usize;
+    loop {
+        let name = format!("{prefix}{n}");
+        if local_names.insert(name.clone()) {
+            extra_decls.push((name.clone(), None));
+            return name;
+        }
+        n += 1;
+    }
+}
+
+// =============================================================================================
+// 1. Constant folding, single-assign literal propagation, and constant switch simplification
+// =============================================================================================
+
+#[derive(Clone, Debug, PartialEq)]
+enum SimpleLit {
+    Num(f64),
+    Str(String),
+    Bool(bool),
+    Null,
+    Undefined,
+}
+
+impl SimpleLit {
+    fn from_expr(expr: &Expr) -> Option<Self> {
+        match expr {
+            Expr::Num(n) if n.is_finite() => Some(Self::Num(*n)),
+            Expr::Unary(UnOp::Neg, inner) => match inner.as_ref() {
+                Expr::Num(n) if n.is_finite() => Some(Self::Num(-*n)),
+                _ => None,
+            },
+            Expr::Str(s) if s.len() <= 32 => Some(Self::Str(s.clone())),
+            Expr::Bool(b) => Some(Self::Bool(*b)),
+            Expr::Null => Some(Self::Null),
+            Expr::Undefined => Some(Self::Undefined),
+            _ => None,
+        }
+    }
+
+    fn to_expr(&self) -> Expr {
+        match self {
+            Self::Num(n) => {
+                if *n < 0.0 {
+                    Expr::Unary(UnOp::Neg, Box::new(Expr::Num(-*n)))
+                } else {
+                    Expr::Num(*n)
+                }
+            }
+            Self::Str(s) => Expr::Str(s.clone()),
+            Self::Bool(b) => Expr::Bool(*b),
+            Self::Null => Expr::Null,
+            Self::Undefined => Expr::Undefined,
+        }
+    }
+
+    fn strict_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Num(a), Self::Num(b)) => *a == *b,
+            (Self::Str(a), Self::Str(b)) => a == b,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Null, Self::Null) => true,
+            (Self::Undefined, Self::Undefined) => true,
+            _ => false,
+        }
+    }
+}
+
+fn exact_i32(expr: &Expr) -> Option<i32> {
+    let n = match expr {
+        Expr::Num(n) => *n,
+        Expr::Unary(UnOp::Neg, inner) => match inner.as_ref() {
+            Expr::Num(n) => -*n,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if n.is_finite() && n.fract() == 0.0 && (-2147483648.0..=2147483647.0).contains(&n) {
+        Some(n as i32)
+    } else {
+        None
+    }
+}
+
+fn exact_u32(expr: &Expr) -> Option<u32> {
+    let n = match expr {
+        Expr::Num(n) => *n,
+        _ => return None,
+    };
+    if n.is_finite() && n.fract() == 0.0 && (0.0..=4294967295.0).contains(&n) {
+        Some(n as u32)
+    } else {
+        None
+    }
+}
+
+fn to_i32_bits(expr: &Expr) -> Option<i32> {
+    exact_i32(expr).or_else(|| exact_u32(expr).map(|u| u as i32))
+}
+
+fn num_expr_i32(v: i32) -> Expr {
+    if v < 0 {
+        Expr::Unary(UnOp::Neg, Box::new(Expr::Num(-(v as f64))))
+    } else {
+        Expr::Num(v as f64)
+    }
+}
+
+fn fold_expr(expr: &mut Expr) -> bool {
+    let mut changed = false;
+    match expr {
+        Expr::Member(obj, _) => changed |= fold_expr(obj),
+        Expr::Index(obj, idx) => {
+            changed |= fold_expr(obj);
+            changed |= fold_expr(idx);
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            changed |= fold_expr(c);
+            for a in args {
+                changed |= fold_expr(a);
+            }
+        }
+        Expr::Unary(_, inner) => changed |= fold_expr(inner),
+        Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
+            changed |= fold_expr(l);
+            changed |= fold_expr(r);
+        }
+        Expr::Cond(c, t, e) => {
+            changed |= fold_expr(c);
+            changed |= fold_expr(t);
+            changed |= fold_expr(e);
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                changed |= fold_expr(v);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for item in items {
+                changed |= fold_expr(item);
+            }
+        }
+        Expr::Arrow(_, ArrowBody::Expr(b)) => changed |= fold_expr(b),
+        Expr::Arrow(_, ArrowBody::Block(stmts)) => {
+            for s in stmts {
+                changed |= fold_stmt(s);
+            }
+        }
+        _ => {}
+    }
+
+    // Apply local expression reductions.
+    let replacement: Option<Expr> = match expr {
+        // `[c0, c1, ...][k]` where every element is a pure literal -> `c_k`
+        Expr::Index(arr, idx) => {
+            if let (Expr::Array(items), Some(k)) = (arr.as_ref(), exact_u32(idx)) {
+                let k = k as usize;
+                if k < items.len() && items.iter().all(|it| SimpleLit::from_expr(it).is_some()) {
+                    Some(items[k].clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        // `Math.imul(c1, c2)` -> exact i32 product
+        Expr::Call(callee, args) if args.len() == 2 => {
+            let is_imul = matches!(
+                callee.as_ref(),
+                Expr::Member(obj, prop)
+                    if matches!(obj.as_ref(), Expr::Ident(id) if id == "Math")
+                        && prop == "imul"
+            );
+            if is_imul {
+                match (to_i32_bits(&args[0]), to_i32_bits(&args[1])) {
+                    (Some(a), Some(b)) => Some(num_expr_i32(a.wrapping_mul(b))),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        // `!true` / `!false`
+        Expr::Unary(UnOp::Not, inner) => match inner.as_ref() {
+            Expr::Bool(b) => Some(Expr::Bool(!*b)),
+            _ => None,
+        },
+        // `true ? a : b` / `false ? a : b`
+        Expr::Cond(cond, then_e, else_e) => match cond.as_ref() {
+            Expr::Bool(true) => Some((**then_e).clone()),
+            Expr::Bool(false) => Some((**else_e).clone()),
+            _ => None,
+        },
+        // Binary constant folds
+        Expr::Binary(op, l, r) => match op {
+            BinOp::StrictEq => match (SimpleLit::from_expr(l), SimpleLit::from_expr(r)) {
+                (Some(a), Some(b)) => Some(Expr::Bool(a.strict_eq(&b))),
+                _ => None,
+            },
+            BinOp::StrictNe => match (SimpleLit::from_expr(l), SimpleLit::from_expr(r)) {
+                (Some(a), Some(b)) => Some(Expr::Bool(!a.strict_eq(&b))),
+                _ => None,
+            },
+            BinOp::Add => match (exact_i32(l), exact_i32(r)) {
+                (Some(a), Some(b)) => {
+                    let s = (a as i64) + (b as i64);
+                    if (-2147483648..=2147483647).contains(&s) {
+                        Some(num_expr_i32(s as i32))
+                    } else if (0..=4294967295).contains(&s) {
+                        Some(Expr::Num(s as f64))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            BinOp::Sub => match (exact_i32(l), exact_i32(r)) {
+                (Some(a), Some(b)) => {
+                    let d = (a as i64) - (b as i64);
+                    if (-2147483648..=2147483647).contains(&d) {
+                        Some(num_expr_i32(d as i32))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            BinOp::BitOr => match (to_i32_bits(l), to_i32_bits(r)) {
+                (Some(a), Some(b)) => Some(num_expr_i32(a | b)),
+                _ => None,
+            },
+            BinOp::BitAnd => match (to_i32_bits(l), to_i32_bits(r)) {
+                (Some(a), Some(b)) => Some(num_expr_i32(a & b)),
+                _ => None,
+            },
+            BinOp::BitXor => match (to_i32_bits(l), to_i32_bits(r)) {
+                (Some(a), Some(b)) => Some(num_expr_i32(a ^ b)),
+                _ => None,
+            },
+            BinOp::Shl => match (to_i32_bits(l), to_i32_bits(r)) {
+                (Some(a), Some(b)) => Some(num_expr_i32(a.wrapping_shl(b as u32))),
+                _ => None,
+            },
+            BinOp::Shr => match (to_i32_bits(l), to_i32_bits(r)) {
+                (Some(a), Some(b)) => Some(num_expr_i32(a.wrapping_shr(b as u32))),
+                _ => None,
+            },
+            BinOp::UShr => match (to_i32_bits(l), to_i32_bits(r)) {
+                (Some(a), Some(b)) => Some(Expr::Num(((a as u32).wrapping_shr(b as u32)) as f64)),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(repl) = replacement {
+        *expr = repl;
+        changed = true;
+    }
+    changed
+}
+
+fn has_unlabeled_switch_break(stmts: &[Stmt]) -> bool {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Break(None) => return true,
+            Stmt::If(_, a, b) => {
+                if has_unlabeled_switch_break(a)
+                    || b.as_ref().is_some_and(|b| has_unlabeled_switch_break(b))
+                {
+                    return true;
+                }
+            }
+            Stmt::Block(b) => {
+                if has_unlabeled_switch_break(b) {
+                    return true;
+                }
+            }
+            Stmt::Labeled(_, inner) => {
+                if has_unlabeled_switch_break(std::slice::from_ref(inner.as_ref())) {
+                    return true;
+                }
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                if has_unlabeled_switch_break(body) || has_unlabeled_switch_break(handler) {
+                    return true;
+                }
+            }
+            // Inner loops and switches capture their own unlabeled `break`.
+            Stmt::LoopForever(..) | Stmt::While(..) | Stmt::Switch(..) => {}
+            _ => {}
+        }
+    }
+    false
+}
+
+fn stmt_definitely_exits_switch(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Return(_) | Stmt::Throw(_)
+    )
+}
+
+fn try_fold_constant_switch(disc: &Expr, cases: &[jsast::SwitchCase]) -> Option<Vec<Stmt>> {
+    let lit = SimpleLit::from_expr(disc)?;
+    let mut default_idx: Option<usize> = None;
+    let mut matched_idx: Option<usize> = None;
+    for (idx, case) in cases.iter().enumerate() {
+        if case.tests.is_empty() {
+            default_idx = Some(idx);
+            continue;
+        }
+        for test in &case.tests {
+            let t_lit = SimpleLit::from_expr(test)?;
+            if matched_idx.is_none() && lit.strict_eq(&t_lit) {
+                matched_idx = Some(idx);
+            }
+        }
+    }
+    let start = match matched_idx.or(default_idx) {
+        Some(i) => i,
+        None => return Some(Vec::new()),
+    };
+    let mut collected: Vec<Stmt> = Vec::new();
+    for case in &cases[start..] {
+        let mut stmts = case.body.clone();
+        let trailing_unlabeled_break = matches!(stmts.last(), Some(Stmt::Break(None)));
+        if trailing_unlabeled_break {
+            stmts.pop();
+        }
+        if has_unlabeled_switch_break(&stmts) {
+            return None;
+        }
+        let exits =
+            trailing_unlabeled_break || stmts.last().is_some_and(stmt_definitely_exits_switch);
+        collected.extend(stmts);
+        if exits {
+            break;
+        }
+    }
+    Some(collected)
+}
+
+fn fold_stmt(stmt: &mut Stmt) -> bool {
+    let mut changed = false;
+    match stmt {
+        Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Const(_, e) | Stmt::Let(_, Some(e)) => {
+            changed |= fold_expr(e);
+        }
+        Stmt::Return(Some(e)) => changed |= fold_expr(e),
+        Stmt::Lets(decls) => {
+            for (_, init) in decls {
+                if let Some(e) = init {
+                    changed |= fold_expr(e);
+                }
+            }
+        }
+        Stmt::If(cond, then_b, else_b) => {
+            changed |= fold_expr(cond);
+            changed |= fold_stmt_list(then_b);
+            if let Some(eb) = else_b {
+                changed |= fold_stmt_list(eb);
+            }
+        }
+        Stmt::Switch(disc, cases) => {
+            changed |= fold_expr(disc);
+            for c in cases {
+                for t in &mut c.tests {
+                    changed |= fold_expr(t);
+                }
+                changed |= fold_stmt_list(&mut c.body);
+            }
+        }
+        Stmt::Labeled(_, inner) => changed |= fold_stmt(inner),
+        Stmt::LoopForever(_, b) | Stmt::Block(b) => changed |= fold_stmt_list(b),
+        Stmt::While(t, b) => {
+            changed |= fold_expr(t);
+            changed |= fold_stmt_list(b);
+        }
+        Stmt::TryCatch { body, handler, .. } => {
+            changed |= fold_stmt_list(body);
+            changed |= fold_stmt_list(handler);
+        }
+        _ => {}
+    }
+    changed
+}
+
+fn fold_stmt_list(stmts: &mut Vec<Stmt>) -> bool {
+    let mut changed = false;
+    let mut i = 0;
+    while i < stmts.len() {
+        changed |= fold_stmt(&mut stmts[i]);
+        match &stmts[i] {
+            Stmt::Switch(disc, cases) => {
+                if let Some(inlined) = try_fold_constant_switch(disc, cases) {
+                    let count = inlined.len();
+                    stmts.splice(i..=i, inlined);
+                    changed = true;
+                    i += count;
+                    continue;
+                }
+            }
+            Stmt::If(Expr::Bool(b), then_b, else_b) => {
+                let replacement = if *b {
+                    then_b.clone()
+                } else {
+                    else_b.clone().unwrap_or_default()
+                };
+                let count = replacement.len();
+                stmts.splice(i..=i, replacement);
+                changed = true;
+                i += count;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    changed
+}
+
+#[derive(Default)]
+struct LocalConstUsage {
+    writes: usize,
+    reads: usize,
+    in_closure: bool,
+}
+
+fn scan_const_usage_expr(
+    expr: &Expr,
+    locals: &HashSet<String>,
+    in_closure: bool,
+    usage: &mut HashMap<String, LocalConstUsage>,
+) {
+    match expr {
+        Expr::Ident(n) => {
+            if locals.contains(n) {
+                let u = usage.entry(n.clone()).or_default();
+                u.reads += 1;
+                u.in_closure |= in_closure;
+            }
+        }
+        Expr::Assign(lhs, rhs) => {
+            if let Expr::Ident(n) = lhs.as_ref() {
+                if locals.contains(n) {
+                    let u = usage.entry(n.clone()).or_default();
+                    u.writes += 1;
+                    u.in_closure |= in_closure;
+                }
+            } else {
+                scan_const_usage_expr(lhs, locals, in_closure, usage);
+            }
+            scan_const_usage_expr(rhs, locals, in_closure, usage);
+        }
+        Expr::CompoundAssign(_, lhs, rhs) => {
+            if let Expr::Ident(n) = lhs.as_ref() {
+                if locals.contains(n) {
+                    let u = usage.entry(n.clone()).or_default();
+                    u.writes += 1;
+                    u.reads += 1;
+                    u.in_closure |= in_closure;
+                }
+            } else {
+                scan_const_usage_expr(lhs, locals, in_closure, usage);
+            }
+            scan_const_usage_expr(rhs, locals, in_closure, usage);
+        }
+        Expr::Member(o, _) => scan_const_usage_expr(o, locals, in_closure, usage),
+        Expr::Index(o, idx) => {
+            scan_const_usage_expr(o, locals, in_closure, usage);
+            scan_const_usage_expr(idx, locals, in_closure, usage);
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            scan_const_usage_expr(c, locals, in_closure, usage);
+            for a in args {
+                scan_const_usage_expr(a, locals, in_closure, usage);
+            }
+        }
+        Expr::Unary(_, e) => scan_const_usage_expr(e, locals, in_closure, usage),
+        Expr::Binary(_, l, r) => {
+            scan_const_usage_expr(l, locals, in_closure, usage);
+            scan_const_usage_expr(r, locals, in_closure, usage);
+        }
+        Expr::Cond(c, t, e) => {
+            scan_const_usage_expr(c, locals, in_closure, usage);
+            scan_const_usage_expr(t, locals, in_closure, usage);
+            scan_const_usage_expr(e, locals, in_closure, usage);
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                scan_const_usage_expr(v, locals, in_closure, usage);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for it in items {
+                scan_const_usage_expr(it, locals, in_closure, usage);
+            }
+        }
+        Expr::Arrow(_, ArrowBody::Expr(b)) => scan_const_usage_expr(b, locals, true, usage),
+        Expr::Arrow(_, ArrowBody::Block(s)) => scan_const_usage_stmts(s, locals, true, usage),
+        _ => {}
+    }
+}
+
+fn scan_const_usage_stmts(
+    stmts: &[Stmt],
+    locals: &HashSet<String>,
+    in_closure: bool,
+    usage: &mut HashMap<String, LocalConstUsage>,
+) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                scan_const_usage_expr(e, locals, in_closure, usage);
+            }
+            Stmt::Let(n, Some(e)) | Stmt::Const(n, e) => {
+                if locals.contains(n) {
+                    let u = usage.entry(n.clone()).or_default();
+                    u.writes += 1;
+                    u.in_closure |= in_closure;
+                }
+                scan_const_usage_expr(e, locals, in_closure, usage);
+            }
+            Stmt::Lets(decls) => {
+                for (n, init) in decls {
+                    if let Some(e) = init {
+                        if locals.contains(n) {
+                            let u = usage.entry(n.clone()).or_default();
+                            u.writes += 1;
+                            u.in_closure |= in_closure;
+                        }
+                        scan_const_usage_expr(e, locals, in_closure, usage);
+                    }
+                }
+            }
+            Stmt::If(t, a, b) => {
+                scan_const_usage_expr(t, locals, in_closure, usage);
+                scan_const_usage_stmts(a, locals, in_closure, usage);
+                if let Some(b) = b {
+                    scan_const_usage_stmts(b, locals, in_closure, usage);
+                }
+            }
+            Stmt::Switch(d, cases) => {
+                scan_const_usage_expr(d, locals, in_closure, usage);
+                for c in cases {
+                    for t in &c.tests {
+                        scan_const_usage_expr(t, locals, in_closure, usage);
+                    }
+                    scan_const_usage_stmts(&c.body, locals, in_closure, usage);
+                }
+            }
+            Stmt::Labeled(_, inner) => {
+                scan_const_usage_stmts(
+                    std::slice::from_ref(inner.as_ref()),
+                    locals,
+                    in_closure,
+                    usage,
+                );
+            }
+            Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+                scan_const_usage_stmts(b, locals, in_closure, usage);
+            }
+            Stmt::While(t, b) => {
+                scan_const_usage_expr(t, locals, in_closure, usage);
+                scan_const_usage_stmts(b, locals, in_closure, usage);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                scan_const_usage_stmts(body, locals, in_closure, usage);
+                scan_const_usage_stmts(handler, locals, in_closure, usage);
+            }
+            Stmt::FunctionDecl { body, .. } => scan_const_usage_stmts(body, locals, true, usage),
+            _ => {}
+        }
+    }
+}
+
+fn count_ident_reads_expr(expr: &Expr, target: &str) -> usize {
+    match expr {
+        Expr::Ident(n) => usize::from(n == target),
+        Expr::Assign(lhs, rhs) => {
+            let l = if matches!(lhs.as_ref(), Expr::Ident(n) if n == target) {
+                0
+            } else {
+                count_ident_reads_expr(lhs, target)
+            };
+            l + count_ident_reads_expr(rhs, target)
+        }
+        Expr::CompoundAssign(_, lhs, rhs) => {
+            count_ident_reads_expr(lhs, target) + count_ident_reads_expr(rhs, target)
+        }
+        Expr::Member(o, _) => count_ident_reads_expr(o, target),
+        Expr::Index(o, i) => count_ident_reads_expr(o, target) + count_ident_reads_expr(i, target),
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            count_ident_reads_expr(c, target)
+                + args
+                    .iter()
+                    .map(|a| count_ident_reads_expr(a, target))
+                    .sum::<usize>()
+        }
+        Expr::Unary(_, e) => count_ident_reads_expr(e, target),
+        Expr::Binary(_, l, r) => {
+            count_ident_reads_expr(l, target) + count_ident_reads_expr(r, target)
+        }
+        Expr::Cond(c, t, e) => {
+            count_ident_reads_expr(c, target)
+                + count_ident_reads_expr(t, target)
+                + count_ident_reads_expr(e, target)
+        }
+        Expr::Object(entries) => entries
+            .iter()
+            .map(|(_, v)| count_ident_reads_expr(v, target))
+            .sum(),
+        Expr::Array(items) | Expr::Seq(items) => items
+            .iter()
+            .map(|x| count_ident_reads_expr(x, target))
+            .sum(),
+        Expr::Arrow(_, ArrowBody::Expr(b)) => count_ident_reads_expr(b, target),
+        Expr::Arrow(_, ArrowBody::Block(s)) => count_ident_reads_stmts(s, target),
+        _ => 0,
+    }
+}
+
+fn count_ident_reads_stmts(stmts: &[Stmt], target: &str) -> usize {
+    let mut n = 0;
+    for s in stmts {
+        n += match s {
+            Stmt::ExprStmt(e)
+            | Stmt::Throw(e)
+            | Stmt::Const(_, e)
+            | Stmt::Let(_, Some(e))
+            | Stmt::Return(Some(e)) => count_ident_reads_expr(e, target),
+            Stmt::Lets(decls) => decls
+                .iter()
+                .filter_map(|(_, init)| init.as_ref())
+                .map(|e| count_ident_reads_expr(e, target))
+                .sum(),
+            Stmt::If(t, a, b) => {
+                count_ident_reads_expr(t, target)
+                    + count_ident_reads_stmts(a, target)
+                    + b.as_ref().map_or(0, |b| count_ident_reads_stmts(b, target))
+            }
+            Stmt::Switch(d, cases) => {
+                count_ident_reads_expr(d, target)
+                    + cases
+                        .iter()
+                        .map(|c| {
+                            c.tests
+                                .iter()
+                                .map(|t| count_ident_reads_expr(t, target))
+                                .sum::<usize>()
+                                + count_ident_reads_stmts(&c.body, target)
+                        })
+                        .sum::<usize>()
+            }
+            Stmt::Labeled(_, inner) => {
+                count_ident_reads_stmts(std::slice::from_ref(inner.as_ref()), target)
+            }
+            Stmt::LoopForever(_, b) | Stmt::Block(b) => count_ident_reads_stmts(b, target),
+            Stmt::While(t, b) => {
+                count_ident_reads_expr(t, target) + count_ident_reads_stmts(b, target)
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                count_ident_reads_stmts(body, target) + count_ident_reads_stmts(handler, target)
+            }
+            Stmt::FunctionDecl { body, .. } => count_ident_reads_stmts(body, target),
+            _ => 0,
+        };
+    }
+    n
+}
+
+fn subst_ident_expr(expr: &mut Expr, target: &str, repl: &Expr) {
+    if matches!(expr, Expr::Ident(n) if n == target) {
+        *expr = repl.clone();
+        return;
+    }
+    match expr {
+        Expr::Assign(lhs, rhs) => {
+            if !matches!(lhs.as_ref(), Expr::Ident(n) if n == target) {
+                subst_ident_expr(lhs, target, repl);
+            }
+            subst_ident_expr(rhs, target, repl);
+        }
+        Expr::CompoundAssign(_, lhs, rhs) => {
+            subst_ident_expr(lhs, target, repl);
+            subst_ident_expr(rhs, target, repl);
+        }
+        Expr::Member(o, _) => subst_ident_expr(o, target, repl),
+        Expr::Index(o, i) => {
+            subst_ident_expr(o, target, repl);
+            subst_ident_expr(i, target, repl);
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            subst_ident_expr(c, target, repl);
+            for a in args {
+                subst_ident_expr(a, target, repl);
+            }
+        }
+        Expr::Unary(_, e) => subst_ident_expr(e, target, repl),
+        Expr::Binary(_, l, r) => {
+            subst_ident_expr(l, target, repl);
+            subst_ident_expr(r, target, repl);
+        }
+        Expr::Cond(c, t, e) => {
+            subst_ident_expr(c, target, repl);
+            subst_ident_expr(t, target, repl);
+            subst_ident_expr(e, target, repl);
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                subst_ident_expr(v, target, repl);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for it in items {
+                subst_ident_expr(it, target, repl);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn subst_ident_stmts(stmts: &mut [Stmt], target: &str, repl: &Expr) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::ExprStmt(e)
+            | Stmt::Throw(e)
+            | Stmt::Const(_, e)
+            | Stmt::Let(_, Some(e))
+            | Stmt::Return(Some(e)) => subst_ident_expr(e, target, repl),
+            Stmt::Lets(decls) => {
+                for (_, init) in decls {
+                    if let Some(e) = init {
+                        subst_ident_expr(e, target, repl);
+                    }
+                }
+            }
+            Stmt::If(t, a, b) => {
+                subst_ident_expr(t, target, repl);
+                subst_ident_stmts(a, target, repl);
+                if let Some(b) = b {
+                    subst_ident_stmts(b, target, repl);
+                }
+            }
+            Stmt::Switch(d, cases) => {
+                subst_ident_expr(d, target, repl);
+                for c in cases {
+                    for t in &mut c.tests {
+                        subst_ident_expr(t, target, repl);
+                    }
+                    subst_ident_stmts(&mut c.body, target, repl);
+                }
+            }
+            Stmt::Labeled(_, inner) => {
+                subst_ident_stmts(std::slice::from_mut(inner.as_mut()), target, repl);
+            }
+            Stmt::LoopForever(_, b) | Stmt::Block(b) => subst_ident_stmts(b, target, repl),
+            Stmt::While(t, b) => {
+                subst_ident_expr(t, target, repl);
+                subst_ident_stmts(b, target, repl);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                subst_ident_stmts(body, target, repl);
+                subst_ident_stmts(handler, target, repl);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Propagates single-assignment uninit local literals whose definition strictly dominates every
+/// read (all reads lie in the trailing sibling statements `stmts[i + 1..]`).
+fn prop_local_lits_in_block(
+    stmts: &mut Vec<Stmt>,
+    single_write_reads: &HashMap<String, usize>,
+) -> bool {
+    let mut changed = false;
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stmt::If(_, a, b) => {
+                changed |= prop_local_lits_in_block(a, single_write_reads);
+                if let Some(b) = b {
+                    changed |= prop_local_lits_in_block(b, single_write_reads);
+                }
+            }
+            Stmt::Switch(_, cases) => {
+                for c in cases {
+                    changed |= prop_local_lits_in_block(&mut c.body, single_write_reads);
+                }
+            }
+            Stmt::Labeled(_, inner) => {
+                let mut tmp = vec![inner.as_ref().clone()];
+                if prop_local_lits_in_block(&mut tmp, single_write_reads) && tmp.len() == 1 {
+                    *inner.as_mut() = tmp.pop().unwrap();
+                    changed = true;
+                }
+            }
+            Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
+                changed |= prop_local_lits_in_block(b, single_write_reads);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                changed |= prop_local_lits_in_block(body, single_write_reads);
+                changed |= prop_local_lits_in_block(handler, single_write_reads);
+            }
+            _ => {}
+        }
+    }
+
+    let mut i = 0;
+    while i < stmts.len() {
+        // Handle both standalone `x = lit;` and comma-sequence `a = lit1, b = lit2;`
+        if let Stmt::ExprStmt(Expr::Assign(lhs, rhs)) = &stmts[i] {
+            if let (Expr::Ident(name), Some(lit)) = (lhs.as_ref(), SimpleLit::from_expr(rhs)) {
+                if let Some(&total_reads) = single_write_reads.get(name) {
+                    // Only duplicate strings when single-use or very short (avoids bundle bloat).
+                    let worth_inlining = match &lit {
+                        SimpleLit::Str(s) => total_reads <= 2 || s.len() <= 8,
+                        _ => total_reads <= 6,
+                    };
+                    if worth_inlining
+                        && count_ident_reads_stmts(&stmts[i + 1..], name) == total_reads
+                    {
+                        let target = name.clone();
+                        let repl = lit.to_expr();
+                        subst_ident_stmts(&mut stmts[i + 1..], &target, &repl);
+                        stmts.remove(i);
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+        } else if let Stmt::ExprStmt(Expr::Seq(items)) = &stmts[i] {
+            // Check if every element in `Seq` is an assignment `name = expr`, and any qualifying
+            // literal element has all its reads in `stmts[i + 1..]` (and not in earlier/later
+            // elements of the same `Seq`).
+            let mut extracted: Vec<(usize, String, SimpleLit)> = Vec::new();
+            for (k, item) in items.iter().enumerate() {
+                if let Expr::Assign(lhs, rhs) = item {
+                    if let (Expr::Ident(name), Some(lit)) =
+                        (lhs.as_ref(), SimpleLit::from_expr(rhs))
+                    {
+                        if let Some(&total_reads) = single_write_reads.get(name) {
+                            let worth_inlining = match &lit {
+                                SimpleLit::Str(s) => total_reads <= 2 || s.len() <= 8,
+                                _ => total_reads <= 6,
+                            };
+                            let seq_reads: usize = items
+                                .iter()
+                                .map(|it| count_ident_reads_expr(it, name))
+                                .sum();
+                            if worth_inlining
+                                && seq_reads == 0
+                                && count_ident_reads_stmts(&stmts[i + 1..], name) == total_reads
+                            {
+                                extracted.push((k, name.clone(), lit));
+                            }
+                        }
+                    }
+                }
+            }
+            if !extracted.is_empty() {
+                let remove_set: HashSet<usize> = extracted.iter().map(|(k, _, _)| *k).collect();
+                for (_, name, lit) in &extracted {
+                    subst_ident_stmts(&mut stmts[i + 1..], name, &lit.to_expr());
+                }
+                if let Stmt::ExprStmt(Expr::Seq(items)) = &mut stmts[i] {
+                    let mut idx = 0usize;
+                    items.retain(|_| {
+                        let keep = !remove_set.contains(&idx);
+                        idx += 1;
+                        keep
+                    });
+                    if items.is_empty() {
+                        stmts.remove(i);
+                        changed = true;
+                        continue;
+                    } else if items.len() == 1 {
+                        let sole = items.pop().unwrap();
+                        stmts[i] = Stmt::ExprStmt(sole);
+                    }
+                }
+                changed = true;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    changed
+}
+
+fn fold_constants_and_switches(body: &mut Vec<Stmt>, uninit_locals: &HashSet<String>) {
+    for _ in 0..3 {
+        let mut changed = fold_stmt_list(body);
+        if !uninit_locals.is_empty() {
+            let mut usage = HashMap::new();
+            scan_const_usage_stmts(body, uninit_locals, false, &mut usage);
+            let single_write_reads: HashMap<String, usize> = usage
+                .into_iter()
+                .filter(|(_, u)| u.writes == 1 && u.reads >= 1 && !u.in_closure)
+                .map(|(n, u)| (n, u.reads))
+                .collect();
+            if !single_write_reads.is_empty() {
+                changed |= prop_local_lits_in_block(body, &single_write_reads);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+// =============================================================================================
+// 2. Spec-identical `Reflect.get(o, k)` fast-path + dominated object-guard CSE
+// =============================================================================================
+
+fn is_reflect_get_call(expr: &Expr) -> Option<(&Expr, &Expr)> {
+    let Expr::Call(callee, args) = expr else {
+        return None;
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    let Expr::Member(obj, prop) = callee.as_ref() else {
+        return None;
+    };
+    if prop == "get" && matches!(obj.as_ref(), Expr::Ident(id) if id == "Reflect") {
+        Some((&args[0], &args[1]))
+    } else {
+        None
+    }
+}
+
+fn is_duplicable_key(expr: &Expr, obj_name: &str) -> bool {
+    match expr {
+        Expr::Str(_) | Expr::Num(_) | Expr::Bool(_) | Expr::Null | Expr::Undefined => true,
+        Expr::Ident(k) => k != obj_name,
+        _ => false,
+    }
+}
+
+fn object_guard_expr(obj_name: &str) -> Expr {
+    // `(o !== null && typeof o === "object") || typeof o === "function"`
+    let obj_id = || Expr::Ident(obj_name.to_owned());
+    let is_nonnull_obj = jsast::binary(
+        BinOp::And,
+        jsast::binary(BinOp::StrictNe, obj_id(), Expr::Null),
+        jsast::binary(
+            BinOp::StrictEq,
+            Expr::Unary(UnOp::TypeOf, Box::new(obj_id())),
+            Expr::Str("object".to_owned()),
+        ),
+    );
+    let is_fn = jsast::binary(
+        BinOp::StrictEq,
+        Expr::Unary(UnOp::TypeOf, Box::new(obj_id())),
+        Expr::Str("function".to_owned()),
+    );
+    jsast::binary(BinOp::Or, is_nonnull_obj, is_fn)
+}
+
+fn collect_assigned_idents_expr(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
+            if let Expr::Ident(n) = lhs.as_ref() {
+                out.insert(n.clone());
+            }
+            collect_assigned_idents_expr(lhs, out);
+            collect_assigned_idents_expr(rhs, out);
+        }
+        Expr::Member(o, _) => collect_assigned_idents_expr(o, out),
+        Expr::Index(o, i) => {
+            collect_assigned_idents_expr(o, out);
+            collect_assigned_idents_expr(i, out);
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            collect_assigned_idents_expr(c, out);
+            for a in args {
+                collect_assigned_idents_expr(a, out);
+            }
+        }
+        Expr::Unary(_, e) => collect_assigned_idents_expr(e, out),
+        Expr::Binary(_, l, r) => {
+            collect_assigned_idents_expr(l, out);
+            collect_assigned_idents_expr(r, out);
+        }
+        Expr::Cond(c, t, e) => {
+            collect_assigned_idents_expr(c, out);
+            collect_assigned_idents_expr(t, out);
+            collect_assigned_idents_expr(e, out);
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                collect_assigned_idents_expr(v, out);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for it in items {
+                collect_assigned_idents_expr(it, out);
+            }
+        }
+        Expr::Arrow(_, ArrowBody::Expr(b)) => collect_assigned_idents_expr(b, out),
+        Expr::Arrow(_, ArrowBody::Block(s)) => collect_assigned_idents_stmts(s, out),
+        _ => {}
+    }
+}
+
+fn collect_assigned_idents_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                collect_assigned_idents_expr(e, out);
+            }
+            Stmt::Let(n, init) => {
+                out.insert(n.clone());
+                if let Some(e) = init {
+                    collect_assigned_idents_expr(e, out);
+                }
+            }
+            Stmt::Const(n, e) => {
+                out.insert(n.clone());
+                collect_assigned_idents_expr(e, out);
+            }
+            Stmt::Lets(decls) => {
+                for (n, init) in decls {
+                    out.insert(n.clone());
+                    if let Some(e) = init {
+                        collect_assigned_idents_expr(e, out);
+                    }
+                }
+            }
+            Stmt::If(t, a, b) => {
+                collect_assigned_idents_expr(t, out);
+                collect_assigned_idents_stmts(a, out);
+                if let Some(b) = b {
+                    collect_assigned_idents_stmts(b, out);
+                }
+            }
+            Stmt::Switch(d, cases) => {
+                collect_assigned_idents_expr(d, out);
+                for c in cases {
+                    for t in &c.tests {
+                        collect_assigned_idents_expr(t, out);
+                    }
+                    collect_assigned_idents_stmts(&c.body, out);
+                }
+            }
+            Stmt::Labeled(_, inner) => {
+                collect_assigned_idents_stmts(std::slice::from_ref(inner.as_ref()), out);
+            }
+            Stmt::LoopForever(_, b) | Stmt::Block(b) => collect_assigned_idents_stmts(b, out),
+            Stmt::While(t, b) => {
+                collect_assigned_idents_expr(t, out);
+                collect_assigned_idents_stmts(b, out);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                collect_assigned_idents_stmts(body, out);
+                collect_assigned_idents_stmts(handler, out);
+            }
+            Stmt::FunctionDecl { body, .. } => collect_assigned_idents_stmts(body, out),
+            _ => {}
+        }
+    }
+}
+
+fn rewrite_reflect_expr(expr: &mut Expr, known: &mut HashSet<String>, unconditional: bool) {
+    // Check `Reflect.get(o, k)` before descending into args (args are rewritten first so nested
+    // `Reflect.get(Reflect.get(a, "b"), "c")` works cleanly).
+    if let Some((Expr::Ident(obj_name), key)) = is_reflect_get_call(expr) {
+        if is_duplicable_key(key, obj_name) {
+            let obj_name = obj_name.clone();
+            let key_expr = key.clone();
+            let fast_access = jsast::index(Expr::Ident(obj_name.clone()), key_expr.clone());
+            if known.contains(&obj_name) {
+                *expr = fast_access;
+            } else {
+                let fallback = jsast::method_call(
+                    jsast::id("Reflect"),
+                    "get",
+                    vec![Expr::Ident(obj_name.clone()), key_expr],
+                );
+                *expr = jsast::cond(object_guard_expr(&obj_name), fast_access, fallback);
+                if unconditional {
+                    known.insert(obj_name);
+                }
+            }
+            return;
+        }
+    }
+
+    match expr {
+        Expr::Assign(lhs, rhs) => {
+            // RHS evaluates before LHS assignment takes effect.
+            rewrite_reflect_expr(rhs, known, unconditional);
+            if let Expr::Ident(n) = lhs.as_ref() {
+                known.remove(n);
+            } else {
+                rewrite_reflect_expr(lhs, known, unconditional);
+            }
+        }
+        Expr::CompoundAssign(_, lhs, rhs) => {
+            rewrite_reflect_expr(lhs, known, unconditional);
+            rewrite_reflect_expr(rhs, known, unconditional);
+            if let Expr::Ident(n) = lhs.as_ref() {
+                known.remove(n);
+            }
+        }
+        Expr::Member(o, _) => rewrite_reflect_expr(o, known, unconditional),
+        Expr::Index(o, i) => {
+            rewrite_reflect_expr(o, known, unconditional);
+            rewrite_reflect_expr(i, known, unconditional);
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            rewrite_reflect_expr(c, known, unconditional);
+            for a in args {
+                rewrite_reflect_expr(a, known, unconditional);
+            }
+        }
+        Expr::Unary(_, e) => rewrite_reflect_expr(e, known, unconditional),
+        Expr::Binary(op, l, r) => {
+            rewrite_reflect_expr(l, known, unconditional);
+            let rhs_uncond = unconditional && !matches!(op, BinOp::And | BinOp::Or);
+            rewrite_reflect_expr(r, known, rhs_uncond);
+        }
+        Expr::Cond(c, t, e) => {
+            rewrite_reflect_expr(c, known, unconditional);
+            let mut t_known = known.clone();
+            let mut e_known = known.clone();
+            rewrite_reflect_expr(t, &mut t_known, false);
+            rewrite_reflect_expr(e, &mut e_known, false);
+            // Drop any ident assigned in either branch.
+            let mut assigned = HashSet::new();
+            collect_assigned_idents_expr(t, &mut assigned);
+            collect_assigned_idents_expr(e, &mut assigned);
+            for a in assigned {
+                known.remove(&a);
+            }
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                rewrite_reflect_expr(v, known, unconditional);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for it in items {
+                rewrite_reflect_expr(it, known, unconditional);
+            }
+        }
+        Expr::Arrow(_, ArrowBody::Expr(b)) => {
+            let mut inner = HashSet::new();
+            rewrite_reflect_expr(b, &mut inner, false);
+        }
+        Expr::Arrow(_, ArrowBody::Block(stmts)) => {
+            let mut inner = HashSet::new();
+            rewrite_reflect_stmts(stmts, &mut inner);
+        }
+        _ => {}
+    }
+}
+
+fn rewrite_reflect_stmts(stmts: &mut [Stmt], known: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                rewrite_reflect_expr(e, known, true);
+            }
+            Stmt::Let(n, init) => {
+                if let Some(e) = init {
+                    rewrite_reflect_expr(e, known, true);
+                }
+                known.remove(n);
+            }
+            Stmt::Const(n, e) => {
+                rewrite_reflect_expr(e, known, true);
+                known.remove(n);
+            }
+            Stmt::Lets(decls) => {
+                for (n, init) in decls {
+                    if let Some(e) = init {
+                        rewrite_reflect_expr(e, known, true);
+                    }
+                    known.remove(n);
+                }
+            }
+            Stmt::If(cond, then_b, else_b) => {
+                rewrite_reflect_expr(cond, known, true);
+                let mut t_known = known.clone();
+                rewrite_reflect_stmts(then_b, &mut t_known);
+                let mut assigned = HashSet::new();
+                collect_assigned_idents_stmts(then_b, &mut assigned);
+                if let Some(eb) = else_b {
+                    let mut e_known = known.clone();
+                    rewrite_reflect_stmts(eb, &mut e_known);
+                    collect_assigned_idents_stmts(eb, &mut assigned);
+                }
+                for a in assigned {
+                    known.remove(&a);
+                }
+            }
+            Stmt::Switch(disc, cases) => {
+                rewrite_reflect_expr(disc, known, true);
+                let mut assigned = HashSet::new();
+                for c in cases {
+                    for t in &mut c.tests {
+                        let mut tk = known.clone();
+                        rewrite_reflect_expr(t, &mut tk, false);
+                    }
+                    let mut ck = known.clone();
+                    rewrite_reflect_stmts(&mut c.body, &mut ck);
+                    collect_assigned_idents_stmts(&c.body, &mut assigned);
+                }
+                for a in assigned {
+                    known.remove(&a);
+                }
+            }
+            Stmt::Labeled(_, inner) => {
+                let mut assigned = HashSet::new();
+                collect_assigned_idents_stmts(std::slice::from_ref(inner.as_ref()), &mut assigned);
+                let mut ik = known.clone();
+                rewrite_reflect_stmts(std::slice::from_mut(inner.as_mut()), &mut ik);
+                for a in assigned {
+                    known.remove(&a);
+                }
+            }
+            Stmt::Block(b) => {
+                rewrite_reflect_stmts(b, known);
+            }
+            Stmt::LoopForever(_, b) => {
+                let mut assigned = HashSet::new();
+                collect_assigned_idents_stmts(b, &mut assigned);
+                for a in &assigned {
+                    known.remove(a);
+                }
+                let mut lk = known.clone();
+                rewrite_reflect_stmts(b, &mut lk);
+            }
+            Stmt::While(t, b) => {
+                let mut assigned = HashSet::new();
+                collect_assigned_idents_expr(t, &mut assigned);
+                collect_assigned_idents_stmts(b, &mut assigned);
+                for a in &assigned {
+                    known.remove(a);
+                }
+                let mut lk = known.clone();
+                rewrite_reflect_expr(t, &mut lk, true);
+                rewrite_reflect_stmts(b, &mut lk);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                let mut assigned = HashSet::new();
+                collect_assigned_idents_stmts(body, &mut assigned);
+                collect_assigned_idents_stmts(handler, &mut assigned);
+                let mut bk = known.clone();
+                rewrite_reflect_stmts(body, &mut bk);
+                let mut hk = known.clone();
+                for a in &assigned {
+                    hk.remove(a);
+                }
+                rewrite_reflect_stmts(handler, &mut hk);
+                for a in assigned {
+                    known.remove(&a);
+                }
+            }
+            Stmt::FunctionDecl { body, .. } => {
+                let mut inner = HashSet::new();
+                rewrite_reflect_stmts(body, &mut inner);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn optimize_reflect_get(body: &mut [Stmt]) {
+    let mut known = HashSet::new();
+    rewrite_reflect_stmts(body, &mut known);
+}
+
+// =============================================================================================
+// 3. `$__mires_i64_div` rem + div fusion into `$__mires_i64_divrem`
+// =============================================================================================
+
+#[derive(Clone, Debug, PartialEq)]
+struct I64DivCall {
+    dst_lo: String,
+    dst_hi: Option<String>,
+    al: Expr,
+    ah: Expr,
+    bl: Expr,
+    bh: Expr,
+    signed: bool,
+    rem: bool,
+    /// Number of consecutive statements covered (1 if hi wasn't read, 2 if followed by `hi = $__mires_i64_hi`).
+    span: usize,
+}
+
+fn is_pure_atom(e: &Expr) -> bool {
+    matches!(
+        e,
+        Expr::Ident(_) | Expr::Num(_) | Expr::Bool(_) | Expr::Unary(UnOp::Neg, _)
+    )
+}
+
+fn match_i64_div_at(stmts: &[Stmt], idx: usize) -> Option<I64DivCall> {
+    let Stmt::ExprStmt(Expr::Assign(lhs, rhs)) = stmts.get(idx)? else {
+        return None;
+    };
+    let Expr::Ident(dst_lo) = lhs.as_ref() else {
+        return None;
+    };
+    let Expr::Call(callee, args) = rhs.as_ref() else {
+        return None;
+    };
+    if !matches!(callee.as_ref(), Expr::Ident(id) if id == i64_pair::HELPER_DIV) || args.len() != 6
+    {
+        return None;
+    }
+    let (Expr::Bool(signed), Expr::Bool(rem)) = (&args[4], &args[5]) else {
+        return None;
+    };
+    if !is_pure_atom(&args[0])
+        || !is_pure_atom(&args[1])
+        || !is_pure_atom(&args[2])
+        || !is_pure_atom(&args[3])
+    {
+        return None;
+    }
+    let mut dst_hi = None;
+    let mut span = 1;
+    if let Some(Stmt::ExprStmt(Expr::Assign(hi_lhs, hi_rhs))) = stmts.get(idx + 1) {
+        if let (Expr::Ident(hi_name), Expr::Ident(src)) = (hi_lhs.as_ref(), hi_rhs.as_ref()) {
+            if src == i64_pair::HELPER_HI {
+                dst_hi = Some(hi_name.clone());
+                span = 2;
+            }
+        }
+    }
+    Some(I64DivCall {
+        dst_lo: dst_lo.clone(),
+        dst_hi,
+        al: args[0].clone(),
+        ah: args[1].clone(),
+        bl: args[2].clone(),
+        bh: args[3].clone(),
+        signed: *signed,
+        rem: *rem,
+        span,
+    })
+}
+
+fn expr_clobbers_divrem(expr: &Expr, operands: &HashSet<String>) -> bool {
+    match expr {
+        Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
+            if let Expr::Ident(n) = lhs.as_ref() {
+                if operands.contains(n)
+                    || n == i64_pair::HELPER_HI
+                    || n == i64_pair::HELPER_RL
+                    || n == i64_pair::HELPER_RH
+                {
+                    return true;
+                }
+            }
+            expr_clobbers_divrem(lhs, operands) || expr_clobbers_divrem(rhs, operands)
+        }
+        Expr::Call(callee, args) => {
+            // Only cold diverging `core$panicking$*` calls are guaranteed not to clobber scratch
+            // registers and return.
+            let is_panic = matches!(
+                callee.as_ref(),
+                Expr::Ident(name) if name.starts_with("core$panicking$")
+            );
+            !is_panic || args.iter().any(|a| expr_clobbers_divrem(a, operands))
+        }
+        Expr::New(..) => true,
+        Expr::Member(o, _) => expr_clobbers_divrem(o, operands),
+        Expr::Index(o, i) => expr_clobbers_divrem(o, operands) || expr_clobbers_divrem(i, operands),
+        Expr::Unary(_, e) => expr_clobbers_divrem(e, operands),
+        Expr::Binary(_, l, r) => {
+            expr_clobbers_divrem(l, operands) || expr_clobbers_divrem(r, operands)
+        }
+        Expr::Cond(c, t, e) => {
+            expr_clobbers_divrem(c, operands)
+                || expr_clobbers_divrem(t, operands)
+                || expr_clobbers_divrem(e, operands)
+        }
+        Expr::Object(entries) => entries
+            .iter()
+            .any(|(_, v)| expr_clobbers_divrem(v, operands)),
+        Expr::Array(items) | Expr::Seq(items) => {
+            items.iter().any(|x| expr_clobbers_divrem(x, operands))
+        }
+        _ => false,
+    }
+}
+
+fn stmts_definitely_diverge(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Throw(_) => true,
+        Stmt::ExprStmt(Expr::Call(callee, _)) => matches!(
+            callee.as_ref(),
+            Expr::Ident(name) if name.starts_with("core$panicking$")
+        ),
+        _ => false,
+    })
+}
+
+fn stmt_clobbers_divrem(stmt: &Stmt, operands: &HashSet<String>) -> bool {
+    match stmt {
+        Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+            expr_clobbers_divrem(e, operands)
+        }
+        Stmt::Let(n, init) => {
+            operands.contains(n)
+                || init
+                    .as_ref()
+                    .is_some_and(|e| expr_clobbers_divrem(e, operands))
+        }
+        Stmt::Const(n, e) => operands.contains(n) || expr_clobbers_divrem(e, operands),
+        Stmt::Lets(decls) => decls.iter().any(|(n, init)| {
+            operands.contains(n)
+                || init
+                    .as_ref()
+                    .is_some_and(|e| expr_clobbers_divrem(e, operands))
+        }),
+        Stmt::If(t, a, b) => {
+            if expr_clobbers_divrem(t, operands) {
+                return true;
+            }
+            let a_clobbers =
+                !stmts_definitely_diverge(a) && a.iter().any(|s| stmt_clobbers_divrem(s, operands));
+            let b_clobbers = b.as_ref().is_some_and(|b| {
+                !stmts_definitely_diverge(b) && b.iter().any(|s| stmt_clobbers_divrem(s, operands))
+            });
+            a_clobbers || b_clobbers
+        }
+        Stmt::Switch(..) | Stmt::LoopForever(..) | Stmt::While(..) | Stmt::TryCatch { .. } => true,
+        Stmt::Block(b) => b.iter().any(|s| stmt_clobbers_divrem(s, operands)),
+        Stmt::Labeled(_, inner) => stmt_clobbers_divrem(inner, operands),
+        _ => false,
+    }
+}
+
+fn fuse_i64_div_rem(
+    stmts: &mut Vec<Stmt>,
+    local_names: &mut HashSet<String>,
+    extra_decls: &mut Vec<(String, Option<Expr>)>,
+) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stmt::If(_, a, b) => {
+                fuse_i64_div_rem(a, local_names, extra_decls);
+                if let Some(b) = b {
+                    fuse_i64_div_rem(b, local_names, extra_decls);
+                }
+            }
+            Stmt::Switch(_, cases) => {
+                for c in cases {
+                    fuse_i64_div_rem(&mut c.body, local_names, extra_decls);
+                }
+            }
+            Stmt::Labeled(_, inner) => {
+                let mut tmp = vec![inner.as_ref().clone()];
+                fuse_i64_div_rem(&mut tmp, local_names, extra_decls);
+                if tmp.len() == 1 {
+                    *inner.as_mut() = tmp.pop().unwrap();
+                }
+            }
+            Stmt::LoopForever(_, b) | Stmt::Block(b) | Stmt::While(_, b) => {
+                fuse_i64_div_rem(b, local_names, extra_decls);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                fuse_i64_div_rem(body, local_names, extra_decls);
+                fuse_i64_div_rem(handler, local_names, extra_decls);
+            }
+            _ => {}
+        }
+    }
+
+    let mut i = 0;
+    while i < stmts.len() {
+        let Some(first) = match_i64_div_at(stmts, i) else {
+            i += 1;
+            continue;
+        };
+        let mut operands: HashSet<String> = HashSet::new();
+        for e in [&first.al, &first.ah, &first.bl, &first.bh] {
+            if let Expr::Ident(n) = e {
+                operands.insert(n.clone());
+            }
+        }
+        // Make sure `first`'s destination writes didn't overwrite its own operands before call 2!
+        if operands.contains(&first.dst_lo)
+            || first.dst_hi.as_ref().is_some_and(|h| operands.contains(h))
+        {
+            i += first.span;
+            continue;
+        }
+        let mut found: Option<(usize, I64DivCall)> = None;
+        let mut j = i + first.span;
+        while j < stmts.len() {
+            if let Some(second) = match_i64_div_at(stmts, j) {
+                if second.al == first.al
+                    && second.ah == first.ah
+                    && second.bl == first.bl
+                    && second.bh == first.bh
+                    && second.signed == first.signed
+                    && second.rem == !first.rem
+                {
+                    found = Some((j, second));
+                }
+                break;
+            }
+            if stmt_clobbers_divrem(&stmts[j], &operands) {
+                break;
+            }
+            j += 1;
+        }
+        let Some((j, second)) = found else {
+            i += first.span;
+            continue;
+        };
+
+        let tmp_lo = alloc_fresh_local(local_names, extra_decls, "$dr_lo");
+        let tmp_hi = second
+            .dst_hi
+            .as_ref()
+            .map(|_| alloc_fresh_local(local_names, extra_decls, "$dr_hi"));
+
+        let divrem_call = jsast::call(
+            jsast::id(i64_pair::HELPER_DIVREM),
+            vec![
+                first.al.clone(),
+                first.ah.clone(),
+                first.bl.clone(),
+                first.bh.clone(),
+                Expr::Bool(first.signed),
+            ],
+        );
+
+        let mut first_repl = Vec::new();
+        let mut second_repl = Vec::new();
+        if first.rem {
+            // First is rem, second is div: divrem returns ql, writes qh to HELPER_HI, rl/rh to HELPER_RL/RH.
+            first_repl.push(jsast::assign_stmt(jsast::id(tmp_lo.clone()), divrem_call));
+            if let Some(ref th) = tmp_hi {
+                first_repl.push(jsast::assign_stmt(
+                    jsast::id(th.clone()),
+                    jsast::id(i64_pair::HELPER_HI),
+                ));
+            }
+            first_repl.push(jsast::assign_stmt(
+                jsast::id(first.dst_lo.clone()),
+                jsast::id(i64_pair::HELPER_RL),
+            ));
+            if let Some(ref dh) = first.dst_hi {
+                first_repl.push(jsast::assign_stmt(
+                    jsast::id(dh.clone()),
+                    jsast::id(i64_pair::HELPER_RH),
+                ));
+            }
+        } else {
+            // First is div, second is rem.
+            first_repl.push(jsast::assign_stmt(
+                jsast::id(first.dst_lo.clone()),
+                divrem_call,
+            ));
+            if let Some(ref dh) = first.dst_hi {
+                first_repl.push(jsast::assign_stmt(
+                    jsast::id(dh.clone()),
+                    jsast::id(i64_pair::HELPER_HI),
+                ));
+            }
+            first_repl.push(jsast::assign_stmt(
+                jsast::id(tmp_lo.clone()),
+                jsast::id(i64_pair::HELPER_RL),
+            ));
+            if let Some(ref th) = tmp_hi {
+                first_repl.push(jsast::assign_stmt(
+                    jsast::id(th.clone()),
+                    jsast::id(i64_pair::HELPER_RH),
+                ));
+            }
+        }
+        second_repl.push(jsast::assign_stmt(
+            jsast::id(second.dst_lo.clone()),
+            jsast::id(tmp_lo),
+        ));
+        if let (Some(dh), Some(th)) = (second.dst_hi.as_ref(), tmp_hi) {
+            second_repl.push(jsast::assign_stmt(jsast::id(dh.clone()), jsast::id(th)));
+        }
+
+        // Splice second first so index `i` stays valid.
+        stmts.splice(j..j + second.span, second_repl);
+        let first_new_len = first_repl.len();
+        stmts.splice(i..i + first.span, first_repl);
+        i += first_new_len;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folds_const_array_index_and_const_switch() {
+        let mut decl = Stmt::FunctionDecl {
+            name: "f".to_owned(),
+            params: vec!["x".to_owned()],
+            body: vec![
+                jsast::lets(vec![("k".to_owned(), None), ("r".to_owned(), None)]),
+                jsast::assign_stmt(jsast::id("k"), Expr::Str("Some".to_owned())),
+                Stmt::Switch(
+                    jsast::id("k"),
+                    vec![
+                        jsast::SwitchCase {
+                            tests: vec![Expr::Str("None".to_owned())],
+                            body: vec![
+                                jsast::assign_stmt(jsast::id("r"), Expr::Num(0.0)),
+                                Stmt::Break(None),
+                            ],
+                        },
+                        jsast::SwitchCase {
+                            tests: vec![Expr::Str("Some".to_owned())],
+                            body: vec![
+                                jsast::assign_stmt(
+                                    jsast::id("r"),
+                                    Expr::Index(
+                                        Box::new(Expr::Array(vec![Expr::Num(1.0)])),
+                                        Box::new(Expr::Num(0.0)),
+                                    ),
+                                ),
+                                Stmt::Break(None),
+                            ],
+                        },
+                    ],
+                ),
+                Stmt::Return(Some(jsast::id("r"))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let printed = jsast::stmt_to_string(&decl);
+        assert!(
+            !printed.contains("switch"),
+            "expected switch folded: {printed}"
+        );
+        assert!(
+            !printed.contains("[1][0]"),
+            "expected [1][0] folded: {printed}"
+        );
+        assert!(
+            printed.contains("return 1;"),
+            "expected return 1;: {printed}"
+        );
+    }
+
+    #[test]
+    fn optimizes_reflect_get_with_dominated_guard_cse() {
+        let mut decl = Stmt::FunctionDecl {
+            name: "f".to_owned(),
+            params: vec!["a".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("k".to_owned(), None),
+                    ("x".to_owned(), None),
+                    ("y".to_owned(), None),
+                ]),
+                jsast::assign_stmt(jsast::id("k"), Expr::Str("children".to_owned())),
+                jsast::assign_stmt(
+                    jsast::id("x"),
+                    jsast::method_call(
+                        jsast::id("Reflect"),
+                        "get",
+                        vec![jsast::id("a"), jsast::id("k")],
+                    ),
+                ),
+                jsast::assign_stmt(
+                    jsast::id("y"),
+                    jsast::method_call(
+                        jsast::id("Reflect"),
+                        "get",
+                        vec![jsast::id("a"), Expr::Str("name".to_owned())],
+                    ),
+                ),
+                Stmt::Return(Some(jsast::id("y"))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let printed = jsast::stmt_to_string(&decl);
+        assert!(
+            printed.contains("a.children"),
+            "expected a.children: {printed}"
+        );
+        assert!(
+            printed.contains("y = a.name;"),
+            "expected unguarded dominated a.name: {printed}"
+        );
+        assert_eq!(
+            printed.matches("Reflect.get").count(),
+            1,
+            "expected only 1 fallback guard: {printed}"
+        );
+    }
+
+    #[test]
+    fn fuses_adjacent_i64_rem_and_div() {
+        let mut decl = Stmt::FunctionDecl {
+            name: "f".to_owned(),
+            params: vec![
+                "r".to_owned(),
+                "q".to_owned(),
+                "e".to_owned(),
+                "d".to_owned(),
+            ],
+            body: vec![
+                jsast::lets(vec![("rl".to_owned(), None), ("rh".to_owned(), None)]),
+                jsast::assign_stmt(
+                    jsast::id("rl"),
+                    jsast::call(
+                        jsast::id(i64_pair::HELPER_DIV),
+                        vec![
+                            jsast::id("r"),
+                            jsast::id("q"),
+                            jsast::id("e"),
+                            jsast::id("d"),
+                            Expr::Bool(false),
+                            Expr::Bool(true),
+                        ],
+                    ),
+                ),
+                jsast::assign_stmt(jsast::id("rh"), jsast::id(i64_pair::HELPER_HI)),
+                jsast::assign_stmt(
+                    jsast::id("r"),
+                    jsast::call(
+                        jsast::id(i64_pair::HELPER_DIV),
+                        vec![
+                            jsast::id("r"),
+                            jsast::id("q"),
+                            jsast::id("e"),
+                            jsast::id("d"),
+                            Expr::Bool(false),
+                            Expr::Bool(false),
+                        ],
+                    ),
+                ),
+                jsast::assign_stmt(jsast::id("q"), jsast::id(i64_pair::HELPER_HI)),
+                Stmt::Return(Some(jsast::id("rl"))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let printed = jsast::stmt_to_string(&decl);
+        assert!(
+            printed.contains(i64_pair::HELPER_DIVREM),
+            "expected divrem: {printed}"
+        );
+        assert!(
+            !printed.contains("$__mires_i64_div("),
+            "expected both div calls fused: {printed}"
+        );
+    }
+}

@@ -2835,6 +2835,8 @@ fn snapshot_scratch(cx: &JsCx<'_>, stmts: &mut Vec<Stmt>, expr: Expr) -> Expr {
         Expr::Ident(name)
             if name.as_str() == super::i64_pair::HELPER_HI
                 || name.as_str() == super::i64_pair::HELPER_OVF
+                || name.as_str() == super::i64_pair::HELPER_RL
+                || name.as_str() == super::i64_pair::HELPER_RH
     );
     if is_scratch {
         let (bind, ident) = cx.temp(expr);

@@ -1126,6 +1126,26 @@ globalThis.__rt._put_tracked = (buf, off, value) => {
 // the direction never matters.
 globalThis.__rt.copy_nonoverlapping = (dst, src, count, clone, plain) => {
   if (count === 0) return;
+  if (clone === undefined && globalThis.__rt._bv === null
+      && globalThis.__rt._element_view_of === null
+      && dst !== null && src !== null && dst.sc === undefined && src.sc === undefined) {
+    const db = dst.buf, sb = src.buf, doff = dst.off, soff = src.off;
+    if (db !== undefined && sb !== undefined && doff >= 0 && soff >= 0
+        && doff + count <= db.length && soff + count <= sb.length) {
+      if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor) {
+        if (count <= 8) {
+          for (let i = 0; i < count; i++) db[doff + i] = sb[soff + i];
+        } else {
+          db.set(soff === 0 && count === sb.length ? sb : sb.subarray(soff, soff + count), doff);
+        }
+        return;
+      }
+      if ((plain || globalThis.__rt._boxes === null) && Array.isArray(db) && Array.isArray(sb)) {
+        for (let i = 0; i < count; i++) db[doff + i] = sb[soff + i];
+        return;
+      }
+    }
+  }
   let effCl = clone, fromNs = false;
   if (clone === undefined && globalThis.__rt._bv !== null) {
     const r = globalThis.__rt._bv.prep_copy_pair(dst, src, count);
@@ -1227,6 +1247,20 @@ globalThis.__rt._bytes = (p) => {
 // allocated as rather than a byte view of it (`_bytes`).
 globalThis.__rt.compare_bytes = (a, b, count) => {
   if (count === 0) return 0;
+  if (globalThis.__rt._bv === null && globalThis.__rt._element_view_of === null
+      && a !== null && b !== null && a.sc === undefined && b.sc === undefined) {
+    const ab = a.buf, bb = b.buf;
+    if (ab instanceof Uint8Array && bb instanceof Uint8Array) {
+      const ao = a.off, bo = b.off;
+      if (ao >= 0 && bo >= 0 && ao + count <= ab.length && bo + count <= bb.length) {
+        for (let i = 0; i < count; i++) {
+          const d = ab[ao + i] - bb[bo + i];
+          if (d !== 0) return d;
+        }
+        return 0;
+      }
+    }
+  }
   a = globalThis.__rt._bytes(a);
   b = globalThis.__rt._bytes(b);
   globalThis.__rt._scales(a, b, "compare_bytes");
@@ -3158,16 +3192,30 @@ globalThis.__rt.bytes_str = (buf, off, len) => {
 // _bstr_units(buf, off, len): the byte string of `len` bytes at `buf[off]`, a
 // plain array or a typed array. An `i8` element is read as its byte.
 // `String.fromCharCode` takes a bounded run of arguments, so long runs chunk.
+const _bstr_u8_to_latin1 =
+  typeof Buffer === "function" && typeof Buffer.from === "function"
+    ? (buf, off, len) => Buffer.from(buf.buffer, buf.byteOffset + off, len).toString("latin1")
+    : null;
+
 globalThis.__rt._bstr_units = (buf, off, len) => {
   if (len <= 0) return "";
-  let out = "";
   if (buf instanceof Uint8Array) {
+    if (len > 32 && _bstr_u8_to_latin1 !== null) {
+      return _bstr_u8_to_latin1(buf, off, len);
+    }
+    if (len <= 32) {
+      let out = "";
+      for (let i = 0; i < len; i++) out += String.fromCharCode(buf[off + i]);
+      return out;
+    }
+    let out = "";
     for (let at = 0; at < len; at += 4096) {
       const end = Math.min(len, at + 4096);
       out += String.fromCharCode.apply(null, buf.subarray(off + at, off + end));
     }
     return out;
   }
+  let out = "";
   for (let at = 0; at < len; at += 4096) {
     const end = Math.min(len, at + 4096);
     const codes = new Array(end - at);
@@ -5038,7 +5086,7 @@ globalThis.__rt._nv_fail = (m, p, l) => { if (p) p(m, l); throw __rt.abort_error
 globalThis.__rt._nv_pinfo = (m, p, l) => { const b = []; for (let i = 0; i < m.length; i++) b.push(m.charCodeAt(i)); p({ message: { template: { buf: b, off: 0 }, args: ((b.length << 1) | 1) >>> 0 }, location: l || { filename: { buf: [], off: 0, len: 0 }, line: 0, col: 0 }, can_unwind: true, force_no_backtrace: false }); };
 globalThis.__rt.tv_new = (k) => ({buf:new __rt._tv_ctors[k](0),len:0,cap:0});
 globalThis.__rt.nv_cap = (c, m, k, p) => { if (c > m) throw __rt._nv_fail("cap", p); return {buf:k!==void 0?new __rt._tv_ctors[k](c):new Array(c),len:0,cap:c}; };
-globalThis.__rt._nv_grow = (v, r, m, e, s, p) => { if (r > m) throw __rt._nv_fail("cap", p); const b = v.buf, t = ArrayBuffer.isView(b), mc = s || (t && b.BYTES_PER_ELEMENT === 1 ? 8 : 4); let n = e ? r : Math.max(mc, v.cap * 2, r); if (n > m) n = m; if (t) { const c = new b.constructor(n); if (v.len) c.set(b.subarray(0, v.len)); v.buf = c; } else b.length = n; v.cap = n; };
+globalThis.__rt._nv_grow = (v, r, m, e, s, p) => { if (r > m) throw __rt._nv_fail("cap", p); const b = v.buf, t = ArrayBuffer.isView(b), mc = s || (t && b.BYTES_PER_ELEMENT === 1 ? 8 : 4); let n = e ? r : Math.max(mc, v.cap * 2, r); if (n > m) n = m; if (t) { const c = new b.constructor(n), vl = v.len; if (vl) { if (vl <= 16) { for (let i = 0; i < vl; i++) c[i] = b[i]; } else c.set(vl === b.length ? b : b.subarray(0, vl)); } v.buf = c; } else b.length = n; v.cap = n; };
 globalThis.__rt.nv_push = (v, x, m, s, p) => { const l = v.len; if (l === v.cap) __rt._nv_grow(v, l + 1, m, 0, s, p); v.buf[l] = x; v.len = l + 1; };
 globalThis.__rt.nv_insert = (v, i, x, m, s, p, loc) => { const l = v.len; if (i > l) throw __rt._nv_fail("oob", p, loc); if (l === v.cap) __rt._nv_grow(v, l + 1, m, 0, s, p); const b = v.buf; if (i < l) b.copyWithin(i + 1, i, l); b[i] = x; v.len = l + 1; };
 globalThis.__rt.nv_reserve = (v, a, m, e, s, p) => { const r = v.len + a; if (r > v.cap) __rt._nv_grow(v, r, m, e, s, p); };
@@ -5048,7 +5096,7 @@ globalThis.__rt.nv_resize = (v, n, x, m, s, p) => { const l = v.len; if (n > l) 
 globalThis.__rt.nv_extend = (v, s, m, mc, p) => { const tl = v.len, sl = s.len, r = tl + sl; if (r > v.cap) __rt._nv_grow(v, r, m, 0, mc, p); s.len = 0; const db = v.buf, sb = s.buf; if (ArrayBuffer.isView(db)) { if (sl) db.set(sb.subarray(0, sl), tl); s.buf = new sb.constructor(0); } else { for (let i = 0; i < sl; i++) { db[tl + i] = sb[i]; sb[i] = void 0; } sb.length = 0; } v.len = r; s.cap = 0; };
 globalThis.__rt.nv_extend_slice = (v, s, m, mc, p) => { const sl = s.len; if (!sl) return; const tl = v.len, r = tl + sl; if (r > v.cap) __rt._nv_grow(v, r, m, 0, mc, p); const db = v.buf, sb = s.buf, so = s.off; if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor) db.set(sb.subarray(so, so + sl), tl); else for (let i = 0; i < sl; i++) db[tl + i] = sb[so + i]; v.len = r; };
 globalThis.__rt.nv_clone = (v) => ({buf:v.buf.slice(0,v.len),len:v.len,cap:v.len});
-globalThis.__rt.nv_from_slice = (s, k) => { const l = s.len, sb = s.buf, so = s.off; let b; if (k !== void 0) { const C = __rt._tv_ctors[k]; b = new C(l); if (l) { if (ArrayBuffer.isView(sb) && sb.constructor === C) b.set(sb.subarray(so, so + l)); else for (let i = 0; i < l; i++) b[i] = sb[so + i]; } } else if (!l) b = []; else if (Array.isArray(sb)) b = sb.slice(so, so + l); else { b = new Array(l); for (let i = 0; i < l; i++) b[i] = sb[so + i]; } return {buf:b,len:l,cap:l}; };
+globalThis.__rt.nv_from_slice = (s, k) => { const l = s.len, sb = s.buf, so = s.off; let b; if (k !== void 0) { const C = __rt._tv_ctors[k]; if (l && ArrayBuffer.isView(sb) && sb.constructor === C) { b = sb.slice(so, so + l); } else { b = new C(l); for (let i = 0; i < l; i++) b[i] = sb[so + i]; } } else if (!l) b = []; else if (Array.isArray(sb)) b = sb.slice(so, so + l); else { b = new Array(l); for (let i = 0; i < l; i++) b[i] = sb[so + i]; } return {buf:b,len:l,cap:l}; };
 globalThis.__rt.nv_from_box = (p, n, k) => { const a = !n ? [] : (Array.isArray(p) || ArrayBuffer.isView(p) ? p : p.w !== void 0 ? p.buf.slice(p.off, p.off + n) : p.buf[p.off]).slice(0, n); return {buf:k!==void 0?new __rt._tv_ctors[k](a):a,len:n,cap:n}; };
 globalThis.__rt.nv_remove = (v, i, p, loc) => { const l = v.len; if (i >= l) throw __rt._nv_fail("oob", p, loc); const b = v.buf, o = b[i]; if (i + 1 < l) b.copyWithin(i, i + 1, l); if (!ArrayBuffer.isView(b)) b[l - 1] = void 0; v.len = l - 1; return o; };
 globalThis.__rt.nv_swap_remove = (v, i, p) => { const l = v.len; if (i >= l) throw __rt._nv_fail("oob", p); const b = v.buf, e = l - 1, o = b[i]; if (i !== e) b[i] = b[e]; if (!ArrayBuffer.isView(b)) b[e] = void 0; v.len = e; return o; };

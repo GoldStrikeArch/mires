@@ -614,9 +614,17 @@ pub(crate) fn run(
 fn merge_o_stats(dst: &mut OGroup, src: OGroup) {
     dst.inline.applied += src.inline.applied;
     dst.inline.cross_object_applied += src.inline.cross_object_applied;
+    dst.inline.declined_budget += src.inline.declined_budget;
+    for (reason, count) in src.inline.declined {
+        *dst.inline.declined.entry(reason).or_default() += count;
+    }
     dst.inline.bytes_before += src.inline.bytes_before;
     dst.inline.bytes_after += src.inline.bytes_after;
     dst.inline.items.extend(src.inline.items);
+    dst.devirt.applied += src.devirt.applied;
+    dst.devirt.witnesses_recorded += src.devirt.witnesses_recorded;
+    dst.devirt.witnesses_failed += src.devirt.witnesses_failed;
+    dst.devirt.items.extend(src.devirt.items);
     dst.dce_items.extend(src.dce_items);
     dst.witnesses_recorded += src.witnesses_recorded;
     dst.witnesses_failed += src.witnesses_failed;
@@ -772,7 +780,6 @@ fn run_with_opts(
         for name in planned_repr
             .bodies
             .keys()
-            .chain(planned_repr.call_retargets.keys())
             .chain(planned_repr.nested_clone.keys())
         {
             if let Some(entry) = planned_funcs.remove(name) {
@@ -787,6 +794,7 @@ fn run_with_opts(
             &ctx,
             &post_live,
             true,
+            Some(&planned_repr.call_retargets),
         );
         planned_funcs.extend(excluded);
         merge_o_stats(&mut o_stats, post_o);
@@ -1040,7 +1048,8 @@ fn run_with_opts(
             o_stats = run_o(table, &mut funcs, &live, &ctx);
             work_table = table.clone();
             if emitting_plans && opts.analyzes(OptimizerPass::AstDce) {
-                let post_o = o_group_with_mode(&mut work_table, &mut funcs, &ctx, &live, true);
+                let post_o =
+                    o_group_with_mode(&mut work_table, &mut funcs, &ctx, &live, true, None);
                 merge_o_stats(&mut o_stats, post_o);
             }
             byte_views = crate::analysis::byte_views::analyze_reachable(
@@ -1618,7 +1627,7 @@ fn o_group(
     ctx: &Ctx<'_>,
     live: &BTreeSet<JsName>,
 ) -> OGroup {
-    o_group_with_mode(table, funcs, ctx, live, false)
+    o_group_with_mode(table, funcs, ctx, live, false, None)
 }
 
 fn o_group_with_mode(
@@ -1627,6 +1636,7 @@ fn o_group_with_mode(
     ctx: &Ctx<'_>,
     live: &BTreeSet<JsName>,
     allow_std_post_repr: bool,
+    call_retargets: Option<&BTreeMap<JsName, crate::lower::CallRetargets>>,
 ) -> OGroup {
     use crate::analysis::{callgraph, effects, summary_check};
     let mut group = OGroup::default();
@@ -1645,6 +1655,16 @@ fn o_group_with_mode(
         .iter()
         .filter_map(|(name, item)| Some((name.clone(), item.jir.interns()?)))
         .collect();
+    if allow_std_post_repr
+        && run_devirt
+        && matches!(ctx.opts.profile, Some(crate::opts::Profile::ReleaseSpeed))
+    {
+        let pre_devirt = crate::opt::devirtualize::run(funcs, &interns_map, table, ctx.vtables);
+        group.devirt.applied += pre_devirt.applied;
+        group.devirt.witnesses_recorded += pre_devirt.witnesses_recorded;
+        group.devirt.witnesses_failed += pre_devirt.witnesses_failed;
+        group.devirt.items.extend(pre_devirt.items);
+    }
     let mut graph = callgraph::build(funcs, &interns_map);
     let mut summaries = effects::compute(funcs, &interns_map, &graph);
     group.summaries_items = summaries.len() as u32;
@@ -1655,10 +1675,14 @@ fn o_group_with_mode(
     let (program, _) = write_program("", &items);
     let inline_renames = crate::minify::item_renames(&program, &items);
 
+    let empty_retargets = crate::lower::CallRetargets::new();
     // One item priced through the real phase-C pipeline on a clone, exactly the solver's rule.
     let measure_full = |name: &JsName, func: &Func| -> Option<(u64, BTreeSet<JsName>)> {
         let item = table.get(name)?;
-        let input = lower_input(name, item, ctx, &[])?;
+        let retargets = call_retargets
+            .and_then(|map| map.get(name))
+            .unwrap_or(&empty_retargets);
+        let input = lower_input_with_retargets(name, item, ctx, &[], retargets)?;
         crate::plan::cost::measure_inline_item(&input, func, &inline_renames)
     };
 
@@ -1746,7 +1770,10 @@ fn o_group_with_mode(
         let measure_imported =
             |name: &JsName, func: &Func, metadata: &crate::opt::inline::Metadata<'_>| {
                 let item = table.get(name)?;
-                let mut input = lower_input(name, item, ctx, &[])?;
+                let retargets = call_retargets
+                    .and_then(|map| map.get(name))
+                    .unwrap_or(&empty_retargets);
+                let mut input = lower_input_with_retargets(name, item, ctx, &[], retargets)?;
                 input.interns = &metadata.interns;
                 input.table = &metadata.interns.types;
                 input.origins = metadata.origins.as_deref();
@@ -1755,7 +1782,7 @@ fn o_group_with_mode(
                 }
                 crate::plan::cost::measure_inline_item(&input, func, &inline_renames)
             };
-        group.inline = crate::opt::inline::run_with_profile(
+        group.inline = crate::opt::inline::run_with_profile_and_retargets(
             funcs,
             &mut metadata,
             &graph,
@@ -1767,6 +1794,7 @@ fn o_group_with_mode(
             &sizes,
             allow_std_post_repr,
             ctx.opts.profile,
+            call_retargets,
         );
         let updates: Vec<_> = metadata
             .into_iter()
@@ -1816,7 +1844,11 @@ fn o_group_with_mode(
         group.summaries_items = summaries.len() as u32;
     }
     if run_devirt {
-        group.devirt = crate::opt::devirtualize::run(funcs, &interns_map, table, ctx.vtables);
+        let post_devirt = crate::opt::devirtualize::run(funcs, &interns_map, table, ctx.vtables);
+        group.devirt.applied += post_devirt.applied;
+        group.devirt.witnesses_recorded += post_devirt.witnesses_recorded;
+        group.devirt.witnesses_failed += post_devirt.witnesses_failed;
+        group.devirt.items.extend(post_devirt.items);
     }
     if run_dce {
         let projection = crate::opt::projection::run(funcs, &interns_map);
@@ -4687,7 +4719,7 @@ mod tests {
             .unwrap()
             .has_invoke());
 
-        let group = o_group_with_mode(&mut table, &mut funcs, &ctx, &live, true);
+        let group = o_group_with_mode(&mut table, &mut funcs, &ctx, &live, true, None);
         assert_eq!(group.inline.applied, 1);
         assert!(
             !funcs[&JsName::new("caller$h1".to_owned())]

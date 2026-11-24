@@ -357,12 +357,13 @@ fn decide_for_plan(
     let (mut accepted, mut reason, mut hotness_source, budget_consumed_bps) =
         decide(profile, before, after);
     // Under ReleaseSpeed, scalarizing a slice parameter (`{buf, off, len}` -> `(buf, off, len)`)
-    // removes property loads (`s.buf[s.off + i]`) inside tight loops even when the caller did
-    // not allocate a fresh slice wrapper on every call. Accept it whenever it does not regress
-    // allocations and stays within the speed size budget.
+    // removes property loads (`s.buf[s.off + i]`) inside tight loops, and flattening an `i64`/`u64`
+    // parameter or return (`(lo, hi)`) eliminates BigInt heap allocations that are not counted as
+    // JS object-literal allocations. Accept either whenever it does not regress object allocations
+    // and stays within the speed size budget.
     if !accepted
         && profile == Profile::ReleaseSpeed
-        && plan.has_slice_param()
+        && (plan.has_slice_param() || plan.has_i64_pair_abi())
         && reason.as_deref() == Some("cost.hotness-evidence-missing")
     {
         if let (Some(b), Some(a)) = (before, after) {
@@ -372,7 +373,11 @@ fn decide_for_plan(
             {
                 accepted = true;
                 reason = None;
-                hotness_source = Some("slice-param-scalarization");
+                hotness_source = Some(if plan.has_i64_pair_abi() {
+                    "i64-pair-abi-scalarization"
+                } else {
+                    "slice-param-scalarization"
+                });
             }
         }
     }

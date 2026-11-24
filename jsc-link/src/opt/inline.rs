@@ -77,14 +77,14 @@ const MIN_SITE_CHARGE: i64 = 24;
 const BUDGET_FLOOR: u64 = 384;
 
 /// Speed-first (`js-profile=release-speed`) post-representation inlining thresholds tuned for V8
-/// TurboFan (inline small hot helpers without creating >12 KB mega-functions that bail out of JIT).
-const SPEED_SHARED_CALLEE_FOOTPRINT: u64 = 256;
+/// TurboFan (inline small hot helpers without creating giant functions that bail out of JIT).
+const SPEED_SHARED_CALLEE_FOOTPRINT: u64 = 320;
 const SPEED_TRACK_CALLER_SHARED_FOOTPRINT: u64 = 256;
-const SPEED_LOOP_CALLEE_FOOTPRINT: u64 = 384;
-const SPEED_INLINE_HINT_FOOTPRINT: u64 = 384;
+const SPEED_LOOP_CALLEE_FOOTPRINT: u64 = 448;
+const SPEED_INLINE_HINT_FOOTPRINT: u64 = 448;
 const SPEED_INLINE_ALWAYS_FOOTPRINT: u64 = 640;
-const SPEED_CALLER_CAP: u64 = 10_240;
-const SPEED_BUDGET_FLOOR: u64 = 8_192;
+const SPEED_CALLER_CAP: u64 = 32_768;
+const SPEED_BUDGET_FLOOR: u64 = 24_576;
 
 /// What the pass did, for the sidecar's `inline` block and the driver's accounting.
 #[derive(Clone, Debug, Default)]
@@ -206,6 +206,7 @@ pub(crate) fn run_with_mode(
 }
 
 /// Runs the inliner under `profile` (`ReleaseSpeed` widens budgets and honors `#[inline]` hints).
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_with_profile(
     funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
@@ -220,6 +221,39 @@ pub(crate) fn run_with_profile(
     allow_std_post_repr: bool,
     profile: Option<crate::opts::Profile>,
 ) -> InlineStats {
+    run_with_profile_and_retargets(
+        funcs,
+        metadata,
+        graph,
+        items,
+        measure,
+        sole_referrer,
+        zombie_free,
+        program_bytes,
+        sizes,
+        allow_std_post_repr,
+        profile,
+        None,
+    )
+}
+
+/// Runs the inliner under `profile`, respecting per-caller representation `call_retargets`
+/// (skipping retargeted call sites and refusing to inline callees that themselves have retargets).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_with_profile_and_retargets(
+    funcs: &mut BTreeMap<JsName, Result<Func, Decline>>,
+    metadata: &mut BTreeMap<JsName, Metadata<'_>>,
+    graph: &Callgraph,
+    items: &ItemIndex,
+    measure: &dyn Fn(&JsName, &Func, &Metadata<'_>) -> Option<Measurement>,
+    sole_referrer: &dyn Fn(&JsName, &JsName) -> bool,
+    zombie_free: &dyn Fn(&JsName) -> bool,
+    program_bytes: u64,
+    sizes: &BTreeMap<JsName, u64>,
+    allow_std_post_repr: bool,
+    profile: Option<crate::opts::Profile>,
+    call_retargets: Option<&BTreeMap<JsName, crate::lower::CallRetargets>>,
+) -> InlineStats {
     let mut stats = InlineStats::default();
     let mut sizes = sizes.clone();
     // Run aggressive speed-first inlining only in the post-representation O pass so pre-repr
@@ -227,7 +261,7 @@ pub(crate) fn run_with_profile(
     // standard-library boundaries.
     let speed = allow_std_post_repr && matches!(profile, Some(crate::opts::Profile::ReleaseSpeed));
     let budget = if speed {
-        (program_bytes / 4).max(SPEED_BUDGET_FLOOR)
+        (program_bytes / 2).max(SPEED_BUDGET_FLOOR)
     } else {
         (program_bytes / PROGRAM_BUDGET_DENOMINATOR).max(BUDGET_FLOOR)
     };
@@ -253,6 +287,7 @@ pub(crate) fn run_with_profile(
             zombie_free,
             allow_std_post_repr,
             speed,
+            call_retargets,
             &mut stats,
         );
         if sites.is_empty() {
@@ -268,8 +303,8 @@ pub(crate) fn run_with_profile(
         let limit = if speed {
             entry_bytes
                 .saturating_mul(2)
-                .max(2_048)
-                .min(entry_bytes.max(SPEED_CALLER_CAP))
+                .max(4_096)
+                .min(entry_bytes.saturating_add(8_192).max(SPEED_CALLER_CAP))
         } else {
             entry_bytes.saturating_mul(2)
         };
@@ -462,19 +497,28 @@ pub(crate) fn run_with_profile(
             let speed_hot_loop = speed
                 && looping.contains(&(site.block as u32))
                 && callee_is_leaf
-                && callee_bytes <= 220;
-            let size_limit = if (is_sole && net <= 0)
-                || speed_hot_loop
-                || (speed && is_sole && callee_bytes <= 512)
-            {
-                limit.max(16_384)
+                && callee_bytes <= 384;
+            let speed_tiny_leaf = speed
+                && callee_is_leaf
+                && (callee_bytes <= 180
+                    || ((callee_func.sig.abi.inline_hint || callee_func.sig.abi.inline_always)
+                        && callee_bytes <= 280));
+            let speed_budget_free = speed_hot_loop || speed_tiny_leaf;
+            let size_limit = if speed_budget_free {
+                limit
+                    .max(entry_bytes.saturating_add(8_192))
+                    .max(SPEED_CALLER_CAP)
+            } else if is_sole && net <= 0 {
+                limit.max(if speed { SPEED_CALLER_CAP } else { 16_384 })
+            } else if speed && is_sole && callee_bytes <= 512 {
+                limit.max(SPEED_CALLER_CAP)
             } else {
                 limit
             };
             if after > size_limit
                 || after > bytes.saturating_add(callee_bytes)
                 || (!bounded_loop_virtualization
-                    && !speed_hot_loop
+                    && !speed_budget_free
                     && growth + charge > budget as i64)
                 || (!growth_allowed && net > 0)
             {
@@ -497,7 +541,7 @@ pub(crate) fn run_with_profile(
                 stats.decline("inline.witness-invalid");
                 continue;
             }
-            if !bounded_loop_virtualization {
+            if !bounded_loop_virtualization && !speed_tiny_leaf {
                 growth += charge;
             }
             bytes = after;
@@ -539,6 +583,7 @@ pub(crate) fn run_with_profile(
                     zombie_free,
                     allow_std_post_repr,
                     speed,
+                    call_retargets,
                     &mut throwaway_stats,
                 )
                 .into_iter()
@@ -1111,6 +1156,27 @@ fn qualifies(
     None
 }
 
+/// Whether `callee` can be safely spliced at an `RTerm::Invoke` call site: no nested `Invoke`,
+/// `Throw`, `Assert`, or `Zombie`, and any `Call`/`Drop`/`Host`/`Intrinsic` sits only inside a
+/// cold diverging block (`RTerm::Unreachable`) so hot paths gain zero `try/catch` blocks while
+/// unwind Drop cleanup remains identical.
+fn callee_invoke_safe(callee: &Func) -> bool {
+    callee.blocks.iter().all(|b| {
+        if matches!(b.term, RTerm::Invoke { .. } | RTerm::Throw(_)) {
+            return false;
+        }
+        let cold_diverging = matches!(b.term, RTerm::Unreachable);
+        b.ops.iter().all(|op| match op.kind {
+            OpKind::Assert { .. } | OpKind::Zombie(_) => false,
+            OpKind::Call { .. }
+            | OpKind::Drop { .. }
+            | OpKind::Host { .. }
+            | OpKind::Intrinsic { .. } => cold_diverging,
+            _ => true,
+        })
+    })
+}
+
 /// The candidate call sites of one caller, in block-and-op order.
 #[allow(clippy::too_many_arguments)] // One call site; the arguments are the refusal oracles.
 fn collect_sites(
@@ -1125,13 +1191,15 @@ fn collect_sites(
     zombie_free: &dyn Fn(&JsName) -> bool,
     allow_std_post_repr: bool,
     speed: bool,
+    call_retargets: Option<&BTreeMap<JsName, crate::lower::CallRetargets>>,
     stats: &mut InlineStats,
 ) -> Vec<Site> {
+    let caller_retargets = call_retargets.and_then(|map| map.get(caller));
     let mut sites = Vec::new();
     for (block_index, block) in func.blocks.iter().enumerate() {
         for (op_index, op) in block.ops.iter().enumerate() {
             let OpKind::Call {
-                callee: Callee::Direct { link_name, .. },
+                callee: Callee::Direct { item, link_name },
                 function: None,
                 args,
                 track_caller,
@@ -1141,9 +1209,22 @@ fn collect_sites(
             else {
                 continue;
             };
-            if matches!(block.term, RTerm::Invoke { .. }) && op_index + 1 == block.ops.len() {
-                stats.decline("inline.exceptional-control-flow");
+            if caller_retargets.is_some_and(|retargets| retargets.contains_key(item)) {
+                stats.decline("inline.repr-retarget");
                 continue;
+            }
+            let is_invoke =
+                matches!(block.term, RTerm::Invoke { .. }) && op_index + 1 == block.ops.len();
+            if is_invoke {
+                let unwind_uses_result = matches!(
+                    &block.term,
+                    RTerm::Invoke { unwind, .. }
+                        if op.result.is_some_and(|r| unwind.1.contains(&r))
+                );
+                if !speed || unwind_uses_result {
+                    stats.decline("inline.exceptional-control-flow");
+                    continue;
+                }
             }
             let semantic_ok = match semantic {
                 CallSemantic::Ordinary => true,
@@ -1182,6 +1263,13 @@ fn collect_sites(
                 continue;
             };
             let callee = JsName::new(name.to_owned());
+            if call_retargets
+                .and_then(|map| map.get(&callee))
+                .is_some_and(|retargets| !retargets.is_empty())
+            {
+                stats.decline("inline.repr-retarget");
+                continue;
+            }
             if &callee == caller || graph.recursive(&callee) {
                 stats.decline("inline.recursive-budget");
                 continue;
@@ -1204,6 +1292,30 @@ fn collect_sites(
                 stats.decline("inline.body-unavailable");
                 continue;
             };
+            if is_invoke && !callee_invoke_safe(callee_func) {
+                stats.decline("inline.exceptional-control-flow");
+                continue;
+            }
+            if let Some(retargets) = caller_retargets {
+                let collides = callee_func.blocks.iter().any(|b| {
+                    b.ops.iter().any(|op| match &op.kind {
+                        OpKind::Call {
+                            callee: Callee::Direct { item, .. },
+                            host: None,
+                            ..
+                        }
+                        | OpKind::Drop {
+                            glue: DropGlue::Direct { item, .. },
+                            ..
+                        } => retargets.contains_key(item),
+                        _ => false,
+                    })
+                });
+                if collides {
+                    stats.decline("inline.repr-retarget");
+                    continue;
+                }
+            }
             if callee_func.sig.abi.inline_never {
                 stats.decline("inline.never");
                 continue;
@@ -1777,16 +1889,60 @@ fn splice(func: &mut Func, block: usize, at: usize, callee: &Func) {
     // The continuation: the rest of the split block, parameterized on the call's result.
     let rest = func.blocks[block].ops.split_off(at + 1);
     func.blocks[block].ops.pop();
-    let term = std::mem::replace(
+    let old_term = std::mem::replace(
         &mut func.blocks[block].term,
         RTerm::Goto(map_block(RBlockId(0)), call_args),
     );
+    let (cont_term, invoke_unwind) = match old_term {
+        RTerm::Invoke { normal, unwind } if rest.is_empty() => {
+            (RTerm::Goto(normal.0, normal.1), Some(unwind))
+        }
+        other => (other, None),
+    };
     func.blocks.push(RBlock {
         id: continuation,
         params: call.result.into_iter().collect(),
         ops: rest,
-        term,
+        term: cont_term,
     });
+    // When splicing a callee at an `RTerm::Invoke` site, redirect any potentially-throwing op
+    // inside the spliced callee blocks to the caller's original `unwind` cleanup edge.
+    if let Some(unwind) = invoke_unwind {
+        let mut idx = block_offset as usize;
+        while idx < func.blocks.len() {
+            if idx == continuation.0 as usize {
+                idx += 1;
+                continue;
+            }
+            let throwing_pos = func.blocks[idx].ops.iter().position(|op| {
+                matches!(
+                    op.kind,
+                    OpKind::Call { .. }
+                        | OpKind::Drop { .. }
+                        | OpKind::Host { .. }
+                        | OpKind::Intrinsic { .. }
+                )
+            });
+            if let Some(pos) = throwing_pos {
+                let fresh_next = RBlockId(func.blocks.len() as u32);
+                let tail_ops = func.blocks[idx].ops.split_off(pos + 1);
+                let tail_term = std::mem::replace(
+                    &mut func.blocks[idx].term,
+                    RTerm::Invoke {
+                        normal: (fresh_next, Vec::new()),
+                        unwind: unwind.clone(),
+                    },
+                );
+                func.blocks.push(RBlock {
+                    id: fresh_next,
+                    params: Vec::new(),
+                    ops: tail_ops,
+                    term: tail_term,
+                });
+            }
+            idx += 1;
+        }
+    }
 }
 
 /// Retargets edges around empty pass-through blocks: a block with no ops whose `Goto` passes
