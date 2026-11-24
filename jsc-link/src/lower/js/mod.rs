@@ -26,6 +26,7 @@ pub mod function;
 pub mod host;
 pub mod i64_pair;
 pub mod intrinsics;
+pub mod loop_opt;
 pub mod place;
 pub mod post_opt;
 pub mod ptr;

@@ -9,10 +9,22 @@ use std::collections::{HashMap, HashSet};
 
 use rcgjs_object::jsast::{self, ArrowBody, BinOp, Expr, Stmt, UnOp};
 
-use super::i64_pair;
+use super::{i64_pair, loop_opt};
+
+/// Entry point called from unit tests (runs all speed post-opts including code-duplicating
+/// loop unrolling and loop-versioned BCE).
+#[cfg(test)]
+pub(super) fn run_speed_post_opts(decl: &mut Stmt) {
+    run_speed_post_opts_with_mode(decl, true);
+}
 
 /// Entry point called from `function::finish` on a lowered `Stmt::FunctionDecl`.
-pub(super) fn run_speed_post_opts(decl: &mut Stmt) {
+///
+/// `allow_duplicating` is `false` during inline / ABI / representation cost-pricing trials so
+/// code-duplicating speed optimizations (constant-trip loop unrolling and hot/cold loop-versioned
+/// BCE) do not distort size budgets or block tiny inlines (`into_iter`, `read_be`) and flat-ABI
+/// slice scalarization (`compress512`, `compress256`).
+pub(super) fn run_speed_post_opts_with_mode(decl: &mut Stmt, allow_duplicating: bool) {
     let Stmt::FunctionDecl { params, body, .. } = decl else {
         return;
     };
@@ -24,13 +36,37 @@ pub(super) fn run_speed_post_opts(decl: &mut Stmt) {
     //    propagation (`ah = 14`, `E = "children"`, `k = "Some"`), and constant switches.
     fold_constants_and_switches(body, &uninit_locals);
 
-    // 2. Spec-identical `Reflect.get(o, k)` fast-path + dominated object-guard CSE.
+    // 2. Collapse nested `if (a) { if (b) { ... } }` and fold guarded `f2i` i32 clamps (`earcut`).
+    loop_opt::fold_guarded_f2i(body);
+
+    // 3. Elide redundant `.slice()` clones on single-use fresh array literals (`compress256`).
+    loop_opt::elide_dead_fresh_slice_clones(body, &local_names);
+
+    // 4. Unroll small pure constant-trip loops (`2..=10` iters, `sha3::permute`), then re-fold
+    //    exposed constant arithmetic (`Math.imul`, `% 10`, `+ 1`) and dead bounds guards.
+    if allow_duplicating && loop_opt::unroll_small_const_loops(body) {
+        prop_straight_line_lits(body, &local_names);
+        fold_constants_and_switches(body, &uninit_locals);
+    }
+
+    // 5. Eliminate redundant dominated panic guards (`if (!aD)`, `if (!H)`, `if (bi)`) and
+    //    constant-table / bitmask-proven bounds checks.
+    loop_opt::eliminate_dominated_guards(body);
+
+    // 6. Hoist loop-invariant `.buf`/`.off`/`.len` property loads across cold diverging panic
+    //    calls (LICM), then version hot checked loops with a single exact pre-loop guard.
     let mut extra_decls: Vec<(String, Option<Expr>)> = Vec::new();
+    loop_opt::hoist_loop_invariant_props(body, &mut local_names, &mut extra_decls);
+    if allow_duplicating {
+        loop_opt::version_checked_loops(body);
+    }
+
+    // 7. Spec-identical `Reflect.get(o, k)` fast-path + dominated object-guard CSE.
     if !local_names.contains("Reflect") {
         optimize_reflect_get(body);
     }
 
-    // 3. Fuse adjacent `$__mires_i64_div(..., rem) + $__mires_i64_div(..., div)` pairs on
+    // 8. Fuse adjacent `$__mires_i64_div(..., rem) + $__mires_i64_div(..., div)` pairs on
     //    identical unchanged operands into a single `$__mires_i64_divrem` call.
     fuse_i64_div_rem(body, &mut local_names, &mut extra_decls);
 
@@ -76,7 +112,7 @@ fn prepend_decls(body: &mut Vec<Stmt>, extra: Vec<(String, Option<Expr>)>) {
     }
 }
 
-fn alloc_fresh_local(
+pub(super) fn alloc_fresh_local(
     local_names: &mut HashSet<String>,
     extra_decls: &mut Vec<(String, Option<Expr>)>,
     prefix: &str,
@@ -149,7 +185,7 @@ impl SimpleLit {
     }
 }
 
-fn exact_i32(expr: &Expr) -> Option<i32> {
+pub(super) fn exact_i32(expr: &Expr) -> Option<i32> {
     let n = match expr {
         Expr::Num(n) => *n,
         Expr::Unary(UnOp::Neg, inner) => match inner.as_ref() {
@@ -165,7 +201,7 @@ fn exact_i32(expr: &Expr) -> Option<i32> {
     }
 }
 
-fn exact_u32(expr: &Expr) -> Option<u32> {
+pub(super) fn exact_u32(expr: &Expr) -> Option<u32> {
     let n = match expr {
         Expr::Num(n) => *n,
         _ => return None,
@@ -332,6 +368,38 @@ fn fold_expr(expr: &mut Expr) -> bool {
             BinOp::UShr => match (to_i32_bits(l), to_i32_bits(r)) {
                 (Some(a), Some(b)) => Some(Expr::Num(((a as u32).wrapping_shr(b as u32)) as f64)),
                 _ => None,
+            },
+            BinOp::Rem => match (exact_u32(l), exact_u32(r)) {
+                (Some(a), Some(b)) if b > 0 => Some(Expr::Num((a % b) as f64)),
+                _ => None,
+            },
+            BinOp::Lt => match (exact_u32(l), exact_u32(r)) {
+                (Some(a), Some(b)) => Some(Expr::Bool(a < b)),
+                _ => match (exact_i32(l), exact_i32(r)) {
+                    (Some(a), Some(b)) => Some(Expr::Bool(a < b)),
+                    _ => None,
+                },
+            },
+            BinOp::Le => match (exact_u32(l), exact_u32(r)) {
+                (Some(a), Some(b)) => Some(Expr::Bool(a <= b)),
+                _ => match (exact_i32(l), exact_i32(r)) {
+                    (Some(a), Some(b)) => Some(Expr::Bool(a <= b)),
+                    _ => None,
+                },
+            },
+            BinOp::Gt => match (exact_u32(l), exact_u32(r)) {
+                (Some(a), Some(b)) => Some(Expr::Bool(a > b)),
+                _ => match (exact_i32(l), exact_i32(r)) {
+                    (Some(a), Some(b)) => Some(Expr::Bool(a > b)),
+                    _ => None,
+                },
+            },
+            BinOp::Ge => match (exact_u32(l), exact_u32(r)) {
+                (Some(a), Some(b)) => Some(Expr::Bool(a >= b)),
+                _ => match (exact_i32(l), exact_i32(r)) {
+                    (Some(a), Some(b)) => Some(Expr::Bool(a >= b)),
+                    _ => None,
+                },
             },
             _ => None,
         },
@@ -994,6 +1062,194 @@ fn fold_constants_and_switches(body: &mut Vec<Stmt>, uninit_locals: &HashSet<Str
     }
 }
 
+/// Forward straight-line constant propagation for unrolled loop bodies (where temp locals like
+/// `s`, `H`, `t`, `o`, `z` are assigned multiple times across unrolled iterations).
+fn prop_straight_line_lits(body: &mut [Stmt], local_names: &HashSet<String>) {
+    fn subst_env_expr(expr: &mut Expr, env: &mut HashMap<String, SimpleLit>) {
+        match expr {
+            Expr::Ident(id) => {
+                if let Some(lit) = env.get(id) {
+                    *expr = lit.to_expr();
+                }
+            }
+            Expr::Assign(lhs, rhs) => {
+                subst_env_expr(rhs, env);
+                fold_expr(rhs);
+                if let Expr::Ident(id) = lhs.as_ref() {
+                    env.remove(id);
+                } else {
+                    subst_env_expr(lhs, env);
+                    fold_expr(lhs);
+                }
+            }
+            Expr::CompoundAssign(_, lhs, rhs) => {
+                subst_env_expr(rhs, env);
+                fold_expr(rhs);
+                if let Expr::Ident(id) = lhs.as_ref() {
+                    env.remove(id);
+                } else {
+                    subst_env_expr(lhs, env);
+                    fold_expr(lhs);
+                }
+            }
+            Expr::Unary(_, e) | Expr::Member(e, _) => subst_env_expr(e, env),
+            Expr::Binary(BinOp::And | BinOp::Or, l, r) => {
+                subst_env_expr(l, env);
+                let mut r_env = env.clone();
+                subst_env_expr(r, &mut r_env);
+                env.retain(|k, v| r_env.get(k) == Some(v));
+            }
+            Expr::Binary(_, l, r) | Expr::Index(l, r) => {
+                subst_env_expr(l, env);
+                subst_env_expr(r, env);
+            }
+            Expr::Cond(c, t, e) => {
+                subst_env_expr(c, env);
+                let mut t_env = env.clone();
+                subst_env_expr(t, &mut t_env);
+                let mut e_env = env.clone();
+                subst_env_expr(e, &mut e_env);
+                env.retain(|k, v| t_env.get(k) == Some(v) && e_env.get(k) == Some(v));
+            }
+            Expr::Call(c, args) | Expr::New(c, args) => {
+                subst_env_expr(c, env);
+                for a in args {
+                    subst_env_expr(a, env);
+                }
+            }
+            Expr::Array(items) | Expr::Seq(items) => {
+                for x in items {
+                    subst_env_expr(x, env);
+                }
+            }
+            Expr::Object(entries) => {
+                for (_, v) in entries {
+                    subst_env_expr(v, env);
+                }
+            }
+            Expr::Arrow(..) => env.clear(),
+            _ => {}
+        }
+        fold_expr(expr);
+    }
+
+    fn run_block(
+        stmts: &mut [Stmt],
+        local_names: &HashSet<String>,
+        env: &mut HashMap<String, SimpleLit>,
+    ) {
+        for stmt in stmts.iter_mut() {
+            match stmt {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+                    subst_env_expr(rhs, env);
+                    if let Expr::Ident(id) = lhs.as_ref() {
+                        if local_names.contains(id) {
+                            if let Some(lit) = SimpleLit::from_expr(rhs) {
+                                env.insert(id.clone(), lit);
+                            } else {
+                                env.remove(id);
+                            }
+                        } else {
+                            env.remove(id);
+                        }
+                    } else {
+                        subst_env_expr(lhs, env);
+                    }
+                }
+                Stmt::ExprStmt(e) => {
+                    subst_env_expr(e, env);
+                }
+                Stmt::Throw(e) | Stmt::Return(Some(e)) => {
+                    subst_env_expr(e, env);
+                    env.clear();
+                }
+                Stmt::Let(n, init) => {
+                    if let Some(e) = init {
+                        subst_env_expr(e, env);
+                    }
+                    env.remove(n);
+                }
+                Stmt::Const(n, e) => {
+                    subst_env_expr(e, env);
+                    env.remove(n);
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        if let Some(e) = init {
+                            subst_env_expr(e, env);
+                        }
+                        env.remove(n);
+                    }
+                }
+                Stmt::If(c, a, b) => {
+                    subst_env_expr(c, env);
+                    let mut a_env = env.clone();
+                    run_block(a, local_names, &mut a_env);
+                    if let Some(b) = b {
+                        let mut b_env = env.clone();
+                        run_block(b, local_names, &mut b_env);
+                        env.retain(|k, v| a_env.get(k) == Some(v) && b_env.get(k) == Some(v));
+                    } else if !stmts_definitely_diverge(a) {
+                        env.retain(|k, v| a_env.get(k) == Some(v));
+                    }
+                }
+                Stmt::Block(b) => run_block(b, local_names, env),
+                Stmt::Labeled(_, inner) => {
+                    // A labeled block/loop can exit early via `break label;` with values written
+                    // prior to the break, so assignments after a conditional break inside `inner`
+                    // must NEVER leak past the labeled statement.
+                    let mut assigned = HashSet::new();
+                    collect_assigned_idents_stmts(
+                        std::slice::from_ref(inner.as_ref()),
+                        &mut assigned,
+                    );
+                    let mut inner_env = env.clone();
+                    run_block(
+                        std::slice::from_mut(inner.as_mut()),
+                        local_names,
+                        &mut inner_env,
+                    );
+                    for a in assigned {
+                        env.remove(&a);
+                    }
+                }
+                Stmt::Break(_) | Stmt::Continue(_) | Stmt::Return(None) => {
+                    env.clear();
+                }
+                Stmt::LoopForever(_, b) => {
+                    env.clear();
+                    let mut b_env = HashMap::new();
+                    run_block(b, local_names, &mut b_env);
+                }
+                Stmt::While(_, b) => {
+                    env.clear();
+                    let mut b_env = HashMap::new();
+                    run_block(b, local_names, &mut b_env);
+                }
+                Stmt::Switch(d, cases) => {
+                    subst_env_expr(d, env);
+                    for c in cases {
+                        let mut c_env = env.clone();
+                        run_block(&mut c.body, local_names, &mut c_env);
+                    }
+                    env.clear();
+                }
+                Stmt::TryCatch { body, handler, .. } => {
+                    let mut b_env = env.clone();
+                    run_block(body, local_names, &mut b_env);
+                    env.clear();
+                    let mut h_env = HashMap::new();
+                    run_block(handler, local_names, &mut h_env);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut env = HashMap::new();
+    run_block(body, local_names, &mut env);
+}
+
 // =============================================================================================
 // 2. Spec-identical `Reflect.get(o, k)` fast-path + dominated object-guard CSE
 // =============================================================================================
@@ -1475,7 +1731,7 @@ fn expr_clobbers_divrem(expr: &Expr, operands: &HashSet<String>) -> bool {
     }
 }
 
-fn stmts_definitely_diverge(stmts: &[Stmt]) -> bool {
+pub(super) fn stmts_definitely_diverge(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|s| match s {
         Stmt::Throw(_) => true,
         Stmt::ExprStmt(Expr::Call(callee, _)) => matches!(

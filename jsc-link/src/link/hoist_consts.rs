@@ -619,10 +619,14 @@ fn find_read_only_nested_array_init(
         fn check_assign(&mut self, lhs: &Expr, rhs: &Expr) {
             if let Expr::Ident(n) = lhs {
                 if n == self.local {
-                    if self.found_init.is_some()
-                        || !is_nested_scalar_array_lit(rhs, 8, self.allow_bigint)
-                    {
+                    if !is_nested_scalar_array_lit(rhs, 8, self.allow_bigint) {
                         self.bad = true;
+                        return;
+                    }
+                    if let Some(prev) = &self.found_init {
+                        if prev != rhs {
+                            self.bad = true;
+                        }
                         return;
                     }
                     self.found_init = Some(rhs.clone());
@@ -921,9 +925,14 @@ fn find_read_only_table_init(body: &[Stmt], local: &str, allow_bigint: bool) -> 
             match s {
                 Stmt::ExprStmt(Expr::Assign(lhs, rhs)) if matches!(lhs.as_ref(), Expr::Ident(n) if n == self.local) =>
                 {
-                    if self.found_init.is_some() || !is_scalar_array_lit(rhs, 8, self.allow_bigint)
-                    {
+                    if !is_scalar_array_lit(rhs, 8, self.allow_bigint) {
                         self.bad = true;
+                        return;
+                    }
+                    if let Some(prev) = &self.found_init {
+                        if prev != rhs.as_ref() {
+                            self.bad = true;
+                        }
                         return;
                     }
                     self.found_init = Some((**rhs).clone());
@@ -1176,13 +1185,14 @@ fn find_read_only_const_slice_init(body: &[Stmt], local: &str, allow_bigint: boo
                 return;
             }
             match s {
-                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) if matches!(lhs.as_ref(), Expr::Ident(n) if n == self.local) =>
-                {
-                    if self.found_init.is_some() {
-                        self.bad = true;
-                        return;
-                    }
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) if matches!(lhs.as_ref(), Expr::Ident(n) if n == self.local) => {
                     if let Some(nested) = is_pure_const_slice_lit(rhs, self.allow_bigint) {
+                        if let Some((prev, prev_nested)) = &self.found_init {
+                            if prev != rhs.as_ref() || *prev_nested != nested {
+                                self.bad = true;
+                            }
+                            return;
+                        }
                         self.found_init = Some(((**rhs).clone(), nested));
                     } else {
                         self.bad = true;

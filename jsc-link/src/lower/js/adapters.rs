@@ -242,6 +242,21 @@ fn native_vec_to_baseline(
         } else if table.is_indirect(element) {
             args.push(Expr::Bool(true));
         }
+        // Real patched `alloc` (`0018-typed-rawvec-and-box.patch`) stores `Unique<T>` directly in
+        // `RawVecInner<T>.ptr`, so `RawVec::ptr()` never casts from `*mut u8` / unscales. Pass
+        // `true` as the 4th arg so `convert_nv_block` returns the typed pointer rather than the
+        // raw byte handle (while keeping the raw/typed pair registered for later byte views).
+        let ptr_is_typed = size > 1
+            && layout
+                .ptr_pointee
+                .and_then(|pt| super::value::size_of(table, table.peeled(pt)))
+                == Some(size);
+        if ptr_is_typed {
+            if args.len() == 2 {
+                args.push(jsast::undefined());
+            }
+            args.push(Expr::Bool(true));
+        }
         jsast::rt_call("convert_nv_block", args)
     };
     let length = jsast::member(value.clone(), "len");
@@ -288,7 +303,7 @@ fn wrap_paths(
             at.push(key.clone());
             let value = match classify(table, field_ty) {
                 Leaf::Zst => jsast::undefined(),
-                Leaf::Pointer => pointer.clone(),
+                Leaf::Pointer(_) => pointer.clone(),
                 Leaf::Unsigned if at.as_slice() == cap => capacity.clone(),
                 Leaf::Unsigned => length.clone(),
                 Leaf::Recurse => {
@@ -423,6 +438,9 @@ pub(crate) struct StringLayout {
 struct VecLayout {
     /// To the `{ buf, off }` data-pointer slot.
     ptr: Vec<String>,
+    /// Pointee type of the `ptr` leaf (`T` under `0018-typed-rawvec-and-box.patch`, `u8` under
+    /// untyped `RawVecInner`).
+    ptr_pointee: Option<TypeId>,
     /// To the length in elements — the `Vec`'s own top-level field.
     len: Vec<String>,
     /// To the capacity in elements, inside the raw-parts aggregate.
@@ -448,15 +466,24 @@ impl VecLayout {
         let mut len = None;
         let mut cap = None;
         let mut ptr = None;
+        let mut ptr_pointee = None;
         walk(table, interns, ty, &[], &mut |path, leaf| match leaf {
             Leaf::Unsigned if path.len() == 1 => len = Some(path.to_vec()),
             Leaf::Unsigned => cap = Some(path.to_vec()),
-            Leaf::Pointer => ptr = Some(path.to_vec()),
+            Leaf::Pointer(pointee) => {
+                ptr = Some(path.to_vec());
+                ptr_pointee = Some(pointee);
+            }
             _ => {}
         })
         .map_err(|detail| no(&detail))?;
         match (ptr, len, cap) {
-            (Some(ptr), Some(len), Some(cap)) => Ok(Self { ptr, len, cap }),
+            (Some(ptr), Some(len), Some(cap)) => Ok(Self {
+                ptr,
+                ptr_pointee,
+                len,
+                cap,
+            }),
             _ => Err(no(
                 "the Vec structure has no pointer, length and capacity leaves",
             )),
@@ -471,7 +498,7 @@ impl VecLayout {
 /// What a leaf field of the walk is.
 #[derive(Clone, Copy, PartialEq)]
 enum Leaf {
-    Pointer,
+    Pointer(TypeId),
     Unsigned,
     Recurse,
     Zst,
@@ -520,7 +547,7 @@ impl StringLayout {
             &mut |path, leaf| match leaf {
                 Leaf::Unsigned if path.len() == 2 => len = Some(path.to_vec()),
                 Leaf::Unsigned => cap = Some(path.to_vec()),
-                Leaf::Pointer => ptr = Some(path.to_vec()),
+                Leaf::Pointer(_) => ptr = Some(path.to_vec()),
                 _ => {}
             },
         )
@@ -571,7 +598,9 @@ fn classify(table: &TypeTable, ty: TypeId) -> Leaf {
     }
     let peeled = table.peeled(ty);
     match table.get(peeled).map(|descriptor| &descriptor.kind) {
-        Some(TypeKind::RawPointer { .. } | TypeKind::Reference { .. }) => Leaf::Pointer,
+        Some(TypeKind::RawPointer { pointee, .. } | TypeKind::Reference { pointee, .. }) => {
+            Leaf::Pointer(*pointee)
+        }
         Some(TypeKind::Integer { signed: false, .. }) => Leaf::Unsigned,
         Some(TypeKind::Adt { .. }) => Leaf::Recurse,
         _ => Leaf::Recurse,

@@ -614,7 +614,7 @@ fn finish(
             eliminate_dead_local_writes(body, &local_names);
         }
         if input.opts.profile == Some(crate::opts::Profile::ReleaseSpeed) {
-            super::post_opt::run_speed_post_opts(&mut decl);
+            super::post_opt::run_speed_post_opts_with_mode(&mut decl, input.physical.is_some());
             if let Stmt::FunctionDecl { params, body, .. } = &mut decl {
                 let mut local_names: HashSet<String> = params.iter().cloned().collect();
                 for stmt in body.iter() {

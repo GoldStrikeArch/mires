@@ -1075,9 +1075,38 @@ impl Analysis {
                         max,
                     ));
                 }
-                let (l, r) = (self.interval_in(*l, block)?, self.interval_in(*r, block)?);
-                Some(binary_transfer(*op, l, r, max))
+                // Unsigned right shift by a constant (even when the shift-amount operand is a
+                // signed `i32` or narrower integer type that `widths` does not track).
+                if matches!(op, BinaryOp::Shr | BinaryOp::ShrUnchecked) {
+                    if let Some(OpKind::Const(ConstTree::Scalar {
+                        bits: shift_raw,
+                        bytes,
+                    })) = self.def_kind(func, self.canon(*r))
+                    {
+                        let shift = (mask(*shift_raw, *bytes) as u32) & (bits - 1);
+                        let l_iv = self.interval_in(*l, block).unwrap_or_else(|| Iv::full(max));
+                        return Some(Iv {
+                            lo: l_iv.lo >> shift,
+                            hi: l_iv.hi >> shift,
+                        });
+                    }
+                }
+                let (l_iv, r_iv) = (self.interval_in(*l, block)?, self.interval_in(*r, block)?);
+                let mut out = binary_transfer(*op, l_iv, r_iv, max);
+                // Even dividend modulo even constant `m >= 2` is always even, so `<= m - 2`.
+                // Wrapping arithmetic modulo `2^bits` preserves parity (since `2^bits` is even).
+                if *op == BinaryOp::Rem
+                    && r_iv.lo == r_iv.hi
+                    && r_iv.lo >= 2
+                    && (r_iv.lo & 1) == 0
+                    && self.is_even_unsigned(func, table, *l, 0)
+                {
+                    out.hi = out.hi.min(r_iv.lo - 2);
+                    out.lo = out.lo.min(out.hi);
+                }
+                Some(out)
             }
+            OpKind::Deref(ptr) => self.const_array_element_interval(func, *ptr, max).or(top),
             OpKind::Cast {
                 kind: CastKind::IntToInt,
                 v,
@@ -1096,6 +1125,99 @@ impl Analysis {
             },
             _ => top,
         }
+    }
+
+    /// Whether an unsigned integer value is provably even (low bit 0). Wrapping arithmetic modulo
+    /// `2^bits` (`bits >= 1`) preserves parity, so no overflow precondition is required.
+    fn is_even_unsigned(&self, func: &Func, table: &TypeTable, v: ValueId, depth: u8) -> bool {
+        if depth >= 6 {
+            return false;
+        }
+        let canon = self.canon(v);
+        match self.def_kind(func, canon) {
+            Some(OpKind::Const(ConstTree::Scalar { bits: val, bytes })) => {
+                (mask(*val, *bytes) & 1) == 0
+            }
+            Some(OpKind::Copy(src) | OpKind::Move(src)) => {
+                self.is_even_unsigned(func, table, *src, depth + 1)
+            }
+            Some(OpKind::Binary { op, l, r, ty }) if matches!(table.int_info(*ty), Some((false, bits)) if bits >= 1) =>
+            {
+                let bits = table.int_info(*ty).map_or(32, |(_, b)| b);
+                match op {
+                    BinaryOp::Add
+                    | BinaryOp::AddUnchecked
+                    | BinaryOp::Sub
+                    | BinaryOp::SubUnchecked => {
+                        self.is_even_unsigned(func, table, *l, depth + 1)
+                            && self.is_even_unsigned(func, table, *r, depth + 1)
+                    }
+                    BinaryOp::Mul | BinaryOp::MulUnchecked => {
+                        self.is_even_unsigned(func, table, *l, depth + 1)
+                            || self.is_even_unsigned(func, table, *r, depth + 1)
+                    }
+                    BinaryOp::Shl | BinaryOp::ShlUnchecked => {
+                        matches!(
+                            self.def_kind(func, self.canon(*r)),
+                            Some(OpKind::Const(ConstTree::Scalar { bits: s, bytes }))
+                                if ((mask(*s, *bytes) as u32) & (bits - 1)) >= 1
+                        )
+                    }
+                    BinaryOp::Rem => {
+                        self.is_even_unsigned(func, table, *l, depth + 1)
+                            && self.is_even_unsigned(func, table, *r, depth + 1)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Computes `[min, max]` over all elements when `ptr` indexes a constant scalar array/slice.
+    fn const_array_element_interval(&self, func: &Func, ptr: ValueId, max: u128) -> Option<Iv> {
+        let (root_val, path) = match self.def_kind(func, self.canon(ptr))? {
+            OpKind::BorrowView {
+                root: Root::Value(v),
+                path,
+                ..
+            }
+            | OpKind::RawView {
+                root: Root::Value(v),
+                path,
+                ..
+            } => (*v, path),
+            _ => return None,
+        };
+        let valid_path = matches!(
+            path.as_slice(),
+            [Proj::Index(_)] | [Proj::Deref, Proj::Index(_)]
+        );
+        if !valid_path {
+            return None;
+        }
+        let OpKind::Const(root_tree) = self.def_kind(func, self.canon(root_val))? else {
+            return None;
+        };
+        let mut tree: &ConstTree = root_tree;
+        while let ConstTree::Reference(inner) = tree {
+            tree = inner.as_ref();
+        }
+        let items = match tree {
+            ConstTree::Aggregate(items) | ConstTree::Slice(items) if !items.is_empty() => items,
+            _ => return None,
+        };
+        let mut lo = u128::MAX;
+        let mut hi = 0u128;
+        for item in items {
+            let ConstTree::Scalar { bits: val, bytes } = item else {
+                return None;
+            };
+            let v = mask(*val, *bytes).min(max);
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        Some(Iv { lo, hi })
     }
 
     /// The length bound of a pointer's metadata: a slice of elements that take space, or `str`,

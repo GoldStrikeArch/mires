@@ -80,7 +80,7 @@ const BUDGET_FLOOR: u64 = 384;
 /// TurboFan (inline small hot helpers without creating giant functions that bail out of JIT).
 const SPEED_SHARED_CALLEE_FOOTPRINT: u64 = 320;
 const SPEED_TRACK_CALLER_SHARED_FOOTPRINT: u64 = 256;
-const SPEED_LOOP_CALLEE_FOOTPRINT: u64 = 448;
+const SPEED_LOOP_CALLEE_FOOTPRINT: u64 = 640;
 const SPEED_INLINE_HINT_FOOTPRINT: u64 = 448;
 const SPEED_INLINE_ALWAYS_FOOTPRINT: u64 = 640;
 const SPEED_CALLER_CAP: u64 = 32_768;
@@ -497,7 +497,7 @@ pub(crate) fn run_with_profile_and_retargets(
             let speed_hot_loop = speed
                 && looping.contains(&(site.block as u32))
                 && callee_is_leaf
-                && callee_bytes <= 384;
+                && callee_bytes <= 640;
             let speed_tiny_leaf = speed
                 && callee_is_leaf
                 && (callee_bytes <= 180
