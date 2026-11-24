@@ -15,7 +15,8 @@ use super::{i64_pair, loop_opt};
 /// loop unrolling and loop-versioned BCE).
 #[cfg(test)]
 pub(super) fn run_speed_post_opts(decl: &mut Stmt) {
-    run_speed_post_opts_with_mode(decl, true);
+    let empty = HashSet::new();
+    run_speed_post_opts_with_mode(decl, true, &empty);
 }
 
 /// Entry point called from `function::finish` on a lowered `Stmt::FunctionDecl`.
@@ -24,7 +25,11 @@ pub(super) fn run_speed_post_opts(decl: &mut Stmt) {
 /// code-duplicating speed optimizations (constant-trip loop unrolling and hot/cold loop-versioned
 /// BCE) do not distort size budgets or block tiny inlines (`into_iter`, `read_be`) and flat-ABI
 /// slice scalarization (`compress512`, `compress256`).
-pub(super) fn run_speed_post_opts_with_mode(decl: &mut Stmt, allow_duplicating: bool) {
+pub(super) fn run_speed_post_opts_with_mode(
+    decl: &mut Stmt,
+    allow_duplicating: bool,
+    immutable_slices: &HashSet<String>,
+) {
     let Stmt::FunctionDecl { params, body, .. } = decl else {
         return;
     };
@@ -35,6 +40,12 @@ pub(super) fn run_speed_post_opts_with_mode(decl: &mut Stmt, allow_duplicating: 
     // 1. Fold constant expressions, constant array indexing (`[1][0]`), single-assign literal
     //    propagation (`ah = 14`, `E = "children"`, `k = "Some"`), and constant switches.
     fold_constants_and_switches(body, &uninit_locals);
+
+    // 1b. Fast-path dead-`lo` `$__mires_i64_f64_to_bits(x)` sign-bit tests (`f64::is_sign_negative`
+    //     in `f64::min`/`f64::max`), then re-fold any exposed constant branches (`c === 1`).
+    if fast_path_f64_sign_bit(body) {
+        fold_constants_and_switches(body, &uninit_locals);
+    }
 
     // 2. Collapse nested `if (a) { if (b) { ... } }` and fold guarded `f2i` i32 clamps (`earcut`).
     loop_opt::fold_guarded_f2i(body);
@@ -54,9 +65,16 @@ pub(super) fn run_speed_post_opts_with_mode(decl: &mut Stmt, allow_duplicating: 
     loop_opt::eliminate_dominated_guards(body);
 
     // 6. Hoist loop-invariant `.buf`/`.off`/`.len` property loads across cold diverging panic
-    //    calls (LICM), then version hot checked loops with a single exact pre-loop guard.
+    //    calls (LICM), CSE repeated dominating `s.charCodeAt(idx)` loads, then version hot
+    //    checked loops with a single exact pre-loop guard.
     let mut extra_decls: Vec<(String, Option<Expr>)> = Vec::new();
-    loop_opt::hoist_loop_invariant_props(body, &mut local_names, &mut extra_decls);
+    cse_dominating_char_code_at(body, &mut local_names, &mut extra_decls);
+    loop_opt::hoist_loop_invariant_props(
+        body,
+        &mut local_names,
+        &mut extra_decls,
+        immutable_slices,
+    );
     if allow_duplicating {
         loop_opt::version_checked_loops(body);
     }
@@ -225,6 +243,43 @@ fn num_expr_i32(v: i32) -> Expr {
     }
 }
 
+fn is_bool_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Bool(_) | Expr::Unary(UnOp::Not, _) => true,
+        Expr::Binary(op, l, r) => match op {
+            BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::StrictEq
+            | BinOp::StrictNe
+            | BinOp::Eq
+            | BinOp::Ne => true,
+            BinOp::And | BinOp::Or => is_bool_expr(l) && is_bool_expr(r),
+            _ => false,
+        },
+        Expr::Cond(_, t, e) => is_bool_expr(t) && is_bool_expr(e),
+        _ => false,
+    }
+}
+
+fn is_already_i32_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Unary(UnOp::BitNot, _) => true,
+        Expr::Binary(
+            BinOp::BitOr | BinOp::BitAnd | BinOp::BitXor | BinOp::Shl | BinOp::Shr,
+            _,
+            _,
+        ) => true,
+        Expr::Call(callee, args) if args.len() == 2 => matches!(
+            callee.as_ref(),
+            Expr::Member(obj, prop)
+                if matches!(obj.as_ref(), Expr::Ident(id) if id == "Math") && prop == "imul"
+        ),
+        _ => false,
+    }
+}
+
 fn fold_expr(expr: &mut Expr) -> bool {
     let mut changed = false;
     match expr {
@@ -310,7 +365,7 @@ fn fold_expr(expr: &mut Expr) -> bool {
                 None
             }
         }
-        // `Math.imul(c1, c2)` -> exact i32 product
+        // `Math.imul(c1, c2)` -> exact i32 product; `Math.imul(x, 1)` / `Math.imul(1, x)` -> `x | 0`
         Expr::Call(callee, args) if args.len() == 2 => {
             let is_imul = matches!(
                 callee.as_ref(),
@@ -321,32 +376,92 @@ fn fold_expr(expr: &mut Expr) -> bool {
             if is_imul {
                 match (to_i32_bits(&args[0]), to_i32_bits(&args[1])) {
                     (Some(a), Some(b)) => Some(num_expr_i32(a.wrapping_mul(b))),
+                    (None, Some(1)) => Some(if is_already_i32_expr(&args[0]) {
+                        args[0].clone()
+                    } else {
+                        Expr::Binary(
+                            BinOp::BitOr,
+                            Box::new(args[0].clone()),
+                            Box::new(Expr::Num(0.0)),
+                        )
+                    }),
+                    (Some(1), None) => Some(if is_already_i32_expr(&args[1]) {
+                        args[1].clone()
+                    } else {
+                        Expr::Binary(
+                            BinOp::BitOr,
+                            Box::new(args[1].clone()),
+                            Box::new(Expr::Num(0.0)),
+                        )
+                    }),
                     _ => None,
                 }
             } else {
                 None
             }
         }
-        // `!true` / `!false`
+        // `!true` / `!false` / `!!bool_expr`
         Expr::Unary(UnOp::Not, inner) => match inner.as_ref() {
             Expr::Bool(b) => Some(Expr::Bool(!*b)),
+            Expr::Unary(UnOp::Not, inner2) if is_bool_expr(inner2) => Some((**inner2).clone()),
             _ => None,
         },
-        // `true ? a : b` / `false ? a : b`
+        // `true ? a : b` / `false ? a : b` / `bool_expr ? 1 : 0` -> `bool_expr | 0`
         Expr::Cond(cond, then_e, else_e) => match cond.as_ref() {
             Expr::Bool(true) => Some((**then_e).clone()),
             Expr::Bool(false) => Some((**else_e).clone()),
+            _ if is_bool_expr(cond)
+                && exact_i32(then_e) == Some(1)
+                && exact_i32(else_e) == Some(0) =>
+            {
+                Some(Expr::Binary(
+                    BinOp::BitOr,
+                    Box::new((**cond).clone()),
+                    Box::new(Expr::Num(0.0)),
+                ))
+            }
+            Expr::Unary(UnOp::Not, inner)
+                if is_bool_expr(inner)
+                    && exact_i32(then_e) == Some(0)
+                    && exact_i32(else_e) == Some(1) =>
+            {
+                Some(Expr::Binary(
+                    BinOp::BitOr,
+                    Box::new((**inner).clone()),
+                    Box::new(Expr::Num(0.0)),
+                ))
+            }
             _ => None,
         },
         // Binary constant folds
         Expr::Binary(op, l, r) => match op {
             BinOp::StrictEq => match (SimpleLit::from_expr(l), SimpleLit::from_expr(r)) {
                 (Some(a), Some(b)) => Some(Expr::Bool(a.strict_eq(&b))),
-                _ => None,
+                _ => match (l.as_ref(), r.as_ref()) {
+                    (_, Expr::Bool(true)) if is_bool_expr(l) => Some((**l).clone()),
+                    (Expr::Bool(true), _) if is_bool_expr(r) => Some((**r).clone()),
+                    (_, Expr::Bool(false)) if is_bool_expr(l) => {
+                        Some(Expr::Unary(UnOp::Not, Box::new((**l).clone())))
+                    }
+                    (Expr::Bool(false), _) if is_bool_expr(r) => {
+                        Some(Expr::Unary(UnOp::Not, Box::new((**r).clone())))
+                    }
+                    _ => None,
+                },
             },
             BinOp::StrictNe => match (SimpleLit::from_expr(l), SimpleLit::from_expr(r)) {
                 (Some(a), Some(b)) => Some(Expr::Bool(!a.strict_eq(&b))),
-                _ => None,
+                _ => match (l.as_ref(), r.as_ref()) {
+                    (_, Expr::Bool(false)) if is_bool_expr(l) => Some((**l).clone()),
+                    (Expr::Bool(false), _) if is_bool_expr(r) => Some((**r).clone()),
+                    (_, Expr::Bool(true)) if is_bool_expr(l) => {
+                        Some(Expr::Unary(UnOp::Not, Box::new((**l).clone())))
+                    }
+                    (Expr::Bool(true), _) if is_bool_expr(r) => {
+                        Some(Expr::Unary(UnOp::Not, Box::new((**r).clone())))
+                    }
+                    _ => None,
+                },
             },
             BinOp::Add => match (exact_i32(l), exact_i32(r)) {
                 (Some(a), Some(b)) => {
@@ -374,10 +489,52 @@ fn fold_expr(expr: &mut Expr) -> bool {
             },
             BinOp::BitOr => match (to_i32_bits(l), to_i32_bits(r)) {
                 (Some(a), Some(b)) => Some(num_expr_i32(a | b)),
+                (None, Some(0)) if is_already_i32_expr(l) => Some((**l).clone()),
+                (Some(0), None) if is_already_i32_expr(r) => Some((**r).clone()),
                 _ => None,
             },
             BinOp::BitAnd => match (to_i32_bits(l), to_i32_bits(r)) {
                 (Some(a), Some(b)) => Some(num_expr_i32(a & b)),
+                (None, Some(m2)) => match l.as_ref() {
+                    Expr::Binary(BinOp::BitAnd, a, b) => {
+                        if let Some(m1) = to_i32_bits(b) {
+                            Some(Expr::Binary(
+                                BinOp::BitAnd,
+                                Box::new((**a).clone()),
+                                Box::new(num_expr_i32(m1 & m2)),
+                            ))
+                        } else {
+                            to_i32_bits(a).map(|m1| {
+                                Expr::Binary(
+                                    BinOp::BitAnd,
+                                    Box::new((**b).clone()),
+                                    Box::new(num_expr_i32(m1 & m2)),
+                                )
+                            })
+                        }
+                    }
+                    _ => None,
+                },
+                (Some(m1), None) => match r.as_ref() {
+                    Expr::Binary(BinOp::BitAnd, a, b) => {
+                        if let Some(m2) = to_i32_bits(b) {
+                            Some(Expr::Binary(
+                                BinOp::BitAnd,
+                                Box::new((**a).clone()),
+                                Box::new(num_expr_i32(m1 & m2)),
+                            ))
+                        } else {
+                            to_i32_bits(a).map(|m2| {
+                                Expr::Binary(
+                                    BinOp::BitAnd,
+                                    Box::new((**b).clone()),
+                                    Box::new(num_expr_i32(m1 & m2)),
+                                )
+                            })
+                        }
+                    }
+                    _ => None,
+                },
                 _ => None,
             },
             BinOp::BitXor => match (to_i32_bits(l), to_i32_bits(r)) {
@@ -394,6 +551,11 @@ fn fold_expr(expr: &mut Expr) -> bool {
             },
             BinOp::UShr => match (to_i32_bits(l), to_i32_bits(r)) {
                 (Some(a), Some(b)) => Some(Expr::Num(((a as u32).wrapping_shr(b as u32)) as f64)),
+                _ if exact_i32(r) == Some(0)
+                    && matches!(l.as_ref(), Expr::Binary(BinOp::UShr, _, _)) =>
+                {
+                    Some(l.as_ref().clone())
+                }
                 _ => None,
             },
             BinOp::Rem => match (exact_u32(l), exact_u32(r)) {
@@ -1962,6 +2124,930 @@ fn fuse_i64_div_rem(
     }
 }
 
+/// Fast-paths dead-`lo` `$__mires_i64_f64_to_bits(x)` sign-bit tests
+/// (`hi = $__mires_i64_hi; (hi & -2147483648) !== 0`), which Rust emits inside
+/// `f64::is_sign_negative` / `f64::min` / `f64::max`.
+///
+/// - Constant literals fold directly using `f64::is_sign_negative`.
+/// - Variables dominated by `x === C` (`C != 0.0`, non-NaN) fold directly to `C < 0.0`.
+/// - Variables dominated by `x === y` (guaranteed non-NaN by IEEE-754) lower to the branchless
+///   inline check `x < 0 || x === 0 && 1 / x < 0` (exact for `-0.0`, `+0.0`, `±Infinity`, finite).
+/// - General variables guard NaN via `x === x ? (x < 0 || x === 0 && 1 / x < 0) : ...` so
+///   `-NaN` sign bits remain bit-exact while non-NaN floats never call `f64_to_bits`.
+fn fast_path_f64_sign_bit(body: &mut Vec<Stmt>) -> bool {
+    let mut read_counts: HashMap<String, usize> = HashMap::new();
+    for stmt in body.iter() {
+        tally_ident_reads_stmt(stmt, &mut read_counts);
+    }
+    let mut non_nan: HashSet<String> = HashSet::new();
+    let mut known_nonzero: HashMap<String, f64> = HashMap::new();
+    fast_path_f64_sign_bit_stmts(body, &read_counts, &mut non_nan, &mut known_nonzero)
+}
+
+fn exact_f64_lit(expr: &Expr) -> Option<f64> {
+    match expr {
+        Expr::Num(n) => Some(*n),
+        Expr::Unary(UnOp::Neg, inner) => match inner.as_ref() {
+            Expr::Num(n) => Some(-*n),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn tally_ident_reads_expr(expr: &Expr, counts: &mut HashMap<String, usize>) {
+    match expr {
+        Expr::Ident(id) => *counts.entry(id.clone()).or_insert(0) += 1,
+        Expr::Member(obj, _) => tally_ident_reads_expr(obj, counts),
+        Expr::Index(obj, idx) => {
+            tally_ident_reads_expr(obj, counts);
+            tally_ident_reads_expr(idx, counts);
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            tally_ident_reads_expr(c, counts);
+            for a in args {
+                tally_ident_reads_expr(a, counts);
+            }
+        }
+        Expr::Unary(_, inner) => tally_ident_reads_expr(inner, counts),
+        Expr::Binary(_, l, r) => {
+            tally_ident_reads_expr(l, counts);
+            tally_ident_reads_expr(r, counts);
+        }
+        Expr::Assign(lhs, rhs) => {
+            if !matches!(lhs.as_ref(), Expr::Ident(_)) {
+                tally_ident_reads_expr(lhs, counts);
+            }
+            tally_ident_reads_expr(rhs, counts);
+        }
+        Expr::CompoundAssign(_, lhs, rhs) => {
+            tally_ident_reads_expr(lhs, counts);
+            tally_ident_reads_expr(rhs, counts);
+        }
+        Expr::Cond(c, t, e) => {
+            tally_ident_reads_expr(c, counts);
+            tally_ident_reads_expr(t, counts);
+            tally_ident_reads_expr(e, counts);
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                tally_ident_reads_expr(v, counts);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for item in items {
+                tally_ident_reads_expr(item, counts);
+            }
+        }
+        Expr::Arrow(_, ArrowBody::Expr(b)) => tally_ident_reads_expr(b, counts),
+        Expr::Arrow(_, ArrowBody::Block(stmts)) => {
+            for s in stmts {
+                tally_ident_reads_stmt(s, counts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tally_ident_reads_stmt(stmt: &Stmt, counts: &mut HashMap<String, usize>) {
+    match stmt {
+        Stmt::ExprStmt(e) | Stmt::Return(Some(e)) | Stmt::Throw(e) => {
+            tally_ident_reads_expr(e, counts);
+        }
+        Stmt::Let(_, Some(e)) | Stmt::Const(_, e) => tally_ident_reads_expr(e, counts),
+        Stmt::Lets(decls) => {
+            for (_, init) in decls {
+                if let Some(e) = init {
+                    tally_ident_reads_expr(e, counts);
+                }
+            }
+        }
+        Stmt::If(c, t, e) => {
+            tally_ident_reads_expr(c, counts);
+            for s in t {
+                tally_ident_reads_stmt(s, counts);
+            }
+            if let Some(el) = e {
+                for s in el {
+                    tally_ident_reads_stmt(s, counts);
+                }
+            }
+        }
+        Stmt::While(c, b) => {
+            tally_ident_reads_expr(c, counts);
+            for s in b {
+                tally_ident_reads_stmt(s, counts);
+            }
+        }
+        Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+            for s in b {
+                tally_ident_reads_stmt(s, counts);
+            }
+        }
+        Stmt::Labeled(_, inner) => tally_ident_reads_stmt(inner, counts),
+        Stmt::Switch(scrut, cases) => {
+            tally_ident_reads_expr(scrut, counts);
+            for c in cases {
+                for t in &c.tests {
+                    tally_ident_reads_expr(t, counts);
+                }
+                for s in &c.body {
+                    tally_ident_reads_stmt(s, counts);
+                }
+            }
+        }
+        Stmt::TryCatch { body, handler, .. } => {
+            for s in body {
+                tally_ident_reads_stmt(s, counts);
+            }
+            for s in handler {
+                tally_ident_reads_stmt(s, counts);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_written_idents_expr(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
+            if let Expr::Ident(id) = lhs.as_ref() {
+                out.insert(id.clone());
+            } else {
+                collect_written_idents_expr(lhs, out);
+            }
+            collect_written_idents_expr(rhs, out);
+        }
+        Expr::Member(obj, _) => collect_written_idents_expr(obj, out),
+        Expr::Index(obj, idx) => {
+            collect_written_idents_expr(obj, out);
+            collect_written_idents_expr(idx, out);
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            collect_written_idents_expr(c, out);
+            for a in args {
+                collect_written_idents_expr(a, out);
+            }
+        }
+        Expr::Unary(_, inner) => collect_written_idents_expr(inner, out),
+        Expr::Binary(_, l, r) => {
+            collect_written_idents_expr(l, out);
+            collect_written_idents_expr(r, out);
+        }
+        Expr::Cond(c, t, e) => {
+            collect_written_idents_expr(c, out);
+            collect_written_idents_expr(t, out);
+            collect_written_idents_expr(e, out);
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                collect_written_idents_expr(v, out);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for item in items {
+                collect_written_idents_expr(item, out);
+            }
+        }
+        Expr::Arrow(_, ArrowBody::Expr(b)) => collect_written_idents_expr(b, out),
+        Expr::Arrow(_, ArrowBody::Block(stmts)) => {
+            for s in stmts {
+                collect_written_idents_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_written_idents_stmt(stmt: &Stmt, out: &mut HashSet<String>) {
+    match stmt {
+        Stmt::ExprStmt(e) | Stmt::Return(Some(e)) | Stmt::Throw(e) => {
+            collect_written_idents_expr(e, out);
+        }
+        Stmt::Let(n, init) => {
+            out.insert(n.clone());
+            if let Some(e) = init {
+                collect_written_idents_expr(e, out);
+            }
+        }
+        Stmt::Const(n, e) => {
+            out.insert(n.clone());
+            collect_written_idents_expr(e, out);
+        }
+        Stmt::Lets(decls) => {
+            for (n, init) in decls {
+                out.insert(n.clone());
+                if let Some(e) = init {
+                    collect_written_idents_expr(e, out);
+                }
+            }
+        }
+        Stmt::If(c, t, e) => {
+            collect_written_idents_expr(c, out);
+            for s in t {
+                collect_written_idents_stmt(s, out);
+            }
+            if let Some(el) = e {
+                for s in el {
+                    collect_written_idents_stmt(s, out);
+                }
+            }
+        }
+        Stmt::While(c, b) => {
+            collect_written_idents_expr(c, out);
+            for s in b {
+                collect_written_idents_stmt(s, out);
+            }
+        }
+        Stmt::LoopForever(_, b) | Stmt::Block(b) => {
+            for s in b {
+                collect_written_idents_stmt(s, out);
+            }
+        }
+        Stmt::Labeled(_, inner) => collect_written_idents_stmt(inner, out),
+        Stmt::Switch(scrut, cases) => {
+            collect_written_idents_expr(scrut, out);
+            for c in cases {
+                for t in &c.tests {
+                    collect_written_idents_expr(t, out);
+                }
+                for s in &c.body {
+                    collect_written_idents_stmt(s, out);
+                }
+            }
+        }
+        Stmt::TryCatch {
+            body,
+            binding,
+            handler,
+        } => {
+            for s in body {
+                collect_written_idents_stmt(s, out);
+            }
+            out.insert(binding.clone());
+            for s in handler {
+                collect_written_idents_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn match_f64_to_bits_call<'a>(
+    stmt: &'a Stmt,
+    read_counts: &HashMap<String, usize>,
+) -> Option<&'a Expr> {
+    let Stmt::ExprStmt(expr) = stmt else {
+        return None;
+    };
+    let call = match expr {
+        Expr::Call(..) => expr,
+        Expr::Assign(lhs, rhs) => {
+            let Expr::Ident(lo) = lhs.as_ref() else {
+                return None;
+            };
+            if read_counts.get(lo).copied().unwrap_or(0) != 0 {
+                return None;
+            }
+            rhs.as_ref()
+        }
+        _ => return None,
+    };
+    let Expr::Call(callee, args) = call else {
+        return None;
+    };
+    if !matches!(callee.as_ref(), Expr::Ident(id) if id == "$__mires_i64_f64_to_bits")
+        || args.len() != 1
+    {
+        return None;
+    }
+    let arg = &args[0];
+    if matches!(arg, Expr::Ident(_)) || exact_f64_lit(arg).is_some() {
+        Some(arg)
+    } else {
+        None
+    }
+}
+
+fn match_hi_assign(stmt: &Stmt, read_counts: &HashMap<String, usize>) -> Option<String> {
+    let Stmt::ExprStmt(Expr::Assign(lhs, rhs)) = stmt else {
+        return None;
+    };
+    let Expr::Ident(hi_var) = lhs.as_ref() else {
+        return None;
+    };
+    if !matches!(rhs.as_ref(), Expr::Ident(id) if id == "$__mires_i64_hi") {
+        return None;
+    }
+    if read_counts.get(hi_var).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+    Some(hi_var.clone())
+}
+
+/// Matches `(hi_var & -2147483648) !== 0` (returns `Some(true)`) or `=== 0` (returns `Some(false)`),
+/// tolerating an optional outer `0 | ...` or `... | 0`.
+fn match_sign_bit_test(expr: &Expr, hi_var: &str) -> Option<bool> {
+    let Expr::Binary(op @ (BinOp::StrictNe | BinOp::StrictEq), l, r) = expr else {
+        return None;
+    };
+    let test_side = if exact_i32(r) == Some(0) {
+        l.as_ref()
+    } else if exact_i32(l) == Some(0) {
+        r.as_ref()
+    } else {
+        return None;
+    };
+    let unwrapped = match test_side {
+        Expr::Binary(BinOp::BitOr, a, b) if exact_i32(a) == Some(0) => b.as_ref(),
+        Expr::Binary(BinOp::BitOr, a, b) if exact_i32(b) == Some(0) => a.as_ref(),
+        other => other,
+    };
+    let Expr::Binary(BinOp::BitAnd, a, b) = unwrapped else {
+        return None;
+    };
+    let is_hi_and_sign = (matches!(a.as_ref(), Expr::Ident(id) if id == hi_var)
+        && to_i32_bits(b) == Some(i32::MIN))
+        || (matches!(b.as_ref(), Expr::Ident(id) if id == hi_var)
+            && to_i32_bits(a) == Some(i32::MIN));
+    if is_hi_and_sign {
+        Some(*op == BinOp::StrictNe)
+    } else {
+        None
+    }
+}
+
+fn build_sign_bit_expr(
+    arg: &Expr,
+    expect_neg: bool,
+    non_nan: &HashSet<String>,
+    known_nonzero: &HashMap<String, f64>,
+) -> Expr {
+    if let Some(c) = exact_f64_lit(arg) {
+        return Expr::Bool(c.is_sign_negative() == expect_neg);
+    }
+    if let Expr::Ident(v) = arg {
+        if let Some(&c) = known_nonzero.get(v) {
+            return Expr::Bool((c < 0.0) == expect_neg);
+        }
+    }
+    let non_nan_check = Expr::Binary(
+        BinOp::Or,
+        Box::new(Expr::Binary(
+            BinOp::Lt,
+            Box::new(arg.clone()),
+            Box::new(Expr::Num(0.0)),
+        )),
+        Box::new(Expr::Binary(
+            BinOp::And,
+            Box::new(Expr::Binary(
+                BinOp::StrictEq,
+                Box::new(arg.clone()),
+                Box::new(Expr::Num(0.0)),
+            )),
+            Box::new(Expr::Binary(
+                BinOp::Lt,
+                Box::new(Expr::Binary(
+                    BinOp::Div,
+                    Box::new(Expr::Num(1.0)),
+                    Box::new(arg.clone()),
+                )),
+                Box::new(Expr::Num(0.0)),
+            )),
+        )),
+    );
+    let is_known_non_nan = matches!(arg, Expr::Ident(v) if non_nan.contains(v));
+    let neg_expr = if is_known_non_nan {
+        non_nan_check
+    } else {
+        let fallback = Expr::Seq(vec![
+            jsast::call(jsast::id("$__mires_i64_f64_to_bits"), vec![arg.clone()]),
+            Expr::Binary(
+                BinOp::StrictNe,
+                Box::new(Expr::Binary(
+                    BinOp::BitAnd,
+                    Box::new(jsast::id("$__mires_i64_hi")),
+                    Box::new(num_expr_i32(i32::MIN)),
+                )),
+                Box::new(Expr::Num(0.0)),
+            ),
+        ]);
+        Expr::Cond(
+            Box::new(Expr::Binary(
+                BinOp::StrictEq,
+                Box::new(arg.clone()),
+                Box::new(arg.clone()),
+            )),
+            Box::new(non_nan_check),
+            Box::new(fallback),
+        )
+    };
+    if expect_neg {
+        neg_expr
+    } else {
+        Expr::Unary(UnOp::Not, Box::new(neg_expr))
+    }
+}
+
+fn fast_path_f64_sign_bit_stmts(
+    stmts: &mut Vec<Stmt>,
+    read_counts: &HashMap<String, usize>,
+    non_nan: &mut HashSet<String>,
+    known_nonzero: &mut HashMap<String, f64>,
+) -> bool {
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < stmts.len() {
+        if i + 2 < stmts.len() {
+            if let Some(arg) = match_f64_to_bits_call(&stmts[i], read_counts).cloned() {
+                if let Some(hi_var) = match_hi_assign(&stmts[i + 1], read_counts) {
+                    let matched = match &mut stmts[i + 2] {
+                        Stmt::ExprStmt(Expr::Assign(_, rhs)) => {
+                            if let Some(expect_neg) = match_sign_bit_test(rhs, &hi_var) {
+                                **rhs =
+                                    build_sign_bit_expr(&arg, expect_neg, non_nan, known_nonzero);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        Stmt::If(cond, _, _) => {
+                            if let Some(expect_neg) = match_sign_bit_test(cond, &hi_var) {
+                                *cond =
+                                    build_sign_bit_expr(&arg, expect_neg, non_nan, known_nonzero);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        _ => false,
+                    };
+                    if matched {
+                        stmts.drain(i..i + 2);
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Recurse into nested control flow while maintaining exact dominating facts.
+        match &mut stmts[i] {
+            Stmt::If(cond, then_b, else_b) => {
+                let mut then_nn = non_nan.clone();
+                let mut then_nz = known_nonzero.clone();
+                if let Expr::Binary(BinOp::StrictEq, l, r) = cond {
+                    if let Expr::Ident(a) = l.as_ref() {
+                        then_nn.insert(a.clone());
+                        if let Some(c) = exact_f64_lit(r) {
+                            if c != 0.0 && !c.is_nan() {
+                                then_nz.insert(a.clone(), c);
+                            }
+                        }
+                    }
+                    if let Expr::Ident(b) = r.as_ref() {
+                        then_nn.insert(b.clone());
+                        if let Some(c) = exact_f64_lit(l) {
+                            if c != 0.0 && !c.is_nan() {
+                                then_nz.insert(b.clone(), c);
+                            }
+                        }
+                    }
+                }
+                changed |=
+                    fast_path_f64_sign_bit_stmts(then_b, read_counts, &mut then_nn, &mut then_nz);
+                if let Some(el) = else_b {
+                    let mut else_nn = non_nan.clone();
+                    let mut else_nz = known_nonzero.clone();
+                    changed |=
+                        fast_path_f64_sign_bit_stmts(el, read_counts, &mut else_nn, &mut else_nz);
+                }
+            }
+            Stmt::Block(b) => {
+                let mut inner_nn = non_nan.clone();
+                let mut inner_nz = known_nonzero.clone();
+                changed |=
+                    fast_path_f64_sign_bit_stmts(b, read_counts, &mut inner_nn, &mut inner_nz);
+            }
+            Stmt::Labeled(_, inner) => {
+                let mut written = HashSet::new();
+                collect_written_idents_stmt(inner, &mut written);
+                let mut inner_nn = non_nan.clone();
+                let mut inner_nz = known_nonzero.clone();
+                for w in &written {
+                    inner_nn.remove(w);
+                    inner_nz.remove(w);
+                }
+                if let Stmt::Block(b) | Stmt::LoopForever(_, b) | Stmt::While(_, b) = inner.as_mut()
+                {
+                    changed |=
+                        fast_path_f64_sign_bit_stmts(b, read_counts, &mut inner_nn, &mut inner_nz);
+                }
+            }
+            Stmt::LoopForever(_, b) | Stmt::While(_, b) => {
+                let mut written = HashSet::new();
+                for s in b.iter() {
+                    collect_written_idents_stmt(s, &mut written);
+                }
+                let mut inner_nn = non_nan.clone();
+                let mut inner_nz = known_nonzero.clone();
+                for w in &written {
+                    inner_nn.remove(w);
+                    inner_nz.remove(w);
+                }
+                changed |=
+                    fast_path_f64_sign_bit_stmts(b, read_counts, &mut inner_nn, &mut inner_nz);
+            }
+            Stmt::Switch(_, cases) => {
+                for c in cases {
+                    let mut inner_nn = non_nan.clone();
+                    let mut inner_nz = known_nonzero.clone();
+                    changed |= fast_path_f64_sign_bit_stmts(
+                        &mut c.body,
+                        read_counts,
+                        &mut inner_nn,
+                        &mut inner_nz,
+                    );
+                }
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                let mut b_nn = non_nan.clone();
+                let mut b_nz = known_nonzero.clone();
+                changed |= fast_path_f64_sign_bit_stmts(body, read_counts, &mut b_nn, &mut b_nz);
+                let mut h_nn = HashSet::new();
+                let mut h_nz = HashMap::new();
+                changed |= fast_path_f64_sign_bit_stmts(handler, read_counts, &mut h_nn, &mut h_nz);
+            }
+            _ => {}
+        }
+
+        // Invalidate facts for any variable written by `stmts[i]`.
+        let mut written = HashSet::new();
+        collect_written_idents_stmt(&stmts[i], &mut written);
+        for w in written {
+            non_nan.remove(&w);
+            known_nonzero.remove(&w);
+        }
+        i += 1;
+    }
+    changed
+}
+
+/// Straight-line CSE for repeated pure `s.charCodeAt(idx)` loads dominated by an unconditional
+/// first evaluation (e.g. `65 <= a.charCodeAt(A) && a.charCodeAt(A) <= 90` followed by
+/// `97 <= a.charCodeAt(A)` in `marked`).
+fn cse_dominating_char_code_at(
+    stmts: &mut Vec<Stmt>,
+    local_names: &mut HashSet<String>,
+    extra_decls: &mut Vec<(String, Option<Expr>)>,
+) {
+    let mut i = 0usize;
+    while i < stmts.len() {
+        // First recurse into nested blocks.
+        match &mut stmts[i] {
+            Stmt::If(_, t, e) => {
+                cse_dominating_char_code_at(t, local_names, extra_decls);
+                if let Some(el) = e {
+                    cse_dominating_char_code_at(el, local_names, extra_decls);
+                }
+            }
+            Stmt::Block(b) | Stmt::LoopForever(_, b) | Stmt::While(_, b) => {
+                cse_dominating_char_code_at(b, local_names, extra_decls);
+            }
+            Stmt::Labeled(_, inner) => {
+                if let Stmt::Block(b) | Stmt::LoopForever(_, b) | Stmt::While(_, b) = inner.as_mut()
+                {
+                    cse_dominating_char_code_at(b, local_names, extra_decls);
+                }
+            }
+            Stmt::Switch(_, cases) => {
+                for c in cases {
+                    cse_dominating_char_code_at(&mut c.body, local_names, extra_decls);
+                }
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                cse_dominating_char_code_at(body, local_names, extra_decls);
+                cse_dominating_char_code_at(handler, local_names, extra_decls);
+            }
+            _ => {}
+        }
+
+        // Look for an unconditional `s.charCodeAt(idx)` evaluated at the start of `stmts[i]`.
+        let candidate = first_unconditional_char_code_at_stmt(&stmts[i]);
+        let Some((recv, idx_expr)) = candidate else {
+            i += 1;
+            continue;
+        };
+        let mut deps = HashSet::new();
+        deps.insert(recv.clone());
+        collect_read_idents_pure_expr(&idx_expr, &mut deps);
+
+        let target = jsast::method_call(jsast::id(recv), "charCodeAt", vec![idx_expr]);
+        // Find maximal straight-line span `[i..end]` where no statement writes any dep in `deps`
+        // (we may include the first statement that writes a dep only if the occurrences precede
+        // the write — conservatively stop before any statement writing a dep, except `stmts[i]`
+        // itself when `stmts[i]` is `Stmt::If(cond, ..)` whose condition does not write deps!).
+        let mut end = i;
+        let mut total = 0usize;
+        let mut handled_cond_only = false;
+        while end < stmts.len() {
+            let mut written = HashSet::new();
+            collect_written_idents_stmt(&stmts[end], &mut written);
+            if written.iter().any(|w| deps.contains(w)) {
+                // Still allow CSE within `stmts[i]`'s own `if` condition if `cond` doesn't write deps.
+                if end == i {
+                    if let Stmt::If(cond, _, _) = &stmts[i] {
+                        let mut cond_w = HashSet::new();
+                        collect_written_idents_expr(cond, &mut cond_w);
+                        if !cond_w.iter().any(|w| deps.contains(w)) {
+                            let c = count_expr_eq_in_expr(cond, &target);
+                            if c >= 2 {
+                                let tmp = alloc_fresh_local(local_names, extra_decls, "$cc");
+                                if let Stmt::If(cond_mut, _, _) = &mut stmts[i] {
+                                    replace_expr_eq_in_expr(
+                                        cond_mut,
+                                        &target,
+                                        &Expr::Ident(tmp.clone()),
+                                    );
+                                }
+                                stmts.insert(i, jsast::assign_stmt(jsast::id(tmp), target.clone()));
+                                handled_cond_only = true;
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            total += count_expr_eq_in_stmt(&stmts[end], &target);
+            end += 1;
+        }
+        if handled_cond_only {
+            i += 2;
+            continue;
+        }
+        if total >= 2 {
+            // If `stmts[i]` is already `v = s.charCodeAt(idx)` and `v` isn't written in `[i+1..end]`,
+            // reuse `v` directly instead of allocating a fresh temp.
+            let existing_local = match &stmts[i] {
+                Stmt::ExprStmt(Expr::Assign(lhs, rhs)) if rhs.as_ref() == &target => {
+                    if let Expr::Ident(v) = lhs.as_ref() {
+                        let written_later = (i + 1..end).any(|k| {
+                            let mut w = HashSet::new();
+                            collect_written_idents_stmt(&stmts[k], &mut w);
+                            w.contains(v)
+                        });
+                        if !written_later {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(v) = existing_local {
+                let repl = Expr::Ident(v);
+                for s in &mut stmts[i + 1..end] {
+                    replace_expr_eq_in_stmt(s, &target, &repl);
+                }
+                i += 1;
+            } else {
+                let tmp = alloc_fresh_local(local_names, extra_decls, "$cc");
+                let repl = Expr::Ident(tmp.clone());
+                for s in &mut stmts[i..end] {
+                    replace_expr_eq_in_stmt(s, &target, &repl);
+                }
+                stmts.insert(i, jsast::assign_stmt(jsast::id(tmp), target));
+                i += 2;
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn is_pure_index_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Ident(_) | Expr::Num(_) => true,
+        Expr::Unary(UnOp::Neg | UnOp::BitNot, inner) => is_pure_index_expr(inner),
+        Expr::Binary(
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
+            | BinOp::UShr,
+            l,
+            r,
+        ) => is_pure_index_expr(l) && is_pure_index_expr(r),
+        _ => false,
+    }
+}
+
+fn collect_read_idents_pure_expr(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Ident(id) => {
+            out.insert(id.clone());
+        }
+        Expr::Unary(_, inner) => collect_read_idents_pure_expr(inner, out),
+        Expr::Binary(_, l, r) => {
+            collect_read_idents_pure_expr(l, out);
+            collect_read_idents_pure_expr(r, out);
+        }
+        _ => {}
+    }
+}
+
+fn first_unconditional_char_code_at_expr(expr: &Expr) -> Option<(String, Expr)> {
+    match expr {
+        Expr::Call(callee, args) if args.len() == 1 => {
+            if let Expr::Member(obj, prop) = callee.as_ref() {
+                if prop == "charCodeAt" {
+                    if let Expr::Ident(recv) = obj.as_ref() {
+                        if is_pure_index_expr(&args[0]) {
+                            return Some((recv.clone(), args[0].clone()));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        Expr::Unary(_, inner) => first_unconditional_char_code_at_expr(inner),
+        Expr::Binary(BinOp::And | BinOp::Or, l, _) => first_unconditional_char_code_at_expr(l),
+        Expr::Binary(_, l, r) => first_unconditional_char_code_at_expr(l).or_else(|| {
+            if !loop_opt::expr_has_side_effect(l) {
+                first_unconditional_char_code_at_expr(r)
+            } else {
+                None
+            }
+        }),
+        Expr::Cond(c, _, _) => first_unconditional_char_code_at_expr(c),
+        Expr::Assign(lhs, rhs) if matches!(lhs.as_ref(), Expr::Ident(_)) => {
+            first_unconditional_char_code_at_expr(rhs)
+        }
+        _ => None,
+    }
+}
+
+fn first_unconditional_char_code_at_stmt(stmt: &Stmt) -> Option<(String, Expr)> {
+    match stmt {
+        Stmt::If(cond, _, _) => first_unconditional_char_code_at_expr(cond),
+        Stmt::ExprStmt(e) | Stmt::Return(Some(e)) => first_unconditional_char_code_at_expr(e),
+        Stmt::Switch(scrut, _) => first_unconditional_char_code_at_expr(scrut),
+        _ => None,
+    }
+}
+
+fn count_expr_eq_in_expr(expr: &Expr, target: &Expr) -> usize {
+    if expr == target {
+        return 1;
+    }
+    match expr {
+        Expr::Member(o, _) => count_expr_eq_in_expr(o, target),
+        Expr::Index(o, i) => count_expr_eq_in_expr(o, target) + count_expr_eq_in_expr(i, target),
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            count_expr_eq_in_expr(c, target)
+                + args
+                    .iter()
+                    .map(|a| count_expr_eq_in_expr(a, target))
+                    .sum::<usize>()
+        }
+        Expr::Unary(_, inner) => count_expr_eq_in_expr(inner, target),
+        Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
+            count_expr_eq_in_expr(l, target) + count_expr_eq_in_expr(r, target)
+        }
+        Expr::Cond(c, t, e) => {
+            count_expr_eq_in_expr(c, target)
+                + count_expr_eq_in_expr(t, target)
+                + count_expr_eq_in_expr(e, target)
+        }
+        Expr::Object(entries) => entries
+            .iter()
+            .map(|(_, v)| count_expr_eq_in_expr(v, target))
+            .sum(),
+        Expr::Array(items) | Expr::Seq(items) => items
+            .iter()
+            .map(|it| count_expr_eq_in_expr(it, target))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn count_expr_eq_in_stmt(stmt: &Stmt, target: &Expr) -> usize {
+    match stmt {
+        Stmt::ExprStmt(e) | Stmt::Return(Some(e)) | Stmt::Throw(e) => {
+            count_expr_eq_in_expr(e, target)
+        }
+        Stmt::If(c, t, e) => {
+            count_expr_eq_in_expr(c, target)
+                + t.iter()
+                    .map(|s| count_expr_eq_in_stmt(s, target))
+                    .sum::<usize>()
+                + e.as_ref()
+                    .map(|el| {
+                        el.iter()
+                            .map(|s| count_expr_eq_in_stmt(s, target))
+                            .sum::<usize>()
+                    })
+                    .unwrap_or(0)
+        }
+        Stmt::Block(b) => b.iter().map(|s| count_expr_eq_in_stmt(s, target)).sum(),
+        Stmt::Labeled(_, inner) => count_expr_eq_in_stmt(inner, target),
+        Stmt::Switch(scrut, cases) => {
+            count_expr_eq_in_expr(scrut, target)
+                + cases
+                    .iter()
+                    .map(|c| {
+                        c.body
+                            .iter()
+                            .map(|s| count_expr_eq_in_stmt(s, target))
+                            .sum::<usize>()
+                    })
+                    .sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+fn replace_expr_eq_in_expr(expr: &mut Expr, target: &Expr, repl: &Expr) {
+    if expr == target {
+        *expr = repl.clone();
+        return;
+    }
+    match expr {
+        Expr::Member(o, _) => replace_expr_eq_in_expr(o, target, repl),
+        Expr::Index(o, i) => {
+            replace_expr_eq_in_expr(o, target, repl);
+            replace_expr_eq_in_expr(i, target, repl);
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            replace_expr_eq_in_expr(c, target, repl);
+            for a in args {
+                replace_expr_eq_in_expr(a, target, repl);
+            }
+        }
+        Expr::Unary(_, inner) => replace_expr_eq_in_expr(inner, target, repl),
+        Expr::Binary(_, l, r) | Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
+            replace_expr_eq_in_expr(l, target, repl);
+            replace_expr_eq_in_expr(r, target, repl);
+        }
+        Expr::Cond(c, t, e) => {
+            replace_expr_eq_in_expr(c, target, repl);
+            replace_expr_eq_in_expr(t, target, repl);
+            replace_expr_eq_in_expr(e, target, repl);
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                replace_expr_eq_in_expr(v, target, repl);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for it in items {
+                replace_expr_eq_in_expr(it, target, repl);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_expr_eq_in_stmt(stmt: &mut Stmt, target: &Expr, repl: &Expr) {
+    match stmt {
+        Stmt::ExprStmt(e) | Stmt::Return(Some(e)) | Stmt::Throw(e) => {
+            replace_expr_eq_in_expr(e, target, repl);
+        }
+        Stmt::If(c, t, e) => {
+            replace_expr_eq_in_expr(c, target, repl);
+            for s in t {
+                replace_expr_eq_in_stmt(s, target, repl);
+            }
+            if let Some(el) = e {
+                for s in el {
+                    replace_expr_eq_in_stmt(s, target, repl);
+                }
+            }
+        }
+        Stmt::Block(b) => {
+            for s in b {
+                replace_expr_eq_in_stmt(s, target, repl);
+            }
+        }
+        Stmt::Labeled(_, inner) => replace_expr_eq_in_stmt(inner, target, repl),
+        Stmt::Switch(scrut, cases) => {
+            replace_expr_eq_in_expr(scrut, target, repl);
+            for c in cases {
+                for s in &mut c.body {
+                    replace_expr_eq_in_stmt(s, target, repl);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2120,6 +3206,169 @@ mod tests {
         assert!(
             !printed.contains("$__mires_i64_div("),
             "expected both div calls fused: {printed}"
+        );
+    }
+
+    #[test]
+    fn fast_paths_dead_lo_f64_sign_bit_and_preserves_live_lo() {
+        let sign_bit_test = |hi: &str| {
+            Expr::Binary(
+                BinOp::StrictNe,
+                Box::new(Expr::Binary(
+                    BinOp::BitAnd,
+                    Box::new(jsast::id(hi)),
+                    Box::new(Expr::Unary(UnOp::Neg, Box::new(Expr::Num(2147483648.0)))),
+                )),
+                Box::new(Expr::Num(0.0)),
+            )
+        };
+        // Dead `lo` sign-bit test: fast-path `x === x ? (x < 0 || x === 0 && 1 / x < 0) : ...`
+        // for general floats, and completely eliminates `f64_to_bits` when `x` is known non-NaN.
+        let mut decl = Stmt::FunctionDecl {
+            name: "is_neg".to_owned(),
+            params: vec!["x".to_owned(), "y".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("lo".to_owned(), None),
+                    ("hi".to_owned(), None),
+                    ("b".to_owned(), None),
+                ]),
+                Stmt::If(
+                    Expr::Binary(
+                        BinOp::StrictEq,
+                        Box::new(jsast::id("x")),
+                        Box::new(jsast::id("y")),
+                    ),
+                    vec![
+                        jsast::assign_stmt(
+                            jsast::id("lo"),
+                            jsast::call(
+                                jsast::id("$__mires_i64_f64_to_bits"),
+                                vec![jsast::id("x")],
+                            ),
+                        ),
+                        jsast::assign_stmt(jsast::id("hi"), jsast::id("$__mires_i64_hi")),
+                        jsast::assign_stmt(jsast::id("b"), sign_bit_test("hi")),
+                        Stmt::Return(Some(jsast::id("b"))),
+                    ],
+                    None,
+                ),
+                Stmt::Return(Some(Expr::Bool(false))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let printed = jsast::stmt_to_string(&decl);
+        assert!(
+            !printed.contains("$__mires_i64_f64_to_bits"),
+            "expected f64_to_bits eliminated when known non-NaN: {printed}"
+        );
+        assert!(
+            printed.contains("1 / x < 0"),
+            "expected IEEE-754 negative-zero check: {printed}"
+        );
+
+        // Live `lo` must keep `$__mires_i64_f64_to_bits` and never rewrite.
+        let mut live_lo = Stmt::FunctionDecl {
+            name: "keep_bits".to_owned(),
+            params: vec!["x".to_owned()],
+            body: vec![
+                jsast::lets(vec![
+                    ("lo".to_owned(), None),
+                    ("hi".to_owned(), None),
+                    ("b".to_owned(), None),
+                ]),
+                jsast::assign_stmt(
+                    jsast::id("lo"),
+                    jsast::call(jsast::id("$__mires_i64_f64_to_bits"), vec![jsast::id("x")]),
+                ),
+                jsast::assign_stmt(jsast::id("hi"), jsast::id("$__mires_i64_hi")),
+                jsast::assign_stmt(jsast::id("b"), sign_bit_test("hi")),
+                Stmt::Return(Some(Expr::Binary(
+                    BinOp::BitXor,
+                    Box::new(jsast::id("lo")),
+                    Box::new(jsast::id("b")),
+                ))),
+            ],
+        };
+        run_speed_post_opts(&mut live_lo);
+        let live_printed = jsast::stmt_to_string(&live_lo);
+        assert!(
+            live_printed.contains("$__mires_i64_f64_to_bits")
+                && !live_printed.contains("1 / x < 0"),
+            "live `lo` must preserve f64_to_bits: {live_printed}"
+        );
+    }
+
+    #[test]
+    fn cses_dominating_char_code_at_and_folds_bool_bit_identities() {
+        let char_at = || jsast::method_call(jsast::id("s"), "charCodeAt", vec![jsast::id("i")]);
+        let mut decl = Stmt::FunctionDecl {
+            name: "scan".to_owned(),
+            params: vec!["s".to_owned(), "i".to_owned(), "x".to_owned()],
+            body: vec![
+                jsast::lets(vec![("a".to_owned(), None), ("b".to_owned(), None)]),
+                jsast::assign_stmt(
+                    jsast::id("a"),
+                    Expr::Cond(
+                        Box::new(Expr::Binary(
+                            BinOp::StrictEq,
+                            Box::new(char_at()),
+                            Box::new(Expr::Num(32.0)),
+                        )),
+                        Box::new(Expr::Num(1.0)),
+                        Box::new(Expr::Num(0.0)),
+                    ),
+                ),
+                Stmt::If(
+                    Expr::Binary(
+                        BinOp::StrictNe,
+                        Box::new(Expr::Binary(
+                            BinOp::StrictEq,
+                            Box::new(char_at()),
+                            Box::new(Expr::Num(9.0)),
+                        )),
+                        Box::new(Expr::Bool(false)),
+                    ),
+                    vec![jsast::assign_stmt(
+                        jsast::id("b"),
+                        jsast::imul(
+                            Expr::Binary(
+                                BinOp::BitAnd,
+                                Box::new(Expr::Binary(
+                                    BinOp::BitAnd,
+                                    Box::new(jsast::id("x")),
+                                    Box::new(Expr::Num(255.0)),
+                                )),
+                                Box::new(Expr::Num(15.0)),
+                            ),
+                            Expr::Num(1.0),
+                        ),
+                    )],
+                    None,
+                ),
+                Stmt::Return(Some(Expr::Binary(
+                    BinOp::Add,
+                    Box::new(jsast::id("a")),
+                    Box::new(jsast::id("b")),
+                ))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let printed = jsast::stmt_to_string(&decl);
+        assert_eq!(
+            printed.matches("charCodeAt").count(),
+            1,
+            "expected dominating charCodeAt CSEd to 1 call: {printed}"
+        );
+        assert!(
+            !printed.contains("Math.imul")
+                && !printed.contains("? 1 : 0")
+                && !printed.contains("!== false"),
+            "expected imul(x,1), bool?1:0, and !==false folded: {printed}"
+        );
+        assert!(
+            printed.contains("x & 15"),
+            "expected nested bitmask folded to `x & 15`: {printed}"
         );
     }
 }

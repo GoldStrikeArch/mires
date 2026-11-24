@@ -187,6 +187,13 @@ impl JsCx<'_> {
                     jsast::member(receiver, "len"),
                 )));
             }
+            if self.heap().native_vec_enabled {
+                if let Some(lowered) =
+                    self.lower_native_vec_call(op, StandardOperation::NativeVecAsSlice, args)?
+                {
+                    return Ok(lowered);
+                }
+            }
         }
         if matches!(semantic, CallSemantic::Standard(StandardOperation::VecPush)) {
             let [receiver, value] = args.as_slice() else {
@@ -313,6 +320,7 @@ impl JsCx<'_> {
             _ => None,
         };
         let slice_positions = physical.map_or_else(Vec::new, |sig| sig.slice_jir_positions());
+        let byte_str_positions = physical.map_or_else(Vec::new, |sig| sig.byte_str_jir_positions());
         let tagged_positions = physical.map_or_else(Vec::new, |sig| sig.tagged_jir_positions());
         let recursive_positions =
             physical.map_or_else(Vec::new, |sig| sig.recursive_jir_positions());
@@ -323,6 +331,29 @@ impl JsCx<'_> {
             if i64_positions.contains(&position) {
                 let (lo, hi) = self.pair_of(*arg)?;
                 arguments.extend([lo, hi]);
+                continue;
+            }
+            if let Some(&(_, bs_mode)) = byte_str_positions
+                .iter()
+                .find(|(bs_pos, _)| *bs_pos == position)
+            {
+                let Some(bv) = self.byte_view(*arg) else {
+                    return Err(decline(
+                        OpClass::Call,
+                        "byte_str ABI argument did not survive byte_view_analysis",
+                    ));
+                };
+                match bs_mode {
+                    crate::plan::abi_flat::ByteStrParam::Full => {
+                        arguments.push(self.byte_view_to_str_expr(*arg)?);
+                    }
+                    crate::plan::abi_flat::ByteStrParam::Sub => {
+                        let base = self.byte_view_base_expr(bv, *arg)?;
+                        let off = self.byte_view_off_expr(*arg)?;
+                        let len = self.byte_view_len_expr(*arg)?;
+                        arguments.extend([base, off, len]);
+                    }
+                }
                 continue;
             }
             let value = if position == 0 && matches!(callee, Callee::Virtual { .. }) {
@@ -769,14 +800,32 @@ impl JsCx<'_> {
             (StandardOperation::StrIsAscii, [s]) if is_str(*s)? => {
                 jsast::rt_call("_bstr_is_ascii", vec![string(*s, &mut prelude, &mut hold)?])
             }
-            // The same answer one byte at a time over a `{ buf, off, len }` slice.
+            // The same answer one byte at a time over a `{ buf, off, len }` slice (or directly
+            // over a `js-str=bytes` byte-string view).
             (StandardOperation::SliceIsAscii, [bytes])
                 if crate::lower::semantic_ops::string::is_immutable_u8_slice_ref(
                     table,
                     self.ty_of(*bytes)?,
                 ) =>
             {
-                jsast::rt_call("bytes_is_ascii", vec![self.expr_of(*bytes)?])
+                if let Some(bv) = self.byte_view(*bytes) {
+                    match bv.mode {
+                        super::ByteViewMode::FullSlice => {
+                            jsast::rt_call("_bstr_is_ascii", vec![self.expr_of(*bytes)?])
+                        }
+                        super::ByteViewMode::VarSlice => {
+                            let base = self.byte_view_base_expr(bv, *bytes)?;
+                            let off = self.byte_view_off_expr(*bytes)?;
+                            let len = self.byte_view_len_expr(*bytes)?;
+                            jsast::rt_call("_bstr_is_ascii_range", vec![base, off, len])
+                        }
+                        super::ByteViewMode::ThinPtr => {
+                            jsast::rt_call("bytes_is_ascii", vec![self.expr_of(*bytes)?])
+                        }
+                    }
+                } else {
+                    jsast::rt_call("bytes_is_ascii", vec![self.expr_of(*bytes)?])
+                }
             }
             (StandardOperation::StrIsCharBoundary, [s, index]) if is_str(*s)? => {
                 let s = string(*s, &mut prelude, &mut hold)?;
@@ -1958,11 +2007,23 @@ impl JsCx<'_> {
                         ("len", jsast::num(len as f64)),
                     ]))));
                 }
-                let fresh_aggregate = matches!(
-                    self.def_of(*arr_v).map(|d| &d.kind),
-                    Some(OpKind::Aggregate { .. })
-                );
-                let mut owned_arr = if fresh_aggregate {
+                let fresh_owned = {
+                    let mut cur = *arr_v;
+                    for _ in 0..8 {
+                        if let Some(OpKind::Move(inner)) = self.def_of(cur).map(|d| &d.kind) {
+                            cur = *inner;
+                        } else {
+                            break;
+                        }
+                    }
+                    match self.def_of(cur).map(|d| &d.kind) {
+                        Some(OpKind::Aggregate { .. } | OpKind::Repeat { .. }) => true,
+                        // `OpKind::Copy` already deep-clones `[T; N]` in `emit.rs` when `needs_clone` holds.
+                        Some(OpKind::Copy(_)) => table.needs_clone(arr_ty),
+                        _ => false,
+                    }
+                };
+                let mut owned_arr = if fresh_owned {
                     arr_expr
                 } else {
                     value::clone_expr_with(table, self.interns, arr_ty, arr_expr, self.nested_clone)
@@ -2789,7 +2850,14 @@ impl JsCx<'_> {
                     // Eligibility proves a POD element and an unobservable global allocator. The
                     // exact backing store becomes unreachable with this value, so running the
                     // generic NativeVec release helper can have no Rust-visible effect.
-                    return Ok(Lowered::Done(Vec::new()));
+                    let mut stmts = Vec::new();
+                    if self.is_inline(*value) {
+                        let expr = self.expr_of(*value)?;
+                        if !jsast::is_droppable(&expr) {
+                            stmts.push(jsast::expr_stmt(expr));
+                        }
+                    }
+                    return Ok(Lowered::Done(stmts));
                 }
                 match self.dropped_string_kind(*value) {
                     Some(emit::DroppedStringKind::NoOp) => {
@@ -2849,8 +2917,30 @@ impl JsCx<'_> {
             }
         }
         match glue {
-            // Empty glue is not emitted as an item, so naming it would dangle.
-            DropGlue::None => Ok(Lowered::Done(Vec::new())),
+            // Empty glue is not emitted as an item, so naming it would dangle. Evaluate any
+            // inlined non-droppable root/index operand as defense-in-depth so effects never drop.
+            DropGlue::None => {
+                let mut stmts = Vec::new();
+                if let Root::Value(v) = root {
+                    if self.is_inline(*v) {
+                        let expr = self.expr_of(*v)?;
+                        if !jsast::is_droppable(&expr) {
+                            stmts.push(jsast::expr_stmt(expr));
+                        }
+                    }
+                }
+                for step in path {
+                    if let Proj::Index(idx) = step {
+                        if self.is_inline(*idx) {
+                            let expr = self.expr_of(*idx)?;
+                            if !jsast::is_droppable(&expr) {
+                                stmts.push(jsast::expr_stmt(expr));
+                            }
+                        }
+                    }
+                }
+                Ok(Lowered::Done(stmts))
+            }
             DropGlue::Direct { item, link_name } => {
                 let argument = self.borrow_view(root, path, true)?;
                 let target = self

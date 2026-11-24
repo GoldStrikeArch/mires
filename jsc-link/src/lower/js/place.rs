@@ -68,6 +68,9 @@ pub struct Walk {
     /// Whether that `str` pointer was specifically mutable (`&mut str` / `*mut str`), so it
     /// cannot alias a memoized `__rt.str_bytes` / `__rt.bstr_bytes` view.
     pub str_from_mut: bool,
+    /// Whether the final projection landed on a `heap.smi_u32_fields` struct field stored as
+    /// signed `Int32`.
+    pub smi_u32: bool,
 }
 
 impl<'a> JsCx<'a> {
@@ -82,40 +85,153 @@ impl<'a> JsCx<'a> {
     /// The place walk (`place.rs::walk_place`).
     pub fn walk_place(&self, root: &Root, path: &[Proj]) -> Res<Walk> {
         let table = self.table;
-        // `js-str=bytes`: one byte of a byte view held as its string is that string's code unit
-        // (`JsCx::byte_string_view` admits only this path, and only where it is read).
+        // `js-str=bytes`: one byte of a byte view held as its string (or `{ buf, off, len }`
+        // byte-string subslice) is that string's code unit.
         if let (
             Root::Value(view),
             [Proj::Deref, step @ (Proj::Index(_) | Proj::ConstantIndex { .. })],
         ) = (root, path)
         {
-            if self.byte_string_view(*view) {
-                let string = self.expr_of(*view)?;
-                let index = match step {
-                    Proj::Index(index) => self.expr_of(*index)?,
-                    Proj::ConstantIndex {
-                        offset,
-                        from_end: false,
-                        ..
-                    } => jsast::num(*offset as f64),
-                    Proj::ConstantIndex { offset, .. } => jsast::binary(
-                        BinOp::Sub,
-                        jsast::member(string.clone(), "length"),
-                        jsast::num(*offset as f64),
-                    ),
-                    _ => unreachable!("matched above"),
-                };
-                let pointee = value::pointee_of(table, self.ty_of(*view)?)
-                    .ok_or_else(|| decline(OpClass::Place, "a byte view that is not a pointer"))?;
-                let element = self.element_ty(pointee)?;
-                return Ok(Walk {
-                    place: JsPlace::Var(jsast::method_call(string, "charCodeAt", vec![index])),
-                    ty: element,
-                    identity: None,
-                    object: false,
-                    str_mutable: false,
-                    str_from_mut: false,
-                });
+            if let Some(bv) = self.byte_view(*view) {
+                match bv.mode {
+                    super::ByteViewMode::FullSlice => {
+                        let string = self.expr_of(*view)?;
+                        let index = match step {
+                            Proj::Index(index) => self.expr_of(*index)?,
+                            Proj::ConstantIndex {
+                                offset,
+                                from_end: false,
+                                ..
+                            } => jsast::num(*offset as f64),
+                            Proj::ConstantIndex { offset, .. } => jsast::binary(
+                                BinOp::Sub,
+                                jsast::member(string.clone(), "length"),
+                                jsast::num(*offset as f64),
+                            ),
+                            _ => unreachable!("matched above"),
+                        };
+                        let pointee =
+                            value::pointee_of(table, self.ty_of(*view)?).ok_or_else(|| {
+                                decline(OpClass::Place, "a byte view that is not a pointer")
+                            })?;
+                        let element = self.element_ty(pointee)?;
+                        return Ok(Walk {
+                            place: JsPlace::Var(jsast::method_call(
+                                string,
+                                "charCodeAt",
+                                vec![index],
+                            )),
+                            ty: element,
+                            identity: None,
+                            object: false,
+                            str_mutable: false,
+                            str_from_mut: false,
+                            smi_u32: false,
+                        });
+                    }
+                    super::ByteViewMode::VarSlice => {
+                        let base = self.byte_view_base_expr(bv, *view)?;
+                        let off = self.byte_view_off_expr(*view)?;
+                        let index = match step {
+                            Proj::Index(index) => self.expr_of(*index)?,
+                            Proj::ConstantIndex {
+                                offset,
+                                from_end: false,
+                                ..
+                            } => jsast::num(*offset as f64),
+                            Proj::ConstantIndex { offset, .. } => {
+                                let len = self.byte_view_len_expr(*view)?;
+                                jsast::binary(
+                                    BinOp::UShr,
+                                    jsast::binary(BinOp::Sub, len, jsast::num(*offset as f64)),
+                                    jsast::num(0),
+                                )
+                            }
+                            _ => unreachable!("matched above"),
+                        };
+                        let total = if matches!(off, Expr::Num(n) if n == 0.0) {
+                            index
+                        } else if matches!(index, Expr::Num(n) if n == 0.0) {
+                            off
+                        } else {
+                            jsast::binary(
+                                BinOp::UShr,
+                                jsast::binary(BinOp::Add, off, index),
+                                jsast::num(0),
+                            )
+                        };
+                        let pointee =
+                            value::pointee_of(table, self.ty_of(*view)?).ok_or_else(|| {
+                                decline(OpClass::Place, "a byte view that is not a pointer")
+                            })?;
+                        let element = self.element_ty(pointee)?;
+                        return Ok(Walk {
+                            place: JsPlace::Var(jsast::method_call(
+                                base,
+                                "charCodeAt",
+                                vec![total],
+                            )),
+                            ty: element,
+                            identity: None,
+                            object: false,
+                            str_mutable: false,
+                            str_from_mut: false,
+                            smi_u32: false,
+                        });
+                    }
+                    super::ByteViewMode::ThinPtr => {
+                        if let Some(arr_len) =
+                            super::byte_view_analysis::is_immutable_byte_array_ptr(
+                                table,
+                                self.ty_of(*view)?,
+                            )
+                        {
+                            let base = self.byte_view_base_expr(bv, *view)?;
+                            let off = self.byte_view_off_expr(*view)?;
+                            let index = match step {
+                                Proj::Index(index) => self.expr_of(*index)?,
+                                Proj::ConstantIndex {
+                                    offset,
+                                    from_end: false,
+                                    ..
+                                } => jsast::num(*offset as f64),
+                                Proj::ConstantIndex { offset, .. } => {
+                                    jsast::num(arr_len.saturating_sub(*offset) as f64)
+                                }
+                                _ => unreachable!("matched above"),
+                            };
+                            let total = if matches!(off, Expr::Num(n) if n == 0.0) {
+                                index
+                            } else if matches!(index, Expr::Num(n) if n == 0.0) {
+                                off
+                            } else {
+                                jsast::binary(
+                                    BinOp::UShr,
+                                    jsast::binary(BinOp::Add, off, index),
+                                    jsast::num(0),
+                                )
+                            };
+                            let pointee =
+                                value::pointee_of(table, self.ty_of(*view)?).ok_or_else(|| {
+                                    decline(OpClass::Place, "a byte view that is not a pointer")
+                                })?;
+                            let element = self.element_ty(pointee)?;
+                            return Ok(Walk {
+                                place: JsPlace::Var(jsast::method_call(
+                                    base,
+                                    "charCodeAt",
+                                    vec![total],
+                                )),
+                                ty: element,
+                                identity: None,
+                                object: false,
+                                str_mutable: false,
+                                str_from_mut: false,
+                                smi_u32: false,
+                            });
+                        }
+                    }
+                }
             }
         }
         let (mut current, mut ty) = self.root_place(root)?;
@@ -126,11 +242,13 @@ impl<'a> JsCx<'a> {
         let mut str_mutable = false;
         let mut str_from_mut = false;
         let mut raw_byte_slice: Option<bool> = None;
+        let mut smi_u32 = false;
         // An SSA value has no storage of its own: an aggregate one is held as the object.
         let mut object = matches!(root, Root::Value(_)) && is_object(table, ty);
 
         for (step, proj) in path.iter().enumerate() {
             identity = None;
+            smi_u32 = false;
             let carried_tail = tail.take();
             let carried_raw_tail = raw_tail.take();
             let carried_str_mutable = std::mem::take(&mut str_mutable);
@@ -230,6 +348,7 @@ impl<'a> JsCx<'a> {
                         }
                     };
                     object &= matches!(key, FieldKey::Transparent);
+                    smi_u32 = variant.is_none() && self.is_smi_u32_field(ty, *field);
                     let field_ty = *field_ty;
                     if matches!(current, JsPlace::Unit(_)) {
                         // Still no storage, and still the same address.
@@ -401,6 +520,7 @@ impl<'a> JsCx<'a> {
             object,
             str_mutable,
             str_from_mut,
+            smi_u32,
         })
     }
 
@@ -672,6 +792,17 @@ impl<'a> JsCx<'a> {
 
     /// `&place` / `&mut place` (`place.rs::codegen_ref`).
     pub fn borrow_view(&self, root: &Root, path: &[Proj], mutable: bool) -> Res<Expr> {
+        if !mutable {
+            if let Root::Cell(cell) = root {
+                if path.is_empty() && self.map_key_unboxing().0.contains(cell) {
+                    return self.cell_expr(*cell);
+                }
+            } else if let Root::Value(v) = root {
+                if path == [Proj::Deref] && self.unboxed_map_key_cell(*v).is_some() {
+                    return self.expr_of(*v);
+                }
+            }
+        }
         let walk = self.walk_place(root, path)?;
         if value::is_str(self.table, walk.ty) {
             let value = walk

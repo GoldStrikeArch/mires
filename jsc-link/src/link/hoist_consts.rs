@@ -2108,6 +2108,301 @@ pub(crate) fn run(
     run_with_opts(table, lowered, defined, live, crate::opts::get())
 }
 
+fn exact_int_lit(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Num(n)
+            if n.is_finite()
+                && n.fract() == 0.0
+                && !(*n == 0.0 && n.is_sign_negative())
+                && *n >= f64::from(i32::MIN)
+                && *n <= f64::from(u32::MAX) =>
+        {
+            Some(*n as i64)
+        }
+        Expr::Unary(UnOp::Neg, inner) => {
+            let v = exact_int_lit(inner)?;
+            if v == 0 {
+                return None;
+            }
+            let neg = v.checked_neg()?;
+            (neg >= i64::from(i32::MIN) && neg <= i64::from(u32::MAX)).then_some(neg)
+        }
+        Expr::RawNum(s) => s
+            .parse::<i64>()
+            .ok()
+            .filter(|&v| v >= i64::from(i32::MIN) && v <= i64::from(u32::MAX)),
+        _ => None,
+    }
+}
+
+fn typed_int_array_ctor(elems: &[Expr]) -> Option<&'static str> {
+    if elems.len() < 8 {
+        return None;
+    }
+    let mut min_v = i64::MAX;
+    let mut max_v = i64::MIN;
+    for e in elems {
+        let v = exact_int_lit(e)?;
+        min_v = min_v.min(v);
+        max_v = max_v.max(v);
+    }
+    if min_v >= 0 && max_v <= 255 {
+        Some("Uint8Array")
+    } else if min_v >= 0 && max_v <= 65535 {
+        Some("Uint16Array")
+    } else if min_v >= i64::from(i32::MIN) && max_v <= i64::from(i32::MAX) {
+        Some("Int32Array")
+    } else if min_v >= 0 && max_v <= i64::from(u32::MAX) {
+        Some("Uint32Array")
+    } else {
+        None
+    }
+}
+
+fn wrap_typed_int_array(expr: Expr) -> Expr {
+    if let Expr::Array(ref elems) = expr {
+        if let Some(ctor) = typed_int_array_ctor(elems) {
+            return Expr::New(Box::new(Expr::Ident(ctor.to_owned())), vec![expr]);
+        }
+    }
+    expr
+}
+
+/// Upgrades internal read-only top-level integer static array items (`let T = [int, ...]` with
+/// `len >= 8` whose only uses across all live items are read-only `T[idx]` / `T.length`) to
+/// `const T = new <TypedArray>([...])` under `ReleaseSpeed`.
+fn upgrade_readonly_static_int_arrays(
+    table: &BTreeMap<JsName, LinkItem>,
+    lowered: &mut [LoweredRow],
+    live: &BTreeSet<JsName>,
+    exclusions: &ProgramExclusions,
+) {
+    struct UseChecker<'a> {
+        cands: &'a mut BTreeSet<String>,
+    }
+    impl UseChecker<'_> {
+        fn stmts(&mut self, stmts: &[Stmt]) {
+            for s in stmts {
+                if self.cands.is_empty() {
+                    return;
+                }
+                self.stmt(s);
+            }
+        }
+        fn stmt(&mut self, s: &Stmt) {
+            match s {
+                Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => self.expr(e, false),
+                Stmt::Const(n, e) => {
+                    self.cands.remove(n);
+                    self.expr(e, false);
+                }
+                Stmt::Let(n, init) => {
+                    self.cands.remove(n);
+                    if let Some(e) = init {
+                        self.expr(e, false);
+                    }
+                }
+                Stmt::Lets(decls) => {
+                    for (n, init) in decls {
+                        self.cands.remove(n);
+                        if let Some(e) = init {
+                            self.expr(e, false);
+                        }
+                    }
+                }
+                Stmt::If(t, a, b) => {
+                    self.expr(t, false);
+                    self.stmts(a);
+                    if let Some(b) = b {
+                        self.stmts(b);
+                    }
+                }
+                Stmt::Switch(d, cases) => {
+                    self.expr(d, false);
+                    for c in cases {
+                        for t in &c.tests {
+                            self.expr(t, false);
+                        }
+                        self.stmts(&c.body);
+                    }
+                }
+                Stmt::Labeled(_, inner) => self.stmt(inner),
+                Stmt::LoopForever(_, b) | Stmt::Block(b) => self.stmts(b),
+                Stmt::While(t, b) => {
+                    self.expr(t, false);
+                    self.stmts(b);
+                }
+                Stmt::TryCatch {
+                    body,
+                    binding,
+                    handler,
+                } => {
+                    self.cands.remove(binding);
+                    self.stmts(body);
+                    self.stmts(handler);
+                }
+                Stmt::FunctionDecl { name, params, body } => {
+                    self.cands.remove(name);
+                    for p in params {
+                        self.cands.remove(p);
+                    }
+                    self.stmts(body);
+                }
+                _ => {}
+            }
+        }
+        fn expr(&mut self, e: &Expr, is_lhs: bool) {
+            match e {
+                Expr::Ident(id) => {
+                    self.cands.remove(id);
+                }
+                Expr::Index(obj, idx) => {
+                    if !is_lhs {
+                        if let Expr::Ident(id) = obj.as_ref() {
+                            if self.cands.contains(id) {
+                                self.expr(idx, false);
+                                return;
+                            }
+                        }
+                    }
+                    self.expr(obj, false);
+                    self.expr(idx, false);
+                }
+                Expr::Member(obj, prop) => {
+                    if !is_lhs && prop == "length" {
+                        if let Expr::Ident(id) = obj.as_ref() {
+                            if self.cands.contains(id) {
+                                return;
+                            }
+                        }
+                    }
+                    self.expr(obj, false);
+                }
+                Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
+                    self.expr(l, true);
+                    self.expr(r, false);
+                }
+                Expr::Unary(_, inner) => self.expr(inner, false),
+                Expr::Binary(_, l, r) => {
+                    self.expr(l, false);
+                    self.expr(r, false);
+                }
+                Expr::Call(c, args) | Expr::New(c, args) => {
+                    self.expr(c, false);
+                    for a in args {
+                        self.expr(a, false);
+                    }
+                }
+                Expr::Cond(c, t, f) => {
+                    self.expr(c, false);
+                    self.expr(t, false);
+                    self.expr(f, false);
+                }
+                Expr::Array(items) | Expr::Seq(items) => {
+                    for x in items {
+                        self.expr(x, false);
+                    }
+                }
+                Expr::Object(entries) => {
+                    for (_, v) in entries {
+                        self.expr(v, false);
+                    }
+                }
+                Expr::Arrow(params, body) => {
+                    for p in params {
+                        self.cands.remove(p);
+                    }
+                    match body {
+                        ArrowBody::Expr(b) => self.expr(b, false),
+                        ArrowBody::Block(s) => self.stmts(s),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let lowered_ok: BTreeSet<&JsName> = lowered
+        .iter()
+        .filter_map(|(name, res, _, _)| res.is_ok().then_some(name))
+        .collect();
+
+    let mut cands: BTreeSet<String> = BTreeSet::new();
+    for (item_name, res, _, _) in lowered.iter() {
+        let Ok(item) = res else { continue };
+        if !live.contains(item_name) {
+            continue;
+        }
+        if table
+            .get(item_name)
+            .is_some_and(|t| t.linkage.exported || t.kind == ItemKind::Import)
+        {
+            continue;
+        }
+        let arr_opt = match &item.decl {
+            Stmt::Let(n, Some(Expr::Array(elems))) | Stmt::Const(n, Expr::Array(elems))
+                if n == item_name.as_str() =>
+            {
+                Some(elems)
+            }
+            _ => None,
+        };
+        let Some(elems) = arr_opt else { continue };
+        if typed_int_array_ctor(elems).is_some()
+            && !exclusions.raw_tokens.contains(item_name.as_str())
+        {
+            cands.insert(item_name.as_str().to_owned());
+        }
+    }
+    if cands.is_empty() {
+        return;
+    }
+
+    // Disqualify any candidate referenced by a non-lowered live item (e.g. baseline fallback JS).
+    for item in table.values() {
+        if !live.contains(&item.name) || lowered_ok.contains(&item.name) {
+            continue;
+        }
+        cands.retain(|c| !item.refs.iter().any(|r| r.as_str() == c) && !item.js.contains(c));
+    }
+    if cands.is_empty() {
+        return;
+    }
+
+    // Verify every use across all lowered items is strictly read-only `T[idx]` or `T.length`.
+    for (item_name, res, _, _) in lowered.iter() {
+        if cands.is_empty() {
+            return;
+        }
+        let Ok(item) = res else { continue };
+        if cands.contains(item_name.as_str()) {
+            // Skip scanning the candidate's own top-level declaration.
+            continue;
+        }
+        let mut checker = UseChecker { cands: &mut cands };
+        checker.stmt(&item.decl);
+    }
+    if cands.is_empty() {
+        return;
+    }
+
+    for (item_name, res, _, _) in lowered.iter_mut() {
+        if !cands.contains(item_name.as_str()) {
+            continue;
+        }
+        let Ok(item) = res else { continue };
+        let decl = std::mem::replace(&mut item.decl, Stmt::Comment(String::new()));
+        let upgraded = match decl {
+            Stmt::Let(n, Some(arr)) | Stmt::Const(n, arr) => {
+                Stmt::Const(n, wrap_typed_int_array(arr))
+            }
+            other => other,
+        };
+        item.decl = upgraded;
+        item.refs = super::lane::refs_of(&item.decl, item_name);
+    }
+}
+
 fn run_with_opts(
     table: &mut BTreeMap<JsName, LinkItem>,
     lowered: &mut [LoweredRow],
@@ -2124,6 +2419,7 @@ fn run_with_opts(
     let mut synthesized: Vec<LinkItem> = Vec::new();
     let mut table_dedup: BTreeMap<String, JsName> = BTreeMap::new();
     let allow_bigint = opts.ecma_target != EcmaTarget::Es2018;
+    let speed_profile = opts.profile == Some(crate::opts::Profile::ReleaseSpeed);
 
     // Pass 1: Hoist single-assignment read-only scalar lookup tables at any nesting depth.
     for (item_name, res, _, _) in lowered.iter_mut() {
@@ -2135,25 +2431,30 @@ fn run_with_opts(
         let mut declared_locals: Vec<String> = Vec::new();
         collect_declared_locals(body, &param_set, &mut declared_locals);
 
-        let mut candidates: Vec<(String, Expr)> = Vec::new();
+        let mut candidates: Vec<(String, Expr, bool)> = Vec::new();
         for local in &declared_locals {
             if let Some(arr_expr) = find_read_only_table_init(body, local, allow_bigint) {
-                candidates.push((local.clone(), arr_expr));
+                candidates.push((local.clone(), arr_expr, true));
             } else if let Some(nested_expr) =
                 find_read_only_nested_array_init(body, local, allow_bigint)
             {
-                candidates.push((local.clone(), nested_expr));
+                candidates.push((local.clone(), nested_expr, false));
             } else if let Some(slice_expr) =
                 find_read_only_const_slice_init(body, local, allow_bigint)
             {
-                candidates.push((local.clone(), slice_expr));
+                candidates.push((local.clone(), slice_expr, false));
             }
         }
 
         if !candidates.is_empty() {
             let mut hoisted_set: BTreeSet<String> = BTreeSet::new();
             let mut replacements: Vec<(String, JsName)> = Vec::new();
-            for (local, arr_expr) in candidates {
+            for (local, arr_expr, is_read_only_table) in candidates {
+                let arr_expr = if speed_profile && is_read_only_table {
+                    wrap_typed_int_array(arr_expr)
+                } else {
+                    arr_expr
+                };
                 let key = format!("arr:{arr_expr}");
                 let hc_name = if let Some(existing) = table_dedup.get(&key) {
                     existing.clone()
@@ -2189,11 +2490,7 @@ fn run_with_opts(
     // `BigInt("...")` bindings.
     let exclusions = collect_program_exclusions(table, lowered, live);
     split_bigint_props(lowered, &exclusions);
-    encode_internal_tags(
-        lowered,
-        &exclusions,
-        opts.profile == Some(crate::opts::Profile::ReleaseSpeed),
-    );
+    encode_internal_tags(lowered, &exclusions, speed_profile);
 
     // Pass 2: Expression constants (`Location` objects, inline `[...][i]`, capture-free
     // `() => <const>`) and shared unreachable-abort outlining. ES2018 BigInt constants are hoisted
@@ -2211,7 +2508,6 @@ fn run_with_opts(
         }
     }
 
-    let speed_profile = opts.profile == Some(crate::opts::Profile::ReleaseSpeed);
     let mut const_map: BTreeMap<String, JsName> = BTreeMap::new();
     for (key, (expr, usage)) in &collector.counts {
         let qualify = if key.starts_with("loc:") {
@@ -2230,13 +2526,23 @@ fn run_with_opts(
         if !qualify {
             continue;
         }
-        let hc_name = if let Some(existing) = table_dedup.get(key) {
+        let init_expr = if speed_profile && key.starts_with("arr:") {
+            wrap_typed_int_array(expr.clone())
+        } else {
+            expr.clone()
+        };
+        let dedup_key = if speed_profile && key.starts_with("arr:") {
+            format!("arr:{init_expr}")
+        } else {
+            key.clone()
+        };
+        let hc_name = if let Some(existing) = table_dedup.get(&dedup_key) {
             existing.clone()
         } else {
             let new_name = fresh_item_name("$hc", &mut counter, table, defined);
             defined.insert(new_name.clone());
             live.insert(new_name.clone());
-            let mut decl = jsast::const_(new_name.as_str(), expr.clone());
+            let mut decl = jsast::const_(new_name.as_str(), init_expr);
             if bstr_strings {
                 crate::lower::bstr::rewrite(&mut decl);
             }
@@ -2247,7 +2553,7 @@ fn run_with_opts(
                 "hoisted constant",
             );
             synthesized.push(item);
-            table_dedup.insert(key.clone(), new_name.clone());
+            table_dedup.insert(dedup_key, new_name.clone());
             added_any = true;
             new_name
         };
@@ -2303,6 +2609,12 @@ fn run_with_opts(
                 lowered_item.refs = super::lane::refs_of(&lowered_item.decl, item_name);
             }
         }
+    }
+
+    // Pass 3: Upgrade internal read-only top-level integer static array items (`CRCT`, `DEO`, etc.)
+    // to `const NAME = new <TypedArray>([...])` under `ReleaseSpeed`.
+    if speed_profile {
+        upgrade_readonly_static_int_arrays(table, lowered, live, &exclusions);
     }
 
     for item in synthesized {
@@ -3000,7 +3312,11 @@ fn collect_program_exclusions(
                                 | CallSemantic::RawJavaScript
                                 | CallSemantic::RawParts
                         )
-                        || matches!(call.callee, Callee::Foreign { .. } | Callee::Runtime { .. })
+                        || (matches!(call.callee, Callee::Foreign { .. } | Callee::Runtime { .. })
+                            && !crate::plan::enum_repr::is_representation_opaque_runtime(
+                                &call.callee,
+                                interns,
+                            ))
                         || match &call.callee {
                             Callee::Direct {
                                 item: target_id,
@@ -5755,6 +6071,88 @@ mod tests {
         assert!(
             !mut_js.contains("$hc_") && mut_js.contains("buf:"),
             "mutated nested slice must NOT hoist:\nmut={mut_js}"
+        );
+    }
+
+    #[test]
+    fn speed_profile_wraps_readonly_hoisted_and_static_int_tables_in_typed_arrays() {
+        let crc_vals: Vec<Expr> = vec![
+            0.0,
+            1996959894.0,
+            3993919788.0,
+            2567524794.0,
+            124634137.0,
+            1886057615.0,
+            3915621685.0,
+            2657392035.0,
+        ]
+        .into_iter()
+        .map(Expr::Num)
+        .collect();
+        let small_vals: Vec<Expr> = (0..8).map(|n| Expr::Num(f64::from(n))).collect();
+
+        let static_ro = Stmt::Let("CRCT".to_owned(), Some(Expr::Array(crc_vals)));
+        let static_mut = Stmt::Let("MUT_T".to_owned(), Some(Expr::Array(small_vals.clone())));
+        let fn_use = jsast::function(
+            "use_tables",
+            vec!["i".to_owned()],
+            vec![
+                Stmt::Let("local_t".to_owned(), Some(Expr::Array(small_vals))),
+                Stmt::ExprStmt(Expr::Assign(
+                    Box::new(Expr::Index(
+                        Box::new(Expr::Ident("MUT_T".to_owned())),
+                        Box::new(Expr::Ident("i".to_owned())),
+                    )),
+                    Box::new(Expr::Num(7.0)),
+                )),
+                Stmt::Return(Some(Expr::Binary(
+                    BinOp::BitXor,
+                    Box::new(Expr::Index(
+                        Box::new(Expr::Ident("CRCT".to_owned())),
+                        Box::new(Expr::Ident("i".to_owned())),
+                    )),
+                    Box::new(Expr::Index(
+                        Box::new(Expr::Ident("local_t".to_owned())),
+                        Box::new(Expr::Ident("i".to_owned())),
+                    )),
+                ))),
+            ],
+        );
+
+        let speed_opts = Opts {
+            optimizer: OptimizerMode::On,
+            profile: Some(crate::opts::Profile::ReleaseSpeed),
+            ..Opts::default()
+        };
+        let (table, lowered, _, _, _) = test_run(
+            speed_opts,
+            vec![
+                ("CRCT", static_ro),
+                ("MUT_T", static_mut),
+                ("use_tables", fn_use),
+            ],
+        );
+
+        let hc_item = table
+            .values()
+            .find(|it| it.name.as_str().starts_with("$hc_"))
+            .expect("local_t hoisted");
+        assert!(
+            hc_item.js.contains("new Uint8Array("),
+            "expected local small-int table wrapped in Uint8Array under ReleaseSpeed: {}",
+            hc_item.js
+        );
+
+        let crct_js = jsast::stmt_to_string(&lowered[0].1.as_ref().unwrap().decl);
+        assert!(
+            crct_js.starts_with("const CRCT = new Uint32Array("),
+            "expected read-only static CRCT upgraded to const Uint32Array: {crct_js}"
+        );
+
+        let mut_js = jsast::stmt_to_string(&lowered[1].1.as_ref().unwrap().decl);
+        assert!(
+            mut_js.starts_with("let MUT_T = ["),
+            "mutated static array must stay plain let Array: {mut_js}"
         );
     }
 }

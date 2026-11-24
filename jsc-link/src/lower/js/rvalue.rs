@@ -379,6 +379,293 @@ pub(super) fn int32_only_values(
     set
 }
 
+/// Unsigned 32-bit (`u32`) SSA values produced by reading a `smi_u32_fields` struct field (or
+/// `Copy`/`Move`/all-strict-incoming `BlockParam` of one) whose consumers all operate soundly on
+/// strictly normalized signed `Int32` (`-2^31..=2^31-1`).
+pub(super) fn strict_i32_u32_values(
+    func: &Func,
+    table: &TypeTable,
+    interns: &rcgjs_object::jir::interns::Interns,
+    defs: &BTreeMap<ValueId, (u32, u32)>,
+    carried_pairs: &BTreeMap<ValueId, CarriedPair>,
+    smi_u32_fields: &BTreeSet<(TypeId, u32)>,
+) -> BTreeSet<ValueId> {
+    if smi_u32_fields.is_empty() {
+        return BTreeSet::new();
+    }
+    let is_u32_num = |ty: TypeId| {
+        table.int_repr(ty) == IntRepr::Number && table.int_info(ty) == Some((false, 32))
+    };
+    let is_32_num = |ty: TypeId| {
+        table.int_repr(ty) == IntRepr::Number
+            && table.int_info(ty).is_some_and(|(_, bits)| bits == 32)
+    };
+    let is_const_u32 = |v: ValueId| -> bool {
+        if !is_u32_num(func.values[v.0 as usize].ty) {
+            return false;
+        }
+        let Some(&(bi, oi)) = defs.get(&v) else {
+            return false;
+        };
+        matches!(
+            func.blocks[bi as usize].ops[oi as usize].kind,
+            OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Scalar { .. })
+        )
+    };
+
+    // Collect `BorrowView`/`RawView` values targeting a `smi_u32_fields` struct field.
+    let mut smi_ptr_values: BTreeSet<ValueId> = BTreeSet::new();
+    for block in &func.blocks {
+        for op in &block.ops {
+            let (
+                Some(res),
+                OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. },
+            ) = (op.result, &op.kind)
+            else {
+                continue;
+            };
+            if let Some(pair) =
+                crate::analysis::heap::view_final_struct_field(func, table, root, path)
+            {
+                if smi_u32_fields.contains(&pair) {
+                    smi_ptr_values.insert(res);
+                }
+            }
+        }
+    }
+
+    // Collect incoming edges per block for strict `BlockParam` validation.
+    let mut incoming: Vec<Vec<Vec<ValueId>>> = vec![Vec::new(); func.blocks.len()];
+    for block in &func.blocks {
+        for (target, args) in block.term.edges() {
+            if let Some(slot) = incoming.get_mut(target.0 as usize) {
+                slot.push(args.to_vec());
+            }
+        }
+    }
+
+    let mut set: BTreeSet<ValueId> = BTreeSet::new();
+    let mut saw_field_read = false;
+    for block in &func.blocks {
+        if block.id.0 > 0 {
+            for &param in &block.params {
+                if !carried_pairs.contains_key(&param)
+                    && is_u32_num(func.values[param.0 as usize].ty)
+                {
+                    set.insert(param);
+                }
+            }
+        }
+        for op in &block.ops {
+            let Some(result) = op.result else { continue };
+            if carried_pairs.contains_key(&result) || !is_u32_num(func.values[result.0 as usize].ty)
+            {
+                continue;
+            }
+            match &op.kind {
+                OpKind::Field {
+                    base,
+                    variant: None,
+                    field,
+                } => {
+                    let base_ty = table.peeled(func.values[base.0 as usize].ty);
+                    if smi_u32_fields.contains(&(base_ty, *field)) {
+                        set.insert(result);
+                        saw_field_read = true;
+                    }
+                }
+                OpKind::Deref(ptr) if smi_ptr_values.contains(ptr) => {
+                    set.insert(result);
+                    saw_field_read = true;
+                }
+                OpKind::Copy(_) | OpKind::Move(_) => {
+                    set.insert(result);
+                }
+                _ => {}
+            }
+        }
+    }
+    if !saw_field_read {
+        return BTreeSet::new();
+    }
+
+    for block in &func.blocks {
+        match &block.term {
+            rcgjs_object::jir::repr::RTerm::Return(Some(v))
+            | rcgjs_object::jir::repr::RTerm::Throw(Some(v)) => {
+                set.remove(v);
+            }
+            // Allow single-target equality branches (`if z === 4294967295` -> `if z === -1`);
+            // multi-target switches may fold into range tests (`Test::Lt`/`InRange`).
+            rcgjs_object::jir::repr::RTerm::Switch { scrut, cases, .. } if cases.len() != 1 => {
+                set.remove(scrut);
+            }
+            _ => {}
+        }
+    }
+
+    loop {
+        let mut removed = false;
+        // 1. Producer check: non-entry BlockParams must have >= 1 incoming edge and ALL incoming
+        //    edge arguments in `set`; Copy/Move results must have their source in `set`.
+        for block in &func.blocks {
+            if block.id.0 > 0 {
+                let preds = &incoming[block.id.0 as usize];
+                for (pos, &param) in block.params.iter().enumerate() {
+                    if !set.contains(&param) {
+                        continue;
+                    }
+                    let all_strict = !preds.is_empty()
+                        && preds
+                            .iter()
+                            .all(|args| args.get(pos).is_some_and(|arg| set.contains(arg)));
+                    if !all_strict {
+                        set.remove(&param);
+                        removed = true;
+                    }
+                }
+            }
+            for op in &block.ops {
+                if let (Some(result), OpKind::Copy(src) | OpKind::Move(src)) = (op.result, &op.kind)
+                {
+                    if set.contains(&result) && !set.contains(src) {
+                        set.remove(&result);
+                        removed = true;
+                    }
+                }
+            }
+        }
+
+        // 2. Consumer check: every use of every value in `set` must accept strictly signed `Int32`.
+        for block in &func.blocks {
+            for (target, args) in block.term.edges() {
+                let params = &func.blocks[target.0 as usize].params;
+                for (pos, arg) in args.iter().enumerate() {
+                    if !set.contains(arg) {
+                        continue;
+                    }
+                    if !params.get(pos).is_some_and(|p| set.contains(p)) {
+                        set.remove(arg);
+                        removed = true;
+                    }
+                }
+            }
+            for op in &block.ops {
+                let uses = op.kind.uses();
+                if uses.is_empty() {
+                    continue;
+                }
+                for &u in &uses {
+                    if !set.contains(&u) {
+                        continue;
+                    }
+                    let ok = match &op.kind {
+                        OpKind::Copy(_) | OpKind::Move(_) => {
+                            op.result.is_some_and(|res| set.contains(&res))
+                        }
+                        OpKind::Binary { op: bin, l, r, ty } => match bin {
+                            BinaryOp::Eq | BinaryOp::Ne => {
+                                is_u32_num(*ty)
+                                    && ((set.contains(l) && set.contains(r))
+                                        || (set.contains(l) && is_const_u32(*r))
+                                        || (set.contains(r) && is_const_u32(*l)))
+                            }
+                            BinaryOp::BitAnd
+                            | BinaryOp::BitOr
+                            | BinaryOp::BitXor
+                            | BinaryOp::Add
+                            | BinaryOp::AddUnchecked
+                            | BinaryOp::Sub
+                            | BinaryOp::SubUnchecked
+                            | BinaryOp::Mul
+                            | BinaryOp::MulUnchecked => is_32_num(*ty),
+                            BinaryOp::Shl
+                            | BinaryOp::ShlUnchecked
+                            | BinaryOp::Shr
+                            | BinaryOp::ShrUnchecked => {
+                                (u != *l || is_32_num(*ty))
+                                    && (u != *r || table.int_repr(*ty) == IntRepr::Number)
+                            }
+                            _ => false,
+                        },
+                        OpKind::Unary {
+                            op: UnaryOp::Not | UnaryOp::Neg,
+                            ty,
+                            ..
+                        } => is_32_num(*ty),
+                        OpKind::Cast {
+                            kind: CastKind::IntToInt,
+                            to,
+                            ..
+                        } => {
+                            table.int_repr(*to) == IntRepr::Number && table.int_info(*to).is_some()
+                        }
+                        OpKind::Aggregate {
+                            ty,
+                            variant: 0,
+                            active_field: None,
+                            fields,
+                        } => {
+                            let st = table.peeled(*ty);
+                            fields
+                                .iter()
+                                .enumerate()
+                                .all(|(fi, f)| *f != u || smi_u32_fields.contains(&(st, fi as u32)))
+                        }
+                        OpKind::SetField {
+                            base,
+                            variant: None,
+                            field,
+                            v,
+                        } => {
+                            *v == u
+                                && *base != u
+                                && smi_u32_fields.contains(&(
+                                    table.peeled(func.values[base.0 as usize].ty),
+                                    *field,
+                                ))
+                        }
+                        OpKind::StoreThrough { ptr, v } => {
+                            *v == u && *ptr != u && smi_ptr_values.contains(ptr)
+                        }
+                        OpKind::Intrinsic { name, args, .. } => {
+                            interns.str(*name).is_some_and(|iname| {
+                                let arg0_ty = args.first().map(|a| func.values[a.0 as usize].ty);
+                                match iname {
+                                    "wrapping_add" | "wrapping_sub" | "wrapping_mul"
+                                    | "unchecked_add" | "unchecked_sub" | "unchecked_mul"
+                                    | "disjoint_bitor" | "rotate_left" | "rotate_right" => {
+                                        arg0_ty.is_some_and(is_32_num)
+                                    }
+                                    "unchecked_shl" | "unchecked_shr" => {
+                                        let lhs_ok = args.first() != Some(&u)
+                                            || arg0_ty.is_some_and(is_32_num);
+                                        let rhs_ok = args.get(1) != Some(&u)
+                                            || arg0_ty.is_some_and(|t| {
+                                                table.int_repr(t) == IntRepr::Number
+                                            });
+                                        lhs_ok && rhs_ok
+                                    }
+                                    _ => false,
+                                }
+                            })
+                        }
+                        _ => false,
+                    };
+                    if !ok {
+                        set.remove(&u);
+                        removed = true;
+                    }
+                }
+            }
+        }
+        if !removed {
+            break;
+        }
+    }
+    set
+}
+
 impl<'a> JsCx<'a> {
     /// `l op r` at operand type `ty` (`rvalue.rs::codegen_rvalue`, `BinaryOp` arm).
     #[allow(clippy::too_many_arguments)]
@@ -1356,7 +1643,13 @@ impl<'a> JsCx<'a> {
         if value::is_bool(table, from_ty) {
             return Ok(match to_repr {
                 IntRepr::BigInt => jsast::cond(value, jsast::bigint(1), jsast::bigint(0)),
-                IntRepr::Number => jsast::cond(value, jsast::num(1), jsast::num(0)),
+                IntRepr::Number => {
+                    if self.opts.profile == Some(crate::opts::Profile::ReleaseSpeed) {
+                        jsast::binary(jsast::BinOp::BitOr, value, jsast::num(0))
+                    } else {
+                        jsast::cond(value, jsast::num(1), jsast::num(0))
+                    }
+                }
             });
         }
         Ok(match (table.int_repr(from_ty), to_repr) {

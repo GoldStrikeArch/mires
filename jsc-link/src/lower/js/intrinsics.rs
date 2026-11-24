@@ -1602,6 +1602,25 @@ impl Intrinsic<'_, '_> {
         let Some(pointee) = self.pointee_of(source)? else {
             return Ok(self.not_a_pointer(name));
         };
+        if !volatile
+            && crate::lower::bstr::enabled()
+            && value::is_u8(self.cx.table, pointee)
+            && self
+                .args
+                .get(source)
+                .is_some_and(|v| self.cx.byte_view(*v).is_some())
+        {
+            let src_val = self.args[source];
+            let bv = self.cx.byte_view(src_val).unwrap();
+            let base = self.cx.byte_view_base_expr(bv, src_val)?;
+            let off = self.cx.byte_view_off_expr(src_val)?;
+            let dst = self.arg(target)?;
+            let count = self.arg(2)?;
+            return Ok(Outcome::Done(vec![jsast::expr_stmt(jsast::rt_call(
+                "bstr_copy_to",
+                vec![base, off, dst, count],
+            ))]));
+        }
         let count_is_one = self.args.get(2).is_some_and(|v| {
             self.cx.def_of(*v).is_some_and(|op| {
                 matches!(

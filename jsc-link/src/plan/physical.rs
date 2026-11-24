@@ -1270,6 +1270,18 @@ fn param_shape(types: &TypeTable, param: &FlatParam) -> ValueShape {
             lane_kind(types, param.field_tys[2]),
         ]);
     }
+    if let Some(bs) = param.byte_str {
+        return match bs {
+            crate::plan::abi_flat::ByteStrParam::Full => {
+                ValueShape::Product(vec![LaneKind::Buffer])
+            }
+            crate::plan::abi_flat::ByteStrParam::Sub => ValueShape::Product(vec![
+                LaneKind::Buffer,
+                lane_kind(types, param.field_tys[1]),
+                lane_kind(types, param.field_tys[2]),
+            ]),
+        };
+    }
     if let Some(tagged) = &param.tagged {
         return ValueShape::Product(
             std::iter::once(LaneKind::Tag)

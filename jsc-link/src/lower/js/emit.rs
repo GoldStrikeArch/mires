@@ -72,6 +72,7 @@ pub(super) fn spill_name_of(names: &[JsName], index: u32) -> String {
 pub struct ScrutTy {
     pub ty: TypeId,
     pub tag_enum: Option<TypeId>,
+    pub strict_i32: bool,
 }
 
 /// The body of one function, and the names of the temporaries its prelude has to declare.
@@ -595,6 +596,7 @@ impl Emitter<'_, '_> {
         self.tmps.get(&tmp.0).copied().flatten().unwrap_or(ScrutTy {
             ty: self.cx.usize_ty(),
             tag_enum: None,
+            strict_i32: false,
         })
     }
 
@@ -616,6 +618,7 @@ impl Emitter<'_, '_> {
                     None => jsast::string(format!("$no-variant-{raw}")),
                 }
             }
+            None if scrut.strict_i32 => jsast::num(f64::from((raw as u32) as i32)),
             None => value::int_literal(self.cx.table, scrut.ty, raw)
                 .unwrap_or_else(|| jsast::num(raw as f64)),
         }
@@ -750,14 +753,47 @@ impl Emitter<'_, '_> {
             }
             Test::Lt(v) => {
                 let op = if negated { BinOp::Le } else { BinOp::Gt };
+                let (value, scrut) = if scrut.strict_i32 {
+                    (
+                        jsast::u32_wrap(value),
+                        ScrutTy {
+                            strict_i32: false,
+                            ..scrut
+                        },
+                    )
+                } else {
+                    (value, scrut)
+                };
                 jsast::binary(op, value, self.case_literal(scrut, v))
             }
             Test::Le(v) => {
                 let op = if negated { BinOp::Lt } else { BinOp::Ge };
+                let (value, scrut) = if scrut.strict_i32 {
+                    (
+                        jsast::u32_wrap(value),
+                        ScrutTy {
+                            strict_i32: false,
+                            ..scrut
+                        },
+                    )
+                } else {
+                    (value, scrut)
+                };
                 jsast::binary(op, value, self.case_literal(scrut, v))
             }
             Test::InRange { lo, len } => match self.cx.table.int_repr(ty) {
                 IntRepr::Number => {
+                    let (value, scrut) = if scrut.strict_i32 {
+                        (
+                            jsast::u32_wrap(value),
+                            ScrutTy {
+                                strict_i32: false,
+                                ..scrut
+                            },
+                        )
+                    } else {
+                        (value, scrut)
+                    };
                     let offset = if self.cx.case_value(ty, lo) == 0 {
                         value
                     } else {
@@ -884,10 +920,19 @@ impl<'a> JsCx<'a> {
     /// The scrutinee type of an `RScrut`.
     pub fn scrut_ty(&self, scrutinee: &RScrut) -> ScrutTy {
         match *scrutinee {
-            RScrut::Value { ty, tag_enum, .. } => ScrutTy { ty, tag_enum },
+            RScrut::Value {
+                value,
+                ty,
+                tag_enum,
+            } => ScrutTy {
+                ty,
+                tag_enum,
+                strict_i32: tag_enum.is_none() && self.is_strict_i32_u32(value),
+            },
             RScrut::Invoke(_) => ScrutTy {
                 ty: self.usize_ty(),
                 tag_enum: None,
+                strict_i32: false,
             },
         }
     }
@@ -1723,11 +1768,23 @@ impl<'a> JsCx<'a> {
                         .byte_view(args[1])
                         .is_some_and(|v| v.mode == super::ByteViewMode::ThinPtr)
             }
-            "transmute"
-            | "transmute_unchecked"
-            | "offset"
-            | "arith_offset"
-            | "slice_get_unchecked" => self.byte_view(result).is_some(),
+            "compare_bytes" => {
+                args.len() == 3
+                    && (self.byte_view(args[0]).is_some() || self.byte_view(args[1]).is_some())
+            }
+            "raw_eq" => {
+                args.len() == 2
+                    && (self.byte_view(args[0]).is_some() || self.byte_view(args[1]).is_some())
+            }
+            "transmute" | "transmute_unchecked" => {
+                self.byte_view(result).is_some()
+                    || (args.len() == 1
+                        && self.byte_view(args[0]).is_some()
+                        && self.ty_of(result).ok().is_some_and(|ty| {
+                            super::byte_view_analysis::is_immutable_str_ref_pub(self.table, ty)
+                        }))
+            }
+            "offset" | "arith_offset" | "slice_get_unchecked" => self.byte_view(result).is_some(),
             _ => false,
         }
     }
@@ -1741,18 +1798,54 @@ impl<'a> JsCx<'a> {
         jsast::member(expr, field)
     }
 
+    fn is_unsigned_u32_val(&self, v: ValueId) -> bool {
+        self.ty_of(v).ok().is_some_and(|ty| {
+            matches!(
+                value::kind(self.table, self.table.peeled(ty)),
+                Some(TypeKind::Integer {
+                    signed: false,
+                    bits: ..=32
+                })
+            )
+        })
+    }
+
+    fn is_already_u32_expr(e: &Expr) -> bool {
+        match e {
+            Expr::Num(n) => n.is_finite() && *n >= 0.0 && *n <= 4294967295.0 && n.fract() == 0.0,
+            Expr::Binary(BinOp::UShr, _, _) => true,
+            _ => false,
+        }
+    }
+
     fn unsigned_add(a: Expr, b: Expr) -> Expr {
         if matches!(a, Expr::Num(n) if n == 0.0) {
+            if Self::is_already_u32_expr(&b) {
+                return b;
+            }
             return jsast::binary(BinOp::UShr, b, jsast::num(0));
         }
+        if matches!(b, Expr::Num(n) if n == 0.0) && Self::is_already_u32_expr(&a) {
+            return a;
+        }
         jsast::binary(BinOp::UShr, jsast::binary(BinOp::Add, a, b), jsast::num(0))
+    }
+
+    fn unsigned_add_val(&self, a: Expr, b_val: ValueId) -> Res<Expr> {
+        let b = self.expr_of(b_val)?;
+        if matches!(a, Expr::Num(n) if n == 0.0)
+            && (self.is_unsigned_u32_val(b_val) || Self::is_already_u32_expr(&b))
+        {
+            return Ok(b);
+        }
+        Ok(Self::unsigned_add(a, b))
     }
 
     fn unsigned_sub(a: Expr, b: Expr) -> Expr {
         jsast::binary(BinOp::UShr, jsast::binary(BinOp::Sub, a, b), jsast::num(0))
     }
 
-    fn byte_view_base_expr(&self, bv: super::ByteView, v: ValueId) -> Res<Expr> {
+    pub(super) fn byte_view_base_expr(&self, bv: super::ByteView, v: ValueId) -> Res<Expr> {
         if let Some(cell) = bv.base_cell {
             let base = self.cell_expr(cell)?;
             return Ok(if bv.base_is_string_obj {
@@ -1766,12 +1859,24 @@ impl<'a> JsCx<'a> {
             if bv.base_is_string_obj {
                 return Ok(jsast::member(base, "text"));
             }
+            if self
+                .byte_view(base_id)
+                .is_some_and(|base_bv| base_bv.mode == super::ByteViewMode::VarSlice)
+            {
+                return Ok(Self::member_or_field(base, "buf"));
+            }
             return Ok(base);
         }
         if bv.mode == super::ByteViewMode::FullSlice {
             return self.expr_of(v);
         }
+        if bv.mode == super::ByteViewMode::VarSlice {
+            return Ok(Self::member_or_field(self.expr_of(v)?, "buf"));
+        }
         if let Some(slice_id) = bv.borrow_slice {
+            if let Some(sbv) = self.byte_view(slice_id) {
+                return self.byte_view_base_expr(sbv, slice_id);
+            }
             return self.expr_of(slice_id);
         }
         Err(decline(
@@ -1780,7 +1885,7 @@ impl<'a> JsCx<'a> {
         ))
     }
 
-    fn byte_view_off_expr(&self, v: ValueId) -> Res<Expr> {
+    pub(super) fn byte_view_off_expr(&self, v: ValueId) -> Res<Expr> {
         let Some(bv) = self.byte_view(v) else {
             return Ok(jsast::num(0));
         };
@@ -1797,7 +1902,7 @@ impl<'a> JsCx<'a> {
         }
     }
 
-    fn byte_view_len_expr(&self, v: ValueId) -> Res<Expr> {
+    pub(super) fn byte_view_len_expr(&self, v: ValueId) -> Res<Expr> {
         let Some(bv) = self.byte_view(v) else {
             return Ok(jsast::member(self.expr_of(v)?, "length"));
         };
@@ -1811,6 +1916,30 @@ impl<'a> JsCx<'a> {
             }
             super::ByteViewMode::VarSlice => Ok(Self::member_or_field(self.expr_of(v)?, "len")),
             super::ByteViewMode::ThinPtr => Ok(jsast::num(0)),
+        }
+    }
+
+    pub(super) fn byte_view_to_str_expr(&self, src: ValueId) -> Res<Expr> {
+        let Some(bv) = self.byte_view(src) else {
+            return self.expr_of(src);
+        };
+        match bv.mode {
+            super::ByteViewMode::FullSlice => self.expr_of(src),
+            super::ByteViewMode::VarSlice => {
+                let base = self.byte_view_base_expr(bv, src)?;
+                let off = self.byte_view_off_expr(src)?;
+                let len = self.byte_view_len_expr(src)?;
+                let end = if matches!(off, Expr::Num(n) if n == 0.0) {
+                    len
+                } else {
+                    Self::unsigned_add(off.clone(), len)
+                };
+                Ok(jsast::method_call(base, "slice", vec![off, end]))
+            }
+            super::ByteViewMode::ThinPtr => Err(decline(
+                OpClass::Place,
+                "`js-str=bytes`: thin pointer cannot convert directly to &str".to_owned(),
+            )),
         }
     }
 
@@ -1917,8 +2046,123 @@ impl<'a> JsCx<'a> {
                         };
                         return Ok(Some(masked));
                     }
+                    "compare_bytes"
+                        if args.len() == 3
+                            && (self.byte_view(args[0]).is_some()
+                                || self.byte_view(args[1]).is_some()) =>
+                    {
+                        let count = self.expr_of(args[2])?;
+                        return Ok(Some(
+                            match (self.byte_view(args[0]), self.byte_view(args[1])) {
+                                (Some(bv0), Some(bv1)) => {
+                                    let b0 = self.byte_view_base_expr(bv0, args[0])?;
+                                    let o0 = self.byte_view_off_expr(args[0])?;
+                                    let b1 = self.byte_view_base_expr(bv1, args[1])?;
+                                    let o1 = self.byte_view_off_expr(args[1])?;
+                                    jsast::rt_call("bstr_cmp_range", vec![b0, o0, b1, o1, count])
+                                }
+                                (Some(bv0), None) => {
+                                    let b0 = self.byte_view_base_expr(bv0, args[0])?;
+                                    let o0 = self.byte_view_off_expr(args[0])?;
+                                    let p1 = self.expr_of(args[1])?;
+                                    jsast::rt_call("bstr_cmp_ptr", vec![b0, o0, p1, count])
+                                }
+                                (None, Some(bv1)) => {
+                                    let p0 = self.expr_of(args[0])?;
+                                    let b1 = self.byte_view_base_expr(bv1, args[1])?;
+                                    let o1 = self.byte_view_off_expr(args[1])?;
+                                    jsast::rt_call("ptr_cmp_bstr", vec![p0, b1, o1, count])
+                                }
+                                (None, None) => unreachable!(),
+                            },
+                        ));
+                    }
+                    "raw_eq"
+                        if args.len() == 2
+                            && (self.byte_view(args[0]).is_some()
+                                || self.byte_view(args[1]).is_some()) =>
+                    {
+                        let arr_len = match op.kind {
+                            OpKind::Intrinsic { ref types, .. } => types
+                                .first()
+                                .and_then(|t| value::kind(self.table, self.table.peeled(*t)))
+                                .and_then(|k| match k {
+                                    TypeKind::Array { length, .. } => Some(*length),
+                                    _ => None,
+                                }),
+                            _ => None,
+                        };
+                        if let Some(len) = arr_len {
+                            let n = jsast::num(len as f64);
+                            return Ok(Some(
+                                match (self.byte_view(args[0]), self.byte_view(args[1])) {
+                                    (Some(bv0), Some(bv1)) => {
+                                        let b0 = self.byte_view_base_expr(bv0, args[0])?;
+                                        let o0 = self.byte_view_off_expr(args[0])?;
+                                        let b1 = self.byte_view_base_expr(bv1, args[1])?;
+                                        let o1 = self.byte_view_off_expr(args[1])?;
+                                        jsast::binary(
+                                            BinOp::StrictEq,
+                                            jsast::rt_call(
+                                                "bstr_cmp_range",
+                                                vec![b0, o0, b1, o1, n],
+                                            ),
+                                            jsast::num(0),
+                                        )
+                                    }
+                                    (Some(bv0), None) => {
+                                        let b0 = self.byte_view_base_expr(bv0, args[0])?;
+                                        let o0 = self.byte_view_off_expr(args[0])?;
+                                        let arr = self.expr_of(args[1])?;
+                                        jsast::rt_call("bstr_eq_arr", vec![b0, o0, arr, n])
+                                    }
+                                    (None, Some(bv1)) => {
+                                        let arr = self.expr_of(args[0])?;
+                                        let b1 = self.byte_view_base_expr(bv1, args[1])?;
+                                        let o1 = self.byte_view_off_expr(args[1])?;
+                                        jsast::rt_call("bstr_eq_arr", vec![b1, o1, arr, n])
+                                    }
+                                    (None, None) => unreachable!(),
+                                },
+                            ));
+                        }
+                    }
+                    "transmute" | "transmute_unchecked"
+                        if args.len() == 1
+                            && self.byte_view(args[0]).is_some()
+                            && self.ty_of(result).ok().is_some_and(|ty| {
+                                super::byte_view_analysis::is_immutable_str_ref_pub(self.table, ty)
+                            }) =>
+                    {
+                        return Ok(Some(self.byte_view_to_str_expr(args[0])?));
+                    }
                     _ => {}
                 }
+            }
+            OpKind::Cast {
+                kind:
+                    rcgjs_object::jir::semantic::CastKind::Transmute
+                    | rcgjs_object::jir::semantic::CastKind::PtrToPtr
+                    | rcgjs_object::jir::semantic::CastKind::PointerCoercion,
+                v: src,
+                to,
+                ..
+            } if self.byte_view(*src).is_some()
+                && super::byte_view_analysis::is_immutable_str_ref_pub(self.table, *to) =>
+            {
+                return Ok(Some(self.byte_view_to_str_expr(*src)?));
+            }
+            OpKind::BorrowView {
+                root: Root::Value(src),
+                path,
+                mutable: false,
+            } if path.as_slice() == [Proj::Deref]
+                && self.byte_view(*src).is_some()
+                && self.ty_of(result).ok().is_some_and(|ty| {
+                    super::byte_view_analysis::is_immutable_str_ref_pub(self.table, ty)
+                }) =>
+            {
+                return Ok(Some(self.byte_view_to_str_expr(*src)?));
             }
             _ => {}
         }
@@ -1927,7 +2171,68 @@ impl<'a> JsCx<'a> {
             return Ok(None);
         };
 
+        if let Some((carrier, cluster)) = self.inlined_vec_cluster_of(result) {
+            if cluster.slice_values.contains(&result) {
+                let base = self.inlined_vec_text_expr(carrier, cluster.root)?;
+                return Ok(Some(match res_bv.mode {
+                    super::ByteViewMode::FullSlice => base,
+                    super::ByteViewMode::VarSlice => {
+                        let len_expr = jsast::member(base.clone(), "length");
+                        jsast::object_of(vec![
+                            ("buf", base),
+                            ("off", jsast::num(0)),
+                            ("len", len_expr),
+                        ])
+                    }
+                    super::ByteViewMode::ThinPtr => jsast::num(0),
+                }));
+            }
+        }
+
         let expr = match &op.kind {
+            OpKind::Const(tree)
+                if super::byte_view_analysis::const_u8_slice_str(tree).is_some() =>
+            {
+                let s = super::byte_view_analysis::const_u8_slice_str(tree).unwrap();
+                let len = s.chars().count();
+                match res_bv.mode {
+                    super::ByteViewMode::FullSlice => jsast::string(s),
+                    super::ByteViewMode::VarSlice => jsast::object_of(vec![
+                        ("buf", jsast::string(s)),
+                        ("off", jsast::num(0)),
+                        ("len", jsast::num(len as f64)),
+                    ]),
+                    super::ByteViewMode::ThinPtr => jsast::num(0),
+                }
+            }
+            OpKind::Cast {
+                kind: rcgjs_object::jir::semantic::CastKind::PointerCoercion,
+                v: src,
+                ..
+            } if self.byte_view(*src).is_none()
+                && self.def_of(*src).is_some_and(|def| {
+                    matches!(
+                        &def.kind,
+                        OpKind::Const(tree)
+                            if super::byte_view_analysis::const_u8_slice_str(tree).is_some()
+                    )
+                }) =>
+            {
+                let OpKind::Const(tree) = &self.def_of(*src).unwrap().kind else {
+                    unreachable!()
+                };
+                let s = super::byte_view_analysis::const_u8_slice_str(tree).unwrap();
+                let len = s.chars().count();
+                match res_bv.mode {
+                    super::ByteViewMode::FullSlice => jsast::string(s),
+                    super::ByteViewMode::VarSlice => jsast::object_of(vec![
+                        ("buf", jsast::string(s)),
+                        ("off", jsast::num(0)),
+                        ("len", jsast::num(len as f64)),
+                    ]),
+                    super::ByteViewMode::ThinPtr => jsast::num(0),
+                }
+            }
             OpKind::Cast { v, .. } | OpKind::Copy(v) | OpKind::Move(v) => {
                 self.byte_view_cast_or_alias(*v, res_bv, result)?
             }
@@ -1952,14 +2257,23 @@ impl<'a> JsCx<'a> {
                 [Proj::Deref] => self.byte_view_cast_or_alias(*v, res_bv, result)?,
                 [Proj::Deref, Proj::Index(idx)] => {
                     let base_off = self.byte_view_off_expr(*v)?;
-                    Self::unsigned_add(base_off, self.expr_of(*idx)?)
+                    self.unsigned_add_val(base_off, *idx)?
                 }
                 [Proj::Deref, Proj::ConstantIndex {
                     offset, from_end, ..
                 }] => {
                     let base_off = self.byte_view_off_expr(*v)?;
                     let idx = if *from_end {
-                        Self::unsigned_sub(self.byte_view_len_expr(*v)?, jsast::num(*offset as f64))
+                        if let Some(arr_len) = self.ty_of(*v).ok().and_then(|ty| {
+                            super::byte_view_analysis::is_immutable_byte_array_ptr(self.table, ty)
+                        }) {
+                            jsast::num(arr_len.saturating_sub(*offset) as f64)
+                        } else {
+                            Self::unsigned_sub(
+                                self.byte_view_len_expr(*v)?,
+                                jsast::num(*offset as f64),
+                            )
+                        }
                     } else {
                         jsast::num(*offset as f64)
                     };
@@ -1970,7 +2284,11 @@ impl<'a> JsCx<'a> {
                     }
                 }
                 [Proj::Deref, Proj::Subslice { from, to, from_end }] => {
-                    let base = self.byte_view_base_expr(res_bv, result)?;
+                    let base = if let Some(sbv) = self.byte_view(*v) {
+                        self.byte_view_base_expr(sbv, *v)?
+                    } else {
+                        self.byte_view_base_expr(res_bv, result)?
+                    };
                     let base_off = self.byte_view_off_expr(*v)?;
                     let new_off = if *from == 0 {
                         base_off
@@ -1995,7 +2313,11 @@ impl<'a> JsCx<'a> {
                 _ => return Ok(None),
             },
             OpKind::SliceView { ptr, len } => {
-                let base = self.byte_view_base_expr(res_bv, result)?;
+                let base = if let Some(pbv) = self.byte_view(*ptr) {
+                    self.byte_view_base_expr(pbv, *ptr)?
+                } else {
+                    self.byte_view_base_expr(res_bv, result)?
+                };
                 if res_bv.mode == super::ByteViewMode::FullSlice {
                     base
                 } else if self.inlined_vec_cluster_of(result).is_some() {
@@ -2010,6 +2332,100 @@ impl<'a> JsCx<'a> {
                     let len_expr = self.expr_of(*len)?;
                     jsast::object_of(vec![("buf", base), ("off", off), ("len", len_expr)])
                 }
+            }
+            OpKind::Const(rcgjs_object::jir::semantic::ConstTree::Variant { variant, .. })
+                if self.ty_of(result).ok().is_some_and(|ty| {
+                    super::byte_view_analysis::null_niche_byte_payload(self.table, ty)
+                        .is_some_and(|(none_v, _, _, _, _)| *variant == none_v)
+                }) =>
+            {
+                jsast::null()
+            }
+            OpKind::Aggregate {
+                ty,
+                variant,
+                fields,
+                ..
+            } if super::byte_view_analysis::null_niche_byte_payload(self.table, *ty).is_some() => {
+                let (none_v, some_v, fidx, _, _) =
+                    super::byte_view_analysis::null_niche_byte_payload(self.table, *ty).unwrap();
+                if *variant == none_v {
+                    jsast::null()
+                } else if *variant == some_v {
+                    let Some(&src) = fields.get(fidx as usize) else {
+                        return Ok(None);
+                    };
+                    self.byte_view_cast_or_alias(src, res_bv, result)?
+                } else {
+                    return Ok(None);
+                }
+            }
+            OpKind::Field {
+                base,
+                variant,
+                field,
+            } if self.ty_of(*base).ok().is_some_and(|bty| {
+                super::byte_view_analysis::null_niche_byte_payload(self.table, bty).is_some_and(
+                    |(_, some_v, fidx, _, _)| *variant == Some(some_v) && *field == fidx,
+                )
+            }) =>
+            {
+                self.byte_view_cast_or_alias(*base, res_bv, result)?
+            }
+            OpKind::Aggregate { ty, fields, .. }
+                if fields.len() == 2
+                    && matches!(
+                        self.table.get(*ty).map(|d| &d.kind),
+                        Some(TypeKind::RawPointer { .. })
+                    ) =>
+            {
+                let (ptr, len) = (fields[0], fields[1]);
+                let base = if let Some(pbv) = self.byte_view(ptr) {
+                    self.byte_view_base_expr(pbv, ptr)?
+                } else {
+                    self.byte_view_base_expr(res_bv, result)?
+                };
+                if res_bv.mode == super::ByteViewMode::FullSlice {
+                    base
+                } else {
+                    let off = self.byte_view_off_expr(ptr)?;
+                    let len_expr = self.expr_of(len)?;
+                    jsast::object_of(vec![("buf", base), ("off", off), ("len", len_expr)])
+                }
+            }
+            OpKind::Aggregate {
+                ty,
+                active_field,
+                fields,
+                ..
+            } if self.table.get(*ty).and_then(|d| d.js.transparent).is_some() => {
+                let d = self.table.get(*ty).unwrap();
+                let inner = d.js.transparent.unwrap();
+                let is_union = matches!(
+                    d.kind,
+                    TypeKind::Adt {
+                        form: rcgjs_object::jir::types::NominalForm::Union,
+                        ..
+                    }
+                );
+                if is_union && active_field.is_some_and(|a| a != inner.field) {
+                    return Ok(None);
+                }
+                let idx = if is_union { 0 } else { inner.field as usize };
+                let Some(&src) = fields.get(idx) else {
+                    return Ok(None);
+                };
+                self.byte_view_cast_or_alias(src, res_bv, result)?
+            }
+            OpKind::Field { base, field, .. }
+                if self
+                    .ty_of(*base)
+                    .ok()
+                    .and_then(|bty| self.table.get(bty))
+                    .and_then(|d| d.js.transparent)
+                    .is_some_and(|inner| inner.field == *field) =>
+            {
+                self.byte_view_cast_or_alias(*base, res_bv, result)?
             }
             OpKind::Call {
                 semantic:
@@ -2037,14 +2453,14 @@ impl<'a> JsCx<'a> {
                 l,
                 r,
                 ..
-            } => Self::unsigned_add(self.byte_view_off_expr(*l)?, self.expr_of(*r)?),
+            } => self.unsigned_add_val(self.byte_view_off_expr(*l)?, *r)?,
             OpKind::Intrinsic { name, args, .. }
                 if matches!(
                     self.interns.str(*name).unwrap_or(""),
                     "offset" | "arith_offset" | "slice_get_unchecked"
                 ) && args.len() >= 2 =>
             {
-                Self::unsigned_add(self.byte_view_off_expr(args[0])?, self.expr_of(args[1])?)
+                self.unsigned_add_val(self.byte_view_off_expr(args[0])?, args[1])?
             }
             _ => return Ok(None),
         };
@@ -2066,7 +2482,13 @@ impl<'a> JsCx<'a> {
                 {
                     self.expr_of(src)
                 } else {
-                    let base = self.byte_view_base_expr(res_bv, result)?;
+                    let base = if let Some(sbv) = self.byte_view(src) {
+                        self.byte_view_base_expr(sbv, src)?
+                    } else if res_bv.base_str.is_some() || res_bv.base_cell.is_some() {
+                        self.byte_view_base_expr(res_bv, result)?
+                    } else {
+                        self.expr_of(src)?
+                    };
                     let len = if self.byte_view(src).is_some() {
                         self.byte_view_len_expr(src)?
                     } else {
@@ -2329,7 +2751,19 @@ impl<'a> JsCx<'a> {
                 let data_ty = fields.first().map(|field| self.ty_of(*field)).transpose()?;
                 let values = fields
                     .iter()
-                    .map(|field| self.expr_of(*field))
+                    .enumerate()
+                    .map(|(fi, field)| {
+                        let expr = self.expr_of(*field)?;
+                        if *variant == 0
+                            && active_field.is_none()
+                            && self.is_smi_u32_field(*ty, fi as u32)
+                            && !self.is_strict_i32_u32(*field)
+                        {
+                            Ok(JsCx::smi_i32_store(expr))
+                        } else {
+                            Ok(expr)
+                        }
+                    })
                     .collect::<Res<Vec<_>>>()?;
                 self.aggregate(*ty, *variant, *active_field, values, data_ty)
             }
@@ -2364,11 +2798,15 @@ impl<'a> JsCx<'a> {
                         format!("field {field} of a type with no such field"),
                     ));
                 };
-                Ok(value::field_expr(
-                    self.interns,
-                    self.expr_of(*base)?,
-                    descriptor.key,
-                ))
+                let expr = value::field_expr(self.interns, self.expr_of(*base)?, descriptor.key);
+                if variant.is_none()
+                    && self.is_smi_u32_field(base_ty, *field)
+                    && !self.is_strict_i32_u32(result)
+                {
+                    Ok(jsast::u32_wrap(expr))
+                } else {
+                    Ok(expr)
+                }
             }
             OpKind::Discriminant(base) => {
                 let base_ty = self.ty_of(*base)?;
@@ -2437,8 +2875,18 @@ impl<'a> JsCx<'a> {
                 }
             }
             OpKind::Deref(pointer) => {
+                if self.unboxed_map_key_cell(*pointer).is_some() {
+                    return self.expr_of(*pointer);
+                }
                 let walk = self.pointee_place(*pointer)?;
-                Ok(self.read_place(&walk.place))
+                let expr = self.read_place(&walk.place);
+                if (walk.smi_u32 || self.is_smi_u32_ptr(*pointer))
+                    && !self.is_strict_i32_u32(result)
+                {
+                    Ok(jsast::u32_wrap(expr))
+                } else {
+                    Ok(expr)
+                }
             }
             OpKind::Binary { op: bin, l, r, ty } => {
                 if let Some(pair) = self.carried_pairs.get(&result) {
@@ -2446,13 +2894,41 @@ impl<'a> JsCx<'a> {
                     return self.carried_pair_value(pair.carrier, *bin, *ty, lhs, rhs);
                 }
                 let rhs_ty = self.ty_of(*r)?;
+                let (lhs, rhs) = if matches!(bin, BinaryOp::Eq | BinaryOp::Ne)
+                    && table.int_repr(*ty) == rcgjs_object::jir::types::IntRepr::Number
+                    && table.int_info(*ty) == Some((false, 32))
+                {
+                    let l_strict = self.is_strict_i32_u32(*l);
+                    let r_strict = self.is_strict_i32_u32(*r);
+                    let lhs = if r_strict && !l_strict {
+                        if let Some(bits) = self.const_u32_bits(*l) {
+                            jsast::num(f64::from((bits as u32) as i32))
+                        } else {
+                            self.expr_of(*l)?
+                        }
+                    } else {
+                        self.expr_of(*l)?
+                    };
+                    let rhs = if l_strict && !r_strict {
+                        if let Some(bits) = self.const_u32_bits(*r) {
+                            jsast::num(f64::from((bits as u32) as i32))
+                        } else {
+                            self.expr_of(*r)?
+                        }
+                    } else {
+                        self.expr_of(*r)?
+                    };
+                    (lhs, rhs)
+                } else {
+                    (self.expr_of(*l)?, self.expr_of(*r)?)
+                };
                 self.binary(
                     *bin,
                     *ty,
                     rhs_ty,
                     result_ty,
-                    self.expr_of(*l)?,
-                    self.expr_of(*r)?,
+                    lhs,
+                    rhs,
                     self.is_int32_only(result),
                 )
             }
@@ -2553,6 +3029,14 @@ impl<'a> JsCx<'a> {
                     // Nothing to store; the value is a JS value with no effect to keep.
                     return Ok(Vec::new());
                 }
+                let value = if variant.is_none()
+                    && self.is_smi_u32_field(base_ty, *field)
+                    && !self.is_strict_i32_u32(*v)
+                {
+                    JsCx::smi_i32_store(value)
+                } else {
+                    value
+                };
                 let target = value::field_expr(self.interns, self.expr_of(*base)?, descriptor.key);
                 self.write_place(JsPlace::Var(target), descriptor.ty, value)
             }
@@ -2594,6 +3078,13 @@ impl<'a> JsCx<'a> {
                 }
                 let walk = self.pointee_place(*pointer)?;
                 let value = self.expr_of(*v)?;
+                let value = if (walk.smi_u32 || self.is_smi_u32_ptr(*pointer))
+                    && !self.is_strict_i32_u32(*v)
+                {
+                    JsCx::smi_i32_store(value)
+                } else {
+                    value
+                };
                 self.write_place(walk.place, walk.ty, value)
             }
             OpKind::Assert {
@@ -2791,6 +3282,7 @@ impl<'a> JsCx<'a> {
                     object: super::place::is_object(self.table, pointee),
                     str_mutable: false,
                     str_from_mut: false,
+                    smi_u32: false,
                 });
             }
         }
@@ -2889,15 +3381,23 @@ impl<'a> JsCx<'a> {
                     };
                     arguments.push(self.caller_location_value(fact)?);
                 }
-                Ok(vec![jsast::expr_stmt(jsast::call(
-                    jsast::id((*name).clone()),
-                    arguments,
-                ))])
+                let call = jsast::call(jsast::id((*name).clone()), arguments);
+                let stmt = if self.opts.profile == Some(crate::opts::Profile::ReleaseSpeed) {
+                    jsast::throw(call)
+                } else {
+                    jsast::expr_stmt(call)
+                };
+                Ok(vec![stmt])
             }
-            [] => Ok(vec![jsast::expr_stmt(jsast::rt_call(
-                "js_abort",
-                vec![jsast::string(assert_message(msg))],
-            ))]),
+            [] => {
+                let call = jsast::rt_call("js_abort", vec![jsast::string(assert_message(msg))]);
+                let stmt = if self.opts.profile == Some(crate::opts::Profile::ReleaseSpeed) {
+                    jsast::throw(call)
+                } else {
+                    jsast::expr_stmt(call)
+                };
+                Ok(vec![stmt])
+            }
             _ => Err(decline(
                 OpClass::Terminator,
                 format!("the `{lang_fn}` panic function is ambiguous among the item's references"),

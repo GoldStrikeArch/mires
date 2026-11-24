@@ -992,6 +992,39 @@ globalThis.__rt._scales = (a, b, op) => {
 // is above. Which store each element gets is `_rebinds`.
 globalThis.__rt.copy = (dst, src, count, clone, plain) => {
   if (count === 0) return;
+  if (clone === undefined && globalThis.__rt._bv === null
+      && globalThis.__rt._element_view_of === null
+      && dst !== null && src !== null && dst.sc === undefined && src.sc === undefined) {
+    const db = dst.buf, sb = src.buf, doff = dst.off, soff = src.off;
+    if (db !== undefined && sb !== undefined && doff >= 0 && soff >= 0
+        && doff + count <= db.length && soff + count <= sb.length) {
+      if (db === sb) {
+        if (doff === soff) return;
+        if (ArrayBuffer.isView(db) || ((plain || globalThis.__rt._boxes === null) && Array.isArray(db))) {
+          if (count <= 8) {
+            if (doff > soff) {
+              for (let i = count - 1; i >= 0; i--) db[doff + i] = db[soff + i];
+            } else {
+              for (let i = 0; i < count; i++) db[doff + i] = db[soff + i];
+            }
+          } else {
+            db.copyWithin(doff, soff, soff + count);
+          }
+          return;
+        }
+      } else if (ArrayBuffer.isView(db) && ArrayBuffer.isView(sb) && db.constructor === sb.constructor) {
+        if (count <= 8) {
+          for (let i = 0; i < count; i++) db[doff + i] = sb[soff + i];
+        } else {
+          db.set(soff === 0 && count === sb.length ? sb : sb.subarray(soff, soff + count), doff);
+        }
+        return;
+      } else if ((plain || globalThis.__rt._boxes === null) && Array.isArray(db) && Array.isArray(sb)) {
+        for (let i = 0; i < count; i++) db[doff + i] = sb[soff + i];
+        return;
+      }
+    }
+  }
   let effCl = clone, fromNs = false;
   if (clone === undefined && globalThis.__rt._bv !== null) {
     const r = globalThis.__rt._bv.prep_copy_pair(dst, src, count);
@@ -1204,6 +1237,19 @@ globalThis.__rt.write_bytes = (dst, byte, count, zero) => {
       dst = globalThis.__rt._bv.write_bytes(dst, byte, count);
     }
   }
+  if (globalThis.__rt._bv === null && globalThis.__rt._element_view_of === null
+      && dst !== null && dst.sc === undefined) {
+    const db = dst.buf, doff = dst.off;
+    if (db !== undefined && doff >= 0 && doff + count <= db.length) {
+      if (zero === undefined && db instanceof Uint8Array) {
+        const blk = globalThis.__rt._blk_get(db);
+        if (blk === undefined || (!blk.freed && blk.typed === undefined && blk.es === 1)) {
+          db.fill(value, doff, doff + count);
+          return;
+        }
+      }
+    }
+  }
   const d = globalThis.__rt._run(dst, count, "write_bytes");
   if (Array.isArray(d.buf) || ArrayBuffer.isView(d.buf)) {
     d.buf.fill(value, d.off, d.off + d.n);
@@ -1250,7 +1296,8 @@ globalThis.__rt.compare_bytes = (a, b, count) => {
   if (globalThis.__rt._bv === null && globalThis.__rt._element_view_of === null
       && a !== null && b !== null && a.sc === undefined && b.sc === undefined) {
     const ab = a.buf, bb = b.buf;
-    if (ab instanceof Uint8Array && bb instanceof Uint8Array) {
+    if ((ab instanceof Uint8Array || (Array.isArray(ab) && globalThis.__rt._blk_get(ab) === undefined))
+        && (bb instanceof Uint8Array || (Array.isArray(bb) && globalThis.__rt._blk_get(bb) === undefined))) {
       const ao = a.off, bo = b.off;
       if (ao >= 0 && bo >= 0 && ao + count <= ab.length && bo + count <= bb.length) {
         for (let i = 0; i < count; i++) {
@@ -3199,6 +3246,19 @@ const _bstr_u8_to_latin1 =
 
 globalThis.__rt._bstr_units = (buf, off, len) => {
   if (len <= 0) return "";
+  if (len === 1) return String.fromCharCode(buf[off] & 0xff);
+  if (len === 2) return String.fromCharCode(buf[off] & 0xff, buf[off + 1] & 0xff);
+  if (len === 3) {
+    return String.fromCharCode(buf[off] & 0xff, buf[off + 1] & 0xff, buf[off + 2] & 0xff);
+  }
+  if (len === 4) {
+    return String.fromCharCode(
+      buf[off] & 0xff,
+      buf[off + 1] & 0xff,
+      buf[off + 2] & 0xff,
+      buf[off + 3] & 0xff,
+    );
+  }
   if (buf instanceof Uint8Array) {
     if (len > 32 && _bstr_u8_to_latin1 !== null) {
       return _bstr_u8_to_latin1(buf, off, len);
@@ -3215,6 +3275,11 @@ globalThis.__rt._bstr_units = (buf, off, len) => {
     }
     return out;
   }
+  if (len <= 32) {
+    let out = "";
+    for (let i = 0; i < len; i++) out += String.fromCharCode(buf[off + i] & 0xff);
+    return out;
+  }
   let out = "";
   for (let at = 0; at < len; at += 4096) {
     const end = Math.min(len, at + 4096);
@@ -3228,8 +3293,16 @@ globalThis.__rt._bstr_units = (buf, off, len) => {
 // bstr_in(s): host text as the byte string of its UTF-8 bytes -- exactly the
 // bytes `TextEncoder` writes, so a lone surrogate is U+FFFD (EF BF BD). ASCII
 // text is its own byte string and comes back as is.
+const _bstr_utf8_to_latin1 =
+  typeof Buffer === "function" && typeof Buffer.from === "function"
+    ? (s) => Buffer.from(s, "utf8").toString("latin1")
+    : null;
+
 globalThis.__rt.bstr_in = (s) => {
   if (globalThis.__rt._bstr_is_ascii(s)) return s;
+  if (s.length > 32 && _bstr_utf8_to_latin1 !== null) {
+    return _bstr_utf8_to_latin1(s);
+  }
   const bytes = globalThis.__rt._encoder.encode(s);
   return globalThis.__rt._bstr_units(bytes, 0, bytes.length);
 };
@@ -3247,6 +3320,66 @@ globalThis.__rt._bstr_is_ascii = (s) => {
 };
 const _bstr_wide = /[^\x00-\x7f]/;
 
+globalThis.__rt._bstr_is_ascii_range = (s, off, len) => {
+  for (let i = off, end = off + len; i < end; i++) {
+    if (s.charCodeAt(i) > 127) return false;
+  }
+  return true;
+};
+
+globalThis.__rt.bstr_cmp_range = (a, ao, b, bo, n) => {
+  for (let i = 0; i < n; i++) {
+    const d = a.charCodeAt(ao + i) - b.charCodeAt(bo + i);
+    if (d !== 0) return d;
+  }
+  return 0;
+};
+
+globalThis.__rt.bstr_eq_arr = (s, so, arr, n) => {
+  for (let i = 0; i < n; i++) {
+    if (s.charCodeAt(so + i) !== arr[i]) return false;
+  }
+  return true;
+};
+
+globalThis.__rt.bstr_cmp_ptr = (s, so, p, n) => {
+  if (n === 0) return 0;
+  if (globalThis.__rt._bv === null && globalThis.__rt._element_view_of === null
+      && p !== null && p.sc === undefined) {
+    const pb = p.buf, po = p.off;
+    if (pb !== undefined && po >= 0 && po + n <= pb.length
+        && (pb instanceof Uint8Array || (Array.isArray(pb) && globalThis.__rt._blk_get(pb) === undefined))) {
+      for (let i = 0; i < n; i++) {
+        const d = s.charCodeAt(so + i) - pb[po + i];
+        if (d !== 0) return d;
+      }
+      return 0;
+    }
+  }
+  const bv = globalThis.__rt.bstr_bytes(s);
+  return globalThis.__rt.compare_bytes({ buf: bv.buf, off: bv.off + so }, p, n);
+};
+
+globalThis.__rt.ptr_cmp_bstr = (p, s, so, n) => {
+  const r = globalThis.__rt.bstr_cmp_ptr(s, so, p, n);
+  return r === 0 ? 0 : -r;
+};
+
+globalThis.__rt.bstr_copy_to = (s, so, dst, n) => {
+  if (n === 0) return;
+  if (globalThis.__rt._bv === null && globalThis.__rt._element_view_of === null
+      && dst !== null && dst.sc === undefined) {
+    const db = dst.buf, doff = dst.off;
+    if (db !== undefined && doff >= 0 && doff + n <= db.length
+        && (db instanceof Uint8Array || (Array.isArray(db) && globalThis.__rt._blk_get(db) === undefined))) {
+      for (let i = 0; i < n; i++) db[doff + i] = s.charCodeAt(so + i);
+      return;
+    }
+  }
+  const bv = globalThis.__rt.bstr_bytes(s);
+  globalThis.__rt.copy_nonoverlapping(dst, { buf: bv.buf, off: bv.off + so }, n);
+};
+
 // bytes_is_ascii(s): `<[u8]>::is_ascii` on a `{ buf, off, len }` byte slice, one byte at a time
 // (`js-str=bytes`), where `core` reads a JavaScript array a word at a time through scalar views.
 // A byte is tested the way `core`'s own byte loop tests it, `b < 128`.
@@ -3261,6 +3394,11 @@ globalThis.__rt.bytes_is_ascii = (s) => {
 // non-ASCII strings <= 48 bytes decode in pure JS (zero Uint8Array /
 // TextDecoder C++ call), 49..=1024 reuse a shared scratch Uint8Array, and larger
 // strings allocate a fresh Uint8Array.
+const _bstr_latin1_to_utf8 =
+  typeof Buffer === "function" && typeof Buffer.from === "function"
+    ? (s) => Buffer.from(s, "latin1").toString("utf8")
+    : null;
+
 globalThis.__rt.bstr_out = (s) => {
   if (globalThis.__rt._bstr_is_ascii(s)) return s;
   const n = s.length;
@@ -3293,6 +3431,9 @@ globalThis.__rt.bstr_out = (s) => {
       }
     }
     return out;
+  }
+  if (_bstr_latin1_to_utf8 !== null) {
+    return _bstr_latin1_to_utf8(s);
   }
   const bytes =
     n <= 1024

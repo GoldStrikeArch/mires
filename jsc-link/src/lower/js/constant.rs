@@ -486,14 +486,18 @@ impl<'a> JsCx<'a> {
                     return Ok(jsast::object(Vec::new()));
                 };
                 let mut entries = Vec::with_capacity(fields.len());
-                for (field, tree) in variant.fields.iter().zip(fields) {
+                for (fi, (field, tree)) in variant.fields.iter().zip(fields).enumerate() {
                     // A zero-sized struct's fields have no keys in the table; the value is `{}`
                     // (spec: `constant.rs:255-269` prints the keys, with `undefined` values).
                     if matches!(field.key, FieldKey::Transparent) {
                         continue;
                     }
                     let key = self.field_key_name(field.key)?;
-                    entries.push((key, self.const_expr_at(tree, field.ty, depth + 1)?));
+                    let mut val = self.const_expr_at(tree, field.ty, depth + 1)?;
+                    if self.is_smi_u32_field(ty, fi as u32) {
+                        val = JsCx::smi_i32_store(val);
+                    }
+                    entries.push((key, val));
                 }
                 Ok(jsast::object(entries))
             }

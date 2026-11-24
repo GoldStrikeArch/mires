@@ -104,6 +104,7 @@ pub fn lower_with_ascii(
     // The parameter list (`base.rs::params`): `Func.params` in order — one per MIR argument, a
     // splatted tuple already as its arity, the caller `Location` last when the body tracks it.
     let slice_positions = physical.map_or_else(Vec::new, |sig| sig.slice_jir_positions());
+    let byte_str_positions = physical.map_or_else(Vec::new, |sig| sig.byte_str_jir_positions());
     let tagged_positions = physical.map_or_else(Vec::new, |sig| sig.tagged_jir_positions());
     let recursive_positions = physical.map_or_else(Vec::new, |sig| sig.recursive_jir_positions());
     let i64_positions = physical.map_or_else(Vec::new, |sig| sig.i64_pair_jir_positions());
@@ -148,7 +149,10 @@ pub fn lower_with_ascii(
                 format!("parameter {} has no name in the plan", param.0),
             ));
         };
-        let slice = slice_positions.contains(&position);
+        let slice = slice_positions.contains(&position)
+            || byte_str_positions.iter().any(|&(pos, mode)| {
+                pos == position && mode == crate::plan::abi_flat::ByteStrParam::Sub
+            });
         if slice {
             let buf = format!("{name}$buf");
             let off = format!("{name}$off");
@@ -228,6 +232,28 @@ pub fn lower_with_ascii(
     cx.set_formal_param_names(formal_param_names.clone());
     let mut param_names: HashSet<String> = formal_param_names.clone();
     param_names.extend(logical_param_names);
+
+    // Fail-closed verification: every `ByteStrParam` parameter promised by `target_abi` MUST
+    // survive `byte_view_analysis` with the exact physical mode (`Full => FullSlice`,
+    // `Sub => VarSlice`); otherwise decline so the lane retries cleanly.
+    for &(pos, bs_mode) in &byte_str_positions {
+        let Some(&param) = func.params.get(pos) else {
+            return Err(decline(
+                OpClass::Other,
+                format!("byte_str param position {pos} out of bounds"),
+            ));
+        };
+        let expected = match bs_mode {
+            crate::plan::abi_flat::ByteStrParam::Full => super::ByteViewMode::FullSlice,
+            crate::plan::abi_flat::ByteStrParam::Sub => super::ByteViewMode::VarSlice,
+        };
+        if cx.byte_view(param).map(|bv| bv.mode) != Some(expected) {
+            return Err(decline(
+                OpClass::Other,
+                format!("byte_str param {pos} did not survive byte_view_analysis as {expected:?}"),
+            ));
+        }
+    }
 
     // The body first: it decides how many temporaries get hoisted and which names are mentioned.
     let (mut body, structure_temps) = emit::emit(&cx, region)?;
@@ -377,6 +403,23 @@ pub fn lower_with_ascii(
     }
 
     let decl = jsast::function(input.name.as_str(), params, out);
+    let mut immutable_slices: HashSet<String> = HashSet::new();
+    for &param in &func.params {
+        let Ok(ty) = cx.ty_of(param) else { continue };
+        if input.table.pointer_form(ty) != Some(rcgjs_object::jir::types::PointerForm::FatSlice) {
+            continue;
+        }
+        let Some(name) = cx.name_of(param) else {
+            continue;
+        };
+        let is_boxed_param = plan
+            .param_cells
+            .iter()
+            .any(|(cell, p)| *p == param && cx.cell_boxed(*cell));
+        if !is_boxed_param && formal_param_names.contains(name) {
+            immutable_slices.insert(name.to_owned());
+        }
+    }
     let allocation_origins = cx
         .take_allocation_origins()
         .into_iter()
@@ -391,6 +434,7 @@ pub fn lower_with_ascii(
         cx.take_zombies(),
         allocation_origins,
         input.bigints,
+        &immutable_slices,
     )
 }
 
@@ -443,6 +487,7 @@ fn try_lower_slice_sort(
             Vec::new(),
             Vec::new(),
             input.bigints,
+            &HashSet::new(),
         )
         .map(Some);
     }
@@ -492,6 +537,7 @@ fn try_lower_slice_sort(
         Vec::new(),
         Vec::new(),
         input.bigints,
+        &HashSet::new(),
     )
     .map(Some)
 }
@@ -528,7 +574,15 @@ pub fn lower_static(input: &LowerInput<'_>, plan: &Plan) -> Result<LoweredItem, 
     let decl = jsast::let_(input.name.as_str(), value);
     // A static's initializer runs once, while the module evaluates, so naming its BigInt constants
     // would buy nothing at run time and cost a declaration per value (`lower/bigint.rs`).
-    finish(input, decl, Vec::new(), cx.take_zombies(), Vec::new(), None)
+    finish(
+        input,
+        decl,
+        Vec::new(),
+        cx.take_zombies(),
+        Vec::new(),
+        None,
+        &HashSet::new(),
+    )
 }
 
 /// A vtable: `const NAME = [<drop or null>, <size>, <align>, <method>, ..]` (`vtable.rs`).
@@ -561,7 +615,15 @@ pub fn lower_vtable(input: &LowerInput<'_>) -> Result<LoweredItem, Decline> {
         .collect();
     let _ = (size, align);
     let decl = jsast::const_(input.name.as_str(), jsast::array(slots));
-    finish(input, decl, Vec::new(), Vec::new(), Vec::new(), None)
+    finish(
+        input,
+        decl,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        &HashSet::new(),
+    )
 }
 
 /// A function with no blocks, for the contexts that lower a static (constants only).
@@ -586,6 +648,7 @@ fn finish(
     zombies: Vec<rcgjs_object::item::FlatZombie>,
     js_alloc_origins: Vec<crate::analysis::js_alloc::Origin>,
     bigints: Option<&crate::lower::bigint::BigIntNames>,
+    immutable_slices: &HashSet<String>,
 ) -> Result<LoweredItem, Decline> {
     // A baseline item passes through the shared finished-JavaScript SROA and DCE pipeline in
     // `JsItem::new`. JIR replacements are installed directly by the linker, so run the same
@@ -625,7 +688,11 @@ fn finish(
             eliminate_dead_local_writes(body, &local_names);
         }
         if input.opts.profile == Some(crate::opts::Profile::ReleaseSpeed) {
-            super::post_opt::run_speed_post_opts_with_mode(&mut decl, input.physical.is_some());
+            super::post_opt::run_speed_post_opts_with_mode(
+                &mut decl,
+                input.physical.is_some(),
+                immutable_slices,
+            );
             if let Stmt::FunctionDecl { params, body, .. } = &mut decl {
                 let mut local_names: HashSet<String> = params.iter().cloned().collect();
                 for stmt in body.iter() {

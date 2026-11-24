@@ -791,6 +791,18 @@ impl<'a> Planner<'a> {
         {
             return true;
         }
+        // `DropGlue::None` emits nothing (`call.rs`), erasing its root and any path index
+        // operands from the final spelling. Keep those operands materialized at their definitions
+        // so effectful calls (e.g. `Vec::remove` whose returned value has a no-op drop) still run.
+        if matches!(
+            op.kind,
+            OpKind::Drop {
+                glue: rcgjs_object::jir::semantic::DropGlue::None,
+                ..
+            }
+        ) {
+            return true;
+        }
         // So does a place walk that reaches an element with no storage: the index that selected
         // it is not spelled, and a read or write of it spells nothing (`js::place::reaches_unit`).
         if let OpKind::BorrowView { root, path, .. }
@@ -2191,6 +2203,141 @@ mod tests {
         assert!(
             p.inline.contains(&v_after),
             "pure expression in non-Invoke block inside Invoke function should fuse"
+        );
+    }
+
+    #[test]
+    fn effectful_call_feeding_noop_drop_is_never_inlined() {
+        use crate::jir::origin::OriginId;
+        use crate::jir::repr::FuncBuilder;
+        use crate::jir::semantic::{
+            AbiSignature, CallSemantic, Callee, DefinitionId, DropGlue, ItemId, Signature, TypeId,
+        };
+        use crate::jir::types::{
+            IntFacts, IntRepr, JsFacts, LayoutFacts, TypeDescriptor, TypeKind, TypeMeta,
+        };
+
+        let mut interns = Interns::new();
+        let unit_ty = TypeId(0);
+        let u32_ty = TypeId(1);
+        let callee_name = interns.intern_str("vec_remove");
+        let mut table = TypeTable::default();
+        table.insert(TypeDescriptor {
+            id: unit_ty,
+            name: None,
+            kind: TypeKind::Tuple(Vec::new()),
+            layout: LayoutFacts {
+                sized: true,
+                zst: true,
+                one_zst: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: None,
+                is_indirect: true,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: unit_ty,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+        table.insert(TypeDescriptor {
+            id: u32_ty,
+            name: None,
+            kind: TypeKind::Integer {
+                signed: false,
+                bits: 32,
+            },
+            layout: LayoutFacts {
+                sized: true,
+                ..LayoutFacts::default()
+            },
+            meta: TypeMeta::default(),
+            js: JsFacts {
+                int: Some(IntFacts {
+                    signed: false,
+                    bits: 32,
+                    repr: IntRepr::Number,
+                }),
+                is_indirect: false,
+                needs_clone: false,
+                crosses_transparent_union: false,
+                transparent: None,
+                peeled: u32_ty,
+                unsized_tail: None,
+                enum_repr: None,
+                is_primitive_enum: false,
+                pointer_form: None,
+                byte_element: false,
+                fields: Vec::new(),
+            },
+        });
+
+        let mut b = FuncBuilder::new(
+            ItemId {
+                definition: DefinitionId {
+                    crate_id: 1,
+                    local_hash: 1,
+                },
+                instantiation: 0,
+            },
+            Signature {
+                arguments: Vec::new(),
+                result: unit_ty,
+                abi: AbiSignature::default(),
+            },
+        );
+        let o = OriginId(0);
+        let b0 = FuncBuilder::ENTRY;
+        let v_removed = b.op(
+            b0,
+            OpKind::Call {
+                callee: Callee::Direct {
+                    item: ItemId {
+                        definition: DefinitionId {
+                            crate_id: 1,
+                            local_hash: 2,
+                        },
+                        instantiation: 0,
+                    },
+                    link_name: callee_name,
+                },
+                function: None,
+                args: Vec::new(),
+                track_caller: None,
+                semantic: CallSemantic::Ordinary,
+                host: None,
+            },
+            u32_ty,
+            o,
+        );
+        b.effect(
+            b0,
+            OpKind::Drop {
+                root: Root::Value(v_removed),
+                path: Vec::new(),
+                glue: DropGlue::None,
+            },
+            o,
+        );
+        b.terminate(b0, RTerm::Return(None));
+
+        let func = b.finish();
+        let on_opts = Opts {
+            optimizer: rcgjs_object::opts::OptimizerMode::On,
+            ..Opts::default()
+        };
+        let p = plan(&func, None, &table, &interns, &on_opts);
+        assert!(
+            !p.inline.contains(&v_removed),
+            "effectful call feeding DropGlue::None must stay materialized so its side effect is never dropped"
         );
     }
 }

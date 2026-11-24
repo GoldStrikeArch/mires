@@ -363,17 +363,18 @@ fn decide_for_plan(
     // and stays within the speed size budget.
     if !accepted
         && profile == Profile::ReleaseSpeed
-        && (plan.has_slice_param() || plan.has_i64_pair_abi())
-        && reason.as_deref() == Some("cost.hotness-evidence-missing")
+        && (plan.has_slice_param() || plan.has_i64_pair_abi() || plan.has_byte_str_abi())
+        && (reason.as_deref() == Some("cost.hotness-evidence-missing") || plan.has_byte_str_abi())
     {
         if let (Some(b), Some(a)) = (before, after) {
-            if a.loop_allocations <= b.loop_allocations
-                && a.allocations <= b.allocations
-                && speed_within_budget(b, a)
-            {
+            let allocs_ok = plan.has_byte_str_abi()
+                || (a.loop_allocations <= b.loop_allocations && a.allocations <= b.allocations);
+            if allocs_ok && speed_within_budget(b, a) {
                 accepted = true;
                 reason = None;
-                hotness_source = Some(if plan.has_i64_pair_abi() {
+                hotness_source = Some(if plan.has_byte_str_abi() {
+                    "bstr-slice-specialization"
+                } else if plan.has_i64_pair_abi() {
                     "i64-pair-abi-scalarization"
                 } else {
                     "slice-param-scalarization"

@@ -9,6 +9,7 @@
 pub mod abi_flat;
 pub mod async_graph;
 pub(crate) mod async_ready;
+pub mod bstr_abi;
 pub mod cost;
 pub mod enum_repr;
 pub mod graph;

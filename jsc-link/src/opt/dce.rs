@@ -81,6 +81,7 @@ pub fn run_with(
         if !options.no_deletions {
             round |= fold_signed_lt_step_overflow(func, table);
             round |= elide_redundant_copies(func, table);
+            round |= cse_ptr_metadata(func, table);
         }
         round |= remove_settled_asserts(func);
         round |= fold_constant_switches(func, table, witnesses);
@@ -878,6 +879,138 @@ fn elide_redundant_copies(func: &mut Func, table: &TypeTable) -> bool {
 /// it, and `Func::verify` rejects that ("value vN is never defined"). Every one of them is
 /// unreferenced by construction: a deleted op's result was unused, a removed parameter's uses were
 /// substituted first, and only unreachable blocks can name a value an unreachable block defined.
+/// Deduplicates dominated `UnaryOp::PtrMetadata` reads of the same fat-pointer SSA value.
+///
+/// Fat-pointer metadata (slice length) is an immutable field of the SSA value itself, never
+/// mutable heap memory. Reusing a dominating `PtrMetadata(v)` eliminates redundant `.length` /
+/// `.len` reloads after inlining (e.g. `FullSlice` byte-string helpers).
+fn cse_ptr_metadata(func: &mut Func, table: &TypeTable) -> bool {
+    let n = func.values.len();
+    let mut copy_of: Vec<Option<ValueId>> = vec![None; n];
+    for block in &func.blocks {
+        for op in &block.ops {
+            if let Some(res) = op.result {
+                if let OpKind::Copy(src) | OpKind::Move(src) = op.kind {
+                    let rdef = func.values[res.0 as usize];
+                    let sdef = func.values[src.0 as usize];
+                    if rdef.carrier == Carrier::Baseline
+                        && sdef.carrier == Carrier::Baseline
+                        && rdef.ty == sdef.ty
+                    {
+                        copy_of[res.0 as usize] = Some(src);
+                    }
+                }
+            }
+        }
+    }
+    let peel = |mut v: ValueId| -> ValueId {
+        for _ in 0..16 {
+            let Some(next) = copy_of.get(v.0 as usize).copied().flatten() else {
+                break;
+            };
+            if next == v {
+                break;
+            }
+            v = next;
+        }
+        v
+    };
+
+    type PtrMetaDef = (RBlockId, usize, ValueId);
+    let mut defs: BTreeMap<(ValueId, TypeId), Vec<PtrMetaDef>> = BTreeMap::new();
+    for block in &func.blocks {
+        for (op_idx, op) in block.ops.iter().enumerate() {
+            let Some(res) = op.result else {
+                continue;
+            };
+            let OpKind::Unary {
+                op: crate::jir::semantic::UnaryOp::PtrMetadata,
+                v,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            let rdef = func.values[res.0 as usize];
+            if rdef.carrier != Carrier::Baseline {
+                continue;
+            }
+            if !matches!(
+                table.get(table.peeled(rdef.ty)).map(|d| &d.kind),
+                Some(TypeKind::Integer { .. })
+            ) {
+                continue;
+            }
+            defs.entry((peel(*v), rdef.ty))
+                .or_default()
+                .push((block.id, op_idx, res));
+        }
+    }
+    if defs.values().all(|list| list.len() <= 1) {
+        return false;
+    }
+
+    let doms = Dominators::of(func);
+    let mut repl: BTreeMap<ValueId, ValueId> = BTreeMap::new();
+    for list in defs.values() {
+        if list.len() <= 1 {
+            continue;
+        }
+        for &(b2, idx2, v2) in list {
+            if !doms.dominates(RBlockId(0), b2) {
+                continue;
+            }
+            let mut best: Option<(RBlockId, usize, ValueId)> = None;
+            for &(b1, idx1, v1) in list {
+                if v1 == v2 {
+                    continue;
+                }
+                let dominates = if b1 == b2 {
+                    idx1 < idx2
+                } else {
+                    doms.dominates(b1, b2)
+                };
+                if !dominates {
+                    continue;
+                }
+                let better = match best {
+                    None => true,
+                    Some((bb, bidx, _)) => {
+                        if b1 == bb {
+                            idx1 < bidx
+                        } else {
+                            doms.dominates(b1, bb)
+                        }
+                    }
+                };
+                if better {
+                    best = Some((b1, idx1, v1));
+                }
+            }
+            if let Some((_, _, dom_v)) = best {
+                repl.insert(v2, dom_v);
+            }
+        }
+    }
+    if repl.is_empty() {
+        return false;
+    }
+    // Resolve chains in case a dominating def is itself dominated by an earlier one.
+    let keys: Vec<ValueId> = repl.keys().copied().collect();
+    for k in keys {
+        let mut cur = repl[&k];
+        while let Some(&next) = repl.get(&cur) {
+            if next == cur {
+                break;
+            }
+            cur = next;
+        }
+        repl.insert(k, cur);
+    }
+    substitute(func, &repl);
+    true
+}
+
 fn has_orphaned_values(func: &Func) -> bool {
     let mut defined = vec![false; func.values.len()];
     for block in &func.blocks {

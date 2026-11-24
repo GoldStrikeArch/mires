@@ -50,7 +50,7 @@ use crate::jir::repr::{
     Carrier, CellId, Dominators, Func, FuncBuilder, Op, OpKind, Proj, RAssertMessage, RBlockId,
     RTerm, Root, ValueId,
 };
-use crate::jir::semantic::{BinaryOp, CastKind, ConstTree, TypeId};
+use crate::jir::semantic::{BinaryOp, CastKind, ConstTree, DropGlue, TypeId};
 use crate::jir::types::{EnumRepr, NominalForm, TypeKind, TypeTable};
 
 use super::candidates;
@@ -281,11 +281,14 @@ pub(crate) fn unbox_cells(func: &mut Func, table: &TypeTable) -> bool {
                 | OpKind::RawView {
                     root: Root::Cell(cell),
                     ..
-                }
-                | OpKind::Drop {
-                    root: Root::Cell(cell),
-                    ..
                 } => {
+                    cell_rooted.insert(*cell);
+                }
+                OpKind::Drop {
+                    root: Root::Cell(cell),
+                    glue,
+                    ..
+                } if !matches!(glue, DropGlue::None) => {
                     cell_rooted.insert(*cell);
                 }
                 _ => {}
@@ -1306,9 +1309,10 @@ impl Analysis {
             })
             .collect();
         for (index, node) in self.nodes.iter().enumerate() {
-            if headers
-                .iter()
-                .any(|header| node.block != *header && doms.dominates(node.block, *header))
+            if self.mutated_nodes.contains(&index)
+                && headers
+                    .iter()
+                    .any(|header| node.block != *header && doms.dominates(node.block, *header))
             {
                 unpinned.extend((0..node.fields.len() as u32).map(|field| (index, field)));
             }
@@ -1965,7 +1969,9 @@ impl Rewriter<'_> {
                     incoming.push(*self.exit[pred.0 as usize].get(&node)?.get(field)?);
                 }
                 let first = *incoming.first()?;
-                if !header && incoming.iter().all(|value| *value == first) {
+                if (!header || !self.analysis.mutated_nodes.contains(&node))
+                    && incoming.iter().all(|value| *value == first)
+                {
                     flags.push(false);
                     values.push(first);
                 } else {

@@ -5692,6 +5692,7 @@ fn flat_abi_i64_pair_param_with_param_cell_declares_box_instead_of_rebinding_mis
         mutable: false,
         written: false,
         slice: false,
+        byte_str: None,
         i64_pair: true,
         tagged: None,
         recursive: None,
@@ -10643,6 +10644,7 @@ fn phase3_typed_heap_lowers_hooks_plain_put_and_zero_offset_guard() {
         boxed_non_adt_keys: BTreeSet::new(),
         all_non_adt_boxed: false,
         all_adts_boxed: false,
+        smi_u32_fields: BTreeSet::new(),
     };
     let speed_opts = Opts {
         profile: Some(crate::opts::Profile::ReleaseSpeed),
@@ -10945,6 +10947,7 @@ fn phase4_inline_overwrite_copy_one_and_sfp_len() {
         boxed_non_adt_keys: BTreeSet::new(),
         all_non_adt_boxed: false,
         all_adts_boxed: false,
+        smi_u32_fields: BTreeSet::new(),
     };
     let speed_opts = Opts {
         profile: Some(crate::opts::Profile::ReleaseSpeed),
@@ -11103,6 +11106,187 @@ fn phase4_inline_overwrite_copy_one_and_sfp_len() {
     let js3 = lower_tier_a("sfp_len_fold", &f3, &pl3, straight(&f3));
     assert!(js3.contains("return n;"), "{js3}");
     assert!(!js3.contains("slice_from_parts"), "{js3}");
+}
+
+#[test]
+fn smi_u32_struct_fields_store_and_compare_signed_i32_and_cast_back_to_u32() {
+    let mut interns = world();
+    let prev_k = interns.intern_str("prev_z");
+    let next_k = interns.intern_str("next_z");
+    let node_name = interns.intern_str("Node");
+    let node_ty = TypeId(500);
+    let node_fields = vec![
+        field(FieldKey::Name(prev_k), U32),
+        field(FieldKey::Name(next_k), U32),
+    ];
+    let mut node_desc = descriptor(
+        node_ty,
+        TypeKind::Adt {
+            def: def(500),
+            args: Vec::new(),
+            form: NominalForm::Struct,
+            variants: vec![variant(node_name, node_fields.clone(), 0, None)],
+            niche: None,
+        },
+        8,
+    );
+    node_desc.js.is_indirect = true;
+    node_desc.js.needs_clone = true;
+    node_desc.js.fields = node_fields;
+    interns.types.insert(node_desc);
+
+    let mut_ref_node = TypeId(501);
+    interns
+        .types
+        .insert(pointer(mut_ref_node, node_ty, PointerForm::Thin, false));
+
+    let mut heap = crate::analysis::heap::HeapPlan::default();
+    heap.smi_u32_fields.insert((node_ty, 0));
+    heap.smi_u32_fields.insert((node_ty, 1));
+
+    // Function: takes `(out: &mut Node, p: Node, x: u32) -> usize`, stores
+    // `Node { prev_z: u32::MAX, next_z: x }` into `*out`, checks `p.prev_z == u32::MAX`,
+    // and returns `p.next_z as usize` (must wrap back to `>>> 0`).
+    let mut b = FuncBuilder::new(
+        item(500),
+        signature(vec![mut_ref_node, node_ty, U32], USIZE),
+    );
+    let e = RBlockId(0);
+    let out = b.param(mut_ref_node, NO_ORIGIN);
+    let p = b.param(node_ty, NO_ORIGIN);
+    let x = b.param(U32, NO_ORIGIN);
+    let none = b.op(
+        e,
+        OpKind::Const(ConstTree::Scalar {
+            bits: u128::from(u32::MAX),
+            bytes: 4,
+        }),
+        U32,
+        NO_ORIGIN,
+    );
+    let node = b.op(
+        e,
+        OpKind::Aggregate {
+            ty: node_ty,
+            variant: 0,
+            active_field: None,
+            fields: vec![none, x],
+        },
+        node_ty,
+        NO_ORIGIN,
+    );
+    b.effect(e, OpKind::StoreThrough { ptr: out, v: node }, NO_ORIGIN);
+    let pz = b.op(
+        e,
+        OpKind::Field {
+            base: p,
+            variant: None,
+            field: 0,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    let is_none = b.op(
+        e,
+        OpKind::Binary {
+            op: BinaryOp::Eq,
+            l: pz,
+            r: none,
+            ty: U32,
+        },
+        BOOL,
+        NO_ORIGIN,
+    );
+    let nz = b.op(
+        e,
+        OpKind::Field {
+            base: p,
+            variant: None,
+            field: 1,
+        },
+        U32,
+        NO_ORIGIN,
+    );
+    let nz_usize = b.op(
+        e,
+        OpKind::Cast {
+            kind: CastKind::IntToInt,
+            v: nz,
+            from: U32,
+            to: USIZE,
+        },
+        USIZE,
+        NO_ORIGIN,
+    );
+    let b_then = b.block();
+    let b_else = b.block();
+    b.terminate(
+        e,
+        RTerm::Switch {
+            scrut: is_none,
+            scrut_ty: BOOL,
+            cases: vec![(1, b_then, Vec::new())],
+            default: (b_else, Vec::new()),
+        },
+    );
+    let zero = b.op(
+        b_then,
+        OpKind::Const(ConstTree::Scalar { bits: 0, bytes: 4 }),
+        USIZE,
+        NO_ORIGIN,
+    );
+    b.terminate(b_then, RTerm::Return(Some(zero)));
+    b.terminate(b_else, RTerm::Return(Some(nz_usize)));
+
+    let f = b.finish();
+    let opts = Opts {
+        optimizer: rcgjs_object::opts::OptimizerMode::On,
+        profile: Some(crate::opts::Profile::ReleaseSpeed),
+        ..Opts::default()
+    };
+    let fuse_plan = crate::lower::fuse::plan(&f, None, &interns.types, &interns, &opts);
+    let structured =
+        crate::lower::structure::structure(&f, &fuse_plan, &interns.types, false).unwrap();
+    let sum = summary(&[]);
+    let body = body_of(BodyKind::Function, f.sig.clone());
+    let js_name = JsName::new("smi_node_test".to_owned());
+    let items = super::host::ItemIndex::new();
+    let vtables = super::unsize::VtableIndex::new();
+    let input = LowerInput {
+        name: &js_name,
+        summary: &sum,
+        body: &body,
+        origins: None,
+        interns: &interns,
+        table: &interns.types,
+        opts: &opts,
+        items: &items,
+        drop_glue: super::host::EMPTY_DROP_GLUE,
+        vtables: &vtables,
+        spills: &[],
+        abi: None,
+        physical: None,
+        call_retargets: crate::lower::EMPTY_CALL_RETARGETS,
+        bigints: None,
+        byte_views: crate::analysis::byte_views::ByteViewPlan::default(),
+        heap: Some(&heap),
+        nested_clone: crate::lower::NestedClone::default(),
+    };
+    let lowered = super::function::lower(&input, &f, &fuse_plan, structured.region).unwrap();
+    let js = jsast::stmt_to_string(&lowered.decl);
+    assert!(
+        (js.contains("prev_z: -1") || js.contains("prev_z = -1"))
+            && (js.contains("next_z: $v2 | 0") || js.contains("next_z = $v2 | 0")),
+        "expected Smi i32 aggregate store (`prev_z: -1`, `next_z: $v2 | 0`): {js}"
+    );
+    assert!(
+        js.contains("=== -1") && !js.contains("4294967295"),
+        "expected Smi `=== -1` comparison without 4294967295: {js}"
+    );
+    assert!(
+        js.contains("next_z >>> 0"),
+        "expected `u32 as usize` to canonicalize signed Smi field back via `>>> 0`: {js}"
+    );
 }
 
 mod invoke;

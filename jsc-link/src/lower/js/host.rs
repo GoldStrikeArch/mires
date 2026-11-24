@@ -1178,10 +1178,13 @@ fn map_marker(cx: &JsCx<'_>, op: &Op, marker: &str, args: &[ValueId]) -> Res<Exp
         }
         let ty = cx.ty_of(*arg)?;
         map_key_class(cx, ty)?;
-        lowered.push(match value::is_slot(cx.table, ty) {
-            true => ptr::slot_element(value),
-            false => value,
-        });
+        lowered.push(
+            if value::is_slot(cx.table, ty) && cx.unboxed_map_key_cell(*arg).is_none() {
+                ptr::slot_element(value)
+            } else {
+                value
+            },
+        );
     }
     let mut iter = lowered.into_iter();
     Ok(match marker {

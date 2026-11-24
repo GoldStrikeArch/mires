@@ -79,7 +79,7 @@ const BUDGET_FLOOR: u64 = 384;
 /// Speed-first (`js-profile=release-speed`) post-representation inlining thresholds tuned for V8
 /// TurboFan (inline small hot helpers without creating giant functions that bail out of JIT).
 const SPEED_SHARED_CALLEE_FOOTPRINT: u64 = 320;
-const SPEED_TRACK_CALLER_SHARED_FOOTPRINT: u64 = 256;
+const SPEED_TRACK_CALLER_SHARED_FOOTPRINT: u64 = 384;
 const SPEED_LOOP_CALLEE_FOOTPRINT: u64 = 640;
 const SPEED_INLINE_HINT_FOOTPRINT: u64 = 448;
 const SPEED_INLINE_ALWAYS_FOOTPRINT: u64 = 640;
@@ -489,9 +489,23 @@ pub(crate) fn run_with_profile_and_retargets(
             let callee_is_leaf = callee_func.blocks.iter().all(|b| {
                 let cold_diverging = matches!(b.term, RTerm::Unreachable);
                 (cold_diverging
-                    || b.ops
-                        .iter()
-                        .all(|op| !matches!(op.kind, OpKind::Call { .. })))
+                    || b.ops.iter().all(|op| {
+                        !matches!(op.kind, OpKind::Call { .. })
+                            || matches!(
+                            op.kind,
+                            OpKind::Call {
+                                semantic: CallSemantic::Standard(
+                                    crate::jir::semantic::StandardOperation::StringAsStr
+                                        | crate::jir::semantic::StandardOperation::NativeStrAsStr
+                                        | crate::jir::semantic::StandardOperation::NativeStrNew
+                                        | crate::jir::semantic::StandardOperation::NativeStrFromStr
+                                        | crate::jir::semantic::StandardOperation::NativeStrLen
+                                        | crate::jir::semantic::StandardOperation::NativeStrPushStr
+                                ),
+                                ..
+                            }
+                        )
+                    }))
                     && !matches!(b.term, RTerm::Invoke { .. })
             });
             let speed_hot_loop = speed
@@ -501,8 +515,10 @@ pub(crate) fn run_with_profile_and_retargets(
             let speed_tiny_leaf = speed
                 && callee_is_leaf
                 && (callee_bytes <= 180
-                    || ((callee_func.sig.abi.inline_hint || callee_func.sig.abi.inline_always)
-                        && callee_bytes <= 280));
+                    || ((callee_func.sig.abi.inline_hint
+                        || callee_func.sig.abi.inline_always
+                        || site.has_track_caller)
+                        && callee_bytes <= 384));
             let speed_budget_free = speed_hot_loop || speed_tiny_leaf;
             let size_limit = if speed_budget_free {
                 limit
@@ -515,8 +531,22 @@ pub(crate) fn run_with_profile_and_retargets(
             } else {
                 limit
             };
+            // Inlining a `#[track_caller]` callee substitutes a `{filename,line,col}` literal
+            // (~70-96 B pre-hoist) before `hoist_consts` shrinks it, and inlining a sole-caller or
+            // loop-virtualizable helper (e.g. `Option::get_or_insert_with` at an `Invoke` site)
+            // may add ~20-40 B of temporary `try/catch` scaffolding before downstream cleanup.
+            // Account for that pre-cleanup slack under `ReleaseSpeed`.
+            let effective_callee_bytes = if speed
+                && (site.has_track_caller
+                    || is_sole
+                    || matches!(criterion, Criterion::LoopVirtualizable))
+            {
+                callee_bytes.saturating_add(96)
+            } else {
+                callee_bytes
+            };
             if after > size_limit
-                || after > bytes.saturating_add(callee_bytes)
+                || after > bytes.saturating_add(effective_callee_bytes)
                 || (!bounded_loop_virtualization
                     && !speed_budget_free
                     && growth + charge > budget as i64)
@@ -529,7 +559,7 @@ pub(crate) fn run_with_profile_and_retargets(
                 continue;
             }
             let record = Witness::Inline {
-                callee_bytes: callee_bytes.min(u32::MAX as u64) as u32,
+                callee_bytes: effective_callee_bytes.min(u32::MAX as u64) as u32,
                 limit: size_limit.min(u32::MAX as u64) as u32,
                 bytes_before: bytes.min(u32::MAX as u64) as u32,
                 bytes_after: after.min(u32::MAX as u64) as u32,
@@ -1156,25 +1186,131 @@ fn qualifies(
     None
 }
 
-/// Whether `callee` can be safely spliced at an `RTerm::Invoke` call site: no nested `Invoke`,
-/// `Throw`, `Assert`, or `Zombie`, and any `Call`/`Drop`/`Host`/`Intrinsic` sits only inside a
-/// cold diverging block (`RTerm::Unreachable`) so hot paths gain zero `try/catch` blocks while
-/// unwind Drop cleanup remains identical.
-fn callee_invoke_safe(callee: &Func) -> bool {
-    callee.blocks.iter().all(|b| {
-        if matches!(b.term, RTerm::Invoke { .. } | RTerm::Throw(_)) {
+fn is_noop_rethrow_block(callee: &Func, mut blk_id: RBlockId) -> bool {
+    for _ in 0..4 {
+        let Some(ub) = callee.blocks.get(blk_id.0 as usize) else {
+            return false;
+        };
+        let ops_noop = ub.ops.iter().all(|op| {
+            matches!(
+                op.kind,
+                OpKind::Drop {
+                    glue: crate::jir::semantic::DropGlue::None,
+                    ..
+                } | OpKind::BorrowView { .. }
+                    | OpKind::RawView { .. }
+                    | OpKind::Copy(_)
+                    | OpKind::Move(_)
+                    | OpKind::CellLoad(_)
+                    | OpKind::Const(_)
+                    | OpKind::Field { .. }
+                    | OpKind::Cast { .. }
+            )
+        });
+        if !ops_noop {
             return false;
         }
-        let cold_diverging = matches!(b.term, RTerm::Unreachable);
-        b.ops.iter().all(|op| match op.kind {
-            OpKind::Assert { .. } | OpKind::Zombie(_) => false,
-            OpKind::Call { .. }
-            | OpKind::Drop { .. }
-            | OpKind::Host { .. }
-            | OpKind::Intrinsic { .. } => cold_diverging,
-            _ => true,
-        })
+        match &ub.term {
+            RTerm::Throw(None) => return true,
+            RTerm::Goto(next, _) if *next != blk_id => blk_id = *next,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// True when every `Invoke`/`Throw` inside `callee` unwinds only through a no-op cleanup pad
+/// (`DropGlue::None` + `Throw(None)`), so splicing can safely redirect unwind edges to the caller
+/// (at an `Invoke` site) or strip them to `Goto(normal)` (at a non-`Invoke` site).
+fn callee_has_only_noop_invokes(callee: &Func) -> bool {
+    callee.blocks.iter().all(|b| match &b.term {
+        RTerm::Throw(Some(_)) => false,
+        RTerm::Throw(None) => b.id != RBlockId(0) && is_noop_rethrow_block(callee, b.id),
+        RTerm::Invoke {
+            unwind: (ub, _), ..
+        } => is_noop_rethrow_block(callee, *ub),
+        _ => true,
     })
+}
+
+/// Whether `callee` can be safely spliced at an `RTerm::Invoke` call site: no `Assert`, `Zombie`,
+/// value-throwing `Throw(Some(_))`, or non-trivial `Drop`/`Host` outside cold diverging blocks;
+/// at most one non-cold `Call` (so splicing 1 `Invoke` yields at most 1 non-cold `Invoke`, e.g.
+/// `Option::get_or_insert_with` / `Option::map` / `Option::and_then`), and any inner `Invoke`
+/// unwinds only through a no-op cleanup pad (`DropGlue::None` + `Throw(None)`) that can redirect
+/// straight to the caller's unwind edge.
+fn callee_invoke_safe(callee: &Func, interns: &Interns) -> bool {
+    if !callee_has_only_noop_invokes(callee) {
+        return false;
+    }
+    let mut non_cold_calls = 0usize;
+    for b in &callee.blocks {
+        let cold_diverging = matches!(b.term, RTerm::Unreachable);
+        for op in &b.ops {
+            let ok = match &op.kind {
+                OpKind::Assert { .. } | OpKind::Zombie(_) => false,
+                OpKind::Drop {
+                    glue: crate::jir::semantic::DropGlue::None,
+                    ..
+                } => true,
+                OpKind::Drop { .. } | OpKind::Host { .. } => cold_diverging,
+                OpKind::Call { .. } => {
+                    if cold_diverging {
+                        true
+                    } else {
+                        non_cold_calls += 1;
+                        non_cold_calls <= 1
+                    }
+                }
+                OpKind::Intrinsic { name, .. } => {
+                    cold_diverging
+                        || matches!(
+                            interns.str(*name).unwrap_or(""),
+                            "compare_bytes"
+                                | "raw_eq"
+                                | "ptr_metadata"
+                                | "offset"
+                                | "arith_offset"
+                                | "slice_get_unchecked"
+                                | "read_via_copy"
+                                | "transmute"
+                                | "transmute_unchecked"
+                                | "cttz"
+                                | "cttz_nonzero"
+                                | "ctlz"
+                                | "ctlz_nonzero"
+                                | "ctpop"
+                                | "bswap"
+                                | "bitreverse"
+                                | "rotate_left"
+                                | "rotate_right"
+                                | "likely"
+                                | "unlikely"
+                                | "select_unpredictable"
+                                | "wrapping_add"
+                                | "wrapping_sub"
+                                | "wrapping_mul"
+                                | "saturating_add"
+                                | "saturating_sub"
+                                | "add_with_overflow"
+                                | "sub_with_overflow"
+                                | "mul_with_overflow"
+                                | "unchecked_add"
+                                | "unchecked_sub"
+                                | "unchecked_mul"
+                                | "black_box"
+                                | "size_of_val"
+                                | "align_of_val"
+                        )
+                }
+                _ => true,
+            };
+            if !ok {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// The candidate call sites of one caller, in block-and-op order.
@@ -1228,6 +1364,7 @@ fn collect_sites(
             }
             let semantic_ok = match semantic {
                 CallSemantic::Ordinary => true,
+                CallSemantic::RawParts if allow_std_post_repr && speed => true,
                 // A `str` identity (`js-str=bytes` only) stays a call: `lower/js/call.rs` spells
                 // it as the string operation it is, which inlining its body would take away.
                 CallSemantic::Standard(std_op)
@@ -1293,7 +1430,7 @@ fn collect_sites(
                 stats.decline("inline.body-unavailable");
                 continue;
             };
-            if is_invoke && !callee_invoke_safe(callee_func) {
+            if is_invoke && !callee_invoke_safe(callee_func, &callee_metadata.interns) {
                 stats.decline("inline.exceptional-control-flow");
                 continue;
             }
@@ -1599,7 +1736,7 @@ fn body_decline(
     allow_host_boundary: bool,
     speed: bool,
 ) -> Option<&'static str> {
-    if callee.has_invoke() {
+    if callee.has_invoke() && !(speed && callee_has_only_noop_invokes(callee)) {
         return Some("inline.exceptional-control-flow");
     }
     let expected_params = if callee.sig.abi.caller_location {
@@ -1624,7 +1761,7 @@ fn body_decline(
     } else {
         args
     };
-    if callee.sig.abi.spread.is_some()
+    if (!speed && callee.sig.abi.spread.is_some())
         || callee.params.len() != expected_params
         || callee
             .blocks
@@ -1755,6 +1892,7 @@ fn independent_host(payload: &HostPayload, interns: &Interns, speed: bool) -> bo
                     && matches!(
                         marker,
                         "read"
+                            | "add"
                             | "iserror"
                             | "throw"
                             | "badread"
@@ -1927,11 +2065,31 @@ fn splice(func: &mut Func, block: usize, at: usize, callee: &Func) {
                 idx += 1;
                 continue;
             }
+            match &mut func.blocks[idx].term {
+                RTerm::Invoke {
+                    unwind: inner_unwind,
+                    ..
+                } => {
+                    *inner_unwind = unwind.clone();
+                    idx += 1;
+                    continue;
+                }
+                RTerm::Throw(None) => {
+                    func.blocks[idx].term = RTerm::Goto(unwind.0, unwind.1.clone());
+                    idx += 1;
+                    continue;
+                }
+                _ => {}
+            }
             let throwing_pos = func.blocks[idx].ops.iter().position(|op| {
                 matches!(
                     op.kind,
                     OpKind::Call { .. }
-                        | OpKind::Drop { .. }
+                        | OpKind::Drop {
+                            glue: crate::jir::semantic::DropGlue::Direct { .. }
+                                | crate::jir::semantic::DropGlue::Dynamic,
+                            ..
+                        }
                         | OpKind::Host { .. }
                         | OpKind::Intrinsic { .. }
                 )
@@ -1954,6 +2112,18 @@ fn splice(func: &mut Func, block: usize, at: usize, callee: &Func) {
                 });
             }
             idx += 1;
+        }
+    } else {
+        // Non-Invoke call site: any no-op `Invoke` admitted under speed mode unwinds straight out
+        // of the caller, so replace it with `Goto(normal)`.
+        for idx in (block_offset as usize)..func.blocks.len() {
+            if idx == continuation.0 as usize {
+                continue;
+            }
+            if let RTerm::Invoke { normal, .. } = &func.blocks[idx].term {
+                let normal = normal.clone();
+                func.blocks[idx].term = RTerm::Goto(normal.0, normal.1);
+            }
         }
     }
 }

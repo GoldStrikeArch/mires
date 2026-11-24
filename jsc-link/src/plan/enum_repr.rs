@@ -31,12 +31,12 @@ use std::sync::Arc;
 
 use rcgjs_object::jir::interns::Interns;
 use rcgjs_object::jir::semantic::{
-    CallSemantic, Callee, ConstTree, DropGlue, GlobalReference, HostPayload, ItemId, Operand,
-    OperandKind, Rvalue, StatementKind, Terminator, TypeId,
+    CallSemantic, Callee, CastKind, ConstTree, DropGlue, GlobalReference, HostPayload, ItemId,
+    Operand, OperandKind, Place, Projection, Rvalue, StatementKind, Terminator, TypeId,
 };
 use rcgjs_object::jir::types::{
-    EnumRepr, NominalAbi, NominalForm, PinnedBoundary, PointerForm, TypeDescriptor, TypeKind,
-    TypeTable,
+    EnumRepr, FieldKey, NominalAbi, NominalForm, PinnedBoundary, PointerForm,
+    RepresentationCandidate, TypeDescriptor, TypeKind, TypeTable,
 };
 use rcgjs_object::object::ItemKind;
 
@@ -44,18 +44,120 @@ use crate::item::{JsName, LinkItem};
 use crate::lower::js::value;
 use crate::opts::{OptimizerMode, Opts, Profile};
 
-/// Outcome of link-time enum representation specialization.
+/// Whether `callee` is a pure representation-opaque sysroot runtime helper (memory/pointer/alloc/
+/// NativeVec primitive) that never inspects `.TAG` or struct field names and never exposes values
+/// across the JS host boundary.
+pub(crate) fn is_representation_opaque_runtime(callee: &Callee, interns: &Interns) -> bool {
+    let Callee::Runtime {
+        member,
+        sysroot: true,
+    } = callee
+    else {
+        return false;
+    };
+    matches!(
+        interns.str(*member).unwrap_or(""),
+        "alloc"
+            | "dealloc"
+            | "realloc"
+            | "alloc_zeroed"
+            | "copy"
+            | "copy_nonoverlapping"
+            | "overwrite"
+            | "_put"
+            | "box"
+            | "prefix"
+            | "unproject"
+            | "erase"
+            | "unref"
+            | "offset"
+            | "offset_from"
+            | "ptr_eq"
+            | "slice_ptr_eq"
+            | "fat_ptr_eq"
+            | "ptr_cmp"
+            | "slice_ptr_cmp"
+            | "fat_ptr_cmp"
+            | "addr"
+            | "slice_from_parts"
+            | "sfp"
+            | "thin"
+            | "tail_raw"
+            | "tail_ref"
+            | "tail_slice"
+            | "tail_slice_raw"
+            | "read_array"
+            | "array_ref"
+            | "write_array"
+            | "unwindow"
+            | "unwindow_slice"
+            | "nv_push_arr"
+            | "nv_push_ta"
+            | "nv_pop_arr"
+            | "nv_pop_ta"
+            | "nv_with_cap_arr"
+            | "nv_with_cap_ta"
+            | "nv_zeroed_arr"
+            | "nv_zeroed_ta"
+            | "nv_zeroed_arr_fn"
+            | "nv_zeroed_arr_fn_tracked"
+            | "nv_reserve_arr"
+            | "nv_reserve_ta"
+            | "nv_try_reserve_arr"
+            | "nv_try_reserve_ta"
+            | "nv_shrink_arr"
+            | "nv_shrink_ta"
+            | "nv_grow_one_arr"
+            | "nv_grow_one_ta"
+            | "nv_from_raw_arr"
+            | "nv_from_raw_ta"
+            | "nv_box_track_arr"
+            | "nv_box_track_slot"
+            | "nv_cap"
+            | "nv_push"
+            | "nv_insert"
+            | "nv_reserve"
+            | "nv_shrink"
+            | "nv_from_elem"
+            | "nv_resize"
+            | "nv_extend"
+            | "nv_extend_slice"
+            | "nv_clone"
+            | "nv_from_slice"
+            | "nv_from_box"
+            | "nv_remove"
+            | "nv_swap_remove"
+            | "nv_idx"
+            | "nv_range"
+            | "convert_sv_nv"
+            | "slice_sort"
+            | "typed_alloc"
+            | "typed_realloc"
+            | "typed_dealloc"
+            | "typed_dealloc_raw"
+            | "box_new"
+            | "typed_vec_push"
+    )
+}
+
+/// Outcome of link-time enum representation specialization and signed-`Int32` Smi `u32` struct
+/// field analysis.
 #[derive(Clone, Debug, Default)]
 pub struct EnumReprPlan {
     pub decisions: BTreeMap<TypeId, EnumRepr>,
     pub null_niche_count: usize,
     pub int_tag_fieldless_count: usize,
     pub int_tag_payload_count: usize,
+    /// `(peeled_struct_ty, field_idx)` pairs for internal multi-field structs whose plain `u32`
+    /// fields never escape by reference/raw-pointer/transmute/static/JS-boundary and can therefore
+    /// be stored as signed `Int32` (`-2^31..=2^31-1`) so V8 keeps them as Smi instead of
+    /// boxing `u32::MAX` (`4294967295`) into a `HeapNumber` `Double` field.
+    pub smi_u32_fields: BTreeSet<(TypeId, u32)>,
 }
 
 impl EnumReprPlan {
     pub fn is_empty(&self) -> bool {
-        self.decisions.is_empty()
+        self.decisions.is_empty() && self.smi_u32_fields.is_empty()
     }
 }
 
@@ -113,8 +215,12 @@ pub fn specialize_table(
 
     let mut excluded_enums: BTreeSet<TypeId> = extra_excluded.clone();
     let mut host_boundary_types: BTreeSet<TypeId> = BTreeSet::new();
+    let mut smi_bad_structs: BTreeSet<TypeId> = BTreeSet::new();
+    let mut smi_bad_fields: BTreeSet<(TypeId, u32)> = BTreeSet::new();
+    let mut smi_high_bit_structs: BTreeSet<TypeId> = BTreeSet::new();
     let mut visited_excl = BTreeSet::new();
     let mut visited_host = BTreeSet::new();
+    let mut visited_smi_bad = BTreeSet::new();
 
     // Seed any `extra_excluded` types transitively so nested enum fields stay aligned with v1.
     for &ty in extra_excluded {
@@ -170,6 +276,16 @@ pub fn specialize_table(
             continue;
         };
 
+        if item.kind == ItemKind::Static {
+            walk_type_id(
+                body.signature.result,
+                interns,
+                &global_types,
+                &mut smi_bad_structs,
+                &mut visited_smi_bad,
+            );
+        }
+
         // 2. Exported / imported / DTS-bearing items cross the JS boundary.
         let is_js_boundary_item =
             item.linkage.exported || item.kind == ItemKind::Import || item.dts.is_some();
@@ -216,10 +332,86 @@ pub fn specialize_table(
         for block in &body.blocks {
             for stmt in &block.statements {
                 match &stmt.kind {
-                    StatementKind::Assign { value: rv, .. } => match rv {
-                        Rvalue::Use(op)
-                        | Rvalue::Repeat { value: op, .. }
-                        | Rvalue::Cast { value: op, .. }
+                    StatementKind::Assign {
+                        destination: place,
+                        value: rv,
+                    } => match rv {
+                        Rvalue::Cast {
+                            kind,
+                            value: op,
+                            result,
+                        } => {
+                            scan_operand_consts(
+                                op,
+                                local,
+                                interns,
+                                table,
+                                &offered_set,
+                                &global_types,
+                                &mut excluded_enums,
+                                &mut visited_excl,
+                            );
+                            let bad_cast = match kind {
+                                CastKind::Transmute => {
+                                    peel_global(op.ty, &global_types)
+                                        != peel_global(*result, &global_types)
+                                        && !is_harmless_ptr_to_ptr(
+                                            op.ty,
+                                            *result,
+                                            local,
+                                            &global_types,
+                                        )
+                                        && !is_ptr_addr_transmute(
+                                            op.ty,
+                                            *result,
+                                            local,
+                                            &global_types,
+                                        )
+                                }
+                                CastKind::PtrToPtr => {
+                                    !is_harmless_ptr_to_ptr(op.ty, *result, local, &global_types)
+                                }
+                                _ => false,
+                            };
+                            if bad_cast {
+                                walk_type_id(
+                                    op.ty,
+                                    interns,
+                                    &global_types,
+                                    &mut smi_bad_structs,
+                                    &mut visited_smi_bad,
+                                );
+                                walk_type_id(
+                                    *result,
+                                    interns,
+                                    &global_types,
+                                    &mut smi_bad_structs,
+                                    &mut visited_smi_bad,
+                                );
+                            }
+                        }
+                        Rvalue::Use(op) => {
+                            scan_operand_consts(
+                                op,
+                                local,
+                                interns,
+                                table,
+                                &offered_set,
+                                &global_types,
+                                &mut excluded_enums,
+                                &mut visited_excl,
+                            );
+                            if is_high_bit_u32_const(op, local, &global_types) {
+                                record_place_field_structs(
+                                    place,
+                                    &body.locals,
+                                    local,
+                                    &global_types,
+                                    &mut smi_high_bit_structs,
+                                );
+                            }
+                        }
+                        Rvalue::Repeat { value: op, .. }
                         | Rvalue::Unary { value: op, .. }
                         | Rvalue::WrapUnsafeBinder(op) => scan_operand_consts(
                             op,
@@ -253,7 +445,9 @@ pub fn specialize_table(
                                 &mut visited_excl,
                             );
                         }
-                        Rvalue::Aggregate { operands, .. } => {
+                        Rvalue::Aggregate {
+                            result, operands, ..
+                        } => {
                             for op in operands {
                                 scan_operand_consts(
                                     op,
@@ -265,13 +459,24 @@ pub fn specialize_table(
                                     &mut excluded_enums,
                                     &mut visited_excl,
                                 );
+                                if is_high_bit_u32_const(op, local, &global_types) {
+                                    smi_high_bit_structs
+                                        .insert(peel_global(*result, &global_types));
+                                }
                             }
                         }
-                        Rvalue::Reference { .. }
-                        | Rvalue::RawPointer { .. }
-                        | Rvalue::Discriminant(_)
-                        | Rvalue::CopyForDeref(_)
-                        | Rvalue::Reborrow { .. } => {}
+                        Rvalue::Reference { place, .. }
+                        | Rvalue::RawPointer { place, .. }
+                        | Rvalue::Reborrow { place, .. } => {
+                            record_borrowed_struct_fields(
+                                place,
+                                &body.locals,
+                                local,
+                                &global_types,
+                                &mut smi_bad_fields,
+                            );
+                        }
+                        Rvalue::Discriminant(_) | Rvalue::CopyForDeref(_) => {}
                     },
                     StatementKind::Assume(op) => scan_operand_consts(
                         op,
@@ -419,6 +624,47 @@ pub fn specialize_table(
                         continue;
                     }
 
+                    let is_smi_raw_call = matches!(
+                        &call.callee,
+                        Callee::Intrinsic { name, .. }
+                            if matches!(
+                                interns.str(*name).unwrap_or(""),
+                                "transmute" | "transmute_unchecked"
+                            )
+                    ) && !(call.arguments.len() == 1
+                        && (peel_global(call.arguments[0].ty, &global_types)
+                            == peel_global(call.destination.ty, &global_types)
+                            || is_harmless_ptr_to_ptr(
+                                call.arguments[0].ty,
+                                call.destination.ty,
+                                local,
+                                &global_types,
+                            )
+                            || is_ptr_addr_transmute(
+                                call.arguments[0].ty,
+                                call.destination.ty,
+                                local,
+                                &global_types,
+                            )));
+                    if is_smi_raw_call {
+                        for arg in &call.arguments {
+                            walk_type_id(
+                                arg.ty,
+                                interns,
+                                &global_types,
+                                &mut smi_bad_structs,
+                                &mut visited_smi_bad,
+                            );
+                        }
+                        walk_type_id(
+                            call.destination.ty,
+                            interns,
+                            &global_types,
+                            &mut smi_bad_structs,
+                            &mut visited_smi_bad,
+                        );
+                    }
+
                     let is_host_boundary = call.host.is_some()
                         || matches!(
                             call.semantic,
@@ -426,7 +672,8 @@ pub fn specialize_table(
                                 | CallSemantic::ViewAbi
                                 | CallSemantic::RawJavaScript
                         )
-                        || matches!(call.callee, Callee::Foreign { .. } | Callee::Runtime { .. });
+                        || (matches!(call.callee, Callee::Foreign { .. } | Callee::Runtime { .. })
+                            && !is_representation_opaque_runtime(&call.callee, interns));
 
                     let is_non_offered_direct = match &call.callee {
                         Callee::Direct {
@@ -694,6 +941,55 @@ pub fn specialize_table(
         }
     }
 
+    // Pass D: Identify internal multi-field struct `u32` fields eligible for signed-`Int32` Smi
+    // storage: only structs that actually store a high-bit `u32` constant (`>= 0x8000_0000`, e.g.
+    // `u32::MAX` sentinel indices in `earcut::Node`), so ordinary small-index structs never pay
+    // extra `>>> 0` on ordered comparisons.
+    for (&id, desc) in &global_types {
+        if desc.js.peeled != id
+            || !smi_high_bit_structs.contains(&id)
+            || excluded_enums.contains(&id)
+            || smi_bad_structs.contains(&id)
+            || desc.meta.abi == NominalAbi::C
+            || desc.meta.boundary != PinnedBoundary::None
+            || desc.meta.candidate != RepresentationCandidate::None
+            || desc.js.transparent.is_some()
+            || desc.js.crosses_transparent_union
+            || desc.js.unsized_tail.is_some()
+        {
+            continue;
+        }
+        let TypeKind::Adt {
+            form: NominalForm::Struct,
+            variants,
+            ..
+        } = &desc.kind
+        else {
+            continue;
+        };
+        if variants.len() != 1 || variants[0].fields.len() < 2 {
+            continue;
+        }
+        for (fi, field) in variants[0].fields.iter().enumerate() {
+            if matches!(field.key, FieldKey::Transparent) {
+                continue;
+            }
+            let Some(fdesc) = global_types.get(&field.ty) else {
+                continue;
+            };
+            if matches!(
+                fdesc.kind,
+                TypeKind::Integer {
+                    signed: false,
+                    bits: 32
+                }
+            ) && !smi_bad_fields.contains(&(id, fi as u32))
+            {
+                plan.smi_u32_fields.insert((id, fi as u32));
+            }
+        }
+    }
+
     if plan.decisions.is_empty() {
         return plan;
     }
@@ -723,6 +1019,218 @@ pub fn specialize_table(
     }
 
     plan
+}
+
+fn is_ptr_addr_transmute(
+    from_ty: TypeId,
+    to_ty: TypeId,
+    local_table: &TypeTable,
+    global: &BTreeMap<TypeId, TypeDescriptor>,
+) -> bool {
+    let is_ptr = |ty: TypeId| -> bool {
+        matches!(
+            lookup_desc(peel_global(ty, global), local_table, global).map(|d| &d.kind),
+            Some(TypeKind::Reference { .. } | TypeKind::RawPointer { .. })
+        )
+    };
+    let is_addr_scalar = |ty: TypeId| -> bool {
+        let Some(d) = lookup_desc(peel_global(ty, global), local_table, global) else {
+            return false;
+        };
+        matches!(d.kind, TypeKind::Integer { .. })
+            || matches!(d.js.enum_repr, Some(EnumRepr::Number { .. }))
+    };
+    (is_ptr(from_ty) && is_addr_scalar(to_ty)) || (is_addr_scalar(from_ty) && is_ptr(to_ty))
+}
+
+fn is_harmless_ptr_to_ptr(
+    from_ty: TypeId,
+    to_ty: TypeId,
+    local_table: &TypeTable,
+    global: &BTreeMap<TypeId, TypeDescriptor>,
+) -> bool {
+    let pointee = |ty: TypeId| -> Option<TypeId> {
+        let peeled = peel_global(ty, global);
+        match lookup_desc(peeled, local_table, global).map(|d| &d.kind)? {
+            TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
+                Some(peel_global(*pointee, global))
+            }
+            _ => None,
+        }
+    };
+    let (Some(a), Some(b)) = (pointee(from_ty), pointee(to_ty)) else {
+        return false;
+    };
+    if a == b {
+        return true;
+    }
+    let is_erased_elem = |ty: TypeId| -> bool {
+        match lookup_desc(ty, local_table, global) {
+            Some(d) if d.layout.zst => true,
+            Some(d) => matches!(d.kind, TypeKind::Integer { bits: 8, .. }),
+            None => false,
+        }
+    };
+    let elem_of = |ty: TypeId| -> Option<TypeId> {
+        match lookup_desc(ty, local_table, global).map(|d| &d.kind)? {
+            TypeKind::Slice(e) | TypeKind::Array { element: e, .. } => {
+                Some(peel_global(*e, global))
+            }
+            _ => None,
+        }
+    };
+    let is_erased =
+        |ty: TypeId| -> bool { is_erased_elem(ty) || elem_of(ty).is_some_and(is_erased_elem) };
+    if is_erased(a) || is_erased(b) {
+        return true;
+    }
+    let ea = elem_of(a);
+    let eb = elem_of(b);
+    ea == Some(b) || eb == Some(a) || (ea.is_some() && ea == eb)
+}
+
+fn is_high_bit_u32_const(
+    op: &Operand,
+    local_table: &TypeTable,
+    global: &BTreeMap<TypeId, TypeDescriptor>,
+) -> bool {
+    let OperandKind::Constant(rcgjs_object::jir::semantic::Constant::Scalar { bits, .. }) =
+        &op.kind
+    else {
+        return false;
+    };
+    if *bits < 0x8000_0000 || *bits > u128::from(u32::MAX) {
+        return false;
+    }
+    let peeled = peel_global(op.ty, global);
+    matches!(
+        lookup_desc(peeled, local_table, global).map(|d| &d.kind),
+        Some(TypeKind::Integer {
+            signed: false,
+            bits: 32
+        })
+    )
+}
+
+fn record_place_field_structs(
+    place: &Place,
+    locals: &[rcgjs_object::jir::semantic::Local],
+    local_table: &TypeTable,
+    global: &BTreeMap<TypeId, TypeDescriptor>,
+    out: &mut BTreeSet<TypeId>,
+) {
+    let Some(mut cur_ty) = locals.get(place.local.0 as usize).map(|l| l.ty) else {
+        return;
+    };
+    let mut downcast = false;
+    for proj in &place.projection {
+        match proj {
+            Projection::Deref => {
+                downcast = false;
+                let peeled = peel_global(cur_ty, global);
+                let Some(desc) = lookup_desc(peeled, local_table, global) else {
+                    return;
+                };
+                match desc.kind {
+                    TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
+                        cur_ty = pointee;
+                    }
+                    _ => return,
+                }
+            }
+            Projection::Field { ty, .. } => {
+                if !downcast {
+                    out.insert(peel_global(cur_ty, global));
+                }
+                downcast = false;
+                cur_ty = *ty;
+            }
+            Projection::Index(_) | Projection::ConstantIndex { .. } => {
+                downcast = false;
+                let peeled = peel_global(cur_ty, global);
+                let Some(desc) = lookup_desc(peeled, local_table, global) else {
+                    return;
+                };
+                match desc.kind {
+                    TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
+                        cur_ty = element;
+                    }
+                    _ => return,
+                }
+            }
+            Projection::Subslice { .. } => {
+                downcast = false;
+            }
+            Projection::Downcast { .. } => {
+                downcast = true;
+            }
+            Projection::OpaqueCast(ty) | Projection::UnwrapUnsafeBinder(ty) => {
+                downcast = false;
+                cur_ty = *ty;
+            }
+        }
+    }
+}
+
+fn record_borrowed_struct_fields(
+    place: &Place,
+    locals: &[rcgjs_object::jir::semantic::Local],
+    local_table: &TypeTable,
+    global: &BTreeMap<TypeId, TypeDescriptor>,
+    bad_fields: &mut BTreeSet<(TypeId, u32)>,
+) {
+    let Some(mut cur_ty) = locals.get(place.local.0 as usize).map(|l| l.ty) else {
+        return;
+    };
+    let mut downcast = false;
+    for proj in &place.projection {
+        match proj {
+            Projection::Deref => {
+                downcast = false;
+                let peeled = peel_global(cur_ty, global);
+                let Some(desc) = lookup_desc(peeled, local_table, global) else {
+                    return;
+                };
+                match desc.kind {
+                    TypeKind::Reference { pointee, .. } | TypeKind::RawPointer { pointee, .. } => {
+                        cur_ty = pointee;
+                    }
+                    _ => return,
+                }
+            }
+            Projection::Field { field, ty } => {
+                let peeled = peel_global(cur_ty, global);
+                if !downcast {
+                    bad_fields.insert((peeled, *field));
+                }
+                downcast = false;
+                cur_ty = *ty;
+            }
+            Projection::Index(_) | Projection::ConstantIndex { .. } => {
+                downcast = false;
+                let peeled = peel_global(cur_ty, global);
+                let Some(desc) = lookup_desc(peeled, local_table, global) else {
+                    return;
+                };
+                match desc.kind {
+                    TypeKind::Array { element, .. } | TypeKind::Slice(element) => {
+                        cur_ty = element;
+                    }
+                    _ => return,
+                }
+            }
+            Projection::Subslice { .. } => {
+                downcast = false;
+            }
+            Projection::Downcast { .. } => {
+                downcast = true;
+            }
+            Projection::OpaqueCast(ty) | Projection::UnwrapUnsafeBinder(ty) => {
+                downcast = false;
+                cur_ty = *ty;
+            }
+        }
+    }
 }
 
 fn build_global_type_map(table: &BTreeMap<JsName, LinkItem>) -> BTreeMap<TypeId, TypeDescriptor> {

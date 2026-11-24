@@ -1273,6 +1273,11 @@ impl Analysis {
             let ptr_ty = func.values[pointer.0 as usize].ty;
             match self.def_kind(func, pointer) {
                 Some(OpKind::SliceView { len, .. }) => return Ok(self.canon(*len)),
+                Some(OpKind::Aggregate { ty, fields, .. })
+                    if fields.len() == 2 && is_slice_pointer(table, *ty) =>
+                {
+                    return Ok(self.canon(fields[1]));
+                }
                 Some(OpKind::Call {
                     callee:
                         Callee::Runtime {

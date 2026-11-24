@@ -64,6 +64,27 @@ use crate::lower::js::emit::spill_name;
 use crate::opt::candidates;
 use crate::opts::Opts;
 
+/// Read-only `js-str=bytes` specialization mode for an immutable `&[u8]` parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum ByteStrParam {
+    /// Whole `&str`-backed `&[u8]` passed as 1 JS parameter `p` (a Latin-1 byte string with
+    /// `off === 0` and `len === p.length`).
+    Full,
+    /// Subslice of a `&str`-backed `&[u8]` passed as 3 flat JS parameters `(p$buf, p$off, p$len)`
+    /// where `p$buf` is a Latin-1 byte string.
+    Sub,
+}
+
+impl ByteStrParam {
+    /// Lattice join: `Full ⊔ Full = Full`, any `Sub` yields `Sub`.
+    pub(crate) fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Full, Self::Full) => Self::Full,
+            _ => Self::Sub,
+        }
+    }
+}
+
 /// One parameter the plan flattens.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FlatParam {
@@ -87,6 +108,9 @@ pub struct FlatParam {
     /// Whether these are the physical `buf`, `off`, and `len` lanes of a slice rather than
     /// declaration-order aggregate fields.
     pub slice: bool,
+    /// Read-only `js-str=bytes` specialization for an immutable `&[u8]` parameter (mutually
+    /// exclusive with canonical `slice: true`).
+    pub byte_str: Option<ByteStrParam>,
     /// Whether this 64-bit integer (`i64`/`u64`) travels as two signed-`Int32` `(lo, hi)` lanes.
     pub i64_pair: bool,
     /// A two-variant enum carried as its physical tag followed by the payload properties named
@@ -101,10 +125,32 @@ pub struct FlatParam {
 }
 
 impl FlatParam {
+    /// Builds a physical read-only byte-string `&[u8]` parameter.
+    pub(crate) fn byte_str_param(ty: TypeId, usize_ty: TypeId, mode: ByteStrParam) -> Self {
+        let (field_tys, passed) = match mode {
+            ByteStrParam::Full => (vec![ty], vec![0]),
+            ByteStrParam::Sub => (vec![ty, usize_ty, usize_ty], vec![0, 1, 2]),
+        };
+        Self {
+            ty,
+            field_tys,
+            passed,
+            by_ref: false,
+            mutable: false,
+            written: false,
+            slice: false,
+            byte_str: Some(mode),
+            i64_pair: false,
+            tagged: None,
+            recursive: None,
+        }
+    }
+
     /// Whether this parameter is a flattened 1-lane scalar reference (`&T` / `&mut T`).
     pub(crate) fn is_scalar_ref(&self) -> bool {
         self.by_ref
             && !self.slice
+            && self.byte_str.is_none()
             && !self.i64_pair
             && self.tagged.is_none()
             && self.recursive.is_none()
@@ -118,6 +164,7 @@ impl FlatParam {
         self.by_ref
             && self.mutable
             && !self.slice
+            && self.byte_str.is_none()
             && !self.i64_pair
             && self.tagged.is_none()
             && self.recursive.is_none()
@@ -126,6 +173,12 @@ impl FlatParam {
 
     /// How many JavaScript parameters the flat parameter takes.
     pub fn fields(&self) -> u32 {
+        if let Some(bs) = self.byte_str {
+            return match bs {
+                ByteStrParam::Full => 1,
+                ByteStrParam::Sub => 3,
+            };
+        }
         if self.i64_pair {
             return 2;
         }
@@ -378,7 +431,35 @@ impl FlatSig {
                     cursor += 1;
                 }
                 Some(param)
-                    if param.i64_pair || param.tagged.is_some() || param.recursive.is_some() =>
+                    if param.byte_str.is_some()
+                        || param.i64_pair
+                        || param.tagged.is_some()
+                        || param.recursive.is_some() =>
+                {
+                    cursor += 1
+                }
+                Some(param) => cursor += param.fields() as usize,
+                None => cursor += 1,
+            }
+        }
+        positions
+    }
+
+    /// Positions of read-only byte-string `&[u8]` parameters in JIR parameter numbering.
+    pub(crate) fn byte_str_jir_positions(&self) -> Vec<(usize, ByteStrParam)> {
+        let mut positions = Vec::new();
+        let mut cursor = 0;
+        for param in &self.params {
+            match param {
+                Some(param) if param.byte_str.is_some() => {
+                    positions.push((cursor, param.byte_str.expect("checked byte_str parameter")));
+                    cursor += 1;
+                }
+                Some(param)
+                    if param.slice
+                        || param.i64_pair
+                        || param.tagged.is_some()
+                        || param.recursive.is_some() =>
                 {
                     cursor += 1
                 }
@@ -403,7 +484,12 @@ impl FlatSig {
                     ));
                     cursor += 1;
                 }
-                Some(param) if param.slice || param.i64_pair || param.recursive.is_some() => {
+                Some(param)
+                    if param.slice
+                        || param.byte_str.is_some()
+                        || param.i64_pair
+                        || param.recursive.is_some() =>
+                {
                     cursor += 1
                 }
                 Some(param) => cursor += param.fields() as usize,
@@ -429,7 +515,12 @@ impl FlatSig {
                     ));
                     cursor += 1;
                 }
-                Some(param) if param.slice || param.i64_pair || param.tagged.is_some() => {
+                Some(param)
+                    if param.slice
+                        || param.byte_str.is_some()
+                        || param.i64_pair
+                        || param.tagged.is_some() =>
+                {
                     cursor += 1
                 }
                 Some(param) => cursor += param.fields() as usize,
@@ -450,7 +541,10 @@ impl FlatSig {
                     cursor += 1;
                 }
                 Some(param)
-                    if param.slice || param.tagged.is_some() || param.recursive.is_some() =>
+                    if param.slice
+                        || param.byte_str.is_some()
+                        || param.tagged.is_some()
+                        || param.recursive.is_some() =>
                 {
                     cursor += 1
                 }
@@ -504,12 +598,19 @@ pub struct AbiPlan {
     /// (see [`allocate_spill_names`]), so it is `$rN` only when nothing else is called that.
     spill_names: Vec<JsName>,
     /// Private flat bodies that retain a canonical exported or indirect entry point.
-    clones: BTreeMap<JsName, JsName>,
+    pub(crate) clones: BTreeMap<JsName, JsName>,
+    /// Synthetic `ItemId` assigned to mixed-caller private clones (e.g. `ByteStrParam` `$bs`
+    /// clones) so the canonical body keeps its original `ItemId` while specific call sites target
+    /// the specialized clone.
+    pub(crate) synthetic_items: BTreeMap<JsName, ItemId>,
+    /// Per-call-site `(caller, block, op_idx) -> target_item` retargets applied at the start of
+    /// [`AbiPlan::rewrite`] before `rewrite_callee_with` prepends entry ops.
+    pub(crate) site_retargets: BTreeMap<(JsName, RBlockId, usize), ItemId>,
     /// Direct callers retargeted from a canonical body to its private flat clone.
-    call_retargets: BTreeMap<JsName, crate::lower::CallRetargets>,
+    pub(crate) call_retargets: BTreeMap<JsName, crate::lower::CallRetargets>,
     /// Proven direct callers of each selected semantic item, used to keep exact-cost groups
     /// coupled where two ABI changes meet in one body.
-    callers: BTreeMap<ItemId, BTreeSet<JsName>>,
+    pub(crate) callers: BTreeMap<ItemId, BTreeSet<JsName>>,
 }
 
 impl AbiPlan {
@@ -525,12 +626,45 @@ impl AbiPlan {
             .any(|sig| sig.params.iter().flatten().any(|p| p.slice))
     }
 
+    /// Whether any flattened signature in this plan specializes a read-only byte-string `&[u8]`.
+    pub(crate) fn has_byte_str_abi(&self) -> bool {
+        self.flat
+            .values()
+            .any(|sig| sig.params.iter().flatten().any(|p| p.byte_str.is_some()))
+    }
+
     /// Whether any flattened signature in this plan passes or returns a 64-bit integer as `(lo, hi)`.
     pub(crate) fn has_i64_pair_abi(&self) -> bool {
         self.flat.values().any(|sig| {
             sig.params.iter().flatten().any(|p| p.i64_pair)
                 || sig.result.as_ref().is_some_and(|r| r.i64_pair)
         })
+    }
+
+    /// Accessors for `bstr_abi` augmentation inside the same crate.
+    pub(crate) fn flat_map(&self) -> &BTreeMap<ItemId, FlatSig> {
+        &self.flat
+    }
+
+    pub(crate) fn flat_map_mut(&mut self) -> &mut BTreeMap<ItemId, FlatSig> {
+        &mut self.flat
+    }
+
+    pub(crate) fn names_map_mut(&mut self) -> &mut BTreeMap<ItemId, JsName> {
+        &mut self.names
+    }
+
+    pub(crate) fn touched_mut(&mut self) -> &mut BTreeSet<JsName> {
+        &mut self.touched
+    }
+
+    pub(crate) fn select_bstr_decision(
+        &mut self,
+        source_name: &JsName,
+        sig: &FlatSig,
+        types: Option<&TypeTable>,
+    ) {
+        self.select_with_types(source_name, sig, types);
     }
 
     /// The plan a retry falls back to: no callee flattened, nothing touched, but the refusals
@@ -562,6 +696,12 @@ impl AbiPlan {
         }
         for (clone, source) in &self.clones {
             out.extend_from_slice(format!("|clone:{clone}:{source}").as_bytes());
+        }
+        for (clone, item) in &self.synthetic_items {
+            out.extend_from_slice(format!("|synth:{clone}:{item:?}").as_bytes());
+        }
+        for ((caller, blk, idx), item) in &self.site_retargets {
+            out.extend_from_slice(format!("|site:{caller}:{}:{idx}:{item:?}", blk.0).as_bytes());
         }
         for spill in &self.spill_names {
             out.extend_from_slice(format!("|spill:{spill}").as_bytes());
@@ -626,6 +766,18 @@ impl AbiPlan {
             .filter(|(clone, _)| targets.contains(*clone))
             .map(|(clone, source)| (clone.clone(), source.clone()))
             .collect();
+        let synthetic_items = self
+            .synthetic_items
+            .iter()
+            .filter(|(clone, _)| targets.contains(*clone))
+            .map(|(clone, item)| (clone.clone(), *item))
+            .collect();
+        let site_retargets = self
+            .site_retargets
+            .iter()
+            .filter(|(_, item)| selected.contains(item))
+            .map(|(k, item)| (k.clone(), *item))
+            .collect();
         let call_retargets = self
             .call_retargets
             .iter()
@@ -662,6 +814,8 @@ impl AbiPlan {
             registers,
             spill_names,
             clones,
+            synthetic_items,
+            site_retargets,
             call_retargets,
             callers,
         }
@@ -675,25 +829,27 @@ impl AbiPlan {
         reasons: &BTreeMap<ItemId, String>,
     ) -> AbiPlan {
         let mut plan = self.subset(selected);
-        let by_source: BTreeMap<JsName, ItemId> = self
-            .flat
-            .keys()
-            .filter_map(|item| Some((self.source_name(*item)?.clone(), *item)))
-            .collect();
+        let mut by_source: BTreeMap<JsName, Vec<ItemId>> = BTreeMap::new();
+        for &item in self.flat.keys() {
+            if let Some(source) = self.source_name(item) {
+                by_source.entry(source.clone()).or_default().push(item);
+            }
+        }
         plan.decisions = self
             .decisions
             .iter()
             .map(|(name, decision)| {
                 let mut decision = decision.clone();
                 if decision.selected {
-                    let item = by_source
+                    let items = by_source
                         .get(name)
                         .expect("every selected decision has a flat signature");
-                    decision.selected = selected.contains(item);
+                    decision.selected = items.iter().any(|item| selected.contains(item));
                     decision.reason = (!decision.selected).then(|| {
+                        let first = items[0];
                         terminal_reason(
                             reasons
-                                .get(item)
+                                .get(&first)
                                 .map(String::as_str)
                                 .unwrap_or("validation.physical-measurement"),
                         )
@@ -718,11 +874,17 @@ impl AbiPlan {
             .is_some_and(|(a, b)| a.iter().any(|caller| b.contains(caller)));
         let a_source = self.source_name(a);
         let b_source = self.source_name(b);
+        let a_target = self.names.get(&a);
+        let b_target = self.names.get(&b);
         share_caller
             || a_source
                 .is_some_and(|source| b_callers.is_some_and(|callers| callers.contains(source)))
             || b_source
                 .is_some_and(|source| a_callers.is_some_and(|callers| callers.contains(source)))
+            || a_target
+                .is_some_and(|target| b_callers.is_some_and(|callers| callers.contains(target)))
+            || b_target
+                .is_some_and(|target| a_callers.is_some_and(|callers| callers.contains(target)))
     }
 
     /// Aggregate-bearing items considered by the physical ABI planner.
@@ -865,13 +1027,19 @@ impl AbiPlan {
             let Some(item) = table.get(source).cloned() else {
                 continue;
             };
-            table.insert(
-                clone.clone(),
-                crate::plan::representation::clone_link_item(item, clone),
-            );
-            let Some(func) = funcs.get(source).cloned() else {
+            let mut cloned_item = crate::plan::representation::clone_link_item(item, clone);
+            if let Some(&synth_id) = self.synthetic_items.get(clone) {
+                if let Some(body) = cloned_item.jir.body.as_mut() {
+                    body.item = synth_id;
+                }
+            }
+            table.insert(clone.clone(), cloned_item);
+            let Some(mut func) = funcs.get(source).cloned() else {
                 continue;
             };
+            if let (Ok(f), Some(&synth_id)) = (&mut func, self.synthetic_items.get(clone)) {
+                f.item = synth_id;
+            }
             funcs.insert(clone.clone(), func);
         }
     }
@@ -976,6 +1144,29 @@ impl AbiPlan {
     ) {
         if self.flat.is_empty() {
             return;
+        }
+        // Apply per-call-site retargets (mixed-caller ByteStr clones) BEFORE `rewrite_callee_with`
+        // prepends entry ops into block 0, so `(block_id, op_idx)` indices match `plan_excluding`
+        // 1-to-1.
+        if !self.site_retargets.is_empty() {
+            for (name, entry) in funcs.iter_mut() {
+                let Ok(func) = entry else { continue };
+                for block in &mut func.blocks {
+                    for (op_idx, op) in block.ops.iter_mut().enumerate() {
+                        if let Some(&target_item) =
+                            self.site_retargets.get(&(name.clone(), block.id, op_idx))
+                        {
+                            if let OpKind::Call {
+                                callee: Callee::Direct { item, .. },
+                                ..
+                            } = &mut op.kind
+                            {
+                                *item = target_item;
+                            }
+                        }
+                    }
+                }
+            }
         }
         for (name, entry) in funcs.iter_mut() {
             let Ok(func) = entry else { continue };
@@ -1259,22 +1450,40 @@ pub fn plan_excluding(
                 return false;
             };
             let mut observed_field = false;
+            let plain_speed_result = opts.profile == Some(crate::opts::Profile::ReleaseSpeed)
+                && !result.i64_pair
+                && result.tagged.is_none()
+                && result.recursive.is_none();
+            let mut accepted_callers = 0usize;
+            let mut rejected_callers = 0usize;
             for caller in direct_callers {
-                let Some(observed) = caller_accepts_result(
+                match caller_accepts_result(
                     table,
                     funcs,
                     caller,
                     func.item,
                     result,
                     &potential_params,
-                ) else {
-                    result_reason = Some("boundary.result-use");
-                    return false;
-                };
-                observed_field |= observed.read || !observed.forwards.is_empty();
-                result_forwards.extend(observed.forwards);
-                result_forward_sites += observed.forward_sites;
-                result_hot_forward |= observed.hot_forward;
+                ) {
+                    Some(observed) => {
+                        accepted_callers += 1;
+                        observed_field |= observed.read || !observed.forwards.is_empty();
+                        result_forwards.extend(observed.forwards);
+                        result_forward_sites += observed.forward_sites;
+                        result_hot_forward |= observed.hot_forward;
+                    }
+                    None if plain_speed_result && funcs.get(caller).is_some_and(Result::is_ok) => {
+                        rejected_callers += 1;
+                    }
+                    None => {
+                        result_reason = Some("boundary.result-use");
+                        return false;
+                    }
+                }
+            }
+            if rejected_callers > 0 && accepted_callers < rejected_callers {
+                result_reason = Some("boundary.result-use");
+                return false;
             }
             if !observed_field {
                 result_reason = Some("not-considered.result-unused");
@@ -1366,23 +1575,31 @@ pub fn plan_excluding(
         }
         // Copy-back runs only after a normal return. A direct or transitive throw must not
         // hide writes in a reconstructed private aggregate from the caller's cleanup code.
-        let has_written_mut_ref = shapes.iter().zip(&uses).any(|(shape, use_)| {
-            shape
-                .as_ref()
-                .is_some_and(|shape| shape.by_ref && shape.mutable)
-                && use_.written
-        });
-        if has_written_mut_ref
-            && (!effects
-                .usable(name)
-                .is_some_and(|summary| !summary.may_unwind)
-                || invoke_call_sites.contains(&func.item))
-        {
-            plan.decline(
-                name.clone(),
-                Decline::Boundary(BoundaryDecline::ExceptionalCopyBack),
-            );
-            continue;
+        // Drop flattening ONLY on written `&mut` parameters so read-only slices/by-value params
+        // on unwinding functions (e.g. `fflate::dflt`) still flatten cleanly.
+        let copy_back_unsafe = !effects
+            .usable(name)
+            .is_some_and(|summary| !summary.may_unwind)
+            || invoke_call_sites.contains(&func.item);
+        if copy_back_unsafe {
+            let mut dropped_written_mut_ref = false;
+            for (shape, use_) in shapes.iter_mut().zip(&uses) {
+                if shape
+                    .as_ref()
+                    .is_some_and(|shape| shape.by_ref && shape.mutable)
+                    && use_.written
+                {
+                    *shape = None;
+                    dropped_written_mut_ref = true;
+                }
+            }
+            if dropped_written_mut_ref && shapes.iter().all(Option::is_none) && result.is_none() {
+                plan.decline(
+                    name.clone(),
+                    Decline::Boundary(BoundaryDecline::ExceptionalCopyBack),
+                );
+                continue;
+            }
         }
         let has_mut_enum = shapes.iter().any(|shape| {
             shape
@@ -1569,6 +1786,20 @@ pub fn plan_excluding(
         plan.names.insert(item, target);
         plan.flat.insert(item, sig);
     }
+    // Phase 5A: Interprocedural read-only ByteStr `&[u8]` physical specialization under
+    // `ReleaseSpeed` + `js-str=bytes`. Runs before `inherit_clone_retargets` so ByteStr clones
+    // inherit any regular `abi_flat` direct-call retargets automatically.
+    crate::plan::bstr_abi::augment_plan(
+        table,
+        funcs,
+        opts,
+        excluded,
+        &ineligible,
+        &pinned_by_tracked_caller,
+        &mut taken,
+        &mut plan,
+    );
+
     // A private body begins as a clone of its canonical source, including every direct call the
     // source makes. Those calls have already been reshaped by `rewrite_calls`; give the clone the
     // same retargets so the expanded arguments reach the matching private callees rather than a
@@ -1625,6 +1856,11 @@ fn signature_shape(sig: &FlatSig, types: Option<&TypeTable>) -> String {
     for param in sig.params.iter().flatten() {
         let kind = if param.slice {
             "slice"
+        } else if let Some(bs) = param.byte_str {
+            match bs {
+                ByteStrParam::Full => "bstr-full",
+                ByteStrParam::Sub => "bstr-sub",
+            }
         } else if param.i64_pair {
             "i64-pair"
         } else if param.tagged.is_some() {
@@ -1661,7 +1897,10 @@ fn inherit_clone_retargets(plan: &mut AbiPlan) {
         let Some(retargets) = plan.call_retargets.get(&source).cloned() else {
             continue;
         };
-        plan.call_retargets.insert(clone, retargets);
+        let entry = plan.call_retargets.entry(clone).or_default();
+        for (item, target) in retargets {
+            entry.entry(item).or_insert(target);
+        }
     }
 }
 
@@ -1936,6 +2175,7 @@ fn flat_param_with(
                 mutable,
                 written,
                 slice: false,
+                byte_str: None,
                 i64_pair: false,
                 tagged: None,
                 recursive: None,
@@ -1955,6 +2195,7 @@ fn flat_param_with(
                     mutable: true,
                     written,
                     slice: false,
+                    byte_str: None,
                     i64_pair: false,
                     tagged: None,
                     recursive: None,
@@ -1972,6 +2213,7 @@ fn flat_param_with(
                 mutable: false,
                 written: false,
                 slice: false,
+                byte_str: None,
                 i64_pair: true,
                 tagged: None,
                 recursive: None,
@@ -1988,6 +2230,7 @@ fn flat_param_with(
                 mutable: false,
                 written,
                 slice: false,
+                byte_str: None,
                 i64_pair: false,
                 tagged: Some(tagged),
                 recursive: None,
@@ -2004,6 +2247,7 @@ fn flat_param_with(
                 mutable: false,
                 written,
                 slice: false,
+                byte_str: None,
                 i64_pair: false,
                 tagged: None,
                 recursive: Some(recursive),
@@ -2024,6 +2268,7 @@ fn flat_param_with(
         mutable,
         written,
         slice: false,
+        byte_str: None,
         i64_pair: false,
         tagged: None,
         recursive: None,
@@ -2083,6 +2328,7 @@ fn slice_param(func: &Func, table: &TypeTable, param: ValueId, ty: TypeId) -> Op
         mutable,
         written: false,
         slice: true,
+        byte_str: None,
         i64_pair: false,
         tagged: None,
         recursive: None,
@@ -3126,8 +3372,13 @@ fn rewrite_callee_with(func: &mut Func, sig: &FlatSig, types: Option<&TypeTable>
             params.push(*param);
             continue;
         };
-        if flat.slice || flat.i64_pair || flat.tagged.is_some() || flat.recursive.is_some() {
-            // Slice, i64 pair, and tagged lanes are physical lowering choices. Keeping the semantic
+        if flat.slice
+            || flat.byte_str.is_some()
+            || flat.i64_pair
+            || flat.tagged.is_some()
+            || flat.recursive.is_some()
+        {
+            // Slice, byte-string, i64 pair, and tagged lanes are physical lowering choices. Keeping the semantic
             // parameter here lets range/enum analysis continue over ordinary JIR; phase C
             // replaces only the JavaScript declaration and direct-call spelling.
             params.push(*param);
@@ -3591,7 +3842,11 @@ pub fn rewrite_calls(func: &mut Func, plan: &AbiPlan, table: Option<&TypeTable>)
                     flat_args.push(*arg);
                     continue;
                 };
-                if flat.slice || flat.i64_pair || flat.tagged.is_some() || flat.recursive.is_some()
+                if flat.slice
+                    || flat.byte_str.is_some()
+                    || flat.i64_pair
+                    || flat.tagged.is_some()
+                    || flat.recursive.is_some()
                 {
                     flat_args.push(*arg);
                     continue;
@@ -4425,6 +4680,7 @@ mod tests {
             mutable: true,
             written: true,
             slice: false,
+            byte_str: None,
             i64_pair: false,
             tagged: None,
             recursive: None,
@@ -4450,6 +4706,7 @@ mod tests {
             mutable: false,
             written: false,
             slice: true,
+            byte_str: None,
             i64_pair: false,
             tagged: None,
             recursive: None,

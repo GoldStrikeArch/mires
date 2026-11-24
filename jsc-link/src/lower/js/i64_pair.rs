@@ -260,6 +260,14 @@ pub fn emit_assign_pair(
     stmts.push(jsast::assign_stmt(jsast::id(dst_hi), tmp_hi));
 }
 
+fn bool_to_i32(cx: &JsCx<'_>, cond: Expr) -> Expr {
+    if cx.opts.profile == Some(crate::opts::Profile::ReleaseSpeed) {
+        jsast::binary(JsBinOp::BitOr, cond, jsast::num(0.0))
+    } else {
+        jsast::cond(cond, jsast::num(1.0), jsast::num(0.0))
+    }
+}
+
 /// Computes `(lo, hi)` for `Add`, emitting statements into `stmts` and returning the two `Expr`s.
 pub fn add_pair(
     cx: &JsCx<'_>,
@@ -287,14 +295,13 @@ pub fn add_pair(
     let sum_lo = jsast::i32_wrap(jsast::binary(JsBinOp::Add, al.clone(), bl));
     let (bind_lo, lo_var) = cx.temp(sum_lo);
     stmts.push(bind_lo);
-    let carry = jsast::cond(
+    let carry = bool_to_i32(
+        cx,
         jsast::binary(
             JsBinOp::Lt,
             jsast::u32_wrap(lo_var.clone()),
             jsast::u32_wrap(al),
         ),
-        jsast::num(1.0),
-        jsast::num(0.0),
     );
     let hi_sum = if const_i32(&bh) == Some(0) {
         jsast::binary(JsBinOp::Add, ah, carry)
@@ -329,10 +336,9 @@ pub fn sub_pair(
     let al = materialize(cx, stmts, al);
     let bl = materialize(cx, stmts, bl);
     let lo = jsast::i32_wrap(jsast::binary(JsBinOp::Sub, al.clone(), bl.clone()));
-    let borrow = jsast::cond(
+    let borrow = bool_to_i32(
+        cx,
         jsast::binary(JsBinOp::Lt, jsast::u32_wrap(al), jsast::u32_wrap(bl)),
-        jsast::num(1.0),
-        jsast::num(0.0),
     );
     let hi_base = if const_i32(&bh) == Some(0) {
         ah
@@ -351,10 +357,9 @@ pub fn neg_pair(cx: &JsCx<'_>, stmts: &mut Vec<Stmt>, (al, ah): (Expr, Expr)) ->
     }
     let lo = jsast::i32_wrap(jsast::neg(al));
     let lo_var = materialize(cx, stmts, lo);
-    let carry = jsast::cond(
+    let carry = bool_to_i32(
+        cx,
         jsast::binary(JsBinOp::StrictEq, lo_var.clone(), jsast::num(0.0)),
-        jsast::num(1.0),
-        jsast::num(0.0),
     );
     let hi = jsast::i32_wrap(jsast::binary(JsBinOp::Add, jsast::bit_not(ah), carry));
     (lo_var, hi)
@@ -1309,7 +1314,7 @@ pub fn cast_to_i64_pair(
     val: Expr,
 ) -> (Expr, Expr) {
     if from_is_bool {
-        let lo = jsast::cond(val, jsast::num(1.0), jsast::num(0.0));
+        let lo = bool_to_i32(cx, val);
         return (lo, jsast::num(0.0));
     }
     if from_is_128 {

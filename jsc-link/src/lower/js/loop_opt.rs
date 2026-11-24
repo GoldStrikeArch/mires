@@ -1361,23 +1361,121 @@ fn elim_guards_in_block(stmts: &mut Vec<Stmt>, env: &mut GuardEnv) {
 // 5. Loop-Invariant Property Hoisting (LICM across cold diverging calls)
 // =================================================================================================
 
+#[derive(Clone, Default)]
+struct LicmState {
+    non_null: HashSet<String>,
+    non_null_props: HashSet<(String, String)>,
+    prop_aliases: HashMap<String, (String, String)>,
+}
+
+impl LicmState {
+    fn invalidate_ident(&mut self, w: &str) {
+        self.non_null.remove(w);
+        self.prop_aliases.remove(w);
+        self.prop_aliases.retain(|_, (base, _)| base != w);
+        self.non_null_props.retain(|(base, _)| base != w);
+    }
+
+    fn invalidate_prop_name(&mut self, prop: &str) {
+        self.prop_aliases.retain(|_, (_, p)| p != prop);
+        self.non_null_props.retain(|(_, p)| p != prop);
+    }
+
+    fn invalidate_calls(&mut self) {
+        self.prop_aliases.clear();
+        self.non_null_props.clear();
+    }
+
+    fn record_unconditional_expr(&mut self, expr: &Expr) {
+        let mut bases = HashSet::new();
+        collect_unconditional_prop_bases_expr(expr, &mut bases);
+        for b in bases {
+            if let Some((orig_obj, orig_prop)) = self.prop_aliases.get(&b).cloned() {
+                self.non_null_props.insert((orig_obj, orig_prop));
+            }
+            self.non_null.insert(b);
+        }
+        // Also record direct two-level reads like `a.query.len`.
+        collect_unconditional_nested_props_expr(expr, &mut self.non_null_props);
+        if expr_has_non_panic_call(expr) {
+            self.invalidate_calls();
+        }
+        let mut prop_w = HashSet::new();
+        collect_prop_writes_expr(expr, &mut prop_w);
+        for (_, p) in prop_w {
+            self.invalidate_prop_name(&p);
+        }
+    }
+}
+
+fn collect_unconditional_nested_props_expr(expr: &Expr, out: &mut HashSet<(String, String)>) {
+    match expr {
+        Expr::Member(obj, _) => {
+            if let Expr::Member(inner_obj, inner_prop) = obj.as_ref() {
+                if let Expr::Ident(id) = inner_obj.as_ref() {
+                    out.insert((id.clone(), inner_prop.clone()));
+                }
+            }
+            collect_unconditional_nested_props_expr(obj, out);
+        }
+        Expr::Index(o, i) => {
+            collect_unconditional_nested_props_expr(o, out);
+            collect_unconditional_nested_props_expr(i, out);
+        }
+        Expr::Assign(l, r) | Expr::CompoundAssign(_, l, r) => {
+            collect_unconditional_nested_props_expr(r, out);
+            if !matches!(l.as_ref(), Expr::Ident(_)) {
+                collect_unconditional_nested_props_expr(l, out);
+            }
+        }
+        Expr::Binary(op, l, r) => {
+            collect_unconditional_nested_props_expr(l, out);
+            if !matches!(op, BinOp::And | BinOp::Or) {
+                collect_unconditional_nested_props_expr(r, out);
+            }
+        }
+        Expr::Unary(_, e) => collect_unconditional_nested_props_expr(e, out),
+        Expr::Cond(c, _, _) => collect_unconditional_nested_props_expr(c, out),
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            collect_unconditional_nested_props_expr(c, out);
+            for a in args {
+                collect_unconditional_nested_props_expr(a, out);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for x in items {
+                collect_unconditional_nested_props_expr(x, out);
+            }
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                collect_unconditional_nested_props_expr(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn hoist_loop_invariant_props(
     stmts: &mut Vec<Stmt>,
     local_names: &mut HashSet<String>,
     extra_decls: &mut Vec<(String, Option<Expr>)>,
+    immutable_slices: &HashSet<String>,
 ) {
     if stmts_have_mutating_nested_fn(stmts) {
         return;
     }
     let mut escaped_locals: HashSet<String> = HashSet::new();
     collect_escaped_idents_stmts(stmts, &mut escaped_locals);
-    let mut non_null: HashSet<String> = HashSet::new();
+    let mut state = LicmState::default();
+    state.non_null.extend(immutable_slices.iter().cloned());
     hoist_props_in_block(
         stmts,
         local_names,
         extra_decls,
         &escaped_locals,
-        &mut non_null,
+        immutable_slices,
+        &mut state,
     );
 }
 
@@ -1460,140 +1558,717 @@ fn collect_unconditional_prop_bases_expr(expr: &Expr, out: &mut HashSet<String>)
     }
 }
 
+fn is_hoistable_field_prop(prop: &str) -> bool {
+    !is_slice_prop(prop)
+        && prop != "length"
+        && !prop.is_empty()
+        && prop
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+        && !prop.as_bytes()[0].is_ascii_digit()
+}
+
+fn collect_field_prop_reads_expr(expr: &Expr, out: &mut HashMap<(String, String), usize>) {
+    match expr {
+        Expr::Member(obj, prop) if is_hoistable_field_prop(prop) => {
+            if let Expr::Ident(id) = obj.as_ref() {
+                *out.entry((id.clone(), prop.clone())).or_default() += 1;
+            }
+            collect_field_prop_reads_expr(obj, out);
+        }
+        Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
+            if let Expr::Member(base, _) = lhs.as_ref() {
+                collect_field_prop_reads_expr(base, out);
+            } else {
+                collect_field_prop_reads_expr(lhs, out);
+            }
+            collect_field_prop_reads_expr(rhs, out);
+        }
+        Expr::Unary(_, e) | Expr::Member(e, _) => collect_field_prop_reads_expr(e, out),
+        Expr::Binary(_, l, r) | Expr::Index(l, r) => {
+            collect_field_prop_reads_expr(l, out);
+            collect_field_prop_reads_expr(r, out);
+        }
+        Expr::Cond(c, t, e) => {
+            collect_field_prop_reads_expr(c, out);
+            collect_field_prop_reads_expr(t, out);
+            collect_field_prop_reads_expr(e, out);
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            collect_field_prop_reads_expr(c, out);
+            for a in args {
+                collect_field_prop_reads_expr(a, out);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for x in items {
+                collect_field_prop_reads_expr(x, out);
+            }
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                collect_field_prop_reads_expr(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_field_prop_reads_stmts(stmts: &[Stmt], out: &mut HashMap<(String, String), usize>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) | Stmt::Const(_, e) => {
+                collect_field_prop_reads_expr(e, out);
+            }
+            Stmt::Let(_, Some(e)) => collect_field_prop_reads_expr(e, out),
+            Stmt::Lets(decls) => {
+                for (_, init) in decls {
+                    if let Some(e) = init {
+                        collect_field_prop_reads_expr(e, out);
+                    }
+                }
+            }
+            Stmt::If(c, a, b) => {
+                collect_field_prop_reads_expr(c, out);
+                if !stmts_definitely_diverge(a) {
+                    collect_field_prop_reads_stmts(a, out);
+                }
+                if let Some(b) = b {
+                    if !stmts_definitely_diverge(b) {
+                        collect_field_prop_reads_stmts(b, out);
+                    }
+                }
+            }
+            Stmt::Switch(d, cases) => {
+                collect_field_prop_reads_expr(d, out);
+                for c in cases {
+                    collect_field_prop_reads_stmts(&c.body, out);
+                }
+            }
+            Stmt::Block(b) | Stmt::LoopForever(_, b) => collect_field_prop_reads_stmts(b, out),
+            Stmt::While(c, b) => {
+                collect_field_prop_reads_expr(c, out);
+                collect_field_prop_reads_stmts(b, out);
+            }
+            Stmt::Labeled(_, inner) => {
+                collect_field_prop_reads_stmts(std::slice::from_ref(inner.as_ref()), out);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                collect_field_prop_reads_stmts(body, out);
+                collect_field_prop_reads_stmts(handler, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_any_prop_name_writes_expr(expr: &Expr, out: &mut HashSet<String>) {
+    match expr {
+        Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
+            if let Expr::Member(_, prop) = lhs.as_ref() {
+                out.insert(prop.clone());
+            }
+            collect_any_prop_name_writes_expr(lhs, out);
+            collect_any_prop_name_writes_expr(rhs, out);
+        }
+        Expr::Unary(_, e) | Expr::Member(e, _) => collect_any_prop_name_writes_expr(e, out),
+        Expr::Binary(_, l, r) | Expr::Index(l, r) => {
+            collect_any_prop_name_writes_expr(l, out);
+            collect_any_prop_name_writes_expr(r, out);
+        }
+        Expr::Cond(c, t, e) => {
+            collect_any_prop_name_writes_expr(c, out);
+            collect_any_prop_name_writes_expr(t, out);
+            collect_any_prop_name_writes_expr(e, out);
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            collect_any_prop_name_writes_expr(c, out);
+            for a in args {
+                collect_any_prop_name_writes_expr(a, out);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for x in items {
+                collect_any_prop_name_writes_expr(x, out);
+            }
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                collect_any_prop_name_writes_expr(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_any_prop_name_writes_stmts(stmts: &[Stmt], out: &mut HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) | Stmt::Const(_, e) => {
+                collect_any_prop_name_writes_expr(e, out);
+            }
+            Stmt::Let(_, Some(e)) => collect_any_prop_name_writes_expr(e, out),
+            Stmt::Lets(decls) => {
+                for (_, init) in decls {
+                    if let Some(e) = init {
+                        collect_any_prop_name_writes_expr(e, out);
+                    }
+                }
+            }
+            Stmt::If(c, a, b) => {
+                collect_any_prop_name_writes_expr(c, out);
+                collect_any_prop_name_writes_stmts(a, out);
+                if let Some(b) = b {
+                    collect_any_prop_name_writes_stmts(b, out);
+                }
+            }
+            Stmt::Switch(d, cases) => {
+                collect_any_prop_name_writes_expr(d, out);
+                for c in cases {
+                    collect_any_prop_name_writes_stmts(&c.body, out);
+                }
+            }
+            Stmt::Block(b) | Stmt::LoopForever(_, b) => collect_any_prop_name_writes_stmts(b, out),
+            Stmt::While(c, b) => {
+                collect_any_prop_name_writes_expr(c, out);
+                collect_any_prop_name_writes_stmts(b, out);
+            }
+            Stmt::Labeled(_, inner) => {
+                collect_any_prop_name_writes_stmts(std::slice::from_ref(inner.as_ref()), out);
+            }
+            Stmt::TryCatch { body, handler, .. } => {
+                collect_any_prop_name_writes_stmts(body, out);
+                collect_any_prop_name_writes_stmts(handler, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Propagates straight-line loop-local invariant aliases (`G = $hp_0; an = G.buf, ao = G.len;` ->
+/// `an = $hp_0.buf, ao = $hp_0.len;`) so a 2nd-level slice-prop LICM pass sees invariant bases.
+fn propagate_loop_slice_aliases_expr(expr: &mut Expr, aliases: &HashMap<String, String>) {
+    if let Expr::Member(obj, prop) = expr {
+        if is_slice_prop(prop) {
+            if let Expr::Ident(id) = obj.as_mut() {
+                if let Some(inv) = aliases.get(id) {
+                    *id = inv.clone();
+                    return;
+                }
+            }
+        }
+    }
+    match expr {
+        Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
+            if let Expr::Member(base, _) = lhs.as_mut() {
+                propagate_loop_slice_aliases_expr(base, aliases);
+            } else {
+                propagate_loop_slice_aliases_expr(lhs, aliases);
+            }
+            propagate_loop_slice_aliases_expr(rhs, aliases);
+        }
+        Expr::Unary(_, e) | Expr::Member(e, _) => propagate_loop_slice_aliases_expr(e, aliases),
+        Expr::Binary(_, l, r) | Expr::Index(l, r) => {
+            propagate_loop_slice_aliases_expr(l, aliases);
+            propagate_loop_slice_aliases_expr(r, aliases);
+        }
+        Expr::Cond(c, t, e) => {
+            propagate_loop_slice_aliases_expr(c, aliases);
+            propagate_loop_slice_aliases_expr(t, aliases);
+            propagate_loop_slice_aliases_expr(e, aliases);
+        }
+        Expr::Call(c, args) | Expr::New(c, args) => {
+            propagate_loop_slice_aliases_expr(c, aliases);
+            for a in args {
+                propagate_loop_slice_aliases_expr(a, aliases);
+            }
+        }
+        Expr::Array(items) | Expr::Seq(items) => {
+            for x in items {
+                propagate_loop_slice_aliases_expr(x, aliases);
+            }
+        }
+        Expr::Object(entries) => {
+            for (_, v) in entries {
+                propagate_loop_slice_aliases_expr(v, aliases);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn propagate_loop_slice_aliases_stmts(
+    stmts: &mut [Stmt],
+    assigned_in_loop: &HashSet<String>,
+    aliases: &mut HashMap<String, String>,
+) {
+    for stmt in stmts.iter_mut() {
+        match stmt {
+            Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
+                propagate_loop_slice_aliases_expr(rhs, aliases);
+                if let Expr::Ident(dst) = lhs.as_ref() {
+                    let dst = dst.clone();
+                    aliases.remove(&dst);
+                    if let Expr::Ident(src) = rhs.as_ref() {
+                        if !assigned_in_loop.contains(src) && src != &dst {
+                            aliases.insert(dst, src.clone());
+                        }
+                    }
+                } else {
+                    if let Expr::Member(base, _) = lhs.as_mut() {
+                        propagate_loop_slice_aliases_expr(base, aliases);
+                    } else {
+                        propagate_loop_slice_aliases_expr(lhs, aliases);
+                    }
+                    let mut w = HashSet::new();
+                    collect_written_idents_expr(lhs, &mut w);
+                    for k in w {
+                        aliases.remove(&k);
+                    }
+                }
+            }
+            Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) | Stmt::Const(_, e) => {
+                propagate_loop_slice_aliases_expr(e, aliases);
+                let mut w = HashSet::new();
+                collect_written_idents_expr(e, &mut w);
+                for k in w {
+                    aliases.remove(&k);
+                }
+            }
+            Stmt::If(c, a, b) => {
+                propagate_loop_slice_aliases_expr(c, aliases);
+                let mut cw = HashSet::new();
+                collect_written_idents_expr(c, &mut cw);
+                for k in cw {
+                    aliases.remove(&k);
+                }
+                let mut a_al = aliases.clone();
+                propagate_loop_slice_aliases_stmts(a, assigned_in_loop, &mut a_al);
+                if let Some(b) = b {
+                    let mut b_al = aliases.clone();
+                    propagate_loop_slice_aliases_stmts(b, assigned_in_loop, &mut b_al);
+                }
+                let mut w = HashSet::new();
+                collect_written_idents_stmts(a, &mut w, true);
+                if let Some(b) = b {
+                    collect_written_idents_stmts(b, &mut w, true);
+                }
+                for k in w {
+                    aliases.remove(&k);
+                }
+            }
+            Stmt::Block(b) => {
+                propagate_loop_slice_aliases_stmts(b, assigned_in_loop, aliases);
+            }
+            Stmt::Labeled(_, inner) => {
+                if let Stmt::Block(b) = inner.as_mut() {
+                    let mut b_al = aliases.clone();
+                    propagate_loop_slice_aliases_stmts(b, assigned_in_loop, &mut b_al);
+                }
+                let mut w = HashSet::new();
+                collect_written_idents_stmts(std::slice::from_ref(inner.as_ref()), &mut w, false);
+                for k in w {
+                    aliases.remove(&k);
+                }
+            }
+            other => {
+                let mut w = HashSet::new();
+                collect_written_idents_stmts(std::slice::from_ref(other), &mut w, true);
+                for k in w {
+                    aliases.remove(&k);
+                }
+            }
+        }
+    }
+}
+
+fn extract_iter0_guard_and_bases(loop_inner: &Stmt) -> Option<(Expr, HashSet<String>)> {
+    let (guard, body0): (&Expr, &[Stmt]) = match loop_inner {
+        Stmt::While(c, b) if !expr_has_side_effect(c) => (c, b.as_slice()),
+        Stmt::LoopForever(_, b) => match b.as_slice() {
+            [Stmt::If(c, then_b, Some(_))] if !expr_has_side_effect(c) => (c, then_b.as_slice()),
+            [Stmt::ExprStmt(Expr::Assign(fl, fr)), Stmt::If(Expr::Ident(fu), then_b, Some(_))]
+                if matches!(fl.as_ref(), Expr::Ident(fn_) if fn_ == fu)
+                    && !expr_has_side_effect(fr) =>
+            {
+                (fr.as_ref(), then_b.as_slice())
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut bases = HashSet::new();
+    for s in body0 {
+        match s {
+            Stmt::ExprStmt(e) if !expr_has_non_panic_call(e) => {
+                collect_unconditional_prop_bases_expr(e, &mut bases);
+            }
+            Stmt::If(cond, then_b, None)
+                if stmts_definitely_diverge(then_b) && !expr_has_non_panic_call(cond) =>
+            {
+                collect_unconditional_prop_bases_expr(cond, &mut bases);
+                break;
+            }
+            _ => break,
+        }
+    }
+    if bases.is_empty() {
+        None
+    } else {
+        Some((guard.clone(), bases))
+    }
+}
+
+fn extract_iter0_then_body_mut(stmt: &mut Stmt) -> Option<&mut Vec<Stmt>> {
+    let inner = match stmt {
+        Stmt::Labeled(_, inner) => inner.as_mut(),
+        other => other,
+    };
+    match inner {
+        Stmt::While(_, b) => Some(b),
+        Stmt::LoopForever(_, b) => match b.as_mut_slice() {
+            [Stmt::If(_, then_b, Some(_))] | [_, Stmt::If(_, then_b, Some(_))] => Some(then_b),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn hoist_props_in_block(
     stmts: &mut Vec<Stmt>,
     local_names: &mut HashSet<String>,
     extra_decls: &mut Vec<(String, Option<Expr>)>,
     escaped_locals: &HashSet<String>,
-    non_null: &mut HashSet<String>,
+    immutable_slices: &HashSet<String>,
+    state: &mut LicmState,
 ) {
     let mut i = 0;
     while i < stmts.len() {
         // First recurse into nested structures (innermost loops first!).
         match &mut stmts[i] {
             Stmt::If(cond, a, b) => {
-                collect_unconditional_prop_bases_expr(cond, non_null);
-                let mut a_nn = non_null.clone();
-                hoist_props_in_block(a, local_names, extra_decls, escaped_locals, &mut a_nn);
+                state.record_unconditional_expr(cond);
+                let mut a_st = state.clone();
+                hoist_props_in_block(
+                    a,
+                    local_names,
+                    extra_decls,
+                    escaped_locals,
+                    immutable_slices,
+                    &mut a_st,
+                );
                 if let Some(b) = b {
-                    let mut b_nn = non_null.clone();
-                    hoist_props_in_block(b, local_names, extra_decls, escaped_locals, &mut b_nn);
+                    let mut b_st = state.clone();
+                    hoist_props_in_block(
+                        b,
+                        local_names,
+                        extra_decls,
+                        escaped_locals,
+                        immutable_slices,
+                        &mut b_st,
+                    );
                 }
                 let mut written = HashSet::new();
+                let mut prop_w = HashSet::new();
                 collect_written_idents_stmts(a, &mut written, true);
+                collect_any_prop_name_writes_stmts(a, &mut prop_w);
+                let mut has_call = stmts_have_non_panic_call(a);
                 if let Some(b) = b {
                     collect_written_idents_stmts(b, &mut written, true);
+                    collect_any_prop_name_writes_stmts(b, &mut prop_w);
+                    has_call |= stmts_have_non_panic_call(b);
                 }
                 for w in written {
-                    non_null.remove(&w);
+                    state.invalidate_ident(&w);
+                }
+                for p in prop_w {
+                    state.invalidate_prop_name(&p);
+                }
+                if has_call {
+                    state.invalidate_calls();
                 }
                 i += 1;
                 continue;
             }
             Stmt::Switch(disc, cases) => {
-                collect_unconditional_prop_bases_expr(disc, non_null);
+                state.record_unconditional_expr(disc);
                 let mut written = HashSet::new();
+                let mut prop_w = HashSet::new();
+                let mut has_call = false;
                 for c in cases.iter_mut() {
-                    let mut c_nn = non_null.clone();
+                    let mut c_st = state.clone();
                     hoist_props_in_block(
                         &mut c.body,
                         local_names,
                         extra_decls,
                         escaped_locals,
-                        &mut c_nn,
+                        immutable_slices,
+                        &mut c_st,
                     );
                     collect_written_idents_stmts(&c.body, &mut written, true);
+                    collect_any_prop_name_writes_stmts(&c.body, &mut prop_w);
+                    has_call |= stmts_have_non_panic_call(&c.body);
                 }
                 for w in written {
-                    non_null.remove(&w);
+                    state.invalidate_ident(&w);
+                }
+                for p in prop_w {
+                    state.invalidate_prop_name(&p);
+                }
+                if has_call {
+                    state.invalidate_calls();
                 }
                 i += 1;
                 continue;
             }
             Stmt::Block(b) => {
-                hoist_props_in_block(b, local_names, extra_decls, escaped_locals, non_null);
+                hoist_props_in_block(
+                    b,
+                    local_names,
+                    extra_decls,
+                    escaped_locals,
+                    immutable_slices,
+                    state,
+                );
                 i += 1;
                 continue;
             }
             Stmt::TryCatch { body, handler, .. } => {
-                let mut b_nn = non_null.clone();
-                hoist_props_in_block(body, local_names, extra_decls, escaped_locals, &mut b_nn);
+                let mut b_st = state.clone();
+                hoist_props_in_block(
+                    body,
+                    local_names,
+                    extra_decls,
+                    escaped_locals,
+                    immutable_slices,
+                    &mut b_st,
+                );
                 let mut written = HashSet::new();
                 collect_written_idents_stmts(body, &mut written, false);
                 for w in written {
-                    non_null.remove(&w);
+                    state.invalidate_ident(&w);
                 }
-                let mut h_nn = non_null.clone();
-                hoist_props_in_block(handler, local_names, extra_decls, escaped_locals, &mut h_nn);
+                state.invalidate_calls();
+                let mut h_st = state.clone();
+                hoist_props_in_block(
+                    handler,
+                    local_names,
+                    extra_decls,
+                    escaped_locals,
+                    immutable_slices,
+                    &mut h_st,
+                );
                 let mut h_written = HashSet::new();
                 collect_written_idents_stmts(handler, &mut h_written, false);
                 for w in h_written {
-                    non_null.remove(&w);
+                    state.invalidate_ident(&w);
                 }
+                state.invalidate_calls();
                 i += 1;
                 continue;
             }
             Stmt::LoopForever(_, b) => {
                 let mut written = HashSet::new();
+                let mut prop_w = HashSet::new();
                 collect_written_idents_stmts(b, &mut written, true);
-                let mut inner_nn = non_null.clone();
+                collect_any_prop_name_writes_stmts(b, &mut prop_w);
+                let mut inner_st = state.clone();
                 for w in &written {
-                    inner_nn.remove(w);
+                    inner_st.invalidate_ident(w);
                 }
-                hoist_props_in_block(b, local_names, extra_decls, escaped_locals, &mut inner_nn);
+                for p in &prop_w {
+                    inner_st.invalidate_prop_name(p);
+                }
+                if stmts_have_non_panic_call(b) {
+                    inner_st.invalidate_calls();
+                }
+                hoist_props_in_block(
+                    b,
+                    local_names,
+                    extra_decls,
+                    escaped_locals,
+                    immutable_slices,
+                    &mut inner_st,
+                );
             }
             Stmt::While(cond, b) => {
                 let mut written = HashSet::new();
+                let mut prop_w = HashSet::new();
                 collect_written_idents_expr(cond, &mut written);
                 collect_written_idents_stmts(b, &mut written, true);
-                let mut inner_nn = non_null.clone();
+                collect_any_prop_name_writes_expr(cond, &mut prop_w);
+                collect_any_prop_name_writes_stmts(b, &mut prop_w);
+                let mut inner_st = state.clone();
                 for w in &written {
-                    inner_nn.remove(w);
+                    inner_st.invalidate_ident(w);
                 }
-                hoist_props_in_block(b, local_names, extra_decls, escaped_locals, &mut inner_nn);
+                for p in &prop_w {
+                    inner_st.invalidate_prop_name(p);
+                }
+                if expr_has_non_panic_call(cond) || stmts_have_non_panic_call(b) {
+                    inner_st.invalidate_calls();
+                }
+                hoist_props_in_block(
+                    b,
+                    local_names,
+                    extra_decls,
+                    escaped_locals,
+                    immutable_slices,
+                    &mut inner_st,
+                );
             }
             Stmt::Labeled(_, inner) => match inner.as_mut() {
                 Stmt::Block(b) => {
                     let mut written = HashSet::new();
+                    let mut prop_w = HashSet::new();
                     collect_written_idents_stmts(b, &mut written, false);
-                    let mut b_nn = non_null.clone();
-                    hoist_props_in_block(b, local_names, extra_decls, escaped_locals, &mut b_nn);
+                    collect_any_prop_name_writes_stmts(b, &mut prop_w);
+                    let has_call = stmts_have_non_panic_call(b);
+                    let mut b_st = state.clone();
+                    hoist_props_in_block(
+                        b,
+                        local_names,
+                        extra_decls,
+                        escaped_locals,
+                        immutable_slices,
+                        &mut b_st,
+                    );
                     for w in written {
-                        non_null.remove(&w);
+                        state.invalidate_ident(&w);
+                    }
+                    for p in prop_w {
+                        state.invalidate_prop_name(&p);
+                    }
+                    if has_call {
+                        state.invalidate_calls();
                     }
                     i += 1;
                     continue;
                 }
                 Stmt::LoopForever(_, b) => {
                     let mut written = HashSet::new();
+                    let mut prop_w = HashSet::new();
                     collect_written_idents_stmts(b, &mut written, true);
-                    let mut inner_nn = non_null.clone();
+                    collect_any_prop_name_writes_stmts(b, &mut prop_w);
+                    let mut inner_st = state.clone();
                     for w in &written {
-                        inner_nn.remove(w);
+                        inner_st.invalidate_ident(w);
+                    }
+                    for p in &prop_w {
+                        inner_st.invalidate_prop_name(p);
+                    }
+                    if stmts_have_non_panic_call(b) {
+                        inner_st.invalidate_calls();
                     }
                     hoist_props_in_block(
                         b,
                         local_names,
                         extra_decls,
                         escaped_locals,
-                        &mut inner_nn,
+                        immutable_slices,
+                        &mut inner_st,
                     );
                 }
                 Stmt::While(cond, b) => {
                     let mut written = HashSet::new();
+                    let mut prop_w = HashSet::new();
                     collect_written_idents_expr(cond, &mut written);
                     collect_written_idents_stmts(b, &mut written, true);
-                    let mut inner_nn = non_null.clone();
+                    collect_any_prop_name_writes_expr(cond, &mut prop_w);
+                    collect_any_prop_name_writes_stmts(b, &mut prop_w);
+                    let mut inner_st = state.clone();
                     for w in &written {
-                        inner_nn.remove(w);
+                        inner_st.invalidate_ident(w);
+                    }
+                    for p in &prop_w {
+                        inner_st.invalidate_prop_name(p);
+                    }
+                    if expr_has_non_panic_call(cond) || stmts_have_non_panic_call(b) {
+                        inner_st.invalidate_calls();
                     }
                     hoist_props_in_block(
                         b,
                         local_names,
                         extra_decls,
                         escaped_locals,
-                        &mut inner_nn,
+                        immutable_slices,
+                        &mut inner_st,
                     );
+                }
+                Stmt::Switch(disc, cases) => {
+                    state.record_unconditional_expr(disc);
+                    let mut written = HashSet::new();
+                    let mut prop_w = HashSet::new();
+                    let mut has_call = false;
+                    for c in cases.iter_mut() {
+                        let mut c_st = state.clone();
+                        hoist_props_in_block(
+                            &mut c.body,
+                            local_names,
+                            extra_decls,
+                            escaped_locals,
+                            immutable_slices,
+                            &mut c_st,
+                        );
+                        collect_written_idents_stmts(&c.body, &mut written, true);
+                        collect_any_prop_name_writes_stmts(&c.body, &mut prop_w);
+                        has_call |= stmts_have_non_panic_call(&c.body);
+                    }
+                    for w in written {
+                        state.invalidate_ident(&w);
+                    }
+                    for p in prop_w {
+                        state.invalidate_prop_name(&p);
+                    }
+                    if has_call {
+                        state.invalidate_calls();
+                    }
+                    i += 1;
+                    continue;
+                }
+                Stmt::If(cond, a, b) => {
+                    state.record_unconditional_expr(cond);
+                    let mut a_st = state.clone();
+                    hoist_props_in_block(
+                        a,
+                        local_names,
+                        extra_decls,
+                        escaped_locals,
+                        immutable_slices,
+                        &mut a_st,
+                    );
+                    if let Some(b) = b {
+                        let mut b_st = state.clone();
+                        hoist_props_in_block(
+                            b,
+                            local_names,
+                            extra_decls,
+                            escaped_locals,
+                            immutable_slices,
+                            &mut b_st,
+                        );
+                    }
+                    let mut written = HashSet::new();
+                    let mut prop_w = HashSet::new();
+                    collect_written_idents_stmts(a, &mut written, true);
+                    collect_any_prop_name_writes_stmts(a, &mut prop_w);
+                    let mut has_call = stmts_have_non_panic_call(a);
+                    if let Some(b) = b {
+                        collect_written_idents_stmts(b, &mut written, true);
+                        collect_any_prop_name_writes_stmts(b, &mut prop_w);
+                        has_call |= stmts_have_non_panic_call(b);
+                    }
+                    for w in written {
+                        state.invalidate_ident(&w);
+                    }
+                    for p in prop_w {
+                        state.invalidate_prop_name(&p);
+                    }
+                    if has_call {
+                        state.invalidate_calls();
+                    }
+                    i += 1;
+                    continue;
                 }
                 _ => {
                     let mut written = HashSet::new();
@@ -1603,28 +2278,55 @@ fn hoist_props_in_block(
                         true,
                     );
                     for w in written {
-                        non_null.remove(&w);
+                        state.invalidate_ident(&w);
                     }
+                    state.invalidate_calls();
                     i += 1;
                     continue;
                 }
             },
             Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
-                collect_unconditional_prop_bases_expr(rhs, non_null);
+                state.record_unconditional_expr(rhs);
                 if let Expr::Ident(dst) = lhs.as_ref() {
-                    if is_guaranteed_non_null_rhs(rhs) {
-                        non_null.insert(dst.clone());
+                    let dst_clone = dst.clone();
+                    let alias = if let Expr::Member(base, prop) = rhs.as_ref() {
+                        if let Expr::Ident(b) = base.as_ref() {
+                            Some((b.clone(), prop.clone()))
+                        } else {
+                            None
+                        }
                     } else {
-                        non_null.remove(dst);
+                        None
+                    };
+                    let guaranteed_nn = is_guaranteed_non_null_rhs(rhs)
+                        || alias
+                            .as_ref()
+                            .is_some_and(|pair| state.non_null_props.contains(pair));
+                    state.invalidate_ident(&dst_clone);
+                    if guaranteed_nn {
+                        state.non_null.insert(dst_clone.clone());
+                    }
+                    if let Some((b, p)) = alias {
+                        if b != dst_clone {
+                            state.prop_aliases.insert(dst_clone, (b, p));
+                        }
                     }
                 } else {
-                    collect_unconditional_prop_bases_expr(lhs, non_null);
+                    state.record_unconditional_expr(lhs);
+                    if let Expr::Member(_, prop) = lhs.as_ref() {
+                        state.invalidate_prop_name(prop);
+                    }
                 }
                 i += 1;
                 continue;
             }
             Stmt::ExprStmt(e) | Stmt::Throw(e) | Stmt::Return(Some(e)) => {
-                collect_unconditional_prop_bases_expr(e, non_null);
+                state.record_unconditional_expr(e);
+                let mut written = HashSet::new();
+                collect_written_idents_expr(e, &mut written);
+                for w in written {
+                    state.invalidate_ident(&w);
+                }
                 i += 1;
                 continue;
             }
@@ -1635,10 +2337,10 @@ fn hoist_props_in_block(
         }
 
         // Now `stmts[i]` is a `LoopForever` or `While` (optionally wrapped in `Stmt::Labeled`).
-        // Check for hoistable `.buf`/`.off`/`.len`.
         let mut assigned_in_loop = HashSet::new();
         let mut props_written_in_loop = HashSet::new();
-        let mut prop_reads: HashMap<(String, String), usize> = HashMap::new();
+        let mut any_prop_name_written = HashSet::new();
+        let mut field_prop_reads: HashMap<(String, String), usize> = HashMap::new();
         let loop_inner = match &stmts[i] {
             Stmt::Labeled(_, inner) => inner.as_ref(),
             other => other,
@@ -1647,7 +2349,8 @@ fn hoist_props_in_block(
             Stmt::LoopForever(_, b) => {
                 collect_written_idents_stmts(b, &mut assigned_in_loop, true);
                 collect_prop_writes_stmts(b, &mut props_written_in_loop);
-                collect_slice_prop_reads_stmts(b, &mut prop_reads);
+                collect_any_prop_name_writes_stmts(b, &mut any_prop_name_written);
+                collect_field_prop_reads_stmts(b, &mut field_prop_reads);
                 stmts_have_non_panic_call(b)
             }
             Stmt::While(c, b) => {
@@ -1655,18 +2358,17 @@ fn hoist_props_in_block(
                 collect_written_idents_stmts(b, &mut assigned_in_loop, true);
                 collect_prop_writes_expr(c, &mut props_written_in_loop);
                 collect_prop_writes_stmts(b, &mut props_written_in_loop);
-                collect_slice_prop_reads_expr(c, &mut prop_reads);
-                collect_slice_prop_reads_stmts(b, &mut prop_reads);
+                collect_any_prop_name_writes_expr(c, &mut any_prop_name_written);
+                collect_any_prop_name_writes_stmts(b, &mut any_prop_name_written);
+                collect_field_prop_reads_expr(c, &mut field_prop_reads);
+                collect_field_prop_reads_stmts(b, &mut field_prop_reads);
                 expr_has_non_panic_call(c) || stmts_have_non_panic_call(b)
             }
             _ => unreachable!(),
         };
         let has_panic = stmt_has_panic_call(&stmts[i]);
-        // If a constant-trip loop (`C_start < C_end`) is guaranteed to execute iteration 0, any
-        // object whose property is read unconditionally before the first side effect/branch in
-        // iteration 0 is guaranteed non-nullish on entry (and stays non-nullish after).
-        let mut loop_non_null = non_null.clone();
-        if let Some(c) = detect_loop_counter(stmts, i, &assigned_in_loop) {
+        let mut loop_non_null = state.non_null.clone();
+        if let Some(c) = detect_loop_counter(stmts, i, &assigned_in_loop, None) {
             if let (Some(c_start), Some(c_end)) = (c.iv_min, exact_u32(&c.bound)) {
                 if c_start < c_end {
                     let iter0_body: Option<&[Stmt]> = match loop_inner {
@@ -1699,52 +2401,154 @@ fn hoist_props_in_block(
             }
         }
 
-        let mut candidates: Vec<(String, String)> = prop_reads
-            .into_iter()
-            .filter_map(|((obj, prop), count)| {
-                if !is_slice_prop(&prop)
-                    || assigned_in_loop.contains(&obj)
-                    || props_written_in_loop.contains(&(obj.clone(), prop.clone()))
-                    || !loop_non_null.contains(&obj)
-                {
-                    return None;
-                }
-                if has_non_panic && (!local_names.contains(&obj) || escaped_locals.contains(&obj)) {
-                    return None;
-                }
-                if count >= 2 || has_panic {
+        // Round 1 (call-free loops only): hoist repeated invariant container fields (`a.matrix`,
+        // `a.query`) and propagate straight-line loop-local aliases (`G = $hp_0; G.buf` -> `$hp_0.buf`)
+        // so Round 2 can hoist the underlying `.buf`/`.off`/`.len` lanes out of the loop too.
+        let mut pre_hoisted_stmts: Vec<Stmt> = Vec::new();
+        if !has_non_panic {
+            let mut field_cands: Vec<(String, String)> = field_prop_reads
+                .into_iter()
+                .filter_map(|((obj, prop), count)| {
+                    if count < 2
+                        || assigned_in_loop.contains(&obj)
+                        || any_prop_name_written.contains(&prop)
+                        || !loop_non_null.contains(&obj)
+                    {
+                        return None;
+                    }
                     Some((obj, prop))
-                } else {
-                    None
+                })
+                .collect();
+            field_cands.sort();
+            if !field_cands.is_empty() {
+                let mut f_subst: HashMap<(String, String), String> = HashMap::new();
+                for (obj, prop) in field_cands {
+                    let tmp = alloc_fresh_local(local_names, extra_decls, "$hp_");
+                    pre_hoisted_stmts.push(jsast::assign_stmt(
+                        jsast::id(&tmp),
+                        Expr::Member(Box::new(Expr::Ident(obj.clone())), prop.clone()),
+                    ));
+                    if state.non_null_props.contains(&(obj.clone(), prop.clone())) {
+                        loop_non_null.insert(tmp.clone());
+                    }
+                    f_subst.insert((obj, prop), tmp);
                 }
-            })
-            .collect();
-        candidates.sort();
+                replace_hoisted_props_stmt(&mut stmts[i], &f_subst);
+            }
+            if let Some(body_mut) = extract_loop_body_mut(&mut stmts[i]) {
+                let mut aliases = HashMap::new();
+                propagate_loop_slice_aliases_stmts(body_mut, &assigned_in_loop, &mut aliases);
+            }
+        }
 
-        if !candidates.is_empty() {
-            let mut hoisted_stmts = Vec::with_capacity(candidates.len());
+        // Round 2: hoist invariant `.buf`/`.off`/`.len` property loads.
+        let mut prop_reads: HashMap<(String, String), usize> = HashMap::new();
+        let loop_inner_after = match &stmts[i] {
+            Stmt::Labeled(_, inner) => inner.as_ref(),
+            other => other,
+        };
+        match loop_inner_after {
+            Stmt::LoopForever(_, b) => collect_slice_prop_reads_stmts(b, &mut prop_reads),
+            Stmt::While(c, b) => {
+                collect_slice_prop_reads_expr(c, &mut prop_reads);
+                collect_slice_prop_reads_stmts(b, &mut prop_reads);
+            }
+            _ => unreachable!(),
+        }
+        let iter0_guard = if !has_non_panic {
+            extract_iter0_guard_and_bases(loop_inner_after)
+        } else {
+            None
+        };
+
+        let mut uncond_cands: Vec<(String, String)> = Vec::new();
+        let mut guarded_cands: Vec<(String, String)> = Vec::new();
+        for ((obj, prop), count) in prop_reads {
+            if !is_slice_prop(&prop)
+                || assigned_in_loop.contains(&obj)
+                || props_written_in_loop.contains(&(obj.clone(), prop.clone()))
+            {
+                continue;
+            }
+            if has_non_panic
+                && !immutable_slices.contains(&obj)
+                && (!local_names.contains(&obj) || escaped_locals.contains(&obj))
+            {
+                continue;
+            }
+            if !(count >= 2 || has_panic) {
+                continue;
+            }
+            if loop_non_null.contains(&obj) {
+                uncond_cands.push((obj, prop));
+            } else if iter0_guard
+                .as_ref()
+                .is_some_and(|(_, bases)| bases.contains(&obj))
+            {
+                guarded_cands.push((obj, prop));
+            }
+        }
+        uncond_cands.sort();
+        guarded_cands.sort();
+
+        if !uncond_cands.is_empty() {
             let mut subst: HashMap<(String, String), String> = HashMap::new();
-            for (obj, prop) in candidates {
+            for (obj, prop) in uncond_cands {
                 let prefix = match prop.as_str() {
                     "buf" => "$hb_",
                     "off" => "$ho_",
                     _ => "$hl_",
                 };
                 let tmp = alloc_fresh_local(local_names, extra_decls, prefix);
-                hoisted_stmts.push(jsast::assign_stmt(
+                pre_hoisted_stmts.push(jsast::assign_stmt(
                     jsast::id(&tmp),
                     Expr::Member(Box::new(Expr::Ident(obj.clone())), prop.clone()),
                 ));
                 subst.insert((obj, prop), tmp);
             }
             replace_hoisted_props_stmt(&mut stmts[i], &subst);
-            let n = hoisted_stmts.len();
-            stmts.splice(i..i, hoisted_stmts);
+        }
+
+        if !guarded_cands.is_empty() {
+            if let Some((guard_cond, _)) = iter0_guard {
+                let mut g_stmts = Vec::with_capacity(guarded_cands.len());
+                let mut g_subst: HashMap<(String, String), String> = HashMap::new();
+                for (obj, prop) in guarded_cands {
+                    let prefix = match prop.as_str() {
+                        "buf" => "$hb_",
+                        "off" => "$ho_",
+                        _ => "$hl_",
+                    };
+                    let tmp = alloc_fresh_local(local_names, extra_decls, prefix);
+                    g_stmts.push(jsast::assign_stmt(
+                        jsast::id(&tmp),
+                        Expr::Member(Box::new(Expr::Ident(obj.clone())), prop.clone()),
+                    ));
+                    g_subst.insert((obj, prop), tmp);
+                }
+                if let Some(then_body) = extract_iter0_then_body_mut(&mut stmts[i]) {
+                    for s in then_body.iter_mut() {
+                        replace_hoisted_props_stmt(s, &g_subst);
+                    }
+                    pre_hoisted_stmts.push(Stmt::If(guard_cond, g_stmts, None));
+                }
+            }
+        }
+
+        if !pre_hoisted_stmts.is_empty() {
+            let n = pre_hoisted_stmts.len();
+            stmts.splice(i..i, pre_hoisted_stmts);
             i += n;
         }
 
         for w in assigned_in_loop {
-            non_null.remove(&w);
+            state.invalidate_ident(&w);
+        }
+        for p in any_prop_name_written {
+            state.invalidate_prop_name(&p);
+        }
+        if has_non_panic {
+            state.invalidate_calls();
         }
         i += 1;
     }
@@ -1950,7 +2754,9 @@ fn collect_slice_prop_reads_expr(expr: &Expr, out: &mut HashMap<(String, String)
             collect_slice_prop_reads_expr(obj, out);
         }
         Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
-            if !matches!(lhs.as_ref(), Expr::Member(_, _)) {
+            if let Expr::Member(base, _) = lhs.as_ref() {
+                collect_slice_prop_reads_expr(base, out);
+            } else {
                 collect_slice_prop_reads_expr(lhs, out);
             }
             collect_slice_prop_reads_expr(rhs, out);
@@ -2044,7 +2850,9 @@ fn replace_hoisted_props_expr(expr: &mut Expr, subst: &HashMap<(String, String),
     }
     match expr {
         Expr::Assign(lhs, rhs) | Expr::CompoundAssign(_, lhs, rhs) => {
-            if !matches!(lhs.as_ref(), Expr::Member(_, _)) {
+            if let Expr::Member(base, _) = lhs.as_mut() {
+                replace_hoisted_props_expr(base, subst);
+            } else {
                 replace_hoisted_props_expr(lhs, subst);
             }
             replace_hoisted_props_expr(rhs, subst);
@@ -2144,7 +2952,8 @@ pub(super) fn version_checked_loops(stmts: &mut [Stmt]) {
         return;
     }
     let mut active_masked: HashMap<String, Expr> = HashMap::new();
-    version_loops_in_block(stmts, &mut active_masked);
+    let mut active_consts: HashMap<String, u32> = HashMap::new();
+    version_loops_in_block(stmts, &mut active_masked, &mut active_consts);
 }
 
 #[derive(Clone)]
@@ -2159,33 +2968,46 @@ fn invalidate_masked(active_masked: &mut HashMap<String, Expr>, ident: &str) {
     active_masked.retain(|_, mask_expr| !expr_reads_ident(mask_expr, ident));
 }
 
-fn version_loops_in_block(stmts: &mut [Stmt], active_masked: &mut HashMap<String, Expr>) {
+fn version_loops_in_block(
+    stmts: &mut [Stmt],
+    active_masked: &mut HashMap<String, Expr>,
+    active_consts: &mut HashMap<String, u32>,
+) {
     // Walk statements in order, maintaining `active_masked` (variables whose current value is
-    // `(... & mask) >>> 0`) so inner loops wrapped in `a: { for (;;) { ... } }` inherit pre-loop
-    // masked initializations from their enclosing block, while still versioning inner loops first.
+    // `(... & mask) >>> 0`) and `active_consts` (variables initialized to exact `u32` constants)
+    // so inner loops wrapped in `a: { for (;;) { ... } }` inherit pre-loop facts from their
+    // enclosing block, while still versioning inner loops first.
     let no_assigned: HashSet<String> = HashSet::new();
     for i in 0..stmts.len() {
         let pre_loop_masked = active_masked.clone();
+        let pre_loop_consts = active_consts.clone();
         match &mut stmts[i] {
             Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
                 let mut rhs_w = HashSet::new();
                 collect_written_idents_expr(rhs, &mut rhs_w);
                 for w in rhs_w {
                     invalidate_masked(active_masked, &w);
+                    active_consts.remove(&w);
                 }
                 if let Expr::Ident(id) = lhs.as_ref() {
                     let id = id.clone();
                     let mask = extract_bitand_mask(rhs, &no_assigned)
                         .filter(|m| !expr_reads_ident(m, &id));
+                    let c_val = exact_u32(rhs);
                     invalidate_masked(active_masked, &id);
+                    active_consts.remove(&id);
                     if let Some(m) = mask {
-                        active_masked.insert(id, m);
+                        active_masked.insert(id.clone(), m);
+                    }
+                    if let Some(c) = c_val {
+                        active_consts.insert(id, c);
                     }
                 } else {
                     let mut lhs_w = HashSet::new();
                     collect_written_idents_expr(lhs, &mut lhs_w);
                     for w in lhs_w {
                         invalidate_masked(active_masked, &w);
+                        active_consts.remove(&w);
                     }
                 }
             }
@@ -2194,17 +3016,21 @@ fn version_loops_in_block(stmts: &mut [Stmt], active_masked: &mut HashMap<String
                 collect_written_idents_expr(cond, &mut w);
                 for k in &w {
                     invalidate_masked(active_masked, k);
+                    active_consts.remove(k);
                 }
                 let mut a_m = active_masked.clone();
-                version_loops_in_block(a, &mut a_m);
+                let mut a_c = active_consts.clone();
+                version_loops_in_block(a, &mut a_m, &mut a_c);
                 collect_written_idents_stmts(a, &mut w, true);
                 if let Some(b) = b {
                     let mut b_m = active_masked.clone();
-                    version_loops_in_block(b, &mut b_m);
+                    let mut b_c = active_consts.clone();
+                    version_loops_in_block(b, &mut b_m, &mut b_c);
                     collect_written_idents_stmts(b, &mut w, true);
                 }
                 for k in w {
                     invalidate_masked(active_masked, &k);
+                    active_consts.remove(&k);
                 }
             }
             Stmt::Switch(disc, cases) => {
@@ -2212,27 +3038,32 @@ fn version_loops_in_block(stmts: &mut [Stmt], active_masked: &mut HashMap<String
                 collect_written_idents_expr(disc, &mut w);
                 for k in &w {
                     invalidate_masked(active_masked, k);
+                    active_consts.remove(k);
                 }
                 for c in cases {
                     let mut c_m = active_masked.clone();
-                    version_loops_in_block(&mut c.body, &mut c_m);
+                    let mut c_c = active_consts.clone();
+                    version_loops_in_block(&mut c.body, &mut c_m, &mut c_c);
                     collect_written_idents_stmts(&c.body, &mut w, true);
                 }
                 for k in w {
                     invalidate_masked(active_masked, &k);
+                    active_consts.remove(&k);
                 }
             }
             Stmt::Block(b) => {
-                version_loops_in_block(b, active_masked);
+                version_loops_in_block(b, active_masked, active_consts);
             }
             Stmt::Labeled(_, inner) => match inner.as_mut() {
                 Stmt::Block(b) => {
                     let mut w = HashSet::new();
                     collect_written_idents_stmts(b, &mut w, false);
                     let mut b_m = active_masked.clone();
-                    version_loops_in_block(b, &mut b_m);
+                    let mut b_c = active_consts.clone();
+                    version_loops_in_block(b, &mut b_m, &mut b_c);
                     for k in w {
                         invalidate_masked(active_masked, &k);
+                        active_consts.remove(&k);
                     }
                 }
                 Stmt::LoopForever(_, b) => {
@@ -2240,9 +3071,11 @@ fn version_loops_in_block(stmts: &mut [Stmt], active_masked: &mut HashMap<String
                     collect_written_idents_stmts(b, &mut w, true);
                     for k in &w {
                         invalidate_masked(active_masked, k);
+                        active_consts.remove(k);
                     }
                     let mut inner_m = active_masked.clone();
-                    version_loops_in_block(b, &mut inner_m);
+                    let mut inner_c = active_consts.clone();
+                    version_loops_in_block(b, &mut inner_m, &mut inner_c);
                 }
                 Stmt::While(c, b) => {
                     let mut w = HashSet::new();
@@ -2250,17 +3083,21 @@ fn version_loops_in_block(stmts: &mut [Stmt], active_masked: &mut HashMap<String
                     collect_written_idents_stmts(b, &mut w, true);
                     for k in &w {
                         invalidate_masked(active_masked, k);
+                        active_consts.remove(k);
                     }
                     let mut inner_m = active_masked.clone();
-                    version_loops_in_block(b, &mut inner_m);
+                    let mut inner_c = active_consts.clone();
+                    version_loops_in_block(b, &mut inner_m, &mut inner_c);
                 }
                 other => {
                     let mut m = active_masked.clone();
-                    version_loops_in_block(std::slice::from_mut(other), &mut m);
+                    let mut c = active_consts.clone();
+                    version_loops_in_block(std::slice::from_mut(other), &mut m, &mut c);
                     let mut w = HashSet::new();
                     collect_written_idents_stmts(std::slice::from_ref(other), &mut w, true);
                     for k in w {
                         invalidate_masked(active_masked, &k);
+                        active_consts.remove(&k);
                     }
                 }
             },
@@ -2269,9 +3106,11 @@ fn version_loops_in_block(stmts: &mut [Stmt], active_masked: &mut HashMap<String
                 collect_written_idents_stmts(b, &mut w, true);
                 for k in &w {
                     invalidate_masked(active_masked, k);
+                    active_consts.remove(k);
                 }
                 let mut inner_m = active_masked.clone();
-                version_loops_in_block(b, &mut inner_m);
+                let mut inner_c = active_consts.clone();
+                version_loops_in_block(b, &mut inner_m, &mut inner_c);
             }
             Stmt::While(c, b) => {
                 let mut w = HashSet::new();
@@ -2279,23 +3118,29 @@ fn version_loops_in_block(stmts: &mut [Stmt], active_masked: &mut HashMap<String
                 collect_written_idents_stmts(b, &mut w, true);
                 for k in &w {
                     invalidate_masked(active_masked, k);
+                    active_consts.remove(k);
                 }
                 let mut inner_m = active_masked.clone();
-                version_loops_in_block(b, &mut inner_m);
+                let mut inner_c = active_consts.clone();
+                version_loops_in_block(b, &mut inner_m, &mut inner_c);
             }
             Stmt::TryCatch { body, handler, .. } => {
                 let mut b_m = active_masked.clone();
-                version_loops_in_block(body, &mut b_m);
+                let mut b_c = active_consts.clone();
+                version_loops_in_block(body, &mut b_m, &mut b_c);
                 let mut w = HashSet::new();
                 collect_written_idents_stmts(body, &mut w, false);
                 for k in &w {
                     invalidate_masked(active_masked, k);
+                    active_consts.remove(k);
                 }
                 let mut h_m = active_masked.clone();
-                version_loops_in_block(handler, &mut h_m);
+                let mut h_c = active_consts.clone();
+                version_loops_in_block(handler, &mut h_m, &mut h_c);
                 collect_written_idents_stmts(handler, &mut w, false);
                 for k in w {
                     invalidate_masked(active_masked, &k);
+                    active_consts.remove(&k);
                 }
             }
             other => {
@@ -2303,11 +3148,12 @@ fn version_loops_in_block(stmts: &mut [Stmt], active_masked: &mut HashMap<String
                 collect_written_idents_stmts(std::slice::from_ref(other), &mut w, true);
                 for k in w {
                     invalidate_masked(active_masked, &k);
+                    active_consts.remove(&k);
                 }
             }
         }
 
-        if let Some(versioned) = try_version_loop_at(stmts, i, &pre_loop_masked) {
+        if let Some(versioned) = try_version_loop_at(stmts, i, &pre_loop_masked, &pre_loop_consts) {
             stmts[i] = versioned;
         }
     }
@@ -2339,14 +3185,83 @@ fn extract_loop_body_mut(stmt: &mut Stmt) -> Option<&mut Vec<Stmt>> {
     }
 }
 
+fn stmts_continue_current_loop(stmts: &[Stmt], loop_label: Option<&str>, nested: bool) -> bool {
+    for s in stmts {
+        match s {
+            Stmt::Continue(None) if !nested => return true,
+            Stmt::Continue(Some(lbl)) if loop_label == Some(lbl.as_str()) => return true,
+            Stmt::If(_, a, b) => {
+                if stmts_continue_current_loop(a, loop_label, nested)
+                    || b.as_deref()
+                        .is_some_and(|b| stmts_continue_current_loop(b, loop_label, nested))
+                {
+                    return true;
+                }
+            }
+            Stmt::Switch(_, cases) => {
+                if cases
+                    .iter()
+                    .any(|c| stmts_continue_current_loop(&c.body, loop_label, nested))
+                {
+                    return true;
+                }
+            }
+            Stmt::Block(b) => {
+                if stmts_continue_current_loop(b, loop_label, nested) {
+                    return true;
+                }
+            }
+            Stmt::Labeled(_, inner) => {
+                if stmts_continue_current_loop(
+                    std::slice::from_ref(inner.as_ref()),
+                    loop_label,
+                    nested,
+                ) {
+                    return true;
+                }
+            }
+            Stmt::LoopForever(_, b) | Stmt::While(_, b) => {
+                if loop_label.is_some() && stmts_continue_current_loop(b, loop_label, true) {
+                    return true;
+                }
+            }
+            Stmt::TryCatch { body, handler, .. }
+                if stmts_continue_current_loop(body, loop_label, nested)
+                    || stmts_continue_current_loop(handler, loop_label, nested) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn stmts_definitely_exit_loop(stmts: &[Stmt], loop_label: Option<&str>) -> bool {
+    if stmts_continue_current_loop(stmts, loop_label, false) {
+        return false;
+    }
+    match stmts.last() {
+        Some(Stmt::Break(_) | Stmt::Return(_) | Stmt::Throw(_)) => true,
+        Some(Stmt::Continue(Some(target))) => loop_label != Some(target.as_str()),
+        Some(Stmt::If(_, then_b, Some(else_b))) => {
+            stmts_definitely_exit_loop(then_b, loop_label)
+                && stmts_definitely_exit_loop(else_b, loop_label)
+        }
+        Some(Stmt::Block(b)) => stmts_definitely_exit_loop(b, loop_label),
+        _ => false,
+    }
+}
+
 fn detect_loop_counter(
     enclosing: &[Stmt],
     loop_idx: usize,
     assigned_in_loop: &HashSet<String>,
+    pre_loop_consts: Option<&HashMap<String, u32>>,
 ) -> Option<CounterInfo> {
-    let stmt = match &enclosing[loop_idx] {
-        Stmt::Labeled(_, inner) => inner.as_ref(),
-        other => other,
+    let (loop_label, stmt) = match &enclosing[loop_idx] {
+        Stmt::Labeled(lbl, inner) => (Some(lbl.as_str()), inner.as_ref()),
+        other => (None, other),
     };
     let (iv, bound, body): (String, Expr, &[Stmt]) = match stmt {
         Stmt::While(Expr::Binary(BinOp::Lt, l, r), b) => {
@@ -2357,7 +3272,7 @@ fn detect_loop_counter(
         }
         Stmt::LoopForever(_, b) => match b.as_slice() {
             [Stmt::If(Expr::Binary(BinOp::Lt, l, r), then_b, Some(else_b))]
-                if matches!(else_b.last(), Some(Stmt::Break(_))) =>
+                if stmts_definitely_exit_loop(else_b, loop_label) =>
             {
                 let Expr::Ident(iv) = l.as_ref() else {
                     return None;
@@ -2366,7 +3281,7 @@ fn detect_loop_counter(
             }
             [Stmt::ExprStmt(Expr::Assign(fl, fr)), Stmt::If(Expr::Ident(fu), then_b, Some(else_b))]
                 if matches!(fl.as_ref(), Expr::Ident(fn_) if fn_ == fu)
-                    && matches!(else_b.last(), Some(Stmt::Break(_))) =>
+                    && stmts_definitely_exit_loop(else_b, loop_label) =>
             {
                 let Expr::Binary(BinOp::Lt, l, r) = fr.as_ref() else {
                     return None;
@@ -2392,7 +3307,8 @@ fn detect_loop_counter(
     if !all_iv_writes_are_plus_one(body, &iv) {
         return None;
     }
-    let iv_min = find_prior_const_init(enclosing, loop_idx, &iv);
+    let iv_min = find_prior_const_init(enclosing, loop_idx, &iv)
+        .or_else(|| pre_loop_consts.and_then(|m| m.get(&iv).copied()));
     Some(CounterInfo { iv, bound, iv_min })
 }
 
@@ -2625,7 +3541,7 @@ fn is_panic_bounds_check_if(
         return None;
     };
     let is_bounds_panic = then_b.iter().any(|s| match s {
-        Stmt::ExprStmt(Expr::Call(callee, _)) => matches!(
+        Stmt::ExprStmt(Expr::Call(callee, _)) | Stmt::Throw(Expr::Call(callee, _)) => matches!(
             callee.as_ref(),
             Expr::Ident(n) if n.starts_with("core$panicking$panic_bounds_check$")
         ),
@@ -2718,10 +3634,12 @@ fn resolve_affine_iv(
     }
 }
 
-/// Resolves `base + iv >>> 0` or `(base + iv | 0) - sub >>> 0` (exact fflate LZ77 byte-match shape).
+/// Resolves `base + iv >>> 0`, `(base + iv >>> 0) + C >>> 0`, or `(base + iv | 0) - sub >>> 0`.
 enum BaseIvShape {
     /// `base + iv >>> 0`
     Add { base: String },
+    /// `(base + iv >>> 0) + add >>> 0` with `1 <= add <= 64`
+    AddConst { base: String, add: u32 },
     /// `(base + iv | 0) - sub >>> 0`
     AddSub { base: String, sub: String },
 }
@@ -2741,7 +3659,11 @@ fn resolve_base_iv_shape(
         other => other,
     };
     let match_base_plus_iv = |node: &Expr| -> Option<String> {
-        let node = match node {
+        let resolved = match node {
+            Expr::Ident(id) => local_defs.get(id).unwrap_or(node),
+            other => other,
+        };
+        let node = match resolved {
             Expr::Binary(BinOp::BitOr, l, r) if exact_i32(r) == Some(0) => l.as_ref(),
             Expr::Binary(BinOp::UShr, l, r) if exact_u32(r) == Some(0) => l.as_ref(),
             other => other,
@@ -2766,6 +3688,18 @@ fn resolve_base_iv_shape(
     if let Some(base) = match_base_plus_iv(inner) {
         return Some(BaseIvShape::Add { base });
     }
+    if let Expr::Binary(BinOp::Add, l, r) = inner {
+        if let (Some(base), Some(add)) = (match_base_plus_iv(l), exact_u32(r)) {
+            if (1..=64).contains(&add) {
+                return Some(BaseIvShape::AddConst { base, add });
+            }
+        }
+        if let (Some(add), Some(base)) = (exact_u32(l), match_base_plus_iv(r)) {
+            if (1..=64).contains(&add) {
+                return Some(BaseIvShape::AddConst { base, add });
+            }
+        }
+    }
     if let Expr::Binary(BinOp::Sub, l, r) = inner {
         if let (Some(base), Expr::Ident(sub)) = (match_base_plus_iv(l), r.as_ref()) {
             if sub != iv && !assigned_in_loop.contains(sub) {
@@ -2787,12 +3721,18 @@ fn derive_check_guards(
     local_defs: &HashMap<String, Expr>,
     assigned_in_loop: &HashSet<String>,
 ) -> Option<Vec<Expr>> {
-    // Resolve `len` through `local_defs` (e.g. `G = $hl_0` after LICM hoisted `r.len`), then
+    // Resolve `len` through up to 4 hops of `local_defs` (e.g. `ao = $hl_0; N = ao;`), then
     // verify `len` is a constant u32 or a loop-invariant identifier.
-    let resolved_len: Expr = match len {
-        Expr::Ident(id) if assigned_in_loop.contains(id) => local_defs.get(id)?.clone(),
-        other => other.clone(),
-    };
+    let mut resolved_len = len.clone();
+    for _ in 0..4 {
+        let Expr::Ident(id) = &resolved_len else {
+            break;
+        };
+        if !assigned_in_loop.contains(id) {
+            break;
+        }
+        resolved_len = local_defs.get(id)?.clone();
+    }
     let len = &resolved_len;
     let len_inv = match len {
         Expr::Ident(id) => !assigned_in_loop.contains(id),
@@ -2927,6 +3867,38 @@ fn derive_check_guards(
                 ));
                 return Some(guards);
             }
+            BaseIvShape::AddConst { base, add } => {
+                guards.push(Expr::Binary(
+                    BinOp::Le,
+                    Box::new(Expr::Num(0.0)),
+                    Box::new(Expr::Ident(base.clone())),
+                ));
+                let base_plus_bound = Expr::Binary(
+                    BinOp::Add,
+                    Box::new(Expr::Ident(base)),
+                    Box::new(c.bound.clone()),
+                );
+                let max_idx = if add == 1 {
+                    base_plus_bound
+                } else {
+                    Expr::Binary(
+                        BinOp::Add,
+                        Box::new(base_plus_bound),
+                        Box::new(Expr::Num(f64::from(add - 1))),
+                    )
+                };
+                guards.push(Expr::Binary(
+                    BinOp::Lt,
+                    Box::new(max_idx.clone()),
+                    Box::new(len.clone()),
+                ));
+                guards.push(Expr::Binary(
+                    BinOp::Le,
+                    Box::new(max_idx),
+                    Box::new(Expr::Num(4294967295.0)),
+                ));
+                return Some(guards);
+            }
             BaseIvShape::AddSub { base, sub } => {
                 guards.push(Expr::Binary(
                     BinOp::Le,
@@ -2967,11 +3939,24 @@ fn derive_check_guards(
     None
 }
 
+fn exact_u64(expr: &Expr) -> Option<u64> {
+    match expr {
+        Expr::Num(n)
+            if n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= 9007199254740991.0 =>
+        {
+            Some(*n as u64)
+        }
+        Expr::RawNum(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
 fn simplify_guards(all_guards: Vec<Expr>) -> Vec<Expr> {
     // First pass: record the strictest constant LHS for `K < rhs` (keep max K) and `C <= rhs`
-    // (keep max C).
+    // (keep max C), and strictest constant RHS for `lhs <= C` (keep min C).
     let mut max_lt: Vec<(Expr, u32)> = Vec::new();
     let mut max_le: Vec<(Expr, u32)> = Vec::new();
+    let mut min_le_rhs: Vec<(Expr, u64)> = Vec::new();
     for g in &all_guards {
         match g {
             Expr::Binary(BinOp::Lt, l, r) => {
@@ -2991,14 +3976,30 @@ fn simplify_guards(all_guards: Vec<Expr>) -> Vec<Expr> {
                         max_le.push((r.as_ref().clone(), c));
                     }
                 }
+                if let Some(c) = exact_u64(r) {
+                    if let Some((_, cur)) = min_le_rhs.iter_mut().find(|(e, _)| e == l.as_ref()) {
+                        *cur = (*cur).min(c);
+                    } else {
+                        min_le_rhs.push((l.as_ref().clone(), c));
+                    }
+                }
             }
             _ => {}
         }
     }
 
     let mut deduped: Vec<Expr> = Vec::new();
-    for g in all_guards {
-        if let Expr::Binary(BinOp::Lt, l, r) = &g {
+    for g in &all_guards {
+        if let Expr::Binary(BinOp::Le, l, r) = g {
+            // If `all_guards` already contains strict `l < r`, drop weaker `l <= r`.
+            let has_strict = all_guards
+                .iter()
+                .any(|o| matches!(o, Expr::Binary(BinOp::Lt, ol, or) if ol == l && or == r));
+            if has_strict {
+                continue;
+            }
+        }
+        if let Expr::Binary(BinOp::Lt, l, r) = g {
             if let Some(k) = exact_u32(l) {
                 if let Some((_, max_k)) = max_lt.iter().find(|(e, _)| e == r.as_ref()) {
                     if k < *max_k {
@@ -3006,7 +4007,7 @@ fn simplify_guards(all_guards: Vec<Expr>) -> Vec<Expr> {
                     }
                 }
             }
-        } else if let Expr::Binary(BinOp::Le, l, r) = &g {
+        } else if let Expr::Binary(BinOp::Le, l, r) = g {
             if let Some(c) = exact_u32(l) {
                 if let Some((_, max_c)) = max_le.iter().find(|(e, _)| e == r.as_ref()) {
                     if c < *max_c {
@@ -3014,9 +4015,16 @@ fn simplify_guards(all_guards: Vec<Expr>) -> Vec<Expr> {
                     }
                 }
             }
+            if let Some(c) = exact_u64(r) {
+                if let Some((_, min_c)) = min_le_rhs.iter().find(|(e, _)| e == l.as_ref()) {
+                    if c > *min_c {
+                        continue;
+                    }
+                }
+            }
         }
-        if !deduped.contains(&g) {
-            deduped.push(g);
+        if !deduped.contains(g) {
+            deduped.push(g.clone());
         }
     }
     deduped
@@ -3026,6 +4034,7 @@ fn try_version_loop_at(
     enclosing: &[Stmt],
     loop_idx: usize,
     pre_loop_masked: &HashMap<String, Expr>,
+    pre_loop_consts: &HashMap<String, u32>,
 ) -> Option<Stmt> {
     if !is_loop_stmt(&enclosing[loop_idx]) {
         return None;
@@ -3037,7 +4046,12 @@ fn try_version_loop_at(
 
     let mut assigned_in_loop = HashSet::new();
     collect_written_idents_stmts(body, &mut assigned_in_loop, true);
-    let counter = detect_loop_counter(enclosing, loop_idx, &assigned_in_loop);
+    let counter = detect_loop_counter(
+        enclosing,
+        loop_idx,
+        &assigned_in_loop,
+        Some(pre_loop_consts),
+    );
     let loop_masked = detect_loop_masked_vars(
         enclosing,
         loop_idx,
@@ -3082,6 +4096,35 @@ fn try_version_loop_at(
     ))
 }
 
+fn record_local_assign_expr(expr: &Expr, local_defs: &mut HashMap<String, Expr>) {
+    match expr {
+        Expr::Assign(lhs, rhs) => {
+            if let Expr::Ident(id) = lhs.as_ref() {
+                let id = id.clone();
+                local_defs.retain(|k, v| k != &id && !expr_reads_ident(v, &id));
+                if !expr_has_side_effect(rhs) && !expr_reads_ident(rhs, &id) {
+                    local_defs.insert(id, rhs.as_ref().clone());
+                }
+            } else {
+                let mut w = HashSet::new();
+                collect_written_idents_expr(expr, &mut w);
+                local_defs
+                    .retain(|k, v| !w.contains(k) && !w.iter().any(|x| expr_reads_ident(v, x)));
+            }
+        }
+        Expr::Seq(items) => {
+            for item in items {
+                record_local_assign_expr(item, local_defs);
+            }
+        }
+        other => {
+            let mut w = HashSet::new();
+            collect_written_idents_expr(other, &mut w);
+            local_defs.retain(|k, v| !w.contains(k) && !w.iter().any(|x| expr_reads_ident(v, x)));
+        }
+    }
+}
+
 fn strip_provable_checks(
     stmts: &mut Vec<Stmt>,
     counter: Option<&CounterInfo>,
@@ -3091,118 +4134,15 @@ fn strip_provable_checks(
     removed: &mut usize,
 ) {
     let mut local_defs: HashMap<String, Expr> = HashMap::new();
-    let mut i = 0;
-    while i < stmts.len() {
-        if let Some((idx, len)) = is_panic_bounds_check_if(&stmts[i], &local_defs) {
-            if let Some(guards) = derive_check_guards(
-                &idx,
-                &len,
-                counter,
-                loop_masked,
-                &local_defs,
-                assigned_in_loop,
-            ) {
-                all_guards.extend(guards);
-                stmts.remove(i);
-                *removed += 1;
-                continue;
-            }
-        }
-        match &mut stmts[i] {
-            Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
-                if let Expr::Ident(id) = lhs.as_ref() {
-                    let id = id.clone();
-                    // Invalidate any cached local def that references `id`.
-                    local_defs.retain(|k, v| k != &id && !expr_reads_ident(v, &id));
-                    if !expr_has_side_effect(rhs) && !expr_reads_ident(rhs, &id) {
-                        local_defs.insert(id, rhs.as_ref().clone());
-                    }
-                }
-            }
-            Stmt::If(_, a, b) => {
-                // Only recurse into `if` branches (do NOT cross into nested loops because their
-                // induction variables and `assigned_in_loop` differ; inner loops were already
-                // processed bottom-up!).
-                if !stmts_definitely_diverge(a) {
-                    let mut a_defs = local_defs.clone();
-                    strip_provable_checks_with_defs(
-                        a,
-                        &mut a_defs,
-                        counter,
-                        loop_masked,
-                        assigned_in_loop,
-                        all_guards,
-                        removed,
-                    );
-                }
-                if let Some(b) = b {
-                    if !stmts_definitely_diverge(b) {
-                        let mut b_defs = local_defs.clone();
-                        strip_provable_checks_with_defs(
-                            b,
-                            &mut b_defs,
-                            counter,
-                            loop_masked,
-                            assigned_in_loop,
-                            all_guards,
-                            removed,
-                        );
-                    }
-                }
-                let mut written = HashSet::new();
-                collect_written_idents_stmts(a, &mut written, true);
-                if let Some(b) = b {
-                    collect_written_idents_stmts(b, &mut written, true);
-                }
-                local_defs.retain(|k, v| {
-                    !written.contains(k) && !written.iter().any(|w| expr_reads_ident(v, w))
-                });
-            }
-            Stmt::Block(b) => {
-                strip_provable_checks_with_defs(
-                    b,
-                    &mut local_defs,
-                    counter,
-                    loop_masked,
-                    assigned_in_loop,
-                    all_guards,
-                    removed,
-                );
-            }
-            Stmt::Labeled(_, inner) => {
-                let mut written = HashSet::new();
-                collect_written_idents_stmts(
-                    std::slice::from_ref(inner.as_ref()),
-                    &mut written,
-                    false,
-                );
-                if let Stmt::Block(b) = inner.as_mut() {
-                    let mut b_defs = local_defs.clone();
-                    strip_provable_checks_with_defs(
-                        b,
-                        &mut b_defs,
-                        counter,
-                        loop_masked,
-                        assigned_in_loop,
-                        all_guards,
-                        removed,
-                    );
-                }
-                local_defs.retain(|k, v| {
-                    !written.contains(k) && !written.iter().any(|w| expr_reads_ident(v, w))
-                });
-            }
-            Stmt::LoopForever(_, b) | Stmt::While(_, b) => {
-                let mut written = HashSet::new();
-                collect_written_idents_stmts(b, &mut written, true);
-                local_defs.retain(|k, v| {
-                    !written.contains(k) && !written.iter().any(|w| expr_reads_ident(v, w))
-                });
-            }
-            _ => {}
-        }
-        i += 1;
-    }
+    strip_provable_checks_with_defs(
+        stmts,
+        &mut local_defs,
+        counter,
+        loop_masked,
+        assigned_in_loop,
+        all_guards,
+        removed,
+    );
 }
 
 fn strip_provable_checks_with_defs(
@@ -3232,14 +4172,8 @@ fn strip_provable_checks_with_defs(
             }
         }
         match &mut stmts[i] {
-            Stmt::ExprStmt(Expr::Assign(lhs, rhs)) => {
-                if let Expr::Ident(id) = lhs.as_ref() {
-                    let id = id.clone();
-                    local_defs.retain(|k, v| k != &id && !expr_reads_ident(v, &id));
-                    if !expr_has_side_effect(rhs) && !expr_reads_ident(rhs, &id) {
-                        local_defs.insert(id, rhs.as_ref().clone());
-                    }
-                }
+            Stmt::ExprStmt(e) => {
+                record_local_assign_expr(e, local_defs);
             }
             Stmt::If(_, a, b) => {
                 if !stmts_definitely_diverge(a) {
@@ -3500,7 +4434,7 @@ fn stmts_have_non_panic_call(stmts: &[Stmt]) -> bool {
 
 fn stmt_has_panic_call(stmt: &Stmt) -> bool {
     match stmt {
-        Stmt::ExprStmt(Expr::Call(callee, _)) => {
+        Stmt::ExprStmt(Expr::Call(callee, _)) | Stmt::Throw(Expr::Call(callee, _)) => {
             matches!(callee.as_ref(), Expr::Ident(n) if n.starts_with("core$panicking$"))
         }
         Stmt::If(_, a, b) => {
@@ -4456,6 +5390,309 @@ mod tests {
         assert!(
             s.contains("\"bookends\""),
             "expected `bookends` branch preserved: {s}"
+        );
+    }
+
+    #[test]
+    fn two_level_licm_and_add_const_bce_version_labeled_switch_dp_loop() {
+        // Models `minisearch::recurse`: `a: switch (tag)` -> `b: for (;;)` -> inner DP `for (;;)`
+        // whose `else` exits via `if (cond) { break; } else { continue b; }`, reading `a.matrix`
+        // via `G = a.matrix; an = G.buf, ao = G.len;` with `l = ai + d >>> 0` and `y = l + 1 >>> 0`.
+        let mut decl = Stmt::FunctionDecl {
+            name: "dp".to_owned(),
+            params: vec![
+                "a".to_owned(),
+                "tag".to_owned(),
+                "ai".to_owned(),
+                "bound".to_owned(),
+            ],
+            body: vec![
+                jsast::lets(vec![
+                    ("o".to_owned(), None),
+                    ("F".to_owned(), None),
+                    ("aj".to_owned(), None),
+                    ("ak".to_owned(), None),
+                    ("d".to_owned(), None),
+                    ("am".to_owned(), None),
+                    ("L".to_owned(), None),
+                    ("l".to_owned(), None),
+                    ("y".to_owned(), None),
+                    ("G".to_owned(), None),
+                    ("an".to_owned(), None),
+                    ("ao".to_owned(), None),
+                    ("N".to_owned(), None),
+                    ("H".to_owned(), None),
+                    ("ap".to_owned(), None),
+                    ("aq".to_owned(), None),
+                    ("P".to_owned(), None),
+                    ("sum".to_owned(), None),
+                ]),
+                jsast::assign_stmt(jsast::id("o"), jsast::member(jsast::id("a"), "columns")),
+                jsast::assign_stmt(jsast::id("sum"), Expr::Num(0.0)),
+                Stmt::Labeled(
+                    "sw".to_owned(),
+                    Box::new(Stmt::Switch(
+                        jsast::id("tag"),
+                        vec![jsast::SwitchCase {
+                            tests: vec![Expr::Num(1.0)],
+                            body: vec![Stmt::Labeled(
+                                "outer".to_owned(),
+                                Box::new(Stmt::LoopForever(
+                                    None,
+                                    vec![
+                                        jsast::assign_stmt(
+                                            jsast::id("F"),
+                                            jsast::member(jsast::id("a"), "matrix"),
+                                        ),
+                                        Stmt::ExprStmt(Expr::Seq(vec![
+                                            jsast::assign(
+                                                jsast::id("aj"),
+                                                jsast::member(jsast::id("F"), "buf"),
+                                            ),
+                                            jsast::assign(
+                                                jsast::id("ak"),
+                                                jsast::member(jsast::id("F"), "len"),
+                                            ),
+                                        ])),
+                                        jsast::assign_stmt(jsast::id("d"), Expr::Num(0.0)),
+                                        Stmt::LoopForever(
+                                            None,
+                                            vec![
+                                                jsast::assign_stmt(
+                                                    jsast::id("am"),
+                                                    Expr::Binary(
+                                                        BinOp::Lt,
+                                                        Box::new(jsast::id("d")),
+                                                        Box::new(jsast::id("bound")),
+                                                    ),
+                                                ),
+                                                Stmt::If(
+                                                    jsast::id("am"),
+                                                    vec![
+                                                        jsast::assign_stmt(
+                                                            jsast::id("L"),
+                                                            Expr::Binary(
+                                                                BinOp::UShr,
+                                                                Box::new(Expr::Binary(
+                                                                    BinOp::Add,
+                                                                    Box::new(jsast::id("d")),
+                                                                    Box::new(Expr::Num(1.0)),
+                                                                )),
+                                                                Box::new(Expr::Num(0.0)),
+                                                            ),
+                                                        ),
+                                                        jsast::assign_stmt(
+                                                            jsast::id("l"),
+                                                            Expr::Binary(
+                                                                BinOp::UShr,
+                                                                Box::new(Expr::Binary(
+                                                                    BinOp::Add,
+                                                                    Box::new(jsast::id("ai")),
+                                                                    Box::new(jsast::id("d")),
+                                                                )),
+                                                                Box::new(Expr::Num(0.0)),
+                                                            ),
+                                                        ),
+                                                        jsast::assign_stmt(
+                                                            jsast::id("G"),
+                                                            jsast::member(jsast::id("a"), "matrix"),
+                                                        ),
+                                                        Stmt::ExprStmt(Expr::Seq(vec![
+                                                            jsast::assign(
+                                                                jsast::id("an"),
+                                                                jsast::member(jsast::id("G"), "buf"),
+                                                            ),
+                                                            jsast::assign(
+                                                                jsast::id("ao"),
+                                                                jsast::member(jsast::id("G"), "len"),
+                                                            ),
+                                                        ])),
+                                                        jsast::assign_stmt(
+                                                            jsast::id("N"),
+                                                            jsast::id("ao"),
+                                                        ),
+                                                        Stmt::If(
+                                                            Expr::Unary(
+                                                                UnOp::Not,
+                                                                Box::new(Expr::Binary(
+                                                                    BinOp::Lt,
+                                                                    Box::new(jsast::id("l")),
+                                                                    Box::new(jsast::id("N")),
+                                                                )),
+                                                            ),
+                                                            vec![Stmt::Throw(jsast::call(
+                                                                jsast::id("core$panicking$panic_bounds_check$h1"),
+                                                                vec![jsast::id("l"), jsast::id("N")],
+                                                            ))],
+                                                            None,
+                                                        ),
+                                                        jsast::assign_stmt(
+                                                            jsast::id("y"),
+                                                            Expr::Binary(
+                                                                BinOp::UShr,
+                                                                Box::new(Expr::Binary(
+                                                                    BinOp::Add,
+                                                                    Box::new(jsast::id("l")),
+                                                                    Box::new(Expr::Num(1.0)),
+                                                                )),
+                                                                Box::new(Expr::Num(0.0)),
+                                                            ),
+                                                        ),
+                                                        jsast::assign_stmt(
+                                                            jsast::id("H"),
+                                                            jsast::member(jsast::id("a"), "matrix"),
+                                                        ),
+                                                        Stmt::ExprStmt(Expr::Seq(vec![
+                                                            jsast::assign(
+                                                                jsast::id("ap"),
+                                                                jsast::member(jsast::id("H"), "buf"),
+                                                            ),
+                                                            jsast::assign(
+                                                                jsast::id("aq"),
+                                                                jsast::member(jsast::id("H"), "len"),
+                                                            ),
+                                                        ])),
+                                                        jsast::assign_stmt(
+                                                            jsast::id("P"),
+                                                            jsast::id("aq"),
+                                                        ),
+                                                        Stmt::If(
+                                                            Expr::Unary(
+                                                                UnOp::Not,
+                                                                Box::new(Expr::Binary(
+                                                                    BinOp::Lt,
+                                                                    Box::new(jsast::id("y")),
+                                                                    Box::new(jsast::id("P")),
+                                                                )),
+                                                            ),
+                                                            vec![Stmt::Throw(jsast::call(
+                                                                jsast::id("core$panicking$panic_bounds_check$h1"),
+                                                                vec![jsast::id("y"), jsast::id("P")],
+                                                            ))],
+                                                            None,
+                                                        ),
+                                                        jsast::assign_stmt(
+                                                            jsast::id("sum"),
+                                                            Expr::Binary(
+                                                                BinOp::Add,
+                                                                Box::new(jsast::index(
+                                                                    jsast::id("an"),
+                                                                    jsast::id("l"),
+                                                                )),
+                                                                Box::new(jsast::index(
+                                                                    jsast::id("ap"),
+                                                                    jsast::id("y"),
+                                                                )),
+                                                            ),
+                                                        ),
+                                                        jsast::assign_stmt(
+                                                            jsast::id("d"),
+                                                            jsast::id("L"),
+                                                        ),
+                                                    ],
+                                                    Some(vec![Stmt::If(
+                                                        Expr::Binary(
+                                                            BinOp::Gt,
+                                                            Box::new(jsast::id("sum")),
+                                                            Box::new(jsast::id("o")),
+                                                        ),
+                                                        vec![Stmt::Break(None)],
+                                                        Some(vec![Stmt::Continue(Some(
+                                                            "outer".to_owned(),
+                                                        ))]),
+                                                    )]),
+                                                ),
+                                            ],
+                                        ),
+                                        Stmt::Break(None),
+                                    ],
+                                )),
+                            )],
+                        }],
+                    )),
+                ),
+                Stmt::Return(Some(jsast::id("sum"))),
+            ],
+        };
+        run_speed_post_opts(&mut decl);
+        let s = jsast::stmt_to_string(&decl);
+        assert!(
+            s.contains("ai + bound < $hl_") && !s.contains("ai + bound <= 4294967296"),
+            "expected AddConst pre-loop guard with strictest RHS bound: {s}"
+        );
+        assert!(
+            s.contains("ai + bound <= 4294967295"),
+            "expected exact u32 upper bound for AddConst: {s}"
+        );
+        assert_eq!(
+            s.matches("panic_bounds_check").count(),
+            2,
+            "expected both bounds checks stripped from fast loop (only 2 in cold fallback): {s}"
+        );
+    }
+
+    #[test]
+    fn immutable_slice_hoists_across_call_and_replaces_lhs_member_base() {
+        let mut decl = Stmt::FunctionDecl {
+            name: "update".to_owned(),
+            params: vec!["s".to_owned(), "n".to_owned()],
+            body: vec![
+                jsast::lets(vec![("i".to_owned(), None)]),
+                jsast::assign_stmt(jsast::id("i"), Expr::Num(0.0)),
+                Stmt::While(
+                    Expr::Binary(
+                        BinOp::Lt,
+                        Box::new(jsast::id("i")),
+                        Box::new(jsast::id("n")),
+                    ),
+                    vec![
+                        Stmt::ExprStmt(jsast::call(jsast::id("helper"), vec![jsast::id("s")])),
+                        jsast::assign_stmt(
+                            jsast::member(
+                                jsast::index(
+                                    jsast::member(jsast::id("s"), "buf"),
+                                    Expr::Binary(
+                                        BinOp::Add,
+                                        Box::new(jsast::member(jsast::id("s"), "off")),
+                                        Box::new(jsast::id("i")),
+                                    ),
+                                ),
+                                "x",
+                            ),
+                            jsast::member(
+                                jsast::index(
+                                    jsast::member(jsast::id("s"), "buf"),
+                                    Expr::Binary(
+                                        BinOp::Add,
+                                        Box::new(jsast::member(jsast::id("s"), "off")),
+                                        Box::new(jsast::id("i")),
+                                    ),
+                                ),
+                                "y",
+                            ),
+                        ),
+                        jsast::assign_stmt(
+                            jsast::id("i"),
+                            Expr::Binary(
+                                BinOp::Add,
+                                Box::new(jsast::id("i")),
+                                Box::new(Expr::Num(1.0)),
+                            ),
+                        ),
+                    ],
+                ),
+            ],
+        };
+        let imm: std::collections::HashSet<String> = ["s".to_owned()].into_iter().collect();
+        super::super::post_opt::run_speed_post_opts_with_mode(&mut decl, true, &imm);
+        let s = jsast::stmt_to_string(&decl);
+        assert!(
+            s.contains("$hb_0 = s.buf;") && s.contains("$ho_0 = s.off;"),
+            "expected immutable slice buf/off hoisted across call: {s}"
+        );
+        assert!(
+            s.contains("$hb_0[$ho_0 + i].x ="),
+            "expected LHS member base replaced with hoisted buf/off: {s}"
         );
     }
 }

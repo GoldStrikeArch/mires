@@ -101,6 +101,9 @@ pub struct HeapPlan {
     pub all_non_adt_boxed: bool,
     /// Conservative fallback when opaque/declined items may box arbitrary ADTs.
     pub all_adts_boxed: bool,
+    /// Internal multi-field struct `(peeled_struct_ty, field_idx)` `u32` fields stored as
+    /// signed `Int32` (V8 Smi) under `ReleaseSpeed`.
+    pub smi_u32_fields: BTreeSet<(TypeId, u32)>,
 }
 
 /// Conservative default heap plan (Tier A off, all indirect writes keep `_put` / `_boxes`).
@@ -115,6 +118,7 @@ pub static DEFAULT_HEAP_PLAN: HeapPlan = HeapPlan {
     boxed_non_adt_keys: BTreeSet::new(),
     all_non_adt_boxed: true,
     all_adts_boxed: true,
+    smi_u32_fields: BTreeSet::new(),
 };
 
 impl Default for HeapPlan {
@@ -619,10 +623,125 @@ fn run_reachability(
             boxed_non_adt_keys: boxed.boxed_non_adt_keys,
             all_non_adt_boxed: boxed.all_non_adt_boxed,
             all_adts_boxed: boxed.all_adts_boxed,
+            smi_u32_fields: BTreeSet::new(),
         },
         string_internally_accessed,
         vec_internally_accessed,
     )
+}
+
+/// Resolves the `(peeled_struct_ty, field_idx)` targeted by the final `Proj::Field` of a
+/// `BorrowView`/`RawView`, if any (and not preceded by a `Proj::Downcast` on the same struct).
+pub fn view_final_struct_field(
+    func: &Func,
+    table: &TypeTable,
+    root: &Root,
+    path: &[Proj],
+) -> Option<(TypeId, u32)> {
+    let mut cur_ty = match root {
+        Root::Value(v) => func.values.get(v.0 as usize)?.ty,
+        Root::Cell(c) => func.cells.get(c.0 as usize)?.ty,
+    };
+    let mut last_field = None;
+    let mut downcast = false;
+    for proj in path {
+        last_field = None;
+        match proj {
+            Proj::Deref => {
+                downcast = false;
+                cur_ty = value::pointee_of(table, cur_ty)?;
+            }
+            Proj::Field { field, ty } => {
+                if !downcast {
+                    last_field = Some((table.peeled(cur_ty), *field));
+                }
+                downcast = false;
+                cur_ty = *ty;
+            }
+            Proj::Index(_) | Proj::ConstantIndex { .. } => {
+                downcast = false;
+                cur_ty = match value::kind(table, cur_ty) {
+                    Some(TypeKind::Array { element, .. } | TypeKind::Slice(element)) => *element,
+                    _ => return None,
+                };
+            }
+            Proj::Subslice { .. } => {
+                downcast = false;
+            }
+            Proj::Downcast { .. } => {
+                downcast = true;
+            }
+        }
+    }
+    last_field
+}
+
+/// Post-SSA defense-in-depth filter for `smi_u32_fields`: removes any `(struct_ty, field)` whose
+/// `BorrowView`/`RawView` in any live SSA `Func` ever escapes to a use other than direct
+/// `OpKind::Deref` / `OpKind::StoreThrough { ptr, .. }` / no-op `OpKind::Drop`.
+pub fn filter_smi_u32_fields_post_ssa(
+    table: &BTreeMap<JsName, LinkItem>,
+    funcs: &BTreeMap<JsName, Result<Func, Decline>>,
+    candidates: &BTreeSet<(TypeId, u32)>,
+) -> BTreeSet<(TypeId, u32)> {
+    if candidates.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut surviving = candidates.clone();
+    for (name, res) in funcs {
+        let Ok(func) = res else { continue };
+        let Some(interns) = table.get(name).and_then(|i| i.jir.interns()) else {
+            continue;
+        };
+        let types = &interns.types;
+        let mut field_views: BTreeMap<ValueId, (TypeId, u32)> = BTreeMap::new();
+        for block in &func.blocks {
+            for op in &block.ops {
+                let (
+                    Some(res_v),
+                    OpKind::BorrowView { root, path, .. } | OpKind::RawView { root, path, .. },
+                ) = (op.result, &op.kind)
+                else {
+                    continue;
+                };
+                if let Some(pair) = view_final_struct_field(func, types, root, path) {
+                    if surviving.contains(&pair) {
+                        field_views.insert(res_v, pair);
+                    }
+                }
+            }
+        }
+        if field_views.is_empty() {
+            continue;
+        }
+        for block in &func.blocks {
+            for u in block.term.uses() {
+                if let Some(pair) = field_views.get(&u) {
+                    surviving.remove(pair);
+                }
+            }
+            for op in &block.ops {
+                for u in op.kind.uses() {
+                    let Some(&pair) = field_views.get(&u) else {
+                        continue;
+                    };
+                    let ok = match &op.kind {
+                        OpKind::Deref(ptr) => *ptr == u,
+                        OpKind::StoreThrough { ptr, v } => *ptr == u && *v != u,
+                        OpKind::Drop {
+                            glue: DropGlue::None,
+                            ..
+                        } => true,
+                        _ => false,
+                    };
+                    if !ok {
+                        surviving.remove(&pair);
+                    }
+                }
+            }
+        }
+    }
+    surviving
 }
 
 fn enqueue(
@@ -2606,6 +2725,7 @@ mod tests {
             boxed_non_adt_keys: boxed.boxed_non_adt_keys,
             all_non_adt_boxed: boxed.all_non_adt_boxed,
             all_adts_boxed: boxed.all_adts_boxed,
+            smi_u32_fields: BTreeSet::new(),
         };
         assert!(plan.needs_box_tracking(&interns.types, boxed_adt));
         assert!(!plan.needs_box_tracking(&interns.types, plain_adt));
@@ -2791,6 +2911,7 @@ mod tests {
             boxed_non_adt_keys: boxed.boxed_non_adt_keys,
             all_non_adt_boxed: boxed.all_non_adt_boxed,
             all_adts_boxed: boxed.all_adts_boxed,
+            smi_u32_fields: BTreeSet::new(),
         };
         assert!(
             !plan.needs_box_tracking(&interns.types, adt_ty),
